@@ -1,0 +1,36 @@
+[package]
+name = "warren-snail"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Kenneth Allen Flegal"]
+description = "A database in one file, read a column at a time, declared and asked in PostgreSQL's SQL"
+rust-version = "1.88"
+repository = "https://github.com/soulstompp/warren-snail"
+readme = "README.md"
+keywords = ["database", "parquet", "postgresql", "sql", "columnar"]
+categories = ["database-implementations", "command-line-utilities"]
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
+
+[lib]
+name = "warren_snail"
+path = "src/lib.rs"
+
+[[bin]]
+name = "warren-snail"
+path = "src/main.rs"
+
+[features]
+# An open snail holds the pages its rounds read, between rounds. Built without it, a snail holds
+# none of its own, as inside PostgreSQL.
+default = ["standalone"]
+standalone = []
+
+[dependencies]
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
+arrow = { version = "58", default-features = false }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+crc32fast = "1"
+libc = "0.2"
