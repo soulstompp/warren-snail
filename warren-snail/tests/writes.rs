@@ -722,3 +722,83 @@ fn a_block_statements_change_may_lie_in_two_files_and_a_block_written_whole_lies
         assert_eq!(&bag(&b), want, "{q}");
     }
 }
+
+/// Every block's entry of every order, read from the snail's directory as it stands.
+#[cfg(feature = "standalone")]
+fn block_entries(path: &std::path::Path) -> Vec<warren_snail::directory::Entry> {
+    use warren_snail::directory::{decode_page, decode_top};
+    let reader = warren_snail::file::Reader::open(path).unwrap();
+    let root = reader.root().unwrap();
+    let mut out = Vec::new();
+    for (_, _, top) in &root.orders {
+        let (head, mut level) = decode_top(&reader.read_extent(*top).unwrap()).unwrap();
+        for _ in 1..head.height {
+            level = level
+                .iter()
+                .flat_map(|e| decode_page(&reader.read_extent(e.child).unwrap(), &head).unwrap())
+                .collect();
+        }
+        out.extend(level);
+    }
+    out
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_snail_of_format_seven_is_read_and_written_as_0_1_0_lays_it_and_stays_of_format_seven() {
+    let s = sample(5_000);
+    let catalog = warren_snail::catalog::Catalog::parse(DDL).unwrap();
+    let seven = tmp("seven.snail");
+    warren_snail::write::write_format_seven(&seven, &catalog, &tables(&s), span()).unwrap();
+    let eight = snail("eight", &s);
+    let order = in_order(&s);
+    let (network, station, id) = order[100];
+    let questions: Vec<String> = vec![
+        "SELECT r.feed, count(*) FROM weather.readings r GROUP BY r.feed".into(),
+        format!(
+            "SELECT r.reading_id, r.feed FROM weather.readings r \
+             WHERE r.network_id = {network} AND r.station_no = {station}"
+        ),
+        "SELECT s.name, count(*) FROM weather.stations s GROUP BY s.name".into(),
+        format!("SELECT r.feed FROM weather.readings r WHERE r.reading_id = {id}"),
+    ];
+    same_answers(&mut fresh(&seven), &mut fresh(&eight), &questions);
+    // The same statements into both: inserted, checked, moved and deleted rows.
+    let (w7, w8) = (
+        &mut Snail::open_writing(&seven).unwrap(),
+        &mut Snail::open_writing(&eight).unwrap(),
+    );
+    for st in [
+        format!(
+            "INSERT INTO weather.readings (reading_id, network_id, station_no, feed, observed_at, checked_at) \
+             VALUES (4000001, {network}, {station}, 'AWS Main', '2022-06-15 10:00:00+00', NULL)"
+        ),
+        format!("UPDATE weather.readings SET feed = 'f7' WHERE reading_id = {id}"),
+        format!(
+            "UPDATE weather.readings SET station_no = {} WHERE reading_id = {}",
+            order[3000].1, order[200].2
+        ),
+        format!("DELETE FROM weather.readings WHERE reading_id = {}", order[400].2),
+    ] {
+        w7.execute(&st).unwrap();
+        w8.execute(&st).unwrap();
+    }
+    for q in &questions {
+        w7.ask(q, None).unwrap();
+        w8.ask(q, None).unwrap();
+    }
+    same_answers(&mut fresh(&seven), &mut fresh(&eight), &questions);
+    Snail::open(&seven).unwrap().census().unwrap();
+    Snail::open(&eight).unwrap().census().unwrap();
+    // The format 7 snail still names its format, and every block's page map begins a run of its
+    // own, as 0.1.0 reads it; this build's own packs them.
+    let reader = warren_snail::file::Reader::open(&seven).unwrap();
+    reader.root().unwrap();
+    assert_eq!(reader.format(), 7);
+    assert!(block_entries(&seven)
+        .iter()
+        .all(|e| e.child.bytes >> 32 == 0));
+    assert!(block_entries(&eight)
+        .iter()
+        .any(|e| e.child.bytes >> 32 > 0));
+}

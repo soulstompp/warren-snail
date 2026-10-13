@@ -5,10 +5,10 @@
 use crate::catalog::{Catalog, Column, ColumnType, Order, Table};
 use crate::cut::{cut, largest_place, unit, Block, Width, Widths};
 use crate::directory::{
-    build, decode_top, encode_top, ColumnPages, Entry, Head, PageEntry, PageMap, Summary,
+    build, decode_top, encode_top, ColumnPages, Entry, Head, MapPages, PageEntry, PageMap, Summary,
 };
 use crate::encode::{descriptor, disk_pages, encode, DataPage, Encoded, DICTIONARY_BYTES};
-use crate::file::{encode_runs, Extent, Place, Root, Run, Writer, FILE_PAGES};
+use crate::file::{encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_SEVEN};
 use crate::places::{key, month_utc, shown, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
@@ -348,12 +348,38 @@ pub fn write_spanned(
     sources: &[(String, Source)],
     span: u64,
 ) -> Result<Vec<Written>> {
+    write_made(path, catalog, tables, sources, span, None)
+}
+
+/// A new snail as warren-snail 0.1.0 made it, in format 7, each page map in pages of its own: for the
+/// tests that read and write such a snail.
+#[doc(hidden)]
+pub fn write_format_seven(
+    path: &Path,
+    catalog: &Catalog,
+    tables: &[(String, Rows)],
+    span: u64,
+) -> Result<Vec<Written>> {
+    write_made(path, catalog, tables, &[], span, Some(FORMAT_SEVEN))
+}
+
+fn write_made(
+    path: &Path,
+    catalog: &Catalog,
+    tables: &[(String, Rows)],
+    sources: &[(String, Source)],
+    span: u64,
+    format: Option<u32>,
+) -> Result<Vec<Written>> {
     for (name, _) in tables {
         if catalog.table(name).is_none() {
             return Err(Error::new(format!("{name} is not in the DDL")));
         }
     }
-    let w = Writer::create_spanned(path, span)?;
+    let mut w = Writer::create_spanned(path, span)?;
+    if let Some(f) = format {
+        w.set_format(f);
+    }
     let written = write_tables(w, catalog, tables, sources);
     if written.is_err() {
         // A write refused leaves no file of its own behind.
@@ -435,7 +461,8 @@ fn write_tables(
             .find(|(n, _)| *n == table.name)
             .map(|(_, s)| s);
         for order in &table.orders {
-            let (extent, written) = write_order(&mut w, table, order, rows, source)?;
+            let packed = w.format() != FORMAT_SEVEN;
+            let (extent, written) = write_order(&mut w, table, order, rows, source, packed)?;
             root.orders
                 .push((table.name.clone(), order.name.clone(), extent));
             out.push(written);
@@ -453,7 +480,7 @@ fn write_tables(
         })
         .collect();
     if !passed.is_empty() {
-        root.free = w.place_end(&encode_runs(&passed))?;
+        root.free = w.place_end(&encode_free(&passed, &[], w.format()))?;
     }
     w.commit(&mut root)?;
     Ok(out)
@@ -654,6 +681,7 @@ fn write_order(
     order: &Order,
     rows: &Rows,
     source: Option<&Source>,
+    packed: bool,
 ) -> Result<(Extent, Written)> {
     let n = rows.len();
     let Laid {
@@ -699,7 +727,7 @@ fn write_order(
             bytes: table.columns[c].ty.is_byte_array().then_some(0),
         })
         .collect();
-    let mut map_pages = 0u64;
+    let mut maps = MapPages::new(packed);
     // The rows came in the order's order, so a row group can be one of its blocks.
     let in_order = source.filter(|_| perm.iter().enumerate().all(|(i, &p)| i == p));
     for b in &blocks {
@@ -742,8 +770,8 @@ fn write_order(
             &month_slots,
             &text_slots,
             &given,
+            &mut maps,
         )?;
-        map_pages += entry.child.pages();
         for (s, (cw, e)) in columns.iter_mut().zip(&encoded).enumerate() {
             cw.moved_blocks += given.get(s).is_some_and(Option::is_some) as usize;
             cw.dictionary_blocks += e.dictionary.is_some() as usize;
@@ -755,6 +783,8 @@ fn write_order(
         }
         entries.push(entry);
     }
+    maps.finish(w)?;
+    let map_pages = maps.pages;
     let head = Head {
         units: units.iter().map(|&k| k as u32).collect(),
         month_slots: month_slots.iter().map(|&s| s as u32).collect(),
@@ -794,6 +824,7 @@ pub(crate) fn write_block(
     month_slots: &[usize],
     text_slots: &[usize],
     given: &[Option<Encoded>],
+    maps: &mut MapPages,
 ) -> Result<(Entry, Vec<Encoded>)> {
     let mut summaries = Vec::with_capacity(order.columns.len());
     let mut encoded = Vec::with_capacity(order.columns.len());
@@ -861,17 +892,16 @@ pub(crate) fn write_block(
         }
     };
     let map_bytes = map_at(0).encode().len();
-    let map_pages = disk_pages(map_bytes).max(1) as u64;
     let data_pages: usize = encoded.iter().map(Encoded::disk_pages).sum();
-    let start = w.reserve(map_pages + data_pages as u64);
-    let map = map_at(start + map_pages);
+    let (child, data) = maps.place(w, map_bytes, data_pages as u64, true)?;
+    let map = map_at(data);
     for (sum, cp) in summaries.iter_mut().zip(&map.columns) {
         sum.pages = (cp.dictionary.map_or(0, Extent::pages)
             + cp.pages.iter().map(|p| p.at.pages()).sum::<u64>()) as u32;
     }
     let map_encoded = map.encode();
     debug_assert_eq!(map_encoded.len(), map_bytes);
-    w.write_at(start, &map_encoded)?;
+    maps.write(w, child, &map_encoded)?;
     for (e, cp) in encoded.iter().zip(&map.columns) {
         if let (Some(d), Some(at)) = (&e.dictionary, cp.dictionary) {
             w.write_at(at.start, d)?;
@@ -889,10 +919,7 @@ pub(crate) fn write_block(
         columns: summaries,
         months,
         bytes,
-        child: Extent {
-            start,
-            bytes: map_bytes as u64,
-        },
+        child,
     };
     Ok((entry, encoded))
 }

@@ -954,6 +954,39 @@ fn a_stand_alone_round_prefers_the_order_whose_pages_it_holds() {
     );
 }
 
+#[cfg(feature = "standalone")]
+#[test]
+fn a_stand_alone_round_counts_no_directory_page_it_holds_against_an_order() {
+    let s = sample(40_000);
+    let path = snail("held_directory", &s);
+    let id = s.reading_id[20_000];
+    let q = format!("SELECT r.reading_id FROM weather.readings r WHERE r.reading_id = {id}");
+    let (_, first) = Snail::open(&path).unwrap().ask(&q, None).unwrap();
+    assert_eq!(first.order, "readings_pkey", "{first:?}");
+    let key = first
+        .consulted
+        .iter()
+        .find(|c| c.order == "readings_pkey")
+        .unwrap();
+
+    // Along r_station the point read takes every block, and its directory alone is more pages
+    // than the primary key reads in all.
+    let mut snail = Snail::open(&path).unwrap();
+    let (_, along) = snail.ask(&q, Some("r_station")).unwrap();
+    assert!(
+        along.directory_pages > key.directory_pages + key.high,
+        "{along:?} {first:?}"
+    );
+    let (b, round) = snail.ask(&q, None).unwrap();
+    assert_eq!(round.order, "r_station", "{round:?}");
+    assert_eq!(
+        (round.column_pages_held, round.column_pages_read),
+        (round.column_pages_predicted, 0),
+        "{round:?}"
+    );
+    assert_eq!(ints64(b.column(0).as_ref()), [Some(id)]);
+}
+
 #[test]
 fn text_read_from_a_dictionary_groups_and_joins_as_its_text() {
     let s = sample(40_000);
@@ -1147,4 +1180,26 @@ fn a_join_kept_to_few_keys_walks_their_rows_alone_and_a_count_by_code_takes_runs
         .collect();
     assert_eq!(got, want);
     assert_eq!((round.rows_walked, round.rows_taken), (0, 20_000));
+}
+
+#[test]
+fn a_blocks_page_map_shares_a_page_with_its_neighbours_and_a_round_reads_each_such_page_once() {
+    let s = sample(20_000);
+    let path = tmp("packed.snail");
+    let catalog = Catalog::parse(DDL).unwrap();
+    let written = write(&path, &catalog, &tables(&s)).unwrap();
+    let readings = written.iter().find(|w| w.order == "r_station").unwrap();
+    // The blocks' maps lie in fewer pages than there are blocks.
+    assert!(readings.blocks > 4, "{readings:?}");
+    assert!(readings.map_pages < readings.blocks as u64, "{readings:?}");
+    // Read whole along the table's order, a round reads the directory and each page of maps once.
+    let q = "SELECT r.feed, count(*) FROM weather.readings r GROUP BY r.feed";
+    let (_, round) = fresh(&path).ask(q, Some("r_station")).unwrap();
+    exact(q, &round);
+    assert_eq!(round.blocks_read, readings.blocks as u64);
+    assert_eq!(
+        round.directory_pages,
+        readings.index_pages + readings.map_pages,
+        "{round:?}"
+    );
 }

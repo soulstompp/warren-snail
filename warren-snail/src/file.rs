@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 const MAGIC: [u8; 8] = *b"wsnail\0\x01";
-const FORMAT: u32 = 7;
+/// The format a snail is made in, and the one before it, which is read and written as it is: its
+/// page maps each lie in pages of their own.
+const FORMAT: u32 = 8;
+pub(crate) const FORMAT_SEVEN: u32 = 7;
 
 /// The pages a file holds before the next begins, unless the snail is made with another span: 1 GiB.
 pub const FILE_PAGES: u64 = 1 << 18;
@@ -168,11 +171,43 @@ pub fn decode_runs(buf: &[u8]) -> Result<Vec<Run>> {
         .collect()
 }
 
+/// The free map as a snail of the current format holds it: its runs, then each page of packed page
+/// maps some of whose maps a commit has stopped naming, with how many. A snail of format 7 holds the
+/// runs alone.
+pub(crate) fn encode_free(runs: &[Run], spent: &[(u64, u32)], format: u32) -> Vec<u8> {
+    let mut bytes = encode_runs(runs);
+    if format != FORMAT_SEVEN {
+        let mut o = Out::default();
+        o.u32(spent.len() as u32);
+        for &(page, n) in spent {
+            o.u64(page);
+            o.u32(n);
+        }
+        bytes.extend_from_slice(&o.0);
+    }
+    bytes
+}
+
+/// Each page of packed page maps some of whose maps a commit has stopped naming, with how many.
+pub(crate) type Spent = Vec<(u64, u32)>;
+
+pub(crate) fn decode_free(buf: &[u8], format: u32) -> Result<(Vec<Run>, Spent)> {
+    let runs = decode_runs(buf)?;
+    if format == FORMAT_SEVEN {
+        return Ok((runs, Vec::new()));
+    }
+    let mut i = In::new(&buf[4 + 24 * runs.len()..]);
+    let spent = (0..i.u32()?)
+        .map(|_| Ok((i.u64()?, i.u32()?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((runs, spent))
+}
+
 impl Root {
-    fn encode(&self) -> Result<Vec<u8>> {
+    fn encode(&self, format: u32) -> Result<Vec<u8>> {
         let mut o = Out::default();
         o.0.extend_from_slice(&MAGIC);
-        o.u32(FORMAT);
+        o.u32(format);
         o.u64(self.generation);
         o.u64(self.pages);
         o.u64(self.span);
@@ -199,9 +234,14 @@ impl Root {
         Ok(o.0)
     }
 
-    fn decode(page: &[u8]) -> Option<Root> {
+    /// A copy of the root and its format, where it is whole and of a format this build reads.
+    fn decode(page: &[u8]) -> Option<(Root, u32)> {
         let mut i = In::new(page);
-        if i.take(8).ok()? != MAGIC || i.u32().ok()? != FORMAT {
+        if i.take(8).ok()? != MAGIC {
+            return None;
+        }
+        let format = i.u32().ok()?;
+        if format != FORMAT && format != FORMAT_SEVEN {
             return None;
         }
         let generation = i.u64().ok()?;
@@ -222,16 +262,19 @@ impl Root {
         }
         let end = i.at();
         let crc = i.u32().ok()?;
-        (crc32fast::hash(&page[..end]) == crc).then_some(Root {
-            generation,
-            pages,
-            span,
-            catalog,
-            orders,
-            free,
-            reused,
-            reused_from,
-        })
+        (crc32fast::hash(&page[..end]) == crc).then_some((
+            Root {
+                generation,
+                pages,
+                span,
+                catalog,
+                orders,
+                free,
+                reused,
+                reused_from,
+            },
+            format,
+        ))
     }
 }
 
@@ -248,6 +291,12 @@ pub trait Place {
     fn reserve(&mut self, pages: u64) -> u64;
     /// Writes bytes at a page already reserved, padded to whole pages.
     fn write_at(&mut self, start: u64, bytes: &[u8]) -> Result<()>;
+
+    /// Whether a run of `pages` reserved next lies in the file that holds `page`.
+    fn lies_with(&self, page: u64, pages: u64) -> bool {
+        let _ = (page, pages);
+        true
+    }
 
     /// Writes bytes at the next free page, padded to whole pages.
     fn place(&mut self, bytes: &[u8]) -> Result<Extent> {
@@ -299,6 +348,8 @@ struct Files {
     first: File,
     rest: RefCell<Vec<Option<File>>>,
     span: Cell<u64>,
+    /// The format the root names, once read.
+    format: Cell<u32>,
     write: bool,
     /// The files written since they last reached the disk.
     dirty: RefCell<BTreeSet<u64>>,
@@ -317,6 +368,7 @@ impl Files {
             first,
             rest: RefCell::new(Vec::new()),
             span: Cell::new(0),
+            format: Cell::new(FORMAT),
             write,
             dirty: RefCell::new(BTreeSet::new()),
         })
@@ -592,8 +644,9 @@ impl Reader {
     pub fn root(&self) -> Result<Root> {
         let from = self.round.get().unwrap_or(0);
         crate::lock::hold_generations_from(&self.files.first, from)?;
-        let root = newer(&self.read(0, 2)?)?;
+        let (root, format) = newer(&self.read(0, 2)?)?;
         self.files.span.set(root.span);
+        self.files.format.set(format);
         crate::lock::keep_generation(&self.files.first, from, root.generation)?;
         self.round.set(Some(root.generation));
         self.forget_reused(&root);
@@ -605,8 +658,9 @@ impl Reader {
     /// The round holds the generation it held, older, so no page the newest root names is freed while
     /// the reader reads it.
     pub fn peek_root(&self) -> Result<Root> {
-        let root = newer(&self.read(0, 2)?)?;
+        let (root, format) = newer(&self.read(0, 2)?)?;
         self.files.span.set(root.span);
+        self.files.format.set(format);
         self.forget_reused(&root);
         Ok(root)
     }
@@ -643,14 +697,36 @@ impl Reader {
     pub fn file(&self) -> &File {
         &self.files.first
     }
+
+    /// The format the root last read names.
+    pub fn format(&self) -> u32 {
+        self.files.format.get()
+    }
 }
 
-/// The newer of the root's two copies, given as the file's first two pages, that is whole.
-fn newer(both: &[u8]) -> Result<Root> {
+/// The newer of the root's two copies, given as the file's first two pages, that is whole, and its
+/// format. A file whose root names a format this build does not read is refused by that format.
+fn newer(both: &[u8]) -> Result<(Root, u32)> {
     match (Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])) {
-        (Some(a), Some(b)) => Ok(if a.generation >= b.generation { a } else { b }),
+        (Some(a), Some(b)) => Ok(if a.0.generation >= b.0.generation {
+            a
+        } else {
+            b
+        }),
         (Some(r), None) | (None, Some(r)) => Ok(r),
-        (None, None) => Err(Error::new("neither copy of the root is whole")),
+        (None, None) => {
+            for copy in [&both[..PAGE], &both[PAGE..]] {
+                if copy[..8] == MAGIC {
+                    let format = u32::from_le_bytes(copy[8..12].try_into().unwrap());
+                    if format != FORMAT && format != FORMAT_SEVEN {
+                        return Err(Error::new(format!(
+                            "the snail is of format {format}, and this warren-snail reads formats {FORMAT_SEVEN} and {FORMAT}"
+                        )));
+                    }
+                }
+            }
+            Err(Error::new("neither copy of the root is whole"))
+        }
     }
 }
 
@@ -701,8 +777,9 @@ impl Writer {
         let files = Files::open(path, true, false)?;
         let mut both = vec![0u8; 2 * PAGE];
         files.first.read_exact_at(&mut both, 0)?;
-        let root = newer(&both)?;
+        let (root, format) = newer(&both)?;
         files.span.set(root.span);
+        files.format.set(format);
         Ok((
             Writer {
                 files,
@@ -744,6 +821,16 @@ impl Writer {
         &self.files.first
     }
 
+    /// The format the snail is written in: a new snail's, or the one its root names.
+    pub fn format(&self) -> u32 {
+        self.files.format.get()
+    }
+
+    /// Makes a new snail in another format this build writes.
+    pub(crate) fn set_format(&mut self, format: u32) {
+        self.files.format.set(format);
+    }
+
     /// Whether `pages` pages from `at` lie in one file. A run longer than a file lies across files.
     fn in_one_file(&self, at: u64, pages: u64) -> bool {
         let span = self.files.span.get();
@@ -770,6 +857,25 @@ impl Writer {
         std::mem::take(&mut self.taken)
     }
 
+    /// The page a run of `pages` reserved now would begin on.
+    fn lands(&self, pages: u64) -> u64 {
+        for &(s, n) in &self.free {
+            let at = if self.in_one_file(s, pages) {
+                s
+            } else {
+                self.next_file(s)
+            };
+            if at + pages <= s + n {
+                return at;
+            }
+        }
+        if self.in_one_file(self.next, pages) {
+            self.next
+        } else {
+            self.next_file(self.next)
+        }
+    }
+
     /// Writes bytes past the file's last page, never into a free run.
     pub fn place_end(&mut self, bytes: &[u8]) -> Result<Extent> {
         let start = self.next;
@@ -783,6 +889,11 @@ impl Writer {
 }
 
 impl Place for Writer {
+    fn lies_with(&self, page: u64, pages: u64) -> bool {
+        let span = self.files.span.get();
+        span == 0 || self.lands(pages) / span == page / span
+    }
+
     fn reserve(&mut self, pages: u64) -> u64 {
         // The first free run with room for the pages in one file.
         for i in 0..self.free.len() {
@@ -832,7 +943,7 @@ impl Writer {
         root.pages = self.next;
         root.span = self.files.span.get();
         self.files.sync()?;
-        let bytes = root.encode()?;
+        let bytes = root.encode(self.files.format.get())?;
         match self.stop {
             Some(Stop::BeforeRoot) => return Err(Error::new("the commit stopped before the root")),
             Some(Stop::HalfRoot) => {
@@ -880,9 +991,10 @@ mod tests {
             reused: vec![(6, 4, 1), (7, 5, 2)],
             reused_from: 5,
         };
-        let mut a = r.encode().unwrap();
+        let mut a = r.encode(FORMAT).unwrap();
         a.resize(PAGE, 0);
-        let back = Root::decode(&a).unwrap();
+        let (back, format) = Root::decode(&a).unwrap();
+        assert_eq!(format, FORMAT);
         assert_eq!((back.generation, back.span), (7, 64));
         assert_eq!(back.orders[0].2.pages(), 2);
         assert_eq!(
@@ -902,6 +1014,25 @@ mod tests {
             },
         ];
         assert_eq!(decode_runs(&encode_runs(&runs)).unwrap(), runs);
+        let spent = [(12, 2), (40, 1)];
+        assert_eq!(
+            decode_free(&encode_free(&runs, &spent, FORMAT), FORMAT).unwrap(),
+            (runs.to_vec(), spent.to_vec())
+        );
+        assert_eq!(
+            decode_free(&encode_free(&runs, &[], FORMAT_SEVEN), FORMAT_SEVEN).unwrap(),
+            (runs.to_vec(), Vec::new())
+        );
+        // A root of format 7 is read as one; of another format, the file is refused by its format.
+        let mut seven = r.encode(FORMAT_SEVEN).unwrap();
+        seven.resize(PAGE, 0);
+        assert_eq!(Root::decode(&seven).unwrap().1, FORMAT_SEVEN);
+        let mut nine = r.encode(9).unwrap();
+        nine.resize(PAGE, 0);
+        let mut both = nine.clone();
+        both.extend_from_slice(&nine);
+        let e = newer(&both).unwrap_err().to_string();
+        assert!(e.contains("format 9"), "{e}");
         a[20] ^= 1;
         assert!(Root::decode(&a).is_none());
     }

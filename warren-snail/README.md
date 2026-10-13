@@ -33,7 +33,8 @@ nothing else; `cargo uninstall warren-snail` takes it out again. The library is 
 
 A snail is the file you name; past 1 GiB, Parquet's size for one file of huge data, it goes on
 into `<file>.1`, `<file>.2` and on beside it. The snail is those files and nothing else: deleting
-them deletes it.
+them deletes it. A snail made since 0.1.1 is of format 8, which 0.1.0 does not open; one 0.1.0 made,
+of format 7, is opened and written in its own format.
 
 ## A first snail
 
@@ -204,9 +205,10 @@ The answer, 2, came from the directory's counts: no column page was read.
 the blocks it read.
 
 **Where it stops.** The counts are kept down to the place that holds about a page. Below that,
-each page names the first key it holds, so a block read in part reads the pages from the first
-that may hold the question's rows to the last. A condition on a column outside the key reads that
-column's pages to test it.
+each page names the first key it holds, in its block's page map, which shares a page with the maps
+of the blocks beside it, so a block read in part reads the pages from the first that may hold the
+question's rows to the last. A condition on a column outside the key reads that column's pages to
+test it.
 
 ## Every order priced, the cheapest read
 

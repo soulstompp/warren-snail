@@ -3,7 +3,7 @@
 
 use super::{Snail, Wasted};
 use crate::catalog::{ColumnType, Level, Table};
-use crate::directory::{decode_page, ColumnPages, Entry, Head, PageMap};
+use crate::directory::{decode_page, read_map, ColumnPages, Entry, Head, PageMap};
 use crate::encode::{decode, descriptor};
 use crate::values::Values;
 use crate::{Error, Result};
@@ -162,7 +162,7 @@ impl Snail {
         let (head, blocks) = self.blocks_of(&self.catalog.tables[ti], oi)?;
         let mut out = Vec::new();
         for e in blocks {
-            let map = PageMap::decode(&self.reader.read_extent(e.child)?, &head.level_text)?;
+            let map = read_map(&self.reader, &e, &head.level_text)?;
             if !map.dead.is_empty() || map.sorted < map.rows() {
                 out.push(Wasted {
                     table: ti,
@@ -214,7 +214,7 @@ impl Snail {
         // groups, each within the span where its row groups allow, as Parquet's rule for huge data has it.
         let maps = blocks
             .iter()
-            .map(|e| PageMap::decode(&self.reader.read_extent(e.child)?, &head.level_text))
+            .map(|e| read_map(&self.reader, e, &head.level_text))
             .collect::<Result<Vec<_>>>()?;
         let bytes = |map: &PageMap| -> u64 {
             map.columns

@@ -170,11 +170,21 @@ impl Walk {
     }
 
     /// The directory pages the round reads next, under the entries left open: a directory page each
-    /// above the blocks, and each block's page map at them.
+    /// above the blocks, and the pages that hold the blocks' page maps at them, each once.
     pub fn below(&self) -> impl Iterator<Item = u64> + '_ {
-        self.open
+        let pages: std::collections::BTreeSet<u64> = self
+            .open
             .iter()
-            .flat_map(|o| o.entry.child.start..o.entry.child.start + o.entry.child.pages())
+            .flat_map(|o| {
+                let run = if self.level == 1 {
+                    o.entry.map_run().0
+                } else {
+                    o.entry.child
+                };
+                run.start..run.start + run.pages()
+            })
+            .collect();
+        pages.into_iter()
     }
 }
 
@@ -380,11 +390,19 @@ impl Snail {
     pub(super) fn predict(&self, mut walk: Walk, want: &Want) -> Result<Plan> {
         let mut column_pages = 0u64;
         let mut reads = Vec::with_capacity(walk.open.len());
+        // The pages that hold the page maps last read: blocks side by side share them.
+        let mut held: Option<(u64, Vec<u8>)> = None;
         for o in std::mem::take(&mut walk.open) {
             let (m, lo, hi, j) = (walk.m, &walk.lo, &walk.hi, walk.keyed);
             let b = &o.entry;
-            let map = PageMap::decode(&self.reader.read_extent(b.child)?, &walk.head.level_text)?;
-            walk.directory_pages += b.child.pages();
+            let (run, at) = b.map_run();
+            let pages = run.pages();
+            if !matches!(&held, Some((start, buf)) if *start == run.start && buf.len() as u64 >= pages * crate::cut::PAGE as u64)
+            {
+                held = Some((run.start, self.reader.read(run.start, pages)?));
+                walk.directory_pages += pages;
+            }
+            let map = PageMap::decode(&held.as_ref().unwrap().1[at..], &walk.head.level_text)?;
             let mut block_reads = Vec::new();
             let mut waste = 0u64;
             for &s in &o.slots {

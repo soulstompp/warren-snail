@@ -2,7 +2,7 @@
 //! levels of entries above them until one page holds the top; and each block's page map.
 
 use crate::cut::PAGE;
-use crate::file::{Extent, In, Out};
+use crate::file::{Extent, In, Out, Place, Reader};
 use crate::places::KeyValue;
 use crate::{Error, Result};
 
@@ -343,6 +343,136 @@ pub struct ColumnPages {
     pub pages: Vec<PageEntry>,
 }
 
+/// The bytes a run of page maps begins with, in a snail of the current format: how many maps it holds.
+pub(crate) const MAP_HEAD: usize = 4;
+
+impl Entry {
+    /// Where a block's page map lies: the run of pages that holds it, and where in that run it
+    /// begins. The block's entry names the run's first page, and where the map begins and its bytes
+    /// in the two halves of the bytes it names; a map that begins its run, as every map of format 7
+    /// does, lies alone in it.
+    pub(crate) fn map_run(&self) -> (Extent, usize) {
+        let at = (self.child.bytes >> 32) as usize;
+        let bytes = self.child.bytes & u64::from(u32::MAX);
+        (
+            Extent {
+                start: self.child.start,
+                bytes: at as u64 + bytes,
+            },
+            at,
+        )
+    }
+}
+
+/// What a block's entry names of its page map: the first page of the run that holds it, where in the
+/// run the map begins, and its bytes.
+pub(crate) fn map_child(start: u64, at: usize, bytes: usize) -> Extent {
+    Extent {
+        start,
+        bytes: ((at as u64) << 32) | bytes as u64,
+    }
+}
+
+/// A block's page map, read from the run that holds it.
+pub(crate) fn read_map(reader: &Reader, e: &Entry, level_text: &[u32]) -> Result<PageMap> {
+    let (run, at) = e.map_run();
+    PageMap::decode(&reader.read_extent(run)?[at..], level_text)
+}
+
+/// How many page maps a run holds, from its first bytes: one where the map begins the run.
+pub(crate) fn maps_held(first: &[u8], at: usize) -> u32 {
+    if at == 0 {
+        1
+    } else {
+        u32::from_le_bytes(first[..MAP_HEAD].try_into().unwrap())
+    }
+}
+
+/// Page maps written as they come: in the current format packed whole into shared pages, each page
+/// beginning with how many maps it holds, a map too wide for a page in a run of its own; in format 7
+/// each in pages of its own. A packed page is written once no further map goes into it.
+pub(crate) struct MapPages {
+    packed: bool,
+    open: Option<(u64, Vec<u8>, u32)>,
+    /// The pages the maps take.
+    pub pages: u64,
+}
+
+impl MapPages {
+    pub(crate) fn new(packed: bool) -> MapPages {
+        MapPages {
+            packed,
+            open: None,
+            pages: 0,
+        }
+    }
+
+    /// Places a map of `bytes` bytes, with `data` pages of its block in a run after it where it
+    /// begins a run, or in a run of their own where it is packed after another map; with
+    /// `same_file`, a map is packed after another only where its block's data lies in that file.
+    /// Returns where the map lies, as its entry names it, and the data's first page. `write` writes
+    /// the map once it is known.
+    pub(crate) fn place(
+        &mut self,
+        w: &mut dyn Place,
+        bytes: usize,
+        data: u64,
+        same_file: bool,
+    ) -> Result<(Extent, u64)> {
+        if !self.packed {
+            let map_pages = bytes.div_ceil(PAGE).max(1) as u64;
+            let start = w.reserve(map_pages + data);
+            self.pages += map_pages;
+            return Ok((map_child(start, 0, bytes), start + map_pages));
+        }
+        let room = self.open.as_ref().is_some_and(|(page, buf, _)| {
+            buf.len() + bytes <= PAGE && (!same_file || data == 0 || w.lies_with(*page, data))
+        });
+        if room {
+            let (page, buf, _) = self.open.as_ref().unwrap();
+            let (page, at) = (*page, buf.len());
+            let start = if data > 0 { w.reserve(data) } else { 0 };
+            return Ok((map_child(page, at, bytes), start));
+        }
+        self.finish(w)?;
+        let map_pages = (MAP_HEAD + bytes).div_ceil(PAGE) as u64;
+        let start = w.reserve(map_pages + data);
+        self.pages += map_pages;
+        self.open = Some((start, vec![0u8; MAP_HEAD], 0));
+        Ok((map_child(start, MAP_HEAD, bytes), start + map_pages))
+    }
+
+    /// Writes a map where `place` put it.
+    pub(crate) fn write(&mut self, w: &mut dyn Place, child: Extent, map: &[u8]) -> Result<()> {
+        if !self.packed {
+            return w.write_at(child.start, map);
+        }
+        let (page, buf, n) = self
+            .open
+            .as_mut()
+            .ok_or_else(|| Error::new("a page map was written where none was placed"))?;
+        if *page != child.start || (child.bytes >> 32) as usize != buf.len() {
+            return Err(Error::new(
+                "a page map was written elsewhere than it was placed",
+            ));
+        }
+        buf.extend_from_slice(map);
+        *n += 1;
+        buf[..MAP_HEAD].copy_from_slice(&n.to_le_bytes());
+        Ok(())
+    }
+
+    /// Writes the page being packed.
+    pub(crate) fn finish(&mut self, w: &mut dyn Place) -> Result<()> {
+        if let Some((page, buf, n)) = self.open.take() {
+            if n > 0 {
+                w.write_at(page, &buf)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A block's page map: where each of its columns' pages lie, and which of its rows are dead.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PageMap {
@@ -516,6 +646,58 @@ mod tests {
             chains: vec![(4, ints([12, 7]))],
         };
         assert_eq!(PageMap::decode(&map.encode(), &[0, 0]).unwrap(), map);
+    }
+
+    #[test]
+    fn page_maps_are_packed_whole_into_shared_pages_and_a_wide_one_takes_a_run_of_its_own() {
+        use crate::file::Stage;
+        let reader = Reader::open(std::path::Path::new("/dev/null")).unwrap();
+        let mut w: Stage = reader.stage();
+        let mut maps = MapPages::new(true);
+        // Ten maps of 1,000 bytes: four to a page, past the page's count of them.
+        let small: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i; 1000]).collect();
+        let mut placed = Vec::new();
+        for m in &small {
+            let (child, data) = maps.place(&mut w, m.len(), 2, true).unwrap();
+            maps.write(&mut w, child, m).unwrap();
+            placed.push((child, data));
+        }
+        // A map wider than a page: a run of its own.
+        let wide = vec![9u8; 6000];
+        let (wide_child, _) = maps.place(&mut w, wide.len(), 0, true).unwrap();
+        maps.write(&mut w, wide_child, &wide).unwrap();
+        maps.finish(&mut w).unwrap();
+        let entry = |child: Extent| Entry {
+            child,
+            ..block(1, 1, 0)
+        };
+        let pages: std::collections::BTreeSet<u64> = placed
+            .iter()
+            .map(|(c, _)| entry(*c).map_run().0.start)
+            .collect();
+        assert_eq!(pages.len(), 3);
+        for ((child, _), m) in placed.iter().zip(&small) {
+            let (run, at) = entry(*child).map_run();
+            let buf = reader.read_extent(run).unwrap();
+            assert_eq!(&buf[at..], m.as_slice());
+            assert_eq!(
+                maps_held(&buf, at),
+                if run.start == *pages.last().unwrap() {
+                    2
+                } else {
+                    4
+                }
+            );
+        }
+        let (run, at) = entry(wide_child).map_run();
+        assert_eq!((run.pages(), at), (2, MAP_HEAD));
+        let buf = reader.read_extent(run).unwrap();
+        assert_eq!((maps_held(&buf, at), &buf[at..]), (1, wide.as_slice()));
+        // Unpacked, as format 7 lays them, each map begins a run of its own.
+        let mut seven = MapPages::new(false);
+        let (child, data) = seven.place(&mut w, 1000, 2, true).unwrap();
+        seven.write(&mut w, child, &small[0]).unwrap();
+        assert_eq!((entry(child).map_run().1, data), (0, child.start + 1));
     }
 
     #[test]

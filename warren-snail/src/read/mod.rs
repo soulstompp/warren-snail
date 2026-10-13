@@ -26,7 +26,7 @@ pub use question::instant;
 
 use crate::catalog::{Catalog, Table};
 use crate::cut::PAGE;
-use crate::directory::{decode_page, PageMap};
+use crate::directory::{decode_page, maps_held, read_map, PageMap};
 use crate::file::{Extent, Reader, Root, Writer};
 use crate::places::{shown, Sublevels};
 use crate::{Error, Result};
@@ -843,6 +843,8 @@ impl Snail {
             Ok(())
         };
         mark(self.root.catalog, 1)?;
+        // Each page of packed page maps: how many maps it holds, and how many entries name one.
+        let mut shared: std::collections::BTreeMap<u64, (u32, u32)> = Default::default();
         for table in &self.catalog.tables {
             for (oi, order) in table.orders.iter().enumerate() {
                 let (_, _, top) = self
@@ -862,9 +864,25 @@ impl Snail {
                     level = below;
                 }
                 for b in &level {
-                    mark(b.child, 1)?;
-                    let map =
-                        PageMap::decode(&self.reader.read_extent(b.child)?, &head.level_text)?;
+                    let (run, at) = b.map_run();
+                    let buf = self.reader.read_extent(run)?;
+                    match maps_held(&buf, at) {
+                        1 => mark(run, 1)?,
+                        n => {
+                            let s = shared.entry(run.start).or_insert((n, 0));
+                            if s.1 == 0 {
+                                mark(
+                                    Extent {
+                                        start: run.start,
+                                        bytes: PAGE as u64,
+                                    },
+                                    1,
+                                )?;
+                            }
+                            s.1 += 1;
+                        }
+                    }
+                    let map = PageMap::decode(&buf[at..], &head.level_text)?;
                     for c in &map.columns {
                         if let Some(d) = c.dictionary {
                             mark(d, 1)?;
@@ -876,9 +894,32 @@ impl Snail {
                 }
             }
         }
-        if self.root.free.bytes > 0 {
+        let (runs, spent) = if self.root.free.bytes > 0 {
             mark(self.root.free, 1)?;
-            for r in crate::file::decode_runs(&self.reader.read_extent(self.root.free)?)? {
+            crate::file::decode_free(
+                &self.reader.read_extent(self.root.free)?,
+                self.reader.format(),
+            )?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        // Every page of packed maps names each map it holds once: by a block's entry, or as spent.
+        let spent: std::collections::BTreeMap<u64, u32> = spent.into_iter().collect();
+        for (page, &(held, named)) in &shared {
+            let gone = spent.get(page).copied().unwrap_or(0);
+            if named + gone != held {
+                return Err(Error::new(format!(
+                    "page {page} holds {held} page maps: {named} named and {gone} spent"
+                )));
+            }
+        }
+        if let Some(page) = spent.keys().find(|p| !shared.contains_key(p)) {
+            return Err(Error::new(format!(
+                "page {page} is spent, and holds no page map named"
+            )));
+        }
+        {
+            for r in runs {
                 mark(
                     Extent {
                         start: r.start,
@@ -916,8 +957,8 @@ impl Snail {
                     let place: Vec<i64> = (0..b.depth as usize)
                         .map(|r| sublevels.value(&b.first, r))
                         .collect();
-                    let map =
-                        PageMap::decode(&self.reader.read_extent(b.child)?, &head.level_text)?;
+                    let map = read_map(&self.reader, b, &head.level_text)?;
+                    let (map_run, _) = b.map_run();
                     for (s, &c) in order.columns.iter().enumerate() {
                         let cp = &map.columns[s];
                         out.push(BlockRow {
@@ -929,7 +970,7 @@ impl Snail {
                             first: shown(&b.first),
                             last: shown(&b.last),
                             rows: b.rows as u64,
-                            map_pages: b.child.pages(),
+                            map_pages: map_run.pages(),
                             column: table.columns[c].name.clone(),
                             k: head.units[s] as u64,
                             dictionary_pages: cp.dictionary.map_or(0, Extent::pages),
@@ -949,7 +990,7 @@ impl Snail {
                             files: {
                                 let span = self.root.span.max(1);
                                 let mut files = std::collections::BTreeSet::new();
-                                for e in [b.child]
+                                for e in [map_run]
                                     .into_iter()
                                     .chain(cp.dictionary)
                                     .chain(cp.pages.iter().map(|p| p.at))

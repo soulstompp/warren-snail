@@ -10,11 +10,13 @@ use super::{Snail, Wasted};
 use crate::catalog::{Catalog, ColumnType, Order, Table};
 use crate::cut::ROW_GROUP_ROWS;
 use crate::directory::{
-    build_from, decode_page, decode_top, encode_page, encode_top, pack, Entry, Head, PageEntry,
-    PageMap,
+    build_from, decode_page, decode_top, encode_page, encode_top, map_child, maps_held, pack,
+    read_map, Entry, Head, MapPages, PageEntry, PageMap, MAP_HEAD,
 };
 use crate::encode::{decode, descriptor, tail_pages};
-use crate::file::{decode_runs, encode_runs, Extent, Place, Root, Run, Writer, STAGED};
+use crate::file::{
+    decode_free, encode_free, Extent, Place, Root, Run, Writer, FORMAT_SEVEN, STAGED,
+};
 use crate::lock;
 
 /// The runs of reused pages the root names, at most.
@@ -444,11 +446,12 @@ impl Snail {
         let generation = root.generation + 1;
         // The free map: its runs whose tag no older round still runs under are free now, and the
         // commit takes pages from the free runs first.
-        let mut runs = if root.free.bytes > 0 {
-            decode_runs(&self.reader.read_extent(root.free)?)?
+        let (mut runs, mut spent) = if root.free.bytes > 0 {
+            decode_free(&self.reader.read_extent(root.free)?, w.format())?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        let mut maps = MapPages::new(w.format() != FORMAT_SEVEN);
         let mut gone: Vec<Extent> = Vec::new();
         if root.free.bytes > 0 {
             gone.push(root.free);
@@ -535,11 +538,13 @@ impl Snail {
                 if let Some(first) = &b.head {
                     head = first.clone();
                 }
-                let entries = b
+                let (entries, held): (Vec<Entry>, Vec<Vec<Extent>>) = b
                     .entries
                     .into_iter()
-                    .map(|e| self.relocate(w, &head, e))
-                    .collect::<Result<Vec<_>>>()?;
+                    .map(|e| self.relocate(w, &head, e, &mut maps))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .unzip();
                 if b.child == Extent::default() {
                     if !top.entries.is_empty() {
                         return Err(Error::new(format!(
@@ -561,19 +566,33 @@ impl Snail {
                     )));
                 }
                 // The block's pages the entries standing for it now no longer name.
-                let kept: std::collections::HashSet<u64> = entries
-                    .iter()
-                    .map(|e| self.extents(&head, e))
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .map(|e| e.start)
-                    .collect();
+                let kept: std::collections::HashSet<u64> =
+                    held.into_iter().flatten().map(|e| e.start).collect();
                 gone.extend(
                     self.extents(&head, &was)?
                         .into_iter()
                         .filter(|e| !kept.contains(&e.start)),
                 );
+                // A page of packed maps is freed once the last of its maps is replaced.
+                if let Some((page, n)) = self.shared_map(&was)? {
+                    if !entries.iter().any(|e| e.child == was.child) {
+                        let i = match spent.iter().position(|&(p, _)| p == page) {
+                            Some(i) => i,
+                            None => {
+                                spent.push((page, 0));
+                                spent.len() - 1
+                            }
+                        };
+                        spent[i].1 += 1;
+                        if spent[i].1 == n {
+                            spent.remove(i);
+                            gone.push(Extent {
+                                start: page,
+                                bytes: crate::cut::PAGE as u64,
+                            });
+                        }
+                    }
+                }
                 replaced.insert(path, entries);
             }
             settle(&mut top, &mut Vec::new(), &replaced, w, &mut gone)?;
@@ -581,6 +600,8 @@ impl Snail {
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| w.place(x))?;
             root.orders[at].2 = w.place(&bytes)?;
         }
+        maps.finish(w)?;
+        spent.sort_unstable();
         // The free map as it stands now: the runs left free, those still waiting, and the pages
         // this generation stops naming, tagged with it.
         let mut map: Vec<Run> = w
@@ -606,10 +627,10 @@ impl Snail {
                 _ => runs.push(r),
             }
         }
-        root.free = if runs.is_empty() {
+        root.free = if runs.is_empty() && spent.is_empty() {
             Extent::default()
         } else {
-            w.place_end(&encode_runs(&runs))?
+            w.place_end(&encode_free(&runs, &spent, w.format()))?
         };
         for (start, pages) in w.taken() {
             self.reused += pages;
@@ -624,10 +645,16 @@ impl Snail {
         Ok(root)
     }
 
-    /// Every page an entry's block holds: its page map, and each column's dictionary and pages.
+    /// Every page an entry's block holds alone: its page map's run where the map lies alone in it, and
+    /// each column's dictionary and pages.
     fn extents(&self, head: &Head, e: &Entry) -> Result<Vec<Extent>> {
-        let map = PageMap::decode(&self.reader.read_extent(e.child)?, &head.level_text)?;
-        let mut out = vec![e.child];
+        let (run, at) = e.map_run();
+        let buf = self.reader.read_extent(run)?;
+        let map = PageMap::decode(&buf[at..], &head.level_text)?;
+        let mut out = Vec::new();
+        if maps_held(&buf, at) == 1 {
+            out.push(run);
+        }
         for c in &map.columns {
             out.extend(c.dictionary);
             out.extend(c.pages.iter().map(|p| p.at));
@@ -635,20 +662,47 @@ impl Snail {
         Ok(out)
     }
 
-    /// An entry whose pages are staged, its pages written into the file and its page map with them.
-    fn relocate(&self, w: &mut Writer, head: &Head, mut e: Entry) -> Result<Entry> {
-        if e.child.start < STAGED {
-            return Ok(e);
+    /// The page a block's page map shares with others, and how many maps it holds; none where the
+    /// map lies alone in its run.
+    fn shared_map(&self, e: &Entry) -> Result<Option<(u64, u32)>> {
+        let (run, at) = e.map_run();
+        if at == 0 {
+            return Ok(None);
         }
-        let mut map = PageMap::decode(&self.reader.read_extent(e.child)?, &head.level_text)?;
+        let first = self.reader.read_extent(Extent {
+            start: run.start,
+            bytes: MAP_HEAD as u64,
+        })?;
+        Ok(match maps_held(&first, at) {
+            1 => None,
+            n => Some((run.start, n)),
+        })
+    }
+
+    /// An entry whose pages are staged, its pages written into the file and its page map with them:
+    /// packed with the other maps the commit writes, where the snail packs its maps. Returns the
+    /// entry, and the pages its block holds alone, as `extents` gives them.
+    fn relocate(
+        &self,
+        w: &mut Writer,
+        head: &Head,
+        mut e: Entry,
+        maps: &mut MapPages,
+    ) -> Result<(Entry, Vec<Extent>)> {
+        if e.child.start < STAGED {
+            let held = self.extents(head, &e)?;
+            return Ok((e, held));
+        }
+        let mut map = read_map(&self.reader, &e, &head.level_text)?;
         let whole = map.columns.iter().all(|c| {
             c.dictionary.is_none_or(|d| d.start >= STAGED)
                 && c.pages.iter().all(|p| p.at.start >= STAGED)
         });
         if whole {
             // A block written whole lies in one run, in one file, its page map first and its columns
-            // after it, as a write lays a block out.
-            let map_pages = e.child.pages().max(1);
+            // after it, as a write lays a block out, the map alone at the run's start.
+            let bytes = map.encode().len();
+            let map_pages = bytes.div_ceil(crate::cut::PAGE).max(1) as u64;
             let data: u64 = map
                 .columns
                 .iter()
@@ -675,17 +729,21 @@ impl Snail {
                 }
             }
             let encoded = map.encode();
-            if encoded.len().div_ceil(crate::cut::PAGE).max(1) as u64 != map_pages {
+            if encoded.len() != bytes {
                 return Err(Error::new(
                     "a page map changed its size when its block moved",
                 ));
             }
             w.write_at(start, &encoded)?;
-            e.child = Extent {
-                start,
-                bytes: encoded.len() as u64,
-            };
-            return Ok(e);
+            e.child = map_child(start, 0, bytes);
+            let held = std::iter::once(e.map_run().0)
+                .chain(
+                    map.columns
+                        .iter()
+                        .flat_map(|c| c.dictionary.into_iter().chain(c.pages.iter().map(|p| p.at))),
+                )
+                .collect();
+            return Ok((e, held));
         }
         let mut copy = |x: Extent| -> Result<Extent> {
             if x.start < STAGED {
@@ -702,8 +760,17 @@ impl Snail {
                 p.at = copy(p.at)?;
             }
         }
-        e.child = w.place(&map.encode())?;
-        Ok(e)
+        let encoded = map.encode();
+        let (child, _) = maps.place(w, encoded.len(), 0, false)?;
+        maps.write(w, child, &encoded)?;
+        e.child = child;
+        let held = map
+            .columns
+            .iter()
+            .flat_map(|c| c.dictionary.into_iter().chain(c.pages.iter().map(|p| p.at)))
+            .chain((e.map_run().1 == 0).then(|| e.map_run().0))
+            .collect();
+        Ok((e, held))
     }
 
     /// Notes that a block of an order is replaced by `new`: either a block the transaction began from,
@@ -1069,7 +1136,7 @@ impl Snail {
         effects: Vec<Effect>,
         rewrite: bool,
     ) -> Result<(Vec<Entry>, bool)> {
-        let mut map = PageMap::decode(&self.reader.read_extent(entry.child)?, &head.level_text)?;
+        let mut map = read_map(&self.reader, entry, &head.level_text)?;
         let positions = map.rows() as usize;
         let descs = order
             .columns
@@ -1374,6 +1441,7 @@ impl Snail {
                 &month_slots,
                 &text_slots,
                 &[],
+                &mut MapPages::new(false),
             )?;
             entries.push(entry);
         }
