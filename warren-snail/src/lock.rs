@@ -15,6 +15,14 @@ const GENERATION_BYTES: u64 = 1 << 58;
 /// The bytes of the blocks, one a block, as its order and first key fall.
 const BLOCKS: u64 = 1 << 61;
 const BLOCK_BYTES: u64 = 1 << 40;
+/// The bytes of the writers, one a writer open on the file, by its slot.
+#[cfg(feature = "standalone")]
+const WRITERS: u64 = 1 << 59;
+const WRITER_SLOTS: u64 = 1 << 16;
+/// A byte for each block and slot: the writer in that slot holds the block.
+const HOLDS: u64 = 1 << 62;
+/// A byte for each slot and block: the writer in that slot waits for the block.
+const WAITS: u64 = (1 << 62) + (1 << 61);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -115,10 +123,106 @@ pub fn older_held(file: &File, generation: u64) -> Result<bool> {
     Ok(f.l_type != libc::F_UNLCK as libc::c_short)
 }
 
+/// A hash of bytes that is the same in every build: FNV-1a, 64 bits.
+#[derive(Clone, Copy)]
+struct Fnv(u64);
+
+impl Default for Fnv {
+    fn default() -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl std::hash::Hasher for Fnv {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// The byte of a block's lock: its table, order and first key, as they fall among the block bytes.
 pub fn block_byte(key: &impl std::hash::Hash) -> u64 {
-    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
-    BLOCKS + BuildHasherDefault::<DefaultHasher>::default().hash_one(key) % BLOCK_BYTES
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    BLOCKS + BuildHasherDefault::<Fnv>::default().hash_one(key) % BLOCK_BYTES
+}
+
+/// The byte of a block's lock from its table's and order's places in the catalog and its first
+/// key's bytes, the same in every build of this version.
+pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::KeyValue]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = Fnv::default();
+    h.write(&(table as u64).to_le_bytes());
+    h.write(&(order as u64).to_le_bytes());
+    for v in key {
+        match v {
+            crate::places::KeyValue::Int(x) => {
+                h.write(&[0]);
+                h.write(&x.to_le_bytes());
+            }
+            crate::places::KeyValue::Text(s) => {
+                h.write(&[1]);
+                h.write(&(s.len() as u64).to_le_bytes());
+                h.write(s.as_bytes());
+            }
+        }
+    }
+    BLOCKS + h.finish() % BLOCK_BYTES
+}
+
+/// Takes a slot for a writer open on the file, held until the file is closed: the first slot no
+/// other writer holds.
+#[cfg(feature = "standalone")]
+pub(crate) fn take_slot(file: &File) -> Result<u64> {
+    for s in 0..WRITER_SLOTS {
+        if take(file, Kind::Alone, WRITERS + s, 1, false)? {
+            return Ok(s);
+        }
+    }
+    Err(Error::new("every writer's slot on the file is taken"))
+}
+
+/// Marks that the writer in `slot` holds the block of lock byte `byte`, or no longer does.
+pub(crate) fn mark_held(file: &File, slot: u64, byte: u64, held: bool) -> Result<()> {
+    let at = HOLDS + ((byte - BLOCKS) << 16) + slot;
+    if held {
+        take(file, Kind::Alone, at, 1, false).map(|_| ())
+    } else {
+        give(file, at, 1)
+    }
+}
+
+/// Marks that the writer in `slot` waits for the block of lock byte `byte`, or no longer does.
+pub(crate) fn mark_waiting(file: &File, slot: u64, byte: u64, waits: bool) -> Result<()> {
+    let at = WAITS + (slot << 40) + (byte - BLOCKS);
+    if waits {
+        take(file, Kind::Alone, at, 1, false).map(|_| ())
+    } else {
+        give(file, at, 1)
+    }
+}
+
+/// The first of another file's locks on `start..start + len`, as its first byte's place in the run.
+fn first_held(file: &File, start: u64, len: u64) -> Result<Option<u64>> {
+    let mut f = flock(libc::F_WRLCK as libc::c_short, start, len);
+    fcntl(file, libc::F_OFD_GETLK, &mut f)
+        .map_err(|e| Error::new(format!("a test of the file's locks: {e}")))?;
+    Ok((f.l_type != libc::F_UNLCK as libc::c_short).then(|| f.l_start as u64 - start))
+}
+
+/// The slot of the other writer that holds the block of lock byte `byte`, if one does.
+pub(crate) fn holder(file: &File, byte: u64) -> Result<Option<u64>> {
+    first_held(file, HOLDS + ((byte - BLOCKS) << 16), WRITER_SLOTS)
+}
+
+/// The lock byte of the block the writer in another file's `slot` waits for, if it waits.
+pub(crate) fn awaited(file: &File, slot: u64) -> Result<Option<u64>> {
+    Ok(first_held(file, WAITS + (slot << 40), BLOCK_BYTES)?.map(|b| BLOCKS + b))
 }
 
 /// Locks a block to change it, waiting while another writer has it, or, where `wait` is false,
@@ -213,5 +317,49 @@ mod tests {
         unlock_block(&a, x).unwrap();
         assert!(lock_block(&b, x, false).unwrap());
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// The lock byte of block (5, 'x') of the third order of the second table.
+    const GOLDEN: u64 = 2_305_843_784_697_650_849;
+
+    #[test]
+    #[cfg(feature = "standalone")]
+    fn a_writers_marks_tell_another_who_holds_a_block_and_what_it_waits_for() {
+        use crate::places::KeyValue;
+        let (path, a, b) = file("marks");
+        // A writer before them takes the first slot.
+        let (_, first, _) = file("marks");
+        take_slot(&first).unwrap();
+        let (sa, sb) = (take_slot(&a).unwrap(), take_slot(&b).unwrap());
+        assert!(sa > 0 && sb > 0);
+        assert_ne!(sa, sb);
+        let x = block_byte_of(0, 0, &[KeyValue::Int(5)]);
+        let y = block_byte_of(0, 0, &[KeyValue::Int(6)]);
+        mark_held(&a, sa, x, true).unwrap();
+        assert_eq!(
+            (holder(&b, x).unwrap(), holder(&b, y).unwrap()),
+            (Some(sa), None)
+        );
+        mark_waiting(&a, sa, y, true).unwrap();
+        assert_eq!(
+            (awaited(&b, sa).unwrap(), awaited(&b, sb).unwrap()),
+            (Some(y), None)
+        );
+        mark_waiting(&a, sa, y, false).unwrap();
+        mark_held(&a, sa, x, false).unwrap();
+        assert_eq!(
+            (holder(&b, x).unwrap(), awaited(&b, sa).unwrap()),
+            (None, None)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_blocks_lock_byte_is_the_same_in_every_build() {
+        use crate::places::KeyValue;
+        assert_eq!(
+            block_byte_of(1, 2, &[KeyValue::Int(5), KeyValue::Text("x".into())]),
+            GOLDEN
+        );
     }
 }

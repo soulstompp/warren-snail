@@ -517,6 +517,18 @@ impl Reader {
         *self.staged.borrow_mut() = Staged::default();
     }
 
+    /// Where the pages staged so far end, for `staged_back_to`.
+    pub(crate) fn staged_mark(&self) -> u64 {
+        self.staged.borrow().next
+    }
+
+    /// Drops the pages staged since `mark`.
+    pub(crate) fn staged_back_to(&self, mark: u64) {
+        let mut s = self.staged.borrow_mut();
+        s.pages.split_off(&(STAGED + mark));
+        s.next = mark;
+    }
+
     pub fn read(&self, start: u64, pages: u64) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; pages as usize * PAGE];
         if start >= STAGED {
@@ -857,17 +869,21 @@ impl Writer {
         std::mem::take(&mut self.taken)
     }
 
+    /// Where a run of `pages` lies in the free run `(s, n)`, where it has room: at its start, or at
+    /// the first page of the next file where a run from its start would cross into it.
+    fn fits(&self, (s, n): (u64, u64), pages: u64) -> Option<u64> {
+        let at = if self.in_one_file(s, pages) {
+            s
+        } else {
+            self.next_file(s)
+        };
+        (at + pages <= s + n).then_some(at)
+    }
+
     /// The page a run of `pages` reserved now would begin on.
     fn lands(&self, pages: u64) -> u64 {
-        for &(s, n) in &self.free {
-            let at = if self.in_one_file(s, pages) {
-                s
-            } else {
-                self.next_file(s)
-            };
-            if at + pages <= s + n {
-                return at;
-            }
+        if let Some(at) = self.free.iter().find_map(|&r| self.fits(r, pages)) {
+            return at;
         }
         if self.in_one_file(self.next, pages) {
             self.next
@@ -898,12 +914,7 @@ impl Place for Writer {
         // The first free run with room for the pages in one file.
         for i in 0..self.free.len() {
             let (s, n) = self.free[i];
-            let at = if self.in_one_file(s, pages) {
-                s
-            } else {
-                self.next_file(s)
-            };
-            if at + pages <= s + n {
+            if let Some(at) = self.fits((s, n), pages) {
                 let (before, after) = ((s, at - s), (at + pages, s + n - at - pages));
                 self.free.remove(i);
                 for r in [after, before] {

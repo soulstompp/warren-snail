@@ -323,7 +323,7 @@ COMMIT;
 ```
 
 ```text
-6 statements, 57 pages written, generation 6
+6 statements, 50 pages written, generation 6
 ```
 
 Each customer's orders afterwards:
@@ -339,19 +339,24 @@ GROUP BY o.customer_id ORDER BY o.customer_id
 | 7 | 3 | 43.00 |
 
 **Where it stops.** A writer locks the blocks it writes, never the file, so writers of different
-blocks commit side by side; writers of one block take turns. Inside a transaction, a writer that
-already holds blocks tries for another for ten seconds, then gives up, so two writers never wait on
-each other forever. A read that pays a page or more of a block only for its dead rows, or for rows
-written after its last, prunes it as the round ends, on a snail open to write: the block is written
-again, in order and without its dead rows. A page the newest
-root no longer names is freed once no older round still reads it, and reused:
+blocks commit side by side; writers of one block take turns, waiting as long as it takes. Each
+statement reads what was committed when it began, and in a transaction its transaction's own changes
+with it, as PostgreSQL's READ COMMITTED has it. A statement that waited for a block takes the rows it
+found again in their newest versions, and only those still meeting its conditions. Writers that
+wait in a ring, each for a block the next holds, fail one of their transactions with `deadlock
+detected`; a transaction one of whose statements failed takes nothing but its end, which rolls it
+back. A writer of 0.1.0 and one of a later version never write one snail at once: their block locks
+lie on different bytes. A read that pays a page or more of a block only for its dead rows, or for
+rows written after its last, prunes it as the round ends, on a snail open to write: the block is
+written again, in order and without its dead rows. A page the newest root no longer names is freed
+once no older round still reads it, and reused:
 
 ```sh
 warren-snail census shop.snail
 ```
 
 ```text
-generation 6: 28 pages named, 0 free, 17 waiting to be freed
+generation 6: 26 pages named, 0 free, 15 waiting to be freed
 ```
 
 ## Parquet, out and back in

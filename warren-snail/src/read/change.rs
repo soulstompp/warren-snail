@@ -7,7 +7,7 @@
 
 use super::statement::{self, Datum, Fill, Row, Source, Statement};
 use super::{Snail, Wasted};
-use crate::catalog::{Catalog, ColumnType, Order, Table};
+use crate::catalog::{Catalog, ColumnType, Level, Order, Table};
 use crate::cut::ROW_GROUP_ROWS;
 use crate::directory::{
     build_from, decode_page, decode_top, encode_page, encode_top, map_child, maps_held, pack,
@@ -22,9 +22,9 @@ use crate::lock;
 /// The runs of reused pages the root names, at most.
 const REUSED_KEPT: usize = 64;
 
-/// The times a statement is run again on the newest root, at most, when it finds the blocks it
-/// changes written since.
-const RETRIES: u32 = 64;
+/// What a transaction answers once one of its statements failed, until it ends, as PostgreSQL does.
+pub(super) const ABORTED: &str =
+    "current transaction is aborted, commands ignored until end of transaction block";
 use crate::places::{key, month_utc, KeyValue};
 use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, write_block, Laid, Rows};
@@ -55,14 +55,12 @@ pub struct Done {
     pub pages_reused: u64,
 }
 
-/// How a writer takes a block's lock: waiting while another writer has it; at once or not at all;
-/// or, already holding others, trying again for ten seconds, never waiting on a writer that may be
-/// waiting on it.
+/// How a writer takes a block's lock: waiting while another writer has it, as long as it takes,
+/// unless the writers waiting make a ring; or at once or not at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Waiting {
     Wait,
     Try,
-    Retry,
 }
 
 /// One row's change on a table.
@@ -83,12 +81,19 @@ struct Effect {
 
 /// A block a transaction began from, by its first key and its page map then, and the entries that
 /// stand for it now, their pages staged.
+#[derive(Clone)]
 pub(super) struct Rebased {
     first: Vec<KeyValue>,
     child: Extent,
     entries: Vec<Entry>,
     /// For an order that held no row, the head its first rows gave it.
     head: Option<Head>,
+}
+
+/// What a statement under way had staged when it began.
+struct Mark {
+    rebased: BTreeMap<(usize, usize), Vec<Rebased>>,
+    staged: u64,
 }
 
 /// The catalog a statement or a transaction declared: the catalog it began from, its DDL now, and
@@ -260,8 +265,32 @@ impl Snail {
             ));
         }
         let st = statement::parse(&self.catalog, sql)?;
+        // A transaction one of whose statements failed takes no statement but its end, which rolls
+        // it back, as PostgreSQL does.
+        if self.aborted {
+            return match st {
+                Statement::Commit | Statement::Rollback => {
+                    self.begun = None;
+                    self.aborted = false;
+                    Ok(Done {
+                        statement: "ROLLBACK",
+                        generation: self.root.generation,
+                        ..Default::default()
+                    })
+                }
+                _ => Err(Error::new(ABORTED)),
+            };
+        }
+        let writes = !matches!(
+            st,
+            Statement::Begin | Statement::Commit | Statement::Rollback
+        );
+        // Each statement reads what was committed when it began; in a transaction, with the
+        // transaction's own changes in place (PostgreSQL's READ COMMITTED).
         if self.begun.is_none() && self.rounds > 0 {
             self.renew()?;
+        } else if self.begun.is_some() && writes {
+            self.renew_in_transaction()?;
         }
         self.rounds += 1;
         let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);
@@ -269,7 +298,6 @@ impl Snail {
             statement: st.kind(),
             ..Default::default()
         };
-        let mut tries = 0;
         let changed = match st {
             Statement::Begin => {
                 if self.begun.is_some() {
@@ -294,38 +322,34 @@ impl Snail {
                 self.abandon()?;
                 false
             }
-            st => loop {
-                tries += 1;
-                if tries > RETRIES {
-                    self.abandon()?;
-                    return Err(Error::new(
-                        "the blocks the statement changes were written since by other writers, again \
-                         and again",
-                    ));
-                }
-                self.stale = false;
-                match self.write_rows(st.clone(), &mut done) {
-                    Ok(_) if self.stale => {
-                        // A block the statement locked was written since the root it read: on
-                        // its own, it is run again on the newest root; in a transaction, refused.
-                        self.abandon()?;
-                        if self.begun.is_some() {
-                            self.begun = None;
-                            return Err(Error::new(
-                                "a block the transaction changes was written since by another \
-                                 writer: the transaction is rolled back",
-                            ));
+            st => {
+                let mark = self.mark();
+                // The rows the statement found when it began, which it keeps to if it runs again.
+                let mut found = None;
+                loop {
+                    self.stale = false;
+                    match self.write_rows(st.clone(), &mut done, &mut found) {
+                        Ok(_) if self.stale => {
+                            // A block the statement locked was written since the root it read: it
+                            // runs again on the newest root, kept to the rows it found, each in its
+                            // newest version and still meeting its conditions, as PostgreSQL checks
+                            // a row changed meanwhile again. The blocks it locked stay locked.
+                            self.back_to(&mark);
+                            if self.begun.is_some() {
+                                self.renew_in_transaction()?;
+                            } else {
+                                self.renew()?;
+                            }
                         }
-                        self.renew()?;
-                    }
-                    Ok(changed) => break changed,
-                    Err(e) => {
-                        self.abandon()?;
-                        self.begun = None;
-                        return Err(e);
+                        Ok(changed) => break changed,
+                        Err(e) => {
+                            self.abandon()?;
+                            self.aborted = self.begun.is_some();
+                            return Err(e);
+                        }
                     }
                 }
-            },
+            }
         };
         if let Some((_, any)) = self.begun.as_mut() {
             *any |= changed;
@@ -339,13 +363,21 @@ impl Snail {
         Ok(done)
     }
 
-    /// The rows an INSERT, UPDATE or DELETE writes, staged. Returns whether it changed any.
-    fn write_rows(&mut self, st: Statement, done: &mut Done) -> Result<bool> {
+    /// The rows an INSERT, UPDATE or DELETE writes, staged. Returns whether it changed any. `found`
+    /// is the rows the statement found when it began: given, an INSERT writes them again, and an
+    /// UPDATE or a DELETE keeps to the rows it finds now that are those, by the table's key.
+    fn write_rows(
+        &mut self,
+        st: Statement,
+        done: &mut Done,
+        found: &mut Option<Vec<Row>>,
+    ) -> Result<bool> {
         Ok(match st {
             Statement::Insert { table, source } => {
-                let rows = match source {
-                    Source::Values(rows) => rows,
-                    Source::Select { question, fill } => {
+                let rows = match (source, found.as_ref()) {
+                    (_, Some(rows)) => rows.clone(),
+                    (Source::Values(rows), None) => rows,
+                    (Source::Select { question, fill }, None) => {
                         let (batch, _) = self.answer(&question, None)?;
                         rows_of(&batch)?
                             .into_iter()
@@ -360,6 +392,7 @@ impl Snail {
                             .collect()
                     }
                 };
+                *found = Some(rows.clone());
                 done.rows = rows.len() as u64;
                 (done.rewritten, done.orders) =
                     self.apply(table, rows.into_iter().map(Change::Insert).collect())?;
@@ -367,7 +400,7 @@ impl Snail {
             }
             Statement::Update { table, find, sets } => {
                 let (batch, _) = self.answer(&find, None)?;
-                let old = rows_of(&batch)?;
+                let old = self.kept_to(table, rows_of(&batch)?, found);
                 done.rows = old.len() as u64;
                 let changes = old
                     .into_iter()
@@ -384,7 +417,7 @@ impl Snail {
             }
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
-                let old = rows_of(&batch)?;
+                let old = self.kept_to(table, rows_of(&batch)?, found);
                 done.rows = old.len() as u64;
                 (done.rewritten, done.orders) =
                     self.apply(table, old.into_iter().map(Change::Delete).collect())?;
@@ -400,6 +433,114 @@ impl Snail {
         })
     }
 
+    /// The rows an UPDATE or a DELETE finds: the first time, every one, kept as `found`; run again,
+    /// only those whose key, on the table's first unique order of plain columns or else every
+    /// column, is a key it found the first time.
+    fn kept_to(&self, ti: usize, now: Vec<Row>, found: &mut Option<Vec<Row>>) -> Vec<Row> {
+        let Some(first) = found.as_ref() else {
+            *found = Some(now.clone());
+            return now;
+        };
+        let table = &self.catalog.tables[ti];
+        let columns: Vec<usize> = table
+            .orders
+            .iter()
+            .filter(|o| o.unique)
+            .find_map(|o| {
+                o.levels
+                    .iter()
+                    .map(|l| match l {
+                        Level::Column(c) => Some(*c),
+                        Level::MonthUtc(_) => None,
+                    })
+                    .collect::<Option<Vec<usize>>>()
+            })
+            .unwrap_or_else(|| (0..table.columns.len()).collect());
+        let key = |r: &Row| -> Vec<Datum> { columns.iter().map(|&c| r[c].clone()).collect() };
+        let keys: std::collections::HashSet<Vec<Datum>> = first.iter().map(key).collect();
+        now.into_iter().filter(|r| keys.contains(&key(r))).collect()
+    }
+
+    /// Where the statement under way began: what it had staged and the root it read, so that it
+    /// can run again from there.
+    fn mark(&self) -> Mark {
+        Mark {
+            rebased: self.rebased.clone(),
+            staged: self.reader.staged_mark(),
+        }
+    }
+
+    fn back_to(&mut self, mark: &Mark) {
+        self.rebased = mark.rebased.clone();
+        self.reader.staged_back_to(mark.staged);
+    }
+
+    /// What a statement of a transaction reads: the newest root, with the transaction's own changes
+    /// in place of the blocks it changed, each still the block it began from, since the
+    /// transaction holds its lock. A transaction that declared a table reads as it began. Returns
+    /// the pages it read.
+    pub(super) fn renew_in_transaction(&mut self) -> Result<u64> {
+        if self.declared.is_some() {
+            return Ok(0);
+        }
+        let before = self.reader.pages_read();
+        let mut root = self.reader.begin_round()?;
+        if root.generation == self.root.generation {
+            return Ok(self.reader.pages_read() - before);
+        }
+        self.catalog = Snail::catalog(&self.reader, &root)?;
+        let mut stage = self.reader.stage();
+        for ((ti, oi), blocks) in self.rebased.clone() {
+            let table = &self.catalog.tables[ti];
+            let order = &table.orders[oi];
+            let at = root
+                .orders
+                .iter()
+                .position(|(t, o, _)| *t == table.name && *o == order.name)
+                .ok_or_else(|| {
+                    Error::new(format!("{}: the root names no {}", table.name, order.name))
+                })?;
+            let (mut head, entries) = decode_top(&self.reader.read_extent(root.orders[at].2)?)?;
+            let mut top = Node {
+                entries,
+                height: head.height,
+                kids: BTreeMap::new(),
+                at: Extent::default(),
+            };
+            let mut replaced: BTreeMap<Vec<usize>, Vec<Entry>> = BTreeMap::new();
+            for b in blocks {
+                if let Some(first) = &b.head {
+                    head = first.clone();
+                }
+                if b.child == Extent::default() {
+                    top.entries = b.entries;
+                    top.height = 1;
+                    continue;
+                }
+                let mut path = Vec::new();
+                self.locate(&mut top, &head, &b.first, &mut path)?;
+                if entry_at(&top, &path).child != b.child {
+                    return Err(Error::new(format!(
+                        "{}: a block of {} the transaction holds was written by another writer",
+                        table.name, order.name
+                    )));
+                }
+                replaced.insert(path, b.entries);
+            }
+            settle(
+                &mut top,
+                &mut Vec::new(),
+                &replaced,
+                &mut stage,
+                &mut Vec::new(),
+            )?;
+            let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| stage.place(x))?;
+            root.orders[at].2 = stage.place(&bytes)?;
+        }
+        self.root = root;
+        Ok(self.reader.pages_read() - before)
+    }
+
     /// Drops what the statement or the transaction staged, the catalog it declared among it, and
     /// lets go of the blocks it locked.
     fn abandon(&mut self) -> Result<()> {
@@ -412,13 +553,69 @@ impl Snail {
     }
 
     fn let_go_blocks(&mut self) -> Result<()> {
-        if let Some(w) = self.writer.as_ref() {
-            for &b in &self.locks {
-                lock::unlock_block(w.file(), b)?;
-            }
+        for b in std::mem::take(&mut self.locks) {
+            self.unlock_byte(b)?;
         }
-        self.locks.clear();
         Ok(())
+    }
+
+    /// Lets go of one block's lock, no longer marked held first.
+    fn unlock_byte(&self, b: u64) -> Result<()> {
+        if let Some(w) = self.writer.as_ref() {
+            lock::mark_held(w.file(), self.slot, b, false)?;
+            lock::unlock_block(w.file(), b)?;
+        }
+        Ok(())
+    }
+
+    /// Takes one block's lock and marks it held. Where another writer holds it, `Try` returns false
+    /// at once; `Wait` marks that it waits, follows the writers each waiting for a block the next
+    /// holds, and waits as long as it takes unless they come back to a block this writer holds: a
+    /// ring, which PostgreSQL ends by failing one of its transactions, as this one fails.
+    fn lock_byte(&self, b: u64, waiting: Waiting) -> Result<bool> {
+        let file = self.writer.as_ref().expect("a snail open to write").file();
+        if !lock::lock_block(file, b, false)? {
+            if waiting == Waiting::Try {
+                return Ok(false);
+            }
+            lock::mark_waiting(file, self.slot, b, true)?;
+            let ring = self.ring(file, b);
+            if !matches!(ring, Ok(false)) {
+                lock::mark_waiting(file, self.slot, b, false)?;
+                ring?;
+                return Err(Error::new(
+                    "deadlock detected: this writer waits for a block held by a writer that waits, \
+                     in a ring, for a block this writer holds",
+                ));
+            }
+            let taken = lock::lock_block(file, b, true);
+            lock::mark_waiting(file, self.slot, b, false)?;
+            taken?;
+        }
+        lock::mark_held(file, self.slot, b, true)?;
+        Ok(true)
+    }
+
+    /// Whether waiting for the block of lock byte `b` closes a ring: its holder waits for a block
+    /// whose holder waits, and so on, back to a block this writer holds.
+    fn ring(&self, file: &std::fs::File, b: u64) -> Result<bool> {
+        let mut at = b;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            if self.locks.contains(&at) {
+                return Ok(true);
+            }
+            let Some(holder) = lock::holder(file, at)? else {
+                return Ok(false);
+            };
+            if !seen.insert(holder) {
+                return Ok(false);
+            }
+            let Some(next) = lock::awaited(file, holder)? else {
+                return Ok(false);
+            };
+            at = next;
+        }
     }
 
     fn written(&self) -> u64 {
@@ -434,7 +631,14 @@ impl Snail {
         let committed = turn.and_then(|_| self.commit_with(&mut w));
         let given = lock::give_root_turn(w.file());
         self.writer = Some(w);
-        self.root = committed?;
+        match committed {
+            Ok(root) => self.root = root,
+            Err(e) => {
+                // A commit that fails lets go of what it held, as one that holds.
+                self.abandon()?;
+                return Err(e);
+            }
+        }
         given?;
         self.abandon()
     }
@@ -900,6 +1104,16 @@ impl Snail {
             if effects.iter().any(|e| e.delete) {
                 return Err(Error::new(format!("{} holds no row to delete", order.name)));
             }
+            // The order's first rows: its lock taken, as a block's is, and the order still empty.
+            let b = lock::block_byte_of(ti, oi, &[]);
+            if !self.locks.contains(&b) {
+                self.lock_byte(b, Waiting::Wait)?;
+                self.locks.insert(b);
+                if !self.empty_in_newest(table, order)? {
+                    self.stale = true;
+                    return Ok(None);
+                }
+            }
             let rows: Vec<Vec<Datum>> = effects.into_iter().map(|e| e.values).collect();
             let (entries, first) = self.written_in_order(w, table, order, rows)?;
             top.entries = entries;
@@ -919,12 +1133,7 @@ impl Snail {
                 by_block.entry(path).or_default().push(e);
             }
             let blocks: Vec<Entry> = by_block.keys().map(|p| entry_at(&top, p).clone()).collect();
-            let waiting = if self.locks.is_empty() {
-                Waiting::Wait
-            } else {
-                Waiting::Retry
-            };
-            if !self.lock_blocks(ti, oi, blocks, waiting)? {
+            if !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
                 self.stale = true;
                 return Ok(None);
             }
@@ -959,45 +1168,24 @@ impl Snail {
         let mut want: Vec<(u64, Entry)> = blocks
             .into_iter()
             .filter(|e| e.child.start < STAGED)
-            .map(|e| (lock::block_byte(&(ti, oi, &e.first)), e))
+            .map(|e| (lock::block_byte_of(ti, oi, &e.first), e))
             .collect();
         want.sort_by_key(|x| x.0);
         want.dedup_by_key(|x| x.0);
-        let file = self.writer.as_ref().expect("a snail open to write").file();
         let mut got = Vec::new();
         for (b, _) in &want {
             if self.locks.contains(b) || got.contains(b) {
                 continue;
             }
-            let taken = match waiting {
-                Waiting::Wait => lock::lock_block(file, *b, true)?,
-                Waiting::Try => lock::lock_block(file, *b, false)?,
-                Waiting::Retry => {
-                    let mut tries = 0;
-                    loop {
-                        if lock::lock_block(file, *b, false)? {
-                            break true;
-                        }
-                        tries += 1;
-                        if tries == 1000 {
-                            break false;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-            };
-            if !taken {
-                for g in &got {
-                    lock::unlock_block(file, *g)?;
-                }
-                if waiting == Waiting::Retry {
-                    return Err(Error::new(
-                        "waited ten seconds for a block another writer holds",
-                    ));
+            if !self.lock_byte(*b, waiting)? {
+                for &g in &got {
+                    self.unlock_byte(g)?;
+                    self.locks.remove(&g);
                 }
                 return Ok(false);
             }
             got.push(*b);
+            self.locks.insert(*b);
         }
         self.locks.extend(got);
         // Each block, under its lock, is the block the newest root names at its first key.
@@ -1026,6 +1214,19 @@ impl Snail {
             }
         }
         Ok(true)
+    }
+
+    /// Whether an order holds no row in the newest root, or is one the newest root does not name yet.
+    fn empty_in_newest(&self, table: &Table, order: &Order) -> Result<bool> {
+        let root = self.reader.peek_root()?;
+        match root
+            .orders
+            .iter()
+            .find(|(t, o, _)| *t == table.name && *o == order.name)
+        {
+            Some((_, _, top)) => Ok(decode_top(&self.reader.read_extent(*top)?)?.1.is_empty()),
+            None => Ok(true),
+        }
     }
 
     /// Reads down the directory to the block a key belongs with, keeping the pages read.

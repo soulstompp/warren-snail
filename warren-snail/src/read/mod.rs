@@ -178,6 +178,10 @@ pub struct Snail {
     writer: Option<Writer>,
     /// A transaction begun and not yet ended: the root it began from, and whether it wrote.
     begun: Option<(Root, bool)>,
+    /// Whether a statement of the transaction under way failed: it is rolled back at its end.
+    aborted: bool,
+    /// Where the snail is open to write, its writer's slot among the file's writers.
+    slot: u64,
     /// The blocks a round read a page or more of waste in, which it prunes as it ends.
     wasted: std::cell::RefCell<Vec<Wasted>>,
     /// The blocks the statement or the transaction under way has written, by table and order, each
@@ -299,6 +303,8 @@ impl Snail {
             rounds: 0,
             writer: None,
             begun: None,
+            aborted: false,
+            slot: 0,
             wasted: Default::default(),
             walked: Default::default(),
             taken: Default::default(),
@@ -318,6 +324,7 @@ impl Snail {
         {
             let (writer, _) = Writer::open(path)?;
             let mut snail = Snail::open(path)?;
+            snail.slot = crate::lock::take_slot(writer.file())?;
             snail.writer = Some(writer);
             Ok(snail)
         }
@@ -514,8 +521,15 @@ impl Snail {
         order: Option<&str>,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
+        if self.aborted {
+            return Err(Error::new(change::ABORTED));
+        }
+        // Each round reads what was committed when it began; in a transaction, with the
+        // transaction's own changes in place.
         let pages_at_start = if self.rounds > 0 && self.begun.is_none() {
             self.renew()?
+        } else if self.rounds > 0 {
+            self.renew_in_transaction()?
         } else {
             0
         };
