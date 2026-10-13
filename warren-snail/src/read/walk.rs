@@ -145,7 +145,7 @@ pub struct Walk {
     hi: Vec<KeyValue>,
     rest: Vec<(Shape, Interval)>,
     /// The conditions on text no level fixes, by their place among the side's.
-    texts: Vec<usize>,
+    pub(super) texts: Vec<usize>,
     /// How many leading levels are the join's columns another table's keys restrict, or 0.
     keyed: usize,
     /// The entries left open, all on one level.
@@ -155,6 +155,13 @@ pub struct Walk {
     /// The rows the counts answered: in all, and on each month of a count by month.
     pub counted: u64,
     pub counted_months: [u64; 12],
+    /// The rows the question holds, as the counts bound them: those of entries closed by the counts,
+    /// and the fewest and most among the entries left open.
+    pub rows_closed: u64,
+    pub rows_low: u64,
+    pub rows_high: u64,
+    /// The rows the order holds, as its top counts them.
+    pub table_rows: u64,
     pub directory_pages: u64,
     /// The fewest and the most column pages the round can read, over the entries left open, and as
     /// the top alone said them.
@@ -201,6 +208,9 @@ pub struct Plan {
     pub walk: Walk,
     reads: Vec<BlockRead>,
     pub column_pages: u64,
+    /// The rows the question holds, estimated from the blocks' page maps: those the counts closed on,
+    /// and of each block read in part, its rows by the share of it each open condition covers.
+    pub rows_estimate: f64,
 }
 
 impl Plan {
@@ -355,6 +365,10 @@ impl Snail {
             level,
             counted: 0,
             counted_months: [0; 12],
+            rows_closed: 0,
+            rows_low: 0,
+            rows_high: 0,
+            table_rows: entries.iter().map(|e| e.rows as u64).sum(),
             directory_pages: pages,
             low: 0,
             high: 0,
@@ -375,6 +389,8 @@ impl Snail {
         walk.level -= 1;
         walk.low = 0;
         walk.high = 0;
+        walk.rows_low = 0;
+        walk.rows_high = 0;
         for o in open {
             let entries = decode_page(&self.reader.read_extent(o.entry.child)?, &walk.head)?;
             walk.directory_pages += o.entry.child.pages();
@@ -389,6 +405,8 @@ impl Snail {
     /// page maps of the blocks it reads.
     pub(super) fn predict(&self, mut walk: Walk, want: &Want) -> Result<Plan> {
         let mut column_pages = 0u64;
+        let mut rows_estimate = walk.rows_closed as f64;
+        let order = &want.table.orders[walk.order];
         let mut reads = Vec::with_capacity(walk.open.len());
         // The pages that hold the page maps last read: blocks side by side share them.
         let mut held: Option<(u64, Vec<u8>)> = None;
@@ -403,6 +421,7 @@ impl Snail {
                 walk.directory_pages += pages;
             }
             let map = PageMap::decode(&held.as_ref().unwrap().1[at..], &walk.head.level_text)?;
+            rows_estimate += estimate(&o, &map, &walk, order);
             let mut block_reads = Vec::new();
             let mut waste = 0u64;
             for &s in &o.slots {
@@ -479,21 +498,34 @@ impl Snail {
             walk,
             reads,
             column_pages,
+            rows_estimate,
         })
     }
 
     /// Hands each row the plan keeps to `each`, as the values of `columns`, in the order's order. The
     /// pages it reads are tagged with the order they were read for.
-    pub(super) fn scan(
+    pub(super) fn read_plan(
         &self,
         plan: &Plan,
         want: &Want,
         columns: &[(usize, bool)],
         sink: &mut dyn Sink,
     ) -> Result<()> {
+        self.scan_blocks(plan, want, columns, sink, 0..plan.reads.len())
+    }
+
+    /// As `scan`, for the blocks of the plan in `blocks` alone.
+    pub(super) fn scan_blocks(
+        &self,
+        plan: &Plan,
+        want: &Want,
+        columns: &[(usize, bool)],
+        sink: &mut dyn Sink,
+        blocks: std::ops::Range<usize>,
+    ) -> Result<()> {
         self.reader
             .tag_reads(Some(super::order_tag(want.side.table, plan.walk.order)));
-        let read = self.scan_tagged(plan, want, columns, sink);
+        let read = self.scan_tagged(plan, want, columns, sink, blocks);
         self.reader.tag_reads(None);
         read
     }
@@ -504,6 +536,7 @@ impl Snail {
         want: &Want,
         columns: &[(usize, bool)],
         sink: &mut dyn Sink,
+        blocks: std::ops::Range<usize>,
     ) -> Result<()> {
         let table = want.table;
         let order = &table.orders[plan.walk.order];
@@ -511,7 +544,7 @@ impl Snail {
         let mut cells: Vec<Cell> = vec![Cell::Null; columns.len()];
         let mut sent: Vec<Dict> = vec![None; columns.len()];
         let lead = sink.lead();
-        for br in &plan.reads {
+        for br in &plan.reads[blocks] {
             // For every column read, its runs of pages decoded: (slot, [(first row, values)]).
             let mut held: Vec<(usize, Vec<(usize, Values)>)> = Vec::new();
             for (s, chosen) in &br.reads {
@@ -886,10 +919,12 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             Some(Countable::Total) => {
                 if rest_may.is_empty() {
                     walk.counted += e.rows as u64;
+                    walk.rows_closed += e.rows as u64;
                     return;
                 }
                 if let (1, Some(n)) = (rest_may.len(), exact) {
                     walk.counted += n;
+                    walk.rows_closed += n;
                     return;
                 }
             }
@@ -912,7 +947,9 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
                 };
                 if let (Some(mi), Some((a, z)), 0) = (mi, months, e.columns[slot].nulls) {
                     for m in a..=z {
-                        walk.counted_months[m as usize - 1] += e.months[mi][m as usize - 1] as u64;
+                        let n = e.months[mi][m as usize - 1] as u64;
+                        walk.counted_months[m as usize - 1] += n;
+                        walk.rows_closed += n;
                     }
                     return;
                 }
@@ -961,6 +998,27 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         slots.len() as u64
     };
     walk.high += whole;
+    // The rows: every row of an entry read whole, the count where one condition's is exact, else
+    // none to all of them.
+    let rows = e.rows as u64;
+    if read_whole {
+        walk.rows_low += rows;
+        walk.rows_high += rows;
+    } else {
+        match (
+            interval,
+            text_may.is_empty(),
+            keys_may,
+            rest_may.len(),
+            exact,
+        ) {
+            (Status::Must, true, false, 1, Some(n)) => {
+                walk.rows_low += n;
+                walk.rows_high += n;
+            }
+            _ => walk.rows_high += rows,
+        }
+    }
     walk.open.push(Open {
         entry: e,
         interval_may: interval == Status::May,
@@ -1012,9 +1070,180 @@ fn rest_status(
     }
 }
 
+/// The rows of the question an open block holds, estimated. The leading levels' range covers the
+/// block page by page, each page's rows taken as lying evenly across its keys; each condition off
+/// the levels covers the block by the share of its least to greatest it takes, or by its count
+/// where the counts give one; a condition on text off the levels leaves the block whole.
+fn estimate(o: &Open, map: &PageMap, walk: &Walk, order: &Order) -> f64 {
+    let e = &o.entry;
+    let mut share = 1.0;
+    if o.interval_may {
+        let m = walk.m;
+        let finest = o
+            .slots
+            .iter()
+            .copied()
+            .max_by_key(|&s| map.columns[s].pages.len());
+        if let Some(s) = finest {
+            let pages = &map.columns[s].pages;
+            let keyed = |p: usize| map.sorted > pages[p].first_row;
+            let (mut covered, mut all) = (0.0, 0.0);
+            for p in (0..pages.len()).filter(|&p| keyed(p)) {
+                let rows = pages[p].rows as f64;
+                let (next, last) = if p + 1 < pages.len() && keyed(p + 1) {
+                    (&pages[p + 1].first[..m], false)
+                } else {
+                    (&e.last[..m], true)
+                };
+                all += rows;
+                covered += rows * page_share(&pages[p].first[..m], next, last, &walk.lo, &walk.hi);
+            }
+            if all > 0.0 {
+                share *= covered / all;
+            }
+        }
+    }
+    for &ri in &o.rest_may {
+        let (s, iv) = walk.rest[ri];
+        share *= rest_share(order.slot(s_column(s)).unwrap(), s, iv, e, &walk.head);
+    }
+    e.rows as f64 * share
+}
+
+/// The share of a page's rows the range `lo` to `hi` covers, the page holding the keys from `first`
+/// to before `next`, or to `next` itself where it is the block's last key: its rows taken as lying
+/// evenly across the integers of the first level its two keys part on; half of them where that
+/// level holds text.
+fn page_share(
+    first: &[KeyValue],
+    next: &[KeyValue],
+    last: bool,
+    lo: &[KeyValue],
+    hi: &[KeyValue],
+) -> f64 {
+    if next < lo || first > hi {
+        return 0.0;
+    }
+    if lo <= first && next <= hi {
+        return 1.0;
+    }
+    let Some(d) = (0..first.len()).find(|&d| first[d] != next[d]) else {
+        return 1.0;
+    };
+    let (KeyValue::Int(a), KeyValue::Int(z)) = (&first[d], &next[d]) else {
+        return 0.5;
+    };
+    let (a, z) = (*a as f64, *z as f64 + if last { 1.0 } else { 0.0 });
+    let from = match lo[..d].cmp(&first[..d]) {
+        std::cmp::Ordering::Less => f64::NEG_INFINITY,
+        std::cmp::Ordering::Greater => f64::INFINITY,
+        std::cmp::Ordering::Equal => lo[d].int() as f64,
+    };
+    let to = match hi[..d].cmp(&first[..d]) {
+        std::cmp::Ordering::Greater => f64::INFINITY,
+        std::cmp::Ordering::Less => f64::NEG_INFINITY,
+        std::cmp::Ordering::Equal => hi[d].int() as f64 + 1.0,
+    };
+    ((to.min(z) - from.max(a)).max(0.0) / (z - a)).clamp(0.0, 1.0)
+}
+
+/// The share of an entry's rows a condition off the leading levels covers: its count where the
+/// counts give one, else the share of the column's least to greatest the condition's range takes,
+/// of the rows that hold a value.
+fn rest_share(slot: usize, s: Shape, iv: Interval, e: &Entry, head: &Head) -> f64 {
+    if e.rows == 0 {
+        return 0.0;
+    }
+    match rest_status(slot, s, iv, e, head) {
+        (Status::None, _) => 0.0,
+        (_, Some(n)) => n as f64 / e.rows as f64,
+        _ => {
+            let c = e.columns[slot];
+            let held = (e.rows - c.nulls) as f64 / e.rows as f64;
+            let (a, z) = (c.min as f64, c.max as f64 + 1.0);
+            let (from, to) = (iv.lo as f64, iv.hi as f64 + 1.0);
+            held * ((to.min(z) - from.max(a)).max(0.0) / (z - a)).clamp(0.0, 1.0)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directory::Summary;
+
+    #[test]
+    fn a_pages_rows_lie_evenly_across_the_integers_its_keys_part_on() {
+        let k = |v: &[i64]| v.iter().map(|&x| KeyValue::Int(x)).collect::<Vec<_>>();
+        // The keys 10 to before 20, the range 15 to 100: half of them.
+        assert_eq!(
+            page_share(&k(&[10]), &k(&[20]), false, &k(&[15]), &k(&[100])),
+            0.5
+        );
+        // The block's last page holds its last key itself: 10 to 19.
+        assert_eq!(
+            page_share(&k(&[10]), &k(&[19]), true, &k(&[15]), &k(&[100])),
+            0.5
+        );
+        assert_eq!(
+            page_share(&k(&[10]), &k(&[20]), false, &k(&[0]), &k(&[100])),
+            1.0
+        );
+        assert_eq!(
+            page_share(&k(&[10]), &k(&[20]), false, &k(&[30]), &k(&[100])),
+            0.0
+        );
+        // A first level the question fixes: the second parts the keys, 10 to 19 of 0 to before 40.
+        assert_eq!(
+            page_share(&k(&[7, 0]), &k(&[7, 40]), false, &k(&[7, 10]), &k(&[7, 19])),
+            0.25
+        );
+        // Text holds no integers to spread the rows across: half of them.
+        let t = |s: &str| vec![KeyValue::Text(s.into())];
+        assert_eq!(page_share(&t("a"), &t("m"), false, &t("c"), &t("z")), 0.5);
+    }
+
+    #[test]
+    fn a_condition_off_the_levels_covers_a_block_by_its_month_count_or_its_least_to_greatest() {
+        // 120 rows: ids from 1 to 100 on all but 20 of them; instants on every month, December 21.
+        let mut months = [9u32; 12];
+        months[11] = 21;
+        let block = Entry {
+            depth: 1,
+            rows: 120,
+            dead: 0,
+            first: vec![KeyValue::Int(0)],
+            last: vec![KeyValue::Int(0)],
+            columns: vec![
+                Summary {
+                    nulls: 20,
+                    min: 1,
+                    max: 100,
+                    pages: 1,
+                },
+                Summary::default(),
+            ],
+            months: vec![months],
+            bytes: vec![],
+            child: Extent::default(),
+        };
+        let head = Head {
+            month_slots: vec![1],
+            ..Default::default()
+        };
+        let december = Interval { lo: 12, hi: 12 };
+        assert_eq!(
+            rest_share(1, Shape::MonthUtc(1), december, &block, &head),
+            21.0 / 120.0
+        );
+        let ids = Interval { lo: 1, hi: 25 };
+        assert_eq!(
+            rest_share(0, Shape::Column(0), ids, &block, &head),
+            100.0 / 120.0 * 0.25
+        );
+        let none = Interval { lo: 200, hi: 300 };
+        assert_eq!(rest_share(0, Shape::Column(0), none, &block, &head), 0.0);
+    }
 
     #[test]
     fn an_order_is_left_unread_only_when_its_fewest_pages_pass_another_orders_most() {

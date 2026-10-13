@@ -530,6 +530,25 @@ impl Catalog {
         Ok(out.join("\n"))
     }
 
+    /// The statements of the DDL that declare its functions, as they are written, in the order of
+    /// `functions`.
+    pub fn function_statements(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for tokens in statements(&self.ddl)? {
+            if cluster_on(&tokens).is_some() {
+                continue;
+            }
+            let text: String = tokens.iter().map(|t| t.to_string()).collect();
+            if let Statement::CreateFunction(_) = Parser::new(&PostgreSqlDialect {})
+                .with_tokens(tokens)
+                .parse_statement()?
+            {
+                out.push(format!("{};", text.trim()));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn parse(ddl: &str) -> Result<Catalog> {
         let mut functions = Vec::new();
         let mut creates = Vec::new();
@@ -904,6 +923,21 @@ mod tests {
         assert_eq!(orders[2].levels, [Level::MonthUtc(1), Level::Column(1)]);
         assert_eq!(orders[2].levels, orders[3].levels);
         assert_eq!(orders[2].columns, orders[3].columns);
+    }
+
+    #[test]
+    fn the_functions_come_back_as_they_are_written_in_their_order() {
+        let clock = "CREATE FUNCTION s.clock(timestamptz) RETURNS timestamp\n    LANGUAGE sql \
+                     IMMUTABLE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;";
+        let day = "CREATE FUNCTION r.day(timestamptz) RETURNS date LANGUAGE sql IMMUTABLE \
+                   AS $$ SELECT ($1 AT TIME ZONE 'UTC')::date $$;";
+        let c = Catalog::parse(&format!(
+            "{clock}\n{TABLE}\nCREATE INDEX i ON s.t (at);\n{day}\nALTER TABLE s.t CLUSTER ON i;"
+        ))
+        .unwrap();
+        let names: Vec<&str> = c.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["s.clock", "r.day"]);
+        assert_eq!(c.function_statements().unwrap(), [clock, day]);
     }
 
     #[test]

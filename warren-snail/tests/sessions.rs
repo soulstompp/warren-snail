@@ -73,19 +73,22 @@ fn each_statement_of_a_transaction_reads_what_was_committed_when_it_began_with_i
     assert_eq!(count(&mut one_, stations), n + 1);
     one_.execute(&reading(5_000_002)).unwrap();
     assert_eq!(count(&mut one_, ALL), 5_003);
-    one_.execute(&station_(2)).unwrap();
+    // Another station committed: the transaction's next read, before any statement of its own, reads it.
+    two.execute(&station_(3)).unwrap();
     assert_eq!(count(&mut one_, stations), n + 2);
+    one_.execute(&station_(2)).unwrap();
+    assert_eq!(count(&mut one_, stations), n + 3);
     // A reader reads only what was committed.
     let mut r = Snail::open(&path).unwrap();
     assert_eq!(
         (count(&mut r, ALL), count(&mut r, stations)),
-        (5_000, n + 1)
+        (5_000, n + 2)
     );
     one_.execute("COMMIT").unwrap();
     let mut r = Snail::open(&path).unwrap();
     assert_eq!(
         (count(&mut r, ALL), count(&mut r, stations)),
-        (5_003, n + 2)
+        (5_003, n + 3)
     );
     r.census().unwrap();
 }

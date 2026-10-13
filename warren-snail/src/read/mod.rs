@@ -269,11 +269,65 @@ pub struct Round {
     pub rows_taken: u64,
 }
 
-/// One table's part of a round: the plan read, the orders that served it, and what each said.
+/// One table's part of a round: the plan read, the orders that served it, and what each said; and
+/// the rows the question holds, as the counts of every order walked bound them, and the table's rows.
 struct Part {
     plan: Plan,
     served: Vec<String>,
     consulted: Vec<Consulted>,
+    rows: (u64, u64),
+    table_rows: u64,
+}
+
+/// A question on one table priced from the directory alone: the order a round would read along, the
+/// pages it would read, and the rows the counts bound, without a column page read.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Price {
+    pub order: String,
+    /// The orders that hold every column the question reads, and what each said.
+    pub served: Vec<String>,
+    pub consulted: Vec<Consulted>,
+    /// The rows the table holds.
+    pub table_rows: u64,
+    /// The fewest and the most rows the question can hold: every order walked bounds them alike.
+    pub rows_low: u64,
+    pub rows_high: u64,
+    /// The rows the question holds, estimated from the page maps of the blocks the order reads, between
+    /// the two: each page's rows taken as lying evenly across its keys, and an entry's across its least
+    /// to greatest.
+    pub rows_estimate: u64,
+    /// The columns whose conditions the order read holds no key for: text off its levels, or a range on
+    /// text. The estimate takes the blocks they open whole.
+    pub keyless: Vec<String>,
+    /// The directory pages the pricing read, page maps among them, and the column pages a round
+    /// along the order reads, exactly.
+    pub directory_pages: u64,
+    pub column_pages: u64,
+    pub blocks: u64,
+}
+
+/// A round handed out a block at a time: `Snail::scan` begins it on the root the snail last read,
+/// `Snail::next_block` hands out each block's rows, and `round` says what it has read so far. A
+/// question that groups, counts or orders its rows comes out in one batch at the end.
+#[non_exhaustive]
+pub struct Scan {
+    q: Question,
+    plan: Plan,
+    columns: Vec<(usize, bool)>,
+    next: usize,
+    whole: bool,
+    done: bool,
+    generation: u64,
+    counted: (u64, [u64; 12]),
+    round: Round,
+}
+
+impl Scan {
+    /// What the round has read so far, and the rows it has handed out.
+    pub fn round(&self) -> Round {
+        self.round.clone()
+    }
 }
 
 impl Snail {
@@ -460,6 +514,14 @@ impl Snail {
                 None => break,
             }
         }
+        // The rows the question holds are the same along every order: each walk bounds them.
+        let rows = walks.iter().fold((0, u64::MAX), |(lo, hi), w| {
+            (
+                lo.max(w.rows_closed + w.rows_low),
+                hi.min(w.rows_closed + w.rows_high),
+            )
+        });
+        let table_rows = walks.first().map_or(0, |w| w.table_rows);
         let mut consulted = Vec::new();
         let mut plans = Vec::new();
         for (walk, out) in walks.into_iter().zip(out) {
@@ -506,7 +568,193 @@ impl Snail {
                 .map(|&o| table.orders[o].name.clone())
                 .collect(),
             consulted,
+            rows,
+            table_rows,
         })
+    }
+
+    /// A question on one table priced from its directory, on the root the snail last read: the order a
+    /// round along it would read, its pages, and the rows the counts bound. It reads directory pages
+    /// and page maps, never a column page.
+    pub fn price(&self, sql: &str, order: Option<&str>) -> Result<Price> {
+        let q = self.one_table(sql)?;
+        let (want, _) = self.want_of(&q);
+        let before = self.touched();
+        let part = self.part(&want, order)?;
+        Ok(Price {
+            order: want.table.orders[part.plan.walk.order].name.clone(),
+            served: part.served,
+            consulted: part.consulted,
+            table_rows: part.table_rows,
+            rows_low: part.rows.0,
+            rows_high: part.rows.1,
+            rows_estimate: (part.plan.rows_estimate.round() as u64).clamp(part.rows.0, part.rows.1),
+            keyless: part
+                .plan
+                .walk
+                .texts
+                .iter()
+                .map(|&i| want.table.columns[want.side.texts[i].column].name.clone())
+                .collect(),
+            directory_pages: self.touched() - before,
+            column_pages: part.plan.column_pages,
+            blocks: part.plan.blocks_read(),
+        })
+    }
+
+    /// Begins a round on one table on the root the snail last read, its blocks handed out one at a
+    /// time by `next_block`.
+    pub fn scan(&self, sql: &str, order: Option<&str>) -> Result<Scan> {
+        let q = self.one_table(sql)?;
+        let (want, columns) = self.want_of(&q);
+        let (before, held_before) = (self.touched(), self.pages_held());
+        let part = self.part(&want, order)?;
+        let w = &part.plan.walk;
+        let round = Round {
+            order: want.table.orders[w.order].name.clone(),
+            served: part.served.clone(),
+            consulted: part.consulted.clone(),
+            directory_pages: self.touched() - before,
+            directory_pages_held: self.pages_held() - held_before,
+            column_pages_top_low: w.top.0,
+            column_pages_top_high: w.top.1,
+            column_pages_low: w.low,
+            column_pages_high: w.high,
+            column_pages_predicted: part.plan.column_pages,
+            entries: w.statuses.0 + w.statuses.1 + w.statuses.2,
+            entries_none: w.statuses.0,
+            entries_may: w.statuses.1,
+            entries_must: w.statuses.2,
+            blocks_read: part.plan.blocks_read(),
+            ..Default::default()
+        };
+        let whole = !(matches!(q.select, question::Select::Rows(_)) && q.order.is_empty());
+        let counted = (w.counted, w.counted_months);
+        Ok(Scan {
+            q,
+            plan: part.plan,
+            columns,
+            next: 0,
+            whole,
+            done: false,
+            generation: self.root.generation,
+            counted,
+            round,
+        })
+    }
+
+    /// The next block's rows of a round `scan` began, or none once every block has come. A question
+    /// that groups, counts or orders its rows comes out in one batch.
+    pub fn next_block(&self, scan: &mut Scan) -> Result<Option<RecordBatch>> {
+        if scan.done {
+            return Ok(None);
+        }
+        if scan.generation != self.root.generation {
+            return Err(Error::new("a scan goes on only on the root it began on"));
+        }
+        let table = &self.catalog.tables[scan.q.sides[0].table];
+        let want = Want {
+            table,
+            side: &scan.q.sides[0],
+            columns: scan.columns.iter().map(|c| c.0).collect(),
+            countable: scan.q.select.countable(),
+            keys: None,
+        };
+        let blocks = scan.plan.blocks_read() as usize;
+        let (read0, walked, taken) = (
+            self.reader.pages_read(),
+            self.walked.get(),
+            self.taken.get(),
+        );
+        let mut answer = Answer::new(&scan.q.select);
+        let range = if scan.whole {
+            scan.next..blocks
+        } else {
+            scan.next..(scan.next + 1).min(blocks)
+        };
+        if range.is_empty() && !scan.whole {
+            scan.done = true;
+            return Ok(None);
+        }
+        scan.next = range.end;
+        self.scan_blocks(&scan.plan, &want, &scan.columns, &mut answer, range)?;
+        if scan.whole {
+            answer.counted(scan.counted.0, &scan.counted.1, scan.q.select.countable());
+            scan.done = true;
+        }
+        let batch = answer.finish(&[table], &scan.q.select, &scan.q.order)?;
+        let r = &mut scan.round;
+        r.column_pages_read += self.reader.pages_read() - read0;
+        r.rows += batch.num_rows() as u64;
+        r.rows_walked += self.walked.get() - walked;
+        r.rows_taken += self.taken.get() - taken;
+        Ok(Some(batch))
+    }
+
+    /// Answers a question on one table as `ask` does, each block's rows handed to `each` as they are
+    /// read: a question that groups, counts or orders its rows hands over one batch at the end.
+    pub fn ask_each(
+        &mut self,
+        sql: &str,
+        order: Option<&str>,
+        each: &mut dyn FnMut(RecordBatch) -> Result<()>,
+    ) -> Result<Round> {
+        let pages_at_start = self.begin_round()?;
+        let mut scan = self.scan(sql, order)?;
+        while let Some(batch) = self.next_block(&mut scan)? {
+            each(batch)?;
+        }
+        let mut round = scan.round();
+        round.pages_at_start = pages_at_start;
+        Ok(round)
+    }
+
+    /// Begins a round: it reads what was committed when it begins; in a transaction, with the
+    /// transaction's own changes in place. The pages it read to begin.
+    fn begin_round(&mut self) -> Result<u64> {
+        if self.aborted {
+            return Err(Error::new(change::ABORTED));
+        }
+        let pages_at_start = if self.rounds > 0 && self.begun.is_none() {
+            self.renew()?
+        } else if self.rounds > 0 {
+            self.renew_in_transaction()?
+        } else {
+            0
+        };
+        self.rounds += 1;
+        Ok(pages_at_start)
+    }
+
+    /// A question on one table, refused as anything else.
+    fn one_table(&self, sql: &str) -> Result<Question> {
+        let q = question::parse(&self.catalog, sql)?;
+        if q.sides.len() != 1 {
+            return Err(Error::new(
+                "a question on two tables is not priced or scanned alone",
+            ));
+        }
+        Ok(q)
+    }
+
+    /// What a round on one table reads: the columns of the answer's inputs, each with whether it is
+    /// read for its month.
+    fn want_of<'a>(&'a self, q: &'a Question) -> (Want<'a>, Vec<(usize, bool)>) {
+        let table = &self.catalog.tables[q.sides[0].table];
+        let columns: Vec<(usize, bool)> = q
+            .select
+            .inputs()
+            .iter()
+            .map(|k| (k.col().column, matches!(k, Key::Month(_))))
+            .collect();
+        let want = Want {
+            table,
+            side: &q.sides[0],
+            columns: columns.iter().map(|c| c.0).collect(),
+            countable: q.select.countable(),
+            keys: None,
+        };
+        (want, columns)
     }
 
     /// Answers a question, along the order named or the one whose pages are fewest: one round.
@@ -521,19 +769,7 @@ impl Snail {
         order: Option<&str>,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
-        if self.aborted {
-            return Err(Error::new(change::ABORTED));
-        }
-        // Each round reads what was committed when it began; in a transaction, with the
-        // transaction's own changes in place.
-        let pages_at_start = if self.rounds > 0 && self.begun.is_none() {
-            self.renew()?
-        } else if self.rounds > 0 {
-            self.renew_in_transaction()?
-        } else {
-            0
-        };
-        self.rounds += 1;
+        let pages_at_start = self.begin_round()?;
         self.wasted.borrow_mut().clear();
         let (batch, mut round) = self.answer_with(sql, order, params)?;
         round.pages_at_start = pages_at_start;
@@ -671,7 +907,7 @@ impl Snail {
         let column_pages_held = self.reader.keep_for_round(part.plan.disk_pages());
         let mid = self.reader.pages_read();
         let (walked, taken) = (self.walked.get(), self.taken.get());
-        self.scan(&part.plan, &want, &columns, sink)?;
+        self.read_plan(&part.plan, &want, &columns, sink)?;
         let column_pages_read = self.reader.pages_read() - mid;
         let w = &part.plan.walk;
         let round = Round {
@@ -763,7 +999,7 @@ impl Snail {
             inputs: a_inputs,
             dicts: Vec::new(),
         };
-        self.scan(&a.plan, &a_want, &a_columns, &mut sink)?;
+        self.read_plan(&a.plan, &a_want, &a_columns, &mut sink)?;
         let mut column_pages_read = self.reader.pages_read() - mid;
 
         let keys = KeySet::new(join_columns(second), held.keys());
@@ -802,7 +1038,7 @@ impl Snail {
             found: None,
             cells: vec![Cell::Null; inputs.len()],
         };
-        self.scan(&b.plan, &b_want, &b_columns, &mut sink)?;
+        self.read_plan(&b.plan, &b_want, &b_columns, &mut sink)?;
         column_pages_read += self.reader.pages_read() - mid;
         let batch = answer.finish(&tables, &q.select, &q.order)?;
         let (wa, wb) = (&a.plan.walk, &b.plan.walk);

@@ -301,10 +301,10 @@ commits on its own.
 
 **What it writes.** A row lands in its block on every order that holds its columns, as its places
 name it, after the block's last rows, in pages of one disk page each, until a prune or a cut writes
-the block again in order. An update marks the old row dead and chains it to its replacement; one that changes the
-table's order's key moves the row to the block its new key names. Every changed page is written to
-a fresh page, then the pages of the directory above it, then the root, in two copies written turn
-about.
+the block again in order. An update marks the old row dead and chains it to its replacement; one
+that changes the table's order's key moves the row to the block its new key names. Every changed
+page is written to a fresh page, then the pages of the directory above it, then the root, in two
+copies written turn about.
 
 **The read it cancels.** A round reads the file as it stood when the round began, so a reader
 never waits for a writer, and never reads a page half written. A write that stops before the root,
@@ -340,16 +340,16 @@ GROUP BY o.customer_id ORDER BY o.customer_id
 
 **Where it stops.** A writer locks the blocks it writes, never the file, so writers of different
 blocks commit side by side; writers of one block take turns, waiting as long as it takes. Each
-statement reads what was committed when it began, and in a transaction its transaction's own changes
-with it, as PostgreSQL's READ COMMITTED has it. A statement that waited for a block takes the rows it
-found again in their newest versions, and only those still meeting its conditions. Writers that
-wait in a ring, each for a block the next holds, fail one of their transactions with `deadlock
-detected`; a transaction one of whose statements failed takes nothing but its end, which rolls it
-back. A writer of 0.1.0 and one of a later version never write one snail at once: their block locks
-lie on different bytes. A read that pays a page or more of a block only for its dead rows, or for
-rows written after its last, prunes it as the round ends, on a snail open to write: the block is
-written again, in order and without its dead rows. A page the newest root no longer names is freed
-once no older round still reads it, and reused:
+statement reads what was committed when it began, and in a transaction its transaction's own
+changes with it, as PostgreSQL's READ COMMITTED has it. A statement that waited for a block takes
+the rows it found again in their newest versions, and only those still meeting its conditions.
+Writers that wait in a ring, each for a block the next holds, fail one of their transactions with
+`deadlock detected`; a transaction one of whose statements failed takes nothing but its end, which
+rolls it back. A writer of 0.1.0 and one of a later version never write one snail at once: their
+block locks lie on different bytes. A read that pays a page or more of a block only for its dead
+rows, or for rows written after its last, prunes it as the round ends, on a snail open to write:
+the block is written again, in order and without its dead rows. A page the newest root no longer
+names is freed once no older round still reads it, and reused:
 
 ```sh
 warren-snail census shop.snail
@@ -499,6 +499,11 @@ put the same rows in, and ask the same question. PostgreSQL's rows are the answe
 checked against. Text is compared by its bytes, as PostgreSQL compares it under the `C` collation,
 so check against a database whose collation is `C`, or `C.UTF-8`. A column that declares any
 collation but `C` or `POSIX` is refused.
+
+[warren-snail-pg](https://github.com/soulstompp/warren-surveyor/tree/HEAD/warren-snail-pg) mounts
+a snail in PostgreSQL as a schema of foreign tables, read only, so the snail's answers and
+PostgreSQL's are asked in one database. Each scan of one of its tables is a round of the snail's
+own, and `EXPLAIN` prints it.
 
 The composed statement [sql-composer](https://github.com/soulstompp/sql-composer) writes is plain
 SQL in PostgreSQL's syntax, and the snail reads it as it reads any other question.
