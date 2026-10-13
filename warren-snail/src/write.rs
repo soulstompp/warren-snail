@@ -293,9 +293,16 @@ fn movable(
             )
         })
     });
+    // A chunk whose dictionary ran out, its later pages plain, is neither encoding the counts choose.
+    let mixed = chunk.page_encoding_stats().is_some_and(|s| {
+        s.iter().any(|p| p.page_type == PageType::DICTIONARY_PAGE)
+            && s.iter()
+                .any(|p| p.page_type == PageType::DATA_PAGE && p.encoding == Encoding::PLAIN)
+    });
     if chunk.compression() != Compression::UNCOMPRESSED
         || chunk.column_descr() != ours.as_ref()
         || !pages_held
+        || mixed
     {
         return Ok(None);
     }
@@ -757,7 +764,7 @@ fn write_order(
                 .collect(),
             None => Vec::new(),
         };
-        let (entry, encoded) = write_block(
+        let (entry, encoded, moved) = write_block(
             w,
             table,
             order,
@@ -773,7 +780,7 @@ fn write_order(
             &mut maps,
         )?;
         for (s, (cw, e)) in columns.iter_mut().zip(&encoded).enumerate() {
-            cw.moved_blocks += given.get(s).is_some_and(Option::is_some) as usize;
+            cw.moved_blocks += moved[s] as usize;
             cw.dictionary_blocks += e.dictionary.is_some() as usize;
             cw.data_pages += e.pages.len();
             cw.disk_pages += e.disk_pages();
@@ -825,9 +832,10 @@ pub(crate) fn write_block(
     text_slots: &[usize],
     given: &[Option<Encoded>],
     maps: &mut MapPages,
-) -> Result<(Entry, Vec<Encoded>)> {
+) -> Result<(Entry, Vec<Encoded>, Vec<bool>)> {
     let mut summaries = Vec::with_capacity(order.columns.len());
     let mut encoded = Vec::with_capacity(order.columns.len());
+    let mut moved = Vec::with_capacity(order.columns.len());
     let mut months = vec![[0u32; 12]; month_slots.len()];
     let mut bytes = vec![0u32; text_slots.len()];
     for (s, &c) in order.columns.iter().enumerate() {
@@ -854,10 +862,19 @@ pub(crate) fn write_block(
                 ))
             })?;
         }
-        encoded.push(match given.get(s).and_then(Option::as_ref) {
-            Some(e) => e.clone(),
-            None => encode(&descs[s], table.columns[c].ty, &values, units[s])?,
-        });
+        // A column given as a file's pages comes in as they lie where the counts would choose its
+        // encoding, a dictionary or none; otherwise it is encoded afresh.
+        let fresh = encode(&descs[s], table.columns[c].ty, &values, units[s])?;
+        match given.get(s).and_then(Option::as_ref) {
+            Some(e) if e.dictionary.is_some() == fresh.dictionary.is_some() => {
+                encoded.push(e.clone());
+                moved.push(true);
+            }
+            _ => {
+                encoded.push(fresh);
+                moved.push(false);
+            }
+        }
     }
     let map_at = |start: u64| -> PageMap {
         let mut at = start;
@@ -921,5 +938,5 @@ pub(crate) fn write_block(
         bytes,
         child,
     };
-    Ok((entry, encoded))
+    Ok((entry, encoded, moved))
 }

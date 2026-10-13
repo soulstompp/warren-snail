@@ -306,8 +306,14 @@ fn a_block_with_dead_rows_or_rows_out_of_place_is_pruned_on_its_way_out() {
 
 /// A table's file written again by the plain library, a row group for each of the file's, in the
 /// snail's own Parquet types and in pages of 200 rows: with each row group's rows reversed, or
-/// compressed.
-fn written_again(file: &Path, to: &Path, reversed: bool, compression: parquet::basic::Compression) {
+/// compressed, or each column's dictionary given `dictionary` bytes before its pages go plain.
+fn written_again(
+    file: &Path,
+    to: &Path,
+    reversed: bool,
+    compression: parquet::basic::Compression,
+    dictionary: Option<usize>,
+) {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::arrow_writer::ArrowWriterOptions;
     use parquet::file::properties::{WriterProperties, WriterVersion};
@@ -316,12 +322,15 @@ fn written_again(file: &Path, to: &Path, reversed: bool, compression: parquet::b
     let groups = builder.metadata().num_row_groups();
     let schema = builder.metadata().file_metadata().schema_descr().clone();
     let arrow_schema = builder.schema().clone();
-    let props = WriterProperties::builder()
+    let mut props = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_1_0)
         .set_compression(compression)
         .set_data_page_row_count_limit(200)
-        .set_write_batch_size(200)
-        .build();
+        .set_write_batch_size(200);
+    if let Some(bytes) = dictionary {
+        props = props.set_dictionary_page_size_limit(bytes);
+    }
+    let props = props.build();
     let mut aw = parquet::arrow::ArrowWriter::try_new_with_options(
         std::fs::File::create(to).unwrap(),
         arrow_schema.clone(),
@@ -375,13 +384,20 @@ fn a_file_the_plain_library_writes_comes_in_by_its_pages_only_where_the_snail_ho
         "SELECT r.feed, count(*) FROM weather.readings r GROUP BY r.feed".to_string(),
     ];
     // Each way the readings are written again: whether their pages may come in as they lie.
-    for (name, reversed, compression, moves) in [
-        ("in-order", false, Compression::UNCOMPRESSED, true),
-        ("reversed", true, Compression::UNCOMPRESSED, false),
-        ("compressed", false, Compression::SNAPPY, false),
+    for (name, reversed, compression, dictionary, moves) in [
+        ("in-order", false, Compression::UNCOMPRESSED, None, true),
+        ("reversed", true, Compression::UNCOMPRESSED, None, false),
+        ("compressed", false, Compression::SNAPPY, None, false),
+        (
+            "dictionary-spent",
+            false,
+            Compression::UNCOMPRESSED,
+            Some(16),
+            false,
+        ),
     ] {
         let again = dir.join(format!("{name}.parquet"));
-        written_again(&file, &again, reversed, compression);
+        written_again(&file, &again, reversed, compression, dictionary);
         let mut tables = Vec::new();
         let mut sources = Vec::new();
         for t in &outs {
@@ -398,20 +414,42 @@ fn a_file_the_plain_library_writes_comes_in_by_its_pages_only_where_the_snail_ho
             ));
             sources.push((t.table.clone(), source(&f, table).unwrap()));
         }
+        // The same rows written afresh: where the counts choose a dictionary.
+        let afresh = warren_snail::write::write_spanned(
+            &tmp(&format!("out-plain-{name}-afresh.snail")),
+            &catalog,
+            &tables,
+            &[],
+            span(),
+        )
+        .unwrap();
+        let chosen = |column: &str| -> usize {
+            afresh
+                .iter()
+                .find(|w| w.order == "r_station")
+                .unwrap()
+                .columns
+                .iter()
+                .find(|c| c.name == column)
+                .unwrap()
+                .dictionary_blocks
+        };
         let snail_again = tmp(&format!("out-plain-{name}.snail"));
         for written in
             warren_snail::write::write_spanned(&snail_again, &catalog, &tables, &sources, span())
                 .unwrap()
         {
             if written.table == "weather.readings" && written.order == "r_station" {
+                // A column moves where the file holds it as the counts would, on a dictionary in
+                // every page or on none: the file's columns all take a dictionary, so each moves
+                // where the counts choose one; where its dictionary ran out, its later pages plain,
+                // it never does.
                 for c in &written.columns {
-                    assert_eq!(
-                        c.moved_blocks,
-                        if moves { written.blocks } else { 0 },
-                        "{name} {}",
-                        c.name
-                    );
+                    let want = if moves { chosen(&c.name) } else { 0 };
+                    assert_eq!(c.moved_blocks, want, "{name} {}", c.name);
                 }
+                let moved: usize = written.columns.iter().map(|c| c.moved_blocks).sum();
+                assert_eq!(moved > 0, moves, "{name}");
             }
         }
         let mut snail_again = Snail::open(&snail_again).unwrap();

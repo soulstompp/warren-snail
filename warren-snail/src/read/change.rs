@@ -1629,7 +1629,7 @@ impl Snail {
         let text_slots: Vec<usize> = head.text_slots.iter().map(|&s| s as usize).collect();
         let mut entries = Vec::with_capacity(blocks.len());
         for b in &blocks {
-            let (entry, _) = write_block(
+            let (entry, _, _) = write_block(
                 w,
                 table,
                 order,

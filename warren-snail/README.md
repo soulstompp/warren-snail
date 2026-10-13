@@ -405,8 +405,9 @@ takes. `k` is the most disk pages one data page of the column may take, sized fr
 place of the order's key in any block, within the Parquet library's caps.
 
 **Where it stops.** Pages stay uncompressed, and a column takes a dictionary only where that takes
-fewer pages than its plain values. A row group that is not one of the snail's blocks, or a page
-compressed or larger than its column's `k`, is encoded afresh.
+fewer pages than its plain values. A row group that is not one of the snail's blocks, a page
+compressed or larger than its column's `k`, or a column on a dictionary where the counts would take
+none, or the other way about, or whose dictionary ran out partway, is encoded afresh.
 
 ## Files past 1 GiB
 
