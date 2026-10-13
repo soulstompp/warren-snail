@@ -298,7 +298,8 @@ pages of its own.
 commits on its own.
 
 **What it writes.** A row lands in its block on every order that holds its columns, as its places
-name it. An update marks the old row dead and chains it to its replacement; one that changes the
+name it, after the block's last rows, in pages of one disk page each, until a prune or a cut writes
+the block again in order. An update marks the old row dead and chains it to its replacement; one that changes the
 table's order's key moves the row to the block its new key names. Every changed page is written to
 a fresh page, then the pages of the directory above it, then the root, in two copies written turn
 about.
@@ -338,8 +339,9 @@ GROUP BY o.customer_id ORDER BY o.customer_id
 **Where it stops.** A writer locks the blocks it writes, never the file, so writers of different
 blocks commit side by side; writers of one block take turns. Inside a transaction, a writer that
 already holds blocks tries for another for ten seconds, then gives up, so two writers never wait on
-each other forever. A read that finds a page or more of dead rows in a block, on a snail open to
-write, prunes it as the round ends: the block is written again without them. A page the newest
+each other forever. A read that pays a page or more of a block only for its dead rows, or for rows
+written after its last, prunes it as the round ends, on a snail open to write: the block is written
+again, in order and without its dead rows. A page the newest
 root no longer names is freed once no older round still reads it, and reused:
 
 ```sh
@@ -347,7 +349,7 @@ warren-snail census shop.snail
 ```
 
 ```text
-generation 6: 18 pages named, 2 free, 17 waiting to be freed
+generation 6: 28 pages named, 0 free, 17 waiting to be freed
 ```
 
 ## Parquet, out and back in

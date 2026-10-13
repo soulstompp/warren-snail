@@ -390,7 +390,8 @@ impl Snail {
             for &s in &o.slots {
                 let pages = &map.columns[s].pages;
                 // A page holding rows written after the sorted ones is read whenever the block is,
-                // and a page's next key bounds it only while that key is a sorted row's.
+                // and a page's next key bounds it only while that key is a sorted row's. A page of
+                // the tail holds no sorted row, so no key range brings a read to it.
                 let unsorted = |p: usize| pages[p].first_row + pages[p].rows > map.sorted;
                 let next = |p: usize| {
                     if p + 1 < pages.len() && !unsorted(p) && pages[p + 1].first_row < map.sorted {
@@ -400,9 +401,10 @@ impl Snail {
                     }
                 };
                 let fits = |p: usize| {
-                    (!o.interval_may
-                        || (pages[p].first[..m] <= *hi.as_slice()
-                            && next(p)[..m] >= *lo.as_slice()))
+                    pages[p].first_row < map.sorted
+                        && (!o.interval_may
+                            || (pages[p].first[..m] <= *hi.as_slice()
+                                && next(p)[..m] >= *lo.as_slice()))
                         && (j == 0
                             || want
                                 .keys

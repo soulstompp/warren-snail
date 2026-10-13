@@ -13,7 +13,7 @@ use crate::directory::{
     build_from, decode_page, decode_top, encode_page, encode_top, pack, Entry, Head, PageEntry,
     PageMap,
 };
-use crate::encode::{decode, descriptor, plain_pages};
+use crate::encode::{decode, descriptor, tail_pages};
 use crate::file::{decode_runs, encode_runs, Extent, Place, Root, Run, Writer, STAGED};
 use crate::lock;
 
@@ -641,6 +641,52 @@ impl Snail {
             return Ok(e);
         }
         let mut map = PageMap::decode(&self.reader.read_extent(e.child)?, &head.level_text)?;
+        let whole = map.columns.iter().all(|c| {
+            c.dictionary.is_none_or(|d| d.start >= STAGED)
+                && c.pages.iter().all(|p| p.at.start >= STAGED)
+        });
+        if whole {
+            // A block written whole lies in one run, in one file, its page map first and its columns
+            // after it, as a write lays a block out.
+            let map_pages = e.child.pages().max(1);
+            let data: u64 = map
+                .columns
+                .iter()
+                .flat_map(|c| c.dictionary.into_iter().chain(c.pages.iter().map(|p| p.at)))
+                .map(|x| x.pages().max(1))
+                .sum();
+            let start = w.reserve(map_pages + data);
+            let mut at = start + map_pages;
+            let mut copy = |x: Extent| -> Result<Extent> {
+                w.write_at(at, &self.reader.read_extent(x)?)?;
+                let moved = Extent {
+                    start: at,
+                    bytes: x.bytes,
+                };
+                at += x.pages().max(1);
+                Ok(moved)
+            };
+            for c in &mut map.columns {
+                if let Some(d) = c.dictionary {
+                    c.dictionary = Some(copy(d)?);
+                }
+                for p in &mut c.pages {
+                    p.at = copy(p.at)?;
+                }
+            }
+            let encoded = map.encode();
+            if encoded.len().div_ceil(crate::cut::PAGE).max(1) as u64 != map_pages {
+                return Err(Error::new(
+                    "a page map changed its size when its block moved",
+                ));
+            }
+            w.write_at(start, &encoded)?;
+            e.child = Extent {
+                start,
+                bytes: encoded.len() as u64,
+            };
+            return Ok(e);
+        }
         let mut copy = |x: Extent| -> Result<Extent> {
             if x.start < STAGED {
                 Ok(x)
@@ -1134,8 +1180,8 @@ impl Snail {
             let rows = rows.unwrap_or_else(rows_now);
             return Ok((self.blocks_written(w, table, order, head, &rows)?, true));
         }
-        // Each column's last page written afresh with the new rows after it, plain, in as many pages
-        // as they take.
+        // The new rows go after the block's last, into its tail: plain pages of one disk page, each
+        // written afresh as rows come, the k-page pages before them left as they lie.
         let key_at = |p: usize| -> Vec<KeyValue> {
             order
                 .levels
@@ -1158,28 +1204,37 @@ impl Snail {
                     .last()
                     .expect("a block's column holds a page")
                     .clone();
-                let dictionary = cp
-                    .dictionary
-                    .map(|d| self.reader.read_extent(d))
-                    .transpose()?;
-                let bytes = self.reader.read_extent(last.at)?;
-                let held = decode(
-                    &descs[s],
-                    ty,
-                    dictionary.as_deref(),
-                    &[bytes.as_slice()],
-                    last.rows as usize,
-                )?;
+                // The tail's last page is written afresh with the new rows; a page of rows in the
+                // order's order stays, and the tail begins after it.
+                let in_tail = last.first_row >= map.sorted;
                 let mut values = Values::new(ty);
-                for i in 0..held.len() {
-                    push(&mut values, &datum_typed(&held, i, ty));
+                if in_tail {
+                    let dictionary = cp
+                        .dictionary
+                        .map(|d| self.reader.read_extent(d))
+                        .transpose()?;
+                    let bytes = self.reader.read_extent(last.at)?;
+                    let held = decode(
+                        &descs[s],
+                        ty,
+                        dictionary.as_deref(),
+                        &[bytes.as_slice()],
+                        last.rows as usize,
+                    )?;
+                    for i in 0..held.len() {
+                        push(&mut values, &datum_typed(&held, i, ty));
+                    }
                 }
                 for (_, row) in &added {
                     push(&mut values, &row[s]);
                 }
-                let base = last.first_row as usize;
+                let base = if in_tail {
+                    last.first_row
+                } else {
+                    last.first_row + last.rows
+                } as usize;
                 let mut fresh = Vec::new();
-                for p in plain_pages(&descs[s], ty, &values, head.units[s] as usize)?.pages {
+                for p in tail_pages(&descs[s], ty, &values, head.units[s] as usize)?.pages {
                     let row = base + p.first_row;
                     fresh.push(PageEntry {
                         at: w.place(&p.bytes)?,
@@ -1193,7 +1248,9 @@ impl Snail {
                     });
                 }
                 let pages = &mut map.columns[s].pages;
-                pages.pop();
+                if in_tail {
+                    pages.pop();
+                }
                 pages.extend(fresh);
             }
         }

@@ -1,7 +1,7 @@
 //! A block's column as the plain parquet library writes it: its own data pages, page by page.
 
 use crate::catalog::ColumnType;
-use crate::cut::{DATA_PAGE_ROWS, PAGE};
+use crate::cut::{unit_sizes, DATA_PAGE_ROWS, PAGE};
 use crate::values::{Values, LENGTH_PREFIX};
 use crate::{Error, Result};
 use bytes::Bytes;
@@ -330,6 +330,25 @@ pub fn plain_pages(
         k,
         guess(k, plain_bits(values, ty), nullable),
     )
+}
+
+/// Values after a block's last, written plain in data pages of one disk page each, or of the fewest a
+/// value too wide for one needs, up to `k`.
+pub fn tail_pages(
+    desc: &ColumnDescPtr,
+    ty: ColumnType,
+    values: &Values,
+    k: usize,
+) -> Result<Encoded> {
+    let sizes = unit_sizes(k.max(1));
+    let mut refused = None;
+    for &size in &sizes {
+        match plain_pages(desc, ty, values, size) {
+            Ok(e) => return Ok(e),
+            Err(e) => refused = Some(e),
+        }
+    }
+    Err(refused.expect("a unit takes at least one size"))
 }
 
 /// The values of the data pages given, in row order, from their bytes and the dictionary's.
@@ -750,6 +769,26 @@ mod tests {
         assert_eq!(e.pages.len(), 1);
         assert_eq!(e.disk_pages(), 8);
         assert_eq!(roundtrip(&e, &desc, ColumnType::Timestamptz), values);
+    }
+
+    #[test]
+    fn a_tail_lies_in_pages_of_one_disk_page_and_a_value_wider_takes_the_fewest_it_needs() {
+        // Six hundred instants are more than one disk page holds: the tail takes two pages of one,
+        // where pages of k would take one of two.
+        let desc = descriptor("observed_at", ColumnType::Timestamptz, false).unwrap();
+        let values = Values::Int((0..600).map(|i| Some(1_669_852_800_000_000 + i)).collect());
+        let e = tail_pages(&desc, ColumnType::Timestamptz, &values, 16).unwrap();
+        assert!(e.dictionary.is_none());
+        assert!(e.pages.len() > 1);
+        assert!(e.pages.iter().all(|p| p.bytes.len() <= PAGE));
+        assert_eq!(roundtrip(&e, &desc, ColumnType::Timestamptz), values);
+        // A name of 5,000 bytes fits no page of one disk page: it takes a page of two.
+        let desc = descriptor("name", ColumnType::Text(None), false).unwrap();
+        let wide = Values::Text(vec![Some("n".repeat(5_000)), Some("short".into())]);
+        let e = tail_pages(&desc, ColumnType::Text(None), &wide, 4).unwrap();
+        assert_eq!(e.disk_pages(), 2);
+        assert_eq!(roundtrip(&e, &desc, ColumnType::Text(None)), wide);
+        assert!(tail_pages(&desc, ColumnType::Text(None), &wide, 1).is_err());
     }
 
     #[test]

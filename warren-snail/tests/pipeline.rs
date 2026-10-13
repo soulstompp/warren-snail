@@ -142,11 +142,6 @@ fn a_table_declared_in_a_file_that_holds_others_takes_rows_and_reads_its_runs() 
     assert_eq!(wind_blocks(&r), wind_blocks(&fresh));
     let (b, _) = r.ask_with(WIND, None, &wind_params()).unwrap();
     assert_eq!(as_written(&b), want);
-    // Read whole on the snail open to write, a block pays no page for its rows out of place, and
-    // stays as it is.
-    let (b, round) = w.ask_with(WIND, None, &wind_params()).unwrap();
-    assert_eq!(as_written(&b), want);
-    assert_eq!(round.blocks_pruned, 0);
     // Read on its key, the pages read only for rows past a block's sorted ones prune it, and it is
     // cut again by the counts.
     let first = rows[0].0;
@@ -165,8 +160,21 @@ fn a_table_declared_in_a_file_that_holds_others_takes_rows_and_reads_its_runs() 
     );
     assert_eq!(round.blocks_pruned, 1);
     assert!(wind_blocks(&w) > 1, "{} blocks", wind_blocks(&w));
-    let (b, _) = w.ask_with(WIND, None, &wind_params()).unwrap();
+    // A row written after a block's last lies in its tail; deleted, it is still there. Read whole,
+    // the block is read a page for that row alone, and pruned; read whole again, it is not.
+    let next = rows.iter().map(|x| x.0).max().unwrap() + 1;
+    w.execute(&format!(
+        "INSERT INTO weather.wind (seq, station, turn) VALUES ({next}, '\\x00', 0.0)"
+    ))
+    .unwrap();
+    w.execute(&format!("DELETE FROM weather.wind WHERE seq = {next}"))
+        .unwrap();
+    let (b, round) = w.ask_with(WIND, None, &wind_params()).unwrap();
     assert_eq!(as_written(&b), want);
+    assert_eq!(round.blocks_pruned, 1, "{round:?}");
+    let (b, round) = w.ask_with(WIND, None, &wind_params()).unwrap();
+    assert_eq!(as_written(&b), want);
+    assert_eq!(round.blocks_pruned, 0);
     drop(w);
     r.census().unwrap();
     let (b, _) = r.ask_with(WIND, None, &wind_params()).unwrap();

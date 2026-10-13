@@ -594,3 +594,131 @@ fn a_program_killed_while_it_holds_a_round_lets_its_pages_go() {
         "{held} and {after} reused, {free} free before"
     );
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_row_written_after_a_blocks_last_lies_in_a_tail_of_one_disk_page_and_the_pages_before_stay() {
+    let s = sample(20_000);
+    let path = snail("tail", &s);
+    // Each column of each block of the readings: its counting unit, its data pages and their disk
+    // pages.
+    let listed = |s: &Snail| -> BTreeMap<(String, u64, String), (u64, u64, u64)> {
+        s.blocks()
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.table == "weather.readings")
+            .map(|b| {
+                (
+                    (b.order, b.block, b.column),
+                    (b.k, b.data_pages, b.disk_pages),
+                )
+            })
+            .collect()
+    };
+    let before = listed(&Snail::open(&path).unwrap());
+    let (network, station) = busiest(&s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let insert = |w: &mut Snail, id: i64| {
+        w.execute(&format!(
+            "INSERT INTO weather.readings (reading_id, network_id, station_no, feed, observed_at, checked_at) \
+             VALUES ({id}, {network}, {station}, 'AWS Main', '2022-06-15 10:00:00+00', NULL)"
+        ))
+        .unwrap()
+    };
+    // One row: each column of the block it lands in, on every order, gains one data page of one disk
+    // page, whatever its counting unit, and every page before it stays as it lay.
+    let d = insert(&mut w, 3_000_001);
+    assert_eq!((d.rows, d.rewritten), (1, 0), "{d:?}");
+    let once = listed(&w);
+    assert_eq!(once.len(), before.len());
+    let grown: Vec<_> = once
+        .iter()
+        .filter(|(at, now)| before[*at] != **now)
+        .collect();
+    assert!(!grown.is_empty());
+    for (at, now) in &grown {
+        let was = before[*at];
+        assert_eq!(
+            (now.0, now.1, now.2),
+            (was.0, was.1 + 1, was.2 + 1),
+            "{at:?}"
+        );
+    }
+    let orders: std::collections::BTreeSet<&String> = grown.iter().map(|(at, _)| &at.0).collect();
+    assert_eq!(orders.len(), 3, "{grown:?}");
+    assert!(grown.iter().any(|(_, now)| now.0 > 1), "{grown:?}");
+    // A second row goes into the same tail page, written afresh: no page more.
+    insert(&mut w, 3_000_002);
+    assert_eq!(listed(&w), once);
+    let q = format!(
+        "SELECT r.reading_id FROM weather.readings r \
+         WHERE r.network_id = {network} AND r.station_no = {station}"
+    );
+    let mut r = fresh(&path);
+    let (b, round) = r.ask(&q, None).unwrap();
+    exact(&q, &round);
+    let ids = ints64(b.column(0).as_ref());
+    assert!(ids.contains(&Some(3_000_001)) && ids.contains(&Some(3_000_002)));
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_block_statements_change_may_lie_in_two_files_and_a_block_written_whole_lies_in_one() {
+    let s = sample(5_000);
+    let path = snail_spanned("files-writes", &s, 64);
+    let order = in_order(&s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    // Readings checked one by one across the stations: each commit writes its pages where a free run
+    // or the last file has room, and frees the pages it replaced.
+    for (i, (_, _, id)) in order.iter().step_by(125).enumerate() {
+        w.execute(&format!(
+            "UPDATE weather.readings SET feed = 'f{i}' WHERE reading_id = {id}"
+        ))
+        .unwrap();
+    }
+    let files = |s: &Snail| -> Vec<u64> { s.blocks().unwrap().iter().map(|b| b.files).collect() };
+    assert!(files(&w).iter().any(|&f| f > 1), "{:?}", files(&w));
+    let questions = [
+        (
+            "SELECT r.feed, count(*) FROM weather.readings r GROUP BY r.feed",
+            "r_station",
+        ),
+        (
+            "SELECT r.observed_at, r.checked_at FROM weather.readings r \
+             WHERE r.observed_at >= '2000-01-01 00:00:00+00'",
+            "r_month",
+        ),
+        (
+            "SELECT r.reading_id FROM weather.readings r WHERE r.reading_id > 0",
+            "readings_pkey",
+        ),
+    ];
+    let mut r = fresh(&path);
+    let asked: Vec<_> = questions
+        .iter()
+        .map(|(q, o)| {
+            let (b, round) = r.ask(q, Some(o)).unwrap();
+            exact(q, &round);
+            bag(&b)
+        })
+        .collect();
+    // Read whole along each order, the blocks the statements changed are pruned: each written whole,
+    // in one run, in one file.
+    for ((q, o), want) in questions.iter().zip(&asked) {
+        let (b, _) = w.ask(q, Some(o)).unwrap();
+        assert_eq!(&bag(&b), want, "{q}");
+    }
+    let readings: Vec<u64> = w
+        .blocks()
+        .unwrap()
+        .iter()
+        .filter(|b| b.table == "weather.readings")
+        .map(|b| b.files)
+        .collect();
+    assert!(readings.iter().all(|&f| f == 1), "{readings:?}");
+    for ((q, o), want) in questions.iter().zip(&asked) {
+        let (b, round) = fresh(&path).ask(q, Some(o)).unwrap();
+        exact(q, &round);
+        assert_eq!(&bag(&b), want, "{q}");
+    }
+}

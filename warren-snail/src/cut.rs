@@ -192,7 +192,7 @@ fn join_before(out: &mut [Block], first: usize, place: &[i64], t: usize, a: usiz
 }
 
 /// The sizes a counting unit takes, ascending, up to `bound`: 1, 2, 3, 4, 6, 8, 9, 12 and on.
-fn unit_sizes(bound: usize) -> Vec<usize> {
+pub(crate) fn unit_sizes(bound: usize) -> Vec<usize> {
     let mut out = Vec::new();
     let mut a = 1;
     while a <= bound {
