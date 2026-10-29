@@ -440,10 +440,12 @@ fn write_made(
         }
     }
     let mut w = Writer::create_spanned(path, span)?;
+    let mut named = catalog.clone();
     if let Some(f) = format {
         w.set_format(f);
+        crate::read::old_names(&mut named, f);
     }
-    let written = write_tables(w, catalog, tables, sources);
+    let written = write_tables(w, &named, tables, sources);
     if written.is_err() {
         // A write refused leaves no file of its own behind.
         let _ = std::fs::remove_file(path);
@@ -470,6 +472,7 @@ fn write_tables(
         generation: 1,
         ..Default::default()
     };
+    crate::file::holds_catalog(w.format(), catalog)?;
     let mut out = Vec::new();
     for table in &catalog.tables {
         crate::file::holds(w.format(), table)?;

@@ -164,7 +164,7 @@ impl Sink for Second<'_> {
 
 /// A catalog as a snail of `format` names its orders: 0.1.x, formats 7 and 8, named a primary key's
 /// order for its table, whatever its constraint was named.
-pub(super) fn old_names(catalog: &mut Catalog, format: u32) {
+pub(crate) fn old_names(catalog: &mut Catalog, format: u32) {
     if format >= 9 {
         return;
     }

@@ -224,6 +224,13 @@ fn a_generated_column_is_computed_at_the_write_where_stored_and_at_the_read_wher
     drop(w);
     let mut s = Snail::open(&path).unwrap();
     let want = [row(&["1", "7.50", "4"]), row(&["2", "4.00", "5"])];
+    // A scan, as the wrapper asks one, reads the columns the table stores, and names a virtual one.
+    let e = s
+        .scan("SELECT id, next FROM s.t", None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("next is a virtual generated column"), "{e}");
     assert_eq!(rows(&mut s, "SELECT id, gross, next FROM s.t"), want);
     assert_eq!(
         rows(
@@ -387,5 +394,119 @@ fn an_insert_select_takes_its_values_by_postgresql_s_assignment_casts() {
             row(&["1", "1", "2.3", "2020-01-02 03:04:05.5+00", "true"]),
             row(&["2", "2", "-2.3", "1999-12-31 23:59:59+00", "false"]),
         ]
+    );
+}
+
+#[test]
+fn a_snail_of_format_eight_refuses_by_name_what_0_1_x_cannot_read() {
+    for (ddl, why) in [
+        (
+            "CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT 1, PRIMARY KEY (a));",
+            "s.t.b has a DEFAULT, a generation or an identity, which a snail of format 8",
+        ),
+        (
+            "CREATE TABLE s.t (a integer NOT NULL CHECK (a > 0), PRIMARY KEY (a));",
+            "s.t: the CHECK t_a_check, which a snail of format 8",
+        ),
+        (
+            "CREATE TABLE s.t (a integer NOT NULL, b integer UNIQUE, PRIMARY KEY (a));",
+            "s.t: the UNIQUE t_b_key, which a snail of format 8",
+        ),
+        (
+            "CREATE SEQUENCE s.n; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));",
+            "the sequence s.n, which a snail of format 8",
+        ),
+    ] {
+        let path = tmp("eight-refuses.snail");
+        let e = warren_snail::write::write_format_eight(
+            &path,
+            &Catalog::parse(ddl).unwrap(),
+            &[],
+            weather::span(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains(why) && e.contains("`out`"), "{ddl}: {e}");
+    }
+    // Declared into a snail of format 8 the same way; and a primary key named by its constraint
+    // keeps the name 0.1.x gave its order there.
+    let path = tmp("eight-declares.snail");
+    warren_snail::write::write_format_eight(
+        &path,
+        &Catalog::parse("CREATE TABLE s.t (a integer NOT NULL, CONSTRAINT k PRIMARY KEY (a));")
+            .unwrap(),
+        &[],
+        weather::span(),
+    )
+    .unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    assert_eq!(w.catalog.tables[0].orders[0].name, "t_pkey");
+    refused(
+        &mut w,
+        "CREATE SEQUENCE s.n",
+        "the sequence s.n, which a snail of format 8",
+    );
+    run(&mut w, "INSERT INTO s.t (a) VALUES (1)");
+}
+
+#[test]
+fn a_literal_too_long_for_its_column_is_refused_before_a_value_is_drawn() {
+    let path = made(
+        "literal-first",
+        "CREATE TABLE s.t (id integer GENERATED ALWAYS AS IDENTITY, code varchar(3), small smallint, PRIMARY KEY (id));",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    refused(
+        &mut w,
+        "INSERT INTO s.t (code) VALUES ('four')",
+        "value too long for type character varying(3)",
+    );
+    refused(
+        &mut w,
+        "INSERT INTO s.t (small) VALUES (70000)",
+        "out of range",
+    );
+    run(&mut w, "INSERT INTO s.t (code) VALUES ('ab  ')");
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    // PostgreSQL refuses a literal as it plans the statement, so the identity drew nothing for it.
+    assert_eq!(
+        rows(&mut s, "SELECT id, code FROM s.t"),
+        [row(&["1", "ab "])]
+    );
+}
+
+#[test]
+fn now_reads_the_transaction_s_clock_and_statement_timestamp_the_statement_s() {
+    let path = made(
+        "clocks",
+        "CREATE TABLE s.t (id integer NOT NULL, now timestamptz DEFAULT now(),
+             st timestamptz DEFAULT statement_timestamp(), PRIMARY KEY (id));",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(&mut w, "BEGIN");
+    run(&mut w, "INSERT INTO s.t (id) VALUES (1)");
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    run(&mut w, "INSERT INTO s.t (id) VALUES (2)");
+    run(&mut w, "COMMIT");
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    let (b, _) = s
+        .ask("SELECT id, now, st FROM s.t ORDER BY id", None)
+        .unwrap();
+    let col = |i: usize| -> Vec<i64> {
+        b.column(i)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+    let (now, st) = (col(1), col(2));
+    assert_eq!(now[0], now[1], "now() is the transaction's");
+    assert!(
+        st[1] > st[0],
+        "statement_timestamp() is each statement's: {st:?}"
     );
 }

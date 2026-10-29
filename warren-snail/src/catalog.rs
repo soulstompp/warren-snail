@@ -1378,6 +1378,7 @@ mod tests {
         assert!(read[3].1.unwrap().contains("USING gin is not held yet"));
         assert!(read[4].1.unwrap().contains("a partial index, WHERE a > 0"));
         assert_eq!(read[5].1, None);
+        assert_eq!(r.catalog.tables[0].order("tb").unwrap().desc, [true]);
         assert_eq!(
             r.statements[5].notices.len(),
             2,
