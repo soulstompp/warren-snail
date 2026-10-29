@@ -171,8 +171,9 @@ along another, where that one holds the question's columns.
 **Where it stops.** An index is held only as a B-tree, on columns or on the month of an instant on
 UTC's clock. A question that reads a column no order holds in the question's own order still reads
 along the table's order. Cluster each table on the index most of its questions lead with: a key
-handed out as rows arrive, such as a sequence, lays the table out in the order the rows came,
-which few questions ask for.
+handed out as rows arrive, such as a sequence or `uuidv7()`, lays the table out in the order the
+rows came, which few questions ask for, and `gen_random_uuid()` scatters the rows across the
+blocks.
 
 ## Blocks, and the counts they keep
 
@@ -312,12 +313,15 @@ transaction each statement commits on its own.
 sequence's next, drawn at the root's turn for the whole statement and never given back, as
 PostgreSQL's `nextval` is not: a statement rolled back leaves its values unused. A writer holds a
 sequence's `CACHE` values at a time. `now()`, `CURRENT_TIMESTAMP` and `transaction_timestamp()`
-read the transaction's clock, `statement_timestamp()` the statement's. A `STORED` generated column
+read the transaction's clock, `statement_timestamp()` the statement's. `gen_random_uuid()` and
+`uuidv4()` hand out a version 4 uuid, `uuidv7()` a version 7, and the version 7 uuids one writer
+hands out rise. A `STORED` generated column
 is computed at the write; a `VIRTUAL` one, PostgreSQL 18's default, at the read, and no order holds
 it. Each `CHECK` is checked at the write, passing where it is NULL, and `NOT ENFORCED` checks
 nothing; each `UNIQUE` at the statement's end. An `INSERT … SELECT` takes each value by
 PostgreSQL's assignment casts: an integer or numeric rounded and held to its column's range, any
-value as its text into a text column; any other type refused, as PostgreSQL refuses it.
+value as its text into a text column, a value into a column of its own type; any other type
+refused, as PostgreSQL refuses it.
 
 **What it writes.** A row lands in its block on every order that holds its columns, as its places
 name it, after the block's last rows, in pages of one disk page each, until a prune or a cut writes
@@ -563,7 +567,8 @@ Each command exits 0, or prints why it refused and exits 1.
 - Column types: `smallint`, `integer`, `bigint`; `numeric(p, s)` up to 18 digits, held as a
   64-bit integer of its smallest unit; `text` and `varchar(n)`, compared by their bytes; `bytea`;
   `timestamptz`, as microseconds on UTC's clock, its infinities among them; `boolean`, false
-  before true, written in any of PostgreSQL's spellings of it.
+  before true, written in any of PostgreSQL's spellings of it; `uuid`, its 16 bytes compared byte
+  by byte, written in any of PostgreSQL's spellings of it.
 - `CREATE INDEX`, a B-tree, its key on columns, on an instant's month,
   `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
   `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is
@@ -580,9 +585,9 @@ Each command exits 0, or prints why it refused and exits 1.
 
 - **A question:** `SELECT` from one table, or two joined by an inner `JOIN … ON` equal columns;
   conditions joined by `AND`, each a column, or an instant's month on the clock, compared with a
-  value by `=`, `<`, `<=`, `>` or `>=`, or a boolean column alone, under `NOT`, or under `IS TRUE`
-  or `IS FALSE`, or a column under `IS NULL` or `IS NOT NULL`; `count(*)`, and `sum` of an integer
-  or numeric column;
+  value by `=`, `<>`, `<`, `<=`, `>` or `>=`, or a boolean column alone, under `NOT`, or under `IS
+  [NOT] TRUE`, `IS [NOT] FALSE` or `IS [NOT] UNKNOWN`, or a column under `IS NULL` or `IS NOT
+  NULL`; `count(*)`, and `sum` of an integer or numeric column;
   `GROUP BY`; `ORDER BY`. A join reads the table its own conditions narrow first, then keeps the
   other to the keys the first holds.
 - **A pipeline,** a question with a `WITH` or a window: steps over one table and the steps before
