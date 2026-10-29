@@ -497,12 +497,18 @@ CREATE INDEX c_p ON s.c (pid, id);";
         !last.first.starts_with("[NULL") && last.last.starts_with("[NULL"),
         "{last:?}"
     );
-    // In that block, IS NULL keeps the NULLs and passes over the values before them.
-    let nulls: Vec<i64> = (0..N).filter(|&id| pid(id).is_none()).collect();
-    let (b, _) = ask(&mut s, "SELECT id FROM s.c WHERE pid IS NULL", Some("c_p"));
-    let mut got: Vec<i64> = ints64(b.column(0).as_ref()).into_iter().flatten().collect();
-    got.sort();
-    assert_eq!(got, nulls);
+    // In that block, IS NULL keeps the NULLs and passes over the values before them: counted, and
+    // fixing pid's run ahead of a range on id, where each row's pid is held against the NULL.
+    for (q, from) in [
+        ("SELECT id FROM s.c WHERE pid IS NULL", 0),
+        ("SELECT id FROM s.c WHERE pid IS NULL AND id >= 7000", 7000),
+    ] {
+        let nulls: Vec<i64> = (from..N).filter(|&id| pid(id).is_none()).collect();
+        let (b, _) = ask(&mut s, q, Some("c_p"));
+        let mut got: Vec<i64> = ints64(b.column(0).as_ref()).into_iter().flatten().collect();
+        got.sort();
+        assert_eq!(got, nulls, "{q}");
+    }
     for from in [N / 4 - 8, N / 4 - 1, 0, 1000] {
         let sql = format!(
             "SELECT c.id FROM s.p p JOIN s.c c ON c.pid = p.id WHERE p.id >= {from} AND p.id < {}",
