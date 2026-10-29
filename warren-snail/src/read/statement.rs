@@ -316,6 +316,14 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
 }
 
 pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
+    // A declaration goes to the catalog as written, where the snail reads what sqlparser does not.
+    if let Some(kind) = crate::ddl::declares(sql) {
+        let ddl = sql.trim().trim_end_matches(';').trim_end().to_string();
+        if crate::ddl::statements(&ddl)?.len() != 1 {
+            return Err(Error::new("one statement at a time"));
+        }
+        return Ok(Statement::Declare { ddl, kind });
+    }
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
     let s = match statements.as_slice() {
         [s] => s,
@@ -390,18 +398,6 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         }
         Sql::Query(_) => Err(Error::new("a SELECT is a question: ask it")),
         Sql::Truncate { .. } => Err(refused("TRUNCATE")),
-        Sql::CreateTable(_) => Ok(Statement::Declare {
-            ddl: s.to_string(),
-            kind: "CREATE TABLE",
-        }),
-        Sql::CreateIndex(_) => Ok(Statement::Declare {
-            ddl: s.to_string(),
-            kind: "CREATE INDEX",
-        }),
-        Sql::AlterTable(_) => Ok(Statement::Declare {
-            ddl: s.to_string(),
-            kind: "ALTER TABLE",
-        }),
         other => Err(Error::new(format!(
             "{other} is not a statement the snail writes"
         ))),

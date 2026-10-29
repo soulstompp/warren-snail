@@ -31,6 +31,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
        warren-snail out <file> --dir <directory>
        warren-snail blocks <file> --out <blocks.parquet>
        warren-snail census <file>
+       warren-snail catalog (<file> | --ddl <ddl.sql> [--taken <taken.sql>]
+                            [--statements <statements.parquet>]) [--out <catalog.parquet>]
        warren-snail hold <file> --seconds <n>
 
   write   a new snail at <file>, where no file may be yet, from the DDL: each table given its rows
@@ -56,6 +58,11 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
   blocks  one row for each column of each block, as the directory holds it, as Parquet.
   census  every page of the file, by what holds it: named by the newest root, free, or freed once
           an older round ends. Refused where a page is held twice, or by nothing.
+  catalog what the snail reads of a DDL, each statement taken or refused by name, and what it
+          reads and does nothing with; or the catalog a snail holds. --taken writes the
+          statements taken, as a DDL a snail can be written from. --statements records each
+          statement as Parquet, and --out each fact of the catalog: a row each, its kind, its
+          object, the fact and its value.
   hold    the snail held open for the seconds given, as a round that long would hold it.";
 
 fn save(path: &str, batch: &RecordBatch) -> Result<()> {
@@ -620,6 +627,77 @@ fn print_round(question: &str, d: &Done) {
     }
 }
 
+fn cmd_catalog(args: &[String]) -> Result<()> {
+    let catalog = match flag(args, "--ddl") {
+        Some(path) => {
+            let ddl =
+                std::fs::read_to_string(path).map_err(|e| Error::new(format!("{path}: {e}")))?;
+            let reading = Catalog::read(&ddl)?;
+            for s in &reading.statements {
+                match &s.refused {
+                    None => println!("taken    {} {}", s.kind, s.object),
+                    Some(why) => println!("refused  {} {}: {why}", s.kind, s.object),
+                }
+                for n in &s.notices {
+                    println!("         {n}");
+                }
+            }
+            if let Some(out) = flag(args, "--statements") {
+                let st = &reading.statements;
+                let batch = table(vec![
+                    ("statement", counts((1..=st.len() as u64).collect())),
+                    ("kind", texts(st.iter().map(|s| s.kind.clone()).collect())),
+                    (
+                        "object",
+                        texts(st.iter().map(|s| s.object.clone()).collect()),
+                    ),
+                    (
+                        "refused",
+                        Arc::new(
+                            st.iter()
+                                .map(|s| s.refused.clone())
+                                .collect::<StringArray>(),
+                        ) as ArrayRef,
+                    ),
+                    (
+                        "notices",
+                        texts(st.iter().map(|s| s.notices.join("\n")).collect()),
+                    ),
+                    ("text", texts(st.iter().map(|s| s.text.clone()).collect())),
+                ])?;
+                save(out, &batch)?;
+            }
+            if let Some(taken) = flag(args, "--taken") {
+                std::fs::write(taken, &reading.catalog.ddl)
+                    .map_err(|e| Error::new(format!("{taken}: {e}")))?;
+            }
+            reading.catalog
+        }
+        None => {
+            let file = args
+                .first()
+                .filter(|a| !a.starts_with("--"))
+                .ok_or_else(|| Error::new(USAGE))?;
+            Snail::open(Path::new(file))?.catalog.clone()
+        }
+    };
+    if let Some(out) = flag(args, "--out") {
+        let f = catalog.facts();
+        let batch = table(vec![
+            ("kind", texts(f.iter().map(|x| x.kind.clone()).collect())),
+            (
+                "object",
+                texts(f.iter().map(|x| x.object.clone()).collect()),
+            ),
+            ("fact", texts(f.iter().map(|x| x.fact.clone()).collect())),
+            ("value", texts(f.iter().map(|x| x.value.clone()).collect())),
+        ])?;
+        save(out, &batch)?;
+        println!("{out}: {}", n(f.len() as u64, "fact"));
+    }
+    Ok(())
+}
+
 fn cmd_blocks(args: &[String]) -> Result<()> {
     let file = args.first().ok_or_else(|| Error::new(USAGE))?;
     let out = flag(args, "--out").ok_or_else(|| Error::new(USAGE))?;
@@ -673,6 +751,7 @@ fn main() -> ExitCode {
         Some("hold") => cmd_hold(&args[1..]),
         Some("census") => cmd_census(&args[1..]),
         Some("blocks") => cmd_blocks(&args[1..]),
+        Some("catalog") => cmd_catalog(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())

@@ -1,18 +1,15 @@
-//! The DDL: each table, its order and its indexes, as PostgreSQL's own statements declare them.
+//! The DDL: each table, its order and its indexes, as PostgreSQL's own statements declare them, and
+//! the types, domains, sequences and collations the DDL declares beside them.
 //!
 //! The order is the index `ALTER TABLE … CLUSTER ON` names, or the primary key where none is named.
-//! Every other index is held in an order of its own, and so is a primary key that is not the order.
+//! Every other index is held in an order of its own, and so is a primary key that is not the order,
+//! and each UNIQUE.
 
 use crate::{Error, Result};
 use sqlparser::ast::{
-    CastKind, CharacterLength, ColumnOption, CreateFunctionBody, DataType, DateTimeField,
-    ExactNumberInfo, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
-    ObjectNamePart, OrderBySort, SelectItem, SetExpr, Statement, TableConstraint, TimezoneInfo,
-    Value,
+    CastKind, CharacterLength, DataType, DateTimeField, ExactNumberInfo, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, TimezoneInfo, Value,
 };
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -65,6 +62,10 @@ impl ColumnType {
         matches!(self, ColumnType::Text(_) | ColumnType::Bytes)
     }
 
+    pub fn is_integer(self) -> bool {
+        matches!(self, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+    }
+
     pub fn name(self) -> String {
         match self {
             ColumnType::Int2 => "smallint".into(),
@@ -78,6 +79,82 @@ impl ColumnType {
             ColumnType::Boolean => "boolean".into(),
         }
     }
+
+    /// The type as PostgreSQL's `format_type` names it.
+    pub fn pg_name(self) -> String {
+        match self {
+            ColumnType::Int2 => "smallint".into(),
+            ColumnType::Int4 => "integer".into(),
+            ColumnType::Int8 => "bigint".into(),
+            ColumnType::Timestamptz => "timestamp with time zone".into(),
+            ColumnType::Text(None) => "text".into(),
+            ColumnType::Text(Some(n)) => format!("character varying({n})"),
+            ColumnType::Bytes => "bytea".into(),
+            ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
+            ColumnType::Boolean => "boolean".into(),
+        }
+    }
+
+    /// The B-tree operator class PostgreSQL takes for a key of this type where its index names
+    /// none.
+    pub fn default_opclass(self) -> &'static str {
+        match self {
+            ColumnType::Int2 => "int2_ops",
+            ColumnType::Int4 => "int4_ops",
+            ColumnType::Int8 => "int8_ops",
+            ColumnType::Timestamptz => "timestamptz_ops",
+            ColumnType::Text(_) => "text_ops",
+            ColumnType::Bytes => "bytea_ops",
+            ColumnType::Numeric { .. } => "numeric_ops",
+            ColumnType::Boolean => "bool_ops",
+        }
+    }
+
+    /// The range of an integer type, as PostgreSQL bounds it.
+    pub fn integer_range(self) -> Option<(i64, i64)> {
+        match self {
+            ColumnType::Int2 => Some((i16::MIN as i64, i16::MAX as i64)),
+            ColumnType::Int4 => Some((i32::MIN as i64, i32::MAX as i64)),
+            ColumnType::Int8 => Some((i64::MIN, i64::MAX)),
+            _ => None,
+        }
+    }
+}
+
+/// Whether PostgreSQL assigns a value of type `from` to a column of type `to` without an explicit
+/// cast: its implicit and assignment casts among the types held (`pg_cast`, `castcontext` 'i' or
+/// 'a'), and the conversion through text output it allows into a string type.
+pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
+    use ColumnType::*;
+    matches!(
+        (from, to),
+        (_, Text(_))
+            | (
+                Int2 | Int4 | Int8 | Numeric { .. },
+                Int2 | Int4 | Int8 | Numeric { .. }
+            )
+            | (Timestamptz, Timestamptz)
+            | (Bytes, Bytes)
+            | (Boolean, Boolean)
+    )
+}
+
+/// A column the DDL generates from the row's other columns.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Generated {
+    pub expr: Expr,
+    /// Computed at the write and kept; otherwise VIRTUAL, computed at the read.
+    pub stored: bool,
+}
+
+/// A column whose values a sequence of its own hands out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Identity {
+    /// GENERATED ALWAYS: a row may give it no value of its own.
+    pub always: bool,
+    pub sequence: String,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +163,19 @@ pub struct Column {
     pub name: String,
     pub ty: ColumnType,
     pub not_null: bool,
+    /// What fills it where a row gives it none.
+    pub default: Option<Expr>,
+    pub generated: Option<Generated>,
+    pub identity: Option<Identity>,
+    /// The collation its DDL names, where it names one.
+    pub collation: Option<String>,
+}
+
+impl Column {
+    /// Whether the column is computed at the read, and so held by no order.
+    pub fn is_virtual(&self) -> bool {
+        self.generated.as_ref().is_some_and(|g| !g.stored)
+    }
 }
 
 /// One level of an order: a column, or the month of a timestamptz column on the UTC clock.
@@ -105,6 +195,15 @@ impl Level {
     }
 }
 
+/// The PRIMARY KEY or UNIQUE an order stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyConstraint {
+    pub primary: bool,
+    /// DEFERRABLE, checked at each statement's end, as PostgreSQL checks one INITIALLY IMMEDIATE.
+    pub deferrable: bool,
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Order {
@@ -121,6 +220,20 @@ pub struct Order {
     /// Whether keys holding a NULL are each their own, so that a unique order takes any number of
     /// them: unless its index says NULLS NOT DISTINCT.
     pub nulls_distinct: bool,
+    /// For each level, whether its index writes it DESC: its values are held rising all the same.
+    pub desc: Vec<bool>,
+    /// Each level as its index writes it: a column's name, or the expression.
+    pub keys: Vec<String>,
+    /// For each level, its B-tree operator class: the one its index names, or its type's default.
+    pub opclasses: Vec<String>,
+    /// The columns its INCLUDE names.
+    pub include: Vec<usize>,
+    /// The storage parameters its index sets, as written: read, and nothing in a snail.
+    pub options: Vec<(String, String)>,
+    /// The PRIMARY KEY or UNIQUE it stands for, where it stands for one.
+    pub constraint: Option<KeyConstraint>,
+    /// Whether ALTER TABLE … CLUSTER ON names it.
+    pub clustered: bool,
 }
 
 impl Order {
@@ -130,6 +243,16 @@ impl Order {
     }
 }
 
+/// A CHECK on a table's row.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Check {
+    pub name: String,
+    pub expr: Expr,
+    /// NOT ENFORCED checks nothing.
+    pub enforced: bool,
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Table {
@@ -137,6 +260,7 @@ pub struct Table {
     pub columns: Vec<Column>,
     /// The table's order first, then its indexes.
     pub orders: Vec<Order>,
+    pub checks: Vec<Check>,
 }
 
 impl Table {
@@ -163,6 +287,63 @@ impl Table {
     pub fn order(&self, name: &str) -> Option<&Order> {
         self.orders.iter().find(|o| o.name == name)
     }
+
+    /// The column whose values are handed out as rows arrive, where the table's order leads with
+    /// one: an identity, or a DEFAULT that a sequence or the clock fills.
+    pub fn arrival_key(&self) -> Option<usize> {
+        let order = self.orders.iter().find(|o| o.table_order)?;
+        let c = order.levels.first()?.column();
+        let col = &self.columns[c];
+        (col.identity.is_some() || col.default.as_ref().is_some_and(hands_out)).then_some(c)
+    }
+}
+
+/// Whether a DEFAULT hands out a value as each row arrives: a sequence's next value, or the clock.
+pub fn hands_out(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x) | Expr::Cast { expr: x, .. } => hands_out(x),
+        Expr::Function(f) => matches!(
+            object_name(&f.name).to_lowercase().as_str(),
+            "nextval"
+                | "pg_catalog.nextval"
+                | "now"
+                | "current_timestamp"
+                | "transaction_timestamp"
+                | "statement_timestamp"
+                | "clock_timestamp"
+                | "gen_random_uuid"
+                | "uuidv7"
+                | "uuidv4"
+        ),
+        _ => false,
+    }
+}
+
+/// What a type the DDL declares is.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum TypeKind {
+    /// Its labels, in their order.
+    Enum {
+        labels: Vec<String>,
+    },
+    /// Its fields: each name, its type as PostgreSQL names it, and the collation it names.
+    Composite {
+        fields: Vec<(String, String, Option<String>)>,
+    },
+    Range(RangeType),
+}
+
+/// A range the DDL declares, and the multirange PostgreSQL makes beside it.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct RangeType {
+    pub subtype: String,
+    pub opclass: Option<String>,
+    pub collation: Option<String>,
+    pub canonical: Option<String>,
+    pub subtype_diff: Option<String>,
+    pub multirange: String,
 }
 
 /// A type the DDL declares.
@@ -170,6 +351,131 @@ impl Table {
 #[non_exhaustive]
 pub struct Type {
     pub name: String,
+    pub kind: TypeKind,
+}
+
+/// A domain's CHECK.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct DomainCheck {
+    pub name: String,
+    pub check: Expr,
+    /// VALIDATE CONSTRAINT has checked it, or it was never NOT VALID.
+    pub valid: bool,
+}
+
+/// A domain the DDL declares: a type and what its values must meet.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Domain {
+    pub name: String,
+    /// Its base type, as PostgreSQL names it.
+    pub base: String,
+    /// Its base type, where the snail holds it.
+    pub base_type: Option<ColumnType>,
+    pub collation: Option<String>,
+    pub default: Option<Expr>,
+    pub not_null: bool,
+    /// The name its NOT NULL is given, where it is given one.
+    pub not_null_name: Option<String>,
+    pub checks: Vec<DomainCheck>,
+}
+
+/// The type a sequence counts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SequenceType {
+    Int2,
+    Int4,
+    Int8,
+}
+
+impl SequenceType {
+    pub fn of(dt: &DataType) -> Option<SequenceType> {
+        match held_type(dt).ok()? {
+            ColumnType::Int2 => Some(SequenceType::Int2),
+            ColumnType::Int4 => Some(SequenceType::Int4),
+            ColumnType::Int8 => Some(SequenceType::Int8),
+            _ => None,
+        }
+    }
+
+    pub fn column(self) -> ColumnType {
+        match self {
+            SequenceType::Int2 => ColumnType::Int2,
+            SequenceType::Int4 => ColumnType::Int4,
+            SequenceType::Int8 => ColumnType::Int8,
+        }
+    }
+
+    pub fn min(self) -> i64 {
+        self.column().integer_range().unwrap().0
+    }
+
+    pub fn max(self) -> i64 {
+        self.column().integer_range().unwrap().1
+    }
+}
+
+/// A sequence the DDL declares, or one a serial or an identity column makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Sequence {
+    pub name: String,
+    pub ty: SequenceType,
+    pub increment: i64,
+    pub min: i64,
+    pub max: i64,
+    pub start: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    /// The table and column it goes with.
+    pub owned_by: Option<(String, String)>,
+    /// Where it stands once the DDL is read, as PostgreSQL's `last_value` and `is_called`: the value
+    /// it hands out next, where it has handed out none since it was made or restarted.
+    pub last_value: i64,
+    pub is_called: bool,
+    /// The identity column it hands values out to.
+    pub identity: bool,
+}
+
+/// A collation the DDL declares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Collation {
+    pub name: String,
+    pub provider: String,
+    pub locale: Option<String>,
+    pub lc_collate: Option<String>,
+    pub lc_ctype: Option<String>,
+    pub deterministic: bool,
+    pub rules: Option<String>,
+    /// The collation it is copied from, where it is.
+    pub from: Option<String>,
+}
+
+impl Collation {
+    /// Whether it orders text by its bytes, as the snail compares text without the feature that
+    /// calls a collation library.
+    pub fn byte_order(&self) -> bool {
+        if let Some(f) = &self.from {
+            return BYTE_ORDER.contains(&f.as_str());
+        }
+        let collate = self.lc_collate.as_ref().or(self.locale.as_ref());
+        match self.provider.as_str() {
+            "libc" => {
+                collate.is_some_and(|c| BYTE_ORDER.contains(&c.as_str()))
+                    && self
+                        .lc_ctype
+                        .as_ref()
+                        .or(self.locale.as_ref())
+                        .is_some_and(|c| BYTE_ORDER.contains(&c.as_str()))
+                    && self.deterministic
+            }
+            "builtin" => collate.is_some_and(|c| c == "C") && self.deterministic,
+            _ => false,
+        }
+    }
 }
 
 /// A function written in SQL whose body is one expression over its arguments.
@@ -190,6 +496,46 @@ pub struct Catalog {
     pub functions: Vec<Function>,
     /// The types the DDL declares, which a column of one names by its place here.
     pub types: Vec<Type>,
+    pub domains: Vec<Domain>,
+    pub sequences: Vec<Sequence>,
+    pub collations: Vec<Collation>,
+}
+
+/// A DDL read a statement at a time: the catalog of the statements taken, and each statement taken
+/// or refused by name.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Reading {
+    pub catalog: Catalog,
+    pub statements: Vec<StatementRead>,
+}
+
+/// One statement of a DDL as the snail read it.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct StatementRead {
+    /// The statement as written.
+    pub text: String,
+    /// What it is, as its first words say: CREATE TABLE, ALTER SEQUENCE and so on.
+    pub kind: String,
+    /// The object it names.
+    pub object: String,
+    /// Why it was refused, where it was.
+    pub refused: Option<String>,
+    /// What it declares that is read and does nothing in a snail, or what IF [NOT] EXISTS passed
+    /// over.
+    pub notices: Vec<String>,
+}
+
+/// One fact of a catalog: what kind of object, which, the fact, and its value, as PostgreSQL's own
+/// catalogs give the same fact.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub struct Fact {
+    pub kind: String,
+    pub object: String,
+    pub fact: String,
+    pub value: String,
 }
 
 /// What an expression reads, once the functions it calls are read through.
@@ -202,6 +548,183 @@ pub enum Shape {
     MonthUtc(usize),
 }
 
+impl Sequence {
+    /// A sequence made by CREATE SEQUENCE, or for a serial or an identity column, from its options
+    /// as PostgreSQL's `init_params` reads them.
+    pub(crate) fn made(
+        name: &str,
+        options: &[crate::ddl::SequenceOption],
+        what: &str,
+    ) -> Result<Sequence> {
+        let mut s = Sequence {
+            name: name.to_string(),
+            ty: SequenceType::Int8,
+            increment: 1,
+            min: 1,
+            max: i64::MAX,
+            start: 1,
+            cache: 1,
+            cycle: false,
+            owned_by: None,
+            last_value: 1,
+            is_called: false,
+            identity: false,
+        };
+        s.set(options, true, what)?;
+        Ok(s)
+    }
+
+    /// The sequence as ALTER SEQUENCE leaves it.
+    pub(crate) fn alter(
+        &mut self,
+        options: &[crate::ddl::SequenceOption],
+        what: &str,
+    ) -> Result<()> {
+        let mut s = self.clone();
+        s.set(options, false, what)?;
+        *self = s;
+        Ok(())
+    }
+
+    fn set(
+        &mut self,
+        options: &[crate::ddl::SequenceOption],
+        init: bool,
+        what: &str,
+    ) -> Result<()> {
+        use crate::ddl::SequenceOption as O;
+        let mut seen: Vec<std::mem::Discriminant<O>> = Vec::new();
+        for o in options {
+            let d = std::mem::discriminant(o);
+            if seen.contains(&d) {
+                return Err(Error::new(format!(
+                    "{what}: conflicting or redundant options"
+                )));
+            }
+            seen.push(d);
+        }
+        let find = |f: &dyn Fn(&O) -> bool| options.iter().find(|o| f(o));
+        let typename = |t: SequenceType| t.column().pg_name();
+        let (mut reset_max, mut reset_min) = (false, false);
+        if let Some(O::As(t)) = find(&|o| matches!(o, O::As(_))) {
+            if !init {
+                reset_max = self.max == self.ty.max();
+                reset_min = self.min == self.ty.min();
+            }
+            self.ty = *t;
+        } else if init {
+            self.ty = SequenceType::Int8;
+        }
+        if let Some(O::Increment(n)) = find(&|o| matches!(o, O::Increment(_))) {
+            if *n == 0 {
+                return Err(Error::new(format!("{what}: INCREMENT must not be zero")));
+            }
+            self.increment = *n;
+        } else if init {
+            self.increment = 1;
+        }
+        if let Some(O::Cycle(b)) = find(&|o| matches!(o, O::Cycle(_))) {
+            self.cycle = *b;
+        } else if init {
+            self.cycle = false;
+        }
+        let max = find(&|o| matches!(o, O::MaxValue(_)));
+        match max {
+            Some(O::MaxValue(Some(v))) => self.max = *v,
+            _ if init || max.is_some() || reset_max => {
+                self.max = if self.increment > 0 || reset_max {
+                    self.ty.max()
+                } else {
+                    -1
+                }
+            }
+            _ => {}
+        }
+        if self.max < self.ty.min() || self.max > self.ty.max() {
+            return Err(Error::new(format!(
+                "{what}: MAXVALUE ({}) is out of range for sequence data type {}",
+                self.max,
+                typename(self.ty)
+            )));
+        }
+        let min = find(&|o| matches!(o, O::MinValue(_)));
+        match min {
+            Some(O::MinValue(Some(v))) => self.min = *v,
+            _ if init || min.is_some() || reset_min => {
+                self.min = if self.increment < 0 || reset_min {
+                    self.ty.min()
+                } else {
+                    1
+                }
+            }
+            _ => {}
+        }
+        if self.min < self.ty.min() || self.min > self.ty.max() {
+            return Err(Error::new(format!(
+                "{what}: MINVALUE ({}) is out of range for sequence data type {}",
+                self.min,
+                typename(self.ty)
+            )));
+        }
+        if self.min >= self.max {
+            return Err(Error::new(format!(
+                "{what}: MINVALUE ({}) must be less than MAXVALUE ({})",
+                self.min, self.max
+            )));
+        }
+        if let Some(O::Start(n)) = find(&|o| matches!(o, O::Start(_))) {
+            self.start = *n;
+        } else if init {
+            self.start = if self.increment > 0 {
+                self.min
+            } else {
+                self.max
+            };
+        }
+        if self.start < self.min {
+            return Err(Error::new(format!(
+                "{what}: START value ({}) cannot be less than MINVALUE ({})",
+                self.start, self.min
+            )));
+        }
+        if self.start > self.max {
+            return Err(Error::new(format!(
+                "{what}: START value ({}) cannot be greater than MAXVALUE ({})",
+                self.start, self.max
+            )));
+        }
+        if let Some(O::Restart(v)) = find(&|o| matches!(o, O::Restart(_))) {
+            self.last_value = v.unwrap_or(self.start);
+            self.is_called = false;
+        } else if init {
+            self.last_value = self.start;
+            self.is_called = false;
+        }
+        if self.last_value < self.min {
+            return Err(Error::new(format!(
+                "{what}: RESTART value ({}) cannot be less than MINVALUE ({})",
+                self.last_value, self.min
+            )));
+        }
+        if self.last_value > self.max {
+            return Err(Error::new(format!(
+                "{what}: RESTART value ({}) cannot be greater than MAXVALUE ({})",
+                self.last_value, self.max
+            )));
+        }
+        if let Some(O::Cache(n)) = find(&|o| matches!(o, O::Cache(_))) {
+            if *n <= 0 {
+                return Err(Error::new(format!(
+                    "{what}: CACHE ({n}) must be greater than zero"
+                )));
+            }
+            self.cache = *n;
+        } else if init {
+            self.cache = 1;
+        }
+        Ok(())
+    }
+}
 pub fn object_name(name: &ObjectName) -> String {
     name.0
         .iter()
@@ -222,7 +745,8 @@ pub fn ident(i: &sqlparser::ast::Ident) -> String {
     }
 }
 
-fn column_type(dt: &DataType) -> Result<ColumnType> {
+/// The type a data type names, where the snail holds it.
+pub fn held_type(dt: &DataType) -> Result<ColumnType> {
     Ok(match dt {
         DataType::SmallInt(None) | DataType::Int2(None) => ColumnType::Int2,
         DataType::Int(None) | DataType::Integer(None) | DataType::Int4(None) => ColumnType::Int4,
@@ -235,13 +759,15 @@ fn column_type(dt: &DataType) -> Result<ColumnType> {
         | DataType::CharacterVarying(length)
         | DataType::CharVarying(length) => ColumnType::Text(match length {
             None => None,
-            Some(CharacterLength::IntegerLength { length, unit: None }) => Some(
-                u32::try_from(*length)
-                    .map_err(|_| Error::new(format!("{dt}: the length is out of range")))?,
-            ),
+            Some(CharacterLength::IntegerLength { length, unit: None }) => {
+                Some(u32::try_from(*length).map_err(|_| {
+                    Error::new(format!("{}: the length is out of range", spelled(dt)))
+                })?)
+            }
             Some(_) => {
                 return Err(Error::new(format!(
-                    "{dt}: PostgreSQL counts a length in characters only"
+                    "{}: PostgreSQL counts a length in characters only",
+                    spelled(dt)
                 )))
             }
         }),
@@ -253,13 +779,15 @@ fn column_type(dt: &DataType) -> Result<ColumnType> {
                 ExactNumberInfo::Precision(p) => (*p, 0),
                 ExactNumberInfo::None => {
                     return Err(Error::new(format!(
-                        "{dt}: a numeric is held with its precision, at most 18 digits"
+                        "{}: a numeric is held with its precision, at most 18 digits",
+                        spelled(dt)
                     )))
                 }
             };
             if !(1..=18).contains(&p) || s < 0 || s as u64 > p {
                 return Err(Error::new(format!(
-                    "{dt}: a numeric is held with at most 18 digits, and a scale within them"
+                    "{}: a numeric is held with at most 18 digits, and a scale within them",
+                    spelled(dt)
                 )));
             }
             ColumnType::Numeric {
@@ -267,8 +795,73 @@ fn column_type(dt: &DataType) -> Result<ColumnType> {
                 scale: s as u8,
             }
         }
-        other => return Err(Error::new(format!("the type {other} is not held"))),
+        other => {
+            return Err(Error::new(format!(
+                "the type {} is not held",
+                spelled(other)
+            )))
+        }
     })
+}
+
+/// A data type as PostgreSQL's `format_type` names it: the held types and the common built-ins by
+/// their canonical names, any other as written, its name folded.
+pub fn format_type(dt: &DataType) -> String {
+    match held_type(dt) {
+        Ok(t) => t.pg_name(),
+        Err(_) => spelled(dt),
+    }
+}
+
+/// A data type the snail does not hold, as PostgreSQL names it.
+fn spelled(dt: &DataType) -> String {
+    let length = |l: &Option<u64>| l.map(|n| format!("({n})")).unwrap_or_default();
+    match dt {
+        DataType::Array(sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner, _))
+        | DataType::Array(sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner)) => {
+            format!("{}[]", format_type(inner))
+        }
+        DataType::Char(l) | DataType::Character(l) => match l {
+            Some(CharacterLength::IntegerLength { length, .. }) => format!("character({length})"),
+            _ => "character(1)".into(),
+        },
+        DataType::Varchar(None) | DataType::CharacterVarying(None) => "character varying".into(),
+        DataType::Numeric(ExactNumberInfo::None) | DataType::Decimal(ExactNumberInfo::None) => {
+            "numeric".into()
+        }
+        DataType::Real | DataType::Float4 => "real".into(),
+        DataType::DoublePrecision | DataType::Float8 => "double precision".into(),
+        DataType::Date => "date".into(),
+        DataType::Uuid => "uuid".into(),
+        DataType::JSON => "json".into(),
+        DataType::JSONB => "jsonb".into(),
+        DataType::Interval { .. } => "interval".into(),
+        DataType::Timestamp(p, tz) => format!(
+            "timestamp{} {}",
+            length(p),
+            match tz {
+                TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => "with time zone",
+                _ => "without time zone",
+            }
+        ),
+        DataType::Time(p, tz) => format!(
+            "time{} {}",
+            length(p),
+            match tz {
+                TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => "with time zone",
+                _ => "without time zone",
+            }
+        ),
+        DataType::Custom(name, args) => {
+            let n = object_name(name);
+            if args.is_empty() {
+                n
+            } else {
+                format!("{n}({})", args.join(","))
+            }
+        }
+        other => other.to_string().to_lowercase(),
+    }
 }
 
 /// A numeric written in decimal, as the integer of its smallest unit at `scale`, rounded half away
@@ -306,7 +899,16 @@ pub fn numeric_units(text: &str, precision: u8, scale: u8) -> Result<i64> {
 }
 
 /// The collations whose order is the bytes', as the snail compares text.
-const BYTE_ORDER: [&str; 2] = ["C", "POSIX"];
+pub(crate) const BYTE_ORDER: [&str; 2] = ["C", "POSIX"];
+
+/// The B-tree operator classes on text that compare its bytes, as the snail does: every one of
+/// them, under a collation of byte order.
+pub(crate) const TEXT_OPCLASSES: [&str; 4] = [
+    "text_ops",
+    "text_pattern_ops",
+    "varchar_ops",
+    "varchar_pattern_ops",
+];
 
 /// The shape of an expression over one table's columns. `alias` is the name the statement gives the
 /// table; `env` holds the shapes of a function's arguments while its body is read.
@@ -342,6 +944,19 @@ pub fn shape(
                 Err(Error::new(format!(
                     "{qualifier}.{name} names no table the statement reads"
                 )))
+            }
+        }
+        Expr::Collate { expr, collation } => {
+            let named = object_name(collation);
+            match shape(expr, table, alias, columns, functions, env)? {
+                Shape::Column(c)
+                    if columns[c].ty.is_text() && BYTE_ORDER.contains(&named.as_str()) =>
+                {
+                    Ok(Shape::Column(c))
+                }
+                _ => Err(Error::new(format!(
+                    "{expr} COLLATE {named}: text is compared by its bytes, so only C is read"
+                ))),
             }
         }
         Expr::Value(v) => match &v.value {
@@ -465,509 +1080,65 @@ pub fn shape(
 }
 
 /// The level a key's expression is. A timestamptz column on the UTC clock keys as the column itself.
-fn level(s: Shape) -> Level {
+pub(crate) fn level(s: Shape) -> Level {
     match s {
         Shape::Column(c) | Shape::Clock(c) => Level::Column(c),
         Shape::MonthUtc(c) => Level::MonthUtc(c),
     }
 }
 
-struct Index {
-    name: String,
-    table: String,
-    keys: Vec<Expr>,
-    /// Each key's NULLs first, as `Order::nulls_first` reads them.
-    nulls_first: Vec<bool>,
-    include: Vec<String>,
-    unique: bool,
-    nulls_distinct: bool,
-}
-
-/// One index of a table, read as an order.
-#[derive(Clone)]
-struct Keyed {
-    name: String,
-    levels: Vec<Level>,
-    include: Vec<usize>,
-    unique: bool,
-    nulls_first: Vec<bool>,
-    nulls_distinct: bool,
-}
-
-/// The statements of a DDL, split on their semicolons by sqlparser's PostgreSQL tokenizer.
-fn statements(ddl: &str) -> Result<Vec<Vec<Token>>> {
-    let tokens = Tokenizer::new(&PostgreSqlDialect {}, ddl).tokenize()?;
-    let mut out = vec![Vec::new()];
-    for t in tokens {
-        if t == Token::SemiColon {
-            out.push(Vec::new());
-        } else {
-            out.last_mut().unwrap().push(t);
-        }
-    }
-    Ok(out
-        .into_iter()
-        .filter(|s| s.iter().any(|t| !matches!(t, Token::Whitespace(_))))
-        .collect())
-}
-
-/// `ALTER TABLE <table> CLUSTER ON <index>`, which sqlparser does not parse: (table, index).
-fn cluster_on(tokens: &[Token]) -> Option<(String, String)> {
-    let words: Vec<&Token> = tokens
-        .iter()
-        .filter(|t| !matches!(t, Token::Whitespace(_)))
-        .collect();
-    let word = |t: &Token| match t {
-        Token::Word(w) => Some(w.clone()),
-        _ => None,
-    };
-    let kw = |t: &Token, k: &str| {
-        word(t).is_some_and(|w| w.quote_style.is_none() && w.value.eq_ignore_ascii_case(k))
-    };
-    if words.len() < 6 || !kw(words[0], "ALTER") || !kw(words[1], "TABLE") {
-        return None;
-    }
-    let n = words.len();
-    if !kw(words[n - 3], "CLUSTER") || !kw(words[n - 2], "ON") {
-        return None;
-    }
-    let index = word(words[n - 1])?;
-    let mut table = Vec::new();
-    for (i, t) in words[2..n - 3].iter().enumerate() {
-        if i % 2 == 1 {
-            if **t != Token::Period {
-                return None;
-            }
-            continue;
-        }
-        let w = word(t)?;
-        table.push(if w.quote_style.is_some() {
-            w.value
-        } else {
-            w.value.to_lowercase()
-        });
-    }
-    let index = if index.quote_style.is_some() {
-        index.value
-    } else {
-        index.value.to_lowercase()
-    };
-    Some((table.join("."), index))
-}
-
 impl Catalog {
-    /// The statements of the DDL that declare a table, as they are written, with every function the
-    /// DDL declares, since an index may call one.
-    pub fn ddl_of(&self, table: &str) -> Result<String> {
-        let mut out = Vec::new();
-        for tokens in statements(&self.ddl)? {
-            let text: String = tokens.iter().map(|t| t.to_string()).collect();
-            let keep = match cluster_on(&tokens) {
-                Some((t, _)) => t == table,
-                None => match Parser::new(&PostgreSqlDialect {})
-                    .with_tokens(tokens)
-                    .parse_statement()?
-                {
-                    Statement::CreateFunction(_) => true,
-                    Statement::CreateTable(t) => object_name(&t.name) == table,
-                    Statement::CreateIndex(i) => object_name(&i.table_name) == table,
-                    _ => false,
-                },
-            };
-            if keep {
-                out.push(format!("{};", text.trim()));
-            }
+    /// The DDL read whole: refused at the first statement the snail does not read, by name.
+    pub fn parse(ddl: &str) -> Result<Catalog> {
+        let reading = crate::ddl::read_ddl(ddl, true)?;
+        match reading.statements.iter().find_map(|s| s.refused.as_ref()) {
+            Some(why) => Err(Error::new(why.clone())),
+            None => Ok(Catalog {
+                ddl: ddl.to_string(),
+                ..reading.catalog
+            }),
         }
-        Ok(out.join("\n"))
+    }
+
+    /// The DDL read a statement at a time: each statement taken or refused by name, and the
+    /// catalog of those taken, whose DDL is theirs.
+    pub fn read(ddl: &str) -> Result<Reading> {
+        crate::ddl::read_ddl(ddl, false)
+    }
+
+    /// The statements of the DDL that declare a table, as they are written, with every function,
+    /// type, domain and collation the DDL declares, and the sequences the table's columns take
+    /// their values from.
+    pub fn ddl_of(&self, table: &str) -> Result<String> {
+        crate::ddl::ddl_of(self, table)
     }
 
     /// The statements of the DDL that declare its functions, as they are written, in the order of
     /// `functions`.
     pub fn function_statements(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for tokens in statements(&self.ddl)? {
-            if cluster_on(&tokens).is_some() {
-                continue;
-            }
-            let text: String = tokens.iter().map(|t| t.to_string()).collect();
-            if let Statement::CreateFunction(_) = Parser::new(&PostgreSqlDialect {})
-                .with_tokens(tokens)
-                .parse_statement()?
-            {
-                out.push(format!("{};", text.trim()));
-            }
-        }
-        Ok(out)
-    }
-
-    pub fn parse(ddl: &str) -> Result<Catalog> {
-        let mut functions = Vec::new();
-        let mut creates = Vec::new();
-        let mut indexes = Vec::new();
-        let mut clusters: Vec<(String, String)> = Vec::new();
-        for tokens in statements(ddl)? {
-            if let Some(c) = cluster_on(&tokens) {
-                clusters.push(c);
-                continue;
-            }
-            let statement = Parser::new(&PostgreSqlDialect {})
-                .with_tokens(tokens)
-                .parse_statement()?;
-            match statement {
-                Statement::CreateFunction(f) => functions.push(Self::function(&f)?),
-                Statement::CreateTable(t) => creates.push(t),
-                Statement::CreateIndex(i) => {
-                    let name = i
-                        .name
-                        .as_ref()
-                        .and_then(|n| {
-                            n.0.last().map(|p| match p {
-                                ObjectNamePart::Identifier(id) => ident(id),
-                                other => other.to_string(),
-                            })
-                        })
-                        .ok_or_else(|| {
-                            Error::new("an index needs a name, which CLUSTER ON names")
-                        })?;
-                    if i.predicate.is_some() {
-                        return Err(Error::new(format!("{name}: a partial index is not held")));
-                    }
-                    if i.using.is_some() {
-                        return Err(Error::new(format!("{name}: only B-tree indexes are read")));
-                    }
-                    let mut nulls_first = Vec::new();
-                    for c in &i.columns {
-                        let desc = match &c.column.options.sort {
-                            None | Some(OrderBySort::Asc) => false,
-                            Some(OrderBySort::Desc) => true,
-                            Some(OrderBySort::Using(other)) => {
-                                return Err(Error::new(format!(
-                                    "{name}: {} USING {other} is not read",
-                                    c.column.expr
-                                )))
-                            }
-                        };
-                        nulls_first.push(c.column.options.nulls_first.unwrap_or(desc) != desc);
-                    }
-                    indexes.push(Index {
-                        name,
-                        table: object_name(&i.table_name),
-                        keys: i.columns.iter().map(|c| c.column.expr.clone()).collect(),
-                        nulls_first,
-                        include: i.include.iter().map(ident).collect(),
-                        unique: i.unique,
-                        nulls_distinct: i.nulls_distinct != Some(false),
-                    });
-                }
-                other => {
-                    let text = other.to_string();
-                    let head: String = text.chars().take(60).collect();
-                    return Err(Error::new(format!("the statement {head}… is not read")));
-                }
-            }
-        }
-        let mut tables = Vec::new();
-        for t in &creates {
-            let name = object_name(&t.name);
-            let mut columns = Vec::new();
-            let mut primary: Option<Vec<String>> = None;
-            for c in &t.columns {
-                let ty = column_type(&c.data_type)?;
-                let mut not_null = false;
-                for o in &c.options {
-                    match &o.option {
-                        ColumnOption::NotNull => not_null = true,
-                        ColumnOption::Null => {}
-                        ColumnOption::PrimaryKey(_) => {
-                            primary = Some(vec![ident(&c.name)]);
-                            not_null = true;
-                        }
-                        ColumnOption::Collation(n) => {
-                            let collation = object_name(n);
-                            if !ty.is_text() {
-                                return Err(Error::new(format!(
-                                    "{name}.{}: COLLATE {collation} on a column that is not text",
-                                    ident(&c.name)
-                                )));
-                            }
-                            if !BYTE_ORDER.contains(&collation.as_str()) {
-                                return Err(Error::new(format!(
-                                    "{name}.{}: COLLATE {collation}: text is compared by its bytes, so only C is read",
-                                    ident(&c.name)
-                                )));
-                            }
-                        }
-                        other => {
-                            return Err(Error::new(format!(
-                                "{name}.{}: the option {other} is not read",
-                                ident(&c.name)
-                            )))
-                        }
-                    }
-                }
-                columns.push(Column {
-                    name: ident(&c.name),
-                    ty,
-                    not_null,
-                });
-            }
-            for k in &t.constraints {
-                match k {
-                    TableConstraint::PrimaryKey(p) => {
-                        let mut names = Vec::new();
-                        for c in &p.columns {
-                            match &c.column.expr {
-                                Expr::Identifier(i) => names.push(ident(i)),
-                                other => {
-                                    return Err(Error::new(format!(
-                                        "{name}: a primary key on {other} is not read"
-                                    )))
-                                }
-                            }
-                        }
-                        primary = Some(names);
-                    }
-                    other => {
-                        return Err(Error::new(format!(
-                            "{name}: the constraint {other} is not read"
-                        )))
-                    }
-                }
-            }
-            if let Some(p) = &primary {
-                for n in p {
-                    match columns.iter_mut().find(|c| &c.name == n) {
-                        Some(c) => c.not_null = true,
-                        None => {
-                            return Err(Error::new(format!(
-                                "{name} has no column {n} for its primary key"
-                            )))
-                        }
-                    }
-                }
-            }
-            tables.push((name, columns, primary));
-        }
-        let mut out = Vec::new();
-        for (name, columns, primary) in tables {
-            let mut index_orders = Vec::new();
-            for i in indexes.iter().filter(|i| i.table == name) {
-                let mut levels = Vec::new();
-                for k in &i.keys {
-                    let s = shape(k, &name, None, &columns, &functions, &[])
-                        .map_err(|e| Error::new(format!("{}: {e}", i.name)))?;
-                    levels.push(level(s));
-                }
-                let mut include = Vec::new();
-                for c in &i.include {
-                    include.push(columns.iter().position(|x| &x.name == c).ok_or_else(|| {
-                        Error::new(format!("{}: {name} has no column {c}", i.name))
-                    })?);
-                }
-                index_orders.push(Keyed {
-                    name: i.name.clone(),
-                    levels,
-                    include,
-                    unique: i.unique,
-                    nulls_first: i.nulls_first.clone(),
-                    nulls_distinct: i.nulls_distinct,
-                });
-            }
-            if let Some((t, _)) = clusters.iter().filter(|(t, _)| *t == name).nth(1) {
-                return Err(Error::new(format!("{t} is clustered on two indexes")));
-            }
-            let clustered = clusters
-                .iter()
-                .find(|(t, _)| *t == name)
-                .map(|(_, i)| i.clone());
-            let primary_levels = primary.as_ref().map(|p| {
-                p.iter()
-                    .map(|n| Level::Column(columns.iter().position(|c| &c.name == n).unwrap()))
-                    .collect::<Vec<_>>()
-            });
-            let all: Vec<usize> = (0..columns.len()).collect();
-            let primary_keyed = primary_levels.as_ref().map(|p| Keyed {
-                name: format!("{}_pkey", name.rsplit('.').next().unwrap()),
-                levels: p.clone(),
-                include: vec![],
-                unique: true,
-                nulls_first: vec![false; p.len()],
-                nulls_distinct: true,
-            });
-            let ordered = match &clustered {
-                Some(c) => {
-                    let pos = index_orders
-                        .iter()
-                        .position(|s| &s.name == c)
-                        .ok_or_else(|| {
-                            Error::new(format!(
-                                "{name} is clustered on {c}, which is no index of it"
-                            ))
-                        })?;
-                    // The order holds every column, so what its index includes adds nothing.
-                    let mut s = index_orders.remove(pos);
-                    s.unique = s.unique || primary_levels.as_ref() == Some(&s.levels);
-                    s
-                }
-                None => match &primary_keyed {
-                    Some(p) => p.clone(),
-                    None => {
-                        return Err(Error::new(format!(
-                        "{name} has no order: name one with CLUSTER ON, or give it a primary key"
-                    )))
-                    }
-                },
-            };
-            if clustered.is_some() {
-                if let Some(p) = primary_keyed {
-                    if p.levels != ordered.levels {
-                        index_orders.insert(0, p);
-                    }
-                }
-            }
-            let key: Vec<usize> = dedup(ordered.levels.iter().map(|l| l.column()));
-            let mut orders = vec![Order {
-                name: ordered.name,
-                levels: ordered.levels,
-                columns: all,
-                unique: ordered.unique,
-                table_order: true,
-                nulls_first: ordered.nulls_first,
-                nulls_distinct: ordered.nulls_distinct,
-            }];
-            for s in index_orders {
-                let held = dedup(
-                    s.levels
-                        .iter()
-                        .map(|l| l.column())
-                        .chain(s.include.iter().copied())
-                        .chain(key.iter().copied()),
-                );
-                orders.push(Order {
-                    name: s.name,
-                    levels: s.levels,
-                    columns: held,
-                    unique: s.unique,
-                    table_order: false,
-                    nulls_first: s.nulls_first,
-                    nulls_distinct: s.nulls_distinct,
-                });
-            }
-            out.push(Table {
-                name,
-                columns,
-                orders,
-            });
-        }
-        for i in &indexes {
-            if !out.iter().any(|t| t.name == i.table) {
-                return Err(Error::new(format!(
-                    "{} is on {}, which the DDL does not create",
-                    i.name, i.table
-                )));
-            }
-        }
-        for (t, _) in &clusters {
-            if !out.iter().any(|x| &x.name == t) {
-                return Err(Error::new(format!(
-                    "CLUSTER ON names {t}, which the DDL does not create"
-                )));
-            }
-        }
-        for t in &out {
-            for o in &t.orders {
-                if let Some(l) = o
-                    .levels
-                    .iter()
-                    .find(|l| t.columns[l.column()].ty == ColumnType::Bytes)
-                {
-                    return Err(Error::new(format!(
-                        "{}: {} is bytea, and a bytea level is not cut",
-                        o.name,
-                        t.columns[l.column()].name
-                    )));
-                }
-            }
-        }
-        Ok(Catalog {
-            ddl: ddl.to_string(),
-            tables: out,
-            functions,
-            types: Vec::new(),
-        })
-    }
-
-    fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
-        let name = object_name(&f.name);
-        let language = f.language.as_ref().map(ident).unwrap_or_default();
-        if language != "sql" {
-            return Err(Error::new(format!("{name}: only LANGUAGE sql is read")));
-        }
-        let mut args = Vec::new();
-        for a in f.args.as_deref().unwrap_or(&[]) {
-            if a.name.is_some() {
-                return Err(Error::new(format!("{name}: named arguments are not read")));
-            }
-            args.push(column_type(&a.data_type).map_err(|e| Error::new(format!("{name}: {e}")))?);
-        }
-        let text = match &f.function_body {
-            Some(CreateFunctionBody::AsBeforeOptions {
-                body: Expr::Value(v),
-                ..
-            }) => match &v.value {
-                Value::DollarQuotedString(s) => s.value.clone(),
-                Value::SingleQuotedString(s) => s.clone(),
-                _ => String::new(),
-            },
-            _ => String::new(),
-        };
-        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &text)
-            .map_err(|e| Error::new(format!("{name}: its body: {e}")))?;
-        let body = match parsed.as_slice() {
-            [Statement::Query(q)] => match q.body.as_ref() {
-                SetExpr::Select(s)
-                    if s.from.is_empty() && s.selection.is_none() && s.projection.len() == 1 =>
-                {
-                    match &s.projection[0] {
-                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                            e.clone()
-                        }
-                        _ => {
-                            return Err(Error::new(format!(
-                                "{name}: its body is not one expression"
-                            )))
-                        }
-                    }
-                }
-                _ => {
-                    return Err(Error::new(format!(
-                        "{name}: its body is not one expression"
-                    )))
-                }
-            },
-            _ => return Err(Error::new(format!("{name}: its body is not one SELECT"))),
-        };
-        Ok(Function { name, args, body })
+        crate::ddl::function_statements(&self.ddl)
     }
 
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
     }
-}
 
-fn dedup(items: impl Iterator<Item = usize>) -> Vec<usize> {
-    let mut out = Vec::new();
-    for i in items {
-        if !out.contains(&i) {
-            out.push(i);
-        }
+    pub fn sequence(&self, name: &str) -> Option<&Sequence> {
+        self.sequences.iter().find(|s| s.name == name)
     }
-    out
+
+    /// Every fact the catalog holds, one a row, sorted.
+    pub fn facts(&self) -> Vec<Fact> {
+        crate::ddl::facts(self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+    use sqlparser::tokenizer::Tokenizer;
 
     fn refused(ddl: &str) -> String {
         Catalog::parse(ddl).unwrap_err().to_string()
@@ -1182,25 +1353,254 @@ mod tests {
     }
 
     #[test]
-    fn the_order_reads_cluster_on_through_the_tokenizer() {
+    fn a_ddl_is_read_a_statement_at_a_time_each_taken_or_refused_by_name() {
+        let r = Catalog::read(
+            "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));
+             CREATE TABLE s.u (a uuid NOT NULL, PRIMARY KEY (a));
+             CREATE INDEX ua ON s.u (a);
+             CREATE INDEX tg ON s.t USING gin (a);
+             CREATE INDEX tp ON s.t (a) WHERE a > 0;
+             CREATE INDEX tb ON s.t USING btree (a DESC) WITH (fillfactor = 90);
+             DROP TABLE s.t;",
+        )
+        .unwrap();
+        let read: Vec<(&str, Option<&str>)> = r
+            .statements
+            .iter()
+            .map(|s| (s.object.as_str(), s.refused.as_deref()))
+            .collect();
+        assert_eq!(read[0], ("s.t", None));
+        assert!(read[1].1.unwrap().contains("the type uuid is not held"));
+        assert_eq!(read[2].1, Some("ua is on s.u, which is refused"));
+        assert!(read[3].1.unwrap().contains("USING gin is not held yet"));
+        assert!(read[4].1.unwrap().contains("a partial index, WHERE a > 0"));
+        assert_eq!(read[5].1, None);
         assert_eq!(
-            cluster_on(
-                &Tokenizer::new(
-                    &PostgreSqlDialect {},
-                    "ALTER TABLE \"S\".t CLUSTER ON \"Ix\""
-                )
-                .tokenize()
-                .unwrap()
-            ),
-            Some(("S.t".to_string(), "Ix".to_string()))
+            r.statements[5].notices.len(),
+            2,
+            "{:?}",
+            r.statements[5].notices
         );
+        assert!(read[6].1.unwrap().contains("is not read"));
+        // The statements taken are a DDL of their own, which reads as the catalog they made.
+        let again = Catalog::parse(&r.catalog.ddl).unwrap();
+        assert_eq!(again.facts(), r.catalog.facts());
+        assert_eq!(again.tables[0].orders.len(), 2);
+        let e = refused(
+            "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t USING hash (a);",
+        );
+        assert!(e.contains("USING hash"), "{e}");
+    }
+
+    #[test]
+    fn a_statement_sqlparser_reads_otherwise_than_written_is_refused() {
+        let tokens = Tokenizer::new(&PostgreSqlDialect {}, "CREATE TABLE s.t (a int, b int)")
+            .tokenize()
+            .unwrap();
+        let fewer = Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE s.t (a int)").unwrap();
+        let e = crate::ddl::read_as_written(&tokens, &fewer[0], "CREATE TABLE s.t")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("it drops , b int"), "{e}");
+        let same =
+            Parser::parse_sql(&PostgreSqlDialect {}, "create table s.t (a INT, b INT)").unwrap();
+        crate::ddl::read_as_written(&tokens, &same[0], "CREATE TABLE s.t").unwrap();
+    }
+
+    #[test]
+    fn keys_checks_and_sequences_are_named_as_postgresql_names_them() {
+        let c = Catalog::parse(
+            "CREATE TABLE s.t (id serial, a integer UNIQUE, b integer CHECK (b > 0),
+                 c integer, d integer GENERATED BY DEFAULT AS IDENTITY,
+                 PRIMARY KEY (id), UNIQUE (a, c) INCLUDE (b), UNIQUE (a),
+                 CHECK (b < c), CHECK (c > 0), CONSTRAINT named CHECK (c < 9));",
+        )
+        .unwrap();
+        let t = &c.tables[0];
+        let orders: Vec<&str> = t.orders.iter().map(|o| o.name.as_str()).collect();
+        // UNIQUE (a) written twice is one key; a key's name takes the columns it includes.
+        assert_eq!(orders, ["t_pkey", "t_a_key", "t_a_c_b_key"]);
+        let checks: Vec<&str> = t.checks.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(checks, ["t_b_check", "t_check", "t_c_check", "named"]);
+        let seqs: Vec<&str> = c.sequences.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(seqs, ["s.t_id_seq", "s.t_d_seq"]);
         assert_eq!(
-            cluster_on(
-                &Tokenizer::new(&PostgreSqlDialect {}, "ALTER TABLE s.t ADD COLUMN x int")
-                    .tokenize()
-                    .unwrap()
-            ),
-            None
+            t.columns[0].default.as_ref().unwrap().to_string(),
+            "nextval('s.t_id_seq'::REGCLASS)"
         );
+        assert!(t.columns[0].not_null && t.columns[4].not_null);
+        assert_eq!(
+            t.columns[4].identity,
+            Some(Identity {
+                always: false,
+                sequence: "s.t_d_seq".into()
+            })
+        );
+        // A name taken is numbered, the label first.
+        let c = Catalog::parse(
+            "CREATE TABLE s.t (a integer NOT NULL, CONSTRAINT t_a_check CHECK (a < 9), CHECK (a > 0), PRIMARY KEY (a));",
+        )
+        .unwrap();
+        let checks: Vec<&str> = c.tables[0].checks.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(checks, ["t_a_check", "t_a_check1"]);
+    }
+
+    #[test]
+    fn a_sequence_s_options_are_read_as_postgresql_reads_them() {
+        let c = Catalog::parse(
+            "CREATE SEQUENCE s.up;
+             CREATE SEQUENCE s.down INCREMENT BY -1;
+             CREATE SEQUENCE s.small AS smallint;
+             ALTER SEQUENCE s.small AS integer;
+             CREATE SEQUENCE s.moved START WITH 10 MAXVALUE 99 CACHE 5 CYCLE;
+             ALTER SEQUENCE s.moved RESTART WITH 50 NO CYCLE;",
+        )
+        .unwrap();
+        let s = |n: &str| c.sequence(n).unwrap().clone();
+        let (up, down, small, moved) = (s("s.up"), s("s.down"), s("s.small"), s("s.moved"));
+        assert_eq!(
+            (up.min, up.max, up.start, up.last_value),
+            (1, i64::MAX, 1, 1)
+        );
+        assert_eq!((down.min, down.max, down.start), (i64::MIN, -1, -1));
+        // A type changed takes the new type's MAXVALUE where the old one stood at its type's.
+        assert_eq!((small.ty, small.max), (SequenceType::Int4, i32::MAX as i64));
+        assert_eq!(
+            (
+                moved.start,
+                moved.max,
+                moved.cache,
+                moved.cycle,
+                moved.last_value,
+                moved.is_called
+            ),
+            (10, 99, 5, false, 50, false)
+        );
+        for (ddl, why) in [
+            (
+                "CREATE SEQUENCE s.x INCREMENT 0",
+                "INCREMENT must not be zero",
+            ),
+            (
+                "CREATE SEQUENCE s.x MINVALUE 5 MAXVALUE 5",
+                "MINVALUE (5) must be less than MAXVALUE (5)",
+            ),
+            (
+                "CREATE SEQUENCE s.x AS smallint MAXVALUE 40000",
+                "out of range for sequence data type smallint",
+            ),
+            (
+                "CREATE SEQUENCE s.x START 0",
+                "START value (0) cannot be less than MINVALUE (1)",
+            ),
+            (
+                "CREATE SEQUENCE s.x CACHE 0",
+                "CACHE (0) must be greater than zero",
+            ),
+            (
+                "CREATE SEQUENCE s.x CACHE 1 CACHE 2",
+                "conflicting or redundant options",
+            ),
+            (
+                "CREATE SEQUENCE s.x AS text",
+                "must be smallint, integer, or bigint",
+            ),
+            ("CREATE TEMP SEQUENCE s.x", "kept in its file"),
+        ] {
+            let e = refused(ddl);
+            assert!(e.contains(why), "{ddl}: {e}");
+        }
+    }
+
+    #[test]
+    fn types_domains_and_collations_are_kept_as_declared() {
+        let c = Catalog::parse(
+            "CREATE TYPE s.mood AS ENUM ('sad', 'ok');
+             ALTER TYPE s.mood ADD VALUE 'happy';
+             ALTER TYPE s.mood ADD VALUE 'meh' BEFORE 'ok';
+             ALTER TYPE s.mood ADD VALUE IF NOT EXISTS 'ok';
+             ALTER TYPE s.mood RENAME VALUE 'sad' TO 'blue';
+             CREATE TYPE s.pair AS (a integer, b text COLLATE \"C\");
+             CREATE TYPE s.span AS RANGE (SUBTYPE = bigint);
+             CREATE DOMAIN s.pos integer NOT NULL CHECK (VALUE > 0);
+             ALTER DOMAIN s.pos ADD CHECK (VALUE < 9) NOT VALID;
+             CREATE COLLATION s.bytes (provider = libc, locale = 'C');",
+        )
+        .unwrap();
+        let TypeKind::Enum { labels } = &c.types[0].kind else {
+            panic!()
+        };
+        assert_eq!(labels, &["blue", "meh", "ok", "happy"]);
+        let TypeKind::Range(r) = &c.types[2].kind else {
+            panic!()
+        };
+        assert_eq!(
+            (r.subtype.as_str(), r.multirange.as_str()),
+            ("bigint", "s.span_multirange")
+        );
+        let d = &c.domains[0];
+        let checks: Vec<(&str, bool)> = d
+            .checks
+            .iter()
+            .map(|k| (k.name.as_str(), k.valid))
+            .collect();
+        assert_eq!(checks, [("pos_check", true), ("pos_check1", false)]);
+        assert!(c.collations[0].byte_order());
+        for (ddl, why) in [
+            (
+                "CREATE TYPE s.m AS ENUM ('a'); ALTER TYPE s.m ADD VALUE 'a'",
+                "already exists",
+            ),
+            (
+                "CREATE TYPE s.m AS ENUM ('a'); ALTER TYPE s.m ADD VALUE 'b' AFTER 'z'",
+                "not an existing enum label",
+            ),
+            (
+                "CREATE TYPE s.m AS ENUM ('a'); CREATE TABLE s.t (m s.m NOT NULL, PRIMARY KEY (m))",
+                "an enum the DDL declares",
+            ),
+            (
+                "CREATE COLLATION s.pt (provider = icu, locale = 'pt-PT')",
+                "only a collation of byte order",
+            ),
+            ("CREATE TYPE s.b (INPUT = x, OUTPUT = y)", "written in C"),
+        ] {
+            let e = refused(ddl);
+            assert!(e.contains(why), "{ddl}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_column_s_default_generation_and_checks_are_read_and_refused_by_name() {
+        let c = Catalog::parse(
+            "CREATE SEQUENCE s.n;
+             CREATE TABLE s.t (a integer NOT NULL DEFAULT nextval('s.n'), at timestamptz DEFAULT now(),
+                 q integer DEFAULT 1 + 1, g integer GENERATED ALWAYS AS (q * 2) STORED,
+                 v integer GENERATED ALWAYS AS (q + 1), PRIMARY KEY (a));",
+        )
+        .unwrap();
+        let t = &c.tables[0];
+        assert!(t.columns[3].generated.as_ref().is_some_and(|g| g.stored));
+        assert!(t.columns[4].is_virtual());
+        // A virtual column is held by no order.
+        assert_eq!(t.orders[0].columns, [0, 1, 2, 3]);
+        assert_eq!(t.arrival_key(), Some(0));
+        for (ddl, why) in [
+            ("CREATE TABLE s.t (a integer NOT NULL DEFAULT nextval('s.none'), PRIMARY KEY (a))", "no sequence s.none"),
+            ("CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT a, PRIMARY KEY (a))", "cannot use column reference"),
+            ("CREATE TABLE s.t (a integer NOT NULL, b boolean DEFAULT now(), PRIMARY KEY (a))", "is of type boolean but default expression is of type timestamp with time zone"),
+            ("CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT random(), PRIMARY KEY (a))", "which the snail does not read"),
+            ("CREATE TABLE s.t (a integer NOT NULL, b integer GENERATED ALWAYS AS (a) STORED, c integer GENERATED ALWAYS AS (b) STORED, PRIMARY KEY (a))", "cannot use generated column \"b\""),
+            ("CREATE TABLE s.t (a integer NOT NULL, b integer GENERATED ALWAYS AS (a), PRIMARY KEY (a)); CREATE INDEX x ON s.t (b)", "virtual generated columns"),
+            ("CREATE TABLE s.t (a text GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (a))", "identity column type"),
+            ("CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a), UNIQUE (b) DEFERRABLE INITIALLY DEFERRED)", "INITIALLY DEFERRED is not held"),
+            ("CREATE TABLE s.t (a integer NOT NULL REFERENCES s.u (a), PRIMARY KEY (a))", "a FOREIGN KEY is not held yet"),
+            ("CREATE TEMP TABLE s.t (a integer NOT NULL, PRIMARY KEY (a))", "logged and lasting"),
+            ("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)) PARTITION BY RANGE (a)", "is not read: only a table's columns"),
+            ("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t (a int8_ops)", "the operator class int8_ops is not read"),
+        ] {
+            let e = refused(ddl);
+            assert!(e.contains(why), "{ddl}: {e}");
+        }
     }
 }

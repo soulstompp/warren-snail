@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod cut;
+mod ddl;
 pub mod directory;
 pub mod encode;
 mod error;
