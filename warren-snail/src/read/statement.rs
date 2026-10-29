@@ -21,6 +21,19 @@ pub enum Datum {
     Int(i64),
     Text(String),
     Bytes(Vec<u8>),
+    /// A value keyed in 128 bits, as its key: a uuid's.
+    Wide(i128),
+}
+
+impl Datum {
+    /// A number's value, or a wide value's key, in 128 bits.
+    pub fn wide(&self) -> Option<i128> {
+        match self {
+            Datum::Int(v) => Some(*v as i128),
+            Datum::Wide(k) => Some(*k),
+            _ => None,
+        }
+    }
 }
 
 /// A row of a table, its values in the table's column order.
@@ -176,6 +189,9 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             Datum::Int(v)
         }
         ColumnType::Timestamptz => Datum::Int(instant(&text_literal(e).map_err(|_| wrong())?)?),
+        ColumnType::Uuid => Datum::Wide(crate::scalars::uuid_parse(
+            &text_literal(e).map_err(|_| wrong())?,
+        )?),
         // A literal is held to its column's length as PostgreSQL plans the statement, before any
         // DEFAULT draws a value: its excess taken off where it is only spaces, else refused.
         ColumnType::Text(n) => super::fill::assign(

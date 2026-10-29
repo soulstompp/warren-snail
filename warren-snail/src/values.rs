@@ -1,4 +1,5 @@
-//! One column's values in row order: integers and instants as numbers, text as text.
+//! One column's values in row order: integers and instants as numbers, uuids as their keys, text as
+//! text.
 
 use crate::catalog::ColumnType;
 use parquet::data_type::ByteArray;
@@ -19,6 +20,8 @@ pub enum Values {
         dict: Arc<[ByteArray]>,
         codes: Vec<Option<u32>>,
     },
+    /// Values keyed in 128 bits, as their keys: a uuid's.
+    Wide(Vec<Option<i128>>),
 }
 
 /// The bytes Parquet writes before each plain text value: its length.
@@ -30,6 +33,7 @@ impl Values {
         match ty {
             ColumnType::Text(_) => Values::Text(Vec::new()),
             ColumnType::Bytes => Values::Utf8(Vec::new()),
+            ColumnType::Uuid => Values::Wide(Vec::new()),
             _ => Values::Int(Vec::new()),
         }
     }
@@ -40,6 +44,7 @@ impl Values {
             Values::Text(v) => v.len(),
             Values::Utf8(v) => v.len(),
             Values::Dict { codes, .. } => codes.len(),
+            Values::Wide(v) => v.len(),
         }
     }
 
@@ -53,6 +58,7 @@ impl Values {
             Values::Text(v) => v[i].is_none(),
             Values::Utf8(v) => v[i].is_none(),
             Values::Dict { codes, .. } => codes[i].is_none(),
+            Values::Wide(v) => v[i].is_none(),
         }
     }
 
@@ -63,6 +69,15 @@ impl Values {
     pub fn int(&self, i: usize) -> Option<i64> {
         match self {
             Values::Int(v) => v[i],
+            Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } | Values::Wide(_) => None,
+        }
+    }
+
+    /// Row `i`'s key in 128 bits: a number's own value, or a wide value's key.
+    pub fn wide(&self, i: usize) -> Option<i128> {
+        match self {
+            Values::Int(v) => v[i].map(i128::from),
+            Values::Wide(v) => v[i],
             Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => None,
         }
     }
@@ -92,7 +107,7 @@ impl Values {
             Values::Dict { dict, codes } => {
                 codes[i].map(|c| std::str::from_utf8(dict[c as usize].data()).unwrap_or_default())
             }
-            Values::Int(_) => None,
+            Values::Int(_) | Values::Wide(_) => None,
         }
     }
 
@@ -102,14 +117,14 @@ impl Values {
             Values::Utf8(v) => v[i].clone(),
             Values::Dict { dict, codes } => codes[i].map(|c| dict[c as usize].clone()),
             Values::Text(v) => v[i].as_deref().map(ByteArray::from),
-            Values::Int(_) => None,
+            Values::Int(_) | Values::Wide(_) => None,
         }
     }
 
     pub fn ints(&self) -> Option<&[Option<i64>]> {
         match self {
             Values::Int(v) => Some(v),
-            Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => None,
+            Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } | Values::Wide(_) => None,
         }
     }
 
@@ -123,6 +138,7 @@ impl Values {
                 dict: dict.clone(),
                 codes: rows.iter().map(|&r| codes[r]).collect(),
             },
+            Values::Wide(v) => Values::Wide(rows.iter().map(|&r| v[r]).collect()),
         }
     }
 
@@ -133,6 +149,7 @@ impl Values {
             (Values::Text(a), Values::Text(b)) => a.push(b[i].clone()),
             (Values::Utf8(a), Values::Utf8(b)) => a.push(b[i].clone()),
             (Values::Utf8(a), b @ Values::Dict { .. }) => a.push(b.text_value(i)),
+            (Values::Wide(a), Values::Wide(b)) => a.push(b[i]),
             _ => panic!("a column's values pushed onto another kind"),
         }
     }
@@ -147,7 +164,7 @@ impl Values {
                 .flatten()
                 .map(|&c| dict[c as usize].len() as u64)
                 .sum(),
-            Values::Int(_) => 0,
+            Values::Int(_) | Values::Wide(_) => 0,
         }
     }
 
@@ -164,7 +181,7 @@ impl Values {
             (Values::Dict { dict, codes }, None) => {
                 codes[i].map_or(0, |c| dict[c as usize].len() as u64 + LENGTH_PREFIX)
             }
-            (Values::Int(_), None) => 0,
+            (Values::Int(_) | Values::Wide(_), None) => 0,
         }
     }
 
@@ -191,7 +208,7 @@ impl Values {
                 })
                 .max()
                 .unwrap_or(0),
-            Values::Int(_) => 0,
+            Values::Int(_) | Values::Wide(_) => 0,
         }
     }
 }

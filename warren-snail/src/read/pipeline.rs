@@ -14,7 +14,7 @@ use sqlparser::ast::{
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-/// One value of a row: a number whole or with its scale, text, bytes, or a truth.
+/// One value of a row: a number whole or with its scale, text, bytes, a truth, or a uuid.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Value {
@@ -25,6 +25,8 @@ pub enum Value {
     Text(String),
     Bytes(Vec<u8>),
     Bool(bool),
+    /// A uuid, as its key.
+    Uuid(i128),
 }
 
 impl Value {
@@ -61,6 +63,7 @@ impl Value {
                 out
             }
             Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            Value::Uuid(k) => crate::scalars::uuid_text(*k),
         })
     }
 }
@@ -93,6 +96,7 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         _ => return Err(Error::new(format!("{a:?} and {b:?} are not compared"))),
     }))
 }
@@ -105,6 +109,7 @@ enum Key {
     Text(String),
     Bytes(Vec<u8>),
     Bool(bool),
+    Uuid(i128),
 }
 
 fn key(v: &Value) -> Key {
@@ -121,6 +126,7 @@ fn key(v: &Value) -> Key {
         Value::Text(t) => Key::Text(t.clone()),
         Value::Bytes(b) => Key::Bytes(b.clone()),
         Value::Bool(b) => Key::Bool(*b),
+        Value::Uuid(k) => Key::Uuid(*k),
     }
 }
 
@@ -356,12 +362,27 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
         "bytea" => match v {
             Value::Bytes(b) => Value::Bytes(b),
             Value::Text(t) => Value::Bytes(hex_bytes(&t)?),
+            Value::Uuid(k) => Value::Bytes(crate::scalars::uuid_bytes(k).to_vec()),
             other => return Err(Error::new(format!("{other:?} cast to bytea"))),
         },
         "boolean" | "bool" => match v {
             Value::Bool(b) => Value::Bool(b),
             Value::Text(t) => boolean_of(&t)?,
             other => return Err(Error::new(format!("{other:?} cast to boolean"))),
+        },
+        "uuid" => match v {
+            Value::Uuid(k) => Value::Uuid(k),
+            Value::Text(t) => Value::Uuid(crate::scalars::uuid_parse(&t)?),
+            // PostgreSQL 19 casts a uuid's 16 bytes to one, and back.
+            Value::Bytes(b) => Value::Uuid(crate::scalars::uuid_key(
+                b.as_slice().try_into().map_err(|_| {
+                    Error::new(format!(
+                        "invalid input length for type uuid: expected 16 bytes, got {}",
+                        b.len()
+                    ))
+                })?,
+            )),
+            other => return Err(Error::new(format!("{other:?} cast to uuid"))),
         },
         _ => return Err(Error::new(format!("a cast to {to} is not read"))),
     })
@@ -533,6 +554,12 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             let (x, y) = match (&x, &y) {
                 (Value::Bool(_), Value::Text(t)) if quoted(right) => (x, boolean_of(t)?),
                 (Value::Text(t), Value::Bool(_)) if quoted(left) => (boolean_of(t)?, y),
+                (Value::Uuid(_), Value::Text(t)) if quoted(right) => {
+                    (x, Value::Uuid(crate::scalars::uuid_parse(t)?))
+                }
+                (Value::Text(t), Value::Uuid(_)) if quoted(left) => {
+                    (Value::Uuid(crate::scalars::uuid_parse(t)?), y)
+                }
                 _ => (x, y),
             };
             match op {
@@ -835,16 +862,21 @@ impl Acc {
             Some(v) if v.is_null() => return Ok(()),
             Some(v) => v,
         };
-        // PostgreSQL has no sum, min or max of a boolean.
-        if let (Value::Bool(_), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_)) = (&v, &self) {
+        // PostgreSQL has no sum, min or max of a boolean or a uuid.
+        if let (Value::Bool(_) | Value::Uuid(_), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_)) =
+            (&v, &self)
+        {
             let name = match self {
                 Acc::Sum(_) => "sum",
                 Acc::Least(_) => "min",
                 _ => "max",
             };
-            return Err(Error::new(format!(
-                "function {name}(boolean) does not exist"
-            )));
+            let ty = if matches!(v, Value::Bool(_)) {
+                "boolean"
+            } else {
+                "uuid"
+            };
+            return Err(Error::new(format!("function {name}({ty}) does not exist")));
         }
         match self {
             Acc::Count(n) => *n += 1,
@@ -1534,8 +1566,8 @@ pub fn is_pipeline(q: &Query) -> bool {
 /// An answer's rows as values: integers, numerics with their scale, text, bytes and truths.
 pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
     use arrow::array::{
-        Array, BinaryArray, BooleanArray, Decimal128Array, Int16Array, Int32Array, Int64Array,
-        StringArray, TimestampMicrosecondArray,
+        Array, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int16Array,
+        Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::DataType as A;
     let mut rows = vec![Vec::with_capacity(batch.num_columns()); batch.num_rows()];
@@ -1572,6 +1604,13 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                         Value::Bytes(any.downcast_ref::<BinaryArray>().unwrap().value(r).to_vec())
                     }
                     A::Boolean => Value::Bool(any.downcast_ref::<BooleanArray>().unwrap().value(r)),
+                    A::FixedSizeBinary(16) => Value::Uuid(crate::scalars::uuid_key(
+                        any.downcast_ref::<FixedSizeBinaryArray>()
+                            .unwrap()
+                            .value(r)
+                            .try_into()
+                            .unwrap(),
+                    )),
                     other => return Err(Error::new(format!("a column of {other} is not read"))),
                 }
             });
@@ -1593,8 +1632,8 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
 /// scale among them.
 pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
     use arrow::array::{
-        ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Int64Array, RecordBatch,
-        RecordBatchOptions, StringArray,
+        ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int64Array,
+        RecordBatch, RecordBatchOptions, StringArray,
     };
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -1640,6 +1679,15 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
                     })
                     .collect::<BooleanArray>(),
             ),
+            (Some(Value::Uuid(_)), _) => {
+                Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    col().map(|v| match v {
+                        Value::Uuid(k) => Some(crate::scalars::uuid_bytes(*k)),
+                        _ => None,
+                    }),
+                    16,
+                )?)
+            }
             _ => Arc::new(col().map(|v| v.text()).collect::<StringArray>()),
         };
         fields.push(Field::new(name, a.data_type().clone(), true));

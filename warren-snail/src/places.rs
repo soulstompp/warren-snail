@@ -1,6 +1,7 @@
 //! The places of an order's levels, outermost first: the sublevels its blocks are cut on.
 //!
-//! An integer is cut by its bits, the top one first, and a boolean on one, false before true. An
+//! An integer is cut by its bits, the top one first, a uuid by its 128, and a boolean on one, false
+//! before true. An
 //! instant is cut on the UTC clock by its year, then its month, day, hour, minute, second and
 //! microsecond. A month is cut by the year's halves, then the month. Text is cut by its bytes, the
 //! first one first, a value that has ended coming before any byte.
@@ -39,14 +40,16 @@ pub fn month_of(micros: i64) -> Option<i64> {
 }
 
 /// One level's value in an order's key: a number (an integer, an instant's microseconds, a month),
-/// or text, compared by its bytes; or a NULL, before every value of its level where `first`, else
-/// after them all. Every value of one level is of one kind, and its NULLs lie on one side.
+/// text, compared by its bytes, or a value keyed in 128 bits (a uuid's key); or a NULL, before every
+/// value of its level where `first`, else after them all. Every value of one level is of one kind,
+/// and its NULLs lie on one side.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KeyValue {
     Int(i64),
     Text(Box<str>),
     Null { first: bool },
+    Wide(i128),
 }
 
 impl KeyValue {
@@ -55,7 +58,16 @@ impl KeyValue {
         match self {
             KeyValue::Int(v) => *v,
             KeyValue::Text(_) => panic!("a numeric level holds text"),
+            KeyValue::Wide(_) => panic!("a level keyed in 128 bits holds no 64-bit number"),
             KeyValue::Null { .. } => panic!("a NULL keys no number"),
+        }
+    }
+
+    /// The number a numeric level keys, in 128 bits.
+    pub fn wide(&self) -> i128 {
+        match self {
+            KeyValue::Wide(v) => *v,
+            other => other.int() as i128,
         }
     }
 
@@ -69,6 +81,7 @@ impl KeyValue {
             KeyValue::Null { first: true } => 0,
             KeyValue::Int(_) => 1,
             KeyValue::Text(_) => 2,
+            KeyValue::Wide(_) => 3,
             KeyValue::Null { first: false } => u8::MAX,
         }
     }
@@ -79,6 +92,7 @@ impl Ord for KeyValue {
         match (self, other) {
             (KeyValue::Int(a), KeyValue::Int(b)) => a.cmp(b),
             (KeyValue::Text(a), KeyValue::Text(b)) => a.cmp(b),
+            (KeyValue::Wide(a), KeyValue::Wide(b)) => a.cmp(b),
             _ => self.rank().cmp(&other.rank()),
         }
     }
@@ -95,6 +109,7 @@ impl fmt::Display for KeyValue {
         match self {
             KeyValue::Int(v) => write!(f, "{v}"),
             KeyValue::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
+            KeyValue::Wide(v) => write!(f, "'{}'", crate::scalars::uuid_text(*v)),
             KeyValue::Null { .. } => write!(f, "NULL"),
         }
     }
@@ -116,6 +131,17 @@ pub fn shown(key: &[KeyValue]) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// A number in 128 bits against a numeric level's value, a NULL lying on its level's side.
+pub fn wide_cmp(k: i128, b: &KeyValue) -> Ordering {
+    match b {
+        KeyValue::Int(x) => k.cmp(&(*x as i128)),
+        KeyValue::Wide(x) => k.cmp(x),
+        KeyValue::Null { first: true } => Ordering::Greater,
+        KeyValue::Null { first: false } => Ordering::Less,
+        KeyValue::Text(_) => Ordering::Less,
+    }
 }
 
 /// The value a numeric level keys, from its column's value.
@@ -143,6 +169,7 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Int8 | ColumnType::Numeric { .. } => 64,
             ColumnType::Timestamptz => 7,
             ColumnType::Boolean => 1,
+            ColumnType::Uuid => 128,
             ColumnType::Text(_) | ColumnType::Bytes => text_sublevels as usize,
         },
     }
@@ -153,6 +180,7 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
         KeyValue::Text(s) => return s.as_bytes().get(r).map_or(-1, |&b| b as i64),
         KeyValue::Null { first: true } => return i64::MIN,
         KeyValue::Null { first: false } => return i64::MAX,
+        KeyValue::Wide(k) => return ((k.wrapping_sub(i128::MIN) as u128 >> (127 - r)) & 1) as i64,
         KeyValue::Int(_) => {}
     }
     let key = key.int();
@@ -182,6 +210,7 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             }
             ColumnType::Boolean => key,
             ColumnType::Text(_) | ColumnType::Bytes => unreachable!("a text level keys text"),
+            ColumnType::Uuid => unreachable!("a uuid level keys 128 bits"),
         },
     }
 }
@@ -274,6 +303,38 @@ mod tests {
         let sorted = all.clone();
         all.sort();
         assert_eq!(all, sorted);
+    }
+
+    #[test]
+    fn a_uuid_is_cut_by_its_128_bits_top_first_and_keeps_the_order_of_its_bytes() {
+        let c = Catalog::parse("CREATE TABLE s.t (a uuid NOT NULL, PRIMARY KEY (a));").unwrap();
+        let t = &c.tables[0];
+        let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
+        assert_eq!(sublevels.len(), 128);
+        let bits = |b: [u8; 16]| {
+            (0..128)
+                .map(|r| sublevels.value(&[KeyValue::Wide(crate::scalars::uuid_key(b))], r))
+                .collect::<Vec<_>>()
+        };
+        let mut low = [0u8; 16];
+        low[15] = 5;
+        assert_eq!(bits(low)[125..], [1, 0, 1]);
+        assert_eq!(bits([0x80; 16])[..2], [1, 0]);
+        let mut all: Vec<[u8; 16]> = [0u8, 1, 0x7f, 0x80, 0xff]
+            .iter()
+            .flat_map(|&a| {
+                [0u8, 0x80, 0xff].map(|z| {
+                    let mut b = [0u8; 16];
+                    b[0] = a;
+                    b[15] = z;
+                    b
+                })
+            })
+            .collect();
+        let mut by_bits = all.clone();
+        by_bits.sort_by_key(|&b| bits(b));
+        all.sort();
+        assert_eq!(by_bits, all);
     }
 
     #[test]

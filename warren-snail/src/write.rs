@@ -6,6 +6,7 @@ use crate::catalog::{Catalog, Column, ColumnType, Order, Table};
 use crate::cut::{cut, largest_place, Block, Width, Widths};
 use crate::directory::{
     build, decode_top, encode_top, ColumnPages, Entry, Head, MapPages, PageEntry, PageMap, Summary,
+    WIDE_LEVEL,
 };
 use crate::encode::{descriptor, disk_pages, encode, DataPage, Encoded, DICTIONARY_BYTES};
 use crate::file::{
@@ -15,9 +16,9 @@ use crate::places::{key, month_utc, null_key, shown, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array, Int16Array, Int32Array,
-    Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
-    TimestampMicrosecondArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+    StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use parquet::data_type::ByteArray;
@@ -56,6 +57,7 @@ impl Rows {
                     Values::Int(x) => x.resize(rows, None),
                     Values::Text(x) => x.resize(rows, None),
                     Values::Utf8(x) => x.resize(rows, None),
+                    Values::Wide(x) => x.resize(rows, None),
                     _ => unreachable!("a column is read as plain values"),
                 }
                 columns.push(out);
@@ -78,6 +80,14 @@ impl Rows {
                     ))
                 };
                 match (&mut out, c.ty, a.data_type()) {
+                    (Values::Wide(out), ColumnType::Uuid, DataType::FixedSizeBinary(16)) => {
+                        let a = a.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+                        out.extend(
+                            a.iter().map(|v| {
+                                v.map(|b| crate::scalars::uuid_key(b.try_into().unwrap()))
+                            }),
+                        );
+                    }
                     (Values::Int(out), ColumnType::Boolean, DataType::Boolean) => {
                         let a = a.as_any().downcast_ref::<BooleanArray>().unwrap();
                         out.extend(a.iter().map(|v| v.map(i64::from)));
@@ -595,11 +605,7 @@ pub(crate) fn laid_out(
     let mut unsorted: Vec<KeyValue> = Vec::with_capacity(n * stride);
     // For each level, the sublevels a text level is cut on: its longest value's bytes and one more;
     // at least one, as an empty order's, where it holds only NULLs.
-    let mut text_sublevels: Vec<u32> = order
-        .levels
-        .iter()
-        .map(|l| table.columns[l.column()].ty.is_byte_array() as u32)
-        .collect();
+    let mut text_sublevels = level_kinds(table, order);
     let fixed = given.is_some();
     if let Some(g) = given {
         text_sublevels = g.to_vec();
@@ -618,6 +624,10 @@ pub(crate) fn laid_out(
                         text_sublevels[li] = text_sublevels[li].max(s.len() as u32 + 1);
                     }
                     unsorted.push(KeyValue::Text(s.into()));
+                    continue;
+                }
+                Values::Wide(v) => {
+                    unsorted.push(KeyValue::Wide(v[r].unwrap()));
                     continue;
                 }
                 Values::Int(v) => v[r].unwrap(),
@@ -696,6 +706,31 @@ pub(crate) fn laid_out(
     })
 }
 
+/// What each level of an order holds before any row is laid on it: a text level cut on one
+/// sublevel, a level keyed in 128 bits marked so, and a number 0.
+pub(crate) fn level_kinds(table: &Table, order: &Order) -> Vec<u32> {
+    order
+        .levels
+        .iter()
+        .map(|l| {
+            let ty = table.columns[l.column()].ty;
+            if ty.is_wide() {
+                WIDE_LEVEL
+            } else {
+                ty.is_byte_array() as u32
+            }
+        })
+        .collect()
+}
+
+/// The columns an order holds keyed in 128 bits, by their slots.
+pub(crate) fn wide_slots(table: &Table, order: &Order) -> Vec<u32> {
+    (0..order.columns.len())
+        .filter(|&s| table.columns[order.columns[s]].ty.is_wide())
+        .map(|s| s as u32)
+        .collect()
+}
+
 /// The month and text columns an order holds, by their slots.
 fn slots(table: &Table, order: &Order) -> (Vec<u32>, Vec<u32>) {
     let months = table
@@ -724,6 +759,7 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> He
         text_slots,
         level_text: laid.text_sublevels.clone(),
         height: 0,
+        wide_slots: wide_slots(table, order),
     }
 }
 
@@ -735,12 +771,9 @@ pub(crate) fn empty_head(table: &Table, order: &Order) -> Head {
         units: vec![1; order.columns.len()],
         month_slots,
         text_slots,
-        level_text: order
-            .levels
-            .iter()
-            .map(|l| table.columns[l.column()].ty.is_byte_array() as u32)
-            .collect(),
+        level_text: level_kinds(table, order),
         height: 1,
+        wide_slots: wide_slots(table, order),
     }
 }
 
@@ -893,6 +926,7 @@ fn write_order(
         text_slots: text_slots.iter().map(|&s| s as u32).collect(),
         level_text: text_sublevels.clone(),
         height: 0,
+        wide_slots: wide_slots(table, order),
     };
     let (top, below) = build(head, entries, &mut |bytes| w.place(bytes))?;
     let levels = decode_top(&top)?.0.height;
@@ -938,11 +972,13 @@ pub(crate) fn write_block(
         let present: Vec<i64> = values
             .ints()
             .map_or(Vec::new(), |v| v.iter().flatten().copied().collect());
+        let keyed: Vec<i128> = (0..values.len()).filter_map(|i| values.wide(i)).collect();
         summaries.push(Summary {
             nulls: values.nulls() as u32,
-            min: present.iter().copied().min().unwrap_or(0),
-            max: present.iter().copied().max().unwrap_or(0),
+            min: keyed.iter().copied().min().unwrap_or(0),
+            max: keyed.iter().copied().max().unwrap_or(0),
             pages: 0,
+            wide: table.columns[c].ty.is_wide(),
         });
         if let Some(m) = month_slots.iter().position(|&x| x == s) {
             for &v in &present {

@@ -359,12 +359,25 @@ fn cmd_write(args: &[String]) -> Result<()> {
     for t in &catalog.tables {
         if let Some(c) = t.arrival_key() {
             let order = t.orders.iter().find(|o| o.table_order).unwrap();
-            println!(
-                "{}: laid out along {}, on {}, a key handed out as rows arrive, since the DDL names \
-                 no other order: its blocks follow the rows' arrival, and each insert meets the \
-                 newest",
-                t.name, order.name, t.columns[c].name
-            );
+            let random = t.columns[c]
+                .default
+                .as_ref()
+                .is_some_and(warren_snail::catalog::hands_out_at_random);
+            if random {
+                println!(
+                    "{}: laid out along {}, on {}, a key handed out at random as rows arrive, since \
+                     the DDL names no other order: each insert lands where its key falls, \
+                     scattered across the blocks",
+                    t.name, order.name, t.columns[c].name
+                );
+            } else {
+                println!(
+                    "{}: laid out along {}, on {}, a key handed out as rows arrive, since the DDL \
+                     names no other order: its blocks follow the rows' arrival, and each insert \
+                     meets the newest",
+                    t.name, order.name, t.columns[c].name
+                );
+            }
         }
     }
     for w in written {

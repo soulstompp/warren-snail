@@ -1668,9 +1668,10 @@ impl Draft {
                         | "clock_timestamp",
                         [],
                     ) => Some(ColumnType::Timestamptz),
-                    ("gen_random_uuid" | "uuidv7" | "uuidv4", _) => {
+                    ("gen_random_uuid" | "uuidv7" | "uuidv4", []) => Some(ColumnType::Uuid),
+                    ("uuidv7", [_]) => {
                         return Err(Error::new(format!(
-                            "{what}: {e} hands out a uuid, which is not held"
+                            "{what}: {e} shifts its instant by an interval, which is not held"
                         )))
                     }
                     ("mod" | "abs", _) => {

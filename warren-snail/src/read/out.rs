@@ -10,7 +10,7 @@ use crate::{Error, Result};
 use bytes::Bytes;
 use parquet::basic::{Compression, Encoding, PageType, Type as PhysicalType};
 use parquet::column::writer::ColumnCloseResult;
-use parquet::data_type::ByteArray;
+use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::file::metadata::{
     ColumnChunkMetaData, ColumnIndexBuilder, KeyValue, OffsetIndexBuilder, PageEncodingStats,
     SortingColumn,
@@ -66,6 +66,7 @@ fn extremes(values: &Values, from: usize, to: usize) -> (Option<(Extreme, Extrem
     for i in from..to {
         let v = match values {
             Values::Int(_) => values.int(i).map(Extreme::Int),
+            Values::Wide(w) => w[i].map(|k| Extreme::Bytes(crate::scalars::uuid_bytes(k).to_vec())),
             _ => values
                 .text_value(i)
                 .map(|b| Extreme::Bytes(b.data().to_vec())),
@@ -110,6 +111,10 @@ fn statistics(physical: PhysicalType, range: Option<(Extreme, Extreme)>, nulls: 
             Some(nulls),
             false,
         ),
+        PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+            let bytes = |e: &Extreme| FixedLenByteArray::from(e.plain(physical));
+            Statistics::fixed_len_byte_array(lo.map(bytes), hi.map(bytes), None, Some(nulls), false)
+        }
         _ => {
             let bytes = |e: &Extreme| ByteArray::from(e.plain(physical));
             Statistics::byte_array(lo.map(bytes), hi.map(bytes), None, Some(nulls), false)

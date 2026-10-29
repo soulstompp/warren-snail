@@ -12,11 +12,70 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
-/// Values from `lo` to `hi`, both included.
+/// Values from `lo` to `hi`, both included, as their keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Interval {
-    pub lo: i64,
-    pub hi: i64,
+    pub lo: i128,
+    pub hi: i128,
+}
+
+impl Interval {
+    /// Every value.
+    pub const ALL: Interval = Interval {
+        lo: i128::MIN,
+        hi: i128::MAX,
+    };
+
+    pub fn at(v: i128) -> Interval {
+        Interval { lo: v, hi: v }
+    }
+
+    pub fn holds(&self, v: i128) -> bool {
+        self.lo <= v && v <= self.hi
+    }
+}
+
+/// A condition on one column, or on its month: the values `kept` holds less those `except` names,
+/// and the column's NULLs too where `nulls`. `<>` keeps every value but one; IS NOT TRUE keeps
+/// false and NULL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Cond {
+    pub shape: Shape,
+    pub kept: Interval,
+    pub except: Vec<i128>,
+    pub nulls: bool,
+}
+
+impl Cond {
+    pub fn new(shape: Shape, kept: Interval) -> Cond {
+        Cond {
+            shape,
+            kept,
+            except: Vec::new(),
+            nulls: false,
+        }
+    }
+
+    /// Whether it keeps a run of values and nothing else, as a range on a level does.
+    pub fn is_range(&self) -> bool {
+        self.except.is_empty() && !self.nulls
+    }
+
+    /// Whether it keeps a row whose value is `v`, none for a NULL.
+    pub fn holds(&self, v: Option<i128>) -> bool {
+        match v {
+            None => self.nulls,
+            Some(v) => self.kept.holds(v) && !self.except.contains(&v),
+        }
+    }
+
+    /// Whether it keeps no value, and no NULL.
+    fn is_empty(&self) -> bool {
+        !self.nulls
+            && (self.kept.lo > self.kept.hi
+                || (self.kept.lo == self.kept.hi && self.except.contains(&self.kept.lo)))
+    }
 }
 
 /// A column of one of the tables a question reads.
@@ -110,17 +169,22 @@ impl Select {
     }
 }
 
-/// A condition on a text column: its values between two bounds, compared by their bytes.
+/// A condition on a text column: its values between two bounds, compared by their bytes, less those
+/// `except` names.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct TextCond {
     pub column: usize,
     pub lo: Bound<String>,
     pub hi: Bound<String>,
+    pub except: Vec<String>,
 }
 
 impl TextCond {
     pub fn holds(&self, v: &str) -> bool {
+        if self.except.iter().any(|x| x == v) {
+            return false;
+        }
         let v = v.as_bytes();
         let above = match &self.lo {
             Included(l) => v >= l.as_bytes(),
@@ -138,7 +202,9 @@ impl TextCond {
     fn is_empty(&self) -> bool {
         match (&self.lo, &self.hi) {
             (Unbounded, _) | (_, Unbounded) => false,
-            (Included(l), Included(h)) => l.as_bytes() > h.as_bytes(),
+            (Included(l), Included(h)) => {
+                l.as_bytes() > h.as_bytes() || (l == h && self.except.contains(l))
+            }
             (Included(l) | Excluded(l), Included(h) | Excluded(h)) => l.as_bytes() >= h.as_bytes(),
         }
     }
@@ -179,7 +245,7 @@ pub struct Sort {
 #[non_exhaustive]
 pub struct Side {
     pub table: usize,
-    pub conds: Vec<(Shape, Interval)>,
+    pub conds: Vec<Cond>,
     pub texts: Vec<TextCond>,
     /// Each column a condition keeps to its NULLs, IS NULL (true), or to its values, IS NOT NULL
     /// (false).
@@ -273,11 +339,24 @@ pub(super) fn truth_literal(e: &Expr) -> Result<i64> {
     }
 }
 
-fn literal(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
+/// A literal compared with a column, or its month, as the key its values are compared by.
+fn literal(e: &Expr, s: Shape, table: &Table) -> Result<i128> {
+    literal_i64(e, s, table)
+        .map(i128::from)
+        .or_else(|err| match s {
+            Shape::Column(c) if table.columns[c].ty == ColumnType::Uuid => {
+                crate::scalars::uuid_parse(&text_literal(e)?)
+            }
+            _ => Err(err),
+        })
+}
+
+fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
     match s {
         Shape::MonthUtc(_) => number(e).ok_or_else(|| Error::new(format!("{e} is not a month"))),
         Shape::Column(c) => match table.columns[c].ty {
             ColumnType::Boolean => truth_literal(e),
+            ColumnType::Uuid => Err(Error::new(format!("{e} is not a uuid"))),
             ColumnType::Timestamptz => {
                 instant(&text_literal(e).map_err(|_| Error::new(format!("{e} is not an instant")))?)
             }
@@ -340,37 +419,58 @@ pub(super) fn text_literal(e: &Expr) -> Result<String> {
     }
 }
 
-/// A condition's values on a column kept to those of `iv` as well.
-fn merge(conds: &mut Vec<(Shape, Interval)>, s: Shape, iv: Interval) {
-    match conds.iter_mut().find(|(x, _)| *x == s) {
-        Some((_, have)) => {
-            *have = Interval {
-                lo: have.lo.max(iv.lo),
-                hi: have.hi.min(iv.hi),
+/// A condition kept to another on the same column as well: the values both keep, and the NULLs
+/// both keep.
+fn merge(conds: &mut Vec<Cond>, c: Cond) {
+    match conds.iter_mut().find(|x| x.shape == c.shape) {
+        Some(have) => {
+            have.kept = Interval {
+                lo: have.kept.lo.max(c.kept.lo),
+                hi: have.kept.hi.min(c.kept.hi),
+            };
+            for v in c.except {
+                if !have.except.contains(&v) {
+                    have.except.push(v);
+                }
             }
+            have.nulls &= c.nulls;
         }
-        None => conds.push((s, iv)),
+        None => conds.push(c),
     }
 }
 
-/// A boolean column standing as a condition, alone, under NOT, or under IS TRUE or IS FALSE: its side,
-/// its column, and the value, 1 or 0, the rows it keeps hold. Each keeps what `= true` or `= false`
-/// keeps, a NULL among neither.
-fn truth_test(from: &From, e: &Expr) -> Option<(usize, usize, i64)> {
-    let (x, v) = match e {
+/// A truth test on a boolean column: the column standing as a condition, alone or under NOT, or
+/// under IS [NOT] TRUE or FALSE. Its side and the condition it is: each keeps what `= true` or
+/// `= false` keeps, and IS NOT TRUE and IS NOT FALSE keep the column's NULLs too. Refused on a
+/// column of any other type, as PostgreSQL refuses it.
+fn truth_test(from: &From, e: &Expr) -> Result<Option<(usize, Cond)>> {
+    let (x, v, nulls, test) = match e {
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => (expr.as_ref(), 0),
-        Expr::IsTrue(x) => (x.as_ref(), 1),
-        Expr::IsFalse(x) => (x.as_ref(), 0),
-        x => (x, 1),
+        } => (expr.as_ref(), 0, false, None),
+        Expr::IsTrue(x) => (x.as_ref(), 1, false, Some("IS TRUE")),
+        Expr::IsFalse(x) => (x.as_ref(), 0, false, Some("IS FALSE")),
+        Expr::IsNotTrue(x) => (x.as_ref(), 0, true, Some("IS NOT TRUE")),
+        Expr::IsNotFalse(x) => (x.as_ref(), 1, true, Some("IS NOT FALSE")),
+        x => (x, 1, false, None),
     };
     match from.resolve(x) {
         Ok((side, Shape::Column(c))) if from.table(side).columns[c].ty == ColumnType::Boolean => {
-            Some((side, c, v))
+            let mut cond = Cond::new(Shape::Column(c), Interval::at(v));
+            cond.nulls = nulls;
+            Ok(Some((side, cond)))
         }
-        _ => None,
+        Ok((side, _)) if test.is_some() => Err(Error::new(format!(
+            "argument of {} must be type boolean, not type {}",
+            test.unwrap(),
+            match from.resolve(x)? {
+                (_, Shape::Column(c)) | (_, Shape::Clock(c)) =>
+                    from.table(side).columns[c].ty.pg_name(),
+                (_, Shape::MonthUtc(_)) => "smallint".into(),
+            }
+        ))),
+        _ => Ok(None),
     }
 }
 
@@ -691,16 +791,29 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         .collect();
     let mut join: Vec<(usize, usize)> = Vec::new();
     for p in parts {
-        if let Some((side, c, v)) = truth_test(&from, p) {
-            merge(
-                &mut sides[side].conds,
-                Shape::Column(c),
-                Interval { lo: v, hi: v },
-            );
+        if let Some((side, cond)) = truth_test(&from, p)? {
+            merge(&mut sides[side].conds, cond);
             continue;
         }
-        if let Expr::IsNull(x) | Expr::IsNotNull(x) = p {
-            let null = matches!(p, Expr::IsNull(_));
+        if let Expr::IsUnknown(x) | Expr::IsNotUnknown(x) = p {
+            if let (side, Shape::Column(c)) = from.resolve(x)? {
+                let ty = from.table(side).columns[c].ty;
+                if ty != ColumnType::Boolean {
+                    return Err(Error::new(format!(
+                        "argument of {} must be type boolean, not type {}",
+                        if matches!(p, Expr::IsUnknown(_)) {
+                            "IS UNKNOWN"
+                        } else {
+                            "IS NOT UNKNOWN"
+                        },
+                        ty.pg_name()
+                    )));
+                }
+            }
+        }
+        if let Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::IsUnknown(x) | Expr::IsNotUnknown(x) = p
+        {
+            let null = matches!(p, Expr::IsNull(_) | Expr::IsUnknown(_));
             let (side, c) = match from.resolve(x)? {
                 (side, Shape::Column(c)) => (side, c),
                 _ => return Err(Error::new(format!("{p}: test a column itself for NULL"))),
@@ -765,6 +878,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             && matches!(
                 op,
                 BinaryOperator::Eq
+                    | BinaryOperator::NotEq
                     | BinaryOperator::Lt
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
@@ -782,8 +896,13 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             }
             if table.columns[c].ty.is_text() {
                 let v = text_literal(lit)?;
+                let mut except = Vec::new();
                 let (lo, hi) = match op {
                     BinaryOperator::Eq => (Included(v.clone()), Included(v)),
+                    BinaryOperator::NotEq => {
+                        except.push(v);
+                        (Unbounded, Unbounded)
+                    }
                     BinaryOperator::Lt => (Unbounded, Excluded(v)),
                     BinaryOperator::LtEq => (Unbounded, Included(v)),
                     BinaryOperator::Gt => (Excluded(v), Unbounded),
@@ -798,37 +917,64 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     Some(t) => {
                         t.lo = tighter(std::mem::replace(&mut t.lo, Unbounded), lo, true);
                         t.hi = tighter(std::mem::replace(&mut t.hi, Unbounded), hi, false);
+                        for x in except {
+                            if !t.except.contains(&x) {
+                                t.except.push(x);
+                            }
+                        }
                     }
-                    None => here.texts.push(TextCond { column: c, lo, hi }),
+                    None => here.texts.push(TextCond {
+                        column: c,
+                        lo,
+                        hi,
+                        except,
+                    }),
                 }
                 continue;
             }
         }
         let (s, v) = match s {
-            Shape::Clock(c) => (Shape::Column(c), clock_literal(lit)?),
+            Shape::Clock(c) => (Shape::Column(c), clock_literal(lit)? as i128),
             _ => (s, literal(lit, s, table)?),
         };
-        let iv = match op {
-            BinaryOperator::Eq => Interval { lo: v, hi: v },
-            BinaryOperator::Lt => Interval {
-                lo: i64::MIN,
-                hi: v.saturating_sub(1),
-            },
-            BinaryOperator::LtEq => Interval {
-                lo: i64::MIN,
-                hi: v,
-            },
-            BinaryOperator::Gt => Interval {
-                lo: v.saturating_add(1),
-                hi: i64::MAX,
-            },
-            BinaryOperator::GtEq => Interval {
-                lo: v,
-                hi: i64::MAX,
-            },
+        let cond = match op {
+            BinaryOperator::Eq => Cond::new(s, Interval::at(v)),
+            BinaryOperator::NotEq => {
+                let mut c = Cond::new(s, Interval::ALL);
+                c.except.push(v);
+                c
+            }
+            BinaryOperator::Lt => Cond::new(
+                s,
+                Interval {
+                    lo: i128::MIN,
+                    hi: v.saturating_sub(1),
+                },
+            ),
+            BinaryOperator::LtEq => Cond::new(
+                s,
+                Interval {
+                    lo: i128::MIN,
+                    hi: v,
+                },
+            ),
+            BinaryOperator::Gt => Cond::new(
+                s,
+                Interval {
+                    lo: v.saturating_add(1),
+                    hi: i128::MAX,
+                },
+            ),
+            BinaryOperator::GtEq => Cond::new(
+                s,
+                Interval {
+                    lo: v,
+                    hi: i128::MAX,
+                },
+            ),
             other => return Err(Error::new(format!("the comparison {other} is not read"))),
         };
-        merge(&mut here.conds, s, iv);
+        merge(&mut here.conds, cond);
     }
     if sides.len() == 2 && join.is_empty() {
         return Err(Error::new("two tables are joined on no key"));
@@ -838,11 +984,11 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         let compared = |c: usize| {
             side.conds
                 .iter()
-                .any(|(s, _)| crate::read::walk::s_column(*s) == c)
+                .any(|x| !x.nulls && crate::read::walk::s_column(x.shape) == c)
                 || side.texts.iter().any(|t| t.column == c)
                 || side.nulls.contains(&(c, false))
         };
-        side.empty |= side.conds.iter().any(|(_, iv)| iv.lo > iv.hi)
+        side.empty |= side.conds.iter().any(Cond::is_empty)
             || side.texts.iter().any(TextCond::is_empty)
             || side.nulls.iter().any(|&(c, null)| null && compared(c));
     }

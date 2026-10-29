@@ -30,6 +30,8 @@ pub enum ColumnType {
     },
     /// A boolean, false before true, packed a bit a row.
     Boolean,
+    /// A uuid: its 16 bytes, compared byte by byte.
+    Uuid,
 }
 
 impl ColumnType {
@@ -39,8 +41,28 @@ impl ColumnType {
         match self {
             ColumnType::Int2 | ColumnType::Int4 => Some(4),
             ColumnType::Int8 | ColumnType::Timestamptz | ColumnType::Numeric { .. } => Some(8),
+            ColumnType::Uuid => Some(16),
             ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Boolean => None,
         }
+    }
+
+    /// Whether its values are keyed in 128 bits.
+    pub fn is_wide(self) -> bool {
+        matches!(self, ColumnType::Uuid)
+    }
+
+    /// Whether 0.1.x held it, so that a snail of format 7 or 8 can.
+    pub fn held_by_0_1(self) -> bool {
+        matches!(
+            self,
+            ColumnType::Int2
+                | ColumnType::Int4
+                | ColumnType::Int8
+                | ColumnType::Timestamptz
+                | ColumnType::Text(_)
+                | ColumnType::Bytes
+                | ColumnType::Numeric { .. }
+        )
     }
 
     /// The bits a value takes where the type is narrower than 4 bytes, so that the cut passes over
@@ -77,6 +99,7 @@ impl ColumnType {
             ColumnType::Bytes => "bytea".into(),
             ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
             ColumnType::Boolean => "boolean".into(),
+            ColumnType::Uuid => "uuid".into(),
         }
     }
 
@@ -92,6 +115,7 @@ impl ColumnType {
             ColumnType::Bytes => "bytea".into(),
             ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
             ColumnType::Boolean => "boolean".into(),
+            ColumnType::Uuid => "uuid".into(),
         }
     }
 
@@ -107,6 +131,7 @@ impl ColumnType {
             ColumnType::Bytes => "bytea_ops",
             ColumnType::Numeric { .. } => "numeric_ops",
             ColumnType::Boolean => "bool_ops",
+            ColumnType::Uuid => "uuid_ops",
         }
     }
 
@@ -136,6 +161,7 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Timestamptz, Timestamptz)
             | (Bytes, Bytes)
             | (Boolean, Boolean)
+            | (Uuid, Uuid)
     )
 }
 
@@ -292,7 +318,7 @@ impl Table {
     }
 
     /// The column whose values are handed out as rows arrive, where the table's order leads with
-    /// one: an identity, or a DEFAULT that a sequence or the clock fills.
+    /// one: an identity, or a DEFAULT that a sequence, the clock or a uuid's generator fills.
     pub fn arrival_key(&self) -> Option<usize> {
         let order = self.orders.iter().find(|o| o.table_order)?;
         let c = order.levels.first()?.column();
@@ -301,14 +327,16 @@ impl Table {
     }
 }
 
-/// Whether a DEFAULT hands out a value as each row arrives: a sequence's next value, or the clock.
+/// Whether a DEFAULT hands out a value as each row arrives: a sequence's next value, the clock, or
+/// a uuid.
 pub fn hands_out(e: &Expr) -> bool {
     match e {
         Expr::Nested(x) | Expr::Cast { expr: x, .. } => hands_out(x),
         Expr::Function(f) => matches!(
-            object_name(&f.name).to_lowercase().as_str(),
+            object_name(&f.name)
+                .to_lowercase()
+                .trim_start_matches("pg_catalog."),
             "nextval"
-                | "pg_catalog.nextval"
                 | "now"
                 | "current_timestamp"
                 | "transaction_timestamp"
@@ -317,6 +345,21 @@ pub fn hands_out(e: &Expr) -> bool {
                 | "gen_random_uuid"
                 | "uuidv7"
                 | "uuidv4"
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a DEFAULT hands out a random value as each row arrives, rising with none: a version 4
+/// uuid.
+pub fn hands_out_at_random(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x) | Expr::Cast { expr: x, .. } => hands_out_at_random(x),
+        Expr::Function(f) => matches!(
+            object_name(&f.name)
+                .to_lowercase()
+                .trim_start_matches("pg_catalog."),
+            "gen_random_uuid" | "uuidv4"
         ),
         _ => false,
     }
@@ -776,6 +819,7 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
         }),
         DataType::Bytea => ColumnType::Bytes,
         DataType::Boolean | DataType::Bool => ColumnType::Boolean,
+        DataType::Uuid => ColumnType::Uuid,
         DataType::Numeric(info) | DataType::Decimal(info) => {
             let (p, s) = match info {
                 ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
@@ -1359,7 +1403,7 @@ mod tests {
     fn a_ddl_is_read_a_statement_at_a_time_each_taken_or_refused_by_name() {
         let r = Catalog::read(
             "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));
-             CREATE TABLE s.u (a uuid NOT NULL, PRIMARY KEY (a));
+             CREATE TABLE s.u (a jsonb NOT NULL, PRIMARY KEY (a));
              CREATE INDEX ua ON s.u (a);
              CREATE INDEX tg ON s.t USING gin (a);
              CREATE INDEX tp ON s.t (a) WHERE a > 0;
@@ -1373,7 +1417,7 @@ mod tests {
             .map(|s| (s.object.as_str(), s.refused.as_deref()))
             .collect();
         assert_eq!(read[0], ("s.t", None));
-        assert!(read[1].1.unwrap().contains("the type uuid is not held"));
+        assert!(read[1].1.unwrap().contains("the type jsonb is not held"));
         assert_eq!(read[2].1, Some("ua is on s.u, which is refused"));
         assert!(read[3].1.unwrap().contains("USING gin is not held yet"));
         assert!(read[4].1.unwrap().contains("a partial index, WHERE a > 0"));

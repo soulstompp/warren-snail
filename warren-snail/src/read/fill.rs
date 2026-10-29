@@ -54,6 +54,7 @@ fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
         (Datum::Int(v), _) => v.to_string(),
         (Datum::Text(s), _) => s.clone(),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()).text().unwrap_or_default(),
+        (Datum::Wide(k), _) => crate::scalars::uuid_text(*k),
     })
 }
 
@@ -133,7 +134,7 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
                 }
             }
         }
-        (Timestamptz, Timestamptz) | (Bytes, Bytes) | (Boolean, Boolean) => d,
+        (Timestamptz, Timestamptz) | (Bytes, Bytes) | (Boolean, Boolean) | (Uuid, Uuid) => d,
         _ => return Err(refused()),
     })
 }
@@ -147,6 +148,7 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Int(v), _) => Value::Int(*v),
         (Datum::Text(s), _) => Value::Text(s.clone()),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()),
+        (Datum::Wide(k), _) => Value::Uuid(*k),
     }
 }
 
@@ -168,6 +170,7 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
         Value::Text(s) => (Datum::Text(s), ColumnType::Text(None)),
         Value::Bytes(b) => (Datum::Bytes(b), ColumnType::Bytes),
         Value::Bool(b) => (Datum::Int(b as i64), ColumnType::Boolean),
+        Value::Uuid(k) => (Datum::Wide(k), ColumnType::Uuid),
     };
     assign(d, from, to, what)
 }

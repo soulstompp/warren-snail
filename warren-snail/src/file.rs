@@ -26,7 +26,7 @@ fn reads(format: u32) -> bool {
 }
 
 /// Refuses a table whose columns a snail of `format` cannot hold: formats 7 and 8 hold the types
-/// 0.1.x held, and no boolean.
+/// 0.1.x held, and no other.
 pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result<()> {
     if format >= FORMAT {
         return Ok(());
@@ -61,11 +61,7 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             table.name, o.name
         )));
     }
-    match table
-        .columns
-        .iter()
-        .find(|c| c.ty == crate::catalog::ColumnType::Boolean)
-    {
+    match table.columns.iter().find(|c| !c.ty.held_by_0_1()) {
         Some(c) => Err(crate::Error::new(format!(
             "{}.{} is {}, which a snail of format {format} cannot hold: put the snail `out` and \
              `write` it afresh, in format {FORMAT}",
@@ -149,6 +145,9 @@ impl Out {
     pub fn i64(&mut self, v: i64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
+    pub fn i128(&mut self, v: i128) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
     pub fn str(&mut self, s: &str) {
         self.u32(s.len() as u32);
         self.0.extend_from_slice(s.as_bytes());
@@ -195,6 +194,9 @@ impl<'a> In<'a> {
     }
     pub fn i64(&mut self) -> Result<i64> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    pub fn i128(&mut self) -> Result<i128> {
+        Ok(i128::from_le_bytes(self.take(16)?.try_into().unwrap()))
     }
     pub fn str(&mut self) -> Result<String> {
         let n = self.u32()? as usize;

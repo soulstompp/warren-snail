@@ -11,12 +11,25 @@ use crate::{Error, Result};
 #[non_exhaustive]
 pub struct Summary {
     pub nulls: u32,
-    /// The least and greatest value present; both 0 where every row is NULL, and for text, which keeps
-    /// neither.
-    pub min: i64,
-    pub max: i64,
+    /// The least and greatest value present, as their keys; both 0 where every row is NULL, and for
+    /// text, which keeps neither.
+    pub min: i128,
+    pub max: i128,
     /// The disk pages the column takes under the entry, dictionaries among them.
     pub pages: u32,
+    /// Whether the column is keyed in 128 bits, so that its least and greatest take 16 bytes each.
+    pub wide: bool,
+}
+
+impl Summary {
+    /// The bytes it takes in its entry.
+    fn size(&self) -> usize {
+        if self.wide {
+            40
+        } else {
+            24
+        }
+    }
 }
 
 /// An entry of an order's directory: a block, or above the blocks a directory page, with the counts
@@ -52,12 +65,21 @@ pub struct Head {
     pub month_slots: Vec<u32>,
     /// Which of the held columns are text, whose bytes each entry keeps.
     pub text_slots: Vec<u32>,
-    /// For each level of the order, the sublevels it is cut on where it is text, and 0 where it is a
-    /// number.
+    /// For each level of the order, the sublevels it is cut on where it is text, `WIDE_LEVEL` where
+    /// it is keyed in 128 bits, and 0 where it is a number.
     pub level_text: Vec<u32>,
     /// The levels of directory pages, the top among them: 1 where the top holds the blocks.
     pub height: u32,
+    /// Which of the held columns are keyed in 128 bits, by their place among the held columns.
+    pub wide_slots: Vec<u32>,
 }
+
+/// What `Head::level_text` holds for a level keyed in 128 bits.
+pub const WIDE_LEVEL: u32 = 1 << 31;
+
+/// The top bit of a head's height, set where the order holds a column keyed in 128 bits: the
+/// columns' places follow it. A head holding none is written as before.
+const HEAD_WIDE: u32 = 1 << 31;
 
 fn add(a: u32, b: u32) -> Result<u32> {
     a.checked_add(b)
@@ -69,7 +91,7 @@ impl Entry {
     pub fn size(&self) -> usize {
         36 + keys_len(&self.first)
             + keys_len(&self.last)
-            + 24 * self.columns.len()
+            + self.columns.iter().map(Summary::size).sum::<usize>()
             + 48 * self.months.len()
             + 4 * self.bytes.len()
     }
@@ -86,7 +108,14 @@ impl Entry {
             dead: 0,
             first: first.first.clone(),
             last: last.last.clone(),
-            columns: vec![Summary::default(); first.columns.len()],
+            columns: first
+                .columns
+                .iter()
+                .map(|c| Summary {
+                    wide: c.wide,
+                    ..Summary::default()
+                })
+                .collect(),
             months: vec![[0u32; 12]; first.months.len()],
             bytes: vec![0u32; first.bytes.len()],
             child,
@@ -130,8 +159,13 @@ impl Entry {
         keys_out(o, &self.last);
         for c in &self.columns {
             o.u32(c.nulls);
-            o.i64(c.min);
-            o.i64(c.max);
+            if c.wide {
+                o.i128(c.min);
+                o.i128(c.max);
+            } else {
+                o.i64(c.min as i64);
+                o.i64(c.max as i64);
+            }
             o.u32(c.pages);
         }
         for m in &self.months {
@@ -152,12 +186,20 @@ impl Entry {
         let first = keys_in(i, &head.level_text)?;
         let last = keys_in(i, &head.level_text)?;
         let mut columns = Vec::with_capacity(head.units.len());
-        for _ in 0..head.units.len() {
+        for s in 0..head.units.len() {
+            let wide = head.wide_slots.contains(&(s as u32));
+            let nulls = i.u32()?;
+            let (min, max) = if wide {
+                (i.i128()?, i.i128()?)
+            } else {
+                (i.i64()? as i128, i.i64()? as i128)
+            };
             columns.push(Summary {
-                nulls: i.u32()?,
-                min: i.i64()?,
-                max: i.i64()?,
+                nulls,
+                min,
+                max,
                 pages: i.u32()?,
+                wide,
             });
         }
         let mut months = Vec::with_capacity(head.month_slots.len());
@@ -205,6 +247,7 @@ fn keys_len(key: &[KeyValue]) -> usize {
             .map(|v| match v {
                 KeyValue::Int(_) => 8,
                 KeyValue::Text(s) => 4 + s.len(),
+                KeyValue::Wide(_) => 16,
                 KeyValue::Null { .. } => 0,
             })
             .sum::<usize>()
@@ -224,12 +267,14 @@ fn keys_out(o: &mut Out, key: &[KeyValue]) {
         match v {
             KeyValue::Int(x) => o.i64(*x),
             KeyValue::Text(s) => o.str(s),
+            KeyValue::Wide(x) => o.i128(*x),
             KeyValue::Null { .. } => {}
         }
     }
 }
 
-/// A key, its levels' kinds told by `level_text`: text where it is not 0.
+/// A key, its levels' kinds told by `level_text`: keyed in 128 bits where it is `WIDE_LEVEL`, else
+/// text where it is not 0.
 fn keys_in(i: &mut In, level_text: &[u32]) -> Result<Vec<KeyValue>> {
     let count = i.u32()?;
     let marked = count & KEY_NULLS != 0;
@@ -241,10 +286,10 @@ fn keys_in(i: &mut In, level_text: &[u32]) -> Result<Vec<KeyValue>> {
                 2 => return Ok(KeyValue::Null { first: false }),
                 other => return Err(Error::new(format!("a key's level is marked {other}"))),
             }
-            Ok(if level_text.get(k).copied().unwrap_or(0) > 0 {
-                KeyValue::Text(i.str()?.into_boxed_str())
-            } else {
-                KeyValue::Int(i.i64()?)
+            Ok(match level_text.get(k).copied().unwrap_or(0) {
+                WIDE_LEVEL => KeyValue::Wide(i.i128()?),
+                0 => KeyValue::Int(i.i64()?),
+                _ => KeyValue::Text(i.str()?.into_boxed_str()),
             })
         })
         .collect()
@@ -268,19 +313,35 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     u32s(&mut o, &head.month_slots);
     u32s(&mut o, &head.text_slots);
     u32s(&mut o, &head.level_text);
-    o.u32(head.height);
+    if head.wide_slots.is_empty() {
+        o.u32(head.height);
+    } else {
+        o.u32(head.height | HEAD_WIDE);
+        u32s(&mut o, &head.wide_slots);
+    }
     o.0.extend_from_slice(&encode_page(entries));
     o.0
 }
 
 pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
     let mut i = In::new(buf);
+    let units = read_u32s(&mut i)?;
+    let month_slots = read_u32s(&mut i)?;
+    let text_slots = read_u32s(&mut i)?;
+    let level_text = read_u32s(&mut i)?;
+    let height = i.u32()?;
+    let wide_slots = if height & HEAD_WIDE != 0 {
+        read_u32s(&mut i)?
+    } else {
+        Vec::new()
+    };
     let head = Head {
-        units: read_u32s(&mut i)?,
-        month_slots: read_u32s(&mut i)?,
-        text_slots: read_u32s(&mut i)?,
-        level_text: read_u32s(&mut i)?,
-        height: i.u32()?,
+        units,
+        month_slots,
+        text_slots,
+        level_text,
+        height: height & !HEAD_WIDE,
+        wide_slots,
     };
     let entries = decode_page(&buf[i.at()..], &head)?;
     Ok((head, entries))
@@ -610,6 +671,7 @@ mod tests {
             text_slots: vec![2],
             level_text: vec![0, 0],
             height: 1,
+            wide_slots: vec![],
         }
     }
 
@@ -623,21 +685,24 @@ mod tests {
             columns: vec![
                 Summary {
                     nulls: 0,
-                    min: -i,
-                    max: i,
+                    min: -(i as i128),
+                    max: i as i128,
                     pages: 1,
+                    ..Default::default()
                 },
                 Summary {
                     nulls: rows,
                     min: 0,
                     max: 0,
                     pages: 2,
+                    ..Default::default()
                 },
                 Summary {
                     nulls: 0,
                     min: 0,
                     max: 0,
                     pages: 2,
+                    ..Default::default()
                 },
             ],
             months: vec![[rows, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
@@ -682,6 +747,77 @@ mod tests {
             chains: vec![(4, ints([12, 7]))],
         };
         assert_eq!(PageMap::decode(&map.encode(), &[0, 0]).unwrap(), map);
+    }
+
+    #[test]
+    fn a_wide_key_and_a_wide_column_s_least_and_greatest_come_back_and_others_as_before() {
+        // A head holding no wide column is written as before: the same bytes.
+        let h = head();
+        let entries = vec![block(1, 3892, 40)];
+        let mut before = Out::default();
+        u32s(&mut before, &h.units);
+        u32s(&mut before, &h.month_slots);
+        u32s(&mut before, &h.text_slots);
+        u32s(&mut before, &h.level_text);
+        before.u32(h.height);
+        before.0.extend_from_slice(&encode_page(&entries));
+        assert_eq!(encode_top(&h, &entries), before.0);
+        // A uuid level and a uuid column held beside an integer.
+        let wide = Head {
+            units: vec![1, 1],
+            month_slots: vec![],
+            text_slots: vec![],
+            level_text: vec![WIDE_LEVEL],
+            height: 1,
+            wide_slots: vec![0],
+        };
+        let key = |k: i128| vec![KeyValue::Wide(k)];
+        let e = Entry {
+            depth: 3,
+            rows: 256,
+            dead: 0,
+            first: key(i128::MIN),
+            last: key(i128::MAX - 1),
+            columns: vec![
+                Summary {
+                    nulls: 0,
+                    min: i128::MIN,
+                    max: i128::MAX - 1,
+                    pages: 1,
+                    wide: true,
+                },
+                Summary {
+                    nulls: 2,
+                    min: -9,
+                    max: 9,
+                    pages: 1,
+                    wide: false,
+                },
+            ],
+            months: vec![],
+            bytes: vec![],
+            child: Extent {
+                start: 7,
+                bytes: 64,
+            },
+        };
+        let mut o = Out::default();
+        e.encode(&mut o);
+        assert_eq!(e.size(), o.0.len());
+        assert_eq!(
+            decode_top(&encode_top(&wide, std::slice::from_ref(&e))).unwrap(),
+            (wide.clone(), vec![e.clone()])
+        );
+        let map = PageMap {
+            columns: vec![],
+            sorted: 256,
+            dead: vec![],
+            chains: vec![(3, key(42))],
+        };
+        assert_eq!(
+            PageMap::decode(&map.encode(), &wide.level_text).unwrap(),
+            map
+        );
     }
 
     #[test]
@@ -780,7 +916,8 @@ mod tests {
                 nulls: 0,
                 min: -5,
                 max: 5,
-                pages: 2
+                pages: 2,
+                ..Default::default()
             }
         );
         let mut a = block(3, 10, 1);
@@ -791,12 +928,14 @@ mod tests {
             min: 0,
             max: 0,
             pages: 1,
+            ..Default::default()
         };
         b.columns[0] = Summary {
             nulls: 1,
             min: 4,
             max: 9,
             pages: 3,
+            ..Default::default()
         };
         b.months[0][4] = 6;
         let e = Entry::over(
@@ -818,7 +957,8 @@ mod tests {
                 nulls: 11,
                 min: 4,
                 max: 9,
-                pages: 4
+                pages: 4,
+                ..Default::default()
             }
         );
         assert_eq!(e.columns[1].nulls, 30);

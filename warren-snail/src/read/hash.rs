@@ -51,6 +51,15 @@ impl Hasher for WordHasher {
         self.add(n as u64);
     }
 
+    /// A number in 128 bits that fits in 64 hashes as that number does.
+    #[inline]
+    fn write_i128(&mut self, n: i128) {
+        self.add(n as u64);
+        if n != n as i64 as i128 {
+            self.add((n >> 64) as u64);
+        }
+    }
+
     #[inline]
     fn write_usize(&mut self, n: usize) {
         self.add(n as u64);

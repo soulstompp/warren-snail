@@ -192,10 +192,26 @@ fn a_boolean_is_compared_grouped_and_ordered_as_postgresql_does() {
         ("f.v >= false", vec![0, 2, 3, 5, 6, 8, 9]),
         ("f.w AND f.v", vec![0, 6]),
         ("f.id > 4 AND NOT f.w", vec![5, 7, 9]),
+        // A test that keeps the NULLs, and `<>`, which keeps none.
+        ("f.v IS NOT TRUE", vec![1, 2, 4, 5, 7, 8]),
+        ("f.v IS NOT FALSE", vec![0, 1, 3, 4, 6, 7, 9]),
+        ("f.v IS UNKNOWN", vec![1, 4, 7]),
+        ("f.v IS NOT UNKNOWN", vec![0, 2, 3, 5, 6, 8, 9]),
+        ("f.v <> true", vec![2, 5, 8]),
+        ("f.v <> 'no'", vec![0, 3, 6, 9]),
+        ("f.v IS NOT TRUE AND f.v IS NOT FALSE", vec![1, 4, 7]),
+        ("f.v IS NOT TRUE AND f.v = false", vec![2, 5, 8]),
+        ("f.v IS NOT TRUE AND f.v IS NULL", vec![1, 4, 7]),
     ] {
         assert_eq!(ids(&ask(&mut snail, &q(w))), want, "{w}");
     }
-    for refused in ["f.v = 1", "f.v = 'o'", "f.v = 'truth'", "f.v IS NOT TRUE"] {
+    for refused in [
+        "f.v = 1",
+        "f.v = 'o'",
+        "f.v = 'truth'",
+        "f.id IS TRUE",
+        "f.id IS UNKNOWN",
+    ] {
         assert!(snail.ask(&q(refused), None).is_err(), "{refused}");
     }
 

@@ -32,8 +32,8 @@ use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, write_block, Laid, Rows};
 use crate::{Error, Result};
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Decimal128Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use parquet::data_type::ByteArray;
 use std::collections::BTreeMap;
@@ -129,6 +129,7 @@ fn pick(entries: &[Entry], key: &[KeyValue]) -> usize {
 fn datum_at(v: &Values, i: usize) -> Datum {
     match v {
         Values::Int(x) => x[i].map_or(Datum::Null, Datum::Int),
+        Values::Wide(x) => x[i].map_or(Datum::Null, Datum::Wide),
         _ => v
             .text(i)
             .map_or(Datum::Null, |s| Datum::Text(s.to_string())),
@@ -153,6 +154,8 @@ fn push(v: &mut Values, d: &Datum) {
         (Values::Text(x), Datum::Null) => x.push(None),
         (Values::Utf8(x), Datum::Bytes(b)) => x.push(Some(ByteArray::from(b.clone()))),
         (Values::Utf8(x), Datum::Null) => x.push(None),
+        (Values::Wide(x), Datum::Wide(k)) => x.push(Some(*k)),
+        (Values::Wide(x), Datum::Null) => x.push(None),
         _ => panic!("a value pushed onto a column of another kind"),
     }
 }
@@ -166,6 +169,7 @@ fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
         .map(|(li, &l)| match &row[l.column()] {
             Datum::Int(v) => key(l, *v),
             Datum::Text(s) => KeyValue::Text(s.as_str().into()),
+            Datum::Wide(k) => KeyValue::Wide(*k),
             Datum::Null => null_key(order, li),
             Datum::Bytes(_) => unreachable!("a level holds no bytea; the catalog refuses it"),
         })
@@ -197,6 +201,11 @@ fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
                 Datum::Int(x.value(r) as i64)
             } else if let Some(x) = any.downcast_ref::<BinaryArray>() {
                 Datum::Bytes(x.value(r).to_vec())
+            } else if let Some(x) = any
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .filter(|x| x.value_length() == 16)
+            {
+                Datum::Wide(crate::scalars::uuid_key(x.value(r).try_into().unwrap()))
             } else {
                 return Err(Error::new(format!(
                     "an answer of {} is not read back as a row",
@@ -219,6 +228,7 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
         A::Utf8 | A::LargeUtf8 | A::Utf8View => ColumnType::Text(None),
         A::Binary | A::LargeBinary | A::BinaryView => ColumnType::Bytes,
         A::Boolean => ColumnType::Boolean,
+        A::FixedSizeBinary(16) => ColumnType::Uuid,
         A::Decimal128(p, s) => ColumnType::Numeric {
             precision: (*p).min(18),
             scale: (*s).max(0) as u8,
@@ -317,6 +327,24 @@ fn clock_of(e: &sqlparser::ast::Expr) -> Option<String> {
     .then_some(name)
 }
 
+/// A uuid a DEFAULT hands out, where it hands one out: gen_random_uuid() and uuidv4() a version 4,
+/// uuidv7() a version 7.
+fn uuid_of(e: &sqlparser::ast::Expr) -> Option<Result<i128>> {
+    let mut e = e;
+    while let sqlparser::ast::Expr::Nested(x) | sqlparser::ast::Expr::Cast { expr: x, .. } = e {
+        e = x;
+    }
+    let sqlparser::ast::Expr::Function(f) = e else {
+        return None;
+    };
+    let name = crate::catalog::object_name(&f.name).to_lowercase();
+    match name.strip_prefix("pg_catalog.").unwrap_or(&name) {
+        "gen_random_uuid" | "uuidv4" => Some(crate::scalars::uuid_v4()),
+        "uuidv7" => Some(crate::scalars::uuid_v7()),
+        _ => None,
+    }
+}
+
 /// The machine's clock now, in microseconds since 1970 UTC.
 pub(super) fn wall_micros() -> i64 {
     std::time::SystemTime::now()
@@ -366,10 +394,13 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             {
                 return Err(what(format!("{v} has more digits than it holds")))
             }
-            (ColumnType::Text(_), Datum::Text(_)) | (ColumnType::Bytes, Datum::Bytes(_)) => {}
-            (ColumnType::Text(_) | ColumnType::Bytes, Datum::Int(_))
+            (ColumnType::Text(_), Datum::Text(_))
+            | (ColumnType::Bytes, Datum::Bytes(_))
+            | (ColumnType::Uuid, Datum::Wide(_)) => {}
+            (ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Uuid, Datum::Int(_))
             | (_, Datum::Text(_))
-            | (_, Datum::Bytes(_)) => {
+            | (_, Datum::Bytes(_))
+            | (_, Datum::Wide(_)) => {
                 return Err(what(format!("{d:?} is not a value of {}", col.ty.name())))
             }
             (_, Datum::Int(_)) => {}
@@ -734,6 +765,9 @@ impl Snail {
                 _ => self.clock.0,
             };
             return fill::assign(Datum::Int(at), ColumnType::Timestamptz, col.ty, &col.name);
+        }
+        if let Some(v) = uuid_of(e) {
+            return fill::assign(Datum::Wide(v?), ColumnType::Uuid, col.ty, &col.name);
         }
         if statement::is_literal(e) {
             return statement::datum(e, t, c);
@@ -1893,6 +1927,7 @@ impl Snail {
                 .map(|(li, (&l, &s))| match datum_at(&columns[s], p) {
                     Datum::Int(v) => key(l, v),
                     Datum::Text(t) => KeyValue::Text(t.into_boxed_str()),
+                    Datum::Wide(k) => KeyValue::Wide(k),
                     Datum::Null => null_key(order, li),
                     Datum::Bytes(_) => unreachable!("a level holds no bytea"),
                 })
@@ -1981,19 +2016,17 @@ impl Snail {
             let sum = &mut entry.columns[s];
             let mut first_value = valueless[s];
             for (_, row) in &added {
-                match &row[s] {
-                    Datum::Null => sum.nulls += 1,
-                    Datum::Int(v) => {
-                        if first_value {
-                            sum.min = *v;
-                            sum.max = *v;
-                            first_value = false;
-                        } else {
-                            sum.min = sum.min.min(*v);
-                            sum.max = sum.max.max(*v);
-                        }
+                if row[s] == Datum::Null {
+                    sum.nulls += 1;
+                } else if let Some(v) = row[s].wide() {
+                    if first_value {
+                        sum.min = v;
+                        sum.max = v;
+                        first_value = false;
+                    } else {
+                        sum.min = sum.min.min(v);
+                        sum.max = sum.max.max(v);
                     }
-                    Datum::Text(_) | Datum::Bytes(_) => {}
                 }
             }
             for (_, values) in &gone {

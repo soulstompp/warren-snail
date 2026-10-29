@@ -53,8 +53,8 @@ struct Kept {
 /// The first side of a join as its rows arrive: how many rows hold each key, and their cells as text
 /// where the side gives answer inputs of its own.
 struct First<'h> {
-    held: &'h mut WordMap<Vec<i64>, Kept>,
-    key: Vec<i64>,
+    held: &'h mut WordMap<Vec<i128>, Kept>,
+    key: Vec<i128>,
     j: usize,
     inputs: bool,
     dicts: Vec<Dict>,
@@ -69,7 +69,8 @@ impl Sink for First<'_> {
         self.key.clear();
         for c in &cells[..self.j] {
             match c {
-                Cell::Int(v) => self.key.push(*v),
+                Cell::Int(v) => self.key.push(*v as i128),
+                Cell::Wide(v) => self.key.push(*v),
                 _ => return,
             }
         }
@@ -92,14 +93,14 @@ impl Sink for First<'_> {
 
 /// The second side of a join as its rows arrive, each met with the first side's rows of its key.
 struct Second<'a> {
-    held: &'a WordMap<Vec<i64>, Kept>,
+    held: &'a WordMap<Vec<i128>, Kept>,
     answer: &'a mut Answer,
     /// Where each of the answer's inputs comes from: (side, its place among that side's inputs).
     from: &'a [(usize, usize)],
     first: usize,
     j: usize,
     inputs: bool,
-    probe: Vec<i64>,
+    probe: Vec<i128>,
     /// The first side's rows of the key the row admitted last.
     found: Option<&'a Kept>,
     cells: Vec<Cell>,
@@ -129,7 +130,8 @@ impl Sink for Second<'_> {
         self.probe.clear();
         for c in lead {
             match c {
-                Cell::Int(v) => self.probe.push(*v),
+                Cell::Int(v) => self.probe.push(*v as i128),
+                Cell::Wide(v) => self.probe.push(*v),
                 _ => {
                     self.found = None;
                     return false;
@@ -1202,7 +1204,7 @@ impl Snail {
         // Each key the first side holds: how many rows hold it, and their cells where the first side
         // gives the answer inputs of its own.
         let a_inputs = a_columns.len() > j;
-        let mut held: WordMap<Vec<i64>, Kept> = WordMap::default();
+        let mut held: WordMap<Vec<i128>, Kept> = WordMap::default();
         let mut sink = First {
             held: &mut held,
             key: Vec::with_capacity(j),

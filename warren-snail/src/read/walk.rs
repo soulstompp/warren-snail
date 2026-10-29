@@ -2,13 +2,13 @@
 //! question may hold rows, its pages predicted from the page maps, then read.
 
 use super::answer::{same, Answer, Cell, Dict, Text};
-use super::question::{Countable, Interval, Side, TextCond};
+use super::question::{Cond, Countable, Side, TextCond};
 use super::{Snail, Wasted};
 use crate::catalog::{Level, Order, Shape, Table};
 use crate::directory::{decode_page, decode_top, Entry, Head, PageMap};
 use crate::encode::{decode_with, descriptor};
 use crate::file::Extent;
-use crate::places::{key, month_of, null_key, KeyValue};
+use crate::places::{key, month_of, null_key, wide_cmp, KeyValue};
 use crate::values::Values;
 use crate::{Error, Result};
 use std::cmp::Ordering;
@@ -71,12 +71,12 @@ pub struct KeySet {
     /// This table's columns they meet, in the join's order.
     pub columns: Vec<usize>,
     /// Each key's values, the keys sorted, laid flat.
-    keys: Vec<i64>,
+    keys: Vec<i128>,
 }
 
 impl KeySet {
-    pub fn new<'a>(columns: Vec<usize>, keys: impl IntoIterator<Item = &'a Vec<i64>>) -> KeySet {
-        let mut sorted: Vec<&[i64]> = keys.into_iter().map(|k| k.as_slice()).collect();
+    pub fn new<'a>(columns: Vec<usize>, keys: impl IntoIterator<Item = &'a Vec<i128>>) -> KeySet {
+        let mut sorted: Vec<&[i128]> = keys.into_iter().map(|k| k.as_slice()).collect();
         sorted.sort_unstable();
         sorted.dedup();
         KeySet {
@@ -89,17 +89,17 @@ impl KeySet {
         self.keys.len().checked_div(self.columns.len()).unwrap_or(0)
     }
 
-    fn key(&self, i: usize) -> &[i64] {
+    fn key(&self, i: usize) -> &[i128] {
         let w = self.columns.len();
         &self.keys[i * w..(i + 1) * w]
     }
 
     /// Whether some key lies from `first` to `last`, both read on their first `j` values.
     fn meets(&self, first: &[KeyValue], last: &[KeyValue]) -> bool {
-        let cmp = |key: &[i64], bound: &[KeyValue]| -> Ordering {
+        let cmp = |key: &[i128], bound: &[KeyValue]| -> Ordering {
             key.iter()
                 .zip(bound)
-                .map(|(k, b)| KeyValue::Int(*k).cmp(b))
+                .map(|(k, b)| wide_cmp(*k, b))
                 .find(|o| *o != Ordering::Equal)
                 .unwrap_or(Ordering::Equal)
         };
@@ -145,7 +145,7 @@ pub struct Walk {
     m: usize,
     lo: Vec<KeyValue>,
     hi: Vec<KeyValue>,
-    rest: Vec<(Shape, Interval)>,
+    rest: Vec<Cond>,
     /// The conditions on text no level fixes, by their place among the side's.
     pub(super) texts: Vec<usize>,
     /// The tests for NULL no level fixes, by their place among the side's.
@@ -264,7 +264,7 @@ pub fn s_column(s: Shape) -> usize {
 pub fn condition_columns(side: &Side) -> Vec<usize> {
     side.conds
         .iter()
-        .map(|(s, _)| s_column(*s))
+        .map(|c| s_column(c.shape))
         .chain(side.texts.iter().map(|t| t.column))
         .chain(side.nulls.iter().map(|&(c, _)| c))
         .collect()
@@ -336,12 +336,21 @@ impl Snail {
                 Level::Column(c) => Shape::Column(c),
                 Level::MonthUtc(c) => Shape::MonthUtc(c),
             };
-            match conds.iter().position(|(s, _)| *s == wanted) {
+            // A level is fixed by a range on it; `<>`, and a test that keeps NULLs, stay
+            // conditions to read.
+            match conds.iter().position(|c| c.shape == wanted && c.is_range()) {
                 Some(i) => {
                     used[i] = true;
-                    let iv = conds[i].1;
-                    lo.push(KeyValue::Int(iv.lo));
-                    hi.push(KeyValue::Int(iv.hi));
+                    let iv = conds[i].kept;
+                    let bound = |v: i128| {
+                        if want.table.columns[l.column()].ty.is_wide() {
+                            KeyValue::Wide(v)
+                        } else {
+                            KeyValue::Int(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+                        }
+                    };
+                    lo.push(bound(iv.lo));
+                    hi.push(bound(iv.hi));
                     if iv.lo != iv.hi {
                         break;
                     }
@@ -359,11 +368,11 @@ impl Snail {
             hi.pop();
         }
         let m = lo.len();
-        let rest: Vec<(Shape, Interval)> = conds
+        let rest: Vec<Cond> = conds
             .iter()
             .zip(&used)
             .filter(|(_, u)| !**u)
-            .map(|(c, _)| *c)
+            .map(|(c, _)| c.clone())
             .collect();
         let texts: Vec<usize> = (0..texts.len()).filter(|&i| !used_texts[i]).collect();
         let nulls: Vec<usize> = (0..nulls.len()).filter(|&i| !used_nulls[i]).collect();
@@ -668,13 +677,13 @@ impl Snail {
                         (l, table.columns[l.column()].ty.is_text(), start, v)
                     })
                     .collect();
-                let rests: Vec<(Shape, Interval, usize, &Values)> = br
+                let rests: Vec<(&Cond, usize, &Values)> = br
                     .rest_may
                     .iter()
                     .map(|&ri| {
-                        let (s, iv) = walk.rest[ri];
-                        let (start, v) = run(slot_of(s_column(s)));
-                        (s, iv, start, v)
+                        let c = &walk.rest[ri];
+                        let (start, v) = run(slot_of(s_column(c.shape)));
+                        (c, start, v)
                     })
                     .collect();
                 let texts: Vec<(&TextCond, usize, &Values)> = br
@@ -730,6 +739,9 @@ impl Snail {
                                 .int(r - start)
                                 .map_or(i64::MIN, |y| key(*l, y).int())
                                 .cmp(x),
+                            (false, _, KeyValue::Wide(x)) => {
+                                v.wide(r - start).unwrap_or(i128::MIN).cmp(x)
+                            }
                             _ => Ordering::Equal,
                         };
                         if ord != Ordering::Equal {
@@ -777,16 +789,15 @@ impl Snail {
                         {
                             continue;
                         }
-                        let keep = rests.iter().all(|&(s, iv, start, v)| {
-                            let x = match (s, v.int(r - start)) {
-                                (_, None) => return false,
-                                (Shape::MonthUtc(_), Some(x)) => match month_of(x) {
-                                    Some(m) => m,
-                                    None => return false,
-                                },
-                                (_, Some(x)) => x,
+                        let keep = rests.iter().all(|&(c, start, v)| {
+                            let x = match c.shape {
+                                // An instant with no month is NULL to a condition on its month.
+                                Shape::MonthUtc(_) => {
+                                    v.int(r - start).and_then(month_of).map(i128::from)
+                                }
+                                _ => v.wide(r - start),
                             };
-                            iv.lo <= x && x <= iv.hi
+                            c.holds(x)
                         });
                         let keep =
                             keep && texts.iter().all(|&(t, start, v)| {
@@ -805,6 +816,8 @@ impl Snail {
                                 v.text_value(i).map_or(Cell::Null, |t| Cell::Text(Text(t)))
                             } else if month {
                                 v.int(i).and_then(month_of).map_or(Cell::Null, Cell::Int)
+                            } else if let Values::Wide(w) = v {
+                                w[i].map_or(Cell::Null, Cell::Wide)
                             } else {
                                 v.int(i).map_or(Cell::Null, Cell::Int)
                             }
@@ -840,11 +853,11 @@ fn keyed_spans(
     sorted: usize,
 ) -> Vec<(usize, usize)> {
     // A row's leading values against a key, compared in place, a NULL lying on its level's side.
-    let cmp = |r: usize, key: &[i64]| -> Ordering {
+    let cmp = |r: usize, key: &[i128]| -> Ordering {
         lead.iter()
             .zip(nulls_first)
             .zip(key)
-            .map(|((&(_, _, start, v), &first), k)| match v.int(r - start) {
+            .map(|((&(_, _, start, v), &first), k)| match v.wide(r - start) {
                 Some(x) => x.cmp(k),
                 None if first => Ordering::Less,
                 None => Ordering::Greater,
@@ -879,7 +892,7 @@ fn keyed_spans(
             out.push((from, end));
         } else {
             // The first row from `lo` whose leading values pass `key`, or reach it.
-            let find = |key: &[i64], mut lo: usize, past: bool| -> usize {
+            let find = |key: &[i128], mut lo: usize, past: bool| -> usize {
                 let mut hi = end;
                 while lo < hi {
                     let mid = (lo + hi) / 2;
@@ -946,8 +959,8 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let mut status = interval;
     let mut rest_may = Vec::new();
     let mut exact: Option<u64> = None;
-    for (ri, (s, iv)) in walk.rest.iter().enumerate() {
-        let (st, n) = rest_status(order.slot(s_column(*s)).unwrap(), *s, *iv, &e, &walk.head);
+    for (ri, c) in walk.rest.iter().enumerate() {
+        let (st, n) = rest_status(order.slot(s_column(c.shape)).unwrap(), c, &e, &walk.head);
         match st {
             Status::None => status = Status::None,
             Status::May => {
@@ -1019,9 +1032,13 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
                 let months = match rest_may.as_slice() {
                     _ if !null_may.is_empty() => None,
                     [] => Some((1, 12)),
-                    [ri] => match walk.rest[*ri] {
-                        (Shape::MonthUtc(x), iv) if x == c && exact.is_some() => {
-                            Some((iv.lo.max(1), iv.hi.min(12)))
+                    [ri] => match &walk.rest[*ri] {
+                        Cond {
+                            shape: Shape::MonthUtc(x),
+                            kept,
+                            ..
+                        } if *x == c && exact.is_some() && walk.rest[*ri].is_range() => {
+                            Some((kept.lo.max(1) as i64, kept.hi.min(12) as i64))
                         }
                         _ => None,
                     },
@@ -1055,7 +1072,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         }
     }
     for &ri in &rest_may {
-        need(s_column(walk.rest[ri].0));
+        need(s_column(walk.rest[ri].shape));
     }
     for &ti in &text_may {
         need(side.texts[ti].column);
@@ -1109,39 +1126,69 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
 
 /// A condition off the leading levels, against one entry's counts: whether no row, some or every
 /// row holds it, and how many hold it where the counts say exactly.
-fn rest_status(
-    slot: usize,
-    s: Shape,
-    iv: Interval,
-    b: &Entry,
-    head: &Head,
-) -> (Status, Option<u64>) {
+fn rest_status(slot: usize, c: &Cond, b: &Entry, head: &Head) -> (Status, Option<u64>) {
     let sum = b.columns[slot];
-    let present = b.rows - sum.nulls;
+    let present = (b.rows - sum.nulls) as u64;
+    let rows = b.rows as u64;
+    let status = |n: u64| {
+        if n == 0 {
+            (Status::None, Some(0))
+        } else if n == rows {
+            (Status::Must, Some(n))
+        } else {
+            (Status::May, Some(n))
+        }
+    };
+    let iv = c.kept;
+    if !c.is_range() {
+        // A test that keeps the column's NULLs takes them from the counts; `<>` passes over a value
+        // the column's least and greatest leave out, and keeps none where both are that value.
+        let nulls = if c.nulls { sum.nulls as u64 } else { 0 };
+        let values = match c.shape {
+            Shape::MonthUtc(_) => head
+                .month_slots
+                .iter()
+                .position(|&x| x as usize == slot)
+                .map(|mi| {
+                    (1..=12i128)
+                        .filter(|&m| c.holds(Some(m)))
+                        .map(|m| b.months[mi][m as usize - 1] as u64)
+                        .sum::<u64>()
+                }),
+            _ if present == 0 => Some(0),
+            _ if sum.max < iv.lo || sum.min > iv.hi => Some(0),
+            _ if sum.min == sum.max => Some(if c.holds(Some(sum.min)) { present } else { 0 }),
+            _ if iv.lo <= sum.min
+                && sum.max <= iv.hi
+                && !c.except.iter().any(|&x| sum.min <= x && x <= sum.max) =>
+            {
+                Some(present)
+            }
+            _ => None,
+        };
+        return match values {
+            Some(v) => status(v + nulls),
+            None if nulls == rows => (Status::Must, Some(rows)),
+            None => (Status::May, None),
+        };
+    }
     if present == 0 {
         return (Status::None, Some(0));
     }
-    match s {
+    match c.shape {
         Shape::MonthUtc(_) => match head.month_slots.iter().position(|&x| x as usize == slot) {
-            Some(mi) => {
-                let n: u64 = (iv.lo.max(1)..=iv.hi.min(12))
+            Some(mi) => status(
+                (iv.lo.max(1)..=iv.hi.min(12))
                     .map(|m| b.months[mi][m as usize - 1] as u64)
-                    .sum();
-                if n == 0 {
-                    (Status::None, Some(0))
-                } else if n == b.rows as u64 {
-                    (Status::Must, Some(n))
-                } else {
-                    (Status::May, Some(n))
-                }
-            }
+                    .sum(),
+            ),
             None => (Status::May, None),
         },
         _ => {
             if sum.max < iv.lo || sum.min > iv.hi {
                 (Status::None, Some(0))
             } else if sum.nulls == 0 && iv.lo <= sum.min && sum.max <= iv.hi {
-                (Status::Must, Some(b.rows as u64))
+                (Status::Must, Some(rows))
             } else {
                 (Status::May, None)
             }
@@ -1184,8 +1231,8 @@ fn estimate(o: &Open, map: &PageMap, walk: &Walk, order: &Order, nulls: &[(usize
         }
     }
     for &ri in &o.rest_may {
-        let (s, iv) = walk.rest[ri];
-        share *= rest_share(order.slot(s_column(s)).unwrap(), s, iv, e, &walk.head);
+        let c = &walk.rest[ri];
+        share *= rest_share(order.slot(s_column(c.shape)).unwrap(), c, e, &walk.head);
     }
     for &ni in &o.null_may {
         let (c, null) = nulls[ni];
@@ -1237,19 +1284,25 @@ fn page_share(
 /// The share of an entry's rows a condition off the leading levels covers: its count where the
 /// counts give one, else the share of the column's least to greatest the condition's range takes,
 /// of the rows that hold a value.
-fn rest_share(slot: usize, s: Shape, iv: Interval, e: &Entry, head: &Head) -> f64 {
+fn rest_share(slot: usize, cond: &Cond, e: &Entry, head: &Head) -> f64 {
     if e.rows == 0 {
         return 0.0;
     }
-    match rest_status(slot, s, iv, e, head) {
+    match rest_status(slot, cond, e, head) {
         (Status::None, _) => 0.0,
         (_, Some(n)) => n as f64 / e.rows as f64,
         _ => {
             let c = e.columns[slot];
             let held = (e.rows - c.nulls) as f64 / e.rows as f64;
+            let nulls = if cond.nulls {
+                c.nulls as f64 / e.rows as f64
+            } else {
+                0.0
+            };
             let (a, z) = (c.min as f64, c.max as f64 + 1.0);
+            let iv = cond.kept;
             let (from, to) = (iv.lo as f64, iv.hi as f64 + 1.0);
-            held * ((to.min(z) - from.max(a)).max(0.0) / (z - a)).clamp(0.0, 1.0)
+            nulls + held * ((to.min(z) - from.max(a)).max(0.0) / (z - a)).clamp(0.0, 1.0)
         }
     }
 }
@@ -1258,6 +1311,7 @@ fn rest_share(slot: usize, s: Shape, iv: Interval, e: &Entry, head: &Head) -> f6
 mod tests {
     use super::*;
     use crate::directory::Summary;
+    use crate::read::question::Interval;
 
     #[test]
     fn a_pages_rows_lie_evenly_across_the_integers_its_keys_part_on() {
@@ -1307,6 +1361,7 @@ mod tests {
                     min: 1,
                     max: 100,
                     pages: 1,
+                    ..Default::default()
                 },
                 Summary::default(),
             ],
@@ -1318,18 +1373,82 @@ mod tests {
             month_slots: vec![1],
             ..Default::default()
         };
-        let december = Interval { lo: 12, hi: 12 };
+        let december = Cond::new(Shape::MonthUtc(1), Interval { lo: 12, hi: 12 });
+        assert_eq!(rest_share(1, &december, &block, &head), 21.0 / 120.0);
+        let ids = Cond::new(Shape::Column(0), Interval { lo: 1, hi: 25 });
+        assert_eq!(rest_share(0, &ids, &block, &head), 100.0 / 120.0 * 0.25);
+        let none = Cond::new(Shape::Column(0), Interval { lo: 200, hi: 300 });
+        assert_eq!(rest_share(0, &none, &block, &head), 0.0);
+    }
+
+    #[test]
+    fn unequal_and_a_test_keeping_nulls_are_counted_where_the_counts_close() {
+        // 100 rows, 20 of them NULL, the rest from 1 to 50.
+        let block = |min: i128, max: i128, nulls: u32| Entry {
+            depth: 1,
+            rows: 100,
+            dead: 0,
+            first: vec![KeyValue::Int(0)],
+            last: vec![KeyValue::Int(0)],
+            columns: vec![Summary {
+                nulls,
+                min,
+                max,
+                pages: 1,
+                ..Default::default()
+            }],
+            months: vec![],
+            bytes: vec![],
+            child: Extent::default(),
+        };
+        let head = Head::default();
+        let unequal = |v: i128| {
+            let mut c = Cond::new(Shape::Column(0), Interval::ALL);
+            c.except.push(v);
+            c
+        };
+        // A value the least and greatest leave out: every value kept, no NULL.
         assert_eq!(
-            rest_share(1, Shape::MonthUtc(1), december, &block, &head),
-            21.0 / 120.0
+            rest_status(0, &unequal(60), &block(1, 50, 20), &head),
+            (Status::May, Some(80))
         );
-        let ids = Interval { lo: 1, hi: 25 };
         assert_eq!(
-            rest_share(0, Shape::Column(0), ids, &block, &head),
-            100.0 / 120.0 * 0.25
+            rest_status(0, &unequal(60), &block(1, 50, 0), &head),
+            (Status::Must, Some(100))
         );
-        let none = Interval { lo: 200, hi: 300 };
-        assert_eq!(rest_share(0, Shape::Column(0), none, &block, &head), 0.0);
+        // Every value is the one left out: none kept.
+        assert_eq!(
+            rest_status(0, &unequal(7), &block(7, 7, 20), &head),
+            (Status::None, Some(0))
+        );
+        // A value among them: the counts cannot say.
+        assert_eq!(
+            rest_status(0, &unequal(7), &block(1, 50, 0), &head),
+            (Status::May, None)
+        );
+        // IS NOT TRUE: false and the NULLs.
+        let mut not_true = Cond::new(Shape::Column(0), Interval::at(0));
+        not_true.nulls = true;
+        assert_eq!(
+            rest_status(0, &not_true, &block(0, 0, 20), &head),
+            (Status::Must, Some(100))
+        );
+        assert_eq!(
+            rest_status(0, &not_true, &block(1, 1, 20), &head),
+            (Status::May, Some(20))
+        );
+        assert_eq!(
+            rest_status(0, &not_true, &block(1, 1, 0), &head),
+            (Status::None, Some(0))
+        );
+        assert_eq!(
+            rest_status(0, &not_true, &block(0, 0, 100), &head),
+            (Status::Must, Some(100))
+        );
+        assert_eq!(
+            rest_status(0, &not_true, &block(0, 1, 20), &head),
+            (Status::May, None)
+        );
     }
 
     #[test]

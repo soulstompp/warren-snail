@@ -7,8 +7,9 @@ use super::question::{Countable, Item, Key, Select, Sort};
 use crate::catalog::{ColumnType, Table};
 use crate::Result;
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, RecordBatchOptions, StringArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int16Array,
+    Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::data_type::ByteArray;
@@ -72,6 +73,8 @@ pub enum Cell {
     Text(Text),
     /// Text as its place in the dictionary of the rows now arriving.
     Code(u32),
+    /// A value keyed in 128 bits, as its key.
+    Wide(i128),
 }
 
 /// The dictionary a column's codes index in the rows now arriving: none for a column read otherwise.
@@ -499,6 +502,15 @@ impl Answer {
                                 .collect::<Decimal128Array>()
                                 .with_precision_and_scale(precision, scale as i8)?,
                         ),
+                        ColumnType::Uuid => {
+                            Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                                rows.iter().map(|r| match &r[i] {
+                                    Cell::Wide(k) => Some(crate::scalars::uuid_bytes(*k)),
+                                    _ => None,
+                                }),
+                                16,
+                            )?)
+                        }
                     };
                     (!col.not_null, a)
                 }

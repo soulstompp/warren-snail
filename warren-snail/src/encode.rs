@@ -11,7 +11,10 @@ use parquet::basic::{
 use parquet::column::page::{Page, PageReader};
 use parquet::column::reader::{get_column_reader, get_typed_column_reader};
 use parquet::column::writer::{ColumnCloseResult, ColumnWriterImpl};
-use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
+use parquet::data_type::{
+    BoolType, ByteArray, ByteArrayType, DataType, FixedLenByteArray, FixedLenByteArrayType,
+    Int32Type, Int64Type,
+};
 use parquet::file::metadata::ColumnChunkMetaData;
 use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::file::serialized_reader::SerializedPageReader;
@@ -94,6 +97,7 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
             }),
         ),
         ColumnType::Boolean => (PhysicalType::BOOLEAN, None),
+        ColumnType::Uuid => (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Uuid)),
     };
     let repetition = if nullable {
         Repetition::OPTIONAL
@@ -105,6 +109,9 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
         .with_logical_type(logical);
     if let ColumnType::Numeric { precision, scale } = ty {
         t = t.with_precision(precision as i32).with_scale(scale as i32);
+    }
+    if physical == PhysicalType::FIXED_LEN_BYTE_ARRAY {
+        t = t.with_length(ty.width().unwrap_or(0) as i32);
     }
     let t = t.build()?;
     Ok(Arc::new(ColumnDescriptor::new(
@@ -185,6 +192,11 @@ fn write(
         }
         (Values::Utf8(v), PhysicalType::BYTE_ARRAY) => {
             write_typed::<ByteArrayType, ByteArray>(desc, p, v, rows_per_page, |b| b.clone())?
+        }
+        (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
+            write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, |&k| {
+                FixedLenByteArray::from(crate::scalars::uuid_bytes(k).to_vec())
+            })?
         }
         _ => {
             return Err(Error::new(format!(
@@ -272,6 +284,10 @@ fn distinct(values: &Values, ty: ColumnType) -> (usize, usize) {
             let d: HashSet<i64> = v.iter().flatten().copied().collect();
             (d.len(), d.len() * ty.width().unwrap_or(8))
         }
+        Values::Wide(v) => {
+            let d: HashSet<i128> = v.iter().flatten().copied().collect();
+            (d.len(), d.len() * ty.width().unwrap_or(16))
+        }
         Values::Text(v) => {
             let d: HashSet<&str> = v.iter().flatten().map(String::as_str).collect();
             (
@@ -311,9 +327,14 @@ pub fn encode(desc: &ColumnDescPtr, ty: ColumnType, values: &Values, k: usize) -
         k,
         guess(k, plain_bits(values, ty), nullable),
     )?;
-    // Parquet writes a boolean without a dictionary.
+    // Parquet writes a boolean without a dictionary, and under its format 1.0 a value of fixed
+    // length.
     let (count, bytes) = distinct(values, ty);
-    if count == 0 || bytes > DICTIONARY_BYTES || ty == ColumnType::Boolean {
+    if count == 0
+        || bytes > DICTIONARY_BYTES
+        || ty == ColumnType::Boolean
+        || desc.physical_type() == PhysicalType::FIXED_LEN_BYTE_ARRAY
+    {
         return Ok(plain);
     }
     let bits = (usize::BITS - (count.max(2) - 1).leading_zeros()) as usize;
@@ -431,6 +452,25 @@ pub fn decode(
                 return Err(short(n));
             }
             Ok(Values::Int(spread(v.into_iter(), &defs, nullable)))
+        }
+        ColumnType::Uuid => {
+            let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
+            let mut v: Vec<FixedLenByteArray> = Vec::new();
+            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            if n != rows {
+                return Err(short(n));
+            }
+            let keys = v
+                .iter()
+                .map(|b| {
+                    <[u8; 16]>::try_from(b.data())
+                        .map(crate::scalars::uuid_key)
+                        .map_err(|_| {
+                            Error::new(format!("{}: a uuid of {} bytes", desc.name(), b.len()))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Values::Wide(spread(keys.into_iter(), &defs, nullable)))
         }
         ColumnType::Text(_) | ColumnType::Bytes => {
             let mut r = get_typed_column_reader::<ByteArrayType>(column);
