@@ -1594,6 +1594,7 @@ mod tests {
             ("CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT a, PRIMARY KEY (a))", "cannot use column reference"),
             ("CREATE TABLE s.t (a integer NOT NULL, b boolean DEFAULT now(), PRIMARY KEY (a))", "is of type boolean but default expression is of type timestamp with time zone"),
             ("CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT random(), PRIMARY KEY (a))", "which the snail does not read"),
+            ("CREATE SEQUENCE s.n; CREATE TABLE s.t (a bigint NOT NULL DEFAULT nextval('s.n') * 10, PRIMARY KEY (a))", "computes with nextval or the clock"),
             ("CREATE TABLE s.t (a integer NOT NULL, b integer GENERATED ALWAYS AS (a) STORED, c integer GENERATED ALWAYS AS (b) STORED, PRIMARY KEY (a))", "cannot use generated column \"b\""),
             ("CREATE TABLE s.t (a integer NOT NULL, b integer GENERATED ALWAYS AS (a), PRIMARY KEY (a)); CREATE INDEX x ON s.t (b)", "virtual generated columns"),
             ("CREATE TABLE s.t (a text GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (a))", "identity column type"),

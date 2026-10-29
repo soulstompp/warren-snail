@@ -301,10 +301,23 @@ pages of its own.
 
 ## Writing
 
-`exec` runs each statement of a file in turn: `INSERT`, from values or from a question; `UPDATE`;
-`DELETE`; `BEGIN`, `COMMIT` and `ROLLBACK`; and `CREATE TABLE`, with `CREATE INDEX` and
-`ALTER TABLE … CLUSTER ON` for a table that holds no rows. Outside a transaction each statement
-commits on its own.
+`exec` runs each statement of a file in turn, as written: `INSERT`, from values or from a question,
+each column it leaves out or gives `DEFAULT` taking its `DEFAULT`; `UPDATE`, to values or to
+`DEFAULT`; `DELETE`; `BEGIN`, `COMMIT` and `ROLLBACK`; and the DDL below: `CREATE TABLE`, with
+`CREATE INDEX` and `ALTER TABLE … CLUSTER ON` for a table that holds no rows, `ALTER TABLE … ADD
+CHECK`, checked against the rows held unless `NOT VALID`, and `VALIDATE CONSTRAINT`. Outside a
+transaction each statement commits on its own.
+
+**What a row is given.** An identity's or a serial's value, or a `DEFAULT nextval(…)`, is its
+sequence's next, drawn at the root's turn for the whole statement and never given back, as
+PostgreSQL's `nextval` is not: a statement rolled back leaves its values unused. A writer holds a
+sequence's `CACHE` values at a time. `now()`, `CURRENT_TIMESTAMP` and `transaction_timestamp()`
+read the transaction's clock, `statement_timestamp()` the statement's. A `STORED` generated column
+is computed at the write; a `VIRTUAL` one, PostgreSQL 18's default, at the read, and no order holds
+it. Each `CHECK` is checked at the write, passing where it is NULL, and `NOT ENFORCED` checks
+nothing; each `UNIQUE` at the statement's end. An `INSERT … SELECT` takes each value by
+PostgreSQL's assignment casts: an integer or numeric rounded and held to its column's range, any
+value as its text into a text column; any other type refused, as PostgreSQL refuses it.
 
 **What it writes.** A row lands in its block on every order that holds its columns, as its places
 name it, after the block's last rows, in pages of one disk page each, until a prune or a cut writes
@@ -531,12 +544,22 @@ SQL in PostgreSQL's syntax, and the snail reads it as it reads any other questio
 - `blocks <file> --out <blocks.parquet>`: each column of each block, as the directory holds it.
 - `census <file>`: every page of the file, named by the newest root, free, or waiting.
 - `hold <file> --seconds <n>`: the snail held open, as a round that long holds it.
+- `catalog (<file> | --ddl <ddl.sql> [--taken <taken.sql>] [--statements <statements.parquet>])
+  [--out <catalog.parquet>]`: what the snail reads of a DDL, a statement at a time, each taken or
+  refused by name, and the catalog's facts as Parquet.
 
 Each command exits 0, or prints why it refused and exits 1.
 
 ### The DDL it reads
 
-- `CREATE TABLE`, its columns `NOT NULL` or not, and a `PRIMARY KEY`.
+- `CREATE TABLE`, its columns `NOT NULL` or not, each with a `DEFAULT`, `GENERATED ALWAYS AS (…)
+  STORED` or `VIRTUAL`, `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY (…)`, or of a serial type;
+  a `PRIMARY KEY`; `UNIQUE`, `NULLS [NOT] DISTINCT`, `DEFERRABLE` and `INCLUDE`; `CHECK`, `NOT
+  ENFORCED`. Unnamed keys, checks and sequences are named as PostgreSQL names them.
+- `CREATE SEQUENCE` and `ALTER SEQUENCE`, their options as PostgreSQL reads them, a sequence's
+  state kept in the file; `CREATE TYPE … AS ENUM`, a composite, `AS RANGE`, with `ALTER TYPE … ADD
+  VALUE` and `RENAME VALUE`; `CREATE DOMAIN` and `ALTER DOMAIN`; `CREATE COLLATION` of byte order.
+  The types and domains are kept; a column of one is not held yet.
 - Column types: `smallint`, `integer`, `bigint`; `numeric(p, s)` up to 18 digits, held as a
   64-bit integer of its smallest unit; `text` and `varchar(n)`, compared by their bytes; `bytea`;
   `timestamptz`, as microseconds on UTC's clock, its infinities among them; `boolean`, false
@@ -545,8 +568,11 @@ Each command exits 0, or prints why it refused and exits 1.
   `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
   `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is
   `$1 AT TIME ZONE 'UTC'`, as `shop.clock` above; `INCLUDE`; `UNIQUE`, which takes any number of
-  NULLs unless it says `NULLS NOT DISTINCT`; a key column's `NULLS FIRST` or `NULLS LAST`, and
-  under `DESC` the side its NULLs take (its values lie ascending).
+  NULLs unless it says `NULLS NOT DISTINCT`; `USING btree` spelled out; each key's operator class,
+  its type's default or, on text, one comparing its bytes; `WITH (fillfactor = …)` and
+  `deduplicate_items`, read and doing nothing; a key column's `NULLS FIRST` or `NULLS LAST`; and
+  `DESC`, its values held rising all the same, giving the side its NULLs take, which `catalog`
+  names.
 - `ALTER TABLE … CLUSTER ON <index>`. The index a table is clustered on may include columns; the
   table's order holds every column already.
 
@@ -565,7 +591,8 @@ Each command exits 0, or prints why it refused and exits 1.
   and `IS [NOT] DISTINCT FROM`; parameters `$1` and on.
 - **A statement:** as `exec` above.
 
-Anything else is refused, with a sentence that says what is not read.
+Anything else is refused, with a sentence that says what is not read. A statement sqlparser reads
+otherwise than it is written is refused too, so nothing it declares is dropped without a word.
 
 ### What the commands record
 

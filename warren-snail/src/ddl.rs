@@ -1589,6 +1589,22 @@ impl Draft {
     /// Refuses a DEFAULT the snail cannot fill a column of type `ty` with: one that reads a column,
     /// calls what it does not read, or hands out a value PostgreSQL would not assign to the column.
     fn check_default(&self, e: &Expr, ty: ColumnType, what: &str) -> Result<()> {
+        // A sequence's value or the clock is a DEFAULT alone, or cast; never computed with.
+        let mut top = e;
+        while let Expr::Nested(x) | Expr::Cast { expr: x, .. } = top {
+            top = x;
+        }
+        let mut within = false;
+        each_expr(e, &mut |x| {
+            within |= !std::ptr::eq(x, top) && crate::catalog::hands_out(x)
+        });
+        if within && !crate::catalog::hands_out(top)
+            || (within && !matches!(top, Expr::Function(_)))
+        {
+            return Err(Error::new(format!(
+                "{what}: a DEFAULT that computes with nextval or the clock is not read: give it alone"
+            )));
+        }
         let given = self.default_type(e, what)?;
         if let Some(g) = given {
             if !assignable(g, ty) {
