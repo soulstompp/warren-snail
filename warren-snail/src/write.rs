@@ -590,8 +590,13 @@ pub(crate) fn laid_out(
     let n = rows.len();
     let stride = order.levels.len();
     let mut unsorted: Vec<KeyValue> = Vec::with_capacity(n * stride);
-    // For each level, the sublevels a text level is cut on: its longest value's bytes and one more.
-    let mut text_sublevels = vec![0u32; stride];
+    // For each level, the sublevels a text level is cut on: its longest value's bytes and one more;
+    // at least one, as an empty order's, where it holds only NULLs.
+    let mut text_sublevels: Vec<u32> = order
+        .levels
+        .iter()
+        .map(|l| table.columns[l.column()].ty.is_byte_array() as u32)
+        .collect();
     let fixed = given.is_some();
     if let Some(g) = given {
         text_sublevels = g.to_vec();

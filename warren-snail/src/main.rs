@@ -159,14 +159,14 @@ fn cmd_exec(args: &[String]) -> Result<()> {
     let sql = args.get(1).ok_or_else(|| Error::new(USAGE))?;
     let out = flag(args, "--out").ok_or_else(|| Error::new(USAGE))?;
     let text = std::fs::read_to_string(sql).map_err(|e| Error::new(format!("{sql}: {e}")))?;
-    let statements =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &text)?;
+    // Each statement as written: the snail reads itself what sqlparser does not.
+    let statements = warren_snail::read::statement::split(&text)?;
     let mut snail = Snail::open_writing(Path::new(file))?;
     let mut done = Vec::with_capacity(statements.len());
     for (i, st) in statements.iter().enumerate() {
         let before = wchar();
         let d = snail
-            .execute(&st.to_string())
+            .execute(st)
             .map_err(|e| Error::new(format!("statement {}: {e}", i + 1)))?;
         done.push((d, wchar() - before));
     }

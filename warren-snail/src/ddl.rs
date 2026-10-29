@@ -1129,7 +1129,7 @@ pub(crate) fn statements(ddl: &str) -> Result<Vec<Vec<Token>>> {
 }
 
 /// A statement as written, without the comments before it.
-fn written(tokens: &[Token]) -> String {
+pub(crate) fn written(tokens: &[Token]) -> String {
     let start = tokens
         .iter()
         .position(|t| !matches!(t, Token::Whitespace(_)))

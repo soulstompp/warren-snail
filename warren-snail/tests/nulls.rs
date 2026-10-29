@@ -742,3 +742,34 @@ fn a_level_s_null_run_is_no_place_of_it_for_the_counting_unit() {
         "{units:?}"
     );
 }
+
+#[test]
+fn a_text_level_whose_first_rows_are_null_takes_text_after_them() {
+    // An order on a text level whose only rows hold NULL there still reads its keys as text.
+    let path = tmp("text-null-first.snail");
+    write(
+        &path,
+        &Catalog::parse(
+            "CREATE TABLE s.b (id integer NOT NULL, k text, PRIMARY KEY (id)); CREATE INDEX b_k ON s.b (k);",
+        )
+        .unwrap(),
+        &[],
+    )
+    .unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in [
+        "INSERT INTO s.b (id, k) VALUES (1, NULL)",
+        "INSERT INTO s.b (id, k) VALUES (2, 'x')",
+        "INSERT INTO s.b (id, k) VALUES (3, NULL), (4, 'y')",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    let (b, _) = ask(
+        &mut s,
+        "SELECT id FROM s.b WHERE k >= 'x' ORDER BY id",
+        Some("b_k"),
+    );
+    assert_eq!(ints64(b.column(0).as_ref()), [Some(2), Some(4)]);
+}

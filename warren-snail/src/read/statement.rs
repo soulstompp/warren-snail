@@ -176,7 +176,14 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             Datum::Int(v)
         }
         ColumnType::Timestamptz => Datum::Int(instant(&text_literal(e).map_err(|_| wrong())?)?),
-        ColumnType::Text(_) => Datum::Text(text_literal(e).map_err(|_| wrong())?),
+        // A literal is held to its column's length as PostgreSQL plans the statement, before any
+        // DEFAULT draws a value: its excess taken off where it is only spaces, else refused.
+        ColumnType::Text(n) => super::fill::assign(
+            Datum::Text(text_literal(e).map_err(|_| wrong())?),
+            ColumnType::Text(None),
+            ColumnType::Text(n),
+            &col.name,
+        )?,
         ColumnType::Bytes => Datum::Bytes(super::pipeline::hex_bytes(
             &text_literal(e).map_err(|_| wrong())?,
         )?),
@@ -330,6 +337,14 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         _ => return Err(Error::new("an INSERT's rows are VALUES or a SELECT")),
     };
     Ok(Statement::Insert { table: ti, source })
+}
+
+/// The statements of a text, each as written, split on their semicolons by sqlparser's tokenizer.
+pub fn split(text: &str) -> Result<Vec<String>> {
+    Ok(crate::ddl::statements(text)?
+        .iter()
+        .map(|t| crate::ddl::written(t))
+        .collect())
 }
 
 pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
