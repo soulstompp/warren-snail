@@ -300,14 +300,18 @@ impl Snail {
         let mut used_texts = vec![false; texts.len()];
         let mut used_nulls = vec![false; nulls.len()];
         let (mut lo, mut hi) = (Vec::new(), Vec::new());
+        // For each level fixed, the test for NULL that fixed it, if one did.
+        let mut by_null: Vec<Option<usize>> = Vec::new();
         for (li, l) in order.levels.iter().enumerate() {
             // A level is fixed on its NULL rows' own run by IS NULL on its column.
             if let Some(i) = nulls.iter().position(|&n| n == (l.column(), true)) {
                 used_nulls[i] = true;
                 lo.push(null_key(order, li));
                 hi.push(null_key(order, li));
+                by_null.push(Some(i));
                 continue;
             }
+            by_null.push(None);
             // A text level is fixed by an equality on it; a range on text stays a condition to read.
             if let Level::Column(c) = *l {
                 if want.table.columns[c].ty.is_text() {
@@ -344,6 +348,15 @@ impl Snail {
                 }
                 None => break,
             }
+        }
+        // A NULL run fixed last narrows nothing the NULLs counted do not, and the counts close a
+        // block holding values beside it, so IS NULL fixes a level only ahead of another fixed.
+        by_null.truncate(lo.len());
+        while let Some(Some(i)) = by_null.last().copied() {
+            used_nulls[i] = false;
+            by_null.pop();
+            lo.pop();
+            hi.pop();
         }
         let m = lo.len();
         let rest: Vec<(Shape, Interval)> = conds

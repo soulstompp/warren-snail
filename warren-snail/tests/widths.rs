@@ -236,6 +236,44 @@ fn a_boolean_is_compared_grouped_and_ordered_as_postgresql_does() {
     );
     assert_eq!(truths(b.column(0).as_ref()), [Some(false)]);
     assert_eq!(truths(b.column(1).as_ref()), [Some(true)]);
+    // A quoted truth beside a boolean is read as one there too, on either side.
+    let p = |w: &str| {
+        format!("WITH x AS (SELECT f.id, f.v FROM s.flags f) SELECT x.id FROM x WHERE {w} ORDER BY x.id")
+    };
+    assert_eq!(ids(&ask(&mut snail, &p("x.v = 'yes'"))), [0, 3, 6, 9]);
+    assert_eq!(ids(&ask(&mut snail, &p("' Of ' = x.v"))), [2, 5, 8]);
+    assert_eq!(ids(&ask(&mut snail, &p("x.v <> 'on'"))), [2, 5, 8]);
+    // A truth tested there is never NULL: v is NULL on 1, 4 and 7.
+    for (w, want) in [
+        ("x.v IS TRUE", vec![0, 3, 6, 9]),
+        ("x.v IS NOT TRUE", vec![1, 2, 4, 5, 7, 8]),
+        ("x.v IS FALSE", vec![2, 5, 8]),
+        ("x.v IS NOT FALSE", vec![0, 1, 3, 4, 6, 7, 9]),
+        ("x.v IS UNKNOWN", vec![1, 4, 7]),
+        ("x.v IS NOT UNKNOWN", vec![0, 2, 3, 5, 6, 8, 9]),
+    ] {
+        assert_eq!(ids(&ask(&mut snail, &p(w))), want, "{w}");
+    }
+    let e = snail.ask(&p("x.v = 'o'"), None).err().unwrap().to_string();
+    assert!(
+        e.contains("invalid input syntax for type boolean: \"o\""),
+        "{e}"
+    );
+    // PostgreSQL has no sum, min or max of a boolean.
+    for f in ["sum", "min", "max"] {
+        let e = snail
+            .ask(
+                &format!("WITH x AS (SELECT f.v FROM s.flags f) SELECT {f}(x.v) FROM x"),
+                None,
+            )
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains(&format!("function {f}(boolean) does not exist")),
+            "{e}"
+        );
+    }
 }
 
 #[test]

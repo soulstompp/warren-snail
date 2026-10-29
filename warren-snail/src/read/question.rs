@@ -754,6 +754,20 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         };
         let table = from.table(side);
         let here = &mut sides[side];
+        // No comparison matches a NULL, so one with NULL keeps no row.
+        if matches!(lit, Expr::Value(v) if v.value == Value::Null)
+            && matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+            )
+        {
+            here.empty = true;
+            continue;
+        }
         if let Shape::Column(c) = s {
             if table.columns[c].ty == ColumnType::Bytes {
                 return Err(Error::new(format!(

@@ -224,7 +224,11 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
-        | Expr::IsFalse(expr) => find_calls(expr, out),
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr) => find_calls(expr, out),
         Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
             find_calls(a, out);
             find_calls(b, out);
@@ -356,13 +360,18 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
         },
         "boolean" | "bool" => match v {
             Value::Bool(b) => Value::Bool(b),
-            Value::Text(t) => Value::Bool(super::question::truth(&t).ok_or_else(|| {
-                Error::new(format!("invalid input syntax for type boolean: \"{t}\""))
-            })?),
+            Value::Text(t) => boolean_of(&t)?,
             other => return Err(Error::new(format!("{other:?} cast to boolean"))),
         },
         _ => return Err(Error::new(format!("a cast to {to} is not read"))),
     })
+}
+
+/// Text read as a boolean, as PostgreSQL's boolean input reads it.
+fn boolean_of(t: &str) -> Result<Value> {
+    super::question::truth(t)
+        .map(Value::Bool)
+        .ok_or_else(|| Error::new(format!("invalid input syntax for type boolean: \"{t}\"")))
 }
 
 /// Bytes written as PostgreSQL's hex form, `\x` and two hex digits a byte.
@@ -467,6 +476,13 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
         },
         Expr::IsNull(x) => Value::Bool(ev(x)?.is_null()),
         Expr::IsNotNull(x) => Value::Bool(!ev(x)?.is_null()),
+        // A truth tested is never NULL: an unknown truth is neither true nor false.
+        Expr::IsTrue(x) => Value::Bool(truth(&ev(x)?)? == Some(true)),
+        Expr::IsNotTrue(x) => Value::Bool(truth(&ev(x)?)? != Some(true)),
+        Expr::IsFalse(x) => Value::Bool(truth(&ev(x)?)? == Some(false)),
+        Expr::IsNotFalse(x) => Value::Bool(truth(&ev(x)?)? != Some(false)),
+        Expr::IsUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_none()),
+        Expr::IsNotUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_some()),
         Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
             let (x, y) = (ev(a)?, ev(b)?);
             let same = match (x.is_null(), y.is_null()) {
@@ -491,6 +507,14 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 _ => {}
             }
             let (x, y) = (ev(left)?, ev(right)?);
+            // A quoted literal beside a boolean is read as one, as PostgreSQL gives its unknown
+            // type the other side's.
+            let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_)));
+            let (x, y) = match (&x, &y) {
+                (Value::Bool(_), Value::Text(t)) if quoted(right) => (x, boolean_of(t)?),
+                (Value::Text(t), Value::Bool(_)) if quoted(left) => (boolean_of(t)?, y),
+                _ => (x, y),
+            };
             match op {
                 BinaryOperator::Plus => numeric_op(&x, &y, i128::checked_add)?,
                 BinaryOperator::Minus => numeric_op(&x, &y, i128::checked_sub)?,
@@ -790,6 +814,17 @@ impl Acc {
             Some(v) if v.is_null() => return Ok(()),
             Some(v) => v,
         };
+        // PostgreSQL has no sum, min or max of a boolean.
+        if let (Value::Bool(_), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_)) = (&v, &self) {
+            let name = match self {
+                Acc::Sum(_) => "sum",
+                Acc::Least(_) => "min",
+                _ => "max",
+            };
+            return Err(Error::new(format!(
+                "function {name}(boolean) does not exist"
+            )));
+        }
         match self {
             Acc::Count(n) => *n += 1,
             // The sum of whole numbers is a numeric of scale 0, as PostgreSQL writes it.

@@ -150,6 +150,11 @@ fn no_comparison_matches_a_null() {
             count(&|a| s_of(a).is_some_and(|s| s.as_str() > "w30")),
             &on_s,
         ),
+        // A comparison with NULL itself keeps no row, as PostgreSQL's does.
+        ("b = NULL", 0, &on_b),
+        ("NULL <= b", 0, &on_b),
+        ("s > NULL", 0, &on_s),
+        ("a < NULL", 0, &on_b),
     ];
     for (cond, want, orders) in &questions {
         for &order in *orders {
@@ -201,6 +206,22 @@ fn is_null_is_counted_from_the_counts_and_reads_no_column_page() {
             let (got, round) = ask(&mut s, &sql, Some(order));
             assert_eq!(one(&got), want, "{sql} along {order}");
             assert_eq!(round.column_pages_read, 0, "{sql} along {order}");
+        }
+    }
+    // In a block holding a level's values beside its NULLs, the NULLs counted close it too.
+    let mut one_block = Snail::open(&written("null-counted-one", DDL, 100)).unwrap();
+    for (cond, want, orders) in [
+        ("b IS NULL", 25, ["t_b", "t_bf", "t_bs"]),
+        ("s IS NULL", 20, ["t_s", "t_bs", "t_pkey"]),
+    ] {
+        for order in orders {
+            let sql = format!("SELECT count(*) FROM s.t WHERE {cond}");
+            let (got, round) = ask(&mut one_block, &sql, Some(order));
+            assert_eq!(
+                (one(&got), round.blocks_read, round.column_pages_read),
+                (want, 0, 0),
+                "{sql} along {order}"
+            );
         }
     }
     // Two tests for NULL on two columns close where the counts hold only one of them open.
