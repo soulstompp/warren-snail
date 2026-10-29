@@ -377,9 +377,10 @@ fn a_null_takes_no_width_in_a_column_s_unit_or_in_its_pages() {
 #[test]
 fn a_boolean_level_cuts_its_false_rows_before_its_true_rows() {
     // 8,192 rows, f false on the even ones: on (f, a) each side fills pages of its own, so no block
-    // holds both, and false's come first.
+    // holds both, false's come first, and f is the first rung of every block's place. So a question
+    // on f alone reads only its side's blocks.
     let n = 8192;
-    let rows = written(
+    let mut snail = written(
         "boolean-level",
         "CREATE TABLE s.t (a bigint NOT NULL, f boolean NOT NULL, PRIMARY KEY (a)); \
          CREATE INDEX t_f ON s.t (f, a);",
@@ -388,9 +389,13 @@ fn a_boolean_level_cuts_its_false_rows_before_its_true_rows() {
             Values::Int((0..n).map(Some).collect()),
             Values::Int((0..n).map(|i| Some(i % 2)).collect()),
         ],
-    )
-    .blocks()
-    .unwrap();
+    );
+    let (b, round) = snail
+        .ask("SELECT t.a FROM s.t t WHERE t.f", Some("t_f"))
+        .unwrap();
+    assert_eq!(b.num_rows(), 4096);
+    assert_eq!(round.blocks_read, 8, "{round:?}");
+    let rows = snail.blocks().unwrap();
     let f: Vec<&BlockRow> = rows
         .iter()
         .filter(|r| r.order == "t_f" && r.column == "f")
@@ -406,6 +411,7 @@ fn a_boolean_level_cuts_its_false_rows_before_its_true_rows() {
     for (i, r) in f.iter().enumerate() {
         assert_eq!(side(&r.first), side(&r.last), "{r:?}");
         assert_eq!(side(&r.first), if i < 8 { "0" } else { "1" }, "{r:?}");
+        assert_eq!(side(&r.place), side(&r.first), "{r:?}");
     }
 }
 
