@@ -532,7 +532,7 @@ impl Snail {
                                         "column \"{}\" is of type {} but expression is of type {}",
                                         col.name,
                                         col.ty.pg_name(),
-                                        types[*i].pg_name()
+                                        types[*i].pg_name().split('(').next().unwrap_or_default()
                                     )));
                                 }
                             }

@@ -84,7 +84,8 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         Error::new(format!(
             "column \"{what}\" is of type {} but expression is of type {}",
             to.pg_name(),
-            from.pg_name()
+            // PostgreSQL names the expression's type without its modifier.
+            from.pg_name().split('(').next().unwrap_or_default()
         ))
     };
     let out_of_range = || Error::new(format!("{} out of range", to.pg_name()));
