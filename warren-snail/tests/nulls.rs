@@ -744,6 +744,7 @@ fn a_level_s_null_run_is_no_place_of_it_for_the_counting_unit() {
 }
 
 #[test]
+#[cfg(feature = "standalone")]
 fn a_text_level_whose_first_rows_are_null_takes_text_after_them() {
     // An order on a text level whose only rows hold NULL there still reads its keys as text.
     let path = tmp("text-null-first.snail");
