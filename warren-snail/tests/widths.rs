@@ -256,6 +256,21 @@ fn a_boolean_is_written_as_postgresql_reads_its_input() {
     ] {
         assert!(w.execute(refused).is_err(), "{refused}");
     }
+    // An answer of integers is no boolean, though its value is 1, as PostgreSQL refuses it by its
+    // type; nor is a boolean answer an integer.
+    for (refused, why) in [
+        (
+            "INSERT INTO s.flags (id, v, w) SELECT f.id, f.id, f.w FROM s.flags f WHERE f.id = 1",
+            "s.flags.v is boolean, and the answer gives Int32",
+        ),
+        (
+            "INSERT INTO s.flags (v, id, w) SELECT f.w, f.w, f.w FROM s.flags f WHERE f.id = 1",
+            "s.flags.id is integer, and the answer gives Boolean",
+        ),
+    ] {
+        let e = w.execute(refused).err().unwrap().to_string();
+        assert!(e.contains(why), "{refused}: {e}");
+    }
     drop(w);
     let mut snail = Snail::open(&path).unwrap();
     let (b, _) = snail
@@ -323,4 +338,137 @@ fn a_snail_of_format_seven_or_eight_refuses_a_boolean_by_name() {
         w.execute("CREATE TABLE s.u (a integer NOT NULL, PRIMARY KEY (a))")
             .unwrap();
     }
+}
+
+#[test]
+fn a_null_takes_no_width_in_a_column_s_unit_or_in_its_pages() {
+    // On t_g a block is a day's 1,024 rows, all of g = 0, so the furthest-out place is the block. b
+    // is NULL on every other row: its 512 values are 4,096 bytes, a unit of one page, where at its
+    // full width the NULLs would make 8,192 and a unit of two. Its pages are guessed at the 4 bytes a
+    // row its values take on the mean, so a block's 1,024 rows take two data pages, not the three of
+    // 8.
+    let n = 8192;
+    let day = 86_400_000_000;
+    let snail = written(
+        "nulls-unit",
+        "CREATE TABLE s.t (a bigint NOT NULL, g integer NOT NULL, at timestamptz NOT NULL, b bigint, \
+         PRIMARY KEY (a)); CREATE INDEX t_g ON s.t (g, at) INCLUDE (b);",
+        "s.t",
+        vec![
+            Values::Int((0..n).map(Some).collect()),
+            Values::Int((0..n).map(|_| Some(0)).collect()),
+            Values::Int(
+                (0..n)
+                    .map(|i| Some(1_577_836_800_000_000 + i / 1024 * day + i % 1024))
+                    .collect(),
+            ),
+            Values::Int((0..n).map(|i| (i % 2 == 0).then_some(i)).collect()),
+        ],
+    );
+    let rows = snail.blocks().unwrap();
+    assert_eq!(blocks_of(&rows, "t_g", "b"), [1024; 8]);
+    let b: Vec<&BlockRow> = rows
+        .iter()
+        .filter(|r| r.order == "t_g" && r.column == "b")
+        .collect();
+    assert!(b.iter().all(|r| r.k == 1 && r.data_pages == 2), "{b:?}");
+}
+
+#[test]
+fn a_boolean_level_cuts_its_false_rows_before_its_true_rows() {
+    // 8,192 rows, f false on the even ones: on (f, a) each side fills pages of its own, so no block
+    // holds both, and false's come first.
+    let n = 8192;
+    let rows = written(
+        "boolean-level",
+        "CREATE TABLE s.t (a bigint NOT NULL, f boolean NOT NULL, PRIMARY KEY (a)); \
+         CREATE INDEX t_f ON s.t (f, a);",
+        "s.t",
+        vec![
+            Values::Int((0..n).map(Some).collect()),
+            Values::Int((0..n).map(|i| Some(i % 2)).collect()),
+        ],
+    )
+    .blocks()
+    .unwrap();
+    let f: Vec<&BlockRow> = rows
+        .iter()
+        .filter(|r| r.order == "t_f" && r.column == "f")
+        .collect();
+    assert_eq!(f.len(), 16);
+    let side = |key: &str| {
+        key.trim_start_matches('[')
+            .split(',')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    for (i, r) in f.iter().enumerate() {
+        assert_eq!(side(&r.first), side(&r.last), "{r:?}");
+        assert_eq!(side(&r.first), if i < 8 { "0" } else { "1" }, "{r:?}");
+    }
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_boolean_goes_out_as_parquet_s_boolean_and_comes_back_by_its_pages() {
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+    use parquet::file::statistics::Statistics;
+    let path = flags("flags-out");
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("flags-out");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let outs = Snail::open_writing(&path).unwrap().out(&dir).unwrap();
+    let file = &outs[0].file;
+    let (batches, _) = weather::parquet_of(file);
+    let got: Vec<Option<bool>> = batches
+        .iter()
+        .flat_map(|b| truths(b.column_by_name("v").unwrap().as_ref()))
+        .collect();
+    let want: Vec<Option<bool>> = (0..10)
+        .map(|i| match i % 3 {
+            0 => Some(true),
+            1 => None,
+            _ => Some(false),
+        })
+        .collect();
+    assert_eq!(got, want);
+    let meta = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Required)
+        .parse_and_finish(&std::fs::File::open(file).unwrap())
+        .unwrap();
+    let v = meta.row_group(0).column(1);
+    match v.statistics() {
+        Some(Statistics::Boolean(s)) => {
+            assert_eq!((s.min_opt(), s.max_opt()), (Some(&false), Some(&true)));
+            assert_eq!(s.null_count_opt(), Some(3));
+        }
+        other => panic!("{other:?}"),
+    }
+    let catalog = Catalog::parse(FLAGS).unwrap();
+    let table = catalog.table("s.flags").unwrap();
+    let rows = Rows::from_batches(table, &batches).unwrap();
+    let source = warren_snail::write::source(file, table).unwrap();
+    let back = tmp("flags-back.snail");
+    for w in warren_snail::write::write_spanned(
+        &back,
+        &catalog,
+        &[("s.flags".to_string(), rows)],
+        &[("s.flags".to_string(), source)],
+        weather::span(),
+    )
+    .unwrap()
+    {
+        if w.order == "flags_pkey" {
+            assert!(
+                w.columns.iter().all(|c| c.moved_blocks == w.blocks),
+                "{w:?}"
+            );
+        }
+    }
+    let (b, _) = Snail::open(&back)
+        .unwrap()
+        .ask("SELECT f.id, f.v FROM s.flags f ORDER BY f.id", None)
+        .unwrap();
+    assert_eq!(truths(b.column(1).as_ref()), want);
 }

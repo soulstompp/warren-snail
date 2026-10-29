@@ -221,9 +221,6 @@ fn check(table: &Table, row: &Row) -> Result<()> {
                 return Err(what("is NOT NULL and the row holds NULL".into()))
             }
             (_, Datum::Null) => {}
-            (ColumnType::Boolean, Datum::Int(v)) if !(0..=1).contains(v) => {
-                return Err(what(format!("{v} is not a boolean")))
-            }
             (ColumnType::Int2, Datum::Int(v)) if i16::try_from(*v).is_err() => {
                 return Err(what(format!("{v} is out of range")))
             }
@@ -385,6 +382,23 @@ impl Snail {
                     (Source::Values(rows), None) => rows,
                     (Source::Select { question, fill }, None) => {
                         let (batch, _) = self.answer(&question, None)?;
+                        // A boolean is filled only from a boolean, and fills nothing else.
+                        let t = &self.catalog.tables[table];
+                        for (col, f) in t.columns.iter().zip(&fill) {
+                            if let Fill::Answer(i) = f {
+                                let given = batch.schema().field(*i).data_type().clone();
+                                if (col.ty == ColumnType::Boolean)
+                                    != (given == arrow::datatypes::DataType::Boolean)
+                                {
+                                    return Err(Error::new(format!(
+                                        "{}.{} is {}, and the answer gives {given}",
+                                        t.name,
+                                        col.name,
+                                        col.ty.name()
+                                    )));
+                                }
+                            }
+                        }
                         rows_of(&batch)?
                             .into_iter()
                             .map(|a| {
