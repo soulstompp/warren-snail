@@ -187,10 +187,16 @@ impl Snail {
     fn table_out(&self, table: &Table, oi: usize, dir: &Path, pruned: u64) -> Result<TableOut> {
         let order = &table.orders[oi];
         let (head, blocks) = self.blocks_of(table, oi)?;
-        let descs = table
-            .columns
+        // The columns it stores: a virtual one is computed again from them when read.
+        let stored: Vec<usize> = (0..table.columns.len())
+            .filter(|&c| !table.columns[c].is_virtual())
+            .collect();
+        let descs = stored
             .iter()
-            .map(|c| descriptor(&c.name, c.ty, !c.not_null))
+            .map(|&c| {
+                let c = &table.columns[c];
+                descriptor(&c.name, c.ty, !c.not_null)
+            })
             .collect::<Result<Vec<_>>>()?;
         let schema = Arc::new(
             Type::group_type_builder("schema")
@@ -202,7 +208,7 @@ impl Snail {
             .iter()
             .map(|l| match l {
                 Level::Column(c) => Some(SortingColumn {
-                    column_idx: *c as i32,
+                    column_idx: stored.iter().position(|x| x == c)? as i32,
                     descending: false,
                     nulls_first: false,
                 }),
@@ -274,7 +280,8 @@ impl Snail {
             in_file += b;
             let n = map.rows() as usize;
             let mut rg = w.next_row_group()?;
-            for (c, col) in table.columns.iter().enumerate() {
+            for (k, &c) in stored.iter().enumerate() {
+                let col = &table.columns[c];
                 let s = order.slot(c).ok_or_else(|| {
                     Error::new(format!(
                         "{}.{} is not held by {}",
@@ -283,7 +290,7 @@ impl Snail {
                 })?;
                 let cp = &map.columns[s];
                 pages += cp.pages.len() as u64 + cp.dictionary.is_some() as u64;
-                let (chunk, close) = self.chunk(&descs[c], col.ty, cp, n)?;
+                let (chunk, close) = self.chunk(&descs[k], col.ty, cp, n)?;
                 rg.append_column(&Bytes::from(chunk), close)?;
             }
             rg.close()?;

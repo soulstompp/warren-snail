@@ -354,6 +354,19 @@ fn cmd_write(args: &[String]) -> Result<()> {
         ])?;
         save(out, &batch)?;
     }
+    // A table laid out on a key handed out as rows arrive is said to be: the DDL names no other
+    // order for it.
+    for t in &catalog.tables {
+        if let Some(c) = t.arrival_key() {
+            let order = t.orders.iter().find(|o| o.table_order).unwrap();
+            println!(
+                "{}: laid out along {}, on {}, a key handed out as rows arrive, since the DDL names \
+                 no other order: its blocks follow the rows' arrival, and each insert meets the \
+                 newest",
+                t.name, order.name, t.columns[c].name
+            );
+        }
+    }
     for w in written {
         println!(
             "{} {}: {}, {}, its directory {} in {}, its page maps {}",
@@ -678,7 +691,17 @@ fn cmd_catalog(args: &[String]) -> Result<()> {
                 .first()
                 .filter(|a| !a.starts_with("--"))
                 .ok_or_else(|| Error::new(USAGE))?;
-            Snail::open(Path::new(file))?.catalog.clone()
+            let snail = Snail::open(Path::new(file))?;
+            let mut catalog = snail.catalog.clone();
+            // A sequence stands where the file says, which its DDL says only until it hands out a
+            // value.
+            for (name, last, called) in snail.sequences()? {
+                if let Some(s) = catalog.sequences.iter_mut().find(|s| s.name == name) {
+                    s.last_value = last;
+                    s.is_called = called;
+                }
+            }
+            catalog
         }
     };
     if let Some(out) = flag(args, "--out") {

@@ -409,6 +409,26 @@ fn numeric_op(a: &Value, b: &Value, op: fn(i128, i128) -> Option<i128>) -> Resul
     })
 }
 
+/// A product, as PostgreSQL multiplies: integers to an integer, any numeric to a numeric whose
+/// scale is its factors' scales added.
+fn multiply(a: &Value, b: &Value) -> Result<Value> {
+    if a.is_null() || b.is_null() {
+        return Ok(Value::Null);
+    }
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return x
+            .checked_mul(*y)
+            .map(Value::Int)
+            .ok_or_else(|| Error::new("bigint out of range"));
+    }
+    let (Some((x, sx)), Some((y, sy))) = (a.numeric(), b.numeric()) else {
+        return Err(Error::new(format!("{a:?} and {b:?} are not numbers")));
+    };
+    x.checked_mul(y)
+        .map(|m| Value::Num(m, sx + sy))
+        .ok_or_else(|| Error::new("a number out of range"))
+}
+
 fn truth(v: &Value) -> Result<Option<bool>> {
     match v {
         Value::Null => Ok(None),
@@ -519,6 +539,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 BinaryOperator::Plus => numeric_op(&x, &y, i128::checked_add)?,
                 BinaryOperator::Minus => numeric_op(&x, &y, i128::checked_sub)?,
                 BinaryOperator::Modulo => numeric_op(&x, &y, i128::checked_rem)?,
+                BinaryOperator::Multiply => multiply(&x, &y)?,
                 BinaryOperator::Eq
                 | BinaryOperator::NotEq
                 | BinaryOperator::Lt
@@ -933,6 +954,16 @@ fn prepare(q: &Query) -> Result<Prepared<'_>> {
         grouping,
         grouped,
     })
+}
+
+/// An expression on one row whose columns the names give, read alone: a CHECK's, a generated
+/// column's, or a DEFAULT's on no row.
+pub(crate) fn eval_on(e: &Expr, names: &[String], row: &[Value]) -> Result<Value> {
+    let frame = Frame {
+        columns: names.iter().map(|n| (None, n.clone())).collect(),
+        params: &[],
+    };
+    eval(e, row, &frame, &computed_none())
 }
 
 /// The values of a row's aggregates and windows: none.

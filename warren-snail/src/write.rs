@@ -40,8 +40,27 @@ impl Rows {
     /// The table's columns, found by name in the batches.
     pub fn from_batches(table: &Table, batches: &[RecordBatch]) -> Result<Rows> {
         let mut columns = Vec::with_capacity(table.columns.len());
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         for c in &table.columns {
             let mut out = Values::new(c.ty);
+            // A virtual column is computed at the read: no order holds it, and its rows give it
+            // no value.
+            if c.is_virtual() {
+                if batches.iter().any(|b| b.column_by_name(&c.name).is_some()) {
+                    return Err(Error::new(format!(
+                        "{}.{} is a virtual generated column, and its rows give it no value",
+                        table.name, c.name
+                    )));
+                }
+                match &mut out {
+                    Values::Int(x) => x.resize(rows, None),
+                    Values::Text(x) => x.resize(rows, None),
+                    Values::Utf8(x) => x.resize(rows, None),
+                    _ => unreachable!("a column is read as plain values"),
+                }
+                columns.push(out);
+                continue;
+            }
             for b in batches {
                 let a = b.column_by_name(&c.name).ok_or_else(|| {
                     Error::new(format!(
@@ -151,6 +170,23 @@ impl Rows {
             columns.push(out);
         }
         Ok(Rows { columns })
+    }
+}
+
+/// A row's value of a column, as a statement holds it.
+fn row_value(ty: ColumnType, v: &Values, i: usize) -> crate::read::statement::Datum {
+    use crate::read::statement::Datum;
+    if v.is_null(i) {
+        return Datum::Null;
+    }
+    match (ty, v) {
+        (_, Values::Int(x)) => x[i].map_or(Datum::Null, Datum::Int),
+        (ColumnType::Bytes, _) => v
+            .text_value(i)
+            .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
+        _ => v
+            .text(i)
+            .map_or(Datum::Null, |s| Datum::Text(s.to_string())),
     }
 }
 
@@ -471,6 +507,18 @@ fn write_tables(
                         table.name, c.name
                     )));
                 }
+            }
+        }
+        // Each row meets the table's CHECKs, as PostgreSQL's COPY checks them.
+        if table.checks.iter().any(|k| k.enforced) {
+            for i in 0..rows.len() {
+                let row: crate::read::statement::Row = table
+                    .columns
+                    .iter()
+                    .zip(&rows.columns)
+                    .map(|(c, v)| row_value(c.ty, v, i))
+                    .collect();
+                crate::read::fill::check(table, &row)?;
             }
         }
         for c in table.month_columns() {

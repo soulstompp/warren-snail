@@ -251,6 +251,9 @@ pub struct Check {
     pub expr: Expr,
     /// NOT ENFORCED checks nothing.
     pub enforced: bool,
+    /// Whether every row was checked: false where it was added NOT VALID and not validated since,
+    /// so that only the rows written after it are.
+    pub valid: bool,
 }
 
 #[derive(Clone, Debug)]

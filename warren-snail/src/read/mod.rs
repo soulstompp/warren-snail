@@ -7,6 +7,7 @@
 
 mod answer;
 mod change;
+pub(crate) mod fill;
 mod hash;
 mod out;
 mod pipeline;
@@ -161,6 +162,159 @@ impl Sink for Second<'_> {
     }
 }
 
+/// A catalog as a snail of `format` names its orders: 0.1.x, formats 7 and 8, named a primary key's
+/// order for its table, whatever its constraint was named.
+pub(super) fn old_names(catalog: &mut Catalog, format: u32) {
+    if format >= 9 {
+        return;
+    }
+    for t in &mut catalog.tables {
+        let bare = t.name.rsplit('.').next().unwrap_or(&t.name).to_string();
+        for o in &mut t.orders {
+            if o.constraint.as_ref().is_some_and(|k| k.primary) {
+                o.name = format!("{bare}_pkey");
+            }
+        }
+    }
+}
+
+/// Calls `f` on each table a query's FROMs name, in its steps and in its body.
+fn each_table(q: &mut sqlparser::ast::Query, f: &mut dyn FnMut(&mut sqlparser::ast::TableFactor)) {
+    use sqlparser::ast::SetExpr;
+    if let Some(with) = q.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            each_table(&mut cte.query, f);
+        }
+    }
+    if let SetExpr::Select(s) = q.body.as_mut() {
+        for item in &mut s.from {
+            f(&mut item.relation);
+            for j in &mut item.joins {
+                f(&mut j.relation);
+            }
+        }
+    }
+}
+
+/// A question that reads a table's virtual columns, read through a first step that computes them
+/// from the columns the table stores; none where it reads no such column.
+fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlparser::ast::Query>> {
+    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, TableAlias, TableFactor};
+    let mut read: Vec<usize> = Vec::new();
+    let mut q = q.clone();
+    each_table(&mut q, &mut |t| {
+        if let TableFactor::Table { name, .. } = t {
+            let n = crate::catalog::object_name(name);
+            if let Some(i) = catalog.tables.iter().position(|x| x.name == n) {
+                if !read.contains(&i) {
+                    read.push(i);
+                }
+            }
+        }
+    });
+    let text = q.to_string();
+    let words: Vec<String> =
+        sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, &text)
+            .tokenize()?
+            .into_iter()
+            .filter_map(|t| match t {
+                sqlparser::tokenizer::Token::Word(w) => Some(if w.quote_style.is_some() {
+                    w.value
+                } else {
+                    w.value.to_lowercase()
+                }),
+                _ => None,
+            })
+            .collect();
+    let wildcard = text.contains(".*") || {
+        let mut any = false;
+        if let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() {
+            any = s.projection.iter().any(|p| {
+                matches!(
+                    p,
+                    sqlparser::ast::SelectItem::Wildcard(_)
+                        | sqlparser::ast::SelectItem::QualifiedWildcard(..)
+                )
+            });
+        }
+        any
+    };
+    let mut steps = Vec::new();
+    for &i in &read {
+        let t = &catalog.tables[i];
+        let reads = t
+            .columns
+            .iter()
+            .any(|c| c.is_virtual() && (wildcard || words.contains(&c.name)));
+        if !reads {
+            continue;
+        }
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let items: Vec<String> = t
+            .columns
+            .iter()
+            .map(|c| match &c.generated {
+                Some(g) if !g.stored => format!("({}) AS {}", g.expr, quote(&c.name)),
+                _ => quote(&c.name),
+            })
+            .collect();
+        let step = format!("snail_computed_{i}");
+        steps.push((
+            i,
+            step.clone(),
+            format!("{step} AS (SELECT {} FROM {})", items.join(", "), t.name),
+        ));
+    }
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    each_table(&mut q, &mut |f| {
+        if let TableFactor::Table { name, alias, .. } = f {
+            let n = crate::catalog::object_name(name);
+            if let Some((i, step, _)) = steps.iter().find(|(i, _, _)| catalog.tables[*i].name == n)
+            {
+                let bare = catalog.tables[*i]
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(step.clone()))]);
+                if alias.is_none() {
+                    *alias = Some(TableAlias {
+                        explicit: true,
+                        name: Ident::new(bare),
+                        columns: vec![],
+                        at: None,
+                    });
+                }
+            }
+        }
+    });
+    let with: Vec<String> = steps.into_iter().map(|(_, _, s)| s).collect();
+    let rest = match &q.with {
+        Some(w) => {
+            let mut q2 = q.clone();
+            q2.with = None;
+            format!(
+                "WITH {}, {} {q2}",
+                with.join(", "),
+                w.cte_tables
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        None => format!("WITH {} {q}", with.join(", ")),
+    };
+    match sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &rest)?
+        .as_slice()
+    {
+        [sqlparser::ast::Statement::Query(q)] => Ok(Some((**q).clone())),
+        _ => Err(Error::new("a question with virtual columns is not read")),
+    }
+}
 /// The tag of the pages read for one order of one table.
 fn order_tag(table: usize, order: usize) -> u32 {
     (table as u32) << 16 | order as u32
@@ -198,6 +352,14 @@ pub struct Snail {
     /// The rows the scans have walked one by one, and taken in runs at once.
     walked: std::cell::Cell<u64>,
     taken: std::cell::Cell<u64>,
+    /// The statement's clock, in microseconds since 1970 UTC: where the transaction began, or
+    /// the statement where it stands alone; and where the statement began.
+    clock: (i64, i64),
+    /// The values each sequence has handed this writer and it has not used, as PostgreSQL's
+    /// sequences cache them a session.
+    handed: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
+    /// The sequences' states a commit at the root's turn writes.
+    advancing: Option<Vec<crate::file::SequenceState>>,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -369,6 +531,9 @@ impl Snail {
             stale: false,
             reused: 0,
             declared: None,
+            clock: (0, 0),
+            handed: Default::default(),
+            advancing: None,
         })
     }
 
@@ -397,7 +562,9 @@ impl Snail {
     fn catalog(reader: &Reader, root: &Root) -> Result<Catalog> {
         let ddl = String::from_utf8(reader.read_extent(root.catalog)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
-        Catalog::parse(&ddl)
+        let mut catalog = Catalog::parse(&ddl)?;
+        old_names(&mut catalog, reader.format());
+        Ok(catalog)
     }
 
     /// Begins a round after the first: the root read afresh, and the catalog read again if the file
@@ -415,6 +582,28 @@ impl Snail {
     /// The generation of the root the snail reads.
     pub fn generation(&self) -> u64 {
         self.root.generation
+    }
+
+    /// Where each sequence stands, as the file holds it: its last value and whether it was handed
+    /// out; where the file holds none, where its DDL leaves it.
+    pub fn sequences(&self) -> Result<Vec<crate::file::SequenceState>> {
+        let held = if self.root.sequences.bytes > 0 {
+            crate::file::decode_sequences(&self.reader.read_extent(self.root.sequences)?)?
+        } else {
+            Vec::new()
+        };
+        Ok(self
+            .catalog
+            .sequences
+            .iter()
+            .map(|s| {
+                held.iter().find(|h| h.0 == s.name).cloned().unwrap_or((
+                    s.name.clone(),
+                    s.last_value,
+                    s.is_called,
+                ))
+            })
+            .collect())
     }
 
     /// The pages read from the file.
@@ -796,6 +985,14 @@ impl Snail {
         let parsed =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
         if let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() {
+            if let Some(r) = computed(&self.catalog, q)? {
+                if order.is_some() {
+                    return Err(Error::new(
+                        "a question that reads a virtual column reads its table along its own order",
+                    ));
+                }
+                return self.ask_pipeline(&r, params);
+            }
             if pipeline::is_pipeline(q) {
                 if order.is_some() {
                     return Err(Error::new("a pipeline reads its table along its own order"));
@@ -832,10 +1029,13 @@ impl Snail {
             .iter()
             .find(|o| o.table_order)
             .ok_or_else(|| Error::new(format!("{} has no order of its own", table.name)))?;
-        let columns = table
-            .columns
+        // The columns it stores: a step computes a virtual one from them.
+        let stored: Vec<usize> = (0..table.columns.len())
+            .filter(|&c| !table.columns[c].is_virtual())
+            .collect();
+        let columns = stored
             .iter()
-            .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
+            .map(|&c| format!("\"{}\"", table.columns[c].name.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ");
         let base = question::parse(
@@ -849,11 +1049,14 @@ impl Snail {
                 if table.columns[*c].not_null
                     || (!order.nulls_first[0] && !order.nulls_distinct) =>
             {
-                Some(*c)
+                stored.iter().position(|x| x == c)
             }
             _ => None,
         };
-        let names = table.columns.iter().map(|c| c.name.clone()).collect();
+        let names = stored
+            .iter()
+            .map(|&c| table.columns[c].name.clone())
+            .collect();
         let mut stream = pipeline::Stream::new(q, &table.name, names, along, params)?;
         // Each block's rows go to the pipeline as the scan reads them, in the order.
         let mut blocks = Blocks {

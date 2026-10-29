@@ -26,12 +26,14 @@ pub enum Datum {
 /// A row of a table, its values in the table's column order.
 pub type Row = Vec<Datum>;
 
-/// Where an inserted row's value comes from: a literal, or a column of the question's answer.
+/// Where an inserted row's value comes from: a literal, a column of the question's answer, or
+/// the column's DEFAULT, which an identity's sequence or its DDL hands out, or else NULL.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Fill {
     Literal(Datum),
     Answer(usize),
+    Default,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +45,8 @@ pub enum Source {
         question: String,
         fill: Vec<Fill>,
     },
+    /// Rows given as VALUES, each cell a literal or the column's DEFAULT.
+    Filled(Vec<Vec<Fill>>),
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +74,13 @@ pub enum Statement {
         ddl: String,
         kind: &'static str,
     },
+    /// An UPDATE: the question that finds the rows, every column of the table in its order, and
+    /// each column set, to a value written out or to its DEFAULT.
+    Set {
+        table: usize,
+        find: String,
+        sets: Vec<(usize, Fill)>,
+    },
 }
 
 impl Statement {
@@ -82,6 +93,7 @@ impl Statement {
             Statement::Update { .. } => "UPDATE",
             Statement::Delete { .. } => "DELETE",
             Statement::Declare { kind, .. } => kind,
+            Statement::Set { .. } => "UPDATE",
         }
     }
 }
@@ -119,8 +131,13 @@ fn uncast(e: &Expr) -> &Expr {
     }
 }
 
+/// Whether an expression is the keyword DEFAULT, which takes the column's DEFAULT.
+fn is_default(e: &Expr) -> bool {
+    matches!(e, Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("default"))
+}
+
 /// Whether an expression is a literal, a value written out.
-fn is_literal(e: &Expr) -> bool {
+pub(crate) fn is_literal(e: &Expr) -> bool {
     match uncast(e) {
         Expr::Value(_) => true,
         Expr::UnaryOp {
@@ -187,11 +204,13 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
     })
 }
 
-/// The question that finds a table's rows, every column in the table's order.
+/// The question that finds a table's rows, every column it stores in the table's order.
 fn finder(table: &Table, relation: &TableWithJoins, selection: Option<&Expr>) -> String {
+    // Its stored columns: a virtual one is computed again from them.
     let columns = table
         .columns
         .iter()
+        .filter(|c| !c.is_virtual())
         .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(", ");
@@ -260,19 +279,17 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                         columns.len()
                     )));
                 }
-                let mut row = vec![Datum::Null; table.columns.len()];
+                let mut row = vec![Fill::Default; table.columns.len()];
                 for (&c, e) in columns.iter().zip(&r.content) {
-                    if matches!(uncast(e), Expr::Identifier(i) if i.value.eq_ignore_ascii_case("default"))
-                    {
-                        return Err(Error::new(
-                            "DEFAULT is not written: a row gives every value it holds",
-                        ));
-                    }
-                    row[c] = datum(e, table, c)?;
+                    row[c] = if is_default(e) {
+                        Fill::Default
+                    } else {
+                        Fill::Literal(datum(e, table, c)?)
+                    };
                 }
                 rows.push(row);
             }
-            Source::Values(rows)
+            Source::Filled(rows)
         }
         SetExpr::Select(s) => {
             if s.projection.len() != columns.len() {
@@ -282,7 +299,7 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                     columns.len()
                 )));
             }
-            let mut fill = vec![Fill::Literal(Datum::Null); table.columns.len()];
+            let mut fill = vec![Fill::Default; table.columns.len()];
             let mut kept = Vec::new();
             for (&c, item) in columns.iter().zip(&s.projection) {
                 let e = match item {
@@ -324,6 +341,10 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         }
         return Ok(Statement::Declare { ddl, kind });
     }
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize()?;
+    if tokens.iter().any(|t| matches!(t, sqlparser::tokenizer::Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("overriding"))) {
+        return Err(refused("OVERRIDING SYSTEM VALUE or USER VALUE"));
+    }
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
     let s = match statements.as_slice() {
         [s] => s,
@@ -357,15 +378,19 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                     AssignmentTarget::ColumnName(n) => column_index(table, n)?,
                     AssignmentTarget::Tuple(_) => return Err(refused("an UPDATE of a tuple")),
                 };
+                if is_default(&a.value) {
+                    sets.push((c, Fill::Default));
+                    continue;
+                }
                 if !is_literal(&a.value) {
                     return Err(Error::new(format!(
                         "{}: an UPDATE sets a value written out",
                         a.value
                     )));
                 }
-                sets.push((c, datum(&a.value, table, c)?));
+                sets.push((c, Fill::Literal(datum(&a.value, table, c)?)));
             }
-            Ok(Statement::Update {
+            Ok(Statement::Set {
                 table: ti,
                 find: finder(table, &u.table, u.selection.as_ref()),
                 sets,
@@ -422,14 +447,18 @@ mod tests {
         match parse(&c, "INSERT INTO s.t (b, a) VALUES ('x', 1), (NULL, -2)").unwrap() {
             Statement::Insert {
                 table: 0,
-                source: Source::Values(rows),
-            } => assert_eq!(
-                rows,
-                [
-                    vec![Datum::Int(1), Datum::Text("x".into()), Datum::Null],
-                    vec![Datum::Int(-2), Datum::Null, Datum::Null],
-                ]
-            ),
+                source: Source::Filled(rows),
+            } => {
+                // A column the INSERT leaves out, or gives DEFAULT, takes its DEFAULT.
+                let shown: Vec<String> = rows.iter().map(|r| format!("{r:?}")).collect();
+                assert_eq!(
+                    shown,
+                    [
+                        "[Literal(Int(1)), Literal(Text(\"x\")), Default]",
+                        "[Literal(Int(-2)), Literal(Null), Default]",
+                    ]
+                );
+            }
             other => panic!("{other:?}"),
         }
         match parse(
@@ -450,10 +479,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match parse(&c, "UPDATE s.t SET b = 'z' WHERE a = 1").unwrap() {
-            Statement::Update { table, find, sets } => {
+            Statement::Set { table, find, sets } => {
                 assert_eq!(table, 0);
                 assert_eq!(find, "SELECT \"a\", \"b\", \"at\" FROM s.t WHERE a = 1");
-                assert_eq!(sets, [(1, Datum::Text("z".into()))]);
+                assert!(matches!(&sets[..], [(1, Fill::Literal(Datum::Text(z)))] if z == "z"));
             }
             other => panic!("{other:?}"),
         }
@@ -487,7 +516,10 @@ mod tests {
                 "INSERT INTO s.t (a) VALUES (1) ON CONFLICT DO NOTHING",
                 "a row's place is its key",
             ),
-            ("INSERT INTO s.t (a) VALUES (DEFAULT)", "DEFAULT"),
+            (
+                "INSERT INTO s.t (a) OVERRIDING SYSTEM VALUE VALUES (1)",
+                "OVERRIDING",
+            ),
             ("UPDATE s.t SET b = b WHERE a = 1", "a value written out"),
             ("INSERT INTO s.u (n, a) VALUES (70000, 1)", "out of range"),
             ("TRUNCATE s.t", "TRUNCATE"),

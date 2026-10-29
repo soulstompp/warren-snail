@@ -31,6 +31,36 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
     if format >= FORMAT {
         return Ok(());
     }
+    let way = format!(
+        "which a snail of format {format} cannot hold: put the snail `out` and `write` it afresh, in \
+         format {FORMAT}"
+    );
+    if let Some(c) = table
+        .columns
+        .iter()
+        .find(|c| c.default.is_some() || c.generated.is_some() || c.identity.is_some())
+    {
+        return Err(crate::Error::new(format!(
+            "{}.{} has a DEFAULT, a generation or an identity, {way}",
+            table.name, c.name
+        )));
+    }
+    if let Some(k) = table.checks.first() {
+        return Err(crate::Error::new(format!(
+            "{}: the CHECK {}, {way}",
+            table.name, k.name
+        )));
+    }
+    if let Some(o) = table
+        .orders
+        .iter()
+        .find(|o| o.constraint.as_ref().is_some_and(|k| !k.primary))
+    {
+        return Err(crate::Error::new(format!(
+            "{}: the UNIQUE {}, {way}",
+            table.name, o.name
+        )));
+    }
     match table
         .columns
         .iter()
@@ -45,6 +75,29 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
         ))),
         None => Ok(()),
     }
+}
+
+/// Refuses a catalog's types, domains, sequences and collations in a snail of `format`: 0.1.x reads
+/// none, and a sequence's state lies in format 9's root.
+pub(crate) fn holds_catalog(format: u32, catalog: &crate::catalog::Catalog) -> crate::Result<()> {
+    if format >= FORMAT {
+        return Ok(());
+    }
+    let what = if let Some(t) = catalog.types.first() {
+        format!("the type {}", t.name)
+    } else if let Some(d) = catalog.domains.first() {
+        format!("the domain {}", d.name)
+    } else if let Some(s) = catalog.sequences.first() {
+        format!("the sequence {}", s.name)
+    } else if let Some(k) = catalog.collations.first() {
+        format!("the collation {}", k.name)
+    } else {
+        return Ok(());
+    };
+    Err(crate::Error::new(format!(
+        "{what}, which a snail of format {format} cannot hold: put the snail `out` and `write` it \
+         afresh, in format {FORMAT}"
+    )))
 }
 
 /// Refuses a NULL on a level of `order` in a snail of `format`: no key of formats 7 and 8 holds one.
@@ -181,6 +234,9 @@ pub struct Root {
     /// every run reused after generation `reused_from`.
     pub reused: Vec<(u64, u64, u64)>,
     pub reused_from: u64,
+    /// Where each sequence stands that has handed out a value since the DDL made or restarted it:
+    /// format 9 only.
+    pub sequences: Extent,
 }
 
 /// A run of pages in the free map: free where its tag is 0, else freed once no round older than its
@@ -213,6 +269,27 @@ pub fn decode_runs(buf: &[u8]) -> Result<Vec<Run>> {
                 tag: i.u64()?,
             })
         })
+        .collect()
+}
+
+/// Where a sequence stands: its name, its last value, and whether it was handed out.
+pub type SequenceState = (String, i64, bool);
+
+pub fn encode_sequences(states: &[SequenceState]) -> Vec<u8> {
+    let mut o = Out::default();
+    o.u32(states.len() as u32);
+    for (name, last, called) in states {
+        o.str(name);
+        o.i64(*last);
+        o.u8(*called as u8);
+    }
+    o.0
+}
+
+pub fn decode_sequences(buf: &[u8]) -> Result<Vec<SequenceState>> {
+    let mut i = In::new(buf);
+    (0..i.u32()?)
+        .map(|_| Ok((i.str()?, i.i64()?, i.u8()? != 0)))
         .collect()
 }
 
@@ -271,6 +348,9 @@ impl Root {
             o.u64(s);
             o.u64(p);
         }
+        if format >= FORMAT {
+            o.extent(self.sequences);
+        }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
         if o.0.len() > PAGE {
@@ -305,6 +385,11 @@ impl Root {
         for _ in 0..m {
             reused.push((i.u64().ok()?, i.u64().ok()?, i.u64().ok()?));
         }
+        let sequences = if format >= FORMAT {
+            i.extent().ok()?
+        } else {
+            Extent::default()
+        };
         let end = i.at();
         let crc = i.u32().ok()?;
         (crc32fast::hash(&page[..end]) == crc).then_some((
@@ -317,6 +402,7 @@ impl Root {
                 free,
                 reused,
                 reused_from,
+                sequences,
             },
             format,
         ))
@@ -1047,6 +1133,10 @@ mod tests {
             },
             reused: vec![(6, 4, 1), (7, 5, 2)],
             reused_from: 5,
+            sequences: Extent {
+                start: 11,
+                bytes: 40,
+            },
         };
         let mut a = r.encode(FORMAT).unwrap();
         a.resize(PAGE, 0);
@@ -1055,8 +1145,13 @@ mod tests {
         assert_eq!((back.generation, back.span), (7, 64));
         assert_eq!(back.orders[0].2.pages(), 2);
         assert_eq!(
-            (back.free, back.reused.clone(), back.reused_from),
-            (r.free, r.reused.clone(), 5)
+            (
+                back.free,
+                back.reused.clone(),
+                back.reused_from,
+                back.sequences
+            ),
+            (r.free, r.reused.clone(), 5, r.sequences)
         );
         let runs = [
             Run {

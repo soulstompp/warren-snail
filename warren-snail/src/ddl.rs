@@ -1772,9 +1772,7 @@ impl Draft {
             return self.create_index(tokens);
         }
         if kind == "ALTER TABLE" {
-            return Err(Error::new(format!(
-                "ALTER TABLE {object}: only CLUSTER ON is read"
-            )));
+            return self.alter_table(tokens, &object);
         }
         let st = Parser::new(&PostgreSqlDialect {})
             .with_tokens(tokens.to_vec())
@@ -2139,6 +2137,100 @@ impl Draft {
             )));
         }
         Ok(Some((table, column)))
+    }
+
+    /// ALTER TABLE … ADD [CONSTRAINT n] CHECK (…) [NOT VALID], and VALIDATE CONSTRAINT; CLUSTER ON is
+    /// read before. Any other form is refused by name.
+    fn alter_table(&mut self, tokens: &[Token], object: &str) -> Result<Vec<String>> {
+        let mut c = Cursor::new(tokens);
+        c.kws(&["ALTER", "TABLE"]);
+        c.kw("ONLY");
+        let name = c.name()?;
+        let schema = schema_of(&name).to_string();
+        if self.table(&name).is_none() {
+            return Err(Error::new(format!("relation \"{name}\" does not exist")));
+        }
+        let mut notices = Vec::new();
+        if c.kws(&["VALIDATE", "CONSTRAINT"]) {
+            let n = c.ident()?;
+            end(&c, &format!("ALTER TABLE {name}"))?;
+            let t = self.table_mut(&name).unwrap();
+            let k = t.checks.iter_mut().find(|k| k.name == n).ok_or_else(|| {
+                Error::new(format!(
+                    "constraint \"{n}\" of relation \"{name}\" does not exist"
+                ))
+            })?;
+            k.valid = true;
+            return Ok(notices);
+        }
+        if !c.kw("ADD") {
+            return Err(Error::new(format!(
+                "ALTER TABLE {object}: only ADD CHECK, VALIDATE CONSTRAINT and CLUSTER ON are read"
+            )));
+        }
+        let given = if c.kw("CONSTRAINT") {
+            Some(c.ident()?)
+        } else {
+            None
+        };
+        if !c.kw("CHECK") {
+            return Err(Error::new(format!(
+                "ALTER TABLE {object} ADD {}: only a CHECK is added",
+                c.rest()
+            )));
+        }
+        let expr = expression(&c.group()?)?;
+        let mut valid = true;
+        let mut enforced = true;
+        while !c.done() {
+            if c.kws(&["NOT", "VALID"]) {
+                valid = false;
+            } else if c.kws(&["NOT", "ENFORCED"]) {
+                enforced = false;
+            } else if c.kw("ENFORCED") {
+            } else if c.kws(&["NO", "INHERIT"]) {
+                notices.push(format!(
+                    "{name}: NO INHERIT is read, and does nothing: no table of a snail inherits"
+                ));
+            } else {
+                return Err(Error::new(format!(
+                    "ALTER TABLE {name} ADD CHECK: {} is not read",
+                    c.rest()
+                )));
+            }
+        }
+        let t = self.table(&name).unwrap();
+        for r in references(&expr) {
+            if !t.columns.iter().any(|x| x.name == r) {
+                return Err(Error::new(format!("column \"{r}\" does not exist")));
+            }
+        }
+        let n = match given {
+            Some(n) => {
+                if t.checks.iter().any(|k| k.name == n) || self.constraint(&schema, &n) {
+                    return Err(Error::new(format!(
+                        "constraint \"{n}\" for relation \"{name}\" already exists"
+                    )));
+                }
+                n
+            }
+            None => {
+                let refs = references(&expr);
+                let col = match refs.as_slice() {
+                    [one] => Some(one.as_str()),
+                    _ => None,
+                };
+                choose(bare(&name), col, "check", &|n| self.constraint(&schema, n))
+            }
+        };
+        self.check_names.push(qualified(&schema, &n));
+        self.table_mut(&name).unwrap().checks.push(Check {
+            name: n,
+            expr,
+            enforced,
+            valid: valid && enforced,
+        });
+        Ok(notices)
     }
 
     fn create_table(
@@ -2588,10 +2680,12 @@ impl Draft {
                 }
             };
             used.push(n.clone());
+            // PostgreSQL marks a CHECK NOT ENFORCED never validated.
             table_checks.push(Check {
                 name: n,
                 expr,
                 enforced,
+                valid: enforced,
             });
         }
         for n in &used {
@@ -3100,6 +3194,7 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
             fact("constraint", &obj, "type", "c".into());
             fact("constraint", &obj, "check", k.expr.to_string());
             fact("constraint", &obj, "enforced", truth(k.enforced));
+            fact("constraint", &obj, "validated", truth(k.valid));
         }
     }
     for ty in &c.types {
@@ -3515,6 +3610,17 @@ pub(crate) fn declares(sql: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// A relation's name as text, as PostgreSQL's regclass reads it: its parts folded unless quoted.
+pub(crate) fn regclass(text: &str) -> Result<String> {
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, text).tokenize()?;
+    let mut c = Cursor::new(&tokens);
+    let name = c.name()?;
+    if !c.done() {
+        return Err(Error::new(format!("'{text}' is no relation's name")));
+    }
+    Ok(name)
+}
 /// The table a CREATE INDEX is on.
 fn index_on(text: &str) -> Option<String> {
     let tokens = Tokenizer::new(&PostgreSqlDialect {}, text)
@@ -3597,7 +3703,7 @@ pub(crate) fn ddl_of(catalog: &Catalog, table: &str) -> Result<String> {
             "CREATE INDEX" | "CREATE UNIQUE INDEX" => {
                 index_on(&written(&tokens)).as_deref() == Some(table)
             }
-            "ALTER TABLE" => cluster_on(&tokens).is_some_and(|(t, _)| t == table),
+            "ALTER TABLE" => object == table,
             _ => false,
         };
         if keep {

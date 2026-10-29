@@ -299,11 +299,11 @@ fn a_boolean_is_written_as_postgresql_reads_its_input() {
     for (refused, why) in [
         (
             "INSERT INTO s.flags (id, v, w) SELECT f.id, f.id, f.w FROM s.flags f WHERE f.id = 1",
-            "s.flags.v is boolean, and the answer gives Int32",
+            "column \"v\" is of type boolean but expression is of type integer",
         ),
         (
             "INSERT INTO s.flags (v, id, w) SELECT f.w, f.w, f.w FROM s.flags f WHERE f.id = 1",
-            "s.flags.id is integer, and the answer gives Boolean",
+            "column \"id\" is of type integer but expression is of type boolean",
         ),
     ] {
         let e = w.execute(refused).err().unwrap().to_string();

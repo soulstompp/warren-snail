@@ -421,6 +421,12 @@ impl From<'_> {
             }
         }
         match found.as_slice() {
+            [(side, Shape::Column(c))] if self.table(*side).columns[*c].is_virtual() => {
+                Err(Error::new(format!(
+                    "{e} is a virtual generated column, computed at the read from the columns the \
+                     table stores: a scan reads only those"
+                )))
+            }
             [one] => Ok(*one),
             [] => Err(first_error.unwrap_or_else(|| Error::new(format!("{e} reads no table")))),
             _ => Err(Error::new(format!(

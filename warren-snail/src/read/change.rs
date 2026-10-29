@@ -5,9 +5,10 @@
 //! its dead rows dropped, and cut again. Every page changed is written to a fresh page, the directory
 //! up to its top, and the commit is the root.
 
+use super::fill;
 use super::statement::{self, Datum, Fill, Row, Source, Statement};
 use super::{Snail, Wasted};
-use crate::catalog::{Catalog, ColumnType, Level, Order, Table};
+use crate::catalog::{assignable, Catalog, ColumnType, Level, Order, Table};
 use crate::cut::ROW_GROUP_ROWS;
 use crate::directory::{
     build_from, decode_page, decode_top, encode_page, encode_top, map_child, maps_held, pack,
@@ -15,7 +16,8 @@ use crate::directory::{
 };
 use crate::encode::{decode, descriptor, tail_pages};
 use crate::file::{
-    decode_free, encode_free, Extent, Place, Root, Run, Writer, FORMAT_SEVEN, STAGED,
+    decode_free, decode_sequences, encode_free, encode_sequences, Extent, Place, Root, Run, Writer,
+    FORMAT_SEVEN, STAGED,
 };
 use crate::lock;
 
@@ -103,6 +105,8 @@ pub(super) struct Declared {
     from: Extent,
     ddl: String,
     made: Vec<(String, String)>,
+    /// The sequences it made or restarted, which stand where the DDL leaves them.
+    resets: Vec<String>,
 }
 
 /// A directory page read on the way down, and the pages under it read too.
@@ -204,6 +208,122 @@ fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
+/// The type of an answer's column, as the snail answers a column of that type.
+fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
+    use arrow::datatypes::DataType as A;
+    Ok(match dt {
+        A::Int16 => ColumnType::Int2,
+        A::Int32 => ColumnType::Int4,
+        A::Int64 => ColumnType::Int8,
+        A::Timestamp(..) => ColumnType::Timestamptz,
+        A::Utf8 | A::LargeUtf8 | A::Utf8View => ColumnType::Text(None),
+        A::Binary | A::LargeBinary | A::BinaryView => ColumnType::Bytes,
+        A::Boolean => ColumnType::Boolean,
+        A::Decimal128(p, s) => ColumnType::Numeric {
+            precision: (*p).min(18),
+            scale: (*s).max(0) as u8,
+        },
+        other => {
+            return Err(Error::new(format!(
+                "an answer of {other} is not read back as a row"
+            )))
+        }
+    })
+}
+
+/// Rows of a table's stored columns widened to all its columns, a virtual one NULL.
+fn widen(table: &Table, rows: Vec<Row>) -> Vec<Row> {
+    if !table.columns.iter().any(|c| c.is_virtual()) {
+        return rows;
+    }
+    rows.into_iter()
+        .map(|r| {
+            let mut given = r.into_iter();
+            table
+                .columns
+                .iter()
+                .map(|c| {
+                    if c.is_virtual() {
+                        Datum::Null
+                    } else {
+                        given.next().unwrap_or(Datum::Null)
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The sequence a column's DEFAULT draws from: its identity's, or its DEFAULT's nextval.
+fn sequence_of(catalog: &Catalog, col: &crate::catalog::Column) -> Option<String> {
+    if let Some(i) = &col.identity {
+        return Some(i.sequence.clone());
+    }
+    let mut e = col.default.as_ref()?;
+    while let sqlparser::ast::Expr::Nested(x) | sqlparser::ast::Expr::Cast { expr: x, .. } = e {
+        e = x;
+    }
+    let sqlparser::ast::Expr::Function(f) = e else {
+        return None;
+    };
+    let name = crate::catalog::object_name(&f.name).to_lowercase();
+    if name != "nextval" && name != "pg_catalog.nextval" {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(l) = &f.args else {
+        return None;
+    };
+    let mut a = match l.args.first()? {
+        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(a)) => a,
+        _ => return None,
+    };
+    while let sqlparser::ast::Expr::Nested(x) | sqlparser::ast::Expr::Cast { expr: x, .. } = a {
+        a = x;
+    }
+    let sqlparser::ast::Expr::Value(v) = a else {
+        return None;
+    };
+    let sqlparser::ast::Value::SingleQuotedString(text) = &v.value else {
+        return None;
+    };
+    crate::ddl::regclass(text)
+        .ok()
+        .filter(|n| catalog.sequence(n).is_some())
+}
+
+/// The clock a DEFAULT reads, where it reads one: now, current_timestamp, transaction_timestamp,
+/// statement_timestamp or clock_timestamp.
+fn clock_of(e: &sqlparser::ast::Expr) -> Option<String> {
+    let mut e = e;
+    while let sqlparser::ast::Expr::Nested(x) | sqlparser::ast::Expr::Cast { expr: x, .. } = e {
+        e = x;
+    }
+    let sqlparser::ast::Expr::Function(f) = e else {
+        return None;
+    };
+    let name = crate::catalog::object_name(&f.name).to_lowercase();
+    let name = name
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(&name)
+        .to_string();
+    matches!(
+        name.as_str(),
+        "now"
+            | "current_timestamp"
+            | "transaction_timestamp"
+            | "statement_timestamp"
+            | "clock_timestamp"
+    )
+    .then_some(name)
+}
+
+/// The machine's clock now, in microseconds since 1970 UTC.
+pub(super) fn wall_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
 /// Refuses a row a table cannot hold.
 fn check(table: &Table, row: &Row) -> Result<()> {
     if row.len() != table.columns.len() {
@@ -296,6 +416,12 @@ impl Snail {
         } else if self.begun.is_some() && writes {
             self.renew_in_transaction()?;
         }
+        // The clock now() reads is the transaction's, begun at BEGIN or with a statement alone.
+        let at = wall_micros();
+        self.clock.1 = at;
+        if self.begun.is_none() {
+            self.clock.0 = at;
+        }
         self.rounds += 1;
         let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);
         let mut done = Done {
@@ -380,37 +506,54 @@ impl Snail {
             Statement::Insert { table, source } => {
                 let rows = match (source, found.as_ref()) {
                     (_, Some(rows)) => rows.clone(),
-                    (Source::Values(rows), None) => rows,
+                    (Source::Values(rows), None) => {
+                        let given = rows
+                            .into_iter()
+                            .map(|r| r.into_iter().map(Fill::Literal).collect())
+                            .collect();
+                        self.filled(table, given)?
+                    }
+                    (Source::Filled(rows), None) => self.filled(table, rows)?,
                     (Source::Select { question, fill }, None) => {
                         let (batch, _) = self.answer(&question, None)?;
-                        // A boolean is filled only from a boolean, and fills nothing else.
                         let t = &self.catalog.tables[table];
+                        let types: Vec<ColumnType> = batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|f| answer_type(f.data_type()))
+                            .collect::<Result<_>>()?;
+                        // Each column the answer fills takes its value by PostgreSQL's assignment
+                        // casts, checked before any row is read, as PostgreSQL checks them.
                         for (col, f) in t.columns.iter().zip(&fill) {
                             if let Fill::Answer(i) = f {
-                                let given = batch.schema().field(*i).data_type().clone();
-                                if (col.ty == ColumnType::Boolean)
-                                    != (given == arrow::datatypes::DataType::Boolean)
-                                {
+                                if !assignable(types[*i], col.ty) {
                                     return Err(Error::new(format!(
-                                        "{}.{} is {}, and the answer gives {given}",
-                                        t.name,
+                                        "column \"{}\" is of type {} but expression is of type {}",
                                         col.name,
-                                        col.ty.name()
+                                        col.ty.pg_name(),
+                                        types[*i].pg_name()
                                     )));
                                 }
                             }
                         }
-                        rows_of(&batch)?
-                            .into_iter()
-                            .map(|a| {
-                                fill.iter()
-                                    .map(|f| match f {
-                                        Fill::Literal(d) => d.clone(),
-                                        Fill::Answer(i) => a[*i].clone(),
-                                    })
-                                    .collect()
-                            })
-                            .collect()
+                        let mut given = Vec::new();
+                        for a in rows_of(&batch)? {
+                            let mut row = Vec::with_capacity(fill.len());
+                            for (col, f) in t.columns.iter().zip(&fill) {
+                                row.push(match f {
+                                    Fill::Answer(i) => Fill::Literal(fill::assign(
+                                        a[*i].clone(),
+                                        types[*i],
+                                        col.ty,
+                                        &col.name,
+                                    )?),
+                                    other => other.clone(),
+                                });
+                            }
+                            given.push(row);
+                        }
+                        self.filled(table, given)?
                     }
                 };
                 *found = Some(rows.clone());
@@ -420,25 +563,17 @@ impl Snail {
                 done.rows > 0
             }
             Statement::Update { table, find, sets } => {
-                let (batch, _) = self.answer(&find, None)?;
-                let old = self.kept_to(table, rows_of(&batch)?, found);
-                done.rows = old.len() as u64;
-                let changes = old
+                let sets = sets
                     .into_iter()
-                    .map(|o| {
-                        let mut n = o.clone();
-                        for (c, d) in &sets {
-                            n[*c] = d.clone();
-                        }
-                        Change::Replace(o, n)
-                    })
+                    .map(|(c, d)| (c, Fill::Literal(d)))
                     .collect();
-                (done.rewritten, done.orders) = self.apply(table, changes)?;
-                done.rows > 0
+                self.set(table, find, sets, done, found)?
             }
+            Statement::Set { table, find, sets } => self.set(table, find, sets, done, found)?,
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
-                let old = self.kept_to(table, rows_of(&batch)?, found);
+                let t = &self.catalog.tables[table];
+                let old = self.kept_to(table, widen(t, rows_of(&batch)?), found);
                 done.rows = old.len() as u64;
                 (done.rewritten, done.orders) =
                     self.apply(table, old.into_iter().map(Change::Delete).collect())?;
@@ -452,6 +587,268 @@ impl Snail {
                 unreachable!("a transaction's own statements write no rows")
             }
         })
+    }
+
+    /// An UPDATE: each row found given its columns set, to a value or to its DEFAULT, its stored
+    /// generated columns computed again, and its CHECKs checked.
+    fn set(
+        &mut self,
+        table: usize,
+        find: String,
+        sets: Vec<(usize, Fill)>,
+        done: &mut Done,
+        found: &mut Option<Vec<Row>>,
+    ) -> Result<bool> {
+        let t = self.catalog.tables[table].clone();
+        for (c, f) in &sets {
+            let col = &t.columns[*c];
+            let always = col.identity.as_ref().is_some_and(|i| i.always);
+            if (col.generated.is_some() || always) && !matches!(f, Fill::Default) {
+                return Err(Error::new(format!(
+                    "column \"{}\" can only be updated to DEFAULT",
+                    col.name
+                )));
+            }
+        }
+        let (batch, _) = self.answer(&find, None)?;
+        let old = self.kept_to(table, widen(&t, rows_of(&batch)?), found);
+        done.rows = old.len() as u64;
+        let defaults: Vec<usize> = sets
+            .iter()
+            .filter(|(_, f)| matches!(f, Fill::Default))
+            .map(|(c, _)| *c)
+            .collect();
+        let mut drawn = self.draws(&t, defaults.iter().map(|&c| (c, old.len())))?;
+        let mut changes = Vec::with_capacity(old.len());
+        for o in old {
+            let mut n = o.clone();
+            for (c, f) in &sets {
+                n[*c] = match f {
+                    Fill::Literal(d) => d.clone(),
+                    _ => self.default_of(&t, *c, &mut drawn)?,
+                };
+            }
+            fill::generate(&t, &mut n)?;
+            fill::check(&t, &n)?;
+            changes.push(Change::Replace(o, n));
+        }
+        (done.rewritten, done.orders) = self.apply(table, changes)?;
+        Ok(done.rows > 0)
+    }
+
+    /// The rows an INSERT gives, each cell a value or its column's DEFAULT: the DEFAULTs filled,
+    /// a sequence's values drawn once for the statement, the stored generated columns computed and
+    /// the CHECKs checked. A value given to a generated column, or to an identity GENERATED ALWAYS,
+    /// is refused, as PostgreSQL refuses it.
+    fn filled(&mut self, table: usize, rows: Vec<Vec<Fill>>) -> Result<Vec<Row>> {
+        let t = self.catalog.tables[table].clone();
+        for r in &rows {
+            for (col, f) in t.columns.iter().zip(r) {
+                let always = col.identity.as_ref().is_some_and(|i| i.always);
+                if (col.generated.is_some() || always) && !matches!(f, Fill::Default) {
+                    return Err(Error::new(format!(
+                        "cannot insert a non-DEFAULT value into column \"{}\"",
+                        col.name
+                    )));
+                }
+            }
+        }
+        let counts = (0..t.columns.len()).map(|c| {
+            (
+                c,
+                rows.iter()
+                    .filter(|r| matches!(r[c], Fill::Default))
+                    .count(),
+            )
+        });
+        let mut drawn = self.draws(&t, counts)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut row = Vec::with_capacity(r.len());
+            for (c, f) in r.into_iter().enumerate() {
+                row.push(match f {
+                    Fill::Literal(d) => d,
+                    _ => self.default_of(&t, c, &mut drawn)?,
+                });
+            }
+            fill::generate(&t, &mut row)?;
+            fill::check(&t, &row)?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// The values each column's sequence hands out for the statement, drawn at once: `counts` the
+    /// rows that take each column's DEFAULT.
+    fn draws(
+        &mut self,
+        t: &Table,
+        counts: impl Iterator<Item = (usize, usize)>,
+    ) -> Result<std::collections::HashMap<String, std::collections::VecDeque<i64>>> {
+        let mut need: Vec<(String, usize)> = Vec::new();
+        for (c, n) in counts {
+            if n == 0 {
+                continue;
+            }
+            if let Some(s) = sequence_of(&self.catalog, &t.columns[c]) {
+                match need.iter_mut().find(|(x, _)| *x == s) {
+                    Some(e) => e.1 += n,
+                    None => need.push((s, n)),
+                }
+            }
+        }
+        let mut out = std::collections::HashMap::new();
+        for (s, n) in need {
+            let values = self.draw(&s, n)?;
+            out.insert(s, values.into());
+        }
+        Ok(out)
+    }
+
+    /// A column's DEFAULT for one row: its identity's or its nextval's next value drawn, the clock,
+    /// a literal, or an expression computed; NULL where it has none.
+    fn default_of(
+        &self,
+        t: &Table,
+        c: usize,
+        drawn: &mut std::collections::HashMap<String, std::collections::VecDeque<i64>>,
+    ) -> Result<Datum> {
+        let col = &t.columns[c];
+        if col.generated.is_some() {
+            return Ok(Datum::Null);
+        }
+        if let Some(s) = sequence_of(&self.catalog, col) {
+            let v = drawn
+                .get_mut(&s)
+                .and_then(|q| q.pop_front())
+                .expect("a value drawn for each DEFAULT");
+            return fill::assign(Datum::Int(v), ColumnType::Int8, col.ty, &col.name);
+        }
+        let Some(e) = &col.default else {
+            return Ok(Datum::Null);
+        };
+        if let Some(name) = clock_of(e) {
+            let at = match name.as_str() {
+                "statement_timestamp" => self.clock.1,
+                "clock_timestamp" => wall_micros(),
+                _ => self.clock.0,
+            };
+            return fill::assign(Datum::Int(at), ColumnType::Timestamptz, col.ty, &col.name);
+        }
+        if statement::is_literal(e) {
+            return statement::datum(e, t, c);
+        }
+        fill::assign_value(super::pipeline::eval_on(e, &[], &[])?, col.ty, &col.name)
+    }
+
+    /// The values a sequence hands this writer: those its cache holds first, then a run of CACHE
+    /// values at a time drawn at the root's turn, never given back.
+    fn draw(&mut self, name: &str, n: usize) -> Result<Vec<i64>> {
+        if self
+            .declared
+            .as_ref()
+            .is_some_and(|d| d.resets.iter().any(|r| r == name))
+        {
+            return Err(Error::new(format!(
+                "{name} is declared in this transaction, and hands out values once it is committed"
+            )));
+        }
+        let s = self
+            .catalog
+            .sequence(name)
+            .cloned()
+            .ok_or_else(|| Error::new(format!("relation \"{name}\" does not exist")))?;
+        let held = self.handed.entry(name.to_string()).or_default();
+        let mut out: Vec<i64> = Vec::with_capacity(n);
+        while out.len() < n {
+            match held.pop_front() {
+                Some(v) => out.push(v),
+                None => break,
+            }
+        }
+        if out.len() < n {
+            let missing = n - out.len();
+            let cache = s.cache.max(1) as usize;
+            let chunk = missing.div_ceil(cache) * cache;
+            let fetched = self.advance(&s, chunk, missing)?;
+            out.extend_from_slice(&fetched[..missing]);
+            self.handed
+                .entry(name.to_string())
+                .or_default()
+                .extend(fetched[missing..].iter().copied());
+        }
+        Ok(out)
+    }
+
+    /// Advances a sequence by up to `chunk` values at the root's turn, a commit of its own, as
+    /// PostgreSQL's nextval is never rolled back: at least `need` of them, or refused where a
+    /// sequence that does not cycle runs out first.
+    fn advance(
+        &mut self,
+        s: &crate::catalog::Sequence,
+        chunk: usize,
+        need: usize,
+    ) -> Result<Vec<i64>> {
+        let mut w = self
+            .writer
+            .take()
+            .ok_or_else(|| Error::new("this snail was opened to read; open it to write"))?;
+        let turn = lock::take_root_turn(w.file());
+        let drawn = turn.and_then(|_| {
+            let root = self.reader.peek_root()?;
+            let mut states = if root.sequences.bytes > 0 {
+                decode_sequences(&self.reader.read_extent(root.sequences)?)?
+            } else {
+                Vec::new()
+            };
+            let (mut last, mut called) = states
+                .iter()
+                .find(|x| x.0 == s.name)
+                .map(|x| (x.1, x.2))
+                .unwrap_or((s.last_value, s.is_called));
+            let mut out = Vec::with_capacity(chunk);
+            while out.len() < chunk {
+                let next = if called {
+                    last.checked_add(s.increment)
+                        .filter(|v| *v >= s.min && *v <= s.max)
+                } else {
+                    Some(last)
+                };
+                match next {
+                    Some(v) => last = v,
+                    None if out.len() >= need => break,
+                    None if s.cycle => last = if s.increment > 0 { s.min } else { s.max },
+                    None => {
+                        let (end, bound) = if s.increment > 0 {
+                            ("maximum", s.max)
+                        } else {
+                            ("minimum", s.min)
+                        };
+                        return Err(Error::new(format!(
+                            "nextval: reached {end} value of sequence \"{}\" ({bound})",
+                            s.name.rsplit('.').next().unwrap_or(&s.name)
+                        )));
+                    }
+                }
+                called = true;
+                out.push(last);
+            }
+            states.retain(|x| x.0 != s.name);
+            states.push((s.name.clone(), last, true));
+            self.advancing = Some(states);
+            let rebased = std::mem::take(&mut self.rebased);
+            let declared = self.declared.take();
+            let committed = self.commit_with(&mut w);
+            self.rebased = rebased;
+            self.declared = declared;
+            self.advancing = None;
+            committed.map(|_| out)
+        });
+        let given = lock::give_root_turn(w.file());
+        self.writer = Some(w);
+        let out = drawn?;
+        given?;
+        Ok(out)
     }
 
     /// The rows an UPDATE or a DELETE finds: the first time, every one, kept as `found`; run again,
@@ -716,6 +1113,12 @@ impl Snail {
             }
             gone.push(root.catalog);
             root.catalog = w.place(d.ddl.as_bytes())?;
+            if !d.resets.is_empty() && root.sequences.bytes > 0 {
+                let mut states = decode_sequences(&self.reader.read_extent(root.sequences)?)?;
+                states.retain(|s| !d.resets.contains(&s.0));
+                gone.push(root.sequences);
+                root.sequences = w.place(&encode_sequences(&states))?;
+            }
             let touched: Vec<&String> = d.made.iter().map(|(t, _)| t).collect();
             let mut orders = Vec::new();
             for (t, o, e) in std::mem::take(&mut root.orders) {
@@ -739,6 +1142,13 @@ impl Snail {
                 }
             }
             root.orders = orders;
+        }
+        // The sequences a statement advanced, at the root's turn, each where it stands now.
+        if let Some(states) = self.advancing.take() {
+            if root.sequences.bytes > 0 {
+                gone.push(root.sequences);
+            }
+            root.sequences = w.place(&encode_sequences(&states))?;
         }
         let rebased = std::mem::take(&mut self.rebased);
         for ((ti, oi), blocks) in rebased {
@@ -1701,9 +2111,11 @@ impl Snail {
     /// orders as written.
     fn declare(&mut self, ddl: &str) -> Result<()> {
         let text = format!("{}\n{ddl};\n", self.catalog.ddl.trim_end());
-        let catalog = Catalog::parse(&text)?;
+        let mut catalog = Catalog::parse(&text)?;
+        super::old_names(&mut catalog, self.reader.format());
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
+        crate::file::holds_catalog(self.reader.format(), &catalog)?;
         for t in &catalog.tables {
             crate::file::holds(self.reader.format(), t)?;
             let old = self.catalog.tables.iter().find(|x| x.name == t.name);
@@ -1739,6 +2151,37 @@ impl Snail {
                     )));
                 }
             }
+            // A CHECK added valid, or validated, is checked against the rows the table holds.
+            if let Some(o) = old {
+                for k in t.checks.iter().filter(|k| k.valid && k.enforced) {
+                    if o.checks.iter().any(|x| x.name == k.name && x.valid) {
+                        continue;
+                    }
+                    let columns = t
+                        .columns
+                        .iter()
+                        .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let q = format!(
+                        "WITH r AS (SELECT {columns} FROM {}) SELECT count(*) AS n FROM r WHERE ({}) IS FALSE",
+                        t.name, k.expr
+                    );
+                    let (b, _) = self.answer(&q, None)?;
+                    let n = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .map_or(0, |a| a.value(0));
+                    if n > 0 {
+                        return Err(Error::new(format!(
+                            "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                            k.name,
+                            t.name.rsplit('.').next().unwrap_or(&t.name)
+                        )));
+                    }
+                }
+            }
         }
         let mut stage = self.reader.stage();
         let mut orders: Vec<(String, String, Extent)> = self
@@ -1757,12 +2200,29 @@ impl Snail {
         let from = self.declared.as_ref().map_or(self.root.catalog, |d| d.from);
         self.root.catalog = stage.place(text.as_bytes())?;
         self.root.orders = orders;
+        // A sequence made or restarted stands where its DDL leaves it, whatever the file kept.
+        let resets: Vec<String> = catalog
+            .sequences
+            .iter()
+            .filter(|s| {
+                self.catalog
+                    .sequence(&s.name)
+                    .is_none_or(|o| (o.last_value, o.is_called) != (s.last_value, s.is_called))
+            })
+            .map(|s| s.name.clone())
+            .collect();
         self.catalog = catalog;
         let d = self.declared.get_or_insert(Declared {
             from,
             ddl: String::new(),
             made: Vec::new(),
+            resets: Vec::new(),
         });
+        for r in resets {
+            if !d.resets.contains(&r) {
+                d.resets.push(r);
+            }
+        }
         d.ddl = text;
         for m in made {
             if !d.made.contains(&m) {
