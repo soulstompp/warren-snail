@@ -2,7 +2,7 @@
 //! from a question, rows a question finds updated or deleted, and the statements that begin and end
 //! a transaction.
 
-use super::question::{instant, number, text_literal};
+use super::question::{instant, number, text_literal, truth_literal};
 use crate::catalog::{ident, object_name, Catalog, ColumnType, Table};
 use crate::{Error, Result};
 use sqlparser::ast::{
@@ -142,6 +142,7 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
     let col = &table.columns[c];
     let wrong = || Error::new(format!("{e} is not a value of {}.{}", table.name, col.name));
     Ok(match col.ty {
+        ColumnType::Boolean => Datum::Int(truth_literal(e).map_err(|_| wrong())?),
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => {
             let v = number(e).ok_or_else(wrong)?;
             let fits = match col.ty {

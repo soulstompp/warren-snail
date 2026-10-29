@@ -30,8 +30,8 @@ use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, write_block, Laid, Rows};
 use crate::{Error, Result};
 use arrow::array::{
-    Array, BinaryArray, Decimal128Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Decimal128Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use parquet::data_type::ByteArray;
 use std::collections::BTreeMap;
@@ -175,6 +175,8 @@ fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Datum::Null
+            } else if let Some(x) = any.downcast_ref::<BooleanArray>() {
+                Datum::Int(x.value(r) as i64)
             } else if let Some(x) = any.downcast_ref::<Int16Array>() {
                 Datum::Int(x.value(r) as i64)
             } else if let Some(x) = any.downcast_ref::<Int32Array>() {
@@ -219,6 +221,9 @@ fn check(table: &Table, row: &Row) -> Result<()> {
                 return Err(what("is NOT NULL and the row holds NULL".into()))
             }
             (_, Datum::Null) => {}
+            (ColumnType::Boolean, Datum::Int(v)) if !(0..=1).contains(v) => {
+                return Err(what(format!("{v} is not a boolean")))
+            }
             (ColumnType::Int2, Datum::Int(v)) if i16::try_from(*v).is_err() => {
                 return Err(what(format!("{v} is out of range")))
             }
@@ -1681,6 +1686,7 @@ impl Snail {
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         for t in &catalog.tables {
+            crate::file::holds(self.reader.format(), t)?;
             let old = self.catalog.tables.iter().find(|x| x.name == t.name);
             let columns_same = old.is_some_and(|o| {
                 o.columns.len() == t.columns.len()

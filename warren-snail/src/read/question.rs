@@ -235,10 +235,46 @@ pub fn instant(s: &str) -> Result<i64> {
     )))
 }
 
+/// A truth as PostgreSQL's boolean input reads it: `true`, `yes`, `on` or `1`, `false`, `no`, `off`
+/// or `0`, or the start of one that names no other, in either case, the white space around it taken
+/// off.
+pub fn truth(s: &str) -> Option<bool> {
+    let s = s
+        .trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
+        .to_ascii_lowercase();
+    let starts = |word: &str, least: usize| s.len() >= least && word.starts_with(s.as_str());
+    match s.as_bytes().first()? {
+        b't' if starts("true", 1) => Some(true),
+        b'f' if starts("false", 1) => Some(false),
+        b'y' if starts("yes", 1) => Some(true),
+        b'n' if starts("no", 1) => Some(false),
+        b'o' if starts("on", 2) => Some(true),
+        b'o' if starts("off", 2) => Some(false),
+        b'1' if s.len() == 1 => Some(true),
+        b'0' if s.len() == 1 => Some(false),
+        _ => None,
+    }
+}
+
+/// A boolean written out, TRUE or FALSE or a quoted truth, as 1 or 0.
+pub(super) fn truth_literal(e: &Expr) -> Result<i64> {
+    let wrong = || Error::new(format!("{e} is not a boolean"));
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Boolean(b) => Ok(*b as i64),
+            Value::SingleQuotedString(s) => truth(s).map(i64::from).ok_or_else(wrong),
+            _ => Err(wrong()),
+        },
+        Expr::Nested(e) => truth_literal(e),
+        _ => Err(wrong()),
+    }
+}
+
 fn literal(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
     match s {
         Shape::MonthUtc(_) => number(e).ok_or_else(|| Error::new(format!("{e} is not a month"))),
         Shape::Column(c) => match table.columns[c].ty {
+            ColumnType::Boolean => truth_literal(e),
             ColumnType::Timestamptz => {
                 instant(&text_literal(e).map_err(|_| Error::new(format!("{e} is not an instant")))?)
             }
@@ -298,6 +334,40 @@ pub(super) fn text_literal(e: &Expr) -> Result<String> {
         },
         Expr::Nested(e) => text_literal(e),
         _ => Err(Error::new(format!("{e} is not text"))),
+    }
+}
+
+/// A condition's values on a column kept to those of `iv` as well.
+fn merge(conds: &mut Vec<(Shape, Interval)>, s: Shape, iv: Interval) {
+    match conds.iter_mut().find(|(x, _)| *x == s) {
+        Some((_, have)) => {
+            *have = Interval {
+                lo: have.lo.max(iv.lo),
+                hi: have.hi.min(iv.hi),
+            }
+        }
+        None => conds.push((s, iv)),
+    }
+}
+
+/// A boolean column standing as a condition, alone, under NOT, or under IS TRUE or IS FALSE: its side,
+/// its column, and the value, 1 or 0, the rows it keeps hold. Each keeps what `= true` or `= false`
+/// keeps, a NULL among neither.
+fn truth_test(from: &From, e: &Expr) -> Option<(usize, usize, i64)> {
+    let (x, v) = match e {
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => (expr.as_ref(), 0),
+        Expr::IsTrue(x) => (x.as_ref(), 1),
+        Expr::IsFalse(x) => (x.as_ref(), 0),
+        x => (x, 1),
+    };
+    match from.resolve(x) {
+        Ok((side, Shape::Column(c))) if from.table(side).columns[c].ty == ColumnType::Boolean => {
+            Some((side, c, v))
+        }
+        _ => None,
     }
 }
 
@@ -611,6 +681,14 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         .collect();
     let mut join: Vec<(usize, usize)> = Vec::new();
     for p in parts {
+        if let Some((side, c, v)) = truth_test(&from, p) {
+            merge(
+                &mut sides[side].conds,
+                Shape::Column(c),
+                Interval { lo: v, hi: v },
+            );
+            continue;
+        }
         let (left, op, right) = match p {
             Expr::BinaryOp { left, op, right } => (left.as_ref(), op.clone(), right.as_ref()),
             other => {
@@ -712,15 +790,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             },
             other => return Err(Error::new(format!("the comparison {other} is not read"))),
         };
-        match here.conds.iter_mut().find(|(x, _)| *x == s) {
-            Some((_, have)) => {
-                *have = Interval {
-                    lo: have.lo.max(iv.lo),
-                    hi: have.hi.min(iv.hi),
-                }
-            }
-            None => here.conds.push((s, iv)),
-        }
+        merge(&mut here.conds, s, iv);
     }
     if sides.len() == 2 && join.is_empty() {
         return Err(Error::new("two tables are joined on no key"));
@@ -735,4 +805,38 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         select,
         order,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truth;
+
+    #[test]
+    fn a_truth_is_read_as_postgresql_reads_a_boolean() {
+        for (s, want) in [
+            ("true", true),
+            ("t", true),
+            ("TrU", true),
+            (" TRUE ", true),
+            ("yes", true),
+            ("y", true),
+            ("on", true),
+            ("1", true),
+            ("\ttrue\n", true),
+            ("false", false),
+            ("F", false),
+            ("no", false),
+            ("n", false),
+            ("off", false),
+            ("of", false),
+            ("0", false),
+        ] {
+            assert_eq!(truth(s), Some(want), "{s:?}");
+        }
+        for s in [
+            "", " ", "o", "truex", "yess", "onn", "2", "01", "tr ue", "nope", "ja",
+        ] {
+            assert_eq!(truth(s), None, "{s:?}");
+        }
+    }
 }

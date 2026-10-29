@@ -356,8 +356,9 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
         },
         "boolean" | "bool" => match v {
             Value::Bool(b) => Value::Bool(b),
-            Value::Text(t) if t == "true" || t == "t" => Value::Bool(true),
-            Value::Text(t) if t == "false" || t == "f" => Value::Bool(false),
+            Value::Text(t) => Value::Bool(super::question::truth(&t).ok_or_else(|| {
+                Error::new(format!("invalid input syntax for type boolean: \"{t}\""))
+            })?),
             other => return Err(Error::new(format!("{other:?} cast to boolean"))),
         },
         _ => return Err(Error::new(format!("a cast to {to} is not read"))),

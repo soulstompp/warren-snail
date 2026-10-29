@@ -11,7 +11,7 @@ use parquet::basic::{
 use parquet::column::page::{Page, PageReader};
 use parquet::column::reader::{get_column_reader, get_typed_column_reader};
 use parquet::column::writer::{ColumnCloseResult, ColumnWriterImpl};
-use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
+use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
 use parquet::file::metadata::ColumnChunkMetaData;
 use parquet::file::properties::{WriterProperties, WriterVersion};
 use parquet::file::serialized_reader::SerializedPageReader;
@@ -93,6 +93,7 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
                 precision: precision as i32,
             }),
         ),
+        ColumnType::Boolean => (PhysicalType::BOOLEAN, None),
     };
     let repetition = if nullable {
         Repetition::OPTIONAL
@@ -174,6 +175,9 @@ fn write(
         (Values::Int(v), PhysicalType::INT64) => {
             write_typed::<Int64Type, i64>(desc, p, v, rows_per_page, |&x| x)?
         }
+        (Values::Int(v), PhysicalType::BOOLEAN) => {
+            write_typed::<BoolType, i64>(desc, p, v, rows_per_page, |&x| x != 0)?
+        }
         (Values::Text(v), PhysicalType::BYTE_ARRAY) => {
             write_typed::<ByteArrayType, String>(desc, p, v, rows_per_page, |s| {
                 ByteArray::from(s.as_str())
@@ -246,16 +250,19 @@ fn fitted(
     )))
 }
 
-/// The bits a value takes written plain: a number its width, text its bytes and its length on the
-/// mean of the values present.
+/// The bits a row's value takes written plain, on the mean of the rows: a number its width, text its
+/// bytes and its length, a NULL none.
 fn plain_bits(values: &Values, ty: ColumnType) -> usize {
-    match ty.width() {
-        Some(w) => w * 8,
-        None => {
-            let present = (values.len() - values.nulls()).max(1) as u64;
-            ((values.bytes() + LENGTH_PREFIX * present).div_ceil(present) * 8) as usize
-        }
+    let rows = values.len().max(1) as u64;
+    let present = (values.len() - values.nulls()) as u64;
+    if let Some(bits) = ty.thin_bits() {
+        return (present * bits).div_ceil(rows) as usize;
     }
+    let bytes = match ty.width() {
+        Some(w) => present * w as u64,
+        None => values.bytes() + LENGTH_PREFIX * present,
+    };
+    (bytes.div_ceil(rows) * 8) as usize
 }
 
 /// The distinct values present, and the bytes a dictionary of them takes written plain.
@@ -304,8 +311,9 @@ pub fn encode(desc: &ColumnDescPtr, ty: ColumnType, values: &Values, k: usize) -
         k,
         guess(k, plain_bits(values, ty), nullable),
     )?;
+    // Parquet writes a boolean without a dictionary.
     let (count, bytes) = distinct(values, ty);
-    if count == 0 || bytes > DICTIONARY_BYTES {
+    if count == 0 || bytes > DICTIONARY_BYTES || ty == ColumnType::Boolean {
         return Ok(plain);
     }
     let bits = (usize::BITS - (count.max(2) - 1).leading_zeros()) as usize;
@@ -392,6 +400,19 @@ pub fn decode(
         ColumnType::Int2 | ColumnType::Int4 => {
             let mut r = get_typed_column_reader::<Int32Type>(column);
             let mut v: Vec<i32> = Vec::new();
+            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            if n != rows {
+                return Err(short(n));
+            }
+            Ok(Values::Int(spread(
+                v.into_iter().map(i64::from),
+                &defs,
+                nullable,
+            )))
+        }
+        ColumnType::Boolean => {
+            let mut r = get_typed_column_reader::<BoolType>(column);
+            let mut v: Vec<bool> = Vec::new();
             let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
             if n != rows {
                 return Err(short(n));

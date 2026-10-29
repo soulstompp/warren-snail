@@ -7,8 +7,8 @@ use super::question::{Countable, Item, Key, Select, Sort};
 use crate::catalog::{ColumnType, Table};
 use crate::Result;
 use arrow::array::{
-    ArrayRef, BinaryArray, Decimal128Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    RecordBatchOptions, StringArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, RecordBatchOptions, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::data_type::ByteArray;
@@ -462,6 +462,9 @@ impl Answer {
                 Item::Key(Key::Column(c)) => {
                     let col = &tables[c.side].columns[c.column];
                     let a: ArrayRef = match col.ty {
+                        ColumnType::Boolean => {
+                            Arc::new(ints().map(|v| v.map(|x| x != 0)).collect::<BooleanArray>())
+                        }
                         ColumnType::Int2 => {
                             Arc::new(ints().map(|v| v.map(|x| x as i16)).collect::<Int16Array>())
                         }

@@ -30,16 +30,27 @@ pub enum ColumnType {
         precision: u8,
         scale: u8,
     },
+    /// A boolean, false before true, packed a bit a row.
+    Boolean,
 }
 
 impl ColumnType {
-    /// Bytes a value takes, plain, where every value takes the same.
+    /// Bytes a value takes, plain, where every value takes the same: what the file writes, so a
+    /// smallint, written as Parquet's INT32, takes 4.
     pub fn width(self) -> Option<usize> {
         match self {
-            ColumnType::Int2 => Some(2),
-            ColumnType::Int4 => Some(4),
+            ColumnType::Int2 | ColumnType::Int4 => Some(4),
             ColumnType::Int8 | ColumnType::Timestamptz | ColumnType::Numeric { .. } => Some(8),
-            ColumnType::Text(_) | ColumnType::Bytes => None,
+            ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Boolean => None,
+        }
+    }
+
+    /// The bits a value takes where the type is narrower than 4 bytes, so that the cut passes over
+    /// it.
+    pub fn thin_bits(self) -> Option<u64> {
+        match self {
+            ColumnType::Boolean => Some(1),
+            _ => None,
         }
     }
 
@@ -63,6 +74,7 @@ impl ColumnType {
             ColumnType::Text(Some(n)) => format!("varchar({n})"),
             ColumnType::Bytes => "bytea".into(),
             ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
+            ColumnType::Boolean => "boolean".into(),
         }
     }
 }
@@ -227,6 +239,7 @@ fn column_type(dt: &DataType) -> Result<ColumnType> {
             }
         }),
         DataType::Bytea => ColumnType::Bytes,
+        DataType::Boolean | DataType::Bool => ColumnType::Boolean,
         DataType::Numeric(info) | DataType::Decimal(info) => {
             let (p, s) = match info {
                 ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),

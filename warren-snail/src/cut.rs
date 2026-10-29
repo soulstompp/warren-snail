@@ -33,6 +33,16 @@ impl Block {
 pub enum Width {
     Fixed(usize),
     Varying(Vec<u64>),
+    /// A column the cut passes over, a boolean or a fixed form under 4 bytes: the bits of its values
+    /// summed from the order's first row, a NULL taking none.
+    Bits(Vec<u64>),
+    /// A column holding a NULL: each row's bytes summed from the order's first row, a NULL taking
+    /// none, and its NULLs summed the same way. It decides rows that hold none of its NULLs, and rows
+    /// its values fill a page of.
+    Nulls {
+        bytes: Vec<u64>,
+        nulls: Vec<u64>,
+    },
 }
 
 /// Each column an order holds, as it is written plain.
@@ -44,21 +54,58 @@ impl Widths {
     pub fn bytes(&self, s: usize, a: usize, b: usize) -> u64 {
         match &self.0[s] {
             Width::Fixed(w) => ((b - a) * w) as u64,
-            Width::Varying(sum) => sum[b] - sum[a],
+            Width::Varying(sum) | Width::Nulls { bytes: sum, .. } => sum[b] - sum[a],
+            Width::Bits(sum) => (sum[b] - sum[a]).div_ceil(8),
         }
     }
 
-    /// Whether rows `a..b` fill at least one page of every column.
+    /// Whether rows `a..b` fill at least one page of every column that decides them, and of one
+    /// column at least. A column decides only through its values: a boolean or a fixed form under 4
+    /// bytes never does, and a column holding a NULL among the rows does not where its values there
+    /// fill less than a page.
     pub fn fill(&self, a: usize, b: usize) -> bool {
-        (0..self.0.len()).all(|s| self.bytes(s, a, b) >= PAGE as u64)
+        let mut some = false;
+        for (s, w) in self.0.iter().enumerate() {
+            let full = self.bytes(s, a, b) >= PAGE as u64;
+            some |= full;
+            let decides = match w {
+                Width::Fixed(_) | Width::Varying(_) => true,
+                Width::Bits(_) => false,
+                Width::Nulls { nulls, .. } => nulls[b] == nulls[a],
+            };
+            if decides && !full {
+                return false;
+            }
+        }
+        some
     }
 
     /// The bytes a row of column `s` takes, plain: its width, or the column's bytes over its `rows`.
     pub fn per_row(&self, s: usize, rows: usize) -> usize {
         match &self.0[s] {
             Width::Fixed(w) => *w,
-            Width::Varying(sum) => (*sum.last().unwrap_or(&0) as usize / rows.max(1)).max(1),
+            Width::Varying(sum) | Width::Nulls { bytes: sum, .. } => {
+                (*sum.last().unwrap_or(&0) as usize / rows.max(1)).max(1)
+            }
+            Width::Bits(sum) => (*sum.last().unwrap_or(&0) as usize / 8 / rows.max(1)).max(1),
         }
+    }
+
+    /// The counting unit of column `s` for `most`, the most plain bytes one place of it takes, over
+    /// the order's `rows`: as `unit`, a column of bits capped by the bits its rows take.
+    pub fn unit(&self, s: usize, most: u64, rows: usize) -> usize {
+        let largest = match &self.0[s] {
+            Width::Bits(sum) => {
+                let fits = DATA_PAGE_ROWS as u64 * sum.last().unwrap_or(&0)
+                    / rows.max(1) as u64
+                    / (8 * PAGE as u64);
+                *unit_sizes(fits.clamp(1, DATA_PAGE_PAGES as u64) as usize)
+                    .last()
+                    .unwrap()
+            }
+            _ => largest_unit(self.per_row(s, rows)),
+        };
+        unit_within(most as usize, largest)
     }
 }
 
@@ -217,8 +264,12 @@ pub fn largest_unit(width: usize) -> usize {
 /// The counting unit for `bytes`: the fewest disk pages, of the sizes a unit takes, holding them,
 /// within the caps for its width.
 pub fn unit(bytes: usize, width: usize) -> usize {
+    unit_within(bytes, largest_unit(width))
+}
+
+/// The fewest disk pages, of the sizes a unit takes up to `largest`, holding `bytes`.
+fn unit_within(bytes: usize, largest: usize) -> usize {
     let pages = bytes.div_ceil(PAGE).max(1);
-    let largest = largest_unit(width);
     unit_sizes(largest)
         .into_iter()
         .find(|&k| k >= pages)
@@ -429,5 +480,33 @@ mod tests {
         assert_eq!(largest_unit(8), 36);
         assert_eq!(largest_unit(4), 18);
         assert_eq!(unit(10_000_000, 8), 36);
+    }
+
+    #[test]
+    fn a_column_of_bits_never_decides_yet_a_part_fills_only_a_page_of_some_column() {
+        let c = int_order();
+        let t = &c.tables[0];
+        let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
+        let n = 40_000;
+        let keys = Keys {
+            stride: 1,
+            data: ints(0..n as i64),
+        };
+        let bits = Width::Bits((0..=n as u64).collect());
+        // Beside a 4-byte column the bits never decide: the quarters of 4,096 fill a page of it.
+        let both = cut(
+            &Keys {
+                stride: 1,
+                data: ints(0..4096),
+            },
+            &sublevels,
+            &Widths(vec![Width::Fixed(4), Width::Bits((0..=4096).collect())]),
+        );
+        assert_eq!(both.len(), 4);
+        // Alone, no part of 40,000 rows a bit each fills a page: one block, not a block a row.
+        let alone = cut(&keys, &sublevels, &Widths(vec![bits.clone()]));
+        assert_eq!(alone.len(), 1);
+        // Its caps are reckoned in bits: 20,000 rows a data page are 2,500 bytes, under a page.
+        assert_eq!(Widths(vec![bits]).unit(0, (n / 8) as u64, n), 1);
     }
 }

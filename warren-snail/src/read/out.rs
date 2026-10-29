@@ -52,6 +52,7 @@ impl Extreme {
     fn plain(&self, physical: PhysicalType) -> Vec<u8> {
         match (self, physical) {
             (Extreme::Int(v), PhysicalType::INT32) => (*v as i32).to_le_bytes().to_vec(),
+            (Extreme::Int(v), PhysicalType::BOOLEAN) => vec![*v as u8],
             (Extreme::Int(v), _) => v.to_le_bytes().to_vec(),
             (Extreme::Bytes(b), _) => b.clone(),
         }
@@ -102,6 +103,13 @@ fn statistics(physical: PhysicalType, range: Option<(Extreme, Extreme)>, nulls: 
         PhysicalType::INT64 => {
             Statistics::int64(lo.map(ints), hi.map(ints), None, Some(nulls), false)
         }
+        PhysicalType::BOOLEAN => Statistics::boolean(
+            lo.map(|e| ints(e) != 0),
+            hi.map(|e| ints(e) != 0),
+            None,
+            Some(nulls),
+            false,
+        ),
         _ => {
             let bytes = |e: &Extreme| ByteArray::from(e.plain(physical));
             Statistics::byte_array(lo.map(bytes), hi.map(bytes), None, Some(nulls), false)

@@ -3,7 +3,7 @@
 //! the root.
 
 use crate::catalog::{Catalog, Column, ColumnType, Order, Table};
-use crate::cut::{cut, largest_place, unit, Block, Width, Widths};
+use crate::cut::{cut, largest_place, Block, Width, Widths};
 use crate::directory::{
     build, decode_top, encode_top, ColumnPages, Entry, Head, MapPages, PageEntry, PageMap, Summary,
 };
@@ -15,8 +15,8 @@ use crate::places::{key, month_utc, shown, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, Decimal128Array, Int16Array, Int32Array, Int64Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array, Int16Array, Int32Array,
+    Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
@@ -59,6 +59,10 @@ impl Rows {
                     ))
                 };
                 match (&mut out, c.ty, a.data_type()) {
+                    (Values::Int(out), ColumnType::Boolean, DataType::Boolean) => {
+                        let a = a.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        out.extend(a.iter().map(|v| v.map(i64::from)));
+                    }
                     (Values::Int(out), ColumnType::Int2, DataType::Int16) => {
                         let a = a.as_any().downcast_ref::<Int16Array>().unwrap();
                         out.extend(a.iter().map(|v| v.map(i64::from)));
@@ -432,6 +436,7 @@ fn write_tables(
     };
     let mut out = Vec::new();
     for table in &catalog.tables {
+        crate::file::holds(w.format(), table)?;
         let Some(rows) = tables
             .iter()
             .find(|(n, _)| *n == table.name)
@@ -593,16 +598,25 @@ pub(crate) fn laid_out(
             .iter()
             .map(|&c| {
                 let ty = table.columns[c].ty;
-                match ty.width() {
-                    Some(wd) => Width::Fixed(wd),
-                    None => {
-                        let mut sum = Vec::with_capacity(n + 1);
-                        sum.push(0u64);
-                        for &r in &perm {
-                            sum.push(sum.last().unwrap() + rows.columns[c].plain(r, ty));
-                        }
-                        Width::Varying(sum)
+                let values = &rows.columns[c];
+                let summed = |each: &dyn Fn(usize) -> u64| {
+                    let mut sum = Vec::with_capacity(n + 1);
+                    sum.push(0u64);
+                    for &r in &perm {
+                        sum.push(sum.last().unwrap() + each(r));
                     }
+                    sum
+                };
+                if let Some(bits) = ty.thin_bits() {
+                    return Width::Bits(summed(&|r| if values.is_null(r) { 0 } else { bits }));
+                }
+                match (ty.width(), values.nulls() > 0) {
+                    (Some(wd), false) => Width::Fixed(wd),
+                    (None, false) => Width::Varying(summed(&|r| values.plain(r, ty))),
+                    (_, true) => Width::Nulls {
+                        bytes: summed(&|r| values.plain(r, ty)),
+                        nulls: summed(&|r| values.is_null(r) as u64),
+                    },
                 }
             })
             .collect(),
@@ -639,7 +653,7 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> He
     let (month_slots, text_slots) = slots(table, order);
     Head {
         units: (0..laid.widths.0.len())
-            .map(|s| unit(most[s] as usize, laid.widths.per_row(s, n)) as u32)
+            .map(|s| laid.widths.unit(s, most[s], n) as u32)
             .collect(),
         month_slots,
         text_slots,
@@ -716,7 +730,7 @@ fn write_order(
     } = laid_out(table, order, rows, None)?;
     let most = largest_place(&keys, &blocks, order, table, &widths);
     let units: Vec<usize> = (0..widths.0.len())
-        .map(|s| unit(most[s] as usize, widths.per_row(s, n)))
+        .map(|s| widths.unit(s, most[s], n))
         .collect();
     let descs = order
         .columns

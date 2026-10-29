@@ -151,8 +151,12 @@ impl Values {
         }
     }
 
-    /// The bytes row `i` takes written plain: a number its width, text its bytes and its length.
+    /// The bytes row `i` takes written plain: a number its width, text its bytes and its length, and
+    /// a NULL none.
     pub fn plain(&self, i: usize, ty: ColumnType) -> u64 {
+        if self.is_null(i) {
+            return 0;
+        }
         match (self, ty.width()) {
             (_, Some(w)) => w as u64,
             (Values::Text(v), None) => v[i].as_ref().map_or(0, |s| s.len() as u64 + LENGTH_PREFIX),

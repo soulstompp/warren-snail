@@ -1,9 +1,9 @@
 //! The places of an order's levels, outermost first: the sublevels its blocks are cut on.
 //!
-//! An integer is cut by its bits, the top one first. An instant is cut on the UTC clock by its year,
-//! then its month, day, hour, minute, second and microsecond. A month is cut by the year's halves,
-//! then the month. Text is cut by its bytes, the first one first, a value that has ended coming
-//! before any byte.
+//! An integer is cut by its bits, the top one first, and a boolean on one, false before true. An
+//! instant is cut on the UTC clock by its year, then its month, day, hour, minute, second and
+//! microsecond. A month is cut by the year's halves, then the month. Text is cut by its bytes, the
+//! first one first, a value that has ended coming before any byte.
 
 use crate::catalog::{ColumnType, Level, Order, Table};
 use chrono::{DateTime, Datelike, Timelike};
@@ -97,6 +97,7 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Int4 => 32,
             ColumnType::Int8 | ColumnType::Numeric { .. } => 64,
             ColumnType::Timestamptz => 7,
+            ColumnType::Boolean => 1,
             ColumnType::Text(_) | ColumnType::Bytes => text_sublevels as usize,
         },
     }
@@ -114,7 +115,7 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
         },
         Level::Column(_) => match ty {
             ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric { .. } => {
-                let bits = ty.width().unwrap() * 8;
+                let bits = sublevel_count(level, ty, 0);
                 let low = -(1i128 << (bits - 1));
                 let biased = (key as i128 - low) as u64;
                 ((biased >> (bits - 1 - r)) & 1) as i64
@@ -131,6 +132,7 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
                     _ => key.rem_euclid(1_000_000),
                 }
             }
+            ColumnType::Boolean => key,
             ColumnType::Text(_) | ColumnType::Bytes => unreachable!("a text level keys text"),
         },
     }

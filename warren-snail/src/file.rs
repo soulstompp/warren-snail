@@ -25,6 +25,28 @@ fn reads(format: u32) -> bool {
     format == FORMAT || format == FORMAT_EIGHT || format == FORMAT_SEVEN
 }
 
+/// Refuses a table whose columns a snail of `format` cannot hold: formats 7 and 8 hold the types
+/// 0.1.x held, and no boolean.
+pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result<()> {
+    if format >= FORMAT {
+        return Ok(());
+    }
+    match table
+        .columns
+        .iter()
+        .find(|c| c.ty == crate::catalog::ColumnType::Boolean)
+    {
+        Some(c) => Err(crate::Error::new(format!(
+            "{}.{} is {}, which a snail of format {format} cannot hold: put the snail `out` and \
+             `write` it afresh, in format {FORMAT}",
+            table.name,
+            c.name,
+            c.ty.name()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The pages a file holds before the next begins, unless the snail is made with another span: 1 GiB.
 pub const FILE_PAGES: u64 = 1 << 18;
 
