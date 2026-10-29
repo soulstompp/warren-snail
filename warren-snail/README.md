@@ -532,7 +532,8 @@ Each command exits 0, or prints why it refused and exits 1.
 - `CREATE TABLE`, its columns `NOT NULL` or not, and a `PRIMARY KEY`.
 - Column types: `smallint`, `integer`, `bigint`; `numeric(p, s)` up to 18 digits, held as a
   64-bit integer of its smallest unit; `text` and `varchar(n)`, compared by their bytes; `bytea`;
-  `timestamptz`, as microseconds on UTC's clock, its infinities among them.
+  `timestamptz`, as microseconds on UTC's clock, its infinities among them; `boolean`, false
+  before true, written in any of PostgreSQL's spellings of it.
 - `CREATE INDEX`, a B-tree, its key on columns, on an instant's month,
   `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
   `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is
@@ -544,7 +545,8 @@ Each command exits 0, or prints why it refused and exits 1.
 
 - **A question:** `SELECT` from one table, or two joined by an inner `JOIN … ON` equal columns;
   conditions joined by `AND`, each a column, or an instant's month on the clock, compared with a
-  value by `=`, `<`, `<=`, `>` or `>=`; `count(*)`, and `sum` of an integer or numeric column;
+  value by `=`, `<`, `<=`, `>` or `>=`, or a boolean column alone, under `NOT`, or under `IS TRUE`
+  or `IS FALSE`; `count(*)`, and `sum` of an integer or numeric column;
   `GROUP BY`; `ORDER BY`. A join reads the table its own conditions narrow first, then keeps the
   other to the keys the first holds.
 - **A pipeline,** a question with a `WITH` or a window: steps over one table and the steps before
