@@ -25,7 +25,7 @@ const REUSED_KEPT: usize = 64;
 /// What a transaction answers once one of its statements failed, until it ends, as PostgreSQL does.
 pub(super) const ABORTED: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
-use crate::places::{key, month_utc, KeyValue};
+use crate::places::{key, month_utc, null_key, KeyValue};
 use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, write_block, Laid, Rows};
 use crate::{Error, Result};
@@ -158,10 +158,11 @@ fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
     order
         .levels
         .iter()
-        .map(|&l| match &row[l.column()] {
+        .enumerate()
+        .map(|(li, &l)| match &row[l.column()] {
             Datum::Int(v) => key(l, *v),
             Datum::Text(s) => KeyValue::Text(s.as_str().into()),
-            Datum::Null => unreachable!("a level holds no NULL; checked before"),
+            Datum::Null => null_key(order, li),
             Datum::Bytes(_) => unreachable!("a level holds no bytea; the catalog refuses it"),
         })
         .collect()
@@ -454,8 +455,8 @@ impl Snail {
     }
 
     /// The rows an UPDATE or a DELETE finds: the first time, every one, kept as `found`; run again,
-    /// only those whose key, on the table's first unique order of plain columns or else every
-    /// column, is a key it found the first time.
+    /// only those whose key, on the table's first unique order of plain NOT NULL columns or else
+    /// every column, is a key it found the first time.
     fn kept_to(&self, ti: usize, now: Vec<Row>, found: &mut Option<Vec<Row>>) -> Vec<Row> {
         let Some(first) = found.as_ref() else {
             *found = Some(now.clone());
@@ -470,8 +471,8 @@ impl Snail {
                 o.levels
                     .iter()
                     .map(|l| match l {
-                        Level::Column(c) => Some(*c),
-                        Level::MonthUtc(_) => None,
+                        Level::Column(c) if table.columns[*c].not_null => Some(*c),
+                        _ => None,
                     })
                     .collect::<Option<Vec<usize>>>()
             })
@@ -1103,6 +1104,9 @@ impl Snail {
         if effects.is_empty() {
             return Ok(None);
         }
+        if effects.iter().any(|e| e.key.iter().any(KeyValue::is_null)) {
+            crate::file::keys_null(self.reader.format(), table, order)?;
+        }
         let at = self
             .root
             .orders
@@ -1475,10 +1479,11 @@ impl Snail {
                 .levels
                 .iter()
                 .zip(&level_slots)
-                .map(|(&l, &s)| match datum_at(&columns[s], p) {
+                .enumerate()
+                .map(|(li, (&l, &s))| match datum_at(&columns[s], p) {
                     Datum::Int(v) => key(l, v),
                     Datum::Text(t) => KeyValue::Text(t.into_boxed_str()),
-                    Datum::Null => unreachable!("a level holds no NULL"),
+                    Datum::Null => null_key(order, li),
                     Datum::Bytes(_) => unreachable!("a level holds no bytea"),
                 })
                 .collect()

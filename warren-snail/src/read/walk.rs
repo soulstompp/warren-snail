@@ -8,7 +8,7 @@ use crate::catalog::{Level, Order, Shape, Table};
 use crate::directory::{decode_page, decode_top, Entry, Head, PageMap};
 use crate::encode::{decode_with, descriptor};
 use crate::file::Extent;
-use crate::places::{key, month_of, KeyValue};
+use crate::places::{key, month_of, null_key, KeyValue};
 use crate::values::Values;
 use crate::{Error, Result};
 use std::cmp::Ordering;
@@ -99,7 +99,7 @@ impl KeySet {
         let cmp = |key: &[i64], bound: &[KeyValue]| -> Ordering {
             key.iter()
                 .zip(bound)
-                .map(|(k, b)| k.cmp(&b.int()))
+                .map(|(k, b)| KeyValue::Int(*k).cmp(b))
                 .find(|o| *o != Ordering::Equal)
                 .unwrap_or(Ordering::Equal)
         };
@@ -131,6 +131,8 @@ struct Open {
     rest_may: Vec<usize>,
     /// The conditions on text the entry may hold.
     text_may: Vec<usize>,
+    /// The tests for NULL the entry's counts leave open.
+    null_may: Vec<usize>,
     /// The columns the round reads under it.
     slots: Vec<usize>,
 }
@@ -146,6 +148,8 @@ pub struct Walk {
     rest: Vec<(Shape, Interval)>,
     /// The conditions on text no level fixes, by their place among the side's.
     pub(super) texts: Vec<usize>,
+    /// The tests for NULL no level fixes, by their place among the side's.
+    nulls: Vec<usize>,
     /// How many leading levels are the join's columns another table's keys restrict, or 0.
     keyed: usize,
     /// The entries left open, all on one level.
@@ -200,6 +204,7 @@ struct BlockRead {
     interval_may: bool,
     rest_may: Vec<usize>,
     text_may: Vec<usize>,
+    null_may: Vec<usize>,
     /// For every column read, its slot and the pages read of it, ascending.
     reads: Vec<(usize, Vec<usize>)>,
 }
@@ -261,6 +266,7 @@ pub fn condition_columns(side: &Side) -> Vec<usize> {
         .iter()
         .map(|(s, _)| s_column(*s))
         .chain(side.texts.iter().map(|t| t.column))
+        .chain(side.nulls.iter().map(|&(c, _)| c))
         .collect()
 }
 
@@ -289,10 +295,19 @@ impl Snail {
         let (head, entries, pages) = self.top(want.table, oi)?;
         let conds = &want.side.conds;
         let texts = &want.side.texts;
+        let nulls = &want.side.nulls;
         let mut used = vec![false; conds.len()];
         let mut used_texts = vec![false; texts.len()];
+        let mut used_nulls = vec![false; nulls.len()];
         let (mut lo, mut hi) = (Vec::new(), Vec::new());
-        for l in &order.levels {
+        for (li, l) in order.levels.iter().enumerate() {
+            // A level is fixed on its NULL rows' own run by IS NULL on its column.
+            if let Some(i) = nulls.iter().position(|&n| n == (l.column(), true)) {
+                used_nulls[i] = true;
+                lo.push(null_key(order, li));
+                hi.push(null_key(order, li));
+                continue;
+            }
             // A text level is fixed by an equality on it; a range on text stays a condition to read.
             if let Level::Column(c) = *l {
                 if want.table.columns[c].ty.is_text() {
@@ -338,6 +353,7 @@ impl Snail {
             .map(|(c, _)| *c)
             .collect();
         let texts: Vec<usize> = (0..texts.len()).filter(|&i| !used_texts[i]).collect();
+        let nulls: Vec<usize> = (0..nulls.len()).filter(|&i| !used_nulls[i]).collect();
         let keyed = match want.keys {
             Some(k)
                 if order.levels.len() >= k.columns.len()
@@ -360,6 +376,7 @@ impl Snail {
             hi,
             rest,
             texts,
+            nulls,
             keyed,
             open: Vec::new(),
             level,
@@ -421,7 +438,7 @@ impl Snail {
                 walk.directory_pages += pages;
             }
             let map = PageMap::decode(&held.as_ref().unwrap().1[at..], &walk.head.level_text)?;
-            rows_estimate += estimate(&o, &map, &walk, order);
+            rows_estimate += estimate(&o, &map, &walk, order, &want.side.nulls);
             let mut block_reads = Vec::new();
             let mut waste = 0u64;
             for &s in &o.slots {
@@ -491,6 +508,7 @@ impl Snail {
                 interval_may: o.interval_may,
                 rest_may: o.rest_may,
                 text_may: o.text_may,
+                null_may: o.null_may,
                 reads: block_reads,
             });
         }
@@ -655,6 +673,15 @@ impl Snail {
                         (t, start, v)
                     })
                     .collect();
+                let nulls: Vec<(bool, usize, &Values)> = br
+                    .null_may
+                    .iter()
+                    .map(|&ni| {
+                        let (c, null) = want.side.nulls[ni];
+                        let (start, v) = run(slot_of(c));
+                        (null, start, v)
+                    })
+                    .collect();
                 let outs: Vec<(bool, bool, usize, &Values)> = columns
                     .iter()
                     .map(|&(c, month)| {
@@ -667,12 +694,26 @@ impl Snail {
                     sink.dictionaries(&dicts);
                     sent = dicts;
                 }
-                // How a row's fixed levels compare with a bound, level by level.
+                // How a row's fixed levels compare with a bound, level by level, a NULL lying on its
+                // level's side.
                 let against = |r: usize, bound: &[KeyValue]| -> Ordering {
-                    for ((l, is_text, start, v), b) in levels.iter().zip(bound) {
-                        let ord = match (is_text, b) {
-                            (true, KeyValue::Text(t)) => v.text(r - start).unwrap_or("").cmp(&**t),
-                            (_, KeyValue::Int(x)) => v
+                    for (li, ((l, is_text, start, v), b)) in levels.iter().zip(bound).enumerate() {
+                        let null = KeyValue::Null {
+                            first: order.nulls_first[li],
+                        };
+                        let ord = match (v.is_null(r - start), is_text, b) {
+                            (true, _, _) => null.cmp(b),
+                            (false, _, KeyValue::Null { first }) => {
+                                if *first {
+                                    Ordering::Greater
+                                } else {
+                                    Ordering::Less
+                                }
+                            }
+                            (false, true, KeyValue::Text(t)) => {
+                                v.text(r - start).unwrap_or("").cmp(&**t)
+                            }
+                            (false, _, KeyValue::Int(x)) => v
                                 .int(r - start)
                                 .map_or(i64::MIN, |y| key(*l, y).int())
                                 .cmp(x),
@@ -687,9 +728,14 @@ impl Snail {
                 // Where the other side's keys lead the order, the rows of the block's sorted part that
                 // hold them are found by their keys, and no other row of that part is visited.
                 let spans = match want.keys {
-                    Some(k) if lead > 0 && walk.keyed == lead => {
-                        keyed_spans(k, &outs[..lead], from, to, br.map.sorted as usize)
-                    }
+                    Some(k) if lead > 0 && walk.keyed == lead => keyed_spans(
+                        k,
+                        &outs[..lead],
+                        &order.nulls_first[..lead],
+                        from,
+                        to,
+                        br.map.sorted as usize,
+                    ),
                     _ => vec![(from, to)],
                 };
                 for (a, b) in spans {
@@ -699,6 +745,7 @@ impl Snail {
                         && !br.interval_may
                         && rests.is_empty()
                         && texts.is_empty()
+                        && nulls.is_empty()
                         && dead.get(d).is_none_or(|&x| x as usize >= b)
                         && sink.run(&outs, a, b)
                     {
@@ -728,10 +775,12 @@ impl Snail {
                             };
                             iv.lo <= x && x <= iv.hi
                         });
-                        let keep = keep
-                            && texts.iter().all(|&(t, start, v)| {
+                        let keep =
+                            keep && texts.iter().all(|&(t, start, v)| {
                                 v.text(r - start).is_some_and(|x| t.holds(x))
-                            });
+                            }) && nulls
+                                .iter()
+                                .all(|&(null, start, v)| v.is_null(r - start) == null);
                         if !keep {
                             continue;
                         }
@@ -772,32 +821,33 @@ impl Snail {
 fn keyed_spans(
     keys: &KeySet,
     lead: &[(bool, bool, usize, &Values)],
+    nulls_first: &[bool],
     from: usize,
     to: usize,
     sorted: usize,
 ) -> Vec<(usize, usize)> {
-    let row = |r: usize| -> Vec<i64> {
-        lead.iter()
-            .map(|&(_, _, start, v)| v.int(r - start).unwrap_or(i64::MIN))
-            .collect()
-    };
-    // A row's leading values against a key, compared in place.
+    // A row's leading values against a key, compared in place, a NULL lying on its level's side.
     let cmp = |r: usize, key: &[i64]| -> Ordering {
         lead.iter()
+            .zip(nulls_first)
             .zip(key)
-            .map(|(&(_, _, start, v), k)| v.int(r - start).unwrap_or(i64::MIN).cmp(k))
+            .map(|((&(_, _, start, v), &first), k)| match v.int(r - start) {
+                Some(x) => x.cmp(k),
+                None if first => Ordering::Less,
+                None => Ordering::Greater,
+            })
             .find(|o| *o != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
     };
     let mut out = Vec::new();
     let end = to.min(sorted);
     if from < end {
-        let (first, last) = (row(from), row(end - 1));
-        let lower = |key: &[i64]| -> usize {
+        // The keys from the first the sorted rows reach to the last they reach.
+        let below = |r: usize| -> usize {
             let (mut lo, mut hi) = (0, keys.len());
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                if keys.key(mid) < key {
+                if cmp(r, keys.key(mid)) == Ordering::Greater {
                     lo = mid + 1;
                 } else {
                     hi = mid;
@@ -805,9 +855,9 @@ fn keyed_spans(
             }
             lo
         };
-        let (i, z) = (lower(&first), {
-            let mut z = lower(&last);
-            while z < keys.len() && keys.key(z) <= last.as_slice() {
+        let (i, z) = (below(from), {
+            let mut z = below(end - 1);
+            while z < keys.len() && cmp(end - 1, keys.key(z)) != Ordering::Less {
                 z += 1;
             }
             z
@@ -894,6 +944,23 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             Status::Must => {}
         }
     }
+    // A test for NULL is answered by the column's NULLs the entry counts.
+    let mut null_may = Vec::new();
+    for &ni in &walk.nulls {
+        let (c, null) = side.nulls[ni];
+        let nulls = e.columns[order.slot(c).unwrap()].nulls;
+        let n = if null { nulls } else { e.rows - nulls } as u64;
+        if n == 0 {
+            status = Status::None;
+        } else if n < e.rows as u64 {
+            null_may.push(ni);
+            exact = if rest_may.len() + null_may.len() == 1 {
+                Some(n)
+            } else {
+                None
+            };
+        }
+    }
     let mut text_may = Vec::new();
     for &ti in &walk.texts {
         let t = &side.texts[ti];
@@ -903,7 +970,8 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             text_may.push(ti);
         }
     }
-    if status != Status::None && (!rest_may.is_empty() || !text_may.is_empty() || keys_may) {
+    let may = rest_may.len() + null_may.len();
+    if status != Status::None && (may > 0 || !text_may.is_empty() || keys_may) {
         status = Status::May;
     }
     match status {
@@ -917,12 +985,12 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     if interval == Status::Must && text_may.is_empty() && !keys_may {
         match want.countable {
             Some(Countable::Total) => {
-                if rest_may.is_empty() {
+                if may == 0 {
                     walk.counted += e.rows as u64;
                     walk.rows_closed += e.rows as u64;
                     return;
                 }
-                if let (1, Some(n)) = (rest_may.len(), exact) {
+                if let (1, Some(n)) = (may, exact) {
                     walk.counted += n;
                     walk.rows_closed += n;
                     return;
@@ -936,6 +1004,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
                     .iter()
                     .position(|&x| x as usize == slot);
                 let months = match rest_may.as_slice() {
+                    _ if !null_may.is_empty() => None,
                     [] => Some((1, 12)),
                     [ri] => match walk.rest[*ri] {
                         (Shape::MonthUtc(x), iv) if x == c && exact.is_some() => {
@@ -978,14 +1047,16 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     for &ti in &text_may {
         need(side.texts[ti].column);
     }
+    for &ni in &null_may {
+        need(side.nulls[ni].0);
+    }
     if let Some(k) = want.keys {
         for &c in &k.columns {
             need(c);
         }
     }
     let whole: u64 = slots.iter().map(|&s| e.columns[s].pages as u64).sum();
-    let read_whole =
-        interval == Status::Must && rest_may.is_empty() && text_may.is_empty() && !keys_may;
+    let read_whole = interval == Status::Must && may == 0 && text_may.is_empty() && !keys_may;
     walk.low += if walk.level > 1 {
         if read_whole {
             whole
@@ -1005,13 +1076,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         walk.rows_low += rows;
         walk.rows_high += rows;
     } else {
-        match (
-            interval,
-            text_may.is_empty(),
-            keys_may,
-            rest_may.len(),
-            exact,
-        ) {
+        match (interval, text_may.is_empty(), keys_may, may, exact) {
             (Status::Must, true, false, 1, Some(n)) => {
                 walk.rows_low += n;
                 walk.rows_high += n;
@@ -1024,6 +1089,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         interval_may: interval == Status::May,
         rest_may,
         text_may,
+        null_may,
         slots,
     });
 }
@@ -1073,8 +1139,9 @@ fn rest_status(
 /// The rows of the question an open block holds, estimated. The leading levels' range covers the
 /// block page by page, each page's rows taken as lying evenly across its keys; each condition off
 /// the levels covers the block by the share of its least to greatest it takes, or by its count
-/// where the counts give one; a condition on text off the levels leaves the block whole.
-fn estimate(o: &Open, map: &PageMap, walk: &Walk, order: &Order) -> f64 {
+/// where the counts give one, and a test for NULL by the NULLs counted; a condition on text off the
+/// levels leaves the block whole.
+fn estimate(o: &Open, map: &PageMap, walk: &Walk, order: &Order, nulls: &[(usize, bool)]) -> f64 {
     let e = &o.entry;
     let mut share = 1.0;
     if o.interval_may {
@@ -1107,6 +1174,11 @@ fn estimate(o: &Open, map: &PageMap, walk: &Walk, order: &Order) -> f64 {
         let (s, iv) = walk.rest[ri];
         share *= rest_share(order.slot(s_column(s)).unwrap(), s, iv, e, &walk.head);
     }
+    for &ni in &o.null_may {
+        let (c, null) = nulls[ni];
+        let n = e.columns[order.slot(c).unwrap()].nulls as f64;
+        share *= if null { n } else { e.rows as f64 - n } / (e.rows as f64).max(1.0);
+    }
     e.rows as f64 * share
 }
 
@@ -1130,19 +1202,21 @@ fn page_share(
     let Some(d) = (0..first.len()).find(|&d| first[d] != next[d]) else {
         return 1.0;
     };
-    let (KeyValue::Int(a), KeyValue::Int(z)) = (&first[d], &next[d]) else {
+    let (KeyValue::Int(a), KeyValue::Int(z), KeyValue::Int(l), KeyValue::Int(h)) =
+        (&first[d], &next[d], &lo[d], &hi[d])
+    else {
         return 0.5;
     };
     let (a, z) = (*a as f64, *z as f64 + if last { 1.0 } else { 0.0 });
     let from = match lo[..d].cmp(&first[..d]) {
         std::cmp::Ordering::Less => f64::NEG_INFINITY,
         std::cmp::Ordering::Greater => f64::INFINITY,
-        std::cmp::Ordering::Equal => lo[d].int() as f64,
+        std::cmp::Ordering::Equal => *l as f64,
     };
     let to = match hi[..d].cmp(&first[..d]) {
         std::cmp::Ordering::Greater => f64::INFINITY,
         std::cmp::Ordering::Less => f64::NEG_INFINITY,
-        std::cmp::Ordering::Equal => hi[d].int() as f64 + 1.0,
+        std::cmp::Ordering::Equal => *h as f64 + 1.0,
     };
     ((to.min(z) - from.max(a)).max(0.0) / (z - a)).clamp(0.0, 1.0)
 }

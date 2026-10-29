@@ -657,11 +657,13 @@ fn windows(
         })?;
         match spec.order_by.as_slice() {
             [o] if !matches!(o.options.sort, Some(OrderBySort::Desc))
+                && o.options.nulls_first != Some(true)
                 && column_of(&o.expr)
                     .is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(order)) => {}
             _ => {
                 return Err(Error::new(format!(
-                    "{call}: a window is read only along the table's order, ascending"
+                    "{call}: a window is read only along the table's order, ascending, its \
+                     NULLs last"
                 )))
             }
         }
@@ -1584,13 +1586,14 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
     )?)
 }
 
-/// Sorts a relation's rows on one of its columns, ascending, so they lie in the table's order.
+/// Sorts a relation's rows on one of its columns, ascending, its NULLs last, so they lie in the
+/// table's order.
 pub fn in_order(rel: &mut Relation, column: usize) -> Result<()> {
     let mut failed = None;
     rel.rows
         .sort_by(|a, b| match compare(&a[column], &b[column]) {
             Ok(Some(o)) => o,
-            Ok(None) => Ordering::Equal,
+            Ok(None) => a[column].is_null().cmp(&b[column].is_null()),
             Err(e) => {
                 failed.get_or_insert(e);
                 Ordering::Equal

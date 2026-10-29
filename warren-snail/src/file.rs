@@ -47,6 +47,22 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
     }
 }
 
+/// Refuses a NULL on a level of `order` in a snail of `format`: no key of formats 7 and 8 holds one.
+pub(crate) fn keys_null(
+    format: u32,
+    table: &crate::catalog::Table,
+    order: &crate::catalog::Order,
+) -> crate::Result<()> {
+    if format >= FORMAT {
+        return Ok(());
+    }
+    Err(crate::Error::new(format!(
+        "{}: a level of {} holds NULL, which a snail of format {format} cannot hold: put the snail \
+         `out` and `write` it afresh, in format {FORMAT}",
+        table.name, order.name
+    )))
+}
+
 /// The pages a file holds before the next begins, unless the snail is made with another span: 1 GiB.
 pub const FILE_PAGES: u64 = 1 << 18;
 

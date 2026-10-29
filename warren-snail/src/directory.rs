@@ -186,31 +186,61 @@ impl Entry {
     }
 }
 
-/// A key's bytes: a number in 8, text in its length and its bytes.
+/// The top bit of a key's count, set where the key holds a NULL: each level's value then follows a
+/// byte saying what it is, a value (0), or a NULL before its level's values (1) or after them (2),
+/// which takes no more. A key holding none is written as format 8 writes it.
+const KEY_NULLS: u32 = 1 << 31;
+
+/// A key's bytes past its count: a number in 8, text in its length and its bytes, and where the key
+/// holds a NULL, a byte a level.
 fn keys_len(key: &[KeyValue]) -> usize {
-    key.iter()
-        .map(|v| match v {
-            KeyValue::Int(_) => 8,
-            KeyValue::Text(s) => 4 + s.len(),
-        })
-        .sum()
+    let marks = if key.iter().any(KeyValue::is_null) {
+        key.len()
+    } else {
+        0
+    };
+    marks
+        + key
+            .iter()
+            .map(|v| match v {
+                KeyValue::Int(_) => 8,
+                KeyValue::Text(s) => 4 + s.len(),
+                KeyValue::Null { .. } => 0,
+            })
+            .sum::<usize>()
 }
 
 fn keys_out(o: &mut Out, key: &[KeyValue]) {
-    o.u32(key.len() as u32);
+    let marked = key.iter().any(KeyValue::is_null);
+    o.u32(key.len() as u32 | if marked { KEY_NULLS } else { 0 });
     for v in key {
+        if marked {
+            o.u8(match v {
+                KeyValue::Null { first: true } => 1,
+                KeyValue::Null { first: false } => 2,
+                _ => 0,
+            });
+        }
         match v {
             KeyValue::Int(x) => o.i64(*x),
             KeyValue::Text(s) => o.str(s),
+            KeyValue::Null { .. } => {}
         }
     }
 }
 
 /// A key, its levels' kinds told by `level_text`: text where it is not 0.
 fn keys_in(i: &mut In, level_text: &[u32]) -> Result<Vec<KeyValue>> {
-    let n = i.u32()? as usize;
-    (0..n)
+    let count = i.u32()?;
+    let marked = count & KEY_NULLS != 0;
+    (0..(count & !KEY_NULLS) as usize)
         .map(|k| {
+            match if marked { i.u8()? } else { 0 } {
+                0 => {}
+                1 => return Ok(KeyValue::Null { first: true }),
+                2 => return Ok(KeyValue::Null { first: false }),
+                other => return Err(Error::new(format!("a key's level is marked {other}"))),
+            }
             Ok(if level_text.get(k).copied().unwrap_or(0) > 0 {
                 KeyValue::Text(i.str()?.into_boxed_str())
             } else {
@@ -652,6 +682,34 @@ mod tests {
             chains: vec![(4, ints([12, 7]))],
         };
         assert_eq!(PageMap::decode(&map.encode(), &[0, 0]).unwrap(), map);
+    }
+
+    #[test]
+    fn a_key_holding_a_null_comes_back_as_written_and_one_holding_none_as_format_eight_wrote_it() {
+        let text = |s: &str| KeyValue::Text(s.into());
+        let (first, last) = (
+            KeyValue::Null { first: true },
+            KeyValue::Null { first: false },
+        );
+        for key in [
+            vec![last.clone(), KeyValue::Int(-7), text("ab")],
+            vec![KeyValue::Int(i64::MIN), first.clone(), last.clone()],
+            vec![first.clone(), first.clone(), first.clone()],
+            vec![KeyValue::Int(3), KeyValue::Int(4), text("")],
+        ] {
+            let mut o = Out::default();
+            keys_out(&mut o, &key);
+            assert_eq!(o.0.len(), 4 + keys_len(&key), "{key:?}");
+            assert_eq!(keys_in(&mut In::new(&o.0), &[0, 0, 1]).unwrap(), key);
+        }
+        // A key holding no NULL: its count, then each value, as format 8 wrote it.
+        let mut o = Out::default();
+        keys_out(&mut o, &[KeyValue::Int(5), text("x")]);
+        let mut eight = 2u32.to_le_bytes().to_vec();
+        eight.extend(5i64.to_le_bytes());
+        eight.extend(1u32.to_le_bytes());
+        eight.push(b'x');
+        assert_eq!(o.0, eight);
     }
 
     #[test]

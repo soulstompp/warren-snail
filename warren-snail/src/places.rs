@@ -4,9 +4,13 @@
 //! instant is cut on the UTC clock by its year, then its month, day, hour, minute, second and
 //! microsecond. A month is cut by the year's halves, then the month. Text is cut by its bytes, the
 //! first one first, a value that has ended coming before any byte.
+//!
+//! A level's NULL rows lie on their own cycle: a run after every value of the level at each of its
+//! sublevels, or before them where the level holds its NULLs first, cut on the levels after it.
 
 use crate::catalog::{ColumnType, Level, Order, Table};
 use chrono::{DateTime, Datelike, Timelike};
+use std::cmp::Ordering;
 use std::fmt;
 
 pub fn civil_utc(micros: i64) -> DateTime<chrono::Utc> {
@@ -35,12 +39,14 @@ pub fn month_of(micros: i64) -> Option<i64> {
 }
 
 /// One level's value in an order's key: a number (an integer, an instant's microseconds, a month),
-/// or text, compared by its bytes. Every value of one level is of one kind.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// or text, compared by its bytes; or a NULL, before every value of its level where `first`, else
+/// after them all. Every value of one level is of one kind, and its NULLs lie on one side.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KeyValue {
     Int(i64),
     Text(Box<str>),
+    Null { first: bool },
 }
 
 impl KeyValue {
@@ -49,7 +55,38 @@ impl KeyValue {
         match self {
             KeyValue::Int(v) => *v,
             KeyValue::Text(_) => panic!("a numeric level holds text"),
+            KeyValue::Null { .. } => panic!("a NULL keys no number"),
         }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, KeyValue::Null { .. })
+    }
+
+    /// Where the value's kind lies among a level's: its NULLs at one end, whatever kinds come after.
+    fn rank(&self) -> u8 {
+        match self {
+            KeyValue::Null { first: true } => 0,
+            KeyValue::Int(_) => 1,
+            KeyValue::Text(_) => 2,
+            KeyValue::Null { first: false } => u8::MAX,
+        }
+    }
+}
+
+impl Ord for KeyValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (KeyValue::Int(a), KeyValue::Int(b)) => a.cmp(b),
+            (KeyValue::Text(a), KeyValue::Text(b)) => a.cmp(b),
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+impl PartialOrd for KeyValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -58,7 +95,15 @@ impl fmt::Display for KeyValue {
         match self {
             KeyValue::Int(v) => write!(f, "{v}"),
             KeyValue::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
+            KeyValue::Null { .. } => write!(f, "NULL"),
         }
+    }
+}
+
+/// The NULL of level `level` of an order, on the side the order holds its NULLs.
+pub fn null_key(order: &Order, level: usize) -> KeyValue {
+    KeyValue::Null {
+        first: order.nulls_first[level],
     }
 }
 
@@ -104,8 +149,11 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
 }
 
 fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
-    if let KeyValue::Text(s) = key {
-        return s.as_bytes().get(r).map_or(-1, |&b| b as i64);
+    match key {
+        KeyValue::Text(s) => return s.as_bytes().get(r).map_or(-1, |&b| b as i64),
+        KeyValue::Null { first: true } => return i64::MIN,
+        KeyValue::Null { first: false } => return i64::MAX,
+        KeyValue::Int(_) => {}
     }
     let key = key.int();
     match level {
@@ -264,6 +312,61 @@ mod tests {
             (month_of(i64::MAX), month_of(i64::MIN), month_of(0)),
             (None, None, Some(1))
         );
+    }
+
+    #[test]
+    fn a_null_key_lies_after_every_value_of_its_level_or_before_them_all_at_every_sublevel() {
+        let (first, last) = (
+            KeyValue::Null { first: true },
+            KeyValue::Null { first: false },
+        );
+        for v in [
+            KeyValue::Int(i64::MIN),
+            KeyValue::Int(0),
+            KeyValue::Int(i64::MAX),
+            KeyValue::Text("".into()),
+            KeyValue::Text("\u{10ffff}".into()),
+        ] {
+            assert!(first < v && v < last, "{v}");
+        }
+        assert_eq!(last.cmp(&last.clone()), Ordering::Equal);
+        assert_eq!(first.cmp(&first.clone()), Ordering::Equal);
+        // A key holding a NULL on its first level lies past every key holding a value there,
+        // whatever follows; on the levels after it, keys sharing the NULL keep their order.
+        let mut keys = [
+            [last.clone(), KeyValue::Int(1)],
+            [KeyValue::Int(i64::MAX), KeyValue::Int(9)],
+            [last.clone(), KeyValue::Int(0)],
+            [KeyValue::Int(-1), KeyValue::Int(0)],
+        ];
+        keys.sort();
+        assert_eq!(
+            keys.iter().map(|k| shown(k)).collect::<Vec<_>>(),
+            [
+                "[-1, 0]",
+                "[9223372036854775807, 9]",
+                "[NULL, 0]",
+                "[NULL, 1]"
+            ]
+        );
+        let c = Catalog::parse(
+            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
+             CREATE INDEX f ON s.t (b NULLS FIRST, a);
+             CREATE INDEX l ON s.t (b, a);",
+        )
+        .unwrap();
+        let t = &c.tables[0];
+        for (order, null) in [(&t.orders[1], &first), (&t.orders[2], &last)] {
+            let sublevels = Sublevels::new(order, t, &[0, 0]);
+            let at =
+                |key: &[KeyValue]| (0..32).map(|r| sublevels.value(key, r)).collect::<Vec<_>>();
+            let null_at = at(&[null.clone(), KeyValue::Int(0)]);
+            for v in [i32::MIN as i64, -1, 0, i32::MAX as i64] {
+                let value_at = at(&[KeyValue::Int(v), KeyValue::Int(0)]);
+                assert_eq!(null_at < value_at, null == &first, "{v}");
+                assert_ne!(null_at[0], value_at[0], "{v}");
+            }
+        }
     }
 
     #[test]

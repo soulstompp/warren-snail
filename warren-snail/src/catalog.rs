@@ -7,7 +7,8 @@ use crate::{Error, Result};
 use sqlparser::ast::{
     CastKind, CharacterLength, ColumnOption, CreateFunctionBody, DataType, DateTimeField,
     ExactNumberInfo, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
-    ObjectNamePart, SelectItem, SetExpr, Statement, TableConstraint, TimezoneInfo, Value,
+    ObjectNamePart, OrderBySort, SelectItem, SetExpr, Statement, TableConstraint, TimezoneInfo,
+    Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -114,6 +115,12 @@ pub struct Order {
     pub unique: bool,
     /// The table's own order, rather than one of its indexes.
     pub table_order: bool,
+    /// For each level, whether its NULL rows come before its values as they lie ascending: under
+    /// NULLS FIRST, or under DESC NULLS LAST, as PostgreSQL's B-tree read backwards holds them.
+    pub nulls_first: Vec<bool>,
+    /// Whether keys holding a NULL are each their own, so that a unique order takes any number of
+    /// them: unless its index says NULLS NOT DISTINCT.
+    pub nulls_distinct: bool,
 }
 
 impl Order {
@@ -469,8 +476,22 @@ struct Index {
     name: String,
     table: String,
     keys: Vec<Expr>,
+    /// Each key's NULLs first, as `Order::nulls_first` reads them.
+    nulls_first: Vec<bool>,
     include: Vec<String>,
     unique: bool,
+    nulls_distinct: bool,
+}
+
+/// One index of a table, read as an order.
+#[derive(Clone)]
+struct Keyed {
+    name: String,
+    levels: Vec<Level>,
+    include: Vec<usize>,
+    unique: bool,
+    nulls_first: Vec<bool>,
+    nulls_distinct: bool,
 }
 
 /// The statements of a DDL, split on their semicolons by sqlparser's PostgreSQL tokenizer.
@@ -614,12 +635,28 @@ impl Catalog {
                     if i.using.is_some() {
                         return Err(Error::new(format!("{name}: only B-tree indexes are read")));
                     }
+                    let mut nulls_first = Vec::new();
+                    for c in &i.columns {
+                        let desc = match &c.column.options.sort {
+                            None | Some(OrderBySort::Asc) => false,
+                            Some(OrderBySort::Desc) => true,
+                            Some(OrderBySort::Using(other)) => {
+                                return Err(Error::new(format!(
+                                    "{name}: {} USING {other} is not read",
+                                    c.column.expr
+                                )))
+                            }
+                        };
+                        nulls_first.push(c.column.options.nulls_first.unwrap_or(desc) != desc);
+                    }
                     indexes.push(Index {
                         name,
                         table: object_name(&i.table_name),
                         keys: i.columns.iter().map(|c| c.column.expr.clone()).collect(),
+                        nulls_first,
                         include: i.include.iter().map(ident).collect(),
                         unique: i.unique,
+                        nulls_distinct: i.nulls_distinct != Some(false),
                     });
                 }
                 other => {
@@ -727,7 +764,14 @@ impl Catalog {
                         Error::new(format!("{}: {name} has no column {c}", i.name))
                     })?);
                 }
-                index_orders.push((i.name.clone(), levels, include, i.unique));
+                index_orders.push(Keyed {
+                    name: i.name.clone(),
+                    levels,
+                    include,
+                    unique: i.unique,
+                    nulls_first: i.nulls_first.clone(),
+                    nulls_distinct: i.nulls_distinct,
+                });
             }
             if let Some((t, _)) = clusters.iter().filter(|(t, _)| *t == name).nth(1) {
                 return Err(Error::new(format!("{t} is clustered on two indexes")));
@@ -742,24 +786,31 @@ impl Catalog {
                     .collect::<Vec<_>>()
             });
             let all: Vec<usize> = (0..columns.len()).collect();
-            let (order_name, order_levels, order_unique) = match &clustered {
+            let primary_keyed = primary_levels.as_ref().map(|p| Keyed {
+                name: format!("{}_pkey", name.rsplit('.').next().unwrap()),
+                levels: p.clone(),
+                include: vec![],
+                unique: true,
+                nulls_first: vec![false; p.len()],
+                nulls_distinct: true,
+            });
+            let ordered = match &clustered {
                 Some(c) => {
-                    let pos = index_orders.iter().position(|s| &s.0 == c).ok_or_else(|| {
-                        Error::new(format!(
-                            "{name} is clustered on {c}, which is no index of it"
-                        ))
-                    })?;
+                    let pos = index_orders
+                        .iter()
+                        .position(|s| &s.name == c)
+                        .ok_or_else(|| {
+                            Error::new(format!(
+                                "{name} is clustered on {c}, which is no index of it"
+                            ))
+                        })?;
                     // The order holds every column, so what its index includes adds nothing.
-                    let s = index_orders.remove(pos);
-                    let unique = s.3 || primary_levels.as_ref() == Some(&s.1);
-                    (s.0, s.1, unique)
+                    let mut s = index_orders.remove(pos);
+                    s.unique = s.unique || primary_levels.as_ref() == Some(&s.levels);
+                    s
                 }
-                None => match &primary_levels {
-                    Some(p) => (
-                        format!("{}_pkey", name.rsplit('.').next().unwrap()),
-                        p.clone(),
-                        true,
-                    ),
+                None => match &primary_keyed {
+                    Some(p) => p.clone(),
                     None => {
                         return Err(Error::new(format!(
                         "{name} has no order: name one with CLUSTER ON, or give it a primary key"
@@ -768,42 +819,38 @@ impl Catalog {
                 },
             };
             if clustered.is_some() {
-                if let Some(p) = &primary_levels {
-                    if *p != order_levels {
-                        index_orders.insert(
-                            0,
-                            (
-                                format!("{}_pkey", name.rsplit('.').next().unwrap()),
-                                p.clone(),
-                                vec![],
-                                true,
-                            ),
-                        );
+                if let Some(p) = primary_keyed {
+                    if p.levels != ordered.levels {
+                        index_orders.insert(0, p);
                     }
                 }
             }
-            let key: Vec<usize> = dedup(order_levels.iter().map(|l| l.column()));
+            let key: Vec<usize> = dedup(ordered.levels.iter().map(|l| l.column()));
             let mut orders = vec![Order {
-                name: order_name,
-                levels: order_levels,
+                name: ordered.name,
+                levels: ordered.levels,
                 columns: all,
-                unique: order_unique,
+                unique: ordered.unique,
                 table_order: true,
+                nulls_first: ordered.nulls_first,
+                nulls_distinct: ordered.nulls_distinct,
             }];
-            for (sname, levels, include, unique) in index_orders {
+            for s in index_orders {
                 let held = dedup(
-                    levels
+                    s.levels
                         .iter()
                         .map(|l| l.column())
-                        .chain(include.iter().copied())
+                        .chain(s.include.iter().copied())
                         .chain(key.iter().copied()),
                 );
                 orders.push(Order {
-                    name: sname,
-                    levels,
+                    name: s.name,
+                    levels: s.levels,
                     columns: held,
-                    unique,
+                    unique: s.unique,
                     table_order: false,
+                    nulls_first: s.nulls_first,
+                    nulls_distinct: s.nulls_distinct,
                 });
             }
             out.push(Table {
@@ -975,6 +1022,41 @@ mod tests {
     fn a_table_with_no_order_is_refused() {
         let e = refused("CREATE TABLE s.t (a integer NOT NULL);");
         assert!(e.contains("has no order"), "{e}");
+    }
+
+    #[test]
+    fn an_index_s_nulls_lie_where_its_b_tree_read_ascending_holds_them() {
+        let c = Catalog::parse(
+            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
+             CREATE INDEX asc_last ON s.t (b, a);
+             CREATE INDEX asc_first ON s.t (b ASC NULLS FIRST, a);
+             CREATE INDEX desc_first ON s.t (b DESC, a DESC NULLS LAST);
+             CREATE INDEX desc_last ON s.t (b DESC NULLS LAST, a NULLS LAST);
+             CREATE UNIQUE INDEX distinct_b ON s.t (b);
+             CREATE UNIQUE INDEX not_distinct_b ON s.t (b) NULLS NOT DISTINCT;",
+        )
+        .unwrap();
+        let t = &c.tables[0];
+        let read = |name: &str| {
+            let o = t.order(name).unwrap();
+            (o.nulls_first.clone(), o.nulls_distinct)
+        };
+        assert_eq!(read("t_pkey"), (vec![false], true));
+        assert_eq!(read("asc_last"), (vec![false, false], true));
+        assert_eq!(read("asc_first"), (vec![true, false], true));
+        assert_eq!(read("desc_first"), (vec![false, true], true));
+        assert_eq!(read("desc_last"), (vec![true, false], true));
+        assert_eq!(read("distinct_b"), (vec![false], true));
+        assert_eq!(read("not_distinct_b"), (vec![false], false));
+        // Clustered on an index, the table's order takes its NULLs as the index lies.
+        let c = Catalog::parse(
+            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
+             CREATE UNIQUE INDEX u ON s.t (b NULLS FIRST) NULLS NOT DISTINCT;
+             ALTER TABLE s.t CLUSTER ON u;",
+        )
+        .unwrap();
+        let o = &c.tables[0].orders[0];
+        assert!(o.table_order && o.nulls_first == [true] && !o.nulls_distinct);
     }
 
     #[test]

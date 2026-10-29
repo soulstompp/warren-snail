@@ -11,7 +11,7 @@ use crate::encode::{descriptor, disk_pages, encode, DataPage, Encoded, DICTIONAR
 use crate::file::{
     encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_EIGHT, FORMAT_SEVEN,
 };
-use crate::places::{key, month_utc, shown, KeyValue, Keys, Sublevels};
+use crate::places::{key, month_utc, null_key, shown, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
 use arrow::array::{
@@ -489,6 +489,13 @@ fn write_tables(
             .find(|(n, _)| *n == table.name)
             .map(|(_, s)| s);
         for order in &table.orders {
+            if order
+                .levels
+                .iter()
+                .any(|l| rows.columns[l.column()].nulls() > 0)
+            {
+                crate::file::keys_null(w.format(), table, order)?;
+            }
             let packed = w.format() != FORMAT_SEVEN;
             let (extent, written) = write_order(&mut w, table, order, rows, source, packed)?;
             root.orders
@@ -543,23 +550,21 @@ pub(crate) fn laid_out(
     }
     for r in 0..n {
         for (li, &l) in order.levels.iter().enumerate() {
-            let null = || {
-                Error::new(format!(
-                    "{}: a level of {} holds NULL",
-                    table.name, order.name
-                ))
-            };
             let column = &rows.columns[l.column()];
+            if column.is_null(r) {
+                unsorted.push(null_key(order, li));
+                continue;
+            }
             let v = match column {
                 Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => {
-                    let s = column.text(r).ok_or_else(null)?;
+                    let s = column.text(r).unwrap();
                     if !fixed {
                         text_sublevels[li] = text_sublevels[li].max(s.len() as u32 + 1);
                     }
                     unsorted.push(KeyValue::Text(s.into()));
                     continue;
                 }
-                Values::Int(v) => v[r].ok_or_else(null)?,
+                Values::Int(v) => v[r].unwrap(),
             };
             if table.columns[l.column()].ty == ColumnType::Timestamptz
                 && (v == i64::MAX || v == i64::MIN)
@@ -578,7 +583,11 @@ pub(crate) fn laid_out(
     let mut perm: Vec<usize> = (0..n).collect();
     perm.sort_by(|&a, &b| row(a).cmp(row(b)));
     if order.unique {
-        if let Some(p) = perm.windows(2).find(|p| row(p[0]) == row(p[1])) {
+        // Keys holding a NULL are each their own, unless the order says they are not distinct.
+        let shared = |a: &[KeyValue], b: &[KeyValue]| {
+            a == b && !(order.nulls_distinct && a.iter().any(KeyValue::is_null))
+        };
+        if let Some(p) = perm.windows(2).find(|p| shared(row(p[0]), row(p[1]))) {
             return Err(Error::new(format!(
                 "{}: two rows share the value {} of {}, which is unique",
                 table.name,

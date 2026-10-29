@@ -842,9 +842,15 @@ impl Snail {
             &self.catalog,
             &format!("SELECT {columns} FROM {}", table.name),
         )?;
-        // The table's order carries its windows where it is one level, unique: its key's column.
+        // The table's order carries its windows where it is one level, unique, every row its own
+        // peer: its key's column, NOT NULL, or holding at most one NULL, last.
         let along = match (order.unique, order.levels.as_slice()) {
-            (true, [crate::catalog::Level::Column(c)]) => Some(*c),
+            (true, [crate::catalog::Level::Column(c)])
+                if table.columns[*c].not_null
+                    || (!order.nulls_first[0] && !order.nulls_distinct) =>
+            {
+                Some(*c)
+            }
             _ => None,
         };
         let names = table.columns.iter().map(|c| c.name.clone()).collect();

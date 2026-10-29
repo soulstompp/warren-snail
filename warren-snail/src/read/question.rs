@@ -181,6 +181,9 @@ pub struct Side {
     pub table: usize,
     pub conds: Vec<(Shape, Interval)>,
     pub texts: Vec<TextCond>,
+    /// Each column a condition keeps to its NULLs, IS NULL (true), or to its values, IS NOT NULL
+    /// (false).
+    pub nulls: Vec<(usize, bool)>,
     /// Some condition can hold for no value.
     pub empty: bool,
 }
@@ -188,7 +191,7 @@ pub struct Side {
 impl Side {
     /// Whether a condition of its own narrows what the side reads.
     pub fn conditioned(&self) -> bool {
-        !self.conds.is_empty() || !self.texts.is_empty()
+        !self.conds.is_empty() || !self.texts.is_empty() || !self.nulls.is_empty()
     }
 }
 
@@ -676,6 +679,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             table: *ti,
             conds: Vec::new(),
             texts: Vec::new(),
+            nulls: Vec::new(),
             empty: false,
         })
         .collect();
@@ -687,6 +691,20 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 Shape::Column(c),
                 Interval { lo: v, hi: v },
             );
+            continue;
+        }
+        if let Expr::IsNull(x) | Expr::IsNotNull(x) = p {
+            let null = matches!(p, Expr::IsNull(_));
+            let (side, c) = match from.resolve(x)? {
+                (side, Shape::Column(c)) => (side, c),
+                _ => return Err(Error::new(format!("{p}: test a column itself for NULL"))),
+            };
+            let here = &mut sides[side];
+            if from.table(side).columns[c].not_null {
+                here.empty |= null;
+            } else if !here.nulls.contains(&(c, null)) {
+                here.nulls.push((c, null));
+            }
             continue;
         }
         let (left, op, right) = match p {
@@ -796,8 +814,17 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         return Err(Error::new("two tables are joined on no key"));
     }
     for side in &mut sides {
-        side.empty = side.conds.iter().any(|(_, iv)| iv.lo > iv.hi)
-            || side.texts.iter().any(TextCond::is_empty);
+        // No comparison matches a NULL, so a column kept to its NULLs and compared holds no row.
+        let compared = |c: usize| {
+            side.conds
+                .iter()
+                .any(|(s, _)| crate::read::walk::s_column(*s) == c)
+                || side.texts.iter().any(|t| t.column == c)
+                || side.nulls.contains(&(c, false))
+        };
+        side.empty |= side.conds.iter().any(|(_, iv)| iv.lo > iv.hi)
+            || side.texts.iter().any(TextCond::is_empty)
+            || side.nulls.iter().any(|&(c, null)| null && compared(c));
     }
     Ok(Question {
         sides,

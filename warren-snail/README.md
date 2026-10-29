@@ -154,6 +154,11 @@ order; a table with none lies in its primary key. Each of its other B-tree index
 its own, holding its key's columns and those it includes, then the table's order's key. A primary
 key that is not the table's order is one too, and keeps its key unique.
 
+A key column's NULLs lie on a run of their own after its values, as PostgreSQL's B-tree holds
+them, or before them under `NULLS FIRST`, and the run is cut on the key's columns after it. So an
+index on a nullable column loads as written, and `IS NULL` on its first column reads that run
+alone.
+
 **What it reads.** A question reads along an order that holds every column it reads. A question on
 a few columns reads only those columns' pages, along whichever order holds them.
 
@@ -173,11 +178,13 @@ which few questions ask for.
 
 Every order is cut into blocks. A block is a run of its order's rows: a place of the order's key,
 such as one customer, or one month of one year. A place splits into its parts where one of them
-fills a page of every column the order holds; a part too thin to fill one joins the block beside
-it, and a place none of whose parts fills a page stays one block. A block keeps counts, never one
-number: the rows on each place of its key, the rows on each month of each instant it holds, each
-column's NULLs, and each text column's bytes. Above the blocks, each order's directory keeps the
-same counts summed, a level at a time, up to one page at the top.
+fills a page of every column that decides it. A column decides only through its values: a boolean
+never does, nor does a column holding NULLs there whose values fill less than a page. A part too
+thin to fill one joins the block beside it, and a place none of whose parts fills a page stays one
+block. A block keeps counts, never one number: the rows on each place of its key, the rows on each
+month of each instant it holds, each column's NULLs, and each text column's bytes. Above the
+blocks, each order's directory keeps the same counts summed, a level at a time, up to one page at
+the top. A count under `IS NULL` or `IS NOT NULL` is answered from the NULLs counted.
 
 **What it reads.** The directory's pages for the places the question fixes, from the top down.
 
@@ -537,7 +544,9 @@ Each command exits 0, or prints why it refused and exits 1.
 - `CREATE INDEX`, a B-tree, its key on columns, on an instant's month,
   `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
   `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is
-  `$1 AT TIME ZONE 'UTC'`, as `shop.clock` above; `INCLUDE`; `UNIQUE`.
+  `$1 AT TIME ZONE 'UTC'`, as `shop.clock` above; `INCLUDE`; `UNIQUE`, which takes any number of
+  NULLs unless it says `NULLS NOT DISTINCT`; a key column's `NULLS FIRST` or `NULLS LAST`, and
+  under `DESC` the side its NULLs take (its values lie ascending).
 - `ALTER TABLE … CLUSTER ON <index>`. The index a table is clustered on may include columns; the
   table's order holds every column already.
 
@@ -546,7 +555,8 @@ Each command exits 0, or prints why it refused and exits 1.
 - **A question:** `SELECT` from one table, or two joined by an inner `JOIN … ON` equal columns;
   conditions joined by `AND`, each a column, or an instant's month on the clock, compared with a
   value by `=`, `<`, `<=`, `>` or `>=`, or a boolean column alone, under `NOT`, or under `IS TRUE`
-  or `IS FALSE`; `count(*)`, and `sum` of an integer or numeric column;
+  or `IS FALSE`, or a column under `IS NULL` or `IS NOT NULL`; `count(*)`, and `sum` of an integer
+  or numeric column;
   `GROUP BY`; `ORDER BY`. A join reads the table its own conditions narrow first, then keeps the
   other to the keys the first holds.
 - **A pipeline,** a question with a `WITH` or a window: steps over one table and the steps before
