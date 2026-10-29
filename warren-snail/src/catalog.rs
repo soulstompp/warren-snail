@@ -325,6 +325,29 @@ impl Table {
         let col = &self.columns[c];
         (col.identity.is_some() || col.default.as_ref().is_some_and(hands_out)).then_some(c)
     }
+
+    /// What `write` says of a table laid out on a key handed out as rows arrive, where it is: the
+    /// DDL names no other order for it.
+    pub fn laid_out_on_arrival(&self) -> Option<String> {
+        let c = self.arrival_key()?;
+        let order = self.orders.iter().find(|o| o.table_order)?;
+        let col = &self.columns[c];
+        Some(if col.default.as_ref().is_some_and(hands_out_at_random) {
+            format!(
+                "{}: laid out along {}, on {}, a key handed out at random as rows arrive, since the \
+                 DDL names no other order: each insert lands where its key falls, scattered across \
+                 the blocks",
+                self.name, order.name, col.name
+            )
+        } else {
+            format!(
+                "{}: laid out along {}, on {}, a key handed out as rows arrive, since the DDL names \
+                 no other order: its blocks follow the rows' arrival, and each insert meets the \
+                 newest",
+                self.name, order.name, col.name
+            )
+        })
+    }
 }
 
 /// Whether a DEFAULT hands out a value as each row arrives: a sequence's next value, the clock, or
@@ -1633,6 +1656,32 @@ mod tests {
         // A virtual column is held by no order.
         assert_eq!(t.orders[0].columns, [0, 1, 2, 3]);
         assert_eq!(t.arrival_key(), Some(0));
+        assert!(t
+            .laid_out_on_arrival()
+            .unwrap()
+            .contains("a key handed out as rows arrive"));
+        // A uuid's key: a v7 rises as rows arrive, a v4 scatters them; a CLUSTER ON names another
+        // order.
+        let u = Catalog::parse(
+            "CREATE TABLE s.u (id uuid DEFAULT uuidv7() NOT NULL, PRIMARY KEY (id));
+             CREATE TABLE s.r (id uuid DEFAULT gen_random_uuid() NOT NULL, n integer NOT NULL,
+                 PRIMARY KEY (id));
+             CREATE TABLE s.c (id uuid DEFAULT gen_random_uuid() NOT NULL, n integer NOT NULL,
+                 PRIMARY KEY (id));
+             CREATE INDEX c_n ON s.c (n);
+             ALTER TABLE s.c CLUSTER ON c_n;",
+        )
+        .unwrap();
+        let words: Vec<Option<String>> = u.tables.iter().map(|t| t.laid_out_on_arrival()).collect();
+        assert!(words[0]
+            .as_deref()
+            .unwrap()
+            .contains("each insert meets the newest"));
+        assert!(words[1]
+            .as_deref()
+            .unwrap()
+            .contains("a key handed out at random"));
+        assert_eq!(words[2], None);
         for (ddl, why) in [
             ("CREATE TABLE s.t (a integer NOT NULL DEFAULT nextval('s.none'), PRIMARY KEY (a))", "no sequence s.none"),
             ("CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT a, PRIMARY KEY (a))", "cannot use column reference"),

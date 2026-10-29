@@ -356,29 +356,12 @@ fn cmd_write(args: &[String]) -> Result<()> {
     }
     // A table laid out on a key handed out as rows arrive is said to be: the DDL names no other
     // order for it.
-    for t in &catalog.tables {
-        if let Some(c) = t.arrival_key() {
-            let order = t.orders.iter().find(|o| o.table_order).unwrap();
-            let random = t.columns[c]
-                .default
-                .as_ref()
-                .is_some_and(warren_snail::catalog::hands_out_at_random);
-            if random {
-                println!(
-                    "{}: laid out along {}, on {}, a key handed out at random as rows arrive, since \
-                     the DDL names no other order: each insert lands where its key falls, \
-                     scattered across the blocks",
-                    t.name, order.name, t.columns[c].name
-                );
-            } else {
-                println!(
-                    "{}: laid out along {}, on {}, a key handed out as rows arrive, since the DDL \
-                     names no other order: its blocks follow the rows' arrival, and each insert \
-                     meets the newest",
-                    t.name, order.name, t.columns[c].name
-                );
-            }
-        }
+    for word in catalog
+        .tables
+        .iter()
+        .filter_map(|t| t.laid_out_on_arrival())
+    {
+        println!("{word}");
     }
     for w in written {
         println!(

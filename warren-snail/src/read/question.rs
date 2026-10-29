@@ -944,13 +944,11 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 c.except.push(v);
                 c
             }
-            BinaryOperator::Lt => Cond::new(
-                s,
-                Interval {
-                    lo: i128::MIN,
-                    hi: v.saturating_sub(1),
-                },
-            ),
+            // A strict bound past either end keeps nothing.
+            BinaryOperator::Lt => match v.checked_sub(1) {
+                Some(hi) => Cond::new(s, Interval { lo: i128::MIN, hi }),
+                None => Cond::new(s, Interval { lo: 1, hi: 0 }),
+            },
             BinaryOperator::LtEq => Cond::new(
                 s,
                 Interval {
@@ -958,13 +956,10 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     hi: v,
                 },
             ),
-            BinaryOperator::Gt => Cond::new(
-                s,
-                Interval {
-                    lo: v.saturating_add(1),
-                    hi: i128::MAX,
-                },
-            ),
+            BinaryOperator::Gt => match v.checked_add(1) {
+                Some(lo) => Cond::new(s, Interval { lo, hi: i128::MAX }),
+                None => Cond::new(s, Interval { lo: 1, hi: 0 }),
+            },
             BinaryOperator::GtEq => Cond::new(
                 s,
                 Interval {

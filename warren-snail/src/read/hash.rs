@@ -99,4 +99,15 @@ mod tests {
         m.insert(vec![1, 2], 7);
         assert_eq!(m.get(&[1i64, 2][..]), Some(&7));
     }
+
+    #[test]
+    fn a_key_in_128_bits_hashes_as_its_number_where_it_fits_and_apart_where_it_does_not() {
+        assert_eq!(hash(&5i128), hash(&5i64));
+        assert_eq!(hash(&-5i128), hash(&-5i64));
+        let wide: Vec<i128> = (0..200).map(|i| (i as i128) << 64 | 7).collect();
+        let mut hashes: Vec<u64> = wide.iter().map(hash).collect();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), wide.len());
+    }
 }

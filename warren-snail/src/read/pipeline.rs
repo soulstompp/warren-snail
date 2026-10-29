@@ -458,6 +458,27 @@ fn truth(v: &Value) -> Result<Option<bool>> {
     }
 }
 
+/// Two values compared, a quoted literal beside a boolean or a uuid read as one, as PostgreSQL gives
+/// its unknown type the other side's.
+fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value)> {
+    let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_)));
+    Ok(match (&x, &y) {
+        (Value::Bool(_), Value::Text(t)) if quoted(right) => {
+            let t = boolean_of(t)?;
+            (x, t)
+        }
+        (Value::Text(t), Value::Bool(_)) if quoted(left) => (boolean_of(t)?, y),
+        (Value::Uuid(_), Value::Text(t)) if quoted(right) => {
+            let t = Value::Uuid(crate::scalars::uuid_parse(t)?);
+            (x, t)
+        }
+        (Value::Text(t), Value::Uuid(_)) if quoted(left) => {
+            (Value::Uuid(crate::scalars::uuid_parse(t)?), y)
+        }
+        _ => (x, y),
+    })
+}
+
 /// Evaluates an expression on one row of a frame, its aggregates' and windows' values computed.
 fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Value> {
     if let Some(v) = computed.calls.get(&(e as *const Expr)) {
@@ -525,7 +546,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
         Expr::IsUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_none()),
         Expr::IsNotUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_some()),
         Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
-            let (x, y) = (ev(a)?, ev(b)?);
+            let (x, y) = beside(ev(a)?, ev(b)?, a, b)?;
             let same = match (x.is_null(), y.is_null()) {
                 (true, true) => true,
                 (false, false) => compare(&x, &y)? == Some(Ordering::Equal),
@@ -547,21 +568,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }
                 _ => {}
             }
-            let (x, y) = (ev(left)?, ev(right)?);
-            // A quoted literal beside a boolean is read as one, as PostgreSQL gives its unknown
-            // type the other side's.
-            let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_)));
-            let (x, y) = match (&x, &y) {
-                (Value::Bool(_), Value::Text(t)) if quoted(right) => (x, boolean_of(t)?),
-                (Value::Text(t), Value::Bool(_)) if quoted(left) => (boolean_of(t)?, y),
-                (Value::Uuid(_), Value::Text(t)) if quoted(right) => {
-                    (x, Value::Uuid(crate::scalars::uuid_parse(t)?))
-                }
-                (Value::Text(t), Value::Uuid(_)) if quoted(left) => {
-                    (Value::Uuid(crate::scalars::uuid_parse(t)?), y)
-                }
-                _ => (x, y),
-            };
+            let (x, y) = beside(ev(left)?, ev(right)?, left, right)?;
             match op {
                 BinaryOperator::Plus => numeric_op(&x, &y, i128::checked_add)?,
                 BinaryOperator::Minus => numeric_op(&x, &y, i128::checked_sub)?,

@@ -171,6 +171,22 @@ fn a_uuid_is_compared_grouped_ordered_and_joined_as_postgresql_does() {
     // A uuid answered as its 16 bytes.
     let (b, _) = ask("SELECT u.id FROM s.u u WHERE u.n = 100", Some("u_pkey"));
     assert_eq!(uuids(b.column(0).as_ref()), [Some(id(100))]);
+    // A strict bound past either end of the uuids keeps nothing; one at an end keeps that end.
+    let (lo, hi) = (
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    );
+    for (w, want) in [
+        (format!("u.b < '{lo}'"), 0),
+        (format!("u.b <= '{lo}'"), 0),
+        (format!("u.b > '{hi}'"), 0),
+        (format!("u.b >= '{hi}'"), 0),
+        (format!("u.b > '{lo}'"), 3072),
+        (format!("u.b < '{hi}'"), 3072),
+    ] {
+        let (b, _) = ask(&format!("SELECT count(*) FROM s.u u WHERE {w}"), None);
+        assert_eq!(ns(&b), [want], "{w}");
+    }
     for refused in [
         "SELECT u.n FROM s.u u WHERE u.id = 'x'",
         "SELECT u.n FROM s.u u WHERE u.id = '0011223344556677889aabbccddeeff'",
@@ -271,6 +287,15 @@ fn a_uuid_goes_out_as_parquet_s_uuid_and_comes_back() {
     assert_eq!(
         id_column.logical_type_ref(),
         Some(&parquet::basic::LogicalType::Uuid)
+    );
+    // Each row group's least and greatest are its uuids' bytes, as Parquet orders them.
+    let first = meta.row_group(0).column(0).statistics().unwrap();
+    assert_eq!(
+        (
+            first.min_bytes_opt().unwrap(),
+            first.max_bytes_opt().unwrap()
+        ),
+        (&uuid_bytes(id(0))[..], &uuid_bytes(id(1023))[..])
     );
     let catalog = Catalog::parse(DDL).unwrap();
     let table = catalog.table("s.u").unwrap();
