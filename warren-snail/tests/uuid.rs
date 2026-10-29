@@ -177,6 +177,8 @@ fn a_uuid_is_compared_grouped_ordered_and_joined_as_postgresql_does() {
         "ffffffff-ffff-ffff-ffff-ffffffffffff",
     );
     for (w, want) in [
+        (format!("u.id < '{lo}'"), 0),
+        (format!("u.id <= '{lo}'"), 1),
         (format!("u.b < '{lo}'"), 0),
         (format!("u.b <= '{lo}'"), 0),
         (format!("u.b > '{hi}'"), 0),

@@ -98,8 +98,13 @@ const SUBMS_MINIMAL_STEP_NS: i64 = NS_PER_MS / (1 << 12) + 1;
 /// The last instant a v7 was handed out at, in nanoseconds since 1970 UTC.
 static PREVIOUS_NS: AtomicI64 = AtomicI64::new(0);
 
-/// The machine's clock in nanoseconds since 1970 UTC, at least a step past the last a v7 took, so
-/// the v7s one writer hands out rise.
+/// The instant a v7 takes, the clock reading `now`, where the last took `prev`: at least a step past
+/// it, so the v7s one writer hands out rise.
+fn ns_after(now: i64, prev: i64) -> i64 {
+    now.max(prev + SUBMS_MINIMAL_STEP_NS)
+}
+
+/// The machine's clock in nanoseconds since 1970 UTC, as the next v7 takes it.
 fn ns_ascending() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -107,7 +112,7 @@ fn ns_ascending() -> i64 {
         .unwrap_or(0);
     let mut prev = PREVIOUS_NS.load(Ordering::Relaxed);
     loop {
-        let ns = now.max(prev + SUBMS_MINIMAL_STEP_NS);
+        let ns = ns_after(now, prev);
         match PREVIOUS_NS.compare_exchange_weak(prev, ns, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return ns,
             Err(p) => prev = p,
@@ -115,17 +120,24 @@ fn ns_ascending() -> i64 {
     }
 }
 
-/// A version 7 uuid, as `uuidv7()` hands one out: the milliseconds since 1970 UTC in 48 bits, the
-/// millisecond's fraction in the next 12, the rest random but its version's and its variant's.
-pub fn uuid_v7() -> Result<i128> {
-    let ns = ns_ascending();
+/// The version 7 uuid of instant `ns`, its last 8 bytes `rest` but its variant's.
+fn uuid_v7_at(ns: i64, rest: [u8; 8]) -> i128 {
     let (ms, sub) = (ns / NS_PER_MS, ns % NS_PER_MS);
     let mut bytes = [0u8; 16];
     bytes[..6].copy_from_slice(&(ms as u64).to_be_bytes()[2..]);
     let fraction = (sub * (1 << 12) / NS_PER_MS) as u16;
     bytes[6..8].copy_from_slice(&fraction.to_be_bytes());
-    random(&mut bytes[8..])?;
-    Ok(versioned(bytes, 7))
+    bytes[8..].copy_from_slice(&rest);
+    versioned(bytes, 7)
+}
+
+/// A version 7 uuid, as `uuidv7()` hands one out: the milliseconds since 1970 UTC in 48 bits, the
+/// millisecond's fraction in the next 12, the rest random but its version's and its variant's.
+pub fn uuid_v7() -> Result<i128> {
+    let ns = ns_ascending();
+    let mut rest = [0u8; 8];
+    random(&mut rest)?;
+    Ok(uuid_v7_at(ns, rest))
 }
 
 #[cfg(test)]
@@ -171,6 +183,8 @@ mod tests {
             "-00112233445566778899aabbccddeeff",
             "00112233445566778899aabbccddeeff-",
             "0-0112233445566778899aabbccddeeff",
+            "00-112233445566778899aabbccddeeff",
+            "001122-33445566778899aabbccddeeff",
             "00112233--4455-6677-8899-aabbccddeeff",
             "{00112233445566778899aabbccddeeff",
             "00112233445566778899aabbccddeeff}",
@@ -193,6 +207,26 @@ mod tests {
             assert_eq!((version(next), variant(next)), (7, 2));
             assert!(next > last);
             last = next;
+        }
+        // A clock that stands still, or steps back, still gives v7s that rise, whatever their
+        // random bytes: each takes a step past the last, and its fraction rises with it.
+        let (mut prev, mut last) = (0i64, i128::MIN);
+        for (i, now) in [
+            5_000_000i64,
+            5_000_000,
+            5_000_000,
+            4_000_000,
+            5_000_100,
+            9_000_000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ns = ns_after(now, prev);
+            assert!(ns > prev, "{i}");
+            let v7 = uuid_v7_at(ns, [0xff - i as u8 * 40; 8]);
+            assert!(v7 > last, "{i}");
+            (prev, last) = (ns, v7);
         }
     }
 }
