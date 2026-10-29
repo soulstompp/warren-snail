@@ -29,6 +29,7 @@ pub struct Col {
 /// A value a question returns or groups by: a column as it is, or the month of an instant on the UTC
 /// clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Key {
     Column(Col),
     Month(Col),
@@ -43,6 +44,7 @@ impl Key {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Item {
     Key(Key),
     Count,
@@ -50,6 +52,7 @@ pub enum Item {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Select {
     /// Rows, as they are.
     Rows(Vec<(String, Key)>),
@@ -62,6 +65,7 @@ pub enum Select {
 
 /// A question the counts can answer: a count in all, or a count by the month of a column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Countable {
     Total,
     ByMonth(usize),
@@ -108,6 +112,7 @@ impl Select {
 
 /// A condition on a text column: its values between two bounds, compared by their bytes.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TextCond {
     pub column: usize,
     pub lo: Bound<String>,
@@ -162,6 +167,7 @@ fn tighter(a: Bound<String>, b: Bound<String>, lower: bool) -> Bound<String> {
 
 /// One column the answer is ordered by: its place, whether descending, and whether NULLs come first.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Sort {
     pub at: usize,
     pub desc: bool,
@@ -170,6 +176,7 @@ pub struct Sort {
 
 /// One table a question reads, and the conditions on it alone.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Side {
     pub table: usize,
     pub conds: Vec<(Shape, Interval)>,
@@ -186,6 +193,7 @@ impl Side {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Question {
     pub sides: Vec<Side>,
     /// The columns two tables meet on: a column of the first, and the column of the second it equals.

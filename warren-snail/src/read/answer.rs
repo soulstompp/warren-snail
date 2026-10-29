@@ -65,6 +65,7 @@ fn merge(into: &mut [Acc], from: &[Acc]) {
 
 /// One value of a row a round keeps.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Cell {
     Null,
     Int(i64),
@@ -96,6 +97,7 @@ pub fn same(a: &[Dict], b: &[Dict]) -> bool {
 
 /// A group's aggregate as rows arrive.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum Acc {
     Count(u64),
     Sum(Option<i128>),

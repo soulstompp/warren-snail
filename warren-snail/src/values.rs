@@ -5,6 +5,7 @@ use parquet::data_type::ByteArray;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Values {
     /// Integers as they are, instants as microseconds since 1970-01-01 UTC.
     Int(Vec<Option<i64>>),

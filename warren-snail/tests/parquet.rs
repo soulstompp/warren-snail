@@ -153,7 +153,7 @@ fn a_table_goes_out_as_its_blocks_and_comes_back_in_by_its_pages() {
             .iter()
             .map(|l| match l {
                 Level::Column(c) => *c as i32,
-                Level::MonthUtc(_) => panic!("a table order on a month"),
+                other => panic!("a table order on {other:?}"),
             })
             .collect();
         for rg in meta.row_groups() {

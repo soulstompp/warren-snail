@@ -14,6 +14,7 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColumnType {
     Int2,
     Int4,
@@ -67,6 +68,7 @@ impl ColumnType {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Column {
     pub name: String,
     pub ty: ColumnType,
@@ -75,6 +77,7 @@ pub struct Column {
 
 /// One level of an order: a column, or the month of a timestamptz column on the UTC clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Level {
     Column(usize),
     MonthUtc(usize),
@@ -90,6 +93,7 @@ impl Level {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Order {
     pub name: String,
     pub levels: Vec<Level>,
@@ -108,6 +112,7 @@ impl Order {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
@@ -141,8 +146,16 @@ impl Table {
     }
 }
 
+/// A type the DDL declares.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Type {
+    pub name: String,
+}
+
 /// A function written in SQL whose body is one expression over its arguments.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Function {
     pub name: String,
     pub args: Vec<ColumnType>,
@@ -150,15 +163,19 @@ pub struct Function {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Catalog {
     /// The DDL as written, kept in the file so the file needs nothing outside itself.
     pub ddl: String,
     pub tables: Vec<Table>,
     pub functions: Vec<Function>,
+    /// The types the DDL declares, which a column of one names by its place here.
+    pub types: Vec<Type>,
 }
 
 /// What an expression reads, once the functions it calls are read through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Shape {
     Column(usize),
     /// A timestamptz column at time zone 'UTC'.
@@ -816,6 +833,7 @@ impl Catalog {
             ddl: ddl.to_string(),
             tables: out,
             functions,
+            types: Vec::new(),
         })
     }
 

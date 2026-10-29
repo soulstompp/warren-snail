@@ -8,6 +8,7 @@ use crate::{Error, Result};
 
 /// What an entry keeps of one of its columns.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Summary {
     pub nulls: u32,
     /// The least and greatest value present; both 0 where every row is NULL, and for text, which keeps
@@ -21,6 +22,7 @@ pub struct Summary {
 /// An entry of an order's directory: a block, or above the blocks a directory page, with the counts
 /// of every row under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Entry {
     /// The sublevels a block's place is cut to; 0 for an entry above the blocks.
     pub depth: u32,
@@ -42,6 +44,7 @@ pub struct Entry {
 
 /// What an order's top page holds besides its entries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Head {
     /// The counting unit k of each column the order holds.
     pub units: Vec<u32>,
@@ -329,6 +332,7 @@ pub fn pack(entries: Vec<Entry>) -> Result<Vec<Vec<Entry>>> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PageEntry {
     pub at: Extent,
     pub first_row: u32,
@@ -338,6 +342,7 @@ pub struct PageEntry {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ColumnPages {
     pub dictionary: Option<Extent>,
     pub pages: Vec<PageEntry>,
@@ -475,6 +480,7 @@ impl MapPages {
 
 /// A block's page map: where each of its columns' pages lie, and which of its rows are dead.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PageMap {
     pub columns: Vec<ColumnPages>,
     /// The rows in the order's order, from the block's first; the rows after them were written into

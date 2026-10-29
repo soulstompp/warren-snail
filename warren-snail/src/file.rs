@@ -14,10 +14,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 const MAGIC: [u8; 8] = *b"wsnail\0\x01";
-/// The format a snail is made in, and the one before it, which is read and written as it is: its
-/// page maps each lie in pages of their own.
-const FORMAT: u32 = 8;
+/// The format a snail is made in, and the two before it, each read and written as it is: format 8,
+/// 0.1.1's, and format 7, 0.1.0's, whose page maps each lie in pages of their own.
+const FORMAT: u32 = 9;
+pub(crate) const FORMAT_EIGHT: u32 = 8;
 pub(crate) const FORMAT_SEVEN: u32 = 7;
+
+/// Whether this build reads and writes a snail of `format`.
+fn reads(format: u32) -> bool {
+    format == FORMAT || format == FORMAT_EIGHT || format == FORMAT_SEVEN
+}
 
 /// The pages a file holds before the next begins, unless the snail is made with another span: 1 GiB.
 pub const FILE_PAGES: u64 = 1 << 18;
@@ -121,6 +127,7 @@ impl<'a> In<'a> {
 
 /// The root: where the catalog and each order's directory lie.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct Root {
     pub generation: u64,
     pub pages: u64,
@@ -241,7 +248,7 @@ impl Root {
             return None;
         }
         let format = i.u32().ok()?;
-        if format != FORMAT && format != FORMAT_SEVEN {
+        if !reads(format) {
             return None;
         }
         let generation = i.u64().ok()?;
@@ -730,9 +737,9 @@ fn newer(both: &[u8]) -> Result<(Root, u32)> {
             for copy in [&both[..PAGE], &both[PAGE..]] {
                 if copy[..8] == MAGIC {
                     let format = u32::from_le_bytes(copy[8..12].try_into().unwrap());
-                    if format != FORMAT && format != FORMAT_SEVEN {
+                    if !reads(format) {
                         return Err(Error::new(format!(
-                            "the snail is of format {format}, and this warren-snail reads formats {FORMAT_SEVEN} and {FORMAT}"
+                            "the snail is of format {format}, and this warren-snail reads formats {FORMAT_SEVEN}, {FORMAT_EIGHT} and {FORMAT}"
                         )));
                     }
                 }
@@ -745,6 +752,7 @@ fn newer(both: &[u8]) -> Result<(Root, u32)> {
 /// Where a commit stops short, for the tests of a crash: before the root, or halfway through it.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Stop {
     BeforeRoot,
     HalfRoot,
@@ -1034,16 +1042,23 @@ mod tests {
             decode_free(&encode_free(&runs, &[], FORMAT_SEVEN), FORMAT_SEVEN).unwrap(),
             (runs.to_vec(), Vec::new())
         );
-        // A root of format 7 is read as one; of another format, the file is refused by its format.
-        let mut seven = r.encode(FORMAT_SEVEN).unwrap();
-        seven.resize(PAGE, 0);
-        assert_eq!(Root::decode(&seven).unwrap().1, FORMAT_SEVEN);
-        let mut nine = r.encode(9).unwrap();
-        nine.resize(PAGE, 0);
-        let mut both = nine.clone();
-        both.extend_from_slice(&nine);
+        assert_eq!(
+            decode_free(&encode_free(&runs, &spent, FORMAT_EIGHT), FORMAT_EIGHT).unwrap(),
+            (runs.to_vec(), spent.to_vec())
+        );
+        // A root of format 7 or 8 is read as one; of another format, the file is refused by its
+        // format.
+        for old in [FORMAT_SEVEN, FORMAT_EIGHT] {
+            let mut page = r.encode(old).unwrap();
+            page.resize(PAGE, 0);
+            assert_eq!(Root::decode(&page).unwrap().1, old);
+        }
+        let mut ten = r.encode(10).unwrap();
+        ten.resize(PAGE, 0);
+        let mut both = ten.clone();
+        both.extend_from_slice(&ten);
         let e = newer(&both).unwrap_err().to_string();
-        assert!(e.contains("format 9"), "{e}");
+        assert!(e.contains("format 10"), "{e}");
         a[20] ^= 1;
         assert!(Root::decode(&a).is_none());
     }

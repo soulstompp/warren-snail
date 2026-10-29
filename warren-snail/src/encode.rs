@@ -24,6 +24,7 @@ use std::sync::Arc;
 pub(crate) const DICTIONARY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DataPage {
     pub bytes: Vec<u8>,
     pub first_row: usize,
@@ -31,6 +32,7 @@ pub struct DataPage {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Encoded {
     pub dictionary: Option<Vec<u8>>,
     pub pages: Vec<DataPage>,

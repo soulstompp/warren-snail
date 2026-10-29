@@ -212,6 +212,7 @@ struct Wasted {
 /// An order a round consulted: the column pages its directory priced the round at, and the exact
 /// prediction from its page maps unless it was left unread.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Consulted {
     pub order: String,
     /// The directory pages read for this order: its directory, and its page maps when predicted.
@@ -225,6 +226,7 @@ pub struct Consulted {
 
 /// What a round read, and what the directory said it would read before it did.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct Round {
     /// The order read, or for a join the order read of each table, the first table read first.
     pub order: String,
@@ -1294,6 +1296,7 @@ pub struct Census {
 
 /// One block's column, as the directory holds it.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BlockRow {
     pub table: String,
     pub order: String,

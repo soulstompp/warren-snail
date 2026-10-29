@@ -14,6 +14,7 @@ use sqlparser::parser::Parser;
 
 /// One value of a row.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Datum {
     Null,
     /// An integer, an instant's microseconds, or a numeric's smallest units.
@@ -27,12 +28,14 @@ pub type Row = Vec<Datum>;
 
 /// Where an inserted row's value comes from: a literal, or a column of the question's answer.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Fill {
     Literal(Datum),
     Answer(usize),
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Source {
     Values(Vec<Row>),
     /// A question, and for each of the table's columns where its value comes from.
@@ -43,6 +46,7 @@ pub enum Source {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Statement {
     Begin,
     Commit,

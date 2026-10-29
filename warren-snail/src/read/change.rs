@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 
 /// What a statement did.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct Done {
     pub statement: &'static str,
     /// The rows it inserted, updated or deleted.

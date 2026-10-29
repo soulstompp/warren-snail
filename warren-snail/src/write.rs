@@ -8,7 +8,9 @@ use crate::directory::{
     build, decode_top, encode_top, ColumnPages, Entry, Head, MapPages, PageEntry, PageMap, Summary,
 };
 use crate::encode::{descriptor, disk_pages, encode, DataPage, Encoded, DICTIONARY_BYTES};
-use crate::file::{encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_SEVEN};
+use crate::file::{
+    encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_EIGHT, FORMAT_SEVEN,
+};
 use crate::places::{key, month_utc, shown, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
@@ -150,6 +152,7 @@ impl Rows {
 
 /// What a write laid out, order by order.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Written {
     pub table: String,
     pub order: String,
@@ -163,6 +166,7 @@ pub struct Written {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ColumnWritten {
     pub name: String,
     pub k: usize,
@@ -368,6 +372,18 @@ pub fn write_format_seven(
     span: u64,
 ) -> Result<Vec<Written>> {
     write_made(path, catalog, tables, &[], span, Some(FORMAT_SEVEN))
+}
+
+/// A new snail as warren-snail 0.1.1 made it, in format 8: for the tests that read and write such a
+/// snail.
+#[doc(hidden)]
+pub fn write_format_eight(
+    path: &Path,
+    catalog: &Catalog,
+    tables: &[(String, Rows)],
+    span: u64,
+) -> Result<Vec<Written>> {
+    write_made(path, catalog, tables, &[], span, Some(FORMAT_EIGHT))
 }
 
 fn write_made(

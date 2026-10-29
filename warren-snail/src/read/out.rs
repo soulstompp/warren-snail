@@ -27,6 +27,7 @@ pub const DDL_KEY: &str = "warren-snail.ddl";
 
 /// A table written out.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TableOut {
     pub table: String,
     /// The table's file, or, where it passes the snail's span, the directory of its files.

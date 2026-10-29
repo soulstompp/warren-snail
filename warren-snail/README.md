@@ -33,8 +33,8 @@ nothing else; `cargo uninstall warren-snail` takes it out again. The library is 
 
 A snail is the file you name; past 1 GiB, Parquet's size for one file of huge data, it goes on
 into `<file>.1`, `<file>.2` and on beside it. The snail is those files and nothing else: deleting
-them deletes it. A snail made since 0.1.1 is of format 8, which 0.1.0 does not open; one 0.1.0 made,
-of format 7, is opened and written in its own format.
+them deletes it. A snail made since 0.2.0 is of format 9, which 0.1.0 and 0.1.1 do not open; one
+either made, of format 7 or 8, is opened and written in its own format.
 
 ## A first snail
 

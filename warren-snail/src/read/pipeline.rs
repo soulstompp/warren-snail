@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 /// One value of a row: a number whole or with its scale, text, bytes, or a truth.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Value {
     Null,
     Int(i64),

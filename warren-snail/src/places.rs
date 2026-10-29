@@ -37,6 +37,7 @@ pub fn month_of(micros: i64) -> Option<i64> {
 /// One level's value in an order's key: a number (an integer, an instant's microseconds, a month),
 /// or text, compared by its bytes. Every value of one level is of one kind.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum KeyValue {
     Int(i64),
     Text(Box<str>),

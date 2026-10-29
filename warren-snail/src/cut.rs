@@ -29,6 +29,7 @@ impl Block {
 /// What one column of an order takes written plain: the same bytes every row, or each row's bytes
 /// summed from the order's first row, so that `sum[b] - sum[a]` is what rows `a..b` take.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Width {
     Fixed(usize),
     Varying(Vec<u64>),

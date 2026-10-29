@@ -743,15 +743,13 @@ fn block_entries(path: &std::path::Path) -> Vec<warren_snail::directory::Entry> 
     out
 }
 
-#[test]
+/// A snail of an older format, made from `s`, answers as this build's own made from it does, before
+/// and after the same statements go into both: inserted, checked, moved and deleted rows. Gives this
+/// build's own.
 #[cfg(feature = "standalone")]
-fn a_snail_of_format_seven_is_read_and_written_as_0_1_0_lays_it_and_stays_of_format_seven() {
-    let s = sample(5_000);
-    let catalog = warren_snail::catalog::Catalog::parse(DDL).unwrap();
-    let seven = tmp("seven.snail");
-    warren_snail::write::write_format_seven(&seven, &catalog, &tables(&s), span()).unwrap();
-    let eight = snail("eight", &s);
-    let order = in_order(&s);
+fn written_alike(old: &std::path::Path, name: &str, s: &Sample) -> std::path::PathBuf {
+    let new = snail(name, s);
+    let order = in_order(s);
     let (network, station, id) = order[100];
     let questions: Vec<String> = vec![
         "SELECT r.feed, count(*) FROM weather.readings r GROUP BY r.feed".into(),
@@ -762,11 +760,10 @@ fn a_snail_of_format_seven_is_read_and_written_as_0_1_0_lays_it_and_stays_of_for
         "SELECT s.name, count(*) FROM weather.stations s GROUP BY s.name".into(),
         format!("SELECT r.feed FROM weather.readings r WHERE r.reading_id = {id}"),
     ];
-    same_answers(&mut fresh(&seven), &mut fresh(&eight), &questions);
-    // The same statements into both: inserted, checked, moved and deleted rows.
-    let (w7, w8) = (
-        &mut Snail::open_writing(&seven).unwrap(),
-        &mut Snail::open_writing(&eight).unwrap(),
+    same_answers(&mut fresh(old), &mut fresh(&new), &questions);
+    let (w_old, w_new) = (
+        &mut Snail::open_writing(old).unwrap(),
+        &mut Snail::open_writing(&new).unwrap(),
     );
     for st in [
         format!(
@@ -780,24 +777,55 @@ fn a_snail_of_format_seven_is_read_and_written_as_0_1_0_lays_it_and_stays_of_for
         ),
         format!("DELETE FROM weather.readings WHERE reading_id = {}", order[400].2),
     ] {
-        w7.execute(&st).unwrap();
-        w8.execute(&st).unwrap();
+        w_old.execute(&st).unwrap();
+        w_new.execute(&st).unwrap();
     }
     for q in &questions {
-        w7.ask(q, None).unwrap();
-        w8.ask(q, None).unwrap();
+        w_old.ask(q, None).unwrap();
+        w_new.ask(q, None).unwrap();
     }
-    same_answers(&mut fresh(&seven), &mut fresh(&eight), &questions);
-    Snail::open(&seven).unwrap().census().unwrap();
-    Snail::open(&eight).unwrap().census().unwrap();
+    same_answers(&mut fresh(old), &mut fresh(&new), &questions);
+    Snail::open(old).unwrap().census().unwrap();
+    Snail::open(&new).unwrap().census().unwrap();
+    new
+}
+
+/// The format a snail's root names.
+#[cfg(feature = "standalone")]
+fn format_of(path: &std::path::Path) -> u32 {
+    let reader = warren_snail::file::Reader::open(path).unwrap();
+    reader.root().unwrap();
+    reader.format()
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_snail_of_format_seven_is_read_and_written_as_0_1_0_lays_it_and_stays_of_format_seven() {
+    let s = sample(5_000);
+    let catalog = warren_snail::catalog::Catalog::parse(DDL).unwrap();
+    let seven = tmp("seven.snail");
+    warren_snail::write::write_format_seven(&seven, &catalog, &tables(&s), span()).unwrap();
+    let nine = written_alike(&seven, "nine-beside-seven", &s);
     // The format 7 snail still names its format, and every block's page map begins a run of its
     // own, as 0.1.0 reads it; this build's own packs them.
-    let reader = warren_snail::file::Reader::open(&seven).unwrap();
-    reader.root().unwrap();
-    assert_eq!(reader.format(), 7);
+    assert_eq!(format_of(&seven), 7);
     assert!(block_entries(&seven)
         .iter()
         .all(|e| e.child.bytes >> 32 == 0));
+    assert!(block_entries(&nine).iter().any(|e| e.child.bytes >> 32 > 0));
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_snail_of_format_eight_is_read_and_written_as_0_1_1_lays_it_and_stays_of_format_eight() {
+    let s = sample(5_000);
+    let catalog = warren_snail::catalog::Catalog::parse(DDL).unwrap();
+    let eight = tmp("eight.snail");
+    warren_snail::write::write_format_eight(&eight, &catalog, &tables(&s), span()).unwrap();
+    let nine = written_alike(&eight, "nine-beside-eight", &s);
+    // Each still names its own format, and the format 8 snail's page maps are packed, as 0.1.1
+    // packs them.
+    assert_eq!((format_of(&eight), format_of(&nine)), (8, 9));
     assert!(block_entries(&eight)
         .iter()
         .any(|e| e.child.bytes >> 32 > 0));
