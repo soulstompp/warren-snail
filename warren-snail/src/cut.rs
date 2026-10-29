@@ -277,7 +277,9 @@ fn unit_within(bytes: usize, largest: usize) -> usize {
 }
 
 /// The most plain bytes one place of the order's leading equality levels takes inside a block, column
-/// by column. Where the order has no such level, a row is its own place.
+/// by column. Where the order has no such level, a row is its own place. A level's NULLs are no place
+/// of it: they lie beside its places, on the places of the levels after it, so a row whose last
+/// equality level is NULL is its own place.
 pub fn largest_place(
     keys: &Keys,
     blocks: &[Block],
@@ -295,7 +297,11 @@ pub fn largest_place(
         let mut i = b.start;
         while i < b.end {
             let mut j = i + 1;
-            while prefix > 0 && j < b.end && keys.row(j)[..prefix] == keys.row(i)[..prefix] {
+            while prefix > 0
+                && j < b.end
+                && !keys.row(i)[prefix - 1].is_null()
+                && keys.row(j)[..prefix] == keys.row(i)[..prefix]
+            {
                 j += 1;
             }
             for (s, m) in most.iter_mut().enumerate() {

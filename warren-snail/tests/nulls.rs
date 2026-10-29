@@ -30,7 +30,8 @@ fn s_of(a: i64) -> Option<String> {
 const DDL: &str = "CREATE TABLE s.t (a bigint NOT NULL, b integer, s text, PRIMARY KEY (a));
 CREATE INDEX t_b ON s.t (b, a);
 CREATE INDEX t_bf ON s.t (b NULLS FIRST, a);
-CREATE INDEX t_s ON s.t (s, a);";
+CREATE INDEX t_s ON s.t (s, a);
+CREATE INDEX t_bs ON s.t (b, s);";
 
 fn rows(n: i64) -> Rows {
     Rows {
@@ -238,7 +239,37 @@ fn is_null_on_a_level_reads_only_its_null_run_and_the_levels_after_it_narrow_it(
         let mut got: Vec<i64> = ints64(b.column(0).as_ref()).into_iter().flatten().collect();
         got.sort();
         assert_eq!((got, round.blocks_read), (want, 1), "{order}");
+        // IS NOT NULL passes over the run's blocks, whose counts hold no value.
+        let all = blocks_of(&rows, order).len() as u64;
+        let (_, round) = ask(&mut s, "SELECT a FROM s.t WHERE b IS NOT NULL", Some(order));
+        assert_eq!(round.blocks_read, all - runs, "{order}");
     }
+}
+
+#[test]
+fn is_null_on_a_level_lets_the_levels_after_it_narrow_the_blocks_read() {
+    // On t_bs the NULL run of b is cut on s. Fixed on b's NULLs, an equality on s reads the run's
+    // blocks that hold it; left a condition to read, it reads every block of the run.
+    let mut s = Snail::open(&written("null-then-text", DDL, 4 * N)).unwrap();
+    let rows = s.blocks().unwrap();
+    let runs = blocks_of(&rows, "t_bs")
+        .iter()
+        .filter(|r| r.first.starts_with("[NULL"))
+        .count() as u64;
+    let (b, round) = ask(
+        &mut s,
+        "SELECT a FROM s.t WHERE b IS NULL AND s = 'w05'",
+        Some("t_bs"),
+    );
+    let want = (0..4 * N)
+        .filter(|&a| b_of(a).is_none() && s_of(a).as_deref() == Some("w05"))
+        .count();
+    assert_eq!(b.num_rows(), want);
+    assert!(
+        runs >= 4 && round.blocks_read * 2 <= runs,
+        "{} of the run's {runs}",
+        round.blocks_read
+    );
 }
 
 #[test]
@@ -538,8 +569,11 @@ fn window_snail(name: &str, index: &str) -> std::path::PathBuf {
     path
 }
 
+/// A key and the rows a window counts from the first to it.
+type Counted = (Option<i64>, Option<i64>);
+
 /// Each row's key and its count of the rows from the first to it, as a window counts them.
-fn counted_along(s: &mut Snail, nulls: &str) -> Result<Vec<(Option<i64>, Option<i64>)>, String> {
+fn counted_along(s: &mut Snail, nulls: &str) -> Result<Vec<Counted>, String> {
     let sql = format!("SELECT k, count(*) OVER (ORDER BY k{nulls}) AS n FROM s.w");
     let (b, _) = s.ask(&sql, None).map_err(|e| e.to_string())?;
     Ok(ints64(b.column(0).as_ref())
@@ -644,4 +678,40 @@ fn a_statement_that_waited_finds_its_rows_again_by_a_key_that_holds_no_null() {
         .ask("SELECT id, v FROM s.k ORDER BY id", None)
         .unwrap();
     assert_eq!(ints64(b.column(1).as_ref()), [Some(100), Some(0), Some(7)]);
+}
+
+#[test]
+fn a_level_s_null_run_is_no_place_of_it_for_the_counting_unit() {
+    // On t_b1, b alone: its values are each a row's, and its NULLs lie beside them, 6,144 rows. Read
+    // as one place of b, the run would make every column's unit twelve pages; beside b's places,
+    // each of its rows is its own place, and the unit is one page.
+    let path = tmp("null-unit.snail");
+    write(
+        &path,
+        &Catalog::parse(
+            "CREATE TABLE s.t (a bigint NOT NULL, b integer, PRIMARY KEY (a));
+             CREATE INDEX t_b1 ON s.t (b);",
+        )
+        .unwrap(),
+        &[(
+            "s.t".to_string(),
+            Rows {
+                columns: vec![
+                    Values::Int((0..N).map(Some).collect()),
+                    Values::Int((0..N).map(|a| (a % 4 == 0).then_some(a)).collect()),
+                ],
+            },
+        )],
+    )
+    .unwrap();
+    let rows = Snail::open(&path).unwrap().blocks().unwrap();
+    let units: Vec<u64> = rows
+        .iter()
+        .filter(|r| r.order == "t_b1")
+        .map(|r| r.k)
+        .collect();
+    assert!(
+        !units.is_empty() && units.iter().all(|&k| k == 1),
+        "{units:?}"
+    );
 }
