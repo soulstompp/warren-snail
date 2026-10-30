@@ -1063,18 +1063,23 @@ fn width(leaf: &crate::catalog::Leaf, values: &Values, perm: &[usize]) -> Width 
         }
         return Width::Bits(summed(&|r| if values.is_null(r) { 0 } else { bits }));
     }
-    // A leaf of a composed column takes its entries' values, whatever its type's width.
+    // A leaf of a composed column takes its entries' values, whatever its type's width; a row none
+    // of whose entries holds a value holds none on the leaf, as a NULL holds none.
     let width = if matches!(values, Values::Nested(_)) {
         None
     } else {
         ty.width()
     };
-    match (width, values.nulls() > 0) {
+    let null = |r: usize| match values {
+        Values::Nested(n) => n.entries(r).all(|e| n.values.is_null(e)),
+        _ => values.is_null(r),
+    };
+    match (width, (0..values.len()).any(null)) {
         (Some(wd), false) => Width::Fixed(wd),
         (None, false) => Width::Varying(summed(&|r| values.plain(r, ty))),
         (_, true) => Width::Nulls {
             bytes: summed(&|r| values.plain(r, ty)),
-            nulls: summed(&|r| values.is_null(r) as u64),
+            nulls: summed(&|r| null(r) as u64),
         },
     }
 }

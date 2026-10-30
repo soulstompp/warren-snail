@@ -204,6 +204,42 @@ fn texts_of(b: &arrow::array::RecordBatch, c: usize) -> Vec<Option<String>> {
         .collect()
 }
 
+#[test]
+fn a_composite_of_one_leaf_counts_for_the_cut_by_its_leaf_s_values() {
+    // 8,192 rows, each a composite whose one field is NULL: its leaf holds no value, so the
+    // integer key decides the cut, 1,024 rows a page, where the field's bigint would decide at 512.
+    let ddl = "CREATE TYPE s.one AS (a bigint); \
+        CREATE TABLE s.t (id integer NOT NULL, o s.one NOT NULL, PRIMARY KEY (id));";
+    let path = weather::tmp("elements-one-leaf-cut.snail");
+    let c = warren_snail::catalog::Catalog::parse(ddl).unwrap();
+    let ty = c.tables[0].columns[1].ty;
+    let o = Values::Composed(
+        (0..8192)
+            .map(|_| Some(Arc::new(Compound::new(ty, Item::Record(vec![Item::Null])))))
+            .collect(),
+    );
+    weather::write(
+        &path,
+        &c,
+        &[(
+            "s.t".into(),
+            warren_snail::write::Rows {
+                columns: vec![Values::Int((0..8192).map(Some).collect()), o],
+            },
+        )],
+    )
+    .unwrap();
+    let rows: Vec<u64> = warren_snail::read::Snail::open(&path)
+        .unwrap()
+        .blocks()
+        .unwrap()
+        .iter()
+        .filter(|r| r.order == "t_pkey" && r.column == "o.a")
+        .map(|r| r.rows)
+        .collect();
+    assert_eq!(rows, [1024; 8]);
+}
+
 const ONE_LEAF: &str = "CREATE TYPE s.none AS (); CREATE TYPE s.one AS (a bigint); \
     CREATE TABLE s.t (id integer NOT NULL, n s.none, o s.one, PRIMARY KEY (id));";
 
