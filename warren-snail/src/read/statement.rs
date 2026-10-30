@@ -100,6 +100,12 @@ pub enum Statement {
         find: String,
         sets: Vec<(usize, Fill)>,
     },
+    /// SET CONSTRAINTS: the foreign keys named, or ALL where none are, deferred to the commit or
+    /// checked at each statement's end until the transaction ends.
+    Constraints {
+        names: Option<Vec<String>>,
+        deferred: bool,
+    },
 }
 
 impl Statement {
@@ -113,6 +119,7 @@ impl Statement {
             Statement::Delete { .. } => "DELETE",
             Statement::Declare { kind, .. } => kind,
             Statement::Set { .. } => "UPDATE",
+            Statement::Constraints { .. } => "SET CONSTRAINTS",
         }
     }
 }
@@ -473,6 +480,10 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         return Ok(Statement::Declare { ddl, kind });
     }
     let tokens = sqlparser::tokenizer::Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize()?;
+    if let Some(read) = crate::ddl::set_constraints(&tokens) {
+        let (names, deferred) = read?;
+        return Ok(Statement::Constraints { names, deferred });
+    }
     if tokens.iter().any(|t| matches!(t, sqlparser::tokenizer::Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("overriding"))) {
         return Err(refused("OVERRIDING SYSTEM VALUE or USER VALUE"));
     }

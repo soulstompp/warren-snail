@@ -6,6 +6,7 @@
 //! up to its top, and the commit is the root.
 
 use super::fill;
+use super::foreign::Touched;
 use super::statement::{self, Datum, Fill, Row, Source, Statement};
 use super::{Snail, Wasted};
 use crate::catalog::{assignable, Catalog, ColumnType, Level, Order, Table};
@@ -61,13 +62,13 @@ pub struct Done {
 /// How a writer takes a block's lock: waiting while another writer has it, as long as it takes,
 /// unless the writers waiting make a ring; or at once or not at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Waiting {
+pub(super) enum Waiting {
     Wait,
     Try,
 }
 
 /// One row's change on a table.
-enum Change {
+pub(super) enum Change {
     Insert(Row),
     Delete(Row),
     Replace(Row, Row),
@@ -93,10 +94,13 @@ pub(super) struct Rebased {
     head: Option<Head>,
 }
 
-/// What a statement under way had staged when it began.
+/// What a statement under way had staged when it began, and what its foreign keys had recorded.
 struct Mark {
     rebased: BTreeMap<(usize, usize), Vec<Rebased>>,
     staged: u64,
+    touched: Touched,
+    pending: Touched,
+    modes: BTreeMap<(usize, usize), bool>,
 }
 
 /// The catalog a statement or a transaction declared: the catalog it began from, its DDL now, and
@@ -120,7 +124,7 @@ struct Node {
 
 /// The entry, among an ordered page's, whose rows a key belongs with: the last whose first key is at
 /// most the key, or the first.
-fn pick(entries: &[Entry], key: &[KeyValue]) -> usize {
+pub(super) fn pick(entries: &[Entry], key: &[KeyValue]) -> usize {
     entries
         .partition_point(|e| e.first.as_slice() <= key)
         .saturating_sub(1)
@@ -139,7 +143,7 @@ fn datum_at(v: &Values, i: usize) -> Datum {
 }
 
 /// A value of a column of type `ty`: bytea's bytes as they are, any other as `datum_at` reads it.
-fn datum_typed(v: &Values, i: usize, ty: ColumnType) -> Datum {
+pub(super) fn datum_typed(v: &Values, i: usize, ty: ColumnType) -> Datum {
     match ty {
         ColumnType::Bytes => v
             .text_value(i)
@@ -178,7 +182,7 @@ fn leaf_datums(ty: ColumnType, d: &Datum) -> Vec<Datum> {
 }
 
 /// A row's key on an order.
-fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
+pub(super) fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
     order
         .levels
         .iter()
@@ -196,7 +200,7 @@ fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
 }
 
 /// The rows of an answer whose columns are the table's, in its order.
-fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
+pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
     let mut rows = vec![Vec::with_capacity(batch.num_columns()); batch.num_rows()];
     let schema = batch.schema();
     for (a, field) in batch.columns().iter().zip(schema.fields()) {
@@ -271,7 +275,7 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
 }
 
 /// Rows of a table's stored columns widened to all its columns, a virtual one NULL.
-fn widen(table: &Table, rows: Vec<Row>) -> Vec<Row> {
+pub(super) fn widen(table: &Table, rows: Vec<Row>) -> Vec<Row> {
     if !table.columns.iter().any(|c| c.is_virtual()) {
         return rows;
     }
@@ -508,10 +512,24 @@ impl Snail {
                 false
             }
             Statement::Commit => {
-                let (_, changed) = self
-                    .begun
-                    .take()
-                    .ok_or_else(|| Error::new("no transaction is begun"))?;
+                if self.begun.is_none() {
+                    return Err(Error::new("no transaction is begun"));
+                }
+                // The foreign keys deferred to the commit are checked on the newest root; one that
+                // fails rolls the transaction back, as PostgreSQL's COMMIT does.
+                let checked = match self.pending.is_empty() {
+                    true => Ok(()),
+                    false => self
+                        .renew_in_transaction()
+                        .and_then(|_| self.keys_at_commit()),
+                };
+                if let Err(e) = checked {
+                    let (root, _) = self.begun.take().expect("a transaction begun");
+                    self.root = root;
+                    self.abandon()?;
+                    return Err(e);
+                }
+                let (_, changed) = self.begun.take().expect("a transaction begun");
                 changed
             }
             Statement::Rollback => {
@@ -524,12 +542,20 @@ impl Snail {
                 false
             }
             st => {
+                self.touched = Touched::default();
                 let mark = self.mark();
                 // The rows the statement found when it began, which it keeps to if it runs again.
                 let mut found = None;
                 loop {
                     self.stale = false;
-                    match self.write_rows(st.clone(), &mut done, &mut found) {
+                    // Its foreign keys are checked as it ends, their actions written first.
+                    let written =
+                        self.write_rows(st.clone(), &mut done, &mut found)
+                            .and_then(|changed| match self.stale {
+                                true => Ok(changed),
+                                false => self.keys_at_statement_end().map(|_| changed),
+                            });
+                    match written {
                         Ok(_) if self.stale => {
                             // A block the statement locked was written since the root it read: it
                             // runs again on the newest root, kept to the rows it found, each in its
@@ -657,6 +683,10 @@ impl Snail {
                 self.declare(&ddl)?;
                 true
             }
+            Statement::Constraints { names, deferred } => {
+                self.constrained(names, deferred)?;
+                false
+            }
             Statement::Begin | Statement::Commit | Statement::Rollback => {
                 unreachable!("a transaction's own statements write no rows")
             }
@@ -754,7 +784,7 @@ impl Snail {
 
     /// The values each column's sequence hands out for the statement, drawn at once: `counts` the
     /// rows that take each column's DEFAULT.
-    fn draws(
+    pub(super) fn draws(
         &mut self,
         t: &Table,
         counts: impl Iterator<Item = (usize, usize)>,
@@ -781,7 +811,7 @@ impl Snail {
 
     /// A column's DEFAULT for one row: its identity's or its nextval's next value drawn, the clock,
     /// a literal, or an expression computed; NULL where it has none.
-    fn default_of(
+    pub(super) fn default_of(
         &self,
         t: &Table,
         c: usize,
@@ -966,12 +996,18 @@ impl Snail {
         Mark {
             rebased: self.rebased.clone(),
             staged: self.reader.staged_mark(),
+            touched: self.touched.clone(),
+            pending: self.pending.clone(),
+            modes: self.modes.clone(),
         }
     }
 
     fn back_to(&mut self, mark: &Mark) {
         self.rebased = mark.rebased.clone();
         self.reader.staged_back_to(mark.staged);
+        self.touched = mark.touched.clone();
+        self.pending = mark.pending.clone();
+        self.modes = mark.modes.clone();
     }
 
     /// What a statement of a transaction reads: the newest root, with the transaction's own changes
@@ -1045,6 +1081,9 @@ impl Snail {
     fn abandon(&mut self) -> Result<()> {
         self.rebased.clear();
         self.reader.clear_staged();
+        self.touched = Touched::default();
+        self.pending = Touched::default();
+        self.modes.clear();
         if self.declared.take().is_some() {
             self.catalog = Snail::catalog(&self.reader, &self.root)?;
         }
@@ -1523,7 +1562,7 @@ impl Snail {
 
     /// Applies one statement's changes to every order of a table. Returns the blocks rewritten in
     /// order, and the orders written.
-    fn apply(&mut self, ti: usize, changes: Vec<Change>) -> Result<(u64, u64)> {
+    pub(super) fn apply(&mut self, ti: usize, changes: Vec<Change>) -> Result<(u64, u64)> {
         let table = self.catalog.tables[ti].clone();
         for c in &changes {
             match c {
@@ -1538,6 +1577,9 @@ impl Snail {
             .into_iter()
             .flatten()
             .collect();
+        if !self.stale {
+            self.touch(ti, &changes);
+        }
         Ok((applied.iter().sum(), applied.len() as u64))
     }
 
@@ -1674,7 +1716,7 @@ impl Snail {
     /// from, by its table, order and first key, in the order of their locks; a block the transaction
     /// staged lies under the lock of the block it began from. Returns false where a lock was not
     /// taken, under `Waiting::Try`, or where a block was written since the root the round reads.
-    fn lock_blocks(
+    pub(super) fn lock_blocks(
         &mut self,
         ti: usize,
         oi: usize,
@@ -1705,6 +1747,14 @@ impl Snail {
         }
         self.locks.extend(got);
         // Each block, under its lock, is the block the newest root names at its first key.
+        let blocks: Vec<Entry> = want.into_iter().map(|(_, e)| e).collect();
+        self.newest_names(ti, oi, &blocks)
+    }
+
+    /// Whether the newest root names each block the round reads, by its first key: a block the
+    /// transaction staged lies under the lock of the block it began from, and is its own.
+    pub(super) fn newest_names(&self, ti: usize, oi: usize, blocks: &[Entry]) -> Result<bool> {
+        let blocks: Vec<&Entry> = blocks.iter().filter(|e| e.child.start < STAGED).collect();
         let root = self.reader.peek_root()?;
         let table = &self.catalog.tables[ti];
         let order = &table.orders[oi];
@@ -1716,13 +1766,16 @@ impl Snail {
                 Error::new(format!("{}: the root names no {}", table.name, order.name))
             })?;
         let (head, entries) = decode_top(&self.reader.read_extent(root.orders[at].2)?)?;
+        if entries.is_empty() && !blocks.is_empty() {
+            return Ok(false);
+        }
         let mut top = Node {
             entries,
             height: head.height,
             kids: BTreeMap::new(),
             at: Extent::default(),
         };
-        for (_, e) in &want {
+        for e in blocks {
             let mut path = Vec::new();
             self.locate(&mut top, &head, &e.first, &mut path)?;
             if entry_at(&top, &path).child != e.child {
@@ -1733,7 +1786,7 @@ impl Snail {
     }
 
     /// Whether an order holds no row in the newest root, or is one the newest root does not name yet.
-    fn empty_in_newest(&self, table: &Table, order: &Order) -> Result<bool> {
+    pub(super) fn empty_in_newest(&self, table: &Table, order: &Order) -> Result<bool> {
         let root = self.reader.peek_root()?;
         match root
             .orders
@@ -2267,6 +2320,34 @@ impl Snail {
                         )));
                     }
                 }
+            }
+        }
+        // A foreign key added valid, or validated, on a table that holds rows is checked against
+        // every row, as the catalog declared reads it.
+        let mut validated: Vec<(usize, usize)> = Vec::new();
+        for (ci, t) in catalog.tables.iter().enumerate() {
+            let Some(o) = self.catalog.tables.iter().find(|x| x.name == t.name) else {
+                continue;
+            };
+            for (fi, k) in t.foreign_keys.iter().enumerate() {
+                let was = o.foreign_keys.iter().any(|x| x.name == k.name && x.valid);
+                if k.valid && k.enforced && !was && self.holds_rows(o)? {
+                    validated.push((ci, fi));
+                }
+            }
+        }
+        if !validated.is_empty() {
+            let before = std::mem::replace(&mut self.catalog, catalog.clone());
+            let mut checked = Ok(true);
+            for &(ci, fi) in &validated {
+                checked = self.key_validated(ci, fi);
+                if !matches!(checked, Ok(true)) {
+                    break;
+                }
+            }
+            self.catalog = before;
+            if !checked? {
+                return Ok(());
             }
         }
         let mut stage = self.reader.stage();

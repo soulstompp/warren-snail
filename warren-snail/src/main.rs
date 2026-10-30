@@ -367,6 +367,7 @@ fn cmd_write(args: &[String]) -> Result<()> {
         .tables
         .iter()
         .filter_map(|t| t.laid_out_on_arrival())
+        .chain(catalog.tables.iter().flat_map(|t| t.keys_read_whole()))
     {
         println!("{word}");
     }

@@ -520,6 +520,62 @@ pub struct Check {
     pub valid: bool,
 }
 
+/// What a foreign key does to the rows that reference a row of its parent deleted, or whose key
+/// changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Action {
+    /// Refused where a row still references the key once the round's changes are checked.
+    NoAction,
+    /// Refused where a row references the key, whatever else the round wrote.
+    Restrict,
+    /// The referencing rows deleted, or given the new key.
+    Cascade,
+    /// The referencing columns set NULL: those the DDL lists, ON DELETE only; every one where it
+    /// lists none.
+    SetNull(Vec<usize>),
+    /// The referencing columns set to their DEFAULT, listed as SET NULL's are.
+    SetDefault(Vec<usize>),
+}
+
+impl ForeignKey {
+    /// The columns an action sets: those it lists, or every referencing column.
+    pub fn set_by(&self, action: &Action) -> Vec<usize> {
+        match action {
+            Action::SetNull(c) | Action::SetDefault(c) if !c.is_empty() => c.clone(),
+            _ => self.columns.clone(),
+        }
+    }
+}
+
+/// A FOREIGN KEY: a row's reference is in its parent's key, unless the reference holds a NULL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForeignKey {
+    pub name: String,
+    /// The table's referencing columns, in the order written.
+    pub columns: Vec<usize>,
+    /// The table referenced.
+    pub parent: String,
+    /// The parent's columns, each matching the referencing column at its place.
+    pub parent_columns: Vec<usize>,
+    /// The parent's order that stands for the PRIMARY KEY, UNIQUE or unique index referenced.
+    pub key: String,
+    /// MATCH FULL: a reference holding a NULL holds only NULLs. Otherwise MATCH SIMPLE: a
+    /// reference holding a NULL references nothing.
+    pub full: bool,
+    pub on_delete: Action,
+    pub on_update: Action,
+    pub deferrable: bool,
+    /// INITIALLY DEFERRED: checked at the commit, unless SET CONSTRAINTS says otherwise.
+    pub deferred: bool,
+    /// NOT ENFORCED checks nothing and acts on nothing.
+    pub enforced: bool,
+    /// Whether every row was checked: false where it was added NOT VALID, or NOT ENFORCED, and not
+    /// validated since.
+    pub valid: bool,
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Table {
@@ -530,6 +586,8 @@ pub struct Table {
     pub checks: Vec<Check>,
     /// The PostgreSQL release whose catalog names its reg* values.
     pub release: u8,
+    /// Its foreign keys, each referencing a table of the file.
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 impl Table {
@@ -602,6 +660,51 @@ impl Table {
                 self.name, order.name, col.name
             )
         })
+    }
+
+    /// The order whose first levels are the columns given, in whatever order: the table's own
+    /// order first, then its indexes in turn.
+    pub fn order_led_by(&self, columns: &[usize]) -> Option<usize> {
+        let mut want = columns.to_vec();
+        want.sort_unstable();
+        self.orders.iter().position(|o| {
+            let mut lead: Vec<usize> = o
+                .levels
+                .iter()
+                .take(want.len())
+                .filter_map(|l| match l {
+                    Level::Column(c) => Some(*c),
+                    Level::MonthUtc(_) => None,
+                })
+                .collect();
+            lead.sort_unstable();
+            lead == want
+        })
+    }
+
+    /// What `write` says of each foreign key whose columns lead none of the table's orders: a
+    /// change of its parent's key reads the table whole.
+    pub fn keys_read_whole(&self) -> Vec<String> {
+        self.foreign_keys
+            .iter()
+            .filter(|k| k.enforced && self.order_led_by(&k.columns).is_none())
+            .map(|k| {
+                let columns: Vec<&str> = k
+                    .columns
+                    .iter()
+                    .map(|&c| self.columns[c].name.as_str())
+                    .collect();
+                format!(
+                    "{}: no order or index leads with {}, the columns of its foreign key {}, so a \
+                     key of {} taken away reads {} whole",
+                    self.name,
+                    columns.join(", "),
+                    k.name,
+                    k.parent,
+                    self.name
+                )
+            })
+            .collect()
     }
 }
 
@@ -2014,7 +2117,7 @@ mod tests {
             ("CREATE TABLE s.t (a integer NOT NULL, b integer GENERATED ALWAYS AS (a), PRIMARY KEY (a)); CREATE INDEX x ON s.t (b)", "virtual generated columns"),
             ("CREATE TABLE s.t (a text GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (a))", "identity column type"),
             ("CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a), UNIQUE (b) DEFERRABLE INITIALLY DEFERRED)", "INITIALLY DEFERRED is not held"),
-            ("CREATE TABLE s.t (a integer NOT NULL REFERENCES s.u (a), PRIMARY KEY (a))", "a FOREIGN KEY is not held yet"),
+            ("CREATE TABLE s.t (a integer NOT NULL REFERENCES s.u (a), PRIMARY KEY (a))", "relation \"s.u\" does not exist"),
             ("CREATE TEMP TABLE s.t (a integer NOT NULL, PRIMARY KEY (a))", "logged and lasting"),
             ("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)) PARTITION BY RANGE (a)", "is not read: only a table's columns"),
             ("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t (a int8_ops)", "the operator class int8_ops is not read"),

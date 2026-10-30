@@ -5,10 +5,10 @@
 //! rest. Each form refuses by name what it does not know.
 
 use crate::catalog::{
-    assignable, format_type, held_type, ident, level, object_name, shape, Catalog, Check,
-    Collation, Column, ColumnType, Domain, DomainCheck, Fact, Function, Generated, Identity,
-    KeyConstraint, Level, Order, Reading, Sequence, SequenceType, Shape, StatementRead, Table,
-    Type, TypeKind, BYTE_ORDER, TEXT_OPCLASSES,
+    assignable, format_type, held_type, ident, level, object_name, shape, Action, Catalog, Check,
+    Collation, Column, ColumnType, Domain, DomainCheck, Fact, ForeignKey, Function, Generated,
+    Identity, KeyConstraint, Level, Order, Reading, Sequence, SequenceType, Shape, StatementRead,
+    Table, Type, TypeKind, BYTE_ORDER, TEXT_OPCLASSES,
 };
 use crate::{Error, Result};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -892,6 +892,229 @@ fn create_collation(c: &mut Cursor) -> Result<Form> {
     })
 }
 
+/// A FOREIGN KEY as written, before its names are found: in a column's REFERENCES, a table's
+/// FOREIGN KEY, or ALTER TABLE … ADD.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyReference {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub parent: String,
+    /// The parent's columns, where written; else its primary key's.
+    pub parent_columns: Option<Vec<String>>,
+    pub full: bool,
+    /// Each action as PostgreSQL's catalog codes it (`a`, `r`, `c`, `n`, `d`), with the columns
+    /// SET NULL or SET DEFAULT lists.
+    pub on_delete: (char, Vec<String>),
+    pub on_update: (char, Vec<String>),
+    pub deferrable: bool,
+    pub deferred: bool,
+    pub enforced: bool,
+    pub not_valid: bool,
+}
+
+/// The attributes written after a constraint, as PostgreSQL's grammar reads them: [NOT]
+/// DEFERRABLE, INITIALLY DEFERRED or IMMEDIATE, [NOT] ENFORCED, and where `table`, NOT VALID and
+/// NO INHERIT. Returns (deferrable, deferred, enforced, not valid), each as written.
+fn constraint_attributes(
+    c: &mut Cursor,
+    table: bool,
+    what: &str,
+) -> Result<(Option<bool>, Option<bool>, Option<bool>, bool)> {
+    let (mut deferrable, mut deferred, mut enforced, mut not_valid) = (None, None, None, false);
+    let set = |slot: &mut Option<bool>, v: bool| -> Result<()> {
+        if slot.is_some_and(|s| s != v) {
+            return Err(Error::new(format!(
+                "{what}: conflicting constraint properties"
+            )));
+        }
+        *slot = Some(v);
+        Ok(())
+    };
+    loop {
+        if c.kws(&["NOT", "DEFERRABLE"]) {
+            set(&mut deferrable, false)?;
+        } else if c.kw("DEFERRABLE") {
+            set(&mut deferrable, true)?;
+        } else if c.kws(&["INITIALLY", "DEFERRED"]) {
+            set(&mut deferred, true)?;
+        } else if c.kws(&["INITIALLY", "IMMEDIATE"]) {
+            set(&mut deferred, false)?;
+        } else if c.kws(&["NOT", "ENFORCED"]) {
+            set(&mut enforced, false)?;
+        } else if c.kw("ENFORCED") {
+            set(&mut enforced, true)?;
+        } else if table && c.kws(&["NOT", "VALID"]) {
+            not_valid = true;
+        } else if table && c.kws(&["NO", "INHERIT"]) {
+            return Err(Error::new(format!(
+                "{what}: FOREIGN KEY constraints cannot be marked NO INHERIT"
+            )));
+        } else {
+            break;
+        }
+        if deferrable == Some(false) && deferred == Some(true) {
+            return Err(Error::new(format!(
+                "{what}: constraint declared INITIALLY DEFERRED must be DEFERRABLE"
+            )));
+        }
+    }
+    Ok((deferrable, deferred, enforced, not_valid))
+}
+
+/// One referential action, after ON DELETE or ON UPDATE: its code, and the columns SET NULL or SET
+/// DEFAULT lists, only ON DELETE's.
+fn referential_action(c: &mut Cursor, delete: bool, what: &str) -> Result<(char, Vec<String>)> {
+    let code = if c.kws(&["NO", "ACTION"]) {
+        'a'
+    } else if c.kw("RESTRICT") {
+        'r'
+    } else if c.kw("CASCADE") {
+        'c'
+    } else if c.kws(&["SET", "NULL"]) {
+        'n'
+    } else if c.kws(&["SET", "DEFAULT"]) {
+        'd'
+    } else {
+        return Err(c.wanted("NO ACTION, RESTRICT, CASCADE, SET NULL or SET DEFAULT"));
+    };
+    let mut columns = Vec::new();
+    if matches!(code, 'n' | 'd') && c.peek() == Some(&Token::LParen) {
+        let set = if code == 'n' {
+            "SET NULL"
+        } else {
+            "SET DEFAULT"
+        };
+        if !delete {
+            return Err(Error::new(format!(
+                "{what}: a column list with {set} is only supported for ON DELETE actions"
+            )));
+        }
+        let mut g = Cursor {
+            t: c.group()?,
+            i: 0,
+        };
+        loop {
+            columns.push(g.ident()?);
+            if !g.token(Token::Comma) {
+                break;
+            }
+        }
+        end(&g, what)?;
+    }
+    Ok((code, columns))
+}
+
+/// A foreign key's REFERENCES and what follows it, the cursor standing at REFERENCES: the parent,
+/// its columns, MATCH, the actions and the attributes. `table` where it is a table's constraint.
+fn key_reference(
+    c: &mut Cursor,
+    name: Option<String>,
+    columns: Vec<String>,
+    table: bool,
+    what: &str,
+) -> Result<KeyReference> {
+    c.expect("REFERENCES")?;
+    let parent = c.name()?;
+    let parent_columns = if c.peek() == Some(&Token::LParen) {
+        let mut g = Cursor {
+            t: c.group()?,
+            i: 0,
+        };
+        let mut out = Vec::new();
+        loop {
+            if g.is("PERIOD") {
+                return Err(Error::new(format!(
+                    "{what}: a foreign key on a PERIOD, a temporal key, is not held yet: its \
+                     period is a range, which the snail does not hold yet"
+                )));
+            }
+            out.push(g.ident()?);
+            if !g.token(Token::Comma) {
+                break;
+            }
+        }
+        end(&g, what)?;
+        Some(out)
+    } else {
+        None
+    };
+    let full = if c.kw("MATCH") {
+        if c.kw("FULL") {
+            true
+        } else if c.kw("SIMPLE") {
+            false
+        } else if c.kw("PARTIAL") {
+            return Err(Error::new(format!(
+                "{what}: MATCH PARTIAL not yet implemented"
+            )));
+        } else {
+            return Err(c.wanted("FULL, PARTIAL or SIMPLE"));
+        }
+    } else {
+        false
+    };
+    let (mut on_delete, mut on_update) = (None, None);
+    loop {
+        if on_delete.is_none() && c.kws(&["ON", "DELETE"]) {
+            on_delete = Some(referential_action(c, true, what)?);
+        } else if on_update.is_none() && c.kws(&["ON", "UPDATE"]) {
+            on_update = Some(referential_action(c, false, what)?);
+        } else {
+            break;
+        }
+    }
+    let (deferrable, deferred, enforced, not_valid) = constraint_attributes(c, table, what)?;
+    let deferred = deferred.unwrap_or(false);
+    Ok(KeyReference {
+        name,
+        columns,
+        parent,
+        parent_columns,
+        full,
+        on_delete: on_delete.unwrap_or(('a', Vec::new())),
+        on_update: on_update.unwrap_or(('a', Vec::new())),
+        // INITIALLY DEFERRED makes it DEFERRABLE, as PostgreSQL's grammar does.
+        deferrable: deferrable.unwrap_or(false) || deferred,
+        deferred,
+        enforced: enforced.unwrap_or(true),
+        not_valid,
+    })
+}
+
+/// A table's FOREIGN KEY constraint, the cursor standing at its first word: [CONSTRAINT name]
+/// FOREIGN KEY (columns) REFERENCES …; none where it is another constraint.
+fn table_key_reference(c: &mut Cursor, what: &str) -> Result<Option<KeyReference>> {
+    let start = c.i;
+    let name = if c.kw("CONSTRAINT") {
+        Some(c.ident()?)
+    } else {
+        None
+    };
+    if !c.kws(&["FOREIGN", "KEY"]) {
+        c.i = start;
+        return Ok(None);
+    }
+    let mut g = Cursor {
+        t: c.group()?,
+        i: 0,
+    };
+    let mut columns = Vec::new();
+    loop {
+        if g.is("PERIOD") {
+            return Err(Error::new(format!(
+                "{what}: a foreign key on a PERIOD, a temporal key, is not held yet: its period \
+                 is a range, which the snail does not hold yet"
+            )));
+        }
+        columns.push(g.ident()?);
+        if !g.token(Token::Comma) {
+            break;
+        }
+    }
+    end(&g, what)?;
+    key_reference(c, name, columns, true, what).map(Some)
+}
+
 /// What a column of a CREATE TABLE writes that sqlparser 0.63 does not read, taken out of its
 /// tokens: its identity and the sequence's options, its generation expression, and NULLS [NOT]
 /// DISTINCT on its UNIQUE.
@@ -902,8 +1125,9 @@ pub(crate) struct ColumnExtras {
     pub unique_nulls_distinct: Option<bool>,
 }
 
-/// A CREATE TABLE's tokens with what sqlparser does not read taken out, and what each column wrote.
-pub(crate) type TableExtras = (Vec<Token>, Vec<(String, ColumnExtras)>);
+/// A CREATE TABLE's tokens with what sqlparser does not read taken out, what each column wrote, and
+/// its foreign keys, in the order written.
+pub(crate) type TableExtras = (Vec<Token>, Vec<(String, ColumnExtras)>, Vec<KeyReference>);
 
 /// A CREATE INDEX's tokens with its operator classes' parameters taken out, and those, by key.
 pub(crate) type IndexExtras = (Vec<Token>, Vec<(usize, String)>);
@@ -938,11 +1162,9 @@ pub(crate) fn create_table_extras(tokens: &[Token]) -> Result<Option<TableExtras
     let elements = head.items()?;
     let close = head.i;
     let mut extras = Vec::new();
-    let mut kept: Vec<Token> = c.t[..open + 1].to_vec();
-    for (n, element) in elements.into_iter().enumerate() {
-        if n > 0 {
-            kept.push(Token::Comma);
-        }
+    let mut references = Vec::new();
+    let mut kept_elements: Vec<Vec<Token>> = Vec::new();
+    for element in elements {
         let mut e = Cursor { t: element, i: 0 };
         let first = matches!(e.peek(), Some(Token::Word(w)) if w.quote_style.is_none()
             && ["CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "EXCLUDE", "LIKE"]
@@ -957,28 +1179,37 @@ pub(crate) fn create_table_extras(tokens: &[Token]) -> Result<Option<TableExtras
                     "{table}: a key WITHOUT OVERLAPS, a temporal key, is not held"
                 )));
             }
-            if e.t.iter().any(|t| Cursor::word_is(Some(t), "PERIOD")) {
-                return Err(Error::new(format!(
-                    "{table}: a foreign key on a PERIOD, a temporal key, is not held"
-                )));
+            if let Some(r) = table_key_reference(&mut e, &table)? {
+                end(&e, &format!("{table}'s FOREIGN KEY"))?;
+                references.push(r);
+                continue;
             }
-            if e.t.iter().any(|t| Cursor::word_is(Some(t), "REFERENCES")) {
-                return Err(Error::new(format!(
-                    "{table}: a FOREIGN KEY is not held yet"
-                )));
-            }
-            kept.extend(e.t);
+            kept_elements.push(e.t);
             continue;
         }
         let column = e.ident()?;
-        if e.t.iter().any(|t| Cursor::word_is(Some(t), "REFERENCES")) {
-            return Err(Error::new(format!(
-                "{table}.{column}: a FOREIGN KEY is not held yet"
-            )));
-        }
         let mut x = ColumnExtras::default();
         let mut out: Vec<Token> = e.t[..e.i].to_vec();
         while !e.done() {
+            // A REFERENCES, named or not, with its MATCH, actions and attributes.
+            if e.is("REFERENCES")
+                || (e.is("CONSTRAINT") && Cursor::word_is(e.peek_at(2), "REFERENCES"))
+            {
+                let name = if e.kw("CONSTRAINT") {
+                    Some(e.ident()?)
+                } else {
+                    None
+                };
+                let what = format!("{table}.{column}");
+                references.push(key_reference(
+                    &mut e,
+                    name,
+                    vec![column.clone()],
+                    false,
+                    &what,
+                )?);
+                continue;
+            }
             if e.kws(&["GENERATED", "ALWAYS", "AS", "IDENTITY"])
                 || e.kws(&["GENERATED", "BY", "DEFAULT", "AS", "IDENTITY"])
             {
@@ -1030,11 +1261,18 @@ pub(crate) fn create_table_extras(tokens: &[Token]) -> Result<Option<TableExtras
             out.push(e.t[e.i].clone());
             e.i += 1;
         }
-        kept.extend(out);
+        kept_elements.push(out);
         extras.push((column, x));
     }
+    let mut kept: Vec<Token> = c.t[..open + 1].to_vec();
+    for (n, element) in kept_elements.into_iter().enumerate() {
+        if n > 0 {
+            kept.push(Token::Comma);
+        }
+        kept.extend(element);
+    }
     kept.extend_from_slice(&c.t[close - 1..]);
-    Ok(Some((kept, extras)))
+    Ok(Some((kept, extras, references)))
 }
 
 /// A CREATE INDEX's tokens with each operator class's parameters taken out, and those taken, by
@@ -1444,6 +1682,7 @@ struct Declared {
     checks: Vec<Check>,
     indexes: Vec<Keyed>,
     clustered: Option<String>,
+    foreign_keys: Vec<ForeignKey>,
 }
 
 impl Declared {
@@ -1464,8 +1703,8 @@ struct Draft {
     domains: Vec<Domain>,
     sequences: Vec<Sequence>,
     collations: Vec<Collation>,
-    /// The CHECKs' names, each schema-qualified, which PostgreSQL keeps unique in a schema beside
-    /// the keys' names.
+    /// The CHECKs' and the foreign keys' names, each schema-qualified, which PostgreSQL chooses
+    /// unique in a schema beside the keys' names.
     check_names: Vec<String>,
 }
 
@@ -1781,8 +2020,8 @@ impl Draft {
         if let Some(form) = read(tokens) {
             return self.form(form?);
         }
-        if let Some((kept, extras)) = create_table_extras(tokens)? {
-            return self.create_table(&kept, extras);
+        if let Some((kept, extras, fks)) = create_table_extras(tokens)? {
+            return self.create_table(&kept, extras, fks);
         }
         let (kind, object) = head(tokens);
         if kind == "CREATE INDEX" || kind == "CREATE UNIQUE INDEX" {
@@ -2156,8 +2395,8 @@ impl Draft {
         Ok(Some((table, column)))
     }
 
-    /// ALTER TABLE … ADD [CONSTRAINT n] CHECK (…) [NOT VALID], and VALIDATE CONSTRAINT; CLUSTER ON is
-    /// read before. Any other form is refused by name.
+    /// ALTER TABLE … ADD [CONSTRAINT n] CHECK (…) [NOT VALID], ADD [CONSTRAINT n] FOREIGN KEY …, and
+    /// VALIDATE CONSTRAINT; CLUSTER ON is read before. Any other form is refused by name.
     fn alter_table(&mut self, tokens: &[Token], object: &str) -> Result<Vec<String>> {
         let mut c = Cursor::new(tokens);
         c.kws(&["ALTER", "TABLE"]);
@@ -2172,6 +2411,16 @@ impl Draft {
             let n = c.ident()?;
             end(&c, &format!("ALTER TABLE {name}"))?;
             let t = self.table_mut(&name).unwrap();
+            if let Some(k) = t.foreign_keys.iter_mut().find(|k| k.name == n) {
+                if !k.enforced {
+                    return Err(Error::new(format!(
+                        "cannot validate NOT ENFORCED constraint \"{n}\" of relation \"{}\"",
+                        bare(&name)
+                    )));
+                }
+                k.valid = true;
+                return Ok(notices);
+            }
             let k = t.checks.iter_mut().find(|k| k.name == n).ok_or_else(|| {
                 Error::new(format!(
                     "constraint \"{n}\" of relation \"{name}\" does not exist"
@@ -2182,9 +2431,19 @@ impl Draft {
         }
         if !c.kw("ADD") {
             return Err(Error::new(format!(
-                "ALTER TABLE {object}: only ADD CHECK, VALIDATE CONSTRAINT and CLUSTER ON are read"
+                "ALTER TABLE {object}: only ADD CHECK, ADD FOREIGN KEY, VALIDATE CONSTRAINT and \
+                 CLUSTER ON are read"
             )));
         }
+        let at = c.i;
+        if let Some(r) = table_key_reference(&mut c, &format!("ALTER TABLE {name}"))? {
+            end(&c, &format!("ALTER TABLE {name} ADD FOREIGN KEY"))?;
+            let k = self.reference(&name, r, false)?;
+            self.check_names.push(qualified(&schema, &k.name));
+            self.table_mut(&name).unwrap().foreign_keys.push(k);
+            return Ok(notices);
+        }
+        c.i = at;
         let given = if c.kw("CONSTRAINT") {
             Some(c.ident()?)
         } else {
@@ -2192,7 +2451,7 @@ impl Draft {
         };
         if !c.kw("CHECK") {
             return Err(Error::new(format!(
-                "ALTER TABLE {object} ADD {}: only a CHECK is added",
+                "ALTER TABLE {object} ADD {}: only a CHECK or a FOREIGN KEY is added",
                 c.rest()
             )));
         }
@@ -2254,6 +2513,7 @@ impl Draft {
         &mut self,
         kept: &[Token],
         mut extras: Vec<(String, ColumnExtras)>,
+        fks: Vec<KeyReference>,
     ) -> Result<Vec<String>> {
         let mut notices = Vec::new();
         let st = Parser::new(&PostgreSqlDialect {})
@@ -2587,6 +2847,7 @@ impl Draft {
             checks: Vec::new(),
             indexes: Vec::new(),
             clustered: None,
+            foreign_keys: Vec::new(),
         });
         for (cname, s) in serials {
             let seq = next.column_sequence(&name, &cname, s, &[], false)?;
@@ -2723,8 +2984,215 @@ impl Draft {
             None => {}
         }
         d.checks = table_checks;
+        // The foreign keys, named as PostgreSQL names them, in the order written: once the table's
+        // own keys are made, so that it may reference itself. Each is valid, the table being empty.
+        for r in fks {
+            let k = next.reference(&name, r, true)?;
+            next.check_names.push(qualified(&schema, &k.name));
+            next.table_mut(&name).unwrap().foreign_keys.push(k);
+        }
         *self = next;
         Ok(notices)
+    }
+
+    /// A foreign key of the table `child` as written, its columns and its parent's key found: the
+    /// parent a table the draft holds, the child itself among them. `made` where the child is made
+    /// by the statement, so that NOT VALID has nothing to pass over.
+    fn reference(&self, child: &str, r: KeyReference, made: bool) -> Result<ForeignKey> {
+        let t = self.table(child).expect("the child the draft holds");
+        let schema = schema_of(child);
+        let column_of = |d: &Declared, n: &str| -> Result<usize> {
+            d.columns.iter().position(|c| c.name == n).ok_or_else(|| {
+                Error::new(format!(
+                    "column \"{n}\" referenced in foreign key constraint does not exist"
+                ))
+            })
+        };
+        let columns: Vec<usize> = r
+            .columns
+            .iter()
+            .map(|n| column_of(t, n))
+            .collect::<Result<_>>()?;
+        let parent = self
+            .table(&r.parent)
+            .ok_or_else(|| Error::new(format!("relation \"{}\" does not exist", r.parent)))?;
+        let pname = bare(&parent.name);
+        // The key referenced: the primary key where no columns are written, else the first unique
+        // key on those columns, as PostgreSQL's transformFkeyCheckAttrs finds it.
+        let (key, parent_columns) = match &r.parent_columns {
+            None => {
+                let p = parent.primary.as_ref().ok_or_else(|| {
+                    Error::new(format!(
+                        "there is no primary key for referenced table \"{pname}\""
+                    ))
+                })?;
+                if p.constraint.as_ref().is_some_and(|k| k.deferrable) {
+                    return Err(Error::new(format!(
+                        "cannot use a deferrable primary key for referenced table \"{pname}\""
+                    )));
+                }
+                (p, p.levels.iter().map(|l| l.column()).collect::<Vec<_>>())
+            }
+            Some(names) => {
+                let wanted: Vec<usize> = names
+                    .iter()
+                    .map(|n| column_of(parent, n))
+                    .collect::<Result<_>>()?;
+                if dedup(wanted.iter().copied()).len() != wanted.len() {
+                    return Err(Error::new(
+                        "foreign key referenced-columns list must not contain duplicates",
+                    ));
+                }
+                let mut deferrable = false;
+                let mut found = None;
+                for k in parent.keys().filter(|k| k.unique) {
+                    let mut on: Vec<usize> = Vec::new();
+                    for l in &k.levels {
+                        match l {
+                            Level::Column(c) => on.push(*c),
+                            Level::MonthUtc(_) => on.clear(),
+                        }
+                    }
+                    let mut a = on.clone();
+                    let mut b = wanted.clone();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    if on.len() != k.levels.len() || a != b {
+                        continue;
+                    }
+                    if k.constraint.as_ref().is_some_and(|c| c.deferrable) {
+                        deferrable = true;
+                        continue;
+                    }
+                    found = Some(k);
+                    break;
+                }
+                match found {
+                    Some(k) => (k, wanted),
+                    None if deferrable => {
+                        return Err(Error::new(format!(
+                            "cannot use a deferrable unique constraint for referenced table \
+                             \"{pname}\""
+                        )))
+                    }
+                    None => {
+                        return Err(Error::new(format!(
+                            "there is no unique constraint matching given keys for referenced \
+                             table \"{pname}\""
+                        )))
+                    }
+                }
+            }
+        };
+        if columns.len() != parent_columns.len() {
+            return Err(Error::new(
+                "number of referencing and referenced columns for foreign key disagree",
+            ));
+        }
+        let name = match &r.name {
+            Some(n) => {
+                let own = t
+                    .keys()
+                    .filter(|k| k.constraint.is_some())
+                    .map(|k| k.name.as_str())
+                    .chain(t.checks.iter().map(|k| k.name.as_str()))
+                    .chain(t.foreign_keys.iter().map(|k| k.name.as_str()));
+                if own.into_iter().any(|x| x == n) {
+                    return Err(Error::new(format!(
+                        "constraint \"{n}\" for relation \"{}\" already exists",
+                        bare(child)
+                    )));
+                }
+                n.clone()
+            }
+            None => choose(
+                bare(child),
+                Some(&name_addition(&r.columns)),
+                "fkey",
+                &|n| self.constraint(schema, n) || t.foreign_keys.iter().any(|k| k.name == n),
+            ),
+        };
+        for (&c, &p) in columns.iter().zip(&parent_columns) {
+            let (a, b) = (t.columns[c].ty, parent.columns[p].ty);
+            if !comparable(a, b) {
+                return Err(Error::new(format!(
+                    "foreign key constraint \"{name}\" cannot be implemented: key columns \"{}\" \
+                     of the referencing table and \"{}\" of the referenced table are of types {} \
+                     and {}, and the snail compares a reference with a key of its own type only, \
+                     an integer with any integer",
+                    t.columns[c].name,
+                    parent.columns[p].name,
+                    a.pg_name(),
+                    b.pg_name()
+                )));
+            }
+        }
+        let action = |(code, listed): (char, Vec<String>)| -> Result<Action> {
+            let mut set: Vec<usize> = Vec::new();
+            for n in &listed {
+                match column_of(t, n) {
+                    Ok(c) if columns.contains(&c) => {
+                        if !set.contains(&c) {
+                            set.push(c);
+                        }
+                    }
+                    _ => {
+                        return Err(Error::new(format!(
+                            "column \"{n}\" referenced in ON DELETE SET action must be part of \
+                             foreign key"
+                        )))
+                    }
+                }
+            }
+            Ok(match code {
+                'r' => Action::Restrict,
+                'c' => Action::Cascade,
+                'n' => Action::SetNull(set),
+                'd' => Action::SetDefault(set),
+                _ => Action::NoAction,
+            })
+        };
+        let on_delete = action(r.on_delete)?;
+        let on_update = action(r.on_update)?;
+        for &c in &columns {
+            match &t.columns[c].generated {
+                Some(g) if !g.stored => {
+                    return Err(Error::new(
+                        "foreign key constraints on virtual generated columns are not supported",
+                    ))
+                }
+                Some(_) => {
+                    for (when, a) in [("ON UPDATE", &on_update), ("ON DELETE", &on_delete)] {
+                        let refused = match a {
+                            Action::SetNull(_) | Action::SetDefault(_) => true,
+                            Action::Cascade => when == "ON UPDATE",
+                            _ => false,
+                        };
+                        if refused {
+                            return Err(Error::new(format!(
+                                "invalid {when} action for foreign key constraint containing \
+                                 generated column"
+                            )));
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        Ok(ForeignKey {
+            name,
+            columns,
+            parent: parent.name.clone(),
+            parent_columns,
+            key: key.name.clone(),
+            full: r.full,
+            on_delete,
+            on_update,
+            deferrable: r.deferrable,
+            deferred: r.deferred,
+            enforced: r.enforced,
+            valid: r.enforced && (made || !r.not_valid),
+        })
     }
 
     fn create_index(&mut self, tokens: &[Token]) -> Result<Vec<String>> {
@@ -3052,7 +3520,19 @@ fn finish_table(d: &Declared) -> Result<Table> {
         orders,
         checks: d.checks.clone(),
         release: crate::regs::LATEST,
+        foreign_keys: d.foreign_keys.clone(),
     })
+}
+
+/// Whether a reference of type `a` is compared with a key of type `b` as the snail compares a key:
+/// of one type, an integer with any integer, text with text, a numeric with one of its scale.
+fn comparable(a: ColumnType, b: ColumnType) -> bool {
+    use ColumnType::*;
+    match (a, b) {
+        (Int2 | Int4 | Int8, Int2 | Int4 | Int8) | (Text(_), Text(_)) => true,
+        (Numeric { scale: x, .. }, Numeric { scale: y, .. }) => x == y,
+        _ => a == b,
+    }
 }
 
 fn dedup(items: impl Iterator<Item = usize>) -> Vec<usize> {
@@ -3218,6 +3698,51 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
             let obj = format!("{}.{}", t.name, k.name);
             fact("constraint", &obj, "type", "c".into());
             fact("constraint", &obj, "check", k.expr.to_string());
+            fact("constraint", &obj, "enforced", truth(k.enforced));
+            fact("constraint", &obj, "validated", truth(k.valid));
+        }
+        let names_of = |table: &Table, columns: &[usize]| {
+            columns
+                .iter()
+                .map(|&i| table.columns[i].name.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for k in &t.foreign_keys {
+            let obj = format!("{}.{}", t.name, k.name);
+            let code = |a: &Action| match a {
+                Action::NoAction => "a",
+                Action::Restrict => "r",
+                Action::Cascade => "c",
+                Action::SetNull(_) => "n",
+                Action::SetDefault(_) => "d",
+            };
+            fact("constraint", &obj, "type", "f".into());
+            fact("constraint", &obj, "columns", names_of(t, &k.columns));
+            if let Some(p) = c.table(&k.parent) {
+                fact(
+                    "constraint",
+                    &obj,
+                    "references",
+                    format!("{}({})", p.name, names_of(p, &k.parent_columns)),
+                );
+            }
+            fact("constraint", &obj, "key", k.key.clone());
+            fact(
+                "constraint",
+                &obj,
+                "match",
+                if k.full { "f" } else { "s" }.into(),
+            );
+            fact("constraint", &obj, "on_delete", code(&k.on_delete).into());
+            fact("constraint", &obj, "on_update", code(&k.on_update).into());
+            let listed = match &k.on_delete {
+                Action::SetNull(c) | Action::SetDefault(c) => names_of(t, c),
+                _ => String::new(),
+            };
+            fact("constraint", &obj, "delete_columns", listed);
+            fact("constraint", &obj, "deferrable", truth(k.deferrable));
+            fact("constraint", &obj, "deferred", truth(k.deferred));
             fact("constraint", &obj, "enforced", truth(k.enforced));
             fact("constraint", &obj, "validated", truth(k.valid));
         }
@@ -3567,8 +4092,32 @@ pub(crate) fn read_ddl(ddl: &str, strict: bool) -> Result<Reading> {
             break;
         }
     }
+    let mut finished = draft.finish();
+    // A table whose foreign key references a table refused is refused for it, in turn.
+    loop {
+        let refused: Vec<String> = finished
+            .iter()
+            .filter_map(|r| r.as_ref().err().map(|(n, _)| n.clone()))
+            .collect();
+        let mut more = false;
+        for r in &mut finished {
+            if let Ok(t) = r {
+                if let Some(k) = t.foreign_keys.iter().find(|k| refused.contains(&k.parent)) {
+                    let e = Error::new(format!(
+                        "{}: its foreign key {} references {}, which is refused",
+                        t.name, k.name, k.parent
+                    ));
+                    *r = Err((t.name.clone(), e));
+                    more = true;
+                }
+            }
+        }
+        if !more {
+            break;
+        }
+    }
     let mut tables = Vec::new();
-    for r in draft.finish() {
+    for r in finished {
         match r {
             Ok(t) => tables.push(t),
             Err((name, e)) => {
@@ -3615,6 +4164,36 @@ pub(crate) fn read_ddl(ddl: &str, strict: bool) -> Result<Reading> {
 
 fn statements_of(ddl: &str) -> Result<Vec<Vec<Token>>> {
     statements(ddl)
+}
+
+/// SET CONSTRAINTS { ALL | name [, …] } { DEFERRED | IMMEDIATE }: the names, none for ALL, and
+/// whether deferred; none where the statement is another.
+pub(crate) fn set_constraints(tokens: &[Token]) -> Option<Result<(Option<Vec<String>>, bool)>> {
+    let mut c = Cursor::new(tokens);
+    if !c.kws(&["SET", "CONSTRAINTS"]) {
+        return None;
+    }
+    let read = (|| {
+        let names = if c.kw("ALL") {
+            None
+        } else {
+            let mut out = vec![c.name()?];
+            while c.token(Token::Comma) {
+                out.push(c.name()?);
+            }
+            Some(out)
+        };
+        let deferred = if c.kw("DEFERRED") {
+            true
+        } else if c.kw("IMMEDIATE") {
+            false
+        } else {
+            return Err(c.wanted("DEFERRED or IMMEDIATE"));
+        };
+        end(&c, "SET CONSTRAINTS")?;
+        Ok((names, deferred))
+    })();
+    Some(read)
 }
 
 /// What a statement declares, where it declares something the catalog holds: CREATE TABLE, INDEX,
@@ -3836,7 +4415,7 @@ mod tests {
 
     #[test]
     fn an_identity_and_a_generation_are_taken_out_of_a_create_table() {
-        let (kept, extras) = create_table_extras(&tokens(
+        let (kept, extras, _) = create_table_extras(&tokens(
             "CREATE TABLE s.t (id bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 10 \
              INCREMENT BY 5), q int NOT NULL, n numeric(12,2) GENERATED ALWAYS AS (q * 2) VIRTUAL, \
              s int GENERATED ALWAYS AS (q + 1) STORED, u int UNIQUE NULLS NOT DISTINCT, \
@@ -3866,6 +4445,67 @@ mod tests {
         .unwrap()
         .to_string();
         assert!(e.contains("WITHOUT OVERLAPS"), "{e}");
+    }
+
+    #[test]
+    fn a_foreign_key_is_taken_out_of_a_create_table_whole_in_the_order_written() {
+        let (kept, _, keys) = create_table_extras(&tokens(
+            "CREATE TABLE s.t (id int PRIMARY KEY, a int NOT NULL CONSTRAINT ta REFERENCES s.u \
+             MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL (a) DEFERRABLE INITIALLY DEFERRED \
+             DEFAULT 1, CONSTRAINT tb FOREIGN KEY (b, a) REFERENCES s.v (x, y) NOT ENFORCED NOT \
+             VALID, b int REFERENCES s.v (x))",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            text(&kept),
+            "CREATE TABLE s . t ( id int PRIMARY KEY , a int NOT NULL DEFAULT 1 , b int )"
+        );
+        let read: Vec<_> = keys
+            .iter()
+            .map(|k| {
+                (
+                    k.name.as_deref(),
+                    k.columns.join(","),
+                    k.parent.as_str(),
+                    k.parent_columns.as_ref().map(|c| c.join(",")),
+                    k.full,
+                    k.on_delete.clone(),
+                    k.on_update.clone(),
+                    (k.deferrable, k.deferred, k.enforced, k.not_valid),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read[0],
+            (
+                Some("ta"),
+                "a".into(),
+                "s.u",
+                None,
+                true,
+                ('n', vec!["a".to_string()]),
+                ('c', vec![]),
+                (true, true, true, false)
+            )
+        );
+        assert_eq!(read[1].0, Some("tb"));
+        assert_eq!(
+            (read[1].1.as_str(), read[1].7),
+            ("b,a", (false, false, false, true))
+        );
+        assert_eq!((read[2].0, read[2].3.as_deref()), (None, Some("x")));
+        for (ddl, why) in [
+            ("CREATE TABLE s.t (a int REFERENCES s.u ON UPDATE SET DEFAULT (a))", "only supported for ON DELETE"),
+            ("CREATE TABLE s.t (a int REFERENCES s.u MATCH PARTIAL)", "MATCH PARTIAL not yet implemented"),
+            ("CREATE TABLE s.t (a int REFERENCES s.u NOT DEFERRABLE INITIALLY DEFERRED)", "must be DEFERRABLE"),
+            ("CREATE TABLE s.t (a int REFERENCES s.u DEFERRABLE NOT DEFERRABLE)", "conflicting constraint properties"),
+            ("CREATE TABLE s.t (a int, r int, FOREIGN KEY (a, PERIOD r) REFERENCES s.u (a, PERIOD r))", "a PERIOD"),
+            ("CREATE TABLE s.t (a int, FOREIGN KEY (a) REFERENCES s.u NO INHERIT)", "NO INHERIT"),
+        ] {
+            let e = create_table_extras(&tokens(ddl)).err().unwrap().to_string();
+            assert!(e.contains(why), "{ddl}: {e}");
+        }
     }
 
     #[test]

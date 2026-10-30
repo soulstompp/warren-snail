@@ -43,7 +43,7 @@ pub fn instant_text(micros: i64) -> String {
 }
 
 /// A value as text, as PostgreSQL's output function for its type writes it.
-fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
+pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
     Some(match (d, from) {
         (Datum::Null, _) => return None,
         (Datum::Int(v), ColumnType::Boolean) => if *v != 0 { "true" } else { "false" }.into(),

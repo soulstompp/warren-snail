@@ -306,8 +306,8 @@ pages of its own.
 each column it leaves out or gives `DEFAULT` taking its `DEFAULT`; `UPDATE`, to values or to
 `DEFAULT`; `DELETE`; `BEGIN`, `COMMIT` and `ROLLBACK`; and the DDL below: `CREATE TABLE`, with
 `CREATE INDEX` and `ALTER TABLE … CLUSTER ON` for a table that holds no rows, `ALTER TABLE … ADD
-CHECK`, checked against the rows held unless `NOT VALID`, and `VALIDATE CONSTRAINT`. Outside a
-transaction each statement commits on its own.
+CHECK` and `ADD FOREIGN KEY`, each checked against the rows held unless `NOT VALID`, and `VALIDATE
+CONSTRAINT`; and `SET CONSTRAINTS`. Outside a transaction each statement commits on its own.
 
 **What a row is given.** An identity's or a serial's value, or a `DEFAULT nextval(…)`, is its
 sequence's next, drawn at the root's turn for the whole statement and never given back, as
@@ -318,10 +318,17 @@ read the transaction's clock, `statement_timestamp()` the statement's. `gen_rand
 hands out rise. A `STORED` generated column
 is computed at the write; a `VIRTUAL` one, PostgreSQL 18's default, at the read, and no order holds
 it. Each `CHECK` is checked at the write, passing where it is NULL, and `NOT ENFORCED` checks
-nothing; each `UNIQUE` at the statement's end. An `INSERT … SELECT` takes each value by
-PostgreSQL's assignment casts: an integer or numeric rounded and held to its column's range, any
-value as its text into a text column, a value into a column of its own type; any other type
-refused, as PostgreSQL refuses it.
+nothing; each `UNIQUE` at the statement's end. Each `FOREIGN KEY` is checked where PostgreSQL checks
+it: at the statement's end, or at the commit where it is deferred, by its DDL or by `SET
+CONSTRAINTS`, on the rows the round wrote and the keys it took from a parent. A reference holding a
+NULL references nothing under `MATCH SIMPLE`, and under `MATCH FULL` holds only NULLs. A row written
+locks the parent's block that holds its key, and a key taken the child's blocks that hold a row
+referencing it. `CASCADE`, `SET NULL` and `SET DEFAULT` are written by the statement that takes the
+key, deferred or not, as `RESTRICT` is checked by it; `NOT ENFORCED` checks and does nothing. A
+commit whose deferred key finds an orphan rolls the transaction back. An `INSERT … SELECT` takes
+each value by PostgreSQL's assignment casts: an integer or numeric rounded and held to its
+column's range, any value as its text into a text column, a value into a column of its own type;
+any other type refused, as PostgreSQL refuses it.
 
 **What it writes.** A row lands in its block on every order that holds its columns, as its places
 name it, after the block's last rows, in pages of one disk page each, until a prune or a cut writes
@@ -583,7 +590,13 @@ Each command exits 0, or prints why it refused and exits 1.
 - `CREATE TABLE`, its columns `NOT NULL` or not, each with a `DEFAULT`, `GENERATED ALWAYS AS (…)
   STORED` or `VIRTUAL`, `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY (…)`, or of a serial type;
   a `PRIMARY KEY`; `UNIQUE`, `NULLS [NOT] DISTINCT`, `DEFERRABLE` and `INCLUDE`; `CHECK`, `NOT
-  ENFORCED`. Unnamed keys, checks and sequences are named as PostgreSQL names them.
+  ENFORCED`; `REFERENCES` and `FOREIGN KEY`, a primary key, a `UNIQUE` or a unique index of a
+  table of the file referenced, `MATCH SIMPLE` or `FULL`, `ON DELETE` and `ON UPDATE` each `NO
+  ACTION`, `RESTRICT`, `CASCADE`, `SET NULL` or `SET DEFAULT`, with the columns it sets, `DEFERRABLE`,
+  `INITIALLY DEFERRED`, `NOT ENFORCED`, and in `ALTER TABLE … ADD`, `NOT VALID`; a foreign key on a
+  `PERIOD` is not held yet. Unnamed keys, checks, foreign keys and sequences are named as PostgreSQL
+  names them. `write` checks each foreign key over the rows it is given, and says where its columns
+  lead no order, so that a key taken from its parent reads the child whole.
 - `CREATE SEQUENCE` and `ALTER SEQUENCE`, their options as PostgreSQL reads them, a sequence's
   state kept in the file; `CREATE TYPE … AS ENUM`, a composite, `AS RANGE`, with `ALTER TYPE … ADD
   VALUE` and `RENAME VALUE`; `CREATE DOMAIN` and `ALTER DOMAIN`; `CREATE COLLATION` of byte order.

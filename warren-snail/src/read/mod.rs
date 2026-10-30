@@ -8,6 +8,7 @@
 mod answer;
 mod change;
 pub(crate) mod fill;
+pub(crate) mod foreign;
 mod hash;
 mod out;
 mod pipeline;
@@ -364,6 +365,12 @@ pub struct Snail {
     handed: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
     /// The sequences' states a commit at the root's turn writes.
     advancing: Option<Vec<crate::file::SequenceState>>,
+    /// What the statement under way changed that its foreign keys check as it ends; what the
+    /// transaction changed that they check at the commit; and the keys SET CONSTRAINTS defers, or
+    /// makes immediate, until it ends.
+    touched: foreign::Touched,
+    pending: foreign::Touched,
+    modes: std::collections::BTreeMap<(usize, usize), bool>,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -538,6 +545,9 @@ impl Snail {
             clock: (0, 0),
             handed: Default::default(),
             advancing: None,
+            touched: Default::default(),
+            pending: Default::default(),
+            modes: Default::default(),
         })
     }
 

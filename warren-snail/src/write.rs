@@ -557,6 +557,7 @@ fn write_tables(
         ..Default::default()
     };
     crate::file::holds_catalog(w.format(), catalog)?;
+    crate::read::foreign::rows_held(catalog, tables)?;
     let mut out = Vec::new();
     for table in &catalog.tables {
         crate::file::holds(w.format(), table)?;

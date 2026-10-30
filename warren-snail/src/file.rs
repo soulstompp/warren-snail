@@ -61,6 +61,13 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             table.name, o.name
         )));
     }
+    // 0.1.x refuses a FOREIGN KEY in the DDL it reads.
+    if let Some(k) = table.foreign_keys.first() {
+        return Err(crate::Error::new(format!(
+            "{}: the FOREIGN KEY {}, {way}",
+            table.name, k.name
+        )));
+    }
     // Formats 7 and 8 hold a column as one leaf.
     if let Some(c) = table.columns.iter().find(|c| c.ty.leaf_count() > 1) {
         let leaves: Vec<String> = c.ty.leaves().iter().map(|l| l.name(&c.name)).collect();
