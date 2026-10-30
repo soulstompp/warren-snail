@@ -81,6 +81,15 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             table.name, c.name, o.name
         )));
     }
+    // Formats 7 and 8 compare text by its bytes alone.
+    if let Some(c) = table.columns.iter().find(|c| c.library.is_some()) {
+        return Err(crate::Error::new(format!(
+            "{}.{} is under the collation {}, {way}",
+            table.name,
+            c.name,
+            c.collation.as_deref().unwrap_or_default()
+        )));
+    }
     // Formats 7 and 8 hold a column as one leaf.
     if let Some(c) = table.columns.iter().find(|c| c.ty.leaf_count() > 1) {
         let leaves: Vec<String> = c.ty.leaves().iter().map(|l| l.name(&c.name)).collect();

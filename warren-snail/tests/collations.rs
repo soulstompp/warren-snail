@@ -346,3 +346,37 @@ fn rows_written_under_a_collation_are_keyed_by_it_and_a_re_cut_carries_the_seque
         .unwrap();
     assert_eq!(ids(&b), vec![6]);
 }
+
+#[test]
+fn formats_7_and_8_refuse_a_column_under_a_library_collation_by_name() {
+    let catalog = Catalog::parse(ICU).unwrap();
+    let rows = || Rows {
+        columns: vec![
+            Values::Int(vec![Some(1)]),
+            Values::Text(vec![Some("a".into())]),
+        ],
+    };
+    for (n, e) in [
+        warren_snail::write::write_format_seven(
+            &tmp("icu-format-seven.snail"),
+            &catalog,
+            &[("s.t".into(), rows())],
+            weather::span(),
+        ),
+        warren_snail::write::write_format_eight(
+            &tmp("icu-format-eight.snail"),
+            &catalog,
+            &[("s.t".into(), rows())],
+            weather::span(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let e = e.unwrap_err().to_string();
+        assert!(
+            e.contains("under the collation") && e.contains("format"),
+            "{n}: {e}"
+        );
+    }
+}
