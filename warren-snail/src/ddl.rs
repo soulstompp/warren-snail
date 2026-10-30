@@ -1374,10 +1374,26 @@ pub(crate) fn written(tokens: &[Token]) -> String {
         .unwrap_or(tokens.len());
     tokens[start..]
         .iter()
-        .map(|t| t.to_string())
+        .map(token_written)
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// A token as it reads again as itself: a quoted string, or a quoted name, its quotes inside it
+/// doubled, or escaped in an E'' string, where sqlparser 0.63 prints them bare.
+fn token_written(t: &Token) -> String {
+    match t {
+        Token::SingleQuotedString(s) => format!("'{}'", s.replace('\'', "''")),
+        Token::NationalStringLiteral(s) => format!("N'{}'", s.replace('\'', "''")),
+        Token::EscapedStringLiteral(s) => {
+            format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+        }
+        Token::Word(w) if w.quote_style == Some('"') => {
+            format!("\"{}\"", w.value.replace('"', "\"\""))
+        }
+        other => other.to_string(),
+    }
 }
 
 /// `ALTER TABLE <table> CLUSTER ON <index>`, which sqlparser does not parse: (table, index).
@@ -4531,5 +4547,19 @@ mod tests {
             cluster_on(&tokens("ALTER TABLE s.t ADD COLUMN x int")),
             None
         );
+    }
+
+    #[test]
+    fn a_statement_as_written_reads_again_as_its_own_tokens() {
+        let sql = "INSERT INTO \"Mixed\"\"Case\".t (a, \"b\"\"c\") VALUES ('it''s', E'back\\\\slash \\'quote\\'', N'n''s', '')";
+        let once = tokens(sql);
+        let again = tokens(&written(&once));
+        assert_eq!(
+            Cursor::new(&again).t,
+            Cursor::new(&once).t,
+            "{}",
+            written(&once)
+        );
+        assert!(written(&once).contains("'it''s'"), "{}", written(&once));
     }
 }

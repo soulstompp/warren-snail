@@ -535,3 +535,22 @@ fn a_census_counts_the_page_that_holds_the_sequences() {
         .unwrap_or_else(|e| panic!("the census of a file holding a sequence: {e}"));
     assert!(census.named > 0, "{census:?}");
 }
+
+#[test]
+fn a_quote_doubled_inside_a_string_is_kept_in_a_statement_and_in_the_ddl_the_file_keeps() {
+    // A CHECK's string the file's DDL keeps, read again at every open, and a value given by a
+    // statement split from a file, as `exec` splits it.
+    let path = made(
+        "quoted",
+        "CREATE TABLE s.t (id integer PRIMARY KEY, v text CHECK (v <> 'it''s not'));",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    let text = "INSERT INTO s.t (id, v) VALUES (1, 'it''s'); INSERT INTO s.t (id, v) VALUES (2, 'it''s not');";
+    let statements = warren_snail::read::statement::split(text).unwrap();
+    run(&mut w, &statements[0]);
+    let e = w.execute(&statements[1]).unwrap_err().to_string();
+    assert!(e.contains("violates check constraint"), "{e}");
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    assert_eq!(rows(&mut s, "SELECT id, v FROM s.t"), [row(&["1", "it's"])]);
+}
