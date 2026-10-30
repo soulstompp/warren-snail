@@ -78,22 +78,35 @@ fn p8_an_element_held_as_a_group_of_leaves_or_a_bit_string_comes_back_from_its_p
         range: 0x7FFF,
         precision: None,
     };
-    for (ty, spelled) in [
+    // Each array of the values spelled, as PostgreSQL 18.6 wrote it (28818, 2026-10-30).
+    for (ty, spelled, written) in [
         (
             timetz,
             &["12:00:00+01", "24:00:00-15:59", "00:00:00+15:59"][..],
+            "{12:00:00+01,24:00:00-15:59,00:00:00+15:59}",
         ),
         (
             interval,
             &["1 mon", "30 days", "-1 year -2 days 03:04:05.5", "infinity"][..],
+            "{\"1 mon\",\"30 days\",\"-1 years -2 days +03:04:05.5\",infinity}",
         ),
         (
             ColumnType::Varbit(None),
             &["", "1", "10100", "000000001"][..],
+            "{\"\",1,10100,000000001}",
         ),
-        (ColumnType::Bit(5), &["00000", "10100", "11111"][..]),
+        (
+            ColumnType::Bit(5),
+            &["00000", "10100", "11111"][..],
+            "{00000,10100,11111}",
+        ),
     ] {
         let parts: Vec<Item> = spelled.iter().map(|s| read(ty, s)).collect();
+        assert_eq!(text_out(array_of(ty), &array(parts.clone())), written);
+        assert_eq!(
+            text_in(array_of(ty), written).unwrap(),
+            array(parts.clone())
+        );
         let mut values = vec![Item::Null, array(vec![]), array(vec![Item::Null])];
         values.push(array(parts.clone()));
         values.push(array(parts.iter().cloned().chain([Item::Null]).collect()));
@@ -103,8 +116,7 @@ fn p8_an_element_held_as_a_group_of_leaves_or_a_bit_string_comes_back_from_its_p
             lower: vec![0, -1],
         });
         round_trip(array_of(ty), &values);
-        // As a composite's field, beside a field of one leaf, and as a range's bound where the
-        // type orders.
+        // As a composite's field, beside a field of one leaf.
         let record = type_of(Composed::Record {
             name: "s.g".into(),
             fields: vec![Field::new("a", ty), Field::new("b", ColumnType::Int4)],
@@ -115,6 +127,9 @@ fn p8_an_element_held_as_a_group_of_leaves_or_a_bit_string_comes_back_from_its_p
         }
         round_trip(record, &records);
     }
+    // A bit string of another length is refused as an element of bit(5), as PostgreSQL's INSERT
+    // refuses it.
+    assert!(text_in(array_of(ColumnType::Bit(5)), "{101}").is_err());
 }
 
 #[test]
@@ -504,6 +519,8 @@ const ROWS: [&[Option<&str>]; 3] = [
         None,
         Some("{(,2),[4,5)}"),
         Some("{[0,10)}"),
+        Some("{[20,30)}"),
+        Some("{[10,20),[40,41)}"),
     ],
     &[
         Some("[2,6)"),
@@ -511,6 +528,8 @@ const ROWS: [&[Option<&str>]; 3] = [
         None,
         Some("[3,4)"),
         Some("(,)"),
+        Some("[30,40)"),
+        Some("[0,1)"),
     ],
     &[
         Some("{1,2,3,4}"),
@@ -518,6 +537,8 @@ const ROWS: [&[Option<&str>]; 3] = [
         None,
         Some("[0:2]={7,NULL,9}"),
         Some("{{1,2},{3,4}}"),
+        Some("{5,6,7}"),
+        Some("{{1},{2},{3}}"),
     ],
 ];
 
@@ -525,47 +546,54 @@ const ROWS: [&[Option<&str>]; 3] = [
 fn a_multirange_s_operators_answer_as_postgresql_s() {
     let mut snail = snail_of("elements-multiranges", QUESTIONS, &ROWS);
     let step = "WITH q AS (SELECT id, m, r FROM s.q)";
-    // Each answer as PostgreSQL 18.6 gave it (28818, 2026-10-30), the rows by id, then by the
-    // second id.
+    // Each answer as PostgreSQL 18.6 gave it (28818, 2026-10-30), a row of the pairs for each
+    // first id, each pair's values by commas and the pairs by bars, by the second id.
     for (q, want) in [
         (
             "SELECT a.id, (a.m @> b.m) AS c, (a.m && b.m) AS o, (a.m << b.m) AS l, (a.m >> b.m) AS g, \
              (a.m &< b.m) AS x, (a.m &> b.m) AS y, (a.m -|- b.m) AS j FROM q a CROSS JOIN q b ORDER BY a.id, b.id",
-            "true,true,false,false,true,true,false|true,false,false,false,false,false,false|,,,,,,|\
-             false,true,false,false,false,true,false|false,true,false,false,true,true,false|\
-             false,false,false,false,false,false,false|true,false,false,false,false,false,false|,,,,,,|\
-             false,false,false,false,false,false,false|false,false,false,false,false,false,false|\
-             ,,,,,,|,,,,,,|,,,,,,|,,,,,,|,,,,,,|\
-             false,true,false,false,true,false,false|true,false,false,false,false,false,false|,,,,,,|\
-             true,true,false,false,true,true,false|false,true,false,false,true,false,false|\
-             true,true,false,false,false,false,false|true,false,false,false,false,false,false|,,,,,,|\
-             false,true,false,false,false,true,false|true,true,false,false,true,true,false",
+            [
+                "true,true,false,false,true,true,false|true,false,false,false,false,false,false|,,,,,,|false,true,false,false,false,true,false|false,true,false,false,true,true,false|false,false,true,false,true,false,false|false,false,true,false,true,false,false",
+                "false,false,false,false,false,false,false|true,false,false,false,false,false,false|,,,,,,|false,false,false,false,false,false,false|false,false,false,false,false,false,false|false,false,false,false,false,false,false|false,false,false,false,false,false,false",
+                ",,,,,,|,,,,,,|,,,,,,|,,,,,,|,,,,,,|,,,,,,|,,,,,,",
+                "false,true,false,false,true,false,false|true,false,false,false,false,false,false|,,,,,,|true,true,false,false,true,true,false|false,true,false,false,true,false,false|false,false,true,false,true,false,false|false,false,true,false,true,false,false",
+                "true,true,false,false,false,false,false|true,false,false,false,false,false,false|,,,,,,|false,true,false,false,false,true,false|true,true,false,false,true,true,false|false,false,true,false,true,false,false|false,false,true,false,true,false,true",
+                "false,false,false,true,false,true,false|true,false,false,false,false,false,false|,,,,,,|false,false,false,true,false,true,false|false,false,false,true,false,true,false|true,true,false,false,true,true,false|false,false,false,false,true,true,false",
+                "false,false,false,true,false,true,false|true,false,false,false,false,false,false|,,,,,,|false,false,false,true,false,true,false|false,false,false,true,false,true,true|false,false,false,false,false,false,false|true,true,false,false,true,true,false",
+            ]
+            .join("|"),
         ),
         (
             "SELECT a.id, (a.m + b.m) AS u, (a.m * b.m) AS i, (a.m - b.m) AS d FROM q a CROSS JOIN q b \
              ORDER BY a.id, b.id",
-            "{[1,3),[5,8)},{[1,3),[5,8)},{}|{[1,3),[5,8)},{},{[1,3),[5,8)}|,,|\
-             {(,3),[4,8)},{[1,2)},{[2,3),[5,8)}|{[0,10)},{[1,3),[5,8)},{}|\
-             {[1,3),[5,8)},{},{}|{},{},{}|,,|{(,2),[4,5)},{},{}|{[0,10)},{},{}|\
-             ,,|,,|,,|,,|,,|\
-             {(,3),[4,8)},{[1,2)},{(,1),[4,5)}|{(,2),[4,5)},{},{(,2),[4,5)}|,,|\
-             {(,2),[4,5)},{(,2),[4,5)},{}|{(,10)},{[0,2),[4,5)},{(,0)}|\
-             {[0,10)},{[1,3),[5,8)},{[0,1),[3,5),[8,10)}|{[0,10)},{},{[0,10)}|,,|\
-             {(,10)},{[0,2),[4,5)},{[2,4),[5,10)}|{[0,10)},{[0,10)},{}",
+            [
+                "{[1,3),[5,8)},{[1,3),[5,8)},{}|{[1,3),[5,8)},{},{[1,3),[5,8)}|,,|{(,3),[4,8)},{[1,2)},{[2,3),[5,8)}|{[0,10)},{[1,3),[5,8)},{}|{[1,3),[5,8),[20,30)},{},{[1,3),[5,8)}|{[1,3),[5,8),[10,20),[40,41)},{},{[1,3),[5,8)}",
+                "{[1,3),[5,8)},{},{}|{},{},{}|,,|{(,2),[4,5)},{},{}|{[0,10)},{},{}|{[20,30)},{},{}|{[10,20),[40,41)},{},{}",
+                ",,|,,|,,|,,|,,|,,|,,",
+                "{(,3),[4,8)},{[1,2)},{(,1),[4,5)}|{(,2),[4,5)},{},{(,2),[4,5)}|,,|{(,2),[4,5)},{(,2),[4,5)},{}|{(,10)},{[0,2),[4,5)},{(,0)}|{(,2),[4,5),[20,30)},{},{(,2),[4,5)}|{(,2),[4,5),[10,20),[40,41)},{},{(,2),[4,5)}",
+                "{[0,10)},{[1,3),[5,8)},{[0,1),[3,5),[8,10)}|{[0,10)},{},{[0,10)}|,,|{(,10)},{[0,2),[4,5)},{[2,4),[5,10)}|{[0,10)},{[0,10)},{}|{[0,10),[20,30)},{},{[0,10)}|{[0,20),[40,41)},{},{[0,10)}",
+                "{[1,3),[5,8),[20,30)},{},{[20,30)}|{[20,30)},{},{[20,30)}|,,|{(,2),[4,5),[20,30)},{},{[20,30)}|{[0,10),[20,30)},{},{[20,30)}|{[20,30)},{[20,30)},{}|{[10,30),[40,41)},{},{[20,30)}",
+                "{[1,3),[5,8),[10,20),[40,41)},{},{[10,20),[40,41)}|{[10,20),[40,41)},{},{[10,20),[40,41)}|,,|{(,2),[4,5),[10,20),[40,41)},{},{[10,20),[40,41)}|{[0,20),[40,41)},{},{[10,20),[40,41)}|{[10,30),[40,41)},{},{[10,20),[40,41)}|{[10,20),[40,41)},{[10,20),[40,41)},{}",
+            ]
+            .join("|"),
         ),
         (
             "SELECT id, (m @> r) AS a, (r @> m) AS b, (m <@ r) AS c, (r <@ m) AS d, (m && r) AS e, \
              (r && m) AS f, (m -|- r) AS g, (r -|- m) AS h, (m << r) AS i, (r >> m) AS j, (m &< r) AS k, \
              (r &> m) AS l, (m @> 4) AS n, (4 <@ m) AS o FROM q ORDER BY id",
-            "false,false,false,false,true,true,false,false,false,false,false,true,false,false|\
-             true,true,true,true,false,false,false,false,false,false,false,false,false,false|\
-             ,,,,,,,,,,,,,|\
-             false,false,false,false,false,false,false,false,false,false,false,true,true,true|\
-             false,true,true,false,true,true,false,false,false,false,true,false,true,true",
+            [
+                "false,false,false,false,true,true,false,false,false,false,false,true,false,false",
+                "true,true,true,true,false,false,false,false,false,false,false,false,false,false",
+                ",,,,,,,,,,,,,",
+                "false,false,false,false,false,false,false,false,false,false,false,true,true,true",
+                "false,true,true,false,true,true,false,false,false,false,true,false,true,true",
+                "false,false,false,false,false,false,true,true,true,true,true,true,false,false",
+                "false,false,false,false,false,false,false,false,false,false,false,false,false,false",
+            ]
+            .join("|"),
         ),
     ] {
-        let sql = format!("{step} {q}");
-        let (b, _) = snail.ask(&sql, None).unwrap();
+        let (b, _) = snail.ask(&format!("{step} {q}"), None).unwrap();
         assert_eq!(answer_text(&b), want, "{q}");
     }
     for refused in [
@@ -610,8 +638,16 @@ fn an_array_slice_answers_as_postgresql_s() {
     // As PostgreSQL 18.6 gave it (28818, 2026-10-30).
     assert_eq!(
         answer_text(&b),
-        "{2,3},{1},{2,3,4},{},{},{},{}|{},{},{},{},{},{},{}|,,,,,,|\
-         {9},{7,NULL},{9},{},{7},{},{}|{{3,4}},{{1,2}},{{3,4}},{{1,2}},{},{},{{1,2}}"
+        [
+            "{2,3},{1},{2,3,4},{},{},{},{}",
+            "{},{},{},{},{},{},{}",
+            ",,,,,,",
+            "{9},{7,NULL},{9},{},{7},{},{}",
+            "{{3,4}},{{1,2}},{{3,4}},{{1,2}},{},{},{{1,2}}",
+            "{6,7},{5},{6,7},{},{},{},{}",
+            "{{2},{3}},{{1}},{{2},{3}},{{1}},{},{},{{1}}",
+        ]
+        .join("|")
     );
     for refused in [
         "SELECT id, a[3000000000] AS x FROM q",
