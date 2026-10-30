@@ -1063,8 +1063,9 @@ pub struct Writer {
     /// The free runs a commit takes pages from before the file's last, and the runs it took.
     free: Vec<(u64, u64)>,
     taken: Vec<(u64, u64)>,
-    /// What carries each commit, where one does, and the pages the commit under way has written.
-    host: Option<Box<dyn crate::carry::Host>>,
+    /// What carries each commit, where one does, and the pages the commit under way has written. A
+    /// host that panics leaves the file at the commit's parent, its root never written.
+    host: Option<std::panic::AssertUnwindSafe<Box<dyn crate::carry::Host>>>,
     carried: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -1142,7 +1143,7 @@ impl Writer {
 
     /// Carries each commit from now on by the host.
     pub(crate) fn carried_by(&mut self, host: Box<dyn crate::carry::Host>) {
-        self.host = Some(host);
+        self.host = Some(std::panic::AssertUnwindSafe(host));
     }
 
     /// The first file, whose locks a writer holds on the blocks it changes and on the root's turn.

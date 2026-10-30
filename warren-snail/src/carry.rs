@@ -39,8 +39,9 @@ pub struct Commit {
 /// What carries a writer's commits. It is handed each commit once the commit's pages are on the
 /// disk, while the commit holds the root's turn, so that commits take turns meanwhile, and returns
 /// once a majority holds it: the root is written then. An error leaves the file at the commit's
-/// parent, the pages it wrote named by nothing, and the statement fails with it.
-pub trait Host {
+/// parent, the pages it wrote named by nothing, and the statement fails with it. It moves with its
+/// writer between threads.
+pub trait Host: Send {
     fn carry(&mut self, commit: &Commit) -> Result<()>;
 }
 

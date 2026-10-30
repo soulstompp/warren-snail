@@ -7,13 +7,13 @@
 mod weather;
 
 #[cfg(feature = "standalone")]
-use std::cell::RefCell;
-#[cfg(feature = "standalone")]
 use std::os::unix::fs::FileExt;
 #[cfg(feature = "standalone")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "standalone")]
-use std::rc::Rc;
+use std::sync::Arc;
+#[cfg(feature = "standalone")]
+use std::sync::Mutex;
 #[cfg(feature = "standalone")]
 use warren_snail::carry::{self, Commit, Host};
 #[cfg(feature = "standalone")]
@@ -113,7 +113,7 @@ fn number(p: &carry::Page, span: u64) -> u64 {
 #[cfg(feature = "standalone")]
 struct Followers {
     paths: Vec<PathBuf>,
-    log: Rc<RefCell<Vec<Commit>>>,
+    log: Arc<Mutex<Vec<Commit>>>,
 }
 
 #[cfg(feature = "standalone")]
@@ -122,14 +122,14 @@ impl Host for Followers {
         for p in &self.paths {
             carry::apply(p, commit)?;
         }
-        self.log.borrow_mut().push(commit.clone());
+        self.log.lock().unwrap().push(commit.clone());
         Ok(())
     }
 }
 
 #[cfg(feature = "standalone")]
-fn followed(paths: &[&Path]) -> (Box<dyn Host>, Rc<RefCell<Vec<Commit>>>) {
-    let log = Rc::new(RefCell::new(Vec::new()));
+fn followed(paths: &[&Path]) -> (Box<dyn Host>, Arc<Mutex<Vec<Commit>>>) {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let host = Followers {
         paths: paths.iter().map(|p| p.to_path_buf()).collect(),
         log: log.clone(),
@@ -248,8 +248,8 @@ fn a_follower_given_each_commit_is_the_leader_byte_for_byte_and_answers_as_it() 
     for (k, commit) in stream(&s).iter().enumerate() {
         let before = parent(&follower);
         let d = run(&mut w, commit);
-        let c = log.borrow().last().unwrap().clone();
-        assert_eq!(log.borrow().len(), k + 1);
+        let c = log.lock().unwrap().last().unwrap().clone();
+        assert_eq!(log.lock().unwrap().len(), k + 1);
         assert_eq!(
             (c.parent, c.generation, d.generation),
             (
@@ -603,7 +603,7 @@ fn a_commit_across_a_huge_snails_files_names_each_page_by_its_file_and_lands_in_
     let mut most = 0;
     for commit in stream(&s) {
         let d = run(&mut w, &commit);
-        let c = log.borrow().last().unwrap().clone();
+        let c = log.lock().unwrap().last().unwrap().clone();
         assert_eq!(c.pages.len() as u64 + 1, d.pages_written);
         assert!(c.pages.iter().all(|p| p.page < span));
         let files: std::collections::BTreeSet<u64> = c.pages.iter().map(|p| p.file).collect();
@@ -629,7 +629,7 @@ fn a_leader_stopped_once_a_majority_holds_its_commit_takes_it_as_its_followers_d
     assert!(e.contains("stopped before the root"), "{e}");
     drop(w);
     assert_eq!((generation(&leader), generation(&follower)), (1, 2));
-    let c = log.borrow()[0].clone();
+    let c = log.lock().unwrap()[0].clone();
     carry::apply(&leader, &c).unwrap();
     assert!(same_bytes(&leader, &follower));
 
@@ -765,4 +765,10 @@ fn an_apply_takes_the_followers_root_turn_so_it_never_lands_beside_a_commit_ther
     let e = apply.join().unwrap().unwrap_err().to_string();
     assert!(e.contains("the follower stands at generation 2"), "{e}");
     Snail::open(&follower).unwrap().census().unwrap();
+}
+
+#[test]
+fn a_writer_moves_between_threads_and_across_an_unwind() {
+    fn moves<T: Send + std::panic::UnwindSafe>() {}
+    moves::<warren_snail::file::Writer>();
 }
