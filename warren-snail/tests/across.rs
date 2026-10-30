@@ -410,7 +410,25 @@ mod written {
             [g0[0] + 2]
         );
         assert_eq!(count_of(&mut together(&split), &joined(9500, 5)), 1);
-        // The pages that carried the decision dropped are freed: every page is named once, or free.
+        // Decided by the readings, first written, the stations' own decision, its roots written,
+        // is dropped by the root the transaction writes there.
+        w.execute("BEGIN").unwrap();
+        w.execute(&reading(9_000_006, 9500, 6)).unwrap();
+        w.execute(&station(9500, 6)).unwrap();
+        w.execute("COMMIT").unwrap();
+        assert!(Snail::open(&split.stations).unwrap().decided().is_empty());
+        assert_eq!(Snail::open(&split.readings).unwrap().decided().len(), 1);
+        // A statement reads only the snail it writes.
+        let e = w
+            .execute(
+                "INSERT INTO weather.readings (reading_id, network_id, station_no, feed, observed_at, checked_at) \
+                 SELECT 9000007, s.network_id, s.station_no, 'AWS Main', '2022-06-15 10:00:00+00', NULL \
+                 FROM weather.stations s WHERE s.network_id = 9500 AND s.station_no = 6",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("reads only the snail it writes"), "{e}");
+        // The pages that carried the decisions dropped are freed: every page is named once, or free.
         for p in paths(&split) {
             Snail::open(p).unwrap().census().unwrap();
         }

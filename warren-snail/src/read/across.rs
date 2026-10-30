@@ -415,13 +415,13 @@ impl Snails {
         Ok(None)
     }
 
-    /// Whether every root a decision named has been written, as the round reads their snails.
+    /// Whether every root a decision named has been written, as each snail's newest root says.
     fn landed(&self, d: &Decision) -> Result<bool> {
         for w in &d.roots {
             let Some(i) = self.holder(&w.holds) else {
                 return Ok(false);
             };
-            let root = &self.snails[i].root;
+            let root = &self.snails[i].reader.peek_root()?;
             let written = root.generation > w.generation
                 || (root.generation == w.generation
                     && root.crc(self.snails[i].reader.format())? == w.crc);
@@ -594,7 +594,10 @@ impl Snails {
         if self.aborted {
             return Err(Error::new(super::change::ABORTED));
         }
-        let read = self.snails_named(sql)?;
+        let mut read = self.snails_named(sql)?;
+        if read.is_empty() {
+            read.push(0);
+        }
         let at_start = self.moment()?;
         for s in &self.snails {
             s.wasted.borrow_mut().clear();
@@ -641,8 +644,7 @@ impl Snails {
         Ok((batch, round))
     }
 
-    /// The snails whose tables a question names, in the order they were opened; the first where it
-    /// names none.
+    /// The snails whose tables a question names, in the order they were opened.
     fn snails_named(&self, sql: &str) -> Result<Vec<usize>> {
         let parsed =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
@@ -674,9 +676,6 @@ impl Snails {
             .collect();
         read.sort();
         read.dedup();
-        if read.is_empty() {
-            read.push(0);
-        }
         Ok(read)
     }
 
@@ -767,11 +766,29 @@ impl Snails {
                 }
                 Ok(done)
             }
-            Statement::Insert { table, .. }
-            | Statement::Update { table, .. }
-            | Statement::Delete { table, .. }
-            | Statement::Set { table, .. } => {
+            st @ (Statement::Insert { .. }
+            | Statement::Update { .. }
+            | Statement::Delete { .. }
+            | Statement::Set { .. }) => {
+                let (table, source) = match &st {
+                    Statement::Insert { table, source } => (*table, Some(source)),
+                    Statement::Update { table, .. }
+                    | Statement::Delete { table, .. }
+                    | Statement::Set { table, .. } => (*table, None),
+                    _ => unreachable!(),
+                };
                 let (i, _) = self.at[table];
+                // The rows an INSERT … SELECT takes are read on the snail it writes.
+                if let Some(statement::Source::Select { question, .. }) = source {
+                    if self.snails_named(question)?.iter().any(|&j| j != i) {
+                        return Err(Error::new(format!(
+                            "a statement across snails reads only the snail it writes: {} lies in \
+                             {}, and its SELECT reads another snail's table",
+                            self.catalog.tables[table].name,
+                            self.paths[i].display()
+                        )));
+                    }
+                }
                 let done = self.run(i, sql)?;
                 if self.begun && !self.written.contains(&i) {
                     self.written.push(i);
@@ -941,20 +958,26 @@ impl Snails {
         let d = written[0];
         let mut roots: Vec<Root> = Vec::with_capacity(written.len());
         let mut bytes: Vec<Vec<u8>> = Vec::with_capacity(written.len());
+        // Each root it writes drops what it decided before where every snail that decision named has
+        // written its root since.
+        let landed_in = |s: &Snails, i: usize| -> Result<Vec<u64>> {
+            let mut landed = Vec::new();
+            for old in &s.snails[i].reader.peek_root()?.decided {
+                if s.landed(old)? {
+                    landed.push(old.at);
+                }
+            }
+            Ok(landed)
+        };
         for &i in &written[1..] {
+            let landed = landed_in(self, i)?;
             let w = writers[i].as_mut().unwrap();
-            let mut root = self.snails[i].commit_pages(w, &[])?;
+            let mut root = self.snails[i].commit_pages(w, &landed)?;
             bytes.push(w.prepare(&mut root)?);
             roots.push(root);
         }
-        // The deciding root carries the others' roots, and drops what it decided before where every
-        // snail that decision named has written its root since.
-        let mut landed = Vec::new();
-        for old in &self.snails[d].reader.peek_root()?.decided {
-            if self.landed(old)? {
-                landed.push(old.at);
-            }
-        }
+        // The deciding root carries the others' roots.
+        let landed = landed_in(self, d)?;
         self.snails[d].deciding = Some((
             roots
                 .iter()
