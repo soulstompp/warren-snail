@@ -128,6 +128,7 @@ fn a_foreign_key_is_read_as_postgresql_reads_it() {
         ("CREATE TABLE s.c (id integer PRIMARY KEY, x integer, FOREIGN KEY (x) REFERENCES s.p (a, b))", "number of referencing and referenced columns"),
         ("CREATE TABLE s.c (id integer PRIMARY KEY, x integer, FOREIGN KEY (x, x) REFERENCES s.p (a, a))", "must not contain duplicates"),
         ("CREATE TABLE s.c (id integer PRIMARY KEY, x numeric(6,2) REFERENCES s.p)", "cannot be implemented"),
+        ("CREATE TABLE s.q (k numeric(6,2) PRIMARY KEY); CREATE TABLE s.c (id integer PRIMARY KEY, x numeric(6,1) REFERENCES s.q)", "of types numeric(6,1) and numeric(6,2)"),
         ("CREATE TABLE s.c (id integer PRIMARY KEY, x integer, FOREIGN KEY (q) REFERENCES s.p)", "column \"q\" referenced in foreign key constraint does not exist"),
         ("CREATE TABLE s.c (id integer PRIMARY KEY, x integer GENERATED ALWAYS AS (id) REFERENCES s.p)", "virtual generated columns are not supported"),
         ("CREATE TABLE s.c (id integer PRIMARY KEY, x integer GENERATED ALWAYS AS (id) STORED REFERENCES s.p ON DELETE SET NULL)", "invalid ON DELETE action"),
@@ -223,6 +224,15 @@ fn a_row_written_references_its_parent_s_key_unless_its_reference_holds_a_null()
         "Key (x)=(4) is not present",
     );
     run(&mut w, "UPDATE s.c SET id = 13 WHERE id = 12");
+    // A key changed to a value equal to it but stored otherwise is taken: NO ACTION finds it held
+    // again; RESTRICT refuses it, as PostgreSQL's manual says.
+    run(&mut w, "UPDATE s.p SET f = '-0' WHERE id = 1");
+    run(&mut w, "ALTER TABLE s.c ADD CONSTRAINT c_f_strict FOREIGN KEY (f) REFERENCES s.p (f) ON UPDATE RESTRICT");
+    refused(
+        &mut w,
+        "UPDATE s.p SET f = 0 WHERE id = 1",
+        "violates RESTRICT setting of foreign key constraint \"c_f_strict\"",
+    );
     drop(w);
     let mut s = Snail::open(&path).unwrap();
     assert_eq!(
@@ -278,7 +288,7 @@ fn a_key_taken_from_its_parent_is_refused_or_acted_on_in_the_same_round() {
     refused(
         &mut w,
         "DELETE FROM s.p WHERE id = 3",
-        "still referenced from table \"re\"",
+        "violates RESTRICT setting of foreign key constraint \"re_r_fkey\"",
     );
     // A key changed only in what the parent holds beside it is no key taken.
     run(&mut w, "UPDATE s.p SET v = 9 WHERE id = 3");

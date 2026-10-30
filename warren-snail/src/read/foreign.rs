@@ -519,9 +519,13 @@ impl Snail {
                     Some(false) => {}
                     Some(true) => {
                         let p = self.parent_of(&k);
+                        let (setting, still) = match action {
+                            Action::Restrict => ("RESTRICT setting of foreign key", ""),
+                            _ => ("foreign key", "still "),
+                        };
                         return Err(Error::new(format!(
-                            "update or delete on table \"{}\" violates foreign key constraint \
-                             \"{}\" on table \"{}\": Key {} is still referenced from table \"{}\".",
+                            "update or delete on table \"{}\" violates {setting} constraint \"{}\" \
+                             on table \"{}\": Key {} is {still}referenced from table \"{}\".",
                             bare(&p.name),
                             k.name,
                             bare(&self.catalog.tables[ci].name),

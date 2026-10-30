@@ -524,8 +524,8 @@ impl Snail {
                         .and_then(|_| self.keys_at_commit()),
                 };
                 if let Err(e) = checked {
-                    let (root, _) = self.begun.take().expect("a transaction begun");
-                    self.root = root;
+                    let (began, _) = self.begun.take().expect("a transaction begun");
+                    self.root = began;
                     self.abandon()?;
                     return Err(e);
                 }
