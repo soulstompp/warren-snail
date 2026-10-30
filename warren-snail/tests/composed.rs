@@ -720,16 +720,15 @@ fn r8_a_repeated_leaf_decides_the_cut_by_its_values_bytes_and_the_shape_never() 
     );
 }
 
-#[test]
-fn a_composed_level_is_cut_on_its_key_and_read_along_it() {
+/// 4,096 arrays of one element spread over its 32 bits, the table ordered on them.
+fn composed_level(name: &str) -> std::path::PathBuf {
     let ty = type_of(Composed::Array {
         element: ColumnType::Int4,
         domain: None,
     });
     let ddl = "CREATE TABLE s.t (id integer NOT NULL, v integer[] NOT NULL, PRIMARY KEY (v, id));";
-    // 4,096 arrays of one element spread over its 32 bits, each written beside its key.
-    let path = snail_of(
-        "composed-level",
+    snail_of(
+        name,
         ddl,
         vec![
             Values::Int((0..4096).map(Some).collect()),
@@ -745,7 +744,12 @@ fn a_composed_level_is_cut_on_its_key_and_read_along_it() {
                     .collect(),
             ),
         ],
-    );
+    )
+}
+
+#[test]
+fn a_composed_level_is_cut_on_its_key_and_read_along_it() {
+    let path = composed_level("composed-level");
     let blocks = block_rows(&path, "t_pkey", "id");
     assert!(blocks.len() > 1, "{blocks:?}");
     assert_eq!(blocks.iter().sum::<u64>(), 4096);
@@ -892,6 +896,33 @@ fn a_composed_table_goes_out_as_arrow_answers_it_and_comes_back_by_its_pages() {
         .unwrap();
     for c in 1..5 {
         assert_eq!(texts_of(&again, c), texts_of(&answer, c));
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_composed_level_takes_a_row_into_the_block_its_key_falls_in() {
+    let path = composed_level("composed-level-writes");
+    let mut w = warren_snail::read::Snail::open_writing(&path).unwrap();
+    for sql in [
+        "INSERT INTO s.t (id, v) VALUES (5000, '{1}')",
+        "INSERT INTO s.t (id, v) SELECT 5001, v FROM s.t WHERE id = 1",
+        "DELETE FROM s.t WHERE v = '{0}'",
+    ] {
+        w.execute(sql).unwrap();
+    }
+    drop(w);
+    let mut snail = warren_snail::read::Snail::open(&path).unwrap();
+    for (q, n) in [
+        ("SELECT id FROM s.t WHERE v = '{1}'", 1),
+        ("SELECT id FROM s.t WHERE v = '{1048576}'", 2),
+        ("SELECT id FROM s.t WHERE v = '{0}'", 0),
+        ("SELECT id FROM s.t WHERE v < '{0}'", 2048),
+        ("SELECT id FROM s.t WHERE v > '{0}'", 2049),
+    ] {
+        let (batch, round) = snail.ask(q, None).unwrap();
+        assert_eq!(batch.num_rows(), n, "{q}");
+        weather::exact(q, &round);
     }
 }
 

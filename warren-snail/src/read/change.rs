@@ -698,7 +698,8 @@ impl Snail {
                             .fields()
                             .iter()
                             .map(|f| {
-                                match crate::scalars::field_scalar(f)
+                                match crate::composed::field_composed(f)
+                                    .or_else(|| crate::scalars::field_scalar(f))
                                     .or_else(|| crate::strings::field_string(f))
                                 {
                                     Some(ty) => Ok(ty),
