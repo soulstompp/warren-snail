@@ -452,7 +452,8 @@ impl Snail {
         for (&(ci, fi), rows) in &t.written {
             let k = self.catalog.tables[ci].foreign_keys[fi].clone();
             let child = &self.catalog.tables[ci];
-            let mut keys: Vec<Vec<Datum>> = Vec::new();
+            // Each reference once, as `=` sees it, in the order of its classes.
+            let mut keys: Vec<(Vec<Datum>, Vec<Datum>)> = Vec::new();
             for r in rows {
                 let key = reference(&k, r);
                 let nulls = key.iter().filter(|d| **d == Datum::Null).count();
@@ -471,16 +472,11 @@ impl Snail {
                     }
                     continue;
                 }
-                let c: Vec<Datum> = key.iter().map(class).collect();
-                if !keys
-                    .iter()
-                    .any(|x| x.iter().map(class).eq(c.iter().cloned()))
-                {
-                    keys.push(key);
-                }
+                keys.push((key.iter().map(class).collect(), key));
             }
             keys.sort();
-            for key in keys {
+            keys.dedup_by(|a, b| a.0 == b.0);
+            for (_, key) in keys {
                 match self.holds_key(&k, &key)? {
                     None => return Ok(false),
                     Some(true) => {}
