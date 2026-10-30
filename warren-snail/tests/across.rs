@@ -410,6 +410,10 @@ mod written {
             [g0[0] + 2]
         );
         assert_eq!(count_of(&mut together(&split), &joined(9500, 5)), 1);
+        // The pages that carried the decision dropped are freed: every page is named once, or free.
+        for p in paths(&split) {
+            Snail::open(p).unwrap().census().unwrap();
+        }
     }
 
     #[test]
