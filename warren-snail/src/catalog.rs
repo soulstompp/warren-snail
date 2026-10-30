@@ -2489,7 +2489,7 @@ mod tests {
 
     #[test]
     fn a_type_not_held_is_refused() {
-        let e = refused("CREATE TABLE s.t (a tsquery NOT NULL, PRIMARY KEY (a));");
+        let e = refused("CREATE TABLE s.t (a pg_snapshot NOT NULL, PRIMARY KEY (a));");
         assert!(e.contains("is not held"), "{e}");
     }
 
