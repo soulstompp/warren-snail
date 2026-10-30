@@ -593,7 +593,7 @@ impl Snail {
     fn catalog(reader: &Reader, root: &Root) -> Result<Catalog> {
         let ddl = String::from_utf8(reader.read_extent(root.catalog)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
-        let mut catalog = Catalog::parse(&ddl)?;
+        let mut catalog = Catalog::parse_kept(&ddl, usize::MAX)?;
         old_names(&mut catalog, reader.format());
         catalog.with_release(root.release)?;
         crate::file::monetary_read(&catalog, &root.monetary)?;

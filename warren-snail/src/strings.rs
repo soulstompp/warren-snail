@@ -310,6 +310,20 @@ pub fn key_bytes(ty: ColumnType, held: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+/// The bytes a value of a column is keyed by, from the bytes it is held as: `key_bytes`'s, and
+/// under a library collation, `collator`'s key of those.
+pub fn column_key<'a>(
+    ty: ColumnType,
+    collator: Option<&crate::collations::Collator>,
+    held: &'a [u8],
+) -> Cow<'a, [u8]> {
+    let key = key_bytes(ty, held);
+    match collator {
+        Some(c) => Cow::Owned(c.key(&key)),
+        None => key,
+    }
+}
+
 /// A string type or a bit string named by PostgreSQL, as an answer's field metadata names it.
 pub fn type_named(named: &str) -> Option<ColumnType> {
     let length = |s: &str| -> Option<u32> { s.strip_suffix(')')?.parse().ok() };
@@ -540,7 +554,8 @@ extern "C" {
 /// A text in upper case, or in lower case where `!upper`, as PostgreSQL's upper and lower map it
 /// under a collation that maps case as `casing`: ASCII's letters alone; PostgreSQL 19's own Unicode
 /// tables, a character to a character, or under `Full` to its full mapping where it has one, a
-/// sigma that ends a word lowered to a final sigma; glibc's C.UTF-8, a character to a character.
+/// sigma that ends a word lowered to a final sigma; glibc's C.UTF-8, a character to a character; a
+/// library collation's own mapping.
 pub fn case(s: &str, upper: bool, casing: crate::catalog::Casing) -> Result<String> {
     use crate::catalog::Casing;
     Ok(match casing {
@@ -567,6 +582,7 @@ pub fn case(s: &str, upper: bool, casing: crate::catalog::Casing) -> Result<Stri
                 })
                 .collect()
         }
+        Casing::Library(id) => crate::collations::get(id).case(s, upper)?,
         Casing::Simple | Casing::Full => {
             let c = cases();
             let chars: Vec<char> = s.chars().collect();
@@ -667,6 +683,119 @@ pub fn like<T: Copy + PartialEq>(
         }
     }
     Ok(pieces[p..].iter().all(|x| *x == Piece::Any))
+}
+
+/// Whether a text matches a LIKE pattern under a nondeterministic collation, as PostgreSQL 19's
+/// `MatchText` matches it there: each run of the pattern between its wildcards compared with a run
+/// of the text by the collation, each length of run tried in turn.
+pub fn like_nondeterministic(
+    text: &[char],
+    pattern: &[char],
+    escape: Option<char>,
+    collator: &crate::collations::Collator,
+) -> Result<bool> {
+    Ok(match_run(text, pattern, escape, collator)? == Matched::Yes)
+}
+
+/// What a LIKE's match of a text's end makes of it: matched, not, or never from a later start.
+#[derive(Clone, Copy, PartialEq)]
+enum Matched {
+    Yes,
+    No,
+    Never,
+}
+
+fn match_run(
+    mut t: &[char],
+    mut p: &[char],
+    escape: Option<char>,
+    collator: &crate::collations::Collator,
+) -> Result<Matched> {
+    let ended = || Error::new("LIKE pattern must not end with escape character");
+    let utf8 = |s: &[char]| s.iter().collect::<String>();
+    if p == ['%'] {
+        return Ok(Matched::Yes);
+    }
+    while !t.is_empty() && !p.is_empty() {
+        if p[0] == '%' {
+            p = &p[1..];
+            while let Some(&c) = p.first() {
+                if c == '%' {
+                    p = &p[1..];
+                } else if c == '_' {
+                    if t.is_empty() {
+                        return Ok(Matched::Never);
+                    }
+                    t = &t[1..];
+                    p = &p[1..];
+                } else {
+                    break;
+                }
+            }
+            if p.is_empty() {
+                return Ok(Matched::Yes);
+            }
+            if Some(p[0]) == escape && p.len() < 2 {
+                return Err(ended());
+            }
+            while !t.is_empty() {
+                let m = match_run(t, p, escape, collator)?;
+                if m != Matched::No {
+                    return Ok(m);
+                }
+                t = &t[1..];
+            }
+            return Ok(Matched::Never);
+        }
+        if p[0] == '_' {
+            t = &t[1..];
+            p = &p[1..];
+            continue;
+        }
+        // The pattern's run up to its next wildcard, its escapes taken off.
+        let mut run = Vec::new();
+        let mut i = 0;
+        while i < p.len() {
+            if Some(p[i]) == escape {
+                i += 1;
+                if i == p.len() {
+                    return Err(ended());
+                }
+            } else if p[i] == '_' || p[i] == '%' {
+                break;
+            }
+            run.push(p[i]);
+            i += 1;
+        }
+        let run = utf8(&run);
+        let rest = &p[i..];
+        if rest.is_empty() {
+            return Ok(if collator.equal(run.as_bytes(), utf8(t).as_bytes()) {
+                Matched::Yes
+            } else {
+                Matched::No
+            });
+        }
+        for k in 0..=t.len() {
+            if collator.equal(run.as_bytes(), utf8(&t[..k]).as_bytes())
+                && match_run(&t[k..], rest, escape, collator)? == Matched::Yes
+            {
+                return Ok(Matched::Yes);
+            }
+        }
+        return Ok(Matched::No);
+    }
+    if !t.is_empty() {
+        return Ok(Matched::No);
+    }
+    while p.first() == Some(&'%') {
+        p = &p[1..];
+    }
+    Ok(if p.is_empty() {
+        Matched::Yes
+    } else {
+        Matched::Never
+    })
 }
 
 /// A LIKE's ESCAPE: its one character, or none where it is empty.

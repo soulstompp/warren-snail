@@ -14,6 +14,9 @@ use crate::{Error, Result};
 use std::cmp::Ordering;
 use std::ops::Bound;
 
+/// A column's collator, where a library orders its text.
+type Coll = Option<&'static crate::collations::Collator>;
+
 /// Where a scan hands the rows it keeps.
 pub trait Sink {
     /// The dictionaries the codes of the rows that follow index, one for each column scanned.
@@ -285,7 +288,8 @@ impl Snail {
                     table.name
                 ))
             })?;
-        let (head, entries) = decode_top(&self.reader.read_extent(*e)?)?;
+        let (head, entries) =
+            crate::write::top_read(table, &table.orders[order], &self.reader.read_extent(*e)?)?;
         Ok((head, entries, e.pages()))
     }
 
@@ -326,8 +330,9 @@ impl Snail {
                             let Bound::Included(v) = &texts[i].lo else {
                                 unreachable!()
                             };
-                            lo.push(crate::places::byte_key(ty, v));
-                            hi.push(crate::places::byte_key(ty, v));
+                            let column = &want.table.columns[c];
+                            lo.push(crate::places::column_byte_key(column, v));
+                            hi.push(crate::places::column_byte_key(column, v));
                             continue;
                         }
                         None => break,
@@ -586,6 +591,12 @@ impl Snail {
         let mut sent: Vec<Dict> = vec![None; columns.len()];
         let lead = sink.lead();
         let leaves = order.leaves(table);
+        // Each column's collator, where a library orders its text.
+        let orderers = table
+            .columns
+            .iter()
+            .map(crate::catalog::Column::orderer)
+            .collect::<Result<Vec<_>>>()?;
         let descs = crate::write::leaf_descriptors(table, order)?;
         for br in &plan.reads[blocks] {
             // For every leaf read, its runs of pages decoded: (slot, [(first row, values)]).
@@ -702,11 +713,17 @@ impl Snail {
                 } else {
                     &[][..]
                 };
-                let levels: Vec<(Level, ColumnType, usize, &Values)> = fixed
+                let levels: Vec<(Level, ColumnType, usize, &Values, Coll)> = fixed
                     .iter()
                     .map(|&l| {
                         let (start, v) = column(l.column());
-                        (l, table.columns[l.column()].ty, start, v)
+                        (
+                            l,
+                            table.columns[l.column()].ty,
+                            start,
+                            v,
+                            orderers[l.column()],
+                        )
                     })
                     .collect();
                 let rests: Vec<(&Cond, usize, &Values)> = br
@@ -718,13 +735,13 @@ impl Snail {
                         (c, start, v)
                     })
                     .collect();
-                let texts: Vec<(&TextCond, ColumnType, usize, &Values)> = br
+                let texts: Vec<(&TextCond, ColumnType, usize, &Values, Coll)> = br
                     .text_may
                     .iter()
                     .map(|&ti| {
                         let t = &want.side.texts[ti];
                         let (start, v) = column(t.column);
-                        (t, table.columns[t.column].ty, start, v)
+                        (t, table.columns[t.column].ty, start, v, orderers[t.column])
                     })
                     .collect();
                 let nulls: Vec<(bool, usize, &Values)> = br
@@ -745,10 +762,15 @@ impl Snail {
                     })
                     .collect();
                 // The columns read whose values are compared by a key other than their bytes: a
-                // bpchar's, without its trailing blanks.
+                // bpchar's, without its trailing blanks; a string's under a library collation, by
+                // the collation's key.
                 let keyed: Vec<bool> = columns
                     .iter()
                     .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::Bpchar(_)))
+                    .collect();
+                let collated: Vec<(ColumnType, Coll)> = columns
+                    .iter()
+                    .map(|&(c, _)| (table.columns[c].ty, orderers[c]))
                     .collect();
                 // Which of them are numerics held as their text, each kept beside its class.
                 let classed: Vec<bool> = columns
@@ -763,7 +785,7 @@ impl Snail {
                 // How a row's fixed levels compare with a bound, level by level, a NULL lying on its
                 // level's side.
                 let against = |r: usize, bound: &[KeyValue]| -> Ordering {
-                    for (li, ((_, ty, start, v), b)) in levels.iter().zip(bound).enumerate() {
+                    for (li, ((_, ty, start, v, coll), b)) in levels.iter().zip(bound).enumerate() {
                         let null = KeyValue::Null {
                             first: order.nulls_first[li],
                         };
@@ -778,14 +800,16 @@ impl Snail {
                             }
                             (false, KeyValue::Text(t)) => {
                                 v.text_value(r - start).map_or(Ordering::Less, |x| {
-                                    crate::strings::key_bytes(*ty, x.data())
+                                    crate::strings::column_key(*ty, *coll, x.data())
                                         .as_ref()
                                         .cmp(t.as_bytes())
                                 })
                             }
                             (false, KeyValue::Bytes(t)) => {
                                 v.text_value(r - start).map_or(Ordering::Less, |x| {
-                                    crate::strings::key_bytes(*ty, x.data()).as_ref().cmp(&**t)
+                                    crate::strings::column_key(*ty, *coll, x.data())
+                                        .as_ref()
+                                        .cmp(&**t)
                                 })
                             }
                             (false, KeyValue::Int(x)) => v
@@ -824,6 +848,7 @@ impl Snail {
                         && texts.is_empty()
                         && nulls.is_empty()
                         && dead.get(d).is_none_or(|&x| x as usize >= b)
+                        && collated.iter().all(|c| c.1.is_none())
                         && sink.run(&outs, a, b)
                     {
                         self.taken.set(self.taken.get() + (b - a) as u64);
@@ -852,9 +877,9 @@ impl Snail {
                             c.holds(x)
                         });
                         let keep =
-                            keep && texts.iter().all(|&(t, ty, start, v)| {
+                            keep && texts.iter().all(|&(t, ty, start, v, coll)| {
                                 v.text_value(r - start).is_some_and(|x| {
-                                    t.holds(&crate::strings::key_bytes(ty, x.data()))
+                                    t.holds(&crate::strings::column_key(ty, coll, x.data()))
                                 })
                             }) && nulls
                                 .iter()
@@ -865,7 +890,13 @@ impl Snail {
                         let make = |o: usize| {
                             let (is_text, month, start, v) = outs[o];
                             let i = r - start;
-                            if let Values::Composed(x) = v {
+                            if let (ty, Some(coll)) = collated[o] {
+                                v.text_value(i).map_or(Cell::Null, |t| {
+                                    let key: Box<[u8]> =
+                                        crate::strings::column_key(ty, Some(coll), t.data()).into();
+                                    Cell::Keyed(crate::read::answer::Keyed::new(key, t))
+                                })
+                            } else if let Values::Composed(x) = v {
                                 x[i].clone().map_or(Cell::Null, Cell::Composed)
                             } else if let Values::Dict { codes, .. } = v {
                                 codes[i].map_or(Cell::Null, Cell::Code)

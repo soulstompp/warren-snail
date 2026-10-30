@@ -10,7 +10,7 @@ repository = "https://github.com/soulstompp/warren-snail"
 readme = "README.md"
 keywords = ["database", "parquet", "postgresql", "sql", "columnar"]
 categories = ["database-implementations", "command-line-utilities"]
-include = ["src/**", "tests/**", "README.md", "LICENSE"]
+include = ["build.rs", "src/**", "tests/**", "README.md", "LICENSE"]
 
 [lib]
 name = "warren_snail"
@@ -28,6 +28,10 @@ standalone = []
 # Zones other than UTC, read from compiled zone files in a directory: the machine's, or one named.
 # Built without it, a zone other than UTC is refused by name.
 zones = []
+# Text under a collation other than byte order: ICU's collators and glibc's locales, called as
+# PostgreSQL calls them, the machine's ICU linked as PostgreSQL links it. Built without it, such a
+# collation is refused by name.
+collations = []
 
 [dependencies]
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }

@@ -223,6 +223,24 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
     }))
 }
 
+/// How two values compare under `under`: two strings under a library collation as it compares
+/// them, any others as `compare` does.
+fn compare_under(under: Option<Casing>, a: &Value, b: &Value) -> Result<Option<Ordering>> {
+    if let (Some(Casing::Library(id)), Some(x), Some(y)) = (under, a.string_key(), b.string_key()) {
+        return Ok(Some(crate::collations::get(id).cmp(x, y)));
+    }
+    compare(a, b)
+}
+
+/// A value as `key` makes it, a string under a library collation by the collation's key, so that
+/// values a nondeterministic collation calls equal are one key.
+fn key_under(v: &Value, under: Option<Casing>) -> Key {
+    match (under, v.string_key()) {
+        (Some(Casing::Library(id)), Some(s)) => Key::Bytes(crate::collations::get(id).key(s)),
+        _ => key(v),
+    }
+}
+
 /// A value as a key that groups and partitions: equal values, at any scale, are one key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
@@ -304,6 +322,10 @@ struct Frame<'a> {
 pub struct Casings {
     columns: HashMap<String, Casing>,
     declared: Vec<crate::catalog::Collation>,
+    /// The columns under a library collation this build opens none of, each with its collation.
+    unheld: HashMap<String, String>,
+    /// Whether a column orders its text through a library, or names a collation that would.
+    library: bool,
 }
 
 impl Casings {
@@ -315,18 +337,39 @@ impl Casings {
         let mut c = Casings {
             columns: HashMap::new(),
             declared: declared.to_vec(),
+            unheld: HashMap::new(),
+            library: false,
         };
         for col in &table.columns {
             let named = match (&col.collation, col.ty) {
-                (Some(n), _) => crate::catalog::collation_held(n, declared),
+                (Some(n), _) => match crate::catalog::collation_casing(n, declared) {
+                    Ok(k) => Some(k),
+                    Err(_) => {
+                        c.unheld.insert(col.name.clone(), n.clone());
+                        c.library = true;
+                        None
+                    }
+                },
                 (None, ColumnType::Name) => Some(Casing::Ascii),
                 _ => None,
             };
             if let Some(k) = named {
+                c.library |= matches!(k, Casing::Library(_));
                 c.columns.insert(col.name.clone(), k);
             }
         }
         c
+    }
+
+    /// The library collation an expression's strings are compared under, where one is: as
+    /// `implicit` finds it; at once none where no column and no COLLATE names one.
+    fn ordering(&self, e: &Expr) -> Result<Option<Casing>> {
+        if !self.library && !names_collate(e) {
+            return Ok(None);
+        }
+        Ok(self
+            .implicit(e)?
+            .filter(|k| matches!(k, Casing::Library(_))))
     }
 
     /// How the collation named maps case, where the snail holds it.
@@ -343,9 +386,13 @@ impl Casings {
                 Some(self.named(&crate::catalog::object_name(collation))?)
             }
             Expr::Nested(x) => self.implicit(x)?,
-            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                column_of(e).and_then(|(_, n)| self.columns.get(&n).copied())
-            }
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => match column_of(e) {
+                Some((_, n)) => match self.unheld.get(&n) {
+                    Some(k) => return Err(crate::collations::unbuilt(k)),
+                    None => self.columns.get(&n).copied(),
+                },
+                None => None,
+            },
             Expr::Function(f) => match args(f).ok().and_then(|a| a.first().copied()) {
                 Some(x) => self.implicit(x)?,
                 None => None,
@@ -371,6 +418,7 @@ impl Casings {
                 _ => continue,
             };
             let k = self.implicit(e)?;
+            self.library |= matches!(k, Some(Casing::Library(_)));
             match (self.columns.get(&name).copied(), k) {
                 (None, Some(k)) => {
                     self.columns.insert(name, k);
@@ -382,6 +430,20 @@ impl Casings {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether an expression names a COLLATE where `Casings::implicit` looks for one.
+fn names_collate(e: &Expr) -> bool {
+    match e {
+        Expr::Collate { .. } => true,
+        Expr::Nested(x) => names_collate(x),
+        Expr::Function(f) => args(f)
+            .ok()
+            .and_then(|a| a.first().copied())
+            .is_some_and(names_collate),
+        Expr::BinaryOp { left, right, .. } => names_collate(left) || names_collate(right),
+        _ => false,
     }
 }
 
@@ -1092,7 +1154,13 @@ fn string_op(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>>
 
 /// A LIKE or an ILIKE, as PostgreSQL reads one: text, a name, a bpchar's own text with its blanks,
 /// or bytea, matched by a pattern of its kind, an ILIKE's both in lower case under `casing`.
-fn like_of(v: &Value, p: &Value, escape: Option<char>, ilike: Option<Casing>) -> Result<bool> {
+fn like_of(
+    v: &Value,
+    p: &Value,
+    escape: Option<char>,
+    ilike: Option<Casing>,
+    under: Option<Casing>,
+) -> Result<bool> {
     let own = |v: &Value| match v {
         Value::Str(_, s) | Value::Text(s) => Some(s.clone()),
         _ => None,
@@ -1113,10 +1181,23 @@ fn like_of(v: &Value, p: &Value, escape: Option<char>, ilike: Option<Casing>) ->
                     .to_string(),
             );
             if let Some(casing) = ilike {
+                if let Casing::Library(id) = casing {
+                    if !crate::collations::get(id).spec.deterministic {
+                        return Err(Error::new(
+                            "nondeterministic collations are not supported for ILIKE",
+                        ));
+                    }
+                }
                 t = crate::strings::case(&t, false, casing)?;
                 q = crate::strings::case(&q, false, casing)?;
             }
             let (t, q): (Vec<char>, Vec<char>) = (t.chars().collect(), q.chars().collect());
+            if let (None, Some(Casing::Library(id))) = (ilike, under) {
+                let c = crate::collations::get(id);
+                if !c.spec.deterministic {
+                    return crate::strings::like_nondeterministic(&t, &q, escape, c);
+                }
+            }
             crate::strings::like(&t, &q, '%', '_', escape)
         }
         _ => Err(Error::new(format!(
@@ -1706,7 +1787,11 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }),
                 _ => None,
             };
-            Value::Bool(like_of(&v, &p, escape, ilike)? != *negated)
+            let under = match frame.casings.ordering(expr)? {
+                Some(k) => Some(k),
+                None => frame.casings.ordering(pattern)?,
+            };
+            Value::Bool(like_of(&v, &p, escape, ilike, under)? != *negated)
         }
         Expr::AnyOp {
             left,
@@ -1789,7 +1874,9 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             let (x, y) = beside(ev(a)?, ev(b)?, a, b)?;
             let same = match (x.is_null(), y.is_null()) {
                 (true, true) => true,
-                (false, false) => compare(&x, &y)? == Some(Ordering::Equal),
+                (false, false) => {
+                    compare_under(frame.casings.ordering(e)?, &x, &y)? == Some(Ordering::Equal)
+                }
                 _ => false,
             };
             Value::Bool(same == matches!(e, Expr::IsNotDistinctFrom(..)))
@@ -1853,17 +1940,19 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 | BinaryOperator::Lt
                 | BinaryOperator::LtEq
                 | BinaryOperator::Gt
-                | BinaryOperator::GtEq => match compare(&x, &y)? {
-                    None => Value::Null,
-                    Some(o) => Value::Bool(match op {
-                        BinaryOperator::Eq => o == Ordering::Equal,
-                        BinaryOperator::NotEq => o != Ordering::Equal,
-                        BinaryOperator::Lt => o == Ordering::Less,
-                        BinaryOperator::LtEq => o != Ordering::Greater,
-                        BinaryOperator::Gt => o == Ordering::Greater,
-                        _ => o != Ordering::Less,
-                    }),
-                },
+                | BinaryOperator::GtEq => {
+                    match compare_under(frame.casings.ordering(e)?, &x, &y)? {
+                        None => Value::Null,
+                        Some(o) => Value::Bool(match op {
+                            BinaryOperator::Eq => o == Ordering::Equal,
+                            BinaryOperator::NotEq => o != Ordering::Equal,
+                            BinaryOperator::Lt => o == Ordering::Less,
+                            BinaryOperator::LtEq => o != Ordering::Greater,
+                            BinaryOperator::Gt => o == Ordering::Greater,
+                            _ => o != Ordering::Less,
+                        }),
+                    }
+                }
                 other => return Err(Error::new(format!("the operator {other} is not read"))),
             }
         }
@@ -2166,8 +2255,9 @@ impl Acc {
         Ok((acc, Some(*x)))
     }
 
-    /// Folds in one row: its value, or none for count(*). A NULL is passed over.
-    fn add(&mut self, v: Option<Value>) -> Result<()> {
+    /// Folds in one row: its value, or none for count(*). A NULL is passed over. min and max compare
+    /// strings under `under`.
+    fn add(&mut self, v: Option<Value>, under: Option<Casing>) -> Result<()> {
         let v = match v {
             None => {
                 if let Acc::Count(n) = self {
@@ -2314,7 +2404,7 @@ impl Acc {
                 let later = v.to_numeric().is_some();
                 let better = match best {
                     None => true,
-                    Some(b) => match compare(&v, b)? {
+                    Some(b) => match compare_under(under, &v, b)? {
                         Some(Ordering::Less) => true,
                         Some(Ordering::Equal) => later,
                         _ => false,
@@ -2328,7 +2418,7 @@ impl Acc {
                 let later = v.to_numeric().is_some();
                 let better = match best {
                     None => true,
-                    Some(b) => match compare(&v, b)? {
+                    Some(b) => match compare_under(under, &v, b)? {
                         Some(Ordering::Greater) => true,
                         Some(Ordering::Equal) => later,
                         _ => false,
@@ -2568,12 +2658,23 @@ impl<'q> StepRun<'q> {
                 .iter()
                 .map(|&c| Acc::of(c).map(|(_, x)| x))
                 .collect::<Result<_>>()?;
+            let grouped_under = self
+                .p
+                .grouping
+                .iter()
+                .map(|g| frame.casings.ordering(g))
+                .collect::<Result<Vec<_>>>()?;
+            let folded_under = folded
+                .iter()
+                .map(|x| x.map(|x| frame.casings.ordering(x)).transpose())
+                .collect::<Result<Vec<_>>>()?;
             for row in rel.rows {
                 let k: Vec<Key> = self
                     .p
                     .grouping
                     .iter()
-                    .map(|g| eval(g, &row, &frame, &none).map(|v| key(&v)))
+                    .zip(&grouped_under)
+                    .map(|(g, &u)| eval(g, &row, &frame, &none).map(|v| key_under(&v, u)))
                     .collect::<Result<_>>()?;
                 let i = match self.at.get(&k) {
                     Some(&i) => i,
@@ -2584,8 +2685,9 @@ impl<'q> StepRun<'q> {
                         self.groups.len() - 1
                     }
                 };
-                for (acc, x) in self.groups[i].1.iter_mut().zip(&folded) {
-                    acc.add(x.map(|x| eval(x, &row, &frame, &none)).transpose()?)?;
+                for ((acc, x), u) in self.groups[i].1.iter_mut().zip(&folded).zip(&folded_under) {
+                    let v = x.map(|x| eval(x, &row, &frame, &none)).transpose()?;
+                    acc.add(v, u.flatten())?;
                 }
             }
             self.columns = frame.columns;
@@ -2689,13 +2791,19 @@ fn sort(
         release,
         casings,
     };
+    // A string sorted under a library collation is sorted by the collation's key.
+    let under = exprs
+        .iter()
+        .map(|o| casings.ordering(&o.expr))
+        .collect::<Result<Vec<_>>>()?;
     let none = computed_none();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = std::mem::take(&mut out.rows)
         .into_iter()
         .map(|row| {
             let k = exprs
                 .iter()
-                .map(|o| {
+                .enumerate()
+                .map(|(i, o)| {
                     let e = match column_of(&o.expr) {
                         Some((_, n)) => Expr::Identifier(sqlparser::ast::Ident::new(n)),
                         None => o.expr.clone(),
@@ -2708,7 +2816,12 @@ fn sort(
                                 ty.pg_name()
                             )))
                         }
-                        v => Ok(v),
+                        v => Ok(match (under[i], v.string_key()) {
+                            (Some(Casing::Library(id)), Some(s)) => {
+                                Value::Bytes(crate::collations::get(id).key(s))
+                            }
+                            _ => v,
+                        }),
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;

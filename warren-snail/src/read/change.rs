@@ -155,8 +155,16 @@ pub(super) fn datum_typed(v: &Values, i: usize, ty: ColumnType) -> Datum {
     }
 }
 
-/// A value's key on a level of type `ty`, from the value: a number's, a string's or bytes'.
-fn level_key(ty: ColumnType, level: Level, d: &Datum, null: KeyValue) -> KeyValue {
+/// A value's key on a level of `column`, from the value: a number's, a string's or bytes'; a
+/// string's under a library collation, by `collator`'s key.
+fn level_key(
+    column: &crate::catalog::Column,
+    collator: Option<&crate::collations::Collator>,
+    level: Level,
+    d: &Datum,
+    null: KeyValue,
+) -> KeyValue {
+    let ty = column.ty;
     match d {
         // An infinite instant's month is NULL, as PostgreSQL's extract gives it.
         Datum::Int(v) => match level {
@@ -164,7 +172,10 @@ fn level_key(ty: ColumnType, level: Level, d: &Datum, null: KeyValue) -> KeyValu
             level => key(level, *v),
         },
         Datum::Interval(v) => KeyValue::Wide(v.total()),
-        Datum::Text(t) => byte_key(ty, &crate::strings::key_bytes(ty, t.as_bytes())),
+        Datum::Text(t) => crate::places::column_byte_key(
+            column,
+            &crate::strings::column_key(ty, collator, t.as_bytes()),
+        ),
         Datum::Bytes(b) => byte_key(ty, b),
         Datum::Wide(k) => KeyValue::Wide(*k),
         Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(*b)),
@@ -217,18 +228,20 @@ fn leaf_datums(ty: ColumnType, d: &Datum) -> Vec<Datum> {
 }
 
 /// A row's key on an order of `table`.
-pub(super) fn key_of(table: &Table, order: &Order, row: &Row) -> Vec<KeyValue> {
+pub(super) fn key_of(table: &Table, order: &Order, row: &Row) -> Result<Vec<KeyValue>> {
     order
         .levels
         .iter()
         .enumerate()
         .map(|(li, &l)| {
-            level_key(
-                table.columns[l.column()].ty,
+            let column = &table.columns[l.column()];
+            Ok(level_key(
+                column,
+                column.orderer()?,
                 l,
                 &row[l.column()],
                 null_key(order, li),
-            )
+            ))
         })
         .collect()
 }
@@ -1151,7 +1164,8 @@ impl Snail {
                 .ok_or_else(|| {
                     Error::new(format!("{}: the root names no {}", table.name, order.name))
                 })?;
-            let (mut head, entries) = decode_top(&self.reader.read_extent(root.orders[at].2)?)?;
+            let (mut head, entries) =
+                crate::write::top_read(table, order, &self.reader.read_extent(root.orders[at].2)?)?;
             let mut top = Node {
                 entries,
                 height: head.height,
@@ -1398,7 +1412,8 @@ impl Snail {
                 .ok_or_else(|| {
                     Error::new(format!("{}: the root names no {}", table.name, order.name))
                 })?;
-            let (mut head, entries) = decode_top(&self.reader.read_extent(root.orders[at].2)?)?;
+            let (mut head, entries) =
+                crate::write::top_read(table, order, &self.reader.read_extent(root.orders[at].2)?)?;
             let mut top = Node {
                 entries,
                 height: head.height,
@@ -1732,13 +1747,13 @@ impl Snail {
         for c in changes {
             match c {
                 Change::Insert(r) => effects.push(Effect {
-                    key: key_of(table, order, r),
+                    key: key_of(table, order, r)?,
                     values: held(r),
                     delete: false,
                     chain: None,
                 }),
                 Change::Delete(r) => effects.push(Effect {
-                    key: key_of(table, order, r),
+                    key: key_of(table, order, r)?,
                     values: held(r),
                     delete: true,
                     chain: None,
@@ -1747,9 +1762,9 @@ impl Snail {
                     if held(o) == held(n) {
                         continue;
                     }
-                    let to = key_of(table, order, n);
+                    let to = key_of(table, order, n)?;
                     effects.push(Effect {
-                        key: key_of(table, order, o),
+                        key: key_of(table, order, o)?,
                         values: held(o),
                         delete: true,
                         chain: Some(to.clone()),
@@ -1777,7 +1792,11 @@ impl Snail {
             .ok_or_else(|| {
                 Error::new(format!("{}: the root names no {}", table.name, order.name))
             })?;
-        let (mut head, entries) = decode_top(&self.reader.read_extent(self.root.orders[at].2)?)?;
+        let (mut head, entries) = crate::write::top_read(
+            table,
+            order,
+            &self.reader.read_extent(self.root.orders[at].2)?,
+        )?;
         let mut top = Node {
             entries,
             height: head.height,
@@ -1893,7 +1912,8 @@ impl Snail {
             .ok_or_else(|| {
                 Error::new(format!("{}: the root names no {}", table.name, order.name))
             })?;
-        let (head, entries) = decode_top(&self.reader.read_extent(root.orders[at].2)?)?;
+        let (head, entries) =
+            crate::write::top_read(table, order, &self.reader.read_extent(root.orders[at].2)?)?;
         if entries.is_empty() && !blocks.is_empty() {
             return Ok(false);
         }
@@ -1984,7 +2004,11 @@ impl Snail {
                 .iter()
                 .position(|(t, o, _)| *t == table.name && *o == order.name)
                 .expect("a block read lies in an order the root names");
-            let (head, entries) = decode_top(&self.reader.read_extent(self.root.orders[at].2)?)?;
+            let (head, entries) = crate::write::top_read(
+                &table,
+                order,
+                &self.reader.read_extent(self.root.orders[at].2)?,
+            )?;
             let mut top = Node {
                 entries,
                 height: head.height,
@@ -2145,6 +2169,11 @@ impl Snail {
         }
         // The new rows go after the block's last, into its tail: plain pages of one disk page, each
         // written afresh as rows come, the k-page pages before them left as they lie.
+        let orderers = order
+            .levels
+            .iter()
+            .map(|l| table.columns[l.column()].orderer())
+            .collect::<Result<Vec<_>>>()?;
         let key_at = |p: usize| -> Vec<KeyValue> {
             order
                 .levels
@@ -2152,8 +2181,9 @@ impl Snail {
                 .zip(&level_slots)
                 .enumerate()
                 .map(|(li, (&l, &s))| {
-                    let ty = table.columns[l.column()].ty;
-                    level_key(ty, l, &datum_typed(&columns[s], p, ty), null_key(order, li))
+                    let column = &table.columns[l.column()];
+                    let d = datum_typed(&columns[s], p, column.ty);
+                    level_key(column, orderers[li], l, &d, null_key(order, li))
                 })
                 .collect()
         };
@@ -2399,7 +2429,8 @@ impl Snail {
     /// orders as written.
     fn declare(&mut self, ddl: &str) -> Result<()> {
         let text = format!("{}\n{ddl};\n", self.catalog.ddl.trim_end());
-        let mut catalog = Catalog::parse(&text)?;
+        let kept = Catalog::statements_in(&self.catalog.ddl)?;
+        let mut catalog = Catalog::parse_kept(&text, kept)?;
         super::old_names(&mut catalog, self.reader.format());
         catalog.with_release(self.root.release)?;
         let mut made: Vec<(String, String)> = Vec::new();

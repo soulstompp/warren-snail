@@ -218,9 +218,20 @@ pub fn byte_key(ty: ColumnType, key: &[u8]) -> KeyValue {
     }
 }
 
+/// The value a level of a column keys, from the bytes its value is keyed by: bytes for a string
+/// under a library collation, else as `byte_key` says.
+pub fn column_byte_key(column: &crate::catalog::Column, key: &[u8]) -> KeyValue {
+    if column.collated() {
+        KeyValue::Bytes(key.into())
+    } else {
+        byte_key(column.ty, key)
+    }
+}
+
 /// The sublevels a level of a string type, bytea or a bit string is cut on so that a value keyed
 /// by `key` lies whole on them, at least `had`: one more than its bytes, or than a bit varying's
-/// bits; `BYTES_LEVEL` beside them for a level keyed by bytes.
+/// bits; `BYTES_LEVEL` beside them for a level keyed by bytes, as `had` says of a string under a
+/// library collation.
 pub fn rungs_for(ty: ColumnType, key: &[u8], had: u32) -> u32 {
     let n = match ty {
         ColumnType::Bit(n) => n,
@@ -228,7 +239,7 @@ pub fn rungs_for(ty: ColumnType, key: &[u8], had: u32) -> u32 {
         _ => key.len() as u32 + 1,
     };
     let n = n.max(had & !crate::directory::BYTES_LEVEL);
-    if ty.keyed_by_bytes() {
+    if ty.keyed_by_bytes() || had & crate::directory::BYTES_LEVEL != 0 {
         n | crate::directory::BYTES_LEVEL
     } else {
         n
@@ -302,10 +313,9 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Text(_)
             | ColumnType::Bpchar(_)
             | ColumnType::Name
-            | ColumnType::NumericText(_) => text_sublevels as usize,
-            ColumnType::Bytes | ColumnType::Varbit(_) => {
-                (text_sublevels & !crate::directory::BYTES_LEVEL) as usize
-            }
+            | ColumnType::NumericText(_)
+            | ColumnType::Bytes
+            | ColumnType::Varbit(_) => (text_sublevels & !crate::directory::BYTES_LEVEL) as usize,
             // An enum by its rank's bits; any other composed type by its key written as text.
             ColumnType::Composed(r) if crate::composed::is_nested(r) => text_sublevels as usize,
             ColumnType::Composed(_) => 32,

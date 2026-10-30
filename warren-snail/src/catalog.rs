@@ -687,9 +687,51 @@ pub struct Column {
     /// The domain its DDL names as its type, whose constraints its values meet; its type is the
     /// domain's base type.
     pub domain: Option<String>,
+    /// The collation its COLLATE names, where that one calls a library, ICU or glibc, to order
+    /// text.
+    pub library: Option<crate::collations::Spec>,
 }
 
 impl Column {
+    /// Whether its text is ordered by a library collation, glibc's LC_COLLATE C and POSIX aside,
+    /// which order by the bytes.
+    pub fn collated(&self) -> bool {
+        self.ty.is_string() && self.library.as_ref().is_some_and(|s| !s.collate_is_c())
+    }
+
+    /// The collator its text is ordered by, where `collated`.
+    pub fn orderer(&self) -> Result<Option<&'static crate::collations::Collator>> {
+        if self.collated() {
+            self.collator()
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// What an order with a level on it records the level was cut under: its collation and the
+    /// version its library gives, where `collated`; nothing otherwise.
+    pub fn cut_under(&self) -> Result<String> {
+        match (self.orderer()?, &self.library) {
+            (Some(c), Some(spec)) => Ok(spec.cut_under(c.version())),
+            _ => Ok(String::new()),
+        }
+    }
+
+    /// The collator its text is ordered by and its case mapped by, where its collation calls a
+    /// library: refused by name by a build without the feature `collations`.
+    pub fn collator(&self) -> Result<Option<&'static crate::collations::Collator>> {
+        match &self.library {
+            None => Ok(None),
+            Some(spec) => {
+                let name = self.collation.as_deref().unwrap_or("default");
+                if !cfg!(feature = "collations") {
+                    return Err(crate::collations::unbuilt(name));
+                }
+                crate::collations::open(spec, name).map(|(_, c)| Some(c))
+            }
+        }
+    }
+
     /// Whether the column is computed at the read, and so held by no order.
     pub fn is_virtual(&self) -> bool {
         self.generated.as_ref().is_some_and(|g| !g.stored)
@@ -1170,14 +1212,51 @@ impl Collation {
     /// Whether it orders text by its bytes, as the snail compares text without the feature that
     /// calls a collation library.
     pub fn byte_order(&self) -> bool {
-        self.casing(&[]).is_some()
+        self.bytes_casing(&[]).is_some()
     }
 
-    /// How it maps case, where it orders text by its bytes: a copy's as its source's, among the
-    /// built-in ones and `declared`; none where it orders text otherwise.
+    /// How it orders text and maps case where the snail holds it: by its bytes as `bytes_casing`
+    /// says, or through its library with the feature `collations`.
     pub fn casing(&self, declared: &[Collation]) -> Option<Casing> {
+        if let Some(k) = self.bytes_casing(declared) {
+            return Some(k);
+        }
+        let spec = self.spec(declared)?;
+        crate::collations::open(&spec, &self.name)
+            .ok()
+            .map(|(id, _)| Casing::Library(id))
+    }
+
+    /// The library collation it is, where it orders text otherwise than by its bytes: a copy's as
+    /// its source's.
+    pub fn spec(&self, declared: &[Collation]) -> Option<crate::collations::Spec> {
+        use crate::collations::Spec;
         if let Some(f) = &self.from {
-            return collation_held(f, declared);
+            return library_spec(f, declared);
+        }
+        if self.bytes_casing(declared).is_some() {
+            return None;
+        }
+        match self.provider.as_str() {
+            "icu" => Some(Spec::icu(
+                self.locale.as_deref().unwrap_or("und"),
+                self.rules.as_deref(),
+                self.deterministic,
+            )),
+            "libc" => {
+                let collate = self.lc_collate.as_ref().or(self.locale.as_ref())?;
+                let ctype = self.lc_ctype.as_ref().or(self.locale.as_ref())?;
+                Some(Spec::libc(collate, ctype))
+            }
+            _ => None,
+        }
+    }
+
+    /// How it maps case where it orders text by its bytes: a copy's as its source's, among the
+    /// built-in ones and `declared`; none where it orders text otherwise.
+    pub fn bytes_casing(&self, declared: &[Collation]) -> Option<Casing> {
+        if let Some(f) = &self.from {
+            return bytes_casing(f, declared);
         }
         if !self.deterministic {
             return None;
@@ -1201,8 +1280,8 @@ impl Collation {
     }
 }
 
-/// How a collation the snail holds without the feature `collations` maps case. Each orders text by
-/// its bytes; they differ only here.
+/// How a collation the snail holds orders text and maps case: without the feature `collations`, each
+/// by its bytes, differing only in case; with it, `Library` through its library.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Casing {
@@ -1214,6 +1293,9 @@ pub enum Casing {
     Full,
     /// glibc's C.UTF-8, a character to a character: libc C.utf8, and the database's default.
     Libc,
+    /// A collation that calls its library, ICU or glibc, ordering text and mapping case as the
+    /// library does: the collator `collations::get` gives by this number.
+    Library(u16),
 }
 
 /// Why a collation is refused without the feature `collations`.
@@ -1222,10 +1304,32 @@ pub(crate) const NOT_HELD: &str =
      is read without the feature collations: C, POSIX, ucs_basic, pg_c_utf8, pg_unicode_fast, \
      C.utf8, or one the DDL makes like them";
 
-/// How the collation named maps case, where the snail holds it without the feature `collations`:
-/// one of PostgreSQL's built-in collations ordering text by its bytes, the database's default
-/// (libc C.UTF-8, as every database on the certificates' server), or one `declared` like them.
+/// How the collation named orders text and maps case, where the snail holds it: by its bytes as
+/// `bytes_casing` says, or, with the feature `collations`, through its library.
 pub fn collation_held(name: &str, declared: &[Collation]) -> Option<Casing> {
+    collation_casing(name, declared).ok()
+}
+
+/// How the collation named orders text and maps case, or why the snail does not hold it, by name.
+pub fn collation_casing(name: &str, declared: &[Collation]) -> Result<Casing> {
+    if let Some(k) = bytes_casing(name, declared) {
+        return Ok(k);
+    }
+    match library_spec(name, declared) {
+        Some(spec) if cfg!(feature = "collations") => {
+            crate::collations::open(&spec, name).map(|(id, _)| Casing::Library(id))
+        }
+        Some(_) => Err(Error::new(format!("COLLATE {name}: {NOT_HELD}"))),
+        None => Err(Error::new(format!(
+            "collation \"{name}\" for encoding \"UTF8\" does not exist"
+        ))),
+    }
+}
+
+/// How the collation named maps case, where it orders text by its bytes: one of PostgreSQL's
+/// built-in collations ordering text by its bytes, the database's default (libc C.UTF-8, as every
+/// database on the certificates' server), or one `declared` like them.
+pub fn bytes_casing(name: &str, declared: &[Collation]) -> Option<Casing> {
     let bare = name.strip_prefix("pg_catalog.").unwrap_or(name);
     match bare {
         "C" | "POSIX" | "ucs_basic" => Some(Casing::Ascii),
@@ -1235,8 +1339,42 @@ pub fn collation_held(name: &str, declared: &[Collation]) -> Option<Casing> {
         _ => declared
             .iter()
             .find(|c| c.name == name)
-            .and_then(|c| c.casing(declared)),
+            .and_then(|c| c.bytes_casing(declared)),
     }
+}
+
+/// The library collation the name names, where it orders text otherwise than by its bytes: one
+/// `declared`, or one of those initdb makes: ICU's `-x-icu` collations and `unicode`, and glibc's
+/// UTF-8 locales by their names and by their names less `.utf8`. With the feature `collations`,
+/// only one the machine's libraries hold; without it, any other name, which it cannot look up.
+pub fn library_spec(name: &str, declared: &[Collation]) -> Option<crate::collations::Spec> {
+    use crate::collations::Spec;
+    if let Some(c) = declared.iter().find(|c| c.name == name) {
+        return c.spec(declared);
+    }
+    let bare = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if bytes_casing(bare, &[]).is_some() {
+        return None;
+    }
+    if bare == "unicode" {
+        return Some(Spec::icu("und", None, true));
+    }
+    let built = cfg!(feature = "collations");
+    if let Some(tag) = bare.strip_suffix("-x-icu") {
+        if built && !crate::collations::icu_locales().iter().any(|t| t == tag) {
+            return None;
+        }
+        return Some(Spec::icu(tag, None, true));
+    }
+    if built {
+        return crate::collations::libc_locale(bare).map(|l| Spec::libc(&l, &l));
+    }
+    let l = if bare.contains('.') {
+        bare.to_string()
+    } else {
+        format!("{bare}.utf8")
+    };
+    Some(Spec::libc(&l, &l))
 }
 
 /// A function written in SQL whose body is one expression over its arguments.
@@ -1869,10 +2007,24 @@ pub fn shape(
         Expr::Collate { expr, collation } => {
             let named = object_name(collation);
             match shape(expr, table, alias, columns, functions, env)? {
+                // A COLLATE that orders as its column does: one of byte order on a column of byte
+                // order, or its column's own library collation.
+                Shape::Column(c)
+                    if columns[c].ty.is_string()
+                        && match &columns[c].library {
+                            None => bytes_casing(&named, &[]).is_some(),
+                            Some(own) => library_spec(&named, &[]).as_ref() == Some(own),
+                        } =>
+                {
+                    Ok(Shape::Column(c))
+                }
                 Shape::Column(c)
                     if columns[c].ty.is_string() && collation_held(&named, &[]).is_some() =>
                 {
-                    Ok(Shape::Column(c))
+                    Err(Error::new(format!(
+                        "{expr} COLLATE {named}: a column read under a collation that orders \
+                         otherwise than its own is not read here"
+                    )))
                 }
                 Shape::Column(c) if !columns[c].ty.is_string() => Err(Error::new(format!(
                     "collations are not supported by type {}",
@@ -2018,6 +2170,25 @@ impl Catalog {
                 ..reading.catalog
             }),
         }
+    }
+
+    /// The DDL read whole, as `parse` reads it, its first `kept` statements as the file's own: a
+    /// library collation they name taken by a build without the feature `collations`, and refused
+    /// only where it is used.
+    pub fn parse_kept(ddl: &str, kept: usize) -> Result<Catalog> {
+        let reading = crate::ddl::read_ddl_kept(ddl, true, kept)?;
+        match reading.statements.iter().find_map(|s| s.refused.as_ref()) {
+            Some(why) => Err(Error::new(why.clone())),
+            None => Ok(Catalog {
+                ddl: ddl.to_string(),
+                ..reading.catalog
+            }),
+        }
+    }
+
+    /// The number of statements a DDL holds.
+    pub fn statements_in(ddl: &str) -> Result<usize> {
+        crate::ddl::statements_in(ddl)
     }
 
     /// The DDL read a statement at a time: each statement taken or refused by name, and the
@@ -2280,11 +2451,21 @@ mod tests {
     }
 
     #[test]
-    fn a_collation_not_ordered_by_bytes_is_refused() {
-        let e = refused(
-            "CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"en_US\", PRIMARY KEY (a));",
-        );
-        assert!(e.contains("only a collation of byte order"), "{e}");
+    fn a_collation_not_ordered_by_bytes_is_refused_without_the_feature() {
+        let ddl =
+            "CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"en_US\", PRIMARY KEY (a));";
+        if cfg!(feature = "collations") {
+            assert!(Catalog::parse(ddl).unwrap().tables[0].columns[1].collated());
+            let e = refused(
+                "CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"xx_YY\", PRIMARY KEY (a));",
+            );
+            assert!(e.contains("does not exist"), "{e}");
+        } else {
+            let e = refused(ddl);
+            assert!(e.contains("only a collation of byte order"), "{e}");
+            let e = refused("CREATE COLLATION s.pt (provider = icu, locale = 'pt-PT')");
+            assert!(e.contains("only a collation of byte order"), "{e}");
+        }
         let e = refused("CREATE TABLE s.t (a integer NOT NULL COLLATE \"C\", PRIMARY KEY (a));");
         assert!(e.contains("not text"), "{e}");
     }
@@ -2518,8 +2699,8 @@ mod tests {
                 "a composite of no fields",
             ),
             (
-                "CREATE COLLATION s.pt (provider = icu, locale = 'pt-PT')",
-                "only a collation of byte order",
+                "CREATE COLLATION s.pt (provider = libc, locale = 'pt_PT.utf8', deterministic = false)",
+                "nondeterministic collations not supported",
             ),
             ("CREATE TYPE s.b (INPUT = x, OUTPUT = y)", "written in C"),
         ] {

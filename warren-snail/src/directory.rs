@@ -75,6 +75,10 @@ pub struct Head {
     pub height: u32,
     /// Which of the held leaves are keyed in 128 bits, by their place among the held leaves.
     pub wide_slots: Vec<u32>,
+    /// For each level of the order, what it was cut under where a library orders it: its
+    /// collation and the version its library gave, as `Column::cut_under` says; empty where none.
+    /// An order cut under other rules than the reader's is refused by name until re-cut.
+    pub cut_under: Vec<String>,
 }
 
 /// What `Head::level_text` holds for a level keyed in 128 bits.
@@ -87,6 +91,10 @@ pub const BYTES_LEVEL: u32 = 1 << 30;
 /// The top bit of a head's height, set where the order holds a column keyed in 128 bits: the
 /// columns' places follow it. A head holding none is written as before.
 const HEAD_WIDE: u32 = 1 << 31;
+
+/// The bit of a head's height set where a level of the order was cut under a library: what each
+/// level was cut under follows the columns keyed in 128 bits. A head with none is written as before.
+const HEAD_CUT: u32 = 1 << 30;
 
 fn add(a: u32, b: u32) -> Result<u32> {
     a.checked_add(b)
@@ -358,11 +366,23 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     u32s(&mut o, &head.month_slots);
     u32s(&mut o, &head.text_slots);
     u32s(&mut o, &head.level_text);
-    if head.wide_slots.is_empty() {
-        o.u32(head.height);
-    } else {
-        o.u32(head.height | HEAD_WIDE);
+    let cut = head.cut_under.iter().any(|c| !c.is_empty());
+    let mut height = head.height;
+    if !head.wide_slots.is_empty() {
+        height |= HEAD_WIDE;
+    }
+    if cut {
+        height |= HEAD_CUT;
+    }
+    o.u32(height);
+    if !head.wide_slots.is_empty() {
         u32s(&mut o, &head.wide_slots);
+    }
+    if cut {
+        o.u32(head.cut_under.len() as u32);
+        for c in &head.cut_under {
+            o.str(c);
+        }
     }
     o.0.extend_from_slice(&encode_page(entries));
     o.0
@@ -380,13 +400,19 @@ pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
     } else {
         Vec::new()
     };
+    let cut_under = if height & HEAD_CUT != 0 {
+        (0..i.u32()?).map(|_| i.str()).collect::<Result<Vec<_>>>()?
+    } else {
+        vec![String::new(); level_text.len()]
+    };
     let head = Head {
         units,
         month_slots,
         text_slots,
         level_text,
-        height: height & !HEAD_WIDE,
+        height: height & !(HEAD_WIDE | HEAD_CUT),
         wide_slots,
+        cut_under,
     };
     let entries = decode_page(&buf[i.at()..], &head)?;
     Ok((head, entries))
@@ -717,6 +743,7 @@ mod tests {
             level_text: vec![0, 0],
             height: 1,
             wide_slots: vec![],
+            cut_under: vec![String::new(); 2],
         }
     }
 
@@ -816,6 +843,7 @@ mod tests {
             level_text: vec![WIDE_LEVEL],
             height: 1,
             wide_slots: vec![0],
+            cut_under: vec![String::new()],
         };
         let key = |k: i128| vec![KeyValue::Wide(k)];
         let e = Entry {

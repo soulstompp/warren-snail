@@ -1235,6 +1235,11 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     },
                     _ => bytes_literal(lit, ty)?,
                 };
+                // Under a library collation, by the collation's key.
+                let v = match table.columns[c].orderer()? {
+                    Some(k) => k.key(&v),
+                    None => v,
+                };
                 let mut except = Vec::new();
                 let (lo, hi) = match op {
                     BinaryOperator::Eq => (Included(v.clone()), Included(v)),

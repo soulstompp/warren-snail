@@ -556,7 +556,7 @@ impl Snail {
         for (&c, d) in k.parent_columns.iter().zip(key) {
             row[c] = d.clone();
         }
-        let at = key_of(p, &p.orders[oi], &row);
+        let at = key_of(p, &p.orders[oi], &row)?;
         let blocks = self.covering(pi, oi, &at, &at)?;
         let n = self.count_where(pi, &k.parent_columns, key)?;
         if n == 0 {
@@ -592,7 +592,7 @@ impl Snail {
     fn referenced(&mut self, ci: usize, k: &ForeignKey, key: &[Datum]) -> Result<Option<bool>> {
         let t = &self.catalog.tables[ci];
         if let Some(oi) = t.order_led_by(&k.columns) {
-            let (lo, hi) = self.run_of(ci, oi, k, key);
+            let (lo, hi) = self.run_of(ci, oi, k, key)?;
             let blocks = self.covering(ci, oi, &lo, &hi)?;
             if !self.fresh(ci, oi, &blocks)? {
                 self.stale = true;
@@ -616,7 +616,7 @@ impl Snail {
         let t = &self.catalog.tables[ci];
         let (oi, blocks) = match t.order_led_by(&k.columns) {
             Some(oi) => {
-                let (lo, hi) = self.run_of(ci, oi, k, key);
+                let (lo, hi) = self.run_of(ci, oi, k, key)?;
                 let blocks = self.covering(ci, oi, &lo, &hi)?;
                 if !self.fresh(ci, oi, &blocks)? {
                     self.stale = true;
@@ -646,7 +646,7 @@ impl Snail {
                 let order = &table.orders[oi];
                 let mut out: Vec<Entry> = Vec::new();
                 for r in &rows {
-                    let at = key_of(table, order, r);
+                    let at = key_of(table, order, r)?;
                     for e in self.covering(ci, oi, &at, &at)? {
                         if !out.iter().any(|x| x.first == e.first) {
                             out.push(e);
@@ -671,20 +671,20 @@ impl Snail {
         oi: usize,
         k: &ForeignKey,
         key: &[Datum],
-    ) -> (Vec<KeyValue>, Vec<KeyValue>) {
+    ) -> Result<(Vec<KeyValue>, Vec<KeyValue>)> {
         let t = &self.catalog.tables[ci];
         let order = &t.orders[oi];
         let mut row = vec![Datum::Null; t.columns.len()];
         for (&c, d) in k.columns.iter().zip(key) {
             row[c] = d.clone();
         }
-        let full = key_of(t, order, &row);
+        let full = key_of(t, order, &row)?;
         let m = k.columns.len();
         let mut lo = full[..m].to_vec();
         let mut hi = lo.clone();
         lo.extend((m..full.len()).map(|_| KeyValue::Null { first: true }));
         hi.extend((m..full.len()).map(|_| KeyValue::Null { first: false }));
-        (lo, hi)
+        Ok((lo, hi))
     }
 
     /// The blocks of an order, as the round reads it, where its keys from `lo` to `hi` lie.

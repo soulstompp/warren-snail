@@ -804,6 +804,11 @@ pub(crate) fn laid_out(
     if let Some(g) = given {
         text_sublevels = g.to_vec();
     }
+    let collators = order
+        .levels
+        .iter()
+        .map(|l| table.columns[l.column()].orderer())
+        .collect::<Result<Vec<_>>>()?;
     for r in 0..n {
         for (li, &l) in order.levels.iter().enumerate() {
             let column = &rows.columns[l.column()];
@@ -825,11 +830,14 @@ pub(crate) fn laid_out(
                 Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => {
                     let ty = table.columns[l.column()].ty;
                     let held = column.text_value(r).unwrap();
-                    let key = crate::strings::key_bytes(ty, held.data());
+                    let key = crate::strings::column_key(ty, collators[li], held.data());
                     if !fixed {
                         text_sublevels[li] = crate::places::rungs_for(ty, &key, text_sublevels[li]);
                     }
-                    unsorted.push(crate::places::byte_key(ty, &key));
+                    unsorted.push(crate::places::column_byte_key(
+                        &table.columns[l.column()],
+                        &key,
+                    ));
                     continue;
                 }
                 Values::Wide(v) => {
@@ -850,6 +858,11 @@ pub(crate) fn laid_out(
     let row = |r: usize| &unsorted[r * stride..(r + 1) * stride];
     let mut perm: Vec<usize> = (0..n).collect();
     perm.sort_by(|&a, &b| row(a).cmp(row(b)));
+    for (li, c) in collators.iter().enumerate() {
+        if let Some(c) = c {
+            agreed(table, order.levels[li].column(), c, rows)?;
+        }
+    }
     if order.unique {
         // Keys holding a NULL are each their own, unless the order says they are not distinct.
         let shared = |a: &[KeyValue], b: &[KeyValue]| {
@@ -956,13 +969,96 @@ pub(crate) fn level_kinds(table: &Table, order: &Order) -> Vec<u32> {
             let ty = table.columns[l.column()].ty;
             if ty.is_wide() {
                 WIDE_LEVEL
-            } else if ty.keyed_by_bytes() {
+            } else if ty.keyed_by_bytes() || table.columns[l.column()].collated() {
                 crate::directory::BYTES_LEVEL | 1
             } else {
                 ty.keyed_by_text() as u32
             }
         })
         .collect()
+}
+
+/// Refuses, by name, a level's values that glibc's `strxfrm_l` keys in another order than its
+/// `strcoll_l` compares them: each value against the next in its keys' order. ICU's sort keys are
+/// its order, and pass.
+fn agreed(
+    table: &Table,
+    column: usize,
+    collator: &crate::collations::Collator,
+    rows: &Rows,
+) -> Result<()> {
+    if collator.spec.provider != crate::collations::Provider::Libc {
+        return Ok(());
+    }
+    let values = &rows.columns[column];
+    let mut keyed: Vec<(Vec<u8>, Vec<u8>)> = (0..rows.len())
+        .filter_map(|r| values.text_value(r))
+        .map(|v| {
+            let held = crate::strings::key_bytes(table.columns[column].ty, v.data()).into_owned();
+            (collator.key(&held), held)
+        })
+        .collect();
+    keyed.sort();
+    keyed.dedup();
+    for p in keyed.windows(2) {
+        if collator.cmp(&p[0].1, &p[1].1) != p[0].0.cmp(&p[1].0) {
+            return Err(Error::new(format!(
+                "{}: {} holds {:?} and {:?}, which glibc's strxfrm_l under collation \"{}\" keys \
+                 in another order than its strcoll_l compares them: no order on it is cut",
+                table.name,
+                table.columns[column].name,
+                String::from_utf8_lossy(&p[0].1),
+                String::from_utf8_lossy(&p[1].1),
+                table.columns[column]
+                    .collation
+                    .as_deref()
+                    .unwrap_or("default"),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What each level of an order is cut under, as `Head::cut_under` records it: nothing where no
+/// library orders it, or where this build opens none.
+pub(crate) fn cut_under_of(table: &Table, order: &Order) -> Vec<String> {
+    order
+        .levels
+        .iter()
+        .map(|l| table.columns[l.column()].cut_under().unwrap_or_default())
+        .collect()
+}
+
+/// An order's top page read, its head and its entries, refused by name where a level of it was cut
+/// under other rules than this build reads it under: a library collation of another version, or
+/// one this build opens none of. The file's other orders read and write as before.
+pub fn top_read(table: &Table, order: &Order, top: &[u8]) -> Result<(Head, Vec<Entry>)> {
+    let (head, entries) = crate::directory::decode_top(top)?;
+    for (li, l) in order.levels.iter().enumerate() {
+        let column = &table.columns[l.column()];
+        let had = head.cut_under.get(li).map_or("", String::as_str);
+        if had.is_empty() && !column.collated() {
+            continue;
+        }
+        let now = column.cut_under();
+        if now.as_deref().ok() != Some(had) {
+            let reads = match now {
+                Ok(n) if n.is_empty() => "no collation".to_string(),
+                Ok(n) => n,
+                Err(e) => e.to_string(),
+            };
+            return Err(Error::new(format!(
+                "{}: the order {} was cut on {} under {}, and this warren-snail reads it under \
+                 {reads}: re-cut it with `warren-snail recut <file> {}`",
+                table.name,
+                order.name,
+                column.name,
+                if had.is_empty() { "no collation" } else { had },
+                table.name
+            )));
+        }
+    }
+    Ok((head, entries))
 }
 
 /// The leaves an order holds keyed in 128 bits, by their slots.
@@ -1009,6 +1105,7 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> He
         level_text: laid.text_sublevels.clone(),
         height: 0,
         wide_slots: wide_slots(table, order),
+        cut_under: cut_under_of(table, order),
     }
 }
 
@@ -1023,6 +1120,7 @@ pub(crate) fn empty_head(table: &Table, order: &Order) -> Head {
         level_text: level_kinds(table, order),
         height: 1,
         wide_slots: wide_slots(table, order),
+        cut_under: cut_under_of(table, order),
     }
 }
 
@@ -1181,6 +1279,7 @@ fn write_order(
         level_text: text_sublevels.clone(),
         height: 0,
         wide_slots: wide_slots(table, order),
+        cut_under: cut_under_of(table, order),
     };
     let (top, below) = build(head, entries, &mut |bytes| w.place(bytes))?;
     let levels = decode_top(&top)?.0.height;

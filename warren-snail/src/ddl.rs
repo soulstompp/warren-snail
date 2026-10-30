@@ -892,6 +892,59 @@ fn create_collation(c: &mut Cursor) -> Result<Form> {
     })
 }
 
+/// A collation CREATE COLLATION makes, checked as PostgreSQL checks it: one of byte order as it is;
+/// one that calls a library only with the feature `collations`, an ICU locale given in the
+/// standard form of a language tag, as PostgreSQL stores it, with its notice.
+fn made_collation(k: &mut Collation, declared: &[Collation]) -> Result<Vec<String>> {
+    if k.bytes_casing(declared).is_some() {
+        return Ok(Vec::new());
+    }
+    if let Some(f) = &k.from {
+        crate::catalog::collation_casing(f, declared)
+            .map_err(|e| Error::new(format!("CREATE COLLATION {}: {e}", k.name)))?;
+        return Ok(Vec::new());
+    }
+    if !k.deterministic && k.provider != "icu" {
+        return Err(Error::new(
+            "nondeterministic collations not supported with this provider",
+        ));
+    }
+    if k.rules.is_some() && k.provider != "icu" {
+        return Err(Error::new(
+            "ICU rules cannot be specified unless locale provider is ICU",
+        ));
+    }
+    if !cfg!(feature = "collations") {
+        return Err(Error::new(format!(
+            "CREATE COLLATION {}: {}",
+            k.name,
+            crate::catalog::NOT_HELD
+        )));
+    }
+    let mut notices = Vec::new();
+    if k.provider == "icu" {
+        let locale = k
+            .locale
+            .clone()
+            .ok_or_else(|| Error::new("parameter \"locale\" must be specified"))?;
+        let tag = crate::collations::language_tag(&locale)?;
+        if tag != locale {
+            notices.push(format!(
+                "using standard form \"{tag}\" for ICU locale \"{locale}\""
+            ));
+            k.locale = Some(tag);
+        }
+    }
+    let spec = k
+        .spec(declared)
+        .ok_or_else(|| Error::new(format!("CREATE COLLATION {}: {}", k.name, NOT_READ)))?;
+    crate::collations::open(&spec, &k.name)?;
+    Ok(notices)
+}
+
+/// Why a collation of a provider the snail does not read is refused.
+const NOT_READ: &str = "its provider is not read";
+
 /// A FOREIGN KEY as written, before its names are found: in a column's REFERENCES, a table's
 /// FOREIGN KEY, or ALTER TABLE … ADD.
 #[derive(Clone, Debug)]
@@ -1722,6 +1775,9 @@ struct Draft {
     /// The CHECKs' and the foreign keys' names, each schema-qualified, which PostgreSQL chooses
     /// unique in a schema beside the keys' names.
     check_names: Vec<String>,
+    /// Whether the statement now read is the file's own, which a build without the feature
+    /// `collations` reads naming a library collation, refusing that collation only where used.
+    kept: bool,
 }
 
 /// A key a CREATE TABLE writes, before its name is chosen.
@@ -2499,12 +2555,9 @@ impl Draft {
                         collation.name
                     )));
                 }
-                if collation.casing(&self.collations).is_none() {
-                    return Err(Error::new(format!(
-                        "CREATE COLLATION {}: {}",
-                        collation.name,
-                        crate::catalog::NOT_HELD
-                    )));
+                let mut collation = collation;
+                if !self.kept {
+                    notices.extend(made_collation(&mut collation, &self.collations)?);
                 }
                 self.collations.push(collation);
             }
@@ -2750,6 +2803,7 @@ impl Draft {
                 identity: None,
                 collation: None,
                 domain,
+                library: None,
             };
             let mut nullness: Option<bool> = None;
             for o in &c.options {
@@ -2809,12 +2863,19 @@ impl Draft {
                                 "{cwhat}: COLLATE {collation} on a column that is not text"
                             )));
                         }
-                        if crate::catalog::collation_held(&collation, &self.collations).is_none() {
-                            return Err(Error::new(format!(
-                                "{cwhat}: COLLATE {collation}: {}",
-                                crate::catalog::NOT_HELD
-                            )));
+                        if !self.kept {
+                            match crate::catalog::collation_casing(&collation, &self.collations) {
+                                Ok(_) => {}
+                                Err(_) if !cfg!(feature = "collations") => {
+                                    return Err(Error::new(format!(
+                                        "{cwhat}: COLLATE {collation}: {}",
+                                        crate::catalog::NOT_HELD
+                                    )))
+                                }
+                                Err(e) => return Err(Error::new(format!("{cwhat}: {e}"))),
+                            }
                         }
+                        col.library = crate::catalog::library_spec(&collation, &self.collations);
                         col.collation = Some(collation);
                     }
                     ColumnOption::ForeignKey(_) => {
@@ -3447,6 +3508,15 @@ impl Draft {
                     o
                 }
             };
+            if let Shape::Column(k) = s {
+                if t.columns[k].collated() && op.ends_with("_pattern_ops") {
+                    return Err(Error::new(format!(
+                        "{shown}: the operator class {op} orders {} by its bytes, which a column \
+                         under a library collation is not cut on",
+                        c.column.expr
+                    )));
+                }
+            }
             if d {
                 notices.push(format!(
                     "{shown}: {} DESC is held rising, its NULLs where PostgreSQL's index read \
@@ -4188,9 +4258,16 @@ fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
 /// Reads a DDL a statement at a time. `strict` stops at the first statement refused, as a file's
 /// own DDL is read.
 pub(crate) fn read_ddl(ddl: &str, strict: bool) -> Result<Reading> {
+    read_ddl_kept(ddl, strict, 0)
+}
+
+/// Reads a DDL as `read_ddl` does, its first `kept` statements as the file's own: a library
+/// collation they name taken by a build without the feature `collations`.
+pub(crate) fn read_ddl_kept(ddl: &str, strict: bool, kept: usize) -> Result<Reading> {
     let mut draft = Draft::default();
     let mut statements: Vec<StatementRead> = Vec::new();
-    for tokens in statements_of(ddl)? {
+    for (at, tokens) in statements_of(ddl)?.into_iter().enumerate() {
+        draft.kept = at < kept;
         let (kind, object) = head(&tokens);
         let mut next = draft.clone();
         let read = match next.apply(&tokens) {
@@ -4307,6 +4384,11 @@ pub(crate) fn read_ddl(ddl: &str, strict: bool) -> Result<Reading> {
         },
         statements,
     })
+}
+
+/// The number of statements a DDL holds.
+pub(crate) fn statements_in(ddl: &str) -> Result<usize> {
+    Ok(statements_of(ddl)?.len())
 }
 
 fn statements_of(ddl: &str) -> Result<Vec<Vec<Token>>> {
