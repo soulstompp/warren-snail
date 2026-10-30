@@ -94,12 +94,14 @@ fn a_numeric_held_as_its_text_is_cut_by_its_class_and_answers_its_own_text() {
     let along = blocks_of(&blocks, "t_v", "v");
     assert!(along.len() > 1, "{along:?}");
     assert_eq!(along.iter().sum::<u64>(), 3000);
-    let (b, _) = s
+    // An equality fixes the level: one block read.
+    let (b, round) = s
         .ask(
             "SELECT id, v FROM s.t WHERE v = 12.5 ORDER BY id",
             Some("t_v"),
         )
         .unwrap();
+    assert_eq!(round.blocks_read, 1);
     assert_eq!(
         texts(b.column(1).as_ref()),
         [
@@ -472,4 +474,100 @@ fn a_numeric_is_written_held_to_its_typmod_and_assigned_as_postgresql_assigns_it
         .unwrap_err()
         .to_string();
     assert!(e.contains("numeric field overflow"), "{e}");
+}
+
+#[test]
+fn a_numeric_s_sum_by_a_text_s_codes_leaves_its_nan_to_the_rows() {
+    // 2,000 rows of two stores, read by their codes: the sum of one of them holds a NaN.
+    let path = tmp("numeric-run.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.r (id integer NOT NULL, g text NOT NULL, v numeric(5,2), \
+         PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let rows = Rows {
+        columns: vec![
+            Values::Int((0..2000).map(Some).collect()),
+            Values::Text(
+                (0..2000)
+                    .map(|i| Some(if i % 2 == 0 { "a" } else { "b" }.to_string()))
+                    .collect(),
+            ),
+            Values::Int(
+                (0..2000)
+                    .map(|i| Some(if i == 6 { 100_000 } else { 1 }))
+                    .collect(),
+            ),
+        ],
+    };
+    write(&path, &catalog, &[("s.r".into(), rows)]).unwrap();
+    let (b, _) = Snail::open(&path)
+        .unwrap()
+        .ask("SELECT g, sum(v) AS s FROM s.r GROUP BY g ORDER BY g", None)
+        .unwrap();
+    assert_eq!(
+        texts(b.column(1).as_ref()),
+        [Some("NaN".into()), Some("10.00".into())]
+    );
+}
+
+#[test]
+fn a_pipeline_divides_integers_as_postgresql_does() {
+    let path = tmp("numeric-int.snail");
+    let catalog =
+        Catalog::parse("CREATE TABLE s.i (id integer NOT NULL, PRIMARY KEY (id));").unwrap();
+    let rows = Rows {
+        columns: vec![Values::Int(vec![Some(7), Some(-7)])],
+    };
+    write(&path, &catalog, &[("s.i".into(), rows)]).unwrap();
+    // Each answer read from PostgreSQL 18.6, 2026-10-30: a quotient cut toward zero, int8mod by -1
+    // always 0.
+    let (b, _) = Snail::open(&path)
+        .unwrap()
+        .ask(
+            "WITH t AS (SELECT id FROM s.i) \
+             SELECT id, id / 2 AS q, id % 2 AS r, \
+             CASE WHEN id > 0 THEN (id - 9223372036854775807 - 8) % -1 END AS m \
+             FROM t ORDER BY id DESC",
+            None,
+        )
+        .unwrap();
+    let ints = |c: usize| weather::ints64(b.column(c).as_ref());
+    assert_eq!(
+        (ints(1), ints(2), ints(3)),
+        (
+            vec![Some(3), Some(-3)],
+            vec![Some(1), Some(-1)],
+            vec![Some(0), None]
+        )
+    );
+}
+
+#[test]
+fn a_numeric_past_18_digits_is_assigned_from_an_answer() {
+    let path = tmp("numeric-select.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.x (id integer NOT NULL, v numeric(30,2), PRIMARY KEY (id)); \
+         CREATE TABLE s.y (id integer NOT NULL, v numeric(30,4), PRIMARY KEY (id));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.x (id, v) VALUES (1, '1234567890123456789012345.67'), (2, 'NaN')")
+        .unwrap();
+    w.execute("INSERT INTO s.y (id, v) SELECT x.id, x.v FROM s.x x")
+        .unwrap();
+    let (b, _) = w
+        .ask(
+            "WITH y AS (SELECT id, v FROM s.y) SELECT id, v::text AS v FROM y ORDER BY id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        texts(b.column(1).as_ref()),
+        [
+            Some("1234567890123456789012345.6700".into()),
+            Some("NaN".into())
+        ]
+    );
 }
