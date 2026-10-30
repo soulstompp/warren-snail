@@ -98,6 +98,23 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
         ),
         ColumnType::Boolean => (PhysicalType::BOOLEAN, None),
         ColumnType::Uuid => (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Uuid)),
+        ColumnType::Oid
+        | ColumnType::Xid
+        | ColumnType::Cid
+        | ColumnType::Char
+        | ColumnType::Xid8
+        | ColumnType::PgLsn => (
+            if ty.unsigned_bits() == 64 {
+                PhysicalType::INT64
+            } else {
+                PhysicalType::INT32
+            },
+            Some(LogicalType::Integer {
+                bit_width: ty.unsigned_bits() as i8,
+                is_signed: false,
+            }),
+        ),
+        ColumnType::Money => (PhysicalType::INT64, None),
     };
     let repetition = if nullable {
         Repetition::OPTIONAL
@@ -120,6 +137,17 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
         0,
         ColumnPath::new(vec![name.to_string()]),
     )))
+}
+
+/// The bits of the unsigned integer a column's descriptor names: 0 for any other column.
+pub(crate) fn unsigned_bits(desc: &ColumnDescPtr) -> u32 {
+    match desc.logical_type_ref() {
+        Some(LogicalType::Integer {
+            bit_width,
+            is_signed: false,
+        }) => *bit_width as u32,
+        _ => 0,
+    }
 }
 
 fn props(dictionary: bool, rows_per_page: usize) -> Arc<WriterProperties> {
@@ -175,9 +203,20 @@ fn write(
         )));
     }
     let p = props(dictionary, rows_per_page);
+    let unsigned = unsigned_bits(desc);
     let (bytes, closed) = match (values, desc.physical_type()) {
+        (Values::Int(v), PhysicalType::INT32) if unsigned > 0 => {
+            write_typed::<Int32Type, i64>(desc, p, v, rows_per_page, |&x| {
+                crate::scalars::unsigned_of(x, unsigned) as i32
+            })?
+        }
         (Values::Int(v), PhysicalType::INT32) => {
             write_typed::<Int32Type, i64>(desc, p, v, rows_per_page, |&x| x as i32)?
+        }
+        (Values::Int(v), PhysicalType::INT64) if unsigned > 0 => {
+            write_typed::<Int64Type, i64>(desc, p, v, rows_per_page, |&x| {
+                crate::scalars::unsigned_of(x, unsigned) as i64
+            })?
         }
         (Values::Int(v), PhysicalType::INT64) => {
             write_typed::<Int64Type, i64>(desc, p, v, rows_per_page, |&x| x)?
@@ -418,7 +457,12 @@ pub fn decode(
     let nullable = desc.max_def_level() > 0;
     let short = |n: usize| Error::new(format!("{}: {n} rows decoded of {rows}", desc.name()));
     match ty {
-        ColumnType::Int2 | ColumnType::Int4 => {
+        ColumnType::Int2
+        | ColumnType::Int4
+        | ColumnType::Oid
+        | ColumnType::Xid
+        | ColumnType::Cid
+        | ColumnType::Char => {
             let mut r = get_typed_column_reader::<Int32Type>(column);
             let mut v: Vec<i32> = Vec::new();
             let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
@@ -426,7 +470,8 @@ pub fn decode(
                 return Err(short(n));
             }
             Ok(Values::Int(spread(
-                v.into_iter().map(i64::from),
+                v.into_iter()
+                    .map(|x| crate::scalars::key_of_raw(ty, i64::from(x))),
                 &defs,
                 nullable,
             )))
@@ -444,14 +489,23 @@ pub fn decode(
                 nullable,
             )))
         }
-        ColumnType::Int8 | ColumnType::Timestamptz | ColumnType::Numeric { .. } => {
+        ColumnType::Int8
+        | ColumnType::Timestamptz
+        | ColumnType::Numeric { .. }
+        | ColumnType::Xid8
+        | ColumnType::PgLsn
+        | ColumnType::Money => {
             let mut r = get_typed_column_reader::<Int64Type>(column);
             let mut v: Vec<i64> = Vec::new();
             let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Int(spread(v.into_iter(), &defs, nullable)))
+            Ok(Values::Int(spread(
+                v.into_iter().map(|x| crate::scalars::key_of_raw(ty, x)),
+                &defs,
+                nullable,
+            )))
         }
         ColumnType::Uuid => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);

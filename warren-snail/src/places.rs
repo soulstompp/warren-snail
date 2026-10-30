@@ -133,6 +133,28 @@ pub fn shown(key: &[KeyValue]) -> String {
     )
 }
 
+/// A key as text, its values outermost first, each written as its column's type writes it.
+pub fn shown_as(key: &[KeyValue], types: &[ColumnType]) -> String {
+    format!(
+        "[{}]",
+        key.iter()
+            .zip(types)
+            .map(|(v, &ty)| match v {
+                KeyValue::Int(k) if crate::scalars::is_scalar(ty) => {
+                    let t = crate::scalars::scalar_text(ty, *k);
+                    if t.bytes().all(|b| b.is_ascii_digit()) {
+                        t
+                    } else {
+                        format!("'{}'", t.replace('\'', "''"))
+                    }
+                }
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// A number in 128 bits against a numeric level's value, a NULL lying on its level's side.
 pub fn wide_cmp(k: i128, b: &KeyValue) -> Ordering {
     match b {
@@ -165,8 +187,13 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
         Level::MonthUtc(_) => 2,
         Level::Column(_) => match ty {
             ColumnType::Int2 => 16,
-            ColumnType::Int4 => 32,
-            ColumnType::Int8 | ColumnType::Numeric { .. } => 64,
+            ColumnType::Int4 | ColumnType::Oid | ColumnType::Xid | ColumnType::Cid => 32,
+            ColumnType::Int8
+            | ColumnType::Numeric { .. }
+            | ColumnType::Xid8
+            | ColumnType::PgLsn
+            | ColumnType::Money => 64,
+            ColumnType::Char => 8,
             ColumnType::Timestamptz => 7,
             ColumnType::Boolean => 1,
             ColumnType::Uuid => 128,
@@ -190,7 +217,17 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             _ => key,
         },
         Level::Column(_) => match ty {
-            ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Numeric { .. } => {
+            ColumnType::Int2
+            | ColumnType::Int4
+            | ColumnType::Int8
+            | ColumnType::Numeric { .. }
+            | ColumnType::Oid
+            | ColumnType::Xid
+            | ColumnType::Cid
+            | ColumnType::Xid8
+            | ColumnType::PgLsn
+            | ColumnType::Char
+            | ColumnType::Money => {
                 let bits = sublevel_count(level, ty, 0);
                 let low = -(1i128 << (bits - 1));
                 let biased = (key as i128 - low) as u64;

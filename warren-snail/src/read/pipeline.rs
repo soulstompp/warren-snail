@@ -4,6 +4,7 @@
 //! groups nothing. The expressions it reads are CASE, mod, abs, casts, comparisons, IS [NOT]
 //! DISTINCT FROM, and the aggregates count, sum, min, max, bool_and and bool_or.
 
+use crate::catalog::ColumnType;
 use crate::{Error, Result};
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -27,6 +28,9 @@ pub enum Value {
     Bool(bool),
     /// A uuid, as its key.
     Uuid(i128),
+    /// A fixed scalar keyed as a number (an oid, an xid, a pg_lsn, a `"char"`, money): its type and
+    /// its key.
+    Scalar(ColumnType, i64),
 }
 
 impl Value {
@@ -64,6 +68,7 @@ impl Value {
             }
             Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             Value::Uuid(k) => crate::scalars::uuid_text(*k),
+            Value::Scalar(ty, k) => crate::scalars::scalar_text(*ty, *k),
         })
     }
 }
@@ -97,6 +102,14 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        (Value::Scalar(a, x), Value::Scalar(b, y)) if a == b => x.cmp(y),
+        (Value::Scalar(ty, _), other) | (other, Value::Scalar(ty, _)) => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} = {}",
+                ty.pg_name(),
+                kind_name(other)
+            )))
+        }
         _ => return Err(Error::new(format!("{a:?} and {b:?} are not compared"))),
     }))
 }
@@ -110,6 +123,7 @@ enum Key {
     Bytes(Vec<u8>),
     Bool(bool),
     Uuid(i128),
+    Scalar(ColumnType, i64),
 }
 
 fn key(v: &Value) -> Key {
@@ -127,6 +141,7 @@ fn key(v: &Value) -> Key {
         Value::Bytes(b) => Key::Bytes(b.clone()),
         Value::Bool(b) => Key::Bool(*b),
         Value::Uuid(k) => Key::Uuid(*k),
+        Value::Scalar(ty, k) => Key::Scalar(*ty, *k),
     }
 }
 
@@ -321,6 +336,7 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
     Ok(match base.as_str() {
         "text" | "varchar" | "character varying" => Value::Text(v.text().unwrap()),
         "bigint" | "int8" | "integer" | "int" | "int4" | "smallint" | "int2" => match v {
+            Value::Scalar(ty, k) => scalar_integer(ty, k, &base)?,
             Value::Int(x) => Value::Int(x),
             Value::Num(m, s) => {
                 let d = 10i128.pow(s);
@@ -339,6 +355,7 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
                 Value::Text(t) => numeric_literal(&t)?,
                 Value::Int(x) => Value::Num(x as i128, 0),
                 Value::Num(m, s) => Value::Num(m, s),
+                Value::Scalar(ColumnType::Money, k) => Value::Num(k as i128, 2),
                 other => return Err(Error::new(format!("{other:?} cast to numeric"))),
             };
             let (m, s) = v.numeric().unwrap();
@@ -384,8 +401,196 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
             )),
             other => return Err(Error::new(format!("{other:?} cast to uuid"))),
         },
-        _ => return Err(Error::new(format!("a cast to {to} is not read"))),
+        _ => match crate::catalog::held_type(to) {
+            Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty)?,
+            _ => return Err(Error::new(format!("a cast to {to} is not read"))),
+        },
     })
+}
+
+/// The name PostgreSQL gives a value's type: an integer's by its range.
+fn kind_name(v: &Value) -> String {
+    match v {
+        Value::Null => "unknown".into(),
+        Value::Int(x) if i32::try_from(*x).is_ok() => "integer".into(),
+        Value::Int(_) => "bigint".into(),
+        Value::Num(..) => "numeric".into(),
+        Value::Text(_) => "text".into(),
+        Value::Bytes(_) => "bytea".into(),
+        Value::Bool(_) => "boolean".into(),
+        Value::Uuid(_) => "uuid".into(),
+        Value::Scalar(ty, _) => ty.pg_name(),
+    }
+}
+
+/// A number rounded to whole units of `to` places from `from`, half away from zero.
+fn rounded(m: i128, from: u32, to: u32) -> i128 {
+    if to >= from {
+        return m * 10i128.pow(to - from);
+    }
+    let d = 10i128.pow(from - to);
+    let (q, r) = (m / d, (m % d).abs());
+    if r * 2 >= d {
+        q + m.signum()
+    } else {
+        q
+    }
+}
+
+/// A value cast to a fixed scalar, as PostgreSQL's casts to it take each kind: text read by the
+/// type's input; an integer to an oid with its bits, a bigint held to an oid's range; an integer or a
+/// numeric to money in cents; an integer to a `"char"` held to a byte's signed range; an xid8 to its
+/// xid.
+fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
+    use crate::scalars::{scalar_parse, unsigned_key, unsigned_of};
+    let no = |v: &Value| {
+        Error::new(format!(
+            "cannot cast type {} to {}",
+            kind_name(v),
+            ty.pg_name()
+        ))
+    };
+    let key = match (&v, ty) {
+        (Value::Null, _) => return Ok(Value::Null),
+        (Value::Scalar(from, k), _) if *from == ty => *k,
+        (Value::Scalar(ColumnType::Xid8, k), ColumnType::Xid) => {
+            unsigned_key(u64::from(unsigned_of(*k, 64) as u32), 32)
+        }
+        (Value::Text(t), _) => scalar_parse(ty, t)?,
+        (Value::Int(x), ColumnType::Oid) => {
+            let u = match i32::try_from(*x) {
+                Ok(i) => i as u32,
+                Err(_) => u32::try_from(*x).map_err(|_| Error::new("OID out of range"))?,
+            };
+            unsigned_key(u64::from(u), 32)
+        }
+        (Value::Int(x), ColumnType::Money) => x
+            .checked_mul(100)
+            .ok_or_else(|| Error::new("bigint out of range"))?,
+        (Value::Num(m, s), ColumnType::Money) => {
+            i64::try_from(rounded(*m, *s, 2)).map_err(|_| Error::new("bigint out of range"))?
+        }
+        (Value::Int(x), ColumnType::Char) if i32::try_from(*x).is_ok() => {
+            let b = i8::try_from(*x).map_err(|_| Error::new("\"char\" out of range"))?;
+            unsigned_key(u64::from(b as u8), 8)
+        }
+        _ => return Err(no(&v)),
+    };
+    Ok(Value::Scalar(ty, key))
+}
+
+/// A fixed scalar cast to an integer type named `base`: an oid's bits as an integer, or as a
+/// bigint unsigned; a `"char"`'s byte, signed, as an integer.
+fn scalar_integer(ty: ColumnType, k: i64, base: &str) -> Result<Value> {
+    use crate::scalars::unsigned_of;
+    let int4 = matches!(base, "integer" | "int" | "int4");
+    let int8 = matches!(base, "bigint" | "int8");
+    Ok(Value::Int(match ty {
+        ColumnType::Oid if int4 => i64::from(unsigned_of(k, 32) as u32 as i32),
+        ColumnType::Oid if int8 => unsigned_of(k, 32) as i64,
+        ColumnType::Char if int4 => i64::from(unsigned_of(k, 8) as u8 as i8),
+        _ => {
+            return Err(Error::new(format!(
+                "cannot cast type {} to {base}",
+                ty.pg_name()
+            )))
+        }
+    }))
+}
+
+/// An integer beside a scalar it is compared with, as PostgreSQL takes it: cast to an oid, or to an
+/// xid where it is an integer, as `xideqint4` reads one.
+fn integer_beside(scalar: &Value, n: Value) -> Result<Value> {
+    match scalar {
+        Value::Scalar(ColumnType::Oid, _) => scalar_cast(n, ColumnType::Oid),
+        Value::Scalar(ColumnType::Xid, _) if matches!(n, Value::Int(x) if i32::try_from(x).is_ok()) =>
+        {
+            let Value::Int(x) = n else { unreachable!() };
+            Ok(Value::Scalar(
+                ColumnType::Xid,
+                crate::scalars::unsigned_key(u64::from(x as i32 as u32), 32),
+            ))
+        }
+        _ => Ok(n),
+    }
+}
+
+/// The comparisons a scalar's type has: xid only `=` and `<>`, cid only `=`, the rest all six.
+fn compared(op: &BinaryOperator, x: &Value, y: &Value) -> Result<()> {
+    let ty = match (x, y) {
+        (Value::Scalar(ty, _), _) | (_, Value::Scalar(ty, _)) => *ty,
+        _ => return Ok(()),
+    };
+    let ok = match ty {
+        ColumnType::Xid => matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq),
+        ColumnType::Cid => matches!(op, BinaryOperator::Eq),
+        _ => true,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::new(format!(
+            "operator does not exist: {} {op} {}",
+            kind_name(x),
+            kind_name(y)
+        )))
+    }
+}
+
+/// An operator on a fixed scalar, as PostgreSQL defines it: money added, subtracted, multiplied by
+/// an integer and divided by one; a pg_lsn less another, a numeric of bytes, and a numeric of bytes
+/// added to one. None where neither side is a scalar.
+fn scalar_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>> {
+    use crate::scalars::{unsigned_key, unsigned_of};
+    use BinaryOperator as B;
+    use ColumnType::{Money, PgLsn};
+    if !matches!(x, Value::Scalar(..)) && !matches!(y, Value::Scalar(..)) {
+        return Ok(None);
+    }
+    if x.is_null() || y.is_null() {
+        return Ok(Some(Value::Null));
+    }
+    let money = |r: Option<i64>| {
+        r.map(|v| Value::Scalar(Money, v))
+            .ok_or_else(|| Error::new("money out of range"))
+    };
+    let lsn_plus = |l: i64, n: &Value, sign: i128| -> Result<Value> {
+        let (m, s) = n.numeric().unwrap();
+        let total = i128::from(unsigned_of(l, 64)) * 10i128.pow(s) + sign * m;
+        let bytes = rounded(total, s, 0);
+        let u = u64::try_from(bytes).map_err(|_| Error::new("pg_lsn out of range"))?;
+        Ok(Value::Scalar(PgLsn, unsigned_key(u, 64)))
+    };
+    Ok(Some(match (op, x, y) {
+        (B::Plus, Value::Scalar(Money, a), Value::Scalar(Money, b)) => money(a.checked_add(*b))?,
+        (B::Minus, Value::Scalar(Money, a), Value::Scalar(Money, b)) => money(a.checked_sub(*b))?,
+        (B::Multiply, Value::Scalar(Money, a), Value::Int(b))
+        | (B::Multiply, Value::Int(b), Value::Scalar(Money, a)) => money(a.checked_mul(*b))?,
+        (B::Divide, Value::Scalar(Money, a), Value::Int(b)) => {
+            if *b == 0 {
+                return Err(Error::new("division by zero"));
+            }
+            money(a.checked_div(*b))?
+        }
+        (B::Minus, Value::Scalar(PgLsn, a), Value::Scalar(PgLsn, b)) => Value::Num(
+            i128::from(unsigned_of(*a, 64)) - i128::from(unsigned_of(*b, 64)),
+            0,
+        ),
+        (B::Plus, Value::Scalar(PgLsn, l), n @ (Value::Int(_) | Value::Num(..)))
+        | (B::Plus, n @ (Value::Int(_) | Value::Num(..)), Value::Scalar(PgLsn, l)) => {
+            lsn_plus(*l, n, 1)?
+        }
+        (B::Minus, Value::Scalar(PgLsn, l), n @ (Value::Int(_) | Value::Num(..))) => {
+            lsn_plus(*l, n, -1)?
+        }
+        _ => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} {op} {}",
+                kind_name(x),
+                kind_name(y)
+            )))
+        }
+    }))
 }
 
 /// Text read as a boolean, as PostgreSQL's boolean input reads it.
@@ -474,6 +679,25 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
         }
         (Value::Text(t), Value::Uuid(_)) if quoted(left) => {
             (Value::Uuid(crate::scalars::uuid_parse(t)?), y)
+        }
+        (Value::Scalar(ty, _), Value::Text(t)) if quoted(right) => {
+            let t = Value::Scalar(*ty, crate::scalars::scalar_parse(*ty, t)?);
+            (x, t)
+        }
+        (Value::Text(t), Value::Scalar(ty, _)) if quoted(left) => {
+            (Value::Scalar(*ty, crate::scalars::scalar_parse(*ty, t)?), y)
+        }
+        (Value::Scalar(..), Value::Int(_)) => {
+            let y = integer_beside(&x, y)?;
+            (x, y)
+        }
+        // xid's comparisons with an integer take it on their right only.
+        (Value::Int(_), Value::Scalar(ColumnType::Xid, _)) => {
+            return Err(Error::new("operator does not exist: integer = xid"))
+        }
+        (Value::Int(_), Value::Scalar(..)) => {
+            let x = integer_beside(&y, x)?;
+            (x, y)
         }
         _ => (x, y),
     })
@@ -569,6 +793,20 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 _ => {}
             }
             let (x, y) = beside(ev(left)?, ev(right)?, left, right)?;
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+            ) {
+                if let Some(v) = scalar_arith(op, &x, &y)? {
+                    return Ok(v);
+                }
+            } else {
+                compared(op, &x, &y)?;
+            }
             match op {
                 BinaryOperator::Plus => numeric_op(&x, &y, i128::checked_add)?,
                 BinaryOperator::Minus => numeric_op(&x, &y, i128::checked_sub)?,
@@ -885,6 +1123,38 @@ impl Acc {
             };
             return Err(Error::new(format!("function {name}({ty}) does not exist")));
         }
+        // Of the scalars, sum is money's alone; min and max are an oid's, an xid8's, a pg_lsn's and
+        // money's, and a `"char"`'s through its text.
+        let v = match (&v, &self) {
+            (Value::Scalar(ColumnType::Char, _), Acc::Least(_) | Acc::Greatest(_)) => {
+                Value::Text(v.text().unwrap_or_default())
+            }
+            (Value::Scalar(ty, _), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_))
+                if !(matches!(self, Acc::Sum(_)) && *ty == ColumnType::Money
+                    || !matches!(self, Acc::Sum(_))
+                        && matches!(
+                            ty,
+                            ColumnType::Oid
+                                | ColumnType::Xid8
+                                | ColumnType::PgLsn
+                                | ColumnType::Money
+                        )) =>
+            {
+                let name = match self {
+                    Acc::Sum(_) => "sum",
+                    Acc::Least(_) => "min",
+                    _ => "max",
+                };
+                return Err(Error::new(format!(
+                    "function {name}({}) does not exist",
+                    ty.pg_name()
+                )));
+            }
+            (Value::Scalar(..), Acc::All(_) | Acc::Any(_)) => {
+                return Err(Error::new(format!("{v:?} is not a truth")))
+            }
+            _ => v,
+        };
         match self {
             Acc::Count(n) => *n += 1,
             // The sum of whole numbers is a numeric of scale 0, as PostgreSQL writes it.
@@ -894,6 +1164,8 @@ impl Acc {
                         Value::Int(x) => Value::Num(x as i128, 0),
                         other => other,
                     }
+                } else if let Some(s) = scalar_arith(&BinaryOperator::Plus, acc, &v)? {
+                    s
                 } else {
                     numeric_op(acc, &v, i128::checked_add)?
                 };
@@ -1201,7 +1473,14 @@ fn sort(out: &mut Relation, ob: &sqlparser::ast::OrderBy, params: &[String]) -> 
                         Some((_, n)) => Expr::Identifier(sqlparser::ast::Ident::new(n)),
                         None => o.expr.clone(),
                     };
-                    eval(&e, &row, &named, &none)
+                    let v = eval(&e, &row, &named, &none)?;
+                    match v {
+                        Value::Scalar(ty, _) if !ty.ordered() => Err(Error::new(format!(
+                            "could not identify an ordering operator for type {}",
+                            ty.pg_name()
+                        ))),
+                        v => Ok(v),
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok((k, row))
@@ -1578,11 +1857,20 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
     };
     use arrow::datatypes::DataType as A;
     let mut rows = vec![Vec::with_capacity(batch.num_columns()); batch.num_rows()];
-    for a in batch.columns() {
+    let schema = batch.schema();
+    for (a, field) in batch.columns().iter().zip(schema.fields()) {
         let any = a.as_any();
+        let scalar = crate::scalars::field_scalar(field);
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Value::Null
+            } else if let Some(ty) = scalar {
+                Value::Scalar(
+                    ty,
+                    crate::scalars::scalar_key_at(ty, a.as_ref(), r).ok_or_else(|| {
+                        Error::new(format!("{} is not of its type", field.name()))
+                    })?,
+                )
             } else {
                 match a.data_type() {
                     A::Int16 => {
@@ -1655,6 +1943,18 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
             })
             .max();
         let first = col().find(|v| !v.is_null());
+        if let Some(Value::Scalar(ty, _)) = first {
+            let ty = *ty;
+            arrays.push(crate::scalars::scalar_array(
+                ty,
+                col().map(|v| match v {
+                    Value::Scalar(_, k) => Some(*k),
+                    _ => None,
+                }),
+            ));
+            fields.push(crate::scalars::scalar_field(name, ty, true));
+            continue;
+        }
         let a: ArrayRef = match (first, scale) {
             (Some(Value::Int(_)) | Some(Value::Num(..)), Some(s)) => Arc::new(
                 col()

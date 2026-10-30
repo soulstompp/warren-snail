@@ -179,11 +179,15 @@ fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
 /// The rows of an answer whose columns are the table's, in its order.
 fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
     let mut rows = vec![Vec::with_capacity(batch.num_columns()); batch.num_rows()];
-    for a in batch.columns() {
+    let schema = batch.schema();
+    for (a, field) in batch.columns().iter().zip(schema.fields()) {
         let any = a.as_any();
+        let scalar = crate::scalars::field_scalar(field);
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Datum::Null
+            } else if let Some(ty) = scalar {
+                Datum::Int(crate::scalars::scalar_key_at(ty, a.as_ref(), r).unwrap())
             } else if let Some(x) = any.downcast_ref::<BooleanArray>() {
                 Datum::Int(x.value(r) as i64)
             } else if let Some(x) = any.downcast_ref::<Int16Array>() {
@@ -552,7 +556,10 @@ impl Snail {
                             .schema()
                             .fields()
                             .iter()
-                            .map(|f| answer_type(f.data_type()))
+                            .map(|f| match crate::scalars::field_scalar(f) {
+                                Some(ty) => Ok(ty),
+                                None => answer_type(f.data_type()),
+                            })
                             .collect::<Result<_>>()?;
                         // Each column the answer fills takes its value by PostgreSQL's assignment
                         // casts, checked before any row is read, as PostgreSQL checks them.

@@ -3038,6 +3038,13 @@ fn finish_table(d: &Declared) -> Result<Table> {
                 columns[l.column()].name
             )));
         }
+        // xid and cid have only a hash operator class, so PostgreSQL keys no B-tree on them.
+        if let Some(l) = o.levels.iter().find(|l| !columns[l.column()].ty.ordered()) {
+            return Err(Error::new(format!(
+                "data type {} has no default operator class for access method \"btree\"",
+                columns[l.column()].ty.pg_name()
+            )));
+        }
     }
     Ok(Table {
         name: name.clone(),

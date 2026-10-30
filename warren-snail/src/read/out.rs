@@ -60,7 +60,12 @@ impl Extreme {
 }
 
 /// The least and greatest of rows `from..to` present, and the rows NULL among them.
-fn extremes(values: &Values, from: usize, to: usize) -> (Option<(Extreme, Extreme)>, u64) {
+fn extremes(
+    values: &Values,
+    ty: ColumnType,
+    from: usize,
+    to: usize,
+) -> (Option<(Extreme, Extreme)>, u64) {
     let mut out: Option<(Extreme, Extreme)> = None;
     let mut nulls = 0;
     for i in from..to {
@@ -81,7 +86,12 @@ fn extremes(values: &Values, from: usize, to: usize) -> (Option<(Extreme, Extrem
             }
         }
     }
-    (out, nulls)
+    // An unsigned number's keys sort as its own bits do, which are what the file writes.
+    let raw = |e: Extreme| match e {
+        Extreme::Int(k) => Extreme::Int(crate::scalars::raw_of_key(ty, k)),
+        other => other,
+    };
+    (out.map(|(lo, hi)| (raw(lo), raw(hi))), nulls)
 }
 
 fn statistics(physical: PhysicalType, range: Option<(Extreme, Extreme)>, nulls: u64) -> Statistics {
@@ -352,7 +362,7 @@ impl Snail {
         let mut whole: Option<(Extreme, Extreme)> = None;
         let mut nulls = 0;
         for &(_, _, first, n) in &spans {
-            let (range, page_nulls) = extremes(&values, first, first + n);
+            let (range, page_nulls) = extremes(&values, ty, first, first + n);
             nulls += page_nulls;
             match &range {
                 Some((lo, hi)) => index.append(

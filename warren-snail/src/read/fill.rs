@@ -51,6 +51,7 @@ fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
         (Datum::Int(v), ColumnType::Numeric { scale, .. }) => {
             numeric_text(*v as i128, scale as u32)
         }
+        (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => crate::scalars::scalar_text(ty, *v),
         (Datum::Int(v), _) => v.to_string(),
         (Datum::Text(s), _) => s.clone(),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()).text().unwrap_or_default(),
@@ -135,6 +136,61 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             }
         }
         (Timestamptz, Timestamptz) | (Bytes, Bytes) | (Boolean, Boolean) | (Uuid, Uuid) => d,
+        (Oid, Oid)
+        | (Xid, Xid)
+        | (Cid, Cid)
+        | (Xid8, Xid8)
+        | (PgLsn, PgLsn)
+        | (Char, Char)
+        | (Money, Money) => d,
+        (Int2 | Int4 | Int8, Oid) => {
+            let Datum::Int(v) = d else {
+                return Err(refused());
+            };
+            // A bigint is held to an oid's range; a smaller integer's bits are taken as they are.
+            let u = if from == Int8 {
+                u32::try_from(v).map_err(|_| Error::new("OID out of range"))?
+            } else {
+                v as i32 as u32
+            };
+            Datum::Int(crate::scalars::unsigned_key(u64::from(u), 32))
+        }
+        (Oid, Int4 | Int8) => {
+            let Datum::Int(v) = d else {
+                return Err(refused());
+            };
+            let u = crate::scalars::unsigned_of(v, 32);
+            Datum::Int(if to == Int4 {
+                i64::from(u as u32 as i32)
+            } else {
+                u as i64
+            })
+        }
+        (Int4 | Int8 | Numeric { .. }, Money) => {
+            let Datum::Int(v) = d else {
+                return Err(refused());
+            };
+            let s = match from {
+                Numeric { scale, .. } => scale as u32,
+                _ => 0,
+            };
+            let cents = rescale(v as i128, s, 2);
+            Datum::Int(i64::try_from(cents).map_err(|_| Error::new("bigint out of range"))?)
+        }
+        (Money, Numeric { precision, scale }) => {
+            let Datum::Int(v) = d else {
+                return Err(refused());
+            };
+            let units = rescale(v as i128, 2, scale as u32);
+            if units.unsigned_abs() >= 10u128.pow(precision as u32) {
+                return Err(Error::new("numeric field overflow"));
+            }
+            Datum::Int(units as i64)
+        }
+        (Text(_), Char) => {
+            let s = text_of(&d, from).unwrap_or_default();
+            Datum::Int(crate::scalars::scalar_parse(Char, &s)?)
+        }
         _ => return Err(refused()),
     })
 }
@@ -145,6 +201,7 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Null, _) => Value::Null,
         (Datum::Int(v), ColumnType::Boolean) => Value::Bool(*v != 0),
         (Datum::Int(v), ColumnType::Numeric { scale, .. }) => Value::Num(*v as i128, scale as u32),
+        (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => Value::Scalar(ty, *v),
         (Datum::Int(v), _) => Value::Int(*v),
         (Datum::Text(s), _) => Value::Text(s.clone()),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()),
@@ -171,6 +228,7 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
         Value::Bytes(b) => (Datum::Bytes(b), ColumnType::Bytes),
         Value::Bool(b) => (Datum::Int(b as i64), ColumnType::Boolean),
         Value::Uuid(k) => (Datum::Wide(k), ColumnType::Uuid),
+        Value::Scalar(ty, k) => (Datum::Int(k), ty),
     };
     assign(d, from, to, what)
 }

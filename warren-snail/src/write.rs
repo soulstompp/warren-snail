@@ -12,7 +12,7 @@ use crate::encode::{descriptor, disk_pages, encode, DataPage, Encoded, DICTIONAR
 use crate::file::{
     encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_EIGHT, FORMAT_SEVEN,
 };
-use crate::places::{key, month_utc, null_key, shown, KeyValue, Keys, Sublevels};
+use crate::places::{key, month_utc, null_key, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
 use arrow::array::{
@@ -86,6 +86,14 @@ impl Rows {
                             a.iter().map(|v| {
                                 v.map(|b| crate::scalars::uuid_key(b.try_into().unwrap()))
                             }),
+                        );
+                    }
+                    (Values::Int(out), ty, dt)
+                        if crate::scalars::is_scalar(ty)
+                            && *dt == crate::scalars::scalar_arrow(ty) =>
+                    {
+                        out.extend(
+                            (0..a.len()).map(|r| crate::scalars::scalar_key_at(ty, a.as_ref(), r)),
                         );
                     }
                     (Values::Int(out), ColumnType::Boolean, DataType::Boolean) => {
@@ -657,7 +665,14 @@ pub(crate) fn laid_out(
             return Err(Error::new(format!(
                 "{}: two rows share the value {} of {}, which is unique",
                 table.name,
-                shown(row(p[0])),
+                crate::places::shown_as(
+                    row(p[0]),
+                    &order
+                        .levels
+                        .iter()
+                        .map(|l| table.columns[l.column()].ty)
+                        .collect::<Vec<_>>()
+                ),
                 order.name
             )));
         }

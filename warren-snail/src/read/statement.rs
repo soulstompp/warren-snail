@@ -161,6 +161,53 @@ pub(crate) fn is_literal(e: &Expr) -> bool {
     }
 }
 
+/// A number written out as PostgreSQL types it: an integer, a bigint past an integer's range, a
+/// numeric where it has a point; with its value.
+pub(super) fn number_datum(e: &Expr) -> Option<(Datum, ColumnType)> {
+    let text = match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => s.clone(),
+            _ => return None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(v) => match &v.value {
+                Value::Number(s, _) => format!("-{s}"),
+                _ => return None,
+            },
+            _ => return None,
+        },
+        Expr::Nested(x) => return number_datum(x),
+        _ => return None,
+    };
+    match text.split_once('.') {
+        None => {
+            let v: i64 = text.parse().ok()?;
+            Some((
+                Datum::Int(v),
+                if i32::try_from(v).is_ok() {
+                    ColumnType::Int4
+                } else {
+                    ColumnType::Int8
+                },
+            ))
+        }
+        Some((_, frac)) => {
+            let scale = u8::try_from(frac.len()).ok().filter(|&s| s <= 18)?;
+            let units = crate::catalog::numeric_units(&text, 18, scale).ok()?;
+            Some((
+                Datum::Int(units),
+                ColumnType::Numeric {
+                    precision: 18,
+                    scale,
+                },
+            ))
+        }
+    }
+}
+
 /// A literal as a value of column `c`.
 pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
     let e = uncast(e);
@@ -192,6 +239,19 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
         ColumnType::Uuid => Datum::Wide(crate::scalars::uuid_parse(
             &text_literal(e).map_err(|_| wrong())?,
         )?),
+        ty @ (ColumnType::Oid
+        | ColumnType::Xid
+        | ColumnType::Cid
+        | ColumnType::Xid8
+        | ColumnType::PgLsn
+        | ColumnType::Char
+        | ColumnType::Money) => match text_literal(e) {
+            Ok(s) => Datum::Int(crate::scalars::scalar_parse(ty, &s)?),
+            Err(_) => {
+                let (d, from) = number_datum(e).ok_or_else(wrong)?;
+                super::fill::assign(d, from, ty, &col.name)?
+            }
+        },
         // A literal is held to its column's length as PostgreSQL plans the statement, before any
         // DEFAULT draws a value: its excess taken off where it is only spaces, else refused.
         ColumnType::Text(n) => super::fill::assign(

@@ -11,7 +11,7 @@ use sqlparser::ast::{
     FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, TimezoneInfo, Value,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ColumnType {
     Int2,
@@ -32,6 +32,20 @@ pub enum ColumnType {
     Boolean,
     /// A uuid: its 16 bytes, compared byte by byte.
     Uuid,
+    /// An oid: an unsigned 32-bit number.
+    Oid,
+    /// A transaction id: an unsigned 32-bit number, compared only by `=` and `<>`.
+    Xid,
+    /// A command id: an unsigned 32-bit number, compared only by `=`.
+    Cid,
+    /// A transaction id with its epoch: an unsigned 64-bit number.
+    Xid8,
+    /// A position in the write-ahead log: an unsigned 64-bit number.
+    PgLsn,
+    /// `"char"`: one byte, compared unsigned.
+    Char,
+    /// money: a count of its smallest unit, a cent under the C locale.
+    Money,
 }
 
 impl ColumnType {
@@ -39,11 +53,38 @@ impl ColumnType {
     /// smallint, written as Parquet's INT32, takes 4.
     pub fn width(self) -> Option<usize> {
         match self {
-            ColumnType::Int2 | ColumnType::Int4 => Some(4),
-            ColumnType::Int8 | ColumnType::Timestamptz | ColumnType::Numeric { .. } => Some(8),
+            ColumnType::Int2
+            | ColumnType::Int4
+            | ColumnType::Oid
+            | ColumnType::Xid
+            | ColumnType::Cid
+            | ColumnType::Char => Some(4),
+            ColumnType::Int8
+            | ColumnType::Timestamptz
+            | ColumnType::Numeric { .. }
+            | ColumnType::Xid8
+            | ColumnType::PgLsn
+            | ColumnType::Money => Some(8),
             ColumnType::Uuid => Some(16),
             ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Boolean => None,
         }
+    }
+
+    /// The bits of its key, for a type keyed as an unsigned number held in the signed range of its
+    /// width: 0 for any other.
+    pub fn unsigned_bits(self) -> u32 {
+        match self {
+            ColumnType::Oid | ColumnType::Xid | ColumnType::Cid => 32,
+            ColumnType::Xid8 | ColumnType::PgLsn => 64,
+            ColumnType::Char => 8,
+            _ => 0,
+        }
+    }
+
+    /// Whether PostgreSQL has a B-tree operator class for it, so that it orders, keys an index and
+    /// is compared by `<`: xid and cid have only a hash one.
+    pub fn ordered(self) -> bool {
+        !matches!(self, ColumnType::Xid | ColumnType::Cid)
     }
 
     /// Whether its values are keyed in 128 bits.
@@ -100,6 +141,7 @@ impl ColumnType {
             ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
             ColumnType::Boolean => "boolean".into(),
             ColumnType::Uuid => "uuid".into(),
+            other => other.pg_name(),
         }
     }
 
@@ -116,11 +158,18 @@ impl ColumnType {
             ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
             ColumnType::Boolean => "boolean".into(),
             ColumnType::Uuid => "uuid".into(),
+            ColumnType::Oid => "oid".into(),
+            ColumnType::Xid => "xid".into(),
+            ColumnType::Cid => "cid".into(),
+            ColumnType::Xid8 => "xid8".into(),
+            ColumnType::PgLsn => "pg_lsn".into(),
+            ColumnType::Char => "\"char\"".into(),
+            ColumnType::Money => "money".into(),
         }
     }
 
     /// The B-tree operator class PostgreSQL takes for a key of this type where its index names
-    /// none.
+    /// none; xid's and cid's are hash ones, as they have no other.
     pub fn default_opclass(self) -> &'static str {
         match self {
             ColumnType::Int2 => "int2_ops",
@@ -132,6 +181,13 @@ impl ColumnType {
             ColumnType::Numeric { .. } => "numeric_ops",
             ColumnType::Boolean => "bool_ops",
             ColumnType::Uuid => "uuid_ops",
+            ColumnType::Oid => "oid_ops",
+            ColumnType::Xid => "xid_ops",
+            ColumnType::Cid => "cid_ops",
+            ColumnType::Xid8 => "xid8_ops",
+            ColumnType::PgLsn => "pg_lsn_ops",
+            ColumnType::Char => "char_ops",
+            ColumnType::Money => "money_ops",
         }
     }
 
@@ -162,6 +218,15 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Bytes, Bytes)
             | (Boolean, Boolean)
             | (Uuid, Uuid)
+            | (Int2 | Int4 | Int8 | Oid, Oid)
+            | (Oid, Int4 | Int8)
+            | (Int4 | Int8 | Numeric { .. } | Money, Money)
+            | (Money, Numeric { .. })
+            | (Text(_) | Char, Char)
+            | (Xid, Xid)
+            | (Cid, Cid)
+            | (Xid8, Xid8)
+            | (PgLsn, PgLsn)
     )
 }
 
@@ -843,6 +908,20 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Bytea => ColumnType::Bytes,
         DataType::Boolean | DataType::Bool => ColumnType::Boolean,
         DataType::Uuid => ColumnType::Uuid,
+        DataType::Custom(name, args) if args.is_empty() => {
+            let n = object_name(name);
+            match n.strip_prefix("pg_catalog.").unwrap_or(&n) {
+                "oid" => ColumnType::Oid,
+                "xid" => ColumnType::Xid,
+                "cid" => ColumnType::Cid,
+                "xid8" => ColumnType::Xid8,
+                "pg_lsn" => ColumnType::PgLsn,
+                // Quoted, as unquoted it is the keyword for character(1).
+                "char" => ColumnType::Char,
+                "money" => ColumnType::Money,
+                _ => return Err(Error::new(format!("the type {} is not held", spelled(dt)))),
+            }
+        }
         DataType::Numeric(info) | DataType::Decimal(info) => {
             let (p, s) = match info {
                 ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),

@@ -859,7 +859,7 @@ impl Snail {
             self.walked.get(),
             self.taken.get(),
         );
-        let mut answer = Answer::new(&scan.q.select);
+        let mut answer = Answer::new(&scan.q.select).typed(&[table]);
         let range = if scan.whole {
             scan.next..blocks
         } else {
@@ -1084,7 +1084,7 @@ impl Snail {
 
     fn ask_one(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)> {
         let table = &self.catalog.tables[q.sides[0].table];
-        let mut answer = Answer::new(&q.select);
+        let mut answer = Answer::new(&q.select).typed(&[table]);
         let (mut round, counted, months) = self.scan_one(q, order, &mut answer)?;
         answer.counted(counted, &months, q.select.countable());
         let batch = answer.finish(&[table], &q.select, &q.order)?;
@@ -1238,7 +1238,7 @@ impl Snail {
             from.push((side, seen[side]));
             seen[side] += 1;
         }
-        let mut answer = Answer::new(&q.select);
+        let mut answer = Answer::new(&q.select).typed(&tables);
         let mid = self.reader.pages_read();
         let mut sink = Second {
             held: &held,
@@ -1491,7 +1491,10 @@ impl<F: FnMut(RecordBatch) -> Result<()>> Sink for Blocks<'_, F> {
 
     fn block_end(&mut self) -> Result<()> {
         // The scan sends each block's own dictionaries before the block's first row.
-        let done = std::mem::replace(&mut self.answer, Answer::new(&self.q.select));
+        let done = std::mem::replace(
+            &mut self.answer,
+            Answer::new(&self.q.select).typed(&[self.table]),
+        );
         let batch = done.finish(&[self.table], &self.q.select, &self.q.order)?;
         (self.feed)(batch)
     }

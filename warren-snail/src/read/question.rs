@@ -108,6 +108,10 @@ pub enum Item {
     Key(Key),
     Count,
     Sum(Col),
+    /// min of a column.
+    Least(Col),
+    /// max of a column.
+    Greatest(Col),
 }
 
 #[derive(Debug)]
@@ -157,7 +161,7 @@ impl Select {
             Select::Groups { keys, items } => {
                 let mut out = keys.clone();
                 for (_, i) in items {
-                    if let Item::Sum(c) = i {
+                    if let Item::Sum(c) | Item::Least(c) | Item::Greatest(c) = i {
                         if !out[keys.len()..].contains(&Key::Column(*c)) {
                             out.push(Key::Column(*c));
                         }
@@ -355,6 +359,7 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
     match s {
         Shape::MonthUtc(_) => number(e).ok_or_else(|| Error::new(format!("{e} is not a month"))),
         Shape::Column(c) => match table.columns[c].ty {
+            ty if crate::scalars::is_scalar(ty) => scalar_literal(e, ty),
             ColumnType::Boolean => truth_literal(e),
             ColumnType::Uuid => Err(Error::new(format!("{e} is not a uuid"))),
             ColumnType::Timestamptz => {
@@ -386,6 +391,44 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
         },
         Shape::Clock(_) => Err(Error::new("compare the column itself, or its month")),
     }
+}
+
+/// A literal compared with a fixed scalar, as its key: quoted, read by the type's input; a number
+/// only beside an oid, cast to one, or an xid, as `xideqint4` reads an integer.
+fn scalar_literal(e: &Expr, ty: ColumnType) -> Result<i64> {
+    if let Ok(s) = text_literal(e) {
+        return crate::scalars::scalar_parse(ty, &s);
+    }
+    let n = match super::statement::number_datum(e) {
+        Some((super::statement::Datum::Int(n), ColumnType::Int4 | ColumnType::Int8)) => n,
+        Some((_, from)) => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} = {}",
+                ty.pg_name(),
+                from.pg_name().split('(').next().unwrap_or_default()
+            )))
+        }
+        None => {
+            return Err(Error::new(format!(
+                "{e} is not a value of {}",
+                ty.pg_name()
+            )))
+        }
+    };
+    let int4 = i32::try_from(n).is_ok();
+    let u = match ty {
+        ColumnType::Oid if int4 => n as i32 as u32,
+        ColumnType::Oid => u32::try_from(n).map_err(|_| Error::new("OID out of range"))?,
+        ColumnType::Xid if int4 => n as i32 as u32,
+        _ => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} = {}",
+                ty.pg_name(),
+                if int4 { "integer" } else { "bigint" }
+            )))
+        }
+    };
+    Ok(crate::scalars::unsigned_key(u64::from(u), 32))
 }
 
 /// A time on the UTC clock, as microseconds since 1970-01-01 UTC: what a column at time zone 'UTC' is
@@ -577,14 +620,46 @@ impl From<'_> {
                             | ColumnType::Int4
                             | ColumnType::Int8
                             | ColumnType::Numeric { .. }
+                            | ColumnType::Money
                     ) =>
                 {
                     Ok(Some(Item::Sum(Col { side, column })))
                 }
                 _ => Err(Error::new(format!(
-                    "{e}: sum is read over an integer or numeric column"
+                    "{e}: sum is read over an integer, numeric or money column"
                 ))),
             },
+            ("min" | "max", [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))]) => {
+                let (side, column) = match self.resolve(x)? {
+                    (side, Shape::Column(column)) => (side, column),
+                    _ => return Err(Error::new(format!("{e}: min and max read a column itself"))),
+                };
+                let ty = self.table(side).columns[column].ty;
+                let col = Col { side, column };
+                match ty {
+                    ColumnType::Int2
+                    | ColumnType::Int4
+                    | ColumnType::Int8
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::Timestamptz
+                    | ColumnType::Oid
+                    | ColumnType::Xid8
+                    | ColumnType::PgLsn
+                    | ColumnType::Char
+                    | ColumnType::Money => Ok(Some(if name == "min" {
+                        Item::Least(col)
+                    } else {
+                        Item::Greatest(col)
+                    })),
+                    ColumnType::Boolean | ColumnType::Uuid | ColumnType::Xid | ColumnType::Cid => {
+                        Err(Error::new(format!(
+                            "function {name}({}) does not exist",
+                            ty.pg_name()
+                        )))
+                    }
+                    _ => Err(Error::new(format!("{e} is not read"))),
+                }
+            }
             _ => Err(Error::new(format!("{e} is not read"))),
         }
     }
@@ -596,6 +671,8 @@ impl From<'_> {
             Item::Key(Key::Month(_)) => "extract".into(),
             Item::Count => "count".into(),
             Item::Sum(_) => "sum".into(),
+            Item::Least(_) => "min".into(),
+            Item::Greatest(_) => "max".into(),
         }
     }
 }
@@ -767,6 +844,15 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     )))
                 }
             };
+            if let (_, Item::Key(Key::Column(c))) = listed[at] {
+                let ty = from.table(c.side).columns[c.column].ty;
+                if !ty.ordered() {
+                    return Err(Error::new(format!(
+                        "could not identify an ordering operator for type {}",
+                        ty.pg_name()
+                    )));
+                }
+            }
             order.push(Sort {
                 at,
                 desc,
@@ -857,6 +943,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             }
             continue;
         }
+        let lit_left = from.resolve(left).is_err();
         let (side, s, lit, op) = match from.resolve(left) {
             Ok((side, s)) => (side, s, right, op),
             Err(_) => {
@@ -872,6 +959,32 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             }
         };
         let table = from.table(side);
+        // xid has only `=` and `<>`, an integer on their right; cid only `=`. Asked first, as
+        // PostgreSQL finds the operator before it reads a value.
+        if let Shape::Column(c) = s {
+            let ty = table.columns[c].ty;
+            let has = match ty {
+                ColumnType::Xid => matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq),
+                ColumnType::Cid => matches!(op, BinaryOperator::Eq),
+                _ => true,
+            };
+            let number = super::statement::number_datum(lit).is_some();
+            if !has || (ty == ColumnType::Xid && lit_left && number) {
+                return Err(Error::new(format!(
+                    "operator does not exist: {} {op} {}",
+                    if lit_left {
+                        "integer".into()
+                    } else {
+                        ty.pg_name()
+                    },
+                    if lit_left {
+                        ty.pg_name()
+                    } else {
+                        "unknown".into()
+                    }
+                )));
+            }
+        }
         let here = &mut sides[side];
         // No comparison matches a NULL, so one with NULL keeps no row.
         if matches!(lit, Expr::Value(v) if v.value == Value::Null)

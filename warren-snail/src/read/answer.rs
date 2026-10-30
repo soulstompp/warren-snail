@@ -11,7 +11,7 @@ use arrow::array::{
     Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
     TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{Field, Schema};
 use parquet::data_type::ByteArray;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -53,12 +53,32 @@ impl Ord for Text {
     }
 }
 
+/// A running sum of money with `step` added: past the range money holds, it stays past it.
+fn held_sum(total: i128, step: i128) -> i128 {
+    if total == PAST_RANGE {
+        return PAST_RANGE;
+    }
+    let t = total + step;
+    if i64::try_from(t).is_ok() {
+        t
+    } else {
+        PAST_RANGE
+    }
+}
+
 /// Adds one group's aggregates into another's.
 fn merge(into: &mut [Acc], from: &[Acc]) {
     for (a, b) in into.iter_mut().zip(from) {
         match (a, b) {
             (Acc::Count(x), Acc::Count(y)) => *x += y,
-            (Acc::Sum(x), Acc::Sum(Some(y))) => *x = Some(x.unwrap_or(0) + y),
+            (Acc::Sum(x), Acc::Sum(Some(y))) => {
+                *x = Some(match (x.unwrap_or(0), *y) {
+                    (PAST_RANGE, _) | (_, PAST_RANGE) => PAST_RANGE,
+                    (a, b) => a.saturating_add(b),
+                })
+            }
+            (Acc::Least(x), Acc::Least(Some(y))) => *x = Some(x.map_or(*y, |x| x.min(*y))),
+            (Acc::Greatest(x), Acc::Greatest(Some(y))) => *x = Some(x.map_or(*y, |x| x.max(*y))),
             _ => {}
         }
     }
@@ -75,6 +95,17 @@ pub enum Cell {
     Code(u32),
     /// A value keyed in 128 bits, as its key.
     Wide(i128),
+}
+
+impl Cell {
+    /// A number's or a wide value's key, in 128 bits.
+    pub fn key(&self) -> Option<i128> {
+        match self {
+            Cell::Int(v) => Some(i128::from(*v)),
+            Cell::Wide(k) => Some(*k),
+            _ => None,
+        }
+    }
 }
 
 /// The dictionary a column's codes index in the rows now arriving: none for a column read otherwise.
@@ -104,6 +135,10 @@ pub fn same(a: &[Dict], b: &[Dict]) -> bool {
 pub enum Acc {
     Count(u64),
     Sum(Option<i128>),
+    /// The least key so far.
+    Least(Option<i128>),
+    /// The greatest key so far.
+    Greatest(Option<i128>),
 }
 
 /// The answer as rows arrive, each as the cells of the question's inputs.
@@ -113,7 +148,13 @@ pub struct Answer {
     /// Whether any input has one.
     coded: bool,
     body: Body,
+    /// For each item, the type of the column it aggregates, where it is known.
+    typed: Vec<Option<ColumnType>>,
 }
+
+/// A running sum held past money's range: refused at the end, as PostgreSQL refuses the step that
+/// leaves it.
+const PAST_RANGE: i128 = i128::MAX;
 
 enum Body {
     Rows(Vec<Vec<Cell>>),
@@ -146,7 +187,25 @@ impl Answer {
             dicts: vec![None; select.inputs().len()],
             coded: false,
             body,
+            typed: Vec::new(),
         }
+    }
+
+    /// The answer told the types of the columns its aggregates read, `tables` side by side: a sum
+    /// of money held to its range row by row, and a `"char"`'s min and max taken by its text.
+    pub(crate) fn typed(mut self, tables: &[&Table]) -> Answer {
+        if let Body::Groups { items, .. } = &self.body {
+            self.typed = items
+                .iter()
+                .map(|i| match i {
+                    Item::Sum(c) | Item::Least(c) | Item::Greatest(c) => {
+                        Some(tables[c.side].columns[c.column].ty)
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+        self
     }
 
     /// The dictionaries the codes of the rows that follow index, one for each input.
@@ -190,6 +249,8 @@ impl Answer {
             .iter()
             .map(|i| match i {
                 Item::Sum(_) => Acc::Sum(None),
+                Item::Least(_) => Acc::Least(None),
+                Item::Greatest(_) => Acc::Greatest(None),
                 _ => Acc::Count(0),
             })
             .collect()
@@ -201,6 +262,7 @@ impl Answer {
 
     /// Adds `n` rows of these cells.
     pub fn add_times(&mut self, cells: &[Cell], n: u64) {
+        let typed = &self.typed;
         match &mut self.body {
             Body::Rows(rows) => {
                 let row: Vec<Cell> = if self.coded {
@@ -242,13 +304,38 @@ impl Answer {
                             .or_insert_with(|| Answer::fresh(items)),
                     },
                 };
-                for (acc, item) in accs.iter_mut().zip(items.iter()) {
+                for (i, (acc, item)) in accs.iter_mut().zip(items.iter()).enumerate() {
+                    let ty = typed.get(i).copied().flatten();
                     match (acc, item) {
                         (Acc::Count(c), Item::Count) => *c += n,
                         (Acc::Sum(total), Item::Sum(c)) => {
                             let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
                             if let Cell::Int(v) = cells[at] {
-                                *total = Some(total.unwrap_or(0) + v as i128 * n as i128);
+                                let t = total.unwrap_or(0);
+                                *total = Some(if ty == Some(ColumnType::Money) {
+                                    held_sum(t, v as i128 * n as i128)
+                                } else {
+                                    t + v as i128 * n as i128
+                                });
+                            }
+                        }
+                        (Acc::Least(m), Item::Least(c)) | (Acc::Greatest(m), Item::Greatest(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            let least = matches!(item, Item::Least(_));
+                            let v = match (ty, &cells[at]) {
+                                (Some(ColumnType::Char), Cell::Int(k)) => {
+                                    Some(i128::from(crate::scalars::char_text_rank(
+                                        crate::scalars::unsigned_of(*k, 8) as u8,
+                                    )))
+                                }
+                                (_, c) => c.key(),
+                            };
+                            if let Some(v) = v {
+                                *m = Some(match *m {
+                                    Some(x) if least => x.min(v),
+                                    Some(x) => x.max(v),
+                                    None => v,
+                                });
                             }
                         }
                         _ => {}
@@ -267,6 +354,15 @@ impl Answer {
         from: usize,
         to: usize,
     ) -> bool {
+        // A money sum is held to its range row by row, and a "char"'s min and max go by its text.
+        if self
+            .typed
+            .iter()
+            .flatten()
+            .any(|t| matches!(t, ColumnType::Money | ColumnType::Char))
+        {
+            return false;
+        }
         let Body::Groups {
             keys,
             items,
@@ -288,6 +384,7 @@ impl Answer {
         for i in items.iter() {
             summed.push(match i {
                 Item::Count | Item::Key(_) => None,
+                Item::Least(_) | Item::Greatest(_) => return false,
                 Item::Sum(c) => match inputs.iter().position(|k| *k == Key::Column(*c)) {
                     Some(at) if !outs[at].1 && outs[at].3.ints().is_some() => Some(at),
                     _ => return false,
@@ -400,6 +497,18 @@ impl Answer {
                 if keys == 0 && groups.is_empty() {
                     groups.insert(Vec::new(), Answer::fresh(&items));
                 }
+                // A sum of money past its range is refused, as PostgreSQL refuses it.
+                for accs in groups.values() {
+                    for (item, acc) in items.iter().zip(accs) {
+                        if let (Item::Sum(c), Acc::Sum(Some(t))) = (item, acc) {
+                            if tables[c.side].columns[c.column].ty == ColumnType::Money
+                                && i64::try_from(*t).is_err()
+                            {
+                                return Err(crate::Error::new("money out of range"));
+                            }
+                        }
+                    }
+                }
                 groups
                     .into_iter()
                     .map(|(key, accs)| {
@@ -413,6 +522,21 @@ impl Answer {
                                 (_, Acc::Count(n)) => Cell::Int(n as i64),
                                 (_, Acc::Sum(total)) => {
                                     total.map_or(Cell::Null, |t| Cell::Int(t as i64))
+                                }
+                                (
+                                    Item::Least(c) | Item::Greatest(c),
+                                    Acc::Least(m) | Acc::Greatest(m),
+                                ) if tables[c.side].columns[c.column].ty == ColumnType::Char => m
+                                    .map_or(Cell::Null, |r| {
+                                        let b = crate::scalars::char_of_text_rank(r as i64);
+                                        let t = crate::scalars::scalar_text(
+                                            ColumnType::Char,
+                                            crate::scalars::unsigned_key(u64::from(b), 8),
+                                        );
+                                        Cell::Text(Text(ByteArray::from(t.as_str())))
+                                    }),
+                                (_, Acc::Least(m) | Acc::Greatest(m)) => {
+                                    m.map_or(Cell::Null, |v| Cell::Int(v as i64))
                                 }
                             })
                             .collect()
@@ -461,8 +585,22 @@ impl Answer {
                     _ => None,
                 })
             };
+            let char_text = matches!(*item, Item::Least(c) | Item::Greatest(c)
+                if tables[c.side].columns[c.column].ty == ColumnType::Char);
             let (nullable, a): (bool, ArrayRef) = match *item {
-                Item::Key(Key::Column(c)) => {
+                // PostgreSQL takes a "char"'s min and max through its text.
+                Item::Least(_) | Item::Greatest(_) if char_text => (
+                    true,
+                    Arc::new(
+                        rows.iter()
+                            .map(|r| match &r[i] {
+                                Cell::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<StringArray>(),
+                    ),
+                ),
+                Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) => {
                     let col = &tables[c.side].columns[c.column];
                     let a: ArrayRef = match col.ty {
                         ColumnType::Boolean => {
@@ -511,8 +649,9 @@ impl Answer {
                                 16,
                             )?)
                         }
+                        ty => crate::scalars::scalar_array(ty, ints()),
                     };
-                    (!col.not_null, a)
+                    (!col.not_null || !matches!(*item, Item::Key(_)), a)
                 }
                 Item::Key(Key::Month(c)) => (
                     !tables[c.side].columns[c.column].not_null,
@@ -532,8 +671,18 @@ impl Answer {
                     _ => (true, Arc::new(ints().collect::<Int64Array>())),
                 },
             };
-            let dt: DataType = a.data_type().clone();
-            fields.push(Field::new(name, dt, nullable));
+            let scalar = match *item {
+                _ if char_text => None,
+                Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) | Item::Sum(c) => {
+                    Some(tables[c.side].columns[c.column].ty)
+                        .filter(|&t| crate::scalars::is_scalar(t))
+                }
+                _ => None,
+            };
+            fields.push(match scalar {
+                Some(ty) => crate::scalars::scalar_field(name, ty, nullable),
+                None => Field::new(name, a.data_type().clone(), nullable),
+            });
             arrays.push(a);
         }
         Ok(RecordBatch::try_new_with_options(
