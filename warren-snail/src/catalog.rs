@@ -46,6 +46,10 @@ pub enum ColumnType {
     Char,
     /// money: a count of its smallest unit, a cent under the C locale.
     Money,
+    /// A MAC address of 6 bytes, compared byte by byte.
+    Macaddr,
+    /// A MAC address of 8 bytes, compared byte by byte.
+    Macaddr8,
 }
 
 impl ColumnType {
@@ -64,7 +68,9 @@ impl ColumnType {
             | ColumnType::Numeric { .. }
             | ColumnType::Xid8
             | ColumnType::PgLsn
-            | ColumnType::Money => Some(8),
+            | ColumnType::Money
+            | ColumnType::Macaddr8 => Some(8),
+            ColumnType::Macaddr => Some(6),
             ColumnType::Uuid => Some(16),
             ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Boolean => None,
         }
@@ -75,9 +81,20 @@ impl ColumnType {
     pub fn unsigned_bits(self) -> u32 {
         match self {
             ColumnType::Oid | ColumnType::Xid | ColumnType::Cid => 32,
-            ColumnType::Xid8 | ColumnType::PgLsn => 64,
+            ColumnType::Xid8 | ColumnType::PgLsn | ColumnType::Macaddr8 => 64,
+            ColumnType::Macaddr => 48,
             ColumnType::Char => 8,
             _ => 0,
+        }
+    }
+
+    /// The bytes of a value the file writes as a fixed array of bytes and keys as a number: a
+    /// MAC address's.
+    pub fn fixed_bytes(self) -> Option<usize> {
+        match self {
+            ColumnType::Macaddr => Some(6),
+            ColumnType::Macaddr8 => Some(8),
+            _ => None,
         }
     }
 
@@ -165,6 +182,8 @@ impl ColumnType {
             ColumnType::PgLsn => "pg_lsn".into(),
             ColumnType::Char => "\"char\"".into(),
             ColumnType::Money => "money".into(),
+            ColumnType::Macaddr => "macaddr".into(),
+            ColumnType::Macaddr8 => "macaddr8".into(),
         }
     }
 
@@ -188,6 +207,8 @@ impl ColumnType {
             ColumnType::PgLsn => "pg_lsn_ops",
             ColumnType::Char => "char_ops",
             ColumnType::Money => "money_ops",
+            ColumnType::Macaddr => "macaddr_ops",
+            ColumnType::Macaddr8 => "macaddr8_ops",
         }
     }
 
@@ -227,6 +248,7 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Cid, Cid)
             | (Xid8, Xid8)
             | (PgLsn, PgLsn)
+            | (Macaddr | Macaddr8, Macaddr | Macaddr8)
     )
 }
 
@@ -919,6 +941,8 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                 // Quoted, as unquoted it is the keyword for character(1).
                 "char" => ColumnType::Char,
                 "money" => ColumnType::Money,
+                "macaddr" => ColumnType::Macaddr,
+                "macaddr8" => ColumnType::Macaddr8,
                 _ => return Err(Error::new(format!("the type {} is not held", spelled(dt)))),
             }
         }

@@ -453,6 +453,10 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
     let key = match (&v, ty) {
         (Value::Null, _) => return Ok(Value::Null),
         (Value::Scalar(from, k), _) if *from == ty => *k,
+        (
+            Value::Scalar(from @ (ColumnType::Macaddr | ColumnType::Macaddr8), k),
+            ColumnType::Macaddr | ColumnType::Macaddr8,
+        ) => crate::scalars::mac_cast(*from, ty, *k)?,
         (Value::Scalar(ColumnType::Xid8, k), ColumnType::Xid) => {
             unsigned_key(u64::from(unsigned_of(*k, 64) as u32), 32)
         }
@@ -571,6 +575,18 @@ fn scalar_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Valu
                 return Err(Error::new("division by zero"));
             }
             money(a.checked_div(*b))?
+        }
+        (B::BitwiseAnd | B::BitwiseOr, Value::Scalar(t, a), Value::Scalar(u, b))
+            if t == u && t.fixed_bytes().is_some() =>
+        {
+            let bits = t.unsigned_bits();
+            let (a, b) = (unsigned_of(*a, bits), unsigned_of(*b, bits));
+            let v = if matches!(op, B::BitwiseAnd) {
+                a & b
+            } else {
+                a | b
+            };
+            Value::Scalar(*t, unsigned_key(v, bits))
         }
         (B::Minus, Value::Scalar(PgLsn, a), Value::Scalar(PgLsn, b)) => Value::Num(
             i128::from(unsigned_of(*a, 64)) - i128::from(unsigned_of(*b, 64)),
@@ -754,6 +770,18 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             other => return Err(Error::new(format!("-{other:?} is not a number"))),
         },
         Expr::UnaryOp {
+            op: UnaryOperator::BitwiseNot,
+            expr,
+        } => match ev(expr)? {
+            Value::Null => Value::Null,
+            Value::Scalar(t, k) if t.fixed_bytes().is_some() => {
+                let bits = t.unsigned_bits();
+                let v = !crate::scalars::unsigned_of(k, bits) & (u64::MAX >> (64 - bits));
+                Value::Scalar(t, crate::scalars::unsigned_key(v, bits))
+            }
+            other => return Err(Error::new(format!("~{other:?} is not read"))),
+        },
+        Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
         } => match truth(&ev(expr)?)? {
@@ -800,7 +828,13 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo
+                    | BinaryOperator::BitwiseAnd
+                    | BinaryOperator::BitwiseOr
             ) {
+                // Each of these operators is strict: over a NULL it is NULL.
+                if x.is_null() || y.is_null() {
+                    return Ok(Value::Null);
+                }
                 if let Some(v) = scalar_arith(op, &x, &y)? {
                     return Ok(v);
                 }

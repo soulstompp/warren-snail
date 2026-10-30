@@ -394,3 +394,69 @@ fn the_scalars_go_out_as_unsigned_integers_and_come_back() {
     let key = scalar_parse(ColumnType::Money, "-92233720368547758.08").unwrap();
     assert_eq!(key, i64::MIN);
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_mac_address_is_held_in_its_bytes_compared_as_them_and_goes_out_as_them() {
+    use arrow::array::FixedSizeBinaryArray;
+    let path = tmp("mac.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.m (n integer NOT NULL, a macaddr, b macaddr8, PRIMARY KEY (n)); \
+         CREATE INDEX m_a ON s.m (a, n); \
+         CREATE TABLE s.e (n integer NOT NULL, b macaddr8, PRIMARY KEY (n));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.m (n, a, b) VALUES (1, '08:00:2b:01:02:03', '08:00:2b:01:02:03'), \
+         (2, 'ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00:00:01'), (3, '80:00:00:00:00:00', NULL), \
+         (4, '00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff:ff:ff')",
+    )
+    .unwrap();
+    // Compared byte by byte: a first byte past 127 sorts after one below it.
+    let (b, round) = w
+        .ask(
+            "SELECT m.n FROM s.m m WHERE m.a > '08:00:2b:01:02:03' ORDER BY m.n",
+            Some("m_a"),
+        )
+        .unwrap();
+    exact("a > 08:00:2b:01:02:03", &round);
+    assert_eq!(ns(&b), [2, 3]);
+    let (b, _) = w.ask("SELECT m.a FROM s.m m WHERE m.n = 1", None).unwrap();
+    let a = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(a.value(0), [0x08, 0x00, 0x2b, 0x01, 0x02, 0x03]);
+    let (b, _) = w
+        .ask(
+            "WITH t AS (SELECT n, a, b FROM s.m) SELECT (a & 'ff:ff:ff:00:00:00')::text AS x, \
+             (~b)::text AS y, n FROM t ORDER BY n",
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        weather::texts(b.column(0).as_ref())[0].as_deref(),
+        Some("08:00:2b:00:00:00")
+    );
+    assert_eq!(
+        weather::texts(b.column(1).as_ref())[0].as_deref(),
+        Some("f7:ff:d4:00:01:fe:fd:fc")
+    );
+    // A macaddr taken into a macaddr8 takes FF:FE in its middle.
+    w.execute("INSERT INTO s.e (n, b) SELECT m.n, m.a FROM s.m m WHERE m.n = 3")
+        .unwrap();
+    let (b, _) = w
+        .ask(
+            "WITH t AS (SELECT n, b FROM s.e) SELECT b::text AS x, n FROM t WHERE n = 3",
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        weather::texts(b.column(0).as_ref())[0].as_deref(),
+        Some("80:00:00:ff:fe:00:00:00")
+    );
+    assert!(w.ask("SELECT min(m.a) FROM s.m m", None).is_err());
+}

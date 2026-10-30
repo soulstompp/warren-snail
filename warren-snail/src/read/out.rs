@@ -88,6 +88,9 @@ fn extremes(
     }
     // An unsigned number's keys sort as its own bits do, which are what the file writes.
     let raw = |e: Extreme| match e {
+        Extreme::Int(k) if ty.fixed_bytes().is_some() => {
+            Extreme::Bytes(crate::scalars::fixed_of_key(ty, k))
+        }
         Extreme::Int(k) => Extreme::Int(crate::scalars::raw_of_key(ty, k)),
         other => other,
     };

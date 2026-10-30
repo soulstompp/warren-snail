@@ -115,6 +115,7 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
             }),
         ),
         ColumnType::Money => (PhysicalType::INT64, None),
+        ColumnType::Macaddr | ColumnType::Macaddr8 => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
     };
     let repetition = if nullable {
         Repetition::OPTIONAL
@@ -231,6 +232,14 @@ fn write(
         }
         (Values::Utf8(v), PhysicalType::BYTE_ARRAY) => {
             write_typed::<ByteArrayType, ByteArray>(desc, p, v, rows_per_page, |b| b.clone())?
+        }
+        (Values::Int(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
+            let n = desc.type_length() as usize;
+            write_typed::<FixedLenByteArrayType, i64>(desc, p, v, rows_per_page, |&k| {
+                FixedLenByteArray::from(
+                    crate::scalars::unsigned_of(k, n as u32 * 8).to_be_bytes()[8 - n..].to_vec(),
+                )
+            })?
         }
         (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
             write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, |&k| {
@@ -503,6 +512,19 @@ pub fn decode(
             }
             Ok(Values::Int(spread(
                 v.into_iter().map(|x| crate::scalars::key_of_raw(ty, x)),
+                &defs,
+                nullable,
+            )))
+        }
+        ColumnType::Macaddr | ColumnType::Macaddr8 => {
+            let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
+            let mut v: Vec<FixedLenByteArray> = Vec::new();
+            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            if n != rows {
+                return Err(short(n));
+            }
+            Ok(Values::Int(spread(
+                v.iter().map(|b| crate::scalars::key_of_fixed(ty, b.data())),
                 &defs,
                 nullable,
             )))

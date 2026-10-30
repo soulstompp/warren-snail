@@ -387,6 +387,189 @@ fn money_out(v: i64) -> String {
     format!("{}${grouped}.{:02}", if v < 0 { "-" } else { "" }, u % 100)
 }
 
+/// One `%x` or `%2x` of glibc's `sscanf`: white space, a sign, `0x` where no width bounds it, then
+/// hex digits, at most `width` characters after the white space. The number as an int, and where
+/// the reading stopped; none where no digit was read.
+fn scan_hex(b: &[u8], mut at: usize, width: Option<usize>) -> Option<(i64, usize)> {
+    while at < b.len() && is_c_space(b[at]) {
+        at += 1;
+    }
+    let limit = width.map_or(b.len(), |w| (at + w).min(b.len()));
+    let negative = match b.get(at) {
+        Some(b'-') if at < limit => {
+            at += 1;
+            true
+        }
+        Some(b'+') if at < limit => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+    if width.is_none()
+        && b.get(at) == Some(&b'0')
+        && matches!(b.get(at + 1), Some(b'x' | b'X'))
+        && b.get(at + 2).is_some_and(u8::is_ascii_hexdigit)
+    {
+        at += 2;
+    }
+    let start = at;
+    let mut v: u32 = 0;
+    while at < limit && b[at].is_ascii_hexdigit() {
+        v = v
+            .wrapping_mul(16)
+            .wrapping_add((b[at] as char).to_digit(16).unwrap());
+        at += 1;
+    }
+    (at > start).then(|| {
+        let v = if negative { v.wrapping_neg() } else { v };
+        (i64::from(v as i32), at)
+    })
+}
+
+/// A macaddr as PostgreSQL's `macaddr_in` reads it: six numbers in hex, by the first of its seven
+/// `sscanf` patterns that takes the whole, each number from 0 to 255.
+fn mac_in(s: &str) -> Result<u64> {
+    let wrong = || Error::new(format!("invalid input syntax for type macaddr: \"{s}\""));
+    let b = s.as_bytes();
+    // Each pattern: the separator after each of the six numbers, and the width of each.
+    let patterns: [(&[u8; 5], Option<usize>); 7] = [
+        (b":::::", None),
+        (b"-----", None),
+        (b"\0\0:\0\0", Some(2)),
+        (b"\0\0-\0\0", Some(2)),
+        (b"\0.\0.\0", Some(2)),
+        (b"\0-\0-\0", Some(2)),
+        (b"\0\0\0\0\0", Some(2)),
+    ];
+    for (seps, width) in patterns {
+        let mut at = 0;
+        let mut out = [0i64; 6];
+        let mut taken = true;
+        for (n, slot) in out.iter_mut().enumerate() {
+            match scan_hex(b, at, width) {
+                Some((v, next)) => {
+                    *slot = v;
+                    at = next;
+                }
+                None => {
+                    taken = false;
+                    break;
+                }
+            }
+            if n < 5 && seps[n] != 0 {
+                if b.get(at) != Some(&seps[n]) {
+                    taken = false;
+                    break;
+                }
+                at += 1;
+            }
+        }
+        if !taken || !b[at..].iter().all(|&c| is_c_space(c)) {
+            continue;
+        }
+        if out.iter().any(|v| !(0..=255).contains(v)) {
+            return Err(Error::new(format!(
+                "invalid octet value in \"macaddr\" value: \"{s}\""
+            )));
+        }
+        return Ok(out.iter().fold(0u64, |acc, &v| (acc << 8) | v as u64));
+    }
+    Err(wrong())
+}
+
+/// A macaddr8 as PostgreSQL's `macaddr8_in` reads it: white space, then six or eight bytes of two
+/// hex digits each, one separator throughout or none, white space after; six bytes take FF:FE in
+/// their middle. A single character left after the last byte is passed over, as PostgreSQL passes
+/// it over.
+fn mac8_in(s: &str) -> Result<u64> {
+    let wrong = || Error::new(format!("invalid input syntax for type macaddr8: \"{s}\""));
+    let b = s.as_bytes();
+    let mut at = 0;
+    while at < b.len() && is_c_space(b[at]) {
+        at += 1;
+    }
+    let mut bytes = [0u8; 8];
+    let (mut count, mut spacer) = (0usize, 0u8);
+    while at + 1 < b.len() {
+        if count == 8 {
+            return Err(wrong());
+        }
+        let pair = std::str::from_utf8(&b[at..at + 2]).map_err(|_| wrong())?;
+        if !pair.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(wrong());
+        }
+        bytes[count] = u8::from_str_radix(pair, 16).map_err(|_| wrong())?;
+        count += 1;
+        at += 2;
+        if matches!(b.get(at), Some(b':' | b'-' | b'.')) {
+            if spacer == 0 {
+                spacer = b[at];
+            } else if spacer != b[at] {
+                return Err(wrong());
+            }
+            at += 1;
+        }
+        if (count == 6 || count == 8) && b.get(at).is_some_and(|&c| is_c_space(c)) {
+            if b[at..].iter().all(|&c| is_c_space(c)) {
+                at = b.len();
+            } else {
+                return Err(wrong());
+            }
+        }
+    }
+    let bytes = match count {
+        8 => bytes,
+        6 => [
+            bytes[0], bytes[1], bytes[2], 0xff, 0xfe, bytes[3], bytes[4], bytes[5],
+        ],
+        _ => return Err(wrong()),
+    };
+    Ok(u64::from_be_bytes(bytes))
+}
+
+/// A MAC address as PostgreSQL writes it: its bytes in lower-case hex, joined by colons.
+fn mac_out(v: u64, n: usize) -> String {
+    v.to_be_bytes()[8 - n..]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// The bytes the file writes for a key of a type it writes as a fixed array of bytes.
+pub fn fixed_of_key(ty: ColumnType, key: i64) -> Vec<u8> {
+    let n = ty.fixed_bytes().unwrap_or(8);
+    unsigned_of(key, ty.unsigned_bits()).to_be_bytes()[8 - n..].to_vec()
+}
+
+/// The key of a value of type `ty` from the fixed array of bytes the file writes.
+pub fn key_of_fixed(ty: ColumnType, bytes: &[u8]) -> i64 {
+    let v = bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+    unsigned_key(v, ty.unsigned_bits())
+}
+
+/// A macaddr as a macaddr8, FF:FE in its middle, or a macaddr8 as a macaddr where its middle is
+/// FF:FE, as PostgreSQL's casts between them take it.
+pub fn mac_cast(from: ColumnType, to: ColumnType, key: i64) -> Result<i64> {
+    if from == to {
+        return Ok(key);
+    }
+    let b = fixed_of_key(from, key);
+    match to {
+        ColumnType::Macaddr8 => Ok(key_of_fixed(
+            to,
+            &[b[0], b[1], b[2], 0xff, 0xfe, b[3], b[4], b[5]],
+        )),
+        _ if b[3] == 0xff && b[4] == 0xfe => {
+            Ok(key_of_fixed(to, &[b[0], b[1], b[2], b[5], b[6], b[7]]))
+        }
+        _ => Err(Error::new(
+            "macaddr8 data out of range to convert to macaddr",
+        )),
+    }
+}
+
 /// A key of a type keyed as a number as PostgreSQL's output function writes the value.
 pub fn scalar_text(ty: ColumnType, key: i64) -> String {
     match ty {
@@ -396,6 +579,8 @@ pub fn scalar_text(ty: ColumnType, key: i64) -> String {
         ColumnType::PgLsn => lsn_out(unsigned_of(key, 64)),
         ColumnType::Char => char_out(unsigned_of(key, 8) as u8),
         ColumnType::Money => money_out(key),
+        ColumnType::Macaddr => mac_out(unsigned_of(key, 48), 6),
+        ColumnType::Macaddr8 => mac_out(unsigned_of(key, 64), 8),
         _ => key.to_string(),
     }
 }
@@ -411,6 +596,8 @@ pub fn scalar_parse(ty: ColumnType, s: &str) -> Result<i64> {
         ColumnType::PgLsn => unsigned_key(lsn_in(s)?, 64),
         ColumnType::Char => unsigned_key(u64::from(char_in(s)), 8),
         ColumnType::Money => money_in(s)?,
+        ColumnType::Macaddr => unsigned_key(mac_in(s)?, 48),
+        ColumnType::Macaddr8 => unsigned_key(mac8_in(s)?, 64),
         other => {
             return Err(Error::new(format!(
                 "{} is not read as a scalar",
@@ -428,6 +615,9 @@ pub const PG_TYPE: &str = "pg_type";
 /// page form.
 pub fn scalar_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
     use arrow::datatypes::DataType as A;
+    if let Some(n) = ty.fixed_bytes() {
+        return A::FixedSizeBinary(n as i32);
+    }
     match ty.unsigned_bits() {
         8 => A::UInt8,
         32 => A::UInt32,
@@ -441,8 +631,17 @@ pub fn scalar_array(
     ty: ColumnType,
     keys: impl Iterator<Item = Option<i64>>,
 ) -> arrow::array::ArrayRef {
-    use arrow::array::{Int64Array, UInt32Array, UInt64Array, UInt8Array};
+    use arrow::array::{FixedSizeBinaryArray, Int64Array, UInt32Array, UInt64Array, UInt8Array};
     use std::sync::Arc;
+    if let Some(n) = ty.fixed_bytes() {
+        return Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                keys.map(|k| k.map(|k| fixed_of_key(ty, k))),
+                n as i32,
+            )
+            .expect("a MAC address takes its bytes"),
+        );
+    }
     match ty.unsigned_bits() {
         8 => Arc::new(
             keys.map(|k| k.map(|k| unsigned_of(k, 8) as u8))
@@ -462,11 +661,17 @@ pub fn scalar_array(
 
 /// Row `r`'s key in a column of scalars of type `ty` an answer holds; none for a NULL.
 pub fn scalar_key_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<i64> {
-    use arrow::array::{Int64Array, UInt32Array, UInt64Array, UInt8Array};
+    use arrow::array::{FixedSizeBinaryArray, Int64Array, UInt32Array, UInt64Array, UInt8Array};
     if a.is_null(r) {
         return None;
     }
     let any = a.as_any();
+    if ty.fixed_bytes().is_some() {
+        return Some(key_of_fixed(
+            ty,
+            any.downcast_ref::<FixedSizeBinaryArray>()?.value(r),
+        ));
+    }
     Some(match ty.unsigned_bits() {
         8 => unsigned_key(u64::from(any.downcast_ref::<UInt8Array>()?.value(r)), 8),
         32 => unsigned_key(u64::from(any.downcast_ref::<UInt32Array>()?.value(r)), 32),
@@ -492,6 +697,8 @@ pub fn field_scalar(f: &arrow::datatypes::Field) -> Option<ColumnType> {
         ColumnType::PgLsn,
         ColumnType::Char,
         ColumnType::Money,
+        ColumnType::Macaddr,
+        ColumnType::Macaddr8,
     ]
     .into_iter()
     .find(|t| t.pg_name() == *named && scalar_arrow(*t) == *f.data_type())
@@ -529,6 +736,8 @@ pub fn is_scalar(ty: ColumnType) -> bool {
             | ColumnType::PgLsn
             | ColumnType::Char
             | ColumnType::Money
+            | ColumnType::Macaddr
+            | ColumnType::Macaddr8
     )
 }
 
@@ -559,6 +768,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_mac_address_is_read_and_written_as_postgresql_reads_and_writes_it() {
+        let mac = |s: &str| {
+            scalar_parse(ColumnType::Macaddr, s).map(|k| scalar_text(ColumnType::Macaddr, k))
+        };
+        for s in [
+            "08:00:2b:01:02:03",
+            "08002b:010203",
+            "08-00-2B-01-02-03",
+            "0800.2b01.0203",
+            "08002b010203",
+            "0800-2b01-0203",
+            " 8:0:2b:1:2:3 ",
+            "0x8:0:2b:1:2:3",
+        ] {
+            assert_eq!(mac(s).unwrap(), "08:00:2b:01:02:03", "{s}");
+        }
+        for s in [
+            "08:00:2b:01:02",
+            "100:00:2b:01:02:03",
+            "08:00:2b:01:02:03x",
+            "-1:0:0:0:0:0",
+            "",
+        ] {
+            assert!(mac(s).is_err(), "{s}");
+        }
+        let mac8 = |s: &str| {
+            scalar_parse(ColumnType::Macaddr8, s).map(|k| scalar_text(ColumnType::Macaddr8, k))
+        };
+        for (s, want) in [
+            ("08002b0102030405", "08:00:2b:01:02:03:04:05"),
+            ("08-00-2b-01-02-03", "08:00:2b:ff:fe:01:02:03"),
+            ("0800.2bff.fe01.0203", "08:00:2b:ff:fe:01:02:03"),
+            (" 08:00:2b:01:02:03:04:05 ", "08:00:2b:01:02:03:04:05"),
+            ("08:00:2b:01:02:03:04:05x", "08:00:2b:01:02:03:04:05"),
+        ] {
+            assert_eq!(mac8(s).unwrap(), want, "{s}");
+        }
+        for s in [
+            "08:00:2b:01:02",
+            "08:00-2b:01:02:03",
+            "08:00:2b:01:02:03:04:05:06",
+            "08:00:2b:01:02:03 x",
+        ] {
+            assert!(mac8(s).is_err(), "{s}");
+        }
+        let six = scalar_parse(ColumnType::Macaddr, "08:00:2b:01:02:03").unwrap();
+        let eight = mac_cast(ColumnType::Macaddr, ColumnType::Macaddr8, six).unwrap();
+        assert_eq!(
+            scalar_text(ColumnType::Macaddr8, eight),
+            "08:00:2b:ff:fe:01:02:03"
+        );
+        assert_eq!(
+            mac_cast(ColumnType::Macaddr8, ColumnType::Macaddr, eight).unwrap(),
+            six
+        );
+        let other = scalar_parse(ColumnType::Macaddr8, "08:00:2b:01:02:03:04:05").unwrap();
+        assert!(mac_cast(ColumnType::Macaddr8, ColumnType::Macaddr, other).is_err());
     }
 
     #[test]

@@ -187,6 +187,12 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             }
             Datum::Int(units as i64)
         }
+        (Macaddr | Macaddr8, Macaddr | Macaddr8) => {
+            let Datum::Int(v) = d else {
+                return Err(refused());
+            };
+            Datum::Int(crate::scalars::mac_cast(from, to, v)?)
+        }
         (Text(_), Char) => {
             let s = text_of(&d, from).unwrap_or_default();
             Datum::Int(crate::scalars::scalar_parse(Char, &s)?)
