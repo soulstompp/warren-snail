@@ -1336,5 +1336,6 @@ mod tests {
         assert!(split_name("  ").is_none());
         assert!(split_name("\"a").is_none());
         assert_eq!(split_name(&"x".repeat(70)).unwrap(), ["x".repeat(63)]);
+        assert_eq!(split_name(&"x".repeat(64)).unwrap(), ["x".repeat(63)]);
     }
 }

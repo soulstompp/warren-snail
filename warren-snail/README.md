@@ -539,8 +539,9 @@ SQL in PostgreSQL's syntax, and the snail reads it as it reads any other questio
 `warren-snail --help` prints each command and its flags.
 
 - `write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
-  [--written <written.parquet>]`: a new snail, where no file is yet. A table given no rows is
-  written empty. `--written` records each order's columns as Parquet.
+  [--release <14..19>] [--written <written.parquet>]`: a new snail, where no file is yet. A table
+  given no rows is written empty. `--release` names the PostgreSQL release the rows' OIDs came
+  from, 19 unless given. `--written` records each order's columns as Parquet.
 - `exec <file> <statements.sql> --out <done.parquet>`: each statement in turn.
 - `read <file> <question.sql> --out <answer.parquet> [--order <name>] [--param <value>]...
   [--rounds <n>] [--hold <MiB>] [--round <round.parquet>]`: the answer as Parquet, and each round.
@@ -573,8 +574,14 @@ Each command exits 0, or prints why it refused and exits 1.
   as PostgreSQL writes them, and a `real` compared with a number written out as a `double
   precision`; `oid`, `xid8` and `pg_lsn`, unsigned; `xid`, compared only by `=` and `<>`, and
   `cid`, only by `=`, neither keying an index; `"char"`, its byte unsigned; `money`, its cents,
-  under the C locale; `macaddr` and `macaddr8`, compared byte by byte. Each is read and written in
-  PostgreSQL's own spellings, assigned from another type as PostgreSQL's casts take it.
+  under the C locale, which the file records for each money column; `macaddr` and `macaddr8`,
+  compared byte by byte; `oid8`, unsigned in 64 bits; and the reg* types, `regclass`, `regtype`,
+  `regproc`, `regprocedure`, `regoper`, `regoperator`, `regnamespace`, `regrole`,
+  `regcollation`, `regconfig`, `regdictionary` and, from PostgreSQL 19, `regdatabase`, each an oid
+  compared as one, written and read as the name of a built-in object of the release the file's
+  OIDs came from, which the snail carries for 14 to 19, and any other OID, every role's among
+  them, bare. Each is read and written in PostgreSQL's own spellings, assigned from another type
+  as PostgreSQL's casts take it.
 - `CREATE INDEX`, a B-tree, its key on columns, on an instant's month,
   `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
   `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is
@@ -594,7 +601,7 @@ Each command exits 0, or prints why it refused and exits 1.
   value by `=`, `<>`, `<`, `<=`, `>` or `>=`, or a boolean column alone, under `NOT`, or under `IS
   [NOT] TRUE`, `IS [NOT] FALSE` or `IS [NOT] UNKNOWN`, or a column under `IS NULL` or `IS NOT
   NULL`; `count(*)`; `sum` of an integer, numeric, money or float column; `min` and `max` of a
-  column with a B-tree, a `"char"`'s by its text; `avg` of a float column;
+  column with a B-tree, a `"char"`'s by its text, a reg* type's an oid; `avg` of a float column;
   `GROUP BY`; `ORDER BY`. A join reads the table its own conditions narrow first, then keeps the
   other to the keys the first holds.
 - **A pipeline,** a question with a `WITH` or a window: steps over one table and the steps before
