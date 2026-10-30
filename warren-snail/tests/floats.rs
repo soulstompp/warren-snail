@@ -208,6 +208,19 @@ fn a_pipeline_reads_a_float_s_operators_and_casts_as_postgresql_does() {
         )),
         [Some("2".into())]
     );
+    // A float rounds half to even into an integer.
+    assert_eq!(
+        texts(&format!(
+            "{step} SELECT CAST(d + 1 AS integer)::text AS x, n FROM t WHERE n = 8"
+        )),
+        [Some("2".into())]
+    );
+    assert_eq!(
+        texts(&format!(
+            "{step} SELECT avg(d)::text AS x FROM t WHERE n = 1 OR n = 8"
+        )),
+        [Some("0.8".into())]
+    );
     for q in [
         format!("{step} SELECT r * '3e38' AS x FROM t WHERE n = 8"),
         format!("{step} SELECT d / 0 AS x FROM t WHERE n = 1"),
@@ -244,4 +257,34 @@ fn a_float_goes_out_as_its_own_bits_and_comes_back() {
         .ask("SELECT f.n FROM s.f f WHERE f.r = '1e-45'", None)
         .unwrap();
     assert_eq!(ns(&b), [9]);
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_float_sum_finite_numbers_make_infinite_is_refused() {
+    let path = tmp("floats-over.snail");
+    let catalog =
+        Catalog::parse("CREATE TABLE s.g (n integer NOT NULL, r real, PRIMARY KEY (n));").unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.g (n, r) VALUES (1, '3e38'), (2, '3e38'), (3, '-1')")
+        .unwrap();
+    assert!(w.ask("SELECT sum(g.r) FROM s.g g", None).is_err());
+    assert!(w
+        .ask(
+            "WITH t AS (SELECT n, r FROM s.g) SELECT sum(r) AS x FROM t",
+            None
+        )
+        .is_err());
+    let (b, _) = w
+        .ask("SELECT sum(g.r) FROM s.g g WHERE g.n > 1", None)
+        .unwrap();
+    assert_eq!(
+        b.column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0),
+        3e38f32 - 1.0
+    );
 }

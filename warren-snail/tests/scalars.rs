@@ -179,6 +179,8 @@ fn the_scalars_are_compared_ordered_grouped_and_summed_as_postgresql_does() {
     );
     for q in [
         "SELECT k.n FROM s.k k WHERE k.x < '5'",
+        "SELECT k.n FROM s.k k WHERE -1 = k.x",
+        "SELECT k.n, k.x FROM s.k k ORDER BY k.x",
         "SELECT k.n FROM s.k k WHERE k.c <> '5'",
         "SELECT k.n FROM s.k k WHERE k.c = 5",
         "SELECT k.n FROM s.k k WHERE k.m = 1",
@@ -411,7 +413,7 @@ fn a_mac_address_is_held_in_its_bytes_compared_as_them_and_goes_out_as_them() {
     w.execute(
         "INSERT INTO s.m (n, a, b) VALUES (1, '08:00:2b:01:02:03', '08:00:2b:01:02:03'), \
          (2, 'ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00:00:01'), (3, '80:00:00:00:00:00', NULL), \
-         (4, '00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff:ff:ff')",
+         (4, '00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff:ff:ff'), (5, NULL, NULL)",
     )
     .unwrap();
     // Compared byte by byte: a first byte past 127 sorts after one below it.
@@ -458,5 +460,14 @@ fn a_mac_address_is_held_in_its_bytes_compared_as_them_and_goes_out_as_them() {
         weather::texts(b.column(0).as_ref())[0].as_deref(),
         Some("80:00:00:ff:fe:00:00:00")
     );
+    // An operator over a NULL is NULL.
+    let (b, _) = w
+        .ask(
+            "WITH t AS (SELECT n, a FROM s.m) SELECT (a & 'ff:ff:ff:00:00:00')::text AS x, n FROM t \
+             ORDER BY n",
+            None,
+        )
+        .unwrap();
+    assert_eq!(weather::texts(b.column(0).as_ref())[4], None);
     assert!(w.ask("SELECT min(m.a) FROM s.m m", None).is_err());
 }
