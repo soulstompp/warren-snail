@@ -510,3 +510,28 @@ fn now_reads_the_transaction_s_clock_and_statement_timestamp_the_statement_s() {
         "statement_timestamp() is each statement's: {st:?}"
     );
 }
+
+#[test]
+fn a_census_counts_the_page_that_holds_the_sequences() {
+    // A copy of a snail, a table with an identity declared on it and one row inserted: the root now
+    // names where its sequence stands, and every page of the file is named or free, once.
+    let path = made(
+        "census-sequences",
+        "CREATE TABLE s.k (id integer NOT NULL, PRIMARY KEY (id));",
+    );
+    let copy = tmp("census-sequences-copy.snail");
+    std::fs::copy(&path, &copy).unwrap();
+    let mut w = Snail::open_writing(&copy).unwrap();
+    run(
+        &mut w,
+        "CREATE TABLE s.t (id integer GENERATED ALWAYS AS IDENTITY, v text, PRIMARY KEY (id))",
+    );
+    run(&mut w, "INSERT INTO s.t (v) VALUES ('a')");
+    drop(w);
+    let s = Snail::open(&copy).unwrap();
+    assert!(!s.sequences().unwrap().is_empty());
+    let census = s
+        .census()
+        .unwrap_or_else(|e| panic!("the census of a file holding a sequence: {e}"));
+    assert!(census.named > 0, "{census:?}");
+}

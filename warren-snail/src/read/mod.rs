@@ -1322,6 +1322,10 @@ impl Snail {
             Ok(())
         };
         mark(self.root.catalog, 1)?;
+        // Where the sequences stand, once one has handed out a value.
+        if self.root.sequences.bytes > 0 {
+            mark(self.root.sequences, 1)?;
+        }
         // Each page of packed page maps: how many maps it holds, and how many entries name one.
         let mut shared: std::collections::BTreeMap<u64, (u32, u32)> = Default::default();
         for table in &self.catalog.tables {
