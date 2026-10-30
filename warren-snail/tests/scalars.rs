@@ -288,6 +288,7 @@ fn a_pipeline_reads_the_scalars_and_their_operators_as_postgresql_does() {
     for q in [
         format!("{step} SELECT m + 1 AS v FROM t"),
         format!("{step} SELECT x AS v FROM t ORDER BY x"),
+        format!("{step} SELECT n FROM t WHERE x < '5'"),
         format!("{step} SELECT max(x) AS v FROM t"),
         format!("{step} SELECT sum(o) AS v FROM t"),
         format!("{step} SELECT m + m AS v FROM t WHERE n = 2"),

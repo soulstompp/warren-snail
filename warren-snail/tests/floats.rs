@@ -224,6 +224,8 @@ fn a_pipeline_reads_a_float_s_operators_and_casts_as_postgresql_does() {
     for q in [
         format!("{step} SELECT r * '3e38' AS x FROM t WHERE n = 8"),
         format!("{step} SELECT d / 0 AS x FROM t WHERE n = 1"),
+        // Zero over zero is refused as a division by zero, not taken as NaN.
+        format!("{step} SELECT d / 0 AS x FROM t WHERE n = 3"),
         format!("{step} SELECT d * 1e-320 AS x FROM t WHERE n = 9"),
         format!("{step} SELECT CAST(d AS real) AS x FROM t WHERE n = 9"),
         format!("{step} SELECT CAST(d AS integer) AS x FROM t WHERE n = 4"),
