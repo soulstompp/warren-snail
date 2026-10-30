@@ -1060,3 +1060,23 @@ fn a_bit_string_shared_by_two_rows_of_a_unique_key_is_named_by_its_bits() {
     .to_string();
     assert!(e.contains("['10100']"), "{e}");
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_bpchar_written_is_keyed_on_its_class_so_a_unique_key_refuses_its_twin_of_other_blanks() {
+    let path = tmp("bpchar-unique.snail");
+    let ddl = "CREATE TABLE s.u (id integer NOT NULL, c character(3) NOT NULL, PRIMARY KEY (id)); \
+               CREATE UNIQUE INDEX u_c ON s.u (c);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.u (id, c) VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    assert!(w
+        .execute("INSERT INTO s.u (id, c) VALUES (3, 'a ')")
+        .is_err());
+    w.execute("DELETE FROM s.u WHERE c = 'a'").unwrap();
+    let (b, _) = w
+        .ask("SELECT t.id FROM s.u t ORDER BY t.id", Some("u_c"))
+        .unwrap();
+    assert_eq!(ids(&b), [2]);
+}
