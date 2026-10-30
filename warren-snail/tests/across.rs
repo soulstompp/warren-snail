@@ -500,33 +500,50 @@ mod written {
     }
 
     #[test]
-    fn a_root_torn_after_the_deciding_root_is_written_again_from_the_root_that_carries_it() {
-        use std::os::unix::fs::FileExt;
+    fn a_root_torn_after_the_deciding_root_leaves_its_pending_copy_and_a_writer_alone_all() {
         let s = sample(5_000);
         let split = split("across-torn", &s);
-        let r0 = alone_count(&split.readings, ALL_READINGS);
-        let at = Snail::open(&split.readings).unwrap().generation();
+        let (n0, r0) = (
+            alone_count(&split.stations, ALL_STATIONS),
+            alone_count(&split.readings, ALL_READINGS),
+        );
         {
             let mut w = Snails::open_writing(&paths(&split)).unwrap();
+            // A first transaction lands whole: the readings' root lies over its parent.
             w.execute("BEGIN").unwrap();
             w.execute(&station(9650, 1)).unwrap();
-            w.execute(&reading(9_000_031, 9650, 1)).unwrap();
-            w.stop_at(Some(StopAcross::AfterDecision));
-            w.execute("COMMIT").unwrap_err();
+            w.execute(&reading(9_000_030, 9650, 1)).unwrap();
+            w.execute("COMMIT").unwrap();
+            // The second is decided, and the readings' root torn as it is written over its parent.
+            w.execute("BEGIN").unwrap();
+            w.execute(&station(9650, 2)).unwrap();
+            w.execute(&reading(9_000_031, 9650, 2)).unwrap();
+            w.stop_at(Some(StopAcross::HalfFinal));
+            let e = w.execute("COMMIT").unwrap_err().to_string();
+            assert!(e.contains("stopped halfway through a root"), "{e}");
         }
-        // The readings' root, torn as it was written over its pending copy: nothing lies beside
-        // its root, and it reads as it stood.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&split.readings)
+        // Its pending copy, whole beside the torn one, is its root, so read alone the readings hold
+        // the transaction's reading.
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0 + 2);
+        // A writer of it alone writes on from that root, its root into the torn copy, never over
+        // the pending copy it begins from: torn again, the root stands.
+        let mut alone = Snail::open_writing(&split.readings).unwrap();
+        alone.stop_at(Some(warren_snail::file::Stop::HalfRoot));
+        alone.execute(&reading(9_000_032, 9650, 2)).unwrap_err();
+        drop(alone);
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0 + 2);
+        Snail::open_writing(&split.readings)
             .unwrap()
-            .write_all_at(&[0u8; 2048], ((at + 1) % 2) * 4096)
+            .execute(&reading(9_000_032, 9650, 2))
             .unwrap();
-        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0);
-        // The stations' root carries it whole: the round across reads it, a writer writes it.
-        assert_eq!(count_of(&mut together(&split), &joined(9650, 1)), 1);
+        // The round across both: all of each transaction, as PostgreSQL commits them.
+        let mut across = together(&split);
+        assert_eq!(count_of(&mut across, &joined(9650, 1)), 1);
+        assert_eq!(count_of(&mut across, &joined(9650, 2)), 2);
+        assert_eq!(count_of(&mut across, ALL_STATIONS), n0 + 2);
+        assert_eq!(count_of(&mut across, ALL_READINGS), r0 + 3);
         drop(Snails::open_writing(&paths(&split)).unwrap());
-        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0 + 1);
+        assert_eq!(count_of(&mut together(&split), &joined(9650, 2)), 2);
         for p in paths(&split) {
             Snail::open(p).unwrap().census().unwrap();
         }

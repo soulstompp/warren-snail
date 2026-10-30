@@ -1330,7 +1330,8 @@ impl Snail {
     /// The commit, at the root's turn: it begins from the newest root.
     fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
         let mut root = self.commit_pages(w, &[])?;
-        w.commit(&mut root)?;
+        // The root goes into the copy that does not hold the root it begins from.
+        w.commit_into(&mut root, 1 - self.reader.root_copy())?;
         Ok(root)
     }
 

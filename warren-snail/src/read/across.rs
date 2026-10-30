@@ -22,14 +22,15 @@ use arrow::array::RecordBatch;
 use std::path::Path;
 
 /// Where a commit across snails stops short, for the tests of a crash: with every other snail's root
-/// written as a pending copy, before the deciding root; or after the deciding root, before the
-/// others' roots are taken.
+/// written as a pending copy, before the deciding root; after the deciding root, before the others'
+/// roots are taken; or halfway through the first other snail's root.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StopAcross {
     BeforeDecision,
     AfterDecision,
+    HalfFinal,
 }
 
 /// What the writer of snails opened together shares among them, so that a writer waiting for a
@@ -550,11 +551,12 @@ impl Snails {
                     .is_some_and(|p| self.holder(&p.decider).is_some())
             });
             let s = &mut self.snails[i];
-            let format = s.reader.format();
+            let (format, parent) = (s.reader.format(), s.reader.root_copy());
             let w = s.writer.as_mut().expect("a snail open to write");
+            // A root owed goes over its parent, never over its pending copy.
             match (owed, void) {
-                (Some(root), _) => w.write_root(root.generation, &root.encode(format)?)?,
-                (None, Some(copy)) => w.write_root(copy.generation, &[0u8; PAGE])?,
+                (Some(root), _) => w.write_copy(parent, &root.encode(format)?)?,
+                (None, Some(_)) => w.write_copy(1 - parent, &[0u8; PAGE])?,
                 (None, None) => {}
             }
         }
@@ -969,10 +971,15 @@ impl Snails {
             }
             Ok(landed)
         };
+        // Each snail's root goes into the copies around the one its parent lies in: a pending
+        // copy, and the deciding root, into the other; another snail's root, once decided, over its
+        // parent, never over its pending copy.
+        let mut parents: Vec<u64> = Vec::with_capacity(written.len());
         for &i in &written[1..] {
             let landed = landed_in(self, i)?;
             let w = writers[i].as_mut().unwrap();
             let mut root = self.snails[i].commit_pages(w, &landed)?;
+            parents.push(self.snails[i].reader.root_copy());
             bytes.push(w.prepare(&mut root)?);
             roots.push(root);
         }
@@ -993,10 +1000,10 @@ impl Snails {
         ));
         let w = writers[d].as_mut().unwrap();
         let mut root = self.snails[d].commit_pages(w, &landed)?;
+        let parent = self.snails[d].reader.root_copy();
         let at = root.generation;
         let decision = w.prepare(&mut root)?;
         // Each other snail's root, first as a pending copy beside its root.
-        let mut pending = Vec::new();
         for (k, &i) in written[1..].iter().enumerate() {
             let mut copy = roots[k].clone();
             copy.pending = Some(Pending {
@@ -1007,20 +1014,23 @@ impl Snails {
             let w = writers[i].as_mut().unwrap();
             let wrote = copy
                 .encode(format)
-                .and_then(|b| w.write_root(copy.generation, &b));
+                .and_then(|b| w.write_copy(1 - parents[k], &b));
             if let Err(e) = wrote {
-                Snails::let_go(&written[1..k + 2], &roots, writers);
+                Snails::let_go(&written[1..k + 2], &parents, writers);
                 return Err(e);
             }
-            pending.push(i);
         }
         if self.stop == Some(StopAcross::BeforeDecision) {
             return Err(Error::new(
                 "the commit across snails stopped before the deciding root",
             ));
         }
-        if let Err(e) = writers[d].as_mut().unwrap().write_root(at, &decision) {
-            Snails::let_go(&written[1..], &roots, writers);
+        if let Err(e) = writers[d]
+            .as_mut()
+            .unwrap()
+            .write_copy(1 - parent, &decision)
+        {
+            Snails::let_go(&written[1..], &parents, writers);
             return Err(e);
         }
         if self.stop == Some(StopAcross::AfterDecision) {
@@ -1029,17 +1039,21 @@ impl Snails {
             ));
         }
         for (k, &i) in written[1..].iter().enumerate() {
-            writers[i]
-                .as_mut()
-                .unwrap()
-                .write_root(roots[k].generation, &bytes[k])
-                .map_err(|e| {
-                    Error::new(format!(
-                        "the transaction across snails is committed, and {}'s root was not \
-                         written: a round across them writes it ({e})",
-                        self.paths[i].display()
-                    ))
-                })?;
+            let over = parents[k];
+            let w = writers[i].as_mut().unwrap();
+            if self.stop == Some(StopAcross::HalfFinal) {
+                w.write_copy(over, &bytes[k][..bytes[k].len() / 2])?;
+                return Err(Error::new(
+                    "the commit across snails stopped halfway through a root after the deciding root",
+                ));
+            }
+            w.write_copy(over, &bytes[k]).map_err(|e| {
+                Error::new(format!(
+                    "the transaction across snails is committed, and {}'s root was not \
+                     written: a round across them writes it ({e})",
+                    self.paths[i].display()
+                ))
+            })?;
         }
         let mut out = Vec::with_capacity(written.len());
         out.push(root);
@@ -1047,11 +1061,12 @@ impl Snails {
         Ok(out)
     }
 
-    /// Lets go of the pending copies a commit across snails wrote before its deciding root.
-    fn let_go(of: &[usize], roots: &[Root], writers: &mut [Option<Writer>]) {
+    /// Lets go of the pending copies a commit across snails wrote before its deciding root, each
+    /// beside its snail's root in `parents`.
+    fn let_go(of: &[usize], parents: &[u64], writers: &mut [Option<Writer>]) {
         for (k, &i) in of.iter().enumerate() {
             if let Some(w) = writers[i].as_mut() {
-                let _ = w.write_root(roots[k].generation, &[0u8; PAGE]);
+                let _ = w.write_copy(1 - parents[k], &[0u8; PAGE]);
             }
         }
     }

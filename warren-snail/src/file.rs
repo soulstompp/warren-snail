@@ -923,6 +923,8 @@ pub struct Reader {
     /// The pending copy of the root the reader last found beside it, written before another
     /// snail's root decided its transaction.
     spare: RefCell<Option<Root>>,
+    /// Which of the root's two copies the root last read lies in.
+    copy: Cell<u64>,
     #[cfg(feature = "standalone")]
     held: RefCell<Held>,
     #[cfg(feature = "standalone")]
@@ -941,6 +943,7 @@ impl Reader {
             round: Cell::new(None),
             staged: Default::default(),
             spare: RefCell::new(None),
+            copy: Cell::new(0),
             #[cfg(feature = "standalone")]
             held: RefCell::new(Held::new(0)),
             #[cfg(feature = "standalone")]
@@ -1121,7 +1124,7 @@ impl Reader {
     pub fn root(&self) -> Result<Root> {
         let from = self.round.get().unwrap_or(0);
         crate::lock::hold_generations_from(&self.files.first, from)?;
-        let (root, format, spare) = copies(&self.read(0, 2)?)?;
+        let (root, format, spare, copy) = copies(&self.read(0, 2)?)?;
         self.files.span.set(root.span);
         self.files.format.set(format);
         crate::lock::keep_generation(&self.files.first, from, root.generation)?;
@@ -1129,6 +1132,7 @@ impl Reader {
         self.forget_reused(&root);
         self.generation.set(root.generation);
         *self.spare.borrow_mut() = spare;
+        self.copy.set(copy);
         Ok(root)
     }
 
@@ -1136,12 +1140,18 @@ impl Reader {
     /// The round holds the generation it held, older, so no page the newest root names is freed while
     /// the reader reads it.
     pub fn peek_root(&self) -> Result<Root> {
-        let (root, format, spare) = copies(&self.read(0, 2)?)?;
+        let (root, format, spare, copy) = copies(&self.read(0, 2)?)?;
         self.files.span.set(root.span);
         self.files.format.set(format);
         self.forget_reused(&root);
         *self.spare.borrow_mut() = spare;
+        self.copy.set(copy);
         Ok(root)
+    }
+
+    /// The copy, 0 or 1, of the root's two that the root last read lies in.
+    pub(crate) fn root_copy(&self) -> u64 {
+        self.copy.get()
     }
 
     /// The pending copy of the root found beside the root last read, if there was one.
@@ -1199,44 +1209,50 @@ impl Reader {
 /// format. A file whose root names a format this build does not read is refused by that format. A
 /// pending copy is never taken.
 pub(crate) fn newer(both: &[u8]) -> Result<(Root, u32)> {
-    copies(both).map(|(root, format, _)| (root, format))
+    copies(both).map(|(root, format, _, _)| (root, format))
 }
 
-/// `newer`, and the other copy where it is a pending one, written for the generation after it.
-pub(crate) fn copies(both: &[u8]) -> Result<(Root, u32, Option<Root>)> {
-    let taken = |r: Option<(Root, u32)>| r.filter(|(r, _)| r.pending.is_none());
-    let (a, b) = (Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..]));
-    let (root, format) = newest(taken(a.clone()), taken(b.clone()), both)?;
-    let pending = [a, b]
-        .into_iter()
-        .flatten()
-        .map(|(r, _)| r)
-        .find(|r| r.pending.is_some() && r.generation == root.generation + 1);
-    Ok((root, format, pending))
-}
-
-fn newest(a: Option<(Root, u32)>, b: Option<(Root, u32)>, both: &[u8]) -> Result<(Root, u32)> {
-    match (a, b) {
-        (Some(a), Some(b)) => Ok(if a.0.generation >= b.0.generation {
-            a
-        } else {
-            b
-        }),
-        (Some(r), None) | (None, Some(r)) => Ok(r),
-        (None, None) => {
-            for copy in [&both[..PAGE], &both[PAGE..]] {
-                if copy[..8] == MAGIC {
-                    let format = u32::from_le_bytes(copy[8..12].try_into().unwrap());
-                    if !reads(format) {
-                        return Err(Error::new(format!(
-                            "the snail is of format {format}, and this warren-snail reads formats {FORMAT_SEVEN}, {FORMAT_EIGHT} and {FORMAT}"
-                        )));
-                    }
-                }
+/// `newer`, the copy of the two it lies in, and the other copy where it is a pending one, written
+/// for the generation after it. Where the only whole copy is a pending one, it is the root: the
+/// copy beside a pending copy is written only once the pending copy's transaction is decided, so
+/// one torn there was its root's last write.
+pub(crate) fn copies(both: &[u8]) -> Result<(Root, u32, Option<Root>, u64)> {
+    let decoded = [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])];
+    let taken = (0..2u64)
+        .filter_map(|c| {
+            decoded[c as usize]
+                .as_ref()
+                .filter(|(r, _)| r.pending.is_none())
+                .map(|d| (c, d))
+        })
+        .max_by_key(|(c, (r, _))| (r.generation, std::cmp::Reverse(*c)));
+    if let Some((copy, (root, format))) = taken {
+        let pending = decoded
+            .iter()
+            .flatten()
+            .map(|(r, _)| r)
+            .find(|r| r.pending.is_some() && r.generation == root.generation + 1)
+            .cloned();
+        return Ok((root.clone(), *format, pending, copy));
+    }
+    if let Some((copy, (root, format))) =
+        (0..2u64).find_map(|c| decoded[c as usize].as_ref().map(|d| (c, d)))
+    {
+        let mut root = root.clone();
+        root.pending = None;
+        return Ok((root, *format, None, copy));
+    }
+    for copy in [&both[..PAGE], &both[PAGE..]] {
+        if copy[..8] == MAGIC {
+            let format = u32::from_le_bytes(copy[8..12].try_into().unwrap());
+            if !reads(format) {
+                return Err(Error::new(format!(
+                    "the snail is of format {format}, and this warren-snail reads formats {FORMAT_SEVEN}, {FORMAT_EIGHT} and {FORMAT}"
+                )));
             }
-            Err(Error::new("neither copy of the root is whole"))
         }
     }
+    Err(Error::new("neither copy of the root is whole"))
 }
 
 /// Where a commit stops short, for the tests of a crash: before the root, or halfway through it.
@@ -1469,6 +1485,12 @@ impl Writer {
     /// names. Where a host carries the commits, the commit is handed to it once its pages are on
     /// the disk, and its root is written only once the host returns.
     pub fn commit(&mut self, root: &mut Root) -> Result<()> {
+        self.commit_into(root, root.generation % 2)
+    }
+
+    /// The commit, its root written to `copy`, 0 or 1, of the root's two: the one that does not
+    /// hold the root it begins from.
+    pub(crate) fn commit_into(&mut self, root: &mut Root, copy: u64) -> Result<()> {
         let bytes = self.prepare(root)?;
         if let Some(host) = self.host.as_mut() {
             let pages = std::mem::take(&mut self.carried);
@@ -1482,16 +1504,15 @@ impl Writer {
         match self.stop {
             Some(Stop::BeforeRoot) => return Err(Error::new("the commit stopped before the root")),
             Some(Stop::HalfRoot) => {
-                self.files.first.write_all_at(
-                    &bytes[..bytes.len() / 2],
-                    (root.generation % 2) * PAGE as u64,
-                )?;
+                self.files
+                    .first
+                    .write_all_at(&bytes[..bytes.len() / 2], copy * PAGE as u64)?;
                 self.written += 1;
                 return Err(Error::new("the commit stopped halfway through the root"));
             }
             None => {}
         }
-        self.write_root(root.generation, &bytes)
+        self.write_copy(copy, &bytes)
     }
 
     /// A commit's pages on the disk, and its root's bytes: the commit but its root.
@@ -1502,9 +1523,9 @@ impl Writer {
         root.encode(self.files.format.get())
     }
 
-    /// A root's bytes written to the copy its generation names, and on the disk.
-    pub(crate) fn write_root(&mut self, generation: u64, bytes: &[u8]) -> Result<()> {
-        self.write_at(generation % 2, bytes)?;
+    /// A root's bytes written to `copy`, 0 or 1, of the root's two, and on the disk.
+    pub(crate) fn write_copy(&mut self, copy: u64, bytes: &[u8]) -> Result<()> {
+        self.write_at(copy, bytes)?;
         self.carried.clear();
         self.files.sync()
     }
@@ -1624,6 +1645,12 @@ mod tests {
         assert!(Root::decode(&a).is_none());
     }
 
+    fn landed_of(pending: &Root) -> Root {
+        let mut r = pending.clone();
+        r.pending = None;
+        r
+    }
+
     #[test]
     fn a_pending_copy_of_the_root_is_never_taken_and_is_found_beside_the_root() {
         let page = |r: &Root| {
@@ -1660,9 +1687,19 @@ mod tests {
         // The copies lie at their generations' places: the pending one, newer, is not taken.
         let mut both = page(&root);
         both.extend_from_slice(&page(&pending));
-        let (taken, _, spare) = copies(&both).unwrap();
+        let (taken, _, spare, copy) = copies(&both).unwrap();
         assert_eq!((taken.generation, &taken.decided), (4, &root.decided));
-        assert_eq!(spare.map(|s| s.generation), Some(5));
+        assert_eq!((spare.map(|s| s.generation), copy), (Some(5), 0));
+        // Its root, written over its parent after its transaction is decided, torn: the pending
+        // copy is the root, taken.
+        let mut torn = page(&landed_of(&pending));
+        torn[20] ^= 1;
+        torn.extend_from_slice(&page(&pending));
+        let (taken, _, spare, copy) = copies(&torn).unwrap();
+        assert_eq!(
+            (taken.generation, taken.pending, spare.is_none(), copy),
+            (5, None, true, 1)
+        );
         // Taken, it is the root it was written for: its checksum leaves the mark out.
         let mut landed = pending.clone();
         landed.pending = None;
@@ -1671,10 +1708,11 @@ mod tests {
             pending.crc(FORMAT).unwrap().to_le_bytes(),
             bytes[bytes.len() - 4..]
         );
-        let mut both = page(&root);
-        both.extend_from_slice(&page(&landed));
-        let (taken, _, spare) = copies(&both).unwrap();
-        assert_eq!((taken.generation, spare.is_none()), (5, true));
+        // Written over its parent, it is taken, and the pending copy beside it is no longer one.
+        let mut both = page(&landed);
+        both.extend_from_slice(&page(&pending));
+        let (taken, _, spare, copy) = copies(&both).unwrap();
+        assert_eq!((taken.generation, spare.is_none(), copy), (5, true, 0));
         // A copy pending beside an older root than its own parent is no pending copy of it.
         let mut both = page(&Root {
             generation: 3,
