@@ -3858,7 +3858,16 @@ mod tests {
             "ERROR: timestamp out of range: \"294277-01-01 00:00:00+00\""
         );
         assert!(tstz("2024-03-05 13:04 EST").contains("abbreviation \"est\" is not read"));
-        assert!(tstz("2024-03-05 13:04 America/New_York").contains("zones"));
+        let named = tstz("2024-03-05 13:04 America/New_York");
+        #[cfg(not(feature = "zones"))]
+        assert!(named.contains("zones"), "{named}");
+        // Under zones, read by the zone's rules where the directory holds it: then New York kept
+        // standard time, five hours west.
+        #[cfg(feature = "zones")]
+        assert!(
+            named == "2024-03-05 18:04:00+00" || named.contains("not recognized"),
+            "{named}"
+        );
         assert_eq!(ts("2024-03-05 13:04:05+02"), "2024-03-05 13:04:05");
     }
 
