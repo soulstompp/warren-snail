@@ -563,6 +563,10 @@ pub fn scalar_in(ty: ColumnType, s: &str) -> Result<Datum> {
             _ => Datum::Compound(Arc::new(Compound::new(ty, text_in(ty, s)?))),
         },
         // A time type held as a group of leaves waits on composed values of such leaves.
+        // A type held as its text, by its input; aclitem's three leaves are a group.
+        ColumnType::Textual(t) if t != crate::textual::Textual::Aclitem => {
+            Datum::Text(crate::textual::text_in(t, s)?)
+        }
         ColumnType::Timetz(_) | ColumnType::Interval { .. } => {
             return Err(Error::new(format!(
                 "{} is not read as a part of a composed value: it is held as a group of leaves",
@@ -584,6 +588,7 @@ pub fn scalar_out(ty: ColumnType, d: &Datum) -> String {
     match (ty, d) {
         (_, Datum::Compound(c)) => text_out(ty, &c.item),
         (ColumnType::Boolean, Datum::Int(v)) => if *v != 0 { "t" } else { "f" }.into(),
+        (ColumnType::Textual(t), Datum::Text(s)) => crate::textual::text_out(t, s).into_owned(),
         (ColumnType::Composed(r), Datum::Int(k)) => match r.def() {
             Composed::Enum { labels, .. } => labels[*k as usize].clone(),
             _ => k.to_string(),
@@ -2459,7 +2464,8 @@ fn leaf_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
         ColumnType::Text(_)
         | ColumnType::Bpchar(_)
         | ColumnType::Name
-        | ColumnType::NumericText(_) => A::Utf8,
+        | ColumnType::NumericText(_)
+        | ColumnType::Textual(_) => A::Utf8,
         ColumnType::Bytes | ColumnType::Composed(_) => A::Binary,
         ColumnType::Numeric { precision, scale } => A::Decimal128(precision, scale as i8),
         ColumnType::Uuid => A::FixedSizeBinary(16),
@@ -2655,7 +2661,8 @@ fn leaf_array(ty: ColumnType, values: Vec<Option<&Datum>>) -> Result<arrow::arra
         ColumnType::Text(_)
         | ColumnType::Bpchar(_)
         | ColumnType::Name
-        | ColumnType::NumericText(_) => Arc::new(
+        | ColumnType::NumericText(_)
+        | ColumnType::Textual(_) => Arc::new(
             values
                 .iter()
                 .map(|d| match d {
@@ -2736,7 +2743,8 @@ fn leaf_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<Datu
         ColumnType::Text(_)
         | ColumnType::Bpchar(_)
         | ColumnType::Name
-        | ColumnType::NumericText(_) => {
+        | ColumnType::NumericText(_)
+        | ColumnType::Textual(_) => {
             Datum::Text(any.downcast_ref::<StringArray>()?.value(r).to_string())
         }
         ColumnType::Bytes => Datum::Bytes(any.downcast_ref::<BinaryArray>()?.value(r).to_vec()),

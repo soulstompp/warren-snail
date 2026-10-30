@@ -2513,18 +2513,20 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 _ => {}
             }
             let x = ev(left)?;
-            // An ARRAY of values beside a json document, as the text of a text[].
+            // An ARRAY of values beside a json document, or a NULL, as the text of a text[].
             let y = match right.as_ref() {
                 Expr::Array(a)
-                    if matches!(
-                        x,
-                        Value::Typed(
-                            ColumnType::Textual(
-                                crate::textual::Textual::Json | crate::textual::Textual::Jsonb
-                            ),
-                            _
-                        )
-                    ) =>
+                    if x.is_null()
+                        && matches!(op.to_string().as_str(), "#>" | "#>>" | "?|" | "?&" | "#-")
+                        || matches!(
+                            x,
+                            Value::Typed(
+                                ColumnType::Textual(
+                                    crate::textual::Textual::Json | crate::textual::Textual::Jsonb
+                                ),
+                                _
+                            )
+                        ) =>
                 {
                     Value::Text(crate::textual::text_array_out(
                         &a.elem
