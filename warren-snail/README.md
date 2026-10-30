@@ -568,7 +568,13 @@ Each command exits 0, or prints why it refused and exits 1.
   64-bit integer of its smallest unit; `text` and `varchar(n)`, compared by their bytes; `bytea`;
   `timestamptz`, as microseconds on UTC's clock, its infinities among them; `boolean`, false
   before true, written in any of PostgreSQL's spellings of it; `uuid`, its 16 bytes compared byte
-  by byte, written in any of PostgreSQL's spellings of it.
+  by byte, written in any of PostgreSQL's spellings of it; `real` and `double precision`, each
+  value kept as its own bits, `-0` equal to `0` and every NaN equal and above `Infinity`, written
+  as PostgreSQL writes them, and a `real` compared with a number written out as a `double
+  precision`; `oid`, `xid8` and `pg_lsn`, unsigned; `xid`, compared only by `=` and `<>`, and
+  `cid`, only by `=`, neither keying an index; `"char"`, its byte unsigned; `money`, its cents,
+  under the C locale; `macaddr` and `macaddr8`, compared byte by byte. Each is read and written in
+  PostgreSQL's own spellings, assigned from another type as PostgreSQL's casts take it.
 - `CREATE INDEX`, a B-tree, its key on columns, on an instant's month,
   `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
   `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is
@@ -587,13 +593,16 @@ Each command exits 0, or prints why it refused and exits 1.
   conditions joined by `AND`, each a column, or an instant's month on the clock, compared with a
   value by `=`, `<>`, `<`, `<=`, `>` or `>=`, or a boolean column alone, under `NOT`, or under `IS
   [NOT] TRUE`, `IS [NOT] FALSE` or `IS [NOT] UNKNOWN`, or a column under `IS NULL` or `IS NOT
-  NULL`; `count(*)`, and `sum` of an integer or numeric column;
+  NULL`; `count(*)`; `sum` of an integer, numeric, money or float column; `min` and `max` of a
+  column with a B-tree, a `"char"`'s by its text; `avg` of a float column;
   `GROUP BY`; `ORDER BY`. A join reads the table its own conditions narrow first, then keeps the
   other to the keys the first holds.
 - **A pipeline,** a question with a `WITH` or a window: steps over one table and the steps before
   them, joined by `CROSS JOIN`; the windows `lag`, `sum`, `count` and `row_number`; the aggregates
-  `count`, `sum`, `min`, `max`, `bool_and` and `bool_or`; `CASE`, `mod`, `abs`, casts, comparisons
-  and `IS [NOT] DISTINCT FROM`; parameters `$1` and on.
+  `count`, `sum`, `min`, `max`, `avg` of a float, `bool_and` and `bool_or`; `CASE`, `mod`, `abs`,
+  casts, comparisons and `IS [NOT] DISTINCT FROM`; the arithmetic of floats and of money, a
+  `pg_lsn` less another or a number of bytes, and `&`, `|` and `~` on a MAC address; parameters
+  `$1` and on.
 - **A statement:** as `exec` above.
 
 Anything else is refused, with a sentence that says what is not read. A statement sqlparser reads
