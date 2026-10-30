@@ -175,6 +175,34 @@ fn no_comparison_matches_a_null() {
 }
 
 #[test]
+fn a_count_under_a_comparison_every_value_of_a_block_passes_is_taken_from_its_counts() {
+    // Along the key, every block holds b's NULLs beside values from -500 to 499.
+    let mut s = Snail::open(&written("null-compared-counted", DDL, N)).unwrap();
+    let count = |f: &dyn Fn(i64) -> bool| (0..N).filter(|&a| f(a)).count() as i64;
+    let present = count(&|a| b_of(a).is_some());
+    for cond in [
+        "b <= 499",
+        "b >= -500",
+        "b > -501",
+        "b < 500",
+        "b >= -500 AND b <= 499",
+    ] {
+        let sql = format!("SELECT count(*) FROM s.t WHERE {cond}");
+        let (got, round) = ask(&mut s, &sql, Some("t_pkey"));
+        assert_eq!(
+            (one(&got), round.blocks_read, round.column_pages_read),
+            (present, 0, 0),
+            "{sql}"
+        );
+    }
+    // A bound among a block's values reads it.
+    let sql = "SELECT count(*) FROM s.t WHERE b < 0";
+    let (got, round) = ask(&mut s, sql, Some("t_pkey"));
+    assert_eq!(one(&got), count(&|a| b_of(a).is_some_and(|b| b < 0)));
+    assert!(round.column_pages_read > 0, "{sql}");
+}
+
+#[test]
 fn an_equality_on_the_empty_text_matches_no_null_in_a_block_holding_both() {
     // 100 rows are one block, holding the empty text first and the NULLs last on t_s.
     let mut s = Snail::open(&written("null-empty", DDL, 100)).unwrap();

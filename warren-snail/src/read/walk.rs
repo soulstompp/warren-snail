@@ -1261,8 +1261,9 @@ fn rest_status(
         _ => {
             if sum.max < iv.lo || sum.min > iv.hi {
                 (Status::None, Some(0))
-            } else if sum.nulls == 0 && iv.lo <= sum.min && sum.max <= iv.hi {
-                (Status::Must, Some(rows))
+            } else if iv.lo <= sum.min && sum.max <= iv.hi {
+                // Every value passes, and the column's NULLs the counts hold are left out.
+                status(present)
             } else {
                 (Status::May, None)
             }
@@ -1461,6 +1462,40 @@ mod tests {
         );
         let none = Cond::new(Shape::Column(0), Interval { lo: 200, hi: 300 });
         assert_eq!(rest_share(block.columns[0], 0, &none, &block, &head), 0.0);
+    }
+
+    #[test]
+    fn a_comparison_every_value_passes_is_counted_less_the_nulls() {
+        // 100 rows, `nulls` of them NULL, the rest from 1 to 50.
+        let block = |nulls: u32| Entry {
+            depth: 1,
+            rows: 100,
+            dead: 0,
+            first: vec![KeyValue::Int(0)],
+            last: vec![KeyValue::Int(0)],
+            columns: vec![Summary {
+                nulls,
+                min: 1,
+                max: 50,
+                pages: 1,
+                ..Default::default()
+            }],
+            months: vec![],
+            bytes: vec![],
+            child: Extent::default(),
+        };
+        let head = Head::default();
+        let status = |lo: i128, hi: i128, b: &Entry| {
+            let c = Cond::new(Shape::Column(0), Interval { lo, hi });
+            rest_status(b.columns[0], 0, &c, b, &head)
+        };
+        assert_eq!(status(1, 60, &block(20)), (Status::May, Some(80)));
+        assert_eq!(status(1, 60, &block(0)), (Status::Must, Some(100)));
+        assert_eq!(status(60, 70, &block(20)), (Status::None, Some(0)));
+        // A bound among the values: the counts cannot say.
+        assert_eq!(status(10, 60, &block(20)), (Status::May, None));
+        // Every row NULL: none.
+        assert_eq!(status(1, 60, &block(100)), (Status::None, Some(0)));
     }
 
     #[test]
