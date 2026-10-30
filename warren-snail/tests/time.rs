@@ -5,13 +5,21 @@
 
 mod weather;
 
+#[cfg(feature = "standalone")]
 use arrow::array::{Array, RecordBatch};
-use warren_snail::catalog::{Catalog, ColumnType};
+use warren_snail::catalog::Catalog;
+#[cfg(feature = "standalone")]
+use warren_snail::catalog::ColumnType;
+#[cfg(feature = "standalone")]
 use warren_snail::read::Snail;
+#[cfg(feature = "standalone")]
 use warren_snail::scalars::{field_scalar, interval_at, scalar_key_at, scalar_text};
 use warren_snail::write::Rows;
-use weather::{tmp, write};
+use weather::tmp;
+#[cfg(feature = "standalone")]
+use weather::write;
 
+#[cfg(feature = "standalone")]
 /// An answer's column, each value as PostgreSQL's output for its type writes it.
 fn texts(b: &RecordBatch, c: usize) -> Vec<Option<String>> {
     let a = b.column(c);
@@ -30,6 +38,7 @@ fn texts(b: &RecordBatch, c: usize) -> Vec<Option<String>> {
         .collect()
 }
 
+#[cfg(feature = "standalone")]
 /// A snail of one table, `s.t`, made empty from its DDL, then the statements run on it.
 fn snail_of(name: &str, ddl: &str, statements: &[&str]) -> Snail {
     let path = tmp(&format!("{name}.snail"));
@@ -49,6 +58,7 @@ fn snail_of(name: &str, ddl: &str, statements: &[&str]) -> Snail {
     snail
 }
 
+#[cfg(feature = "standalone")]
 fn table(ty: &str) -> String {
     format!(
         "CREATE TABLE s.t (id integer NOT NULL, v {ty}, PRIMARY KEY (id)); \
@@ -56,10 +66,12 @@ fn table(ty: &str) -> String {
     )
 }
 
+#[cfg(feature = "standalone")]
 fn some(v: &[&str]) -> Vec<Option<String>> {
     v.iter().map(|s| Some(s.to_string())).collect()
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn each_time_type_sorts_and_writes_as_postgresql_does_its_ends_and_infinities_among_them() {
     // Each type's values in PostgreSQL's order (types/time-ranges-composed.md), written in other
@@ -177,6 +189,7 @@ fn each_time_type_sorts_and_writes_as_postgresql_does_its_ends_and_infinities_am
     }
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn an_instant_from_the_snail_s_last_microsecond_on_is_refused_by_name() {
     let mut snail = snail_of("time-top", &table("timestamptz"), &[]);
@@ -213,6 +226,7 @@ fn an_instant_from_the_snail_s_last_microsecond_on_is_refused_by_name() {
     );
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn equal_intervals_share_a_place_group_as_one_and_sum_as_postgresql_sums_them() {
     let mut snail = snail_of(
@@ -251,6 +265,7 @@ fn equal_intervals_share_a_place_group_as_one_and_sum_as_postgresql_sums_them() 
     assert_eq!(texts(&b, 0), some(&["1 mon 31 days 744:00:00"]));
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn the_pipeline_adds_takes_and_casts_time_as_postgresql_does() {
     let mut snail = snail_of(
@@ -309,6 +324,7 @@ fn the_pipeline_adds_takes_and_casts_time_as_postgresql_does() {
     }
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn a_value_is_rounded_to_its_column_s_precision_at_the_write() {
     let mut snail = snail_of(
@@ -335,6 +351,7 @@ fn a_value_is_rounded_to_its_column_s_precision_at_the_write() {
     }
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn a_setting_set_to_the_value_the_snail_answers_under_does_nothing_and_any_other_is_refused() {
     let mut snail = snail_of("time-set", &table("date"), &[]);
@@ -388,6 +405,7 @@ fn a_snail_of_format_8_refuses_an_infinite_instant_on_a_level_by_name() {
     );
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn out_names_the_columns_holding_an_infinity_or_24_00() {
     let mut snail = snail_of(
@@ -402,7 +420,7 @@ fn out_names_the_columns_holding_an_infinity_or_24_00() {
     assert_eq!(out[0].extremes, ["d", "t"]);
 }
 
-#[cfg(feature = "zones")]
+#[cfg(all(feature = "zones", feature = "standalone"))]
 #[test]
 fn under_zones_an_instant_at_a_named_zone_reads_its_rules() {
     let mut snail = snail_of(
