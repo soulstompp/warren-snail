@@ -624,7 +624,7 @@ pub fn push_datum(v: &mut Values, d: &Datum) {
 }
 
 /// Row `i`'s value as a column of type `ty` holds it: a number, a float's bits, a uuid's key, text,
-/// bytea's bytes, or a composed value.
+/// bytea's bytes, a bit string's key, or a composed value.
 pub fn datum_of(v: &Values, i: usize, ty: ColumnType) -> Datum {
     match v {
         Values::Int(x) => x[i].map_or(Datum::Null, Datum::Int),
@@ -633,7 +633,7 @@ pub fn datum_of(v: &Values, i: usize, ty: ColumnType) -> Datum {
         Values::Float8(x) => x[i].map_or(Datum::Null, Datum::Float8),
         Values::Composed(x) => x[i].clone().map_or(Datum::Null, Datum::Compound),
         Values::Nested(_) => panic!("a leaf's value read without its levels"),
-        _ if ty == ColumnType::Bytes => v
+        _ if ty == ColumnType::Bytes || ty.is_bits() => v
             .text_value(i)
             .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
         _ => v

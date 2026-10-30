@@ -325,6 +325,8 @@ fn key(v: &Value) -> Key {
         Value::Double(d) => Key::Double(crate::scalars::float8_key(d.to_bits())),
         Value::Str(..) => Key::Text(String::from_utf8_lossy(v.string_key().unwrap()).into()),
         Value::Bits(_, k) => Key::Bytes(k.clone()),
+        // A composed NULL keeps its type, and groups as a NULL.
+        Value::Composed(_, c) if c.item.is_null() => Key::Null,
         Value::Composed(_, c) => Key::Composed(c.key.clone()),
         Value::Interval(v) => Key::Interval(v.total()),
         Value::Typed(ty, s) => {
@@ -2422,23 +2424,58 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             right,
         } => any_all(compare_op, ev(left)?, ev(right)?, left, false)?,
         Expr::CompoundFieldAccess { root, access_chain } => {
+            use sqlparser::ast::{AccessExpr, Subscript};
             let mut v = ev(root)?;
             let mut at: Vec<i64> = Vec::new();
+            // Each subscript's lower and upper where any is a slice: a lone subscript the upper,
+            // its lower 1.
+            let mut slices: Vec<(Option<i64>, Option<i64>)> = Vec::new();
+            let mut sliced = false;
+            // A subscript as an integer of 32 bits; none where it is NULL.
+            let int = |e: &Expr| -> Result<Option<i64>> {
+                match ev(e)? {
+                    Value::Int(i) if i32::try_from(i).is_ok() => Ok(Some(i)),
+                    Value::Int(_) => Err(Error::new("integer out of range")),
+                    Value::Null => Ok(None),
+                    other => Err(Error::new(format!(
+                        "array subscript must have type integer, not {}",
+                        kind_name(&other)
+                    ))),
+                }
+            };
             for a in access_chain {
                 match a {
-                    sqlparser::ast::AccessExpr::Subscript(sqlparser::ast::Subscript::Index {
-                        index,
-                    }) => match ev(index)? {
-                        Value::Int(i) => at.push(i),
-                        Value::Null => return Ok(Value::Null),
-                        other => {
-                            return Err(Error::new(format!(
-                                "array subscript must have type integer, not {}",
-                                kind_name(&other)
-                            )))
+                    AccessExpr::Subscript(Subscript::Index { index }) => match int(index)? {
+                        Some(i) => {
+                            at.push(i);
+                            slices.push((Some(1), Some(i)));
                         }
+                        None => return Ok(Value::Null),
                     },
-                    sqlparser::ast::AccessExpr::Dot(Expr::Identifier(i)) if at.is_empty() => {
+                    AccessExpr::Subscript(Subscript::Slice {
+                        lower_bound,
+                        upper_bound,
+                        stride,
+                    }) => {
+                        if stride.is_some() {
+                            return Err(Error::new(
+                                "an array slice's stride is not read: PostgreSQL has none",
+                            ));
+                        }
+                        let bound = |b: &Option<Expr>| -> Result<Option<Option<i64>>> {
+                            match b {
+                                None => Ok(Some(None)),
+                                Some(e) => Ok(int(e)?.map(Some)),
+                            }
+                        };
+                        let (Some(l), Some(u)) = (bound(lower_bound)?, bound(upper_bound)?) else {
+                            return Ok(Value::Null);
+                        };
+                        sliced = true;
+                        at.push(0);
+                        slices.push((l, u));
+                    }
+                    AccessExpr::Dot(Expr::Identifier(i)) if at.is_empty() => {
                         v = match v {
                             Value::Null => Value::Null,
                             Value::Composed(ty, c) => {
@@ -2451,11 +2488,24 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     other => return Err(Error::new(format!("{other} is not read"))),
                 }
             }
+            if at.len() > 6 {
+                return Err(Error::new(format!(
+                    "number of array dimensions ({}) exceeds the maximum allowed (6)",
+                    at.len()
+                )));
+            }
             if !at.is_empty() {
                 v = match v {
                     Value::Null => Value::Null,
                     Value::Composed(ty, c) => match ty {
                         ColumnType::Composed(r) => match r.def() {
+                            crate::composed::Composed::Array { .. } if sliced => Value::Composed(
+                                ty,
+                                std::sync::Arc::new(crate::composed::Compound::new(
+                                    ty,
+                                    crate::composed::slice(&c.item, &slices),
+                                )),
+                            ),
                             crate::composed::Composed::Array { element, .. } => {
                                 part_value(*element, &crate::composed::subscript(&c.item, &at))
                             }
@@ -4582,9 +4632,12 @@ fn part_value(ty: ColumnType, item: &crate::composed::Item) -> Value {
     super::fill::value_of(&crate::composed::datum_of(ty, item), ty)
 }
 
-/// The composed type a value is, or a quoted literal beside it is read as.
+/// The composed type a value is, or a quoted literal beside it is read as: a multirange's where
+/// either side is one.
 fn composed_beside(x: &Value, y: &Value) -> Option<ColumnType> {
+    let multi = |ty: &ColumnType| matches!(ty, ColumnType::Composed(r) if matches!(r.def(), crate::composed::Composed::Multirange { .. }));
     match (x, y) {
+        (Value::Composed(ty, _), _) | (_, Value::Composed(ty, _)) if multi(ty) => Some(*ty),
         (Value::Composed(ty, _), _) | (_, Value::Composed(ty, _)) if ty.is_nested() => Some(*ty),
         _ => None,
     }
@@ -4592,7 +4645,8 @@ fn composed_beside(x: &Value, y: &Value) -> Option<ColumnType> {
 
 /// An operator of the composed types, where either side is one: an array's `||`, `@>`, `<@` and
 /// `&&`; a range's `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`, `+`, `*` and `-`, beside a
-/// range or, for `@>` and `<@`, an element of its subtype. None where neither side is composed.
+/// range or, for `@>` and `<@`, an element of its subtype; a multirange's, beside a multirange, a
+/// range or an element, `+`, `*` and `-` beside a multirange. None where neither side is composed.
 fn composed_op(
     op: &BinaryOperator,
     x: &Value,
@@ -4731,6 +4785,36 @@ fn composed_op(
                 ))),
                 _ => Err(no()),
             }
+        }
+        Composed::Multirange { range, .. } => {
+            use crate::composed::Spanned;
+            if x.is_null() || y.is_null() {
+                return Ok(Some(Value::Null));
+            }
+            // A side as a multirange, a quoted literal read by its input, or as a range of its
+            // ranges' type.
+            let side = |v: &Value, e: &Expr| -> Result<Option<Spanned>> {
+                Ok(match v {
+                    Value::Composed(t, c) if *t == *range => Some(Spanned::Range(c.item.clone())),
+                    _ => match whole(v, e)? {
+                        Some(Item::Multirange(rs)) => Some(Spanned::Ranges(rs)),
+                        _ => None,
+                    },
+                })
+            };
+            let subtype = crate::composed::range_of(ty).map_or(ColumnType::Int4, |r| r.0);
+            let (a, b) = match (side(x, left)?, side(y, right)?) {
+                (Some(a), Some(b)) => (a, b),
+                (Some(a), None) if name == "@>" => (a, Spanned::Element(element_of(subtype, y)?)),
+                (None, Some(b)) if name == "<@" => (Spanned::Element(element_of(subtype, x)?), b),
+                _ => return Err(no()),
+            };
+            Ok(Some(
+                match crate::composed::multirange_op(ty, name, &a, &b)? {
+                    crate::composed::RangeAnswer::Truth(t) => Value::Bool(t),
+                    crate::composed::RangeAnswer::Range(i) => out(i),
+                },
+            ))
         }
         _ => Err(no()),
     }

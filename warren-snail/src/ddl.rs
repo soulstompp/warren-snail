@@ -1858,12 +1858,6 @@ impl Draft {
                 }
             };
             let (element, domain) = self.held(inner, what)?;
-            if element.is_bits() {
-                return Err(refused(format!(
-                    "an array of {} is not held yet: a bit string as an element waits for t8b",
-                    element.pg_name()
-                )));
-            }
             // PostgreSQL holds an array of any number of dimensions as one type.
             if let ColumnType::Composed(r) = element {
                 if domain.is_none() && matches!(r.def(), Composed::Array { .. }) {
@@ -1929,9 +1923,6 @@ impl Draft {
                 labels: labels.clone(),
             }),
             TypeKind::Composite { fields } => {
-                if fields.is_empty() {
-                    return Err(refused("a composite of no fields, is not held".into()));
-                }
                 let fields = fields
                     .iter()
                     .map(|(name, ty, collation)| {
@@ -1943,12 +1934,6 @@ impl Draft {
                             }
                         }
                         let (ty, domain) = self.held(&parse_type(ty)?, what)?;
-                        if ty.is_bits() {
-                            return Err(refused(format!(
-                                "its field {name} is {}, a bit string, which a composite holds once t8b builds it",
-                                ty.pg_name()
-                            )));
-                        }
                         Ok(Field {
                             name: name.clone(),
                             ty,

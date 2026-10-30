@@ -1028,7 +1028,7 @@ pub(crate) fn laid_out(
 
 /// A column's values as each of its leaves holds them: the column's own where it is one leaf.
 pub(crate) fn leaf_values(ty: ColumnType, values: &Values) -> Vec<std::borrow::Cow<'_, Values>> {
-    if ty.leaf_count() == 1 {
+    if !ty.is_group() {
         vec![std::borrow::Cow::Borrowed(values)]
     } else {
         values

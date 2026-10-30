@@ -2821,10 +2821,6 @@ mod tests {
                 "not an existing enum label",
             ),
             (
-                "CREATE TYPE s.c AS (); CREATE TABLE s.t (c s.c NOT NULL, PRIMARY KEY (c))",
-                "a composite of no fields",
-            ),
-            (
                 "CREATE COLLATION s.pt (provider = libc, locale = 'pt_PT.utf8', deterministic = false)",
                 "nondeterministic collations not supported",
             ),

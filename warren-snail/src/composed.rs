@@ -59,7 +59,7 @@ pub enum Composed {
     /// A composite the DDL declares, or a table's row type: its fields in order.
     Record { name: String, fields: Vec<Field> },
     /// A range of `subtype`; `discrete` where PostgreSQL makes each value canonical, its bounds
-    /// written `[lower,upper)`, as int4range's and int8range's canonical functions do.
+    /// written `[lower,upper)`, as int4range's, int8range's and daterange's canonical functions do.
     Range {
         name: String,
         subtype: ColumnType,
@@ -103,7 +103,7 @@ pub fn type_of(c: Composed) -> ColumnType {
 
 /// The range types PostgreSQL has built in over the element types the snail holds, each with its
 /// multirange: their names, the subtype, and whether each value is made canonical.
-pub const BUILT_IN_RANGES: [(&str, &str, ColumnType, bool); 4] = [
+pub const BUILT_IN_RANGES: [(&str, &str, ColumnType, bool); 6] = [
     ("int4range", "int4multirange", ColumnType::Int4, true),
     ("int8range", "int8multirange", ColumnType::Int8, true),
     (
@@ -116,6 +116,13 @@ pub const BUILT_IN_RANGES: [(&str, &str, ColumnType, bool); 4] = [
         "tstzrange",
         "tstzmultirange",
         ColumnType::Timestamptz,
+        false,
+    ),
+    ("daterange", "datemultirange", ColumnType::Date, true),
+    (
+        "tsrange",
+        "tsmultirange",
+        ColumnType::Timestamp(None),
         false,
     ),
 ];
@@ -562,17 +569,18 @@ pub fn scalar_in(ty: ColumnType, s: &str) -> Result<Datum> {
             }
             _ => Datum::Compound(Arc::new(Compound::new(ty, text_in(ty, s)?))),
         },
-        // A time type held as a group of leaves waits on composed values of such leaves.
         // A type held as its text, by its input; aclitem's three leaves are a group.
         ColumnType::Textual(t) if t != crate::textual::Textual::Aclitem => {
             Datum::Text(crate::textual::text_in(t, s)?)
         }
-        ColumnType::Timetz(_) | ColumnType::Interval { .. } => {
-            return Err(Error::new(format!(
-                "{} is not read as a part of a composed value: it is held as a group of leaves",
-                ty.pg_name()
-            )))
-        }
+        ColumnType::Interval { range, precision } => Datum::Interval(crate::times::interval_in(
+            s,
+            range,
+            precision.map(u32::from),
+        )?),
+        ColumnType::Bit(n) => Datum::Bytes(crate::strings::bits_parse(s, Some(n), false)?),
+        ColumnType::Varbit(n) => Datum::Bytes(crate::strings::bits_parse(s, n, true)?),
+        ColumnType::TimestamptzRounded(_) => Datum::Int(crate::scalars::scalar_parse(ty, s)?),
         ty if crate::scalars::is_scalar(ty) => Datum::Int(crate::scalars::scalar_parse(ty, s)?),
         other => {
             return Err(Error::new(format!(
@@ -1122,41 +1130,43 @@ pub fn make_range(
             upper,
         });
     }
-    let bits = match subtype {
-        ColumnType::Int4 => 32,
-        _ => 64,
-    };
-    let next = |v: &Item| -> Result<Item> {
+    // The value after a bound's: an integer's next, a date's next day; none for an infinite date,
+    // which keeps its bound as it is.
+    let next = |v: &Item| -> Result<Option<Item>> {
         let Item::Scalar(Datum::Int(x)) = v else {
             return Err(Error::new("a discrete range's bound is not an integer"));
         };
-        let top = if bits == 32 {
-            i32::MAX as i64
-        } else {
-            i64::MAX
-        };
-        if *x == top {
-            return Err(Error::new(if bits == 32 {
-                "integer out of range"
-            } else {
-                "bigint out of range"
-            }));
-        }
-        Ok(Item::Scalar(Datum::Int(x + 1)))
+        Ok(Some(Item::Scalar(Datum::Int(match subtype {
+            ColumnType::Date if *x == i64::from(i32::MIN) || *x == i64::from(i32::MAX) => {
+                return Ok(None)
+            }
+            ColumnType::Date => i64::from(crate::times::date_pli(*x as i32, 1)?),
+            ColumnType::Int4 if *x == i64::from(i32::MAX) => {
+                return Err(Error::new("integer out of range"))
+            }
+            _ if *x == i64::MAX => return Err(Error::new("bigint out of range")),
+            _ => x + 1,
+        }))))
     };
     let mut f = flags;
     let lo = match lower {
-        Some(l) if f & LB_INC == 0 => {
-            f |= LB_INC;
-            Some(next(&l)?)
-        }
+        Some(l) if f & LB_INC == 0 => match next(&l)? {
+            Some(n) => {
+                f |= LB_INC;
+                Some(n)
+            }
+            None => Some(*l),
+        },
         l => l.map(|b| *b),
     };
     let hi = match upper {
-        Some(h) if f & UB_INC != 0 => {
-            f &= !UB_INC;
-            Some(next(&h)?)
-        }
+        Some(h) if f & UB_INC != 0 => match next(&h)? {
+            Some(n) => {
+                f &= !UB_INC;
+                Some(n)
+            }
+            None => Some(*h),
+        },
         h => h.map(|b| *b),
     };
     serialize(f, lo, hi)
@@ -1263,6 +1273,15 @@ fn upper_key(subtype: ColumnType, r: &Item) -> Vec<u8> {
     out
 }
 
+/// A range's lower bound as a key of its own, comparable with another range's.
+fn lower_key(subtype: ColumnType, r: &Item) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Item::Range { flags, lower, .. } = r {
+        bounds_key(&mut out, subtype, *flags | UB_INF, lower.as_deref(), None);
+    }
+    out
+}
+
 /// Whether range `b`, which starts no earlier than `a`, overlaps `a` or meets it with no value
 /// between: its lower bound at or below `a`'s upper, or at the same value, one of the two inclusive.
 fn joins(subtype: ColumnType, a: &Item, b: &Item) -> bool {
@@ -1292,7 +1311,8 @@ fn joins(subtype: ColumnType, a: &Item, b: &Item) -> bool {
 }
 
 /// Ranges sorted, the empty ones dropped, and those that overlap or meet merged, as
-/// `multirange_canonicalize` makes them.
+/// `multirange_canonicalize` makes them: a merged range's bound the later range's where the two
+/// are equal, as `range_union_internal` takes it.
 pub fn canonical_ranges(range: ColumnType, ranges: Vec<Item>) -> Vec<Item> {
     let Some((subtype, _)) = range_of(range) else {
         return ranges;
@@ -1306,24 +1326,29 @@ pub fn canonical_ranges(range: ColumnType, ranges: Vec<Item>) -> Vec<Item> {
     for r in ranges {
         match out.last_mut() {
             Some(last) if joins(subtype, last, &r) => {
-                if upper_key(subtype, &r) > upper_key(subtype, last) {
-                    let (
-                        Item::Range {
-                            flags: fl,
-                            upper: ul,
-                            ..
-                        },
-                        Item::Range {
-                            flags: fr,
-                            upper: ur,
-                            ..
-                        },
-                    ) = (last, r)
-                    else {
-                        unreachable!()
-                    };
+                let later_upper = upper_key(subtype, &r) >= upper_key(subtype, last);
+                let same_lower = lower_key(subtype, &r) == lower_key(subtype, last);
+                let (
+                    Item::Range {
+                        flags: fl,
+                        lower: ll,
+                        upper: ul,
+                    },
+                    Item::Range {
+                        flags: fr,
+                        lower: lr,
+                        upper: ur,
+                    },
+                ) = (last, r)
+                else {
+                    unreachable!()
+                };
+                if later_upper {
                     *ul = ur;
                     *fl = (*fl & !(UB_INC | UB_INF)) | (fr & (UB_INC | UB_INF));
+                }
+                if same_lower {
+                    *ll = lr;
                 }
             }
             _ => out.push(r),
@@ -1513,6 +1538,9 @@ fn range_text(subtype: ColumnType, flags: u8, lo: Option<&Item>, hi: Option<&Ite
     )
 }
 
+/// The name of the one leaf a composite of no fields holds.
+pub const NO_FIELDS: &str = "none";
+
 /// One node of a composed column's Parquet type tree.
 #[derive(Clone, Debug)]
 enum Node {
@@ -1553,7 +1581,8 @@ impl Node {
         };
         let def = match ty {
             ColumnType::Composed(r) => r.def(),
-            // A value held as a group of leaves, a tid: a group of its own.
+            // A value held as a group of leaves, a tid, a timetz, an interval or a bit varying: a group
+            // of its own.
             _ if ty.leaf_count() > 1 => {
                 return Node::Group {
                     name: name.into(),
@@ -1594,6 +1623,13 @@ impl Node {
                         element: Box::new(leaf("element", ColumnType::Int4, false, true)),
                     },
                 ],
+            },
+            // A composite of no fields holds one leaf, a boolean always NULL, which carries the
+            // composite's own NULL in its levels: Parquet has no group of no fields.
+            Composed::Record { fields, .. } if fields.is_empty() => Node::Group {
+                name: name.into(),
+                optional,
+                children: vec![leaf(NO_FIELDS, ColumnType::Boolean, true, false)],
             },
             Composed::Record { fields, .. } => Node::Group {
                 name: name.into(),
@@ -1732,6 +1768,64 @@ enum Tree {
     List(Vec<Tree>),
 }
 
+/// A value of an element type held as a group of leaves, on its leaves: a tid's block number and
+/// offset, each keyed in its own bits; a timetz's time and zone; an interval's months, days and
+/// microseconds; a bit varying's length and bits.
+fn grouped(ty: ColumnType, d: &Datum) -> Tree {
+    let int = |v: i64| Tree::Leaf(Datum::Int(v));
+    match (ty, d) {
+        (ColumnType::Tid, Datum::Int(k)) => {
+            let (b, o) = crate::scalars::tid_parts(*k);
+            Tree::Group(vec![
+                int(crate::scalars::unsigned_key(u64::from(b), 32)),
+                int(crate::scalars::unsigned_key(u64::from(o), 16)),
+            ])
+        }
+        (ColumnType::Timetz(_), Datum::Int(k)) => {
+            let (t, z) = crate::scalars::timetz_parts(*k);
+            Tree::Group(vec![int(t), int(i64::from(z))])
+        }
+        (ColumnType::Interval { .. }, Datum::Interval(v)) => Tree::Group(vec![
+            int(i64::from(v.months)),
+            int(i64::from(v.days)),
+            int(v.micros),
+        ]),
+        (ColumnType::Varbit(_), Datum::Bytes(k)) => {
+            let (len, bits) = crate::strings::bits_of_key(k);
+            Tree::Group(vec![int(i64::from(len)), Tree::Leaf(Datum::Bytes(bits))])
+        }
+        _ => Tree::Null,
+    }
+}
+
+/// A value of an element type held as a group of leaves, from its leaves.
+fn ungrouped(ty: ColumnType, parts: &[Tree]) -> Option<Datum> {
+    use Tree::Leaf;
+    Some(match (ty, parts) {
+        (ColumnType::Tid, [Leaf(Datum::Int(b)), Leaf(Datum::Int(o))]) => {
+            Datum::Int(crate::scalars::tid_key(
+                crate::scalars::unsigned_of(*b, 32) as u32,
+                crate::scalars::unsigned_of(*o, 16) as u16,
+            ))
+        }
+        (ColumnType::Timetz(_), [Leaf(Datum::Int(t)), Leaf(Datum::Int(z))]) => {
+            Datum::Int(crate::scalars::timetz_key(*t, *z as i32))
+        }
+        (
+            ColumnType::Interval { .. },
+            [Leaf(Datum::Int(m)), Leaf(Datum::Int(d)), Leaf(Datum::Int(u))],
+        ) => Datum::Interval(crate::times::Interval {
+            months: *m as i32,
+            days: *d as i32,
+            micros: *u,
+        }),
+        (ColumnType::Varbit(_), [Leaf(Datum::Int(len)), Leaf(Datum::Bytes(bits))]) => {
+            Datum::Bytes(crate::strings::bits_key(*len as u32, bits))
+        }
+        _ => return None,
+    })
+}
+
 /// A value of type `ty` on its type's tree.
 fn tree_of(ty: ColumnType, item: &Item) -> Tree {
     let def = match ty {
@@ -1740,14 +1834,7 @@ fn tree_of(ty: ColumnType, item: &Item) -> Tree {
     };
     match (def, item) {
         (_, Item::Null) => Tree::Null,
-        // A tid: its block number and its offset, each keyed in its own bits.
-        (None, Item::Scalar(Datum::Int(k))) if ty == ColumnType::Tid => {
-            let (b, o) = crate::scalars::tid_parts(*k);
-            Tree::Group(vec![
-                Tree::Leaf(Datum::Int(crate::scalars::unsigned_key(u64::from(b), 32))),
-                Tree::Leaf(Datum::Int(crate::scalars::unsigned_key(u64::from(o), 16))),
-            ])
-        }
+        (None, Item::Scalar(d)) if ty.leaf_count() > 1 => grouped(ty, d),
         (_, Item::Scalar(d)) => Tree::Leaf(d.clone()),
         (
             Some(Composed::Array { element, .. }),
@@ -1771,6 +1858,9 @@ fn tree_of(ty: ColumnType, item: &Item) -> Tree {
                 if plain { Tree::Null } else { ints(dims) },
                 if plain { Tree::Null } else { ints(lower) },
             ])
+        }
+        (Some(Composed::Record { fields, .. }), Item::Record(_)) if fields.is_empty() => {
+            Tree::Group(vec![Tree::Null])
         }
         (Some(Composed::Record { fields, .. }), Item::Record(values)) => Tree::Group(
             fields
@@ -1810,15 +1900,7 @@ fn item_of(ty: ColumnType, t: Tree) -> Item {
     };
     match (def, t) {
         (_, Tree::Null) => Item::Null,
-        (None, Tree::Group(parts)) if ty == ColumnType::Tid => match parts.as_slice() {
-            [Tree::Leaf(Datum::Int(b)), Tree::Leaf(Datum::Int(o))] => {
-                Item::Scalar(Datum::Int(crate::scalars::tid_key(
-                    crate::scalars::unsigned_of(*b, 32) as u32,
-                    crate::scalars::unsigned_of(*o, 16) as u16,
-                )))
-            }
-            _ => Item::Null,
-        },
+        (None, Tree::Group(parts)) => ungrouped(ty, &parts).map_or(Item::Null, Item::Scalar),
         (_, Tree::Leaf(d)) => Item::Scalar(d),
         (Some(Composed::Array { element, .. }), Tree::Group(parts)) => {
             let mut parts = parts.into_iter();
@@ -2467,6 +2549,7 @@ fn leaf_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
         | ColumnType::NumericText(_)
         | ColumnType::Textual(_) => A::Utf8,
         ColumnType::Bytes | ColumnType::Composed(_) => A::Binary,
+        ColumnType::Bit(_) => crate::strings::string_arrow(ty),
         ColumnType::Numeric { precision, scale } => A::Decimal128(precision, scale as i8),
         ColumnType::Uuid => A::FixedSizeBinary(16),
         ColumnType::Float4 => A::Float32,
@@ -2680,6 +2763,13 @@ fn leaf_array(ty: ColumnType, values: Vec<Option<&Datum>>) -> Result<arrow::arra
                 })
                 .collect::<BinaryArray>(),
         ),
+        ColumnType::Bit(_) => crate::strings::string_array(
+            ty,
+            values.iter().map(|d| match d {
+                Some(Datum::Bytes(b)) => Some(b.as_slice()),
+                _ => None,
+            }),
+        ),
         ColumnType::Composed(_) => {
             let labels = labels(ty).unwrap_or(&[]);
             Arc::new(
@@ -2748,6 +2838,7 @@ fn leaf_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<Datu
             Datum::Text(any.downcast_ref::<StringArray>()?.value(r).to_string())
         }
         ColumnType::Bytes => Datum::Bytes(any.downcast_ref::<BinaryArray>()?.value(r).to_vec()),
+        ColumnType::Bit(_) => Datum::Bytes(crate::strings::bits_key_at(ty, a, r)?),
         ColumnType::Composed(_) => {
             let b = any.downcast_ref::<BinaryArray>()?.value(r);
             Datum::Int(labels(ty)?.iter().position(|l| l.as_bytes() == b)? as i64)
@@ -3193,6 +3284,296 @@ pub fn range_holds(ty: ColumnType, r: &Item, v: &Item) -> Result<bool> {
     };
     Ok(cmp_bounds(&lo, &point(true)) != std::cmp::Ordering::Greater
         && cmp_bounds(&hi, &point(false)) != std::cmp::Ordering::Less)
+}
+
+/// One side of a multirange's operator: a multirange's ranges, a range, or a value of its subtype.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum Spanned {
+    Ranges(Vec<Item>),
+    Range(Item),
+    Element(Item),
+}
+
+impl Spanned {
+    /// Its ranges: a range's own, none where it is empty.
+    fn ranges(&self) -> Option<Vec<Item>> {
+        match self {
+            Spanned::Ranges(v) => Some(v.clone()),
+            Spanned::Range(Item::Range { flags, .. }) if flags & EMPTY != 0 => Some(Vec::new()),
+            Spanned::Range(r) => Some(vec![r.clone()]),
+            Spanned::Element(_) => None,
+        }
+    }
+}
+
+/// The range from the lower bound of a multirange's first range to the upper bound of its last.
+fn span_of(ranges: &[Item]) -> Item {
+    match (ranges.first(), ranges.last()) {
+        (
+            Some(Item::Range {
+                flags: fl,
+                lower: lo,
+                ..
+            }),
+            Some(Item::Range {
+                flags: fu,
+                upper: hi,
+                ..
+            }),
+        ) => Item::Range {
+            flags: (fl & (LB_INC | LB_INF)) | (fu & (UB_INC | UB_INF)),
+            lower: lo.clone(),
+            upper: hi.clone(),
+        },
+        _ => empty_range(),
+    }
+}
+
+/// An operator of a multirange of type `ty`, beside a multirange, a range of its ranges' type or,
+/// for `@>` and `<@`, a value of their subtype: `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>` and `-|-`;
+/// `+`, `*` and `-` of two multiranges. As PostgreSQL's multirange functions answer them, an empty
+/// multirange or range overlapping, adjoining and lying beside nothing.
+pub fn multirange_op(ty: ColumnType, op: &str, a: &Spanned, b: &Spanned) -> Result<RangeAnswer> {
+    use RangeAnswer::{Range, Truth};
+    let Some(Composed::Multirange { range, .. }) = (match ty {
+        ColumnType::Composed(r) => Some(r.def()),
+        _ => None,
+    }) else {
+        return Err(Error::new("not a multirange"));
+    };
+    let range = *range;
+    let truth = |o: &str, x: &Item, y: &Item| -> Result<bool> {
+        Ok(matches!(range_op(range, o, x, y)?, Truth(true)))
+    };
+    let holds = |rs: &[Item], v: &Item| -> Result<bool> {
+        for r in rs {
+            if range_holds(range, r, v)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if let ("<@", Spanned::Element(v)) = (op, a) {
+        return Ok(Truth(holds(&b.ranges().unwrap_or_default(), v)?));
+    }
+    if let ("@>", Spanned::Element(v)) = (op, b) {
+        return Ok(Truth(holds(&a.ranges().unwrap_or_default(), v)?));
+    }
+    let (Some(x), Some(y)) = (a.ranges(), b.ranges()) else {
+        return Err(Error::new(format!(
+            "the operator {op} on a multirange and a value of its subtype is not read"
+        )));
+    };
+    let both = matches!((a, b), (Spanned::Ranges(_), Spanned::Ranges(_)));
+    let either_empty = x.is_empty() || y.is_empty();
+    Ok(match op {
+        "@>" | "<@" => {
+            let (big, small) = if op == "@>" { (&x, &y) } else { (&y, &x) };
+            let mut every = true;
+            for s in small {
+                let mut held = false;
+                for g in big {
+                    if truth("@>", g, s)? {
+                        held = true;
+                        break;
+                    }
+                }
+                every &= held;
+            }
+            Truth(every)
+        }
+        _ if either_empty && matches!(op, "&&" | "<<" | ">>" | "&<" | "&>" | "-|-") => Truth(false),
+        "&&" => {
+            let mut any = false;
+            for r in &x {
+                for s in &y {
+                    any |= truth("&&", r, s)?;
+                }
+            }
+            Truth(any)
+        }
+        "<<" => Truth(truth("<<", x.last().unwrap(), y.first().unwrap())?),
+        ">>" => Truth(truth(">>", x.first().unwrap(), y.last().unwrap())?),
+        "&<" => Truth(truth("&<", x.last().unwrap(), y.last().unwrap())?),
+        "&>" => Truth(truth("&>", x.first().unwrap(), y.first().unwrap())?),
+        "-|-" => Truth(truth("-|-", &span_of(&x), &span_of(&y))?),
+        "+" | "*" | "-" if !both => {
+            return Err(Error::new(format!(
+                "the operator {op} on a multirange and a range is not read: PostgreSQL has none"
+            )))
+        }
+        "+" if x.is_empty() => Range(Item::Multirange(y)),
+        "+" if y.is_empty() => Range(Item::Multirange(x)),
+        "+" => Range(Item::Multirange(canonical_ranges(
+            range,
+            x.into_iter().chain(y).collect(),
+        ))),
+        "*" if either_empty => Range(Item::Multirange(Vec::new())),
+        "*" => Range(Item::Multirange(multirange_intersect(range, &x, &y)?)),
+        "-" if either_empty => Range(Item::Multirange(x)),
+        "-" => Range(Item::Multirange(multirange_minus(range, &x, &y)?)),
+        other => {
+            return Err(Error::new(format!(
+                "the operator {other} on a multirange is not read"
+            )))
+        }
+    })
+}
+
+/// The ranges of `x` less those of `y`, as `multirange_minus_internal` walks the two in order.
+fn multirange_minus(range: ColumnType, x: &[Item], y: &[Item]) -> Result<Vec<Item>> {
+    use std::cmp::Ordering::{Greater, Less};
+    let (subtype, discrete) = range_of(range).ok_or_else(|| Error::new("not a range"))?;
+    let truth = |o: &str, a: &Item, b: &Item| -> Result<bool> {
+        Ok(matches!(
+            range_op(range, o, a, b)?,
+            RangeAnswer::Truth(true)
+        ))
+    };
+    let mut out = Vec::new();
+    let mut i2 = 0;
+    for r in x {
+        let mut r1 = r.clone();
+        while i2 < y.len() && truth("<<", &y[i2], &r1)? {
+            i2 += 1;
+        }
+        while i2 < y.len() {
+            let r2 = &y[i2];
+            let split = match (bounds(subtype, &r1), bounds(subtype, r2)) {
+                (Some((l1, u1)), Some((l2, u2)))
+                    if cmp_bounds(&l1, &l2) == Less && cmp_bounds(&u1, &u2) == Greater =>
+                {
+                    let mut hi = l2.clone();
+                    hi.inclusive = !l2.inclusive;
+                    hi.lower = false;
+                    let mut lo = u2.clone();
+                    lo.inclusive = !u2.inclusive;
+                    lo.lower = true;
+                    Some((
+                        range_item(subtype, discrete, &l1, &hi)?,
+                        range_item(subtype, discrete, &lo, &u1)?,
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((left, right)) = split {
+                out.push(left);
+                r1 = right;
+                i2 += 1;
+            } else if truth("&&", &r1, r2)? {
+                r1 = match range_op(range, "-", &r1, r2)? {
+                    RangeAnswer::Range(i) => i,
+                    RangeAnswer::Truth(_) => unreachable!(),
+                };
+                let gone = matches!(r1, Item::Range { flags, .. } if flags & EMPTY != 0);
+                if gone || truth("<<", &r1, r2)? {
+                    break;
+                }
+                i2 += 1;
+            } else {
+                break;
+            }
+        }
+        out.push(r1);
+    }
+    Ok(canonical_ranges(range, out))
+}
+
+/// The ranges `x` and `y` both hold, as `multirange_intersect_internal` walks the two in order.
+fn multirange_intersect(range: ColumnType, x: &[Item], y: &[Item]) -> Result<Vec<Item>> {
+    let truth = |o: &str, a: &Item, b: &Item| -> Result<bool> {
+        Ok(matches!(
+            range_op(range, o, a, b)?,
+            RangeAnswer::Truth(true)
+        ))
+    };
+    let mut out = Vec::new();
+    let mut i2 = 0;
+    for r1 in x {
+        while i2 < y.len() && truth("<<", &y[i2], r1)? {
+            i2 += 1;
+        }
+        while i2 < y.len() {
+            let r2 = &y[i2];
+            if !truth("&&", r1, r2)? {
+                break;
+            }
+            if let RangeAnswer::Range(i) = range_op(range, "*", r1, r2)? {
+                out.push(i);
+            }
+            if truth("&<", r2, r1)? {
+                i2 += 1;
+            } else {
+                break;
+            }
+        }
+        if i2 >= y.len() {
+            break;
+        }
+    }
+    Ok(canonical_ranges(range, out))
+}
+
+/// An array's slice, as `array_get_slice` takes it: each dimension from its lower subscript to its
+/// upper, one not given or past the array's own its bound, the dimensions past those given whole;
+/// its lower bounds 1. Empty where the subscripts are more than its dimensions or a dimension's
+/// lower passes its upper.
+pub fn slice(a: &Item, at: &[(Option<i64>, Option<i64>)]) -> Item {
+    let empty = Item::Array {
+        elements: Vec::new(),
+        dims: Vec::new(),
+        lower: Vec::new(),
+    };
+    let Item::Array {
+        elements,
+        dims,
+        lower,
+    } = a
+    else {
+        return Item::Null;
+    };
+    let n = dims.len();
+    if n == 0 || n < at.len() {
+        return empty;
+    }
+    let mut lo = vec![0i64; n];
+    let mut hi = vec![0i64; n];
+    for i in 0..n {
+        let (l, u) = at.get(i).copied().unwrap_or((None, None));
+        let first = i64::from(lower[i]);
+        let last = first + i64::from(dims[i]) - 1;
+        lo[i] = l.filter(|&l| l >= first).unwrap_or(first);
+        hi[i] = u.filter(|&u| u <= last).unwrap_or(last);
+        if lo[i] > hi[i] {
+            return empty;
+        }
+    }
+    let mut out = Vec::new();
+    let mut at = lo.clone();
+    loop {
+        let mut offset = 0usize;
+        for i in 0..n {
+            offset = offset * dims[i] as usize + (at[i] - i64::from(lower[i])) as usize;
+        }
+        out.push(elements[offset].clone());
+        let mut d = n;
+        loop {
+            if d == 0 {
+                return Item::Array {
+                    elements: out,
+                    dims: (0..n).map(|i| (hi[i] - lo[i] + 1) as i32).collect(),
+                    lower: vec![1; n],
+                };
+            }
+            d -= 1;
+            at[d] += 1;
+            if at[d] <= hi[d] {
+                break;
+            }
+            at[d] = lo[d];
+        }
+    }
 }
 
 /// An array's elements' keys, its NULLs none.

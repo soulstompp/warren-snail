@@ -669,7 +669,7 @@ impl Snail {
             let mut groups: Vec<usize> = Vec::new();
             for (s, _) in &br.reads {
                 let c = leaves[*s].0;
-                if table.columns[c].ty.leaf_count() > 1 && !groups.contains(&c) {
+                if table.columns[c].ty.is_group() && !groups.contains(&c) {
                     groups.push(c);
                 }
             }
