@@ -288,8 +288,7 @@ impl Snail {
                     table.name
                 ))
             })?;
-        let (head, entries) =
-            crate::write::top_read(table, &table.orders[order], &self.reader.read_extent(*e)?)?;
+        let (head, entries) = decode_top(&self.reader.read_extent(*e)?)?;
         Ok((head, entries, e.pages()))
     }
 
@@ -297,6 +296,7 @@ impl Snail {
     pub(super) fn start(&self, oi: usize, want: &Want) -> Result<Walk> {
         let order = &want.table.orders[oi];
         let (head, entries, pages) = self.top(want.table, oi)?;
+        crate::write::cut_checked(want.table, order, &head)?;
         let conds = &want.side.conds;
         let texts = &want.side.texts;
         let nulls = &want.side.nulls;

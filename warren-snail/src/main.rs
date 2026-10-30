@@ -31,6 +31,7 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
        warren-snail out <file> --dir <directory>
        warren-snail blocks <file> --out <blocks.parquet>
        warren-snail census <file>
+       warren-snail recut <file> --to <new file>
        warren-snail catalog (<file> | --ddl <ddl.sql> [--taken <taken.sql>]
                             [--statements <statements.parquet>]) [--out <catalog.parquet>]
        warren-snail hold <file> --seconds <n>
@@ -60,6 +61,9 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
   blocks  one row for each column of each block, as the directory holds it, as Parquet.
   census  every page of the file, by what holds it: named by the newest root, free, or freed once
           an older round ends. Refused where a page is held twice, or by nothing.
+  recut   the snail written afresh at <new file>, where no file may be yet, every order cut under
+          the collations' versions this build reads: each table out, then written back, carrying
+          where its sequences stand. An order cut under another version is refused until re-cut.
   catalog what the snail reads of a DDL, each statement taken or refused by name, and what it
           reads and does nothing with; or the catalog a snail holds. --taken writes the
           statements taken, as a DDL a snail can be written from. --statements records each
@@ -294,6 +298,25 @@ fn cmd_out(args: &[String]) -> Result<()> {
                 t.extremes.join(", ")
             );
         }
+    }
+    Ok(())
+}
+
+fn cmd_recut(args: &[String]) -> Result<()> {
+    let file = args.first().ok_or_else(|| Error::new(USAGE))?;
+    let to = flag(args, "--to").ok_or_else(|| Error::new(USAGE))?;
+    #[cfg(feature = "standalone")]
+    let mut snail = Snail::open_writing(Path::new(file))?;
+    #[cfg(not(feature = "standalone"))]
+    let mut snail = Snail::open(Path::new(file))?;
+    for w in snail.recut(Path::new(to))? {
+        println!(
+            "{} {}: {}, {}",
+            w.table,
+            w.order,
+            n(w.rows as u64, "row"),
+            n(w.blocks as u64, "block")
+        );
     }
     Ok(())
 }
@@ -834,6 +857,7 @@ fn main() -> ExitCode {
         Some("out") => cmd_out(&args[1..]),
         Some("hold") => cmd_hold(&args[1..]),
         Some("census") => cmd_census(&args[1..]),
+        Some("recut") => cmd_recut(&args[1..]),
         Some("blocks") => cmd_blocks(&args[1..]),
         Some("catalog") => cmd_catalog(&args[1..]),
         Some("help" | "--help" | "-h") => {

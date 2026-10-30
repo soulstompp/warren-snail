@@ -565,6 +565,7 @@ pub fn write_spanned(
         span,
         None,
         crate::regs::LATEST,
+        None,
     )
 }
 
@@ -578,7 +579,39 @@ pub fn write_released(
     span: u64,
     release: u8,
 ) -> Result<Vec<Written>> {
-    write_made(path, catalog, tables, sources, span, None, release)
+    write_made(path, catalog, tables, sources, span, None, release, None)
+}
+
+/// What a snail written afresh from another carries over of it beyond its rows: where its
+/// sequences stand, and the `lc_monetary` each money column was written under.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Carried {
+    pub sequences: Vec<crate::file::SequenceState>,
+    pub monetary: Vec<(String, String, String)>,
+}
+
+/// A new snail as `write_released` writes it, carrying over what `carried` holds of the snail its
+/// rows came from.
+pub fn write_carried(
+    path: &Path,
+    catalog: &Catalog,
+    tables: &[(String, Rows)],
+    sources: &[(String, Source)],
+    span: u64,
+    release: u8,
+    carried: &Carried,
+) -> Result<Vec<Written>> {
+    write_made(
+        path,
+        catalog,
+        tables,
+        sources,
+        span,
+        None,
+        release,
+        Some(carried),
+    )
 }
 
 /// A new snail as warren-snail 0.1.0 made it, in format 7, each page map in pages of its own: for the
@@ -598,6 +631,7 @@ pub fn write_format_seven(
         span,
         Some(FORMAT_SEVEN),
         crate::regs::LATEST,
+        None,
     )
 }
 
@@ -618,9 +652,11 @@ pub fn write_format_eight(
         span,
         Some(FORMAT_EIGHT),
         crate::regs::LATEST,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_made(
     path: &Path,
     catalog: &Catalog,
@@ -629,6 +665,7 @@ fn write_made(
     span: u64,
     format: Option<u32>,
     release: u8,
+    carried: Option<&Carried>,
 ) -> Result<Vec<Written>> {
     for (name, _) in tables {
         if catalog.table(name).is_none() {
@@ -642,7 +679,7 @@ fn write_made(
         w.set_format(f);
         crate::read::old_names(&mut named, f);
     }
-    let written = write_tables(w, &named, tables, sources);
+    let written = write_tables(w, &named, tables, sources, carried);
     if written.is_err() {
         // A write refused leaves no file of its own behind.
         let _ = std::fs::remove_file(path);
@@ -664,11 +701,12 @@ fn write_tables(
     catalog: &Catalog,
     tables: &[(String, Rows)],
     sources: &[(String, Source)],
+    carried: Option<&Carried>,
 ) -> Result<Vec<Written>> {
     let mut root = Root {
         generation: 1,
         release: catalog.release,
-        monetary: crate::file::monetary_of(catalog, &[]),
+        monetary: crate::file::monetary_of(catalog, carried.map_or(&[], |c| &c.monetary)),
         ..Default::default()
     };
     crate::file::holds_catalog(w.format(), catalog)?;
@@ -759,6 +797,9 @@ fn write_tables(
         }
     }
     root.catalog = w.place(catalog.ddl.as_bytes())?;
+    if let Some(c) = carried.filter(|c| !c.sequences.is_empty()) {
+        root.sequences = w.place(&crate::file::encode_sequences(&c.sequences))?;
+    }
     // The pages passed over at a file's end, where a run would have crossed into the next, are free.
     let passed: Vec<Run> = w
         .left_free()
@@ -1029,11 +1070,17 @@ pub(crate) fn cut_under_of(table: &Table, order: &Order) -> Vec<String> {
         .collect()
 }
 
-/// An order's top page read, its head and its entries, refused by name where a level of it was cut
-/// under other rules than this build reads it under: a library collation of another version, or
-/// one this build opens none of. The file's other orders read and write as before.
+/// An order's top page read, its head and its entries, refused as `cut_checked` refuses it.
 pub fn top_read(table: &Table, order: &Order, top: &[u8]) -> Result<(Head, Vec<Entry>)> {
     let (head, entries) = crate::directory::decode_top(top)?;
+    cut_checked(table, order, &head)?;
+    Ok((head, entries))
+}
+
+/// Refuses, by name, an order a level of which was cut under other rules than this build reads it
+/// under: a library collation of another version, or one this build opens none of. Its rows read
+/// whole as before, and the file's other orders read and write as before.
+pub fn cut_checked(table: &Table, order: &Order, head: &Head) -> Result<()> {
     for (li, l) in order.levels.iter().enumerate() {
         let column = &table.columns[l.column()];
         let had = head.cut_under.get(li).map_or("", String::as_str);
@@ -1058,7 +1105,7 @@ pub fn top_read(table: &Table, order: &Order, top: &[u8]) -> Result<(Head, Vec<E
             )));
         }
     }
-    Ok((head, entries))
+    Ok(())
 }
 
 /// The leaves an order holds keyed in 128 bits, by their slots.

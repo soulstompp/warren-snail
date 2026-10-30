@@ -285,6 +285,69 @@ fn statistics(physical: PhysicalType, range: Option<(Extreme, Extreme)>, nulls: 
 }
 
 impl Snail {
+    /// The snail written afresh at `to`, where no file may be yet, every order cut under the rules
+    /// this build reads it under: each table out as `out` writes it, into a directory beside `to`,
+    /// then written back as `write` writes it, carrying where its sequences stand and the
+    /// `lc_monetary` of its money. The way across for an order cut under a collation's other
+    /// version, which is refused until re-cut.
+    pub fn recut(&mut self, to: &Path) -> Result<Vec<crate::write::Written>> {
+        if to.exists() {
+            return Err(Error::new(format!("{} exists already", to.display())));
+        }
+        let mut parts = to.as_os_str().to_owned();
+        parts.push(".parts");
+        let parts = PathBuf::from(parts);
+        std::fs::create_dir_all(&parts)
+            .map_err(|e| Error::new(format!("{}: {e}", parts.display())))?;
+        let written = self.recut_through(to, &parts);
+        let _ = std::fs::remove_dir_all(&parts);
+        written
+    }
+
+    fn recut_through(&mut self, to: &Path, parts: &Path) -> Result<Vec<crate::write::Written>> {
+        self.out(parts)?;
+        let catalog = crate::catalog::Catalog::parse_kept(&self.catalog.ddl, usize::MAX)?;
+        let mut tables = Vec::new();
+        let mut sources = Vec::new();
+        for t in &catalog.tables {
+            let files = crate::write::parquet_files(&parts.join(format!("{}.parquet", t.name)))?;
+            let mut batches = Vec::new();
+            for f in &files {
+                let file = std::fs::File::open(f)
+                    .map_err(|e| Error::new(format!("{}: {e}", f.display())))?;
+                for b in
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?
+                        .build()?
+                {
+                    batches.push(b?);
+                }
+            }
+            tables.push((
+                t.name.clone(),
+                crate::write::Rows::from_batches(t, &batches)?,
+            ));
+            sources.push((t.name.clone(), crate::write::sources(&files, t)?));
+        }
+        let sequences = if self.root.sequences.bytes > 0 {
+            crate::file::decode_sequences(&self.reader.read_extent(self.root.sequences)?)?
+        } else {
+            Vec::new()
+        };
+        let carried = crate::write::Carried {
+            sequences,
+            monetary: self.root.monetary.clone(),
+        };
+        crate::write::write_carried(
+            to,
+            &catalog,
+            &tables,
+            &sources,
+            crate::file::FILE_PAGES,
+            self.root.release,
+            &carried,
+        )
+    }
+
     /// Every table out to `<dir>/<table>.parquet`. A block holding a dead row, or a row past its
     /// sorted ones, is pruned first, as a snail open to write prunes; then each block of the
     /// table's order is one row group, its pages as they lie.
@@ -404,12 +467,16 @@ impl Snail {
                 .build()?,
         );
         // Each level of the order sorts on its column's leaves, each as its index among the file's;
-        // a numeric held as its text lies in its classes' order, not its text's, and names none.
+        // a numeric held as its text lies in its classes' order, not its text's, and names none, as
+        // does a string under a library collation, which lies in the collation's order.
         let sorting = order
             .levels
             .iter()
             .map(|l| match l {
-                Level::Column(c) if matches!(table.columns[*c].ty, ColumnType::NumericText(_)) => {
+                Level::Column(c)
+                    if matches!(table.columns[*c].ty, ColumnType::NumericText(_))
+                        || table.columns[*c].collated() =>
+                {
                     None
                 }
                 // A composed level sorts on its key, which no leaf's order in the file is.
