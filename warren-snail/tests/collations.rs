@@ -133,6 +133,36 @@ fn a_condition_on_text_under_icu_compares_by_the_collation_on_both_paths() {
         .unwrap();
     let least = sorted(&Spec::icu("en-US", None, true), &FORTY)[0];
     assert_eq!(texts(&b, 0), vec![FORTY[least as usize - 1].to_string()]);
+    let (b, _) = snail
+        .ask(
+            "WITH t AS (SELECT id, v FROM s.t) SELECT min(v) AS x, max(v) AS y FROM t",
+            None,
+        )
+        .unwrap();
+    let order = sorted(&Spec::icu("en-US", None, true), &FORTY);
+    let most = order[order.len() - 1];
+    assert_eq!(
+        (texts(&b, 0), texts(&b, 1)),
+        (
+            vec![FORTY[least as usize - 1].to_string()],
+            vec![FORTY[most as usize - 1].to_string()]
+        )
+    );
+    // A COLLATE on either side compares by it, over the column's own.
+    let bytes: Vec<i64> = (1..=40)
+        .filter(|&i| FORTY[i as usize - 1].as_bytes() < b"b".as_slice())
+        .collect();
+    for w in ["v COLLATE \"C\" < 'b'", "v < 'b' COLLATE \"C\""] {
+        let (b, _) = snail
+            .ask(
+                &format!(
+                    "WITH t AS (SELECT id, v FROM s.t) SELECT id FROM t WHERE {w} ORDER BY id"
+                ),
+                None,
+            )
+            .unwrap();
+        assert_eq!(ids(&b), bytes, "{w}");
+    }
 }
 
 #[test]

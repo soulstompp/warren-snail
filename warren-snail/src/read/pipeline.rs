@@ -397,10 +397,18 @@ impl Casings {
                 Some(x) => self.implicit(x)?,
                 None => None,
             },
-            Expr::BinaryOp { left, right, .. } => match self.implicit(left)? {
-                Some(k) => Some(k),
-                None => self.implicit(right)?,
-            },
+            // An explicit COLLATE on either side wins over a column's own.
+            Expr::BinaryOp { left, right, .. } => {
+                let (first, then) = if names_collate(right) && !names_collate(left) {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                match self.implicit(first)? {
+                    Some(k) => Some(k),
+                    None => self.implicit(then)?,
+                }
+            }
             _ => None,
         })
     }
