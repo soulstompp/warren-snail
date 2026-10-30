@@ -28,7 +28,7 @@ const REUSED_KEPT: usize = 64;
 /// What a transaction answers once one of its statements failed, until it ends, as PostgreSQL does.
 pub(super) const ABORTED: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
-use crate::places::{key, month_utc, null_key, KeyValue};
+use crate::places::{byte_key, key, month_utc, null_key, KeyValue};
 use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, leaf_descriptors, write_block, Laid, Rows};
 use crate::{Error, Result};
@@ -142,13 +142,27 @@ fn datum_at(v: &Values, i: usize) -> Datum {
     }
 }
 
-/// A value of a column of type `ty`: bytea's bytes as they are, any other as `datum_at` reads it.
+/// A value of a column of type `ty`: bytea's bytes and a bit string's key as they are, any other as
+/// `datum_at` reads it.
 pub(super) fn datum_typed(v: &Values, i: usize, ty: ColumnType) -> Datum {
     match ty {
-        ColumnType::Bytes => v
+        ty if ty.keyed_by_bytes() => v
             .text_value(i)
             .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
         _ => datum_at(v, i),
+    }
+}
+
+/// A value's key on a level of type `ty`, from the value: a number's, a string's or bytes'.
+fn level_key(ty: ColumnType, level: Level, d: &Datum, null: KeyValue) -> KeyValue {
+    match d {
+        Datum::Int(v) => key(level, *v),
+        Datum::Text(t) => byte_key(ty, &crate::strings::key_bytes(ty, t.as_bytes())),
+        Datum::Bytes(b) => byte_key(ty, b),
+        Datum::Wide(k) => KeyValue::Wide(*k),
+        Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(*b)),
+        Datum::Float8(b) => KeyValue::Int(crate::scalars::float8_key(*b)),
+        Datum::Null => null,
     }
 }
 
@@ -178,23 +192,26 @@ fn leaf_datums(ty: ColumnType, d: &Datum) -> Vec<Datum> {
     }
     let mut v = Values::new(ty);
     push(&mut v, d);
-    v.into_leaves(ty).iter().map(|l| datum_at(l, 0)).collect()
+    v.into_leaves(ty)
+        .iter()
+        .zip(ty.leaves())
+        .map(|(l, leaf)| datum_typed(l, 0, leaf.ty))
+        .collect()
 }
 
-/// A row's key on an order.
-pub(super) fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
+/// A row's key on an order of `table`.
+pub(super) fn key_of(table: &Table, order: &Order, row: &Row) -> Vec<KeyValue> {
     order
         .levels
         .iter()
         .enumerate()
-        .map(|(li, &l)| match &row[l.column()] {
-            Datum::Int(v) => key(l, *v),
-            Datum::Text(s) => KeyValue::Text(s.as_str().into()),
-            Datum::Wide(k) => KeyValue::Wide(*k),
-            Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(*b)),
-            Datum::Float8(b) => KeyValue::Int(crate::scalars::float8_key(*b)),
-            Datum::Null => null_key(order, li),
-            Datum::Bytes(_) => unreachable!("a level holds no bytea; the catalog refuses it"),
+        .map(|(li, &l)| {
+            level_key(
+                table.columns[l.column()].ty,
+                l,
+                &row[l.column()],
+                null_key(order, li),
+            )
         })
         .collect()
 }
@@ -422,19 +439,46 @@ fn check(table: &Table, row: &Row) -> Result<()> {
                     s.chars().count()
                 )))
             }
+            (ColumnType::Bpchar(Some(n)), Datum::Text(s)) if s.chars().count() != n as usize => {
+                return Err(what(format!(
+                    "is character({n}) and the row holds {} characters",
+                    s.chars().count()
+                )))
+            }
+            (ColumnType::Name, Datum::Text(s)) if s.len() > crate::strings::NAME_BYTES => {
+                return Err(what(format!("is name and the row holds {} bytes", s.len())))
+            }
+            (ColumnType::Bit(n), Datum::Bytes(k)) if crate::strings::bits_of_key(k).0 != n => {
+                return Err(what(format!(
+                    "is bit({n}) and the row holds {} bits",
+                    crate::strings::bits_of_key(k).0
+                )))
+            }
+            (ColumnType::Varbit(Some(n)), Datum::Bytes(k))
+                if crate::strings::bits_of_key(k).0 > n =>
+            {
+                return Err(what(format!(
+                    "is bit varying({n}) and the row holds {} bits",
+                    crate::strings::bits_of_key(k).0
+                )))
+            }
             (ColumnType::Numeric { precision, .. }, Datum::Int(v))
                 if v.unsigned_abs() >= 10u64.pow(precision as u32) =>
             {
                 return Err(what(format!("{v} has more digits than it holds")))
             }
-            (ColumnType::Text(_), Datum::Text(_))
-            | (ColumnType::Bytes, Datum::Bytes(_))
+            (ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name, Datum::Text(_))
+            | (ColumnType::Bytes | ColumnType::Bit(_) | ColumnType::Varbit(_), Datum::Bytes(_))
             | (ColumnType::Uuid, Datum::Wide(_))
             | (ColumnType::Float4, Datum::Float4(_))
             | (ColumnType::Float8, Datum::Float8(_)) => {}
             (
                 ColumnType::Text(_)
                 | ColumnType::Bytes
+                | ColumnType::Bpchar(_)
+                | ColumnType::Name
+                | ColumnType::Bit(_)
+                | ColumnType::Varbit(_)
                 | ColumnType::Uuid
                 | ColumnType::Float4
                 | ColumnType::Float8,
@@ -1604,13 +1648,13 @@ impl Snail {
         for c in changes {
             match c {
                 Change::Insert(r) => effects.push(Effect {
-                    key: key_of(order, r),
+                    key: key_of(table, order, r),
                     values: held(r),
                     delete: false,
                     chain: None,
                 }),
                 Change::Delete(r) => effects.push(Effect {
-                    key: key_of(order, r),
+                    key: key_of(table, order, r),
                     values: held(r),
                     delete: true,
                     chain: None,
@@ -1619,9 +1663,9 @@ impl Snail {
                     if held(o) == held(n) {
                         continue;
                     }
-                    let to = key_of(order, n);
+                    let to = key_of(table, order, n);
                     effects.push(Effect {
-                        key: key_of(order, o),
+                        key: key_of(table, order, o),
                         values: held(o),
                         delete: true,
                         chain: Some(to.clone()),
@@ -2023,14 +2067,9 @@ impl Snail {
                 .iter()
                 .zip(&level_slots)
                 .enumerate()
-                .map(|(li, (&l, &s))| match datum_at(&columns[s], p) {
-                    Datum::Int(v) => key(l, v),
-                    Datum::Text(t) => KeyValue::Text(t.into_boxed_str()),
-                    Datum::Wide(k) => KeyValue::Wide(k),
-                    Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(b)),
-                    Datum::Float8(b) => KeyValue::Int(crate::scalars::float8_key(b)),
-                    Datum::Null => null_key(order, li),
-                    Datum::Bytes(_) => unreachable!("a level holds no bytea"),
+                .map(|(li, (&l, &s))| {
+                    let ty = table.columns[l.column()].ty;
+                    level_key(ty, l, &datum_typed(&columns[s], p, ty), null_key(order, li))
                 })
                 .collect()
         };

@@ -54,6 +54,7 @@ pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
         (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => crate::scalars::scalar_text(ty, *v),
         (Datum::Int(v), _) => v.to_string(),
         (Datum::Text(s), _) => s.clone(),
+        (Datum::Bytes(k), ty) if ty.is_bits() => crate::strings::bits_text(k),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()).text().unwrap_or_default(),
         (Datum::Wide(k), _) => crate::scalars::uuid_text(*k),
         (Datum::Float4(b), _) => crate::scalars::float_text(u64::from(*b), false),
@@ -93,9 +94,31 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         ))
     };
     let out_of_range = || Error::new(format!("{} out of range", to.pg_name()));
+    // A string as text: a bpchar's without its trailing blanks, as its cast to text takes it.
+    let as_text = |d: &Datum| -> String {
+        let s = text_of(d, from).unwrap_or_default();
+        crate::strings::text_of(from, &s).to_string()
+    };
     Ok(match (from, to) {
+        (_, Bpchar(n)) => Datum::Text(crate::strings::bpchar_in(
+            &text_of(&d, from).unwrap_or_default(),
+            n,
+            false,
+        )?),
+        (_, Name) => Datum::Text(crate::strings::name_in(&as_text(&d))),
+        (Bit(_) | Varbit(_), Bit(_) | Varbit(_)) => {
+            let Datum::Bytes(k) = &d else {
+                return Err(refused());
+            };
+            let (n, varying) = match to {
+                Bit(n) => (Some(n), false),
+                Varbit(n) => (n, true),
+                _ => unreachable!("a bit string's type"),
+            };
+            Datum::Bytes(crate::strings::bits_cast(k, n, varying, false)?)
+        }
         (_, Text(n)) => {
-            let s = text_of(&d, from).unwrap_or_default();
+            let s = as_text(&d);
             match n {
                 Some(n) if s.chars().count() > n as usize => {
                     // PostgreSQL takes off a value's excess where it is only spaces.
@@ -280,9 +303,8 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             }
             Datum::Int(units as i64)
         }
-        (Text(_), Char) => {
-            let s = text_of(&d, from).unwrap_or_default();
-            Datum::Int(crate::scalars::scalar_parse(Char, &s)?)
+        (Text(_) | Bpchar(_), Char) => {
+            Datum::Int(crate::scalars::scalar_parse(Char, &as_text(&d))?)
         }
         _ => return Err(refused()),
     })
@@ -296,7 +318,9 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Int(v), ColumnType::Numeric { scale, .. }) => Value::Num(*v as i128, scale as u32),
         (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => Value::Scalar(ty, *v),
         (Datum::Int(v), _) => Value::Int(*v),
+        (Datum::Text(s), ColumnType::Bpchar(_) | ColumnType::Name) => Value::Str(ty, s.clone()),
         (Datum::Text(s), _) => Value::Text(s.clone()),
+        (Datum::Bytes(k), ty) if ty.is_bits() => Value::Bits(ty, k.clone()),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()),
         (Datum::Wide(k), _) => Value::Uuid(*k),
         (Datum::Float4(b), _) => Value::Real(f32::from_bits(*b)),
@@ -326,6 +350,8 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
         Value::Scalar(ty, k) => (Datum::Int(k), ty),
         Value::Real(f) => (Datum::Float4(f.to_bits()), ColumnType::Float4),
         Value::Double(d) => (Datum::Float8(d.to_bits()), ColumnType::Float8),
+        Value::Str(ty, s) => (Datum::Text(s), ty),
+        Value::Bits(ty, k) => (Datum::Bytes(k), ty),
     };
     assign(d, from, to, what)
 }

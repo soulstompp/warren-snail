@@ -8,7 +8,7 @@ use crate::catalog::{
     assignable, format_type, held_type, ident, level, object_name, shape, Action, Catalog, Check,
     Collation, Column, ColumnType, Domain, DomainCheck, Fact, ForeignKey, Function, Generated,
     Identity, KeyConstraint, Level, Order, Reading, Sequence, SequenceType, Shape, StatementRead,
-    Table, Type, TypeKind, BYTE_ORDER, TEXT_OPCLASSES,
+    Table, Type, TypeKind, TEXT_OPCLASSES,
 };
 use crate::{Error, Result};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -2355,22 +2355,11 @@ impl Draft {
                         collation.name
                     )));
                 }
-                if let Some(f) = &collation.from {
-                    if !BYTE_ORDER.contains(&f.as_str())
-                        && !self.collations.iter().any(|c| &c.name == f)
-                    {
-                        return Err(Error::new(format!(
-                            "CREATE COLLATION {}: FROM {f}: only C, POSIX and the DDL's own \
-                             collations of byte order are read",
-                            collation.name
-                        )));
-                    }
-                }
-                if !collation.byte_order() {
+                if collation.casing(&self.collations).is_none() {
                     return Err(Error::new(format!(
-                        "CREATE COLLATION {}: text is compared by its bytes, so only a collation \
-                         of byte order is read (libc C or POSIX, builtin C)",
-                        collation.name
+                        "CREATE COLLATION {}: {}",
+                        collation.name,
+                        crate::catalog::NOT_HELD
                     )));
                 }
                 self.collations.push(collation);
@@ -2670,16 +2659,15 @@ impl Draft {
                     }
                     ColumnOption::Collation(n) => {
                         let collation = object_name(n);
-                        if !ty.is_text() {
+                        if !ty.is_string() {
                             return Err(Error::new(format!(
                                 "{cwhat}: COLLATE {collation} on a column that is not text"
                             )));
                         }
-                        if !BYTE_ORDER.contains(&collation.as_str())
-                            && !self.collations.iter().any(|k| k.name == collation)
-                        {
+                        if crate::catalog::collation_held(&collation, &self.collations).is_none() {
                             return Err(Error::new(format!(
-                                "{cwhat}: COLLATE {collation}: text is compared by its bytes, so only C is read"
+                                "{cwhat}: COLLATE {collation}: {}",
+                                crate::catalog::NOT_HELD
                             )));
                         }
                         col.collation = Some(collation);
@@ -3301,7 +3289,11 @@ impl Draft {
                     let o = object_name(o);
                     let o = o.strip_prefix("pg_catalog.").unwrap_or(&o).to_string();
                     let text = matches!(s, Shape::Column(k) if t.columns[k].ty.is_text());
-                    if o != default && !(text && TEXT_OPCLASSES.contains(&o.as_str())) {
+                    let bpchar = matches!(s, Shape::Column(k) if matches!(t.columns[k].ty, ColumnType::Bpchar(_)));
+                    if o != default
+                        && !(text && TEXT_OPCLASSES.contains(&o.as_str()))
+                        && !(bpchar && o == "bpchar_pattern_ops")
+                    {
                         return Err(Error::new(format!(
                             "{shown}: the operator class {o} is not read on {}",
                             c.column.expr
@@ -3511,17 +3503,6 @@ fn finish_table(d: &Declared) -> Result<Table> {
         });
     }
     for o in &orders {
-        if let Some(l) = o
-            .levels
-            .iter()
-            .find(|l| columns[l.column()].ty == ColumnType::Bytes)
-        {
-            return Err(Error::new(format!(
-                "{}: {} is bytea, and a bytea level is not cut",
-                o.name,
-                columns[l.column()].name
-            )));
-        }
         // xid and cid have only a hash operator class, so PostgreSQL keys no B-tree on them.
         if let Some(l) = o.levels.iter().find(|l| !columns[l.column()].ty.ordered()) {
             return Err(Error::new(format!(
@@ -3626,12 +3607,18 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 let s = if id.always { "always" } else { "by default" };
                 fact("column", &o, "identity", s.into());
             }
-            if col.ty.is_text() {
+            if col.ty.is_string() {
+                // name's own collation is C; any other string type's the database's default.
+                let own = if col.ty == ColumnType::Name {
+                    "C"
+                } else {
+                    "default"
+                };
                 fact(
                     "column",
                     &o,
                     "collation",
-                    col.collation.clone().unwrap_or_else(|| "default".into()),
+                    col.collation.clone().unwrap_or_else(|| own.into()),
                 );
             }
         }

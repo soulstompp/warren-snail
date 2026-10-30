@@ -68,6 +68,19 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             table.name, k.name
         )));
     }
+    // Formats 7 and 8 key a level by a number or text alone.
+    if let Some((o, c)) = table.orders.iter().find_map(|o| {
+        o.levels
+            .iter()
+            .map(|l| &table.columns[l.column()])
+            .find(|c| c.ty == crate::catalog::ColumnType::Bytes)
+            .map(|c| (o, c))
+    }) {
+        return Err(crate::Error::new(format!(
+            "{}: {} is a bytea level of {}, {way}",
+            table.name, c.name, o.name
+        )));
+    }
     // Formats 7 and 8 hold a column as one leaf.
     if let Some(c) = table.columns.iter().find(|c| c.ty.leaf_count() > 1) {
         let leaves: Vec<String> = c.ty.leaves().iter().map(|l| l.name(&c.name)).collect();
@@ -171,6 +184,10 @@ impl Out {
         self.u32(s.len() as u32);
         self.0.extend_from_slice(s.as_bytes());
     }
+    pub fn bytes(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
     pub fn extent(&mut self, e: Extent) {
         self.u64(e.start);
         self.u64(e.bytes);
@@ -221,6 +238,10 @@ impl<'a> In<'a> {
         let n = self.u32()? as usize;
         String::from_utf8(self.take(n)?.to_vec())
             .map_err(|_| Error::new("a name in the file is not UTF-8"))
+    }
+    pub fn bytes(&mut self) -> Result<Vec<u8>> {
+        let n = self.u32()? as usize;
+        Ok(self.take(n)?.to_vec())
     }
     pub fn extent(&mut self) -> Result<Extent> {
         Ok(Extent {

@@ -35,6 +35,10 @@ pub enum Value {
     Real(f32),
     /// A double precision.
     Double(f64),
+    /// A value of a string type other than text, a bpchar's or a name's: its type and its own text.
+    Str(ColumnType, String),
+    /// A bit string: its type, bit(n) or bit varying, and its key.
+    Bits(ColumnType, Vec<u8>),
 }
 
 impl Value {
@@ -75,7 +79,19 @@ impl Value {
             Value::Scalar(ty, k) => crate::scalars::scalar_text(*ty, *k),
             Value::Real(f) => crate::scalars::float_text(u64::from(f.to_bits()), false),
             Value::Double(d) => crate::scalars::float_text(d.to_bits(), true),
+            Value::Str(_, s) => s.clone(),
+            Value::Bits(_, k) => crate::strings::bits_text(k),
         })
+    }
+
+    /// The bytes a string is compared by, beside another string: text's and a name's own, a
+    /// bpchar's without its trailing blanks.
+    fn string_key(&self) -> Option<&[u8]> {
+        match self {
+            Value::Text(t) => Some(t.as_bytes()),
+            Value::Str(ty, s) => Some(crate::strings::text_of(*ty, s).as_bytes()),
+            _ => None,
+        }
     }
 }
 
@@ -119,8 +135,11 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
             ));
         }
     }
+    if let (Some(x), Some(y)) = (a.string_key(), b.string_key()) {
+        return Ok(Some(x.cmp(y)));
+    }
     Ok(Some(match (a, b) {
-        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Value::Bits(_, x), Value::Bits(_, y)) => x.cmp(y),
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
@@ -170,6 +189,8 @@ fn key(v: &Value) -> Key {
         Value::Scalar(ty, k) => Key::Scalar(*ty, *k),
         Value::Real(f) => Key::Real(crate::scalars::float4_key(f.to_bits())),
         Value::Double(d) => Key::Double(crate::scalars::float8_key(d.to_bits())),
+        Value::Str(..) => Key::Text(String::from_utf8_lossy(v.string_key().unwrap()).into()),
+        Value::Bits(_, k) => Key::Bytes(k.clone()),
     }
 }
 
@@ -400,11 +421,21 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
     let name = to.to_string().to_lowercase();
     let base = name.split('(').next().unwrap_or("").trim().to_string();
     Ok(match base.as_str() {
-        "text" | "varchar" | "character varying" => Value::Text(v.text().unwrap()),
+        // A bpchar's trailing blanks are taken off where it becomes text.
+        "text" | "varchar" | "character varying" => match v {
+            Value::Str(ty, s) => Value::Text(crate::strings::text_of(ty, &s).to_string()),
+            v => Value::Text(v.text().unwrap()),
+        },
         "bigint" | "int8" | "integer" | "int" | "int4" | "smallint" | "int2" => match v {
             Value::Real(f) => float_integer(f64::from(f), &base)?,
             Value::Double(d) => float_integer(d, &base)?,
             Value::Scalar(ty, k) => scalar_integer(ty, k, &base)?,
+            Value::Bits(_, k) if matches!(base.as_str(), "integer" | "int" | "int4") => {
+                bits_integer(&k, 32)?
+            }
+            Value::Bits(_, k) if matches!(base.as_str(), "bigint" | "int8") => {
+                bits_integer(&k, 64)?
+            }
             Value::Int(x) => Value::Int(x),
             Value::Num(m, s) => {
                 let d = 10i128.pow(s);
@@ -458,7 +489,7 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
         }
         "bytea" => match v {
             Value::Bytes(b) => Value::Bytes(b),
-            Value::Text(t) => Value::Bytes(hex_bytes(&t)?),
+            Value::Text(t) => Value::Bytes(crate::strings::bytea_in(&t)?),
             Value::Uuid(k) => Value::Bytes(crate::scalars::uuid_bytes(k).to_vec()),
             other => return Err(Error::new(format!("{other:?} cast to bytea"))),
         },
@@ -502,12 +533,94 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
                 scalar_cast(v, ColumnType::Reg(kind, release))?
             }
             Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty)?,
+            Ok(ty @ (ColumnType::Bpchar(_) | ColumnType::Name)) => string_cast(v, ty, true)?,
+            Ok(ty) if ty.is_bits() => bits_cast(v, ty, true)?,
             Ok(ty @ (ColumnType::Float4 | ColumnType::Float8)) => {
                 float_cast(v, ty == ColumnType::Float8)?
             }
             _ => return Err(Error::new(format!("a cast to {to} is not read"))),
         },
     })
+}
+
+/// A value cast to bpchar or name, as PostgreSQL's casts take each kind: a string's text, a bpchar's
+/// without its trailing blanks into a name, held to the type's length, cut where `explicit`; any
+/// other value's text output, as its cast to a string type through its output takes it.
+pub(crate) fn string_cast(v: Value, ty: ColumnType, explicit: bool) -> Result<Value> {
+    let s = match &v {
+        Value::Null => return Ok(Value::Null),
+        Value::Str(from, s) if ty == ColumnType::Name => {
+            crate::strings::text_of(*from, s).to_string()
+        }
+        other => other.text().unwrap_or_default(),
+    };
+    Ok(match ty {
+        ColumnType::Bpchar(n) => Value::Str(ty, crate::strings::bpchar_in(&s, n, explicit)?),
+        _ => Value::Str(ColumnType::Name, crate::strings::name_in(&s)),
+    })
+}
+
+/// A value cast to a bit string of type `ty`, as PostgreSQL's casts take each kind: a bit string
+/// cut or padded to bit(n)'s length and cut to bit varying(n)'s where `explicit`, refused otherwise;
+/// text read by its input; an integer's bits, the rightmost n of its two's complement, into bit(n).
+pub(crate) fn bits_cast(v: Value, ty: ColumnType, explicit: bool) -> Result<Value> {
+    let (n, varying) = match ty {
+        ColumnType::Bit(n) => (Some(n), false),
+        ColumnType::Varbit(n) => (n, true),
+        _ => unreachable!("a bit string's type"),
+    };
+    Ok(match v {
+        Value::Null => Value::Null,
+        Value::Bits(_, k) => Value::Bits(ty, crate::strings::bits_cast(&k, n, varying, explicit)?),
+        Value::Text(t) => Value::Bits(ty, crate::strings::bits_parse(&t, n, varying)?),
+        Value::Int(x) if !varying && explicit => {
+            let n = n.unwrap_or(1);
+            let wide = if i32::try_from(x).is_ok() { 32 } else { 64 };
+            let mut bits = vec![0u8; (n as usize).div_ceil(8)];
+            for i in 0..n {
+                let from_right = n - 1 - i;
+                let bit = if from_right >= wide {
+                    x < 0
+                } else {
+                    (x >> from_right) & 1 == 1
+                };
+                if bit {
+                    bits[i as usize / 8] |= 0x80 >> (i % 8);
+                }
+            }
+            Value::Bits(ty, crate::strings::bits_key(n, &bits))
+        }
+        other => {
+            return Err(Error::new(format!(
+                "cannot cast type {} to {}",
+                kind_name(&other),
+                ty.pg_name()
+            )))
+        }
+    })
+}
+
+/// A bit string cast to an integer of `bits` bits, as `bittoint4` and `bittoint8` take it: its
+/// bits as an unsigned number, refused past the integer's width.
+fn bits_integer(k: &[u8], bits: u32) -> Result<Value> {
+    let (len, b) = crate::strings::bits_of_key(k);
+    if len > bits {
+        return Err(Error::new(if bits == 32 {
+            "integer out of range"
+        } else {
+            "bigint out of range"
+        }));
+    }
+    let mut v: u64 = 0;
+    for x in &b {
+        v = v << 8 | u64::from(*x);
+    }
+    v >>= b.len() as u32 * 8 - len;
+    Ok(Value::Int(if bits == 32 {
+        i64::from(v as u32 as i32)
+    } else {
+        v as i64
+    }))
 }
 
 /// The name PostgreSQL gives a value's type: an integer's by its range.
@@ -524,6 +637,10 @@ fn kind_name(v: &Value) -> String {
         Value::Scalar(ty, _) => ty.pg_name(),
         Value::Real(_) => "real".into(),
         Value::Double(_) => "double precision".into(),
+        Value::Str(ColumnType::Name, _) => "name".into(),
+        Value::Str(..) => "character".into(),
+        Value::Bits(ColumnType::Bit(_), _) => "bit".into(),
+        Value::Bits(..) => "bit varying".into(),
     }
 }
 
@@ -931,23 +1048,6 @@ fn boolean_of(t: &str) -> Result<Value> {
         .ok_or_else(|| Error::new(format!("invalid input syntax for type boolean: \"{t}\"")))
 }
 
-/// Bytes written as PostgreSQL's hex form, `\x` and two hex digits a byte.
-pub fn hex_bytes(t: &str) -> Result<Vec<u8>> {
-    let h = t
-        .strip_prefix("\\x")
-        .ok_or_else(|| Error::new(format!("'{t}' is not bytea's hex form")))?;
-    if h.len() % 2 != 0 {
-        return Err(Error::new(format!("'{t}' has an odd count of hex digits")));
-    }
-    (0..h.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&h[i..i + 2], 16)
-                .map_err(|_| Error::new(format!("'{t}' is not bytea's hex form")))
-        })
-        .collect()
-}
-
 fn numeric_op(a: &Value, b: &Value, op: fn(i128, i128) -> Option<i128>) -> Result<Value> {
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
@@ -1004,6 +1104,14 @@ fn literal_type(ty: ColumnType) -> ColumnType {
     }
 }
 
+/// A string type without its length: the type a literal beside one is read as.
+fn unbounded(ty: ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::Bpchar(_) => ColumnType::Bpchar(None),
+        other => other,
+    }
+}
+
 /// Two values compared, a quoted literal beside a boolean or a uuid read as one, as PostgreSQL gives
 /// its unknown type the other side's.
 fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value)> {
@@ -1038,6 +1146,31 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
             let ty = literal_type(*ty);
             (Value::Scalar(ty, crate::scalars::scalar_parse(ty, t)?), y)
         }
+        // A quoted literal beside bytea, a bpchar, a name or a bit string is read by that type's
+        // input.
+        (Value::Bytes(_), Value::Text(t)) if quoted(right) => {
+            let t = Value::Bytes(crate::strings::bytea_in(t)?);
+            (x, t)
+        }
+        (Value::Text(t), Value::Bytes(_)) if quoted(left) => {
+            (Value::Bytes(crate::strings::bytea_in(t)?), y)
+        }
+        (Value::Str(ty, _), Value::Text(t)) if quoted(right) => {
+            let t = string_cast(Value::Text(t.clone()), unbounded(*ty), false)?;
+            (x, t)
+        }
+        (Value::Text(t), Value::Str(ty, _)) if quoted(left) => (
+            string_cast(Value::Text(t.clone()), unbounded(*ty), false)?,
+            y,
+        ),
+        (Value::Bits(..), Value::Text(t)) if quoted(right) => {
+            let t = bits_cast(Value::Text(t.clone()), ColumnType::Varbit(None), false)?;
+            (x, t)
+        }
+        (Value::Text(t), Value::Bits(..)) if quoted(left) => (
+            bits_cast(Value::Text(t.clone()), ColumnType::Varbit(None), false)?,
+            y,
+        ),
         (Value::Scalar(..), Value::Int(_)) => {
             let y = integer_beside(&x, y)?;
             (x, y)
@@ -1073,6 +1206,12 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             }
             SqlValue::Number(s, _) => numeric_literal(s)?,
             SqlValue::SingleQuotedString(s) => Value::Text(s.clone()),
+            // A bit-string constant is a bit of its own length.
+            SqlValue::SingleQuotedByteStringLiteral(_) | SqlValue::HexStringLiteral(_) => {
+                let s = super::question::bit_literal(e).unwrap();
+                let k = crate::strings::bits_parse(&s, None, false)?;
+                Value::Bits(ColumnType::Bit(crate::strings::bits_of_key(&k).0), k)
+            }
             SqlValue::Null => Value::Null,
             SqlValue::Boolean(b) => Value::Bool(*b),
             SqlValue::Placeholder(p) => {
@@ -1491,27 +1630,37 @@ impl Acc {
             Some(v) if v.is_null() => return Ok(()),
             Some(v) => v,
         };
-        // PostgreSQL has no sum, min or max of a boolean or a uuid.
-        if let (Value::Bool(_) | Value::Uuid(_), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_)) =
-            (&v, &self)
-        {
+        // PostgreSQL has no sum, min or max of a boolean, a uuid or a bit string, and no sum of a
+        // string or bytea.
+        if matches!(
+            (&v, &self),
+            (
+                Value::Bool(_) | Value::Uuid(_) | Value::Bits(..),
+                Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_),
+            ) | (
+                Value::Text(_) | Value::Str(..) | Value::Bytes(_),
+                Acc::Sum(_)
+            )
+        ) {
             let name = match self {
                 Acc::Sum(_) => "sum",
                 Acc::Least(_) => "min",
                 _ => "max",
             };
-            let ty = if matches!(v, Value::Bool(_)) {
-                "boolean"
-            } else {
-                "uuid"
-            };
-            return Err(Error::new(format!("function {name}({ty}) does not exist")));
+            return Err(Error::new(format!(
+                "function {name}({}) does not exist",
+                kind_name(&v)
+            )));
         }
         // Of the scalars, sum is money's alone; min and max are an oid's, an xid8's, a pg_lsn's,
         // money's and a tid's, and a `"char"`'s through its text.
         let v = match (&v, &self) {
             (Value::Scalar(ColumnType::Char, _), Acc::Least(_) | Acc::Greatest(_)) => {
                 Value::Text(v.text().unwrap_or_default())
+            }
+            // A name's min and max are text's, as PostgreSQL reads a name through text.
+            (Value::Str(ColumnType::Name, s), Acc::Least(_) | Acc::Greatest(_)) => {
+                Value::Text(s.clone())
             }
             // A reg* type's min and max are oid's, an oid.
             (Value::Scalar(ColumnType::Reg(..), k), Acc::Least(_) | Acc::Greatest(_)) => {
@@ -2304,9 +2453,25 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
     for (a, field) in batch.columns().iter().zip(schema.fields()) {
         let any = a.as_any();
         let scalar = crate::scalars::field_scalar(field);
+        let string = crate::strings::field_string(field);
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Value::Null
+            } else if let Some(ty) = string.filter(|t| t.is_bits()) {
+                Value::Bits(
+                    ty,
+                    crate::strings::bits_key_at(ty, a.as_ref(), r).ok_or_else(|| {
+                        Error::new(format!("{} is not of its type", field.name()))
+                    })?,
+                )
+            } else if let Some(ty) = string {
+                Value::Str(
+                    ty,
+                    any.downcast_ref::<StringArray>()
+                        .ok_or_else(|| Error::new(format!("{} is not of its type", field.name())))?
+                        .value(r)
+                        .to_string(),
+                )
             } else if let Some(ty) = scalar {
                 Value::Scalar(
                     ty,
@@ -2396,6 +2561,30 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
             })
             .max();
         let first = col().find(|v| !v.is_null());
+        if let Some(Value::Str(ty, _) | Value::Bits(ty, _)) = first {
+            // A column of bit strings of more than one type is bit varying.
+            let ty = match *ty {
+                ty if col().all(|v| match v {
+                    Value::Str(t, _) | Value::Bits(t, _) => *t == ty,
+                    _ => true,
+                }) =>
+                {
+                    ty
+                }
+                ty if ty.is_bits() => ColumnType::Varbit(None),
+                _ => ColumnType::Bpchar(None),
+            };
+            arrays.push(crate::strings::string_array(
+                ty,
+                col().map(|v| match v {
+                    Value::Str(_, s) => Some(s.as_bytes()),
+                    Value::Bits(_, k) => Some(k.as_slice()),
+                    _ => None,
+                }),
+            ));
+            fields.push(crate::strings::string_field(name, ty, true));
+            continue;
+        }
         if let Some(Value::Scalar(ty, _)) = first {
             let ty = *ty;
             arrays.push(crate::scalars::scalar_array(
@@ -2548,7 +2737,7 @@ mod tests {
             Value::Int(100000)
         ));
         assert_eq!(Value::Bytes(vec![0xc1, 0x01]).text().unwrap(), "\\xc101");
-        assert_eq!(hex_bytes("\\xc101").unwrap(), [0xc1, 0x01]);
+        assert_eq!(crate::strings::bytea_in("\\xc101").unwrap(), [0xc1, 0x01]);
     }
 
     fn query(sql: &str) -> Query {

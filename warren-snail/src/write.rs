@@ -139,6 +139,24 @@ impl Rows {
                             .unwrap();
                         out.extend(a.iter());
                     }
+                    (Values::Text(out), ty, dt)
+                        if matches!(ty, ColumnType::Bpchar(_) | ColumnType::Name)
+                            && matches!(
+                                dt,
+                                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                            ) =>
+                    {
+                        let a = arrow::compute::cast(a, &DataType::Utf8)?;
+                        let a = a.as_any().downcast_ref::<StringArray>().unwrap();
+                        out.extend(a.iter().map(|v| v.map(str::to_string)));
+                    }
+                    (Values::Utf8(out), ty, dt)
+                        if ty.is_bits() && *dt == crate::strings::string_arrow(ty) =>
+                    {
+                        out.extend((0..a.len()).map(|r| {
+                            crate::strings::bits_key_at(ty, a.as_ref(), r).map(ByteArray::from)
+                        }));
+                    }
                     (Values::Text(out), ColumnType::Text(_), DataType::Utf8) => {
                         let a = a.as_any().downcast_ref::<StringArray>().unwrap();
                         out.extend(a.iter().map(|v| v.map(str::to_string)));
@@ -215,7 +233,7 @@ fn row_value(ty: ColumnType, v: &Values, i: usize) -> crate::read::statement::Da
     }
     match (ty, v) {
         (_, Values::Int(x)) => x[i].map_or(Datum::Null, Datum::Int),
-        (ColumnType::Bytes, _) => v
+        (ty, _) if ty.keyed_by_bytes() => v
             .text_value(i)
             .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
         _ => v
@@ -694,11 +712,13 @@ pub(crate) fn laid_out(
             }
             let v = match column {
                 Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => {
-                    let s = column.text(r).unwrap();
+                    let ty = table.columns[l.column()].ty;
+                    let held = column.text_value(r).unwrap();
+                    let key = crate::strings::key_bytes(ty, held.data());
                     if !fixed {
-                        text_sublevels[li] = text_sublevels[li].max(s.len() as u32 + 1);
+                        text_sublevels[li] = crate::places::rungs_for(ty, &key, text_sublevels[li]);
                     }
-                    unsorted.push(KeyValue::Text(s.into()));
+                    unsorted.push(crate::places::byte_key(ty, &key));
                     continue;
                 }
                 Values::Wide(v) => {
@@ -814,6 +834,8 @@ pub(crate) fn level_kinds(table: &Table, order: &Order) -> Vec<u32> {
             let ty = table.columns[l.column()].ty;
             if ty.is_wide() {
                 WIDE_LEVEL
+            } else if ty.keyed_by_bytes() {
+                crate::directory::BYTES_LEVEL | 1
             } else {
                 ty.is_byte_array() as u32
             }

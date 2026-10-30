@@ -7,8 +7,8 @@ use super::question::{Countable, Item, Key, Select, Sort};
 use crate::catalog::{ColumnType, Table};
 use crate::Result;
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+    ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{Field, Schema};
@@ -50,6 +50,49 @@ impl PartialOrd for Text {
 impl Ord for Text {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.data().cmp(other.0.data())
+    }
+}
+
+/// A value compared by a key other than its own bytes, a bpchar's without its trailing blanks:
+/// compared, grouped and hashed by its key, and written as its own bytes.
+#[derive(Clone, Debug)]
+pub struct Keyed {
+    pub key: Box<[u8]>,
+    pub image: Text,
+}
+
+impl Keyed {
+    pub fn new(key: Box<[u8]>, image: ByteArray) -> Keyed {
+        Keyed {
+            key,
+            image: Text(image),
+        }
+    }
+}
+
+impl PartialEq for Keyed {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Keyed {}
+
+impl std::hash::Hash for Keyed {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state)
+    }
+}
+
+impl PartialOrd for Keyed {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Keyed {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
     }
 }
 
@@ -118,6 +161,14 @@ fn merge(into: &mut [Acc], from: &[Acc]) {
                 *over |= *o;
             }
             (Acc::FloatSum(_, over), Acc::FloatSum(None, o)) => *over |= *o,
+            (Acc::Cell(x, greatest), Acc::Cell(Some(y), _)) => {
+                let take = x
+                    .as_ref()
+                    .is_none_or(|x| if *greatest { y > x } else { y < x });
+                if take {
+                    *x = Some(y.clone());
+                }
+            }
             (Acc::Avg(n, sx, sxx, over), Acc::Avg(m, sy, syy, o)) => {
                 // Two runs of rows combined as PostgreSQL's float8_combine combines them.
                 if *m > 0.0 {
@@ -176,6 +227,8 @@ pub enum Cell {
     Wide(i128),
     /// A float, compared by its class and written as its own bits.
     Float(Float),
+    /// A value compared by a key other than its own bytes, and written as its own bytes.
+    Keyed(Keyed),
 }
 
 impl Cell {
@@ -213,7 +266,7 @@ pub fn same(a: &[Dict], b: &[Dict]) -> bool {
 }
 
 /// A group's aggregate as rows arrive.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Acc {
     Count(u64),
@@ -227,6 +280,9 @@ pub enum Acc {
     /// A float's rows, their sum and their sum of squared deviations, as PostgreSQL's
     /// float8_accum folds them, and whether finite numbers made either infinite on the way.
     Avg(f64, f64, f64, bool),
+    /// The least value so far, or the greatest where `greatest`, of a column whose values are no
+    /// number: a string's, bytea's, a bit string's.
+    Cell(Option<Cell>, bool),
 }
 
 /// The answer as rows arrive, each as the cells of the question's inputs.
@@ -347,6 +403,15 @@ impl Answer {
                     Acc::FloatSum(None, false)
                 }
                 Item::Avg(_) => Acc::Avg(0.0, 0.0, 0.0, false),
+                Item::Least(_) | Item::Greatest(_)
+                    if typed
+                        .get(at)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|t| t.is_byte_array() || t.is_bits()) =>
+                {
+                    Acc::Cell(None, matches!(i, Item::Greatest(_)))
+                }
                 Item::Sum(_) => Acc::Sum(None),
                 Item::Least(_) => Acc::Least(None),
                 Item::Greatest(_) => Acc::Greatest(None),
@@ -362,6 +427,7 @@ impl Answer {
     /// Adds `n` rows of these cells.
     pub fn add_times(&mut self, cells: &[Cell], n: u64) {
         let typed = &self.typed;
+        let dicts = &self.dicts;
         match &mut self.body {
             Body::Rows(rows) => {
                 let row: Vec<Cell> = if self.coded {
@@ -456,6 +522,18 @@ impl Answer {
                                     } else if x.is_nan() || x.is_infinite() {
                                         *sxx = f64::NAN;
                                     }
+                                }
+                            }
+                        }
+                        (Acc::Cell(m, greatest), Item::Least(c) | Item::Greatest(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            if cells[at] != Cell::Null {
+                                let y = as_text(&cells[at], &dicts[at]);
+                                let take =
+                                    m.as_ref()
+                                        .is_none_or(|x| if *greatest { &y > x } else { &y < x });
+                                if take {
+                                    *m = Some(y);
                                 }
                             }
                         }
@@ -699,6 +777,7 @@ impl Answer {
                                 (_, Acc::Least(m) | Acc::Greatest(m)) => {
                                     m.map_or(Cell::Null, |v| Cell::Int(v as i64))
                                 }
+                                (_, Acc::Cell(m, _)) => m.unwrap_or(Cell::Null),
                                 (Item::Sum(c), Acc::FloatSum(total, _)) => {
                                     total.map_or(Cell::Null, |t| {
                                         float_cell(
@@ -796,21 +875,13 @@ impl Answer {
                                 .collect::<TimestampMicrosecondArray>()
                                 .with_timezone("UTC"),
                         ),
-                        ColumnType::Text(_) => Arc::new(
-                            rows.iter()
-                                .map(|r| match &r[i] {
-                                    Cell::Text(t) => Some(t.as_str()),
-                                    _ => None,
-                                })
-                                .collect::<StringArray>(),
-                        ),
-                        ColumnType::Bytes => Arc::new(
-                            rows.iter()
-                                .map(|r| match &r[i] {
-                                    Cell::Text(t) => Some(t.0.data()),
-                                    _ => None,
-                                })
-                                .collect::<BinaryArray>(),
+                        ty if ty.is_byte_array() || ty.is_bits() => crate::strings::string_array(
+                            ty,
+                            rows.iter().map(|r| match &r[i] {
+                                Cell::Text(t) => Some(t.0.data()),
+                                Cell::Keyed(k) => Some(k.image.0.data()),
+                                _ => None,
+                            }),
                         ),
                         ColumnType::Numeric { precision, scale } => Arc::new(
                             ints()
@@ -897,9 +968,21 @@ impl Answer {
                 }
                 _ => None,
             };
-            fields.push(match scalar {
-                Some(ty) => crate::scalars::scalar_field(name, ty, nullable),
-                None => Field::new(name, a.data_type().clone(), nullable),
+            // A name's min and max are text's, as PostgreSQL reads them through text.
+            let named = match *item {
+                Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) => {
+                    Some(tables[c.side].columns[c.column].ty).filter(|&t| {
+                        crate::strings::is_named(t)
+                            && !(matches!(*item, Item::Least(_) | Item::Greatest(_))
+                                && t == ColumnType::Name)
+                    })
+                }
+                _ => None,
+            };
+            fields.push(match (scalar, named) {
+                (Some(ty), _) => crate::scalars::scalar_field(name, ty, nullable),
+                (None, Some(ty)) => crate::strings::string_field(name, ty, nullable),
+                (None, None) => Field::new(name, a.data_type().clone(), nullable),
             });
             arrays.push(a);
         }

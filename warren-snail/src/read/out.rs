@@ -110,6 +110,8 @@ fn extremes(
             Extreme::Bytes(crate::scalars::fixed_of_key(ty, k))
         }
         Extreme::Int(k) => Extreme::Int(crate::scalars::raw_of_bits(k, bits)),
+        // A bit string, held as its key, is written as its bits.
+        Extreme::Bytes(k) if ty.is_bits() => Extreme::Bytes(crate::strings::bits_of_key(&k).1),
         Extreme::Float(k, _) if k == 0 => Extreme::Float(
             k,
             match (ty, least) {

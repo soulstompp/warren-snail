@@ -307,8 +307,33 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             ColumnType::Text(n),
             &col.name,
         )?,
-        ColumnType::Bytes => Datum::Bytes(super::pipeline::hex_bytes(
+        ColumnType::Bytes => Datum::Bytes(crate::strings::bytea_in(
             &text_literal(e).map_err(|_| wrong())?,
+        )?),
+        // A literal is read by its type's input, under the column's modifier: a bpchar padded to its
+        // length or its excess blanks taken off, a name cut to 63 bytes, a bit string held to its
+        // length.
+        ColumnType::Bpchar(n) => Datum::Text(crate::strings::bpchar_in(
+            &text_literal(e).map_err(|_| wrong())?,
+            n,
+            false,
+        )?),
+        ColumnType::Name => Datum::Text(crate::strings::name_in(
+            &text_literal(e).map_err(|_| wrong())?,
+        )),
+        ColumnType::Bit(n) => Datum::Bytes(crate::strings::bits_parse(
+            &super::question::bit_literal(e)
+                .map_or_else(|| text_literal(e), Ok)
+                .map_err(|_| wrong())?,
+            Some(n),
+            false,
+        )?),
+        ColumnType::Varbit(n) => Datum::Bytes(crate::strings::bits_parse(
+            &super::question::bit_literal(e)
+                .map_or_else(|| text_literal(e), Ok)
+                .map_err(|_| wrong())?,
+            n,
+            true,
         )?),
         ColumnType::Numeric { precision, scale } => {
             let text = match e {

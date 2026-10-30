@@ -175,31 +175,31 @@ impl Select {
     }
 }
 
-/// A condition on a text column: its values between two bounds, compared by their bytes, less those
-/// `except` names.
+/// A condition on a column of a string type, bytea or a bit string: its values between two bounds,
+/// compared by the bytes they are keyed by (`strings::key_bytes`), less those `except` names.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct TextCond {
     pub column: usize,
-    pub lo: Bound<String>,
-    pub hi: Bound<String>,
-    pub except: Vec<String>,
+    pub lo: Bound<Vec<u8>>,
+    pub hi: Bound<Vec<u8>>,
+    pub except: Vec<Vec<u8>>,
 }
 
 impl TextCond {
-    pub fn holds(&self, v: &str) -> bool {
+    /// Whether it keeps a value keyed by `v`.
+    pub fn holds(&self, v: &[u8]) -> bool {
         if self.except.iter().any(|x| x == v) {
             return false;
         }
-        let v = v.as_bytes();
         let above = match &self.lo {
-            Included(l) => v >= l.as_bytes(),
-            Excluded(l) => v > l.as_bytes(),
+            Included(l) => v >= l.as_slice(),
+            Excluded(l) => v > l.as_slice(),
             Unbounded => true,
         };
         let below = match &self.hi {
-            Included(h) => v <= h.as_bytes(),
-            Excluded(h) => v < h.as_bytes(),
+            Included(h) => v <= h.as_slice(),
+            Excluded(h) => v < h.as_slice(),
             Unbounded => true,
         };
         above && below
@@ -208,17 +208,15 @@ impl TextCond {
     fn is_empty(&self) -> bool {
         match (&self.lo, &self.hi) {
             (Unbounded, _) | (_, Unbounded) => false,
-            (Included(l), Included(h)) => {
-                l.as_bytes() > h.as_bytes() || (l == h && self.except.contains(l))
-            }
-            (Included(l) | Excluded(l), Included(h) | Excluded(h)) => l.as_bytes() >= h.as_bytes(),
+            (Included(l), Included(h)) => l > h || (l == h && self.except.contains(l)),
+            (Included(l) | Excluded(l), Included(h) | Excluded(h)) => l >= h,
         }
     }
 }
 
 /// The tighter of two bounds on one side: the greater of two lower bounds, the lesser of two upper
 /// ones, and at one value the one that excludes it.
-fn tighter(a: Bound<String>, b: Bound<String>, lower: bool) -> Bound<String> {
+fn tighter(a: Bound<Vec<u8>>, b: Bound<Vec<u8>>, lower: bool) -> Bound<Vec<u8>> {
     let take_a = match (&a, &b) {
         (Unbounded, _) => false,
         (_, Unbounded) => true,
@@ -226,7 +224,7 @@ fn tighter(a: Bound<String>, b: Bound<String>, lower: bool) -> Bound<String> {
             if x == y {
                 matches!(a, Excluded(_))
             } else {
-                (x.as_bytes() > y.as_bytes()) == lower
+                (x > y) == lower
             }
         }
     };
@@ -494,6 +492,57 @@ fn clock_literal(e: &Expr) -> Result<i64> {
     }
 }
 
+/// A literal compared with a column of a string type, bytea or a bit string, read by the type's
+/// input as PostgreSQL reads the literal beside one, as the bytes its values are keyed by: text as
+/// it is, a bpchar without its trailing blanks, a name cut to 63 bytes, bytea and a bit string as
+/// their inputs read them, a bit string of any length.
+fn bytes_literal(e: &Expr, ty: ColumnType) -> Result<Vec<u8>> {
+    if let Some(s) = bit_literal(e) {
+        if !ty.is_bits() {
+            return Err(Error::new(format!(
+                "operator does not exist: {} = bit",
+                ty.pg_name().split('(').next().unwrap_or_default()
+            )));
+        }
+        return crate::strings::bits_parse(&s, None, true);
+    }
+    let s = match e {
+        Expr::Cast {
+            expr, data_type, ..
+        } if crate::catalog::held_type(data_type).is_ok_and(|t| same_kind(t, ty)) => {
+            text_literal(expr)?
+        }
+        _ => text_literal(e)?,
+    };
+    Ok(match ty {
+        ColumnType::Bpchar(_) => crate::strings::bpchar_key(s.as_bytes()).to_vec(),
+        ColumnType::Name => crate::strings::name_in(&s).into_bytes(),
+        ColumnType::Bytes => crate::strings::bytea_in(&s)?,
+        ColumnType::Bit(_) | ColumnType::Varbit(_) => crate::strings::bits_parse(&s, None, true)?,
+        _ => s.into_bytes(),
+    })
+}
+
+/// Whether a literal cast to `to` is read beside a column of `ty` by `ty`'s own input: a cast to its
+/// own kind of type, of any modifier.
+fn same_kind(to: ColumnType, ty: ColumnType) -> bool {
+    std::mem::discriminant(&to) == std::mem::discriminant(&ty) || (to.is_bits() && ty.is_bits())
+}
+
+/// A bit-string constant, `B'…'` or `X'…'`, as the input of a bit string reads it: its letter,
+/// then its digits.
+pub(super) fn bit_literal(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedByteStringLiteral(s) => Some(format!("B{s}")),
+            Value::HexStringLiteral(s) => Some(format!("X{s}")),
+            _ => None,
+        },
+        Expr::Nested(e) => bit_literal(e),
+        _ => None,
+    }
+}
+
 pub(super) fn text_literal(e: &Expr) -> Result<String> {
     match e {
         Expr::Value(v) => match &v.value {
@@ -716,17 +765,24 @@ impl From<'_> {
                     | ColumnType::Money
                     | ColumnType::Float4
                     | ColumnType::Float8
-                    | ColumnType::Tid => Ok(Some(if name == "min" {
+                    | ColumnType::Tid
+                    | ColumnType::Text(_)
+                    | ColumnType::Bpchar(_)
+                    | ColumnType::Name
+                    | ColumnType::Bytes => Ok(Some(if name == "min" {
                         Item::Least(col)
                     } else {
                         Item::Greatest(col)
                     })),
-                    ColumnType::Boolean | ColumnType::Uuid | ColumnType::Xid | ColumnType::Cid => {
-                        Err(Error::new(format!(
-                            "function {name}({}) does not exist",
-                            ty.pg_name()
-                        )))
-                    }
+                    ColumnType::Boolean
+                    | ColumnType::Uuid
+                    | ColumnType::Xid
+                    | ColumnType::Cid
+                    | ColumnType::Bit(_)
+                    | ColumnType::Varbit(_) => Err(Error::new(format!(
+                        "function {name}({}) does not exist",
+                        ty.pg_name().split('(').next().unwrap_or_default()
+                    ))),
                     _ => Err(Error::new(format!("{e} is not read"))),
                 }
             }
@@ -1002,7 +1058,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             let (x, y) = if a == 0 { (x, y) } else { (y, x) };
             for (side, c) in [(0, x), (1, y)] {
                 let ty = from.table(side).columns[c].ty;
-                if ty.is_byte_array() || ty == ColumnType::Timestamptz {
+                if ty.is_byte_array() || ty.is_bits() || ty == ColumnType::Timestamptz {
                     return Err(Error::new(format!(
                         "{p}: a join on {} is not read",
                         ty.name()
@@ -1073,13 +1129,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             continue;
         }
         if let Shape::Column(c) = s {
-            if table.columns[c].ty == ColumnType::Bytes {
-                return Err(Error::new(format!(
-                    "{p}: a condition on bytea is read only in a pipeline"
-                )));
-            }
-            if table.columns[c].ty.is_text() {
-                let v = text_literal(lit)?;
+            let ty = table.columns[c].ty;
+            if ty.is_string() || ty.keyed_by_bytes() {
+                let v = bytes_literal(lit, ty)?;
                 let mut except = Vec::new();
                 let (lo, hi) = match op {
                     BinaryOperator::Eq => (Included(v.clone()), Included(v)),
@@ -1093,7 +1145,8 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     BinaryOperator::GtEq => (Included(v), Unbounded),
                     other => {
                         return Err(Error::new(format!(
-                            "the comparison {other} on text is not read"
+                            "the comparison {other} on {} is not read",
+                            ty.pg_name()
                         )))
                     }
                 };

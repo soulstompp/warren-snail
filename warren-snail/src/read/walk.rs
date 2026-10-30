@@ -4,7 +4,7 @@
 use super::answer::{same, Answer, Cell, Dict, Text};
 use super::question::{Cond, Countable, Side, TextCond};
 use super::{Snail, Wasted};
-use crate::catalog::{Level, Order, Shape, Table};
+use crate::catalog::{ColumnType, Level, Order, Shape, Table};
 use crate::directory::{decode_page, decode_top, Entry, Head, PageMap, Summary};
 use crate::encode::decode_with;
 use crate::file::Extent;
@@ -312,9 +312,11 @@ impl Snail {
                 continue;
             }
             by_null.push(None);
-            // A text level is fixed by an equality on it; a range on text stays a condition to read.
+            // A level of a string type, bytea or a bit string is fixed by an equality on it; a range
+            // on one stays a condition to read.
             if let Level::Column(c) = *l {
-                if want.table.columns[c].ty.is_text() {
+                let ty = want.table.columns[c].ty;
+                if ty.is_string() || ty.keyed_by_bytes() {
                     let fixed = texts.iter().position(|t| {
                         t.column == c && matches!((&t.lo, &t.hi), (Bound::Included(a), Bound::Included(b)) if a == b)
                     });
@@ -324,8 +326,8 @@ impl Snail {
                             let Bound::Included(v) = &texts[i].lo else {
                                 unreachable!()
                             };
-                            lo.push(KeyValue::Text(v.as_str().into()));
-                            hi.push(KeyValue::Text(v.as_str().into()));
+                            lo.push(crate::places::byte_key(ty, v));
+                            hi.push(crate::places::byte_key(ty, v));
                             continue;
                         }
                         None => break,
@@ -700,11 +702,11 @@ impl Snail {
                 } else {
                     &[][..]
                 };
-                let levels: Vec<(Level, bool, usize, &Values)> = fixed
+                let levels: Vec<(Level, ColumnType, usize, &Values)> = fixed
                     .iter()
                     .map(|&l| {
                         let (start, v) = column(l.column());
-                        (l, table.columns[l.column()].ty.is_text(), start, v)
+                        (l, table.columns[l.column()].ty, start, v)
                     })
                     .collect();
                 let rests: Vec<(&Cond, usize, &Values)> = br
@@ -716,13 +718,13 @@ impl Snail {
                         (c, start, v)
                     })
                     .collect();
-                let texts: Vec<(&TextCond, usize, &Values)> = br
+                let texts: Vec<(&TextCond, ColumnType, usize, &Values)> = br
                     .text_may
                     .iter()
                     .map(|&ti| {
                         let t = &want.side.texts[ti];
                         let (start, v) = column(t.column);
-                        (t, start, v)
+                        (t, table.columns[t.column].ty, start, v)
                     })
                     .collect();
                 let nulls: Vec<(bool, usize, &Values)> = br
@@ -738,8 +740,15 @@ impl Snail {
                     .iter()
                     .map(|&(c, month)| {
                         let (start, v) = column(c);
-                        (table.columns[c].ty.is_byte_array(), month, start, v)
+                        let ty = table.columns[c].ty;
+                        (ty.is_byte_array() || ty.is_bits(), month, start, v)
                     })
+                    .collect();
+                // The columns read whose values are compared by a key other than their bytes: a
+                // bpchar's, without its trailing blanks.
+                let keyed: Vec<bool> = columns
+                    .iter()
+                    .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::Bpchar(_)))
                     .collect();
                 let dicts: Vec<Dict> = outs.iter().map(|o| o.3.dict().cloned()).collect();
                 if !same(&sent, &dicts) {
@@ -749,30 +758,38 @@ impl Snail {
                 // How a row's fixed levels compare with a bound, level by level, a NULL lying on its
                 // level's side.
                 let against = |r: usize, bound: &[KeyValue]| -> Ordering {
-                    for (li, ((l, is_text, start, v), b)) in levels.iter().zip(bound).enumerate() {
+                    for (li, ((l, ty, start, v), b)) in levels.iter().zip(bound).enumerate() {
                         let null = KeyValue::Null {
                             first: order.nulls_first[li],
                         };
-                        let ord = match (v.is_null(r - start), is_text, b) {
-                            (true, _, _) => null.cmp(b),
-                            (false, _, KeyValue::Null { first }) => {
-                                if *first {
+                        let ord = match (v.is_null(r - start), b) {
+                            (true, _) => null.cmp(b),
+                            (false, &KeyValue::Null { first }) => {
+                                if first {
                                     Ordering::Greater
                                 } else {
                                     Ordering::Less
                                 }
                             }
-                            (false, true, KeyValue::Text(t)) => {
-                                v.text(r - start).unwrap_or("").cmp(&**t)
+                            (false, KeyValue::Text(t)) => {
+                                v.text_value(r - start).map_or(Ordering::Less, |x| {
+                                    crate::strings::key_bytes(*ty, x.data())
+                                        .as_ref()
+                                        .cmp(t.as_bytes())
+                                })
                             }
-                            (false, _, KeyValue::Int(x)) => v
+                            (false, KeyValue::Bytes(t)) => {
+                                v.text_value(r - start).map_or(Ordering::Less, |x| {
+                                    crate::strings::key_bytes(*ty, x.data()).as_ref().cmp(&**t)
+                                })
+                            }
+                            (false, KeyValue::Int(x)) => v
                                 .int(r - start)
                                 .map_or(i64::MIN, |y| key(*l, y).int())
                                 .cmp(x),
-                            (false, _, KeyValue::Wide(x)) => {
+                            (false, KeyValue::Wide(x)) => {
                                 v.wide(r - start).unwrap_or(i128::MIN).cmp(x)
                             }
-                            _ => Ordering::Equal,
                         };
                         if ord != Ordering::Equal {
                             return ord;
@@ -830,18 +847,27 @@ impl Snail {
                             c.holds(x)
                         });
                         let keep =
-                            keep && texts.iter().all(|&(t, start, v)| {
-                                v.text(r - start).is_some_and(|x| t.holds(x))
+                            keep && texts.iter().all(|&(t, ty, start, v)| {
+                                v.text_value(r - start).is_some_and(|x| {
+                                    t.holds(&crate::strings::key_bytes(ty, x.data()))
+                                })
                             }) && nulls
                                 .iter()
                                 .all(|&(null, start, v)| v.is_null(r - start) == null);
                         if !keep {
                             continue;
                         }
-                        let make = |&(is_text, month, start, v): &(bool, bool, usize, &Values)| {
+                        let make = |&(is_text, month, start, v): &(bool, bool, usize, &Values),
+                                    keyed: bool| {
                             let i = r - start;
                             if let Values::Dict { codes, .. } = v {
                                 codes[i].map_or(Cell::Null, Cell::Code)
+                            } else if keyed {
+                                v.text_value(i).map_or(Cell::Null, |t| {
+                                    let key: Box<[u8]> =
+                                        crate::strings::bpchar_key(t.data()).into();
+                                    Cell::Keyed(crate::read::answer::Keyed::new(key, t))
+                                })
                             } else if is_text {
                                 v.text_value(i).map_or(Cell::Null, |t| Cell::Text(Text(t)))
                             } else if month {
@@ -854,14 +880,18 @@ impl Snail {
                                 v.int(i).map_or(Cell::Null, Cell::Int)
                             }
                         };
-                        for (cell, o) in cells[..lead].iter_mut().zip(&outs) {
-                            *cell = make(o);
+                        for ((cell, o), &k) in cells[..lead].iter_mut().zip(&outs).zip(&keyed) {
+                            *cell = make(o, k);
                         }
                         if lead > 0 && !sink.admits(&cells[..lead]) {
                             continue;
                         }
-                        for (cell, o) in cells[lead..].iter_mut().zip(&outs[lead..]) {
-                            *cell = make(o);
+                        for ((cell, o), &k) in cells[lead..]
+                            .iter_mut()
+                            .zip(&outs[lead..])
+                            .zip(&keyed[lead..])
+                        {
+                            *cell = make(o, k);
                         }
                         sink.row(&cells);
                     }

@@ -77,6 +77,10 @@ pub struct Head {
 /// What `Head::level_text` holds for a level keyed in 128 bits.
 pub const WIDE_LEVEL: u32 = 1 << 31;
 
+/// The bit `Head::level_text` sets beside its sublevels for a level keyed by bytes that need not
+/// be text: a bytea's, a bit string's.
+pub const BYTES_LEVEL: u32 = 1 << 30;
+
 /// The top bit of a head's height, set where the order holds a column keyed in 128 bits: the
 /// columns' places follow it. A head holding none is written as before.
 const HEAD_WIDE: u32 = 1 << 31;
@@ -248,6 +252,7 @@ fn keys_len(key: &[KeyValue]) -> usize {
                 KeyValue::Int(_) => 8,
                 KeyValue::Text(s) => 4 + s.len(),
                 KeyValue::Wide(_) => 16,
+                KeyValue::Bytes(b) => 4 + b.len(),
                 KeyValue::Null { .. } => 0,
             })
             .sum::<usize>()
@@ -268,13 +273,14 @@ fn keys_out(o: &mut Out, key: &[KeyValue]) {
             KeyValue::Int(x) => o.i64(*x),
             KeyValue::Text(s) => o.str(s),
             KeyValue::Wide(x) => o.i128(*x),
+            KeyValue::Bytes(b) => o.bytes(b),
             KeyValue::Null { .. } => {}
         }
     }
 }
 
-/// A key, its levels' kinds told by `level_text`: keyed in 128 bits where it is `WIDE_LEVEL`, else
-/// text where it is not 0.
+/// A key, its levels' kinds told by `level_text`: keyed in 128 bits where it is `WIDE_LEVEL`, by
+/// bytes where it holds `BYTES_LEVEL`, else text where it is not 0.
 fn keys_in(i: &mut In, level_text: &[u32]) -> Result<Vec<KeyValue>> {
     let count = i.u32()?;
     let marked = count & KEY_NULLS != 0;
@@ -289,6 +295,7 @@ fn keys_in(i: &mut In, level_text: &[u32]) -> Result<Vec<KeyValue>> {
             Ok(match level_text.get(k).copied().unwrap_or(0) {
                 WIDE_LEVEL => KeyValue::Wide(i.i128()?),
                 0 => KeyValue::Int(i.i64()?),
+                n if n & BYTES_LEVEL != 0 => KeyValue::Bytes(i.bytes()?.into_boxed_slice()),
                 _ => KeyValue::Text(i.str()?.into_boxed_str()),
             })
         })

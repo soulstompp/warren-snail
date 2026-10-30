@@ -62,6 +62,16 @@ pub enum ColumnType {
     /// A tid: a block number of 32 bits and an offset of 16 in it, both unsigned, compared block
     /// then offset, and held as a group of two leaves.
     Tid,
+    /// bpchar, or character(n): text compared without its trailing blanks, a value of character(n)
+    /// padded with blanks to its n characters; any length where none is named.
+    Bpchar(Option<u32>),
+    /// name: at most 63 bytes, compared by its bytes.
+    Name,
+    /// bit(n): exactly n bits, held as its key.
+    Bit(u32),
+    /// bit varying(n): at most n bits, any number where none is named, held as its key, and in the
+    /// file as a group of two leaves, its length and its bits.
+    Varbit(Option<u32>),
 }
 
 impl ColumnType {
@@ -90,7 +100,14 @@ impl ColumnType {
             ColumnType::Uuid => Some(16),
             // Its two leaves, 4 bytes each.
             ColumnType::Tid => Some(8),
-            ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Boolean => None,
+            // Its bits as a fixed array of bytes, the last padded.
+            ColumnType::Bit(n) => Some((n as usize).div_ceil(8)),
+            ColumnType::Text(_)
+            | ColumnType::Bytes
+            | ColumnType::Boolean
+            | ColumnType::Bpchar(_)
+            | ColumnType::Name
+            | ColumnType::Varbit(_) => None,
         }
     }
 
@@ -157,6 +174,8 @@ impl ColumnType {
     pub fn thin_bits(self) -> Option<u64> {
         match self {
             ColumnType::Boolean => Some(1),
+            // bit(1) to bit(24), written in 1 to 3 bytes.
+            ColumnType::Bit(n) if n <= 24 => Some(u64::from(n).div_ceil(8) * 8),
             _ => None,
         }
     }
@@ -165,10 +184,28 @@ impl ColumnType {
         matches!(self, ColumnType::Text(_))
     }
 
-    /// Whether its values are bytes of varying length, held and compared by their bytes: text, or
-    /// bytea.
+    /// Whether it is a string type, text under a collation: text, varchar, bpchar or name.
+    pub fn is_string(self) -> bool {
+        matches!(
+            self,
+            ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name
+        )
+    }
+
+    /// Whether it is a bit string: bit(n) or bit varying.
+    pub fn is_bits(self) -> bool {
+        matches!(self, ColumnType::Bit(_) | ColumnType::Varbit(_))
+    }
+
+    /// Whether a level of it is keyed by bytes that need not be text: bytea's, or a bit string's.
+    pub fn keyed_by_bytes(self) -> bool {
+        matches!(self, ColumnType::Bytes) || self.is_bits()
+    }
+
+    /// Whether its values are bytes of varying length, held as Parquet's byte arrays: a string's,
+    /// or bytea's.
     pub fn is_byte_array(self) -> bool {
-        matches!(self, ColumnType::Text(_) | ColumnType::Bytes)
+        matches!(self, ColumnType::Bytes) || self.is_string()
     }
 
     pub fn is_integer(self) -> bool {
@@ -218,6 +255,12 @@ impl ColumnType {
             ColumnType::Reg(kind, _) => kind.type_name().into(),
             ColumnType::Oid8 => "oid8".into(),
             ColumnType::Tid => "tid".into(),
+            ColumnType::Bpchar(None) => "bpchar".into(),
+            ColumnType::Bpchar(Some(n)) => format!("character({n})"),
+            ColumnType::Name => "name".into(),
+            ColumnType::Bit(n) => format!("bit({n})"),
+            ColumnType::Varbit(None) => "bit varying".into(),
+            ColumnType::Varbit(Some(n)) => format!("bit varying({n})"),
         }
     }
 
@@ -249,6 +292,10 @@ impl ColumnType {
             ColumnType::Reg(..) => "oid_ops",
             ColumnType::Oid8 => "oid8_ops",
             ColumnType::Tid => "tid_ops",
+            ColumnType::Bpchar(_) => "bpchar_ops",
+            ColumnType::Name => "name_ops",
+            ColumnType::Bit(_) => "bit_ops",
+            ColumnType::Varbit(_) => "varbit_ops",
         }
     }
 
@@ -270,6 +317,11 @@ impl ColumnType {
             ColumnType::Tid => &[
                 ("block", ColumnType::Oid, 32),
                 ("offset", ColumnType::Oid, 16),
+            ],
+            // Its length as an integer is held, its bits as bytea, the last byte padded.
+            ColumnType::Varbit(_) => &[
+                ("length", ColumnType::Int4, 0),
+                ("bits", ColumnType::Bytes, 0),
             ],
             _ => &[],
         }
@@ -335,7 +387,7 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
     use ColumnType::*;
     matches!(
         (from, to),
-        (_, Text(_))
+        (_, Text(_) | Bpchar(_) | Name)
             | (
                 Int2 | Int4 | Int8 | Numeric { .. },
                 Int2 | Int4 | Int8 | Numeric { .. }
@@ -348,7 +400,8 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Oid, Int4 | Int8)
             | (Int4 | Int8 | Numeric { .. } | Money, Money)
             | (Money, Numeric { .. })
-            | (Text(_) | Char, Char)
+            | (Text(_) | Bpchar(_) | Char, Char)
+            | (Bit(_) | Varbit(_), Bit(_) | Varbit(_))
             | (Xid, Xid)
             | (Cid, Cid)
             | (Xid8, Xid8)
@@ -885,23 +938,72 @@ impl Collation {
     /// Whether it orders text by its bytes, as the snail compares text without the feature that
     /// calls a collation library.
     pub fn byte_order(&self) -> bool {
+        self.casing(&[]).is_some()
+    }
+
+    /// How it maps case, where it orders text by its bytes: a copy's as its source's, among the
+    /// built-in ones and `declared`; none where it orders text otherwise.
+    pub fn casing(&self, declared: &[Collation]) -> Option<Casing> {
         if let Some(f) = &self.from {
-            return BYTE_ORDER.contains(&f.as_str());
+            return collation_held(f, declared);
         }
-        let collate = self.lc_collate.as_ref().or(self.locale.as_ref());
+        if !self.deterministic {
+            return None;
+        }
+        let collate = self.lc_collate.as_ref().or(self.locale.as_ref())?;
+        let ctype = self.lc_ctype.as_ref().or(self.locale.as_ref())?;
         match self.provider.as_str() {
-            "libc" => {
-                collate.is_some_and(|c| BYTE_ORDER.contains(&c.as_str()))
-                    && self
-                        .lc_ctype
-                        .as_ref()
-                        .or(self.locale.as_ref())
-                        .is_some_and(|c| BYTE_ORDER.contains(&c.as_str()))
-                    && self.deterministic
-            }
-            "builtin" => collate.is_some_and(|c| c == "C") && self.deterministic,
-            _ => false,
+            "libc" => match (collate.as_str(), ctype.as_str()) {
+                ("C" | "POSIX" | "C.utf8" | "C.UTF-8", "C" | "POSIX") => Some(Casing::Ascii),
+                ("C" | "POSIX" | "C.utf8" | "C.UTF-8", "C.utf8" | "C.UTF-8") => Some(Casing::Libc),
+                _ => None,
+            },
+            "builtin" => match collate.as_str() {
+                "C" => Some(Casing::Ascii),
+                "C.UTF-8" | "C.utf8" => Some(Casing::Simple),
+                "PG_UNICODE_FAST" => Some(Casing::Full),
+                _ => None,
+            },
+            _ => None,
         }
+    }
+}
+
+/// How a collation the snail holds without the feature `collations` maps case. Each orders text by
+/// its bytes; they differ only here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Casing {
+    /// ASCII's letters alone: C, POSIX, ucs_basic.
+    Ascii,
+    /// PostgreSQL's own Unicode tables, a character to a character: pg_c_utf8.
+    Simple,
+    /// PostgreSQL's own Unicode tables, a character to its full mapping: pg_unicode_fast.
+    Full,
+    /// glibc's C.UTF-8, a character to a character: libc C.utf8, and the database's default.
+    Libc,
+}
+
+/// Why a collation is refused without the feature `collations`.
+pub(crate) const NOT_HELD: &str =
+    "text is compared by its bytes, so only a collation of byte order \
+     is read without the feature collations: C, POSIX, ucs_basic, pg_c_utf8, pg_unicode_fast, \
+     C.utf8, or one the DDL makes like them";
+
+/// How the collation named maps case, where the snail holds it without the feature `collations`:
+/// one of PostgreSQL's built-in collations ordering text by its bytes, the database's default
+/// (libc C.UTF-8, as every database on the certificates' server), or one `declared` like them.
+pub fn collation_held(name: &str, declared: &[Collation]) -> Option<Casing> {
+    let bare = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    match bare {
+        "C" | "POSIX" | "ucs_basic" => Some(Casing::Ascii),
+        "pg_c_utf8" => Some(Casing::Simple),
+        "pg_unicode_fast" => Some(Casing::Full),
+        "C.utf8" | "default" => Some(Casing::Libc),
+        _ => declared
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.casing(declared)),
     }
 }
 
@@ -1201,6 +1303,27 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
             }
         }),
         DataType::Bytea => ColumnType::Bytes,
+        DataType::Char(length) | DataType::Character(length) => match length {
+            None => ColumnType::Bpchar(Some(1)),
+            Some(CharacterLength::IntegerLength { length, unit: None }) => {
+                ColumnType::Bpchar(Some(type_length(*length, "char", MAX_LENGTH)?))
+            }
+            Some(_) => {
+                return Err(Error::new(format!(
+                    "{}: PostgreSQL counts a length in characters only",
+                    spelled(dt)
+                )))
+            }
+        },
+        DataType::Bit(length) => ColumnType::Bit(match length {
+            None => 1,
+            Some(n) => type_length(*n, "bit", MAX_LENGTH * 8)?,
+        }),
+        DataType::BitVarying(length) | DataType::VarBit(length) => ColumnType::Varbit(
+            length
+                .map(|n| type_length(n, "bit varying", MAX_LENGTH * 8))
+                .transpose()?,
+        ),
         DataType::Boolean | DataType::Bool => ColumnType::Boolean,
         DataType::Uuid => ColumnType::Uuid,
         DataType::Regclass => ColumnType::Reg(crate::regs::RegKind::Class, crate::regs::LATEST),
@@ -1237,12 +1360,27 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                 "macaddr8" => ColumnType::Macaddr8,
                 "oid8" => ColumnType::Oid8,
                 "tid" => ColumnType::Tid,
+                "bpchar" => ColumnType::Bpchar(None),
+                "name" => ColumnType::Name,
                 other => match crate::regs::RegKind::of_type_name(other) {
                     Some(kind) => ColumnType::Reg(kind, crate::regs::LATEST),
                     None => {
                         return Err(Error::new(format!("the type {} is not held", spelled(dt))))
                     }
                 },
+            }
+        }
+        // bpchar(n) and nchar(n), as PostgreSQL's grammar reads them.
+        DataType::Custom(name, args) if args.len() == 1 => {
+            let n = object_name(name);
+            match n.strip_prefix("pg_catalog.").unwrap_or(&n) {
+                "bpchar" | "nchar" => {
+                    let length = args[0].trim().parse::<u64>().map_err(|_| {
+                        Error::new(format!("{}: invalid type modifier", spelled(dt)))
+                    })?;
+                    ColumnType::Bpchar(Some(type_length(length, "char", MAX_LENGTH)?))
+                }
+                _ => return Err(Error::new(format!("the type {} is not held", spelled(dt)))),
             }
         }
         DataType::Numeric(info) | DataType::Decimal(info) => {
@@ -1274,6 +1412,25 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
             )))
         }
     })
+}
+
+/// The most characters a string type's modifier names, and a bit string's eighth of its bits:
+/// PostgreSQL's MaxAttrSize.
+const MAX_LENGTH: u64 = 10 * 1024 * 1024;
+
+/// The length a type's modifier names, held to 1 and `most`, as PostgreSQL's typmod input holds it.
+fn type_length(n: u64, name: &str, most: u64) -> Result<u32> {
+    if n < 1 {
+        return Err(Error::new(format!(
+            "length for type {name} must be at least 1"
+        )));
+    }
+    if n > most {
+        return Err(Error::new(format!(
+            "length for type {name} cannot exceed {most}"
+        )));
+    }
+    Ok(n as u32)
 }
 
 /// A data type as PostgreSQL's `format_type` names it: the held types and the common built-ins by
@@ -1370,9 +1527,6 @@ pub fn numeric_units(text: &str, precision: u8, scale: u8) -> Result<i64> {
     i64::try_from(units).map_err(|_| wrong())
 }
 
-/// The collations whose order is the bytes', as the snail compares text.
-pub(crate) const BYTE_ORDER: [&str; 2] = ["C", "POSIX"];
-
 /// The B-tree operator classes on text that compare its bytes, as the snail does: every one of
 /// them, under a collation of byte order.
 pub(crate) const TEXT_OPCLASSES: [&str; 4] = [
@@ -1422,13 +1576,15 @@ pub fn shape(
             let named = object_name(collation);
             match shape(expr, table, alias, columns, functions, env)? {
                 Shape::Column(c)
-                    if columns[c].ty.is_text() && BYTE_ORDER.contains(&named.as_str()) =>
+                    if columns[c].ty.is_string() && collation_held(&named, &[]).is_some() =>
                 {
                     Ok(Shape::Column(c))
                 }
-                _ => Err(Error::new(format!(
-                    "{expr} COLLATE {named}: text is compared by its bytes, so only C is read"
+                Shape::Column(c) if !columns[c].ty.is_string() => Err(Error::new(format!(
+                    "collations are not supported by type {}",
+                    columns[c].ty.pg_name()
                 ))),
+                _ => Err(Error::new(format!("{expr} COLLATE {named}: {NOT_HELD}"))),
             }
         }
         Expr::Value(v) => match &v.value {
@@ -1756,7 +1912,7 @@ mod tests {
     }
 
     #[test]
-    fn a_numeric_is_held_to_18_digits_and_bytea_never_as_a_level() {
+    fn a_numeric_is_held_to_18_digits_and_bytea_as_a_level() {
         let c = Catalog::parse(
             "CREATE TABLE s.t (a bigint NOT NULL, k bytea, m numeric(9,2) NOT NULL, PRIMARY KEY (a));",
         )
@@ -1782,14 +1938,12 @@ mod tests {
                 "CREATE TABLE s.t (a numeric(19,0) NOT NULL, PRIMARY KEY (a));",
                 "at most 18 digits",
             ),
-            (
-                "CREATE TABLE s.t (k bytea NOT NULL, PRIMARY KEY (k));",
-                "a bytea level",
-            ),
         ] {
             let e = refused(ddl);
             assert!(e.contains(why), "{ddl}: {e}");
         }
+        let c = Catalog::parse("CREATE TABLE s.t (k bytea NOT NULL, PRIMARY KEY (k));").unwrap();
+        assert_eq!(c.tables[0].orders[0].levels, [Level::Column(0)]);
         assert_eq!(numeric_units("12.345", 9, 2).unwrap(), 1235);
         assert_eq!(numeric_units("-12.344", 9, 2).unwrap(), -1234);
         assert_eq!(numeric_units("7", 9, 2).unwrap(), 700);
@@ -1822,7 +1976,7 @@ mod tests {
         let e = refused(
             "CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"en_US\", PRIMARY KEY (a));",
         );
-        assert!(e.contains("only C is read"), "{e}");
+        assert!(e.contains("only a collation of byte order"), "{e}");
         let e = refused("CREATE TABLE s.t (a integer NOT NULL COLLATE \"C\", PRIMARY KEY (a));");
         assert!(e.contains("not text"), "{e}");
     }

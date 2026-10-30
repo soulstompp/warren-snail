@@ -108,7 +108,10 @@ pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<Colu
                 unit: TimeUnit::MICROS,
             }),
         ),
-        ColumnType::Text(_) => (PhysicalType::BYTE_ARRAY, Some(LogicalType::String)),
+        ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name => {
+            (PhysicalType::BYTE_ARRAY, Some(LogicalType::String))
+        }
+        ColumnType::Bit(_) => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Bytes => (PhysicalType::BYTE_ARRAY, None),
         ColumnType::Numeric { precision, scale } => (
             PhysicalType::INT64,
@@ -141,7 +144,7 @@ pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<Colu
         ColumnType::Macaddr | ColumnType::Macaddr8 => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Float4 => (PhysicalType::FLOAT, None),
         ColumnType::Float8 => (PhysicalType::DOUBLE, None),
-        ColumnType::Tid => return Err(group(column, ty)),
+        ColumnType::Tid | ColumnType::Varbit(_) => return Err(group(column, ty)),
     };
     let repetition = if nullable && leaf.field.is_none() {
         Repetition::OPTIONAL
@@ -258,6 +261,12 @@ fn write(
         }
         (Values::Utf8(v), PhysicalType::BYTE_ARRAY) => {
             write_typed::<ByteArrayType, ByteArray>(desc, p, v, rows_per_page, |b| b.clone())?
+        }
+        // A bit string, held as its key, is written as its bits.
+        (Values::Utf8(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
+            write_typed::<FixedLenByteArrayType, ByteArray>(desc, p, v, rows_per_page, |k| {
+                FixedLenByteArray::from(crate::strings::bits_of_key(k.data()).1)
+            })?
         }
         (Values::Int(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
             let n = desc.type_length() as usize;
@@ -508,7 +517,22 @@ pub fn decode(
     // An unsigned number is keyed by the bits its descriptor names.
     let bits = unsigned_bits(desc);
     match ty {
-        ColumnType::Tid => Err(group(desc.name(), ty)),
+        ColumnType::Tid | ColumnType::Varbit(_) => Err(group(desc.name(), ty)),
+        ColumnType::Bit(n) => {
+            let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
+            let mut v: Vec<FixedLenByteArray> = Vec::new();
+            let (n_read, _, _) =
+                r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            if n_read != rows {
+                return Err(short(n_read));
+            }
+            Ok(Values::Utf8(spread(
+                v.iter()
+                    .map(|b| ByteArray::from(crate::strings::bits_key(n, b.data()))),
+                &defs,
+                nullable,
+            )))
+        }
         ColumnType::Int2
         | ColumnType::Int4
         | ColumnType::Oid
@@ -619,7 +643,7 @@ pub fn decode(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Values::Wide(spread(keys.into_iter(), &defs, nullable)))
         }
-        ColumnType::Text(_) | ColumnType::Bytes => {
+        ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Bpchar(_) | ColumnType::Name => {
             let mut r = get_typed_column_reader::<ByteArrayType>(column);
             let mut v: Vec<ByteArray> = Vec::new();
             let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;

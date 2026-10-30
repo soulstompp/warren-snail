@@ -33,14 +33,17 @@ fn the_wind_is_read_run_by_run_along_the_log_s_order() {
             Some(warren_snail::read::numeric_text(tenths as i128, 1))
         ]]
     );
-    let e = snail
+    // A condition on bytea is read by bytea's input, and compares the bytes.
+    let (c, round) = snail
         .ask(
             "SELECT count(*) FROM weather.wind w WHERE w.station = '\\xff'",
             None,
         )
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("a condition on bytea"), "{e}");
+        .unwrap();
+    exact("bytea's condition", &round);
+    let ff = rows.iter().filter(|r| r.1 == [0xff]).count();
+    assert!(ff > 0);
+    assert_eq!(one(&c), ff as i64);
 }
 
 #[test]

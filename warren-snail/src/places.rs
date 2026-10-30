@@ -40,9 +40,10 @@ pub fn month_of(micros: i64) -> Option<i64> {
 }
 
 /// One level's value in an order's key: a number (an integer, an instant's microseconds, a month),
-/// text, compared by its bytes, or a value keyed in 128 bits (a uuid's key); or a NULL, before every
-/// value of its level where `first`, else after them all. Every value of one level is of one kind,
-/// and its NULLs lie on one side.
+/// text, compared by its bytes, a value keyed in 128 bits (a uuid's key), or a value keyed by bytes
+/// that need not be text (a bytea's, a bit string's); or a NULL, before every value of its level
+/// where `first`, else after them all. Every value of one level is of one kind, and its NULLs lie on
+/// one side.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KeyValue {
@@ -50,6 +51,7 @@ pub enum KeyValue {
     Text(Box<str>),
     Null { first: bool },
     Wide(i128),
+    Bytes(Box<[u8]>),
 }
 
 impl KeyValue {
@@ -58,6 +60,7 @@ impl KeyValue {
         match self {
             KeyValue::Int(v) => *v,
             KeyValue::Text(_) => panic!("a numeric level holds text"),
+            KeyValue::Bytes(_) => panic!("a numeric level holds bytes"),
             KeyValue::Wide(_) => panic!("a level keyed in 128 bits holds no 64-bit number"),
             KeyValue::Null { .. } => panic!("a NULL keys no number"),
         }
@@ -82,6 +85,7 @@ impl KeyValue {
             KeyValue::Int(_) => 1,
             KeyValue::Text(_) => 2,
             KeyValue::Wide(_) => 3,
+            KeyValue::Bytes(_) => 4,
             KeyValue::Null { first: false } => u8::MAX,
         }
     }
@@ -93,6 +97,7 @@ impl Ord for KeyValue {
             (KeyValue::Int(a), KeyValue::Int(b)) => a.cmp(b),
             (KeyValue::Text(a), KeyValue::Text(b)) => a.cmp(b),
             (KeyValue::Wide(a), KeyValue::Wide(b)) => a.cmp(b),
+            (KeyValue::Bytes(a), KeyValue::Bytes(b)) => a.cmp(b),
             _ => self.rank().cmp(&other.rank()),
         }
     }
@@ -110,6 +115,7 @@ impl fmt::Display for KeyValue {
             KeyValue::Int(v) => write!(f, "{v}"),
             KeyValue::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
             KeyValue::Wide(v) => write!(f, "'{}'", crate::scalars::uuid_text(*v)),
+            KeyValue::Bytes(b) => write!(f, "'{}'", crate::strings::bytea_out(b)),
             KeyValue::Null { .. } => write!(f, "NULL"),
         }
     }
@@ -162,7 +168,65 @@ pub fn wide_cmp(k: i128, b: &KeyValue) -> Ordering {
         KeyValue::Wide(x) => k.cmp(x),
         KeyValue::Null { first: true } => Ordering::Greater,
         KeyValue::Null { first: false } => Ordering::Less,
-        KeyValue::Text(_) => Ordering::Less,
+        KeyValue::Text(_) | KeyValue::Bytes(_) => Ordering::Less,
+    }
+}
+
+/// Writes a part of varying length into a key of parts in a row: each 0x00 as 0x00 0xFF, then
+/// 0x00 0x00 to end it, so that the key's bytes compare as the parts do, one after another.
+pub fn varying_part(out: &mut Vec<u8>, part: &[u8]) {
+    for &b in part {
+        out.push(b);
+        if b == 0 {
+            out.push(0xff);
+        }
+    }
+    out.extend_from_slice(&[0, 0]);
+}
+
+/// The first part of a key of parts in a row, a part of varying length, and the key after it.
+pub fn split_varying(key: &[u8]) -> (Vec<u8>, &[u8]) {
+    let mut part = Vec::with_capacity(key.len());
+    let mut i = 0;
+    while i < key.len() {
+        if key[i] == 0 {
+            if key.get(i + 1) == Some(&0xff) {
+                part.push(0);
+                i += 2;
+                continue;
+            }
+            return (part, &key[(i + 2).min(key.len())..]);
+        }
+        part.push(key[i]);
+        i += 1;
+    }
+    (part, &[])
+}
+
+/// The value a level of a string type, bytea or a bit string keys, from the bytes its value is
+/// keyed by (`strings::key_bytes`): text for a string, bytes for the others.
+pub fn byte_key(ty: ColumnType, key: &[u8]) -> KeyValue {
+    if ty.keyed_by_bytes() {
+        KeyValue::Bytes(key.into())
+    } else {
+        KeyValue::Text(String::from_utf8_lossy(key).into())
+    }
+}
+
+/// The sublevels a level of a string type, bytea or a bit string is cut on so that a value keyed
+/// by `key` lies whole on them, at least `had`: one more than its bytes, or than a bit varying's
+/// bits; `BYTES_LEVEL` beside them for a level keyed by bytes.
+pub fn rungs_for(ty: ColumnType, key: &[u8], had: u32) -> u32 {
+    let n = match ty {
+        ColumnType::Bit(n) => n,
+        ColumnType::Varbit(_) => crate::strings::bits_of_key(key).0 + 1,
+        _ => key.len() as u32 + 1,
+    };
+    let n = n.max(had & !crate::directory::BYTES_LEVEL);
+    if ty.keyed_by_bytes() {
+        n | crate::directory::BYTES_LEVEL
+    } else {
+        n
     }
 }
 
@@ -206,7 +270,13 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Timestamptz => 7,
             ColumnType::Boolean => 1,
             ColumnType::Uuid => 128,
-            ColumnType::Text(_) | ColumnType::Bytes => text_sublevels as usize,
+            ColumnType::Bit(n) => n as usize,
+            ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name => {
+                text_sublevels as usize
+            }
+            ColumnType::Bytes | ColumnType::Varbit(_) => {
+                (text_sublevels & !crate::directory::BYTES_LEVEL) as usize
+            }
         },
     }
 }
@@ -217,6 +287,10 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
         KeyValue::Null { first: true } => return i64::MIN,
         KeyValue::Null { first: false } => return i64::MAX,
         KeyValue::Wide(k) => return ((k.wrapping_sub(i128::MIN) as u128 >> (127 - r)) & 1) as i64,
+        // A bit string is cut by its bits, each a place of three, an ended one first; bytea by its
+        // bytes, as text is.
+        KeyValue::Bytes(b) if ty.is_bits() => return crate::strings::bit_of_key(b, r),
+        KeyValue::Bytes(b) => return b.get(r).map_or(-1, |&x| x as i64),
         KeyValue::Int(_) => {}
     }
     let key = key.int();
@@ -262,7 +336,12 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
                 }
             }
             ColumnType::Boolean => key,
-            ColumnType::Text(_) | ColumnType::Bytes => unreachable!("a text level keys text"),
+            ColumnType::Text(_)
+            | ColumnType::Bytes
+            | ColumnType::Bpchar(_)
+            | ColumnType::Name
+            | ColumnType::Bit(_)
+            | ColumnType::Varbit(_) => unreachable!("a string level keys text, a bit string bytes"),
             ColumnType::Uuid => unreachable!("a uuid level keys 128 bits"),
         },
     }
@@ -511,5 +590,45 @@ mod tests {
         ];
         keys.sort();
         assert_eq!(shown(&keys), "['', 'ab', 'b']");
+    }
+
+    #[test]
+    fn parts_in_a_row_compare_as_a_tuple_does_an_ended_part_first() {
+        // Every byte string of up to 3 bytes over 0x00, 0x01 and 0xFF, and every pair of two of them.
+        let mut parts: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..3 {
+            let longer: Vec<Vec<u8>> = parts
+                .iter()
+                .filter(|p| p.len() == parts.last().unwrap().len())
+                .flat_map(|p| {
+                    [0u8, 1, 0xff].map(|b| {
+                        let mut p = p.clone();
+                        p.push(b);
+                        p
+                    })
+                })
+                .collect();
+            parts.extend(longer);
+        }
+        assert_eq!(parts.len(), 40);
+        let tuples: Vec<(&[u8], &[u8])> = parts
+            .iter()
+            .flat_map(|a| parts.iter().map(move |b| (a.as_slice(), b.as_slice())))
+            .collect();
+        let key = |(a, b): (&[u8], &[u8])| {
+            let mut k = Vec::new();
+            varying_part(&mut k, a);
+            varying_part(&mut k, b);
+            k
+        };
+        let keys: Vec<Vec<u8>> = tuples.iter().map(|&t| key(t)).collect();
+        for (x, kx) in tuples.iter().zip(&keys) {
+            for (y, ky) in tuples.iter().zip(&keys) {
+                assert_eq!(kx.cmp(ky), x.cmp(y), "{x:?} {y:?}");
+            }
+            let (a, rest) = split_varying(kx);
+            let (b, end) = split_varying(rest);
+            assert_eq!((a.as_slice(), b.as_slice(), end), (x.0, x.1, &[][..]));
+        }
     }
 }

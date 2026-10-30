@@ -186,6 +186,11 @@ pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::Ke
                 h.write(&[4]);
                 h.write(&x.to_le_bytes());
             }
+            crate::places::KeyValue::Bytes(b) => {
+                h.write(&[5]);
+                h.write(&(b.len() as u64).to_le_bytes());
+                h.write(b);
+            }
         }
     }
     BLOCKS + h.finish() % BLOCK_BYTES

@@ -35,8 +35,12 @@ impl Values {
     /// No values yet, of the kind a column of type `ty` holds.
     pub fn new(ty: ColumnType) -> Values {
         match ty {
-            ColumnType::Text(_) => Values::Text(Vec::new()),
-            ColumnType::Bytes => Values::Utf8(Vec::new()),
+            ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name => {
+                Values::Text(Vec::new())
+            }
+            ColumnType::Bytes | ColumnType::Bit(_) | ColumnType::Varbit(_) => {
+                Values::Utf8(Vec::new())
+            }
             ColumnType::Uuid => Values::Wide(Vec::new()),
             ColumnType::Float4 => Values::Float4(Vec::new()),
             ColumnType::Float8 => Values::Float8(Vec::new()),
@@ -240,6 +244,30 @@ impl Values {
                     ),
                 ]
             }
+            // A bit string, held as its key: its length, and its bits as bytes.
+            (ColumnType::Varbit(_), values) => {
+                let parts: Vec<Option<(u32, Vec<u8>)>> = (0..values.len())
+                    .map(|i| {
+                        values
+                            .text_value(i)
+                            .map(|k| crate::strings::bits_of_key(k.data()))
+                    })
+                    .collect();
+                vec![
+                    Values::Int(
+                        parts
+                            .iter()
+                            .map(|p| p.as_ref().map(|p| i64::from(p.0)))
+                            .collect(),
+                    ),
+                    Values::Utf8(
+                        parts
+                            .into_iter()
+                            .map(|p| p.map(|p| ByteArray::from(p.1)))
+                            .collect(),
+                    ),
+                ]
+            }
             (_, values) => vec![values],
         }
     }
@@ -258,6 +286,18 @@ impl Values {
                             unsigned_of((*b)?, 32) as u32,
                             unsigned_of((*o)?, 16) as u16,
                         ))
+                    })
+                    .collect(),
+            ),
+            (ColumnType::Varbit(_), [lengths, bits]) => Values::Utf8(
+                (0..lengths.len())
+                    .map(|i| {
+                        let len = lengths.int(i)?;
+                        let b = bits.text_value(i)?;
+                        Some(ByteArray::from(crate::strings::bits_key(
+                            len as u32,
+                            b.data(),
+                        )))
                     })
                     .collect(),
             ),
