@@ -683,12 +683,28 @@ impl Snails {
     /// Runs one statement that writes, or begins or ends a transaction across the snails. A
     /// statement writes the snail that holds its table; outside a transaction it commits there. A
     /// transaction's COMMIT commits every snail it wrote, one root deciding.
+    /// Its pages read, written and reused are every snail's.
     pub fn execute(&mut self, sql: &str) -> Result<Done> {
         if !self.writing {
             return Err(Error::new(
                 "these snails were opened to read; open them to write",
             ));
         }
+        let totals = |s: &Snails| {
+            s.snails.iter().fold((0, 0, 0), |(r, w, u), x| {
+                (r + x.pages_read(), w + x.written(), u + x.reused)
+            })
+        };
+        let before = totals(self);
+        let mut done = self.execute_across(sql)?;
+        let after = totals(self);
+        done.pages_read = after.0 - before.0;
+        done.pages_written = after.1 - before.1;
+        done.pages_reused = after.2 - before.2;
+        Ok(done)
+    }
+
+    fn execute_across(&mut self, sql: &str) -> Result<Done> {
         self.resolve()?;
         let st = statement::parse(&self.catalog, sql)?;
         if self.aborted && !matches!(st, Statement::Commit | Statement::Rollback) {

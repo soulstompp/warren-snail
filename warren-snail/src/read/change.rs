@@ -1302,7 +1302,7 @@ impl Snail {
         }
     }
 
-    fn written(&self) -> u64 {
+    pub(super) fn written(&self) -> u64 {
         self.writer.as_ref().map_or(0, Writer::pages_written)
     }
 

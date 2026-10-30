@@ -14,7 +14,7 @@ use warren_snail::catalog::Catalog;
 use warren_snail::cut::PAGE;
 #[cfg(feature = "standalone")]
 use warren_snail::read::HELD_BYTES;
-use warren_snail::read::{Round, Snail};
+use warren_snail::read::{Round, Snail, Snails};
 use warren_snail::write::{parquet_files, sources, write_released, Rows};
 use warren_snail::{Error, Result};
 
@@ -24,10 +24,10 @@ PostgreSQL's SQL. It runs on Linux.
 
 usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
                           [--release <14..19>] [--written <written.parquet>]
-       warren-snail exec <file> <statements.sql> --out <done.parquet>
+       warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
                          [--param <value>]... [--rounds <n>] [--hold <MiB>]
-                         [--round <round.parquet>] [--text]
+                         [--round <round.parquet>] [--text] [--with <file>]...
        warren-snail out <file> --dir <directory>
        warren-snail blocks <file> --out <blocks.parquet>
        warren-snail census <file>
@@ -47,13 +47,17 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           COMMIT and ROLLBACK; CREATE TABLE, and CREATE INDEX and ALTER TABLE … CLUSTER ON for a
           table that holds no rows. Outside a transaction each statement commits. --out records
           each statement as Parquet: its rows, its generation, and the pages it read, wrote
-          and reused.
+          and reused. Each --with opens one more snail with <file>, as one writer of them all: a
+          statement writes the snail that holds its table, and a transaction's COMMIT commits
+          every snail it wrote, one root deciding.
   read    the question's answer, as Parquet. Prints each round: the order it read along, and the
           pages it predicted and read. --order names the order to read along; each --param gives
           the next of $1, $2 and on, as text. --rounds asks it again on the one open snail, which
           holds the pages its rounds read, --hold MiB of them (128 unless given). --round records
           each round as Parquet. --text writes each value of a time type, a scalar's and an
-          interval's, as PostgreSQL's output writes it, text exactly as the value.
+          interval's, as PostgreSQL's output writes it, text exactly as the value. Each --with
+          opens one more snail with <file>, each holding --hold MiB: every round reads one moment
+          of them all, and a join of their tables reads each table from its own snail.
   out     each table to <directory>/<table>.parquet, a row group for each block of its order, its
           pages copied as they lie; a block that holds dead rows, or rows written after its sorted
           ones, is pruned on its way out. A table past the size of one of the snail's files goes
@@ -207,13 +211,24 @@ fn cmd_exec(args: &[String]) -> Result<()> {
     let text = std::fs::read_to_string(sql).map_err(|e| Error::new(format!("{sql}: {e}")))?;
     // Each statement as written: the snail reads itself what sqlparser does not.
     let statements = warren_snail::read::statement::split(&text)?;
-    let mut snail = Snail::open_writing(Path::new(file))?;
+    let others = withs(args);
+    let mut opened = if others.is_empty() {
+        Opened::One(Snail::open_writing(Path::new(file))?)
+    } else {
+        let paths: Vec<&Path> = std::iter::once(file.as_str())
+            .chain(others)
+            .map(Path::new)
+            .collect();
+        Opened::Several(Snails::open_writing(&paths)?)
+    };
     let mut done = Vec::with_capacity(statements.len());
     for (i, st) in statements.iter().enumerate() {
         let before = wchar();
-        let d = snail
-            .execute(st)
-            .map_err(|e| Error::new(format!("statement {}: {e}", i + 1)))?;
+        let d = match &mut opened {
+            Opened::One(s) => s.execute(st),
+            Opened::Several(s) => s.execute(st),
+        }
+        .map_err(|e| Error::new(format!("statement {}: {e}", i + 1)))?;
         done.push((d, wchar() - before));
     }
     let system_agrees: Vec<bool> = done
@@ -494,7 +509,13 @@ fn cmd_read(args: &[String]) -> Result<()> {
         .filter(|w| w[0] == "--param")
         .map(|w| w[1].clone())
         .collect();
-    let (mut snail, held_bytes) = open(file, flag(args, "--hold"))?;
+    let others = withs(args);
+    let (mut snail, held_bytes) = open(file, &others, flag(args, "--hold"))?;
+    if !others.is_empty() && flag(args, "--order").is_some() {
+        return Err(Error::new(
+            "a round across several snails chooses its orders itself: --order is refused with --with",
+        ));
+    }
     let mut first: Option<RecordBatch> = None;
     let mut done: Vec<Done> = Vec::new();
     for n in 1..=rounds {
@@ -507,15 +528,18 @@ fn cmd_read(args: &[String]) -> Result<()> {
         } else {
             (snail.pages_read(), snail.pages_held())
         };
-        let (answer, round) = snail.ask_with(&sql, flag(args, "--order"), &params)?;
+        let (answer, round) = match &mut snail {
+            Opened::One(s) => s.ask_with(&sql, flag(args, "--order"), &params)?,
+            Opened::Several(s) => s.ask_with(&sql, &params)?,
+        };
         let elapsed_us = began.elapsed().as_micros() as u64;
         let (after, _) = rchar();
         let d = Done {
             n,
-            pages_at_open: if n == 1 {
-                snail.pages_at_open
-            } else {
-                round.pages_at_start
+            pages_at_open: match (&snail, n) {
+                (Opened::One(s), 1) => s.pages_at_open,
+                (Opened::Several(s), 1) => s.pages_at_open() + round.pages_at_start,
+                _ => round.pages_at_start,
             },
             counted: snail.pages_read() - read_before,
             held: snail.pages_held() - held_before,
@@ -628,10 +652,63 @@ fn cmd_read(args: &[String]) -> Result<()> {
             ("rows_walked", each(&|d| d.round.rows_walked)),
             ("rows_taken", each(&|d| d.round.rows_taken)),
             ("elapsed_us", each(&|d| d.elapsed_us)),
+            (
+                "snails",
+                texts(
+                    done.iter()
+                        .map(|d| {
+                            d.round
+                                .snails
+                                .iter()
+                                .map(|p| {
+                                    format!(
+                                        "{}:{}:{}:{}",
+                                        p.pages_at_start,
+                                        p.column_pages_predicted,
+                                        p.column_pages_held,
+                                        p.column_pages_read
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .collect(),
+                ),
+            ),
         ])?;
         save(path, &batch)?;
     }
     Ok(())
+}
+
+/// The snails each `--with` names.
+fn withs(args: &[String]) -> Vec<&str> {
+    args.windows(2)
+        .filter(|w| w[0] == "--with")
+        .map(|w| w[1].as_str())
+        .collect()
+}
+
+/// One snail, or several opened together.
+enum Opened {
+    One(Snail),
+    Several(Snails),
+}
+
+impl Opened {
+    fn pages_read(&self) -> u64 {
+        match self {
+            Opened::One(s) => s.pages_read(),
+            Opened::Several(s) => s.pages_read(),
+        }
+    }
+
+    fn pages_held(&self) -> u64 {
+        match self {
+            Opened::One(s) => s.pages_held(),
+            Opened::Several(s) => s.pages_held(),
+        }
+    }
 }
 
 /// One round of `read`, as it went: the pages read from the file and found held, the bytes the system
@@ -646,8 +723,13 @@ struct Done {
     round: Round,
 }
 
-/// The snail, holding what `--hold` gives in MiB, or `HELD_BYTES`; and the bytes it holds.
-fn open(file: &str, hold: Option<&str>) -> Result<(Snail, u64)> {
+/// The snail, and the others opened with it, each holding what `--hold` gives in MiB, or
+/// `HELD_BYTES`; and the bytes each holds.
+fn open(file: &str, others: &[&str], hold: Option<&str>) -> Result<(Opened, u64)> {
+    let paths: Vec<&Path> = std::iter::once(file)
+        .chain(others.iter().copied())
+        .map(Path::new)
+        .collect();
     #[cfg(feature = "standalone")]
     {
         let bytes = match hold {
@@ -658,7 +740,11 @@ fn open(file: &str, hold: Option<&str>) -> Result<(Snail, u64)> {
             }
             None => HELD_BYTES,
         };
-        Ok((Snail::open_holding(Path::new(file), bytes)?, bytes as u64))
+        let opened = match others.is_empty() {
+            true => Opened::One(Snail::open_holding(paths[0], bytes)?),
+            false => Opened::Several(Snails::open_holding(&paths, bytes)?),
+        };
+        Ok((opened, bytes as u64))
     }
     #[cfg(not(feature = "standalone"))]
     {
@@ -667,7 +753,11 @@ fn open(file: &str, hold: Option<&str>) -> Result<(Snail, u64)> {
                 "built without `standalone`, a snail holds no pages of its own: --hold is refused",
             ));
         }
-        Ok((Snail::open(Path::new(file))?, 0))
+        let opened = match others.is_empty() {
+            true => Opened::One(Snail::open(paths[0])?),
+            false => Opened::Several(Snails::open(&paths)?),
+        };
+        Ok((opened, 0))
     }
 }
 
@@ -715,6 +805,18 @@ fn print_round(question: &str, d: &Done) {
                 "{e} predicted, {} of them held",
                 c.held
             ))
+        );
+    }
+    for (i, p) in r.snails.iter().enumerate() {
+        println!(
+            "    snail {}: {} of its root as the round began, along {}; {} of columns predicted, \
+             {} of them held and {} read",
+            i + 1,
+            n(p.pages_at_start, "page"),
+            if p.order.is_empty() { "none" } else { &p.order },
+            p.column_pages_predicted,
+            p.column_pages_held,
+            p.column_pages_read
         );
     }
 }
