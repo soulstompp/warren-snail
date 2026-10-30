@@ -498,6 +498,36 @@ mod tests {
     }
 
     #[test]
+    fn a_string_is_assigned_as_postgresql_s_casts_to_one_take_it() {
+        use ColumnType::*;
+        let a = |d: Datum, f, t| assign(d, f, t, "c");
+        let text = |s: &str| Datum::Text(s.to_string());
+        // A bpchar's trailing blanks go where it becomes text or a name, and stay where it stays
+        // a bpchar, held to the length.
+        assert_eq!(
+            a(text("ab "), Bpchar(Some(3)), Text(None)).unwrap(),
+            text("ab")
+        );
+        assert_eq!(a(text("ab "), Bpchar(Some(3)), Name).unwrap(), text("ab"));
+        assert_eq!(
+            a(text("ab "), Bpchar(Some(3)), Bpchar(Some(2))).unwrap(),
+            text("ab")
+        );
+        assert!(a(text("abc"), Text(None), Bpchar(Some(2))).is_err());
+        assert_eq!(a(Datum::Int(1), Boolean, Name).unwrap(), text("t"));
+        assert_eq!(a(Datum::Int(1), Boolean, Text(None)).unwrap(), text("true"));
+        let c = |b: u64| Datum::Int(crate::scalars::unsigned_key(b, 8));
+        assert_eq!(a(c(0x61), Char, Bpchar(Some(2))).unwrap(), text("a "));
+        for b in [0x80, 0xc3, 0xff] {
+            assert!(a(c(b), Char, Bpchar(None)).is_err(), "{b:#x}");
+        }
+        let bits = |s: &str| Datum::Bytes(crate::strings::bits_parse(s, None, true).unwrap());
+        assert_eq!(a(bits("101"), Varbit(None), Bit(3)).unwrap(), bits("101"));
+        assert!(a(bits("1010"), Varbit(None), Bit(3)).is_err());
+        assert!(a(bits("1010"), Bit(4), Varbit(Some(3))).is_err());
+    }
+
+    #[test]
     fn a_value_is_assigned_as_postgresql_s_assignment_casts_take_it() {
         let n92 = ColumnType::Numeric {
             precision: 9,

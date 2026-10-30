@@ -532,7 +532,10 @@ fn bits_snail(name: &str) -> std::path::PathBuf {
 #[cfg(feature = "standalone")]
 fn a_bit_string_is_read_as_bit_in_reads_it_and_held_to_its_length() {
     let path = tmp("bits-insert.snail");
-    write(&path, &Catalog::parse(BITS_DDL).unwrap(), &[]).unwrap();
+    let ddl = format!(
+        "{BITS_DDL} CREATE TABLE s.u (id integer NOT NULL, b bit(5), v varbit, PRIMARY KEY (id));"
+    );
+    write(&path, &Catalog::parse(&ddl).unwrap(), &[]).unwrap();
     let mut w = Snail::open_writing(&path).unwrap();
     w.execute(
         "INSERT INTO s.t (id, b, v) VALUES (1, '10100', '1'), (2, NULL, NULL), \
@@ -549,6 +552,14 @@ fn a_bit_string_is_read_as_bit_in_reads_it_and_held_to_its_length() {
         (bit_texts(&b, 1), bit_texts(&b, 2))
     };
     assert_eq!(ask(&path), ask(&bits_snail("bits-insert-rows")));
+    // Through an INSERT … SELECT, each bit string comes back as itself.
+    w.execute("INSERT INTO s.u (id, b, v) SELECT t.id, t.b, t.v FROM s.t t")
+        .unwrap();
+    let (b, _) = Snail::open(&path)
+        .unwrap()
+        .ask("SELECT u.id, u.b, u.v FROM s.u u ORDER BY u.id", None)
+        .unwrap();
+    assert_eq!((bit_texts(&b, 1), bit_texts(&b, 2)), ask(&path));
     for (v, why) in [
         ("'1010'", "bit string length 4 does not match type bit(5)"),
         ("'10102'", "\"2\" is not a valid binary digit"),
