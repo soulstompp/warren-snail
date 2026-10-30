@@ -201,6 +201,17 @@ impl Values {
         }
     }
 
+    /// Row `i`'s value of a column of `ty` held as bytes or as text, as a row holds it.
+    pub fn held(&self, i: usize, ty: ColumnType) -> Datum {
+        if ty.held_as_bytes() {
+            self.text_value(i)
+                .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec()))
+        } else {
+            self.text(i)
+                .map_or(Datum::Null, |s| Datum::Text(s.to_string()))
+        }
+    }
+
     /// Row `i`'s text; a composed value's key, written as text that sorts as the key does.
     pub fn text(&self, i: usize) -> Option<&str> {
         match self {
@@ -412,6 +423,14 @@ impl Values {
                     .map(|n| Values::Nested(Box::new(n)))
                     .collect()
             }
+            // A path, a polygon or a snapshot, as a row holds it, striped onto its own tree.
+            (ty, values) if ty.is_held_tree() => {
+                let held: Vec<Datum> = (0..values.len()).map(|i| values.held(i, ty)).collect();
+                crate::composed::stripe_held(ty, &held)
+                    .into_iter()
+                    .map(|n| Values::Nested(Box::new(n)))
+                    .collect()
+            }
             // A timetz's time and zone, each as it is.
             (ColumnType::Timetz(_), Values::Int(v)) => {
                 let parts: Vec<Option<(i64, i32)>> = v
@@ -519,6 +538,20 @@ impl Values {
                     })
                     .collect();
                 Values::Composed(crate::composed::assemble_rows(r, &nested))
+            }
+            (ty, parts) if ty.is_held_tree() => {
+                let nested: Vec<&Nested> = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Values::Nested(n) => Some(&**n),
+                        _ => None,
+                    })
+                    .collect();
+                let mut v = Values::new(ty);
+                for d in crate::composed::assemble_held(ty, &nested) {
+                    push_datum(&mut v, &d);
+                }
+                v
             }
             (ColumnType::Timetz(_), [Values::Int(times), Values::Int(zones)]) => Values::Int(
                 times

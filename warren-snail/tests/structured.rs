@@ -346,3 +346,296 @@ fn a_type_postgresql_neither_orders_nor_groups_is_refused_both_ways() {
         .unwrap();
     assert_eq!(texts(b.column(1).as_ref()), [Some("1".to_string()), None]);
 }
+
+/// Each row's values of a pipeline's answer as text, a column after the first each.
+fn texts_of(snail: &mut Snail, q: &str) -> Vec<Vec<Option<String>>> {
+    let (b, _) = snail.ask(q, None).unwrap();
+    (1..b.num_columns())
+        .map(|c| texts(b.column(c).as_ref()))
+        .collect()
+}
+
+/// A table's snail written out to Parquet, then written back from its file by `write`.
+#[cfg(feature = "standalone")]
+fn out_and_back(path: &std::path::Path, catalog: &Catalog, name: &str) -> std::path::PathBuf {
+    let dir = tmp(&format!("{name}-out"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Opened to write, so a block holding a tail is pruned on its way out.
+    let outs = Snail::open_writing(path).unwrap().out(&dir).unwrap();
+    let file = std::fs::File::open(&outs[0].file).unwrap();
+    let batches: Vec<RecordBatch> =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+    let rows = Rows::from_batches(&catalog.tables[0], &batches).unwrap();
+    let back = tmp(&format!("{name}-back.snail"));
+    write(&back, catalog, &[("s.t".into(), rows)]).unwrap();
+    back
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_path_and_a_polygon_are_trees_of_their_own_the_polygon_s_bounding_box_kept_out_and_back() {
+    let path = tmp("path-polygon.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id integer NOT NULL, p path, g polygon, PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let empty = Rows {
+        columns: vec![
+            Values::Int(vec![]),
+            Values::Utf8(vec![]),
+            Values::Utf8(vec![]),
+        ],
+    };
+    write(&path, &catalog, &[("s.t".into(), empty)]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.t (id, p, g) VALUES (1, '[(0,0),(-0,NaN)]', '((0,0),(1,1),(1,0))'), \
+         (2, '((1,2))', CAST(CAST('(0,0),(-0,-0)' AS box) AS polygon)), (3, NULL, NULL)",
+    )
+    .unwrap();
+    // Onto the tail of the block that holds the rows.
+    w.execute("INSERT INTO s.t (id, p, g) VALUES (4, '((5,5),(9,9),(1,1))', '((0,0))')")
+        .unwrap();
+    drop(w);
+    let blocks = Snail::open(&path).unwrap().blocks().unwrap();
+    let mut leaves: Vec<&str> = blocks
+        .iter()
+        .filter(|r| r.order == "t_pkey" && r.column != "id")
+        .map(|r| r.column.as_str())
+        .collect();
+    leaves.dedup();
+    assert_eq!(
+        leaves,
+        [
+            "p.closed",
+            "p.points.list.element.x",
+            "p.points.list.element.y",
+            "g.bound.high_x",
+            "g.bound.high_y",
+            "g.bound.low_x",
+            "g.bound.low_y",
+            "g.points.list.element.x",
+            "g.points.list.element.y"
+        ]
+    );
+    // PostgreSQL 18.6's answers on 28818, 2026-10-30, to the same statements: a polygon made from a
+    // box keeps the box, `(-0,-0),(0,0)`, where its points make `(-0,-0),(-0,-0)`.
+    let q = "WITH t AS (SELECT id, p, g FROM s.t) \
+             SELECT id, p::text AS x, CAST(g AS box)::text AS y, g::text AS z FROM t ORDER BY id";
+    let want = |s: &str| Some(s.to_string());
+    let expected = vec![
+        vec![
+            want("[(0,0),(-0,NaN)]"),
+            want("((1,2))"),
+            None,
+            want("((5,5),(9,9),(1,1))"),
+        ],
+        vec![
+            want("(1,1),(0,0)"),
+            want("(-0,-0),(0,0)"),
+            None,
+            want("(0,0),(0,0)"),
+        ],
+        vec![
+            want("((0,0),(1,1),(1,0))"),
+            want("((-0,-0),(-0,0),(0,0),(0,-0))"),
+            None,
+            want("((0,0))"),
+        ],
+    ];
+    assert_eq!(texts_of(&mut Snail::open(&path).unwrap(), q), expected);
+    let back = out_and_back(&path, &catalog, "path-polygon");
+    assert_eq!(texts_of(&mut Snail::open(&back).unwrap(), q), expected);
+    // A path compares by its points' count.
+    let (b, _) = Snail::open(&path)
+        .unwrap()
+        .ask("SELECT id FROM s.t WHERE p = '[(7,7)]' ORDER BY id", None)
+        .unwrap();
+    assert_eq!(ids(&b), [2]);
+}
+
+#[test]
+fn a_snapshot_is_its_xmin_its_xmax_and_its_transactions_compared_by_nothing() {
+    let ddl = "CREATE TABLE s.t (id integer NOT NULL, v pg_snapshot, w txid_snapshot, \
+               PRIMARY KEY (id));";
+    let held = |v: &[Option<&str>]| Values::Text(v.iter().map(|s| s.map(str::to_string)).collect());
+    let path = snail_of(
+        "snapshot",
+        ddl,
+        vec![
+            Values::Int(vec![Some(1), Some(2), Some(3)]),
+            held(&[
+                Some("10:20:12,15"),
+                Some("18446744073709551615:18446744073709551615:"),
+                None,
+            ]),
+            held(&[Some("1:1:"), None, Some("5:9:6")]),
+        ],
+    );
+    let mut snail = Snail::open(&path).unwrap();
+    let blocks = snail.blocks().unwrap();
+    let mut leaves: Vec<&str> = blocks
+        .iter()
+        .filter(|r| r.column.starts_with("v."))
+        .map(|r| r.column.as_str())
+        .collect();
+    leaves.dedup();
+    assert_eq!(leaves, ["v.xmin", "v.xmax", "v.xip.list.element"]);
+    let q = "WITH t AS (SELECT id, v, w FROM s.t) \
+             SELECT id, v::text AS x, w::text AS y FROM t ORDER BY id";
+    assert_eq!(
+        texts_of(&mut snail, q),
+        [
+            vec![
+                Some("10:20:12,15".to_string()),
+                Some("18446744073709551615:18446744073709551615:".to_string()),
+                None
+            ],
+            vec![Some("1:1:".to_string()), None, Some("5:9:6".to_string())]
+        ]
+    );
+    // PostgreSQL has no operator, order or equality for either, nor a cast between the two.
+    for q in [
+        "SELECT id FROM s.t WHERE v = '1:1:'",
+        "WITH t AS (SELECT id, v FROM s.t) SELECT id FROM t WHERE v = '1:1:'",
+        "WITH t AS (SELECT id, v FROM s.t) SELECT id FROM t WHERE v < '1:2:'",
+        "SELECT v, count(*) FROM s.t GROUP BY v",
+        "SELECT id FROM s.t ORDER BY w",
+        "SELECT min(v) FROM s.t",
+        "WITH t AS (SELECT id, v FROM s.t) SELECT id, CAST(v AS txid_snapshot) AS x FROM t",
+    ] {
+        assert!(snail.ask(q, None).is_err(), "{q}");
+    }
+    let (b, _) = snail
+        .ask(
+            "WITH t AS (SELECT id FROM s.t) \
+             SELECT id, CAST(CAST('1:3:2,2' AS pg_snapshot) AS text) AS x FROM t WHERE id = 1",
+            None,
+        )
+        .unwrap();
+    assert_eq!(texts(b.column(1).as_ref()), [Some("1:3:2".to_string())]);
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn an_array_of_a_type_with_no_equality_refuses_one_only_of_two_arrays_of_one_shape() {
+    let path = tmp("carried-arrays.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id integer NOT NULL, p point[], b box[], a aclitem[], q path[], \
+         PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let empty = Rows {
+        columns: (0..5)
+            .map(|c| Values::new(catalog.tables[0].columns[c].ty))
+            .collect(),
+    };
+    write(&path, &catalog, &[("s.t".into(), empty)]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.t (id, p, b, a, q) VALUES \
+         (1, '{\"(1,2)\",\"(0,0)\"}', '{(1,1),(0,0);(2,2),(1,1)}', '{=r/10,10=rw*/10}', \
+          '{\"[(0,0),(1,1)]\",\"((0,0))\"}'), \
+         (2, '{}', '{}', '{}', '{}'), (3, NULL, NULL, NULL, NULL)",
+    )
+    .unwrap();
+    drop(w);
+    let mut snail = Snail::open(&path).unwrap();
+    // PostgreSQL 18.6's text of the same values on 28818, 2026-10-30: box's array between `;`.
+    let q = "WITH t AS (SELECT id, p, b, a, q FROM s.t) \
+             SELECT id, p::text AS w, b::text AS x, a::text AS y, q::text AS z FROM t ORDER BY id";
+    let want = |s: &str| Some(s.to_string());
+    assert_eq!(
+        texts_of(&mut snail, q),
+        [
+            vec![want("{\"(1,2)\",\"(0,0)\"}"), want("{}"), None],
+            vec![want("{(1,1),(0,0);(2,2),(1,1)}"), want("{}"), None],
+            vec![want("{=r/10,10=rw*/10}"), want("{}"), None],
+            vec![want("{\"[(0,0),(1,1)]\",\"((0,0))\"}"), want("{}"), None],
+        ]
+    );
+    // A pipeline answers no row with a column of no type.
+    let found = |snail: &mut Snail, q: &str| {
+        snail.ask(q, None).map(|(b, _)| {
+            if b.num_rows() == 0 {
+                Vec::new()
+            } else {
+                ids(&b)
+            }
+        })
+    };
+    // Of no other shape than each row's, = is answered; of one row's, refused, as array_eq looks
+    // for its elements' equality only there.
+    assert_eq!(
+        found(
+            &mut snail,
+            "SELECT id FROM s.t WHERE p = '{\"(9,9)\"}' ORDER BY id"
+        )
+        .unwrap(),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        found(
+            &mut snail,
+            "WITH t AS (SELECT id, p FROM s.t) \
+             SELECT id FROM t WHERE p IS DISTINCT FROM '{\"(9,9)\"}' ORDER BY id"
+        )
+        .unwrap(),
+        [1, 2, 3]
+    );
+    for q in [
+        "SELECT id FROM s.t WHERE p = '{}'",
+        "SELECT id FROM s.t WHERE p <> '{\"(9,9)\",\"(8,8)\"}'",
+        "SELECT id FROM s.t WHERE q @> '{}'",
+        "SELECT p, count(*) FROM s.t GROUP BY p",
+        "SELECT id FROM s.t ORDER BY a",
+        "SELECT id FROM s.t WHERE a < '{}'",
+        "SELECT min(p) FROM s.t",
+        "WITH t AS (SELECT id, a FROM s.t) SELECT id, a + '=r/10' AS x FROM t WHERE id = 1",
+        "WITH t AS (SELECT id, a FROM s.t) SELECT id, a @> '=r/10' AS x FROM t",
+    ] {
+        assert!(snail.ask(q, None).is_err(), "{q}");
+    }
+    // aclitem's equality groups its arrays and finds them.
+    assert_eq!(
+        found(
+            &mut snail,
+            "SELECT id FROM s.t WHERE a = '{=r/10,10=rw*/10}' ORDER BY id"
+        )
+        .unwrap(),
+        [1]
+    );
+    let (b, _) = snail
+        .ask(
+            "SELECT min(id) AS i, count(*) AS n FROM s.t GROUP BY a",
+            None,
+        )
+        .unwrap();
+    assert_eq!(b.num_rows(), 3);
+    // aclcontains: the grantee and grantor, every privilege and grant option asked held.
+    let q = "WITH t AS (SELECT id, a FROM s.t) SELECT id, a @> '10=w/10' AS x, \
+             a @> '10=w*/10' AS y, a @> '10=d/10' AS z FROM t WHERE id = 1";
+    let (b, _) = snail.ask(q, None).unwrap();
+    let truth = |c: usize| {
+        b.column(c)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!((truth(1), truth(2), truth(3)), (true, true, false));
+    // min of one value is that value, as PostgreSQL compares none.
+    let (b, _) = snail
+        .ask("SELECT min(p)::text AS x FROM s.t WHERE id = 1", None)
+        .unwrap();
+    assert_eq!(
+        texts(b.column(0).as_ref()),
+        [Some("{\"(1,2)\",\"(0,0)\"}".to_string())]
+    );
+}

@@ -438,8 +438,8 @@ impl Snail {
                 types.push(desc.self_type_ptr());
                 leaves.push((c, leaf, desc, s));
             }
-            // A composed column is the tree of its leaves.
-            if col.ty.is_nested() {
+            // A composed column is the tree of its leaves, and so is a path, a polygon or a snapshot.
+            if col.ty.tree().is_some() {
                 fields.push(Arc::new(crate::composed::parquet_type(
                     &col.name, col.ty, true,
                 )?));

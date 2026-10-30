@@ -236,8 +236,9 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         (Value::Composed(a, x), Value::Composed(b, y)) if a == b => {
-            // An array's or a composite's = asks each part's equality first.
-            if let Some(part) = a.unequal_part() {
+            // An array's or a composite's = asks each part's equality first; two arrays' only
+            // where they are of one shape.
+            if let Some(part) = a.unequal_part().filter(|_| asks_parts(&x.item, &y.item)) {
                 return Err(unequal(part));
             }
             x.key.cmp(&y.key)
@@ -1144,11 +1145,9 @@ fn integer_beside(scalar: &Value, n: Value) -> Result<Value> {
 fn compared(op: &BinaryOperator, x: &Value, y: &Value) -> Result<()> {
     // An array of a type with no B-tree is compared by = and <> alone: where both are values.
     if let (Value::Composed(ty, _), _) | (_, Value::Composed(ty, _)) = (x, y) {
-        if !ty.ordered()
-            && !x.is_null()
-            && !y.is_null()
-            && !matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq)
-        {
+        let both = !x.is_null() && !y.is_null();
+        let equal = matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq);
+        if !ty.ordered() && both && !equal {
             return Err(Error::new(format!(
                 "could not identify a comparison function for type {}",
                 ty.pg_name()
@@ -1173,6 +1172,28 @@ fn compared(op: &BinaryOperator, x: &Value, y: &Value) -> Result<()> {
             kind_name(x),
             kind_name(y)
         )))
+    }
+}
+
+/// Whether comparing two composed values asks their parts' equality: always, but of two arrays of
+/// different shapes, their dimensions or lower bounds apart, which PostgreSQL's `array_eq` finds
+/// unequal before it asks.
+fn asks_parts(a: &crate::composed::Item, b: &crate::composed::Item) -> bool {
+    use crate::composed::Item;
+    match (a, b) {
+        (
+            Item::Array {
+                dims: d1,
+                lower: l1,
+                ..
+            },
+            Item::Array {
+                dims: d2,
+                lower: l2,
+                ..
+            },
+        ) => d1 == d2 && l1 == l2,
+        _ => true,
     }
 }
 
@@ -3025,8 +3046,12 @@ impl Acc {
                     ty.pg_name()
                 )));
             }
-            // min and max compare a second value with the first.
-            if !ty.ordered() && matches!(self, Acc::Least(Some(_)) | Acc::Greatest(Some(_))) {
+            // Of a type with no B-tree, refused where a second value meets the first, as
+            // PostgreSQL's array_smaller and array_larger are first called on two.
+            if !ty.ordered()
+                && !v.is_null()
+                && matches!(self, Acc::Least(Some(_)) | Acc::Greatest(Some(_)))
+            {
                 return Err(Error::new(format!(
                     "could not identify a comparison function for type {}",
                     ty.pg_name()
@@ -3969,13 +3994,15 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
 }
 
 /// Whether a question is read as a pipeline: a WITH, or a window in what it returns.
-/// Whether a question over one table compares or computes a geometric column in its WHERE, which
-/// only the pipeline reads: the question path keys no geometric value.
-pub fn reads_geometric(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
+/// Whether a question over one table compares or computes in its WHERE a column PostgreSQL compares
+/// a row at a time, which only the pipeline reads: the question path keys no geometric value, nor
+/// an array whose elements' type has no equality; or takes min or max of an array or a composite
+/// whose parts have no order, which PostgreSQL refuses only where a second value meets the first.
+pub fn reads_per_row(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
     };
-    let (Some(w), [from]) = (&s.selection, s.from.as_slice()) else {
+    let [from] = s.from.as_slice() else {
         return false;
     };
     let TableFactor::Table { name, .. } = &from.relation else {
@@ -3989,38 +4016,70 @@ pub fn reads_geometric(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
     else {
         return false;
     };
-    let geometric: Vec<&str> = table
+    let by_rows: Vec<&str> = table
         .columns
         .iter()
-        .filter(|c| matches!(c.ty, ColumnType::Geometric(_)))
+        .filter(|c| c.ty.compared_by_rows())
         .map(|c| c.name.as_str())
         .collect();
-    fn names(e: &Expr, geometric: &[&str]) -> bool {
+    fn names(e: &Expr, by_rows: &[&str]) -> bool {
         match e {
-            Expr::Identifier(i) => geometric.contains(&crate::catalog::ident(i).as_str()),
+            Expr::Identifier(i) => by_rows.contains(&crate::catalog::ident(i).as_str()),
             Expr::CompoundIdentifier(parts) => parts
                 .last()
-                .is_some_and(|i| geometric.contains(&crate::catalog::ident(i).as_str())),
+                .is_some_and(|i| by_rows.contains(&crate::catalog::ident(i).as_str())),
             Expr::Nested(e) | Expr::Cast { expr: e, .. } | Expr::UnaryOp { expr: e, .. } => {
-                names(e, geometric)
+                names(e, by_rows)
             }
-            Expr::BinaryOp { left, right, .. } => names(left, geometric) || names(right, geometric),
+            Expr::BinaryOp { left, right, .. } => names(left, by_rows) || names(right, by_rows),
             _ => false,
         }
     }
-    fn operated(e: &Expr, geometric: &[&str]) -> bool {
+    fn operated(e: &Expr, by_rows: &[&str]) -> bool {
         match e {
             Expr::BinaryOp {
                 left,
                 op: BinaryOperator::And | BinaryOperator::Or,
                 right,
-            } => operated(left, geometric) || operated(right, geometric),
-            Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => operated(e, geometric),
-            Expr::BinaryOp { .. } => names(e, geometric),
+            } => operated(left, by_rows) || operated(right, by_rows),
+            Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => operated(e, by_rows),
+            Expr::BinaryOp { .. } => names(e, by_rows),
             _ => false,
         }
     }
-    !geometric.is_empty() && operated(w, &geometric)
+    let unordered: Vec<&str> = table
+        .columns
+        .iter()
+        .filter(|c| c.ty.is_nested() && !c.ty.ordered())
+        .map(|c| c.name.as_str())
+        .collect();
+    fn called(e: &Expr) -> Option<&sqlparser::ast::Function> {
+        match e {
+            Expr::Function(f) => Some(f),
+            Expr::Nested(e) | Expr::Cast { expr: e, .. } => called(e),
+            _ => None,
+        }
+    }
+    let extreme = s.projection.iter().any(|i| {
+        let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = i else {
+            return false;
+        };
+        let Some(f) = called(e) else {
+            return false;
+        };
+        let called = crate::catalog::object_name(&f.name).to_lowercase();
+        let FunctionArguments::List(list) = &f.args else {
+            return false;
+        };
+        matches!(called.as_str(), "min" | "max")
+            && list.args.iter().any(|a| {
+                matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if names(e, &unordered))
+            })
+    });
+    extreme
+        || s.selection
+            .as_ref()
+            .is_some_and(|w| !by_rows.is_empty() && operated(w, &by_rows))
 }
 
 pub fn is_pipeline(q: &Query) -> bool {
@@ -4083,6 +4142,11 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                         Error::new(format!("{} is not of its type", field.name()))
                     })?,
                 )
+            } else if let Some(ty) = string.filter(|t| t.is_held_tree()) {
+                // A path, a polygon or a snapshot, its tree made into the value a row holds.
+                let held = crate::composed::group_at(ty, a.as_ref(), r)
+                    .ok_or_else(|| Error::new(format!("{} is not of its type", field.name())))?;
+                super::fill::value_of(&held, ty)
             } else if let Some(ColumnType::Geometric(k)) = string {
                 let s = any
                     .downcast_ref::<arrow::array::StructArray>()
@@ -4240,13 +4304,13 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
             })
             .max();
         let first = col().find(|v| !v.is_null());
-        // A column of geometric values: a group of float8s where every value is of one type of a
-        // fixed size; otherwise each value's text, named for the first one's type.
+        // A column of geometric values: its type's leaves, a group of float8s or a path's or a
+        // polygon's tree, where every value is of one type; otherwise each value's text, named for
+        // the first one's type.
         if let Some(Value::Geometric(g)) = first {
             let k = g.kind();
-            let fixed = k.fixed_leaves().is_some()
-                && col().all(|v| !matches!(v, Value::Geometric(h) if h.kind() != k));
-            if fixed {
+            let one = col().all(|v| !matches!(v, Value::Geometric(h) if h.kind() != k));
+            if one {
                 let ty = ColumnType::Geometric(k);
                 let bytes: Vec<Option<Vec<u8>>> = col()
                     .map(|v| match v {
@@ -4725,6 +4789,39 @@ fn composed_op(
         ))
     };
     match r.def() {
+        // An aclitem array's own operators, beside an aclitem: `@>` as aclcontains, `+` and `-`,
+        // which PostgreSQL no longer takes.
+        Composed::Array { element, .. }
+            if *element == ColumnType::Textual(crate::textual::Textual::Aclitem)
+                && matches!(x, Value::Composed(..))
+                && !matches!(y, Value::Composed(..))
+                && matches!(name, "@>" | "+" | "-") =>
+        {
+            if x.is_null() || y.is_null() {
+                return Ok(Some(Value::Null));
+            }
+            let item = match y {
+                Value::Typed(ColumnType::Textual(crate::textual::Textual::Aclitem), s) => s.clone(),
+                Value::Text(t) if quoted(right) => {
+                    crate::textual::text_in(crate::textual::Textual::Aclitem, t)?
+                }
+                _ => return Err(no()),
+            };
+            match name {
+                "+" => Err(Error::new("aclinsert is no longer supported")),
+                "-" => Err(Error::new("aclremove is no longer supported")),
+                _ => {
+                    let Some(Item::Array { elements, dims, .. }) = whole(x, left)? else {
+                        return Err(no());
+                    };
+                    Ok(Some(Value::Bool(crate::textual::aclcontains(
+                        &elements,
+                        dims.len(),
+                        &item,
+                    )?)))
+                }
+            }
+        }
         Composed::Array { element, .. } => {
             let (a, b) = (whole(x, left)?, whole(y, right)?);
             if name == "||" {

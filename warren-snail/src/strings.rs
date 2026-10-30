@@ -340,8 +340,7 @@ pub fn type_named(named: &str) -> Option<ColumnType> {
             if let Some(t) = crate::textual::Internal::of_type_name(n) {
                 return Some(ColumnType::Internal(t));
             }
-            if let Some(k) = crate::geo::GeoKind::of_name(n).filter(|k| k.fixed_leaves().is_some())
-            {
+            if let Some(k) = crate::geo::GeoKind::of_name(n) {
                 return Some(ColumnType::Geometric(k));
             }
             if let Some(m) = n.strip_prefix("character(") {
@@ -417,6 +416,8 @@ pub fn string_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
         ColumnType::Varbit(_) => A::Struct(bits_fields()),
         ColumnType::Bytes => A::Binary,
         ColumnType::Internal(t) if t.is_bytes() => A::Binary,
+        // A path, a polygon or a snapshot: the tree of its own.
+        ty if ty.is_held_tree() => crate::composed::group_arrow(ty),
         ColumnType::Geometric(_) => A::Struct(geometric_fields(ty)),
         ColumnType::Textual(crate::textual::Textual::Aclitem) => A::Struct(aclitem_fields()),
         _ => A::Utf8,
@@ -463,6 +464,23 @@ pub fn string_array<'a>(
     use arrow::array::{BinaryArray, FixedSizeBinaryArray, Int32Array, StringArray, StructArray};
     use std::sync::Arc;
     match ty {
+        // A path, a polygon or a snapshot, on the tree of its own.
+        ty if ty.is_held_tree() => {
+            let values: Vec<Option<crate::read::statement::Datum>> = held
+                .map(|b| {
+                    b.map(|b| match ty {
+                        ColumnType::Geometric(_) => {
+                            crate::read::statement::Datum::Bytes(b.to_vec())
+                        }
+                        _ => crate::read::statement::Datum::Text(
+                            String::from_utf8_lossy(b).into_owned(),
+                        ),
+                    })
+                })
+                .collect();
+            crate::composed::group_array(ty, &values.iter().map(Option::as_ref).collect::<Vec<_>>())
+                .expect("a value held as a tree takes its leaves")
+        }
         ColumnType::Bit(n) => Arc::new(
             FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                 held.map(|k| k.map(|k| bits_of_key(k).1)),

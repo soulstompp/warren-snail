@@ -1479,10 +1479,11 @@ impl Conj {
 /// as do a numeric's of one scale, the oid and the reg* types, the bit strings, and each time type
 /// of any precision; every other type has its own, whatever length or fields it is declared with, a
 /// composed type the one it is; cidr inet's, and pg_node_tree text's. Where PostgreSQL has no
-/// `=` that is equality of the values, its refusal: none at all, on point, json, jsonpath, xml,
-/// refcursor and the index summaries; one too many, on the statistics types; one that compares
-/// areas, lengths or points within a tolerance, on the other geometric types; none for an array or a
-/// composite one of whose parts has no equality.
+/// `=` that is equality of the values, its refusal: none at all, on point, polygon, json, jsonpath,
+/// xml, refcursor, the snapshots and the index summaries; one too many, on the statistics types;
+/// one that compares areas, lengths or points' counts or points within a tolerance, on the other
+/// geometric types, a path among them; none for an array or a composite one of whose parts has no
+/// equality.
 fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
     use crate::textual::{Internal, Textual};
     let none = || format!("operator does not exist: {0} = {0}", ty.pg_name());
@@ -1501,20 +1502,26 @@ fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
         ColumnType::Bit(_) | ColumnType::Varbit(_) => "bits".into(),
         ColumnType::Textual(Textual::Inet | Textual::Cidr) => "inet".into(),
         ColumnType::Textual(
-            Textual::Json | Textual::Jsonpath | Textual::Xml | Textual::Refcursor,
+            Textual::Json
+            | Textual::Jsonpath
+            | Textual::Xml
+            | Textual::Refcursor
+            | Textual::PgSnapshot
+            | Textual::TxidSnapshot,
         ) => return Err(none()),
         ColumnType::Textual(t) => format!("{t:?}"),
         ColumnType::Internal(Internal::NodeTree) => "text".into(),
         ColumnType::Internal(Internal::Ndistinct | Internal::Dependencies | Internal::McvList) => {
             return Err(format!("operator is not unique: {0} = {0}", ty.pg_name()))
         }
-        ColumnType::Internal(_) | ColumnType::Geometric(crate::geo::GeoKind::Point) => {
+        ColumnType::Internal(_)
+        | ColumnType::Geometric(crate::geo::GeoKind::Point | crate::geo::GeoKind::Polygon) => {
             return Err(none())
         }
         ColumnType::Geometric(_) => {
             return Err(format!(
-                "a join on {} is not read: its = compares areas, lengths or points within a \
-                 tolerance, not the values",
+                "a join on {} is not read: its = compares areas, lengths, points' counts or \
+                 points within a tolerance, not the values",
                 ty.pg_name()
             ))
         }

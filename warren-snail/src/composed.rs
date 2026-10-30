@@ -69,6 +69,10 @@ pub enum Composed {
     Multirange { name: String, range: ColumnType },
     /// An enum: its labels in the order its DDL gives them.
     Enum { name: String, labels: Vec<String> },
+    /// No composed type: the tree of leaves a type held as a tree of its own is held as, a path's,
+    /// a polygon's or a snapshot's, by which its column's leaves are found as a composed column's
+    /// are. A column is never of it.
+    Held(ColumnType),
 }
 
 fn held() -> &'static RwLock<Vec<&'static Composed>> {
@@ -163,6 +167,7 @@ impl Composed {
             | Composed::Range { name, .. }
             | Composed::Multirange { name, .. }
             | Composed::Enum { name, .. } => name.clone(),
+            Composed::Held(ty) => ty.pg_name(),
         }
     }
 
@@ -174,6 +179,7 @@ impl Composed {
             Composed::Range { .. } => "range_ops",
             Composed::Multirange { .. } => "multirange_ops",
             Composed::Enum { .. } => "enum_ops",
+            Composed::Held(ty) => ty.default_opclass(),
         }
     }
 }
@@ -650,6 +656,7 @@ pub fn text_in(ty: ColumnType, s: &str) -> Result<Item> {
         } => range_in(*subtype, *discrete, s),
         Composed::Multirange { range, .. } => multirange_in(*range, s),
         Composed::Enum { .. } => Ok(Item::Scalar(scalar_in(ty, s)?)),
+        Composed::Held(t) => Ok(Item::Scalar(scalar_in(*t, s)?)),
     }
 }
 
@@ -1361,7 +1368,7 @@ pub fn canonical_ranges(range: ColumnType, ranges: Vec<Item>) -> Vec<Item> {
 }
 
 /// Whether a part's text must be quoted in an array: empty, NULL in any case, or holding a quote, a
-/// backslash, a brace, a comma or white space.
+/// backslash, a brace, its element type's delimiter or white space.
 fn array_quoted(t: &str, delim: u8) -> bool {
     t.is_empty()
         || t.eq_ignore_ascii_case("NULL")
@@ -1408,6 +1415,7 @@ pub fn text_out(ty: ColumnType, item: &Item) -> String {
     match (r.def(), item) {
         (_, Item::Null) => String::new(),
         (Composed::Enum { .. }, Item::Scalar(d)) => scalar_out(ty, d),
+        (Composed::Held(t), Item::Scalar(d)) => scalar_out(*t, d),
         (
             Composed::Array { element, .. },
             Item::Array {
@@ -1591,6 +1599,9 @@ impl Node {
             optional,
             thin,
         };
+        if let Some(node) = Node::held(name, ty, optional) {
+            return node;
+        }
         let def = match ty {
             ColumnType::Composed(r) => r.def(),
             // A value held as a group of leaves, a tid, a timetz, an interval or a bit varying: a group
@@ -1666,7 +1677,63 @@ impl Node {
                 element: Box::new(Node::of("element", *range, false)),
             },
             Composed::Enum { .. } => leaf(name, ty, optional, false),
+            Composed::Held(t) => Node::of(name, *t, optional),
         }
+    }
+
+    /// The tree of a value of a type held as a tree of its own, in the order PostgreSQL lays it
+    /// out: a path its closed flag and its points; a polygon its bounding box and its points; a
+    /// snapshot its xmin, its xmax and the transactions in progress. A point is a group of its x
+    /// and y, a bounding box a box's group.
+    fn held(name: &str, ty: ColumnType, optional: bool) -> Option<Node> {
+        use crate::geo::GeoKind;
+        let points = || Node::List {
+            name: "points".into(),
+            optional: false,
+            element: Box::new(Node::of(
+                "element",
+                ColumnType::Geometric(GeoKind::Point),
+                false,
+            )),
+        };
+        let xid = |name: &str| Node::Leaf {
+            name: name.into(),
+            ty: ColumnType::Xid8,
+            bits: 64,
+            optional: false,
+            thin: false,
+        };
+        let children = match ty {
+            ColumnType::Geometric(GeoKind::Path) => vec![
+                Node::Leaf {
+                    name: "closed".into(),
+                    ty: ColumnType::Boolean,
+                    bits: 0,
+                    optional: false,
+                    thin: false,
+                },
+                points(),
+            ],
+            ColumnType::Geometric(GeoKind::Polygon) => vec![
+                Node::of("bound", ColumnType::Geometric(GeoKind::Box), false),
+                points(),
+            ],
+            ColumnType::Textual(t) if t.is_snapshot() => vec![
+                xid("xmin"),
+                xid("xmax"),
+                Node::List {
+                    name: "xip".into(),
+                    optional: false,
+                    element: Box::new(xid("element")),
+                },
+            ],
+            _ => return None,
+        };
+        Some(Node::Group {
+            name: name.into(),
+            optional,
+            children,
+        })
     }
 
     fn optional(&self) -> bool {
@@ -1782,16 +1849,21 @@ enum Tree {
 
 /// A value of an element type held as a group of leaves, on its leaves: a tid's block number and
 /// offset, each keyed in its own bits; a timetz's time and zone; an interval's months, days and
-/// microseconds; a bit varying's length and bits; an aclitem's grantee, grantor and privileges, each
-/// keyed in its own bits; a geometric value's float8s.
+/// microseconds; a bit varying's length and bits; a geometric value's float8s, a path's closed
+/// flag and its points, a polygon's bounding box and its points; an aclitem's grantee, grantor and
+/// privileges; a snapshot's xmin, xmax and the transactions in progress, each keyed in 64 bits.
 fn grouped(ty: ColumnType, d: &Datum) -> Tree {
+    use crate::geo::Geo;
+    use crate::scalars::unsigned_key;
     let int = |v: i64| Tree::Leaf(Datum::Int(v));
+    let float = |f: f64| Tree::Leaf(Datum::Float8(f.to_bits()));
+    let point = |p: &crate::geo::Point| Tree::Group(vec![float(p.x), float(p.y)]);
     match (ty, d) {
         (ColumnType::Tid, Datum::Int(k)) => {
             let (b, o) = crate::scalars::tid_parts(*k);
             Tree::Group(vec![
-                int(crate::scalars::unsigned_key(u64::from(b), 32)),
-                int(crate::scalars::unsigned_key(u64::from(o), 16)),
+                int(unsigned_key(u64::from(b), 32)),
+                int(unsigned_key(u64::from(o), 16)),
             ])
         }
         (ColumnType::Timetz(_), Datum::Int(k)) => {
@@ -1807,35 +1879,73 @@ fn grouped(ty: ColumnType, d: &Datum) -> Tree {
             let (len, bits) = crate::strings::bits_of_key(k);
             Tree::Group(vec![int(i64::from(len)), Tree::Leaf(Datum::Bytes(bits))])
         }
+        (ColumnType::Geometric(k), Datum::Bytes(b)) => match crate::geo::geo_of_bytes(k, b) {
+            Ok(Geo::Path(p)) => Tree::Group(vec![
+                int(p.closed as i64),
+                Tree::List(p.points.iter().map(point).collect()),
+            ]),
+            Ok(Geo::Polygon(p)) => Tree::Group(vec![
+                grouped(
+                    ColumnType::Geometric(crate::geo::GeoKind::Box),
+                    &Datum::Bytes(crate::geo::geo_bytes(&Geo::Box(p.bound))),
+                ),
+                Tree::List(p.points.iter().map(point).collect()),
+            ]),
+            Ok(g) => Tree::Group(crate::geo::geo_leaves(&g).into_iter().map(float).collect()),
+            Err(_) => Tree::Null,
+        },
         (ColumnType::Textual(crate::textual::Textual::Aclitem), Datum::Text(s)) => {
             match crate::textual::aclitem_parse(s) {
                 Ok((grantee, grantor, privileges)) => Tree::Group(vec![
-                    int(crate::scalars::unsigned_key(u64::from(grantee), 32)),
-                    int(crate::scalars::unsigned_key(u64::from(grantor), 32)),
-                    int(crate::scalars::unsigned_key(privileges, 64)),
+                    int(unsigned_key(u64::from(grantee), 32)),
+                    int(unsigned_key(u64::from(grantor), 32)),
+                    int(unsigned_key(privileges, 64)),
                 ]),
                 Err(_) => Tree::Null,
             }
         }
-        (ColumnType::Geometric(_), Datum::Bytes(b)) => Tree::Group(
-            b.chunks(8)
-                .map(|x| Tree::Leaf(Datum::Float8(u64::from_be_bytes(x.try_into().unwrap()))))
-                .collect(),
-        ),
+        (ColumnType::Textual(t), Datum::Text(s)) if t.is_snapshot() => {
+            match crate::textual::snapshot_parse(s) {
+                Ok((xmin, xmax, xip)) => Tree::Group(vec![
+                    int(unsigned_key(xmin, 64)),
+                    int(unsigned_key(xmax, 64)),
+                    Tree::List(xip.into_iter().map(|x| int(unsigned_key(x, 64))).collect()),
+                ]),
+                Err(_) => Tree::Null,
+            }
+        }
         _ => Tree::Null,
     }
 }
 
 /// A value of an element type held as a group of leaves, from its leaves.
 fn ungrouped(ty: ColumnType, parts: &[Tree]) -> Option<Datum> {
+    use crate::geo::{Geo, GeoBox, GeoKind, Point};
+    use crate::scalars::unsigned_of;
     use Tree::Leaf;
+    let float = |t: &Tree| match t {
+        Leaf(Datum::Float8(b)) => Some(f64::from_bits(*b)),
+        _ => None,
+    };
+    let point = |t: &Tree| match t {
+        Tree::Group(xy) => Some(Point {
+            x: float(xy.first()?)?,
+            y: float(xy.get(1)?)?,
+        }),
+        _ => None,
+    };
+    let points = |t: &Tree| match t {
+        Tree::List(v) => v.iter().map(point).collect::<Option<Vec<Point>>>(),
+        _ => None,
+    };
+    let u64_of = |t: &Tree| match t {
+        Leaf(Datum::Int(k)) => Some(unsigned_of(*k, 64)),
+        _ => None,
+    };
     Some(match (ty, parts) {
-        (ColumnType::Tid, [Leaf(Datum::Int(b)), Leaf(Datum::Int(o))]) => {
-            Datum::Int(crate::scalars::tid_key(
-                crate::scalars::unsigned_of(*b, 32) as u32,
-                crate::scalars::unsigned_of(*o, 16) as u16,
-            ))
-        }
+        (ColumnType::Tid, [Leaf(Datum::Int(b)), Leaf(Datum::Int(o))]) => Datum::Int(
+            crate::scalars::tid_key(unsigned_of(*b, 32) as u32, unsigned_of(*o, 16) as u16),
+        ),
         (ColumnType::Timetz(_), [Leaf(Datum::Int(t)), Leaf(Datum::Int(z))]) => {
             Datum::Int(crate::scalars::timetz_key(*t, *z as i32))
         }
@@ -1850,23 +1960,47 @@ fn ungrouped(ty: ColumnType, parts: &[Tree]) -> Option<Datum> {
         (ColumnType::Varbit(_), [Leaf(Datum::Int(len)), Leaf(Datum::Bytes(bits))]) => {
             Datum::Bytes(crate::strings::bits_key(*len as u32, bits))
         }
+        (ColumnType::Geometric(GeoKind::Path), [Leaf(Datum::Int(closed)), list]) => {
+            Datum::Bytes(crate::geo::geo_bytes(&Geo::Path(crate::geo::Path {
+                closed: *closed != 0,
+                points: points(list)?,
+            })))
+        }
+        (ColumnType::Geometric(GeoKind::Polygon), [Tree::Group(b), list]) => {
+            let corner = |i: usize| -> Option<Point> {
+                Some(Point {
+                    x: float(b.get(i)?)?,
+                    y: float(b.get(i + 1)?)?,
+                })
+            };
+            Datum::Bytes(crate::geo::geo_bytes(&Geo::Polygon(crate::geo::Polygon {
+                points: points(list)?,
+                bound: GeoBox {
+                    high: corner(0)?,
+                    low: corner(2)?,
+                },
+            })))
+        }
+        (ColumnType::Geometric(k), leaves) => {
+            let floats = leaves.iter().map(float).collect::<Option<Vec<f64>>>()?;
+            Datum::Bytes(crate::geo::geo_bytes(
+                &crate::geo::geo_from_leaves(k, &floats, false).ok()?,
+            ))
+        }
         (
             ColumnType::Textual(crate::textual::Textual::Aclitem),
             [Leaf(Datum::Int(grantee)), Leaf(Datum::Int(grantor)), Leaf(Datum::Int(privileges))],
         ) => Datum::Text(crate::textual::aclitem_text(
-            crate::scalars::unsigned_of(*grantee, 32) as u32,
-            crate::scalars::unsigned_of(*grantor, 32) as u32,
-            crate::scalars::unsigned_of(*privileges, 64),
+            unsigned_of(*grantee, 32) as u32,
+            unsigned_of(*grantor, 32) as u32,
+            unsigned_of(*privileges, 64),
         )),
-        (ColumnType::Geometric(_), parts) => {
-            let mut b = Vec::with_capacity(8 * parts.len());
-            for p in parts {
-                let Leaf(Datum::Float8(x)) = p else {
-                    return None;
-                };
-                b.extend_from_slice(&x.to_be_bytes());
-            }
-            Datum::Bytes(b)
+        (ColumnType::Textual(t), [xmin, xmax, Tree::List(xip)]) if t.is_snapshot() => {
+            Datum::Text(crate::textual::snapshot_text(
+                u64_of(xmin)?,
+                u64_of(xmax)?,
+                &xip.iter().map(u64_of).collect::<Option<Vec<u64>>>()?,
+            ))
         }
         _ => return None,
     })
@@ -1880,7 +2014,8 @@ fn tree_of(ty: ColumnType, item: &Item) -> Tree {
     };
     match (def, item) {
         (_, Item::Null) => Tree::Null,
-        (None, Item::Scalar(d)) if ty.leaf_count() > 1 => grouped(ty, d),
+        (Some(Composed::Held(t)), item) => tree_of(*t, item),
+        (None, Item::Scalar(d)) if ty.is_group() => grouped(ty, d),
         (_, Item::Scalar(d)) => Tree::Leaf(d.clone()),
         (
             Some(Composed::Array { element, .. }),
@@ -1946,6 +2081,7 @@ fn item_of(ty: ColumnType, t: Tree) -> Item {
     };
     match (def, t) {
         (_, Tree::Null) => Item::Null,
+        (Some(Composed::Held(t)), tree) => item_of(*t, tree),
         (None, Tree::Group(parts)) => ungrouped(ty, &parts).map_or(Item::Null, Item::Scalar),
         (_, Tree::Leaf(d)) => Item::Scalar(d),
         (Some(Composed::Array { element, .. }), Tree::Group(parts)) => {
@@ -2296,15 +2432,24 @@ impl Nested {
 
 /// A composed column's values as each of its leaves holds them.
 pub fn stripe(r: TypeRef, values: &[Option<Arc<Compound>>]) -> Vec<Nested> {
-    let shape = shape_of(r);
     let ty = ColumnType::Composed(r);
+    stripe_trees(
+        r,
+        values
+            .iter()
+            .map(|v| v.as_ref().map_or(Tree::Null, |c| tree_of(ty, &c.item))),
+    )
+}
+
+/// A column's values on the tree of `r`, as each of its leaves holds them.
+fn stripe_trees(r: TypeRef, trees: impl Iterator<Item = Tree>) -> Vec<Nested> {
+    let shape = shape_of(r);
     let node = &shape.node;
     let mut stripes = vec![Stripe::default(); shape.leaves.len()];
-    for v in values {
+    for t in trees {
         for s in &mut stripes {
             s.starts.push(s.defs.len() as u32);
         }
-        let t = v.as_ref().map_or(Tree::Null, |c| tree_of(ty, &c.item));
         shred(node, &t, 0, 0, 0, &mut stripes, 0);
     }
     stripes
@@ -2329,8 +2474,19 @@ pub fn stripe(r: TypeRef, values: &[Option<Arc<Compound>>]) -> Vec<Nested> {
 
 /// A composed column's values from its leaves', each of the same rows.
 pub fn assemble_rows(r: TypeRef, leaves: &[&Nested]) -> Vec<Option<Arc<Compound>>> {
-    let shape = shape_of(r);
     let ty = ColumnType::Composed(r);
+    assemble_trees(r, leaves)
+        .into_iter()
+        .map(|t| match t {
+            Tree::Null => None,
+            t => Some(Arc::new(Compound::new(ty, item_of(ty, t)))),
+        })
+        .collect()
+}
+
+/// A column's values on the tree of `r`, from its leaves', each of the same rows.
+fn assemble_trees(r: TypeRef, leaves: &[&Nested]) -> Vec<Tree> {
+    let shape = shape_of(r);
     let node = &shape.node;
     let stripes: Vec<Stripe> = leaves
         .iter()
@@ -2354,9 +2510,43 @@ pub fn assemble_rows(r: TypeRef, leaves: &[&Nested]) -> Vec<Option<Arc<Compound>
     let rows = leaves.first().map_or(0, |l| l.rows());
     let mut cur: Vec<usize> = vec![0; stripes.len()];
     (0..rows)
-        .map(|_| match assemble(node, 0, 0, &stripes, &mut cur, 0) {
-            Tree::Null => None,
-            t => Some(Arc::new(Compound::new(ty, item_of(ty, t)))),
+        .map(|_| assemble(node, 0, 0, &stripes, &mut cur, 0))
+        .collect()
+}
+
+/// The definition whose tree holds a type held as a tree of its own, a path, a polygon, a
+/// pg_snapshot or a txid_snapshot; none for any other.
+pub fn held_tree(ty: ColumnType) -> Option<TypeRef> {
+    let tree = match ty {
+        ColumnType::Geometric(k) => k.fixed_leaves().is_none(),
+        ColumnType::Textual(t) => t.is_snapshot(),
+        _ => false,
+    };
+    tree.then(|| TypeRef::of(Composed::Held(ty)))
+}
+
+/// A column of a type held as a tree of its own, each value as a row holds it, as each of the
+/// leaves of its tree holds them.
+pub fn stripe_held(ty: ColumnType, values: &[Datum]) -> Vec<Nested> {
+    let r = held_tree(ty).expect("a type held as a tree of its own");
+    stripe_trees(
+        r,
+        values.iter().map(|d| match d {
+            Datum::Null => Tree::Null,
+            d => grouped(ty, d),
+        }),
+    )
+}
+
+/// A column of a type held as a tree of its own, each value as a row holds it, from the leaves
+/// of its tree, each of the same rows.
+pub fn assemble_held(ty: ColumnType, leaves: &[&Nested]) -> Vec<Datum> {
+    let r = held_tree(ty).expect("a type held as a tree of its own");
+    assemble_trees(r, leaves)
+        .into_iter()
+        .map(|t| match t {
+            Tree::Group(parts) => ungrouped(ty, &parts).unwrap_or(Datum::Null),
+            _ => Datum::Null,
         })
         .collect()
 }
@@ -2907,6 +3097,35 @@ fn leaf_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<Datu
         ColumnType::Float8 => Datum::Float8(any.downcast_ref::<Float64Array>()?.value(r).to_bits()),
         ty => Datum::Int(crate::scalars::scalar_key_at(ty, a, r)?),
     })
+}
+
+/// The Arrow type an answer holds a value held as a group of leaves as, a tree of its own among
+/// them: what arrow's Parquet reader gives its page form.
+pub fn group_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
+    Node::of("v", ty, true).arrow()
+}
+
+/// Values held as a group of leaves, each as a row holds it, as an Arrow array of the type
+/// `group_arrow` gives.
+pub fn group_array(ty: ColumnType, values: &[Option<&Datum>]) -> Result<arrow::array::ArrayRef> {
+    let trees: Vec<Tree> = values
+        .iter()
+        .map(|d| match d {
+            None | Some(Datum::Null) => Tree::Null,
+            Some(d) => grouped(ty, d),
+        })
+        .collect();
+    Node::of("v", ty, true).array(&trees.iter().collect::<Vec<_>>())
+}
+
+/// The value held as a group of leaves at row `r` of an Arrow array of the type `group_arrow`
+/// gives, as a row holds it; none where it is not one.
+pub fn group_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<Datum> {
+    match Node::of("v", ty, true).tree_at(a, r)? {
+        Tree::Null => Some(Datum::Null),
+        Tree::Group(parts) => ungrouped(ty, &parts),
+        _ => None,
+    }
 }
 
 /// The Arrow type an answer holds a composed column as.
@@ -3850,6 +4069,6 @@ pub fn replace(ty: ColumnType, from: ColumnType, to: ColumnType) -> ColumnType {
             name,
             range: replace(range, from, to),
         },
-        e @ Composed::Enum { .. } => e,
+        e @ (Composed::Enum { .. } | Composed::Held(_)) => e,
     })
 }

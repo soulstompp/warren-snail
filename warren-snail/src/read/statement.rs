@@ -158,6 +158,47 @@ fn column_index(table: &Table, name: &ObjectName) -> Result<usize> {
         .ok_or_else(|| Error::new(format!("{} has no column {last}", table.name)))
 }
 
+/// A geometric literal cast to another geometric type inside its cast to `to`, cast as PostgreSQL
+/// casts it, `CAST(CAST('(0,0),(1,1)' AS box) AS polygon)` a box's polygon; none where every cast
+/// names `to`. Refused where a cast names a type no geometric value is cast to.
+fn geo_cast_through(e: &Expr, to: crate::geo::GeoKind) -> Result<Option<crate::geo::Geo>> {
+    let mut kinds = Vec::new();
+    let mut x = e;
+    loop {
+        match x {
+            Expr::Nested(inner) => x = inner,
+            Expr::Cast {
+                expr, data_type, ..
+            } => {
+                let name = data_type.to_string().to_lowercase();
+                let name = name.strip_prefix("pg_catalog.").unwrap_or(&name);
+                kinds.push(crate::geo::GeoKind::of_name(name).ok_or_else(|| {
+                    Error::new(format!(
+                        "{e}: a cast to {name} is not a value of {}",
+                        to.name()
+                    ))
+                })?);
+                x = expr;
+            }
+            _ => break,
+        }
+    }
+    if kinds.iter().all(|&k| k == to) {
+        return Ok(None);
+    }
+    let mut g = crate::geo::geo_in(*kinds.last().unwrap_or(&to), &text_literal(x)?)?;
+    for &k in kinds.iter().rev().skip(1).chain(std::iter::once(&to)) {
+        g = crate::geo::geo_cast(&g, k).ok_or_else(|| {
+            Error::new(format!(
+                "cannot cast type {} to {}",
+                g.kind().name(),
+                k.name()
+            ))
+        })??;
+    }
+    Ok(Some(g))
+}
+
 /// An expression with its casts taken off.
 fn uncast(e: &Expr) -> &Expr {
     match e {
@@ -258,6 +299,11 @@ pub(crate) fn numeric_literal_text(e: &Expr) -> Option<String> {
 
 /// A literal as a value of column `c`.
 pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
+    if let ColumnType::Geometric(k) = table.columns[c].ty {
+        if let Some(g) = geo_cast_through(e, k)? {
+            return Ok(Datum::Bytes(crate::geo::geo_bytes(&g)));
+        }
+    }
     let e = uncast(e);
     if let Expr::Value(v) = e {
         if matches!(v.value, Value::Null) {

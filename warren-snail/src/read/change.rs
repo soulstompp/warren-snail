@@ -214,8 +214,9 @@ fn leaf_datums(ty: ColumnType, d: &Datum) -> Vec<Datum> {
     if ty.leaf_count() == 1 && !ty.is_nested() {
         return vec![d.clone()];
     }
-    // A composed value whole, for each of its leaves, each striped from it where it is written.
-    if ty.is_nested() {
+    // A composed value whole, for each of its leaves, each striped from it where it is written; a
+    // path, a polygon or a snapshot too.
+    if ty.tree().is_some() {
         return vec![d.clone(); ty.leaf_count()];
     }
     let mut v = Values::new(ty);
@@ -254,6 +255,8 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
         let any = a.as_any();
         let scalar = crate::scalars::field_scalar(field);
         let bits = crate::strings::field_string(field).filter(|t| t.is_bits());
+        // A geometric value, an aclitem or a snapshot, its leaves made into the value a row holds.
+        let group = crate::strings::field_string(field).filter(|t| t.is_group() && !t.is_bits());
         let composed = crate::composed::field_composed(field);
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
@@ -266,6 +269,9 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
                 )
             } else if let Some(ty) = bits {
                 Datum::Bytes(crate::strings::bits_key_at(ty, a.as_ref(), r).unwrap())
+            } else if let Some(ty) = group {
+                crate::composed::group_at(ty, a.as_ref(), r)
+                    .ok_or_else(|| Error::new(format!("{} is not of its type", field.name())))?
             } else if let Some(ty) = composed {
                 let c = crate::composed::compound_at(ty, a.as_ref(), r)
                     .ok_or_else(|| Error::new(format!("{} is not of its type", field.name())))?;
@@ -2277,16 +2283,27 @@ impl Snail {
                     None
                 };
                 if let Some((r, index)) = leaf.nested {
-                    // A leaf of a composed column: the rows held, then the new rows striped onto it.
-                    let whole: Vec<Option<std::sync::Arc<crate::composed::Compound>>> =
-                        added_leaves
-                            .iter()
-                            .map(|row| match &row[s] {
-                                Datum::Compound(c) => Some(c.clone()),
-                                _ => None,
-                            })
-                            .collect();
-                    let new = crate::composed::stripe(r, &whole).swap_remove(index as usize);
+                    // A leaf of a composed column, or of a path's, a polygon's or a snapshot's
+                    // tree: the rows held, then the new rows striped onto it.
+                    let mut new = match r.def() {
+                        crate::composed::Composed::Held(held) => {
+                            let values: Vec<Datum> =
+                                added_leaves.iter().map(|row| row[s].clone()).collect();
+                            crate::composed::stripe_held(*held, &values)
+                        }
+                        _ => {
+                            let whole: Vec<Option<std::sync::Arc<crate::composed::Compound>>> =
+                                added_leaves
+                                    .iter()
+                                    .map(|row| match &row[s] {
+                                        Datum::Compound(c) => Some(c.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                            crate::composed::stripe(r, &whole)
+                        }
+                    };
+                    let new = new.swap_remove(index as usize);
                     let mut leaf_values = match held {
                         Some(Values::Nested(n)) => *n,
                         _ => crate::composed::Nested::empty(&new),

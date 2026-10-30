@@ -101,13 +101,13 @@ pub enum ColumnType {
     /// A timestamptz rounded to the digits after the second its precision names.
     TimestamptzRounded(u8),
     /// A type held as PostgreSQL's text of each value: json, jsonb, jsonpath, xml, inet, cidr,
-    /// tsvector, tsquery or refcursor.
+    /// tsvector, tsquery, refcursor, aclitem, pg_snapshot or txid_snapshot.
     Textual(crate::textual::Textual),
     /// A type only a server makes, which no literal gives: pg_node_tree and the statistics types,
     /// held as copied, and gtsvector and the BRIN summaries, NULL only.
     Internal(crate::textual::Internal),
-    /// A geometric type of fixed size, point, line, lseg, box or circle: its float8s, each a leaf of a
-    /// group.
+    /// A geometric type: a point, a line, an lseg, a box or a circle its float8s, each a leaf of a
+    /// group; a path or a polygon a tree of its own, its points a list.
     Geometric(crate::geo::GeoKind),
 }
 
@@ -146,8 +146,8 @@ impl ColumnType {
             ColumnType::Tid => Some(8),
             // Its grantee and grantor as oids, its privileges as 64 unsigned bits.
             ColumnType::Textual(crate::textual::Textual::Aclitem) => Some(16),
-            // A float8 a leaf.
-            ColumnType::Geometric(k) => Some(8 * k.fixed_leaves().unwrap_or(0)),
+            // A float8 a leaf; a path's and a polygon's points vary.
+            ColumnType::Geometric(k) => k.fixed_leaves().map(|n| 8 * n),
             // Its bits as a fixed array of bytes, the last padded.
             ColumnType::Bit(n) => Some((n as usize).div_ceil(8)),
             ColumnType::Date => Some(4),
@@ -250,6 +250,19 @@ impl ColumnType {
             },
             ty if ty.grouped() => None,
             ty => Some(ty),
+        }
+    }
+
+    /// Whether PostgreSQL decides its comparisons a row at a time, so that only the pipeline reads
+    /// them: a geometric value's, and an array's whose elements' type has no equality, which `=`
+    /// refuses only where the two arrays are of one shape.
+    pub fn compared_by_rows(self) -> bool {
+        match self {
+            ColumnType::Geometric(_) => true,
+            ColumnType::Composed(r) => {
+                matches!(r.def(), crate::composed::Composed::Array { element, .. } if !element.grouped())
+            }
+            _ => false,
         }
     }
 
@@ -588,23 +601,36 @@ impl ColumnType {
         }
     }
 
-    /// How many leaves its Parquet type tree has.
-    pub fn leaf_count(self) -> usize {
+    /// The definition whose tree of leaves holds its values, each leaf with its levels: a composed
+    /// type's own but an enum's, and the tree a path, a polygon or a snapshot is held as.
+    pub fn tree(self) -> Option<crate::composed::TypeRef> {
         match self {
-            ColumnType::Composed(r) if crate::composed::is_nested(r) => {
-                crate::composed::leaves(r).len()
-            }
-            _ => self.fields().len().max(1),
+            ColumnType::Composed(r) if crate::composed::is_nested(r) => Some(r),
+            ty => crate::composed::held_tree(ty),
         }
     }
 
-    /// Whether its values are held as a tree of leaves rather than as one: a tid, or a composed type
-    /// but an enum.
+    /// How many leaves its Parquet type tree has.
+    pub fn leaf_count(self) -> usize {
+        match self.tree() {
+            Some(r) => crate::composed::leaves(r).len(),
+            None => self.fields().len().max(1),
+        }
+    }
+
+    /// Whether its values are held as a tree of leaves rather than as one: a tid, a value of a fixed
+    /// group, a path, a polygon or a snapshot, or a composed type but an enum.
     pub fn is_group(self) -> bool {
         match self {
             ColumnType::Composed(r) => crate::composed::is_nested(r),
             _ => self.leaf_count() > 1,
         }
+    }
+
+    /// Whether it is a type held as a tree of leaves of its own, each with its levels, though no
+    /// composed type: a path, a polygon or a snapshot.
+    pub fn is_held_tree(self) -> bool {
+        !matches!(self, ColumnType::Composed(_)) && self.tree().is_some()
     }
 
     /// Whether it is a composed type held as a tree of leaves, each with its levels: every composed
@@ -615,10 +641,8 @@ impl ColumnType {
 
     /// The leaves of its Parquet type tree: the value itself, or a leaf a field of the group it is.
     pub fn leaves(self) -> Vec<Leaf> {
-        if let ColumnType::Composed(r) = self {
-            if crate::composed::is_nested(r) {
-                return crate::composed::leaves(r).to_vec();
-            }
+        if let Some(r) = self.tree() {
+            return crate::composed::leaves(r).to_vec();
         }
         match self.fields() {
             [] => vec![Leaf {
@@ -1889,14 +1913,7 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                     ColumnType::Textual(crate::textual::Textual::of_type_name(other).unwrap())
                 }
                 other if crate::geo::GeoKind::of_name(other).is_some() => {
-                    let k = crate::geo::GeoKind::of_name(other).unwrap();
-                    if k.fixed_leaves().is_none() {
-                        return Err(Error::new(format!(
-                            "the type {other} is not held yet: its points are a list, which the \
-                             repeated leaf holds"
-                        )));
-                    }
-                    ColumnType::Geometric(k)
+                    ColumnType::Geometric(crate::geo::GeoKind::of_name(other).unwrap())
                 }
                 other if crate::textual::Internal::of_type_name(other).is_some() => {
                     ColumnType::Internal(crate::textual::Internal::of_type_name(other).unwrap())
@@ -2510,7 +2527,7 @@ mod tests {
 
     #[test]
     fn a_type_not_held_is_refused() {
-        let e = refused("CREATE TABLE s.t (a pg_snapshot NOT NULL, PRIMARY KEY (a));");
+        let e = refused("CREATE TABLE s.t (a int2vector NOT NULL, PRIMARY KEY (a));");
         assert!(e.contains("is not held"), "{e}");
     }
 

@@ -93,6 +93,14 @@ impl Rows {
                             out.push(v);
                         }
                     }
+                    // A path, a polygon or a snapshot, as arrow's Parquet reader gives its tree.
+                    (out, ty, DataType::Struct(_)) if ty.is_held_tree() => {
+                        for r in 0..a.len() {
+                            let d =
+                                crate::composed::group_at(ty, a.as_ref(), r).ok_or_else(wrong)?;
+                            crate::values::push_datum(out, &d);
+                        }
+                    }
                     // An enum: its labels, as their ranks.
                     (
                         Values::Int(out),

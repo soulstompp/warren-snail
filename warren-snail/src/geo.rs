@@ -3371,20 +3371,44 @@ bin	<->	path	[(NaN,NaN),(NaN,NaN),(1,1),(2,2)]	path	[(5,5),(6,6)]	4.242640687119
     }
 }
 
-/// A value of a fixed size as a row holds it: its float8s' bits, 8 bytes each, big-endian, in the
-/// order `geo_leaves` lays them out.
+/// A value as a row holds it: its float8s' bits, 8 bytes each, big-endian, in the order
+/// `geo_leaves` lays them out; a path's closed flag a byte before them, and a polygon's bounding
+/// box, its high corner then its low, before its points.
 pub fn geo_bytes(g: &Geo) -> Vec<u8> {
-    geo_leaves(g)
-        .iter()
-        .flat_map(|f| f.to_bits().to_be_bytes())
-        .collect()
+    let mut out = match g {
+        Geo::Path(p) => vec![p.closed as u8],
+        Geo::Polygon(p) => geo_leaves(&Geo::Box(p.bound))
+            .iter()
+            .flat_map(|f| f.to_bits().to_be_bytes())
+            .collect(),
+        _ => Vec::new(),
+    };
+    out.extend(geo_leaves(g).iter().flat_map(|f| f.to_bits().to_be_bytes()));
+    out
 }
 
-/// A value of type `kind` of a fixed size, from the bytes a row holds it as.
+/// A value of type `kind`, from the bytes a row holds it as: a polygon with the bounding box it
+/// was made with, which one made again from its points can differ from where `-0` and `0` tie.
 pub fn geo_of_bytes(kind: GeoKind, b: &[u8]) -> Result<Geo> {
-    let leaves: Vec<f64> = b
-        .chunks(8)
-        .map(|c| f64::from_bits(u64::from_be_bytes(c.try_into().unwrap_or([0; 8]))))
-        .collect();
-    geo_from_leaves(kind, &leaves, false)
+    let floats = |b: &[u8]| -> Vec<f64> {
+        b.chunks(8)
+            .map(|c| f64::from_bits(u64::from_be_bytes(c.try_into().unwrap_or([0; 8]))))
+            .collect()
+    };
+    match kind {
+        GeoKind::Path if !b.is_empty() => geo_from_leaves(kind, &floats(&b[1..]), b[0] != 0),
+        GeoKind::Polygon if b.len() >= 32 => {
+            let Geo::Box(bound) = geo_from_leaves(GeoKind::Box, &floats(&b[..32]), false)? else {
+                unreachable!()
+            };
+            let Geo::Polygon(p) = geo_from_leaves(kind, &floats(&b[32..]), false)? else {
+                unreachable!()
+            };
+            Ok(Geo::Polygon(Polygon {
+                points: p.points,
+                bound,
+            }))
+        }
+        _ => geo_from_leaves(kind, &floats(b), false),
+    }
 }

@@ -1,9 +1,9 @@
 //! The types held as PostgreSQL's text of each value: json and jsonb, jsonpath, xml, inet and cidr,
-//! tsvector and tsquery, and refcursor; and the types only a server makes, into its catalogs and
-//! its indexes' pages, which no literal gives: pg_node_tree and the statistics types, copied only,
-//! and gtsvector and the BRIN summaries, NULL only. Each is read as its input function reads it
-//! and printed as its output function writes it; those PostgreSQL orders are keyed as their
-//! comparison orders them.
+//! tsvector and tsquery, refcursor, aclitem, pg_snapshot and txid_snapshot; and the types only a
+//! server makes, into its catalogs and its indexes' pages, which no literal gives: pg_node_tree and
+//! the statistics types, copied only, and gtsvector and the BRIN summaries, NULL only. Each is read
+//! as its input function reads it and printed as its output function writes it; those PostgreSQL
+//! orders are keyed as their comparison orders them.
 
 use crate::{Error, Result};
 
@@ -34,10 +34,16 @@ pub enum Textual {
     /// aclitem: a grantee, a grantor and their privileges, held as the text `aclitemout` writes with
     /// each role's OID, and on its pages as a group of three leaves; compared by `=` alone.
     Aclitem,
+    /// pg_snapshot: a snapshot's xmin, its xmax and the transactions in progress, held as the text
+    /// `pg_snapshot_out` writes, and on its pages as a tree of its own: xmin, xmax and a list of
+    /// the transactions; no comparison.
+    PgSnapshot,
+    /// txid_snapshot: pg_snapshot's older name, a type of its own, read and written alike.
+    TxidSnapshot,
 }
 
 impl Textual {
-    pub const ALL: [Textual; 10] = [
+    pub const ALL: [Textual; 12] = [
         Textual::Json,
         Textual::Jsonb,
         Textual::Jsonpath,
@@ -48,6 +54,8 @@ impl Textual {
         Textual::Tsquery,
         Textual::Refcursor,
         Textual::Aclitem,
+        Textual::PgSnapshot,
+        Textual::TxidSnapshot,
     ];
 
     /// Its name, as PostgreSQL's `format_type` writes it.
@@ -63,7 +71,14 @@ impl Textual {
             Textual::Tsquery => "tsquery",
             Textual::Refcursor => "refcursor",
             Textual::Aclitem => "aclitem",
+            Textual::PgSnapshot => "pg_snapshot",
+            Textual::TxidSnapshot => "txid_snapshot",
         }
+    }
+
+    /// Whether it is a snapshot: pg_snapshot or txid_snapshot.
+    pub fn is_snapshot(self) -> bool {
+        matches!(self, Textual::PgSnapshot | Textual::TxidSnapshot)
     }
 
     pub fn of_type_name(name: &str) -> Option<Textual> {
@@ -201,7 +216,100 @@ pub fn text_in(kind: Textual, s: &str) -> Result<String> {
         Textual::Cidr => crate::inet::inet_in(s, true)?,
         Textual::Tsvector => crate::tsearch::tsvector_in(s)?,
         Textual::Tsquery => crate::tsearch::tsquery_in(s)?,
+        Textual::PgSnapshot | Textual::TxidSnapshot => {
+            let (xmin, xmax, xip) = snapshot_parse(s)?;
+            snapshot_text(xmin, xmax, &xip)
+        }
     })
+}
+
+/// A number as C's `strtoull` reads it in base 10 from byte `at`: white space passed over, a sign,
+/// then digits, a number past 64 bits the greatest, one after `-` taken from 2^64; and the byte
+/// after it, or `at` where no digit follows.
+fn strtou64(b: &[u8], at: usize) -> (u64, usize) {
+    let mut i = at;
+    while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+        i += 1;
+    }
+    let negative = b.get(i) == Some(&b'-');
+    if matches!(b.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let start = i;
+    let mut v: u64 = 0;
+    let mut over = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        match v
+            .checked_mul(10)
+            .and_then(|x| x.checked_add(u64::from(b[i] - b'0')))
+        {
+            Some(x) => v = x,
+            None => over = true,
+        }
+        i += 1;
+    }
+    if i == start {
+        return (0, at);
+    }
+    let v = if over {
+        u64::MAX
+    } else if negative {
+        v.wrapping_neg()
+    } else {
+        v
+    };
+    (v, i)
+}
+
+/// A snapshot as `parse_snapshot` reads it: `xmin:xmax:` then the transactions in progress,
+/// commas between, each read as `strtou64` reads it; xmin and xmax each of a transaction number
+/// that is not 0 in its low 32 bits, xmax not before xmin, the transactions from xmin to before
+/// xmax in order, a repeated one dropped. Its xmin, its xmax and its transactions.
+pub fn snapshot_parse(s: &str) -> Result<(u64, u64, Vec<u64>)> {
+    let bad = || {
+        Error::new(format!(
+            "invalid input syntax for type pg_snapshot: \"{s}\""
+        ))
+    };
+    let b = s.as_bytes();
+    let (xmin, p) = strtou64(b, 0);
+    if b.get(p) != Some(&b':') {
+        return Err(bad());
+    }
+    let (xmax, p) = strtou64(b, p + 1);
+    if b.get(p) != Some(&b':') {
+        return Err(bad());
+    }
+    let valid = |x: u64| x as u32 != 0;
+    if !valid(xmin) || !valid(xmax) || xmax < xmin {
+        return Err(bad());
+    }
+    let mut p = p + 1;
+    let mut xip: Vec<u64> = Vec::new();
+    let mut last = 0u64;
+    while p < b.len() {
+        let (v, end) = strtou64(b, p);
+        p = end;
+        if v < xmin || v >= xmax || v < last {
+            return Err(bad());
+        }
+        if v != last {
+            xip.push(v);
+        }
+        last = v;
+        match b.get(p) {
+            Some(b',') => p += 1,
+            None => {}
+            Some(_) => return Err(bad()),
+        }
+    }
+    Ok((xmin, xmax, xip))
+}
+
+/// A snapshot as `pg_snapshot_out` writes it.
+pub fn snapshot_text(xmin: u64, xmax: u64, xip: &[u64]) -> String {
+    let xip: Vec<String> = xip.iter().map(u64::to_string).collect();
+    format!("{xmin}:{xmax}:{}", xip.join(","))
 }
 
 /// A value of `kind` as its output function writes it, from the text the snail holds.
@@ -423,6 +531,38 @@ pub fn aclitem_parse(s: &str) -> Result<(u32, u32, u64)> {
     Ok((grantee.unwrap_or(0), grantor, privs | goptions << 32))
 }
 
+/// Whether an aclitem array of `dimensions` dimensions holds `item` as `aclcontains` finds it: an
+/// element of the same grantee and grantor whose privileges and grant options hold all of
+/// `item`'s. Refused where the array is not of one dimension or holds a NULL, as `check_acl`
+/// refuses it.
+pub fn aclcontains(
+    elements: &[crate::composed::Item],
+    dimensions: usize,
+    item: &str,
+) -> Result<bool> {
+    use crate::composed::Item;
+    use crate::read::statement::Datum;
+    if dimensions != 1 {
+        return Err(Error::new("ACL arrays must be one-dimensional"));
+    }
+    let held: Vec<&str> = elements
+        .iter()
+        .map(|e| match e {
+            Item::Scalar(Datum::Text(s)) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .ok_or_else(|| Error::new("ACL arrays must not contain null values"))?;
+    let (grantee, grantor, rights) = aclitem_parse(item)?;
+    for s in held {
+        let (g, r, held) = aclitem_parse(s)?;
+        if g == grantee && r == grantor && held & rights == rights {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// An aclitem as `aclitemout` writes it where no role is named: its grantee's OID (none for
 /// PUBLIC), `=`, each privilege's letter and `*` where it is granted with its option, `/`, its
 /// grantor's OID.
@@ -531,4 +671,50 @@ pub fn text_array_out(elements: &[Option<String>]) -> String {
         })
         .collect();
     format!("{{{}}}", quoted.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_snapshot_is_read_as_parse_snapshot_reads_it_and_written_as_pg_snapshot_out() {
+        // PostgreSQL 18.6's answers on 28818, 2026-10-30: `SELECT '<spelling>'::pg_snapshot`.
+        let taken = [
+            ("10:20:12,12,15", "10:20:12,15"),
+            (" 010:+20: 12,", "10:20:12"),
+            ("4294967297:4294967297:", "4294967297:4294967297:"),
+            ("-5:-1:", "18446744073709551611:18446744073709551615:"),
+            ("1:1:", "1:1:"),
+            (
+                "18446744073709551616:18446744073709551617:",
+                "18446744073709551615:18446744073709551615:",
+            ),
+            ("10:20:12,15,", "10:20:12,15"),
+            ("1:2:+1", "1:2:1"),
+            ("1:3:2,2,2", "1:3:2"),
+        ];
+        for (s, out) in taken {
+            assert_eq!(text_in(Textual::PgSnapshot, s).unwrap(), out, "{s}");
+            assert_eq!(text_in(Textual::TxidSnapshot, s).unwrap(), out, "{s}");
+        }
+        let refused = [
+            "10:20:12,,15",
+            "10:20:12 ",
+            "10:20:5",
+            "10:20:20",
+            "4294967296:4294967297:",
+            "-1:2:",
+            "10:20:-11",
+            ":5:",
+            "10:20",
+        ];
+        for s in refused {
+            let e = text_in(Textual::PgSnapshot, s).unwrap_err().to_string();
+            assert!(
+                e.contains("invalid input syntax for type pg_snapshot"),
+                "{s}: {e}"
+            );
+        }
+    }
 }
