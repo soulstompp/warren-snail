@@ -454,6 +454,29 @@ one row group larger than a file in a file of its own; `write` reads such a dire
 files in turn. `write --file-pages <n>` makes a snail whose files hold `n` pages, to see the split
 on small data.
 
+## Followers: the commit carried
+
+**What it writes.** A snail open to write can be given a host, `Snail::carried_by`, that carries
+its commits to other copies of the file. A commit is handed to the host once its pages are on the
+disk, as a `carry::Commit`: every page it wrote, by its bytes, each named by its file and its page
+there, and the root's bytes. The root is written only once the host returns, so a host can wait
+until a majority of the copies holds the commit; meanwhile the commit keeps the root's turn, and
+the next commit waits for it. `Commit::encode` gives the bytes to send, uncompressed, and
+`Commit::decode` refuses bytes that are not a commit whole.
+
+**The read it cancels.** A follower runs no statement. `carry::apply` writes a commit's pages where
+they lie, then its root, so the follower stands at each of the leader's generations, its files byte
+for byte the leader's. A new follower begins as `carry::copy`, every file of the leader's copied
+whole while a round holds the generation the copy stands at.
+
+**How it shows.** `census` on a follower names every page as on the leader, at the same generation.
+
+**Where it stops.** A follower applies one commit at a time, only at the commit's parent; any other
+is refused by name, and a commit already landed changes nothing. An apply stopped before the root,
+or halfway through it, leaves the follower at the parent, and applied again it finishes. A round on
+a follower reads its own generation, and an apply that frees pages an older round of the follower's
+may read waits for that round to end. With no host, a commit writes its root as it always has.
+
 ## A question read as it goes: WITH and windows
 
 **What it reads.** A question with a `WITH`, or a window, is read as a pipeline over one table,
@@ -673,6 +696,8 @@ fn main() -> warren_snail::Result<()> {
   and the `Round` it took; `ask_with` takes the parameters of a pipeline.
 - `execute` runs one statement; `out`, `blocks` and `census` are the commands of those names.
 - `write::write_from` writes a new snail from a `catalog::Catalog` and each table's `write::Rows`.
+- `carried_by` gives a snail open to write its `carry::Host`; `carry::apply` and `carry::copy` keep
+  a follower.
 
 ### The feature `standalone`
 

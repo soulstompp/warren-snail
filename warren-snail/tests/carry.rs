@@ -654,6 +654,40 @@ fn a_leader_stopped_once_a_majority_holds_its_commit_takes_it_as_its_followers_d
     assert_eq!(one(&got), 1);
 }
 
+/// A host that holds each commit at the root's turn until told to go on, saying first that it holds
+/// it.
+#[cfg(feature = "standalone")]
+struct Held(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(feature = "standalone")]
+impl Host for Held {
+    fn carry(&mut self, _: &Commit) -> warren_snail::Result<()> {
+        self.0.send(()).unwrap();
+        self.1.recv().unwrap();
+        Ok(())
+    }
+}
+
+/// A writer on its own thread whose one statement's commit its host holds at the root's turn:
+/// returned once the host holds it, with the sender that lets it go on, the writer's thread giving
+/// back the generation the statement made.
+#[cfg(feature = "standalone")]
+fn holding(
+    path: &Path,
+    sql: String,
+) -> (std::thread::JoinHandle<u64>, std::sync::mpsc::Sender<()>) {
+    let (carrying_tx, carrying) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel();
+    let p = path.to_path_buf();
+    let writer = std::thread::spawn(move || {
+        let mut w = Snail::open_writing(&p).unwrap();
+        w.carried_by(Box::new(Held(carrying_tx, go_rx))).unwrap();
+        w.execute(&sql).unwrap().generation
+    });
+    carrying.recv().unwrap();
+    (writer, go)
+}
+
 #[test]
 #[cfg(feature = "standalone")]
 fn commits_take_turns_at_the_root_while_one_waits_for_its_host() {
@@ -661,27 +695,10 @@ fn commits_take_turns_at_the_root_while_one_waits_for_its_host() {
     let path = snail("turns-host", &s);
     let order = in_order(&s);
     let (a, b) = (order[10].2, order[order.len() - 10].2);
-    struct Held(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
-    impl Host for Held {
-        fn carry(&mut self, _: &Commit) -> warren_snail::Result<()> {
-            self.0.send(()).unwrap();
-            self.1.recv().unwrap();
-            Ok(())
-        }
-    }
-    let (carrying_tx, carrying) = std::sync::mpsc::channel();
-    let (go, go_rx) = std::sync::mpsc::channel();
-    let p = path.clone();
-    let first = std::thread::spawn(move || {
-        let mut w = Snail::open_writing(&p).unwrap();
-        w.carried_by(Box::new(Held(carrying_tx, go_rx))).unwrap();
-        w.execute(&format!(
-            "UPDATE weather.readings SET feed = 'one' WHERE reading_id = {a}"
-        ))
-        .unwrap()
-        .generation
-    });
-    carrying.recv().unwrap();
+    let (first, go) = holding(
+        &path,
+        format!("UPDATE weather.readings SET feed = 'one' WHERE reading_id = {a}"),
+    );
     // The first commit holds the root's turn while its host carries it: a writer of another block
     // commits only once it is through.
     let p = path.clone();
@@ -705,4 +722,39 @@ fn commits_take_turns_at_the_root_while_one_waits_for_its_host() {
         (feed_of(&mut r, a), feed_of(&mut r, b)),
         ("one".into(), "two".into())
     );
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn an_apply_takes_the_followers_root_turn_so_it_never_lands_beside_a_commit_there() {
+    let s = sample(5_000);
+    let base = snail("beside-base", &s);
+    let leader = copied(&base, &tmp("beside-leader.snail"));
+    let follower = copied(&base, &tmp("beside-follower.snail"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut w = Snail::open_writing(&leader).unwrap();
+    w.carried_by(Box::new(Sent(tx))).unwrap();
+    run(&mut w, &stream(&s)[0]);
+    let c = rx.recv().unwrap();
+    // A commit on the follower itself, held at the root's turn: the apply waits for it, then finds
+    // the follower moved on, and is refused by name.
+    let (local, go) = holding(
+        &follower,
+        format!(
+            "DELETE FROM weather.readings WHERE reading_id = {}",
+            s.reading_id[0]
+        ),
+    );
+    let f = follower.clone();
+    let apply = std::thread::spawn(move || carry::apply(&f, &c));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !apply.is_finished(),
+        "the apply wrote beside a commit on the follower"
+    );
+    go.send(()).unwrap();
+    assert_eq!(local.join().unwrap(), 2);
+    let e = apply.join().unwrap().unwrap_err().to_string();
+    assert!(e.contains("the follower stands at generation 2"), "{e}");
+    Snail::open(&follower).unwrap().census().unwrap();
 }

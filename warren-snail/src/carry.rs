@@ -125,11 +125,12 @@ impl Commit {
     }
 }
 
-/// Applies a commit to a follower's snail at `path`: its pages written where they lie and brought to
-/// the disk, then its root. The follower must stand at the commit's parent, and is refused by name
-/// otherwise; one that stands at the commit already, its root the commit's, is left as it is. Where
-/// the commit frees pages a generation older than one of the follower's rounds holds may name, it
-/// waits for those rounds to end first, as long as it takes.
+/// Applies a commit to a follower's snail at `path`, at the follower's root's turn, as a commit
+/// there would take it: the commit's pages written where they lie and brought to the disk, then its
+/// root. The follower must stand at the commit's parent, and is refused by name otherwise; one that
+/// stands at the commit already, its root the commit's, is left as it is. Where the commit frees
+/// pages a round of the follower's may still read, holding an older generation, it waits for that
+/// round to end first, as long as it takes.
 pub fn apply(path: &Path, commit: &Commit) -> Result<()> {
     land(path, commit, None)
 }
@@ -142,6 +143,14 @@ pub fn apply_stopping(path: &Path, commit: &Commit, stop: Option<Stop>) -> Resul
 
 fn land(path: &Path, commit: &Commit, stop: Option<Stop>) -> Result<()> {
     let files = Files::open(path, true, false)?;
+    crate::lock::take_root_turn(&files.first)?;
+    let landed = land_at_turn(&files, commit, stop);
+    let given = crate::lock::give_root_turn(&files.first);
+    landed?;
+    given
+}
+
+fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()> {
     let mut both = vec![0u8; 2 * PAGE];
     files.first.read_exact_at(&mut both, 0)?;
     let (root, format) = newer(&both)?;
@@ -194,7 +203,7 @@ fn land(path: &Path, commit: &Commit, stop: Option<Stop>) -> Result<()> {
         }
         pages.insert(n, &p.bytes);
     }
-    crate::lock::wait_older_let_go(&files.first, freed(&files, &root, &theirs, &pages, format)?)?;
+    crate::lock::wait_older_let_go(&files.first, freed(files, &root, &theirs, &pages, format)?)?;
     let mut run: Vec<u8> = Vec::new();
     let mut start = 0;
     for (&n, bytes) in &pages {
