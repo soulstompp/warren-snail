@@ -1476,11 +1476,11 @@ impl Conj {
 }
 
 /// The family of keys a type's values are compared by on a join: integers of any width share one,
-/// as do a numeric's of one scale, the oid and the reg* types, and timestamptz of any precision;
-/// every other type has its own, whatever length or fields it is declared with. None for a type a
-/// join does not read.
-fn join_family(ty: ColumnType) -> Option<String> {
-    Some(match ty {
+/// as do a numeric's of one scale, the oid and the reg* types, the bit strings, and each time type
+/// of any precision; every other type has its own, whatever length or fields it is declared with, a
+/// composed type the one it is.
+fn join_family(ty: ColumnType) -> String {
+    match ty {
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => "integer".into(),
         ColumnType::Numeric { scale, .. } => format!("numeric {scale}"),
         ColumnType::NumericText(_) => "numeric".into(),
@@ -1491,7 +1491,10 @@ fn join_family(ty: ColumnType) -> Option<String> {
         ColumnType::Time(_) => "time".into(),
         ColumnType::Interval { .. } => "interval".into(),
         ColumnType::Bpchar(_) => "bpchar".into(),
+        ColumnType::Timetz(_) => "timetz".into(),
+        ColumnType::Bit(_) | ColumnType::Varbit(_) => "bits".into(),
         ColumnType::Bytes
+        | ColumnType::Tid
         | ColumnType::Name
         | ColumnType::Boolean
         | ColumnType::Uuid
@@ -1506,22 +1509,14 @@ fn join_family(ty: ColumnType) -> Option<String> {
         | ColumnType::Float4
         | ColumnType::Float8
         | ColumnType::Oid8
-        | ColumnType::Date => format!("{ty:?}"),
-        _ => return None,
-    })
+        | ColumnType::Date
+        | ColumnType::Composed(_) => format!("{ty:?}"),
+    }
 }
 
 /// Whether two tables' columns are compared by `op` on the keys they are held by: two columns of
 /// one family, by an operator their type has.
 fn comparable(p: &Expr, a: ColumnType, op: Cmp, b: ColumnType) -> Result<()> {
-    for ty in [a, b] {
-        if join_family(ty).is_none() {
-            return Err(Error::new(format!(
-                "{p}: a join on {} is not read",
-                ty.name()
-            )));
-        }
-    }
     if join_family(a) != join_family(b) {
         return Err(Error::new(format!(
             "{p}: {} and {} are compared through a cast, which a join does not read",
@@ -1530,8 +1525,8 @@ fn comparable(p: &Expr, a: ColumnType, op: Cmp, b: ColumnType) -> Result<()> {
         )));
     }
     let has = match a {
-        ColumnType::Xid => matches!(op, Cmp::Eq | Cmp::NotEq),
         ColumnType::Cid => op == Cmp::Eq,
+        a if !a.ordered() => matches!(op, Cmp::Eq | Cmp::NotEq),
         _ => true,
     };
     if !has {
