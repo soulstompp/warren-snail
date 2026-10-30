@@ -223,9 +223,12 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
     for (a, field) in batch.columns().iter().zip(schema.fields()) {
         let any = a.as_any();
         let scalar = crate::scalars::field_scalar(field);
+        let bits = crate::strings::field_string(field).filter(|t| t.is_bits());
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Datum::Null
+            } else if let Some(ty) = bits {
+                Datum::Bytes(crate::strings::bits_key_at(ty, a.as_ref(), r).unwrap())
             } else if let Some(ty) = scalar {
                 Datum::Int(crate::scalars::scalar_key_at(ty, a.as_ref(), r).unwrap())
             } else if let Some(x) = any.downcast_ref::<BooleanArray>() {
@@ -662,9 +665,13 @@ impl Snail {
                             .schema()
                             .fields()
                             .iter()
-                            .map(|f| match crate::scalars::field_scalar(f) {
-                                Some(ty) => Ok(ty),
-                                None => answer_type(f.data_type()),
+                            .map(|f| {
+                                match crate::scalars::field_scalar(f)
+                                    .or_else(|| crate::strings::field_string(f))
+                                {
+                                    Some(ty) => Ok(ty),
+                                    None => answer_type(f.data_type()),
+                                }
                             })
                             .collect::<Result<_>>()?;
                         // Each column the answer fills takes its value by PostgreSQL's assignment

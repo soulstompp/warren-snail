@@ -22,6 +22,9 @@ fn snail_of(name: &str, ddl: &str, columns: Vec<Values>) -> std::path::PathBuf {
 }
 
 fn ids(b: &RecordBatch) -> Vec<i64> {
+    if b.num_rows() == 0 {
+        return Vec::new();
+    }
     ints64(b.column(0).as_ref()).into_iter().flatten().collect()
 }
 
@@ -277,6 +280,14 @@ fn a_bpchar_is_read_padded_to_its_length_its_excess_blanks_taken_off() {
         .ask("SELECT t.id, t.v, t.c FROM s.t t ORDER BY t.id", None)
         .unwrap();
     let want = bpchar_rows();
+    // Each level keyed on the bytes it is compared by, as the rows are written into the orders.
+    let mut snail = Snail::open(&path).unwrap();
+    for (by, order) in [("t.v", "t_v"), ("t.c", "t_c")] {
+        let q = format!("SELECT t.id, {by} FROM s.t t ORDER BY {by}, t.id");
+        let (o, round) = snail.ask(&q, Some(order)).unwrap();
+        exact(&q, &round);
+        assert_eq!(ids(&o), [4, 5, 1, 2, 3, 6, 8, 7], "{q} along {order}");
+    }
     for c in [1, 2] {
         let held: Vec<Option<String>> = (0..8)
             .map(|i| want[c].text(i).map(str::to_string))
@@ -742,6 +753,34 @@ fn a_bit_string_is_cut_by_its_bits_and_a_short_one_never_decides() {
     };
     assert_eq!(beside(16), [512; 8]);
     assert_eq!(beside(32), [1024; 4]);
+    // A bit varying is cut by its bits too, each a place of three: its length's leaf, 4 bytes, fills
+    // a page at 1,024 rows.
+    let varying: Vec<Vec<u8>> = spread(64)
+        .into_iter()
+        .map(|k| {
+            let (len, bits) = warren_snail::strings::bits_of_key(&k);
+            warren_snail::strings::bits_key(len, &bits)
+        })
+        .collect();
+    let path = snail_of(
+        "bits-cut-varbit",
+        "CREATE TABLE s.t (v varbit NOT NULL, PRIMARY KEY (v));",
+        vec![Values::Utf8(
+            varying
+                .into_iter()
+                .map(|k| Some(ByteArray::from(k)))
+                .collect(),
+        )],
+    );
+    let rows: Vec<u64> = blocks_of(
+        &Snail::open(&path).unwrap().blocks().unwrap(),
+        "t_pkey",
+        "v.length",
+    )
+    .iter()
+    .map(|r| r.rows)
+    .collect();
+    assert_eq!(rows, [1024; 4]);
 }
 
 #[test]
@@ -837,4 +876,153 @@ fn case_follows_the_collation_a_column_or_a_collate_names() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("only a collation of byte order"), "{e}");
+}
+
+#[test]
+fn strings_are_joined_and_matched_by_like_as_postgresql_does() {
+    let path = snail_of(
+        "like",
+        "CREATE TABLE s.t (id integer NOT NULL, v text, b bpchar, y bytea, PRIMARY KEY (id));",
+        vec![
+            Values::Int((1..=5).map(Some).collect()),
+            Values::Text(
+                ["a-b", "a_b", "Élan", "a%", ""]
+                    .iter()
+                    .map(|s| Some(s.to_string()))
+                    .collect(),
+            ),
+            Values::Text(
+                ["a  ", "ab", "É ", "x", ""]
+                    .iter()
+                    .map(|s| Some(s.to_string()))
+                    .collect(),
+            ),
+            Values::Utf8(
+                [&b"\x00a"[..], b"a", b"%", b"", b"ab"]
+                    .iter()
+                    .map(|b| Some(ByteArray::from(b.to_vec())))
+                    .collect(),
+            ),
+        ],
+    );
+    let mut snail = Snail::open(&path).unwrap();
+    let mut ask = |q: &str| -> Vec<i64> {
+        let (b, _) = snail
+            .ask(&format!("WITH t AS (SELECT id, v, b, y FROM s.t) SELECT id FROM t WHERE {q} ORDER BY id"), None)
+            .unwrap();
+        ids(&b)
+    };
+    assert_eq!(ask("v LIKE 'a_b'"), [1, 2]);
+    assert_eq!(ask("v LIKE 'a\\_b'"), [2]);
+    assert_eq!(ask("v LIKE 'a!_b' ESCAPE '!'"), [2]);
+    assert_eq!(ask("v LIKE 'a%'"), [1, 2, 4]);
+    assert_eq!(ask("v LIKE '%\\%'"), [4]);
+    assert_eq!(ask("v NOT LIKE '%'"), Vec::<i64>::new());
+    assert_eq!(ask("v LIKE ''"), [5]);
+    assert_eq!(ask("v ILIKE 'é%'"), [3]);
+    assert_eq!(ask("v COLLATE \"C\" ILIKE 'é%'"), Vec::<i64>::new());
+    // A bpchar's blanks are matched; bytea is matched by its bytes.
+    assert_eq!(ask("b LIKE 'a'"), Vec::<i64>::new());
+    assert_eq!(ask("b LIKE 'a  '"), [1]);
+    assert_eq!(ask("y LIKE '\\000%'"), [1]);
+    assert_eq!(ask("y LIKE '_'"), [2, 3]);
+    assert_eq!(ask("y LIKE 'a%'"), [2, 5]);
+    let (b, _) = snail
+        .ask(
+            "WITH t AS (SELECT id, v, b, y FROM s.t) SELECT id, v || b AS x, b || 'z' AS z, \
+             v || id AS n, y || '\\x01' AS w FROM t ORDER BY id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(texts(&b, 1)[0].as_deref(), Some("a-ba"));
+    assert_eq!(texts(&b, 2)[2].as_deref(), Some("Éz"));
+    assert_eq!(texts(&b, 3)[1].as_deref(), Some("a_b2"));
+    assert_eq!(bytes(&b, 4)[1].as_deref(), Some(&b"a\x01"[..]));
+    let e = snail
+        .ask(
+            "WITH t AS (SELECT id, v FROM s.t) SELECT id FROM t WHERE v LIKE 'a\\'",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("must not end with escape character"), "{e}");
+}
+
+#[test]
+fn bit_strings_are_operated_on_as_postgresql_does() {
+    let path = bits_snail("bits-ops");
+    let mut snail = Snail::open(&path).unwrap();
+    let mut ask = |e: &str| -> Vec<Option<String>> {
+        let (b, _) = snail
+            .ask(
+                &format!("WITH t AS (SELECT id, b, v FROM s.t) SELECT id, ({e})::text AS x FROM t ORDER BY id"),
+                None,
+            )
+            .unwrap();
+        texts(&b, 1)
+    };
+    let first = |v: Vec<Option<String>>| v[0].clone().unwrap();
+    assert_eq!(first(ask("b & B'01100'")), "00100");
+    assert_eq!(first(ask("b | B'00011'")), "10111");
+    assert_eq!(first(ask("b # B'11111'")), "01011");
+    assert_eq!(first(ask("~b")), "01011");
+    assert_eq!(first(ask("b << 2")), "10000");
+    assert_eq!(first(ask("b >> 2")), "00101");
+    assert_eq!(first(ask("b << -1")), "01010");
+    assert_eq!(first(ask("b || v")), "101001");
+    assert_eq!(first(ask("CAST(b AS bit(3))")), "101");
+    assert_eq!(first(ask("CAST(id AS bit(4))")), "0001");
+    assert_eq!(first(ask("CAST(-id AS bit(40))")), "1".repeat(40));
+    assert_eq!(first(ask("CAST(b AS integer)")), "20");
+    let e = snail
+        .ask(
+            "WITH t AS (SELECT id, b FROM s.t) SELECT id, b & B'1' AS x FROM t",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("cannot AND bit strings of different sizes"),
+        "{e}"
+    );
+}
+
+#[test]
+fn the_string_types_are_read_from_their_spellings() {
+    use warren_snail::catalog::ColumnType::*;
+    let c = Catalog::parse(
+        "CREATE TABLE s.t (id integer NOT NULL, a char, b character(5), c bpchar, d bpchar(3), \
+         e name, f bit, g bit(9), h bit varying, i varbit(3), j bytea, PRIMARY KEY (id)); \
+         CREATE INDEX t_b ON s.t (b bpchar_pattern_ops);",
+    )
+    .unwrap();
+    let types: Vec<_> = c.tables[0].columns.iter().map(|c| c.ty).collect();
+    assert_eq!(
+        types,
+        [
+            Int4,
+            Bpchar(Some(1)),
+            Bpchar(Some(5)),
+            Bpchar(None),
+            Bpchar(Some(3)),
+            Name,
+            Bit(1),
+            Bit(9),
+            Varbit(None),
+            Varbit(Some(3)),
+            Bytes
+        ]
+    );
+    for (ddl, why) in [
+        ("CREATE TABLE s.t (a char(0));", "must be at least 1"),
+        ("CREATE TABLE s.t (a bit(0));", "must be at least 1"),
+        (
+            "CREATE TABLE s.t (a char(10485761));",
+            "cannot exceed 10485760",
+        ),
+        ("CREATE TABLE s.t (a integer COLLATE \"C\");", "not text"),
+    ] {
+        let e = Catalog::parse(ddl).unwrap_err().to_string();
+        assert!(e.contains(why), "{ddl}: {e}");
+    }
 }

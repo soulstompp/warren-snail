@@ -100,11 +100,32 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         crate::strings::text_of(from, &s).to_string()
     };
     Ok(match (from, to) {
+        // A "char" is its one byte as a bpchar, which UTF-8 holds only below 0x80.
+        (Char, Bpchar(n)) => {
+            let Datum::Int(k) = d else {
+                return Err(refused());
+            };
+            let b = crate::scalars::unsigned_of(k, 8) as u8;
+            if b >= 0x80 {
+                return Err(Error::new(format!(
+                    "the \"char\" byte {b:#04x} makes a {} that is no UTF-8",
+                    to.pg_name()
+                )));
+            }
+            let s = if b == 0 {
+                String::new()
+            } else {
+                char::from(b).to_string()
+            };
+            Datum::Text(crate::strings::bpchar_in(&s, n, false)?)
+        }
         (_, Bpchar(n)) => Datum::Text(crate::strings::bpchar_in(
             &text_of(&d, from).unwrap_or_default(),
             n,
             false,
         )?),
+        // A boolean meets a name through its output, which no cast to text takes: `t` or `f`.
+        (Boolean, Name) => Datum::Text(if d == Datum::Int(0) { "f" } else { "t" }.to_string()),
         (_, Name) => Datum::Text(crate::strings::name_in(&as_text(&d))),
         (Bit(_) | Varbit(_), Bit(_) | Varbit(_)) => {
             let Datum::Bytes(k) = &d else {

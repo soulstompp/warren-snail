@@ -589,6 +589,153 @@ pub fn case(s: &str, upper: bool, casing: crate::catalog::Casing) -> Result<Stri
     })
 }
 
+/// One piece of a LIKE pattern.
+#[derive(Clone, Copy, PartialEq)]
+enum Piece<T> {
+    /// `%`: any run, the empty one among them.
+    Any,
+    /// `_`: any one.
+    One,
+    Lit(T),
+    /// An escape that ends the pattern, refused where the text is matched up to it.
+    End,
+}
+
+/// Whether `text` matches the LIKE `pattern`, each a sequence of characters or of bytes, as
+/// PostgreSQL's LIKE reads one: `%` any run, `_` any one, and `escape` before any one that one
+/// itself; a pattern that ends with its escape refused where the match reaches it with text left.
+pub fn like<T: Copy + PartialEq>(
+    text: &[T],
+    pattern: &[T],
+    percent: T,
+    under: T,
+    escape: Option<T>,
+) -> Result<bool> {
+    let mut pieces = Vec::with_capacity(pattern.len());
+    let mut i = 0;
+    while i < pattern.len() {
+        let c = pattern[i];
+        if Some(c) == escape {
+            pieces.push(pattern.get(i + 1).map_or(Piece::End, |&n| Piece::Lit(n)));
+            i += 2;
+            continue;
+        }
+        pieces.push(if c == percent {
+            Piece::Any
+        } else if c == under {
+            Piece::One
+        } else {
+            Piece::Lit(c)
+        });
+        i += 1;
+    }
+    // The text and the pattern walked together; at a mismatch, back to the last `%`, which takes
+    // one more of the text.
+    let (mut t, mut p) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pieces.get(p) {
+            Some(Piece::Any) => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(Piece::One) => {
+                t += 1;
+                p += 1;
+            }
+            Some(Piece::Lit(c)) if *c == text[t] => {
+                t += 1;
+                p += 1;
+            }
+            Some(Piece::End) => {
+                return Err(Error::new(
+                    "LIKE pattern must not end with escape character",
+                ))
+            }
+            _ => match star {
+                Some((sp, st)) => {
+                    star = Some((sp, st + 1));
+                    p = sp + 1;
+                    t = st + 1;
+                }
+                None => return Ok(false),
+            },
+        }
+    }
+    Ok(pieces[p..].iter().all(|x| *x == Piece::Any))
+}
+
+/// A LIKE's ESCAPE: its one character, or none where it is empty.
+pub fn like_escape(e: &str) -> Result<Option<char>> {
+    let mut chars = e.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => Ok(None),
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(Error::new(
+            "invalid escape string: Escape string must be empty or one character.",
+        )),
+    }
+}
+
+/// A bit string's bits, each a 0 or a 1, from its key.
+fn bits_of(key: &[u8]) -> Vec<bool> {
+    let (len, b) = bits_of_key(key);
+    (0..len as usize)
+        .map(|r| (b[r / 8] >> (7 - r % 8)) & 1 == 1)
+        .collect()
+}
+
+/// A bit string's key, from its bits.
+fn key_of_bits(bits: &[bool]) -> Vec<u8> {
+    let mut b = vec![0u8; bits.len().div_ceil(8)];
+    for (r, &x) in bits.iter().enumerate() {
+        if x {
+            b[r / 8] |= 0x80 >> (r % 8);
+        }
+    }
+    bits_key(bits.len() as u32, &b)
+}
+
+/// Two bit strings of one length, bit by bit, as `bitand`, `bitor` and `bitxor` take them: `name`
+/// the operation PostgreSQL's refusal names where their lengths differ.
+pub fn bits_each(a: &[u8], b: &[u8], name: &str, f: fn(bool, bool) -> bool) -> Result<Vec<u8>> {
+    let (x, y) = (bits_of(a), bits_of(b));
+    if x.len() != y.len() {
+        return Err(Error::new(format!(
+            "cannot {name} bit strings of different sizes"
+        )));
+    }
+    Ok(key_of_bits(
+        &x.iter().zip(&y).map(|(&p, &q)| f(p, q)).collect::<Vec<_>>(),
+    ))
+}
+
+/// A bit string with every bit turned, as `bitnot` takes it.
+pub fn bits_not(a: &[u8]) -> Vec<u8> {
+    key_of_bits(&bits_of(a).iter().map(|b| !b).collect::<Vec<_>>())
+}
+
+/// A bit string shifted `n` places to the left, to the right where `n` is negative, as
+/// `bitshiftleft` takes it: of the same length, zeros coming in.
+pub fn bits_shift(a: &[u8], n: i64) -> Vec<u8> {
+    let x = bits_of(a);
+    let len = x.len() as i64;
+    let out: Vec<bool> = (0..len)
+        .map(|r| {
+            let from = r + n;
+            (0..len).contains(&from) && x[from as usize]
+        })
+        .collect();
+    key_of_bits(&out)
+}
+
+/// Two bit strings one after the other, as `bitcat` takes them.
+pub fn bits_cat(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut x = bits_of(a);
+    x.extend(bits_of(b));
+    key_of_bits(&x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +952,32 @@ mod tests {
         assert_eq!(low("İstanbul", Full), "i\u{307}stanbul");
         assert_eq!(low("İstanbul", Libc), "istanbul");
         assert_eq!(up("ǆemal", Libc), "ǄEMAL");
+    }
+
+    #[test]
+    fn like_matches_as_postgresql_s_like_does() {
+        let m = |t: &str, p: &str| {
+            let (t, p): (Vec<char>, Vec<char>) = (t.chars().collect(), p.chars().collect());
+            like(&t, &p, '%', '_', Some('\\'))
+        };
+        assert!(m("abc", "a%").unwrap());
+        assert!(m("abc", "%c").unwrap());
+        assert!(m("abc", "_b_").unwrap());
+        assert!(!m("abc", "_b").unwrap());
+        assert!(m("a%c", "a\\%c").unwrap());
+        assert!(!m("abc", "a\\%c").unwrap());
+        assert!(m("", "%").unwrap());
+        assert!(m("", "").unwrap());
+        assert!(!m("", "_").unwrap());
+        assert!(m("aXbXc", "a%b%c").unwrap());
+        assert!(m("é", "_").unwrap());
+        // A pattern ending in its escape is refused only where the match reaches it with text left.
+        assert!(!m("a", "a\\").unwrap());
+        assert!(m("ab", "a\\").is_err());
+        assert!(m("xab", "%a\\").is_err());
+        assert!(like(b"a%", b"a!%", b'%', b'_', Some(b'!')).unwrap());
+        assert!(like(b"a\\b", b"a\\b", b'%', b'_', None).unwrap());
+        assert_eq!(like_escape("").unwrap(), None);
+        assert!(like_escape("ab").is_err());
     }
 }

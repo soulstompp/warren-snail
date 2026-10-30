@@ -513,10 +513,17 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
     let base = name.split('(').next().unwrap_or("").trim().to_string();
     Ok(match base.as_str() {
         // A bpchar's trailing blanks are taken off where it becomes text.
-        "text" | "varchar" | "character varying" => match v {
-            Value::Str(ty, s) => Value::Text(crate::strings::text_of(ty, &s).to_string()),
-            v => Value::Text(v.text().unwrap()),
-        },
+        // varchar(n) cut to its n characters, as an explicit cast cuts it.
+        "text" | "varchar" | "character varying" => {
+            let t = match v {
+                Value::Str(ty, s) => crate::strings::text_of(ty, &s).to_string(),
+                v => v.text().unwrap(),
+            };
+            match crate::catalog::held_type(to) {
+                Ok(ColumnType::Text(Some(n))) => Value::Text(t.chars().take(n as usize).collect()),
+                _ => Value::Text(t),
+            }
+        }
         "bigint" | "int8" | "integer" | "int" | "int4" | "smallint" | "int2" => match v {
             Value::Real(f) => float_integer(f64::from(f), &base)?,
             Value::Double(d) => float_integer(d, &base)?,
@@ -937,6 +944,131 @@ fn scalar_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Valu
     }))
 }
 
+/// A value as text where it meets text in `||`: a string's own text, a bpchar's without its
+/// trailing blanks, any other value as its type's output writes it.
+fn text_part(v: &Value) -> String {
+    match v {
+        Value::Str(ty, s) => crate::strings::text_of(*ty, s).to_string(),
+        other => other.text().unwrap_or_default(),
+    }
+}
+
+/// An operator on strings, bytea or bit strings, as PostgreSQL defines it: `||` of text and any
+/// other value as its text, of bytea and of bit strings; `&`, `|` and `#` of bit strings of one
+/// length, and `<<` and `>>` of one by an integer. None where neither side is one of them.
+fn string_op(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>> {
+    use crate::strings::{bits_cat, bits_each, bits_of_key, bits_shift};
+    use BinaryOperator as B;
+    let stringy = |v: &Value| {
+        matches!(
+            v,
+            Value::Text(_) | Value::Str(..) | Value::Bytes(_) | Value::Bits(..)
+        )
+    };
+    // Each of these is strict: over a NULL it is NULL, whatever the other side.
+    if (x.is_null() || y.is_null())
+        && matches!(
+            op,
+            B::StringConcat | B::PGBitwiseXor | B::PGBitwiseShiftLeft | B::PGBitwiseShiftRight
+        )
+    {
+        return Ok(Some(Value::Null));
+    }
+    if !(stringy(x) || stringy(y))
+        || !matches!(
+            op,
+            B::StringConcat
+                | B::BitwiseAnd
+                | B::BitwiseOr
+                | B::PGBitwiseXor
+                | B::PGBitwiseShiftLeft
+                | B::PGBitwiseShiftRight
+        )
+    {
+        return Ok(None);
+    }
+    if x.is_null() || y.is_null() {
+        return Ok(Some(Value::Null));
+    }
+    // A bit string an operator makes is a bit of its own length, as PostgreSQL takes a bit varying
+    // to bit for them.
+    let bit = |k: Vec<u8>| Value::Bits(ColumnType::Bit(bits_of_key(&k).0), k);
+    Ok(Some(match (op, x, y) {
+        (B::StringConcat, Value::Bytes(a), Value::Bytes(b)) => {
+            Value::Bytes(a.iter().chain(b).copied().collect())
+        }
+        (B::StringConcat, Value::Bits(_, a), Value::Bits(_, b)) => {
+            Value::Bits(ColumnType::Varbit(None), bits_cat(a, b))
+        }
+        (B::StringConcat, a, b)
+            if matches!(a, Value::Text(_) | Value::Str(..))
+                || matches!(b, Value::Text(_) | Value::Str(..)) =>
+        {
+            Value::Text(text_part(a) + &text_part(b))
+        }
+        (B::BitwiseAnd, Value::Bits(_, a), Value::Bits(_, b)) => {
+            bit(bits_each(a, b, "AND", |p, q| p && q)?)
+        }
+        (B::BitwiseOr, Value::Bits(_, a), Value::Bits(_, b)) => {
+            bit(bits_each(a, b, "OR", |p, q| p || q)?)
+        }
+        (B::PGBitwiseXor, Value::Bits(_, a), Value::Bits(_, b)) => {
+            bit(bits_each(a, b, "XOR", |p, q| p != q)?)
+        }
+        (B::PGBitwiseShiftLeft, Value::Bits(_, a), Value::Int(n)) if i32::try_from(*n).is_ok() => {
+            bit(bits_shift(a, *n))
+        }
+        (B::PGBitwiseShiftRight, Value::Bits(_, a), Value::Int(n)) if i32::try_from(*n).is_ok() => {
+            bit(bits_shift(a, -*n))
+        }
+        _ => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} {op} {}",
+                kind_name(x),
+                kind_name(y)
+            )))
+        }
+    }))
+}
+
+/// A LIKE or an ILIKE, as PostgreSQL reads one: text, a name, a bpchar's own text with its blanks,
+/// or bytea, matched by a pattern of its kind, an ILIKE's both in lower case under `casing`.
+fn like_of(v: &Value, p: &Value, escape: Option<char>, ilike: Option<Casing>) -> Result<bool> {
+    let own = |v: &Value| match v {
+        Value::Str(_, s) | Value::Text(s) => Some(s.clone()),
+        _ => None,
+    };
+    match (v, p) {
+        (Value::Bytes(a), Value::Bytes(b)) if ilike.is_none() => {
+            let e = match escape {
+                None => None,
+                Some(c) => Some(u8::try_from(c).map_err(|_| Error::new("invalid escape string"))?),
+            };
+            crate::strings::like(a, b, b'%', b'_', e)
+        }
+        (a, b) if own(a).is_some() && b.string_key().is_some() => {
+            let (mut t, mut q) = (
+                own(a).unwrap(),
+                std::str::from_utf8(b.string_key().unwrap())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            if let Some(casing) = ilike {
+                t = crate::strings::case(&t, false, casing)?;
+                q = crate::strings::case(&q, false, casing)?;
+            }
+            let (t, q): (Vec<char>, Vec<char>) = (t.chars().collect(), q.chars().collect());
+            crate::strings::like(&t, &q, '%', '_', escape)
+        }
+        _ => Err(Error::new(format!(
+            "operator does not exist: {} {} {}",
+            kind_name(v),
+            if ilike.is_some() { "~~*" } else { "~~" },
+            kind_name(p)
+        ))),
+    }
+}
+
 /// A number as a double precision, as PostgreSQL widens it beside a float: an integer as itself
 /// rounded, a numeric read from its text, a real exactly.
 fn as_double(v: &Value) -> Option<f64> {
@@ -1352,6 +1484,10 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             expr,
         } => match ev(expr)? {
             Value::Null => Value::Null,
+            Value::Bits(_, k) => {
+                let k = crate::strings::bits_not(&k);
+                Value::Bits(ColumnType::Bit(crate::strings::bits_of_key(&k).0), k)
+            }
             Value::Scalar(t, k) if t.fixed_bytes().is_some() => {
                 let bits = t.unsigned_bits();
                 let v = !crate::scalars::unsigned_of(k, bits) & (u64::MAX >> (64 - bits));
@@ -1366,6 +1502,53 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             None => Value::Null,
             Some(b) => Value::Bool(!b),
         },
+        Expr::Like {
+            negated,
+            any: false,
+            expr,
+            pattern,
+            escape_char,
+        }
+        | Expr::ILike {
+            negated,
+            any: false,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            let escape = match escape_char {
+                None => Some('\\'),
+                Some(x) => match ev(x)? {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Text(t) => crate::strings::like_escape(&t)?,
+                    other => {
+                        return Err(Error::new(format!(
+                            "an ESCAPE of {} is not read",
+                            kind_name(&other)
+                        )))
+                    }
+                },
+            };
+            let (v, p) = (ev(expr)?, ev(pattern)?);
+            if v.is_null() || p.is_null() {
+                return Ok(Value::Null);
+            }
+            // A quoted pattern beside bytea is read as bytea.
+            let p = match (&v, p) {
+                (Value::Bytes(_), Value::Text(t)) if quoted(pattern) => {
+                    Value::Bytes(crate::strings::bytea_in(&t)?)
+                }
+                (_, p) => p,
+            };
+            let ilike = match e {
+                Expr::ILike { .. } => Some(match frame.casings.implicit(expr)? {
+                    Some(k) => k,
+                    None => frame.casings.implicit(pattern)?.unwrap_or(Casing::Libc),
+                }),
+                _ => None,
+            };
+            Value::Bool(like_of(&v, &p, escape, ilike)? != *negated)
+        }
         Expr::IsNull(x) => Value::Bool(ev(x)?.is_null()),
         Expr::IsNotNull(x) => Value::Bool(!ev(x)?.is_null()),
         // A truth tested is never NULL: an unknown truth is neither true nor false.
@@ -1399,6 +1582,9 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 _ => {}
             }
             let (x, y) = beside(ev(left)?, ev(right)?, left, right)?;
+            if let Some(v) = string_op(op, &x, &y)? {
+                return Ok(v);
+            }
             if matches!(
                 op,
                 BinaryOperator::Plus
