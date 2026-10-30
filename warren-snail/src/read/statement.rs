@@ -284,7 +284,8 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
         | ColumnType::Char
         | ColumnType::Money
         | ColumnType::Macaddr
-        | ColumnType::Macaddr8) => match text_literal(e) {
+        | ColumnType::Macaddr8
+        | ColumnType::Tid) => match text_literal(e) {
             Ok(s) => Datum::Int(crate::scalars::scalar_parse(ty, &s)?),
             Err(_) => {
                 let (d, from) = number_datum(e).ok_or_else(wrong)?;

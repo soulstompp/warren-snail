@@ -59,6 +59,9 @@ pub enum ColumnType {
     Reg(crate::regs::RegKind, u8),
     /// oid8: an unsigned 64-bit object identifier, PostgreSQL 19's.
     Oid8,
+    /// A tid: a block number of 32 bits and an offset of 16 in it, both unsigned, compared block
+    /// then offset, and held as a group of two leaves.
+    Tid,
 }
 
 impl ColumnType {
@@ -85,6 +88,8 @@ impl ColumnType {
             | ColumnType::Float8 => Some(8),
             ColumnType::Macaddr => Some(6),
             ColumnType::Uuid => Some(16),
+            // Its two leaves, 4 bytes each.
+            ColumnType::Tid => Some(8),
             ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Boolean => None,
         }
     }
@@ -95,7 +100,7 @@ impl ColumnType {
         match self {
             ColumnType::Oid | ColumnType::Reg(..) | ColumnType::Xid | ColumnType::Cid => 32,
             ColumnType::Xid8 | ColumnType::PgLsn | ColumnType::Macaddr8 | ColumnType::Oid8 => 64,
-            ColumnType::Macaddr => 48,
+            ColumnType::Macaddr | ColumnType::Tid => 48,
             ColumnType::Char => 8,
             _ => 0,
         }
@@ -212,6 +217,7 @@ impl ColumnType {
             ColumnType::Float8 => "double precision".into(),
             ColumnType::Reg(kind, _) => kind.type_name().into(),
             ColumnType::Oid8 => "oid8".into(),
+            ColumnType::Tid => "tid".into(),
         }
     }
 
@@ -242,6 +248,7 @@ impl ColumnType {
             // A reg* type has none of its own: PostgreSQL takes oid's, to which it is binary-coercible.
             ColumnType::Reg(..) => "oid_ops",
             ColumnType::Oid8 => "oid8_ops",
+            ColumnType::Tid => "tid_ops",
         }
     }
 
@@ -258,7 +265,14 @@ impl ColumnType {
     /// The fields of a value held as a group, each its name, the type it is held as and the bits of
     /// the unsigned number it holds; none for a value held as one leaf.
     fn fields(self) -> &'static [(&'static str, ColumnType, u32)] {
-        &[]
+        match self {
+            // The block number as an oid is held, the offset as an oid too, 16 bits of it.
+            ColumnType::Tid => &[
+                ("block", ColumnType::Oid, 32),
+                ("offset", ColumnType::Oid, 16),
+            ],
+            _ => &[],
+        }
     }
 
     /// How many leaves its Parquet type tree has.
@@ -340,6 +354,7 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Xid8, Xid8)
             | (PgLsn, PgLsn)
             | (Macaddr | Macaddr8, Macaddr | Macaddr8)
+            | (Tid, Tid)
             | (
                 Int2 | Int4 | Int8 | Numeric { .. } | Float4 | Float8,
                 Float4 | Float8
@@ -465,7 +480,13 @@ impl Order {
     pub fn leaves(&self, table: &Table) -> Vec<(usize, Leaf)> {
         self.columns
             .iter()
-            .flat_map(|&c| table.columns[c].ty.leaves().into_iter().map(move |l| (c, l)))
+            .flat_map(|&c| {
+                table.columns[c]
+                    .ty
+                    .leaves()
+                    .into_iter()
+                    .map(move |l| (c, l))
+            })
             .collect()
     }
 
@@ -1112,6 +1133,7 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                 "macaddr" => ColumnType::Macaddr,
                 "macaddr8" => ColumnType::Macaddr8,
                 "oid8" => ColumnType::Oid8,
+                "tid" => ColumnType::Tid,
                 other => match crate::regs::RegKind::of_type_name(other) {
                     Some(kind) => ColumnType::Reg(kind, crate::regs::LATEST),
                     None => {

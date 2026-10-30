@@ -61,12 +61,18 @@ impl Encoded {
 pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDescPtr> {
     match ty.leaves().as_slice() {
         [leaf] => leaf_descriptor(name, leaf, nullable),
-        leaves => Err(Error::new(format!(
-            "{name}: {} is held as a group of {} leaves, each its own descriptor",
-            ty.pg_name(),
-            leaves.len()
-        ))),
+        _ => Err(group(name, ty)),
     }
+}
+
+/// Why a type held as a group of leaves has no one descriptor, nor one leaf's values.
+fn group(column: &str, ty: ColumnType) -> Error {
+    let fields: Vec<String> = ty.leaves().iter().map(|l| l.name(column)).collect();
+    Error::new(format!(
+        "{column} is {}, held as a group of leaves, {}, each of its own",
+        ty.pg_name(),
+        fields.join(" and ")
+    ))
 }
 
 /// The descriptor of one leaf of a column: the column's own where it is one leaf, OPTIONAL where the
@@ -135,6 +141,7 @@ pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<Colu
         ColumnType::Macaddr | ColumnType::Macaddr8 => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Float4 => (PhysicalType::FLOAT, None),
         ColumnType::Float8 => (PhysicalType::DOUBLE, None),
+        ColumnType::Tid => return Err(group(column, ty)),
     };
     let repetition = if nullable && leaf.field.is_none() {
         Repetition::OPTIONAL
@@ -501,6 +508,7 @@ pub fn decode(
     // An unsigned number is keyed by the bits its descriptor names.
     let bits = unsigned_bits(desc);
     match ty {
+        ColumnType::Tid => Err(group(desc.name(), ty)),
         ColumnType::Int2
         | ColumnType::Int4
         | ColumnType::Oid

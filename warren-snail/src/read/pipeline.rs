@@ -1507,8 +1507,8 @@ impl Acc {
             };
             return Err(Error::new(format!("function {name}({ty}) does not exist")));
         }
-        // Of the scalars, sum is money's alone; min and max are an oid's, an xid8's, a pg_lsn's and
-        // money's, and a `"char"`'s through its text.
+        // Of the scalars, sum is money's alone; min and max are an oid's, an xid8's, a pg_lsn's,
+        // money's and a tid's, and a `"char"`'s through its text.
         let v = match (&v, &self) {
             (Value::Scalar(ColumnType::Char, _), Acc::Least(_) | Acc::Greatest(_)) => {
                 Value::Text(v.text().unwrap_or_default())
@@ -1527,6 +1527,7 @@ impl Acc {
                                 | ColumnType::Xid8
                                 | ColumnType::PgLsn
                                 | ColumnType::Money
+                                | ColumnType::Tid
                         )) =>
             {
                 let name = match self {

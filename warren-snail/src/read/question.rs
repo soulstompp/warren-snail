@@ -694,7 +694,8 @@ impl From<'_> {
                     | ColumnType::Char
                     | ColumnType::Money
                     | ColumnType::Float4
-                    | ColumnType::Float8 => Ok(Some(if name == "min" {
+                    | ColumnType::Float8
+                    | ColumnType::Tid => Ok(Some(if name == "min" {
                         Item::Least(col)
                     } else {
                         Item::Greatest(col)

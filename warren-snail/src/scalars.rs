@@ -289,6 +289,97 @@ fn char_out(c: u8) -> String {
     }
 }
 
+/// A number read as glibc's `strtoul` reads it in base 10: white space, a sign, then digits. The
+/// number, whether it overflowed, and where the reading stopped: at the start where no digit was
+/// read.
+fn strtoul10(s: &[u8]) -> (u64, bool, usize) {
+    let mut at = 0;
+    while at < s.len() && is_c_space(s[at]) {
+        at += 1;
+    }
+    let negative = match s.get(at) {
+        Some(b'-') => {
+            at += 1;
+            true
+        }
+        Some(b'+') => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+    let start = at;
+    let (mut v, mut over) = (0u64, false);
+    while let Some(d) = s.get(at).filter(|b| b.is_ascii_digit()) {
+        match v
+            .checked_mul(10)
+            .and_then(|x| x.checked_add(u64::from(d - b'0')))
+        {
+            Some(x) => v = x,
+            None => over = true,
+        }
+        at += 1;
+    }
+    if at == start {
+        return (0, false, 0);
+    }
+    if over {
+        return (u64::MAX, true, at);
+    }
+    (if negative { v.wrapping_neg() } else { v }, false, at)
+}
+
+/// The key of a tid: its block number and its offset, the block's bits above the offset's.
+pub fn tid_key(block: u32, offset: u16) -> i64 {
+    unsigned_key((u64::from(block) << 16) | u64::from(offset), 48)
+}
+
+/// A tid's block number and offset, from its key.
+pub fn tid_parts(key: i64) -> (u32, u16) {
+    let v = unsigned_of(key, 48);
+    ((v >> 16) as u32, v as u16)
+}
+
+/// A tid as PostgreSQL's `tidin` reads it: the first `(`, or a comma, begins the block number and
+/// the next comma the offset, the scan stopping at a `)`; each read as `strtoul` reads it in base
+/// 10, the block ending at the comma and taken where it fits after it is extended either way, the
+/// offset ending at the `)` and at most 65535.
+fn tid_in(s: &str) -> Result<i64> {
+    let wrong = || Error::new(format!("invalid input syntax for type tid: \"{s}\""));
+    let b = s.as_bytes();
+    let mut coord = Vec::with_capacity(2);
+    for (i, &c) in b.iter().enumerate() {
+        if coord.len() == 2 || c == b')' {
+            break;
+        }
+        if c == b',' || (c == b'(' && coord.is_empty()) {
+            coord.push(i + 1);
+        }
+    }
+    let [block_at, offset_at] = coord[..] else {
+        return Err(wrong());
+    };
+    let (v, over, end) = strtoul10(&b[block_at..]);
+    if over || b.get(block_at + end) != Some(&b',') {
+        return Err(wrong());
+    }
+    let block = v as u32;
+    if v != u64::from(block) && v != (block as i32) as i64 as u64 {
+        return Err(wrong());
+    }
+    let (v, over, end) = strtoul10(&b[offset_at..]);
+    if over || b.get(offset_at + end) != Some(&b')') || v > u64::from(u16::MAX) {
+        return Err(wrong());
+    }
+    Ok(tid_key(block, v as u16))
+}
+
+/// A tid as PostgreSQL's `tidout` writes it: `(block,offset)`.
+fn tid_out(key: i64) -> String {
+    let (block, offset) = tid_parts(key);
+    format!("({block},{offset})")
+}
+
 /// A pg_lsn as PostgreSQL's `pg_lsn_in` reads it: one to eight hex digits, a slash, one to eight.
 fn lsn_in(s: &str) -> Result<u64> {
     let wrong = || Error::new(format!("invalid input syntax for type pg_lsn: \"{s}\""));
@@ -1037,6 +1128,7 @@ pub fn scalar_text(ty: ColumnType, key: i64) -> String {
         ColumnType::Money => money_out(key),
         ColumnType::Macaddr => mac_out(unsigned_of(key, 48), 6),
         ColumnType::Macaddr8 => mac_out(unsigned_of(key, 64), 8),
+        ColumnType::Tid => tid_out(key),
         _ => key.to_string(),
     }
 }
@@ -1061,6 +1153,7 @@ pub fn scalar_parse(ty: ColumnType, s: &str) -> Result<i64> {
         ColumnType::Money => money_in(s)?,
         ColumnType::Macaddr => unsigned_key(mac_in(s)?, 48),
         ColumnType::Macaddr8 => unsigned_key(mac8_in(s)?, 64),
+        ColumnType::Tid => tid_in(s)?,
         other => {
             return Err(Error::new(format!(
                 "{} is not read as a scalar",
@@ -1078,10 +1171,22 @@ pub const PG_TYPE: &str = "pg_type";
 /// reg* column's OIDs.
 pub const PG_RELEASE: &str = "pg_release";
 
+/// A tid's two leaves as arrow's Parquet reader gives them: its block number and its offset.
+fn tid_fields() -> arrow::datatypes::Fields {
+    use arrow::datatypes::{DataType as A, Field};
+    vec![
+        Field::new("block", A::UInt32, false),
+        Field::new("offset", A::UInt16, false),
+    ]
+    .into()
+}
 /// The Arrow type an answer holds a scalar of type `ty` as: what arrow's Parquet reader gives its
 /// page form.
 pub fn scalar_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
     use arrow::datatypes::DataType as A;
+    if ty == ColumnType::Tid {
+        return A::Struct(tid_fields());
+    }
     if let Some(n) = ty.fixed_bytes() {
         return A::FixedSizeBinary(n as i32);
     }
@@ -1100,6 +1205,20 @@ pub fn scalar_array(
 ) -> arrow::array::ArrayRef {
     use arrow::array::{FixedSizeBinaryArray, Int64Array, UInt32Array, UInt64Array, UInt8Array};
     use std::sync::Arc;
+    if ty == ColumnType::Tid {
+        let keys: Vec<Option<i64>> = keys.collect();
+        let parts = |k: &Option<i64>| k.map_or((0, 0), tid_parts);
+        let blocks: UInt32Array = keys.iter().map(|k| Some(parts(k).0)).collect();
+        let offsets: arrow::array::UInt16Array = keys.iter().map(|k| Some(parts(k).1)).collect();
+        return Arc::new(
+            arrow::array::StructArray::try_new(
+                tid_fields(),
+                vec![Arc::new(blocks), Arc::new(offsets)],
+                Some(keys.iter().map(Option::is_some).collect()),
+            )
+            .expect("a tid takes its two leaves"),
+        );
+    }
     if let Some(n) = ty.fixed_bytes() {
         return Arc::new(
             FixedSizeBinaryArray::try_from_sparse_iter_with_size(
@@ -1133,6 +1252,18 @@ pub fn scalar_key_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> O
         return None;
     }
     let any = a.as_any();
+    if ty == ColumnType::Tid {
+        let s = any.downcast_ref::<arrow::array::StructArray>()?;
+        let block = s
+            .column_by_name("block")?
+            .as_any()
+            .downcast_ref::<UInt32Array>()?;
+        let offset = s
+            .column_by_name("offset")?
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()?;
+        return Some(tid_key(block.value(r), offset.value(r)));
+    }
     if ty.fixed_bytes().is_some() {
         return Some(key_of_fixed(
             ty,
@@ -1180,6 +1311,7 @@ pub fn field_scalar(f: &arrow::datatypes::Field) -> Option<ColumnType> {
         ColumnType::Macaddr,
         ColumnType::Macaddr8,
         ColumnType::Oid8,
+        ColumnType::Tid,
     ]
     .into_iter()
     .find(|t| t.pg_name() == *named && scalar_arrow(*t) == *f.data_type())
@@ -1221,6 +1353,7 @@ pub fn is_scalar(ty: ColumnType) -> bool {
             | ColumnType::Macaddr8
             | ColumnType::Reg(..)
             | ColumnType::Oid8
+            | ColumnType::Tid
     )
 }
 
@@ -1517,6 +1650,68 @@ mod tests {
         for s in ["92233720368547758.08", "x", "1.5x"] {
             assert!(money(s).is_err(), "{s}");
         }
+    }
+
+    #[test]
+    fn a_tid_reads_and_writes_as_tidin_and_tidout_do() {
+        // Each spelling as PostgreSQL 18.6 read it (`'…'::tid::text`, 2026-10-30).
+        let tid =
+            |s: &str| scalar_parse(ColumnType::Tid, s).map(|k| scalar_text(ColumnType::Tid, k));
+        for (s, want) in [
+            ("(1,2)", "(1,2)"),
+            ("(-1,0)", "(4294967295,0)"),
+            ("( 1, 2)", "(1,2)"),
+            ("(\t1,\n2)", "(1,2)"),
+            ("(+1,+2)", "(1,2)"),
+            ("(-0,-0)", "(0,0)"),
+            ("(-2147483648,0)", "(2147483648,0)"),
+            ("(18446744073709551615,0)", "(4294967295,0)"),
+            ("(4294967295,65535)", "(4294967295,65535)"),
+            ("(010,1)", "(10,1)"),
+            ("x(1,2)", "(1,2)"),
+            ("(1,2)junk", "(1,2)"),
+            ("(1,2) ", "(1,2)"),
+            ("(,2)", "(0,2)"),
+            ("(1,)", "(1,0)"),
+            (",1,2)", "(1,2)"),
+        ] {
+            assert_eq!(tid(s).unwrap(), want, "{s}");
+        }
+        for s in [
+            "( 1 , 2 )",
+            "(4294967296,0)",
+            "(-2147483649,0)",
+            "(-4294967295,0)",
+            "(18446744073709551616,0)",
+            "(0,65536)",
+            "(0,-1)",
+            "(0,99999999999999999999)",
+            "(0x10,1)",
+            "1,2)",
+            "(1,2",
+            "((1,2)",
+            "(1,2,3)",
+            "(1;2)",
+            "( ,2)",
+            "(-,2)",
+            "",
+        ] {
+            assert!(tid(s).is_err(), "{s}");
+        }
+        // Its key rises with the block, then the offset, both unsigned.
+        let keys: Vec<i64> = [
+            (0, 0),
+            (0, 1),
+            (0, 65535),
+            (1, 0),
+            (2147483648, 1),
+            (4294967295, 65535),
+        ]
+        .iter()
+        .map(|&(b, o)| tid_key(b, o))
+        .collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(tid_parts(tid_key(4294967295, 65535)), (4294967295, 65535));
     }
 
     #[test]

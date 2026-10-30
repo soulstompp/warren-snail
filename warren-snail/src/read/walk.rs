@@ -1168,7 +1168,28 @@ fn summary_of(table: &Table, order: &Order, c: &Cond, e: &Entry) -> (Summary, us
     let slots = order
         .slots(table, column)
         .expect("an order holds the columns read along it");
-    (e.columns[slots.start], slots.start)
+    let leaves = &e.columns[slots.clone()];
+    if let [one] = leaves {
+        return (*one, slots.start);
+    }
+    // A group's least and greatest: its leaves' least, and its leaves' greatest, each made into
+    // the column's key as its leaves' values are.
+    let ty = table.columns[column].ty;
+    let key = |pick: fn(&Summary) -> i128| {
+        let parts = leaves
+            .iter()
+            .map(|s| Values::Int(vec![Some(pick(s) as i64)]))
+            .collect();
+        Values::from_leaves(ty, parts).wide(0).unwrap_or(0)
+    };
+    let sum = Summary {
+        nulls: leaves[0].nulls,
+        min: key(|s| s.min),
+        max: key(|s| s.max),
+        pages: leaves.iter().map(|s| s.pages).sum(),
+        wide: false,
+    };
+    (sum, slots.start)
 }
 
 /// A condition off the leading levels, against one entry's counts, `sum` what it keeps of the
@@ -1429,9 +1450,15 @@ mod tests {
             ..Default::default()
         };
         let december = Cond::new(Shape::MonthUtc(1), Interval { lo: 12, hi: 12 });
-        assert_eq!(rest_share(block.columns[1], 1, &december, &block, &head), 21.0 / 120.0);
+        assert_eq!(
+            rest_share(block.columns[1], 1, &december, &block, &head),
+            21.0 / 120.0
+        );
         let ids = Cond::new(Shape::Column(0), Interval { lo: 1, hi: 25 });
-        assert_eq!(rest_share(block.columns[0], 0, &ids, &block, &head), 100.0 / 120.0 * 0.25);
+        assert_eq!(
+            rest_share(block.columns[0], 0, &ids, &block, &head),
+            100.0 / 120.0 * 0.25
+        );
         let none = Cond::new(Shape::Column(0), Interval { lo: 200, hi: 300 });
         assert_eq!(rest_share(block.columns[0], 0, &none, &block, &head), 0.0);
     }
@@ -1478,10 +1505,7 @@ mod tests {
             (Status::None, Some(0))
         );
         // A value among them: the counts cannot say.
-        assert_eq!(
-            status(&unequal(7), &block(1, 50, 0)),
-            (Status::May, None)
-        );
+        assert_eq!(status(&unequal(7), &block(1, 50, 0)), (Status::May, None));
         // IS NOT TRUE: false and the NULLs.
         let mut not_true = Cond::new(Shape::Column(0), Interval::at(0));
         not_true.nulls = true;
@@ -1489,22 +1513,13 @@ mod tests {
             status(&not_true, &block(0, 0, 20)),
             (Status::Must, Some(100))
         );
-        assert_eq!(
-            status(&not_true, &block(1, 1, 20)),
-            (Status::May, Some(20))
-        );
-        assert_eq!(
-            status(&not_true, &block(1, 1, 0)),
-            (Status::None, Some(0))
-        );
+        assert_eq!(status(&not_true, &block(1, 1, 20)), (Status::May, Some(20)));
+        assert_eq!(status(&not_true, &block(1, 1, 0)), (Status::None, Some(0)));
         assert_eq!(
             status(&not_true, &block(0, 0, 100)),
             (Status::Must, Some(100))
         );
-        assert_eq!(
-            status(&not_true, &block(0, 1, 20)),
-            (Status::May, None)
-        );
+        assert_eq!(status(&not_true, &block(0, 1, 20)), (Status::May, None));
     }
 
     #[test]

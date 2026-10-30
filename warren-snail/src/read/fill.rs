@@ -144,7 +144,8 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         | (Xid8, Xid8)
         | (PgLsn, PgLsn)
         | (Char, Char)
-        | (Money, Money) => d,
+        | (Money, Money)
+        | (Tid, Tid) => d,
         // A reg* type is an oid to PostgreSQL's casts: from and to one, binary-coercible, as are a
         // function's two and an operator's two to each other.
         (Oid | Reg(..), Oid | Reg(..))

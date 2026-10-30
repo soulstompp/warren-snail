@@ -575,13 +575,15 @@ Each command exits 0, or prints why it refused and exits 1.
   precision`; `oid`, `xid8` and `pg_lsn`, unsigned; `xid`, compared only by `=` and `<>`, and
   `cid`, only by `=`, neither keying an index; `"char"`, its byte unsigned; `money`, its cents,
   under the C locale, which the file records for each money column; `macaddr` and `macaddr8`,
-  compared byte by byte; `oid8`, unsigned in 64 bits; and the reg* types, `regclass`, `regtype`,
+  compared byte by byte; `oid8`, unsigned in 64 bits; the reg* types, `regclass`, `regtype`,
   `regproc`, `regprocedure`, `regoper`, `regoperator`, `regnamespace`, `regrole`,
   `regcollation`, `regconfig`, `regdictionary` and, from PostgreSQL 19, `regdatabase`, each an oid
   compared as one, written and read as the name of a built-in object of the release the file's
   OIDs came from, which the snail carries for 14 to 19, and any other OID, every role's among
-  them, bare. Each is read and written in PostgreSQL's own spellings, assigned from another type
-  as PostgreSQL's casts take it.
+  them, bare; and `tid`, compared by its block number, then its offset, held as a group of two
+  leaves, its block number and its offset, and so put out as a Parquet group of the two. Each is
+  read and written in PostgreSQL's own spellings, assigned from another type as PostgreSQL's casts
+  take it.
 - `CREATE INDEX`, a B-tree, its key on columns, on an instant's month,
   `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
   `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is

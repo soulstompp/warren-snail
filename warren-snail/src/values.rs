@@ -219,17 +219,50 @@ impl Values {
 
     /// A column's values as the leaves of its type hold them, one `Values` a leaf: its own where it
     /// is one leaf.
-    pub fn into_leaves(self, _ty: ColumnType) -> Vec<Values> {
-        vec![self]
+    pub fn into_leaves(self, ty: ColumnType) -> Vec<Values> {
+        use crate::scalars::{tid_parts, unsigned_key};
+        match (ty, self) {
+            // A tid's block number and offset, each keyed in the signed range of its own bits.
+            (ColumnType::Tid, Values::Int(v)) => {
+                let parts: Vec<Option<(u32, u16)>> = v.iter().map(|k| k.map(tid_parts)).collect();
+                vec![
+                    Values::Int(
+                        parts
+                            .iter()
+                            .map(|p| p.map(|(b, _)| unsigned_key(u64::from(b), 32)))
+                            .collect(),
+                    ),
+                    Values::Int(
+                        parts
+                            .iter()
+                            .map(|p| p.map(|(_, o)| unsigned_key(u64::from(o), 16)))
+                            .collect(),
+                    ),
+                ]
+            }
+            (_, values) => vec![values],
+        }
     }
 
     /// A column's values from its leaves', each of the same rows: its one leaf's own where it is
     /// one.
     pub fn from_leaves(ty: ColumnType, leaves: Vec<Values>) -> Values {
-        leaves
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Values::new(ty))
+        use crate::scalars::{tid_key, unsigned_of};
+        match (ty, leaves.as_slice()) {
+            (ColumnType::Tid, [Values::Int(blocks), Values::Int(offsets)]) => Values::Int(
+                blocks
+                    .iter()
+                    .zip(offsets)
+                    .map(|(b, o)| {
+                        Some(tid_key(
+                            unsigned_of((*b)?, 32) as u32,
+                            unsigned_of((*o)?, 16) as u16,
+                        ))
+                    })
+                    .collect(),
+            ),
+            _ => leaves.into_iter().next().unwrap_or_else(|| Values::new(ty)),
+        }
     }
 
     /// The most characters any value holds.

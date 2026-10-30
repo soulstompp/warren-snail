@@ -29,9 +29,7 @@ pub(super) const ABORTED: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
 use crate::places::{key, month_utc, null_key, KeyValue};
 use crate::values::Values;
-use crate::write::{
-    empty_head, head_of, laid_out, leaf_descriptors, write_block, Laid, Rows,
-};
+use crate::write::{empty_head, head_of, laid_out, leaf_descriptors, write_block, Laid, Rows};
 use crate::{Error, Result};
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int16Array,
