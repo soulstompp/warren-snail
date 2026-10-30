@@ -7,6 +7,7 @@
 
 mod answer;
 mod change;
+mod clock;
 pub(crate) mod fill;
 pub(crate) mod foreign;
 mod hash;
@@ -73,6 +74,7 @@ impl Sink for First<'_> {
                 Cell::Int(v) => self.key.push(*v as i128),
                 Cell::Wide(v) => self.key.push(*v),
                 Cell::Float(f) => self.key.push(i128::from(f.key)),
+                Cell::Interval(v) => self.key.push(v.0.total()),
                 _ => return,
             }
         }
@@ -135,6 +137,7 @@ impl Sink for Second<'_> {
                 Cell::Int(v) => self.probe.push(*v as i128),
                 Cell::Wide(v) => self.probe.push(*v),
                 Cell::Float(f) => self.probe.push(i128::from(f.key)),
+                Cell::Interval(v) => self.probe.push(v.0.total()),
                 _ => {
                     self.found = None;
                     return false;

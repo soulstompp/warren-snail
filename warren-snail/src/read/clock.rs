@@ -1,0 +1,524 @@
+//! The time types in a pipeline: their operators, their casts and their comparisons across types,
+//! as PostgreSQL resolves each under the settings the snail answers under.
+
+use super::pipeline::Value;
+use crate::catalog::ColumnType;
+use crate::times;
+use crate::{Error, Result};
+use sqlparser::ast::BinaryOperator;
+use std::cmp::Ordering;
+
+/// A time type without its precision: the type its operators and comparisons take.
+pub(super) fn base(ty: ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::Time(_) => ColumnType::Time(None),
+        ColumnType::Timetz(_) => ColumnType::Timetz(None),
+        ColumnType::Timestamp(_) => ColumnType::Timestamp(None),
+        ColumnType::TimestamptzRounded(_) => ColumnType::Timestamptz,
+        ColumnType::Interval { .. } => full_interval(),
+        ty => ty,
+    }
+}
+
+fn full_interval() -> ColumnType {
+    ColumnType::Interval {
+        range: times::INTERVAL_FULL_RANGE,
+        precision: None,
+    }
+}
+
+/// A value's time type, without its precision, where it is of one.
+pub(super) fn time_of(v: &Value) -> Option<ColumnType> {
+    match v {
+        Value::Interval(_) => Some(full_interval()),
+        Value::Scalar(ty, _) => match base(*ty) {
+            t @ (ColumnType::Date
+            | ColumnType::Time(_)
+            | ColumnType::Timetz(_)
+            | ColumnType::Timestamp(_)
+            | ColumnType::Timestamptz) => Some(t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// An instant of either kind, a date taken as one where the other side is one, as PostgreSQL's
+/// implicit casts take it: a date at midnight, and a timestamp as a timestamptz under UTC.
+fn instants(x: &Value, y: &Value) -> Result<Option<(ColumnType, i64, i64)>> {
+    let (Some(a), Some(b)) = (time_of(x), time_of(y)) else {
+        return Ok(None);
+    };
+    let (Value::Scalar(_, p), Value::Scalar(_, q)) = (x, y) else {
+        return Ok(None);
+    };
+    let wide = |t: ColumnType| match t {
+        ColumnType::Date => 0,
+        ColumnType::Timestamp(_) => 1,
+        ColumnType::Timestamptz => 2,
+        _ => 3,
+    };
+    let to = match (wide(a), wide(b)) {
+        (3, _) | (_, 3) | (0, 0) => return Ok(None),
+        (m, n) => m.max(n),
+    };
+    let lift = |t: ColumnType, k: i64| -> Result<i64> {
+        Ok(match (t, to) {
+            (ColumnType::Date, 1) => times::date_timestamp(k as i32)?,
+            (ColumnType::Date, _) => times::date_timestamptz(k as i32)?,
+            (ColumnType::Timestamp(_), 2) => times::timestamp_timestamptz(k),
+            _ => k,
+        })
+    };
+    let ty = if to == 1 {
+        ColumnType::Timestamp(None)
+    } else {
+        ColumnType::Timestamptz
+    };
+    Ok(Some((ty, lift(a, *p)?, lift(b, *q)?)))
+}
+
+/// Two values compared where either is of a time type: none where PostgreSQL has no operator for
+/// them, so the caller refuses as it would.
+pub(super) fn compare(x: &Value, y: &Value) -> Result<Option<Ordering>> {
+    match (x, y) {
+        (Value::Interval(a), Value::Interval(b)) => Ok(Some(a.total().cmp(&b.total()))),
+        (Value::Scalar(a, p), Value::Scalar(b, q)) if base(*a) == base(*b) => Ok(Some(p.cmp(q))),
+        _ => match (time_of(x), time_of(y), x, y) {
+            (
+                Some(ColumnType::Date),
+                Some(ColumnType::Timestamp(_)),
+                Value::Scalar(_, d),
+                Value::Scalar(_, t),
+            ) => Ok(Some(times::date_cmp_timestamp(*d as i32, *t))),
+            (
+                Some(ColumnType::Timestamp(_)),
+                Some(ColumnType::Date),
+                Value::Scalar(_, t),
+                Value::Scalar(_, d),
+            ) => Ok(Some(times::timestamp_cmp_date(*t, *d as i32))),
+            (
+                Some(ColumnType::Date),
+                Some(ColumnType::Timestamptz),
+                Value::Scalar(_, d),
+                Value::Scalar(_, t),
+            ) => Ok(Some(times::date_cmp_timestamptz(*d as i32, *t))),
+            (
+                Some(ColumnType::Timestamptz),
+                Some(ColumnType::Date),
+                Value::Scalar(_, t),
+                Value::Scalar(_, d),
+            ) => Ok(Some(times::timestamptz_cmp_date(*t, *d as i32))),
+            (
+                Some(ColumnType::Timestamp(_)),
+                Some(ColumnType::Timestamptz),
+                Value::Scalar(_, a),
+                Value::Scalar(_, b),
+            ) => Ok(Some(times::timestamp_cmp_timestamptz(*a, *b))),
+            (
+                Some(ColumnType::Timestamptz),
+                Some(ColumnType::Timestamp(_)),
+                Value::Scalar(_, a),
+                Value::Scalar(_, b),
+            ) => Ok(Some(times::timestamptz_cmp_timestamp(*a, *b))),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// A number beside an interval's `*` or `/`, as the double precision PostgreSQL casts it to.
+fn factor(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(x) => Some(*x as f64),
+        Value::Num(m, s) => super::pipeline::numeric_text(*m, *s).parse().ok(),
+        Value::Real(f) => Some(f64::from(*f)),
+        Value::Double(d) => Some(*d),
+        _ => None,
+    }
+}
+
+fn scalar(ty: ColumnType, k: i64) -> Value {
+    Value::Scalar(ty, k)
+}
+
+fn timetz(t: (i64, i32)) -> Value {
+    scalar(
+        ColumnType::Timetz(None),
+        crate::scalars::timetz_key(t.0, t.1),
+    )
+}
+
+/// An operator where either side is of a time type, as PostgreSQL resolves it; none where neither
+/// is, and a refusal in PostgreSQL's words where it has no such operator.
+pub(super) fn arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>> {
+    use BinaryOperator::{Divide, Minus, Multiply, Plus};
+    use ColumnType as T;
+    let (a, b) = (time_of(x), time_of(y));
+    if a.is_none() && b.is_none() {
+        return Ok(None);
+    }
+    let int = |v: &Value| match v {
+        Value::Int(n) => Some(*n),
+        _ => None,
+    };
+    let ts = T::Timestamp(None);
+    let v = match (op, a, b, x, y) {
+        // date ± integer, integer + date, date − date.
+        (Plus, Some(T::Date), None, Value::Scalar(_, d), n) if int(n).is_some() => scalar(
+            T::Date,
+            i64::from(times::date_pli(*d as i32, int(n).unwrap())?),
+        ),
+        (Plus, None, Some(T::Date), n, Value::Scalar(_, d)) if int(n).is_some() => scalar(
+            T::Date,
+            i64::from(times::date_pli(*d as i32, int(n).unwrap())?),
+        ),
+        (Minus, Some(T::Date), None, Value::Scalar(_, d), n) if int(n).is_some() => scalar(
+            T::Date,
+            i64::from(times::date_mii(*d as i32, int(n).unwrap())?),
+        ),
+        (Minus, Some(T::Date), Some(T::Date), Value::Scalar(_, p), Value::Scalar(_, q)) => {
+            Value::Int(times::date_mi(*p as i32, *q as i32)?)
+        }
+        // date ± interval, interval + date: a timestamp.
+        (
+            Plus,
+            Some(T::Date),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, d),
+            Value::Interval(v),
+        )
+        | (
+            Plus,
+            Some(T::Interval { .. }),
+            Some(T::Date),
+            Value::Interval(v),
+            Value::Scalar(_, d),
+        ) => scalar(ts, times::date_pl_interval(*d as i32, *v)?),
+        (
+            Minus,
+            Some(T::Date),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, d),
+            Value::Interval(v),
+        ) => scalar(ts, times::date_mi_interval(*d as i32, *v)?),
+        // date + time and time + date: a timestamp; date + timetz and timetz + date: a timestamptz.
+        (Plus, Some(T::Date), Some(T::Time(_)), Value::Scalar(_, d), Value::Scalar(_, t))
+        | (Plus, Some(T::Time(_)), Some(T::Date), Value::Scalar(_, t), Value::Scalar(_, d)) => {
+            scalar(ts, times::datetime_pl(*d as i32, *t)?)
+        }
+        (Plus, Some(T::Date), Some(T::Timetz(_)), Value::Scalar(_, d), Value::Scalar(_, k))
+        | (Plus, Some(T::Timetz(_)), Some(T::Date), Value::Scalar(_, k), Value::Scalar(_, d)) => {
+            let (t, z) = crate::scalars::timetz_parts(*k);
+            scalar(T::Timestamptz, times::datetimetz_pl(*d as i32, t, z)?)
+        }
+        // An instant ± interval, interval + instant.
+        (
+            Plus,
+            Some(T::Timestamp(_)),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, t),
+            Value::Interval(v),
+        )
+        | (
+            Plus,
+            Some(T::Interval { .. }),
+            Some(T::Timestamp(_)),
+            Value::Interval(v),
+            Value::Scalar(_, t),
+        ) => scalar(ts, times::timestamp_pl_interval(*t, *v)?),
+        (
+            Minus,
+            Some(T::Timestamp(_)),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, t),
+            Value::Interval(v),
+        ) => scalar(ts, times::timestamp_mi_interval(*t, *v)?),
+        (
+            Plus,
+            Some(T::Timestamptz),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, t),
+            Value::Interval(v),
+        )
+        | (
+            Plus,
+            Some(T::Interval { .. }),
+            Some(T::Timestamptz),
+            Value::Interval(v),
+            Value::Scalar(_, t),
+        ) => scalar(T::Timestamptz, times::timestamptz_pl_interval(*t, *v)?),
+        (
+            Minus,
+            Some(T::Timestamptz),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, t),
+            Value::Interval(v),
+        ) => scalar(T::Timestamptz, times::timestamptz_mi_interval(*t, *v)?),
+        // time ± interval, interval + time, time − time; timetz ± interval, interval + timetz.
+        (
+            Plus,
+            Some(T::Time(_)),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, t),
+            Value::Interval(v),
+        )
+        | (
+            Plus,
+            Some(T::Interval { .. }),
+            Some(T::Time(_)),
+            Value::Interval(v),
+            Value::Scalar(_, t),
+        ) => scalar(T::Time(None), times::time_pl_interval(*t, *v)?),
+        (
+            Minus,
+            Some(T::Time(_)),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, t),
+            Value::Interval(v),
+        ) => scalar(T::Time(None), times::time_mi_interval(*t, *v)?),
+        (Minus, Some(T::Time(_)), Some(T::Time(_)), Value::Scalar(_, p), Value::Scalar(_, q)) => {
+            Value::Interval(times::time_mi_time(*p, *q))
+        }
+        (
+            Plus,
+            Some(T::Timetz(_)),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, k),
+            Value::Interval(v),
+        )
+        | (
+            Plus,
+            Some(T::Interval { .. }),
+            Some(T::Timetz(_)),
+            Value::Interval(v),
+            Value::Scalar(_, k),
+        ) => {
+            let (t, z) = crate::scalars::timetz_parts(*k);
+            timetz(times::timetz_pl_interval(t, z, *v)?)
+        }
+        (
+            Minus,
+            Some(T::Timetz(_)),
+            Some(T::Interval { .. }),
+            Value::Scalar(_, k),
+            Value::Interval(v),
+        ) => {
+            let (t, z) = crate::scalars::timetz_parts(*k);
+            timetz(times::timetz_mi_interval(t, z, *v)?)
+        }
+        // interval ± interval, and by a number.
+        (Plus, _, _, Value::Interval(p), Value::Interval(q)) => {
+            Value::Interval(times::interval_pl(*p, *q)?)
+        }
+        (Minus, _, _, Value::Interval(p), Value::Interval(q)) => {
+            Value::Interval(times::interval_mi(*p, *q)?)
+        }
+        (Multiply, _, None, Value::Interval(v), f) | (Multiply, None, _, f, Value::Interval(v))
+            if factor(f).is_some() =>
+        {
+            Value::Interval(times::interval_mul(*v, factor(f).unwrap())?)
+        }
+        (Divide, _, None, Value::Interval(v), f) if factor(f).is_some() => {
+            Value::Interval(times::interval_div(*v, factor(f).unwrap())?)
+        }
+        // An instant less another, the date or the timestamp taken as the wider: an interval.
+        (Minus, Some(_), Some(_), _, _) => match instants(x, y)? {
+            Some((_, p, q)) => Value::Interval(times::timestamp_mi(p, q)?),
+            None => return Err(no_operator(op, x, y)),
+        },
+        _ => return Err(no_operator(op, x, y)),
+    };
+    Ok(Some(v))
+}
+
+fn no_operator(op: &BinaryOperator, x: &Value, y: &Value) -> Error {
+    Error::new(format!(
+        "operator does not exist: {} {op} {}",
+        super::pipeline::kind_name(x),
+        super::pipeline::kind_name(y)
+    ))
+}
+
+/// A value's unary minus, where it is an interval.
+pub(super) fn negate(v: &Value) -> Result<Option<Value>> {
+    match v {
+        Value::Interval(x) => Ok(Some(Value::Interval(times::interval_um(*x)?))),
+        _ => Ok(None),
+    }
+}
+
+/// Whether a type is one of the time types.
+pub(super) fn is_time(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Date
+            | ColumnType::Time(_)
+            | ColumnType::Timetz(_)
+            | ColumnType::Timestamp(_)
+            | ColumnType::Timestamptz
+            | ColumnType::TimestamptzRounded(_)
+            | ColumnType::Interval { .. }
+    )
+}
+
+/// A value cast to a time type `to`, as PostgreSQL's casts take it: text by the type's input, and
+/// between the time types by pg_cast's rows, rounded to the precision `to` names.
+pub(super) fn cast(v: Value, to: ColumnType) -> Result<Value> {
+    use ColumnType as T;
+    let refused = |v: &Value| {
+        Error::new(format!(
+            "cannot cast type {} to {}",
+            super::pipeline::kind_name(v),
+            to.pg_name()
+        ))
+    };
+    let p = |p: Option<u8>| p.map(u32::from);
+    if let Value::Text(s) = &v {
+        return Ok(match to {
+            T::Interval { .. } => {
+                // A cast from text reads the text whole, then cuts it to the fields named.
+                let (range, precision) = match to {
+                    T::Interval { range, precision } => (range, precision),
+                    _ => unreachable!(),
+                };
+                let x = times::interval_in(s, times::INTERVAL_FULL_RANGE, None)?;
+                Value::Interval(times::round_interval(x, range, p(precision))?)
+            }
+            to => scalar(to, crate::scalars::scalar_parse(to, s)?),
+        });
+    }
+    let from = time_of(&v).ok_or_else(|| refused(&v))?;
+    let null = |x: Option<Value>| x.unwrap_or(Value::Null);
+    Ok(match (from, to, &v) {
+        (T::Interval { .. }, T::Interval { range, precision }, Value::Interval(x)) => {
+            Value::Interval(times::round_interval(*x, range, p(precision))?)
+        }
+        (T::Interval { .. }, T::Time(q), Value::Interval(x)) => {
+            let t = times::interval_time(*x)?;
+            scalar(T::Time(q), p(q).map_or(t, |q| times::round_time(t, q)))
+        }
+        (_, _, Value::Scalar(_, k)) => {
+            let k = *k;
+            let rounded = |t: i64, q: Option<u8>| -> Result<i64> {
+                match p(q) {
+                    Some(q) => times::round_instant(t, q),
+                    None => Ok(t),
+                }
+            };
+            match (from, to) {
+                (T::Date, T::Date) => v,
+                (T::Date, T::Timestamp(q)) => {
+                    scalar(to, rounded(times::date_timestamp(k as i32)?, q)?)
+                }
+                (T::Date, T::Timestamptz) => scalar(to, times::date_timestamptz(k as i32)?),
+                (T::Date, T::TimestamptzRounded(q)) => {
+                    scalar(to, rounded(times::date_timestamptz(k as i32)?, Some(q))?)
+                }
+                (T::Timestamp(_), T::Date) => scalar(to, i64::from(times::timestamp_date(k)?)),
+                (T::Timestamptz, T::Date) => scalar(to, i64::from(times::timestamptz_date(k)?)),
+                (T::Timestamp(_), T::Timestamp(q)) => scalar(to, rounded(k, q)?),
+                (T::Timestamp(_), T::Timestamptz) => scalar(to, times::timestamp_timestamptz(k)),
+                (T::Timestamp(_), T::TimestamptzRounded(q)) => {
+                    scalar(to, rounded(times::timestamp_timestamptz(k), Some(q))?)
+                }
+                (T::Timestamptz, T::Timestamptz) => v,
+                (T::Timestamptz, T::TimestamptzRounded(q)) => scalar(to, rounded(k, Some(q))?),
+                (T::Timestamptz, T::Timestamp(q)) => {
+                    scalar(to, rounded(times::timestamptz_timestamp(k), q)?)
+                }
+                (T::Timestamp(_), T::Time(q)) => null(
+                    times::timestamp_time(k)?
+                        .map(|t| scalar(to, p(q).map_or(t, |q| times::round_time(t, q)))),
+                ),
+                (T::Timestamptz, T::Time(q)) => null(
+                    times::timestamptz_time(k)?
+                        .map(|t| scalar(to, p(q).map_or(t, |q| times::round_time(t, q)))),
+                ),
+                (T::Timestamptz, T::Timetz(q)) => {
+                    null(times::timestamptz_timetz(k)?.map(|(t, z)| {
+                        timetz(p(q).map_or((t, z), |q| times::round_timetz(t, z, q)))
+                    }))
+                }
+                (T::Time(_), T::Time(q)) => scalar(to, p(q).map_or(k, |q| times::round_time(k, q))),
+                (T::Time(_), T::Timetz(q)) => {
+                    let (t, z) = times::time_timetz(k);
+                    timetz(p(q).map_or((t, z), |q| times::round_timetz(t, z, q)))
+                }
+                (T::Time(_), T::Interval { range, precision }) => Value::Interval(
+                    times::round_interval(times::time_interval(k), range, p(precision))?,
+                ),
+                (T::Timetz(_), T::Timetz(q)) => {
+                    let (t, z) = crate::scalars::timetz_parts(k);
+                    timetz(p(q).map_or((t, z), |q| times::round_timetz(t, z, q)))
+                }
+                (T::Timetz(_), T::Time(q)) => {
+                    let (t, z) = crate::scalars::timetz_parts(k);
+                    let t = times::timetz_time(t, z);
+                    scalar(to, p(q).map_or(t, |q| times::round_time(t, q)))
+                }
+                _ => return Err(refused(&v)),
+            }
+        }
+        _ => return Err(refused(&v)),
+    })
+}
+
+/// An instant past either end of what the snail holds, refused as PostgreSQL refuses one past its
+/// range, and from the snail's last instant on by name.
+fn held_instant(t: i128) -> Result<i64> {
+    let first = (times::date2j(-4713, 11, 24) - times::UNIX_EPOCH_JDATE) as i128
+        * times::MICROS_PER_DAY as i128;
+    if t < first {
+        return Err(Error::new("timestamp out of range"));
+    }
+    if t >= i128::from(i64::MAX) {
+        return Err(Error::new(
+            "timestamp out of range: past the snail's last instant, 294247-01-10 04:00:54.775806",
+        ));
+    }
+    Ok(t as i64)
+}
+
+/// A value AT TIME ZONE `zone`, as PostgreSQL's timestamptz_zone and timestamp_zone take it: an
+/// instant as the zone's clock shows it, and a time on the zone's clock as the instant it is. A zone
+/// other than UTC is read only under the feature zones.
+pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
+    let name = match zone {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(t) => t,
+        other => {
+            return Err(Error::new(format!(
+                "function timezone({}, …) does not exist",
+                super::pipeline::kind_name(&other)
+            )))
+        }
+    };
+    let second = 1_000_000i128;
+    Ok(match (time_of(&v), &v) {
+        (_, Value::Null) => Value::Null,
+        (Some(ColumnType::Timestamptz), Value::Scalar(_, t)) => {
+            let local = if *t == i64::MIN || *t == i64::MAX {
+                *t
+            } else {
+                let east = crate::zones::utc_offset(&name, t.div_euclid(1_000_000))?;
+                held_instant(i128::from(*t) + i128::from(east) * second)?
+            };
+            Value::Scalar(ColumnType::Timestamp(None), local)
+        }
+        (Some(ColumnType::Timestamp(_)), Value::Scalar(_, t)) => {
+            let at = if *t == i64::MIN || *t == i64::MAX {
+                *t
+            } else {
+                let east = crate::zones::local_offset(&name, t.div_euclid(1_000_000))?;
+                held_instant(i128::from(*t) - i128::from(east) * second)?
+            };
+            Value::Scalar(ColumnType::Timestamptz, at)
+        }
+        _ => {
+            return Err(Error::new(format!(
+                "{} AT TIME ZONE is not read",
+                super::pipeline::kind_name(&v)
+            )))
+        }
+    })
+}

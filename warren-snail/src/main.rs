@@ -27,7 +27,7 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
        warren-snail exec <file> <statements.sql> --out <done.parquet>
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
                          [--param <value>]... [--rounds <n>] [--hold <MiB>]
-                         [--round <round.parquet>]
+                         [--round <round.parquet>] [--text]
        warren-snail out <file> --dir <directory>
        warren-snail blocks <file> --out <blocks.parquet>
        warren-snail census <file>
@@ -51,7 +51,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           pages it predicted and read. --order names the order to read along; each --param gives
           the next of $1, $2 and on, as text. --rounds asks it again on the one open snail, which
           holds the pages its rounds read, --hold MiB of them (128 unless given). --round records
-          each round as Parquet.
+          each round as Parquet. --text writes each value of a time type, a scalar's and an
+          interval's, as PostgreSQL's output writes it, text exactly as the value.
   out     each table to <directory>/<table>.parquet, a row group for each block of its order, its
           pages copied as they lie; a block that holds dead rows, or rows written after its sorted
           ones, is pruned on its way out. A table past the size of one of the snail's files goes
@@ -64,7 +65,10 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           statements taken, as a DDL a snail can be written from. --statements records each
           statement as Parquet, and --out each fact of the catalog: a row each, its kind, its
           object, the fact and its value.
-  hold    the snail held open for the seconds given, as a round that long would hold it.";
+  hold    the snail held open for the seconds given, as a round that long would hold it.
+
+  Built with the feature zones, SNAIL_ZONES names the directory compiled zones are read from: the
+  machine's /usr/share/zoneinfo unless given.";
 
 fn save(path: &str, batch: &RecordBatch) -> Result<()> {
     let mut w = ArrowWriter::try_new(
@@ -75,6 +79,43 @@ fn save(path: &str, batch: &RecordBatch) -> Result<()> {
     w.write(batch)?;
     w.close()?;
     Ok(())
+}
+
+/// An answer with each column of a time type, a scalar or an interval written as text, as
+/// PostgreSQL's output writes each value.
+fn as_text(batch: &RecordBatch) -> Result<RecordBatch> {
+    use arrow::array::{Array, StringArray};
+    use arrow::datatypes::DataType as A;
+    use warren_snail::catalog::ColumnType;
+    let schema = batch.schema();
+    let mut fields = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    for (a, f) in batch.columns().iter().zip(schema.fields()) {
+        let ty = warren_snail::scalars::field_scalar(f).or(match f.data_type() {
+            A::Timestamp(_, Some(_)) => Some(ColumnType::Timestamptz),
+            _ => None,
+        });
+        let Some(ty) = ty else {
+            fields.push(f.as_ref().clone());
+            columns.push(a.clone());
+            continue;
+        };
+        let text: StringArray = (0..a.len())
+            .map(|r| match ty {
+                _ if a.is_null(r) => None,
+                ColumnType::Interval { .. } => warren_snail::scalars::interval_at(a.as_ref(), r)
+                    .map(warren_snail::times::interval_out),
+                ty => warren_snail::scalars::scalar_key_at(ty, a.as_ref(), r)
+                    .map(|k| warren_snail::scalars::scalar_text(ty, k)),
+            })
+            .collect();
+        fields.push(Field::new(f.name(), A::Utf8, f.is_nullable()));
+        columns.push(Arc::new(text));
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        columns,
+    )?)
 }
 
 fn table(columns: Vec<(&str, ArrayRef)>) -> Result<RecordBatch> {
@@ -246,6 +287,13 @@ fn cmd_out(args: &[String]) -> Result<()> {
             n(t.pruned, "block"),
             t.file.display()
         );
+        if !t.extremes.is_empty() {
+            println!(
+                "{}: {} hold an infinity or 24:00:00, written as the extremes of their page forms",
+                t.table,
+                t.extremes.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -454,7 +502,11 @@ fn cmd_read(args: &[String]) -> Result<()> {
         };
         match &first {
             None => {
-                save(out, &answer)?;
+                if args.iter().any(|a| a == "--text") {
+                    save(out, &as_text(&answer)?)?;
+                } else {
+                    save(out, &answer)?;
+                }
                 first = Some(answer);
             }
             Some(a) if *a != answer => {
@@ -770,6 +822,11 @@ fn cmd_blocks(args: &[String]) -> Result<()> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Built with zones, SNAIL_ZONES names the directory of compiled zones read, a server's own.
+    #[cfg(feature = "zones")]
+    if let Some(dir) = std::env::var_os("SNAIL_ZONES") {
+        warren_snail::zones::set_directory(dir.into());
+    }
     let result = match args.first().map(String::as_str) {
         Some("write") => cmd_write(&args[1..]),
         Some("read") => cmd_read(&args[1..]),

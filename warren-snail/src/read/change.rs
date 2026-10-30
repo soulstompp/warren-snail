@@ -28,7 +28,7 @@ const REUSED_KEPT: usize = 64;
 /// What a transaction answers once one of its statements failed, until it ends, as PostgreSQL does.
 pub(super) const ABORTED: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
-use crate::places::{byte_key, key, month_utc, null_key, KeyValue};
+use crate::places::{byte_key, key, month_of, null_key, KeyValue};
 use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, leaf_descriptors, write_block, Laid, Rows};
 use crate::{Error, Result};
@@ -137,6 +137,7 @@ fn datum_at(v: &Values, i: usize) -> Datum {
         Values::Float4(x) => x[i].map_or(Datum::Null, Datum::Float4),
         Values::Float8(x) => x[i].map_or(Datum::Null, Datum::Float8),
         Values::Composed(x) => x[i].clone().map_or(Datum::Null, Datum::Compound),
+        Values::Interval(x) => x[i].map_or(Datum::Null, Datum::Interval),
         _ => v
             .text(i)
             .map_or(Datum::Null, |s| Datum::Text(s.to_string())),
@@ -157,7 +158,12 @@ pub(super) fn datum_typed(v: &Values, i: usize, ty: ColumnType) -> Datum {
 /// A value's key on a level of type `ty`, from the value: a number's, a string's or bytes'.
 fn level_key(ty: ColumnType, level: Level, d: &Datum, null: KeyValue) -> KeyValue {
     match d {
-        Datum::Int(v) => key(level, *v),
+        // An infinite instant's month is NULL, as PostgreSQL's extract gives it.
+        Datum::Int(v) => match level {
+            Level::MonthUtc(_) if month_of(*v).is_none() => null,
+            level => key(level, *v),
+        },
+        Datum::Interval(v) => KeyValue::Wide(v.total()),
         Datum::Text(t) => byte_key(ty, &crate::strings::key_bytes(ty, t.as_bytes())),
         Datum::Bytes(b) => byte_key(ty, b),
         Datum::Wide(k) => KeyValue::Wide(*k),
@@ -185,6 +191,8 @@ fn push(v: &mut Values, d: &Datum) {
         (Values::Float8(x), Datum::Null) => x.push(None),
         (Values::Composed(x), Datum::Compound(c)) => x.push(Some(c.clone())),
         (Values::Composed(x), Datum::Null) => x.push(None),
+        (Values::Interval(x), Datum::Interval(i)) => x.push(Some(*i)),
+        (Values::Interval(x), Datum::Null) => x.push(None),
         _ => panic!("a value pushed onto a column of another kind"),
     }
 }
@@ -237,6 +245,12 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Datum::Null
+            } else if let Some(ColumnType::Interval { .. }) = scalar {
+                Datum::Interval(
+                    crate::scalars::interval_at(a.as_ref(), r).ok_or_else(|| {
+                        Error::new(format!("{} is not an interval", field.name()))
+                    })?,
+                )
             } else if let Some(ty) = bits {
                 Datum::Bytes(crate::strings::bits_key_at(ty, a.as_ref(), r).unwrap())
             } else if let Some(ty) = composed {
@@ -248,7 +262,11 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
                     _ => Datum::Compound(c),
                 }
             } else if let Some(ty) = scalar {
-                Datum::Int(crate::scalars::scalar_key_at(ty, a.as_ref(), r).unwrap())
+                Datum::Int(
+                    crate::scalars::scalar_key_at(ty, a.as_ref(), r).ok_or_else(|| {
+                        Error::new(format!("{} is not of its type", field.name()))
+                    })?,
+                )
             } else if let Some(x) = any.downcast_ref::<BooleanArray>() {
                 Datum::Int(x.value(r) as i64)
             } else if let Some(x) = any.downcast_ref::<Int16Array>() {
@@ -435,8 +453,7 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             table.columns.len()
         )));
     }
-    let months = table.month_columns();
-    for (c, (col, d)) in table.columns.iter().zip(row).enumerate() {
+    for (col, d) in table.columns.iter().zip(row) {
         let what = |why: String| Error::new(format!("{}.{}: {why}", table.name, col.name));
         match (col.ty, d) {
             (_, Datum::Null) if col.not_null => {
@@ -448,13 +465,6 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             }
             (ColumnType::Int4, Datum::Int(v)) if i32::try_from(*v).is_err() => {
                 return Err(what(format!("{v} is out of range")))
-            }
-            (ColumnType::Timestamptz, Datum::Int(v))
-                if (*v == i64::MAX || *v == i64::MIN) && months.contains(&c) =>
-            {
-                return Err(what(
-                    "holds an infinite instant, whose month cannot be counted".into(),
-                ))
             }
             (ColumnType::Text(Some(n)), Datum::Text(s)) if s.chars().count() > n as usize => {
                 return Err(what(format!(
@@ -505,7 +515,8 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             | (ColumnType::Composed(_), Datum::Compound(_))
             | (ColumnType::Uuid, Datum::Wide(_))
             | (ColumnType::Float4, Datum::Float4(_))
-            | (ColumnType::Float8, Datum::Float8(_)) => {}
+            | (ColumnType::Float8, Datum::Float8(_))
+            | (ColumnType::Interval { .. }, Datum::Interval(_)) => {}
             (
                 ColumnType::Text(_)
                 | ColumnType::Bytes
@@ -515,7 +526,8 @@ fn check(table: &Table, row: &Row) -> Result<()> {
                 | ColumnType::Varbit(_)
                 | ColumnType::Uuid
                 | ColumnType::Float4
-                | ColumnType::Float8,
+                | ColumnType::Float8
+                | ColumnType::Interval { .. },
                 Datum::Int(_),
             )
             | (_, Datum::Text(_))
@@ -523,7 +535,8 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             | (_, Datum::Wide(_))
             | (_, Datum::Float4(_))
             | (_, Datum::Float8(_))
-            | (_, Datum::Compound(_)) => {
+            | (_, Datum::Compound(_))
+            | (_, Datum::Interval(_)) => {
                 return Err(what(format!("{d:?} is not a value of {}", col.ty.name())))
             }
             (_, Datum::Int(_)) => {}
@@ -583,6 +596,7 @@ impl Snail {
             ..Default::default()
         };
         let changed = match st {
+            Statement::Setting { .. } => false,
             Statement::Begin => {
                 if self.begun.is_some() {
                     return Err(Error::new("a transaction is begun already"));
@@ -779,8 +793,11 @@ impl Snail {
                 self.constrained(names, deferred)?;
                 false
             }
-            Statement::Begin | Statement::Commit | Statement::Rollback => {
-                unreachable!("a transaction's own statements write no rows")
+            Statement::Begin
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::Setting { .. } => {
+                unreachable!("a transaction's own statements and a setting write no rows")
             }
         })
     }
@@ -1673,6 +1690,9 @@ impl Snail {
                                 crate::file::holds_nan(self.reader.format(), &table, ci)?;
                             }
                         }
+                        if col.ty.is_timestamptz() && matches!(d, Datum::Int(i64::MAX | i64::MIN)) {
+                            crate::file::instant_ends(self.reader.format(), &table, ci)?;
+                        }
                     }
                 }
                 Change::Delete(_) => {}
@@ -2279,19 +2299,21 @@ impl Snail {
                 + cp.pages.iter().map(|p| p.at.pages()).sum::<u64>())
                 as u32;
             if let Some(mi) = head.month_slots.iter().position(|&x| x as usize == s) {
-                let month = |d: &Datum| match d {
-                    Datum::Int(v) => Some(month_utc(*v) as usize - 1),
-                    _ => None,
+                // A month's count, or an infinite instant's at its end.
+                let count = |d: &Datum, entry: &mut Entry, by: i64| {
+                    if let Datum::Int(v) = d {
+                        let n = match month_of(*v) {
+                            Some(m) => &mut entry.months[mi][m as usize - 1],
+                            None => &mut entry.ends[mi][(*v > 0) as usize],
+                        };
+                        *n = (*n as i64 + by) as u32;
+                    }
                 };
                 for row in &added_leaves {
-                    if let Some(m) = month(&row[s]) {
-                        entry.months[mi][m] += 1;
-                    }
+                    count(&row[s], &mut entry, 1);
                 }
                 for values in &gone_leaves {
-                    if let Some(m) = month(&values[s]) {
-                        entry.months[mi][m] -= 1;
-                    }
+                    count(&values[s], &mut entry, -1);
                 }
             }
             if let Some(t) = head.text_slots.iter().position(|&x| x as usize == s) {

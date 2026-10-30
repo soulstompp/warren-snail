@@ -81,6 +81,25 @@ pub enum ColumnType {
     /// A composed type: an array, a composite or a table's row type, a range or a multirange, or an
     /// enum, its definition held apart.
     Composed(crate::composed::TypeRef),
+    /// A date: days since 1970-01-01, its infinities the ends of 32 bits.
+    Date,
+    /// A time of day: microseconds since midnight, 24:00:00 the last of them, rounded to the
+    /// digits after the second its precision names, where it names one.
+    Time(Option<u8>),
+    /// A time of day and its zone, in seconds west of UTC as PostgreSQL holds it: a group of two
+    /// leaves, compared by the time on the UTC clock, then the zone.
+    Timetz(Option<u8>),
+    /// A timestamp: microseconds since 1970-01-01 on a clock of no zone, its infinities the ends
+    /// of 64 bits.
+    Timestamp(Option<u8>),
+    /// An interval: months, days and microseconds, a group of three leaves, compared by its total
+    /// of 30-day months and 24-hour days; `range` its fields as PostgreSQL's typmod masks them.
+    Interval {
+        range: u16,
+        precision: Option<u8>,
+    },
+    /// A timestamptz rounded to the digits after the second its precision names.
+    TimestamptzRounded(u8),
 }
 
 impl ColumnType {
@@ -104,6 +123,7 @@ impl ColumnType {
             }
             ColumnType::Int8
             | ColumnType::Timestamptz
+            | ColumnType::TimestamptzRounded(_)
             | ColumnType::Numeric { .. }
             | ColumnType::Xid8
             | ColumnType::PgLsn
@@ -117,6 +137,10 @@ impl ColumnType {
             ColumnType::Tid => Some(8),
             // Its bits as a fixed array of bytes, the last padded.
             ColumnType::Bit(n) => Some((n as usize).div_ceil(8)),
+            ColumnType::Date => Some(4),
+            ColumnType::Time(_) | ColumnType::Timestamp(_) => Some(8),
+            ColumnType::Timetz(_) => Some(12),
+            ColumnType::Interval { .. } => Some(16),
             ColumnType::Text(_)
             | ColumnType::Bytes
             | ColumnType::Boolean
@@ -180,7 +204,7 @@ impl ColumnType {
 
     /// Whether its values are keyed in 128 bits.
     pub fn is_wide(self) -> bool {
-        matches!(self, ColumnType::Uuid)
+        matches!(self, ColumnType::Uuid | ColumnType::Interval { .. })
             || matches!(self, ColumnType::Numeric { precision, .. } if precision > 18)
     }
 
@@ -277,6 +301,14 @@ impl ColumnType {
         matches!(self, ColumnType::NumericText(_)) || self.is_string() || self.is_nested()
     }
 
+    /// Whether it is a timestamptz, rounded or not.
+    pub fn is_timestamptz(self) -> bool {
+        matches!(
+            self,
+            ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_)
+        )
+    }
+
     pub fn is_integer(self) -> bool {
         matches!(self, ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
     }
@@ -287,6 +319,7 @@ impl ColumnType {
             ColumnType::Int4 => "integer".into(),
             ColumnType::Int8 => "bigint".into(),
             ColumnType::Timestamptz => "timestamptz".into(),
+            ColumnType::TimestamptzRounded(p) => format!("timestamptz({p})"),
             ColumnType::Text(None) => "text".into(),
             ColumnType::Text(Some(ColumnType::VARCHAR)) => "varchar".into(),
             ColumnType::Text(Some(n)) => format!("varchar({n})"),
@@ -305,6 +338,7 @@ impl ColumnType {
             ColumnType::Int4 => "integer".into(),
             ColumnType::Int8 => "bigint".into(),
             ColumnType::Timestamptz => "timestamp with time zone".into(),
+            ColumnType::TimestamptzRounded(p) => format!("timestamp({p}) with time zone"),
             ColumnType::Text(None) => "text".into(),
             ColumnType::Text(Some(ColumnType::VARCHAR)) => "character varying".into(),
             ColumnType::Text(Some(n)) => format!("character varying({n})"),
@@ -335,6 +369,17 @@ impl ColumnType {
             ColumnType::NumericText(None) => "numeric".into(),
             ColumnType::NumericText(Some((p, s))) => format!("numeric({p},{s})"),
             ColumnType::Composed(r) => r.def().pg_name(),
+            ColumnType::Date => "date".into(),
+            ColumnType::Time(p) => format!("time{} without time zone", precision_of(p)),
+            ColumnType::Timetz(p) => format!("time{} with time zone", precision_of(p)),
+            ColumnType::Timestamp(p) => format!("timestamp{} without time zone", precision_of(p)),
+            ColumnType::Interval { range, precision } => {
+                format!(
+                    "interval{}{}",
+                    interval_fields(range),
+                    precision_of(precision)
+                )
+            }
         }
     }
 
@@ -345,7 +390,7 @@ impl ColumnType {
             ColumnType::Int2 => "int2_ops",
             ColumnType::Int4 => "int4_ops",
             ColumnType::Int8 => "int8_ops",
-            ColumnType::Timestamptz => "timestamptz_ops",
+            ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => "timestamptz_ops",
             ColumnType::Text(_) => "text_ops",
             ColumnType::Bytes => "bytea_ops",
             ColumnType::Numeric { .. } => "numeric_ops",
@@ -371,6 +416,11 @@ impl ColumnType {
             ColumnType::Bit(_) => "bit_ops",
             ColumnType::Varbit(_) => "varbit_ops",
             ColumnType::NumericText(_) => "numeric_ops",
+            ColumnType::Date => "date_ops",
+            ColumnType::Time(_) => "time_ops",
+            ColumnType::Timetz(_) => "timetz_ops",
+            ColumnType::Timestamp(_) => "timestamp_ops",
+            ColumnType::Interval { .. } => "interval_ops",
             ColumnType::Composed(r) => r.def().default_opclass(),
         }
     }
@@ -407,6 +457,15 @@ impl ColumnType {
             ColumnType::Varbit(_) => &[
                 ("length", ColumnType::Int4, 0),
                 ("bits", ColumnType::Bytes, 0),
+            ],
+            ColumnType::Timetz(_) => &[
+                ("time", ColumnType::Time(None), 0),
+                ("zone", ColumnType::Int4, 0),
+            ],
+            ColumnType::Interval { .. } => &[
+                ("months", ColumnType::Int4, 0),
+                ("days", ColumnType::Int4, 0),
+                ("micros", ColumnType::Int8, 0),
             ],
             _ => &[],
         }
@@ -540,7 +599,25 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
                 Int2 | Int4 | Int8 | Numeric { .. },
                 Int2 | Int4 | Int8 | Numeric { .. }
             )
-            | (Timestamptz, Timestamptz)
+            | (
+                Timestamptz | TimestamptzRounded(_),
+                Timestamptz | TimestamptzRounded(_)
+            )
+            | (
+                Date,
+                Date | Timestamp(_) | Timestamptz | TimestamptzRounded(_)
+            )
+            | (
+                Timestamp(_),
+                Date | Time(_) | Timestamp(_) | Timestamptz | TimestamptzRounded(_)
+            )
+            | (
+                Timestamptz | TimestamptzRounded(_),
+                Date | Time(_) | Timetz(_) | Timestamp(_)
+            )
+            | (Time(_), Time(_) | Timetz(_) | Interval { .. })
+            | (Timetz(_), Time(_) | Timetz(_))
+            | (Interval { .. }, Interval { .. } | Time(_))
             | (Bytes, Bytes)
             | (Boolean, Boolean)
             | (Uuid, Uuid)
@@ -1440,6 +1517,28 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Timestamp(None, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             ColumnType::Timestamptz
         }
+        DataType::Timestamp(Some(p), TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
+            ColumnType::TimestamptzRounded((*p).min(6) as u8)
+        }
+        DataType::Timestamp(p, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            ColumnType::Timestamp(time_precision(*p))
+        }
+        DataType::Time(p, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            ColumnType::Time(time_precision(*p))
+        }
+        DataType::Time(p, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
+            ColumnType::Timetz(time_precision(*p))
+        }
+        DataType::Date => ColumnType::Date,
+        DataType::Interval { fields, precision } => ColumnType::Interval {
+            range: match fields {
+                None => crate::times::INTERVAL_FULL_RANGE,
+                Some(f) => crate::times::interval_range(&f.to_string().to_lowercase()).ok_or_else(
+                    || Error::new(format!("{}: no such interval fields", spelled(dt))),
+                )?,
+            },
+            precision: time_precision(*precision),
+        },
         DataType::Text => ColumnType::Text(None),
         DataType::Varchar(length)
         | DataType::CharacterVarying(length)
@@ -1515,6 +1614,15 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                 "tid" => ColumnType::Tid,
                 "bpchar" => ColumnType::Bpchar(None),
                 "name" => ColumnType::Name,
+                "date" => ColumnType::Date,
+                "time" => ColumnType::Time(None),
+                "timetz" => ColumnType::Timetz(None),
+                "timestamp" => ColumnType::Timestamp(None),
+                "timestamptz" => ColumnType::Timestamptz,
+                "interval" => ColumnType::Interval {
+                    range: crate::times::INTERVAL_FULL_RANGE,
+                    precision: None,
+                },
                 other => match crate::regs::RegKind::of_type_name(other) {
                     Some(kind) => ColumnType::Reg(kind, crate::regs::LATEST),
                     None => {
@@ -1588,6 +1696,37 @@ fn type_length(n: u64, name: &str, most: u64) -> Result<u32> {
     Ok(n as u32)
 }
 
+/// The digits after the second a time type's typmod keeps: PostgreSQL takes more than 6 as 6.
+fn time_precision(p: Option<u64>) -> Option<u8> {
+    p.map(|p| p.min(6) as u8)
+}
+
+/// An interval's fields as its name writes them, from PostgreSQL's typmod mask: a field `f`'s bit
+/// is `1 << f`, month 1, year 2, day 3, hour 10, minute 11 and second 12.
+fn interval_fields(range: u16) -> &'static str {
+    let (y, m, d, h, mi, s) = (1 << 2, 1 << 1, 1 << 3, 1 << 10, 1 << 11, 1 << 12);
+    match range {
+        r if r == y => " year",
+        r if r == m => " month",
+        r if r == d => " day",
+        r if r == h => " hour",
+        r if r == mi => " minute",
+        r if r == s => " second",
+        r if r == y | m => " year to month",
+        r if r == d | h => " day to hour",
+        r if r == d | h | mi => " day to minute",
+        r if r == d | h | mi | s => " day to second",
+        r if r == h | mi => " hour to minute",
+        r if r == h | mi | s => " hour to second",
+        r if r == mi | s => " minute to second",
+        _ => "",
+    }
+}
+
+/// A time type's precision as its name writes it.
+fn precision_of(p: Option<u8>) -> String {
+    p.map(|p| format!("({p})")).unwrap_or_default()
+}
 /// A data type as PostgreSQL's `format_type` names it: the held types and the common built-ins by
 /// their canonical names, any other as written, its name folded.
 pub fn format_type(dt: &DataType) -> String {
@@ -1795,7 +1934,7 @@ pub fn shape(
                 )));
             }
             match shape(timestamp, table, alias, columns, functions, env)? {
-                Shape::Column(c) if columns[c].ty == ColumnType::Timestamptz => Ok(Shape::Clock(c)),
+                Shape::Column(c) if columns[c].ty.is_timestamptz() => Ok(Shape::Clock(c)),
                 _ => Err(Error::new(format!(
                     "{timestamp} AT TIME ZONE 'UTC' needs a timestamptz column"
                 ))),
@@ -1838,13 +1977,11 @@ pub fn shape(
             }
             match shape(month, table, alias, columns, functions, env)? {
                 Shape::Clock(c) => Ok(Shape::MonthUtc(c)),
-                Shape::Column(c) if columns[c].ty == ColumnType::Timestamptz => {
-                    Err(Error::new(format!(
-                        "the month of {} needs a clock: extract on a timestamptz is stable, and \
+                Shape::Column(c) if columns[c].ty.is_timestamptz() => Err(Error::new(format!(
+                    "the month of {} needs a clock: extract on a timestamptz is stable, and \
                          PostgreSQL refuses it as an index expression",
-                        columns[c].name
-                    )))
-                }
+                    columns[c].name
+                ))),
                 _ => Err(Error::new(format!(
                     "the month of {month} needs a timestamptz on a clock"
                 ))),
@@ -2062,7 +2199,7 @@ mod tests {
 
     #[test]
     fn a_type_not_held_is_refused() {
-        let e = refused("CREATE TABLE s.t (a date NOT NULL, PRIMARY KEY (a));");
+        let e = refused("CREATE TABLE s.t (a tsquery NOT NULL, PRIMARY KEY (a));");
         assert!(e.contains("is not held"), "{e}");
     }
 

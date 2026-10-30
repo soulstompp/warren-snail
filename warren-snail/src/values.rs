@@ -32,6 +32,8 @@ pub enum Values {
     Composed(Vec<Option<Arc<Compound>>>),
     /// One leaf of a composed column's tree: its levels, and a value an entry of them.
     Nested(Box<Nested>),
+    /// Intervals, as their own fields; each one's key is its total.
+    Interval(Vec<Option<crate::times::Interval>>),
 }
 
 /// The bytes Parquet writes before each plain text value: its length.
@@ -52,6 +54,7 @@ impl Values {
             ColumnType::NumericText(_) => Values::Text(Vec::new()),
             ColumnType::Float4 => Values::Float4(Vec::new()),
             ColumnType::Float8 => Values::Float8(Vec::new()),
+            ColumnType::Interval { .. } => Values::Interval(Vec::new()),
             ty if ty.is_nested() => Values::Composed(Vec::new()),
             _ => Values::Int(Vec::new()),
         }
@@ -66,6 +69,7 @@ impl Values {
             Values::Wide(_) => Values::Wide(Vec::new()),
             Values::Float4(_) => Values::Float4(Vec::new()),
             Values::Float8(_) => Values::Float8(Vec::new()),
+            Values::Interval(_) => Values::Interval(Vec::new()),
             Values::Composed(_) => Values::Composed(Vec::new()),
             Values::Nested(n) => Values::Nested(Box::new(Nested {
                 values: Values::new_like(&n.values),
@@ -86,6 +90,7 @@ impl Values {
             Values::Wide(v) => v.push(None),
             Values::Float4(v) => v.push(None),
             Values::Float8(v) => v.push(None),
+            Values::Interval(v) => v.push(None),
             Values::Composed(v) => v.push(None),
             Values::Nested(_) => panic!("a NULL pushed onto a leaf without its levels"),
         }
@@ -102,6 +107,7 @@ impl Values {
             Values::Float8(v) => v.len(),
             Values::Composed(v) => v.len(),
             Values::Nested(n) => n.rows(),
+            Values::Interval(v) => v.len(),
         }
     }
 
@@ -120,6 +126,7 @@ impl Values {
             Values::Float8(v) => v[i].is_none(),
             Values::Composed(v) => v[i].is_none(),
             Values::Nested(n) => n.defs[n.starts[i] as usize] == 0,
+            Values::Interval(v) => v[i].is_none(),
         }
     }
 
@@ -138,6 +145,7 @@ impl Values {
             | Values::Dict { .. }
             | Values::Wide(_)
             | Values::Composed(_)
+            | Values::Interval(_)
             | Values::Nested(_) => None,
         }
     }
@@ -148,11 +156,20 @@ impl Values {
             Values::Int(v) => v[i].map(i128::from),
             Values::Float4(_) | Values::Float8(_) => self.int(i).map(i128::from),
             Values::Wide(v) => v[i],
+            Values::Interval(v) => v[i].map(crate::times::Interval::total),
             Values::Text(_)
             | Values::Utf8(_)
             | Values::Dict { .. }
             | Values::Composed(_)
             | Values::Nested(_) => None,
+        }
+    }
+
+    /// Row `i`'s own fields, for an interval.
+    pub fn interval(&self, i: usize) -> Option<crate::times::Interval> {
+        match self {
+            Values::Interval(v) => v[i],
+            _ => None,
         }
     }
 
@@ -196,6 +213,7 @@ impl Values {
             | Values::Wide(_)
             | Values::Float4(_)
             | Values::Float8(_)
+            | Values::Interval(_)
             | Values::Nested(_) => None,
         }
     }
@@ -214,6 +232,7 @@ impl Values {
             | Values::Wide(_)
             | Values::Float4(_)
             | Values::Float8(_)
+            | Values::Interval(_)
             | Values::Nested(_) => None,
         }
     }
@@ -236,6 +255,7 @@ impl Values {
             | Values::Float4(_)
             | Values::Float8(_)
             | Values::Composed(_)
+            | Values::Interval(_)
             | Values::Nested(_) => None,
         }
     }
@@ -255,6 +275,7 @@ impl Values {
             Values::Float8(v) => Values::Float8(rows.iter().map(|&r| v[r]).collect()),
             Values::Composed(v) => Values::Composed(rows.iter().map(|&r| v[r].clone()).collect()),
             Values::Nested(n) => Values::Nested(Box::new(n.gather(rows))),
+            Values::Interval(v) => Values::Interval(rows.iter().map(|&r| v[r]).collect()),
         }
     }
 
@@ -274,6 +295,7 @@ impl Values {
             (Values::Float8(a), Values::Float8(b)) => a.push(b[i]),
             (Values::Composed(a), Values::Composed(b)) => a.push(b[i].clone()),
             (Values::Nested(a), Values::Nested(b)) => a.push_from(b, i),
+            (Values::Interval(a), Values::Interval(b)) => a.push(b[i]),
             _ => panic!("a column's values pushed onto another kind"),
         }
     }
@@ -293,6 +315,7 @@ impl Values {
             | Values::Wide(_)
             | Values::Float4(_)
             | Values::Float8(_)
+            | Values::Interval(_)
             | Values::Composed(_) => 0,
         }
     }
@@ -326,6 +349,7 @@ impl Values {
                 | Values::Float4(_)
                 | Values::Float8(_)
                 | Values::Composed(_)
+                | Values::Interval(_)
                 | Values::Nested(_),
                 None,
             ) => 0,
@@ -385,6 +409,22 @@ impl Values {
                     .map(|n| Values::Nested(Box::new(n)))
                     .collect()
             }
+            // A timetz's time and zone, each as it is.
+            (ColumnType::Timetz(_), Values::Int(v)) => {
+                let parts: Vec<Option<(i64, i32)>> = v
+                    .iter()
+                    .map(|k| k.map(crate::scalars::timetz_parts))
+                    .collect();
+                vec![
+                    Values::Int(parts.iter().map(|p| p.map(|(t, _)| t)).collect()),
+                    Values::Int(parts.iter().map(|p| p.map(|(_, z)| i64::from(z))).collect()),
+                ]
+            }
+            (ColumnType::Interval { .. }, Values::Interval(v)) => vec![
+                Values::Int(v.iter().map(|x| x.map(|x| i64::from(x.months))).collect()),
+                Values::Int(v.iter().map(|x| x.map(|x| i64::from(x.days))).collect()),
+                Values::Int(v.iter().map(|x| x.map(|x| x.micros)).collect()),
+            ],
             (_, values) => vec![values],
         }
     }
@@ -428,6 +468,30 @@ impl Values {
                     .collect();
                 Values::Composed(crate::composed::assemble_rows(r, &nested))
             }
+            (ColumnType::Timetz(_), [Values::Int(times), Values::Int(zones)]) => Values::Int(
+                times
+                    .iter()
+                    .zip(zones)
+                    .map(|(t, z)| Some(crate::scalars::timetz_key((*t)?, (*z)? as i32)))
+                    .collect(),
+            ),
+            (
+                ColumnType::Interval { .. },
+                [Values::Int(months), Values::Int(days), Values::Int(micros)],
+            ) => Values::Interval(
+                months
+                    .iter()
+                    .zip(days)
+                    .zip(micros)
+                    .map(|((m, d), u)| {
+                        Some(crate::times::Interval {
+                            months: (*m)? as i32,
+                            days: (*d)? as i32,
+                            micros: (*u)?,
+                        })
+                    })
+                    .collect(),
+            ),
             _ => leaves.into_iter().next().unwrap_or_else(|| Values::new(ty)),
         }
     }
@@ -460,6 +524,7 @@ impl Values {
             | Values::Float4(_)
             | Values::Float8(_)
             | Values::Composed(_)
+            | Values::Interval(_)
             | Values::Nested(_) => 0,
         }
     }

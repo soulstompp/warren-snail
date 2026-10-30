@@ -48,6 +48,9 @@ pub struct Entry {
     pub columns: Vec<Summary>,
     /// The rows on each month, January first, for each of the order's month columns.
     pub months: Vec<[u32; 12]>,
+    /// The rows at `-infinity` and at `infinity`, for each of the order's month columns: an
+    /// infinite instant has no month.
+    pub ends: Vec<[u32; 2]>,
     /// The bytes of the text present, as PostgreSQL's `octet_length` counts them, for each of the
     /// order's text columns.
     pub bytes: Vec<u32>,
@@ -90,13 +93,27 @@ fn add(a: u32, b: u32) -> Result<u32> {
         .ok_or_else(|| Error::new("a directory entry counts more than its counts hold"))
 }
 
+/// The top bit of an entry's depth, set where its month columns hold an infinite instant: their
+/// counts at each end follow their months. An entry holding none is written as format 8 writes it.
+const ENTRY_ENDS: u32 = 1 << 31;
+
 impl Entry {
+    /// Whether any of its month columns holds an infinite instant.
+    fn has_ends(&self) -> bool {
+        self.ends.iter().any(|e| e[0] > 0 || e[1] > 0)
+    }
+
     /// The bytes the entry takes in its page.
     pub fn size(&self) -> usize {
         36 + keys_len(&self.first)
             + keys_len(&self.last)
             + self.columns.iter().map(Summary::size).sum::<usize>()
             + 48 * self.months.len()
+            + if self.has_ends() {
+                8 * self.ends.len()
+            } else {
+                0
+            }
             + 4 * self.bytes.len()
     }
 
@@ -121,6 +138,7 @@ impl Entry {
                 })
                 .collect(),
             months: vec![[0u32; 12]; first.months.len()],
+            ends: vec![[0u32; 2]; first.months.len()],
             bytes: vec![0u32; first.bytes.len()],
             child,
         };
@@ -148,6 +166,11 @@ impl Entry {
                     e.months[m][i] = add(e.months[m][i], n)?;
                 }
             }
+            for (m, ends) in x.ends.iter().enumerate() {
+                for (i, &n) in ends.iter().enumerate() {
+                    e.ends[m][i] = add(e.ends[m][i], n)?;
+                }
+            }
             for (t, &n) in x.bytes.iter().enumerate() {
                 e.bytes[t] = add(e.bytes[t], n)?;
             }
@@ -156,7 +179,8 @@ impl Entry {
     }
 
     fn encode(&self, o: &mut Out) {
-        o.u32(self.depth);
+        let ends = self.has_ends();
+        o.u32(self.depth | if ends { ENTRY_ENDS } else { 0 });
         o.u32(self.rows);
         o.u32(self.dead);
         keys_out(o, &self.first);
@@ -177,6 +201,12 @@ impl Entry {
                 o.u32(n);
             }
         }
+        if ends {
+            for e in &self.ends {
+                o.u32(e[0]);
+                o.u32(e[1]);
+            }
+        }
         for &n in &self.bytes {
             o.u32(n);
         }
@@ -185,6 +215,7 @@ impl Entry {
 
     fn decode(i: &mut In, head: &Head) -> Result<Entry> {
         let depth = i.u32()?;
+        let (depth, ends) = (depth & !ENTRY_ENDS, depth & ENTRY_ENDS != 0);
         let rows = i.u32()?;
         let dead = i.u32()?;
         let first = keys_in(i, &head.level_text)?;
@@ -214,6 +245,12 @@ impl Entry {
             }
             months.push(m);
         }
+        let mut at_ends = vec![[0u32; 2]; head.month_slots.len()];
+        if ends {
+            for e in at_ends.iter_mut() {
+                *e = [i.u32()?, i.u32()?];
+            }
+        }
         let bytes = (0..head.text_slots.len())
             .map(|_| i.u32())
             .collect::<Result<Vec<_>>>()?;
@@ -226,6 +263,7 @@ impl Entry {
             last,
             columns,
             months,
+            ends: at_ends,
             bytes,
             child,
         })
@@ -713,6 +751,7 @@ mod tests {
                 },
             ],
             months: vec![[rows, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
+            ends: vec![[0, 0]],
             bytes: vec![10 * rows],
             child: Extent {
                 start: child,
@@ -802,6 +841,7 @@ mod tests {
                 },
             ],
             months: vec![],
+            ends: vec![],
             bytes: vec![],
             child: Extent {
                 start: 7,

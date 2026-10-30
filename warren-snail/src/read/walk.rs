@@ -8,7 +8,7 @@ use crate::catalog::{ColumnType, Level, Order, Shape, Table};
 use crate::directory::{decode_page, decode_top, Entry, Head, PageMap, Summary};
 use crate::encode::decode_leaf_with;
 use crate::file::Extent;
-use crate::places::{key, month_of, null_key, wide_cmp, KeyValue};
+use crate::places::{level_key, month_of, null_key, wide_cmp, KeyValue};
 use crate::values::Values;
 use crate::{Error, Result};
 use std::cmp::Ordering;
@@ -763,7 +763,7 @@ impl Snail {
                 // How a row's fixed levels compare with a bound, level by level, a NULL lying on its
                 // level's side.
                 let against = |r: usize, bound: &[KeyValue]| -> Ordering {
-                    for (li, ((l, ty, start, v), b)) in levels.iter().zip(bound).enumerate() {
+                    for (li, ((_, ty, start, v), b)) in levels.iter().zip(bound).enumerate() {
                         let null = KeyValue::Null {
                             first: order.nulls_first[li],
                         };
@@ -790,8 +790,8 @@ impl Snail {
                             }
                             (false, KeyValue::Int(x)) => v
                                 .int(r - start)
-                                .map_or(i64::MIN, |y| key(*l, y).int())
-                                .cmp(x),
+                                .map_or(KeyValue::Int(i64::MIN), |y| level_key(order, li, y))
+                                .cmp(&KeyValue::Int(*x)),
                             (false, KeyValue::Wide(x)) => {
                                 v.wide(r - start).unwrap_or(i128::MIN).cmp(x)
                             }
@@ -881,6 +881,10 @@ impl Snail {
                                 v.text_value(i).map_or(Cell::Null, |t| Cell::Text(Text(t)))
                             } else if month {
                                 v.int(i).and_then(month_of).map_or(Cell::Null, Cell::Int)
+                            } else if let Values::Interval(x) = v {
+                                x[i].map_or(Cell::Null, |x| {
+                                    Cell::Interval(crate::read::answer::Lapse(x))
+                                })
                             } else if let Values::Wide(w) = v {
                                 w[i].map_or(Cell::Null, Cell::Wide)
                             } else if let (Some(key), Some(bits)) = (v.int(i), v.bits(i)) {
@@ -1114,6 +1118,10 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
                     },
                     _ => None,
                 };
+                // Every row by its month only where no instant is infinite, whose month is NULL.
+                let ends = |mi: usize| e.ends[mi].iter().map(|&n| n as u64).sum::<u64>();
+                let months = months
+                    .filter(|&(a, z)| (a, z) != (1, 12) || mi.is_some_and(|mi| ends(mi) == 0));
                 if let (Some(mi), Some((a, z)), 0) = (mi, months, e.columns[slot].nulls) {
                     for m in a..=z {
                         let n = e.months[mi][m as usize - 1] as u64;
@@ -1253,6 +1261,16 @@ fn rest_status(
         // A test that keeps the column's NULLs takes them from the counts; `<>` passes over a value
         // the column's least and greatest leave out, and keeps none where both are that value.
         let nulls = if c.nulls { sum.nulls as u64 } else { 0 };
+        // An infinite instant's month is NULL too.
+        let nulls = nulls
+            + match (c.nulls, c.shape) {
+                (true, Shape::MonthUtc(_)) => head
+                    .month_slots
+                    .iter()
+                    .position(|&x| x as usize == slot)
+                    .map_or(0, |mi| b.ends[mi].iter().map(|&n| n as u64).sum()),
+                _ => 0,
+            };
         let values = match c.shape {
             Shape::MonthUtc(_) => head
                 .month_slots
@@ -1478,6 +1496,7 @@ mod tests {
                 Summary::default(),
             ],
             months: vec![months],
+            ends: vec![[0, 0]],
             bytes: vec![],
             child: Extent::default(),
         };
@@ -1516,6 +1535,7 @@ mod tests {
                 ..Default::default()
             }],
             months: vec![],
+            ends: vec![],
             bytes: vec![],
             child: Extent::default(),
         };
@@ -1550,6 +1570,7 @@ mod tests {
                 ..Default::default()
             }],
             months: vec![],
+            ends: vec![],
             bytes: vec![],
             child: Extent::default(),
         };

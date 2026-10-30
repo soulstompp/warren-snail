@@ -721,7 +721,7 @@ fn a_join_keeps_each_side_to_the_keys_the_other_holds() {
 }
 
 #[test]
-fn an_infinite_instant_is_carried_and_refused_only_on_a_level() {
+fn an_infinite_instant_is_carried_on_a_level_and_counted_at_its_end_beside_the_months() {
     let catalog = Catalog::parse(DDL).unwrap();
     let path = tmp("infinite.snail");
     let mut s = sample(3000);
@@ -752,26 +752,59 @@ fn an_infinite_instant_is_carried_and_refused_only_on_a_level() {
         assert_eq!(snail.ask(&q, None).unwrap().0.num_rows(), 0, "{q}");
     }
 
-    // Where the month's index counts its months, an infinite instant is refused.
+    // Where the month's index counts its months, an infinite instant is counted at its end, in no
+    // month: its month lies on the level's NULL run.
     s.observed_at[5] = i64::MAX;
+    s.observed_at[6] = i64::MIN;
     let _ = std::fs::remove_file(&path);
-    let e = write(&path, &catalog, &tables(&s)).unwrap_err().to_string();
-    assert!(
-        e.contains("observed_at holds an infinite instant, whose month cannot be counted"),
-        "{e}"
-    );
-
-    // Keyed on an instant whose months nothing counts, the level itself refuses it.
+    write(&path, &catalog, &tables(&s)).unwrap();
+    let mut snail = Snail::open(&path).unwrap();
+    let month = "extract(month FROM weather.clock(r.observed_at))::smallint";
+    let q = format!("SELECT {month} AS m, count(*) FROM weather.readings r GROUP BY {month}");
+    let (b, _) = snail.ask(&q, None).unwrap();
+    let months = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int16Array>()
+        .unwrap();
+    let counts = b
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let nulls: Vec<i64> = (0..b.num_rows())
+        .filter(|&r| arrow::array::Array::is_null(months, r))
+        .map(|r| counts.value(r))
+        .collect();
+    assert_eq!(nulls, [2], "{q}");
+    let total: i64 = (0..b.num_rows()).map(|r| counts.value(r)).sum();
+    assert_eq!(total, 3000);
+    // Keyed on an instant, the infinities are places at the ends of the level.
     let keyed =
         Catalog::parse("CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));").unwrap();
     let _ = std::fs::remove_file(&path);
     let rows = Rows {
-        columns: vec![Values::Int(vec![Some(0), Some(i64::MAX)])],
+        columns: vec![Values::Int(vec![
+            Some(0),
+            Some(i64::MAX),
+            Some(i64::MIN),
+            Some(-1),
+        ])],
     };
-    let e = write(&path, &keyed, &[("s.t".into(), rows)])
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("which a level of t_pkey cannot place"), "{e}");
+    write(&path, &keyed, &[("s.t".into(), rows)]).unwrap();
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, _) = snail.ask("SELECT at FROM s.t ORDER BY at", None).unwrap();
+    assert_eq!(
+        timestamps(b.column(0).as_ref()),
+        [Some(i64::MIN), Some(-1), Some(0), Some(i64::MAX)]
+    );
+    let (b, _) = snail
+        .ask(
+            "SELECT at FROM s.t WHERE at > '1970-01-01 00:00:00+00' ORDER BY at",
+            None,
+        )
+        .unwrap();
+    assert_eq!(timestamps(b.column(0).as_ref()), [Some(i64::MAX)]);
 }
 
 #[test]

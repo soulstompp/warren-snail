@@ -18,7 +18,9 @@ pub mod read;
 pub mod regs;
 pub mod scalars;
 pub mod strings;
+pub mod times;
 pub mod values;
 pub mod write;
+pub mod zones;
 
 pub use error::{Error, Result};

@@ -29,6 +29,8 @@ pub enum Datum {
     Float8(u64),
     /// A value of a composed type, held whole.
     Compound(std::sync::Arc<crate::composed::Compound>),
+    /// An interval, as its own fields.
+    Interval(crate::times::Interval),
 }
 
 impl Datum {
@@ -108,6 +110,10 @@ pub enum Statement {
         names: Option<Vec<String>>,
         deferred: bool,
     },
+    /// A setting set to the value the snail answers under, which changes nothing: its name.
+    Setting {
+        name: String,
+    },
 }
 
 impl Statement {
@@ -122,6 +128,7 @@ impl Statement {
             Statement::Declare { kind, .. } => kind,
             Statement::Set { .. } => "UPDATE",
             Statement::Constraints { .. } => "SET CONSTRAINTS",
+            Statement::Setting { .. } => "SET",
         }
     }
 }
@@ -283,6 +290,16 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             Datum::Int(v)
         }
         ColumnType::Timestamptz => Datum::Int(instant(&text_literal(e).map_err(|_| wrong())?)?),
+        ColumnType::TimestamptzRounded(p) => Datum::Int(crate::times::timestamptz_in(
+            &text_literal(e).map_err(|_| wrong())?,
+            Some(u32::from(p)),
+            crate::scalars::wall_clock(),
+        )?),
+        ColumnType::Interval { range, precision } => Datum::Interval(crate::times::interval_in(
+            &text_literal(e).map_err(|_| wrong())?,
+            range,
+            precision.map(u32::from),
+        )?),
         ColumnType::Uuid => Datum::Wide(crate::scalars::uuid_parse(
             &text_literal(e).map_err(|_| wrong())?,
         )?),
@@ -310,7 +327,11 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
         | ColumnType::Money
         | ColumnType::Macaddr
         | ColumnType::Macaddr8
-        | ColumnType::Tid) => match text_literal(e) {
+        | ColumnType::Tid
+        | ColumnType::Date
+        | ColumnType::Time(_)
+        | ColumnType::Timetz(_)
+        | ColumnType::Timestamp(_)) => match text_literal(e) {
             Ok(s) => Datum::Int(crate::scalars::scalar_parse(ty, &s)?),
             Err(_) => {
                 let (d, from) = number_datum(e).ok_or_else(wrong)?;
@@ -593,10 +614,90 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         }
         Sql::Query(_) => Err(Error::new("a SELECT is a question: ask it")),
         Sql::Truncate { .. } => Err(refused("TRUNCATE")),
+        Sql::Set(sqlparser::ast::Set::SingleAssignment {
+            variable, values, ..
+        }) => setting(&object_name(variable), values),
+        Sql::Set(sqlparser::ast::Set::SetTimeZone { value, .. }) => {
+            setting("timezone", std::slice::from_ref(value))
+        }
         other => Err(Error::new(format!(
             "{other} is not a statement the snail writes"
         ))),
     }
+}
+
+/// The settings the snail answers under, each its name as PostgreSQL's SET takes it and its
+/// value: what PostgreSQL's side of a certificate runs under too.
+pub const SETTINGS: [(&str, &str); 9] = [
+    ("timezone", "UTC"),
+    ("datestyle", "ISO, MDY"),
+    ("intervalstyle", "postgres"),
+    ("extra_float_digits", "1"),
+    ("bytea_output", "hex"),
+    ("standard_conforming_strings", "on"),
+    ("lc_monetary", "C"),
+    ("lc_numeric", "C"),
+    ("lc_time", "C"),
+];
+
+/// A SET of `name` to `values`: taken, changing nothing, where it sets the value the snail answers
+/// under, and refused by name where it sets another or a setting the snail does not read.
+fn setting(name: &str, values: &[Expr]) -> Result<Statement> {
+    let name = name.to_lowercase();
+    let Some(&(_, fixed)) = SETTINGS.iter().find(|(n, _)| *n == name) else {
+        return Err(Error::new(format!(
+            "SET {name} is not read: the snail answers under fixed settings"
+        )));
+    };
+    // Each value as SET reads it: a word, a quoted text or a number.
+    let words: Vec<String> = values
+        .iter()
+        .map(|v| match v {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) | Value::Number(s, _) => s.clone(),
+                Value::Boolean(b) => b.to_string(),
+                other => other.to_string(),
+            },
+            Expr::Identifier(i) => i.value.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+    let joined = words.join(", ");
+    let same = match name.as_str() {
+        "datestyle" => {
+            // Each part of a DateStyle sets its output or its order of fields, as PostgreSQL's
+            // check_datestyle reads it; the parts it does not name keep the fixed ones.
+            let (mut style, mut order) = ("iso", "mdy");
+            let mut known = true;
+            for part in joined.split(',').map(|p| p.trim().to_lowercase()) {
+                match part.as_str() {
+                    "iso" | "sql" | "postgres" | "german" => {
+                        style = if part == "iso" { "iso" } else { "other" }
+                    }
+                    "ymd" | "dmy" | "euro" | "european" => order = "other",
+                    "mdy" | "us" | "noneuro" | "noneuropean" | "default" => {}
+                    _ => known = false,
+                }
+            }
+            known && style == "iso" && order == "mdy"
+        }
+        "standard_conforming_strings" => {
+            matches!(
+                joined.to_lowercase().as_str(),
+                "on" | "true" | "yes" | "1" | "default"
+            )
+        }
+        "lc_monetary" | "lc_numeric" | "lc_time" => {
+            matches!(joined.as_str(), "C" | "POSIX") || joined.eq_ignore_ascii_case("default")
+        }
+        _ => joined.eq_ignore_ascii_case(fixed) || joined.eq_ignore_ascii_case("default"),
+    };
+    if !same {
+        return Err(Error::new(format!(
+            "SET {name} to {joined} is refused: the snail answers under {name} {fixed}"
+        )));
+    }
+    Ok(Statement::Setting { name })
 }
 
 #[cfg(test)]

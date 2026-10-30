@@ -319,6 +319,7 @@ fn scalar_key(out: &mut Vec<u8>, ty: ColumnType, d: &Datum) {
         Datum::Float8(b) => key64(out, crate::scalars::float8_key(*b)),
         Datum::Text(s) => ended(out, &crate::strings::key_bytes(ty, s.as_bytes())),
         Datum::Bytes(b) => ended(out, b),
+        Datum::Interval(v) => key128(out, v.total()),
         Datum::Compound(c) => out.extend_from_slice(&c.key),
         Datum::Null => {
             debug_assert!(false, "a NULL of {} keyed", ty.pg_name());
@@ -561,6 +562,13 @@ pub fn scalar_in(ty: ColumnType, s: &str) -> Result<Datum> {
             }
             _ => Datum::Compound(Arc::new(Compound::new(ty, text_in(ty, s)?))),
         },
+        // A time type held as a group of leaves waits on composed values of such leaves.
+        ColumnType::Timetz(_) | ColumnType::Interval { .. } => {
+            return Err(Error::new(format!(
+                "{} is not read as a part of a composed value: it is held as a group of leaves",
+                ty.pg_name()
+            )))
+        }
         ty if crate::scalars::is_scalar(ty) => Datum::Int(crate::scalars::scalar_parse(ty, s)?),
         other => {
             return Err(Error::new(format!(

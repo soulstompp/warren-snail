@@ -161,6 +161,29 @@ pub(crate) fn keys_null(
     )))
 }
 
+/// Refuses an infinite instant in column `column` of `table` in a snail of `format` where a level
+/// of an order holds the column or its month: no key of formats 7 and 8 holds one, nor their twelve
+/// counts of a month.
+pub(crate) fn instant_ends(
+    format: u32,
+    table: &crate::catalog::Table,
+    column: usize,
+) -> crate::Result<()> {
+    if format >= FORMAT
+        || !table
+            .orders
+            .iter()
+            .any(|o| o.levels.iter().any(|l| l.column() == column))
+    {
+        return Ok(());
+    }
+    Err(crate::Error::new(format!(
+        "{}.{} holds an infinite instant on a level, which a snail of format {format} cannot hold: \
+         put the snail `out` and `write` it afresh, in format {FORMAT}",
+        table.name, table.columns[column].name
+    )))
+}
+
 /// The pages a file holds before the next begins, unless the snail is made with another span: 1 GiB.
 pub const FILE_PAGES: u64 = 1 << 18;
 

@@ -291,21 +291,10 @@ pub fn number(e: &Expr) -> Option<i64> {
     }
 }
 
-/// An instant written with its offset from UTC, as microseconds since 1970-01-01 UTC.
+/// An instant as PostgreSQL's timestamptz input reads it under TimeZone UTC, as microseconds since
+/// 1970-01-01 UTC.
 pub fn instant(s: &str) -> Result<i64> {
-    for f in [
-        "%Y-%m-%d %H:%M:%S%.f%#z",
-        "%Y-%m-%d %H:%M:%S%#z",
-        "%Y-%m-%dT%H:%M:%S%.f%#z",
-        "%Y-%m-%dT%H:%M:%S%#z",
-    ] {
-        if let Ok(t) = chrono::DateTime::parse_from_str(s, f) {
-            return Ok(t.timestamp_micros());
-        }
-    }
-    Err(Error::new(format!(
-        "'{s}' is not an instant with its offset from UTC"
-    )))
+    crate::times::timestamptz_in(s, None, crate::scalars::wall_clock())
 }
 
 /// A truth as PostgreSQL's boolean input reads it: `true`, `yes`, `on` or `1`, `false`, `no`, `off`
@@ -351,8 +340,30 @@ fn literal(e: &Expr, s: Shape, table: &Table) -> Result<i128> {
             Shape::Column(c) if table.columns[c].ty == ColumnType::Uuid => {
                 crate::scalars::uuid_parse(&text_literal(e)?)
             }
+            Shape::Column(c) => match table.columns[c].ty {
+                // An interval is compared by its total, a literal read as the column's type reads it.
+                // Read as an interval of every field, whatever fields the column keeps.
+                ColumnType::Interval { .. } => Ok(crate::times::interval_in(
+                    &text_literal(uncast_to(e, "interval")).map_err(|_| err)?,
+                    crate::times::INTERVAL_FULL_RANGE,
+                    None,
+                )?
+                .total()),
+                _ => Err(err),
+            },
             _ => Err(err),
         })
+}
+
+/// A literal as written, its cast to the type named taken off.
+fn uncast_to<'e>(e: &'e Expr, name: &str) -> &'e Expr {
+    match e {
+        Expr::Cast {
+            expr, data_type, ..
+        } if data_type.to_string().to_lowercase().starts_with(name) => expr,
+        Expr::Nested(x) => uncast_to(x, name),
+        e => e,
+    }
 }
 
 fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
@@ -384,7 +395,8 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
                     ty.pg_name()
                 ))),
             },
-            ColumnType::Timestamptz => {
+            ColumnType::Interval { .. } => Err(Error::new(format!("{e} is not an interval"))),
+            ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => {
                 instant(&text_literal(e).map_err(|_| Error::new(format!("{e} is not an instant")))?)
             }
             // An integer: a number written out, or a quoted literal its input reads.
@@ -446,9 +458,16 @@ fn scalar_literal(e: &Expr, ty: ColumnType, release: u8) -> Result<i64> {
             }
         }
     }
-    // A quoted literal beside a reg* type is read as an oid, whose comparisons it takes.
+    // A quoted literal beside a reg* type is read as an oid, whose comparisons it takes; beside a
+    // time type, as that type without the column's precision.
     if let Ok(s) = text_literal(e) {
-        let ty = if ty.is_oid() { ColumnType::Oid } else { ty };
+        let ty = match ty {
+            ty if ty.is_oid() => ColumnType::Oid,
+            ColumnType::Time(_) => ColumnType::Time(None),
+            ColumnType::Timetz(_) => ColumnType::Timetz(None),
+            ColumnType::Timestamp(_) => ColumnType::Timestamp(None),
+            ty => ty,
+        };
         return crate::scalars::scalar_parse(ty, &s);
     }
     let n = match super::statement::number_datum(e) {
@@ -488,23 +507,9 @@ fn scalar_literal(e: &Expr, ty: ColumnType, release: u8) -> Result<i64> {
 }
 
 /// A time on the UTC clock, as microseconds since 1970-01-01 UTC: what a column at time zone 'UTC' is
-/// compared with.
+/// compared with, read as PostgreSQL's timestamp input reads it.
 fn clock_literal(e: &Expr) -> Result<i64> {
-    let s = text_literal(e)?;
-    for f in [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-    ] {
-        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(&s, f) {
-            return Ok(t.and_utc().timestamp_micros());
-        }
-    }
-    match chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
-        Ok(d) => Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros()),
-        Err(_) => Err(Error::new(format!("'{s}' is not a time on the clock"))),
-    }
+    crate::times::timestamp_in(&text_literal(e)?, None, crate::scalars::wall_clock())
 }
 
 /// A literal compared with a column of a string type, bytea or a bit string, read by the type's
@@ -731,6 +736,8 @@ impl From<'_> {
                             | ColumnType::Money
                             | ColumnType::Float4
                             | ColumnType::Float8
+                            | ColumnType::Interval { .. }
+                            | ColumnType::Time(_)
                     ) =>
                 {
                     Ok(Some(Item::Sum(Col { side, column })))
@@ -740,7 +747,15 @@ impl From<'_> {
                 ))),
             },
             ("avg", [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))]) => match self.resolve(x)? {
-                (side, Shape::Column(column)) if matches!(self.table(side).columns[column].ty, ty if ty.is_float() || ty.is_integer() || ty.is_numeric()) => {
+                // A float's, an integer's or a numeric's; an interval's, and a time's through its cast
+                // to one.
+                (side, Shape::Column(column))
+                    if matches!(self.table(side).columns[column].ty, ty if ty.is_float() || ty.is_integer() || ty.is_numeric())
+                        || matches!(
+                            self.table(side).columns[column].ty,
+                            ColumnType::Interval { .. } | ColumnType::Time(_)
+                        ) =>
+                {
                     Ok(Some(Item::Avg(Col { side, column })))
                 }
                 (side, Shape::Column(column)) => Err(Error::new(format!(
@@ -763,6 +778,7 @@ impl From<'_> {
                     | ColumnType::Numeric { .. }
                     | ColumnType::NumericText(_)
                     | ColumnType::Timestamptz
+                    | ColumnType::TimestamptzRounded(_)
                     | ColumnType::Oid
                     | ColumnType::Reg(..)
                     | ColumnType::Oid8
@@ -776,6 +792,11 @@ impl From<'_> {
                     | ColumnType::Text(_)
                     | ColumnType::Bpchar(_)
                     | ColumnType::Name
+                    | ColumnType::Date
+                    | ColumnType::Time(_)
+                    | ColumnType::Timetz(_)
+                    | ColumnType::Timestamp(_)
+                    | ColumnType::Interval { .. }
                     | ColumnType::Bytes => Ok(Some(if name == "min" {
                         Item::Least(col)
                     } else {
@@ -1081,11 +1102,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             let (x, y) = if a == 0 { (x, y) } else { (y, x) };
             for (side, c) in [(0, x), (1, y)] {
                 let ty = from.table(side).columns[c].ty;
-                if ty.is_byte_array()
-                    || ty.is_bits()
-                    || ty.is_nested()
-                    || ty == ColumnType::Timestamptz
-                {
+                if ty.is_byte_array() || ty.is_bits() || ty.is_nested() || ty.is_timestamptz() {
                     return Err(Error::new(format!(
                         "{p}: a join on {} is not read",
                         ty.name()

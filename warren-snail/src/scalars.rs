@@ -1112,6 +1112,37 @@ pub fn float4_between(c: f64) -> Option<(i64, i64)> {
     Some((float4_key(below.to_bits()), float4_key(above.to_bits())))
 }
 
+/// The bits a timetz's zone takes below its time in its key, the zone counted from the least.
+const ZONE_BITS: u32 = 17;
+
+/// A timetz's key: its time on the UTC clock, then its zone in seconds west of UTC, so that it
+/// sorts as PostgreSQL compares a timetz.
+pub fn timetz_key(time: i64, zone: i32) -> i64 {
+    let zone = i64::from(zone);
+    ((time + zone * 1_000_000) << ZONE_BITS) | (zone + (1 << (ZONE_BITS - 1)))
+}
+
+/// A timetz's time and zone, from its key.
+pub fn timetz_parts(key: i64) -> (i64, i32) {
+    let (utc, zone) = timetz_utc(key);
+    let zone = zone - (1 << (ZONE_BITS - 1));
+    (utc - zone * 1_000_000, zone as i32)
+}
+
+/// A timetz's time on the UTC clock and its zone counted from the least, from its key.
+pub fn timetz_utc(key: i64) -> (i64, i64) {
+    (key >> ZONE_BITS, key & ((1 << ZONE_BITS) - 1))
+}
+
+/// The machine's clock now, in microseconds since 1970 UTC: what `now` and `today` read in a
+/// literal.
+pub fn wall_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 /// A key of a type keyed as a number as PostgreSQL's output function writes the value.
 pub fn scalar_text(ty: ColumnType, key: i64) -> String {
     match ty {
@@ -1129,6 +1160,16 @@ pub fn scalar_text(ty: ColumnType, key: i64) -> String {
         ColumnType::Macaddr => mac_out(unsigned_of(key, 48), 6),
         ColumnType::Macaddr8 => mac_out(unsigned_of(key, 64), 8),
         ColumnType::Tid => tid_out(key),
+        ColumnType::Date => crate::times::date_out(key as i32),
+        ColumnType::Time(_) => crate::times::time_out(key),
+        ColumnType::Timestamp(_) => crate::times::timestamp_out(key),
+        ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => {
+            crate::times::timestamptz_out(key)
+        }
+        ColumnType::Timetz(_) => {
+            let (t, z) = timetz_parts(key);
+            crate::times::timetz_out(t, z)
+        }
         _ => key.to_string(),
     }
 }
@@ -1154,6 +1195,17 @@ pub fn scalar_parse(ty: ColumnType, s: &str) -> Result<i64> {
         ColumnType::Macaddr => unsigned_key(mac_in(s)?, 48),
         ColumnType::Macaddr8 => unsigned_key(mac8_in(s)?, 64),
         ColumnType::Tid => tid_in(s)?,
+        ColumnType::Date => i64::from(crate::times::date_in(s, wall_clock())?),
+        ColumnType::Time(p) => crate::times::time_in(s, p.map(u32::from), wall_clock())?,
+        ColumnType::Timestamp(p) => crate::times::timestamp_in(s, p.map(u32::from), wall_clock())?,
+        ColumnType::Timestamptz => crate::times::timestamptz_in(s, None, wall_clock())?,
+        ColumnType::TimestamptzRounded(p) => {
+            crate::times::timestamptz_in(s, Some(u32::from(p)), wall_clock())?
+        }
+        ColumnType::Timetz(p) => {
+            let (t, z) = crate::times::timetz_in(s, p.map(u32::from), wall_clock())?;
+            timetz_key(t, z)
+        }
         other => {
             return Err(Error::new(format!(
                 "{} is not read as a scalar",
@@ -1180,12 +1232,95 @@ fn tid_fields() -> arrow::datatypes::Fields {
     ]
     .into()
 }
+/// A timetz's two leaves as arrow's Parquet reader gives them: its time and its zone.
+fn timetz_fields() -> arrow::datatypes::Fields {
+    use arrow::datatypes::{DataType as A, Field, TimeUnit};
+    vec![
+        Field::new("time", A::Time64(TimeUnit::Microsecond), false),
+        Field::new("zone", A::Int32, false),
+    ]
+    .into()
+}
+
+/// An interval's three leaves as arrow's Parquet reader gives them.
+fn interval_fields() -> arrow::datatypes::Fields {
+    use arrow::datatypes::{DataType as A, Field};
+    vec![
+        Field::new("months", A::Int32, false),
+        Field::new("days", A::Int32, false),
+        Field::new("micros", A::Int64, false),
+    ]
+    .into()
+}
+
+/// A column of intervals as an answer holds it: a struct of its three leaves.
+pub fn interval_array(
+    values: impl Iterator<Item = Option<crate::times::Interval>>,
+) -> arrow::array::ArrayRef {
+    use arrow::array::{Int32Array, Int64Array, StructArray};
+    use std::sync::Arc;
+    let values: Vec<Option<crate::times::Interval>> = values.collect();
+    let at = |f: fn(&crate::times::Interval) -> i64| -> Vec<i64> {
+        values.iter().map(|v| v.as_ref().map_or(0, f)).collect()
+    };
+    let months: Int32Array = at(|v| v.months.into())
+        .into_iter()
+        .map(|x| x as i32)
+        .collect();
+    let days: Int32Array = at(|v| v.days.into())
+        .into_iter()
+        .map(|x| x as i32)
+        .collect();
+    let micros: Int64Array = at(|v| v.micros).into_iter().collect();
+    Arc::new(
+        StructArray::try_new(
+            interval_fields(),
+            vec![Arc::new(months), Arc::new(days), Arc::new(micros)],
+            Some(values.iter().map(Option::is_some).collect()),
+        )
+        .expect("an interval takes its three leaves"),
+    )
+}
+
+/// Row `r`'s interval in a column an answer holds; none for a NULL.
+pub fn interval_at(a: &dyn arrow::array::Array, r: usize) -> Option<crate::times::Interval> {
+    use arrow::array::{Int32Array, Int64Array, StructArray};
+    if a.is_null(r) {
+        return None;
+    }
+    let s = a.as_any().downcast_ref::<StructArray>()?;
+    let i32_of = |n: &str| {
+        s.column_by_name(n)?
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|x| x.value(r))
+    };
+    Some(crate::times::Interval {
+        months: i32_of("months")?,
+        days: i32_of("days")?,
+        micros: s
+            .column_by_name("micros")?
+            .as_any()
+            .downcast_ref::<Int64Array>()?
+            .value(r),
+    })
+}
+
 /// The Arrow type an answer holds a scalar of type `ty` as: what arrow's Parquet reader gives its
 /// page form.
 pub fn scalar_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
-    use arrow::datatypes::DataType as A;
-    if ty == ColumnType::Tid {
-        return A::Struct(tid_fields());
+    use arrow::datatypes::{DataType as A, TimeUnit};
+    match ty {
+        ColumnType::Tid => return A::Struct(tid_fields()),
+        ColumnType::Timetz(_) => return A::Struct(timetz_fields()),
+        ColumnType::Interval { .. } => return A::Struct(interval_fields()),
+        ColumnType::Date => return A::Date32,
+        ColumnType::Time(_) => return A::Time64(TimeUnit::Microsecond),
+        ColumnType::Timestamp(_) => return A::Timestamp(TimeUnit::Microsecond, None),
+        ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => {
+            return A::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
+        _ => {}
     }
     if let Some(n) = ty.fixed_bytes() {
         return A::FixedSizeBinary(n as i32);
@@ -1205,6 +1340,42 @@ pub fn scalar_array(
 ) -> arrow::array::ArrayRef {
     use arrow::array::{FixedSizeBinaryArray, Int64Array, UInt32Array, UInt64Array, UInt8Array};
     use std::sync::Arc;
+    match ty {
+        ColumnType::Date => {
+            return Arc::new(
+                keys.map(|k| k.map(|k| k as i32))
+                    .collect::<arrow::array::Date32Array>(),
+            )
+        }
+        ColumnType::Time(_) => {
+            return Arc::new(keys.collect::<arrow::array::Time64MicrosecondArray>())
+        }
+        ColumnType::Timestamp(_) => {
+            return Arc::new(keys.collect::<arrow::array::TimestampMicrosecondArray>())
+        }
+        ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => {
+            return Arc::new(
+                keys.collect::<arrow::array::TimestampMicrosecondArray>()
+                    .with_timezone("UTC"),
+            )
+        }
+        ColumnType::Timetz(_) => {
+            let keys: Vec<Option<i64>> = keys.collect();
+            let parts = |k: &Option<i64>| k.map_or((0, 0), timetz_parts);
+            let times: arrow::array::Time64MicrosecondArray =
+                keys.iter().map(|k| Some(parts(k).0)).collect();
+            let zones: arrow::array::Int32Array = keys.iter().map(|k| Some(parts(k).1)).collect();
+            return Arc::new(
+                arrow::array::StructArray::try_new(
+                    timetz_fields(),
+                    vec![Arc::new(times), Arc::new(zones)],
+                    Some(keys.iter().map(Option::is_some).collect()),
+                )
+                .expect("a timetz takes its two leaves"),
+            );
+        }
+        _ => {}
+    }
     if ty == ColumnType::Tid {
         let keys: Vec<Option<i64>> = keys.collect();
         let parts = |k: &Option<i64>| k.map_or((0, 0), tid_parts);
@@ -1252,6 +1423,38 @@ pub fn scalar_key_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> O
         return None;
     }
     let any = a.as_any();
+    match ty {
+        ColumnType::Date => {
+            return Some(i64::from(
+                any.downcast_ref::<arrow::array::Date32Array>()?.value(r),
+            ))
+        }
+        ColumnType::Time(_) => {
+            return Some(
+                any.downcast_ref::<arrow::array::Time64MicrosecondArray>()?
+                    .value(r),
+            )
+        }
+        ColumnType::Timestamp(_) | ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => {
+            return Some(
+                any.downcast_ref::<arrow::array::TimestampMicrosecondArray>()?
+                    .value(r),
+            )
+        }
+        ColumnType::Timetz(_) => {
+            let s = any.downcast_ref::<arrow::array::StructArray>()?;
+            let time = s
+                .column_by_name("time")?
+                .as_any()
+                .downcast_ref::<arrow::array::Time64MicrosecondArray>()?;
+            let zone = s
+                .column_by_name("zone")?
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()?;
+            return Some(timetz_key(time.value(r), zone.value(r)));
+        }
+        _ => {}
+    }
     if ty == ColumnType::Tid {
         let s = any.downcast_ref::<arrow::array::StructArray>()?;
         let block = s
@@ -1280,6 +1483,14 @@ pub fn scalar_key_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> O
 
 /// An answer's field, named for a scalar's PostgreSQL type in its metadata.
 pub fn scalar_field(name: &str, ty: ColumnType, nullable: bool) -> arrow::datatypes::Field {
+    // An interval's answer is named by its type alone, whatever fields its column keeps.
+    let ty = match ty {
+        ColumnType::Interval { .. } => ColumnType::Interval {
+            range: crate::times::INTERVAL_FULL_RANGE,
+            precision: None,
+        },
+        ty => ty,
+    };
     let mut named = vec![(PG_TYPE.to_string(), ty.pg_name())];
     if let ColumnType::Reg(_, release) = ty {
         named.push((PG_RELEASE.to_string(), release.to_string()));
@@ -1312,8 +1523,34 @@ pub fn field_scalar(f: &arrow::datatypes::Field) -> Option<ColumnType> {
         ColumnType::Macaddr8,
         ColumnType::Oid8,
         ColumnType::Tid,
+        ColumnType::Date,
     ]
     .into_iter()
+    .chain(
+        [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+        ]
+        .into_iter()
+        .flat_map(|p| {
+            [
+                ColumnType::Time(p),
+                ColumnType::Timetz(p),
+                ColumnType::Timestamp(p),
+            ]
+        }),
+    )
+    .chain(std::iter::once(ColumnType::Interval {
+        range: crate::times::INTERVAL_FULL_RANGE,
+        precision: None,
+    }))
+    .chain(std::iter::once(ColumnType::Timestamptz))
     .find(|t| t.pg_name() == *named && scalar_arrow(*t) == *f.data_type())
 }
 
@@ -1354,6 +1591,10 @@ pub fn is_scalar(ty: ColumnType) -> bool {
             | ColumnType::Reg(..)
             | ColumnType::Oid8
             | ColumnType::Tid
+            | ColumnType::Date
+            | ColumnType::Time(_)
+            | ColumnType::Timetz(_)
+            | ColumnType::Timestamp(_)
     )
 }
 

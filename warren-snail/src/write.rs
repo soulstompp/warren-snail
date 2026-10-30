@@ -12,7 +12,7 @@ use crate::encode::{disk_pages, encode, leaf_descriptor, DataPage, Encoded, DICT
 use crate::file::{
     encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_EIGHT, FORMAT_SEVEN,
 };
-use crate::places::{key, month_utc, null_key, KeyValue, Keys, Sublevels};
+use crate::places::{level_key, month_of, null_key, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
 use arrow::array::{
@@ -60,6 +60,7 @@ impl Rows {
                     Values::Wide(x) => x.resize(rows, None),
                     Values::Float4(x) => x.resize(rows, None),
                     Values::Float8(x) => x.resize(rows, None),
+                    Values::Interval(x) => x.resize(rows, None),
                     _ => unreachable!("a column is read as plain values"),
                 }
                 columns.push(out);
@@ -127,6 +128,51 @@ impl Rows {
                             (0..a.len()).map(|r| crate::scalars::scalar_key_at(ty, a.as_ref(), r)),
                         );
                     }
+                    // A time of day as a reader writes it in nanoseconds, each a whole microsecond.
+                    (
+                        Values::Int(out),
+                        ColumnType::Time(_),
+                        DataType::Time64(TimeUnit::Nanosecond),
+                    ) => {
+                        let a = a
+                            .as_any()
+                            .downcast_ref::<arrow::array::Time64NanosecondArray>()
+                            .unwrap();
+                        for v in a.iter() {
+                            out.push(match v {
+                                Some(ns) if ns % 1000 != 0 => {
+                                    return Err(Error::new(format!(
+                                        "{}.{}: {ns} nanoseconds is no whole microsecond",
+                                        table.name, c.name
+                                    )))
+                                }
+                                v => v.map(|ns| ns / 1000),
+                            });
+                        }
+                    }
+                    (Values::Interval(out), ColumnType::Interval { .. }, DataType::Struct(_)) => {
+                        let s = a
+                            .as_any()
+                            .downcast_ref::<arrow::array::StructArray>()
+                            .unwrap();
+                        let field = |name: &str| s.column_by_name(name).ok_or_else(wrong);
+                        let (m, d, u) = (field("months")?, field("days")?, field("micros")?);
+                        let (m, d, u) = match (
+                            m.as_any().downcast_ref::<Int32Array>(),
+                            d.as_any().downcast_ref::<Int32Array>(),
+                            u.as_any().downcast_ref::<Int64Array>(),
+                        ) {
+                            (Some(m), Some(d), Some(u)) => (m, d, u),
+                            _ => return Err(wrong()),
+                        };
+                        out.extend((0..s.len()).map(|r| {
+                            (!s.is_null(r)).then(|| crate::times::Interval {
+                                months: m.value(r),
+                                days: d.value(r),
+                                micros: u.value(r),
+                            })
+                        }));
+                    }
                     (Values::Float4(out), ColumnType::Float4, DataType::Float32) => {
                         let a = a
                             .as_any()
@@ -159,7 +205,7 @@ impl Rows {
                     }
                     (
                         Values::Int(out),
-                        ColumnType::Timestamptz,
+                        ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_),
                         DataType::Timestamp(TimeUnit::Microsecond, _),
                     ) => {
                         let a = a
@@ -684,21 +730,19 @@ fn write_tables(
                 crate::read::fill::check(table, &row)?;
             }
         }
-        for c in table.month_columns() {
-            if rows.columns[c]
-                .ints()
-                .is_some_and(|v| v.iter().flatten().any(|&x| x == i64::MAX || x == i64::MIN))
-            {
-                return Err(Error::new(format!(
-                    "{}.{} holds an infinite instant, whose month cannot be counted",
-                    table.name, table.columns[c].name
-                )));
-            }
-        }
         let source = sources
             .iter()
             .find(|(n, _)| *n == table.name)
             .map(|(_, s)| s);
+        for (c, col) in table.columns.iter().enumerate() {
+            if col.ty.is_timestamptz()
+                && rows.columns[c]
+                    .ints()
+                    .is_some_and(|v| v.iter().any(|x| matches!(x, Some(i64::MAX | i64::MIN))))
+            {
+                crate::file::instant_ends(w.format(), table, c)?;
+            }
+        }
         for order in &table.orders {
             if order
                 .levels
@@ -792,21 +836,15 @@ pub(crate) fn laid_out(
                     unsorted.push(KeyValue::Wide(v[r].unwrap()));
                     continue;
                 }
+                Values::Interval(_) => {
+                    unsorted.push(KeyValue::Wide(column.wide(r).unwrap()));
+                    continue;
+                }
                 Values::Float4(_) | Values::Float8(_) => column.int(r).unwrap(),
                 Values::Int(v) => v[r].unwrap(),
                 Values::Nested(_) => unreachable!("a level reads its column whole"),
             };
-            if table.columns[l.column()].ty == ColumnType::Timestamptz
-                && (v == i64::MAX || v == i64::MIN)
-            {
-                return Err(Error::new(format!(
-                    "{}: {} holds an infinite instant, which a level of {} cannot place",
-                    table.name,
-                    table.columns[l.column()].name,
-                    order.name
-                )));
-            }
-            unsorted.push(key(l, v));
+            unsorted.push(level_key(order, li, v));
         }
     }
     let row = |r: usize| &unsorted[r * stride..(r + 1) * stride];
@@ -1183,6 +1221,7 @@ pub(crate) fn write_block(
     let mut encoded = Vec::with_capacity(leaves.len());
     let mut moved = Vec::with_capacity(leaves.len());
     let mut months = vec![[0u32; 12]; month_slots.len()];
+    let mut ends = vec![[0u32; 2]; month_slots.len()];
     let mut bytes = vec![0u32; text_slots.len()];
     let block_leaves = order.columns.iter().flat_map(|&c| {
         let ty = table.columns[c].ty;
@@ -1204,7 +1243,10 @@ pub(crate) fn write_block(
         });
         if let Some(m) = month_slots.iter().position(|&x| x == s) {
             for &v in &present {
-                months[m][month_utc(v) as usize - 1] += 1;
+                match month_of(v) {
+                    Some(month) => months[m][month as usize - 1] += 1,
+                    None => ends[m][(v > 0) as usize] += 1,
+                }
             }
         }
         if let Some(t) = text_slots.iter().position(|&x| x == s) {
@@ -1288,6 +1330,7 @@ pub(crate) fn write_block(
         last: keys.row(b.end - 1).to_vec(),
         columns: summaries,
         months,
+        ends,
         bytes,
         child,
     };

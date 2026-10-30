@@ -6,41 +6,10 @@ use super::statement::{Datum, Row};
 use crate::catalog::{ColumnType, Table};
 use crate::numeric::Numeric;
 use crate::{Error, Result};
-use chrono::{Datelike, Timelike};
 
-/// An instant as PostgreSQL writes a timestamptz under TimeZone UTC and DateStyle ISO: its
-/// microseconds where it has any, its year past 9999 as it is, and BC after a year before 1.
+/// An instant as PostgreSQL writes a timestamptz under TimeZone UTC and DateStyle ISO.
 pub fn instant_text(micros: i64) -> String {
-    match micros {
-        i64::MAX => return "infinity".into(),
-        i64::MIN => return "-infinity".into(),
-        _ => {}
-    }
-    let t = crate::places::civil_utc(micros);
-    let (bc, year) = if t.year() <= 0 {
-        (true, 1 - t.year())
-    } else {
-        (false, t.year())
-    };
-    let mut out = format!(
-        "{year:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        t.month(),
-        t.day(),
-        t.hour(),
-        t.minute(),
-        t.second()
-    );
-    let us = micros.rem_euclid(1_000_000);
-    if us > 0 {
-        let f = format!("{us:06}");
-        out.push('.');
-        out.push_str(f.trim_end_matches('0'));
-    }
-    out.push_str("+00");
-    if bc {
-        out.push_str(" BC");
-    }
-    out
+    crate::times::timestamptz_out(micros)
 }
 
 /// A numeric column's value as the number it is.
@@ -85,7 +54,7 @@ pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
     Some(match (d, from) {
         (Datum::Null, _) => return None,
         (Datum::Int(v), ColumnType::Boolean) => if *v != 0 { "true" } else { "false" }.into(),
-        (Datum::Int(v), ColumnType::Timestamptz) => instant_text(*v),
+        (Datum::Int(v), ty) if ty.is_timestamptz() => instant_text(*v),
         (Datum::Int(_) | Datum::Wide(_), ColumnType::Numeric { .. }) => {
             numeric_of(d, from)?.to_string()
         }
@@ -101,6 +70,34 @@ pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
         (Datum::Float4(b), _) => crate::scalars::float_text(u64::from(*b), false),
         (Datum::Float8(b), _) => crate::scalars::float_text(*b, true),
         (Datum::Compound(c), ty) => crate::composed::text_out(ty, &c.item),
+        (Datum::Interval(v), _) => crate::times::interval_out(*v),
+    })
+}
+
+/// Whether a type is one of the time types.
+fn is_time(ty: ColumnType) -> bool {
+    use ColumnType::*;
+    matches!(
+        ty,
+        Date | Time(_)
+            | Timetz(_)
+            | Timestamp(_)
+            | Timestamptz
+            | TimestamptzRounded(_)
+            | Interval { .. }
+    )
+}
+
+/// A time type's value assigned to a column of a time type, as PostgreSQL's implicit and assignment
+/// casts take it, rounded to the column's precision; an empty error where no cast takes it.
+fn time_assign(d: Datum, from: ColumnType, to: ColumnType) -> Result<Datum> {
+    if !crate::catalog::assignable(from, to) {
+        return Err(Error::new(""));
+    }
+    Ok(match super::clock::cast(value_of(&d, from), to)? {
+        Value::Scalar(_, k) => Datum::Int(k),
+        Value::Interval(x) => Datum::Interval(x),
+        _ => Datum::Null,
     })
 }
 
@@ -246,7 +243,10 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             }
             Datum::Int(v)
         }
-        (Timestamptz, Timestamptz) | (Bytes, Bytes) | (Boolean, Boolean) | (Uuid, Uuid) => d,
+        (from, to) if is_time(from) && is_time(to) => {
+            time_assign(d, from, to).map_err(|e| if e.0.is_empty() { refused() } else { e })?
+        }
+        (Bytes, Bytes) | (Boolean, Boolean) | (Uuid, Uuid) => d,
         (Oid, Oid)
         | (Xid, Xid)
         | (Cid, Cid)
@@ -378,6 +378,7 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
                 crate::composed::Item::Scalar(Datum::Int(*v)),
             )),
         ),
+        (Datum::Int(v), ty) if ty.is_timestamptz() => Value::Scalar(ColumnType::Timestamptz, *v),
         (Datum::Int(v), _) => Value::Int(*v),
         (Datum::Text(s), ColumnType::Bpchar(_) | ColumnType::Name) => Value::Str(ty, s.clone()),
         (Datum::Text(s), _) => Value::Text(s.clone()),
@@ -387,6 +388,7 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Float4(b), _) => Value::Real(f32::from_bits(*b)),
         (Datum::Float8(b), _) => Value::Double(f64::from_bits(*b)),
         (Datum::Compound(c), ty) => Value::Composed(ty, c.clone()),
+        (Datum::Interval(v), _) => Value::Interval(*v),
     }
 }
 
@@ -396,7 +398,7 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
         Value::Null => return Ok(Datum::Null),
         // An instant's column reads its microseconds as an integer; an integer is one where the
         // column is a timestamptz.
-        Value::Int(x) if to == ColumnType::Timestamptz => (Datum::Int(x), ColumnType::Timestamptz),
+        Value::Int(x) if to.is_timestamptz() => (Datum::Int(x), ColumnType::Timestamptz),
         Value::Int(x) => (Datum::Int(x), ColumnType::Int8),
         // A numeric an expression computes is unconstrained.
         v @ (Value::Num(..) | Value::Numeric(_)) => (
@@ -417,6 +419,13 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
             crate::composed::Item::Scalar(d) => (d.clone(), ty),
             _ => (Datum::Compound(c), ty),
         },
+        Value::Interval(v) => (
+            Datum::Interval(v),
+            ColumnType::Interval {
+                range: crate::times::INTERVAL_FULL_RANGE,
+                precision: None,
+            },
+        ),
     };
     assign(d, from, to, what)
 }

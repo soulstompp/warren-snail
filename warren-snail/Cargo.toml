@@ -25,6 +25,9 @@ path = "src/main.rs"
 # none of its own, as inside PostgreSQL.
 default = ["standalone"]
 standalone = []
+# Zones other than UTC, read from compiled zone files in a directory: the machine's, or one named.
+# Built without it, a zone other than UTC is refused by name.
+zones = []
 
 [dependencies]
 sqlparser = { version = "0.63", default-features = false, features = ["std"] }

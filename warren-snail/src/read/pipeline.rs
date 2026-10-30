@@ -44,6 +44,8 @@ pub enum Value {
     Numeric(crate::numeric::Numeric),
     /// A value of a composed type: its type, and the value held whole; an enum's is its rank.
     Composed(ColumnType, std::sync::Arc<crate::composed::Compound>),
+    /// An interval, as its own fields.
+    Interval(crate::times::Interval),
 }
 
 impl Value {
@@ -119,6 +121,7 @@ impl Value {
             Value::Bits(_, k) => crate::strings::bits_text(k),
             Value::Numeric(n) => n.to_string(),
             Value::Composed(ty, c) => crate::composed::text_out(*ty, &c.item),
+            Value::Interval(v) => crate::times::interval_out(*v),
         })
     }
 
@@ -182,6 +185,9 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
     if let (Some(x), Some(y)) = (a.string_key(), b.string_key()) {
         return Ok(Some(x.cmp(y)));
     }
+    if let Some(o) = super::clock::compare(a, b)? {
+        return Ok(Some(o));
+    }
     Ok(Some(match (a, b) {
         (Value::Bits(_, x), Value::Bits(_, y)) => x.cmp(y),
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
@@ -202,6 +208,7 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
                 kind_name(other)
             )))
         }
+        (Value::Interval(x), Value::Interval(y)) => x.total().cmp(&y.total()),
         (Value::Scalar(a, x), Value::Scalar(b, y)) if a == b || a.is_oid() && b.is_oid() => {
             x.cmp(y)
         }
@@ -231,6 +238,7 @@ enum Key {
     /// A numeric no `Num` holds, by its class's key.
     Class(String),
     Composed(Box<[u8]>),
+    Interval(i128),
 }
 
 fn key(v: &Value) -> Key {
@@ -258,6 +266,7 @@ fn key(v: &Value) -> Key {
         Value::Str(..) => Key::Text(String::from_utf8_lossy(v.string_key().unwrap()).into()),
         Value::Bits(_, k) => Key::Bytes(k.clone()),
         Value::Composed(_, c) => Key::Composed(c.key.clone()),
+        Value::Interval(v) => Key::Interval(v.total()),
     }
 }
 
@@ -658,6 +667,7 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
                 crate::regs::check_release(Some(kind), release)?;
                 scalar_cast(v, ColumnType::Reg(kind, release))?
             }
+            Ok(ty) if super::clock::is_time(ty) => super::clock::cast(v, ty)?,
             Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty)?,
             Ok(ty @ (ColumnType::Bpchar(_) | ColumnType::Name)) => string_cast(v, ty, true)?,
             Ok(ty) if ty.is_bits() => bits_cast(v, ty, true)?,
@@ -750,7 +760,7 @@ fn bits_integer(k: &[u8], bits: u32) -> Result<Value> {
 }
 
 /// The name PostgreSQL gives a value's type: an integer's by its range.
-fn kind_name(v: &Value) -> String {
+pub(super) fn kind_name(v: &Value) -> String {
     match v {
         Value::Null => "unknown".into(),
         Value::Int(x) if i32::try_from(*x).is_ok() => "integer".into(),
@@ -768,6 +778,7 @@ fn kind_name(v: &Value) -> String {
         Value::Bits(ColumnType::Bit(_), _) => "bit".into(),
         Value::Bits(..) => "bit varying".into(),
         Value::Composed(ty, _) => ty.pg_name(),
+        Value::Interval(_) => "interval".into(),
     }
 }
 
@@ -1410,7 +1421,8 @@ fn literal_type(ty: ColumnType) -> ColumnType {
     if ty.is_oid() {
         ColumnType::Oid
     } else {
-        ty
+        // A time type's literal takes its type without the column's precision.
+        super::clock::base(ty)
     }
 }
 
@@ -1524,6 +1536,17 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
         (Value::Text(t), Value::Int(_)) if quoted(left) => {
             (Value::Int(crate::composed::int_in(t, 64)?), y.clone())
         }
+        (Value::Interval(_), Value::Text(t)) if quoted(right) => {
+            let t = super::clock::cast(Value::Text(t.clone()), literal_interval())?;
+            (x, t)
+        }
+        (Value::Text(t), Value::Interval(_)) if quoted(left) => (
+            super::clock::cast(Value::Text(t.clone()), literal_interval())?,
+            y,
+        ),
+        // A date beside an integer is added to or taken from, its integer kept.
+        (Value::Scalar(..), Value::Int(_)) if super::clock::time_of(&x).is_some() => (x, y),
+        (Value::Int(_), Value::Scalar(..)) if super::clock::time_of(&y).is_some() => (x, y),
         (Value::Scalar(..), Value::Int(_)) => {
             let y = integer_beside(&x, y)?;
             (x, y)
@@ -1538,6 +1561,14 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
         }
         _ => (x, y),
     })
+}
+
+/// The interval a quoted literal beside an interval is read as.
+fn literal_interval() -> ColumnType {
+    ColumnType::Interval {
+        range: crate::times::INTERVAL_FULL_RANGE,
+        precision: None,
+    }
 }
 
 /// Evaluates an expression on one row of a frame, its aggregates' and windows' values computed.
@@ -1604,6 +1635,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             Value::Numeric(n) => Value::Numeric(n.neg()),
             Value::Real(f) => Value::Real(-f),
             Value::Double(d) => Value::Double(-d),
+            other @ Value::Interval(_) => super::clock::negate(&other)?.unwrap_or(Value::Null),
             other => return Err(Error::new(format!("-{other:?} is not a number"))),
         },
         Expr::UnaryOp {
@@ -1798,6 +1830,9 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 if x.is_null() || y.is_null() {
                     return Ok(Value::Null);
                 }
+                if let Some(v) = super::clock::arith(op, &x, &y)? {
+                    return Ok(v);
+                }
                 if let Some(v) = float_arith(op, &x, &y)? {
                     return Ok(v);
                 }
@@ -1848,6 +1883,10 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 None => Value::Null,
             }
         }
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => super::clock::at_zone(ev(timestamp)?, ev(time_zone)?)?,
         Expr::Function(f) => {
             let name = function_name(f);
             let a = args(f)?;
@@ -1871,6 +1910,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                         }
                     }
                 }
+                ("timezone", [zone, x]) => super::clock::at_zone(ev(x)?, ev(zone)?)?,
                 ("abs", [x]) => match ev(x)? {
                     Value::Null => Value::Null,
                     Value::Int(v) => Value::Int(
@@ -2094,6 +2134,9 @@ enum Acc {
     Avg(f64, f64, f64),
     /// avg of an integer or a numeric, its sum and rows as numeric_avg_accum folds them.
     NumAvg(crate::numeric::Sum),
+    /// sum, or avg where `avg`, of an interval, as PostgreSQL's interval_avg_accum folds it; of a
+    /// time through its cast to an interval.
+    Intervals(crate::times::IntervalAccum, bool),
 }
 
 impl Acc {
@@ -2180,7 +2223,7 @@ impl Acc {
             }
         }
         // Of the scalars, sum is money's alone; min and max are an oid's, an xid8's, a pg_lsn's,
-        // money's and a tid's, and a `"char"`'s through its text.
+        // money's, a tid's and a time type's, and a `"char"`'s through its text.
         let v = match (&v, &self) {
             (Value::Scalar(ColumnType::Char, _), Acc::Least(_) | Acc::Greatest(_)) => {
                 Value::Text(v.text().unwrap_or_default())
@@ -2194,7 +2237,8 @@ impl Acc {
                 Value::Scalar(ColumnType::Oid, *k)
             }
             (Value::Scalar(ty, _), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_))
-                if !(matches!(self, Acc::Sum(_)) && *ty == ColumnType::Money
+                if !(matches!(self, Acc::Sum(_))
+                    && matches!(ty, ColumnType::Money | ColumnType::Time(_))
                     || !matches!(self, Acc::Sum(_))
                         && matches!(
                             ty,
@@ -2204,6 +2248,11 @@ impl Acc {
                                 | ColumnType::PgLsn
                                 | ColumnType::Money
                                 | ColumnType::Tid
+                                | ColumnType::Date
+                                | ColumnType::Time(_)
+                                | ColumnType::Timetz(_)
+                                | ColumnType::Timestamp(_)
+                                | ColumnType::Timestamptz
                         )) =>
             {
                 let name = match self {
@@ -2221,6 +2270,28 @@ impl Acc {
             }
             _ => v,
         };
+        // An interval's sum or average, and a time's through its cast to an interval.
+        let lapse = match &v {
+            Value::Interval(x) => Some(*x),
+            Value::Scalar(ColumnType::Time(_), t) => Some(crate::times::time_interval(*t)),
+            _ => None,
+        };
+        if let Some(x) = lapse {
+            match self {
+                Acc::Sum(Value::Null) => *self = Acc::Intervals(Default::default(), false),
+                Acc::Avg(n, ..) if *n == 0.0 => *self = Acc::Intervals(Default::default(), true),
+                _ => {}
+            }
+            if let Acc::Intervals(s, avg) = self {
+                s.add(x)?;
+                if *avg {
+                    s.avg()?;
+                } else {
+                    s.sum()?;
+                }
+                return Ok(());
+            }
+        }
         match self {
             Acc::Count(n) => *n += 1,
             // The sum of whole numbers is a numeric of scale 0, as PostgreSQL writes it.
@@ -2284,6 +2355,13 @@ impl Acc {
                 let t = truth(&v)?.unwrap_or(false);
                 *a = Some(a.map_or(t, |x| x || t));
             }
+            // Reached only by a value no interval is: the first was one.
+            Acc::Intervals(..) => {
+                return Err(Error::new(format!(
+                    "{} beside an interval is not summed",
+                    kind_name(&v)
+                )))
+            }
             Acc::Avg(n, sx, sxx) => {
                 let x = match v {
                     Value::Real(f) => f64::from(f),
@@ -2327,6 +2405,9 @@ impl Acc {
                 Some(a) => Value::of_numeric(a?),
                 None => Value::Null,
             },
+            Acc::Intervals(s, avg) => {
+                (if *avg { s.avg()? } else { s.sum()? }).map_or(Value::Null, Value::Interval)
+            }
         })
     }
 }
@@ -3070,6 +3151,12 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                         .value(r)
                         .to_string(),
                 )
+            } else if let Some(ColumnType::Interval { .. }) = scalar {
+                Value::Interval(
+                    crate::scalars::interval_at(a.as_ref(), r).ok_or_else(|| {
+                        Error::new(format!("{} is not of its type", field.name()))
+                    })?,
+                )
             } else if let Some(ty) = scalar {
                 Value::Scalar(
                     ty,
@@ -3086,7 +3173,13 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                         Value::Int(any.downcast_ref::<Int32Array>().unwrap().value(r) as i64)
                     }
                     A::Int64 => Value::Int(any.downcast_ref::<Int64Array>().unwrap().value(r)),
-                    A::Timestamp(..) => Value::Int(
+                    // An instant, and a timestamp of no zone, as the scalars they are.
+                    A::Timestamp(_, zone) => Value::Scalar(
+                        if zone.is_some() {
+                            ColumnType::Timestamptz
+                        } else {
+                            ColumnType::Timestamp(None)
+                        },
                         any.downcast_ref::<TimestampMicrosecondArray>()
                             .unwrap()
                             .value(r),
@@ -3189,6 +3282,21 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
                 }),
             ));
             fields.push(crate::strings::string_field(name, ty, true));
+            continue;
+        }
+        if let Some(Value::Interval(_)) = first {
+            arrays.push(crate::scalars::interval_array(col().map(|v| match v {
+                Value::Interval(x) => Some(*x),
+                _ => None,
+            })));
+            fields.push(crate::scalars::scalar_field(
+                name,
+                ColumnType::Interval {
+                    range: crate::times::INTERVAL_FULL_RANGE,
+                    precision: None,
+                },
+                true,
+            ));
             continue;
         }
         if let Some(Value::Scalar(ty, _)) = first {

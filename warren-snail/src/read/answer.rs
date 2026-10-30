@@ -109,6 +109,37 @@ fn held_sum(total: i128, step: i128) -> i128 {
     }
 }
 
+/// An interval a round keeps: compared, grouped and hashed by its total, as PostgreSQL's `=` sees
+/// it, and written out as its own fields.
+#[derive(Clone, Copy, Debug)]
+pub struct Lapse(pub crate::times::Interval);
+
+impl PartialEq for Lapse {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total() == other.0.total()
+    }
+}
+
+impl Eq for Lapse {}
+
+impl std::hash::Hash for Lapse {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.total().hash(state)
+    }
+}
+
+impl PartialOrd for Lapse {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Lapse {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total().cmp(&other.0.total())
+    }
+}
+
 /// A float a round keeps: its class's key, by which it is compared, grouped and hashed, and its own
 /// bits, which it is written out as.
 #[derive(Clone, Copy, Debug)]
@@ -219,6 +250,12 @@ fn merge(into: &mut [Acc], from: &[Acc]) {
                     *x = Some(y.clone());
                 }
             }
+            (Acc::IntervalExtreme(x, least), Acc::IntervalExtreme(Some(y), _)) => {
+                *x = Some(later_extreme(*x, *y, *least))
+            }
+            (Acc::IntervalSum(x, _, past), Acc::IntervalSum(y, _, o)) => {
+                *past |= *o || x.combine(y).is_err();
+            }
             (Acc::FloatSum(x, over), Acc::FloatSum(Some(y), o)) => {
                 *x = Some(x.map_or(*y, |x| x + y));
                 *over |= *o;
@@ -258,6 +295,20 @@ fn merge(into: &mut [Acc], from: &[Acc]) {
             }
             _ => {}
         }
+    }
+}
+
+/// Of an interval's extreme so far and the next, the one an aggregate keeps: the next where they
+/// are equal.
+fn later_extreme(
+    x: Option<crate::times::Interval>,
+    y: crate::times::Interval,
+    least: bool,
+) -> crate::times::Interval {
+    match x {
+        Some(x) if least && x.total() < y.total() => x,
+        Some(x) if !least && x.total() > y.total() => x,
+        _ => y,
     }
 }
 
@@ -305,6 +356,8 @@ pub enum Cell {
     Classed(Classed),
     /// A composed value, compared by its key and written as its parts.
     Composed(Arc<crate::composed::Compound>),
+    /// An interval, compared by its total and written as its own fields.
+    Interval(Lapse),
 }
 
 impl Cell {
@@ -346,6 +399,7 @@ impl Cell {
             Cell::Wide(k) => Some(*k),
             // A float's key, its bits beside it, so the least and the greatest keep their own.
             Cell::Float(f) => Some((i128::from(f.key) << 64) | i128::from(f.bits)),
+            Cell::Interval(v) => Some(v.0.total()),
             _ => None,
         }
     }
@@ -382,6 +436,13 @@ pub enum Acc {
     Least(Option<i128>),
     /// The greatest key so far.
     Greatest(Option<i128>),
+    /// An interval's least, or its greatest where not `least`, so far: the later of two equal ones,
+    /// as PostgreSQL's interval_smaller and interval_larger take it.
+    IntervalExtreme(Option<crate::times::Interval>, bool),
+    /// An interval's sum, or its average where `avg`, as PostgreSQL's interval_avg_accum folds it: a
+    /// time's through its cast to an interval; and whether a step left the interval's range, which
+    /// refuses the answer.
+    IntervalSum(crate::times::IntervalAccum, bool, bool),
     /// A float's sum so far, and whether finite numbers made it infinite on the way.
     FloatSum(Option<f64>, bool),
     /// A float's rows, their sum and their sum of squared deviations, as PostgreSQL's
@@ -535,6 +596,14 @@ impl Answer {
                 {
                     Acc::NumAvg(Box::default())
                 }
+                Item::Sum(_) | Item::Avg(_)
+                    if matches!(
+                        typed.get(at).copied().flatten(),
+                        Some(ColumnType::Interval { .. } | ColumnType::Time(_))
+                    ) =>
+                {
+                    Acc::IntervalSum(Default::default(), matches!(i, Item::Avg(_)), false)
+                }
                 Item::Avg(_) => Acc::Avg(0.0, 0.0, 0.0, false),
                 Item::Least(_) | Item::Greatest(_)
                     if is_classed(typed.get(at).copied().flatten()) =>
@@ -563,6 +632,14 @@ impl Answer {
                         .is_some_and(ColumnType::is_nested) =>
                 {
                     Acc::Extreme(None, matches!(i, Item::Least(_)))
+                }
+                Item::Least(_) | Item::Greatest(_)
+                    if matches!(
+                        typed.get(at).copied().flatten(),
+                        Some(ColumnType::Interval { .. })
+                    ) =>
+                {
+                    Acc::IntervalExtreme(None, matches!(i, Item::Least(_)))
                 }
                 Item::Least(_) => Acc::Least(None),
                 Item::Greatest(_) => Acc::Greatest(None),
@@ -697,6 +774,25 @@ impl Answer {
                                 if better {
                                     *m = Some(v.clone());
                                 }
+                            }
+                        }
+                        (Acc::IntervalSum(s, _, past), Item::Sum(c) | Item::Avg(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            let v = match &cells[at] {
+                                Cell::Interval(v) => Some(v.0),
+                                Cell::Int(t) => Some(crate::times::time_interval(*t)),
+                                _ => None,
+                            };
+                            if let Some(v) = v {
+                                for _ in 0..n {
+                                    *past |= s.add(v).is_err();
+                                }
+                            }
+                        }
+                        (Acc::IntervalExtreme(m, least), Item::Least(c) | Item::Greatest(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            if let Cell::Interval(v) = cells[at] {
+                                *m = Some(later_extreme(*m, v.0, *least));
                             }
                         }
                         (Acc::Least(m), Item::Least(c)) | (Acc::Greatest(m), Item::Greatest(c)) => {
@@ -945,6 +1041,18 @@ impl Answer {
                         if let Acc::NumAvg(s) = acc {
                             s.avg().transpose()?;
                         }
+                        // And an interval's whose steps left its range, or that holds both
+                        // infinities.
+                        if let Acc::IntervalSum(s, avg, past) = acc {
+                            if *past {
+                                return Err(crate::Error::new("interval out of range"));
+                            }
+                            if *avg {
+                                s.avg()?;
+                            } else {
+                                s.sum()?;
+                            }
+                        }
                     }
                 }
                 groups
@@ -1017,6 +1125,15 @@ impl Answer {
                                     Cell::of_numeric(&a.expect("a mean held"))
                                 }),
                                 (_, Acc::Numeric(_)) => Cell::Null,
+                                (_, Acc::IntervalExtreme(m, _)) => {
+                                    m.map_or(Cell::Null, |v| Cell::Interval(Lapse(v)))
+                                }
+                                (_, Acc::IntervalSum(s, avg, _)) => {
+                                    let v = if avg { s.avg() } else { s.sum() };
+                                    v.ok()
+                                        .flatten()
+                                        .map_or(Cell::Null, |v| Cell::Interval(Lapse(v)))
+                                }
                                 (Item::Sum(c), Acc::FloatSum(total, _)) => {
                                     total.map_or(Cell::Null, |t| {
                                         float_cell(
@@ -1171,7 +1288,7 @@ impl Answer {
                             Arc::new(ints().map(|v| v.map(|x| x as i32)).collect::<Int32Array>())
                         }
                         ColumnType::Int8 => Arc::new(ints().collect::<Int64Array>()),
-                        ColumnType::Timestamptz => Arc::new(
+                        ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => Arc::new(
                             ints()
                                 .collect::<TimestampMicrosecondArray>()
                                 .with_timezone("UTC"),
@@ -1213,15 +1330,37 @@ impl Answer {
                             )?
                         }
                         ty @ ColumnType::Composed(_) => crate::composed::enum_array(ty, ints())?,
+                        ColumnType::Interval { .. } => {
+                            crate::scalars::interval_array(rows.iter().map(|r| match &r[i] {
+                                Cell::Interval(v) => Some(v.0),
+                                _ => None,
+                            }))
+                        }
                         ty => crate::scalars::scalar_array(ty, ints()),
                     };
                     (!col.not_null || !matches!(*item, Item::Key(_)), a)
                 }
-                Item::Key(Key::Month(c)) => (
-                    !tables[c.side].columns[c.column].not_null,
+                // An infinite instant has no month, so a month may be NULL whatever its column holds.
+                Item::Key(Key::Month(_)) => (
+                    true,
                     Arc::new(ints().map(|v| v.map(|x| x as i16)).collect::<Int16Array>()),
                 ),
                 Item::Count => (false, Arc::new(ints().collect::<Int64Array>())),
+                // An interval's sum and average, and a time's, are intervals.
+                Item::Avg(c) | Item::Sum(c)
+                    if matches!(
+                        tables[c.side].columns[c.column].ty,
+                        ColumnType::Interval { .. } | ColumnType::Time(_)
+                    ) =>
+                {
+                    (
+                        true,
+                        crate::scalars::interval_array(rows.iter().map(|r| match &r[i] {
+                            Cell::Interval(v) => Some(v.0),
+                            _ => None,
+                        })),
+                    )
+                }
                 Item::Avg(_) => (
                     true,
                     Arc::new(
@@ -1258,9 +1397,21 @@ impl Answer {
                 {
                     Some(ColumnType::Oid)
                 }
+                Item::Avg(c) | Item::Sum(c)
+                    if matches!(
+                        tables[c.side].columns[c.column].ty,
+                        ColumnType::Interval { .. } | ColumnType::Time(_)
+                    ) =>
+                {
+                    Some(ColumnType::Interval {
+                        range: crate::times::INTERVAL_FULL_RANGE,
+                        precision: None,
+                    })
+                }
                 Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) | Item::Sum(c) => {
-                    Some(tables[c.side].columns[c.column].ty)
-                        .filter(|&t| crate::scalars::is_scalar(t))
+                    Some(tables[c.side].columns[c.column].ty).filter(|&t| {
+                        crate::scalars::is_scalar(t) || matches!(t, ColumnType::Interval { .. })
+                    })
                 }
                 _ => None,
             };

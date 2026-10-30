@@ -129,7 +129,7 @@ pub(crate) fn primitive(
                 is_signed: true,
             }),
         ),
-        ColumnType::Timestamptz => (
+        ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => (
             PhysicalType::INT64,
             Some(LogicalType::Timestamp {
                 is_adjusted_to_u_t_c: true,
@@ -181,7 +181,26 @@ pub(crate) fn primitive(
         ColumnType::Composed(r) if !crate::composed::is_nested(r) => {
             (PhysicalType::BYTE_ARRAY, Some(LogicalType::Enum))
         }
-        ColumnType::Tid | ColumnType::Varbit(_) | ColumnType::Composed(_) => {
+        ColumnType::Date => (PhysicalType::INT32, Some(LogicalType::Date)),
+        ColumnType::Time(_) => (
+            PhysicalType::INT64,
+            Some(LogicalType::Time {
+                is_adjusted_to_u_t_c: false,
+                unit: TimeUnit::MICROS,
+            }),
+        ),
+        ColumnType::Timestamp(_) => (
+            PhysicalType::INT64,
+            Some(LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: false,
+                unit: TimeUnit::MICROS,
+            }),
+        ),
+        ColumnType::Tid
+        | ColumnType::Varbit(_)
+        | ColumnType::Composed(_)
+        | ColumnType::Timetz(_)
+        | ColumnType::Interval { .. } => {
             return Err(Error::new(format!(
                 "{name} is {}, held as a group of leaves",
                 ty.pg_name()
@@ -488,6 +507,10 @@ fn distinct(values: &Values, ty: ColumnType) -> (usize, usize) {
             let d: HashSet<u64> = v.iter().flatten().copied().collect();
             (d.len(), d.len() * 8)
         }
+        Values::Interval(v) => {
+            let d: HashSet<crate::times::Interval> = v.iter().flatten().copied().collect();
+            (d.len(), d.len() * 16)
+        }
         Values::Text(v) => {
             let d: HashSet<&str> = v.iter().flatten().map(String::as_str).collect();
             (
@@ -654,7 +677,10 @@ fn decode_as(
     // An unsigned number is keyed by the bits its descriptor names.
     let bits = unsigned_bits(desc);
     let out = match ty {
-        ColumnType::Tid | ColumnType::Varbit(_) => return Err(group(desc.name(), ty)),
+        ColumnType::Tid
+        | ColumnType::Varbit(_)
+        | ColumnType::Timetz(_)
+        | ColumnType::Interval { .. } => return Err(group(desc.name(), ty)),
         ColumnType::Bit(n) => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
             let mut v: Vec<FixedLenByteArray> = Vec::new();
@@ -707,6 +733,7 @@ fn decode_as(
         }
         ColumnType::Int2
         | ColumnType::Int4
+        | ColumnType::Date
         | ColumnType::Oid
         | ColumnType::Reg(..)
         | ColumnType::Xid
@@ -764,6 +791,9 @@ fn decode_as(
         }
         ColumnType::Int8
         | ColumnType::Timestamptz
+        | ColumnType::TimestamptzRounded(_)
+        | ColumnType::Timestamp(_)
+        | ColumnType::Time(_)
         | ColumnType::Numeric { .. }
         | ColumnType::Xid8
         | ColumnType::PgLsn

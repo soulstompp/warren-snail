@@ -14,7 +14,7 @@
 //! sublevels, or before them where the level holds its NULLs first, cut on the levels after it.
 
 use crate::catalog::{ColumnType, Level, Order, Table};
-use chrono::{DateTime, Datelike, Timelike};
+use chrono::DateTime;
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -243,11 +243,27 @@ pub fn key(level: Level, value: i64) -> KeyValue {
     }
 }
 
+/// The value level `li` of an order keys, from its column's value: an infinite instant's month is
+/// NULL, as PostgreSQL's extract gives it, and lies on the level's NULL run.
+pub fn level_key(order: &Order, li: usize, value: i64) -> KeyValue {
+    match order.levels[li] {
+        Level::MonthUtc(_) if month_of(value).is_none() => null_key(order, li),
+        l => key(l, value),
+    }
+}
+
 /// Whether a level is read by equality, rather than walked as a line.
 pub fn by_equality(level: Level, table: &Table) -> bool {
     match level {
         Level::MonthUtc(_) => true,
-        Level::Column(c) => table.columns[c].ty != ColumnType::Timestamptz,
+        Level::Column(c) => !matches!(
+            table.columns[c].ty,
+            ColumnType::Timestamptz
+                | ColumnType::TimestamptzRounded(_)
+                | ColumnType::Timestamp(_)
+                | ColumnType::Time(_)
+                | ColumnType::Timetz(_)
+        ),
     }
 }
 
@@ -273,7 +289,13 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Macaddr8 => 64,
             ColumnType::Float4 => 32,
             ColumnType::Float8 => 64,
-            ColumnType::Timestamptz => 7,
+            ColumnType::Timestamptz
+            | ColumnType::TimestamptzRounded(_)
+            | ColumnType::Timestamp(_) => 7,
+            ColumnType::Date => 3,
+            ColumnType::Time(_) => 4,
+            ColumnType::Timetz(_) => 5,
+            ColumnType::Interval { .. } => 6,
             ColumnType::Boolean => 1,
             ColumnType::Uuid => 128,
             ColumnType::Bit(n) => n as usize,
@@ -306,6 +328,9 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
         KeyValue::Null { first: true } => return i64::MIN,
         KeyValue::Null { first: false } => return i64::MAX,
         KeyValue::Wide(k) if ty.is_numeric() => return decimal_digit(*k, r),
+        KeyValue::Wide(k) if matches!(ty, ColumnType::Interval { .. }) => {
+            return interval_rung(*k, r)
+        }
         KeyValue::Wide(k) => return ((k.wrapping_sub(i128::MIN) as u128 >> (127 - r)) & 1) as i64,
         // A bit string is cut by its bits, each a place of three, an ended one first; bytea by its
         // bytes, as text is.
@@ -344,18 +369,44 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
                 let biased = (key as i128 - low) as u64;
                 ((biased >> (bits - 1 - r)) & 1) as i64
             }
-            ColumnType::Timestamptz => {
-                let t = civil_utc(key);
+            ColumnType::Timestamptz
+            | ColumnType::TimestamptzRounded(_)
+            | ColumnType::Timestamp(_) => match end_rung(key, i64::MIN, i64::MAX, r) {
+                Some(v) => v,
+                None => {
+                    let (year, month, day, hour, minute, second, micro) = crate::times::civil(key);
+                    match r {
+                        0 => year,
+                        1 => month as i64,
+                        2 => day as i64,
+                        3 => hour as i64,
+                        4 => minute as i64,
+                        5 => second as i64,
+                        _ => micro as i64,
+                    }
+                }
+            },
+            ColumnType::Date => match end_rung(key, i32::MIN as i64, i32::MAX as i64, r) {
+                Some(v) => v,
+                None => {
+                    let (year, month, day) =
+                        crate::times::j2date(key + crate::times::UNIX_EPOCH_JDATE);
+                    match r {
+                        0 => year,
+                        1 => month as i64,
+                        _ => day as i64,
+                    }
+                }
+            },
+            ColumnType::Time(_) => clock_rung(key, r),
+            ColumnType::Timetz(_) => {
+                let (utc, zone) = crate::scalars::timetz_utc(key);
                 match r {
-                    0 => t.year() as i64,
-                    1 => t.month() as i64,
-                    2 => t.day() as i64,
-                    3 => t.hour() as i64,
-                    4 => t.minute() as i64,
-                    5 => t.second() as i64,
-                    _ => key.rem_euclid(1_000_000),
+                    0..=3 => clock_rung(utc, r),
+                    _ => zone,
                 }
             }
+            ColumnType::Interval { .. } => unreachable!("an interval level keys 128 bits"),
             ColumnType::Boolean => key,
             ColumnType::Text(_)
             | ColumnType::Bytes
@@ -368,6 +419,50 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             }
             ColumnType::Uuid => unreachable!("a uuid level keys 128 bits"),
         },
+    }
+}
+
+/// An infinity's rung `r` on the calendar: a place before every year or after the last, the same
+/// at every rung after; none for a finite value.
+fn end_rung(key: i64, start: i64, end: i64, r: usize) -> Option<i64> {
+    let end_place = |at: i64| Some(if r == 0 { at } else { 0 });
+    if key == start {
+        end_place(i64::MIN + 1)
+    } else if key == end {
+        end_place(i64::MAX - 1)
+    } else {
+        None
+    }
+}
+
+/// Rung `r` of microseconds on the clock: the hour, then the minute, the second and the microsecond.
+fn clock_rung(micros: i64, r: usize) -> i64 {
+    match r {
+        0 => micros.div_euclid(3_600_000_000),
+        1 => micros.rem_euclid(3_600_000_000) / 60_000_000,
+        2 => micros.rem_euclid(60_000_000) / 1_000_000,
+        _ => micros.rem_euclid(1_000_000),
+    }
+}
+
+/// Rung `r` of an interval's total: its months of 30 days, then the day among them, then the clock;
+/// its infinities a place at each end.
+fn interval_rung(total: i128, r: usize) -> i64 {
+    use crate::times::Interval;
+    let month = 30 * crate::times::MICROS_PER_DAY as i128;
+    if total == Interval::INFINITY.total() || total == Interval::NEG_INFINITY.total() {
+        let at = if total > 0 {
+            i64::MAX - 1
+        } else {
+            i64::MIN + 1
+        };
+        return if r == 0 { at } else { 0 };
+    }
+    let within = total.rem_euclid(month) as i64;
+    match r {
+        0 => total.div_euclid(month) as i64,
+        1 => within / crate::times::MICROS_PER_DAY,
+        _ => clock_rung(within.rem_euclid(crate::times::MICROS_PER_DAY), r - 2),
     }
 }
 
@@ -440,6 +535,7 @@ pub fn ints(values: impl IntoIterator<Item = i64>) -> Vec<KeyValue> {
 mod tests {
     use super::*;
     use crate::catalog::Catalog;
+    use chrono::Datelike;
 
     #[test]
     fn an_integer_is_cut_by_its_bits_top_first_and_keeps_its_order() {
@@ -511,6 +607,185 @@ mod tests {
         let v: Vec<i64> = (0..9).map(|r| sublevels.value(&key, r)).collect();
         assert_eq!(v, [1, 12, 2017, 12, 31, 23, 59, 59, 1]);
         assert_eq!(month_utc(at + 999_999), 1);
+    }
+
+    /// Rung `r` of every level of a key, for the order's one level.
+    fn rungs(ddl: &str, key: KeyValue) -> Vec<i64> {
+        let c = Catalog::parse(ddl).unwrap();
+        let t = &c.tables[0];
+        let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
+        (0..sublevels.len())
+            .map(|r| sublevels.value(std::slice::from_ref(&key), r))
+            .collect()
+    }
+
+    #[test]
+    fn every_date_s_calendar_rises_with_it_and_its_infinities_lie_at_the_ends() {
+        let ddl = "CREATE TABLE s.t (d date NOT NULL, PRIMARY KEY (d));";
+        let c = Catalog::parse(ddl).unwrap();
+        let t = &c.tables[0];
+        let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
+        assert_eq!(sublevels.len(), 3);
+        let at = |d: i64| -> [i64; 3] {
+            let k = [KeyValue::Int(d)];
+            [0, 1, 2].map(|r| sublevels.value(&k, r))
+        };
+        // From PostgreSQL's first date, 4714-11-24 BC, to its last, 5874897-12-31, day by day, each
+        // day's year, month and day counted on alongside.
+        let (first, last) = (
+            crate::times::date2j(-4713, 11, 24) - crate::times::UNIX_EPOCH_JDATE,
+            crate::times::date2j(5_874_897, 12, 31) - crate::times::UNIX_EPOCH_JDATE,
+        );
+        let leap =
+            |y: i64| y.rem_euclid(4) == 0 && (y.rem_euclid(100) != 0 || y.rem_euclid(400) == 0);
+        let length = |y: i64, m: i64| match m {
+            2 if leap(y) => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        // Every date's calendar, as the rungs read it; the rungs themselves on every 61st day.
+        let mut civil = [-4713i64, 11, 24];
+        for d in first..=last {
+            let (y, m, day) = crate::times::j2date(d + crate::times::UNIX_EPOCH_JDATE);
+            assert!(
+                y == civil[0] && i64::from(m) == civil[1] && i64::from(day) == civil[2],
+                "{d}"
+            );
+            if d % 61 == 0 || d == last {
+                assert_eq!(at(d), civil, "{d}");
+            }
+            civil[2] += 1;
+            if civil[2] > length(civil[0], civil[1]) {
+                civil[2] = 1;
+                civil[1] += 1;
+                if civil[1] > 12 {
+                    civil[1] = 1;
+                    civil[0] += 1;
+                }
+            }
+        }
+        let (start, end) = (at(i32::MIN as i64), at(i32::MAX as i64));
+        assert!(start < at(first) && at(last) < end);
+        assert_eq!(
+            (start[1..].to_vec(), end[1..].to_vec()),
+            (vec![0, 0], vec![0, 0])
+        );
+        let null = [KeyValue::Null { first: false }];
+        assert!(end < [0, 1, 2].map(|r| sublevels.value(&null, r)));
+    }
+
+    #[test]
+    fn an_instant_s_infinities_lie_before_every_year_and_after_the_last() {
+        for ddl in [
+            "CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));",
+            "CREATE TABLE s.t (at timestamp NOT NULL, PRIMARY KEY (at));",
+        ] {
+            let first = crate::times::date2j(-4713, 11, 24) - crate::times::UNIX_EPOCH_JDATE;
+            let low = rungs(ddl, KeyValue::Int(first * 86_400_000_000));
+            let high = rungs(ddl, KeyValue::Int(i64::MAX - 1));
+            assert_eq!(low, [-4713, 11, 24, 0, 0, 0, 0]);
+            assert_eq!(high, [294_247, 1, 10, 4, 0, 54, 775_806]);
+            let (start, end) = (
+                rungs(ddl, KeyValue::Int(i64::MIN)),
+                rungs(ddl, KeyValue::Int(i64::MAX)),
+            );
+            assert!(start < low && high < end, "{ddl}");
+        }
+    }
+
+    #[test]
+    fn a_time_is_cut_by_the_clock_its_hour_running_0_to_24() {
+        let ddl = "CREATE TABLE s.t (v time NOT NULL, PRIMARY KEY (v));";
+        assert_eq!(rungs(ddl, KeyValue::Int(0)), [0, 0, 0, 0]);
+        assert_eq!(
+            rungs(ddl, KeyValue::Int(86_399_999_999)),
+            [23, 59, 59, 999_999]
+        );
+        assert_eq!(rungs(ddl, KeyValue::Int(86_400_000_000)), [24, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_timetz_sorts_and_is_cut_by_its_utc_clock_then_its_zone() {
+        let ddl = "CREATE TABLE s.t (v timetz NOT NULL, PRIMARY KEY (v));";
+        let h = 3_600_000_000i64;
+        // PostgreSQL's order of these (types/time-ranges-composed.md, timetz), each zone west of UTC.
+        let sorted = [
+            (0, -14 * 3600),
+            (h, 0),
+            (12 * h, -3600),
+            (11 * h, 0),
+            (10 * h, 3600),
+            (0, 12 * 3600),
+            (23 * h, 5 * 3600),
+        ];
+        let keys: Vec<i64> = sorted
+            .iter()
+            .map(|&(t, z)| crate::scalars::timetz_key(t, z))
+            .collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]));
+        for (&k, &(t, z)) in keys.iter().zip(&sorted) {
+            assert_eq!(crate::scalars::timetz_parts(k), (t, z));
+        }
+        let cut: Vec<Vec<i64>> = keys.iter().map(|&k| rungs(ddl, KeyValue::Int(k))).collect();
+        assert!(cut.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(cut[0][0], -14);
+        assert_eq!(cut[6][0], 28);
+        // The same instant in two zones: one place on the clock, two on the zone.
+        assert_eq!(cut[2][..4], cut[3][..4]);
+        let (most, least) = (15 * 3600 + 59 * 60, -(15 * 3600 + 59 * 60));
+        assert!(
+            crate::scalars::timetz_key(0, most) > crate::scalars::timetz_key(0, least),
+            "a more westerly zone sorts later"
+        );
+        assert_eq!(
+            rungs(
+                ddl,
+                KeyValue::Int(crate::scalars::timetz_key(86_400_000_000, most))
+            )[0],
+            39
+        );
+    }
+
+    #[test]
+    fn an_interval_sorts_and_is_cut_by_its_total_of_30_day_months() {
+        use crate::times::Interval;
+        let ddl = "CREATE TABLE s.t (v interval NOT NULL, PRIMARY KEY (v));";
+        let (d, u) = (86_400_000_000i64, 3_600_000_000i64);
+        let v = |months, days, micros| Interval {
+            months,
+            days,
+            micros,
+        };
+        // PostgreSQL's order of these (types/time-ranges-composed.md, interval).
+        let sorted = [
+            v(2, -31, 0),
+            v(1, 0, -1),
+            v(1, 0, 0),
+            v(0, 29, 25 * u),
+            v(-1, 61, 0),
+        ];
+        let cut: Vec<Vec<i64>> = sorted
+            .iter()
+            .map(|x| rungs(ddl, KeyValue::Wide(x.total())))
+            .collect();
+        assert!(cut.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(cut[0], [0, 29, 0, 0, 0, 0]);
+        assert_eq!(cut[1], [0, 29, 23, 59, 59, 999_999]);
+        assert_eq!(cut[2], [1, 0, 0, 0, 0, 0]);
+        assert_eq!(cut[3], [1, 0, 1, 0, 0, 0]);
+        // Equal intervals share a place: 1 day and 24 hours, 1 mon and 30 days.
+        assert_eq!(v(0, 1, 0).total(), v(0, 0, d).total());
+        assert_eq!(v(1, 0, 0).total(), v(0, 30, 0).total());
+        let (start, end) = (
+            rungs(ddl, KeyValue::Wide(Interval::NEG_INFINITY.total())),
+            rungs(ddl, KeyValue::Wide(Interval::INFINITY.total())),
+        );
+        let near = rungs(
+            ddl,
+            KeyValue::Wide(v(i32::MAX, i32::MAX, i64::MAX - 1).total()),
+        );
+        assert!(start < cut[0] && near < end);
     }
 
     #[test]

@@ -59,6 +59,11 @@ fn nan_columns(
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+/// The key under which a file out names the columns holding an extreme kept for a value its page
+/// form has no value of its own for: an infinity, or a time's 24:00:00. A reader reads each as the
+/// number it lies as.
+pub const EXTREMES_KEY: &str = "warren-snail.extremes";
+
 /// A table written out.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -73,6 +78,57 @@ pub struct TableOut {
     pub pages: u64,
     /// The blocks pruned on their way out.
     pub pruned: u64,
+    /// The columns holding an infinity or a time's 24:00:00, kept as the extremes of their page
+    /// forms.
+    pub extremes: Vec<String>,
+}
+
+/// The columns of `table` holding an extreme, by the least and greatest each block of `order` keeps
+/// of their leaves: an infinity at the ends of its leaf, a time's 24:00:00, an interval's infinity
+/// with each of its leaves at an end.
+fn held_extremes(table: &Table, order: &crate::catalog::Order, blocks: &[Entry]) -> Vec<String> {
+    use crate::times::TIME_END;
+    let mut out = Vec::new();
+    for (c, col) in table.columns.iter().enumerate() {
+        let Some(slots) = order.slots(table, c) else {
+            continue;
+        };
+        let holds = |at: &dyn Fn(&[crate::directory::Summary]) -> bool| {
+            blocks.iter().any(|e| {
+                let s = &e.columns[slots.clone()];
+                s[0].nulls < e.rows && at(s)
+            })
+        };
+        let ends = |lo: i128, hi: i128| {
+            move |s: &[crate::directory::Summary]| s[0].min == lo || s[0].max == hi
+        };
+        let found = match col.ty {
+            ColumnType::Date => holds(&ends(i32::MIN.into(), i32::MAX.into())),
+            ColumnType::Timestamptz
+            | ColumnType::TimestamptzRounded(_)
+            | ColumnType::Timestamp(_) => holds(&ends(i64::MIN.into(), i64::MAX.into())),
+            ColumnType::Time(_) | ColumnType::Timetz(_) => {
+                holds(&|s| s[0].max == i128::from(TIME_END))
+            }
+            ColumnType::Interval { .. } => holds(&|s| {
+                let at = |pick: fn(&crate::directory::Summary) -> i128, e: [i128; 3]| {
+                    s.iter().zip(e).all(|(x, e)| pick(x) == e)
+                };
+                at(
+                    |x| x.max,
+                    [i32::MAX.into(), i32::MAX.into(), i64::MAX.into()],
+                ) || at(
+                    |x| x.min,
+                    [i32::MIN.into(), i32::MIN.into(), i64::MIN.into()],
+                )
+            }),
+            _ => false,
+        };
+        if found {
+            out.push(col.name.clone());
+        }
+    }
+    out
 }
 
 /// A value's least or greatest, as Parquet orders the column: a number, bytes, or a float by its
@@ -374,6 +430,7 @@ impl Snail {
             })
             .collect::<Option<Vec<_>>>()
             .map(|levels| levels.concat());
+        let held_extremes = held_extremes(table, order, &blocks);
         let props = WriterProperties::builder()
             .set_writer_version(WriterVersion::PARQUET_1_0)
             .set_compression(Compression::UNCOMPRESSED)
@@ -393,6 +450,10 @@ impl Snail {
                 .chain(
                     nan_columns(table, order, &blocks)
                         .map(|v| KeyValue::new(NAN_KEY.to_string(), v)),
+                )
+                .chain(
+                    (!held_extremes.is_empty())
+                        .then(|| KeyValue::new(EXTREMES_KEY.to_string(), held_extremes.join(","))),
                 )
                 .collect(),
             ))
@@ -471,6 +532,7 @@ impl Snail {
             row_groups: blocks.len() as u64,
             pages,
             pruned,
+            extremes: held_extremes,
         })
     }
 
