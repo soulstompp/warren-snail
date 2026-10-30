@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod carry;
 pub mod catalog;
 pub mod cut;
 mod ddl;

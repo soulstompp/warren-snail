@@ -123,6 +123,17 @@ pub fn older_held(file: &File, generation: u64) -> Result<bool> {
     Ok(f.l_type != libc::F_UNLCK as libc::c_short)
 }
 
+/// Waits until no round of another file holds a generation older than `generation`, as long as it
+/// takes, holding no lock a round would wait for.
+pub fn wait_older_let_go(file: &File, generation: u64) -> Result<()> {
+    let mut nap = std::time::Duration::from_millis(1);
+    while older_held(file, generation)? {
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 /// A hash of bytes that is the same in every build: FNV-1a, 64 bits.
 #[derive(Clone, Copy)]
 struct Fnv(u64);

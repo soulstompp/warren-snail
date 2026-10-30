@@ -563,6 +563,20 @@ impl Snail {
         }
     }
 
+    /// Hands each commit from now on to the host before its root is written, which waits for the host
+    /// to return (`carry`).
+    pub fn carried_by(&mut self, host: Box<dyn crate::carry::Host>) -> Result<()> {
+        match self.writer.as_mut() {
+            Some(w) => {
+                w.carried_by(host);
+                Ok(())
+            }
+            None => Err(Error::new(
+                "this snail was opened to read; open it to write",
+            )),
+        }
+    }
+
     fn catalog(reader: &Reader, root: &Root) -> Result<Catalog> {
         let ddl = String::from_utf8(reader.read_extent(root.catalog)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;

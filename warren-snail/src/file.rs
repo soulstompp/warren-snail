@@ -186,7 +186,7 @@ impl<'a> In<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         In { buf, at: 0 }
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.at + n;
         if end > self.buf.len() {
             return Err(Error::new("the directory ends early"));
@@ -409,7 +409,7 @@ pub(crate) fn decode_free(buf: &[u8], format: u32) -> Result<(Vec<Run>, Spent)> 
 }
 
 impl Root {
-    fn encode(&self, format: u32) -> Result<Vec<u8>> {
+    pub(crate) fn encode(&self, format: u32) -> Result<Vec<u8>> {
         let mut o = Out::default();
         o.0.extend_from_slice(&MAGIC);
         o.u32(format);
@@ -450,7 +450,7 @@ impl Root {
     }
 
     /// A copy of the root and its format, where it is whole and of a format this build reads.
-    fn decode(page: &[u8]) -> Option<(Root, u32)> {
+    pub(crate) fn decode(page: &[u8]) -> Option<(Root, u32)> {
         let mut i = In::new(page);
         if i.take(8).ok()? != MAGIC {
             return None;
@@ -573,20 +573,20 @@ impl Place for Stage {
 
 /// The files a snail's pages lie in: the first, then `<path>.1`, `.2` and on, each holding the span's
 /// pages. Until the span is known from the root, every page is the first file's.
-struct Files {
+pub(crate) struct Files {
     path: PathBuf,
-    first: File,
+    pub(crate) first: File,
     rest: RefCell<Vec<Option<File>>>,
-    span: Cell<u64>,
+    pub(crate) span: Cell<u64>,
     /// The format the root names, once read.
-    format: Cell<u32>,
+    pub(crate) format: Cell<u32>,
     write: bool,
     /// The files written since they last reached the disk.
     dirty: RefCell<BTreeSet<u64>>,
 }
 
 impl Files {
-    fn open(path: &Path, write: bool, create: bool) -> Result<Files> {
+    pub(crate) fn open(path: &Path, write: bool, create: bool) -> Result<Files> {
         let first = OpenOptions::new()
             .read(true)
             .write(write)
@@ -606,9 +606,7 @@ impl Files {
 
     /// The path of the `n`th file.
     fn path_of(&self, n: u64) -> PathBuf {
-        let mut p = self.path.clone().into_os_string();
-        p.push(format!(".{n}"));
-        PathBuf::from(p)
+        path_of(&self.path, n)
     }
 
     fn with<T>(&self, n: u64, f: impl FnOnce(&File) -> std::io::Result<T>) -> Result<T> {
@@ -654,7 +652,7 @@ impl Files {
         out
     }
 
-    fn read_at(&self, buf: &mut [u8], page: u64) -> Result<()> {
+    pub(crate) fn read_at(&self, buf: &mut [u8], page: u64) -> Result<()> {
         for (n, at, k, from) in self.runs(page, (buf.len() / PAGE) as u64) {
             let b = &mut buf[from as usize * PAGE..(from + k) as usize * PAGE];
             self.with(n, |f| f.read_exact_at(b, at * PAGE as u64))?;
@@ -662,7 +660,7 @@ impl Files {
         Ok(())
     }
 
-    fn write_at(&self, buf: &[u8], page: u64) -> Result<()> {
+    pub(crate) fn write_at(&self, buf: &[u8], page: u64) -> Result<()> {
         for (n, at, k, from) in self.runs(page, (buf.len() / PAGE) as u64) {
             let b = &buf[from as usize * PAGE..(from + k) as usize * PAGE];
             self.with(n, |f| f.write_all_at(b, at * PAGE as u64))?;
@@ -672,12 +670,19 @@ impl Files {
     }
 
     /// Every file written reaches the disk.
-    fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&self) -> Result<()> {
         for n in std::mem::take(&mut *self.dirty.borrow_mut()) {
             self.with(n, |f| f.sync_data())?;
         }
         Ok(())
     }
+}
+
+/// The path of a snail's `n`th file, the first being the path itself.
+pub(crate) fn path_of(path: &Path, n: u64) -> PathBuf {
+    let mut p = path.to_path_buf().into_os_string();
+    p.push(format!(".{n}"));
+    PathBuf::from(p)
 }
 
 /// Reads whole pages, one `pread` a run, and counts every page it reads from the file. Built
@@ -948,7 +953,7 @@ impl Reader {
 
 /// The newer of the root's two copies, given as the file's first two pages, that is whole, and its
 /// format. A file whose root names a format this build does not read is refused by that format.
-fn newer(both: &[u8]) -> Result<(Root, u32)> {
+pub(crate) fn newer(both: &[u8]) -> Result<(Root, u32)> {
     match (Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])) {
         (Some(a), Some(b)) => Ok(if a.0.generation >= b.0.generation {
             a
@@ -990,6 +995,9 @@ pub struct Writer {
     /// The free runs a commit takes pages from before the file's last, and the runs it took.
     free: Vec<(u64, u64)>,
     taken: Vec<(u64, u64)>,
+    /// What carries each commit, where one does, and the pages the commit under way has written.
+    host: Option<Box<dyn crate::carry::Host>>,
+    carried: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Writer {
@@ -1012,6 +1020,8 @@ impl Writer {
             stop: None,
             free: Vec::new(),
             taken: Vec::new(),
+            host: None,
+            carried: BTreeMap::new(),
         })
     }
 
@@ -1031,6 +1041,8 @@ impl Writer {
                 stop: None,
                 free: Vec::new(),
                 taken: Vec::new(),
+                host: None,
+                carried: BTreeMap::new(),
             },
             root,
         ))
@@ -1057,6 +1069,12 @@ impl Writer {
         self.next = root.pages;
         self.free.clear();
         self.taken.clear();
+        self.carried.clear();
+    }
+
+    /// Carries each commit from now on by the host.
+    pub(crate) fn carried_by(&mut self, host: Box<dyn crate::carry::Host>) {
+        self.host = Some(host);
     }
 
     /// The first file, whose locks a writer holds on the blocks it changes and on the root's turn.
@@ -1174,18 +1192,33 @@ impl Place for Writer {
         buf.resize(bytes.len().div_ceil(PAGE).max(1) * PAGE, 0);
         self.files.write_at(&buf, start)?;
         self.written += (buf.len() / PAGE) as u64;
+        if self.host.is_some() {
+            for (i, page) in buf.chunks(PAGE).enumerate() {
+                self.carried.insert(start + i as u64, page.to_vec());
+            }
+        }
         Ok(())
     }
 }
 
 impl Writer {
     /// The commit: every page reaches the disk, then the root, written to the copy its generation
-    /// names.
+    /// names. Where a host carries the commits, the commit is handed to it once its pages are on
+    /// the disk, and its root is written only once the host returns.
     pub fn commit(&mut self, root: &mut Root) -> Result<()> {
         root.pages = self.next;
         root.span = self.files.span.get();
         self.files.sync()?;
         let bytes = root.encode(self.files.format.get())?;
+        if let Some(host) = self.host.as_mut() {
+            let pages = std::mem::take(&mut self.carried);
+            host.carry(&crate::carry::Commit::of(
+                root.generation,
+                pages,
+                &bytes,
+                root.span,
+            ))?;
+        }
         match self.stop {
             Some(Stop::BeforeRoot) => return Err(Error::new("the commit stopped before the root")),
             Some(Stop::HalfRoot) => {
@@ -1199,6 +1232,7 @@ impl Writer {
             None => {}
         }
         self.write_at(root.generation % 2, &bytes)?;
+        self.carried.clear();
         self.files.sync()?;
         Ok(())
     }
