@@ -93,6 +93,7 @@ pub(crate) fn unbuilt(name: &str) -> Error {
 mod library {
     use super::*;
 
+    #[non_exhaustive]
     pub struct Collator {
         pub spec: Spec,
     }
@@ -150,6 +151,7 @@ mod library {
 #[cfg(feature = "collations")]
 mod library {
     use super::*;
+    use std::cell::RefCell;
     use std::ffi::{c_char, CStr, CString};
     use std::sync::{Mutex, OnceLock};
 
@@ -287,34 +289,68 @@ mod library {
     }
 
     /// A collation opened: its library's collator or locale, and the version of its order.
+    #[non_exhaustive]
     pub struct Collator {
         pub spec: Spec,
         version: String,
         inner: Inner,
     }
 
-    // SAFETY: ICU's collators and case maps are read only through their const functions once
-    // opened, which ICU allows from any thread; a glibc locale_t is read only by the *_l functions.
+    // SAFETY: ICU's collators and case maps, and glibc's locale_t, may be used from any thread,
+    // though by one thread at a time; each thread opens and keeps its own (`at`).
     unsafe impl Send for Collator {}
-    unsafe impl Sync for Collator {}
 
-    static OPEN: Mutex<Vec<&'static Collator>> = Mutex::new(Vec::new());
+    /// The collations opened, by the number `open` gives each: the same on every thread.
+    static SPECS: Mutex<Vec<Spec>> = Mutex::new(Vec::new());
 
-    /// The collator of `spec`, opened once and kept as long as the program runs, as a backend keeps
-    /// the locales it builds; with the number it is found by. `name` names it in a refusal.
-    pub fn open(spec: &Spec, name: &str) -> Result<(u16, &'static Collator)> {
-        let mut open = OPEN.lock().unwrap();
-        if let Some(at) = open.iter().position(|c| c.spec == *spec) {
-            return Ok((at as u16, open[at]));
-        }
-        let c: &'static Collator = Box::leak(Box::new(make(spec, name)?));
-        open.push(c);
-        Ok(((open.len() - 1) as u16, c))
+    std::thread_local! {
+        /// This thread's collator of each collation opened, as a backend keeps the locales it
+        /// builds, kept as long as the program runs.
+        static HELD: RefCell<Vec<Option<&'static Collator>>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// The collator `open` gave the number `id`.
+    /// The collator of `spec` on this thread, with the number it is found by on any. `name` names
+    /// it in a refusal.
+    pub fn open(spec: &Spec, name: &str) -> Result<(u16, &'static Collator)> {
+        let id = {
+            let mut specs = SPECS.lock().unwrap();
+            match specs.iter().position(|s| s == spec) {
+                Some(at) => at,
+                None => {
+                    let c = make(spec, name)?;
+                    specs.push(spec.clone());
+                    let id = specs.len() - 1;
+                    HELD.with_borrow_mut(|h| {
+                        h.resize(id + 1, None);
+                        h[id] = Some(Box::leak(Box::new(c)));
+                    });
+                    id
+                }
+            }
+        };
+        Ok((id as u16, at(id, name)?))
+    }
+
+    /// This thread's collator of the collation numbered `id`, opened here the first time.
+    fn at(id: usize, name: &str) -> Result<&'static Collator> {
+        if let Some(c) = HELD.with_borrow(|h| h.get(id).copied().flatten()) {
+            return Ok(c);
+        }
+        let spec = SPECS.lock().unwrap()[id].clone();
+        let c: &'static Collator = Box::leak(Box::new(make(&spec, name)?));
+        HELD.with_borrow_mut(|h| {
+            if h.len() <= id {
+                h.resize(id + 1, None);
+            }
+            h[id] = Some(c);
+        });
+        Ok(c)
+    }
+
+    /// The collator `open` gave the number `id`, on this thread.
     pub fn get(id: u16) -> &'static Collator {
-        OPEN.lock().unwrap()[id as usize]
+        at(id as usize, "")
+            .expect("a collation opened on one thread opens on another, its library the same")
     }
 
     fn make(spec: &Spec, name: &str) -> Result<Collator> {
