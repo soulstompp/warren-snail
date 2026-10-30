@@ -1,7 +1,7 @@
 //! A row as a write fills it: a value assigned to a column of another type as PostgreSQL's
 //! assignment casts take it, a stored generated column computed, and a table's CHECKs checked.
 
-use super::pipeline::{eval_on, numeric_text, Value};
+use super::pipeline::{eval_on, numeric_text, Casings, Value};
 use super::statement::{Datum, Row};
 use crate::catalog::{ColumnType, Table};
 use crate::{Error, Result};
@@ -379,7 +379,13 @@ pub fn generate(table: &Table, row: &mut Row) -> Result<()> {
         if let Some(g) = &col.generated {
             row[c] = if g.stored {
                 assign_value(
-                    eval_on(&g.expr, &names, &vals, table.release)?,
+                    eval_on(
+                        &g.expr,
+                        &names,
+                        &vals,
+                        table.release,
+                        &Casings::of_table(table, &[]),
+                    )?,
                     col.ty,
                     &col.name,
                 )?
@@ -402,7 +408,13 @@ pub fn with_virtual(table: &Table, row: &Row) -> Result<Row> {
     for (c, col) in table.columns.iter().enumerate() {
         if let Some(g) = col.generated.as_ref().filter(|g| !g.stored) {
             out[c] = assign_value(
-                eval_on(&g.expr, &names, &vals, table.release)?,
+                eval_on(
+                    &g.expr,
+                    &names,
+                    &vals,
+                    table.release,
+                    &Casings::of_table(table, &[]),
+                )?,
                 col.ty,
                 &col.name,
             )?;
@@ -421,7 +433,13 @@ pub fn check(table: &Table, row: &Row) -> Result<()> {
     let names = names(table);
     let vals = values(table, &full);
     for k in table.checks.iter().filter(|k| k.enforced) {
-        match eval_on(&k.expr, &names, &vals, table.release)? {
+        match eval_on(
+            &k.expr,
+            &names,
+            &vals,
+            table.release,
+            &Casings::of_table(table, &[]),
+        )? {
             Value::Bool(false) => {
                 return Err(Error::new(format!(
                     "new row for relation \"{}\" violates check constraint \"{}\"",

@@ -4,7 +4,7 @@
 //! groups nothing. The expressions it reads are CASE, mod, abs, casts, comparisons, IS [NOT]
 //! DISTINCT FROM, and the aggregates count, sum, min, max, bool_and and bool_or.
 
-use crate::catalog::ColumnType;
+use crate::catalog::{Casing, ColumnType};
 use crate::{Error, Result};
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -216,6 +216,97 @@ struct Frame<'a> {
     params: &'a [String],
     /// The release whose catalog names a reg* value.
     release: u8,
+    /// How the columns map case, by their names.
+    casings: &'a Casings,
+}
+
+/// How the columns a statement reads and makes map case, by their names, where not as the
+/// database's default does: a string column under a collation its DDL or a COLLATE names, a name
+/// under its own C; and the collations the DDL makes. A name two columns map differently by maps
+/// as the default.
+#[derive(Clone, Debug, Default)]
+pub struct Casings {
+    columns: HashMap<String, Casing>,
+    declared: Vec<crate::catalog::Collation>,
+}
+
+impl Casings {
+    /// The casings of a table's columns, and the collations the DDL makes.
+    pub fn of_table(
+        table: &crate::catalog::Table,
+        declared: &[crate::catalog::Collation],
+    ) -> Casings {
+        let mut c = Casings {
+            columns: HashMap::new(),
+            declared: declared.to_vec(),
+        };
+        for col in &table.columns {
+            let named = match (&col.collation, col.ty) {
+                (Some(n), _) => crate::catalog::collation_held(n, declared),
+                (None, ColumnType::Name) => Some(Casing::Ascii),
+                _ => None,
+            };
+            if let Some(k) = named {
+                c.columns.insert(col.name.clone(), k);
+            }
+        }
+        c
+    }
+
+    /// How the collation named maps case, where the snail holds it.
+    fn named(&self, name: &str) -> Result<Casing> {
+        crate::catalog::collation_held(name, &self.declared)
+            .ok_or_else(|| Error::new(format!("COLLATE {name}: {}", crate::catalog::NOT_HELD)))
+    }
+
+    /// The casing an expression's text takes where a COLLATE or a column names one, as PostgreSQL
+    /// carries a collation from a column or a COLLATE to what a function makes of it.
+    fn implicit(&self, e: &Expr) -> Result<Option<Casing>> {
+        Ok(match e {
+            Expr::Collate { collation, .. } => {
+                Some(self.named(&crate::catalog::object_name(collation))?)
+            }
+            Expr::Nested(x) => self.implicit(x)?,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                column_of(e).and_then(|(_, n)| self.columns.get(&n).copied())
+            }
+            Expr::Function(f) => match args(f).ok().and_then(|a| a.first().copied()) {
+                Some(x) => self.implicit(x)?,
+                None => None,
+            },
+            Expr::BinaryOp { left, right, .. } => match self.implicit(left)? {
+                Some(k) => Some(k),
+                None => self.implicit(right)?,
+            },
+            _ => None,
+        })
+    }
+
+    /// The casings a step's columns take, by their names, added: each where its expression names
+    /// one, and none where two columns of one name map differently.
+    fn add_step(&mut self, q: &Query) -> Result<()> {
+        let SetExpr::Select(sel) = q.body.as_ref() else {
+            return Ok(());
+        };
+        for item in &sel.projection {
+            let (e, name) = match item {
+                SelectItem::UnnamedExpr(e) => (e, default_name(e)),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, ident(alias)),
+                _ => continue,
+            };
+            let k = self.implicit(e)?;
+            match (self.columns.get(&name).copied(), k) {
+                (None, Some(k)) => {
+                    self.columns.insert(name, k);
+                }
+                (Some(had), k) if Some(had) != k => {
+                    self.columns.remove(&name);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Frame<'_> {
@@ -1199,6 +1290,13 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             row[frame.find(q.as_deref(), &n)?].clone()
         }
         Expr::Nested(x) => ev(x)?,
+        // Every collation the snail holds orders text by its bytes: a COLLATE changes no value.
+        Expr::Collate { expr, collation } => {
+            frame
+                .casings
+                .named(&crate::catalog::object_name(collation))?;
+            ev(expr)?
+        }
         Expr::Value(v) => match &v.value {
             SqlValue::Number(s, _) if s.contains(['e', 'E']) => {
                 let (m, sc) = numeric_parts(s)?;
@@ -1369,6 +1467,24 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             let a = args(f)?;
             match (name.as_str(), a.as_slice()) {
                 ("mod", [x, y]) => numeric_op(&ev(x)?, &ev(y)?, i128::checked_rem)?,
+                // Under the collation its argument carries, the database's default where none.
+                ("upper" | "lower", [x]) => {
+                    let casing = frame.casings.implicit(x)?.unwrap_or(Casing::Libc);
+                    match ev(x)? {
+                        Value::Null => Value::Null,
+                        v @ (Value::Text(_) | Value::Str(..)) => Value::Text(crate::strings::case(
+                            std::str::from_utf8(v.string_key().unwrap()).unwrap_or_default(),
+                            name == "upper",
+                            casing,
+                        )?),
+                        other => {
+                            return Err(Error::new(format!(
+                                "function {name}({}) does not exist",
+                                kind_name(&other)
+                            )))
+                        }
+                    }
+                }
                 ("abs", [x]) => match ev(x)? {
                     Value::Null => Value::Null,
                     Value::Int(v) => Value::Int(
@@ -1839,11 +1955,18 @@ fn prepare(q: &Query) -> Result<Prepared<'_>> {
 
 /// An expression on one row whose columns the names give, read alone: a CHECK's, a generated
 /// column's, or a DEFAULT's on no row.
-pub(crate) fn eval_on(e: &Expr, names: &[String], row: &[Value], release: u8) -> Result<Value> {
+pub(crate) fn eval_on(
+    e: &Expr,
+    names: &[String],
+    row: &[Value],
+    release: u8,
+    casings: &Casings,
+) -> Result<Value> {
     let frame = Frame {
         columns: names.iter().map(|n| (None, n.clone())).collect(),
         params: &[],
         release,
+        casings,
     };
     eval(e, row, &frame, &computed_none())
 }
@@ -1903,11 +2026,13 @@ impl<'q> StepRun<'q> {
         columns: Columns,
         params: &[String],
         release: u8,
+        casings: &Casings,
     ) -> Result<Option<Relation>> {
         let frame = Frame {
             columns,
             params,
             release,
+            casings,
         };
         let none = computed_none();
         if let Some(w) = self.p.selection {
@@ -1984,7 +2109,7 @@ impl<'q> StepRun<'q> {
     }
 
     /// The rows a step that groups or sorts returns, once every chunk is read.
-    fn finish(mut self, params: &[String], release: u8) -> Result<Relation> {
+    fn finish(mut self, params: &[String], release: u8, casings: &Casings) -> Result<Relation> {
         let mut out = Relation {
             names: self.names(),
             rows: std::mem::take(&mut self.rows),
@@ -2000,6 +2125,7 @@ impl<'q> StepRun<'q> {
                 columns: std::mem::take(&mut self.columns),
                 params,
                 release,
+                casings,
             };
             for (first, accs) in &self.groups {
                 let computed = Computed {
@@ -2023,7 +2149,7 @@ impl<'q> StepRun<'q> {
             }
         }
         if let Some(ob) = self.p.order_by {
-            sort(&mut out, ob, params, release)?;
+            sort(&mut out, ob, params, release, casings)?;
         }
         Ok(out)
     }
@@ -2035,6 +2161,7 @@ fn sort(
     ob: &sqlparser::ast::OrderBy,
     params: &[String],
     release: u8,
+    casings: &Casings,
 ) -> Result<()> {
     let exprs = match &ob.kind {
         OrderByKind::Expressions(e) => e,
@@ -2044,6 +2171,7 @@ fn sort(
         columns: out.names.iter().map(|n| (None, n.clone())).collect(),
         params,
         release,
+        casings,
     };
     let none = computed_none();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = std::mem::take(&mut out.rows)
@@ -2126,6 +2254,7 @@ fn select(
     table: &Table,
     params: &[String],
     release: u8,
+    casings: &Casings,
 ) -> Result<Relation> {
     let p = prepare(q)?;
     let (rel, columns) = if p.from.is_empty() {
@@ -2141,9 +2270,9 @@ fn select(
         from(p.from, steps, table)?
     };
     let mut run = StepRun::new(p);
-    match run.feed(rel, columns, params, release)? {
+    match run.feed(rel, columns, params, release, casings)? {
         Some(out) => Ok(out),
-        None => run.finish(params, release),
+        None => run.finish(params, release, casings),
     }
 }
 
@@ -2187,6 +2316,7 @@ pub struct Stream<'q> {
     params: Vec<String>,
     /// The release whose catalog names a reg* value.
     release: u8,
+    casings: Casings,
     /// Each step, and last the question itself under no name.
     steps: Vec<(String, &'q Query, Kind)>,
     runs: Vec<Option<StepRun<'q>>>,
@@ -2209,6 +2339,7 @@ impl<'q> Stream<'q> {
         order: Option<usize>,
         params: &[String],
         release: u8,
+        casings: Casings,
     ) -> Result<Stream<'q>> {
         let mut s = Stream {
             table: Table {
@@ -2221,6 +2352,7 @@ impl<'q> Stream<'q> {
             },
             params: params.to_vec(),
             release,
+            casings,
             steps: Vec::new(),
             runs: Vec::new(),
             view: HashMap::new(),
@@ -2255,6 +2387,7 @@ impl<'q> Stream<'q> {
                 }
             }
             let p = prepare(query)?;
+            s.casings.add_step(query)?;
             let kind = if after {
                 for n in streamed {
                     s.kept.entry(n).or_insert_with(|| Relation {
@@ -2274,7 +2407,7 @@ impl<'q> Stream<'q> {
                 Kind::Fixed
             };
             if kind == Kind::Fixed {
-                let r = select(query, &s.view, &s.table, params, release)?;
+                let r = select(query, &s.view, &s.table, params, release, &s.casings)?;
                 s.view.insert(name.clone(), r);
             }
             s.runs.push(match kind {
@@ -2323,7 +2456,7 @@ impl<'q> Stream<'q> {
             }
             let run = self.runs[i].as_mut().unwrap();
             let (rel, columns) = from(run.p.from, &self.view, &table)?;
-            if let Some(out) = run.feed(rel, columns, &self.params, self.release)? {
+            if let Some(out) = run.feed(rel, columns, &self.params, self.release, &self.casings)? {
                 if let Some(k) = self.kept.get_mut(name) {
                     gather(k, &out);
                 }
@@ -2383,11 +2516,19 @@ impl<'q> Stream<'q> {
                     Some(k) => k,
                     None => continue,
                 },
-                Kind::Folded => self.runs[i]
-                    .take()
-                    .unwrap()
-                    .finish(&self.params, self.release)?,
-                Kind::After => select(query, &whole, &table, &self.params, self.release)?,
+                Kind::Folded => self.runs[i].take().unwrap().finish(
+                    &self.params,
+                    self.release,
+                    &self.casings,
+                )?,
+                Kind::After => select(
+                    query,
+                    &whole,
+                    &table,
+                    &self.params,
+                    self.release,
+                    &self.casings,
+                )?,
             };
             whole.insert(name, r);
         }
@@ -2417,6 +2558,7 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
         table.relation.order,
         params,
         crate::regs::LATEST,
+        Casings::default(),
     )?;
     s.feed(table.relation.clone())?;
     s.finish()
@@ -2833,6 +2975,7 @@ mod tests {
                 t.relation.order,
                 &[],
                 crate::regs::LATEST,
+                Casings::default(),
             )
             .unwrap();
             for part in [&t.relation.rows[..2], &t.relation.rows[2..]] {

@@ -442,6 +442,153 @@ pub fn bits_key_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Opt
     }
 }
 
+/// PostgreSQL 19's own Unicode case tables (`cases.txt`, written by inner-warren's `cases.nu` from
+/// its source): each code point's simple lower and upper case, the full mappings, and the code
+/// points Unicode calls Cased and Case_Ignorable.
+struct Cases {
+    simple: std::collections::HashMap<u32, (u32, u32)>,
+    /// A code point's full lower and upper case, and whether it is mapped so only as a final sigma.
+    special: std::collections::HashMap<u32, (bool, Vec<u32>, Vec<u32>)>,
+    cased: Vec<(u32, u32)>,
+    ignorable: Vec<(u32, u32)>,
+}
+
+fn cases() -> &'static Cases {
+    static CASES: std::sync::OnceLock<Cases> = std::sync::OnceLock::new();
+    CASES.get_or_init(|| {
+        let hex = |s: &str| u32::from_str_radix(s, 16).expect("a code point of cases.txt");
+        let cps =
+            |s: &str| -> Vec<u32> { s.split(',').filter(|x| !x.is_empty()).map(hex).collect() };
+        let mut c = Cases {
+            simple: Default::default(),
+            special: Default::default(),
+            cased: Vec::new(),
+            ignorable: Vec::new(),
+        };
+        let mut section = "";
+        for line in include_str!("cases.txt").lines() {
+            if let Some(name) = line.strip_prefix("= ") {
+                section = name;
+                continue;
+            }
+            let f: Vec<&str> = line.split(' ').collect();
+            match section {
+                "map" => {
+                    c.simple.insert(hex(f[0]), (hex(f[1]), hex(f[2])));
+                }
+                "special" => {
+                    let lower = cps(f.get(2).copied().unwrap_or_default());
+                    let upper = cps(f.get(3).copied().unwrap_or_default());
+                    c.special.insert(hex(f[0]), (f[1] == "1", lower, upper));
+                }
+                "cased" => c.cased.push((hex(f[0]), hex(f[1]))),
+                _ => c.ignorable.push((hex(f[0]), hex(f[1]))),
+            }
+        }
+        c.ignorable.sort();
+        c
+    })
+}
+
+fn in_ranges(ranges: &[(u32, u32)], cp: u32) -> bool {
+    ranges.iter().any(|&(lo, hi)| lo <= cp && cp <= hi)
+}
+
+/// Whether the character at `at`, a sigma, ends a word as Unicode's Final_Sigma says: a cased
+/// character before it and none after, each passing over the case-ignorable ones.
+fn final_sigma(chars: &[char], at: usize) -> bool {
+    let c = cases();
+    let first_cased = |mut it: Box<dyn Iterator<Item = &char> + '_>| {
+        it.find(|&&x| !in_ranges(&c.ignorable, x as u32))
+            .is_some_and(|&x| in_ranges(&c.cased, x as u32))
+    };
+    first_cased(Box::new(chars[..at].iter().rev()))
+        && !first_cased(Box::new(chars[at + 1..].iter()))
+}
+
+/// glibc's C.UTF-8, the locale libc's C.utf8 and the database's default map case under.
+fn c_utf8() -> Result<libc::locale_t> {
+    static LOCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let at = *LOCALE.get_or_init(|| {
+        // SAFETY: newlocale reads the NUL-terminated name and makes a locale of its own.
+        let loc = unsafe {
+            libc::newlocale(
+                libc::LC_CTYPE_MASK,
+                c"C.UTF-8".as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        loc as usize
+    });
+    if at == 0 {
+        return Err(Error::new(
+            "this machine's C library has no C.UTF-8, which libc's C.utf8 maps case under",
+        ));
+    }
+    Ok(at as libc::locale_t)
+}
+
+extern "C" {
+    fn towlower_l(wc: u32, locale: libc::locale_t) -> u32;
+    fn towupper_l(wc: u32, locale: libc::locale_t) -> u32;
+}
+
+/// A text in upper case, or in lower case where `!upper`, as PostgreSQL's upper and lower map it
+/// under a collation that maps case as `casing`: ASCII's letters alone; PostgreSQL 19's own Unicode
+/// tables, a character to a character, or under `Full` to its full mapping where it has one, a
+/// sigma that ends a word lowered to a final sigma; glibc's C.UTF-8, a character to a character.
+pub fn case(s: &str, upper: bool, casing: crate::catalog::Casing) -> Result<String> {
+    use crate::catalog::Casing;
+    Ok(match casing {
+        Casing::Ascii => {
+            if upper {
+                s.to_ascii_uppercase()
+            } else {
+                s.to_ascii_lowercase()
+            }
+        }
+        Casing::Libc => {
+            let loc = c_utf8()?;
+            s.chars()
+                .map(|ch| {
+                    // SAFETY: the locale lives as long as the program; any code point is a wint_t.
+                    let m = unsafe {
+                        if upper {
+                            towupper_l(ch as u32, loc)
+                        } else {
+                            towlower_l(ch as u32, loc)
+                        }
+                    };
+                    char::from_u32(m).unwrap_or(ch)
+                })
+                .collect()
+        }
+        Casing::Simple | Casing::Full => {
+            let c = cases();
+            let chars: Vec<char> = s.chars().collect();
+            let mut out = String::with_capacity(s.len());
+            for (at, &ch) in chars.iter().enumerate() {
+                let cp = ch as u32;
+                if casing == Casing::Full {
+                    if let Some((sigma, lower, up)) = c.special.get(&cp) {
+                        if !sigma || final_sigma(&chars, at) {
+                            let to = if upper { up } else { lower };
+                            out.extend(to.iter().filter_map(|&x| char::from_u32(x)));
+                            continue;
+                        }
+                    }
+                }
+                let to = c
+                    .simple
+                    .get(&cp)
+                    .map_or(cp, |&(lo, up)| if upper { up } else { lo });
+                out.push(char::from_u32(to).unwrap_or(ch));
+            }
+            out
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +780,30 @@ mod tests {
                 all[j]
             );
         }
+    }
+
+    #[test]
+    fn case_is_mapped_as_each_collation_maps_it() {
+        use crate::catalog::Casing::*;
+        let up = |s: &str, c| case(s, true, c).unwrap();
+        let low = |s: &str, c| case(s, false, c).unwrap();
+        assert_eq!(up("élan ÉLAN", Ascii), "éLAN ÉLAN");
+        assert_eq!(low("élan ÉLAN", Ascii), "élan Élan");
+        for c in [Simple, Full, Libc] {
+            assert_eq!(up("élan", c), "ÉLAN", "{c:?}");
+        }
+        assert_eq!(up("straße", Simple), "STRAßE");
+        assert_eq!(up("straße", Full), "STRASSE");
+        assert_eq!(up("ŉ", Full), "ʼN");
+        assert_eq!(low("ΣΑΣ ΟΔΟΣ", Simple), "σασ οδοσ");
+        assert_eq!(low("ΣΑΣ ΟΔΟΣ", Full), "σας οδος");
+        // A sigma no cased letter comes before is no final one; nor one a letter follows.
+        assert_eq!(low("Σ", Full), "σ");
+        assert_eq!(low("ΑΣ'Β", Full), "ασ'β");
+        assert_eq!(low("ΑΣ.", Full), "ας.");
+        assert_eq!(low("İstanbul", Simple), "istanbul");
+        assert_eq!(low("İstanbul", Full), "i\u{307}stanbul");
+        assert_eq!(low("İstanbul", Libc), "istanbul");
+        assert_eq!(up("ǆemal", Libc), "ǄEMAL");
     }
 }

@@ -890,7 +890,7 @@ impl Snail {
             return statement::datum(e, t, c);
         }
         fill::assign_value(
-            super::pipeline::eval_on(e, &[], &[], t.release)?,
+            super::pipeline::eval_on(e, &[], &[], t.release, &Default::default())?,
             col.ty,
             &col.name,
         )

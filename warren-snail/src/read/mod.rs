@@ -1098,8 +1098,15 @@ impl Snail {
             .iter()
             .map(|&c| table.columns[c].name.clone())
             .collect();
-        let mut stream =
-            pipeline::Stream::new(q, &table.name, names, along, params, table.release)?;
+        let mut stream = pipeline::Stream::new(
+            q,
+            &table.name,
+            names,
+            along,
+            params,
+            table.release,
+            pipeline::Casings::of_table(table, &self.catalog.collations),
+        )?;
         // Each block's rows go to the pipeline as the scan reads them, in the order.
         let mut blocks = Blocks {
             table,

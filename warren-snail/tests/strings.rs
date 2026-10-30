@@ -782,3 +782,59 @@ fn the_collations_of_byte_order_are_held_and_any_other_refused_by_name() {
         .to_string();
     assert!(e.contains("only a collation of byte order"), "{e}");
 }
+
+#[test]
+fn case_follows_the_collation_a_column_or_a_collate_names() {
+    let path = snail_of(
+        "case-collations",
+        "CREATE TABLE s.t (id integer NOT NULL, d text, c text COLLATE \"C\", f text COLLATE \
+         pg_unicode_fast, n name, PRIMARY KEY (id));",
+        vec![
+            Values::Int(vec![Some(1)]),
+            Values::Text(vec![Some("straße é".into())]),
+            Values::Text(vec![Some("straße é".into())]),
+            Values::Text(vec![Some("straße é".into())]),
+            Values::Text(vec![Some("straße é".into())]),
+        ],
+    );
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, _) = snail
+        .ask(
+            "WITH t AS (SELECT id, d, c, f, n FROM s.t) SELECT upper(d) AS d, upper(c) AS c, \
+             upper(f) AS f, upper(n) AS n, upper(d COLLATE pg_c_utf8) AS s, \
+             upper(d COLLATE \"POSIX\") AS p FROM t",
+            None,
+        )
+        .unwrap();
+    let row: Vec<Option<String>> = (0..6).map(|c| texts(&b, c)[0].clone()).collect();
+    let some = |s: &str| Some(s.to_string());
+    // The default glibc's C.UTF-8, C ASCII's letters alone, pg_unicode_fast in full, a name under
+    // its own C, pg_c_utf8 a character to a character.
+    assert_eq!(
+        row,
+        [
+            some("STRAßE É"),
+            some("STRAßE é"),
+            some("STRASSE É"),
+            some("STRAßE é"),
+            some("STRAßE É"),
+            some("STRAßE é")
+        ]
+    );
+    // A column a step renames keeps its collation.
+    let (b, _) = snail
+        .ask(
+            "WITH t AS (SELECT id, f AS g FROM s.t) SELECT lower(upper(g)) AS x FROM t",
+            None,
+        )
+        .unwrap();
+    assert_eq!(texts(&b, 0)[0].as_deref(), Some("strasse é"));
+    let e = snail
+        .ask(
+            "WITH t AS (SELECT id, d FROM s.t) SELECT upper(d COLLATE \"en_US.utf8\") AS x FROM t",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("only a collation of byte order"), "{e}");
+}
