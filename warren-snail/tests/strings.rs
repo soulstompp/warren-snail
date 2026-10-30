@@ -816,8 +816,19 @@ fn the_collations_of_byte_order_are_held_and_any_other_refused_by_name() {
         let ddl = format!(
             "CREATE TABLE s.t (id integer NOT NULL, v text COLLATE {c}, PRIMARY KEY (id));"
         );
+        // With the feature collations, a collation a library orders is taken.
+        if cfg!(feature = "collations") && c != "c" {
+            let k = Catalog::parse(&ddl).unwrap_or_else(|e| panic!("{c}: {e}"));
+            assert!(k.tables[0].columns[1].collated(), "{c}");
+            continue;
+        }
         let e = Catalog::parse(&ddl).unwrap_err().to_string();
-        assert!(e.contains("only a collation of byte order"), "{c}: {e}");
+        let named = if cfg!(feature = "collations") {
+            "does not exist"
+        } else {
+            "only a collation of byte order"
+        };
+        assert!(e.contains(named), "{c}: {e}");
     }
     let c = Catalog::parse(
         "CREATE COLLATION s.fast (provider = builtin, locale = 'PG_UNICODE_FAST'); \
@@ -827,10 +838,13 @@ fn the_collations_of_byte_order_are_held_and_any_other_refused_by_name() {
     )
     .unwrap();
     assert_eq!(c.collations.len(), 2);
-    let e = Catalog::parse("CREATE COLLATION s.us (provider = libc, locale = 'en_US.utf8');")
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("only a collation of byte order"), "{e}");
+    let us = Catalog::parse("CREATE COLLATION s.us (provider = libc, locale = 'en_US.utf8');");
+    if cfg!(feature = "collations") {
+        assert_eq!(us.unwrap().collations.len(), 1);
+    } else {
+        let e = us.unwrap_err().to_string();
+        assert!(e.contains("only a collation of byte order"), "{e}");
+    }
 }
 
 #[test]
@@ -879,14 +893,17 @@ fn case_follows_the_collation_a_column_or_a_collate_names() {
         )
         .unwrap();
     assert_eq!(texts(&b, 0)[0].as_deref(), Some("strasse é"));
-    let e = snail
-        .ask(
-            "WITH t AS (SELECT id, d FROM s.t) SELECT upper(d COLLATE \"en_US.utf8\") AS x FROM t",
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("only a collation of byte order"), "{e}");
+    // A collation a library orders: glibc's en_US.utf8 with the feature collations, its ß kept.
+    let us = snail.ask(
+        "WITH t AS (SELECT id, d FROM s.t) SELECT upper(d COLLATE \"en_US.utf8\") AS x FROM t",
+        None,
+    );
+    if cfg!(feature = "collations") {
+        assert_eq!(texts(&us.unwrap().0, 0), [some("STRAßE É")]);
+    } else {
+        let e = us.unwrap_err().to_string();
+        assert!(e.contains("only a collation of byte order"), "{e}");
+    }
 }
 
 #[test]
