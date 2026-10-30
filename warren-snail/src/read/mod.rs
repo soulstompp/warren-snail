@@ -17,7 +17,7 @@ pub mod statement;
 mod walk;
 
 pub use change::Done;
-pub use out::{TableOut, DDL_KEY, RELEASE_KEY};
+pub use out::{TableOut, DDL_KEY, NAN_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 
 /// An answer's rows as values, as a pipeline reads them.

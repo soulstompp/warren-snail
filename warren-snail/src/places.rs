@@ -6,6 +6,10 @@
 //! microsecond. A month is cut by the year's halves, then the month. Text is cut by its bytes, the
 //! first one first, a value that has ended coming before any byte.
 //!
+//! A numeric past 18 digits is cut by its decimal digits: one of 19 to 38 digits by those of its
+//! integer offset by 10^38, the first one first; any other by the bytes of its class's key, whose
+//! bytes past its kind and the place of its first digit are its digits.
+//!
 //! A level's NULL rows lie on their own cycle: a run after every value of the level at each of its
 //! sublevels, or before them where the level holds its NULLs first, cut on the levels after it.
 
@@ -257,6 +261,7 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             | ColumnType::Reg(..)
             | ColumnType::Xid
             | ColumnType::Cid => 32,
+            ColumnType::Numeric { precision, .. } if precision > 18 => WIDE_DECIMAL_DIGITS as usize,
             ColumnType::Int8
             | ColumnType::Numeric { .. }
             | ColumnType::Xid8
@@ -272,9 +277,10 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Boolean => 1,
             ColumnType::Uuid => 128,
             ColumnType::Bit(n) => n as usize,
-            ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name => {
-                text_sublevels as usize
-            }
+            ColumnType::Text(_)
+            | ColumnType::Bpchar(_)
+            | ColumnType::Name
+            | ColumnType::NumericText(_) => text_sublevels as usize,
             ColumnType::Bytes | ColumnType::Varbit(_) => {
                 (text_sublevels & !crate::directory::BYTES_LEVEL) as usize
             }
@@ -282,11 +288,21 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
     }
 }
 
+/// The decimal digits a numeric of 19 to 38 digits is cut by: those of its integer offset by 10^38.
+const WIDE_DECIMAL_DIGITS: u32 = 39;
+
+/// Decimal digit `r` of a numeric's integer offset by 10^38, the first one first.
+fn decimal_digit(k: i128, r: usize) -> i64 {
+    let biased = (k as u128).wrapping_add(10u128.pow(38));
+    ((biased / 10u128.pow(WIDE_DECIMAL_DIGITS - 1 - r as u32)) % 10) as i64
+}
+
 fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
     match key {
         KeyValue::Text(s) => return s.as_bytes().get(r).map_or(-1, |&b| b as i64),
         KeyValue::Null { first: true } => return i64::MIN,
         KeyValue::Null { first: false } => return i64::MAX,
+        KeyValue::Wide(k) if ty.is_numeric() => return decimal_digit(*k, r),
         KeyValue::Wide(k) => return ((k.wrapping_sub(i128::MIN) as u128 >> (127 - r)) & 1) as i64,
         // A bit string is cut by its bits, each a place of three, an ended one first; bytea by its
         // bytes, as text is.
@@ -342,7 +358,10 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             | ColumnType::Bpchar(_)
             | ColumnType::Name
             | ColumnType::Bit(_)
-            | ColumnType::Varbit(_) => unreachable!("a string level keys text, a bit string bytes"),
+            | ColumnType::Varbit(_)
+            | ColumnType::NumericText(_) => {
+                unreachable!("a level of a string or a numeric text keys text, a bit string bytes")
+            }
             ColumnType::Uuid => unreachable!("a uuid level keys 128 bits"),
         },
     }

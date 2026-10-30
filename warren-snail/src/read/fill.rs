@@ -1,9 +1,10 @@
 //! A row as a write fills it: a value assigned to a column of another type as PostgreSQL's
 //! assignment casts take it, a stored generated column computed, and a table's CHECKs checked.
 
-use super::pipeline::{eval_on, numeric_text, Casings, Value};
+use super::pipeline::{eval_on, Casings, Value};
 use super::statement::{Datum, Row};
 use crate::catalog::{ColumnType, Table};
+use crate::numeric::Numeric;
 use crate::{Error, Result};
 use chrono::{Datelike, Timelike};
 
@@ -42,14 +43,51 @@ pub fn instant_text(micros: i64) -> String {
     out
 }
 
+/// A numeric column's value as the number it is.
+pub(crate) fn numeric_of(d: &Datum, ty: ColumnType) -> Option<Numeric> {
+    match (d, ty) {
+        (Datum::Int(u), ColumnType::Numeric { precision, scale }) => Some(
+            crate::numeric::column_numeric(i128::from(*u), precision, scale),
+        ),
+        (Datum::Wide(u), ColumnType::Numeric { precision, scale }) => {
+            Some(crate::numeric::column_numeric(*u, precision, scale))
+        }
+        (Datum::Text(s), ColumnType::NumericText(_)) => Numeric::parse(s).ok(),
+        _ => None,
+    }
+}
+
+/// A number held to a numeric column's type, as the column's datum: rounded to its scale and
+/// refused past its digits, as PostgreSQL holds a value to a typmod.
+pub(crate) fn numeric_datum(n: Numeric, ty: ColumnType) -> Result<Datum> {
+    match ty {
+        ColumnType::Numeric { precision, scale } => {
+            let u = crate::numeric::column_units(&n, precision, scale)?;
+            Ok(if precision > 18 {
+                Datum::Wide(u)
+            } else {
+                Datum::Int(u as i64)
+            })
+        }
+        ColumnType::NumericText(t) => {
+            let n = match t {
+                Some((p, s)) => n.typmod(u32::from(p), i32::from(s))?,
+                None => n,
+            };
+            Ok(Datum::Text(n.to_string()))
+        }
+        other => Err(Error::new(format!("{} is no numeric", other.pg_name()))),
+    }
+}
+
 /// A value as text, as PostgreSQL's output function for its type writes it.
 pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
     Some(match (d, from) {
         (Datum::Null, _) => return None,
         (Datum::Int(v), ColumnType::Boolean) => if *v != 0 { "true" } else { "false" }.into(),
         (Datum::Int(v), ColumnType::Timestamptz) => instant_text(*v),
-        (Datum::Int(v), ColumnType::Numeric { scale, .. }) => {
-            numeric_text(*v as i128, scale as u32)
+        (Datum::Int(_) | Datum::Wide(_), ColumnType::Numeric { .. }) => {
+            numeric_of(d, from)?.to_string()
         }
         (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => crate::scalars::scalar_text(ty, *v),
         (Datum::Int(v), _) => v.to_string(),
@@ -155,31 +193,54 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
                 _ => Datum::Text(s),
             }
         }
-        (Int2 | Int4 | Int8 | Numeric { .. }, Int2 | Int4 | Int8 | Numeric { .. }) => {
+        // A numeric on either side is taken as the number it is.
+        (f, t) if f.is_numeric() || t.is_numeric() => {
+            let n = match (&d, from) {
+                (_, f) if f.is_numeric() => numeric_of(&d, from).ok_or_else(refused)?,
+                (Datum::Int(v), Int2 | Int4 | Int8) => crate::numeric::Numeric::of_int(*v),
+                (Datum::Int(cents), Money) if to.is_numeric() => {
+                    crate::numeric::Numeric::of_units(i128::from(*cents), 2)
+                }
+                (Datum::Float4(b), Float4) => {
+                    crate::numeric::Numeric::of_float(f64::from(f32::from_bits(*b)), false)
+                }
+                (Datum::Float8(b), Float8) => {
+                    crate::numeric::Numeric::of_float(f64::from_bits(*b), true)
+                }
+                _ => return Err(refused()),
+            };
+            match to {
+                t if t.is_numeric() => numeric_datum(n, to)?,
+                Int2 | Int4 | Int8 => {
+                    let (lo, hi) = to.integer_range().unwrap();
+                    Datum::Int(n.to_integer(lo, hi, &to.pg_name())?)
+                }
+                // numeric_cash: its cents, as numeric_int8 rounds them.
+                Money => Datum::Int(n.mul(&crate::numeric::Numeric::of_int(100))?.to_integer(
+                    i64::MIN,
+                    i64::MAX,
+                    "bigint",
+                )?),
+                Float4 | Float8 => {
+                    let f = n.to_float(to == Float8)?;
+                    if to == Float8 {
+                        Datum::Float8(f.to_bits())
+                    } else {
+                        Datum::Float4((f as f32).to_bits())
+                    }
+                }
+                _ => return Err(refused()),
+            }
+        }
+        (Int2 | Int4 | Int8, Int2 | Int4 | Int8) => {
             let Datum::Int(v) = d else {
                 return Err(refused());
             };
-            let (m, s) = match from {
-                Numeric { scale, .. } => (v as i128, scale as u32),
-                _ => (v as i128, 0),
-            };
-            match to {
-                Numeric { precision, scale } => {
-                    let units = rescale(m, s, scale as u32);
-                    if units.unsigned_abs() >= 10u128.pow(precision as u32) {
-                        return Err(Error::new("numeric field overflow"));
-                    }
-                    Datum::Int(units as i64)
-                }
-                _ => {
-                    let whole = rescale(m, s, 0);
-                    let (lo, hi) = to.integer_range().unwrap();
-                    if whole < lo as i128 || whole > hi as i128 {
-                        return Err(out_of_range());
-                    }
-                    Datum::Int(whole as i64)
-                }
+            let (lo, hi) = to.integer_range().unwrap();
+            if v < lo || v > hi {
+                return Err(out_of_range());
             }
+            Datum::Int(v)
         }
         (Timestamptz, Timestamptz) | (Bytes, Bytes) | (Boolean, Boolean) | (Uuid, Uuid) => d,
         (Oid, Oid)
@@ -251,26 +312,12 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
                 u as i64
             })
         }
-        (Int4 | Int8 | Numeric { .. }, Money) => {
+        (Int4 | Int8, Money) => {
             let Datum::Int(v) = d else {
                 return Err(refused());
             };
-            let s = match from {
-                Numeric { scale, .. } => scale as u32,
-                _ => 0,
-            };
-            let cents = rescale(v as i128, s, 2);
+            let cents = rescale(v as i128, 0, 2);
             Datum::Int(i64::try_from(cents).map_err(|_| Error::new("bigint out of range"))?)
-        }
-        (Money, Numeric { precision, scale }) => {
-            let Datum::Int(v) = d else {
-                return Err(refused());
-            };
-            let units = rescale(v as i128, 2, scale as u32);
-            if units.unsigned_abs() >= 10u128.pow(precision as u32) {
-                return Err(Error::new("numeric field overflow"));
-            }
-            Datum::Int(units as i64)
         }
         (Macaddr | Macaddr8, Macaddr | Macaddr8) => {
             let Datum::Int(v) = d else {
@@ -279,7 +326,7 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             Datum::Int(crate::scalars::mac_cast(from, to, v)?)
         }
         (Float4, Float4) | (Float8, Float8) => d,
-        (Int2 | Int4 | Int8 | Numeric { .. } | Float4 | Float8, Float4 | Float8) => {
+        (Int2 | Int4 | Int8 | Float4 | Float8, Float4 | Float8) => {
             let v = value_of(&d, from);
             let wide = to == Float8;
             match super::pipeline::float_cast(v, wide)? {
@@ -304,26 +351,6 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
                 _ => return Err(refused()),
             }
         }
-        (Float4 | Float8, Numeric { precision, scale }) => {
-            let (f, wide) = match d {
-                Datum::Float4(b) => (f64::from(f32::from_bits(b)), false),
-                Datum::Float8(b) => (f64::from_bits(b), true),
-                _ => return Err(refused()),
-            };
-            if !f.is_finite() {
-                return Err(Error::new(format!(
-                    "cannot convert {} to numeric({precision},{scale}): it holds no NaN or infinity",
-                    if f.is_nan() { "NaN" } else { "infinity" }
-                )));
-            }
-            let text = crate::scalars::float_numeric_text(f, wide);
-            let (m, s) = super::pipeline::numeric_parts(&text)?;
-            let units = rescale(m, s, scale as u32);
-            if units.unsigned_abs() >= 10u128.pow(precision as u32) {
-                return Err(Error::new("numeric field overflow"));
-            }
-            Datum::Int(units as i64)
-        }
         (Text(_) | Bpchar(_), Char) => {
             Datum::Int(crate::scalars::scalar_parse(Char, &as_text(&d))?)
         }
@@ -336,7 +363,7 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
     match (d, ty) {
         (Datum::Null, _) => Value::Null,
         (Datum::Int(v), ColumnType::Boolean) => Value::Bool(*v != 0),
-        (Datum::Int(v), ColumnType::Numeric { scale, .. }) => Value::Num(*v as i128, scale as u32),
+        (_, ty) if ty.is_numeric() => numeric_of(d, ty).map_or(Value::Null, Value::of_numeric),
         (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => Value::Scalar(ty, *v),
         (Datum::Int(v), _) => Value::Int(*v),
         (Datum::Text(s), ColumnType::Bpchar(_) | ColumnType::Name) => Value::Str(ty, s.clone()),
@@ -357,12 +384,10 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
         // column is a timestamptz.
         Value::Int(x) if to == ColumnType::Timestamptz => (Datum::Int(x), ColumnType::Timestamptz),
         Value::Int(x) => (Datum::Int(x), ColumnType::Int8),
-        Value::Num(m, s) => (
-            Datum::Int(i64::try_from(m).map_err(|_| Error::new("numeric field overflow"))?),
-            ColumnType::Numeric {
-                precision: 18,
-                scale: s.min(18) as u8,
-            },
+        // A numeric an expression computes is unconstrained.
+        v @ (Value::Num(..) | Value::Numeric(_)) => (
+            Datum::Text(v.text().unwrap_or_default()),
+            ColumnType::NumericText(None),
         ),
         Value::Text(s) => (Datum::Text(s), ColumnType::Text(None)),
         Value::Bytes(b) => (Datum::Bytes(b), ColumnType::Bytes),

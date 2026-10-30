@@ -5,6 +5,7 @@
 //! DISTINCT FROM, and the aggregates count, sum, min, max, bool_and and bool_or.
 
 use crate::catalog::{Casing, ColumnType};
+use crate::numeric::Numeric;
 use crate::{Error, Result};
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -39,6 +40,8 @@ pub enum Value {
     Str(ColumnType, String),
     /// A bit string: its type, bit(n) or bit varying, and its key.
     Bits(ColumnType, Vec<u8>),
+    /// A numeric `Num` does not hold: NaN, an infinity, or one whose digits pass 128 bits.
+    Numeric(crate::numeric::Numeric),
 }
 
 impl Value {
@@ -46,9 +49,32 @@ impl Value {
         matches!(self, Value::Null)
     }
 
+    /// A numeric as a value: `Num` where its digits fit 128 bits.
+    pub(crate) fn of_numeric(n: crate::numeric::Numeric) -> Value {
+        match n.units() {
+            Some((m, s)) => Value::Num(m, s),
+            None => Value::Numeric(n),
+        }
+    }
+
+    /// The value as a numeric, where it is an integer or a numeric.
+    pub(crate) fn to_numeric(&self) -> Option<crate::numeric::Numeric> {
+        match self {
+            Value::Int(v) => Some(crate::numeric::Numeric::of_int(*v)),
+            Value::Num(m, s) => Some(crate::numeric::Numeric::of_units(*m, *s)),
+            Value::Numeric(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+
     /// A numeric's digits at a scale at least its own.
     fn at_scale(m: i128, from: u32, to: u32) -> i128 {
         m * 10i128.pow(to - from)
+    }
+
+    /// A numeric's digits at a scale at least its own, where they fit 128 bits.
+    fn at_scale_checked(m: i128, from: u32, to: u32) -> Option<i128> {
+        10i128.checked_pow(to - from)?.checked_mul(m)
     }
 
     /// The value as a numeric: its digits and scale.
@@ -81,6 +107,7 @@ impl Value {
             Value::Double(d) => crate::scalars::float_text(d.to_bits(), true),
             Value::Str(_, s) => s.clone(),
             Value::Bits(_, k) => crate::strings::bits_text(k),
+            Value::Numeric(n) => n.to_string(),
         })
     }
 
@@ -115,9 +142,15 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
     }
     if let (Some((x, sx)), Some((y, sy))) = (a.numeric(), b.numeric()) {
         let s = sx.max(sy);
-        return Ok(Some(
-            Value::at_scale(x, sx, s).cmp(&Value::at_scale(y, sy, s)),
-        ));
+        if let (Some(p), Some(q)) = (
+            Value::at_scale_checked(x, sx, s),
+            Value::at_scale_checked(y, sy, s),
+        ) {
+            return Ok(Some(p.cmp(&q)));
+        }
+    }
+    if let (Some(x), Some(y)) = (a.to_numeric(), b.to_numeric()) {
+        return Ok(Some(x.cmp(&y)));
     }
     // Two reals compare as reals; a float beside any other number, as doubles.
     if let (Value::Real(x), Value::Real(y)) = (a, b) {
@@ -169,6 +202,8 @@ enum Key {
     Scalar(ColumnType, i64),
     Real(i64),
     Double(i64),
+    /// A numeric no `Num` holds, by its class's key.
+    Class(String),
 }
 
 fn key(v: &Value) -> Key {
@@ -182,6 +217,10 @@ fn key(v: &Value) -> Key {
             }
             Key::Num(m, s)
         }
+        Value::Numeric(n) => match n.trimmed().units() {
+            Some((m, s)) => Key::Num(m, s),
+            None => Key::Class(n.class_key()),
+        },
         Value::Text(t) => Key::Text(t.clone()),
         Value::Bytes(b) => Key::Bytes(b.clone()),
         Value::Bool(b) => Key::Bool(*b),
@@ -444,55 +483,22 @@ fn is_count_star(f: &sqlparser::ast::Function) -> bool {
         if matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]))
 }
 
-/// A numeric's text, in plain or exponent form, as its digits and their scale.
-pub(crate) fn numeric_parts(s: &str) -> Result<(i128, u32)> {
-    let (mantissa, exp) = match s.split_once(['e', 'E']) {
-        Some((m, e)) => (
-            m,
-            e.parse::<i32>()
-                .map_err(|_| Error::new(format!("'{s}' is not a number")))?,
-        ),
-        None => (s, 0),
-    };
-    let v = numeric_literal(mantissa)?;
-    let (m, sc) = v.numeric().unwrap();
-    let sc = sc as i32 - exp;
-    Ok(if sc >= 0 {
-        (m, sc as u32)
-    } else {
-        (
-            10i128
-                .checked_pow((-sc) as u32)
-                .and_then(|p| m.checked_mul(p))
-                .ok_or_else(|| Error::new(format!("'{s}' is out of range")))?,
-            0,
-        )
-    })
-}
-
+/// A number written out: an integer where it is digits alone and fits a bigint, else a numeric as
+/// `numeric_in` reads it.
 fn numeric_literal(s: &str) -> Result<Value> {
     let t = s.trim();
-    let (neg, t) = match t.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
-    if whole.is_empty() && frac.is_empty()
-        || !whole.chars().all(|c| c.is_ascii_digit())
-        || !frac.chars().all(|c| c.is_ascii_digit())
-    {
-        return Err(Error::new(format!("'{s}' is not a number")));
+    let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
+    if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+        if let Ok(v) = t.parse::<i64>() {
+            return Ok(Value::Int(v));
+        }
     }
-    let digits = format!("{whole}{frac}");
-    let m: i128 = digits
-        .parse()
-        .map_err(|_| Error::new(format!("'{s}' is out of range")))?;
-    let m = if neg { -m } else { m };
-    Ok(if frac.is_empty() {
-        i64::try_from(m).map(Value::Int).unwrap_or(Value::Num(m, 0))
-    } else {
-        Value::Num(m, frac.len() as u32)
-    })
+    Ok(Value::of_numeric(Numeric::parse(s)?))
+}
+
+/// A numeric's typmod, as a cast names it; none where it names none.
+fn cast_typmod(to: &DataType) -> Result<Option<(u32, i32)>> {
+    Ok(crate::catalog::held_type(to)?.numeric_typmod().flatten())
 }
 
 /// Whether an expression is a quoted literal: of unknown type, which a cast reads by the target's
@@ -535,11 +541,13 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
                 bits_integer(&k, 64)?
             }
             Value::Int(x) => Value::Int(x),
-            Value::Num(m, s) => {
-                let d = 10i128.pow(s);
-                let (q, r) = (m / d, (m % d).abs());
-                let q = if r * 2 >= d { q + m.signum() } else { q };
-                Value::Int(i64::try_from(q).map_err(|_| Error::new("out of range for an integer"))?)
+            v @ (Value::Num(..) | Value::Numeric(_)) => {
+                let (name, lo, hi) = match base.as_str() {
+                    "smallint" | "int2" => ("smallint", i16::MIN as i64, i16::MAX as i64),
+                    "integer" | "int" | "int4" => ("integer", i32::MIN as i64, i32::MAX as i64),
+                    _ => ("bigint", i64::MIN, i64::MAX),
+                };
+                Value::Int(v.to_numeric().unwrap().to_integer(lo, hi, name)?)
             }
             Value::Text(t) => match numeric_literal(&t)? {
                 Value::Int(x) => Value::Int(x),
@@ -548,42 +556,20 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
             other => return Err(Error::new(format!("{other:?} cast to an integer"))),
         },
         "numeric" | "decimal" => {
-            let v = match v {
-                Value::Text(t) => numeric_literal(&t)?,
-                Value::Int(x) => Value::Num(x as i128, 0),
-                Value::Num(m, s) => Value::Num(m, s),
-                Value::Scalar(ColumnType::Money, k) => Value::Num(k as i128, 2),
-                Value::Real(_) | Value::Double(_) => {
-                    let wide = matches!(v, Value::Double(_));
-                    let f = as_double(&v).unwrap();
-                    if !f.is_finite() {
-                        return Err(Error::new(format!(
-                            "cannot convert {} to numeric: the snail holds no NaN or infinity in one",
-                            if f.is_nan() { "NaN" } else { "infinity" }
-                        )));
-                    }
-                    let (m, s) = numeric_parts(&crate::scalars::float_numeric_text(f, wide))?;
-                    Value::Num(m, s)
-                }
-                other => return Err(Error::new(format!("{other:?} cast to numeric"))),
-            };
-            let (m, s) = v.numeric().unwrap();
-            match to {
-                DataType::Numeric(info) | DataType::Decimal(info) => match info {
-                    sqlparser::ast::ExactNumberInfo::PrecisionAndScale(_, scale) => {
-                        let scale = *scale as u32;
-                        if scale >= s {
-                            Value::Num(Value::at_scale(m, s, scale), scale)
-                        } else {
-                            let d = 10i128.pow(s - scale);
-                            let (q, r) = (m / d, (m % d).abs());
-                            Value::Num(if r * 2 >= d { q + m.signum() } else { q }, scale)
-                        }
-                    }
-                    _ => Value::Num(m, s),
+            let n = match v {
+                Value::Text(t) => Numeric::parse(&t)?,
+                Value::Scalar(ColumnType::Money, k) => Numeric::of_units(k as i128, 2),
+                Value::Real(f) => Numeric::of_float(f64::from(f), false),
+                Value::Double(d) => Numeric::of_float(d, true),
+                v => match v.to_numeric() {
+                    Some(n) => n,
+                    None => return Err(Error::new(format!("{v:?} cast to numeric"))),
                 },
-                _ => Value::Num(m, s),
-            }
+            };
+            Value::of_numeric(match cast_typmod(to)? {
+                Some((p, s)) => n.typmod(p, s)?,
+                None => n,
+            })
         }
         "bytea" => match v {
             Value::Bytes(b) => Value::Bytes(b),
@@ -727,7 +713,7 @@ fn kind_name(v: &Value) -> String {
         Value::Null => "unknown".into(),
         Value::Int(x) if i32::try_from(*x).is_ok() => "integer".into(),
         Value::Int(_) => "bigint".into(),
-        Value::Num(..) => "numeric".into(),
+        Value::Num(..) | Value::Numeric(_) => "numeric".into(),
         Value::Text(_) => "text".into(),
         Value::Bytes(_) => "bytea".into(),
         Value::Bool(_) => "boolean".into(),
@@ -806,6 +792,11 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
             .ok_or_else(|| Error::new("bigint out of range"))?,
         (Value::Num(m, s), ColumnType::Money) => {
             i64::try_from(rounded(*m, *s, 2)).map_err(|_| Error::new("bigint out of range"))?
+        }
+        // numeric_cash: its cents, as numeric_int8 rounds them.
+        (Value::Numeric(n), ColumnType::Money) => {
+            n.mul(&Numeric::of_int(100))?
+                .to_integer(i64::MIN, i64::MAX, "bigint")?
         }
         (Value::Int(x), ColumnType::Char) if i32::try_from(*x).is_ok() => {
             let b = i8::try_from(*x).map_err(|_| Error::new("\"char\" out of range"))?;
@@ -1075,6 +1066,7 @@ fn as_double(v: &Value) -> Option<f64> {
     Some(match v {
         Value::Int(x) => *x as f64,
         Value::Num(m, s) => numeric_text(*m, *s).parse().ok()?,
+        Value::Numeric(n) => n.to_float(true).ok()?,
         Value::Real(f) => f64::from(*f),
         Value::Double(d) => *d,
         _ => return None,
@@ -1239,6 +1231,14 @@ pub(crate) fn float_cast(v: Value, wide: bool) -> Result<Value> {
             }
         }
         Value::Num(m, s) => of(bits(&numeric_text(m, s))?),
+        Value::Numeric(n) => {
+            let f = n.to_float(wide)?;
+            if wide {
+                Value::Double(f)
+            } else {
+                Value::Real(f as f32)
+            }
+        }
         Value::Text(t) => of(bits(&t)?),
         other => {
             return Err(Error::new(format!(
@@ -1271,42 +1271,72 @@ fn boolean_of(t: &str) -> Result<Value> {
         .ok_or_else(|| Error::new(format!("invalid input syntax for type boolean: \"{t}\"")))
 }
 
-fn numeric_op(a: &Value, b: &Value, op: fn(i128, i128) -> Option<i128>) -> Result<Value> {
+/// An arithmetic operator on two numbers, as PostgreSQL's integer and numeric operators compute
+/// it: two integers to an integer, any numeric to a numeric, at the scales numeric.c gives a sum, a
+/// difference, a product, a quotient and a remainder.
+fn arith(op: &BinaryOperator, a: &Value, b: &Value) -> Result<Value> {
+    use BinaryOperator as B;
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
     }
-    let (Some((x, sx)), Some((y, sy))) = (a.numeric(), b.numeric()) else {
-        return Err(Error::new(format!("{a:?} and {b:?} are not numbers")));
-    };
-    let s = sx.max(sy);
-    let r = op(Value::at_scale(x, sx, s), Value::at_scale(y, sy, s))
-        .ok_or_else(|| Error::new("a number out of range, or divided by zero"))?;
-    Ok(match (a, b) {
-        (Value::Int(_), Value::Int(_)) => {
-            Value::Int(i64::try_from(r).map_err(|_| Error::new("bigint out of range"))?)
+    if let (&Value::Int(x), &Value::Int(y)) = (a, b) {
+        if matches!(op, B::Divide | B::Modulo) && y == 0 {
+            return Err(Error::new("division by zero"));
         }
-        _ => Value::Num(r, s),
-    })
-}
-
-/// A product, as PostgreSQL multiplies: integers to an integer, any numeric to a numeric whose
-/// scale is its factors' scales added.
-fn multiply(a: &Value, b: &Value) -> Result<Value> {
-    if a.is_null() || b.is_null() {
-        return Ok(Value::Null);
-    }
-    if let (Value::Int(x), Value::Int(y)) = (a, b) {
-        return x
-            .checked_mul(*y)
+        let r = match op {
+            B::Plus => x.checked_add(y),
+            B::Minus => x.checked_sub(y),
+            B::Multiply => x.checked_mul(y),
+            B::Divide => x.checked_div(y),
+            // As int8mod gives it, by -1 always 0.
+            _ if y == -1 => Some(0),
+            _ => x.checked_rem(y),
+        };
+        return r
             .map(Value::Int)
             .ok_or_else(|| Error::new("bigint out of range"));
     }
-    let (Some((x, sx)), Some((y, sy))) = (a.numeric(), b.numeric()) else {
-        return Err(Error::new(format!("{a:?} and {b:?} are not numbers")));
+    if let (Some((x, sx)), Some((y, sy))) = (a.numeric(), b.numeric()) {
+        let s = sx.max(sy);
+        let aligned = || {
+            Some((
+                Value::at_scale_checked(x, sx, s)?,
+                Value::at_scale_checked(y, sy, s)?,
+            ))
+        };
+        let fast = match op {
+            B::Plus => aligned()
+                .and_then(|(p, q)| p.checked_add(q))
+                .map(|r| (r, s)),
+            B::Minus => aligned()
+                .and_then(|(p, q)| p.checked_sub(q))
+                .map(|r| (r, s)),
+            B::Modulo if y != 0 => aligned()
+                .and_then(|(p, q)| p.checked_rem(q))
+                .map(|r| (r, s)),
+            B::Multiply if sx + sy <= crate::numeric::DSCALE_MAX => {
+                x.checked_mul(y).map(|r| (r, sx + sy))
+            }
+            _ => None,
+        };
+        if let Some((r, s)) = fast {
+            return Ok(Value::Num(r, s));
+        }
+    }
+    let (Some(x), Some(y)) = (a.to_numeric(), b.to_numeric()) else {
+        return Err(Error::new(format!(
+            "operator does not exist: {} {op} {}",
+            kind_name(a),
+            kind_name(b)
+        )));
     };
-    x.checked_mul(y)
-        .map(|m| Value::Num(m, sx + sy))
-        .ok_or_else(|| Error::new("a number out of range"))
+    Ok(Value::of_numeric(match op {
+        B::Plus => x.add(&y),
+        B::Minus => x.sub(&y),
+        B::Multiply => x.mul(&y),
+        B::Divide => x.div(&y),
+        _ => x.rem(&y),
+    }?))
 }
 
 fn truth(v: &Value) -> Result<Option<bool>> {
@@ -1430,10 +1460,6 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             ev(expr)?
         }
         Expr::Value(v) => match &v.value {
-            SqlValue::Number(s, _) if s.contains(['e', 'E']) => {
-                let (m, sc) = numeric_parts(s)?;
-                Value::Num(m, sc)
-            }
             SqlValue::Number(s, _) => numeric_literal(s)?,
             SqlValue::SingleQuotedString(s) => Value::Text(s.clone()),
             // A bit-string constant is a bit of its own length.
@@ -1475,6 +1501,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     .ok_or_else(|| Error::new("bigint out of range"))?,
             ),
             Value::Num(m, s) => Value::Num(-m, s),
+            Value::Numeric(n) => Value::Numeric(n.neg()),
             Value::Real(f) => Value::Real(-f),
             Value::Double(d) => Value::Double(-d),
             other => return Err(Error::new(format!("-{other:?} is not a number"))),
@@ -1609,10 +1636,11 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 compared(op, &x, &y)?;
             }
             match op {
-                BinaryOperator::Plus => numeric_op(&x, &y, i128::checked_add)?,
-                BinaryOperator::Minus => numeric_op(&x, &y, i128::checked_sub)?,
-                BinaryOperator::Modulo => numeric_op(&x, &y, i128::checked_rem)?,
-                BinaryOperator::Multiply => multiply(&x, &y)?,
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo => arith(op, &x, &y)?,
                 BinaryOperator::Eq
                 | BinaryOperator::NotEq
                 | BinaryOperator::Lt
@@ -1652,7 +1680,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             let name = function_name(f);
             let a = args(f)?;
             match (name.as_str(), a.as_slice()) {
-                ("mod", [x, y]) => numeric_op(&ev(x)?, &ev(y)?, i128::checked_rem)?,
+                ("mod", [x, y]) => arith(&BinaryOperator::Modulo, &ev(x)?, &ev(y)?)?,
                 // Under the collation its argument carries, the database's default where none.
                 ("upper" | "lower", [x]) => {
                     let casing = frame.casings.implicit(x)?.unwrap_or(Casing::Libc);
@@ -1678,6 +1706,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                             .ok_or_else(|| Error::new("bigint out of range"))?,
                     ),
                     Value::Num(m, s) => Value::Num(m.abs(), s),
+                    Value::Numeric(n) => Value::Numeric(n.abs()),
                     Value::Real(f) => Value::Real(f.abs()),
                     Value::Double(d) => Value::Double(d.abs()),
                     other => return Err(Error::new(format!("abs of {other:?}"))),
@@ -1846,7 +1875,7 @@ fn windows(
                         *state = if state.is_null() {
                             v
                         } else {
-                            numeric_op(state, &v, i128::checked_add)?
+                            arith(&BinaryOperator::Plus, state, &v)?
                         };
                     }
                     state.clone()
@@ -1891,6 +1920,8 @@ enum Acc {
     /// avg of a float: its rows, their sum and their sum of squared deviations, as
     /// PostgreSQL's float8_accum folds them.
     Avg(f64, f64, f64),
+    /// avg of an integer or a numeric, its sum and rows as numeric_avg_accum folds them.
+    NumAvg(crate::numeric::Sum),
 }
 
 impl Acc {
@@ -2010,27 +2041,47 @@ impl Acc {
                 } else if let Some(s) = scalar_arith(&BinaryOperator::Plus, acc, &v)? {
                     s
                 } else {
-                    numeric_op(acc, &v, i128::checked_add)?
+                    arith(&BinaryOperator::Plus, acc, &v)?
                 };
             }
+            // Of two numerics equal, numeric_smaller and numeric_larger keep the later.
             Acc::Least(best) => {
+                let later = v.to_numeric().is_some();
                 let better = match best {
                     None => true,
-                    Some(b) => compare(&v, b)? == Some(Ordering::Less),
+                    Some(b) => match compare(&v, b)? {
+                        Some(Ordering::Less) => true,
+                        Some(Ordering::Equal) => later,
+                        _ => false,
+                    },
                 };
                 if better {
                     *best = Some(v);
                 }
             }
             Acc::Greatest(best) => {
+                let later = v.to_numeric().is_some();
                 let better = match best {
                     None => true,
-                    Some(b) => compare(&v, b)? == Some(Ordering::Greater),
+                    Some(b) => match compare(&v, b)? {
+                        Some(Ordering::Greater) => true,
+                        Some(Ordering::Equal) => later,
+                        _ => false,
+                    },
                 };
                 if better {
                     *best = Some(v);
                 }
             }
+            Acc::Avg(n, ..) if *n == 0.0 && v.to_numeric().is_some() => {
+                let mut s = crate::numeric::Sum::default();
+                s.add(&v.to_numeric().unwrap());
+                *self = Acc::NumAvg(s);
+            }
+            Acc::NumAvg(s) => match v.to_numeric() {
+                Some(n) => s.add(&n),
+                None => return Err(Error::new(format!("avg of {} is not read", kind_name(&v)))),
+            },
             Acc::All(a) => {
                 let t = truth(&v)?.unwrap_or(true);
                 *a = Some(a.map_or(t, |x| x && t));
@@ -2070,15 +2121,19 @@ impl Acc {
         Ok(())
     }
 
-    fn value(&self) -> Value {
-        match self {
+    fn value(&self) -> Result<Value> {
+        Ok(match self {
             Acc::Count(n) => Value::Int(*n),
             Acc::Sum(v) => v.clone(),
             Acc::Least(b) | Acc::Greatest(b) => b.clone().unwrap_or(Value::Null),
             Acc::All(a) | Acc::Any(a) => a.map_or(Value::Null, Value::Bool),
             Acc::Avg(n, sx, _) if *n > 0.0 => Value::Double(sx / n),
             Acc::Avg(..) => Value::Null,
-        }
+            Acc::NumAvg(s) => match s.avg() {
+                Some(a) => Value::of_numeric(a?),
+                None => Value::Null,
+            },
+        })
     }
 }
 
@@ -2321,8 +2376,8 @@ impl<'q> StepRun<'q> {
                         .aggregates
                         .iter()
                         .zip(accs)
-                        .map(|(&c, a)| (c as *const Expr, a.value()))
-                        .collect(),
+                        .map(|(&c, a)| Ok((c as *const Expr, a.value()?)))
+                        .collect::<Result<_>>()?,
                     _q: std::marker::PhantomData,
                 };
                 out.rows.push(
@@ -2782,6 +2837,7 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
         let any = a.as_any();
         let scalar = crate::scalars::field_scalar(field);
         let string = crate::strings::field_string(field);
+        let numeric = crate::numeric::is_numeric_field(field);
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Value::Null
@@ -2821,10 +2877,18 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                             .unwrap()
                             .value(r),
                     ),
-                    A::Decimal128(_, s) => Value::Num(
-                        any.downcast_ref::<Decimal128Array>().unwrap().value(r),
-                        *s as u32,
-                    ),
+                    A::Decimal128(p, s) => {
+                        let m = any.downcast_ref::<Decimal128Array>().unwrap().value(r);
+                        // NaN is a numeric column's greatest integer its page form holds.
+                        if numeric && m == crate::numeric::nan_units(*p) {
+                            Value::Numeric(Numeric::NAN)
+                        } else {
+                            Value::Num(m, *s as u32)
+                        }
+                    }
+                    A::Utf8 if numeric => Value::of_numeric(Numeric::parse(
+                        any.downcast_ref::<StringArray>().unwrap().value(r),
+                    )?),
                     A::Utf8 => Value::Text(
                         any.downcast_ref::<StringArray>()
                             .unwrap()
@@ -2923,6 +2987,24 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
                 }),
             ));
             fields.push(crate::scalars::scalar_field(name, ty, true));
+            continue;
+        }
+        // A numeric column holding a value no Decimal128 of 38 digits holds at its scale is written
+        // as each value's text, named a numeric.
+        let past = |s: u32| {
+            col().any(|v| match v {
+                Value::Numeric(_) => true,
+                Value::Num(m, from) => Value::at_scale_checked(*m, *from, s)
+                    .is_none_or(|x| x.unsigned_abs() >= 10u128.pow(38)),
+                _ => false,
+            })
+        };
+        if matches!(first, Some(Value::Numeric(_)))
+            || (matches!(first, Some(Value::Int(_) | Value::Num(..)))
+                && (scale.is_some_and(past) || col().any(|v| matches!(v, Value::Numeric(_)))))
+        {
+            arrays.push(Arc::new(col().map(|v| v.text()).collect::<StringArray>()));
+            fields.push(crate::numeric::text_field(name, true));
             continue;
         }
         let a: ArrayRef = match (first, scale) {

@@ -42,6 +42,8 @@ impl Values {
                 Values::Utf8(Vec::new())
             }
             ColumnType::Uuid => Values::Wide(Vec::new()),
+            ColumnType::Numeric { precision, .. } if precision > 18 => Values::Wide(Vec::new()),
+            ColumnType::NumericText(_) => Values::Text(Vec::new()),
             ColumnType::Float4 => Values::Float4(Vec::new()),
             ColumnType::Float8 => Values::Float8(Vec::new()),
             _ => Values::Int(Vec::new()),

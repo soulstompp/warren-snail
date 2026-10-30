@@ -248,8 +248,13 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
             } else if let Some(x) = any.downcast_ref::<StringArray>() {
                 Datum::Text(x.value(r).to_string())
             } else if let Some(x) = any.downcast_ref::<Decimal128Array>() {
-                // A numeric column's answer is its smallest units, at the column's own scale.
-                Datum::Int(x.value(r) as i64)
+                // A numeric column's answer is its smallest units, at the column's own scale: in
+                // 64 bits up to 18 digits, past them in 128.
+                if x.precision() > 18 {
+                    Datum::Wide(x.value(r))
+                } else {
+                    Datum::Int(x.value(r) as i64)
+                }
             } else if let Some(x) = any.downcast_ref::<BinaryArray>() {
                 Datum::Bytes(x.value(r).to_vec())
             } else if let Some(x) = any
@@ -282,10 +287,7 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
         A::FixedSizeBinary(16) => ColumnType::Uuid,
         A::Float32 => ColumnType::Float4,
         A::Float64 => ColumnType::Float8,
-        A::Decimal128(p, s) => ColumnType::Numeric {
-            precision: (*p).min(18),
-            scale: (*s).max(0) as u8,
-        },
+        A::Decimal128(p, s) => ColumnType::numeric(Some((u32::from(*p), i32::from(*s)))),
         other => {
             return Err(Error::new(format!(
                 "an answer of {other} is not read back as a row"
@@ -465,12 +467,22 @@ fn check(table: &Table, row: &Row) -> Result<()> {
                     crate::strings::bits_of_key(k).0
                 )))
             }
-            (ColumnType::Numeric { precision, .. }, Datum::Int(v))
-                if v.unsigned_abs() >= 10u64.pow(precision as u32) =>
+            (ColumnType::Numeric { precision, .. }, Datum::Int(_) | Datum::Wide(_))
+                if d.wide().is_some_and(|u| {
+                    u != crate::numeric::nan_units(precision)
+                        && u.unsigned_abs() >= 10u128.pow(precision as u32)
+                }) =>
             {
-                return Err(what(format!("{v} has more digits than it holds")))
+                return Err(what(format!("{d:?} has more digits than it holds")))
+            }
+            (ColumnType::Numeric { precision, .. }, Datum::Wide(_)) if precision > 18 => {}
+            (ColumnType::NumericText(_), Datum::Text(s))
+                if crate::numeric::Numeric::parse(s).is_err() =>
+            {
+                return Err(what(format!("'{s}' is not a numeric")))
             }
             (ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name, Datum::Text(_))
+            | (ColumnType::NumericText(_), Datum::Text(_))
             | (ColumnType::Bytes | ColumnType::Bit(_) | ColumnType::Varbit(_), Datum::Bytes(_))
             | (ColumnType::Uuid, Datum::Wide(_))
             | (ColumnType::Float4, Datum::Float4(_))
@@ -670,6 +682,14 @@ impl Snail {
                                     .or_else(|| crate::strings::field_string(f))
                                 {
                                     Some(ty) => Ok(ty),
+                                    None if crate::numeric::is_numeric_field(f)
+                                        && matches!(
+                                            f.data_type(),
+                                            arrow::datatypes::DataType::Utf8
+                                        ) =>
+                                    {
+                                        Ok(ColumnType::NumericText(None))
+                                    }
                                     None => answer_type(f.data_type()),
                                 }
                             })
@@ -1617,7 +1637,16 @@ impl Snail {
         let table = self.catalog.tables[ti].clone();
         for c in &changes {
             match c {
-                Change::Insert(r) | Change::Replace(_, r) => check(&table, r)?,
+                Change::Insert(r) | Change::Replace(_, r) => {
+                    check(&table, r)?;
+                    for (ci, (col, d)) in table.columns.iter().zip(r).enumerate() {
+                        if let ColumnType::Numeric { precision, .. } = col.ty {
+                            if d.wide() == Some(crate::numeric::nan_units(precision)) {
+                                crate::file::holds_nan(self.reader.format(), &table, ci)?;
+                            }
+                        }
+                    }
+                }
                 Change::Delete(_) => {}
             }
         }

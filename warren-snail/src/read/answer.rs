@@ -143,6 +143,61 @@ impl Ord for Float {
     }
 }
 
+/// Whether a column's values are numerics held as their text.
+fn is_classed(ty: Option<ColumnType>) -> bool {
+    matches!(ty, Some(ColumnType::NumericText(_)))
+}
+
+/// Where an item of the answer is a numeric: the type it is written from, and whether it takes
+/// NULL. A numeric column itself, its min, max and sum; an integer's or a numeric's mean.
+fn numeric_output(item: &Item, tables: &[&Table]) -> Option<(ColumnType, bool)> {
+    let col = |c: &super::question::Col| &tables[c.side].columns[c.column];
+    match item {
+        Item::Key(Key::Column(c)) if col(c).ty.is_numeric() => Some((col(c).ty, !col(c).not_null)),
+        Item::Least(c) | Item::Greatest(c) | Item::Sum(c) if col(c).ty.is_numeric() => {
+            Some((col(c).ty, true))
+        }
+        Item::Avg(c) if col(c).ty.is_numeric() || col(c).ty.is_integer() => {
+            Some((ColumnType::NumericText(None), true))
+        }
+        _ => None,
+    }
+}
+
+/// A numeric held as its text, as a round keeps it: compared, grouped and hashed by its class's
+/// key, and written out as its own text.
+#[derive(Clone, Debug)]
+pub struct Classed {
+    pub key: Text,
+    pub image: Text,
+}
+
+impl PartialEq for Classed {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Classed {}
+
+impl std::hash::Hash for Classed {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state)
+    }
+}
+
+impl PartialOrd for Classed {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Classed {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
 /// Adds one group's aggregates into another's.
 fn merge(into: &mut [Acc], from: &[Acc]) {
     for (a, b) in into.iter_mut().zip(from) {
@@ -183,6 +238,15 @@ fn merge(into: &mut [Acc], from: &[Acc]) {
                     }
                 }
                 *over |= *o;
+            }
+            (Acc::Numeric(x), Acc::Numeric(y)) | (Acc::NumAvg(x), Acc::NumAvg(y)) => x.merge(y),
+            (Acc::LeastCell(x), Acc::LeastCell(Some(y))) if x.as_ref().is_none_or(|x| y <= x) => {
+                *x = Some(y.clone());
+            }
+            (Acc::GreatestCell(x), Acc::GreatestCell(Some(y)))
+                if x.as_ref().is_none_or(|x| y >= x) =>
+            {
+                *x = Some(y.clone());
             }
             _ => {}
         }
@@ -229,9 +293,42 @@ pub enum Cell {
     Float(Float),
     /// A value compared by a key other than its own bytes, and written as its own bytes.
     Keyed(Keyed),
+    /// A numeric held as its text, compared by its class and written as its own text.
+    Classed(Classed),
 }
 
 impl Cell {
+    /// A numeric's own text, kept beside its class.
+    pub fn classed(image: ByteArray) -> Cell {
+        let key = crate::numeric::class_of_text(std::str::from_utf8(image.data()).unwrap_or(""));
+        Cell::Classed(Classed {
+            key: Text(ByteArray::from(key.as_str())),
+            image: Text(image),
+        })
+    }
+
+    /// A numeric, kept beside its class.
+    pub fn of_numeric(n: &crate::numeric::Numeric) -> Cell {
+        Cell::Classed(Classed {
+            key: Text(ByteArray::from(n.class_key().as_str())),
+            image: Text(ByteArray::from(n.to_string().as_str())),
+        })
+    }
+
+    /// The numeric a cell of a column of type `ty` holds: a numeric's, or an integer's.
+    pub fn numeric(&self, ty: ColumnType) -> Option<crate::numeric::Numeric> {
+        match (self, ty) {
+            (Cell::Int(u), ColumnType::Numeric { precision, scale }) => Some(
+                crate::numeric::column_numeric(i128::from(*u), precision, scale),
+            ),
+            (Cell::Wide(u), ColumnType::Numeric { precision, scale }) => {
+                Some(crate::numeric::column_numeric(*u, precision, scale))
+            }
+            (Cell::Int(v), _) => Some(crate::numeric::Numeric::of_int(*v)),
+            (Cell::Classed(c), _) => crate::numeric::Numeric::parse(c.image.as_str()).ok(),
+            _ => None,
+        }
+    }
     /// A number's or a wide value's key, in 128 bits.
     pub fn key(&self) -> Option<i128> {
         match self {
@@ -283,6 +380,12 @@ pub enum Acc {
     /// The least value so far, or the greatest where `greatest`, of a column whose values are no
     /// number: a string's, bytea's, a bit string's.
     Cell(Option<Cell>, bool),
+    /// A numeric's sum, or an integer's or a numeric's mean, as numeric_accum folds them.
+    Numeric(Box<crate::numeric::Sum>),
+    NumAvg(Box<crate::numeric::Sum>),
+    /// The least and the greatest numeric held as its text, by its class.
+    LeastCell(Option<Cell>),
+    GreatestCell(Option<Cell>),
 }
 
 /// The answer as rows arrive, each as the cells of the question's inputs.
@@ -402,7 +505,34 @@ impl Answer {
                 {
                     Acc::FloatSum(None, false)
                 }
+                Item::Sum(_)
+                    if typed
+                        .get(at)
+                        .copied()
+                        .flatten()
+                        .is_some_and(ColumnType::is_numeric) =>
+                {
+                    Acc::Numeric(Box::default())
+                }
+                Item::Avg(_)
+                    if typed
+                        .get(at)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|t| t.is_numeric() || t.is_integer()) =>
+                {
+                    Acc::NumAvg(Box::default())
+                }
                 Item::Avg(_) => Acc::Avg(0.0, 0.0, 0.0, false),
+                Item::Least(_) | Item::Greatest(_)
+                    if is_classed(typed.get(at).copied().flatten()) =>
+                {
+                    if matches!(i, Item::Least(_)) {
+                        Acc::LeastCell(None)
+                    } else {
+                        Acc::GreatestCell(None)
+                    }
+                }
                 Item::Least(_) | Item::Greatest(_)
                     if typed
                         .get(at)
@@ -556,6 +686,27 @@ impl Answer {
                                 });
                             }
                         }
+                        (Acc::Numeric(s), Item::Sum(c)) | (Acc::NumAvg(s), Item::Avg(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            if let Some(x) = ty.and_then(|t| cells[at].numeric(t)) {
+                                s.add_times(&x, n);
+                            }
+                        }
+                        // Of two numerics equal, numeric_smaller and numeric_larger keep the later.
+                        (Acc::LeastCell(m), Item::Least(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            let v = &cells[at];
+                            if *v != Cell::Null && m.as_ref().is_none_or(|x| v <= x) {
+                                *m = Some(v.clone());
+                            }
+                        }
+                        (Acc::GreatestCell(m), Item::Greatest(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            let v = &cells[at];
+                            if *v != Cell::Null && m.as_ref().is_none_or(|x| v >= x) {
+                                *m = Some(v.clone());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -626,13 +777,26 @@ impl Answer {
                 }
             })
             .collect();
+        // A numeric's NaN is left to the rows one at a time.
+        let nan: Vec<Option<i64>> = typed
+            .iter()
+            .map(|t| match t {
+                Some(ColumnType::Numeric { precision, .. }) => {
+                    Some(crate::numeric::nan_units(*precision) as i64)
+                }
+                _ => None,
+            })
+            .collect();
         for (i, c) in codes.iter().enumerate() {
             let c = c.unwrap() as usize;
             count[c] += 1;
-            for (s, at) in sums.iter_mut().zip(&summed) {
+            for (item, (s, at)) in sums.iter_mut().zip(&summed).enumerate() {
                 if let Some(at) = at {
                     let (_, _, st, v) = outs[*at];
                     if let Some(x) = v.int(from + i - st) {
+                        if nan.get(item).copied().flatten() == Some(x) {
+                            return false;
+                        }
                         s[c] = Some(s[c].unwrap_or(0) + x as i128);
                     }
                 }
@@ -643,12 +807,19 @@ impl Answer {
         }
         for c in (0..n).filter(|&c| count[c] > 0) {
             let accs = by_code[c].get_or_insert_with(|| Answer::fresh(items, typed));
-            for ((acc, item), s) in accs.iter_mut().zip(items.iter()).zip(&sums) {
+            for (at, ((acc, item), s)) in accs.iter_mut().zip(items.iter()).zip(&sums).enumerate() {
                 match (acc, item) {
                     (Acc::Count(k), Item::Count) => *k += count[c],
                     (Acc::Sum(total), Item::Sum(_)) => {
                         if let Some(x) = s[c] {
                             *total = Some(total.unwrap_or(0) + x);
+                        }
+                    }
+                    (Acc::Numeric(sum), Item::Sum(_)) => {
+                        if let (Some(x), Some(ColumnType::Numeric { scale, .. })) =
+                            (s[c], typed.get(at).copied().flatten())
+                        {
+                            sum.add_units(x, u32::from(scale));
                         }
                     }
                     _ => {}
@@ -735,6 +906,13 @@ impl Answer {
                         if let Acc::FloatSum(_, true) | Acc::Avg(_, _, _, true) = acc {
                             return Err(crate::Error::new("value out of range: overflow"));
                         }
+                        // And a numeric's past what a numeric holds.
+                        if let Acc::Numeric(s) = acc {
+                            s.total().transpose()?;
+                        }
+                        if let Acc::NumAvg(s) = acc {
+                            s.avg().transpose()?;
+                        }
                     }
                 }
                 groups
@@ -774,10 +952,38 @@ impl Answer {
                                         })
                                     })
                                 }
+                                (
+                                    Item::Least(c) | Item::Greatest(c),
+                                    Acc::Least(m) | Acc::Greatest(m),
+                                ) if tables[c.side].columns[c.column].ty.is_wide() => {
+                                    m.map_or(Cell::Null, Cell::Wide)
+                                }
                                 (_, Acc::Least(m) | Acc::Greatest(m)) => {
                                     m.map_or(Cell::Null, |v| Cell::Int(v as i64))
                                 }
                                 (_, Acc::Cell(m, _)) => m.unwrap_or(Cell::Null),
+                                (_, Acc::LeastCell(m) | Acc::GreatestCell(m)) => {
+                                    m.unwrap_or(Cell::Null)
+                                }
+                                // A numeric(p, s)'s sum as its units at s, where 38 digits hold
+                                // them; else, and any other numeric's, beside its class.
+                                (Item::Sum(c), Acc::Numeric(s)) => match s.total() {
+                                    None => Cell::Null,
+                                    Some(t) => {
+                                        let t = t.expect("a sum held");
+                                        let units = match tables[c.side].columns[c.column].ty {
+                                            ColumnType::Numeric { scale, .. } => t
+                                                .units_at(u32::from(scale))
+                                                .filter(|u| u.unsigned_abs() < 10u128.pow(38)),
+                                            _ => None,
+                                        };
+                                        units.map_or_else(|| Cell::of_numeric(&t), Cell::Wide)
+                                    }
+                                },
+                                (_, Acc::NumAvg(s)) => s.avg().map_or(Cell::Null, |a| {
+                                    Cell::of_numeric(&a.expect("a mean held"))
+                                }),
+                                (_, Acc::Numeric(_)) => Cell::Null,
                                 (Item::Sum(c), Acc::FloatSum(total, _)) => {
                                     total.map_or(Cell::Null, |t| {
                                         float_cell(
@@ -844,6 +1050,68 @@ impl Answer {
             };
             let char_text = matches!(*item, Item::Least(c) | Item::Greatest(c)
                 if tables[c.side].columns[c.column].ty == ColumnType::Char);
+            // A numeric: as its page form gives it, its sum at its scale up to 38 digits, a mean
+            // and anything past them as its text; each named a numeric.
+            if let Some((ty, nullable)) = numeric_output(item, tables) {
+                let units = || {
+                    rows.iter().map(|r| match &r[i] {
+                        Cell::Int(v) => Some(i128::from(*v)),
+                        Cell::Wide(v) => Some(*v),
+                        _ => None,
+                    })
+                };
+                let texted = rows.iter().any(|r| matches!(r[i], Cell::Classed(_)));
+                let (a, field): (ArrayRef, Field) = match (ty, item) {
+                    (ColumnType::Numeric { scale, .. }, Item::Sum(_)) if !texted => (
+                        Arc::new(
+                            units()
+                                .collect::<Decimal128Array>()
+                                .with_precision_and_scale(38, scale as i8)?,
+                        ),
+                        Field::new(
+                            name,
+                            arrow::datatypes::DataType::Decimal128(38, scale as i8),
+                            nullable,
+                        )
+                        .with_metadata(crate::numeric::text_field(name, true).metadata().clone()),
+                    ),
+                    (
+                        ColumnType::Numeric { precision, scale },
+                        Item::Key(_) | Item::Least(_) | Item::Greatest(_),
+                    ) => (
+                        Arc::new(
+                            units()
+                                .collect::<Decimal128Array>()
+                                .with_precision_and_scale(precision, scale as i8)?,
+                        ),
+                        crate::numeric::numeric_field(name, ty, nullable),
+                    ),
+                    _ => (
+                        Arc::new(
+                            rows.iter()
+                                .map(|r| match (&r[i], ty) {
+                                    (Cell::Classed(c), _) => Some(c.image.as_str().to_string()),
+                                    // A sum's units at its column's scale.
+                                    (Cell::Wide(u), ColumnType::Numeric { scale, .. })
+                                        if matches!(item, Item::Sum(_)) =>
+                                    {
+                                        Some(
+                                            crate::numeric::Numeric::of_units(*u, u32::from(scale))
+                                                .to_string(),
+                                        )
+                                    }
+                                    (Cell::Null, _) => None,
+                                    (other, _) => other.numeric(ty).map(|n| n.to_string()),
+                                })
+                                .collect::<StringArray>(),
+                        ),
+                        crate::numeric::text_field(name, nullable),
+                    ),
+                };
+                fields.push(field);
+                arrays.push(a);
+                continue;
+            }
             let (nullable, a): (bool, ArrayRef) = match *item {
                 // PostgreSQL takes a "char"'s min and max through its text.
                 Item::Least(_) | Item::Greatest(_) if char_text => (

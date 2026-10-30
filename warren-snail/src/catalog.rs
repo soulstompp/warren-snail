@@ -23,8 +23,9 @@ pub enum ColumnType {
     Text(Option<u32>),
     /// Bytes, compared byte by byte.
     Bytes,
-    /// A numeric of at most 18 digits, `scale` of them after the point, held as the integer of its
-    /// smallest unit.
+    /// A numeric of at most 38 digits, `scale` of them after the point, held as the integer of its
+    /// smallest unit: in 64 bits up to 18 digits, past them in 128, as Parquet's decimal in the
+    /// fewest bytes that hold them; NaN as the greatest integer that form holds.
     Numeric {
         precision: u8,
         scale: u8,
@@ -73,6 +74,10 @@ pub enum ColumnType {
     /// bit varying(n): at most n bits, any number where none is named, held as its key, and in the
     /// file as a group of two leaves, its length and its bits.
     Varbit(Option<u32>),
+    /// A numeric no Parquet decimal holds: unconstrained, or past 38 digits, or of a scale below 0
+    /// or past its precision; its precision and scale where its DDL names them. Held as
+    /// PostgreSQL's text of each value, and keyed on its class.
+    NumericText(Option<(u16, i16)>),
 }
 
 impl ColumnType {
@@ -91,6 +96,9 @@ impl ColumnType {
             | ColumnType::Char
             | ColumnType::Reg(..)
             | ColumnType::Float4 => Some(4),
+            ColumnType::Numeric { precision, .. } if precision > 18 => {
+                Some(crate::numeric::decimal_bytes(precision))
+            }
             ColumnType::Int8
             | ColumnType::Timestamptz
             | ColumnType::Numeric { .. }
@@ -111,7 +119,8 @@ impl ColumnType {
             | ColumnType::Boolean
             | ColumnType::Bpchar(_)
             | ColumnType::Name
-            | ColumnType::Varbit(_) => None,
+            | ColumnType::Varbit(_)
+            | ColumnType::NumericText(_) => None,
         }
     }
 
@@ -157,6 +166,41 @@ impl ColumnType {
     /// Whether its values are keyed in 128 bits.
     pub fn is_wide(self) -> bool {
         matches!(self, ColumnType::Uuid)
+            || matches!(self, ColumnType::Numeric { precision, .. } if precision > 18)
+    }
+
+    /// Whether it is a numeric, held in either form.
+    pub fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            ColumnType::Numeric { .. } | ColumnType::NumericText(_)
+        )
+    }
+
+    /// A numeric's precision and scale, none where it is unconstrained; none at all for any other
+    /// type.
+    pub fn numeric_typmod(self) -> Option<Option<(u32, i32)>> {
+        match self {
+            ColumnType::Numeric { precision, scale } => {
+                Some(Some((u32::from(precision), i32::from(scale))))
+            }
+            ColumnType::NumericText(t) => Some(t.map(|(p, s)| (u32::from(p), i32::from(s)))),
+            _ => None,
+        }
+    }
+
+    /// The numeric of that precision and scale, or unconstrained, in the form that holds it: a
+    /// Parquet decimal where one does, its text otherwise.
+    pub fn numeric(typmod: Option<(u32, i32)>) -> ColumnType {
+        match typmod {
+            Some((p, s)) if (1..=38).contains(&p) && s >= 0 && s as u32 <= p => {
+                ColumnType::Numeric {
+                    precision: p as u8,
+                    scale: s as u8,
+                }
+            }
+            t => ColumnType::NumericText(t.map(|(p, s)| (p as u16, s as i16))),
+        }
     }
 
     /// Whether 0.1.x held it, so that a snail of format 7 or 8 can.
@@ -169,8 +213,7 @@ impl ColumnType {
                 | ColumnType::Timestamptz
                 | ColumnType::Text(_)
                 | ColumnType::Bytes
-                | ColumnType::Numeric { .. }
-        )
+        ) || matches!(self, ColumnType::Numeric { precision, .. } if precision <= 18)
     }
 
     /// The bits a value takes where the type is narrower than 4 bytes, so that the cut passes over
@@ -207,9 +250,15 @@ impl ColumnType {
     }
 
     /// Whether its values are bytes of varying length, held as Parquet's byte arrays: a string's,
-    /// or bytea's.
+    /// bytea's, or a numeric's held as its text.
     pub fn is_byte_array(self) -> bool {
-        matches!(self, ColumnType::Bytes) || self.is_string()
+        matches!(self, ColumnType::Bytes | ColumnType::NumericText(_)) || self.is_string()
+    }
+
+    /// Whether a level of it is keyed by text compared by its bytes: a string's, or the key of a
+    /// numeric's class where it is held as its text.
+    pub fn keyed_by_text(self) -> bool {
+        matches!(self, ColumnType::NumericText(_)) || self.is_string()
     }
 
     pub fn is_integer(self) -> bool {
@@ -267,6 +316,8 @@ impl ColumnType {
             ColumnType::Bit(n) => format!("bit({n})"),
             ColumnType::Varbit(None) => "bit varying".into(),
             ColumnType::Varbit(Some(n)) => format!("bit varying({n})"),
+            ColumnType::NumericText(None) => "numeric".into(),
+            ColumnType::NumericText(Some((p, s))) => format!("numeric({p},{s})"),
         }
     }
 
@@ -302,6 +353,7 @@ impl ColumnType {
             ColumnType::Name => "name_ops",
             ColumnType::Bit(_) => "bit_ops",
             ColumnType::Varbit(_) => "varbit_ops",
+            ColumnType::NumericText(_) => "numeric_ops",
         }
     }
 
@@ -424,6 +476,9 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Int2 | Int4 | Int8 | Oid | Oid8, Oid8)
             | (Oid8, Int8)
     ) || match (from, to) {
+        // A numeric in either form, as the typmod'd one is.
+        (NumericText(_), t) => assignable(ColumnType::numeric(Some((9, 2))), t),
+        (f, NumericText(_)) => assignable(f, ColumnType::numeric(Some((9, 2)))),
         (Reg(a, _), Reg(b, _)) => a == b || crate::regs::casts_between(a, b),
         // text to regclass is regclass(text), an implicit cast; to any other reg* only explicit.
         (Text(_), Reg(crate::regs::RegKind::Class, _)) => true,
@@ -1391,23 +1446,25 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
             let (p, s) = match info {
                 ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
                 ExactNumberInfo::Precision(p) => (*p, 0),
-                ExactNumberInfo::None => {
-                    return Err(Error::new(format!(
-                        "{}: a numeric is held with its precision, at most 18 digits",
-                        spelled(dt)
-                    )))
-                }
+                ExactNumberInfo::None => return Ok(ColumnType::numeric(None)),
             };
-            if !(1..=18).contains(&p) || s < 0 || s as u64 > p {
+            // As numerictypmodin refuses them.
+            if !(1..=u64::from(crate::numeric::PRECISION_MAX)).contains(&p) {
                 return Err(Error::new(format!(
-                    "{}: a numeric is held with at most 18 digits, and a scale within them",
-                    spelled(dt)
+                    "NUMERIC precision {p} must be between 1 and {}",
+                    crate::numeric::PRECISION_MAX
                 )));
             }
-            ColumnType::Numeric {
-                precision: p as u8,
-                scale: s as u8,
+            if !(i64::from(crate::numeric::SCALE_MIN)..=i64::from(crate::numeric::SCALE_MAX))
+                .contains(&s)
+            {
+                return Err(Error::new(format!(
+                    "NUMERIC scale {s} must be between {} and {}",
+                    crate::numeric::SCALE_MIN,
+                    crate::numeric::SCALE_MAX
+                )));
             }
+            ColumnType::numeric(Some((p as u32, s as i32)))
         }
         other => {
             return Err(Error::new(format!(
@@ -1916,9 +1973,11 @@ mod tests {
     }
 
     #[test]
-    fn a_numeric_is_held_to_18_digits_and_bytea_as_a_level() {
+    fn a_numeric_is_held_in_the_form_its_typmod_allows_and_bytea_as_a_level() {
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a bigint NOT NULL, k bytea, m numeric(9,2) NOT NULL, PRIMARY KEY (a));",
+            "CREATE TABLE s.t (a bigint NOT NULL, k bytea, m numeric(9,2) NOT NULL, \
+             w numeric(38,2), u numeric, x decimal(3,-1), y numeric(3,5), z numeric(40), \
+             PRIMARY KEY (a));",
         )
         .unwrap();
         let types: Vec<ColumnType> = c.tables[0].columns.iter().map(|c| c.ty).collect();
@@ -1930,17 +1989,30 @@ mod tests {
                 ColumnType::Numeric {
                     precision: 9,
                     scale: 2
-                }
+                },
+                ColumnType::Numeric {
+                    precision: 38,
+                    scale: 2
+                },
+                ColumnType::NumericText(None),
+                ColumnType::NumericText(Some((3, -1))),
+                ColumnType::NumericText(Some((3, 5))),
+                ColumnType::NumericText(Some((40, 0))),
             ]
+        );
+        let names: Vec<String> = types.iter().map(|t| t.pg_name()).collect();
+        assert_eq!(
+            names[4..],
+            ["numeric", "numeric(3,-1)", "numeric(3,5)", "numeric(40,0)"]
         );
         for (ddl, why) in [
             (
-                "CREATE TABLE s.t (a numeric NOT NULL, PRIMARY KEY (a));",
-                "with its precision",
+                "CREATE TABLE s.t (a numeric(1001) NOT NULL, PRIMARY KEY (a));",
+                "NUMERIC precision 1001 must be between 1 and 1000",
             ),
             (
-                "CREATE TABLE s.t (a numeric(19,0) NOT NULL, PRIMARY KEY (a));",
-                "at most 18 digits",
+                "CREATE TABLE s.t (a numeric(5,1001) NOT NULL, PRIMARY KEY (a));",
+                "NUMERIC scale 1001 must be between -1000 and 1000",
             ),
         ] {
             let e = refused(ddl);

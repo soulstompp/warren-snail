@@ -108,13 +108,18 @@ pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<Colu
                 unit: TimeUnit::MICROS,
             }),
         ),
-        ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name => {
-            (PhysicalType::BYTE_ARRAY, Some(LogicalType::String))
-        }
+        ColumnType::Text(_)
+        | ColumnType::Bpchar(_)
+        | ColumnType::Name
+        | ColumnType::NumericText(_) => (PhysicalType::BYTE_ARRAY, Some(LogicalType::String)),
         ColumnType::Bit(_) => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Bytes => (PhysicalType::BYTE_ARRAY, None),
         ColumnType::Numeric { precision, scale } => (
-            PhysicalType::INT64,
+            if precision > 18 {
+                PhysicalType::FIXED_LEN_BYTE_ARRAY
+            } else {
+                PhysicalType::INT64
+            },
             Some(LogicalType::Decimal {
                 scale: scale as i32,
                 precision: precision as i32,
@@ -281,6 +286,15 @@ fn write(
         }
         (Values::Float8(v), PhysicalType::DOUBLE) => {
             write_typed::<DoubleType, u64>(desc, p, v, rows_per_page, |&b| f64::from_bits(b))?
+        }
+        // A decimal's integer, big-endian in the bytes of its length.
+        (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            if matches!(desc.logical_type_ref(), Some(LogicalType::Decimal { .. })) =>
+        {
+            let n = desc.type_length() as usize;
+            write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, |&k| {
+                FixedLenByteArray::from(k.to_be_bytes()[16 - n..].to_vec())
+            })?
         }
         (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
             write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, |&k| {
@@ -566,6 +580,19 @@ pub fn decode(
                 nullable,
             )))
         }
+        ColumnType::Numeric { precision, .. } if precision > 18 => {
+            let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
+            let mut v: Vec<FixedLenByteArray> = Vec::new();
+            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            if n != rows {
+                return Err(short(n));
+            }
+            Ok(Values::Wide(spread(
+                v.iter().map(|b| decimal_integer(b.data())),
+                &defs,
+                nullable,
+            )))
+        }
         ColumnType::Int8
         | ColumnType::Timestamptz
         | ColumnType::Numeric { .. }
@@ -643,7 +670,11 @@ pub fn decode(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Values::Wide(spread(keys.into_iter(), &defs, nullable)))
         }
-        ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Bpchar(_) | ColumnType::Name => {
+        ColumnType::Text(_)
+        | ColumnType::Bytes
+        | ColumnType::Bpchar(_)
+        | ColumnType::Name
+        | ColumnType::NumericText(_) => {
             let mut r = get_typed_column_reader::<ByteArrayType>(column);
             let mut v: Vec<ByteArray> = Vec::new();
             let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
@@ -663,6 +694,18 @@ pub fn decode(
             Ok(Values::Utf8(spread(v.into_iter(), &defs, nullable)))
         }
     }
+}
+
+/// The integer a decimal's fixed array holds, big-endian and signed.
+pub fn decimal_integer(b: &[u8]) -> i128 {
+    let fill = if b.first().is_some_and(|&x| x & 0x80 != 0) {
+        0xff
+    } else {
+        0
+    };
+    let mut out = [fill; 16];
+    out[16 - b.len()..].copy_from_slice(b);
+    i128::from_be_bytes(out)
 }
 
 /// Decodes a block's column as `decode` does, but text read from a dictionary comes back as its

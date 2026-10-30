@@ -191,7 +191,7 @@ pub(crate) fn number_text(e: &Expr) -> Option<String> {
 }
 
 /// A number written out as PostgreSQL types it: an integer, a bigint past an integer's range, a
-/// numeric where it has a point; with its value.
+/// numeric where it has a point or an exponent or passes a bigint's range; with its value.
 pub(super) fn number_datum(e: &Expr) -> Option<(Datum, ColumnType)> {
     let text = match e {
         Expr::Value(v) => match &v.value {
@@ -211,29 +211,39 @@ pub(super) fn number_datum(e: &Expr) -> Option<(Datum, ColumnType)> {
         Expr::Nested(x) => return number_datum(x),
         _ => return None,
     };
-    match text.split_once('.') {
-        None => {
-            let v: i64 = text.parse().ok()?;
-            Some((
-                Datum::Int(v),
-                if i32::try_from(v).is_ok() {
-                    ColumnType::Int4
-                } else {
-                    ColumnType::Int8
-                },
-            ))
-        }
-        Some((_, frac)) => {
-            let scale = u8::try_from(frac.len()).ok().filter(|&s| s <= 18)?;
-            let units = crate::catalog::numeric_units(&text, 18, scale).ok()?;
-            Some((
-                Datum::Int(units),
-                ColumnType::Numeric {
-                    precision: 18,
-                    scale,
-                },
-            ))
-        }
+    if let Ok(v) = text.parse::<i64>() {
+        return Some((
+            Datum::Int(v),
+            if i32::try_from(v).is_ok() {
+                ColumnType::Int4
+            } else {
+                ColumnType::Int8
+            },
+        ));
+    }
+    let n = crate::numeric::Numeric::parse(&text).ok()?;
+    Some((Datum::Text(n.to_string()), ColumnType::NumericText(None)))
+}
+
+/// A number written out, or a quoted literal, as the text a numeric's input reads.
+pub(crate) fn numeric_literal_text(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) | Value::SingleQuotedString(s) => Some(s.clone()),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(v) => match &v.value {
+                Value::Number(s, _) => Some(format!("-{s}")),
+                _ => None,
+            },
+            _ => None,
+        },
+        Expr::Nested(x) => numeric_literal_text(x),
+        _ => None,
     }
 }
 
@@ -335,26 +345,9 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             n,
             true,
         )?),
-        ColumnType::Numeric { precision, scale } => {
-            let text = match e {
-                Expr::Value(v) => match &v.value {
-                    Value::Number(s, _) => s.clone(),
-                    Value::SingleQuotedString(s) => s.clone(),
-                    _ => return Err(wrong()),
-                },
-                Expr::UnaryOp {
-                    op: UnaryOperator::Minus,
-                    expr,
-                } => match expr.as_ref() {
-                    Expr::Value(v) => match &v.value {
-                        Value::Number(s, _) => format!("-{s}"),
-                        _ => return Err(wrong()),
-                    },
-                    _ => return Err(wrong()),
-                },
-                _ => return Err(wrong()),
-            };
-            Datum::Int(crate::catalog::numeric_units(&text, precision, scale)?)
+        ty @ (ColumnType::Numeric { .. } | ColumnType::NumericText(_)) => {
+            let text = numeric_literal_text(e).ok_or_else(wrong)?;
+            super::fill::numeric_datum(crate::numeric::Numeric::parse(&text)?, ty)?
         }
     })
 }

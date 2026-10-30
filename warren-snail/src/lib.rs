@@ -11,6 +11,7 @@ pub mod file;
 #[cfg(feature = "standalone")]
 pub mod held;
 pub mod lock;
+pub mod numeric;
 pub mod places;
 pub mod read;
 pub mod regs;

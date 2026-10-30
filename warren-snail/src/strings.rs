@@ -297,11 +297,15 @@ pub fn bits_cast(key: &[u8], n: Option<u32>, varying: bool, explicit: bool) -> R
     Ok(bits_key(n, &out))
 }
 
-/// The bytes a value of a string type or a bit string is keyed by, from the bytes it is held as:
-/// a bpchar's without its trailing blanks, any other's as they are.
+/// The bytes a value of a string type, a bit string or a numeric held as its text is keyed by,
+/// from the bytes it is held as: a bpchar's without its trailing blanks, a numeric's its class's
+/// key, any other's as they are.
 pub fn key_bytes(ty: ColumnType, held: &[u8]) -> Cow<'_, [u8]> {
     match ty {
         ColumnType::Bpchar(_) => Cow::Borrowed(bpchar_key(held)),
+        ColumnType::NumericText(_) => Cow::Owned(
+            crate::numeric::class_of_text(std::str::from_utf8(held).unwrap_or("")).into_bytes(),
+        ),
         _ => Cow::Borrowed(held),
     }
 }

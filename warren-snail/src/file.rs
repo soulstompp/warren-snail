@@ -128,6 +128,23 @@ pub(crate) fn holds_catalog(format: u32, catalog: &crate::catalog::Catalog) -> c
     )))
 }
 
+/// Refuses a numeric column's NaN in a snail of `format`: 0.1.x would read the integer that stands
+/// for it as a number.
+pub(crate) fn holds_nan(
+    format: u32,
+    table: &crate::catalog::Table,
+    column: usize,
+) -> crate::Result<()> {
+    if format >= FORMAT {
+        return Ok(());
+    }
+    Err(crate::Error::new(format!(
+        "{}.{} holds NaN, which a snail of format {format} cannot hold: put the snail `out` and \
+         `write` it afresh, in format {FORMAT}",
+        table.name, table.columns[column].name
+    )))
+}
+
 /// Refuses a NULL on a level of `order` in a snail of `format`: no key of formats 7 and 8 holds one.
 pub(crate) fn keys_null(
     format: u32,

@@ -316,7 +316,7 @@ impl Snail {
             // on one stays a condition to read.
             if let Level::Column(c) = *l {
                 let ty = want.table.columns[c].ty;
-                if ty.is_string() || ty.keyed_by_bytes() {
+                if ty.keyed_by_text() || ty.keyed_by_bytes() {
                     let fixed = texts.iter().position(|t| {
                         t.column == c && matches!((&t.lo, &t.hi), (Bound::Included(a), Bound::Included(b)) if a == b)
                     });
@@ -750,6 +750,11 @@ impl Snail {
                     .iter()
                     .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::Bpchar(_)))
                     .collect();
+                // Which of them are numerics held as their text, each kept beside its class.
+                let classed: Vec<bool> = columns
+                    .iter()
+                    .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::NumericText(_)))
+                    .collect();
                 let dicts: Vec<Dict> = outs.iter().map(|o| o.3.dict().cloned()).collect();
                 if !same(&sent, &dicts) {
                     sink.dictionaries(&dicts);
@@ -857,17 +862,19 @@ impl Snail {
                         if !keep {
                             continue;
                         }
-                        let make = |&(is_text, month, start, v): &(bool, bool, usize, &Values),
-                                    keyed: bool| {
+                        let make = |o: usize| {
+                            let (is_text, month, start, v) = outs[o];
                             let i = r - start;
                             if let Values::Dict { codes, .. } = v {
                                 codes[i].map_or(Cell::Null, Cell::Code)
-                            } else if keyed {
+                            } else if keyed[o] {
                                 v.text_value(i).map_or(Cell::Null, |t| {
                                     let key: Box<[u8]> =
                                         crate::strings::bpchar_key(t.data()).into();
                                     Cell::Keyed(crate::read::answer::Keyed::new(key, t))
                                 })
+                            } else if classed[o] {
+                                v.text_value(i).map_or(Cell::Null, Cell::classed)
                             } else if is_text {
                                 v.text_value(i).map_or(Cell::Null, |t| Cell::Text(Text(t)))
                             } else if month {
@@ -880,18 +887,14 @@ impl Snail {
                                 v.int(i).map_or(Cell::Null, Cell::Int)
                             }
                         };
-                        for ((cell, o), &k) in cells[..lead].iter_mut().zip(&outs).zip(&keyed) {
-                            *cell = make(o, k);
+                        for (o, cell) in cells[..lead].iter_mut().enumerate() {
+                            *cell = make(o);
                         }
                         if lead > 0 && !sink.admits(&cells[..lead]) {
                             continue;
                         }
-                        for ((cell, o), &k) in cells[lead..]
-                            .iter_mut()
-                            .zip(&outs[lead..])
-                            .zip(&keyed[lead..])
-                        {
-                            *cell = make(o, k);
+                        for (o, cell) in cells.iter_mut().enumerate().skip(lead) {
+                            *cell = make(o);
                         }
                         sink.row(&cells);
                     }

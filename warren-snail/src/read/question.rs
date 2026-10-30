@@ -379,32 +379,33 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
             ColumnType::Timestamptz => {
                 instant(&text_literal(e).map_err(|_| Error::new(format!("{e} is not an instant")))?)
             }
-            ColumnType::Numeric { precision, scale } => {
-                let text = match e {
-                    Expr::Value(v) => match &v.value {
-                        Value::Number(s, _) | Value::SingleQuotedString(s) => s.clone(),
-                        _ => return Err(Error::new(format!("{e} is not a number"))),
-                    },
-                    Expr::UnaryOp {
-                        op: UnaryOperator::Minus,
-                        expr,
-                    } => format!("-{expr}"),
-                    _ => return Err(Error::new(format!("{e} is not a number"))),
-                };
-                if text
-                    .split_once('.')
-                    .is_some_and(|(_, f)| f.len() > scale as usize)
-                {
-                    return Err(Error::new(format!(
-                        "{e}: compare a numeric({precision},{scale}) with at most {scale} digits after the point"
-                    )));
-                }
-                crate::catalog::numeric_units(&text, 18, scale)
-            }
             _ => number(e).ok_or_else(|| Error::new(format!("{e} is not an integer"))),
         },
         Shape::Clock(_) => Err(Error::new("compare the column itself, or its month")),
     }
+}
+
+/// A literal compared with a numeric, as the number `numeric_in` reads: a number written out, a
+/// quoted literal, or either cast to numeric, held to the cast's typmod.
+fn numeric_literal(e: &Expr) -> Result<crate::numeric::Numeric> {
+    if let Expr::Cast {
+        expr, data_type, ..
+    } = e
+    {
+        if let Some(typmod) = crate::catalog::held_type(data_type)
+            .ok()
+            .and_then(ColumnType::numeric_typmod)
+        {
+            let n = numeric_literal(expr)?;
+            return match typmod {
+                Some((p, s)) => n.typmod(p, s),
+                None => Ok(n),
+            };
+        }
+    }
+    let text = super::statement::numeric_literal_text(e)
+        .ok_or_else(|| Error::new(format!("{e} is not a number")))?;
+    crate::numeric::Numeric::parse(&text)
 }
 
 /// A literal compared with a fixed scalar, as its key: quoted, read by the type's input; a number
@@ -712,6 +713,7 @@ impl From<'_> {
                             | ColumnType::Int4
                             | ColumnType::Int8
                             | ColumnType::Numeric { .. }
+                            | ColumnType::NumericText(_)
                             | ColumnType::Money
                             | ColumnType::Float4
                             | ColumnType::Float8
@@ -724,23 +726,13 @@ impl From<'_> {
                 ))),
             },
             ("avg", [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))]) => match self.resolve(x)? {
-                (side, Shape::Column(column)) if self.table(side).columns[column].ty.is_float() => {
+                (side, Shape::Column(column)) if matches!(self.table(side).columns[column].ty, ty if ty.is_float() || ty.is_integer() || ty.is_numeric()) => {
                     Ok(Some(Item::Avg(Col { side, column })))
                 }
-                (side, Shape::Column(column))
-                    if !matches!(
-                        self.table(side).columns[column].ty,
-                        ColumnType::Int2
-                            | ColumnType::Int4
-                            | ColumnType::Int8
-                            | ColumnType::Numeric { .. }
-                    ) =>
-                {
-                    Err(Error::new(format!(
-                        "function avg({}) does not exist",
-                        self.table(side).columns[column].ty.pg_name()
-                    )))
-                }
+                (side, Shape::Column(column)) => Err(Error::new(format!(
+                    "function avg({}) does not exist",
+                    self.table(side).columns[column].ty.pg_name()
+                ))),
                 _ => Err(Error::new(format!("{e} is not read"))),
             },
             ("min" | "max", [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))]) => {
@@ -755,6 +747,7 @@ impl From<'_> {
                     | ColumnType::Int4
                     | ColumnType::Int8
                     | ColumnType::Numeric { .. }
+                    | ColumnType::NumericText(_)
                     | ColumnType::Timestamptz
                     | ColumnType::Oid
                     | ColumnType::Reg(..)
@@ -1130,8 +1123,51 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         }
         if let Shape::Column(c) = s {
             let ty = table.columns[c].ty;
-            if ty.is_string() || ty.keyed_by_bytes() {
-                let v = bytes_literal(lit, ty)?;
+            // A numeric(p, s) by the keys either side of the number, whatever its scale.
+            if let ColumnType::Numeric { precision, scale } = ty {
+                let n = numeric_literal(lit)?;
+                let (at, below, above) = crate::numeric::column_bounds(&n, precision, scale);
+                let none = Interval { lo: 1, hi: 0 };
+                let cond = match op {
+                    BinaryOperator::Eq => Cond::new(s, at.map_or(none, Interval::at)),
+                    BinaryOperator::NotEq => {
+                        let mut c = Cond::new(s, Interval::ALL);
+                        c.except.extend(at);
+                        c
+                    }
+                    BinaryOperator::Lt => Cond::new(
+                        s,
+                        Interval {
+                            lo: i128::MIN,
+                            hi: below,
+                        },
+                    ),
+                    BinaryOperator::LtEq => Cond::new(
+                        s,
+                        Interval {
+                            lo: i128::MIN,
+                            hi: at.unwrap_or(below),
+                        },
+                    ),
+                    BinaryOperator::Gt => {
+                        Cond::new(s, above.map_or(none, |lo| Interval { lo, hi: i128::MAX }))
+                    }
+                    BinaryOperator::GtEq => Cond::new(
+                        s,
+                        at.or(above)
+                            .map_or(none, |lo| Interval { lo, hi: i128::MAX }),
+                    ),
+                    other => return Err(Error::new(format!("the comparison {other} is not read"))),
+                };
+                merge(&mut here.conds, cond);
+                continue;
+            }
+            if ty.keyed_by_text() || ty.keyed_by_bytes() {
+                // A numeric held as its text, by its class's key.
+                let v = match ty {
+                    ColumnType::NumericText(_) => numeric_literal(lit)?.class_key().into_bytes(),
+                    _ => bytes_literal(lit, ty)?,
+                };
                 let mut except = Vec::new();
                 let (lo, hi) = match op {
                     BinaryOperator::Eq => (Included(v.clone()), Included(v)),

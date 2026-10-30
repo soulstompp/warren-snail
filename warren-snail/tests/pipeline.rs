@@ -134,7 +134,7 @@ fn a_table_declared_in_a_file_that_holds_others_takes_rows_and_reads_its_runs() 
         .execute("INSERT INTO weather.wind (seq, station, turn) VALUES (1, '\\x00', 12345.6)")
         .unwrap_err()
         .to_string();
-    assert!(e.contains("more digits"), "{e}");
+    assert!(e.contains("numeric field overflow"), "{e}");
     let want = turned_as_asked(&rows);
     // Each insert cut the block it grew at the commit where one of its parts would fill a page: as
     // many blocks as the same lines written afresh.

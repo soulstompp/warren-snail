@@ -29,6 +29,36 @@ pub const DDL_KEY: &str = "warren-snail.ddl";
 /// OIDs came from.
 pub const RELEASE_KEY: &str = "warren-snail.release";
 
+/// The key under which a file out of a table names each numeric column holding a NaN, and the
+/// integer that stands for it: a line a column, its name, a tab, and the integer.
+pub const NAN_KEY: &str = "warren-snail.nan";
+
+/// The numeric columns of a table whose blocks hold a NaN, each with the integer that stands for it
+/// on its pages, as `NAN_KEY` names them; none where no column holds one.
+fn nan_columns(
+    table: &Table,
+    order: &crate::catalog::Order,
+    blocks: &[crate::directory::Entry],
+) -> Option<String> {
+    let lines: Vec<String> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(c, col)| {
+            let ColumnType::Numeric { precision, .. } = col.ty else {
+                return None;
+            };
+            let nan = crate::numeric::nan_units(precision);
+            let s = order.leaf_slot(table, c)?;
+            blocks
+                .iter()
+                .any(|e| e.columns[s].nulls < e.rows && e.columns[s].max == nan)
+                .then(|| format!("{}\t{nan}", col.name))
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// A table written out.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -52,11 +82,14 @@ enum Extreme {
     Int(i64),
     Bytes(Vec<u8>),
     Float(i64, u64),
+    /// A decimal's integer, and the bytes the file writes it in.
+    Decimal(i128, Vec<u8>),
 }
 
 impl Extreme {
     fn plain(&self, physical: PhysicalType) -> Vec<u8> {
         match (self, physical) {
+            (Extreme::Decimal(_, b), _) => b.clone(),
             (Extreme::Float(_, b), PhysicalType::FLOAT) => (*b as u32).to_le_bytes().to_vec(),
             (Extreme::Float(_, b), _) => b.to_le_bytes().to_vec(),
             (Extreme::Int(v), PhysicalType::INT32) => (*v as i32).to_le_bytes().to_vec(),
@@ -86,6 +119,11 @@ fn extremes(
         }
         let v = match values {
             Values::Int(_) => values.int(i).map(Extreme::Int),
+            // A decimal's integer, signed as Parquet orders it, in the bytes of its length.
+            Values::Wide(w) if ty.is_numeric() => w[i].map(|k| {
+                let n = ty.width().unwrap_or(16);
+                Extreme::Decimal(k, k.to_be_bytes()[16 - n..].to_vec())
+            }),
             Values::Wide(w) => w[i].map(|k| Extreme::Bytes(crate::scalars::uuid_bytes(k).to_vec())),
             Values::Float4(f) => f[i]
                 .filter(|&b| !f32::from_bits(b).is_nan())
@@ -330,6 +368,10 @@ impl Snail {
                         .iter()
                         .any(|c| matches!(c.ty, ColumnType::Reg(..)))
                         .then(|| KeyValue::new(RELEASE_KEY.to_string(), table.release.to_string())),
+                )
+                .chain(
+                    nan_columns(table, order, &blocks)
+                        .map(|v| KeyValue::new(NAN_KEY.to_string(), v)),
                 )
                 .collect(),
             ))

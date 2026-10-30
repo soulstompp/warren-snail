@@ -182,36 +182,57 @@ impl Rows {
                         out.extend(a.iter().map(|v| v.map(|b| ByteArray::from(b.to_vec()))));
                     }
                     (
-                        Values::Int(out),
+                        Values::Int(_) | Values::Wide(_),
                         ColumnType::Numeric { precision, scale },
-                        DataType::Decimal128(_, s),
+                        DataType::Decimal128(p, s),
                     ) => {
                         let a = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
-                        let s = *s as i32;
-                        let to = scale as i32;
                         let limit = 10i128.pow(precision as u32);
+                        for v in a.iter() {
+                            let units = match v {
+                                None => None,
+                                // NaN, at the greatest integer its page form holds.
+                                Some(x) if x == crate::numeric::nan_units(*p) => {
+                                    Some(crate::numeric::nan_units(precision))
+                                }
+                                // A value at a scale finer than the column's is refused unless
+                                // its extra digits are zeros.
+                                Some(x) => Some(
+                                    crate::numeric::Numeric::of_units(x, *s as u32)
+                                        .units_at(u32::from(scale))
+                                        .filter(|u| u.abs() < limit)
+                                        .ok_or_else(|| {
+                                            Error::new(format!(
+                                                "{}.{}: a value is no {}",
+                                                table.name,
+                                                c.name,
+                                                c.ty.name()
+                                            ))
+                                        })?,
+                                ),
+                            };
+                            match &mut out {
+                                Values::Int(o) => o.push(units.map(|u| u as i64)),
+                                Values::Wide(o) => o.push(units),
+                                _ => unreachable!("a numeric's units"),
+                            }
+                        }
+                    }
+                    // A numeric held as its text, each value read as numeric_in reads it and held
+                    // to the column's typmod.
+                    (Values::Text(out), ColumnType::NumericText(_), DataType::Utf8) => {
+                        let a = a.as_any().downcast_ref::<StringArray>().unwrap();
                         for v in a.iter() {
                             out.push(match v {
                                 None => None,
-                                Some(x) => {
-                                    // A value at a scale finer than the column's is refused
-                                    // unless its extra digits are zeros.
-                                    let units = if s <= to {
-                                        x.checked_mul(10i128.pow((to - s) as u32))
-                                    } else {
-                                        let d = 10i128.pow((s - to) as u32);
-                                        (x % d == 0).then_some(x / d)
+                                Some(s) => {
+                                    match crate::read::fill::numeric_datum(
+                                        crate::numeric::Numeric::parse(s)?,
+                                        c.ty,
+                                    )? {
+                                        crate::read::statement::Datum::Text(t) => Some(t),
+                                        _ => unreachable!("a numeric held as its text"),
                                     }
-                                    .filter(|u| u.abs() < limit)
-                                    .ok_or_else(|| {
-                                        Error::new(format!(
-                                            "{}.{}: a value is no {}",
-                                            table.name,
-                                            c.name,
-                                            c.ty.name()
-                                        ))
-                                    })?;
-                                    Some(units as i64)
                                 }
                             });
                         }
@@ -233,6 +254,7 @@ fn row_value(ty: ColumnType, v: &Values, i: usize) -> crate::read::statement::Da
     }
     match (ty, v) {
         (_, Values::Int(x)) => x[i].map_or(Datum::Null, Datum::Int),
+        (_, Values::Wide(x)) => x[i].map_or(Datum::Null, Datum::Wide),
         (ty, _) if ty.keyed_by_bytes() => v
             .text_value(i)
             .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
@@ -592,12 +614,18 @@ fn write_tables(
             }
             continue;
         };
-        for (c, values) in table.columns.iter().zip(&rows.columns) {
+        for (ci, (c, values)) in table.columns.iter().zip(&rows.columns).enumerate() {
             if values.len() != rows.len() {
                 return Err(Error::new(format!(
                     "{}: its columns differ in length",
                     table.name
                 )));
+            }
+            if let (ColumnType::Numeric { precision, .. }, Some(v)) = (c.ty, values.ints()) {
+                let nan = crate::numeric::nan_units(precision) as i64;
+                if v.contains(&Some(nan)) {
+                    crate::file::holds_nan(w.format(), table, ci)?;
+                }
             }
             if c.not_null && values.nulls() > 0 {
                 return Err(Error::new(format!(
