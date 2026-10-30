@@ -117,6 +117,35 @@ fn a_reg_type_is_compared_ordered_and_grouped_as_an_oid() {
 
 #[test]
 #[cfg(feature = "standalone")]
+fn a_literal_cast_to_a_reg_type_is_read_by_that_type_s_input_and_compared_as_an_oid() {
+    let path = written("regs-cast", 19);
+    let mut snail = Snail::open(&path).unwrap();
+    for (q, want) in [
+        (
+            "SELECT r.n FROM s.r r WHERE r.c = 'pg_class'::regclass",
+            vec![1],
+        ),
+        (
+            "SELECT r.n FROM s.r r WHERE r.c < 'pg_class'::regclass ORDER BY r.n",
+            vec![3, 4],
+        ),
+        // Another reg* type's literal, and an oid's, compare as oids.
+        ("SELECT r.n FROM s.r r WHERE r.c = 'int4'::regtype", vec![]),
+        ("SELECT r.n FROM s.r r WHERE r.t = 'int4'::regtype", vec![1]),
+        ("SELECT r.n FROM s.r r WHERE r.c = '1255'::oid", vec![4]),
+    ] {
+        let (b, round) = snail.ask(q, None).unwrap();
+        exact(q, &round);
+        assert_eq!(ns(&b), want, "{q}");
+    }
+    // A name no object of the release holds is refused, as regclass's input refuses it.
+    assert!(snail
+        .ask("SELECT r.n FROM s.r r WHERE r.c = 'nosuch'::regclass", None)
+        .is_err());
+}
+
+#[test]
+#[cfg(feature = "standalone")]
 fn a_reg_value_standing_alone_prints_a_built_in_object_s_name_and_any_other_oid_bare() {
     let path = written("regs-text", 19);
     let mut snail = Snail::open(&path).unwrap();

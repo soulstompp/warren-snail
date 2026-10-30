@@ -361,7 +361,7 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
     match s {
         Shape::MonthUtc(_) => number(e).ok_or_else(|| Error::new(format!("{e} is not a month"))),
         Shape::Column(c) => match table.columns[c].ty {
-            ty if crate::scalars::is_scalar(ty) => scalar_literal(e, ty),
+            ty if crate::scalars::is_scalar(ty) => scalar_literal(e, ty, table.release),
             ty @ (ColumnType::Float4 | ColumnType::Float8) => {
                 let wide = ty == ColumnType::Float8;
                 let text = match text_literal(e) {
@@ -410,8 +410,29 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
 }
 
 /// A literal compared with a fixed scalar, as its key: quoted, read by the type's input; a number
-/// only beside an oid, cast to one, or an xid, as `xideqint4` reads an integer.
-fn scalar_literal(e: &Expr, ty: ColumnType) -> Result<i64> {
+/// only beside an oid, cast to one, or an xid, as `xideqint4` reads an integer. A literal cast to
+/// the column's type is read by that type's input, and beside an oid or a reg* type a literal cast
+/// to any reg* type by that one's, under the file's release, or one cast to an oid.
+fn scalar_literal(e: &Expr, ty: ColumnType, release: u8) -> Result<i64> {
+    if let Expr::Cast {
+        expr, data_type, ..
+    } = e
+    {
+        if let (Ok(s), Ok(to)) = (text_literal(expr), crate::catalog::held_type(data_type)) {
+            let to = match to {
+                ColumnType::Reg(kind, _) if ty.is_oid() => {
+                    crate::regs::check_release(Some(kind), release)?;
+                    Some(ColumnType::Reg(kind, release))
+                }
+                ColumnType::Oid if ty.is_oid() => Some(ColumnType::Oid),
+                to if to == ty => Some(to),
+                _ => None,
+            };
+            if let Some(to) = to {
+                return crate::scalars::scalar_parse(to, &s);
+            }
+        }
+    }
     // A quoted literal beside a reg* type is read as an oid, whose comparisons it takes.
     if let Ok(s) = text_literal(e) {
         let ty = if ty.is_oid() { ColumnType::Oid } else { ty };
