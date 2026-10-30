@@ -382,7 +382,8 @@ fn out_and_back(path: &std::path::Path, catalog: &Catalog, name: &str) -> std::p
 fn a_path_and_a_polygon_are_trees_of_their_own_the_polygon_s_bounding_box_kept_out_and_back() {
     let path = tmp("path-polygon.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, p path, g polygon, PRIMARY KEY (id));",
+        "CREATE TABLE s.t (id integer NOT NULL, p path, g polygon, PRIMARY KEY (id)); \
+         CREATE TABLE s.u (id integer NOT NULL, p path, g polygon, PRIMARY KEY (id));",
     )
     .unwrap();
     let empty = Rows {
@@ -458,6 +459,17 @@ fn a_path_and_a_polygon_are_trees_of_their_own_the_polygon_s_bounding_box_kept_o
         .ask("SELECT id FROM s.t WHERE p = '[(7,7)]' ORDER BY id", None)
         .unwrap();
     assert_eq!(ids(&b), [2]);
+    // Taken from an answer by an INSERT … SELECT, each value as its leaves give it.
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.u (id, p, g) SELECT id, p, g FROM s.t WHERE id = 2")
+        .unwrap();
+    drop(w);
+    let q = "WITH t AS (SELECT id, p, g FROM s.u) \
+             SELECT id, p::text AS x, CAST(g AS box)::text AS y FROM t";
+    assert_eq!(
+        texts_of(&mut Snail::open(&path).unwrap(), q),
+        [vec![want("((1,2))")], vec![want("(-0,-0),(0,0)")]]
+    );
 }
 
 #[test]
@@ -593,7 +605,9 @@ fn an_array_of_a_type_with_no_equality_refuses_one_only_of_two_arrays_of_one_sha
         "SELECT id FROM s.t WHERE p = '{}'",
         "SELECT id FROM s.t WHERE p <> '{\"(9,9)\",\"(8,8)\"}'",
         "SELECT id FROM s.t WHERE q @> '{}'",
+        "WITH t AS (SELECT id, p FROM s.t) SELECT id FROM t WHERE p IS DISTINCT FROM '{}'",
         "SELECT p, count(*) FROM s.t GROUP BY p",
+        "WITH t AS (SELECT id, p FROM s.t) SELECT p, count(*) FROM t GROUP BY p",
         "SELECT id FROM s.t ORDER BY a",
         "SELECT id FROM s.t WHERE a < '{}'",
         "SELECT min(p) FROM s.t",
