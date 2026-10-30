@@ -1259,6 +1259,7 @@ mod tests {
         assert_eq!(r(RegKind::Proc, "now").unwrap(), 1299);
         assert!(r(RegKind::Proc, "abs").is_err());
         assert!(r(RegKind::Proc, "pg_catalog.abs").is_err());
+        assert!(r(RegKind::Proc, "public.now").is_err());
         assert_eq!(r(RegKind::Procedure, "abs(int4)").unwrap(), 1397);
         assert_eq!(
             r(RegKind::Procedure, "pg_catalog.abs( integer )").unwrap(),

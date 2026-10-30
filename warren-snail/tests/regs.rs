@@ -184,6 +184,62 @@ fn a_reg_value_standing_alone_prints_a_built_in_object_s_name_and_any_other_oid_
         "WITH t AS (SELECT n, c FROM s.r) SELECT CAST(CAST(CAST(c AS text) AS regclass) AS oid)::text AS x FROM t WHERE n = 1 OR n = 4",
     );
     assert_eq!(c, [s(&["1259", "1255"])]);
+    // In a pipeline a reg* value is compared as an oid, with an oid and with a literal read as one,
+    // and its min an oid.
+    let mut ns_of = |q: &str| ns(&snail.ask(q, None).unwrap().0);
+    assert_eq!(
+        ns_of("WITH t AS (SELECT n, c FROM s.r) SELECT n FROM t WHERE c = CAST(1259 AS oid)"),
+        [1]
+    );
+    assert_eq!(
+        ns_of("WITH t AS (SELECT n, c FROM s.r) SELECT n FROM t WHERE c = '1259'"),
+        [1]
+    );
+    assert!(snail
+        .ask(
+            "WITH t AS (SELECT n, c FROM s.r) SELECT n FROM t WHERE c = 'pg_class'",
+            None
+        )
+        .is_err());
+    let (b, _) = snail
+        .ask(
+            "WITH t AS (SELECT n, c FROM s.r) SELECT min(c) AS x FROM t",
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        b.schema()
+            .field(0)
+            .metadata()
+            .get("pg_type")
+            .map(String::as_str),
+        Some("oid")
+    );
+    // A text assigned to a regclass is read by regclass(text): a name alone.
+    let path = tmp("regs-assign.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.x (n integer NOT NULL, t text, PRIMARY KEY (n)); \
+         CREATE TABLE s.y (n integer NOT NULL, c regclass, PRIMARY KEY (n));",
+    )
+    .unwrap();
+    weather::write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.x (n, t) VALUES (1, 'pg_class'), (2, '1259')")
+        .unwrap();
+    w.execute("INSERT INTO s.y (n, c) SELECT n, t FROM s.x WHERE n = 1")
+        .unwrap();
+    assert!(w
+        .execute("INSERT INTO s.y (n, c) SELECT n, t FROM s.x WHERE n = 2")
+        .is_err());
+    let (b, _) = w.ask("SELECT y.c FROM s.y y", None).unwrap();
+    assert_eq!(
+        b.column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(0),
+        1259
+    );
 }
 
 #[test]
@@ -301,14 +357,20 @@ fn an_oid8_is_held_unsigned_in_64_bits_and_read_as_postgresql_19_reads_it() {
         b
     };
     // An integer beside an oid8 comes through int8, its bits as they are: -1 is the largest.
-    assert_eq!(ns(&ask("SELECT e.n FROM s.e e WHERE e.e = -1", None)), [1]);
+    assert_eq!(
+        ns(&ask(
+            "SELECT e.n FROM s.e e WHERE e.e = -1 ORDER BY e.n",
+            None
+        )),
+        [1, 6]
+    );
     for order in ["e_pkey", "e_e"] {
         assert_eq!(
             ns(&ask(
-                "SELECT e.n, e.e FROM s.e e WHERE e.e >= '9223372036854775808' ORDER BY e.e",
+                "SELECT e.n, e.e FROM s.e e WHERE e.e >= '9223372036854775808' ORDER BY e.e, e.n",
                 Some(order)
             )),
-            [3, 1]
+            [3, 1, 6]
         );
     }
     let b = ask("SELECT min(e.e), max(e.e) FROM s.e e", None);
@@ -355,7 +417,8 @@ fn write_oid8(path: &std::path::Path) {
     let mut w = Snail::open_writing(path).unwrap();
     w.execute(
         "INSERT INTO s.e (n, e, o) VALUES (1, '18446744073709551615', 4294967295), \
-         (2, '0x10', 0), (3, '9223372036854775808', NULL), (4, 0, NULL), (5, NULL, NULL)",
+         (2, '0x10', 0), (3, '9223372036854775808', NULL), (4, 0, NULL), (5, NULL, NULL), \
+         (6, -1, NULL)",
     )
     .unwrap();
     // oid to oid8 by assignment, and an integer through int8.
@@ -374,4 +437,69 @@ fn write_oid8(path: &std::path::Path) {
     assert!(w
         .execute("INSERT INTO s.f (n, o) SELECT n, e FROM s.e WHERE n = 2")
         .is_err());
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_reg_type_is_cut_by_its_bits_as_an_oid_is_and_goes_out_naming_its_release() {
+    use warren_snail::scalars::unsigned_key;
+    use warren_snail::values::Values;
+    use warren_snail::write::Rows;
+    // 4,096 regclass values spread evenly over their 32 bits cut as 4,096 oids spread so.
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.c (id regclass NOT NULL, PRIMARY KEY (id)); \
+         CREATE TABLE s.o (id oid NOT NULL, PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let spread = || {
+        Values::Int(
+            (0..4096)
+                .map(|i| Some(unsigned_key(i * (1u64 << 20), 32)))
+                .collect(),
+        )
+    };
+    let path = tmp("regs-cut.snail");
+    let rows = |v| Rows { columns: vec![v] };
+    warren_snail::write::write_released(
+        &path,
+        &catalog,
+        &[
+            ("s.c".into(), rows(spread())),
+            ("s.o".into(), rows(spread())),
+        ],
+        &[],
+        weather::span(),
+        16,
+    )
+    .unwrap();
+    let mut snail = Snail::open_writing(&path).unwrap();
+    let blocks = snail.blocks().unwrap();
+    let of = |order: &str| {
+        blocks
+            .iter()
+            .filter(|r| r.order == order)
+            .map(|r| r.rows)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(of("c_pkey"), [1024; 4]);
+    assert_eq!(of("c_pkey"), of("o_pkey"));
+    let dir = tmp("regs-out");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let outs = snail.out(&dir).unwrap();
+    let release = |table: &str| {
+        let t = outs.iter().find(|t| t.table == table).unwrap();
+        let reader =
+            parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&t.file).unwrap())
+                .unwrap();
+        parquet::file::reader::FileReader::metadata(&reader)
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|k| k.key == warren_snail::read::RELEASE_KEY)
+            .and_then(|k| k.value.clone())
+    };
+    assert_eq!(release("s.c"), Some("16".to_string()));
+    assert_eq!(release("s.o"), None);
 }
