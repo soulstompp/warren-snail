@@ -337,6 +337,13 @@ pub struct Root {
     /// The file's own default collation, as a database's, which jsonb's strings sort under: format 9
     /// only; libc C.UTF-8 where it names none.
     pub collation: String,
+    /// The transactions across snails this root's writes decided, each until a round across them
+    /// finds every other snail's root written: format 9 only.
+    pub decided: Vec<Decision>,
+    /// Where this copy of the root was written before another snail's root decided its
+    /// transaction: it is taken only once a round across them finds that root written. Format 9
+    /// only.
+    pub pending: Option<Pending>,
 }
 
 /// The default collation a file names where it names none: libc C.UTF-8, which orders text by its
@@ -352,6 +359,50 @@ impl Root {
             &self.collation
         }
     }
+}
+
+/// A transaction across snails, as the root that decided it holds it: the generation that root
+/// made, the root it wrote into each other snail, and the pages that carry those roots' bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Decision {
+    pub at: u64,
+    pub roots: Vec<Written>,
+    pub carried: Extent,
+}
+
+/// The bytes of each root a decision carries, in the order it names them.
+pub(crate) fn encode_carried(roots: &[Vec<u8>]) -> Vec<u8> {
+    let mut o = Out::default();
+    o.u32(roots.len() as u32);
+    for r in roots {
+        o.bytes(r);
+    }
+    o.0
+}
+
+pub(crate) fn decode_carried(buf: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut i = In::new(buf);
+    (0..i.u32()?).map(|_| i.bytes()).collect()
+}
+
+/// One snail's root a transaction across snails wrote: a table the snail holds, which names it
+/// among the snails opened together, and the root's generation and checksum.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Written {
+    pub holds: String,
+    pub generation: u64,
+    pub crc: u32,
+}
+
+/// The root that decides a pending copy's transaction: a table its snail holds, and the
+/// generation it makes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Pending {
+    pub decider: String,
+    pub at: u64,
 }
 
 /// The `lc_monetary` money is written under: C, the only one the snail reads until the collations
@@ -536,6 +587,30 @@ impl Root {
                 o.str(l);
             }
             o.str(self.collation());
+            o.u32(self.decided.len() as u32);
+            for d in &self.decided {
+                o.u64(d.at);
+                o.extent(d.carried);
+                o.u32(d.roots.len() as u32);
+                for w in &d.roots {
+                    o.str(&w.holds);
+                    o.u64(w.generation);
+                    o.u32(w.crc);
+                }
+            }
+            match &self.pending {
+                None => o.u8(0),
+                Some(p) => {
+                    o.u8(1);
+                    o.str(&p.decider);
+                    o.u64(p.at);
+                }
+            }
+        } else if !self.decided.is_empty() || self.pending.is_some() {
+            return Err(Error::new(format!(
+                "a snail of format {format} is written by no transaction across snails: `out`, \
+                 then `write`"
+            )));
         }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
@@ -583,15 +658,46 @@ impl Root {
         } else {
             (Extent::default(), crate::regs::LATEST, Vec::new())
         };
-        // A root written before format 9 named its default collation ends here, its CRC next.
-        let before = i.at();
-        let ended = page.get(before..before + 4).is_some_and(|c| {
-            u32::from_le_bytes(c.try_into().unwrap()) == crc32fast::hash(&page[..before])
-        });
-        let collation = if format >= FORMAT && !ended {
+        // A root written before format 9 named its default collation ends here, its CRC next; one
+        // written before it held decisions across snails ends after its collation.
+        let ended = |i: &In| {
+            let at = i.at();
+            page.get(at..at + 4).is_some_and(|c| {
+                u32::from_le_bytes(c.try_into().unwrap()) == crc32fast::hash(&page[..at])
+            })
+        };
+        let collation = if format >= FORMAT && !ended(&i) {
             i.str().ok()?
         } else {
             String::new()
+        };
+        let (decided, pending) = if format >= FORMAT && !ended(&i) {
+            let n = i.u32().ok()? as usize;
+            let mut decided = Vec::with_capacity(n.min(256));
+            for _ in 0..n {
+                let at = i.u64().ok()?;
+                let carried = i.extent().ok()?;
+                let m = i.u32().ok()? as usize;
+                let mut roots = Vec::with_capacity(m.min(256));
+                for _ in 0..m {
+                    roots.push(Written {
+                        holds: i.str().ok()?,
+                        generation: i.u64().ok()?,
+                        crc: i.u32().ok()?,
+                    });
+                }
+                decided.push(Decision { at, roots, carried });
+            }
+            let pending = match i.u8().ok()? {
+                0 => None,
+                _ => Some(Pending {
+                    decider: i.str().ok()?,
+                    at: i.u64().ok()?,
+                }),
+            };
+            (decided, pending)
+        } else {
+            (Vec::new(), None)
         };
         let end = i.at();
         let crc = i.u32().ok()?;
@@ -609,8 +715,21 @@ impl Root {
                 release,
                 monetary,
                 collation,
+                decided,
+                pending,
             },
             format,
+        ))
+    }
+
+    /// The checksum a root's encoding ends with, as the root it stands for once taken: its pending
+    /// mark left out.
+    pub(crate) fn crc(&self, format: u32) -> Result<u32> {
+        let mut taken = self.clone();
+        taken.pending = None;
+        let bytes = taken.encode(format)?;
+        Ok(u32::from_le_bytes(
+            bytes[bytes.len() - 4..].try_into().unwrap(),
         ))
     }
 }
@@ -801,6 +920,9 @@ pub struct Reader {
     generation: Cell<u64>,
     round: Cell<Option<u64>>,
     staged: Rc<RefCell<Staged>>,
+    /// The pending copy of the root the reader last found beside it, written before another
+    /// snail's root decided its transaction.
+    spare: RefCell<Option<Root>>,
     #[cfg(feature = "standalone")]
     held: RefCell<Held>,
     #[cfg(feature = "standalone")]
@@ -818,6 +940,7 @@ impl Reader {
             generation: Cell::new(0),
             round: Cell::new(None),
             staged: Default::default(),
+            spare: RefCell::new(None),
             #[cfg(feature = "standalone")]
             held: RefCell::new(Held::new(0)),
             #[cfg(feature = "standalone")]
@@ -998,13 +1121,14 @@ impl Reader {
     pub fn root(&self) -> Result<Root> {
         let from = self.round.get().unwrap_or(0);
         crate::lock::hold_generations_from(&self.files.first, from)?;
-        let (root, format) = newer(&self.read(0, 2)?)?;
+        let (root, format, spare) = copies(&self.read(0, 2)?)?;
         self.files.span.set(root.span);
         self.files.format.set(format);
         crate::lock::keep_generation(&self.files.first, from, root.generation)?;
         self.round.set(Some(root.generation));
         self.forget_reused(&root);
         self.generation.set(root.generation);
+        *self.spare.borrow_mut() = spare;
         Ok(root)
     }
 
@@ -1012,11 +1136,24 @@ impl Reader {
     /// The round holds the generation it held, older, so no page the newest root names is freed while
     /// the reader reads it.
     pub fn peek_root(&self) -> Result<Root> {
-        let (root, format) = newer(&self.read(0, 2)?)?;
+        let (root, format, spare) = copies(&self.read(0, 2)?)?;
         self.files.span.set(root.span);
         self.files.format.set(format);
         self.forget_reused(&root);
+        *self.spare.borrow_mut() = spare;
         Ok(root)
+    }
+
+    /// The pending copy of the root found beside the root last read, if there was one.
+    pub(crate) fn pending_copy(&self) -> Option<Root> {
+        self.spare.borrow().clone()
+    }
+
+    /// Reads from now on as of a pending copy of the root, written for the generation after the
+    /// one the round holds: the pages held that it reused are dropped.
+    pub(crate) fn adopt(&self, root: &Root) {
+        self.forget_reused(root);
+        self.generation.set(root.generation);
     }
 
     fn forget_reused(&self, root: &Root) {
@@ -1059,9 +1196,27 @@ impl Reader {
 }
 
 /// The newer of the root's two copies, given as the file's first two pages, that is whole, and its
-/// format. A file whose root names a format this build does not read is refused by that format.
+/// format. A file whose root names a format this build does not read is refused by that format. A
+/// pending copy is never taken.
 pub(crate) fn newer(both: &[u8]) -> Result<(Root, u32)> {
-    match (Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])) {
+    copies(both).map(|(root, format, _)| (root, format))
+}
+
+/// `newer`, and the other copy where it is a pending one, written for the generation after it.
+pub(crate) fn copies(both: &[u8]) -> Result<(Root, u32, Option<Root>)> {
+    let taken = |r: Option<(Root, u32)>| r.filter(|(r, _)| r.pending.is_none());
+    let (a, b) = (Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..]));
+    let (root, format) = newest(taken(a.clone()), taken(b.clone()), both)?;
+    let pending = [a, b]
+        .into_iter()
+        .flatten()
+        .map(|(r, _)| r)
+        .find(|r| r.pending.is_some() && r.generation == root.generation + 1);
+    Ok((root, format, pending))
+}
+
+fn newest(a: Option<(Root, u32)>, b: Option<(Root, u32)>, both: &[u8]) -> Result<(Root, u32)> {
+    match (a, b) {
         (Some(a), Some(b)) => Ok(if a.0.generation >= b.0.generation {
             a
         } else {
@@ -1314,10 +1469,7 @@ impl Writer {
     /// names. Where a host carries the commits, the commit is handed to it once its pages are on
     /// the disk, and its root is written only once the host returns.
     pub fn commit(&mut self, root: &mut Root) -> Result<()> {
-        root.pages = self.next;
-        root.span = self.files.span.get();
-        self.files.sync()?;
-        let bytes = root.encode(self.files.format.get())?;
+        let bytes = self.prepare(root)?;
         if let Some(host) = self.host.as_mut() {
             let pages = std::mem::take(&mut self.carried);
             host.carry(&crate::carry::Commit::of(
@@ -1339,10 +1491,22 @@ impl Writer {
             }
             None => {}
         }
-        self.write_at(root.generation % 2, &bytes)?;
-        self.carried.clear();
+        self.write_root(root.generation, &bytes)
+    }
+
+    /// A commit's pages on the disk, and its root's bytes: the commit but its root.
+    pub(crate) fn prepare(&mut self, root: &mut Root) -> Result<Vec<u8>> {
+        root.pages = self.next;
+        root.span = self.files.span.get();
         self.files.sync()?;
-        Ok(())
+        root.encode(self.files.format.get())
+    }
+
+    /// A root's bytes written to the copy its generation names, and on the disk.
+    pub(crate) fn write_root(&mut self, generation: u64, bytes: &[u8]) -> Result<()> {
+        self.write_at(generation % 2, bytes)?;
+        self.carried.clear();
+        self.files.sync()
     }
 }
 
@@ -1381,6 +1545,7 @@ mod tests {
             release: 16,
             monetary: vec![("s.t".into(), "m".into(), "C".into())],
             collation: "und-x-icu".into(),
+            ..Default::default()
         };
         let mut a = r.encode(FORMAT).unwrap();
         a.resize(PAGE, 0);
@@ -1457,6 +1622,68 @@ mod tests {
         assert!(e.contains("format 10"), "{e}");
         a[20] ^= 1;
         assert!(Root::decode(&a).is_none());
+    }
+
+    #[test]
+    fn a_pending_copy_of_the_root_is_never_taken_and_is_found_beside_the_root() {
+        let page = |r: &Root| {
+            let mut p = r.encode(FORMAT).unwrap();
+            p.resize(PAGE, 0);
+            p
+        };
+        let root = Root {
+            generation: 4,
+            decided: vec![Decision {
+                at: 4,
+                roots: vec![Written {
+                    holds: "b.t".into(),
+                    generation: 9,
+                    crc: 77,
+                }],
+                carried: Extent {
+                    start: 3,
+                    bytes: 900,
+                },
+            }],
+            ..Default::default()
+        };
+        let pending = Root {
+            generation: 5,
+            pending: Some(Pending {
+                decider: "a.t".into(),
+                at: 12,
+            }),
+            ..Default::default()
+        };
+        let (back, _) = Root::decode(&page(&pending)).unwrap();
+        assert_eq!(back.pending, pending.pending);
+        // The copies lie at their generations' places: the pending one, newer, is not taken.
+        let mut both = page(&root);
+        both.extend_from_slice(&page(&pending));
+        let (taken, _, spare) = copies(&both).unwrap();
+        assert_eq!((taken.generation, &taken.decided), (4, &root.decided));
+        assert_eq!(spare.map(|s| s.generation), Some(5));
+        // Taken, it is the root it was written for: its checksum leaves the mark out.
+        let mut landed = pending.clone();
+        landed.pending = None;
+        let bytes = landed.encode(FORMAT).unwrap();
+        assert_eq!(
+            pending.crc(FORMAT).unwrap().to_le_bytes(),
+            bytes[bytes.len() - 4..]
+        );
+        let mut both = page(&root);
+        both.extend_from_slice(&page(&landed));
+        let (taken, _, spare) = copies(&both).unwrap();
+        assert_eq!((taken.generation, spare.is_none()), (5, true));
+        // A copy pending beside an older root than its own parent is no pending copy of it.
+        let mut both = page(&Root {
+            generation: 3,
+            ..Default::default()
+        });
+        both.extend_from_slice(&page(&pending));
+        assert!(copies(&both).unwrap().2.is_none());
+        // Formats 7 and 8 hold no decision.
+        assert!(root.encode(FORMAT_EIGHT).is_err());
     }
 
     #[test]

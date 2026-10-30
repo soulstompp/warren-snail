@@ -318,303 +318,344 @@ impl Snail {
     /// A question on several tables: each read in turn, kept to the keys of the tables read before
     /// it that it meets, then met in memory. One round.
     pub(super) fn ask_join(&self, q: &Question) -> Result<(RecordBatch, Round)> {
-        let n = q.sides.len();
-        let tables: Vec<&Table> = q
-            .sides
-            .iter()
-            .map(|s| &self.catalog.tables[s.table])
-            .collect();
-        let order = read_order(q, &tables);
-        let inputs = q.select.inputs();
-        // The tables no outer join may leave NULL, joined in the order they were read, each to one
-        // joined before it; the last read is met as it is read where it alone joins it to them.
-        let core: Vec<usize> = order
-            .iter()
-            .copied()
-            .filter(|&s| !q.nullable(s) && !(q.full && s < 2))
-            .collect();
-        let last = *order.last().unwrap();
-        let stream = q.outer.is_empty()
-            && !q.full
-            && q.after.is_empty()
-            && q.meets.iter().any(|m| m.touches(last) && m.op == Cmp::Eq)
-            && connected(q, &core[..core.len() - 1]);
+        let at: Vec<(usize, usize)> = q.sides.iter().map(|s| (0, s.table)).collect();
+        ask_join_across(&[self], &at, q)
+    }
+}
 
-        // The columns each table's scan returns: the keys it is kept to first, then every column the
-        // join reads of it, then the answer's.
-        let mut needed: Vec<Vec<(usize, bool)>> = vec![Vec::new(); n];
-        let mut add = |side: usize, c: (usize, bool)| {
-            if !needed[side].contains(&c) {
-                needed[side].push(c);
-            }
-        };
-        let tests = q
-            .after
-            .iter()
-            .chain(q.outer.iter().flat_map(|o| o.tests.iter()));
-        for t in tests {
-            match t {
-                Test::One(s, p) => {
-                    if let Some(c) = p.column() {
-                        add(*s, c);
-                    }
-                }
-                Test::Two(m) => {
-                    add(m.a.side, (m.a.column, false));
-                    add(m.b.side, (m.b.column, false));
-                }
-            }
-        }
-        for m in q
-            .meets
-            .iter()
-            .chain(q.outer.iter().flat_map(|o| o.meets.iter()))
-        {
-            add(m.a.side, (m.a.column, false));
-            add(m.b.side, (m.b.column, false));
-        }
-        let mut answers = vec![false; n];
-        for k in &inputs {
-            answers[k.col().side] = true;
-            add(k.col().side, (k.col().column, matches!(k, Key::Month(_))));
-        }
+/// A question on several tables, each read from the snail that holds it: `at` names, for each of
+/// the question's tables, its snail among `snails` and its place among that snail's tables. One
+/// round, each snail's part of it in the round's `snails` where there is more than one.
+pub(super) fn ask_join_across(
+    snails: &[&Snail],
+    at: &[(usize, usize)],
+    q: &Question,
+) -> Result<(RecordBatch, Round)> {
+    let n = q.sides.len();
+    let tables: Vec<&Table> = at
+        .iter()
+        .map(|&(s, t)| &snails[s].catalog.tables[t])
+        .collect();
+    // Each table's own conditions, as the snail that holds it numbers its tables.
+    let sides: Vec<super::question::Side> = q
+        .sides
+        .iter()
+        .zip(at)
+        .map(|(side, &(_, t))| {
+            let mut side = side.clone();
+            side.table = t;
+            side
+        })
+        .collect();
+    let mut parts: Vec<Round> = vec![Round::default(); snails.len()];
+    let order = read_order(q, &tables);
+    let inputs = q.select.inputs();
+    // The tables no outer join may leave NULL, joined in the order they were read, each to one
+    // joined before it; the last read is met as it is read where it alone joins it to them.
+    let core: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&s| !q.nullable(s) && !(q.full && s < 2))
+        .collect();
+    let last = *order.last().unwrap();
+    let stream = q.outer.is_empty()
+        && !q.full
+        && q.after.is_empty()
+        && q.meets.iter().any(|m| m.touches(last) && m.op == Cmp::Eq)
+        && connected(q, &core[..core.len() - 1]);
 
-        let mut t = Tables {
-            tables: tables.clone(),
-            columns: vec![Vec::new(); n],
-            held: (0..n).map(|_| Held::default()).collect(),
-        };
-        let mut round = Round::default();
-        let mut names = Vec::new();
-        let (walked, taken) = (self.walked.get(), self.taken.get());
-        let mut answer = Answer::new(&q.select).typed(&tables);
-        for (i, &side) in order.iter().enumerate() {
-            // The tables read before it that it may be kept to, the one read last first.
-            let by: Vec<(usize, Vec<Meet>)> = order[..i]
+    // The columns each table's scan returns: the keys it is kept to first, then every column the
+    // join reads of it, then the answer's.
+    let mut needed: Vec<Vec<(usize, bool)>> = vec![Vec::new(); n];
+    let mut add = |side: usize, c: (usize, bool)| {
+        if !needed[side].contains(&c) {
+            needed[side].push(c);
+        }
+    };
+    let tests = q
+        .after
+        .iter()
+        .chain(q.outer.iter().flat_map(|o| o.tests.iter()));
+    for t in tests {
+        match t {
+            Test::One(s, p) => {
+                if let Some(c) = p.column() {
+                    add(*s, c);
+                }
+            }
+            Test::Two(m) => {
+                add(m.a.side, (m.a.column, false));
+                add(m.b.side, (m.b.column, false));
+            }
+        }
+    }
+    for m in q
+        .meets
+        .iter()
+        .chain(q.outer.iter().flat_map(|o| o.meets.iter()))
+    {
+        add(m.a.side, (m.a.column, false));
+        add(m.b.side, (m.b.column, false));
+    }
+    let mut answers = vec![false; n];
+    for k in &inputs {
+        answers[k.col().side] = true;
+        add(k.col().side, (k.col().column, matches!(k, Key::Month(_))));
+    }
+
+    let mut t = Tables {
+        tables: tables.clone(),
+        columns: vec![Vec::new(); n],
+        held: (0..n).map(|_| Held::default()).collect(),
+    };
+    let mut round = Round::default();
+    let mut names = Vec::new();
+    let ran: Vec<(u64, u64)> = snails
+        .iter()
+        .map(|s| (s.walked.get(), s.taken.get()))
+        .collect();
+    let mut answer = Answer::new(&q.select).typed(&tables);
+    for (i, &side) in order.iter().enumerate() {
+        let (at_snail, _) = at[side];
+        let snail = snails[at_snail];
+        // The tables read before it that it may be kept to, the one read last first.
+        let by: Vec<(usize, Vec<Meet>)> = order[..i]
+            .iter()
+            .rev()
+            .map(|&s| (s, keeps(q, side, s)))
+            .filter(|(_, m)| !m.is_empty())
+            .collect();
+        let table = tables[side];
+        let keys = by.first().map(|(s, meets)| {
+            let meets = led(table, meets);
+            let values = t.held[*s].cells.iter().filter_map(|cells| {
+                meets
+                    .iter()
+                    .map(|m| {
+                        level_value(
+                            &cells[t.at(*s, m.b.column, false)],
+                            t.ty(*s, m.b.column),
+                            &table.columns[m.a.column],
+                        )
+                    })
+                    .collect::<Option<Vec<KeyValue>>>()
+            });
+            KeySet::new(
+                meets.iter().map(|m| m.a.column).collect(),
+                values.collect::<Vec<_>>(),
+            )
+        });
+        // Its scan's columns: the walk's keys, then every other key it is kept to, then the rest.
+        let mut columns: Vec<(usize, bool)> = Vec::new();
+        for c in keys.iter().flat_map(|k| k.columns.iter()) {
+            if !columns.contains(&(*c, false)) {
+                columns.push((*c, false));
+            }
+        }
+        let streamed = stream && side == last;
+        let probe: Vec<Meet> = if streamed {
+            q.meets
                 .iter()
-                .rev()
-                .map(|&s| (s, keeps(q, side, s)))
-                .filter(|(_, m)| !m.is_empty())
-                .collect();
-            let table = tables[side];
-            let keys = by.first().map(|(s, meets)| {
-                let meets = led(table, meets);
-                let values = t.held[*s].cells.iter().filter_map(|cells| {
-                    meets
+                .filter(|m| m.touches(side) && m.op == Cmp::Eq)
+                .map(|m| m.seen_from(side))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for m in by.iter().flat_map(|(_, m)| m).chain(&probe) {
+            if !columns.contains(&(m.a.column, false)) {
+                columns.push((m.a.column, false));
+            }
+        }
+        let lead = columns.len();
+        for c in &needed[side] {
+            if !columns.contains(c) {
+                columns.push(*c);
+            }
+        }
+        t.columns[side] = columns.clone();
+        let want = Want {
+            table,
+            side: &sides[side],
+            columns: columns.iter().map(|c| c.0).collect(),
+            countable: None,
+            keys: keys.as_ref(),
+        };
+        let mut mine = Round::default();
+        let (before, held_before) = (snail.touched(), snail.pages_held());
+        let part = snail.part(&want, None)?;
+        mine.directory_pages = snail.touched() - before;
+        mine.directory_pages_held = snail.pages_held() - held_before;
+        mine.column_pages_held = snail.reader.keep_for_round(part.plan.disk_pages());
+        let mid = snail.reader.pages_read();
+        if streamed {
+            let joined = meet_core(q, &t, &core[..core.len() - 1]);
+            let mut sink = Probe::new(q, &t, &joined, side, &probe, &inputs, &mut answer);
+            snail.read_plan(&part.plan, &want, &columns, &mut sink)?;
+        } else {
+            let filters: Vec<Filter> = by
+                .iter()
+                .map(|(s, meets)| Filter {
+                    at: meets
                         .iter()
                         .map(|m| {
-                            level_value(
-                                &cells[t.at(*s, m.b.column, false)],
-                                t.ty(*s, m.b.column),
-                                &table.columns[m.a.column],
-                            )
-                        })
-                        .collect::<Option<Vec<KeyValue>>>()
-                });
-                KeySet::new(
-                    meets.iter().map(|m| m.a.column).collect(),
-                    values.collect::<Vec<_>>(),
-                )
-            });
-            // Its scan's columns: the walk's keys, then every other key it is kept to, then the rest.
-            let mut columns: Vec<(usize, bool)> = Vec::new();
-            for c in keys.iter().flat_map(|k| k.columns.iter()) {
-                if !columns.contains(&(*c, false)) {
-                    columns.push((*c, false));
-                }
-            }
-            let streamed = stream && side == last;
-            let probe: Vec<Meet> = if streamed {
-                q.meets
-                    .iter()
-                    .filter(|m| m.touches(side) && m.op == Cmp::Eq)
-                    .map(|m| m.seen_from(side))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            for m in by.iter().flat_map(|(_, m)| m).chain(&probe) {
-                if !columns.contains(&(m.a.column, false)) {
-                    columns.push((m.a.column, false));
-                }
-            }
-            let lead = columns.len();
-            for c in &needed[side] {
-                if !columns.contains(c) {
-                    columns.push(*c);
-                }
-            }
-            t.columns[side] = columns.clone();
-            let want = Want {
-                table,
-                side: &q.sides[side],
-                columns: columns.iter().map(|c| c.0).collect(),
-                countable: None,
-                keys: keys.as_ref(),
-            };
-            let (before, held_before) = (self.touched(), self.pages_held());
-            let part = self.part(&want, None)?;
-            round.directory_pages += self.touched() - before;
-            round.directory_pages_held += self.pages_held() - held_before;
-            round.column_pages_held += self.reader.keep_for_round(part.plan.disk_pages());
-            let mid = self.reader.pages_read();
-            if streamed {
-                let joined = self.meet_core(q, &t, &core[..core.len() - 1]);
-                let mut sink = Probe::new(q, &t, &joined, side, &probe, &inputs, &mut answer);
-                self.read_plan(&part.plan, &want, &columns, &mut sink)?;
-            } else {
-                let filters: Vec<Filter> = by
-                    .iter()
-                    .map(|(s, meets)| Filter {
-                        at: meets
-                            .iter()
-                            .map(|m| {
-                                columns
-                                    .iter()
-                                    .position(|c| *c == (m.a.column, false))
-                                    .unwrap()
-                            })
-                            .collect(),
-                        types: meets.iter().map(|m| table.columns[m.a.column].ty).collect(),
-                        keys: t.held[*s]
-                            .cells
-                            .iter()
-                            .filter_map(|cells| {
-                                meets
-                                    .iter()
-                                    .map(|m| {
-                                        part_of(
-                                            &cells[t.at(*s, m.b.column, false)],
-                                            t.ty(*s, m.b.column),
-                                        )
-                                    })
-                                    .collect::<Option<Vec<Part>>>()
-                            })
-                            .map(|k| (k, ()))
-                            .collect(),
-                    })
-                    .collect();
-                let mut held = Held::default();
-                let mut sink = Gather {
-                    held: &mut held,
-                    index: (!answers[side]).then(WordMap::default),
-                    filters: &filters,
-                    lead: if filters.is_empty() { 0 } else { lead },
-                    dicts: Vec::new(),
-                    probe: Vec::new(),
-                };
-                self.read_plan(&part.plan, &want, &columns, &mut sink)?;
-                t.held[side] = held;
-            }
-            round.column_pages_read += self.reader.pages_read() - mid;
-            let w = &part.plan.walk;
-            names.push(table.orders[w.order].name.clone());
-            round.consulted.extend(part.consulted);
-            round.column_pages_top_low += w.top.0;
-            round.column_pages_top_high += w.top.1;
-            round.column_pages_low += w.low;
-            round.column_pages_high += w.high;
-            round.column_pages_predicted += part.plan.column_pages;
-            round.entries += w.statuses.0 + w.statuses.1 + w.statuses.2;
-            round.entries_none += w.statuses.0;
-            round.entries_may += w.statuses.1;
-            round.entries_must += w.statuses.2;
-            round.blocks_read += part.plan.blocks_read();
-        }
-        if !stream {
-            let mut joined = if q.full {
-                let o = &q.outer[0];
-                let start = Joined {
-                    width: n,
-                    rows: (0..t.held[0].cells.len() as u32)
-                        .flat_map(|r| {
-                            let mut row = vec![NONE; n];
-                            row[0] = r;
-                            row
+                            columns
+                                .iter()
+                                .position(|c| *c == (m.a.column, false))
+                                .unwrap()
                         })
                         .collect(),
-                    weights: t.held[0].weights.clone(),
-                };
-                full_join(&t, start, o.side, &o.meets, &o.tests)
-            } else {
-                self.meet_core(q, &t, &core)
-            };
-            for o in q.outer.iter().skip(q.full as usize) {
-                joined = t.join(&joined, o.side, &o.meets, &o.tests, true);
-            }
-            let mut cells = vec![Cell::Null; inputs.len()];
-            for i in 0..joined.len() {
-                let row = joined.row(i);
-                if !q.after.iter().all(|a| t.test(a, row)) {
-                    continue;
-                }
-                for (cell, k) in cells.iter_mut().zip(&inputs) {
-                    let c = k.col();
-                    *cell = t
-                        .cell(row, c.side, c.column, matches!(k, Key::Month(_)))
-                        .clone();
-                }
-                answer.add_times(&cells, joined.weights[i]);
-            }
-        }
-        // A table that may stand NULL gives the answer NULLs, whatever its columns hold.
-        let shown: Vec<Table> = (0..n)
-            .map(|s| {
-                let mut table = tables[s].clone();
-                if q.nullable(s) {
-                    for c in &mut table.columns {
-                        c.not_null = false;
-                    }
-                }
-                table
-            })
-            .collect();
-        let shown: Vec<&Table> = shown.iter().collect();
-        let batch = answer.finish(&shown, &q.select, &q.order)?;
-        round.order = names.join("+");
-        round.rows = batch.num_rows() as u64;
-        round.rows_walked = self.walked.get() - walked;
-        round.rows_taken = self.taken.get() - taken;
-        Ok((batch, round))
-    }
-
-    /// The tables `sides` met on what every answer row holds of them: from the first, each next one
-    /// that meets one already met.
-    fn meet_core(&self, q: &Question, t: &Tables, sides: &[usize]) -> Joined {
-        let n = q.sides.len();
-        let first = sides[0];
-        let mut joined = Joined {
-            width: n,
-            rows: Vec::new(),
-            weights: Vec::new(),
-        };
-        let mut row = vec![NONE; n];
-        for (r, &w) in t.held[first].weights.iter().enumerate() {
-            row[first] = r as u32;
-            joined.push(&row, w);
-        }
-        let mut done = vec![first];
-        while done.len() < sides.len() {
-            let next = *sides
-                .iter()
-                .find(|&&s| {
-                    !done.contains(&s)
-                        && q.meets
-                            .iter()
-                            .any(|m| m.touches(s) && done.iter().any(|&d| m.touches(d)))
+                    types: meets.iter().map(|m| table.columns[m.a.column].ty).collect(),
+                    keys: t.held[*s]
+                        .cells
+                        .iter()
+                        .filter_map(|cells| {
+                            meets
+                                .iter()
+                                .map(|m| {
+                                    part_of(
+                                        &cells[t.at(*s, m.b.column, false)],
+                                        t.ty(*s, m.b.column),
+                                    )
+                                })
+                                .collect::<Option<Vec<Part>>>()
+                        })
+                        .map(|k| (k, ()))
+                        .collect(),
                 })
-                .expect("the tables no outer join may leave NULL meet each other");
-            let meets: Vec<Meet> = q
-                .meets
-                .iter()
-                .filter(|m| m.touches(next) && done.iter().any(|&d| m.touches(d)))
-                .map(|m| m.seen_from(next))
                 .collect();
-            joined = t.join(&joined, next, &meets, &[], false);
-            done.push(next);
+            let mut held = Held::default();
+            let mut sink = Gather {
+                held: &mut held,
+                index: (!answers[side]).then(WordMap::default),
+                filters: &filters,
+                lead: if filters.is_empty() { 0 } else { lead },
+                dicts: Vec::new(),
+                probe: Vec::new(),
+            };
+            snail.read_plan(&part.plan, &want, &columns, &mut sink)?;
+            t.held[side] = held;
         }
-        joined
+        mine.column_pages_read = snail.reader.pages_read() - mid;
+        let w = &part.plan.walk;
+        let name = table.orders[w.order].name.clone();
+        mine.consulted = part.consulted;
+        mine.column_pages_top_low = w.top.0;
+        mine.column_pages_top_high = w.top.1;
+        mine.column_pages_low = w.low;
+        mine.column_pages_high = w.high;
+        mine.column_pages_predicted = part.plan.column_pages;
+        mine.entries = w.statuses.0 + w.statuses.1 + w.statuses.2;
+        mine.entries_none = w.statuses.0;
+        mine.entries_may = w.statuses.1;
+        mine.entries_must = w.statuses.2;
+        mine.blocks_read = part.plan.blocks_read();
+        for r in [&mut round, &mut parts[at_snail]] {
+            r.add_table(&mine, &name);
+        }
+        names.push(name);
     }
+    if !stream {
+        let mut joined = if q.full {
+            let o = &q.outer[0];
+            let start = Joined {
+                width: n,
+                rows: (0..t.held[0].cells.len() as u32)
+                    .flat_map(|r| {
+                        let mut row = vec![NONE; n];
+                        row[0] = r;
+                        row
+                    })
+                    .collect(),
+                weights: t.held[0].weights.clone(),
+            };
+            full_join(&t, start, o.side, &o.meets, &o.tests)
+        } else {
+            meet_core(q, &t, &core)
+        };
+        for o in q.outer.iter().skip(q.full as usize) {
+            joined = t.join(&joined, o.side, &o.meets, &o.tests, true);
+        }
+        let mut cells = vec![Cell::Null; inputs.len()];
+        for i in 0..joined.len() {
+            let row = joined.row(i);
+            if !q.after.iter().all(|a| t.test(a, row)) {
+                continue;
+            }
+            for (cell, k) in cells.iter_mut().zip(&inputs) {
+                let c = k.col();
+                *cell = t
+                    .cell(row, c.side, c.column, matches!(k, Key::Month(_)))
+                    .clone();
+            }
+            answer.add_times(&cells, joined.weights[i]);
+        }
+    }
+    // A table that may stand NULL gives the answer NULLs, whatever its columns hold.
+    let shown: Vec<Table> = (0..n)
+        .map(|s| {
+            let mut table = tables[s].clone();
+            if q.nullable(s) {
+                for c in &mut table.columns {
+                    c.not_null = false;
+                }
+            }
+            table
+        })
+        .collect();
+    let shown: Vec<&Table> = shown.iter().collect();
+    let batch = answer.finish(&shown, &q.select, &q.order)?;
+    round.order = names.join("+");
+    round.rows = batch.num_rows() as u64;
+    for (i, s) in snails.iter().enumerate() {
+        let (walked, taken) = (s.walked.get() - ran[i].0, s.taken.get() - ran[i].1);
+        round.rows_walked += walked;
+        round.rows_taken += taken;
+        parts[i].rows_walked = walked;
+        parts[i].rows_taken = taken;
+    }
+    if snails.len() > 1 {
+        round.snails = parts;
+    }
+    Ok((batch, round))
+}
+
+/// The tables `sides` met on what every answer row holds of them: from the first, each next one
+/// that meets one already met.
+fn meet_core(q: &Question, t: &Tables, sides: &[usize]) -> Joined {
+    let n = q.sides.len();
+    let first = sides[0];
+    let mut joined = Joined {
+        width: n,
+        rows: Vec::new(),
+        weights: Vec::new(),
+    };
+    let mut row = vec![NONE; n];
+    for (r, &w) in t.held[first].weights.iter().enumerate() {
+        row[first] = r as u32;
+        joined.push(&row, w);
+    }
+    let mut done = vec![first];
+    while done.len() < sides.len() {
+        let next = *sides
+            .iter()
+            .find(|&&s| {
+                !done.contains(&s)
+                    && q.meets
+                        .iter()
+                        .any(|m| m.touches(s) && done.iter().any(|&d| m.touches(d)))
+            })
+            .expect("the tables no outer join may leave NULL meet each other");
+        let meets: Vec<Meet> = q
+            .meets
+            .iter()
+            .filter(|m| m.touches(next) && done.iter().any(|&d| m.touches(d)))
+            .map(|m| m.seen_from(next))
+            .collect();
+        joined = t.join(&joined, next, &meets, &[], false);
+        done.push(next);
+    }
+    joined
 }
 
 /// The rows of the first table joined FULL with table `side`'s: each pair that meets and passes the

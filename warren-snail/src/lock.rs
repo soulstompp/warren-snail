@@ -23,6 +23,10 @@ const WRITER_SLOTS: u64 = 1 << 16;
 const HOLDS: u64 = 1 << 62;
 /// A byte for each slot and block: the writer in that slot waits for the block.
 const WAITS: u64 = (1 << 62) + (1 << 61);
+/// A byte for each slot and writer: the writer of snails opened together that holds the slot, the
+/// same slot in each of their files.
+const WRITER_OF: u64 = (1 << 62) + (1 << 58);
+const WRITER_IDS: u64 = 1 << 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -206,6 +210,47 @@ pub(crate) fn take_slot(file: &File) -> Result<u64> {
         }
     }
     Err(Error::new("every writer's slot on the file is taken"))
+}
+
+/// Takes one slot in every file of snails opened together to write, the same in each, held until
+/// they are closed, and marks it in each as the writer `id`'s: the last slot no other writer holds
+/// in any of them.
+#[cfg(feature = "standalone")]
+pub(crate) fn take_slot_across(files: &[&File], id: u64) -> Result<u64> {
+    for s in (0..WRITER_SLOTS).rev() {
+        let mut taken = Vec::new();
+        for f in files {
+            if !take(f, Kind::Alone, WRITERS + s, 1, false)? {
+                break;
+            }
+            taken.push(*f);
+        }
+        if taken.len() == files.len() {
+            for f in files {
+                take(f, Kind::Alone, WRITER_OF + (s << 40) + id, 1, false)?;
+            }
+            return Ok(s);
+        }
+        for f in taken {
+            give(f, WRITERS + s, 1)?;
+        }
+    }
+    Err(Error::new(
+        "no writer's slot is free in every file of the snails opened together",
+    ))
+}
+
+/// A writer's mark among those of every process now running: its process and its count there.
+#[cfg(feature = "standalone")]
+pub(crate) fn writer_id() -> u64 {
+    static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ((u64::from(std::process::id()) << 18) | (n & 0x3_ffff)) % WRITER_IDS
+}
+
+/// The mark of the writer of snails opened together that holds `slot` in another file, if one does.
+pub(crate) fn writer_of(file: &File, slot: u64) -> Result<Option<u64>> {
+    first_held(file, WRITER_OF + (slot << 40), WRITER_IDS)
 }
 
 /// Marks that the writer in `slot` holds the block of lock byte `byte`, or no longer does.

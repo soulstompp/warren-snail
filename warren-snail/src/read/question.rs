@@ -245,7 +245,7 @@ pub struct Sort {
 }
 
 /// One table a question reads, and the conditions on it alone.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Side {
     pub table: usize,

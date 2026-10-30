@@ -1,0 +1,629 @@
+//! Several snails opened together, the weather's stations in one and its readings in another: a
+//! join across them answered as one snail holding both answers it, each snail read its predicted
+//! pages; every root read twice, taken where none changed; a name two snails hold refused; a
+//! transaction writing both, one root deciding, and a crash between the roots leaving each snail
+//! whole and the round across them all or nothing; writers waiting in a ring across the files.
+
+mod weather;
+
+use std::path::{Path, PathBuf};
+use warren_snail::catalog::Catalog;
+use warren_snail::read::{Round, Snails};
+use weather::*;
+
+/// The stations alone, and the readings alone, each as the weather's DDL declares it.
+const STATIONS: &str = "
+CREATE TABLE weather.stations (
+    network_id integer NOT NULL,
+    station_no integer NOT NULL,
+    name character varying(80) NOT NULL,
+    PRIMARY KEY (network_id, station_no)
+);
+CREATE INDEX s_name ON weather.stations (name, network_id, station_no);
+";
+
+const READINGS: &str = "
+CREATE FUNCTION weather.clock(timestamptz) RETURNS timestamp
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
+CREATE TABLE weather.readings (
+    reading_id bigint NOT NULL,
+    network_id integer NOT NULL,
+    station_no integer NOT NULL,
+    feed character varying(32) NOT NULL,
+    observed_at timestamptz NOT NULL,
+    checked_at timestamptz,
+    PRIMARY KEY (reading_id)
+);
+CREATE INDEX r_station ON weather.readings (network_id, station_no);
+ALTER TABLE weather.readings CLUSTER ON r_station;
+CREATE INDEX r_month ON weather.readings
+    ((extract(month FROM weather.clock(observed_at))::smallint), observed_at) INCLUDE (checked_at);
+";
+
+/// The sample's stations in one snail and its readings in another, and both in a third.
+struct Split {
+    stations: PathBuf,
+    readings: PathBuf,
+    both: PathBuf,
+}
+
+fn split(name: &str, s: &Sample) -> Split {
+    let one = |file: &str, ddl: &str, table: &str, rows: Rows| {
+        let path = tmp(&format!("{name}-{file}.snail"));
+        write(
+            &path,
+            &Catalog::parse(ddl).unwrap(),
+            &[(table.into(), rows)],
+        )
+        .unwrap();
+        path
+    };
+    Split {
+        stations: one("stations", STATIONS, "weather.stations", stations(s)),
+        readings: one("readings", READINGS, "weather.readings", readings(s)),
+        both: snail(&format!("{name}-both"), s),
+    }
+}
+
+use warren_snail::write::Rows;
+
+fn paths(s: &Split) -> [&Path; 2] {
+    [&s.stations, &s.readings]
+}
+
+/// The snails opened together, holding no page between rounds.
+fn together(s: &Split) -> Snails {
+    #[cfg(feature = "standalone")]
+    return Snails::open_holding(&paths(s), 0).unwrap();
+    #[cfg(not(feature = "standalone"))]
+    Snails::open(&paths(s)).unwrap()
+}
+
+/// Every snail's part of a round across them read its predicted pages, less those held.
+fn each_exact(q: &str, round: &Round) {
+    assert_eq!(round.snails.len(), 2, "{q}: {round:?}");
+    for part in &round.snails {
+        assert_eq!(
+            part.column_pages_read,
+            part.column_pages_predicted - part.column_pages_held,
+            "{q}: {round:?}"
+        );
+    }
+    exact(q, round);
+}
+
+/// A station's readings, joined across the two.
+fn joined(network: i64, station: i64) -> String {
+    format!(
+        "SELECT count(*) FROM weather.stations s JOIN weather.readings r \
+         ON r.network_id = s.network_id AND r.station_no = s.station_no \
+         WHERE s.network_id = {network} AND s.station_no = {station}"
+    )
+}
+
+#[test]
+fn a_join_across_two_snails_answers_as_one_snail_holding_both_and_each_reads_its_predicted_pages() {
+    let s = sample(20_000);
+    let split = split("across-joins", &s);
+    let mut both = fresh(&split.both);
+    let mut across = together(&split);
+    let (network, station) = busiest(&s);
+    let name = commonest_name(&s);
+    let questions = [
+        joined(network, station),
+        format!(
+            "SELECT s.name, count(*) FROM weather.stations s JOIN weather.readings r \
+             ON r.network_id = s.network_id AND r.station_no = s.station_no \
+             WHERE s.network_id = {network} GROUP BY s.name"
+        ),
+        format!(
+            "SELECT r.reading_id, s.name FROM weather.readings r JOIN weather.stations s \
+             ON s.network_id = r.network_id AND s.station_no = r.station_no \
+             WHERE r.observed_at >= '2022-03-01 00:00:00+00' AND r.observed_at < '2022-03-02 00:00:00+00'"
+        ),
+        format!(
+            "SELECT r.feed, count(*) FROM weather.stations s JOIN weather.readings r \
+             ON r.network_id = s.network_id AND r.station_no = s.station_no \
+             WHERE s.name = '{name}' GROUP BY r.feed ORDER BY r.feed"
+        ),
+        "SELECT s.network_id, s.station_no, r.reading_id FROM weather.stations s \
+         LEFT JOIN weather.readings r ON r.network_id = s.network_id AND r.station_no = s.station_no \
+         AND r.feed = 'AWS Backup' WHERE s.network_id < 40"
+            .to_string(),
+    ];
+    for q in &questions {
+        let (want, alone) = both.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let (got, round) = across.ask(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(bag(&got), bag(&want), "{q}");
+        assert!(want.num_rows() > 0, "{q}");
+        // Each table read along the same order, its pages as one snail reads them.
+        assert_eq!(round.order, alone.order, "{q}");
+        assert_eq!(
+            round.column_pages_predicted, alone.column_pages_predicted,
+            "{q}"
+        );
+        each_exact(q, &round);
+        assert!(
+            round.snails.iter().all(|p| p.column_pages_predicted > 0),
+            "{q}: {round:?}"
+        );
+        // Every root read twice: two pages a copy pair, two snails.
+        assert_eq!(round.pages_at_start, 8, "{q}: {round:?}");
+        assert!(round.snails.iter().all(|p| p.pages_at_start == 4));
+    }
+}
+
+#[test]
+fn a_question_on_one_snail_s_tables_is_read_as_that_snail_reads_it() {
+    let s = sample(5_000);
+    let split = split("across-one", &s);
+    let mut alone = fresh(&split.readings);
+    let mut across = together(&split);
+    let q = format!("SELECT count(*), max(r.observed_at) FROM weather.readings r WHERE {SPAN}");
+    let (want, r1) = alone.ask(&q, None).unwrap();
+    let (got, r2) = across.ask(&q).unwrap();
+    assert_eq!(bag(&got), bag(&want));
+    assert_eq!(
+        (r2.order.as_str(), r2.column_pages_predicted),
+        (r1.order.as_str(), r1.column_pages_predicted)
+    );
+    // Its part is the readings' snail's; the stations' read only its root, twice.
+    assert_eq!(
+        r2.snails[1].column_pages_predicted,
+        r1.column_pages_predicted
+    );
+    assert_eq!(
+        (r2.snails[0].pages_at_start, r2.snails[0].column_pages_read),
+        (4, 0)
+    );
+    // One snail opened alone reads its root once.
+    #[cfg(feature = "standalone")]
+    let mut one = Snails::open_holding(&[&split.readings], 0).unwrap();
+    #[cfg(not(feature = "standalone"))]
+    let mut one = Snails::open(&[&split.readings]).unwrap();
+    let (_, r3) = one.ask(&q).unwrap();
+    assert_eq!(r3.pages_at_start, 2);
+    assert!(r3.snails.is_empty());
+}
+
+#[test]
+fn two_snails_holding_one_name_are_refused_when_opened_together() {
+    let s = sample(500);
+    let split = split("across-names", &s);
+    let e = Snails::open(&[&split.both, &split.readings])
+        .err()
+        .expect("both hold the readings")
+        .to_string();
+    assert!(
+        e.starts_with("relation \"weather.r_month\" is held by")
+            || e.starts_with("relation \"weather.readings\" is held by"),
+        "{e}"
+    );
+    // An index's name is a relation's in its table's schema, as PostgreSQL holds it.
+    let other = tmp("across-names-other.snail");
+    let ddl = "CREATE TABLE weather.other (a integer NOT NULL, PRIMARY KEY (a)); \
+               CREATE INDEX s_name ON weather.other (a);";
+    write(
+        &other,
+        &Catalog::parse(ddl).unwrap(),
+        &[(
+            "weather.other".into(),
+            Rows {
+                columns: vec![ints(&[1, 2])],
+            },
+        )],
+    )
+    .unwrap();
+    let e = Snails::open(&[&split.stations, &other])
+        .err()
+        .expect("both hold s_name")
+        .to_string();
+    assert!(
+        e.starts_with("relation \"weather.s_name\" is held by"),
+        "{e}"
+    );
+    // A function two snails declare alike is one; declared otherwise, refused.
+    let clock = tmp("across-names-clock.snail");
+    let ddl = format!(
+        "{} CREATE TABLE weather.more (a integer NOT NULL, PRIMARY KEY (a));",
+        READINGS.split("CREATE TABLE").next().unwrap()
+    );
+    write(
+        &clock,
+        &Catalog::parse(&ddl).unwrap(),
+        &[(
+            "weather.more".into(),
+            Rows {
+                columns: vec![ints(&[1])],
+            },
+        )],
+    )
+    .unwrap();
+    assert!(Snails::open(&[&split.readings, &clock]).is_ok());
+    let odd = tmp("across-names-odd.snail");
+    let ddl = "CREATE FUNCTION weather.clock(timestamptz) RETURNS timestamp \
+               LANGUAGE sql IMMUTABLE AS $$ SELECT $1 AT TIME ZONE 'Europe/Lisbon' $$; \
+               CREATE TABLE weather.odd (a integer NOT NULL, PRIMARY KEY (a));";
+    if let Ok(catalog) = Catalog::parse(ddl) {
+        write(
+            &odd,
+            &catalog,
+            &[(
+                "weather.odd".into(),
+                Rows {
+                    columns: vec![ints(&[1])],
+                },
+            )],
+        )
+        .unwrap();
+        let e = Snails::open(&[&split.readings, &odd])
+            .err()
+            .expect("the clocks differ")
+            .to_string();
+        assert!(e.contains("is declared otherwise by"), "{e}");
+    }
+}
+
+#[cfg(feature = "standalone")]
+mod written {
+    use super::*;
+    use warren_snail::read::{Snail, StopAcross};
+
+    fn count_of(s: &mut Snails, q: &str) -> i64 {
+        one(&s.ask(q).unwrap_or_else(|e| panic!("{q}: {e}")).0)
+    }
+
+    fn station(network: i64, no: i64) -> String {
+        format!(
+            "INSERT INTO weather.stations (network_id, station_no, name) VALUES ({network}, {no}, 'Sagres {no}')"
+        )
+    }
+
+    fn reading(id: i64, network: i64, no: i64) -> String {
+        format!(
+            "INSERT INTO weather.readings (reading_id, network_id, station_no, feed, observed_at, checked_at) \
+             VALUES ({id}, {network}, {no}, 'AWS Main', '2022-06-15 10:00:00+00', NULL)"
+        )
+    }
+
+    fn alone_count(path: &Path, q: &str) -> i64 {
+        one(&Snail::open(path).unwrap().ask(q, None).unwrap().0)
+    }
+
+    const ALL_READINGS: &str = "SELECT count(*) FROM weather.readings r";
+    const ALL_STATIONS: &str = "SELECT count(*) FROM weather.stations s";
+
+    #[test]
+    fn a_round_takes_the_roots_where_none_changed_between_its_two_readings() {
+        let s = sample(5_000);
+        let split = split("across-moment", &s);
+        let (network, station) = busiest(&s);
+        let q = joined(network, station);
+        let mut across = together(&split);
+        let before = count_of(&mut across, &q);
+        assert!(before > 0);
+        // Between the first pass's two roots, the station is deleted, then a reading of it is
+        // written: two commits in turn, each a transaction of its own. No moment holds the station
+        // beside the new reading.
+        let (a, b) = (split.stations.clone(), split.readings.clone());
+        across.between_roots(Some(Box::new(move || {
+            Snail::open_writing(&a)
+                .unwrap()
+                .execute(&format!(
+                    "DELETE FROM weather.stations WHERE network_id = {network} AND station_no = {station}"
+                ))
+                .unwrap();
+            Snail::open_writing(&b)
+                .unwrap()
+                .execute(&reading(9_000_001, network, station))
+                .unwrap();
+        })));
+        let (batch, round) = across.ask(&q).unwrap();
+        assert_eq!(one(&batch), 0, "a pair of roots no moment held: {round:?}");
+        // The first pass found a root changed, so the round read both again: four pages a snail
+        // twice, and each catalog once on its new generation.
+        assert_eq!(round.pages_at_start, 18, "{round:?}");
+        let (_, round) = across.ask(&q).unwrap();
+        assert_eq!(round.pages_at_start, 8);
+    }
+
+    #[test]
+    fn a_transaction_across_two_snails_commits_both_one_root_deciding() {
+        let s = sample(5_000);
+        let split = split("across-commit", &s);
+        let mut w = Snails::open_writing(&paths(&split)).unwrap();
+        let (n0, r0) = (
+            alone_count(&split.stations, ALL_STATIONS),
+            alone_count(&split.readings, ALL_READINGS),
+        );
+        let g0 = w.generations();
+        w.execute("BEGIN").unwrap();
+        w.execute(&station(9500, 1)).unwrap();
+        w.execute(&reading(9_000_001, 9500, 1)).unwrap();
+        w.execute(&reading(9_000_002, 9500, 1)).unwrap();
+        // The transaction reads its own rows across both; nothing is committed meanwhile.
+        assert_eq!(count_of(&mut w, &joined(9500, 1)), 2);
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0);
+        let d = w.execute("COMMIT").unwrap();
+        assert_eq!(d.statement, "COMMIT");
+        assert_eq!(w.generations(), [g0[0] + 1, g0[1] + 1]);
+        // The stations' root, first written, decided it, naming the readings' new root.
+        let decided = Snail::open(&split.stations).unwrap().decided().to_vec();
+        assert_eq!(decided.len(), 1);
+        assert_eq!(decided[0].at, g0[0] + 1);
+        assert_eq!(
+            decided[0]
+                .roots
+                .iter()
+                .map(|r| (r.holds.as_str(), r.generation))
+                .collect::<Vec<_>>(),
+            [("weather.readings", g0[1] + 1)]
+        );
+        assert!(Snail::open(&split.readings).unwrap().decided().is_empty());
+        assert_eq!(
+            (
+                alone_count(&split.stations, ALL_STATIONS),
+                alone_count(&split.readings, ALL_READINGS)
+            ),
+            (n0 + 1, r0 + 2)
+        );
+        assert_eq!(count_of(&mut together(&split), &joined(9500, 1)), 2);
+        for p in paths(&split) {
+            Snail::open(p).unwrap().census().unwrap();
+        }
+        // Rolled back, neither changes; a statement that fails fails the transaction on both.
+        w.execute("BEGIN").unwrap();
+        w.execute(&station(9500, 2)).unwrap();
+        w.execute(&reading(9_000_003, 9500, 2)).unwrap();
+        w.execute("ROLLBACK").unwrap();
+        w.execute("BEGIN").unwrap();
+        w.execute(&station(9500, 3)).unwrap();
+        let e = w
+            .execute(&reading(9_000_001, 9500, 3))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unique"), "{e}");
+        let e = w.execute(&station(9500, 4)).unwrap_err().to_string();
+        assert!(e.contains("current transaction is aborted"), "{e}");
+        assert_eq!(w.execute("COMMIT").unwrap().statement, "ROLLBACK");
+        assert_eq!(
+            (
+                alone_count(&split.stations, ALL_STATIONS),
+                alone_count(&split.readings, ALL_READINGS)
+            ),
+            (n0 + 1, r0 + 2)
+        );
+        // A transaction that writes one snail commits there alone.
+        w.execute("BEGIN").unwrap();
+        w.execute(&reading(9_000_004, 9500, 1)).unwrap();
+        w.execute("COMMIT").unwrap();
+        assert_eq!(w.generations(), [g0[0] + 1, g0[1] + 2]);
+        // The next transaction across them that the stations decide drops the decision before it,
+        // every root of which is written.
+        w.execute("BEGIN").unwrap();
+        w.execute(&station(9500, 5)).unwrap();
+        w.execute(&reading(9_000_005, 9500, 5)).unwrap();
+        w.execute("COMMIT").unwrap();
+        let decided = Snail::open(&split.stations).unwrap().decided().to_vec();
+        assert_eq!(
+            decided.iter().map(|d| d.at).collect::<Vec<_>>(),
+            [g0[0] + 2]
+        );
+        assert_eq!(count_of(&mut together(&split), &joined(9500, 5)), 1);
+    }
+
+    #[test]
+    fn a_crash_after_the_deciding_root_leaves_each_snail_whole_and_the_round_across_them_all() {
+        let s = sample(5_000);
+        let split = split("across-crash-after", &s);
+        let (n0, r0) = (
+            alone_count(&split.stations, ALL_STATIONS),
+            alone_count(&split.readings, ALL_READINGS),
+        );
+        {
+            let mut w = Snails::open_writing(&paths(&split)).unwrap();
+            w.execute("BEGIN").unwrap();
+            w.execute(&station(9600, 1)).unwrap();
+            w.execute(&reading(9_000_011, 9600, 1)).unwrap();
+            w.stop_at(Some(StopAcross::AfterDecision));
+            let e = w.execute("COMMIT").unwrap_err().to_string();
+            assert!(e.contains("stopped after the deciding root"), "{e}");
+        }
+        // Each snail read alone is a whole generation: the stations' holds the transaction's
+        // station, its reading on the null side of the join; the readings' does not hold it yet.
+        assert_eq!(alone_count(&split.stations, ALL_STATIONS), n0 + 1);
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0);
+        for p in paths(&split) {
+            Snail::open(p).unwrap().census().unwrap();
+        }
+        // Read alone, the stations' root marks its newest rows as a transaction's whose root in the
+        // readings is not yet taken there, which tells its station from one no reading names.
+        let readings_at = Snail::open(&split.readings).unwrap().generation();
+        let decided = Snail::open(&split.stations).unwrap().decided().to_vec();
+        assert_eq!(
+            decided
+                .iter()
+                .flat_map(|d| d.roots.iter().map(|r| r.generation))
+                .collect::<Vec<_>>(),
+            [readings_at + 1]
+        );
+        // The round across them reads the readings' new root, which the deciding root names.
+        let mut across = together(&split);
+        assert_eq!(count_of(&mut across, &joined(9600, 1)), 1);
+        assert_eq!(count_of(&mut across, ALL_READINGS), r0 + 1);
+        // A writer of the readings alone takes no commit; one of the stations alone does, and
+        // carries the decision.
+        let e = Snail::open_writing(&split.readings)
+            .unwrap()
+            .execute(&reading(9_000_012, 9600, 1))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("open the two together"), "{e}");
+        Snail::open_writing(&split.stations)
+            .unwrap()
+            .execute(&station(9600, 2))
+            .unwrap();
+        assert_eq!(count_of(&mut together(&split), &joined(9600, 1)), 1);
+        // Opened together to write, the readings' root is written.
+        drop(Snails::open_writing(&paths(&split)).unwrap());
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0 + 1);
+        Snail::open_writing(&split.readings)
+            .unwrap()
+            .execute(&reading(9_000_012, 9600, 1))
+            .unwrap();
+        assert_eq!(count_of(&mut together(&split), &joined(9600, 1)), 2);
+        for p in paths(&split) {
+            Snail::open(p).unwrap().census().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_root_torn_after_the_deciding_root_is_written_again_from_the_root_that_carries_it() {
+        use std::os::unix::fs::FileExt;
+        let s = sample(5_000);
+        let split = split("across-torn", &s);
+        let r0 = alone_count(&split.readings, ALL_READINGS);
+        let at = Snail::open(&split.readings).unwrap().generation();
+        {
+            let mut w = Snails::open_writing(&paths(&split)).unwrap();
+            w.execute("BEGIN").unwrap();
+            w.execute(&station(9650, 1)).unwrap();
+            w.execute(&reading(9_000_031, 9650, 1)).unwrap();
+            w.stop_at(Some(StopAcross::AfterDecision));
+            w.execute("COMMIT").unwrap_err();
+        }
+        // The readings' root, torn as it was written over its pending copy: nothing lies beside
+        // its root, and it reads as it stood.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&split.readings)
+            .unwrap()
+            .write_all_at(&[0u8; 2048], ((at + 1) % 2) * 4096)
+            .unwrap();
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0);
+        // The stations' root carries it whole: the round across reads it, a writer writes it.
+        assert_eq!(count_of(&mut together(&split), &joined(9650, 1)), 1);
+        drop(Snails::open_writing(&paths(&split)).unwrap());
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0 + 1);
+        for p in paths(&split) {
+            Snail::open(p).unwrap().census().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_crash_before_the_deciding_root_leaves_each_snail_whole_and_the_round_across_them_none() {
+        let s = sample(5_000);
+        let split = split("across-crash-before", &s);
+        let (n0, r0) = (
+            alone_count(&split.stations, ALL_STATIONS),
+            alone_count(&split.readings, ALL_READINGS),
+        );
+        {
+            let mut w = Snails::open_writing(&paths(&split)).unwrap();
+            w.execute("BEGIN").unwrap();
+            w.execute(&station(9700, 1)).unwrap();
+            w.execute(&reading(9_000_021, 9700, 1)).unwrap();
+            w.stop_at(Some(StopAcross::BeforeDecision));
+            let e = w.execute("COMMIT").unwrap_err().to_string();
+            assert!(e.contains("stopped before the deciding root"), "{e}");
+        }
+        assert_eq!(alone_count(&split.stations, ALL_STATIONS), n0);
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0);
+        let mut across = together(&split);
+        assert_eq!(count_of(&mut across, &joined(9700, 1)), 0);
+        assert_eq!(count_of(&mut across, ALL_READINGS), r0);
+        let e = Snail::open_writing(&split.readings)
+            .unwrap()
+            .execute(&reading(9_000_022, 9700, 1))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("open the two together"), "{e}");
+        // Opened together to write, the pending root no deciding root named is let go.
+        drop(Snails::open_writing(&paths(&split)).unwrap());
+        Snail::open_writing(&split.readings)
+            .unwrap()
+            .execute(&reading(9_000_022, 9700, 1))
+            .unwrap();
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0 + 1);
+        assert_eq!(count_of(&mut together(&split), &joined(9700, 1)), 0);
+        for p in paths(&split) {
+            Snail::open(p).unwrap().census().unwrap();
+        }
+    }
+
+    #[test]
+    fn writers_waiting_in_a_ring_across_two_snails_fail_one_with_a_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let s = sample(5_000);
+        let split = split("across-ring", &s);
+        let (network, station) = stations_of(&s)[0];
+        let b = in_order(&s)[4_000].2;
+        let set_station = |name: &str| {
+            format!(
+                "UPDATE weather.stations SET name = '{name}' WHERE network_id = {network} AND station_no = {station}"
+            )
+        };
+        let set_reading = |feed: &str| {
+            format!("UPDATE weather.readings SET feed = '{feed}' WHERE reading_id = {b}")
+        };
+        // The second writer holds the reading's block.
+        let (held_tx, held_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (out_tx, out_rx) = mpsc::channel();
+        let p = paths(&split).map(Path::to_path_buf);
+        let (sta, rea) = (set_station("two"), set_reading("two"));
+        std::thread::spawn(move || {
+            let mut two = Snails::open_writing(&[&p[0], &p[1]]).unwrap();
+            two.execute("BEGIN").unwrap();
+            two.execute(&rea).unwrap();
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            // It now waits for the station's block, which the first writer holds while it waits
+            // for the reading's: the ring closes across the two files.
+            let ring = two.execute(&sta).map_err(|e| e.to_string());
+            let end = two
+                .execute("COMMIT")
+                .map(|d| d.statement)
+                .map_err(|e| e.to_string());
+            out_tx.send((ring, end)).unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (one_tx, one_rx) = mpsc::channel();
+        let p = paths(&split).map(Path::to_path_buf);
+        let (sta, rea) = (set_station("one"), set_reading("one"));
+        std::thread::spawn(move || {
+            let mut one_ = Snails::open_writing(&[&p[0], &p[1]]).unwrap();
+            let done: Vec<Result<&'static str, String>> =
+                ["BEGIN".to_string(), sta, rea, "COMMIT".into()]
+                    .iter()
+                    .map(|st| {
+                        one_.execute(st)
+                            .map(|d| d.statement)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect();
+            one_tx.send(done).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        go_tx.send(()).unwrap();
+        let (ring, end) = out_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let e = ring.unwrap_err();
+        assert!(e.starts_with("deadlock detected"), "{e}");
+        assert_eq!(end, Ok("ROLLBACK"));
+        let done = one_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(done.iter().all(Result::is_ok), "{done:?}");
+        let mut r = Snail::open(&split.readings).unwrap();
+        assert_eq!(feed_of(&mut r, b), "one");
+        let (batch, _) = Snail::open(&split.stations)
+            .unwrap()
+            .ask(
+                &format!(
+                    "SELECT s.name FROM weather.stations s WHERE s.network_id = {network} AND s.station_no = {station}"
+                ),
+                None,
+            )
+            .unwrap();
+        assert_eq!(texts(batch.column(0).as_ref())[0].as_deref(), Some("one"));
+    }
+}

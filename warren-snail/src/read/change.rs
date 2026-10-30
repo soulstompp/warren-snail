@@ -1153,9 +1153,16 @@ impl Snail {
             return Ok(0);
         }
         let before = self.reader.pages_read();
-        let mut root = self.reader.begin_round()?;
+        let root = self.reader.begin_round()?;
+        self.in_transaction_on(root)?;
+        Ok(self.reader.pages_read() - before)
+    }
+
+    /// What a statement of a transaction reads on `root`: the transaction's own changes in place of
+    /// the blocks it changed.
+    pub(super) fn in_transaction_on(&mut self, mut root: Root) -> Result<()> {
         if root.generation == self.root.generation {
-            return Ok(self.reader.pages_read() - before);
+            return Ok(());
         }
         self.catalog = Snail::catalog(&self.reader, &root)?;
         let mut stage = self.reader.stage();
@@ -1208,13 +1215,14 @@ impl Snail {
             root.orders[at].2 = stage.place(&bytes)?;
         }
         self.root = root;
-        Ok(self.reader.pages_read() - before)
+        Ok(())
     }
 
     /// Drops what the statement or the transaction staged, the catalog it declared among it, and
     /// lets go of the blocks it locked.
-    fn abandon(&mut self) -> Result<()> {
+    pub(super) fn abandon(&mut self) -> Result<()> {
         self.rebased.clear();
+        self.deciding = None;
         self.reader.clear_staged();
         self.touched = Touched::default();
         self.pending = Touched::default();
@@ -1272,6 +1280,9 @@ impl Snail {
     /// Whether waiting for the block of lock byte `b` closes a ring: its holder waits for a block
     /// whose holder waits, and so on, back to a block this writer holds.
     fn ring(&self, file: &std::fs::File, b: u64) -> Result<bool> {
+        if let Some((group, me)) = &self.group {
+            return group.ring(*me, b);
+        }
         let mut at = b;
         let mut seen = std::collections::BTreeSet::new();
         loop {
@@ -1318,7 +1329,24 @@ impl Snail {
 
     /// The commit, at the root's turn: it begins from the newest root.
     fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
+        let mut root = self.commit_pages(w, &[])?;
+        w.commit(&mut root)?;
+        Ok(root)
+    }
+
+    /// The commit but its root, at the root's turn: every page written, and the root that names
+    /// them, less the decisions across snails `landed` names by their generations, whose pages it
+    /// frees. A snail whose other copy of the root waits on a transaction across snails takes no
+    /// commit until a round across them finishes it or lets it go.
+    pub(super) fn commit_pages(&mut self, w: &mut Writer, landed: &[u64]) -> Result<Root> {
         let mut root = self.reader.peek_root()?;
+        if let Some(p) = self.reader.pending_copy().and_then(|r| r.pending) {
+            return Err(Error::new(format!(
+                "this snail holds a root written for a transaction across snails, decided by the \
+                 snail that holds {} at its generation {}: open the two together to write it",
+                p.decider, p.at
+            )));
+        }
         w.begin_commit(&root);
         let generation = root.generation + 1;
         // The free map: its runs whose tag no older round still runs under are free now, and the
@@ -1333,6 +1361,12 @@ impl Snail {
         if root.free.bytes > 0 {
             gone.push(root.free);
         }
+        for d in &root.decided {
+            if landed.contains(&d.at) && d.carried.bytes > 0 {
+                gone.push(d.carried);
+            }
+        }
+        root.decided.retain(|d| !landed.contains(&d.at));
         let mut tags: Vec<u64> = runs.iter().map(|r| r.tag).filter(|&t| t > 0).collect();
         tags.sort_unstable();
         tags.dedup();
@@ -1405,6 +1439,16 @@ impl Snail {
                 gone.push(root.sequences);
             }
             root.sequences = w.place(&encode_sequences(&states))?;
+        }
+        // A transaction across snails this commit decides: the roots it writes into the others,
+        // carried.
+        if let Some((roots, bytes)) = self.deciding.take() {
+            let carried = w.place(&bytes)?;
+            root.decided.push(crate::file::Decision {
+                at: generation,
+                roots,
+                carried,
+            });
         }
         let rebased = std::mem::take(&mut self.rebased);
         for ((ti, oi), blocks) in rebased {
@@ -1533,7 +1577,6 @@ impl Snail {
             root.reused_from = root.reused_from.max(g);
         }
         root.generation = generation;
-        w.commit(&mut root)?;
         Ok(root)
     }
 

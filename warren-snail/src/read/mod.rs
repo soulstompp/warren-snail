@@ -4,6 +4,7 @@
 //! Several tables joined are read one after another, from the question's scopes, each kept to the
 //! keys the tables read before it hold (`join`).
 
+mod across;
 mod answer;
 mod change;
 mod clock;
@@ -17,6 +18,7 @@ mod question;
 pub mod statement;
 mod walk;
 
+pub use across::{Snails, StopAcross};
 pub use change::Done;
 pub use out::{TableOut, DDL_KEY, NAN_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
@@ -241,6 +243,12 @@ pub struct Snail {
     handed: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
     /// The sequences' states a commit at the root's turn writes.
     advancing: Option<Vec<crate::file::SequenceState>>,
+    /// Where the snail is written beside others opened together, what their writer shares, and the
+    /// snail's place among them.
+    group: Option<(std::rc::Rc<across::Group>, usize)>,
+    /// The transaction across snails the next commit decides: the root it writes into each other
+    /// snail, and their bytes, which the commit carries.
+    deciding: Option<(Vec<crate::file::Written>, Vec<u8>)>,
     /// What the statement under way changed that its foreign keys check as it ends; what the
     /// transaction changed that they check at the commit; and the keys SET CONSTRAINTS defers, or
     /// makes immediate, until it ends.
@@ -318,6 +326,34 @@ pub struct Round {
     /// The rows the scan walked one by one, and those it handed on in runs at once.
     pub rows_walked: u64,
     pub rows_taken: u64,
+    /// For a round across several snails, each snail's part of it, in the order they were opened:
+    /// the root pages it read as the round began, and what it read of each of its tables.
+    pub snails: Vec<Round>,
+}
+
+impl Round {
+    /// Adds one table's reading, along its order `name`, to a round of several.
+    pub(crate) fn add_table(&mut self, table: &Round, name: &str) {
+        self.order = match self.order.is_empty() {
+            true => name.to_string(),
+            false => format!("{}+{name}", self.order),
+        };
+        self.consulted.extend(table.consulted.iter().cloned());
+        self.directory_pages += table.directory_pages;
+        self.directory_pages_held += table.directory_pages_held;
+        self.column_pages_top_low += table.column_pages_top_low;
+        self.column_pages_top_high += table.column_pages_top_high;
+        self.column_pages_low += table.column_pages_low;
+        self.column_pages_high += table.column_pages_high;
+        self.column_pages_predicted += table.column_pages_predicted;
+        self.column_pages_held += table.column_pages_held;
+        self.column_pages_read += table.column_pages_read;
+        self.entries += table.entries;
+        self.entries_none += table.entries_none;
+        self.entries_may += table.entries_may;
+        self.entries_must += table.entries_must;
+        self.blocks_read += table.blocks_read;
+    }
 }
 
 /// One table's part of a round: the plan read, the orders that served it, and what each said; and
@@ -421,6 +457,8 @@ impl Snail {
             clock: (0, 0),
             handed: Default::default(),
             advancing: None,
+            group: None,
+            deciding: None,
             touched: Default::default(),
             pending: Default::default(),
             modes: Default::default(),
@@ -499,6 +537,14 @@ impl Snail {
     /// locale.
     pub fn monetary(&self) -> &[(String, String, String)] {
         &self.root.monetary
+    }
+
+    /// The transactions across snails whose commit this snail's root wrote, each naming the root it
+    /// wrote into each other snail: kept until a writer of them all finds every one written. Rows
+    /// such a transaction wrote here may stand on the null side of a join with another snail until
+    /// its root is written.
+    pub fn decided(&self) -> &[crate::file::Decision] {
+        &self.root.decided
     }
 
     /// Where each sequence stands, as the file holds it: its last value and whether it was handed
@@ -1074,6 +1120,7 @@ impl Snail {
             rows_held: 0,
             rows_walked: self.walked.get() - walked,
             rows_taken: self.taken.get() - taken,
+            snails: Vec::new(),
         };
         Ok((round, w.counted, w.counted_months))
     }
@@ -1099,6 +1146,12 @@ impl Snail {
         // Where the sequences stand, once one has handed out a value.
         if self.root.sequences.bytes > 0 {
             mark(self.root.sequences, 1)?;
+        }
+        // The roots each decision across snails carries.
+        for d in &self.root.decided {
+            if d.carried.bytes > 0 {
+                mark(d.carried, 1)?;
+            }
         }
         // Each page of packed page maps: how many maps it holds, and how many entries name one.
         let mut shared: std::collections::BTreeMap<u64, (u32, u32)> = Default::default();
