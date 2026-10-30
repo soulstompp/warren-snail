@@ -148,7 +148,7 @@ fn datum_at(v: &Values, i: usize) -> Datum {
 /// `datum_at` reads it.
 pub(super) fn datum_typed(v: &Values, i: usize, ty: ColumnType) -> Datum {
     match ty {
-        ty if ty.keyed_by_bytes() => v
+        ty if ty.held_as_bytes() => v
             .text_value(i)
             .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
         _ => datum_at(v, i),
@@ -524,9 +524,14 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             }
             (ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name, Datum::Text(_))
             | (ColumnType::NumericText(_), Datum::Text(_))
-            | (ColumnType::Bytes | ColumnType::Bit(_) | ColumnType::Varbit(_), Datum::Bytes(_))
+            | (ColumnType::Textual(_), Datum::Text(_))
+            | (ColumnType::Geometric(_), Datum::Bytes(_))
             | (ColumnType::Composed(_), Datum::Compound(_))
-            | (ColumnType::Uuid, Datum::Wide(_))
+            | (ColumnType::Bytes | ColumnType::Bit(_) | ColumnType::Varbit(_), Datum::Bytes(_)) => {
+            }
+            (ColumnType::Internal(t), Datum::Text(_) | Datum::Bytes(_))
+                if t.copied() && t.is_bytes() == matches!(d, Datum::Bytes(_)) => {}
+            (ColumnType::Uuid, Datum::Wide(_))
             | (ColumnType::Float4, Datum::Float4(_))
             | (ColumnType::Float8, Datum::Float8(_))
             | (ColumnType::Interval { .. }, Datum::Interval(_)) => {}

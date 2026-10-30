@@ -334,6 +334,24 @@ pub struct Root {
     /// Each money column's `lc_monetary`: its table, its column and the locale; format 9 only, as
     /// formats 7 and 8 hold no money.
     pub monetary: Vec<(String, String, String)>,
+    /// The file's own default collation, as a database's, which jsonb's strings sort under: format 9
+    /// only; libc C.UTF-8 where it names none.
+    pub collation: String,
+}
+
+/// The default collation a file names where it names none: libc C.UTF-8, which orders text by its
+/// bytes.
+pub const COLLATION: &str = "C.UTF-8";
+
+impl Root {
+    /// The file's own default collation.
+    pub fn collation(&self) -> &str {
+        if self.collation.is_empty() {
+            COLLATION
+        } else {
+            &self.collation
+        }
+    }
 }
 
 /// The `lc_monetary` money is written under: C, the only one the snail reads until the collations
@@ -517,6 +535,7 @@ impl Root {
                 o.str(c);
                 o.str(l);
             }
+            o.str(self.collation());
         }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
@@ -564,6 +583,16 @@ impl Root {
         } else {
             (Extent::default(), crate::regs::LATEST, Vec::new())
         };
+        // A root written before format 9 named its default collation ends here, its CRC next.
+        let before = i.at();
+        let ended = page.get(before..before + 4).is_some_and(|c| {
+            u32::from_le_bytes(c.try_into().unwrap()) == crc32fast::hash(&page[..before])
+        });
+        let collation = if format >= FORMAT && !ended {
+            i.str().ok()?
+        } else {
+            String::new()
+        };
         let end = i.at();
         let crc = i.u32().ok()?;
         (crc32fast::hash(&page[..end]) == crc).then_some((
@@ -579,6 +608,7 @@ impl Root {
                 sequences,
                 release,
                 monetary,
+                collation,
             },
             format,
         ))
@@ -1350,11 +1380,30 @@ mod tests {
             },
             release: 16,
             monetary: vec![("s.t".into(), "m".into(), "C".into())],
+            collation: "und-x-icu".into(),
         };
         let mut a = r.encode(FORMAT).unwrap();
         a.resize(PAGE, 0);
         let (back, format) = Root::decode(&a).unwrap();
         assert_eq!(format, FORMAT);
+        assert_eq!(back.collation(), "und-x-icu");
+        // A root that names no default collation names C.UTF-8, and so does one written before
+        // format 9 named one, its CRC right after its money columns.
+        let plain = Root {
+            collation: String::new(),
+            ..r.clone()
+        };
+        let full = plain.encode(FORMAT).unwrap();
+        let mut p = full.clone();
+        p.resize(PAGE, 0);
+        assert_eq!(Root::decode(&p).unwrap().0.collation(), COLLATION);
+        let mut old = full[..full.len() - 4 - (4 + COLLATION.len())].to_vec();
+        let crc = crc32fast::hash(&old);
+        old.extend_from_slice(&crc.to_le_bytes());
+        old.resize(PAGE, 0);
+        let (was, _) = Root::decode(&old).unwrap();
+        assert_eq!((was.collation.as_str(), was.collation()), ("", COLLATION));
+        assert_eq!(was.monetary, r.monetary);
         assert_eq!((back.generation, back.span), (7, 64));
         assert_eq!((back.release, &back.monetary), (16, &r.monetary));
         assert_eq!(back.orders[0].2.pages(), 2);

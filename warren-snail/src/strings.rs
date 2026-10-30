@@ -297,15 +297,17 @@ pub fn bits_cast(key: &[u8], n: Option<u32>, varying: bool, explicit: bool) -> R
     Ok(bits_key(n, &out))
 }
 
-/// The bytes a value of a string type, a bit string or a numeric held as its text is keyed by,
-/// from the bytes it is held as: a bpchar's without its trailing blanks, a numeric's its class's
-/// key, any other's as they are.
+/// The bytes a value of a string type, a bit string, a numeric held as its text or a type held as
+/// its text is keyed by, from the bytes it is held as: a bpchar's without its trailing blanks, a
+/// numeric's, a jsonb's, an inet's, a tsvector's or a tsquery's its class's key, any other's as
+/// they are.
 pub fn key_bytes(ty: ColumnType, held: &[u8]) -> Cow<'_, [u8]> {
     match ty {
         ColumnType::Bpchar(_) => Cow::Borrowed(bpchar_key(held)),
         ColumnType::NumericText(_) => Cow::Owned(
             crate::numeric::class_of_text(std::str::from_utf8(held).unwrap_or("")).into_bytes(),
         ),
+        ColumnType::Textual(t) => crate::textual::key_bytes(t, held),
         _ => Cow::Borrowed(held),
     }
 }
@@ -332,6 +334,16 @@ pub fn type_named(named: &str) -> Option<ColumnType> {
         "name" => ColumnType::Name,
         "bit varying" => ColumnType::Varbit(None),
         n => {
+            if let Some(t) = crate::textual::Textual::of_type_name(n) {
+                return Some(ColumnType::Textual(t));
+            }
+            if let Some(t) = crate::textual::Internal::of_type_name(n) {
+                return Some(ColumnType::Internal(t));
+            }
+            if let Some(k) = crate::geo::GeoKind::of_name(n).filter(|k| k.fixed_leaves().is_some())
+            {
+                return Some(ColumnType::Geometric(k));
+            }
             if let Some(m) = n.strip_prefix("character(") {
                 ColumnType::Bpchar(Some(length(m)?))
             } else if let Some(m) = n.strip_prefix("bit varying(") {
@@ -341,6 +353,48 @@ pub fn type_named(named: &str) -> Option<ColumnType> {
             }
         }
     })
+}
+
+/// An aclitem's three leaves as arrow's Parquet reader gives them: its grantee, grantor and
+/// privileges.
+fn aclitem_fields() -> arrow::datatypes::Fields {
+    use arrow::datatypes::{DataType as A, Field};
+    vec![
+        Field::new("grantee", A::UInt32, false),
+        Field::new("grantor", A::UInt32, false),
+        Field::new("privileges", A::UInt64, false),
+    ]
+    .into()
+}
+
+/// An answer's aclitem at row `r`, as the text the snail holds; none for a NULL.
+pub fn aclitem_at(a: &dyn arrow::array::Array, r: usize) -> Option<String> {
+    use arrow::array::{Array, StructArray, UInt32Array, UInt64Array};
+    let s = a.as_any().downcast_ref::<StructArray>()?;
+    if s.is_null(r) {
+        return None;
+    }
+    let u32_at = |i: usize| {
+        s.column(i)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|x| x.value(r))
+    };
+    let privileges = s.column(2).as_any().downcast_ref::<UInt64Array>()?.value(r);
+    Some(crate::textual::aclitem_text(
+        u32_at(0)?,
+        u32_at(1)?,
+        privileges,
+    ))
+}
+
+/// A geometric value's float8 leaves as arrow's Parquet reader gives them: a field each.
+fn geometric_fields(ty: ColumnType) -> arrow::datatypes::Fields {
+    use arrow::datatypes::{DataType as A, Field};
+    ty.leaves()
+        .iter()
+        .map(|l| Field::new(l.field.unwrap_or_default(), A::Float64, false))
+        .collect()
 }
 
 /// A bit string's two leaves as arrow's Parquet reader gives a bit varying's: its length and its
@@ -362,14 +416,25 @@ pub fn string_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
         ColumnType::Bit(n) => A::FixedSizeBinary((n as i32 + 7) / 8),
         ColumnType::Varbit(_) => A::Struct(bits_fields()),
         ColumnType::Bytes => A::Binary,
+        ColumnType::Internal(t) if t.is_bytes() => A::Binary,
+        ColumnType::Geometric(_) => A::Struct(geometric_fields(ty)),
+        ColumnType::Textual(crate::textual::Textual::Aclitem) => A::Struct(aclitem_fields()),
         _ => A::Utf8,
     }
 }
 
 /// Whether an answer names the type of a column of `ty` in its field's metadata: a bpchar's, a
-/// name's, a bit string's, which their Arrow types do not say.
+/// name's, a bit string's, a type's held as its text or only a server makes, which their Arrow
+/// types do not say.
 pub fn is_named(ty: ColumnType) -> bool {
-    matches!(ty, ColumnType::Bpchar(_) | ColumnType::Name) || ty.is_bits()
+    matches!(
+        ty,
+        ColumnType::Bpchar(_)
+            | ColumnType::Name
+            | ColumnType::Textual(_)
+            | ColumnType::Internal(_)
+            | ColumnType::Geometric(_)
+    ) || ty.is_bits()
 }
 
 /// An answer's field for a column of a string type or a bit string, named for its PostgreSQL type
@@ -424,7 +489,68 @@ pub fn string_array<'a>(
                 .expect("a bit varying takes its two leaves"),
             )
         }
-        ColumnType::Bytes => Arc::new(held.collect::<BinaryArray>()),
+        ColumnType::Textual(crate::textual::Textual::Aclitem) => {
+            let parts: Vec<Option<(u32, u32, u64)>> = held
+                .map(|b| {
+                    b.and_then(|b| crate::textual::aclitem_parse(std::str::from_utf8(b).ok()?).ok())
+                })
+                .collect();
+            Arc::new(
+                StructArray::try_new(
+                    aclitem_fields(),
+                    vec![
+                        Arc::new(
+                            parts
+                                .iter()
+                                .map(|p| Some(p.map_or(0, |p| p.0)))
+                                .collect::<arrow::array::UInt32Array>(),
+                        ),
+                        Arc::new(
+                            parts
+                                .iter()
+                                .map(|p| Some(p.map_or(0, |p| p.1)))
+                                .collect::<arrow::array::UInt32Array>(),
+                        ),
+                        Arc::new(
+                            parts
+                                .iter()
+                                .map(|p| Some(p.map_or(0, |p| p.2)))
+                                .collect::<arrow::array::UInt64Array>(),
+                        ),
+                    ],
+                    Some(parts.iter().map(Option::is_some).collect()),
+                )
+                .expect("an aclitem takes its three leaves"),
+            )
+        }
+        ColumnType::Geometric(_) => {
+            let rows: Vec<Option<&[u8]>> = held.collect();
+            let n = ty.leaf_count();
+            let leaves: Vec<arrow::array::ArrayRef> = (0..n)
+                .map(|l| {
+                    Arc::new(
+                        rows.iter()
+                            .map(|b| {
+                                Some(f64::from_bits(u64::from_be_bytes(b.map_or([0; 8], |b| {
+                                    b[8 * l..8 * l + 8].try_into().unwrap()
+                                }))))
+                            })
+                            .collect::<arrow::array::Float64Array>(),
+                    ) as arrow::array::ArrayRef
+                })
+                .collect();
+            Arc::new(
+                StructArray::try_new(
+                    geometric_fields(ty),
+                    leaves,
+                    Some(rows.iter().map(Option::is_some).collect()),
+                )
+                .expect("a geometric value takes its leaves"),
+            )
+        }
+        ColumnType::Bytes | ColumnType::Internal(_) if ty.held_as_bytes() => {
+            Arc::new(held.collect::<BinaryArray>())
+        }
         _ => Arc::new(
             held.map(|b| b.map(|b| std::str::from_utf8(b).unwrap_or_default()))
                 .collect::<StringArray>(),

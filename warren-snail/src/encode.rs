@@ -140,6 +140,13 @@ pub(crate) fn primitive(
         | ColumnType::Bpchar(_)
         | ColumnType::Name
         | ColumnType::NumericText(_) => (PhysicalType::BYTE_ARRAY, Some(LogicalType::String)),
+        ColumnType::Textual(crate::textual::Textual::Json) => {
+            (PhysicalType::BYTE_ARRAY, Some(LogicalType::Json))
+        }
+        ColumnType::Textual(_) | ColumnType::Internal(crate::textual::Internal::NodeTree) => {
+            (PhysicalType::BYTE_ARRAY, Some(LogicalType::String))
+        }
+        ColumnType::Internal(_) => (PhysicalType::BYTE_ARRAY, None),
         ColumnType::Bit(_) => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Bytes => (PhysicalType::BYTE_ARRAY, None),
         ColumnType::Numeric { precision, scale } => (
@@ -200,7 +207,8 @@ pub(crate) fn primitive(
         | ColumnType::Varbit(_)
         | ColumnType::Composed(_)
         | ColumnType::Timetz(_)
-        | ColumnType::Interval { .. } => {
+        | ColumnType::Interval { .. }
+        | ColumnType::Geometric(_) => {
             return Err(Error::new(format!(
                 "{name} is {}, held as a group of leaves",
                 ty.pg_name()
@@ -680,7 +688,8 @@ fn decode_as(
         ColumnType::Tid
         | ColumnType::Varbit(_)
         | ColumnType::Timetz(_)
-        | ColumnType::Interval { .. } => return Err(group(desc.name(), ty)),
+        | ColumnType::Interval { .. }
+        | ColumnType::Geometric(_) => return Err(group(desc.name(), ty)),
         ColumnType::Bit(n) => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
             let mut v: Vec<FixedLenByteArray> = Vec::new();
@@ -890,7 +899,9 @@ fn decode_as(
         | ColumnType::Bytes
         | ColumnType::Bpchar(_)
         | ColumnType::Name
-        | ColumnType::NumericText(_) => {
+        | ColumnType::NumericText(_)
+        | ColumnType::Textual(_)
+        | ColumnType::Internal(_) => {
             let mut r = get_typed_column_reader::<ByteArrayType>(column);
             let mut v: Vec<ByteArray> = Vec::new();
             let (n, _, _) = r.read_records(
@@ -902,8 +913,10 @@ fn decode_as(
             if n != rows {
                 return Err(short(n));
             }
-            // Text is UTF-8; bytea's bytes are any.
-            let bad = (ty != ColumnType::Bytes)
+            // Text is UTF-8; bytea's bytes are any, and so are the statistics types'.
+            let bytes = matches!(ty, ColumnType::Bytes)
+                || matches!(ty, ColumnType::Internal(i) if i.is_bytes());
+            let bad = (!bytes)
                 .then(|| v.iter().find(|b| std::str::from_utf8(b.data()).is_err()))
                 .flatten();
             if let Some(bad) = bad {

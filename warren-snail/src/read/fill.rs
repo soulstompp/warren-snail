@@ -63,6 +63,10 @@ pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
             crate::composed::scalar_out(ty, &Datum::Int(*v))
         }
         (Datum::Int(v), _) => v.to_string(),
+        // As a value held as its text is cast to text: inet's and cidr's mask always written.
+        (Datum::Text(s), ty @ (ColumnType::Textual(_) | ColumnType::Internal(_))) => {
+            crate::textual::text_cast(ty, s)
+        }
         (Datum::Text(s), _) => s.clone(),
         (Datum::Bytes(k), ty) if ty.is_bits() => crate::strings::bits_text(k),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()).text().unwrap_or_default(),
@@ -359,6 +363,16 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         (Text(_) | Bpchar(_), Char) => {
             Datum::Int(crate::scalars::scalar_parse(Char, &as_text(&d))?)
         }
+        // A value held as its text into its own type, or by the assignment casts between json and
+        // jsonb, inet and cidr.
+        (Textual(a), Textual(b)) if crate::textual::assignable(a, b) => {
+            let Datum::Text(s) = &d else {
+                return Err(refused());
+            };
+            Datum::Text(crate::textual::cast(a, b, s)?)
+        }
+        (Internal(a), Internal(b)) if a == b => d,
+        (Geometric(a), Geometric(b)) if a == b => d,
         _ => return Err(refused()),
     })
 }
@@ -381,8 +395,14 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Int(v), ty) if ty.is_timestamptz() => Value::Scalar(ColumnType::Timestamptz, *v),
         (Datum::Int(v), _) => Value::Int(*v),
         (Datum::Text(s), ColumnType::Bpchar(_) | ColumnType::Name) => Value::Str(ty, s.clone()),
+        (Datum::Text(s), ColumnType::Textual(_) | ColumnType::Internal(_)) => {
+            Value::Typed(ty, s.clone())
+        }
         (Datum::Text(s), _) => Value::Text(s.clone()),
         (Datum::Bytes(k), ty) if ty.is_bits() => Value::Bits(ty, k.clone()),
+        (Datum::Bytes(b), ColumnType::Geometric(k)) => {
+            crate::geo::geo_of_bytes(k, b).map_or(Value::Null, Value::Geometric)
+        }
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()),
         (Datum::Wide(k), _) => Value::Uuid(*k),
         (Datum::Float4(b), _) => Value::Real(f32::from_bits(*b)),
@@ -425,6 +445,11 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
                 range: crate::times::INTERVAL_FULL_RANGE,
                 precision: None,
             },
+        ),
+        Value::Typed(ty, s) => (Datum::Text(s), ty),
+        Value::Geometric(g) => (
+            Datum::Bytes(crate::geo::geo_bytes(&g)),
+            ColumnType::Geometric(g.kind()),
         ),
     };
     assign(d, from, to, what)

@@ -46,6 +46,11 @@ pub enum Value {
     Composed(ColumnType, std::sync::Arc<crate::composed::Compound>),
     /// An interval, as its own fields.
     Interval(crate::times::Interval),
+    /// A value of a type held as its text (json, jsonb, jsonpath, xml, inet, cidr, tsvector, tsquery,
+    /// refcursor, pg_node_tree): its type and the text the snail holds.
+    Typed(ColumnType, String),
+    /// A geometric value.
+    Geometric(crate::geo::Geo),
 }
 
 impl Value {
@@ -122,6 +127,8 @@ impl Value {
             Value::Numeric(n) => n.to_string(),
             Value::Composed(ty, c) => crate::composed::text_out(*ty, &c.item),
             Value::Interval(v) => crate::times::interval_out(*v),
+            Value::Typed(ty, s) => crate::textual::text_cast(*ty, s),
+            Value::Geometric(g) => crate::geo::geo_out(g),
         })
     }
 
@@ -187,6 +194,41 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
     }
     if let Some(o) = super::clock::compare(a, b)? {
         return Ok(Some(o));
+    }
+    // Two geometric values, equal or not by their type's `=`, where it has one.
+    if let (Value::Geometric(x), Value::Geometric(y)) = (a, b) {
+        return match crate::geo::geo_binary("=", x, y) {
+            Some(v) => Ok(Some(match v? {
+                crate::geo::GeoValue::Bool(true) => Ordering::Equal,
+                _ => Ordering::Less,
+            })),
+            None => Err(Error::new(format!(
+                "operator does not exist: {} = {}",
+                x.kind().name(),
+                y.kind().name()
+            ))),
+        };
+    }
+    // A value held as its text beside one of a type it compares with, by their classes' keys; a
+    // node tree beside text, as text.
+    match (a, b) {
+        (Value::Typed(x, s), Value::Typed(y, t)) => {
+            return crate::textual::compare(*x, s, *y, t).map(Some)
+        }
+        (Value::Typed(ColumnType::Internal(_), s), Value::Text(t)) => {
+            return Ok(Some(s.as_bytes().cmp(t.as_bytes())))
+        }
+        (Value::Text(s), Value::Typed(ColumnType::Internal(_), t)) => {
+            return Ok(Some(s.as_bytes().cmp(t.as_bytes())))
+        }
+        (Value::Typed(ty, _), other) | (other, Value::Typed(ty, _)) => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} = {}",
+                ty.pg_name(),
+                kind_name(other)
+            )))
+        }
+        _ => {}
     }
     Ok(Some(match (a, b) {
         (Value::Bits(_, x), Value::Bits(_, y)) => x.cmp(y),
@@ -285,6 +327,26 @@ fn key(v: &Value) -> Key {
         Value::Bits(_, k) => Key::Bytes(k.clone()),
         Value::Composed(_, c) => Key::Composed(c.key.clone()),
         Value::Interval(v) => Key::Interval(v.total()),
+        Value::Typed(ty, s) => {
+            Key::Bytes(crate::strings::key_bytes(*ty, s.as_bytes()).into_owned())
+        }
+        // Never a key: grouping and partitioning refuse it first.
+        Value::Geometric(g) => Key::Bytes(crate::geo::geo_bytes(g)),
+    }
+}
+
+/// A value as a key that groups, refused where PostgreSQL has no equality to group it by.
+fn grouped_key(v: &Value) -> Result<Key> {
+    match v {
+        Value::Typed(ty, _) if !ty.grouped() => Err(Error::new(format!(
+            "could not identify an equality operator for type {}",
+            ty.pg_name()
+        ))),
+        Value::Geometric(g) => Err(Error::new(format!(
+            "could not identify an equality operator for type {}",
+            g.kind().name()
+        ))),
+        v => Ok(key(v)),
     }
 }
 
@@ -624,6 +686,60 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
     }
     let name = to.to_string().to_lowercase();
     let base = name.split('(').next().unwrap_or("").trim().to_string();
+    // A geometric type by its cast from another, or by its input from text.
+    if let Some(k) = crate::geo::GeoKind::of_name(base.as_str()) {
+        return Ok(match v {
+            Value::Geometric(g) => match crate::geo::geo_cast(&g, k) {
+                Some(c) => Value::Geometric(c?),
+                None => {
+                    return Err(Error::new(format!(
+                        "cannot cast type {} to {}",
+                        g.kind().name(),
+                        k.name()
+                    )))
+                }
+            },
+            Value::Text(t) => Value::Geometric(crate::geo::geo_in(k, &t)?),
+            other => {
+                return Err(Error::new(format!(
+                    "cannot cast type {} to {}",
+                    kind_name(&other),
+                    k.name()
+                )))
+            }
+        });
+    }
+    // A jsonb's number or boolean at its top, as its casts take one; a JSON null, NULL.
+    if let Value::Typed(ColumnType::Textual(crate::textual::Textual::Jsonb), s) = &v {
+        let target = match base.as_str() {
+            "smallint" | "int2" => Some("smallint"),
+            "integer" | "int" | "int4" => Some("integer"),
+            "bigint" | "int8" => Some("bigint"),
+            "numeric" | "decimal" => Some("numeric"),
+            "real" | "float4" => Some("real"),
+            "double precision" | "float8" => Some("double precision"),
+            _ => None,
+        };
+        if let Some(target) = target {
+            let Some(n) = crate::jsonb::jsonb_number(s, target)? else {
+                return Ok(Value::Null);
+            };
+            return Ok(match target {
+                "smallint" | "integer" | "bigint" => {
+                    Value::Int(n.to_integer(i64::MIN, i64::MAX, target)?)
+                }
+                "real" => Value::Real(n.to_float(false)? as f32),
+                "double precision" => Value::Double(n.to_float(true)?),
+                _ => Value::of_numeric(match cast_typmod(to)? {
+                    Some((p, s)) => n.typmod(p, s)?,
+                    None => n,
+                }),
+            });
+        }
+        if matches!(base.as_str(), "boolean" | "bool") {
+            return Ok(crate::jsonb::jsonb_bool(s)?.map_or(Value::Null, Value::Bool));
+        }
+    }
     Ok(match base.as_str() {
         // A bpchar's trailing blanks are taken off where it becomes text.
         // varchar(n) cut to its n characters, as an explicit cast cuts it.
@@ -738,6 +854,7 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
                 scalar_cast(v, ColumnType::Reg(kind, release))?
             }
             Ok(ty) if super::clock::is_time(ty) => super::clock::cast(v, ty)?,
+            Ok(ty @ (ColumnType::Textual(_) | ColumnType::Internal(_))) => typed_cast(v, ty)?,
             Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty)?,
             Ok(ty @ (ColumnType::Bpchar(_) | ColumnType::Name)) => string_cast(v, ty, true)?,
             Ok(ty) if ty.is_bits() => bits_cast(v, ty, true)?,
@@ -746,6 +863,42 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
             }
             _ => return Err(Error::new(format!("a cast to {to} is not read"))),
         },
+    })
+}
+
+/// A value cast to a type held as its text, as PostgreSQL's casts take each kind: a string's text
+/// read by the type's input; a value of a type it casts from (json and jsonb, inet and cidr) by
+/// that cast. A node tree and the others only a server makes are never cast to.
+pub(crate) fn typed_cast(v: Value, ty: ColumnType) -> Result<Value> {
+    let ColumnType::Textual(to) = ty else {
+        let ColumnType::Internal(t) = ty else {
+            unreachable!("a type held as its text")
+        };
+        return match v {
+            Value::Null => Ok(Value::Null),
+            Value::Typed(from, s) if from == ty => Ok(Value::Typed(from, s)),
+            _ => Err(t.refusal()),
+        };
+    };
+    Ok(match v {
+        Value::Null => Value::Null,
+        Value::Typed(ColumnType::Textual(from), s) => {
+            Value::Typed(ty, crate::textual::cast(from, to, &s)?)
+        }
+        v @ (Value::Text(_) | Value::Str(..)) => {
+            let s = match &v {
+                Value::Str(t, s) => crate::strings::text_of(*t, s).to_string(),
+                v => v.text().unwrap_or_default(),
+            };
+            Value::Typed(ty, crate::textual::text_in(to, &s)?)
+        }
+        other => {
+            return Err(Error::new(format!(
+                "cannot cast type {} to {}",
+                kind_name(&other),
+                ty.pg_name()
+            )))
+        }
     })
 }
 
@@ -849,6 +1002,8 @@ pub(super) fn kind_name(v: &Value) -> String {
         Value::Bits(..) => "bit varying".into(),
         Value::Composed(ty, _) => ty.pg_name(),
         Value::Interval(_) => "interval".into(),
+        Value::Typed(ty, _) => ty.pg_name(),
+        Value::Geometric(g) => g.kind().name().into(),
     }
 }
 
@@ -1080,6 +1235,386 @@ fn text_part(v: &Value) -> String {
         Value::Str(ty, s) => crate::strings::text_of(*ty, s).to_string(),
         other => other.text().unwrap_or_default(),
     }
+}
+
+/// A geometric operator's answer as a value: a geometric value, a truth, a double precision, an
+/// integer or NULL.
+fn of_geo(v: crate::geo::GeoValue) -> Value {
+    use crate::geo::GeoValue as G;
+    match v {
+        G::Geo(g) => Value::Geometric(g),
+        G::Bool(b) => Value::Bool(b),
+        G::Float(f) => Value::Double(f),
+        G::Int(i) => Value::Int(i64::from(i)),
+        _ => Value::Null,
+    }
+}
+
+/// An operator on geometric values, as PostgreSQL defines it on their types; a quoted literal
+/// beside one read as a value of its type. None where neither side is geometric.
+fn geo_op(
+    op: &BinaryOperator,
+    x: &Value,
+    y: &Value,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<Value>> {
+    let read = |v: &Value, e: &Expr, beside: &Value| -> Result<Value> {
+        Ok(match (v, beside) {
+            (Value::Text(t), Value::Geometric(g)) if quoted(e) => {
+                Value::Geometric(crate::geo::geo_in(g.kind(), t)?)
+            }
+            (v, _) => v.clone(),
+        })
+    };
+    let name = op.to_string();
+    if !matches!(x, Value::Geometric(_)) && !matches!(y, Value::Geometric(_)) {
+        // An operator only geometric types have, over a NULL, is NULL.
+        return Ok((matches!(
+            name.as_str(),
+            "~=" | "<^"
+                | ">^"
+                | "?||"
+                | "?-|"
+                | "?#"
+                | "##"
+                | "<->"
+                | "&<|"
+                | "|&>"
+                | "<<|"
+                | "|>>"
+                | "&<"
+                | "&>"
+        ) && (x.is_null() || y.is_null()))
+        .then_some(Value::Null));
+    }
+    let (x, y) = (read(x, left, y)?, read(y, right, x)?);
+    let refused = || {
+        Error::new(format!(
+            "operator does not exist: {} {name} {}",
+            kind_name(&x),
+            kind_name(&y)
+        ))
+    };
+    match (&x, &y) {
+        (Value::Geometric(a), Value::Geometric(b)) => match crate::geo::geo_binary(&name, a, b) {
+            Some(v) => Ok(Some(of_geo(v?))),
+            None => Err(refused()),
+        },
+        // Over a NULL, NULL: a NULL written out, where the type has the operator beside its own.
+        (Value::Geometric(g), Value::Null) | (Value::Null, Value::Geometric(g)) => {
+            let written = |e: &Expr| matches!(e, Expr::Value(v) if v.value == SqlValue::Null);
+            if !written(left) && !written(right) {
+                return Ok(Some(Value::Null));
+            }
+            match crate::geo::geo_binary(&name, g, g) {
+                Some(_) => Ok(Some(Value::Null)),
+                None => Err(refused()),
+            }
+        }
+        _ => Err(refused()),
+    }
+}
+
+/// Whether a value is of a type held as its text with a `||` of its own: jsonb, tsvector, tsquery.
+fn concat_of_own(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Typed(
+            ColumnType::Textual(
+                crate::textual::Textual::Jsonb
+                    | crate::textual::Textual::Tsvector
+                    | crate::textual::Textual::Tsquery
+            ),
+            _
+        )
+    )
+}
+
+/// An operator on a type held as its text, as PostgreSQL defines it on that type: inet's and
+/// cidr's containment, overlap, bitwise and arithmetic. A comparison of a type PostgreSQL does not
+/// order is refused, whatever stands beside it. None where neither side is such a value, or for a
+/// comparison of one that orders, which `compare` answers.
+fn typed_op(
+    op: &BinaryOperator,
+    x: &Value,
+    y: &Value,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<Value>> {
+    use crate::textual::Textual;
+    let typed = |v: &Value| match v {
+        Value::Typed(ty, _) => Some(*ty),
+        _ => None,
+    };
+    let name = op.to_string();
+    let Some(ty) = typed(x).or_else(|| typed(y)) else {
+        // An operator only these types have, over a NULL, is NULL.
+        return Ok((matches!(
+            name.as_str(),
+            "<<="
+                | ">>="
+                | "&&"
+                | "->"
+                | "->>"
+                | "#>"
+                | "#>>"
+                | "@>"
+                | "<@"
+                | "?"
+                | "?|"
+                | "?&"
+                | "#-"
+                | "@@"
+                | "<->"
+        ) && (x.is_null() || y.is_null()))
+        .then_some(Value::Null));
+    };
+    let refused = || {
+        Error::new(format!(
+            "operator does not exist: {} {name} {}",
+            kind_name(x),
+            kind_name(y)
+        ))
+    };
+    if matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    ) {
+        let equal = matches!(op, BinaryOperator::Eq);
+        return if ty.ordered() || equal && ty == ColumnType::Textual(Textual::Aclitem) {
+            Ok(None)
+        } else {
+            Err(refused())
+        };
+    }
+    // `||` of a type with none of its own is text's, of each side's text.
+    if *op == BinaryOperator::StringConcat && !concat_of_own(x) && !concat_of_own(y) {
+        return Ok(None);
+    }
+    // A quoted literal is read as the type the operator takes on its side.
+    let read = |v: &Value, e: &Expr, as_: Textual| -> Result<Value> {
+        Ok(match v {
+            Value::Text(t) if quoted(e) => {
+                Value::Typed(ColumnType::Textual(as_), crate::textual::text_in(as_, t)?)
+            }
+            v => v.clone(),
+        })
+    };
+    let kind = |v: &Value| match v {
+        Value::Typed(ColumnType::Textual(t), _) => Some(*t),
+        _ => None,
+    };
+    let (lk, rk) = (kind(x), kind(y));
+    // json's and jsonb's: a key or an index, a path or keys as text[], a document beside a
+    // document.
+    if let Some(doc @ (Textual::Json | Textual::Jsonb)) = lk {
+        let jsonb = doc == Textual::Jsonb;
+        let Value::Typed(_, a) = x else {
+            unreachable!("a json document")
+        };
+        let texts = || -> Result<Option<Vec<Option<String>>>> {
+            match y {
+                Value::Null => Ok(None),
+                Value::Text(t) if quoted(right) || matches!(right, Expr::Array(_)) => {
+                    crate::textual::text_array_in(t).map(Some)
+                }
+                _ => Err(refused()),
+            }
+        };
+        let json_of = |s: Option<String>| {
+            s.map_or(Value::Null, |s| Value::Typed(ColumnType::Textual(doc), s))
+        };
+        let text_of = |s: Option<String>| s.map_or(Value::Null, Value::Text);
+        let doc_of = |s: String| Value::Typed(ColumnType::Textual(doc), s);
+        use crate::jsonb as j;
+        return Ok(Some(match (name.as_str(), y) {
+            (_, Value::Null) => Value::Null,
+            ("->", Value::Text(k)) if !matches!(right, Expr::Array(_)) => json_of(if jsonb {
+                j::jsonb_field(a, k)?
+            } else {
+                j::json_field(a, k)?
+            }),
+            ("->", Value::Int(i)) => json_of(if jsonb {
+                j::jsonb_element(a, *i)?
+            } else {
+                j::json_element(a, *i)?
+            }),
+            ("->>", Value::Text(k)) if !matches!(right, Expr::Array(_)) => text_of(if jsonb {
+                j::jsonb_field_text(a, k)?
+            } else {
+                j::json_field_text(a, k)?
+            }),
+            ("->>", Value::Int(i)) => text_of(if jsonb {
+                j::jsonb_element_text(a, *i)?
+            } else {
+                j::json_element_text(a, *i)?
+            }),
+            ("#>" | "#>>", _) => {
+                let Some(path) = texts()? else {
+                    return Ok(Some(Value::Null));
+                };
+                match (name.as_str(), jsonb) {
+                    ("#>", true) => json_of(j::jsonb_path(a, &path)?),
+                    ("#>", false) => json_of(j::json_path(a, &path)?),
+                    (_, true) => text_of(j::jsonb_path_text(a, &path)?),
+                    (_, false) => text_of(j::json_path_text(a, &path)?),
+                }
+            }
+            ("?", Value::Text(k)) if jsonb && !matches!(right, Expr::Array(_)) => {
+                Value::Bool(j::jsonb_exists(a, k)?)
+            }
+            ("?|" | "?&" | "#-", _) if jsonb => {
+                let Some(keys) = texts()? else {
+                    return Ok(Some(Value::Null));
+                };
+                match name.as_str() {
+                    "?|" => Value::Bool(j::jsonb_exists_any(a, &keys)?),
+                    "?&" => Value::Bool(j::jsonb_exists_all(a, &keys)?),
+                    _ => doc_of(j::jsonb_delete_path(a, &keys)?),
+                }
+            }
+            ("-", Value::Int(i)) if jsonb => doc_of(j::jsonb_delete_index(a, *i)?),
+            ("-", Value::Text(_)) if jsonb && matches!(right, Expr::Array(_)) => {
+                doc_of(j::jsonb_delete_keys(a, &texts()?.unwrap_or_default())?)
+            }
+            ("-", Value::Text(k)) if jsonb => doc_of(j::jsonb_delete_key(a, k)?),
+            ("@>" | "<@" | "||", _) if jsonb => {
+                let b = match read(y, right, Textual::Jsonb)? {
+                    Value::Typed(ColumnType::Textual(Textual::Jsonb), b) => b,
+                    _ => return Err(refused()),
+                };
+                match name.as_str() {
+                    "@>" => Value::Bool(j::jsonb_contains(a, &b)?),
+                    "<@" => Value::Bool(j::jsonb_contains(&b, a)?),
+                    _ => doc_of(j::jsonb_concat(a, &b)?),
+                }
+            }
+            _ => return Err(refused()),
+        }));
+    }
+    // A document on the right of @>, <@ or ||, a literal on the left read as jsonb.
+    if rk == Some(Textual::Jsonb) && matches!(name.as_str(), "@>" | "<@" | "||") {
+        let (Value::Typed(_, a), Value::Typed(_, b)) = (read(x, left, Textual::Jsonb)?, y) else {
+            return if x.is_null() {
+                Ok(Some(Value::Null))
+            } else {
+                Err(refused())
+            };
+        };
+        let doc_of = |s: String| Value::Typed(ColumnType::Textual(Textual::Jsonb), s);
+        return Ok(Some(match name.as_str() {
+            "@>" => Value::Bool(crate::jsonb::jsonb_contains(&a, b)?),
+            "<@" => Value::Bool(crate::jsonb::jsonb_contains(b, &a)?),
+            _ => doc_of(crate::jsonb::jsonb_concat(&a, b)?),
+        }));
+    }
+    let net = |k: Option<Textual>| k.is_some_and(Textual::is_network);
+    // The other side's type, where it is a literal: the type the operator reads beside this one.
+    let (x, y) = match (lk, rk) {
+        (Some(Textual::Tsvector), None) if name == "@@" => {
+            (x.clone(), read(y, right, Textual::Tsquery)?)
+        }
+        (None, Some(Textual::Tsvector)) if name == "@@" => {
+            (read(x, left, Textual::Tsquery)?, y.clone())
+        }
+        (Some(Textual::Tsquery), None) if name == "@@" => {
+            (x.clone(), read(y, right, Textual::Tsvector)?)
+        }
+        (None, Some(Textual::Tsquery)) if name == "@@" => {
+            (read(x, left, Textual::Tsvector)?, y.clone())
+        }
+        (Some(k), None) if k.is_network() && name != "+" && name != "-" => {
+            (x.clone(), read(y, right, Textual::Inet)?)
+        }
+        (Some(k), None) if k.is_network() && name == "-" && quoted(right) => {
+            (x.clone(), read(y, right, Textual::Inet)?)
+        }
+        (None, Some(k)) if k.is_network() && name != "+" => {
+            (read(x, left, Textual::Inet)?, y.clone())
+        }
+        (Some(k), None) => (x.clone(), read(y, right, k)?),
+        (None, Some(k)) => (read(x, left, k)?, y.clone()),
+        _ => (x.clone(), y.clone()),
+    };
+    if x.is_null() || y.is_null() {
+        return Ok(Some(Value::Null));
+    }
+    let typed_as = |t: Textual, s: String| Value::Typed(ColumnType::Textual(t), s);
+    let (lk, rk) = (kind(&x), kind(&y));
+    let (Value::Typed(_, a) | Value::Text(a)) = &x else {
+        return match (name.as_str(), &x, &y) {
+            ("+", Value::Int(n), Value::Typed(_, b)) if net(rk) => Ok(Some(typed_as(
+                Textual::Inet,
+                crate::inet::inet_plus(b, *n)?,
+            ))),
+            _ => Err(refused()),
+        };
+    };
+    Ok(Some(match (name.as_str(), lk, rk, &y) {
+        // inet's and cidr's, each an inet's result.
+        ("<<", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            Value::Bool(crate::inet::inet_sub(a, b))
+        }
+        ("<<=", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            Value::Bool(crate::inet::inet_subeq(a, b))
+        }
+        (">>", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            Value::Bool(crate::inet::inet_sup(a, b))
+        }
+        (">>=", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            Value::Bool(crate::inet::inet_supeq(a, b))
+        }
+        ("&&", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            Value::Bool(crate::inet::inet_overlap(a, b))
+        }
+        ("&", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            typed_as(Textual::Inet, crate::inet::inet_and(a, b)?)
+        }
+        ("|", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            typed_as(Textual::Inet, crate::inet::inet_or(a, b)?)
+        }
+        ("+", l, None, Value::Int(n)) if net(l) => {
+            typed_as(Textual::Inet, crate::inet::inet_plus(a, *n)?)
+        }
+        ("-", l, None, Value::Int(n)) if net(l) => {
+            typed_as(Textual::Inet, crate::inet::inet_minus_int(a, *n)?)
+        }
+        ("-", l, r, Value::Typed(_, b)) if net(l) && net(r) => {
+            Value::Int(crate::inet::inet_minus(a, b)?)
+        }
+        // tsvector's and tsquery's.
+        ("@@", Some(Textual::Tsvector), Some(Textual::Tsquery), Value::Typed(_, b)) => {
+            Value::Bool(crate::tsearch::ts_match(a, b))
+        }
+        ("@@", Some(Textual::Tsquery), Some(Textual::Tsvector), Value::Typed(_, b)) => {
+            Value::Bool(crate::tsearch::ts_match(b, a))
+        }
+        ("||", Some(Textual::Tsvector), Some(Textual::Tsvector), Value::Typed(_, b)) => {
+            typed_as(Textual::Tsvector, crate::tsearch::tsvector_concat(a, b)?)
+        }
+        ("||", Some(Textual::Tsquery), Some(Textual::Tsquery), Value::Typed(_, b)) => {
+            typed_as(Textual::Tsquery, crate::tsearch::tsquery_or(a, b)?)
+        }
+        ("&&", Some(Textual::Tsquery), Some(Textual::Tsquery), Value::Typed(_, b)) => {
+            typed_as(Textual::Tsquery, crate::tsearch::tsquery_and(a, b)?)
+        }
+        ("<->", Some(Textual::Tsquery), Some(Textual::Tsquery), Value::Typed(_, b)) => {
+            typed_as(Textual::Tsquery, crate::tsearch::tsquery_phrase(a, b)?)
+        }
+        ("@>", Some(Textual::Tsquery), Some(Textual::Tsquery), Value::Typed(_, b)) => {
+            Value::Bool(crate::tsearch::tsq_mcontains(a, b))
+        }
+        ("<@", Some(Textual::Tsquery), Some(Textual::Tsquery), Value::Typed(_, b)) => {
+            Value::Bool(crate::tsearch::tsq_mcontains(b, a))
+        }
+        _ => return Err(refused()),
+    }))
 }
 
 /// An operator on strings, bytea or bit strings, as PostgreSQL defines it: `||` of text and any
@@ -1610,6 +2145,27 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
             string_cast(Value::Text(t.clone()), unbounded(*ty), false)?,
             y,
         ),
+        // Beside a geometric value, by its type's input.
+        (Value::Geometric(g), Value::Text(t)) if quoted(right) => {
+            let t = Value::Geometric(crate::geo::geo_in(g.kind(), t)?);
+            (x, t)
+        }
+        (Value::Text(t), Value::Geometric(g)) if quoted(left) => {
+            (Value::Geometric(crate::geo::geo_in(g.kind(), t)?), y)
+        }
+        // Beside a value held as its text, by its type's input; beside a node tree, as text.
+        (Value::Typed(ColumnType::Textual(ty), _), Value::Text(t)) if quoted(right) => {
+            let ty = ty.literal_type();
+            let t = Value::Typed(ColumnType::Textual(ty), crate::textual::text_in(ty, t)?);
+            (x, t)
+        }
+        (Value::Text(t), Value::Typed(ColumnType::Textual(ty), _)) if quoted(left) => (
+            Value::Typed(
+                ColumnType::Textual(ty.literal_type()),
+                crate::textual::text_in(ty.literal_type(), t)?,
+            ),
+            y,
+        ),
         (Value::Bits(..), Value::Text(t)) if quoted(right) => {
             let t = bits_cast(Value::Text(t.clone()), ColumnType::Varbit(None), false)?;
             (x, t)
@@ -1741,7 +2297,60 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 let v = !crate::scalars::unsigned_of(k, bits) & (u64::MAX >> (64 - bits));
                 Value::Scalar(t, crate::scalars::unsigned_key(v, bits))
             }
+            // An inet's or a cidr's bits inverted, an inet.
+            Value::Typed(ColumnType::Textual(t), s) if t.is_network() => Value::Typed(
+                ColumnType::Textual(crate::textual::Textual::Inet),
+                crate::inet::inet_not(&s)?,
+            ),
             other => return Err(Error::new(format!("~{other:?} is not read"))),
+        },
+        // A geometric value's prefix operators.
+        Expr::UnaryOp {
+            op:
+                op @ (UnaryOperator::AtDashAt
+                | UnaryOperator::Hash
+                | UnaryOperator::DoubleAt
+                | UnaryOperator::QuestionDash
+                | UnaryOperator::QuestionPipe),
+            expr,
+        } => match ev(expr)? {
+            Value::Null => Value::Null,
+            Value::Geometric(g) => match crate::geo::geo_unary(&op.to_string(), &g) {
+                Some(v) => of_geo(v?),
+                None => {
+                    return Err(Error::new(format!(
+                        "operator does not exist: {op} {}",
+                        g.kind().name()
+                    )))
+                }
+            },
+            other => {
+                return Err(Error::new(format!(
+                    "operator does not exist: {op} {}",
+                    kind_name(&other)
+                )))
+            }
+        },
+        // A tsquery negated, a quoted literal read as one.
+        Expr::UnaryOp {
+            op: UnaryOperator::PGPrefixFactorial,
+            expr,
+        } => match ev(expr)? {
+            Value::Null => Value::Null,
+            Value::Typed(ColumnType::Textual(crate::textual::Textual::Tsquery), s) => Value::Typed(
+                ColumnType::Textual(crate::textual::Textual::Tsquery),
+                crate::tsearch::tsquery_not(&s)?,
+            ),
+            Value::Text(t) if quoted(expr) => Value::Typed(
+                ColumnType::Textual(crate::textual::Textual::Tsquery),
+                crate::tsearch::tsquery_not(&crate::tsearch::tsquery_in(&t)?)?,
+            ),
+            other => {
+                return Err(Error::new(format!(
+                    "operator does not exist: !! {}",
+                    kind_name(&other)
+                )))
+            }
         },
         Expr::UnaryOp {
             op: UnaryOperator::Not,
@@ -1903,11 +2512,48 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }
                 _ => {}
             }
-            let (x, y) = (ev(left)?, ev(right)?);
+            let x = ev(left)?;
+            // An ARRAY of values beside a json document, as the text of a text[].
+            let y = match right.as_ref() {
+                Expr::Array(a)
+                    if matches!(
+                        x,
+                        Value::Typed(
+                            ColumnType::Textual(
+                                crate::textual::Textual::Json | crate::textual::Textual::Jsonb
+                            ),
+                            _
+                        )
+                    ) =>
+                {
+                    Value::Text(crate::textual::text_array_out(
+                        &a.elem
+                            .iter()
+                            .map(|e| ev(e).map(|v| v.text()))
+                            .collect::<Result<Vec<_>>>()?,
+                    ))
+                }
+                e => ev(e)?,
+            };
             if let Some(v) = composed_op(op, &x, &y, left, right)? {
                 return Ok(v);
             }
-            let (x, y) = beside(x, y, left, right)?;
+            if let Some(v) = geo_op(op, &x, &y, left, right)? {
+                return Ok(v);
+            }
+            // An operator on a type held as its text reads a literal beside it as the operator
+            // takes it.
+            if let Some(v) = typed_op(op, &x, &y, left, right)? {
+                return Ok(v);
+            }
+            // `||` beside a type held as its text with none of its own reads a literal as text.
+            let as_text = *op == BinaryOperator::StringConcat
+                && (matches!(x, Value::Typed(..)) || matches!(y, Value::Typed(..)));
+            let (x, y) = if as_text {
+                (x, y)
+            } else {
+                beside(x, y, left, right)?
+            };
             if let Some(v) = string_op(op, &x, &y)? {
                 return Ok(v);
             }
@@ -2326,6 +2972,47 @@ impl Acc {
             (Value::Scalar(ColumnType::Char, _), Acc::Least(_) | Acc::Greatest(_)) => {
                 Value::Text(v.text().unwrap_or_default())
             }
+            // Of the types held as their text only inet has min and max, which take a cidr as an
+            // inet; none has a sum.
+            (Value::Typed(ty, s), Acc::Least(_) | Acc::Greatest(_)) if matches!(ty, ColumnType::Textual(t) if t.is_network()) => {
+                Value::Typed(
+                    ColumnType::Textual(crate::textual::Textual::Inet),
+                    crate::textual::cast(
+                        match ty {
+                            ColumnType::Textual(t) => *t,
+                            _ => unreachable!(),
+                        },
+                        crate::textual::Textual::Inet,
+                        s,
+                    )?,
+                )
+            }
+            (Value::Typed(ty, _), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_)) => {
+                let name = match self {
+                    Acc::Sum(_) => "sum",
+                    Acc::Least(_) => "min",
+                    _ => "max",
+                };
+                return Err(Error::new(format!(
+                    "function {name}({}) does not exist",
+                    ty.pg_name()
+                )));
+            }
+            (Value::Typed(..), Acc::All(_) | Acc::Any(_)) => {
+                return Err(Error::new(format!("{v:?} is not a truth")))
+            }
+            // No geometric type has min, max or sum.
+            (Value::Geometric(g), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_)) => {
+                let name = match self {
+                    Acc::Sum(_) => "sum",
+                    Acc::Least(_) => "min",
+                    _ => "max",
+                };
+                return Err(Error::new(format!(
+                    "function {name}({}) does not exist",
+                    g.kind().name()
+                )));
+            }
             // A name's min and max are text's, as PostgreSQL reads a name through text.
             (Value::Str(ColumnType::Name, s), Acc::Least(_) | Acc::Greatest(_)) => {
                 Value::Text(s.clone())
@@ -2682,7 +3369,12 @@ impl<'q> StepRun<'q> {
                     .grouping
                     .iter()
                     .zip(&grouped_under)
-                    .map(|(g, &u)| eval(g, &row, &frame, &none).map(|v| key_under(&v, u)))
+                    .map(|(g, &u)| {
+                        eval(g, &row, &frame, &none).and_then(|v| {
+                            grouped_key(&v)?;
+                            Ok(key_under(&v, u))
+                        })
+                    })
                     .collect::<Result<_>>()?;
                 let i = match self.at.get(&k) {
                     Some(&i) => i,
@@ -2818,12 +3510,18 @@ fn sort(
                     };
                     let v = eval(&e, &row, &named, &none)?;
                     match v {
-                        Value::Scalar(ty, _) | Value::Composed(ty, _) if !ty.ordered() => {
+                        Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
+                            if !ty.ordered() =>
+                        {
                             Err(Error::new(format!(
                                 "could not identify an ordering operator for type {}",
                                 ty.pg_name()
                             )))
                         }
+                        Value::Geometric(g) => Err(Error::new(format!(
+                            "could not identify an ordering operator for type {}",
+                            g.kind().name()
+                        ))),
                         v => Ok(match (under[i], v.string_key()) {
                             (Some(Casing::Library(id)), Some(s)) => {
                                 Value::Bytes(crate::collations::get(id).key(s))
@@ -3204,6 +3902,60 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
 }
 
 /// Whether a question is read as a pipeline: a WITH, or a window in what it returns.
+/// Whether a question over one table compares or computes a geometric column in its WHERE, which
+/// only the pipeline reads: the question path keys no geometric value.
+pub fn reads_geometric(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    let (Some(w), [from]) = (&s.selection, s.from.as_slice()) else {
+        return false;
+    };
+    let TableFactor::Table { name, .. } = &from.relation else {
+        return false;
+    };
+    let name = crate::catalog::object_name(name);
+    let Some(table) = catalog
+        .tables
+        .iter()
+        .find(|t| t.name == name || t.name.rsplit('.').next() == Some(name.as_str()))
+    else {
+        return false;
+    };
+    let geometric: Vec<&str> = table
+        .columns
+        .iter()
+        .filter(|c| matches!(c.ty, ColumnType::Geometric(_)))
+        .map(|c| c.name.as_str())
+        .collect();
+    fn names(e: &Expr, geometric: &[&str]) -> bool {
+        match e {
+            Expr::Identifier(i) => geometric.contains(&crate::catalog::ident(i).as_str()),
+            Expr::CompoundIdentifier(parts) => parts
+                .last()
+                .is_some_and(|i| geometric.contains(&crate::catalog::ident(i).as_str())),
+            Expr::Nested(e) | Expr::Cast { expr: e, .. } | Expr::UnaryOp { expr: e, .. } => {
+                names(e, geometric)
+            }
+            Expr::BinaryOp { left, right, .. } => names(left, geometric) || names(right, geometric),
+            _ => false,
+        }
+    }
+    fn operated(e: &Expr, geometric: &[&str]) -> bool {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And | BinaryOperator::Or,
+                right,
+            } => operated(left, geometric) || operated(right, geometric),
+            Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => operated(e, geometric),
+            Expr::BinaryOp { .. } => names(e, geometric),
+            _ => false,
+        }
+    }
+    !geometric.is_empty() && operated(w, &geometric)
+}
+
 pub fn is_pipeline(q: &Query) -> bool {
     if q.with.is_some() {
         return true;
@@ -3264,6 +4016,46 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                         Error::new(format!("{} is not of its type", field.name()))
                     })?,
                 )
+            } else if let Some(ColumnType::Geometric(k)) = string {
+                let s = any
+                    .downcast_ref::<arrow::array::StructArray>()
+                    .ok_or_else(|| Error::new(format!("{} is not of its type", field.name())))?;
+                let leaves: Vec<f64> = s
+                    .columns()
+                    .iter()
+                    .map(|l| {
+                        l.as_any()
+                            .downcast_ref::<arrow::array::Float64Array>()
+                            .map(|f| f.value(r))
+                    })
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| Error::new(format!("{} is not of its type", field.name())))?;
+                Value::Geometric(crate::geo::geo_from_leaves(k, &leaves, false)?)
+            } else if let Some(ty) =
+                string.filter(|t| matches!(t, ColumnType::Textual(_) | ColumnType::Internal(_)))
+            {
+                let wrong = || Error::new(format!("{} is not of its type", field.name()));
+                if ty == ColumnType::Textual(crate::textual::Textual::Aclitem) {
+                    Value::Typed(
+                        ty,
+                        crate::strings::aclitem_at(a.as_ref(), r).ok_or_else(wrong)?,
+                    )
+                } else if ty.held_as_bytes() {
+                    Value::Bytes(
+                        any.downcast_ref::<BinaryArray>()
+                            .ok_or_else(wrong)?
+                            .value(r)
+                            .to_vec(),
+                    )
+                } else {
+                    Value::Typed(
+                        ty,
+                        any.downcast_ref::<StringArray>()
+                            .ok_or_else(wrong)?
+                            .value(r)
+                            .to_string(),
+                    )
+                }
             } else if let Some(ty) = string {
                 Value::Str(
                     ty,
@@ -3381,6 +4173,58 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
             })
             .max();
         let first = col().find(|v| !v.is_null());
+        // A column of geometric values: a group of float8s where every value is of one type of a
+        // fixed size; otherwise each value's text, named for the first one's type.
+        if let Some(Value::Geometric(g)) = first {
+            let k = g.kind();
+            let fixed = k.fixed_leaves().is_some()
+                && col().all(|v| !matches!(v, Value::Geometric(h) if h.kind() != k));
+            if fixed {
+                let ty = ColumnType::Geometric(k);
+                let bytes: Vec<Option<Vec<u8>>> = col()
+                    .map(|v| match v {
+                        Value::Geometric(g) => Some(crate::geo::geo_bytes(g)),
+                        _ => None,
+                    })
+                    .collect();
+                arrays.push(crate::strings::string_array(
+                    ty,
+                    bytes.iter().map(Option::as_deref),
+                ));
+                fields.push(crate::strings::string_field(name, ty, true));
+            } else {
+                arrays.push(Arc::new(
+                    col()
+                        .map(|v| match v {
+                            Value::Geometric(g) => Some(crate::geo::geo_out(g)),
+                            _ => None,
+                        })
+                        .collect::<StringArray>(),
+                ));
+                fields.push(
+                    Field::new(name, arrow::datatypes::DataType::Utf8, true).with_metadata(
+                        [(crate::scalars::PG_TYPE.to_string(), k.name().to_string())].into(),
+                    ),
+                );
+            }
+            continue;
+        }
+        // A column of a type held as its text, named for it; of inet and cidr together, inet.
+        if let Some(Value::Typed(ty, _)) = first {
+            let ty = match *ty {
+                ty if col().all(|v| !matches!(v, Value::Typed(t, _) if *t != ty)) => ty,
+                _ => ColumnType::Textual(crate::textual::Textual::Inet),
+            };
+            arrays.push(crate::strings::string_array(
+                ty,
+                col().map(|v| match v {
+                    Value::Typed(_, s) => Some(s.as_bytes()),
+                    _ => None,
+                }),
+            ));
+            fields.push(crate::strings::string_field(name, ty, true));
+            continue;
+        }
         if let Some(Value::Str(ty, _) | Value::Bits(ty, _)) = first {
             // A column of bit strings of more than one type is bit varying.
             let ty = match *ty {

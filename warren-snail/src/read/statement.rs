@@ -378,6 +378,16 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             let text = numeric_literal_text(e).ok_or_else(wrong)?;
             super::fill::numeric_datum(crate::numeric::Numeric::parse(&text)?, ty)?
         }
+        // A literal is read by its type's input into the text the snail holds.
+        ColumnType::Textual(t) => Datum::Text(crate::textual::text_in(
+            t,
+            &text_literal(e).map_err(|_| wrong())?,
+        )?),
+        ColumnType::Internal(t) => return Err(t.refusal()),
+        ColumnType::Geometric(k) => Datum::Bytes(crate::geo::geo_bytes(&crate::geo::geo_in(
+            k,
+            &text_literal(e).map_err(|_| wrong())?,
+        )?)),
     })
 }
 

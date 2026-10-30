@@ -46,12 +46,15 @@ impl Values {
             ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name => {
                 Values::Text(Vec::new())
             }
-            ColumnType::Bytes | ColumnType::Bit(_) | ColumnType::Varbit(_) => {
-                Values::Utf8(Vec::new())
-            }
+            ColumnType::Bytes
+            | ColumnType::Bit(_)
+            | ColumnType::Varbit(_)
+            | ColumnType::Geometric(_) => Values::Utf8(Vec::new()),
             ColumnType::Uuid => Values::Wide(Vec::new()),
             ColumnType::Numeric { precision, .. } if precision > 18 => Values::Wide(Vec::new()),
             ColumnType::NumericText(_) => Values::Text(Vec::new()),
+            ColumnType::Internal(t) if t.is_bytes() => Values::Utf8(Vec::new()),
+            ColumnType::Textual(_) | ColumnType::Internal(_) => Values::Text(Vec::new()),
             ColumnType::Float4 => Values::Float4(Vec::new()),
             ColumnType::Float8 => Values::Float8(Vec::new()),
             ColumnType::Interval { .. } => Values::Interval(Vec::new()),
@@ -425,6 +428,55 @@ impl Values {
                 Values::Int(v.iter().map(|x| x.map(|x| i64::from(x.days))).collect()),
                 Values::Int(v.iter().map(|x| x.map(|x| x.micros)).collect()),
             ],
+            // An aclitem, held as its text: its grantee, its grantor and its privileges, each a leaf.
+            (ColumnType::Textual(crate::textual::Textual::Aclitem), values) => {
+                let parts: Vec<Option<(u32, u32, u64)>> = (0..values.len())
+                    .map(|i| {
+                        values
+                            .text(i)
+                            .and_then(|t| crate::textual::aclitem_parse(t).ok())
+                    })
+                    .collect();
+                vec![
+                    Values::Int(
+                        parts
+                            .iter()
+                            .map(|p| p.map(|p| unsigned_key(u64::from(p.0), 32)))
+                            .collect(),
+                    ),
+                    Values::Int(
+                        parts
+                            .iter()
+                            .map(|p| p.map(|p| unsigned_key(u64::from(p.1), 32)))
+                            .collect(),
+                    ),
+                    Values::Int(
+                        parts
+                            .iter()
+                            .map(|p| p.map(|p| unsigned_key(p.2, 64)))
+                            .collect(),
+                    ),
+                ]
+            }
+            // A geometric value, held as its float8s' bits: a leaf each.
+            (ColumnType::Geometric(k), values) => {
+                let n = k.fixed_leaves().unwrap_or(0);
+                (0..n)
+                    .map(|l| {
+                        Values::Float8(
+                            (0..values.len())
+                                .map(|i| {
+                                    values.text_value(i).map(|b| {
+                                        u64::from_be_bytes(
+                                            b.data()[8 * l..8 * l + 8].try_into().unwrap(),
+                                        )
+                                    })
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect()
+            }
             (_, values) => vec![values],
         }
     }
@@ -489,6 +541,31 @@ impl Values {
                             days: (*d)? as i32,
                             micros: (*u)?,
                         })
+                    })
+                    .collect(),
+            ),
+            (
+                ColumnType::Textual(crate::textual::Textual::Aclitem),
+                [Values::Int(grantee), Values::Int(grantor), Values::Int(privileges)],
+            ) => Values::Text(
+                (0..grantee.len())
+                    .map(|i| {
+                        Some(crate::textual::aclitem_text(
+                            unsigned_of(grantee[i]?, 32) as u32,
+                            unsigned_of(grantor[i]?, 32) as u32,
+                            unsigned_of(privileges[i]?, 64),
+                        ))
+                    })
+                    .collect(),
+            ),
+            (ColumnType::Geometric(_), [first, ..]) => Values::Utf8(
+                (0..first.len())
+                    .map(|i| {
+                        let mut b = Vec::with_capacity(8 * leaves.len());
+                        for l in &leaves {
+                            b.extend_from_slice(&l.bits(i)?.to_be_bytes());
+                        }
+                        Some(ByteArray::from(b))
                     })
                     .collect(),
             ),

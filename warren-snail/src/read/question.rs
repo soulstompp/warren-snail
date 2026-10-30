@@ -539,6 +539,11 @@ fn bytes_literal(e: &Expr, ty: ColumnType) -> Result<Vec<u8>> {
         ColumnType::Name => crate::strings::name_in(&s).into_bytes(),
         ColumnType::Bytes => crate::strings::bytea_in(&s)?,
         ColumnType::Bit(_) | ColumnType::Varbit(_) => crate::strings::bits_parse(&s, None, true)?,
+        // Its class's key, from the text its input reads; an inet beside a cidr by inet's.
+        ColumnType::Textual(t) => {
+            let t = t.literal_type();
+            crate::textual::key_bytes(t, crate::textual::text_in(t, &s)?.as_bytes()).into_owned()
+        }
         _ => s.into_bytes(),
     })
 }
@@ -797,7 +802,17 @@ impl From<'_> {
                     | ColumnType::Timetz(_)
                     | ColumnType::Timestamp(_)
                     | ColumnType::Interval { .. }
-                    | ColumnType::Bytes => Ok(Some(if name == "min" {
+                    | ColumnType::Bytes
+                    | ColumnType::Internal(crate::textual::Internal::NodeTree) => {
+                        Ok(Some(if name == "min" {
+                            Item::Least(col)
+                        } else {
+                            Item::Greatest(col)
+                        }))
+                    }
+                    // Of the types held as their text only inet has min and max, a cidr's taken
+                    // as an inet.
+                    ColumnType::Textual(t) if t.is_network() => Ok(Some(if name == "min" {
                         Item::Least(col)
                     } else {
                         Item::Greatest(col)
@@ -817,6 +832,10 @@ impl From<'_> {
                             Item::Greatest(col)
                         }))
                     }
+                    ColumnType::Textual(_) | ColumnType::Internal(_) => Err(Error::new(format!(
+                        "function {name}({}) does not exist",
+                        ty.pg_name()
+                    ))),
                     ColumnType::Boolean
                     | ColumnType::Uuid
                     | ColumnType::Xid
@@ -948,6 +967,16 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 },
                 None => from.key_of(g)?,
             };
+            // A type PostgreSQL has no equality for is grouped by none.
+            if let Key::Column(c) = k {
+                let ty = from.table(c.side).columns[c.column].ty;
+                if !ty.grouped() {
+                    return Err(Error::new(format!(
+                        "could not identify an equality operator for type {}",
+                        ty.pg_name()
+                    )));
+                }
+            }
             if !keys.contains(&k) {
                 keys.push(k);
             }
@@ -1130,11 +1159,18 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             }
         };
         let table = from.table(side);
-        // xid has only `=` and `<>`, an integer on their right; cid only `=`. Asked first, as
-        // PostgreSQL finds the operator before it reads a value.
+        // xid has only `=` and `<>`, an integer on their right; cid only `=`; a type held as its
+        // text that PostgreSQL does not order, none, nor do the statistics types, whose `=` is
+        // bytea's and text's both. Asked first, as PostgreSQL finds the operator before it reads a
+        // value.
         if let Shape::Column(c) = s {
             let ty = table.columns[c].ty;
             let has = match ty {
+                ColumnType::Textual(crate::textual::Textual::Aclitem) => {
+                    matches!(op, BinaryOperator::Eq)
+                }
+                ColumnType::Textual(t) => t.ordered(),
+                ColumnType::Internal(t) => t == crate::textual::Internal::NodeTree,
                 ColumnType::Xid => matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq),
                 ColumnType::Cid => matches!(op, BinaryOperator::Eq),
                 _ => true,

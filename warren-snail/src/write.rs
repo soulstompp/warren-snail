@@ -225,6 +225,85 @@ impl Rows {
                         let a = a.as_any().downcast_ref::<StringArray>().unwrap();
                         out.extend(a.iter().map(|v| v.map(str::to_string)));
                     }
+                    // A value of a type held as its text, read as its input reads it; a node tree
+                    // as it is.
+                    (
+                        Values::Text(out),
+                        ty @ (ColumnType::Textual(_) | ColumnType::Internal(_)),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View,
+                    ) => {
+                        let a = arrow::compute::cast(a, &DataType::Utf8)?;
+                        let a = a.as_any().downcast_ref::<StringArray>().unwrap();
+                        for v in a.iter() {
+                            out.push(match (v, ty) {
+                                (None, _) => None,
+                                (Some(s), ColumnType::Textual(t)) => {
+                                    Some(crate::textual::text_in(t, s)?)
+                                }
+                                (Some(s), ColumnType::Internal(t)) if t.copied() => {
+                                    Some(s.to_string())
+                                }
+                                (Some(_), ColumnType::Internal(t)) => return Err(t.refusal()),
+                                _ => unreachable!("a type held as its text"),
+                            });
+                        }
+                    }
+                    // An aclitem, its three fields made into the text the snail holds.
+                    (
+                        Values::Text(out),
+                        ColumnType::Textual(crate::textual::Textual::Aclitem),
+                        DataType::Struct(_),
+                    ) => {
+                        for r in 0..a.len() {
+                            out.push(if a.is_null(r) {
+                                None
+                            } else {
+                                Some(crate::strings::aclitem_at(a.as_ref(), r).ok_or_else(wrong)?)
+                            });
+                        }
+                    }
+                    // A geometric value, its float8s each a field of the group.
+                    (Values::Utf8(out), ColumnType::Geometric(_), DataType::Struct(fields))
+                        if fields.len() == c.ty.leaf_count() =>
+                    {
+                        let s = a
+                            .as_any()
+                            .downcast_ref::<arrow::array::StructArray>()
+                            .ok_or_else(wrong)?;
+                        let leaves: Vec<&arrow::array::Float64Array> = s
+                            .columns()
+                            .iter()
+                            .map(|l| l.as_any().downcast_ref::<arrow::array::Float64Array>())
+                            .collect::<Option<_>>()
+                            .ok_or_else(wrong)?;
+                        for r in 0..s.len() {
+                            out.push((!s.is_null(r)).then(|| {
+                                ByteArray::from(
+                                    leaves
+                                        .iter()
+                                        .flat_map(|l| l.value(r).to_bits().to_be_bytes())
+                                        .collect::<Vec<u8>>(),
+                                )
+                            }));
+                        }
+                    }
+                    // A statistics type's bytes, as they are; gtsvector's and the BRIN summaries'
+                    // NULLs alone.
+                    (
+                        Values::Utf8(out),
+                        ColumnType::Internal(t),
+                        DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+                    ) => {
+                        let a = arrow::compute::cast(a, &DataType::Binary)?;
+                        let a = a.as_any().downcast_ref::<BinaryArray>().unwrap();
+                        for v in a.iter() {
+                            out.push(match v {
+                                None => None,
+                                Some(_) if !t.copied() => return Err(t.refusal()),
+                                Some(b) => Some(ByteArray::from(b.to_vec())),
+                            });
+                        }
+                    }
                     (Values::Utf8(out), ty, dt)
                         if ty.is_bits() && *dt == crate::strings::string_arrow(ty) =>
                     {
@@ -330,7 +409,7 @@ fn row_value(ty: ColumnType, v: &Values, i: usize) -> crate::read::statement::Da
     match (ty, v) {
         (_, Values::Int(x)) => x[i].map_or(Datum::Null, Datum::Int),
         (_, Values::Wide(x)) => x[i].map_or(Datum::Null, Datum::Wide),
-        (ty, _) if ty.keyed_by_bytes() => v
+        (ty, _) if ty.held_as_bytes() => v
             .text_value(i)
             .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
         _ => v

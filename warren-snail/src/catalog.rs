@@ -100,6 +100,15 @@ pub enum ColumnType {
     },
     /// A timestamptz rounded to the digits after the second its precision names.
     TimestamptzRounded(u8),
+    /// A type held as PostgreSQL's text of each value: json, jsonb, jsonpath, xml, inet, cidr,
+    /// tsvector, tsquery or refcursor.
+    Textual(crate::textual::Textual),
+    /// A type only a server makes, which no literal gives: pg_node_tree and the statistics types,
+    /// held as copied, and gtsvector and the BRIN summaries, NULL only.
+    Internal(crate::textual::Internal),
+    /// A geometric type of fixed size, point, line, lseg, box or circle: its float8s, each a leaf of a
+    /// group.
+    Geometric(crate::geo::GeoKind),
 }
 
 impl ColumnType {
@@ -135,6 +144,10 @@ impl ColumnType {
             ColumnType::Uuid => Some(16),
             // Its two leaves, 4 bytes each.
             ColumnType::Tid => Some(8),
+            // Its grantee and grantor as oids, its privileges as 64 unsigned bits.
+            ColumnType::Textual(crate::textual::Textual::Aclitem) => Some(16),
+            // A float8 a leaf.
+            ColumnType::Geometric(k) => Some(8 * k.fixed_leaves().unwrap_or(0)),
             // Its bits as a fixed array of bytes, the last padded.
             ColumnType::Bit(n) => Some((n as usize).div_ceil(8)),
             ColumnType::Date => Some(4),
@@ -147,7 +160,9 @@ impl ColumnType {
             | ColumnType::Bpchar(_)
             | ColumnType::Name
             | ColumnType::Varbit(_)
-            | ColumnType::NumericText(_) => None,
+            | ColumnType::NumericText(_)
+            | ColumnType::Textual(_)
+            | ColumnType::Internal(_) => None,
             ColumnType::Composed(_) => None,
         }
     }
@@ -198,8 +213,23 @@ impl ColumnType {
                 }
                 _ => true,
             },
+            ColumnType::Geometric(_) => false,
+            ColumnType::Textual(t) => t.ordered(),
+            ColumnType::Internal(t) => t.ordered(),
             _ => true,
         }
+    }
+
+    /// Whether PostgreSQL has an equality it groups and finds DISTINCT values by, a B-tree's or a
+    /// hash's: every type it orders, xid and cid, aclitem.
+    pub fn grouped(self) -> bool {
+        self.ordered()
+            || matches!(
+                self,
+                ColumnType::Xid
+                    | ColumnType::Cid
+                    | ColumnType::Textual(crate::textual::Textual::Aclitem)
+            )
     }
 
     /// Whether its values are keyed in 128 bits.
@@ -283,22 +313,50 @@ impl ColumnType {
         matches!(self, ColumnType::Bit(_) | ColumnType::Varbit(_))
     }
 
-    /// Whether a level of it is keyed by bytes that need not be text: bytea's, or a bit string's.
+    /// Whether a level of it is keyed by bytes that need not be text: bytea's, a bit string's, the
+    /// statistics types', or the key of the class of a value held as its text that PostgreSQL
+    /// orders (jsonb, inet, cidr, tsvector, tsquery).
     pub fn keyed_by_bytes(self) -> bool {
-        matches!(self, ColumnType::Bytes) || self.is_bits()
+        match self {
+            ColumnType::Textual(t) => t.ordered() || t == crate::textual::Textual::Aclitem,
+            ColumnType::Internal(t) => t.is_bytes(),
+            t => matches!(t, ColumnType::Bytes) || t.is_bits(),
+        }
+    }
+
+    /// Whether its values are held as bytes rather than text: bytea's, a bit string's key, the
+    /// statistics types'.
+    pub fn held_as_bytes(self) -> bool {
+        match self {
+            ColumnType::Geometric(_) => true,
+            ColumnType::Internal(t) => t.is_bytes(),
+            t => matches!(t, ColumnType::Bytes) || t.is_bits(),
+        }
     }
 
     /// Whether its values are bytes of varying length, held as Parquet's byte arrays: a string's,
-    /// bytea's, or a numeric's held as its text.
+    /// bytea's, a numeric's held as its text, or a value of a type held as its text or only a server
+    /// makes.
     pub fn is_byte_array(self) -> bool {
-        matches!(self, ColumnType::Bytes | ColumnType::NumericText(_)) || self.is_string()
+        matches!(
+            self,
+            ColumnType::Bytes
+                | ColumnType::NumericText(_)
+                | ColumnType::Textual(_)
+                | ColumnType::Internal(_)
+                | ColumnType::Geometric(_)
+        ) || self.is_string()
     }
 
     /// Whether a level of it is keyed by text compared by its bytes: a string's, the key of a
-    /// numeric's class where it is held as its text, or a composed value's key written as text that
-    /// sorts as the key does.
+    /// numeric's class where it is held as its text, a composed value's key written as text that
+    /// sorts as the key does, or a pg_node_tree's text.
     pub fn keyed_by_text(self) -> bool {
-        matches!(self, ColumnType::NumericText(_)) || self.is_string() || self.is_nested()
+        matches!(
+            self,
+            ColumnType::NumericText(_) | ColumnType::Internal(crate::textual::Internal::NodeTree)
+        ) || self.is_string()
+            || self.is_nested()
     }
 
     /// Whether it is a timestamptz, rounded or not.
@@ -380,6 +438,9 @@ impl ColumnType {
                     precision_of(precision)
                 )
             }
+            ColumnType::Textual(t) => t.type_name().into(),
+            ColumnType::Internal(t) => t.type_name().into(),
+            ColumnType::Geometric(k) => k.name().into(),
         }
     }
 
@@ -422,6 +483,9 @@ impl ColumnType {
             ColumnType::Timestamp(_) => "timestamp_ops",
             ColumnType::Interval { .. } => "interval_ops",
             ColumnType::Composed(r) => r.def().default_opclass(),
+            ColumnType::Textual(t) => t.opclass().unwrap_or(""),
+            ColumnType::Internal(t) => t.opclass().unwrap_or(""),
+            ColumnType::Geometric(_) => "",
         }
     }
 
@@ -452,6 +516,38 @@ impl ColumnType {
             ColumnType::Tid => &[
                 ("block", ColumnType::Oid, 32),
                 ("offset", ColumnType::Oid, 16),
+            ],
+            // Its grantee and grantor, oids, and its privileges, the grant options in the high half.
+            ColumnType::Textual(crate::textual::Textual::Aclitem) => &[
+                ("grantee", ColumnType::Oid, 32),
+                ("grantor", ColumnType::Oid, 32),
+                ("privileges", ColumnType::Xid8, 64),
+            ],
+            // Its float8s, in the order PostgreSQL lays them out.
+            ColumnType::Geometric(crate::geo::GeoKind::Point) => {
+                &[("x", ColumnType::Float8, 0), ("y", ColumnType::Float8, 0)]
+            }
+            ColumnType::Geometric(crate::geo::GeoKind::Line) => &[
+                ("a", ColumnType::Float8, 0),
+                ("b", ColumnType::Float8, 0),
+                ("c", ColumnType::Float8, 0),
+            ],
+            ColumnType::Geometric(crate::geo::GeoKind::Lseg) => &[
+                ("x1", ColumnType::Float8, 0),
+                ("y1", ColumnType::Float8, 0),
+                ("x2", ColumnType::Float8, 0),
+                ("y2", ColumnType::Float8, 0),
+            ],
+            ColumnType::Geometric(crate::geo::GeoKind::Box) => &[
+                ("high_x", ColumnType::Float8, 0),
+                ("high_y", ColumnType::Float8, 0),
+                ("low_x", ColumnType::Float8, 0),
+                ("low_y", ColumnType::Float8, 0),
+            ],
+            ColumnType::Geometric(crate::geo::GeoKind::Circle) => &[
+                ("x", ColumnType::Float8, 0),
+                ("y", ColumnType::Float8, 0),
+                ("radius", ColumnType::Float8, 0),
             ],
             // Its length as an integer is held, its bits as bytea, the last byte padded.
             ColumnType::Varbit(_) => &[
@@ -650,6 +746,9 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
         (Composed(a), Composed(b)) => a == b,
         // text to regclass is regclass(text), an implicit cast; to any other reg* only explicit.
         (Text(_), Reg(crate::regs::RegKind::Class, _)) => true,
+        (Textual(a), Textual(b)) => crate::textual::assignable(a, b),
+        (Internal(a), Internal(b)) => a == b,
+        (Geometric(a), Geometric(b)) => a == b,
         _ => false,
     }
 }
@@ -1717,6 +1816,10 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Boolean | DataType::Bool => ColumnType::Boolean,
         DataType::Uuid => ColumnType::Uuid,
         DataType::Regclass => ColumnType::Reg(crate::regs::RegKind::Class, crate::regs::LATEST),
+        DataType::JSON => ColumnType::Textual(crate::textual::Textual::Json),
+        DataType::JSONB => ColumnType::Textual(crate::textual::Textual::Jsonb),
+        DataType::TsVector => ColumnType::Textual(crate::textual::Textual::Tsvector),
+        DataType::TsQuery => ColumnType::Textual(crate::textual::Textual::Tsquery),
         DataType::Real | DataType::Float4 => ColumnType::Float4,
         DataType::DoublePrecision | DataType::Float8 | DataType::Float(ExactNumberInfo::None) => {
             ColumnType::Float8
@@ -1761,6 +1864,22 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                     range: crate::times::INTERVAL_FULL_RANGE,
                     precision: None,
                 },
+                other if crate::textual::Textual::of_type_name(other).is_some() => {
+                    ColumnType::Textual(crate::textual::Textual::of_type_name(other).unwrap())
+                }
+                other if crate::geo::GeoKind::of_name(other).is_some() => {
+                    let k = crate::geo::GeoKind::of_name(other).unwrap();
+                    if k.fixed_leaves().is_none() {
+                        return Err(Error::new(format!(
+                            "the type {other} is not held yet: its points are a list, which the \
+                             repeated leaf holds"
+                        )));
+                    }
+                    ColumnType::Geometric(k)
+                }
+                other if crate::textual::Internal::of_type_name(other).is_some() => {
+                    ColumnType::Internal(crate::textual::Internal::of_type_name(other).unwrap())
+                }
                 other => match crate::regs::RegKind::of_type_name(other) {
                     Some(kind) => ColumnType::Reg(kind, crate::regs::LATEST),
                     None => {
@@ -2494,7 +2613,7 @@ mod tests {
     fn a_ddl_is_read_a_statement_at_a_time_each_taken_or_refused_by_name() {
         let r = Catalog::read(
             "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));
-             CREATE TABLE s.u (a jsonb NOT NULL, PRIMARY KEY (a));
+             CREATE TABLE s.u (a s.unknown NOT NULL, PRIMARY KEY (a));
              CREATE INDEX ua ON s.u (a);
              CREATE INDEX tg ON s.t USING gin (a);
              CREATE INDEX tp ON s.t (a) WHERE a > 0;
@@ -2508,7 +2627,14 @@ mod tests {
             .map(|s| (s.object.as_str(), s.refused.as_deref()))
             .collect();
         assert_eq!(read[0], ("s.t", None));
-        assert!(read[1].1.unwrap().contains("the type jsonb is not held"));
+        assert!(
+            read[1]
+                .1
+                .unwrap()
+                .contains("the type s.unknown is not held"),
+            "{:?}",
+            read[1]
+        );
         assert_eq!(read[2].1, Some("ua is on s.u, which is refused"));
         assert!(read[3].1.unwrap().contains("USING gin is not held yet"));
         assert!(read[4].1.unwrap().contains("a partial index, WHERE a > 0"));

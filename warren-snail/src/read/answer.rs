@@ -1293,6 +1293,24 @@ impl Answer {
                                 .collect::<TimestampMicrosecondArray>()
                                 .with_timezone("UTC"),
                         ),
+                        // A cidr's min and max are inet's, an inet.
+                        ColumnType::Textual(t)
+                            if t.is_network() && !matches!(*item, Item::Key(_)) =>
+                        {
+                            let inet: Vec<Option<String>> = rows
+                                .iter()
+                                .map(|r| match &r[i] {
+                                    Cell::Keyed(k) => crate::textual::cast(
+                                        t,
+                                        crate::textual::Textual::Inet,
+                                        k.image.as_str(),
+                                    )
+                                    .ok(),
+                                    _ => None,
+                                })
+                                .collect();
+                            Arc::new(inet.iter().map(Option::as_deref).collect::<StringArray>())
+                        }
                         ty if ty.is_byte_array() || ty.is_bits() => crate::strings::string_array(
                             ty,
                             rows.iter().map(|r| match &r[i] {
@@ -1415,14 +1433,27 @@ impl Answer {
                 }
                 _ => None,
             };
-            // A name's min and max are text's, as PostgreSQL reads them through text.
+            // A name's and a node tree's min and max are text's, as PostgreSQL reads them through
+            // text; a cidr's are inet's.
             let named = match *item {
                 Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) => {
-                    Some(tables[c.side].columns[c.column].ty).filter(|&t| {
-                        crate::strings::is_named(t)
-                            && !(matches!(*item, Item::Least(_) | Item::Greatest(_))
-                                && t == ColumnType::Name)
-                    })
+                    let extreme = matches!(*item, Item::Least(_) | Item::Greatest(_));
+                    match tables[c.side].columns[c.column].ty {
+                        ColumnType::Textual(crate::textual::Textual::Cidr) if extreme => {
+                            Some(ColumnType::Textual(crate::textual::Textual::Inet))
+                        }
+                        t => Some(t).filter(|&t| {
+                            crate::strings::is_named(t)
+                                && !(extreme
+                                    && matches!(
+                                        t,
+                                        ColumnType::Name
+                                            | ColumnType::Internal(
+                                                crate::textual::Internal::NodeTree
+                                            )
+                                    ))
+                        }),
+                    }
                 }
                 _ => None,
             };

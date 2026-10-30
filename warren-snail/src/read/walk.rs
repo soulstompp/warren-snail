@@ -765,12 +765,18 @@ impl Snail {
                         (ty.is_byte_array() || ty.is_bits(), month, start, v)
                     })
                     .collect();
-                // The columns read whose values are compared by a key other than their bytes: a
-                // bpchar's, without its trailing blanks; a string's under a library collation, by
+                // The columns read whose values are compared by a key other than their bytes, each
+                // its type: a bpchar's, without its trailing blanks; a jsonb's, an inet's, a
+                // tsvector's or a tsquery's, its class's; a string's under a library collation, by
                 // the collation's key.
-                let keyed: Vec<bool> = columns
+                let keyed: Vec<Option<ColumnType>> = columns
                     .iter()
-                    .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::Bpchar(_)))
+                    .map(|&(c, _)| {
+                        let ty = table.columns[c].ty;
+                        matches!(ty, ColumnType::Bpchar(_) | ColumnType::Textual(_))
+                            .then_some(ty)
+                            .filter(|t| t.keyed_by_bytes() || matches!(t, ColumnType::Bpchar(_)))
+                    })
                     .collect();
                 let collated: Vec<(ColumnType, Coll)> = columns
                     .iter()
@@ -904,10 +910,10 @@ impl Snail {
                                 x[i].clone().map_or(Cell::Null, Cell::Composed)
                             } else if let Values::Dict { codes, .. } = v {
                                 codes[i].map_or(Cell::Null, Cell::Code)
-                            } else if keyed[o] {
+                            } else if let Some(ty) = keyed[o] {
                                 v.text_value(i).map_or(Cell::Null, |t| {
                                     let key: Box<[u8]> =
-                                        crate::strings::bpchar_key(t.data()).into();
+                                        crate::strings::key_bytes(ty, t.data()).into();
                                     Cell::Keyed(crate::read::answer::Keyed::new(key, t))
                                 })
                             } else if classed[o] {

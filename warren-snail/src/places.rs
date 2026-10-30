@@ -315,7 +315,12 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             | ColumnType::Name
             | ColumnType::NumericText(_)
             | ColumnType::Bytes
-            | ColumnType::Varbit(_) => (text_sublevels & !crate::directory::BYTES_LEVEL) as usize,
+            | ColumnType::Varbit(_)
+            | ColumnType::Textual(_)
+            | ColumnType::Internal(_)
+            | ColumnType::Geometric(_) => {
+                (text_sublevels & !crate::directory::BYTES_LEVEL) as usize
+            }
             // An enum by its rank's bits; any other composed type by its key written as text.
             ColumnType::Composed(r) if crate::composed::is_nested(r) => text_sublevels as usize,
             ColumnType::Composed(_) => 32,
@@ -424,8 +429,11 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             | ColumnType::Name
             | ColumnType::Bit(_)
             | ColumnType::Varbit(_)
-            | ColumnType::NumericText(_) => {
-                unreachable!("a level of a string or a numeric text keys text, a bit string bytes")
+            | ColumnType::NumericText(_)
+            | ColumnType::Geometric(_)
+            | ColumnType::Textual(_)
+            | ColumnType::Internal(_) => {
+                unreachable!("a level of a string or a numeric text keys text; of a bit string, bytea or a value held as its text, bytes")
             }
             ColumnType::Uuid => unreachable!("a uuid level keys 128 bits"),
         },

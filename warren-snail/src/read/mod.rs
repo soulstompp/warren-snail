@@ -1037,7 +1037,10 @@ impl Snail {
                 }
                 return self.ask_pipeline(&r, params);
             }
-            if pipeline::is_pipeline(q) || pipeline::tests_composite_null(&self.catalog, q) {
+            if pipeline::is_pipeline(q)
+                || pipeline::tests_composite_null(&self.catalog, q)
+                || pipeline::reads_geometric(&self.catalog, q)
+            {
                 if order.is_some() && pipeline::is_pipeline(q) {
                     return Err(Error::new("a pipeline reads its table along its own order"));
                 }
