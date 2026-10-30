@@ -700,3 +700,91 @@ fn an_array_slice_answers_as_postgresql_s() {
         );
     }
 }
+
+#[test]
+fn p8_an_array_of_a_geometric_type_or_an_aclitem_comes_back_from_its_pages() {
+    use warren_snail::geo::GeoKind;
+    // Each array as PostgreSQL 18.6 wrote it (28818, 2026-10-30), box's elements between `;`; an
+    // aclitem's roles as their OIDs, as the snail prints every role.
+    for (ty, written) in [
+        (
+            ColumnType::Geometric(GeoKind::Point),
+            "{\"(1,2)\",\"(0,0)\"}",
+        ),
+        (
+            ColumnType::Geometric(GeoKind::Box),
+            "{(1,1),(0,0);(2,2),(1,1)}",
+        ),
+        (ColumnType::Geometric(GeoKind::Circle), "{\"<(0,0),1>\"}"),
+        (ColumnType::Geometric(GeoKind::Lseg), "{\"[(0,0),(1,1)]\"}"),
+        (ColumnType::Geometric(GeoKind::Line), "{\"{1,-1,0}\"}"),
+        (
+            ColumnType::Textual(warren_snail::textual::Textual::Aclitem),
+            "{=r/6171,3373=rw*/3373}",
+        ),
+    ] {
+        let a = array_of(ty);
+        let item = text_in(a, written).unwrap();
+        assert_eq!(text_out(a, &item), written);
+        let Item::Array { elements, .. } = &item else {
+            unreachable!()
+        };
+        let mut values = vec![Item::Null, array(vec![]), item.clone()];
+        values.push(array(
+            elements.iter().cloned().chain([Item::Null]).collect(),
+        ));
+        round_trip(a, &values);
+    }
+}
+
+const UNEQUAL: &str = "CREATE TABLE s.u (id integer NOT NULL, j json[], p point[], x xid[], \
+    PRIMARY KEY (id));";
+
+#[test]
+fn an_array_whose_element_has_no_equality_is_compared_by_none() {
+    let mut snail = snail_of(
+        "elements-unequal",
+        UNEQUAL,
+        &[
+            &[Some("{\"{}\"}"), Some("{\"[]\"}")],
+            &[Some("{\"(1,2)\"}"), Some("{}")],
+            &[Some("{1}"), Some("{1}")],
+        ],
+    );
+    let step = "WITH q AS (SELECT id, j, p, x FROM s.u)";
+    // As PostgreSQL 18.6 answered or refused each (28818, 2026-10-30): json and point have no
+    // equality, xid one but no order.
+    for (q, refused) in [
+        ("SELECT id, (j = j) AS a FROM q", true),
+        ("SELECT id, (j IS DISTINCT FROM j) AS a FROM q", true),
+        ("SELECT id, (j @> j) AS a FROM q", true),
+        ("SELECT id, (p = p) AS a FROM q", true),
+        ("SELECT id, (x = x) AS a FROM q", false),
+        ("SELECT id, (x @> x) AS a FROM q", false),
+        ("SELECT id, (x < x) AS a FROM q", true),
+        ("SELECT j, count(*) AS n FROM q GROUP BY j", true),
+        ("SELECT x, count(*) AS n FROM q GROUP BY x", false),
+        ("SELECT min(j) AS a FROM q WHERE id = 1", false),
+        ("SELECT min(j) AS a FROM q", true),
+    ] {
+        let r = snail.ask(&format!("{step} {q}"), None);
+        assert_eq!(r.is_err(), refused, "{q}: {:?}", r.err());
+    }
+    for (q, refused) in [
+        ("SELECT id FROM s.u WHERE j = '{\"{}\"}'", true),
+        ("SELECT id FROM s.u WHERE j = NULL", false),
+        ("SELECT id FROM s.u WHERE x = '{1}'", false),
+        ("SELECT a.id FROM s.u a JOIN s.u b ON a.j = b.j", true),
+        ("SELECT a.id FROM s.u a JOIN s.u b ON a.x = b.x", false),
+    ] {
+        let r = snail.ask(q, None);
+        assert_eq!(r.is_err(), refused, "{q}: {:?}", r.err());
+        if let Err(e) = r {
+            assert!(
+                e.to_string()
+                    .contains("could not identify an equality operator for type json"),
+                "{q}: {e}"
+            );
+        }
+    }
+}

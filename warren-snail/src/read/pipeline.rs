@@ -235,7 +235,13 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
-        (Value::Composed(a, x), Value::Composed(b, y)) if a == b => x.key.cmp(&y.key),
+        (Value::Composed(a, x), Value::Composed(b, y)) if a == b => {
+            // An array's or a composite's = asks each part's equality first.
+            if let Some(part) = a.unequal_part() {
+                return Err(unequal(part));
+            }
+            x.key.cmp(&y.key)
+        }
         (Value::Composed(a, _), Value::Composed(b, _)) => {
             return Err(Error::new(format!(
                 "operator does not exist: {} = {}",
@@ -337,10 +343,18 @@ fn key(v: &Value) -> Key {
     }
 }
 
+/// Why a value of a type PostgreSQL finds no equality for is compared by none.
+fn unequal(part: ColumnType) -> Error {
+    Error::new(format!(
+        "could not identify an equality operator for type {}",
+        part.pg_name()
+    ))
+}
+
 /// A value as a key that groups, refused where PostgreSQL has no equality to group it by.
 fn grouped_key(v: &Value) -> Result<Key> {
     match v {
-        Value::Typed(ty, _) if !ty.grouped() => Err(Error::new(format!(
+        Value::Typed(ty, _) | Value::Composed(ty, _) if !ty.grouped() => Err(Error::new(format!(
             "could not identify an equality operator for type {}",
             ty.pg_name()
         ))),
@@ -3011,7 +3025,8 @@ impl Acc {
                     ty.pg_name()
                 )));
             }
-            if !ty.ordered() && matches!(self, Acc::Least(_) | Acc::Greatest(_)) {
+            // min and max compare a second value with the first.
+            if !ty.ordered() && matches!(self, Acc::Least(Some(_)) | Acc::Greatest(Some(_))) {
                 return Err(Error::new(format!(
                     "could not identify a comparison function for type {}",
                     ty.pg_name()
@@ -4761,6 +4776,9 @@ fn composed_op(
             let (Some(a), Some(b)) = (a, b) else {
                 return Err(no());
             };
+            if let Some(part) = ty.unequal_part() {
+                return Err(unequal(part));
+            }
             Ok(Some(Value::Bool(crate::composed::array_op(
                 ty, name, &a, &b,
             )?)))

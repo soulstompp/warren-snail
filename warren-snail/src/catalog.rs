@@ -221,8 +221,12 @@ impl ColumnType {
     }
 
     /// Whether PostgreSQL has an equality it groups and finds DISTINCT values by, a B-tree's or a
-    /// hash's: every type it orders, xid and cid, aclitem.
+    /// hash's: every type it orders, xid and cid, aclitem; an array or a composite where each of
+    /// its parts has one.
     pub fn grouped(self) -> bool {
+        if let ColumnType::Composed(_) = self {
+            return self.unequal_part().is_none();
+        }
         self.ordered()
             || matches!(
                 self,
@@ -230,6 +234,23 @@ impl ColumnType {
                     | ColumnType::Cid
                     | ColumnType::Textual(crate::textual::Textual::Aclitem)
             )
+    }
+
+    /// The part PostgreSQL finds no equality for, which an array's or a composite's `=` asks of
+    /// each element or field: the type itself, an array's element's, or a composite's first such
+    /// field's; none where it has one.
+    pub fn unequal_part(self) -> Option<ColumnType> {
+        match self {
+            ColumnType::Composed(r) => match r.def() {
+                crate::composed::Composed::Array { element, .. } => element.unequal_part(),
+                crate::composed::Composed::Record { fields, .. } => {
+                    fields.iter().find_map(|f| f.ty.unequal_part())
+                }
+                _ => None,
+            },
+            ty if ty.grouped() => None,
+            ty => Some(ty),
+        }
     }
 
     /// Whether its values are keyed in 128 bits.

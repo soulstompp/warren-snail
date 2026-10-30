@@ -1481,7 +1481,8 @@ impl Conj {
 /// composed type the one it is; cidr inet's, and pg_node_tree text's. Where PostgreSQL has no
 /// `=` that is equality of the values, its refusal: none at all, on point, json, jsonpath, xml,
 /// refcursor and the index summaries; one too many, on the statistics types; one that compares
-/// areas, lengths or points within a tolerance, on the other geometric types.
+/// areas, lengths or points within a tolerance, on the other geometric types; none for an array or a
+/// composite one of whose parts has no equality.
 fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
     use crate::textual::{Internal, Textual};
     let none = || format!("operator does not exist: {0} = {0}", ty.pg_name());
@@ -1515,6 +1516,13 @@ fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
                 "a join on {} is not read: its = compares areas, lengths or points within a \
                  tolerance, not the values",
                 ty.pg_name()
+            ))
+        }
+        // An array's or a composite's = asks each part's equality first.
+        ColumnType::Composed(_) if ty.unequal_part().is_some() => {
+            return Err(format!(
+                "could not identify an equality operator for type {}",
+                ty.unequal_part().unwrap().pg_name()
             ))
         }
         ColumnType::Bytes
@@ -1771,6 +1779,13 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
                 return Err(Error::new(format!(
                     "could not identify a comparison function for type {}",
                     ty.pg_name()
+                )));
+            }
+            // An array's or a composite's = asks each part's equality first.
+            if let Some(part) = ty.unequal_part().filter(|_| ty.is_nested()) {
+                return Err(Error::new(format!(
+                    "could not identify an equality operator for type {}",
+                    part.pg_name()
                 )));
             }
             // A numeric held as its text, by its class's key; a composed value by its key,

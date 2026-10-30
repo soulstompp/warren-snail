@@ -569,10 +569,9 @@ pub fn scalar_in(ty: ColumnType, s: &str) -> Result<Datum> {
             }
             _ => Datum::Compound(Arc::new(Compound::new(ty, text_in(ty, s)?))),
         },
-        // A type held as its text, by its input; aclitem's three leaves are a group.
-        ColumnType::Textual(t) if t != crate::textual::Textual::Aclitem => {
-            Datum::Text(crate::textual::text_in(t, s)?)
-        }
+        // A type held as its text, by its input.
+        ColumnType::Textual(t) => Datum::Text(crate::textual::text_in(t, s)?),
+        ColumnType::Geometric(k) => Datum::Bytes(crate::geo::geo_bytes(&crate::geo::geo_in(k, s)?)),
         ColumnType::Interval { range, precision } => Datum::Interval(crate::times::interval_in(
             s,
             range,
@@ -597,6 +596,9 @@ pub fn scalar_out(ty: ColumnType, d: &Datum) -> String {
         (_, Datum::Compound(c)) => text_out(ty, &c.item),
         (ColumnType::Boolean, Datum::Int(v)) => if *v != 0 { "t" } else { "f" }.into(),
         (ColumnType::Textual(t), Datum::Text(s)) => crate::textual::text_out(t, s).into_owned(),
+        (ColumnType::Geometric(k), Datum::Bytes(b)) => crate::geo::geo_of_bytes(k, b)
+            .map(|g| crate::geo::geo_out(&g))
+            .unwrap_or_default(),
         (ColumnType::Composed(r), Datum::Int(k)) => match r.def() {
             Composed::Enum { labels, .. } => labels[*k as usize].clone(),
             _ => k.to_string(),
@@ -656,6 +658,7 @@ pub fn text_in(ty: ColumnType, s: &str) -> Result<Item> {
 /// unquoted NULL in any case a NULL; a backslash before any character that character.
 fn array_in(element: ColumnType, s: &str) -> Result<Item> {
     let b = s.as_bytes();
+    let delim = delimiter(element);
     let bad = |why: &str| malformed("array", s, why);
     let mut p = 0;
     let mut dims: Vec<i32> = Vec::new();
@@ -749,7 +752,7 @@ fn array_in(element: ColumnType, s: &str) -> Result<Item> {
     let end = || bad("Unexpected end of input.");
     loop {
         // The next token.
-        while p < b.len() && is_space(b[p]) && b[p] != b',' {
+        while p < b.len() && is_space(b[p]) && b[p] != delim {
             p += 1;
         }
         let Some(&c) = b.get(p) else {
@@ -795,10 +798,10 @@ fn array_in(element: ColumnType, s: &str) -> Result<Item> {
                     break;
                 }
             }
-            b',' => {
+            c if c == delim => {
                 p += 1;
                 if !expect_delim {
-                    return Err(bad("Unexpected \",\" character."));
+                    return Err(bad(&format!("Unexpected \"{}\" character.", delim as char)));
                 }
                 expect_delim = false;
             }
@@ -822,7 +825,7 @@ fn array_in(element: ColumnType, s: &str) -> Result<Item> {
                                 loop {
                                     match b.get(p) {
                                         None => return Err(end()),
-                                        Some(b',' | b'}' | b'{') => break,
+                                        Some(&x) if x == delim || x == b'}' || x == b'{' => break,
                                         Some(&x) if is_space(x) => p += 1,
                                         Some(_) => {
                                             return Err(bad("Incorrectly quoted array element."))
@@ -853,7 +856,7 @@ fn array_in(element: ColumnType, s: &str) -> Result<Item> {
                                 escaped = true;
                                 p += 1;
                             }
-                            Some(b',' | b'}') => break,
+                            Some(&x) if x == delim || x == b'}' => break,
                             Some(&x) => {
                                 buf.push(x);
                                 if !is_space(x) {
@@ -1359,11 +1362,20 @@ pub fn canonical_ranges(range: ColumnType, ranges: Vec<Item>) -> Vec<Item> {
 
 /// Whether a part's text must be quoted in an array: empty, NULL in any case, or holding a quote, a
 /// backslash, a brace, a comma or white space.
-fn array_quoted(t: &str) -> bool {
+fn array_quoted(t: &str, delim: u8) -> bool {
     t.is_empty()
         || t.eq_ignore_ascii_case("NULL")
         || t.bytes()
-            .any(|c| matches!(c, b'"' | b'\\' | b'{' | b'}' | b',') || is_space(c))
+            .any(|c| matches!(c, b'"' | b'\\' | b'{' | b'}') || c == delim || is_space(c))
+}
+
+/// The character an array of a type writes between its elements: box's `;`, every other's `,`.
+fn delimiter(element: ColumnType) -> u8 {
+    if element == ColumnType::Geometric(crate::geo::GeoKind::Box) {
+        b';'
+    } else {
+        b','
+    }
 }
 
 /// A part's text quoted where it must be: a quote and a backslash each doubled inside a record's or
@@ -1421,7 +1433,7 @@ pub fn text_out(ty: ColumnType, item: &Item) -> String {
                         "NULL".to_string()
                     } else {
                         let t = part_text(*element, e);
-                        if array_quoted(&t) {
+                        if array_quoted(&t, delimiter(*element)) {
                             quoted(&t, false)
                         } else {
                             t
@@ -1429,7 +1441,7 @@ pub fn text_out(ty: ColumnType, item: &Item) -> String {
                     }
                 })
                 .collect();
-            nest(&mut out, &texts, dims);
+            nest(&mut out, &texts, dims, delimiter(*element) as char);
             out
         }
         (Composed::Record { fields, .. }, Item::Record(values)) => {
@@ -1478,11 +1490,11 @@ pub fn text_out(ty: ColumnType, item: &Item) -> String {
 }
 
 /// An array's element texts in braces, a pair of them a dimension, the last dimension innermost.
-fn nest(out: &mut String, texts: &[String], dims: &[i32]) {
+fn nest(out: &mut String, texts: &[String], dims: &[i32], delim: char) {
     match dims {
         [] | [_] => {
             out.push('{');
-            out.push_str(&texts.join(","));
+            out.push_str(&texts.join(&delim.to_string()));
             out.push('}');
         }
         [first, rest @ ..] => {
@@ -1490,9 +1502,9 @@ fn nest(out: &mut String, texts: &[String], dims: &[i32]) {
             out.push('{');
             for (i, chunk) in texts.chunks(step.max(1)).enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.push(delim);
                 }
-                nest(out, chunk, rest);
+                nest(out, chunk, rest, delim);
             }
             out.push('}');
         }
@@ -1770,7 +1782,8 @@ enum Tree {
 
 /// A value of an element type held as a group of leaves, on its leaves: a tid's block number and
 /// offset, each keyed in its own bits; a timetz's time and zone; an interval's months, days and
-/// microseconds; a bit varying's length and bits.
+/// microseconds; a bit varying's length and bits; an aclitem's grantee, grantor and privileges, each
+/// keyed in its own bits; a geometric value's float8s.
 fn grouped(ty: ColumnType, d: &Datum) -> Tree {
     let int = |v: i64| Tree::Leaf(Datum::Int(v));
     match (ty, d) {
@@ -1794,6 +1807,21 @@ fn grouped(ty: ColumnType, d: &Datum) -> Tree {
             let (len, bits) = crate::strings::bits_of_key(k);
             Tree::Group(vec![int(i64::from(len)), Tree::Leaf(Datum::Bytes(bits))])
         }
+        (ColumnType::Textual(crate::textual::Textual::Aclitem), Datum::Text(s)) => {
+            match crate::textual::aclitem_parse(s) {
+                Ok((grantee, grantor, privileges)) => Tree::Group(vec![
+                    int(crate::scalars::unsigned_key(u64::from(grantee), 32)),
+                    int(crate::scalars::unsigned_key(u64::from(grantor), 32)),
+                    int(crate::scalars::unsigned_key(privileges, 64)),
+                ]),
+                Err(_) => Tree::Null,
+            }
+        }
+        (ColumnType::Geometric(_), Datum::Bytes(b)) => Tree::Group(
+            b.chunks(8)
+                .map(|x| Tree::Leaf(Datum::Float8(u64::from_be_bytes(x.try_into().unwrap()))))
+                .collect(),
+        ),
         _ => Tree::Null,
     }
 }
@@ -1821,6 +1849,24 @@ fn ungrouped(ty: ColumnType, parts: &[Tree]) -> Option<Datum> {
         }),
         (ColumnType::Varbit(_), [Leaf(Datum::Int(len)), Leaf(Datum::Bytes(bits))]) => {
             Datum::Bytes(crate::strings::bits_key(*len as u32, bits))
+        }
+        (
+            ColumnType::Textual(crate::textual::Textual::Aclitem),
+            [Leaf(Datum::Int(grantee)), Leaf(Datum::Int(grantor)), Leaf(Datum::Int(privileges))],
+        ) => Datum::Text(crate::textual::aclitem_text(
+            crate::scalars::unsigned_of(*grantee, 32) as u32,
+            crate::scalars::unsigned_of(*grantor, 32) as u32,
+            crate::scalars::unsigned_of(*privileges, 64),
+        )),
+        (ColumnType::Geometric(_), parts) => {
+            let mut b = Vec::with_capacity(8 * parts.len());
+            for p in parts {
+                let Leaf(Datum::Float8(x)) = p else {
+                    return None;
+                };
+                b.extend_from_slice(&x.to_be_bytes());
+            }
+            Datum::Bytes(b)
         }
         _ => return None,
     })
