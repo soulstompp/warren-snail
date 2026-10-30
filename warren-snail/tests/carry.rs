@@ -10,6 +10,7 @@ mod weather;
 use std::cell::RefCell;
 #[cfg(feature = "standalone")]
 use std::os::unix::fs::FileExt;
+#[cfg(feature = "standalone")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "standalone")]
 use std::rc::Rc;
@@ -19,9 +20,11 @@ use warren_snail::carry::{self, Commit, Host};
 use warren_snail::file::Stop;
 #[cfg(feature = "standalone")]
 use warren_snail::read::Snail;
+#[cfg(feature = "standalone")]
 use weather::*;
 
 /// Every file of a snail: the first, then `<path>.1` and on.
+#[cfg(feature = "standalone")]
 fn files_of(path: &Path) -> Vec<PathBuf> {
     let mut out = vec![path.to_path_buf()];
     for n in 1.. {
@@ -37,6 +40,7 @@ fn files_of(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Whether two snails' files are the same, file for file and byte for byte.
+#[cfg(feature = "standalone")]
 fn same_bytes(a: &Path, b: &Path) -> bool {
     let (x, y) = (files_of(a), files_of(b));
     x.len() == y.len()
@@ -46,6 +50,7 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
 }
 
 /// Nothing left at a snail's path, nor at any of its further files.
+#[cfg(feature = "standalone")]
 fn removed(path: &Path) -> PathBuf {
     for p in files_of(path) {
         let _ = std::fs::remove_file(p);
@@ -54,6 +59,7 @@ fn removed(path: &Path) -> PathBuf {
 }
 
 /// A copy of a snail's files, made with no snail open on them.
+#[cfg(feature = "standalone")]
 fn copied(from: &Path, to: &Path) -> PathBuf {
     removed(to);
     for (n, p) in files_of(from).iter().enumerate() {
@@ -150,6 +156,7 @@ impl Host for Sent {
 /// station, which moves it on the table's order; a reading deleted; a transaction of five; a reading
 /// written, checked and deleted again, once pages are being reused; and every reading of the
 /// busiest station deleted.
+#[cfg(feature = "standalone")]
 fn stream(s: &Sample) -> Vec<Vec<String>> {
     let (bn, bs) = busiest(s);
     let (n1, s1, _) = in_order(s)[10];
@@ -194,6 +201,7 @@ fn stream(s: &Sample) -> Vec<Vec<String>> {
 
 /// The questions a follower is held to the leader on: every kind of read, along every order that
 /// serves it, the rows the stream changes among them.
+#[cfg(feature = "standalone")]
 fn questions(s: &Sample) -> Vec<String> {
     let (bn, bs) = busiest(s);
     let join =
