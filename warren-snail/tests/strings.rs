@@ -1037,3 +1037,26 @@ fn the_string_types_are_read_from_their_spellings() {
         assert!(e.contains(why), "{ddl}: {e}");
     }
 }
+
+#[test]
+fn a_bit_string_shared_by_two_rows_of_a_unique_key_is_named_by_its_bits() {
+    let catalog = Catalog::parse("CREATE TABLE s.t (v bit(5) NOT NULL, PRIMARY KEY (v));").unwrap();
+    let k = || {
+        Some(ByteArray::from(
+            bits_parse("10100", Some(5), false).unwrap(),
+        ))
+    };
+    let e = write(
+        &tmp("bits-unique.snail"),
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![Values::Utf8(vec![k(), k()])],
+            },
+        )],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("['10100']"), "{e}");
+}

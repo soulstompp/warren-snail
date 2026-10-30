@@ -18,7 +18,8 @@ pub enum ColumnType {
     Int4,
     Int8,
     Timestamptz,
-    /// Text, compared by its bytes, with the most characters a value may hold.
+    /// Text, compared by its bytes, with the most characters a value may hold: none for text, and
+    /// `VARCHAR` for varchar without a length.
     Text(Option<u32>),
     /// Bytes, compared byte by byte.
     Bytes,
@@ -75,6 +76,9 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
+    /// The length of a varchar declared without one: more characters than any value can hold.
+    pub const VARCHAR: u32 = u32::MAX;
+
     /// Bytes a value takes, plain, where every value takes the same: what the file writes, so a
     /// smallint, written as Parquet's INT32, takes 4.
     pub fn width(self) -> Option<usize> {
@@ -219,6 +223,7 @@ impl ColumnType {
             ColumnType::Int8 => "bigint".into(),
             ColumnType::Timestamptz => "timestamptz".into(),
             ColumnType::Text(None) => "text".into(),
+            ColumnType::Text(Some(ColumnType::VARCHAR)) => "varchar".into(),
             ColumnType::Text(Some(n)) => format!("varchar({n})"),
             ColumnType::Bytes => "bytea".into(),
             ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
@@ -236,6 +241,7 @@ impl ColumnType {
             ColumnType::Int8 => "bigint".into(),
             ColumnType::Timestamptz => "timestamp with time zone".into(),
             ColumnType::Text(None) => "text".into(),
+            ColumnType::Text(Some(ColumnType::VARCHAR)) => "character varying".into(),
             ColumnType::Text(Some(n)) => format!("character varying({n})"),
             ColumnType::Bytes => "bytea".into(),
             ColumnType::Numeric { precision, scale } => format!("numeric({precision},{scale})"),
@@ -1289,11 +1295,9 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Varchar(length)
         | DataType::CharacterVarying(length)
         | DataType::CharVarying(length) => ColumnType::Text(match length {
-            None => None,
+            None => Some(ColumnType::VARCHAR),
             Some(CharacterLength::IntegerLength { length, unit: None }) => {
-                Some(u32::try_from(*length).map_err(|_| {
-                    Error::new(format!("{}: the length is out of range", spelled(dt)))
-                })?)
+                Some(type_length(*length, "varchar", MAX_LENGTH)?)
             }
             Some(_) => {
                 return Err(Error::new(format!(
@@ -1965,9 +1969,10 @@ mod tests {
                 ColumnType::Text(Some(64)),
                 ColumnType::Text(Some(255)),
                 ColumnType::Text(None),
-                ColumnType::Text(None)
+                ColumnType::Text(Some(ColumnType::VARCHAR))
             ]
         );
+        assert_eq!(types[4].pg_name(), "character varying");
         assert_eq!(types[1].width(), None);
     }
 

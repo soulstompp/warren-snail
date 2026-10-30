@@ -146,6 +146,7 @@ pub fn shown_as(key: &[KeyValue], types: &[ColumnType]) -> String {
         key.iter()
             .zip(types)
             .map(|(v, &ty)| match v {
+                KeyValue::Bytes(k) if ty.is_bits() => format!("'{}'", crate::strings::bits_text(k)),
                 KeyValue::Int(k) if crate::scalars::is_scalar(ty) => {
                     let t = crate::scalars::scalar_text(ty, *k);
                     if t.bytes().all(|b| b.is_ascii_digit()) {
