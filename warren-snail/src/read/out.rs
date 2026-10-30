@@ -45,16 +45,20 @@ pub struct TableOut {
     pub pruned: u64,
 }
 
-/// A value's least or greatest, as Parquet orders the column: a number, or bytes.
+/// A value's least or greatest, as Parquet orders the column: a number, bytes, or a float by its
+/// key, then its own bits.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Extreme {
     Int(i64),
     Bytes(Vec<u8>),
+    Float(i64, u64),
 }
 
 impl Extreme {
     fn plain(&self, physical: PhysicalType) -> Vec<u8> {
         match (self, physical) {
+            (Extreme::Float(_, b), PhysicalType::FLOAT) => (*b as u32).to_le_bytes().to_vec(),
+            (Extreme::Float(_, b), _) => b.to_le_bytes().to_vec(),
             (Extreme::Int(v), PhysicalType::INT32) => (*v as i32).to_le_bytes().to_vec(),
             (Extreme::Int(v), PhysicalType::BOOLEAN) => vec![*v as u8],
             (Extreme::Int(v), _) => v.to_le_bytes().to_vec(),
@@ -64,7 +68,8 @@ impl Extreme {
 }
 
 /// The least and greatest of rows `from..to` present, and the rows NULL among them, in a leaf held
-/// as `ty`, an unsigned number of `bits` bits where it holds one.
+/// as `ty`, an unsigned number of `bits` bits where it holds one. A float's are as the plain parquet
+/// library writes them: a NaN neither, and a zero least `-0` and a zero greatest `0`.
 fn extremes(
     values: &Values,
     ty: ColumnType,
@@ -75,38 +80,58 @@ fn extremes(
     let mut out: Option<(Extreme, Extreme)> = None;
     let mut nulls = 0;
     for i in from..to {
+        if values.is_null(i) {
+            nulls += 1;
+            continue;
+        }
         let v = match values {
             Values::Int(_) => values.int(i).map(Extreme::Int),
             Values::Wide(w) => w[i].map(|k| Extreme::Bytes(crate::scalars::uuid_bytes(k).to_vec())),
+            Values::Float4(f) => f[i]
+                .filter(|&b| !f32::from_bits(b).is_nan())
+                .map(|b| Extreme::Float(crate::scalars::float4_key(b), u64::from(b))),
+            Values::Float8(f) => f[i]
+                .filter(|&b| !f64::from_bits(b).is_nan())
+                .map(|b| Extreme::Float(crate::scalars::float8_key(b), b)),
             _ => values
                 .text_value(i)
                 .map(|b| Extreme::Bytes(b.data().to_vec())),
         };
-        match v {
-            None => nulls += 1,
-            Some(v) => {
-                out = Some(match out {
-                    None => (v.clone(), v),
-                    Some((lo, hi)) => (lo.min(v.clone()), hi.max(v)),
-                })
-            }
+        if let Some(v) = v {
+            out = Some(match out {
+                None => (v.clone(), v),
+                Some((lo, hi)) => (lo.min(v.clone()), hi.max(v)),
+            })
         }
     }
     // An unsigned number's keys sort as its own bits do, which are what the file writes.
-    let raw = |e: Extreme| match e {
+    let raw = |e: Extreme, least: bool| match e {
         Extreme::Int(k) if ty.fixed_bytes().is_some() => {
             Extreme::Bytes(crate::scalars::fixed_of_key(ty, k))
         }
         Extreme::Int(k) => Extreme::Int(crate::scalars::raw_of_bits(k, bits)),
+        Extreme::Float(k, _) if k == 0 => Extreme::Float(
+            k,
+            match (ty, least) {
+                (ColumnType::Float4, true) => u64::from((-0.0f32).to_bits()),
+                (ColumnType::Float4, false) => u64::from(0.0f32.to_bits()),
+                (_, true) => (-0.0f64).to_bits(),
+                (_, false) => 0.0f64.to_bits(),
+            },
+        ),
         other => other,
     };
-    (out.map(|(lo, hi)| (raw(lo), raw(hi))), nulls)
+    (out.map(|(lo, hi)| (raw(lo, true), raw(hi, false))), nulls)
 }
 
 fn statistics(physical: PhysicalType, range: Option<(Extreme, Extreme)>, nulls: u64) -> Statistics {
     let ints = |e: &Extreme| match e {
         Extreme::Int(v) => *v,
-        Extreme::Bytes(_) => unreachable!("a number's column holds numbers"),
+        _ => unreachable!("a number's column holds numbers"),
+    };
+    let floats = |e: &Extreme| match e {
+        Extreme::Float(_, b) => *b,
+        _ => unreachable!("a float's column holds floats"),
     };
     let (lo, hi) = match &range {
         Some((lo, hi)) => (Some(lo), Some(hi)),
@@ -123,6 +148,20 @@ fn statistics(physical: PhysicalType, range: Option<(Extreme, Extreme)>, nulls: 
         PhysicalType::INT64 => {
             Statistics::int64(lo.map(ints), hi.map(ints), None, Some(nulls), false)
         }
+        PhysicalType::FLOAT => Statistics::float(
+            lo.map(|e| f32::from_bits(floats(e) as u32)),
+            hi.map(|e| f32::from_bits(floats(e) as u32)),
+            None,
+            Some(nulls),
+            false,
+        ),
+        PhysicalType::DOUBLE => Statistics::double(
+            lo.map(|e| f64::from_bits(floats(e))),
+            hi.map(|e| f64::from_bits(floats(e))),
+            None,
+            Some(nulls),
+            false,
+        ),
         PhysicalType::BOOLEAN => Statistics::boolean(
             lo.map(|e| ints(e) != 0),
             hi.map(|e| ints(e) != 0),
@@ -409,9 +448,13 @@ impl Snail {
         let mut index = ColumnIndexBuilder::new(physical);
         let mut whole: Option<(Extreme, Extreme)> = None;
         let mut nulls = 0;
+        // A page holding values and no least or greatest, only NaNs, leaves the chunk without a column
+        // index, as the plain library leaves it.
+        let mut indexed = true;
         for &(_, _, first, n) in &spans {
             let (range, page_nulls) = extremes(&values, ty, leaf.bits, first, first + n);
             nulls += page_nulls;
+            indexed &= range.is_some() || page_nulls == n as u64;
             match &range {
                 Some((lo, hi)) => index.append(
                     false,
@@ -472,7 +515,7 @@ impl Snail {
                 rows_written: rows as u64,
                 metadata,
                 bloom_filter: None,
-                column_index: Some(index.build()?),
+                column_index: if indexed { Some(index.build()?) } else { None },
                 offset_index: Some(offsets.build()),
             },
         ))

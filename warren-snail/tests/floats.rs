@@ -290,3 +290,127 @@ fn a_float_sum_finite_numbers_make_infinite_is_refused() {
         3e38f32 - 1.0
     );
 }
+
+/// What a file says of a float column of a row group: its statistics' NULLs, least and greatest as
+/// bytes, and whether a column index holds its pages.
+type Said = (Option<u64>, Option<Vec<u8>>, Option<Vec<u8>>, bool);
+
+/// What a file says of each float column of its first row group.
+fn float_statistics(path: &std::path::Path) -> Vec<Said> {
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+    use parquet::file::page_index::column_index::ColumnIndexMetaData;
+    let file = std::fs::File::open(path).unwrap();
+    let meta = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(&file)
+        .unwrap();
+    let rg = meta.row_group(0);
+    let index = meta.column_index();
+    (1..rg.num_columns())
+        .map(|c| {
+            let s = rg.column(c).statistics().unwrap();
+            let indexed = index.is_some_and(|i| !matches!(i[0][c], ColumnIndexMetaData::NONE));
+            (
+                s.null_count_opt(),
+                s.min_bytes_opt().map(<[u8]>::to_vec),
+                s.max_bytes_opt().map(<[u8]>::to_vec),
+                indexed,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_float_s_statistics_out_are_those_the_parquet_library_writes() {
+    use arrow::array::{Float32Array, Float64Array, Int32Array};
+    use parquet::arrow::ArrowWriter;
+    // NULLs, NaNs, both zeros, the infinities: each case its own table, one row group.
+    let nan = f64::NAN;
+    let cases: [&[Option<f64>]; 7] = [
+        &[
+            Some(1.5),
+            None,
+            Some(nan),
+            Some(-0.0),
+            Some(0.0),
+            Some(-2.0),
+        ],
+        &[Some(nan), Some(nan), None],
+        &[Some(-0.0)],
+        &[Some(0.0), Some(1.0)],
+        &[Some(-1.0), Some(-0.0)],
+        &[None, None],
+        &[
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(nan),
+            Some(5e-324),
+        ],
+    ];
+    for (i, values) in cases.iter().enumerate() {
+        let ddl =
+            "CREATE TABLE s.f (id integer NOT NULL, r real, d double precision, PRIMARY KEY (id));";
+        let catalog = Catalog::parse(ddl).unwrap();
+        let ids: Vec<i32> = (0..values.len() as i32).collect();
+        let path = tmp(&format!("float-statistics-{i}.snail"));
+        write(
+            &path,
+            &catalog,
+            &[(
+                "s.f".into(),
+                Rows {
+                    columns: vec![
+                        Values::Int(ids.iter().map(|&x| Some(i64::from(x))).collect()),
+                        Values::Float4(
+                            values
+                                .iter()
+                                .map(|v| v.map(|f| (f as f32).to_bits()))
+                                .collect(),
+                        ),
+                        Values::Float8(values.iter().map(|v| v.map(f64::to_bits)).collect()),
+                    ],
+                },
+            )],
+        )
+        .unwrap();
+        let dir = tmp(&format!("float-statistics-{i}-out"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outs = Snail::open(&path).unwrap().out(&dir).unwrap();
+        // The same values through the plain library's own writer.
+        let theirs = dir.join("parquet.parquet");
+        let batch = arrow::array::RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                std::sync::Arc::new(Int32Array::from(ids.clone())) as _,
+            ),
+            (
+                "r",
+                std::sync::Arc::new(Float32Array::from(
+                    values
+                        .iter()
+                        .map(|v| v.map(|f| f as f32))
+                        .collect::<Vec<_>>(),
+                )) as _,
+            ),
+            (
+                "d",
+                std::sync::Arc::new(Float64Array::from(values.to_vec())) as _,
+            ),
+        ])
+        .unwrap();
+        let mut w = ArrowWriter::try_new(
+            std::fs::File::create(&theirs).unwrap(),
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        assert_eq!(
+            float_statistics(&outs[0].file),
+            float_statistics(&theirs),
+            "case {i}: {values:?}"
+        );
+    }
+}
