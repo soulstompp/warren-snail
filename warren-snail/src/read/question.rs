@@ -112,6 +112,8 @@ pub enum Item {
     Least(Col),
     /// max of a column.
     Greatest(Col),
+    /// avg of a float column.
+    Avg(Col),
 }
 
 #[derive(Debug)]
@@ -161,7 +163,7 @@ impl Select {
             Select::Groups { keys, items } => {
                 let mut out = keys.clone();
                 for (_, i) in items {
-                    if let Item::Sum(c) | Item::Least(c) | Item::Greatest(c) = i {
+                    if let Item::Sum(c) | Item::Least(c) | Item::Greatest(c) | Item::Avg(c) = i {
                         if !out[keys.len()..].contains(&Key::Column(*c)) {
                             out.push(Key::Column(*c));
                         }
@@ -360,6 +362,20 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
         Shape::MonthUtc(_) => number(e).ok_or_else(|| Error::new(format!("{e} is not a month"))),
         Shape::Column(c) => match table.columns[c].ty {
             ty if crate::scalars::is_scalar(ty) => scalar_literal(e, ty),
+            ty @ (ColumnType::Float4 | ColumnType::Float8) => {
+                let wide = ty == ColumnType::Float8;
+                let text = match text_literal(e) {
+                    Ok(s) => s,
+                    Err(_) => super::statement::number_text(e)
+                        .ok_or_else(|| Error::new(format!("{e} is not a number")))?,
+                };
+                let bits = crate::scalars::float_parse(&text, wide)?;
+                Ok(if wide {
+                    crate::scalars::float8_key(bits)
+                } else {
+                    crate::scalars::float4_key(bits as u32)
+                })
+            }
             ColumnType::Boolean => truth_literal(e),
             ColumnType::Uuid => Err(Error::new(format!("{e} is not a uuid"))),
             ColumnType::Timestamptz => {
@@ -621,6 +637,8 @@ impl From<'_> {
                             | ColumnType::Int8
                             | ColumnType::Numeric { .. }
                             | ColumnType::Money
+                            | ColumnType::Float4
+                            | ColumnType::Float8
                     ) =>
                 {
                     Ok(Some(Item::Sum(Col { side, column })))
@@ -628,6 +646,26 @@ impl From<'_> {
                 _ => Err(Error::new(format!(
                     "{e}: sum is read over an integer, numeric or money column"
                 ))),
+            },
+            ("avg", [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))]) => match self.resolve(x)? {
+                (side, Shape::Column(column)) if self.table(side).columns[column].ty.is_float() => {
+                    Ok(Some(Item::Avg(Col { side, column })))
+                }
+                (side, Shape::Column(column))
+                    if !matches!(
+                        self.table(side).columns[column].ty,
+                        ColumnType::Int2
+                            | ColumnType::Int4
+                            | ColumnType::Int8
+                            | ColumnType::Numeric { .. }
+                    ) =>
+                {
+                    Err(Error::new(format!(
+                        "function avg({}) does not exist",
+                        self.table(side).columns[column].ty.pg_name()
+                    )))
+                }
+                _ => Err(Error::new(format!("{e} is not read"))),
             },
             ("min" | "max", [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))]) => {
                 let (side, column) = match self.resolve(x)? {
@@ -646,7 +684,9 @@ impl From<'_> {
                     | ColumnType::Xid8
                     | ColumnType::PgLsn
                     | ColumnType::Char
-                    | ColumnType::Money => Ok(Some(if name == "min" {
+                    | ColumnType::Money
+                    | ColumnType::Float4
+                    | ColumnType::Float8 => Ok(Some(if name == "min" {
                         Item::Least(col)
                     } else {
                         Item::Greatest(col)
@@ -673,6 +713,7 @@ impl From<'_> {
             Item::Sum(_) => "sum".into(),
             Item::Least(_) => "min".into(),
             Item::Greatest(_) => "max".into(),
+            Item::Avg(_) => "avg".into(),
         }
     }
 }
@@ -1044,6 +1085,52 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     }),
                 }
                 continue;
+            }
+        }
+        // A real beside a number written out is compared as a double precision: where no real is
+        // that number, the reals either side of it bound what is kept.
+        if let Shape::Column(c) = s {
+            if table.columns[c].ty == ColumnType::Float4 && text_literal(lit).is_err() {
+                if let Some(t) = super::statement::number_text(lit) {
+                    let d = f64::from_bits(crate::scalars::float_parse(&t, true)?);
+                    if let Some((below, above)) = crate::scalars::float4_between(d) {
+                        let (below, above) = (i128::from(below), i128::from(above));
+                        let cond = match op {
+                            BinaryOperator::Eq => Cond::new(s, Interval { lo: 1, hi: 0 }),
+                            BinaryOperator::NotEq => Cond::new(s, Interval::ALL),
+                            BinaryOperator::Lt | BinaryOperator::LtEq => Cond::new(
+                                s,
+                                Interval {
+                                    lo: i128::MIN,
+                                    hi: below,
+                                },
+                            ),
+                            BinaryOperator::Gt | BinaryOperator::GtEq => Cond::new(
+                                s,
+                                Interval {
+                                    lo: above,
+                                    hi: i128::MAX,
+                                },
+                            ),
+                            other => {
+                                return Err(Error::new(format!(
+                                    "the comparison {other} is not read"
+                                )))
+                            }
+                        };
+                        merge(&mut here.conds, cond);
+                        continue;
+                    }
+                    let key = crate::scalars::float4_key((d as f32).to_bits());
+                    let cond = match op {
+                        BinaryOperator::Eq => Cond::new(s, Interval::at(key.into())),
+                        _ => Cond::new(s, Interval::ALL),
+                    };
+                    if op == BinaryOperator::Eq {
+                        merge(&mut here.conds, cond);
+                        continue;
+                    }
+                }
             }
         }
         let (s, v) = match s {

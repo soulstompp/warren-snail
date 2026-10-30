@@ -71,6 +71,7 @@ impl Sink for First<'_> {
             match c {
                 Cell::Int(v) => self.key.push(*v as i128),
                 Cell::Wide(v) => self.key.push(*v),
+                Cell::Float(f) => self.key.push(i128::from(f.key)),
                 _ => return,
             }
         }
@@ -132,6 +133,7 @@ impl Sink for Second<'_> {
             match c {
                 Cell::Int(v) => self.probe.push(*v as i128),
                 Cell::Wide(v) => self.probe.push(*v),
+                Cell::Float(f) => self.probe.push(i128::from(f.key)),
                 _ => {
                     self.found = None;
                     return false;

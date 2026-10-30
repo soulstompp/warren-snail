@@ -7,8 +7,8 @@ use super::question::{Countable, Item, Key, Select, Sort};
 use crate::catalog::{ColumnType, Table};
 use crate::Result;
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int16Array,
-    Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+    ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
     TimestampMicrosecondArray,
 };
 use arrow::datatypes::{Field, Schema};
@@ -66,6 +66,40 @@ fn held_sum(total: i128, step: i128) -> i128 {
     }
 }
 
+/// A float a round keeps: its class's key, by which it is compared, grouped and hashed, and its own
+/// bits, which it is written out as.
+#[derive(Clone, Copy, Debug)]
+pub struct Float {
+    pub key: i64,
+    pub bits: u64,
+}
+
+impl PartialEq for Float {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Float {}
+
+impl std::hash::Hash for Float {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state)
+    }
+}
+
+impl PartialOrd for Float {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Float {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
 /// Adds one group's aggregates into another's.
 fn merge(into: &mut [Acc], from: &[Acc]) {
     for (a, b) in into.iter_mut().zip(from) {
@@ -79,8 +113,53 @@ fn merge(into: &mut [Acc], from: &[Acc]) {
             }
             (Acc::Least(x), Acc::Least(Some(y))) => *x = Some(x.map_or(*y, |x| x.min(*y))),
             (Acc::Greatest(x), Acc::Greatest(Some(y))) => *x = Some(x.map_or(*y, |x| x.max(*y))),
+            (Acc::FloatSum(x, over), Acc::FloatSum(Some(y), o)) => {
+                *x = Some(x.map_or(*y, |x| x + y));
+                *over |= *o;
+            }
+            (Acc::FloatSum(_, over), Acc::FloatSum(None, o)) => *over |= *o,
+            (Acc::Avg(n, sx, sxx, over), Acc::Avg(m, sy, syy, o)) => {
+                // Two runs of rows combined as PostgreSQL's float8_combine combines them.
+                if *m > 0.0 {
+                    if *n == 0.0 {
+                        (*n, *sx, *sxx) = (*m, *sy, *syy);
+                    } else {
+                        let total = *n + m;
+                        let t = *sx / *n - sy / m;
+                        *sxx = *sxx + syy + *n * m * t * t / total;
+                        *sx += sy;
+                        *n = total;
+                    }
+                }
+                *over |= *o;
+            }
             _ => {}
         }
+    }
+}
+
+/// A float's value, a real's widened, from its bits.
+fn float_value(f: &Float, wide: bool) -> f64 {
+    if wide {
+        f64::from_bits(f.bits)
+    } else {
+        f64::from(f32::from_bits(f.bits as u32))
+    }
+}
+
+/// A float as a round keeps it, a real where `wide` is not.
+fn float_cell(v: f64, wide: bool) -> Cell {
+    if wide {
+        Cell::Float(Float {
+            key: crate::scalars::float8_key(v.to_bits()),
+            bits: v.to_bits(),
+        })
+    } else {
+        let b = (v as f32).to_bits();
+        Cell::Float(Float {
+            key: crate::scalars::float4_key(b),
+            bits: u64::from(b),
+        })
     }
 }
 
@@ -95,6 +174,8 @@ pub enum Cell {
     Code(u32),
     /// A value keyed in 128 bits, as its key.
     Wide(i128),
+    /// A float, compared by its class and written as its own bits.
+    Float(Float),
 }
 
 impl Cell {
@@ -103,6 +184,8 @@ impl Cell {
         match self {
             Cell::Int(v) => Some(i128::from(*v)),
             Cell::Wide(k) => Some(*k),
+            // A float's key, its bits beside it, so the least and the greatest keep their own.
+            Cell::Float(f) => Some((i128::from(f.key) << 64) | i128::from(f.bits)),
             _ => None,
         }
     }
@@ -139,6 +222,11 @@ pub enum Acc {
     Least(Option<i128>),
     /// The greatest key so far.
     Greatest(Option<i128>),
+    /// A float's sum so far, and whether finite numbers made it infinite on the way.
+    FloatSum(Option<f64>, bool),
+    /// A float's rows, their sum and their sum of squared deviations, as PostgreSQL's
+    /// float8_accum folds them, and whether finite numbers made either infinite on the way.
+    Avg(f64, f64, f64, bool),
 }
 
 /// The answer as rows arrive, each as the cells of the question's inputs.
@@ -198,7 +286,7 @@ impl Answer {
             self.typed = items
                 .iter()
                 .map(|i| match i {
-                    Item::Sum(c) | Item::Least(c) | Item::Greatest(c) => {
+                    Item::Sum(c) | Item::Least(c) | Item::Greatest(c) | Item::Avg(c) => {
                         Some(tables[c.side].columns[c.column].ty)
                     }
                     _ => None,
@@ -244,10 +332,21 @@ impl Answer {
         }
     }
 
-    fn fresh(items: &[Item]) -> Vec<Acc> {
+    fn fresh(items: &[Item], typed: &[Option<ColumnType>]) -> Vec<Acc> {
         items
             .iter()
-            .map(|i| match i {
+            .enumerate()
+            .map(|(at, i)| match i {
+                Item::Sum(_)
+                    if typed
+                        .get(at)
+                        .copied()
+                        .flatten()
+                        .is_some_and(ColumnType::is_float) =>
+                {
+                    Acc::FloatSum(None, false)
+                }
+                Item::Avg(_) => Acc::Avg(0.0, 0.0, 0.0, false),
                 Item::Sum(_) => Acc::Sum(None),
                 Item::Least(_) => Acc::Least(None),
                 Item::Greatest(_) => Acc::Greatest(None),
@@ -295,13 +394,13 @@ impl Answer {
                         if by_code.len() <= c {
                             by_code.resize(c + 1, None);
                         }
-                        by_code[c].get_or_insert_with(|| Answer::fresh(items))
+                        by_code[c].get_or_insert_with(|| Answer::fresh(items, typed))
                     }
                     _ => match local.get_mut(&cells[..*keys]) {
                         Some(a) => a,
                         None => local
                             .entry(cells[..*keys].to_vec())
-                            .or_insert_with(|| Answer::fresh(items)),
+                            .or_insert_with(|| Answer::fresh(items, typed)),
                     },
                 };
                 for (i, (acc, item)) in accs.iter_mut().zip(items.iter()).enumerate() {
@@ -317,6 +416,47 @@ impl Answer {
                                 } else {
                                     t + v as i128 * n as i128
                                 });
+                            }
+                        }
+                        (Acc::FloatSum(total, over), Item::Sum(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            if let Cell::Float(f) = &cells[at] {
+                                let wide = ty == Some(ColumnType::Float8);
+                                let x = float_value(f, wide);
+                                for _ in 0..n {
+                                    let t = total.unwrap_or(0.0);
+                                    let s = if total.is_none() {
+                                        x
+                                    } else if wide {
+                                        t + x
+                                    } else {
+                                        f64::from(t as f32 + x as f32)
+                                    };
+                                    *over |=
+                                        s.is_infinite() && !t.is_infinite() && !x.is_infinite();
+                                    *total = Some(s);
+                                }
+                            }
+                        }
+                        (Acc::Avg(count, sx, sxx, over), Item::Avg(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            if let Cell::Float(f) = &cells[at] {
+                                let x = float_value(f, ty == Some(ColumnType::Float8));
+                                for _ in 0..n {
+                                    let (n0, sx0) = (*count, *sx);
+                                    *count = n0 + 1.0;
+                                    *sx = sx0 + x;
+                                    if n0 > 0.0 {
+                                        let t = x * *count - *sx;
+                                        *sxx += t * t / (*count * n0);
+                                        if sx.is_infinite() || sxx.is_infinite() {
+                                            *over |= !sx0.is_infinite() && !x.is_infinite();
+                                            *sxx = f64::NAN;
+                                        }
+                                    } else if x.is_nan() || x.is_infinite() {
+                                        *sxx = f64::NAN;
+                                    }
+                                }
                             }
                         }
                         (Acc::Least(m), Item::Least(c)) | (Acc::Greatest(m), Item::Greatest(c)) => {
@@ -355,14 +495,15 @@ impl Answer {
         to: usize,
     ) -> bool {
         // A money sum is held to its range row by row, and a "char"'s min and max go by its text.
-        if self
-            .typed
-            .iter()
-            .flatten()
-            .any(|t| matches!(t, ColumnType::Money | ColumnType::Char))
-        {
+        if self.typed.iter().flatten().any(|t| {
+            matches!(
+                t,
+                ColumnType::Money | ColumnType::Char | ColumnType::Float4 | ColumnType::Float8
+            )
+        }) {
             return false;
         }
+        let typed = &self.typed;
         let Body::Groups {
             keys,
             items,
@@ -384,7 +525,7 @@ impl Answer {
         for i in items.iter() {
             summed.push(match i {
                 Item::Count | Item::Key(_) => None,
-                Item::Least(_) | Item::Greatest(_) => return false,
+                Item::Least(_) | Item::Greatest(_) | Item::Avg(_) => return false,
                 Item::Sum(c) => match inputs.iter().position(|k| *k == Key::Column(*c)) {
                     Some(at) if !outs[at].1 && outs[at].3.ints().is_some() => Some(at),
                     _ => return false,
@@ -423,7 +564,7 @@ impl Answer {
             by_code.resize(n, None);
         }
         for c in (0..n).filter(|&c| count[c] > 0) {
-            let accs = by_code[c].get_or_insert_with(|| Answer::fresh(items));
+            let accs = by_code[c].get_or_insert_with(|| Answer::fresh(items, typed));
             for ((acc, item), s) in accs.iter_mut().zip(items.iter()).zip(&sums) {
                 match (acc, item) {
                     (Acc::Count(k), Item::Count) => *k += count[c],
@@ -441,12 +582,15 @@ impl Answer {
 
     /// Adds the rows the counts answered, in all or on each month.
     pub fn counted(&mut self, total: u64, months: &[u64; 12], countable: Option<Countable>) {
+        let typed = &self.typed;
         let (items, groups) = match &mut self.body {
             Body::Groups { items, groups, .. } => (items.clone(), groups),
             Body::Rows(_) => return,
         };
         let mut add = |key: Vec<Cell>, n: u64| {
-            let accs = groups.entry(key).or_insert_with(|| Answer::fresh(&items));
+            let accs = groups
+                .entry(key)
+                .or_insert_with(|| Answer::fresh(&items, typed));
             for (acc, item) in accs.iter_mut().zip(&items) {
                 if let (Acc::Count(c), Item::Count) = (acc, item) {
                     *c += n;
@@ -475,6 +619,8 @@ impl Answer {
         order: &[Sort],
     ) -> Result<RecordBatch> {
         self.flush();
+        let typed = self.typed.clone();
+        let typed = &typed;
         let columns: Vec<(String, Item)> = match select {
             Select::Rows(keys) => keys
                 .iter()
@@ -495,7 +641,7 @@ impl Answer {
                     Select::Rows(_) => unreachable!(),
                 };
                 if keys == 0 && groups.is_empty() {
-                    groups.insert(Vec::new(), Answer::fresh(&items));
+                    groups.insert(Vec::new(), Answer::fresh(&items, typed));
                 }
                 // A sum of money past its range is refused, as PostgreSQL refuses it.
                 for accs in groups.values() {
@@ -506,6 +652,10 @@ impl Answer {
                             {
                                 return Err(crate::Error::new("money out of range"));
                             }
+                        }
+                        // So is a float's that finite numbers made infinite.
+                        if let Acc::FloatSum(_, true) | Acc::Avg(_, _, _, true) = acc {
+                            return Err(crate::Error::new("value out of range: overflow"));
                         }
                     }
                 }
@@ -535,9 +685,31 @@ impl Answer {
                                         );
                                         Cell::Text(Text(ByteArray::from(t.as_str())))
                                     }),
+                                (
+                                    Item::Least(c) | Item::Greatest(c),
+                                    Acc::Least(m) | Acc::Greatest(m),
+                                ) if tables[c.side].columns[c.column].ty.is_float() => {
+                                    m.map_or(Cell::Null, |v| {
+                                        Cell::Float(Float {
+                                            key: (v >> 64) as i64,
+                                            bits: v as u64,
+                                        })
+                                    })
+                                }
                                 (_, Acc::Least(m) | Acc::Greatest(m)) => {
                                     m.map_or(Cell::Null, |v| Cell::Int(v as i64))
                                 }
+                                (Item::Sum(c), Acc::FloatSum(total, _)) => {
+                                    total.map_or(Cell::Null, |t| {
+                                        float_cell(
+                                            t,
+                                            tables[c.side].columns[c.column].ty
+                                                == ColumnType::Float8,
+                                        )
+                                    })
+                                }
+                                (_, Acc::Avg(n, sx, _, _)) if n > 0.0 => float_cell(sx / n, true),
+                                (_, Acc::Avg(..) | Acc::FloatSum(..)) => Cell::Null,
                             })
                             .collect()
                     })
@@ -582,6 +754,12 @@ impl Answer {
             let ints = || {
                 rows.iter().map(|r| match &r[i] {
                     Cell::Int(v) => Some(*v),
+                    _ => None,
+                })
+            };
+            let floats = || {
+                rows.iter().map(|r| match &r[i] {
+                    Cell::Float(f) => Some(f.bits),
                     _ => None,
                 })
             };
@@ -649,6 +827,16 @@ impl Answer {
                                 16,
                             )?)
                         }
+                        ColumnType::Float4 => Arc::new(
+                            floats()
+                                .map(|b| b.map(|b| f32::from_bits(b as u32)))
+                                .collect::<Float32Array>(),
+                        ),
+                        ColumnType::Float8 => Arc::new(
+                            floats()
+                                .map(|b| b.map(f64::from_bits))
+                                .collect::<Float64Array>(),
+                        ),
                         ty => crate::scalars::scalar_array(ty, ints()),
                     };
                     (!col.not_null || !matches!(*item, Item::Key(_)), a)
@@ -658,7 +846,31 @@ impl Answer {
                     Arc::new(ints().map(|v| v.map(|x| x as i16)).collect::<Int16Array>()),
                 ),
                 Item::Count => (false, Arc::new(ints().collect::<Int64Array>())),
+                Item::Avg(_) => (
+                    true,
+                    Arc::new(
+                        floats()
+                            .map(|b| b.map(f64::from_bits))
+                            .collect::<Float64Array>(),
+                    ),
+                ),
                 Item::Sum(c) => match tables[c.side].columns[c.column].ty {
+                    ColumnType::Float4 => (
+                        true,
+                        Arc::new(
+                            floats()
+                                .map(|b| b.map(|b| f32::from_bits(b as u32)))
+                                .collect::<Float32Array>(),
+                        ),
+                    ),
+                    ColumnType::Float8 => (
+                        true,
+                        Arc::new(
+                            floats()
+                                .map(|b| b.map(f64::from_bits))
+                                .collect::<Float64Array>(),
+                        ),
+                    ),
                     ColumnType::Numeric { scale, .. } => (
                         true,
                         Arc::new(

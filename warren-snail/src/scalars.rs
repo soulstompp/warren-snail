@@ -570,6 +570,445 @@ pub fn mac_cast(from: ColumnType, to: ColumnType, key: i64) -> Result<i64> {
     }
 }
 
+/// The key of a real's bits: its class as PostgreSQL's comparison sees it, `-0` with `0` and every
+/// NaN one place above infinity, held in the signed range of 32 bits.
+pub fn float4_key(bits: u32) -> i64 {
+    if f32::from_bits(bits).is_nan() {
+        return 0x7f80_0001;
+    }
+    let s = if bits == 0x8000_0000 { 0 } else { bits as i32 };
+    i64::from(if s >= 0 { s } else { s ^ 0x7fff_ffff })
+}
+
+/// The key of a double precision's bits, as `float4_key` keys a real's.
+pub fn float8_key(bits: u64) -> i64 {
+    if f64::from_bits(bits).is_nan() {
+        return 0x7ff0_0000_0000_0001;
+    }
+    let s = if bits == 0x8000_0000_0000_0000 {
+        0
+    } else {
+        bits as i64
+    };
+    if s >= 0 {
+        s
+    } else {
+        s ^ 0x7fff_ffff_ffff_ffff
+    }
+}
+
+/// The longest prefix of `s` glibc's `strtod` reads, past any white space: a decimal or hex number,
+/// an infinity or a NaN. Where the number starts, and where the prefix ends; none where it reads
+/// nothing.
+fn strtod_prefix(s: &[u8]) -> Option<(usize, usize)> {
+    let mut at = 0;
+    while at < s.len() && is_c_space(s[at]) {
+        at += 1;
+    }
+    let start = at;
+    if matches!(s.get(at), Some(b'+' | b'-')) {
+        at += 1;
+    }
+    let word = |at: usize, w: &str| {
+        s.len() >= at + w.len() && s[at..at + w.len()].eq_ignore_ascii_case(w.as_bytes())
+    };
+    if word(at, "infinity") {
+        return Some((start, at + 8));
+    }
+    if word(at, "inf") {
+        return Some((start, at + 3));
+    }
+    if word(at, "nan") {
+        let mut end = at + 3;
+        if s.get(end) == Some(&b'(') {
+            let mut k = end + 1;
+            while s
+                .get(k)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            {
+                k += 1;
+            }
+            if s.get(k) == Some(&b')') {
+                end = k + 1;
+            }
+        }
+        return Some((start, end));
+    }
+    let hex = s.get(at) == Some(&b'0')
+        && matches!(s.get(at + 1), Some(b'x' | b'X'))
+        && (s.get(at + 2).is_some_and(u8::is_ascii_hexdigit)
+            || (s.get(at + 2) == Some(&b'.') && s.get(at + 3).is_some_and(u8::is_ascii_hexdigit)));
+    let (digit, marker): (fn(&u8) -> bool, u8) = if hex {
+        at += 2;
+        (u8::is_ascii_hexdigit, b'p')
+    } else {
+        (u8::is_ascii_digit, b'e')
+    };
+    let mut seen = false;
+    while s.get(at).is_some_and(digit) {
+        at += 1;
+        seen = true;
+    }
+    if s.get(at) == Some(&b'.') {
+        let mut k = at + 1;
+        while s.get(k).is_some_and(digit) {
+            k += 1;
+            seen = true;
+        }
+        if seen {
+            at = k;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    if s.get(at).is_some_and(|c| c.to_ascii_lowercase() == marker) {
+        let mut k = at + 1;
+        if matches!(s.get(k), Some(b'+' | b'-')) {
+            k += 1;
+        }
+        if s.get(k).is_some_and(u8::is_ascii_digit) {
+            while s.get(k).is_some_and(u8::is_ascii_digit) {
+                k += 1;
+            }
+            at = k;
+        }
+    }
+    Some((start, at))
+}
+
+/// A hex number C reads, `0x` its digits, a point among them, `p` and a power of two, as a
+/// double; none where its digits pass the 60 bits held exactly.
+fn hex_float(t: &str) -> Option<f64> {
+    let (negative, t) = match t.as_bytes()[0] {
+        b'-' => (true, &t[1..]),
+        b'+' => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let t = &t[2..];
+    let (mantissa, power) = match t.find(['p', 'P']) {
+        Some(i) => (&t[..i], t[i + 1..].parse::<i32>().ok()?),
+        None => (t, 0),
+    };
+    let (whole, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{frac}");
+    let digits = digits.trim_start_matches('0');
+    if digits.len() > 15 {
+        return None;
+    }
+    let m = if digits.is_empty() {
+        0
+    } else {
+        u64::from_str_radix(digits, 16).ok()?
+    };
+    let v = m as f64 * 2f64.powi(power - 4 * frac.len() as i32);
+    Some(if negative { -v } else { v })
+}
+
+/// A real or a double precision as PostgreSQL's `float4in` or `float8in` reads one: white space,
+/// what `strtod` reads, white space; refused where its digits are not zero and it reads as zero or
+/// as an infinity. Its bits, a real's in the low 32.
+pub fn float_parse(s: &str, wide: bool) -> Result<u64> {
+    let name = if wide { "double precision" } else { "real" };
+    let wrong = || Error::new(format!("invalid input syntax for type {name}: \"{s}\""));
+    let b = s.as_bytes();
+    let (start, end) = strtod_prefix(b).ok_or_else(wrong)?;
+    if !b[end..].iter().all(|&c| is_c_space(c)) {
+        return Err(wrong());
+    }
+    let t = &s[start..end];
+    let body = t.trim_start_matches(['+', '-']);
+    let negative = t.starts_with('-');
+    let lower = body.to_ascii_lowercase();
+    let range = || Error::new(format!("\"{t}\" is out of range for type {name}"));
+    // Its digits before any exponent, all of them zero or not.
+    let mantissa = match lower.strip_prefix("0x") {
+        Some(h) => h.split('p').next().unwrap_or(""),
+        None => lower.split('e').next().unwrap_or(""),
+    };
+    let zero_digits = !mantissa.bytes().any(|c| c.is_ascii_hexdigit() && c != b'0');
+    let special = lower.starts_with("inf") || lower.starts_with("nan");
+    let sign = |v: f64| if negative { -v } else { v };
+    let v: f64 = if lower.starts_with("nan") {
+        sign(f64::NAN)
+    } else if lower.starts_with("inf") {
+        sign(f64::INFINITY)
+    } else if lower.starts_with("0x") {
+        hex_float(t).ok_or_else(wrong)?
+    } else if wide {
+        t.parse::<f64>().map_err(|_| wrong())?
+    } else {
+        let f: f32 = t.parse().map_err(|_| wrong())?;
+        if !special && (f.is_infinite() || (f == 0.0 && !zero_digits)) {
+            return Err(range());
+        }
+        return Ok(u64::from(f.to_bits()));
+    };
+    if wide {
+        if !special && (v.is_infinite() || (v == 0.0 && !zero_digits)) {
+            return Err(range());
+        }
+        Ok(v.to_bits())
+    } else {
+        let f = v as f32;
+        if !special && (f.is_infinite() || (f == 0.0 && !zero_digits)) {
+            return Err(range());
+        }
+        // A NaN keeps its sign, as strtof gives it.
+        let f = if v.is_nan() {
+            f32::from_bits(f32::NAN.to_bits() | (u32::from(negative) << 31))
+        } else {
+            f
+        };
+        Ok(u64::from(f.to_bits()))
+    }
+}
+
+/// Whether the decimal `digits` × 10^(`exp` - its length + 1) reads back as the float `bits` and lies
+/// strictly inside the values that do: read a hair above and a hair below, it still does.
+fn strictly_inside(digits: &str, exp: i32, bits: u64, wide: bool) -> bool {
+    let at = exp - digits.len() as i32 + 1;
+    let reads = |m: &str, e: i32| {
+        let t = format!("{m}e{e}");
+        if wide {
+            t.parse::<f64>().map(f64::to_bits).ok() == Some(bits)
+        } else {
+            t.parse::<f32>().map(|f| u64::from(f.to_bits())).ok() == Some(bits)
+        }
+    };
+    let m: u64 = digits.parse().unwrap_or(0);
+    reads(digits, at)
+        && reads(&format!("{digits}{}1", "0".repeat(20)), at - 21)
+        && (m == 0 || reads(&format!("{}{}", m - 1, "9".repeat(21)), at - 21))
+}
+
+/// A float's shortest digits as PostgreSQL's Ryu gives them, which never writes the exact midpoint
+/// between two floats: the shortest digits strictly inside the values that read back as it, the
+/// nearest of their length. Its sign, its digits and the exponent of its first.
+fn pg_shortest(e: String, bits: u64, wide: bool) -> (bool, String, i32) {
+    let (negative, d, exp) = shortest(e);
+    let magnitude = if wide {
+        bits & !(1 << 63)
+    } else {
+        bits & 0x7fff_ffff
+    };
+    let v = if wide {
+        f64::from_bits(magnitude)
+    } else {
+        f64::from(f32::from_bits(magnitude as u32))
+    };
+    if magnitude == 0 {
+        return (negative, d, exp);
+    }
+    if strictly_inside(&d, exp, magnitude, wide) {
+        let (d, exp) = half_even(d, exp, magnitude, wide, v);
+        return (negative, d, exp);
+    }
+    for n in d.len() + 1..=17 {
+        let (_, d, exp) = shortest(format!("{:.*e}", n - 1, v));
+        if strictly_inside(&d, exp, magnitude, wide) {
+            return (negative, d, exp);
+        }
+    }
+    (negative, d, exp)
+}
+
+/// The digits of `v` exactly halfway between two decimals of `d`'s length, where both read back as
+/// it, rounded half to even as PostgreSQL's Ryu rounds them; any other `d` as it is.
+fn half_even(d: String, exp: i32, magnitude: u64, wide: bool, v: f64) -> (String, i32) {
+    let n = d.len();
+    let exact = format!("{:.*e}", n + 59, v);
+    let (m, x) = exact.split_once('e').expect("an exponent form");
+    let digits: String = m.chars().filter(char::is_ascii_digit).collect();
+    let x: i32 = x.parse().expect("an exponent");
+    let tie = digits.as_bytes()[n] == b'5' && digits[n + 1..].bytes().all(|b| b == b'0');
+    if !tie {
+        return (d, exp);
+    }
+    let low = digits[..n].to_string();
+    let mut high: Vec<u8> = low.clone().into_bytes();
+    let mut i = n;
+    let mut x_high = x;
+    loop {
+        if i == 0 {
+            high.insert(0, b'1');
+            high.pop();
+            x_high += 1;
+            break;
+        }
+        i -= 1;
+        if high[i] == b'9' {
+            high[i] = b'0';
+        } else {
+            high[i] += 1;
+            break;
+        }
+    }
+    let high = String::from_utf8(high).expect("digits");
+    let trim = |s: &str| {
+        let t = s.trim_end_matches('0');
+        if t.is_empty() {
+            "0".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    let even = |s: &str| (s.as_bytes()[n - 1] - b'0').is_multiple_of(2);
+    let (lo_in, hi_in) = (
+        strictly_inside(&trim(&low), x, magnitude, wide),
+        strictly_inside(&trim(&high), x_high, magnitude, wide),
+    );
+    match (lo_in, hi_in) {
+        (true, true) if even(&low) => (trim(&low), x),
+        (true, true) => (trim(&high), x_high),
+        (true, false) => (trim(&low), x),
+        (false, true) => (trim(&high), x_high),
+        (false, false) => (d, exp),
+    }
+}
+
+/// A value's shortest digits and the exponent of its first, from Rust's exponent form.
+fn shortest(e: String) -> (bool, String, i32) {
+    let (m, x) = e.split_once('e').expect("an exponent form");
+    let negative = m.starts_with('-');
+    let digits: String = m.chars().filter(char::is_ascii_digit).collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    (
+        negative,
+        digits.to_string(),
+        x.parse().expect("an exponent"),
+    )
+}
+
+/// A real or a double precision as PostgreSQL's `float4out` or `float8out` writes one with
+/// `extra_float_digits` at 1: NaN, Infinity and -Infinity by name; else its shortest digits, laid
+/// out in full where the first's exponent is from -4 up to 6 for a real or 15 for a double, or as
+/// a digit, a point, the rest and an exponent of at least two digits.
+pub fn float_text(bits: u64, wide: bool) -> String {
+    let (nan, inf, neg_inf, e, limit) = if wide {
+        let v = f64::from_bits(bits);
+        (
+            v.is_nan(),
+            v == f64::INFINITY,
+            v == f64::NEG_INFINITY,
+            format!("{v:e}"),
+            15,
+        )
+    } else {
+        let v = f32::from_bits(bits as u32);
+        (
+            v.is_nan(),
+            v == f32::INFINITY,
+            v == f32::NEG_INFINITY,
+            format!("{v:e}"),
+            6,
+        )
+    };
+    if nan {
+        return "NaN".into();
+    }
+    if inf {
+        return "Infinity".into();
+    }
+    if neg_inf {
+        return "-Infinity".into();
+    }
+    let (negative, d, exp) = pg_shortest(e, bits, wide);
+    let sign = if negative { "-" } else { "" };
+    if (-4..limit).contains(&exp) {
+        let body = if exp >= 0 {
+            let whole = exp as usize + 1;
+            if d.len() <= whole {
+                format!("{d}{}", "0".repeat(whole - d.len()))
+            } else {
+                format!("{}.{}", &d[..whole], &d[whole..])
+            }
+        } else {
+            format!("0.{}{d}", "0".repeat((-exp - 1) as usize))
+        };
+        return format!("{sign}{body}");
+    }
+    let rest = if d.len() > 1 {
+        format!(".{}", &d[1..])
+    } else {
+        String::new()
+    };
+    format!(
+        "{sign}{}{rest}e{}{:02}",
+        &d[..1],
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    )
+}
+
+/// A double precision as PostgreSQL's `float8_numeric` or `float4_numeric` gives it to numeric:
+/// the text of `%.*g` with 15 or 6 significant digits.
+pub fn float_numeric_text(v: f64, wide: bool) -> String {
+    let digits = if wide { 15 } else { 6 };
+    let e = format!("{:.*e}", digits - 1, v);
+    let (m, x) = e.split_once('e').unwrap();
+    let exp: i32 = x.parse().unwrap();
+    let negative = m.starts_with('-');
+    let d: String = m.chars().filter(char::is_ascii_digit).collect();
+    let d = d.trim_end_matches('0');
+    let d = if d.is_empty() { "0" } else { d };
+    let sign = if negative { "-" } else { "" };
+    if exp < -4 || exp >= digits as i32 {
+        let rest = if d.len() > 1 {
+            format!(".{}", &d[1..])
+        } else {
+            String::new()
+        };
+        return format!(
+            "{sign}{}{rest}e{}{:02}",
+            &d[..1],
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        );
+    }
+    if exp >= 0 {
+        let whole = exp as usize + 1;
+        if d.len() <= whole {
+            format!("{sign}{d}{}", "0".repeat(whole - d.len()))
+        } else {
+            format!("{sign}{}.{}", &d[..whole], &d[whole..])
+        }
+    } else {
+        format!("{sign}0.{}{d}", "0".repeat((-exp - 1) as usize))
+    }
+}
+
+/// The keys of the reals either side of a double precision `c`, where no real is `c` itself: the
+/// greatest below it and the least above it. None where a real is `c`.
+pub fn float4_between(c: f64) -> Option<(i64, i64)> {
+    if c.is_nan() {
+        return None;
+    }
+    let f = c as f32;
+    if f as f64 == c {
+        return None;
+    }
+    let up = |f: f32| {
+        f32::from_bits(if f >= 0.0 {
+            if f == 0.0 {
+                1
+            } else {
+                f.to_bits() + 1
+            }
+        } else {
+            f.to_bits() - 1
+        })
+    };
+    let down = |f: f32| -up(-f);
+    let (below, above) = if (f as f64) < c {
+        (f, up(f))
+    } else {
+        (down(f), f)
+    };
+    Some((float4_key(below.to_bits()), float4_key(above.to_bits())))
+}
+
 /// A key of a type keyed as a number as PostgreSQL's output function writes the value.
 pub fn scalar_text(ty: ColumnType, key: i64) -> String {
     match ty {
@@ -768,6 +1207,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_real_s_key_sorts_as_postgresql_orders_reals() {
+        // Every bit pattern, walked from -Infinity up through the negatives, -0, 0 and the positives
+        // to Infinity: each key rises as the machine's own < does, -0 and 0 share one, and every NaN
+        // lies on one key above Infinity.
+        let walk = (0x8000_0001u32..=0xff80_0000)
+            .rev()
+            .chain([0x8000_0000, 0])
+            .chain(1..=0x7f80_0000);
+        let (mut last, mut last_key, mut walked) = (f32::NEG_INFINITY, i64::MIN, 0u64);
+        for b in walk {
+            let (f, k) = (f32::from_bits(b), float4_key(b));
+            assert!(
+                (f > last && k > last_key) || (f == last && k == last_key) || walked == 0,
+                "{b:#x}"
+            );
+            (last, last_key, walked) = (f, k, walked + 1);
+        }
+        assert_eq!(walked, (1u64 << 32) - 2 * ((1 << 23) - 1));
+        let nan = float4_key(0x7fc0_0000);
+        assert!(nan > float4_key(0x7f80_0000));
+        let nans = (0x7f80_0001u32..=0x7fff_ffff).chain(0xff80_0001..=0xffff_ffff);
+        assert!(nans.into_iter().all(|b| float4_key(b) == nan));
+        // Every key lies in the signed range of 32 bits, as the cut takes it.
+        assert!((i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&nan));
+        assert_eq!(float4_key(0xff80_0000), i64::from(i32::MIN) + 0x007f_ffff);
+    }
+
+    #[test]
+    fn a_double_s_key_sorts_as_postgresql_orders_doubles_at_its_boundaries() {
+        let ordered = [
+            f64::NEG_INFINITY,
+            f64::MIN,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -5e-324,
+            0.0,
+            5e-324,
+            f64::MIN_POSITIVE,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        for w in ordered.windows(2) {
+            assert!(
+                float8_key(w[0].to_bits()) < float8_key(w[1].to_bits()),
+                "{w:?}"
+            );
+        }
+        assert_eq!(
+            float8_key((-0.0f64).to_bits()),
+            float8_key(0.0f64.to_bits())
+        );
+        let nan = float8_key(f64::NAN.to_bits());
+        assert!(nan > float8_key(f64::INFINITY.to_bits()));
+        for b in [
+            0x7ff0_0000_0000_0001u64,
+            0xfff8_0000_0000_0000,
+            0x7fff_ffff_ffff_ffff,
+            0xffff_ffff_ffff_ffff,
+        ] {
+            assert_eq!(float8_key(b), nan);
+        }
+    }
+
+    #[test]
+    fn a_float_is_read_and_written_as_postgresql_reads_and_writes_it() {
+        let real = |s: &str| float_parse(s, false).map(|b| float_text(b, false));
+        let double = |s: &str| float_parse(s, true).map(|b| float_text(b, true));
+        for (s, want) in [
+            ("0.1", "0.1"),
+            ("3.4028235e+38", "3.4028235e+38"),
+            ("-0", "-0"),
+            ("NaN", "NaN"),
+            ("-NaN", "NaN"),
+            ("-INF", "-Infinity"),
+            ("  1.5  ", "1.5"),
+            ("1e-45", "1e-45"),
+            ("1.5e-45", "1e-45"),
+            ("16777217", "1.6777216e+07"),
+            ("123456", "123456"),
+            ("1234567", "1.234567e+06"),
+            ("0.0001", "0.0001"),
+            ("0.00001", "1e-05"),
+            ("495232.625", "495232.62"),
+        ] {
+            assert_eq!(real(s).unwrap(), want, "{s}");
+        }
+        for (s, want) in [
+            ("0.30000000000000004", "0.30000000000000004"),
+            ("123456789012345678", "1.2345678901234568e+17"),
+            ("123456789012345", "123456789012345"),
+            ("1e15", "1e+15"),
+            ("1e-7", "1e-07"),
+            ("4.9e-324", "5e-324"),
+            ("0x10", "16"),
+            ("inf", "Infinity"),
+            ("nan(1)", "NaN"),
+            ("1e-320", "1e-320"),
+            // The double nearest 1e23 lies exactly between it and the next, and PostgreSQL never
+            // writes such a midpoint.
+            ("1e23", "9.999999999999999e+22"),
+            // Exactly halfway between two decimals of its shortest length, rounded half to even.
+            ("214988023257504.63", "214988023257504.62"),
+        ] {
+            assert_eq!(double(s).unwrap(), want, "{s}");
+        }
+        for s in ["", "1.5x", "1e400", "1e-400", "infinit", "1e", "--1", " "] {
+            assert!(double(s).is_err(), "{s}");
+        }
+        assert!(real("1e39").is_err() && real("1e-46").is_err());
+        // -NaN keeps its sign bit, as strtod gives it.
+        assert_eq!(float_parse("-NaN", true).unwrap(), 0xfff8_0000_0000_0000);
+        // No real is 0.1 as a double, so it lies between two.
+        let (below, above) = float4_between(0.1).unwrap();
+        assert_eq!(above, below + 1);
+        assert_eq!(float4_between(1.5), None);
     }
 
     #[test]

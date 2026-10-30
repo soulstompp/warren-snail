@@ -130,6 +130,8 @@ fn datum_at(v: &Values, i: usize) -> Datum {
     match v {
         Values::Int(x) => x[i].map_or(Datum::Null, Datum::Int),
         Values::Wide(x) => x[i].map_or(Datum::Null, Datum::Wide),
+        Values::Float4(x) => x[i].map_or(Datum::Null, Datum::Float4),
+        Values::Float8(x) => x[i].map_or(Datum::Null, Datum::Float8),
         _ => v
             .text(i)
             .map_or(Datum::Null, |s| Datum::Text(s.to_string())),
@@ -156,6 +158,10 @@ fn push(v: &mut Values, d: &Datum) {
         (Values::Utf8(x), Datum::Null) => x.push(None),
         (Values::Wide(x), Datum::Wide(k)) => x.push(Some(*k)),
         (Values::Wide(x), Datum::Null) => x.push(None),
+        (Values::Float4(x), Datum::Float4(b)) => x.push(Some(*b)),
+        (Values::Float4(x), Datum::Null) => x.push(None),
+        (Values::Float8(x), Datum::Float8(b)) => x.push(Some(*b)),
+        (Values::Float8(x), Datum::Null) => x.push(None),
         _ => panic!("a value pushed onto a column of another kind"),
     }
 }
@@ -170,6 +176,8 @@ fn key_of(order: &Order, row: &Row) -> Vec<KeyValue> {
             Datum::Int(v) => key(l, *v),
             Datum::Text(s) => KeyValue::Text(s.as_str().into()),
             Datum::Wide(k) => KeyValue::Wide(*k),
+            Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(*b)),
+            Datum::Float8(b) => KeyValue::Int(crate::scalars::float8_key(*b)),
             Datum::Null => null_key(order, li),
             Datum::Bytes(_) => unreachable!("a level holds no bytea; the catalog refuses it"),
         })
@@ -198,6 +206,10 @@ fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
                 Datum::Int(x.value(r))
             } else if let Some(x) = any.downcast_ref::<TimestampMicrosecondArray>() {
                 Datum::Int(x.value(r))
+            } else if let Some(x) = any.downcast_ref::<arrow::array::Float32Array>() {
+                Datum::Float4(x.value(r).to_bits())
+            } else if let Some(x) = any.downcast_ref::<arrow::array::Float64Array>() {
+                Datum::Float8(x.value(r).to_bits())
             } else if let Some(x) = any.downcast_ref::<StringArray>() {
                 Datum::Text(x.value(r).to_string())
             } else if let Some(x) = any.downcast_ref::<Decimal128Array>() {
@@ -233,6 +245,8 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
         A::Binary | A::LargeBinary | A::BinaryView => ColumnType::Bytes,
         A::Boolean => ColumnType::Boolean,
         A::FixedSizeBinary(16) => ColumnType::Uuid,
+        A::Float32 => ColumnType::Float4,
+        A::Float64 => ColumnType::Float8,
         A::Decimal128(p, s) => ColumnType::Numeric {
             precision: (*p).min(18),
             scale: (*s).max(0) as u8,
@@ -400,11 +414,22 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             }
             (ColumnType::Text(_), Datum::Text(_))
             | (ColumnType::Bytes, Datum::Bytes(_))
-            | (ColumnType::Uuid, Datum::Wide(_)) => {}
-            (ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Uuid, Datum::Int(_))
+            | (ColumnType::Uuid, Datum::Wide(_))
+            | (ColumnType::Float4, Datum::Float4(_))
+            | (ColumnType::Float8, Datum::Float8(_)) => {}
+            (
+                ColumnType::Text(_)
+                | ColumnType::Bytes
+                | ColumnType::Uuid
+                | ColumnType::Float4
+                | ColumnType::Float8,
+                Datum::Int(_),
+            )
             | (_, Datum::Text(_))
             | (_, Datum::Bytes(_))
-            | (_, Datum::Wide(_)) => {
+            | (_, Datum::Wide(_))
+            | (_, Datum::Float4(_))
+            | (_, Datum::Float8(_)) => {
                 return Err(what(format!("{d:?} is not a value of {}", col.ty.name())))
             }
             (_, Datum::Int(_)) => {}
@@ -1935,6 +1960,8 @@ impl Snail {
                     Datum::Int(v) => key(l, v),
                     Datum::Text(t) => KeyValue::Text(t.into_boxed_str()),
                     Datum::Wide(k) => KeyValue::Wide(k),
+                    Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(b)),
+                    Datum::Float8(b) => KeyValue::Int(crate::scalars::float8_key(b)),
                     Datum::Null => null_key(order, li),
                     Datum::Bytes(_) => unreachable!("a level holds no bytea"),
                 })

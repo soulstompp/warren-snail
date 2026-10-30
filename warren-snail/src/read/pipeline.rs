@@ -31,6 +31,10 @@ pub enum Value {
     /// A fixed scalar keyed as a number (an oid, an xid, a pg_lsn, a `"char"`, money): its type and
     /// its key.
     Scalar(ColumnType, i64),
+    /// A real.
+    Real(f32),
+    /// A double precision.
+    Double(f64),
 }
 
 impl Value {
@@ -69,6 +73,8 @@ impl Value {
             Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             Value::Uuid(k) => crate::scalars::uuid_text(*k),
             Value::Scalar(ty, k) => crate::scalars::scalar_text(*ty, *k),
+            Value::Real(f) => crate::scalars::float_text(u64::from(f.to_bits()), false),
+            Value::Double(d) => crate::scalars::float_text(d.to_bits(), true),
         })
     }
 }
@@ -97,6 +103,22 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
             Value::at_scale(x, sx, s).cmp(&Value::at_scale(y, sy, s)),
         ));
     }
+    // Two reals compare as reals; a float beside any other number, as doubles.
+    if let (Value::Real(x), Value::Real(y)) = (a, b) {
+        return Ok(Some(
+            crate::scalars::float4_key(x.to_bits()).cmp(&crate::scalars::float4_key(y.to_bits())),
+        ));
+    }
+    if matches!(a, Value::Real(_) | Value::Double(_))
+        || matches!(b, Value::Real(_) | Value::Double(_))
+    {
+        if let (Some(x), Some(y)) = (as_double(a), as_double(b)) {
+            return Ok(Some(
+                crate::scalars::float8_key(x.to_bits())
+                    .cmp(&crate::scalars::float8_key(y.to_bits())),
+            ));
+        }
+    }
     Ok(Some(match (a, b) {
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
@@ -124,6 +146,8 @@ enum Key {
     Bool(bool),
     Uuid(i128),
     Scalar(ColumnType, i64),
+    Real(i64),
+    Double(i64),
 }
 
 fn key(v: &Value) -> Key {
@@ -142,6 +166,8 @@ fn key(v: &Value) -> Key {
         Value::Bool(b) => Key::Bool(*b),
         Value::Uuid(k) => Key::Uuid(*k),
         Value::Scalar(ty, k) => Key::Scalar(*ty, *k),
+        Value::Real(f) => Key::Real(crate::scalars::float4_key(f.to_bits())),
+        Value::Double(d) => Key::Double(crate::scalars::float8_key(d.to_bits())),
     }
 }
 
@@ -207,7 +233,7 @@ struct Calls<'q> {
     windows: Vec<&'q Expr>,
 }
 
-const AGGREGATES: [&str; 6] = ["count", "sum", "min", "max", "bool_and", "bool_or"];
+const AGGREGATES: [&str; 7] = ["count", "sum", "min", "max", "avg", "bool_and", "bool_or"];
 
 fn function_name(f: &sqlparser::ast::Function) -> String {
     match f.name.0.last() {
@@ -302,6 +328,32 @@ fn is_count_star(f: &sqlparser::ast::Function) -> bool {
         if matches!(l.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]))
 }
 
+/// A numeric's text, in plain or exponent form, as its digits and their scale.
+pub(crate) fn numeric_parts(s: &str) -> Result<(i128, u32)> {
+    let (mantissa, exp) = match s.split_once(['e', 'E']) {
+        Some((m, e)) => (
+            m,
+            e.parse::<i32>()
+                .map_err(|_| Error::new(format!("'{s}' is not a number")))?,
+        ),
+        None => (s, 0),
+    };
+    let v = numeric_literal(mantissa)?;
+    let (m, sc) = v.numeric().unwrap();
+    let sc = sc as i32 - exp;
+    Ok(if sc >= 0 {
+        (m, sc as u32)
+    } else {
+        (
+            10i128
+                .checked_pow((-sc) as u32)
+                .and_then(|p| m.checked_mul(p))
+                .ok_or_else(|| Error::new(format!("'{s}' is out of range")))?,
+            0,
+        )
+    })
+}
+
 fn numeric_literal(s: &str) -> Result<Value> {
     let t = s.trim();
     let (neg, t) = match t.strip_prefix('-') {
@@ -336,6 +388,8 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
     Ok(match base.as_str() {
         "text" | "varchar" | "character varying" => Value::Text(v.text().unwrap()),
         "bigint" | "int8" | "integer" | "int" | "int4" | "smallint" | "int2" => match v {
+            Value::Real(f) => float_integer(f64::from(f), &base)?,
+            Value::Double(d) => float_integer(d, &base)?,
             Value::Scalar(ty, k) => scalar_integer(ty, k, &base)?,
             Value::Int(x) => Value::Int(x),
             Value::Num(m, s) => {
@@ -356,6 +410,18 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
                 Value::Int(x) => Value::Num(x as i128, 0),
                 Value::Num(m, s) => Value::Num(m, s),
                 Value::Scalar(ColumnType::Money, k) => Value::Num(k as i128, 2),
+                Value::Real(_) | Value::Double(_) => {
+                    let wide = matches!(v, Value::Double(_));
+                    let f = as_double(&v).unwrap();
+                    if !f.is_finite() {
+                        return Err(Error::new(format!(
+                            "cannot convert {} to numeric: the snail holds no NaN or infinity in one",
+                            if f.is_nan() { "NaN" } else { "infinity" }
+                        )));
+                    }
+                    let (m, s) = numeric_parts(&crate::scalars::float_numeric_text(f, wide))?;
+                    Value::Num(m, s)
+                }
                 other => return Err(Error::new(format!("{other:?} cast to numeric"))),
             };
             let (m, s) = v.numeric().unwrap();
@@ -403,6 +469,9 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
         },
         _ => match crate::catalog::held_type(to) {
             Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty)?,
+            Ok(ty @ (ColumnType::Float4 | ColumnType::Float8)) => {
+                float_cast(v, ty == ColumnType::Float8)?
+            }
             _ => return Err(Error::new(format!("a cast to {to} is not read"))),
         },
     })
@@ -420,6 +489,8 @@ fn kind_name(v: &Value) -> String {
         Value::Bool(_) => "boolean".into(),
         Value::Uuid(_) => "uuid".into(),
         Value::Scalar(ty, _) => ty.pg_name(),
+        Value::Real(_) => "real".into(),
+        Value::Double(_) => "double precision".into(),
     }
 }
 
@@ -609,6 +680,201 @@ fn scalar_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Valu
     }))
 }
 
+/// A number as a double precision, as PostgreSQL widens it beside a float: an integer as itself
+/// rounded, a numeric read from its text, a real exactly.
+fn as_double(v: &Value) -> Option<f64> {
+    Some(match v {
+        Value::Int(x) => *x as f64,
+        Value::Num(m, s) => numeric_text(*m, *s).parse().ok()?,
+        Value::Real(f) => f64::from(*f),
+        Value::Double(d) => *d,
+        _ => return None,
+    })
+}
+
+fn out_of_range(what: &str) -> Error {
+    Error::new(format!("value out of range: {what}"))
+}
+
+/// A float's operator, as PostgreSQL's float4 and float8 operators give it: two reals in real, any
+/// float beside a double, an integer or a numeric in double precision; refused where finite
+/// numbers make an infinity, where a product or quotient of numbers not zero is zero, and where
+/// it divides by zero. Money times or divided by a float, rounded to the cent, and money divided
+/// by money. None where neither side is a float.
+fn float_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>> {
+    use BinaryOperator as B;
+    let float = |v: &Value| matches!(v, Value::Real(_) | Value::Double(_));
+    let money = |v: &Value| matches!(v, Value::Scalar(ColumnType::Money, _));
+    if !(float(x) || float(y) || (money(x) && money(y) && matches!(op, B::Divide))) {
+        return Ok(None);
+    }
+    let with_money = match (x, y) {
+        (Value::Scalar(ColumnType::Money, c), f) if float(f) => Some((*c, as_double(f), true)),
+        (f, Value::Scalar(ColumnType::Money, c)) if float(f) => Some((*c, as_double(f), false)),
+        _ => None,
+    };
+    if let Some((c, f, money_left)) = with_money {
+        let f = f.expect("a float is a double");
+        let r = match op {
+            B::Multiply => c as f64 * f,
+            B::Divide if money_left => {
+                if f == 0.0 {
+                    return Err(Error::new("division by zero"));
+                }
+                c as f64 / f
+            }
+            _ => {
+                return Err(Error::new(format!(
+                    "operator does not exist: {} {op} {}",
+                    kind_name(x),
+                    kind_name(y)
+                )))
+            }
+        };
+        let r = r.round_ties_even();
+        if !(-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&r) {
+            return Err(Error::new("money out of range"));
+        }
+        return Ok(Some(Value::Scalar(ColumnType::Money, r as i64)));
+    }
+    if let (Value::Scalar(ColumnType::Money, a), Value::Scalar(ColumnType::Money, b)) = (x, y) {
+        if *b == 0 {
+            return Err(Error::new("division by zero"));
+        }
+        return Ok(Some(Value::Double(*a as f64 / *b as f64)));
+    }
+    let (Some(a), Some(b)) = (as_double(x), as_double(y)) else {
+        return Err(Error::new(format!(
+            "operator does not exist: {} {op} {}",
+            kind_name(x),
+            kind_name(y)
+        )));
+    };
+    let real = matches!((x, y), (Value::Real(_), Value::Real(_)));
+    let (r, overflow, underflow) = match op {
+        B::Plus | B::Minus => {
+            let r = if real {
+                let (p, q) = (a as f32, b as f32);
+                f64::from(if matches!(op, B::Plus) { p + q } else { p - q })
+            } else if matches!(op, B::Plus) {
+                a + b
+            } else {
+                a - b
+            };
+            (
+                r,
+                r.is_infinite() && !a.is_infinite() && !b.is_infinite(),
+                false,
+            )
+        }
+        B::Multiply => {
+            let r = if real {
+                f64::from(a as f32 * b as f32)
+            } else {
+                a * b
+            };
+            (
+                r,
+                r.is_infinite() && !a.is_infinite() && !b.is_infinite(),
+                r == 0.0 && a != 0.0 && b != 0.0,
+            )
+        }
+        B::Divide => {
+            if b == 0.0 && !a.is_nan() {
+                return Err(Error::new("division by zero"));
+            }
+            let r = if real {
+                f64::from(a as f32 / b as f32)
+            } else {
+                a / b
+            };
+            (
+                r,
+                r.is_infinite() && !a.is_infinite(),
+                r == 0.0 && a != 0.0 && !b.is_infinite(),
+            )
+        }
+        _ => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} {op} {}",
+                kind_name(x),
+                kind_name(y)
+            )))
+        }
+    };
+    if overflow {
+        return Err(out_of_range("overflow"));
+    }
+    if underflow {
+        return Err(out_of_range("underflow"));
+    }
+    Ok(Some(if real {
+        Value::Real(r as f32)
+    } else {
+        Value::Double(r)
+    }))
+}
+
+/// A value cast to a float, real where `wide` is not: an integer or a numeric rounded to it, text
+/// read as float4in or float8in reads it; a double to a real refused where it overflows or falls
+/// to zero.
+pub(crate) fn float_cast(v: Value, wide: bool) -> Result<Value> {
+    let bits = |t: &str| crate::scalars::float_parse(t, wide);
+    let of = |b: u64| {
+        if wide {
+            Value::Double(f64::from_bits(b))
+        } else {
+            Value::Real(f32::from_bits(b as u32))
+        }
+    };
+    Ok(match v {
+        Value::Null => Value::Null,
+        Value::Real(f) if wide => Value::Double(f64::from(f)),
+        Value::Real(f) => Value::Real(f),
+        Value::Double(d) if wide => Value::Double(d),
+        Value::Double(d) => {
+            let f = d as f32;
+            if f.is_infinite() && !d.is_infinite() {
+                return Err(out_of_range("overflow"));
+            }
+            if f == 0.0 && d != 0.0 {
+                return Err(out_of_range("underflow"));
+            }
+            Value::Real(f)
+        }
+        Value::Int(x) => {
+            if wide {
+                Value::Double(x as f64)
+            } else {
+                Value::Real(x as f32)
+            }
+        }
+        Value::Num(m, s) => of(bits(&numeric_text(m, s))?),
+        Value::Text(t) => of(bits(&t)?),
+        other => {
+            return Err(Error::new(format!(
+                "cannot cast type {} to {}",
+                kind_name(&other),
+                if wide { "double precision" } else { "real" }
+            )))
+        }
+    })
+}
+
+/// A float rounded to an integer type named `base`, half to even, held to its range.
+pub(crate) fn float_integer(f: f64, base: &str) -> Result<Value> {
+    let (name, lo, hi) = match base {
+        "smallint" | "int2" => ("smallint", i16::MIN as f64, -(i16::MIN as f64)),
+        "integer" | "int" | "int4" => ("integer", i32::MIN as f64, -(i32::MIN as f64)),
+        _ => ("bigint", i64::MIN as f64, -(i64::MIN as f64)),
+    };
+    let r = f.round_ties_even();
+    if r.is_nan() || r < lo || r >= hi {
+        return Err(Error::new(format!("{name} out of range")));
+    }
+    Ok(Value::Int(r as i64))
+}
+
 /// Text read as a boolean, as PostgreSQL's boolean input reads it.
 fn boolean_of(t: &str) -> Result<Value> {
     super::question::truth(t)
@@ -696,6 +962,14 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
         (Value::Text(t), Value::Uuid(_)) if quoted(left) => {
             (Value::Uuid(crate::scalars::uuid_parse(t)?), y)
         }
+        (Value::Real(_) | Value::Double(_), Value::Text(t)) if quoted(right) => {
+            let t = float_cast(Value::Text(t.clone()), matches!(x, Value::Double(_)))?;
+            (x, t)
+        }
+        (Value::Text(t), Value::Real(_) | Value::Double(_)) if quoted(left) => (
+            float_cast(Value::Text(t.clone()), matches!(y, Value::Double(_)))?,
+            y,
+        ),
         (Value::Scalar(ty, _), Value::Text(t)) if quoted(right) => {
             let t = Value::Scalar(*ty, crate::scalars::scalar_parse(*ty, t)?);
             (x, t)
@@ -732,6 +1006,10 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
         }
         Expr::Nested(x) => ev(x)?,
         Expr::Value(v) => match &v.value {
+            SqlValue::Number(s, _) if s.contains(['e', 'E']) => {
+                let (m, sc) = numeric_parts(s)?;
+                Value::Num(m, sc)
+            }
             SqlValue::Number(s, _) => numeric_literal(s)?,
             SqlValue::SingleQuotedString(s) => Value::Text(s.clone()),
             SqlValue::Null => Value::Null,
@@ -767,6 +1045,8 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     .ok_or_else(|| Error::new("bigint out of range"))?,
             ),
             Value::Num(m, s) => Value::Num(-m, s),
+            Value::Real(f) => Value::Real(-f),
+            Value::Double(d) => Value::Double(-d),
             other => return Err(Error::new(format!("-{other:?} is not a number"))),
         },
         Expr::UnaryOp {
@@ -835,6 +1115,9 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 if x.is_null() || y.is_null() {
                     return Ok(Value::Null);
                 }
+                if let Some(v) = float_arith(op, &x, &y)? {
+                    return Ok(v);
+                }
                 if let Some(v) = scalar_arith(op, &x, &y)? {
                     return Ok(v);
                 }
@@ -893,6 +1176,8 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                             .ok_or_else(|| Error::new("bigint out of range"))?,
                     ),
                     Value::Num(m, s) => Value::Num(m.abs(), s),
+                    Value::Real(f) => Value::Real(f.abs()),
+                    Value::Double(d) => Value::Double(d.abs()),
                     other => return Err(Error::new(format!("abs of {other:?}"))),
                 },
                 _ => return Err(Error::new(format!("{e} is not read"))),
@@ -1101,6 +1386,9 @@ enum Acc {
     Greatest(Option<Value>),
     All(Option<bool>),
     Any(Option<bool>),
+    /// avg of a float: its rows, their sum and their sum of squared deviations, as
+    /// PostgreSQL's float8_accum folds them.
+    Avg(f64, f64, f64),
 }
 
 impl Acc {
@@ -1124,6 +1412,7 @@ impl Acc {
             "max" => Acc::Greatest(None),
             "bool_and" => Acc::All(None),
             "bool_or" => Acc::Any(None),
+            "avg" => Acc::Avg(0.0, 0.0, 0.0),
             _ => return Err(Error::new(format!("{call} is not read"))),
         };
         Ok((acc, Some(*x)))
@@ -1198,6 +1487,8 @@ impl Acc {
                         Value::Int(x) => Value::Num(x as i128, 0),
                         other => other,
                     }
+                } else if let Some(s) = float_arith(&BinaryOperator::Plus, acc, &v)? {
+                    s
                 } else if let Some(s) = scalar_arith(&BinaryOperator::Plus, acc, &v)? {
                     s
                 } else {
@@ -1230,6 +1521,33 @@ impl Acc {
                 let t = truth(&v)?.unwrap_or(false);
                 *a = Some(a.map_or(t, |x| x || t));
             }
+            Acc::Avg(n, sx, sxx) => {
+                let x = match v {
+                    Value::Real(f) => f64::from(f),
+                    Value::Double(d) => d,
+                    other => {
+                        return Err(Error::new(format!(
+                            "avg of {} is not read",
+                            kind_name(&other)
+                        )))
+                    }
+                };
+                let (n0, sx0, sxx0) = (*n, *sx, *sxx);
+                *n = n0 + 1.0;
+                *sx = sx0 + x;
+                if n0 > 0.0 {
+                    let t = x * *n - *sx;
+                    *sxx = sxx0 + t * t / (*n * n0);
+                    if sx.is_infinite() || sxx.is_infinite() {
+                        if !sx0.is_infinite() && !x.is_infinite() {
+                            return Err(out_of_range("overflow"));
+                        }
+                        *sxx = f64::NAN;
+                    }
+                } else if x.is_nan() || x.is_infinite() {
+                    *sxx = f64::NAN;
+                }
+            }
         }
         Ok(())
     }
@@ -1240,6 +1558,8 @@ impl Acc {
             Acc::Sum(v) => v.clone(),
             Acc::Least(b) | Acc::Greatest(b) => b.clone().unwrap_or(Value::Null),
             Acc::All(a) | Acc::Any(a) => a.map_or(Value::Null, Value::Bool),
+            Acc::Avg(n, sx, _) if *n > 0.0 => Value::Double(sx / n),
+            Acc::Avg(..) => Value::Null,
         }
     }
 }
@@ -1933,6 +2253,16 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                         Value::Bytes(any.downcast_ref::<BinaryArray>().unwrap().value(r).to_vec())
                     }
                     A::Boolean => Value::Bool(any.downcast_ref::<BooleanArray>().unwrap().value(r)),
+                    A::Float32 => Value::Real(
+                        any.downcast_ref::<arrow::array::Float32Array>()
+                            .unwrap()
+                            .value(r),
+                    ),
+                    A::Float64 => Value::Double(
+                        any.downcast_ref::<arrow::array::Float64Array>()
+                            .unwrap()
+                            .value(r),
+                    ),
                     A::FixedSizeBinary(16) => Value::Uuid(crate::scalars::uuid_key(
                         any.downcast_ref::<FixedSizeBinaryArray>()
                             .unwrap()
@@ -2019,6 +2349,22 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
                         _ => None,
                     })
                     .collect::<BooleanArray>(),
+            ),
+            (Some(Value::Real(_)), _) => Arc::new(
+                col()
+                    .map(|v| match v {
+                        Value::Real(f) => Some(*f),
+                        _ => None,
+                    })
+                    .collect::<arrow::array::Float32Array>(),
+            ),
+            (Some(Value::Double(_)), _) => Arc::new(
+                col()
+                    .map(|v| match v {
+                        Value::Double(d) => Some(*d),
+                        _ => None,
+                    })
+                    .collect::<arrow::array::Float64Array>(),
             ),
             (Some(Value::Uuid(_)), _) => {
                 Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(

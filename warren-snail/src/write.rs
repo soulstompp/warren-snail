@@ -58,6 +58,8 @@ impl Rows {
                     Values::Text(x) => x.resize(rows, None),
                     Values::Utf8(x) => x.resize(rows, None),
                     Values::Wide(x) => x.resize(rows, None),
+                    Values::Float4(x) => x.resize(rows, None),
+                    Values::Float8(x) => x.resize(rows, None),
                     _ => unreachable!("a column is read as plain values"),
                 }
                 columns.push(out);
@@ -95,6 +97,20 @@ impl Rows {
                         out.extend(
                             (0..a.len()).map(|r| crate::scalars::scalar_key_at(ty, a.as_ref(), r)),
                         );
+                    }
+                    (Values::Float4(out), ColumnType::Float4, DataType::Float32) => {
+                        let a = a
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float32Array>()
+                            .unwrap();
+                        out.extend(a.iter().map(|v| v.map(f32::to_bits)));
+                    }
+                    (Values::Float8(out), ColumnType::Float8, DataType::Float64) => {
+                        let a = a
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float64Array>()
+                            .unwrap();
+                        out.extend(a.iter().map(|v| v.map(f64::to_bits)));
                     }
                     (Values::Int(out), ColumnType::Boolean, DataType::Boolean) => {
                         let a = a.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -638,6 +654,7 @@ pub(crate) fn laid_out(
                     unsorted.push(KeyValue::Wide(v[r].unwrap()));
                     continue;
                 }
+                Values::Float4(_) | Values::Float8(_) => column.int(r).unwrap(),
                 Values::Int(v) => v[r].unwrap(),
             };
             if table.columns[l.column()].ty == ColumnType::Timestamptz

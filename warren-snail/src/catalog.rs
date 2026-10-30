@@ -50,6 +50,10 @@ pub enum ColumnType {
     Macaddr,
     /// A MAC address of 8 bytes, compared byte by byte.
     Macaddr8,
+    /// real: a float of 32 bits, `-0` equal to `0` and every NaN equal and above infinity.
+    Float4,
+    /// double precision: a float of 64 bits, compared as a real is.
+    Float8,
 }
 
 impl ColumnType {
@@ -62,14 +66,16 @@ impl ColumnType {
             | ColumnType::Oid
             | ColumnType::Xid
             | ColumnType::Cid
-            | ColumnType::Char => Some(4),
+            | ColumnType::Char
+            | ColumnType::Float4 => Some(4),
             ColumnType::Int8
             | ColumnType::Timestamptz
             | ColumnType::Numeric { .. }
             | ColumnType::Xid8
             | ColumnType::PgLsn
             | ColumnType::Money
-            | ColumnType::Macaddr8 => Some(8),
+            | ColumnType::Macaddr8
+            | ColumnType::Float8 => Some(8),
             ColumnType::Macaddr => Some(6),
             ColumnType::Uuid => Some(16),
             ColumnType::Text(_) | ColumnType::Bytes | ColumnType::Boolean => None,
@@ -86,6 +92,11 @@ impl ColumnType {
             ColumnType::Char => 8,
             _ => 0,
         }
+    }
+
+    /// Whether it is a float: a real or a double precision.
+    pub fn is_float(self) -> bool {
+        matches!(self, ColumnType::Float4 | ColumnType::Float8)
     }
 
     /// The bytes of a value the file writes as a fixed array of bytes and keys as a number: a
@@ -184,6 +195,8 @@ impl ColumnType {
             ColumnType::Money => "money".into(),
             ColumnType::Macaddr => "macaddr".into(),
             ColumnType::Macaddr8 => "macaddr8".into(),
+            ColumnType::Float4 => "real".into(),
+            ColumnType::Float8 => "double precision".into(),
         }
     }
 
@@ -209,6 +222,8 @@ impl ColumnType {
             ColumnType::Money => "money_ops",
             ColumnType::Macaddr => "macaddr_ops",
             ColumnType::Macaddr8 => "macaddr8_ops",
+            ColumnType::Float4 => "float4_ops",
+            ColumnType::Float8 => "float8_ops",
         }
     }
 
@@ -249,6 +264,11 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Xid8, Xid8)
             | (PgLsn, PgLsn)
             | (Macaddr | Macaddr8, Macaddr | Macaddr8)
+            | (
+                Int2 | Int4 | Int8 | Numeric { .. } | Float4 | Float8,
+                Float4 | Float8
+            )
+            | (Float4 | Float8, Int2 | Int4 | Int8 | Numeric { .. })
     )
 }
 
@@ -930,6 +950,24 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Bytea => ColumnType::Bytes,
         DataType::Boolean | DataType::Bool => ColumnType::Boolean,
         DataType::Uuid => ColumnType::Uuid,
+        DataType::Real | DataType::Float4 => ColumnType::Float4,
+        DataType::DoublePrecision | DataType::Float8 | DataType::Float(ExactNumberInfo::None) => {
+            ColumnType::Float8
+        }
+        DataType::Float(ExactNumberInfo::Precision(p)) => match p {
+            1..=24 => ColumnType::Float4,
+            25..=53 => ColumnType::Float8,
+            0 => {
+                return Err(Error::new(
+                    "precision for type float must be at least 1 bit",
+                ))
+            }
+            _ => {
+                return Err(Error::new(
+                    "precision for type float must be less than 54 bits",
+                ))
+            }
+        },
         DataType::Custom(name, args) if args.is_empty() => {
             let n = object_name(name);
             match n.strip_prefix("pg_catalog.").unwrap_or(&n) {
@@ -1429,7 +1467,7 @@ mod tests {
 
     #[test]
     fn a_type_not_held_is_refused() {
-        let e = refused("CREATE TABLE s.t (a double precision NOT NULL, PRIMARY KEY (a));");
+        let e = refused("CREATE TABLE s.t (a date NOT NULL, PRIMARY KEY (a));");
         assert!(e.contains("is not held"), "{e}");
     }
 

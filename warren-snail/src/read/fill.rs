@@ -56,6 +56,8 @@ fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
         (Datum::Text(s), _) => s.clone(),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()).text().unwrap_or_default(),
         (Datum::Wide(k), _) => crate::scalars::uuid_text(*k),
+        (Datum::Float4(b), _) => crate::scalars::float_text(u64::from(*b), false),
+        (Datum::Float8(b), _) => crate::scalars::float_text(*b, true),
     })
 }
 
@@ -193,6 +195,52 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             };
             Datum::Int(crate::scalars::mac_cast(from, to, v)?)
         }
+        (Float4, Float4) | (Float8, Float8) => d,
+        (Int2 | Int4 | Int8 | Numeric { .. } | Float4 | Float8, Float4 | Float8) => {
+            let v = value_of(&d, from);
+            let wide = to == Float8;
+            match super::pipeline::float_cast(v, wide)? {
+                Value::Real(f) => Datum::Float4(f.to_bits()),
+                Value::Double(f) => Datum::Float8(f.to_bits()),
+                _ => return Err(refused()),
+            }
+        }
+        (Float4 | Float8, Int2 | Int4 | Int8) => {
+            let f = match d {
+                Datum::Float4(b) => f64::from(f32::from_bits(b)),
+                Datum::Float8(b) => f64::from_bits(b),
+                _ => return Err(refused()),
+            };
+            let base = match to {
+                Int2 => "smallint",
+                Int4 => "integer",
+                _ => "bigint",
+            };
+            match super::pipeline::float_integer(f, base)? {
+                Value::Int(v) => Datum::Int(v),
+                _ => return Err(refused()),
+            }
+        }
+        (Float4 | Float8, Numeric { precision, scale }) => {
+            let (f, wide) = match d {
+                Datum::Float4(b) => (f64::from(f32::from_bits(b)), false),
+                Datum::Float8(b) => (f64::from_bits(b), true),
+                _ => return Err(refused()),
+            };
+            if !f.is_finite() {
+                return Err(Error::new(format!(
+                    "cannot convert {} to numeric({precision},{scale}): it holds no NaN or infinity",
+                    if f.is_nan() { "NaN" } else { "infinity" }
+                )));
+            }
+            let text = crate::scalars::float_numeric_text(f, wide);
+            let (m, s) = super::pipeline::numeric_parts(&text)?;
+            let units = rescale(m, s, scale as u32);
+            if units.unsigned_abs() >= 10u128.pow(precision as u32) {
+                return Err(Error::new("numeric field overflow"));
+            }
+            Datum::Int(units as i64)
+        }
         (Text(_), Char) => {
             let s = text_of(&d, from).unwrap_or_default();
             Datum::Int(crate::scalars::scalar_parse(Char, &s)?)
@@ -212,6 +260,8 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Text(s), _) => Value::Text(s.clone()),
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()),
         (Datum::Wide(k), _) => Value::Uuid(*k),
+        (Datum::Float4(b), _) => Value::Real(f32::from_bits(*b)),
+        (Datum::Float8(b), _) => Value::Double(f64::from_bits(*b)),
     }
 }
 
@@ -235,6 +285,8 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
         Value::Bool(b) => (Datum::Int(b as i64), ColumnType::Boolean),
         Value::Uuid(k) => (Datum::Wide(k), ColumnType::Uuid),
         Value::Scalar(ty, k) => (Datum::Int(k), ty),
+        Value::Real(f) => (Datum::Float4(f.to_bits()), ColumnType::Float4),
+        Value::Double(d) => (Datum::Float8(d.to_bits()), ColumnType::Float8),
     };
     assign(d, from, to, what)
 }

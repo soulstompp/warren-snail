@@ -196,6 +196,8 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Char => 8,
             ColumnType::Macaddr => 48,
             ColumnType::Macaddr8 => 64,
+            ColumnType::Float4 => 32,
+            ColumnType::Float8 => 64,
             ColumnType::Timestamptz => 7,
             ColumnType::Boolean => 1,
             ColumnType::Uuid => 128,
@@ -231,7 +233,9 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             | ColumnType::Char
             | ColumnType::Money
             | ColumnType::Macaddr
-            | ColumnType::Macaddr8 => {
+            | ColumnType::Macaddr8
+            | ColumnType::Float4
+            | ColumnType::Float8 => {
                 let bits = sublevel_count(level, ty, 0);
                 let low = -(1i128 << (bits - 1));
                 let biased = (key as i128 - low) as u64;

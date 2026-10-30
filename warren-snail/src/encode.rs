@@ -12,8 +12,8 @@ use parquet::column::page::{Page, PageReader};
 use parquet::column::reader::{get_column_reader, get_typed_column_reader};
 use parquet::column::writer::{ColumnCloseResult, ColumnWriterImpl};
 use parquet::data_type::{
-    BoolType, ByteArray, ByteArrayType, DataType, FixedLenByteArray, FixedLenByteArrayType,
-    Int32Type, Int64Type,
+    BoolType, ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArray,
+    FixedLenByteArrayType, FloatType, Int32Type, Int64Type,
 };
 use parquet::file::metadata::ColumnChunkMetaData;
 use parquet::file::properties::{WriterProperties, WriterVersion};
@@ -116,6 +116,8 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
         ),
         ColumnType::Money => (PhysicalType::INT64, None),
         ColumnType::Macaddr | ColumnType::Macaddr8 => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
+        ColumnType::Float4 => (PhysicalType::FLOAT, None),
+        ColumnType::Float8 => (PhysicalType::DOUBLE, None),
     };
     let repetition = if nullable {
         Repetition::OPTIONAL
@@ -241,6 +243,12 @@ fn write(
                 )
             })?
         }
+        (Values::Float4(v), PhysicalType::FLOAT) => {
+            write_typed::<FloatType, u32>(desc, p, v, rows_per_page, |&b| f32::from_bits(b))?
+        }
+        (Values::Float8(v), PhysicalType::DOUBLE) => {
+            write_typed::<DoubleType, u64>(desc, p, v, rows_per_page, |&b| f64::from_bits(b))?
+        }
         (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
             write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, |&k| {
                 FixedLenByteArray::from(crate::scalars::uuid_bytes(k).to_vec())
@@ -335,6 +343,14 @@ fn distinct(values: &Values, ty: ColumnType) -> (usize, usize) {
         Values::Wide(v) => {
             let d: HashSet<i128> = v.iter().flatten().copied().collect();
             (d.len(), d.len() * ty.width().unwrap_or(16))
+        }
+        Values::Float4(v) => {
+            let d: HashSet<u32> = v.iter().flatten().copied().collect();
+            (d.len(), d.len() * 4)
+        }
+        Values::Float8(v) => {
+            let d: HashSet<u64> = v.iter().flatten().copied().collect();
+            (d.len(), d.len() * 8)
         }
         Values::Text(v) => {
             let d: HashSet<&str> = v.iter().flatten().map(String::as_str).collect();
@@ -512,6 +528,32 @@ pub fn decode(
             }
             Ok(Values::Int(spread(
                 v.into_iter().map(|x| crate::scalars::key_of_raw(ty, x)),
+                &defs,
+                nullable,
+            )))
+        }
+        ColumnType::Float4 => {
+            let mut r = get_typed_column_reader::<FloatType>(column);
+            let mut v: Vec<f32> = Vec::new();
+            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            if n != rows {
+                return Err(short(n));
+            }
+            Ok(Values::Float4(spread(
+                v.into_iter().map(f32::to_bits),
+                &defs,
+                nullable,
+            )))
+        }
+        ColumnType::Float8 => {
+            let mut r = get_typed_column_reader::<DoubleType>(column);
+            let mut v: Vec<f64> = Vec::new();
+            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            if n != rows {
+                return Err(short(n));
+            }
+            Ok(Values::Float8(spread(
+                v.into_iter().map(f64::to_bits),
                 &defs,
                 nullable,
             )))

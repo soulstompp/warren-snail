@@ -22,6 +22,10 @@ pub enum Values {
     },
     /// Values keyed in 128 bits, as their keys: a uuid's.
     Wide(Vec<Option<i128>>),
+    /// Reals, as their own bits; each one's key is its class's.
+    Float4(Vec<Option<u32>>),
+    /// Double precisions, as their own bits.
+    Float8(Vec<Option<u64>>),
 }
 
 /// The bytes Parquet writes before each plain text value: its length.
@@ -34,6 +38,8 @@ impl Values {
             ColumnType::Text(_) => Values::Text(Vec::new()),
             ColumnType::Bytes => Values::Utf8(Vec::new()),
             ColumnType::Uuid => Values::Wide(Vec::new()),
+            ColumnType::Float4 => Values::Float4(Vec::new()),
+            ColumnType::Float8 => Values::Float8(Vec::new()),
             _ => Values::Int(Vec::new()),
         }
     }
@@ -45,6 +51,8 @@ impl Values {
             Values::Utf8(v) => v.len(),
             Values::Dict { codes, .. } => codes.len(),
             Values::Wide(v) => v.len(),
+            Values::Float4(v) => v.len(),
+            Values::Float8(v) => v.len(),
         }
     }
 
@@ -59,6 +67,8 @@ impl Values {
             Values::Utf8(v) => v[i].is_none(),
             Values::Dict { codes, .. } => codes[i].is_none(),
             Values::Wide(v) => v[i].is_none(),
+            Values::Float4(v) => v[i].is_none(),
+            Values::Float8(v) => v[i].is_none(),
         }
     }
 
@@ -66,9 +76,12 @@ impl Values {
         (0..self.len()).filter(|&i| self.is_null(i)).count()
     }
 
+    /// Row `i`'s key in 64 bits: a number's own value, a float's class's.
     pub fn int(&self, i: usize) -> Option<i64> {
         match self {
             Values::Int(v) => v[i],
+            Values::Float4(v) => v[i].map(crate::scalars::float4_key),
+            Values::Float8(v) => v[i].map(crate::scalars::float8_key),
             Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } | Values::Wide(_) => None,
         }
     }
@@ -77,8 +90,18 @@ impl Values {
     pub fn wide(&self, i: usize) -> Option<i128> {
         match self {
             Values::Int(v) => v[i].map(i128::from),
+            Values::Float4(_) | Values::Float8(_) => self.int(i).map(i128::from),
             Values::Wide(v) => v[i],
             Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => None,
+        }
+    }
+
+    /// Row `i`'s own bits, for a float: a real's in the low 32.
+    pub fn bits(&self, i: usize) -> Option<u64> {
+        match self {
+            Values::Float4(v) => v[i].map(u64::from),
+            Values::Float8(v) => v[i],
+            _ => None,
         }
     }
 
@@ -107,7 +130,7 @@ impl Values {
             Values::Dict { dict, codes } => {
                 codes[i].map(|c| std::str::from_utf8(dict[c as usize].data()).unwrap_or_default())
             }
-            Values::Int(_) | Values::Wide(_) => None,
+            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => None,
         }
     }
 
@@ -117,14 +140,19 @@ impl Values {
             Values::Utf8(v) => v[i].clone(),
             Values::Dict { dict, codes } => codes[i].map(|c| dict[c as usize].clone()),
             Values::Text(v) => v[i].as_deref().map(ByteArray::from),
-            Values::Int(_) | Values::Wide(_) => None,
+            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => None,
         }
     }
 
     pub fn ints(&self) -> Option<&[Option<i64>]> {
         match self {
             Values::Int(v) => Some(v),
-            Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } | Values::Wide(_) => None,
+            Values::Text(_)
+            | Values::Utf8(_)
+            | Values::Dict { .. }
+            | Values::Wide(_)
+            | Values::Float4(_)
+            | Values::Float8(_) => None,
         }
     }
 
@@ -139,6 +167,8 @@ impl Values {
                 codes: rows.iter().map(|&r| codes[r]).collect(),
             },
             Values::Wide(v) => Values::Wide(rows.iter().map(|&r| v[r]).collect()),
+            Values::Float4(v) => Values::Float4(rows.iter().map(|&r| v[r]).collect()),
+            Values::Float8(v) => Values::Float8(rows.iter().map(|&r| v[r]).collect()),
         }
     }
 
@@ -150,6 +180,8 @@ impl Values {
             (Values::Utf8(a), Values::Utf8(b)) => a.push(b[i].clone()),
             (Values::Utf8(a), b @ Values::Dict { .. }) => a.push(b.text_value(i)),
             (Values::Wide(a), Values::Wide(b)) => a.push(b[i]),
+            (Values::Float4(a), Values::Float4(b)) => a.push(b[i]),
+            (Values::Float8(a), Values::Float8(b)) => a.push(b[i]),
             _ => panic!("a column's values pushed onto another kind"),
         }
     }
@@ -164,7 +196,7 @@ impl Values {
                 .flatten()
                 .map(|&c| dict[c as usize].len() as u64)
                 .sum(),
-            Values::Int(_) | Values::Wide(_) => 0,
+            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => 0,
         }
     }
 
@@ -181,7 +213,7 @@ impl Values {
             (Values::Dict { dict, codes }, None) => {
                 codes[i].map_or(0, |c| dict[c as usize].len() as u64 + LENGTH_PREFIX)
             }
-            (Values::Int(_) | Values::Wide(_), None) => 0,
+            (Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_), None) => 0,
         }
     }
 
@@ -208,7 +240,7 @@ impl Values {
                 })
                 .max()
                 .unwrap_or(0),
-            Values::Int(_) | Values::Wide(_) => 0,
+            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => 0,
         }
     }
 }

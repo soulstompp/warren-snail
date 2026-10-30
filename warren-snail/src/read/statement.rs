@@ -23,13 +23,19 @@ pub enum Datum {
     Bytes(Vec<u8>),
     /// A value keyed in 128 bits, as its key: a uuid's.
     Wide(i128),
+    /// A real, as its own bits.
+    Float4(u32),
+    /// A double precision, as its own bits.
+    Float8(u64),
 }
 
 impl Datum {
-    /// A number's value, or a wide value's key, in 128 bits.
+    /// A number's value, or a wide value's or a float's key, in 128 bits.
     pub fn wide(&self) -> Option<i128> {
         match self {
             Datum::Int(v) => Some(*v as i128),
+            Datum::Float4(b) => Some(crate::scalars::float4_key(*b) as i128),
+            Datum::Float8(b) => Some(crate::scalars::float8_key(*b) as i128),
             Datum::Wide(k) => Some(*k),
             _ => None,
         }
@@ -161,6 +167,22 @@ pub(crate) fn is_literal(e: &Expr) -> bool {
     }
 }
 
+/// A number written out, a minus sign before it or not, as its text.
+pub(crate) fn number_text(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => Some(s.clone()),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => number_text(expr).map(|s| format!("-{s}")),
+        Expr::Nested(x) => number_text(x),
+        _ => None,
+    }
+}
+
 /// A number written out as PostgreSQL types it: an integer, a bigint past an integer's range, a
 /// numeric where it has a point; with its value.
 pub(super) fn number_datum(e: &Expr) -> Option<(Datum, ColumnType)> {
@@ -239,6 +261,19 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
         ColumnType::Uuid => Datum::Wide(crate::scalars::uuid_parse(
             &text_literal(e).map_err(|_| wrong())?,
         )?),
+        ColumnType::Float4 | ColumnType::Float8 => {
+            let wide = col.ty == ColumnType::Float8;
+            let text = match text_literal(e) {
+                Ok(s) => s,
+                Err(_) => number_text(e).ok_or_else(wrong)?,
+            };
+            let bits = crate::scalars::float_parse(&text, wide)?;
+            if wide {
+                Datum::Float8(bits)
+            } else {
+                Datum::Float4(bits as u32)
+            }
+        }
         ty @ (ColumnType::Oid
         | ColumnType::Xid
         | ColumnType::Cid

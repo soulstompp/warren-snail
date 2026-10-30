@@ -818,6 +818,8 @@ impl Snail {
                                 v.int(i).and_then(month_of).map_or(Cell::Null, Cell::Int)
                             } else if let Values::Wide(w) = v {
                                 w[i].map_or(Cell::Null, Cell::Wide)
+                            } else if let (Some(key), Some(bits)) = (v.int(i), v.bits(i)) {
+                                Cell::Float(crate::read::answer::Float { key, bits })
                             } else {
                                 v.int(i).map_or(Cell::Null, Cell::Int)
                             }
