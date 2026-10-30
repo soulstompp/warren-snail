@@ -1092,7 +1092,12 @@ pub fn cut_checked(table: &Table, order: &Order, head: &Head) -> Result<()> {
             let reads = match now {
                 Ok(n) if n.is_empty() => "no collation".to_string(),
                 Ok(n) => n,
-                Err(e) => e.to_string(),
+                Err(e) => {
+                    return Err(Error::new(format!(
+                        "{}: the order {} was cut on {} under {had}: {e}",
+                        table.name, order.name, column.name
+                    )))
+                }
             };
             return Err(Error::new(format!(
                 "{}: the order {} was cut on {} under {}, and this warren-snail reads it under \

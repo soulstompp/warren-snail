@@ -591,12 +591,16 @@ impl Snail {
         let mut sent: Vec<Dict> = vec![None; columns.len()];
         let lead = sink.lead();
         let leaves = order.leaves(table);
-        // Each column's collator, where a library orders its text.
-        let orderers = table
-            .columns
+        // Each column's collator the round reads, where a library orders its text.
+        let mut orderers: Vec<Coll> = vec![None; table.columns.len()];
+        for c in columns
             .iter()
-            .map(crate::catalog::Column::orderer)
-            .collect::<Result<Vec<_>>>()?;
+            .map(|&(c, _)| c)
+            .chain(want.side.texts.iter().map(|t| t.column))
+            .chain(order.levels.iter().map(|l| l.column()))
+        {
+            orderers[c] = table.columns[c].orderer()?;
+        }
         let descs = crate::write::leaf_descriptors(table, order)?;
         for br in &plan.reads[blocks] {
             // For every leaf read, its runs of pages decoded: (slot, [(first row, values)]).
