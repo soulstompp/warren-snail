@@ -410,7 +410,10 @@ fn three_tables_and_four_are_read_from_their_scope_outward() {
          WHERE t.theme_id = {theme} AND b.builder_id = {builder}"
     );
     let round = same(&mut snail, &q, vec![vec![s(n)]]);
-    assert!(round.order.starts_with("themes_pkey+b_row+"), "{round:?}");
+    assert_eq!(
+        round.order, "themes_pkey+b_row+owned_pkey+sets_pkey",
+        "{round:?}"
+    );
 }
 
 #[test]
@@ -436,6 +439,10 @@ fn an_outer_join_keeps_its_driving_side_and_reads_the_other_kept_to_its_keys() {
     let round = same(&mut snail, &q, want.clone());
     assert_eq!(round.order, "s_theme+o_set", "{round:?}");
     assert!(want.iter().any(|r| r[1].is_none()), "a set nobody owns");
+    assert!(
+        exact_of(&round, "o_set") < whole(&snail, "o_set", &["set_num", "builder_id", "row_no"]),
+        "the table a LEFT JOIN may leave NULL is kept to the keys of the table it keeps: {round:?}"
+    );
     // A RIGHT JOIN keeps the table after it.
     let q = format!(
         "SELECT s.set_num, o.builder_id, o.row_no FROM j.owned o \
@@ -464,7 +471,11 @@ fn an_outer_join_keeps_its_driving_side_and_reads_the_other_kept_to_its_keys() {
          LEFT JOIN j.owned o ON o.set_num = s.set_num AND o.builder_id <= 600 \
          WHERE s.theme_id = {theme}"
     );
-    same(&mut snail, &q, narrowed);
+    let round = same(&mut snail, &q, narrowed);
+    assert_eq!(
+        round.order, "s_theme+owned_pkey",
+        "its builders narrow the rows owned: {round:?}"
+    );
     // A condition on the table it keeps, in its ON, joins only its rows that pass, and keeps the rest.
     let mut kept: Vec<Row> = Vec::new();
     for st in d.sets.iter().filter(|st| st.theme == theme) {
@@ -532,7 +543,11 @@ fn an_outer_join_keeps_its_driving_side_and_reads_the_other_kept_to_its_keys() {
     let q = "SELECT b.buy_id, o.set_num FROM j.buys b \
              LEFT JOIN j.owned o ON o.builder_id = b.builder_id AND o.row_no = b.row_no \
              WHERE o.builder_id = 77";
-    same(&mut snail, q, want);
+    let round = same(&mut snail, q, want);
+    assert!(
+        round.order.starts_with("owned_pkey+"),
+        "an inner join, the builder fixes the rows owned first: {round:?}"
+    );
 
     // A chain of outer joins: a theme's sets, their rows owned, and the buys of each.
     let theme_sets: Vec<&Set> = d.sets.iter().filter(|st| st.theme == theme).collect();
@@ -706,6 +721,11 @@ fn a_join_on_text_and_the_tables_named_by_commas_are_read_as_an_inner_join() {
          WHERE s.theme_id = t.theme_id AND t.theme_id = {theme}"
     );
     same(&mut snail, &q, vec![vec![s(n)]]);
+    // A join on integers of two widths.
+    let ids: BTreeSet<i64> = d.spans.iter().map(|x| x.0).collect();
+    let n = d.buys.iter().filter(|b| ids.contains(&b.id)).count();
+    let q = "SELECT count(*) FROM j.buys b JOIN j.spans s ON s.span_id = b.buy_id";
+    same(&mut snail, q, vec![vec![s(n)]]);
 }
 
 #[test]
