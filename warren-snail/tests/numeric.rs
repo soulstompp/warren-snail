@@ -142,6 +142,7 @@ fn a_numeric_held_as_its_text_is_cut_by_its_class_and_answers_its_own_text() {
 }
 
 #[test]
+#[cfg(feature = "standalone")]
 fn nan_lies_on_a_numeric_s_pages_as_10_to_its_precision_and_out_names_it() {
     let path = tmp("numeric-nan.snail");
     let catalog = Catalog::parse(
@@ -292,6 +293,7 @@ fn a_sum_past_128_bits_is_held_whole() {
 }
 
 #[test]
+#[cfg(feature = "standalone")]
 fn a_snail_of_format_eight_refuses_a_numeric_past_18_digits_and_a_nan_by_name() {
     for (ddl, column) in [
         (
@@ -426,6 +428,7 @@ fn a_pipeline_computes_a_numeric_at_numeric_c_s_scales() {
 }
 
 #[test]
+#[cfg(feature = "standalone")]
 fn a_numeric_is_written_held_to_its_typmod_and_assigned_as_postgresql_assigns_it() {
     let path = tmp("numeric-assign.snail");
     let catalog = Catalog::parse(
@@ -544,6 +547,7 @@ fn a_pipeline_divides_integers_as_postgresql_does() {
 }
 
 #[test]
+#[cfg(feature = "standalone")]
 fn a_numeric_past_18_digits_is_assigned_from_an_answer() {
     let path = tmp("numeric-select.snail");
     let catalog = Catalog::parse(
@@ -569,5 +573,33 @@ fn a_numeric_past_18_digits_is_assigned_from_an_answer() {
             Some("1234567890123456789012345.6700".into()),
             Some("NaN".into())
         ]
+    );
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_numeric_held_as_its_text_goes_out_naming_no_sorting_column() {
+    // Its rows lie in their classes' order, 2 before 10, which is not its text's.
+    let path = tmp("numeric-text-out.snail");
+    let catalog =
+        Catalog::parse("CREATE TABLE s.u (v numeric NOT NULL, PRIMARY KEY (v));").unwrap();
+    let rows = Rows {
+        columns: vec![Values::Text(vec![Some("2".into()), Some("10".into())])],
+    };
+    write(&path, &catalog, &[("s.u".into(), rows)]).unwrap();
+    let dir = tmp("numeric-text-out-parquet");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let outs = Snail::open_writing(&path).unwrap().out(&dir).unwrap();
+    let reader = parquet::file::reader::SerializedFileReader::new(
+        std::fs::File::open(&outs[0].file).unwrap(),
+    )
+    .unwrap();
+    let meta = parquet::file::reader::FileReader::metadata(&reader).clone();
+    assert_eq!(meta.row_group(0).sorting_columns(), None);
+    let (batches, _) = weather::parquet_of(&outs[0].file);
+    assert_eq!(
+        texts(batches[0].column(0).as_ref()),
+        [Some("2".into()), Some("10".into())]
     );
 }

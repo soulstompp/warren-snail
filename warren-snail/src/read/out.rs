@@ -332,11 +332,15 @@ impl Snail {
                 .with_fields(fields)
                 .build()?,
         );
-        // Each level of the order sorts on its column's leaves, each as its index among the file's.
+        // Each level of the order sorts on its column's leaves, each as its index among the file's;
+        // a numeric held as its text lies in its classes' order, not its text's, and names none.
         let sorting = order
             .levels
             .iter()
             .map(|l| match l {
+                Level::Column(c) if matches!(table.columns[*c].ty, ColumnType::NumericText(_)) => {
+                    None
+                }
                 Level::Column(c) => Some(
                     leaves
                         .iter()
