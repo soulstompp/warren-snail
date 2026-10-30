@@ -90,6 +90,9 @@ pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
             numeric_of(d, from)?.to_string()
         }
         (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => crate::scalars::scalar_text(ty, *v),
+        (Datum::Int(v), ty @ ColumnType::Composed(_)) => {
+            crate::composed::scalar_out(ty, &Datum::Int(*v))
+        }
         (Datum::Int(v), _) => v.to_string(),
         (Datum::Text(s), _) => s.clone(),
         (Datum::Bytes(k), ty) if ty.is_bits() => crate::strings::bits_text(k),
@@ -97,6 +100,7 @@ pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
         (Datum::Wide(k), _) => crate::scalars::uuid_text(*k),
         (Datum::Float4(b), _) => crate::scalars::float_text(u64::from(*b), false),
         (Datum::Float8(b), _) => crate::scalars::float_text(*b, true),
+        (Datum::Compound(c), ty) => crate::composed::text_out(ty, &c.item),
     })
 }
 
@@ -251,6 +255,7 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         | (Char, Char)
         | (Money, Money)
         | (Tid, Tid) => d,
+        (Composed(a), Composed(b)) if a == b => d,
         // A reg* type is an oid to PostgreSQL's casts: from and to one, binary-coercible, as are a
         // function's two and an operator's two to each other.
         (Oid | Reg(..), Oid | Reg(..))
@@ -365,6 +370,14 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Int(v), ColumnType::Boolean) => Value::Bool(*v != 0),
         (_, ty) if ty.is_numeric() => numeric_of(d, ty).map_or(Value::Null, Value::of_numeric),
         (Datum::Int(v), ty) if crate::scalars::is_scalar(ty) => Value::Scalar(ty, *v),
+        // An enum: its rank, held whole.
+        (Datum::Int(v), ty @ ColumnType::Composed(_)) => Value::Composed(
+            ty,
+            std::sync::Arc::new(crate::composed::Compound::new(
+                ty,
+                crate::composed::Item::Scalar(Datum::Int(*v)),
+            )),
+        ),
         (Datum::Int(v), _) => Value::Int(*v),
         (Datum::Text(s), ColumnType::Bpchar(_) | ColumnType::Name) => Value::Str(ty, s.clone()),
         (Datum::Text(s), _) => Value::Text(s.clone()),
@@ -373,6 +386,7 @@ pub fn value_of(d: &Datum, ty: ColumnType) -> Value {
         (Datum::Wide(k), _) => Value::Uuid(*k),
         (Datum::Float4(b), _) => Value::Real(f32::from_bits(*b)),
         (Datum::Float8(b), _) => Value::Double(f64::from_bits(*b)),
+        (Datum::Compound(c), ty) => Value::Composed(ty, c.clone()),
     }
 }
 
@@ -398,6 +412,11 @@ pub fn assign_value(v: Value, to: ColumnType, what: &str) -> Result<Datum> {
         Value::Double(d) => (Datum::Float8(d.to_bits()), ColumnType::Float8),
         Value::Str(ty, s) => (Datum::Text(s), ty),
         Value::Bits(ty, k) => (Datum::Bytes(k), ty),
+        Value::Composed(ty, c) => match &c.item {
+            crate::composed::Item::Null => return Ok(Datum::Null),
+            crate::composed::Item::Scalar(d) => (d.clone(), ty),
+            _ => (Datum::Compound(c), ty),
+        },
     };
     assign(d, from, to, what)
 }
@@ -500,6 +519,107 @@ pub fn check(table: &Table, row: &Row) -> Result<()> {
                     table.name, k.name
                 )))
             }
+        }
+    }
+    Ok(())
+}
+
+/// The DEFAULT a domain gives a column that names it and gives none of its own: its own, or its
+/// base domain's.
+pub fn domain_default<'a>(
+    domains: &'a [crate::catalog::Domain],
+    name: &str,
+) -> Option<&'a sqlparser::ast::Expr> {
+    let d = domains.iter().find(|d| d.name == name)?;
+    d.default
+        .as_ref()
+        .or_else(|| domain_default(domains, &d.base))
+}
+
+/// Refuses a value a domain does not allow: a NULL where it is NOT NULL, or one a CHECK of its own
+/// or of its base domain finds false.
+fn meets_domain(
+    domains: &[crate::catalog::Domain],
+    name: &str,
+    ty: ColumnType,
+    d: &Datum,
+    release: u8,
+) -> Result<()> {
+    let Some(dom) = domains.iter().find(|x| x.name == name) else {
+        return Ok(());
+    };
+    meets_domain(domains, &dom.base, ty, d, release)?;
+    if dom.not_null && *d == Datum::Null {
+        return Err(Error::new(format!(
+            "domain {} does not allow null values",
+            dom.name
+        )));
+    }
+    let names = ["value".to_string()];
+    let value = [value_of(d, ty)];
+    for k in &dom.checks {
+        match eval_on(&k.check, &names, &value, release, &Casings::default())? {
+            Value::Bool(false) => {
+                return Err(Error::new(format!(
+                    "value for domain {} violates check constraint \"{}\"",
+                    dom.name, k.name
+                )))
+            }
+            Value::Null | Value::Bool(true) => {}
+            other => {
+                return Err(Error::new(format!(
+                    "{}: the CHECK {} gives {other:?}, not a truth",
+                    dom.name, k.name
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a part of a value of type `ty` that a domain its type names does not allow: an array's
+/// elements, a composite's fields, each in turn.
+fn meets_parts(
+    domains: &[crate::catalog::Domain],
+    ty: ColumnType,
+    item: &crate::composed::Item,
+    release: u8,
+) -> Result<()> {
+    use crate::composed::{datum_of, Composed, Item};
+    let ColumnType::Composed(r) = ty else {
+        return Ok(());
+    };
+    match (r.def(), item) {
+        (Composed::Array { element, domain }, Item::Array { elements, .. }) => {
+            for e in elements {
+                if let Some(d) = domain {
+                    meets_domain(domains, d, *element, &datum_of(*element, e), release)?;
+                }
+                meets_parts(domains, *element, e, release)?;
+            }
+        }
+        (Composed::Record { fields, .. }, Item::Record(values)) => {
+            for (f, v) in fields.iter().zip(values) {
+                if let Some(d) = &f.domain {
+                    meets_domain(domains, d, f.ty, &datum_of(f.ty, v), release)?;
+                }
+                meets_parts(domains, f.ty, v, release)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Refuses a row whose values a domain their columns name does not allow, or whose parts a domain
+/// an array's element or a composite's field names does not.
+pub fn check_domains(domains: &[crate::catalog::Domain], table: &Table, row: &Row) -> Result<()> {
+    for (col, d) in table.columns.iter().zip(row) {
+        if let Some(name) = &col.domain {
+            meets_domain(domains, name, col.ty, d, table.release)?;
+        }
+        if let Datum::Compound(c) = d {
+            meets_parts(domains, col.ty, &c.item, table.release)?;
         }
     }
     Ok(())

@@ -2,6 +2,7 @@
 
 pub mod carry;
 pub mod catalog;
+pub mod composed;
 pub mod cut;
 mod ddl;
 pub mod directory;

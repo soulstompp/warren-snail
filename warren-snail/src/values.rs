@@ -2,6 +2,8 @@
 //! text.
 
 use crate::catalog::ColumnType;
+use crate::composed::{Compound, Nested};
+use crate::read::statement::Datum;
 use parquet::data_type::ByteArray;
 use std::sync::Arc;
 
@@ -26,6 +28,10 @@ pub enum Values {
     Float4(Vec<Option<u32>>),
     /// Double precisions, as their own bits.
     Float8(Vec<Option<u64>>),
+    /// Values of a composed type held as a tree of leaves, each held whole.
+    Composed(Vec<Option<Arc<Compound>>>),
+    /// One leaf of a composed column's tree: its levels, and a value an entry of them.
+    Nested(Box<Nested>),
 }
 
 /// The bytes Parquet writes before each plain text value: its length.
@@ -46,7 +52,42 @@ impl Values {
             ColumnType::NumericText(_) => Values::Text(Vec::new()),
             ColumnType::Float4 => Values::Float4(Vec::new()),
             ColumnType::Float8 => Values::Float8(Vec::new()),
+            ty if ty.is_nested() => Values::Composed(Vec::new()),
             _ => Values::Int(Vec::new()),
+        }
+    }
+
+    /// No values yet, of the kind `other` holds.
+    pub fn new_like(other: &Values) -> Values {
+        match other {
+            Values::Int(_) => Values::Int(Vec::new()),
+            Values::Text(_) => Values::Text(Vec::new()),
+            Values::Utf8(_) | Values::Dict { .. } => Values::Utf8(Vec::new()),
+            Values::Wide(_) => Values::Wide(Vec::new()),
+            Values::Float4(_) => Values::Float4(Vec::new()),
+            Values::Float8(_) => Values::Float8(Vec::new()),
+            Values::Composed(_) => Values::Composed(Vec::new()),
+            Values::Nested(n) => Values::Nested(Box::new(Nested {
+                values: Values::new_like(&n.values),
+                defs: Vec::new(),
+                reps: Vec::new(),
+                starts: Vec::new(),
+            })),
+        }
+    }
+
+    /// Appends a NULL.
+    pub fn push_null(&mut self) {
+        match self {
+            Values::Int(v) => v.push(None),
+            Values::Text(v) => v.push(None),
+            Values::Utf8(v) => v.push(None),
+            Values::Dict { codes, .. } => codes.push(None),
+            Values::Wide(v) => v.push(None),
+            Values::Float4(v) => v.push(None),
+            Values::Float8(v) => v.push(None),
+            Values::Composed(v) => v.push(None),
+            Values::Nested(_) => panic!("a NULL pushed onto a leaf without its levels"),
         }
     }
 
@@ -59,6 +100,8 @@ impl Values {
             Values::Wide(v) => v.len(),
             Values::Float4(v) => v.len(),
             Values::Float8(v) => v.len(),
+            Values::Composed(v) => v.len(),
+            Values::Nested(n) => n.rows(),
         }
     }
 
@@ -75,6 +118,8 @@ impl Values {
             Values::Wide(v) => v[i].is_none(),
             Values::Float4(v) => v[i].is_none(),
             Values::Float8(v) => v[i].is_none(),
+            Values::Composed(v) => v[i].is_none(),
+            Values::Nested(n) => n.defs[n.starts[i] as usize] == 0,
         }
     }
 
@@ -88,7 +133,12 @@ impl Values {
             Values::Int(v) => v[i],
             Values::Float4(v) => v[i].map(crate::scalars::float4_key),
             Values::Float8(v) => v[i].map(crate::scalars::float8_key),
-            Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } | Values::Wide(_) => None,
+            Values::Text(_)
+            | Values::Utf8(_)
+            | Values::Dict { .. }
+            | Values::Wide(_)
+            | Values::Composed(_)
+            | Values::Nested(_) => None,
         }
     }
 
@@ -98,7 +148,11 @@ impl Values {
             Values::Int(v) => v[i].map(i128::from),
             Values::Float4(_) | Values::Float8(_) => self.int(i).map(i128::from),
             Values::Wide(v) => v[i],
-            Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => None,
+            Values::Text(_)
+            | Values::Utf8(_)
+            | Values::Dict { .. }
+            | Values::Composed(_)
+            | Values::Nested(_) => None,
         }
     }
 
@@ -127,6 +181,7 @@ impl Values {
         }
     }
 
+    /// Row `i`'s text; a composed value's key, written as text that sorts as the key does.
     pub fn text(&self, i: usize) -> Option<&str> {
         match self {
             Values::Text(v) => v[i].as_deref(),
@@ -136,7 +191,12 @@ impl Values {
             Values::Dict { dict, codes } => {
                 codes[i].map(|c| std::str::from_utf8(dict[c as usize].data()).unwrap_or_default())
             }
-            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => None,
+            Values::Composed(v) => v[i].as_ref().map(|c| &*c.hex),
+            Values::Int(_)
+            | Values::Wide(_)
+            | Values::Float4(_)
+            | Values::Float8(_)
+            | Values::Nested(_) => None,
         }
     }
 
@@ -146,7 +206,23 @@ impl Values {
             Values::Utf8(v) => v[i].clone(),
             Values::Dict { dict, codes } => codes[i].map(|c| dict[c as usize].clone()),
             Values::Text(v) => v[i].as_deref().map(ByteArray::from),
-            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => None,
+            // A composed value's key, written as text that sorts as the key does.
+            Values::Composed(v) => v[i]
+                .as_ref()
+                .map(|c| ByteArray::from(c.hex.as_bytes().to_vec())),
+            Values::Int(_)
+            | Values::Wide(_)
+            | Values::Float4(_)
+            | Values::Float8(_)
+            | Values::Nested(_) => None,
+        }
+    }
+
+    /// Row `i`'s composed value.
+    pub fn compound(&self, i: usize) -> Option<&Arc<Compound>> {
+        match self {
+            Values::Composed(v) => v[i].as_ref(),
+            _ => None,
         }
     }
 
@@ -158,7 +234,9 @@ impl Values {
             | Values::Dict { .. }
             | Values::Wide(_)
             | Values::Float4(_)
-            | Values::Float8(_) => None,
+            | Values::Float8(_)
+            | Values::Composed(_)
+            | Values::Nested(_) => None,
         }
     }
 
@@ -175,6 +253,8 @@ impl Values {
             Values::Wide(v) => Values::Wide(rows.iter().map(|&r| v[r]).collect()),
             Values::Float4(v) => Values::Float4(rows.iter().map(|&r| v[r]).collect()),
             Values::Float8(v) => Values::Float8(rows.iter().map(|&r| v[r]).collect()),
+            Values::Composed(v) => Values::Composed(rows.iter().map(|&r| v[r].clone()).collect()),
+            Values::Nested(n) => Values::Nested(Box::new(n.gather(rows))),
         }
     }
 
@@ -185,9 +265,15 @@ impl Values {
             (Values::Text(a), Values::Text(b)) => a.push(b[i].clone()),
             (Values::Utf8(a), Values::Utf8(b)) => a.push(b[i].clone()),
             (Values::Utf8(a), b @ Values::Dict { .. }) => a.push(b.text_value(i)),
+            (Values::Utf8(a), Values::Text(b)) => a.push(b[i].as_deref().map(ByteArray::from)),
+            (Values::Text(a), b @ (Values::Utf8(_) | Values::Dict { .. })) => {
+                a.push(b.text(i).map(str::to_string))
+            }
             (Values::Wide(a), Values::Wide(b)) => a.push(b[i]),
             (Values::Float4(a), Values::Float4(b)) => a.push(b[i]),
             (Values::Float8(a), Values::Float8(b)) => a.push(b[i]),
+            (Values::Composed(a), Values::Composed(b)) => a.push(b[i].clone()),
+            (Values::Nested(a), Values::Nested(b)) => a.push_from(b, i),
             _ => panic!("a column's values pushed onto another kind"),
         }
     }
@@ -202,15 +288,30 @@ impl Values {
                 .flatten()
                 .map(|&c| dict[c as usize].len() as u64)
                 .sum(),
-            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => 0,
+            Values::Nested(n) => n.values.bytes(),
+            Values::Int(_)
+            | Values::Wide(_)
+            | Values::Float4(_)
+            | Values::Float8(_)
+            | Values::Composed(_) => 0,
         }
     }
 
-    /// The bytes row `i` takes written plain: a number its width, text its bytes and its length, and
-    /// a NULL none.
+    /// The bytes row `i` takes written plain: a number its width, text its bytes and its length, an
+    /// enum its label's, a leaf of a composed column the values of its entries, and a NULL none.
     pub fn plain(&self, i: usize, ty: ColumnType) -> u64 {
         if self.is_null(i) {
             return 0;
+        }
+        if let Values::Nested(n) = self {
+            return n
+                .entries(i)
+                .filter(|&e| !n.values.is_null(e))
+                .map(|e| n.values.plain(e, ty))
+                .sum();
+        }
+        if let (Values::Int(v), Some(labels)) = (self, crate::composed::labels(ty)) {
+            return v[i].map_or(0, |k| labels[k as usize].len() as u64 + LENGTH_PREFIX);
         }
         match (self, ty.width()) {
             (_, Some(w)) => w as u64,
@@ -219,7 +320,15 @@ impl Values {
             (Values::Dict { dict, codes }, None) => {
                 codes[i].map_or(0, |c| dict[c as usize].len() as u64 + LENGTH_PREFIX)
             }
-            (Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_), None) => 0,
+            (
+                Values::Int(_)
+                | Values::Wide(_)
+                | Values::Float4(_)
+                | Values::Float8(_)
+                | Values::Composed(_)
+                | Values::Nested(_),
+                None,
+            ) => 0,
         }
     }
 
@@ -270,6 +379,12 @@ impl Values {
                     ),
                 ]
             }
+            (ColumnType::Composed(r), Values::Composed(v)) if crate::composed::is_nested(r) => {
+                crate::composed::stripe(r, &v)
+                    .into_iter()
+                    .map(|n| Values::Nested(Box::new(n)))
+                    .collect()
+            }
             (_, values) => vec![values],
         }
     }
@@ -303,6 +418,16 @@ impl Values {
                     })
                     .collect(),
             ),
+            (ColumnType::Composed(r), parts) if crate::composed::is_nested(r) => {
+                let nested: Vec<&Nested> = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        Values::Nested(n) => Some(&**n),
+                        _ => None,
+                    })
+                    .collect();
+                Values::Composed(crate::composed::assemble_rows(r, &nested))
+            }
             _ => leaves.into_iter().next().unwrap_or_else(|| Values::new(ty)),
         }
     }
@@ -330,7 +455,47 @@ impl Values {
                 })
                 .max()
                 .unwrap_or(0),
-            Values::Int(_) | Values::Wide(_) | Values::Float4(_) | Values::Float8(_) => 0,
+            Values::Int(_)
+            | Values::Wide(_)
+            | Values::Float4(_)
+            | Values::Float8(_)
+            | Values::Composed(_)
+            | Values::Nested(_) => 0,
         }
+    }
+}
+
+/// Appends a value to a column's values of its kind.
+pub fn push_datum(v: &mut Values, d: &Datum) {
+    match (v, d) {
+        (v, Datum::Null) => v.push_null(),
+        (Values::Int(x), Datum::Int(n)) => x.push(Some(*n)),
+        (Values::Text(x), Datum::Text(s)) => x.push(Some(s.clone())),
+        (Values::Utf8(x), Datum::Bytes(b)) => x.push(Some(ByteArray::from(b.clone()))),
+        (Values::Utf8(x), Datum::Text(s)) => x.push(Some(ByteArray::from(s.as_str()))),
+        (Values::Wide(x), Datum::Wide(k)) => x.push(Some(*k)),
+        (Values::Float4(x), Datum::Float4(b)) => x.push(Some(*b)),
+        (Values::Float8(x), Datum::Float8(b)) => x.push(Some(*b)),
+        (Values::Composed(x), Datum::Compound(c)) => x.push(Some(c.clone())),
+        _ => panic!("a value pushed onto a column of another kind"),
+    }
+}
+
+/// Row `i`'s value as a column of type `ty` holds it: a number, a float's bits, a uuid's key, text,
+/// bytea's bytes, or a composed value.
+pub fn datum_of(v: &Values, i: usize, ty: ColumnType) -> Datum {
+    match v {
+        Values::Int(x) => x[i].map_or(Datum::Null, Datum::Int),
+        Values::Wide(x) => x[i].map_or(Datum::Null, Datum::Wide),
+        Values::Float4(x) => x[i].map_or(Datum::Null, Datum::Float4),
+        Values::Float8(x) => x[i].map_or(Datum::Null, Datum::Float8),
+        Values::Composed(x) => x[i].clone().map_or(Datum::Null, Datum::Compound),
+        Values::Nested(_) => panic!("a leaf's value read without its levels"),
+        _ if ty == ColumnType::Bytes => v
+            .text_value(i)
+            .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
+        _ => v
+            .text(i)
+            .map_or(Datum::Null, |s| Datum::Text(s.to_string())),
     }
 }

@@ -24,7 +24,7 @@ pub use pipeline::{numeric_text, Value};
 pub fn pipeline_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>> {
     Ok(pipeline::relation_of(batch)?.rows)
 }
-pub use question::instant;
+pub use question::{instant, truth};
 
 use crate::catalog::{Catalog, Table};
 use crate::cut::PAGE;
@@ -1034,8 +1034,8 @@ impl Snail {
                 }
                 return self.ask_pipeline(&r, params);
             }
-            if pipeline::is_pipeline(q) {
-                if order.is_some() {
+            if pipeline::is_pipeline(q) || pipeline::tests_composite_null(&self.catalog, q) {
+                if order.is_some() && pipeline::is_pipeline(q) {
                     return Err(Error::new("a pipeline reads its table along its own order"));
                 }
                 return self.ask_pipeline(q, params);

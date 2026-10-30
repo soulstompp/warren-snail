@@ -1,6 +1,7 @@
 //! A block's column as the plain parquet library writes it: its own data pages, page by page.
 
 use crate::catalog::{ColumnType, Leaf};
+use crate::composed::Nested;
 use crate::cut::{unit_sizes, DATA_PAGE_ROWS, PAGE};
 use crate::values::{Values, LENGTH_PREFIX};
 use crate::{Error, Result};
@@ -78,7 +79,34 @@ fn group(column: &str, ty: ColumnType) -> Error {
 /// The descriptor of one leaf of a column: the column's own where it is one leaf, OPTIONAL where the
 /// column takes NULL; a field REQUIRED inside its group, which holds the column's NULLs.
 pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<ColumnDescPtr> {
-    let ty = leaf.ty;
+    if let Some((r, i)) = leaf.nested {
+        return crate::composed::leaf_descriptor(column, r, i as usize, nullable);
+    }
+    if let ColumnType::Tid = leaf.ty {
+        return Err(group(column, leaf.ty));
+    }
+    let repetition = if nullable && leaf.field.is_none() {
+        Repetition::OPTIONAL
+    } else {
+        Repetition::REQUIRED
+    };
+    let t = primitive(leaf.field.unwrap_or(column), leaf.ty, leaf.bits, repetition)?;
+    Ok(Arc::new(ColumnDescriptor::new(
+        Arc::new(t),
+        if nullable { 1 } else { 0 },
+        0,
+        ColumnPath::new(leaf.path(column)),
+    )))
+}
+
+/// The Parquet type of a value of type `ty` named `name`: a leaf, its physical type and its
+/// annotation, the bits of the unsigned number it holds where it holds one.
+pub(crate) fn primitive(
+    name: &str,
+    ty: ColumnType,
+    bits: u32,
+    repetition: Repetition,
+) -> Result<Type> {
     let (physical, logical) = match ty {
         ColumnType::Int2 => (
             PhysicalType::INT32,
@@ -141,7 +169,7 @@ pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<Colu
                 PhysicalType::INT32
             },
             Some(LogicalType::Integer {
-                bit_width: leaf.bits as i8,
+                bit_width: bits as i8,
                 is_signed: false,
             }),
         ),
@@ -149,14 +177,18 @@ pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<Colu
         ColumnType::Macaddr | ColumnType::Macaddr8 => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Float4 => (PhysicalType::FLOAT, None),
         ColumnType::Float8 => (PhysicalType::DOUBLE, None),
-        ColumnType::Tid | ColumnType::Varbit(_) => return Err(group(column, ty)),
+        // An enum: its label, as Parquet's ENUM.
+        ColumnType::Composed(r) if !crate::composed::is_nested(r) => {
+            (PhysicalType::BYTE_ARRAY, Some(LogicalType::Enum))
+        }
+        ColumnType::Tid | ColumnType::Varbit(_) | ColumnType::Composed(_) => {
+            return Err(Error::new(format!(
+                "{name} is {}, held as a group of leaves",
+                ty.pg_name()
+            )))
+        }
     };
-    let repetition = if nullable && leaf.field.is_none() {
-        Repetition::OPTIONAL
-    } else {
-        Repetition::REQUIRED
-    };
-    let mut t = Type::primitive_type_builder(leaf.field.unwrap_or(column), physical)
+    let mut t = Type::primitive_type_builder(name, physical)
         .with_repetition(repetition)
         .with_logical_type(logical);
     if let ColumnType::Numeric { precision, scale } = ty {
@@ -165,13 +197,7 @@ pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<Colu
     if physical == PhysicalType::FIXED_LEN_BYTE_ARRAY {
         t = t.with_length(ty.width().unwrap_or(0) as i32);
     }
-    let t = t.build()?;
-    Ok(Arc::new(ColumnDescriptor::new(
-        Arc::new(t),
-        if nullable { 1 } else { 0 },
-        0,
-        ColumnPath::new(leaf.path(column)),
-    )))
+    Ok(t.build()?)
 }
 
 /// The bits of the unsigned integer a column's descriptor names: 0 for any other column.
@@ -204,6 +230,7 @@ fn write_typed<T: DataType, V>(
     props: Arc<WriterProperties>,
     values: &[Option<V>],
     rows_per_page: usize,
+    levels: Option<&Nested>,
     conv: impl Fn(&V) -> T::T,
 ) -> Result<(Vec<u8>, ColumnCloseResult)> {
     let mut sink = TrackedWrite::new(Vec::new());
@@ -211,7 +238,23 @@ fn write_typed<T: DataType, V>(
         let pages = Box::new(SerializedPageWriter::new(&mut sink));
         let mut w = ColumnWriterImpl::<T>::new(desc.clone(), props, pages);
         let nullable = desc.max_def_level() > 0;
-        for chunk in values.chunks(rows_per_page) {
+        if let Some(n) = levels {
+            // A leaf of a composed column: its entries a row at a time, each with its levels.
+            let rows = n.rows();
+            let mut a = 0;
+            while a < rows {
+                let b = (a + rows_per_page).min(rows);
+                let (x, y) = (n.starts[a] as usize, n.starts[b] as usize);
+                let present: Vec<T::T> = values[x..y].iter().flatten().map(&conv).collect();
+                let reps = (desc.max_rep_level() > 0).then(|| &n.reps[x..y]);
+                w.write_batch(&present, Some(&n.defs[x..y]), reps)?;
+                a = b;
+            }
+        }
+        for chunk in values
+            .chunks(rows_per_page)
+            .take_while(|_| levels.is_none())
+        {
             let present: Vec<T::T> = chunk.iter().flatten().map(&conv).collect();
             if nullable {
                 let defs: Vec<i16> = chunk.iter().map(|v| v.is_some() as i16).collect();
@@ -227,6 +270,7 @@ fn write_typed<T: DataType, V>(
 
 fn write(
     desc: &ColumnDescPtr,
+    ty: ColumnType,
     values: &Values,
     dictionary: bool,
     rows_per_page: usize,
@@ -239,65 +283,88 @@ fn write(
     }
     let p = props(dictionary, rows_per_page);
     let unsigned = unsigned_bits(desc);
-    let (bytes, closed) = match (values, desc.physical_type()) {
+    // A leaf of a composed column writes its values with their levels.
+    let (inner, levels) = match values {
+        Values::Nested(n) => (&n.values, Some(&**n)),
+        v => (v, None),
+    };
+    let labels = crate::composed::labels(ty);
+    let (bytes, closed) = match (inner, desc.physical_type()) {
+        (Values::Int(v), PhysicalType::BYTE_ARRAY) if labels.is_some() => {
+            let labels = labels.unwrap();
+            write_typed::<ByteArrayType, i64>(desc, p, v, rows_per_page, levels, |&k| {
+                ByteArray::from(labels[k as usize].as_str())
+            })?
+        }
         (Values::Int(v), PhysicalType::INT32) if unsigned > 0 => {
-            write_typed::<Int32Type, i64>(desc, p, v, rows_per_page, |&x| {
+            write_typed::<Int32Type, i64>(desc, p, v, rows_per_page, levels, |&x| {
                 crate::scalars::unsigned_of(x, unsigned) as i32
             })?
         }
         (Values::Int(v), PhysicalType::INT32) => {
-            write_typed::<Int32Type, i64>(desc, p, v, rows_per_page, |&x| x as i32)?
+            write_typed::<Int32Type, i64>(desc, p, v, rows_per_page, levels, |&x| x as i32)?
         }
         (Values::Int(v), PhysicalType::INT64) if unsigned > 0 => {
-            write_typed::<Int64Type, i64>(desc, p, v, rows_per_page, |&x| {
+            write_typed::<Int64Type, i64>(desc, p, v, rows_per_page, levels, |&x| {
                 crate::scalars::unsigned_of(x, unsigned) as i64
             })?
         }
         (Values::Int(v), PhysicalType::INT64) => {
-            write_typed::<Int64Type, i64>(desc, p, v, rows_per_page, |&x| x)?
+            write_typed::<Int64Type, i64>(desc, p, v, rows_per_page, levels, |&x| x)?
         }
         (Values::Int(v), PhysicalType::BOOLEAN) => {
-            write_typed::<BoolType, i64>(desc, p, v, rows_per_page, |&x| x != 0)?
+            write_typed::<BoolType, i64>(desc, p, v, rows_per_page, levels, |&x| x != 0)?
         }
         (Values::Text(v), PhysicalType::BYTE_ARRAY) => {
-            write_typed::<ByteArrayType, String>(desc, p, v, rows_per_page, |s| {
+            write_typed::<ByteArrayType, String>(desc, p, v, rows_per_page, levels, |s| {
                 ByteArray::from(s.as_str())
             })?
         }
         (Values::Utf8(v), PhysicalType::BYTE_ARRAY) => {
-            write_typed::<ByteArrayType, ByteArray>(desc, p, v, rows_per_page, |b| b.clone())?
+            write_typed::<ByteArrayType, ByteArray>(desc, p, v, rows_per_page, levels, |b| {
+                b.clone()
+            })?
         }
         // A bit string, held as its key, is written as its bits.
         (Values::Utf8(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
-            write_typed::<FixedLenByteArrayType, ByteArray>(desc, p, v, rows_per_page, |k| {
-                FixedLenByteArray::from(crate::strings::bits_of_key(k.data()).1)
-            })?
+            write_typed::<FixedLenByteArrayType, ByteArray>(
+                desc,
+                p,
+                v,
+                rows_per_page,
+                levels,
+                |k| FixedLenByteArray::from(crate::strings::bits_of_key(k.data()).1),
+            )?
         }
         (Values::Int(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
             let n = desc.type_length() as usize;
-            write_typed::<FixedLenByteArrayType, i64>(desc, p, v, rows_per_page, |&k| {
+            write_typed::<FixedLenByteArrayType, i64>(desc, p, v, rows_per_page, levels, |&k| {
                 FixedLenByteArray::from(
                     crate::scalars::unsigned_of(k, n as u32 * 8).to_be_bytes()[8 - n..].to_vec(),
                 )
             })?
         }
         (Values::Float4(v), PhysicalType::FLOAT) => {
-            write_typed::<FloatType, u32>(desc, p, v, rows_per_page, |&b| f32::from_bits(b))?
+            write_typed::<FloatType, u32>(desc, p, v, rows_per_page, levels, |&b| {
+                f32::from_bits(b)
+            })?
         }
         (Values::Float8(v), PhysicalType::DOUBLE) => {
-            write_typed::<DoubleType, u64>(desc, p, v, rows_per_page, |&b| f64::from_bits(b))?
+            write_typed::<DoubleType, u64>(desc, p, v, rows_per_page, levels, |&b| {
+                f64::from_bits(b)
+            })?
         }
         // A decimal's integer, big-endian in the bytes of its length.
         (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY)
             if matches!(desc.logical_type_ref(), Some(LogicalType::Decimal { .. })) =>
         {
             let n = desc.type_length() as usize;
-            write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, |&k| {
+            write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, levels, |&k| {
                 FixedLenByteArray::from(k.to_be_bytes()[16 - n..].to_vec())
             })?
         }
         (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
-            write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, |&k| {
+            write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, levels, |&k| {
                 FixedLenByteArray::from(crate::scalars::uuid_bytes(k).to_vec())
             })?
         }
@@ -344,6 +411,7 @@ fn guess(k: usize, bits: usize, nullable: bool) -> usize {
 /// Writes with fewer rows a page until every data page lies within `k` disk pages.
 fn fitted(
     desc: &ColumnDescPtr,
+    ty: ColumnType,
     values: &Values,
     dictionary: bool,
     k: usize,
@@ -351,7 +419,7 @@ fn fitted(
 ) -> Result<Encoded> {
     let limit = k * PAGE;
     for _ in 0..64 {
-        let e = write(desc, values, dictionary, rows)?;
+        let e = write(desc, ty, values, dictionary, rows)?;
         let largest = e.pages.iter().map(|p| p.bytes.len()).max().unwrap_or(0);
         if largest <= limit {
             return Ok(e);
@@ -371,7 +439,16 @@ fn plain_bits(values: &Values, ty: ColumnType) -> usize {
     let rows = values.len().max(1) as u64;
     let present = (values.len() - values.nulls()) as u64;
     if let Some(bits) = ty.thin_bits() {
+        if let Values::Nested(n) = values {
+            let set = n.values.len() - n.values.nulls();
+            return (set as u64 * bits).div_ceil(rows) as usize;
+        }
         return (present * bits).div_ceil(rows) as usize;
+    }
+    // A leaf of a composed column, or an enum: each row's own bytes.
+    if matches!(values, Values::Nested(_)) || crate::composed::labels(ty).is_some() {
+        let bytes: u64 = (0..values.len()).map(|r| values.plain(r, ty)).sum();
+        return (bytes.div_ceil(rows) * 8) as usize;
     }
     let bytes = match ty.width() {
         Some(w) => present * w as u64,
@@ -383,6 +460,18 @@ fn plain_bits(values: &Values, ty: ColumnType) -> usize {
 /// The distinct values present, and the bytes a dictionary of them takes written plain.
 fn distinct(values: &Values, ty: ColumnType) -> (usize, usize) {
     match values {
+        Values::Nested(n) => distinct(&n.values, ty),
+        Values::Composed(_) => (0, 0),
+        Values::Int(v) if crate::composed::labels(ty).is_some() => {
+            let labels = crate::composed::labels(ty).unwrap();
+            let d: HashSet<i64> = v.iter().flatten().copied().collect();
+            (
+                d.len(),
+                d.iter()
+                    .map(|&k| labels[k as usize].len() + LENGTH_PREFIX as usize)
+                    .sum(),
+            )
+        }
         Values::Int(v) => {
             let d: HashSet<i64> = v.iter().flatten().copied().collect();
             (d.len(), d.len() * ty.width().unwrap_or(8))
@@ -433,6 +522,7 @@ pub fn encode(desc: &ColumnDescPtr, ty: ColumnType, values: &Values, k: usize) -
     let nullable = desc.max_def_level() > 0;
     let plain = fitted(
         desc,
+        ty,
         values,
         false,
         k,
@@ -449,7 +539,7 @@ pub fn encode(desc: &ColumnDescPtr, ty: ColumnType, values: &Values, k: usize) -
         return Ok(plain);
     }
     let bits = (usize::BITS - (count.max(2) - 1).leading_zeros()) as usize;
-    let dict = fitted(desc, values, true, k, guess(k, bits, nullable))?;
+    let dict = fitted(desc, ty, values, true, k, guess(k, bits, nullable))?;
     Ok(if dict.disk_pages() < plain.disk_pages() {
         dict
     } else {
@@ -467,6 +557,7 @@ pub fn plain_pages(
     let nullable = desc.max_def_level() > 0;
     fitted(
         desc,
+        ty,
         values,
         false,
         k,
@@ -501,6 +592,35 @@ pub fn decode(
     pages: &[&[u8]],
     rows: usize,
 ) -> Result<Values> {
+    decode_as(desc, ty, dictionary, pages, rows, false)
+}
+
+/// A leaf's values, as `decode` reads them; a leaf of a composed column's with its levels.
+pub fn decode_leaf(
+    desc: &ColumnDescPtr,
+    leaf: &Leaf,
+    dictionary: Option<&[u8]>,
+    pages: &[&[u8]],
+    rows: usize,
+) -> Result<Values> {
+    decode_as(
+        desc,
+        leaf.ty,
+        dictionary,
+        pages,
+        rows,
+        leaf.nested.is_some(),
+    )
+}
+
+fn decode_as(
+    desc: &ColumnDescPtr,
+    ty: ColumnType,
+    dictionary: Option<&[u8]>,
+    pages: &[&[u8]],
+    rows: usize,
+    nested: bool,
+) -> Result<Values> {
     let mut buf = Vec::new();
     if let Some(d) = dictionary {
         buf.extend_from_slice(d);
@@ -526,26 +646,64 @@ pub fn decode(
     )?);
     let column = get_column_reader(desc.clone(), reader);
     let mut defs: Vec<i16> = Vec::new();
+    let mut reps: Vec<i16> = Vec::new();
     let nullable = desc.max_def_level() > 0;
+    let repeated = desc.max_rep_level() > 0;
+    let max_def = desc.max_def_level();
     let short = |n: usize| Error::new(format!("{}: {n} rows decoded of {rows}", desc.name()));
     // An unsigned number is keyed by the bits its descriptor names.
     let bits = unsigned_bits(desc);
-    match ty {
-        ColumnType::Tid | ColumnType::Varbit(_) => Err(group(desc.name(), ty)),
+    let out = match ty {
+        ColumnType::Tid | ColumnType::Varbit(_) => return Err(group(desc.name(), ty)),
         ColumnType::Bit(n) => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
             let mut v: Vec<FixedLenByteArray> = Vec::new();
-            let (n_read, _, _) =
-                r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n_read, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n_read != rows {
                 return Err(short(n_read));
             }
-            Ok(Values::Utf8(spread(
+            Values::Utf8(spread(
                 v.iter()
                     .map(|b| ByteArray::from(crate::strings::bits_key(n, b.data()))),
                 &defs,
-                nullable,
-            )))
+                max_def,
+            ))
+        }
+        ColumnType::Composed(r) if crate::composed::is_nested(r) => {
+            return Err(group(desc.name(), ty))
+        }
+        // An enum: its labels, read as their ranks.
+        ColumnType::Composed(_) => {
+            let labels = crate::composed::labels(ty).unwrap_or(&[]);
+            let mut r = get_typed_column_reader::<ByteArrayType>(column);
+            let mut v: Vec<ByteArray> = Vec::new();
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
+            if n != rows {
+                return Err(short(n));
+            }
+            let ranks = v
+                .iter()
+                .map(|b| {
+                    labels
+                        .iter()
+                        .position(|l| l.as_bytes() == b.data())
+                        .map(|k| k as i64)
+                        .ok_or_else(|| {
+                            Error::new(format!("{}: a label its enum does not hold", desc.name()))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Values::Int(spread(ranks.into_iter(), &defs, max_def))
         }
         ColumnType::Int2
         | ColumnType::Int4
@@ -556,42 +714,53 @@ pub fn decode(
         | ColumnType::Char => {
             let mut r = get_typed_column_reader::<Int32Type>(column);
             let mut v: Vec<i32> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Int(spread(
+            Values::Int(spread(
                 v.into_iter()
                     .map(|x| crate::scalars::key_of_bits(i64::from(x), bits)),
                 &defs,
-                nullable,
-            )))
+                max_def,
+            ))
         }
         ColumnType::Boolean => {
             let mut r = get_typed_column_reader::<BoolType>(column);
             let mut v: Vec<bool> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Int(spread(
-                v.into_iter().map(i64::from),
-                &defs,
-                nullable,
-            )))
+            Values::Int(spread(v.into_iter().map(i64::from), &defs, max_def))
         }
         ColumnType::Numeric { precision, .. } if precision > 18 => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
             let mut v: Vec<FixedLenByteArray> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Wide(spread(
+            Values::Wide(spread(
                 v.iter().map(|b| decimal_integer(b.data())),
                 &defs,
-                nullable,
-            )))
+                max_def,
+            ))
         }
         ColumnType::Int8
         | ColumnType::Timestamptz
@@ -602,59 +771,76 @@ pub fn decode(
         | ColumnType::Money => {
             let mut r = get_typed_column_reader::<Int64Type>(column);
             let mut v: Vec<i64> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Int(spread(
+            Values::Int(spread(
                 v.into_iter().map(|x| crate::scalars::key_of_bits(x, bits)),
                 &defs,
-                nullable,
-            )))
+                max_def,
+            ))
         }
         ColumnType::Float4 => {
             let mut r = get_typed_column_reader::<FloatType>(column);
             let mut v: Vec<f32> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Float4(spread(
-                v.into_iter().map(f32::to_bits),
-                &defs,
-                nullable,
-            )))
+            Values::Float4(spread(v.into_iter().map(f32::to_bits), &defs, max_def))
         }
         ColumnType::Float8 => {
             let mut r = get_typed_column_reader::<DoubleType>(column);
             let mut v: Vec<f64> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Float8(spread(
-                v.into_iter().map(f64::to_bits),
-                &defs,
-                nullable,
-            )))
+            Values::Float8(spread(v.into_iter().map(f64::to_bits), &defs, max_def))
         }
         ColumnType::Macaddr | ColumnType::Macaddr8 => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
             let mut v: Vec<FixedLenByteArray> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
-            Ok(Values::Int(spread(
+            Values::Int(spread(
                 v.iter().map(|b| crate::scalars::key_of_fixed(ty, b.data())),
                 &defs,
-                nullable,
-            )))
+                max_def,
+            ))
         }
         ColumnType::Uuid => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
             let mut v: Vec<FixedLenByteArray> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
@@ -668,7 +854,7 @@ pub fn decode(
                         })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Values::Wide(spread(keys.into_iter(), &defs, nullable)))
+            Values::Wide(spread(keys.into_iter(), &defs, max_def))
         }
         ColumnType::Text(_)
         | ColumnType::Bytes
@@ -677,7 +863,12 @@ pub fn decode(
         | ColumnType::NumericText(_) => {
             let mut r = get_typed_column_reader::<ByteArrayType>(column);
             let mut v: Vec<ByteArray> = Vec::new();
-            let (n, _, _) = r.read_records(rows, nullable.then_some(&mut defs), None, &mut v)?;
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
             if n != rows {
                 return Err(short(n));
             }
@@ -691,9 +882,16 @@ pub fn decode(
                     desc.name()
                 )));
             }
-            Ok(Values::Utf8(spread(v.into_iter(), &defs, nullable)))
+            Values::Utf8(spread(v.into_iter(), &defs, max_def))
         }
-    }
+    };
+    Ok(if nested {
+        Values::Nested(Box::new(crate::composed::Nested::of_levels(
+            out, defs, reps,
+        )))
+    } else {
+        out
+    })
 }
 
 /// The integer a decimal's fixed array holds, big-endian and signed.
@@ -725,6 +923,21 @@ pub fn decode_with(
         }
     }
     decode(desc, ty, dictionary, pages, rows)
+}
+
+/// A leaf's values as `decode_with` reads them; a leaf of a composed column's with its levels.
+pub fn decode_leaf_with(
+    desc: &ColumnDescPtr,
+    leaf: &Leaf,
+    dictionary: Option<&[u8]>,
+    pages: &[&[u8]],
+    rows: usize,
+    dict: &mut Option<Arc<[ByteArray]>>,
+) -> Result<Values> {
+    if leaf.nested.is_some() {
+        return decode_leaf(desc, leaf, dictionary, pages, rows);
+    }
+    decode_with(desc, leaf.ty, dictionary, pages, rows, dict)
 }
 
 /// A dictionary column's codes, page by page, or none where a page is written otherwise.
@@ -905,13 +1118,13 @@ fn varint(data: &[u8]) -> Option<(u64, usize)> {
 }
 
 /// The values present, put back among the NULLs their definition levels mark.
-fn spread<T>(present: impl Iterator<Item = T>, defs: &[i16], nullable: bool) -> Vec<Option<T>> {
-    if !nullable {
+fn spread<T>(present: impl Iterator<Item = T>, defs: &[i16], max_def: i16) -> Vec<Option<T>> {
+    if max_def == 0 {
         return present.map(Some).collect();
     }
     let mut it = present;
     defs.iter()
-        .map(|&d| if d > 0 { it.next() } else { None })
+        .map(|&d| if d == max_def { it.next() } else { None })
         .collect()
 }
 
@@ -1084,7 +1297,7 @@ mod tests {
     fn a_guess_too_large_is_cut_down_until_every_page_fits_k() {
         let desc = descriptor("reading_id", ColumnType::Int8, false).unwrap();
         let values = Values::Int((0..5000).map(|i| Some(i * 7919)).collect());
-        let e = fitted(&desc, &values, false, 1, 20_000).unwrap();
+        let e = fitted(&desc, ColumnType::Text(None), &values, false, 1, 20_000).unwrap();
         assert!(e.pages.len() > 1);
         assert!(e.pages.iter().all(|p| p.bytes.len() <= PAGE));
         assert_eq!(roundtrip(&e, &desc, ColumnType::Int8), values);

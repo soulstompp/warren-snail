@@ -284,6 +284,9 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Bytes | ColumnType::Varbit(_) => {
                 (text_sublevels & !crate::directory::BYTES_LEVEL) as usize
             }
+            // An enum by its rank's bits; any other composed type by its key written as text.
+            ColumnType::Composed(r) if crate::composed::is_nested(r) => text_sublevels as usize,
+            ColumnType::Composed(_) => 32,
         },
     }
 }
@@ -334,7 +337,8 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             | ColumnType::Macaddr8
             | ColumnType::Float4
             | ColumnType::Float8
-            | ColumnType::Tid => {
+            | ColumnType::Tid
+            | ColumnType::Composed(_) => {
                 let bits = sublevel_count(level, ty, 0);
                 let low = -(1i128 << (bits - 1));
                 let biased = (key as i128 - low) as u64;

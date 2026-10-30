@@ -4,7 +4,7 @@
 use super::{Snail, Wasted};
 use crate::catalog::{ColumnType, Leaf, Level, Table};
 use crate::directory::{decode_page, read_map, ColumnPages, Entry, Head, PageMap};
-use crate::encode::{decode, leaf_descriptor};
+use crate::encode::{decode_leaf, leaf_descriptor};
 use crate::values::Values;
 use crate::{Error, Result};
 use bytes::Bytes;
@@ -118,6 +118,14 @@ fn extremes(
             continue;
         }
         let v = match values {
+            // An enum's rank, written as its label.
+            Values::Int(_) if crate::composed::labels(ty).is_some() => values.int(i).map(|k| {
+                Extreme::Bytes(
+                    crate::composed::labels(ty).unwrap()[k as usize]
+                        .as_bytes()
+                        .to_vec(),
+                )
+            }),
             Values::Int(_) => values.int(i).map(Extreme::Int),
             // A decimal's integer, signed as Parquet orders it, in the bytes of its length.
             Values::Wide(w) if ty.is_numeric() => w[i].map(|k| {
@@ -311,6 +319,13 @@ impl Snail {
                 types.push(desc.self_type_ptr());
                 leaves.push((c, leaf, desc, s));
             }
+            // A composed column is the tree of its leaves.
+            if col.ty.is_nested() {
+                fields.push(Arc::new(crate::composed::parquet_type(
+                    &col.name, col.ty, true,
+                )?));
+                continue;
+            }
             // A column of one leaf is that leaf; a column of more is a group of them, which holds
             // the column's NULLs.
             fields.push(match types.as_slice() {
@@ -341,6 +356,8 @@ impl Snail {
                 Level::Column(c) if matches!(table.columns[*c].ty, ColumnType::NumericText(_)) => {
                     None
                 }
+                // A composed level sorts on its key, which no leaf's order in the file is.
+                Level::Column(c) if matches!(table.columns[*c].ty, ColumnType::Composed(_)) => None,
                 Level::Column(c) => Some(
                     leaves
                         .iter()
@@ -491,7 +508,15 @@ impl Snail {
             .iter()
             .map(|&(at, len, _, _)| &bytes[at..at + len])
             .collect();
-        let values = decode(desc, ty, dictionary.as_deref(), &slices, rows)?;
+        let decoded = decode_leaf(desc, leaf, dictionary.as_deref(), &slices, rows)?;
+        // A leaf of a composed column holds its values an entry of its levels: its statistics are
+        // of those, and its rows begin where its entries repeated at no level do.
+        let (values, entries) = match &decoded {
+            Values::Nested(n) => (&n.values, Some(&n.starts)),
+            v => (v, None),
+        };
+        let at = |r: usize| entries.map_or(r, |s| s[r] as usize);
+        let num_values = at(rows);
         let physical = desc.physical_type();
         let mut index = ColumnIndexBuilder::new(physical);
         let mut whole: Option<(Extreme, Extreme)> = None;
@@ -500,9 +525,9 @@ impl Snail {
         // index, as the plain library leaves it.
         let mut indexed = true;
         for &(_, _, first, n) in &spans {
-            let (range, page_nulls) = extremes(&values, ty, leaf.bits, first, first + n);
+            let (range, page_nulls) = extremes(values, ty, leaf.bits, at(first), at(first + n));
             nulls += page_nulls;
-            indexed &= range.is_some() || page_nulls == n as u64;
+            indexed &= range.is_some() || page_nulls == (at(first + n) - at(first)) as u64;
             match &range {
                 Some((lo, hi)) => index.append(
                     false,
@@ -547,7 +572,7 @@ impl Snail {
         let len = bytes.len() as i64;
         let metadata = ColumnChunkMetaData::builder(desc.clone())
             .set_encodings(encodings)
-            .set_num_values(rows as i64)
+            .set_num_values(num_values as i64)
             .set_compression(Compression::UNCOMPRESSED)
             .set_total_compressed_size(len)
             .set_total_uncompressed_size(len)

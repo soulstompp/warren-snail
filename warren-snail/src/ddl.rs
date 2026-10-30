@@ -1785,37 +1785,167 @@ impl Draft {
         None
     }
 
-    /// A column's type as the DDL names it, refused by name where the snail does not hold it.
-    fn column_type(&self, dt: &DataType, what: &str) -> Result<ColumnType> {
-        if let DataType::Custom(name, _) = dt {
-            let n = object_name(name);
-            if let Some(t) = self.types.iter().find(|t| t.name == n) {
-                let kind = match t.kind {
-                    TypeKind::Enum { .. } => "an enum",
-                    TypeKind::Composite { .. } => "a composite",
-                    TypeKind::Range(_) => "a range",
-                };
-                return Err(Error::new(format!(
-                    "{what}: {n}, {kind} the DDL declares, is not held as a column's type"
+    /// A type as the DDL names it, and the domain it names where it names one, whose base type it
+    /// is held as: a type built in, an array of any type held, an enum, a composite or a range the
+    /// DDL declares, a range's multirange, or a table's row type.
+    fn held(&self, dt: &DataType, what: &str) -> Result<(ColumnType, Option<String>)> {
+        use crate::composed::{type_of, Composed, Field};
+        let refused = |why: String| Error::new(format!("{what}: {why}"));
+        if let DataType::Array(def) = dt {
+            let inner = match def {
+                sqlparser::ast::ArrayElemTypeDef::SquareBracket(t, _)
+                | sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
+                | sqlparser::ast::ArrayElemTypeDef::Parenthesis(t)
+                | sqlparser::ast::ArrayElemTypeDef::Qualified(t, _) => t,
+                sqlparser::ast::ArrayElemTypeDef::None => {
+                    return Err(refused("an array names its element's type".into()))
+                }
+            };
+            let (element, domain) = self.held(inner, what)?;
+            if element.is_bits() {
+                return Err(refused(format!(
+                    "an array of {} is not held yet: a bit string as an element waits for t8b",
+                    element.pg_name()
                 )));
             }
-            if self.domains.iter().any(|d| d.name == n) {
-                return Err(Error::new(format!(
-                    "{what}: {n}, a domain the DDL declares, is not held as a column's type"
-                )));
+            // PostgreSQL holds an array of any number of dimensions as one type.
+            if let ColumnType::Composed(r) = element {
+                if domain.is_none() && matches!(r.def(), Composed::Array { .. }) {
+                    return Ok((element, None));
+                }
             }
-            if self.tables.iter().any(|t| t.name == n) {
-                return Err(Error::new(format!(
-                    "{what}: {n}, a table's row type, is not held as a column's type"
-                )));
-            }
-            if self.type_named(&n) == Some("multirange") {
-                return Err(Error::new(format!(
-                    "{what}: {n}, a multirange the DDL declares, is not held as a column's type"
-                )));
+            return Ok((type_of(Composed::Array { element, domain }), None));
+        }
+        if let DataType::Custom(name, args) = dt {
+            if args.is_empty() {
+                let n = object_name(name);
+                let n = n.strip_prefix("pg_catalog.").unwrap_or(&n).to_string();
+                if let Some(t) = self.types.iter().find(|t| t.name == n) {
+                    return Ok((self.declared_type(t, what)?, None));
+                }
+                if let Some(t) = self.types.iter().find(|t| match &t.kind {
+                    TypeKind::Range(r) => r.multirange == n,
+                    _ => false,
+                }) {
+                    let range = self.declared_type(t, what)?;
+                    return Ok((type_of(Composed::Multirange { name: n, range }), None));
+                }
+                if let Some(t) = crate::composed::built_in(&n) {
+                    return Ok((t, None));
+                }
+                if let Some(d) = self.domains.iter().find(|d| d.name == n) {
+                    let (base, _) = self.held(&parse_type(&d.base)?, what)?;
+                    return Ok((base, Some(d.name.clone())));
+                }
+                if let Some(t) = self.tables.iter().find(|t| t.name == n) {
+                    let fields = t
+                        .columns
+                        .iter()
+                        .map(|c| Field {
+                            name: c.name.clone(),
+                            ty: c.ty,
+                            domain: c.domain.clone(),
+                        })
+                        .collect();
+                    return Ok((type_of(Composed::Record { name: n, fields }), None));
+                }
+                if let Some(e) = n.strip_prefix('_') {
+                    if let Ok(inner) = parse_type(e) {
+                        if let Ok((element, domain)) = self.held(&inner, what) {
+                            return Ok((type_of(Composed::Array { element, domain }), None));
+                        }
+                    }
+                }
             }
         }
-        held_type(dt).map_err(|e| Error::new(format!("{what}: {e}")))
+        held_type(dt)
+            .map(|t| (t, None))
+            .map_err(|e| Error::new(format!("{what}: {e}")))
+    }
+
+    /// A type the DDL declares, as the snail holds it.
+    fn declared_type(&self, t: &Type, what: &str) -> Result<ColumnType> {
+        use crate::composed::{type_of, Composed, Field};
+        let refused = |why: String| Error::new(format!("{what}: {}, {why}", t.name));
+        Ok(match &t.kind {
+            TypeKind::Enum { labels } => type_of(Composed::Enum {
+                name: t.name.clone(),
+                labels: labels.clone(),
+            }),
+            TypeKind::Composite { fields } => {
+                if fields.is_empty() {
+                    return Err(refused("a composite of no fields, is not held".into()));
+                }
+                let fields = fields
+                    .iter()
+                    .map(|(name, ty, collation)| {
+                        if let Some(k) = collation {
+                            if crate::catalog::collation_held(k, &self.collations).is_none() {
+                                return Err(refused(format!(
+                                    "its field {name} names COLLATE {k}: text is compared by its bytes"
+                                )));
+                            }
+                        }
+                        let (ty, domain) = self.held(&parse_type(ty)?, what)?;
+                        if ty.is_bits() {
+                            return Err(refused(format!(
+                                "its field {name} is {}, a bit string, which a composite holds once t8b builds it",
+                                ty.pg_name()
+                            )));
+                        }
+                        Ok(Field {
+                            name: name.clone(),
+                            ty,
+                            domain,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                type_of(Composed::Record {
+                    name: t.name.clone(),
+                    fields,
+                })
+            }
+            TypeKind::Range(r) => {
+                if let Some(c) = &r.canonical {
+                    return Err(refused(format!(
+                        "a range whose CANONICAL is {c}, a function the snail does not run"
+                    )));
+                }
+                if let Some(k) = &r.collation {
+                    if crate::catalog::collation_held(k, &self.collations).is_none() {
+                        return Err(refused(format!(
+                            "a range under COLLATE {k}: text is compared by its bytes"
+                        )));
+                    }
+                }
+                let (subtype, domain) = self.held(&parse_type(&r.subtype)?, what)?;
+                if domain.is_some() || subtype.is_nested() || subtype.is_bits() {
+                    return Err(refused(format!(
+                        "a range of {}, which is not held",
+                        r.subtype
+                    )));
+                }
+                if let Some(o) = &r.opclass {
+                    if *o != subtype.default_opclass() {
+                        return Err(refused(format!(
+                            "a range on the operator class {o}, where only {}'s default is read",
+                            r.subtype
+                        )));
+                    }
+                }
+                if !subtype.ordered() {
+                    return Err(refused(format!(
+                        "a range of {}, which has no B-tree",
+                        r.subtype
+                    )));
+                }
+                type_of(Composed::Range {
+                    name: t.name.clone(),
+                    subtype,
+                    discrete: false,
+                })
+            }
+        })
     }
 
     /// A sequence named as nextval's argument names it, `'s.seq'` or `'s.seq'::regclass`.
@@ -2108,6 +2238,10 @@ impl Draft {
                 let TypeKind::Enum { labels } = &mut t.kind else {
                     return Err(Error::new(format!("{name} is not an enum")));
                 };
+                let was = crate::composed::type_of(crate::composed::Composed::Enum {
+                    name: name.clone(),
+                    labels: labels.clone(),
+                });
                 match change {
                     AlterType::AddValue {
                         label,
@@ -2154,6 +2288,16 @@ impl Draft {
                             Error::new(format!("\"{from}\" is not an existing enum label"))
                         })?;
                         labels[i] = to;
+                    }
+                }
+                // Every column of the enum, or of a type holding it, takes its labels as they now stand.
+                let now = crate::composed::type_of(crate::composed::Composed::Enum {
+                    name: name.clone(),
+                    labels: labels.clone(),
+                });
+                for t in &mut self.tables {
+                    for c in &mut t.columns {
+                        c.ty = crate::composed::replace(c.ty, was, now);
                     }
                 }
             }
@@ -2593,9 +2737,9 @@ impl Draft {
                 },
                 _ => None,
             };
-            let ty = match serial {
-                Some(s) => s.column(),
-                None => self.column_type(&c.data_type, &cwhat)?,
+            let (ty, domain) = match serial {
+                Some(s) => (s.column(), None),
+                None => self.held(&c.data_type, &cwhat)?,
             };
             let mut col = Column {
                 name: cname.clone(),
@@ -2605,6 +2749,7 @@ impl Draft {
                 generated: None,
                 identity: None,
                 collation: None,
+                domain,
             };
             let mut nullness: Option<bool> = None;
             for o in &c.options {
@@ -2659,7 +2804,7 @@ impl Draft {
                     }
                     ColumnOption::Collation(n) => {
                         let collation = object_name(n);
-                        if !ty.is_string() {
+                        if !collatable(ty) {
                             return Err(Error::new(format!(
                                 "{cwhat}: COLLATE {collation} on a column that is not text"
                             )));
@@ -3593,7 +3738,12 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
         for (i, col) in t.columns.iter().enumerate() {
             let o = format!("{}.{}", t.name, col.name);
             fact("column", &o, "position", (i + 1).to_string());
-            fact("column", &o, "type", col.ty.pg_name());
+            fact(
+                "column",
+                &o,
+                "type",
+                col.domain.clone().unwrap_or_else(|| col.ty.pg_name()),
+            );
             fact("column", &o, "not_null", truth(col.not_null));
             if let Some(d) = &col.default {
                 fact("column", &o, "default", d.to_string());
@@ -3607,13 +3757,7 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 let s = if id.always { "always" } else { "by default" };
                 fact("column", &o, "identity", s.into());
             }
-            if col.ty.is_string() {
-                // name's own collation is C; any other string type's the database's default.
-                let own = if col.ty == ColumnType::Name {
-                    "C"
-                } else {
-                    "default"
-                };
+            if let Some(own) = collation_of(col.ty) {
                 fact(
                     "column",
                     &o,
@@ -4548,5 +4692,41 @@ mod tests {
             written(&once)
         );
         assert!(written(&once).contains("'it''s'"), "{}", written(&once));
+    }
+}
+
+/// A type written as text, as sqlparser reads it: a composite's field's, a domain's base, a range's
+/// subtype.
+fn parse_type(text: &str) -> Result<DataType> {
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, text).tokenize()?;
+    let tokens: Vec<Token> = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    let mut p = Parser::new(&PostgreSqlDialect {}).with_tokens(tokens.clone());
+    let dt = p.parse_data_type()?;
+    if p.index() < tokens.len() && !matches!(tokens[p.index()], Token::EOF) {
+        return Err(Error::new(format!("{text} is not one type")));
+    }
+    Ok(dt)
+}
+
+/// Whether a column of the type has a collation, as PostgreSQL gives one: a string type, or an array
+/// of a type that has one.
+fn collatable(ty: ColumnType) -> bool {
+    collation_of(ty).is_some()
+}
+
+/// The collation a column of the type takes where its DDL names none: name's own, C; any other
+/// string type's the database's default; an array's its element's.
+fn collation_of(ty: ColumnType) -> Option<&'static str> {
+    match ty {
+        ColumnType::Composed(r) => match r.def() {
+            crate::composed::Composed::Array { element, .. } => collation_of(*element),
+            _ => None,
+        },
+        ColumnType::Name => Some("C"),
+        ty if ty.is_string() => Some("default"),
+        _ => None,
     }
 }

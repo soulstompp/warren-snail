@@ -376,8 +376,22 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
             }
             ColumnType::Boolean => truth_literal(e),
             ColumnType::Uuid => Err(Error::new(format!("{e} is not a uuid"))),
+            // An enum: its label's rank.
+            ty @ ColumnType::Composed(_) => match crate::composed::literal(ty, e)? {
+                super::statement::Datum::Int(k) => Ok(k),
+                _ => Err(Error::new(format!(
+                    "{e} is not a value of {}",
+                    ty.pg_name()
+                ))),
+            },
             ColumnType::Timestamptz => {
                 instant(&text_literal(e).map_err(|_| Error::new(format!("{e} is not an instant")))?)
+            }
+            // An integer: a number written out, or a quoted literal its input reads.
+            ty @ (ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8)
+                if text_literal(e).is_ok() =>
+            {
+                crate::composed::int_in(&text_literal(e)?, ty.integer_bits())
             }
             _ => number(e).ok_or_else(|| Error::new(format!("{e} is not an integer"))),
         },
@@ -767,12 +781,28 @@ impl From<'_> {
                     } else {
                         Item::Greatest(col)
                     })),
+                    // An array, a composite or an enum; a range or a multirange has none.
+                    ColumnType::Composed(r)
+                        if ty.ordered()
+                            && !matches!(
+                                r.def(),
+                                crate::composed::Composed::Range { .. }
+                                    | crate::composed::Composed::Multirange { .. }
+                            ) =>
+                    {
+                        Ok(Some(if name == "min" {
+                            Item::Least(col)
+                        } else {
+                            Item::Greatest(col)
+                        }))
+                    }
                     ColumnType::Boolean
                     | ColumnType::Uuid
                     | ColumnType::Xid
                     | ColumnType::Cid
                     | ColumnType::Bit(_)
-                    | ColumnType::Varbit(_) => Err(Error::new(format!(
+                    | ColumnType::Varbit(_)
+                    | ColumnType::Composed(_) => Err(Error::new(format!(
                         "function {name}({}) does not exist",
                         ty.pg_name().split('(').next().unwrap_or_default()
                     ))),
@@ -1051,7 +1081,11 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             let (x, y) = if a == 0 { (x, y) } else { (y, x) };
             for (side, c) in [(0, x), (1, y)] {
                 let ty = from.table(side).columns[c].ty;
-                if ty.is_byte_array() || ty.is_bits() || ty == ColumnType::Timestamptz {
+                if ty.is_byte_array()
+                    || ty.is_bits()
+                    || ty.is_nested()
+                    || ty == ColumnType::Timestamptz
+                {
                     return Err(Error::new(format!(
                         "{p}: a join on {} is not read",
                         ty.name()
@@ -1163,9 +1197,25 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 continue;
             }
             if ty.keyed_by_text() || ty.keyed_by_bytes() {
-                // A numeric held as its text, by its class's key.
+                if !ty.ordered() && !matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq) {
+                    return Err(Error::new(format!(
+                        "could not identify a comparison function for type {}",
+                        ty.pg_name()
+                    )));
+                }
+                // A numeric held as its text, by its class's key; a composed value by its key,
+                // written as text that sorts as the key does.
                 let v = match ty {
                     ColumnType::NumericText(_) => numeric_literal(lit)?.class_key().into_bytes(),
+                    ty if ty.is_nested() => match crate::composed::compared(ty, lit)? {
+                        super::statement::Datum::Compound(k) => k.hex.as_bytes().to_vec(),
+                        _ => {
+                            return Err(Error::new(format!(
+                                "{lit} is not a value of {}",
+                                ty.pg_name()
+                            )))
+                        }
+                    },
                     _ => bytes_literal(lit, ty)?,
                 };
                 let mut except = Vec::new();

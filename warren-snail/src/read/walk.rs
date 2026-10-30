@@ -6,7 +6,7 @@ use super::question::{Cond, Countable, Side, TextCond};
 use super::{Snail, Wasted};
 use crate::catalog::{ColumnType, Level, Order, Shape, Table};
 use crate::directory::{decode_page, decode_top, Entry, Head, PageMap, Summary};
-use crate::encode::decode_with;
+use crate::encode::decode_leaf_with;
 use crate::file::Extent;
 use crate::places::{key, month_of, null_key, wide_cmp, KeyValue};
 use crate::values::Values;
@@ -628,9 +628,9 @@ impl Snail {
                         let rows: usize = pages.iter().map(|p| p.rows as usize).sum();
                         runs.push((
                             pages[0].first_row as usize,
-                            decode_with(
+                            decode_leaf_with(
                                 desc,
-                                leaf.ty,
+                                leaf,
                                 dictionary.as_deref(),
                                 &slices,
                                 rows,
@@ -865,7 +865,9 @@ impl Snail {
                         let make = |o: usize| {
                             let (is_text, month, start, v) = outs[o];
                             let i = r - start;
-                            if let Values::Dict { codes, .. } = v {
+                            if let Values::Composed(x) = v {
+                                x[i].clone().map_or(Cell::Null, Cell::Composed)
+                            } else if let Values::Dict { codes, .. } = v {
                                 codes[i].map_or(Cell::Null, Cell::Code)
                             } else if keyed[o] {
                                 v.text_value(i).map_or(Cell::Null, |t| {

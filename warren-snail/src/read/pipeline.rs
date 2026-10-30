@@ -42,11 +42,18 @@ pub enum Value {
     Bits(ColumnType, Vec<u8>),
     /// A numeric `Num` does not hold: NaN, an infinity, or one whose digits pass 128 bits.
     Numeric(crate::numeric::Numeric),
+    /// A value of a composed type: its type, and the value held whole; an enum's is its rank.
+    Composed(ColumnType, std::sync::Arc<crate::composed::Compound>),
 }
 
 impl Value {
     fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        match self {
+            Value::Null => true,
+            // A composed column's NULL, which keeps its type.
+            Value::Composed(_, c) => c.item.is_null(),
+            _ => false,
+        }
     }
 
     /// A numeric as a value: `Num` where its digits fit 128 bits.
@@ -88,6 +95,9 @@ impl Value {
 
     /// The value as PostgreSQL writes it as text.
     pub fn text(&self) -> Option<String> {
+        if self.is_null() {
+            return None;
+        }
         Some(match self {
             Value::Null => return None,
             Value::Int(v) => v.to_string(),
@@ -108,6 +118,7 @@ impl Value {
             Value::Str(_, s) => s.clone(),
             Value::Bits(_, k) => crate::strings::bits_text(k),
             Value::Numeric(n) => n.to_string(),
+            Value::Composed(ty, c) => crate::composed::text_out(*ty, &c.item),
         })
     }
 
@@ -176,6 +187,21 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        (Value::Composed(a, x), Value::Composed(b, y)) if a == b => x.key.cmp(&y.key),
+        (Value::Composed(a, _), Value::Composed(b, _)) => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} = {}",
+                a.pg_name(),
+                b.pg_name()
+            )))
+        }
+        (Value::Composed(ty, _), other) | (other, Value::Composed(ty, _)) => {
+            return Err(Error::new(format!(
+                "operator does not exist: {} = {}",
+                ty.pg_name(),
+                kind_name(other)
+            )))
+        }
         (Value::Scalar(a, x), Value::Scalar(b, y)) if a == b || a.is_oid() && b.is_oid() => {
             x.cmp(y)
         }
@@ -204,6 +230,7 @@ enum Key {
     Double(i64),
     /// A numeric no `Num` holds, by its class's key.
     Class(String),
+    Composed(Box<[u8]>),
 }
 
 fn key(v: &Value) -> Key {
@@ -230,6 +257,7 @@ fn key(v: &Value) -> Key {
         Value::Double(d) => Key::Double(crate::scalars::float8_key(d.to_bits())),
         Value::Str(..) => Key::Text(String::from_utf8_lossy(v.string_key().unwrap()).into()),
         Value::Bits(_, k) => Key::Bytes(k.clone()),
+        Value::Composed(_, c) => Key::Composed(c.key.clone()),
     }
 }
 
@@ -596,6 +624,20 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
             )),
             other => return Err(Error::new(format!("{other:?} cast to uuid"))),
         },
+        _ if crate::composed::resolve(to).is_some() => {
+            let ty = crate::composed::resolve(to).unwrap();
+            match v {
+                Value::Composed(from, c) if from == ty => Value::Composed(from, c),
+                Value::Text(t) => composed_value(ty, &t)?,
+                other => {
+                    return Err(Error::new(format!(
+                        "cannot cast type {} to {}",
+                        kind_name(&other),
+                        ty.pg_name()
+                    )))
+                }
+            }
+        }
         _ => match crate::catalog::held_type(to) {
             // text to regclass is regclass(text), which reads a name alone; a literal is read by
             // regclass's input.
@@ -725,6 +767,7 @@ fn kind_name(v: &Value) -> String {
         Value::Str(..) => "character".into(),
         Value::Bits(ColumnType::Bit(_), _) => "bit".into(),
         Value::Bits(..) => "bit varying".into(),
+        Value::Composed(ty, _) => ty.pg_name(),
     }
 }
 
@@ -847,6 +890,20 @@ fn integer_beside(scalar: &Value, n: Value) -> Result<Value> {
 
 /// The comparisons a scalar's type has: xid only `=` and `<>`, cid only `=`, the rest all six.
 fn compared(op: &BinaryOperator, x: &Value, y: &Value) -> Result<()> {
+    // An array of a type with no B-tree is compared by = and <> alone: where both are values.
+    if let (Value::Composed(ty, _), _) | (_, Value::Composed(ty, _)) = (x, y) {
+        if !ty.ordered()
+            && !x.is_null()
+            && !y.is_null()
+            && !matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq)
+        {
+            return Err(Error::new(format!(
+                "could not identify a comparison function for type {}",
+                ty.pg_name()
+            )));
+        }
+        return Ok(());
+    }
     let ty = match (x, y) {
         (Value::Scalar(ty, _), _) | (_, Value::Scalar(ty, _)) => *ty,
         _ => return Ok(()),
@@ -1341,7 +1398,7 @@ fn arith(op: &BinaryOperator, a: &Value, b: &Value) -> Result<Value> {
 
 fn truth(v: &Value) -> Result<Option<bool>> {
     match v {
-        Value::Null => Ok(None),
+        v if v.is_null() => Ok(None),
         Value::Bool(b) => Ok(Some(*b)),
         other => Err(Error::new(format!("{other:?} is not a truth"))),
     }
@@ -1355,6 +1412,19 @@ fn literal_type(ty: ColumnType) -> ColumnType {
     } else {
         ty
     }
+}
+
+/// Whether a type is a composite or a table's row type.
+fn is_record(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Composed(r) if matches!(r.def(), crate::composed::Composed::Record { .. }))
+}
+
+/// A composed value read from its text by its type's input.
+fn composed_value(ty: ColumnType, t: &str) -> Result<Value> {
+    Ok(match crate::composed::scalar_in(ty, t)? {
+        crate::read::statement::Datum::Compound(c) => Value::Composed(ty, c),
+        d => super::fill::value_of(&d, ty),
+    })
 }
 
 /// A string type without its length: the type a literal beside one is read as.
@@ -1398,6 +1468,21 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
             float_cast(Value::Text(t.clone()), matches!(y, Value::Double(_)))?,
             y,
         ),
+        (Value::Composed(ty, _), Value::Text(_)) if quoted(right) && is_record(*ty) => {
+            return Err(Error::new(
+                "input of anonymous composite types is not implemented",
+            ))
+        }
+        (Value::Text(_), Value::Composed(ty, _)) if quoted(left) && is_record(*ty) => {
+            return Err(Error::new(
+                "input of anonymous composite types is not implemented",
+            ))
+        }
+        (Value::Composed(ty, _), Value::Text(t)) if quoted(right) => {
+            let t = composed_value(*ty, t)?;
+            (x, t)
+        }
+        (Value::Text(t), Value::Composed(ty, _)) if quoted(left) => (composed_value(*ty, t)?, y),
         (Value::Scalar(ty, _), Value::Text(t)) if quoted(right) => {
             let ty = literal_type(*ty);
             let t = Value::Scalar(ty, crate::scalars::scalar_parse(ty, t)?);
@@ -1432,6 +1517,13 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
             bits_cast(Value::Text(t.clone()), ColumnType::Varbit(None), false)?,
             y,
         ),
+        // A quoted literal beside an integer is read by the integer's input.
+        (Value::Int(_), Value::Text(t)) if quoted(right) => {
+            (x.clone(), Value::Int(crate::composed::int_in(t, 64)?))
+        }
+        (Value::Text(t), Value::Int(_)) if quoted(left) => {
+            (Value::Int(crate::composed::int_in(t, 64)?), y.clone())
+        }
         (Value::Scalar(..), Value::Int(_)) => {
             let y = integer_beside(&x, y)?;
             (x, y)
@@ -1584,8 +1676,76 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             };
             Value::Bool(like_of(&v, &p, escape, ilike)? != *negated)
         }
-        Expr::IsNull(x) => Value::Bool(ev(x)?.is_null()),
-        Expr::IsNotNull(x) => Value::Bool(!ev(x)?.is_null()),
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => any_all(compare_op, ev(left)?, ev(right)?, left, true)?,
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => any_all(compare_op, ev(left)?, ev(right)?, left, false)?,
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut v = ev(root)?;
+            let mut at: Vec<i64> = Vec::new();
+            for a in access_chain {
+                match a {
+                    sqlparser::ast::AccessExpr::Subscript(sqlparser::ast::Subscript::Index {
+                        index,
+                    }) => match ev(index)? {
+                        Value::Int(i) => at.push(i),
+                        Value::Null => return Ok(Value::Null),
+                        other => {
+                            return Err(Error::new(format!(
+                                "array subscript must have type integer, not {}",
+                                kind_name(&other)
+                            )))
+                        }
+                    },
+                    sqlparser::ast::AccessExpr::Dot(Expr::Identifier(i)) if at.is_empty() => {
+                        v = match v {
+                            Value::Null => Value::Null,
+                            Value::Composed(ty, c) => {
+                                let (fty, item) = crate::composed::field(ty, &c.item, &crate::catalog::ident(i))?;
+                                part_value(fty, &item)
+                            }
+                            other => return Err(Error::new(format!("column notation .{} applied to type {}, which is not a composite type", i.value, kind_name(&other)))),
+                        };
+                    }
+                    other => return Err(Error::new(format!("{other} is not read"))),
+                }
+            }
+            if !at.is_empty() {
+                v = match v {
+                    Value::Null => Value::Null,
+                    Value::Composed(ty, c) => match ty {
+                        ColumnType::Composed(r) => match r.def() {
+                            crate::composed::Composed::Array { element, .. } => {
+                                part_value(*element, &crate::composed::subscript(&c.item, &at))
+                            }
+                            _ => {
+                                return Err(Error::new(format!(
+                                "cannot subscript type {} because it does not support subscripting",
+                                ty.pg_name()
+                            )))
+                            }
+                        },
+                        _ => unreachable!(),
+                    },
+                    other => {
+                        return Err(Error::new(format!(
+                            "cannot subscript type {} because it does not support subscripting",
+                            kind_name(&other)
+                        )))
+                    }
+                };
+            }
+            v
+        }
+        Expr::IsNull(x) => Value::Bool(null_test(&ev(x)?, false)),
+        Expr::IsNotNull(x) => Value::Bool(null_test(&ev(x)?, true)),
         // A truth tested is never NULL: an unknown truth is neither true nor false.
         Expr::IsTrue(x) => Value::Bool(truth(&ev(x)?)? == Some(true)),
         Expr::IsNotTrue(x) => Value::Bool(truth(&ev(x)?)? != Some(true)),
@@ -1616,7 +1776,11 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }
                 _ => {}
             }
-            let (x, y) = beside(ev(left)?, ev(right)?, left, right)?;
+            let (x, y) = (ev(left)?, ev(right)?);
+            if let Some(v) = composed_op(op, &x, &y, left, right)? {
+                return Ok(v);
+            }
+            let (x, y) = beside(x, y, left, right)?;
             if let Some(v) = string_op(op, &x, &y)? {
                 return Ok(v);
             }
@@ -1992,6 +2156,28 @@ impl Acc {
                 "function {name}({}) does not exist",
                 kind_name(&v)
             )));
+        }
+        // No composed type has a sum; a range and a multirange have no min or max.
+        if let Value::Composed(ty, _) = &v {
+            let ranged = matches!(ty, ColumnType::Composed(r) if matches!(r.def(), crate::composed::Composed::Range { .. } | crate::composed::Composed::Multirange { .. }));
+            let name = match self {
+                Acc::Sum(_) => Some("sum"),
+                Acc::Least(_) if ranged => Some("min"),
+                Acc::Greatest(_) if ranged => Some("max"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                return Err(Error::new(format!(
+                    "function {name}({}) does not exist",
+                    ty.pg_name()
+                )));
+            }
+            if !ty.ordered() && matches!(self, Acc::Least(_) | Acc::Greatest(_)) {
+                return Err(Error::new(format!(
+                    "could not identify a comparison function for type {}",
+                    ty.pg_name()
+                )));
+            }
         }
         // Of the scalars, sum is money's alone; min and max are an oid's, an xid8's, a pg_lsn's,
         // money's and a tid's, and a `"char"`'s through its text.
@@ -2435,10 +2621,12 @@ fn sort(
                     };
                     let v = eval(&e, &row, &named, &none)?;
                     match v {
-                        Value::Scalar(ty, _) if !ty.ordered() => Err(Error::new(format!(
-                            "could not identify an ordering operator for type {}",
-                            ty.pg_name()
-                        ))),
+                        Value::Scalar(ty, _) | Value::Composed(ty, _) if !ty.ordered() => {
+                            Err(Error::new(format!(
+                                "could not identify an ordering operator for type {}",
+                                ty.pg_name()
+                            )))
+                        }
                         v => Ok(v),
                     }
                 })
@@ -2846,9 +3034,27 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
         let scalar = crate::scalars::field_scalar(field);
         let string = crate::strings::field_string(field);
         let numeric = crate::numeric::is_numeric_field(field);
+        let composed = crate::composed::field_composed(field);
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
-                Value::Null
+                match composed {
+                    // A composed column's NULL keeps its type, which its operators read.
+                    Some(ty) if ty.is_nested() => Value::Composed(
+                        ty,
+                        std::sync::Arc::new(crate::composed::Compound::new(
+                            ty,
+                            crate::composed::Item::Null,
+                        )),
+                    ),
+                    _ => Value::Null,
+                }
+            } else if let Some(ty) = composed {
+                Value::Composed(
+                    ty,
+                    crate::composed::compound_at(ty, a.as_ref(), r).ok_or_else(|| {
+                        Error::new(format!("{} is not of its type", field.name()))
+                    })?,
+                )
             } else if let Some(ty) = string.filter(|t| t.is_bits()) {
                 Value::Bits(
                     ty,
@@ -3013,6 +3219,18 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
         {
             arrays.push(Arc::new(col().map(|v| v.text()).collect::<StringArray>()));
             fields.push(crate::numeric::text_field(name, true));
+            continue;
+        }
+        if let Some(Value::Composed(ty, _)) = first {
+            let ty = *ty;
+            arrays.push(crate::composed::arrow_array(
+                ty,
+                col().map(|v| match v {
+                    Value::Composed(_, c) => Some(&**c),
+                    _ => None,
+                }),
+            )?);
+            fields.push(crate::composed::arrow_field(name, ty, true));
             continue;
         }
         let a: ArrayRef = match (first, scale) {
@@ -3281,5 +3499,283 @@ mod tests {
             let e = run(&query(sql), &table(), &[]).unwrap_err().to_string();
             assert!(e.contains(why), "{sql}: {e}");
         }
+    }
+}
+
+/// A part of a composed value as a value of its own type.
+fn part_value(ty: ColumnType, item: &crate::composed::Item) -> Value {
+    super::fill::value_of(&crate::composed::datum_of(ty, item), ty)
+}
+
+/// The composed type a value is, or a quoted literal beside it is read as.
+fn composed_beside(x: &Value, y: &Value) -> Option<ColumnType> {
+    match (x, y) {
+        (Value::Composed(ty, _), _) | (_, Value::Composed(ty, _)) if ty.is_nested() => Some(*ty),
+        _ => None,
+    }
+}
+
+/// An operator of the composed types, where either side is one: an array's `||`, `@>`, `<@` and
+/// `&&`; a range's `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`, `+`, `*` and `-`, beside a
+/// range or, for `@>` and `<@`, an element of its subtype. None where neither side is composed.
+fn composed_op(
+    op: &BinaryOperator,
+    x: &Value,
+    y: &Value,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<Value>> {
+    use crate::composed::{Composed, Item};
+    let Some(ty) = composed_beside(x, y) else {
+        return Ok(None);
+    };
+    let name = match op {
+        BinaryOperator::StringConcat => "||",
+        BinaryOperator::AtArrow => "@>",
+        BinaryOperator::ArrowAt => "<@",
+        BinaryOperator::PGOverlap => "&&",
+        BinaryOperator::PGBitwiseShiftLeft => "<<",
+        BinaryOperator::PGBitwiseShiftRight => ">>",
+        BinaryOperator::AndLt => "&<",
+        BinaryOperator::AndGt => "&>",
+        BinaryOperator::Custom(s) if s == "-|-" => "-|-",
+        BinaryOperator::Plus => "+",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::Minus => "-",
+        _ => return Ok(None),
+    };
+    let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_)));
+    let ColumnType::Composed(r) = ty else {
+        return Ok(None);
+    };
+    // A value as the composed type, a quoted literal read by its input; or as an element of it.
+    let whole = |v: &Value, e: &Expr| -> Result<Option<Item>> {
+        Ok(match v {
+            Value::Composed(t, c) if *t == ty => Some(c.item.clone()),
+            Value::Text(t) if quoted(e) => match crate::composed::scalar_in(ty, t)? {
+                crate::read::statement::Datum::Compound(c) => Some(c.item.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+    };
+    let element_of = |et: ColumnType, v: &Value| -> Result<Item> {
+        let d = super::fill::assign_value(v.clone(), et, "")?;
+        Ok(match d {
+            crate::read::statement::Datum::Null => Item::Null,
+            crate::read::statement::Datum::Compound(c) => c.item.clone(),
+            d => Item::Scalar(d),
+        })
+    };
+    let out = |item: Item| {
+        Value::Composed(
+            ty,
+            std::sync::Arc::new(crate::composed::Compound::new(ty, item)),
+        )
+    };
+    let no = || {
+        Error::new(format!(
+            "operator does not exist: {} {name} {}",
+            kind_name(x),
+            kind_name(y)
+        ))
+    };
+    match r.def() {
+        Composed::Array { element, .. } => {
+            let (a, b) = (whole(x, left)?, whole(y, right)?);
+            if name == "||" {
+                let first = matches!(y, Value::Composed(..))
+                    && a.is_none()
+                    && !x.is_null()
+                    && !quoted(left);
+                let last = matches!(x, Value::Composed(..))
+                    && b.is_none()
+                    && !y.is_null()
+                    && !quoted(right);
+                if first {
+                    let e = element_of(*element, x)?;
+                    return Ok(Some(out(crate::composed::concat(
+                        ty,
+                        Some(&e),
+                        b.as_ref(),
+                        true,
+                        false,
+                    )?)));
+                }
+                if last {
+                    let e = element_of(*element, y)?;
+                    return Ok(Some(out(crate::composed::concat(
+                        ty,
+                        a.as_ref(),
+                        Some(&e),
+                        false,
+                        true,
+                    )?)));
+                }
+                if a.is_none() && b.is_none() {
+                    return Ok(Some(Value::Null));
+                }
+                return Ok(Some(out(crate::composed::concat(
+                    ty,
+                    a.as_ref(),
+                    b.as_ref(),
+                    false,
+                    false,
+                )?)));
+            }
+            if !matches!(name, "@>" | "<@" | "&&") {
+                return Err(no());
+            }
+            if x.is_null() || y.is_null() {
+                return Ok(Some(Value::Null));
+            }
+            let (Some(a), Some(b)) = (a, b) else {
+                return Err(no());
+            };
+            Ok(Some(Value::Bool(crate::composed::array_op(
+                ty, name, &a, &b,
+            )?)))
+        }
+        Composed::Range { subtype, .. } => {
+            if x.is_null() || y.is_null() {
+                return Ok(Some(Value::Null));
+            }
+            let (a, b) = (whole(x, left)?, whole(y, right)?);
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    Ok(Some(match crate::composed::range_op(ty, name, &a, &b)? {
+                        crate::composed::RangeAnswer::Truth(t) => Value::Bool(t),
+                        crate::composed::RangeAnswer::Range(i) => out(i),
+                    }))
+                }
+                (Some(a), None) if name == "@>" => Ok(Some(Value::Bool(
+                    crate::composed::range_holds(ty, &a, &element_of(*subtype, y)?)?,
+                ))),
+                (None, Some(b)) if name == "<@" => Ok(Some(Value::Bool(
+                    crate::composed::range_holds(ty, &b, &element_of(*subtype, x)?)?,
+                ))),
+                _ => Err(no()),
+            }
+        }
+        _ => Err(no()),
+    }
+}
+
+/// `x op ANY (array)` or `x op ALL (array)`: each element compared with `x`, true where one (or
+/// each) holds, NULL where none (or not every one) holds and one compared NULL.
+fn any_all(op: &BinaryOperator, x: Value, arr: Value, left: &Expr, any: bool) -> Result<Value> {
+    use crate::composed::{Composed, Item};
+    let (ty, c) = match arr {
+        Value::Null => return Ok(Value::Null),
+        Value::Composed(ty, c) => (ty, c),
+        other => {
+            return Err(Error::new(format!(
+                "op ANY/ALL (array) requires array on right side, not {}",
+                kind_name(&other)
+            )))
+        }
+    };
+    let ColumnType::Composed(r) = ty else {
+        unreachable!()
+    };
+    let Composed::Array { element, .. } = r.def() else {
+        return Err(Error::new(
+            "op ANY/ALL (array) requires array on right side",
+        ));
+    };
+    let Item::Array { elements, .. } = &c.item else {
+        return Ok(Value::Null);
+    };
+    let mut unknown = false;
+    for e in elements {
+        let v = part_value(*element, e);
+        let (a, b) = beside(x.clone(), v, left, &Expr::value(SqlValue::Null))?;
+        let t = match compare(&a, &b)? {
+            None => None,
+            Some(o) => Some(match op {
+                BinaryOperator::Eq => o == Ordering::Equal,
+                BinaryOperator::NotEq => o != Ordering::Equal,
+                BinaryOperator::Lt => o == Ordering::Less,
+                BinaryOperator::LtEq => o != Ordering::Greater,
+                BinaryOperator::Gt => o == Ordering::Greater,
+                BinaryOperator::GtEq => o != Ordering::Less,
+                other => return Err(Error::new(format!("the operator {other} is not read"))),
+            }),
+        };
+        match t {
+            Some(true) if any => return Ok(Value::Bool(true)),
+            Some(false) if !any => return Ok(Value::Bool(false)),
+            None => unknown = true,
+            _ => {}
+        }
+    }
+    Ok(if unknown {
+        Value::Null
+    } else {
+        Value::Bool(!any)
+    })
+}
+
+/// Whether a question tests a composite column for NULL, which PostgreSQL answers by its fields: a
+/// pipeline reads it, a row at a time.
+pub fn tests_composite_null(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    let Some(w) = &s.selection else {
+        return false;
+    };
+    let tables: Vec<&crate::catalog::Table> = s
+        .from
+        .iter()
+        .filter_map(|f| match &f.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => {
+                let n = crate::catalog::object_name(name);
+                catalog.tables.iter().find(|t| t.name == n)
+            }
+            _ => None,
+        })
+        .collect();
+    let composite = |e: &Expr| {
+        column_of(e).is_some_and(|(_, n)| {
+            tables.iter().any(|t| {
+                t.column(&n).is_some_and(|c| {
+                    matches!(t.columns[c].ty, ColumnType::Composed(r) if matches!(r.def(), crate::composed::Composed::Record { .. }))
+                })
+            })
+        })
+    };
+    let mut found = false;
+    let mut stack = vec![w];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::IsNull(x) | Expr::IsNotNull(x) => found |= composite(x),
+            Expr::BinaryOp { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } => stack.push(x),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// A value tested for NULL as PostgreSQL tests it: a composite by its fields, NULL where every one
+/// is, and NOT NULL only where none is.
+fn null_test(v: &Value, not: bool) -> bool {
+    if let Value::Composed(_, c) = v {
+        if let crate::composed::Item::Record(fields) = &c.item {
+            return if not {
+                fields.iter().all(|f| !f.is_null())
+            } else {
+                fields.iter().all(|f| f.is_null())
+            };
+        }
+    }
+    if not {
+        !v.is_null()
+    } else {
+        v.is_null()
     }
 }

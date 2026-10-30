@@ -211,6 +211,14 @@ fn merge(into: &mut [Acc], from: &[Acc]) {
             }
             (Acc::Least(x), Acc::Least(Some(y))) => *x = Some(x.map_or(*y, |x| x.min(*y))),
             (Acc::Greatest(x), Acc::Greatest(Some(y))) => *x = Some(x.map_or(*y, |x| x.max(*y))),
+            (Acc::Extreme(x, least), Acc::Extreme(Some(y), _)) => {
+                let better = x
+                    .as_ref()
+                    .is_none_or(|x| if *least { y < x } else { y > x });
+                if better {
+                    *x = Some(y.clone());
+                }
+            }
             (Acc::FloatSum(x, over), Acc::FloatSum(Some(y), o)) => {
                 *x = Some(x.map_or(*y, |x| x + y));
                 *over |= *o;
@@ -295,6 +303,8 @@ pub enum Cell {
     Keyed(Keyed),
     /// A numeric held as its text, compared by its class and written as its own text.
     Classed(Classed),
+    /// A composed value, compared by its key and written as its parts.
+    Composed(Arc<crate::composed::Compound>),
 }
 
 impl Cell {
@@ -386,6 +396,8 @@ pub enum Acc {
     /// The least and the greatest numeric held as its text, by its class.
     LeastCell(Option<Cell>),
     GreatestCell(Option<Cell>),
+    /// A composed value's least (true) or greatest so far, by its key.
+    Extreme(Option<Arc<crate::composed::Compound>>, bool),
 }
 
 /// The answer as rows arrive, each as the cells of the question's inputs.
@@ -543,6 +555,15 @@ impl Answer {
                     Acc::Cell(None, matches!(i, Item::Greatest(_)))
                 }
                 Item::Sum(_) => Acc::Sum(None),
+                Item::Least(_) | Item::Greatest(_)
+                    if typed
+                        .get(at)
+                        .copied()
+                        .flatten()
+                        .is_some_and(ColumnType::is_nested) =>
+                {
+                    Acc::Extreme(None, matches!(i, Item::Least(_)))
+                }
                 Item::Least(_) => Acc::Least(None),
                 Item::Greatest(_) => Acc::Greatest(None),
                 _ => Acc::Count(0),
@@ -664,6 +685,17 @@ impl Answer {
                                         .is_none_or(|x| if *greatest { &y > x } else { &y < x });
                                 if take {
                                     *m = Some(y);
+                                }
+                            }
+                        }
+                        (Acc::Extreme(m, least), Item::Least(c) | Item::Greatest(c)) => {
+                            let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
+                            if let Cell::Composed(v) = &cells[at] {
+                                let better =
+                                    m.as_ref()
+                                        .is_none_or(|x| if *least { v < x } else { v > x });
+                                if better {
+                                    *m = Some(v.clone());
                                 }
                             }
                         }
@@ -958,6 +990,7 @@ impl Answer {
                                 ) if tables[c.side].columns[c.column].ty.is_wide() => {
                                     m.map_or(Cell::Null, Cell::Wide)
                                 }
+                                (_, Acc::Extreme(m, _)) => m.map_or(Cell::Null, Cell::Composed),
                                 (_, Acc::Least(m) | Acc::Greatest(m)) => {
                                     m.map_or(Cell::Null, |v| Cell::Int(v as i64))
                                 }
@@ -1170,6 +1203,16 @@ impl Answer {
                                 .map(|b| b.map(f64::from_bits))
                                 .collect::<Float64Array>(),
                         ),
+                        ty @ ColumnType::Composed(_) if ty.is_nested() => {
+                            crate::composed::arrow_array(
+                                ty,
+                                rows.iter().map(|r| match &r[i] {
+                                    Cell::Composed(c) => Some(&**c),
+                                    _ => None,
+                                }),
+                            )?
+                        }
+                        ty @ ColumnType::Composed(_) => crate::composed::enum_array(ty, ints())?,
                         ty => crate::scalars::scalar_array(ty, ints()),
                     };
                     (!col.not_null || !matches!(*item, Item::Key(_)), a)
@@ -1232,10 +1275,18 @@ impl Answer {
                 }
                 _ => None,
             };
-            fields.push(match (scalar, named) {
-                (Some(ty), _) => crate::scalars::scalar_field(name, ty, nullable),
-                (None, Some(ty)) => crate::strings::string_field(name, ty, nullable),
-                (None, None) => Field::new(name, a.data_type().clone(), nullable),
+            let composed = match *item {
+                Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) => {
+                    Some(tables[c.side].columns[c.column].ty)
+                        .filter(|t| matches!(t, ColumnType::Composed(_)))
+                }
+                _ => None,
+            };
+            fields.push(match (scalar, named, composed) {
+                (_, _, Some(ty)) => crate::composed::arrow_field(name, ty, nullable),
+                (Some(ty), _, _) => crate::scalars::scalar_field(name, ty, nullable),
+                (None, Some(ty), _) => crate::strings::string_field(name, ty, nullable),
+                (None, None, None) => Field::new(name, a.data_type().clone(), nullable),
             });
             arrays.push(a);
         }

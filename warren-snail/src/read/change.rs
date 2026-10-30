@@ -15,7 +15,7 @@ use crate::directory::{
     build_from, decode_page, decode_top, encode_page, encode_top, map_child, maps_held, pack,
     read_map, Entry, Head, MapPages, PageEntry, PageMap, MAP_HEAD,
 };
-use crate::encode::{decode, tail_pages};
+use crate::encode::{decode_leaf, tail_pages};
 use crate::file::{
     decode_free, decode_sequences, encode_free, encode_sequences, Extent, Place, Root, Run, Writer,
     FORMAT_SEVEN, STAGED,
@@ -136,6 +136,7 @@ fn datum_at(v: &Values, i: usize) -> Datum {
         Values::Wide(x) => x[i].map_or(Datum::Null, Datum::Wide),
         Values::Float4(x) => x[i].map_or(Datum::Null, Datum::Float4),
         Values::Float8(x) => x[i].map_or(Datum::Null, Datum::Float8),
+        Values::Composed(x) => x[i].clone().map_or(Datum::Null, Datum::Compound),
         _ => v
             .text(i)
             .map_or(Datum::Null, |s| Datum::Text(s.to_string())),
@@ -162,6 +163,8 @@ fn level_key(ty: ColumnType, level: Level, d: &Datum, null: KeyValue) -> KeyValu
         Datum::Wide(k) => KeyValue::Wide(*k),
         Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(*b)),
         Datum::Float8(b) => KeyValue::Int(crate::scalars::float8_key(*b)),
+        // A composed value by its key, written as text that sorts as the key does.
+        Datum::Compound(c) => KeyValue::Text(c.hex.clone()),
         Datum::Null => null,
     }
 }
@@ -180,6 +183,8 @@ fn push(v: &mut Values, d: &Datum) {
         (Values::Float4(x), Datum::Null) => x.push(None),
         (Values::Float8(x), Datum::Float8(b)) => x.push(Some(*b)),
         (Values::Float8(x), Datum::Null) => x.push(None),
+        (Values::Composed(x), Datum::Compound(c)) => x.push(Some(c.clone())),
+        (Values::Composed(x), Datum::Null) => x.push(None),
         _ => panic!("a value pushed onto a column of another kind"),
     }
 }
@@ -187,8 +192,12 @@ fn push(v: &mut Values, d: &Datum) {
 /// A value of a column of type `ty` as each of its leaves holds it: the value itself where the
 /// column is one leaf.
 fn leaf_datums(ty: ColumnType, d: &Datum) -> Vec<Datum> {
-    if ty.leaf_count() == 1 {
+    if ty.leaf_count() == 1 && !ty.is_nested() {
         return vec![d.clone()];
+    }
+    // A composed value whole, for each of its leaves, each striped from it where it is written.
+    if ty.is_nested() {
+        return vec![d.clone(); ty.leaf_count()];
     }
     let mut v = Values::new(ty);
     push(&mut v, d);
@@ -224,11 +233,20 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
         let any = a.as_any();
         let scalar = crate::scalars::field_scalar(field);
         let bits = crate::strings::field_string(field).filter(|t| t.is_bits());
+        let composed = crate::composed::field_composed(field);
         for (r, row) in rows.iter_mut().enumerate() {
             row.push(if a.is_null(r) {
                 Datum::Null
             } else if let Some(ty) = bits {
                 Datum::Bytes(crate::strings::bits_key_at(ty, a.as_ref(), r).unwrap())
+            } else if let Some(ty) = composed {
+                let c = crate::composed::compound_at(ty, a.as_ref(), r)
+                    .ok_or_else(|| Error::new(format!("{} is not of its type", field.name())))?;
+                match &c.item {
+                    // An enum, as its rank.
+                    crate::composed::Item::Scalar(d) => d.clone(),
+                    _ => Datum::Compound(c),
+                }
             } else if let Some(ty) = scalar {
                 Datum::Int(crate::scalars::scalar_key_at(ty, a.as_ref(), r).unwrap())
             } else if let Some(x) = any.downcast_ref::<BooleanArray>() {
@@ -484,6 +502,7 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             (ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name, Datum::Text(_))
             | (ColumnType::NumericText(_), Datum::Text(_))
             | (ColumnType::Bytes | ColumnType::Bit(_) | ColumnType::Varbit(_), Datum::Bytes(_))
+            | (ColumnType::Composed(_), Datum::Compound(_))
             | (ColumnType::Uuid, Datum::Wide(_))
             | (ColumnType::Float4, Datum::Float4(_))
             | (ColumnType::Float8, Datum::Float8(_)) => {}
@@ -503,7 +522,8 @@ fn check(table: &Table, row: &Row) -> Result<()> {
             | (_, Datum::Bytes(_))
             | (_, Datum::Wide(_))
             | (_, Datum::Float4(_))
-            | (_, Datum::Float8(_)) => {
+            | (_, Datum::Float8(_))
+            | (_, Datum::Compound(_)) => {
                 return Err(what(format!("{d:?} is not a value of {}", col.ty.name())))
             }
             (_, Datum::Int(_)) => {}
@@ -805,6 +825,7 @@ impl Snail {
             }
             fill::generate(&t, &mut n)?;
             fill::check(&t, &n)?;
+            fill::check_domains(&self.catalog.domains, &t, &n)?;
             changes.push(Change::Replace(o, n));
         }
         (done.rewritten, done.orders) = self.apply(table, changes)?;
@@ -848,6 +869,7 @@ impl Snail {
             }
             fill::generate(&t, &mut row)?;
             fill::check(&t, &row)?;
+            fill::check_domains(&self.catalog.domains, &t, &row)?;
             out.push(row);
         }
         Ok(out)
@@ -899,7 +921,12 @@ impl Snail {
                 .expect("a value drawn for each DEFAULT");
             return fill::assign(Datum::Int(v), ColumnType::Int8, col.ty, &col.name);
         }
-        let Some(e) = &col.default else {
+        // A column of a domain with no DEFAULT of its own takes the domain's.
+        let domain_default = col
+            .domain
+            .as_ref()
+            .and_then(|d| fill::domain_default(&self.catalog.domains, d));
+        let Some(e) = col.default.as_ref().or(domain_default) else {
             return Ok(Datum::Null);
         };
         if let Some(name) = clock_of(e) {
@@ -913,7 +940,7 @@ impl Snail {
         if let Some(v) = uuid_of(e) {
             return fill::assign(Datum::Wide(v?), ColumnType::Uuid, col.ty, &col.name);
         }
-        if statement::is_literal(e) {
+        if statement::is_literal(e) || crate::composed::constructs(col.ty, e) {
             return statement::datum(e, t, c);
         }
         fill::assign_value(
@@ -2006,9 +2033,9 @@ impl Snail {
                     .map(|p| self.reader.read_extent(p.at))
                     .collect::<Result<Vec<_>>>()?;
                 let slices: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
-                parts.push(decode(
+                parts.push(decode_leaf(
                     &descs[s],
-                    leaves[s].1.ty,
+                    &leaves[s].1,
                     dictionary.as_deref(),
                     &slices,
                     positions,
@@ -2133,25 +2160,50 @@ impl Snail {
                 // order's order stays, and the tail begins after it.
                 let in_tail = last.first_row >= map.sorted;
                 let mut values = Values::new(ty);
-                if in_tail {
+                let held = if in_tail {
                     let dictionary = cp
                         .dictionary
                         .map(|d| self.reader.read_extent(d))
                         .transpose()?;
                     let bytes = self.reader.read_extent(last.at)?;
-                    let held = decode(
+                    Some(decode_leaf(
                         &descs[s],
-                        ty,
+                        leaf,
                         dictionary.as_deref(),
                         &[bytes.as_slice()],
                         last.rows as usize,
-                    )?;
-                    for i in 0..held.len() {
-                        push(&mut values, &datum_typed(&held, i, ty));
+                    )?)
+                } else {
+                    None
+                };
+                if let Some((r, index)) = leaf.nested {
+                    // A leaf of a composed column: the rows held, then the new rows striped onto it.
+                    let whole: Vec<Option<std::sync::Arc<crate::composed::Compound>>> =
+                        added_leaves
+                            .iter()
+                            .map(|row| match &row[s] {
+                                Datum::Compound(c) => Some(c.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                    let new = crate::composed::stripe(r, &whole).swap_remove(index as usize);
+                    let mut leaf_values = match held {
+                        Some(Values::Nested(n)) => *n,
+                        _ => crate::composed::Nested::empty(&new),
+                    };
+                    for row in 0..new.rows() {
+                        leaf_values.push_from(&new, row);
                     }
-                }
-                for row in &added_leaves {
-                    push(&mut values, &row[s]);
+                    values = Values::Nested(Box::new(leaf_values));
+                } else {
+                    if let Some(held) = held {
+                        for i in 0..held.len() {
+                            push(&mut values, &datum_typed(&held, i, ty));
+                        }
+                    }
+                    for row in &added_leaves {
+                        push(&mut values, &row[s]);
+                    }
                 }
                 let base = if in_tail {
                     last.first_row

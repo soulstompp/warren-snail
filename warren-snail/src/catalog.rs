@@ -78,6 +78,9 @@ pub enum ColumnType {
     /// or past its precision; its precision and scale where its DDL names them. Held as
     /// PostgreSQL's text of each value, and keyed on its class.
     NumericText(Option<(u16, i16)>),
+    /// A composed type: an array, a composite or a table's row type, a range or a multirange, or an
+    /// enum, its definition held apart.
+    Composed(crate::composed::TypeRef),
 }
 
 impl ColumnType {
@@ -121,6 +124,7 @@ impl ColumnType {
             | ColumnType::Name
             | ColumnType::Varbit(_)
             | ColumnType::NumericText(_) => None,
+            ColumnType::Composed(_) => None,
         }
     }
 
@@ -160,7 +164,18 @@ impl ColumnType {
     /// Whether PostgreSQL has a B-tree operator class for it, so that it orders, keys an index and
     /// is compared by `<`: xid and cid have only a hash one.
     pub fn ordered(self) -> bool {
-        !matches!(self, ColumnType::Xid | ColumnType::Cid)
+        match self {
+            ColumnType::Xid | ColumnType::Cid => false,
+            // An array or a composite orders by its parts.
+            ColumnType::Composed(r) => match r.def() {
+                crate::composed::Composed::Array { element, .. } => element.ordered(),
+                crate::composed::Composed::Record { fields, .. } => {
+                    fields.iter().all(|f| f.ty.ordered())
+                }
+                _ => true,
+            },
+            _ => true,
+        }
     }
 
     /// Whether its values are keyed in 128 bits.
@@ -255,10 +270,11 @@ impl ColumnType {
         matches!(self, ColumnType::Bytes | ColumnType::NumericText(_)) || self.is_string()
     }
 
-    /// Whether a level of it is keyed by text compared by its bytes: a string's, or the key of a
-    /// numeric's class where it is held as its text.
+    /// Whether a level of it is keyed by text compared by its bytes: a string's, the key of a
+    /// numeric's class where it is held as its text, or a composed value's key written as text that
+    /// sorts as the key does.
     pub fn keyed_by_text(self) -> bool {
-        matches!(self, ColumnType::NumericText(_)) || self.is_string()
+        matches!(self, ColumnType::NumericText(_)) || self.is_string() || self.is_nested()
     }
 
     pub fn is_integer(self) -> bool {
@@ -318,6 +334,7 @@ impl ColumnType {
             ColumnType::Varbit(Some(n)) => format!("bit varying({n})"),
             ColumnType::NumericText(None) => "numeric".into(),
             ColumnType::NumericText(Some((p, s))) => format!("numeric({p},{s})"),
+            ColumnType::Composed(r) => r.def().pg_name(),
         }
     }
 
@@ -354,6 +371,16 @@ impl ColumnType {
             ColumnType::Bit(_) => "bit_ops",
             ColumnType::Varbit(_) => "varbit_ops",
             ColumnType::NumericText(_) => "numeric_ops",
+            ColumnType::Composed(r) => r.def().default_opclass(),
+        }
+    }
+
+    /// The bits of an integer type.
+    pub fn integer_bits(self) -> u32 {
+        match self {
+            ColumnType::Int2 => 16,
+            ColumnType::Int4 => 32,
+            _ => 64,
         }
     }
 
@@ -387,16 +414,44 @@ impl ColumnType {
 
     /// How many leaves its Parquet type tree has.
     pub fn leaf_count(self) -> usize {
-        self.fields().len().max(1)
+        match self {
+            ColumnType::Composed(r) if crate::composed::is_nested(r) => {
+                crate::composed::leaves(r).len()
+            }
+            _ => self.fields().len().max(1),
+        }
+    }
+
+    /// Whether its values are held as a tree of leaves rather than as one: a tid, or a composed type
+    /// but an enum.
+    pub fn is_group(self) -> bool {
+        match self {
+            ColumnType::Composed(r) => crate::composed::is_nested(r),
+            _ => self.leaf_count() > 1,
+        }
+    }
+
+    /// Whether it is a composed type held as a tree of leaves, each with its levels: every composed
+    /// type but an enum.
+    pub fn is_nested(self) -> bool {
+        matches!(self, ColumnType::Composed(r) if crate::composed::is_nested(r))
     }
 
     /// The leaves of its Parquet type tree: the value itself, or a leaf a field of the group it is.
     pub fn leaves(self) -> Vec<Leaf> {
+        if let ColumnType::Composed(r) = self {
+            if crate::composed::is_nested(r) {
+                return crate::composed::leaves(r).to_vec();
+            }
+        }
         match self.fields() {
             [] => vec![Leaf {
                 field: None,
                 ty: self,
                 bits: self.unsigned_bits(),
+                nested: None,
+                thin: false,
+                repeated: false,
             }],
             fields => fields
                 .iter()
@@ -404,6 +459,9 @@ impl ColumnType {
                     field: Some(name),
                     ty,
                     bits,
+                    nested: None,
+                    thin: false,
+                    repeated: false,
                 })
                 .collect(),
         }
@@ -422,11 +480,43 @@ pub struct Leaf {
     pub ty: ColumnType,
     /// The bits of the unsigned number it holds, as the file annotates them: 0 where it holds none.
     pub bits: u32,
+    /// For a leaf of a composed column's tree, that type and the leaf's place among its leaves.
+    pub nested: Option<(crate::composed::TypeRef, u16)>,
+    /// Whether the cut passes over it, as over a boolean: an array's dimensions and lower bounds.
+    pub thin: bool,
+    /// Whether it lies under a list, so that a row holds any number of its values.
+    pub repeated: bool,
 }
 
 impl Leaf {
-    /// Its path in the file: the column's name, then its field's.
+    /// A leaf of a composed column's tree: its path below the column joined by points, its type,
+    /// the composed type and its place among that type's leaves.
+    pub(crate) fn nested(
+        field: &'static str,
+        ty: ColumnType,
+        bits: u32,
+        of: crate::composed::TypeRef,
+        index: u16,
+        thin: bool,
+        repeated: bool,
+    ) -> Leaf {
+        Leaf {
+            field: Some(field),
+            ty,
+            bits,
+            nested: Some((of, index)),
+            thin,
+            repeated,
+        }
+    }
+
+    /// Its path in the file: the column's name, then its field's, or its path in its column's tree.
     pub fn path(&self, column: &str) -> Vec<String> {
+        if let Some((r, i)) = self.nested {
+            return std::iter::once(column.to_string())
+                .chain(crate::composed::leaf_path(r, i as usize).iter().cloned())
+                .collect();
+        }
         std::iter::once(column.to_string())
             .chain(self.field.map(str::to_string))
             .collect()
@@ -480,6 +570,7 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
         (NumericText(_), t) => assignable(ColumnType::numeric(Some((9, 2))), t),
         (f, NumericText(_)) => assignable(f, ColumnType::numeric(Some((9, 2)))),
         (Reg(a, _), Reg(b, _)) => a == b || crate::regs::casts_between(a, b),
+        (Composed(a), Composed(b)) => a == b,
         // text to regclass is regclass(text), an implicit cast; to any other reg* only explicit.
         (Text(_), Reg(crate::regs::RegKind::Class, _)) => true,
         _ => false,
@@ -516,6 +607,9 @@ pub struct Column {
     pub identity: Option<Identity>,
     /// The collation its DDL names, where it names one.
     pub collation: Option<String>,
+    /// The domain its DDL names as its type, whose constraints its values meet; its type is the
+    /// domain's base type.
+    pub domain: Option<String>,
 }
 
 impl Column {
@@ -2283,8 +2377,8 @@ mod tests {
                 "not an existing enum label",
             ),
             (
-                "CREATE TYPE s.m AS ENUM ('a'); CREATE TABLE s.t (m s.m NOT NULL, PRIMARY KEY (m))",
-                "an enum the DDL declares",
+                "CREATE TYPE s.c AS (); CREATE TABLE s.t (c s.c NOT NULL, PRIMARY KEY (c))",
+                "a composite of no fields",
             ),
             (
                 "CREATE COLLATION s.pt (provider = icu, locale = 'pt-PT')",

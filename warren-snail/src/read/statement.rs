@@ -27,6 +27,8 @@ pub enum Datum {
     Float4(u32),
     /// A double precision, as its own bits.
     Float8(u64),
+    /// A value of a composed type, held whole.
+    Compound(std::sync::Arc<crate::composed::Compound>),
 }
 
 impl Datum {
@@ -258,9 +260,15 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
     let col = &table.columns[c];
     let wrong = || Error::new(format!("{e} is not a value of {}.{}", table.name, col.name));
     Ok(match col.ty {
+        ty @ ColumnType::Composed(_) => crate::composed::literal(ty, e)?,
         ColumnType::Boolean => Datum::Int(truth_literal(e).map_err(|_| wrong())?),
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => {
-            let v = number(e).ok_or_else(wrong)?;
+            // A quoted literal is read by the integer's input.
+            let quoted = text_literal(e)
+                .ok()
+                .map(|s| crate::composed::int_in(&s, col.ty.integer_bits()))
+                .transpose()?;
+            let v = quoted.or_else(|| number(e)).ok_or_else(wrong)?;
             let fits = match col.ty {
                 ColumnType::Int2 => i16::try_from(v).is_ok(),
                 ColumnType::Int4 => i32::try_from(v).is_ok(),
@@ -454,7 +462,7 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                     SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                     _ => return Err(Error::new("name each column the INSERT's question returns")),
                 };
-                if is_literal(e) {
+                if is_literal(e) || crate::composed::constructs(table.columns[c].ty, e) {
                     fill[c] = Fill::Literal(datum(e, table, c)?);
                 } else {
                     fill[c] = Fill::Answer(kept.len());
@@ -542,7 +550,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                     sets.push((c, Fill::Default));
                     continue;
                 }
-                if !is_literal(&a.value) {
+                if !is_literal(&a.value)
+                    && !crate::composed::constructs(table.columns[c].ty, &a.value)
+                {
                     return Err(Error::new(format!(
                         "{}: an UPDATE sets a value written out",
                         a.value

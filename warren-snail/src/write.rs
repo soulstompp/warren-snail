@@ -82,6 +82,35 @@ impl Rows {
                     ))
                 };
                 match (&mut out, c.ty, a.data_type()) {
+                    // A composed column as arrow's Parquet reader gives its page form.
+                    (Values::Composed(out), ty, _) => {
+                        for r in 0..a.len() {
+                            let v = crate::composed::compound_at(ty, a.as_ref(), r);
+                            if v.is_none() && !a.is_null(r) {
+                                return Err(wrong());
+                            }
+                            out.push(v);
+                        }
+                    }
+                    // An enum: its labels, as their ranks.
+                    (
+                        Values::Int(out),
+                        ty @ ColumnType::Composed(_),
+                        DataType::Binary | DataType::Utf8,
+                    ) => {
+                        for r in 0..a.len() {
+                            let v = crate::composed::compound_at(ty, a.as_ref(), r);
+                            if v.is_none() && !a.is_null(r) {
+                                return Err(wrong());
+                            }
+                            out.push(v.and_then(|c| match c.item {
+                                crate::composed::Item::Scalar(
+                                    crate::read::statement::Datum::Int(k),
+                                ) => Some(k),
+                                _ => None,
+                            }));
+                        }
+                    }
                     (Values::Wide(out), ColumnType::Uuid, DataType::FixedSizeBinary(16)) => {
                         let a = a.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
                         out.extend(
@@ -739,6 +768,16 @@ pub(crate) fn laid_out(
                 continue;
             }
             let v = match column {
+                // A composed value by its key, written as text that sorts as the key does.
+                Values::Composed(x) => {
+                    let ty = table.columns[l.column()].ty;
+                    let key = x[r].as_ref().unwrap().hex.as_bytes().to_vec();
+                    if !fixed {
+                        text_sublevels[li] = crate::places::rungs_for(ty, &key, text_sublevels[li]);
+                    }
+                    unsorted.push(crate::places::byte_key(ty, &key));
+                    continue;
+                }
                 Values::Text(_) | Values::Utf8(_) | Values::Dict { .. } => {
                     let ty = table.columns[l.column()].ty;
                     let held = column.text_value(r).unwrap();
@@ -755,6 +794,7 @@ pub(crate) fn laid_out(
                 }
                 Values::Float4(_) | Values::Float8(_) => column.int(r).unwrap(),
                 Values::Int(v) => v[r].unwrap(),
+                Values::Nested(_) => unreachable!("a level reads its column whole"),
             };
             if table.columns[l.column()].ty == ColumnType::Timestamptz
                 && (v == i64::MAX || v == i64::MIN)
@@ -802,7 +842,7 @@ pub(crate) fn laid_out(
     for &c in &order.columns {
         let ty = table.columns[c].ty;
         for (leaf, values) in ty.leaves().iter().zip(leaf_values(ty, &rows.columns[c])) {
-            widths.0.push(width(leaf.ty, &values, &perm));
+            widths.0.push(width(leaf, &values, &perm));
         }
     }
     let blocks = cut(&keys, &sublevels, &widths);
@@ -829,8 +869,9 @@ pub(crate) fn leaf_values(ty: ColumnType, values: &Values) -> Vec<std::borrow::C
     }
 }
 
-/// What a leaf held as `ty` takes written plain, its rows in the order `perm` lays them.
-fn width(ty: ColumnType, values: &Values, perm: &[usize]) -> Width {
+/// What a leaf takes written plain, its rows in the order `perm` lays them.
+fn width(leaf: &crate::catalog::Leaf, values: &Values, perm: &[usize]) -> Width {
+    let ty = leaf.ty;
     let summed = |each: &dyn Fn(usize) -> u64| {
         let mut sum = Vec::with_capacity(perm.len() + 1);
         sum.push(0u64);
@@ -839,10 +880,25 @@ fn width(ty: ColumnType, values: &Values, perm: &[usize]) -> Width {
         }
         sum
     };
+    // An array's dimensions and lower bounds: the cut passes over them, their bits counted.
+    if leaf.thin {
+        return Width::Bits(summed(&|r| values.plain(r, ty) * 8));
+    }
     if let Some(bits) = ty.thin_bits() {
+        if let Values::Nested(n) = values {
+            return Width::Bits(summed(&|r| {
+                n.entries(r).filter(|&e| !n.values.is_null(e)).count() as u64 * bits
+            }));
+        }
         return Width::Bits(summed(&|r| if values.is_null(r) { 0 } else { bits }));
     }
-    match (ty.width(), values.nulls() > 0) {
+    // A leaf of a composed column takes its entries' values, whatever its type's width.
+    let width = if matches!(values, Values::Nested(_)) {
+        None
+    } else {
+        ty.width()
+    };
+    match (width, values.nulls() > 0) {
         (Some(wd), false) => Width::Fixed(wd),
         (None, false) => Width::Varying(summed(&|r| values.plain(r, ty))),
         (_, true) => Width::Nulls {
@@ -865,7 +921,7 @@ pub(crate) fn level_kinds(table: &Table, order: &Order) -> Vec<u32> {
             } else if ty.keyed_by_bytes() {
                 crate::directory::BYTES_LEVEL | 1
             } else {
-                ty.is_byte_array() as u32
+                ty.keyed_by_text() as u32
             }
         })
         .collect()
@@ -877,7 +933,7 @@ pub(crate) fn wide_slots(table: &Table, order: &Order) -> Vec<u32> {
         .leaves(table)
         .iter()
         .enumerate()
-        .filter(|(_, (_, leaf))| leaf.ty.is_wide())
+        .filter(|(_, (_, leaf))| leaf.ty.is_wide() && leaf.nested.is_none())
         .map(|(s, _)| s as u32)
         .collect()
 }
@@ -895,7 +951,7 @@ pub(crate) fn slots(table: &Table, order: &Order) -> (Vec<u32>, Vec<u32>) {
         .leaves(table)
         .iter()
         .enumerate()
-        .filter(|(_, (_, leaf))| leaf.ty.is_byte_array())
+        .filter(|(_, (_, leaf))| leaf.ty.is_byte_array() && leaf.nested.is_none())
         .map(|(s, _)| s as u32)
         .collect();
     (months, texts)
@@ -946,7 +1002,7 @@ fn leaves_written(table: &Table, order: &Order, units: &[usize]) -> Vec<ColumnWr
             data_pages: 0,
             disk_pages: 0,
             moved_blocks: 0,
-            bytes: leaf.ty.is_byte_array().then_some(0),
+            bytes: (leaf.ty.is_byte_array() && leaf.nested.is_none()).then_some(0),
         })
         .collect()
 }
@@ -1144,7 +1200,7 @@ pub(crate) fn write_block(
             min: keyed.iter().copied().min().unwrap_or(0),
             max: keyed.iter().copied().max().unwrap_or(0),
             pages: 0,
-            wide: leaf.ty.is_wide(),
+            wide: leaf.ty.is_wide() && leaf.nested.is_none(),
         });
         if let Some(m) = month_slots.iter().position(|&x| x == s) {
             for &v in &present {
