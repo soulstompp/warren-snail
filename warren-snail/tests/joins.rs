@@ -804,15 +804,22 @@ fn what_a_join_does_not_read_is_refused_with_its_reason() {
     }
 }
 
-#[test]
-fn the_structured_types_join_by_their_classes_or_are_refused_as_postgresql_refuses_them() {
+/// Two tables of the structured types, written empty.
+fn structured(name: &str) -> PathBuf {
     let ddl = "CREATE TABLE s.a (id integer NOT NULL, n inet, j jsonb, t tsvector, x json, p point, \
                b box, PRIMARY KEY (id)); \
                CREATE TABLE s.c (id integer NOT NULL, n cidr, j jsonb, t tsvector, x json, p point, \
                b box, PRIMARY KEY (id));";
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("joins_structured.snail");
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.snail"));
     let _ = std::fs::remove_file(&path);
     warren_snail::write::write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    path
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn the_structured_types_join_by_their_classes() {
+    let path = structured("joins_structured");
     let mut w = Snail::open_writing(&path).unwrap();
     w.execute(
         "INSERT INTO s.a (id, n, j, t) VALUES (1, '10.1.0.0/16', '{\"a\": 1.0}', 'b a'), \
@@ -838,6 +845,12 @@ fn the_structured_types_join_by_their_classes_or_are_refused_as_postgresql_refus
         let want: Vec<Row> = want.into_iter().map(|(a, c)| vec![s(a), s(c)]).collect();
         same(&mut snail, &q, want);
     }
+}
+
+#[test]
+fn a_structured_type_postgresql_has_no_key_for_is_refused_as_postgresql_refuses_it() {
+    let path = structured("joins_structured_refused");
+    let mut snail = fresh(&path);
     for (on, why) in [
         ("a.x = c.x", "operator does not exist: json = json"),
         ("a.p = c.p", "operator does not exist: point = point"),
