@@ -275,6 +275,8 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             }
         }
         ty @ (ColumnType::Oid
+        | ColumnType::Reg(..)
+        | ColumnType::Oid8
         | ColumnType::Xid
         | ColumnType::Cid
         | ColumnType::Xid8

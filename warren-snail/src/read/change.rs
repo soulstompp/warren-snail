@@ -804,7 +804,11 @@ impl Snail {
         if statement::is_literal(e) {
             return statement::datum(e, t, c);
         }
-        fill::assign_value(super::pipeline::eval_on(e, &[], &[])?, col.ty, &col.name)
+        fill::assign_value(
+            super::pipeline::eval_on(e, &[], &[], t.release)?,
+            col.ty,
+            &col.name,
+        )
     }
 
     /// The values a sequence hands this writer: those its cache holds first, then a run of CACHE
@@ -1179,6 +1183,7 @@ impl Snail {
             }
             gone.push(root.catalog);
             root.catalog = w.place(d.ddl.as_bytes())?;
+            root.monetary = crate::file::monetary_of(&self.catalog, &root.monetary);
             if !d.resets.is_empty() && root.sequences.bytes > 0 {
                 let mut states = decode_sequences(&self.reader.read_extent(root.sequences)?)?;
                 states.retain(|s| !d.resets.contains(&s.0));
@@ -2180,6 +2185,7 @@ impl Snail {
         let text = format!("{}\n{ddl};\n", self.catalog.ddl.trim_end());
         let mut catalog = Catalog::parse(&text)?;
         super::old_names(&mut catalog, self.reader.format());
+        catalog.with_release(self.root.release)?;
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         crate::file::holds_catalog(self.reader.format(), &catalog)?;

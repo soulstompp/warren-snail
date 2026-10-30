@@ -187,11 +187,16 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
         Level::MonthUtc(_) => 2,
         Level::Column(_) => match ty {
             ColumnType::Int2 => 16,
-            ColumnType::Int4 | ColumnType::Oid | ColumnType::Xid | ColumnType::Cid => 32,
+            ColumnType::Int4
+            | ColumnType::Oid
+            | ColumnType::Reg(..)
+            | ColumnType::Xid
+            | ColumnType::Cid => 32,
             ColumnType::Int8
             | ColumnType::Numeric { .. }
             | ColumnType::Xid8
             | ColumnType::PgLsn
+            | ColumnType::Oid8
             | ColumnType::Money => 64,
             ColumnType::Char => 8,
             ColumnType::Macaddr => 48,
@@ -226,6 +231,8 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             | ColumnType::Int8
             | ColumnType::Numeric { .. }
             | ColumnType::Oid
+            | ColumnType::Reg(..)
+            | ColumnType::Oid8
             | ColumnType::Xid
             | ColumnType::Cid
             | ColumnType::Xid8

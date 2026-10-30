@@ -16,7 +16,7 @@ pub mod statement;
 mod walk;
 
 pub use change::Done;
-pub use out::{TableOut, DDL_KEY};
+pub use out::{TableOut, DDL_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 
 /// An answer's rows as values, as a pipeline reads them.
@@ -568,6 +568,8 @@ impl Snail {
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
         let mut catalog = Catalog::parse(&ddl)?;
         old_names(&mut catalog, reader.format());
+        catalog.with_release(root.release)?;
+        crate::file::monetary_read(&catalog, &root.monetary)?;
         Ok(catalog)
     }
 
@@ -586,6 +588,17 @@ impl Snail {
     /// The generation of the root the snail reads.
     pub fn generation(&self) -> u64 {
         self.root.generation
+    }
+
+    /// The PostgreSQL release the file's OIDs came from, whose catalog names its reg* values.
+    pub fn release(&self) -> u8 {
+        self.root.release
+    }
+
+    /// Each money column's `lc_monetary`, as the file records it: its table, its column and the
+    /// locale.
+    pub fn monetary(&self) -> &[(String, String, String)] {
+        &self.root.monetary
     }
 
     /// Where each sequence stands, as the file holds it: its last value and whether it was handed
@@ -1061,7 +1074,8 @@ impl Snail {
             .iter()
             .map(|&c| table.columns[c].name.clone())
             .collect();
-        let mut stream = pipeline::Stream::new(q, &table.name, names, along, params)?;
+        let mut stream =
+            pipeline::Stream::new(q, &table.name, names, along, params, table.release)?;
         // Each block's rows go to the pipeline as the scan reads them, in the order.
         let mut blocks = Blocks {
             table,

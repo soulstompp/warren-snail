@@ -3051,6 +3051,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         columns: columns.clone(),
         orders,
         checks: d.checks.clone(),
+        release: crate::regs::LATEST,
     })
 }
 
@@ -3606,6 +3607,7 @@ pub(crate) fn read_ddl(ddl: &str, strict: bool) -> Result<Reading> {
             domains: draft.domains,
             sequences: draft.sequences,
             collations: draft.collations,
+            release: crate::regs::LATEST,
         },
         statements,
     })

@@ -54,6 +54,11 @@ pub enum ColumnType {
     Float4,
     /// double precision: a float of 64 bits, compared as a real is.
     Float8,
+    /// A reg* type: an oid, printed and read as the name of the object it names in the catalog of
+    /// the PostgreSQL release the file's OIDs came from, which it carries.
+    Reg(crate::regs::RegKind, u8),
+    /// oid8: an unsigned 64-bit object identifier, PostgreSQL 19's.
+    Oid8,
 }
 
 impl ColumnType {
@@ -67,6 +72,7 @@ impl ColumnType {
             | ColumnType::Xid
             | ColumnType::Cid
             | ColumnType::Char
+            | ColumnType::Reg(..)
             | ColumnType::Float4 => Some(4),
             ColumnType::Int8
             | ColumnType::Timestamptz
@@ -75,6 +81,7 @@ impl ColumnType {
             | ColumnType::PgLsn
             | ColumnType::Money
             | ColumnType::Macaddr8
+            | ColumnType::Oid8
             | ColumnType::Float8 => Some(8),
             ColumnType::Macaddr => Some(6),
             ColumnType::Uuid => Some(16),
@@ -86,12 +93,18 @@ impl ColumnType {
     /// width: 0 for any other.
     pub fn unsigned_bits(self) -> u32 {
         match self {
-            ColumnType::Oid | ColumnType::Xid | ColumnType::Cid => 32,
-            ColumnType::Xid8 | ColumnType::PgLsn | ColumnType::Macaddr8 => 64,
+            ColumnType::Oid | ColumnType::Reg(..) | ColumnType::Xid | ColumnType::Cid => 32,
+            ColumnType::Xid8 | ColumnType::PgLsn | ColumnType::Macaddr8 | ColumnType::Oid8 => 64,
             ColumnType::Macaddr => 48,
             ColumnType::Char => 8,
             _ => 0,
         }
+    }
+
+    /// Whether it is compared as an oid: an oid, or a reg* type, which PostgreSQL compares through
+    /// oid's operators.
+    pub fn is_oid(self) -> bool {
+        matches!(self, ColumnType::Oid | ColumnType::Reg(..))
     }
 
     /// Whether it is a float: a real or a double precision.
@@ -197,6 +210,8 @@ impl ColumnType {
             ColumnType::Macaddr8 => "macaddr8".into(),
             ColumnType::Float4 => "real".into(),
             ColumnType::Float8 => "double precision".into(),
+            ColumnType::Reg(kind, _) => kind.type_name().into(),
+            ColumnType::Oid8 => "oid8".into(),
         }
     }
 
@@ -224,6 +239,9 @@ impl ColumnType {
             ColumnType::Macaddr8 => "macaddr8_ops",
             ColumnType::Float4 => "float4_ops",
             ColumnType::Float8 => "float8_ops",
+            // A reg* type has none of its own: PostgreSQL takes oid's, to which it is binary-coercible.
+            ColumnType::Reg(..) => "oid_ops",
+            ColumnType::Oid8 => "oid8_ops",
         }
     }
 
@@ -269,7 +287,16 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
                 Float4 | Float8
             )
             | (Float4 | Float8, Int2 | Int4 | Int8 | Numeric { .. })
-    )
+            | (Int2 | Int4 | Int8 | Oid, Reg(..))
+            | (Reg(..), Oid | Int4 | Int8)
+            | (Int2 | Int4 | Int8 | Oid | Oid8, Oid8)
+            | (Oid8, Int8)
+    ) || match (from, to) {
+        (Reg(a, _), Reg(b, _)) => a == b || crate::regs::casts_between(a, b),
+        // text to regclass is regclass(text), an implicit cast; to any other reg* only explicit.
+        (Text(_), Reg(crate::regs::RegKind::Class, _)) => true,
+        _ => false,
+    }
 }
 
 /// A column the DDL generates from the row's other columns.
@@ -397,6 +424,8 @@ pub struct Table {
     /// The table's order first, then its indexes.
     pub orders: Vec<Order>,
     pub checks: Vec<Check>,
+    /// The PostgreSQL release whose catalog names its reg* values.
+    pub release: u8,
 }
 
 impl Table {
@@ -675,6 +704,8 @@ pub struct Catalog {
     pub domains: Vec<Domain>,
     pub sequences: Vec<Sequence>,
     pub collations: Vec<Collation>,
+    /// The PostgreSQL release the file's OIDs came from, whose catalog names its reg* values.
+    pub release: u8,
 }
 
 /// A DDL read a statement at a time: the catalog of the statements taken, and each statement taken
@@ -950,6 +981,7 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
         DataType::Bytea => ColumnType::Bytes,
         DataType::Boolean | DataType::Bool => ColumnType::Boolean,
         DataType::Uuid => ColumnType::Uuid,
+        DataType::Regclass => ColumnType::Reg(crate::regs::RegKind::Class, crate::regs::LATEST),
         DataType::Real | DataType::Float4 => ColumnType::Float4,
         DataType::DoublePrecision | DataType::Float8 | DataType::Float(ExactNumberInfo::None) => {
             ColumnType::Float8
@@ -981,7 +1013,13 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                 "money" => ColumnType::Money,
                 "macaddr" => ColumnType::Macaddr,
                 "macaddr8" => ColumnType::Macaddr8,
-                _ => return Err(Error::new(format!("the type {} is not held", spelled(dt)))),
+                "oid8" => ColumnType::Oid8,
+                other => match crate::regs::RegKind::of_type_name(other) {
+                    Some(kind) => ColumnType::Reg(kind, crate::regs::LATEST),
+                    None => {
+                        return Err(Error::new(format!("the type {} is not held", spelled(dt))))
+                    }
+                },
             }
         }
         DataType::Numeric(info) | DataType::Decimal(info) => {
@@ -1332,6 +1370,29 @@ impl Catalog {
 
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// Each reg* type its columns, its functions' arguments and its domains name, named by the
+    /// catalog of `release`: refused where the release has no such type.
+    pub fn with_release(&mut self, release: u8) -> Result<()> {
+        crate::regs::check_release(None, release)?;
+        self.release = release;
+        let mut types: Vec<&mut ColumnType> = Vec::new();
+        for t in &mut self.tables {
+            t.release = release;
+            types.extend(t.columns.iter_mut().map(|c| &mut c.ty));
+        }
+        for f in &mut self.functions {
+            types.extend(f.args.iter_mut());
+        }
+        types.extend(self.domains.iter_mut().filter_map(|d| d.base_type.as_mut()));
+        for ty in types {
+            if let ColumnType::Reg(kind, at) = ty {
+                crate::regs::check_release(Some(*kind), release)?;
+                *at = release;
+            }
+        }
+        Ok(())
     }
 
     pub fn sequence(&self, name: &str) -> Option<&Sequence> {

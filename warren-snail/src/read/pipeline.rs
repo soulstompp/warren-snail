@@ -124,7 +124,9 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
-        (Value::Scalar(a, x), Value::Scalar(b, y)) if a == b => x.cmp(y),
+        (Value::Scalar(a, x), Value::Scalar(b, y)) if a == b || a.is_oid() && b.is_oid() => {
+            x.cmp(y)
+        }
         (Value::Scalar(ty, _), other) | (other, Value::Scalar(ty, _)) => {
             return Err(Error::new(format!(
                 "operator does not exist: {} = {}",
@@ -191,6 +193,8 @@ pub struct Table {
 struct Frame<'a> {
     columns: Vec<(Option<String>, String)>,
     params: &'a [String],
+    /// The release whose catalog names a reg* value.
+    release: u8,
 }
 
 impl Frame<'_> {
@@ -379,7 +383,17 @@ fn numeric_literal(s: &str) -> Result<Value> {
     })
 }
 
-fn cast(v: Value, to: &DataType) -> Result<Value> {
+/// Whether an expression is a quoted literal: of unknown type, which a cast reads by the target's
+/// input.
+fn quoted(e: &Expr) -> bool {
+    match e {
+        Expr::Value(v) => matches!(v.value, SqlValue::SingleQuotedString(_)),
+        Expr::Nested(e) => quoted(e),
+        _ => false,
+    }
+}
+
+fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -468,6 +482,25 @@ fn cast(v: Value, to: &DataType) -> Result<Value> {
             other => return Err(Error::new(format!("{other:?} cast to uuid"))),
         },
         _ => match crate::catalog::held_type(to) {
+            // text to regclass is regclass(text), which reads a name alone; a literal is read by
+            // regclass's input.
+            Ok(ColumnType::Reg(crate::regs::RegKind::Class, _))
+                if !literal && matches!(v, Value::Text(_)) =>
+            {
+                let Value::Text(t) = &v else { unreachable!() };
+                let ty = ColumnType::Reg(crate::regs::RegKind::Class, release);
+                Value::Scalar(
+                    ty,
+                    crate::scalars::unsigned_key(
+                        u64::from(crate::regs::class_of_text(t, release)?),
+                        32,
+                    ),
+                )
+            }
+            Ok(ColumnType::Reg(kind, _)) => {
+                crate::regs::check_release(Some(kind), release)?;
+                scalar_cast(v, ColumnType::Reg(kind, release))?
+            }
             Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty)?,
             Ok(ty @ (ColumnType::Float4 | ColumnType::Float8)) => {
                 float_cast(v, ty == ColumnType::Float8)?
@@ -524,6 +557,20 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
     let key = match (&v, ty) {
         (Value::Null, _) => return Ok(Value::Null),
         (Value::Scalar(from, k), _) if *from == ty => *k,
+        // An oid and the reg* types are binary-coercible, as are a function's two and an operator's
+        // two to each other.
+        (Value::Scalar(ColumnType::Reg(a, _), k), ColumnType::Reg(b, _))
+            if crate::regs::casts_between(*a, b) =>
+        {
+            *k
+        }
+        (Value::Scalar(ColumnType::Oid, k), ColumnType::Reg(..))
+        | (Value::Scalar(ColumnType::Reg(..), k), ColumnType::Oid) => *k,
+        (Value::Scalar(ColumnType::Oid, k), ColumnType::Oid8) => {
+            unsigned_key(unsigned_of(*k, 32), 64)
+        }
+        // int8 and oid8 are binary-coercible; a smaller integer comes through int8.
+        (Value::Int(x), ColumnType::Oid8) => unsigned_key(*x as u64, 64),
         (
             Value::Scalar(from @ (ColumnType::Macaddr | ColumnType::Macaddr8), k),
             ColumnType::Macaddr | ColumnType::Macaddr8,
@@ -532,7 +579,7 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
             unsigned_key(u64::from(unsigned_of(*k, 64) as u32), 32)
         }
         (Value::Text(t), _) => scalar_parse(ty, t)?,
-        (Value::Int(x), ColumnType::Oid) => {
+        (Value::Int(x), ColumnType::Oid | ColumnType::Reg(..)) => {
             let u = match i32::try_from(*x) {
                 Ok(i) => i as u32,
                 Err(_) => u32::try_from(*x).map_err(|_| Error::new("OID out of range"))?,
@@ -561,8 +608,9 @@ fn scalar_integer(ty: ColumnType, k: i64, base: &str) -> Result<Value> {
     let int4 = matches!(base, "integer" | "int" | "int4");
     let int8 = matches!(base, "bigint" | "int8");
     Ok(Value::Int(match ty {
-        ColumnType::Oid if int4 => i64::from(unsigned_of(k, 32) as u32 as i32),
-        ColumnType::Oid if int8 => unsigned_of(k, 32) as i64,
+        ty if ty.is_oid() && int4 => i64::from(unsigned_of(k, 32) as u32 as i32),
+        ty if ty.is_oid() && int8 => unsigned_of(k, 32) as i64,
+        ColumnType::Oid8 if int8 => unsigned_of(k, 64) as i64,
         ColumnType::Char if int4 => i64::from(unsigned_of(k, 8) as u8 as i8),
         _ => {
             return Err(Error::new(format!(
@@ -577,7 +625,8 @@ fn scalar_integer(ty: ColumnType, k: i64, base: &str) -> Result<Value> {
 /// xid where it is an integer, as `xideqint4` reads one.
 fn integer_beside(scalar: &Value, n: Value) -> Result<Value> {
     match scalar {
-        Value::Scalar(ColumnType::Oid, _) => scalar_cast(n, ColumnType::Oid),
+        Value::Scalar(ty, _) if ty.is_oid() => scalar_cast(n, ColumnType::Oid),
+        Value::Scalar(ColumnType::Oid8, _) => scalar_cast(n, ColumnType::Oid8),
         Value::Scalar(ColumnType::Xid, _) if matches!(n, Value::Int(x) if i32::try_from(x).is_ok()) =>
         {
             let Value::Int(x) = n else { unreachable!() };
@@ -945,6 +994,16 @@ fn truth(v: &Value) -> Result<Option<bool>> {
     }
 }
 
+/// The type a quoted literal beside a scalar of type `ty` is read as: an oid beside a reg* type,
+/// whose comparisons are oid's; else `ty`.
+fn literal_type(ty: ColumnType) -> ColumnType {
+    if ty.is_oid() {
+        ColumnType::Oid
+    } else {
+        ty
+    }
+}
+
 /// Two values compared, a quoted literal beside a boolean or a uuid read as one, as PostgreSQL gives
 /// its unknown type the other side's.
 fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value)> {
@@ -971,11 +1030,13 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
             y,
         ),
         (Value::Scalar(ty, _), Value::Text(t)) if quoted(right) => {
-            let t = Value::Scalar(*ty, crate::scalars::scalar_parse(*ty, t)?);
+            let ty = literal_type(*ty);
+            let t = Value::Scalar(ty, crate::scalars::scalar_parse(ty, t)?);
             (x, t)
         }
         (Value::Text(t), Value::Scalar(ty, _)) if quoted(left) => {
-            (Value::Scalar(*ty, crate::scalars::scalar_parse(*ty, t)?), y)
+            let ty = literal_type(*ty);
+            (Value::Scalar(ty, crate::scalars::scalar_parse(ty, t)?), y)
         }
         (Value::Scalar(..), Value::Int(_)) => {
             let y = integer_beside(&x, y)?;
@@ -1034,7 +1095,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             expr,
             data_type,
             ..
-        } => cast(ev(expr)?, data_type)?,
+        } => cast(ev(expr)?, data_type, frame.release, quoted(expr))?,
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -1452,12 +1513,17 @@ impl Acc {
             (Value::Scalar(ColumnType::Char, _), Acc::Least(_) | Acc::Greatest(_)) => {
                 Value::Text(v.text().unwrap_or_default())
             }
+            // A reg* type's min and max are oid's, an oid.
+            (Value::Scalar(ColumnType::Reg(..), k), Acc::Least(_) | Acc::Greatest(_)) => {
+                Value::Scalar(ColumnType::Oid, *k)
+            }
             (Value::Scalar(ty, _), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_))
                 if !(matches!(self, Acc::Sum(_)) && *ty == ColumnType::Money
                     || !matches!(self, Acc::Sum(_))
                         && matches!(
                             ty,
                             ColumnType::Oid
+                                | ColumnType::Oid8
                                 | ColumnType::Xid8
                                 | ColumnType::PgLsn
                                 | ColumnType::Money
@@ -1623,10 +1689,11 @@ fn prepare(q: &Query) -> Result<Prepared<'_>> {
 
 /// An expression on one row whose columns the names give, read alone: a CHECK's, a generated
 /// column's, or a DEFAULT's on no row.
-pub(crate) fn eval_on(e: &Expr, names: &[String], row: &[Value]) -> Result<Value> {
+pub(crate) fn eval_on(e: &Expr, names: &[String], row: &[Value], release: u8) -> Result<Value> {
     let frame = Frame {
         columns: names.iter().map(|n| (None, n.clone())).collect(),
         params: &[],
+        release,
     };
     eval(e, row, &frame, &computed_none())
 }
@@ -1685,8 +1752,13 @@ impl<'q> StepRun<'q> {
         mut rel: Relation,
         columns: Columns,
         params: &[String],
+        release: u8,
     ) -> Result<Option<Relation>> {
-        let frame = Frame { columns, params };
+        let frame = Frame {
+            columns,
+            params,
+            release,
+        };
         let none = computed_none();
         if let Some(w) = self.p.selection {
             let mut kept = Vec::with_capacity(rel.rows.len());
@@ -1762,7 +1834,7 @@ impl<'q> StepRun<'q> {
     }
 
     /// The rows a step that groups or sorts returns, once every chunk is read.
-    fn finish(mut self, params: &[String]) -> Result<Relation> {
+    fn finish(mut self, params: &[String], release: u8) -> Result<Relation> {
         let mut out = Relation {
             names: self.names(),
             rows: std::mem::take(&mut self.rows),
@@ -1777,6 +1849,7 @@ impl<'q> StepRun<'q> {
             let frame = Frame {
                 columns: std::mem::take(&mut self.columns),
                 params,
+                release,
             };
             for (first, accs) in &self.groups {
                 let computed = Computed {
@@ -1800,14 +1873,19 @@ impl<'q> StepRun<'q> {
             }
         }
         if let Some(ob) = self.p.order_by {
-            sort(&mut out, ob, params)?;
+            sort(&mut out, ob, params, release)?;
         }
         Ok(out)
     }
 }
 
 /// A step's rows sorted as its ORDER BY says, on the step's own columns.
-fn sort(out: &mut Relation, ob: &sqlparser::ast::OrderBy, params: &[String]) -> Result<()> {
+fn sort(
+    out: &mut Relation,
+    ob: &sqlparser::ast::OrderBy,
+    params: &[String],
+    release: u8,
+) -> Result<()> {
     let exprs = match &ob.kind {
         OrderByKind::Expressions(e) => e,
         _ => return Err(Error::new("ORDER BY ALL is not read")),
@@ -1815,6 +1893,7 @@ fn sort(out: &mut Relation, ob: &sqlparser::ast::OrderBy, params: &[String]) -> 
     let named = Frame {
         columns: out.names.iter().map(|n| (None, n.clone())).collect(),
         params,
+        release,
     };
     let none = computed_none();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = std::mem::take(&mut out.rows)
@@ -1896,6 +1975,7 @@ fn select(
     steps: &HashMap<String, Relation>,
     table: &Table,
     params: &[String],
+    release: u8,
 ) -> Result<Relation> {
     let p = prepare(q)?;
     let (rel, columns) = if p.from.is_empty() {
@@ -1911,9 +1991,9 @@ fn select(
         from(p.from, steps, table)?
     };
     let mut run = StepRun::new(p);
-    match run.feed(rel, columns, params)? {
+    match run.feed(rel, columns, params, release)? {
         Some(out) => Ok(out),
-        None => run.finish(params),
+        None => run.finish(params, release),
     }
 }
 
@@ -1955,6 +2035,8 @@ enum Kind {
 pub struct Stream<'q> {
     table: Table,
     params: Vec<String>,
+    /// The release whose catalog names a reg* value.
+    release: u8,
     /// Each step, and last the question itself under no name.
     steps: Vec<(String, &'q Query, Kind)>,
     runs: Vec<Option<StepRun<'q>>>,
@@ -1976,6 +2058,7 @@ impl<'q> Stream<'q> {
         names: Vec<String>,
         order: Option<usize>,
         params: &[String],
+        release: u8,
     ) -> Result<Stream<'q>> {
         let mut s = Stream {
             table: Table {
@@ -1987,6 +2070,7 @@ impl<'q> Stream<'q> {
                 },
             },
             params: params.to_vec(),
+            release,
             steps: Vec::new(),
             runs: Vec::new(),
             view: HashMap::new(),
@@ -2040,7 +2124,7 @@ impl<'q> Stream<'q> {
                 Kind::Fixed
             };
             if kind == Kind::Fixed {
-                let r = select(query, &s.view, &s.table, params)?;
+                let r = select(query, &s.view, &s.table, params, release)?;
                 s.view.insert(name.clone(), r);
             }
             s.runs.push(match kind {
@@ -2089,7 +2173,7 @@ impl<'q> Stream<'q> {
             }
             let run = self.runs[i].as_mut().unwrap();
             let (rel, columns) = from(run.p.from, &self.view, &table)?;
-            if let Some(out) = run.feed(rel, columns, &self.params)? {
+            if let Some(out) = run.feed(rel, columns, &self.params, self.release)? {
                 if let Some(k) = self.kept.get_mut(name) {
                     gather(k, &out);
                 }
@@ -2149,8 +2233,11 @@ impl<'q> Stream<'q> {
                     Some(k) => k,
                     None => continue,
                 },
-                Kind::Folded => self.runs[i].take().unwrap().finish(&self.params)?,
-                Kind::After => select(query, &whole, &table, &self.params)?,
+                Kind::Folded => self.runs[i]
+                    .take()
+                    .unwrap()
+                    .finish(&self.params, self.release)?,
+                Kind::After => select(query, &whole, &table, &self.params, self.release)?,
             };
             whole.insert(name, r);
         }
@@ -2179,6 +2266,7 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
         table.relation.names.clone(),
         table.relation.order,
         params,
+        crate::regs::LATEST,
     )?;
     s.feed(table.relation.clone())?;
     s.finish()
@@ -2554,6 +2642,7 @@ mod tests {
                 t.relation.names.clone(),
                 t.relation.order,
                 &[],
+                crate::regs::LATEST,
             )
             .unwrap();
             for part in [&t.relation.rows[..2], &t.relation.rows[2..]] {

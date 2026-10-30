@@ -12,6 +12,7 @@ pub mod held;
 pub mod lock;
 pub mod places;
 pub mod read;
+pub mod regs;
 pub mod scalars;
 pub mod values;
 pub mod write;

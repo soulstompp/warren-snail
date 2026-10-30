@@ -885,6 +885,12 @@ impl Answer {
             };
             let scalar = match *item {
                 _ if char_text => None,
+                // A reg* type's min and max are oid's, an oid.
+                Item::Least(c) | Item::Greatest(c)
+                    if tables[c.side].columns[c.column].ty.is_oid() =>
+                {
+                    Some(ColumnType::Oid)
+                }
                 Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) | Item::Sum(c) => {
                     Some(tables[c.side].columns[c.column].ty)
                         .filter(|&t| crate::scalars::is_scalar(t))

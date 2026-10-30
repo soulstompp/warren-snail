@@ -145,7 +145,45 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         | (PgLsn, PgLsn)
         | (Char, Char)
         | (Money, Money) => d,
-        (Int2 | Int4 | Int8, Oid) => {
+        // A reg* type is an oid to PostgreSQL's casts: from and to one, binary-coercible, as are a
+        // function's two and an operator's two to each other.
+        (Oid | Reg(..), Oid | Reg(..))
+            if from.is_oid()
+                && (from == Oid
+                    || to == Oid
+                    || matches!((from, to), (Reg(a, _), Reg(b, _)) if a == b || crate::regs::casts_between(a, b))) =>
+        {
+            d
+        }
+        (Text(_), Reg(crate::regs::RegKind::Class, release)) => {
+            let s = text_of(&d, from).unwrap_or_default();
+            Datum::Int(crate::scalars::unsigned_key(
+                u64::from(crate::regs::class_of_text(&s, release)?),
+                32,
+            ))
+        }
+        (Oid8, Oid8) => d,
+        (Int2 | Int4 | Int8, Oid8) | (Oid8, Int8) => {
+            let Datum::Int(v) = d else {
+                return Err(refused());
+            };
+            // int8 and oid8 are binary-coercible; a smaller integer comes through int8.
+            Datum::Int(if to == Oid8 {
+                crate::scalars::unsigned_key(v as u64, 64)
+            } else {
+                crate::scalars::unsigned_of(v, 64) as i64
+            })
+        }
+        (Oid, Oid8) => {
+            let Datum::Int(v) = d else {
+                return Err(refused());
+            };
+            Datum::Int(crate::scalars::unsigned_key(
+                crate::scalars::unsigned_of(v, 32),
+                64,
+            ))
+        }
+        (Int2 | Int4 | Int8, Oid | Reg(..)) => {
             let Datum::Int(v) = d else {
                 return Err(refused());
             };
@@ -157,7 +195,7 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             };
             Datum::Int(crate::scalars::unsigned_key(u64::from(u), 32))
         }
-        (Oid, Int4 | Int8) => {
+        (Oid | Reg(..), Int4 | Int8) => {
             let Datum::Int(v) = d else {
                 return Err(refused());
             };
@@ -313,7 +351,11 @@ pub fn generate(table: &Table, row: &mut Row) -> Result<()> {
     for (c, col) in table.columns.iter().enumerate() {
         if let Some(g) = &col.generated {
             row[c] = if g.stored {
-                assign_value(eval_on(&g.expr, &names, &vals)?, col.ty, &col.name)?
+                assign_value(
+                    eval_on(&g.expr, &names, &vals, table.release)?,
+                    col.ty,
+                    &col.name,
+                )?
             } else {
                 Datum::Null
             };
@@ -332,7 +374,11 @@ pub fn with_virtual(table: &Table, row: &Row) -> Result<Row> {
     let vals = values(table, row);
     for (c, col) in table.columns.iter().enumerate() {
         if let Some(g) = col.generated.as_ref().filter(|g| !g.stored) {
-            out[c] = assign_value(eval_on(&g.expr, &names, &vals)?, col.ty, &col.name)?;
+            out[c] = assign_value(
+                eval_on(&g.expr, &names, &vals, table.release)?,
+                col.ty,
+                &col.name,
+            )?;
         }
     }
     Ok(out)
@@ -348,7 +394,7 @@ pub fn check(table: &Table, row: &Row) -> Result<()> {
     let names = names(table);
     let vals = values(table, &full);
     for k in table.checks.iter().filter(|k| k.enforced) {
-        match eval_on(&k.expr, &names, &vals)? {
+        match eval_on(&k.expr, &names, &vals, table.release)? {
             Value::Bool(false) => {
                 return Err(Error::new(format!(
                     "new row for relation \"{}\" violates check constraint \"{}\"",

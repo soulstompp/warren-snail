@@ -234,7 +234,7 @@ fn strtoul(s: &[u8]) -> Option<(u64, bool, usize)> {
 /// An unsigned number as PostgreSQL's `uint32in_subr` or `uint64in_subr` reads one for type `name`:
 /// `strtoul`'s reading, white space after it; a 32-bit one taken where it fits after the number is
 /// extended either way, so `-1` is the largest.
-fn unsigned_in(s: &str, bits: u32, name: &str) -> Result<u64> {
+pub(crate) fn unsigned_in(s: &str, bits: u32, name: &str) -> Result<u64> {
     let wrong = || Error::new(format!("invalid input syntax for type {name}: \"{s}\""));
     let range = || Error::new(format!("value \"{s}\" is out of range for type {name}"));
     let (v, over, end) = strtoul(s.as_bytes()).ok_or_else(wrong)?;
@@ -1012,8 +1012,13 @@ pub fn float4_between(c: f64) -> Option<(i64, i64)> {
 /// A key of a type keyed as a number as PostgreSQL's output function writes the value.
 pub fn scalar_text(ty: ColumnType, key: i64) -> String {
     match ty {
-        ColumnType::Oid | ColumnType::Xid | ColumnType::Cid | ColumnType::Xid8 => {
-            unsigned_of(key, ty.unsigned_bits()).to_string()
+        ColumnType::Oid
+        | ColumnType::Xid
+        | ColumnType::Cid
+        | ColumnType::Xid8
+        | ColumnType::Oid8 => unsigned_of(key, ty.unsigned_bits()).to_string(),
+        ColumnType::Reg(kind, release) => {
+            crate::regs::reg_text(kind, unsigned_of(key, 32) as u32, release)
         }
         ColumnType::PgLsn => lsn_out(unsigned_of(key, 64)),
         ColumnType::Char => char_out(unsigned_of(key, 8) as u8),
@@ -1028,9 +1033,16 @@ pub fn scalar_text(ty: ColumnType, key: i64) -> String {
 /// it, as its key.
 pub fn scalar_parse(ty: ColumnType, s: &str) -> Result<i64> {
     Ok(match ty {
-        ColumnType::Oid | ColumnType::Xid | ColumnType::Cid | ColumnType::Xid8 => {
+        ColumnType::Oid
+        | ColumnType::Xid
+        | ColumnType::Cid
+        | ColumnType::Xid8
+        | ColumnType::Oid8 => {
             let bits = ty.unsigned_bits();
             unsigned_key(unsigned_in(s, bits, &ty.pg_name())?, bits)
+        }
+        ColumnType::Reg(kind, release) => {
+            unsigned_key(u64::from(crate::regs::reg_parse(kind, s, release)?), 32)
         }
         ColumnType::PgLsn => unsigned_key(lsn_in(s)?, 64),
         ColumnType::Char => unsigned_key(u64::from(char_in(s)), 8),
@@ -1049,6 +1061,10 @@ pub fn scalar_parse(ty: ColumnType, s: &str) -> Result<i64> {
 /// The key of an answer's field metadata that names the PostgreSQL type of a column whose Arrow
 /// type does not say it.
 pub const PG_TYPE: &str = "pg_type";
+
+/// The key of an answer's field metadata that names the PostgreSQL release whose catalog names a
+/// reg* column's OIDs.
+pub const PG_RELEASE: &str = "pg_release";
 
 /// The Arrow type an answer holds a scalar of type `ty` as: what arrow's Parquet reader gives its
 /// page form.
@@ -1121,13 +1137,26 @@ pub fn scalar_key_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> O
 
 /// An answer's field, named for a scalar's PostgreSQL type in its metadata.
 pub fn scalar_field(name: &str, ty: ColumnType, nullable: bool) -> arrow::datatypes::Field {
+    let mut named = vec![(PG_TYPE.to_string(), ty.pg_name())];
+    if let ColumnType::Reg(_, release) = ty {
+        named.push((PG_RELEASE.to_string(), release.to_string()));
+    }
     arrow::datatypes::Field::new(name, scalar_arrow(ty), nullable)
-        .with_metadata([(PG_TYPE.to_string(), ty.pg_name())].into_iter().collect())
+        .with_metadata(named.into_iter().collect())
 }
 
 /// The scalar type an answer's field holds, by its metadata.
 pub fn field_scalar(f: &arrow::datatypes::Field) -> Option<ColumnType> {
     let named = f.metadata().get(PG_TYPE)?;
+    if let Some(kind) = crate::regs::RegKind::of_type_name(named) {
+        let release = f
+            .metadata()
+            .get(PG_RELEASE)
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(crate::regs::LATEST);
+        let ty = ColumnType::Reg(kind, release);
+        return (scalar_arrow(ty) == *f.data_type()).then_some(ty);
+    }
     [
         ColumnType::Oid,
         ColumnType::Xid,
@@ -1138,6 +1167,7 @@ pub fn field_scalar(f: &arrow::datatypes::Field) -> Option<ColumnType> {
         ColumnType::Money,
         ColumnType::Macaddr,
         ColumnType::Macaddr8,
+        ColumnType::Oid8,
     ]
     .into_iter()
     .find(|t| t.pg_name() == *named && scalar_arrow(*t) == *f.data_type())
@@ -1177,6 +1207,8 @@ pub fn is_scalar(ty: ColumnType) -> bool {
             | ColumnType::Money
             | ColumnType::Macaddr
             | ColumnType::Macaddr8
+            | ColumnType::Reg(..)
+            | ColumnType::Oid8
     )
 }
 

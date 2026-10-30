@@ -15,7 +15,7 @@ use warren_snail::cut::PAGE;
 #[cfg(feature = "standalone")]
 use warren_snail::read::HELD_BYTES;
 use warren_snail::read::{Round, Snail};
-use warren_snail::write::{parquet_files, sources, write_spanned, Rows};
+use warren_snail::write::{parquet_files, sources, write_released, Rows};
 use warren_snail::{Error, Result};
 
 const USAGE: &str =
@@ -23,7 +23,7 @@ const USAGE: &str =
 PostgreSQL's SQL. It runs on Linux.
 
 usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
-                          [--written <written.parquet>]
+                          [--release <14..19>] [--written <written.parquet>]
        warren-snail exec <file> <statements.sql> --out <done.parquet>
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
                          [--param <value>]... [--rounds <n>] [--hold <MiB>]
@@ -39,8 +39,9 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           in a Parquet file, or a directory of them as `out` writes them, and a table given none
           written empty. Prints what each order laid out. A row group already cut as the snail
           cuts it comes in by its pages as they lie. The pages lie in files of 1 GiB, <file>, then
-          <file>.1 and on; --file-pages sets another size, in 4 KiB pages. --written records each
-          order's columns as Parquet.
+          <file>.1 and on; --file-pages sets another size, in 4 KiB pages. --release names the
+          PostgreSQL release the rows' OIDs came from, whose built-in objects name its reg* values:
+          19 unless given. --written records each order's columns as Parquet.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
           COMMIT and ROLLBACK; CREATE TABLE, and CREATE INDEX and ALTER TABLE … CLUSTER ON for a
           table that holds no rows. Outside a transaction each statement commits. --out records
@@ -288,7 +289,13 @@ fn cmd_write(args: &[String]) -> Result<()> {
             .map_err(|_| Error::new("--file-pages takes a whole number"))?,
         None => warren_snail::file::FILE_PAGES,
     };
-    let written = write_spanned(Path::new(file), &catalog, &tables, &given, span)?;
+    let release = match flag(args, "--release") {
+        Some(r) => r
+            .parse()
+            .map_err(|_| Error::new("--release takes PostgreSQL's major release, 14 to 19"))?,
+        None => warren_snail::regs::LATEST,
+    };
+    let written = write_released(Path::new(file), &catalog, &tables, &given, span, release)?;
     if let Some(out) = flag(args, "--written") {
         let rows: Vec<(
             &warren_snail::write::Written,

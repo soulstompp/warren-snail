@@ -433,7 +433,28 @@ pub fn write_spanned(
     sources: &[(String, Source)],
     span: u64,
 ) -> Result<Vec<Written>> {
-    write_made(path, catalog, tables, sources, span, None)
+    write_made(
+        path,
+        catalog,
+        tables,
+        sources,
+        span,
+        None,
+        crate::regs::LATEST,
+    )
+}
+
+/// A new snail as `write_spanned` writes it, its OIDs from PostgreSQL `release`, whose catalog
+/// names its reg* values: 14 to 19.
+pub fn write_released(
+    path: &Path,
+    catalog: &Catalog,
+    tables: &[(String, Rows)],
+    sources: &[(String, Source)],
+    span: u64,
+    release: u8,
+) -> Result<Vec<Written>> {
+    write_made(path, catalog, tables, sources, span, None, release)
 }
 
 /// A new snail as warren-snail 0.1.0 made it, in format 7, each page map in pages of its own: for the
@@ -445,7 +466,15 @@ pub fn write_format_seven(
     tables: &[(String, Rows)],
     span: u64,
 ) -> Result<Vec<Written>> {
-    write_made(path, catalog, tables, &[], span, Some(FORMAT_SEVEN))
+    write_made(
+        path,
+        catalog,
+        tables,
+        &[],
+        span,
+        Some(FORMAT_SEVEN),
+        crate::regs::LATEST,
+    )
 }
 
 /// A new snail as warren-snail 0.1.1 made it, in format 8: for the tests that read and write such a
@@ -457,7 +486,15 @@ pub fn write_format_eight(
     tables: &[(String, Rows)],
     span: u64,
 ) -> Result<Vec<Written>> {
-    write_made(path, catalog, tables, &[], span, Some(FORMAT_EIGHT))
+    write_made(
+        path,
+        catalog,
+        tables,
+        &[],
+        span,
+        Some(FORMAT_EIGHT),
+        crate::regs::LATEST,
+    )
 }
 
 fn write_made(
@@ -467,14 +504,16 @@ fn write_made(
     sources: &[(String, Source)],
     span: u64,
     format: Option<u32>,
+    release: u8,
 ) -> Result<Vec<Written>> {
     for (name, _) in tables {
         if catalog.table(name).is_none() {
             return Err(Error::new(format!("{name} is not in the DDL")));
         }
     }
-    let mut w = Writer::create_spanned(path, span)?;
     let mut named = catalog.clone();
+    named.with_release(release)?;
+    let mut w = Writer::create_spanned(path, span)?;
     if let Some(f) = format {
         w.set_format(f);
         crate::read::old_names(&mut named, f);
@@ -504,6 +543,8 @@ fn write_tables(
 ) -> Result<Vec<Written>> {
     let mut root = Root {
         generation: 1,
+        release: catalog.release,
+        monetary: crate::file::monetary_of(catalog, &[]),
         ..Default::default()
     };
     crate::file::holds_catalog(w.format(), catalog)?;

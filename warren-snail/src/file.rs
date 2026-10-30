@@ -239,6 +239,75 @@ pub struct Root {
     /// Where each sequence stands that has handed out a value since the DDL made or restarted it:
     /// format 9 only.
     pub sequences: Extent,
+    /// The PostgreSQL release the file's OIDs came from: format 9 only, 19 in formats 7 and 8,
+    /// which hold no reg* value.
+    pub release: u8,
+    /// Each money column's `lc_monetary`: its table, its column and the locale; format 9 only, as
+    /// formats 7 and 8 hold no money.
+    pub monetary: Vec<(String, String, String)>,
+}
+
+/// The `lc_monetary` money is written under: C, the only one the snail reads until the collations
+/// feature's glibc does.
+pub const MONETARY: &str = "C";
+
+/// Each money column of a catalog with its `lc_monetary`: the one `had` records for it, or C for a
+/// column it does not.
+pub fn monetary_of(
+    catalog: &crate::catalog::Catalog,
+    had: &[(String, String, String)],
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for t in &catalog.tables {
+        for c in t
+            .columns
+            .iter()
+            .filter(|c| c.ty == crate::catalog::ColumnType::Money)
+        {
+            let locale = had
+                .iter()
+                .find(|(a, b, _)| *a == t.name && *b == c.name)
+                .map_or(MONETARY.to_string(), |m| m.2.clone());
+            out.push((t.name.clone(), c.name.clone(), locale));
+        }
+    }
+    out
+}
+
+/// Refuses a money column the file records no `lc_monetary` for, or one written under a locale
+/// other than C or POSIX.
+pub fn monetary_read(
+    catalog: &crate::catalog::Catalog,
+    recorded: &[(String, String, String)],
+) -> crate::Result<()> {
+    for t in &catalog.tables {
+        for c in t
+            .columns
+            .iter()
+            .filter(|c| c.ty == crate::catalog::ColumnType::Money)
+        {
+            match recorded
+                .iter()
+                .find(|(a, b, _)| *a == t.name && *b == c.name)
+            {
+                None => {
+                    return Err(crate::Error::new(format!(
+                        "{}.{} is money, and the file records no lc_monetary for it",
+                        t.name, c.name
+                    )))
+                }
+                Some((_, _, l)) if l != "C" && l != "POSIX" => {
+                    return Err(crate::Error::new(format!(
+                        "{}.{} is money written under lc_monetary {l}: this warren-snail reads \
+                         money under C and POSIX only",
+                        t.name, c.name
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A run of pages in the free map: free where its tag is 0, else freed once no round older than its
@@ -352,6 +421,13 @@ impl Root {
         }
         if format >= FORMAT {
             o.extent(self.sequences);
+            o.u8(self.release);
+            o.u32(self.monetary.len() as u32);
+            for (t, c, l) in &self.monetary {
+                o.str(t);
+                o.str(c);
+                o.str(l);
+            }
         }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
@@ -387,10 +463,17 @@ impl Root {
         for _ in 0..m {
             reused.push((i.u64().ok()?, i.u64().ok()?, i.u64().ok()?));
         }
-        let sequences = if format >= FORMAT {
-            i.extent().ok()?
+        let (sequences, release, monetary) = if format >= FORMAT {
+            let sequences = i.extent().ok()?;
+            let release = i.u8().ok()?;
+            let n = i.u32().ok()? as usize;
+            let mut monetary = Vec::with_capacity(n.min(256));
+            for _ in 0..n {
+                monetary.push((i.str().ok()?, i.str().ok()?, i.str().ok()?));
+            }
+            (sequences, release, monetary)
         } else {
-            Extent::default()
+            (Extent::default(), crate::regs::LATEST, Vec::new())
         };
         let end = i.at();
         let crc = i.u32().ok()?;
@@ -405,6 +488,8 @@ impl Root {
                 reused,
                 reused_from,
                 sequences,
+                release,
+                monetary,
             },
             format,
         ))
@@ -1139,12 +1224,15 @@ mod tests {
                 start: 11,
                 bytes: 40,
             },
+            release: 16,
+            monetary: vec![("s.t".into(), "m".into(), "C".into())],
         };
         let mut a = r.encode(FORMAT).unwrap();
         a.resize(PAGE, 0);
         let (back, format) = Root::decode(&a).unwrap();
         assert_eq!(format, FORMAT);
         assert_eq!((back.generation, back.span), (7, 64));
+        assert_eq!((back.release, &back.monetary), (16, &r.monetary));
         assert_eq!(back.orders[0].2.pages(), 2);
         assert_eq!(
             (

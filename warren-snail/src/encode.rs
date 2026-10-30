@@ -99,11 +99,13 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
         ColumnType::Boolean => (PhysicalType::BOOLEAN, None),
         ColumnType::Uuid => (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Uuid)),
         ColumnType::Oid
+        | ColumnType::Reg(..)
         | ColumnType::Xid
         | ColumnType::Cid
         | ColumnType::Char
         | ColumnType::Xid8
-        | ColumnType::PgLsn => (
+        | ColumnType::PgLsn
+        | ColumnType::Oid8 => (
             if ty.unsigned_bits() == 64 {
                 PhysicalType::INT64
             } else {
@@ -485,6 +487,7 @@ pub fn decode(
         ColumnType::Int2
         | ColumnType::Int4
         | ColumnType::Oid
+        | ColumnType::Reg(..)
         | ColumnType::Xid
         | ColumnType::Cid
         | ColumnType::Char => {
@@ -519,6 +522,7 @@ pub fn decode(
         | ColumnType::Numeric { .. }
         | ColumnType::Xid8
         | ColumnType::PgLsn
+        | ColumnType::Oid8
         | ColumnType::Money => {
             let mut r = get_typed_column_reader::<Int64Type>(column);
             let mut v: Vec<i64> = Vec::new();

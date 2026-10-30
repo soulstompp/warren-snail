@@ -25,6 +25,10 @@ use std::sync::Arc;
 /// The key under which a file out names its table's DDL.
 pub const DDL_KEY: &str = "warren-snail.ddl";
 
+/// The key under which a file out of a table holding a reg* column names the PostgreSQL release its
+/// OIDs came from.
+pub const RELEASE_KEY: &str = "warren-snail.release";
+
 /// A table written out.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -237,10 +241,20 @@ impl Snail {
             .set_writer_version(WriterVersion::PARQUET_1_0)
             .set_compression(Compression::UNCOMPRESSED)
             .set_sorting_columns(sorting)
-            .set_key_value_metadata(Some(vec![KeyValue::new(
-                DDL_KEY.to_string(),
-                self.catalog.ddl_of(&table.name)?,
-            )]))
+            .set_key_value_metadata(Some(
+                std::iter::once(KeyValue::new(
+                    DDL_KEY.to_string(),
+                    self.catalog.ddl_of(&table.name)?,
+                ))
+                .chain(
+                    table
+                        .columns
+                        .iter()
+                        .any(|c| matches!(c.ty, ColumnType::Reg(..)))
+                        .then(|| KeyValue::new(RELEASE_KEY.to_string(), table.release.to_string())),
+                )
+                .collect(),
+            ))
             .build();
         let props = Arc::new(props);
         // A table whose pages pass the span of the snail's own files goes out as files of whole row

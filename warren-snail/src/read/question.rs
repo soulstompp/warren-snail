@@ -412,7 +412,9 @@ fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
 /// A literal compared with a fixed scalar, as its key: quoted, read by the type's input; a number
 /// only beside an oid, cast to one, or an xid, as `xideqint4` reads an integer.
 fn scalar_literal(e: &Expr, ty: ColumnType) -> Result<i64> {
+    // A quoted literal beside a reg* type is read as an oid, whose comparisons it takes.
     if let Ok(s) = text_literal(e) {
+        let ty = if ty.is_oid() { ColumnType::Oid } else { ty };
         return crate::scalars::scalar_parse(ty, &s);
     }
     let n = match super::statement::number_datum(e) {
@@ -432,9 +434,13 @@ fn scalar_literal(e: &Expr, ty: ColumnType) -> Result<i64> {
         }
     };
     let int4 = i32::try_from(n).is_ok();
+    // int8 and oid8 are binary-coercible; an integer comes through int8.
+    if ty == ColumnType::Oid8 {
+        return Ok(crate::scalars::unsigned_key(n as u64, 64));
+    }
     let u = match ty {
-        ColumnType::Oid if int4 => n as i32 as u32,
-        ColumnType::Oid => u32::try_from(n).map_err(|_| Error::new("OID out of range"))?,
+        ty if ty.is_oid() && int4 => n as i32 as u32,
+        ty if ty.is_oid() => u32::try_from(n).map_err(|_| Error::new("OID out of range"))?,
         ColumnType::Xid if int4 => n as i32 as u32,
         _ => {
             return Err(Error::new(format!(
@@ -681,6 +687,8 @@ impl From<'_> {
                     | ColumnType::Numeric { .. }
                     | ColumnType::Timestamptz
                     | ColumnType::Oid
+                    | ColumnType::Reg(..)
+                    | ColumnType::Oid8
                     | ColumnType::Xid8
                     | ColumnType::PgLsn
                     | ColumnType::Char
