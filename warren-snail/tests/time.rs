@@ -445,3 +445,30 @@ fn under_zones_an_instant_at_a_named_zone_reads_its_rules() {
         some(&["2024-01-05 13:04:05+00", "2024-07-05 13:04:05+00"])
     );
 }
+
+#[cfg(feature = "standalone")]
+#[test]
+fn at_time_zone_reads_an_abbreviation_first_as_postgresql_does() {
+    let mut snail = snail_of(
+        "time-abbreviations",
+        &table("timestamptz"),
+        &["INSERT INTO s.t (id, v) VALUES (1, '2024-07-05 13:04:05+00')"],
+    );
+    let step = "WITH t AS (SELECT id, v FROM s.t)";
+    // UTC's abbreviations, whatever their case, are UTC's clock: no zone file is read for them.
+    for zone in ["Z", "ut", "UTC", "zulu", "GMT", "uct"] {
+        let q = format!("{step} SELECT id, v AT TIME ZONE '{zone}' AS x FROM t");
+        let (b, _) = snail.ask(&q, None).unwrap();
+        assert_eq!(texts(&b, 1), some(&["2024-07-05 13:04:05"]), "{zone}");
+        let q =
+            format!("{step} SELECT id, timezone('{zone}', v AT TIME ZONE '{zone}') AS x FROM t");
+        let (b, _) = snail.ask(&q, None).unwrap();
+        assert_eq!(texts(&b, 1), some(&["2024-07-05 13:04:05+00"]), "{zone}");
+    }
+    // Any other abbreviation is refused by name, never read as the zone file of its name.
+    for zone in ["EST", "cet"] {
+        let q = format!("{step} SELECT id, v AT TIME ZONE '{zone}' AS x FROM t");
+        let e = snail.ask(&q, None).unwrap_err().to_string();
+        assert!(e.contains("abbreviation"), "{zone}: {e}");
+    }
+}

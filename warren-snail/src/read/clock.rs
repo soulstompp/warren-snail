@@ -494,13 +494,18 @@ pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
         }
     };
     let second = 1_000_000i128;
+    // An abbreviation first, as PostgreSQL reads the name: UTC's at offset 0.
+    let fixed = times::zone_abbreviation(&name)?;
     Ok(match (time_of(&v), &v) {
         (_, Value::Null) => Value::Null,
         (Some(ColumnType::Timestamptz), Value::Scalar(_, t)) => {
             let local = if *t == i64::MIN || *t == i64::MAX {
                 *t
             } else {
-                let east = crate::zones::utc_offset(&name, t.div_euclid(1_000_000))?;
+                let east = match fixed {
+                    Some(east) => east,
+                    None => crate::zones::utc_offset(&name, t.div_euclid(1_000_000))?,
+                };
                 held_instant(i128::from(*t) + i128::from(east) * second)?
             };
             Value::Scalar(ColumnType::Timestamp(None), local)
@@ -509,7 +514,10 @@ pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
             let at = if *t == i64::MIN || *t == i64::MAX {
                 *t
             } else {
-                let east = crate::zones::local_offset(&name, t.div_euclid(1_000_000))?;
+                let east = match fixed {
+                    Some(east) => east,
+                    None => crate::zones::local_offset(&name, t.div_euclid(1_000_000))?,
+                };
                 held_instant(i128::from(*t) - i128::from(east) * second)?
             };
             Value::Scalar(ColumnType::Timestamptz, at)

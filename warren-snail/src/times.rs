@@ -533,6 +533,21 @@ fn decode_timezone_abbrev(key: &[u8]) -> D<Option<(i32, i32)>> {
     Ok(None)
 }
 
+/// A zone named in AT TIME ZONE or timezone() as an abbreviation, as PostgreSQL's
+/// DecodeTimezoneName reads it first, its name lowered and cut to 63 bytes: UTC's at offset 0, any
+/// other of PostgreSQL's refused by name; none for a name that is no abbreviation, which is then a
+/// zone's.
+pub fn zone_abbreviation(name: &str) -> Result<Option<i32>> {
+    let mut key: Vec<u8> = name.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    key.truncate(63);
+    match decode_timezone_abbrev(&key) {
+        Ok(Some((_, offset))) => Ok(Some(offset)),
+        Ok(None) => Ok(None),
+        Err(Dterr::Refused(e)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
