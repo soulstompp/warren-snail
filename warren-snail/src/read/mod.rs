@@ -1,9 +1,8 @@
 //! A question in PostgreSQL's SQL, read off a snail: for each table it reads, the orders that serve it,
 //! each one's pages predicted from the directory before any column page is read, then the read.
 //!
-//! Two tables joined on keys are read one after the other: the table its own conditions narrow first,
-//! the table named first where both or neither are narrowed. The other is then kept to the keys the
-//! first holds.
+//! Several tables joined are read one after another, from the question's scopes, each kept to the
+//! keys the tables read before it hold (`join`).
 
 mod answer;
 mod change;
@@ -11,6 +10,7 @@ mod clock;
 pub(crate) mod fill;
 pub(crate) mod foreign;
 mod hash;
+mod join;
 mod out;
 mod pipeline;
 mod question;
@@ -33,142 +33,15 @@ use crate::directory::{decode_page, maps_held, read_map, PageMap};
 use crate::file::{Extent, Reader, Root, Writer};
 use crate::places::{shown, Sublevels};
 use crate::{Error, Result};
-use answer::{as_text, Answer, Cell, Dict};
+use answer::{Answer, Cell, Dict};
 use arrow::array::RecordBatch;
-use hash::WordMap;
 use question::{Key, Question};
 use std::path::Path;
-use walk::{condition_columns, next_down, ruled_out, KeySet, Plan, Sink, Want};
+use walk::{condition_columns, next_down, ruled_out, Plan, Sink, Want};
 
 /// What an open snail holds between rounds unless told otherwise: PostgreSQL's default
 /// `shared_buffers`.
 pub const HELD_BYTES: usize = 128 << 20;
-
-/// What the first side of a join holds of one key: how many of its rows hold it, and their cells
-/// where it gives answer inputs of its own.
-#[derive(Default)]
-struct Kept {
-    rows: u64,
-    cells: Vec<Vec<Cell>>,
-}
-
-/// The first side of a join as its rows arrive: how many rows hold each key, and their cells as text
-/// where the side gives answer inputs of its own.
-struct First<'h> {
-    held: &'h mut WordMap<Vec<i128>, Kept>,
-    key: Vec<i128>,
-    j: usize,
-    inputs: bool,
-    dicts: Vec<Dict>,
-}
-
-impl Sink for First<'_> {
-    fn dictionaries(&mut self, dicts: &[Dict]) {
-        self.dicts = dicts.to_vec();
-    }
-
-    fn row(&mut self, cells: &[Cell]) {
-        self.key.clear();
-        for c in &cells[..self.j] {
-            match c {
-                Cell::Int(v) => self.key.push(*v as i128),
-                Cell::Wide(v) => self.key.push(*v),
-                Cell::Float(f) => self.key.push(i128::from(f.key)),
-                Cell::Interval(v) => self.key.push(v.0.total()),
-                _ => return,
-            }
-        }
-        let kept = match self.held.get_mut(self.key.as_slice()) {
-            Some(k) => k,
-            None => self.held.entry(self.key.clone()).or_default(),
-        };
-        kept.rows += 1;
-        if self.inputs {
-            let none = None;
-            let text = cells[self.j..]
-                .iter()
-                .enumerate()
-                .map(|(i, c)| as_text(c, self.dicts.get(self.j + i).unwrap_or(&none)))
-                .collect();
-            kept.cells.push(text);
-        }
-    }
-}
-
-/// The second side of a join as its rows arrive, each met with the first side's rows of its key.
-struct Second<'a> {
-    held: &'a WordMap<Vec<i128>, Kept>,
-    answer: &'a mut Answer,
-    /// Where each of the answer's inputs comes from: (side, its place among that side's inputs).
-    from: &'a [(usize, usize)],
-    first: usize,
-    j: usize,
-    inputs: bool,
-    probe: Vec<i128>,
-    /// The first side's rows of the key the row admitted last.
-    found: Option<&'a Kept>,
-    cells: Vec<Cell>,
-}
-
-impl Sink for Second<'_> {
-    fn dictionaries(&mut self, dicts: &[Dict]) {
-        let mine: Vec<Dict> = self
-            .from
-            .iter()
-            .map(|&(side, at)| {
-                if side == self.first {
-                    None
-                } else {
-                    dicts[self.j + at].clone()
-                }
-            })
-            .collect();
-        self.answer.dictionaries(&mine);
-    }
-
-    fn lead(&self) -> usize {
-        self.j
-    }
-
-    fn admits(&mut self, lead: &[Cell]) -> bool {
-        self.probe.clear();
-        for c in lead {
-            match c {
-                Cell::Int(v) => self.probe.push(*v as i128),
-                Cell::Wide(v) => self.probe.push(*v),
-                Cell::Float(f) => self.probe.push(i128::from(f.key)),
-                Cell::Interval(v) => self.probe.push(v.0.total()),
-                _ => {
-                    self.found = None;
-                    return false;
-                }
-            }
-        }
-        self.found = self.held.get(self.probe.as_slice());
-        self.found.is_some()
-    }
-
-    fn row(&mut self, row: &[Cell]) {
-        let Some(kept) = self.found else { return };
-        if !self.inputs {
-            for (cell, &(_, at)) in self.cells.iter_mut().zip(self.from) {
-                *cell = row[self.j + at].clone();
-            }
-            self.answer.add_times(&self.cells, kept.rows);
-            return;
-        }
-        for m in &kept.cells {
-            for (cell, &(side, at)) in self.cells.iter_mut().zip(self.from) {
-                *cell = if side == self.first {
-                    m[at].clone()
-                } else {
-                    row[self.j + at].clone()
-                };
-            }
-            self.answer.add(&self.cells);
-        }
-    }
-}
 
 /// A catalog as a snail of `format` names its orders: 0.1.x, formats 7 and 8, named a primary key's
 /// order for its table, whatever its constraint was named.
@@ -1203,142 +1076,6 @@ impl Snail {
             rows_taken: self.taken.get() - taken,
         };
         Ok((round, w.counted, w.counted_months))
-    }
-
-    fn ask_join(&self, q: &Question) -> Result<(RecordBatch, Round)> {
-        let (walked, taken) = (self.walked.get(), self.taken.get());
-        let first = if q.sides[1].conditioned() && !q.sides[0].conditioned() {
-            1
-        } else {
-            0
-        };
-        let second = 1 - first;
-        let join_columns = |side: usize| -> Vec<usize> {
-            q.join
-                .iter()
-                .map(|&(a, b)| if side == 0 { a } else { b })
-                .collect()
-        };
-        let tables: Vec<&Table> = q
-            .sides
-            .iter()
-            .map(|s| &self.catalog.tables[s.table])
-            .collect();
-        let inputs = q.select.inputs();
-        // Each side's scan returns the join's columns, then the answer's inputs it holds.
-        let scan_columns = |side: usize| -> Vec<(usize, bool)> {
-            join_columns(side)
-                .into_iter()
-                .map(|c| (c, false))
-                .chain(
-                    inputs
-                        .iter()
-                        .filter(|k| k.col().side == side)
-                        .map(|k| (k.col().column, matches!(k, Key::Month(_)))),
-                )
-                .collect()
-        };
-        let j = q.join.len();
-
-        let a_columns = scan_columns(first);
-        let a_want = Want {
-            table: tables[first],
-            side: &q.sides[first],
-            columns: a_columns.iter().map(|c| c.0).collect(),
-            countable: None,
-            keys: None,
-        };
-        let (before, held_before) = (self.touched(), self.pages_held());
-        let a = self.part(&a_want, None)?;
-        let mut directory_pages = self.touched() - before;
-        let mut directory_pages_held = self.pages_held() - held_before;
-        let mut column_pages_held = self.reader.keep_for_round(a.plan.disk_pages());
-        let mid = self.reader.pages_read();
-        // Each key the first side holds: how many rows hold it, and their cells where the first side
-        // gives the answer inputs of its own.
-        let a_inputs = a_columns.len() > j;
-        let mut held: WordMap<Vec<i128>, Kept> = WordMap::default();
-        let mut sink = First {
-            held: &mut held,
-            key: Vec::with_capacity(j),
-            j,
-            inputs: a_inputs,
-            dicts: Vec::new(),
-        };
-        self.read_plan(&a.plan, &a_want, &a_columns, &mut sink)?;
-        let mut column_pages_read = self.reader.pages_read() - mid;
-
-        let keys = KeySet::new(join_columns(second), held.keys());
-        let b_columns = scan_columns(second);
-        let b_want = Want {
-            table: tables[second],
-            side: &q.sides[second],
-            columns: b_columns.iter().map(|c| c.0).collect(),
-            countable: None,
-            keys: Some(&keys),
-        };
-        let (before, held_before) = (self.touched(), self.pages_held());
-        let b = self.part(&b_want, None)?;
-        directory_pages += self.touched() - before;
-        directory_pages_held += self.pages_held() - held_before;
-        column_pages_held += self.reader.keep_for_round(b.plan.disk_pages());
-
-        // Where each of the answer's inputs comes from: (side, its place among that side's cells).
-        let mut from = Vec::with_capacity(inputs.len());
-        let mut seen = [0usize; 2];
-        for k in &inputs {
-            let side = k.col().side;
-            from.push((side, seen[side]));
-            seen[side] += 1;
-        }
-        let mut answer = Answer::new(&q.select).typed(&tables);
-        let mid = self.reader.pages_read();
-        let mut sink = Second {
-            held: &held,
-            answer: &mut answer,
-            from: &from,
-            first,
-            j,
-            inputs: a_inputs,
-            probe: Vec::with_capacity(j),
-            found: None,
-            cells: vec![Cell::Null; inputs.len()],
-        };
-        self.read_plan(&b.plan, &b_want, &b_columns, &mut sink)?;
-        column_pages_read += self.reader.pages_read() - mid;
-        let batch = answer.finish(&tables, &q.select, &q.order)?;
-        let (wa, wb) = (&a.plan.walk, &b.plan.walk);
-        let entries = |w: &walk::Walk| w.statuses.0 + w.statuses.1 + w.statuses.2;
-        let round = Round {
-            order: format!(
-                "{}+{}",
-                tables[first].orders[wa.order].name, tables[second].orders[wb.order].name
-            ),
-            served: Vec::new(),
-            consulted: a.consulted.iter().chain(&b.consulted).cloned().collect(),
-            pages_at_start: 0,
-            directory_pages,
-            directory_pages_held,
-            column_pages_top_low: wa.top.0 + wb.top.0,
-            column_pages_top_high: wa.top.1 + wb.top.1,
-            column_pages_low: wa.low + wb.low,
-            column_pages_high: wa.high + wb.high,
-            column_pages_predicted: a.plan.column_pages + b.plan.column_pages,
-            column_pages_held,
-            column_pages_read,
-            entries: entries(wa) + entries(wb),
-            entries_none: wa.statuses.0 + wb.statuses.0,
-            entries_may: wa.statuses.1 + wb.statuses.1,
-            entries_must: wa.statuses.2 + wb.statuses.2,
-            blocks_read: a.plan.blocks_read() + b.plan.blocks_read(),
-            rows: batch.num_rows() as u64,
-            blocks_pruned: 0,
-            pages_written: 0,
-            rows_held: 0,
-            rows_walked: self.walked.get() - walked,
-            rows_taken: self.taken.get() - taken,
-        };
-        Ok((batch, round))
     }
 
     /// Every block of every order: what the directory holds of it, column by column.

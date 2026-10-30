@@ -8,7 +8,7 @@ use crate::catalog::{ColumnType, Level, Order, Shape, Table};
 use crate::directory::{decode_page, decode_top, Entry, Head, PageMap, Summary};
 use crate::encode::decode_leaf_with;
 use crate::file::Extent;
-use crate::places::{level_key, month_of, null_key, wide_cmp, KeyValue};
+use crate::places::{level_key, month_of, null_key, KeyValue};
 use crate::values::Values;
 use crate::{Error, Result};
 use std::cmp::Ordering;
@@ -73,13 +73,13 @@ pub struct Want<'a> {
 pub struct KeySet {
     /// This table's columns they meet, in the join's order.
     pub columns: Vec<usize>,
-    /// Each key's values, the keys sorted, laid flat.
-    keys: Vec<i128>,
+    /// Each key's values as this table's levels key them, the keys sorted, laid flat.
+    keys: Vec<KeyValue>,
 }
 
 impl KeySet {
-    pub fn new<'a>(columns: Vec<usize>, keys: impl IntoIterator<Item = &'a Vec<i128>>) -> KeySet {
-        let mut sorted: Vec<&[i128]> = keys.into_iter().map(|k| k.as_slice()).collect();
+    pub fn new(columns: Vec<usize>, keys: impl IntoIterator<Item = Vec<KeyValue>>) -> KeySet {
+        let mut sorted: Vec<Vec<KeyValue>> = keys.into_iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         KeySet {
@@ -92,30 +92,23 @@ impl KeySet {
         self.keys.len().checked_div(self.columns.len()).unwrap_or(0)
     }
 
-    fn key(&self, i: usize) -> &[i128] {
+    fn key(&self, i: usize) -> &[KeyValue] {
         let w = self.columns.len();
         &self.keys[i * w..(i + 1) * w]
     }
 
     /// Whether some key lies from `first` to `last`, both read on their first `j` values.
     fn meets(&self, first: &[KeyValue], last: &[KeyValue]) -> bool {
-        let cmp = |key: &[i128], bound: &[KeyValue]| -> Ordering {
-            key.iter()
-                .zip(bound)
-                .map(|(k, b)| wide_cmp(*k, b))
-                .find(|o| *o != Ordering::Equal)
-                .unwrap_or(Ordering::Equal)
-        };
         let (mut lo, mut hi) = (0, self.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if cmp(self.key(mid), first) == Ordering::Less {
+            if self.key(mid) < first {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        lo < self.len() && cmp(self.key(lo), last) != Ordering::Greater
+        lo < self.len() && self.key(lo) <= last
     }
 }
 
@@ -787,6 +780,8 @@ impl Snail {
                     .iter()
                     .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::NumericText(_)))
                     .collect();
+                let types: Vec<ColumnType> =
+                    columns.iter().map(|&(c, _)| table.columns[c].ty).collect();
                 let dicts: Vec<Dict> = outs.iter().map(|o| o.3.dict().cloned()).collect();
                 if !same(&sent, &dicts) {
                     sink.dictionaries(&dicts);
@@ -839,10 +834,11 @@ impl Snail {
                 // Where the other side's keys lead the order, the rows of the block's sorted part that
                 // hold them are found by their keys, and no other row of that part is visited.
                 let spans = match want.keys {
-                    Some(k) if lead > 0 && walk.keyed == lead => keyed_spans(
+                    Some(k) if walk.keyed > 0 && lead >= walk.keyed => keyed_spans(
                         k,
-                        &outs[..lead],
-                        &order.nulls_first[..lead],
+                        &outs[..walk.keyed],
+                        &types[..walk.keyed],
+                        &order.nulls_first[..walk.keyed],
                         from,
                         to,
                         br.map.sorted as usize,
@@ -959,21 +955,19 @@ impl Snail {
 fn keyed_spans(
     keys: &KeySet,
     lead: &[(bool, bool, usize, &Values)],
+    types: &[ColumnType],
     nulls_first: &[bool],
     from: usize,
     to: usize,
     sorted: usize,
 ) -> Vec<(usize, usize)> {
     // A row's leading values against a key, compared in place, a NULL lying on its level's side.
-    let cmp = |r: usize, key: &[i128]| -> Ordering {
+    let cmp = |r: usize, key: &[KeyValue]| -> Ordering {
         lead.iter()
+            .zip(types)
             .zip(nulls_first)
             .zip(key)
-            .map(|((&(_, _, start, v), &first), k)| match v.wide(r - start) {
-                Some(x) => x.cmp(k),
-                None if first => Ordering::Less,
-                None => Ordering::Greater,
-            })
+            .map(|(((&(_, _, start, v), &ty), &first), k)| against_key(ty, v, r - start, first, k))
             .find(|o| *o != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
     };
@@ -1004,7 +998,7 @@ fn keyed_spans(
             out.push((from, end));
         } else {
             // The first row from `lo` whose leading values pass `key`, or reach it.
-            let find = |key: &[i128], mut lo: usize, past: bool| -> usize {
+            let find = |key: &[KeyValue], mut lo: usize, past: bool| -> usize {
                 let mut hi = end;
                 while lo < hi {
                     let mid = (lo + hi) / 2;
@@ -1034,6 +1028,35 @@ fn keyed_spans(
         out.push((from.max(end), to));
     }
     out
+}
+
+/// Row `i`'s value of a level of type `ty` against a level's key: a number by its key, a value of a
+/// string type, bytea, a bit string or a composed type by the bytes it is keyed by, a NULL lying on
+/// its level's side.
+pub(super) fn against_key(
+    ty: ColumnType,
+    v: &Values,
+    i: usize,
+    first: bool,
+    key: &KeyValue,
+) -> Ordering {
+    if v.is_null(i) {
+        return KeyValue::Null { first }.cmp(key);
+    }
+    match key {
+        KeyValue::Null { first: true } => Ordering::Greater,
+        KeyValue::Null { first: false } => Ordering::Less,
+        KeyValue::Text(k) => v.text_value(i).map_or(Ordering::Less, |x| {
+            crate::strings::key_bytes(ty, x.data())
+                .as_ref()
+                .cmp(k.as_bytes())
+        }),
+        KeyValue::Bytes(k) => v.text_value(i).map_or(Ordering::Less, |x| {
+            crate::strings::key_bytes(ty, x.data()).as_ref().cmp(&**k)
+        }),
+        KeyValue::Int(k) => v.wide(i).map_or(Ordering::Less, |x| x.cmp(&i128::from(*k))),
+        KeyValue::Wide(k) => v.wide(i).map_or(Ordering::Less, |x| x.cmp(k)),
+    }
 }
 
 /// What a question makes of one entry on the walk's level: none of its rows, so it is skipped; all of
@@ -1675,7 +1698,7 @@ mod tests {
         use crate::places::ints;
         let keys = KeySet::new(
             vec![0, 1],
-            &[vec![3, 1], vec![7, 2], vec![3, 9], vec![3, 1]],
+            [ints([3, 1]), ints([7, 2]), ints([3, 9]), ints([3, 1])],
         );
         assert!(keys.meets(&ints([3, 0]), &ints([3, 1])));
         assert!(keys.meets(&ints([3, 1]), &ints([3, 1])));

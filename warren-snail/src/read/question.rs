@@ -259,21 +259,179 @@ pub struct Side {
 }
 
 impl Side {
-    /// Whether a condition of its own narrows what the side reads.
-    pub fn conditioned(&self) -> bool {
-        !self.conds.is_empty() || !self.texts.is_empty() || !self.nulls.is_empty()
+    /// A condition on this table alone, kept beside the ones it has.
+    fn take(&mut self, piece: Piece, table: &Table) {
+        match piece {
+            Piece::Cond(c) => merge(&mut self.conds, c),
+            Piece::Text(t) => match self.texts.iter_mut().find(|x| x.column == t.column) {
+                Some(have) => {
+                    have.lo = tighter(std::mem::replace(&mut have.lo, Unbounded), t.lo, true);
+                    have.hi = tighter(std::mem::replace(&mut have.hi, Unbounded), t.hi, false);
+                    for x in t.except {
+                        if !have.except.contains(&x) {
+                            have.except.push(x);
+                        }
+                    }
+                }
+                None => self.texts.push(t),
+            },
+            Piece::Null(c, null) => {
+                if table.columns[c].not_null {
+                    self.empty |= null;
+                } else if !self.nulls.contains(&(c, null)) {
+                    self.nulls.push((c, null));
+                }
+            }
+            Piece::Empty => self.empty = true,
+        }
     }
+}
+
+/// A condition on one column of one table: a range of its keys or of its month's, a range of the
+/// bytes it is keyed by, a test for NULL (IS NULL where true), or one no row passes.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum Piece {
+    Cond(Cond),
+    Text(TextCond),
+    Null(usize, bool),
+    Empty,
+}
+
+impl Piece {
+    /// Whether a row whose column is NULL fails it: every comparison, IS NOT NULL, and the truth
+    /// tests but IS NOT TRUE and IS NOT FALSE.
+    pub fn strict(&self) -> bool {
+        match self {
+            Piece::Cond(c) => !c.nulls,
+            Piece::Null(_, null) => !null,
+            Piece::Text(_) | Piece::Empty => true,
+        }
+    }
+
+    /// The column it reads, and whether it is read for its month; none where it reads none.
+    pub fn column(&self) -> Option<(usize, bool)> {
+        match self {
+            Piece::Cond(c) => Some(match c.shape {
+                Shape::MonthUtc(x) => (x, true),
+                Shape::Column(x) | Shape::Clock(x) => (x, false),
+            }),
+            Piece::Text(t) => Some((t.column, false)),
+            Piece::Null(c, _) => Some((*c, false)),
+            Piece::Empty => None,
+        }
+    }
+}
+
+/// How two values of two tables' columns are compared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Cmp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl Cmp {
+    /// Whether two values that compare so pass it.
+    pub fn holds(self, o: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering::*;
+        match self {
+            Cmp::Eq => o == Equal,
+            Cmp::NotEq => o != Equal,
+            Cmp::Lt => o == Less,
+            Cmp::LtEq => o != Greater,
+            Cmp::Gt => o == Greater,
+            Cmp::GtEq => o != Less,
+        }
+    }
+
+    /// The same comparison, its two sides swapped.
+    pub fn flipped(self) -> Cmp {
+        match self {
+            Cmp::Lt => Cmp::Gt,
+            Cmp::LtEq => Cmp::GtEq,
+            Cmp::Gt => Cmp::Lt,
+            Cmp::GtEq => Cmp::LtEq,
+            other => other,
+        }
+    }
+}
+
+/// Two columns of two tables compared: `a op b`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Meet {
+    pub a: Col,
+    pub op: Cmp,
+    pub b: Col,
+}
+
+impl Meet {
+    /// The same comparison written from table `side`'s column, where it holds one.
+    pub fn seen_from(self, side: usize) -> Meet {
+        if self.a.side == side {
+            self
+        } else {
+            Meet {
+                a: self.b,
+                op: self.op.flipped(),
+                b: self.a,
+            }
+        }
+    }
+
+    pub fn touches(&self, side: usize) -> bool {
+        self.a.side == side || self.b.side == side
+    }
+}
+
+/// A test read on a pair of rows an outer join would join, or on the joined rows where a table may
+/// stand NULL: a condition on one table's column, or two tables' columns compared.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum Test {
+    One(usize, Piece),
+    Two(Meet),
+}
+
+/// A table an outer join may leave NULL, and its ON: it meets the tables before it on `meets`, each
+/// written from its own column, and a pair of rows joins only where `tests` hold too.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Outer {
+    pub side: usize,
+    pub meets: Vec<Meet>,
+    pub tests: Vec<Test>,
 }
 
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Question {
     pub sides: Vec<Side>,
-    /// The columns two tables meet on: a column of the first, and the column of the second it equals.
-    pub join: Vec<(usize, usize)>,
+    /// Two tables' columns compared, which every answer row holds: equal on a join's keys, or by
+    /// an inequality.
+    pub meets: Vec<Meet>,
+    /// The tables an outer join may leave NULL, as they are joined, each with its ON.
+    pub outer: Vec<Outer>,
+    /// The first two tables are joined FULL: `outer` holds the second, and either may stand NULL.
+    pub full: bool,
+    /// What is read on the joined rows: WHERE's conditions on a table that may stand NULL, each of
+    /// which keeps its NULL.
+    pub after: Vec<Test>,
     pub select: Select,
     /// How the answer is ordered: by which of its columns, outermost first.
     pub order: Vec<Sort>,
+}
+
+impl Question {
+    /// Whether table `side` may stand NULL in an answer row.
+    pub fn nullable(&self, side: usize) -> bool {
+        (self.full && side == 0) || self.outer.iter().any(|o| o.side == side)
+    }
 }
 
 pub fn number(e: &Expr) -> Option<i64> {
@@ -660,6 +818,14 @@ impl From<'_> {
         &self.catalog.tables[self.tables[side].0]
     }
 
+    /// The name a table goes by in the question: its alias, or its own.
+    fn named(&self, side: usize) -> String {
+        match &self.tables[side].1 {
+            Some(a) => a.clone(),
+            None => self.table(side).name.clone(),
+        }
+    }
+
     /// What an expression reads, and of which table: the one table whose columns it names.
     fn resolve(&self, e: &Expr) -> Result<(usize, Shape)> {
         let mut found = Vec::new();
@@ -690,7 +856,7 @@ impl From<'_> {
             [one] => Ok(*one),
             [] => Err(first_error.unwrap_or_else(|| Error::new(format!("{e} reads no table")))),
             _ => Err(Error::new(format!(
-                "{e} could name a column of either table: qualify it"
+                "{e} could name a column of more than one table: qualify it"
             ))),
         }
     }
@@ -898,30 +1064,70 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
     if s.distinct.is_some() || s.having.is_some() {
         return Err(Error::new("DISTINCT and HAVING are not read"));
     }
+    // Each table after the first, and how it is joined to those before it: its join, the conjuncts
+    // of its ON, and the first table of its FROM item, before which its ON may read nothing.
     let mut tables = Vec::new();
-    let mut parts: Vec<&Expr> = Vec::new();
-    match s.from.as_slice() {
-        [t] => {
-            tables.push(relation(catalog, &t.relation)?);
-            for j in &t.joins {
-                match &j.join_operator {
-                    JoinOperator::Join(JoinConstraint::On(e))
-                    | JoinOperator::Inner(JoinConstraint::On(e)) => {
-                        tables.push(relation(catalog, &j.relation)?);
-                        conjuncts(e, &mut parts);
-                    }
-                    _ => return Err(Error::new("only an inner JOIN … ON is read")),
-                }
-            }
+    let mut steps: Vec<(Joining, Vec<&Expr>, usize)> = Vec::new();
+    if s.from.is_empty() {
+        return Err(Error::new("a question reads a table"));
+    }
+    for t in &s.from {
+        let start = tables.len();
+        tables.push(relation(catalog, &t.relation)?);
+        if start > 0 {
+            steps.push((Joining::Inner, Vec::new(), start));
         }
-        _ => {
-            return Err(Error::new(
-                "a question reads one table, or tables joined with JOIN … ON",
-            ))
+        for j in &t.joins {
+            let (joining, constraint) = match &j.join_operator {
+                JoinOperator::Join(c) | JoinOperator::Inner(c) => (Joining::Inner, c),
+                JoinOperator::CrossJoin(c @ JoinConstraint::None) => (Joining::Inner, c),
+                JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (Joining::Left, c),
+                JoinOperator::Right(c) | JoinOperator::RightOuter(c) => (Joining::Right, c),
+                JoinOperator::FullOuter(c) => (Joining::Full, c),
+                other => {
+                    return Err(Error::new(format!(
+                        "{} is not read",
+                        format!("{other:?}").split('(').next().unwrap_or_default()
+                    )))
+                }
+            };
+            let mut on = Vec::new();
+            match constraint {
+                JoinConstraint::On(e) => conjuncts(e, &mut on),
+                JoinConstraint::None if matches!(j.join_operator, JoinOperator::CrossJoin(_)) => {}
+                JoinConstraint::Using(_) => {
+                    return Err(Error::new(
+                        "JOIN … USING is not read: name the columns the tables meet on in ON",
+                    ))
+                }
+                _ => return Err(Error::new("a JOIN is read with its ON")),
+            }
+            tables.push(relation(catalog, &j.relation)?);
+            // The table a RIGHT or FULL JOIN keeps is the one before it, so it is read as the
+            // first join.
+            if matches!(joining, Joining::Right | Joining::Full) && tables.len() != 2 {
+                return Err(Error::new(
+                    "a RIGHT or FULL JOIN is read only as the first join: write the tables it \
+                     keeps first, joined by LEFT JOIN",
+                ));
+            }
+            steps.push((joining, on, start));
         }
     }
-    if tables.len() > 2 {
-        return Err(Error::new("a join of more than two tables is not read"));
+    for (i, (ti, alias)) in tables.iter().enumerate() {
+        let name = |(t, a): &(usize, Option<String>)| match a {
+            Some(a) => a.clone(),
+            None => catalog.tables[*t].name.clone(),
+        };
+        if tables[..i]
+            .iter()
+            .any(|x| name(x) == name(&(*ti, alias.clone())))
+        {
+            return Err(Error::new(format!(
+                "table name \"{}\" specified more than once",
+                name(&(*ti, alias.clone()))
+            )));
+        }
     }
     let from = From { catalog, tables };
 
@@ -1061,8 +1267,69 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         }
     }
 
+    let mut wheres: Vec<&Expr> = Vec::new();
     if let Some(w) = &s.selection {
-        conjuncts(w, &mut parts);
+        conjuncts(w, &mut wheres);
+    }
+    // WHERE's conjuncts, and each inner join's ON's, hold of every answer row; an outer join's ON
+    // holds only of the pairs of rows it joins.
+    let n = from.tables.len();
+    let mut pool: Vec<Conj> = Vec::new();
+    for p in wheres {
+        pool.push(conjunct(&from, p)?);
+    }
+    let mut nullable = vec![false; n];
+    let mut held: Vec<Vec<Conj>> = (0..n).map(|_| Vec::new()).collect();
+    let mut full = false;
+    for (k, (joining, on, start)) in steps.into_iter().enumerate() {
+        let side = k + 1;
+        let mut read = Vec::new();
+        for p in on {
+            let c = conjunct(&from, p)?;
+            // An ON reads only the tables of its FROM item joined by then.
+            if let Some(&s) = c.sides().iter().find(|&&s| s < start || s > side) {
+                return Err(Error::new(format!(
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    from.named(s)
+                )));
+            }
+            read.push(c);
+        }
+        match joining {
+            Joining::Inner => pool.extend(read),
+            Joining::Left => {
+                nullable[side] = true;
+                held[side] = read;
+            }
+            Joining::Right => {
+                nullable[0] = true;
+                held[0] = read;
+            }
+            Joining::Full => {
+                nullable[0] = true;
+                nullable[1] = true;
+                full = true;
+                held[1] = read;
+            }
+        }
+    }
+    // A conjunct of every answer row that fails on a NULL of a table an outer join may leave NULL
+    // leaves no row where it stands NULL: that join is an inner one, and its ON holds of every
+    // answer row too. A FULL JOIN that must keep one of its tables keeps the other as a LEFT JOIN.
+    while let Some(s) = pool
+        .iter()
+        .flat_map(Conj::strict_sides)
+        .find(|&s| nullable[s])
+    {
+        nullable[s] = false;
+        if full {
+            full = false;
+            if s == 1 {
+                held[0] = std::mem::take(&mut held[1]);
+            }
+            continue;
+        }
+        pool.append(&mut held[s]);
     }
     let mut sides: Vec<Side> = from
         .tables
@@ -1075,331 +1342,80 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             empty: false,
         })
         .collect();
-    let mut join: Vec<(usize, usize)> = Vec::new();
-    for p in parts {
-        if let Some((side, cond)) = truth_test(&from, p)? {
-            merge(&mut sides[side].conds, cond);
-            continue;
-        }
-        if let Expr::IsUnknown(x) | Expr::IsNotUnknown(x) = p {
-            if let (side, Shape::Column(c)) = from.resolve(x)? {
-                let ty = from.table(side).columns[c].ty;
-                if ty != ColumnType::Boolean {
-                    return Err(Error::new(format!(
-                        "argument of {} must be type boolean, not type {}",
-                        if matches!(p, Expr::IsUnknown(_)) {
-                            "IS UNKNOWN"
-                        } else {
-                            "IS NOT UNKNOWN"
-                        },
-                        ty.pg_name()
-                    )));
+    let mut meets: Vec<Meet> = Vec::new();
+    let mut after = Vec::new();
+    for c in pool {
+        match c {
+            Conj::One(s, piece) if nullable[s] => after.push(Test::One(s, piece)),
+            Conj::One(s, piece) => sides[s].take(piece, from.table(s)),
+            Conj::Two(m) => {
+                if !meets.contains(&m) {
+                    meets.push(m);
                 }
             }
         }
-        if let Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::IsUnknown(x) | Expr::IsNotUnknown(x) = p
-        {
-            let null = matches!(p, Expr::IsNull(_) | Expr::IsUnknown(_));
-            let (side, c) = match from.resolve(x)? {
-                (side, Shape::Column(c)) => (side, c),
-                _ => return Err(Error::new(format!("{p}: test a column itself for NULL"))),
-            };
-            let here = &mut sides[side];
-            if from.table(side).columns[c].not_null {
-                here.empty |= null;
-            } else if !here.nulls.contains(&(c, null)) {
-                here.nulls.push((c, null));
-            }
-            continue;
-        }
-        let (left, op, right) = match p {
-            Expr::BinaryOp { left, op, right } => (left.as_ref(), op.clone(), right.as_ref()),
-            other => {
-                return Err(Error::new(format!(
-                    "{other} is not a comparison the snail reads"
-                )))
-            }
-        };
-        if let (Ok((a, Shape::Column(x))), Ok((b, Shape::Column(y)))) =
-            (from.resolve(left), from.resolve(right))
-        {
-            if a == b || op != BinaryOperator::Eq {
-                return Err(Error::new(format!(
-                    "{p}: two tables meet only on columns equal to each other"
-                )));
-            }
-            let (x, y) = if a == 0 { (x, y) } else { (y, x) };
-            for (side, c) in [(0, x), (1, y)] {
-                let ty = from.table(side).columns[c].ty;
-                if ty.is_byte_array() || ty.is_bits() || ty.is_nested() || ty.is_timestamptz() {
-                    return Err(Error::new(format!(
-                        "{p}: a join on {} is not read",
-                        ty.name()
-                    )));
-                }
-            }
-            if !join.contains(&(x, y)) {
-                join.push((x, y));
-            }
-            continue;
-        }
-        let lit_left = from.resolve(left).is_err();
-        let (side, s, lit, op) = match from.resolve(left) {
-            Ok((side, s)) => (side, s, right, op),
-            Err(_) => {
-                let (side, s) = from.resolve(right)?;
-                let flipped = match op {
-                    BinaryOperator::Lt => BinaryOperator::Gt,
-                    BinaryOperator::LtEq => BinaryOperator::GtEq,
-                    BinaryOperator::Gt => BinaryOperator::Lt,
-                    BinaryOperator::GtEq => BinaryOperator::LtEq,
-                    other => other,
-                };
-                (side, s, left, flipped)
-            }
-        };
-        let table = from.table(side);
-        // xid has only `=` and `<>`, an integer on their right; cid only `=`; a type held as its
-        // text that PostgreSQL does not order, none, nor do the statistics types, whose `=` is
-        // bytea's and text's both. Asked first, as PostgreSQL finds the operator before it reads a
-        // value.
-        if let Shape::Column(c) = s {
-            let ty = table.columns[c].ty;
-            let has = match ty {
-                ColumnType::Textual(crate::textual::Textual::Aclitem) => {
-                    matches!(op, BinaryOperator::Eq)
-                }
-                ColumnType::Textual(t) => t.ordered(),
-                ColumnType::Internal(t) => t == crate::textual::Internal::NodeTree,
-                ColumnType::Xid => matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq),
-                ColumnType::Cid => matches!(op, BinaryOperator::Eq),
-                _ => true,
-            };
-            let number = super::statement::number_datum(lit).is_some();
-            if !has || (ty == ColumnType::Xid && lit_left && number) {
-                return Err(Error::new(format!(
-                    "operator does not exist: {} {op} {}",
-                    if lit_left {
-                        "integer".into()
-                    } else {
-                        ty.pg_name()
-                    },
-                    if lit_left {
-                        ty.pg_name()
-                    } else {
-                        "unknown".into()
-                    }
-                )));
-            }
-        }
-        let here = &mut sides[side];
-        // No comparison matches a NULL, so one with NULL keeps no row.
-        if matches!(lit, Expr::Value(v) if v.value == Value::Null)
-            && matches!(
-                op,
-                BinaryOperator::Eq
-                    | BinaryOperator::NotEq
-                    | BinaryOperator::Lt
-                    | BinaryOperator::LtEq
-                    | BinaryOperator::Gt
-                    | BinaryOperator::GtEq
-            )
-        {
-            here.empty = true;
-            continue;
-        }
-        if let Shape::Column(c) = s {
-            let ty = table.columns[c].ty;
-            // A numeric(p, s) by the keys either side of the number, whatever its scale.
-            if let ColumnType::Numeric { precision, scale } = ty {
-                let n = numeric_literal(lit)?;
-                let (at, below, above) = crate::numeric::column_bounds(&n, precision, scale);
-                let none = Interval { lo: 1, hi: 0 };
-                let cond = match op {
-                    BinaryOperator::Eq => Cond::new(s, at.map_or(none, Interval::at)),
-                    BinaryOperator::NotEq => {
-                        let mut c = Cond::new(s, Interval::ALL);
-                        c.except.extend(at);
-                        c
-                    }
-                    BinaryOperator::Lt => Cond::new(
-                        s,
-                        Interval {
-                            lo: i128::MIN,
-                            hi: below,
-                        },
-                    ),
-                    BinaryOperator::LtEq => Cond::new(
-                        s,
-                        Interval {
-                            lo: i128::MIN,
-                            hi: at.unwrap_or(below),
-                        },
-                    ),
-                    BinaryOperator::Gt => {
-                        Cond::new(s, above.map_or(none, |lo| Interval { lo, hi: i128::MAX }))
-                    }
-                    BinaryOperator::GtEq => Cond::new(
-                        s,
-                        at.or(above)
-                            .map_or(none, |lo| Interval { lo, hi: i128::MAX }),
-                    ),
-                    other => return Err(Error::new(format!("the comparison {other} is not read"))),
-                };
-                merge(&mut here.conds, cond);
-                continue;
-            }
-            if ty.keyed_by_text() || ty.keyed_by_bytes() {
-                if !ty.ordered() && !matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq) {
-                    return Err(Error::new(format!(
-                        "could not identify a comparison function for type {}",
-                        ty.pg_name()
-                    )));
-                }
-                // A numeric held as its text, by its class's key; a composed value by its key,
-                // written as text that sorts as the key does.
-                let v = match ty {
-                    ColumnType::NumericText(_) => numeric_literal(lit)?.class_key().into_bytes(),
-                    ty if ty.is_nested() => match crate::composed::compared(ty, lit)? {
-                        super::statement::Datum::Compound(k) => k.hex.as_bytes().to_vec(),
-                        _ => {
-                            return Err(Error::new(format!(
-                                "{lit} is not a value of {}",
-                                ty.pg_name()
-                            )))
-                        }
-                    },
-                    _ => bytes_literal(lit, ty)?,
-                };
-                // Under a library collation, by the collation's key.
-                let v = match table.columns[c].orderer()? {
-                    Some(k) => k.key(&v),
-                    None => v,
-                };
-                let mut except = Vec::new();
-                let (lo, hi) = match op {
-                    BinaryOperator::Eq => (Included(v.clone()), Included(v)),
-                    BinaryOperator::NotEq => {
-                        except.push(v);
-                        (Unbounded, Unbounded)
-                    }
-                    BinaryOperator::Lt => (Unbounded, Excluded(v)),
-                    BinaryOperator::LtEq => (Unbounded, Included(v)),
-                    BinaryOperator::Gt => (Excluded(v), Unbounded),
-                    BinaryOperator::GtEq => (Included(v), Unbounded),
-                    other => {
-                        return Err(Error::new(format!(
-                            "the comparison {other} on {} is not read",
-                            ty.pg_name()
-                        )))
-                    }
-                };
-                match here.texts.iter_mut().find(|t| t.column == c) {
-                    Some(t) => {
-                        t.lo = tighter(std::mem::replace(&mut t.lo, Unbounded), lo, true);
-                        t.hi = tighter(std::mem::replace(&mut t.hi, Unbounded), hi, false);
-                        for x in except {
-                            if !t.except.contains(&x) {
-                                t.except.push(x);
-                            }
-                        }
-                    }
-                    None => here.texts.push(TextCond {
-                        column: c,
-                        lo,
-                        hi,
-                        except,
-                    }),
-                }
-                continue;
-            }
-        }
-        // A real beside a number written out is compared as a double precision: where no real is
-        // that number, the reals either side of it bound what is kept.
-        if let Shape::Column(c) = s {
-            if table.columns[c].ty == ColumnType::Float4 && text_literal(lit).is_err() {
-                if let Some(t) = super::statement::number_text(lit) {
-                    let d = f64::from_bits(crate::scalars::float_parse(&t, true)?);
-                    if let Some((below, above)) = crate::scalars::float4_between(d) {
-                        let (below, above) = (i128::from(below), i128::from(above));
-                        let cond = match op {
-                            BinaryOperator::Eq => Cond::new(s, Interval { lo: 1, hi: 0 }),
-                            BinaryOperator::NotEq => Cond::new(s, Interval::ALL),
-                            BinaryOperator::Lt | BinaryOperator::LtEq => Cond::new(
-                                s,
-                                Interval {
-                                    lo: i128::MIN,
-                                    hi: below,
-                                },
-                            ),
-                            BinaryOperator::Gt | BinaryOperator::GtEq => Cond::new(
-                                s,
-                                Interval {
-                                    lo: above,
-                                    hi: i128::MAX,
-                                },
-                            ),
-                            other => {
-                                return Err(Error::new(format!(
-                                    "the comparison {other} is not read"
-                                )))
-                            }
-                        };
-                        merge(&mut here.conds, cond);
-                        continue;
-                    }
-                    let key = crate::scalars::float4_key((d as f32).to_bits());
-                    let cond = match op {
-                        BinaryOperator::Eq => Cond::new(s, Interval::at(key.into())),
-                        _ => Cond::new(s, Interval::ALL),
-                    };
-                    if op == BinaryOperator::Eq {
-                        merge(&mut here.conds, cond);
-                        continue;
-                    }
-                }
-            }
-        }
-        let (s, v) = match s {
-            Shape::Clock(c) => (Shape::Column(c), clock_literal(lit)? as i128),
-            _ => (s, literal(lit, s, table)?),
-        };
-        let cond = match op {
-            BinaryOperator::Eq => Cond::new(s, Interval::at(v)),
-            BinaryOperator::NotEq => {
-                let mut c = Cond::new(s, Interval::ALL);
-                c.except.push(v);
-                c
-            }
-            // A strict bound past either end keeps nothing.
-            BinaryOperator::Lt => match v.checked_sub(1) {
-                Some(hi) => Cond::new(s, Interval { lo: i128::MIN, hi }),
-                None => Cond::new(s, Interval { lo: 1, hi: 0 }),
-            },
-            BinaryOperator::LtEq => Cond::new(
-                s,
-                Interval {
-                    lo: i128::MIN,
-                    hi: v,
-                },
-            ),
-            BinaryOperator::Gt => match v.checked_add(1) {
-                Some(lo) => Cond::new(s, Interval { lo, hi: i128::MAX }),
-                None => Cond::new(s, Interval { lo: 1, hi: 0 }),
-            },
-            BinaryOperator::GtEq => Cond::new(
-                s,
-                Interval {
-                    lo: v,
-                    hi: i128::MAX,
-                },
-            ),
-            other => return Err(Error::new(format!("the comparison {other} is not read"))),
-        };
-        merge(&mut here.conds, cond);
     }
-    if sides.len() == 2 && join.is_empty() {
-        return Err(Error::new("two tables are joined on no key"));
+    let mut outer = Vec::new();
+    for s in (0..n).filter(|&s| nullable[s] && !(full && s == 0)) {
+        let mut o = Outer {
+            side: s,
+            meets: Vec::new(),
+            tests: Vec::new(),
+        };
+        for c in std::mem::take(&mut held[s]) {
+            match c {
+                // A condition on the table it may leave NULL narrows that table's rows; in a FULL
+                // JOIN, which keeps both, it is read on each pair.
+                Conj::One(t, piece) if t == s && !full => sides[s].take(piece, from.table(s)),
+                Conj::One(t, piece) => o.tests.push(Test::One(t, piece)),
+                Conj::Two(m) if m.touches(s) && m.op == Cmp::Eq => o.meets.push(m.seen_from(s)),
+                Conj::Two(m) => o.tests.push(Test::Two(m)),
+            }
+        }
+        if full && o.meets.is_empty() {
+            return Err(Error::new(
+                "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions",
+            ));
+        }
+        if o.meets.is_empty()
+            && !o
+                .tests
+                .iter()
+                .any(|t| matches!(t, Test::Two(m) if m.touches(s)))
+        {
+            return Err(Error::new(format!(
+                "{} is joined on no key: its ON compares none of its columns with another table's",
+                from.named(s)
+            )));
+        }
+        outer.push(o);
+    }
+    // The tables no outer join may leave NULL are joined to each other by what every answer row
+    // holds; a FULL JOIN's two by its ON.
+    let mut group: Vec<usize> = (0..n).collect();
+    let find = |g: &[usize], mut s: usize| {
+        while g[s] != s {
+            s = g[s];
+        }
+        s
+    };
+    let mut joins: Vec<(usize, usize)> = meets.iter().map(|m| (m.a.side, m.b.side)).collect();
+    if full {
+        joins.push((0, 1));
+    }
+    for (a, b) in joins {
+        let (x, y) = (find(&group, a), find(&group, b));
+        group[x] = y;
+    }
+    let inner: Vec<usize> = (0..n).filter(|&s| !nullable[s] || full && s < 2).collect();
+    if let Some(&s) = inner
+        .iter()
+        .find(|&&s| find(&group, s) != find(&group, inner[0]))
+    {
+        return Err(Error::new(format!(
+            "{} is joined on no key: compare one of its columns with another table's",
+            from.named(s)
+        )));
     }
     for side in &mut sides {
         // No comparison matches a NULL, so a column kept to its NULLs and compared holds no row.
@@ -1416,10 +1432,429 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
     }
     Ok(Question {
         sides,
-        join,
+        meets,
+        outer,
+        full,
+        after,
         select,
         order,
     })
+}
+
+/// How a table is joined to the tables before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Joining {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// One conjunct, as a question reads it: a condition on one table, or two tables' columns compared.
+#[derive(Debug)]
+enum Conj {
+    One(usize, Piece),
+    Two(Meet),
+}
+
+impl Conj {
+    fn sides(&self) -> Vec<usize> {
+        match self {
+            Conj::One(s, _) => vec![*s],
+            Conj::Two(m) => vec![m.a.side, m.b.side],
+        }
+    }
+
+    /// The tables a NULL of which fails it.
+    fn strict_sides(&self) -> Vec<usize> {
+        match self {
+            Conj::One(s, p) if p.strict() => vec![*s],
+            Conj::One(..) => Vec::new(),
+            Conj::Two(m) => vec![m.a.side, m.b.side],
+        }
+    }
+}
+
+/// The family of keys a type's values are compared by on a join: integers of any width share one,
+/// as do a numeric's of one scale, the oid and the reg* types, and timestamptz of any precision;
+/// every other type has its own, whatever length or fields it is declared with. None for a type a
+/// join does not read.
+fn join_family(ty: ColumnType) -> Option<String> {
+    Some(match ty {
+        ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => "integer".into(),
+        ColumnType::Numeric { scale, .. } => format!("numeric {scale}"),
+        ColumnType::NumericText(_) => "numeric".into(),
+        ColumnType::Text(_) => "text".into(),
+        ColumnType::Oid | ColumnType::Reg(..) => "oid".into(),
+        ColumnType::Timestamptz | ColumnType::TimestamptzRounded(_) => "timestamptz".into(),
+        ColumnType::Timestamp(_) => "timestamp".into(),
+        ColumnType::Time(_) => "time".into(),
+        ColumnType::Interval { .. } => "interval".into(),
+        ColumnType::Bpchar(_) => "bpchar".into(),
+        ColumnType::Bytes
+        | ColumnType::Name
+        | ColumnType::Boolean
+        | ColumnType::Uuid
+        | ColumnType::Xid
+        | ColumnType::Cid
+        | ColumnType::Xid8
+        | ColumnType::PgLsn
+        | ColumnType::Char
+        | ColumnType::Money
+        | ColumnType::Macaddr
+        | ColumnType::Macaddr8
+        | ColumnType::Float4
+        | ColumnType::Float8
+        | ColumnType::Oid8
+        | ColumnType::Date => format!("{ty:?}"),
+        _ => return None,
+    })
+}
+
+/// Whether two tables' columns are compared by `op` on the keys they are held by: two columns of
+/// one family, by an operator their type has.
+fn comparable(p: &Expr, a: ColumnType, op: Cmp, b: ColumnType) -> Result<()> {
+    for ty in [a, b] {
+        if join_family(ty).is_none() {
+            return Err(Error::new(format!(
+                "{p}: a join on {} is not read",
+                ty.name()
+            )));
+        }
+    }
+    if join_family(a) != join_family(b) {
+        return Err(Error::new(format!(
+            "{p}: {} and {} are compared through a cast, which a join does not read",
+            a.pg_name(),
+            b.pg_name()
+        )));
+    }
+    let has = match a {
+        ColumnType::Xid => matches!(op, Cmp::Eq | Cmp::NotEq),
+        ColumnType::Cid => op == Cmp::Eq,
+        _ => true,
+    };
+    if !has {
+        let sign = match op {
+            Cmp::Eq => "=",
+            Cmp::NotEq => "<>",
+            Cmp::Lt => "<",
+            Cmp::LtEq => "<=",
+            Cmp::Gt => ">",
+            Cmp::GtEq => ">=",
+        };
+        return Err(Error::new(format!(
+            "operator does not exist: {} {sign} {}",
+            a.pg_name(),
+            b.pg_name()
+        )));
+    }
+    Ok(())
+}
+
+/// What one conjunct says: a condition on one table's column, or two tables' columns compared.
+fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
+    if let Some((side, cond)) = truth_test(from, p)? {
+        return Ok(Conj::One(side, Piece::Cond(cond)));
+    }
+    if let Expr::IsUnknown(x) | Expr::IsNotUnknown(x) = p {
+        if let (side, Shape::Column(c)) = from.resolve(x)? {
+            let ty = from.table(side).columns[c].ty;
+            if ty != ColumnType::Boolean {
+                return Err(Error::new(format!(
+                    "argument of {} must be type boolean, not type {}",
+                    if matches!(p, Expr::IsUnknown(_)) {
+                        "IS UNKNOWN"
+                    } else {
+                        "IS NOT UNKNOWN"
+                    },
+                    ty.pg_name()
+                )));
+            }
+        }
+    }
+    if let Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::IsUnknown(x) | Expr::IsNotUnknown(x) = p {
+        let null = matches!(p, Expr::IsNull(_) | Expr::IsUnknown(_));
+        let (side, c) = match from.resolve(x)? {
+            (side, Shape::Column(c)) => (side, c),
+            _ => return Err(Error::new(format!("{p}: test a column itself for NULL"))),
+        };
+        return Ok(Conj::One(side, Piece::Null(c, null)));
+    }
+    let (left, op, right) = match p {
+        Expr::BinaryOp { left, op, right } => (left.as_ref(), op.clone(), right.as_ref()),
+        other => {
+            return Err(Error::new(format!(
+                "{other} is not a comparison the snail reads"
+            )))
+        }
+    };
+    if let (Ok((a, Shape::Column(x))), Ok((b, Shape::Column(y)))) =
+        (from.resolve(left), from.resolve(right))
+    {
+        if a == b {
+            return Err(Error::new(format!(
+                "{p}: two columns of one table compared are not read"
+            )));
+        }
+        let op = match op {
+            BinaryOperator::Eq => Cmp::Eq,
+            BinaryOperator::NotEq => Cmp::NotEq,
+            BinaryOperator::Lt => Cmp::Lt,
+            BinaryOperator::LtEq => Cmp::LtEq,
+            BinaryOperator::Gt => Cmp::Gt,
+            BinaryOperator::GtEq => Cmp::GtEq,
+            other => {
+                return Err(Error::new(format!(
+                    "{p}: two tables are compared by =, <>, <, <=, > or >=, not {other}"
+                )))
+            }
+        };
+        let (ta, tb) = (from.table(a).columns[x].ty, from.table(b).columns[y].ty);
+        comparable(p, ta, op, tb)?;
+        return Ok(Conj::Two(Meet {
+            a: Col { side: a, column: x },
+            op,
+            b: Col { side: b, column: y },
+        }));
+    }
+    let lit_left = from.resolve(left).is_err();
+    let (side, s, lit, op) = match from.resolve(left) {
+        Ok((side, s)) => (side, s, right, op),
+        Err(_) => {
+            let (side, s) = from.resolve(right)?;
+            let flipped = match op {
+                BinaryOperator::Lt => BinaryOperator::Gt,
+                BinaryOperator::LtEq => BinaryOperator::GtEq,
+                BinaryOperator::Gt => BinaryOperator::Lt,
+                BinaryOperator::GtEq => BinaryOperator::LtEq,
+                other => other,
+            };
+            (side, s, left, flipped)
+        }
+    };
+    let table = from.table(side);
+    // xid has only `=` and `<>`, an integer on their right; cid only `=`; a type held as its
+    // text that PostgreSQL does not order, none, nor do the statistics types, whose `=` is bytea's
+    // and text's both. Asked first, as PostgreSQL finds the operator before it reads a value.
+    if let Shape::Column(c) = s {
+        let ty = table.columns[c].ty;
+        let has = match ty {
+            ColumnType::Textual(crate::textual::Textual::Aclitem) => {
+                matches!(op, BinaryOperator::Eq)
+            }
+            ColumnType::Textual(t) => t.ordered(),
+            ColumnType::Internal(t) => t == crate::textual::Internal::NodeTree,
+            ColumnType::Xid => matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq),
+            ColumnType::Cid => matches!(op, BinaryOperator::Eq),
+            _ => true,
+        };
+        let number = super::statement::number_datum(lit).is_some();
+        if !has || (ty == ColumnType::Xid && lit_left && number) {
+            return Err(Error::new(format!(
+                "operator does not exist: {} {op} {}",
+                if lit_left {
+                    "integer".into()
+                } else {
+                    ty.pg_name()
+                },
+                if lit_left {
+                    ty.pg_name()
+                } else {
+                    "unknown".into()
+                }
+            )));
+        }
+    }
+    // No comparison matches a NULL, so one with NULL keeps no row.
+    if matches!(lit, Expr::Value(v) if v.value == Value::Null)
+        && matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+        )
+    {
+        return Ok(Conj::One(side, Piece::Empty));
+    }
+    if let Shape::Column(c) = s {
+        let ty = table.columns[c].ty;
+        // A numeric(p, s) by the keys either side of the number, whatever its scale.
+        if let ColumnType::Numeric { precision, scale } = ty {
+            let n = numeric_literal(lit)?;
+            let (at, below, above) = crate::numeric::column_bounds(&n, precision, scale);
+            let none = Interval { lo: 1, hi: 0 };
+            let cond = match op {
+                BinaryOperator::Eq => Cond::new(s, at.map_or(none, Interval::at)),
+                BinaryOperator::NotEq => {
+                    let mut c = Cond::new(s, Interval::ALL);
+                    c.except.extend(at);
+                    c
+                }
+                BinaryOperator::Lt => Cond::new(
+                    s,
+                    Interval {
+                        lo: i128::MIN,
+                        hi: below,
+                    },
+                ),
+                BinaryOperator::LtEq => Cond::new(
+                    s,
+                    Interval {
+                        lo: i128::MIN,
+                        hi: at.unwrap_or(below),
+                    },
+                ),
+                BinaryOperator::Gt => {
+                    Cond::new(s, above.map_or(none, |lo| Interval { lo, hi: i128::MAX }))
+                }
+                BinaryOperator::GtEq => Cond::new(
+                    s,
+                    at.or(above)
+                        .map_or(none, |lo| Interval { lo, hi: i128::MAX }),
+                ),
+                other => return Err(Error::new(format!("the comparison {other} is not read"))),
+            };
+            return Ok(Conj::One(side, Piece::Cond(cond)));
+        }
+        if ty.keyed_by_text() || ty.keyed_by_bytes() {
+            if !ty.ordered() && !matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq) {
+                return Err(Error::new(format!(
+                    "could not identify a comparison function for type {}",
+                    ty.pg_name()
+                )));
+            }
+            // A numeric held as its text, by its class's key; a composed value by its key,
+            // written as text that sorts as the key does.
+            let v = match ty {
+                ColumnType::NumericText(_) => numeric_literal(lit)?.class_key().into_bytes(),
+                ty if ty.is_nested() => match crate::composed::compared(ty, lit)? {
+                    super::statement::Datum::Compound(k) => k.hex.as_bytes().to_vec(),
+                    _ => {
+                        return Err(Error::new(format!(
+                            "{lit} is not a value of {}",
+                            ty.pg_name()
+                        )))
+                    }
+                },
+                _ => bytes_literal(lit, ty)?,
+            };
+            // Under a library collation, by the collation's key.
+            let v = match table.columns[c].orderer()? {
+                Some(k) => k.key(&v),
+                None => v,
+            };
+            let mut except = Vec::new();
+            let (lo, hi) = match op {
+                BinaryOperator::Eq => (Included(v.clone()), Included(v)),
+                BinaryOperator::NotEq => {
+                    except.push(v);
+                    (Unbounded, Unbounded)
+                }
+                BinaryOperator::Lt => (Unbounded, Excluded(v)),
+                BinaryOperator::LtEq => (Unbounded, Included(v)),
+                BinaryOperator::Gt => (Excluded(v), Unbounded),
+                BinaryOperator::GtEq => (Included(v), Unbounded),
+                other => {
+                    return Err(Error::new(format!(
+                        "the comparison {other} on {} is not read",
+                        ty.pg_name()
+                    )))
+                }
+            };
+            return Ok(Conj::One(
+                side,
+                Piece::Text(TextCond {
+                    column: c,
+                    lo,
+                    hi,
+                    except,
+                }),
+            ));
+        }
+    }
+    // A real beside a number written out is compared as a double precision: where no real is
+    // that number, the reals either side of it bound what is kept.
+    if let Shape::Column(c) = s {
+        if table.columns[c].ty == ColumnType::Float4 && text_literal(lit).is_err() {
+            if let Some(t) = super::statement::number_text(lit) {
+                let d = f64::from_bits(crate::scalars::float_parse(&t, true)?);
+                if let Some((below, above)) = crate::scalars::float4_between(d) {
+                    let (below, above) = (i128::from(below), i128::from(above));
+                    let cond = match op {
+                        BinaryOperator::Eq => Cond::new(s, Interval { lo: 1, hi: 0 }),
+                        BinaryOperator::NotEq => Cond::new(s, Interval::ALL),
+                        BinaryOperator::Lt | BinaryOperator::LtEq => Cond::new(
+                            s,
+                            Interval {
+                                lo: i128::MIN,
+                                hi: below,
+                            },
+                        ),
+                        BinaryOperator::Gt | BinaryOperator::GtEq => Cond::new(
+                            s,
+                            Interval {
+                                lo: above,
+                                hi: i128::MAX,
+                            },
+                        ),
+                        other => {
+                            return Err(Error::new(format!("the comparison {other} is not read")))
+                        }
+                    };
+                    return Ok(Conj::One(side, Piece::Cond(cond)));
+                }
+                let key = crate::scalars::float4_key((d as f32).to_bits());
+                let cond = match op {
+                    BinaryOperator::Eq => Cond::new(s, Interval::at(key.into())),
+                    _ => Cond::new(s, Interval::ALL),
+                };
+                if op == BinaryOperator::Eq {
+                    return Ok(Conj::One(side, Piece::Cond(cond)));
+                }
+            }
+        }
+    }
+    let (s, v) = match s {
+        Shape::Clock(c) => (Shape::Column(c), clock_literal(lit)? as i128),
+        _ => (s, literal(lit, s, table)?),
+    };
+    let cond = match op {
+        BinaryOperator::Eq => Cond::new(s, Interval::at(v)),
+        BinaryOperator::NotEq => {
+            let mut c = Cond::new(s, Interval::ALL);
+            c.except.push(v);
+            c
+        }
+        // A strict bound past either end keeps nothing.
+        BinaryOperator::Lt => match v.checked_sub(1) {
+            Some(hi) => Cond::new(s, Interval { lo: i128::MIN, hi }),
+            None => Cond::new(s, Interval { lo: 1, hi: 0 }),
+        },
+        BinaryOperator::LtEq => Cond::new(
+            s,
+            Interval {
+                lo: i128::MIN,
+                hi: v,
+            },
+        ),
+        BinaryOperator::Gt => match v.checked_add(1) {
+            Some(lo) => Cond::new(s, Interval { lo, hi: i128::MAX }),
+            None => Cond::new(s, Interval { lo: 1, hi: 0 }),
+        },
+        BinaryOperator::GtEq => Cond::new(
+            s,
+            Interval {
+                lo: v,
+                hi: i128::MAX,
+            },
+        ),
+        other => return Err(Error::new(format!("the comparison {other} is not read"))),
+    };
+    Ok(Conj::One(side, Piece::Cond(cond)))
 }
 
 #[cfg(test)]
