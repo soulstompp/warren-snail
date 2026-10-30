@@ -803,3 +803,49 @@ fn what_a_join_does_not_read_is_refused_with_its_reason() {
         assert!(e.contains(why), "{q}: {e}");
     }
 }
+
+#[test]
+fn the_structured_types_join_by_their_classes_or_are_refused_as_postgresql_refuses_them() {
+    let ddl = "CREATE TABLE s.a (id integer NOT NULL, n inet, j jsonb, t tsvector, x json, p point, \
+               b box, PRIMARY KEY (id)); \
+               CREATE TABLE s.c (id integer NOT NULL, n cidr, j jsonb, t tsvector, x json, p point, \
+               b box, PRIMARY KEY (id));";
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("joins_structured.snail");
+    let _ = std::fs::remove_file(&path);
+    warren_snail::write::write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.a (id, n, j, t) VALUES (1, '10.1.0.0/16', '{\"a\": 1.0}', 'b a'), \
+         (2, '10.1.2.3', '[1, 2]', 'a:1'), (3, '10.1.0.0', '{\"a\": 1}', 'c')",
+    )
+    .unwrap();
+    w.execute(
+        "INSERT INTO s.c (id, n, j, t) VALUES (1, '10.1.0.0/16', '{\"a\": 1}', 'a b'), \
+         (2, '10.1.2.3/32', '[1,2]', 'a'), (3, '10.2.0.0/16', 'null', 'a:1')",
+    )
+    .unwrap();
+    drop(w);
+    let mut snail = fresh(&path);
+    // As PostgreSQL 18.6 answers each: an inet beside a cidr by network_eq, jsonb's numbers by
+    // their values, a tsvector by its lexemes, an inet before a cidr by network_lt.
+    for (on, want) in [
+        ("a.n = c.n", vec![(1, 1), (2, 2)]),
+        ("a.j = c.j", vec![(1, 1), (2, 2), (3, 1)]),
+        ("a.t = c.t", vec![(1, 1), (2, 3)]),
+        ("a.n < c.n", vec![(1, 2), (1, 3), (2, 3), (3, 2), (3, 3)]),
+    ] {
+        let q = format!("SELECT a.id, c.id AS other FROM s.a a JOIN s.c c ON {on}");
+        let want: Vec<Row> = want.into_iter().map(|(a, c)| vec![s(a), s(c)]).collect();
+        same(&mut snail, &q, want);
+    }
+    for (on, why) in [
+        ("a.x = c.x", "operator does not exist: json = json"),
+        ("a.p = c.p", "operator does not exist: point = point"),
+        ("a.b = c.b", "compares areas"),
+        ("a.n = c.j", "through a cast"),
+    ] {
+        let q = format!("SELECT count(*) FROM s.a a JOIN s.c c ON {on}");
+        let e = snail.ask(&q, None).unwrap_err().to_string();
+        assert!(e.contains(why), "{q}: {e}");
+    }
+}
