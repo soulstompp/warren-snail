@@ -780,8 +780,6 @@ impl Snail {
                     .iter()
                     .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::NumericText(_)))
                     .collect();
-                let types: Vec<ColumnType> =
-                    columns.iter().map(|&(c, _)| table.columns[c].ty).collect();
                 let dicts: Vec<Dict> = outs.iter().map(|o| o.3.dict().cloned()).collect();
                 if !same(&sent, &dicts) {
                     sink.dictionaries(&dicts);
@@ -837,7 +835,7 @@ impl Snail {
                     Some(k) if walk.keyed > 0 && lead >= walk.keyed => keyed_spans(
                         k,
                         &outs[..walk.keyed],
-                        &types[..walk.keyed],
+                        &collated[..walk.keyed],
                         &order.nulls_first[..walk.keyed],
                         from,
                         to,
@@ -955,7 +953,7 @@ impl Snail {
 fn keyed_spans(
     keys: &KeySet,
     lead: &[(bool, bool, usize, &Values)],
-    types: &[ColumnType],
+    types: &[(ColumnType, Coll)],
     nulls_first: &[bool],
     from: usize,
     to: usize,
@@ -967,7 +965,9 @@ fn keyed_spans(
             .zip(types)
             .zip(nulls_first)
             .zip(key)
-            .map(|(((&(_, _, start, v), &ty), &first), k)| against_key(ty, v, r - start, first, k))
+            .map(|(((&(_, _, start, v), &(ty, coll)), &first), k)| {
+                against_key(ty, coll, v, r - start, first, k)
+            })
             .find(|o| *o != Ordering::Equal)
             .unwrap_or(Ordering::Equal)
     };
@@ -1031,10 +1031,11 @@ fn keyed_spans(
 }
 
 /// Row `i`'s value of a level of type `ty` against a level's key: a number by its key, a value of a
-/// string type, bytea, a bit string or a composed type by the bytes it is keyed by, a NULL lying on
-/// its level's side.
+/// string type, bytea, a bit string or a composed type by the bytes it is keyed by, under its
+/// collation where a library orders it, a NULL lying on its level's side.
 pub(super) fn against_key(
     ty: ColumnType,
+    coll: Coll,
     v: &Values,
     i: usize,
     first: bool,
@@ -1047,12 +1048,14 @@ pub(super) fn against_key(
         KeyValue::Null { first: true } => Ordering::Greater,
         KeyValue::Null { first: false } => Ordering::Less,
         KeyValue::Text(k) => v.text_value(i).map_or(Ordering::Less, |x| {
-            crate::strings::key_bytes(ty, x.data())
+            crate::strings::column_key(ty, coll, x.data())
                 .as_ref()
                 .cmp(k.as_bytes())
         }),
         KeyValue::Bytes(k) => v.text_value(i).map_or(Ordering::Less, |x| {
-            crate::strings::key_bytes(ty, x.data()).as_ref().cmp(&**k)
+            crate::strings::column_key(ty, coll, x.data())
+                .as_ref()
+                .cmp(&**k)
         }),
         KeyValue::Int(k) => v.wide(i).map_or(Ordering::Less, |x| x.cmp(&i128::from(*k))),
         KeyValue::Wide(k) => v.wide(i).map_or(Ordering::Less, |x| x.cmp(k)),

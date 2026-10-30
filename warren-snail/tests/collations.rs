@@ -380,3 +380,105 @@ fn formats_7_and_8_refuse_a_column_under_a_library_collation_by_name() {
         );
     }
 }
+
+#[test]
+fn a_join_on_text_under_a_library_collation_meets_and_compares_as_the_collation_does() {
+    // A deterministic collation: equal only where the bytes are; ordered as ICU orders, its bytes
+    // breaking a tie. The rows met are kept along the index on the text, by the collation's keys.
+    let wide: Vec<String> = (0..8000)
+        .map(|i| format!("{} {i}", FORTY[i % FORTY.len()]))
+        .collect();
+    let many: Vec<&str> = wide.iter().map(String::as_str).collect();
+    let path = snail_of("icu-join", ICU, &many);
+    #[cfg(feature = "standalone")]
+    let mut snail = Snail::open_holding(&path, 0).unwrap();
+    #[cfg(not(feature = "standalone"))]
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail
+        .ask(
+            "SELECT a.id, count(*) FROM s.t a JOIN s.t b ON b.v = a.v WHERE a.id <= 3 \
+             GROUP BY a.id ORDER BY a.id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(ids(&b), vec![1, 2, 3], "{round:?}");
+    assert_eq!(ints64(b.column(1).as_ref()), vec![Some(1); 3]);
+    assert!(
+        round.order.ends_with("+t_v"),
+        "kept along the index: {round:?}"
+    );
+    assert_eq!(round.column_pages_read, round.column_pages_predicted);
+    let path = snail_of("icu-join-forty", ICU, &FORTY);
+    let mut snail = Snail::open(&path).unwrap();
+    let spec = Spec::icu("en-US", None, true);
+    let (_, c) = open(&spec, "test").unwrap();
+    let mut want = Vec::new();
+    for a in 1..=5i64 {
+        for b in 1..=FORTY.len() as i64 {
+            let (x, y) = (FORTY[a as usize - 1], FORTY[b as usize - 1]);
+            let o = match c.cmp(x.as_bytes(), y.as_bytes()) {
+                Ordering::Equal => x.as_bytes().cmp(y.as_bytes()),
+                o => o,
+            };
+            if o == Ordering::Less {
+                want.push((a, b));
+            }
+        }
+    }
+    let (b, _) = snail
+        .ask(
+            "SELECT a.id, b.id AS other FROM s.t a JOIN s.t b ON a.v < b.v WHERE a.id <= 5 \
+             ORDER BY a.id, other",
+            None,
+        )
+        .unwrap();
+    let got: Vec<(i64, i64)> = ids(&b)
+        .into_iter()
+        .zip(ints64(b.column(1).as_ref()).into_iter().flatten())
+        .collect();
+    assert_eq!(got, want);
+
+    // A nondeterministic collation: values it holds equal meet.
+    let ddl = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
+               deterministic = false); \
+               CREATE TABLE s.t (id integer NOT NULL, v text COLLATE s.ci, PRIMARY KEY (id)); \
+               CREATE INDEX t_v ON s.t (v, id);";
+    let values = ["a", "A", "b", "B", "ab", "AB", "Ab", "c"];
+    let path = snail_of("icu-ci-join", ddl, &values);
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, _) = snail
+        .ask(
+            "SELECT a.id, count(*) FROM s.t a JOIN s.t b ON b.v = a.v GROUP BY a.id ORDER BY a.id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(ids(&b), (1..=8).collect::<Vec<i64>>());
+    assert_eq!(
+        ints64(b.column(1).as_ref()),
+        [2, 2, 2, 2, 3, 3, 3, 1].map(Some).to_vec()
+    );
+
+    // Two columns under two collations, or one under a collation and one by its bytes, are refused.
+    let ddl = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
+               deterministic = false); \
+               CREATE TABLE s.t (id integer NOT NULL, v text COLLATE \"en-US-x-icu\", \
+               PRIMARY KEY (id)); \
+               CREATE TABLE s.u (id integer NOT NULL, w text COLLATE s.ci, x text, PRIMARY KEY (id));";
+    let path = tmp("icu-two.snail");
+    let catalog = Catalog::parse(ddl).unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut snail = Snail::open(&path).unwrap();
+    for (q, why) in [
+        (
+            "SELECT count(*) FROM s.t t JOIN s.u u ON u.w = t.v",
+            "could not determine which collation",
+        ),
+        (
+            "SELECT count(*) FROM s.t t JOIN s.u u ON u.x = t.v",
+            "compared by its bytes",
+        ),
+    ] {
+        let e = snail.ask(q, None).unwrap_err().to_string();
+        assert!(e.contains(why), "{q}: {e}");
+    }
+}

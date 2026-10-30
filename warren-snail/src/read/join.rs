@@ -16,7 +16,7 @@ use super::hash::WordMap;
 use super::question::{Cmp, Key, Meet, Piece, Question, Test};
 use super::walk::{KeySet, Sink, Want};
 use super::{Round, Snail};
-use crate::catalog::{ColumnType, Level, Table};
+use crate::catalog::{Column, ColumnType, Level, Table};
 use crate::places::KeyValue;
 use crate::Result;
 use arrow::array::RecordBatch;
@@ -43,17 +43,17 @@ fn part_of(c: &Cell, ty: ColumnType) -> Option<Part> {
     })
 }
 
-/// A cell of a column of type `from` as a level of type `ty` keys it; none where no value of the
+/// A cell of a column of type `from` as a level of column `to` keys it; none where no value of the
 /// level is it.
-fn level_value(c: &Cell, from: ColumnType, ty: ColumnType) -> Option<KeyValue> {
+fn level_value(c: &Cell, from: ColumnType, to: &Column) -> Option<KeyValue> {
     Some(match part_of(c, from)? {
-        Part::Num(v) if ty.is_wide() => KeyValue::Wide(v),
+        Part::Num(v) if to.ty.is_wide() => KeyValue::Wide(v),
         Part::Num(v) => KeyValue::Int(i64::try_from(v).ok()?),
         Part::Bytes(_) if matches!(c, Cell::Composed(_)) => match c {
             Cell::Composed(x) => KeyValue::Text(x.hex.clone()),
             _ => unreachable!(),
         },
-        Part::Bytes(b) => crate::places::byte_key(ty, &b),
+        Part::Bytes(b) => crate::places::column_byte_key(to, &b),
     })
 }
 
@@ -406,7 +406,7 @@ impl Snail {
                             level_value(
                                 &cells[t.at(*s, m.b.column, false)],
                                 t.ty(*s, m.b.column),
-                                table.columns[m.a.column].ty,
+                                &table.columns[m.a.column],
                             )
                         })
                         .collect::<Option<Vec<KeyValue>>>()

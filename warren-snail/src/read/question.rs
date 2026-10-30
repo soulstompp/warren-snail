@@ -1478,9 +1478,14 @@ impl Conj {
 /// The family of keys a type's values are compared by on a join: integers of any width share one,
 /// as do a numeric's of one scale, the oid and the reg* types, the bit strings, and each time type
 /// of any precision; every other type has its own, whatever length or fields it is declared with, a
-/// composed type the one it is.
-fn join_family(ty: ColumnType) -> String {
-    match ty {
+/// composed type the one it is; cidr inet's, and pg_node_tree text's. Where PostgreSQL has no
+/// `=` that is equality of the values, its refusal: none at all, on point, json, jsonpath, xml,
+/// refcursor and the index summaries; one too many, on the statistics types; one that compares
+/// areas, lengths or points within a tolerance, on the other geometric types.
+fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
+    use crate::textual::{Internal, Textual};
+    let none = || format!("operator does not exist: {0} = {0}", ty.pg_name());
+    Ok(match ty {
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => "integer".into(),
         ColumnType::Numeric { scale, .. } => format!("numeric {scale}"),
         ColumnType::NumericText(_) => "numeric".into(),
@@ -1493,6 +1498,25 @@ fn join_family(ty: ColumnType) -> String {
         ColumnType::Bpchar(_) => "bpchar".into(),
         ColumnType::Timetz(_) => "timetz".into(),
         ColumnType::Bit(_) | ColumnType::Varbit(_) => "bits".into(),
+        ColumnType::Textual(Textual::Inet | Textual::Cidr) => "inet".into(),
+        ColumnType::Textual(
+            Textual::Json | Textual::Jsonpath | Textual::Xml | Textual::Refcursor,
+        ) => return Err(none()),
+        ColumnType::Textual(t) => format!("{t:?}"),
+        ColumnType::Internal(Internal::NodeTree) => "text".into(),
+        ColumnType::Internal(Internal::Ndistinct | Internal::Dependencies | Internal::McvList) => {
+            return Err(format!("operator is not unique: {0} = {0}", ty.pg_name()))
+        }
+        ColumnType::Internal(_) | ColumnType::Geometric(crate::geo::GeoKind::Point) => {
+            return Err(none())
+        }
+        ColumnType::Geometric(_) => {
+            return Err(format!(
+                "a join on {} is not read: its = compares areas, lengths or points within a \
+                 tolerance, not the values",
+                ty.pg_name()
+            ))
+        }
         ColumnType::Bytes
         | ColumnType::Tid
         | ColumnType::Name
@@ -1511,13 +1535,41 @@ fn join_family(ty: ColumnType) -> String {
         | ColumnType::Oid8
         | ColumnType::Date
         | ColumnType::Composed(_) => format!("{ty:?}"),
-    }
+    })
 }
 
 /// Whether two tables' columns are compared by `op` on the keys they are held by: two columns of
-/// one family, by an operator their type has.
-fn comparable(p: &Expr, a: ColumnType, op: Cmp, b: ColumnType) -> Result<()> {
-    if join_family(a) != join_family(b) {
+/// one family, by an operator their type has, and two strings under one collation.
+fn comparable(
+    p: &Expr,
+    ca: &crate::catalog::Column,
+    op: Cmp,
+    cb: &crate::catalog::Column,
+) -> Result<()> {
+    let (a, b) = (ca.ty, cb.ty);
+    let fa = join_family(a).map_err(|e| Error::new(format!("{p}: {e}")))?;
+    let fb = join_family(b).map_err(|e| Error::new(format!("{p}: {e}")))?;
+    match (ca.collated(), cb.collated()) {
+        (true, true) if ca.collation != cb.collation => {
+            return Err(Error::new(format!(
+                "{p}: could not determine which collation to use for string comparison"
+            )))
+        }
+        (true, false) | (false, true) => {
+            let named = if ca.collated() {
+                &ca.collation
+            } else {
+                &cb.collation
+            };
+            return Err(Error::new(format!(
+                "{p}: a join of a column under the collation {} with one compared by its bytes \
+                 is not read",
+                named.as_deref().unwrap_or_default()
+            )));
+        }
+        _ => {}
+    }
+    if fa != fb {
         return Err(Error::new(format!(
             "{p}: {} and {} are compared through a cast, which a join does not read",
             a.pg_name(),
@@ -1525,7 +1577,7 @@ fn comparable(p: &Expr, a: ColumnType, op: Cmp, b: ColumnType) -> Result<()> {
         )));
     }
     let has = match a {
-        ColumnType::Cid => op == Cmp::Eq,
+        ColumnType::Cid | ColumnType::Textual(crate::textual::Textual::Aclitem) => op == Cmp::Eq,
         a if !a.ordered() => matches!(op, Cmp::Eq | Cmp::NotEq),
         _ => true,
     };
@@ -1605,8 +1657,7 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
                 )))
             }
         };
-        let (ta, tb) = (from.table(a).columns[x].ty, from.table(b).columns[y].ty);
-        comparable(p, ta, op, tb)?;
+        comparable(p, &from.table(a).columns[x], op, &from.table(b).columns[y])?;
         return Ok(Conj::Two(Meet {
             a: Col { side: a, column: x },
             op,
