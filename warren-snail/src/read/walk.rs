@@ -5,8 +5,8 @@ use super::answer::{same, Answer, Cell, Dict, Text};
 use super::question::{Cond, Countable, Side, TextCond};
 use super::{Snail, Wasted};
 use crate::catalog::{Level, Order, Shape, Table};
-use crate::directory::{decode_page, decode_top, Entry, Head, PageMap};
-use crate::encode::{decode_with, descriptor};
+use crate::directory::{decode_page, decode_top, Entry, Head, PageMap, Summary};
+use crate::encode::decode_with;
 use crate::file::Extent;
 use crate::places::{key, month_of, null_key, wide_cmp, KeyValue};
 use crate::values::Values;
@@ -445,7 +445,6 @@ impl Snail {
     pub(super) fn predict(&self, mut walk: Walk, want: &Want) -> Result<Plan> {
         let mut column_pages = 0u64;
         let mut rows_estimate = walk.rows_closed as f64;
-        let order = &want.table.orders[walk.order];
         let mut reads = Vec::with_capacity(walk.open.len());
         // The pages that hold the page maps last read: blocks side by side share them.
         let mut held: Option<(u64, Vec<u8>)> = None;
@@ -460,7 +459,7 @@ impl Snail {
                 walk.directory_pages += pages;
             }
             let map = PageMap::decode(&held.as_ref().unwrap().1[at..], &walk.head.level_text)?;
-            rows_estimate += estimate(&o, &map, &walk, order, &want.side.nulls);
+            rows_estimate += estimate(&o, &map, &walk, want.table, &want.side.nulls);
             let mut block_reads = Vec::new();
             let mut waste = 0u64;
             for &s in &o.slots {
@@ -584,11 +583,13 @@ impl Snail {
         let mut cells: Vec<Cell> = vec![Cell::Null; columns.len()];
         let mut sent: Vec<Dict> = vec![None; columns.len()];
         let lead = sink.lead();
+        let leaves = order.leaves(table);
+        let descs = crate::write::leaf_descriptors(table, order)?;
         for br in &plan.reads[blocks] {
-            // For every column read, its runs of pages decoded: (slot, [(first row, values)]).
+            // For every leaf read, its runs of pages decoded: (slot, [(first row, values)]).
             let mut held: Vec<(usize, Vec<(usize, Values)>)> = Vec::new();
             for (s, chosen) in &br.reads {
-                let col = &table.columns[order.columns[*s]];
+                let leaf = &leaves[*s].1;
                 let cp = &br.map.columns[*s];
                 let mut runs = Vec::new();
                 if !chosen.is_empty() {
@@ -596,7 +597,7 @@ impl Snail {
                         Some(d) => Some(self.reader.read_extent(d)?),
                         None => None,
                     };
-                    let desc = descriptor(&col.name, col.ty, !col.not_null)?;
+                    let desc = &descs[*s];
                     let mut dict = None;
                     let mut i = 0;
                     while i < chosen.len() {
@@ -626,8 +627,8 @@ impl Snail {
                         runs.push((
                             pages[0].first_row as usize,
                             decode_with(
-                                &desc,
-                                col.ty,
+                                desc,
+                                leaf.ty,
                                 dictionary.as_deref(),
                                 &slices,
                                 rows,
@@ -639,7 +640,7 @@ impl Snail {
                 }
                 held.push((*s, runs));
             }
-            // The rows every column read holds. Within one of these ranges each column is one run.
+            // The rows every leaf read holds. Within one of these ranges each leaf is one run.
             let mut rows: Vec<(usize, usize)> = vec![(0, br.map.rows() as usize)];
             let dead = &br.map.dead;
             for (_, runs) in &held {
@@ -654,9 +655,16 @@ impl Snail {
                 }
                 rows = kept;
             }
-            let slot_of = |c: usize| order.slot(c).unwrap();
+            // The columns read whose values are a group of leaves.
+            let mut groups: Vec<usize> = Vec::new();
+            for (s, _) in &br.reads {
+                let c = leaves[*s].0;
+                if table.columns[c].ty.leaf_count() > 1 && !groups.contains(&c) {
+                    groups.push(c);
+                }
+            }
             for &(from, to) in &rows {
-                // Each slot read: the run that holds this range, and its first row.
+                // Each leaf read: the run that holds this range, and its first row.
                 let run = |s: usize| -> (usize, &Values) {
                     let (_, runs) = held.iter().find(|h| h.0 == s).unwrap();
                     let (start, v) = runs
@@ -664,6 +672,28 @@ impl Snail {
                         .find(|(start, v)| *start <= from && from < start + v.len())
                         .unwrap();
                     (*start, v)
+                };
+                // A group's values over this range, made from its leaves'.
+                let joined: Vec<(usize, Values)> = groups
+                    .iter()
+                    .map(|&c| {
+                        let parts = order
+                            .slots(table, c)
+                            .unwrap()
+                            .map(|s| {
+                                let (start, v) = run(s);
+                                v.gather(&(from - start..to - start).collect::<Vec<_>>())
+                            })
+                            .collect();
+                        (c, Values::from_leaves(table.columns[c].ty, parts))
+                    })
+                    .collect();
+                // Each column read: the values that hold this range, and their first row.
+                let column = |c: usize| -> (usize, &Values) {
+                    match joined.iter().find(|j| j.0 == c) {
+                        Some((_, v)) => (from, v),
+                        None => run(order.leaf_slot(table, c).unwrap()),
+                    }
                 };
                 let fixed = if br.interval_may {
                     &order.levels[..walk.m]
@@ -673,7 +703,7 @@ impl Snail {
                 let levels: Vec<(Level, bool, usize, &Values)> = fixed
                     .iter()
                     .map(|&l| {
-                        let (start, v) = run(slot_of(l.column()));
+                        let (start, v) = column(l.column());
                         (l, table.columns[l.column()].ty.is_text(), start, v)
                     })
                     .collect();
@@ -682,7 +712,7 @@ impl Snail {
                     .iter()
                     .map(|&ri| {
                         let c = &walk.rest[ri];
-                        let (start, v) = run(slot_of(s_column(c.shape)));
+                        let (start, v) = column(s_column(c.shape));
                         (c, start, v)
                     })
                     .collect();
@@ -691,7 +721,7 @@ impl Snail {
                     .iter()
                     .map(|&ti| {
                         let t = &want.side.texts[ti];
-                        let (start, v) = run(slot_of(t.column));
+                        let (start, v) = column(t.column);
                         (t, start, v)
                     })
                     .collect();
@@ -700,14 +730,14 @@ impl Snail {
                     .iter()
                     .map(|&ni| {
                         let (c, null) = want.side.nulls[ni];
-                        let (start, v) = run(slot_of(c));
+                        let (start, v) = column(c);
                         (null, start, v)
                     })
                     .collect();
                 let outs: Vec<(bool, bool, usize, &Values)> = columns
                     .iter()
                     .map(|&(c, month)| {
-                        let (start, v) = run(slot_of(c));
+                        let (start, v) = column(c);
                         (table.columns[c].ty.is_byte_array(), month, start, v)
                     })
                     .collect();
@@ -961,8 +991,10 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let mut status = interval;
     let mut rest_may = Vec::new();
     let mut exact: Option<u64> = None;
+    let table = want.table;
     for (ri, c) in walk.rest.iter().enumerate() {
-        let (st, n) = rest_status(order.slot(s_column(c.shape)).unwrap(), c, &e, &walk.head);
+        let (sum, slot) = summary_of(table, order, c, &e);
+        let (st, n) = rest_status(sum, slot, c, &e, &walk.head);
         match st {
             Status::None => status = Status::None,
             Status::May => {
@@ -972,11 +1004,12 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             Status::Must => {}
         }
     }
-    // A test for NULL is answered by the column's NULLs the entry counts.
+    // A test for NULL is answered by the column's NULLs the entry counts, which each of its leaves
+    // holds.
     let mut null_may = Vec::new();
     for &ni in &walk.nulls {
         let (c, null) = side.nulls[ni];
-        let nulls = e.columns[order.slot(c).unwrap()].nulls;
+        let nulls = e.columns[order.leaf_slot(table, c).unwrap()].nulls;
         let n = if null { nulls } else { e.rows - nulls } as u64;
         if n == 0 {
             status = Status::None;
@@ -992,7 +1025,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let mut text_may = Vec::new();
     for &ti in &walk.texts {
         let t = &side.texts[ti];
-        if e.columns[order.slot(t.column).unwrap()].nulls == e.rows {
+        if e.columns[order.leaf_slot(table, t.column).unwrap()].nulls == e.rows {
             status = Status::None;
         } else {
             text_may.push(ti);
@@ -1025,7 +1058,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
                 }
             }
             Some(Countable::ByMonth(c)) => {
-                let slot = order.slot(c).unwrap();
+                let slot = order.leaf_slot(table, c).unwrap();
                 let mi = walk
                     .head
                     .month_slots
@@ -1058,11 +1091,13 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             None => {}
         }
     }
+    // A column read is each of its leaves read.
     let mut slots: Vec<usize> = Vec::new();
     let mut need = |c: usize| {
-        let s = order.slot(c).unwrap();
-        if !slots.contains(&s) {
-            slots.push(s);
+        for s in order.slots(table, c).unwrap() {
+            if !slots.contains(&s) {
+                slots.push(s);
+            }
         }
     };
     for &c in &want.columns {
@@ -1126,10 +1161,26 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     });
 }
 
-/// A condition off the leading levels, against one entry's counts: whether no row, some or every
-/// row holds it, and how many hold it where the counts say exactly.
-fn rest_status(slot: usize, c: &Cond, b: &Entry, head: &Head) -> (Status, Option<u64>) {
-    let sum = b.columns[slot];
+/// What an entry keeps of the column a condition reads: its one leaf's summary, or the one its
+/// leaves' summaries make; and the slot of its first leaf.
+fn summary_of(table: &Table, order: &Order, c: &Cond, e: &Entry) -> (Summary, usize) {
+    let column = s_column(c.shape);
+    let slots = order
+        .slots(table, column)
+        .expect("an order holds the columns read along it");
+    (e.columns[slots.start], slots.start)
+}
+
+/// A condition off the leading levels, against one entry's counts, `sum` what it keeps of the
+/// column and `slot` the column's first leaf: whether no row, some or every row holds it, and how
+/// many hold it where the counts say exactly.
+fn rest_status(
+    sum: Summary,
+    slot: usize,
+    c: &Cond,
+    b: &Entry,
+    head: &Head,
+) -> (Status, Option<u64>) {
     let present = (b.rows - sum.nulls) as u64;
     let rows = b.rows as u64;
     let status = |n: u64| {
@@ -1203,7 +1254,8 @@ fn rest_status(slot: usize, c: &Cond, b: &Entry, head: &Head) -> (Status, Option
 /// the levels covers the block by the share of its least to greatest it takes, or by its count
 /// where the counts give one, and a test for NULL by the NULLs counted; a condition on text off the
 /// levels leaves the block whole.
-fn estimate(o: &Open, map: &PageMap, walk: &Walk, order: &Order, nulls: &[(usize, bool)]) -> f64 {
+fn estimate(o: &Open, map: &PageMap, walk: &Walk, table: &Table, nulls: &[(usize, bool)]) -> f64 {
+    let order = &table.orders[walk.order];
     let e = &o.entry;
     let mut share = 1.0;
     if o.interval_may {
@@ -1234,11 +1286,12 @@ fn estimate(o: &Open, map: &PageMap, walk: &Walk, order: &Order, nulls: &[(usize
     }
     for &ri in &o.rest_may {
         let c = &walk.rest[ri];
-        share *= rest_share(order.slot(s_column(c.shape)).unwrap(), c, e, &walk.head);
+        let (sum, slot) = summary_of(table, order, c, e);
+        share *= rest_share(sum, slot, c, e, &walk.head);
     }
     for &ni in &o.null_may {
         let (c, null) = nulls[ni];
-        let n = e.columns[order.slot(c).unwrap()].nulls as f64;
+        let n = e.columns[order.leaf_slot(table, c).unwrap()].nulls as f64;
         share *= if null { n } else { e.rows as f64 - n } / (e.rows as f64).max(1.0);
     }
     e.rows as f64 * share
@@ -1286,15 +1339,15 @@ fn page_share(
 /// The share of an entry's rows a condition off the leading levels covers: its count where the
 /// counts give one, else the share of the column's least to greatest the condition's range takes,
 /// of the rows that hold a value.
-fn rest_share(slot: usize, cond: &Cond, e: &Entry, head: &Head) -> f64 {
+fn rest_share(sum: Summary, slot: usize, cond: &Cond, e: &Entry, head: &Head) -> f64 {
     if e.rows == 0 {
         return 0.0;
     }
-    match rest_status(slot, cond, e, head) {
+    match rest_status(sum, slot, cond, e, head) {
         (Status::None, _) => 0.0,
         (_, Some(n)) => n as f64 / e.rows as f64,
         _ => {
-            let c = e.columns[slot];
+            let c = sum;
             let held = (e.rows - c.nulls) as f64 / e.rows as f64;
             let nulls = if cond.nulls {
                 c.nulls as f64 / e.rows as f64
@@ -1376,11 +1429,11 @@ mod tests {
             ..Default::default()
         };
         let december = Cond::new(Shape::MonthUtc(1), Interval { lo: 12, hi: 12 });
-        assert_eq!(rest_share(1, &december, &block, &head), 21.0 / 120.0);
+        assert_eq!(rest_share(block.columns[1], 1, &december, &block, &head), 21.0 / 120.0);
         let ids = Cond::new(Shape::Column(0), Interval { lo: 1, hi: 25 });
-        assert_eq!(rest_share(0, &ids, &block, &head), 100.0 / 120.0 * 0.25);
+        assert_eq!(rest_share(block.columns[0], 0, &ids, &block, &head), 100.0 / 120.0 * 0.25);
         let none = Cond::new(Shape::Column(0), Interval { lo: 200, hi: 300 });
-        assert_eq!(rest_share(0, &none, &block, &head), 0.0);
+        assert_eq!(rest_share(block.columns[0], 0, &none, &block, &head), 0.0);
     }
 
     #[test]
@@ -1404,6 +1457,7 @@ mod tests {
             child: Extent::default(),
         };
         let head = Head::default();
+        let status = |c: &Cond, b: &Entry| rest_status(b.columns[0], 0, c, b, &head);
         let unequal = |v: i128| {
             let mut c = Cond::new(Shape::Column(0), Interval::ALL);
             c.except.push(v);
@@ -1411,44 +1465,44 @@ mod tests {
         };
         // A value the least and greatest leave out: every value kept, no NULL.
         assert_eq!(
-            rest_status(0, &unequal(60), &block(1, 50, 20), &head),
+            status(&unequal(60), &block(1, 50, 20)),
             (Status::May, Some(80))
         );
         assert_eq!(
-            rest_status(0, &unequal(60), &block(1, 50, 0), &head),
+            status(&unequal(60), &block(1, 50, 0)),
             (Status::Must, Some(100))
         );
         // Every value is the one left out: none kept.
         assert_eq!(
-            rest_status(0, &unequal(7), &block(7, 7, 20), &head),
+            status(&unequal(7), &block(7, 7, 20)),
             (Status::None, Some(0))
         );
         // A value among them: the counts cannot say.
         assert_eq!(
-            rest_status(0, &unequal(7), &block(1, 50, 0), &head),
+            status(&unequal(7), &block(1, 50, 0)),
             (Status::May, None)
         );
         // IS NOT TRUE: false and the NULLs.
         let mut not_true = Cond::new(Shape::Column(0), Interval::at(0));
         not_true.nulls = true;
         assert_eq!(
-            rest_status(0, &not_true, &block(0, 0, 20), &head),
+            status(&not_true, &block(0, 0, 20)),
             (Status::Must, Some(100))
         );
         assert_eq!(
-            rest_status(0, &not_true, &block(1, 1, 20), &head),
+            status(&not_true, &block(1, 1, 20)),
             (Status::May, Some(20))
         );
         assert_eq!(
-            rest_status(0, &not_true, &block(1, 1, 0), &head),
+            status(&not_true, &block(1, 1, 0)),
             (Status::None, Some(0))
         );
         assert_eq!(
-            rest_status(0, &not_true, &block(0, 0, 100), &head),
+            status(&not_true, &block(0, 0, 100)),
             (Status::Must, Some(100))
         );
         assert_eq!(
-            rest_status(0, &not_true, &block(0, 1, 20), &head),
+            status(&not_true, &block(0, 1, 20)),
             (Status::May, None)
         );
     }

@@ -1,6 +1,6 @@
 //! A block's column as the plain parquet library writes it: its own data pages, page by page.
 
-use crate::catalog::ColumnType;
+use crate::catalog::{ColumnType, Leaf};
 use crate::cut::{unit_sizes, DATA_PAGE_ROWS, PAGE};
 use crate::values::{Values, LENGTH_PREFIX};
 use crate::{Error, Result};
@@ -57,7 +57,22 @@ impl Encoded {
     }
 }
 
+/// The descriptor of a column held as one leaf.
 pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDescPtr> {
+    match ty.leaves().as_slice() {
+        [leaf] => leaf_descriptor(name, leaf, nullable),
+        leaves => Err(Error::new(format!(
+            "{name}: {} is held as a group of {} leaves, each its own descriptor",
+            ty.pg_name(),
+            leaves.len()
+        ))),
+    }
+}
+
+/// The descriptor of one leaf of a column: the column's own where it is one leaf, OPTIONAL where the
+/// column takes NULL; a field REQUIRED inside its group, which holds the column's NULLs.
+pub fn leaf_descriptor(column: &str, leaf: &Leaf, nullable: bool) -> Result<ColumnDescPtr> {
+    let ty = leaf.ty;
     let (physical, logical) = match ty {
         ColumnType::Int2 => (
             PhysicalType::INT32,
@@ -112,7 +127,7 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
                 PhysicalType::INT32
             },
             Some(LogicalType::Integer {
-                bit_width: ty.unsigned_bits() as i8,
+                bit_width: leaf.bits as i8,
                 is_signed: false,
             }),
         ),
@@ -121,12 +136,12 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
         ColumnType::Float4 => (PhysicalType::FLOAT, None),
         ColumnType::Float8 => (PhysicalType::DOUBLE, None),
     };
-    let repetition = if nullable {
+    let repetition = if nullable && leaf.field.is_none() {
         Repetition::OPTIONAL
     } else {
         Repetition::REQUIRED
     };
-    let mut t = Type::primitive_type_builder(name, physical)
+    let mut t = Type::primitive_type_builder(leaf.field.unwrap_or(column), physical)
         .with_repetition(repetition)
         .with_logical_type(logical);
     if let ColumnType::Numeric { precision, scale } = ty {
@@ -140,7 +155,7 @@ pub fn descriptor(name: &str, ty: ColumnType, nullable: bool) -> Result<ColumnDe
         Arc::new(t),
         if nullable { 1 } else { 0 },
         0,
-        ColumnPath::new(vec![name.to_string()]),
+        ColumnPath::new(leaf.path(column)),
     )))
 }
 
@@ -483,6 +498,8 @@ pub fn decode(
     let mut defs: Vec<i16> = Vec::new();
     let nullable = desc.max_def_level() > 0;
     let short = |n: usize| Error::new(format!("{}: {n} rows decoded of {rows}", desc.name()));
+    // An unsigned number is keyed by the bits its descriptor names.
+    let bits = unsigned_bits(desc);
     match ty {
         ColumnType::Int2
         | ColumnType::Int4
@@ -499,7 +516,7 @@ pub fn decode(
             }
             Ok(Values::Int(spread(
                 v.into_iter()
-                    .map(|x| crate::scalars::key_of_raw(ty, i64::from(x))),
+                    .map(|x| crate::scalars::key_of_bits(i64::from(x), bits)),
                 &defs,
                 nullable,
             )))
@@ -531,7 +548,7 @@ pub fn decode(
                 return Err(short(n));
             }
             Ok(Values::Int(spread(
-                v.into_iter().map(|x| crate::scalars::key_of_raw(ty, x)),
+                v.into_iter().map(|x| crate::scalars::key_of_bits(x, bits)),
                 &defs,
                 nullable,
             )))

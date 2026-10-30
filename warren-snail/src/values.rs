@@ -217,6 +217,21 @@ impl Values {
         }
     }
 
+    /// A column's values as the leaves of its type hold them, one `Values` a leaf: its own where it
+    /// is one leaf.
+    pub fn into_leaves(self, _ty: ColumnType) -> Vec<Values> {
+        vec![self]
+    }
+
+    /// A column's values from its leaves', each of the same rows: its one leaf's own where it is
+    /// one.
+    pub fn from_leaves(ty: ColumnType, leaves: Vec<Values>) -> Values {
+        leaves
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Values::new(ty))
+    }
+
     /// The most characters any value holds.
     pub fn longest(&self) -> usize {
         match self {

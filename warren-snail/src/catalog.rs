@@ -254,6 +254,64 @@ impl ColumnType {
             _ => None,
         }
     }
+
+    /// The fields of a value held as a group, each its name, the type it is held as and the bits of
+    /// the unsigned number it holds; none for a value held as one leaf.
+    fn fields(self) -> &'static [(&'static str, ColumnType, u32)] {
+        &[]
+    }
+
+    /// How many leaves its Parquet type tree has.
+    pub fn leaf_count(self) -> usize {
+        self.fields().len().max(1)
+    }
+
+    /// The leaves of its Parquet type tree: the value itself, or a leaf a field of the group it is.
+    pub fn leaves(self) -> Vec<Leaf> {
+        match self.fields() {
+            [] => vec![Leaf {
+                field: None,
+                ty: self,
+                bits: self.unsigned_bits(),
+            }],
+            fields => fields
+                .iter()
+                .map(|&(name, ty, bits)| Leaf {
+                    field: Some(name),
+                    ty,
+                    bits,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One leaf of a column's Parquet type tree, the storage's unit: its own descriptor and levels, its
+/// own unit and encoding, its own summary and pages in each block, and its own width in the cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Leaf {
+    /// Its field of the column's group; none where the column is one leaf, named as the column is.
+    pub field: Option<&'static str>,
+    /// The type its values are held as: the column's own where it is one leaf, and a field's the
+    /// narrowest held type whose values hold the field's.
+    pub ty: ColumnType,
+    /// The bits of the unsigned number it holds, as the file annotates them: 0 where it holds none.
+    pub bits: u32,
+}
+
+impl Leaf {
+    /// Its path in the file: the column's name, then its field's.
+    pub fn path(&self, column: &str) -> Vec<String> {
+        std::iter::once(column.to_string())
+            .chain(self.field.map(str::to_string))
+            .collect()
+    }
+
+    /// Its name, as a Parquet reader names a leaf: its path, joined by points.
+    pub fn name(&self, column: &str) -> String {
+        self.path(column).join(".")
+    }
 }
 
 /// Whether PostgreSQL assigns a value of type `from` to a column of type `to` without an explicit
@@ -401,6 +459,31 @@ impl Order {
     pub fn slot(&self, column: usize) -> Option<usize> {
         self.columns.iter().position(|&c| c == column)
     }
+
+    /// The leaves this order holds, by their slots: each column it holds, its leaves in turn, each
+    /// with its table column.
+    pub fn leaves(&self, table: &Table) -> Vec<(usize, Leaf)> {
+        self.columns
+            .iter()
+            .flat_map(|&c| table.columns[c].ty.leaves().into_iter().map(move |l| (c, l)))
+            .collect()
+    }
+
+    /// The slots of a table column's leaves among those this order holds.
+    pub fn slots(&self, table: &Table, column: usize) -> Option<std::ops::Range<usize>> {
+        let at = self.slot(column)?;
+        let start = self.columns[..at]
+            .iter()
+            .map(|&c| table.columns[c].ty.leaf_count())
+            .sum::<usize>();
+        Some(start..start + table.columns[column].ty.leaf_count())
+    }
+
+    /// The slot of a column's first leaf among the leaves this order holds: a column of one
+    /// leaf's own.
+    pub fn leaf_slot(&self, table: &Table, column: usize) -> Option<usize> {
+        self.slots(table, column).map(|s| s.start)
+    }
 }
 
 /// A CHECK on a table's row.
@@ -429,6 +512,21 @@ pub struct Table {
 }
 
 impl Table {
+    /// The leaves of its columns, in its columns' order, each with its column.
+    pub fn leaves(&self) -> Vec<(usize, Leaf)> {
+        (0..self.columns.len())
+            .flat_map(|c| self.columns[c].ty.leaves().into_iter().map(move |l| (c, l)))
+            .collect()
+    }
+
+    /// Where a column's first leaf lies among the table's leaves.
+    pub fn first_leaf(&self, column: usize) -> usize {
+        self.columns[..column]
+            .iter()
+            .map(|c| c.ty.leaf_count())
+            .sum()
+    }
+
     pub fn column(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
     }

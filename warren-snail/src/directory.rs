@@ -6,7 +6,7 @@ use crate::file::{Extent, In, Out, Place, Reader};
 use crate::places::KeyValue;
 use crate::{Error, Result};
 
-/// What an entry keeps of one of its columns.
+/// What an entry keeps of one of the leaves its order holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Summary {
@@ -15,9 +15,9 @@ pub struct Summary {
     /// text, which keeps neither.
     pub min: i128,
     pub max: i128,
-    /// The disk pages the column takes under the entry, dictionaries among them.
+    /// The disk pages the leaf takes under the entry, dictionaries among them.
     pub pages: u32,
-    /// Whether the column is keyed in 128 bits, so that its least and greatest take 16 bytes each.
+    /// Whether the leaf is keyed in 128 bits, so that its least and greatest take 16 bytes each.
     pub wide: bool,
 }
 
@@ -44,7 +44,7 @@ pub struct Entry {
     /// The first and last row's key, one value a level.
     pub first: Vec<KeyValue>,
     pub last: Vec<KeyValue>,
-    /// One for each column the order holds, in its order.
+    /// One for each leaf the order holds, each column's in turn.
     pub columns: Vec<Summary>,
     /// The rows on each month, January first, for each of the order's month columns.
     pub months: Vec<[u32; 12]>,
@@ -59,18 +59,18 @@ pub struct Entry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Head {
-    /// The counting unit k of each column the order holds.
+    /// The counting unit k of each leaf the order holds.
     pub units: Vec<u32>,
-    /// Which of the held columns keep month counts, by their place among the held columns.
+    /// Which of the held leaves keep month counts, by their place among the held leaves.
     pub month_slots: Vec<u32>,
-    /// Which of the held columns are text, whose bytes each entry keeps.
+    /// Which of the held leaves are text, whose bytes each entry keeps.
     pub text_slots: Vec<u32>,
     /// For each level of the order, the sublevels it is cut on where it is text, `WIDE_LEVEL` where
     /// it is keyed in 128 bits, and 0 where it is a number.
     pub level_text: Vec<u32>,
     /// The levels of directory pages, the top among them: 1 where the top holds the blocks.
     pub height: u32,
-    /// Which of the held columns are keyed in 128 bits, by their place among the held columns.
+    /// Which of the held leaves are keyed in 128 bits, by their place among the held leaves.
     pub wide_slots: Vec<u32>,
 }
 
@@ -569,7 +569,7 @@ impl MapPages {
     }
 }
 
-/// A block's page map: where each of its columns' pages lie, and which of its rows are dead.
+/// A block's page map: where each of its leaves' pages lie, and which of its rows are dead.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PageMap {

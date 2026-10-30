@@ -1438,7 +1438,7 @@ impl Snail {
                         .collect();
                     let map = read_map(&self.reader, b, &head.level_text)?;
                     let (map_run, _) = b.map_run();
-                    for (s, &c) in order.columns.iter().enumerate() {
+                    for (s, (c, leaf)) in order.leaves(table).iter().enumerate() {
                         let cp = &map.columns[s];
                         out.push(BlockRow {
                             table: table.name.clone(),
@@ -1450,7 +1450,7 @@ impl Snail {
                             last: shown(&b.last),
                             rows: b.rows as u64,
                             map_pages: map_run.pages(),
-                            column: table.columns[c].name.clone(),
+                            column: leaf.name(&table.columns[*c].name),
                             k: head.units[s] as u64,
                             dictionary_pages: cp.dictionary.map_or(0, Extent::pages),
                             data_pages: cp.pages.len() as u64,

@@ -156,15 +156,27 @@ pub fn unsigned_of(key: i64, bits: u32) -> u64 {
 /// The value the file writes for a key of type `ty`: an unsigned number's own bits, any other key
 /// as it is.
 pub fn raw_of_key(ty: ColumnType, key: i64) -> i64 {
-    match ty.unsigned_bits() {
+    raw_of_bits(key, ty.unsigned_bits())
+}
+
+/// A key of type `ty`, from the value the file writes.
+pub fn key_of_raw(ty: ColumnType, raw: i64) -> i64 {
+    key_of_bits(raw, ty.unsigned_bits())
+}
+
+/// The value the file writes for the key of an unsigned number of `bits` bits, its own bits; for
+/// `bits` 0, any other key, as it is.
+pub(crate) fn raw_of_bits(key: i64, bits: u32) -> i64 {
+    match bits {
         0 => key,
         bits => unsigned_of(key, bits) as i64,
     }
 }
 
-/// A key of type `ty`, from the value the file writes.
-pub fn key_of_raw(ty: ColumnType, raw: i64) -> i64 {
-    match ty.unsigned_bits() {
+/// The key of an unsigned number of `bits` bits from the value the file writes; for `bits` 0, any
+/// other value, as it is.
+pub(crate) fn key_of_bits(raw: i64, bits: u32) -> i64 {
+    match bits {
         0 => raw,
         64 => unsigned_key(raw as u64, 64),
         bits => unsigned_key(raw as u64 & ((1u64 << bits) - 1), bits),

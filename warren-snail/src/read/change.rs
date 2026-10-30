@@ -14,7 +14,7 @@ use crate::directory::{
     build_from, decode_page, decode_top, encode_page, encode_top, map_child, maps_held, pack,
     read_map, Entry, Head, MapPages, PageEntry, PageMap, MAP_HEAD,
 };
-use crate::encode::{decode, descriptor, tail_pages};
+use crate::encode::{decode, tail_pages};
 use crate::file::{
     decode_free, decode_sequences, encode_free, encode_sequences, Extent, Place, Root, Run, Writer,
     FORMAT_SEVEN, STAGED,
@@ -29,7 +29,9 @@ pub(super) const ABORTED: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
 use crate::places::{key, month_utc, null_key, KeyValue};
 use crate::values::Values;
-use crate::write::{empty_head, head_of, laid_out, write_block, Laid, Rows};
+use crate::write::{
+    empty_head, head_of, laid_out, leaf_descriptors, write_block, Laid, Rows,
+};
 use crate::{Error, Result};
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int16Array,
@@ -164,6 +166,17 @@ fn push(v: &mut Values, d: &Datum) {
         (Values::Float8(x), Datum::Null) => x.push(None),
         _ => panic!("a value pushed onto a column of another kind"),
     }
+}
+
+/// A value of a column of type `ty` as each of its leaves holds it: the value itself where the
+/// column is one leaf.
+fn leaf_datums(ty: ColumnType, d: &Datum) -> Vec<Datum> {
+    if ty.leaf_count() == 1 {
+        return vec![d.clone()];
+    }
+    let mut v = Values::new(ty);
+    push(&mut v, d);
+    v.into_leaves(ty).iter().map(|l| datum_at(l, 0)).collect()
 }
 
 /// A row's key on an order.
@@ -1844,35 +1857,33 @@ impl Snail {
     ) -> Result<(Vec<Entry>, bool)> {
         let mut map = read_map(&self.reader, entry, &head.level_text)?;
         let positions = map.rows() as usize;
-        let descs = order
-            .columns
-            .iter()
-            .map(|&c| {
-                let col = &table.columns[c];
-                descriptor(&col.name, col.ty, !col.not_null)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Every column of the block, whole.
+        let leaves = order.leaves(table);
+        let descs = leaf_descriptors(table, order)?;
+        // Every column of the block, whole: each of its leaves decoded, and the column made of them.
         let mut columns = Vec::with_capacity(order.columns.len());
-        for (s, &c) in order.columns.iter().enumerate() {
-            let cp = &map.columns[s];
-            let dictionary = cp
-                .dictionary
-                .map(|d| self.reader.read_extent(d))
-                .transpose()?;
-            let pages = cp
-                .pages
-                .iter()
-                .map(|p| self.reader.read_extent(p.at))
-                .collect::<Result<Vec<_>>>()?;
-            let slices: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
-            columns.push(decode(
-                &descs[s],
-                table.columns[c].ty,
-                dictionary.as_deref(),
-                &slices,
-                positions,
-            )?);
+        for &c in &order.columns {
+            let mut parts = Vec::new();
+            for s in order.slots(table, c).unwrap() {
+                let cp = &map.columns[s];
+                let dictionary = cp
+                    .dictionary
+                    .map(|d| self.reader.read_extent(d))
+                    .transpose()?;
+                let pages = cp
+                    .pages
+                    .iter()
+                    .map(|p| self.reader.read_extent(p.at))
+                    .collect::<Result<Vec<_>>>()?;
+                let slices: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+                parts.push(decode(
+                    &descs[s],
+                    leaves[s].1.ty,
+                    dictionary.as_deref(),
+                    &slices,
+                    positions,
+                )?);
+            }
+            columns.push(Values::from_leaves(table.columns[c].ty, parts));
         }
         let mut dead: std::collections::BTreeSet<u32> = map.dead.iter().copied().collect();
         let types: Vec<ColumnType> = order.columns.iter().map(|&c| table.columns[c].ty).collect();
@@ -1972,9 +1983,20 @@ impl Snail {
                 })
                 .collect()
         };
+        // Each row added and each row gone, its values as the order's leaves hold them.
+        let in_leaves = |values: &[Datum]| -> Vec<Datum> {
+            order
+                .columns
+                .iter()
+                .zip(values)
+                .flat_map(|(&c, d)| leaf_datums(table.columns[c].ty, d))
+                .collect()
+        };
+        let added_leaves: Vec<Vec<Datum>> = added.iter().map(|(_, r)| in_leaves(r)).collect();
+        let gone_leaves: Vec<Vec<Datum>> = gone.iter().map(|(_, r)| in_leaves(r)).collect();
         if !added.is_empty() {
-            for (s, &c) in order.columns.iter().enumerate() {
-                let ty = table.columns[c].ty;
+            for (s, (_, leaf)) in leaves.iter().enumerate() {
+                let ty = leaf.ty;
                 let cp = &map.columns[s];
                 let last = cp
                     .pages
@@ -2002,7 +2024,7 @@ impl Snail {
                         push(&mut values, &datum_typed(&held, i, ty));
                     }
                 }
-                for (_, row) in &added {
+                for row in &added_leaves {
                     push(&mut values, &row[s]);
                 }
                 let base = if in_tail {
@@ -2051,10 +2073,10 @@ impl Snail {
                 entry.last = key.clone();
             }
         }
-        for s in 0..order.columns.len() {
+        for s in 0..leaves.len() {
             let sum = &mut entry.columns[s];
             let mut first_value = valueless[s];
-            for (_, row) in &added {
+            for row in &added_leaves {
                 if row[s] == Datum::Null {
                     sum.nulls += 1;
                 } else if let Some(v) = row[s].wide() {
@@ -2068,7 +2090,7 @@ impl Snail {
                     }
                 }
             }
-            for (_, values) in &gone {
+            for values in &gone_leaves {
                 if values[s] == Datum::Null {
                     sum.nulls -= 1;
                 }
@@ -2082,12 +2104,12 @@ impl Snail {
                     Datum::Int(v) => Some(month_utc(*v) as usize - 1),
                     _ => None,
                 };
-                for (_, row) in &added {
+                for row in &added_leaves {
                     if let Some(m) = month(&row[s]) {
                         entry.months[mi][m] += 1;
                     }
                 }
-                for (_, values) in &gone {
+                for values in &gone_leaves {
                     if let Some(m) = month(&values[s]) {
                         entry.months[mi][m] -= 1;
                     }
@@ -2099,10 +2121,10 @@ impl Snail {
                     Datum::Bytes(x) => x.len() as u32,
                     _ => 0,
                 };
-                for (_, row) in &added {
+                for row in &added_leaves {
                     entry.bytes[t] += bytes(&row[s]);
                 }
-                for (_, values) in &gone {
+                for values in &gone_leaves {
                     entry.bytes[t] -= bytes(&values[s]);
                 }
             }
@@ -2123,14 +2145,7 @@ impl Snail {
         let Laid {
             perm, keys, blocks, ..
         } = laid_out(table, order, rows, Some(&head.level_text))?;
-        let descs = order
-            .columns
-            .iter()
-            .map(|&c| {
-                let col = &table.columns[c];
-                descriptor(&col.name, col.ty, !col.not_null)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let descs = leaf_descriptors(table, order)?;
         let units: Vec<usize> = head.units.iter().map(|&k| k as usize).collect();
         let month_slots: Vec<usize> = head.month_slots.iter().map(|&s| s as usize).collect();
         let text_slots: Vec<usize> = head.text_slots.iter().map(|&s| s as usize).collect();

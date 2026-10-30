@@ -2,13 +2,13 @@
 //! each index, the blocks cut and encoded, every block's pages written, then the directory, then
 //! the root.
 
-use crate::catalog::{Catalog, Column, ColumnType, Order, Table};
+use crate::catalog::{Catalog, ColumnType, Order, Table};
 use crate::cut::{cut, largest_place, Block, Width, Widths};
 use crate::directory::{
     build, decode_top, encode_top, ColumnPages, Entry, Head, MapPages, PageEntry, PageMap, Summary,
     WIDE_LEVEL,
 };
-use crate::encode::{descriptor, disk_pages, encode, DataPage, Encoded, DICTIONARY_BYTES};
+use crate::encode::{disk_pages, encode, leaf_descriptor, DataPage, Encoded, DICTIONARY_BYTES};
 use crate::file::{
     encode_free, Extent, Place, Root, Run, Writer, FILE_PAGES, FORMAT_EIGHT, FORMAT_SEVEN,
 };
@@ -254,15 +254,16 @@ pub struct ColumnWritten {
 }
 
 /// A table's rows as a Parquet file holds them: each row group's first row and rows, and for each
-/// row group and each of the table's columns, the chunk's pages where they can come in as they lie.
+/// row group and each of the table's leaves, in its columns' order, the chunk's pages where they can
+/// come in as they lie.
 pub struct Source {
     pub groups: Vec<(usize, usize)>,
     pub chunks: Vec<Vec<Option<Encoded>>>,
 }
 
 /// The row groups of a Parquet file holding a table's rows, and the pages of each column chunk that
-/// can come in as they lie: uncompressed version 1 pages, plain or on a dictionary, each column of
-/// the table's own type.
+/// can come in as they lie: uncompressed version 1 pages, plain or on a dictionary, each leaf of its
+/// column's own type, found by its path.
 pub fn source(path: &Path, table: &Table) -> Result<Source> {
     use parquet::file::metadata::{ParquetMetaDataOptions, ParquetMetaDataReader};
     let file =
@@ -274,13 +275,21 @@ pub fn source(path: &Path, table: &Table) -> Result<Source> {
         ))
         .parse_and_finish(&file)?;
     let schema = meta.file_metadata().schema_descr();
-    let at: Vec<Option<usize>> = table
-        .columns
+    let leaves = table.leaves();
+    let at: Vec<Option<usize>> = leaves
         .iter()
-        .map(|c| {
-            (0..schema.num_columns()).find(|&i| schema.column(i).path().parts() == [c.name.clone()])
+        .map(|(c, leaf)| {
+            let path = leaf.path(&table.columns[*c].name);
+            (0..schema.num_columns()).find(|&i| schema.column(i).path().parts() == path)
         })
         .collect();
+    let ours = leaves
+        .iter()
+        .map(|(c, leaf)| {
+            let col = &table.columns[*c];
+            leaf_descriptor(&col.name, leaf, !col.not_null)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut groups = Vec::new();
     let mut chunks = Vec::new();
     let mut first = 0;
@@ -288,14 +297,14 @@ pub fn source(path: &Path, table: &Table) -> Result<Source> {
         let n = rg.num_rows() as usize;
         groups.push((first, n));
         first += n;
-        let mut row = Vec::with_capacity(table.columns.len());
-        for (c, col) in table.columns.iter().enumerate() {
+        let mut row = Vec::with_capacity(leaves.len());
+        for (l, desc) in ours.iter().enumerate() {
             let offsets = meta
                 .offset_index()
                 .and_then(|o| o.get(g))
-                .and_then(|o| at[c].and_then(|i| o.get(i)));
-            row.push(match (at[c], offsets) {
-                (Some(i), Some(o)) => movable(&file, rg.column(i), o, col, n)?,
+                .and_then(|o| at[l].and_then(|i| o.get(i)));
+            row.push(match (at[l], offsets) {
+                (Some(i), Some(o)) => movable(&file, rg.column(i), o, desc, n)?,
                 _ => None,
             });
         }
@@ -346,17 +355,17 @@ pub fn parquet_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files.into_iter().map(|(_, p)| p).collect())
 }
 
-/// A column chunk's pages, where they can come in as they lie.
+/// A column chunk's pages, where they can come in as they lie: the chunk of a leaf the snail
+/// describes as `ours`.
 fn movable(
     file: &std::fs::File,
     chunk: &parquet::file::metadata::ColumnChunkMetaData,
     offsets: &parquet::file::page_index::offset_index::OffsetIndexMetaData,
-    col: &Column,
+    ours: &parquet::schema::types::ColumnDescPtr,
     rows: usize,
 ) -> Result<Option<Encoded>> {
     use parquet::basic::{Compression, Encoding, PageType};
     use std::os::unix::fs::FileExt;
-    let ours = descriptor(&col.name, col.ty, !col.not_null)?;
     let pages_held = chunk.page_encoding_stats().is_some_and(|s| {
         s.iter().all(|p| {
             matches!(
@@ -740,35 +749,13 @@ pub(crate) fn laid_out(
         data: perm.iter().flat_map(|&r| row(r).iter().cloned()).collect(),
     };
     let sublevels = Sublevels::new(order, table, &text_sublevels);
-    let widths = Widths(
-        order
-            .columns
-            .iter()
-            .map(|&c| {
-                let ty = table.columns[c].ty;
-                let values = &rows.columns[c];
-                let summed = |each: &dyn Fn(usize) -> u64| {
-                    let mut sum = Vec::with_capacity(n + 1);
-                    sum.push(0u64);
-                    for &r in &perm {
-                        sum.push(sum.last().unwrap() + each(r));
-                    }
-                    sum
-                };
-                if let Some(bits) = ty.thin_bits() {
-                    return Width::Bits(summed(&|r| if values.is_null(r) { 0 } else { bits }));
-                }
-                match (ty.width(), values.nulls() > 0) {
-                    (Some(wd), false) => Width::Fixed(wd),
-                    (None, false) => Width::Varying(summed(&|r| values.plain(r, ty))),
-                    (_, true) => Width::Nulls {
-                        bytes: summed(&|r| values.plain(r, ty)),
-                        nulls: summed(&|r| values.is_null(r) as u64),
-                    },
-                }
-            })
-            .collect(),
-    );
+    let mut widths = Widths(Vec::new());
+    for &c in &order.columns {
+        let ty = table.columns[c].ty;
+        for (leaf, values) in ty.leaves().iter().zip(leaf_values(ty, &rows.columns[c])) {
+            widths.0.push(width(leaf.ty, &values, &perm));
+        }
+    }
     let blocks = cut(&keys, &sublevels, &widths);
     Ok(Laid {
         perm,
@@ -777,6 +764,43 @@ pub(crate) fn laid_out(
         widths,
         blocks,
     })
+}
+
+/// A column's values as each of its leaves holds them: the column's own where it is one leaf.
+pub(crate) fn leaf_values(ty: ColumnType, values: &Values) -> Vec<std::borrow::Cow<'_, Values>> {
+    if ty.leaf_count() == 1 {
+        vec![std::borrow::Cow::Borrowed(values)]
+    } else {
+        values
+            .clone()
+            .into_leaves(ty)
+            .into_iter()
+            .map(std::borrow::Cow::Owned)
+            .collect()
+    }
+}
+
+/// What a leaf held as `ty` takes written plain, its rows in the order `perm` lays them.
+fn width(ty: ColumnType, values: &Values, perm: &[usize]) -> Width {
+    let summed = |each: &dyn Fn(usize) -> u64| {
+        let mut sum = Vec::with_capacity(perm.len() + 1);
+        sum.push(0u64);
+        for &r in perm {
+            sum.push(sum.last().unwrap() + each(r));
+        }
+        sum
+    };
+    if let Some(bits) = ty.thin_bits() {
+        return Width::Bits(summed(&|r| if values.is_null(r) { 0 } else { bits }));
+    }
+    match (ty.width(), values.nulls() > 0) {
+        (Some(wd), false) => Width::Fixed(wd),
+        (None, false) => Width::Varying(summed(&|r| values.plain(r, ty))),
+        (_, true) => Width::Nulls {
+            bytes: summed(&|r| values.plain(r, ty)),
+            nulls: summed(&|r| values.is_null(r) as u64),
+        },
+    }
 }
 
 /// What each level of an order holds before any row is laid on it: a text level cut on one
@@ -796,31 +820,38 @@ pub(crate) fn level_kinds(table: &Table, order: &Order) -> Vec<u32> {
         .collect()
 }
 
-/// The columns an order holds keyed in 128 bits, by their slots.
+/// The leaves an order holds keyed in 128 bits, by their slots.
 pub(crate) fn wide_slots(table: &Table, order: &Order) -> Vec<u32> {
-    (0..order.columns.len())
-        .filter(|&s| table.columns[order.columns[s]].ty.is_wide())
-        .map(|s| s as u32)
+    order
+        .leaves(table)
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, leaf))| leaf.ty.is_wide())
+        .map(|(s, _)| s as u32)
         .collect()
 }
 
-/// The month and text columns an order holds, by their slots.
-fn slots(table: &Table, order: &Order) -> (Vec<u32>, Vec<u32>) {
+/// The month and text leaves an order holds, by their slots: a month column's one leaf, and each
+/// leaf of text or bytes.
+pub(crate) fn slots(table: &Table, order: &Order) -> (Vec<u32>, Vec<u32>) {
     let months = table
         .month_columns()
         .into_iter()
-        .filter_map(|c| order.slot(c))
+        .filter_map(|c| order.leaf_slot(table, c))
         .map(|s| s as u32)
         .collect();
-    let texts = (0..order.columns.len())
-        .filter(|&s| table.columns[order.columns[s]].ty.is_byte_array())
-        .map(|s| s as u32)
+    let texts = order
+        .leaves(table)
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, leaf))| leaf.ty.is_byte_array())
+        .map(|(s, _)| s as u32)
         .collect();
     (months, texts)
 }
 
-/// The head of an order's directory for `n` rows laid out on it: each column's unit from its
-/// furthest-out place, the month and text columns, and each text level's sublevels.
+/// The head of an order's directory for `n` rows laid out on it: each leaf's unit from its
+/// furthest-out place, the month and text leaves, and each text level's sublevels.
 pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> Head {
     let most = largest_place(&laid.keys, &laid.blocks, order, table, &laid.widths);
     let (month_slots, text_slots) = slots(table, order);
@@ -841,7 +872,7 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> He
 pub(crate) fn empty_head(table: &Table, order: &Order) -> Head {
     let (month_slots, text_slots) = slots(table, order);
     Head {
-        units: vec![1; order.columns.len()],
+        units: vec![1; order.leaves(table).len()],
         month_slots,
         text_slots,
         level_text: level_kinds(table, order),
@@ -850,24 +881,31 @@ pub(crate) fn empty_head(table: &Table, order: &Order) -> Head {
     }
 }
 
-/// An order that holds no row yet: its top alone.
-fn empty_order(w: &mut dyn Place, table: &Table, order: &Order) -> Result<(Extent, Written)> {
-    let head = empty_head(table, order);
-    let top = w.place(&encode_top(&head, &[]))?;
-    let columns = order
-        .columns
+/// What a write says of each leaf an order holds, before its blocks are written: its name and its
+/// unit.
+fn leaves_written(table: &Table, order: &Order, units: &[usize]) -> Vec<ColumnWritten> {
+    order
+        .leaves(table)
         .iter()
-        .zip(&head.units)
-        .map(|(&c, &k)| ColumnWritten {
-            name: table.columns[c].name.clone(),
-            k: k as usize,
+        .zip(units)
+        .map(|((c, leaf), &k)| ColumnWritten {
+            name: leaf.name(&table.columns[*c].name),
+            k,
             dictionary_blocks: 0,
             data_pages: 0,
             disk_pages: 0,
             moved_blocks: 0,
-            bytes: table.columns[c].ty.is_byte_array().then_some(0),
+            bytes: leaf.ty.is_byte_array().then_some(0),
         })
-        .collect();
+        .collect()
+}
+
+/// An order that holds no row yet: its top alone.
+fn empty_order(w: &mut dyn Place, table: &Table, order: &Order) -> Result<(Extent, Written)> {
+    let head = empty_head(table, order);
+    let top = w.place(&encode_top(&head, &[]))?;
+    let units: Vec<usize> = head.units.iter().map(|&k| k as usize).collect();
+    let columns = leaves_written(table, order, &units);
     Ok((
         top,
         Written {
@@ -881,6 +919,21 @@ fn empty_order(w: &mut dyn Place, table: &Table, order: &Order) -> Result<(Exten
             columns,
         },
     ))
+}
+
+/// The descriptor of each leaf an order holds, by its slot.
+pub(crate) fn leaf_descriptors(
+    table: &Table,
+    order: &Order,
+) -> Result<Vec<parquet::schema::types::ColumnDescPtr>> {
+    order
+        .leaves(table)
+        .iter()
+        .map(|(c, leaf)| {
+            let col = &table.columns[*c];
+            leaf_descriptor(&col.name, leaf, !col.not_null)
+        })
+        .collect()
 }
 
 fn write_order(
@@ -903,41 +956,25 @@ fn write_order(
     let units: Vec<usize> = (0..widths.0.len())
         .map(|s| widths.unit(s, most[s], n))
         .collect();
-    let descs = order
-        .columns
-        .iter()
-        .map(|&c| {
-            let col = &table.columns[c];
-            descriptor(&col.name, col.ty, !col.not_null)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let month_slots: Vec<usize> = table
-        .month_columns()
-        .into_iter()
-        .filter_map(|c| order.slot(c))
-        .collect();
-    let text_slots: Vec<usize> = (0..order.columns.len())
-        .filter(|&s| table.columns[order.columns[s]].ty.is_byte_array())
-        .collect();
+    let descs = leaf_descriptors(table, order)?;
+    let (month_slots, text_slots) = slots(table, order);
+    let month_slots: Vec<usize> = month_slots.into_iter().map(|s| s as usize).collect();
+    let text_slots: Vec<usize> = text_slots.into_iter().map(|s| s as usize).collect();
 
     let mut entries = Vec::with_capacity(blocks.len());
-    let mut columns: Vec<ColumnWritten> = order
-        .columns
-        .iter()
-        .zip(&units)
-        .map(|(&c, &k)| ColumnWritten {
-            name: table.columns[c].name.clone(),
-            k,
-            dictionary_blocks: 0,
-            data_pages: 0,
-            disk_pages: 0,
-            moved_blocks: 0,
-            bytes: table.columns[c].ty.is_byte_array().then_some(0),
-        })
-        .collect();
+    let mut columns = leaves_written(table, order, &units);
     let mut maps = MapPages::new(packed);
     // The rows came in the order's order, so a row group can be one of its blocks.
     let in_order = source.filter(|_| perm.iter().enumerate().all(|(i, &p)| i == p));
+    // Where each leaf the order holds lies among the table's, as a source's chunks lie.
+    let at: Vec<usize> = order
+        .columns
+        .iter()
+        .flat_map(|&c| {
+            let first = table.first_leaf(c);
+            first..first + table.columns[c].ty.leaf_count()
+        })
+        .collect();
     for b in &blocks {
         let given: Vec<Option<Encoded>> = match in_order.and_then(|s| {
             s.groups
@@ -945,12 +982,11 @@ fn write_order(
                 .position(|&(first, n)| first == b.start && n == b.rows())
                 .map(|g| &s.chunks[g])
         }) {
-            Some(chunks) => order
-                .columns
+            Some(chunks) => at
                 .iter()
                 .enumerate()
-                .map(|(s, &c)| {
-                    chunks[c]
+                .map(|(s, &l)| {
+                    chunks[l]
                         .as_ref()
                         .filter(|e| {
                             e.dictionary
@@ -1035,13 +1071,19 @@ pub(crate) fn write_block(
     given: &[Option<Encoded>],
     maps: &mut MapPages,
 ) -> Result<(Entry, Vec<Encoded>, Vec<bool>)> {
-    let mut summaries = Vec::with_capacity(order.columns.len());
-    let mut encoded = Vec::with_capacity(order.columns.len());
-    let mut moved = Vec::with_capacity(order.columns.len());
+    let leaves = order.leaves(table);
+    let mut summaries = Vec::with_capacity(leaves.len());
+    let mut encoded = Vec::with_capacity(leaves.len());
+    let mut moved = Vec::with_capacity(leaves.len());
     let mut months = vec![[0u32; 12]; month_slots.len()];
     let mut bytes = vec![0u32; text_slots.len()];
-    for (s, &c) in order.columns.iter().enumerate() {
-        let values = rows.columns[c].gather(&perm[b.start..b.end]);
+    let block_leaves = order.columns.iter().flat_map(|&c| {
+        let ty = table.columns[c].ty;
+        rows.columns[c]
+            .gather(&perm[b.start..b.end])
+            .into_leaves(ty)
+    });
+    for (s, ((_, leaf), values)) in leaves.iter().zip(block_leaves).enumerate() {
         let present: Vec<i64> = values
             .ints()
             .map_or(Vec::new(), |v| v.iter().flatten().copied().collect());
@@ -1051,7 +1093,7 @@ pub(crate) fn write_block(
             min: keyed.iter().copied().min().unwrap_or(0),
             max: keyed.iter().copied().max().unwrap_or(0),
             pages: 0,
-            wide: table.columns[c].ty.is_wide(),
+            wide: leaf.ty.is_wide(),
         });
         if let Some(m) = month_slots.iter().position(|&x| x == s) {
             for &v in &present {
@@ -1066,9 +1108,9 @@ pub(crate) fn write_block(
                 ))
             })?;
         }
-        // A column given as a file's pages comes in as they lie where the counts would choose its
+        // A leaf given as a file's pages comes in as they lie where the counts would choose its
         // encoding, a dictionary or none; otherwise it is encoded afresh.
-        let fresh = encode(&descs[s], table.columns[c].ty, &values, units[s])?;
+        let fresh = encode(&descs[s], leaf.ty, &values, units[s])?;
         match given.get(s).and_then(Option::as_ref) {
             Some(e) if e.dictionary.is_some() == fresh.dictionary.is_some() => {
                 encoded.push(e.clone());

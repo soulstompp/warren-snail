@@ -1,4 +1,4 @@
-//! The block cut, and each column's counting unit.
+//! The block cut, and each leaf's counting unit.
 
 use crate::catalog::{Order, Table};
 use crate::places::{by_equality, Keys, Sublevels};
@@ -26,7 +26,7 @@ impl Block {
     }
 }
 
-/// What one column of an order takes written plain: the same bytes every row, or each row's bytes
+/// What one leaf an order holds takes written plain: the same bytes every row, or each row's bytes
 /// summed from the order's first row, so that `sum[b] - sum[a]` is what rows `a..b` take.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -45,7 +45,7 @@ pub enum Width {
     },
 }
 
-/// Each column an order holds, as it is written plain.
+/// Each leaf an order holds, as it is written plain.
 #[derive(Clone, Debug)]
 pub struct Widths(pub Vec<Width>);
 

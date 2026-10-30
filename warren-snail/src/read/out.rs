@@ -2,13 +2,13 @@
 //! order in order, each block's pages copied as they lie and the footer written beside them.
 
 use super::{Snail, Wasted};
-use crate::catalog::{ColumnType, Level, Table};
+use crate::catalog::{ColumnType, Leaf, Level, Table};
 use crate::directory::{decode_page, read_map, ColumnPages, Entry, Head, PageMap};
-use crate::encode::{decode, descriptor};
+use crate::encode::{decode, leaf_descriptor};
 use crate::values::Values;
 use crate::{Error, Result};
 use bytes::Bytes;
-use parquet::basic::{Compression, Encoding, PageType, Type as PhysicalType};
+use parquet::basic::{Compression, Encoding, PageType, Repetition, Type as PhysicalType};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::data_type::{ByteArray, FixedLenByteArray};
 use parquet::file::metadata::{
@@ -63,10 +63,12 @@ impl Extreme {
     }
 }
 
-/// The least and greatest of rows `from..to` present, and the rows NULL among them.
+/// The least and greatest of rows `from..to` present, and the rows NULL among them, in a leaf held
+/// as `ty`, an unsigned number of `bits` bits where it holds one.
 fn extremes(
     values: &Values,
     ty: ColumnType,
+    bits: u32,
     from: usize,
     to: usize,
 ) -> (Option<(Extreme, Extreme)>, u64) {
@@ -95,7 +97,7 @@ fn extremes(
         Extreme::Int(k) if ty.fixed_bytes().is_some() => {
             Extreme::Bytes(crate::scalars::fixed_of_key(ty, k))
         }
-        Extreme::Int(k) => Extreme::Int(crate::scalars::raw_of_key(ty, k)),
+        Extreme::Int(k) => Extreme::Int(crate::scalars::raw_of_bits(k, bits)),
         other => other,
     };
     (out.map(|(lo, hi)| (raw(lo), raw(hi))), nulls)
@@ -213,30 +215,65 @@ impl Snail {
         let stored: Vec<usize> = (0..table.columns.len())
             .filter(|&c| !table.columns[c].is_virtual())
             .collect();
-        let descs = stored
-            .iter()
-            .map(|&c| {
-                let c = &table.columns[c];
-                descriptor(&c.name, c.ty, !c.not_null)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Each stored column's leaves, each with its column, its descriptor and its slot in the order.
+        let mut leaves = Vec::new();
+        let mut fields = Vec::with_capacity(stored.len());
+        for &c in &stored {
+            let col = &table.columns[c];
+            let slots = order.slots(table, c).ok_or_else(|| {
+                Error::new(format!(
+                    "{}.{} is not held by {}",
+                    table.name, col.name, order.name
+                ))
+            })?;
+            let mut types = Vec::new();
+            for (leaf, s) in col.ty.leaves().into_iter().zip(slots) {
+                let desc = leaf_descriptor(&col.name, &leaf, !col.not_null)?;
+                types.push(desc.self_type_ptr());
+                leaves.push((c, leaf, desc, s));
+            }
+            // A column of one leaf is that leaf; a column of more is a group of them, which holds
+            // the column's NULLs.
+            fields.push(match types.as_slice() {
+                [one] => one.clone(),
+                _ => Arc::new(
+                    Type::group_type_builder(&col.name)
+                        .with_repetition(if col.not_null {
+                            Repetition::REQUIRED
+                        } else {
+                            Repetition::OPTIONAL
+                        })
+                        .with_fields(types)
+                        .build()?,
+                ),
+            });
+        }
         let schema = Arc::new(
             Type::group_type_builder("schema")
-                .with_fields(descs.iter().map(|d| d.self_type_ptr()).collect())
+                .with_fields(fields)
                 .build()?,
         );
+        // Each level of the order sorts on its column's leaves, each as its index among the file's.
         let sorting = order
             .levels
             .iter()
             .map(|l| match l {
-                Level::Column(c) => Some(SortingColumn {
-                    column_idx: stored.iter().position(|x| x == c)? as i32,
-                    descending: false,
-                    nulls_first: false,
-                }),
+                Level::Column(c) => Some(
+                    leaves
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| x.0 == *c)
+                        .map(|(i, _)| SortingColumn {
+                            column_idx: i as i32,
+                            descending: false,
+                            nulls_first: false,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 Level::MonthUtc(_) => None,
             })
-            .collect::<Option<Vec<_>>>();
+            .collect::<Option<Vec<_>>>()
+            .map(|levels| levels.concat());
         let props = WriterProperties::builder()
             .set_writer_version(WriterVersion::PARQUET_1_0)
             .set_compression(Compression::UNCOMPRESSED)
@@ -312,17 +349,10 @@ impl Snail {
             in_file += b;
             let n = map.rows() as usize;
             let mut rg = w.next_row_group()?;
-            for (k, &c) in stored.iter().enumerate() {
-                let col = &table.columns[c];
-                let s = order.slot(c).ok_or_else(|| {
-                    Error::new(format!(
-                        "{}.{} is not held by {}",
-                        table.name, col.name, order.name
-                    ))
-                })?;
-                let cp = &map.columns[s];
+            for (_, leaf, desc, s) in &leaves {
+                let cp = &map.columns[*s];
                 pages += cp.pages.len() as u64 + cp.dictionary.is_some() as u64;
-                let (chunk, close) = self.chunk(&descs[k], col.ty, cp, n)?;
+                let (chunk, close) = self.chunk(desc, leaf, cp, n)?;
                 rg.append_column(&Bytes::from(chunk), close)?;
             }
             rg.close()?;
@@ -340,15 +370,16 @@ impl Snail {
         })
     }
 
-    /// One block's column as a Parquet column chunk: its pages as they lie, one after another, and
+    /// One block's leaf as a Parquet column chunk: its pages as they lie, one after another, and
     /// what the footer says of them.
     fn chunk(
         &self,
         desc: &ColumnDescPtr,
-        ty: ColumnType,
+        leaf: &Leaf,
         cp: &ColumnPages,
         rows: usize,
     ) -> Result<(Vec<u8>, ColumnCloseResult)> {
+        let ty = leaf.ty;
         let dictionary = cp
             .dictionary
             .map(|d| self.reader.read_extent(d))
@@ -379,7 +410,7 @@ impl Snail {
         let mut whole: Option<(Extreme, Extreme)> = None;
         let mut nulls = 0;
         for &(_, _, first, n) in &spans {
-            let (range, page_nulls) = extremes(&values, ty, first, first + n);
+            let (range, page_nulls) = extremes(&values, ty, leaf.bits, first, first + n);
             nulls += page_nulls;
             match &range {
                 Some((lo, hi)) => index.append(
