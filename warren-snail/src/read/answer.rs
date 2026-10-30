@@ -168,13 +168,13 @@ fn numeric_output(item: &Item, tables: &[&Table]) -> Option<(ColumnType, bool)> 
 /// key, and written out as its own text.
 #[derive(Clone, Debug)]
 pub struct Classed {
-    pub key: Text,
+    pub class: Text,
     pub image: Text,
 }
 
 impl PartialEq for Classed {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
+        self.class == other.class
     }
 }
 
@@ -182,7 +182,7 @@ impl Eq for Classed {}
 
 impl std::hash::Hash for Classed {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.key.hash(state)
+        self.class.hash(state)
     }
 }
 
@@ -194,7 +194,7 @@ impl PartialOrd for Classed {
 
 impl Ord for Classed {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
+        self.class.cmp(&other.class)
     }
 }
 
@@ -302,7 +302,7 @@ impl Cell {
     pub fn classed(image: ByteArray) -> Cell {
         let key = crate::numeric::class_of_text(std::str::from_utf8(image.data()).unwrap_or(""));
         Cell::Classed(Classed {
-            key: Text(ByteArray::from(key.as_str())),
+            class: Text(ByteArray::from(key.as_str())),
             image: Text(image),
         })
     }
@@ -310,7 +310,7 @@ impl Cell {
     /// A numeric, kept beside its class.
     pub fn of_numeric(n: &crate::numeric::Numeric) -> Cell {
         Cell::Classed(Classed {
-            key: Text(ByteArray::from(n.class_key().as_str())),
+            class: Text(ByteArray::from(n.class_key().as_str())),
             image: Text(ByteArray::from(n.to_string().as_str())),
         })
     }
@@ -1151,12 +1151,6 @@ impl Answer {
                                 _ => None,
                             }),
                         ),
-                        ColumnType::Numeric { precision, scale } => Arc::new(
-                            ints()
-                                .map(|v| v.map(i128::from))
-                                .collect::<Decimal128Array>()
-                                .with_precision_and_scale(precision, scale as i8)?,
-                        ),
                         ColumnType::Uuid => {
                             Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(
                                 rows.iter().map(|r| match &r[i] {
@@ -1208,15 +1202,6 @@ impl Answer {
                             floats()
                                 .map(|b| b.map(f64::from_bits))
                                 .collect::<Float64Array>(),
-                        ),
-                    ),
-                    ColumnType::Numeric { scale, .. } => (
-                        true,
-                        Arc::new(
-                            ints()
-                                .map(|v| v.map(i128::from))
-                                .collect::<Decimal128Array>()
-                                .with_precision_and_scale(38, scale as i8)?,
                         ),
                     ),
                     _ => (true, Arc::new(ints().collect::<Int64Array>())),

@@ -1365,8 +1365,8 @@ fn unbounded(ty: ColumnType) -> ColumnType {
     }
 }
 
-/// Two values compared, a quoted literal beside a boolean or a uuid read as one, as PostgreSQL gives
-/// its unknown type the other side's.
+/// Two values compared, a quoted literal beside a boolean, a uuid or a numeric read as one, as
+/// PostgreSQL gives its unknown type the other side's.
 fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value)> {
     let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_)));
     Ok(match (&x, &y) {
@@ -1381,6 +1381,14 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
         }
         (Value::Text(t), Value::Uuid(_)) if quoted(left) => {
             (Value::Uuid(crate::scalars::uuid_parse(t)?), y)
+        }
+        // A quoted literal beside a numeric is read as numeric_in reads it.
+        (Value::Num(..) | Value::Numeric(_), Value::Text(t)) if quoted(right) => {
+            let t = Value::of_numeric(Numeric::parse(t)?);
+            (x, t)
+        }
+        (Value::Text(t), Value::Num(..) | Value::Numeric(_)) if quoted(left) => {
+            (Value::of_numeric(Numeric::parse(t)?), y)
         }
         (Value::Real(_) | Value::Double(_), Value::Text(t)) if quoted(right) => {
             let t = float_cast(Value::Text(t.clone()), matches!(x, Value::Double(_)))?;
@@ -2989,19 +2997,19 @@ pub fn batch_of(rel: &Relation) -> Result<arrow::array::RecordBatch> {
             fields.push(crate::scalars::scalar_field(name, ty, true));
             continue;
         }
-        // A numeric column holding a value no Decimal128 of 38 digits holds at its scale is written
-        // as each value's text, named a numeric.
-        let past = |s: u32| {
+        // A numeric column whose values print at more than one scale, or one holding a value no
+        // Decimal128 of 38 digits holds, is written as each value's text, named a numeric.
+        let texted = |s: u32| {
             col().any(|v| match v {
                 Value::Numeric(_) => true,
-                Value::Num(m, from) => Value::at_scale_checked(*m, *from, s)
-                    .is_none_or(|x| x.unsigned_abs() >= 10u128.pow(38)),
+                Value::Int(x) => s > 0 || x.unsigned_abs() >= 10u64.pow(18),
+                Value::Num(m, from) => *from != s || m.unsigned_abs() >= 10u128.pow(38),
                 _ => false,
             })
         };
         if matches!(first, Some(Value::Numeric(_)))
             || (matches!(first, Some(Value::Int(_) | Value::Num(..)))
-                && (scale.is_some_and(past) || col().any(|v| matches!(v, Value::Numeric(_)))))
+                && (scale.is_some_and(texted) || col().any(|v| matches!(v, Value::Numeric(_)))))
         {
             arrays.push(Arc::new(col().map(|v| v.text()).collect::<StringArray>()));
             fields.push(crate::numeric::text_field(name, true));
