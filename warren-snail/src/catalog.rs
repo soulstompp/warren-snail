@@ -100,7 +100,7 @@ impl ColumnType {
         match self {
             ColumnType::Oid | ColumnType::Reg(..) | ColumnType::Xid | ColumnType::Cid => 32,
             ColumnType::Xid8 | ColumnType::PgLsn | ColumnType::Macaddr8 | ColumnType::Oid8 => 64,
-            ColumnType::Macaddr | ColumnType::Tid => 48,
+            ColumnType::Macaddr => 48,
             ColumnType::Char => 8,
             _ => 0,
         }

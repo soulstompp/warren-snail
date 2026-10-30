@@ -92,19 +92,46 @@ fn a_tid_is_held_as_two_leaves_its_block_then_its_offset() {
     }
 }
 
+/// A table clustered on its tid, NULL on some rows, a column after it.
+const OUT_DDL: &str =
+    "CREATE TABLE s.t (id integer NOT NULL, v tid, w integer NOT NULL, PRIMARY KEY (id)); \
+                       CREATE INDEX t_v ON s.t (v, id); \
+                       ALTER TABLE s.t CLUSTER ON t_v;";
+
+/// Each row of an answer reading id, v and w, by id.
+fn by_id(batches: &[RecordBatch]) -> Vec<(i64, Option<String>, i64)> {
+    let mut rows: Vec<(i64, Option<String>, i64)> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = ints64(b.column(0).as_ref());
+            let ws = ints64(b.column(2).as_ref());
+            ids.into_iter()
+                .zip(tids(b, 1))
+                .zip(ws)
+                .map(|((i, v), w)| (i.unwrap(), v, w.unwrap()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 #[test]
 fn a_tid_goes_out_as_a_group_of_its_leaves_sorted_on_both_and_comes_back_by_their_pages() {
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::file::statistics::Statistics;
+    let n = 3000;
     let path = snail_of(
         "tid-out",
-        "CREATE TABLE s.t (id integer NOT NULL, v tid NOT NULL, PRIMARY KEY (v));",
+        OUT_DDL,
         vec![
-            Values::Int((0..3000).map(Some).collect()),
+            Values::Int((0..n).map(Some).collect()),
             Values::Int(
-                (0..3000)
-                    .map(|i| Some(tid_key(i / 7, (i % 7) as u16)))
+                (0..n)
+                    .map(|i| (i % 1000 != 999).then(|| tid_key((i / 7) as u32, (i % 7) as u16)))
                     .collect(),
             ),
+            Values::Int((0..n).map(|i| Some(i * 3)).collect()),
         ],
     );
     let dir = tmp("tid-out-parquet");
@@ -117,26 +144,44 @@ fn a_tid_goes_out_as_a_group_of_its_leaves_sorted_on_both_and_comes_back_by_thei
     let paths: Vec<String> = (0..schema.num_columns())
         .map(|i| schema.column(i).path().string())
         .collect();
-    assert_eq!(paths, ["id", "v.block", "v.offset"]);
-    // The table's order, v, sorts on its block, then its offset.
+    assert_eq!(paths, ["id", "v.block", "v.offset", "w"]);
     for g in 0..reader.metadata().num_row_groups() {
-        let sorting = reader.metadata().row_group(g).sorting_columns().unwrap();
-        let on: Vec<i32> = sorting.iter().map(|s| s.column_idx).collect();
-        assert_eq!(on, [1, 2]);
+        let rg = reader.metadata().row_group(g);
+        // The table's order, (v, id), sorts on v's block, then its offset, then id.
+        let on: Vec<i32> = rg
+            .sorting_columns()
+            .unwrap()
+            .iter()
+            .map(|s| s.column_idx)
+            .collect();
+        assert_eq!(on, [1, 2, 0]);
+        // The offset's statistics are its own 16-bit numbers.
+        if let Some(Statistics::Int32(s)) = rg.column(2).statistics() {
+            if s.min_opt().is_some() {
+                assert_eq!(
+                    (s.min_opt(), s.max_opt()),
+                    (Some(&0), Some(&6)),
+                    "row group {g}"
+                );
+            }
+        } else {
+            panic!("row group {g}: no statistics of v.offset");
+        }
     }
-    // arrow reads the group as a struct of an unsigned 32-bit block and an unsigned 16-bit offset.
+    // arrow reads the group as a struct, NULL where the tid is, of an unsigned 32-bit block and an
+    // unsigned 16-bit offset.
     let (batches, groups) = parquet_of(file);
     let v = batches[0].schema().field_with_name("v").unwrap().clone();
     assert_eq!(
         v.data_type().to_string(),
         "Struct(\"block\": non-null UInt32, \"offset\": non-null UInt16)"
     );
-    let back_rows: Vec<Option<String>> = batches.iter().flat_map(|b| tids(b, 1)).collect();
-    assert_eq!(back_rows[8], Some("(1,1)".into()));
+    assert!(v.is_nullable());
+    let read = by_id(&batches);
+    assert_eq!(read[8], (8, Some("(1,1)".into()), 24));
+    assert_eq!(read[999], (999, None, 2997));
     // Written back, each leaf comes in by its pages.
-    let catalog =
-        Catalog::parse("CREATE TABLE s.t (id integer NOT NULL, v tid NOT NULL, PRIMARY KEY (v));")
-            .unwrap();
+    let catalog = Catalog::parse(OUT_DDL).unwrap();
     let table = catalog.table("s.t").unwrap();
     let rows = Rows::from_batches(table, &batches).unwrap();
     let given = warren_snail::write::source(file, table).unwrap();
@@ -149,22 +194,27 @@ fn a_tid_goes_out_as_a_group_of_its_leaves_sorted_on_both_and_comes_back_by_thei
         weather::span(),
     )
     .unwrap();
-    let pkey = written.iter().find(|w| w.order == "t_pkey").unwrap();
-    assert_eq!(pkey.blocks, groups);
-    let leaves: Vec<(&str, usize)> = pkey
+    let order = written.iter().find(|w| w.order == "t_v").unwrap();
+    assert_eq!(order.blocks, groups);
+    let leaves: Vec<(&str, usize)> = order
         .columns
         .iter()
         .map(|c| (c.name.as_str(), c.moved_blocks))
         .collect();
     assert_eq!(
         leaves,
-        [("id", groups), ("v.block", groups), ("v.offset", groups)]
+        [
+            ("id", groups),
+            ("v.block", groups),
+            ("v.offset", groups),
+            ("w", groups)
+        ]
     );
     let (b, _) = Snail::open(&back)
         .unwrap()
-        .ask("SELECT t.v FROM s.t t WHERE t.id = 8", None)
+        .ask("SELECT t.id, t.v, t.w FROM s.t t ORDER BY t.id", None)
         .unwrap();
-    assert_eq!(tids(&b, 0), [Some("(1,1)".into())]);
+    assert_eq!(by_id(&[b]), read);
 }
 
 #[test]
@@ -419,6 +469,28 @@ fn a_tid_written_into_a_block_goes_into_each_leaf_s_tail_and_is_pruned_back_in_o
         let r = of(&blocks, "t_pkey", leaf);
         assert_eq!((r[0].dead_marked, r[0].data_pages), (0, 1), "{leaf}");
     }
+    // A tid is assigned to a tid and to text, and text never to a tid.
+    w.execute("CREATE TABLE s.u (id integer NOT NULL, v tid, x text, PRIMARY KEY (id))")
+        .unwrap();
+    w.execute("CREATE TABLE s.w (id integer NOT NULL, v tid, PRIMARY KEY (id))")
+        .unwrap();
+    w.execute("INSERT INTO s.u (id, v, x) SELECT t.id, t.v, t.v FROM s.t t")
+        .unwrap();
+    let (b, _) = w
+        .ask("SELECT u.id, u.v, u.x FROM s.u u WHERE u.id = 8", None)
+        .unwrap();
+    assert_eq!(
+        (tids(&b, 1), weather::texts(b.column(2).as_ref())),
+        (
+            vec![Some("(2147483648,1)".into())],
+            vec![Some("(2147483648,1)".into())]
+        )
+    );
+    assert!(w
+        .execute("INSERT INTO s.w (id, v) SELECT u.id, u.x FROM s.u u")
+        .unwrap_err()
+        .to_string()
+        .contains("is of type tid but expression is of type text"));
     drop(w);
     check(&mut Snail::open(&path).unwrap());
 }
