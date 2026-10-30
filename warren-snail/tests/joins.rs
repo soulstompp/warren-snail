@@ -580,6 +580,20 @@ fn an_outer_join_keeps_its_driving_side_and_reads_the_other_kept_to_its_keys() {
     let round = same(&mut snail, &q, want);
     assert_eq!(round.order, "s_theme+o_set+b_row", "{round:?}");
 
+    // Counted: each theme's sets give the answer nothing but their number, a theme with none one
+    // row.
+    let want: Vec<Row> = d
+        .themes
+        .iter()
+        .map(|t| {
+            let n = d.sets.iter().filter(|st| st.theme == t.id).count().max(1);
+            vec![s(t.id), s(n)]
+        })
+        .collect();
+    let q = "SELECT t.theme_id, count(*) FROM j.themes t LEFT JOIN j.sets s ON s.theme_id = t.theme_id \
+             GROUP BY t.theme_id";
+    same(&mut snail, q, want);
+
     // FULL: every theme with its sets, a theme with none, and a set of no theme.
     let ids: BTreeSet<i64> = d.themes.iter().map(|t| t.id).collect();
     let mut want: Vec<Row> = Vec::new();
