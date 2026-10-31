@@ -14,8 +14,8 @@ use std::ops::Bound;
 /// One rescan of a question, where each of a set of columns takes one value the rescan is given:
 /// the round for a key the order those values fix holds, priced from the directory as every round
 /// is, every order that serves the question priced from its top, the one read walked down to its
-/// blocks and predicted from their page maps. The order read, and its directory and column pages.
-/// Nothing is held between rescans, so every rescan reads its pages again.
+/// blocks and predicted from their page maps. The order read, its directory and column pages, and the
+/// rows the key holds. Nothing is held between rescans, so every rescan reads its pages again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Point {
@@ -27,6 +27,10 @@ pub struct Point {
     pub unique: bool,
     pub directory_pages: u64,
     pub column_pages: u64,
+    /// The rows the key holds, as the counts bound them, and the estimate from its page maps.
+    pub rows_low: u64,
+    pub rows_high: u64,
+    pub rows_estimate: u64,
 }
 
 /// The leading levels of `order` that `side`'s equalities and a value for each of `given`'s
@@ -233,6 +237,9 @@ impl Snail {
             unique: order.unique && levels == order.levels.len(),
             directory_pages: self.touched() - before,
             column_pages: part.plan.column_pages,
+            rows_low: part.rows.0,
+            rows_high: part.rows.1,
+            rows_estimate: (part.plan.rows_estimate.round() as u64).clamp(part.rows.0, part.rows.1),
         }))
     }
 }
