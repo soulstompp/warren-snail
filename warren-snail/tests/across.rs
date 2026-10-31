@@ -116,11 +116,10 @@ fn a_join_across_two_snails_answers_as_one_snail_holding_both_and_each_reads_its
              ON r.network_id = s.network_id AND r.station_no = s.station_no \
              WHERE s.network_id = {network} GROUP BY s.name"
         ),
-        format!(
-            "SELECT r.reading_id, s.name FROM weather.readings r JOIN weather.stations s \
-             ON s.network_id = r.network_id AND s.station_no = r.station_no \
-             WHERE r.observed_at >= '2022-03-01 00:00:00+00' AND r.observed_at < '2022-03-02 00:00:00+00'"
-        ),
+        "SELECT r.reading_id, s.name FROM weather.readings r JOIN weather.stations s \
+         ON s.network_id = r.network_id AND s.station_no = r.station_no \
+         WHERE r.observed_at >= '2022-03-01 00:00:00+00' AND r.observed_at < '2022-03-02 00:00:00+00'"
+            .to_string(),
         format!(
             "SELECT r.feed, count(*) FROM weather.stations s JOIN weather.readings r \
              ON r.network_id = s.network_id AND r.station_no = s.station_no \
@@ -413,6 +412,33 @@ mod written {
         assert!(pages[0] > 6 && pages[1] == 6, "{pages:?}");
         let (batch, _) = answer_together(&[&apart[0], &apart[1]], &q).unwrap();
         assert_eq!(one(&batch), 0, "a pair of roots no moment held");
+    }
+
+    /// A crash after the deciding root of a transaction across the two: snails opened apart and
+    /// taken at one moment read the root it carries for the readings, as a round across them does.
+    #[test]
+    fn snails_opened_apart_read_the_root_a_decision_among_them_carries() {
+        use warren_snail::read::{answer_together, at_one_moment};
+        let s = sample(5_000);
+        let split = split("together-decided", &s);
+        let r0 = alone_count(&split.readings, ALL_READINGS);
+        {
+            let mut w = Snails::open_writing(&paths(&split)).unwrap();
+            w.execute("BEGIN").unwrap();
+            w.execute(&station(9600, 1)).unwrap();
+            w.execute(&reading(9_000_011, 9600, 1)).unwrap();
+            w.stop_at(Some(StopAcross::AfterDecision));
+            assert!(w.execute("COMMIT").is_err());
+        }
+        assert_eq!(alone_count(&split.readings, ALL_READINGS), r0);
+        let mut apart = [fresh(&split.stations), fresh(&split.readings)];
+        at_one_moment(&mut apart).unwrap();
+        let refs = [&apart[0], &apart[1]];
+        assert_eq!(one(&answer_together(&refs, &joined(9600, 1)).unwrap().0), 1);
+        assert_eq!(
+            one(&answer_together(&refs, ALL_READINGS).unwrap().0),
+            r0 + 1
+        );
     }
 
     #[test]
