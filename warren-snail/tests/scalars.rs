@@ -271,6 +271,13 @@ fn a_pipeline_reads_the_scalars_and_their_operators_as_postgresql_does() {
         )),
         [Some("18446744073709551615".into())]
     );
+    // A pg_lsn plus a number of bytes rounded half away from zero, as PostgreSQL 18.6 gave it.
+    assert_eq!(
+        texts(&format!(
+            "{step} SELECT (l + 1.5)::text AS v FROM t WHERE l = '0/1'"
+        )),
+        [Some("0/00000003".into())]
+    );
     assert_eq!(
         texts(&format!("{step} SELECT ch::text AS v, n FROM t ORDER BY n")),
         ["a", "\\377", "\\200", "z", ""]
