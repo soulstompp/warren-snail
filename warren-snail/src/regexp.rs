@@ -14,6 +14,7 @@ use crate::{Error, Result};
 
 /// The options a `regexp_` function's flags argument gives (`pg_re_flags`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReFlags {
     pub cflags: i32,
     pub glob: bool,
