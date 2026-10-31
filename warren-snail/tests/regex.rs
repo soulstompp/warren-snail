@@ -52,7 +52,8 @@ fn each(snail: &mut Snail, expr: &str) -> warren_snail::Result<Vec<Option<String
 
 /// One expression of constants, as text.
 fn one(snail: &mut Snail, expr: &str) -> warren_snail::Result<Option<String>> {
-    let q = format!("WITH x AS (SELECT id FROM s.t WHERE id = 1) SELECT ({expr})::text AS v FROM x");
+    let q =
+        format!("WITH x AS (SELECT id FROM s.t WHERE id = 1) SELECT ({expr})::text AS v FROM x");
     let (b, _) = snail.ask(&q, None)?;
     let a = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
     Ok(a.is_valid(0).then(|| a.value(0).to_string()))
@@ -69,13 +70,22 @@ fn gave(values: &[&str]) -> Vec<Option<String>> {
 #[test]
 fn the_operators_answer_as_postgresql_s() {
     let mut s = snail("regex_operators");
-    let t = || gave(&["true", "true", "true", "true", "true", "true", "true", "NULL", "NULL"]);
+    let t = || {
+        gave(&[
+            "true", "true", "true", "true", "true", "true", "true", "NULL", "NULL",
+        ])
+    };
     assert_eq!(each(&mut s, "t ~ p").unwrap(), t());
     assert_eq!(each(&mut s, "t ~* p").unwrap(), t());
-    let f = gave(&["false", "false", "false", "false", "false", "false", "false", "NULL", "NULL"]);
+    let f = gave(&[
+        "false", "false", "false", "false", "false", "false", "false", "NULL", "NULL",
+    ]);
     assert_eq!(each(&mut s, "t !~ p").unwrap(), f);
     assert_eq!(one(&mut s, "'É' ~* 'é'").unwrap().as_deref(), Some("true"));
-    assert_eq!(one(&mut s, "'abc' !~* 'B'").unwrap().as_deref(), Some("false"));
+    assert_eq!(
+        one(&mut s, "'abc' !~* 'B'").unwrap().as_deref(),
+        Some("false")
+    );
 }
 
 #[test]
@@ -84,7 +94,17 @@ fn the_regexp_functions_answer_as_postgresql_s() {
     let cases: [(&str, [&str; 9]); 8] = [
         (
             "regexp_match(t, p)",
-            ["{a,b,c}", "{bar,beque}", "{zz}", "{\"\"}", "{o}", "{c,NULL}", "{É}", "NULL", "NULL"],
+            [
+                "{a,b,c}",
+                "{bar,beque}",
+                "{zz}",
+                "{\"\"}",
+                "{o}",
+                "{c,NULL}",
+                "{É}",
+                "NULL",
+                "NULL",
+            ],
         ),
         (
             "regexp_replace(t, p, '<\\&>', 'g')",
@@ -132,7 +152,9 @@ fn the_regexp_functions_answer_as_postgresql_s() {
         ),
         (
             "regexp_like(t, p, 'i')",
-            ["true", "true", "true", "true", "true", "true", "true", "NULL", "NULL"],
+            [
+                "true", "true", "true", "true", "true", "true", "true", "NULL", "NULL",
+            ],
         ),
     ];
     for (expr, want) in cases {
@@ -147,7 +169,10 @@ fn similar_to_reads_its_pattern_as_postgresql_translates_it() {
         ("'abcabc' SIMILAR TO '(abc)+'", "true"),
         ("'abc' NOT SIMILAR TO '%b%'", "false"),
         ("'a%c' SIMILAR TO 'a#%c' ESCAPE '#'", "true"),
-        ("substring('foobar' similar '%#\"o_b#\"%' escape '#')", "oob"),
+        (
+            "substring('foobar' similar '%#\"o_b#\"%' escape '#')",
+            "oob",
+        ),
         ("similar_to_escape('a%_b')", "^(?:a.*.b)$"),
         ("similar_to_escape('a#%', '#')", "^(?:a\\%)$"),
         ("similar_escape('x\\%', NULL)", "^(?:x\\%)$"),
@@ -179,16 +204,34 @@ fn the_classes_are_the_collation_s() {
 fn the_errors_are_postgresql_s_words() {
     let mut s = snail("regex_errors");
     for (expr, words) in [
-        ("'abc' ~ '('", "invalid regular expression: parentheses () not balanced"),
-        ("'abc' ~ 'a{3,2}'", "invalid regular expression: invalid repetition count(s)"),
-        ("'abc' ~ '\\9'", "invalid regular expression: invalid backreference number"),
+        (
+            "'abc' ~ '('",
+            "invalid regular expression: parentheses () not balanced",
+        ),
+        (
+            "'abc' ~ 'a{3,2}'",
+            "invalid regular expression: invalid repetition count(s)",
+        ),
+        (
+            "'abc' ~ '\\9'",
+            "invalid regular expression: invalid backreference number",
+        ),
         (
             "regexp_match('abc', 'b', 'g')",
             "regexp_match() does not support the \"global\" option",
         ),
-        ("regexp_match('abc', 'b', 'z')", "invalid regular expression option: \"z\""),
-        ("regexp_replace('abc', 'b', 'x', '2')", "invalid regular expression option: \"2\""),
-        ("regexp_instr('abc', 'b', 0)", "invalid value for parameter \"start\": 0"),
+        (
+            "regexp_match('abc', 'b', 'z')",
+            "invalid regular expression option: \"z\"",
+        ),
+        (
+            "regexp_replace('abc', 'b', 'x', '2')",
+            "invalid regular expression option: \"2\"",
+        ),
+        (
+            "regexp_instr('abc', 'b', 0)",
+            "invalid value for parameter \"start\": 0",
+        ),
         ("'abc' SIMILAR TO 'a' ESCAPE 'xy'", "invalid escape string"),
         (
             "substring('abc' similar 'a#\"b#\"c#\"' escape '#')",
@@ -203,7 +246,10 @@ fn the_errors_are_postgresql_s_words() {
 #[test]
 fn a_function_returning_a_set_is_refused_by_name() {
     let mut s = snail("regex_sets");
-    for f in ["regexp_matches('abc', 'b')", "regexp_split_to_table('a b', ' ')"] {
+    for f in [
+        "regexp_matches('abc', 'b')",
+        "regexp_split_to_table('a b', ' ')",
+    ] {
         let e = one(&mut s, f).unwrap_err().to_string();
         assert!(e.contains("returns a set of rows"), "{f}: {e}");
     }
@@ -213,9 +259,15 @@ fn a_function_returning_a_set_is_refused_by_name() {
 fn a_question_the_question_path_does_not_read_is_handed_over() {
     let mut s = snail("regex_question");
     let (b, _) = s
-        .ask("SELECT id FROM s.t WHERE t ~ 'b' AND t SIMILAR TO '%c%'", None)
+        .ask(
+            "SELECT id FROM s.t WHERE t ~ 'b' AND t SIMILAR TO '%c%'",
+            None,
+        )
         .unwrap();
-    let ids = b.column(0).as_any().downcast_ref::<arrow::array::Int64Array>();
+    let ids = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>();
     let ids: Vec<i64> = match ids {
         Some(a) => a.values().to_vec(),
         None => b
