@@ -261,15 +261,19 @@ fn the_errors_are_postgresql_s_words() {
 }
 
 #[test]
-fn a_function_returning_a_set_is_refused_by_name() {
+fn a_function_returning_a_set_is_read_in_a_select_list_alone() {
     let mut s = snail("regex_sets");
-    for f in [
-        "regexp_matches('abc', 'b')",
-        "regexp_split_to_table('a b', ' ')",
+    // Each one's first row, as PostgreSQL 19 gives it.
+    for (f, first) in [
+        ("regexp_matches('abc', 'b')", "{b}"),
+        ("regexp_split_to_table('a b', ' ')", "a"),
     ] {
-        let e = one(&mut s, f).unwrap_err().to_string();
-        assert!(e.contains("returns a set of rows"), "{f}: {e}");
+        assert_eq!(one(&mut s, f).unwrap().as_deref(), Some(first), "{f}");
     }
+    let e = one(&mut s, "CASE WHEN true THEN regexp_matches('abc', 'b') END")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not allowed in CASE"), "{e}");
 }
 
 #[test]

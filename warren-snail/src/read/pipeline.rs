@@ -970,8 +970,7 @@ fn cast(
             };
             return Ok(match target {
                 "smallint" | "integer" | "bigint" => {
-                    let (name, lo, hi) = integer_range(target);
-                    Value::Int(n.to_integer(lo, hi, name)?)
+                    Value::Int(n.to_integer(i64::MIN, i64::MAX, target)?)
                 }
                 "real" => Value::Real(n.to_float(false)? as f32),
                 "double precision" => Value::Double(n.to_float(true)?),

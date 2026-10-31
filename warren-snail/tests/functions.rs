@@ -1063,6 +1063,7 @@ fn an_integer_cast_is_held_to_its_type_s_range() {
         ("134217726::smallint", "smallint out of range"),
         ("a::smallint", "smallint out of range"),
         ("c::integer", "integer out of range"),
+        ("99999.5::int2", "smallint out of range"),
         (
             "'99999'::int2",
             "value \"99999\" is out of range for type smallint",
