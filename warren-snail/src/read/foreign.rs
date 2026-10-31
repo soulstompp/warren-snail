@@ -31,6 +31,8 @@ pub(super) struct Touched {
     written: BTreeMap<(usize, usize), Vec<Row>>,
     /// The keys taken from a parent: its row as it was, and as it is where its key changed.
     taken: BTreeMap<(usize, usize), Vec<(Row, Option<Row>)>>,
+    /// The rows written into an EXCLUDE's strand, by its table and order, each as the round leaves it.
+    excluded: BTreeMap<(usize, usize), Vec<Row>>,
 }
 
 impl Touched {
@@ -806,6 +808,170 @@ impl Snail {
         let mut t = Touched::default();
         t.written.insert((ci, fi), rows);
         self.keys_checked(&t)
+    }
+
+    /// The rows a table's changes write into each of its EXCLUDE's strands, as they stand now.
+    pub(super) fn touch_exclusions(&mut self, ti: usize, changes: &[Change]) {
+        let table = &self.catalog.tables[ti];
+        for (oi, o) in table.orders.iter().enumerate() {
+            if o.exclusion.is_none() {
+                continue;
+            }
+            let rows = self.touched.excluded.entry((ti, oi)).or_default();
+            for c in changes {
+                match c {
+                    Change::Insert(r) => rows.push(r.clone()),
+                    Change::Delete(o) => rows.retain(|x| x != o),
+                    Change::Replace(o, n) => {
+                        rows.retain(|x| x != o);
+                        rows.push(n.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each row a statement wrote into an EXCLUDE's strand held against the rows the strand holds:
+    /// writers of one strand taking turns, the blocks whose span the row's value meets locked, and
+    /// a row conflicting with another refused. Returns false where the statement must run again.
+    pub(super) fn exclusions_checked(&mut self) -> Result<bool> {
+        let due = std::mem::take(&mut self.touched.excluded);
+        for (&(ti, oi), rows) in &due {
+            if rows.is_empty() {
+                continue;
+            }
+            let b = crate::lock::block_byte_of(ti, oi, &[]);
+            if !self.locks.contains(&b) {
+                self.lock_byte(b, Waiting::Wait)?;
+                self.locks.insert(b);
+                if self.reader.peek_root()?.generation != self.root.generation {
+                    self.stale = true;
+                    return Ok(false);
+                }
+            }
+            for r in rows {
+                if !self.excluded_row(ti, oi, r)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// One row held against an EXCLUDE's strand: none conflicting, a row holding a NULL in one of
+    /// its levels, or one its predicate does not admit, conflicting with none.
+    fn excluded_row(&mut self, ti: usize, oi: usize, r: &Row) -> Result<bool> {
+        let t = &self.catalog.tables[ti];
+        let o = &t.orders[oi];
+        let operators = o.exclusion.as_ref().unwrap().operators.clone();
+        let columns: Vec<usize> = o.levels.iter().map(|l| l.column()).collect();
+        if columns.iter().any(|&c| r[c] == Datum::Null) {
+            return Ok(true);
+        }
+        if let Some(p) = super::partial::Predicate::of(&self.catalog, t, o)? {
+            if !p.admits(t, r) {
+                return Ok(true);
+            }
+        }
+        let blocks = self.spanning(ti, oi, r, &operators)?;
+        if !self.fresh(ti, oi, &blocks)? || !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
+            self.stale = true;
+            return Ok(false);
+        }
+        let t = &self.catalog.tables[ti];
+        let o = &t.orders[oi];
+        let own = t.orders.iter().find(|x| x.table_order).unwrap();
+        let key: Vec<usize> = own.levels.iter().map(|l| l.column()).collect();
+        let column = |c: usize| format!("r.\"{}\"", t.columns[c].name.replace('"', "\"\""));
+        let conditions = columns
+            .iter()
+            .zip(&operators)
+            .map(|(&c, op)| format!("{} {op} {}", column(c), literal(&r[c], t.columns[c].ty)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let admitted = o
+            .predicate
+            .as_ref()
+            .map(|p| format!(" AND ({p})"))
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT {} FROM {} r WHERE {conditions}{admitted}",
+            key.iter()
+                .map(|&c| column(c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            quoted(&t.name)
+        );
+        let (b, _) = self.answer(&sql, Some(&o.name))?;
+        let mine: Vec<Datum> = key.iter().map(|&c| r[c].clone()).collect();
+        let held = rows_of(&b)?;
+        if held.iter().any(|other| *other != mine) {
+            return Err(Error::new(format!(
+                "conflicting key value violates exclusion constraint \"{}\"",
+                o.name
+            )));
+        }
+        Ok(true)
+    }
+
+    /// The blocks of an EXCLUDE's strand whose rows may conflict with a row: each spanned level's
+    /// span meeting its value by its operator, and where its first level is compared by `=`, its key
+    /// there between the block's first and last.
+    fn spanning(&self, ti: usize, oi: usize, r: &Row, operators: &[String]) -> Result<Vec<Entry>> {
+        let table = &self.catalog.tables[ti];
+        let order = &table.orders[oi];
+        let Some((_, _, top)) = self
+            .root
+            .orders
+            .iter()
+            .find(|(t, o, _)| *t == table.name && *o == order.name)
+        else {
+            return Err(Error::new(format!(
+                "{}: the root names no {}",
+                table.name, order.name
+            )));
+        };
+        let (head, entries) = decode_top(&self.reader.read_extent(*top)?)?;
+        let at = key_of(table, order, r)?;
+        let probes: Vec<Option<(usize, crate::spans::Probe, bool)>> = order
+            .levels
+            .iter()
+            .map(|l| {
+                let c = l.column();
+                let slot = order.leaf_slot(table, c)?;
+                let k = head.span_slots.iter().position(|&s| s as usize == slot)?;
+                let probe = match crate::spans::bounds(table.columns[c].ty, &r[c])? {
+                    None => crate::spans::Probe::Empty,
+                    Some((lo, hi)) => crate::spans::Probe::Span(lo, hi),
+                };
+                Some((k, probe, crate::spans::is_inet(table.columns[c].ty)))
+            })
+            .collect();
+        let meets = |e: &Entry| {
+            let first = operators[0] != "=" || (e.first[..1] <= at[..1] && at[..1] <= e.last[..1]);
+            first
+                && probes.iter().zip(operators).all(|(p, op)| match p {
+                    Some((k, probe, inet)) => {
+                        crate::spans::may_hold(op, &e.spans[*k], probe, *inet)
+                    }
+                    None => true,
+                })
+        };
+        let mut out = Vec::new();
+        let mut level = vec![(entries, head.height)];
+        while let Some((entries, height)) = level.pop() {
+            for e in entries.into_iter().filter(|e| meets(e)) {
+                if height > 1 {
+                    level.push((
+                        decode_page(&self.reader.read_extent(e.child)?, &head)?,
+                        height - 1,
+                    ));
+                } else {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

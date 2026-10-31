@@ -1733,6 +1733,7 @@ struct Keyed {
     predicate: Option<String>,
     /// The columns its predicate reads, which its strand carries.
     predicate_columns: Vec<usize>,
+    exclusion: Option<crate::catalog::Exclusion>,
     levels: Vec<Level>,
     include: Vec<usize>,
     unique: bool,
@@ -2770,6 +2771,7 @@ impl Draft {
         // Each CHECK: its name where written, its expression, NOT ENFORCED, and the column it is
         // written on.
         let mut checks: Vec<(Option<String>, Expr, bool)> = Vec::new();
+        let mut excludes: Vec<sqlparser::ast::ExcludeConstraint> = Vec::new();
         let mut serials: Vec<(String, SequenceType)> = Vec::new();
         let mut identities: Vec<(String, SequenceType, bool, Vec<SequenceOption>)> = Vec::new();
         for c in &t.columns {
@@ -2980,11 +2982,7 @@ impl Draft {
                 TableConstraint::ForeignKey(_) => {
                     return Err(Error::new(format!("{name}: a FOREIGN KEY is not held yet")))
                 }
-                TableConstraint::Exclude(_) => {
-                    return Err(Error::new(format!(
-                        "{name}: an EXCLUDE constraint is not held yet"
-                    )))
-                }
+                TableConstraint::Exclude(x) => excludes.push(x.clone()),
                 other => {
                     return Err(Error::new(format!(
                         "{name}: the constraint {other} is not read"
@@ -3130,6 +3128,7 @@ impl Draft {
                 method: Method::Btree,
                 predicate: None,
                 predicate_columns: Vec::new(),
+                exclusion: None,
                 nulls_first: vec![false; levels.len()],
                 desc: vec![false; levels.len()],
                 keys: k.columns.clone(),
@@ -3207,7 +3206,82 @@ impl Draft {
             next.check_names.push(qualified(&schema, &k.name));
             next.table_mut(&name).unwrap().foreign_keys.push(k);
         }
+        for x in excludes {
+            notices.extend(next.exclude(&name, &x)?);
+        }
         *self = next;
+        Ok(notices)
+    }
+
+    /// An EXCLUDE constraint of a table: the index of its method that stands for it, read as its
+    /// CREATE INDEX would be, each element's operator commutative and of its operator class.
+    fn exclude(
+        &mut self,
+        table: &str,
+        x: &sqlparser::ast::ExcludeConstraint,
+    ) -> Result<Vec<String>> {
+        let schema = schema_of(table).to_string();
+        let method = match &x.index_method {
+            None => Method::Btree,
+            Some(m) => {
+                let m = ident(m).to_lowercase();
+                Method::of_name(&m)
+                    .ok_or_else(|| Error::new(format!("access method \"{m}\" does not exist")))?
+            }
+        };
+        let am = method.name();
+        if matches!(method, Method::Gin | Method::Brin) {
+            return Err(Error::new(format!(
+                "access method \"{am}\" does not support exclusion constraints"
+            )));
+        }
+        let keys: Vec<Expr> = x
+            .elements
+            .iter()
+            .map(|e| e.column.column.expr.clone())
+            .collect();
+        let name = match &x.name {
+            Some(n) => ident(n),
+            None => {
+                let addition = name_addition(&key_names(&keys));
+                choose(bare(table), Some(&addition), "excl", &|n| {
+                    self.relation(&schema, n) || self.constraint(&schema, n)
+                })
+            }
+        };
+        let deferrable = deferrable(x.characteristics.as_ref(), &name)?;
+        let mut text = format!(
+            "CREATE INDEX \"{}\" ON {table} USING {am} ({})",
+            name.replace('"', "\"\""),
+            x.elements
+                .iter()
+                .map(|e| e.column.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if !x.include.is_empty() {
+            let include: Vec<String> = x.include.iter().map(|i| i.to_string()).collect();
+            text.push_str(&format!(" INCLUDE ({})", include.join(", ")));
+        }
+        if let Some(p) = &x.where_clause {
+            text.push_str(&format!(" WHERE ({p})"));
+        }
+        let tokens = statements(&text)?.into_iter().next().unwrap_or_default();
+        let notices = self.create_index(&tokens)?;
+        let t = self.table_mut(table).unwrap();
+        let columns = t.columns.clone();
+        let k = t.indexes.last_mut().unwrap();
+        let mut operators = Vec::new();
+        for (i, e) in x.elements.iter().enumerate() {
+            let op = e.operator.to_string();
+            let ty = columns[k.levels[i].column()].ty;
+            crate::methods::exclusion_operator(method, &k.opclasses[i], ty, &op)?;
+            operators.push(op);
+        }
+        k.exclusion = Some(crate::catalog::Exclusion {
+            operators,
+            deferrable,
+        });
         Ok(notices)
     }
 
@@ -3687,6 +3761,7 @@ impl Draft {
             method,
             predicate,
             predicate_columns,
+            exclusion: None,
             levels,
             include,
             unique: i.unique,
@@ -3762,6 +3837,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         constraint: ordered.constraint,
         clustered: d.clustered.is_some(),
         predicate: None,
+        exclusion: ordered.exclusion,
     }];
     for s in strands {
         let held = dedup(
@@ -3789,6 +3865,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
             constraint: s.constraint,
             clustered: false,
             predicate: s.predicate,
+            exclusion: s.exclusion,
         });
     }
     for o in &orders {

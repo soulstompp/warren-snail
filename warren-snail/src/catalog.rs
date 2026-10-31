@@ -1046,6 +1046,19 @@ pub struct Order {
     pub clustered: bool,
     /// A partial index's predicate, as written: the strand holds only the rows it admits.
     pub predicate: Option<String>,
+    /// The EXCLUDE constraint it stands for, where it stands for one.
+    pub exclusion: Option<Exclusion>,
+}
+
+/// An EXCLUDE constraint: no two rows whose values each level's operator finds conflicting, a row
+/// holding a NULL in one conflicting with none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Exclusion {
+    /// Each level's operator, as written.
+    pub operators: Vec<String>,
+    /// DEFERRABLE, checked at each statement's end, as PostgreSQL checks one INITIALLY IMMEDIATE.
+    pub deferrable: bool,
 }
 
 impl Order {

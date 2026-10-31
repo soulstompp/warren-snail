@@ -855,6 +855,15 @@ fn write_tables(
                 crate::read::fill::check(table, &row)?;
             }
         }
+        // An EXCLUDE is checked where a statement writes its rows.
+        if let Some(o) = table.orders.iter().find(|o| o.exclusion.is_some()) {
+            if !rows.is_empty() {
+                return Err(Error::new(format!(
+                    "{}: write does not hold its rows to the EXCLUDE {}: give them by INSERT",
+                    table.name, o.name
+                )));
+            }
+        }
         let source = sources
             .iter()
             .find(|(n, _)| *n == table.name)

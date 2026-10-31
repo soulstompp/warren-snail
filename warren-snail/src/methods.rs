@@ -450,3 +450,39 @@ fn bare_name(ty: ColumnType) -> String {
     }
     out
 }
+
+/// Whether an EXCLUDE's element may name an operator, as PostgreSQL's `ComputeIndexAttrs` asks:
+/// commutative, and of the element's operator class's family.
+pub fn exclusion_operator(method: Method, opclass: &str, ty: ColumnType, op: &str) -> Result<()> {
+    let members: &[&str] = match (method, opclass) {
+        (Method::Btree | Method::Hash, _) => &["="],
+        (_, "range_ops" | "multirange_ops") => &["&&", "=", "-|-"],
+        (_, "inet_ops") => &["&&", "=", "<>"],
+        (_, "text_ops") => &["="],
+        _ => &[],
+    };
+    // A range's and a multirange's operators are the polymorphic ones.
+    let t = if is_range(ty) {
+        "anyrange".to_string()
+    } else if is_multirange(ty) {
+        "anymultirange".to_string()
+    } else {
+        bare_name(ty)
+    };
+    if !["=", "<>", "&&", "-|-", "~="].contains(&op) {
+        return Err(Error::new(format!(
+            "operator {op}({t},{t}) is not commutative"
+        )));
+    }
+    if !members.contains(&op) {
+        let family = match opclass {
+            "int2_ops" | "int4_ops" | "int8_ops" => "integer_ops",
+            "inet_ops" => "network_ops",
+            o => o,
+        };
+        return Err(Error::new(format!(
+            "operator {op}({t},{t}) is not a member of operator family \"{family}\""
+        )));
+    }
+    Ok(())
+}

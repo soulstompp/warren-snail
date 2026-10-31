@@ -737,3 +737,174 @@ fn a_condition_by_a_gist_operator_is_refused_in_a_partial_index_s_predicate() {
         "{got:?}"
     );
 }
+
+#[test]
+fn an_exclude_constraint_is_read_as_postgresql_19_reads_it() {
+    let table = "CREATE TABLE s.b (id int PRIMARY KEY, room int, during int4range, \
+                 EXCLUDE USING gist (during WITH &&), \
+                 CONSTRAINT b_code EXCLUDE USING btree (room WITH =) WHERE (id > 100));";
+    let reading = Catalog::read(table).unwrap();
+    assert_eq!(
+        reading.statements[0].refused, None,
+        "{:?}",
+        reading.statements
+    );
+    let t = &reading.catalog.tables[0];
+    let during = t.order("b_during_excl").unwrap();
+    assert_eq!(during.method.name(), "gist");
+    assert_eq!(during.exclusion.as_ref().unwrap().operators, ["&&"]);
+    let code = t.order("b_code").unwrap();
+    assert_eq!(code.predicate.as_deref(), Some("(id > 100)"));
+    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31).
+    for (constraint, why) in [
+        (
+            "EXCLUDE USING gist (r WITH <<)",
+            "operator <<(anyrange,anyrange) is not commutative",
+        ),
+        (
+            "EXCLUDE USING gist (r WITH @>)",
+            "operator @>(anyrange,anyrange) is not commutative",
+        ),
+        (
+            "EXCLUDE (a WITH <>)",
+            "operator <>(integer,integer) is not a member of operator family \"integer_ops\"",
+        ),
+        (
+            "EXCLUDE USING gin (a WITH =)",
+            "access method \"gin\" does not support exclusion constraints",
+        ),
+        (
+            "EXCLUDE USING gist (a WITH =)",
+            "data type integer has no default operator class for access method \"gist\"",
+        ),
+    ] {
+        let got = outcomes(&format!(
+            "CREATE TABLE s.c (id int PRIMARY KEY, a int, r int4range, {constraint});"
+        ));
+        let e = got[0]
+            .as_deref()
+            .unwrap_or_else(|| panic!("{constraint} was taken"));
+        assert!(e.contains(why), "{constraint}: {e}");
+    }
+}
+
+#[cfg(feature = "standalone")]
+fn refused(w: &mut Snail, sql: &str, why: &str) {
+    let e = w
+        .execute(sql)
+        .err()
+        .unwrap_or_else(|| panic!("{sql} was taken"))
+        .to_string();
+    assert!(e.contains(why), "{sql}: {e}");
+}
+
+#[cfg(feature = "standalone")]
+fn bookings(name: &str) -> std::path::PathBuf {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.b (id int PRIMARY KEY, room int, during int4range, \
+         EXCLUDE USING gist (during WITH &&), \
+         CONSTRAINT b_code EXCLUDE USING btree (room WITH =) WHERE (id > 100));",
+    )
+    .unwrap();
+    let path = tmp(&format!("{name}.snail"));
+    write(&path, &catalog, &[]).unwrap();
+    path
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn an_exclude_refuses_a_row_whose_values_conflict_with_another_s() {
+    let mut w = Snail::open_writing(&bookings("exclude")).unwrap();
+    // Each statement taken or refused as PostgreSQL 19 RC1 took or refused it (28819, 2026-10-31).
+    let conflict = "conflicting key value violates exclusion constraint";
+    for sql in [
+        "INSERT INTO s.b (id, room, during) VALUES (1, 1, '[1,5)')",
+        "INSERT INTO s.b (id, room, during) VALUES (2, 1, '[5,9)')",
+        "INSERT INTO s.b (id, room, during) VALUES (4, 2, 'empty'), (5, 2, NULL)",
+        "UPDATE s.b SET during = '[10,20)' WHERE id = 1",
+        "INSERT INTO s.b (id, room, during) VALUES (6, 3, '[1,5)')",
+        "INSERT INTO s.b (id, room, during) VALUES (101, 7, NULL), (2101, 8, NULL)",
+        "DELETE FROM s.b WHERE id = 2",
+        "INSERT INTO s.b (id, room, during) VALUES (7, 3, '[6,9)')",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for (sql, name) in [
+        (
+            "INSERT INTO s.b (id, room, during) VALUES (3, 2, '[4,6)')",
+            "b_during_excl",
+        ),
+        (
+            "UPDATE s.b SET during = '[3,4)' WHERE id = 7",
+            "b_during_excl",
+        ),
+        (
+            "INSERT INTO s.b (id, room, during) VALUES (102, 7, NULL)",
+            "b_code",
+        ),
+        (
+            "INSERT INTO s.b (id, room, during) VALUES (103, 9, NULL), (104, 9, NULL)",
+            "b_code",
+        ),
+        (
+            "INSERT INTO s.b (id, room, during) VALUES (8, 4, '[15,16)')",
+            "b_during_excl",
+        ),
+    ] {
+        refused(&mut w, sql, &format!("{conflict} \"{name}\""));
+    }
+    // A room repeated outside the predicate conflicts with nothing.
+    w.execute("INSERT INTO s.b (id, room, during) VALUES (9, 7, NULL)")
+        .unwrap();
+    drop(w);
+    let mut s = fresh(&bookings_path("exclude"));
+    assert_eq!(
+        ids(&mut s, "SELECT id FROM s.b WHERE id > 0", "b_pkey"),
+        [1, 4, 5, 6, 7, 9, 101, 2101]
+    );
+}
+
+#[cfg(feature = "standalone")]
+fn bookings_path(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.snail"))
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_writer_whose_value_conflicts_with_another_s_uncommitted_waits_and_is_refused_as_postgresql_refuses_it(
+) {
+    use std::time::Duration;
+    let path = bookings("exclude-two");
+    let mut one = Snail::open_writing(&path).unwrap();
+    one.execute("INSERT INTO s.b (id, room, during) VALUES (1, 1, '[1,5)')")
+        .unwrap();
+    for (end, taken) in [("ROLLBACK", true), ("COMMIT", false)] {
+        // The first writer holds a range in a transaction; a second writer's range overlapping it
+        // waits for it, then is refused where it committed and taken where it rolled back.
+        one.execute("BEGIN").unwrap();
+        one.execute("INSERT INTO s.b (id, room, during) VALUES (10, 1, '[100,200)')")
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let mut two = Snail::open_writing(&p).unwrap();
+            let r = two
+                .execute("INSERT INTO s.b (id, room, during) VALUES (20, 2, '[150,160)')")
+                .map_err(|e| e.to_string());
+            if r.is_ok() {
+                two.execute("DELETE FROM s.b WHERE id = 20").unwrap();
+            }
+            tx.send(r).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(rx.try_recv().is_err(), "the second writer did not wait");
+        one.execute(end).unwrap();
+        let r = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(r.is_ok(), taken, "{end}: {r:?}");
+        if !taken {
+            assert!(r
+                .unwrap_err()
+                .contains("conflicting key value violates exclusion constraint \"b_during_excl\""),);
+        }
+    }
+}

@@ -671,7 +671,13 @@ impl Snail {
                         self.write_rows(st.clone(), &mut done, &mut found)
                             .and_then(|changed| match self.stale {
                                 true => Ok(changed),
-                                false => self.keys_at_statement_end().map(|_| changed),
+                                false => self
+                                    .exclusions_checked()
+                                    .and_then(|fresh| match fresh {
+                                        true => self.keys_at_statement_end(),
+                                        false => Ok(false),
+                                    })
+                                    .map(|_| changed),
                             });
                     match written {
                         Ok(_) if self.stale => {
@@ -1260,7 +1266,7 @@ impl Snail {
     /// at once; `Wait` marks that it waits, follows the writers each waiting for a block the next
     /// holds, and waits as long as it takes unless they come back to a block this writer holds: a
     /// ring, which PostgreSQL ends by failing one of its transactions, as this one fails.
-    fn lock_byte(&self, b: u64, waiting: Waiting) -> Result<bool> {
+    pub(super) fn lock_byte(&self, b: u64, waiting: Waiting) -> Result<bool> {
         let file = self.writer.as_ref().expect("a snail open to write").file();
         if !lock::lock_block(file, b, false)? {
             if waiting == Waiting::Try {
@@ -1778,6 +1784,7 @@ impl Snail {
             .collect();
         if !self.stale {
             self.touch(ti, &changes);
+            self.touch_exclusions(ti, &changes);
         }
         Ok((applied.iter().sum(), applied.len() as u64))
     }
