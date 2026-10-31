@@ -11,6 +11,7 @@ mod arrays;
 mod calls;
 mod change;
 mod clock;
+mod collate;
 pub(crate) mod fill;
 pub(crate) mod foreign;
 mod hash;

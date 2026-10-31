@@ -1097,3 +1097,84 @@ fn a_bpchar_written_is_keyed_on_its_class_so_a_unique_key_refuses_its_twin_of_ot
         .unwrap();
     assert_eq!(ids(&b), [2]);
 }
+
+#[test]
+fn a_collation_is_derived_as_postgresql_derives_it_and_carried_by_each_column() {
+    let ddl =
+        "CREATE TABLE s.t (id integer NOT NULL, a text COLLATE \"C\", b text COLLATE \"POSIX\", \
+               c text, n name, PRIMARY KEY (id));";
+    let text = |v: &[Option<&str>]| Values::Text(v.iter().map(|s| s.map(str::to_string)).collect());
+    let path = snail_of(
+        "derived",
+        ddl,
+        vec![
+            Values::Int(vec![Some(1), Some(2)]),
+            text(&[Some("é"), Some("a")]),
+            text(&[Some("b"), None]),
+            text(&[Some("é"), Some("x")]),
+            text(&[Some("é"), Some("y")]),
+        ],
+    );
+    let mut s = Snail::open(&path).unwrap();
+    let step = "WITH q AS (SELECT id, a, b, c, n FROM s.t)";
+    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31): two implicit collations met
+    // where a function or an operator needs one, or where a step sorts or groups; two explicit
+    // ones that differ.
+    for (q, refused) in [
+        (
+            "SELECT id, upper(a || b) AS x FROM q",
+            "could not determine which collation to use for upper() function",
+        ),
+        (
+            "SELECT id, (a < b) AS x FROM q",
+            "could not determine which collation to use for string comparison",
+        ),
+        (
+            "SELECT id, (a LIKE b) AS x FROM q",
+            "could not determine which collation to use for LIKE",
+        ),
+        (
+            "SELECT id, (a ~ b) AS x FROM q",
+            "could not determine which collation to use for regular expression",
+        ),
+        (
+            "SELECT id, (a IN (b, c))::text AS x FROM q",
+            "could not determine which collation to use for string comparison",
+        ),
+        (
+            "SELECT id, (a COLLATE \"C\" < b COLLATE \"POSIX\") AS x FROM q",
+            "collation mismatch between explicit collations \"C\" and \"POSIX\"",
+        ),
+        (
+            "SELECT id, a || b AS x FROM q ORDER BY 2",
+            "collation mismatch between implicit collations \"C\" and \"POSIX\"",
+        ),
+        (
+            "SELECT a || b AS x, count(*) AS k FROM q GROUP BY 1",
+            "collation mismatch between implicit collations \"C\" and \"POSIX\"",
+        ),
+        (
+            ", r AS (SELECT id, a || b AS x FROM q) SELECT id, upper(x) AS y FROM r",
+            "could not determine which collation to use for upper() function",
+        ),
+    ] {
+        let sql = format!("{step}{}{q}", if q.starts_with(',') { "" } else { " " });
+        assert_eq!(s.ask(&sql, None).unwrap_err().to_string(), refused, "{q}");
+    }
+    // A collation other than the default wins over it, an explicit one over an implicit, and a
+    // NULL is compared under none; what needs no collation reads two; a column a step makes
+    // carries its own collation, each by its place, where two of one name carry two.
+    for (q, want) in [
+        ("SELECT id, upper(a || c) AS x FROM q ORDER BY id", vec![Some("éé"), Some("AX")]),
+        ("SELECT id, upper(n || c) AS x FROM q ORDER BY id", vec![Some("éé"), Some("YX")]),
+        ("SELECT id, upper(c || a) AS x FROM q ORDER BY id", vec![Some("éé"), Some("XA")]),
+        ("SELECT id, (a < b COLLATE \"C\")::text AS x FROM q ORDER BY id", vec![Some("false"), None]),
+        ("SELECT id, length(a || b)::text AS x FROM q ORDER BY id", vec![Some("2"), None]),
+        (", r AS (SELECT id, a || b AS x FROM q) SELECT id, upper(x || 'z') AS x FROM r ORDER BY id", vec![Some("ÉBZ"), None]),
+        (", t1 AS (SELECT id, a AS x FROM q), t2 AS (SELECT id, c AS x FROM q) SELECT t1.id, upper(t1.x) || upper(t2.x) AS x FROM t1, t2 WHERE t1.id = t2.id ORDER BY t1.id", vec![Some("éÉ"), Some("AX")]),
+    ] {
+        let sql = format!("{step}{}{q}", if q.starts_with(',') { "" } else { " " });
+        let (b, _) = s.ask(&sql, None).unwrap();
+        assert_eq!(texts(&b, 1), want.iter().map(|v| v.map(str::to_string)).collect::<Vec<_>>(), "{q}");
+    }
+}

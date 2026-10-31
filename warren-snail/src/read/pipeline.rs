@@ -407,11 +407,12 @@ struct Frame<'a> {
     now: i64,
 }
 
-/// How the columns a statement reads and makes map case, by their names, where not as the
-/// database's default does: a string column under a collation its DDL or a COLLATE names, a name
-/// under its own C; and the collations the DDL makes. A name two columns map differently by maps
-/// as the default. Beside them, the lc_monetary the statement's money reads and prints under: the
-/// file's.
+/// How the columns a statement reads and makes map case and order text, where not as the
+/// database's default does: the collation each relation the statement makes carries on each of
+/// its columns, by its place, and the collation each of its steps' expressions takes and is called
+/// under, as PostgreSQL derives them; and the collations the DDL makes. An expression read alone (a
+/// CHECK's, a DEFAULT's) finds its table's columns by their names. Beside them, the lc_monetary the
+/// statement's money reads and prints under: the file's.
 #[derive(Clone, Debug, Default)]
 pub struct Casings {
     columns: HashMap<String, Casing>,
@@ -422,6 +423,12 @@ pub struct Casings {
     library: bool,
     /// The file's lc_monetary.
     monetary: crate::monetary::Monetary,
+    /// The collation each relation's columns carry, by the relation's name.
+    relations: HashMap<String, Vec<(String, super::collate::Carried)>>,
+    /// Each step expression's collation, and the one it is called under.
+    nodes: HashMap<*const Expr, (super::collate::Derived, super::collate::Derived)>,
+    /// The casing each collation the steps name maps case and orders text by, or why none.
+    resolved: HashMap<String, std::result::Result<Casing, String>>,
 }
 
 impl Casings {
@@ -450,7 +457,24 @@ impl Casings {
             unheld: HashMap::new(),
             library: false,
             monetary: table.monetary,
+            relations: HashMap::new(),
+            nodes: HashMap::new(),
+            resolved: HashMap::new(),
         };
+        let carried = table
+            .columns
+            .iter()
+            .map(|col| {
+                let carried = match (&col.collation, col.ty) {
+                    (_, ty) if !super::collate::collatable(ty) => super::collate::Carried::None,
+                    (Some(n), _) => super::collate::Carried::Named(super::collate::named(n)),
+                    (None, ColumnType::Name) => super::collate::Carried::Named("C".into()),
+                    (None, _) => super::collate::Carried::Named(super::collate::DEFAULT.into()),
+                };
+                (col.name.clone(), carried)
+            })
+            .collect();
+        c.relations.insert(table.name.clone(), carried);
         for col in &table.columns {
             let named = match (&col.collation, col.ty) {
                 (Some(n), _) => match crate::catalog::collation_casing(n, declared) {
@@ -489,9 +513,103 @@ impl Casings {
             .ok_or_else(|| Error::new(format!("COLLATE {name}: {}", crate::catalog::NOT_HELD)))
     }
 
-    /// The casing an expression's text takes where a COLLATE or a column names one, as PostgreSQL
-    /// carries a collation from a column or a COLLATE to what a function makes of it.
+    /// The casing a collation's name maps case and orders text by, or why this build holds none,
+    /// as `resolve` found it where a step names it.
+    fn casing_named(&self, name: &str) -> Result<Casing> {
+        match self.resolved.get(name) {
+            Some(Ok(k)) => Ok(*k),
+            Some(Err(e)) => Err(Error::new(e.clone())),
+            None => self.resolve(name),
+        }
+    }
+
+    /// The casing a collation's name maps case and orders text by, or why this build holds none:
+    /// a column's under a library collation without the feature, refused by name.
+    fn resolve(&self, name: &str) -> Result<Casing> {
+        if self
+            .unheld
+            .values()
+            .any(|n| super::collate::named(n) == name)
+        {
+            return Err(crate::collations::unbuilt(name));
+        }
+        if name == super::collate::DEFAULT {
+            return Ok(Casing::Libc);
+        }
+        crate::catalog::collation_casing(name, &self.declared)
+    }
+
+    /// The casing a call or an operator is called under, as its inputs' collation settles it;
+    /// refused in PostgreSQL's words for `what` where none is settled.
+    fn input(&self, e: &Expr, what: &str) -> Result<Option<Casing>> {
+        match self.nodes.get(&(e as *const Expr)) {
+            Some((_, input)) => input
+                .settled(what)?
+                .map(|n| self.casing_named(n))
+                .transpose(),
+            None if self.nodes.is_empty() => self.implicit(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether the inputs of a call or an operator settle no collation.
+    fn unsettled(&self, e: &Expr) -> bool {
+        self.nodes
+            .get(&(e as *const Expr))
+            .is_some_and(|(_, input)| input.settled("").is_err())
+    }
+
+    /// The library collation a comparison is made under, where one is, as `input` settles it.
+    fn compared(&self, e: &Expr, what: &str) -> Result<Option<Casing>> {
+        if self.nodes.is_empty() {
+            return self.ordering(e);
+        }
+        Ok(self
+            .input(e, what)?
+            .filter(|k| matches!(k, Casing::Library(_))))
+    }
+
+    /// The library collation a key is compared under where a step sorts, groups or partitions by
+    /// it, where one is: its own collation.
+    fn keyed(&self, e: &Expr) -> Result<Option<Casing>> {
+        match self.nodes.get(&(e as *const Expr)) {
+            Some((out, _)) => Ok(out
+                .keyed()?
+                .map(|n| self.casing_named(n))
+                .transpose()?
+                .filter(|k| matches!(k, Casing::Library(_)))),
+            None if self.nodes.is_empty() => self.ordering(e),
+            None => Ok(None),
+        }
+    }
+
+    /// The library collation a column a step makes is compared under, by what it carries.
+    fn carried(&self, c: &super::collate::Carried) -> Result<Option<Casing>> {
+        Ok(match c {
+            super::collate::Carried::Named(n) => Some(self.casing_named(n)?),
+            super::collate::Carried::Unsettled => {
+                return Err(Error::new(
+                    "could not determine which collation to use for string comparison",
+                ))
+            }
+            super::collate::Carried::None => None,
+        }
+        .filter(|k| matches!(k, Casing::Library(_))))
+    }
+
+    /// The casing an expression's text takes: the collation it takes in its step, else, read alone,
+    /// where a COLLATE or a column names one, as PostgreSQL carries a collation from a column or a
+    /// COLLATE to what a function makes of it.
     fn implicit(&self, e: &Expr) -> Result<Option<Casing>> {
+        if let Some((out, _)) = self.nodes.get(&(e as *const Expr)) {
+            return out
+                .settled("string comparison")?
+                .map(|n| self.casing_named(n))
+                .transpose();
+        }
+        if !self.nodes.is_empty() {
+            return Ok(None);
+        }
         Ok(match e {
             Expr::Collate { collation, .. } => {
                 Some(self.named(&crate::catalog::object_name(collation))?)
@@ -524,31 +642,110 @@ impl Casings {
         })
     }
 
-    /// The casings a step's columns take, by their names, added: each where its expression names
-    /// one, and none where two columns of one name map differently.
-    fn add_step(&mut self, q: &Query) -> Result<()> {
-        let SetExpr::Select(sel) = q.body.as_ref() else {
-            return Ok(());
+    /// A step's collations derived before any row, over the columns its FROM reads: each of its
+    /// expressions', the relation it makes carrying each item's under the step's name; a key it
+    /// sorts, groups or partitions by, or returns once each, refused where two implicit collations
+    /// meet in it, as PostgreSQL's parser refuses one. The collation each of its columns carries.
+    fn add_step(
+        &mut self,
+        name: &str,
+        p: &Prepared,
+        columns: &[(Option<String>, String, super::collate::Carried)],
+    ) -> Result<Vec<super::collate::Carried>> {
+        let mut d = super::collate::Deriving {
+            columns,
+            types: &p.types,
+            nodes: std::mem::take(&mut self.nodes),
         };
-        for item in &sel.projection {
-            let (e, name) = match item {
-                SelectItem::UnnamedExpr(e) => (e, default_name(e)),
-                SelectItem::ExprWithAlias { expr, alias } => (expr, ident(alias)),
-                _ => continue,
-            };
-            let k = self.implicit(e)?;
-            self.library |= matches!(k, Some(Casing::Library(_)));
-            match (self.columns.get(&name).copied(), k) {
-                (None, Some(k)) => {
-                    self.columns.insert(name, k);
+        let mut carried = Vec::with_capacity(p.items.len());
+        let mut outs = Vec::with_capacity(p.items.len());
+        for (e, _) in &p.items {
+            let out = d.derive(e)?;
+            if p.distinct {
+                out.keyed()?;
+            }
+            let collatable = d
+                .types
+                .get(&(*e as *const Expr))
+                .is_none_or(|t| super::collate::collatable(*t));
+            carried.push(out.carried(collatable));
+            outs.push(out);
+        }
+        if let Some(w) = p.selection {
+            d.derive(w)?;
+        }
+        for g in &p.grouping {
+            d.derive(g)?.keyed()?;
+        }
+        // ORDER BY reads the columns the step returns: an item named, by its place or by its name,
+        // is that item, keyed as it was derived.
+        let nodes = d.nodes;
+        let outputs: Vec<(Option<String>, String, super::collate::Carried)> = p
+            .items
+            .iter()
+            .zip(&carried)
+            .map(|((_, n), c)| (None, n.clone(), c.clone()))
+            .collect();
+        let mut d = super::collate::Deriving {
+            columns: &outputs,
+            types: &p.types,
+            nodes,
+        };
+        if let Some(OrderByKind::Expressions(os)) = p.order_by.map(|o| &o.kind) {
+            for o in os {
+                let named = match &o.expr {
+                    Expr::Identifier(i) => {
+                        let n = ident(i);
+                        let mut at = (0..p.items.len()).filter(|&i| p.items[i].1 == n);
+                        match (at.next(), at.next()) {
+                            (Some(at), None) => Some(at),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match ordinal(&o.expr, "ORDER BY", carried.len()) {
+                    Ok(Some(at)) => {
+                        outs[at].keyed()?;
+                    }
+                    Err(_) => {}
+                    Ok(None) => {
+                        let out = d.derive(&o.expr)?;
+                        match named {
+                            Some(at) => outs[at].keyed()?,
+                            None => out.keyed()?,
+                        };
+                    }
                 }
-                (Some(had), k) if Some(had) != k => {
-                    self.columns.remove(&name);
-                }
-                _ => {}
             }
         }
-        Ok(())
+        self.nodes = d.nodes;
+        // Each collation the step names, resolved once.
+        let named: Vec<String> = self
+            .nodes
+            .values()
+            .flat_map(|(out, input)| out.names().chain(input.names()))
+            .map(str::to_string)
+            .collect();
+        for n in named {
+            if !self.resolved.contains_key(&n) {
+                let k = self.resolve(&n).map_err(|e| e.to_string());
+                self.resolved.insert(n, k);
+            }
+        }
+        self.library |= carried.iter().any(|c| {
+            matches!(c, super::collate::Carried::Named(n)
+                if matches!(self.casing_named(n), Ok(Casing::Library(_))))
+        });
+        self.relations.insert(
+            name.to_string(),
+            p.items
+                .iter()
+                .map(|(_, n)| n.clone())
+                .zip(carried.iter().cloned())
+                .collect(),
+        );
+        Ok(carried)
     }
 }
 
@@ -2121,13 +2318,35 @@ fn like_of(
     }
 }
 
-/// The casing a regular expression is compiled under: its text's collation, else its pattern's,
-/// else the database's default.
-fn regex_casing(frame: &Frame, s: &Expr, p: &Expr) -> Result<Casing> {
-    Ok(match frame.casings.implicit(s)? {
-        Some(k) => k,
-        None => frame.casings.implicit(p)?.unwrap_or(Casing::Libc),
-    })
+/// The casing a function of strings is called under: the collation its arguments settle, else the
+/// database's default. Where they settle none, a function that maps case or searches for a
+/// substring is refused in PostgreSQL's words, but where an argument is NULL, which it never reads;
+/// any other needs none.
+fn string_casing(frame: &Frame, e: &Expr, name: &str, values: &[Value]) -> Result<Casing> {
+    let what = match name {
+        "upper" | "lower" | "initcap" | "casefold" => format!("{name}() function"),
+        "strpos" | "position" | "replace" | "split_part" | "starts_with" => {
+            "string comparison".to_string()
+        }
+        _ => String::new(),
+    };
+    if frame.casings.unsettled(e) && (what.is_empty() || values.iter().any(Value::is_null)) {
+        return Ok(Casing::Libc);
+    }
+    Ok(frame.casings.input(e, &what)?.unwrap_or(Casing::Libc))
+}
+
+/// The casing a regular expression is compiled under: the collation its text and its pattern
+/// settle, else the database's default; refused where they settle none, but where either value
+/// is NULL, which the match never reads.
+fn regex_casing(frame: &Frame, e: &Expr, values: &[&Value]) -> Result<Casing> {
+    if frame.casings.unsettled(e) && values.iter().any(|v| v.is_null()) {
+        return Ok(Casing::Libc);
+    }
+    Ok(frame
+        .casings
+        .input(e, "regular expression")?
+        .unwrap_or(Casing::Libc))
 }
 
 /// `s ~ p` and its kin, as PostgreSQL's textregexeq, nameregexeq, bpcharregexeq and their kin read
@@ -2880,17 +3099,14 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }
                 (_, p) => p,
             };
+            // Under the collation the text and the pattern settle.
             let ilike = match e {
-                Expr::ILike { .. } => Some(match frame.casings.implicit(expr)? {
-                    Some(k) => k,
-                    None => frame.casings.implicit(pattern)?.unwrap_or(Casing::Libc),
-                }),
+                Expr::ILike { .. } => {
+                    Some(frame.casings.input(e, "ILIKE")?.unwrap_or(Casing::Libc))
+                }
                 _ => None,
             };
-            let under = match frame.casings.ordering(expr)? {
-                Some(k) => Some(k),
-                None => frame.casings.ordering(pattern)?,
-            };
+            let under = frame.casings.compared(e, "LIKE")?;
             Value::Bool(like_of(&v, &p, escape, ilike, under)? != *negated)
         }
         // `a SIMILAR TO b [ESCAPE c]` is `a ~ similar_to_escape(b [, c])`, as PostgreSQL's grammar
@@ -2907,13 +3123,14 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             }
             let p = super::calls::regexps("similar_to_escape", &args, Casing::Libc)?
                 .unwrap_or(Value::Null);
-            let casing = regex_casing(frame, expr, pattern)?;
+            let s = ev(expr)?;
+            let casing = regex_casing(frame, e, &[&s, &p])?;
             let op = if *negated {
                 BinaryOperator::PGRegexNotMatch
             } else {
                 BinaryOperator::PGRegexMatch
             };
-            regex_match(&ev(expr)?, &p, &op, false, *negated, casing)?
+            regex_match(&s, &p, &op, false, *negated, casing)?
         }
         Expr::AnyOp {
             left,
@@ -3044,7 +3261,12 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             let mut unknown = false;
             for x in list {
                 let (a, b) = beside(v.clone(), ev(x)?, expr, x)?;
-                match compare(&a, &b)? {
+                // Each value compared under the collation the list settles, a NULL under none.
+                let under = match b.is_null() {
+                    true => None,
+                    false => frame.casings.compared(e, "string comparison")?,
+                };
+                match compare_under(under, &a, &b)? {
                     Some(Ordering::Equal) => return Ok(Value::Bool(!*negated)),
                     None => unknown = true,
                     Some(_) => {}
@@ -3070,7 +3292,8 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             let same = match (x.is_null(), y.is_null()) {
                 (true, true) => true,
                 (false, false) => {
-                    compare_under(frame.casings.ordering(e)?, &x, &y)? == Some(Ordering::Equal)
+                    compare_under(frame.casings.compared(e, "string comparison")?, &x, &y)?
+                        == Some(Ordering::Equal)
                 }
                 _ => false,
             };
@@ -3109,8 +3332,9 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                         op,
                         BinaryOperator::PGRegexNotMatch | BinaryOperator::PGRegexNotIMatch
                     );
-                    let casing = regex_casing(frame, left, right)?;
-                    return regex_match(&ev(left)?, &ev(right)?, op, icase, not, casing);
+                    let (s, p) = (ev(left)?, ev(right)?);
+                    let casing = regex_casing(frame, e, &[&s, &p])?;
+                    return regex_match(&s, &p, op, icase, not, casing);
                 }
                 _ => {}
             }
@@ -3200,7 +3424,12 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 | BinaryOperator::LtEq
                 | BinaryOperator::Gt
                 | BinaryOperator::GtEq => {
-                    match compare_under(frame.casings.ordering(e)?, &x, &y)? {
+                    // A NULL is compared under no collation.
+                    let under = match x.is_null() || y.is_null() {
+                        true => None,
+                        false => frame.casings.compared(e, "string comparison")?,
+                    };
+                    match compare_under(under, &x, &y)? {
                         None => Value::Null,
                         Some(o) => Value::Bool(match op {
                             BinaryOperator::Eq => o == Ordering::Equal,
@@ -3430,13 +3659,15 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             match (name.as_str(), a.as_slice()) {
                 // Under the collation its argument carries, the database's default where none.
                 ("upper" | "lower", [x]) => {
-                    let casing = frame.casings.implicit(x)?.unwrap_or(Casing::Libc);
                     match ev(x)? {
                         Value::Null => Value::Null,
                         v @ (Value::Text(_) | Value::Str(..)) => Value::Text(crate::strings::case(
                             std::str::from_utf8(v.string_key().unwrap()).unwrap_or_default(),
                             name == "upper",
-                            casing,
+                            frame
+                                .casings
+                                .input(e, &format!("{name}() function"))?
+                                .unwrap_or(Casing::Libc),
                         )?),
                         // A range's or a multirange's bound.
                         v @ Value::Composed(..) => {
@@ -3499,19 +3730,13 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     {
                         return Ok(v);
                     }
-                    // Under the collation an argument names, else the one the first carries.
-                    let casing = match a.iter().find(|x| names_collate(x)).or(a.first()) {
-                        Some(x) => frame.casings.implicit(x)?.unwrap_or(Casing::Libc),
-                        None => Casing::Libc,
-                    };
+                    // Under the collation its arguments settle.
+                    let casing = string_casing(frame, e, &name, &values)?;
                     if let Some(v) = super::calls::strings(&name, &values, casing)? {
                         return Ok(v);
                     }
                     if super::calls::is_regexp_function(&name) {
-                        let casing = match a.as_slice() {
-                            [s, p, ..] => regex_casing(frame, s, p)?,
-                            _ => casing,
-                        };
+                        let casing = regex_casing(frame, e, &values.iter().collect::<Vec<_>>())?;
                         if let Some(v) = super::calls::regexps(&name, &values, casing)? {
                             return Ok(v);
                         }
@@ -3578,6 +3803,48 @@ fn typed_from(
                 .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
             for (c, t) in names.iter().zip(types) {
                 out.push((Some(q.clone()), c.clone(), *t));
+            }
+        }
+    }
+    out
+}
+
+/// The columns a FROM reads, each under its alias, with the collation it carries: a step's by its
+/// place among the step's columns, the table's by its name among the table's.
+fn carried_from(
+    items: &[TableWithJoins],
+    typed: &HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)>,
+    relations: &HashMap<String, Vec<(String, super::collate::Carried)>>,
+    table: &str,
+) -> Vec<(Option<String>, String, super::collate::Carried)> {
+    let mut out = Vec::new();
+    for item in items {
+        for t in std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation)) {
+            let TableFactor::Table { name, alias, .. } = t else {
+                continue;
+            };
+            let n = crate::catalog::object_name(name);
+            let key = if typed.contains_key(&n) {
+                n.clone()
+            } else if table == n || table.rsplit('.').next() == Some(n.as_str()) {
+                table.to_string()
+            } else {
+                continue;
+            };
+            let (Some((names, _)), Some(carried)) = (typed.get(&key), relations.get(&key)) else {
+                continue;
+            };
+            let q = alias
+                .as_ref()
+                .map(|a| ident(&a.name))
+                .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+            for (i, c) in names.iter().enumerate() {
+                let found = match carried.len() == names.len() {
+                    true => carried.get(i),
+                    false => carried.iter().find(|(m, _)| m == c),
+                };
+                let collation = found.map_or(super::collate::Carried::None, |(_, k)| k.clone());
+                out.push((Some(q.clone()), c.clone(), collation));
             }
         }
     }
@@ -3709,7 +3976,7 @@ fn windows(
         let parted_under = spec
             .partition_by
             .iter()
-            .map(|p| frame.casings.ordering(p))
+            .map(|p| frame.casings.keyed(p))
             .collect::<Result<Vec<_>>>()?;
         for (r, row) in rel.rows.iter().enumerate() {
             let part: Vec<Key> = spec
@@ -3858,7 +4125,7 @@ fn windows_whole(
         let parted_under = spec
             .partition_by
             .iter()
-            .map(|p| frame.casings.ordering(p))
+            .map(|p| frame.casings.keyed(p))
             .collect::<Result<Vec<_>>>()?;
         for r in 0..rel.rows.len() {
             let k: Vec<Key> = spec
@@ -3891,7 +4158,7 @@ fn windows_whole(
                 let under = folds
                     .args
                     .iter()
-                    .map(|x| frame.casings.ordering(x))
+                    .map(|x| frame.casings.keyed(x))
                     .collect::<Result<Vec<_>>>()?;
                 Some((acc, folds, under))
             } else {
@@ -4656,6 +4923,8 @@ struct Prepared<'q> {
     /// Each expression's type, where the step resolves it, and the type of each column it returns.
     types: super::typed::Types,
     returns: Vec<Option<ColumnType>>,
+    /// The collation each column it returns carries.
+    carried: Vec<super::collate::Carried>,
     /// The clock its statement reads.
     now: i64,
 }
@@ -4684,13 +4953,16 @@ impl Prepared<'_> {
                     .into_iter()
                     .map(|x| Ok((eval(x, row, frame, &computed)?, quoted(x))))
                     .collect::<Result<Vec<_>>>()?;
-                // Under the collation an argument names, else the one the first carries.
-                let a = args(f)?;
-                let casing = match a.iter().find(|x| names_collate(x)).or_else(|| a.first()) {
-                    Some(x) => frame.casings.implicit(x)?.unwrap_or(Casing::Libc),
-                    None => Casing::Libc,
+                // Under the collation its arguments settle; a regular expression's refused where
+                // they settle none.
+                let name = function_name(f);
+                let casing = match super::calls::is_regexp_function(&name) {
+                    true => {
+                        regex_casing(frame, c, &values.iter().map(|(v, _)| v).collect::<Vec<_>>())?
+                    }
+                    false => string_casing(frame, c, &name, &[])?,
                 };
-                super::sets::values(&function_name(f), values, frame.type_of(c), casing)
+                super::sets::values(&name, values, frame.type_of(c), casing)
             })
             .collect::<Result<Vec<_>>>()?;
         let n = sets.iter().map(Vec::len).max().unwrap_or(0);
@@ -4865,6 +5137,7 @@ fn prepare<'q>(
         distinct: s.distinct.is_some(),
         types: typing.types,
         returns,
+        carried: Vec::new(),
         now,
     })
 }
@@ -4994,14 +5267,14 @@ impl<'q> StepRun<'q> {
                 .p
                 .grouping
                 .iter()
-                .map(|g| frame.casings.ordering(g))
+                .map(|g| frame.casings.keyed(g))
                 .collect::<Result<Vec<_>>>()?;
             let folded_under = folded
                 .iter()
                 .map(|f| {
                     f.args
                         .iter()
-                        .map(|x| frame.casings.ordering(x))
+                        .map(|x| frame.casings.keyed(x))
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -5176,16 +5449,18 @@ impl<'q> StepRun<'q> {
             out.rows = self.once(std::mem::take(&mut out.rows));
         }
         if let Some(ob) = self.p.order_by {
-            sort(&mut out, ob, params, release, casings)?;
+            sort(&mut out, ob, &self.p.carried, params, release, casings)?;
         }
         Ok(out)
     }
 }
 
-/// A step's rows sorted as its ORDER BY says, on the step's own columns.
+/// A step's rows sorted as its ORDER BY says, on the step's own columns, each carrying its
+/// collation.
 fn sort(
     out: &mut Relation,
     ob: &sqlparser::ast::OrderBy,
+    carried: &[super::collate::Carried],
     params: &[String],
     release: u8,
     casings: &Casings,
@@ -5212,11 +5487,9 @@ fn sort(
     let under = exprs
         .iter()
         .zip(&at)
-        .map(|(o, at)| match at {
-            Some(c) => casings.ordering(&Expr::Identifier(sqlparser::ast::Ident::new(
-                out.names[*c].clone(),
-            ))),
-            None => casings.ordering(&o.expr),
+        .map(|(o, at)| match at.and_then(|c| carried.get(c)) {
+            Some(c) => casings.carried(c),
+            None => casings.keyed(&o.expr),
         })
         .collect::<Result<Vec<_>>>()?;
     let none = computed_none();
@@ -5466,7 +5739,7 @@ impl<'q> Stream<'q> {
                 SetExpr::Select(sel) => typed_from(&sel.from, &typed, &s.table.name),
                 _ => Vec::new(),
             };
-            let p = prepare(query, &columns, release, now)?;
+            let mut p = prepare(query, &columns, release, now)?;
             typed.insert(
                 name.clone(),
                 (
@@ -5474,7 +5747,13 @@ impl<'q> Stream<'q> {
                     p.returns.clone(),
                 ),
             );
-            s.casings.add_step(query)?;
+            let carried = match query.body.as_ref() {
+                SetExpr::Select(sel) => {
+                    carried_from(&sel.from, &typed, &s.casings.relations, &s.table.name)
+                }
+                _ => Vec::new(),
+            };
+            p.carried = s.casings.add_step(&name, &p, &carried)?;
             let kind = if after {
                 for n in streamed {
                     s.kept.entry(n).or_insert_with(|| Relation {
