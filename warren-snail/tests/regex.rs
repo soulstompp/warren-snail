@@ -195,6 +195,8 @@ fn the_classes_are_the_collation_s() {
         ("'٣' COLLATE pg_c_utf8 ~ '[[:digit:]]'", "false"),
         ("'٣' COLLATE pg_unicode_fast ~ '[[:digit:]]'", "true"),
         ("'É' COLLATE \"C\" ~* 'é'", "false"),
+        ("'$' COLLATE pg_c_utf8 ~ '[[:punct:]]'", "true"),
+        ("'$' COLLATE pg_unicode_fast ~ '[[:punct:]]'", "false"),
     ] {
         assert_eq!(one(&mut s, expr).unwrap().as_deref(), Some(want), "{expr}");
     }
@@ -281,4 +283,28 @@ fn a_question_the_question_path_does_not_read_is_handed_over() {
             .collect(),
     };
     assert_eq!(ids, vec![1, 6, 9]);
+}
+
+#[test]
+fn regexp_replace_reads_its_start_and_its_count() {
+    let mut s = snail("regex_replace");
+    for (expr, want) in [
+        ("regexp_replace('abcabc', 'b', 'X', 3)", "abcaXc"),
+        ("regexp_replace('abcabc', 'b', 'X', 1, 2)", "abcaXc"),
+        ("regexp_replace('abcabc', 'B', 'X', 1, 0, 'i')", "aXcaXc"),
+    ] {
+        assert_eq!(one(&mut s, expr).unwrap().as_deref(), Some(want), "{expr}");
+    }
+}
+
+#[test]
+fn a_question_on_similar_to_alone_is_handed_over() {
+    let mut s = snail("regex_similar_question");
+    let (b, _) = s
+        .ask("SELECT id FROM s.t WHERE t SIMILAR TO '%(z|o)%'", None)
+        .unwrap();
+    let ids: Vec<String> = (0..b.num_rows())
+        .map(|r| arrow::util::display::array_value_to_string(b.column(0), r).unwrap())
+        .collect();
+    assert_eq!(ids, ["2", "3", "5"]);
 }
