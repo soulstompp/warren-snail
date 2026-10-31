@@ -813,4 +813,63 @@ mod written {
             .unwrap();
         assert_eq!(texts(batch.column(0).as_ref())[0].as_deref(), Some("one"));
     }
+
+    /// SET CONSTRAINTS across two snails: each name reaches the snail holding it, found as that
+    /// snail's own SET CONSTRAINTS finds it, and one neither holds is refused in PostgreSQL's words.
+    #[test]
+    fn set_constraints_across_snails_reaches_the_snail_holding_each_name() {
+        let one = tmp("constraints-across-one.snail");
+        let two = tmp("constraints-across-two.snail");
+        let made = |path: &Path, ddl: &str| {
+            write(path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+        };
+        made(
+            &one,
+            "CREATE TABLE parent (id integer PRIMARY KEY);
+             CREATE TABLE child (id integer PRIMARY KEY, p integer,
+                 CONSTRAINT k_fk FOREIGN KEY (p) REFERENCES parent (id) DEFERRABLE);",
+        );
+        made(
+            &two,
+            "CREATE TABLE s.parent (id integer PRIMARY KEY);
+             CREATE TABLE s.child (id integer PRIMARY KEY, q integer, CONSTRAINT k_check CHECK (id > 0),
+                 CONSTRAINT s_fk FOREIGN KEY (q) REFERENCES s.parent (id) DEFERRABLE);",
+        );
+        let mut w = Snails::open_writing(&[&one, &two]).unwrap();
+        for (sql, why) in [
+            (
+                "SET CONSTRAINTS s_fk IMMEDIATE",
+                "constraint \"s_fk\" does not exist",
+            ),
+            (
+                "SET CONSTRAINTS s.nope IMMEDIATE",
+                "constraint \"nope\" does not exist",
+            ),
+            (
+                "SET CONSTRAINTS t.k_fk IMMEDIATE",
+                "schema \"t\" does not exist",
+            ),
+            (
+                "SET CONSTRAINTS s.k_check DEFERRED",
+                "constraint \"k_check\" is not deferrable",
+            ),
+        ] {
+            w.execute("BEGIN").unwrap();
+            let e = w
+                .execute(sql)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} was taken"));
+            assert_eq!(e.to_string(), why, "{sql}");
+            w.execute("ROLLBACK").unwrap();
+        }
+        w.execute("BEGIN").unwrap();
+        w.execute("SET CONSTRAINTS k_fk, s.s_fk DEFERRED").unwrap();
+        w.execute("INSERT INTO child (id, p) VALUES (1, 9)")
+            .unwrap();
+        w.execute("INSERT INTO s.child (id, q) VALUES (1, 8)")
+            .unwrap();
+        let e = w.execute("SET CONSTRAINTS s.s_fk IMMEDIATE").unwrap_err();
+        assert!(e.to_string().contains("Key (q)=(8) is not present"), "{e}");
+        w.execute("ROLLBACK").unwrap();
+    }
 }

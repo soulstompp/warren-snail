@@ -749,21 +749,37 @@ impl Snails {
                 "a table is declared on its own snail: open it alone to write",
             )),
             Statement::Setting { .. } => self.snails[0].execute(sql),
-            Statement::Constraints { names, .. } => {
-                // Each snail takes it for the keys it holds.
+            Statement::Constraints { names, deferred } => {
+                // Each snail takes the names it finds, as its own SET CONSTRAINTS finds them; a name
+                // none finds is refused by the snail naming its schema, or the first.
                 let mut done = Done::default();
-                for i in 0..self.snails.len() {
-                    let holds = names.as_ref().is_none_or(|ns| {
-                        ns.iter().any(|n| {
-                            self.snails[i]
-                                .catalog
-                                .tables
-                                .iter()
-                                .any(|t| t.foreign_keys.iter().any(|k| k.name == *n))
-                        })
-                    });
-                    if holds {
+                let Some(names) = names else {
+                    for i in 0..self.snails.len() {
                         done = self.run(i, sql)?;
+                    }
+                    return Ok(done);
+                };
+                let mut given: Vec<Vec<String>> = vec![Vec::new(); self.snails.len()];
+                for n in &names {
+                    let found: Vec<usize> = (0..self.snails.len())
+                        .filter(|&i| super::foreign::named(&self.snails[i].catalog, n).is_ok())
+                        .collect();
+                    if found.is_empty() {
+                        let schema = n.rsplit_once('.').map(|(s, _)| s);
+                        let i = (0..self.snails.len())
+                            .find(|&i| {
+                                schema.is_some_and(|s| self.snails[i].catalog.holds_schema(s))
+                            })
+                            .unwrap_or(0);
+                        return self.run(i, &set_constraints(std::slice::from_ref(n), deferred));
+                    }
+                    for i in found {
+                        given[i].push(n.clone());
+                    }
+                }
+                for (i, ns) in given.iter().enumerate() {
+                    if !ns.is_empty() {
+                        done = self.run(i, &set_constraints(ns, deferred))?;
                     }
                 }
                 Ok(done)
@@ -1108,6 +1124,21 @@ pub(super) fn carried_root(
         }
     }
     Ok(None)
+}
+
+/// SET CONSTRAINTS of the names given, each part of each quoted, deferred or immediate.
+fn set_constraints(names: &[String], deferred: bool) -> String {
+    let quoted: Vec<String> = names
+        .iter()
+        .map(|n| {
+            n.split('.')
+                .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .collect();
+    let mode = if deferred { "DEFERRED" } else { "IMMEDIATE" };
+    format!("SET CONSTRAINTS {} {mode}", quoted.join(", "))
 }
 
 impl Snail {

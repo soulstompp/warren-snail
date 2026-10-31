@@ -145,6 +145,79 @@ fn schema_of(name: &str) -> &str {
     name.rsplit_once('.').map_or("public", |(s, _)| s)
 }
 
+/// A constraint SET CONSTRAINTS names, each with whether it is DEFERRABLE.
+pub(super) enum Named<'c> {
+    /// A foreign key: its table's place and its own.
+    Key((usize, usize), bool),
+    /// A PRIMARY KEY, a UNIQUE or an EXCLUDE: its table and its order.
+    Order(&'c Table, &'c crate::catalog::Order, bool),
+    /// A table's CHECK or a domain's, which is never DEFERRABLE.
+    Check,
+}
+
+/// What a name SET CONSTRAINTS gives finds, as PostgreSQL's AfterTriggerSetState finds it: its
+/// bare name, and every constraint of that name in the schema it names, or else in the first schema
+/// of the search path holding one. Refused where it names another database or too many parts, a
+/// schema the file names nothing in, or no constraint.
+pub(super) fn named<'c, 'n>(catalog: &'c Catalog, n: &'n str) -> Result<(&'n str, Vec<Named<'c>>)> {
+    let parts: Vec<&str> = n.split('.').collect();
+    let (schema, bare) = match parts.as_slice() {
+        [bare] => (None, *bare),
+        [schema, bare] => (Some(*schema), *bare),
+        [_, _, _] => {
+            return Err(Error::new(format!(
+                "cross-database references are not implemented: \"{n}\""
+            )))
+        }
+        _ => {
+            return Err(Error::new(format!(
+                "improper qualified name (too many dotted names): {n}"
+            )))
+        }
+    };
+    let schemas: Vec<&str> = match schema {
+        Some(s) if catalog.holds_schema(s) => vec![s],
+        Some(s) => return Err(Error::new(format!("schema \"{s}\" does not exist"))),
+        None => SEARCH_PATH.to_vec(),
+    };
+    let mut found = Vec::new();
+    for s in schemas {
+        for (ci, t) in catalog.tables.iter().enumerate() {
+            if schema_of(&t.name) != s {
+                continue;
+            }
+            for (fi, k) in t.foreign_keys.iter().enumerate() {
+                if k.name == bare {
+                    found.push(Named::Key((ci, fi), k.deferrable));
+                }
+            }
+            for o in t.orders.iter().filter(|o| o.name == bare) {
+                let deferrable = (o.constraint.as_ref().map(|k| k.deferrable))
+                    .or(o.exclusion.as_ref().map(|e| e.deferrable));
+                if let Some(d) = deferrable {
+                    found.push(Named::Order(t, o, d));
+                }
+            }
+            if t.checks.iter().any(|k| k.name == bare) {
+                found.push(Named::Check);
+            }
+        }
+        for d in &catalog.domains {
+            if schema_of(&d.name) == s && d.checks.iter().any(|k| k.name == bare) {
+                found.push(Named::Check);
+            }
+        }
+        // The first schema holding a constraint of that name is the only one read.
+        if !found.is_empty() {
+            break;
+        }
+    }
+    if found.is_empty() {
+        return Err(Error::new(format!("constraint \"{bare}\" does not exist")));
+    }
+    Ok((bare, found))
+}
+
 impl Snail {
     /// The foreign keys a table's changes touch, each change recorded where the key reads it: a row
     /// written into a child, and a key taken from a parent, the parent's row holding no NULL in it.
@@ -326,84 +399,24 @@ impl Snail {
             }
             Some(names) => {
                 for n in names {
-                    let parts: Vec<&str> = n.split('.').collect();
-                    let (schema, bare) = match parts.as_slice() {
-                        [bare] => (None, *bare),
-                        [schema, bare] => (Some(*schema), *bare),
-                        [_, _, _] => {
-                            return Err(Error::new(format!(
-                                "cross-database references are not implemented: \"{n}\""
-                            )))
-                        }
-                        _ => {
-                            return Err(Error::new(format!(
-                                "improper qualified name (too many dotted names): {n}"
-                            )))
-                        }
-                    };
-                    let schemas: Vec<&str> = match schema {
-                        Some(s) if self.catalog.holds_schema(s) => vec![s],
-                        Some(s) => {
-                            return Err(Error::new(format!("schema \"{s}\" does not exist")))
-                        }
-                        None => SEARCH_PATH.to_vec(),
-                    };
+                    let (bare, found) = named(&self.catalog, n)?;
                     let not_deferrable =
                         || Error::new(format!("constraint \"{bare}\" is not deferrable"));
-                    let mut found = false;
-                    for s in schemas {
-                        for (ci, t) in self.catalog.tables.iter().enumerate() {
-                            if schema_of(&t.name) != s {
-                                continue;
+                    for c in found {
+                        match c {
+                            Named::Key(at, true) => keys.push(at),
+                            Named::Order(t, o, true) if deferred => {
+                                return Err(Error::new(format!(
+                                    "SET CONSTRAINTS {n} DEFERRED: {}.{} is a DEFERRABLE key, and \
+                                     the snail checks a key at each statement's end",
+                                    t.name, o.name
+                                )))
                             }
-                            for (fi, k) in t.foreign_keys.iter().enumerate() {
-                                if k.name != bare {
-                                    continue;
-                                }
-                                found = true;
-                                if k.deferrable {
-                                    keys.push((ci, fi));
-                                } else if deferred {
-                                    return Err(not_deferrable());
-                                }
+                            Named::Key(_, false) | Named::Order(..) | Named::Check if deferred => {
+                                return Err(not_deferrable())
                             }
-                            for o in t.orders.iter().filter(|o| o.name == bare) {
-                                let Some(deferrable) = key_deferrable(o) else {
-                                    continue;
-                                };
-                                found = true;
-                                if deferrable && deferred {
-                                    return Err(Error::new(format!(
-                                        "SET CONSTRAINTS {n} DEFERRED: {}.{} is a DEFERRABLE key, \
-                                         and the snail checks a key at each statement's end",
-                                        t.name, o.name
-                                    )));
-                                } else if deferred {
-                                    return Err(not_deferrable());
-                                }
-                            }
-                            if t.checks.iter().any(|k| k.name == bare) {
-                                found = true;
-                                if deferred {
-                                    return Err(not_deferrable());
-                                }
-                            }
+                            _ => {}
                         }
-                        for d in &self.catalog.domains {
-                            if schema_of(&d.name) == s && d.checks.iter().any(|k| k.name == bare) {
-                                found = true;
-                                if deferred {
-                                    return Err(not_deferrable());
-                                }
-                            }
-                        }
-                        // The first schema holding a constraint of that name is the only one read.
-                        if found {
-                            break;
-                        }
-                    }
-                    if !found {
-                        return Err(Error::new(format!("constraint \"{bare}\" does not exist")));
                     }
                 }
             }
