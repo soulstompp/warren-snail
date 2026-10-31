@@ -430,6 +430,15 @@ impl Casings {
         self.monetary
     }
 
+    /// No column's casing, and money read and printed under `monetary`: what an expression naming
+    /// no column of a table reads, a domain's CHECK or a DEFAULT.
+    pub(crate) fn under(monetary: crate::monetary::Monetary) -> Casings {
+        Casings {
+            monetary,
+            ..Casings::default()
+        }
+    }
+
     /// The casings of a table's columns, and the collations the DDL makes.
     pub fn of_table(
         table: &crate::catalog::Table,

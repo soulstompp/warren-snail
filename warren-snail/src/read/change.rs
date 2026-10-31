@@ -476,9 +476,6 @@ fn check(table: &Table, row: &Row) -> Result<()> {
     for (col, d) in table.columns.iter().zip(row) {
         let what = |why: String| Error::new(format!("{}.{}: {why}", table.name, col.name));
         match (col.ty, d) {
-            (_, Datum::Null) if col.not_null => {
-                return Err(what("is NOT NULL and the row holds NULL".into()))
-            }
             (_, Datum::Null) => {}
             (ColumnType::Int2, Datum::Int(v)) if i16::try_from(*v).is_err() => {
                 return Err(what(format!("{v} is out of range")))
@@ -873,8 +870,8 @@ impl Snail {
                 };
             }
             fill::generate(&t, &mut n)?;
-            fill::check(&t, &n)?;
             fill::check_domains(&self.catalog.domains, &t, &n)?;
+            fill::check(&t, &n)?;
             fill::without_overlaps(&t, &n)?;
             changes.push(Change::Replace(o, n));
         }
@@ -918,8 +915,8 @@ impl Snail {
                 });
             }
             fill::generate(&t, &mut row)?;
-            fill::check(&t, &row)?;
             fill::check_domains(&self.catalog.domains, &t, &row)?;
+            fill::check(&t, &row)?;
             fill::without_overlaps(&t, &row)?;
             out.push(row);
         }
@@ -995,7 +992,13 @@ impl Snail {
             return statement::datum(e, t, c);
         }
         fill::assign_value(
-            super::pipeline::eval_on(e, &[], &[], t.release, &Default::default())?,
+            super::pipeline::eval_on(
+                e,
+                &[],
+                &[],
+                t.release,
+                &super::pipeline::Casings::under(t.monetary),
+            )?,
             col.ty,
             &col.name,
         )

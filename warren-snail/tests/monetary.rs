@@ -408,4 +408,48 @@ mod under_a_locale {
             ])
         );
     }
+
+    #[test]
+    #[cfg(feature = "standalone")]
+    fn a_domain_s_check_and_a_default_read_their_money_under_the_file_s_locale() {
+        // Each as PostgreSQL 18.6 and 19 RC1 took, refused and printed it on 28818 and 28819 under
+        // lc_monetary en_DK.utf8 (2026-10-31): a money literal standing alone, read where the
+        // domain's CHECK and the DEFAULT are.
+        let ddl = "CREATE DOMAIN s.floor AS money CHECK (VALUE >= 'kr. 1,50'::money);
+                   CREATE TABLE s.d (id integer NOT NULL, v s.floor,
+                       w money DEFAULT 'kr. 1,50'::money + CAST(1 AS money), PRIMARY KEY (id));";
+        let path = tmp("money-dk-domain.snail");
+        write_carried(
+            &path,
+            &Catalog::parse(ddl).unwrap(),
+            &[],
+            &[],
+            span(),
+            warren_snail::regs::LATEST,
+            &carried(&[("s.d", "v", "en_DK.utf8"), ("s.d", "w", "en_DK.utf8")]),
+        )
+        .unwrap();
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("INSERT INTO s.d (id, v) VALUES (1, CAST(2 AS money))")
+            .unwrap();
+        w.execute("INSERT INTO s.d (id, v) VALUES (3, 'kr. 1,50')")
+            .unwrap();
+        let e = w
+            .execute("INSERT INTO s.d (id, v) VALUES (2, CAST(1 AS money))")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "value for domain s.floor violates check constraint \"floor_check\""
+        );
+        drop(w);
+        let mut s = Snail::open(&path).unwrap();
+        let (b, _) = s
+            .ask("SELECT d.id, d.v, d.w FROM s.d d ORDER BY d.id", None)
+            .unwrap();
+        assert_eq!(
+            [shown(&b, 1), shown(&b, 2)].concat(),
+            some(&["kr. 2,00", "kr. 1,50", "kr. 2,50", "kr. 2,50"])
+        );
+    }
 }

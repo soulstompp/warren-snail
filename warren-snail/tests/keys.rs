@@ -358,7 +358,7 @@ fn a_deferred_key_is_checked_at_the_commit_and_one_that_fails_rolls_it_back() {
     );
     run(&mut w, "ROLLBACK");
     run(&mut w, "BEGIN");
-    run(&mut w, "SET CONSTRAINTS soon DEFERRED");
+    run(&mut w, "SET CONSTRAINTS s.soon DEFERRED");
     run(&mut w, "INSERT INTO s.c (id, q) VALUES (2, 8)");
     refused(
         &mut w,
@@ -367,10 +367,10 @@ fn a_deferred_key_is_checked_at_the_commit_and_one_that_fails_rolls_it_back() {
     );
     run(&mut w, "ROLLBACK");
     run(&mut w, "BEGIN");
-    run(&mut w, "SET CONSTRAINTS s.soon, late DEFERRED");
+    run(&mut w, "SET CONSTRAINTS s.soon, s.late DEFERRED");
     run(&mut w, "INSERT INTO s.c (id, q) VALUES (3, 9)");
     run(&mut w, "INSERT INTO s.p (id) VALUES (9)");
-    run(&mut w, "SET CONSTRAINTS soon IMMEDIATE");
+    run(&mut w, "SET CONSTRAINTS s.soon IMMEDIATE");
     run(&mut w, "DELETE FROM s.p WHERE id = 7");
     run(&mut w, "INSERT INTO s.p (id) VALUES (7)");
     run(&mut w, "COMMIT");
@@ -386,12 +386,12 @@ fn a_deferred_key_is_checked_at_the_commit_and_one_that_fails_rolls_it_back() {
     run(&mut w, "ROLLBACK");
     refused(
         &mut w,
-        "SET CONSTRAINTS now DEFERRED",
+        "SET CONSTRAINTS s.now DEFERRED",
         "constraint \"now\" is not deferrable",
     );
     refused(
         &mut w,
-        "SET CONSTRAINTS nothing DEFERRED",
+        "SET CONSTRAINTS s.nothing DEFERRED",
         "constraint \"nothing\" does not exist",
     );
     // Outside a transaction it does nothing.
@@ -408,6 +408,113 @@ fn a_deferred_key_is_checked_at_the_commit_and_one_that_fails_rolls_it_back() {
         ["1,7,NULL", "3,NULL,9", "5,NULL,NULL"]
     );
     assert_eq!(rows(&mut s, "SELECT id FROM s.p"), ["11", "7", "9"]);
+}
+
+#[test]
+fn set_constraints_finds_a_name_in_its_schema_or_the_first_on_the_search_path_holding_it() {
+    // Each taken or refused as PostgreSQL 18.6 and 19 RC1 took or refused it, in their words, on
+    // 28818 and 28819 (2026-10-31). A table naming no schema lies in public.
+    let path = made(
+        "keys-set-constraints",
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE child (id integer PRIMARY KEY, p integer,
+             CONSTRAINT k_fk FOREIGN KEY (p) REFERENCES parent (id) DEFERRABLE, CONSTRAINT k_check CHECK (id > 0));
+         CREATE TABLE s.parent (id integer PRIMARY KEY);
+         CREATE TABLE s.child (id integer PRIMARY KEY, p integer, q integer,
+             CONSTRAINT k_fk FOREIGN KEY (p) REFERENCES s.parent (id),
+             CONSTRAINT s_fk FOREIGN KEY (q) REFERENCES s.parent (id) DEFERRABLE, CONSTRAINT s_ex EXCLUDE (q WITH =));
+         CREATE DOMAIN s.pos AS integer CONSTRAINT pos_check CHECK (VALUE > 0);",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    for (sql, why) in [
+        (
+            "SET CONSTRAINTS s_fk IMMEDIATE",
+            "constraint \"s_fk\" does not exist",
+        ),
+        (
+            "SET CONSTRAINTS k_check, s_fk IMMEDIATE",
+            "constraint \"s_fk\" does not exist",
+        ),
+        (
+            "SET CONSTRAINTS s.nope IMMEDIATE",
+            "constraint \"nope\" does not exist",
+        ),
+        (
+            "SET CONSTRAINTS t.k_fk IMMEDIATE",
+            "schema \"t\" does not exist",
+        ),
+        (
+            "SET CONSTRAINTS s.k_fk DEFERRED",
+            "constraint \"k_fk\" is not deferrable",
+        ),
+        (
+            "SET CONSTRAINTS k_check DEFERRED",
+            "constraint \"k_check\" is not deferrable",
+        ),
+        (
+            "SET CONSTRAINTS s.pos_check DEFERRED",
+            "constraint \"pos_check\" is not deferrable",
+        ),
+        (
+            "SET CONSTRAINTS s.s_ex DEFERRED",
+            "constraint \"s_ex\" is not deferrable",
+        ),
+        (
+            "SET CONSTRAINTS child_pkey DEFERRED",
+            "constraint \"child_pkey\" is not deferrable",
+        ),
+        (
+            "SET CONSTRAINTS d.s.k_fk IMMEDIATE",
+            "cross-database references are not implemented: \"d.s.k_fk\"",
+        ),
+        (
+            "SET CONSTRAINTS a.b.c.d IMMEDIATE",
+            "improper qualified name (too many dotted names): a.b.c.d",
+        ),
+    ] {
+        run(&mut w, "BEGIN");
+        let e = w
+            .execute(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was taken"));
+        assert_eq!(e.to_string(), why, "{sql}");
+        run(&mut w, "ROLLBACK");
+    }
+    // A key named in its schema; the first schema of the search path holding the name, and that one
+    // alone; and a constraint not DEFERRABLE made IMMEDIATE, which it is.
+    for sql in [
+        "SET CONSTRAINTS s.s_fk IMMEDIATE",
+        "SET CONSTRAINTS k_fk DEFERRED",
+        "SET CONSTRAINTS public.k_fk DEFERRED",
+        "SET CONSTRAINTS s.k_fk IMMEDIATE",
+        "SET CONSTRAINTS k_check IMMEDIATE",
+        "SET CONSTRAINTS s.pos_check IMMEDIATE",
+        "SET CONSTRAINTS s.s_ex IMMEDIATE",
+    ] {
+        run(&mut w, "BEGIN");
+        run(&mut w, sql);
+        run(&mut w, "ROLLBACK");
+    }
+    // The key a bare name finds is the one deferred.
+    run(&mut w, "BEGIN");
+    run(&mut w, "SET CONSTRAINTS k_fk DEFERRED");
+    run(&mut w, "INSERT INTO child (id, p) VALUES (1, 9)");
+    refused(
+        &mut w,
+        "SET CONSTRAINTS k_fk IMMEDIATE",
+        "insert or update on table \"child\" violates foreign key constraint \"k_fk\": Key (p)=(9) \
+         is not present in table \"parent\".",
+    );
+    run(&mut w, "ROLLBACK");
+    run(&mut w, "BEGIN");
+    run(&mut w, "SET CONSTRAINTS s.s_fk DEFERRED");
+    run(&mut w, "INSERT INTO s.child (id, q) VALUES (1, 8)");
+    run(&mut w, "INSERT INTO s.parent (id) VALUES (8)");
+    run(&mut w, "COMMIT");
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    assert_eq!(rows(&mut s, "SELECT id, q FROM s.child"), ["1,8"]);
+    assert!(rows(&mut s, "SELECT id FROM child").is_empty());
 }
 
 #[test]

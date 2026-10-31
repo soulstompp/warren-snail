@@ -2570,6 +2570,20 @@ impl Catalog {
         self.tables.iter().find(|t| t.name == name)
     }
 
+    /// Whether a schema of that name is the database's own, or one an object of the file names.
+    pub(crate) fn holds_schema(&self, schema: &str) -> bool {
+        let named = |n: &str| n.rsplit_once('.').is_some_and(|(s, _)| s == schema);
+        matches!(
+            schema,
+            "public" | "pg_catalog" | "pg_toast" | "information_schema"
+        ) || self.tables.iter().any(|t| named(&t.name))
+            || self.sequences.iter().any(|s| named(&s.name))
+            || self.types.iter().any(|t| named(&t.name))
+            || self.domains.iter().any(|d| named(&d.name))
+            || self.collations.iter().any(|c| named(&c.name))
+            || self.functions.iter().any(|f| named(&f.name))
+    }
+
     /// Each reg* type its columns, its functions' arguments and its domains name, named by the
     /// catalog of `release`: refused where the release has no such type.
     pub fn with_release(&mut self, release: u8) -> Result<()> {

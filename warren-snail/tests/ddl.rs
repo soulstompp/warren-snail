@@ -554,3 +554,238 @@ fn a_quote_doubled_inside_a_string_is_kept_in_a_statement_and_in_the_ddl_the_fil
     let mut s = Snail::open(&path).unwrap();
     assert_eq!(rows(&mut s, "SELECT id, v FROM s.t"), [row(&["1", "it's"])]);
 }
+
+/// A NOT NULL refusal in PostgreSQL's words, its detail after them: the column, the relation, and
+/// the row as PostgreSQL writes it.
+fn not_null(column: &str, relation: &str, row: &str) -> String {
+    format!(
+        "null value in column \"{column}\" of relation \"{relation}\" violates not-null \
+         constraint: Failing row contains {row}."
+    )
+}
+
+const NOT_NULL_DDL: &str = "CREATE DOMAIN s.posint AS integer NOT NULL CHECK (VALUE > 0);
+    CREATE TABLE s.nn (id integer PRIMARY KEY, a integer NOT NULL, b text NOT NULL DEFAULT 'x',
+        c varchar(80), d boolean, e numeric(6,2) NOT NULL,
+        g integer GENERATED ALWAYS AS (a * 2) STORED, v integer GENERATED ALWAYS AS (a + 1) VIRTUAL,
+        w integer GENERATED ALWAYS AS (CASE WHEN a = 7 THEN NULL ELSE a END) VIRTUAL NOT NULL,
+        long text, dd s.posint DEFAULT 1, CONSTRAINT nn_c CHECK (a > 0));
+    CREATE TABLE s.parent (id integer PRIMARY KEY);
+    CREATE TABLE s.child (id integer PRIMARY KEY, p integer NOT NULL REFERENCES s.parent (id) ON DELETE SET NULL);
+    CREATE TABLE s.held (id integer PRIMARY KEY, p s.posint REFERENCES s.parent (id) ON DELETE SET NULL);";
+
+#[test]
+fn a_null_in_a_not_null_column_is_refused_in_postgresql_s_words_with_the_row_it_fails_on() {
+    // Each refused as PostgreSQL 18.6 and 19 RC1 refused it, in their words, on 28818 and 28819
+    // (2026-10-31): the stored columns in turn, then the virtual ones; a domain's NULL before
+    // them; a CHECK after them, row by row.
+    let path = made("not-null", NOT_NULL_DDL);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let e = "éééééééééééééééééééééééééééééééééééééééé";
+    let cut = &e[..64];
+    for (sql, why) in [
+        (
+            "INSERT INTO s.nn (id, a, e) VALUES (1, NULL, 1.5)".to_string(),
+            not_null(
+                "a",
+                "nn",
+                "(1, null, x, null, null, 1.50, null, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, e) VALUES (NULL, 1, 1)".to_string(),
+            not_null(
+                "id",
+                "nn",
+                "(null, 1, x, null, null, 1.00, 2, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, b, e) VALUES (2, -1, NULL, 1)".to_string(),
+            not_null(
+                "b",
+                "nn",
+                "(2, -1, null, null, null, 1.00, -2, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, b, e) VALUES (3, 1, 'y', 1), (4, NULL, 'z', 1)".to_string(),
+            not_null(
+                "a",
+                "nn",
+                "(4, null, z, null, null, 1.00, null, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, b, e) VALUES (3, -1, 'y', 1), (4, NULL, 'z', 1)".to_string(),
+            "new row for relation \"nn\" violates check constraint \"nn_c\"".to_string(),
+        ),
+        (
+            format!("INSERT INTO s.nn (id, a, e, long) VALUES (5, NULL, 1, '{e}')"),
+            not_null(
+                "a",
+                "nn",
+                &format!("(5, null, x, null, null, 1.00, null, virtual, virtual, {cut}..., 1)"),
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, e) VALUES (6, 7, 1)".to_string(),
+            not_null(
+                "w",
+                "nn",
+                "(6, 7, x, null, null, 1.00, 14, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, e, dd) VALUES (7, NULL, 1, NULL)".to_string(),
+            "domain s.posint does not allow null values".to_string(),
+        ),
+        (
+            "INSERT INTO s.nn (id, e) VALUES (8, 1)".to_string(),
+            not_null(
+                "a",
+                "nn",
+                "(8, null, x, null, null, 1.00, null, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, e, c, d) VALUES (9, NULL, 1, 'it''s', true)".to_string(),
+            not_null(
+                "a",
+                "nn",
+                "(9, null, x, it's, t, 1.00, null, virtual, virtual, null, 1)",
+            ),
+        ),
+    ] {
+        let got = w
+            .execute(&sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was taken"));
+        assert_eq!(got.to_string(), why, "{sql}");
+    }
+    run(
+        &mut w,
+        "INSERT INTO s.nn (id, a, b, e) VALUES (3, 1, 'y', 1)",
+    );
+    for (sql, why) in [
+        (
+            "UPDATE s.nn SET a = NULL WHERE id = 3",
+            not_null(
+                "a",
+                "nn",
+                "(3, null, y, null, null, 1.00, null, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "UPDATE s.nn SET e = NULL WHERE id = 3",
+            not_null(
+                "e",
+                "nn",
+                "(3, 1, y, null, null, null, 2, virtual, virtual, null, 1)",
+            ),
+        ),
+        (
+            "INSERT INTO s.nn (id, a, e) SELECT id + 10, NULL, e FROM s.nn WHERE id = 3",
+            not_null(
+                "a",
+                "nn",
+                "(13, null, x, null, null, 1.00, null, virtual, virtual, null, 1)",
+            ),
+        ),
+    ] {
+        let got = w
+            .execute(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was taken"));
+        assert_eq!(got.to_string(), why, "{sql}");
+    }
+    // A foreign key's SET NULL meets the child's NOT NULL, and its domain's.
+    run(&mut w, "INSERT INTO s.parent (id) VALUES (1), (2)");
+    run(&mut w, "INSERT INTO s.child (id, p) VALUES (1, 1)");
+    run(&mut w, "INSERT INTO s.held (id, p) VALUES (1, 2)");
+    let got = w.execute("DELETE FROM s.parent WHERE id = 1").unwrap_err();
+    assert_eq!(got.to_string(), not_null("p", "child", "(1, null)"));
+    let got = w.execute("DELETE FROM s.parent WHERE id = 2").unwrap_err();
+    assert_eq!(
+        got.to_string(),
+        "domain s.posint does not allow null values"
+    );
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    assert_eq!(
+        rows(&mut s, "SELECT id, a, w FROM s.nn"),
+        [row(&["3", "1", "1"])]
+    );
+    assert_eq!(rows(&mut s, "SELECT id FROM s.parent").len(), 2);
+}
+
+#[test]
+fn write_refuses_a_null_in_a_not_null_column_at_the_first_row_holding_one() {
+    // As PostgreSQL 18.6 and 19 RC1 refused the same rows by COPY, in their words, on 28818 and
+    // 28819 (2026-10-31): row by row, each row's domains, then its NOT NULLs.
+    use warren_snail::values::Values;
+    use warren_snail::write::Rows;
+    let catalog = Catalog::parse(
+        "CREATE DOMAIN s.posint AS integer NOT NULL CHECK (VALUE > 0);
+         CREATE TABLE s.loaded (id integer PRIMARY KEY, a integer NOT NULL, b integer NOT NULL);
+         CREATE TABLE s.held (id integer PRIMARY KEY, a integer NOT NULL, dd s.posint);",
+    )
+    .unwrap();
+    let ints = |v: &[Option<i64>]| Values::Int(v.to_vec());
+    let loaded = |a: &[Option<i64>], b: &[Option<i64>]| {
+        vec![(
+            "s.loaded".to_string(),
+            Rows {
+                columns: vec![ints(&[Some(1), Some(2), Some(3)]), ints(a), ints(b)],
+            },
+        )]
+    };
+    let held = |a: &[Option<i64>], dd: &[Option<i64>]| {
+        vec![(
+            "s.held".to_string(),
+            Rows {
+                columns: vec![ints(&[Some(1), Some(2)]), ints(a), ints(dd)],
+            },
+        )]
+    };
+    for (n, (tables, why)) in [
+        (
+            loaded(&[Some(1), None, None], &[Some(1), Some(2), None]),
+            not_null("a", "loaded", "(2, null, 2)"),
+        ),
+        (
+            loaded(&[Some(1), None, Some(3)], &[None, Some(2), Some(3)]),
+            not_null("b", "loaded", "(1, 1, null)"),
+        ),
+        (
+            held(&[None, Some(2)], &[Some(1), None]),
+            not_null("a", "held", "(1, null, 1)"),
+        ),
+        (
+            held(&[Some(1), None], &[None, Some(1)]),
+            "domain s.posint does not allow null values".to_string(),
+        ),
+        (
+            held(&[Some(1), Some(2)], &[Some(1), Some(0)]),
+            "value for domain s.posint violates check constraint \"posint_check\"".to_string(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let e = write(
+            &tmp(&format!("not-null-write-{n}.snail")),
+            &catalog,
+            &tables,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("rows {n} were taken"));
+        assert_eq!(e.to_string(), why, "rows {n}");
+    }
+    write(
+        &tmp("not-null-write.snail"),
+        &catalog,
+        &held(&[Some(1), Some(2)], &[Some(1), Some(2)]),
+    )
+    .unwrap();
+}

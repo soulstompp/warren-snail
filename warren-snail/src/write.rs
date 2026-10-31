@@ -829,12 +829,6 @@ fn write_tables(
                     crate::file::holds_nan(w.format(), table, ci)?;
                 }
             }
-            if c.not_null && values.nulls() > 0 {
-                return Err(Error::new(format!(
-                    "{}.{} is NOT NULL and a row holds NULL",
-                    table.name, c.name
-                )));
-            }
             if let ColumnType::Text(Some(n)) = c.ty {
                 let longest = values.longest();
                 if longest > n as usize {
@@ -845,8 +839,17 @@ fn write_tables(
                 }
             }
         }
-        // Each row meets the table's CHECKs, as PostgreSQL's COPY checks them.
-        if table.checks.iter().any(|k| k.enforced) {
+        // Each row in turn meets its columns' domains, then the table's NOT NULLs and CHECKs, as
+        // PostgreSQL's COPY checks them.
+        let nulls = table
+            .columns
+            .iter()
+            .zip(&rows.columns)
+            .any(|(c, v)| c.not_null && v.nulls() > 0);
+        if nulls
+            || table.checks.iter().any(|k| k.enforced)
+            || table.columns.iter().any(|c| c.domain.is_some())
+        {
             for i in 0..rows.len() {
                 let row: crate::read::statement::Row = table
                     .columns
@@ -854,6 +857,7 @@ fn write_tables(
                     .zip(&rows.columns)
                     .map(|(c, v)| row_value(c.ty, v, i))
                     .collect();
+                crate::read::fill::check_domains(&catalog.domains, table, &row)?;
                 crate::read::fill::check(table, &row)?;
             }
         }

@@ -503,9 +503,11 @@ pub fn with_virtual(table: &Table, row: &Row) -> Result<Row> {
     Ok(out)
 }
 
-/// Refuses a row that fails one of its table's enforced CHECKs. A CHECK whose condition is NULL
+/// Refuses a row that holds NULL in a NOT NULL column, then one that fails one of its table's
+/// enforced CHECKs, as PostgreSQL's ExecConstraints checks them. A CHECK whose condition is NULL
 /// passes, as in PostgreSQL. Its virtual columns are computed for the CHECKs that read them.
 pub fn check(table: &Table, row: &Row) -> Result<()> {
+    not_null(table, row)?;
     if table.checks.iter().all(|k| !k.enforced) {
         return Ok(());
     }
@@ -558,6 +560,71 @@ pub fn without_overlaps(table: &Table, row: &Row) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a row that holds NULL in a NOT NULL column, in PostgreSQL's words with its detail: each
+/// stored column in turn, then each virtual one, computed.
+fn not_null(table: &Table, row: &Row) -> Result<()> {
+    let refused = |c: usize| {
+        Error::new(format!(
+            "null value in column \"{}\" of relation \"{}\" violates not-null constraint: Failing \
+             row contains {}.",
+            table.columns[c].name,
+            table.name.rsplit('.').next().unwrap_or(&table.name),
+            failing_row(table, row)
+        ))
+    };
+    let stored = table
+        .columns
+        .iter()
+        .zip(row)
+        .position(|(col, d)| col.not_null && !col.is_virtual() && *d == Datum::Null);
+    if let Some(c) = stored {
+        return Err(refused(c));
+    }
+    if !table.columns.iter().any(|c| c.not_null && c.is_virtual()) {
+        return Ok(());
+    }
+    let full = with_virtual(table, row)?;
+    match table
+        .columns
+        .iter()
+        .zip(&full)
+        .position(|(col, d)| col.not_null && col.is_virtual() && *d == Datum::Null)
+    {
+        Some(c) => Err(refused(c)),
+        None => Ok(()),
+    }
+}
+
+/// A row as PostgreSQL writes it in a refusal's detail: each value as its type's output function
+/// writes it, cut to 64 bytes, a virtual column as `virtual`.
+pub(crate) fn failing_row(table: &Table, row: &Row) -> String {
+    const LONGEST: usize = 64;
+    let values: Vec<String> = table
+        .columns
+        .iter()
+        .zip(row)
+        .map(|(col, d)| {
+            if col.is_virtual() {
+                return "virtual".to_string();
+            }
+            if *d == Datum::Null {
+                return "null".to_string();
+            }
+            let mut text = crate::composed::scalar_out(col.ty, d);
+            if text.len() > LONGEST {
+                let cut = (0..=LONGEST)
+                    .rev()
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(0);
+                text.truncate(cut);
+                text.push_str("...");
+            }
+            text
+        })
+        .collect();
+    format!("({})", values.join(", "))
+}
+
 /// The DEFAULT a domain gives a column that names it and gives none of its own: its own, or its
 /// base domain's.
 pub fn domain_default<'a>(
@@ -578,11 +645,12 @@ fn meets_domain(
     ty: ColumnType,
     d: &Datum,
     release: u8,
+    casings: &Casings,
 ) -> Result<()> {
     let Some(dom) = domains.iter().find(|x| x.name == name) else {
         return Ok(());
     };
-    meets_domain(domains, &dom.base, ty, d, release)?;
+    meets_domain(domains, &dom.base, ty, d, release, casings)?;
     if dom.not_null && *d == Datum::Null {
         return Err(Error::new(format!(
             "domain {} does not allow null values",
@@ -592,7 +660,7 @@ fn meets_domain(
     let names = ["value".to_string()];
     let value = [value_of(d, ty)];
     for k in &dom.checks {
-        match eval_on(&k.check, &names, &value, release, &Casings::default())? {
+        match eval_on(&k.check, &names, &value, release, casings)? {
             Value::Bool(false) => {
                 return Err(Error::new(format!(
                     "value for domain {} violates check constraint \"{}\"",
@@ -618,6 +686,7 @@ fn meets_parts(
     ty: ColumnType,
     item: &crate::composed::Item,
     release: u8,
+    casings: &Casings,
 ) -> Result<()> {
     use crate::composed::{datum_of, Composed, Item};
     let ColumnType::Composed(r) = ty else {
@@ -627,17 +696,24 @@ fn meets_parts(
         (Composed::Array { element, domain }, Item::Array { elements, .. }) => {
             for e in elements {
                 if let Some(d) = domain {
-                    meets_domain(domains, d, *element, &datum_of(*element, e), release)?;
+                    meets_domain(
+                        domains,
+                        d,
+                        *element,
+                        &datum_of(*element, e),
+                        release,
+                        casings,
+                    )?;
                 }
-                meets_parts(domains, *element, e, release)?;
+                meets_parts(domains, *element, e, release, casings)?;
             }
         }
         (Composed::Record { fields, .. }, Item::Record(values)) => {
             for (f, v) in fields.iter().zip(values) {
                 if let Some(d) = &f.domain {
-                    meets_domain(domains, d, f.ty, &datum_of(f.ty, v), release)?;
+                    meets_domain(domains, d, f.ty, &datum_of(f.ty, v), release, casings)?;
                 }
-                meets_parts(domains, f.ty, v, release)?;
+                meets_parts(domains, f.ty, v, release, casings)?;
             }
         }
         _ => {}
@@ -646,14 +722,16 @@ fn meets_parts(
 }
 
 /// Refuses a row whose values a domain their columns name does not allow, or whose parts a domain
-/// an array's element or a composite's field names does not.
+/// an array's element or a composite's field names does not. A domain's CHECK reads its money
+/// under the file's lc_monetary.
 pub fn check_domains(domains: &[crate::catalog::Domain], table: &Table, row: &Row) -> Result<()> {
+    let casings = Casings::under(table.monetary);
     for (col, d) in table.columns.iter().zip(row) {
         if let Some(name) = &col.domain {
-            meets_domain(domains, name, col.ty, d, table.release)?;
+            meets_domain(domains, name, col.ty, d, table.release, &casings)?;
         }
         if let Datum::Compound(c) = d {
-            meets_parts(domains, col.ty, &c.item, table.release)?;
+            meets_parts(domains, col.ty, &c.item, table.release, &casings)?;
         }
     }
     Ok(())
