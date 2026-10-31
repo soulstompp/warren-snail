@@ -908,3 +908,40 @@ fn a_writer_whose_value_conflicts_with_another_s_uncommitted_waits_and_is_refuse
         }
     }
 }
+
+#[test]
+fn write_and_a_snail_of_format_eight_refuse_an_exclude_by_name() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a), \
+         CONSTRAINT t_b EXCLUDE (b WITH =));",
+    )
+    .unwrap();
+    let rows = Rows {
+        columns: vec![Values::Int(vec![Some(1)]), Values::Int(vec![Some(2)])],
+    };
+    let e = write(
+        &tmp("exclude-write.snail"),
+        &catalog,
+        &[("s.t".into(), rows)],
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        e.contains("write does not hold its rows to the EXCLUDE t_b: give them by INSERT"),
+        "{e}"
+    );
+    let e = warren_snail::write::write_format_eight(
+        &tmp("eight-exclude.snail"),
+        &catalog,
+        &[],
+        weather::span(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        e.contains("s.t: the EXCLUDE t_b, which a snail of format 8"),
+        "{e}"
+    );
+}

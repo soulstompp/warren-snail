@@ -874,7 +874,9 @@ impl Snail {
             }
         }
         let blocks = self.spanning(ti, oi, r, &operators)?;
-        if !self.fresh(ti, oi, &blocks)? || !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
+        // Locked as a statement locks the blocks it changes: those the round staged lie under the
+        // locks of the blocks they began from.
+        if !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
             self.stale = true;
             return Ok(false);
         }
