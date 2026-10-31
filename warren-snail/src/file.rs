@@ -51,6 +51,12 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             table.name, k.name
         )));
     }
+    if let Some(o) = table.orders.iter().find(|o| o.without_overlaps()) {
+        return Err(crate::Error::new(format!(
+            "{}: the key WITHOUT OVERLAPS {}, {way}",
+            table.name, o.name
+        )));
+    }
     if let Some(o) = table
         .orders
         .iter()

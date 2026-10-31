@@ -857,11 +857,16 @@ fn write_tables(
                 crate::read::fill::check(table, &row)?;
             }
         }
-        // An EXCLUDE is checked where a statement writes its rows.
+        // An EXCLUDE, and a key WITHOUT OVERLAPS, are checked where a statement writes its rows.
         if let Some(o) = table.orders.iter().find(|o| o.exclusion.is_some()) {
             if !rows.is_empty() {
+                let what = if o.without_overlaps() {
+                    "key WITHOUT OVERLAPS"
+                } else {
+                    "EXCLUDE"
+                };
                 return Err(Error::new(format!(
-                    "{}: write does not hold its rows to the EXCLUDE {}: give them by INSERT",
+                    "{}: write does not hold its rows to the {what} {}: give them by INSERT",
                     table.name, o.name
                 )));
             }

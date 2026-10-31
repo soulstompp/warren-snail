@@ -3583,6 +3583,68 @@ pub fn range_op(ty: ColumnType, op: &str, a: &Item, b: &Item) -> Result<RangeAns
     })
 }
 
+/// A period's range type, and its ranges: a range's own, none where it is empty; a multirange's.
+fn period_ranges(ty: ColumnType, period: &Item) -> (ColumnType, Vec<Item>) {
+    let range = match ty {
+        ColumnType::Composed(r) => match r.def() {
+            Composed::Multirange { range, .. } => *range,
+            _ => ty,
+        },
+        _ => ty,
+    };
+    let ranges = match period {
+        Item::Multirange(v) => v.clone(),
+        Item::Range { flags, .. } if flags & EMPTY != 0 => Vec::new(),
+        r @ Item::Range { .. } => vec![r.clone()],
+        _ => Vec::new(),
+    };
+    (range, ranges)
+}
+
+/// Whether the periods of a key's rows, each a range or a multirange of type `ty`, together hold
+/// a period: `period <@ range_agg(periods)`, false where there are no periods, as that aggregate's
+/// NULL.
+pub(crate) fn periods_hold(ty: ColumnType, periods: &[Item], period: &Item) -> Result<bool> {
+    if periods.is_empty() {
+        return Ok(false);
+    }
+    let (range, wanted) = period_ranges(ty, period);
+    let all: Vec<Item> = periods
+        .iter()
+        .flat_map(|p| period_ranges(ty, p).1)
+        .collect();
+    let union = canonical_ranges(range, all);
+    for w in &wanted {
+        let mut held = false;
+        for u in &union {
+            if matches!(range_op(range, "@>", u, w)?, RangeAnswer::Truth(true)) {
+                held = true;
+                break;
+            }
+        }
+        if !held {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Two periods of type `ty` intersected, `*`: two ranges, or two multiranges.
+pub(crate) fn period_intersection(ty: ColumnType, a: &Item, b: &Item) -> Result<Item> {
+    let (range, x) = period_ranges(ty, a);
+    if matches!(a, Item::Multirange(_)) {
+        let (_, y) = period_ranges(ty, b);
+        if x.is_empty() || y.is_empty() {
+            return Ok(Item::Multirange(Vec::new()));
+        }
+        return Ok(Item::Multirange(multirange_intersect(range, &x, &y)?));
+    }
+    match range_op(range, "*", a, b)? {
+        RangeAnswer::Range(i) => Ok(i),
+        RangeAnswer::Truth(_) => Err(Error::new("a range's `*` gives a range")),
+    }
+}
+
 /// Whether a range holds a value of its subtype: `@>` and `<@` with an element.
 pub fn range_holds(ty: ColumnType, r: &Item, v: &Item) -> Result<bool> {
     let (subtype, _) = range_of(ty).ok_or_else(|| Error::new("not a range"))?;

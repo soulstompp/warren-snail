@@ -432,7 +432,7 @@ pub fn opclass_params(method: Method, opclass: &str, written: &str) -> Result<()
 }
 
 /// A type as PostgreSQL's `format_type_be` names it in a refusal: without its modifier.
-fn bare_name(ty: ColumnType) -> String {
+pub(crate) fn bare_name(ty: ColumnType) -> String {
     match ty {
         ColumnType::Bpchar(_) => return "character".into(),
         ColumnType::Interval { .. } => return "interval".into(),

@@ -875,6 +875,7 @@ impl Snail {
             fill::generate(&t, &mut n)?;
             fill::check(&t, &n)?;
             fill::check_domains(&self.catalog.domains, &t, &n)?;
+            fill::without_overlaps(&t, &n)?;
             changes.push(Change::Replace(o, n));
         }
         (done.rewritten, done.orders) = self.apply(table, changes)?;
@@ -919,6 +920,7 @@ impl Snail {
             fill::generate(&t, &mut row)?;
             fill::check(&t, &row)?;
             fill::check_domains(&self.catalog.domains, &t, &row)?;
+            fill::without_overlaps(&t, &row)?;
             out.push(row);
         }
         Ok(out)

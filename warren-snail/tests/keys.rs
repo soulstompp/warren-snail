@@ -116,6 +116,7 @@ fn a_foreign_key_is_read_as_postgresql_reads_it() {
             "match=f",
             "on_delete=n",
             "on_update=c",
+            "period=false",
             "references=s.p(b,a)",
             "type=f",
             "validated=true"

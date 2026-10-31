@@ -951,9 +951,13 @@ const NOT_READ: &str = "its provider is not read";
 pub(crate) struct KeyReference {
     pub name: Option<String>,
     pub columns: Vec<String>,
+    /// Its last column written PERIOD.
+    pub period: bool,
     pub parent: String,
     /// The parent's columns, where written; else its primary key's.
     pub parent_columns: Option<Vec<String>>,
+    /// The parent's last column written PERIOD.
+    pub parent_period: bool,
     pub full: bool,
     /// Each action as PostgreSQL's catalog codes it (`a`, `r`, `c`, `n`, `d`), with the columns
     /// SET NULL or SET DEFAULT lists.
@@ -1062,34 +1066,17 @@ fn referential_action(c: &mut Cursor, delete: bool, what: &str) -> Result<(char,
 fn key_reference(
     c: &mut Cursor,
     name: Option<String>,
-    columns: Vec<String>,
+    (columns, period): (Vec<String>, bool),
     table: bool,
     what: &str,
 ) -> Result<KeyReference> {
     c.expect("REFERENCES")?;
     let parent = c.name()?;
-    let parent_columns = if c.peek() == Some(&Token::LParen) {
-        let mut g = Cursor {
-            t: c.group()?,
-            i: 0,
-        };
-        let mut out = Vec::new();
-        loop {
-            if g.is("PERIOD") {
-                return Err(Error::new(format!(
-                    "{what}: a foreign key on a PERIOD, a temporal key, is not held yet: its \
-                     period is a range, which the snail does not hold yet"
-                )));
-            }
-            out.push(g.ident()?);
-            if !g.token(Token::Comma) {
-                break;
-            }
-        }
-        end(&g, what)?;
-        Some(out)
+    let (parent_columns, parent_period) = if c.peek() == Some(&Token::LParen) {
+        let (out, period) = period_columns(c, what)?;
+        (Some(out), period)
     } else {
-        None
+        (None, false)
     };
     let full = if c.kw("MATCH") {
         if c.kw("FULL") {
@@ -1121,8 +1108,10 @@ fn key_reference(
     Ok(KeyReference {
         name,
         columns,
+        period,
         parent,
         parent_columns,
+        parent_period,
         full,
         on_delete: on_delete.unwrap_or(('a', Vec::new())),
         on_update: on_update.unwrap_or(('a', Vec::new())),
@@ -1147,25 +1136,43 @@ fn table_key_reference(c: &mut Cursor, what: &str) -> Result<Option<KeyReference
         c.i = start;
         return Ok(None);
     }
+    let columns = period_columns(c, what)?;
+    key_reference(c, name, columns, true, what).map(Some)
+}
+
+/// A foreign key's columns in parentheses, the cursor standing at the parenthesis, as PostgreSQL's
+/// grammar reads them: one or more, and PERIOD before the last where there are two or more.
+/// Returns the columns, and whether the last is PERIOD.
+fn period_columns(c: &mut Cursor, what: &str) -> Result<(Vec<String>, bool)> {
     let mut g = Cursor {
         t: c.group()?,
         i: 0,
     };
     let mut columns = Vec::new();
+    let mut period = false;
     loop {
-        if g.is("PERIOD") {
-            return Err(Error::new(format!(
-                "{what}: a foreign key on a PERIOD, a temporal key, is not held yet: its period \
-                 is a range, which the snail does not hold yet"
-            )));
+        // PERIOD before a name; a column named period stands alone.
+        if g.is("PERIOD") && matches!(g.peek_at(1), Some(Token::Word(_))) {
+            if columns.is_empty() {
+                return Err(Error::new(format!(
+                    "{what}: PERIOD is read only before the last of two or more columns"
+                )));
+            }
+            g.i += 1;
+            period = true;
         }
         columns.push(g.ident()?);
         if !g.token(Token::Comma) {
             break;
         }
+        if period {
+            return Err(Error::new(format!(
+                "{what}: PERIOD is read only before the last of two or more columns"
+            )));
+        }
     }
     end(&g, what)?;
-    key_reference(c, name, columns, true, what).map(Some)
+    Ok((columns, period))
 }
 
 /// What a column of a CREATE TABLE writes that sqlparser 0.63 does not read, taken out of its
@@ -1178,9 +1185,15 @@ pub(crate) struct ColumnExtras {
     pub unique_nulls_distinct: Option<bool>,
 }
 
-/// A CREATE TABLE's tokens with what sqlparser does not read taken out, what each column wrote, and
-/// its foreign keys, in the order written.
-pub(crate) type TableExtras = (Vec<Token>, Vec<(String, ColumnExtras)>, Vec<KeyReference>);
+/// A CREATE TABLE's tokens with what sqlparser does not read taken out, what each column wrote, its
+/// foreign keys, in the order written, and which of its PRIMARY KEYs and UNIQUEs, counted in the
+/// order written, are WITHOUT OVERLAPS.
+pub(crate) type TableExtras = (
+    Vec<Token>,
+    Vec<(String, ColumnExtras)>,
+    Vec<KeyReference>,
+    Vec<usize>,
+);
 
 /// A CREATE INDEX's tokens with its operator classes' parameters taken out, and those, by key.
 pub(crate) type IndexExtras = (Vec<Token>, Vec<(usize, String)>);
@@ -1217,6 +1230,7 @@ pub(crate) fn create_table_extras(tokens: &[Token]) -> Result<Option<TableExtras
     let mut extras = Vec::new();
     let mut references = Vec::new();
     let mut kept_elements: Vec<Vec<Token>> = Vec::new();
+    let (mut keys, mut without_overlaps) = (0, Vec::new());
     for element in elements {
         let mut e = Cursor { t: element, i: 0 };
         let first = matches!(e.peek(), Some(Token::Word(w)) if w.quote_style.is_none()
@@ -1224,20 +1238,43 @@ pub(crate) fn create_table_extras(tokens: &[Token]) -> Result<Option<TableExtras
                 .iter()
                 .any(|k| w.value.eq_ignore_ascii_case(k)));
         if first {
-            if let Some(at) = e.t.windows(2).position(|w| {
-                Cursor::word_is(Some(&w[0]), "WITHOUT") && Cursor::word_is(Some(&w[1]), "OVERLAPS")
-            }) {
-                let _ = at;
-                return Err(Error::new(format!(
-                    "{table}: a key WITHOUT OVERLAPS, a temporal key, is not held"
-                )));
-            }
             if let Some(r) = table_key_reference(&mut e, &table)? {
                 end(&e, &format!("{table}'s FOREIGN KEY"))?;
                 references.push(r);
                 continue;
             }
-            kept_elements.push(e.t);
+            // A PRIMARY KEY or a UNIQUE whose last column is WITHOUT OVERLAPS: the two words taken
+            // out, and the key counted among the table's PRIMARY KEYs and UNIQUEs.
+            let mut k = Cursor {
+                t: e.t.clone(),
+                i: 0,
+            };
+            if k.kw("CONSTRAINT") {
+                k.ident()?;
+            }
+            let keyed = k.kws(&["PRIMARY", "KEY"]) || k.kw("UNIQUE");
+            let written = e.t.windows(2).position(|w| {
+                Cursor::word_is(Some(&w[0]), "WITHOUT") && Cursor::word_is(Some(&w[1]), "OVERLAPS")
+            });
+            if let Some(at) = written {
+                let closes = keyed && {
+                    let _ = k.kws(&["NULLS", "NOT", "DISTINCT"]) || k.kws(&["NULLS", "DISTINCT"]);
+                    k.peek() == Some(&Token::LParen) && k.group().is_ok() && at + 3 == k.i
+                };
+                if !closes {
+                    return Err(Error::new(format!(
+                        "{table}: WITHOUT OVERLAPS is read only after the last column of a \
+                         PRIMARY KEY's or a UNIQUE's columns"
+                    )));
+                }
+                without_overlaps.push(keys);
+                let mut t = e.t;
+                t.drain(at..at + 2);
+                kept_elements.push(t);
+            } else {
+                kept_elements.push(e.t);
+            }
+            keys += usize::from(keyed);
             continue;
         }
         let column = e.ident()?;
@@ -1257,7 +1294,7 @@ pub(crate) fn create_table_extras(tokens: &[Token]) -> Result<Option<TableExtras
                 references.push(key_reference(
                     &mut e,
                     name,
-                    vec![column.clone()],
+                    (vec![column.clone()], false),
                     false,
                     &what,
                 )?);
@@ -1325,7 +1362,7 @@ pub(crate) fn create_table_extras(tokens: &[Token]) -> Result<Option<TableExtras
         kept.extend(element);
     }
     kept.extend_from_slice(&c.t[close - 1..]);
-    Ok(Some((kept, extras, references)))
+    Ok(Some((kept, extras, references, without_overlaps)))
 }
 
 /// A CREATE INDEX's tokens with each operator class's parameters taken out, and those taken, by
@@ -1793,6 +1830,8 @@ struct KeySpec {
     include: Vec<String>,
     nulls_distinct: bool,
     deferrable: bool,
+    /// Its last column WITHOUT OVERLAPS.
+    without_overlaps: bool,
 }
 
 impl Draft {
@@ -2226,8 +2265,8 @@ impl Draft {
         if let Some(form) = read(tokens) {
             return self.form(form?);
         }
-        if let Some((kept, extras, fks)) = create_table_extras(tokens)? {
-            return self.create_table(&kept, extras, fks);
+        if let Some((kept, extras, fks, temporal)) = create_table_extras(tokens)? {
+            return self.create_table(&kept, extras, fks, &temporal);
         }
         let (kind, object) = head(tokens);
         if kind == "CREATE INDEX" || kind == "CREATE UNIQUE INDEX" {
@@ -2720,6 +2759,7 @@ impl Draft {
         kept: &[Token],
         mut extras: Vec<(String, ColumnExtras)>,
         fks: Vec<KeyReference>,
+        without_overlaps: &[usize],
     ) -> Result<Vec<String>> {
         let mut notices = Vec::new();
         let st = Parser::new(&PostgreSqlDialect {})
@@ -2839,6 +2879,7 @@ impl Draft {
                         include: Vec::new(),
                         nulls_distinct: true,
                         deferrable: deferrable(p.characteristics.as_ref(), &cwhat)?,
+                        without_overlaps: false,
                     }),
                     ColumnOption::Unique(u) => keys.push(KeySpec {
                         name: given.or_else(|| u.name.as_ref().map(ident)),
@@ -2847,6 +2888,7 @@ impl Draft {
                         include: Vec::new(),
                         nulls_distinct: x.unique_nulls_distinct.unwrap_or(true),
                         deferrable: deferrable(u.characteristics.as_ref(), &cwhat)?,
+                        without_overlaps: false,
                     }),
                     ColumnOption::Check(k) => {
                         if k.no_inherit {
@@ -2938,6 +2980,12 @@ impl Draft {
             }
             columns.push(col);
         }
+        // The table's PRIMARY KEYs and UNIQUEs, counted in the order written.
+        let mut table_keys = 0;
+        let mut overlapping = || {
+            table_keys += 1;
+            without_overlaps.contains(&(table_keys - 1))
+        };
         for k in &t.constraints {
             match k {
                 TableConstraint::PrimaryKey(p) => keys.push(KeySpec {
@@ -2947,6 +2995,7 @@ impl Draft {
                     include: p.include.iter().map(ident).collect(),
                     nulls_distinct: true,
                     deferrable: deferrable(p.characteristics.as_ref(), &name)?,
+                    without_overlaps: overlapping(),
                 }),
                 TableConstraint::Unique(u) => {
                     if u.index_name.is_some()
@@ -2964,6 +3013,7 @@ impl Draft {
                         include: u.include.iter().map(ident).collect(),
                         nulls_distinct: u.nulls_distinct != NullsDistinctOption::NotDistinct,
                         deferrable: deferrable(u.characteristics.as_ref(), &name)?,
+                        without_overlaps: overlapping(),
                     })
                 }
                 TableConstraint::Check(c) => {
@@ -3010,6 +3060,20 @@ impl Draft {
                     return Err(Error::new(format!(
                         "{name}.{n}: a key on a virtual generated column is not supported"
                     )));
+                }
+            }
+            if k.without_overlaps {
+                let last = k.columns.last().expect("a key names a column");
+                let ty = columns[column_index(last).unwrap()].ty;
+                if !crate::spans::is_period(ty) {
+                    return Err(Error::new(format!(
+                        "column \"{last}\" in WITHOUT OVERLAPS is not a range or multirange type"
+                    )));
+                }
+                if k.columns.len() < 2 {
+                    return Err(Error::new(
+                        "constraint using WITHOUT OVERLAPS needs at least two columns",
+                    ));
                 }
             }
         }
@@ -3089,11 +3153,17 @@ impl Draft {
                 .map(|n| Level::Column(column_index(n).unwrap()))
                 .collect();
             let include: Vec<usize> = k.include.iter().map(|n| column_index(n).unwrap()).collect();
+            let method = if k.without_overlaps {
+                Method::Gist
+            } else {
+                Method::Btree
+            };
             if let Some(prior) = made.iter_mut().find(|m| {
                 m.levels == levels
                     && m.include == include
                     && m.nulls_distinct == k.nulls_distinct
                     && m.constraint.as_ref().map(|c| c.deferrable) == Some(k.deferrable)
+                    && m.method == method
             }) {
                 if let Some(c) = prior.constraint.as_mut() {
                     c.primary |= k.primary;
@@ -3123,22 +3193,60 @@ impl Draft {
                     )
                 }
             };
+            // A key WITHOUT OVERLAPS is an EXCLUDE on GiST: `=` on each column but its last, `&&`
+            // on its last, as PostgreSQL's ComputeIndexAttrs finds them in each column's operator
+            // class.
+            let (opclasses, exclusion) = if k.without_overlaps {
+                let mut opclasses = Vec::new();
+                let mut operators = Vec::new();
+                for (i, l) in levels.iter().enumerate() {
+                    let ty = columns[l.column()].ty;
+                    let op = crate::methods::opclass(Method::Gist, ty, None)?;
+                    let operator = if i + 1 == levels.len() { "&&" } else { "=" };
+                    if crate::methods::exclusion_operator(Method::Gist, &op, ty, operator).is_err()
+                    {
+                        return Err(Error::new(format!(
+                            "could not identify an equality operator for type {}",
+                            crate::methods::bare_name(ty)
+                        )));
+                    }
+                    if !crate::methods::held(Method::Gist, &op) {
+                        return Err(Error::new(format!(
+                            "{name}: a key WITHOUT OVERLAPS on {}: USING gist with the operator \
+                             class {op} is not held yet",
+                            columns[l.column()].name
+                        )));
+                    }
+                    opclasses.push(op);
+                    operators.push(operator.to_string());
+                }
+                let exclusion = crate::catalog::Exclusion {
+                    operators,
+                    deferrable: k.deferrable,
+                };
+                (opclasses, Some(exclusion))
+            } else {
+                let opclasses = levels
+                    .iter()
+                    .map(|l| columns[l.column()].ty.default_opclass().to_string())
+                    .collect();
+                (opclasses, None)
+            };
             made.push(Keyed {
                 name: kname,
-                method: Method::Btree,
+                method,
                 predicate: None,
                 predicate_columns: Vec::new(),
-                exclusion: None,
+                // A key WITHOUT OVERLAPS refuses what overlaps, the same key among it, by its
+                // EXCLUDE.
+                unique: exclusion.is_none(),
+                exclusion,
                 nulls_first: vec![false; levels.len()],
                 desc: vec![false; levels.len()],
                 keys: k.columns.clone(),
-                opclasses: levels
-                    .iter()
-                    .map(|l| columns[l.column()].ty.default_opclass().to_string())
-                    .collect(),
+                opclasses,
                 levels,
                 include,
-                unique: true,
                 nulls_distinct: k.nulls_distinct,
                 options: Vec::new(),
                 constraint: Some(KeyConstraint {
@@ -3199,15 +3307,16 @@ impl Draft {
             None => {}
         }
         d.checks = table_checks;
+        for x in excludes {
+            notices.extend(next.exclude(&name, &x)?);
+        }
         // The foreign keys, named as PostgreSQL names them, in the order written: once the table's
-        // own keys are made, so that it may reference itself. Each is valid, the table being empty.
+        // own keys and EXCLUDEs are made, so that it may reference itself. Each is valid, the table
+        // being empty.
         for r in fks {
             let k = next.reference(&name, r, true)?;
             next.check_names.push(qualified(&schema, &k.name));
             next.table_mut(&name).unwrap().foreign_keys.push(k);
-        }
-        for x in excludes {
-            notices.extend(next.exclude(&name, &x)?);
         }
         *self = next;
         Ok(notices)
@@ -3307,8 +3416,18 @@ impl Draft {
             .table(&r.parent)
             .ok_or_else(|| Error::new(format!("relation \"{}\" does not exist", r.parent)))?;
         let pname = bare(&parent.name);
+        let with_period = r.period || r.parent_period;
+        let referenced_only = || {
+            Error::new(
+                "foreign key uses PERIOD on the referenced table but not the referencing table",
+            )
+        };
+        if with_period && !r.period {
+            return Err(referenced_only());
+        }
         // The key referenced: the primary key where no columns are written, else the first unique
-        // key on those columns, as PostgreSQL's transformFkeyCheckAttrs finds it.
+        // key on those columns, as PostgreSQL's transformFkeyCheckAttrs finds it; with PERIOD, the
+        // first EXCLUDE, a key WITHOUT OVERLAPS among them, whose last column is the PERIOD.
         let (key, parent_columns) = match &r.parent_columns {
             None => {
                 let p = parent.primary.as_ref().ok_or_else(|| {
@@ -3320,6 +3439,9 @@ impl Draft {
                     return Err(Error::new(format!(
                         "cannot use a deferrable primary key for referenced table \"{pname}\""
                     )));
+                }
+                if p.exclusion.is_some() && !r.period {
+                    return Err(referenced_only());
                 }
                 (p, p.levels.iter().map(|l| l.column()).collect::<Vec<_>>())
             }
@@ -3333,9 +3455,23 @@ impl Draft {
                         "foreign key referenced-columns list must not contain duplicates",
                     ));
                 }
+                if with_period && !r.parent_period {
+                    return Err(Error::new(
+                        "foreign key uses PERIOD on the referencing table but not the referenced \
+                         table",
+                    ));
+                }
                 let mut deferrable = false;
                 let mut found = None;
-                for k in parent.keys().filter(|k| k.unique) {
+                let candidate = |k: &&Keyed| {
+                    k.predicate.is_none()
+                        && if with_period {
+                            k.exclusion.is_some()
+                        } else {
+                            k.unique || (k.exclusion.is_some() && k.constraint.is_some())
+                        }
+                };
+                for k in parent.keys().filter(candidate) {
                     let mut on: Vec<usize> = Vec::new();
                     for l in &k.levels {
                         match l {
@@ -3348,6 +3484,9 @@ impl Draft {
                     a.sort_unstable();
                     b.sort_unstable();
                     if on.len() != k.levels.len() || a != b {
+                        continue;
+                    }
+                    if with_period && on.last() != wanted.last() {
                         continue;
                     }
                     if k.constraint.as_ref().is_some_and(|c| c.deferrable) {
@@ -3374,10 +3513,41 @@ impl Draft {
                 }
             }
         };
+        if key.exclusion.is_some() && !with_period {
+            return Err(Error::new(
+                "foreign key must use PERIOD when referencing a primary key using WITHOUT OVERLAPS",
+            ));
+        }
+        if r.period {
+            for (when, (code, _)) in [("ON UPDATE", &r.on_update), ("ON DELETE", &r.on_delete)] {
+                if *code != 'a' {
+                    return Err(Error::new(format!(
+                        "unsupported {when} action for foreign key constraint using PERIOD"
+                    )));
+                }
+            }
+        }
         if columns.len() != parent_columns.len() {
             return Err(Error::new(
                 "number of referencing and referenced columns for foreign key disagree",
             ));
+        }
+        // A PERIOD is compared by its key's `&&`, and is a range or a multirange.
+        if with_period {
+            let last = key.opclasses.len() - 1;
+            if key.method != Method::Gist
+                || crate::methods::exclusion_operator(
+                    key.method,
+                    &key.opclasses[last],
+                    parent.columns[key.levels[last].column()].ty,
+                    "&&",
+                )
+                .is_err()
+            {
+                return Err(Error::new(
+                    "could not identify an overlaps operator for foreign key",
+                ));
+            }
         }
         let name = match &r.name {
             Some(n) => {
@@ -3415,6 +3585,15 @@ impl Draft {
                     a.pg_name(),
                     b.pg_name()
                 )));
+            }
+        }
+        if with_period {
+            let p = parent_columns[parent_columns.len() - 1];
+            if !crate::spans::is_period(parent.columns[p].ty) {
+                return Err(Error::new(
+                    "invalid type for PERIOD part of foreign key: only range and multirange are \
+                     supported",
+                ));
             }
         }
         let action = |(code, listed): (char, Vec<String>)| -> Result<Action> {
@@ -3482,6 +3661,7 @@ impl Draft {
             deferred: r.deferred,
             enforced: r.enforced,
             valid: r.enforced && (made || !r.not_valid),
+            period: with_period,
         })
     }
 
@@ -3805,7 +3985,10 @@ fn finish_table(d: &Declared) -> Result<Table> {
             })?;
             // The order holds every column, so what its index includes adds nothing.
             let mut s = strands.remove(pos);
-            s.unique = s.unique || d.primary.as_ref().map(|p| &p.levels) == Some(&s.levels);
+            s.unique = s.unique
+                || d.primary
+                    .as_ref()
+                    .is_some_and(|p| p.unique && p.levels == s.levels);
             s
         }
         None => d.primary.clone().ok_or_else(|| {
@@ -4005,6 +4188,7 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 fact("constraint", &obj, "type", ty.into());
                 fact("constraint", &obj, "columns", names(&o.levels));
                 fact("constraint", &obj, "deferrable", truth(k.deferrable));
+                fact("constraint", &obj, "period", truth(o.without_overlaps()));
                 if !k.primary {
                     fact(
                         "constraint",
@@ -4015,7 +4199,14 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 }
             }
             fact("index", &obj, "method", o.method.name().into());
-            fact("index", &obj, "unique", truth(o.unique));
+            // PostgreSQL marks a key WITHOUT OVERLAPS's index unique, its EXCLUDE refusing the
+            // same key.
+            fact(
+                "index",
+                &obj,
+                "unique",
+                truth(o.unique || o.without_overlaps()),
+            );
             fact(
                 "index",
                 &obj,
@@ -4114,6 +4305,7 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
             };
             fact("constraint", &obj, "delete_columns", listed);
             fact("constraint", &obj, "deferrable", truth(k.deferrable));
+            fact("constraint", &obj, "period", truth(k.period));
             fact("constraint", &obj, "deferred", truth(k.deferred));
             fact("constraint", &obj, "enforced", truth(k.enforced));
             fact("constraint", &obj, "validated", truth(k.valid));
@@ -4800,7 +4992,7 @@ mod tests {
 
     #[test]
     fn an_identity_and_a_generation_are_taken_out_of_a_create_table() {
-        let (kept, extras, _) = create_table_extras(&tokens(
+        let (kept, extras, _, _) = create_table_extras(&tokens(
             "CREATE TABLE s.t (id bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 10 \
              INCREMENT BY 5), q int NOT NULL, n numeric(12,2) GENERATED ALWAYS AS (q * 2) VIRTUAL, \
              s int GENERATED ALWAYS AS (q + 1) STORED, u int UNIQUE NULLS NOT DISTINCT, \
@@ -4823,18 +5015,36 @@ mod tests {
         assert_eq!((g.expr.to_string().as_str(), g.stored), ("q * 2", false));
         assert!(extras[3].1.generated.as_ref().unwrap().stored);
         assert_eq!(extras[4].1.unique_nulls_distinct, Some(false));
-        let e = create_table_extras(&tokens(
-            "CREATE TABLE s.r (room int, valid int, PRIMARY KEY (room, valid WITHOUT OVERLAPS))",
+    }
+
+    #[test]
+    fn without_overlaps_is_taken_out_of_a_key_and_its_key_counted() {
+        let (kept, _, _, temporal) = create_table_extras(&tokens(
+            "CREATE TABLE s.r (room int4range, valid daterange, UNIQUE (room), CHECK (true), \
+             CONSTRAINT r_k UNIQUE NULLS NOT DISTINCT (room, valid WITHOUT OVERLAPS), \
+             PRIMARY KEY (room, valid WITHOUT OVERLAPS) INCLUDE (room))",
         ))
-        .err()
         .unwrap()
-        .to_string();
-        assert!(e.contains("WITHOUT OVERLAPS"), "{e}");
+        .unwrap();
+        assert_eq!(
+            text(&kept),
+            "CREATE TABLE s . r ( room int4range , valid daterange , UNIQUE ( room ) , CHECK ( \
+             true ) , CONSTRAINT r_k UNIQUE NULLS NOT DISTINCT ( room , valid ) , PRIMARY KEY ( \
+             room , valid ) INCLUDE ( room ) )"
+        );
+        assert_eq!(temporal, [1, 2]);
+        for ddl in [
+            "CREATE TABLE s.r (room int4range, valid daterange, UNIQUE (valid WITHOUT OVERLAPS, room))",
+            "CREATE TABLE s.r (room int4range, valid daterange, CHECK (valid WITHOUT OVERLAPS))",
+        ] {
+            let e = create_table_extras(&tokens(ddl)).err().unwrap().to_string();
+            assert!(e.contains("after the last column"), "{ddl}: {e}");
+        }
     }
 
     #[test]
     fn a_foreign_key_is_taken_out_of_a_create_table_whole_in_the_order_written() {
-        let (kept, _, keys) = create_table_extras(&tokens(
+        let (kept, _, keys, _) = create_table_extras(&tokens(
             "CREATE TABLE s.t (id int PRIMARY KEY, a int NOT NULL CONSTRAINT ta REFERENCES s.u \
              MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL (a) DEFERRABLE INITIALLY DEFERRED \
              DEFAULT 1, CONSTRAINT tb FOREIGN KEY (b, a) REFERENCES s.v (x, y) NOT ENFORCED NOT \
@@ -4880,12 +5090,31 @@ mod tests {
             ("b,a", (false, false, false, true))
         );
         assert_eq!((read[2].0, read[2].3.as_deref()), (None, Some("x")));
+        let (_, _, keys, _) = create_table_extras(&tokens(
+            "CREATE TABLE s.t (a int, r int4range, period int, FOREIGN KEY (a, PERIOD r) \
+             REFERENCES s.u (b, PERIOD q), FOREIGN KEY (a, period) REFERENCES s.v)",
+        ))
+        .unwrap()
+        .unwrap();
+        let read: Vec<_> = keys
+            .iter()
+            .map(|k| (k.columns.join(","), k.period, k.parent_period))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("a,r".to_string(), true, true),
+                ("a,period".to_string(), false, false)
+            ]
+        );
         for (ddl, why) in [
             ("CREATE TABLE s.t (a int REFERENCES s.u ON UPDATE SET DEFAULT (a))", "only supported for ON DELETE"),
             ("CREATE TABLE s.t (a int REFERENCES s.u MATCH PARTIAL)", "MATCH PARTIAL not yet implemented"),
             ("CREATE TABLE s.t (a int REFERENCES s.u NOT DEFERRABLE INITIALLY DEFERRED)", "must be DEFERRABLE"),
             ("CREATE TABLE s.t (a int REFERENCES s.u DEFERRABLE NOT DEFERRABLE)", "conflicting constraint properties"),
-            ("CREATE TABLE s.t (a int, r int, FOREIGN KEY (a, PERIOD r) REFERENCES s.u (a, PERIOD r))", "a PERIOD"),
+            ("CREATE TABLE s.t (a int, r int, FOREIGN KEY (PERIOD r) REFERENCES s.u (a, PERIOD r))", "PERIOD is read only before the last"),
+            ("CREATE TABLE s.t (a int, r int, FOREIGN KEY (PERIOD a, r) REFERENCES s.u (a, PERIOD r))", "PERIOD is read only before the last"),
+            ("CREATE TABLE s.t (a int, r int, FOREIGN KEY (a, PERIOD r) REFERENCES s.u (PERIOD a, r))", "PERIOD is read only before the last"),
             ("CREATE TABLE s.t (a int, FOREIGN KEY (a) REFERENCES s.u NO INHERIT)", "NO INHERIT"),
         ] {
             let e = create_table_extras(&tokens(ddl)).err().unwrap().to_string();

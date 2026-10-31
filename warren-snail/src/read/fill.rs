@@ -539,6 +539,25 @@ pub fn check(table: &Table, row: &Row) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a row whose period of a key WITHOUT OVERLAPS is empty, as PostgreSQL refuses it where
+/// the row enters the key's index.
+pub fn without_overlaps(table: &Table, row: &Row) -> Result<()> {
+    for o in table.orders.iter().filter(|o| o.without_overlaps()) {
+        let c = o.levels[o.levels.len() - 1].column();
+        if matches!(
+            crate::spans::bounds(table.columns[c].ty, &row[c]),
+            Some(None)
+        ) {
+            return Err(Error::new(format!(
+                "empty WITHOUT OVERLAPS value found in column \"{}\" in relation \"{}\"",
+                table.columns[c].name,
+                table.name.rsplit('.').next().unwrap_or(&table.name)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The DEFAULT a domain gives a column that names it and gives none of its own: its own, or its
 /// base domain's.
 pub fn domain_default<'a>(

@@ -11,13 +11,16 @@ use crate::values::Values;
 
 /// Whether a strand of `method` keeps a span of a column of type `ty`.
 fn spanned(method: Method, ty: ColumnType) -> bool {
-    matches!(method, Method::Gist | Method::Spgist)
-        && (is_inet(ty)
-            || matches!(
-                ty,
-                ColumnType::Composed(r)
-                    if matches!(r.def(), Composed::Range { .. } | Composed::Multirange { .. })
-            ))
+    matches!(method, Method::Gist | Method::Spgist) && (is_inet(ty) || is_period(ty))
+}
+
+/// Whether a column may be a key's period: a range or a multirange.
+pub(crate) fn is_period(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Composed(r)
+            if matches!(r.def(), Composed::Range { .. } | Composed::Multirange { .. })
+    )
 }
 
 pub(crate) fn is_inet(ty: ColumnType) -> bool {

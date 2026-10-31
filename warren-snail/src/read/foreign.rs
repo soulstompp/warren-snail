@@ -55,11 +55,31 @@ fn reference(k: &ForeignKey, row: &Row) -> Vec<Datum> {
     k.columns.iter().map(|&c| row[c].clone()).collect()
 }
 
-/// Whether two rows reference the same key: neither holding a NULL, and each value equal.
-fn same_reference(k: &ForeignKey, a: &Row, b: &Row) -> bool {
-    k.columns
+/// Whether a row `b` that replaced `a` references what `a` did: neither holding a NULL, each value
+/// equal, and a PERIOD's within `a`'s, as PostgreSQL's `ri_KeysEqual` reads a child's key.
+fn same_reference(t: &Table, k: &ForeignKey, a: &Row, b: &Row) -> bool {
+    let equal = k
+        .equal_columns()
         .iter()
-        .all(|&c| a[c] != Datum::Null && b[c] != Datum::Null && class(&a[c]) == class(&b[c]))
+        .all(|&c| a[c] != Datum::Null && b[c] != Datum::Null && class(&a[c]) == class(&b[c]));
+    if !equal || !k.period {
+        return equal;
+    }
+    let p = k.columns[k.columns.len() - 1];
+    match (period_of(&a[p]), period_of(&b[p])) {
+        (Some(old), Some(new)) => {
+            crate::composed::periods_hold(t.columns[p].ty, &[old], &new).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// A period's value: none where it is NULL.
+fn period_of(d: &Datum) -> Option<crate::composed::Item> {
+    match d {
+        Datum::Compound(c) => Some(c.item.clone()),
+        _ => None,
+    }
 }
 
 /// Drops one row equal to `row` from the rows written for a key; whether there was one.
@@ -143,7 +163,7 @@ impl Snail {
                                 // whose reference did not change is not checked again.
                                 let ours = forget(&mut self.touched, at, o)
                                     || forget(&mut self.pending, at, o);
-                                if ours || !same_reference(k, o, n) {
+                                if ours || !same_reference(child, k, o, n) {
                                     self.touched.written.entry(at).or_default().push(n.clone());
                                 }
                             }
@@ -429,6 +449,7 @@ impl Snail {
                         }
                         fill::generate(&t, &mut m)?;
                         fill::check(&t, &m)?;
+                        fill::without_overlaps(&t, &m)?;
                         out.push(Change::Replace(r, m));
                     }
                     out
@@ -479,7 +500,12 @@ impl Snail {
             keys.sort();
             keys.dedup_by(|a, b| a.0 == b.0);
             for (_, key) in keys {
-                match self.holds_key(&k, &key)? {
+                let held = if k.period {
+                    self.holds_period(&k, &key)?
+                } else {
+                    self.holds_key(&k, &key)?
+                };
+                match held {
                     None => return Ok(false),
                     Some(true) => {}
                     Some(false) => {
@@ -505,14 +531,19 @@ impl Snail {
                     &k.on_delete
                 };
                 let key: Vec<Datum> = k.parent_columns.iter().map(|&p| old[p].clone()).collect();
-                if !matches!(action, Action::Restrict) {
+                if !k.period && !matches!(action, Action::Restrict) {
                     match self.holds_key(&k, &key)? {
                         None => return Ok(false),
                         Some(true) => continue,
                         Some(false) => {}
                     }
                 }
-                match self.referenced(ci, &k, &key)? {
+                let referenced = if k.period {
+                    self.period_referenced(ci, &k, &key)?
+                } else {
+                    self.referenced(ci, &k, &key)?
+                };
+                match referenced {
                     None => return Ok(false),
                     Some(false) => {}
                     Some(true) => {
@@ -613,10 +644,11 @@ impl Snail {
     /// The child's rows that reference a key, given in the parent's columns' order, as the round
     /// reads them once no writer can add or take one it does not see: the blocks where they would
     /// lie the newest along an order the reference leads, or else the whole child unchanged since
-    /// the round's root; the blocks that hold one locked. None where the round must run again.
+    /// the round's root; the blocks that hold one locked. Under a PERIOD, the rows whose PERIOD
+    /// meets the key's, along an order its other columns lead. None where the round must run again.
     fn children(&mut self, ci: usize, k: &ForeignKey, key: &[Datum]) -> Result<Option<Vec<Row>>> {
         let t = &self.catalog.tables[ci];
-        let (oi, blocks) = match t.order_led_by(&k.columns) {
+        let (oi, blocks) = match t.order_led_by(k.equal_columns()) {
             Some(oi) => {
                 let (lo, hi) = self.run_of(ci, oi, k, key)?;
                 let blocks = self.covering(ci, oi, &lo, &hi)?;
@@ -637,26 +669,13 @@ impl Snail {
                 )
             }
         };
-        let rows = self.rows_where(ci, &k.columns, key)?;
+        let rows = self.rows_where(ci, &k.columns, key, k.period)?;
         if rows.is_empty() {
             return Ok(Some(rows));
         }
         let blocks = match blocks {
             Some(b) => b,
-            None => {
-                let table = &self.catalog.tables[ci];
-                let order = &table.orders[oi];
-                let mut out: Vec<Entry> = Vec::new();
-                for r in &rows {
-                    let at = key_of(table, order, r)?;
-                    for e in self.covering(ci, oi, &at, &at)? {
-                        if !out.iter().any(|x| x.first == e.first) {
-                            out.push(e);
-                        }
-                    }
-                }
-                out
-            }
+            None => self.blocks_holding(ci, oi, &rows)?,
         };
         if !self.lock_blocks(ci, oi, blocks, Waiting::Wait)? {
             self.stale = true;
@@ -665,8 +684,25 @@ impl Snail {
         Ok(Some(rows))
     }
 
+    /// The blocks of an order, as the round reads it, that hold the rows given.
+    fn blocks_holding(&self, ti: usize, oi: usize, rows: &[Row]) -> Result<Vec<Entry>> {
+        let table = &self.catalog.tables[ti];
+        let order = &table.orders[oi];
+        let mut out: Vec<Entry> = Vec::new();
+        for r in rows {
+            let at = key_of(table, order, r)?;
+            for e in self.covering(ti, oi, &at, &at)? {
+                if !out.iter().any(|x| x.first == e.first) {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The least and the greatest key of an order the reference leads where a key's references
-    /// lie: the reference's values on its first levels, the rest open at both ends.
+    /// lie: the reference's values on its first levels, the rest open at both ends; under a
+    /// PERIOD, its other columns' values.
     fn run_of(
         &self,
         ci: usize,
@@ -674,19 +710,135 @@ impl Snail {
         k: &ForeignKey,
         key: &[Datum],
     ) -> Result<(Vec<KeyValue>, Vec<KeyValue>)> {
-        let t = &self.catalog.tables[ci];
+        self.run(ci, oi, k.equal_columns(), key)
+    }
+
+    /// The least and the greatest key of an order whose first levels are the columns given, where
+    /// they hold the values given: those values, the rest open at both ends.
+    fn run(
+        &self,
+        ti: usize,
+        oi: usize,
+        columns: &[usize],
+        values: &[Datum],
+    ) -> Result<(Vec<KeyValue>, Vec<KeyValue>)> {
+        let t = &self.catalog.tables[ti];
         let order = &t.orders[oi];
         let mut row = vec![Datum::Null; t.columns.len()];
-        for (&c, d) in k.columns.iter().zip(key) {
+        for (&c, d) in columns.iter().zip(values) {
             row[c] = d.clone();
         }
         let full = key_of(t, order, &row)?;
-        let m = k.columns.len();
+        let m = columns.len();
         let mut lo = full[..m].to_vec();
         let mut hi = lo.clone();
         lo.extend((m..full.len()).map(|_| KeyValue::Null { first: true }));
         hi.extend((m..full.len()).map(|_| KeyValue::Null { first: false }));
         Ok((lo, hi))
+    }
+
+    /// The parent of a foreign key, and its order that stands for the key referenced.
+    fn referenced_order(&self, k: &ForeignKey) -> (usize, usize) {
+        let pi = self
+            .catalog
+            .tables
+            .iter()
+            .position(|t| t.name == k.parent)
+            .expect("a foreign key's parent is in the file");
+        let oi = self.catalog.tables[pi]
+            .orders
+            .iter()
+            .position(|o| o.name == k.key)
+            .expect("the order a foreign key references");
+        (pi, oi)
+    }
+
+    /// The parent's rows whose columns of a PERIOD key match a reference's other columns and whose
+    /// PERIOD meets the reference's, with their PERIODs, as the round reads them; and whether the
+    /// blocks where the rows of its other columns lie are the newest root's.
+    fn periods_meeting(
+        &self,
+        k: &ForeignKey,
+        key: &[Datum],
+    ) -> Result<(Vec<Row>, Vec<crate::composed::Item>, bool)> {
+        let (pi, oi) = self.referenced_order(k);
+        let rows = self.rows_where(pi, &k.parent_columns, key, true)?;
+        let pc = k.parent_columns[k.parent_columns.len() - 1];
+        let periods = rows.iter().filter_map(|r| period_of(&r[pc])).collect();
+        let n = key.len() - 1;
+        let (lo, hi) = self.run(pi, oi, &k.parent_columns[..n], &key[..n])?;
+        let blocks = self.covering(pi, oi, &lo, &hi)?;
+        let fresh = self.fresh(pi, oi, &blocks)?;
+        Ok((rows, periods, fresh))
+    }
+
+    /// Whether the periods of the parent's rows matching a reference's other columns together hold
+    /// its PERIOD, as the round reads them once no writer can take one away or bring one: where
+    /// they hold it, the blocks those rows lie in locked; where they do not, the blocks where the
+    /// rows of its other columns lie still the newest root's. None where the round must run again.
+    fn holds_period(&mut self, k: &ForeignKey, key: &[Datum]) -> Result<Option<bool>> {
+        let (pi, oi) = self.referenced_order(k);
+        let (rows, periods, fresh) = self.periods_meeting(k, key)?;
+        let ty = self.catalog.tables[pi].columns[k.parent_columns[key.len() - 1]].ty;
+        let Some(period) = period_of(&key[key.len() - 1]) else {
+            return Ok(Some(true));
+        };
+        if !crate::composed::periods_hold(ty, &periods, &period)? {
+            if !fresh {
+                self.stale = true;
+                return Ok(None);
+            }
+            return Ok(Some(false));
+        }
+        let blocks = self.blocks_holding(pi, oi, &rows)?;
+        if !self.lock_blocks(pi, oi, blocks, Waiting::Wait)? {
+            self.stale = true;
+            return Ok(None);
+        }
+        Ok(Some(true))
+    }
+
+    /// Whether a child's row still references a key taken from the parent under a PERIOD, as
+    /// PostgreSQL's NO ACTION asks it: a row whose other columns match the key's and whose PERIOD
+    /// meets the key's, the part of its PERIOD within the key's not held by the periods of the
+    /// parent's rows that match the key and meet its PERIOD now. The child's rows found and the
+    /// parent's rows that hold them locked. None where the round must run again.
+    fn period_referenced(
+        &mut self,
+        ci: usize,
+        k: &ForeignKey,
+        key: &[Datum],
+    ) -> Result<Option<bool>> {
+        let Some(rows) = self.children(ci, k, key)? else {
+            return Ok(None);
+        };
+        if rows.is_empty() {
+            return Ok(Some(false));
+        }
+        let (pi, oi) = self.referenced_order(k);
+        let (parents, periods, fresh) = self.periods_meeting(k, key)?;
+        let n = key.len() - 1;
+        let ty = self.catalog.tables[ci].columns[k.columns[n]].ty;
+        let taken = period_of(&key[n]).expect("a key taken holds no NULL");
+        for r in &rows {
+            let Some(p) = period_of(&r[k.columns[n]]) else {
+                continue;
+            };
+            let within = crate::composed::period_intersection(ty, &p, &taken)?;
+            if !crate::composed::periods_hold(ty, &periods, &within)? {
+                if !fresh {
+                    self.stale = true;
+                    return Ok(None);
+                }
+                return Ok(Some(true));
+            }
+        }
+        let blocks = self.blocks_holding(pi, oi, &parents)?;
+        if !self.lock_blocks(pi, oi, blocks, Waiting::Wait)? {
+            self.stale = true;
+            return Ok(None);
+        }
+        Ok(Some(false))
     }
 
     /// The blocks of an order, as the round reads it, where its keys from `lo` to `hi` lie.
@@ -740,14 +892,21 @@ impl Snail {
         Ok(())
     }
 
-    /// The conditions on a table's columns that keep it to one key, as a question writes them.
-    fn conditions(t: &Table, columns: &[usize], key: &[Datum]) -> String {
+    /// The conditions on a table's columns that keep it to one key, as a question writes them;
+    /// under a PERIOD, its last column by `&&`.
+    fn conditions(t: &Table, columns: &[usize], key: &[Datum], period: bool) -> String {
         columns
             .iter()
             .zip(key)
-            .map(|(&c, d)| {
+            .enumerate()
+            .map(|(i, (&c, d))| {
+                let op = if period && i + 1 == columns.len() {
+                    "&&"
+                } else {
+                    "="
+                };
                 format!(
-                    "r.\"{}\" = {}",
+                    "r.\"{}\" {op} {}",
                     t.columns[c].name.replace('"', "\"\""),
                     literal(d, t.columns[c].ty)
                 )
@@ -762,7 +921,7 @@ impl Snail {
         let sql = format!(
             "SELECT count(*) FROM {} r WHERE {}",
             quoted(&t.name),
-            Snail::conditions(t, columns, key)
+            Snail::conditions(t, columns, key, false)
         );
         let (b, _) = self.answer(&sql, None)?;
         Ok(b.column(0)
@@ -773,12 +932,13 @@ impl Snail {
     }
 
     /// A table's rows that hold a key, every one where no columns are given, as the round reads
-    /// the file.
+    /// the file; under a PERIOD, those whose last column meets its last value.
     pub(super) fn rows_where(
         &self,
         ti: usize,
         columns: &[usize],
         key: &[Datum],
+        period: bool,
     ) -> Result<Vec<Row>> {
         let t = &self.catalog.tables[ti];
         let stored = t
@@ -794,7 +954,7 @@ impl Snail {
             format!(
                 "SELECT {stored} FROM {} r WHERE {}",
                 quoted(&t.name),
-                Snail::conditions(t, columns, key)
+                Snail::conditions(t, columns, key, period)
             )
         };
         let (b, _) = self.answer(&sql, None)?;
@@ -804,7 +964,7 @@ impl Snail {
     /// Checks every row of a child against a foreign key made valid on a table that holds rows:
     /// added, or validated.
     pub(super) fn key_validated(&mut self, ci: usize, fi: usize) -> Result<bool> {
-        let rows = self.rows_where(ci, &[], &[])?;
+        let rows = self.rows_where(ci, &[], &[], false)?;
         let mut t = Touched::default();
         t.written.insert((ci, fi), rows);
         self.keys_checked(&t)
@@ -860,13 +1020,14 @@ impl Snail {
     }
 
     /// One row held against an EXCLUDE's strand: none conflicting, a row holding a NULL in one of
-    /// its levels, or one its predicate does not admit, conflicting with none.
+    /// its levels, or one its predicate does not admit, conflicting with none. Under a UNIQUE NULLS
+    /// NOT DISTINCT WITHOUT OVERLAPS, a NULL conflicts with a NULL in its level.
     fn excluded_row(&mut self, ti: usize, oi: usize, r: &Row) -> Result<bool> {
         let t = &self.catalog.tables[ti];
         let o = &t.orders[oi];
         let operators = o.exclusion.as_ref().unwrap().operators.clone();
         let columns: Vec<usize> = o.levels.iter().map(|l| l.column()).collect();
-        if columns.iter().any(|&c| r[c] == Datum::Null) {
+        if o.nulls_distinct && columns.iter().any(|&c| r[c] == Datum::Null) {
             return Ok(true);
         }
         if let Some(p) = super::partial::Predicate::of(&self.catalog, t, o)? {
@@ -883,13 +1044,24 @@ impl Snail {
         }
         let t = &self.catalog.tables[ti];
         let o = &t.orders[oi];
+        // A row is told from another by the table's key, or by every column it stores where its
+        // order is no unique key.
         let own = t.orders.iter().find(|x| x.table_order).unwrap();
-        let key: Vec<usize> = own.levels.iter().map(|l| l.column()).collect();
+        let key: Vec<usize> = if own.unique {
+            own.levels.iter().map(|l| l.column()).collect()
+        } else {
+            (0..t.columns.len())
+                .filter(|&c| !t.columns[c].is_virtual())
+                .collect()
+        };
         let column = |c: usize| format!("r.\"{}\"", t.columns[c].name.replace('"', "\"\""));
         let conditions = columns
             .iter()
             .zip(&operators)
-            .map(|(&c, op)| format!("{} {op} {}", column(c), literal(&r[c], t.columns[c].ty)))
+            .map(|(&c, op)| match &r[c] {
+                Datum::Null => format!("{} IS NULL", column(c)),
+                d => format!("{} {op} {}", column(c), literal(d, t.columns[c].ty)),
+            })
             .collect::<Vec<_>>()
             .join(" AND ");
         let admitted = o
@@ -907,8 +1079,11 @@ impl Snail {
         );
         let (b, _) = self.answer(&sql, Some(&o.name))?;
         let mine: Vec<Datum> = key.iter().map(|&c| r[c].clone()).collect();
-        let held = rows_of(&b)?;
-        if held.iter().any(|other| *other != mine) {
+        let mut held = rows_of(&b)?;
+        if let Some(at) = held.iter().position(|other| *other == mine) {
+            held.swap_remove(at);
+        }
+        if !held.is_empty() {
             return Err(Error::new(format!(
                 "conflicting key value violates exclusion constraint \"{}\"",
                 o.name
@@ -1025,12 +1200,31 @@ pub(crate) fn rows_held(catalog: &Catalog, tables: &[(String, Rows)]) -> Result<
                 references.push((key.iter().map(class).collect(), key));
             }
             references.sort();
+            // Under a PERIOD, the parent's periods by the classes of its other columns.
+            let n = k.equal_columns().len();
+            let mut periods: BTreeMap<Vec<Datum>, Vec<crate::composed::Item>> = BTreeMap::new();
+            if k.period {
+                for h in &held {
+                    if let Some(p) = period_of(&h[n]) {
+                        periods.entry(h[..n].to_vec()).or_default().push(p);
+                    }
+                }
+            }
             let mut at = 0;
             for (c, key) in &references {
-                while at < held.len() && held[at] < *c {
-                    at += 1;
-                }
-                if at == held.len() || held[at] != *c {
+                let found = if k.period {
+                    let ty = child.columns[k.columns[n]].ty;
+                    let p = period_of(&key[n]).expect("a reference holding no NULL");
+                    let some = periods.get(&c[..n]).map_or(&[][..], |v| v.as_slice());
+                    !matches!(crate::spans::bounds(ty, &key[n]), Some(None))
+                        && crate::composed::periods_hold(ty, some, &p)?
+                } else {
+                    while at < held.len() && held[at] < *c {
+                        at += 1;
+                    }
+                    at < held.len() && held[at] == *c
+                };
+                if !found {
                     return Err(Error::new(format!(
                         "insert or update on table \"{}\" violates foreign key constraint \"{}\": \
                          Key {} is not present in table \"{}\".",

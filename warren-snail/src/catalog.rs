@@ -1119,6 +1119,12 @@ pub struct Exclusion {
 }
 
 impl Order {
+    /// Whether it stands for a PRIMARY KEY or UNIQUE `WITHOUT OVERLAPS`: an EXCLUDE on GiST, `=` on
+    /// each key but its last, `&&` on its last, a range or a multirange.
+    pub fn without_overlaps(&self) -> bool {
+        self.constraint.is_some() && self.exclusion.is_some()
+    }
+
     /// Where a table column sits among the columns this order holds.
     pub fn slot(&self, column: usize) -> Option<usize> {
         self.columns.iter().position(|&c| c == column)
@@ -1223,6 +1229,16 @@ pub struct ForeignKey {
     /// Whether every row was checked: false where it was added NOT VALID, or NOT ENFORCED, and not
     /// validated since.
     pub valid: bool,
+    /// PERIOD: its last column a range or a multirange, which the periods of the parent's rows
+    /// matching the other columns by `=` together hold.
+    pub period: bool,
+}
+
+impl ForeignKey {
+    /// The columns a reference matches by `=`: every one, or all but its PERIOD.
+    pub fn equal_columns(&self) -> &[usize] {
+        &self.columns[..self.columns.len() - usize::from(self.period)]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1338,10 +1354,10 @@ impl Table {
     pub fn keys_read_whole(&self) -> Vec<String> {
         self.foreign_keys
             .iter()
-            .filter(|k| k.enforced && self.order_led_by(&k.columns).is_none())
+            .filter(|k| k.enforced && self.order_led_by(k.equal_columns()).is_none())
             .map(|k| {
                 let columns: Vec<&str> = k
-                    .columns
+                    .equal_columns()
                     .iter()
                     .map(|&c| self.columns[c].name.as_str())
                     .collect();
