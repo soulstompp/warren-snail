@@ -129,6 +129,12 @@ fn a_value_that_fixes_no_further_level_prices_no_point() {
         ),
         None
     );
+    // A network's value alone fixes the first of the key's two levels: a rescan finds its stations.
+    let p = point("SELECT s.name FROM weather.stations s", &["network_id"]).unwrap();
+    assert_eq!(
+        (p.order.as_str(), p.levels, p.unique),
+        ("stations_pkey", 1, false)
+    );
     // A station's number alone leads no order.
     assert_eq!(
         point("SELECT s.name FROM weather.stations s", &["station_no"]),
