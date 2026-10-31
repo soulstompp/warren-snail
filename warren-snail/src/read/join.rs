@@ -351,58 +351,9 @@ pub(super) fn ask_join_across(
     let mut parts: Vec<Round> = vec![Round::default(); snails.len()];
     let order = read_order(q, &tables);
     let inputs = q.select.inputs();
-    // The tables no outer join may leave NULL, joined in the order they were read, each to one
-    // joined before it; the last read is met as it is read where it alone joins it to them.
-    let core: Vec<usize> = order
-        .iter()
-        .copied()
-        .filter(|&s| !q.nullable(s) && !(q.full && s < 2))
-        .collect();
+    let (core, stream) = core_of(q, &order);
     let last = *order.last().unwrap();
-    let stream = q.outer.is_empty()
-        && !q.full
-        && q.after.is_empty()
-        && q.meets.iter().any(|m| m.touches(last) && m.op == Cmp::Eq)
-        && connected(q, &core[..core.len() - 1]);
-
-    // The columns each table's scan returns: the keys it is kept to first, then every column the
-    // join reads of it, then the answer's.
-    let mut needed: Vec<Vec<(usize, bool)>> = vec![Vec::new(); n];
-    let mut add = |side: usize, c: (usize, bool)| {
-        if !needed[side].contains(&c) {
-            needed[side].push(c);
-        }
-    };
-    let tests = q
-        .after
-        .iter()
-        .chain(q.outer.iter().flat_map(|o| o.tests.iter()));
-    for t in tests {
-        match t {
-            Test::One(s, p) => {
-                if let Some(c) = p.column() {
-                    add(*s, c);
-                }
-            }
-            Test::Two(m) => {
-                add(m.a.side, (m.a.column, false));
-                add(m.b.side, (m.b.column, false));
-            }
-        }
-    }
-    for m in q
-        .meets
-        .iter()
-        .chain(q.outer.iter().flat_map(|o| o.meets.iter()))
-    {
-        add(m.a.side, (m.a.column, false));
-        add(m.b.side, (m.b.column, false));
-    }
-    let mut answers = vec![false; n];
-    for k in &inputs {
-        answers[k.col().side] = true;
-        add(k.col().side, (k.col().column, matches!(k, Key::Month(_))));
-    }
+    let (needed, answers) = needed_of(q);
 
     let mut t = Tables {
         tables: tables.clone(),
@@ -419,16 +370,16 @@ pub(super) fn ask_join_across(
     for (i, &side) in order.iter().enumerate() {
         let (at_snail, _) = at[side];
         let snail = snails[at_snail];
-        // The tables read before it that it may be kept to, the one read last first.
-        let by: Vec<(usize, Vec<Meet>)> = order[..i]
-            .iter()
-            .rev()
-            .map(|&s| (s, keeps(q, side, s)))
-            .filter(|(_, m)| !m.is_empty())
-            .collect();
         let table = tables[side];
-        let keys = by.first().map(|(s, meets)| {
-            let meets = led(table, meets);
+        let streamed = stream && side == last;
+        let Reading {
+            by,
+            led: kept_by,
+            probe,
+            columns,
+            lead,
+        } = reading(q, &order, i, table, streamed, &needed[side]);
+        let keys = by.first().zip(kept_by.as_ref()).map(|((s, _), meets)| {
             let values = t.held[*s].cells.iter().filter_map(|cells| {
                 meets
                     .iter()
@@ -446,34 +397,6 @@ pub(super) fn ask_join_across(
                 values.collect::<Vec<_>>(),
             )
         });
-        // Its scan's columns: the walk's keys, then every other key it is kept to, then the rest.
-        let mut columns: Vec<(usize, bool)> = Vec::new();
-        for c in keys.iter().flat_map(|k| k.columns.iter()) {
-            if !columns.contains(&(*c, false)) {
-                columns.push((*c, false));
-            }
-        }
-        let streamed = stream && side == last;
-        let probe: Vec<Meet> = if streamed {
-            q.meets
-                .iter()
-                .filter(|m| m.touches(side) && m.op == Cmp::Eq)
-                .map(|m| m.seen_from(side))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for m in by.iter().flat_map(|(_, m)| m).chain(&probe) {
-            if !columns.contains(&(m.a.column, false)) {
-                columns.push((m.a.column, false));
-            }
-        }
-        let lead = columns.len();
-        for c in &needed[side] {
-            if !columns.contains(c) {
-                columns.push(*c);
-            }
-        }
         t.columns[side] = columns.clone();
         let want = Want {
             table,
@@ -907,6 +830,132 @@ fn keeps(q: &Question, side: usize, by: usize) -> Vec<Meet> {
     out
 }
 
+/// The tables no outer join may leave NULL, in the order they are read, each joined to one joined
+/// before it; and whether the last read is met as it is read, where it alone joins it to them.
+pub(super) fn core_of(q: &Question, order: &[usize]) -> (Vec<usize>, bool) {
+    let core: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&s| !q.nullable(s) && !(q.full && s < 2))
+        .collect();
+    let last = *order.last().unwrap();
+    let stream = q.outer.is_empty()
+        && !q.full
+        && q.after.is_empty()
+        && q.meets.iter().any(|m| m.touches(last) && m.op == Cmp::Eq)
+        && connected(q, &core[..core.len() - 1]);
+    (core, stream)
+}
+
+/// Every column the join reads of each table, then the answer's; and whether the answer reads the
+/// table.
+pub(super) fn needed_of(q: &Question) -> (Vec<Vec<(usize, bool)>>, Vec<bool>) {
+    let n = q.sides.len();
+    let mut needed: Vec<Vec<(usize, bool)>> = vec![Vec::new(); n];
+    let mut add = |side: usize, c: (usize, bool)| {
+        if !needed[side].contains(&c) {
+            needed[side].push(c);
+        }
+    };
+    let tests = q
+        .after
+        .iter()
+        .chain(q.outer.iter().flat_map(|o| o.tests.iter()));
+    for t in tests {
+        match t {
+            Test::One(s, p) => {
+                if let Some(c) = p.column() {
+                    add(*s, c);
+                }
+            }
+            Test::Two(m) => {
+                add(m.a.side, (m.a.column, false));
+                add(m.b.side, (m.b.column, false));
+            }
+        }
+    }
+    for m in q
+        .meets
+        .iter()
+        .chain(q.outer.iter().flat_map(|o| o.meets.iter()))
+    {
+        add(m.a.side, (m.a.column, false));
+        add(m.b.side, (m.b.column, false));
+    }
+    let mut answers = vec![false; n];
+    for k in &q.select.inputs() {
+        answers[k.col().side] = true;
+        add(k.col().side, (k.col().column, matches!(k, Key::Month(_))));
+    }
+    (needed, answers)
+}
+
+/// A table's part of a join's round, known before any row is read: the tables read before it that
+/// it may be kept to, the one read last first, each with the equalities it is kept by; those of the
+/// one read last in the order of an order's leading levels, which its walk is kept by; the
+/// equalities its rows meet as they are read, where it is read last and met so; and the columns its
+/// scan returns, the keys it is kept to first, `lead` of them.
+pub(super) struct Reading {
+    pub(super) by: Vec<(usize, Vec<Meet>)>,
+    pub(super) led: Option<Vec<Meet>>,
+    pub(super) probe: Vec<Meet>,
+    pub(super) columns: Vec<(usize, bool)>,
+    pub(super) lead: usize,
+}
+
+/// The `i`-th table of `order` as a join's round reads it.
+pub(super) fn reading(
+    q: &Question,
+    order: &[usize],
+    i: usize,
+    table: &Table,
+    streamed: bool,
+    needed: &[(usize, bool)],
+) -> Reading {
+    let side = order[i];
+    let by: Vec<(usize, Vec<Meet>)> = order[..i]
+        .iter()
+        .rev()
+        .map(|&s| (s, keeps(q, side, s)))
+        .filter(|(_, m)| !m.is_empty())
+        .collect();
+    let led = by.first().map(|(_, meets)| led(table, meets));
+    // The walk's keys, then every other key it is kept to, then the rest.
+    let mut columns: Vec<(usize, bool)> = Vec::new();
+    for m in led.iter().flatten() {
+        if !columns.contains(&(m.a.column, false)) {
+            columns.push((m.a.column, false));
+        }
+    }
+    let probe: Vec<Meet> = if streamed {
+        q.meets
+            .iter()
+            .filter(|m| m.touches(side) && m.op == Cmp::Eq)
+            .map(|m| m.seen_from(side))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for m in by.iter().flat_map(|(_, m)| m).chain(&probe) {
+        if !columns.contains(&(m.a.column, false)) {
+            columns.push((m.a.column, false));
+        }
+    }
+    let lead = columns.len();
+    for c in needed {
+        if !columns.contains(c) {
+            columns.push(*c);
+        }
+    }
+    Reading {
+        by,
+        led,
+        probe,
+        columns,
+        lead,
+    }
+}
+
 /// The equalities a table is kept by, in the order of the leading levels of the first of its orders
 /// they lead, where one does.
 fn led(table: &Table, meets: &[Meet]) -> Vec<Meet> {
@@ -955,7 +1004,7 @@ fn fixed(table: &Table, side: &super::question::Side) -> bool {
 /// of the table read last that keeps one, and where none may, the next table as written that no
 /// outer join may leave NULL, then any. A FULL JOIN's two tables are read first, by their own
 /// conditions.
-fn read_order(q: &Question, tables: &[&Table]) -> Vec<usize> {
+pub(super) fn read_order(q: &Question, tables: &[&Table]) -> Vec<usize> {
     let n = q.sides.len();
     let mut order: Vec<usize> = if q.full {
         vec![0, 1]

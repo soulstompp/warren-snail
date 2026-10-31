@@ -959,6 +959,11 @@ pub struct Reader {
 }
 
 impl Reader {
+    /// The file the reader was opened on.
+    pub(crate) fn path(&self) -> &Path {
+        &self.files.path
+    }
+
     /// A reader that holds no page between rounds.
     pub fn open(path: &Path) -> Result<Reader> {
         Ok(Reader {

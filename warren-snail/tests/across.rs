@@ -186,6 +186,97 @@ fn a_question_on_one_snail_s_tables_is_read_as_that_snail_reads_it() {
     assert!(r3.snails.is_empty());
 }
 
+/// Snails opened apart and read together, on the roots they took at one moment, answer a join as
+/// the snails opened together do, each table read along the same order in the same pages; and the
+/// join priced from their directories alone reads no column page: the table read first exactly as
+/// the round reads it, each table kept to its keys between the fewest pages and the most.
+#[test]
+fn snails_read_together_answer_as_snails_opened_together_and_their_join_is_priced_within_its_bounds(
+) {
+    use warren_snail::read::{answer_together, at_one_moment, price_together};
+    let s = sample(20_000);
+    let split = split("together-joins", &s);
+    let (network, station) = busiest(&s);
+    let name = commonest_name(&s);
+    let questions = [
+        joined(network, station),
+        format!(
+            "SELECT s.name, count(*) FROM weather.stations s JOIN weather.readings r \
+             ON r.network_id = s.network_id AND r.station_no = s.station_no \
+             WHERE s.network_id = {network} GROUP BY s.name"
+        ),
+        format!(
+            "SELECT r.feed, count(*) FROM weather.stations s JOIN weather.readings r \
+             ON r.network_id = s.network_id AND r.station_no = s.station_no \
+             WHERE s.name = '{name}' GROUP BY r.feed"
+        ),
+        "SELECT s.name, r.reading_id FROM weather.readings r JOIN weather.stations s \
+         ON s.network_id = r.network_id AND s.station_no = r.station_no \
+         WHERE r.observed_at >= '2022-03-01 00:00:00+00' AND r.observed_at < '2022-03-02 00:00:00+00'"
+            .to_string(),
+        "SELECT s.network_id, s.station_no, r.reading_id FROM weather.stations s \
+         LEFT JOIN weather.readings r ON r.network_id = s.network_id AND r.station_no = s.station_no \
+         AND r.feed = 'AWS Backup' WHERE s.network_id < 40"
+            .to_string(),
+    ];
+    for q in &questions {
+        let mut across = together(&split);
+        let (want, opened) = across.ask(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let mut apart = [fresh(&split.stations), fresh(&split.readings)];
+        assert_eq!(at_one_moment(&mut apart).unwrap(), vec![2, 2], "{q}");
+        let refs = [&apart[0], &apart[1]];
+        let before: Vec<u64> = refs.iter().map(|s| s.pages_read()).collect();
+        let priced = price_together(&refs, q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let read: u64 = refs
+            .iter()
+            .zip(&before)
+            .map(|(s, b)| s.pages_read() - b)
+            .sum();
+        assert_eq!(read, priced.directory_pages(), "{q}: {priced:?}");
+        let (got, round) = answer_together(&refs, q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(bag(&got), bag(&want), "{q}");
+        assert_eq!(round.order, opened.order, "{q}");
+        assert_eq!(
+            round.column_pages_predicted, opened.column_pages_predicted,
+            "{q}"
+        );
+        each_exact(q, &round);
+        assert_eq!(priced.order(), round.order, "{q}: {priced:?}");
+        for (k, t) in priced.tables.iter().enumerate() {
+            let part = &round.snails[usize::from(t.table == "weather.readings")];
+            let pages = part.column_pages_predicted;
+            assert!(
+                t.column_pages_low <= pages && pages <= t.column_pages_high,
+                "{q}: {t:?} against {pages}"
+            );
+            assert!(
+                t.column_pages_low <= t.column_pages_estimate
+                    && t.column_pages_estimate <= t.column_pages_high,
+                "{q}: {t:?}"
+            );
+            if k == 0 || !t.kept {
+                assert_eq!(t.column_pages_low, pages, "{q}: {t:?}");
+            }
+        }
+    }
+    // The first question's readings are kept to one station's keys: priced from the round of one
+    // key, far under their whole read.
+    let mut apart = [fresh(&split.stations), fresh(&split.readings)];
+    at_one_moment(&mut apart).unwrap();
+    let priced = price_together(&[&apart[0], &apart[1]], &questions[0]).unwrap();
+    let kept = &priced.tables[1];
+    assert!(kept.kept, "{priced:?}");
+    assert_eq!(
+        kept.key_column_pages
+            .map(|p| p * priced.tables[0].rows_estimate),
+        Some(kept.column_pages_estimate)
+    );
+    assert!(
+        kept.column_pages_estimate < kept.column_pages_high,
+        "{priced:?}"
+    );
+}
+
 #[test]
 fn two_snails_holding_one_name_are_refused_when_opened_together() {
     let s = sample(500);
@@ -292,6 +383,37 @@ mod written {
 
     const ALL_READINGS: &str = "SELECT count(*) FROM weather.readings r";
     const ALL_STATIONS: &str = "SELECT count(*) FROM weather.stations s";
+
+    /// Snails opened apart, a commit on each landing between their opens: the moment reads every
+    /// root again, finds the first changed, and takes both afresh, so the pair read is one a moment
+    /// held.
+    #[test]
+    fn snails_opened_apart_take_their_roots_at_one_moment() {
+        use warren_snail::read::{answer_together, at_one_moment};
+        let s = sample(5_000);
+        let split = split("together-moment", &s);
+        let (network, station) = busiest(&s);
+        let q = joined(network, station);
+        let stations = fresh(&split.stations);
+        let first = stations.generation();
+        Snail::open_writing(&split.stations)
+            .unwrap()
+            .execute(&format!(
+                "DELETE FROM weather.stations WHERE network_id = {network} AND station_no = {station}"
+            ))
+            .unwrap();
+        Snail::open_writing(&split.readings)
+            .unwrap()
+            .execute(&reading(9_000_001, network, station))
+            .unwrap();
+        let mut apart = [stations, fresh(&split.readings)];
+        let pages = at_one_moment(&mut apart).unwrap();
+        assert_eq!(apart[0].generation(), first + 1);
+        // Each root read again, then afresh and again; the stations' catalog once more.
+        assert!(pages[0] > 6 && pages[1] == 6, "{pages:?}");
+        let (batch, _) = answer_together(&[&apart[0], &apart[1]], &q).unwrap();
+        assert_eq!(one(&batch), 0, "a pair of roots no moment held");
+    }
 
     #[test]
     fn a_round_takes_the_roots_where_none_changed_between_its_two_readings() {

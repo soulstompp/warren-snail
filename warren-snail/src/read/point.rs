@@ -143,6 +143,13 @@ impl Snail {
                     .ok_or_else(|| Error::new(format!("{} has no column {n}", table.name)))
             })
             .collect::<Result<_>>()?;
+        self.point_of(&want, &given)
+    }
+
+    /// The round of a key along the order the columns `given` fix furthest, as `price_point` prices
+    /// it, for a table's part of a round as `want` reads it.
+    pub(super) fn point_of(&self, want: &Want, given: &[usize]) -> Result<Option<Point>> {
+        let table = want.table;
         let mut read = condition_columns(want.side);
         read.extend(want.columns.iter().copied());
         read.extend(given.iter().copied());
@@ -161,7 +168,7 @@ impl Snail {
             .map(|&o| {
                 let order = &table.orders[o];
                 let own = fixed_levels(order, table, want.side, &[]);
-                (o, own, fixed_levels(order, table, want.side, &given))
+                (o, own, fixed_levels(order, table, want.side, given))
             })
             .filter(|&(_, own, levels)| levels > own)
             .max_by_key(|&(o, own, levels)| (levels - own, std::cmp::Reverse(o)));

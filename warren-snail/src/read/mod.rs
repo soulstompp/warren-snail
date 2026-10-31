@@ -20,6 +20,7 @@ mod pipeline;
 mod point;
 mod question;
 pub mod statement;
+mod together;
 mod typed;
 mod walk;
 
@@ -28,6 +29,7 @@ pub use change::Done;
 pub use out::{TableOut, DDL_KEY, NAN_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 pub use point::Point;
+pub use together::{answer_together, at_one_moment, price_together, Priced, TablePrice};
 
 /// An answer's rows as values, as a pipeline reads them.
 pub fn pipeline_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>> {

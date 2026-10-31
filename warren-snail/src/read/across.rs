@@ -179,10 +179,35 @@ impl Snails {
     }
 
     fn of(snails: Vec<Snail>, paths: &[&Path], writing: bool) -> Result<Snails> {
+        let (catalog, at) = {
+            let refs: Vec<&Snail> = snails.iter().collect();
+            Snails::merged(&refs, &|i| paths[i].display().to_string())?
+        };
+        Ok(Snails {
+            snails,
+            paths: paths.iter().map(|p| p.to_path_buf()).collect(),
+            catalog,
+            at,
+            begun: false,
+            aborted: false,
+            written: Vec::new(),
+            stop: None,
+            between: None,
+            writing,
+        })
+    }
+
+    /// Every snail's catalog as one, each table as its snail holds it, and for each table its snail
+    /// and its place among that snail's tables: refused where the snails come from two releases, or
+    /// two of them hold one name, as one database holding every snail's tables would refuse it.
+    /// `shown` names a snail in a refusal.
+    pub(super) fn merged(
+        snails: &[&Snail],
+        shown: &dyn Fn(usize) -> String,
+    ) -> Result<(Catalog, Vec<(usize, usize)>)> {
         if snails.is_empty() {
             return Err(Error::new("no snail to open"));
         }
-        let shown = |i: usize| paths[i].display().to_string();
         // One database holds every snail's tables, so one release's OIDs, and each name once.
         if let Some(i) = (1..snails.len()).find(|&i| snails[i].release() != snails[0].release()) {
             return Err(Error::new(format!(
@@ -295,18 +320,7 @@ impl Snails {
                 }
             }
         }
-        Ok(Snails {
-            snails,
-            paths: paths.iter().map(|p| p.to_path_buf()).collect(),
-            catalog,
-            at,
-            begun: false,
-            aborted: false,
-            written: Vec::new(),
-            stop: None,
-            between: None,
-            writing,
-        })
+        Ok((catalog, at))
     }
 
     /// The snails, in the order they were opened.
@@ -378,29 +392,15 @@ impl Snails {
         holder: usize,
         at: u64,
     ) -> Result<Option<Root>> {
-        for d in &decided.decided {
-            for (k, w) in d.roots.iter().enumerate() {
-                if w.generation != at + 1 || self.holder(&w.holds) != Some(holder) {
-                    continue;
-                }
-                let bytes = decode_carried(&self.snails[decider].reader.read_extent(d.carried)?)?;
-                let mut page = bytes.get(k).cloned().unwrap_or_default();
-                page.resize(PAGE, 0);
-                let root = Root::decode(&page)
-                    .map(|(r, _)| r)
-                    .filter(|r| r.generation == w.generation);
-                let format = self.snails[holder].reader.format();
-                return match root {
-                    Some(r) if r.crc(format)? == w.crc => Ok(Some(r)),
-                    _ => Err(Error::new(format!(
-                        "{} carries a root for {} that is not whole",
-                        self.paths[decider].display(),
-                        self.paths[holder].display()
-                    ))),
-                };
-            }
-        }
-        Ok(None)
+        let snails: Vec<&Snail> = self.snails.iter().collect();
+        carried_root(
+            &snails,
+            &|t| self.holder(t),
+            &|i| self.paths[i].display().to_string(),
+            (decider, decided),
+            holder,
+            at,
+        )
     }
 
     /// The root a transaction across snails decided for snail `i`, standing at `at`, that is not
@@ -1072,9 +1072,47 @@ impl Snails {
     }
 }
 
+/// The root a decision of a snail's root, `decided` as the snail at `decided.0` among `snails`
+/// holds it, carries for the snail at `holder`, whose root stands at `at`: the one it wrote for the
+/// generation after, its checksum held. None where no decision names one. `holds` finds the snail
+/// among them holding a table named so; `shown` names a snail in a refusal.
+pub(super) fn carried_root(
+    snails: &[&Snail],
+    holds: &dyn Fn(&str) -> Option<usize>,
+    shown: &dyn Fn(usize) -> String,
+    decided: (usize, &Root),
+    holder: usize,
+    at: u64,
+) -> Result<Option<Root>> {
+    let (decider, decided) = decided;
+    for d in &decided.decided {
+        for (k, w) in d.roots.iter().enumerate() {
+            if w.generation != at + 1 || holds(&w.holds) != Some(holder) {
+                continue;
+            }
+            let bytes = decode_carried(&snails[decider].reader.read_extent(d.carried)?)?;
+            let mut page = bytes.get(k).cloned().unwrap_or_default();
+            page.resize(PAGE, 0);
+            let root = Root::decode(&page)
+                .map(|(r, _)| r)
+                .filter(|r| r.generation == w.generation);
+            let format = snails[holder].reader.format();
+            return match root {
+                Some(r) if r.crc(format)? == w.crc => Ok(Some(r)),
+                _ => Err(Error::new(format!(
+                    "{} carries a root for {} that is not whole",
+                    shown(decider),
+                    shown(holder)
+                ))),
+            };
+        }
+    }
+    Ok(None)
+}
+
 impl Snail {
     /// Reads from now on as of a pending copy of the root a round across snails found decided.
-    fn adopt(&mut self, mut root: Root) -> Result<()> {
+    pub(super) fn adopt(&mut self, mut root: Root) -> Result<()> {
         root.pending = None;
         self.reader.adopt(&root);
         if self.begun.is_some() {
