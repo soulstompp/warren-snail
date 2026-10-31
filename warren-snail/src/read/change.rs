@@ -1991,6 +1991,10 @@ impl Snail {
             for e in effects {
                 let mut path = Vec::new();
                 self.locate(&mut top, &head, &e.key, &mut path)?;
+                // A row written is checked against the block after its own, where glibc orders it.
+                if let (false, Some(next)) = (e.delete, following(&top, &path)) {
+                    crate::write::agreed_beside(table, order, &e.key, next)?;
+                }
                 by_block.entry(path).or_default().push(e);
             }
             let blocks: Vec<Entry> = by_block.keys().map(|p| entry_at(&top, p).clone()).collect();
@@ -2850,6 +2854,17 @@ fn entry_at<'a>(node: &'a Node, path: &[usize]) -> &'a Entry {
         [i] => &node.entries[*i],
         [i, rest @ ..] => entry_at(&node.kids[i], rest),
         [] => unreachable!("a path names a block"),
+    }
+}
+
+/// The first key of the block after the one a path names, where one follows: the entry beside the
+/// path's on the lowest page that has one.
+fn following<'a>(node: &'a Node, path: &[usize]) -> Option<&'a [KeyValue]> {
+    let (&i, rest) = path.split_first()?;
+    let here = node.entries.get(i + 1).map(|e| e.first.as_slice());
+    match rest {
+        [] => here,
+        _ => following(&node.kids[&i], rest).or(here),
     }
 }
 

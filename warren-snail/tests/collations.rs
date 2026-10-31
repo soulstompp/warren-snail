@@ -268,6 +268,56 @@ fn glibc_s_order_is_refused_where_strxfrm_l_and_strcoll_l_disagree() {
     assert!(e.contains("strxfrm_l") && e.contains("strcoll_l"), "{e}");
 }
 
+/// A value an INSERT writes is checked at the insert against its neighbours under glibc: within its
+/// block as the block is laid out, and against the first of the block after, which the layout of
+/// its own block never sees.
+#[test]
+#[cfg(feature = "standalone")]
+fn glibc_s_order_is_checked_at_the_insert_against_the_block_after() {
+    let ddl =
+        "CREATE TABLE s.t (v text COLLATE \"en_US.utf8\" NOT NULL, n integer, PRIMARY KEY (v));";
+    // Values of 0 then of 1: the order's blocks part between them, the first of 1's being "1 B",
+    // which glibc's strxfrm_l keys after "1b" and its strcoll_l compares before.
+    let mut values: Vec<String> = (0..3000).map(|i| format!("0{i}")).collect();
+    values.extend((0..3000).map(|i| format!("1b{i}")));
+    values.push("1 B".into());
+    let path = tmp("libc-beside.snail");
+    let catalog = Catalog::parse(ddl).unwrap();
+    let n = Values::Int((0..values.len() as i64).map(Some).collect());
+    let v = Values::Text(values.into_iter().map(Some).collect());
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![v, n],
+            },
+        )],
+    )
+    .unwrap();
+    let blocks = Snail::open(&path)
+        .unwrap()
+        .blocks()
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.column == "v")
+        .count();
+    assert!(blocks > 1, "{blocks}");
+    let mut w = Snail::open_writing(&path).unwrap();
+    let e = w
+        .execute("INSERT INTO s.t VALUES ('1b', -1)")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("\"1b\" and \"1 B\""), "{e}");
+    // A value glibc orders alike is written.
+    w.execute("INSERT INTO s.t VALUES ('1a', -3)").unwrap();
+    let (b, _) = w
+        .ask("SELECT count(*) FROM s.t t WHERE t.v < '1b0'", None)
+        .unwrap();
+    assert_eq!(one(&b), 3002);
+}
+
 #[test]
 fn an_order_cut_under_another_version_is_refused_by_name_and_the_others_read() {
     let path = snail_of("icu-version", ICU, &FORTY);

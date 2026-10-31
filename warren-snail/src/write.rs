@@ -1338,21 +1338,62 @@ fn agreed(
     keyed.dedup();
     for p in keyed.windows(2) {
         if collator.cmp(&p[0].1, &p[1].1) != p[0].0.cmp(&p[1].0) {
-            return Err(Error::new(format!(
-                "{}: {} holds {:?} and {:?}, which glibc's strxfrm_l under collation \"{}\" keys \
-                 in another order than its strcoll_l compares them: no order on it is cut",
-                table.name,
-                table.columns[column].name,
-                String::from_utf8_lossy(&p[0].1),
-                String::from_utf8_lossy(&p[1].1),
-                table.columns[column]
-                    .collation
-                    .as_deref()
-                    .unwrap_or("default"),
-            )));
+            return Err(disagreed(table, column, &p[0].1, &p[1].1));
         }
     }
     Ok(())
+}
+
+/// Refuses, by name, a key written beside the first key of the block after its own, where on the
+/// first level they part a glibc collation's `strxfrm_l` keys them in another order than its
+/// `strcoll_l` compares them: the neighbour no layout of its own block sees.
+pub(crate) fn agreed_beside(
+    table: &Table,
+    order: &Order,
+    key: &[KeyValue],
+    next: &[KeyValue],
+) -> Result<()> {
+    let Some(li) = key.iter().zip(next).position(|(a, b)| a != b) else {
+        return Ok(());
+    };
+    let column = order.levels[li].column();
+    let Some(collator) = table.columns[column].orderer()? else {
+        return Ok(());
+    };
+    if collator.spec.provider != crate::collations::Provider::Libc || collator.spec.collate_is_c() {
+        return Ok(());
+    }
+    // A glibc level's key is strxfrm_l's bytes, a NUL, then the value's own.
+    let held = |k: &KeyValue| match k {
+        KeyValue::Bytes(b) => b
+            .iter()
+            .position(|&x| x == 0)
+            .map(|at| b[at + 1..].to_vec()),
+        _ => None,
+    };
+    let (Some(a), Some(b)) = (held(&key[li]), held(&next[li])) else {
+        return Ok(());
+    };
+    if collator.cmp(&a, &b) != key[li].cmp(&next[li]) {
+        return Err(disagreed(table, column, &a, &b));
+    }
+    Ok(())
+}
+
+/// The refusal of two values glibc's `strxfrm_l` and `strcoll_l` order otherwise.
+fn disagreed(table: &Table, column: usize, a: &[u8], b: &[u8]) -> Error {
+    Error::new(format!(
+        "{}: {} holds {:?} and {:?}, which glibc's strxfrm_l under collation \"{}\" keys in \
+         another order than its strcoll_l compares them: no order on it is cut",
+        table.name,
+        table.columns[column].name,
+        String::from_utf8_lossy(a),
+        String::from_utf8_lossy(b),
+        table.columns[column]
+            .collation
+            .as_deref()
+            .unwrap_or("default"),
+    ))
 }
 
 /// What each level of an order is cut under, as `Head::cut_under` records it: nothing where no
