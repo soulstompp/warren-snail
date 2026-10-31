@@ -115,6 +115,10 @@ pub fn answer_together(snails: &[&Snail], sql: &str) -> Result<(RecordBatch, Rou
 #[non_exhaustive]
 pub struct TablePrice {
     pub table: String,
+    /// Its place among the question's tables, as FROM names them.
+    pub side: usize,
+    /// Where it is kept, the place of the table whose keys it is kept to.
+    pub kept_by: Option<usize>,
     pub order: String,
     /// Whether it is kept to the keys of a table read before it, its walk narrowed by them.
     pub kept: bool,
@@ -178,6 +182,8 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
         return Ok(Priced {
             tables: vec![TablePrice {
                 table: catalog.tables[q.sides[0].table].name.clone(),
+                side: 0,
+                kept_by: None,
                 order: p.order,
                 kept: false,
                 directory_pages: p.directory_pages,
@@ -232,16 +238,18 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
                 let given: Vec<usize> = meets.iter().map(|m| m.a.column).collect();
                 snail
                     .point_of(&want, &given)?
-                    .map(|p| (rows[by], p.column_pages, p.order))
+                    .map(|p| (by, p.column_pages, p.order))
             }
             _ => None,
         };
         let (low, estimate) = match &point {
-            Some((keys, one, _)) => (0, keys.saturating_mul(*one).min(own)),
+            Some((by, one, _)) => (0, rows[*by].saturating_mul(*one).min(own)),
             None => (own, own),
         };
         out.push(TablePrice {
             table: table.name.clone(),
+            side,
+            kept_by: point.as_ref().map(|p| p.0),
             order: match &point {
                 Some((_, _, along)) => along.clone(),
                 None => table.orders[part.plan.walk.order].name.clone(),
