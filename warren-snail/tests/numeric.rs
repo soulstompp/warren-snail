@@ -282,6 +282,13 @@ fn nan_lies_on_a_kind_leaf_beside_a_numeric_s_decimal() {
         (stats(4).min_bytes_opt(), stats(4).max_bytes_opt()),
         (Some(&[0u8][..]), Some(&[1u8][..]))
     );
+    assert_eq!(
+        (
+            stats(1).min_bytes_opt().unwrap(),
+            stats(1).max_bytes_opt().unwrap()
+        ),
+        (&(-99_999i64).to_le_bytes()[..], &150i64.to_le_bytes()[..])
+    );
     // A level of a numeric sorts on its kind, then its decimal.
     let keyed = &outs.iter().find(|t| t.table == "s.k").unwrap().file;
     let reader =
