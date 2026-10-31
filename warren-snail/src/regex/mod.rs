@@ -65,6 +65,13 @@ impl Regex {
         eflags: i32,
         details: &mut RegMatch,
     ) -> Result<Option<Vec<RegMatch>>, RegError> {
-        exec::exec(&self.guts, string, search_start, nmatch, eflags, Some(details))
+        exec::exec(
+            &self.guts,
+            string,
+            search_start,
+            nmatch,
+            eflags,
+            Some(details),
+        )
     }
 }

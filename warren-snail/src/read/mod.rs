@@ -201,6 +201,90 @@ fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlpa
         _ => Err(Error::new("a question with virtual columns is not read")),
     }
 }
+
+/// A statement with each `SUBSTRING(s SIMILAR p ESCAPE e)` written `SUBSTRING(s FROM p FOR e)`,
+/// the same call in PostgreSQL's grammar (substring of three texts), which sqlparser reads.
+fn substring_similar(sql: &str) -> Result<std::borrow::Cow<'_, str>> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    if !sql.to_ascii_lowercase().contains("similar") {
+        return Ok(std::borrow::Cow::Borrowed(sql));
+    }
+    let tokens =
+        Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql).tokenize_with_location()?;
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset = |line: u64, column: u64| -> usize {
+        let start = starts[line as usize - 1];
+        start
+            + sql[start..]
+                .chars()
+                .take(column as usize - 1)
+                .map(char::len_utf8)
+                .sum::<usize>()
+    };
+    let solid: Vec<&sqlparser::tokenizer::TokenWithSpan> = tokens
+        .iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+    let keyword = |i: usize, k: Keyword| {
+        solid.get(i).is_some_and(
+            |t| matches!(&t.token, Token::Word(w) if w.keyword == k && w.quote_style.is_none()),
+        )
+    };
+    // The depth inside each SUBSTRING call's parentheses, innermost last.
+    let mut calls: Vec<usize> = Vec::new();
+    let mut depth = 0;
+    let mut swaps: Vec<(usize, usize, &str)> = Vec::new();
+    for i in 0..solid.len() {
+        match &solid[i].token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                if calls.last() == Some(&depth) {
+                    calls.pop();
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        if keyword(i, Keyword::SUBSTRING)
+            && matches!(solid.get(i + 1).map(|t| &t.token), Some(Token::LParen))
+        {
+            calls.push(depth + 1);
+            continue;
+        }
+        if calls.last() != Some(&depth) {
+            continue;
+        }
+        let to = if keyword(i, Keyword::SIMILAR) && !keyword(i + 1, Keyword::TO) {
+            "FROM"
+        } else if keyword(i, Keyword::ESCAPE) {
+            "FOR"
+        } else {
+            continue;
+        };
+        let s = &solid[i].span;
+        swaps.push((
+            offset(s.start.line, s.start.column),
+            offset(s.end.line, s.end.column),
+            to,
+        ));
+    }
+    if swaps.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(sql));
+    }
+    let mut out = String::with_capacity(sql.len());
+    let mut at = 0;
+    for (from, to, word) in swaps {
+        out.push_str(&sql[at..from]);
+        out.push_str(word);
+        at = to;
+    }
+    out.push_str(&sql[at..]);
+    Ok(std::borrow::Cow::Owned(out))
+}
+
 /// The tag of the pages read for one order of one table.
 fn order_tag(table: usize, order: usize) -> u32 {
     (table as u32) << 16 | order as u32
@@ -948,6 +1032,7 @@ impl Snail {
         order: Option<&str>,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
+        let sql = &*substring_similar(sql)?;
         let parsed =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
         if let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() {

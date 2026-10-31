@@ -2311,3 +2311,259 @@ pub(super) fn formatting(
         _ => return Ok(None),
     }))
 }
+
+/// Whether a function is a regular expression's: the `regexp_` functions and SIMILAR TO's
+/// translations.
+pub(super) fn is_regexp_function(name: &str) -> bool {
+    matches!(
+        name,
+        "regexp_count"
+            | "regexp_instr"
+            | "regexp_like"
+            | "regexp_match"
+            | "regexp_matches"
+            | "regexp_replace"
+            | "regexp_split_to_array"
+            | "regexp_split_to_table"
+            | "regexp_substr"
+            | "similar_escape"
+            | "similar_to_escape"
+    )
+}
+
+/// Whether a regular expression's function returns a set of rows.
+pub(super) fn returns_a_set(name: &str) -> bool {
+    matches!(name, "regexp_matches" | "regexp_split_to_table")
+}
+
+/// Why a function returning a set is refused.
+pub(super) fn set_refused(name: &str) -> Error {
+    Error::new(format!(
+        "{name} returns a set of rows, and the snail reads no function that returns a set yet"
+    ))
+}
+
+/// `text[]`, what regexp_match and regexp_split_to_array return.
+pub(super) fn text_array() -> ColumnType {
+    ColumnType::Composed(crate::composed::TypeRef::of(
+        crate::composed::Composed::Array {
+            element: ColumnType::Text(None),
+            domain: None,
+        },
+    ))
+}
+
+/// A one-dimensional `text[]` of the elements, from 1.
+fn text_array_of(elements: Vec<Option<String>>) -> Value {
+    use crate::composed::{Compound, Item};
+    let ty = text_array();
+    let n = elements.len() as i32;
+    let elements: Vec<Item> = elements
+        .into_iter()
+        .map(|e| match e {
+            Some(s) => Item::Scalar(super::statement::Datum::Text(s)),
+            None => Item::Null,
+        })
+        .collect();
+    let (dims, lower) = if n == 0 {
+        (vec![], vec![])
+    } else {
+        (vec![n], vec![1])
+    };
+    let item = Item::Array {
+        elements,
+        dims,
+        lower,
+    };
+    Value::Composed(ty, std::sync::Arc::new(Compound::new(ty, item)))
+}
+
+/// The classes and case a regular expression is compiled under, by the collation its text
+/// carries.
+pub(super) fn ctype_of(casing: crate::catalog::Casing) -> Result<crate::regex::Ctype> {
+    use crate::catalog::Casing;
+    use crate::regex::Ctype;
+    let ctype = match casing {
+        Casing::Ascii => Ctype::C,
+        Casing::Libc => Ctype::Libc { default: true },
+        Casing::Simple | Casing::Full => {
+            return Err(Error::new(
+                "a regular expression under PostgreSQL's own Unicode tables (pg_c_utf8, \
+                 pg_unicode_fast) is not read yet",
+            ))
+        }
+    };
+    if !ctype.available() {
+        return Err(Error::new(
+            "this machine's C library has no C.UTF-8, whose classes a regular expression reads",
+        ));
+    }
+    Ok(ctype)
+}
+
+/// The value of a regular expression's function, as regexp.c gives it, under `casing`; None where
+/// the name is none of them. Every one but similar_escape is strict.
+pub(super) fn regexps(
+    name: &str,
+    args: &[Value],
+    casing: crate::catalog::Casing,
+) -> Result<Option<Value>> {
+    use crate::regexp as r;
+    if !is_regexp_function(name) {
+        return Ok(None);
+    }
+    if returns_a_set(name) {
+        return Err(set_refused(name));
+    }
+    let no_form = || {
+        Error::new(format!(
+            "function {name}({}) does not exist",
+            args.iter()
+                .map(super::pipeline::kind_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
+    if name == "similar_escape" {
+        let [pat, esc] = args else {
+            return Err(no_form());
+        };
+        let pat = (!pat.is_null()).then(|| text_arg(pat)).transpose()?;
+        let esc = (!esc.is_null()).then(|| text_arg(esc)).transpose()?;
+        return Ok(Some(
+            r::similar_escape(pat.as_deref(), esc.as_deref())?.map_or(Value::Null, Value::Text),
+        ));
+    }
+    if args.iter().any(Value::is_null) {
+        return Ok(Some(Value::Null));
+    }
+    if name == "similar_to_escape" {
+        return Ok(Some(Value::Text(match args {
+            [pat] => r::similar_to_escape(&text_arg(pat)?, None)?,
+            [pat, esc] => r::similar_to_escape(&text_arg(pat)?, Some(&text_arg(esc)?))?,
+            _ => return Err(no_form()),
+        })));
+    }
+    let ctype = ctype_of(casing)?;
+    let (s, p) = match args {
+        [s, p, ..] => (text_arg(s)?, text_arg(p)?),
+        _ => return Err(no_form()),
+    };
+    let rest = &args[2..];
+    let int = |i: usize| -> Result<Option<i32>> { rest.get(i).map(int32).transpose() };
+    let txt = |i: usize| -> Result<Option<String>> { rest.get(i).map(text_arg).transpose() };
+    let text = |x: Option<String>| x.map_or(Value::Null, Value::Text);
+    Ok(Some(match (name, rest.len()) {
+        ("regexp_count", 0..=2) => Value::Int(i64::from(r::regexp_count(
+            &s,
+            &p,
+            int(0)?,
+            txt(1)?.as_deref(),
+            ctype,
+        )?)),
+        ("regexp_instr", 0..=5) => Value::Int(i64::from(r::regexp_instr(
+            &s,
+            &p,
+            int(0)?,
+            int(1)?,
+            int(2)?,
+            txt(3)?.as_deref(),
+            int(4)?,
+            ctype,
+        )?)),
+        ("regexp_like", 0..=1) => Value::Bool(r::regexp_like(&s, &p, txt(0)?.as_deref(), ctype)?),
+        ("regexp_match", 0..=1) => match r::regexp_match(&s, &p, txt(0)?.as_deref(), ctype)? {
+            Some(e) => text_array_of(e),
+            None => Value::Null,
+        },
+        ("regexp_split_to_array", 0..=1) => text_array_of(
+            r::regexp_split_to_array(&s, &p, txt(0)?.as_deref(), ctype)?
+                .into_iter()
+                .map(Some)
+                .collect(),
+        ),
+        ("regexp_substr", 0..=4) => text(r::regexp_substr(
+            &s,
+            &p,
+            int(0)?,
+            int(1)?,
+            txt(2)?.as_deref(),
+            int(3)?,
+            ctype,
+        )?),
+        ("regexp_replace", 1) => Value::Text(r::textregexreplace_noopt(
+            &s,
+            &p,
+            &text_arg(&rest[0])?,
+            ctype,
+        )?),
+        // The fourth argument an integer is the start; text, the flags.
+        ("regexp_replace", 2) => match &rest[1] {
+            Value::Int(_) => Value::Text(r::textregexreplace_extended(
+                &s,
+                &p,
+                &text_arg(&rest[0])?,
+                int32(&rest[1])?,
+                None,
+                None,
+                ctype,
+            )?),
+            opt => Value::Text(r::textregexreplace(
+                &s,
+                &p,
+                &text_arg(&rest[0])?,
+                &text_arg(opt)?,
+                ctype,
+            )?),
+        },
+        ("regexp_replace", 3..=4) => Value::Text(r::textregexreplace_extended(
+            &s,
+            &p,
+            &text_arg(&rest[0])?,
+            int32(&rest[1])?,
+            Some(int32(&rest[2])?),
+            rest.get(3).map(text_arg).transpose()?.as_deref(),
+            ctype,
+        )?),
+        _ => return Err(no_form()),
+    }))
+}
+
+/// `s ~ p` and its kin, `~*` where `icase`, negated where `not`, under `casing`: a text, a name or
+/// a bpchar's text against a pattern.
+pub(super) fn regex_op(
+    s: &Value,
+    p: &Value,
+    icase: bool,
+    not: bool,
+    casing: crate::catalog::Casing,
+) -> Result<Value> {
+    if s.is_null() || p.is_null() {
+        return Ok(Value::Null);
+    }
+    let ctype = ctype_of(casing)?;
+    let m = crate::regexp::textregexeq(&text_arg(s)?, &text_arg(p)?, icase, ctype)?;
+    Ok(Value::Bool(m != not))
+}
+
+/// `substring(s from p)`, and `substring(s from p for esc)` (SQL's form, `similar_escape`'s
+/// translation first), under `casing`.
+pub(super) fn substring_by_pattern(
+    s: &Value,
+    p: &Value,
+    esc: Option<&Value>,
+    casing: crate::catalog::Casing,
+) -> Result<Value> {
+    if s.is_null() || p.is_null() || esc.is_some_and(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let p = match esc {
+        None => text_arg(p)?,
+        Some(e) => match crate::regexp::similar_escape(Some(&text_arg(p)?), Some(&text_arg(e)?))? {
+            Some(p) => p,
+            None => return Ok(Value::Null),
+        },
+    };
+    let ctype = ctype_of(casing)?;
+    Ok(crate::regexp::textregexsubstr(&text_arg(s)?, &p, ctype)?.map_or(Value::Null, Value::Text))
+}

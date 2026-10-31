@@ -228,6 +228,19 @@ impl Typing<'_> {
                 }
                 Some(ColumnType::Boolean)
             }
+            Expr::SimilarTo {
+                expr,
+                pattern,
+                escape_char,
+                ..
+            } => {
+                self.type_of(expr)?;
+                self.type_of(pattern)?;
+                if let Some(c) = escape_char {
+                    self.type_of(c)?;
+                }
+                Some(ColumnType::Boolean)
+            }
             Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
                 self.type_of(a)?;
                 self.type_of(b)?;
@@ -279,7 +292,11 @@ impl Typing<'_> {
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq
-                    | BinaryOperator::Overlaps => Some(ColumnType::Boolean),
+                    | BinaryOperator::Overlaps
+                    | BinaryOperator::PGRegexMatch
+                    | BinaryOperator::PGRegexIMatch
+                    | BinaryOperator::PGRegexNotMatch
+                    | BinaryOperator::PGRegexNotIMatch => Some(ColumnType::Boolean),
                     _ => None,
                 }
             }
@@ -351,6 +368,9 @@ impl Typing<'_> {
                     return Ok(t);
                 }
                 if let Some(t) = strings(&name, &types)? {
+                    return Ok(t);
+                }
+                if let Some(t) = regexps(&name, &types)? {
                     return Ok(t);
                 }
                 crate::functions::refuse_server(&name, self.release)?;
@@ -808,4 +828,47 @@ pub(super) fn strings(
         "substr" | "reverse" | "btrim" | "ltrim" | "rtrim" if bytes => Some(C::Bytes),
         _ => Some(C::Text(None)),
     }))
+}
+
+/// The type a regular expression's function returns, in the form PostgreSQL resolves for its
+/// arguments, or its refusal where it has no such form or returns a set; none where the name is
+/// none of them.
+pub(super) fn regexps(
+    name: &str,
+    args: &[Option<ColumnType>],
+) -> Result<Option<Option<ColumnType>>> {
+    use ColumnType as C;
+    if !super::calls::is_regexp_function(name) {
+        return Ok(None);
+    }
+    if super::calls::returns_a_set(name) {
+        return Err(super::calls::set_refused(name));
+    }
+    // Each form, a letter an argument: t a string, i an integer.
+    let forms: &[&str] = match name {
+        "regexp_count" => &["tt", "tti", "ttit"],
+        "regexp_instr" => &["tt", "tti", "ttii", "ttiii", "ttiiit", "ttiiiti"],
+        "regexp_like" | "regexp_match" | "regexp_split_to_array" => &["tt", "ttt"],
+        "regexp_replace" => &["ttt", "tttt", "ttti", "tttii", "tttiit"],
+        "regexp_substr" => &["tt", "tti", "ttii", "ttiit", "ttiiti"],
+        "similar_escape" => &["tt"],
+        _ => &["t", "tt"],
+    };
+    let fits = |form: &str| {
+        form.len() == args.len()
+            && form.chars().zip(args).all(|(k, t)| match (k, t) {
+                (_, None) => true,
+                ('t', Some(t)) => matches!(t, C::Text(_) | C::Bpchar(_) | C::Name),
+                (_, Some(t)) => matches!(t, C::Int2 | C::Int4),
+            })
+    };
+    if !forms.iter().any(|f| fits(f)) {
+        return Err(no_form(name, args));
+    }
+    Ok(Some(Some(match name {
+        "regexp_count" | "regexp_instr" => C::Int4,
+        "regexp_like" => C::Boolean,
+        "regexp_match" | "regexp_split_to_array" => super::calls::text_array(),
+        _ => C::Text(None),
+    })))
 }

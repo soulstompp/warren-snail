@@ -1864,6 +1864,36 @@ fn like_of(
     }
 }
 
+/// The casing a regular expression is compiled under: its text's collation, else its pattern's,
+/// else the database's default.
+fn regex_casing(frame: &Frame, s: &Expr, p: &Expr) -> Result<Casing> {
+    Ok(match frame.casings.implicit(s)? {
+        Some(k) => k,
+        None => frame.casings.implicit(p)?.unwrap_or(Casing::Libc),
+    })
+}
+
+/// `s ~ p` and its kin, as PostgreSQL's textregexeq, nameregexeq and their kin read them: a text,
+/// a name or a bpchar's text against a text pattern.
+fn regex_match(
+    s: &Value,
+    p: &Value,
+    op: &BinaryOperator,
+    icase: bool,
+    not: bool,
+    casing: Casing,
+) -> Result<Value> {
+    let string = |v: &Value| matches!(v, Value::Null | Value::Text(_) | Value::Str(..));
+    if !string(s) || !string(p) {
+        return Err(Error::new(format!(
+            "operator does not exist: {} {op} {}",
+            kind_name(s),
+            kind_name(p)
+        )));
+    }
+    super::calls::regex_op(s, p, icase, not, casing)
+}
+
 /// A number as a double precision, as PostgreSQL widens it beside a float: an integer as itself
 /// rounded, a numeric read from its text, a real exactly.
 fn as_double(v: &Value) -> Option<f64> {
@@ -2562,6 +2592,28 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             };
             Value::Bool(like_of(&v, &p, escape, ilike, under)? != *negated)
         }
+        // `a SIMILAR TO b [ESCAPE c]` is `a ~ similar_to_escape(b [, c])`, as PostgreSQL's grammar
+        // writes it; NOT SIMILAR TO, `!~`.
+        Expr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            let mut args = vec![ev(pattern)?];
+            if let Some(c) = escape_char {
+                args.push(ev(c)?);
+            }
+            let p = super::calls::regexps("similar_to_escape", &args, Casing::Libc)?
+                .unwrap_or(Value::Null);
+            let casing = regex_casing(frame, expr, pattern)?;
+            let op = if *negated {
+                BinaryOperator::PGRegexNotMatch
+            } else {
+                BinaryOperator::PGRegexMatch
+            };
+            regex_match(&ev(expr)?, &p, &op, false, *negated, casing)?
+        }
         Expr::AnyOp {
             left,
             compare_op,
@@ -2744,6 +2796,21 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     };
                     return super::calls::overlaps([ev(s1)?, ev(e1)?, ev(s2)?, ev(e2)?], frame.now);
                 }
+                BinaryOperator::PGRegexMatch
+                | BinaryOperator::PGRegexIMatch
+                | BinaryOperator::PGRegexNotMatch
+                | BinaryOperator::PGRegexNotIMatch => {
+                    let icase = matches!(
+                        op,
+                        BinaryOperator::PGRegexIMatch | BinaryOperator::PGRegexNotIMatch
+                    );
+                    let not = matches!(
+                        op,
+                        BinaryOperator::PGRegexNotMatch | BinaryOperator::PGRegexNotIMatch
+                    );
+                    let casing = regex_casing(frame, left, right)?;
+                    return regex_match(&ev(left)?, &ev(right)?, op, icase, not, casing);
+                }
                 _ => {}
             }
             let x = ev(left)?;
@@ -2876,10 +2943,27 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 Some(x) => ev(x)?,
                 None => Value::Int(1),
             };
+            // A text to start from is a pattern: substring(text, text), or with a text for its end,
+            // SQL's substring(text, text, text) by similar_escape.
             if matches!(from, Value::Text(_) | Value::Str(..)) {
-                return Err(Error::new(format!(
-                    "{e}: a substring by a regular expression is not read yet"
-                )));
+                let esc = substring_for.as_deref().map(&ev).transpose()?;
+                if !matches!(esc, Some(Value::Int(_))) {
+                    let casing = match frame.casings.implicit(expr)? {
+                        Some(k) => k,
+                        None => substring_from
+                            .as_deref()
+                            .map(|x| frame.casings.implicit(x))
+                            .transpose()?
+                            .flatten()
+                            .unwrap_or(Casing::Libc),
+                    };
+                    return super::calls::substring_by_pattern(
+                        &ev(expr)?,
+                        &from,
+                        esc.as_ref(),
+                        casing,
+                    );
+                }
             }
             let mut args = vec![ev(expr)?, from];
             if let Some(x) = substring_for {
@@ -3002,6 +3086,15 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     };
                     if let Some(v) = super::calls::strings(&name, &values, casing)? {
                         return Ok(v);
+                    }
+                    if super::calls::is_regexp_function(&name) {
+                        let casing = match a.as_slice() {
+                            [s, p, ..] => regex_casing(frame, s, p)?,
+                            _ => casing,
+                        };
+                        if let Some(v) = super::calls::regexps(&name, &values, casing)? {
+                            return Ok(v);
+                        }
                     }
                     if let Some(v) = super::calls::formatting(&name, &values, &types)? {
                         return Ok(v);
@@ -5035,7 +5128,11 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
                 };
             !(own && plain) || args(f).is_ok_and(|a| a.into_iter().any(calls_beyond_the_question))
         }
-        Expr::Ceil { .. } | Expr::Floor { .. } | Expr::Extract { .. } => true,
+        Expr::Ceil { .. }
+        | Expr::Floor { .. }
+        | Expr::Extract { .. }
+        | Expr::SimilarTo { .. }
+        | Expr::Substring { .. } => true,
         Expr::BinaryOp { left, op, right } => {
             matches!(
                 op,
@@ -5045,6 +5142,10 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo
                     | BinaryOperator::Overlaps
+                    | BinaryOperator::PGRegexMatch
+                    | BinaryOperator::PGRegexIMatch
+                    | BinaryOperator::PGRegexNotMatch
+                    | BinaryOperator::PGRegexNotIMatch
             ) || calls_beyond_the_question(left)
                 || calls_beyond_the_question(right)
         }

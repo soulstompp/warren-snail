@@ -49,7 +49,8 @@ impl Function {
 }
 
 /// The functions of a type the snail answers, by signature: the numbers', time's, then the aggregates
-/// past those the types carry and the window functions, then strings'.
+/// past those the types carry and the window functions, then strings', then the regular
+/// expressions'.
 const HELD: &[&str] = &[
     "abs(bigint)",
     "abs(double precision)",
@@ -401,6 +402,35 @@ const HELD: &[&str] = &[
     "to_date(text,text)",
     "to_number(text,text)",
     "to_timestamp(text,text)",
+    "\"substring\"(text,text,text)",
+    "regexp_count(text,text)",
+    "regexp_count(text,text,integer)",
+    "regexp_count(text,text,integer,text)",
+    "regexp_instr(text,text)",
+    "regexp_instr(text,text,integer)",
+    "regexp_instr(text,text,integer,integer)",
+    "regexp_instr(text,text,integer,integer,integer)",
+    "regexp_instr(text,text,integer,integer,integer,text)",
+    "regexp_instr(text,text,integer,integer,integer,text,integer)",
+    "regexp_like(text,text)",
+    "regexp_like(text,text,text)",
+    "regexp_match(text,text)",
+    "regexp_match(text,text,text)",
+    "regexp_replace(text,text,text)",
+    "regexp_replace(text,text,text,integer)",
+    "regexp_replace(text,text,text,integer,integer)",
+    "regexp_replace(text,text,text,integer,integer,text)",
+    "regexp_replace(text,text,text,text)",
+    "regexp_split_to_array(text,text)",
+    "regexp_split_to_array(text,text,text)",
+    "regexp_substr(text,text)",
+    "regexp_substr(text,text,integer)",
+    "regexp_substr(text,text,integer,integer)",
+    "regexp_substr(text,text,integer,integer,text)",
+    "regexp_substr(text,text,integer,integer,text,integer)",
+    "similar_escape(text,text)",
+    "similar_to_escape(text)",
+    "similar_to_escape(text,text)",
 ];
 
 fn held() -> &'static std::collections::HashSet<&'static str> {
