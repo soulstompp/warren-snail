@@ -136,9 +136,9 @@ fn bare(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
-/// The schemas a name no schema qualifies is looked for in, as PostgreSQL's default search path
-/// reads: the file's objects that name no schema lie in public.
-const SEARCH_PATH: [&str; 1] = ["public"];
+/// The schema a name no schema qualifies is looked for in: PostgreSQL's default search path holds
+/// one the file can hold, public, where the file's objects that name no schema lie.
+const SEARCH_PATH: &str = "public";
 
 /// The schema an object of the file lies in: the one its name gives, else public.
 fn schema_of(name: &str) -> &str {
@@ -156,9 +156,9 @@ pub(super) enum Named<'c> {
 }
 
 /// What a name SET CONSTRAINTS gives finds, as PostgreSQL's AfterTriggerSetState finds it: its
-/// bare name, and every constraint of that name in the schema it names, or else in the first schema
-/// of the search path holding one. Refused where it names another database or too many parts, a
-/// schema the file names nothing in, or no constraint.
+/// bare name, and every constraint of that name in the schema it names, or else in the search
+/// path's. Refused where it names another database or too many parts, a schema the file names
+/// nothing in, or no constraint.
 pub(super) fn named<'c, 'n>(catalog: &'c Catalog, n: &'n str) -> Result<(&'n str, Vec<Named<'c>>)> {
     let parts: Vec<&str> = n.split('.').collect();
     let (schema, bare) = match parts.as_slice() {
@@ -175,41 +175,35 @@ pub(super) fn named<'c, 'n>(catalog: &'c Catalog, n: &'n str) -> Result<(&'n str
             )))
         }
     };
-    let schemas: Vec<&str> = match schema {
-        Some(s) if catalog.holds_schema(s) => vec![s],
+    let s = match schema {
+        Some(s) if catalog.holds_schema(s) => s,
         Some(s) => return Err(Error::new(format!("schema \"{s}\" does not exist"))),
-        None => SEARCH_PATH.to_vec(),
+        None => SEARCH_PATH,
     };
     let mut found = Vec::new();
-    for s in schemas {
-        for (ci, t) in catalog.tables.iter().enumerate() {
-            if schema_of(&t.name) != s {
-                continue;
-            }
-            for (fi, k) in t.foreign_keys.iter().enumerate() {
-                if k.name == bare {
-                    found.push(Named::Key((ci, fi), k.deferrable));
-                }
-            }
-            for o in t.orders.iter().filter(|o| o.name == bare) {
-                let deferrable = (o.constraint.as_ref().map(|k| k.deferrable))
-                    .or(o.exclusion.as_ref().map(|e| e.deferrable));
-                if let Some(d) = deferrable {
-                    found.push(Named::Order(t, o, d));
-                }
-            }
-            if t.checks.iter().any(|k| k.name == bare) {
-                found.push(Named::Check);
+    for (ci, t) in catalog.tables.iter().enumerate() {
+        if schema_of(&t.name) != s {
+            continue;
+        }
+        for (fi, k) in t.foreign_keys.iter().enumerate() {
+            if k.name == bare {
+                found.push(Named::Key((ci, fi), k.deferrable));
             }
         }
-        for d in &catalog.domains {
-            if schema_of(&d.name) == s && d.checks.iter().any(|k| k.name == bare) {
-                found.push(Named::Check);
+        for o in t.orders.iter().filter(|o| o.name == bare) {
+            let deferrable = (o.constraint.as_ref().map(|k| k.deferrable))
+                .or(o.exclusion.as_ref().map(|e| e.deferrable));
+            if let Some(d) = deferrable {
+                found.push(Named::Order(t, o, d));
             }
         }
-        // The first schema holding a constraint of that name is the only one read.
-        if !found.is_empty() {
-            break;
+        if t.checks.iter().any(|k| k.name == bare) {
+            found.push(Named::Check);
+        }
+    }
+    for d in &catalog.domains {
+        if schema_of(&d.name) == s && d.checks.iter().any(|k| k.name == bare) {
+            found.push(Named::Check);
         }
     }
     if found.is_empty() {
