@@ -844,7 +844,8 @@ impl Snail {
             if !self.locks.contains(&b) {
                 self.lock_byte(b, Waiting::Wait)?;
                 self.locks.insert(b);
-                if self.reader.peek_root()?.generation != self.root.generation {
+                // Another writer of the strand committed while it waited: run again on the newest root.
+                if self.root.generation != self.reader.peek_root()?.generation {
                     self.stale = true;
                     return Ok(false);
                 }
