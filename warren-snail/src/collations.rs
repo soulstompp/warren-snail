@@ -81,6 +81,21 @@ impl Spec {
     }
 }
 
+/// A class of characters, as a regular expression asks a collation's library for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CharClass {
+    Digit,
+    Alpha,
+    Alnum,
+    Upper,
+    Lower,
+    Graph,
+    Print,
+    Punct,
+    Space,
+}
+
 /// Why a collation that calls a library is refused by a build without the feature.
 pub(crate) fn unbuilt(name: &str) -> Error {
     Error::new(format!(
@@ -121,6 +136,15 @@ mod library {
             unreachable!("no collator opens without the feature collations")
         }
         pub fn version(&self) -> &str {
+            unreachable!("no collator opens without the feature collations")
+        }
+        pub fn ctype_is_c(&self) -> bool {
+            unreachable!("no collator opens without the feature collations")
+        }
+        pub fn is_class(&self, _class: CharClass, _c: u32) -> bool {
+            unreachable!("no collator opens without the feature collations")
+        }
+        pub fn char_case(&self, _c: u32, _upper: bool) -> u32 {
             unreachable!("no collator opens without the feature collations")
         }
     }
@@ -223,6 +247,17 @@ mod library {
         u_versionToString(info: *const u8, out: *mut c_char);
         u_getVersion(info: *mut u8);
         u_errorName(code: UErrorCode) -> *const c_char;
+        u_isdigit(c: i32) -> i8;
+        u_isalpha(c: i32) -> i8;
+        u_isalnum(c: i32) -> i8;
+        u_isupper(c: i32) -> i8;
+        u_islower(c: i32) -> i8;
+        u_isgraph(c: i32) -> i8;
+        u_isprint(c: i32) -> i8;
+        u_ispunct(c: i32) -> i8;
+        u_isspace(c: i32) -> i8;
+        u_toupper(c: i32) -> i32;
+        u_tolower(c: i32) -> i32;
         ucasemap_open(locale: *const c_char, options: u32, status: *mut UErrorCode) -> *mut UCaseMap;
         ucasemap_utf8ToLower(
             csm: *const UCaseMap,
@@ -284,6 +319,14 @@ mod library {
         fn towlower_l(wc: u32, locale: libc::locale_t) -> u32;
         fn towupper_l(wc: u32, locale: libc::locale_t) -> u32;
         fn iswalnum_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswdigit_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswalpha_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswupper_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswlower_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswgraph_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswprint_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswpunct_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+        fn iswspace_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
     }
 
     fn failed(status: UErrorCode) -> bool {
@@ -766,6 +809,81 @@ mod library {
         /// under ICU, glibc's own under libc.
         pub fn version(&self) -> &str {
             &self.version
+        }
+
+        /// Whether glibc's LC_CTYPE is C or POSIX, under which PostgreSQL takes a regular
+        /// expression's classes and case as ASCII's.
+        pub fn ctype_is_c(&self) -> bool {
+            self.spec.provider == Provider::Libc
+                && matches!(self.spec.ctype.as_str(), "C" | "POSIX")
+        }
+
+        /// Whether a character is of a class, as PostgreSQL asks the collation's library for a
+        /// regular expression (`wc_isalpha_icu`, `wc_isalpha_libc_mb` and their kin): ICU's
+        /// u_isalpha and its kin, which take no locale; glibc's iswalpha_l and its kin under the
+        /// collation's LC_CTYPE.
+        pub fn is_class(&self, class: CharClass, c: u32) -> bool {
+            use CharClass as K;
+            match &self.inner {
+                Inner::Icu { .. } => {
+                    let c = c as i32;
+                    // SAFETY: ICU's property functions take any code point.
+                    let r = unsafe {
+                        match class {
+                            K::Digit => u_isdigit(c),
+                            K::Alpha => u_isalpha(c),
+                            K::Alnum => u_isalnum(c),
+                            K::Upper => u_isupper(c),
+                            K::Lower => u_islower(c),
+                            K::Graph => u_isgraph(c),
+                            K::Print => u_isprint(c),
+                            K::Punct => u_ispunct(c),
+                            K::Space => u_isspace(c),
+                        }
+                    };
+                    r != 0
+                }
+                Inner::Libc { loc } => {
+                    // SAFETY: the locale lives as long as the program; any code point is a wint_t.
+                    let r = unsafe {
+                        match class {
+                            K::Digit => iswdigit_l(c, *loc),
+                            K::Alpha => iswalpha_l(c, *loc),
+                            K::Alnum => iswalnum_l(c, *loc),
+                            K::Upper => iswupper_l(c, *loc),
+                            K::Lower => iswlower_l(c, *loc),
+                            K::Graph => iswgraph_l(c, *loc),
+                            K::Print => iswprint_l(c, *loc),
+                            K::Punct => iswpunct_l(c, *loc),
+                            K::Space => iswspace_l(c, *loc),
+                        }
+                    };
+                    r != 0
+                }
+            }
+        }
+
+        /// A character's upper or lower case, as PostgreSQL maps one in a regular expression:
+        /// ICU's u_toupper and u_tolower, glibc's towupper_l and towlower_l.
+        pub fn char_case(&self, c: u32, upper: bool) -> u32 {
+            match &self.inner {
+                // SAFETY: ICU's case functions take any code point.
+                Inner::Icu { .. } => unsafe {
+                    if upper {
+                        u_toupper(c as i32) as u32
+                    } else {
+                        u_tolower(c as i32) as u32
+                    }
+                },
+                // SAFETY: as in `is_class`.
+                Inner::Libc { loc } => unsafe {
+                    if upper {
+                        towupper_l(c, *loc)
+                    } else {
+                        towlower_l(c, *loc)
+                    }
+                },
+            }
         }
     }
 

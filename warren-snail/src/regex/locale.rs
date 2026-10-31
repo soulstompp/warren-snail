@@ -1,7 +1,8 @@
 //! The character classes and the case mapping a regular expression is compiled and run under, by
 //! its collation, as PostgreSQL 19's `regc_pg_locale.c` reads them: under C, POSIX and ucs_basic
 //! ASCII's classes alone, from PostgreSQL's own table; under glibc's C.UTF-8 the C library's;
-//! under pg_c_utf8 and pg_unicode_fast PostgreSQL's own Unicode tables.
+//! under pg_c_utf8 and pg_unicode_fast PostgreSQL's own Unicode tables; under a collation that
+//! calls its library, with the feature `collations`, ICU's or glibc's, as the library answers.
 
 use super::guts::{CharClass, Chr, MAX_SIMPLE_CHR};
 
@@ -17,6 +18,9 @@ pub enum Ctype {
     /// PostgreSQL's builtin provider: pg_c_utf8, or pg_unicode_fast where `full`, its digit, alnum
     /// and punct Unicode's rather than POSIX's.
     Builtin { full: bool },
+    /// A collation that calls its library, ICU or glibc, by the number `collations::get` finds it
+    /// by; never one whose LC_CTYPE is C, which reads as `C`.
+    Library(u16),
 }
 
 const PG_ISDIGIT: u8 = 0x01;
@@ -66,6 +70,11 @@ fn libc_locale() -> libc::locale_t {
     crate::strings::c_utf8().expect("the machine's C.UTF-8, found before a pattern was compiled")
 }
 
+/// The collator of a collation that calls its library.
+fn library(id: u16) -> &'static crate::collations::Collator {
+    crate::collations::get(id)
+}
+
 fn libc_probe(f: unsafe extern "C" fn(u32, libc::locale_t) -> libc::c_int, c: Chr) -> bool {
     // SAFETY: the locale lives as long as the program; any code point is a wint_t.
     unsafe { f(c, libc_locale()) != 0 }
@@ -83,7 +92,7 @@ impl Ctype {
         match self {
             Ctype::C => true,
             Ctype::Libc { .. } => crate::strings::c_utf8().is_ok(),
-            Ctype::Builtin { .. } => true,
+            Ctype::Builtin { .. } | Ctype::Library(_) => true,
         }
     }
 
@@ -95,6 +104,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISDIGIT),
             Ctype::Libc { .. } => libc_probe(iswdigit_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Digit, c),
             Ctype::Builtin { full } => crate::categories::isdigit(c, !full),
         }
     }
@@ -103,6 +113,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISALPHA),
             Ctype::Libc { .. } => libc_probe(iswalpha_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Alpha, c),
             Ctype::Builtin { .. } => crate::categories::isalpha(c),
         }
     }
@@ -111,6 +122,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISALNUM),
             Ctype::Libc { .. } => libc_probe(iswalnum_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Alnum, c),
             Ctype::Builtin { full } => crate::categories::isalnum(c, !full),
         }
     }
@@ -124,6 +136,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISUPPER),
             Ctype::Libc { .. } => libc_probe(iswupper_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Upper, c),
             Ctype::Builtin { .. } => crate::categories::isupper(c),
         }
     }
@@ -132,6 +145,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISLOWER),
             Ctype::Libc { .. } => libc_probe(iswlower_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Lower, c),
             Ctype::Builtin { .. } => crate::categories::islower(c),
         }
     }
@@ -140,6 +154,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISGRAPH),
             Ctype::Libc { .. } => libc_probe(iswgraph_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Graph, c),
             Ctype::Builtin { .. } => crate::categories::isgraph(c),
         }
     }
@@ -148,6 +163,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISPRINT),
             Ctype::Libc { .. } => libc_probe(iswprint_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Print, c),
             Ctype::Builtin { .. } => crate::categories::isprint(c),
         }
     }
@@ -156,6 +172,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISPUNCT),
             Ctype::Libc { .. } => libc_probe(iswpunct_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Punct, c),
             Ctype::Builtin { full } => crate::categories::ispunct(c, !full),
         }
     }
@@ -164,6 +181,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISSPACE),
             Ctype::Libc { .. } => libc_probe(iswspace_l, c),
+            Ctype::Library(id) => library(*id).is_class(crate::collations::CharClass::Space, c),
             Ctype::Builtin { .. } => crate::categories::isspace(c),
         }
     }
@@ -175,6 +193,7 @@ impl Ctype {
             // SAFETY: as in `libc_probe`.
             Ctype::Libc { .. } => unsafe { towupper_l(c, libc_locale()) },
             Ctype::Builtin { .. } => crate::strings::simple_case(c, true),
+            Ctype::Library(id) => library(*id).char_case(c, true),
         }
     }
 
@@ -185,6 +204,7 @@ impl Ctype {
             // SAFETY: as in `libc_probe`.
             Ctype::Libc { .. } => unsafe { towlower_l(c, libc_locale()) },
             Ctype::Builtin { .. } => crate::strings::simple_case(c, false),
+            Ctype::Library(id) => library(*id).char_case(c, false),
         }
     }
 

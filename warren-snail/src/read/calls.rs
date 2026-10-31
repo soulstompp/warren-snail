@@ -2379,7 +2379,8 @@ fn text_array_of(elements: Vec<Option<String>>) -> Value {
 }
 
 /// The classes and case a regular expression is compiled under, by the collation its text
-/// carries.
+/// carries: a library's own, or ASCII's where its LC_CTYPE is C; refused under a nondeterministic
+/// collation as PostgreSQL refuses it.
 pub(super) fn ctype_of(casing: crate::catalog::Casing) -> Result<crate::regex::Ctype> {
     use crate::catalog::Casing;
     use crate::regex::Ctype;
@@ -2388,6 +2389,19 @@ pub(super) fn ctype_of(casing: crate::catalog::Casing) -> Result<crate::regex::C
         Casing::Libc => Ctype::Libc { default: true },
         Casing::Simple => Ctype::Builtin { full: false },
         Casing::Full => Ctype::Builtin { full: true },
+        Casing::Library(id) => {
+            let c = crate::collations::get(id);
+            if !c.spec.deterministic {
+                return Err(Error::new(
+                    "nondeterministic collations are not supported for regular expressions",
+                ));
+            }
+            if c.ctype_is_c() {
+                Ctype::C
+            } else {
+                Ctype::Library(id)
+            }
+        }
     };
     if !ctype.available() {
         return Err(Error::new(

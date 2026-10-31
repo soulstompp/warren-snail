@@ -27,10 +27,16 @@ const ROWS: [(Option<&str>, Option<&str>); 9] = [
 ];
 
 fn snail(name: &str) -> Snail {
+    snail_after(name, "")
+}
+
+/// The table's snail, its DDL after `before`.
+fn snail_after(name: &str, before: &str) -> Snail {
     let path = tmp(&format!("{name}.snail"));
-    let catalog =
-        Catalog::parse("CREATE TABLE s.t (id integer NOT NULL, t text, p text, PRIMARY KEY (id));")
-            .unwrap();
+    let catalog = Catalog::parse(&format!(
+        "{before} CREATE TABLE s.t (id integer NOT NULL, t text, p text, PRIMARY KEY (id));"
+    ))
+    .unwrap();
     let columns = vec![
         Values::Int((1..=ROWS.len() as i64).map(Some).collect()),
         Values::Text(ROWS.iter().map(|r| r.0.map(str::to_string)).collect()),
@@ -333,4 +339,53 @@ fn back_references_lookaround_and_the_preference_are_postgresql_s() {
     ] {
         assert_eq!(one(&mut s, expr).unwrap().as_deref(), Some(want), "{expr}");
     }
+}
+
+#[cfg(feature = "collations")]
+#[test]
+fn the_classes_and_case_under_a_library_s_collation_are_its_library_s() {
+    let mut s = snail_after(
+        "regex_library",
+        "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); \
+         CREATE COLLATION s.cx (provider = libc, lc_collate = 'en_US.utf8', lc_ctype = 'C');",
+    );
+    for (expr, want) in [
+        // ICU's u_isupper holds of Lu alone; glibc's iswupper_l of a title case letter too.
+        ("'ǅ' COLLATE \"en-x-icu\" ~ '[[:upper:]]'", "false"),
+        ("'ǅ' COLLATE \"en_US\" ~ '[[:upper:]]'", "true"),
+        ("'é' COLLATE \"en_US\" ~ '^[[:upper:]]$'", "false"),
+        ("'٣' COLLATE \"en-x-icu\" ~ '^[[:digit:]]$'", "true"),
+        ("'٣' COLLATE \"en_US\" ~ '^[[:digit:]]$'", "false"),
+        ("'\u{2028}' COLLATE \"en-x-icu\" ~ '[[:space:]]'", "true"),
+        // An LC_CTYPE of C reads ASCII's classes and case.
+        ("'é' COLLATE s.cx ~ '[[:alpha:]]'", "false"),
+        ("'É' COLLATE s.cx ~* 'é'", "false"),
+        ("'É' COLLATE \"tr-x-icu\" ~* 'é'", "true"),
+        ("'É' COLLATE \"en_US\" ~* 'é'", "true"),
+        ("'ſ' COLLATE \"en-x-icu\" ~* 's'", "false"),
+        (
+            "regexp_like('Ab' COLLATE \"en-x-icu\", '[[:lower:]]+$')",
+            "true",
+        ),
+        (
+            "regexp_replace('ΣΑΣ' COLLATE \"el-x-icu\", 'σ', 'x', 'gi')",
+            "xΑx",
+        ),
+    ] {
+        assert_eq!(one(&mut s, expr).unwrap().as_deref(), Some(want), "{expr}");
+    }
+    for expr in [
+        "'a' COLLATE s.ci ~ 'a'",
+        "regexp_match('a' COLLATE s.ci, 'a')",
+    ] {
+        let e = one(&mut s, expr).unwrap_err().to_string();
+        assert!(
+            e.contains("nondeterministic collations are not supported for regular expressions"),
+            "{expr}: {e}"
+        );
+    }
+    assert_eq!(
+        one(&mut s, "(NULL::text) COLLATE s.ci ~ 'a'").unwrap(),
+        None
+    );
 }
