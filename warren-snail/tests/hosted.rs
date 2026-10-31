@@ -204,12 +204,15 @@ fn a_writer_with_no_host_to_ask_refuses_a_snail_written_through_a_host() {
     drop(w);
     said.committed(8);
     refused(&path);
-    // A sequence's advance marks it so too.
+    // A sequence's advance marks it so too, its transaction never committed: no root waits.
     let sequenced = tmp("hosted-unjudged-sequence.snail");
     write(&sequenced, &Catalog::parse(SEQUENCED).unwrap(), &[]).unwrap();
+    let g = Snail::open(&sequenced).unwrap().generation();
     let (mut w, _) = hosted(&sequenced, 9, &said);
+    w.execute("BEGIN").unwrap();
     w.execute("INSERT INTO shop.orders (v) VALUES (1)").unwrap();
     drop(w);
+    assert_eq!(Snail::open(&sequenced).unwrap().generation(), g + 1);
     let mut plain = Snail::open_writing(&sequenced).unwrap();
     let e = plain
         .execute("INSERT INTO shop.orders (id, v) VALUES (5, 1)")
