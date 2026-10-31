@@ -1007,6 +1007,7 @@ mod tests {
             hicolormap: vec![WHITE],
             hiarraycols: 1,
             pseudo: (0..NCOLORS).map(|c| (1..=4).contains(&c)).collect(),
+            cd: Vec::new(),
             ctype: Ctype::C,
         }
     }

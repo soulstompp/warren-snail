@@ -294,11 +294,12 @@ pub struct Side {
     pub nulls: Vec<(usize, bool)>,
     /// Some condition can hold for no value.
     pub empty: bool,
-    /// The conditions by an operator a GiST or SP-GiST strand answers.
+    /// The conditions by an operator a GiST or SP-GiST strand answers, and by a pattern.
     pub ops: Vec<OpCond>,
 }
 
-/// A condition on a range, a multirange or an inet column by an operator a GiST or SP-GiST strand
+/// A condition held a row at a time as a pipeline holds it: a pattern on a column of text, or a
+/// condition on a range, a multirange or an inet column by an operator a GiST or SP-GiST strand
 /// answers: a range's or a multirange's `&&`, `@>`, `<@`, `<<`, `>>`, `&<`, `&>` and `-|-`, an
 /// inet's `&&`, `<<`, `<<=`, `>>` and `>>=`, with a value. A row is held to it as a pipeline holds
 /// one; a block of a strand that keeps the column's span is ruled out where `probe` lies outside it.
@@ -314,6 +315,9 @@ pub struct OpCond {
     /// rules a block out by it.
     pub op: String,
     pub probe: Option<crate::spans::Probe>,
+    /// Whether a row on which it fails fails the round, as a pattern PostgreSQL refuses fails
+    /// its statement; else such a row is not kept.
+    pub raises: bool,
 }
 
 impl Side {
@@ -1801,8 +1805,11 @@ fn comparable(
 }
 
 /// What one conjunct says, as the conditions and comparisons PostgreSQL's analyser reads it as: a
-/// BETWEEN as its comparisons.
+/// BETWEEN as its comparisons; a pattern as itself, and the keys its fixed prefix narrows to.
 fn read_conjunct(from: &From, p: &Expr) -> Result<Vec<Conj>> {
+    if let Some(read) = pattern(from, p)? {
+        return Ok(read);
+    }
     match p {
         Expr::Between {
             expr,
@@ -1812,6 +1819,208 @@ fn read_conjunct(from: &From, p: &Expr) -> Result<Vec<Conj>> {
         } => between(from, p, expr, *negated, low, high),
         p => Ok(vec![conjunct(from, p)?]),
     }
+}
+
+/// How a pattern matches: LIKE, ILIKE, SIMILAR TO, or a regular expression, `~*` and `!~*`
+/// ignoring case.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Matched {
+    Like,
+    ILike,
+    Similar,
+    Regex { icase: bool },
+}
+
+/// The casing a column's text takes, as a pipeline's `Casings` gives it: its collation's, a name's
+/// ASCII's, else the database's default.
+fn column_casing(
+    column: &crate::catalog::Column,
+    declared: &[crate::catalog::Collation],
+) -> Result<crate::catalog::Casing> {
+    use crate::catalog::Casing;
+    Ok(match (&column.collation, column.ty) {
+        (Some(n), _) => crate::catalog::collation_casing(n, declared)?,
+        (None, ColumnType::Name) => Casing::Ascii,
+        _ => Casing::Libc,
+    })
+}
+
+/// A pattern on a column of a string type, or LIKE on a bytea, against a quoted pattern and
+/// escape: held a row at a time as a pipeline holds it, and, where it is no negation, the keys
+/// its fixed prefix narrows the read to (`prefix::narrowing`). A NULL pattern or escape keeps no
+/// row. A regular expression is compiled as it is read, as PostgreSQL's planner compiles it to
+/// read its prefix, so a pattern it refuses is refused over no rows too. None where it is no such
+/// pattern.
+fn pattern(from: &From, p: &Expr) -> Result<Option<Vec<Conj>>> {
+    let (x, pat, escape, negated, how) = match p {
+        Expr::Like {
+            negated,
+            any: false,
+            expr,
+            pattern,
+            escape_char,
+        } => (expr, pattern, escape_char, *negated, Matched::Like),
+        Expr::ILike {
+            negated,
+            any: false,
+            expr,
+            pattern,
+            escape_char,
+        } => (expr, pattern, escape_char, *negated, Matched::ILike),
+        Expr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => (expr, pattern, escape_char, *negated, Matched::Similar),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::PGRegexMatch
+            | BinaryOperator::PGRegexIMatch
+            | BinaryOperator::PGRegexNotMatch
+            | BinaryOperator::PGRegexNotIMatch => (
+                left,
+                right,
+                &None,
+                matches!(
+                    op,
+                    BinaryOperator::PGRegexNotMatch | BinaryOperator::PGRegexNotIMatch
+                ),
+                Matched::Regex {
+                    icase: matches!(
+                        op,
+                        BinaryOperator::PGRegexIMatch | BinaryOperator::PGRegexNotIMatch
+                    ),
+                },
+            ),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let Ok((side, Shape::Column(c))) = from.resolve(x) else {
+        return Ok(None);
+    };
+    let table = from.table(side);
+    let column = &table.columns[c];
+    if !(column.ty.is_string() || (column.ty == ColumnType::Bytes && how == Matched::Like)) {
+        return Ok(None);
+    }
+    let null = |e: &Expr| matches!(e, Expr::Value(v) if v.value == Value::Null);
+    if null(pat) || escape.as_deref().is_some_and(null) {
+        return Ok(Some(vec![Conj::One(side, Piece::Empty)]));
+    }
+    let (Ok(text), Ok(escape)) = (
+        text_literal(pat),
+        escape.as_deref().map(text_literal).transpose(),
+    ) else {
+        return Ok(None);
+    };
+    let ctype = || super::calls::ctype_of(column_casing(column, &from.catalog.collations)?);
+    let fixed = match how {
+        Matched::Regex { icase } => {
+            let fixed = super::prefix::regex_fixed_prefix(&text, icase, ctype()?)?;
+            if negated {
+                super::prefix::Fixed::None
+            } else {
+                fixed
+            }
+        }
+        Matched::Similar => {
+            let re = crate::regexp::similar_to_escape(&text, escape.as_deref())?;
+            let fixed = super::prefix::regex_fixed_prefix(&re, false, ctype()?)?;
+            if negated {
+                super::prefix::Fixed::None
+            } else {
+                fixed
+            }
+        }
+        _ if negated => super::prefix::Fixed::None,
+        Matched::Like if column.ty == ColumnType::Bytes => match escape {
+            None => super::prefix::like_fixed_prefix(&crate::strings::bytea_in(&text)?),
+            Some(_) => super::prefix::Fixed::None,
+        },
+        Matched::Like | Matched::ILike => {
+            let escape = match &escape {
+                None => Some('\\'),
+                Some(e) => crate::strings::like_escape(e)?,
+            };
+            if how == Matched::Like {
+                super::prefix::like_fixed_prefix_chars(&text, escape, |_| false)
+            } else {
+                match ctype() {
+                    // A character of more than one case is a wildcard of its cases.
+                    Ok(t) => super::prefix::like_fixed_prefix_chars(&text, escape, |ch| {
+                        let c = crate::regex::Chr::from(ch);
+                        t.isupper(c) || t.islower(c) || t.toupper(c) != c || t.tolower(c) != c
+                    }),
+                    Err(_) => super::prefix::Fixed::None,
+                }
+            }
+        }
+    };
+    let own = Box::new(Expr::Identifier(sqlparser::ast::Ident::with_quote(
+        '"',
+        column.name.clone(),
+    )));
+    let expr = match p.clone() {
+        Expr::Like {
+            negated,
+            any,
+            pattern,
+            escape_char,
+            ..
+        } => Expr::Like {
+            negated,
+            any,
+            expr: own,
+            pattern,
+            escape_char,
+        },
+        Expr::ILike {
+            negated,
+            any,
+            pattern,
+            escape_char,
+            ..
+        } => Expr::ILike {
+            negated,
+            any,
+            expr: own,
+            pattern,
+            escape_char,
+        },
+        Expr::SimilarTo {
+            negated,
+            pattern,
+            escape_char,
+            ..
+        } => Expr::SimilarTo {
+            negated,
+            expr: own,
+            pattern,
+            escape_char,
+        },
+        Expr::BinaryOp { op, right, .. } => Expr::BinaryOp {
+            left: own,
+            op,
+            right,
+        },
+        _ => unreachable!("a pattern is one of these"),
+    };
+    let mut read = vec![Conj::One(
+        side,
+        Piece::Op(OpCond {
+            column: c,
+            expr,
+            name: column.name.clone(),
+            op: String::new(),
+            probe: None,
+            raises: true,
+        }),
+    )];
+    if let Some(t) = super::prefix::narrowing(c, column, fixed)? {
+        read.push(Conj::One(side, Piece::Text(t)));
+    }
+    Ok(Some(read))
 }
 
 /// A BETWEEN's lower bound, and whether it is SYMMETRIC: `spelled` writes `BETWEEN SYMMETRIC x`
@@ -2355,6 +2564,7 @@ fn op_cond(
         name: column,
         op: seen.unwrap_or_default().to_string(),
         probe: seen.and(probe),
+        raises: false,
     }))
 }
 

@@ -5,7 +5,8 @@
 //! The compiler is `comp.rs` (regcomp.c) with what it includes: the lexer (`lex.rs`), the colors
 //! (`color.rs`), the NFA (`nfa.rs`), the character vectors (`cvec.rs`) and the classes and
 //! collating elements (`classes.rs`, regc_locale.c). The executor is `exec.rs` (regexec.c) with its
-//! lazy DFA (`dfa.rs`). The collation's classes and case are `locale.rs` (regc_pg_locale.c).
+//! lazy DFA (`dfa.rs`). The collation's classes and case are `locale.rs` (regc_pg_locale.c); the
+//! prefix every string a pattern matches begins with is `prefix.rs` (regprefix.c).
 
 mod classes;
 mod color;
@@ -17,9 +18,11 @@ pub(crate) mod guts;
 mod lex;
 mod locale;
 mod nfa;
+mod prefix;
 
 pub use guts::{Chr, RegError, RegMatch};
 pub use locale::Ctype;
+pub use prefix::Prefix;
 
 /// The flags a pattern is compiled under and a string searched under, and what the compiler notes
 /// of a pattern, as regex.h names them.
@@ -54,6 +57,11 @@ impl Regex {
     /// What the compiler noted of it (`REG_U*`).
     pub fn info(&self) -> i64 {
         self.guts.info
+    }
+
+    /// The prefix every string it matches begins with (`pg_regprefix`).
+    pub fn prefix(&self) -> Prefix {
+        prefix::regprefix(&self.guts)
     }
 
     /// The string searched from `search_start` (`pg_regexec`): the whole match and the first

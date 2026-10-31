@@ -455,3 +455,297 @@ fn each_spelling_of_substring_is_the_call_postgresql_s_grammar_makes_of_it() {
         );
     }
 }
+
+/// The rows of `s.p`: an id, a text key of 2,000 places, and a nullable text under the collation C,
+/// NULL on every 13th row, under an index DESC.
+const PREFIXED: i64 = 65_536;
+
+fn k_of(id: i64) -> String {
+    format!("p{:04}-{}", id % 2000, id % 5)
+}
+
+fn u_of(id: i64) -> Option<String> {
+    (id % 13 != 0).then(|| k_of(id * 7 + 3))
+}
+
+/// The table's snail: its key, an index on `k`, and on `u` DESC.
+fn prefixed(name: &str) -> std::path::PathBuf {
+    let path = tmp(&format!("{name}.snail"));
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.p (id integer NOT NULL, k text NOT NULL, u text COLLATE \"C\", \
+         PRIMARY KEY (id));
+         CREATE INDEX p_k ON s.p (k);
+         CREATE INDEX p_u ON s.p (u DESC);",
+    )
+    .unwrap();
+    let ids: Vec<i64> = (0..PREFIXED).collect();
+    let columns = vec![
+        Values::Int(ids.iter().map(|&i| Some(i)).collect()),
+        Values::Text(ids.iter().map(|&i| Some(k_of(i))).collect()),
+        Values::Text(ids.iter().map(|&i| u_of(i)).collect()),
+    ];
+    write(&path, &catalog, &[("s.p".into(), Rows { columns })]).unwrap();
+    path
+}
+
+/// The ids of `s.p` whose row passes `keep`.
+fn prefixed_kept(keep: impl Fn(i64) -> bool) -> Vec<i64> {
+    (0..PREFIXED).filter(|&i| keep(i)).collect()
+}
+
+#[test]
+fn a_range_on_a_text_level_narrows_the_walk_each_end_kept_or_left_out_as_written() {
+    let path = prefixed("qpath_text_range");
+    let k = |i: i64| k_of(i);
+    for (q, keep) in [
+        (
+            "SELECT id FROM s.p WHERE k >= 'p0100' AND k < 'p0102'",
+            Box::new(|i: i64| k(i).as_str() >= "p0100" && k(i).as_str() < "p0102")
+                as Box<dyn Fn(i64) -> bool>,
+        ),
+        (
+            "SELECT id FROM s.p WHERE k > 'p0100-4' AND k <= 'p0101-2'",
+            Box::new(|i: i64| k(i).as_str() > "p0100-4" && k(i).as_str() <= "p0101-2"),
+        ),
+        (
+            "SELECT id FROM s.p WHERE k < 'p0001-1'",
+            Box::new(|i: i64| k(i).as_str() < "p0001-1"),
+        ),
+        (
+            "SELECT id FROM s.p WHERE k >= 'p1999-3'",
+            Box::new(|i: i64| k(i).as_str() >= "p1999-3"),
+        ),
+    ] {
+        let (a, r) = asked(&path, q, Some("p_k"));
+        assert_eq!(a, prefixed_kept(&keep), "{q}");
+        // A few blocks of the order's, not all of them.
+        let (_, whole) = asked(&path, "SELECT id FROM s.p WHERE k IS NOT NULL", Some("p_k"));
+        assert!(r.blocks_read * 8 < whole.blocks_read, "{q}: {r:?}");
+        assert!(r.entries_none > 0, "{q}: {r:?}");
+        // Along the table's key the same rows.
+        assert_eq!(asked(&path, q, Some("p_pkey")).0, a, "{q}");
+    }
+    // Counted from the counts where a block lies inside the range: no column page read for it.
+    let (b, r) = fresh(&path)
+        .ask(
+            "SELECT count(*) FROM s.p WHERE k >= 'p0100' AND k < 'p0400'",
+            Some("p_k"),
+        )
+        .unwrap();
+    assert_eq!(
+        one(&b),
+        prefixed_kept(|i| k(i).as_str() >= "p0100" && k(i).as_str() < "p0400").len() as i64
+    );
+    assert!(r.entries_must > 0, "{r:?}");
+    // On an index DESC whose NULLs come first: none of them is in a range, open or not.
+    for (q, keep) in [
+        (
+            "SELECT id FROM s.p WHERE u < 'p0300'",
+            Box::new(|i: i64| u_of(i).is_some_and(|u| u.as_str() < "p0300"))
+                as Box<dyn Fn(i64) -> bool>,
+        ),
+        (
+            "SELECT id FROM s.p WHERE u > 'p1700'",
+            Box::new(|i: i64| u_of(i).is_some_and(|u| u.as_str() > "p1700")),
+        ),
+        (
+            "SELECT id FROM s.p WHERE u BETWEEN 'p0500' AND 'p0501'",
+            Box::new(|i: i64| {
+                u_of(i).is_some_and(|u| ("p0500".."p0501").contains(&u.as_str()) || u == "p0501")
+            }),
+        ),
+    ] {
+        let (a, r) = asked(&path, q, Some("p_u"));
+        assert_eq!(a, prefixed_kept(&keep), "{q}");
+        let (_, whole) = asked(&path, "SELECT id FROM s.p WHERE u IS NOT NULL", Some("p_u"));
+        assert!(r.blocks_read < whole.blocks_read, "{q}: {r:?}");
+    }
+}
+
+#[test]
+fn a_pattern_s_fixed_prefix_narrows_the_read_along_an_order_on_its_column_and_changes_no_answer() {
+    let path = prefixed("qpath_prefix");
+    let k = |i: i64| k_of(i);
+    // ILIKE's prefix stops at its first letter, which has two cases: no prefix, the order read
+    // whole, the same rows.
+    let (unnarrowed, whole) = asked(
+        &path,
+        "SELECT id FROM s.p WHERE k ILIKE 'p012%'",
+        Some("p_k"),
+    );
+    assert_eq!(unnarrowed, prefixed_kept(|i| k(i).starts_with("p012")));
+    assert_eq!(whole.entries_none, 0, "{whole:?}");
+    let range = asked(
+        &path,
+        "SELECT id FROM s.p WHERE k >= 'p012' AND k < 'p013'",
+        Some("p_k"),
+    );
+    for q in [
+        "SELECT id FROM s.p WHERE k LIKE 'p012%'",
+        "SELECT id FROM s.p WHERE k LIKE 'p012_-%'",
+        "SELECT id FROM s.p WHERE k LIKE 'p012%' ESCAPE '#'",
+        "SELECT id FROM s.p WHERE k ~ '^p012'",
+        "SELECT id FROM s.p WHERE k ~ '^p012.*'",
+        "SELECT id FROM s.p WHERE k ~ '^p012[0-9]'",
+        "SELECT id FROM s.p WHERE k SIMILAR TO 'p012%'",
+        "SELECT id FROM s.p WHERE k SIMILAR TO 'p012#%%' ESCAPE '#' OR k SIMILAR TO 'p012%'",
+    ] {
+        // A disjunction is the pipeline's, which reads the table whole.
+        let order = if q.contains(" OR ") {
+            None
+        } else {
+            Some("p_k")
+        };
+        let (a, r) = asked(&path, q, order);
+        assert_eq!(a, unnarrowed, "{q}");
+        if order.is_some() {
+            // The blocks the written range reads, and far fewer column pages than the whole.
+            assert_eq!(
+                (r.blocks_read, r.directory_pages),
+                (range.1.blocks_read, range.1.directory_pages),
+                "{q}: {r:?}"
+            );
+            assert!(
+                r.column_pages_read * 8 < whole.column_pages_read,
+                "{q}: {r:?}"
+            );
+        }
+    }
+    // A pattern of one string narrows to its one key.
+    for q in [
+        "SELECT id FROM s.p WHERE k LIKE 'p0123-3'",
+        "SELECT id FROM s.p WHERE k ~ '^p0123-3$'",
+        "SELECT id FROM s.p WHERE k SIMILAR TO 'p0123-3'",
+        "SELECT id FROM s.p WHERE k ILIKE '0123-3'",
+    ] {
+        let (a, r) = asked(&path, q, Some("p_k"));
+        let want = if q.contains("ILIKE") {
+            Vec::new()
+        } else {
+            prefixed_kept(|i| k(i) == "p0123-3")
+        };
+        assert_eq!(a, want, "{q}");
+        assert!(r.blocks_read <= 1, "{q}: {r:?}");
+    }
+    // The pattern is held on every row the range keeps: what the prefix keeps beside it is not
+    // in the answer.
+    let (a, _) = asked(
+        &path,
+        "SELECT id FROM s.p WHERE k LIKE 'p012%-3'",
+        Some("p_k"),
+    );
+    assert_eq!(
+        a,
+        prefixed_kept(|i| k(i).starts_with("p012") && k(i).ends_with("-3"))
+    );
+    let (a, _) = asked(
+        &path,
+        "SELECT id FROM s.p WHERE k ~ '^p01(2|3)4'",
+        Some("p_k"),
+    );
+    assert_eq!(
+        a,
+        prefixed_kept(|i| k(i).starts_with("p0124") || k(i).starts_with("p0134"))
+    );
+    // A negation narrows nothing; NULL keeps no row.
+    let (a, r) = asked(
+        &path,
+        "SELECT id FROM s.p WHERE k NOT LIKE 'p012%'",
+        Some("p_k"),
+    );
+    assert_eq!(a, prefixed_kept(|i| !k(i).starts_with("p012")));
+    assert_eq!(r.entries_none, 0, "{r:?}");
+    let (a, _) = asked(&path, "SELECT id FROM s.p WHERE k !~ '^p'", Some("p_k"));
+    assert!(a.is_empty());
+    let (a, r) = asked(&path, "SELECT id FROM s.p WHERE k LIKE NULL", None);
+    assert!(a.is_empty());
+    assert_eq!(r.column_pages_read, 0);
+    // A pattern on a nullable text under C, along its index DESC: no NULL among the rows.
+    let (a, r) = asked(&path, "SELECT id FROM s.p WHERE u LIKE 'p03%'", Some("p_u"));
+    assert_eq!(
+        a,
+        prefixed_kept(|i| u_of(i).is_some_and(|u| u.starts_with("p03")))
+    );
+    let (_, whole) = asked(&path, "SELECT id FROM s.p WHERE u IS NOT NULL", Some("p_u"));
+    assert!(r.blocks_read * 4 < whole.blocks_read, "{r:?}");
+    // Counted.
+    let (b, _) = fresh(&path)
+        .ask("SELECT count(*) FROM s.p WHERE k LIKE 'p01%'", None)
+        .unwrap();
+    assert_eq!(
+        one(&b),
+        prefixed_kept(|i| k(i).starts_with("p01")).len() as i64
+    );
+    // A regular expression PostgreSQL's planner refuses as it reads its prefix is refused over
+    // no rows too, in its words.
+    let e = fresh(&path)
+        .ask("SELECT id FROM s.p WHERE id < 0 AND k ~ '('", None)
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("invalid regular expression: parentheses () not balanced"),
+        "{e}"
+    );
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_bpchar_s_name_s_and_a_bytea_s_prefix_narrow_as_their_keys_are_held() {
+    let rows: Vec<String> = (0..20_000)
+        .map(|i| {
+            format!(
+                "({i}, 'q{:03}{}', 'q{:03}-{}', '\\x71{:06x}')",
+                i % 500,
+                if i % 3 == 0 { "" } else { " x" },
+                i % 500,
+                i % 4,
+                i % 4096
+            )
+        })
+        .collect();
+    let insert = format!("INSERT INTO s.v VALUES {}", rows.join(", "));
+    let mut s = snail_of(
+        "qpath_prefix_kinds",
+        "CREATE TABLE s.v (id integer NOT NULL, c char(6), nm name, b bytea, PRIMARY KEY (id));
+         CREATE INDEX v_c ON s.v (c);
+         CREATE INDEX v_nm ON s.v (nm);
+         CREATE INDEX v_b ON s.v (b);",
+        &[&insert],
+    );
+    let mut ask = |q: &str, order: &str| {
+        let (b, r) = s.ask(q, Some(order)).unwrap();
+        exact(q, &r);
+        (ids(&b), r)
+    };
+    // A bpchar's padded text matches `^q012 ` where its value is 'q012', held without its blanks.
+    let (a, r) = ask("SELECT id FROM s.v WHERE c ~ '^q012 '", "v_c");
+    assert_eq!(
+        a,
+        (0..20_000).filter(|i| i % 500 == 12).collect::<Vec<i64>>()
+    );
+    let (_, whole) = ask("SELECT id FROM s.v WHERE c IS NOT NULL", "v_c");
+    assert!(r.blocks_read < whole.blocks_read, "{r:?}");
+    let (a, _) = ask("SELECT id FROM s.v WHERE c LIKE 'q01%'", "v_c");
+    assert_eq!(
+        a,
+        (0..20_000)
+            .filter(|i| (10..20).contains(&(i % 500)))
+            .collect::<Vec<i64>>()
+    );
+    // A name, under C.
+    let (a, r) = ask("SELECT id FROM s.v WHERE nm LIKE 'q012-%'", "v_nm");
+    assert_eq!(
+        a,
+        (0..20_000).filter(|i| i % 500 == 12).collect::<Vec<i64>>()
+    );
+    let (_, whole) = ask("SELECT id FROM s.v WHERE nm IS NOT NULL", "v_nm");
+    assert!(r.blocks_read < whole.blocks_read, "{r:?}");
+    // A bytea's pattern is bytea: its bytes are the prefix.
+    let (a, r) = ask("SELECT id FROM s.v WHERE b LIKE 'q\\000\\000%'", "v_b");
+    assert_eq!(
+        a,
+        (0..20_000).filter(|i| i % 4096 < 256).collect::<Vec<i64>>()
+    );
+    let (_, whole) = ask("SELECT id FROM s.v WHERE b IS NOT NULL", "v_b");
+    assert!(r.blocks_read < whole.blocks_read, "{r:?}");
+}

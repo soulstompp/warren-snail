@@ -248,6 +248,15 @@ pub struct ColorMapRange {
     pub rownum: usize,
 }
 
+/// What the compiler knew of a color's characters (`struct colordesc`): how many of those up to
+/// `MAX_SIMPLE_CHR` it holds, its entries in the high map, and the first character it was given.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColorChrs {
+    pub nschrs: i32,
+    pub nuchrs: i32,
+    pub firstchr: Chr,
+}
+
 /// The map from a character to its color, as the executor reads it (the run-time part of `struct
 /// colormap`).
 #[derive(Clone, Debug)]
@@ -264,6 +273,8 @@ pub struct ColorMap {
     pub hiarraycols: usize,
     /// Which colors are pseudocolors, by color.
     pub pseudo: Vec<bool>,
+    /// What the compiler knew of each color's characters, by color, as `pg_regprefix` reads it.
+    pub cd: Vec<ColorChrs>,
     /// The character classes the colors were made under.
     pub ctype: Ctype,
 }

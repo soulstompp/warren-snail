@@ -204,7 +204,7 @@ fn a_question_priced_names_the_columns_it_holds_no_key_for() {
         ),
         ["feed"]
     );
-    // An equality on a text level keys it; a range on it does not.
+    // An equality on a text level keys it, and a range on it; `<>` does not.
     let (network, station) = stations_of(&s)[0];
     let station_name = name(network, station);
     assert!(keyless(
@@ -212,9 +212,14 @@ fn a_question_priced_names_the_columns_it_holds_no_key_for() {
         Some("s_name")
     )
     .is_empty());
+    assert!(keyless(
+        "SELECT s.station_no FROM weather.stations s WHERE s.name >= 'F' AND s.name < 'G'",
+        Some("s_name")
+    )
+    .is_empty());
     assert_eq!(
         keyless(
-            "SELECT s.station_no FROM weather.stations s WHERE s.name >= 'F' AND s.name < 'G'",
+            "SELECT s.station_no FROM weather.stations s WHERE s.name <> 'Faro'",
             Some("s_name")
         ),
         ["name"]

@@ -112,6 +112,13 @@ impl Cmap {
             pseudo: (0..=self.max)
                 .map(|co| (self.cd[co].flags & PSEUDO) != 0)
                 .collect(),
+            cd: (0..=self.max)
+                .map(|co| ColorChrs {
+                    nschrs: self.cd[co].nschrs,
+                    nuchrs: self.cd[co].nuchrs,
+                    firstchr: self.cd[co].firstchr,
+                })
+                .collect(),
             ctype,
         }
     }

@@ -143,6 +143,8 @@ pub struct Walk {
     m: usize,
     lo: Vec<KeyValue>,
     hi: Vec<KeyValue>,
+    /// Whether the last level fixed leaves out its bound's own key, at its low end and at its high.
+    ends_open: (bool, bool),
     rest: Vec<Cond>,
     /// The conditions on text no level fixes, by their place among the side's.
     pub(super) texts: Vec<usize>,
@@ -176,6 +178,43 @@ pub struct Walk {
 impl Walk {
     pub fn is_open(&self) -> bool {
         !self.open.is_empty()
+    }
+
+    /// Whether a key ordered so against the low end of the run the leading levels fix lies before it.
+    fn short_of(&self, o: Ordering) -> bool {
+        o == Ordering::Less || (o == Ordering::Equal && self.ends_open.0)
+    }
+
+    /// Whether a key ordered so against the run's high end lies past it.
+    fn over(&self, o: Ordering) -> bool {
+        o == Ordering::Greater || (o == Ordering::Equal && self.ends_open.1)
+    }
+
+    /// Whether keys of the leading levels lie before the run they fix.
+    fn before(&self, k: &[KeyValue]) -> bool {
+        self.short_of(k.cmp(self.lo.as_slice()))
+    }
+
+    /// Whether keys of the leading levels lie past the run they fix.
+    fn past(&self, k: &[KeyValue]) -> bool {
+        self.over(k.cmp(self.hi.as_slice()))
+    }
+
+    /// `before` and `past`, holding the run's ends alone.
+    fn bounds(&self) -> (impl Fn(&[KeyValue]) -> bool, impl Fn(&[KeyValue]) -> bool) {
+        let (lo, hi, (lo_open, hi_open)) = (self.lo.clone(), self.hi.clone(), self.ends_open);
+        (
+            move |k: &[KeyValue]| match k.cmp(lo.as_slice()) {
+                Ordering::Less => true,
+                Ordering::Equal => lo_open,
+                Ordering::Greater => false,
+            },
+            move |k: &[KeyValue]| match k.cmp(hi.as_slice()) {
+                Ordering::Greater => true,
+                Ordering::Equal => hi_open,
+                Ordering::Less => false,
+            },
+        )
     }
 
     /// The directory pages the round reads next, under the entries left open: a directory page each
@@ -301,6 +340,7 @@ impl Snail {
         let mut used_texts = vec![false; texts.len()];
         let mut used_nulls = vec![false; nulls.len()];
         let (mut lo, mut hi) = (Vec::new(), Vec::new());
+        let mut ends_open = (false, false);
         // For each level fixed, the test for NULL that fixed it, if one did.
         let mut by_null: Vec<Option<usize>> = Vec::new();
         for (li, l) in order.levels.iter().enumerate() {
@@ -313,27 +353,46 @@ impl Snail {
                 continue;
             }
             by_null.push(None);
-            // A level of a string type, bytea or a bit string is fixed by an equality on it; a range
-            // on one stays a condition to read.
+            // A level of a string type, bytea or a bit string is fixed by an equality on it, or by a
+            // range, each end its bound's key; an end left open by the NULLs on its side, which no
+            // value is.
             if let Level::Column(c) = *l {
                 let ty = want.table.columns[c].ty;
                 if ty.keyed_by_text() || ty.keyed_by_bytes() {
+                    let column = &want.table.columns[c];
                     let fixed = texts.iter().position(|t| {
-                        t.column == c && matches!((&t.lo, &t.hi), (Bound::Included(a), Bound::Included(b)) if a == b)
+                        t.column == c && t.gaps.is_empty() && matches!((&t.lo, &t.hi), (Bound::Included(a), Bound::Included(b)) if a == b)
                     });
-                    match fixed {
-                        Some(i) => {
-                            used_texts[i] = true;
-                            let Bound::Included(v) = &texts[i].lo else {
-                                unreachable!()
-                            };
-                            let column = &want.table.columns[c];
-                            lo.push(crate::places::column_byte_key(column, v));
-                            hi.push(crate::places::column_byte_key(column, v));
-                            continue;
-                        }
-                        None => break,
+                    if let Some(i) = fixed {
+                        used_texts[i] = true;
+                        let Bound::Included(v) = &texts[i].lo else {
+                            unreachable!()
+                        };
+                        lo.push(crate::places::column_byte_key(column, v));
+                        hi.push(crate::places::column_byte_key(column, v));
+                        continue;
                     }
+                    let ranged = texts.iter().position(|t| {
+                        t.column == c
+                            && t.is_range()
+                            && !matches!((&t.lo, &t.hi), (Bound::Unbounded, Bound::Unbounded))
+                    });
+                    if let Some(i) = ranged {
+                        used_texts[i] = true;
+                        let end = |b: &Bound<Vec<u8>>, first: bool| match b {
+                            Bound::Included(v) => {
+                                (crate::places::column_byte_key(column, v), false)
+                            }
+                            Bound::Excluded(v) => (crate::places::column_byte_key(column, v), true),
+                            Bound::Unbounded => (KeyValue::Null { first }, true),
+                        };
+                        let (l, lo_open) = end(&texts[i].lo, true);
+                        let (h, hi_open) = end(&texts[i].hi, false);
+                        lo.push(l);
+                        hi.push(h);
+                        ends_open = (lo_open, hi_open);
+                    }
+                    break;
                 }
             }
             let wanted = match *l {
@@ -400,6 +459,7 @@ impl Snail {
             m,
             lo,
             hi,
+            ends_open,
             rest,
             texts,
             nulls,
@@ -453,7 +513,8 @@ impl Snail {
         // The pages that hold the page maps last read: blocks side by side share them.
         let mut held: Option<(u64, Vec<u8>)> = None;
         for o in std::mem::take(&mut walk.open) {
-            let (m, lo, hi, j) = (walk.m, &walk.lo, &walk.hi, walk.keyed);
+            let (m, j) = (walk.m, walk.keyed);
+            let (before, past) = walk.bounds();
             let b = &o.entry;
             let (run, at) = b.map_run();
             let pages = run.pages();
@@ -482,8 +543,7 @@ impl Snail {
                 let fits = |p: usize| {
                     pages[p].first_row < map.sorted
                         && (!o.interval_may
-                            || (pages[p].first[..m] <= *hi.as_slice()
-                                && next(p)[..m] >= *lo.as_slice()))
+                            || (!past(&pages[p].first[..m]) && !before(&next(p)[..m])))
                         && (j == 0
                             || want
                                 .keys
@@ -589,6 +649,8 @@ impl Snail {
         let mut sent: Vec<Dict> = vec![None; columns.len()];
         let lead = sink.lead();
         let leaves = order.leaves(table);
+        // The casings a condition by a pattern is held under.
+        let casings = super::pipeline::Casings::of_table(table, &self.catalog.collations);
         // Each column's collator the round reads, where a library orders its text.
         let mut orderers: Vec<Coll> = vec![None; table.columns.len()];
         for c in columns
@@ -880,8 +942,8 @@ impl Snail {
                             continue;
                         }
                         if br.interval_may
-                            && (against(r, &walk.lo) == Ordering::Less
-                                || against(r, &walk.hi) == Ordering::Greater)
+                            && (walk.short_of(against(r, &walk.lo))
+                                || walk.over(against(r, &walk.hi)))
                         {
                             continue;
                         }
@@ -903,22 +965,27 @@ impl Snail {
                             }) && nulls
                                 .iter()
                                 .all(|&(null, start, v)| v.is_null(r - start) == null);
-                        // A condition by an operator, held as a pipeline holds it.
-                        let keep = keep
-                            && ops.iter().all(|&(o, ty, start, v)| {
-                                let d = crate::values::datum_of(v, r - start, ty);
-                                matches!(
-                                    super::pipeline::eval_on(
-                                        &o.expr,
-                                        std::slice::from_ref(&o.name),
-                                        &[super::fill::value_of(&d, ty)],
-                                        table.release,
-                                        &Default::default(),
-                                    ),
-                                    Ok(super::pipeline::Value::Bool(true))
-                                )
-                            });
                         if !keep {
+                            continue;
+                        }
+                        // A condition by an operator or a pattern, held as a pipeline holds it.
+                        let mut kept = true;
+                        for &(o, ty, start, v) in &ops {
+                            let d = crate::values::datum_of(v, r - start, ty);
+                            let held = super::pipeline::eval_on(
+                                &o.expr,
+                                std::slice::from_ref(&o.name),
+                                &[super::fill::value_of(&d, ty)],
+                                table.release,
+                                &casings,
+                            );
+                            let held = if o.raises { Some(held?) } else { held.ok() };
+                            if !matches!(held, Some(super::pipeline::Value::Bool(true))) {
+                                kept = false;
+                                break;
+                            }
+                        }
+                        if !kept {
                             continue;
                         }
                         let make = |o: usize| {
@@ -1105,9 +1172,9 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         Status::Must
     } else {
         let (pf, pl) = (&e.first[..m], &e.last[..m]);
-        if pl < walk.lo.as_slice() || pf > walk.hi.as_slice() {
+        if walk.before(pl) || walk.past(pf) {
             Status::None
-        } else if walk.lo.as_slice() <= pf && pl <= walk.hi.as_slice() {
+        } else if !walk.before(pf) && !walk.past(pl) {
             Status::Must
         } else {
             Status::May

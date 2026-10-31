@@ -9,7 +9,7 @@ use crate::regex::guts::{
     REG_ADVANCED, REG_EXPANDED, REG_EXTENDED, REG_ICASE, REG_NEWLINE, REG_NLANCH, REG_NLSTOP,
     REG_NOSUB, REG_QUOTE,
 };
-use crate::regex::{Chr, Ctype, RegMatch, Regex};
+use crate::regex::{Chr, Ctype, Prefix, RegMatch, Regex};
 use crate::{Error, Result};
 
 /// The options a `regexp_` function's flags argument gives (`pg_re_flags`).
@@ -226,6 +226,20 @@ pub fn like_regex(
 pub fn textregexeq(s: &str, p: &str, icase: bool, ctype: Ctype) -> Result<bool> {
     let cflags = REG_ADVANCED | if icase { REG_ICASE } else { 0 };
     Ok(re_compile_and_execute(p, s, cflags, ctype, 0)?.is_some())
+}
+
+/// `regexp_fixed_prefix`: the prefix every string the pattern matches begins with, the pattern
+/// compiled as `~` and `~*` compile it, and whether it matches that string alone; None where no
+/// prefix is common to them.
+pub fn regexp_fixed_prefix(p: &str, icase: bool, ctype: Ctype) -> Result<Option<(String, bool)>> {
+    let cflags = REG_ADVANCED | REG_NOSUB | if icase { REG_ICASE } else { 0 };
+    let re = re_compile_and_cache(p, cflags, ctype)?;
+    let text = |s: Vec<Chr>| s.into_iter().filter_map(char::from_u32).collect::<String>();
+    Ok(match re.prefix() {
+        Prefix::Partial(s) => Some((text(s), false)),
+        Prefix::Exact(s) => Some((text(s), true)),
+        _ => None,
+    })
 }
 
 /// `substring(s from p)` (`textregexsubstr`): what the first capture matched where the pattern

@@ -21,6 +21,7 @@ mod out;
 pub(crate) mod partial;
 mod pipeline;
 mod point;
+mod prefix;
 mod question;
 mod ranges;
 mod rest;
@@ -402,8 +403,9 @@ pub struct Price {
     /// the two: each page's rows taken as lying evenly across its keys, and an entry's across its least
     /// to greatest.
     pub rows_estimate: u64,
-    /// The columns whose conditions the order read holds no key for: text off its levels, or a range on
-    /// text. The estimate takes the blocks they open whole.
+    /// The columns whose conditions the order read holds no key for: text off its levels, or one on a
+    /// text level that keeps more than a run, as `<>` does. The estimate takes the blocks they open
+    /// whole.
     pub keyless: Vec<String>,
     /// The directory pages the pricing read, page maps among them, and the column pages a round
     /// along the order reads, exactly.
