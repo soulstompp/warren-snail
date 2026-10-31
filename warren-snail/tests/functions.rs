@@ -975,13 +975,16 @@ fn a_substring_search_under_a_nondeterministic_collation_is_refused() {
             "{e}"
         );
     }
-    // Under a deterministic collation the search reads, PostgreSQL 19's answer.
-    assert_eq!(
-        ask(&mut snail, "strpos(v COLLATE \"C\", 'B')")
-            .unwrap()
-            .as_deref(),
-        Some("3")
-    );
+    // Under a deterministic collation the search reads, the one either argument names: PostgreSQL
+    // 19's answers.
+    for e in [
+        "strpos(v COLLATE \"C\", 'B')",
+        "strpos(v, 'B' COLLATE \"C\")",
+        "position(('B' COLLATE \"C\") IN v)",
+        "position('B' IN (v COLLATE \"C\"))",
+    ] {
+        assert_eq!(ask(&mut snail, e).unwrap().as_deref(), Some("3"), "{e}");
+    }
 }
 
 #[test]
@@ -1039,10 +1042,14 @@ fn the_aggregates_and_windows_compare_strings_under_their_collation() {
             .map(|r| r[1].clone())
             .collect();
     assert_eq!(counts, ["2", "2", "2", "2", "2", "2", "1"].map(s));
-    let ranks: Vec<Option<String>> =
-        rows("SELECT id, (rank() OVER (PARTITION BY v ORDER BY id))::text AS c FROM t ORDER BY id")
-            .into_iter()
-            .map(|r| r[1].clone())
-            .collect();
-    assert_eq!(ranks, ["1", "2", "1", "2", "1", "2", "1"].map(s));
+    // A partition read whole, and one read along the order a row at a time.
+    for f in ["rank()", "row_number()"] {
+        let ranks: Vec<Option<String>> = rows(&format!(
+            "SELECT id, ({f} OVER (PARTITION BY v ORDER BY id))::text AS c FROM t ORDER BY id"
+        ))
+        .into_iter()
+        .map(|r| r[1].clone())
+        .collect();
+        assert_eq!(ranks, ["1", "2", "1", "2", "1", "2", "1"].map(s), "{f}");
+    }
 }

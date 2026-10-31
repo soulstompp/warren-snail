@@ -420,13 +420,13 @@ fn aggregate(name: &str, args: &[Option<ColumnType>], star: bool) -> Result<Opti
             | ColumnType::Cid
             | ColumnType::Bit(_)
             | ColumnType::Varbit(_) => return refused(),
+            // An array or a row of a type with no order is refused only where two are compared.
             ColumnType::Composed(r)
-                if !ty.ordered()
-                    || matches!(
-                        r.def(),
-                        crate::composed::Composed::Range { .. }
-                            | crate::composed::Composed::Multirange { .. }
-                    ) =>
+                if matches!(
+                    r.def(),
+                    crate::composed::Composed::Range { .. }
+                        | crate::composed::Composed::Multirange { .. }
+                ) =>
             {
                 return refused()
             }
