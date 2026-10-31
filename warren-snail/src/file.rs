@@ -924,6 +924,24 @@ impl Files {
     }
 }
 
+/// A snail's file by what it is, whatever path names it: its device and inode.
+pub type Identity = (u64, u64);
+
+/// The file `file` is, by its device and inode.
+pub fn identity(file: &File) -> std::io::Result<Identity> {
+    file.metadata().map(|m| identity_of(&m))
+}
+
+/// The file at `path`, by its device and inode.
+pub fn identity_at(path: &Path) -> std::io::Result<Identity> {
+    std::fs::metadata(path).map(|m| identity_of(&m))
+}
+
+fn identity_of(m: &std::fs::Metadata) -> Identity {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
 /// The path of a snail's `n`th file, the first being the path itself.
 pub(crate) fn path_of(path: &Path, n: u64) -> PathBuf {
     let mut p = path.to_path_buf().into_os_string();
@@ -1981,6 +1999,25 @@ mod tests {
         both.extend_from_slice(&b);
         let c = copies(&both, judge).unwrap();
         (c.root.generation, c.waiting)
+    }
+
+    #[test]
+    fn a_file_is_one_identity_whatever_path_names_it() {
+        let dir = std::env::temp_dir().join(format!("snail-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (one, link, other) = (dir.join("one"), dir.join("link"), dir.join("other"));
+        for p in [&one, &link, &other] {
+            let _ = std::fs::remove_file(p);
+        }
+        std::fs::write(&one, b"a").unwrap();
+        std::fs::write(&other, b"b").unwrap();
+        std::fs::hard_link(&one, &link).unwrap();
+        let id = identity_at(&one).unwrap();
+        assert_eq!(identity_at(&link).unwrap(), id);
+        assert_eq!(identity(&File::open(&link).unwrap()).unwrap(), id);
+        assert_ne!(identity_at(&other).unwrap(), id);
+        assert!(identity_at(&dir.join("none")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

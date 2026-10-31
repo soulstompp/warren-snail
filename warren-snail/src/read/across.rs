@@ -37,19 +37,16 @@ pub enum StopAcross {
 /// this writer's own as another's; and the file's device and inode.
 pub(crate) struct Seen {
     file: std::fs::File,
-    at: (u64, u64),
+    at: crate::file::Identity,
 }
 
 impl Seen {
     fn open(path: &Path) -> Result<Seen> {
-        use std::os::unix::fs::MetadataExt;
         let file = std::fs::File::open(path)
             .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        let m = file
-            .metadata()
-            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         Ok(Seen {
-            at: (m.dev(), m.ino()),
+            at: crate::file::identity(&file)
+                .map_err(|e| Error::new(format!("{}: {e}", path.display())))?,
             file,
         })
     }
@@ -636,16 +633,14 @@ impl Snails {
     /// The order snails' root turns are taken in, the same for every writer: by their first
     /// files' places on the machine.
     fn turn_order(&self, of: &[usize]) -> Result<Vec<usize>> {
-        use std::os::unix::fs::MetadataExt;
         let mut keyed = Vec::with_capacity(of.len());
         for &i in of {
-            let m = self.snails[i]
+            let file = self.snails[i]
                 .writer
                 .as_ref()
                 .expect("a snail open to write")
-                .file()
-                .metadata()?;
-            keyed.push(((m.dev(), m.ino()), i));
+                .file();
+            keyed.push((crate::file::identity(file)?, i));
         }
         keyed.sort();
         Ok(keyed.into_iter().map(|(_, i)| i).collect())
