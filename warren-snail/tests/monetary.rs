@@ -374,6 +374,107 @@ mod under_a_locale {
     }
 
     #[test]
+    fn a_round_trip_through_out_and_write_keeps_the_release_and_the_lc_monetary() {
+        use warren_snail::read::{MONETARY_KEY, RELEASE_KEY};
+        use warren_snail::write::write_parquet;
+        let catalog = Catalog::parse(
+            "CREATE TABLE s.r (id integer NOT NULL, c regclass, v money, PRIMARY KEY (id)); \
+             CREATE INDEX r_v ON s.r (v, id) INCLUDE (c);",
+        )
+        .unwrap();
+        let oid = |o: u64| Some(warren_snail::scalars::unsigned_key(o, 32));
+        let rows = Rows {
+            columns: vec![
+                Values::Int((1..=COUNTS.len() as i64).map(Some).collect()),
+                Values::Int(vec![oid(1259), oid(1247), None, oid(2615), oid(1259)]),
+                Values::Int(COUNTS.to_vec()),
+            ],
+        };
+        let path = tmp("money-gb-18.snail");
+        write_carried(
+            &path,
+            &catalog,
+            &[("s.r".into(), rows)],
+            &[],
+            span(),
+            18,
+            &carried(&[("s.r", "v", "en_GB.utf8")]),
+        )
+        .unwrap();
+        let dir = tmp("money-gb-18-parquet");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = Snail::open(&path).unwrap().out(&dir).unwrap()[0]
+            .file
+            .clone();
+        let given = [("s.r".to_string(), file)];
+        let asked = |p: &PathBuf| {
+            let mut s = Snail::open(p).unwrap();
+            let (b, _) = s
+                .ask(
+                    "SELECT r.id, r.c, r.v FROM s.r r ORDER BY r.id",
+                    Some("r_v"),
+                )
+                .unwrap();
+            (
+                s.release(),
+                s.monetary().to_vec(),
+                shown(&b, 1),
+                shown(&b, 2),
+            )
+        };
+        // No flag: the release and the lc_monetary its file names.
+        let back = tmp("money-gb-18-back.snail");
+        write_parquet(&back, &catalog, &given, span(), None, None).unwrap();
+        let was = asked(&path);
+        assert_eq!(was.0, 18);
+        assert_eq!(
+            was.1,
+            [("s.r".to_string(), "v".to_string(), "en_GB.utf8".to_string())]
+        );
+        assert_eq!(was.3[1], Some("-£1.50".to_string()));
+        assert_eq!(asked(&back), was);
+        let blocks = |p: &PathBuf| {
+            Snail::open(p)
+                .unwrap()
+                .blocks()
+                .unwrap()
+                .iter()
+                .map(|r| (r.order.clone(), r.rows))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(blocks(&back), blocks(&path));
+        // A flag naming what the file names is taken; one naming another is refused by name.
+        let again = tmp("money-gb-18-again.snail");
+        write_parquet(
+            &again,
+            &catalog,
+            &given,
+            span(),
+            Some(18),
+            Some("en_GB.utf8"),
+        )
+        .unwrap();
+        assert_eq!(asked(&again), was);
+        for (release, locale, words) in [
+            (Some(19), None, ["--release 19", RELEASE_KEY]),
+            (
+                None,
+                Some("en_IL.utf8"),
+                ["--lc-monetary en_IL.utf8", MONETARY_KEY],
+            ),
+            (None, Some("C"), ["--lc-monetary C", MONETARY_KEY]),
+        ] {
+            let refused = tmp("money-gb-18-refused.snail");
+            let e = write_parquet(&refused, &catalog, &given, span(), release, locale)
+                .unwrap_err()
+                .to_string();
+            assert!(words.iter().all(|w| e.contains(w)), "{e}");
+            assert!(!refused.exists());
+        }
+    }
+
+    #[test]
     #[cfg(feature = "standalone")]
     fn money_held_in_an_array_reads_and_prints_under_the_file_s_locale() {
         // A file whose money lies in an array alone records it for that column.

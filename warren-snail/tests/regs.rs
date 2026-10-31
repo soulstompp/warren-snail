@@ -530,5 +530,5 @@ fn a_reg_type_is_cut_by_its_bits_as_an_oid_is_and_goes_out_naming_its_release() 
             .and_then(|k| k.value.clone())
     };
     assert_eq!(release("s.c"), Some("16".to_string()));
-    assert_eq!(release("s.o"), None);
+    assert_eq!(release("s.o"), Some("16".to_string()));
 }

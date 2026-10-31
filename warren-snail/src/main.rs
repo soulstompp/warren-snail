@@ -4,7 +4,6 @@
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{Field, Schema};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use std::fs::File;
 use std::path::Path;
@@ -15,7 +14,7 @@ use warren_snail::cut::PAGE;
 #[cfg(feature = "standalone")]
 use warren_snail::read::HELD_BYTES;
 use warren_snail::read::{Round, Snail, Snails};
-use warren_snail::write::{parquet_files, sources, write_released, Rows};
+use warren_snail::write::write_parquet;
 use warren_snail::{Error, Result};
 
 const USAGE: &str =
@@ -43,12 +42,13 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           in a Parquet file, or a directory of them as `out` writes them, and a table given none
           written empty. Prints what each order laid out. A row group already cut as the snail
           cuts it comes in by its pages as they lie. The pages lie in files of 1 GiB, <file>, then
-          <file>.1 and on; --file-pages sets another size, in 4 KiB pages. --release names the
-          PostgreSQL release the rows' OIDs came from, whose built-in objects name its reg* values:
-          19 unless given. --lc-monetary names the lc_monetary the rows' money was written under,
-          which the snail reads and prints its money under: C unless given, any other locale
-          through glibc, with the feature collations. --written records each order's columns as
-          Parquet.
+          <file>.1 and on; --file-pages sets another size, in 4 KiB pages. The release the rows'
+          OIDs came from, whose built-in objects name its reg* values, and the lc_monetary their
+          money was written under, which the snail reads and prints its money under, are those
+          the files name, as `out` names them; where they name none, --release and --lc-monetary
+          give them, 19 and C unless given, any locale but C and POSIX through glibc, with the
+          feature collations. A flag naming another than the files name is refused. --written
+          records each order's columns as Parquet.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
           COMMIT and ROLLBACK; CREATE TABLE, and CREATE INDEX and ALTER TABLE … CLUSTER ON for a
           table that holds no rows. Outside a transaction each statement commits. --out records
@@ -615,61 +615,36 @@ fn cmd_write(args: &[String]) -> Result<()> {
     let ddl =
         std::fs::read_to_string(ddl_path).map_err(|e| Error::new(format!("{ddl_path}: {e}")))?;
     let catalog = Catalog::parse(&ddl)?;
-    let mut tables = Vec::new();
-    let mut given = Vec::new();
-    for a in args.iter().skip(1).filter(|a| a.contains('=')) {
-        let (name, path) = a.split_once('=').unwrap();
-        let t = catalog
-            .table(name)
-            .ok_or_else(|| Error::new(format!("{name} is not in the DDL")))?;
-        // A table past the span comes as a directory of its files, read in turn.
-        let files = parquet_files(Path::new(path))?;
-        let mut batches = Vec::new();
-        for f in &files {
-            let file = File::open(f).map_err(|e| Error::new(format!("{}: {e}", f.display())))?;
-            batches.extend(
-                ParquetRecordBatchReaderBuilder::try_new(file)?
-                    .build()?
-                    .collect::<std::result::Result<Vec<_>, _>>()?,
-            );
-        }
-        tables.push((name.to_string(), Rows::from_batches(t, &batches)?));
-        given.push((name.to_string(), sources(&files, t)?));
-    }
+    // A table past the span comes as a directory of its files, read in turn.
+    let given: Vec<(String, std::path::PathBuf)> = args
+        .iter()
+        .skip(1)
+        .filter(|a| a.contains('='))
+        .map(|a| {
+            let (name, path) = a.split_once('=').unwrap();
+            (name.to_string(), path.into())
+        })
+        .collect();
     let span = match flag(args, "--file-pages") {
         Some(n) => n
             .parse()
             .map_err(|_| Error::new("--file-pages takes a whole number"))?,
         None => warren_snail::file::FILE_PAGES,
     };
-    let release = match flag(args, "--release") {
-        Some(r) => r
-            .parse()
-            .map_err(|_| Error::new("--release takes PostgreSQL's major release, 14 to 19"))?,
-        None => warren_snail::regs::LATEST,
-    };
-    let written = match flag(args, "--lc-monetary") {
-        Some(locale) => {
-            let mut carried = warren_snail::write::Carried::default();
-            for t in &catalog.tables {
-                for c in t.columns.iter().filter(|c| c.ty.holds_money()) {
-                    carried
-                        .monetary
-                        .push((t.name.clone(), c.name.clone(), locale.to_string()));
-                }
-            }
-            warren_snail::write::write_carried(
-                Path::new(file),
-                &catalog,
-                &tables,
-                &given,
-                span,
-                release,
-                &carried,
-            )?
-        }
-        None => write_released(Path::new(file), &catalog, &tables, &given, span, release)?,
-    };
+    let release = flag(args, "--release")
+        .map(|r| {
+            r.parse()
+                .map_err(|_| Error::new("--release takes PostgreSQL's major release, 14 to 19"))
+        })
+        .transpose()?;
+    let written = write_parquet(
+        Path::new(file),
+        &catalog,
+        &given,
+        span,
+        release,
+        flag(args, "--lc-monetary"),
+    )?;
     if let Some(out) = flag(args, "--written") {
         let rows: Vec<(
             &warren_snail::write::Written,

@@ -557,6 +557,170 @@ pub fn parquet_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files.into_iter().map(|(_, p)| p).collect())
 }
 
+/// What a table's Parquet files name of the snail they came out of, as `out` names it: the
+/// PostgreSQL release its OIDs came from, and the lc_monetary its money was written under.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Named {
+    pub release: Option<u8>,
+    pub lc_monetary: Option<String>,
+}
+
+/// What a table's files name, each by its key-value metadata: refused where two of them name
+/// different ones, and where a release is no number.
+pub fn named(table: &str, paths: &[std::path::PathBuf]) -> Result<Named> {
+    use crate::read::{MONETARY_KEY, RELEASE_KEY};
+    let mut out = Named::default();
+    for p in paths {
+        let file =
+            std::fs::File::open(p).map_err(|e| Error::new(format!("{}: {e}", p.display())))?;
+        let meta = parquet::file::metadata::ParquetMetaDataReader::new().parse_and_finish(&file)?;
+        let kv = meta.file_metadata().key_value_metadata();
+        let value = |key: &str| {
+            kv.and_then(|kv| kv.iter().find(|k| k.key == key))
+                .and_then(|k| k.value.clone())
+        };
+        if let Some(r) = value(RELEASE_KEY) {
+            let r: u8 = r.parse().map_err(|_| {
+                Error::new(format!(
+                    "{table}: {} names the release {r} under {RELEASE_KEY}, which is no release",
+                    p.display()
+                ))
+            })?;
+            match out.release {
+                Some(was) if was != r => {
+                    return Err(Error::new(format!(
+                        "{table}: its files name the releases {was} and {r} under {RELEASE_KEY}"
+                    )))
+                }
+                _ => out.release = Some(r),
+            }
+        }
+        if let Some(l) = value(MONETARY_KEY) {
+            match &out.lc_monetary {
+                Some(was) if !crate::monetary::Monetary::names_same(was, &l) => {
+                    return Err(Error::new(format!(
+                        "{table}: its files name the lc_monetary {was} and {l} under \
+                         {MONETARY_KEY}"
+                    )))
+                }
+                _ => out.lc_monetary = Some(l),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The release and the lc_monetary a write from Parquet files takes: what its tables' files name,
+/// alike in each; else what the flags give, `--release` and `--lc-monetary`; else 19 and C. A flag
+/// naming another than the files name is refused by name.
+pub fn settled(
+    named: &[(String, Named)],
+    release: Option<u8>,
+    lc_monetary: Option<&str>,
+) -> Result<(u8, Option<String>)> {
+    use crate::read::{MONETARY_KEY, RELEASE_KEY};
+    let mut file_release: Option<(&str, u8)> = None;
+    let mut file_monetary: Option<(&str, &str)> = None;
+    for (table, n) in named {
+        if let Some(r) = n.release {
+            match file_release {
+                Some((other, was)) if was != r => {
+                    return Err(Error::new(format!(
+                        "{table}'s file names the release {r} under {RELEASE_KEY}, and {other}'s \
+                         {was}: a snail's OIDs come from one release"
+                    )))
+                }
+                Some(_) => {}
+                None => file_release = Some((table, r)),
+            }
+        }
+        if let Some(l) = n.lc_monetary.as_deref() {
+            match file_monetary {
+                Some((other, was)) if !crate::monetary::Monetary::names_same(was, l) => {
+                    return Err(Error::new(format!(
+                        "{table}'s file names the lc_monetary {l} under {MONETARY_KEY}, and \
+                         {other}'s {was}: the snail answers under one"
+                    )))
+                }
+                Some(_) => {}
+                None => file_monetary = Some((table, l)),
+            }
+        }
+    }
+    let release = match (file_release, release) {
+        (Some((table, was)), Some(r)) if r != was => {
+            return Err(Error::new(format!(
+                "--release {r}, and {table}'s file names the release {was} under {RELEASE_KEY}: \
+                 write takes the release its files name"
+            )))
+        }
+        (Some((_, was)), _) => was,
+        (None, Some(r)) => r,
+        (None, None) => crate::regs::LATEST,
+    };
+    let lc_monetary = match (file_monetary, lc_monetary) {
+        (Some((table, was)), Some(l)) if !crate::monetary::Monetary::names_same(was, l) => {
+            return Err(Error::new(format!(
+                "--lc-monetary {l}, and {table}'s file names the lc_monetary {was} under \
+                 {MONETARY_KEY}: write takes the lc_monetary its files name"
+            )))
+        }
+        (Some((_, was)), _) => Some(was.to_string()),
+        (None, l) => l.map(str::to_string),
+    };
+    Ok((release, lc_monetary))
+}
+
+/// A new snail from Parquet files, as the command's `write` takes them: each table's rows from its
+/// file, or the files of a directory as `out` writes a table past the span, a row group cut as the
+/// snail cuts it coming in by its pages; under the release and the lc_monetary `settled` gives,
+/// which every column holding money is read under.
+pub fn write_parquet(
+    path: &Path,
+    catalog: &Catalog,
+    given: &[(String, std::path::PathBuf)],
+    span: u64,
+    release: Option<u8>,
+    lc_monetary: Option<&str>,
+) -> Result<Vec<Written>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut tables = Vec::new();
+    let mut sourced = Vec::new();
+    let mut names = Vec::new();
+    for (name, p) in given {
+        let t = catalog
+            .table(name)
+            .ok_or_else(|| Error::new(format!("{name} is not in the DDL")))?;
+        let files = parquet_files(p)?;
+        let mut batches = Vec::new();
+        for f in &files {
+            let file =
+                std::fs::File::open(f).map_err(|e| Error::new(format!("{}: {e}", f.display())))?;
+            batches.extend(
+                ParquetRecordBatchReaderBuilder::try_new(file)?
+                    .build()?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+        }
+        tables.push((name.clone(), Rows::from_batches(t, &batches)?));
+        sourced.push((name.clone(), sources(&files, t)?));
+        names.push((name.clone(), named(name, &files)?));
+    }
+    let (release, lc_monetary) = settled(&names, release, lc_monetary)?;
+    let mut carried = Carried::default();
+    if let Some(l) = lc_monetary {
+        for t in &catalog.tables {
+            for c in t.columns.iter().filter(|c| c.ty.holds_money()) {
+                carried
+                    .monetary
+                    .push((t.name.clone(), c.name.clone(), l.clone()));
+            }
+        }
+    }
+    write_carried(path, catalog, &tables, &sourced, span, release, &carried)
+}
+
 /// A column chunk's pages, where they can come in as they lie: the chunk of a leaf the snail
 /// describes as `ours`.
 fn movable(

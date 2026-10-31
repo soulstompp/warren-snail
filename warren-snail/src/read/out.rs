@@ -25,12 +25,12 @@ use std::sync::Arc;
 /// The key under which a file out names its table's DDL.
 pub const DDL_KEY: &str = "warren-snail.ddl";
 
-/// The key under which a file out of a table holding a reg* column names the PostgreSQL release its
-/// OIDs came from.
+/// The key under which a file out names the PostgreSQL release its snail's OIDs came from, which
+/// `write` takes.
 pub const RELEASE_KEY: &str = "warren-snail.release";
 
 /// The key under which a file out of a table holding money names the lc_monetary its money was
-/// written under, where it is not C.
+/// written under, which `write` takes.
 pub const MONETARY_KEY: &str = "warren-snail.lc_monetary";
 
 /// The key under which a file out of a table names each numeric column holding a NaN, and the
@@ -511,15 +511,15 @@ impl Snail {
                     DDL_KEY.to_string(),
                     self.catalog.ddl_of(&table.name)?,
                 ))
+                .chain(std::iter::once(KeyValue::new(
+                    RELEASE_KEY.to_string(),
+                    table.release.to_string(),
+                )))
                 .chain(
                     table
                         .columns
                         .iter()
-                        .any(|c| matches!(c.ty, ColumnType::Reg(..)))
-                        .then(|| KeyValue::new(RELEASE_KEY.to_string(), table.release.to_string())),
-                )
-                .chain(
-                    (!table.monetary.is_c() && table.columns.iter().any(|c| c.ty.holds_money()))
+                        .any(|c| c.ty.holds_money())
                         .then(|| KeyValue::new(MONETARY_KEY.to_string(), table.monetary.name())),
                 )
                 .chain(
