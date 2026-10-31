@@ -43,6 +43,19 @@ pub struct Commit {
 /// writer between threads.
 pub trait Host: Send {
     fn carry(&mut self, commit: &Commit) -> Result<()>;
+
+    /// The tag of the host's transaction a transaction's root is written for, where the host
+    /// decides whether it is taken: the root carries it, and is taken only where the host's judge
+    /// says that transaction committed. A sequence's advance lands at once, its root untagged.
+    fn tag(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// What tells a round whether a root its host tagged is taken: whether the host's transaction the
+/// tag names committed, as the round asking sees it. An error refuses the round.
+pub trait Judge {
+    fn taken(&self, tag: u64) -> Result<bool>;
 }
 
 impl Commit {
@@ -89,6 +102,14 @@ impl Commit {
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
         o.0
+    }
+
+    /// The tag its host gave the commit's root, where it tagged it: a sequence's advance, and a
+    /// commit whose host tags nothing, carry none.
+    pub fn host(&self) -> Option<u64> {
+        let mut page = self.root.clone();
+        page.resize(PAGE, 0);
+        Root::decode(&page).and_then(|(r, _)| r.host)
     }
 
     /// The commit `encode` wrote, refused where its bytes are not whole.
@@ -189,6 +210,27 @@ fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()
         )));
     }
     let span = root.span;
+    let pages = pages_of(commit, span)?;
+    crate::lock::wait_older_let_go(&files.first, freed(files, &root, &theirs, &pages, format)?)?;
+    write_pages(files, &pages)?;
+    match stop {
+        Some(Stop::BeforeRoot) => return Err(Error::new("the apply stopped before the root")),
+        Some(Stop::HalfRoot) => {
+            files
+                .first
+                .write_all_at(&commit.root[..commit.root.len() / 2], copy as u64)?;
+            return Err(Error::new("the apply stopped halfway through the root"));
+        }
+        None => {}
+    }
+    files.first.write_all_at(&page, copy as u64)?;
+    files.first.sync_data()?;
+    Ok(())
+}
+
+/// A commit's pages by their numbers in a snail whose files hold `span` pages, refused where one is
+/// no page a commit writes.
+fn pages_of(commit: &Commit, span: u64) -> Result<BTreeMap<u64, &[u8]>> {
     let mut pages: BTreeMap<u64, &[u8]> = BTreeMap::new();
     for p in &commit.pages {
         let n = p.file * span + p.page;
@@ -204,10 +246,14 @@ fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()
         }
         pages.insert(n, &p.bytes);
     }
-    crate::lock::wait_older_let_go(&files.first, freed(files, &root, &theirs, &pages, format)?)?;
+    Ok(pages)
+}
+
+/// A commit's pages written where they lie, a run at a time, and brought to the disk.
+fn write_pages(files: &Files, pages: &BTreeMap<u64, &[u8]>) -> Result<()> {
     let mut run: Vec<u8> = Vec::new();
     let mut start = 0;
-    for (&n, bytes) in &pages {
+    for (&n, bytes) in pages {
         if !run.is_empty() && start + (run.len() / PAGE) as u64 != n {
             files.write_at(&run, start)?;
             run.clear();
@@ -220,20 +266,104 @@ fn land_at_turn(files: &Files, commit: &Commit, stop: Option<Stop>) -> Result<()
     if !run.is_empty() {
         files.write_at(&run, start)?;
     }
-    files.sync()?;
-    match stop {
-        Some(Stop::BeforeRoot) => return Err(Error::new("the apply stopped before the root")),
-        Some(Stop::HalfRoot) => {
-            files
-                .first
-                .write_all_at(&commit.root[..commit.root.len() / 2], copy as u64)?;
-            return Err(Error::new("the apply stopped halfway through the root"));
-        }
-        None => {}
+    files.sync()
+}
+
+/// What a replay of a commit did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Replayed {
+    /// Its pages and its root written.
+    Landed,
+    /// Its root found where it lies already: nothing written.
+    Already,
+    /// The file found past it, at a later generation: nothing written.
+    Passed,
+}
+
+/// Replays a commit on the snail at `path`, at its root's turn, as a host's recovery reads its log
+/// again from a point the file may be past already. A commit whose root lies in the copy its
+/// generation names is left as it is. One whose parent lies in the other copy has its pages written
+/// and brought to the disk, then its root, over whatever that copy held: a root of the same
+/// generation its host never took among them, since the log holds the commits in the order they
+/// were written. One the file is past, holding a later generation, is left; any other is refused by
+/// name. Where the commit frees pages a round of the snail's may still read, holding an older
+/// generation, `waiting` is called with the newest tag it frees each time the replay finds such a
+/// round, until none does; an error from it ends the replay, nothing written.
+pub fn replay(
+    path: &Path,
+    commit: &Commit,
+    waiting: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<Replayed> {
+    let files = Files::open(path, true, false)?;
+    crate::lock::take_root_turn(&files.first)?;
+    let replayed = replay_at_turn(&files, commit, waiting);
+    let given = crate::lock::give_root_turn(&files.first);
+    let replayed = replayed?;
+    given?;
+    Ok(replayed)
+}
+
+fn replay_at_turn(
+    files: &Files,
+    commit: &Commit,
+    waiting: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<Replayed> {
+    let mut both = vec![0u8; 2 * PAGE];
+    files.first.read_exact_at(&mut both, 0)?;
+    let mut page = commit.root.clone();
+    page.resize(PAGE, 0);
+    let (theirs, their_format) = Root::decode(&page)
+        .filter(|(r, _)| {
+            commit.root.len() <= PAGE
+                && r.generation == commit.generation
+                && commit.parent + 1 == commit.generation
+        })
+        .ok_or_else(|| {
+            Error::new(format!(
+                "the commit of generation {} holds no whole root of its generation",
+                commit.generation
+            ))
+        })?;
+    let c = (commit.generation % 2) as usize;
+    if both[c * PAGE..(c + 1) * PAGE] == page[..] {
+        return Ok(Replayed::Already);
     }
-    files.first.write_all_at(&page, copy as u64)?;
+    let decoded = [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])];
+    let newest = decoded.iter().flatten().map(|(r, _)| r.generation).max();
+    let (root, format) = match (&decoded[1 - c], newest) {
+        (_, Some(n)) if n > commit.generation => return Ok(Replayed::Passed),
+        (Some((r, f)), _) if r.generation == commit.parent => (r.clone(), *f),
+        (None, Some(n)) if n == commit.generation => return Ok(Replayed::Passed),
+        _ => {
+            return Err(Error::new(format!(
+                "the commit begins from generation {}, and the snail stands at generation {}",
+                commit.parent,
+                newest.map_or("none whole".to_string(), |n| n.to_string())
+            )))
+        }
+    };
+    files.span.set(root.span);
+    files.format.set(format);
+    if their_format != format || theirs.span != root.span {
+        return Err(Error::new(format!(
+            "the commit is of format {their_format} in files of {} pages, and the snail of \
+             format {format} in files of {}",
+            theirs.span, root.span
+        )));
+    }
+    let pages = pages_of(commit, root.span)?;
+    let f = freed(files, &root, &theirs, &pages, format)?;
+    let mut nap = std::time::Duration::from_millis(1);
+    while crate::lock::older_held(&files.first, f)? {
+        waiting(f)?;
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(50));
+    }
+    write_pages(files, &pages)?;
+    files.first.write_all_at(&page, (c * PAGE) as u64)?;
     files.first.sync_data()?;
-    Ok(())
+    Ok(Replayed::Landed)
 }
 
 /// The newest tag of the runs a commit frees: those its parent's free map holds waiting on a tag the

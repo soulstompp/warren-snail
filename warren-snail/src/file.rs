@@ -375,6 +375,11 @@ pub struct Root {
     /// transaction: it is taken only once a round across them finds that root written. Format 9
     /// only.
     pub pending: Option<Pending>,
+    /// The tag of the host's transaction this root was written for, where its host tags them: it
+    /// is taken only where the host says that transaction committed, or where a root of the next
+    /// generation lies beside it; a round with no host to ask reads the copy beside it. Format 9
+    /// only.
+    pub host: Option<u64>,
 }
 
 /// The default collation a file names where it names none: libc C.UTF-8, which orders text by its
@@ -606,6 +611,14 @@ impl Root {
                     o.u64(p.at);
                 }
             }
+            if let Some(tag) = self.host {
+                o.u64(tag);
+            }
+        } else if self.host.is_some() {
+            return Err(Error::new(format!(
+                "a snail of format {format} is written through no host that tags its roots: `out`, \
+                 then `write`"
+            )));
         } else if !self.decided.is_empty() || self.pending.is_some() {
             return Err(Error::new(format!(
                 "a snail of format {format} is written by no transaction across snails: `out`, \
@@ -699,6 +712,12 @@ impl Root {
         } else {
             (Vec::new(), None)
         };
+        // A root its host tagged carries the tag last.
+        let host = if format >= FORMAT && !ended(&i) {
+            Some(i.u64().ok()?)
+        } else {
+            None
+        };
         let end = i.at();
         let crc = i.u32().ok()?;
         (crc32fast::hash(&page[..end]) == crc).then_some((
@@ -717,6 +736,7 @@ impl Root {
                 collation,
                 decided,
                 pending,
+                host,
             },
             format,
         ))
@@ -925,6 +945,10 @@ pub struct Reader {
     spare: RefCell<Option<Root>>,
     /// Which of the root's two copies the root last read lies in.
     copy: Cell<u64>,
+    /// What decides the roots a host tagged, where the reader has one to ask; and the tag of the
+    /// copy beside the root last read that it did not take, a root of the generation after it.
+    judge: RefCell<Option<Rc<dyn crate::carry::Judge>>>,
+    waiting: Cell<Option<u64>>,
     #[cfg(feature = "standalone")]
     held: RefCell<Held>,
     #[cfg(feature = "standalone")]
@@ -949,6 +973,8 @@ impl Reader {
             staged: Default::default(),
             spare: RefCell::new(None),
             copy: Cell::new(0),
+            judge: RefCell::new(None),
+            waiting: Cell::new(None),
             #[cfg(feature = "standalone")]
             held: RefCell::new(Held::new(0)),
             #[cfg(feature = "standalone")]
@@ -1129,15 +1155,22 @@ impl Reader {
     pub fn root(&self) -> Result<Root> {
         let from = self.round.get().unwrap_or(0);
         crate::lock::hold_generations_from(&self.files.first, from)?;
-        let (root, format, spare, copy) = copies(&self.read(0, 2)?)?;
+        let Copies {
+            root,
+            format,
+            pending,
+            copy,
+            waiting,
+        } = self.copies()?;
         self.files.span.set(root.span);
         self.files.format.set(format);
         crate::lock::keep_generation(&self.files.first, from, root.generation)?;
         self.round.set(Some(root.generation));
         self.forget_reused(&root);
         self.generation.set(root.generation);
-        *self.spare.borrow_mut() = spare;
+        *self.spare.borrow_mut() = pending;
         self.copy.set(copy);
+        self.waiting.set(waiting);
         Ok(root)
     }
 
@@ -1145,13 +1178,45 @@ impl Reader {
     /// The round holds the generation it held, older, so no page the newest root names is freed while
     /// the reader reads it.
     pub fn peek_root(&self) -> Result<Root> {
-        let (root, format, spare, copy) = copies(&self.read(0, 2)?)?;
+        let Copies {
+            root,
+            format,
+            pending,
+            copy,
+            waiting,
+        } = self.copies()?;
         self.files.span.set(root.span);
         self.files.format.set(format);
         self.forget_reused(&root);
-        *self.spare.borrow_mut() = spare;
+        *self.spare.borrow_mut() = pending;
         self.copy.set(copy);
+        self.waiting.set(waiting);
         Ok(root)
+    }
+
+    /// The root's two copies read, and the root taken from them as the reader's judge, where it has
+    /// one, decides the roots a host tagged.
+    fn copies(&self) -> Result<Copies> {
+        let both = self.read(0, 2)?;
+        let judge = self.judge.borrow().clone();
+        copies(&both, judge.as_deref())
+    }
+
+    /// Takes the roots a host tagged from now on only where `judge` says the host's transaction
+    /// committed, as the round asking sees it.
+    pub fn judged_by(&self, judge: Rc<dyn crate::carry::Judge>) {
+        *self.judge.borrow_mut() = Some(judge);
+    }
+
+    /// Whether the reader has a judge of the roots a host tagged.
+    pub(crate) fn judged(&self) -> bool {
+        self.judge.borrow().is_some()
+    }
+
+    /// The tag of the copy beside the root last read, a root of the generation after it its host
+    /// tagged, where the round did not take it.
+    pub fn waiting_on(&self) -> Option<u64> {
+        self.waiting.get()
     }
 
     /// The copy, 0 or 1, of the root's two that the root last read lies in.
@@ -1214,20 +1279,53 @@ impl Reader {
 /// format. A file whose root names a format this build does not read is refused by that format. A
 /// pending copy is never taken.
 pub(crate) fn newer(both: &[u8]) -> Result<(Root, u32)> {
-    copies(both).map(|(root, format, _, _)| (root, format))
+    copies(both, None).map(|c| (c.root, c.format))
+}
+
+/// The root a round takes from the root's two copies, and what lies beside it.
+pub(crate) struct Copies {
+    pub(crate) root: Root,
+    pub(crate) format: u32,
+    /// The other copy, where it is a pending one written for the generation after the root.
+    pub(crate) pending: Option<Root>,
+    /// The copy, 0 or 1, the root lies in.
+    pub(crate) copy: u64,
+    /// The tag of the other copy, where it is a root of the generation after the root that its
+    /// host tagged and the round did not take.
+    pub(crate) waiting: Option<u64>,
 }
 
 /// `newer`, the copy of the two it lies in, and the other copy where it is a pending one, written
 /// for the generation after it. Where the only whole copy is a pending one, it is the root: the
 /// copy beside a pending copy is written only once the pending copy's transaction is decided, so
-/// one torn there was its root's last write.
-pub(crate) fn copies(both: &[u8]) -> Result<(Root, u32, Option<Root>, u64)> {
+/// one torn there was its root's last write. A copy its host tagged is taken where `judge` says
+/// its host's transaction committed, or where the other copy is a tagged root of the generation
+/// after it, which its host wrote only once that transaction had: else the copy beside it.
+pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Result<Copies> {
     let decoded = [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])];
+    let mut settled = [false; 2];
+    for c in 0..2 {
+        let Some((r, _)) = &decoded[c] else {
+            continue;
+        };
+        settled[c] = match r.host {
+            None => true,
+            Some(tag) => {
+                decoded[1 - c]
+                    .as_ref()
+                    .is_some_and(|(o, _)| o.host.is_some() && o.generation == r.generation + 1)
+                    || match judge {
+                        Some(j) => j.taken(tag)?,
+                        None => false,
+                    }
+            }
+        };
+    }
     let taken = (0..2u64)
         .filter_map(|c| {
             decoded[c as usize]
                 .as_ref()
-                .filter(|(r, _)| r.pending.is_none())
+                .filter(|(r, _)| r.pending.is_none() && settled[c as usize])
                 .map(|d| (c, d))
         })
         .max_by_key(|(c, (r, _))| (r.generation, std::cmp::Reverse(*c)));
@@ -1238,14 +1336,30 @@ pub(crate) fn copies(both: &[u8]) -> Result<(Root, u32, Option<Root>, u64)> {
             .map(|(r, _)| r)
             .find(|r| r.pending.is_some() && r.generation == root.generation + 1)
             .cloned();
-        return Ok((root.clone(), *format, pending, copy));
+        let waiting = decoded[1 - copy as usize]
+            .as_ref()
+            .filter(|(r, _)| r.generation == root.generation + 1)
+            .and_then(|(r, _)| r.host);
+        return Ok(Copies {
+            root: root.clone(),
+            format: *format,
+            pending,
+            copy,
+            waiting,
+        });
     }
     if let Some((copy, (root, format))) =
         (0..2u64).find_map(|c| decoded[c as usize].as_ref().map(|d| (c, d)))
     {
         let mut root = root.clone();
         root.pending = None;
-        return Ok((root, *format, None, copy));
+        return Ok(Copies {
+            root,
+            format: *format,
+            pending: None,
+            copy,
+            waiting: None,
+        });
     }
     for copy in [&both[..PAGE], &both[PAGE..]] {
         if copy[..8] == MAGIC {
@@ -1359,6 +1473,11 @@ impl Writer {
     /// Carries each commit from now on by the host.
     pub(crate) fn carried_by(&mut self, host: Box<dyn crate::carry::Host>) {
         self.host = Some(std::panic::AssertUnwindSafe(host));
+    }
+
+    /// The tag the host gives a transaction's root, where it tags them.
+    pub(crate) fn host_tag(&self) -> Option<u64> {
+        self.host.as_ref().and_then(|h| h.tag())
     }
 
     /// The first file, whose locks a writer holds on the blocks it changes and on the root's turn.
@@ -1704,7 +1823,12 @@ mod tests {
         // The copies lie at their generations' places: the pending one, newer, is not taken.
         let mut both = page(&root);
         both.extend_from_slice(&page(&pending));
-        let (taken, _, spare, copy) = copies(&both).unwrap();
+        let Copies {
+            root: taken,
+            pending: spare,
+            copy,
+            ..
+        } = copies(&both, None).unwrap();
         assert_eq!((taken.generation, &taken.decided), (4, &root.decided));
         assert_eq!((spare.map(|s| s.generation), copy), (Some(5), 0));
         // Its root, written over its parent after its transaction is decided, torn: the pending
@@ -1712,7 +1836,12 @@ mod tests {
         let mut torn = page(&landed_of(&pending));
         torn[20] ^= 1;
         torn.extend_from_slice(&page(&pending));
-        let (taken, _, spare, copy) = copies(&torn).unwrap();
+        let Copies {
+            root: taken,
+            pending: spare,
+            copy,
+            ..
+        } = copies(&torn, None).unwrap();
         assert_eq!(
             (taken.generation, taken.pending, spare.is_none(), copy),
             (5, None, true, 1)
@@ -1728,7 +1857,12 @@ mod tests {
         // Written over its parent, it is taken, and the pending copy beside it is no longer one.
         let mut both = page(&landed);
         both.extend_from_slice(&page(&pending));
-        let (taken, _, spare, copy) = copies(&both).unwrap();
+        let Copies {
+            root: taken,
+            pending: spare,
+            copy,
+            ..
+        } = copies(&both, None).unwrap();
         assert_eq!((taken.generation, spare.is_none(), copy), (5, true, 0));
         // A copy pending beside an older root than its own parent is no pending copy of it.
         let mut both = page(&Root {
@@ -1736,9 +1870,95 @@ mod tests {
             ..Default::default()
         });
         both.extend_from_slice(&page(&pending));
-        assert!(copies(&both).unwrap().2.is_none());
+        assert!(copies(&both, None).unwrap().pending.is_none());
         // Formats 7 and 8 hold no decision.
         assert!(root.encode(FORMAT_EIGHT).is_err());
+    }
+
+    /// A judge that takes the tags it is given.
+    struct Committed(Vec<u64>);
+
+    impl crate::carry::Judge for Committed {
+        fn taken(&self, tag: u64) -> Result<bool> {
+            Ok(self.0.contains(&tag))
+        }
+    }
+
+    fn tagged(generation: u64, host: Option<u64>) -> Vec<u8> {
+        let mut p = Root {
+            generation,
+            host,
+            ..Default::default()
+        }
+        .encode(FORMAT)
+        .unwrap();
+        p.resize(PAGE, 0);
+        p
+    }
+
+    /// Of the copies at their generations' places: `(the generation taken, the tag waiting beside
+    /// it)` as `judge` decides.
+    fn taken_of(
+        a: Vec<u8>,
+        b: Vec<u8>,
+        judge: Option<&dyn crate::carry::Judge>,
+    ) -> (u64, Option<u64>) {
+        let mut both = a;
+        both.extend_from_slice(&b);
+        let c = copies(&both, judge).unwrap();
+        (c.root.generation, c.waiting)
+    }
+
+    #[test]
+    fn a_root_its_host_tagged_is_taken_only_where_its_host_says_it_committed() {
+        let (back, _) = Root::decode(&tagged(5, Some(1 << 40 | 7))).unwrap();
+        assert_eq!(back.host, Some(1 << 40 | 7));
+        assert_eq!(Root::decode(&tagged(5, None)).unwrap().0.host, None);
+        let yes = Committed(vec![9]);
+        let no = Committed(vec![]);
+        // Generation 5 tagged 9 beside its parent: taken where the judge says 9 committed; a round
+        // with no judge, or a judge that says it did not, reads the parent.
+        assert_eq!(
+            taken_of(tagged(4, None), tagged(5, Some(9)), Some(&yes)),
+            (5, None)
+        );
+        assert_eq!(
+            taken_of(tagged(4, None), tagged(5, Some(9)), Some(&no)),
+            (4, Some(9))
+        );
+        assert_eq!(
+            taken_of(tagged(4, None), tagged(5, Some(9)), None),
+            (4, Some(9))
+        );
+        // A tagged root of the generation after it lies beside a tagged root only where its host
+        // took it: taken without asking.
+        assert_eq!(
+            taken_of(tagged(6, Some(10)), tagged(5, Some(9)), None),
+            (5, Some(10))
+        );
+        assert_eq!(
+            taken_of(tagged(6, Some(10)), tagged(5, Some(9)), Some(&no)),
+            (5, Some(10))
+        );
+        assert_eq!(
+            taken_of(
+                tagged(6, Some(10)),
+                tagged(5, Some(9)),
+                Some(&Committed(vec![10]))
+            ),
+            (6, None)
+        );
+        // The parent torn by the commit after the tagged root: the tagged root is the root.
+        let mut torn = tagged(6, None);
+        torn[20] ^= 1;
+        assert_eq!(taken_of(torn, tagged(5, Some(9)), None), (5, None));
+        // Formats 7 and 8 hold no tag.
+        assert!(Root {
+            host: Some(9),
+            ..Default::default()
+        }
+        .encode(FORMAT_EIGHT)
+        .is_err());
     }
 
     #[test]

@@ -1344,7 +1344,12 @@ impl Snail {
 
     /// The commit, at the root's turn: it begins from the newest root.
     fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
+        // A sequence's advance lands at once; a transaction's root carries its host's tag.
+        let advance = self.advancing.is_some();
         let mut root = self.commit_pages(w, &[])?;
+        if !advance {
+            root.host = w.host_tag();
+        }
         // The root goes into the copy that does not hold the root it begins from.
         w.commit_into(&mut root, 1 - self.reader.root_copy())?;
         Ok(root)
@@ -1363,6 +1368,13 @@ impl Snail {
                 p.decider, p.at
             )));
         }
+        if let Some(tag) = self.reader.waiting_on().filter(|_| !self.reader.judged()) {
+            return Err(Error::new(format!(
+                "this snail's newest root waits on its host's word on its transaction {tag}: \
+                 write it through its host"
+            )));
+        }
+        root.host = None;
         w.begin_commit(&root);
         let generation = root.generation + 1;
         // The free map: its runs whose tag no older round still runs under are free now, and the

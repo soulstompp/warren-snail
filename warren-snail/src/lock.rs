@@ -16,7 +16,6 @@ const GENERATION_BYTES: u64 = 1 << 58;
 const BLOCKS: u64 = 1 << 61;
 const BLOCK_BYTES: u64 = 1 << 40;
 /// The bytes of the writers, one a writer open on the file, by its slot.
-#[cfg(feature = "standalone")]
 const WRITERS: u64 = 1 << 59;
 const WRITER_SLOTS: u64 = 1 << 16;
 /// A byte for each block and slot: the writer in that slot holds the block.
@@ -202,7 +201,6 @@ pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::Ke
 
 /// Takes a slot for a writer open on the file, held until the file is closed: the first slot no
 /// other writer holds.
-#[cfg(feature = "standalone")]
 pub(crate) fn take_slot(file: &File) -> Result<u64> {
     for s in 0..WRITER_SLOTS {
         if take(file, Kind::Alone, WRITERS + s, 1, false)? {

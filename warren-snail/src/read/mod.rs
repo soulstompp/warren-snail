@@ -595,6 +595,31 @@ impl Snail {
         }
     }
 
+    /// Opens a snail whose roots a host may have tagged, taking each only where `judge` says its
+    /// host's transaction committed, as the round asking sees it. It holds no pages between rounds.
+    pub fn open_judged(path: &Path, judge: std::rc::Rc<dyn crate::carry::Judge>) -> Result<Snail> {
+        let reader = Reader::open(path)?;
+        reader.judged_by(judge);
+        Snail::opened(reader)
+    }
+
+    /// Opens a snail to write inside a host, as its one writer: every commit carried by `host`, a
+    /// transaction's root tagged as the host tags it, and every root a host tagged taken only where
+    /// `judge` says its transaction committed. Built with or without `standalone`, as inside
+    /// PostgreSQL, whose commit is then the snail's: it holds no pages between rounds.
+    pub fn open_carried(
+        path: &Path,
+        host: Box<dyn crate::carry::Host>,
+        judge: std::rc::Rc<dyn crate::carry::Judge>,
+    ) -> Result<Snail> {
+        let (mut writer, _) = Writer::open(path)?;
+        let mut snail = Snail::open_judged(path, judge)?;
+        snail.slot = crate::lock::take_slot(writer.file())?;
+        writer.carried_by(host);
+        snail.writer = Some(writer);
+        Ok(snail)
+    }
+
     fn catalog(reader: &Reader, root: &Root) -> Result<Catalog> {
         let ddl = String::from_utf8(reader.read_extent(root.catalog)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
