@@ -199,6 +199,103 @@ fn geo_cast_through(e: &Expr, to: crate::geo::GeoKind) -> Result<Option<crate::g
     Ok(Some(g))
 }
 
+/// A literal written with its casts, read as PostgreSQL reads it: by the innermost cast's type, cast
+/// outward by each in turn, then assigned to column `c` from the outermost cast's type. None where
+/// it has no cast, or where every cast names the column's own type and that type cuts nothing a
+/// cast would cut, so that the column's input reads it alike.
+fn cast_through(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
+    let col = &table.columns[c];
+    let own = |dt: &sqlparser::ast::DataType| {
+        let name = dt.to_string().to_lowercase();
+        crate::catalog::held_type(dt).is_ok_and(|ty| ty.with_monetary(table.monetary) == col.ty)
+            || col.domain.as_deref() == Some(name.as_str())
+            || (matches!(col.ty, ColumnType::Composed(_)) && col.ty.pg_name() == name)
+    };
+    let mut outermost = None;
+    let mut every_own = true;
+    let mut x = e;
+    loop {
+        match x {
+            Expr::Nested(inner) => x = inner,
+            // A minus sign before a cast negates the value the cast gives.
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => {
+                every_own = false;
+                x = expr;
+            }
+            Expr::Cast {
+                expr, data_type, ..
+            } => {
+                outermost.get_or_insert(data_type);
+                every_own &= own(data_type);
+                x = expr;
+            }
+            _ => break,
+        }
+    }
+    let Some(to) = outermost else {
+        return Ok(None);
+    };
+    let cuts = matches!(
+        col.ty,
+        ColumnType::Text(Some(_))
+            | ColumnType::Bpchar(Some(_))
+            | ColumnType::Bit(_)
+            | ColumnType::Varbit(Some(_))
+    );
+    if every_own && !cuts {
+        return Ok(None);
+    }
+    let v = super::pipeline::eval_on(
+        e,
+        &[],
+        &[],
+        table.release,
+        &super::pipeline::Casings::under(table.monetary),
+    )?;
+    let held = crate::catalog::held_type(to)
+        .ok()
+        .or_else(|| crate::composed::resolve(to));
+    let Some(from) = held.map(|ty| ty.with_monetary(table.monetary)) else {
+        return super::fill::assign_value(v, col.ty, &col.name).map(Some);
+    };
+    if !crate::catalog::assignable(from, col.ty) {
+        // An array is assigned element by element, each by its element's assignment: read from its
+        // text by the column's input.
+        if elements_assignable(from, col.ty) {
+            return match v.text() {
+                Some(t) => crate::composed::scalar_in(col.ty, &t).map(Some),
+                None => Ok(Some(Datum::Null)),
+            };
+        }
+        return Err(Error::new(format!(
+            "column \"{}\" is of type {} but expression is of type {}",
+            col.name,
+            col.ty.pg_name(),
+            from.pg_name()
+        )));
+    }
+    let d = super::fill::assign_value(v, from, &col.name)?;
+    super::fill::assign(d, from, col.ty, &col.name).map(Some)
+}
+
+/// Whether two array types' elements, or theirs in turn, are assigned one to the other.
+fn elements_assignable(from: ColumnType, to: ColumnType) -> bool {
+    let element = |ty: ColumnType| match ty {
+        ColumnType::Composed(r) => match r.def() {
+            crate::composed::Composed::Array { element, .. } => Some(*element),
+            _ => None,
+        },
+        _ => None,
+    };
+    match (element(from), element(to)) {
+        (Some(a), Some(b)) => crate::catalog::assignable(a, b) || elements_assignable(a, b),
+        _ => false,
+    }
+}
+
 /// An expression with its casts taken off.
 fn uncast(e: &Expr) -> &Expr {
     match e {
@@ -303,6 +400,8 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
         if let Some(g) = geo_cast_through(e, k)? {
             return Ok(Datum::Bytes(crate::geo::geo_bytes(&g)));
         }
+    } else if let Some(d) = cast_through(e, table, c)? {
+        return Ok(d);
     }
     let e = uncast(e);
     if let Expr::Value(v) = e {

@@ -789,3 +789,59 @@ fn write_refuses_a_null_in_a_not_null_column_at_the_first_row_holding_one() {
     )
     .unwrap();
 }
+
+#[test]
+fn a_literal_written_with_casts_is_read_through_each_innermost_first() {
+    // Each as PostgreSQL 18.6 and 19 RC1 took or refused it on 28818 and 28819 (2026-10-31): a
+    // number cast to an integer is rounded, a string cut by its cast, a typmod applied at the cast
+    // and again at the column, an array assigned element by element; a cast to a type the column
+    // takes by no assignment refused.
+    let path = made(
+        "cast-through",
+        "CREATE TABLE s.t (id integer PRIMARY KEY, n numeric(9,1), v varchar(2), m money,
+             i integer, tm time, d numeric DEFAULT 2.5::integer, a numeric(5,2)[]);",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(
+        &mut w,
+        "INSERT INTO s.t (id, n, v, tm, i, a) VALUES (1, 1.5::integer, 'abcd'::varchar(2), \
+         '10:11:12.6'::time(0), -1.5::integer, '{1.555}'::numeric[])",
+    );
+    run(
+        &mut w,
+        "UPDATE s.t SET n = '1.25'::numeric(9,1)::numeric(9,2) WHERE id = 1",
+    );
+    run(
+        &mut w,
+        "INSERT INTO s.t (id, n) SELECT id + 1, 2.5::smallint FROM s.t WHERE id = 1",
+    );
+    for (sql, why) in [
+        (
+            "INSERT INTO s.t (id, m) VALUES (3, '7'::smallint)",
+            "column \"m\" is of type money but expression is of type smallint",
+        ),
+        (
+            "INSERT INTO s.t (id, i) VALUES (3, NULL::text)",
+            "column \"i\" is of type integer but expression is of type text",
+        ),
+    ] {
+        let e = w
+            .execute(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was taken"));
+        assert_eq!(e.to_string(), why, "{sql}");
+    }
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    assert_eq!(
+        rows(
+            &mut s,
+            "WITH t AS (SELECT id, n, v, i, tm, d, a FROM s.t) SELECT id, n::text AS n, v, \
+             i::text AS i, tm::text AS tm, d::text AS d, a::text AS a FROM t"
+        ),
+        [
+            row(&["1", "1.3", "ab", "-2", "10:11:13", "3", "{1.56}"]),
+            row(&["2", "3.0", "NULL", "NULL", "NULL", "3", "NULL"])
+        ]
+    );
+}
