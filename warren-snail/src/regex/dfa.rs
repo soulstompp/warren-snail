@@ -128,6 +128,16 @@ impl Dfa<'_> {
     }
 }
 
+/// Whether a back reference's DFA refers to one of the matches worked on, as C asserts; where
+/// it does not, `REG_ASSERT` is recorded.
+fn backref_in_range(v: &mut Vars, d: &Dfa) -> bool {
+    if d.backno >= 0 && d.backno as usize >= v.nmatch {
+        v.seterr(REG_ASSERT);
+        return false;
+    }
+    true
+}
+
 /// `longest`: the end of the longest match of the DFA that starts at `start` and ends at or before
 /// `stop`; None where there is none, or on an error (`v.err` set). `hitstopp`, where given, says
 /// whether the scan reached the string's end.
@@ -146,6 +156,9 @@ pub(super) fn longest(
     }
 
     // A back reference to a string already matched is matched against that string.
+    if !backref_in_range(v, d) {
+        return None;
+    }
     if d.backno >= 0 && v.pmatch[d.backno as usize].rm_so >= 0 {
         let cp = dfa_backref(v, d, start, start, stop, false);
         if cp == Some(v.stop) && stop == v.stop {
@@ -268,6 +281,9 @@ pub(super) fn shortest(
     }
 
     // A back reference to a string already matched is matched against that string.
+    if !backref_in_range(v, d) {
+        return None;
+    }
     if d.backno >= 0 && v.pmatch[d.backno as usize].rm_so >= 0 {
         let cp = dfa_backref(v, d, start, min, max, true);
         if cp.is_some() {
