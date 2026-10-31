@@ -894,6 +894,31 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_above_the_blocks_keeps_the_span_of_every_block_under_it() {
+        let span = |lo: u8, hi: u8, empty: bool| Span {
+            present: true,
+            lo: vec![1, lo],
+            hi: vec![1, hi],
+            empty,
+        };
+        let mut a = block(1, 10, 0);
+        a.spans = vec![span(5, 9, false)];
+        let mut b = block(2, 10, 1);
+        b.spans = vec![span(2, 6, true)];
+        let over = Entry::over(&[a.clone(), b], Extent::default()).unwrap();
+        assert_eq!(over.spans, [span(2, 9, true)]);
+        // Written with a head that names the span's column, read back the same.
+        let head = Head {
+            span_slots: vec![0],
+            ..head()
+        };
+        let (read, entries) = decode_top(&encode_top(&head, &[a.clone(), over])).unwrap();
+        assert_eq!(read.span_slots, [0]);
+        assert_eq!(entries[0].spans, a.spans);
+        assert_eq!(entries[1].spans, [span(2, 9, true)]);
+    }
+
+    #[test]
     fn a_top_a_page_and_a_page_map_come_back_as_written() {
         let h = head();
         let entries = vec![block(1, 3892, 40), block(2, 7, 41)];

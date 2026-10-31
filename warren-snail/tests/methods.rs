@@ -501,22 +501,35 @@ fn a_gist_or_sp_gist_index_is_held_on_a_range_a_multirange_an_inet_and_text_alon
 /// A table of `n` rows, row i's range [10j, 10j + 5) for j = 7919i mod n, so that neighbours on the
 /// table's key lie far apart on the range's order; with a GiST index on the range.
 fn ranges(name: &str, n: i64) -> std::path::PathBuf {
-    let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id int NOT NULL, r int4range, PRIMARY KEY (id)); \
-         CREATE INDEX t_r ON s.t USING gist (r);",
-    )
+    spans_of(name, n, "int4range")
+}
+
+/// As `ranges`, of type `ty`: a multirange holds its range and one past it.
+fn spans_of(name: &str, n: i64, ty: &str) -> std::path::PathBuf {
+    let catalog = Catalog::parse(&format!(
+        "CREATE TABLE s.t (id int NOT NULL, r {ty}, PRIMARY KEY (id)); \
+         CREATE INDEX t_r ON s.t USING gist (r);"
+    ))
     .unwrap();
-    let ty = warren_snail::composed::built_in("int4range").unwrap();
+    let multi = ty.contains("multi");
+    let ty = warren_snail::composed::built_in(ty).unwrap();
     let id = Values::Int((0..n).map(Some).collect());
     let r = Values::Composed(
         (0..n)
             .map(|i| {
                 let j = (i * 7919) % n;
                 // Every hundredth row empty, and every hundred-and-first NULL.
-                let text = if i % 100 == 0 {
-                    "empty".to_string()
-                } else {
-                    format!("[{},{})", j * 10, j * 10 + 5)
+                let text = match (i % 100 == 0, multi) {
+                    (true, false) => "empty".to_string(),
+                    (true, true) => "{}".to_string(),
+                    (false, false) => format!("[{},{})", j * 10, j * 10 + 5),
+                    (false, true) => format!(
+                        "{{[{},{}),[{},{})}}",
+                        j * 10,
+                        j * 10 + 2,
+                        j * 10 + 4,
+                        j * 10 + 5
+                    ),
                 };
                 (i % 101 != 0).then(|| {
                     std::sync::Arc::new(warren_snail::composed::Compound::new(
@@ -665,5 +678,54 @@ fn a_range_written_into_a_gist_strand_widens_its_block_s_span() {
             "t_r"
         ),
         [1, 30000]
+    );
+}
+
+#[test]
+fn a_gist_strand_on_a_multirange_keeps_the_span_of_its_ranges() {
+    let mut s = fresh(&spans_of("gist-multirange", 20480, "int4multirange"));
+    let blocks = blocks_of(&s.blocks().unwrap(), "t_r", "r.list.element.lower").len();
+    for q in [
+        "SELECT id FROM s.t WHERE r && '{[100004,100005)}'",
+        "SELECT id FROM s.t WHERE r && '[100003,100004)'::int4range",
+        "SELECT id FROM s.t WHERE r @> 100004",
+        "SELECT id FROM s.t WHERE r <@ '{[100000,100010)}'",
+        "SELECT id FROM s.t WHERE r <@ '{}'",
+        "SELECT id FROM s.t WHERE r >> '{[204000,204010)}'",
+        "SELECT id FROM s.t WHERE r -|- '{[100005,100010)}'",
+    ] {
+        let along_key = ids(&mut s, q, "t_pkey");
+        assert_eq!(ids(&mut s, q, "t_r"), along_key, "{q}");
+    }
+    let (_, along) = s
+        .ask(
+            "SELECT id FROM s.t WHERE r && '{[100004,100005)}'",
+            Some("t_r"),
+        )
+        .unwrap();
+    assert!(blocks > 2, "{blocks}");
+    assert!(along.blocks_read < blocks as u64, "{along:?}");
+    assert_eq!(
+        ids(
+            &mut s,
+            "SELECT id FROM s.t WHERE r && '{[100004,100005)}'",
+            "t_r"
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn a_condition_by_a_gist_operator_is_refused_in_a_partial_index_s_predicate() {
+    let got = outcomes(
+        "CREATE TABLE s.t (id int PRIMARY KEY, r int4range);\n\
+         CREATE INDEX t_r ON s.t (id) WHERE r && '[1,2)';",
+    );
+    assert!(
+        got[1]
+            .as_deref()
+            .is_some_and(|e| e.contains("is not read in a predicate")),
+        "{got:?}"
     );
 }
