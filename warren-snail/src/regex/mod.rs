@@ -53,6 +53,18 @@ impl Regex {
         nmatch: usize,
         eflags: i32,
     ) -> Result<Option<Vec<RegMatch>>, RegError> {
-        exec::exec(&self.guts, string, search_start, nmatch, eflags)
+        exec::exec(&self.guts, string, search_start, nmatch, eflags, None)
+    }
+
+    /// As `exec`, and `REG_EXPECT`'s `rm_extend` written into `details`.
+    pub fn exec_details(
+        &self,
+        string: &[Chr],
+        search_start: usize,
+        nmatch: usize,
+        eflags: i32,
+        details: &mut RegMatch,
+    ) -> Result<Option<Vec<RegMatch>>, RegError> {
+        exec::exec(&self.guts, string, search_start, nmatch, eflags, Some(details))
     }
 }
