@@ -566,6 +566,37 @@ fn a_range_on_a_text_level_narrows_the_walk_each_end_kept_or_left_out_as_written
 }
 
 #[test]
+fn an_equality_on_a_text_level_fixes_it_and_the_next_level_narrows_after_it() {
+    let path = tmp("qpath_text_equality.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.g (id integer NOT NULL, g text NOT NULL, k text NOT NULL, PRIMARY KEY (id));
+         CREATE INDEX g_gk ON s.g (g, k);",
+    )
+    .unwrap();
+    let ids: Vec<i64> = (0..PREFIXED).collect();
+    let columns = vec![
+        Values::Int(ids.iter().map(|&i| Some(i)).collect()),
+        Values::Text(ids.iter().map(|&i| Some(format!("g{}", i % 4))).collect()),
+        Values::Text(ids.iter().map(|&i| Some(k_of(i))).collect()),
+    ];
+    write(&path, &catalog, &[("s.g".into(), Rows { columns })]).unwrap();
+    // A text level after it keeps no summary, so only the walk narrows by it.
+    let (a, r) = asked(
+        &path,
+        "SELECT id FROM s.g WHERE g = 'g1' AND k < 'p0100'",
+        Some("g_gk"),
+    );
+    assert_eq!(
+        a,
+        (0..PREFIXED)
+            .filter(|&i| i % 4 == 1 && k_of(i).as_str() < "p0100")
+            .collect::<Vec<i64>>()
+    );
+    let (_, whole) = asked(&path, "SELECT id FROM s.g WHERE g = 'g1'", Some("g_gk"));
+    assert!(r.blocks_read < whole.blocks_read, "{r:?} {whole:?}");
+}
+
+#[test]
 fn a_pattern_s_fixed_prefix_narrows_the_read_along_an_order_on_its_column_and_changes_no_answer() {
     let path = prefixed("qpath_prefix");
     let k = |i: i64| k_of(i);
