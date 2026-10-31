@@ -76,7 +76,6 @@ pub const REG_EXPANDED: i32 = 0o40;
 pub const REG_NLSTOP: i32 = 0o100;
 pub const REG_NLANCH: i32 = 0o200;
 pub const REG_NEWLINE: i32 = 0o300;
-pub const REG_PEND: i32 = 0o400;
 pub const REG_EXPECT: i32 = 0o1000;
 pub const REG_BOSONLY: i32 = 0o2000;
 /// A test flag: `[[=x=]]` stands for x and y.
@@ -202,6 +201,7 @@ pub struct Cnfa {
 }
 
 impl Cnfa {
+    #[cfg(test)]
     pub fn is_null(&self) -> bool {
         self.nstates == 0
     }
@@ -226,8 +226,6 @@ pub struct Subre {
     pub flags: u8,
     /// The kind of lookaround constraint, in `Guts::lacons`.
     pub latype: u8,
-    /// Its number in the tree, 1 to `Guts::ntree - 1`; its index in `Guts::subres`.
-    pub id: usize,
     /// A capture's subexpression number.
     pub capno: usize,
     /// A back reference's subexpression number.
@@ -235,7 +233,8 @@ pub struct Subre {
     /// An iteration's or a back reference's fewest and most repetitions (`DUPINF` for no most).
     pub min: i16,
     pub max: i16,
-    /// The node's first child and its next sibling, by id.
+    /// The node's first child and its next sibling, by their numbers in the tree (`numst`), their
+    /// places in `Guts::subres`.
     pub child: Option<usize>,
     pub sibling: Option<usize>,
     pub cnfa: Cnfa,

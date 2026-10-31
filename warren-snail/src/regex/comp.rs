@@ -410,7 +410,6 @@ impl Vars {
                 op: node.op,
                 flags: node.flags,
                 latype: node.latype,
-                id,
                 capno: node.capno as usize,
                 backno: node.backno as usize,
                 min: node.min,
@@ -429,10 +428,8 @@ impl Vars {
         let lacons = self
             .lacons
             .iter_mut()
-            .enumerate()
-            .map(|(i, la)| Subre {
+            .map(|la| Subre {
                 latype: la.latype,
-                id: i,
                 cnfa: std::mem::take(&mut la.cnfa),
                 ..Subre::default()
             })

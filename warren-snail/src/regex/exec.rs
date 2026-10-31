@@ -1160,9 +1160,6 @@ mod tests {
     fn guts(mut tree: Vec<Subre>, whole: &Nfa, nsub: usize, info: i64, cflags: i32) -> Guts {
         let mut subres = vec![Subre::default()];
         subres.append(&mut tree);
-        for (id, s) in subres.iter_mut().enumerate() {
-            s.id = id;
-        }
         subres[1].cnfa = compact(whole);
         Guts {
             cflags,
