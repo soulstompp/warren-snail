@@ -69,16 +69,71 @@ fn combine_flags(f1: i32, f2: i32) -> i32 {
     up(f1 | f2) | pref2(f1, f2)
 }
 
-/// How deep the parse's recursion goes before the pattern is refused as too complex: the levels of
-/// parse, parsebranch and parseqatom, and of the tree's nodes and clones beneath them.
-pub(super) const MAX_DEPTH: usize = 4_000;
+/// What `parseqatom`'s atom leaves to do.
+enum AtomStep {
+    /// A constraint made, or an error: the node to return.
+    Done(SrId),
+    /// An atom made, with its node where it has one.
+    Atom {
+        atom: SrId,
+        atomtype: i32,
+        subno: i32,
+    },
+    /// Parentheses, their contents to be parsed between `s` and `s2`.
+    Paren {
+        cap: bool,
+        subno: i32,
+        atomtype: i32,
+        s: StateId,
+        s2: StateId,
+    },
+    /// A lookaround constraint, its contents to be parsed between `s` and `s2`.
+    Lacon { latype: u8, s: StateId, s2: StateId },
+}
 
-/// The stack, in bytes, one level of a traversal of the NFA takes in PostgreSQL's compiler.
-pub(super) const TRAVERSE_FRAME: usize = 48;
+/// What `parseqatom`'s quantifier leaves to do.
+enum QuantStep {
+    /// The node to return.
+    Done(SrId),
+    /// The rest of the branch, to be parsed from `s2` as the second child of t's child.
+    Rest { top: SrId, t: SrId, s2: StateId },
+}
 
-/// The stack, in bytes, PostgreSQL lets the traversals of the NFA take before the pattern is too
-/// complex.
-pub(super) const C_STACK_BUDGET: usize = 2_097_152;
+/// How deep the compiler's own recursion goes before the pattern is refused as too complex, so
+/// that it stays within a thread's stack: the levels of parse, parsebranch and parseqatom, of
+/// repeat, of the tree's nodes, and two for each of the clones that break a loop of constraints.
+pub(super) const MAX_DEPTH: usize = 3_000;
+
+// The stack, in bytes, each function of PostgreSQL 19's compiler takes on x86_64, as regcomp.o is
+// built with -O2: parseqatom, dupnfa, delsub, fixempties, checkmatchall and breakconstraintloop are
+// inlined into their callers there, and take nothing of their own.
+pub(super) const F_PARSE: usize = 80;
+pub(super) const F_PARSEBRANCH: usize = 144;
+pub(super) const F_SUBRE: usize = 64;
+pub(super) const F_REPEAT: usize = 80;
+pub(super) const F_NFATREE: usize = 112;
+pub(super) const F_NFANODE: usize = 64;
+pub(super) const F_OPTIMIZE: usize = 144;
+pub(super) const F_CLEANUP: usize = 32;
+pub(super) const F_DELTRAVERSE: usize = 48;
+pub(super) const F_DUPTRAVERSE: usize = 32;
+pub(super) const F_REMOVETRAVERSE: usize = 64;
+pub(super) const F_CLEARTRAVERSE: usize = 32;
+pub(super) const F_MARKREACHABLE: usize = 32;
+pub(super) const F_MARKCANREACH: usize = 48;
+pub(super) const F_EMPTYREACHABLE: usize = 48;
+pub(super) const F_FINDCONSTRAINTLOOP: usize = 64;
+pub(super) const F_CLONESUCCESSORSTATES: usize = 112;
+pub(super) const F_CHECKMATCHALL: usize = 64;
+
+/// What PostgreSQL's check adds to the stack it measures: rstacktoodeep's frame and the start of
+/// stack_is_too_deep's.
+const F_CHECK: usize = 32;
+
+/// The stack the compiler's functions may take before a pattern is too complex: max_stack_depth's
+/// 2MB, less what the backend takes before pg_regcomp and pg_regcomp's own frame, 7,392 bytes when
+/// a query compares a text with a pattern.
+pub(super) const C_STACK_BUDGET: usize = 2_097_152 - 7_392;
 
 /// A node of the tree of subexpressions while it is built (`struct subre`).
 #[derive(Clone, Debug)]
@@ -210,9 +265,11 @@ impl Vars {
         self.see(t) && self.next() != 0
     }
 
-    /// Whether the recursion has gone as deep as the compiler allows (`rstacktoodeep`).
-    pub(super) fn stack_too_deep(&self) -> bool {
-        self.depth >= MAX_DEPTH || self.cstack + TRAVERSE_FRAME > C_STACK_BUDGET
+    /// Whether a function whose frame takes `frame` bytes, entered now, finds the stack too deep
+    /// (`rstacktoodeep`): PostgreSQL's measure of its stack, from the frames of the functions in
+    /// progress; or the compiler's own recursion as deep as it goes.
+    pub(super) fn stack_too_deep(&self, frame: usize) -> bool {
+        self.depth >= MAX_DEPTH || self.cstack + frame + F_CHECK > C_STACK_BUDGET
     }
 
     /// An empty arc between two states of the main NFA (`EMPTYARC`).
@@ -480,7 +537,9 @@ impl Vars {
     /// node, an alternation where there is more than one (`parse`).
     pub(super) fn parse(&mut self, stopper: i32, typ: i32, init: StateId, fin: StateId) -> SrId {
         self.depth += 1;
+        self.cstack += F_PARSE;
         let r = self.parse_(stopper, typ, init, fin);
+        self.cstack -= F_PARSE;
         self.depth -= 1;
         r
     }
@@ -551,7 +610,9 @@ impl Vars {
         partial: bool,
     ) -> SrId {
         self.depth += 1;
+        self.cstack += F_PARSEBRANCH;
         let r = self.parsebranch_(stopper, typ, left, right, partial);
+        self.cstack -= F_PARSEBRANCH;
         self.depth -= 1;
         r
     }
@@ -614,8 +675,69 @@ impl Vars {
         typ: i32,
         lp: StateId,
         rp: StateId,
-        mut top: SrId,
+        top: SrId,
     ) -> SrId {
+        // the atom or constraint; the contents of parentheses parsed here, so that the recursion
+        // holds little
+        let (atom, atomtype, subno) = match self.qatom_atom(typ, lp, rp, top) {
+            AtomStep::Done(t) => return t,
+            AtomStep::Atom {
+                atom,
+                atomtype,
+                subno,
+            } => (atom, atomtype, subno),
+            AtomStep::Paren {
+                cap,
+                subno,
+                atomtype,
+                s,
+                s2,
+            } => {
+                let atom = self.parse(b')' as i32, typ, s, s2);
+                self.next();
+                if self.iserr() {
+                    return NOSR;
+                }
+                let atom = self.qatom_capture(atom, cap, subno, s, s2);
+                if self.iserr() {
+                    return NOSR;
+                }
+                (atom, atomtype, subno)
+            }
+            AtomStep::Lacon { latype, s, s2 } => {
+                let t = self.parse(b')' as i32, LACON, s, s2);
+                // its inner structure does not matter
+                self.freesubre(t);
+                if self.iserr() {
+                    return NOSR;
+                }
+                self.next();
+                self.processlacon(s, s2, latype, lp, rp);
+                return top;
+            }
+        };
+
+        // the quantifier, and the rest of the branch where the atom needs the tree
+        match self.qatom_quantify(stopper, lp, rp, top, atom, atomtype, subno) {
+            QuantStep::Done(t) => t,
+            QuantStep::Rest { top, t, s2 } => {
+                // the rest of the branch, as the second child of t's child
+                let rest = self.parsebranch(stopper, typ, s2, rp, true);
+                let tc = sr!(self, t).child;
+                sr!(self, tc).sibling = rest;
+                if self.iserr() {
+                    return NOSR;
+                }
+                self.qatom_join(top, t, rest);
+                top
+            }
+        }
+    }
+
+    /// `parseqatom`'s atom or constraint: a constraint's arcs made, an atom's arcs or node made,
+    /// or the parentheses' states made for their contents.
+    #[inline(never)]
+    fn qatom_atom(&mut self, typ: i32, lp: StateId, rp: StateId, top: SrId) -> AtomStep {
         let nfa = self.nfa;
         macro_rules! arcv {
             ($t:expr, $val:expr) => {
@@ -625,7 +747,7 @@ impl Vars {
         macro_rules! noerrn {
             () => {
                 if self.iserr() {
-                    return NOSR;
+                    return AtomStep::Done(NOSR);
                 }
             };
         }
@@ -643,7 +765,7 @@ impl Vars {
                     arcv!(BEHIND, self.nlcolor);
                 }
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             t if t == b'$' as i32 => {
                 arcv!(b'$' as i32, 1);
@@ -651,19 +773,19 @@ impl Vars {
                     arcv!(AHEAD, self.nlcolor);
                 }
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             SBEGIN => {
                 arcv!(b'^' as i32, 1); // BOL
                 arcv!(b'^' as i32, 0); // or BOS
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             SEND => {
                 arcv!(b'$' as i32, 1); // EOL
                 arcv!(b'$' as i32, 0); // or EOS
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             t if t == b'<' as i32 => {
                 self.wordchrs();
@@ -672,7 +794,7 @@ impl Vars {
                 self.nonword(BEHIND, lp, s);
                 self.word(AHEAD, s, rp);
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             t if t == b'>' as i32 => {
                 self.wordchrs();
@@ -681,7 +803,7 @@ impl Vars {
                 self.word(BEHIND, lp, s);
                 self.nonword(AHEAD, s, rp);
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             WBDRY => {
                 self.wordchrs();
@@ -694,7 +816,7 @@ impl Vars {
                 self.word(BEHIND, lp, s);
                 self.nonword(AHEAD, s, rp);
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             NWBDRY => {
                 self.wordchrs();
@@ -707,7 +829,7 @@ impl Vars {
                 self.nonword(BEHIND, lp, s);
                 self.nonword(AHEAD, s, rp);
                 self.next();
-                return top;
+                return AtomStep::Done(top);
             }
             LACON => {
                 let latype = self.nextvalue as u8;
@@ -715,18 +837,12 @@ impl Vars {
                 let s = self.newstate(nfa);
                 let s2 = self.newstate(nfa);
                 noerrn!();
-                let t = self.parse(b')' as i32, LACON, s, s2);
-                // its inner structure does not matter
-                self.freesubre(t);
-                noerrn!();
-                self.next();
-                self.processlacon(s, s2, latype, lp, rp);
-                return top;
+                return AtomStep::Lacon { latype, s, s2 };
             }
             // then the errors
             t if t == b'*' as i32 || t == b'+' as i32 || t == b'?' as i32 || t == b'{' as i32 => {
                 self.verr(REG_BADRPT);
-                return top;
+                return AtomStep::Done(top);
             }
             // then plain characters, and their variants
             t if t == b')' as i32 || t == PLAIN => {
@@ -734,7 +850,7 @@ impl Vars {
                     // an unbalanced parenthesis
                     if (self.cflags & REG_ADVANCED) != REG_EXTENDED {
                         self.verr(REG_EPAREN);
-                        return top;
+                        return AtomStep::Done(top);
                     }
                     // legal in EREs, by the specification's botch
                     self.note(REG_UPBOTCH);
@@ -798,26 +914,13 @@ impl Vars {
                 self.emptyarc(lp, s);
                 self.emptyarc(s2, rp);
                 noerrn!();
-                atom = self.parse(b')' as i32, typ, s, s2);
-                self.next();
-                noerrn!();
-                if cap {
-                    if sr!(self, atom).capno == 0 {
-                        // the usual case: the atom marked as capturing
-                        sr!(self, atom).flags |= CAP;
-                        sr!(self, atom).capno = subno;
-                    } else {
-                        // a wrapper that captures, for "((x))"
-                        let f = sr!(self, atom).flags as i32 | CAP as i32;
-                        let t = self.subre(b'(', f, s, s2);
-                        noerrn!();
-                        sr!(self, t).capno = subno;
-                        sr!(self, t).child = atom;
-                        atom = t;
-                    }
-                    self.subs[subno as usize] = atom;
-                }
-                // everything else waits on a possible {0}
+                return AtomStep::Paren {
+                    cap,
+                    subno,
+                    atomtype,
+                    s,
+                    s2,
+                };
             }
             BACKREF => {
                 if typ == LACON {
@@ -843,8 +946,67 @@ impl Vars {
             }
             _ => {
                 self.verr(REG_ASSERT);
-                return top;
+                return AtomStep::Done(top);
             }
+        }
+
+        AtomStep::Atom {
+            atom,
+            atomtype,
+            subno,
+        }
+    }
+
+    /// `parseqatom`'s capturing parentheses: the atom marked as capturing, or wrapped in a node that
+    /// captures where it captures already.
+    #[inline(never)]
+    fn qatom_capture(&mut self, atom: SrId, cap: bool, subno: i32, s: StateId, s2: StateId) -> SrId {
+        let mut atom = atom;
+        if cap {
+            if sr!(self, atom).capno == 0 {
+                // the usual case: the atom marked as capturing
+                sr!(self, atom).flags |= CAP;
+                sr!(self, atom).capno = subno;
+            } else {
+                // a wrapper that captures, for "((x))"
+                let f = sr!(self, atom).flags as i32 | CAP as i32;
+                let t = self.subre(b'(', f, s, s2);
+                if self.iserr() {
+                    return NOSR;
+                }
+                sr!(self, t).capno = subno;
+                sr!(self, t).child = atom;
+                atom = t;
+            }
+            self.subs[subno as usize] = atom;
+        }
+        // everything else waits on a possible {0}
+        atom
+    }
+
+    /// `parseqatom`'s quantifier, and where the atom needs the tree, its nodes and the skeleton
+    /// the rest of the branch hangs from.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn qatom_quantify(
+        &mut self,
+        stopper: i32,
+        lp: StateId,
+        rp: StateId,
+        top: SrId,
+        atom: SrId,
+        atomtype: i32,
+        subno: i32,
+    ) -> QuantStep {
+        let nfa = self.nfa;
+        let mut top = top;
+        let mut atom = atom;
+        macro_rules! noerrn {
+            () => {
+                if self.iserr() {
+                    return QuantStep::Done(NOSR);
+                }
+            };
         }
 
         // ...and an atom may be followed by a quantifier
@@ -879,7 +1041,7 @@ impl Vars {
                 };
                 if m > n {
                     self.verr(REG_BADBR);
-                    return top;
+                    return QuantStep::Done(top);
                 }
                 // {m,n} has a preference, even as {m,m}
                 qprefer = greedy(self.nextvalue);
@@ -891,7 +1053,7 @@ impl Vars {
             if !self.see(b'}' as i32) {
                 // errors too
                 self.verr(REG_BADBR);
-                return top;
+                return QuantStep::Done(top);
             }
             self.next();
         } else {
@@ -915,7 +1077,7 @@ impl Vars {
                 self.delsub(nfa, lp, rp);
             }
             self.emptyarc(lp, rp);
-            return top;
+            return QuantStep::Done(top);
         }
 
         // the simple case
@@ -933,7 +1095,7 @@ impl Vars {
                 self.freesubre(atom);
             }
             sr!(self, top).flags = f as u8;
-            return top;
+            return QuantStep::Done(top);
         }
 
         // the hard part: capturing parentheses, a back reference, a clash of preferences, or an
@@ -970,7 +1132,7 @@ impl Vars {
 
         // the rest of the branch split into x{...} and what follows
         let aflags = sr!(self, atom).flags as i32;
-        let mut t = self.subre(b'.', combine_flags(qprefer, aflags), lp, rp);
+        let t = self.subre(b'.', combine_flags(qprefer, aflags), lp, rp);
         noerrn!();
         sr!(self, t).child = atom;
         // the node whose child is the atom
@@ -1066,65 +1228,66 @@ impl Vars {
         }
 
         // and the recursion that waited
-        t = sr!(self, sr!(self, top).child).sibling;
+        let t = sr!(self, sr!(self, top).child).sibling;
         if !(self.see(b'|' as i32) || self.see(stopper) || self.see(EOS)) {
-            // the rest of the branch, as the second child of t's child
-            let rest = self.parsebranch(stopper, typ, s2, rp, true);
-            let tc = sr!(self, t).child;
-            sr!(self, tc).sibling = rest;
-            noerrn!();
+            return QuantStep::Rest { top, t, s2 };
+        }
 
-            // the flags, as promised
-            let rf = sr!(self, rest).flags as i32;
-            let tf = sr!(self, t).flags as i32;
-            sr!(self, t).flags |= combine_flags(tf, rf) as u8;
-            let tf = sr!(self, t).flags as i32;
-            let topf = sr!(self, top).flags as i32;
-            sr!(self, top).flags |= combine_flags(topf, tf) as u8;
+        // nothing left in the branch: s2 links straight to rp, and t goes
+        self.emptyarc(s2, rp);
+        let topc = sr!(self, top).child;
+        sr!(self, topc).sibling = sr!(self, t).child;
+        let sf = sr!(self, sr!(self, t).child).flags as i32;
+        let topf = sr!(self, top).flags as i32;
+        sr!(self, top).flags |= combine_flags(topf, sf) as u8;
+        self.freesrnode(t);
 
-            // top and t are concatenations: top's child the branch's prefix, its sibling t; t's
-            // child the atom, its sibling the rest. Where the atom came first, the prefix is
-            // empty and one concatenation goes.
-            let topc = sr!(self, top).child;
-            if sr!(self, topc).begin == sr!(self, topc).end {
-                self.freesubre(topc);
-                sr!(self, top).child = sr!(self, t).child;
-                self.freesrnode(t);
-            } else {
-                // otherwise an atom messy only by its preference may join the rest in one plain
-                // node
-                let tc = sr!(self, t).child;
-                let tcs = sr!(self, tc).sibling;
-                if sr!(self, tc).op == b'='
-                    && sr!(self, tcs).op == b'='
-                    && !messy(up(sr!(self, tc).flags as i32 | sr!(self, tcs).flags as i32))
-                {
-                    sr!(self, t).op = b'=';
-                    let f = combine_flags(sr!(self, tc).flags as i32, sr!(self, tcs).flags as i32);
-                    sr!(self, t).flags = f as u8;
-                    self.freesubreandsiblings(tc);
-                    sr!(self, t).child = NOSR;
-                }
-            }
-        } else {
-            // nothing left in the branch: s2 links straight to rp, and t goes
-            self.emptyarc(s2, rp);
-            let topc = sr!(self, top).child;
-            sr!(self, topc).sibling = sr!(self, t).child;
-            let sf = sr!(self, sr!(self, t).child).flags as i32;
-            let topf = sr!(self, top).flags as i32;
-            sr!(self, top).flags |= combine_flags(topf, sf) as u8;
+        // where the messy atom was all the branch, top goes too
+        if sr!(self, topc).begin == sr!(self, topc).end {
+            let tt = sr!(self, topc).sibling;
+            sr!(self, topc).sibling = NOSR;
+            self.freesubre(top);
+            top = tt;
+        }
+        QuantStep::Done(top)
+    }
+
+    /// `parseqatom`'s rest of the branch joined: the flags carried up, and the concatenations
+    /// made fewer where they can be.
+    #[inline(never)]
+    fn qatom_join(&mut self, top: SrId, t: SrId, rest: SrId) {
+        // the flags, as promised
+        let rf = sr!(self, rest).flags as i32;
+        let tf = sr!(self, t).flags as i32;
+        sr!(self, t).flags |= combine_flags(tf, rf) as u8;
+        let tf = sr!(self, t).flags as i32;
+        let topf = sr!(self, top).flags as i32;
+        sr!(self, top).flags |= combine_flags(topf, tf) as u8;
+
+        // top and t are concatenations: top's child the branch's prefix, its sibling t; t's
+        // child the atom, its sibling the rest. Where the atom came first, the prefix is
+        // empty and one concatenation goes.
+        let topc = sr!(self, top).child;
+        if sr!(self, topc).begin == sr!(self, topc).end {
+            self.freesubre(topc);
+            sr!(self, top).child = sr!(self, t).child;
             self.freesrnode(t);
-
-            // where the messy atom was all the branch, top goes too
-            if sr!(self, topc).begin == sr!(self, topc).end {
-                let tt = sr!(self, topc).sibling;
-                sr!(self, topc).sibling = NOSR;
-                self.freesubre(top);
-                top = tt;
+        } else {
+            // otherwise an atom messy only by its preference may join the rest in one plain
+            // node
+            let tc = sr!(self, t).child;
+            let tcs = sr!(self, tc).sibling;
+            if sr!(self, tc).op == b'='
+                && sr!(self, tcs).op == b'='
+                && !messy(up(sr!(self, tc).flags as i32 | sr!(self, tcs).flags as i32))
+            {
+                sr!(self, t).op = b'=';
+                let f = combine_flags(sr!(self, tc).flags as i32, sr!(self, tcs).flags as i32);
+                sr!(self, t).flags = f as u8;
+                self.freesubreandsiblings(tc);
+                sr!(self, t).child = NOSR;
             }
         }
-        top
     }
 
     /// The arcs for a character ahead or behind that is not a word's (`nonword`).
@@ -1200,6 +1363,14 @@ impl Vars {
 
     /// The sub-NFA between `lp` and `rp` made `m` to `n` repetitions of itself (`repeat`).
     fn repeat(&mut self, lp: StateId, rp: StateId, m: i32, n: i32) {
+        self.depth += 1;
+        self.cstack += F_REPEAT;
+        self.repeat_(lp, rp, m, n);
+        self.cstack -= F_REPEAT;
+        self.depth -= 1;
+    }
+
+    fn repeat_(&mut self, lp: StateId, rp: StateId, m: i32, n: i32) {
         const SOME: i32 = 2;
         const INF: i32 = 3;
         let reduce = |x: i32| {
@@ -1641,7 +1812,7 @@ impl Vars {
 
     /// A new node of the tree (`subre`); the recursion of the parse is checked here.
     fn subre(&mut self, op: u8, flags: i32, begin: StateId, end: StateId) -> SrId {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_SUBRE) {
             self.verr(REG_ETOOBIG);
             return NOSR;
         }
@@ -1771,11 +1942,26 @@ impl Vars {
     /// Each node's compacted NFA, children first: what the top node's optimization noted
     /// (`nfatree`).
     fn nfatree(&mut self, t: SrId) -> i64 {
+        self.depth += 1;
+        self.cstack += F_NFATREE;
+        let r = self.nfatree_(t);
+        self.cstack -= F_NFATREE;
+        self.depth -= 1;
+        r
+    }
+
+    fn nfatree_(&mut self, t: SrId) -> i64 {
         let mut t2 = sr!(self, t).child;
         while t2 != NOSR {
             self.nfatree(t2);
             t2 = sr!(self, t2).sibling;
         }
+        self.nfatree_node(t)
+    }
+
+    /// One node's compacted NFA, for `nfatree`.
+    #[inline(never)]
+    fn nfatree_node(&mut self, t: SrId) -> i64 {
         let (begin, end) = (sr!(self, t).begin, sr!(self, t).end);
         let (ret, cnfa) = self.nfanode(begin, end, false);
         if let Some(cnfa) = cnfa {
@@ -1787,6 +1973,18 @@ impl Vars {
     /// The compacted NFA of the sub-NFA from `begin` to `end`, made a search's where
     /// `converttosearch`; with what its optimization noted (`nfanode`).
     pub(super) fn nfanode(
+        &mut self,
+        begin: StateId,
+        end: StateId,
+        converttosearch: bool,
+    ) -> (i64, Option<Cnfa>) {
+        self.cstack += F_NFANODE;
+        let r = self.nfanode_(begin, end, converttosearch);
+        self.cstack -= F_NFANODE;
+        r
+    }
+
+    fn nfanode_(
         &mut self,
         begin: StateId,
         end: StateId,

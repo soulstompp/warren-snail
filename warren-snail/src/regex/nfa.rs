@@ -159,6 +159,16 @@ macro_rules! ar {
 }
 pub(super) use ar;
 
+/// What one arc out of a source state of `clonesuccessorstates` leaves to do.
+enum CloneStep {
+    /// On to the next arc.
+    Next,
+    /// The arc's target merged into the clone, then on.
+    Merge(StateId),
+    /// No more arcs, after an error.
+    Stop,
+}
+
 /// One level of `checkmatchall_recurse`: the state, the arc it is at, what it has found, and
 /// the lengths of its paths to the end.
 struct MatchallLevel {
@@ -888,20 +898,20 @@ impl Vars {
     }
 
     /// One level of a traversal entered: its frame pushed, charged to the stack.
-    fn tpush<T>(&mut self, frames: &mut Vec<T>, f: T) {
+    fn tpush<T>(&mut self, frames: &mut Vec<T>, f: T, frame: usize) {
         frames.push(f);
-        self.cstack += TRAVERSE_FRAME;
+        self.cstack += frame;
     }
 
     /// One level of a traversal left.
-    fn tpop<T>(&mut self, frames: &mut Vec<T>) {
+    fn tpop<T>(&mut self, frames: &mut Vec<T>, frame: usize) {
         frames.pop();
-        self.cstack -= TRAVERSE_FRAME;
+        self.cstack -= frame;
     }
 
     /// A traversal's levels all left at once, after an error.
-    fn tunwind<T>(&mut self, frames: &mut Vec<T>) {
-        self.cstack -= frames.len() * TRAVERSE_FRAME;
+    fn tunwind<T>(&mut self, frames: &mut Vec<T>, frame: usize) {
+        self.cstack -= frames.len() * frame;
         frames.clear();
     }
 
@@ -916,7 +926,7 @@ impl Vars {
                 let na = st!(self, s).outs;
                 if na == NOARC {
                     st!(self, s).tmp = NOSTATE;
-                    self.tpop(&mut frames);
+                    self.tpop(&mut frames, F_DELTRAVERSE);
                     continue;
                 }
                 let nto = ar!(self, na).to;
@@ -925,7 +935,7 @@ impl Vars {
             } else {
                 // the arc's target done
                 if self.iserr() {
-                    self.tunwind(&mut frames);
+                    self.tunwind(&mut frames, F_DELTRAVERSE);
                     return;
                 }
                 self.freearc(nfa, a);
@@ -939,7 +949,7 @@ impl Vars {
 
     /// One state of `deltraverse` entered, where it has arcs out and is not in progress.
     fn deltraverse_enter(&mut self, frames: &mut Vec<(StateId, ArcId, StateId)>, s: StateId) {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_DELTRAVERSE) {
             self.verr(REG_ETOOBIG);
             return;
         }
@@ -951,7 +961,7 @@ impl Vars {
             return;
         }
         st!(self, s).tmp = s;
-        self.tpush(frames, (s, NOARC, NOSTATE));
+        self.tpush(frames, (s, NOARC, NOSTATE), F_DELTRAVERSE);
     }
 
     /// The sub-NFA from `start` to `stop` copied between `from` and `to` (`dupnfa`); `start` may
@@ -984,7 +994,7 @@ impl Vars {
         while let Some(&(s, a, done)) = frames.last() {
             if !done {
                 if a == NOARC || self.iserr() {
-                    self.tpop(&mut frames);
+                    self.tpop(&mut frames, F_DUPTRAVERSE);
                     continue;
                 }
                 frames.last_mut().expect("a level").2 = true;
@@ -992,7 +1002,7 @@ impl Vars {
                 self.duptraverse_enter(nfa, &mut frames, to, NOSTATE);
             } else {
                 if self.iserr() {
-                    self.tpop(&mut frames);
+                    self.tpop(&mut frames, F_DUPTRAVERSE);
                     continue;
                 }
                 let to = ar!(self, a).to;
@@ -1011,7 +1021,7 @@ impl Vars {
         s: StateId,
         stmp: StateId,
     ) {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_DUPTRAVERSE) {
             self.verr(REG_ETOOBIG);
             return;
         }
@@ -1029,7 +1039,7 @@ impl Vars {
             return;
         }
         let outs = st!(self, s).outs;
-        self.tpush(frames, (s, outs, false));
+        self.tpush(frames, (s, outs, false), F_DUPTRAVERSE);
     }
 
     /// The constraints of the sub-NFA from `start` to `stop` made EMPTY arcs
@@ -1054,7 +1064,7 @@ impl Vars {
         while let Some(&(s, a, done)) = frames.last() {
             if !done {
                 if a == NOARC || self.iserr() {
-                    self.tpop(&mut frames);
+                    self.tpop(&mut frames, F_REMOVETRAVERSE);
                     continue;
                 }
                 frames.last_mut().expect("a level").2 = true;
@@ -1062,7 +1072,7 @@ impl Vars {
                 self.removetraverse_enter(&mut frames, to);
             } else {
                 if self.iserr() {
-                    self.tpop(&mut frames);
+                    self.tpop(&mut frames, F_REMOVETRAVERSE);
                     continue;
                 }
                 let to = ar!(self, a).to;
@@ -1088,7 +1098,7 @@ impl Vars {
 
     /// One state of `removetraverse` entered, where it is not done already.
     fn removetraverse_enter(&mut self, frames: &mut Vec<(StateId, ArcId, bool)>, s: StateId) {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_REMOVETRAVERSE) {
             self.verr(REG_ETOOBIG);
             return;
         }
@@ -1097,7 +1107,7 @@ impl Vars {
         }
         st!(self, s).tmp = s;
         let outs = st!(self, s).outs;
-        self.tpush(frames, (s, outs, false));
+        self.tpush(frames, (s, outs, false), F_REMOVETRAVERSE);
     }
 
     /// The tmp fields a traversal left set cleared (`cleartraverse`), depth first on a stack of
@@ -1107,7 +1117,7 @@ impl Vars {
         self.cleartraverse_enter(&mut frames, s);
         while let Some(&(_, a)) = frames.last() {
             if a == NOARC {
-                self.tpop(&mut frames);
+                self.tpop(&mut frames, F_CLEARTRAVERSE);
                 continue;
             }
             frames.last_mut().expect("a level").1 = ar!(self, a).outchain;
@@ -1118,7 +1128,7 @@ impl Vars {
 
     /// One state of `cleartraverse` entered, where its tmp is set.
     fn cleartraverse_enter(&mut self, frames: &mut Vec<(StateId, ArcId)>, s: StateId) {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_CLEARTRAVERSE) {
             self.verr(REG_ETOOBIG);
             return;
         }
@@ -1127,7 +1137,7 @@ impl Vars {
         }
         st!(self, s).tmp = NOSTATE;
         let outs = st!(self, s).outs;
-        self.tpush(frames, (s, outs));
+        self.tpush(frames, (s, outs), F_CLEARTRAVERSE);
     }
 
     /// Where getting from `s1` to `s2` crosses one PLAIN arc, of one color or a set: the state
@@ -1186,6 +1196,13 @@ impl Vars {
     /// An NFA made one the executor can run, of PLAIN and LACON arcs only: what its analysis
     /// noted (`optimize`).
     pub(super) fn optimize(&mut self, nfa: NfaId) -> i64 {
+        self.cstack += F_OPTIMIZE;
+        let r = self.optimize_(nfa);
+        self.cstack -= F_OPTIMIZE;
+        r
+    }
+
+    fn optimize_(&mut self, nfa: NfaId) -> i64 {
         // CANTMATCH arcs dropped, if any
         if (self.nfas[nfa].flags & HASCANTMATCH) != 0 {
             self.removecantmatch(nfa);
@@ -1691,7 +1708,7 @@ impl Vars {
         self.emptyreachable_enter(&mut frames, s, &mut lastfound, inarcsorig);
         while let Some(&(_, a)) = frames.last() {
             if a == NOARC {
-                self.tpop(&mut frames);
+                self.tpop(&mut frames, F_EMPTYREACHABLE);
                 continue;
             }
             frames.last_mut().expect("a level").1 = ar!(self, a).inchain;
@@ -1711,14 +1728,14 @@ impl Vars {
         lastfound: &mut StateId,
         inarcsorig: &[ArcId],
     ) {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_EMPTYREACHABLE) {
             self.verr(REG_ETOOBIG);
             return;
         }
         st!(self, s).tmp = *lastfound;
         *lastfound = s;
         let first = inarcsorig[st!(self, s).no as usize];
-        self.tpush(frames, (s, first));
+        self.tpush(frames, (s, first), F_EMPTYREACHABLE);
     }
 
     /// Whether a state has a constraint arc out (`hasconstraintout`).
@@ -1804,7 +1821,7 @@ impl Vars {
             if a == NOARC {
                 // no loop leads out of s
                 st!(self, s).tmp = s;
-                self.tpop(&mut frames);
+                self.tpop(&mut frames, F_FINDCONSTRAINTLOOP);
                 continue;
             }
             frames.last_mut().expect("a level").1 = ar!(self, a).outchain;
@@ -1812,7 +1829,7 @@ impl Vars {
                 let sto = ar!(self, a).to;
                 st!(self, s).tmp = sto;
                 if self.findconstraintloop_enter(nfa, &mut frames, sto) == Some(true) {
-                    self.tunwind(&mut frames);
+                    self.tunwind(&mut frames, F_FINDCONSTRAINTLOOP);
                     return true;
                 }
             }
@@ -1828,7 +1845,7 @@ impl Vars {
         frames: &mut Vec<(StateId, ArcId)>,
         s: StateId,
     ) -> Option<bool> {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_FINDCONSTRAINTLOOP) {
             self.verr(REG_ETOOBIG);
             // to leave as soon as can be
             return Some(true);
@@ -1844,7 +1861,7 @@ impl Vars {
             return Some(true);
         }
         let outs = st!(self, s).outs;
-        self.tpush(frames, (s, outs));
+        self.tpush(frames, (s, outs), F_FINDCONSTRAINTLOOP);
         None
     }
 
@@ -1943,7 +1960,7 @@ impl Vars {
         outerdonemap: Option<&[u8]>,
         nstates: usize,
     ) {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_CLONESUCCESSORSTATES) {
             self.verr(REG_ETOOBIG);
             return;
         }
@@ -1971,63 +1988,16 @@ impl Vars {
         // ssource visited
         donemap[st!(self, ssource).no as usize] = 1;
 
-        self.depth += 1;
-        self.cstack += TRAVERSE_FRAME;
+        self.depth += 2;
+        self.cstack += F_CLONESUCCESSORSTATES;
 
         // ssource's arcs out cloned, new clone states made but not yet visited; a child clone's
         // tmp holds the state it is a clone of
         let mut a = st!(self, ssource).outs;
         while a != NOARC && !self.iserr() {
-            let sto = ar!(self, a).to;
-            if isconstraintarc(&ar!(self, a)) && self.hasconstraintout(sto) {
-                // a constraint back is not followed, nor a state merged into this clone
-                if donemap[st!(self, sto).no as usize] != 0 {
-                    a = ar!(self, a).outchain;
-                    continue;
-                }
-
-                // a child clone of sto made already
-                let mut prevclone = NOSTATE;
-                let mut a2 = st!(self, sclone).outs;
-                while a2 != NOARC {
-                    let to2 = ar!(self, a2).to;
-                    if st!(self, to2).tmp == sto {
-                        prevclone = to2;
-                        break;
-                    }
-                    a2 = ar!(self, a2).outchain;
-                }
-
-                // an arc labeled as refarc, or as any arc crossed to reach sclone, is met
-                // already: sto's arcs are merged into sclone
-                let (at, aco) = (ar!(self, a).typ, ar!(self, a).co);
-                let canmerge = if refarc != NOARC
-                    && at == ar!(self, refarc).typ
-                    && aco == ar!(self, refarc).co
-                {
-                    true
-                } else {
-                    let mut found = false;
-                    let mut s = sclone;
-                    while st!(self, s).ins != NOARC {
-                        let ins = st!(self, s).ins;
-                        if st!(self, s).nins == 1
-                            && at == ar!(self, ins).typ
-                            && aco == ar!(self, ins).co
-                        {
-                            found = true;
-                            break;
-                        }
-                        s = ar!(self, ins).from;
-                    }
-                    found
-                };
-
-                if canmerge {
-                    // the child clone, if any, is not needed
-                    if prevclone != NOSTATE {
-                        self.dropstate(nfa, prevclone);
-                    }
+            match self.clonesuccessorstates_arc(nfa, sclone, refarc, a, donemap) {
+                CloneStep::Next => {}
+                CloneStep::Merge(sto) => {
                     // sto's arcs merged into sclone
                     self.clonesuccessorstates(
                         nfa,
@@ -2039,21 +2009,8 @@ impl Vars {
                         outerdonemap,
                         nstates,
                     );
-                } else if prevclone != NOSTATE {
-                    // one more arc to the child clone
-                    self.cparc(nfa, a, sclone, prevclone);
-                } else {
-                    // a new child clone
-                    let stoclone = self.newstate(nfa);
-                    if stoclone == NOSTATE {
-                        break;
-                    }
-                    st!(self, stoclone).tmp = sto;
-                    self.cparc(nfa, a, sclone, stoclone);
                 }
-            } else {
-                // other arcs copied as they are
-                self.cparc(nfa, a, sclone, sto);
+                CloneStep::Stop => break,
             }
             a = ar!(self, a).outchain;
         }
@@ -2080,8 +2037,86 @@ impl Vars {
                 a = ar!(self, a).outchain;
             }
         }
-        self.cstack -= TRAVERSE_FRAME;
-        self.depth -= 1;
+        self.cstack -= F_CLONESUCCESSORSTATES;
+        self.depth -= 2;
+    }
+
+    /// One arc out of a source state of `clonesuccessorstates`: copied to `sclone`, led to a
+    /// child clone, or its target to be merged into `sclone`.
+    #[inline(never)]
+    fn clonesuccessorstates_arc(
+        &mut self,
+        nfa: NfaId,
+        sclone: StateId,
+        refarc: ArcId,
+        a: ArcId,
+        donemap: &[u8],
+    ) -> CloneStep {
+        let sto = ar!(self, a).to;
+        if !(isconstraintarc(&ar!(self, a)) && self.hasconstraintout(sto)) {
+            // other arcs copied as they are
+            self.cparc(nfa, a, sclone, sto);
+            return CloneStep::Next;
+        }
+
+        // a constraint back is not followed, nor a state merged into this clone
+        if donemap[st!(self, sto).no as usize] != 0 {
+            return CloneStep::Next;
+        }
+
+        // a child clone of sto made already
+        let mut prevclone = NOSTATE;
+        let mut a2 = st!(self, sclone).outs;
+        while a2 != NOARC {
+            let to2 = ar!(self, a2).to;
+            if st!(self, to2).tmp == sto {
+                prevclone = to2;
+                break;
+            }
+            a2 = ar!(self, a2).outchain;
+        }
+
+        // an arc labeled as refarc, or as any arc crossed to reach sclone, is met already: sto's
+        // arcs are merged into sclone
+        let (at, aco) = (ar!(self, a).typ, ar!(self, a).co);
+        let canmerge =
+            if refarc != NOARC && at == ar!(self, refarc).typ && aco == ar!(self, refarc).co {
+                true
+            } else {
+                let mut found = false;
+                let mut s = sclone;
+                while st!(self, s).ins != NOARC {
+                    let ins = st!(self, s).ins;
+                    if st!(self, s).nins == 1 && at == ar!(self, ins).typ && aco == ar!(self, ins).co
+                    {
+                        found = true;
+                        break;
+                    }
+                    s = ar!(self, ins).from;
+                }
+                found
+            };
+
+        if canmerge {
+            // the child clone, if any, is not needed
+            if prevclone != NOSTATE {
+                self.dropstate(nfa, prevclone);
+            }
+            CloneStep::Merge(sto)
+        } else if prevclone != NOSTATE {
+            // one more arc to the child clone
+            self.cparc(nfa, a, sclone, prevclone);
+            CloneStep::Next
+        } else {
+            // a new child clone
+            let stoclone = self.newstate(nfa);
+            if stoclone == NOSTATE {
+                return CloneStep::Stop;
+            }
+            st!(self, stoclone).tmp = sto;
+            self.cparc(nfa, a, sclone, stoclone);
+            CloneStep::Next
+        }
     }
 
     /// The CANTMATCH arcs removed, once parsing is done (`removecantmatch`).
@@ -2110,6 +2145,7 @@ impl Vars {
             return;
         }
         let (pre, post) = (self.nfas[nfa].pre, self.nfas[nfa].post);
+        self.cstack += F_CLEANUP;
 
         // reachable from pre marked pre, then those reaching post marked post
         self.markreachable(nfa, pre, NOSTATE, pre);
@@ -2123,6 +2159,7 @@ impl Vars {
             s = nexts;
         }
         self.cleartraverse(nfa, pre);
+        self.cstack -= F_CLEANUP;
 
         // the survivors numbered
         let mut n = 0;
@@ -2139,15 +2176,15 @@ impl Vars {
     /// first on a stack of its own: each level a state and its next arc out.
     fn markreachable(&mut self, _nfa: NfaId, s: StateId, okay: StateId, mark: StateId) {
         let mut frames: Vec<(StateId, ArcId)> = Vec::new();
-        self.mark_enter(&mut frames, s, okay, mark, true);
+        self.mark_enter(&mut frames, s, okay, mark, true, F_MARKREACHABLE);
         while let Some(&(_, a)) = frames.last() {
             if a == NOARC {
-                self.tpop(&mut frames);
+                self.tpop(&mut frames, F_MARKREACHABLE);
                 continue;
             }
             frames.last_mut().expect("a level").1 = ar!(self, a).outchain;
             let to = ar!(self, a).to;
-            self.mark_enter(&mut frames, to, okay, mark, true);
+            self.mark_enter(&mut frames, to, okay, mark, true, F_MARKREACHABLE);
         }
     }
 
@@ -2155,15 +2192,15 @@ impl Vars {
     /// `markreachable` on the arcs in.
     fn markcanreach(&mut self, _nfa: NfaId, s: StateId, okay: StateId, mark: StateId) {
         let mut frames: Vec<(StateId, ArcId)> = Vec::new();
-        self.mark_enter(&mut frames, s, okay, mark, false);
+        self.mark_enter(&mut frames, s, okay, mark, false, F_MARKCANREACH);
         while let Some(&(_, a)) = frames.last() {
             if a == NOARC {
-                self.tpop(&mut frames);
+                self.tpop(&mut frames, F_MARKCANREACH);
                 continue;
             }
             frames.last_mut().expect("a level").1 = ar!(self, a).inchain;
             let from = ar!(self, a).from;
-            self.mark_enter(&mut frames, from, okay, mark, false);
+            self.mark_enter(&mut frames, from, okay, mark, false, F_MARKCANREACH);
         }
     }
 
@@ -2175,8 +2212,9 @@ impl Vars {
         okay: StateId,
         mark: StateId,
         forward: bool,
+        frame: usize,
     ) {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(frame) {
             self.verr(REG_ETOOBIG);
             return;
         }
@@ -2189,7 +2227,7 @@ impl Vars {
         } else {
             st!(self, s).ins
         };
-        self.tpush(frames, (s, first));
+        self.tpush(frames, (s, first), frame);
     }
 
     /// What an optimized NFA shows: that it matches nothing, or can match the empty string; and
@@ -2412,7 +2450,7 @@ impl Vars {
                     }
                 }
                 let f = frames.pop().expect("a level");
-                self.cstack -= TRAVERSE_FRAME;
+                self.cstack -= F_CHECKMATCHALL;
                 haspaths[st!(self, f.s).no as usize] = Some(f.haspath);
                 st!(self, f.s).tmp = NOSTATE;
                 returned = Some(f.result);
@@ -2422,7 +2460,7 @@ impl Vars {
 
     /// One state of `checkmatchall_recurse` entered: false where the stack is too deep.
     fn checkmatchall_enter(&mut self, frames: &mut Vec<MatchallLevel>, s: StateId) -> bool {
-        if self.stack_too_deep() {
+        if self.stack_too_deep(F_CHECKMATCHALL) {
             return false;
         }
         // s being visited
@@ -2437,6 +2475,7 @@ impl Vars {
                 foundloop: false,
                 haspath: vec![false; DUPINF as usize + 2],
             },
+            F_CHECKMATCHALL,
         );
         true
     }
