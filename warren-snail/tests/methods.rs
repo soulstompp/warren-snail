@@ -945,3 +945,42 @@ fn write_and_a_snail_of_format_eight_refuse_an_exclude_by_name() {
         "{e}"
     );
 }
+
+#[cfg(feature = "standalone")]
+#[test]
+fn writers_of_one_exclude_s_strand_take_turns_whatever_blocks_they_write() {
+    use std::time::Duration;
+    let catalog =
+        Catalog::parse("CREATE TABLE s.w (id int PRIMARY KEY, room int, EXCLUDE (room WITH =));")
+            .unwrap();
+    let path = tmp("exclude-turns.snail");
+    write(&path, &catalog, &[]).unwrap();
+    let mut one = Snail::open_writing(&path).unwrap();
+    let rows: Vec<String> = (0..2048).map(|i| format!("({i}, {})", i * 2)).collect();
+    one.execute(&format!(
+        "INSERT INTO s.w (id, room) VALUES {}",
+        rows.join(", ")
+    ))
+    .unwrap();
+    let blocks = blocks_of(&fresh(&path).blocks().unwrap(), "w_room_excl", "room");
+    assert!(blocks.len() >= 2, "{blocks:?}");
+    // The first writer holds a room in the strand's first block; the second writes one in its last,
+    // which no block of the first's holds, and waits for the first all the same.
+    one.execute("BEGIN").unwrap();
+    one.execute("INSERT INTO s.w (id, room) VALUES (5001, 1)")
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let mut two = Snail::open_writing(&p).unwrap();
+        tx.send(
+            two.execute("INSERT INTO s.w (id, room) VALUES (5002, 4095)")
+                .map_err(|e| e.to_string()),
+        )
+        .unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(rx.try_recv().is_err(), "the second writer did not wait");
+    one.execute("COMMIT").unwrap();
+    rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+}
