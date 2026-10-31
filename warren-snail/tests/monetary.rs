@@ -70,13 +70,6 @@ fn shown(b: &RecordBatch, c: usize) -> Vec<Option<String>> {
         .collect()
 }
 
-fn ids(b: &RecordBatch) -> Vec<i64> {
-    weather::ints64(b.column(0).as_ref())
-        .into_iter()
-        .flatten()
-        .collect()
-}
-
 fn some(v: &[&str]) -> Vec<Option<String>> {
     v.iter()
         .map(|s| (!s.is_empty()).then(|| s.to_string()))
@@ -145,6 +138,13 @@ fn a_table_made_on_a_snail_holding_no_money_records_its_money_under_c() {
 #[cfg(feature = "collations")]
 mod under_a_locale {
     use super::*;
+
+    fn ids(b: &RecordBatch) -> Vec<i64> {
+        weather::ints64(b.column(0).as_ref())
+            .into_iter()
+            .flatten()
+            .collect()
+    }
 
     #[test]
     fn money_under_a_locale_prints_as_postgresql_prints_it_under_that_lc_monetary() {
