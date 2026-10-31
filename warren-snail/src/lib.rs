@@ -23,6 +23,8 @@ pub mod lock;
 pub mod numeric;
 pub mod places;
 pub mod read;
+pub mod regex;
+pub mod regexp;
 pub mod regs;
 pub mod scalars;
 pub mod strings;

@@ -688,7 +688,7 @@ fn final_sigma(chars: &[char], at: usize) -> bool {
 }
 
 /// glibc's C.UTF-8, the locale libc's C.utf8 and the database's default map case under.
-fn c_utf8() -> Result<libc::locale_t> {
+pub(crate) fn c_utf8() -> Result<libc::locale_t> {
     static LOCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let at = *LOCALE.get_or_init(|| {
         // SAFETY: newlocale reads the NUL-terminated name and makes a locale of its own.
