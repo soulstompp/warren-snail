@@ -1833,6 +1833,7 @@ pub(super) fn strings(
     let text = |s: String| Value::Text(s);
     // The functions not strict: concat, concat_ws and format pass over NULL, quote_nullable writes
     // it.
+    substring_search(name, casing)?;
     match (name, args) {
         ("concat", a) => {
             return Ok(Some(text(
@@ -2159,6 +2160,27 @@ pub(super) fn strings(
         }
         _ => return Ok(None),
     }))
+}
+
+/// Refuses a search for a substring under a nondeterministic collation: starts_with as PostgreSQL
+/// refuses it, the searches PostgreSQL makes there substring by substring under the collation
+/// (strpos, POSITION, replace, split_part) as not read yet.
+pub(super) fn substring_search(name: &str, casing: crate::catalog::Casing) -> Result<()> {
+    let crate::catalog::Casing::Library(id) = casing else {
+        return Ok(());
+    };
+    if crate::collations::get(id).spec.deterministic {
+        return Ok(());
+    }
+    match name {
+        "starts_with" => Err(Error::new(
+            "nondeterministic collations are not supported for substring searches",
+        )),
+        "strpos" | "position" | "replace" | "split_part" => Err(Error::new(format!(
+            "{name} under a nondeterministic collation is not read yet"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// `POSITION(sub IN s)`: where the substring first begins, counted from 1, 0 where it does not

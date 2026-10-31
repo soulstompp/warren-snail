@@ -778,7 +778,11 @@ mod library {
         let mut buf = vec![0u8; s.len() + 16];
         loop {
             let mut status = U_ZERO_ERROR;
-            let n = f(buf.as_mut_ptr() as *mut c_char, buf.len() as i32, &mut status) as usize;
+            let n = f(
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as i32,
+                &mut status,
+            ) as usize;
             if status == U_BUFFER_OVERFLOW_ERROR || n > buf.len() {
                 buf.resize(n + 1, 0);
                 continue;

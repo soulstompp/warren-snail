@@ -2888,7 +2888,14 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             super::calls::strings("substr", &args, Casing::Libc)?
                 .ok_or_else(|| Error::new(format!("{e} is not read")))?
         }
-        Expr::Position { expr, r#in } => super::calls::position(ev(r#in)?, ev(expr)?)?,
+        Expr::Position { expr, r#in } => {
+            // Under the collation either side names, else the one the string carries.
+            let explicit = [&**r#in, &**expr].into_iter().find(|x| names_collate(x));
+            if let Some(casing) = frame.casings.implicit(explicit.unwrap_or(r#in))? {
+                super::calls::substring_search("position", casing)?;
+            }
+            super::calls::position(ev(r#in)?, ev(expr)?)?
+        }
         Expr::Trim {
             expr,
             trim_where,
@@ -2988,7 +2995,8 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     {
                         return Ok(v);
                     }
-                    let casing = match a.first() {
+                    // Under the collation an argument names, else the one the first carries.
+                    let casing = match a.iter().find(|x| names_collate(x)).or(a.first()) {
                         Some(x) => frame.casings.implicit(x)?.unwrap_or(Casing::Libc),
                         None => Casing::Libc,
                     };

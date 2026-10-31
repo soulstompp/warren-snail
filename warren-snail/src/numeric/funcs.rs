@@ -1,7 +1,7 @@
 //! numeric's functions as `numeric.c` computes them: on a finite number held in base-10000
 //! digits, as PostgreSQL holds one while it computes (`NumericVar`), each step at the scale
 //! `numeric.c` gives it.
-#![allow(clippy::approx_constant)]
+#![allow(clippy::approx_constant, clippy::manual_clamp)]
 
 use super::{division_by_zero, overflow, Nat, Numeric, Repr};
 use crate::{Error, Result};

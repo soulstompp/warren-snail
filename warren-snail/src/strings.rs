@@ -605,14 +605,21 @@ pub fn bits_key_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Opt
 }
 
 /// PostgreSQL 19's own Unicode case tables (`cases.txt`, written by inner-warren's `cases.nu` from
-/// its source): each code point's simple lower and upper case, the full mappings, and the code
-/// points Unicode calls Cased and Case_Ignorable.
+/// its source): each code point's simple lower and upper case, its simple title case and folding,
+/// the full mappings, the code points Unicode calls Cased and Case_Ignorable, and those it calls
+/// Alphabetic and a decimal digit.
 struct Cases {
     simple: std::collections::HashMap<u32, (u32, u32)>,
+    /// A code point's simple title case and folding.
+    titled: std::collections::HashMap<u32, (u32, u32)>,
     /// A code point's full lower and upper case, and whether it is mapped so only as a final sigma.
     special: std::collections::HashMap<u32, (bool, Vec<u32>, Vec<u32>)>,
+    /// A code point's full title case and folding, where `special` maps it.
+    special_titled: std::collections::HashMap<u32, (Vec<u32>, Vec<u32>)>,
     cased: Vec<(u32, u32)>,
     ignorable: Vec<(u32, u32)>,
+    alphabetic: Vec<(u32, u32)>,
+    digit: Vec<(u32, u32)>,
 }
 
 fn cases() -> &'static Cases {
@@ -623,9 +630,13 @@ fn cases() -> &'static Cases {
             |s: &str| -> Vec<u32> { s.split(',').filter(|x| !x.is_empty()).map(hex).collect() };
         let mut c = Cases {
             simple: Default::default(),
+            titled: Default::default(),
             special: Default::default(),
+            special_titled: Default::default(),
             cased: Vec::new(),
             ignorable: Vec::new(),
+            alphabetic: Vec::new(),
+            digit: Vec::new(),
         };
         let mut section = "";
         for line in include_str!("cases.txt").lines() {
@@ -637,17 +648,25 @@ fn cases() -> &'static Cases {
             match section {
                 "map" => {
                     c.simple.insert(hex(f[0]), (hex(f[1]), hex(f[2])));
+                    c.titled.insert(hex(f[0]), (hex(f[3]), hex(f[4])));
                 }
                 "special" => {
                     let lower = cps(f.get(2).copied().unwrap_or_default());
                     let upper = cps(f.get(3).copied().unwrap_or_default());
                     c.special.insert(hex(f[0]), (f[1] == "1", lower, upper));
+                    let title = cps(f.get(4).copied().unwrap_or_default());
+                    let fold = cps(f.get(5).copied().unwrap_or_default());
+                    c.special_titled.insert(hex(f[0]), (title, fold));
                 }
                 "cased" => c.cased.push((hex(f[0]), hex(f[1]))),
-                _ => c.ignorable.push((hex(f[0]), hex(f[1]))),
+                "ignorable" => c.ignorable.push((hex(f[0]), hex(f[1]))),
+                "alphabetic" => c.alphabetic.push((hex(f[0]), hex(f[1]))),
+                _ => c.digit.push((hex(f[0]), hex(f[1]))),
             }
         }
         c.ignorable.sort();
+        c.alphabetic.sort();
+        c.digit.sort();
         c
     })
 }
@@ -1020,8 +1039,8 @@ extern "C" {
 /// A text with each word's first letter in upper case and the rest in lower, as PostgreSQL's
 /// initcap makes it under a collation that maps case as `casing`: a word a run of letters and
 /// digits, read after each character is mapped; ASCII's letters alone, glibc's C.UTF-8 a
-/// character to a character, or a library collation as its library titles text. Under
-/// PostgreSQL's own Unicode tables it is not read yet.
+/// character to a character, a library collation as its library titles text, or PostgreSQL's own
+/// Unicode tables as its builtin provider titles.
 pub fn title(s: &str, casing: crate::catalog::Casing) -> Result<String> {
     use crate::catalog::Casing;
     let mut was_alnum = false;
@@ -1057,23 +1076,90 @@ pub fn title(s: &str, casing: crate::catalog::Casing) -> Result<String> {
                 .collect())
         }
         Casing::Library(id) => crate::collations::get(id).title(s),
-        Casing::Simple | Casing::Full => Err(Error::new(
-            "initcap under PostgreSQL's own Unicode tables (pg_c_utf8, pg_unicode_fast) is not read yet",
-        )),
+        Casing::Simple | Casing::Full => Ok(unicode_title_fold(s, true, casing == Casing::Full)),
     }
+}
+
+/// Whether a code point lies in one of the sorted ranges.
+fn in_sorted(ranges: &[(u32, u32)], cp: u32) -> bool {
+    let at = ranges.partition_point(|&(_, hi)| hi < cp);
+    ranges.get(at).is_some_and(|&(lo, _)| lo <= cp)
+}
+
+/// A text titled, as initcap titles it under PostgreSQL's own Unicode tables, or else folded, as
+/// casefold folds it there; in full under pg_unicode_fast, a character to a character under
+/// pg_c_utf8. A word begins wherever a character is a letter or digit and the one before it is not,
+/// or the other way round, read on the text as given: Alphabetic or a decimal digit, the digits
+/// ASCII's alone under pg_c_utf8. A word's first character takes its title case (its upper case
+/// under pg_c_utf8), every other its lower.
+fn unicode_title_fold(s: &str, title: bool, full: bool) -> String {
+    let c = cases();
+    let chars: Vec<char> = s.chars().collect();
+    let alnum = |cp: u32| {
+        in_sorted(&c.alphabetic, cp)
+            || if full {
+                in_sorted(&c.digit, cp)
+            } else {
+                (0x30..=0x39).contains(&cp)
+            }
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut prev: Option<bool> = None;
+    for (at, &ch) in chars.iter().enumerate() {
+        let cp = ch as u32;
+        // 0 lower, 1 upper, 2 title, 3 fold.
+        let kind = if title {
+            let a = alnum(cp);
+            let starts = prev != Some(a);
+            prev = Some(a);
+            match (starts, full) {
+                (false, _) => 0,
+                (true, true) => 2,
+                (true, false) => 1,
+            }
+        } else {
+            3
+        };
+        if full && cp >= 0x80 {
+            if let (Some((sigma, lower, upper)), Some((titled, folded))) =
+                (c.special.get(&cp), c.special_titled.get(&cp))
+            {
+                if !sigma || final_sigma(&chars, at) {
+                    let to = match kind {
+                        0 => lower,
+                        1 => upper,
+                        2 => titled,
+                        _ => folded,
+                    };
+                    out.extend(to.iter().filter_map(|&x| char::from_u32(x)));
+                    continue;
+                }
+            }
+        }
+        let to = match kind {
+            0 | 1 => c
+                .simple
+                .get(&cp)
+                .map_or(cp, |&(lo, up)| if kind == 1 { up } else { lo }),
+            _ => c
+                .titled
+                .get(&cp)
+                .map_or(cp, |&(t, f)| if kind == 2 { t } else { f }),
+        };
+        out.push(char::from_u32(to).unwrap_or(ch));
+    }
+    out
 }
 
 /// A text case folded, as PostgreSQL's casefold folds it under a collation that maps case as
 /// `casing`: ASCII's letters and glibc's C.UTF-8 to lower case, a library collation as its library
-/// folds. Under PostgreSQL's own Unicode tables it is not read yet.
+/// folds, PostgreSQL's own Unicode tables as its builtin provider folds.
 pub fn fold(s: &str, casing: crate::catalog::Casing) -> Result<String> {
     use crate::catalog::Casing;
     match casing {
         Casing::Ascii | Casing::Libc => case(s, false, casing),
         Casing::Library(id) => crate::collations::get(id).fold(s),
-        Casing::Simple | Casing::Full => Err(Error::new(
-            "casefold under PostgreSQL's own Unicode tables (pg_c_utf8, pg_unicode_fast) is not read yet",
-        )),
+        Casing::Simple | Casing::Full => Ok(unicode_title_fold(s, false, casing == Casing::Full)),
     }
 }
 

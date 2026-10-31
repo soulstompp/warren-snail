@@ -394,8 +394,8 @@ pub fn encode(b: &[u8], format: &str) -> Result<String> {
             let url = f == Format::Base64Url;
             let alphabet = if url { BASE64URL } else { BASE64 };
             let mut line = 0;
-            let mut chunks = b.chunks_exact(3);
-            for c in chunks.by_ref() {
+            let (chunks, rest) = b.as_chunks::<3>();
+            for c in chunks {
                 let buf = u32::from(c[0]) << 16 | u32::from(c[1]) << 8 | u32::from(c[2]);
                 for shift in [18, 12, 6, 0] {
                     out.push(alphabet[((buf >> shift) & 0x3f) as usize] as char);
@@ -406,7 +406,6 @@ pub fn encode(b: &[u8], format: &str) -> Result<String> {
                     line = 0;
                 }
             }
-            let rest = chunks.remainder();
             if !rest.is_empty() {
                 let buf = u32::from(rest[0]) << 16 | rest.get(1).map_or(0, |&x| u32::from(x) << 8);
                 out.push(alphabet[((buf >> 18) & 0x3f) as usize] as char);

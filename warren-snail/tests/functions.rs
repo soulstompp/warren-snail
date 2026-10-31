@@ -647,3 +647,402 @@ fn the_formatting_functions_write_and_read_as_postgresql_s() {
         );
     }
 }
+
+#[cfg(feature = "standalone")]
+/// The texts initcap and casefold are asked of under each collation.
+const CASED: [&str; 7] = [
+    "hello wORLD-foo 1st",
+    "ǆemal ǅ ǲ straße ΣΑΣ ὈΔΥΣΣΕΎΣ",
+    "ijssel İstanbul ıi",
+    "ŉ ǰ ﬀ ﬃx",
+    "٣abc ३x 2nd",
+    "o'neil x.y_z",
+    "ΌΣΟΣ σ",
+];
+
+#[cfg(feature = "standalone")]
+/// initcap and casefold of each of `CASED` under each collation named, against PostgreSQL 19's.
+fn cased_under(name: &str, want: &[(&str, &str, [&str; 7])]) {
+    let values: Vec<String> = CASED
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("({}, '{}')", i + 1, v.replace('\'', "''")))
+        .collect();
+    let insert = format!("INSERT INTO s.t VALUES {}", values.join(", "));
+    let mut snail = snail_of(
+        name,
+        "CREATE TABLE s.t (id integer NOT NULL, v text, PRIMARY KEY (id));",
+        &[&insert],
+    );
+    for (collation, f, rows) in want {
+        let q = format!(
+            "WITH t AS (SELECT id, v FROM s.t) SELECT id, {f}(v COLLATE \"{collation}\") AS x FROM t \
+             ORDER BY id"
+        );
+        let (b, _) = snail.ask(&q, None).unwrap();
+        let got = texts(&b, 1);
+        let want: Vec<Option<String>> = rows.iter().map(|r| Some(r.to_string())).collect();
+        assert_eq!(got, want, "{f} under {collation}");
+    }
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn initcap_and_casefold_map_case_under_each_collation_s_own_rules() {
+    // PostgreSQL 19's answers.
+    cased_under(
+        "cased",
+        &[
+            (
+                "C",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "ǆEmal ǅ ǲ StraßE ΣΑΣ ὈΔΥΣΣΕΎΣ",
+                    "Ijssel İStanbul ıI",
+                    "ŉ ǰ ﬀ ﬃX",
+                    "٣Abc ३X 2nd",
+                    "O'Neil X.Y_Z",
+                    "ΌΣΟΣ σ",
+                ],
+            ),
+            (
+                "C",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǅ ǲ straße ΣΑΣ ὈΔΥΣΣΕΎΣ",
+                    "ijssel İstanbul ıi",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "ΌΣΟΣ σ",
+                ],
+            ),
+            (
+                "ucs_basic",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "ǆEmal ǅ ǲ StraßE ΣΑΣ ὈΔΥΣΣΕΎΣ",
+                    "Ijssel İStanbul ıI",
+                    "ŉ ǰ ﬀ ﬃX",
+                    "٣Abc ३X 2nd",
+                    "O'Neil X.Y_Z",
+                    "ΌΣΟΣ σ",
+                ],
+            ),
+            (
+                "ucs_basic",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǅ ǲ straße ΣΑΣ ὈΔΥΣΣΕΎΣ",
+                    "ijssel İstanbul ıi",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "ΌΣΟΣ σ",
+                ],
+            ),
+            (
+                "pg_c_utf8",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "Ǆemal Ǆ Ǳ Straße Σασ Ὀδυσσεύσ",
+                    "Ijssel İstanbul Ii",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣Abc ३X 2nd",
+                    "O'Neil X.Y_Z",
+                    "Όσοσ Σ",
+                ],
+            ),
+            (
+                "pg_c_utf8",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǆ ǳ straße σασ ὀδυσσεύσ",
+                    "ijssel İstanbul ıi",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "όσοσ σ",
+                ],
+            ),
+            (
+                "pg_unicode_fast",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "ǅemal ǅ ǲ Straße Σας Ὀδυσσεύς",
+                    "Ijssel İstanbul Ii",
+                    "ʼN J̌ Ff Ffix",
+                    "٣abc ३x 2nd",
+                    "O'Neil X.Y_Z",
+                    "Όσος Σ",
+                ],
+            ),
+            (
+                "pg_unicode_fast",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǆ ǳ strasse σασ ὀδυσσεύσ",
+                    "ijssel i̇stanbul ıi",
+                    "ʼn ǰ ff ffix",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "όσοσ σ",
+                ],
+            ),
+            (
+                "C.utf8",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "Ǆemal Ǆ Ǳ Straße Σασ Ὀδυσσεύσ",
+                    "Ijssel İstanbul Ii",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣abc ३x 2nd",
+                    "O'Neil X.Y_Z",
+                    "Όσοσ Σ",
+                ],
+            ),
+        ],
+    );
+}
+
+#[test]
+#[cfg(all(feature = "standalone", feature = "collations"))]
+fn initcap_and_casefold_map_case_under_each_library_collation() {
+    // PostgreSQL 19's answers.
+    cased_under(
+        "cased-library",
+        &[
+            (
+                "C.utf8",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǆ ǳ straße σασ ὀδυσσεύσ",
+                    "ijssel istanbul ıi",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "όσοσ σ",
+                ],
+            ),
+            (
+                "en-x-icu",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "ǅemal ǅ ǲ Straße Σας Ὀδυσσεύς",
+                    "Ijssel İstanbul Ii",
+                    "ʼN J̌ Ff Ffix",
+                    "٣abc ३x 2nd",
+                    "O'neil X.y_z",
+                    "Όσος Σ",
+                ],
+            ),
+            (
+                "en-x-icu",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǆ ǳ strasse σασ ὀδυσσεύσ",
+                    "ijssel i̇stanbul ıi",
+                    "ʼn ǰ ff ffix",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "όσοσ σ",
+                ],
+            ),
+            (
+                "nl-x-icu",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "ǅemal ǅ ǲ Straße Σας Ὀδυσσεύς",
+                    "IJssel İstanbul Ii",
+                    "ʼN J̌ Ff Ffix",
+                    "٣abc ३x 2nd",
+                    "O'neil X.y_z",
+                    "Όσος Σ",
+                ],
+            ),
+            (
+                "nl-x-icu",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǆ ǳ strasse σασ ὀδυσσεύσ",
+                    "ijssel i̇stanbul ıi",
+                    "ʼn ǰ ff ffix",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "όσοσ σ",
+                ],
+            ),
+            (
+                "tr-x-icu",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "ǅemal ǅ ǲ Straße Σας Ὀδυσσεύς",
+                    "İjssel İstanbul Ii",
+                    "ʼN J̌ Ff Ffix",
+                    "٣abc ३x 2nd",
+                    "O'neil X.y_z",
+                    "Όσος Σ",
+                ],
+            ),
+            (
+                "tr-x-icu",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǆ ǳ strasse σασ ὀδυσσεύσ",
+                    "ijssel istanbul ıi",
+                    "ʼn ǰ ff ffix",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "όσοσ σ",
+                ],
+            ),
+            (
+                "en_US.utf8",
+                "initcap",
+                [
+                    "Hello World-Foo 1st",
+                    "Ǆemal Ǆ Ǳ Straße Σασ Ὀδυσσεύσ",
+                    "Ijssel İstanbul Ii",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣abc ३x 2nd",
+                    "O'Neil X.Y_Z",
+                    "Όσοσ Σ",
+                ],
+            ),
+            (
+                "en_US.utf8",
+                "casefold",
+                [
+                    "hello world-foo 1st",
+                    "ǆemal ǆ ǳ straße σασ ὀδυσσεύσ",
+                    "ijssel istanbul ıi",
+                    "ŉ ǰ ﬀ ﬃx",
+                    "٣abc ३x 2nd",
+                    "o'neil x.y_z",
+                    "όσοσ σ",
+                ],
+            ),
+        ],
+    );
+}
+
+#[test]
+#[cfg(all(feature = "standalone", feature = "collations"))]
+fn a_substring_search_under_a_nondeterministic_collation_is_refused() {
+    let mut snail = snail_of(
+        "nondeterministic",
+        "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
+         deterministic = false); \
+         CREATE TABLE s.t (id integer NOT NULL, v text COLLATE s.ci, PRIMARY KEY (id));",
+        &["INSERT INTO s.t VALUES (1, 'xABC')"],
+    );
+    let ask = |snail: &mut Snail, e: &str| {
+        let q = format!("WITH t AS (SELECT id, v FROM s.t) SELECT ({e})::text AS x FROM t");
+        snail.ask(&q, None).map(|(b, _)| texts(&b, 0).remove(0))
+    };
+    // PostgreSQL 19's own refusal.
+    assert_eq!(
+        ask(&mut snail, "starts_with(v, 'x')")
+            .unwrap_err()
+            .to_string(),
+        "nondeterministic collations are not supported for substring searches"
+    );
+    for (e, name) in [
+        ("strpos(v, 'b')", "strpos"),
+        ("position('b' IN v)", "position"),
+        ("replace(v, 'b', 'X')", "replace"),
+        ("split_part(v, 'b', 2)", "split_part"),
+    ] {
+        assert_eq!(
+            ask(&mut snail, e).unwrap_err().to_string(),
+            format!("{name} under a nondeterministic collation is not read yet"),
+            "{e}"
+        );
+    }
+    // Under a deterministic collation the search reads, PostgreSQL 19's answer.
+    assert_eq!(
+        ask(&mut snail, "strpos(v COLLATE \"C\", 'B')")
+            .unwrap()
+            .as_deref(),
+        Some("3")
+    );
+}
+
+#[test]
+#[cfg(all(feature = "standalone", feature = "collations"))]
+fn the_aggregates_and_windows_compare_strings_under_their_collation() {
+    let mut snail = snail_of(
+        "collated-folds",
+        "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
+         deterministic = false); \
+         CREATE TABLE s.t (id integer NOT NULL, v text COLLATE s.ci, w text COLLATE \"en-x-icu\", \
+         PRIMARY KEY (id));",
+        &[
+            "INSERT INTO s.t VALUES (1, 'a', 'b'), (2, 'A', 'B'), (3, 'b', 'a'), (4, 'B', 'A'), \
+           (5, 'ab', '_c'), (6, 'AB', 'C'), (7, 'c', 'c')",
+        ],
+    );
+    let mut rows = |select: &str| -> Vec<Vec<Option<String>>> {
+        let q = format!("WITH t AS (SELECT id, v, w FROM s.t) {select}");
+        let (b, _) = snail.ask(&q, None).unwrap();
+        (0..b.num_rows())
+            .map(|r| {
+                (0..b.num_columns())
+                    .map(|c| {
+                        let a =
+                            arrow::compute::cast(b.column(c), &arrow::datatypes::DataType::Utf8)
+                                .unwrap();
+                        let a = a.as_string::<i32>();
+                        (!a.is_null(r)).then(|| a.value(r).to_string())
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let s = |x: &str| Some(x.to_string());
+    // PostgreSQL 19's answers.
+    assert_eq!(
+        rows(
+            "SELECT count(DISTINCT v)::text AS a, count(DISTINCT w)::text AS b, \
+             string_agg(w, ',' ORDER BY w) AS c, string_agg(v, ',' ORDER BY v DESC, id) AS d, \
+             percentile_disc(0.5) WITHIN GROUP (ORDER BY w) AS e, \
+             string_agg(DISTINCT w, ',') AS f FROM t"
+        ),
+        [[
+            s("4"),
+            s("7"),
+            s("_c,a,A,b,B,c,C"),
+            s("c,b,B,ab,AB,a,A"),
+            s("b"),
+            s("_c,a,A,b,B,c,C")
+        ]]
+    );
+    let counts: Vec<Option<String>> =
+        rows("SELECT id, (count(*) OVER (PARTITION BY v))::text AS c FROM t ORDER BY id")
+            .into_iter()
+            .map(|r| r[1].clone())
+            .collect();
+    assert_eq!(counts, ["2", "2", "2", "2", "2", "2", "1"].map(s));
+    let ranks: Vec<Option<String>> =
+        rows("SELECT id, (rank() OVER (PARTITION BY v ORDER BY id))::text AS c FROM t ORDER BY id")
+            .into_iter()
+            .map(|r| r[1].clone())
+            .collect();
+    assert_eq!(ranks, ["1", "2", "1", "2", "1", "2", "1"].map(s));
+}
