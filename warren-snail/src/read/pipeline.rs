@@ -4646,7 +4646,7 @@ struct Prepared<'q> {
     order_by: Option<&'q sqlparser::ast::OrderBy>,
     items: Vec<(&'q Expr, String)>,
     calls: Calls<'q>,
-    grouping: &'q [Expr],
+    grouping: Vec<&'q Expr>,
     grouped: bool,
     /// Whether it returns each row once (SELECT DISTINCT).
     distinct: bool,
@@ -4708,6 +4708,82 @@ impl Prepared<'_> {
     }
 }
 
+/// The position in the select list a GROUP BY or ORDER BY item names, counted from 0, as
+/// PostgreSQL's parser reads one: an integer constant, written with its minus or in parentheses,
+/// names the item at that place, and any other constant is refused. None where it is an
+/// expression.
+fn ordinal(e: &Expr, clause: &str, items: usize) -> Result<Option<usize>> {
+    let text = match e {
+        Expr::Nested(x) => return ordinal(x, clause, items),
+        Expr::Value(v) => match &v.value {
+            SqlValue::Placeholder(_) => return Ok(None),
+            SqlValue::Number(s, _) => s.clone(),
+            _ => String::new(),
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(v) => match &v.value {
+                SqlValue::Number(s, _) => format!("-{s}"),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let Ok(n) = text.parse::<i32>() else {
+        return Err(Error::new(format!("non-integer constant in {clause}")));
+    };
+    match usize::try_from(n) {
+        Ok(at) if (1..=items).contains(&at) => Ok(Some(at - 1)),
+        _ => Err(Error::new(format!(
+            "{clause} position {n} is not in select list"
+        ))),
+    }
+}
+
+/// What a GROUP BY item groups by, as PostgreSQL's parser reads it: an ordinal the select list's
+/// item at that place, where it holds no aggregate; a bare name no column of the FROM bears the
+/// select list's item of that name; any other an expression over the FROM's columns.
+fn grouped_by<'q>(
+    g: &'q Expr,
+    items: &[(&'q Expr, String)],
+    columns: &[super::typed::TypedColumn],
+) -> Result<&'q Expr> {
+    let named = match ordinal(g, "GROUP BY", items.len())? {
+        Some(at) => Some(items[at].0),
+        None => match g {
+            Expr::Identifier(i) if !columns.iter().any(|(_, n, _)| *n == ident(i)) => {
+                let name = ident(i);
+                let mut found = items.iter().filter(|(_, n)| *n == name).map(|(e, _)| *e);
+                let first = found.next();
+                if let Some(e) = first {
+                    if found.any(|other| other != e) {
+                        return Err(Error::new(format!("GROUP BY \"{name}\" is ambiguous")));
+                    }
+                }
+                first
+            }
+            _ => None,
+        },
+    };
+    let Some(e) = named else {
+        return Ok(g);
+    };
+    let mut calls = Calls::default();
+    find_calls(e, &mut calls);
+    if !calls.aggregates.is_empty() {
+        return Err(Error::new(
+            "aggregate functions are not allowed in GROUP BY",
+        ));
+    }
+    if !calls.windows.is_empty() {
+        return Err(Error::new("window functions are not allowed in GROUP BY"));
+    }
+    Ok(e)
+}
+
 /// A step read before any row: its parts, each expression typed over the columns its FROM reads.
 fn prepare<'q>(
     q: &'q Query,
@@ -4748,7 +4824,11 @@ fn prepare<'q>(
         GroupByExpr::Expressions(g, m) if m.is_empty() => g.as_slice(),
         _ => return Err(Error::new("GROUP BY ALL is not read")),
     };
-    if grouping.iter().any(holds_set) {
+    let grouping = grouping
+        .iter()
+        .map(|g| grouped_by(g, &items, columns))
+        .collect::<Result<Vec<&Expr>>>()?;
+    if grouping.iter().any(|g| holds_set(g)) {
         return Err(Error::new(
             "a set-returning function in GROUP BY is not read",
         ));
@@ -4770,7 +4850,7 @@ fn prepare<'q>(
     if let Some(w) = s.selection.as_ref() {
         typing.type_of(w)?;
     }
-    for g in grouping {
+    for g in &grouping {
         typing.type_of(g)?;
     }
     Ok(Prepared {
@@ -5123,10 +5203,21 @@ fn sort(
         types: &types,
         now: super::change::wall_micros(),
     };
+    // An ordinal names the column at that place.
+    let at = exprs
+        .iter()
+        .map(|o| ordinal(&o.expr, "ORDER BY", out.names.len()))
+        .collect::<Result<Vec<_>>>()?;
     // A string sorted under a library collation is sorted by the collation's key.
     let under = exprs
         .iter()
-        .map(|o| casings.ordering(&o.expr))
+        .zip(&at)
+        .map(|(o, at)| match at {
+            Some(c) => casings.ordering(&Expr::Identifier(sqlparser::ast::Ident::new(
+                out.names[*c].clone(),
+            ))),
+            None => casings.ordering(&o.expr),
+        })
         .collect::<Result<Vec<_>>>()?;
     let none = computed_none();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = std::mem::take(&mut out.rows)
@@ -5136,11 +5227,16 @@ fn sort(
                 .iter()
                 .enumerate()
                 .map(|(i, o)| {
-                    let e = match column_of(&o.expr) {
-                        Some((_, n)) => Expr::Identifier(sqlparser::ast::Ident::new(n)),
-                        None => o.expr.clone(),
+                    let v = match at[i] {
+                        Some(c) => row[c].clone(),
+                        None => {
+                            let e = match column_of(&o.expr) {
+                                Some((_, n)) => Expr::Identifier(sqlparser::ast::Ident::new(n)),
+                                None => o.expr.clone(),
+                            };
+                            eval(&e, &row, &named, &none)?
+                        }
                     };
-                    let v = eval(&e, &row, &named, &none)?;
                     match v {
                         Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
                             if !ty.ordered() =>

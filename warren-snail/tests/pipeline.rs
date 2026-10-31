@@ -252,3 +252,68 @@ fn a_row_of_bytes_and_a_numeric_is_updated_and_deleted() {
     assert_eq!(got.len(), 399);
     assert_eq!(got, want);
 }
+
+#[test]
+fn a_step_s_ordinal_names_the_select_list_s_column() {
+    let s = sample(5_000);
+    let path = snail("pipeline-ordinal", &s);
+    let mut snail = Snail::open(&path).unwrap();
+    let step = "WITH f AS (SELECT r.feed AS feed, r.station_no AS n FROM weather.readings r)";
+    let (plain, _) = snail
+        .ask(
+            "SELECT r.feed, count(*) FROM weather.readings r GROUP BY r.feed",
+            None,
+        )
+        .unwrap();
+    assert_eq!(plain.num_rows(), FEEDS.len());
+    for q in [
+        "SELECT feed, count(*) FROM f GROUP BY 1",
+        "SELECT feed, count(*) FROM f GROUP BY (1)",
+        "SELECT feed AS g, count(*) FROM f GROUP BY g",
+    ] {
+        let (b, _) = snail.ask(&format!("{step} {q}"), None).unwrap();
+        assert_eq!(bag(&b), bag(&plain), "{q}");
+    }
+    let (by_name, _) = snail
+        .ask(
+            &format!("{step} SELECT feed, n FROM f ORDER BY feed DESC, n"),
+            None,
+        )
+        .unwrap();
+    let (by_place, _) = snail
+        .ask(
+            &format!("{step} SELECT feed, n FROM f ORDER BY 1 DESC, 2"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(by_place, by_name);
+    for (q, refused) in [
+        (
+            "SELECT feed, count(*) FROM f GROUP BY 2",
+            "aggregate functions are not allowed in GROUP BY",
+        ),
+        (
+            "SELECT feed, count(*) FROM f GROUP BY 0",
+            "GROUP BY position 0 is not in select list",
+        ),
+        (
+            "SELECT feed, count(*) FROM f GROUP BY 'a'",
+            "non-integer constant in GROUP BY",
+        ),
+        (
+            "SELECT feed, n FROM f ORDER BY 3",
+            "ORDER BY position 3 is not in select list",
+        ),
+        (
+            "SELECT feed, n FROM f ORDER BY -1",
+            "ORDER BY position -1 is not in select list",
+        ),
+        (
+            "SELECT feed, n FROM f ORDER BY 1.5",
+            "non-integer constant in ORDER BY",
+        ),
+    ] {
+        let e = snail.ask(&format!("{step} {q}"), None).unwrap_err();
+        assert_eq!(e.to_string(), refused, "{q}");
+    }
+}
