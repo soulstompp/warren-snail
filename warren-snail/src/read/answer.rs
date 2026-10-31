@@ -1229,11 +1229,7 @@ impl Answer {
                         ColumnType::Numeric { precision, scale },
                         Item::Key(_) | Item::Least(_) | Item::Greatest(_),
                     ) => (
-                        Arc::new(
-                            units()
-                                .collect::<Decimal128Array>()
-                                .with_precision_and_scale(precision, scale as i8)?,
-                        ),
+                        crate::numeric::decimal_array(precision, scale, units())?,
                         crate::numeric::numeric_field(name, ty, nullable),
                     ),
                     _ => (

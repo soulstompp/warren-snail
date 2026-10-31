@@ -1883,6 +1883,16 @@ fn grouped(ty: ColumnType, d: &Datum) -> Tree {
                 int(unsigned_key(u64::from(o), 16)),
             ])
         }
+        // A numeric's decimal, 0 where it is NaN, and whether it is NaN.
+        (ColumnType::Numeric { precision, .. }, Datum::Int(_) | Datum::Wide(_)) => {
+            let nan = d.wide() == Some(crate::numeric::nan_units(precision));
+            let value = match d {
+                _ if nan && precision > 18 => Datum::Wide(0),
+                _ if nan => Datum::Int(0),
+                d => d.clone(),
+            };
+            Tree::Group(vec![Tree::Leaf(value), int(i64::from(nan))])
+        }
         (ColumnType::Timetz(_), Datum::Int(k)) => {
             let (t, z) = crate::scalars::timetz_parts(*k);
             Tree::Group(vec![int(t), int(i64::from(z))])
@@ -1965,6 +1975,13 @@ fn ungrouped(ty: ColumnType, parts: &[Tree]) -> Option<Datum> {
         ),
         (ColumnType::Timetz(_), [Leaf(Datum::Int(t)), Leaf(Datum::Int(z))]) => {
             Datum::Int(crate::scalars::timetz_key(*t, *z as i32))
+        }
+        (ColumnType::Numeric { precision, .. }, [Leaf(value), Leaf(Datum::Int(nan))]) => {
+            match (*nan == 1, precision > 18) {
+                (true, true) => Datum::Wide(crate::numeric::nan_units(precision)),
+                (true, false) => Datum::Int(crate::numeric::nan_units(precision) as i64),
+                (false, _) => value.clone(),
+            }
         }
         (
             ColumnType::Interval { .. },

@@ -8,7 +8,7 @@
 
 mod weather;
 
-use arrow::array::{Array, RecordBatch, TimestampMicrosecondArray};
+use arrow::array::{Array, RecordBatch, StructArray, TimestampMicrosecondArray};
 use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
 use weather::{tmp, write};
@@ -32,7 +32,8 @@ fn refused(w: &mut Snail, sql: &str, why: &str) {
     assert!(e.contains(why), "{sql}: {e}");
 }
 
-/// An answer's rows, each cell as arrow writes it, NULL as none, sorted.
+/// An answer's rows, each cell as arrow writes it, a numeric(p, s) its decimal or NaN, NULL as
+/// none, sorted.
 fn rows(s: &mut Snail, sql: &str) -> Vec<Vec<Option<String>>> {
     let (b, _): (RecordBatch, _) = s.ask(sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let mut out: Vec<Vec<Option<String>>> = (0..b.num_rows())
@@ -40,8 +41,16 @@ fn rows(s: &mut Snail, sql: &str) -> Vec<Vec<Option<String>>> {
             b.columns()
                 .iter()
                 .map(|a| {
-                    (!a.is_null(r))
-                        .then(|| arrow::util::display::array_value_to_string(a, r).unwrap())
+                    (!a.is_null(r)).then(|| match a.as_any().downcast_ref::<StructArray>() {
+                        Some(g) if warren_snail::numeric::decimal_type(a.data_type()).is_some() => {
+                            match warren_snail::numeric::decimal_at(a.as_ref(), r) {
+                                Some((None, _, _)) => "NaN".to_string(),
+                                _ => arrow::util::display::array_value_to_string(g.column(0), r)
+                                    .unwrap(),
+                            }
+                        }
+                        _ => arrow::util::display::array_value_to_string(a, r).unwrap(),
+                    })
                 })
                 .collect()
         })

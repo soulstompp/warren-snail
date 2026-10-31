@@ -36,7 +36,7 @@ mod walk;
 pub use across::{Snails, StopAcross};
 pub use change::Done;
 pub use level::{LevelCounts, PlaceRows};
-pub use out::{TableOut, DDL_KEY, MONETARY_KEY, NAN_KEY, RELEASE_KEY};
+pub use out::{TableOut, DDL_KEY, MONETARY_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 pub use point::Point;
 pub use together::{answer_together, at_one_moment, price_together, Priced, TablePrice};
@@ -63,9 +63,13 @@ use walk::{condition_columns, next_down, ruled_out, Plan, Sink, Want};
 /// `shared_buffers`.
 pub const HELD_BYTES: usize = 128 << 20;
 
-/// A catalog as a snail of `format` names its orders: 0.1.x, formats 7 and 8, named a primary key's
-/// order for its table, whatever its constraint was named.
+/// A catalog as a snail of `format` holds its tables: their columns as the format's leaves, and
+/// their orders as it names them: 0.1.x, formats 7 and 8, named a primary key's order for its
+/// table, whatever its constraint was named.
 pub(crate) fn old_names(catalog: &mut Catalog, format: u32) {
+    for t in &mut catalog.tables {
+        t.format = format;
+    }
     if format >= 9 {
         return;
     }

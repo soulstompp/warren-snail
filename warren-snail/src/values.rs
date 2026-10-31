@@ -431,6 +431,29 @@ impl Values {
                     .map(|n| Values::Nested(Box::new(n)))
                     .collect()
             }
+            // A numeric's decimal, 0 where it is NaN, and whether it is NaN.
+            (ColumnType::Numeric { precision, .. }, Values::Int(v)) => {
+                let nan = crate::numeric::nan_units(precision) as i64;
+                vec![
+                    Values::Int(
+                        v.iter()
+                            .map(|x| x.map(|x| if x == nan { 0 } else { x }))
+                            .collect(),
+                    ),
+                    Values::Int(v.iter().map(|x| x.map(|x| i64::from(x == nan))).collect()),
+                ]
+            }
+            (ColumnType::Numeric { precision, .. }, Values::Wide(v)) => {
+                let nan = crate::numeric::nan_units(precision);
+                vec![
+                    Values::Wide(
+                        v.iter()
+                            .map(|x| x.map(|x| if x == nan { 0 } else { x }))
+                            .collect(),
+                    ),
+                    Values::Int(v.iter().map(|x| x.map(|x| i64::from(x == nan))).collect()),
+                ]
+            }
             // A timetz's time and zone, each as it is.
             (ColumnType::Timetz(_), Values::Int(v)) => {
                 let parts: Vec<Option<(i64, i32)>> = v
@@ -552,6 +575,26 @@ impl Values {
                     push_datum(&mut v, &d);
                 }
                 v
+            }
+            (ColumnType::Numeric { precision, .. }, [Values::Int(units), Values::Int(nans)]) => {
+                let nan = crate::numeric::nan_units(precision) as i64;
+                Values::Int(
+                    units
+                        .iter()
+                        .zip(nans)
+                        .map(|(u, n)| if (*n)? == 1 { Some(nan) } else { *u })
+                        .collect(),
+                )
+            }
+            (ColumnType::Numeric { precision, .. }, [Values::Wide(units), Values::Int(nans)]) => {
+                let nan = crate::numeric::nan_units(precision);
+                Values::Wide(
+                    units
+                        .iter()
+                        .zip(nans)
+                        .map(|(u, n)| if (*n)? == 1 { Some(nan) } else { *u })
+                        .collect(),
+                )
             }
             (ColumnType::Timetz(_), [Values::Int(times), Values::Int(zones)]) => Values::Int(
                 times

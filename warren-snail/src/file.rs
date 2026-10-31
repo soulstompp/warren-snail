@@ -16,7 +16,7 @@ use std::rc::Rc;
 const MAGIC: [u8; 8] = *b"wsnail\0\x01";
 /// The format a snail is made in, and the two before it, each read and written as it is: format 8,
 /// 0.1.1's, and format 7, 0.1.0's, whose page maps each lie in pages of their own.
-const FORMAT: u32 = 9;
+pub(crate) const FORMAT: u32 = 9;
 pub(crate) const FORMAT_EIGHT: u32 = 8;
 pub(crate) const FORMAT_SEVEN: u32 = 7;
 
@@ -122,8 +122,13 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
         )));
     }
     // Formats 7 and 8 hold a column as one leaf.
-    if let Some(c) = table.columns.iter().find(|c| c.ty.leaf_count() > 1) {
-        let leaves: Vec<String> = c.ty.leaves().iter().map(|l| l.name(&c.name)).collect();
+    if let Some(i) = (0..table.columns.len()).find(|&i| table.leaf_count(i) > 1) {
+        let c = &table.columns[i];
+        let leaves: Vec<String> = table
+            .column_leaves(i)
+            .iter()
+            .map(|l| l.name(&c.name))
+            .collect();
         return Err(crate::Error::new(format!(
             "{}.{} is {}, a group of {} leaves, {}, {way}",
             table.name,

@@ -33,36 +33,6 @@ pub const RELEASE_KEY: &str = "warren-snail.release";
 /// written under, which `write` takes.
 pub const MONETARY_KEY: &str = "warren-snail.lc_monetary";
 
-/// The key under which a file out of a table names each numeric column holding a NaN, and the
-/// integer that stands for it: a line a column, its name, a tab, and the integer.
-pub const NAN_KEY: &str = "warren-snail.nan";
-
-/// The numeric columns of a table whose blocks hold a NaN, each with the integer that stands for it
-/// on its pages, as `NAN_KEY` names them; none where no column holds one.
-fn nan_columns(
-    table: &Table,
-    order: &crate::catalog::Order,
-    blocks: &[crate::directory::Entry],
-) -> Option<String> {
-    let lines: Vec<String> = table
-        .columns
-        .iter()
-        .enumerate()
-        .filter_map(|(c, col)| {
-            let ColumnType::Numeric { precision, .. } = col.ty else {
-                return None;
-            };
-            let nan = crate::numeric::nan_units(precision);
-            let s = order.leaf_slot(table, c)?;
-            blocks
-                .iter()
-                .any(|e| e.columns[s].nulls < e.rows && e.columns[s].max == nan)
-                .then(|| format!("{}\t{nan}", col.name))
-        })
-        .collect();
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
 /// The key under which a file out names the columns holding an extreme kept for a value its page
 /// form has no value of its own for: an infinity, or a time's 24:00:00. A reader reads each as the
 /// number it lies as.
@@ -437,7 +407,7 @@ impl Snail {
                 ))
             })?;
             let mut types = Vec::new();
-            for (leaf, s) in col.ty.leaves().into_iter().zip(slots) {
+            for (leaf, s) in table.column_leaves(c).into_iter().zip(slots) {
                 let desc = leaf_descriptor(&col.name, &leaf, !col.not_null)?;
                 types.push(desc.self_type_ptr());
                 leaves.push((c, leaf, desc, s));
@@ -485,8 +455,8 @@ impl Snail {
                 }
                 // A composed level sorts on its key, which no leaf's order in the file is.
                 Level::Column(c) if matches!(table.columns[*c].ty, ColumnType::Composed(_)) => None,
-                Level::Column(c) => Some(
-                    leaves
+                Level::Column(c) => {
+                    let mut on: Vec<SortingColumn> = leaves
                         .iter()
                         .enumerate()
                         .filter(|(_, x)| x.0 == *c)
@@ -495,8 +465,14 @@ impl Snail {
                             descending: false,
                             nulls_first: false,
                         })
-                        .collect::<Vec<_>>(),
-                ),
+                        .collect();
+                    // A numeric's NaN lies after its numbers: its rows sort on whether it is NaN,
+                    // then on its decimal.
+                    if table.may_hold_nan(*c) {
+                        on.reverse();
+                    }
+                    Some(on)
+                }
                 Level::MonthUtc(_) => None,
             })
             .collect::<Option<Vec<_>>>()
@@ -521,10 +497,6 @@ impl Snail {
                         .iter()
                         .any(|c| c.ty.holds_money())
                         .then(|| KeyValue::new(MONETARY_KEY.to_string(), table.monetary.name())),
-                )
-                .chain(
-                    nan_columns(table, order, &blocks)
-                        .map(|v| KeyValue::new(NAN_KEY.to_string(), v)),
                 )
                 .chain(
                     (!held_extremes.is_empty())

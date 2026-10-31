@@ -3733,6 +3733,7 @@ impl Draft {
                         release: crate::regs::LATEST,
                         foreign_keys: Vec::new(),
                         monetary: crate::monetary::Monetary::C,
+                        format: crate::file::FORMAT,
                     }],
                     functions: self.functions.clone(),
                     types: self.types.clone(),
@@ -4073,6 +4074,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         release: crate::regs::LATEST,
         foreign_keys: d.foreign_keys.clone(),
         monetary: crate::monetary::Monetary::C,
+        format: crate::file::FORMAT,
     })
 }
 

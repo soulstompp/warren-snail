@@ -16,9 +16,9 @@ use crate::places::{level_key, month_of, null_key, KeyValue, Keys, Sublevels};
 use crate::values::Values;
 use crate::{Error, Result};
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, StringViewArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use parquet::data_type::ByteArray;
@@ -343,24 +343,22 @@ impl Rows {
                         let a = a.as_any().downcast_ref::<BinaryViewArray>().unwrap();
                         out.extend(a.iter().map(|v| v.map(|b| ByteArray::from(b.to_vec()))));
                     }
+                    // A numeric(p, s): the group of its decimal and whether it is NaN, as `out`
+                    // writes it, or a decimal alone, as another writer gives one.
                     (
                         Values::Int(_) | Values::Wide(_),
                         ColumnType::Numeric { precision, scale },
-                        DataType::Decimal128(p, s),
-                    ) => {
-                        let a = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                        dt,
+                    ) if crate::numeric::decimal_type(dt).is_some() => {
                         let limit = 10i128.pow(precision as u32);
-                        for v in a.iter() {
-                            let units = match v {
+                        for r in 0..a.len() {
+                            let units = match crate::numeric::decimal_at(a.as_ref(), r) {
                                 None => None,
-                                // NaN, at the greatest integer its page form holds.
-                                Some(x) if x == crate::numeric::nan_units(*p) => {
-                                    Some(crate::numeric::nan_units(precision))
-                                }
+                                Some((None, _, _)) => Some(crate::numeric::nan_units(precision)),
                                 // A value at a scale finer than the column's is refused unless
                                 // its extra digits are zeros.
-                                Some(x) => Some(
-                                    crate::numeric::Numeric::of_units(x, *s as u32)
+                                Some((Some(x), _, s)) => Some(
+                                    crate::numeric::Numeric::of_units(x, s as u32)
                                         .units_at(u32::from(scale))
                                         .filter(|u| u.abs() < limit)
                                         .ok_or_else(|| {
@@ -1219,8 +1217,8 @@ pub(crate) fn laid_out(
     let sublevels = Sublevels::new(order, table, &text_sublevels);
     let mut widths = Widths(Vec::new());
     for &c in &order.columns {
-        let ty = table.columns[c].ty;
-        for (leaf, values) in ty.leaves().iter().zip(leaf_values(ty, &rows.columns[c])) {
+        let leaves = table.column_leaves(c);
+        for (leaf, values) in leaves.iter().zip(leaf_values(table, c, &rows.columns[c])) {
             widths.0.push(width(leaf, &values, &perm));
         }
     }
@@ -1234,14 +1232,19 @@ pub(crate) fn laid_out(
     })
 }
 
-/// A column's values as each of its leaves holds them: the column's own where it is one leaf.
-pub(crate) fn leaf_values(ty: ColumnType, values: &Values) -> Vec<std::borrow::Cow<'_, Values>> {
-    if !ty.is_group() {
+/// A column's values as each of the leaves its table holds it as holds them: the column's own where
+/// it is one leaf.
+pub(crate) fn leaf_values<'a>(
+    table: &Table,
+    column: usize,
+    values: &'a Values,
+) -> Vec<std::borrow::Cow<'a, Values>> {
+    if !table.is_group(column) {
         vec![std::borrow::Cow::Borrowed(values)]
     } else {
         values
             .clone()
-            .into_leaves(ty)
+            .into_leaves(table.columns[column].ty)
             .into_iter()
             .map(std::borrow::Cow::Owned)
             .collect()
@@ -1561,7 +1564,7 @@ fn write_order(
         .iter()
         .flat_map(|&c| {
             let first = table.first_leaf(c);
-            first..first + table.columns[c].ty.leaf_count()
+            first..first + table.leaf_count(c)
         })
         .collect();
     for b in &blocks {
@@ -1675,12 +1678,10 @@ pub(crate) fn write_block(
             crate::spans::of_rows(table.columns[c].ty, &rows.columns[c], &perm[b.start..b.end])
         })
         .collect();
-    let block_leaves = order.columns.iter().flat_map(|&c| {
-        let ty = table.columns[c].ty;
-        rows.columns[c]
-            .gather(&perm[b.start..b.end])
-            .into_leaves(ty)
-    });
+    let block_leaves = order
+        .columns
+        .iter()
+        .flat_map(|&c| table.split_leaves(c, rows.columns[c].gather(&perm[b.start..b.end])));
     for (s, ((_, leaf), values)) in leaves.iter().zip(block_leaves).enumerate() {
         let present: Vec<i64> = values
             .ints()

@@ -736,7 +736,7 @@ impl Snail {
             let mut groups: Vec<usize> = Vec::new();
             for (s, _) in &br.reads {
                 let c = leaves[*s].0;
-                if table.columns[c].ty.is_group() && !groups.contains(&c) {
+                if table.is_group(c) && !groups.contains(&c) {
                     groups.push(c);
                 }
             }
@@ -1427,7 +1427,13 @@ fn summary_of(table: &Table, order: &Order, c: &Cond, e: &Entry) -> (Summary, us
     let key = |pick: fn(&Summary) -> i128| {
         let parts = leaves
             .iter()
-            .map(|s| Values::Int(vec![Some(pick(s) as i64)]))
+            .map(|s| {
+                if s.wide {
+                    Values::Wide(vec![Some(pick(s))])
+                } else {
+                    Values::Int(vec![Some(pick(s) as i64)])
+                }
+            })
             .collect();
         Values::from_leaves(ty, parts).wide(0).unwrap_or(0)
     };

@@ -5885,15 +5885,18 @@ pub fn relation_of(batch: &arrow::array::RecordBatch) -> Result<Relation> {
                             .unwrap()
                             .value(r),
                     ),
-                    A::Decimal128(p, s) => {
-                        let m = any.downcast_ref::<Decimal128Array>().unwrap().value(r);
-                        // NaN is a numeric column's greatest integer its page form holds.
-                        if numeric && m == crate::numeric::nan_units(*p) {
-                            Value::Numeric(Numeric::NAN)
-                        } else {
-                            Value::Num(m, *s as u32)
+                    A::Decimal128(_, s) => Value::Num(
+                        any.downcast_ref::<Decimal128Array>().unwrap().value(r),
+                        *s as u32,
+                    ),
+                    // A numeric(p, s), its decimal and whether it is NaN.
+                    A::Struct(_) if numeric => match crate::numeric::decimal_at(a.as_ref(), r) {
+                        Some((Some(m), _, s)) => Value::Num(m, s as u32),
+                        Some((None, _, _)) => Value::Numeric(Numeric::NAN),
+                        None => {
+                            return Err(Error::new(format!("{} is not of its type", field.name())))
                         }
-                    }
+                    },
                     A::Utf8 if numeric => Value::of_numeric(Numeric::parse(
                         any.downcast_ref::<StringArray>().unwrap().value(r),
                     )?),

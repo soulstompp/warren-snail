@@ -33,8 +33,8 @@ use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, leaf_descriptors, write_block, Laid, Rows};
 use crate::{Error, Result};
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use parquet::data_type::ByteArray;
 use std::collections::BTreeMap;
@@ -209,10 +209,11 @@ pub(super) fn push(v: &mut Values, d: &Datum) {
     }
 }
 
-/// A value of a column of type `ty` as each of its leaves holds it: the value itself where the
-/// column is one leaf.
-fn leaf_datums(ty: ColumnType, d: &Datum) -> Vec<Datum> {
-    if ty.leaf_count() == 1 && !ty.is_nested() {
+/// A value of a table's column as each of the leaves it is held as holds it: the value itself
+/// where the column is one leaf.
+fn leaf_datums(table: &Table, column: usize, d: &Datum) -> Vec<Datum> {
+    let ty = table.columns[column].ty;
+    if !table.is_group(column) {
         return vec![d.clone()];
     }
     // A composed value whole, for each of its leaves, each striped from it where it is written; a
@@ -352,13 +353,14 @@ pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
                 Datum::Float8(x.value(r).to_bits())
             } else if let Some(x) = any.downcast_ref::<StringArray>() {
                 Datum::Text(x.value(r).to_string())
-            } else if let Some(x) = any.downcast_ref::<Decimal128Array>() {
-                // A numeric column's answer is its smallest units, at the column's own scale: in
-                // 64 bits up to 18 digits, past them in 128.
-                if x.precision() > 18 {
-                    Datum::Wide(x.value(r))
+            } else if let Some((m, p, _)) = crate::numeric::decimal_at(a.as_ref(), r) {
+                // A numeric column's answer is its smallest units, at the column's own scale, NaN
+                // at its key: in 64 bits up to 18 digits, past them in 128.
+                let units = m.unwrap_or_else(|| crate::numeric::nan_units(p));
+                if p > 18 {
+                    Datum::Wide(units)
                 } else {
-                    Datum::Int(x.value(r) as i64)
+                    Datum::Int(units as i64)
                 }
             } else if let Some(x) = any.downcast_ref::<BinaryArray>() {
                 Datum::Bytes(x.value(r).to_vec())
@@ -392,7 +394,10 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
         A::FixedSizeBinary(16) => ColumnType::Uuid,
         A::Float32 => ColumnType::Float4,
         A::Float64 => ColumnType::Float8,
-        A::Decimal128(p, s) => ColumnType::numeric(Some((u32::from(*p), i32::from(*s)))),
+        A::Decimal128(..) | A::Struct(_) if crate::numeric::decimal_type(dt).is_some() => {
+            let (p, s) = crate::numeric::decimal_type(dt).unwrap();
+            ColumnType::numeric(Some((u32::from(p), i32::from(s))))
+        }
         other => {
             return Err(Error::new(format!(
                 "an answer of {other} is not read back as a row"
@@ -2342,7 +2347,7 @@ impl Snail {
                 .columns
                 .iter()
                 .zip(values)
-                .flat_map(|(&c, d)| leaf_datums(table.columns[c].ty, d))
+                .flat_map(|(&c, d)| leaf_datums(table, c, d))
                 .collect()
         };
         let added_leaves: Vec<Vec<Datum>> = added.iter().map(|(_, r)| in_leaves(r)).collect();

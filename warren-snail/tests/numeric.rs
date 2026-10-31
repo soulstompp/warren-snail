@@ -1,12 +1,13 @@
 //! numeric past 18 digits: from 19 to 38 held as the integer of its smallest unit in 128 bits and cut
 //! by its decimal digits, any other held as its text and keyed on its class; NaN in a numeric(p, s)
-//! as 10^p on its pages, named by `out`; formats 7 and 8 refusing what 0.1.x cannot read.
+//! on a kind leaf beside its decimal; formats 7 and 8 holding its decimal alone and refusing what
+//! 0.1.x cannot read.
 
 mod weather;
 
-use arrow::array::{Array, Decimal128Array, StringArray};
+use arrow::array::{Array, StringArray};
 use warren_snail::catalog::Catalog;
-use warren_snail::read::{BlockRow, Snail, NAN_KEY};
+use warren_snail::read::{BlockRow, Snail};
 use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{tmp, write};
@@ -25,10 +26,10 @@ fn texts(a: &dyn Array) -> Vec<Option<String>> {
         .collect()
 }
 
-fn decimals(a: &dyn Array) -> Vec<Option<i128>> {
-    let a = a.as_any().downcast_ref::<Decimal128Array>().unwrap();
+/// Each row of an answer's numeric(p, s): its integer, none where it is NaN; none at all for NULL.
+fn decimals(a: &dyn Array) -> Vec<Option<Option<i128>>> {
     (0..a.len())
-        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .map(|i| warren_snail::numeric::decimal_at(a, i).map(|(m, _, _)| m))
         .collect()
 }
 
@@ -49,7 +50,7 @@ fn a_numeric_of_19_to_38_digits_is_cut_by_its_decimal_digits() {
     write(&path, &catalog, &[("s.k".into(), rows)]).unwrap();
     let mut s = Snail::open(&path).unwrap();
     let blocks = s.blocks().unwrap();
-    assert_eq!(blocks_of(&blocks, "k_pkey", "v"), [1000; 10]);
+    assert_eq!(blocks_of(&blocks, "k_pkey", "v.value"), [1000; 10]);
     // A question on one thousand reads its block alone.
     let (b, round) = s
         .ask(
@@ -61,7 +62,7 @@ fn a_numeric_of_19_to_38_digits_is_cut_by_its_decimal_digits() {
     assert_eq!(round.blocks_read, 1);
     assert_eq!(
         decimals(b.column(0).as_ref())[0],
-        Some(-2000 * step),
+        Some(Some(-2000 * step)),
         "the block's first number"
     );
 }
@@ -143,11 +144,13 @@ fn a_numeric_held_as_its_text_is_cut_by_its_class_and_answers_its_own_text() {
 
 #[test]
 #[cfg(feature = "standalone")]
-fn nan_lies_on_a_numeric_s_pages_as_10_to_its_precision_and_out_names_it() {
+fn nan_lies_on_a_kind_leaf_beside_a_numeric_s_decimal() {
+    use arrow::array::Decimal128Array;
     let path = tmp("numeric-nan.snail");
     let catalog = Catalog::parse(
         "CREATE TABLE s.n (id integer NOT NULL, a numeric(5,2), w numeric(30,2), \
-         PRIMARY KEY (id));",
+         PRIMARY KEY (id)); \
+         CREATE TABLE s.k (v numeric(5,2) NOT NULL, PRIMARY KEY (v));",
     )
     .unwrap();
     let rows = Rows {
@@ -162,13 +165,52 @@ fn nan_lies_on_a_numeric_s_pages_as_10_to_its_precision_and_out_names_it() {
             ]),
         ],
     };
-    write(&path, &catalog, &[("s.n".into(), rows)]).unwrap();
+    let keys = Rows {
+        columns: vec![Values::Int(vec![Some(-1), Some(100_000), Some(1)])],
+    };
+    write(
+        &path,
+        &catalog,
+        &[("s.n".into(), rows), ("s.k".into(), keys)],
+    )
+    .unwrap();
     let mut s = Snail::open_writing(&path).unwrap();
     let (b, _) = s.ask("SELECT id, a, w FROM s.n ORDER BY id", None).unwrap();
     assert_eq!(
         decimals(b.column(1).as_ref()),
-        [Some(150), Some(100_000), None, Some(-99_999)]
+        [Some(Some(150)), Some(None), None, Some(Some(-99_999))]
     );
+    // NaN's decimal is 0, no number past the column's digits.
+    let group = b
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    assert_eq!(decimals(group.column(0).as_ref())[1], Some(Some(0)));
+    // The answer's column is what arrow's Parquet reader gives its page form, the group of its
+    // decimal and its kind.
+    let fields = |a: &dyn Array| match a.data_type() {
+        arrow::datatypes::DataType::Struct(f) => f
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect::<Vec<_>>(),
+        other => panic!("{other} is no group"),
+    };
+    assert_eq!(
+        fields(b.column(1).as_ref()),
+        [
+            ("value".into(), arrow::datatypes::DataType::Decimal128(5, 2)),
+            ("nan".into(), arrow::datatypes::DataType::Boolean)
+        ]
+    );
+    let leaves: Vec<String> = s
+        .blocks()
+        .unwrap()
+        .iter()
+        .filter(|r| r.order == "n_pkey")
+        .map(|r| r.column.clone())
+        .collect();
+    assert_eq!(leaves, ["id", "a.value", "a.nan", "w.value", "w.nan"]);
     // NaN above +Infinity, and every number below it.
     let (b, _) = s
         .ask("SELECT id FROM s.n WHERE a > 'Infinity'", None)
@@ -189,7 +231,7 @@ fn nan_lies_on_a_numeric_s_pages_as_10_to_its_precision_and_out_names_it() {
     let (b, _) = s
         .ask("SELECT max(w) AS m, sum(a) AS s FROM s.n", None)
         .unwrap();
-    assert_eq!(decimals(b.column(0).as_ref()), [Some(10i128.pow(30))]);
+    assert_eq!(decimals(b.column(0).as_ref()), [Some(None)]);
     assert_eq!(texts(b.column(1).as_ref()), [Some("NaN".into())]);
 
     let dir = tmp("numeric-nan-parquet");
@@ -201,42 +243,65 @@ fn nan_lies_on_a_numeric_s_pages_as_10_to_its_precision_and_out_names_it() {
         parquet::file::reader::SerializedFileReader::new(std::fs::File::open(file).unwrap())
             .unwrap();
     let meta = parquet::file::reader::FileReader::metadata(&reader).clone();
-    let named = meta
+    assert!(!meta
         .file_metadata()
         .key_value_metadata()
         .unwrap()
         .iter()
-        .find(|k| k.key == NAN_KEY)
-        .and_then(|k| k.value.clone())
-        .unwrap();
-    assert_eq!(
-        named,
-        format!("a\t100000\nw\t{}", 10i128.pow(30)),
-        "each column holding a NaN, and its integer"
-    );
+        .any(|k| k.key == "warren-snail.nan"));
     let schema = meta.file_metadata().schema_descr();
+    let leaf = |i: usize| {
+        let c = schema.column(i);
+        (c.path().string(), c.physical_type(), c.max_def_level())
+    };
+    use parquet::basic::Type as P;
+    assert_eq!(
+        (1..5).map(leaf).collect::<Vec<_>>(),
+        [
+            ("a.value".into(), P::INT64, 1),
+            ("a.nan".into(), P::BOOLEAN, 1),
+            ("w.value".into(), P::FIXED_LEN_BYTE_ARRAY, 1),
+            ("w.nan".into(), P::BOOLEAN, 1)
+        ]
+    );
+    assert_eq!(schema.column(3).type_length(), 13);
+    // A decimal's least and greatest, signed as Parquet orders it, NaN's 0 among them; and its
+    // kind's.
+    let stats = |i: usize| meta.row_group(0).column(i).statistics().unwrap().clone();
     assert_eq!(
         (
-            schema.column(1).physical_type(),
-            schema.column(2).physical_type()
+            stats(3).min_bytes_opt().unwrap(),
+            stats(3).max_bytes_opt().unwrap()
         ),
         (
-            parquet::basic::Type::INT64,
-            parquet::basic::Type::FIXED_LEN_BYTE_ARRAY
+            &(-(10i128.pow(30) - 1)).to_be_bytes()[3..],
+            &12_345i128.to_be_bytes()[3..]
         )
     );
-    assert_eq!(schema.column(2).type_length(), 13);
-    // A decimal's least and greatest, signed as Parquet orders it.
-    let w = meta.row_group(0).column(2).statistics().unwrap();
     assert_eq!(
-        (w.min_bytes_opt().unwrap(), w.max_bytes_opt().unwrap()),
-        (
-            &(-(10i128.pow(30) - 1)).to_be_bytes()[3..],
-            &10i128.pow(30).to_be_bytes()[3..]
-        )
+        (stats(4).min_bytes_opt(), stats(4).max_bytes_opt()),
+        (Some(&[0u8][..]), Some(&[1u8][..]))
+    );
+    // A level of a numeric sorts on its kind, then its decimal.
+    let keyed = &outs.iter().find(|t| t.table == "s.k").unwrap().file;
+    let reader =
+        parquet::file::reader::SerializedFileReader::new(std::fs::File::open(keyed).unwrap())
+            .unwrap();
+    let on: Vec<i32> = parquet::file::reader::FileReader::metadata(&reader)
+        .row_group(0)
+        .sorting_columns()
+        .unwrap()
+        .iter()
+        .map(|c| c.column_idx)
+        .collect();
+    assert_eq!(on, [1, 0]);
+    // arrow's reader reads the page form as the answer's type.
+    let (batches, _) = weather::parquet_of(file);
+    assert_eq!(
+        fields(batches[0].column_by_name("a").unwrap().as_ref()),
+        fields(b_of(&mut s).column(1).as_ref())
     );
     // Back by write, NaN NaN again.
-    let (batches, _) = weather::parquet_of(file);
     let table = catalog.table("s.n").unwrap();
     let back = tmp("numeric-nan-back.snail");
     write(
@@ -247,9 +312,129 @@ fn nan_lies_on_a_numeric_s_pages_as_10_to_its_precision_and_out_names_it() {
     .unwrap();
     let (b, _) = Snail::open(&back)
         .unwrap()
-        .ask("SELECT id FROM s.n WHERE w = 'NaN'", None)
+        .ask(
+            "WITH n AS (SELECT id, a, w FROM s.n) SELECT id FROM n WHERE w = 'NaN' OR a = 'NaN' ORDER BY id",
+            None,
+        )
         .unwrap();
-    assert_eq!(weather::ints64(b.column(0).as_ref()), [Some(0)]);
+    assert_eq!(weather::ints64(b.column(0).as_ref()), [Some(0), Some(1)]);
+    // A decimal alone, as another writer gives one, holds numbers: one past the column's digits
+    // is no numeric(5,2).
+    let plain = |v: i128| {
+        arrow::array::RecordBatch::try_from_iter([(
+            "v",
+            std::sync::Arc::new(
+                Decimal128Array::from(vec![v])
+                    .with_precision_and_scale(5, 2)
+                    .unwrap(),
+            ) as arrow::array::ArrayRef,
+        )])
+        .unwrap()
+    };
+    let k = catalog.table("s.k").unwrap();
+    let Values::Int(v) = &Rows::from_batches(k, &[plain(99_999)]).unwrap().columns[0] else {
+        panic!("a numeric(5,2) is held as its integer")
+    };
+    assert_eq!(v, &[Some(99_999)]);
+    let e = Rows::from_batches(k, &[plain(100_000)])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(e.contains("a value is no numeric(5,2)"), "{e}");
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn nan_in_an_array_or_a_composite_lies_on_its_element_s_kind_leaf() {
+    let path = tmp("numeric-nan-composed.snail");
+    let catalog = Catalog::parse(
+        "CREATE TYPE s.priced AS (a integer, n numeric(5,2)); \
+         CREATE TABLE s.r (id integer NOT NULL, p s.priced, a numeric(5,2)[], w numeric(30,2)[], \
+         PRIMARY KEY (id));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.r (id, p, a, w) VALUES (1, '(1,NaN)', '{NaN,1.005}', '{NaN,1}'), \
+         (2, '(2,1.005)', '{}', '{}'), (3, NULL, NULL, NULL), \
+         (4, '(,NaN)', '{NULL,NaN}', '{{NaN,2},{3,NaN}}')",
+    )
+    .unwrap();
+    let asked = "WITH t AS (SELECT id, p, a, w FROM s.r) SELECT id, p::text AS p, a::text AS a, \
+                 w::text AS w, (p).n::text AS n FROM t ORDER BY id";
+    // Each as PostgreSQL 18.6 printed it on 28818 (2026-10-31).
+    let want = vec![
+        vec![
+            Some("1".to_string()),
+            Some("(1,NaN)".into()),
+            Some("{NaN,1.01}".into()),
+            Some("{NaN,1.00}".into()),
+            Some("NaN".into()),
+        ],
+        vec![
+            Some("2".into()),
+            Some("(2,1.01)".into()),
+            Some("{}".into()),
+            Some("{}".into()),
+            Some("1.01".into()),
+        ],
+        vec![Some("3".into()), None, None, None, None],
+        vec![
+            Some("4".into()),
+            Some("(,NaN)".into()),
+            Some("{NULL,NaN}".into()),
+            Some("{{NaN,2.00},{3.00,NaN}}".into()),
+            Some("NaN".into()),
+        ],
+    ];
+    assert_eq!(row_texts(&w.ask(asked, None).unwrap().0), want);
+    // Out, each element its decimal and its kind, and back by write.
+    let dir = tmp("numeric-nan-composed-parquet");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = w.out(&dir).unwrap()[0].file.clone();
+    let reader =
+        parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&file).unwrap())
+            .unwrap();
+    let leaves: Vec<String> = parquet::file::reader::FileReader::metadata(&reader)
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|c| c.path().string())
+        .filter(|p| p.ends_with(".value") || p.ends_with(".nan"))
+        .collect();
+    assert_eq!(
+        leaves,
+        [
+            "p.n.value",
+            "p.n.nan",
+            "a.elements.list.element.value",
+            "a.elements.list.element.nan",
+            "w.elements.list.element.value",
+            "w.elements.list.element.nan"
+        ]
+    );
+    let (batches, _) = weather::parquet_of(&file);
+    let back = tmp("numeric-nan-composed-back.snail");
+    write(
+        &back,
+        &catalog,
+        &[(
+            "s.r".into(),
+            Rows::from_batches(catalog.table("s.r").unwrap(), &batches).unwrap(),
+        )],
+    )
+    .unwrap();
+    let (b, _) = Snail::open(&back).unwrap().ask(asked, None).unwrap();
+    assert_eq!(row_texts(&b), want);
+}
+
+/// The answer whose column 1 is `s.n`'s `a`.
+#[cfg(feature = "standalone")]
+fn b_of(s: &mut Snail) -> arrow::array::RecordBatch {
+    s.ask("SELECT id, a FROM s.n ORDER BY id", None).unwrap().0
 }
 
 #[test]
@@ -353,6 +538,37 @@ fn a_snail_of_format_eight_refuses_a_numeric_past_18_digits_and_a_nan_by_name() 
         .unwrap_err()
         .to_string();
     assert!(e.contains("holds NaN"), "{e}");
+    // A numeric(p, s) of format 8 is its decimal alone, one leaf, as 0.1.1 wrote it, before and
+    // after a write; out puts it out so.
+    w.execute("INSERT INTO s.k (id, v) VALUES (3, -2.25)")
+        .unwrap();
+    let leaves: Vec<String> = w
+        .blocks()
+        .unwrap()
+        .iter()
+        .map(|r| r.column.clone())
+        .collect();
+    assert_eq!(leaves, ["id", "v"]);
+    let (b, _) = w.ask("SELECT id, v FROM s.k ORDER BY id", None).unwrap();
+    assert_eq!(
+        decimals(b.column(1).as_ref()),
+        [Some(Some(150)), Some(Some(-225))]
+    );
+    let dir = tmp("numeric-eight-parquet");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = w.out(&dir).unwrap()[0].file.clone();
+    let reader =
+        parquet::file::reader::SerializedFileReader::new(std::fs::File::open(file).unwrap())
+            .unwrap();
+    let schema = parquet::file::reader::FileReader::metadata(&reader)
+        .file_metadata()
+        .schema_descr_ptr();
+    assert_eq!(schema.num_columns(), 2);
+    assert_eq!(schema.column(1).path().string(), "v");
+    drop(w);
+    let r = Snail::open(&path).unwrap();
+    assert_eq!(r.blocks().unwrap().len(), 2);
 }
 
 /// Each row's values as text: a decimal at its scale, text as it is.

@@ -100,6 +100,83 @@ fn money_under_c_and_posix_reads_and_prints_as_dollars_and_cents_in_every_build(
 }
 
 #[test]
+fn out_names_c_and_write_takes_it_against_a_flag_naming_another() {
+    use warren_snail::read::MONETARY_KEY;
+    use warren_snail::write::{settled, write_parquet, Named};
+    let path = snail_under("money-c-out", "C").unwrap();
+    let dir = tmp("money-c-parquet");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = Snail::open(&path).unwrap().out(&dir).unwrap()[0]
+        .file
+        .clone();
+    let reader =
+        parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&file).unwrap())
+            .unwrap();
+    let named = parquet::file::reader::FileReader::metadata(&reader)
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap()
+        .iter()
+        .find(|k| k.key == MONETARY_KEY)
+        .and_then(|k| k.value.clone());
+    assert_eq!(named.as_deref(), Some("C"));
+    let catalog = Catalog::parse(DDL).unwrap();
+    let given = [("s.t".to_string(), file)];
+    let e = write_parquet(
+        &tmp("money-c-gb.snail"),
+        &catalog,
+        &given,
+        span(),
+        None,
+        Some("en_GB.utf8"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("--lc-monetary en_GB.utf8") && e.contains("names the lc_monetary C"),
+        "{e}"
+    );
+    // POSIX is C.
+    let back = tmp("money-c-posix-back.snail");
+    write_parquet(&back, &catalog, &given, span(), None, Some("POSIX")).unwrap();
+    assert_eq!(Snail::open(&back).unwrap().monetary()[0].2, "C");
+    // Two tables' files naming two releases, or two locales, are refused by name.
+    let of = |release: Option<u8>, lc: Option<&str>| {
+        let mut n = Named::default();
+        n.release = release;
+        n.lc_monetary = lc.map(str::to_string);
+        n
+    };
+    let e = settled(
+        &[
+            ("s.a".into(), of(Some(18), None)),
+            ("s.b".into(), of(Some(19), None)),
+        ],
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("a snail's OIDs come from one release"), "{e}");
+    let e = settled(
+        &[
+            ("s.a".into(), of(None, Some("C"))),
+            ("s.b".into(), of(None, Some("en_GB.utf8"))),
+        ],
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("the snail answers under one"), "{e}");
+    assert_eq!(
+        settled(&[("s.a".into(), of(None, None))], None, None).unwrap(),
+        (19, None)
+    );
+}
+
+#[test]
 #[cfg(not(feature = "collations"))]
 fn money_under_another_locale_is_refused_by_name_without_the_feature() {
     let e = snail_under("money-gb-unbuilt", "en_GB.utf8")

@@ -25,7 +25,9 @@ pub enum ColumnType {
     Bytes,
     /// A numeric of at most 38 digits, `scale` of them after the point, held as the integer of its
     /// smallest unit: in 64 bits up to 18 digits, past them in 128, as Parquet's decimal in the
-    /// fewest bytes that hold them; NaN as the greatest integer that form holds.
+    /// fewest bytes that hold them. Keyed with NaN one past its greatest integer, and held in the
+    /// file as a group of two leaves, its decimal and beside it whether it is NaN; as its decimal
+    /// alone in formats 7 and 8, which hold no NaN.
     Numeric {
         precision: u8,
         scale: u8,
@@ -709,6 +711,7 @@ impl ColumnType {
     pub fn leaf_count(self) -> usize {
         match self.tree() {
             Some(r) => crate::composed::leaves(r).len(),
+            None if matches!(self, ColumnType::Numeric { .. }) => 2,
             None => self.fields().len().max(1),
         }
     }
@@ -739,15 +742,21 @@ impl ColumnType {
         if let Some(r) = self.tree() {
             return crate::composed::leaves(r).to_vec();
         }
+        // A numeric's decimal, and beside it whether it is NaN.
+        if let ColumnType::Numeric { .. } = self {
+            return [
+                (crate::numeric::VALUE_LEAF, self),
+                (crate::numeric::NAN_LEAF, ColumnType::Boolean),
+            ]
+            .into_iter()
+            .map(|(name, ty)| Leaf {
+                field: Some(name),
+                ..Leaf::whole(ty)
+            })
+            .collect();
+        }
         match self.fields() {
-            [] => vec![Leaf {
-                field: None,
-                ty: self,
-                bits: self.unsigned_bits(),
-                nested: None,
-                thin: false,
-                repeated: false,
-            }],
+            [] => vec![Leaf::whole(self)],
             fields => fields
                 .iter()
                 .map(|&(name, ty, bits)| Leaf {
@@ -784,6 +793,18 @@ pub struct Leaf {
 }
 
 impl Leaf {
+    /// The one leaf of a column held as its value itself.
+    pub(crate) fn whole(ty: ColumnType) -> Leaf {
+        Leaf {
+            field: None,
+            ty,
+            bits: ty.unsigned_bits(),
+            nested: None,
+            thin: false,
+            repeated: false,
+        }
+    }
+
     /// A leaf of a composed column's tree: its path below the column joined by points, its type,
     /// the composed type and its place among that type's leaves.
     pub(crate) fn nested(
@@ -1135,13 +1156,7 @@ impl Order {
     pub fn leaves(&self, table: &Table) -> Vec<(usize, Leaf)> {
         self.columns
             .iter()
-            .flat_map(|&c| {
-                table.columns[c]
-                    .ty
-                    .leaves()
-                    .into_iter()
-                    .map(move |l| (c, l))
-            })
+            .flat_map(|&c| table.column_leaves(c).into_iter().map(move |l| (c, l)))
             .collect()
     }
 
@@ -1150,9 +1165,9 @@ impl Order {
         let at = self.slot(column)?;
         let start = self.columns[..at]
             .iter()
-            .map(|&c| table.columns[c].ty.leaf_count())
+            .map(|&c| table.leaf_count(c))
             .sum::<usize>();
-        Some(start..start + table.columns[column].ty.leaf_count())
+        Some(start..start + table.leaf_count(column))
     }
 
     /// The slot of a column's first leaf among the leaves this order holds: a column of one
@@ -1255,22 +1270,67 @@ pub struct Table {
     pub foreign_keys: Vec<ForeignKey>,
     /// The lc_monetary its money reads and prints under: the file's.
     pub monetary: crate::monetary::Monetary,
+    /// The format of the file it lies in, whose leaves its columns are held as.
+    pub format: u32,
 }
 
 impl Table {
     /// The leaves of its columns, in its columns' order, each with its column.
     pub fn leaves(&self) -> Vec<(usize, Leaf)> {
         (0..self.columns.len())
-            .flat_map(|c| self.columns[c].ty.leaves().into_iter().map(move |l| (c, l)))
+            .flat_map(|c| self.column_leaves(c).into_iter().map(move |l| (c, l)))
             .collect()
+    }
+
+    /// Whether a column may hold NaN: a numeric(p, s) in a file of format 9; formats 7 and 8 hold
+    /// none.
+    pub fn may_hold_nan(&self, column: usize) -> bool {
+        matches!(self.columns[column].ty, ColumnType::Numeric { .. })
+            && self.format >= crate::file::FORMAT
+    }
+
+    /// The leaves a column is held as: its type's, a numeric(p, s) that may hold no NaN its decimal
+    /// alone.
+    pub fn column_leaves(&self, column: usize) -> Vec<Leaf> {
+        let ty = self.columns[column].ty;
+        match ty {
+            ColumnType::Numeric { .. } if !self.may_hold_nan(column) => vec![Leaf::whole(ty)],
+            _ => ty.leaves(),
+        }
+    }
+
+    /// How many leaves a column is held as.
+    pub fn leaf_count(&self, column: usize) -> usize {
+        match self.columns[column].ty {
+            ColumnType::Numeric { .. } if !self.may_hold_nan(column) => 1,
+            ty => ty.leaf_count(),
+        }
+    }
+
+    /// Whether a column's values are held as a tree of leaves rather than as one.
+    pub fn is_group(&self, column: usize) -> bool {
+        match self.columns[column].ty {
+            ColumnType::Numeric { .. } if !self.may_hold_nan(column) => false,
+            ty => ty.is_group(),
+        }
+    }
+
+    /// A column's values as the leaves it is held as hold them, one `Values` a leaf.
+    pub fn split_leaves(
+        &self,
+        column: usize,
+        values: crate::values::Values,
+    ) -> Vec<crate::values::Values> {
+        if self.is_group(column) {
+            values.into_leaves(self.columns[column].ty)
+        } else {
+            vec![values]
+        }
     }
 
     /// Where a column's first leaf lies among the table's leaves.
     pub fn first_leaf(&self, column: usize) -> usize {
-        self.columns[..column]
-            .iter()
-            .map(|c| c.ty.leaf_count())
-            .sum()
+        (0..column).map(|c| self.leaf_count(c)).sum()
     }
 
     pub fn column(&self, name: &str) -> Option<usize> {

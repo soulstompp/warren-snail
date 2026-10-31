@@ -1159,7 +1159,8 @@ impl Ord for Numeric {
     }
 }
 
-/// The integer that stands for NaN in a numeric(p, s) column: `10^p`, the least past its digits.
+/// The key NaN takes in a numeric(p, s) column, beside its integers: `10^p`, the least past its
+/// digits.
 pub fn nan_units(precision: u8) -> i128 {
     10i128.pow(u32::from(precision))
 }
@@ -1174,7 +1175,7 @@ pub fn decimal_bytes(precision: u8) -> usize {
 }
 
 /// A number held to a numeric(p, s) column, as the integer of its smallest unit: rounded to its
-/// scale and refused past its digits, NaN at the greatest integer its page form holds.
+/// scale and refused past its digits, NaN at its key.
 pub(crate) fn column_units(n: &Numeric, precision: u8, scale: u8) -> Result<i128> {
     if n.is_nan() {
         return Ok(nan_units(precision));
@@ -1258,9 +1259,103 @@ pub fn text_field(name: &str, nullable: bool) -> arrow::datatypes::Field {
     )
 }
 
-/// An answer's field of a numeric of type `ty`, as arrow's Parquet reader gives its page form:
-/// Decimal128 of its precision and scale up to 38 digits, NaN at the greatest integer that form
-/// holds; its text past them. Its metadata `pg_type` names the type.
+/// The name of a numeric(p, s)'s leaf that holds its decimal.
+pub const VALUE_LEAF: &str = "value";
+
+/// The name of a numeric(p, s)'s leaf that holds whether it is NaN.
+pub const NAN_LEAF: &str = "nan";
+
+/// The fields of a numeric(p, s) as arrow's Parquet reader gives the group of its leaves: its
+/// decimal, 0 where it is NaN, and whether it is NaN.
+pub fn decimal_fields(precision: u8, scale: i8) -> arrow::datatypes::Fields {
+    use arrow::datatypes::{DataType, Field};
+    vec![
+        Field::new(VALUE_LEAF, DataType::Decimal128(precision, scale), false),
+        Field::new(NAN_LEAF, DataType::Boolean, false),
+    ]
+    .into()
+}
+
+/// A numeric(p, s) column of an answer, as arrow's Parquet reader gives the group of its leaves,
+/// from each row's key: its integer, or NaN's.
+pub fn decimal_array(
+    precision: u8,
+    scale: u8,
+    keys: impl Iterator<Item = Option<i128>>,
+) -> Result<arrow::array::ArrayRef> {
+    use arrow::array::{BooleanArray, Decimal128Array, StructArray};
+    let keys: Vec<Option<i128>> = keys.collect();
+    let nan = nan_units(precision);
+    let values = keys
+        .iter()
+        .map(|k| Some(k.filter(|&k| k != nan).unwrap_or(0)))
+        .collect::<Decimal128Array>()
+        .with_precision_and_scale(precision, scale as i8)?;
+    let nans: BooleanArray = keys.iter().map(|k| Some(*k == Some(nan))).collect();
+    Ok(std::sync::Arc::new(StructArray::try_new(
+        decimal_fields(precision, scale as i8),
+        vec![std::sync::Arc::new(values), std::sync::Arc::new(nans)],
+        Some(keys.iter().map(Option::is_some).collect()),
+    )?))
+}
+
+/// Row `r` of a numeric column as arrow's Parquet reader gives it: the group of its decimal and
+/// whether it is NaN, or a decimal alone, as another writer gives one. The decimal's integer, none
+/// for NaN, and its precision and scale; none where the column is neither or the row is NULL.
+pub fn decimal_at(a: &dyn arrow::array::Array, r: usize) -> Option<(Option<i128>, u8, i8)> {
+    use arrow::array::{BooleanArray, Decimal128Array, StructArray};
+    if a.is_null(r) {
+        return None;
+    }
+    if let Some(d) = a.as_any().downcast_ref::<Decimal128Array>() {
+        return Some((Some(d.value(r)), d.precision(), d.scale()));
+    }
+    let s = a.as_any().downcast_ref::<StructArray>()?;
+    let d = s
+        .column_by_name(VALUE_LEAF)?
+        .as_any()
+        .downcast_ref::<Decimal128Array>()?;
+    let nan = s
+        .column_by_name(NAN_LEAF)?
+        .as_any()
+        .downcast_ref::<BooleanArray>()?;
+    if s.num_columns() != 2 {
+        return None;
+    }
+    Some((
+        (!nan.value(r)).then(|| d.value(r)),
+        d.precision(),
+        d.scale(),
+    ))
+}
+
+/// The precision and scale of a numeric column as arrow's Parquet reader gives it: the group of
+/// its decimal and whether it is NaN, or a decimal alone.
+pub fn decimal_type(dt: &arrow::datatypes::DataType) -> Option<(u8, i8)> {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Decimal128(p, s) => Some((*p, *s)),
+        DataType::Struct(fields) => match fields.iter().map(|f| f.as_ref()).collect::<Vec<_>>()[..]
+        {
+            [v, n]
+                if v.name() == VALUE_LEAF
+                    && n.name() == NAN_LEAF
+                    && *n.data_type() == DataType::Boolean =>
+            {
+                match v.data_type() {
+                    DataType::Decimal128(p, s) => Some((*p, *s)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// An answer's field of a numeric of type `ty`, as arrow's Parquet reader gives its page form: up
+/// to 38 digits the group of its decimal, Decimal128 of its precision and scale, and whether it is
+/// NaN; its text past them. Its metadata `pg_type` names the type.
 pub fn numeric_field(
     name: &str,
     ty: crate::catalog::ColumnType,
@@ -1269,7 +1364,7 @@ pub fn numeric_field(
     use arrow::datatypes::DataType;
     let data_type = match ty {
         crate::catalog::ColumnType::Numeric { precision, scale } => {
-            DataType::Decimal128(precision, scale as i8)
+            DataType::Struct(decimal_fields(precision, scale as i8))
         }
         _ => DataType::Utf8,
     };
