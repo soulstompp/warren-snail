@@ -964,8 +964,9 @@ fn writers_of_one_exclude_s_strand_take_turns_whatever_blocks_they_write() {
     .unwrap();
     let blocks = blocks_of(&fresh(&path).blocks().unwrap(), "w_room_excl", "room");
     assert!(blocks.len() >= 2, "{blocks:?}");
-    // The first writer holds a room in the strand's first block; the second writes one in its last,
-    // which no block of the first's holds, and waits for the first all the same.
+    // The first writer holds a room in the strand's first block and a key in the table's last; the
+    // second writes a room in the strand's last block and a key in the table's first, blocks the
+    // first holds none of, and waits for the first all the same.
     one.execute("BEGIN").unwrap();
     one.execute("INSERT INTO s.w (id, room) VALUES (5001, 1)")
         .unwrap();
@@ -974,7 +975,7 @@ fn writers_of_one_exclude_s_strand_take_turns_whatever_blocks_they_write() {
     std::thread::spawn(move || {
         let mut two = Snail::open_writing(&p).unwrap();
         tx.send(
-            two.execute("INSERT INTO s.w (id, room) VALUES (5002, 4095)")
+            two.execute("INSERT INTO s.w (id, room) VALUES (-1, 4095)")
                 .map_err(|e| e.to_string()),
         )
         .unwrap();
