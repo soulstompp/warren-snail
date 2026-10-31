@@ -79,6 +79,8 @@ pub const REG_NEWLINE: i32 = 0o300;
 pub const REG_PEND: i32 = 0o400;
 pub const REG_EXPECT: i32 = 0o1000;
 pub const REG_BOSONLY: i32 = 0o2000;
+/// A test flag: `[[=x=]]` stands for x and y.
+pub const REG_FAKE: i32 = 0o10000;
 
 // Execution flags (regex.h).
 pub const REG_NOTBOL: i32 = 0o1;

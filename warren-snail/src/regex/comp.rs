@@ -601,14 +601,7 @@ impl Vars {
 
     /// One quantified atom or constraint between `lp` and `rp`, and where the atom needs the tree,
     /// the rest of the branch with it; `top` the node of the branch so far (`parseqatom`).
-    fn parseqatom(
-        &mut self,
-        stopper: i32,
-        typ: i32,
-        lp: StateId,
-        rp: StateId,
-        top: SrId,
-    ) -> SrId {
+    fn parseqatom(&mut self, stopper: i32, typ: i32, lp: StateId, rp: StateId, top: SrId) -> SrId {
         self.depth += 1;
         let r = self.parseqatom_(stopper, typ, lp, rp, top);
         self.depth -= 1;

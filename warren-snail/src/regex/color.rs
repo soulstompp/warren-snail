@@ -687,14 +687,7 @@ impl Vars {
 
     /// Arcs of every full color but `but` between two states: one RAINBOW arc where there is no
     /// exception (`rainbow`).
-    pub(super) fn rainbow(
-        &mut self,
-        nfa: NfaId,
-        typ: i32,
-        but: Color,
-        from: StateId,
-        to: StateId,
-    ) {
+    pub(super) fn rainbow(&mut self, nfa: NfaId, typ: i32, but: Color, from: StateId, to: StateId) {
         if but == COLORLESS {
             self.newarc(nfa, typ, RAINBOW, from, to);
             return;

@@ -1214,8 +1214,7 @@ impl Vars {
                 while a != NOARC && !self.iserr() {
                     let nexta = ar!(self, a).outchain;
                     let t = ar!(self, a).typ;
-                    if (t == b'^' as i32 || t == BEHIND) && self.pull(nfa, a, &mut intermediates)
-                    {
+                    if (t == b'^' as i32 || t == BEHIND) && self.pull(nfa, a, &mut intermediates) {
                         progress = true;
                     }
                     a = nexta;
