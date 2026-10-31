@@ -485,6 +485,25 @@ or halfway through it, leaves the follower at the parent, and applied again it f
 a follower reads its own generation, and an apply that frees pages an older round of the follower's
 may read waits for that round to end. With no host, a commit writes its root as it always has.
 
+## Inside a host that decides its commits
+
+**What it writes.** `Snail::open_carried` opens a snail to write inside a host, PostgreSQL's
+transaction for one, built with `standalone` or without. Each transaction's root carries the host's
+tag for it, `Host::tag`, and is taken only where the host's judge, `carry::Judge`, says that
+transaction committed; a sequence's advance lands at once. A host may keep the root, writing it
+itself at its own word. A host's transaction commits a snail once.
+
+**The read it cancels.** A second commit deciding beside the host's: the host's own record of its
+transaction decides alone.
+
+**How it shows.** `Snail::open_judged` reads a snail as a judge decides its tagged roots; a round
+with no judge reads the root before a tagged one, whole, and `census` reads that one.
+
+**Where it stops.** A snail its host writes is written only through it: a writer with no judge is
+refused by name. A host's recovery reads its log of commits again with `carry::replay`, which lands
+a commit on its parent, over a root of the same generation the host never took, and leaves one the
+file holds already or is past.
+
 ## A question read as it goes: WITH and windows
 
 **What it reads.** A question with a `WITH`, or a window, is read as a pipeline over one table,
@@ -719,12 +738,14 @@ fn main() -> warren_snail::Result<()> {
 - `write::write_from` writes a new snail from a `catalog::Catalog` and each table's `write::Rows`.
 - `carried_by` gives a snail open to write its `carry::Host`; `carry::apply` and `carry::copy` keep
   a follower.
+- `open_carried` opens a snail to write inside a host that tags and decides its roots, and
+  `open_judged` reads one; `carry::replay` and `carry::replay_held` land a host's log of commits.
 
 ### The feature `standalone`
 
 On by default. With it, an open snail holds the pages its rounds read, and writes. Built without
-it (`default-features = false`), a snail holds no pages of its own and refuses every write, for a
-host that holds pages of its own.
+it (`default-features = false`), a snail holds no pages of its own and writes only inside a host,
+for a host that holds pages of its own.
 
 ## The bench
 
