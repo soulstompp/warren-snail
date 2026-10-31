@@ -104,7 +104,7 @@ impl Predicate {
 
     /// Whether every row a question's conditions keep passes it: each of its conditions is implied
     /// by one of the question's on the same column, a range within its range, a NULL kept only where
-    /// it keeps one. Sound, and incomplete by design.
+    /// it keeps one.
     pub(crate) fn implied_by(&self, q: &Side) -> bool {
         if q.empty {
             return true;

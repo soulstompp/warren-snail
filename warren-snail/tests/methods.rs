@@ -307,6 +307,23 @@ fn a_snail_of_format_eight_refuses_an_index_of_another_method_by_name() {
         e.contains("s.t: the hash index t_b, which a snail of format 8") && e.contains("`out`"),
         "{e}"
     );
+    let e = warren_snail::write::write_format_eight(
+        &path,
+        &Catalog::parse(
+            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
+             CREATE INDEX t_b ON s.t (b) WHERE b > 0;",
+        )
+        .unwrap(),
+        &[],
+        weather::span(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        e.contains("s.t: the partial index t_b, which a snail of format 8") && e.contains("`out`"),
+        "{e}"
+    );
 }
 
 #[test]
