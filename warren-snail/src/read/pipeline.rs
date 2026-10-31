@@ -5623,12 +5623,8 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::SimilarTo { .. }
         | Expr::Like { .. }
         | Expr::ILike { .. }
+        | Expr::Between { .. }
         | Expr::Substring { .. } => true,
-        Expr::Between {
-            expr, low, high, ..
-        } => [expr, low, high]
-            .into_iter()
-            .any(|x| calls_beyond_the_question(x)),
         Expr::BinaryOp { left, op, right } => {
             matches!(
                 op,

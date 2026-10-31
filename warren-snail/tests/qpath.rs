@@ -188,10 +188,13 @@ fn not_between_keeps_the_values_outside_its_bounds_and_skips_the_blocks_inside()
             s.as_str() < "k001" || s.as_str() > "k498-6"
         })
     );
-    // Two columns of one table are not read, as `n > id` is not.
-    assert!(fresh(&path)
-        .ask("SELECT id FROM s.t WHERE n NOT BETWEEN 1 AND id", None)
-        .is_err());
+    // Two columns of one table the question path does not read: a pipeline does.
+    let (a, _) = asked(
+        &path,
+        "SELECT id FROM s.t WHERE n NOT BETWEEN 1 AND id",
+        None,
+    );
+    assert_eq!(a, kept(|i| n_of(i).is_some_and(|n| n < 1 || n > i)));
 }
 
 #[test]
@@ -465,7 +468,7 @@ fn k_of(id: i64) -> String {
 }
 
 fn u_of(id: i64) -> Option<String> {
-    (id % 13 != 0).then(|| k_of(id * 7 + 3))
+    (id % 13 != 0).then(|| format!("{}é", k_of(id * 7 + 3)))
 }
 
 /// The table's snail: its key, an index on `k`, and on `u` DESC.
@@ -686,6 +689,36 @@ fn a_pattern_s_fixed_prefix_narrows_the_read_along_an_order_on_its_column_and_ch
             .contains("invalid regular expression: parentheses () not balanced"),
         "{e}"
     );
+    // A row on which the pattern fails fails the question, as in PostgreSQL.
+    let e = fresh(&path)
+        .ask("SELECT id FROM s.p WHERE k LIKE 'p\\'", Some("p_k"))
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("LIKE pattern must not end with escape character"),
+        "{e}"
+    );
+    // Held under the column's collation: under C, é is no letter.
+    let (a, _) = asked(
+        &path,
+        "SELECT id FROM s.p WHERE u ~ '^p0[0-9]{3}-[0-9][[:alpha:]]'",
+        Some("p_u"),
+    );
+    assert!(a.is_empty());
+    let (a, _) = asked(
+        &path,
+        "SELECT id FROM s.p WHERE u COLLATE \"C.utf8\" ~ '^p0[0-9]{3}-[0-9][[:alpha:]]'",
+        None,
+    );
+    assert_eq!(
+        a,
+        prefixed_kept(|i| u_of(i).is_some_and(|u| u.starts_with("p0")))
+    );
+    // A pattern the question path does not read, a column, is a pipeline's.
+    let (b, _) = fresh(&path)
+        .ask("SELECT count(*) FROM s.p WHERE k LIKE k", None)
+        .unwrap();
+    assert_eq!(one(&b), PREFIXED);
 }
 
 #[cfg(feature = "standalone")]
@@ -748,4 +781,68 @@ fn a_bpchar_s_name_s_and_a_bytea_s_prefix_narrow_as_their_keys_are_held() {
     );
     let (_, whole) = ask("SELECT id FROM s.v WHERE b IS NOT NULL", "v_b");
     assert!(r.blocks_read < whole.blocks_read, "{r:?}");
+}
+
+/// Under a collation a library orders, the keys are the library's: a prefix narrows nothing, as
+/// PostgreSQL's planner reads no range from one there, and an exact pattern narrows to its one key,
+/// under a nondeterministic collation the key its class shares.
+#[cfg(feature = "collations")]
+#[test]
+fn under_a_library_s_collation_only_an_exact_pattern_narrows_the_read() {
+    let path = tmp("qpath_prefix_collated.snail");
+    let catalog = Catalog::parse(
+        "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TABLE s.c (id integer NOT NULL, k text COLLATE \"en-US-x-icu\", ci text COLLATE s.ci,
+         PRIMARY KEY (id));
+         CREATE INDEX c_k ON s.c (k);
+         CREATE INDEX c_ci ON s.c (ci);",
+    )
+    .unwrap();
+    let ids: Vec<i64> = (0..PREFIXED).collect();
+    let ci = |i: i64| {
+        let k = k_of(i);
+        if (i / 2000) % 2 == 0 {
+            k.to_uppercase()
+        } else {
+            k
+        }
+    };
+    let columns = vec![
+        Values::Int(ids.iter().map(|&i| Some(i)).collect()),
+        Values::Text(ids.iter().map(|&i| Some(k_of(i))).collect()),
+        Values::Text(ids.iter().map(|&i| Some(ci(i))).collect()),
+    ];
+    write(&path, &catalog, &[("s.c".into(), Rows { columns })]).unwrap();
+    let kept = |keep: &dyn Fn(i64) -> bool| -> Vec<i64> {
+        ids.iter().copied().filter(|&i| keep(i)).collect()
+    };
+    let (a, r) = asked(
+        &path,
+        "SELECT id FROM s.c WHERE k LIKE 'p012%'",
+        Some("c_k"),
+    );
+    assert_eq!(a, kept(&|i| k_of(i).starts_with("p012")));
+    assert_eq!(r.entries_none, 0, "{r:?}");
+    let (a, r) = asked(
+        &path,
+        "SELECT id FROM s.c WHERE k LIKE 'p0123-3'",
+        Some("c_k"),
+    );
+    assert_eq!(a, kept(&|i| k_of(i) == "p0123-3"));
+    assert!(r.blocks_read <= 1, "{r:?}");
+    // Under the nondeterministic collation, every member of the class.
+    let (a, r) = asked(
+        &path,
+        "SELECT id FROM s.c WHERE ci LIKE 'p0123-3'",
+        Some("c_ci"),
+    );
+    assert_eq!(a, kept(&|i| k_of(i) == "p0123-3"));
+    assert!(r.blocks_read <= 1, "{r:?}");
+    let (a, r) = asked(
+        &path,
+        "SELECT id FROM s.c WHERE ci LIKE 'p012%'",
+        Some("c_ci"),
+    );
+    assert_eq!(a, kept(&|i| k_of(i).starts_with("p012")));
+    assert_eq!(r.entries_none, 0, "{r:?}");
 }

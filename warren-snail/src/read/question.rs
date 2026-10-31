@@ -1896,6 +1896,14 @@ fn pattern(from: &From, p: &Expr) -> Result<Option<Vec<Conj>>> {
         },
         _ => return Ok(None),
     };
+    // The column itself: a COLLATE beside it changes its classes and its case, which a pipeline
+    // reads.
+    if !matches!(
+        x.as_ref(),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+    ) {
+        return Ok(None);
+    }
     let Ok((side, Shape::Column(c))) = from.resolve(x) else {
         return Ok(None);
     };
