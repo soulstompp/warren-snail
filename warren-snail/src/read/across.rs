@@ -661,6 +661,16 @@ impl Snails {
         if self.aborted {
             return Err(Error::new(super::change::ABORTED));
         }
+        // Its clock is the transaction's across the snails, begun at BEGIN or with the round alone.
+        let at = super::change::wall_micros();
+        let _clocked = crate::scalars::clocked(
+            if self.begun {
+                self.snails[0].clock.0
+            } else {
+                at
+            },
+            at,
+        );
         let mut read = self.snails_named(sql)?;
         if read.is_empty() {
             read.push(0);

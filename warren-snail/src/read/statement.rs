@@ -438,7 +438,7 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
         ColumnType::TimestamptzRounded(p) => Datum::Int(crate::times::timestamptz_in(
             &text_literal(e).map_err(|_| wrong())?,
             Some(u32::from(p)),
-            crate::scalars::wall_clock(),
+            crate::scalars::transaction_clock(),
         )?),
         ColumnType::Interval { range, precision } => Datum::Interval(crate::times::interval_in(
             &text_literal(e).map_err(|_| wrong())?,

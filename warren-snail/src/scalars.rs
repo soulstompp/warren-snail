@@ -1066,8 +1066,40 @@ pub fn timetz_utc(key: i64) -> (i64, i64) {
     (key >> ZONE_BITS, key & ((1 << ZONE_BITS) - 1))
 }
 
-/// The machine's clock now, in microseconds since 1970 UTC: what `now` and `today` read in a
-/// literal.
+thread_local! {
+    /// The clocks of the round under way on this thread, in microseconds since 1970 UTC: where its
+    /// transaction began, and where its statement began.
+    static ROUND: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The clock now() and a literal's `now`, `today`, `tomorrow` and `yesterday` read: where the
+/// transaction of the round under way began, as PostgreSQL's transaction timestamp; the machine's
+/// where no round is under way.
+pub(crate) fn transaction_clock() -> i64 {
+    ROUND.with(|c| c.get()).map_or_else(wall_clock, |(t, _)| t)
+}
+
+/// The clock statement_timestamp() reads: where the statement of the round under way began.
+pub(crate) fn statement_clock() -> i64 {
+    ROUND.with(|c| c.get()).map_or_else(wall_clock, |(_, s)| s)
+}
+
+/// A round's clocks, read by all the round evaluates while it is held; the clocks before it come
+/// back where it is dropped.
+pub(crate) struct Clocked(Option<(i64, i64)>);
+
+/// Holds the clocks of a round, its transaction's and its statement's.
+pub(crate) fn clocked(transaction: i64, statement: i64) -> Clocked {
+    Clocked(ROUND.with(|c| c.replace(Some((transaction, statement)))))
+}
+
+impl Drop for Clocked {
+    fn drop(&mut self) {
+        ROUND.with(|c| c.set(self.0));
+    }
+}
+
+/// The machine's clock now, in microseconds since 1970 UTC: what clock_timestamp() reads.
 pub fn wall_clock() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1127,15 +1159,17 @@ pub fn scalar_parse(ty: ColumnType, s: &str) -> Result<i64> {
         ColumnType::Macaddr => unsigned_key(mac_in(s)?, 48),
         ColumnType::Macaddr8 => unsigned_key(mac8_in(s)?, 64),
         ColumnType::Tid => tid_in(s)?,
-        ColumnType::Date => i64::from(crate::times::date_in(s, wall_clock())?),
-        ColumnType::Time(p) => crate::times::time_in(s, p.map(u32::from), wall_clock())?,
-        ColumnType::Timestamp(p) => crate::times::timestamp_in(s, p.map(u32::from), wall_clock())?,
-        ColumnType::Timestamptz => crate::times::timestamptz_in(s, None, wall_clock())?,
+        ColumnType::Date => i64::from(crate::times::date_in(s, transaction_clock())?),
+        ColumnType::Time(p) => crate::times::time_in(s, p.map(u32::from), transaction_clock())?,
+        ColumnType::Timestamp(p) => {
+            crate::times::timestamp_in(s, p.map(u32::from), transaction_clock())?
+        }
+        ColumnType::Timestamptz => crate::times::timestamptz_in(s, None, transaction_clock())?,
         ColumnType::TimestamptzRounded(p) => {
-            crate::times::timestamptz_in(s, Some(u32::from(p)), wall_clock())?
+            crate::times::timestamptz_in(s, Some(u32::from(p)), transaction_clock())?
         }
         ColumnType::Timetz(p) => {
-            let (t, z) = crate::times::timetz_in(s, p.map(u32::from), wall_clock())?;
+            let (t, z) = crate::times::timetz_in(s, p.map(u32::from), transaction_clock())?;
             timetz_key(t, z)
         }
         other => {

@@ -383,6 +383,40 @@ mod written {
     const ALL_READINGS: &str = "SELECT count(*) FROM weather.readings r";
     const ALL_STATIONS: &str = "SELECT count(*) FROM weather.stations s";
 
+    /// A transaction across the snails reads one clock, its start: a literal's `now` written into
+    /// the second snail is now() as a round across them reads it, and each statement's own clock
+    /// is past it.
+    #[test]
+    fn a_transaction_across_snails_reads_one_clock() {
+        let s = sample(2_000);
+        let split = split("together-clock", &s);
+        let (network, station) = busiest(&s);
+        let mut w = Snails::open_writing(&paths(&split)).unwrap();
+        w.execute("BEGIN").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        w.execute(&format!(
+            "INSERT INTO weather.readings (reading_id, network_id, station_no, feed, observed_at, checked_at) \
+             VALUES (9000001, {network}, {station}, 'AWS Main', 'now', NULL)"
+        ))
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(
+            count_of(
+                &mut w,
+                "SELECT count(*) FROM weather.readings r WHERE r.observed_at = now()"
+            ),
+            1
+        );
+        assert_eq!(
+            count_of(
+                &mut w,
+                "SELECT count(*) FROM weather.stations s WHERE now() < statement_timestamp()"
+            ),
+            count_of(&mut w, ALL_STATIONS)
+        );
+        w.execute("ROLLBACK").unwrap();
+    }
+
     /// Snails opened apart, a commit on each landing between their opens: the moment reads every
     /// root again, finds the first changed, and takes both afresh, so the pair read is one a moment
     /// held.

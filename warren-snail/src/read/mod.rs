@@ -932,6 +932,7 @@ impl Snail {
         each: &mut dyn FnMut(RecordBatch) -> Result<()>,
     ) -> Result<Round> {
         let pages_at_start = self.begin_round()?;
+        let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let mut scan = self.scan(sql, order)?;
         while let Some(batch) = self.next_block(&mut scan)? {
             each(batch)?;
@@ -955,6 +956,12 @@ impl Snail {
             0
         };
         self.rounds += 1;
+        // Its clock is its transaction's, begun at BEGIN or with the round alone.
+        let at = change::wall_micros();
+        self.clock.1 = at;
+        if self.begun.is_none() {
+            self.clock.0 = at;
+        }
         Ok(pages_at_start)
     }
 
@@ -1002,6 +1009,7 @@ impl Snail {
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
         let pages_at_start = self.begin_round()?;
+        let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         self.wasted.borrow_mut().clear();
         let (batch, mut round) = self.answer_with(sql, order, params)?;
         round.pages_at_start = pages_at_start;

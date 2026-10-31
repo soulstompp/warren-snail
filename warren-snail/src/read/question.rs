@@ -514,7 +514,7 @@ pub fn number(e: &Expr) -> Option<i64> {
 /// An instant as PostgreSQL's timestamptz input reads it under TimeZone UTC, as microseconds since
 /// 1970-01-01 UTC.
 pub fn instant(s: &str) -> Result<i64> {
-    crate::times::timestamptz_in(s, None, crate::scalars::wall_clock())
+    crate::times::timestamptz_in(s, None, crate::scalars::transaction_clock())
 }
 
 /// A truth as PostgreSQL's boolean input reads it: `true`, `yes`, `on` or `1`, `false`, `no`, `off`
@@ -730,7 +730,7 @@ fn scalar_literal(e: &Expr, ty: ColumnType, release: u8) -> Result<i64> {
 /// A time on the UTC clock, as microseconds since 1970-01-01 UTC: what a column at time zone 'UTC' is
 /// compared with, read as PostgreSQL's timestamp input reads it.
 fn clock_literal(e: &Expr) -> Result<i64> {
-    crate::times::timestamp_in(&text_literal(e)?, None, crate::scalars::wall_clock())
+    crate::times::timestamp_in(&text_literal(e)?, None, crate::scalars::transaction_clock())
 }
 
 /// A literal compared with a column of a string type, bytea or a bit string, read by the type's

@@ -1133,8 +1133,11 @@ pub(super) fn time(
     }
     let day = t::MICROS_PER_DAY;
     match (name, args) {
-        ("now" | "transaction_timestamp" | "statement_timestamp" | "current_timestamp", []) => {
+        ("now" | "transaction_timestamp" | "current_timestamp", []) => {
             return Ok(Some(timestamptz(now)))
+        }
+        ("statement_timestamp", []) => {
+            return Ok(Some(timestamptz(crate::scalars::statement_clock())))
         }
         ("clock_timestamp", []) => return Ok(Some(timestamptz(crate::scalars::wall_clock()))),
         ("timeofday", []) => return Ok(Some(Value::Text(timeofday(crate::scalars::wall_clock())))),

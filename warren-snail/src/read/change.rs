@@ -631,6 +631,14 @@ impl Snail {
                 "this snail was opened to read; open it to write",
             ));
         }
+        // The clock now() reads is the transaction's, begun at BEGIN or with a statement alone, and
+        // so is a literal's `now` from the statement's first word.
+        let at = wall_micros();
+        self.clock.1 = at;
+        if self.begun.is_none() {
+            self.clock.0 = at;
+        }
+        let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let st = statement::parse(&self.catalog, sql)?;
         // A transaction one of whose statements failed takes no statement but its end, which rolls
         // it back, as PostgreSQL does.
@@ -658,12 +666,6 @@ impl Snail {
             self.renew()?;
         } else if self.begun.is_some() && writes {
             self.renew_in_transaction()?;
-        }
-        // The clock now() reads is the transaction's, begun at BEGIN or with a statement alone.
-        let at = wall_micros();
-        self.clock.1 = at;
-        if self.begun.is_none() {
-            self.clock.0 = at;
         }
         self.rounds += 1;
         let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);

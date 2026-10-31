@@ -472,3 +472,48 @@ fn at_time_zone_reads_an_abbreviation_first_as_postgresql_does() {
         assert!(e.contains("abbreviation"), "{zone}: {e}");
     }
 }
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_transaction_reads_one_clock_its_start_wherever_postgresql_reads_it() {
+    let mut s = snail_of(
+        "one-clock",
+        "CREATE TABLE s.t (id integer NOT NULL, at timestamptz, d date, \
+         by timestamptz DEFAULT now(), PRIMARY KEY (id));",
+        &[],
+    );
+    let one = |s: &mut Snail, q: &str| -> bool {
+        let (b, _) = s.ask(q, None).unwrap();
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        a.value(0)
+    };
+    let step = "WITH q AS (SELECT id, at, d, by FROM s.t)";
+    s.execute("BEGIN").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    s.execute("INSERT INTO s.t (id, at, d) VALUES (1, 'now', 'today'), (2, 'now', 'tomorrow')")
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // Each statement of the transaction reads its start: now() and its kin, a literal's `now`,
+    // `today` and `tomorrow`, and a DEFAULT now(); statement_timestamp() the statement's own, and
+    // clock_timestamp() the machine's.
+    for q in [
+        "SELECT (count(*) = 2) AS x FROM q WHERE at = now() AND by = transaction_timestamp()",
+        "SELECT (count(*) = 2) AS x FROM q WHERE at = 'now'::timestamptz AND by = current_timestamp",
+        "SELECT (count(*) = 1) AS x FROM q WHERE d = 'today'::date AND d = current_date",
+        "SELECT (count(*) = 1) AS x FROM q WHERE d = 'tomorrow'::date AND d = 'yesterday'::date + 2",
+        "SELECT (count(*) = 2) AS x FROM q WHERE now() < statement_timestamp()",
+        "SELECT (count(*) = 2) AS x FROM q WHERE statement_timestamp() <= clock_timestamp()",
+    ] {
+        assert!(one(&mut s, &format!("{step} {q}")), "{q}");
+    }
+    s.execute("COMMIT").unwrap();
+    // A statement alone is its own transaction: now() is its start.
+    assert!(one(
+        &mut s,
+        &format!("{step} SELECT (count(*) = 2) AS x FROM q WHERE now() > at AND now() = statement_timestamp()")
+    ));
+}

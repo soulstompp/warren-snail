@@ -4885,7 +4885,7 @@ pub(crate) fn eval_on(
         release,
         casings,
         types: &types,
-        now: super::change::wall_micros(),
+        now: crate::scalars::transaction_clock(),
     };
     eval(e, row, &frame, &computed_none())
 }
@@ -5201,7 +5201,7 @@ fn sort(
         release,
         casings,
         types: &types,
-        now: super::change::wall_micros(),
+        now: crate::scalars::transaction_clock(),
     };
     // An ordinal names the column at that place.
     let at = exprs
@@ -5439,8 +5439,8 @@ impl<'q> Stream<'q> {
             }
         }
         queries.push((String::new(), q));
-        // One clock the whole statement reads.
-        let now = super::change::wall_micros();
+        // One clock the whole statement reads: its transaction's.
+        let now = crate::scalars::transaction_clock();
         let mut typed: HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)> = HashMap::new();
         typed.insert(
             s.table.name.clone(),
