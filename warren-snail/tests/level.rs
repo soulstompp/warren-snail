@@ -135,6 +135,8 @@ fn a_level_whose_places_lie_several_to_a_page_is_bounded_by_its_pages() {
     assert!(!l.whole, "{l:?}");
     let places = keyed(&l);
     assert!(places.windows(2).all(|w| w[0].0 < w[1].0));
+    // The ends are listed: the first page's first row and the last block's last.
+    assert_eq!((places[0].0, places[places.len() - 1].0), (0, 2999));
     assert!(
         places.len() > 10 && places.len() < held.len(),
         "{}",
@@ -273,4 +275,63 @@ fn pages_count_their_live_rows_and_a_block_s_new_rows_may_lie_on_any_of_its_plac
     let four = places.iter().find(|p| p.0 == 4).unwrap();
     assert!(four.1 > 0 && four.1 < four.2, "{four:?}");
     assert_eq!(grouped(&mut snail, "m"), held);
+}
+
+/// A table of 8,000 rows on (g, id), each g a thousand of them: a block holds two places, and its
+/// pages of ids, 512 rows each, lie wholly on one place or across the two.
+#[cfg(feature = "standalone")]
+fn paired(name: &str) -> std::path::PathBuf {
+    let path = tmp(name);
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.p (id bigint NOT NULL, g integer NOT NULL, PRIMARY KEY (id));
+         CREATE INDEX p_g ON s.p (g, id);",
+    )
+    .unwrap();
+    let rows = Rows {
+        columns: vec![
+            Values::Int((0..8000).map(Some).collect()),
+            Values::Int((0..8000).map(|i| Some(i / 1000)).collect()),
+        ],
+    };
+    write(&path, &catalog, &[("s.p".into(), rows)]).unwrap();
+    path
+}
+
+/// A page's dead rows are not its place's, and rows written after a block's sorted rows count for
+/// each of its places: nine rows in ten deleted, then rows of one place inserted, every place's live
+/// rows lie between its bounds.
+#[test]
+#[cfg(feature = "standalone")]
+fn dead_rows_are_no_place_s_and_new_rows_may_be_any_of_their_block_s() {
+    let path = paired("level-paired.snail");
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("DELETE FROM s.p WHERE id % 10 <> 0").unwrap();
+    let values: Vec<String> = (0..300).map(|i| format!("({}, 1)", 100_000 + i)).collect();
+    w.execute(&format!(
+        "INSERT INTO s.p (id, g) VALUES {}",
+        values.join(", ")
+    ))
+    .unwrap();
+    drop(w);
+    let snail = fresh(&path);
+    let dead: u64 = snail
+        .blocks()
+        .unwrap()
+        .iter()
+        .filter(|b| b.order == "p_g" && b.column == "id")
+        .map(|b| b.dead_marked)
+        .sum();
+    assert!(dead > 0, "the deleted rows stand dead in their blocks");
+    let l = snail.level_counts("s.p", "g", u64::MAX).unwrap().unwrap();
+    assert_eq!(l.rows, 800 + 300);
+    let held = plain(
+        (0..8000)
+            .filter(|i| i % 10 == 0)
+            .map(|i| i / 1000)
+            .chain([1; 300]),
+    );
+    for (v, low, high) in keyed(&l) {
+        let n = held[&v];
+        assert!(low <= n && n <= high, "{v}: {low} {n} {high}");
+    }
 }
