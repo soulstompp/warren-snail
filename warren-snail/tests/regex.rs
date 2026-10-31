@@ -86,6 +86,15 @@ fn the_operators_answer_as_postgresql_s() {
         one(&mut s, "'abc' !~* 'B'").unwrap().as_deref(),
         Some("false")
     );
+    // A bpchar is matched with its blanks by the operators, without them by the functions.
+    for (expr, want) in [
+        ("'tab'::char(6) ~ '\\s'", "true"),
+        ("'line'::char(6) ~ 'e$'", "false"),
+        ("'ab'::char(4) SIMILAR TO 'ab'", "false"),
+        ("regexp_like('tab'::char(6), '\\s')", "false"),
+    ] {
+        assert_eq!(one(&mut s, expr).unwrap().as_deref(), Some(want), "{expr}");
+    }
 }
 
 #[test]

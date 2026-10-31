@@ -1873,8 +1873,8 @@ fn regex_casing(frame: &Frame, s: &Expr, p: &Expr) -> Result<Casing> {
     })
 }
 
-/// `s ~ p` and its kin, as PostgreSQL's textregexeq, nameregexeq and their kin read them: a text,
-/// a name or a bpchar's text against a text pattern.
+/// `s ~ p` and its kin, as PostgreSQL's textregexeq, nameregexeq, bpcharregexeq and their kin read
+/// them: a text, a name or a bpchar against a text pattern.
 fn regex_match(
     s: &Value,
     p: &Value,

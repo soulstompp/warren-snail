@@ -2525,8 +2525,8 @@ pub(super) fn regexps(
     }))
 }
 
-/// `s ~ p` and its kin, `~*` where `icase`, negated where `not`, under `casing`: a text, a name or
-/// a bpchar's text against a pattern.
+/// `s ~ p` and its kin, `~*` where `icase`, negated where `not`, under `casing`: a text, a name, or
+/// a bpchar with its blanks (bpcharregexeq), against a pattern.
 pub(super) fn regex_op(
     s: &Value,
     p: &Value,
@@ -2538,7 +2538,11 @@ pub(super) fn regex_op(
         return Ok(Value::Null);
     }
     let ctype = ctype_of(casing)?;
-    let m = crate::regexp::textregexeq(&text_arg(s)?, &text_arg(p)?, icase, ctype)?;
+    let s = match s {
+        Value::Str(ColumnType::Bpchar(_), own) => own.clone(),
+        s => text_arg(s)?,
+    };
+    let m = crate::regexp::textregexeq(&s, &text_arg(p)?, icase, ctype)?;
     Ok(Value::Bool(m != not))
 }
 
