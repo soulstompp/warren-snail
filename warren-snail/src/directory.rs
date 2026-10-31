@@ -32,6 +32,59 @@ impl Summary {
     }
 }
 
+/// What an entry keeps of a column a GiST or SP-GiST strand names: the least lower bound and the
+/// greatest upper bound of its values, as bytes that sort as the bounds do, and whether it holds an
+/// empty value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Span {
+    /// Whether it holds a value with bounds: where none, `lo` and `hi` are empty.
+    pub present: bool,
+    pub lo: Vec<u8>,
+    pub hi: Vec<u8>,
+    /// Whether it holds an empty value: an empty range or multirange.
+    pub empty: bool,
+}
+
+impl Span {
+    /// The bytes it takes in its entry.
+    fn size(&self) -> usize {
+        1 + if self.present {
+            8 + self.lo.len() + self.hi.len()
+        } else {
+            0
+        }
+    }
+
+    /// It widened to hold a value's bounds, or an empty value where none are given.
+    pub fn widen(&mut self, bounds: Option<(&[u8], &[u8])>) {
+        match bounds {
+            None => self.empty = true,
+            Some((lo, hi)) if !self.present => {
+                self.present = true;
+                self.lo = lo.to_vec();
+                self.hi = hi.to_vec();
+            }
+            Some((lo, hi)) => {
+                if lo < self.lo.as_slice() {
+                    self.lo = lo.to_vec();
+                }
+                if hi > self.hi.as_slice() {
+                    self.hi = hi.to_vec();
+                }
+            }
+        }
+    }
+
+    /// It widened to hold every value another holds.
+    pub fn join(&mut self, other: &Span) {
+        if other.present {
+            self.widen(Some((&other.lo, &other.hi)));
+        }
+        self.empty |= other.empty;
+    }
+}
+
 /// An entry of an order's directory: a block, or above the blocks a directory page, with the counts
 /// of every row under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +107,8 @@ pub struct Entry {
     /// The bytes of the text present, as PostgreSQL's `octet_length` counts them, for each of the
     /// order's text columns.
     pub bytes: Vec<u32>,
+    /// The span of each column a GiST or SP-GiST strand names, as the head's `span_slots` list them.
+    pub spans: Vec<Span>,
     /// A block's page map, or the directory page below an entry above the blocks.
     pub child: Extent,
 }
@@ -79,6 +134,9 @@ pub struct Head {
     /// collation and the version its library gave, as `Column::cut_under` says; empty where none.
     /// An order cut under other rules than the reader's is refused by name until re-cut.
     pub cut_under: Vec<String>,
+    /// Which of the held leaves are the first of a column whose span each entry keeps, by their place
+    /// among the held leaves.
+    pub span_slots: Vec<u32>,
 }
 
 /// What `Head::level_text` holds for a level keyed in 128 bits.
@@ -95,6 +153,11 @@ const HEAD_WIDE: u32 = 1 << 31;
 /// The bit of a head's height set where a level of the order was cut under a library: what each
 /// level was cut under follows the columns keyed in 128 bits. A head with none is written as before.
 const HEAD_CUT: u32 = 1 << 30;
+
+/// The bit of a head's height set where the order keeps the span of a column a GiST or SP-GiST
+/// strand names: the slots follow what each level was cut under, and each entry keeps a span for
+/// each. A head with none is written as before.
+const HEAD_SPANS: u32 = 1 << 29;
 
 fn add(a: u32, b: u32) -> Result<u32> {
     a.checked_add(b)
@@ -123,6 +186,7 @@ impl Entry {
                 0
             }
             + 4 * self.bytes.len()
+            + self.spans.iter().map(Span::size).sum::<usize>()
     }
 
     /// The entry for a directory page: the counts of the entries it holds, summed.
@@ -148,6 +212,7 @@ impl Entry {
             months: vec![[0u32; 12]; first.months.len()],
             ends: vec![[0u32; 2]; first.months.len()],
             bytes: vec![0u32; first.bytes.len()],
+            spans: vec![Span::default(); first.spans.len()],
             child,
         };
         let mut seen = vec![false; e.columns.len()];
@@ -181,6 +246,9 @@ impl Entry {
             }
             for (t, &n) in x.bytes.iter().enumerate() {
                 e.bytes[t] = add(e.bytes[t], n)?;
+            }
+            for (s, span) in x.spans.iter().enumerate() {
+                e.spans[s].join(span);
             }
         }
         Ok(e)
@@ -217,6 +285,13 @@ impl Entry {
         }
         for &n in &self.bytes {
             o.u32(n);
+        }
+        for s in &self.spans {
+            o.u8(u8::from(s.present) | (u8::from(s.empty) << 1));
+            if s.present {
+                o.bytes(&s.lo);
+                o.bytes(&s.hi);
+            }
         }
         o.extent(self.child);
     }
@@ -262,6 +337,22 @@ impl Entry {
         let bytes = (0..head.text_slots.len())
             .map(|_| i.u32())
             .collect::<Result<Vec<_>>>()?;
+        let mut spans = Vec::with_capacity(head.span_slots.len());
+        for _ in 0..head.span_slots.len() {
+            let flags = i.u8()?;
+            let present = flags & 1 != 0;
+            let (lo, hi) = if present {
+                (i.bytes()?, i.bytes()?)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            spans.push(Span {
+                present,
+                lo,
+                hi,
+                empty: flags & 2 != 0,
+            });
+        }
         let child = i.extent()?;
         Ok(Entry {
             depth,
@@ -273,6 +364,7 @@ impl Entry {
             months,
             ends: at_ends,
             bytes,
+            spans,
             child,
         })
     }
@@ -374,6 +466,9 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     if cut {
         height |= HEAD_CUT;
     }
+    if !head.span_slots.is_empty() {
+        height |= HEAD_SPANS;
+    }
     o.u32(height);
     if !head.wide_slots.is_empty() {
         u32s(&mut o, &head.wide_slots);
@@ -383,6 +478,9 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
         for c in &head.cut_under {
             o.str(c);
         }
+    }
+    if !head.span_slots.is_empty() {
+        u32s(&mut o, &head.span_slots);
     }
     o.0.extend_from_slice(&encode_page(entries));
     o.0
@@ -405,14 +503,20 @@ pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
     } else {
         vec![String::new(); level_text.len()]
     };
+    let span_slots = if height & HEAD_SPANS != 0 {
+        read_u32s(&mut i)?
+    } else {
+        Vec::new()
+    };
     let head = Head {
         units,
         month_slots,
         text_slots,
         level_text,
-        height: height & !(HEAD_WIDE | HEAD_CUT),
+        height: height & !(HEAD_WIDE | HEAD_CUT | HEAD_SPANS),
         wide_slots,
         cut_under,
+        span_slots,
     };
     let entries = decode_page(&buf[i.at()..], &head)?;
     Ok((head, entries))
@@ -744,6 +848,7 @@ mod tests {
             height: 1,
             wide_slots: vec![],
             cut_under: vec![String::new(); 2],
+            span_slots: Vec::new(),
         }
     }
 
@@ -780,6 +885,7 @@ mod tests {
             months: vec![[rows, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
             ends: vec![[0, 0]],
             bytes: vec![10 * rows],
+            spans: Vec::new(),
             child: Extent {
                 start: child,
                 bytes: 300,
@@ -844,6 +950,7 @@ mod tests {
             height: 1,
             wide_slots: vec![0],
             cut_under: vec![String::new()],
+            span_slots: Vec::new(),
         };
         let key = |k: i128| vec![KeyValue::Wide(k)];
         let e = Entry {
@@ -871,6 +978,7 @@ mod tests {
             months: vec![],
             ends: vec![],
             bytes: vec![],
+            spans: Vec::new(),
             child: Extent {
                 start: 7,
                 bytes: 64,

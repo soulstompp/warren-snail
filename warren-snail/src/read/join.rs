@@ -70,6 +70,7 @@ fn passes(p: &Piece, c: &Cell, ty: ColumnType) -> bool {
             Some(Part::Bytes(b)) => t.holds(&b),
             _ => false,
         },
+        Piece::Op(_) => unreachable!("an operator's condition is read on its own table"),
     }
 }
 

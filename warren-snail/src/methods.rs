@@ -8,9 +8,15 @@ use crate::geo::GeoKind;
 use crate::textual::Textual;
 use crate::{Error, Result};
 
-/// Whether the snail holds an index of the method.
-pub fn held(method: Method) -> bool {
-    matches!(method, Method::Btree | Method::Hash)
+/// Whether the snail holds an index of the method with a key of the operator class: a B-tree and a
+/// hash on any; a GiST or an SP-GiST on a range, a multirange, an inet, or text.
+pub fn held(method: Method, opclass: &str) -> bool {
+    match method {
+        Method::Btree | Method::Hash => true,
+        Method::Gist => matches!(opclass, "range_ops" | "multirange_ops" | "inet_ops"),
+        Method::Spgist => matches!(opclass, "range_ops" | "inet_ops" | "text_ops"),
+        _ => false,
+    }
 }
 
 fn composed(ty: ColumnType) -> Option<&'static Composed> {

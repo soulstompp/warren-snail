@@ -3677,9 +3677,9 @@ impl Draft {
             }
             return Err(Error::new(format!("relation \"{name}\" already exists")));
         }
-        if !crate::methods::held(method) {
+        if let Some(o) = opclasses.iter().find(|o| !crate::methods::held(method, o)) {
             return Err(Error::new(format!(
-                "{shown}: USING {am} is not held yet; a B-tree and a hash are"
+                "{shown}: USING {am} with the operator class {o} is not held yet"
             )));
         }
         let keyed = Keyed {

@@ -26,6 +26,10 @@ impl Predicate {
             &format!("SELECT count(*) FROM {} WHERE {predicate}", table.name),
         )?;
         match q.sides.as_slice() {
+            [side] if !side.ops.is_empty() => Err(Error::new(
+                "a condition by an operator a GiST or SP-GiST strand answers is not read in a \
+                 predicate",
+            )),
             [side] if q.meets.is_empty() && q.after.is_empty() => {
                 Ok(Predicate { side: side.clone() })
             }

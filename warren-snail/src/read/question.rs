@@ -256,6 +256,26 @@ pub struct Side {
     pub nulls: Vec<(usize, bool)>,
     /// Some condition can hold for no value.
     pub empty: bool,
+    /// The conditions by an operator a GiST or SP-GiST strand answers.
+    pub ops: Vec<OpCond>,
+}
+
+/// A condition on a range, a multirange or an inet column by an operator a GiST or SP-GiST strand
+/// answers: a range's or a multirange's `&&`, `@>`, `<@`, `<<`, `>>`, `&<`, `&>` and `-|-`, an
+/// inet's `&&`, `<<`, `<<=`, `>>` and `>>=`, with a value. A row is held to it as a pipeline holds
+/// one; a block of a strand that keeps the column's span is ruled out where `probe` lies outside it.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct OpCond {
+    pub column: usize,
+    /// The condition, the column written as its name.
+    pub expr: Expr,
+    /// The column's name.
+    pub name: String,
+    /// The operator as the column, on its left, reads it; and its value's span, where the operator
+    /// rules a block out by it.
+    pub op: String,
+    pub probe: Option<crate::spans::Probe>,
 }
 
 impl Side {
@@ -283,6 +303,7 @@ impl Side {
                 }
             }
             Piece::Empty => self.empty = true,
+            Piece::Op(o) => self.ops.push(o),
         }
     }
 }
@@ -296,6 +317,7 @@ pub enum Piece {
     Text(TextCond),
     Null(usize, bool),
     Empty,
+    Op(OpCond),
 }
 
 impl Piece {
@@ -305,7 +327,7 @@ impl Piece {
         match self {
             Piece::Cond(c) => !c.nulls,
             Piece::Null(_, null) => !null,
-            Piece::Text(_) | Piece::Empty => true,
+            Piece::Text(_) | Piece::Empty | Piece::Op(_) => true,
         }
     }
 
@@ -318,6 +340,7 @@ impl Piece {
             }),
             Piece::Text(t) => Some((t.column, false)),
             Piece::Null(c, _) => Some((*c, false)),
+            Piece::Op(o) => Some((o.column, false)),
             Piece::Empty => None,
         }
     }
@@ -1348,12 +1371,19 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             texts: Vec::new(),
             nulls: Vec::new(),
             empty: false,
+            ops: Vec::new(),
         })
         .collect();
     let mut meets: Vec<Meet> = Vec::new();
     let mut after = Vec::new();
     for c in pool {
         match c {
+            Conj::One(s, Piece::Op(o)) if nullable[s] => {
+                return Err(Error::new(format!(
+                    "{}: on a table an outer join may leave NULL, it is not read yet",
+                    o.expr
+                )))
+            }
             Conj::One(s, piece) if nullable[s] => after.push(Test::One(s, piece)),
             Conj::One(s, piece) => sides[s].take(piece, from.table(s)),
             Conj::Two(m) => {
@@ -1375,6 +1405,12 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 // A condition on the table it may leave NULL narrows that table's rows; in a FULL
                 // JOIN, which keeps both, it is read on each pair.
                 Conj::One(t, piece) if t == s && !full => sides[s].take(piece, from.table(s)),
+                Conj::One(_, Piece::Op(o)) => {
+                    return Err(Error::new(format!(
+                        "{}: in an outer join's ON, it is not read yet",
+                        o.expr
+                    )))
+                }
                 Conj::One(t, piece) => o.tests.push(Test::One(t, piece)),
                 Conj::Two(m) if m.touches(s) && m.op == Cmp::Eq => o.meets.push(m.seen_from(s)),
                 Conj::Two(m) => o.tests.push(Test::Two(m)),
@@ -1735,6 +1771,11 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
             )));
         }
     }
+    if let Shape::Column(c) = s {
+        if let Some(o) = op_cond(table, c, &op, lit, lit_left)? {
+            return Ok(Conj::One(side, Piece::Op(o)));
+        }
+    }
     // No comparison matches a NULL, so one with NULL keeps no row.
     if matches!(lit, Expr::Value(v) if v.value == Value::Null)
         && matches!(
@@ -1931,6 +1972,112 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
         other => return Err(Error::new(format!("the comparison {other} is not read"))),
     };
     Ok(Conj::One(side, Piece::Cond(cond)))
+}
+
+/// A condition by an operator a GiST or SP-GiST strand answers, on column `c` and the value `lit`,
+/// the column on the operator's left unless `lit_left`; none where `op` is no such operator on the
+/// column's type.
+fn op_cond(
+    table: &Table,
+    c: usize,
+    op: &BinaryOperator,
+    lit: &Expr,
+    lit_left: bool,
+) -> Result<Option<OpCond>> {
+    use crate::composed::{Composed, Item};
+    let ty = table.columns[c].ty;
+    let name = op.to_string();
+    let def = match ty {
+        ColumnType::Composed(r) => Some(r.def()),
+        _ => None,
+    };
+    let ranged = matches!(
+        def,
+        Some(Composed::Range { .. } | Composed::Multirange { .. })
+    );
+    let inet = crate::spans::is_inet(ty);
+    let read = if ranged {
+        ["&&", "@>", "<@", "<<", ">>", "&<", "&>", "-|-"].contains(&name.as_str())
+    } else {
+        inet && ["&&", "<<", "<<=", ">>", ">>="].contains(&name.as_str())
+    };
+    if !read {
+        return Ok(None);
+    }
+    let column = table.columns[c].name.clone();
+    let own = Box::new(Expr::Identifier(sqlparser::ast::Ident::with_quote(
+        '"',
+        column.clone(),
+    )));
+    let (left, right) = if lit_left {
+        (Box::new(lit.clone()), own)
+    } else {
+        (own, Box::new(lit.clone()))
+    };
+    let expr = Expr::BinaryOp {
+        left,
+        op: op.clone(),
+        right,
+    };
+    // The operator as the column, on its left, reads it; `&<` and `&>` have no other side.
+    let seen = if !lit_left {
+        Some(name.as_str())
+    } else {
+        match name.as_str() {
+            "@>" => Some("<@"),
+            "<@" => Some("@>"),
+            "<<" => Some(">>"),
+            ">>" => Some("<<"),
+            "<<=" => Some(">>="),
+            ">>=" => Some("<<="),
+            "&&" | "-|-" => Some(name.as_str()),
+            _ => None,
+        }
+    };
+    let quoted = matches!(lit, Expr::Value(v) if matches!(v.value, Value::SingleQuotedString(_)));
+    let span = |ty: ColumnType, item: &Item| match crate::composed::span_bounds(ty, item) {
+        Some((lo, hi)) => crate::spans::Probe::Span(lo, hi),
+        None => crate::spans::Probe::Empty,
+    };
+    let probe = if inet {
+        let text = crate::inet::inet_in(&text_literal(lit)?, false)?;
+        let (lo, hi) = crate::inet::inet_span(&text);
+        Some(crate::spans::Probe::Span(lo, hi))
+    } else {
+        let (subtype, _) = crate::composed::range_of(ty).unwrap();
+        let range_ty = match def {
+            Some(Composed::Multirange { range, .. }) => Some(*range),
+            _ => None,
+        };
+        // A value cast to the multirange's range type is a range; any other its own type's.
+        let cast_to_range = range_ty.filter(|r| {
+            matches!(lit, Expr::Cast { data_type, .. }
+                if crate::catalog::format_type(data_type) == r.pg_name())
+        });
+        let element = seen == Some("@>") && !quoted && cast_to_range.is_none();
+        if element {
+            match crate::composed::literal(subtype, lit) {
+                Ok(d) => crate::composed::element_bounds(ty, &Item::Scalar(d))
+                    .map(|(lo, hi)| crate::spans::Probe::Span(lo, hi)),
+                Err(_) => None,
+            }
+        } else {
+            let as_ty = cast_to_range.unwrap_or(ty);
+            match crate::composed::compared(as_ty, lit) {
+                Ok(super::statement::Datum::Compound(k)) => Some(span(as_ty, &k.item)),
+                Ok(_) => None,
+                Err(e) if quoted => return Err(e),
+                Err(_) => None,
+            }
+        }
+    };
+    Ok(Some(OpCond {
+        column: c,
+        expr,
+        name: column,
+        op: seen.unwrap_or_default().to_string(),
+        probe: seen.and(probe),
+    }))
 }
 
 #[cfg(test)]

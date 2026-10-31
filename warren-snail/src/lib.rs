@@ -29,6 +29,7 @@ pub mod regex;
 pub mod regexp;
 pub mod regs;
 pub mod scalars;
+pub(crate) mod spans;
 pub mod strings;
 pub mod textual;
 pub mod times;

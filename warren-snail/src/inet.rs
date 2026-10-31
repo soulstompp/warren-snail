@@ -558,6 +558,21 @@ pub fn inet_supeq(a: &str, b: &str) -> bool {
     within(&held(b), &held(a), true)
 }
 
+/// The addresses an inet's network spans, its first and its last, as bytes that sort by family, 4
+/// before 6, then by address.
+pub fn inet_span(text: &str) -> (Vec<u8>, Vec<u8>) {
+    let v = held(text);
+    let family = if v.v6 { 6 } else { 4 };
+    let (mut lo, mut hi) = (vec![family], vec![family]);
+    for (i, &b) in v.bytes().iter().enumerate() {
+        let kept = (v.bits as usize).saturating_sub(i * 8).min(8);
+        let mask = if kept == 0 { 0 } else { 0xffu8 << (8 - kept) };
+        lo.push(b & mask);
+        hi.push(b | !mask);
+    }
+    (lo, hi)
+}
+
 /// `a && b`, as `network_overlap` tests it: one family, the addresses alike up to the shorter
 /// mask.
 pub fn inet_overlap(a: &str, b: &str) -> bool {

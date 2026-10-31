@@ -3386,6 +3386,54 @@ fn cmp_bounds(a: &Bound, b: &Bound) -> std::cmp::Ordering {
     }
 }
 
+/// A bound's bytes, sorting as the bound does among lower and upper bounds alike: at one value, a
+/// lower bound that holds it with an upper bound that holds it, an upper bound that leaves it out
+/// before both, a lower bound that leaves it out after both.
+fn bound_bytes(subtype: ColumnType, b: &Bound) -> Vec<u8> {
+    match &b.value {
+        None => vec![if b.lower { 0 } else { 2 }],
+        Some(v) => {
+            let mut out = vec![1];
+            key_into(&mut out, subtype, v);
+            out.push(match (b.lower, b.inclusive) {
+                (false, false) => 0,
+                (_, true) => 1,
+                (true, false) => 2,
+            });
+            out
+        }
+    }
+}
+
+/// The span of a range or a multirange: its least lower bound's bytes and its greatest upper
+/// bound's, as `bound_bytes` writes them; none where it is empty.
+pub fn span_bounds(ty: ColumnType, item: &Item) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (subtype, _) = range_of(ty)?;
+    let (lo, hi) = match item {
+        Item::Multirange(ranges) => (
+            ranges.iter().find_map(|r| bounds(subtype, r))?.0,
+            ranges.iter().rev().find_map(|r| bounds(subtype, r))?.1,
+        ),
+        r => bounds(subtype, r)?,
+    };
+    Some((bound_bytes(subtype, &lo), bound_bytes(subtype, &hi)))
+}
+
+/// A value of a range's subtype as the span of a range holding it alone.
+pub fn element_bounds(ty: ColumnType, v: &Item) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (subtype, _) = range_of(ty)?;
+    let at = |lower: bool| Bound {
+        key: Some(key(subtype, v)),
+        value: Some(v.clone()),
+        inclusive: true,
+        lower,
+    };
+    Some((
+        bound_bytes(subtype, &at(true)),
+        bound_bytes(subtype, &at(false)),
+    ))
+}
+
 /// Whether two bounds at one value touch with no value between: an upper and a lower, one of the
 /// two inclusive, or, for a discrete range, values one apart as its canonical form writes them.
 fn adjacent(upper: &Bound, lower: &Bound) -> bool {

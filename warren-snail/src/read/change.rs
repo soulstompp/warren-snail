@@ -2450,6 +2450,13 @@ impl Snail {
                 }
             }
         }
+        // A spanned column's span widens to hold each row added; a row gone leaves it as it was.
+        for (k, c) in crate::spans::columns(table, order).into_iter().enumerate() {
+            let at = order.slot(c).unwrap();
+            for (_, values) in &added {
+                crate::spans::widen(&mut entry.spans[k], table.columns[c].ty, &values[at]);
+            }
+        }
         entry.child = w.place(&map.encode())?;
         Ok((vec![entry], false))
     }

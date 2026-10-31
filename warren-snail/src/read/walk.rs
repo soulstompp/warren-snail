@@ -2,7 +2,7 @@
 //! question may hold rows, its pages predicted from the page maps, then read.
 
 use super::answer::{same, Answer, Cell, Dict, Text};
-use super::question::{Cond, Countable, Side, TextCond};
+use super::question::{Cond, Countable, OpCond, Side, TextCond};
 use super::{Snail, Wasted};
 use crate::catalog::{ColumnType, Level, Order, Shape, Table};
 use crate::directory::{decode_page, decode_top, Entry, Head, PageMap, Summary};
@@ -129,6 +129,8 @@ struct Open {
     text_may: Vec<usize>,
     /// The tests for NULL the entry's counts leave open.
     null_may: Vec<usize>,
+    /// The conditions by an operator a GiST or SP-GiST strand answers that the entry may hold.
+    op_may: Vec<usize>,
     /// The columns the round reads under it.
     slots: Vec<usize>,
 }
@@ -201,6 +203,7 @@ struct BlockRead {
     rest_may: Vec<usize>,
     text_may: Vec<usize>,
     null_may: Vec<usize>,
+    op_may: Vec<usize>,
     /// For every column read, its slot and the pages read of it, ascending.
     reads: Vec<(usize, Vec<usize>)>,
 }
@@ -263,6 +266,7 @@ pub fn condition_columns(side: &Side) -> Vec<usize> {
         .map(|c| s_column(c.shape))
         .chain(side.texts.iter().map(|t| t.column))
         .chain(side.nulls.iter().map(|&(c, _)| c))
+        .chain(side.ops.iter().map(|o| o.column))
         .collect()
 }
 
@@ -530,6 +534,7 @@ impl Snail {
                 rest_may: o.rest_may,
                 text_may: o.text_may,
                 null_may: o.null_may,
+                op_may: o.op_may,
                 reads: block_reads,
             });
         }
@@ -750,6 +755,15 @@ impl Snail {
                         (null, start, v)
                     })
                     .collect();
+                let ops: Vec<(&OpCond, ColumnType, usize, &Values)> = br
+                    .op_may
+                    .iter()
+                    .map(|&oi| {
+                        let o = &want.side.ops[oi];
+                        let (start, v) = column(o.column);
+                        (o, table.columns[o.column].ty, start, v)
+                    })
+                    .collect();
                 let outs: Vec<(bool, bool, usize, &Values)> = columns
                     .iter()
                     .map(|&(c, month)| {
@@ -851,6 +865,7 @@ impl Snail {
                         && rests.is_empty()
                         && texts.is_empty()
                         && nulls.is_empty()
+                        && ops.is_empty()
                         && dead.get(d).is_none_or(|&x| x as usize >= b)
                         && collated.iter().all(|c| c.1.is_none())
                         && sink.run(&outs, a, b)
@@ -888,6 +903,21 @@ impl Snail {
                             }) && nulls
                                 .iter()
                                 .all(|&(null, start, v)| v.is_null(r - start) == null);
+                        // A condition by an operator, held as a pipeline holds it.
+                        let keep = keep
+                            && ops.iter().all(|&(o, ty, start, v)| {
+                                let d = crate::values::datum_of(v, r - start, ty);
+                                matches!(
+                                    super::pipeline::eval_on(
+                                        &o.expr,
+                                        std::slice::from_ref(&o.name),
+                                        &[super::fill::value_of(&d, ty)],
+                                        table.release,
+                                        &Default::default(),
+                                    ),
+                                    Ok(super::pipeline::Value::Bool(true))
+                                )
+                            });
                         if !keep {
                             continue;
                         }
@@ -1137,8 +1167,36 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             text_may.push(ti);
         }
     }
+    // A condition by an operator rules the entry out where the column holds no value there, or where
+    // its span, kept on a GiST or SP-GiST strand, says no value there can hold it.
+    let mut op_may = Vec::new();
+    for (oi, o) in side.ops.iter().enumerate() {
+        let slot = order.leaf_slot(table, o.column).unwrap();
+        let span = walk
+            .head
+            .span_slots
+            .iter()
+            .position(|&s| s as usize == slot)
+            .and_then(|k| e.spans.get(k));
+        let ruled_out = e.columns[slot].nulls == e.rows
+            || match (span, &o.probe) {
+                (Some(span), Some(probe)) => !crate::spans::may_hold(
+                    &o.op,
+                    span,
+                    probe,
+                    crate::spans::is_inet(table.columns[o.column].ty),
+                ),
+                _ => false,
+            };
+        if ruled_out {
+            status = Status::None;
+        } else {
+            op_may.push(oi);
+        }
+    }
     let may = rest_may.len() + null_may.len();
-    if status != Status::None && (may > 0 || !text_may.is_empty() || keys_may) {
+    if status != Status::None && (may > 0 || !text_may.is_empty() || !op_may.is_empty() || keys_may)
+    {
         status = Status::May;
     }
     match status {
@@ -1149,7 +1207,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         Status::May => walk.statuses.1 += 1,
         Status::Must => walk.statuses.2 += 1,
     }
-    if interval == Status::Must && text_may.is_empty() && !keys_may {
+    if interval == Status::Must && text_may.is_empty() && op_may.is_empty() && !keys_may {
         match want.countable {
             Some(Countable::Total) => {
                 if may == 0 {
@@ -1224,6 +1282,9 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     for &ti in &text_may {
         need(side.texts[ti].column);
     }
+    for &oi in &op_may {
+        need(side.ops[oi].column);
+    }
     for &ni in &null_may {
         need(side.nulls[ni].0);
     }
@@ -1233,7 +1294,11 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         }
     }
     let whole: u64 = slots.iter().map(|&s| e.columns[s].pages as u64).sum();
-    let read_whole = interval == Status::Must && may == 0 && text_may.is_empty() && !keys_may;
+    let read_whole = interval == Status::Must
+        && may == 0
+        && text_may.is_empty()
+        && op_may.is_empty()
+        && !keys_may;
     walk.low += if walk.level > 1 {
         if read_whole {
             whole
@@ -1253,7 +1318,13 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         walk.rows_low += rows;
         walk.rows_high += rows;
     } else {
-        match (interval, text_may.is_empty(), keys_may, may, exact) {
+        match (
+            interval,
+            text_may.is_empty() && op_may.is_empty(),
+            keys_may,
+            may,
+            exact,
+        ) {
             (Status::Must, true, false, 1, Some(n)) => {
                 walk.rows_low += n;
                 walk.rows_high += n;
@@ -1267,6 +1338,7 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         rest_may,
         text_may,
         null_may,
+        op_may,
         slots,
     });
 }
@@ -1565,6 +1637,7 @@ mod tests {
             months: vec![months],
             ends: vec![[0, 0]],
             bytes: vec![],
+            spans: Vec::new(),
             child: Extent::default(),
         };
         let head = Head {
@@ -1604,6 +1677,7 @@ mod tests {
             months: vec![],
             ends: vec![],
             bytes: vec![],
+            spans: Vec::new(),
             child: Extent::default(),
         };
         let head = Head::default();
@@ -1639,6 +1713,7 @@ mod tests {
             months: vec![],
             ends: vec![],
             bytes: vec![],
+            spans: Vec::new(),
             child: Extent::default(),
         };
         let head = Head::default();

@@ -471,3 +471,199 @@ fn a_statement_routes_a_row_into_a_partial_strand_and_out_as_its_predicate_says(
         .value(0);
     assert_eq!(n, 1535);
 }
+
+#[test]
+fn a_gist_or_sp_gist_index_is_held_on_a_range_a_multirange_an_inet_and_text_alone() {
+    let table = "CREATE TABLE s.t (id int PRIMARY KEY, r int4range, m int4multirange, n inet, \
+                 tx text, p point, v tsvector);";
+    let got = outcomes(&format!(
+        "{table}\nCREATE INDEX t_r ON s.t USING gist (r) INCLUDE (tx);\n\
+         CREATE INDEX t_rm ON s.t USING gist (r, m);\n\
+         CREATE INDEX t_n ON s.t USING gist (n inet_ops);\n\
+         CREATE INDEX t_sr ON s.t USING spgist (r);\n\
+         CREATE INDEX t_sn ON s.t USING spgist (n);\n\
+         CREATE INDEX t_st ON s.t USING spgist (tx);\n\
+         CREATE INDEX t_p ON s.t USING gist (p);\n\
+         CREATE INDEX t_v ON s.t USING gist (v);\n\
+         CREATE INDEX t_q ON s.t USING spgist (p kd_point_ops);"
+    ));
+    assert_eq!(got[1..7], [None, None, None, None, None, None], "{got:?}");
+    for (at, op) in [(7, "point_ops"), (8, "tsvector_ops"), (9, "kd_point_ops")] {
+        assert!(
+            got[at].as_deref().is_some_and(
+                |e| e.contains(&format!("with the operator class {op} is not held yet"))
+            ),
+            "{got:?}"
+        );
+    }
+}
+
+/// A table of `n` rows, row i's range [10j, 10j + 5) for j = 7919i mod n, so that neighbours on the
+/// table's key lie far apart on the range's order; with a GiST index on the range.
+fn ranges(name: &str, n: i64) -> std::path::PathBuf {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id int NOT NULL, r int4range, PRIMARY KEY (id)); \
+         CREATE INDEX t_r ON s.t USING gist (r);",
+    )
+    .unwrap();
+    let ty = warren_snail::composed::built_in("int4range").unwrap();
+    let id = Values::Int((0..n).map(Some).collect());
+    let r = Values::Composed(
+        (0..n)
+            .map(|i| {
+                let j = (i * 7919) % n;
+                // Every hundredth row empty, and every hundred-and-first NULL.
+                let text = if i % 100 == 0 {
+                    "empty".to_string()
+                } else {
+                    format!("[{},{})", j * 10, j * 10 + 5)
+                };
+                (i % 101 != 0).then(|| {
+                    std::sync::Arc::new(warren_snail::composed::Compound::new(
+                        ty,
+                        warren_snail::composed::text_in(ty, &text).unwrap(),
+                    ))
+                })
+            })
+            .collect(),
+    );
+    let path = tmp(&format!("{name}.snail"));
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![id, r],
+            },
+        )],
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn a_gist_strand_on_a_range_rules_out_a_block_whose_span_its_value_misses() {
+    let mut s = fresh(&ranges("gist-range", 20480));
+    let blocks = blocks_of(&s.blocks().unwrap(), "t_r", "r.lower").len();
+    assert!(blocks > 2, "{blocks}");
+    for q in [
+        "SELECT id FROM s.t WHERE r && '[100000,100100)'",
+        "SELECT id FROM s.t WHERE '[100000,100100)' && r",
+        "SELECT id FROM s.t WHERE r @> '[100001,100003)'",
+        "SELECT id FROM s.t WHERE r @> 100002",
+        "SELECT id FROM s.t WHERE r @> 'empty'",
+        "SELECT id FROM s.t WHERE r <@ '[100000,100100)'",
+        "SELECT id FROM s.t WHERE '[100000,100100)' @> r",
+        "SELECT id FROM s.t WHERE r <@ 'empty'",
+        "SELECT id FROM s.t WHERE r << '[1000,1010)'",
+        "SELECT id FROM s.t WHERE r >> '[204000,204010)'",
+        "SELECT id FROM s.t WHERE r &< '[0,1000)'",
+        "SELECT id FROM s.t WHERE r &> '[204000,204010)'",
+        "SELECT id FROM s.t WHERE r -|- '[100005,100010)'",
+        "SELECT id FROM s.t WHERE r && 'empty'",
+        "SELECT id FROM s.t WHERE r && '(,)' AND id < 50",
+    ] {
+        let along_key = ids(&mut s, q, "t_pkey");
+        assert_eq!(ids(&mut s, q, "t_r"), along_key, "{q}");
+    }
+    // A narrow value lies in the span of one block or two: the rest are never read.
+    let q = "SELECT id FROM s.t WHERE r && '[100000,100100)'";
+    let (_, along) = s.ask(q, Some("t_r")).unwrap();
+    assert!(
+        along.blocks_read <= 2 && along.entries_none as usize >= blocks - 2,
+        "{along:?}"
+    );
+    let (_, whole) = s.ask(q, Some("t_pkey")).unwrap();
+    assert!(whole.blocks_read > along.blocks_read, "{whole:?}");
+    // An empty range lies in no span; only the blocks holding one are read for <@ 'empty'.
+    let (_, empty) = s
+        .ask("SELECT id FROM s.t WHERE r <@ 'empty'", Some("t_r"))
+        .unwrap();
+    assert!(empty.blocks_read < blocks as u64, "{empty:?}");
+}
+
+#[test]
+fn an_sp_gist_strand_on_an_inet_rules_out_a_block_whose_addresses_its_network_misses() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id int NOT NULL, n inet, PRIMARY KEY (id)); \
+         CREATE INDEX t_n ON s.t USING spgist (n);",
+    )
+    .unwrap();
+    let path = tmp("spgist-inet.snail");
+    write(&path, &catalog, &[]).unwrap();
+    #[cfg(feature = "standalone")]
+    {
+        let mut w = Snail::open_writing(&path).unwrap();
+        let rows: Vec<String> = (0..4096)
+            .map(|i| {
+                let j = (i * 7919) % 4096;
+                format!("({i}, '10.{}.{}.0/24')", j / 256, j % 256)
+            })
+            .collect();
+        w.execute(&format!(
+            "INSERT INTO s.t (id, n) VALUES {}",
+            rows.join(", ")
+        ))
+        .unwrap();
+        drop(w);
+        let mut s = fresh(&path);
+        for q in [
+            "SELECT id FROM s.t WHERE n << '10.7.0.0/16'",
+            "SELECT id FROM s.t WHERE n <<= '10.7.3.0/24'",
+            "SELECT id FROM s.t WHERE n >> '10.7.3.4'",
+            "SELECT id FROM s.t WHERE n >>= '10.7.3.0/24'",
+            "SELECT id FROM s.t WHERE n && '10.15.0.0/16'",
+            "SELECT id FROM s.t WHERE '10.7.0.0/16' >> n",
+            "SELECT id FROM s.t WHERE n && '192.168.0.0/16'",
+        ] {
+            let along_key = ids(&mut s, q, "t_pkey");
+            assert_eq!(ids(&mut s, q, "t_n"), along_key, "{q}");
+        }
+        let (_, along) = s
+            .ask("SELECT id FROM s.t WHERE n << '10.7.0.0/16'", Some("t_n"))
+            .unwrap();
+        assert_eq!(along.blocks_read, 1, "{along:?}");
+        let (_, none) = s
+            .ask(
+                "SELECT id FROM s.t WHERE n && '192.168.0.0/16'",
+                Some("t_n"),
+            )
+            .unwrap();
+        assert_eq!(none.blocks_read, 0, "{none:?}");
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_range_written_into_a_gist_strand_widens_its_block_s_span() {
+    let path = ranges("gist-writes", 20480);
+    let mut w = Snail::open_writing(&path).unwrap();
+    // A range past every span, into the strand's last block; one moved past it; one deleted.
+    for sql in [
+        "INSERT INTO s.t (id, r) VALUES (30000, '[900000,900010)')",
+        "UPDATE s.t SET r = '[950000,950001)' WHERE id = 1",
+        "DELETE FROM s.t WHERE id = 2",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    drop(w);
+    let mut s = fresh(&path);
+    for q in [
+        "SELECT id FROM s.t WHERE r && '[900005,900006)'",
+        "SELECT id FROM s.t WHERE r @> 950000",
+        "SELECT id FROM s.t WHERE r >> '[800000,800001)'",
+        "SELECT id FROM s.t WHERE r && '[79190,79195)'",
+    ] {
+        let along_key = ids(&mut s, q, "t_pkey");
+        assert_eq!(ids(&mut s, q, "t_r"), along_key, "{q}");
+    }
+    assert_eq!(
+        ids(
+            &mut s,
+            "SELECT id FROM s.t WHERE r >> '[800000,800001)'",
+            "t_r"
+        ),
+        [1, 30000]
+    );
+}

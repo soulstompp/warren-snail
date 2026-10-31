@@ -1266,6 +1266,7 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> He
         height: 0,
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
+        span_slots: crate::spans::slots(table, order),
     }
 }
 
@@ -1281,6 +1282,7 @@ pub(crate) fn empty_head(table: &Table, order: &Order) -> Head {
         height: 1,
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
+        span_slots: crate::spans::slots(table, order),
     }
 }
 
@@ -1440,6 +1442,7 @@ fn write_order(
         height: 0,
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
+        span_slots: crate::spans::slots(table, order),
     };
     let (top, below) = build(head, entries, &mut |bytes| w.place(bytes))?;
     let levels = decode_top(&top)?.0.height;
@@ -1482,6 +1485,12 @@ pub(crate) fn write_block(
     let mut months = vec![[0u32; 12]; month_slots.len()];
     let mut ends = vec![[0u32; 2]; month_slots.len()];
     let mut bytes = vec![0u32; text_slots.len()];
+    let spans: Vec<crate::directory::Span> = crate::spans::columns(table, order)
+        .into_iter()
+        .map(|c| {
+            crate::spans::of_rows(table.columns[c].ty, &rows.columns[c], &perm[b.start..b.end])
+        })
+        .collect();
     let block_leaves = order.columns.iter().flat_map(|&c| {
         let ty = table.columns[c].ty;
         rows.columns[c]
@@ -1591,6 +1600,7 @@ pub(crate) fn write_block(
         months,
         ends,
         bytes,
+        spans,
         child,
     };
     Ok((entry, encoded, moved))
