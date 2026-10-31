@@ -15,6 +15,7 @@ pub(crate) mod foreign;
 mod hash;
 mod join;
 mod out;
+pub(crate) mod partial;
 mod pipeline;
 mod point;
 mod question;
@@ -683,9 +684,22 @@ impl Snail {
         if let Some(k) = want.keys {
             needed.extend(k.columns.iter().copied());
         }
-        let served: Vec<usize> = (0..table.orders.len())
-            .filter(|&o| needed.iter().all(|&c| table.orders[o].slot(c).is_some()))
-            .collect();
+        // A partial strand holds only the rows its predicate admits, so it serves a question whose
+        // conditions imply the predicate.
+        let implied = |o: usize| -> Result<bool> {
+            Ok(
+                match partial::Predicate::of(&self.catalog, table, &table.orders[o])? {
+                    Some(p) => p.implied_by(want.side),
+                    None => true,
+                },
+            )
+        };
+        let mut served = Vec::new();
+        for o in 0..table.orders.len() {
+            if needed.iter().all(|&c| table.orders[o].slot(c).is_some()) && implied(o)? {
+                served.push(o);
+            }
+        }
         if served.is_empty() {
             return Err(Error::new(format!(
                 "no order of {} holds every column the question reads",
@@ -699,6 +713,13 @@ impl Snail {
                     .iter()
                     .position(|x| x.name == n)
                     .ok_or_else(|| Error::new(format!("{} has no order {n}", table.name)))?;
+                if !implied(o)? {
+                    return Err(Error::new(format!(
+                        "{n} holds only the rows its predicate admits, WHERE {}, which the \
+                         question does not imply",
+                        table.orders[o].predicate.as_deref().unwrap_or_default()
+                    )));
+                }
                 if !served.contains(&o) {
                     return Err(Error::new(format!(
                         "{n} does not hold every column the question reads"

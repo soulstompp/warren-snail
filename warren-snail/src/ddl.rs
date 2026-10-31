@@ -1730,6 +1730,9 @@ fn qualified(schema: &str, name: &str) -> String {
 struct Keyed {
     name: String,
     method: Method,
+    predicate: Option<String>,
+    /// The columns its predicate reads, which its strand carries.
+    predicate_columns: Vec<usize>,
     levels: Vec<Level>,
     include: Vec<usize>,
     unique: bool,
@@ -2207,6 +2210,11 @@ impl Draft {
                     return Err(Error::new(format!(
                         "cannot cluster on index \"{index}\" because access method does not \
                          support clustering"
+                    )))
+                }
+                Some(k) if k.predicate.is_some() => {
+                    return Err(Error::new(format!(
+                        "cannot cluster on partial index \"{index}\""
                     )))
                 }
                 Some(_) => {}
@@ -3120,6 +3128,8 @@ impl Draft {
             made.push(Keyed {
                 name: kname,
                 method: Method::Btree,
+                predicate: None,
+                predicate_columns: Vec::new(),
                 nulls_first: vec![false; levels.len()],
                 desc: vec![false; levels.len()],
                 keys: k.columns.clone(),
@@ -3453,11 +3463,40 @@ impl Draft {
                 "access method \"{am}\" does not support multicolumn indexes"
             )));
         }
-        if let Some(p) = &i.predicate {
-            return Err(Error::new(format!(
-                "{shown}: a partial index, WHERE {p}, is not held yet"
-            )));
-        }
+        let (predicate, predicate_columns) = match &i.predicate {
+            None => (None, Vec::new()),
+            Some(p) => {
+                // The predicate is read as a question's WHERE on the table alone.
+                let alone = Catalog {
+                    ddl: String::new(),
+                    tables: vec![Table {
+                        name: t.name.clone(),
+                        columns: t.columns.clone(),
+                        orders: Vec::new(),
+                        checks: Vec::new(),
+                        release: crate::regs::LATEST,
+                        foreign_keys: Vec::new(),
+                    }],
+                    functions: self.functions.clone(),
+                    types: self.types.clone(),
+                    domains: self.domains.clone(),
+                    sequences: self.sequences.clone(),
+                    collations: self.collations.clone(),
+                    release: crate::regs::LATEST,
+                };
+                let text = p.to_string();
+                let read = crate::read::partial::Predicate::read(&alone, &alone.tables[0], &text)
+                    .map_err(
+                    |e| {
+                        Error::new(format!(
+                            "{shown}: its predicate, WHERE {text}, is read only as comparisons of \
+                             its columns with values, IS NULL and IS NOT NULL, and the truth tests: \
+                             {e}"
+                        ))
+                    })?;
+                (Some(text), read.columns())
+            }
+        };
         let mut levels = Vec::new();
         let mut desc = Vec::new();
         let mut nulls_first = Vec::new();
@@ -3646,6 +3685,8 @@ impl Draft {
         let keyed = Keyed {
             name,
             method,
+            predicate,
+            predicate_columns,
             levels,
             include,
             unique: i.unique,
@@ -3720,6 +3761,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         options: ordered.options,
         constraint: ordered.constraint,
         clustered: d.clustered.is_some(),
+        predicate: None,
     }];
     for s in strands {
         let held = dedup(
@@ -3727,7 +3769,8 @@ fn finish_table(d: &Declared) -> Result<Table> {
                 .iter()
                 .map(|l| l.column())
                 .chain(s.include.iter().copied())
-                .chain(key.iter().copied()),
+                .chain(key.iter().copied())
+                .chain(s.predicate_columns.iter().copied()),
         );
         orders.push(Order {
             name: s.name,
@@ -3745,6 +3788,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
             options: s.options,
             constraint: s.constraint,
             clustered: false,
+            predicate: s.predicate,
         });
     }
     for o in &orders {

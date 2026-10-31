@@ -1044,6 +1044,8 @@ pub struct Order {
     pub constraint: Option<KeyConstraint>,
     /// Whether ALTER TABLE … CLUSTER ON names it.
     pub clustered: bool,
+    /// A partial index's predicate, as written: the strand holds only the rows it admits.
+    pub predicate: Option<String>,
 }
 
 impl Order {
@@ -2784,7 +2786,15 @@ mod tests {
             .1
             .unwrap()
             .contains("data type integer has no default operator class for access method \"gin\""));
-        assert!(read[4].1.unwrap().contains("a partial index, WHERE a > 0"));
+        assert_eq!(read[4].1, None);
+        assert_eq!(
+            r.catalog.tables[0]
+                .order("tp")
+                .unwrap()
+                .predicate
+                .as_deref(),
+            Some("a > 0")
+        );
         assert_eq!(read[5].1, None);
         assert_eq!(r.catalog.tables[0].order("tb").unwrap().desc, [true]);
         assert_eq!(
@@ -2797,7 +2807,7 @@ mod tests {
         // The statements taken are a DDL of their own, which reads as the catalog they made.
         let again = Catalog::parse(&r.catalog.ddl).unwrap();
         assert_eq!(again.facts(), r.catalog.facts());
-        assert_eq!(again.tables[0].orders.len(), 2);
+        assert_eq!(again.tables[0].orders.len(), 3);
         let e = refused(
             "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t USING foo (a);",
         );

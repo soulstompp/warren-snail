@@ -869,6 +869,22 @@ fn write_tables(
             }
         }
         for order in &table.orders {
+            // A partial strand holds the rows its predicate admits, encoded afresh.
+            let admitted = match crate::read::partial::Predicate::of(catalog, table, order)? {
+                Some(p) => {
+                    let kept: Vec<usize> = (0..rows.len())
+                        .filter(|&r| p.admits_at(table, rows, r))
+                        .collect();
+                    Some(Rows {
+                        columns: rows.columns.iter().map(|v| v.gather(&kept)).collect(),
+                    })
+                }
+                None => None,
+            };
+            let (rows, source) = match &admitted {
+                Some(r) => (r, None),
+                None => (rows, source),
+            };
             if order
                 .levels
                 .iter()

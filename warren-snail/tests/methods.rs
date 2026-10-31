@@ -1,7 +1,8 @@
 //! The index methods other than the B-tree: each read from its DDL as PostgreSQL 19 reads it, refused
 //! in its words where PostgreSQL refuses it, and held as a strand of its own kind. A hash strand is a
 //! strand on its key's B-tree order, `=` one place of it; aclitem, cid and xid, which have a hash and
-//! no B-tree, on their bytes.
+//! no B-tree, on their bytes. A partial strand holds the rows its predicate admits, routed there at the
+//! write, and serves a question whose conditions imply the predicate.
 
 mod weather;
 
@@ -306,4 +307,150 @@ fn a_snail_of_format_eight_refuses_an_index_of_another_method_by_name() {
         e.contains("s.t: the hash index t_b, which a snail of format 8") && e.contains("`out`"),
         "{e}"
     );
+}
+
+#[test]
+fn a_partial_index_s_predicate_is_read_as_a_question_s_where_or_refused_by_name() {
+    let table = "CREATE TABLE s.t (id int PRIMARY KEY, a int, tags int[], gone timestamptz);";
+    let got = outcomes(&format!(
+        "{table}\nCREATE INDEX t_live ON s.t (a) WHERE gone IS NULL;\n\
+         CREATE INDEX t_big ON s.t USING hash (a) WHERE a > 100 AND a <= 200;\n\
+         CREATE INDEX t_tagged ON s.t (a) WHERE cardinality(tags) > 0;\n\
+         ALTER TABLE s.t CLUSTER ON t_live;"
+    ));
+    assert_eq!(got[1..3], [None, None], "{got:?}");
+    assert!(
+        got[3]
+            .as_deref()
+            .is_some_and(|e| e.contains("t_tagged") && e.contains("predicate")),
+        "{got:?}"
+    );
+    assert!(
+        got[4]
+            .as_deref()
+            .is_some_and(|e| e.contains("cannot cluster on partial index \"t_live\"")),
+        "{got:?}"
+    );
+}
+
+/// A table of 4,096 rows, `a` its id's remainder by 512, `b` NULL on every fourth row, and a partial
+/// strand on `a` holding the rows whose `b` is not NULL and whose `a` is under 256.
+fn partial_snail(name: &str) -> std::path::PathBuf {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id int NOT NULL, a int NOT NULL, b int, PRIMARY KEY (id)); \
+         CREATE INDEX t_part ON s.t (a) WHERE b IS NOT NULL AND a < 256;",
+    )
+    .unwrap();
+    let n = 4096i64;
+    let id = Values::Int((0..n).map(Some).collect());
+    let a = Values::Int((0..n).map(|i| Some(i % 512)).collect());
+    let b = Values::Int((0..n).map(|i| (i % 4 != 0).then_some(i)).collect());
+    let path = tmp(&format!("{name}.snail"));
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![id, a, b],
+            },
+        )],
+    )
+    .unwrap();
+    path
+}
+
+/// The rows an order holds, by the directory.
+fn rows_of_order(s: &Snail, order: &str) -> u64 {
+    s.blocks()
+        .unwrap()
+        .iter()
+        .filter(|r| r.order == order && r.column == "a")
+        .map(|r| r.rows)
+        .sum()
+}
+
+#[test]
+fn a_partial_strand_holds_the_rows_its_predicate_admits_and_serves_what_implies_it() {
+    let mut s = fresh(&partial_snail("partial"));
+    // The rows whose b is not NULL and whose a is under 256: three of every four of half of them.
+    assert_eq!(rows_of_order(&s, "t_part"), 1536);
+    let implied = "SELECT id FROM s.t WHERE a = 7 AND b IS NOT NULL";
+    let mut want = ids(&mut s, implied, "t_pkey");
+    want.sort_unstable();
+    assert_eq!(want.len(), 8);
+    assert_eq!(ids(&mut s, implied, "t_part"), want);
+    let (_, round) = s.ask(implied, None).unwrap();
+    assert!(round.served.contains(&"t_part".to_string()), "{round:?}");
+    // A comparison of b keeps no NULL, so it implies b IS NOT NULL.
+    let implied = "SELECT id FROM s.t WHERE a >= 10 AND a < 12 AND b > 0";
+    assert_eq!(
+        ids(&mut s, implied, "t_part"),
+        ids(&mut s, implied, "t_pkey")
+    );
+    for not_implied in [
+        "SELECT id FROM s.t WHERE a = 7",
+        "SELECT id FROM s.t WHERE a = 300 AND b IS NOT NULL",
+        "SELECT id FROM s.t WHERE a < 300 AND b IS NOT NULL",
+    ] {
+        let (_, round) = s.ask(not_implied, None).unwrap();
+        assert!(
+            !round.served.contains(&"t_part".to_string()),
+            "{not_implied}: {round:?}"
+        );
+        let e = s
+            .ask(not_implied, Some("t_part"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("which the question does not imply"),
+            "{not_implied}: {e}"
+        );
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_statement_routes_a_row_into_a_partial_strand_and_out_as_its_predicate_says() {
+    let path = partial_snail("partial-writes");
+    let mut w = Snail::open_writing(&path).unwrap();
+    // In: a new row admitted, and a row whose b was NULL given one; out: a row whose b is set NULL,
+    // one whose a moves past 255, one deleted; and a row left out moved within what it leaves out.
+    for sql in [
+        "INSERT INTO s.t (id, a, b) VALUES (5000, 7, 1), (5001, 7, NULL)",
+        "UPDATE s.t SET b = 1 WHERE id = 4",
+        "UPDATE s.t SET b = NULL WHERE id = 1",
+        "UPDATE s.t SET a = 300 WHERE id = 2",
+        "DELETE FROM s.t WHERE id = 3",
+        "UPDATE s.t SET a = 301 WHERE id = 256",
+        "UPDATE s.t SET b = 2 WHERE id = 5",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    drop(w);
+    let mut s = fresh(&path);
+    // 1,536 rows, one in and one more given b, three out.
+    assert_eq!(rows_of_order(&s, "t_part"), 1535);
+    for q in [
+        "SELECT id FROM s.t WHERE a = 7 AND b IS NOT NULL",
+        "SELECT id FROM s.t WHERE a < 8 AND b IS NOT NULL",
+        "SELECT id FROM s.t WHERE a = 0 AND b IS NOT NULL",
+        "SELECT id FROM s.t WHERE a = 4 AND b IS NOT NULL",
+    ] {
+        assert_eq!(ids(&mut s, q, "t_part"), ids(&mut s, q, "t_pkey"), "{q}");
+    }
+    let (b, _) = s
+        .ask(
+            "SELECT count(*) FROM s.t WHERE a < 256 AND b IS NOT NULL",
+            Some("t_part"),
+        )
+        .unwrap();
+    let n = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 1535);
 }

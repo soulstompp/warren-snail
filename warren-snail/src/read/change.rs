@@ -68,6 +68,7 @@ pub(super) enum Waiting {
 }
 
 /// One row's change on a table.
+#[derive(Clone)]
 pub(super) enum Change {
     Insert(Row),
     Delete(Row),
@@ -186,7 +187,7 @@ fn level_key(
     }
 }
 
-fn push(v: &mut Values, d: &Datum) {
+pub(super) fn push(v: &mut Values, d: &Datum) {
     match (v, d) {
         (Values::Int(x), Datum::Int(n)) => x.push(Some(*n)),
         (Values::Int(x), Datum::Null) => x.push(None),
@@ -1798,6 +1799,29 @@ impl Snail {
         let order = &table.orders[oi];
         let held =
             |r: &Row| -> Vec<Datum> { order.columns.iter().map(|&c| r[c].clone()).collect() };
+        // A partial strand takes the rows its predicate admits: a row replaced by one it does not
+        // admit leaves it, and one it did not admit comes in when its replacement passes.
+        let predicate = super::partial::Predicate::of(&self.catalog, table, order)?;
+        let admits = |r: &Row| predicate.as_ref().is_none_or(|p| p.admits(table, r));
+        let routed: Vec<Change>;
+        let changes = if predicate.is_some() {
+            routed = changes
+                .iter()
+                .filter_map(|c| match c {
+                    Change::Insert(r) | Change::Delete(r) if !admits(r) => None,
+                    Change::Replace(o, n) => match (admits(o), admits(n)) {
+                        (true, true) => Some(c.clone()),
+                        (true, false) => Some(Change::Delete(o.clone())),
+                        (false, true) => Some(Change::Insert(n.clone())),
+                        (false, false) => None,
+                    },
+                    c => Some(c.clone()),
+                })
+                .collect();
+            routed.as_slice()
+        } else {
+            changes
+        };
         let mut effects = Vec::new();
         for c in changes {
             match c {

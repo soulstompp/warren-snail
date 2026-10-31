@@ -74,6 +74,12 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             o.name
         )));
     }
+    if let Some(o) = table.orders.iter().find(|o| o.predicate.is_some()) {
+        return Err(crate::Error::new(format!(
+            "{}: the partial index {}, {way}",
+            table.name, o.name
+        )));
+    }
     // 0.1.x refuses a FOREIGN KEY in the DDL it reads.
     if let Some(k) = table.foreign_keys.first() {
         return Err(crate::Error::new(format!(
