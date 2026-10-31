@@ -262,8 +262,8 @@ pub struct Snail {
     handed: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
     /// The sequences' states a commit at the root's turn writes.
     advancing: Option<Vec<crate::file::SequenceState>>,
-    /// Where the snail is written beside others opened together, what their writer shares, and the
-    /// snail's place among them.
+    /// Where the snail is open to write, what its writer shares among the snails it writes, and
+    /// the snail's place among them.
     group: Option<(std::rc::Rc<across::Group>, usize)>,
     /// The transaction across snails the next commit decides: the root it writes into each other
     /// snail, and their bytes, which the commit carries.
@@ -494,6 +494,7 @@ impl Snail {
             let (writer, _) = Writer::open(path)?;
             let mut snail = Snail::open(path)?;
             snail.slot = crate::lock::take_slot(writer.file())?;
+            snail.group = Some((std::rc::Rc::new(across::Group::alone(path, snail.slot)?), 0));
             snail.writer = Some(writer);
             Ok(snail)
         }
@@ -541,6 +542,7 @@ impl Snail {
         let (mut writer, _) = Writer::open(path)?;
         let mut snail = Snail::open_judged(path, judge)?;
         snail.slot = crate::lock::take_slot(writer.file())?;
+        snail.group = Some((std::rc::Rc::new(across::Group::alone(path, snail.slot)?), 0));
         writer.carried_by(host);
         snail.writer = Some(writer);
         Ok(snail)

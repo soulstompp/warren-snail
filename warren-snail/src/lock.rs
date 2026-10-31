@@ -26,6 +26,12 @@ const WAITS: u64 = (1 << 62) + (1 << 61);
 /// same slot in each of their files.
 const WRITER_OF: u64 = (1 << 62) + (1 << 58);
 const WRITER_IDS: u64 = 1 << 40;
+/// A run for each slot and each file beside: the writer of snails opened together that holds the
+/// slot marks, in each of their files, the path of every other, a lock a byte, so that a writer that
+/// never opened those files follows a ring through them.
+const BESIDE: u64 = (1 << 62) + (1 << 59);
+const BESIDE_FILES: u64 = 1 << 16;
+const PATH_BYTES: u64 = 1 << 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -251,6 +257,78 @@ pub(crate) fn writer_of(file: &File, slot: u64) -> Result<Option<u64>> {
     first_held(file, WRITER_OF + (slot << 40), WRITER_IDS)
 }
 
+/// The byte of the `i`th byte of the `k`th path the writer in `slot` marks beside the file.
+fn beside_at(slot: u64, k: u64, i: u64) -> u64 {
+    BESIDE + (slot << 37) + (k << 21) + (i << 9)
+}
+
+/// Marks, in a file of snails opened together to write, that the writer in `slot` writes the files
+/// of `paths` too: each byte of each path a lock whose length is the byte and one more.
+#[cfg(feature = "standalone")]
+pub(crate) fn mark_beside(file: &File, slot: u64, paths: &[&[u8]]) -> Result<()> {
+    if paths.len() as u64 > BESIDE_FILES {
+        return Err(Error::new(format!(
+            "more than {} snails opened together to write",
+            BESIDE_FILES + 1
+        )));
+    }
+    for (k, path) in paths.iter().enumerate() {
+        if path.len() as u64 > PATH_BYTES {
+            return Err(Error::new(format!(
+                "a snail opened together with others to write lies at a path longer than \
+                 {PATH_BYTES} bytes"
+            )));
+        }
+        for (i, &b) in path.iter().enumerate() {
+            take(
+                file,
+                Kind::Alone,
+                beside_at(slot, k as u64, i as u64),
+                1 + u64::from(b),
+                false,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The paths of the files the writer in another file's `slot` writes beside it, as it marked them.
+pub(crate) fn beside(file: &File, slot: u64) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for k in 0..BESIDE_FILES {
+        let mut path = Vec::new();
+        for i in 0..PATH_BYTES {
+            match held_at(file, beside_at(slot, k, i), 1)? {
+                Some((_, len)) => path.push((len - 1) as u8),
+                None => break,
+            }
+        }
+        if path.is_empty() {
+            break;
+        }
+        out.push(path);
+    }
+    Ok(out)
+}
+
+/// The writers of other files that wait for a block of this one: for the tests of writers waiting
+/// in a ring.
+#[doc(hidden)]
+pub fn waiting(file: &File) -> Result<u64> {
+    fn among(file: &File, start: u64, len: u64) -> Result<u64> {
+        if len == 0 {
+            return Ok(0);
+        }
+        Ok(match held_at(file, start, len)? {
+            None => 0,
+            Some((at, n)) => {
+                1 + among(file, start, at - start)? + among(file, at + n, start + len - at - n)?
+            }
+        })
+    }
+    among(file, WAITS, WRITER_SLOTS << 40)
+}
+
 /// Marks that the writer in `slot` holds the block of lock byte `byte`, or no longer does.
 pub(crate) fn mark_held(file: &File, slot: u64, byte: u64, held: bool) -> Result<()> {
     let at = HOLDS + ((byte - BLOCKS) << 16) + slot;
@@ -273,10 +351,15 @@ pub(crate) fn mark_waiting(file: &File, slot: u64, byte: u64, waits: bool) -> Re
 
 /// The first of another file's locks on `start..start + len`, as its first byte's place in the run.
 fn first_held(file: &File, start: u64, len: u64) -> Result<Option<u64>> {
+    Ok(held_at(file, start, len)?.map(|(at, _)| at - start))
+}
+
+/// The first of another file's locks on `start..start + len`, by its first byte and its length.
+fn held_at(file: &File, start: u64, len: u64) -> Result<Option<(u64, u64)>> {
     let mut f = flock(libc::F_WRLCK as libc::c_short, start, len);
     fcntl(file, libc::F_OFD_GETLK, &mut f)
         .map_err(|e| Error::new(format!("a test of the file's locks: {e}")))?;
-    Ok((f.l_type != libc::F_UNLCK as libc::c_short).then(|| f.l_start as u64 - start))
+    Ok((f.l_type != libc::F_UNLCK as libc::c_short).then(|| (f.l_start as u64, f.l_len as u64)))
 }
 
 /// The slot of the other writer that holds the block of lock byte `byte`, if one does.
@@ -415,6 +498,38 @@ mod tests {
             (holder(&b, x).unwrap(), awaited(&b, sa).unwrap()),
             (None, None)
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "standalone")]
+    fn a_writers_marks_of_the_files_beside_it_are_read_back_by_another_opened_only_to_read() {
+        let (path, a, b) = file("beside");
+        let seen = File::open(&path).unwrap();
+        let far: &[u8] = b"/a/snail/at/the/end/of/a/long/path/\x01\xff.snail";
+        mark_beside(&a, 7, &[b"/one.snail", far]).unwrap();
+        assert_eq!(
+            beside(&seen, 7).unwrap(),
+            vec![b"/one.snail".to_vec(), far.to_vec()]
+        );
+        assert!(
+            beside(&seen, 6).unwrap().is_empty(),
+            "another slot marks none"
+        );
+        assert!(beside(&a, 7).unwrap().is_empty(), "a file's own marks");
+        let (x, y) = (
+            block_byte(&(0usize, 0usize, 1)),
+            block_byte(&(0usize, 0usize, 2)),
+        );
+        mark_waiting(&a, 7, x, true).unwrap();
+        mark_waiting(&b, 8, y, true).unwrap();
+        assert_eq!(waiting(&seen).unwrap(), 2);
+        drop(a);
+        assert!(
+            beside(&seen, 7).unwrap().is_empty(),
+            "a closed file's marks go"
+        );
+        assert_eq!(waiting(&seen).unwrap(), 1);
         std::fs::remove_file(path).unwrap();
     }
 

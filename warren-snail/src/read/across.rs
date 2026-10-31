@@ -33,49 +33,110 @@ pub enum StopAcross {
     HalfFinal,
 }
 
-/// What the writer of snails opened together shares among them, so that a writer waiting for a
-/// block finds a ring through any of their files: each snail's first file opened again, whose locks
-/// show this writer's own as another's, and the slot it holds in each.
+/// A snail's first file opened again only to read its locks, so that they show every writer's,
+/// this writer's own as another's; and the file's device and inode.
+pub(crate) struct Seen {
+    file: std::fs::File,
+    at: (u64, u64),
+}
+
+impl Seen {
+    fn open(path: &Path) -> Result<Seen> {
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::File::open(path)
+            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let m = file
+            .metadata()
+            .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        Ok(Seen {
+            at: (m.dev(), m.ino()),
+            file,
+        })
+    }
+}
+
+/// What a writer shares among the snails it writes, so that waiting for a block it finds a ring
+/// through any snail's file: each of its snails' first files seen afresh, and the slot it holds in
+/// each.
 pub(crate) struct Group {
-    files: Vec<std::fs::File>,
+    files: Vec<Seen>,
     slot: u64,
 }
 
 impl Group {
+    /// What the writer of one snail shares: its file, seen afresh, and its slot there.
+    pub(crate) fn alone(path: &Path, slot: u64) -> Result<Group> {
+        Ok(Group {
+            files: vec![Seen::open(path)?],
+            slot,
+        })
+    }
+
+    fn seen<'a>(&'a self, reached: &'a [Seen], f: usize) -> &'a Seen {
+        match f.checked_sub(self.files.len()) {
+            Some(r) => &reached[r],
+            None => &self.files[f],
+        }
+    }
+
+    /// The file a path names: one this writer writes or the walk has reached already, by its device
+    /// and inode, or one opened now; none where it cannot be opened, and the walk passes it over.
+    fn reach(&self, reached: &mut Vec<Seen>, path: &[u8]) -> Option<usize> {
+        use std::os::unix::ffi::OsStrExt;
+        let seen = Seen::open(Path::new(std::ffi::OsStr::from_bytes(path))).ok()?;
+        if let Some(f) = self
+            .files
+            .iter()
+            .chain(reached.iter())
+            .position(|s| s.at == seen.at)
+        {
+            return Some(f);
+        }
+        reached.push(seen);
+        Some(self.files.len() + reached.len() - 1)
+    }
+
     /// Whether waiting for the block of lock byte `b` in the `me`th file closes a ring: its holder
-    /// waits for a block, in that file or in another of these, whose holder waits, and so on, back
-    /// to a block this writer holds.
+    /// waits for a block, in that file or in another it writes, whose holder waits, and so on, back
+    /// to a block this writer holds. A file this writer never opened is reached where a writer of
+    /// several marks it beside the file the walk stands in.
     pub(crate) fn ring(&self, me: usize, b: u64) -> Result<bool> {
+        let mut reached = Vec::new();
         let mut at = (me, b);
         let mut seen = std::collections::BTreeSet::new();
         loop {
             let (f, byte) = at;
-            let Some(holder) = lock::holder(&self.files[f], byte)? else {
+            let Some(holder) = lock::holder(&self.seen(&reached, f).file, byte)? else {
                 return Ok(false);
             };
-            if holder == self.slot {
+            if f < self.files.len() && holder == self.slot {
                 return Ok(true);
             }
-            if !seen.insert((f, holder)) {
+            let of = lock::writer_of(&self.seen(&reached, f).file, holder)?;
+            let who = match of {
+                Some(id) => (Some(id), (0, 0), 0),
+                None => (None, self.seen(&reached, f).at, holder),
+            };
+            if !seen.insert(who) {
                 return Ok(false);
             }
             // A writer of one snail waits only in its file; a writer of several, the same slot in
-            // each of their files, waits in any of those it shares with this writer.
-            let next = match lock::writer_of(&self.files[f], holder)? {
-                None => lock::awaited(&self.files[f], holder)?.map(|a| (f, a)),
-                Some(id) => {
-                    let mut found = None;
-                    for (g, file) in self.files.iter().enumerate() {
-                        if lock::writer_of(file, holder)? == Some(id) {
-                            if let Some(a) = lock::awaited(file, holder)? {
-                                found = Some((g, a));
-                                break;
-                            }
+            // each of their files, waits in this one or in one it marks beside it here.
+            let mut next = lock::awaited(&self.seen(&reached, f).file, holder)?.map(|a| (f, a));
+            if let (None, Some(id)) = (next, of) {
+                for path in lock::beside(&self.seen(&reached, f).file, holder)? {
+                    let Some(g) = self.reach(&mut reached, &path) else {
+                        continue;
+                    };
+                    let file = &self.seen(&reached, g).file;
+                    if lock::writer_of(file, holder)? == Some(id) {
+                        if let Some(a) = lock::awaited(file, holder)? {
+                            next = Some((g, a));
+                            break;
                         }
                     }
-                    found
                 }
-            };
+            }
             match next {
                 Some(n) => at = n,
                 None => return Ok(false),
@@ -146,18 +207,27 @@ impl Snails {
                 .iter()
                 .map(|s| s.writer.as_ref().unwrap().file())
                 .collect();
-            let slot = lock::take_slot_across(&files, lock::writer_id())?;
+            let id = lock::writer_id();
+            let slot = lock::take_slot_across(&files, id)?;
+            // In each file, the path of every other, for a writer that never opened them.
+            let named: Vec<Vec<u8>> = paths
+                .iter()
+                .map(|p| {
+                    use std::os::unix::ffi::OsStringExt;
+                    std::fs::canonicalize(p)
+                        .map(|c| c.into_os_string().into_vec())
+                        .map_err(|e| Error::new(format!("{}: {e}", p.display())))
+                })
+                .collect::<Result<_>>()?;
+            for (i, f) in files.iter().enumerate() {
+                let others: Vec<&[u8]> = (0..named.len())
+                    .filter(|&j| j != i)
+                    .map(|j| named[j].as_slice())
+                    .collect();
+                lock::mark_beside(f, slot, &others)?;
+            }
             let group = std::rc::Rc::new(Group {
-                files: paths
-                    .iter()
-                    .map(|p| {
-                        std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(p)
-                            .map_err(|e| Error::new(format!("{}: {e}", p.display())))
-                    })
-                    .collect::<Result<_>>()?,
+                files: paths.iter().map(|p| Seen::open(p)).collect::<Result<_>>()?,
                 slot,
             });
             for (i, s) in snails.iter_mut().enumerate() {

@@ -1336,7 +1336,8 @@ impl Snail {
                 return Ok(false);
             }
             lock::mark_waiting(file, self.slot, b, true)?;
-            let ring = self.ring(file, b);
+            let (group, me) = self.group.as_ref().expect("a snail open to write");
+            let ring = group.ring(*me, b);
             if !matches!(ring, Ok(false)) {
                 lock::mark_waiting(file, self.slot, b, false)?;
                 ring?;
@@ -1351,31 +1352,6 @@ impl Snail {
         }
         lock::mark_held(file, self.slot, b, true)?;
         Ok(true)
-    }
-
-    /// Whether waiting for the block of lock byte `b` closes a ring: its holder waits for a block
-    /// whose holder waits, and so on, back to a block this writer holds.
-    fn ring(&self, file: &std::fs::File, b: u64) -> Result<bool> {
-        if let Some((group, me)) = &self.group {
-            return group.ring(*me, b);
-        }
-        let mut at = b;
-        let mut seen = std::collections::BTreeSet::new();
-        loop {
-            if self.locks.contains(&at) {
-                return Ok(true);
-            }
-            let Some(holder) = lock::holder(file, at)? else {
-                return Ok(false);
-            };
-            if !seen.insert(holder) {
-                return Ok(false);
-            }
-            let Some(next) = lock::awaited(file, holder)? else {
-                return Ok(false);
-            };
-            at = next;
-        }
     }
 
     pub(super) fn written(&self) -> u64 {

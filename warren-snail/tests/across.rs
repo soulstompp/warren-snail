@@ -872,4 +872,207 @@ mod written {
         assert!(e.to_string().contains("Key (q)=(8) is not present"), "{e}");
         w.execute("ROLLBACK").unwrap();
     }
+
+    /// A snail holding `ring.t<i>`, keys enough for its order to be cut into several blocks; and the
+    /// first key of its first block and of its last.
+    fn ring_table(name: &str, i: usize) -> (PathBuf, i64, i64) {
+        let path = tmp(&format!("{name}-{i}.snail"));
+        let ddl = format!(
+            "CREATE TABLE ring.t{i} (k integer NOT NULL, v integer NOT NULL, PRIMARY KEY (k));"
+        );
+        let keys: Vec<i64> = (0..4096).collect();
+        write(
+            &path,
+            &Catalog::parse(&ddl).unwrap(),
+            &[(
+                format!("ring.t{i}"),
+                Rows {
+                    columns: vec![ints(&keys), ints(&[0; 4096])],
+                },
+            )],
+        )
+        .unwrap();
+        let blocks = Snail::open(&path).unwrap().blocks().unwrap();
+        let last = blocks.iter().map(|b| b.block).max().unwrap();
+        assert!(last > 0, "{name}: one block");
+        let first = |n: u64| numbers(&blocks.iter().find(|b| b.block == n).unwrap().first)[0];
+        (path, first(0), first(last))
+    }
+
+    /// The value of a ring table's row.
+    fn ring_value(path: &Path, i: usize, k: i64) -> i64 {
+        let q = format!("SELECT r.v FROM ring.t{i} r WHERE r.k = {k}");
+        one(&Snail::open(path).unwrap().ask(&q, None).unwrap().0)
+    }
+
+    /// What a writer's second write and its end came to.
+    type Ended = (Result<u64, String>, Result<&'static str, String>);
+
+    /// Writers in a ring, each in a thread of its own: writer i opens the snails `files` names (one
+    /// alone, or several together), begins, and writes `holds`. Once every one holds, each but the
+    /// last writes `awaits` in turn, the next told to only once the writers waiting in the file
+    /// `waits_in` names have grown by it; then the last. What each one's second write and end came
+    /// to. A writer that never comes back fails the test.
+    fn in_a_ring(writers: Vec<(Vec<PathBuf>, String, String, PathBuf)>) -> Vec<Ended> {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let mut held = Vec::new();
+        let mut go = Vec::new();
+        let mut ended = Vec::new();
+        for (files, holds, awaits, _) in writers.clone() {
+            let (held_tx, held_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let (end_tx, end_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut execute: Box<
+                    dyn FnMut(&str) -> warren_snail::Result<warren_snail::read::Done>,
+                > = if files.len() == 1 {
+                    let mut s = Snail::open_writing(&files[0]).unwrap();
+                    Box::new(move |q| s.execute(q))
+                } else {
+                    let refs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+                    let mut s = Snails::open_writing(&refs).unwrap();
+                    Box::new(move |q| s.execute(q))
+                };
+                execute("BEGIN").unwrap();
+                execute(&holds).unwrap();
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                let second = execute(&awaits).map(|d| d.rows).map_err(|e| e.to_string());
+                let end = execute("COMMIT")
+                    .map(|d| d.statement)
+                    .map_err(|e| e.to_string());
+                end_tx.send((second, end)).unwrap();
+            });
+            held.push(held_rx);
+            go.push(go_tx);
+            ended.push(end_rx);
+        }
+        for h in &held {
+            h.recv_timeout(Duration::from_secs(20)).unwrap();
+        }
+        let mut waiting: std::collections::BTreeMap<PathBuf, u64> = Default::default();
+        let last = writers.len() - 1;
+        for (i, (_, _, _, waits_in)) in writers.iter().enumerate().take(last) {
+            go[i].send(()).unwrap();
+            let want = *waiting
+                .entry(waits_in.clone())
+                .and_modify(|n| *n += 1)
+                .or_insert(1);
+            let seen = std::fs::File::open(waits_in).unwrap();
+            let since = Instant::now();
+            while warren_snail::lock::waiting(&seen).unwrap() < want {
+                assert!(
+                    since.elapsed() < Duration::from_secs(20),
+                    "writer {i} never waited"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        // The walks of those waiting ended before the ring was closed.
+        std::thread::sleep(Duration::from_millis(100));
+        go[last].send(()).unwrap();
+        ended
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                e.recv_timeout(Duration::from_secs(20))
+                    .unwrap_or_else(|_| panic!("writer {i} still waits"))
+            })
+            .collect()
+    }
+
+    /// The last writer was refused as a deadlock and rolled back; every other wrote a row and
+    /// committed.
+    fn the_last_refused(ended: &[Ended]) {
+        let (last, rest) = ended.split_last().unwrap();
+        let e = last.0.as_ref().unwrap_err();
+        assert!(e.starts_with("deadlock detected"), "{e}");
+        assert_eq!(last.1, Ok("ROLLBACK"));
+        for (i, (second, end)) in rest.iter().enumerate() {
+            assert_eq!((second, end), (&Ok(1), &Ok("COMMIT")), "writer {i}");
+        }
+    }
+
+    /// `n` writers each of two of `n` snails, writer i holding a row of table i and waiting for the
+    /// same row of table i + 1, which the next holds, the last for table 1's: the last closes the
+    /// ring through snails it never opened, and is refused as a deadlock. The others commit in turn
+    /// back round the ring, table 1 left as the first wrote it and each other as the writer before
+    /// its own.
+    fn ring_of_writers_of_two(name: &str, n: usize) {
+        let tables: Vec<(PathBuf, i64, i64)> = (1..=n).map(|i| ring_table(name, i)).collect();
+        let k = tables[0].1;
+        let writers = (1..=n)
+            .map(|i| {
+                let j = i % n + 1;
+                let set = |t: usize| format!("UPDATE ring.t{t} SET v = {i} WHERE k = {k}");
+                (
+                    vec![tables[i - 1].0.clone(), tables[j - 1].0.clone()],
+                    set(i),
+                    set(j),
+                    tables[j - 1].0.clone(),
+                )
+            })
+            .collect();
+        the_last_refused(&in_a_ring(writers));
+        for (i, (path, _, _)) in tables.iter().enumerate() {
+            let t = i + 1;
+            assert_eq!(
+                ring_value(path, t, k),
+                if t == 1 { 1 } else { t as i64 - 1 },
+                "t{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn writers_waiting_in_a_ring_through_three_snails_fail_the_one_closing_it_where_it_never_opened_one(
+    ) {
+        ring_of_writers_of_two("ring-three", 3);
+    }
+
+    #[test]
+    fn writers_waiting_in_a_ring_through_four_snails_fail_the_one_closing_it_where_it_never_opened_two(
+    ) {
+        ring_of_writers_of_two("ring-four", 4);
+    }
+
+    /// Four writers in a ring through two snails: the first writes only the first and closes the
+    /// ring, a writer of the two holding the block of the first it waits for, a writer of the second
+    /// alone holding the one that writer waits for there, and a writer of both, waiting for the
+    /// first's block, holding the one the second-alone waits for. The first never opened the second
+    /// snail, and is refused as a deadlock.
+    #[test]
+    fn a_writer_of_one_snail_closing_a_ring_through_a_snail_it_never_opened_fails_with_a_deadlock()
+    {
+        let (a, a0, a1) = ring_table("ring-alone", 1);
+        let (b, b0, b1) = ring_table("ring-alone", 2);
+        let set = |t: usize, k: i64, v: i64| format!("UPDATE ring.t{t} SET v = {v} WHERE k = {k}");
+        let ended = in_a_ring(vec![
+            (
+                vec![a.clone(), b.clone()],
+                set(1, a1, 2),
+                set(2, b0, 2),
+                b.clone(),
+            ),
+            (vec![b.clone()], set(2, b0, 3), set(2, b1, 3), b.clone()),
+            (
+                vec![b.clone(), a.clone()],
+                set(2, b1, 4),
+                set(1, a0, 4),
+                a.clone(),
+            ),
+            (vec![a.clone()], set(1, a0, 1), set(1, a1, 1), a.clone()),
+        ]);
+        the_last_refused(&ended);
+        assert_eq!(
+            [
+                ring_value(&a, 1, a0),
+                ring_value(&a, 1, a1),
+                ring_value(&b, 2, b0),
+                ring_value(&b, 2, b1)
+            ],
+            [4, 2, 2, 3]
+        );
+    }
 }
