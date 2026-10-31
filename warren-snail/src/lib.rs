@@ -3,6 +3,7 @@
 pub mod bytes;
 pub mod carry;
 pub mod catalog;
+mod categories;
 pub mod collations;
 pub mod composed;
 pub mod cut;

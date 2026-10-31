@@ -2386,12 +2386,8 @@ pub(super) fn ctype_of(casing: crate::catalog::Casing) -> Result<crate::regex::C
     let ctype = match casing {
         Casing::Ascii => Ctype::C,
         Casing::Libc => Ctype::Libc { default: true },
-        Casing::Simple | Casing::Full => {
-            return Err(Error::new(
-                "a regular expression under PostgreSQL's own Unicode tables (pg_c_utf8, \
-                 pg_unicode_fast) is not read yet",
-            ))
-        }
+        Casing::Simple => Ctype::Builtin { full: false },
+        Casing::Full => Ctype::Builtin { full: true },
     };
     if !ctype.available() {
         return Err(Error::new(

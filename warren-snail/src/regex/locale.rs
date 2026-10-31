@@ -1,6 +1,7 @@
 //! The character classes and the case mapping a regular expression is compiled and run under, by
 //! its collation, as PostgreSQL 19's `regc_pg_locale.c` reads them: under C, POSIX and ucs_basic
-//! ASCII's classes alone, from PostgreSQL's own table; under glibc's C.UTF-8 the C library's.
+//! ASCII's classes alone, from PostgreSQL's own table; under glibc's C.UTF-8 the C library's;
+//! under pg_c_utf8 and pg_unicode_fast PostgreSQL's own Unicode tables.
 
 use super::guts::{CharClass, Chr, MAX_SIMPLE_CHR};
 
@@ -13,6 +14,9 @@ pub enum Ctype {
     /// glibc's C.UTF-8: libc's C.utf8, or the database's default where `default`, which maps
     /// ASCII's letters by C's rules.
     Libc { default: bool },
+    /// PostgreSQL's builtin provider: pg_c_utf8, or pg_unicode_fast where `full`, its digit, alnum
+    /// and punct Unicode's rather than POSIX's.
+    Builtin { full: bool },
 }
 
 const PG_ISDIGIT: u8 = 0x01;
@@ -79,6 +83,7 @@ impl Ctype {
         match self {
             Ctype::C => true,
             Ctype::Libc { .. } => crate::strings::c_utf8().is_ok(),
+            Ctype::Builtin { .. } => true,
         }
     }
 
@@ -90,6 +95,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISDIGIT),
             Ctype::Libc { .. } => libc_probe(iswdigit_l, c),
+            Ctype::Builtin { full } => crate::categories::isdigit(c, !full),
         }
     }
 
@@ -97,6 +103,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISALPHA),
             Ctype::Libc { .. } => libc_probe(iswalpha_l, c),
+            Ctype::Builtin { .. } => crate::categories::isalpha(c),
         }
     }
 
@@ -104,6 +111,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISALNUM),
             Ctype::Libc { .. } => libc_probe(iswalnum_l, c),
+            Ctype::Builtin { full } => crate::categories::isalnum(c, !full),
         }
     }
 
@@ -116,6 +124,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISUPPER),
             Ctype::Libc { .. } => libc_probe(iswupper_l, c),
+            Ctype::Builtin { .. } => crate::categories::isupper(c),
         }
     }
 
@@ -123,6 +132,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISLOWER),
             Ctype::Libc { .. } => libc_probe(iswlower_l, c),
+            Ctype::Builtin { .. } => crate::categories::islower(c),
         }
     }
 
@@ -130,6 +140,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISGRAPH),
             Ctype::Libc { .. } => libc_probe(iswgraph_l, c),
+            Ctype::Builtin { .. } => crate::categories::isgraph(c),
         }
     }
 
@@ -137,6 +148,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISPRINT),
             Ctype::Libc { .. } => libc_probe(iswprint_l, c),
+            Ctype::Builtin { .. } => crate::categories::isprint(c),
         }
     }
 
@@ -144,6 +156,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISPUNCT),
             Ctype::Libc { .. } => libc_probe(iswpunct_l, c),
+            Ctype::Builtin { full } => crate::categories::ispunct(c, !full),
         }
     }
 
@@ -151,6 +164,7 @@ impl Ctype {
         match self {
             Ctype::C => Self::c_has(c, PG_ISSPACE),
             Ctype::Libc { .. } => libc_probe(iswspace_l, c),
+            Ctype::Builtin { .. } => crate::categories::isspace(c),
         }
     }
 
@@ -160,6 +174,7 @@ impl Ctype {
             Ctype::Libc { default: true } if c <= 127 => ascii_toupper(c),
             // SAFETY: as in `libc_probe`.
             Ctype::Libc { .. } => unsafe { towupper_l(c, libc_locale()) },
+            Ctype::Builtin { .. } => crate::strings::simple_case(c, true),
         }
     }
 
@@ -169,6 +184,7 @@ impl Ctype {
             Ctype::Libc { default: true } if c <= 127 => ascii_tolower(c),
             // SAFETY: as in `libc_probe`.
             Ctype::Libc { .. } => unsafe { towlower_l(c, libc_locale()) },
+            Ctype::Builtin { .. } => crate::strings::simple_case(c, false),
         }
     }
 
@@ -281,5 +297,19 @@ mod tests {
         assert!(t.isalpha(0xe9) && t.isupper(0xc9) && t.tolower(0xc9) == 0xe9);
         let alpha = t.class_members(CharClass::Alpha);
         assert!(alpha.locale_dependent && alpha.ranges.contains(&(65, 90)));
+    }
+
+    #[test]
+    fn the_builtin_provider_s_classes_are_postgresql_s_own_tables() {
+        let (posix, full) = (
+            Ctype::Builtin { full: false },
+            Ctype::Builtin { full: true },
+        );
+        assert!(!posix.isdigit(0x0663) && full.isdigit(0x0663));
+        assert!(posix.ispunct('$' as Chr) && !full.ispunct('$' as Chr));
+        assert!(
+            posix.isalpha(0x1500) && posix.tolower(0xc9) == 0xe9 && posix.toupper(0x1f0) == 0x1f0
+        );
+        assert!(posix.class_members(CharClass::Space).locale_dependent);
     }
 }

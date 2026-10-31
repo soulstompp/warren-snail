@@ -671,6 +671,15 @@ fn cases() -> &'static Cases {
     })
 }
 
+/// A code point's simple upper or lower case under PostgreSQL's own tables
+/// (`unicode_uppercase_simple`, `unicode_lowercase_simple`).
+pub(crate) fn simple_case(cp: u32, upper: bool) -> u32 {
+    cases()
+        .simple
+        .get(&cp)
+        .map_or(cp, |&(lower, up)| if upper { up } else { lower })
+}
+
 fn in_ranges(ranges: &[(u32, u32)], cp: u32) -> bool {
     ranges.iter().any(|&(lo, hi)| lo <= cp && cp <= hi)
 }
