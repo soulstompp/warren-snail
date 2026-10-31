@@ -156,7 +156,7 @@ struct Row {
 }
 
 /// The releases a row's header names: all of them, or ranges such as `14-15,17`.
-fn releases_of(spec: Option<&str>) -> u8 {
+pub(crate) fn releases_of(spec: Option<&str>) -> u8 {
     let bit = |r: u8| 1u8 << (r - RELEASES.start());
     match spec {
         None => RELEASES.map(bit).fold(0, |a, b| a | b),

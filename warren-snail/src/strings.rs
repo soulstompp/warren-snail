@@ -1013,6 +1013,70 @@ pub fn bits_cat(a: &[u8], b: &[u8]) -> Vec<u8> {
     key_of_bits(&x)
 }
 
+extern "C" {
+    fn iswalnum_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
+}
+
+/// A text with each word's first letter in upper case and the rest in lower, as PostgreSQL's
+/// initcap makes it under a collation that maps case as `casing`: a word a run of letters and
+/// digits, read after each character is mapped; ASCII's letters alone, glibc's C.UTF-8 a
+/// character to a character, or a library collation as its library titles text. Under
+/// PostgreSQL's own Unicode tables it is not read yet.
+pub fn title(s: &str, casing: crate::catalog::Casing) -> Result<String> {
+    use crate::catalog::Casing;
+    let mut was_alnum = false;
+    match casing {
+        Casing::Ascii => Ok(s
+            .chars()
+            .map(|ch| {
+                let m = if was_alnum {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch.to_ascii_uppercase()
+                };
+                was_alnum = m.is_ascii_alphanumeric();
+                m
+            })
+            .collect()),
+        Casing::Libc => {
+            let loc = c_utf8()?;
+            Ok(s.chars()
+                .map(|ch| {
+                    // SAFETY: the locale lives as long as the program; any code point is a wint_t.
+                    let m = unsafe {
+                        if was_alnum {
+                            towlower_l(ch as u32, loc)
+                        } else {
+                            towupper_l(ch as u32, loc)
+                        }
+                    };
+                    // SAFETY: as above.
+                    was_alnum = unsafe { iswalnum_l(m, loc) } != 0;
+                    char::from_u32(m).unwrap_or(ch)
+                })
+                .collect())
+        }
+        Casing::Library(id) => crate::collations::get(id).title(s),
+        Casing::Simple | Casing::Full => Err(Error::new(
+            "initcap under PostgreSQL's own Unicode tables (pg_c_utf8, pg_unicode_fast) is not read yet",
+        )),
+    }
+}
+
+/// A text case folded, as PostgreSQL's casefold folds it under a collation that maps case as
+/// `casing`: ASCII's letters and glibc's C.UTF-8 to lower case, a library collation as its library
+/// folds. Under PostgreSQL's own Unicode tables it is not read yet.
+pub fn fold(s: &str, casing: crate::catalog::Casing) -> Result<String> {
+    use crate::catalog::Casing;
+    match casing {
+        Casing::Ascii | Casing::Libc => case(s, false, casing),
+        Casing::Library(id) => crate::collations::get(id).fold(s),
+        Casing::Simple | Casing::Full => Err(Error::new(
+            "casefold under PostgreSQL's own Unicode tables (pg_c_utf8, pg_unicode_fast) is not read yet",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

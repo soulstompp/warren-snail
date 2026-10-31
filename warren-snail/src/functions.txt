@@ -1,0 +1,2924 @@
+"bit"(bigint,integer)		type	an operator's, a cast's or an index's
+"bit"(bit,integer,boolean)		type	an operator's, a cast's or an index's
+"bit"(integer,integer)		type	an operator's, a cast's or an index's
+"char"(integer)		type	an operator's, a cast's or an index's
+"char"(text)		type	an operator's, a cast's or an index's
+"current_schema"()		server	sessions
+"current_user"()		server	roles and privileges
+"extract"(text,date)		type	time
+"extract"(text,interval)		type	time
+"extract"(text,time with time zone)		type	time
+"extract"(text,time without time zone)		type	time
+"extract"(text,timestamp with time zone)		type	time
+"extract"(text,timestamp without time zone)		type	time
+"interval"(interval,integer)		type	an operator's, a cast's or an index's
+"interval"(time without time zone)		type	an operator's, a cast's or an index's
+"json_object"(text[])	16-19	type	JSON
+"json_object"(text[],text[])	16-19	type	JSON
+"left"(text,integer)		type	strings and formatting
+"like"(bytea,bytea)		type	strings and formatting
+"like"(name,text)		type	strings and formatting
+"like"(text,text)		type	strings and formatting
+"normalize"(text,text)		type	strings and formatting
+"numeric"(bigint)		type	an operator's, a cast's or an index's
+"numeric"(double precision)		type	an operator's, a cast's or an index's
+"numeric"(integer)		type	an operator's, a cast's or an index's
+"numeric"(jsonb)		type	an operator's, a cast's or an index's
+"numeric"(money)		type	an operator's, a cast's or an index's
+"numeric"(numeric,integer)		type	an operator's, a cast's or an index's
+"numeric"(real)		type	an operator's, a cast's or an index's
+"numeric"(smallint)		type	an operator's, a cast's or an index's
+"overlaps"(time with time zone,time with time zone,time with time zone,time with time zone)		type	time
+"overlaps"(time without time zone,interval,time without time zone,interval)		type	time
+"overlaps"(time without time zone,interval,time without time zone,time without time zone)		type	time
+"overlaps"(time without time zone,time without time zone,time without time zone,interval)		type	time
+"overlaps"(time without time zone,time without time zone,time without time zone,time without time zone)		type	time
+"overlaps"(timestamp with time zone,interval,timestamp with time zone,interval)		type	time
+"overlaps"(timestamp with time zone,interval,timestamp with time zone,timestamp with time zone)		type	time
+"overlaps"(timestamp with time zone,timestamp with time zone,timestamp with time zone,interval)		type	time
+"overlaps"(timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone)		type	time
+"overlaps"(timestamp without time zone,interval,timestamp without time zone,interval)		type	time
+"overlaps"(timestamp without time zone,interval,timestamp without time zone,timestamp without time zone)		type	time
+"overlaps"(timestamp without time zone,timestamp without time zone,timestamp without time zone,interval)		type	time
+"overlaps"(timestamp without time zone,timestamp without time zone,timestamp without time zone,timestamp without time zone)		type	time
+"overlay"(bit,bit,integer)		type	bit strings
+"overlay"(bit,bit,integer,integer)		type	bit strings
+"overlay"(bytea,bytea,integer)		type	strings and formatting
+"overlay"(bytea,bytea,integer,integer)		type	strings and formatting
+"overlay"(text,text,integer)		type	strings and formatting
+"overlay"(text,text,integer,integer)		type	strings and formatting
+"position"(bit,bit)		type	bit strings
+"position"(bytea,bytea)		type	strings and formatting
+"position"(text,text)		type	strings and formatting
+"right"(text,integer)		type	strings and formatting
+"session_user"()		server	roles and privileges
+"substring"(bit,integer)		type	bit strings
+"substring"(bit,integer,integer)		type	bit strings
+"substring"(bytea,integer)		type	strings and formatting
+"substring"(bytea,integer,integer)		type	strings and formatting
+"substring"(text,integer)		type	strings and formatting
+"substring"(text,integer,integer)		type	strings and formatting
+"substring"(text,text)		type	strings and formatting
+"substring"(text,text,text)		type	regular expressions
+"system_user"()	16-19	server	roles and privileges
+"time"(interval)		type	an operator's, a cast's or an index's
+"time"(time with time zone)		type	an operator's, a cast's or an index's
+"time"(time without time zone,integer)		type	an operator's, a cast's or an index's
+"time"(timestamp with time zone)		type	an operator's, a cast's or an index's
+"time"(timestamp without time zone)		type	an operator's, a cast's or an index's
+"timestamp"(date)		type	an operator's, a cast's or an index's
+"timestamp"(date,time without time zone)		type	time
+"timestamp"(timestamp with time zone)		type	an operator's, a cast's or an index's
+"timestamp"(timestamp without time zone,integer)		type	an operator's, a cast's or an index's
+"varchar"(character varying,integer,boolean)		type	an operator's, a cast's or an index's
+"varchar"(name)		type	an operator's, a cast's or an index's
+"xmlexists"(text,xml)		type	xml
+abbrev(cidr)		type	network
+abbrev(inet)		type	network
+abs(bigint)		type	numbers
+abs(double precision)		type	numbers
+abs(integer)		type	numbers
+abs(numeric)		type	numbers
+abs(real)		type	numbers
+abs(smallint)		type	numbers
+aclcontains(aclitem[],aclitem)		type	an operator's, a cast's or an index's
+acldefault("char",oid)		type	arrays
+aclexplode(aclitem[])		type	arrays
+aclinsert(aclitem[],aclitem)		type	an operator's, a cast's or an index's
+aclitemeq(aclitem,aclitem)		type	an operator's, a cast's or an index's
+aclitemin(cstring)		type	input and output
+aclitemout(aclitem)		type	input and output
+aclremove(aclitem[],aclitem)		type	an operator's, a cast's or an index's
+acos(double precision)		type	numbers
+acosd(double precision)		type	numbers
+acosh(double precision)		type	numbers
+age(timestamp with time zone)		type	time
+age(timestamp with time zone,timestamp with time zone)		type	time
+age(timestamp without time zone)		type	time
+age(timestamp without time zone,timestamp without time zone)		type	time
+age(xid)		server	sessions
+amvalidate(oid)		server	the server's catalog
+any_in(cstring)		type	input and output
+any_out("any")		type	input and output
+any_value(anyelement)	16-19	type	aggregates
+any_value_transfn(anyelement,anyelement)	16-19	type	aggregates' support
+anyarray_in(cstring)		type	input and output
+anyarray_out(anyarray)		type	input and output
+anyarray_send(anyarray)		type	input and output
+anycompatible_in(cstring)		type	input and output
+anycompatible_out(anycompatible)		type	input and output
+anycompatiblearray_in(cstring)		type	input and output
+anycompatiblearray_out(anycompatiblearray)		type	input and output
+anycompatiblearray_send(anycompatiblearray)		type	input and output
+anycompatiblemultirange_in(cstring,oid,integer)		type	input and output
+anycompatiblemultirange_out(anycompatiblemultirange)		type	input and output
+anycompatiblenonarray_in(cstring)		type	input and output
+anycompatiblenonarray_out(anycompatiblenonarray)		type	input and output
+anycompatiblerange_in(cstring,oid,integer)		type	input and output
+anycompatiblerange_out(anycompatiblerange)		type	input and output
+anyelement_in(cstring)		type	input and output
+anyelement_out(anyelement)		type	input and output
+anyenum_in(cstring)		type	input and output
+anyenum_out(anyenum)		type	input and output
+anymultirange_in(cstring,oid,integer)		type	input and output
+anymultirange_out(anymultirange)		type	input and output
+anynonarray_in(cstring)		type	input and output
+anynonarray_out(anynonarray)		type	input and output
+anyrange_in(cstring,oid,integer)		type	input and output
+anyrange_out(anyrange)		type	input and output
+anytextcat(anynonarray,text)		type	an operator's, a cast's or an index's
+area(box)		type	geometric
+area(circle)		type	geometric
+area(path)		type	geometric
+array_agg(anyarray)		type	arrays
+array_agg(anynonarray)		type	arrays
+array_append(anycompatiblearray,anycompatible)		type	an operator's, a cast's or an index's
+array_cat(anycompatiblearray,anycompatiblearray)		type	an operator's, a cast's or an index's
+array_dims(anyarray)		type	arrays
+array_eq(anyarray,anyarray)		type	an operator's, a cast's or an index's
+array_fill(anyelement,integer[])		type	arrays
+array_fill(anyelement,integer[],integer[])		type	arrays
+array_ge(anyarray,anyarray)		type	an operator's, a cast's or an index's
+array_gt(anyarray,anyarray)		type	an operator's, a cast's or an index's
+array_in(cstring,oid,integer)		type	input and output
+array_larger(anyarray,anyarray)		type	aggregates' support
+array_le(anyarray,anyarray)		type	an operator's, a cast's or an index's
+array_length(anyarray,integer)		type	arrays
+array_lower(anyarray,integer)		type	arrays
+array_lt(anyarray,anyarray)		type	an operator's, a cast's or an index's
+array_ndims(anyarray)		type	arrays
+array_ne(anyarray,anyarray)		type	an operator's, a cast's or an index's
+array_out(anyarray)		type	input and output
+array_position(anycompatiblearray,anycompatible)		type	arrays
+array_position(anycompatiblearray,anycompatible,integer)		type	arrays
+array_positions(anycompatiblearray,anycompatible)		type	arrays
+array_prepend(anycompatible,anycompatiblearray)		type	an operator's, a cast's or an index's
+array_remove(anycompatiblearray,anycompatible)		type	arrays
+array_replace(anycompatiblearray,anycompatible,anycompatible)		type	arrays
+array_reverse(anyarray)	18-19	type	arrays
+array_sample(anyarray,integer)	16-19	type	arrays
+array_send(anyarray)		type	input and output
+array_shuffle(anyarray)	16-19	type	arrays
+array_smaller(anyarray,anyarray)		type	aggregates' support
+array_sort(anyarray)	18-19	type	arrays
+array_sort(anyarray,boolean)	18-19	type	arrays
+array_sort(anyarray,boolean,boolean)	18-19	type	arrays
+array_to_json(anyarray)		type	JSON
+array_to_json(anyarray,boolean)		type	JSON
+array_to_string(anyarray,text)		type	arrays
+array_to_string(anyarray,text,text)		type	arrays
+array_to_tsvector(text[])		type	text search
+array_upper(anyarray,integer)		type	arrays
+arraycontained(anyarray,anyarray)		type	an operator's, a cast's or an index's
+arraycontains(anyarray,anyarray)		type	an operator's, a cast's or an index's
+arrayoverlap(anyarray,anyarray)		type	an operator's, a cast's or an index's
+ascii(text)		type	strings and formatting
+asin(double precision)		type	numbers
+asind(double precision)		type	numbers
+asinh(double precision)		type	numbers
+atan(double precision)		type	numbers
+atan2(double precision,double precision)		type	numbers
+atan2d(double precision,double precision)		type	numbers
+atand(double precision)		type	numbers
+atanh(double precision)		type	numbers
+avg(bigint)		type	aggregates the types carry
+avg(double precision)		type	aggregates the types carry
+avg(integer)		type	aggregates the types carry
+avg(interval)		type	aggregates the types carry
+avg(numeric)		type	aggregates the types carry
+avg(real)		type	aggregates the types carry
+avg(smallint)		type	aggregates the types carry
+binary_upgrade_add_sub_rel_state(text,oid,"char",pg_lsn)	17-19	server	the server itself
+binary_upgrade_check_logical_slot_pending_wal(name,pg_lsn)	19	server	the server itself
+binary_upgrade_create_conflict_detection_slot()	19	server	the server itself
+binary_upgrade_create_empty_extension(text,text,boolean,text,oid[],text[],text[])		server	the server itself
+binary_upgrade_logical_slot_has_caught_up(name)	17-18	server	the server itself
+binary_upgrade_replorigin_advance(text,pg_lsn)	17-19	server	the server itself
+binary_upgrade_set_missing_value(oid,text,text)		server	the server itself
+binary_upgrade_set_next_array_pg_type_oid(oid)		server	the server itself
+binary_upgrade_set_next_heap_pg_class_oid(oid)		server	the server itself
+binary_upgrade_set_next_heap_relfilenode(oid)	15-19	server	the server itself
+binary_upgrade_set_next_index_pg_class_oid(oid)		server	the server itself
+binary_upgrade_set_next_index_relfilenode(oid)	15-19	server	the server itself
+binary_upgrade_set_next_multirange_array_pg_type_oid(oid)		server	the server itself
+binary_upgrade_set_next_multirange_pg_type_oid(oid)		server	the server itself
+binary_upgrade_set_next_pg_authid_oid(oid)		server	the server itself
+binary_upgrade_set_next_pg_enum_oid(oid)		server	the server itself
+binary_upgrade_set_next_pg_tablespace_oid(oid)	15-19	server	the server itself
+binary_upgrade_set_next_pg_type_oid(oid)		server	the server itself
+binary_upgrade_set_next_toast_pg_class_oid(oid)		server	the server itself
+binary_upgrade_set_next_toast_relfilenode(oid)	15-19	server	the server itself
+binary_upgrade_set_record_init_privs(boolean)		server	the server itself
+bit_and(bigint)		type	aggregates
+bit_and(bit)		type	aggregates
+bit_and(integer)		type	aggregates
+bit_and(smallint)		type	aggregates
+bit_count(bit)		type	bit strings
+bit_count(bytea)		type	strings and formatting
+bit_in(cstring,oid,integer)		type	input and output
+bit_length(bit)		type	bit strings
+bit_length(bytea)		type	strings and formatting
+bit_length(text)		type	strings and formatting
+bit_or(bigint)		type	aggregates
+bit_or(bit)		type	aggregates
+bit_or(integer)		type	aggregates
+bit_or(smallint)		type	aggregates
+bit_out(bit)		type	input and output
+bit_send(bit)		type	input and output
+bit_xor(bigint)		type	aggregates
+bit_xor(bit)		type	aggregates
+bit_xor(integer)		type	aggregates
+bit_xor(smallint)		type	aggregates
+bitand(bit,bit)		type	an operator's, a cast's or an index's
+bitcat(bit varying,bit varying)		type	an operator's, a cast's or an index's
+bitcmp(bit,bit)		type	an operator's, a cast's or an index's
+biteq(bit,bit)		type	an operator's, a cast's or an index's
+bitge(bit,bit)		type	an operator's, a cast's or an index's
+bitgt(bit,bit)		type	an operator's, a cast's or an index's
+bitle(bit,bit)		type	an operator's, a cast's or an index's
+bitlt(bit,bit)		type	an operator's, a cast's or an index's
+bitne(bit,bit)		type	an operator's, a cast's or an index's
+bitnot(bit)		type	an operator's, a cast's or an index's
+bitor(bit,bit)		type	an operator's, a cast's or an index's
+bitshiftleft(bit,integer)		type	an operator's, a cast's or an index's
+bitshiftright(bit,integer)		type	an operator's, a cast's or an index's
+bittypmodin(cstring[])		type	input and output
+bittypmodout(integer)		type	input and output
+bitxor(bit,bit)		type	an operator's, a cast's or an index's
+bool(integer)		type	an operator's, a cast's or an index's
+bool(jsonb)		type	an operator's, a cast's or an index's
+bool_and(boolean)		type	aggregates the types carry
+bool_or(boolean)		type	aggregates the types carry
+booland_statefunc(boolean,boolean)		type	aggregates' support
+booleq(boolean,boolean)		type	an operator's, a cast's or an index's
+boolge(boolean,boolean)		type	an operator's, a cast's or an index's
+boolgt(boolean,boolean)		type	an operator's, a cast's or an index's
+boolin(cstring)		type	input and output
+boolle(boolean,boolean)		type	an operator's, a cast's or an index's
+boollt(boolean,boolean)		type	an operator's, a cast's or an index's
+boolne(boolean,boolean)		type	an operator's, a cast's or an index's
+boolor_statefunc(boolean,boolean)		type	aggregates' support
+boolout(boolean)		type	input and output
+boolsend(boolean)		type	input and output
+bound_box(box,box)		type	an operator's, a cast's or an index's
+box(circle)		type	an operator's, a cast's or an index's
+box(point)		type	an operator's, a cast's or an index's
+box(point,point)		type	geometric
+box(polygon)		type	an operator's, a cast's or an index's
+box_above(box,box)		type	an operator's, a cast's or an index's
+box_above_eq(box,box)		type	an operator's, a cast's or an index's
+box_add(box,point)		type	an operator's, a cast's or an index's
+box_below(box,box)		type	an operator's, a cast's or an index's
+box_below_eq(box,box)		type	an operator's, a cast's or an index's
+box_center(box)		type	an operator's, a cast's or an index's
+box_contain(box,box)		type	an operator's, a cast's or an index's
+box_contain_pt(box,point)		type	an operator's, a cast's or an index's
+box_contained(box,box)		type	an operator's, a cast's or an index's
+box_distance(box,box)		type	an operator's, a cast's or an index's
+box_div(box,point)		type	an operator's, a cast's or an index's
+box_eq(box,box)		type	an operator's, a cast's or an index's
+box_ge(box,box)		type	an operator's, a cast's or an index's
+box_gt(box,box)		type	an operator's, a cast's or an index's
+box_in(cstring)		type	input and output
+box_intersect(box,box)		type	an operator's, a cast's or an index's
+box_le(box,box)		type	an operator's, a cast's or an index's
+box_left(box,box)		type	an operator's, a cast's or an index's
+box_lt(box,box)		type	an operator's, a cast's or an index's
+box_mul(box,point)		type	an operator's, a cast's or an index's
+box_out(box)		type	input and output
+box_overabove(box,box)		type	an operator's, a cast's or an index's
+box_overbelow(box,box)		type	an operator's, a cast's or an index's
+box_overlap(box,box)		type	an operator's, a cast's or an index's
+box_overleft(box,box)		type	an operator's, a cast's or an index's
+box_overright(box,box)		type	an operator's, a cast's or an index's
+box_right(box,box)		type	an operator's, a cast's or an index's
+box_same(box,box)		type	an operator's, a cast's or an index's
+box_send(box)		type	input and output
+box_sub(box,point)		type	an operator's, a cast's or an index's
+bpchar("char")		type	an operator's, a cast's or an index's
+bpchar(character,integer,boolean)		type	an operator's, a cast's or an index's
+bpchar(name)		type	an operator's, a cast's or an index's
+bpchar_larger(character,character)		type	aggregates' support
+bpchar_pattern_ge(character,character)		type	an operator's, a cast's or an index's
+bpchar_pattern_gt(character,character)		type	an operator's, a cast's or an index's
+bpchar_pattern_le(character,character)		type	an operator's, a cast's or an index's
+bpchar_pattern_lt(character,character)		type	an operator's, a cast's or an index's
+bpchar_smaller(character,character)		type	aggregates' support
+bpcharcmp(character,character)		type	an operator's, a cast's or an index's
+bpchareq(character,character)		type	an operator's, a cast's or an index's
+bpcharge(character,character)		type	an operator's, a cast's or an index's
+bpchargt(character,character)		type	an operator's, a cast's or an index's
+bpchariclike(character,text)		type	an operator's, a cast's or an index's
+bpcharicnlike(character,text)		type	an operator's, a cast's or an index's
+bpcharicregexeq(character,text)		type	an operator's, a cast's or an index's
+bpcharicregexne(character,text)		type	an operator's, a cast's or an index's
+bpcharin(cstring,oid,integer)		type	input and output
+bpcharle(character,character)		type	an operator's, a cast's or an index's
+bpcharlike(character,text)		type	an operator's, a cast's or an index's
+bpcharlt(character,character)		type	an operator's, a cast's or an index's
+bpcharne(character,character)		type	an operator's, a cast's or an index's
+bpcharnlike(character,text)		type	an operator's, a cast's or an index's
+bpcharout(character)		type	input and output
+bpcharregexeq(character,text)		type	an operator's, a cast's or an index's
+bpcharregexne(character,text)		type	an operator's, a cast's or an index's
+bpcharsend(character)		type	input and output
+bpchartypmodin(cstring[])		type	input and output
+bpchartypmodout(integer)		type	input and output
+brin_bloom_summary_in(cstring)		type	input and output
+brin_bloom_summary_out(pg_brin_bloom_summary)		type	input and output
+brin_bloom_summary_send(pg_brin_bloom_summary)		type	input and output
+brin_desummarize_range(regclass,bigint)		server	the server's catalog
+brin_minmax_multi_summary_in(cstring)		type	input and output
+brin_minmax_multi_summary_out(pg_brin_minmax_multi_summary)		type	input and output
+brin_minmax_multi_summary_send(pg_brin_minmax_multi_summary)		type	input and output
+brin_summarize_new_values(regclass)		server	the server's catalog
+brin_summarize_range(regclass,bigint)		server	the server's catalog
+broadcast(inet)		type	network
+btarraycmp(anyarray,anyarray)		type	an operator's, a cast's or an index's
+btboolcmp(boolean,boolean)		type	an operator's, a cast's or an index's
+btbpchar_pattern_cmp(character,character)		type	an operator's, a cast's or an index's
+btcharcmp("char","char")		type	an operator's, a cast's or an index's
+btequalimage(oid)		type	an operator's, a cast's or an index's
+btfloat48cmp(real,double precision)		type	an operator's, a cast's or an index's
+btfloat4cmp(real,real)		type	an operator's, a cast's or an index's
+btfloat84cmp(double precision,real)		type	an operator's, a cast's or an index's
+btfloat8cmp(double precision,double precision)		type	an operator's, a cast's or an index's
+btint24cmp(smallint,integer)		type	an operator's, a cast's or an index's
+btint28cmp(smallint,bigint)		type	an operator's, a cast's or an index's
+btint2cmp(smallint,smallint)		type	an operator's, a cast's or an index's
+btint42cmp(integer,smallint)		type	an operator's, a cast's or an index's
+btint48cmp(integer,bigint)		type	an operator's, a cast's or an index's
+btint4cmp(integer,integer)		type	an operator's, a cast's or an index's
+btint82cmp(bigint,smallint)		type	an operator's, a cast's or an index's
+btint84cmp(bigint,integer)		type	an operator's, a cast's or an index's
+btint8cmp(bigint,bigint)		type	an operator's, a cast's or an index's
+btnamecmp(name,name)		type	an operator's, a cast's or an index's
+btnametextcmp(name,text)		type	an operator's, a cast's or an index's
+btoid8cmp(oid8,oid8)	19	type	an operator's, a cast's or an index's
+btoidcmp(oid,oid)		type	an operator's, a cast's or an index's
+btoidvectorcmp(oidvector,oidvector)		type	an operator's, a cast's or an index's
+btrecordcmp(record,record)		type	an operator's, a cast's or an index's
+btrecordimagecmp(record,record)		type	an operator's, a cast's or an index's
+btrim(bytea,bytea)		type	strings and formatting
+btrim(text)		type	strings and formatting
+btrim(text,text)		type	strings and formatting
+bttext_pattern_cmp(text,text)		type	an operator's, a cast's or an index's
+bttextcmp(text,text)		type	an operator's, a cast's or an index's
+bttextnamecmp(text,name)		type	an operator's, a cast's or an index's
+bttidcmp(tid,tid)		type	an operator's, a cast's or an index's
+btvarstrequalimage(oid)		type	an operator's, a cast's or an index's
+bytea(bigint)	18-19	type	an operator's, a cast's or an index's
+bytea(integer)	18-19	type	an operator's, a cast's or an index's
+bytea(smallint)	18-19	type	an operator's, a cast's or an index's
+bytea(uuid)	19	type	an operator's, a cast's or an index's
+bytea_larger(bytea,bytea)	18-19	type	aggregates' support
+bytea_smaller(bytea,bytea)	18-19	type	aggregates' support
+byteacat(bytea,bytea)		type	an operator's, a cast's or an index's
+byteacmp(bytea,bytea)		type	an operator's, a cast's or an index's
+byteaeq(bytea,bytea)		type	an operator's, a cast's or an index's
+byteage(bytea,bytea)		type	an operator's, a cast's or an index's
+byteagt(bytea,bytea)		type	an operator's, a cast's or an index's
+byteain(cstring)		type	input and output
+byteale(bytea,bytea)		type	an operator's, a cast's or an index's
+bytealike(bytea,bytea)		type	an operator's, a cast's or an index's
+bytealt(bytea,bytea)		type	an operator's, a cast's or an index's
+byteane(bytea,bytea)		type	an operator's, a cast's or an index's
+byteanlike(bytea,bytea)		type	an operator's, a cast's or an index's
+byteaout(bytea)		type	input and output
+byteasend(bytea)		type	input and output
+cardinality(anyarray)		type	arrays
+casefold(text)	18-19	type	strings and formatting
+cash_cmp(money,money)		type	an operator's, a cast's or an index's
+cash_div_cash(money,money)		type	an operator's, a cast's or an index's
+cash_div_flt4(money,real)		type	an operator's, a cast's or an index's
+cash_div_flt8(money,double precision)		type	an operator's, a cast's or an index's
+cash_div_int2(money,smallint)		type	an operator's, a cast's or an index's
+cash_div_int4(money,integer)		type	an operator's, a cast's or an index's
+cash_div_int8(money,bigint)		type	an operator's, a cast's or an index's
+cash_eq(money,money)		type	an operator's, a cast's or an index's
+cash_ge(money,money)		type	an operator's, a cast's or an index's
+cash_gt(money,money)		type	an operator's, a cast's or an index's
+cash_in(cstring)		type	input and output
+cash_le(money,money)		type	an operator's, a cast's or an index's
+cash_lt(money,money)		type	an operator's, a cast's or an index's
+cash_mi(money,money)		type	an operator's, a cast's or an index's
+cash_mul_flt4(money,real)		type	an operator's, a cast's or an index's
+cash_mul_flt8(money,double precision)		type	an operator's, a cast's or an index's
+cash_mul_int2(money,smallint)		type	an operator's, a cast's or an index's
+cash_mul_int4(money,integer)		type	an operator's, a cast's or an index's
+cash_mul_int8(money,bigint)		type	an operator's, a cast's or an index's
+cash_ne(money,money)		type	an operator's, a cast's or an index's
+cash_out(money)		type	input and output
+cash_pl(money,money)		type	an operator's, a cast's or an index's
+cash_send(money)		type	input and output
+cash_words(money)		type	strings and formatting
+cashlarger(money,money)		type	aggregates' support
+cashsmaller(money,money)		type	aggregates' support
+cbrt(double precision)		type	numbers
+ceil(double precision)		type	numbers
+ceil(numeric)		type	numbers
+ceiling(double precision)		type	numbers
+ceiling(numeric)		type	numbers
+center(box)		type	geometric
+center(circle)		type	geometric
+char_length(character)		type	strings and formatting
+char_length(text)		type	strings and formatting
+character_length(character)		type	strings and formatting
+character_length(text)		type	strings and formatting
+chareq("char","char")		type	an operator's, a cast's or an index's
+charge("char","char")		type	an operator's, a cast's or an index's
+chargt("char","char")		type	an operator's, a cast's or an index's
+charin(cstring)		type	input and output
+charle("char","char")		type	an operator's, a cast's or an index's
+charlt("char","char")		type	an operator's, a cast's or an index's
+charne("char","char")		type	an operator's, a cast's or an index's
+charout("char")		type	input and output
+charsend("char")		type	input and output
+chr(integer)		type	strings and formatting
+cideq(cid,cid)		type	an operator's, a cast's or an index's
+cidin(cstring)		type	input and output
+cidout(cid)		type	input and output
+cidr(inet)		type	an operator's, a cast's or an index's
+cidr_in(cstring)		type	input and output
+cidr_out(cidr)		type	input and output
+cidr_send(cidr)		type	input and output
+cidsend(cid)		type	input and output
+circle(box)		type	an operator's, a cast's or an index's
+circle(point,double precision)		type	geometric
+circle(polygon)		type	an operator's, a cast's or an index's
+circle_above(circle,circle)		type	an operator's, a cast's or an index's
+circle_add_pt(circle,point)		type	an operator's, a cast's or an index's
+circle_below(circle,circle)		type	an operator's, a cast's or an index's
+circle_center(circle)		type	an operator's, a cast's or an index's
+circle_contain(circle,circle)		type	an operator's, a cast's or an index's
+circle_contain_pt(circle,point)		type	an operator's, a cast's or an index's
+circle_contained(circle,circle)		type	an operator's, a cast's or an index's
+circle_distance(circle,circle)		type	an operator's, a cast's or an index's
+circle_div_pt(circle,point)		type	an operator's, a cast's or an index's
+circle_eq(circle,circle)		type	an operator's, a cast's or an index's
+circle_ge(circle,circle)		type	an operator's, a cast's or an index's
+circle_gt(circle,circle)		type	an operator's, a cast's or an index's
+circle_in(cstring)		type	input and output
+circle_le(circle,circle)		type	an operator's, a cast's or an index's
+circle_left(circle,circle)		type	an operator's, a cast's or an index's
+circle_lt(circle,circle)		type	an operator's, a cast's or an index's
+circle_mul_pt(circle,point)		type	an operator's, a cast's or an index's
+circle_ne(circle,circle)		type	an operator's, a cast's or an index's
+circle_out(circle)		type	input and output
+circle_overabove(circle,circle)		type	an operator's, a cast's or an index's
+circle_overbelow(circle,circle)		type	an operator's, a cast's or an index's
+circle_overlap(circle,circle)		type	an operator's, a cast's or an index's
+circle_overleft(circle,circle)		type	an operator's, a cast's or an index's
+circle_overright(circle,circle)		type	an operator's, a cast's or an index's
+circle_right(circle,circle)		type	an operator's, a cast's or an index's
+circle_same(circle,circle)		type	an operator's, a cast's or an index's
+circle_send(circle)		type	input and output
+circle_sub_pt(circle,point)		type	an operator's, a cast's or an index's
+clock_timestamp()		type	time
+close_lb(line,box)	14	type	an operator's, a cast's or an index's
+close_ls(line,lseg)		type	an operator's, a cast's or an index's
+close_lseg(lseg,lseg)		type	an operator's, a cast's or an index's
+close_pb(point,box)		type	an operator's, a cast's or an index's
+close_pl(point,line)		type	an operator's, a cast's or an index's
+close_ps(point,lseg)		type	an operator's, a cast's or an index's
+close_sb(lseg,box)		type	an operator's, a cast's or an index's
+close_sl(lseg,line)	14	type	an operator's, a cast's or an index's
+col_description(oid,integer)		server	the server's catalog
+concat("any")		type	strings and formatting
+concat_ws(text,"any")		type	strings and formatting
+convert(bytea,name,name)		type	strings and formatting
+convert_from(bytea,name)		type	strings and formatting
+convert_to(text,name)		type	strings and formatting
+corr(double precision,double precision)		type	aggregates
+cos(double precision)		type	numbers
+cosd(double precision)		type	numbers
+cosh(double precision)		type	numbers
+cot(double precision)		type	numbers
+cotd(double precision)		type	numbers
+count("any")		type	aggregates the types carry
+count()		type	aggregates the types carry
+covar_pop(double precision,double precision)		type	aggregates
+covar_samp(double precision,double precision)		type	aggregates
+crc32(bytea)	18-19	type	strings and formatting
+crc32c(bytea)	18-19	type	strings and formatting
+cstring_in(cstring)		type	input and output
+cstring_out(cstring)		type	input and output
+cstring_send(cstring)		type	input and output
+cume_dist("any")		type	aggregates
+cume_dist()		type	window functions
+current_database()		server	sessions
+current_query()		server	sessions
+current_schemas(boolean)		server	sessions
+current_setting(text)		type	settings
+current_setting(text,boolean)		type	settings
+currtid2(text,tid)		server	the server's catalog
+currval(regclass)		type	sequences
+cursor_to_xml(refcursor,integer,boolean,boolean,text)		server	sessions
+cursor_to_xmlschema(refcursor,boolean,boolean,text)		server	sessions
+database_to_xml(boolean,boolean,text)		type	xml
+database_to_xml_and_xmlschema(boolean,boolean,text)		type	xml
+database_to_xmlschema(boolean,boolean,text)		type	xml
+date(timestamp with time zone)		type	an operator's, a cast's or an index's
+date(timestamp without time zone)		type	an operator's, a cast's or an index's
+date_add(timestamp with time zone,interval)	16-19	type	time
+date_add(timestamp with time zone,interval,text)	16-19	type	time
+date_bin(interval,timestamp with time zone,timestamp with time zone)		type	time
+date_bin(interval,timestamp without time zone,timestamp without time zone)		type	time
+date_cmp(date,date)		type	an operator's, a cast's or an index's
+date_cmp_timestamp(date,timestamp without time zone)		type	an operator's, a cast's or an index's
+date_cmp_timestamptz(date,timestamp with time zone)		type	an operator's, a cast's or an index's
+date_eq(date,date)		type	an operator's, a cast's or an index's
+date_eq_timestamp(date,timestamp without time zone)		type	an operator's, a cast's or an index's
+date_eq_timestamptz(date,timestamp with time zone)		type	an operator's, a cast's or an index's
+date_ge(date,date)		type	an operator's, a cast's or an index's
+date_ge_timestamp(date,timestamp without time zone)		type	an operator's, a cast's or an index's
+date_ge_timestamptz(date,timestamp with time zone)		type	an operator's, a cast's or an index's
+date_gt(date,date)		type	an operator's, a cast's or an index's
+date_gt_timestamp(date,timestamp without time zone)		type	an operator's, a cast's or an index's
+date_gt_timestamptz(date,timestamp with time zone)		type	an operator's, a cast's or an index's
+date_in(cstring)		type	input and output
+date_larger(date,date)		type	aggregates' support
+date_le(date,date)		type	an operator's, a cast's or an index's
+date_le_timestamp(date,timestamp without time zone)		type	an operator's, a cast's or an index's
+date_le_timestamptz(date,timestamp with time zone)		type	an operator's, a cast's or an index's
+date_lt(date,date)		type	an operator's, a cast's or an index's
+date_lt_timestamp(date,timestamp without time zone)		type	an operator's, a cast's or an index's
+date_lt_timestamptz(date,timestamp with time zone)		type	an operator's, a cast's or an index's
+date_mi(date,date)		type	an operator's, a cast's or an index's
+date_mi_interval(date,interval)		type	an operator's, a cast's or an index's
+date_mii(date,integer)		type	an operator's, a cast's or an index's
+date_ne(date,date)		type	an operator's, a cast's or an index's
+date_ne_timestamp(date,timestamp without time zone)		type	an operator's, a cast's or an index's
+date_ne_timestamptz(date,timestamp with time zone)		type	an operator's, a cast's or an index's
+date_out(date)		type	input and output
+date_part(text,date)		type	time
+date_part(text,interval)		type	time
+date_part(text,time with time zone)		type	time
+date_part(text,time without time zone)		type	time
+date_part(text,timestamp with time zone)		type	time
+date_part(text,timestamp without time zone)		type	time
+date_pl_interval(date,interval)		type	an operator's, a cast's or an index's
+date_pli(date,integer)		type	an operator's, a cast's or an index's
+date_send(date)		type	input and output
+date_smaller(date,date)		type	aggregates' support
+date_subtract(timestamp with time zone,interval)	16-19	type	time
+date_subtract(timestamp with time zone,interval,text)	16-19	type	time
+date_trunc(text,interval)		type	time
+date_trunc(text,timestamp with time zone)		type	time
+date_trunc(text,timestamp with time zone,text)		type	time
+date_trunc(text,timestamp without time zone)		type	time
+datemultirange()		type	ranges and multiranges
+datemultirange(daterange)		type	an operator's, a cast's or an index's
+datemultirange(daterange[])		type	ranges and multiranges
+daterange(date,date)		type	ranges and multiranges
+daterange(date,date,text)		type	ranges and multiranges
+daterange_canonical(daterange)		type	ranges and multiranges
+daterange_subdiff(date,date)		type	ranges and multiranges
+datetime_pl(date,time without time zone)		type	an operator's, a cast's or an index's
+datetimetz_pl(date,time with time zone)		type	an operator's, a cast's or an index's
+dcbrt(double precision)		type	an operator's, a cast's or an index's
+decode(text,text)		type	strings and formatting
+degrees(double precision)		type	numbers
+dense_rank("any")		type	aggregates
+dense_rank()		type	window functions
+dexp(double precision)		type	numbers
+diagonal(box)		type	geometric
+diameter(circle)		type	geometric
+dist_bl(box,line)	14	type	an operator's, a cast's or an index's
+dist_bp(box,point)		type	an operator's, a cast's or an index's
+dist_bs(box,lseg)		type	an operator's, a cast's or an index's
+dist_cpoint(circle,point)		type	an operator's, a cast's or an index's
+dist_cpoly(circle,polygon)		type	an operator's, a cast's or an index's
+dist_lb(line,box)	14	type	an operator's, a cast's or an index's
+dist_lp(line,point)		type	an operator's, a cast's or an index's
+dist_ls(line,lseg)		type	an operator's, a cast's or an index's
+dist_pathp(path,point)		type	an operator's, a cast's or an index's
+dist_pb(point,box)		type	an operator's, a cast's or an index's
+dist_pc(point,circle)		type	an operator's, a cast's or an index's
+dist_pl(point,line)		type	an operator's, a cast's or an index's
+dist_polyc(polygon,circle)		type	an operator's, a cast's or an index's
+dist_polyp(polygon,point)		type	an operator's, a cast's or an index's
+dist_ppath(point,path)		type	an operator's, a cast's or an index's
+dist_ppoly(point,polygon)		type	an operator's, a cast's or an index's
+dist_ps(point,lseg)		type	an operator's, a cast's or an index's
+dist_sb(lseg,box)		type	an operator's, a cast's or an index's
+dist_sl(lseg,line)		type	an operator's, a cast's or an index's
+dist_sp(lseg,point)		type	an operator's, a cast's or an index's
+div(numeric,numeric)		type	numbers
+dlog1(double precision)		type	numbers
+dlog10(double precision)		type	numbers
+domain_in(cstring,oid,integer)		type	input and output
+dpow(double precision,double precision)		type	an operator's, a cast's or an index's
+dround(double precision)		type	numbers
+dsqrt(double precision)		type	an operator's, a cast's or an index's
+dtrunc(double precision)		type	numbers
+elem_contained_by_multirange(anyelement,anymultirange)		type	an operator's, a cast's or an index's
+elem_contained_by_range(anyelement,anyrange)		type	an operator's, a cast's or an index's
+encode(bytea,text)		type	strings and formatting
+enum_cmp(anyenum,anyenum)		type	an operator's, a cast's or an index's
+enum_eq(anyenum,anyenum)		type	an operator's, a cast's or an index's
+enum_first(anyenum)		type	enums
+enum_ge(anyenum,anyenum)		type	an operator's, a cast's or an index's
+enum_gt(anyenum,anyenum)		type	an operator's, a cast's or an index's
+enum_in(cstring,oid)		type	input and output
+enum_larger(anyenum,anyenum)		type	aggregates' support
+enum_last(anyenum)		type	enums
+enum_le(anyenum,anyenum)		type	an operator's, a cast's or an index's
+enum_lt(anyenum,anyenum)		type	an operator's, a cast's or an index's
+enum_ne(anyenum,anyenum)		type	an operator's, a cast's or an index's
+enum_out(anyenum)		type	input and output
+enum_range(anyenum)		type	enums
+enum_range(anyenum,anyenum)		type	enums
+enum_send(anyenum)		type	enums
+enum_smaller(anyenum,anyenum)		type	aggregates' support
+erf(double precision)	16-19	type	numbers
+erfc(double precision)	16-19	type	numbers
+error_on_null(anyelement)	19	type	the rest
+event_trigger_out(event_trigger)		type	input and output
+every(boolean)		type	aggregates the types carry
+exp(double precision)		type	numbers
+exp(numeric)		type	numbers
+factorial(bigint)		type	numbers
+family(inet)		type	network
+fdw_handler_out(fdw_handler)		type	input and output
+first_value(anyelement)		type	window functions
+float4(bigint)		type	an operator's, a cast's or an index's
+float4(double precision)		type	an operator's, a cast's or an index's
+float4(integer)		type	an operator's, a cast's or an index's
+float4(jsonb)		type	an operator's, a cast's or an index's
+float4(numeric)		type	an operator's, a cast's or an index's
+float4(smallint)		type	an operator's, a cast's or an index's
+float48div(real,double precision)		type	an operator's, a cast's or an index's
+float48eq(real,double precision)		type	an operator's, a cast's or an index's
+float48ge(real,double precision)		type	an operator's, a cast's or an index's
+float48gt(real,double precision)		type	an operator's, a cast's or an index's
+float48le(real,double precision)		type	an operator's, a cast's or an index's
+float48lt(real,double precision)		type	an operator's, a cast's or an index's
+float48mi(real,double precision)		type	an operator's, a cast's or an index's
+float48mul(real,double precision)		type	an operator's, a cast's or an index's
+float48ne(real,double precision)		type	an operator's, a cast's or an index's
+float48pl(real,double precision)		type	an operator's, a cast's or an index's
+float4_accum(double precision[],real)		type	aggregates' support
+float4abs(real)		type	an operator's, a cast's or an index's
+float4div(real,real)		type	an operator's, a cast's or an index's
+float4eq(real,real)		type	an operator's, a cast's or an index's
+float4ge(real,real)		type	an operator's, a cast's or an index's
+float4gt(real,real)		type	an operator's, a cast's or an index's
+float4in(cstring)		type	input and output
+float4larger(real,real)		type	aggregates' support
+float4le(real,real)		type	an operator's, a cast's or an index's
+float4lt(real,real)		type	an operator's, a cast's or an index's
+float4mi(real,real)		type	an operator's, a cast's or an index's
+float4mul(real,real)		type	an operator's, a cast's or an index's
+float4ne(real,real)		type	an operator's, a cast's or an index's
+float4out(real)		type	input and output
+float4pl(real,real)		type	an operator's, a cast's or an index's
+float4send(real)		type	input and output
+float4smaller(real,real)		type	aggregates' support
+float4um(real)		type	an operator's, a cast's or an index's
+float4up(real)		type	an operator's, a cast's or an index's
+float8(bigint)		type	an operator's, a cast's or an index's
+float8(integer)		type	an operator's, a cast's or an index's
+float8(jsonb)		type	an operator's, a cast's or an index's
+float8(numeric)		type	an operator's, a cast's or an index's
+float8(real)		type	an operator's, a cast's or an index's
+float8(smallint)		type	an operator's, a cast's or an index's
+float84div(double precision,real)		type	an operator's, a cast's or an index's
+float84eq(double precision,real)		type	an operator's, a cast's or an index's
+float84ge(double precision,real)		type	an operator's, a cast's or an index's
+float84gt(double precision,real)		type	an operator's, a cast's or an index's
+float84le(double precision,real)		type	an operator's, a cast's or an index's
+float84lt(double precision,real)		type	an operator's, a cast's or an index's
+float84mi(double precision,real)		type	an operator's, a cast's or an index's
+float84mul(double precision,real)		type	an operator's, a cast's or an index's
+float84ne(double precision,real)		type	an operator's, a cast's or an index's
+float84pl(double precision,real)		type	an operator's, a cast's or an index's
+float8_accum(double precision[],double precision)		type	aggregates' support
+float8_avg(double precision[])		type	aggregates' support
+float8_combine(double precision[],double precision[])		type	aggregates' support
+float8_corr(double precision[])		type	aggregates' support
+float8_covar_pop(double precision[])		type	aggregates' support
+float8_covar_samp(double precision[])		type	aggregates' support
+float8_regr_accum(double precision[],double precision,double precision)		type	aggregates' support
+float8_regr_avgx(double precision[])		type	aggregates' support
+float8_regr_avgy(double precision[])		type	aggregates' support
+float8_regr_combine(double precision[],double precision[])		type	aggregates' support
+float8_regr_intercept(double precision[])		type	aggregates' support
+float8_regr_r2(double precision[])		type	aggregates' support
+float8_regr_slope(double precision[])		type	aggregates' support
+float8_regr_sxx(double precision[])		type	aggregates' support
+float8_regr_sxy(double precision[])		type	aggregates' support
+float8_regr_syy(double precision[])		type	aggregates' support
+float8_stddev_pop(double precision[])		type	aggregates' support
+float8_stddev_samp(double precision[])		type	aggregates' support
+float8_var_pop(double precision[])		type	aggregates' support
+float8_var_samp(double precision[])		type	aggregates' support
+float8abs(double precision)		type	an operator's, a cast's or an index's
+float8div(double precision,double precision)		type	an operator's, a cast's or an index's
+float8eq(double precision,double precision)		type	an operator's, a cast's or an index's
+float8ge(double precision,double precision)		type	an operator's, a cast's or an index's
+float8gt(double precision,double precision)		type	an operator's, a cast's or an index's
+float8in(cstring)		type	input and output
+float8larger(double precision,double precision)		type	aggregates' support
+float8le(double precision,double precision)		type	an operator's, a cast's or an index's
+float8lt(double precision,double precision)		type	an operator's, a cast's or an index's
+float8mi(double precision,double precision)		type	an operator's, a cast's or an index's
+float8mul(double precision,double precision)		type	an operator's, a cast's or an index's
+float8ne(double precision,double precision)		type	an operator's, a cast's or an index's
+float8out(double precision)		type	input and output
+float8pl(double precision,double precision)		type	an operator's, a cast's or an index's
+float8send(double precision)		type	input and output
+float8smaller(double precision,double precision)		type	aggregates' support
+float8um(double precision)		type	an operator's, a cast's or an index's
+float8up(double precision)		type	an operator's, a cast's or an index's
+floor(double precision)		type	numbers
+floor(numeric)		type	numbers
+flt4_mul_cash(real,money)		type	an operator's, a cast's or an index's
+flt8_mul_cash(double precision,money)		type	an operator's, a cast's or an index's
+fmgr_c_validator(oid)		server	the server's catalog
+fmgr_internal_validator(oid)		server	the server's catalog
+fmgr_sql_validator(oid)		server	the server's catalog
+format(text)		type	strings and formatting
+format(text,"any")		type	strings and formatting
+format_type(oid,integer)		type	the rest
+gamma(double precision)	18-19	type	numbers
+gcd(bigint,bigint)		type	numbers
+gcd(integer,integer)		type	numbers
+gcd(numeric,numeric)		type	numbers
+gen_random_uuid()		type	uuid
+generate_series(bigint,bigint)		type	numbers
+generate_series(bigint,bigint,bigint)		type	numbers
+generate_series(integer,integer)		type	numbers
+generate_series(integer,integer,integer)		type	numbers
+generate_series(numeric,numeric)		type	numbers
+generate_series(numeric,numeric,numeric)		type	numbers
+generate_series(timestamp with time zone,timestamp with time zone,interval)		type	time
+generate_series(timestamp with time zone,timestamp with time zone,interval,text)	16-19	type	time
+generate_series(timestamp without time zone,timestamp without time zone,interval)		type	time
+generate_subscripts(anyarray,integer)		type	arrays
+generate_subscripts(anyarray,integer,boolean)		type	arrays
+get_bit(bit,integer)		type	bit strings
+get_bit(bytea,bigint)		type	strings and formatting
+get_byte(bytea,integer)		type	strings and formatting
+get_current_ts_config()		type	text search
+getdatabaseencoding()		server	sessions
+getpgusername()		server	roles and privileges
+gin_clean_pending_list(regclass)		server	the server's catalog
+gin_cmp_tslexeme(text,text)		type	an operator's, a cast's or an index's
+gin_compare_jsonb(text,text)		type	an operator's, a cast's or an index's
+gist_translate_cmptype_common(integer)	18-19	type	an operator's, a cast's or an index's
+gtsvectorin(cstring)		type	input and output
+gtsvectorout(gtsvector)		type	input and output
+has_any_column_privilege(name,oid,text)		server	roles and privileges
+has_any_column_privilege(name,text,text)		server	roles and privileges
+has_any_column_privilege(oid,oid,text)		server	roles and privileges
+has_any_column_privilege(oid,text)		server	roles and privileges
+has_any_column_privilege(oid,text,text)		server	roles and privileges
+has_any_column_privilege(text,text)		server	roles and privileges
+has_column_privilege(name,oid,smallint,text)		server	roles and privileges
+has_column_privilege(name,oid,text,text)		server	roles and privileges
+has_column_privilege(name,text,smallint,text)		server	roles and privileges
+has_column_privilege(name,text,text,text)		server	roles and privileges
+has_column_privilege(oid,oid,smallint,text)		server	roles and privileges
+has_column_privilege(oid,oid,text,text)		server	roles and privileges
+has_column_privilege(oid,smallint,text)		server	roles and privileges
+has_column_privilege(oid,text,smallint,text)		server	roles and privileges
+has_column_privilege(oid,text,text)		server	roles and privileges
+has_column_privilege(oid,text,text,text)		server	roles and privileges
+has_column_privilege(text,smallint,text)		server	roles and privileges
+has_column_privilege(text,text,text)		server	roles and privileges
+has_database_privilege(name,oid,text)		server	roles and privileges
+has_database_privilege(name,text,text)		server	roles and privileges
+has_database_privilege(oid,oid,text)		server	roles and privileges
+has_database_privilege(oid,text)		server	roles and privileges
+has_database_privilege(oid,text,text)		server	roles and privileges
+has_database_privilege(text,text)		server	roles and privileges
+has_foreign_data_wrapper_privilege(name,oid,text)		server	roles and privileges
+has_foreign_data_wrapper_privilege(name,text,text)		server	roles and privileges
+has_foreign_data_wrapper_privilege(oid,oid,text)		server	roles and privileges
+has_foreign_data_wrapper_privilege(oid,text)		server	roles and privileges
+has_foreign_data_wrapper_privilege(oid,text,text)		server	roles and privileges
+has_foreign_data_wrapper_privilege(text,text)		server	roles and privileges
+has_function_privilege(name,oid,text)		server	roles and privileges
+has_function_privilege(name,text,text)		server	roles and privileges
+has_function_privilege(oid,oid,text)		server	roles and privileges
+has_function_privilege(oid,text)		server	roles and privileges
+has_function_privilege(oid,text,text)		server	roles and privileges
+has_function_privilege(text,text)		server	roles and privileges
+has_language_privilege(name,oid,text)		server	roles and privileges
+has_language_privilege(name,text,text)		server	roles and privileges
+has_language_privilege(oid,oid,text)		server	roles and privileges
+has_language_privilege(oid,text)		server	roles and privileges
+has_language_privilege(oid,text,text)		server	roles and privileges
+has_language_privilege(text,text)		server	roles and privileges
+has_largeobject_privilege(name,oid,text)	18-19	server	roles and privileges
+has_largeobject_privilege(oid,oid,text)	18-19	server	roles and privileges
+has_largeobject_privilege(oid,text)	18-19	server	roles and privileges
+has_parameter_privilege(name,text,text)	15-19	server	roles and privileges
+has_parameter_privilege(oid,text,text)	15-19	server	roles and privileges
+has_parameter_privilege(text,text)	15-19	server	roles and privileges
+has_schema_privilege(name,oid,text)		server	roles and privileges
+has_schema_privilege(name,text,text)		server	roles and privileges
+has_schema_privilege(oid,oid,text)		server	roles and privileges
+has_schema_privilege(oid,text)		server	roles and privileges
+has_schema_privilege(oid,text,text)		server	roles and privileges
+has_schema_privilege(text,text)		server	roles and privileges
+has_sequence_privilege(name,oid,text)		server	roles and privileges
+has_sequence_privilege(name,text,text)		server	roles and privileges
+has_sequence_privilege(oid,oid,text)		server	roles and privileges
+has_sequence_privilege(oid,text)		server	roles and privileges
+has_sequence_privilege(oid,text,text)		server	roles and privileges
+has_sequence_privilege(text,text)		server	roles and privileges
+has_server_privilege(name,oid,text)		server	roles and privileges
+has_server_privilege(name,text,text)		server	roles and privileges
+has_server_privilege(oid,oid,text)		server	roles and privileges
+has_server_privilege(oid,text)		server	roles and privileges
+has_server_privilege(oid,text,text)		server	roles and privileges
+has_server_privilege(text,text)		server	roles and privileges
+has_table_privilege(name,oid,text)		server	roles and privileges
+has_table_privilege(name,text,text)		server	roles and privileges
+has_table_privilege(oid,oid,text)		server	roles and privileges
+has_table_privilege(oid,text)		server	roles and privileges
+has_table_privilege(oid,text,text)		server	roles and privileges
+has_table_privilege(text,text)		server	roles and privileges
+has_tablespace_privilege(name,oid,text)		server	roles and privileges
+has_tablespace_privilege(name,text,text)		server	roles and privileges
+has_tablespace_privilege(oid,oid,text)		server	roles and privileges
+has_tablespace_privilege(oid,text)		server	roles and privileges
+has_tablespace_privilege(oid,text,text)		server	roles and privileges
+has_tablespace_privilege(text,text)		server	roles and privileges
+has_type_privilege(name,oid,text)		server	roles and privileges
+has_type_privilege(name,text,text)		server	roles and privileges
+has_type_privilege(oid,oid,text)		server	roles and privileges
+has_type_privilege(oid,text)		server	roles and privileges
+has_type_privilege(oid,text,text)		server	roles and privileges
+has_type_privilege(text,text)		server	roles and privileges
+hash_aclitem(aclitem)		type	an operator's, a cast's or an index's
+hash_aclitem_extended(aclitem,bigint)		type	an operator's, a cast's or an index's
+hash_array(anyarray)		type	an operator's, a cast's or an index's
+hash_array_extended(anyarray,bigint)		type	an operator's, a cast's or an index's
+hash_multirange(anymultirange)		type	an operator's, a cast's or an index's
+hash_multirange_extended(anymultirange,bigint)		type	an operator's, a cast's or an index's
+hash_numeric(numeric)		type	an operator's, a cast's or an index's
+hash_numeric_extended(numeric,bigint)		type	an operator's, a cast's or an index's
+hash_range(anyrange)		type	an operator's, a cast's or an index's
+hash_range_extended(anyrange,bigint)		type	an operator's, a cast's or an index's
+hash_record(record)		type	an operator's, a cast's or an index's
+hash_record_extended(record,bigint)		type	an operator's, a cast's or an index's
+hashbool(boolean)	18-19	type	an operator's, a cast's or an index's
+hashboolextended(boolean,bigint)	18-19	type	an operator's, a cast's or an index's
+hashbpchar(character)		type	an operator's, a cast's or an index's
+hashbpcharextended(character,bigint)		type	an operator's, a cast's or an index's
+hashbytea(bytea)	18-19	type	an operator's, a cast's or an index's
+hashbyteaextended(bytea,bigint)	18-19	type	an operator's, a cast's or an index's
+hashchar("char")		type	an operator's, a cast's or an index's
+hashcharextended("char",bigint)		type	an operator's, a cast's or an index's
+hashcid(cid)	18-19	type	an operator's, a cast's or an index's
+hashcidextended(cid,bigint)	18-19	type	an operator's, a cast's or an index's
+hashdate(date)	18-19	type	an operator's, a cast's or an index's
+hashdateextended(date,bigint)	18-19	type	an operator's, a cast's or an index's
+hashenum(anyenum)		type	an operator's, a cast's or an index's
+hashenumextended(anyenum,bigint)		type	an operator's, a cast's or an index's
+hashfloat4(real)		type	an operator's, a cast's or an index's
+hashfloat4extended(real,bigint)		type	an operator's, a cast's or an index's
+hashfloat8(double precision)		type	an operator's, a cast's or an index's
+hashfloat8extended(double precision,bigint)		type	an operator's, a cast's or an index's
+hashinet(inet)		type	an operator's, a cast's or an index's
+hashinetextended(inet,bigint)		type	an operator's, a cast's or an index's
+hashint2(smallint)		type	an operator's, a cast's or an index's
+hashint2extended(smallint,bigint)		type	an operator's, a cast's or an index's
+hashint4(integer)		type	an operator's, a cast's or an index's
+hashint4extended(integer,bigint)		type	an operator's, a cast's or an index's
+hashint8(bigint)		type	an operator's, a cast's or an index's
+hashint8extended(bigint,bigint)		type	an operator's, a cast's or an index's
+hashmacaddr(macaddr)		type	an operator's, a cast's or an index's
+hashmacaddr8(macaddr8)		type	an operator's, a cast's or an index's
+hashmacaddr8extended(macaddr8,bigint)		type	an operator's, a cast's or an index's
+hashmacaddrextended(macaddr,bigint)		type	an operator's, a cast's or an index's
+hashname(name)		type	an operator's, a cast's or an index's
+hashnameextended(name,bigint)		type	an operator's, a cast's or an index's
+hashoid(oid)		type	an operator's, a cast's or an index's
+hashoid8(oid8)	19	type	an operator's, a cast's or an index's
+hashoid8extended(oid8,bigint)	19	type	an operator's, a cast's or an index's
+hashoidextended(oid,bigint)		type	an operator's, a cast's or an index's
+hashoidvector(oidvector)		type	an operator's, a cast's or an index's
+hashoidvectorextended(oidvector,bigint)		type	an operator's, a cast's or an index's
+hashtext(text)		type	an operator's, a cast's or an index's
+hashtextextended(text,bigint)		type	an operator's, a cast's or an index's
+hashtid(tid)		type	an operator's, a cast's or an index's
+hashtidextended(tid,bigint)		type	an operator's, a cast's or an index's
+hashxid(xid)	18-19	type	an operator's, a cast's or an index's
+hashxid8(xid8)	18-19	type	an operator's, a cast's or an index's
+hashxid8extended(xid8,bigint)	18-19	type	an operator's, a cast's or an index's
+hashxidextended(xid,bigint)	18-19	type	an operator's, a cast's or an index's
+height(box)		type	geometric
+host(inet)		type	network
+hostmask(inet)		type	network
+icu_unicode_version()	17-19	type	collations
+in_range(bigint,bigint,bigint,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(date,date,interval,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(double precision,double precision,double precision,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(integer,integer,bigint,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(integer,integer,integer,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(integer,integer,smallint,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(interval,interval,interval,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(numeric,numeric,numeric,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(real,real,double precision,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(smallint,smallint,bigint,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(smallint,smallint,integer,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(smallint,smallint,smallint,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(time with time zone,time with time zone,interval,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(time without time zone,time without time zone,interval,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(timestamp with time zone,timestamp with time zone,interval,boolean,boolean)		type	an operator's, a cast's or an index's
+in_range(timestamp without time zone,timestamp without time zone,interval,boolean,boolean)		type	an operator's, a cast's or an index's
+index_am_handler_out(index_am_handler)		type	input and output
+inet_client_addr()		server	sessions
+inet_client_port()		server	sessions
+inet_in(cstring)		type	input and output
+inet_merge(inet,inet)		type	an operator's, a cast's or an index's
+inet_out(inet)		type	input and output
+inet_same_family(inet,inet)		type	an operator's, a cast's or an index's
+inet_send(inet)		type	input and output
+inet_server_addr()		server	sessions
+inet_server_port()		server	sessions
+inetand(inet,inet)		type	an operator's, a cast's or an index's
+inetmi(inet,inet)		type	an operator's, a cast's or an index's
+inetmi_int8(inet,bigint)		type	an operator's, a cast's or an index's
+inetnot(inet)		type	an operator's, a cast's or an index's
+inetor(inet,inet)		type	an operator's, a cast's or an index's
+inetpl(inet,bigint)		type	an operator's, a cast's or an index's
+initcap(text)		type	strings and formatting
+int2(bigint)		type	an operator's, a cast's or an index's
+int2(bytea)	18-19	type	an operator's, a cast's or an index's
+int2(double precision)		type	an operator's, a cast's or an index's
+int2(integer)		type	an operator's, a cast's or an index's
+int2(jsonb)		type	an operator's, a cast's or an index's
+int2(numeric)		type	an operator's, a cast's or an index's
+int2(real)		type	an operator's, a cast's or an index's
+int24div(smallint,integer)		type	an operator's, a cast's or an index's
+int24eq(smallint,integer)		type	an operator's, a cast's or an index's
+int24ge(smallint,integer)		type	an operator's, a cast's or an index's
+int24gt(smallint,integer)		type	an operator's, a cast's or an index's
+int24le(smallint,integer)		type	an operator's, a cast's or an index's
+int24lt(smallint,integer)		type	an operator's, a cast's or an index's
+int24mi(smallint,integer)		type	an operator's, a cast's or an index's
+int24mul(smallint,integer)		type	an operator's, a cast's or an index's
+int24ne(smallint,integer)		type	an operator's, a cast's or an index's
+int24pl(smallint,integer)		type	an operator's, a cast's or an index's
+int28div(smallint,bigint)		type	an operator's, a cast's or an index's
+int28eq(smallint,bigint)		type	an operator's, a cast's or an index's
+int28ge(smallint,bigint)		type	an operator's, a cast's or an index's
+int28gt(smallint,bigint)		type	an operator's, a cast's or an index's
+int28le(smallint,bigint)		type	an operator's, a cast's or an index's
+int28lt(smallint,bigint)		type	an operator's, a cast's or an index's
+int28mi(smallint,bigint)		type	an operator's, a cast's or an index's
+int28mul(smallint,bigint)		type	an operator's, a cast's or an index's
+int28ne(smallint,bigint)		type	an operator's, a cast's or an index's
+int28pl(smallint,bigint)		type	an operator's, a cast's or an index's
+int2_avg_accum(bigint[],smallint)		type	aggregates' support
+int2_avg_accum_inv(bigint[],smallint)		type	aggregates' support
+int2_mul_cash(smallint,money)		type	an operator's, a cast's or an index's
+int2_sum(bigint,smallint)		type	aggregates' support
+int2abs(smallint)		type	an operator's, a cast's or an index's
+int2and(smallint,smallint)		type	an operator's, a cast's or an index's
+int2div(smallint,smallint)		type	an operator's, a cast's or an index's
+int2eq(smallint,smallint)		type	an operator's, a cast's or an index's
+int2ge(smallint,smallint)		type	an operator's, a cast's or an index's
+int2gt(smallint,smallint)		type	an operator's, a cast's or an index's
+int2in(cstring)		type	input and output
+int2int4_sum(bigint[])		type	aggregates' support
+int2larger(smallint,smallint)		type	aggregates' support
+int2le(smallint,smallint)		type	an operator's, a cast's or an index's
+int2lt(smallint,smallint)		type	an operator's, a cast's or an index's
+int2mi(smallint,smallint)		type	an operator's, a cast's or an index's
+int2mod(smallint,smallint)		type	an operator's, a cast's or an index's
+int2mul(smallint,smallint)		type	an operator's, a cast's or an index's
+int2ne(smallint,smallint)		type	an operator's, a cast's or an index's
+int2not(smallint)		type	an operator's, a cast's or an index's
+int2or(smallint,smallint)		type	an operator's, a cast's or an index's
+int2out(smallint)		type	input and output
+int2pl(smallint,smallint)		type	an operator's, a cast's or an index's
+int2send(smallint)		type	input and output
+int2shl(smallint,integer)		type	an operator's, a cast's or an index's
+int2shr(smallint,integer)		type	an operator's, a cast's or an index's
+int2smaller(smallint,smallint)		type	aggregates' support
+int2um(smallint)		type	an operator's, a cast's or an index's
+int2up(smallint)		type	an operator's, a cast's or an index's
+int2vectorin(cstring)		type	input and output
+int2vectorout(int2vector)		type	input and output
+int2vectorsend(int2vector)		type	input and output
+int2xor(smallint,smallint)		type	an operator's, a cast's or an index's
+int4("char")		type	an operator's, a cast's or an index's
+int4(bigint)		type	an operator's, a cast's or an index's
+int4(bit)		type	an operator's, a cast's or an index's
+int4(boolean)		type	an operator's, a cast's or an index's
+int4(bytea)	18-19	type	an operator's, a cast's or an index's
+int4(double precision)		type	an operator's, a cast's or an index's
+int4(jsonb)		type	an operator's, a cast's or an index's
+int4(numeric)		type	an operator's, a cast's or an index's
+int4(real)		type	an operator's, a cast's or an index's
+int4(smallint)		type	an operator's, a cast's or an index's
+int42div(integer,smallint)		type	an operator's, a cast's or an index's
+int42eq(integer,smallint)		type	an operator's, a cast's or an index's
+int42ge(integer,smallint)		type	an operator's, a cast's or an index's
+int42gt(integer,smallint)		type	an operator's, a cast's or an index's
+int42le(integer,smallint)		type	an operator's, a cast's or an index's
+int42lt(integer,smallint)		type	an operator's, a cast's or an index's
+int42mi(integer,smallint)		type	an operator's, a cast's or an index's
+int42mul(integer,smallint)		type	an operator's, a cast's or an index's
+int42ne(integer,smallint)		type	an operator's, a cast's or an index's
+int42pl(integer,smallint)		type	an operator's, a cast's or an index's
+int48div(integer,bigint)		type	an operator's, a cast's or an index's
+int48eq(integer,bigint)		type	an operator's, a cast's or an index's
+int48ge(integer,bigint)		type	an operator's, a cast's or an index's
+int48gt(integer,bigint)		type	an operator's, a cast's or an index's
+int48le(integer,bigint)		type	an operator's, a cast's or an index's
+int48lt(integer,bigint)		type	an operator's, a cast's or an index's
+int48mi(integer,bigint)		type	an operator's, a cast's or an index's
+int48mul(integer,bigint)		type	an operator's, a cast's or an index's
+int48ne(integer,bigint)		type	an operator's, a cast's or an index's
+int48pl(integer,bigint)		type	an operator's, a cast's or an index's
+int4_avg_accum(bigint[],integer)		type	aggregates' support
+int4_avg_accum_inv(bigint[],integer)		type	aggregates' support
+int4_avg_combine(bigint[],bigint[])		type	aggregates' support
+int4_mul_cash(integer,money)		type	an operator's, a cast's or an index's
+int4_sum(bigint,integer)		type	aggregates' support
+int4abs(integer)		type	an operator's, a cast's or an index's
+int4and(integer,integer)		type	an operator's, a cast's or an index's
+int4div(integer,integer)		type	an operator's, a cast's or an index's
+int4eq(integer,integer)		type	an operator's, a cast's or an index's
+int4ge(integer,integer)		type	an operator's, a cast's or an index's
+int4gt(integer,integer)		type	an operator's, a cast's or an index's
+int4in(cstring)		type	input and output
+int4inc(integer)		type	aggregates' support
+int4larger(integer,integer)		type	aggregates' support
+int4le(integer,integer)		type	an operator's, a cast's or an index's
+int4lt(integer,integer)		type	an operator's, a cast's or an index's
+int4mi(integer,integer)		type	an operator's, a cast's or an index's
+int4mod(integer,integer)		type	an operator's, a cast's or an index's
+int4mul(integer,integer)		type	an operator's, a cast's or an index's
+int4multirange()		type	ranges and multiranges
+int4multirange(int4range)		type	an operator's, a cast's or an index's
+int4multirange(int4range[])		type	ranges and multiranges
+int4ne(integer,integer)		type	an operator's, a cast's or an index's
+int4not(integer)		type	an operator's, a cast's or an index's
+int4or(integer,integer)		type	an operator's, a cast's or an index's
+int4out(integer)		type	input and output
+int4pl(integer,integer)		type	an operator's, a cast's or an index's
+int4range(integer,integer)		type	ranges and multiranges
+int4range(integer,integer,text)		type	ranges and multiranges
+int4range_canonical(int4range)		type	ranges and multiranges
+int4range_subdiff(integer,integer)		type	ranges and multiranges
+int4send(integer)		type	input and output
+int4shl(integer,integer)		type	an operator's, a cast's or an index's
+int4shr(integer,integer)		type	an operator's, a cast's or an index's
+int4smaller(integer,integer)		type	aggregates' support
+int4um(integer)		type	an operator's, a cast's or an index's
+int4up(integer)		type	an operator's, a cast's or an index's
+int4xor(integer,integer)		type	an operator's, a cast's or an index's
+int8(bit)		type	an operator's, a cast's or an index's
+int8(bytea)	18-19	type	an operator's, a cast's or an index's
+int8(double precision)		type	an operator's, a cast's or an index's
+int8(integer)		type	an operator's, a cast's or an index's
+int8(jsonb)		type	an operator's, a cast's or an index's
+int8(numeric)		type	an operator's, a cast's or an index's
+int8(oid)		type	an operator's, a cast's or an index's
+int8(real)		type	an operator's, a cast's or an index's
+int8(smallint)		type	an operator's, a cast's or an index's
+int82div(bigint,smallint)		type	an operator's, a cast's or an index's
+int82eq(bigint,smallint)		type	an operator's, a cast's or an index's
+int82ge(bigint,smallint)		type	an operator's, a cast's or an index's
+int82gt(bigint,smallint)		type	an operator's, a cast's or an index's
+int82le(bigint,smallint)		type	an operator's, a cast's or an index's
+int82lt(bigint,smallint)		type	an operator's, a cast's or an index's
+int82mi(bigint,smallint)		type	an operator's, a cast's or an index's
+int82mul(bigint,smallint)		type	an operator's, a cast's or an index's
+int82ne(bigint,smallint)		type	an operator's, a cast's or an index's
+int82pl(bigint,smallint)		type	an operator's, a cast's or an index's
+int84div(bigint,integer)		type	an operator's, a cast's or an index's
+int84eq(bigint,integer)		type	an operator's, a cast's or an index's
+int84ge(bigint,integer)		type	an operator's, a cast's or an index's
+int84gt(bigint,integer)		type	an operator's, a cast's or an index's
+int84le(bigint,integer)		type	an operator's, a cast's or an index's
+int84lt(bigint,integer)		type	an operator's, a cast's or an index's
+int84mi(bigint,integer)		type	an operator's, a cast's or an index's
+int84mul(bigint,integer)		type	an operator's, a cast's or an index's
+int84ne(bigint,integer)		type	an operator's, a cast's or an index's
+int84pl(bigint,integer)		type	an operator's, a cast's or an index's
+int8_avg(bigint[])		type	aggregates' support
+int8_mul_cash(bigint,money)		type	an operator's, a cast's or an index's
+int8_sum(numeric,bigint)		type	aggregates' support
+int8abs(bigint)		type	an operator's, a cast's or an index's
+int8and(bigint,bigint)		type	an operator's, a cast's or an index's
+int8dec(bigint)		type	aggregates' support
+int8dec_any(bigint,"any")		type	aggregates' support
+int8div(bigint,bigint)		type	an operator's, a cast's or an index's
+int8eq(bigint,bigint)		type	an operator's, a cast's or an index's
+int8ge(bigint,bigint)		type	an operator's, a cast's or an index's
+int8gt(bigint,bigint)		type	an operator's, a cast's or an index's
+int8in(cstring)		type	input and output
+int8inc(bigint)		type	aggregates' support
+int8inc_any(bigint,"any")		type	aggregates' support
+int8inc_float8_float8(bigint,double precision,double precision)		type	aggregates' support
+int8larger(bigint,bigint)		type	aggregates' support
+int8le(bigint,bigint)		type	an operator's, a cast's or an index's
+int8lt(bigint,bigint)		type	an operator's, a cast's or an index's
+int8mi(bigint,bigint)		type	an operator's, a cast's or an index's
+int8mod(bigint,bigint)		type	an operator's, a cast's or an index's
+int8mul(bigint,bigint)		type	an operator's, a cast's or an index's
+int8multirange()		type	ranges and multiranges
+int8multirange(int8range)		type	an operator's, a cast's or an index's
+int8multirange(int8range[])		type	ranges and multiranges
+int8ne(bigint,bigint)		type	an operator's, a cast's or an index's
+int8not(bigint)		type	an operator's, a cast's or an index's
+int8or(bigint,bigint)		type	an operator's, a cast's or an index's
+int8out(bigint)		type	input and output
+int8pl(bigint,bigint)		type	an operator's, a cast's or an index's
+int8pl_inet(bigint,inet)		type	an operator's, a cast's or an index's
+int8range(bigint,bigint)		type	ranges and multiranges
+int8range(bigint,bigint,text)		type	ranges and multiranges
+int8range_canonical(int8range)		type	ranges and multiranges
+int8range_subdiff(bigint,bigint)		type	ranges and multiranges
+int8send(bigint)		type	input and output
+int8shl(bigint,integer)		type	an operator's, a cast's or an index's
+int8shr(bigint,integer)		type	an operator's, a cast's or an index's
+int8smaller(bigint,bigint)		type	aggregates' support
+int8um(bigint)		type	an operator's, a cast's or an index's
+int8up(bigint)		type	an operator's, a cast's or an index's
+int8xor(bigint,bigint)		type	an operator's, a cast's or an index's
+integer_pl_date(integer,date)		type	an operator's, a cast's or an index's
+inter_lb(line,box)		type	an operator's, a cast's or an index's
+inter_sb(lseg,box)		type	an operator's, a cast's or an index's
+inter_sl(lseg,line)		type	an operator's, a cast's or an index's
+interval_accum(interval[],interval)	14-16	type	aggregates' support
+interval_accum_inv(interval[],interval)	14-16	type	aggregates' support
+interval_avg(interval[])	14-16	type	aggregates' support
+interval_cmp(interval,interval)		type	an operator's, a cast's or an index's
+interval_combine(interval[],interval[])	14-16	type	aggregates' support
+interval_div(interval,double precision)		type	an operator's, a cast's or an index's
+interval_eq(interval,interval)		type	an operator's, a cast's or an index's
+interval_ge(interval,interval)		type	an operator's, a cast's or an index's
+interval_gt(interval,interval)		type	an operator's, a cast's or an index's
+interval_hash(interval)		type	an operator's, a cast's or an index's
+interval_hash_extended(interval,bigint)		type	an operator's, a cast's or an index's
+interval_in(cstring,oid,integer)		type	input and output
+interval_larger(interval,interval)		type	aggregates' support
+interval_le(interval,interval)		type	an operator's, a cast's or an index's
+interval_lt(interval,interval)		type	an operator's, a cast's or an index's
+interval_mi(interval,interval)		type	an operator's, a cast's or an index's
+interval_mul(interval,double precision)		type	an operator's, a cast's or an index's
+interval_ne(interval,interval)		type	an operator's, a cast's or an index's
+interval_out(interval)		type	input and output
+interval_pl(interval,interval)		type	an operator's, a cast's or an index's
+interval_pl_date(interval,date)		type	an operator's, a cast's or an index's
+interval_pl_time(interval,time without time zone)		type	an operator's, a cast's or an index's
+interval_pl_timestamp(interval,timestamp without time zone)		type	an operator's, a cast's or an index's
+interval_pl_timestamptz(interval,timestamp with time zone)		type	an operator's, a cast's or an index's
+interval_pl_timetz(interval,time with time zone)		type	an operator's, a cast's or an index's
+interval_send(interval)		type	input and output
+interval_smaller(interval,interval)		type	aggregates' support
+interval_um(interval)		type	an operator's, a cast's or an index's
+intervaltypmodin(cstring[])		type	input and output
+intervaltypmodout(integer)		type	input and output
+is_normalized(text,text)		type	strings and formatting
+isclosed(path)		type	geometric
+isempty(anymultirange)		type	ranges and multiranges
+isempty(anyrange)		type	an operator's, a cast's or an index's
+isfinite(date)		type	time
+isfinite(interval)		type	time
+isfinite(timestamp with time zone)		type	time
+isfinite(timestamp without time zone)		type	time
+ishorizontal(line)		type	geometric
+ishorizontal(lseg)		type	geometric
+ishorizontal(point,point)		type	geometric
+isopen(path)		type	geometric
+isparallel(line,line)		type	geometric
+isparallel(lseg,lseg)		type	geometric
+isperp(line,line)		type	geometric
+isperp(lseg,lseg)		type	geometric
+isvertical(line)		type	geometric
+isvertical(lseg)		type	geometric
+isvertical(point,point)		type	geometric
+json_agg(anyelement)		type	JSON
+json_agg_strict(anyelement)	16-19	type	JSON
+json_array_element(json,integer)		type	an operator's, a cast's or an index's
+json_array_element_text(json,integer)		type	an operator's, a cast's or an index's
+json_array_elements(json)		type	JSON
+json_array_elements_text(json)		type	JSON
+json_array_length(json)		type	JSON
+json_build_array("any")		type	JSON
+json_build_array()		type	JSON
+json_build_object("any")		type	JSON
+json_build_object()		type	JSON
+json_each(json)		type	JSON
+json_each_text(json)		type	JSON
+json_extract_path(json,text[])		type	an operator's, a cast's or an index's
+json_extract_path_text(json,text[])		type	an operator's, a cast's or an index's
+json_in(cstring)		type	input and output
+json_object(text[])	14-15	type	JSON
+json_object(text[],text[])	14-15	type	JSON
+json_object_agg("any","any")		type	JSON
+json_object_agg_strict("any","any")	16-19	type	JSON
+json_object_agg_unique("any","any")	16-19	type	JSON
+json_object_agg_unique_strict("any","any")	16-19	type	JSON
+json_object_field(json,text)		type	an operator's, a cast's or an index's
+json_object_field_text(json,text)		type	an operator's, a cast's or an index's
+json_object_keys(json)		type	JSON
+json_out(json)		type	input and output
+json_populate_record(anyelement,json,boolean)		type	JSON
+json_populate_recordset(anyelement,json,boolean)		type	JSON
+json_send(json)		type	input and output
+json_strip_nulls(json)	14-17	type	JSON
+json_strip_nulls(json,boolean)	18-19	type	JSON
+json_to_record(json)		type	JSON
+json_to_recordset(json)		type	JSON
+json_to_tsvector(json,jsonb)		type	JSON
+json_to_tsvector(regconfig,json,jsonb)		type	JSON
+json_typeof(json)		type	JSON
+jsonb_agg(anyelement)		type	JSON
+jsonb_agg_strict(anyelement)	16-19	type	JSON
+jsonb_array_element(jsonb,integer)		type	an operator's, a cast's or an index's
+jsonb_array_element_text(jsonb,integer)		type	an operator's, a cast's or an index's
+jsonb_array_elements(jsonb)		type	JSON
+jsonb_array_elements_text(jsonb)		type	JSON
+jsonb_array_length(jsonb)		type	JSON
+jsonb_build_array("any")		type	JSON
+jsonb_build_array()		type	JSON
+jsonb_build_object("any")		type	JSON
+jsonb_build_object()		type	JSON
+jsonb_cmp(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_concat(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_contained(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_contains(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_delete(jsonb,integer)		type	an operator's, a cast's or an index's
+jsonb_delete(jsonb,text)		type	an operator's, a cast's or an index's
+jsonb_delete(jsonb,text[])		type	an operator's, a cast's or an index's
+jsonb_delete_path(jsonb,text[])		type	an operator's, a cast's or an index's
+jsonb_each(jsonb)		type	JSON
+jsonb_each_text(jsonb)		type	JSON
+jsonb_eq(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_exists(jsonb,text)		type	an operator's, a cast's or an index's
+jsonb_exists_all(jsonb,text[])		type	an operator's, a cast's or an index's
+jsonb_exists_any(jsonb,text[])		type	an operator's, a cast's or an index's
+jsonb_extract_path(jsonb,text[])		type	an operator's, a cast's or an index's
+jsonb_extract_path_text(jsonb,text[])		type	an operator's, a cast's or an index's
+jsonb_ge(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_gt(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_hash(jsonb)		type	an operator's, a cast's or an index's
+jsonb_hash_extended(jsonb,bigint)		type	an operator's, a cast's or an index's
+jsonb_in(cstring)		type	input and output
+jsonb_insert(jsonb,text[],jsonb,boolean)		type	JSON
+jsonb_le(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_lt(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_ne(jsonb,jsonb)		type	an operator's, a cast's or an index's
+jsonb_object(text[])		type	JSON
+jsonb_object(text[],text[])		type	JSON
+jsonb_object_agg("any","any")		type	JSON
+jsonb_object_agg_strict("any","any")	16-19	type	JSON
+jsonb_object_agg_unique("any","any")	16-19	type	JSON
+jsonb_object_agg_unique_strict("any","any")	16-19	type	JSON
+jsonb_object_field(jsonb,text)		type	an operator's, a cast's or an index's
+jsonb_object_field_text(jsonb,text)		type	an operator's, a cast's or an index's
+jsonb_object_keys(jsonb)		type	JSON
+jsonb_out(jsonb)		type	input and output
+jsonb_path_exists(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_exists_opr(jsonb,jsonpath)		type	an operator's, a cast's or an index's
+jsonb_path_exists_tz(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_match(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_match_opr(jsonb,jsonpath)		type	an operator's, a cast's or an index's
+jsonb_path_match_tz(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_query(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_query_array(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_query_array_tz(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_query_first(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_query_first_tz(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_path_query_tz(jsonb,jsonpath,jsonb,boolean)		type	JSON
+jsonb_populate_record(anyelement,jsonb)		type	JSON
+jsonb_populate_record_valid(anyelement,jsonb)	17-19	type	JSON
+jsonb_populate_recordset(anyelement,jsonb)		type	JSON
+jsonb_pretty(jsonb)		type	JSON
+jsonb_send(jsonb)		type	input and output
+jsonb_set(jsonb,text[],jsonb,boolean)		type	JSON
+jsonb_set_lax(jsonb,text[],jsonb,boolean,text)		type	JSON
+jsonb_strip_nulls(jsonb)	14-17	type	JSON
+jsonb_strip_nulls(jsonb,boolean)	18-19	type	JSON
+jsonb_to_record(jsonb)		type	JSON
+jsonb_to_recordset(jsonb)		type	JSON
+jsonb_to_tsvector(jsonb,jsonb)		type	JSON
+jsonb_to_tsvector(regconfig,jsonb,jsonb)		type	JSON
+jsonb_typeof(jsonb)		type	JSON
+jsonpath_in(cstring)		type	input and output
+jsonpath_out(jsonpath)		type	input and output
+jsonpath_send(jsonpath)		type	input and output
+justify_days(interval)		type	time
+justify_hours(interval)		type	time
+justify_interval(interval)		type	time
+lag(anycompatible,integer,anycompatible)		type	window functions
+lag(anyelement)		type	window functions
+lag(anyelement,integer)		type	window functions
+language_handler_out(language_handler)		type	input and output
+last_value(anyelement)		type	window functions
+lastval()		type	sequences
+lcm(bigint,bigint)		type	numbers
+lcm(integer,integer)		type	numbers
+lcm(numeric,numeric)		type	numbers
+lead(anycompatible,integer,anycompatible)		type	window functions
+lead(anyelement)		type	window functions
+lead(anyelement,integer)		type	window functions
+length(bit)		type	bit strings
+length(bytea)		type	strings and formatting
+length(bytea,name)		type	strings and formatting
+length(character)		type	strings and formatting
+length(lseg)		type	geometric
+length(path)		type	geometric
+length(text)		type	strings and formatting
+length(tsvector)		type	text search
+lgamma(double precision)	18-19	type	numbers
+like_escape(bytea,bytea)		type	strings and formatting
+like_escape(text,text)		type	strings and formatting
+line(point,point)		type	geometric
+line_distance(line,line)		type	an operator's, a cast's or an index's
+line_eq(line,line)		type	an operator's, a cast's or an index's
+line_horizontal(line)		type	an operator's, a cast's or an index's
+line_in(cstring)		type	input and output
+line_interpt(line,line)		type	an operator's, a cast's or an index's
+line_intersect(line,line)		type	an operator's, a cast's or an index's
+line_out(line)		type	input and output
+line_parallel(line,line)		type	an operator's, a cast's or an index's
+line_perp(line,line)		type	an operator's, a cast's or an index's
+line_send(line)		type	input and output
+line_vertical(line)		type	an operator's, a cast's or an index's
+ln(double precision)		type	numbers
+ln(numeric)		type	numbers
+lo_close(integer)		server	large objects
+lo_creat(integer)		server	large objects
+lo_create(oid)		server	large objects
+lo_export(oid,text)		server	large objects
+lo_from_bytea(oid,bytea)		server	large objects
+lo_get(oid)		server	large objects
+lo_get(oid,bigint,integer)		server	large objects
+lo_import(text)		server	large objects
+lo_import(text,oid)		server	large objects
+lo_lseek(integer,integer,integer)		server	large objects
+lo_lseek64(integer,bigint,integer)		server	large objects
+lo_open(oid,integer)		server	large objects
+lo_put(oid,bigint,bytea)		server	large objects
+lo_tell(integer)		server	large objects
+lo_tell64(integer)		server	large objects
+lo_truncate(integer,integer)		server	large objects
+lo_truncate64(integer,bigint)		server	large objects
+lo_unlink(oid)		server	large objects
+log(double precision)		type	numbers
+log(numeric)		type	numbers
+log(numeric,numeric)		type	numbers
+log10(double precision)		type	numbers
+log10(numeric)		type	numbers
+loread(integer,integer)		server	large objects
+lower(anymultirange)		type	ranges and multiranges
+lower(anyrange)		type	ranges and multiranges
+lower(text)		type	strings and formatting
+lower_inc(anymultirange)		type	ranges and multiranges
+lower_inc(anyrange)		type	ranges and multiranges
+lower_inf(anymultirange)		type	ranges and multiranges
+lower_inf(anyrange)		type	ranges and multiranges
+lowrite(integer,bytea)		server	large objects
+lpad(text,integer)		type	strings and formatting
+lpad(text,integer,text)		type	strings and formatting
+lseg(box)		type	an operator's, a cast's or an index's
+lseg(point,point)		type	geometric
+lseg_center(lseg)		type	an operator's, a cast's or an index's
+lseg_distance(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_eq(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_ge(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_gt(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_horizontal(lseg)		type	an operator's, a cast's or an index's
+lseg_in(cstring)		type	input and output
+lseg_interpt(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_intersect(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_le(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_length(lseg)		type	an operator's, a cast's or an index's
+lseg_lt(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_ne(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_out(lseg)		type	input and output
+lseg_parallel(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_perp(lseg,lseg)		type	an operator's, a cast's or an index's
+lseg_send(lseg)		type	input and output
+lseg_vertical(lseg)		type	an operator's, a cast's or an index's
+ltrim(bytea,bytea)		type	strings and formatting
+ltrim(text)		type	strings and formatting
+ltrim(text,text)		type	strings and formatting
+macaddr(macaddr8)		type	an operator's, a cast's or an index's
+macaddr8(macaddr)		type	an operator's, a cast's or an index's
+macaddr8_and(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_cmp(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_eq(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_ge(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_gt(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_in(cstring)		type	input and output
+macaddr8_le(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_lt(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_ne(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_not(macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_or(macaddr8,macaddr8)		type	an operator's, a cast's or an index's
+macaddr8_out(macaddr8)		type	input and output
+macaddr8_send(macaddr8)		type	input and output
+macaddr8_set7bit(macaddr8)		type	network
+macaddr_and(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_cmp(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_eq(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_ge(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_gt(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_in(cstring)		type	input and output
+macaddr_le(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_lt(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_ne(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_not(macaddr)		type	an operator's, a cast's or an index's
+macaddr_or(macaddr,macaddr)		type	an operator's, a cast's or an index's
+macaddr_out(macaddr)		type	input and output
+macaddr_send(macaddr)		type	input and output
+make_date(integer,integer,integer)		type	time
+make_interval(integer,integer,integer,integer,integer,integer,double precision)		type	time
+make_time(integer,integer,double precision)		type	time
+make_timestamp(integer,integer,integer,integer,integer,double precision)		type	time
+make_timestamptz(integer,integer,integer,integer,integer,double precision)		type	time
+make_timestamptz(integer,integer,integer,integer,integer,double precision,text)		type	time
+makeaclitem(oid,oid,text,boolean)		type	the rest
+masklen(inet)		type	network
+max(anyarray)		type	aggregates the types carry
+max(anyenum)		type	aggregates the types carry
+max(bigint)		type	aggregates the types carry
+max(bytea)	18-19	type	aggregates the types carry
+max(character)		type	aggregates the types carry
+max(date)		type	aggregates the types carry
+max(double precision)		type	aggregates the types carry
+max(inet)		type	aggregates the types carry
+max(integer)		type	aggregates the types carry
+max(interval)		type	aggregates the types carry
+max(money)		type	aggregates the types carry
+max(numeric)		type	aggregates the types carry
+max(oid)		type	aggregates the types carry
+max(oid8)	19	type	aggregates the types carry
+max(pg_lsn)		type	aggregates the types carry
+max(real)		type	aggregates the types carry
+max(record)	18-19	type	aggregates the types carry
+max(smallint)		type	aggregates the types carry
+max(text)		type	aggregates the types carry
+max(tid)		type	aggregates the types carry
+max(time with time zone)		type	aggregates the types carry
+max(time without time zone)		type	aggregates the types carry
+max(timestamp with time zone)		type	aggregates the types carry
+max(timestamp without time zone)		type	aggregates the types carry
+max(xid8)	15-19	type	aggregates the types carry
+md5(bytea)		type	strings and formatting
+md5(text)		type	strings and formatting
+min(anyarray)		type	aggregates the types carry
+min(anyenum)		type	aggregates the types carry
+min(bigint)		type	aggregates the types carry
+min(bytea)	18-19	type	aggregates the types carry
+min(character)		type	aggregates the types carry
+min(date)		type	aggregates the types carry
+min(double precision)		type	aggregates the types carry
+min(inet)		type	aggregates the types carry
+min(integer)		type	aggregates the types carry
+min(interval)		type	aggregates the types carry
+min(money)		type	aggregates the types carry
+min(numeric)		type	aggregates the types carry
+min(oid)		type	aggregates the types carry
+min(oid8)	19	type	aggregates the types carry
+min(pg_lsn)		type	aggregates the types carry
+min(real)		type	aggregates the types carry
+min(record)	18-19	type	aggregates the types carry
+min(smallint)		type	aggregates the types carry
+min(text)		type	aggregates the types carry
+min(tid)		type	aggregates the types carry
+min(time with time zone)		type	aggregates the types carry
+min(time without time zone)		type	aggregates the types carry
+min(timestamp with time zone)		type	aggregates the types carry
+min(timestamp without time zone)		type	aggregates the types carry
+min(xid8)	15-19	type	aggregates the types carry
+min_scale(numeric)		type	numbers
+mod(bigint,bigint)		type	numbers
+mod(integer,integer)		type	numbers
+mod(numeric,numeric)		type	numbers
+mod(smallint,smallint)		type	numbers
+mode(anyelement)		type	aggregates
+money(bigint)		type	an operator's, a cast's or an index's
+money(integer)		type	an operator's, a cast's or an index's
+money(numeric)		type	an operator's, a cast's or an index's
+mul_d_interval(double precision,interval)		type	an operator's, a cast's or an index's
+multirange(anyrange)		type	ranges and multiranges
+multirange_adjacent_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_adjacent_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_after_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_after_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_before_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_before_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_cmp(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_contained_by_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_contained_by_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_contains_elem(anymultirange,anyelement)		type	an operator's, a cast's or an index's
+multirange_contains_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_contains_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_eq(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_ge(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_gt(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_in(cstring,oid,integer)		type	input and output
+multirange_intersect(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_intersect_agg_transfn(anymultirange,anymultirange)		type	aggregates' support
+multirange_le(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_lt(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_minus(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_minus_multi(anymultirange,anymultirange)	19	type	ranges and multiranges
+multirange_ne(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_out(anymultirange)		type	input and output
+multirange_overlaps_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_overlaps_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_overleft_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_overleft_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_overright_multirange(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+multirange_overright_range(anymultirange,anyrange)		type	an operator's, a cast's or an index's
+multirange_send(anymultirange)		type	input and output
+multirange_union(anymultirange,anymultirange)		type	an operator's, a cast's or an index's
+mxid_age(xid)		server	locks
+name(character varying)		type	an operator's, a cast's or an index's
+name(character)		type	an operator's, a cast's or an index's
+name(text)		type	an operator's, a cast's or an index's
+nameconcatoid(name,oid)		type	strings and formatting
+nameeq(name,name)		type	an operator's, a cast's or an index's
+nameeqtext(name,text)		type	an operator's, a cast's or an index's
+namege(name,name)		type	an operator's, a cast's or an index's
+namegetext(name,text)		type	an operator's, a cast's or an index's
+namegt(name,name)		type	an operator's, a cast's or an index's
+namegttext(name,text)		type	an operator's, a cast's or an index's
+nameiclike(name,text)		type	an operator's, a cast's or an index's
+nameicnlike(name,text)		type	an operator's, a cast's or an index's
+nameicregexeq(name,text)		type	an operator's, a cast's or an index's
+nameicregexne(name,text)		type	an operator's, a cast's or an index's
+namein(cstring)		type	input and output
+namele(name,name)		type	an operator's, a cast's or an index's
+nameletext(name,text)		type	an operator's, a cast's or an index's
+namelike(name,text)		type	an operator's, a cast's or an index's
+namelt(name,name)		type	an operator's, a cast's or an index's
+namelttext(name,text)		type	an operator's, a cast's or an index's
+namene(name,name)		type	an operator's, a cast's or an index's
+namenetext(name,text)		type	an operator's, a cast's or an index's
+namenlike(name,text)		type	an operator's, a cast's or an index's
+nameout(name)		type	input and output
+nameregexeq(name,text)		type	an operator's, a cast's or an index's
+nameregexne(name,text)		type	an operator's, a cast's or an index's
+namesend(name)		type	input and output
+netmask(inet)		type	network
+network(inet)		type	network
+network_cmp(inet,inet)		type	an operator's, a cast's or an index's
+network_eq(inet,inet)		type	an operator's, a cast's or an index's
+network_ge(inet,inet)		type	an operator's, a cast's or an index's
+network_gt(inet,inet)		type	an operator's, a cast's or an index's
+network_larger(inet,inet)		type	aggregates' support
+network_le(inet,inet)		type	an operator's, a cast's or an index's
+network_lt(inet,inet)		type	an operator's, a cast's or an index's
+network_ne(inet,inet)		type	an operator's, a cast's or an index's
+network_overlap(inet,inet)		type	an operator's, a cast's or an index's
+network_smaller(inet,inet)		type	aggregates' support
+network_sub(inet,inet)		type	an operator's, a cast's or an index's
+network_subeq(inet,inet)		type	an operator's, a cast's or an index's
+network_sup(inet,inet)		type	an operator's, a cast's or an index's
+network_supeq(inet,inet)		type	an operator's, a cast's or an index's
+nextval(regclass)		type	sequences
+notlike(bytea,bytea)		type	strings and formatting
+notlike(name,text)		type	strings and formatting
+notlike(text,text)		type	strings and formatting
+now()		type	time
+npoints(path)		type	geometric
+npoints(polygon)		type	geometric
+nth_value(anyelement,integer)		type	window functions
+ntile(integer)		type	window functions
+num_nonnulls("any")		type	numbers
+num_nulls("any")		type	numbers
+numeric_abs(numeric)		type	an operator's, a cast's or an index's
+numeric_add(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_cmp(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_div(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_div_trunc(numeric,numeric)		type	numbers
+numeric_eq(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_exp(numeric)		type	numbers
+numeric_ge(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_gt(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_in(cstring,oid,integer)		type	input and output
+numeric_inc(numeric)		type	aggregates' support
+numeric_larger(numeric,numeric)		type	aggregates' support
+numeric_le(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_ln(numeric)		type	numbers
+numeric_log(numeric,numeric)		type	numbers
+numeric_lt(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_mod(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_mul(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_ne(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_out(numeric)		type	input and output
+numeric_pl_pg_lsn(numeric,pg_lsn)		type	an operator's, a cast's or an index's
+numeric_power(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_send(numeric)		type	input and output
+numeric_smaller(numeric,numeric)		type	aggregates' support
+numeric_sqrt(numeric)		type	numbers
+numeric_sub(numeric,numeric)		type	an operator's, a cast's or an index's
+numeric_uminus(numeric)		type	an operator's, a cast's or an index's
+numeric_uplus(numeric)		type	an operator's, a cast's or an index's
+numerictypmodin(cstring[])		type	input and output
+numerictypmodout(integer)		type	input and output
+nummultirange()		type	ranges and multiranges
+nummultirange(numrange)		type	an operator's, a cast's or an index's
+nummultirange(numrange[])		type	ranges and multiranges
+numnode(tsquery)		type	text search
+numrange(numeric,numeric)		type	ranges and multiranges
+numrange(numeric,numeric,text)		type	ranges and multiranges
+numrange_subdiff(numeric,numeric)		type	ranges and multiranges
+obj_description(oid)		server	the server's catalog
+obj_description(oid,name)		server	the server's catalog
+octet_length(bit)		type	bit strings
+octet_length(bytea)		type	strings and formatting
+octet_length(character)		type	strings and formatting
+octet_length(text)		type	strings and formatting
+oid(bigint)		type	an operator's, a cast's or an index's
+oid8(oid)	19	type	an operator's, a cast's or an index's
+oid8eq(oid8,oid8)	19	type	an operator's, a cast's or an index's
+oid8ge(oid8,oid8)	19	type	an operator's, a cast's or an index's
+oid8gt(oid8,oid8)	19	type	an operator's, a cast's or an index's
+oid8in(cstring)	19	type	input and output
+oid8larger(oid8,oid8)	19	type	aggregates' support
+oid8le(oid8,oid8)	19	type	an operator's, a cast's or an index's
+oid8lt(oid8,oid8)	19	type	an operator's, a cast's or an index's
+oid8ne(oid8,oid8)	19	type	an operator's, a cast's or an index's
+oid8out(oid8)	19	type	input and output
+oid8send(oid8)	19	type	input and output
+oid8smaller(oid8,oid8)	19	type	aggregates' support
+oideq(oid,oid)		type	an operator's, a cast's or an index's
+oidge(oid,oid)		type	an operator's, a cast's or an index's
+oidgt(oid,oid)		type	an operator's, a cast's or an index's
+oidin(cstring)		type	input and output
+oidlarger(oid,oid)		type	aggregates' support
+oidle(oid,oid)		type	an operator's, a cast's or an index's
+oidlt(oid,oid)		type	an operator's, a cast's or an index's
+oidne(oid,oid)		type	an operator's, a cast's or an index's
+oidout(oid)		type	input and output
+oidsend(oid)		type	input and output
+oidsmaller(oid,oid)		type	aggregates' support
+oidvectoreq(oidvector,oidvector)		type	an operator's, a cast's or an index's
+oidvectorge(oidvector,oidvector)		type	an operator's, a cast's or an index's
+oidvectorgt(oidvector,oidvector)		type	an operator's, a cast's or an index's
+oidvectorin(cstring)		type	input and output
+oidvectorle(oidvector,oidvector)		type	an operator's, a cast's or an index's
+oidvectorlt(oidvector,oidvector)		type	an operator's, a cast's or an index's
+oidvectorne(oidvector,oidvector)		type	an operator's, a cast's or an index's
+oidvectorout(oidvector)		type	input and output
+oidvectorsend(oidvector)		type	input and output
+oidvectortypes(oidvector)		type	arrays
+on_pb(point,box)		type	an operator's, a cast's or an index's
+on_pl(point,line)		type	an operator's, a cast's or an index's
+on_ppath(point,path)		type	an operator's, a cast's or an index's
+on_ps(point,lseg)		type	an operator's, a cast's or an index's
+on_sb(lseg,box)		type	an operator's, a cast's or an index's
+on_sl(lseg,line)		type	an operator's, a cast's or an index's
+parse_ident(text,boolean)		type	arrays
+path(polygon)		type	an operator's, a cast's or an index's
+path_add(path,path)		type	an operator's, a cast's or an index's
+path_add_pt(path,point)		type	an operator's, a cast's or an index's
+path_center(path)	14	type	an operator's, a cast's or an index's
+path_contain_pt(path,point)		type	an operator's, a cast's or an index's
+path_distance(path,path)		type	an operator's, a cast's or an index's
+path_div_pt(path,point)		type	an operator's, a cast's or an index's
+path_in(cstring)		type	input and output
+path_inter(path,path)		type	an operator's, a cast's or an index's
+path_length(path)		type	an operator's, a cast's or an index's
+path_mul_pt(path,point)		type	an operator's, a cast's or an index's
+path_n_eq(path,path)		type	an operator's, a cast's or an index's
+path_n_ge(path,path)		type	an operator's, a cast's or an index's
+path_n_gt(path,path)		type	an operator's, a cast's or an index's
+path_n_le(path,path)		type	an operator's, a cast's or an index's
+path_n_lt(path,path)		type	an operator's, a cast's or an index's
+path_npoints(path)		type	an operator's, a cast's or an index's
+path_out(path)		type	input and output
+path_send(path)		type	input and output
+path_sub_pt(path,point)		type	an operator's, a cast's or an index's
+pclose(path)		type	geometric
+percent_rank("any")		type	aggregates
+percent_rank()		type	window functions
+percentile_cont(double precision,double precision)		type	aggregates
+percentile_cont(double precision,interval)		type	aggregates
+percentile_cont(double precision[],double precision)		type	arrays
+percentile_cont(double precision[],interval)		type	arrays
+percentile_disc(double precision,anyelement)		type	aggregates
+percentile_disc(double precision[],anyelement)		type	arrays
+pg_advisory_lock(bigint)		server	locks
+pg_advisory_lock(integer,integer)		server	locks
+pg_advisory_lock_shared(bigint)		server	locks
+pg_advisory_lock_shared(integer,integer)		server	locks
+pg_advisory_unlock(bigint)		server	locks
+pg_advisory_unlock(integer,integer)		server	locks
+pg_advisory_unlock_all()		server	locks
+pg_advisory_unlock_shared(bigint)		server	locks
+pg_advisory_unlock_shared(integer,integer)		server	locks
+pg_advisory_xact_lock(bigint)		server	locks
+pg_advisory_xact_lock(integer,integer)		server	locks
+pg_advisory_xact_lock_shared(bigint)		server	locks
+pg_advisory_xact_lock_shared(integer,integer)		server	locks
+pg_available_extension_versions()		server	the server's catalog
+pg_available_extensions()		server	the server's catalog
+pg_available_wal_summaries()	17-19	server	WAL and replication
+pg_backend_pid()		server	sessions
+pg_backup_start(text,boolean)	15-19	server	WAL and replication
+pg_backup_start_time()	14	server	WAL and replication
+pg_backup_stop(boolean)	15-19	server	WAL and replication
+pg_basetype(regtype)	17-19	type	the rest
+pg_blocking_pids(integer)		server	locks
+pg_cancel_backend(integer)		server	sessions
+pg_char_to_encoding(name)		type	strings and formatting
+pg_clear_attribute_stats(text,text,text,boolean)	18-19	server	statistics and sizes
+pg_clear_extended_stats(text,text,text,text,boolean)	19	server	statistics and sizes
+pg_clear_relation_stats(text,text)	18-19	server	statistics and sizes
+pg_client_encoding()		server	sessions
+pg_collation_actual_version(oid)		server	the server's catalog
+pg_collation_for("any")		type	collations
+pg_collation_is_visible(oid)		server	the server's catalog
+pg_column_compression("any")		server	statistics and sizes
+pg_column_is_updatable(regclass,smallint,boolean)		server	the server's catalog
+pg_column_size("any")		server	statistics and sizes
+pg_column_toast_chunk_id("any")	17-19	server	statistics and sizes
+pg_conf_load_time()		server	the server itself
+pg_config()		server	the server itself
+pg_control_checkpoint()		server	the server itself
+pg_control_init()		server	the server itself
+pg_control_recovery()		server	the server itself
+pg_control_system()		server	the server itself
+pg_conversion_is_visible(oid)		server	the server's catalog
+pg_copy_logical_replication_slot(name,name)		server	WAL and replication
+pg_copy_logical_replication_slot(name,name,boolean)		server	WAL and replication
+pg_copy_logical_replication_slot(name,name,boolean,name)		server	WAL and replication
+pg_copy_physical_replication_slot(name,name)		server	WAL and replication
+pg_copy_physical_replication_slot(name,name,boolean)		server	WAL and replication
+pg_create_logical_replication_slot(name,name,boolean,boolean)	14-16	server	WAL and replication
+pg_create_logical_replication_slot(name,name,boolean,boolean,boolean)	17-19	server	WAL and replication
+pg_create_physical_replication_slot(name,boolean,boolean)		server	WAL and replication
+pg_create_restore_point(text)		server	WAL and replication
+pg_current_logfile()		server	files and logs
+pg_current_logfile(text)		server	files and logs
+pg_current_snapshot()		server	sessions
+pg_current_wal_flush_lsn()		server	WAL and replication
+pg_current_wal_insert_lsn()		server	WAL and replication
+pg_current_wal_lsn()		server	WAL and replication
+pg_current_xact_id()		server	sessions
+pg_current_xact_id_if_assigned()		server	sessions
+pg_cursor()		server	sessions
+pg_database_collation_actual_version(oid)	15-19	server	other databases
+pg_database_size(name)		server	statistics and sizes
+pg_database_size(oid)		server	statistics and sizes
+pg_ddl_command_in(cstring)		type	input and output
+pg_ddl_command_out(pg_ddl_command)		type	input and output
+pg_ddl_command_send(pg_ddl_command)		type	input and output
+pg_dependencies_in(cstring)		type	input and output
+pg_dependencies_out(pg_dependencies)		type	input and output
+pg_dependencies_send(pg_dependencies)		type	input and output
+pg_describe_object(oid,oid,integer)		server	the server's catalog
+pg_drop_replication_slot(name)		server	WAL and replication
+pg_encoding_max_length(integer)		type	strings and formatting
+pg_encoding_to_char(integer)		type	strings and formatting
+pg_event_trigger_ddl_commands()		server	sessions
+pg_event_trigger_dropped_objects()		server	sessions
+pg_event_trigger_table_rewrite_oid()		server	sessions
+pg_event_trigger_table_rewrite_reason()		server	sessions
+pg_export_snapshot()		server	sessions
+pg_extension_config_dump(regclass,text)		server	the server's catalog
+pg_extension_update_paths(name)		server	the server's catalog
+pg_filenode_relation(oid,oid)		server	files and logs
+pg_function_is_visible(oid)		server	the server's catalog
+pg_get_acl(oid,oid,integer)	18-19	server	roles and privileges
+pg_get_aios()	18-19	server	the server itself
+pg_get_backend_memory_contexts()		server	the server itself
+pg_get_catalog_foreign_keys()		server	the server's catalog
+pg_get_constraintdef(oid)		server	the server's catalog
+pg_get_constraintdef(oid,boolean)		server	the server's catalog
+pg_get_dsm_registry_allocations()	19	server	the server itself
+pg_get_expr(pg_node_tree,oid)		server	the server's catalog
+pg_get_expr(pg_node_tree,oid,boolean)		server	the server's catalog
+pg_get_function_arg_default(oid,integer)		server	the server's catalog
+pg_get_function_arguments(oid)		server	the server's catalog
+pg_get_function_identity_arguments(oid)		server	the server's catalog
+pg_get_function_result(oid)		server	the server's catalog
+pg_get_function_sqlbody(oid)		server	the server's catalog
+pg_get_functiondef(oid)		server	the server's catalog
+pg_get_indexdef(oid)		server	the server's catalog
+pg_get_indexdef(oid,integer,boolean)		server	the server's catalog
+pg_get_keywords()		type	the rest
+pg_get_loaded_modules()	18-19	server	the server itself
+pg_get_multixact_members(xid)		server	locks
+pg_get_multixact_stats()	19	server	statistics and sizes
+pg_get_object_address(text,text[],text[])		server	the server's catalog
+pg_get_partition_constraintdef(oid)		server	the server's catalog
+pg_get_partkeydef(oid)		server	the server's catalog
+pg_get_publication_sequences(text)	19	server	WAL and replication
+pg_get_publication_tables(text)	14-15	server	WAL and replication
+pg_get_publication_tables(text[])	16-19	server	WAL and replication
+pg_get_publication_tables(text[],oid)	19	server	WAL and replication
+pg_get_replica_identity_index(regclass)		server	the server's catalog
+pg_get_replication_slots()		server	WAL and replication
+pg_get_ruledef(oid)		server	the server's catalog
+pg_get_ruledef(oid,boolean)		server	the server's catalog
+pg_get_sequence_data(regclass)	18-19	server	the server's catalog
+pg_get_serial_sequence(text,text)		type	sequences
+pg_get_shmem_allocations()		server	the server itself
+pg_get_shmem_allocations_numa()	18-19	server	the server itself
+pg_get_statisticsobjdef(oid)		server	the server's catalog
+pg_get_statisticsobjdef_columns(oid)		server	the server's catalog
+pg_get_statisticsobjdef_expressions(oid)		server	the server's catalog
+pg_get_triggerdef(oid)		server	the server's catalog
+pg_get_triggerdef(oid,boolean)		server	the server's catalog
+pg_get_userbyid(oid)		server	roles and privileges
+pg_get_viewdef(oid)		server	the server's catalog
+pg_get_viewdef(oid,boolean)		server	the server's catalog
+pg_get_viewdef(oid,integer)		server	the server's catalog
+pg_get_viewdef(text)		server	the server's catalog
+pg_get_viewdef(text,boolean)		server	the server's catalog
+pg_get_wait_events()	17-19	server	the server itself
+pg_get_wal_replay_pause_state()		server	WAL and replication
+pg_get_wal_resource_managers()	15-19	server	WAL and replication
+pg_get_wal_summarizer_state()	17-19	server	WAL and replication
+pg_has_role(name,name,text)		server	roles and privileges
+pg_has_role(name,oid,text)		server	roles and privileges
+pg_has_role(name,text)		server	roles and privileges
+pg_has_role(oid,name,text)		server	roles and privileges
+pg_has_role(oid,oid,text)		server	roles and privileges
+pg_has_role(oid,text)		server	roles and privileges
+pg_hba_file_rules()		server	files and logs
+pg_ident_file_mappings()	15-19	server	files and logs
+pg_identify_object(oid,oid,integer)		server	the server's catalog
+pg_identify_object_as_address(oid,oid,integer)		server	the server's catalog
+pg_import_system_collations(regnamespace)		server	the server's catalog
+pg_index_column_has_property(regclass,integer,text)		server	the server's catalog
+pg_index_has_property(regclass,text)		server	the server's catalog
+pg_indexam_has_property(oid,text)		server	the server's catalog
+pg_indexam_progress_phasename(oid,bigint)		server	the server's catalog
+pg_indexes_size(regclass)		server	statistics and sizes
+pg_input_error_info(text,text)	16-19	type	input and output
+pg_input_is_valid(text,text)	16-19	type	input and output
+pg_is_in_backup()	14	server	WAL and replication
+pg_is_in_recovery()		server	WAL and replication
+pg_is_other_temp_schema(oid)		server	sessions
+pg_is_wal_replay_paused()		server	WAL and replication
+pg_isolation_test_session_is_blocked(integer,integer[])		server	locks
+pg_jit_available()		server	the server itself
+pg_last_committed_xact()		server	WAL and replication
+pg_last_wal_receive_lsn()		server	WAL and replication
+pg_last_wal_replay_lsn()		server	WAL and replication
+pg_last_xact_replay_timestamp()		server	WAL and replication
+pg_listening_channels()		server	sessions
+pg_lock_status()		server	locks
+pg_log_backend_memory_contexts(integer)		server	the server itself
+pg_log_standby_snapshot()	16-19	server	WAL and replication
+pg_logical_emit_message(boolean,text,bytea)	14-16	server	WAL and replication
+pg_logical_emit_message(boolean,text,bytea,boolean)	17-19	server	WAL and replication
+pg_logical_emit_message(boolean,text,text)	14-16	server	WAL and replication
+pg_logical_emit_message(boolean,text,text,boolean)	17-19	server	WAL and replication
+pg_logical_slot_get_binary_changes(name,pg_lsn,integer,text[])		server	WAL and replication
+pg_logical_slot_get_changes(name,pg_lsn,integer,text[])		server	WAL and replication
+pg_logical_slot_peek_binary_changes(name,pg_lsn,integer,text[])		server	WAL and replication
+pg_logical_slot_peek_changes(name,pg_lsn,integer,text[])		server	WAL and replication
+pg_ls_archive_statusdir()		server	files and logs
+pg_ls_dir(text)		server	files and logs
+pg_ls_dir(text,boolean,boolean)		server	files and logs
+pg_ls_logdir()		server	files and logs
+pg_ls_logicalmapdir()	15-19	server	files and logs
+pg_ls_logicalsnapdir()	15-19	server	files and logs
+pg_ls_replslotdir(text)	15-19	server	files and logs
+pg_ls_summariesdir()	18-19	server	files and logs
+pg_ls_tmpdir()		server	files and logs
+pg_ls_tmpdir(oid)		server	files and logs
+pg_ls_waldir()		server	files and logs
+pg_lsn(numeric)		type	numbers
+pg_lsn_cmp(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_eq(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_ge(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_gt(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_hash(pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_hash_extended(pg_lsn,bigint)		type	an operator's, a cast's or an index's
+pg_lsn_in(cstring)		type	input and output
+pg_lsn_larger(pg_lsn,pg_lsn)		type	aggregates' support
+pg_lsn_le(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_lt(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_mi(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_mii(pg_lsn,numeric)		type	an operator's, a cast's or an index's
+pg_lsn_ne(pg_lsn,pg_lsn)		type	an operator's, a cast's or an index's
+pg_lsn_out(pg_lsn)		type	input and output
+pg_lsn_pli(pg_lsn,numeric)		type	an operator's, a cast's or an index's
+pg_lsn_send(pg_lsn)		type	input and output
+pg_lsn_smaller(pg_lsn,pg_lsn)		type	aggregates' support
+pg_mcv_list_in(cstring)		type	input and output
+pg_mcv_list_items(pg_mcv_list)		server	statistics and sizes
+pg_mcv_list_out(pg_mcv_list)		type	input and output
+pg_mcv_list_send(pg_mcv_list)		type	input and output
+pg_my_temp_schema()		server	sessions
+pg_ndistinct_in(cstring)		type	input and output
+pg_ndistinct_out(pg_ndistinct)		type	input and output
+pg_ndistinct_send(pg_ndistinct)		type	input and output
+pg_nextoid(regclass,name,regclass)		server	the server's catalog
+pg_node_tree_in(cstring)		type	input and output
+pg_node_tree_out(pg_node_tree)		type	input and output
+pg_node_tree_send(pg_node_tree)		type	input and output
+pg_notification_queue_usage()		server	sessions
+pg_notify(text,text)		server	sessions
+pg_numa_available()	18-19	server	the server itself
+pg_opclass_is_visible(oid)		server	the server's catalog
+pg_operator_is_visible(oid)		server	the server's catalog
+pg_opfamily_is_visible(oid)		server	the server's catalog
+pg_options_to_table(text[])		type	arrays
+pg_partition_ancestors(regclass)		server	the server's catalog
+pg_partition_root(regclass)		server	the server's catalog
+pg_partition_tree(regclass)		server	the server's catalog
+pg_postmaster_start_time()		server	the server itself
+pg_prepared_statement()		server	sessions
+pg_prepared_xact()		server	sessions
+pg_promote(boolean,integer)		server	WAL and replication
+pg_read_binary_file(text)		server	files and logs
+pg_read_binary_file(text,bigint,bigint)		server	files and logs
+pg_read_binary_file(text,bigint,bigint,boolean)		server	files and logs
+pg_read_binary_file(text,boolean)	16-19	server	files and logs
+pg_read_file(text)		server	files and logs
+pg_read_file(text,bigint,bigint)		server	files and logs
+pg_read_file(text,bigint,bigint,boolean)		server	files and logs
+pg_read_file(text,boolean)	16-19	server	files and logs
+pg_read_file_old(text,bigint,bigint)	14-16	server	files and logs
+pg_relation_filenode(regclass)		server	files and logs
+pg_relation_filepath(regclass)		server	files and logs
+pg_relation_is_publishable(regclass)		server	WAL and replication
+pg_relation_is_updatable(regclass,boolean)		server	the server's catalog
+pg_relation_size(regclass)		server	statistics and sizes
+pg_relation_size(regclass,text)		server	statistics and sizes
+pg_reload_conf()		server	files and logs
+pg_replication_origin_advance(text,pg_lsn)		server	WAL and replication
+pg_replication_origin_create(text)		server	WAL and replication
+pg_replication_origin_drop(text)		server	WAL and replication
+pg_replication_origin_oid(text)		server	WAL and replication
+pg_replication_origin_progress(text,boolean)		server	WAL and replication
+pg_replication_origin_session_is_setup()		server	WAL and replication
+pg_replication_origin_session_progress(boolean)		server	WAL and replication
+pg_replication_origin_session_reset()		server	WAL and replication
+pg_replication_origin_session_setup(text)	14-18	server	WAL and replication
+pg_replication_origin_session_setup(text,integer)	19	server	WAL and replication
+pg_replication_origin_xact_reset()		server	WAL and replication
+pg_replication_origin_xact_setup(pg_lsn,timestamp with time zone)		server	WAL and replication
+pg_replication_slot_advance(name,pg_lsn)		server	WAL and replication
+pg_restore_attribute_stats("any")	18-19	server	statistics and sizes
+pg_restore_extended_stats("any")	19	server	statistics and sizes
+pg_restore_relation_stats("any")	18-19	server	statistics and sizes
+pg_rotate_logfile()		server	files and logs
+pg_rotate_logfile_old()	14-16	server	files and logs
+pg_safe_snapshot_blocking_pids(integer)		server	locks
+pg_sequence_last_value(regclass)		server	the server's catalog
+pg_sequence_parameters(oid)		server	the server's catalog
+pg_settings_get_flags(text)	15-19	server	the server itself
+pg_show_all_file_settings()		server	files and logs
+pg_show_all_settings()		server	the server itself
+pg_show_replication_origin_status()		server	WAL and replication
+pg_size_bytes(text)		type	numbers
+pg_size_pretty(bigint)		type	numbers
+pg_size_pretty(numeric)		type	numbers
+pg_sleep(double precision)		server	sessions
+pg_sleep_for(interval)		server	sessions
+pg_sleep_until(timestamp with time zone)		server	sessions
+pg_snapshot_in(cstring)		type	input and output
+pg_snapshot_out(pg_snapshot)		type	input and output
+pg_snapshot_send(pg_snapshot)		type	input and output
+pg_snapshot_xip(pg_snapshot)		type	the rest
+pg_snapshot_xmax(pg_snapshot)		type	the rest
+pg_snapshot_xmin(pg_snapshot)		type	the rest
+pg_split_walfile_name(text)	16-19	server	WAL and replication
+pg_start_backup(text,boolean,boolean)	14	server	WAL and replication
+pg_stat_clear_snapshot()		server	statistics and sizes
+pg_stat_file(text)		server	files and logs
+pg_stat_file(text,boolean)		server	files and logs
+pg_stat_force_next_flush()	15-19	server	statistics and sizes
+pg_stat_get_activity(integer)		server	statistics and sizes
+pg_stat_get_analyze_count(oid)		server	statistics and sizes
+pg_stat_get_archiver()		server	statistics and sizes
+pg_stat_get_autoanalyze_count(oid)		server	statistics and sizes
+pg_stat_get_autovacuum_count(oid)		server	statistics and sizes
+pg_stat_get_autovacuum_scores()	19	server	statistics and sizes
+pg_stat_get_backend_activity(integer)		server	statistics and sizes
+pg_stat_get_backend_activity_start(integer)		server	statistics and sizes
+pg_stat_get_backend_client_addr(integer)		server	statistics and sizes
+pg_stat_get_backend_client_port(integer)		server	statistics and sizes
+pg_stat_get_backend_dbid(integer)		server	statistics and sizes
+pg_stat_get_backend_idset()		server	statistics and sizes
+pg_stat_get_backend_io(integer)	18-19	server	statistics and sizes
+pg_stat_get_backend_pid(integer)		server	statistics and sizes
+pg_stat_get_backend_start(integer)		server	statistics and sizes
+pg_stat_get_backend_subxact(integer)	16-19	server	statistics and sizes
+pg_stat_get_backend_userid(integer)		server	statistics and sizes
+pg_stat_get_backend_wait_event(integer)		server	statistics and sizes
+pg_stat_get_backend_wait_event_type(integer)		server	statistics and sizes
+pg_stat_get_backend_wal(integer)	18-19	server	statistics and sizes
+pg_stat_get_backend_xact_start(integer)		server	statistics and sizes
+pg_stat_get_bgwriter_buf_written_checkpoints()	14-16	server	statistics and sizes
+pg_stat_get_bgwriter_buf_written_clean()		server	statistics and sizes
+pg_stat_get_bgwriter_maxwritten_clean()		server	statistics and sizes
+pg_stat_get_bgwriter_requested_checkpoints()	14-16	server	statistics and sizes
+pg_stat_get_bgwriter_stat_reset_time()		server	statistics and sizes
+pg_stat_get_bgwriter_timed_checkpoints()	14-16	server	statistics and sizes
+pg_stat_get_blocks_fetched(oid)		server	statistics and sizes
+pg_stat_get_blocks_hit(oid)		server	statistics and sizes
+pg_stat_get_buf_alloc()		server	statistics and sizes
+pg_stat_get_buf_fsync_backend()	14-16	server	statistics and sizes
+pg_stat_get_buf_written_backend()	14-16	server	statistics and sizes
+pg_stat_get_checkpoint_sync_time()	14-16	server	statistics and sizes
+pg_stat_get_checkpoint_write_time()	14-16	server	statistics and sizes
+pg_stat_get_checkpointer_buffers_written()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_num_performed()	18-19	server	statistics and sizes
+pg_stat_get_checkpointer_num_requested()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_num_timed()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_restartpoints_performed()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_restartpoints_requested()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_restartpoints_timed()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_slru_written()	18-19	server	statistics and sizes
+pg_stat_get_checkpointer_stat_reset_time()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_sync_time()	17-19	server	statistics and sizes
+pg_stat_get_checkpointer_write_time()	17-19	server	statistics and sizes
+pg_stat_get_db_active_time(oid)		server	statistics and sizes
+pg_stat_get_db_blk_read_time(oid)		server	statistics and sizes
+pg_stat_get_db_blk_write_time(oid)		server	statistics and sizes
+pg_stat_get_db_blocks_fetched(oid)		server	statistics and sizes
+pg_stat_get_db_blocks_hit(oid)		server	statistics and sizes
+pg_stat_get_db_checksum_failures(oid)		server	statistics and sizes
+pg_stat_get_db_checksum_last_failure(oid)		server	statistics and sizes
+pg_stat_get_db_conflict_all(oid)		server	statistics and sizes
+pg_stat_get_db_conflict_bufferpin(oid)		server	statistics and sizes
+pg_stat_get_db_conflict_lock(oid)		server	statistics and sizes
+pg_stat_get_db_conflict_logicalslot(oid)	16-19	server	statistics and sizes
+pg_stat_get_db_conflict_snapshot(oid)		server	statistics and sizes
+pg_stat_get_db_conflict_startup_deadlock(oid)		server	statistics and sizes
+pg_stat_get_db_conflict_tablespace(oid)		server	statistics and sizes
+pg_stat_get_db_deadlocks(oid)		server	statistics and sizes
+pg_stat_get_db_idle_in_transaction_time(oid)		server	statistics and sizes
+pg_stat_get_db_numbackends(oid)		server	statistics and sizes
+pg_stat_get_db_parallel_workers_launched(oid)	18-19	server	statistics and sizes
+pg_stat_get_db_parallel_workers_to_launch(oid)	18-19	server	statistics and sizes
+pg_stat_get_db_session_time(oid)		server	statistics and sizes
+pg_stat_get_db_sessions(oid)		server	statistics and sizes
+pg_stat_get_db_sessions_abandoned(oid)		server	statistics and sizes
+pg_stat_get_db_sessions_fatal(oid)		server	statistics and sizes
+pg_stat_get_db_sessions_killed(oid)		server	statistics and sizes
+pg_stat_get_db_stat_reset_time(oid)		server	statistics and sizes
+pg_stat_get_db_temp_bytes(oid)		server	statistics and sizes
+pg_stat_get_db_temp_files(oid)		server	statistics and sizes
+pg_stat_get_db_tuples_deleted(oid)		server	statistics and sizes
+pg_stat_get_db_tuples_fetched(oid)		server	statistics and sizes
+pg_stat_get_db_tuples_inserted(oid)		server	statistics and sizes
+pg_stat_get_db_tuples_returned(oid)		server	statistics and sizes
+pg_stat_get_db_tuples_updated(oid)		server	statistics and sizes
+pg_stat_get_db_xact_commit(oid)		server	statistics and sizes
+pg_stat_get_db_xact_rollback(oid)		server	statistics and sizes
+pg_stat_get_dead_tuples(oid)		server	statistics and sizes
+pg_stat_get_function_calls(oid)		server	statistics and sizes
+pg_stat_get_function_self_time(oid)		server	statistics and sizes
+pg_stat_get_function_stat_reset_time(oid)	19	server	statistics and sizes
+pg_stat_get_function_total_time(oid)		server	statistics and sizes
+pg_stat_get_ins_since_vacuum(oid)		server	statistics and sizes
+pg_stat_get_io()	16-19	server	statistics and sizes
+pg_stat_get_last_analyze_time(oid)		server	statistics and sizes
+pg_stat_get_last_autoanalyze_time(oid)		server	statistics and sizes
+pg_stat_get_last_autovacuum_time(oid)		server	statistics and sizes
+pg_stat_get_last_vacuum_time(oid)		server	statistics and sizes
+pg_stat_get_lastscan(oid)	16-19	server	statistics and sizes
+pg_stat_get_live_tuples(oid)		server	statistics and sizes
+pg_stat_get_lock()	19	server	statistics and sizes
+pg_stat_get_mod_since_analyze(oid)		server	statistics and sizes
+pg_stat_get_numscans(oid)		server	statistics and sizes
+pg_stat_get_progress_info(text)		server	statistics and sizes
+pg_stat_get_recovery()	19	server	statistics and sizes
+pg_stat_get_recovery_prefetch()	15-19	server	statistics and sizes
+pg_stat_get_replication_slot(text)		server	WAL and replication
+pg_stat_get_slru()		server	statistics and sizes
+pg_stat_get_snapshot_timestamp()		server	statistics and sizes
+pg_stat_get_stat_reset_time(oid)	19	server	statistics and sizes
+pg_stat_get_subscription(oid)		server	statistics and sizes
+pg_stat_get_subscription_stats(oid)	15-19	server	statistics and sizes
+pg_stat_get_total_analyze_time(oid)	18-19	server	statistics and sizes
+pg_stat_get_total_autoanalyze_time(oid)	18-19	server	statistics and sizes
+pg_stat_get_total_autovacuum_time(oid)	18-19	server	statistics and sizes
+pg_stat_get_total_vacuum_time(oid)	18-19	server	statistics and sizes
+pg_stat_get_tuples_deleted(oid)		server	statistics and sizes
+pg_stat_get_tuples_fetched(oid)		server	statistics and sizes
+pg_stat_get_tuples_hot_updated(oid)		server	statistics and sizes
+pg_stat_get_tuples_inserted(oid)		server	statistics and sizes
+pg_stat_get_tuples_newpage_updated(oid)	16-19	server	statistics and sizes
+pg_stat_get_tuples_returned(oid)		server	statistics and sizes
+pg_stat_get_tuples_updated(oid)		server	statistics and sizes
+pg_stat_get_vacuum_count(oid)		server	statistics and sizes
+pg_stat_get_wal()		server	statistics and sizes
+pg_stat_get_wal_receiver()		server	statistics and sizes
+pg_stat_get_wal_senders()		server	statistics and sizes
+pg_stat_get_xact_blocks_fetched(oid)		server	statistics and sizes
+pg_stat_get_xact_blocks_hit(oid)		server	statistics and sizes
+pg_stat_get_xact_function_calls(oid)		server	statistics and sizes
+pg_stat_get_xact_function_self_time(oid)		server	statistics and sizes
+pg_stat_get_xact_function_total_time(oid)		server	statistics and sizes
+pg_stat_get_xact_numscans(oid)		server	statistics and sizes
+pg_stat_get_xact_tuples_deleted(oid)		server	statistics and sizes
+pg_stat_get_xact_tuples_fetched(oid)		server	statistics and sizes
+pg_stat_get_xact_tuples_hot_updated(oid)		server	statistics and sizes
+pg_stat_get_xact_tuples_inserted(oid)		server	statistics and sizes
+pg_stat_get_xact_tuples_newpage_updated(oid)	16-19	server	statistics and sizes
+pg_stat_get_xact_tuples_returned(oid)		server	statistics and sizes
+pg_stat_get_xact_tuples_updated(oid)		server	statistics and sizes
+pg_stat_have_stats(text,oid,bigint)	18-19	server	statistics and sizes
+pg_stat_have_stats(text,oid,oid)	15-17	server	statistics and sizes
+pg_stat_reset()		server	statistics and sizes
+pg_stat_reset_backend_stats(integer)	18-19	server	statistics and sizes
+pg_stat_reset_replication_slot(text)		server	WAL and replication
+pg_stat_reset_shared(text)		server	statistics and sizes
+pg_stat_reset_single_function_counters(oid)		server	statistics and sizes
+pg_stat_reset_single_table_counters(oid)		server	statistics and sizes
+pg_stat_reset_slru(text)		server	statistics and sizes
+pg_stat_reset_subscription_stats(oid)	15-19	server	statistics and sizes
+pg_statistics_obj_is_visible(oid)		server	the server's catalog
+pg_stop_backup()	14	server	WAL and replication
+pg_stop_backup(boolean,boolean)	14	server	WAL and replication
+pg_stop_making_pinned_objects()	15-19	server	the server's catalog
+pg_switch_wal()		server	WAL and replication
+pg_sync_replication_slots()	17-19	server	WAL and replication
+pg_table_is_visible(oid)		server	the server's catalog
+pg_table_size(regclass)		server	statistics and sizes
+pg_tablespace_databases(oid)		server	other databases
+pg_tablespace_location(oid)		server	files and logs
+pg_tablespace_size(name)		server	statistics and sizes
+pg_tablespace_size(oid)		server	statistics and sizes
+pg_terminate_backend(integer,bigint)		server	sessions
+pg_timezone_abbrevs()	14-17	type	time
+pg_timezone_abbrevs_abbrevs()	18-19	type	time
+pg_timezone_abbrevs_zone()	18-19	type	time
+pg_timezone_names()		type	time
+pg_total_relation_size(regclass)		server	statistics and sizes
+pg_trigger_depth()		server	sessions
+pg_try_advisory_lock(bigint)		server	locks
+pg_try_advisory_lock(integer,integer)		server	locks
+pg_try_advisory_lock_shared(bigint)		server	locks
+pg_try_advisory_lock_shared(integer,integer)		server	locks
+pg_try_advisory_xact_lock(bigint)		server	locks
+pg_try_advisory_xact_lock(integer,integer)		server	locks
+pg_try_advisory_xact_lock_shared(bigint)		server	locks
+pg_try_advisory_xact_lock_shared(integer,integer)		server	locks
+pg_ts_config_is_visible(oid)		server	the server's catalog
+pg_ts_dict_is_visible(oid)		server	the server's catalog
+pg_ts_parser_is_visible(oid)		server	the server's catalog
+pg_ts_template_is_visible(oid)		server	the server's catalog
+pg_type_is_visible(oid)		server	the server's catalog
+pg_typeof("any")		type	the rest
+pg_visible_in_snapshot(xid8,pg_snapshot)		type	the rest
+pg_wal_lsn_diff(pg_lsn,pg_lsn)		type	numbers
+pg_wal_replay_pause()		server	WAL and replication
+pg_wal_replay_resume()		server	WAL and replication
+pg_wal_summary_contents(bigint,pg_lsn,pg_lsn)	17-19	server	WAL and replication
+pg_walfile_name(pg_lsn)		server	WAL and replication
+pg_walfile_name_offset(pg_lsn)		server	WAL and replication
+pg_xact_commit_timestamp(xid)		server	WAL and replication
+pg_xact_commit_timestamp_origin(xid)		server	WAL and replication
+pg_xact_status(xid8)		server	sessions
+phraseto_tsquery(regconfig,text)		type	text search
+phraseto_tsquery(text)		type	text search
+pi()		type	numbers
+plainto_tsquery(regconfig,text)		type	text search
+plainto_tsquery(text)		type	text search
+plpgsql_validator(oid)		server	the server's catalog
+point(box)		type	an operator's, a cast's or an index's
+point(circle)		type	an operator's, a cast's or an index's
+point(double precision,double precision)		type	geometric
+point(lseg)		type	an operator's, a cast's or an index's
+point(path)	14	type	an operator's, a cast's or an index's
+point(polygon)		type	an operator's, a cast's or an index's
+point_above(point,point)		type	an operator's, a cast's or an index's
+point_add(point,point)		type	an operator's, a cast's or an index's
+point_below(point,point)		type	an operator's, a cast's or an index's
+point_distance(point,point)		type	an operator's, a cast's or an index's
+point_div(point,point)		type	an operator's, a cast's or an index's
+point_eq(point,point)		type	an operator's, a cast's or an index's
+point_horiz(point,point)		type	an operator's, a cast's or an index's
+point_in(cstring)		type	input and output
+point_left(point,point)		type	an operator's, a cast's or an index's
+point_mul(point,point)		type	an operator's, a cast's or an index's
+point_ne(point,point)		type	an operator's, a cast's or an index's
+point_out(point)		type	input and output
+point_right(point,point)		type	an operator's, a cast's or an index's
+point_send(point)		type	input and output
+point_sub(point,point)		type	an operator's, a cast's or an index's
+point_vert(point,point)		type	an operator's, a cast's or an index's
+poly_above(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_below(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_center(polygon)		type	an operator's, a cast's or an index's
+poly_contain(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_contain_pt(polygon,point)		type	an operator's, a cast's or an index's
+poly_contained(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_distance(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_in(cstring)		type	input and output
+poly_left(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_npoints(polygon)		type	an operator's, a cast's or an index's
+poly_out(polygon)		type	input and output
+poly_overabove(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_overbelow(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_overlap(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_overleft(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_overright(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_right(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_same(polygon,polygon)		type	an operator's, a cast's or an index's
+poly_send(polygon)		type	input and output
+polygon(box)		type	an operator's, a cast's or an index's
+polygon(circle)		type	an operator's, a cast's or an index's
+polygon(integer,circle)		type	geometric
+polygon(path)		type	an operator's, a cast's or an index's
+popen(path)		type	geometric
+postgresql_fdw_validator(text[],oid)		server	the server's catalog
+pow(double precision,double precision)		type	numbers
+pow(numeric,numeric)		type	numbers
+power(double precision,double precision)		type	numbers
+power(numeric,numeric)		type	numbers
+pt_contained_circle(point,circle)		type	an operator's, a cast's or an index's
+pt_contained_poly(point,polygon)		type	an operator's, a cast's or an index's
+query_to_xml(text,boolean,boolean,text)		type	xml
+query_to_xml_and_xmlschema(text,boolean,boolean,text)		type	xml
+query_to_xmlschema(text,boolean,boolean,text)		type	xml
+querytree(tsquery)		type	text search
+quote_ident(text)		type	strings and formatting
+quote_literal(anyelement)		type	strings and formatting
+quote_literal(text)		type	strings and formatting
+quote_nullable(anyelement)		type	strings and formatting
+quote_nullable(text)		type	strings and formatting
+radians(double precision)		type	numbers
+radius(circle)		type	geometric
+random()		type	numbers
+random(bigint,bigint)	17-19	type	numbers
+random(date,date)	19	type	numbers
+random(integer,integer)	17-19	type	numbers
+random(numeric,numeric)	17-19	type	numbers
+random(timestamp with time zone,timestamp with time zone)	19	type	numbers
+random(timestamp without time zone,timestamp without time zone)	19	type	numbers
+random_normal(double precision,double precision)	16-19	type	numbers
+range_adjacent(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_adjacent_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_after(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_after_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_agg(anymultirange)	15-19	type	ranges and multiranges
+range_agg(anyrange)		type	ranges and multiranges
+range_before(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_before_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_cmp(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_contained_by(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_contained_by_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_contains(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_contains_elem(anyrange,anyelement)		type	an operator's, a cast's or an index's
+range_contains_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_eq(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_ge(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_gt(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_in(cstring,oid,integer)		type	input and output
+range_intersect(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_intersect_agg(anymultirange)		type	ranges and multiranges
+range_intersect_agg(anyrange)		type	ranges and multiranges
+range_intersect_agg_transfn(anyrange,anyrange)		type	aggregates' support
+range_le(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_lt(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_merge(anymultirange)		type	ranges and multiranges
+range_merge(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_minus(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_minus_multi(anyrange,anyrange)	19	type	ranges and multiranges
+range_ne(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_out(anyrange)		type	input and output
+range_overlaps(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_overlaps_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_overleft(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_overleft_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_overright(anyrange,anyrange)		type	an operator's, a cast's or an index's
+range_overright_multirange(anyrange,anymultirange)		type	an operator's, a cast's or an index's
+range_send(anyrange)		type	input and output
+range_union(anyrange,anyrange)		type	an operator's, a cast's or an index's
+rank("any")		type	aggregates
+rank()		type	window functions
+record_eq(record,record)		type	an operator's, a cast's or an index's
+record_ge(record,record)		type	an operator's, a cast's or an index's
+record_gt(record,record)		type	an operator's, a cast's or an index's
+record_image_eq(record,record)		type	an operator's, a cast's or an index's
+record_image_ge(record,record)		type	an operator's, a cast's or an index's
+record_image_gt(record,record)		type	an operator's, a cast's or an index's
+record_image_le(record,record)		type	an operator's, a cast's or an index's
+record_image_lt(record,record)		type	an operator's, a cast's or an index's
+record_image_ne(record,record)		type	an operator's, a cast's or an index's
+record_in(cstring,oid,integer)		type	input and output
+record_larger(record,record)	18-19	type	aggregates' support
+record_le(record,record)		type	an operator's, a cast's or an index's
+record_lt(record,record)		type	an operator's, a cast's or an index's
+record_ne(record,record)		type	an operator's, a cast's or an index's
+record_out(record)		type	input and output
+record_send(record)		type	input and output
+record_smaller(record,record)	18-19	type	aggregates' support
+regclass(text)		type	an operator's, a cast's or an index's
+regclassin(cstring)		type	input and output
+regclassout(regclass)		type	input and output
+regclasssend(regclass)		type	input and output
+regcollationin(cstring)		type	input and output
+regcollationout(regcollation)		type	input and output
+regcollationsend(regcollation)		type	input and output
+regconfigin(cstring)		type	input and output
+regconfigout(regconfig)		type	input and output
+regconfigsend(regconfig)		type	input and output
+regdatabasein(cstring)	19	type	input and output
+regdatabaseout(regdatabase)	19	type	input and output
+regdatabasesend(regdatabase)	19	type	input and output
+regdictionaryin(cstring)		type	input and output
+regdictionaryout(regdictionary)		type	input and output
+regdictionarysend(regdictionary)		type	input and output
+regexp_count(text,text)	15-19	type	regular expressions
+regexp_count(text,text,integer)	15-19	type	regular expressions
+regexp_count(text,text,integer,text)	15-19	type	regular expressions
+regexp_instr(text,text)	15-19	type	regular expressions
+regexp_instr(text,text,integer)	15-19	type	regular expressions
+regexp_instr(text,text,integer,integer)	15-19	type	regular expressions
+regexp_instr(text,text,integer,integer,integer)	15-19	type	regular expressions
+regexp_instr(text,text,integer,integer,integer,text)	15-19	type	regular expressions
+regexp_instr(text,text,integer,integer,integer,text,integer)	15-19	type	regular expressions
+regexp_like(text,text)	15-19	type	regular expressions
+regexp_like(text,text,text)	15-19	type	regular expressions
+regexp_match(text,text)		type	regular expressions
+regexp_match(text,text,text)		type	regular expressions
+regexp_matches(text,text)		type	regular expressions
+regexp_matches(text,text,text)		type	regular expressions
+regexp_replace(text,text,text)		type	regular expressions
+regexp_replace(text,text,text,integer)	15-19	type	regular expressions
+regexp_replace(text,text,text,integer,integer)	15-19	type	regular expressions
+regexp_replace(text,text,text,integer,integer,text)	15-19	type	regular expressions
+regexp_replace(text,text,text,text)		type	regular expressions
+regexp_split_to_array(text,text)		type	regular expressions
+regexp_split_to_array(text,text,text)		type	regular expressions
+regexp_split_to_table(text,text)		type	regular expressions
+regexp_split_to_table(text,text,text)		type	regular expressions
+regexp_substr(text,text)	15-19	type	regular expressions
+regexp_substr(text,text,integer)	15-19	type	regular expressions
+regexp_substr(text,text,integer,integer)	15-19	type	regular expressions
+regexp_substr(text,text,integer,integer,text)	15-19	type	regular expressions
+regexp_substr(text,text,integer,integer,text,integer)	15-19	type	regular expressions
+regnamespacein(cstring)		type	input and output
+regnamespaceout(regnamespace)		type	input and output
+regnamespacesend(regnamespace)		type	input and output
+regoperatorin(cstring)		type	input and output
+regoperatorout(regoperator)		type	input and output
+regoperatorsend(regoperator)		type	input and output
+regoperin(cstring)		type	input and output
+regoperout(regoper)		type	input and output
+regopersend(regoper)		type	input and output
+regprocedurein(cstring)		type	input and output
+regprocedureout(regprocedure)		type	input and output
+regproceduresend(regprocedure)		type	input and output
+regprocin(cstring)		type	input and output
+regprocout(regproc)		type	input and output
+regprocsend(regproc)		type	input and output
+regr_avgx(double precision,double precision)		type	aggregates
+regr_avgy(double precision,double precision)		type	aggregates
+regr_count(double precision,double precision)		type	aggregates
+regr_intercept(double precision,double precision)		type	aggregates
+regr_r2(double precision,double precision)		type	aggregates
+regr_slope(double precision,double precision)		type	aggregates
+regr_sxx(double precision,double precision)		type	aggregates
+regr_sxy(double precision,double precision)		type	aggregates
+regr_syy(double precision,double precision)		type	aggregates
+regrolein(cstring)		type	input and output
+regroleout(regrole)		type	input and output
+regrolesend(regrole)		type	input and output
+regtypein(cstring)		type	input and output
+regtypeout(regtype)		type	input and output
+regtypesend(regtype)		type	input and output
+repeat(text,integer)		type	strings and formatting
+replace(text,text,text)		type	strings and formatting
+reverse(bytea)	18-19	type	strings and formatting
+reverse(text)		type	strings and formatting
+round(double precision)		type	numbers
+round(numeric)		type	numbers
+round(numeric,integer)		type	numbers
+row_number()		type	window functions
+row_security_active(oid)		server	roles and privileges
+row_security_active(text)		server	roles and privileges
+row_to_json(record)		type	JSON
+row_to_json(record,boolean)		type	JSON
+rpad(text,integer)		type	strings and formatting
+rpad(text,integer,text)		type	strings and formatting
+rtrim(bytea,bytea)		type	strings and formatting
+rtrim(text)		type	strings and formatting
+rtrim(text,text)		type	strings and formatting
+satisfies_hash_partition(oid,integer,integer,"any")		server	the server's catalog
+scale(numeric)		type	numbers
+schema_to_xml(name,boolean,boolean,text)		type	xml
+schema_to_xml_and_xmlschema(name,boolean,boolean,text)		type	xml
+schema_to_xmlschema(name,boolean,boolean,text)		type	xml
+set_bit(bit,integer,integer)		type	bit strings
+set_bit(bytea,bigint,integer)		type	strings and formatting
+set_byte(bytea,integer,integer)		type	strings and formatting
+set_config(text,text,boolean)		type	settings
+set_masklen(cidr,integer)		type	network
+set_masklen(inet,integer)		type	network
+setseed(double precision)		type	numbers
+setval(regclass,bigint)		type	sequences
+setval(regclass,bigint,boolean)		type	sequences
+setweight(tsvector,"char")		type	text search
+setweight(tsvector,"char",text[])		type	text search
+sha224(bytea)		type	strings and formatting
+sha256(bytea)		type	strings and formatting
+sha384(bytea)		type	strings and formatting
+sha512(bytea)		type	strings and formatting
+shell_in(cstring)		type	input and output
+shell_out(void)		type	input and output
+shobj_description(oid,name)		server	the server's catalog
+sign(double precision)		type	numbers
+sign(numeric)		type	numbers
+similar_escape(text,text)		type	regular expressions
+similar_to_escape(text)		type	regular expressions
+similar_to_escape(text,text)		type	regular expressions
+sin(double precision)		type	numbers
+sind(double precision)		type	numbers
+sinh(double precision)		type	numbers
+slope(point,point)		type	geometric
+spg_poly_quad_compress(polygon)		type	an operator's, a cast's or an index's
+split_part(text,text,integer)		type	strings and formatting
+sqrt(double precision)		type	numbers
+sqrt(numeric)		type	numbers
+starts_with(text,text)		type	an operator's, a cast's or an index's
+statement_timestamp()		type	time
+stddev(bigint)		type	aggregates
+stddev(double precision)		type	aggregates
+stddev(integer)		type	aggregates
+stddev(numeric)		type	aggregates
+stddev(real)		type	aggregates
+stddev(smallint)		type	aggregates
+stddev_pop(bigint)		type	aggregates
+stddev_pop(double precision)		type	aggregates
+stddev_pop(integer)		type	aggregates
+stddev_pop(numeric)		type	aggregates
+stddev_pop(real)		type	aggregates
+stddev_pop(smallint)		type	aggregates
+stddev_samp(bigint)		type	aggregates
+stddev_samp(double precision)		type	aggregates
+stddev_samp(integer)		type	aggregates
+stddev_samp(numeric)		type	aggregates
+stddev_samp(real)		type	aggregates
+stddev_samp(smallint)		type	aggregates
+string_agg(bytea,bytea)		type	strings and formatting
+string_agg(text,text)		type	strings and formatting
+string_to_array(text,text)		type	arrays
+string_to_array(text,text,text)		type	arrays
+string_to_table(text,text)		type	strings and formatting
+string_to_table(text,text,text)		type	strings and formatting
+strip(tsvector)		type	text search
+strpos(text,text)		type	strings and formatting
+substr(bytea,integer)		type	strings and formatting
+substr(bytea,integer,integer)		type	strings and formatting
+substr(text,integer)		type	strings and formatting
+substr(text,integer,integer)		type	strings and formatting
+sum(bigint)		type	aggregates the types carry
+sum(double precision)		type	aggregates the types carry
+sum(integer)		type	aggregates the types carry
+sum(interval)		type	aggregates the types carry
+sum(money)		type	aggregates the types carry
+sum(numeric)		type	aggregates the types carry
+sum(real)		type	aggregates the types carry
+sum(smallint)		type	aggregates the types carry
+table_am_handler_out(table_am_handler)		type	input and output
+table_to_xml(regclass,boolean,boolean,text)		type	xml
+table_to_xml_and_xmlschema(regclass,boolean,boolean,text)		type	xml
+table_to_xmlschema(regclass,boolean,boolean,text)		type	xml
+tan(double precision)		type	numbers
+tand(double precision)		type	numbers
+tanh(double precision)		type	numbers
+text("char")		type	an operator's, a cast's or an index's
+text(boolean)		type	an operator's, a cast's or an index's
+text(character)		type	an operator's, a cast's or an index's
+text(inet)		type	an operator's, a cast's or an index's
+text(name)		type	an operator's, a cast's or an index's
+text(xml)		type	xml
+text_ge(text,text)		type	an operator's, a cast's or an index's
+text_gt(text,text)		type	an operator's, a cast's or an index's
+text_larger(text,text)		type	aggregates' support
+text_le(text,text)		type	an operator's, a cast's or an index's
+text_lt(text,text)		type	an operator's, a cast's or an index's
+text_pattern_ge(text,text)		type	an operator's, a cast's or an index's
+text_pattern_gt(text,text)		type	an operator's, a cast's or an index's
+text_pattern_le(text,text)		type	an operator's, a cast's or an index's
+text_pattern_lt(text,text)		type	an operator's, a cast's or an index's
+text_smaller(text,text)		type	aggregates' support
+textanycat(text,anynonarray)		type	an operator's, a cast's or an index's
+textcat(text,text)		type	an operator's, a cast's or an index's
+texteq(text,text)		type	an operator's, a cast's or an index's
+texteqname(text,name)		type	an operator's, a cast's or an index's
+textgename(text,name)		type	an operator's, a cast's or an index's
+textgtname(text,name)		type	an operator's, a cast's or an index's
+texticlike(text,text)		type	an operator's, a cast's or an index's
+texticnlike(text,text)		type	an operator's, a cast's or an index's
+texticregexeq(text,text)		type	an operator's, a cast's or an index's
+texticregexne(text,text)		type	an operator's, a cast's or an index's
+textin(cstring)		type	input and output
+textlen(text)		type	strings and formatting
+textlename(text,name)		type	an operator's, a cast's or an index's
+textlike(text,text)		type	an operator's, a cast's or an index's
+textltname(text,name)		type	an operator's, a cast's or an index's
+textne(text,text)		type	an operator's, a cast's or an index's
+textnename(text,name)		type	an operator's, a cast's or an index's
+textnlike(text,text)		type	an operator's, a cast's or an index's
+textout(text)		type	input and output
+textregexeq(text,text)		type	an operator's, a cast's or an index's
+textregexne(text,text)		type	an operator's, a cast's or an index's
+textsend(text)		type	input and output
+tid_block(tid)	19	type	the rest
+tid_offset(tid)	19	type	the rest
+tideq(tid,tid)		type	an operator's, a cast's or an index's
+tidge(tid,tid)		type	an operator's, a cast's or an index's
+tidgt(tid,tid)		type	an operator's, a cast's or an index's
+tidin(cstring)		type	input and output
+tidlarger(tid,tid)		type	aggregates' support
+tidle(tid,tid)		type	an operator's, a cast's or an index's
+tidlt(tid,tid)		type	an operator's, a cast's or an index's
+tidne(tid,tid)		type	an operator's, a cast's or an index's
+tidout(tid)		type	input and output
+tidsend(tid)		type	input and output
+tidsmaller(tid,tid)		type	aggregates' support
+time_cmp(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_eq(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_ge(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_gt(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_hash(time without time zone)		type	an operator's, a cast's or an index's
+time_hash_extended(time without time zone,bigint)		type	an operator's, a cast's or an index's
+time_in(cstring,oid,integer)		type	input and output
+time_larger(time without time zone,time without time zone)		type	aggregates' support
+time_le(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_lt(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_mi_interval(time without time zone,interval)		type	an operator's, a cast's or an index's
+time_mi_time(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_ne(time without time zone,time without time zone)		type	an operator's, a cast's or an index's
+time_out(time without time zone)		type	input and output
+time_pl_interval(time without time zone,interval)		type	an operator's, a cast's or an index's
+time_send(time without time zone)		type	input and output
+time_smaller(time without time zone,time without time zone)		type	aggregates' support
+timedate_pl(time without time zone,date)		type	an operator's, a cast's or an index's
+timeofday()		type	time
+timestamp_cmp(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_cmp_date(timestamp without time zone,date)		type	an operator's, a cast's or an index's
+timestamp_cmp_timestamptz(timestamp without time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamp_eq(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_eq_date(timestamp without time zone,date)		type	an operator's, a cast's or an index's
+timestamp_eq_timestamptz(timestamp without time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamp_ge(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_ge_date(timestamp without time zone,date)		type	an operator's, a cast's or an index's
+timestamp_ge_timestamptz(timestamp without time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamp_gt(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_gt_date(timestamp without time zone,date)		type	an operator's, a cast's or an index's
+timestamp_gt_timestamptz(timestamp without time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamp_hash(timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_hash_extended(timestamp without time zone,bigint)		type	an operator's, a cast's or an index's
+timestamp_in(cstring,oid,integer)		type	input and output
+timestamp_larger(timestamp without time zone,timestamp without time zone)		type	aggregates' support
+timestamp_le(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_le_date(timestamp without time zone,date)		type	an operator's, a cast's or an index's
+timestamp_le_timestamptz(timestamp without time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamp_lt(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_lt_date(timestamp without time zone,date)		type	an operator's, a cast's or an index's
+timestamp_lt_timestamptz(timestamp without time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamp_mi(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_mi_interval(timestamp without time zone,interval)		type	an operator's, a cast's or an index's
+timestamp_ne(timestamp without time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamp_ne_date(timestamp without time zone,date)		type	an operator's, a cast's or an index's
+timestamp_ne_timestamptz(timestamp without time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamp_out(timestamp without time zone)		type	input and output
+timestamp_pl_interval(timestamp without time zone,interval)		type	an operator's, a cast's or an index's
+timestamp_send(timestamp without time zone)		type	input and output
+timestamp_smaller(timestamp without time zone,timestamp without time zone)		type	aggregates' support
+timestamptypmodin(cstring[])		type	input and output
+timestamptypmodout(integer)		type	input and output
+timestamptz(date)		type	an operator's, a cast's or an index's
+timestamptz(date,time with time zone)		type	time
+timestamptz(date,time without time zone)		type	time
+timestamptz(timestamp with time zone,integer)		type	an operator's, a cast's or an index's
+timestamptz(timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_cmp(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_cmp_date(timestamp with time zone,date)		type	an operator's, a cast's or an index's
+timestamptz_cmp_timestamp(timestamp with time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_eq(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_eq_date(timestamp with time zone,date)		type	an operator's, a cast's or an index's
+timestamptz_eq_timestamp(timestamp with time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_ge(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_ge_date(timestamp with time zone,date)		type	an operator's, a cast's or an index's
+timestamptz_ge_timestamp(timestamp with time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_gt(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_gt_date(timestamp with time zone,date)		type	an operator's, a cast's or an index's
+timestamptz_gt_timestamp(timestamp with time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_hash(timestamp with time zone)	18-19	type	an operator's, a cast's or an index's
+timestamptz_hash_extended(timestamp with time zone,bigint)	18-19	type	an operator's, a cast's or an index's
+timestamptz_in(cstring,oid,integer)		type	input and output
+timestamptz_larger(timestamp with time zone,timestamp with time zone)		type	aggregates' support
+timestamptz_le(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_le_date(timestamp with time zone,date)		type	an operator's, a cast's or an index's
+timestamptz_le_timestamp(timestamp with time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_lt(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_lt_date(timestamp with time zone,date)		type	an operator's, a cast's or an index's
+timestamptz_lt_timestamp(timestamp with time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_mi(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_mi_interval(timestamp with time zone,interval)		type	an operator's, a cast's or an index's
+timestamptz_ne(timestamp with time zone,timestamp with time zone)		type	an operator's, a cast's or an index's
+timestamptz_ne_date(timestamp with time zone,date)		type	an operator's, a cast's or an index's
+timestamptz_ne_timestamp(timestamp with time zone,timestamp without time zone)		type	an operator's, a cast's or an index's
+timestamptz_out(timestamp with time zone)		type	input and output
+timestamptz_pl_interval(timestamp with time zone,interval)		type	an operator's, a cast's or an index's
+timestamptz_send(timestamp with time zone)		type	input and output
+timestamptz_smaller(timestamp with time zone,timestamp with time zone)		type	aggregates' support
+timestamptztypmodin(cstring[])		type	input and output
+timestamptztypmodout(integer)		type	input and output
+timetypmodin(cstring[])		type	input and output
+timetypmodout(integer)		type	input and output
+timetz(time with time zone,integer)		type	an operator's, a cast's or an index's
+timetz(time without time zone)		type	an operator's, a cast's or an index's
+timetz(timestamp with time zone)		type	an operator's, a cast's or an index's
+timetz_cmp(time with time zone,time with time zone)		type	an operator's, a cast's or an index's
+timetz_eq(time with time zone,time with time zone)		type	an operator's, a cast's or an index's
+timetz_ge(time with time zone,time with time zone)		type	an operator's, a cast's or an index's
+timetz_gt(time with time zone,time with time zone)		type	an operator's, a cast's or an index's
+timetz_hash(time with time zone)		type	an operator's, a cast's or an index's
+timetz_hash_extended(time with time zone,bigint)		type	an operator's, a cast's or an index's
+timetz_in(cstring,oid,integer)		type	input and output
+timetz_larger(time with time zone,time with time zone)		type	aggregates' support
+timetz_le(time with time zone,time with time zone)		type	an operator's, a cast's or an index's
+timetz_lt(time with time zone,time with time zone)		type	an operator's, a cast's or an index's
+timetz_mi_interval(time with time zone,interval)		type	an operator's, a cast's or an index's
+timetz_ne(time with time zone,time with time zone)		type	an operator's, a cast's or an index's
+timetz_out(time with time zone)		type	input and output
+timetz_pl_interval(time with time zone,interval)		type	an operator's, a cast's or an index's
+timetz_send(time with time zone)		type	input and output
+timetz_smaller(time with time zone,time with time zone)		type	aggregates' support
+timetzdate_pl(time with time zone,date)		type	an operator's, a cast's or an index's
+timetztypmodin(cstring[])		type	input and output
+timetztypmodout(integer)		type	input and output
+timezone(interval,time with time zone)		type	time
+timezone(interval,timestamp with time zone)		type	time
+timezone(interval,timestamp without time zone)		type	time
+timezone(text,time with time zone)		type	time
+timezone(text,timestamp with time zone)		type	time
+timezone(text,timestamp without time zone)		type	time
+timezone(time with time zone)	17-19	type	time
+timezone(timestamp with time zone)	17-19	type	time
+timezone(timestamp without time zone)	17-19	type	time
+to_ascii(text)		type	strings and formatting
+to_ascii(text,integer)		type	strings and formatting
+to_ascii(text,name)		type	strings and formatting
+to_bin(bigint)	17-19	type	numbers
+to_bin(integer)	17-19	type	numbers
+to_char(bigint,text)		type	strings and formatting
+to_char(double precision,text)		type	strings and formatting
+to_char(integer,text)		type	strings and formatting
+to_char(interval,text)		type	strings and formatting
+to_char(numeric,text)		type	strings and formatting
+to_char(real,text)		type	strings and formatting
+to_char(timestamp with time zone,text)		type	strings and formatting
+to_char(timestamp without time zone,text)		type	strings and formatting
+to_date(text,text)		type	strings and formatting
+to_hex(bigint)		type	numbers
+to_hex(integer)		type	numbers
+to_json(anyelement)		type	JSON
+to_jsonb(anyelement)		type	JSON
+to_number(text,text)		type	strings and formatting
+to_oct(bigint)	17-19	type	numbers
+to_oct(integer)	17-19	type	numbers
+to_regclass(text)		type	strings and formatting
+to_regcollation(text)		type	strings and formatting
+to_regdatabase(text)	19	type	strings and formatting
+to_regnamespace(text)		type	strings and formatting
+to_regoper(text)		type	strings and formatting
+to_regoperator(text)		type	strings and formatting
+to_regproc(text)		type	strings and formatting
+to_regprocedure(text)		type	strings and formatting
+to_regrole(text)		type	strings and formatting
+to_regtype(text)		type	strings and formatting
+to_regtypemod(text)	17-19	type	strings and formatting
+to_timestamp(double precision)		type	time
+to_timestamp(text,text)		type	strings and formatting
+to_tsquery(regconfig,text)		type	text search
+to_tsquery(text)		type	text search
+to_tsvector(json)		type	JSON
+to_tsvector(jsonb)		type	JSON
+to_tsvector(regconfig,json)		type	JSON
+to_tsvector(regconfig,jsonb)		type	JSON
+to_tsvector(regconfig,text)		type	text search
+to_tsvector(text)		type	text search
+transaction_timestamp()		type	time
+translate(text,text,text)		type	strings and formatting
+trigger_out(trigger)		type	input and output
+trim_array(anyarray,integer)		type	arrays
+trim_scale(numeric)		type	numbers
+trunc(double precision)		type	numbers
+trunc(macaddr)		type	network
+trunc(macaddr8)		type	network
+trunc(numeric)		type	numbers
+trunc(numeric,integer)		type	numbers
+ts_debug(regconfig,text)		type	text search
+ts_debug(text)		type	text search
+ts_delete(tsvector,text)		type	text search
+ts_delete(tsvector,text[])		type	text search
+ts_filter(tsvector,"char"[])		type	text search
+ts_headline(json,tsquery)		type	JSON
+ts_headline(json,tsquery,text)		type	JSON
+ts_headline(jsonb,tsquery)		type	JSON
+ts_headline(jsonb,tsquery,text)		type	JSON
+ts_headline(regconfig,json,tsquery)		type	JSON
+ts_headline(regconfig,json,tsquery,text)		type	JSON
+ts_headline(regconfig,jsonb,tsquery)		type	JSON
+ts_headline(regconfig,jsonb,tsquery,text)		type	JSON
+ts_headline(regconfig,text,tsquery)		type	text search
+ts_headline(regconfig,text,tsquery,text)		type	text search
+ts_headline(text,tsquery)		type	text search
+ts_headline(text,tsquery,text)		type	text search
+ts_lexize(regdictionary,text)		type	text search
+ts_match_qv(tsquery,tsvector)		type	an operator's, a cast's or an index's
+ts_match_tq(text,tsquery)		type	an operator's, a cast's or an index's
+ts_match_tt(text,text)		type	an operator's, a cast's or an index's
+ts_match_vq(tsvector,tsquery)		type	an operator's, a cast's or an index's
+ts_parse(oid,text)		type	text search
+ts_parse(text,text)		type	text search
+ts_rank(real[],tsvector,tsquery)		type	text search
+ts_rank(real[],tsvector,tsquery,integer)		type	text search
+ts_rank(tsvector,tsquery)		type	text search
+ts_rank(tsvector,tsquery,integer)		type	text search
+ts_rank_cd(real[],tsvector,tsquery)		type	text search
+ts_rank_cd(real[],tsvector,tsquery,integer)		type	text search
+ts_rank_cd(tsvector,tsquery)		type	text search
+ts_rank_cd(tsvector,tsquery,integer)		type	text search
+ts_rewrite(tsquery,text)		type	text search
+ts_rewrite(tsquery,tsquery,tsquery)		type	text search
+ts_stat(text)		type	text search
+ts_stat(text,text)		type	text search
+ts_token_type(oid)		type	text search
+ts_token_type(text)		type	text search
+tsm_handler_out(tsm_handler)		type	input and output
+tsmultirange()		type	ranges and multiranges
+tsmultirange(tsrange)		type	an operator's, a cast's or an index's
+tsmultirange(tsrange[])		type	ranges and multiranges
+tsq_mcontained(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsq_mcontains(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_and(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_cmp(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_eq(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_ge(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_gt(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_le(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_lt(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_ne(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_not(tsquery)		type	an operator's, a cast's or an index's
+tsquery_or(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_phrase(tsquery,tsquery)		type	an operator's, a cast's or an index's
+tsquery_phrase(tsquery,tsquery,integer)		type	text search
+tsqueryin(cstring)		type	input and output
+tsqueryout(tsquery)		type	input and output
+tsquerysend(tsquery)		type	input and output
+tsrange(timestamp without time zone,timestamp without time zone)		type	ranges and multiranges
+tsrange(timestamp without time zone,timestamp without time zone,text)		type	ranges and multiranges
+tsrange_subdiff(timestamp without time zone,timestamp without time zone)		type	ranges and multiranges
+tstzmultirange()		type	ranges and multiranges
+tstzmultirange(tstzrange)		type	an operator's, a cast's or an index's
+tstzmultirange(tstzrange[])		type	ranges and multiranges
+tstzrange(timestamp with time zone,timestamp with time zone)		type	ranges and multiranges
+tstzrange(timestamp with time zone,timestamp with time zone,text)		type	ranges and multiranges
+tstzrange_subdiff(timestamp with time zone,timestamp with time zone)		type	ranges and multiranges
+tsvector_cmp(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_concat(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_eq(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_ge(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_gt(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_le(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_lt(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_ne(tsvector,tsvector)		type	an operator's, a cast's or an index's
+tsvector_to_array(tsvector)		type	text search
+tsvectorin(cstring)		type	input and output
+tsvectorout(tsvector)		type	input and output
+tsvectorsend(tsvector)		type	input and output
+txid_current()		server	sessions
+txid_current_if_assigned()		server	sessions
+txid_current_snapshot()		server	sessions
+txid_snapshot_in(cstring)		type	input and output
+txid_snapshot_out(txid_snapshot)		type	input and output
+txid_snapshot_send(txid_snapshot)		type	input and output
+txid_snapshot_xip(txid_snapshot)		type	the rest
+txid_snapshot_xmax(txid_snapshot)		type	the rest
+txid_snapshot_xmin(txid_snapshot)		type	the rest
+txid_status(bigint)		server	sessions
+txid_visible_in_snapshot(bigint,txid_snapshot)		type	the rest
+unicode_assigned(text)	17-19	type	strings and formatting
+unicode_version()	17-19	type	strings and formatting
+unistr(text)		type	strings and formatting
+unknownin(cstring)		type	input and output
+unknownout(unknown)		type	input and output
+unknownsend(unknown)		type	input and output
+unnest(anyarray)		type	arrays
+unnest(anymultirange)		type	ranges and multiranges
+unnest(tsvector)		type	text search
+upper(anymultirange)		type	ranges and multiranges
+upper(anyrange)		type	ranges and multiranges
+upper(text)		type	strings and formatting
+upper_inc(anymultirange)		type	ranges and multiranges
+upper_inc(anyrange)		type	ranges and multiranges
+upper_inf(anymultirange)		type	ranges and multiranges
+upper_inf(anyrange)		type	ranges and multiranges
+uuid(bytea)	19	type	an operator's, a cast's or an index's
+uuid_cmp(uuid,uuid)		type	an operator's, a cast's or an index's
+uuid_eq(uuid,uuid)		type	an operator's, a cast's or an index's
+uuid_extract_timestamp(uuid)	17-19	type	uuid
+uuid_extract_version(uuid)	17-19	type	uuid
+uuid_ge(uuid,uuid)		type	an operator's, a cast's or an index's
+uuid_gt(uuid,uuid)		type	an operator's, a cast's or an index's
+uuid_hash(uuid)		type	an operator's, a cast's or an index's
+uuid_hash_extended(uuid,bigint)		type	an operator's, a cast's or an index's
+uuid_in(cstring)		type	input and output
+uuid_le(uuid,uuid)		type	an operator's, a cast's or an index's
+uuid_lt(uuid,uuid)		type	an operator's, a cast's or an index's
+uuid_ne(uuid,uuid)		type	an operator's, a cast's or an index's
+uuid_out(uuid)		type	input and output
+uuid_send(uuid)		type	input and output
+uuidv4()	18-19	type	uuid
+uuidv7()	18-19	type	uuid
+uuidv7(interval)	18-19	type	uuid
+var_pop(bigint)		type	aggregates
+var_pop(double precision)		type	aggregates
+var_pop(integer)		type	aggregates
+var_pop(numeric)		type	aggregates
+var_pop(real)		type	aggregates
+var_pop(smallint)		type	aggregates
+var_samp(bigint)		type	aggregates
+var_samp(double precision)		type	aggregates
+var_samp(integer)		type	aggregates
+var_samp(numeric)		type	aggregates
+var_samp(real)		type	aggregates
+var_samp(smallint)		type	aggregates
+varbit(bit varying,integer,boolean)		type	an operator's, a cast's or an index's
+varbit_in(cstring,oid,integer)		type	input and output
+varbit_out(bit varying)		type	input and output
+varbit_send(bit varying)		type	input and output
+varbitcmp(bit varying,bit varying)		type	an operator's, a cast's or an index's
+varbiteq(bit varying,bit varying)		type	an operator's, a cast's or an index's
+varbitge(bit varying,bit varying)		type	an operator's, a cast's or an index's
+varbitgt(bit varying,bit varying)		type	an operator's, a cast's or an index's
+varbitle(bit varying,bit varying)		type	an operator's, a cast's or an index's
+varbitlt(bit varying,bit varying)		type	an operator's, a cast's or an index's
+varbitne(bit varying,bit varying)		type	an operator's, a cast's or an index's
+varbittypmodin(cstring[])		type	input and output
+varbittypmodout(integer)		type	input and output
+varcharin(cstring,oid,integer)		type	input and output
+varcharout(character varying)		type	input and output
+varcharsend(character varying)		type	input and output
+varchartypmodin(cstring[])		type	input and output
+varchartypmodout(integer)		type	input and output
+variance(bigint)		type	aggregates
+variance(double precision)		type	aggregates
+variance(integer)		type	aggregates
+variance(numeric)		type	aggregates
+variance(real)		type	aggregates
+variance(smallint)		type	aggregates
+version()		server	the server itself
+void_in(cstring)		type	input and output
+void_out(void)		type	input and output
+void_send(void)		type	input and output
+websearch_to_tsquery(regconfig,text)		type	text search
+websearch_to_tsquery(text)		type	text search
+width(box)		type	geometric
+width_bucket(anycompatible,anycompatiblearray)		type	arrays
+width_bucket(double precision,double precision,double precision,integer)		type	numbers
+width_bucket(numeric,numeric,numeric,integer)		type	numbers
+xid(xid8)		type	an operator's, a cast's or an index's
+xid8_larger(xid8,xid8)	15-19	type	aggregates' support
+xid8_smaller(xid8,xid8)	15-19	type	aggregates' support
+xid8cmp(xid8,xid8)		type	an operator's, a cast's or an index's
+xid8eq(xid8,xid8)		type	an operator's, a cast's or an index's
+xid8ge(xid8,xid8)		type	an operator's, a cast's or an index's
+xid8gt(xid8,xid8)		type	an operator's, a cast's or an index's
+xid8in(cstring)		type	input and output
+xid8le(xid8,xid8)		type	an operator's, a cast's or an index's
+xid8lt(xid8,xid8)		type	an operator's, a cast's or an index's
+xid8ne(xid8,xid8)		type	an operator's, a cast's or an index's
+xid8out(xid8)		type	input and output
+xid8send(xid8)		type	input and output
+xideq(xid,xid)		type	an operator's, a cast's or an index's
+xideqint4(xid,integer)		type	an operator's, a cast's or an index's
+xidin(cstring)		type	input and output
+xidneq(xid,xid)		type	an operator's, a cast's or an index's
+xidneqint4(xid,integer)		type	an operator's, a cast's or an index's
+xidout(xid)		type	input and output
+xidsend(xid)		type	input and output
+xml(text)		type	an operator's, a cast's or an index's
+xml_in(cstring)		type	input and output
+xml_is_well_formed(text)		type	xml
+xml_is_well_formed_content(text)		type	xml
+xml_is_well_formed_document(text)		type	xml
+xml_out(xml)		type	input and output
+xml_send(xml)		type	input and output
+xmlagg(xml)		type	xml
+xmlcomment(text)		type	xml
+xmlconcat2(xml,xml)		type	xml
+xmltext(text)	17-19	type	xml
+xmlvalidate(xml,text)		type	xml
+xpath(text,xml)		type	xml
+xpath(text,xml,text[])		type	xml
+xpath_exists(text,xml)		type	xml
+xpath_exists(text,xml,text[])		type	xml

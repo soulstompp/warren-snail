@@ -5,7 +5,9 @@
 //! keys the tables read before it hold (`join`).
 
 mod across;
+mod aggregates;
 mod answer;
+mod calls;
 mod change;
 mod clock;
 pub(crate) mod fill;
@@ -16,6 +18,7 @@ mod out;
 mod pipeline;
 mod question;
 pub mod statement;
+mod typed;
 mod walk;
 
 pub use across::{Snails, StopAcross};
@@ -965,6 +968,13 @@ impl Snail {
                 }
                 return self.ask_pipeline(q, params);
             }
+            // What the question path does not read, a pipeline reads.
+            if pipeline::hands_over(q) && question::parse(&self.catalog, sql).is_err() {
+                if order.is_some() {
+                    return Err(Error::new("a pipeline reads its table along its own order"));
+                }
+                return self.ask_pipeline(q, params);
+            }
         }
         if !params.is_empty() {
             return Err(Error::new("parameters are read only in a pipeline"));
@@ -1023,10 +1033,12 @@ impl Snail {
             .iter()
             .map(|&c| table.columns[c].name.clone())
             .collect();
+        let types = stored.iter().map(|&c| Some(table.columns[c].ty)).collect();
         let mut stream = pipeline::Stream::new(
             q,
             &table.name,
             names,
+            types,
             along,
             params,
             table.release,

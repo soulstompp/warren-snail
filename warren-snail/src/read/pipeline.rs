@@ -54,7 +54,7 @@ pub enum Value {
 }
 
 impl Value {
-    fn is_null(&self) -> bool {
+    pub(super) fn is_null(&self) -> bool {
         match self {
             Value::Null => true,
             // A composed column's NULL, which keeps its type.
@@ -154,6 +154,16 @@ pub fn numeric_text(m: i128, s: u32) -> String {
     let padded = format!("{:0>width$}", digits, width = s + 1);
     let (whole, frac) = padded.split_at(padded.len() - s);
     format!("{sign}{whole}.{frac}")
+}
+
+/// Two values compared as PostgreSQL compares values of one kind, two strings under `under`; none
+/// where either is NULL.
+pub(super) fn compare_values(
+    a: &Value,
+    b: &Value,
+    under: Option<Casing>,
+) -> Result<Option<Ordering>> {
+    compare_under(under, a, b)
 }
 
 /// Two values compared as PostgreSQL compares values of one kind; none where either is NULL.
@@ -391,6 +401,10 @@ struct Frame<'a> {
     release: u8,
     /// How the columns map case, by their names.
     casings: &'a Casings,
+    /// Each expression's type, where the step resolves it.
+    types: &'a super::typed::Types,
+    /// The statement's clock, in microseconds since 1970 UTC.
+    now: i64,
 }
 
 /// How the columns a statement reads and makes map case, by their names, where not as the
@@ -535,6 +549,22 @@ fn names_collate(e: &Expr) -> bool {
 }
 
 impl Frame<'_> {
+    /// The type the step resolved an expression to, where it resolved one.
+    fn type_of(&self, e: &Expr) -> Option<ColumnType> {
+        self.types.get(&(e as *const Expr)).copied()
+    }
+
+    /// An integer an operator or a function returns, held to the range of the type the step
+    /// resolved it to.
+    fn held(&self, e: &Expr, v: Value) -> Result<Value> {
+        match (v, self.type_of(e)) {
+            (Value::Int(x), Some(t @ (ColumnType::Int2 | ColumnType::Int4))) => {
+                super::calls::held_to(Some(t), i128::from(x))
+            }
+            (v, _) => Ok(v),
+        }
+    }
+
     fn find(&self, qualifier: Option<&str>, name: &str) -> Result<usize> {
         let found: Vec<usize> = self
             .columns
@@ -558,7 +588,7 @@ fn ident(i: &sqlparser::ast::Ident) -> String {
 }
 
 /// The column an expression names, where it names one.
-fn column_of(e: &Expr) -> Option<(Option<String>, String)> {
+pub(super) fn column_of(e: &Expr) -> Option<(Option<String>, String)> {
     match e {
         Expr::Identifier(i) => Some((None, ident(i))),
         Expr::CompoundIdentifier(p) if p.len() == 2 => Some((Some(ident(&p[0])), ident(&p[1]))),
@@ -574,9 +604,49 @@ struct Calls<'q> {
     windows: Vec<&'q Expr>,
 }
 
-const AGGREGATES: [&str; 7] = ["count", "sum", "min", "max", "avg", "bool_and", "bool_or"];
+const AGGREGATES: [&str; 34] = [
+    "string_agg",
+    "count",
+    "sum",
+    "min",
+    "max",
+    "avg",
+    "bool_and",
+    "bool_or",
+    "every",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "covar_pop",
+    "covar_samp",
+    "corr",
+    "regr_count",
+    "regr_sxx",
+    "regr_syy",
+    "regr_sxy",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_r2",
+    "regr_slope",
+    "regr_intercept",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "any_value",
+    "mode",
+    "percentile_cont",
+    "percentile_disc",
+];
 
-fn function_name(f: &sqlparser::ast::Function) -> String {
+/// Whether a name is an aggregate a step folds.
+pub(super) fn is_aggregate(name: &str) -> bool {
+    AGGREGATES.contains(&name)
+}
+
+pub(super) fn function_name(f: &sqlparser::ast::Function) -> String {
     match f.name.0.last() {
         Some(ObjectNamePart::Identifier(i)) => ident(i),
         _ => f.name.to_string().to_lowercase(),
@@ -590,7 +660,7 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
                 out.windows.push(e);
                 return;
             }
-            if AGGREGATES.contains(&function_name(f).as_str()) {
+            if AGGREGATES.contains(&function_name(f).as_str()) || !f.within_group.is_empty() {
                 out.aggregates.push(e);
                 return;
             }
@@ -1734,6 +1804,11 @@ fn string_op(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>>
 
 /// A LIKE or an ILIKE, as PostgreSQL reads one: text, a name, a bpchar's own text with its blanks,
 /// or bytea, matched by a pattern of its kind, an ILIKE's both in lower case under `casing`.
+/// `like` and `notlike` by name: LIKE with its backslash escape, under the collation `under`.
+pub(super) fn like_values(v: &Value, p: &Value, under: Option<Casing>) -> Result<bool> {
+    like_of(v, p, Some('\\'), None, under)
+}
+
 fn like_of(
     v: &Value,
     p: &Value,
@@ -2274,7 +2349,9 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
         }
         Expr::Value(v) => match &v.value {
             SqlValue::Number(s, _) => numeric_literal(s)?,
-            SqlValue::SingleQuotedString(s) => Value::Text(s.clone()),
+            SqlValue::SingleQuotedString(s) | SqlValue::EscapedStringLiteral(s) => {
+                Value::Text(s.clone())
+            }
             // A bit-string constant is a bit of its own length.
             SqlValue::SingleQuotedByteStringLiteral(_) | SqlValue::HexStringLiteral(_) => {
                 let s = super::question::bit_literal(e).unwrap();
@@ -2304,15 +2381,53 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             data_type,
             ..
         } => cast(ev(expr)?, data_type, frame.release, quoted(expr))?,
+        // An interval written as `interval '…'` with no fields named, read by its input.
+        Expr::Interval(i)
+            if i.leading_field.is_none()
+                && i.last_field.is_none()
+                && i.leading_precision.is_none()
+                && i.fractional_seconds_precision.is_none() =>
+        {
+            match ev(&i.value)? {
+                Value::Null => Value::Null,
+                Value::Text(s) => Value::Interval(crate::times::interval_in(
+                    &s,
+                    crate::times::INTERVAL_FULL_RANGE,
+                    None,
+                )?),
+                _ => return Err(Error::new(format!("{e} is not read"))),
+            }
+        }
+        // A constant written after its type is read as that type's input reads it.
+        Expr::TypedString(t) => match t.value.value.clone().into_string() {
+            Some(s) => cast(Value::Text(s), &t.data_type, frame.release, true)?,
+            None => return Err(Error::new(format!("{e} is not read"))),
+        },
+        // A number written with its minus is one constant, as PostgreSQL's grammar folds it.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Value(v) if matches!(v.value, SqlValue::Number(..))) => {
+            let Expr::Value(v) = expr.as_ref() else {
+                unreachable!()
+            };
+            let SqlValue::Number(s, _) = &v.value else {
+                unreachable!()
+            };
+            numeric_literal(&format!("-{s}"))?
+        }
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
         } => match ev(expr)? {
             Value::Null => Value::Null,
-            Value::Int(x) => Value::Int(
-                x.checked_neg()
-                    .ok_or_else(|| Error::new("bigint out of range"))?,
-            ),
+            Value::Int(x) => frame.held(
+                e,
+                Value::Int(
+                    x.checked_neg()
+                        .ok_or_else(|| Error::new("bigint out of range"))?,
+                ),
+            )?,
             Value::Num(m, s) => Value::Num(-m, s),
             Value::Numeric(n) => Value::Numeric(n.neg()),
             Value::Real(f) => Value::Real(-f),
@@ -2563,6 +2678,31 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             }
             v
         }
+        // True where some value of the list equals it, else NULL where it or a value is NULL.
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = ev(expr)?;
+            if v.is_null() {
+                return Ok(Value::Null);
+            }
+            let mut unknown = false;
+            for x in list {
+                let (a, b) = beside(v.clone(), ev(x)?, expr, x)?;
+                match compare(&a, &b)? {
+                    Some(Ordering::Equal) => return Ok(Value::Bool(!*negated)),
+                    None => unknown = true,
+                    Some(_) => {}
+                }
+            }
+            if unknown {
+                Value::Null
+            } else {
+                Value::Bool(*negated)
+            }
+        }
         Expr::IsNull(x) => Value::Bool(null_test(&ev(x)?, false)),
         Expr::IsNotNull(x) => Value::Bool(null_test(&ev(x)?, true)),
         // A truth tested is never NULL: an unknown truth is neither true nor false.
@@ -2594,6 +2734,15 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                         (Some(true), None) | (None, Some(true)) if !and => Value::Bool(true),
                         _ => Value::Null,
                     });
+                }
+                BinaryOperator::Overlaps => {
+                    let (Expr::Tuple(a), Expr::Tuple(b)) = (left.as_ref(), right.as_ref()) else {
+                        return Err(Error::new(format!("{e}: OVERLAPS reads two pairs")));
+                    };
+                    let ([s1, e1], [s2, e2]) = (a.as_slice(), b.as_slice()) else {
+                        return Err(Error::new(format!("{e}: OVERLAPS reads two pairs")));
+                    };
+                    return super::calls::overlaps([ev(s1)?, ev(e1)?, ev(s2)?, ev(e2)?], frame.now);
                 }
                 _ => {}
             }
@@ -2675,7 +2824,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 | BinaryOperator::Minus
                 | BinaryOperator::Multiply
                 | BinaryOperator::Divide
-                | BinaryOperator::Modulo => arith(op, &x, &y)?,
+                | BinaryOperator::Modulo => frame.held(e, arith(op, &x, &y)?)?,
                 BinaryOperator::Eq
                 | BinaryOperator::NotEq
                 | BinaryOperator::Lt
@@ -2717,11 +2866,95 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             timestamp,
             time_zone,
         } => super::clock::at_zone(ev(timestamp)?, ev(time_zone)?)?,
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let from = match substring_from {
+                Some(x) => ev(x)?,
+                None => Value::Int(1),
+            };
+            if matches!(from, Value::Text(_) | Value::Str(..)) {
+                return Err(Error::new(format!(
+                    "{e}: a substring by a regular expression is not read yet"
+                )));
+            }
+            let mut args = vec![ev(expr)?, from];
+            if let Some(x) = substring_for {
+                args.push(ev(x)?);
+            }
+            super::calls::strings("substr", &args, Casing::Libc)?
+                .ok_or_else(|| Error::new(format!("{e} is not read")))?
+        }
+        Expr::Position { expr, r#in } => super::calls::position(ev(r#in)?, ev(expr)?)?,
+        Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            let name = match trim_where {
+                Some(sqlparser::ast::TrimWhereField::Leading) => "ltrim",
+                Some(sqlparser::ast::TrimWhereField::Trailing) => "rtrim",
+                _ => "btrim",
+            };
+            let mut args = vec![ev(expr)?];
+            match (trim_what, trim_characters.as_deref()) {
+                (Some(w), _) => args.push(ev(w)?),
+                (None, Some([c])) => args.push(ev(c)?),
+                (None, None) => {}
+                _ => return Err(Error::new(format!("{e} is not read"))),
+            }
+            super::calls::strings(name, &args, Casing::Libc)?
+                .ok_or_else(|| Error::new(format!("{e} is not read")))?
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => super::calls::overlay(
+            ev(expr)?,
+            ev(overlay_what)?,
+            ev(overlay_from)?,
+            overlay_for.as_deref().map(&ev).transpose()?,
+        )?,
+        Expr::Extract { field, expr, .. } => {
+            let unit = super::calls::field_unit(field);
+            super::calls::extract(&unit, &ev(expr)?)?
+                .ok_or_else(|| Error::new(format!("{e} is not read")))?
+        }
+        Expr::Ceil {
+            expr,
+            field:
+                sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime),
+        }
+        | Expr::Floor {
+            expr,
+            field:
+                sqlparser::ast::CeilFloorKind::DateTimeField(sqlparser::ast::DateTimeField::NoDateTime),
+        } => {
+            let name = if matches!(e, Expr::Ceil { .. }) {
+                "ceil"
+            } else {
+                "floor"
+            };
+            super::calls::numbers(name, &[ev(expr)?], &[frame.type_of(expr)], frame.type_of(e))?
+                .ok_or_else(|| Error::new(format!("{e} is not read")))?
+        }
         Expr::Function(f) => {
             let name = function_name(f);
+            if name == "make_interval" {
+                let values = super::calls::named_interval(f, |x| ev(x))?;
+                return Ok(
+                    super::calls::time(&name, &values, frame.type_of(e), frame.now)?
+                        .unwrap_or(Value::Null),
+                );
+            }
             let a = args(f)?;
             match (name.as_str(), a.as_slice()) {
-                ("mod", [x, y]) => arith(&BinaryOperator::Modulo, &ev(x)?, &ev(y)?)?,
                 // Under the collation its argument carries, the database's default where none.
                 ("upper" | "lower", [x]) => {
                     let casing = frame.casings.implicit(x)?.unwrap_or(Casing::Libc);
@@ -2741,19 +2974,33 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     }
                 }
                 ("timezone", [zone, x]) => super::clock::at_zone(ev(x)?, ev(zone)?)?,
-                ("abs", [x]) => match ev(x)? {
-                    Value::Null => Value::Null,
-                    Value::Int(v) => Value::Int(
-                        v.checked_abs()
-                            .ok_or_else(|| Error::new("bigint out of range"))?,
-                    ),
-                    Value::Num(m, s) => Value::Num(m.abs(), s),
-                    Value::Numeric(n) => Value::Numeric(n.abs()),
-                    Value::Real(f) => Value::Real(f.abs()),
-                    Value::Double(d) => Value::Double(d.abs()),
-                    other => return Err(Error::new(format!("abs of {other:?}"))),
-                },
-                _ => return Err(Error::new(format!("{e} is not read"))),
+                _ => {
+                    let values = a.iter().map(|x| ev(x)).collect::<Result<Vec<_>>>()?;
+                    let types: Vec<Option<ColumnType>> =
+                        a.iter().map(|x| frame.type_of(x)).collect();
+                    if let Some(v) =
+                        super::calls::numbers(&name, &values, &types, frame.type_of(e))?
+                    {
+                        return Ok(v);
+                    }
+                    if let Some(v) =
+                        super::calls::time(&name, &values, frame.type_of(e), frame.now)?
+                    {
+                        return Ok(v);
+                    }
+                    let casing = match a.first() {
+                        Some(x) => frame.casings.implicit(x)?.unwrap_or(Casing::Libc),
+                        None => Casing::Libc,
+                    };
+                    if let Some(v) = super::calls::strings(&name, &values, casing)? {
+                        return Ok(v);
+                    }
+                    if let Some(v) = super::calls::formatting(&name, &values, &types)? {
+                        return Ok(v);
+                    }
+                    crate::functions::refuse_server(&name, frame.release)?;
+                    return Err(Error::new(format!("{e} is not read")));
+                }
             }
         }
         other => return Err(Error::new(format!("{other} is not read"))),
@@ -2775,6 +3022,40 @@ fn relation<'a>(
     Err(Error::new(format!(
         "{name} is neither a step of the WITH nor the table"
     )))
+}
+
+/// The columns a FROM reads, each under its alias, with their types where known: each relation's
+/// by its name in `typed`.
+fn typed_from(
+    items: &[TableWithJoins],
+    typed: &HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)>,
+    table: &str,
+) -> Vec<super::typed::TypedColumn> {
+    let mut out = Vec::new();
+    for item in items {
+        for t in std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation)) {
+            let TableFactor::Table { name, alias, .. } = t else {
+                continue;
+            };
+            let n = crate::catalog::object_name(name);
+            let of = typed.get(&n).or_else(|| {
+                (table == n || table.rsplit('.').next() == Some(n.as_str()))
+                    .then(|| typed.get(table))
+                    .flatten()
+            });
+            let Some((names, types)) = of else {
+                continue;
+            };
+            let q = alias
+                .as_ref()
+                .map(|a| ident(&a.name))
+                .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+            for (c, t) in names.iter().zip(types) {
+                out.push((Some(q.clone()), c.clone(), *t));
+            }
+        }
+    }
+    out
 }
 
 /// Columns by their qualifier and name.
@@ -2899,11 +3180,17 @@ fn windows(
             _q: std::marker::PhantomData,
         };
         let running = state.entry(call as *const Expr).or_default();
+        let parted_under = spec
+            .partition_by
+            .iter()
+            .map(|p| frame.casings.ordering(p))
+            .collect::<Result<Vec<_>>>()?;
         for (r, row) in rel.rows.iter().enumerate() {
             let part: Vec<Key> = spec
                 .partition_by
                 .iter()
-                .map(|p| eval(p, row, frame, &none).map(|v| key(&v)))
+                .zip(&parted_under)
+                .map(|(p, &u)| eval(p, row, frame, &none).map(|v| key_under(&v, u)))
                 .collect::<Result<_>>()?;
             let state = running.entry(part).or_insert(Value::Null);
             let value = match (name.as_str(), a.as_slice()) {
@@ -2916,6 +3203,10 @@ fn windows(
                     if !v.is_null() {
                         *state = if state.is_null() {
                             v
+                        } else if let Some(s) = float_arith(&BinaryOperator::Plus, state, &v)? {
+                            s
+                        } else if let Some(s) = scalar_arith(&BinaryOperator::Plus, state, &v)? {
+                            s
                         } else {
                             arith(&BinaryOperator::Plus, state, &v)?
                         };
@@ -2938,6 +3229,292 @@ fn windows(
     Ok(out)
 }
 
+/// Whether a window call folds as the rows come: lag of one argument, sum, count(*) and row_number,
+/// along the order, over the rows from the partition's first to the current.
+fn streams(call: &Expr) -> bool {
+    let Expr::Function(f) = call else {
+        return false;
+    };
+    let Some(WindowType::WindowSpec(spec)) = &f.over else {
+        return false;
+    };
+    let to_current = spec.window_frame.as_ref().is_none_or(|fr| {
+        matches!(fr.start_bound, WindowFrameBound::Preceding(None))
+            && matches!(fr.end_bound, None | Some(WindowFrameBound::CurrentRow))
+    });
+    let name = function_name(f);
+    !spec.order_by.is_empty()
+        && to_current
+        && f.filter.is_none()
+        && f.null_treatment.is_none()
+        && (is_count_star(f)
+            || matches!(
+                (name.as_str(), args(f).map(|a| a.len())),
+                ("lag", Ok(1)) | ("sum", Ok(1)) | ("row_number", Ok(0))
+            ))
+}
+
+/// Each window call's value on each row of a relation read whole, the rows in the table's order:
+/// each partition's rows known before any of its values, so a window reads its rows ahead too.
+fn windows_whole(
+    calls: &[&Expr],
+    rel: &Relation,
+    frame: &Frame,
+) -> Result<Vec<HashMap<*const Expr, Value>>> {
+    let mut out: Vec<HashMap<*const Expr, Value>> = vec![HashMap::new(); rel.rows.len()];
+    let none = computed_none();
+    let at = |e: &Expr, r: usize| eval(e, &rel.rows[r], frame, &none);
+    for &call in calls {
+        let Expr::Function(f) = call else {
+            unreachable!()
+        };
+        let spec = match &f.over {
+            Some(WindowType::WindowSpec(s)) => s,
+            _ => return Err(Error::new(format!("{call}: a named window is not read"))),
+        };
+        if matches!(
+            f.null_treatment,
+            Some(sqlparser::ast::NullTreatment::IgnoreNulls)
+        ) {
+            return Err(Error::new(format!("{call}: IGNORE NULLS is not read")));
+        }
+        // Its rows in the table's order, or in no order: then every row of a partition its peer.
+        let ordered = match spec.order_by.as_slice() {
+            [] => false,
+            [o] if !matches!(o.options.sort, Some(OrderBySort::Desc))
+                && o.options.nulls_first != Some(true)
+                && rel.order.is_some_and(|order| {
+                    column_of(&o.expr)
+                        .is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(order))
+                }) =>
+            {
+                true
+            }
+            _ => {
+                return Err(Error::new(format!(
+                    "{call}: a window is read only along the table's order, ascending, its \
+                     NULLs last"
+                )))
+            }
+        };
+        // Its frame: from the partition's first row to the current, or to its last.
+        let whole = match &spec.window_frame {
+            None => !ordered,
+            Some(fr) => {
+                if !matches!(fr.start_bound, WindowFrameBound::Preceding(None)) {
+                    return Err(Error::new(format!(
+                        "{call}: only a frame from the partition's first row is read"
+                    )));
+                }
+                match fr.end_bound {
+                    None | Some(WindowFrameBound::CurrentRow) => {
+                        !ordered && matches!(fr.units, WindowFrameUnits::Range)
+                    }
+                    Some(WindowFrameBound::Following(None)) => true,
+                    _ => {
+                        return Err(Error::new(format!(
+                            "{call}: only a frame to the current row or the partition's last is \
+                             read"
+                        )))
+                    }
+                }
+            }
+        };
+        let name = function_name(f);
+        let a = if is_count_star(f) {
+            Vec::new()
+        } else {
+            args(f)?
+        };
+        // The partitions, each its rows in order.
+        let mut parts: Vec<Vec<usize>> = Vec::new();
+        let mut index: HashMap<Vec<Key>, usize> = HashMap::new();
+        let parted_under = spec
+            .partition_by
+            .iter()
+            .map(|p| frame.casings.ordering(p))
+            .collect::<Result<Vec<_>>>()?;
+        for r in 0..rel.rows.len() {
+            let k: Vec<Key> = spec
+                .partition_by
+                .iter()
+                .zip(&parted_under)
+                .map(|(p, &u)| at(p, r).map(|v| key_under(&v, u)))
+                .collect::<Result<_>>()?;
+            let i = *index.entry(k).or_insert_with(|| {
+                parts.push(Vec::new());
+                parts.len() - 1
+            });
+            parts[i].push(r);
+        }
+        let aggregate = AGGREGATES.contains(&name.as_str()) || is_count_star(f);
+        if aggregate {
+            if let FunctionArguments::List(l) = &f.args {
+                if l.duplicate_treatment.is_some() {
+                    return Err(Error::new(
+                        "DISTINCT is not implemented for window functions",
+                    ));
+                }
+            }
+        }
+        for ix in &parts {
+            let n = ix.len();
+            // An aggregate over the frame: folded a row at a time, or once over the partition.
+            let mut acc = if aggregate {
+                let (acc, folds) = Acc::of(call)?;
+                let under = folds
+                    .args
+                    .iter()
+                    .map(|x| frame.casings.ordering(x))
+                    .collect::<Result<Vec<_>>>()?;
+                Some((acc, folds, under))
+            } else {
+                None
+            };
+            let mut folded = 0;
+            let mut ntile: Option<(i64, i64, i64, i64)> = None;
+            for (i, &r) in ix.iter().enumerate() {
+                let to = if whole { n - 1 } else { i };
+                let value = match (name.as_str(), a.as_slice()) {
+                    _ if aggregate => {
+                        let (acc, folds, under) = acc.as_mut().unwrap();
+                        while folded <= to {
+                            let row = ix[folded];
+                            folded += 1;
+                            if let Some(w) = folds.filter {
+                                if truth(&at(w, row)?)? != Some(true) {
+                                    continue;
+                                }
+                            }
+                            acc.add_row(
+                                folds
+                                    .args
+                                    .iter()
+                                    .map(|x| at(x, row))
+                                    .collect::<Result<_>>()?,
+                                under,
+                            )?;
+                        }
+                        acc.value()?
+                    }
+                    ("row_number", []) => Value::Int(i as i64 + 1),
+                    ("rank" | "dense_rank", []) => {
+                        Value::Int(if ordered { i as i64 + 1 } else { 1 })
+                    }
+                    ("percent_rank", []) => Value::Double(if ordered && n > 1 {
+                        i as f64 / (n - 1) as f64
+                    } else {
+                        0.0
+                    }),
+                    ("cume_dist", []) => Value::Double(if ordered {
+                        (i + 1) as f64 / n as f64
+                    } else {
+                        1.0
+                    }),
+                    ("ntile", [k]) => {
+                        if ntile.is_none() {
+                            match at(k, r)? {
+                                Value::Null => {
+                                    out[r].insert(call as *const Expr, Value::Null);
+                                    continue;
+                                }
+                                Value::Int(b) if b <= 0 => {
+                                    return Err(Error::new(
+                                        "argument of ntile must be greater than zero",
+                                    ))
+                                }
+                                Value::Int(b) => {
+                                    let total = n as i64;
+                                    let mut boundary = total / b;
+                                    let mut remainder = 0;
+                                    if boundary <= 0 {
+                                        boundary = 1;
+                                    } else {
+                                        remainder = total % b;
+                                        if remainder != 0 {
+                                            boundary += 1;
+                                        }
+                                    }
+                                    ntile = Some((1, 0, boundary, remainder));
+                                }
+                                other => {
+                                    return Err(Error::new(format!(
+                                        "function ntile({}) does not exist",
+                                        kind_name(&other)
+                                    )))
+                                }
+                            }
+                        }
+                        let (tile, per, boundary, remainder) = ntile.as_mut().unwrap();
+                        *per += 1;
+                        if *boundary < *per {
+                            if *remainder != 0 && *tile == *remainder {
+                                *remainder = 0;
+                                *boundary -= 1;
+                            }
+                            *tile += 1;
+                            *per = 1;
+                        }
+                        Value::Int(*tile)
+                    }
+                    ("lag" | "lead", [x, rest @ ..]) if rest.len() <= 2 => {
+                        let offset = match rest.first() {
+                            None => 1,
+                            Some(k) => match at(k, r)? {
+                                Value::Null => {
+                                    out[r].insert(call as *const Expr, Value::Null);
+                                    continue;
+                                }
+                                Value::Int(k) => k,
+                                other => {
+                                    return Err(Error::new(format!(
+                                        "function {name}(…, {}) does not exist",
+                                        kind_name(&other)
+                                    )))
+                                }
+                            },
+                        };
+                        let target = if name == "lag" {
+                            i as i64 - offset
+                        } else {
+                            i as i64 + offset
+                        };
+                        if (0..n as i64).contains(&target) {
+                            at(x, ix[target as usize])?
+                        } else {
+                            match rest.get(1) {
+                                Some(d) => at(d, r)?,
+                                None => Value::Null,
+                            }
+                        }
+                    }
+                    ("first_value", [x]) => at(x, ix[0])?,
+                    ("last_value", [x]) => at(x, ix[to])?,
+                    ("nth_value", [x, k]) => match at(k, r)? {
+                        Value::Null => Value::Null,
+                        Value::Int(k) if k <= 0 => {
+                            return Err(Error::new(
+                                "argument of nth_value must be greater than zero",
+                            ))
+                        }
+                        Value::Int(k) if (k - 1) as usize <= to => at(x, ix[(k - 1) as usize])?,
+                        Value::Int(_) => Value::Null,
+                        other => {
+                            return Err(Error::new(format!(
+                                "function nth_value(…, {}) does not exist",
+                                kind_name(&other)
+                            )))
+                        }
+                    },
+                    _ => return Err(Error::new(format!("the window {call} is not read"))),
+                };
+                out[r].insert(call as *const Expr, value);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The output name PostgreSQL gives an item it is not told.
 fn default_name(e: &Expr) -> String {
     match e {
@@ -2952,6 +3529,7 @@ fn default_name(e: &Expr) -> String {
 }
 
 /// One aggregate, folded a row at a time.
+#[derive(Clone, Debug)]
 enum Acc {
     Count(i64),
     Sum(Value),
@@ -2967,33 +3545,203 @@ enum Acc {
     /// sum, or avg where `avg`, of an interval, as PostgreSQL's interval_avg_accum folds it; of a
     /// time through its cast to an interval.
     Intervals(crate::times::IntervalAccum, bool),
+    /// An aggregate past those the types carry.
+    More(Box<super::aggregates::Agg>),
+    /// An aggregate of each value once: the values seen, each a row of its arguments, folded in
+    /// their order at the end, as PostgreSQL sorts a DISTINCT aggregate's input, each argument
+    /// compared under its collation.
+    Distinct {
+        seen: std::collections::HashSet<Vec<Key>>,
+        values: Vec<Vec<Value>>,
+        under: Vec<Option<Casing>>,
+        of: Box<Acc>,
+    },
+    /// An aggregate whose rows come in the order its ORDER BY gives: each row's arguments, then
+    /// the values it is ordered by, folded in that order at the end; the arguments' collations.
+    Ordered {
+        by: Vec<super::aggregates::Direction>,
+        args: usize,
+        rows: Vec<Vec<Value>>,
+        under: Vec<Option<Casing>>,
+        of: Box<Acc>,
+    },
+}
+
+/// What an aggregate call folds from each row: the expressions it folds, the FILTER that admits a
+/// row, and an ordered-set aggregate's direct arguments.
+struct Folds<'q> {
+    args: Vec<&'q Expr>,
+    filter: Option<&'q Expr>,
+    direct: Vec<&'q Expr>,
 }
 
 impl Acc {
-    /// The aggregate a call folds, and the expression it folds: none for count(*).
-    fn of(call: &Expr) -> Result<(Acc, Option<&Expr>)> {
+    /// The aggregate a call folds, and what it folds from each row: no expression for count(*).
+    fn of(call: &Expr) -> Result<(Acc, Folds<'_>)> {
         let Expr::Function(f) = call else {
             unreachable!()
         };
         let name = function_name(f);
+        let filter = f.filter.as_deref();
         if name == "count" && is_count_star(f) {
-            return Ok((Acc::Count(0), None));
+            let folds = Folds {
+                args: Vec::new(),
+                filter,
+                direct: Vec::new(),
+            };
+            return Ok((Acc::Count(0), folds));
+        }
+        let mut by: Vec<&sqlparser::ast::OrderByExpr> = Vec::new();
+        let distinct = match &f.args {
+            FunctionArguments::List(l) => {
+                for c in &l.clauses {
+                    match c {
+                        sqlparser::ast::FunctionArgumentClause::OrderBy(o) => by.extend(o),
+                        _ => {
+                            return Err(Error::new(format!(
+                                "{call}: a clause among an aggregate's arguments is not read"
+                            )))
+                        }
+                    }
+                }
+                matches!(
+                    l.duplicate_treatment,
+                    Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                )
+            }
+            _ => false,
+        };
+        if distinct && !by.is_empty() {
+            return Err(Error::new(format!(
+                "{call}: an ORDER BY beside DISTINCT among an aggregate's arguments is not read"
+            )));
         }
         let a = args(f)?;
-        let [x] = a.as_slice() else {
-            return Err(Error::new(format!("{call} is not read")));
-        };
-        let acc = match name.as_str() {
-            "count" => Acc::Count(0),
-            "sum" => Acc::Sum(Value::Null),
-            "min" => Acc::Least(None),
-            "max" => Acc::Greatest(None),
-            "bool_and" => Acc::All(None),
-            "bool_or" => Acc::Any(None),
-            "avg" => Acc::Avg(0.0, 0.0, 0.0),
+        if !f.within_group.is_empty() {
+            let by = f
+                .within_group
+                .iter()
+                .map(|o| {
+                    let desc = matches!(o.options.sort, Some(OrderBySort::Desc));
+                    super::aggregates::Direction {
+                        desc,
+                        nulls_first: o.options.nulls_first.unwrap_or(desc),
+                        under: None,
+                    }
+                })
+                .collect();
+            let agg = super::aggregates::Agg::sorted(&name, by)
+                .ok_or_else(|| Error::new(format!("{call} is not read")))?;
+            let folds = Folds {
+                args: f.within_group.iter().map(|o| &o.expr).collect(),
+                filter,
+                direct: a,
+            };
+            return Ok((Acc::More(Box::new(agg)), folds));
+        }
+        let acc = match (name.as_str(), a.as_slice()) {
+            ("count", [_]) => Acc::Count(0),
+            ("sum", [_]) => Acc::Sum(Value::Null),
+            ("min", [_]) => Acc::Least(None),
+            ("max", [_]) => Acc::Greatest(None),
+            ("bool_and" | "every", [_]) => Acc::All(None),
+            ("bool_or", [_]) => Acc::Any(None),
+            ("avg", [_]) => Acc::Avg(0.0, 0.0, 0.0),
+            (n, [_] | [_, _]) => match super::aggregates::Agg::of(n) {
+                Some(agg) => Acc::More(Box::new(agg)),
+                None => return Err(Error::new(format!("{call} is not read"))),
+            },
             _ => return Err(Error::new(format!("{call} is not read"))),
         };
-        Ok((acc, Some(*x)))
+        let acc = if distinct {
+            Acc::Distinct {
+                seen: Default::default(),
+                values: Vec::new(),
+                under: Vec::new(),
+                of: Box::new(acc),
+            }
+        } else if !by.is_empty() {
+            Acc::Ordered {
+                by: by
+                    .iter()
+                    .map(|o| {
+                        let desc = matches!(o.options.sort, Some(OrderBySort::Desc));
+                        super::aggregates::Direction {
+                            desc,
+                            nulls_first: o.options.nulls_first.unwrap_or(desc),
+                            under: None,
+                        }
+                    })
+                    .collect(),
+                args: a.len(),
+                rows: Vec::new(),
+                under: Vec::new(),
+                of: Box::new(acc),
+            }
+        } else {
+            acc
+        };
+        let mut args = a;
+        args.extend(by.iter().map(|o| &o.expr));
+        let folds = Folds {
+            args,
+            filter,
+            direct: Vec::new(),
+        };
+        Ok((acc, folds))
+    }
+
+    /// Folds in one row's arguments, none for count(*), each compared under the collation `under`
+    /// gives it.
+    fn add_row(&mut self, values: Vec<Value>, under: &[Option<Casing>]) -> Result<()> {
+        match self {
+            Acc::More(agg) => agg.add(&values, under),
+            Acc::Ordered {
+                by,
+                args,
+                rows,
+                under: kept,
+                ..
+            } => {
+                let (of_args, of_by) = under.split_at((*args).min(under.len()));
+                kept.clear();
+                kept.extend_from_slice(of_args);
+                for (d, u) in by.iter_mut().zip(of_by) {
+                    d.under = *u;
+                }
+                rows.push(values);
+                Ok(())
+            }
+            Acc::Distinct {
+                seen,
+                values: kept,
+                under: kept_under,
+                ..
+            } => {
+                if values.iter().any(Value::is_null) {
+                    return Ok(());
+                }
+                kept_under.clear();
+                kept_under.extend_from_slice(under);
+                let k = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| key_under(v, under.get(i).copied().flatten()))
+                    .collect();
+                if seen.insert(k) {
+                    kept.push(values);
+                }
+                Ok(())
+            }
+            _ => self.add(values.into_iter().next(), under.first().copied().flatten()),
+        }
+    }
+
+    /// An ordered-set aggregate's direct arguments, the first time they are given.
+    fn direct(&mut self, values: Vec<Value>) {
+        if let Acc::More(agg) = self {
+            agg.direct(values);
+        }
     }
 
     /// Folds in one row: its value, or none for count(*). A NULL is passed over. min and max compare
@@ -3232,6 +3980,8 @@ impl Acc {
                 let t = truth(&v)?.unwrap_or(false);
                 *a = Some(a.map_or(t, |x| x || t));
             }
+            Acc::More(agg) => agg.add(&[v], &[under])?,
+            Acc::Distinct { .. } | Acc::Ordered { .. } => self.add_row(vec![v], &[under])?,
             // Reached only by a value no interval is: the first was one.
             Acc::Intervals(..) => {
                 return Err(Error::new(format!(
@@ -3285,6 +4035,60 @@ impl Acc {
             Acc::Intervals(s, avg) => {
                 (if *avg { s.avg()? } else { s.sum()? }).map_or(Value::Null, Value::Interval)
             }
+            Acc::More(agg) => agg.value()?,
+            Acc::Ordered {
+                by,
+                args,
+                rows,
+                under,
+                of,
+            } => {
+                let mut rows = rows.clone();
+                let mut failed = None;
+                rows.sort_by(|a, b| {
+                    super::aggregates::compare_rows(&a[*args..], &b[*args..], by).unwrap_or_else(
+                        |e| {
+                            failed.get_or_insert(e);
+                            Ordering::Equal
+                        },
+                    )
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                let mut acc = (**of).clone();
+                for mut r in rows {
+                    r.truncate(*args);
+                    acc.add_row(r, under)?;
+                }
+                acc.value()?
+            }
+            Acc::Distinct {
+                values, under, of, ..
+            } => {
+                let mut values = values.clone();
+                let mut failed = None;
+                values.sort_by(|a, b| {
+                    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                        match compare_under(under.get(i).copied().flatten(), x, y) {
+                            Ok(Some(Ordering::Equal)) | Ok(None) => {}
+                            Ok(Some(o)) => return o,
+                            Err(e) => {
+                                failed.get_or_insert(e);
+                            }
+                        }
+                    }
+                    Ordering::Equal
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+                let mut acc = (**of).clone();
+                for v in values {
+                    acc.add_row(v, under)?;
+                }
+                acc.value()?
+            }
         })
     }
 }
@@ -3302,17 +4106,34 @@ struct Prepared<'q> {
     calls: Calls<'q>,
     grouping: &'q [Expr],
     grouped: bool,
+    /// Whether it returns each row once (SELECT DISTINCT).
+    distinct: bool,
+    /// Whether a window reads its partition whole: the step then holds its rows until they have
+    /// all come.
+    whole_windows: bool,
+    /// Each expression's type, where the step resolves it, and the type of each column it returns.
+    types: super::typed::Types,
+    returns: Vec<Option<ColumnType>>,
+    /// The clock its statement reads.
+    now: i64,
 }
 
-fn prepare(q: &Query) -> Result<Prepared<'_>> {
+/// A step read before any row: its parts, each expression typed over the columns its FROM reads.
+fn prepare<'q>(
+    q: &'q Query,
+    columns: &[super::typed::TypedColumn],
+    release: u8,
+    now: i64,
+) -> Result<Prepared<'q>> {
     let s = match q.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::new("a step is a SELECT")),
     };
-    if s.distinct.is_some() || s.having.is_some() || q.limit_clause.is_some() {
-        return Err(Error::new(
-            "DISTINCT, HAVING and LIMIT are not read in a step",
-        ));
+    if matches!(s.distinct, Some(sqlparser::ast::Distinct::On(_))) {
+        return Err(Error::new("DISTINCT ON is not read in a step"));
+    }
+    if s.having.is_some() || q.limit_clause.is_some() {
+        return Err(Error::new("HAVING and LIMIT are not read in a step"));
     }
     let items: Vec<(&Expr, String)> = s
         .projection
@@ -3332,8 +4153,24 @@ fn prepare(q: &Query) -> Result<Prepared<'_>> {
         _ => return Err(Error::new("GROUP BY ALL is not read")),
     };
     let grouped = !grouping.is_empty() || !calls.aggregates.is_empty();
+    let calls_windows_whole = calls.windows.iter().any(|w| !streams(w));
     if grouped && !calls.windows.is_empty() {
         return Err(Error::new("a window over groups is not read"));
+    }
+    let mut typing = super::typed::Typing {
+        columns,
+        release,
+        types: super::typed::Types::new(),
+    };
+    let returns = items
+        .iter()
+        .map(|(e, _)| typing.type_of(e))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(w) = s.selection.as_ref() {
+        typing.type_of(w)?;
+    }
+    for g in grouping {
+        typing.type_of(g)?;
     }
     Ok(Prepared {
         from: &s.from,
@@ -3343,6 +4180,11 @@ fn prepare(q: &Query) -> Result<Prepared<'_>> {
         calls,
         grouping,
         grouped,
+        whole_windows: calls_windows_whole,
+        distinct: s.distinct.is_some(),
+        types: typing.types,
+        returns,
+        now,
     })
 }
 
@@ -3355,11 +4197,14 @@ pub(crate) fn eval_on(
     release: u8,
     casings: &Casings,
 ) -> Result<Value> {
+    let types = super::typed::Types::new();
     let frame = Frame {
         columns: names.iter().map(|n| (None, n.clone())).collect(),
         params: &[],
         release,
         casings,
+        types: &types,
+        now: super::change::wall_micros(),
     };
     eval(e, row, &frame, &computed_none())
 }
@@ -3382,6 +4227,11 @@ struct StepRun<'q> {
     groups: Vec<(Vec<Value>, Vec<Acc>)>,
     /// The rows held for an ORDER BY.
     rows: Vec<Vec<Value>>,
+    /// The rows its FROM gives, held for a window that reads its partition whole, and the column
+    /// holding the table's order among them.
+    held: Relation,
+    /// The rows a DISTINCT step has returned, by their keys.
+    seen: std::collections::HashSet<Vec<Key>>,
     /// The columns the step's FROM reads, as the last chunk gave them.
     columns: Columns,
 }
@@ -3394,8 +4244,20 @@ impl<'q> StepRun<'q> {
             at: HashMap::new(),
             groups: Vec::new(),
             rows: Vec::new(),
+            held: Relation::default(),
+            seen: Default::default(),
             columns: Vec::new(),
         }
+    }
+
+    /// A DISTINCT step's rows, each the first time it comes; any other step's as they are.
+    fn once(&mut self, rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+        if !self.p.distinct {
+            return rows;
+        }
+        rows.into_iter()
+            .filter(|r| self.seen.insert(r.iter().map(key).collect()))
+            .collect()
     }
 
     fn names(&self) -> Vec<String> {
@@ -3426,6 +4288,8 @@ impl<'q> StepRun<'q> {
             params,
             release,
             casings,
+            types: &self.p.types,
+            now: self.p.now,
         };
         let none = computed_none();
         if let Some(w) = self.p.selection {
@@ -3438,12 +4302,12 @@ impl<'q> StepRun<'q> {
             rel.rows = kept;
         }
         if self.p.grouped {
-            let folded: Vec<Option<&Expr>> = self
+            let folded: Vec<Folds> = self
                 .p
                 .calls
                 .aggregates
                 .iter()
-                .map(|&c| Acc::of(c).map(|(_, x)| x))
+                .map(|&c| Acc::of(c).map(|(_, f)| f))
                 .collect::<Result<_>>()?;
             let grouped_under = self
                 .p
@@ -3453,7 +4317,12 @@ impl<'q> StepRun<'q> {
                 .collect::<Result<Vec<_>>>()?;
             let folded_under = folded
                 .iter()
-                .map(|x| x.map(|x| frame.casings.ordering(x)).transpose())
+                .map(|f| {
+                    f.args
+                        .iter()
+                        .map(|x| frame.casings.ordering(x))
+                        .collect::<Result<Vec<_>>>()
+                })
                 .collect::<Result<Vec<_>>>()?;
             for row in rel.rows {
                 let k: Vec<Key> = self
@@ -3477,11 +4346,35 @@ impl<'q> StepRun<'q> {
                         self.groups.len() - 1
                     }
                 };
-                for ((acc, x), u) in self.groups[i].1.iter_mut().zip(&folded).zip(&folded_under) {
-                    let v = x.map(|x| eval(x, &row, &frame, &none)).transpose()?;
-                    acc.add(v, u.flatten())?;
+                for ((acc, f), u) in self.groups[i].1.iter_mut().zip(&folded).zip(&folded_under) {
+                    if let Some(w) = f.filter {
+                        if truth(&eval(w, &row, &frame, &none)?)? != Some(true) {
+                            continue;
+                        }
+                    }
+                    if !f.direct.is_empty() {
+                        acc.direct(
+                            f.direct
+                                .iter()
+                                .map(|x| eval(x, &row, &frame, &none))
+                                .collect::<Result<_>>()?,
+                        );
+                    }
+                    acc.add_row(
+                        f.args
+                            .iter()
+                            .map(|x| eval(x, &row, &frame, &none))
+                            .collect::<Result<_>>()?,
+                        u,
+                    )?;
                 }
             }
+            self.columns = frame.columns;
+            return Ok(None);
+        }
+        if self.p.whole_windows {
+            self.held.order = self.held.order.or(rel.order);
+            self.held.rows.extend(rel.rows);
             self.columns = frame.columns;
             return Ok(None);
         }
@@ -3503,6 +4396,11 @@ impl<'q> StepRun<'q> {
                     .map(|(e, _)| eval(e, row, &frame, &computed))
                     .collect::<Result<_>>()?,
             );
+        }
+        if self.p.distinct {
+            let seen = &mut self.seen;
+            out.rows
+                .retain(|r| seen.insert(r.iter().map(key).collect()));
         }
         // The order holds where an item is the column that held it.
         out.order = rel.order.and_then(|o| {
@@ -3536,6 +4434,8 @@ impl<'q> StepRun<'q> {
                 params,
                 release,
                 casings,
+                types: &self.p.types,
+                now: self.p.now,
             };
             for (first, accs) in &self.groups {
                 let computed = Computed {
@@ -3545,7 +4445,21 @@ impl<'q> StepRun<'q> {
                         .aggregates
                         .iter()
                         .zip(accs)
-                        .map(|(&c, a)| Ok((c as *const Expr, a.value()?)))
+                        .map(|(&c, a)| {
+                            // A direct argument is read once a group, from no row where none came.
+                            let (_, f) = Acc::of(c)?;
+                            if f.direct.is_empty() {
+                                return Ok((c as *const Expr, a.value()?));
+                            }
+                            let mut a = a.clone();
+                            a.direct(
+                                f.direct
+                                    .iter()
+                                    .map(|x| eval(x, first, &frame, &computed_none()))
+                                    .collect::<Result<_>>()?,
+                            );
+                            Ok((c as *const Expr, a.value()?))
+                        })
                         .collect::<Result<_>>()?,
                     _q: std::marker::PhantomData,
                 };
@@ -3557,6 +4471,39 @@ impl<'q> StepRun<'q> {
                         .collect::<Result<_>>()?,
                 );
             }
+        }
+        if self.p.whole_windows {
+            let frame = Frame {
+                columns: std::mem::take(&mut self.columns),
+                params,
+                release,
+                casings,
+                types: &self.p.types,
+                now: self.p.now,
+            };
+            let held = std::mem::take(&mut self.held);
+            let per_row = windows_whole(&self.p.calls.windows, &held, &frame)?;
+            for (row, w) in held.rows.iter().zip(per_row) {
+                let computed = Computed {
+                    calls: w,
+                    _q: std::marker::PhantomData,
+                };
+                out.rows.push(
+                    self.p
+                        .items
+                        .iter()
+                        .map(|(e, _)| eval(e, row, &frame, &computed))
+                        .collect::<Result<_>>()?,
+                );
+            }
+            out.order = held.order.and_then(|o| {
+                self.p.items.iter().position(|(e, _)| {
+                    column_of(e).is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
+                })
+            });
+        }
+        if self.p.grouped || self.p.whole_windows {
+            out.rows = self.once(std::mem::take(&mut out.rows));
         }
         if let Some(ob) = self.p.order_by {
             sort(&mut out, ob, params, release, casings)?;
@@ -3577,11 +4524,14 @@ fn sort(
         OrderByKind::Expressions(e) => e,
         _ => return Err(Error::new("ORDER BY ALL is not read")),
     };
+    let types = super::typed::Types::new();
     let named = Frame {
         columns: out.names.iter().map(|n| (None, n.clone())).collect(),
         params,
         release,
         casings,
+        types: &types,
+        now: super::change::wall_micros(),
     };
     // A string sorted under a library collation is sorted by the collation's key.
     let under = exprs
@@ -3678,14 +4628,13 @@ fn sort(
 
 /// One SELECT read whole, over the steps before it and the table.
 fn select(
-    q: &Query,
+    p: Prepared<'_>,
     steps: &HashMap<String, Relation>,
     table: &Table,
     params: &[String],
     release: u8,
     casings: &Casings,
 ) -> Result<Relation> {
-    let p = prepare(q)?;
     let (rel, columns) = if p.from.is_empty() {
         (
             Relation {
@@ -3749,6 +4698,8 @@ pub struct Stream<'q> {
     /// Each step, and last the question itself under no name.
     steps: Vec<(String, &'q Query, Kind)>,
     runs: Vec<Option<StepRun<'q>>>,
+    /// Each step read once every row has come, prepared.
+    later: Vec<Option<Prepared<'q>>>,
     /// The steps read whole, then each streamed step's chunk as it is read.
     view: HashMap<String, Relation>,
     /// The streamed relations a step read after the rows have come reads, gathered.
@@ -3759,12 +4710,14 @@ pub struct Stream<'q> {
 }
 
 impl<'q> Stream<'q> {
-    /// `names` are the table's columns, and `order` the one holding its order's key, where the
-    /// windows can read along it.
+    /// `names` are the table's columns, `types` their types, and `order` the one holding its
+    /// order's key, where the windows can read along it.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         q: &'q Query,
         table: &str,
         names: Vec<String>,
+        types: Vec<Option<ColumnType>>,
         order: Option<usize>,
         params: &[String],
         release: u8,
@@ -3784,6 +4737,7 @@ impl<'q> Stream<'q> {
             casings,
             steps: Vec::new(),
             runs: Vec::new(),
+            later: Vec::new(),
             view: HashMap::new(),
             kept: HashMap::new(),
             fed: false,
@@ -3799,6 +4753,13 @@ impl<'q> Stream<'q> {
             }
         }
         queries.push((String::new(), q));
+        // One clock the whole statement reads.
+        let now = super::change::wall_micros();
+        let mut typed: HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)> = HashMap::new();
+        typed.insert(
+            s.table.name.clone(),
+            (s.table.relation.names.clone(), types),
+        );
         for (name, query) in queries {
             let mut streamed = Vec::new();
             let mut after = false;
@@ -3815,7 +4776,18 @@ impl<'q> Stream<'q> {
                     }
                 }
             }
-            let p = prepare(query)?;
+            let columns = match query.body.as_ref() {
+                SetExpr::Select(sel) => typed_from(&sel.from, &typed, &s.table.name),
+                _ => Vec::new(),
+            };
+            let p = prepare(query, &columns, release, now)?;
+            typed.insert(
+                name.clone(),
+                (
+                    p.items.iter().map(|(_, n)| n.clone()).collect(),
+                    p.returns.clone(),
+                ),
+            );
             s.casings.add_step(query)?;
             let kind = if after {
                 for n in streamed {
@@ -3827,7 +4799,7 @@ impl<'q> Stream<'q> {
                 }
                 Kind::After
             } else if !streamed.is_empty() {
-                if p.grouped || p.order_by.is_some() {
+                if p.grouped || p.order_by.is_some() || p.whole_windows {
                     Kind::Folded
                 } else {
                     Kind::Streamed
@@ -3835,14 +4807,23 @@ impl<'q> Stream<'q> {
             } else {
                 Kind::Fixed
             };
+            let mut p = Some(p);
             if kind == Kind::Fixed {
-                let r = select(query, &s.view, &s.table, params, release, &s.casings)?;
+                let r = select(
+                    p.take().unwrap(),
+                    &s.view,
+                    &s.table,
+                    params,
+                    release,
+                    &s.casings,
+                )?;
                 s.view.insert(name.clone(), r);
             }
             s.runs.push(match kind {
-                Kind::Streamed | Kind::Folded => Some(StepRun::new(p)),
+                Kind::Streamed | Kind::Folded => p.take().map(StepRun::new),
                 _ => None,
             });
+            s.later.push(p.filter(|_| kind == Kind::After));
             s.steps.push((name, query, kind));
         }
         // The question's own rows are gathered where they stream.
@@ -3938,7 +4919,7 @@ impl<'q> Stream<'q> {
             }),
         };
         let steps = std::mem::take(&mut self.steps);
-        for (i, (name, query, kind)) in steps.into_iter().enumerate() {
+        for (i, (name, _, kind)) in steps.into_iter().enumerate() {
             let r = match kind {
                 Kind::Fixed => continue,
                 Kind::Streamed => match self.kept.remove(&name) {
@@ -3951,7 +4932,7 @@ impl<'q> Stream<'q> {
                     &self.casings,
                 )?,
                 Kind::After => select(
-                    query,
+                    self.later[i].take().unwrap(),
                     &whole,
                     &table,
                     &self.params,
@@ -3984,6 +4965,7 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
         q,
         &table.name,
         table.relation.names.clone(),
+        vec![None; table.relation.names.len()],
         table.relation.order,
         params,
         crate::regs::LATEST,
@@ -3991,6 +4973,80 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
     )?;
     s.feed(table.relation.clone())?;
     s.finish()
+}
+
+/// Whether a question on one table the question path does not read is handed to the pipeline: it
+/// returns each row once, or calls a function, an aggregate over each value once, filtered or
+/// ordered, or an operator on numbers, the question path does not read.
+pub fn hands_over(q: &Query) -> bool {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    if q.with.is_some() || s.from.len() != 1 || !s.from[0].joins.is_empty() {
+        return false;
+    }
+    if s.distinct.is_some() {
+        return true;
+    }
+    let mut exprs: Vec<&Expr> = s
+        .projection
+        .iter()
+        .filter_map(|i| match i {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+            _ => None,
+        })
+        .collect();
+    exprs.extend(s.selection.iter());
+    if let GroupByExpr::Expressions(g, _) = &s.group_by {
+        exprs.extend(g.iter());
+    }
+    if let Some(OrderByKind::Expressions(o)) = q.order_by.as_ref().map(|o| &o.kind) {
+        exprs.extend(o.iter().map(|x| &x.expr));
+    }
+    exprs.into_iter().any(calls_beyond_the_question)
+}
+
+/// Whether an expression calls a function, or an operator on numbers, the question path does not
+/// read: its aggregates and the functions a DDL names are its own.
+fn calls_beyond_the_question(e: &Expr) -> bool {
+    match e {
+        Expr::Function(f) => {
+            let own = f.name.0.len() > 1
+                || matches!(
+                    function_name(f).as_str(),
+                    "count" | "sum" | "min" | "max" | "avg"
+                );
+            // An aggregate of its own but over each value once, filtered or ordered, is not.
+            let plain = f.filter.is_none()
+                && f.within_group.is_empty()
+                && match &f.args {
+                    FunctionArguments::List(l) => {
+                        l.duplicate_treatment.is_none() && l.clauses.is_empty()
+                    }
+                    _ => true,
+                };
+            !(own && plain) || args(f).is_ok_and(|a| a.into_iter().any(calls_beyond_the_question))
+        }
+        Expr::Ceil { .. } | Expr::Floor { .. } | Expr::Extract { .. } => true,
+        Expr::BinaryOp { left, op, right } => {
+            matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::Overlaps
+            ) || calls_beyond_the_question(left)
+                || calls_beyond_the_question(right)
+        }
+        Expr::Nested(x)
+        | Expr::UnaryOp { expr: x, .. }
+        | Expr::Cast { expr: x, .. }
+        | Expr::IsNull(x)
+        | Expr::IsNotNull(x) => calls_beyond_the_question(x),
+        _ => false,
+    }
 }
 
 /// Whether a question is read as a pipeline: a WITH, or a window in what it returns.
@@ -4670,6 +5726,7 @@ mod tests {
                 &q,
                 "t",
                 t.relation.names.clone(),
+                vec![None; t.relation.names.len()],
                 t.relation.order,
                 &[],
                 crate::regs::LATEST,

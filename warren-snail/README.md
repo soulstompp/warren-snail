@@ -642,12 +642,16 @@ Each command exits 0, or prints why it refused and exits 1.
   column with a B-tree, a `"char"`'s by its text, a reg* type's an oid; `avg` of a float column;
   `GROUP BY`; `ORDER BY`. A join reads the table its own conditions narrow first, then keeps the
   other to the keys the first holds.
-- **A pipeline,** a question with a `WITH` or a window: steps over one table and the steps before
+- **A pipeline,** a question with a `WITH` or a window, or one on one table calling a function or an
+  operator on numbers the question path does not read: steps over one table and the steps before
   them, joined by `CROSS JOIN`; the windows `lag`, `sum`, `count` and `row_number`; the aggregates
-  `count`, `sum`, `min`, `max`, `avg` of a float, `bool_and` and `bool_or`; `CASE`, `mod`, `abs`,
-  casts, comparisons and `IS [NOT] DISTINCT FROM`; the arithmetic of floats and of money, a
-  `pg_lsn` less another or a number of bytes, and `&`, `|` and `~` on a MAC address; parameters
-  `$1` and on.
+  `count`, `sum`, `min`, `max`, `avg` of a float, `bool_and` and `bool_or`; `CASE`, `IN`, casts,
+  comparisons and `IS [NOT] DISTINCT FROM`; the arithmetic of floats and of money, an integer's held
+  to its type's range, a `pg_lsn` less another or a number of bytes, and `&`, `|` and `~` on a MAC
+  address; the functions of the numbers and of time (`warren-snail functions` lists each function
+  PostgreSQL defines, held, not read yet, or the server's own, refused by name); parameters `$1`
+  and on. Each step's expressions are typed before any row is read, so a function or an aggregate
+  PostgreSQL has no form of for its arguments is refused over no rows too.
 - **A statement:** as `exec` above.
 
 Anything else is refused, with a sentence that says what is not read. A statement sqlparser reads

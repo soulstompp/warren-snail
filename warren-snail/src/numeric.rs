@@ -7,6 +7,8 @@ use crate::{Error, Result};
 use std::cmp::Ordering;
 use std::fmt;
 
+mod funcs;
+
 /// The most digits a numeric holds after the point.
 pub const DSCALE_MAX: u32 = 16383;
 /// The most digits a numeric holds before the point.

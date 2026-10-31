@@ -34,6 +34,7 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
        warren-snail recut <file> --to <new file>
        warren-snail catalog (<file> | --ddl <ddl.sql> [--taken <taken.sql>]
                             [--statements <statements.parquet>]) [--out <catalog.parquet>]
+       warren-snail functions [--release <14..19>] [--out <functions.parquet>]
        warren-snail hold <file> --seconds <n>
 
   write   a new snail at <file>, where no file may be yet, from the DDL: each table given its rows
@@ -73,6 +74,10 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           statements taken, as a DDL a snail can be written from. --statements records each
           statement as Parquet, and --out each fact of the catalog: a row each, its kind, its
           object, the fact and its value.
+  functions every function PostgreSQL defines, 19 unless --release names another release: a type's
+          the snail answers, a type's it does not answer yet, or the server's own, which it refuses
+          by name. Prints how many of each; --out records each as Parquet: its signature, class,
+          family and whether the snail answers it.
   hold    the snail held open for the seconds given, as a round that long would hold it.
 
   Built with the feature zones, SNAIL_ZONES names the directory compiled zones are read from: the
@@ -945,6 +950,64 @@ fn cmd_blocks(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_functions(args: &[String]) -> Result<()> {
+    use warren_snail::functions::{all, Class};
+    let release = match flag(args, "--release") {
+        Some(r) => r
+            .parse()
+            .ok()
+            .filter(|r| warren_snail::regs::RELEASES.contains(r))
+            .ok_or_else(|| Error::new(format!("--release {r}: the list holds 14 to 19")))?,
+        None => warren_snail::regs::LATEST,
+    };
+    let of: Vec<_> = all().iter().filter(|f| f.in_release(release)).collect();
+    let state = |f: &warren_snail::functions::Function| match (f.class, f.held()) {
+        (Class::Server, _) => "refused",
+        (_, true) => "held",
+        _ => "not read",
+    };
+    for s in ["held", "not read", "refused"] {
+        println!("{s:9} {}", of.iter().filter(|f| state(f) == s).count());
+    }
+    println!("in all    {} functions of {release}", of.len());
+    if let Some(out) = flag(args, "--out") {
+        let batch = table(vec![
+            (
+                "signature",
+                texts(of.iter().map(|f| f.signature.to_string()).collect()),
+            ),
+            (
+                "name",
+                texts(of.iter().map(|f| f.name.to_string()).collect()),
+            ),
+            (
+                "class",
+                texts(
+                    of.iter()
+                        .map(|f| {
+                            match f.class {
+                                Class::Server => "server",
+                                _ => "type",
+                            }
+                            .to_string()
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "family",
+                texts(of.iter().map(|f| f.family.to_string()).collect()),
+            ),
+            (
+                "state",
+                texts(of.iter().map(|f| state(f).to_string()).collect()),
+            ),
+        ])?;
+        save(out, &batch)?;
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Built with zones, SNAIL_ZONES names the directory of compiled zones read, a server's own.
@@ -962,6 +1025,7 @@ fn main() -> ExitCode {
         Some("recut") => cmd_recut(&args[1..]),
         Some("blocks") => cmd_blocks(&args[1..]),
         Some("catalog") => cmd_catalog(&args[1..]),
+        Some("functions") => cmd_functions(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())

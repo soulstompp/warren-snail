@@ -11,6 +11,9 @@
 use crate::{Error, Result};
 use std::cmp::Ordering;
 
+mod funcs;
+pub use funcs::*;
+
 pub const MICROS_PER_DAY: i64 = 86_400_000_000;
 /// The Julian day of 1970-01-01.
 pub const UNIX_EPOCH_JDATE: i64 = 2_440_588;

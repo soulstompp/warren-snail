@@ -114,6 +114,12 @@ mod library {
         pub fn case(&self, _s: &str, _upper: bool) -> Result<String> {
             unreachable!("no collator opens without the feature collations")
         }
+        pub fn title(&self, _s: &str) -> Result<String> {
+            unreachable!("no collator opens without the feature collations")
+        }
+        pub fn fold(&self, _s: &str) -> Result<String> {
+            unreachable!("no collator opens without the feature collations")
+        }
         pub fn version(&self) -> &str {
             unreachable!("no collator opens without the feature collations")
         }
@@ -234,6 +240,22 @@ mod library {
             length: i32,
             status: *mut UErrorCode
         ) -> i32;
+        ucasemap_utf8ToTitle(
+            csm: *mut UCaseMap,
+            dest: *mut c_char,
+            capacity: i32,
+            src: *const c_char,
+            length: i32,
+            status: *mut UErrorCode
+        ) -> i32;
+        ucasemap_utf8FoldCase(
+            csm: *const UCaseMap,
+            dest: *mut c_char,
+            capacity: i32,
+            src: *const c_char,
+            length: i32,
+            status: *mut UErrorCode
+        ) -> i32;
         uloc_getLanguage(
             locale: *const c_char,
             language: *mut c_char,
@@ -261,6 +283,7 @@ mod library {
         ) -> libc::size_t;
         fn towlower_l(wc: u32, locale: libc::locale_t) -> u32;
         fn towupper_l(wc: u32, locale: libc::locale_t) -> u32;
+        fn iswalnum_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
     }
 
     fn failed(status: UErrorCode) -> bool {
@@ -633,42 +656,30 @@ mod library {
         /// towlower_l a character at a time.
         pub fn case(&self, s: &str, upper: bool) -> Result<String> {
             match &self.inner {
-                Inner::Icu { casemap, .. } => {
-                    let mut buf = vec![0u8; s.len() + 16];
-                    loop {
-                        let mut status = U_ZERO_ERROR;
-                        // SAFETY: the case map is open; the source and destination lengths are
-                        // theirs.
-                        let n = unsafe {
-                            let f = if upper {
-                                ucasemap_utf8ToUpper
-                            } else {
-                                ucasemap_utf8ToLower
-                            };
-                            f(
+                Inner::Icu { casemap, .. } => icu_case(s, |dest, capacity, status| {
+                    // SAFETY: the case map is open; the source and destination lengths are theirs.
+                    unsafe {
+                        if upper {
+                            ucasemap_utf8ToUpper(
                                 *casemap,
-                                buf.as_mut_ptr() as *mut c_char,
-                                buf.len() as i32,
+                                dest,
+                                capacity,
                                 s.as_ptr() as *const c_char,
                                 s.len() as i32,
-                                &mut status,
+                                status,
                             )
-                        } as usize;
-                        if status == U_BUFFER_OVERFLOW_ERROR || n > buf.len() {
-                            buf.resize(n + 1, 0);
-                            continue;
+                        } else {
+                            ucasemap_utf8ToLower(
+                                *casemap,
+                                dest,
+                                capacity,
+                                s.as_ptr() as *const c_char,
+                                s.len() as i32,
+                                status,
+                            )
                         }
-                        if failed(status) {
-                            return Err(Error::new(format!(
-                                "case conversion failed: {}",
-                                error_name(status)
-                            )));
-                        }
-                        buf.truncate(n);
-                        return String::from_utf8(buf)
-                            .map_err(|_| Error::new("case conversion gave no UTF-8"));
                     }
-                }
+                }),
                 Inner::Libc { loc } => Ok(s
                     .chars()
                     .map(|ch| {
@@ -687,10 +698,99 @@ mod library {
             }
         }
 
+        /// A text with each word's first letter in title case and the rest in lower, as
+        /// PostgreSQL's initcap maps it under this collation: ICU's case map of its locale with
+        /// its locale's word breaks, or glibc's towupper_l at a word's first character and
+        /// towlower_l after, a word being the characters iswalnum_l calls alphanumeric.
+        pub fn title(&self, s: &str) -> Result<String> {
+            match &self.inner {
+                Inner::Icu { casemap, .. } => icu_case(s, |dest, capacity, status| {
+                    // SAFETY: the case map is open and this thread's own (`at`), so its break
+                    // iterator is used by no other; the lengths are theirs.
+                    unsafe {
+                        ucasemap_utf8ToTitle(
+                            *casemap,
+                            dest,
+                            capacity,
+                            s.as_ptr() as *const c_char,
+                            s.len() as i32,
+                            status,
+                        )
+                    }
+                }),
+                Inner::Libc { loc } => {
+                    let mut was_alnum = false;
+                    Ok(s.chars()
+                        .map(|ch| {
+                            // SAFETY: the locale lives as long as the program; any code point is a
+                            // wint_t.
+                            let m = unsafe {
+                                if was_alnum {
+                                    towlower_l(ch as u32, *loc)
+                                } else {
+                                    towupper_l(ch as u32, *loc)
+                                }
+                            };
+                            // SAFETY: as above.
+                            was_alnum = unsafe { iswalnum_l(m, *loc) } != 0;
+                            char::from_u32(m).unwrap_or(ch)
+                        })
+                        .collect())
+                }
+            }
+        }
+
+        /// A text case folded, as PostgreSQL's casefold folds it under this collation: ICU's
+        /// case map of its locale, folded with the Turkic mappings for tr and az; glibc's lower
+        /// case, which is its folding.
+        pub fn fold(&self, s: &str) -> Result<String> {
+            match &self.inner {
+                Inner::Icu { casemap, .. } => icu_case(s, |dest, capacity, status| {
+                    // SAFETY: the case map is open; the source and destination lengths are theirs.
+                    unsafe {
+                        ucasemap_utf8FoldCase(
+                            *casemap,
+                            dest,
+                            capacity,
+                            s.as_ptr() as *const c_char,
+                            s.len() as i32,
+                            status,
+                        )
+                    }
+                }),
+                Inner::Libc { .. } => self.case(s, false),
+            }
+        }
+
         /// The version of its order its library gives, as PostgreSQL records it: the collator's
         /// under ICU, glibc's own under libc.
         pub fn version(&self) -> &str {
             &self.version
+        }
+    }
+
+    /// What one of ICU's UTF-8 case maps writes, given the destination and its capacity: grown
+    /// and called again where it wrote past it, refused in PostgreSQL's words where it failed.
+    fn icu_case(
+        s: &str,
+        mut f: impl FnMut(*mut c_char, i32, &mut UErrorCode) -> i32,
+    ) -> Result<String> {
+        let mut buf = vec![0u8; s.len() + 16];
+        loop {
+            let mut status = U_ZERO_ERROR;
+            let n = f(buf.as_mut_ptr() as *mut c_char, buf.len() as i32, &mut status) as usize;
+            if status == U_BUFFER_OVERFLOW_ERROR || n > buf.len() {
+                buf.resize(n + 1, 0);
+                continue;
+            }
+            if failed(status) {
+                return Err(Error::new(format!(
+                    "case conversion failed: {}",
+                    error_name(status)
+                )));
+            }
+            buf.truncate(n);
+            return String::from_utf8(buf).map_err(|_| Error::new("case conversion gave no UTF-8"));
         }
     }
 

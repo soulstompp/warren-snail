@@ -440,10 +440,18 @@ pub fn number(e: &Expr) -> Option<i64> {
             Value::Number(s, _) => s.parse().ok(),
             _ => None,
         },
+        // A number written with its minus is one constant, as PostgreSQL's grammar folds it: so
+        // the least bigint is read whole.
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } => number(expr).map(|v| -v),
+        } => match expr.as_ref() {
+            Expr::Value(v) => match &v.value {
+                Value::Number(s, _) => format!("-{s}").parse().ok(),
+                _ => None,
+            },
+            e => number(e).and_then(i64::checked_neg),
+        },
         Expr::Nested(e) => number(e),
         _ => None,
     }

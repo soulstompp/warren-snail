@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod bytes;
 pub mod carry;
 pub mod catalog;
 pub mod collations;
@@ -10,6 +11,8 @@ pub mod directory;
 pub mod encode;
 mod error;
 pub mod file;
+pub mod formatting;
+pub mod functions;
 pub mod geo;
 #[cfg(feature = "standalone")]
 pub mod held;
