@@ -3597,6 +3597,9 @@ mod tests {
             |s: &str, conv: &Conv| to_number(s, "L9G999D9", conv).unwrap().unwrap().to_string();
         assert_eq!(read("kr. 1,234.5", &dk), "0.1");
         assert_eq!(read("£1,234.5", &gb), "1234.5");
+        // L reads as many characters as its symbol holds: three of HK$1,234.5, as PostgreSQL 18.6
+        // read it.
+        assert_eq!(read("HK$1,234.5", &at("HK$")), "1234.5");
     }
 
     #[test]
