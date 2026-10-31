@@ -560,6 +560,83 @@ fn a_foreign_key_not_enforced_checks_and_acts_on_nothing() {
     assert_eq!(rows(&mut s, "SELECT id, r FROM s.c"), ["1,1", "2,2"]);
 }
 
+/// Two enforced keys of one table on one parent are refused by name where one writes, as a row of
+/// the parent is deleted or its key updated, the rows or columns the other reads or writes; read
+/// where they write nothing of each other's, or are one key written twice.
+#[test]
+fn two_keys_on_one_parent_acting_on_what_each_other_reads_are_refused_by_name() {
+    let parents = "CREATE TABLE s.p (id integer PRIMARY KEY, v integer);
+                   CREATE TABLE s.q (a integer PRIMARY KEY, b integer NOT NULL, UNIQUE (a, b));";
+    let child =
+        |body: &str| format!("{parents} CREATE TABLE s.c (id integer PRIMARY KEY, {body});");
+    for (body, event) in [
+        // On one column, CASCADE beside NO ACTION, either written first.
+        (
+            "r integer REFERENCES s.p ON DELETE CASCADE, CONSTRAINT c_kept FOREIGN KEY (r) REFERENCES s.p",
+            "DELETE",
+        ),
+        (
+            "r integer REFERENCES s.p, CONSTRAINT c_gone FOREIGN KEY (r) REFERENCES s.p ON DELETE CASCADE",
+            "DELETE",
+        ),
+        // SET NULL beside SET DEFAULT on one column; CASCADE ON UPDATE beside NO ACTION.
+        (
+            "r integer DEFAULT 1 REFERENCES s.p ON DELETE SET NULL, \
+             CONSTRAINT c_back FOREIGN KEY (r) REFERENCES s.p ON DELETE SET DEFAULT",
+            "DELETE",
+        ),
+        (
+            "r integer REFERENCES s.p ON UPDATE CASCADE, CONSTRAINT c_kept FOREIGN KEY (r) REFERENCES s.p",
+            "UPDATE",
+        ),
+        // Two columns apart: the rows one deletes are those the other reads.
+        (
+            "a integer REFERENCES s.p ON DELETE CASCADE, b integer REFERENCES s.p ON DELETE RESTRICT",
+            "DELETE",
+        ),
+        // Two columns and the first of them, SET NULL on both: each sets what the other reads.
+        (
+            "x integer, y integer, FOREIGN KEY (x, y) REFERENCES s.q (a, b) ON DELETE SET NULL, \
+             FOREIGN KEY (x) REFERENCES s.q ON DELETE SET NULL",
+            "DELETE",
+        ),
+    ] {
+        let e = refused_ddl(&child(body));
+        assert!(
+            e.contains(&format!("both act ON {event} of \"p\""))
+                || e.contains(&format!("both act ON {event} of \"q\"")),
+            "{body}: {e}"
+        );
+        assert!(e.contains("such a pair is not read"), "{body}: {e}");
+    }
+    // Added by ALTER TABLE beside a key already made.
+    let e = refused_ddl(&format!(
+        "{} ALTER TABLE s.c ADD CONSTRAINT c_cleared FOREIGN KEY (r) REFERENCES s.p ON DELETE SET NULL;",
+        child("r integer DEFAULT 1 REFERENCES s.p ON DELETE SET DEFAULT")
+    ));
+    assert!(
+        e.contains(
+            "foreign keys \"c_r_fkey\" and \"c_cleared\" of relation \"c\" both act ON DELETE"
+        ),
+        "{e}"
+    );
+    for body in [
+        // One key written twice; two that only check.
+        "r integer REFERENCES s.p ON DELETE CASCADE, FOREIGN KEY (r) REFERENCES s.p ON DELETE CASCADE",
+        "r integer REFERENCES s.p, FOREIGN KEY (r) REFERENCES s.p ON DELETE RESTRICT DEFERRABLE",
+        // Two columns apart, neither writing what the other reads.
+        "a integer REFERENCES s.p ON DELETE CASCADE, b integer REFERENCES s.p ON DELETE SET NULL",
+        "a integer REFERENCES s.p ON UPDATE CASCADE, b integer REFERENCES s.p ON UPDATE NO ACTION",
+        // A key not enforced, or on another parent.
+        "r integer REFERENCES s.p NOT ENFORCED, FOREIGN KEY (r) REFERENCES s.p ON DELETE CASCADE",
+        "r integer REFERENCES s.p ON DELETE CASCADE, FOREIGN KEY (r) REFERENCES s.q",
+    ] {
+        let c = Catalog::parse(&child(body)).unwrap_or_else(|e| panic!("{body}: {e}"));
+        let t = c.tables.iter().find(|t| t.name == "s.c").unwrap();
+        assert_eq!(t.foreign_keys.len(), 2, "{body}");
+    }
+}
+
 #[test]
 fn a_foreign_key_made_valid_on_rows_held_checks_every_one() {
     let path = made(

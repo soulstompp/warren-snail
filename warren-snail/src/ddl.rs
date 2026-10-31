@@ -2684,6 +2684,7 @@ impl Draft {
         if let Some(r) = table_key_reference(&mut c, &format!("ALTER TABLE {name}"))? {
             end(&c, &format!("ALTER TABLE {name} ADD FOREIGN KEY"))?;
             let k = self.reference(&name, r, false)?;
+            parting(&name, &self.table(&name).unwrap().foreign_keys, &k)?;
             self.check_names.push(qualified(&schema, &k.name));
             self.table_mut(&name).unwrap().foreign_keys.push(k);
             return Ok(notices);
@@ -3315,6 +3316,7 @@ impl Draft {
         // being empty.
         for r in fks {
             let k = next.reference(&name, r, true)?;
+            parting(&name, &next.table(&name).unwrap().foreign_keys, &k)?;
             next.check_names.push(qualified(&schema, &k.name));
             next.table_mut(&name).unwrap().foreign_keys.push(k);
         }
@@ -4515,6 +4517,76 @@ pub(crate) fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         }
         _ => {}
     }
+}
+
+/// What a foreign key's action writes where a parent's row is deleted or its key updated: nothing,
+/// the rows that reference it, or the columns it sets in them.
+enum Writes {
+    Nothing,
+    Rows,
+    Columns(Vec<usize>),
+}
+
+fn writes(k: &ForeignKey, action: &Action, deleting: bool) -> Writes {
+    match action {
+        Action::NoAction | Action::Restrict => Writes::Nothing,
+        Action::Cascade if deleting => Writes::Rows,
+        _ => Writes::Columns(k.set_by(action)),
+    }
+}
+
+/// Whether two keys on one parent, acting on one of its rows deleted or updated, meet: one writes
+/// rows or columns the other reads or writes, and the two are not one key written twice.
+fn meet(k: &ForeignKey, a: &Action, o: &ForeignKey, b: &Action, deleting: bool) -> bool {
+    let pairs = |f: &ForeignKey| {
+        let mut p: Vec<(usize, usize)> = f
+            .columns
+            .iter()
+            .copied()
+            .zip(f.parent_columns.iter().copied())
+            .collect();
+        p.sort();
+        p
+    };
+    if a == b && pairs(k) == pairs(o) {
+        return false;
+    }
+    let reads = |set: &[usize], f: &ForeignKey| set.iter().any(|c| f.columns.contains(c));
+    match (writes(k, a, deleting), writes(o, b, deleting)) {
+        (Writes::Nothing, Writes::Nothing) | (Writes::Rows, Writes::Rows) => false,
+        (Writes::Rows, Writes::Nothing) | (Writes::Nothing, Writes::Rows) => true,
+        (Writes::Rows, Writes::Columns(c)) | (Writes::Nothing, Writes::Columns(c)) => reads(&c, k),
+        (Writes::Columns(c), Writes::Rows) | (Writes::Columns(c), Writes::Nothing) => reads(&c, o),
+        (Writes::Columns(c), Writes::Columns(d)) => reads(&c, o) || reads(&d, k),
+    }
+}
+
+/// Refuses a foreign key that meets another enforced key of its table on the same parent, ON
+/// DELETE or ON UPDATE: PostgreSQL acts on the two in the order its names for their triggers sort.
+fn parting(child: &str, keys: &[ForeignKey], k: &ForeignKey) -> Result<()> {
+    if !k.enforced {
+        return Ok(());
+    }
+    for o in keys.iter().filter(|o| o.enforced && o.parent == k.parent) {
+        for (a, b, deleting) in [
+            (&k.on_delete, &o.on_delete, true),
+            (&k.on_update, &o.on_update, false),
+        ] {
+            if meet(k, a, o, b, deleting) {
+                return Err(Error::new(format!(
+                    "foreign keys \"{}\" and \"{}\" of relation \"{}\" both act ON {} of \"{}\", \
+                     one writing what the other reads, and PostgreSQL's answer follows the order \
+                     their triggers fire in: such a pair is not read",
+                    o.name,
+                    k.name,
+                    bare(child),
+                    if deleting { "DELETE" } else { "UPDATE" },
+                    bare(&k.parent)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The columns an expression reads, each once, in the order it first reads them.
