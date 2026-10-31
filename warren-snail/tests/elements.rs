@@ -645,6 +645,33 @@ fn a_multirange_s_operators_answer_as_postgresql_s() {
 }
 
 #[test]
+fn a_value_of_another_type_beside_a_range_is_refused_as_postgresql_resolves_the_operator() {
+    let mut snail = snail_of("elements-resolution", QUESTIONS, &ROWS);
+    let step = "WITH q AS (SELECT id, m, r FROM s.q)";
+    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31): an element of a type other
+    // than the subtype, or a range of another range type, has no form of the operator.
+    for (e, refused) in [
+        ("m @> 4::bigint", "int4multirange @> bigint"),
+        ("m @> 4.5", "int4multirange @> numeric"),
+        ("4::int2 <@ m", "smallint <@ int4multirange"),
+        ("m <@ 4", "int4multirange <@ integer"),
+        ("m && '[1,2)'::int8range", "int4multirange && int8range"),
+        ("r -|- '[1,2)'::int8range", "int4range -|- int8range"),
+        ("r @> 4::bigint", "int4range @> bigint"),
+        ("r = m", "int4range = int4multirange"),
+        ("r + 4", "int4range + integer"),
+    ] {
+        let q = format!("{step} SELECT id, ({e}) AS x FROM q WHERE id = 1");
+        let got = snail.ask(&q, None).unwrap_err().to_string();
+        assert_eq!(got, format!("operator does not exist: {refused}"), "{e}");
+    }
+    for e in ["m @> 4", "m @> NULL", "r <@ m", "m @> '{[1,2)}'", "4 <@ r"] {
+        let q = format!("{step} SELECT id, ({e}) AS x FROM q WHERE id = 1");
+        assert!(snail.ask(&q, None).is_ok(), "{e}");
+    }
+}
+
+#[test]
 fn a_multirange_s_equal_bounds_merge_into_the_later_range_s() {
     let num = warren_snail::composed::built_in("nummultirange").unwrap();
     // As PostgreSQL 18.6 read each (28818, 2026-10-30).

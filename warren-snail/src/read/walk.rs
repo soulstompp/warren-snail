@@ -968,9 +968,15 @@ impl Snail {
                         if !keep {
                             continue;
                         }
-                        // A condition by an operator or a pattern, held as a pipeline holds it.
+                        // A condition by an operator or a pattern, held as a pipeline holds it; one
+                        // it cannot hold fails the question. Every such condition is strict: a NULL
+                        // fails it.
                         let mut kept = true;
                         for &(o, ty, start, v) in &ops {
+                            if v.is_null(r - start) {
+                                kept = false;
+                                break;
+                            }
                             let d = crate::values::datum_of(v, r - start, ty);
                             let held = super::pipeline::eval_on(
                                 &o.expr,
@@ -978,9 +984,8 @@ impl Snail {
                                 &[super::fill::value_of(&d, ty)],
                                 table.release,
                                 &casings,
-                            );
-                            let held = if o.raises { Some(held?) } else { held.ok() };
-                            if !matches!(held, Some(super::pipeline::Value::Bool(true))) {
+                            )?;
+                            if !matches!(held, super::pipeline::Value::Bool(true)) {
                                 kept = false;
                                 break;
                             }

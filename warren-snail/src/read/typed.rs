@@ -394,6 +394,9 @@ impl Typing<'_> {
             }
             Expr::BinaryOp { left, op, right } => {
                 let (a, b) = (self.type_of(left)?, self.type_of(right)?);
+                if let Some(t) = range_operator(&op.to_string(), a, b)? {
+                    return Ok(Some(t));
+                }
                 match op {
                     BinaryOperator::Plus
                     | BinaryOperator::Minus
@@ -1068,6 +1071,71 @@ pub(super) fn multirange_range(ty: ColumnType) -> Option<ColumnType> {
         },
         _ => None,
     }
+}
+
+/// A type without its modifier, as PostgreSQL's polymorphic forms match it.
+fn unmodified(ty: ColumnType) -> ColumnType {
+    match super::clock::base(ty) {
+        t if t.is_numeric() => NUMERIC,
+        ColumnType::Text(Some(_)) => ColumnType::Text(Some(ColumnType::VARCHAR)),
+        ColumnType::Bpchar(_) => ColumnType::Bpchar(None),
+        ColumnType::Varbit(_) => ColumnType::Varbit(None),
+        t => t,
+    }
+}
+
+/// The type a range's or a multirange's operator returns over its two sides, as PostgreSQL resolves
+/// its polymorphic forms: `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>` and `-|-` beside a range or a
+/// multirange over the same range type; `@>` with an element of the subtype on its right, `<@` on
+/// its left; `+`, `*`, `-` and the comparisons beside the same type; an untyped literal or NULL as
+/// the other side's type. Refused where PostgreSQL finds no operator; none where neither side is a
+/// range or a multirange, or the operator is none of theirs.
+pub(super) fn range_operator(
+    op: &str,
+    a: Option<ColumnType>,
+    b: Option<ColumnType>,
+) -> Result<Option<ColumnType>> {
+    use crate::composed::Composed;
+    // The range type a side stands on, and whether it is a multirange of it.
+    let ranged = |t: ColumnType| match t {
+        ColumnType::Composed(r) => match r.def() {
+            Composed::Range { .. } => Some((t, false)),
+            Composed::Multirange { range, .. } => Some((*range, true)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (x, y) = (a.and_then(ranged), b.and_then(ranged));
+    if x.is_none() && y.is_none() {
+        return Ok(None);
+    }
+    let truth = ["@>", "<@", "&&", "<<", ">>", "&<", "&>", "-|-"].contains(&op);
+    let same = ["+", "*", "-", "=", "<>", "<", "<=", ">", ">="].contains(&op);
+    if !truth && !same {
+        return Ok(None);
+    }
+    let subtype = |r: ColumnType| crate::composed::range_of(r).map(|(s, _)| unmodified(s));
+    let fits = match (a, b, x, y) {
+        (None, _, _, _) | (_, None, _, _) => true,
+        (_, _, Some(rx), Some(ry)) if truth => rx.0 == ry.0,
+        (Some(s), Some(t), Some(_), Some(_)) => s == t,
+        (_, Some(e), Some(rx), None) => op == "@>" && subtype(rx.0) == Some(unmodified(e)),
+        (Some(e), _, None, Some(ry)) => op == "<@" && subtype(ry.0) == Some(unmodified(e)),
+        _ => false,
+    };
+    if !fits {
+        return Err(Error::new(format!(
+            "operator does not exist: {} {op} {}",
+            arg_name(a),
+            arg_name(b)
+        )));
+    }
+    let comparison = ["=", "<>", "<", "<=", ">", ">="].contains(&op);
+    Ok(Some(if truth || comparison {
+        ColumnType::Boolean
+    } else {
+        a.or(b).unwrap()
+    }))
 }
 
 /// The keywords PostgreSQL's grammar reads as a type's, or as a clause's, never as a function's

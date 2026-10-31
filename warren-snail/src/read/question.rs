@@ -315,9 +315,6 @@ pub struct OpCond {
     /// rules a block out by it.
     pub op: String,
     pub probe: Option<crate::spans::Probe>,
-    /// Whether a row on which it fails fails the round, as a pattern PostgreSQL refuses fails
-    /// its statement; else such a row is not kept.
-    pub raises: bool,
 }
 
 impl Side {
@@ -2022,7 +2019,6 @@ fn pattern(from: &From, p: &Expr) -> Result<Option<Vec<Conj>>> {
             name: column.name.clone(),
             op: String::new(),
             probe: None,
-            raises: true,
         }),
     )];
     if let Some(t) = super::prefix::narrowing(c, column, fixed)? {
@@ -2499,6 +2495,21 @@ fn op_cond(
     if !read {
         return Ok(None);
     }
+    // A value of a type no form of the operator takes beside the column is refused before any row.
+    if ranged {
+        let other = super::typed::Typing {
+            columns: &[],
+            release: table.release,
+            types: super::typed::Types::new(),
+        }
+        .type_of(lit)?;
+        let (a, b) = if lit_left {
+            (other, Some(ty))
+        } else {
+            (Some(ty), other)
+        };
+        super::typed::range_operator(&name, a, b)?;
+    }
     let column = table.columns[c].name.clone();
     let own = Box::new(Expr::Identifier(sqlparser::ast::Ident::with_quote(
         '"',
@@ -2572,7 +2583,6 @@ fn op_cond(
         name: column,
         op: seen.unwrap_or_default().to_string(),
         probe: seen.and(probe),
-        raises: false,
     }))
 }
 

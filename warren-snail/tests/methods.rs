@@ -597,6 +597,62 @@ fn a_gist_strand_on_a_range_rules_out_a_block_whose_span_its_value_misses() {
 }
 
 #[test]
+fn a_gist_strand_s_condition_it_cannot_hold_is_refused_never_taken_as_false() {
+    let mut s = fresh(&ranges("gist-refused", 4096));
+    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31), along either order and before
+    // any row: no form of the operator takes a value of that type beside an int4range.
+    for (q, refused) in [
+        (
+            "SELECT id FROM s.t WHERE r -|- '[20005,20010)'::int8range",
+            "int4range -|- int8range",
+        ),
+        (
+            "SELECT id FROM s.t WHERE r && '[20000,20100)'::int8range",
+            "int4range && int8range",
+        ),
+        (
+            "SELECT id FROM s.t WHERE r @> 20002::bigint",
+            "int4range @> bigint",
+        ),
+        (
+            "SELECT id FROM s.t WHERE r @> 20002.5",
+            "int4range @> numeric",
+        ),
+        (
+            "SELECT id FROM s.t WHERE 20002::int2 <@ r",
+            "smallint <@ int4range",
+        ),
+        (
+            "SELECT id FROM s.t WHERE r @> 99999999::bigint",
+            "int4range @> bigint",
+        ),
+    ] {
+        for order in ["t_pkey", "t_r"] {
+            let got = s.ask(q, Some(order)).unwrap_err().to_string();
+            assert_eq!(got, format!("operator does not exist: {refused}"), "{q}");
+        }
+    }
+    // A value that fails as a row is held to it fails the question, as PostgreSQL's does.
+    for order in ["t_pkey", "t_r"] {
+        let got = s
+            .ask(
+                "SELECT id FROM s.t WHERE r && int4range(20010, 20005)",
+                Some(order),
+            )
+            .unwrap_err();
+        assert_eq!(
+            got.to_string(),
+            "range lower bound must be less than or equal to range upper bound"
+        );
+    }
+    // A NULL fails every operator a strand answers, along the key where its rows are walked too.
+    let q = "SELECT id FROM s.t WHERE r -|- '[20005,20010)'";
+    let along_key = ids(&mut s, q, "t_pkey");
+    assert_eq!(along_key.len(), 2, "{along_key:?}");
+    assert_eq!(ids(&mut s, q, "t_r"), along_key);
+}
+
+#[test]
 fn an_sp_gist_strand_on_an_inet_rules_out_a_block_whose_addresses_its_network_misses() {
     let catalog = Catalog::parse(
         "CREATE TABLE s.t (id int NOT NULL, n inet, PRIMARY KEY (id)); \
