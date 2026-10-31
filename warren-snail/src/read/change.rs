@@ -248,6 +248,55 @@ pub(super) fn key_of(table: &Table, order: &Order, row: &Row) -> Result<Vec<KeyV
         .collect()
 }
 
+/// The type each column a question returns takes before any row is read, as PostgreSQL types it: a
+/// column's from its table, an expression's as the pipeline types it; none where it is not known.
+fn stated_types(catalog: &Catalog, question: &str) -> Vec<Option<ColumnType>> {
+    use sqlparser::ast::{SelectItem, SetExpr, Statement as Sql, TableFactor};
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let Ok(parsed) = sqlparser::parser::Parser::parse_sql(&dialect, question) else {
+        return Vec::new();
+    };
+    let [Sql::Query(q)] = parsed.as_slice() else {
+        return Vec::new();
+    };
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return Vec::new();
+    };
+    let mut columns: Vec<super::typed::TypedColumn> = Vec::new();
+    for item in &s.from {
+        for f in std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation)) {
+            let TableFactor::Table { name, alias, .. } = f else {
+                continue;
+            };
+            let n = crate::catalog::object_name(name);
+            let Some(t) = catalog.table(&n) else {
+                continue;
+            };
+            let q = alias
+                .as_ref()
+                .map(|a| crate::catalog::ident(&a.name))
+                .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+            for c in &t.columns {
+                columns.push((Some(q.clone()), c.name.clone(), Some(c.ty)));
+            }
+        }
+    }
+    let mut typing = super::typed::Typing {
+        columns: &columns,
+        release: catalog.release,
+        types: Default::default(),
+    };
+    s.projection
+        .iter()
+        .map(|p| match p {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                typing.type_of(e).ok().flatten()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The rows of an answer whose columns are the table's, in its order.
 pub(super) fn rows_of(batch: &RecordBatch) -> Result<Vec<Row>> {
     let mut rows = vec![Vec::with_capacity(batch.num_columns()); batch.num_rows()];
@@ -734,7 +783,6 @@ impl Snail {
                     (Source::Filled(rows), None) => self.filled(table, rows)?,
                     (Source::Select { question, fill }, None) => {
                         let (batch, _) = self.answer(&question, None)?;
-                        let t = &self.catalog.tables[table];
                         let types: Vec<ColumnType> = batch
                             .schema()
                             .fields()
@@ -758,17 +806,27 @@ impl Snail {
                             })
                             .collect::<Result<_>>()?;
                         // Each column the answer fills takes its value by PostgreSQL's assignment
-                        // casts, checked before any row is read, as PostgreSQL checks them.
+                        // casts, checked before any row is read, as PostgreSQL checks them. A column
+                        // of the answer holding no value, every column of an answer of no rows, is
+                        // given no type by its values: it takes the type its question gives it, and
+                        // where none is known fills only NULLs.
+                        let stated = stated_types(&self.catalog, &question);
+                        let t = &self.catalog.tables[table];
                         for (col, f) in t.columns.iter().zip(&fill) {
-                            if let Fill::Answer(i) = f {
-                                if !assignable(types[*i], col.ty) {
-                                    return Err(Error::new(format!(
-                                        "column \"{}\" is of type {} but expression is of type {}",
-                                        col.name,
-                                        col.ty.pg_name(),
-                                        types[*i].pg_name().split('(').next().unwrap_or_default()
-                                    )));
-                                }
+                            let Fill::Answer(i) = f else { continue };
+                            let typed = batch.column(*i).null_count() < batch.num_rows();
+                            let from = if typed {
+                                Some(types[*i])
+                            } else {
+                                stated.get(*i).copied().flatten()
+                            };
+                            if let Some(from) = from.filter(|&from| !assignable(from, col.ty)) {
+                                return Err(Error::new(format!(
+                                    "column \"{}\" is of type {} but expression is of type {}",
+                                    col.name,
+                                    col.ty.pg_name(),
+                                    from.pg_name().split('(').next().unwrap_or_default()
+                                )));
                             }
                         }
                         let mut given = Vec::new();
@@ -2560,6 +2618,81 @@ impl Snail {
     /// A table, an index or a table's order declared: the catalog read again with it, and each order
     /// it adds or changes empty, until rows come. A table that holds rows keeps its columns and
     /// orders as written.
+    /// Refuses a domain's NOT NULL set, or a CHECK of its added valid or validated, that a value one
+    /// of its columns holds, or a column of a domain over it, does not meet, as PostgreSQL's ALTER
+    /// DOMAIN validates them: each table in turn, each row, each of its columns, in PostgreSQL's
+    /// words. `catalog` is the catalog the DDL declares; the rows are the file's.
+    fn domains_validated(&mut self, catalog: &Catalog) -> Result<()> {
+        fn derives(domains: &[crate::catalog::Domain], name: &str, of: &str) -> bool {
+            name == of
+                || domains
+                    .iter()
+                    .find(|d| d.name == name)
+                    .is_some_and(|d| derives(domains, &d.base, of))
+        }
+        for d in &catalog.domains {
+            let was = self.catalog.domains.iter().find(|x| x.name == d.name);
+            let not_null = d.not_null && !was.is_some_and(|w| w.not_null);
+            let checks: Vec<&crate::catalog::DomainCheck> = d
+                .checks
+                .iter()
+                .filter(|k| k.valid)
+                .filter(|k| {
+                    !was.is_some_and(|w| w.checks.iter().any(|x| x.name == k.name && x.valid))
+                })
+                .collect();
+            if !not_null && checks.is_empty() {
+                continue;
+            }
+            let held: Vec<(Table, Vec<usize>)> = self
+                .catalog
+                .tables
+                .iter()
+                .filter_map(|t| {
+                    let cols: Vec<usize> = (0..t.columns.len())
+                        .filter(|&c| {
+                            t.columns[c]
+                                .domain
+                                .as_deref()
+                                .is_some_and(|n| derives(&catalog.domains, n, &d.name))
+                        })
+                        .collect();
+                    (!cols.is_empty()).then(|| (t.clone(), cols))
+                })
+                .collect();
+            for (t, cols) in held {
+                let names = cols
+                    .iter()
+                    .map(|&c| format!("\"{}\"", t.columns[c].name.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let (b, _) = self.answer(&format!("SELECT {names} FROM {}", t.name), None)?;
+                let bare = t.name.rsplit('.').next().unwrap_or(&t.name);
+                for r in rows_of(&b)? {
+                    for (k, &c) in cols.iter().enumerate() {
+                        let col = &t.columns[c];
+                        if not_null && r[k] == Datum::Null {
+                            return Err(Error::new(format!(
+                                "column \"{}\" of table \"{bare}\" contains null values",
+                                col.name
+                            )));
+                        }
+                        for check in &checks {
+                            if !fill::check_holds(&check.check, col.ty, &r[k], &t)? {
+                                return Err(Error::new(format!(
+                                    "column \"{}\" of table \"{bare}\" contains values that \
+                                     violate the new constraint",
+                                    col.name
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn declare(&mut self, ddl: &str) -> Result<()> {
         let text = format!("{}\n{ddl};\n", self.catalog.ddl.trim_end());
         let kept = Catalog::statements_in(&self.catalog.ddl)?;
@@ -2637,6 +2770,7 @@ impl Snail {
                 }
             }
         }
+        self.domains_validated(&catalog)?;
         // A foreign key added valid, or validated, on a table that holds rows is checked against
         // every row, as the catalog declared reads it.
         let mut validated: Vec<(usize, usize)> = Vec::new();

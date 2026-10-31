@@ -637,6 +637,24 @@ pub fn domain_default<'a>(
         .or_else(|| domain_default(domains, &d.base))
 }
 
+/// Whether a value of a column of `table` meets a domain's CHECK: where its condition is true or
+/// NULL, its money read under the file's lc_monetary.
+pub(super) fn check_holds(
+    check: &sqlparser::ast::Expr,
+    ty: ColumnType,
+    d: &Datum,
+    table: &Table,
+) -> Result<bool> {
+    let v = eval_on(
+        check,
+        &["value".to_string()],
+        &[value_of(d, ty)],
+        table.release,
+        &Casings::under(table.monetary),
+    )?;
+    Ok(!matches!(v, Value::Bool(false)))
+}
+
 /// Refuses a value a domain does not allow: a NULL where it is NOT NULL, or one a CHECK of its own
 /// or of its base domain finds false.
 fn meets_domain(

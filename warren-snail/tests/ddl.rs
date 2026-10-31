@@ -845,3 +845,111 @@ fn a_literal_written_with_casts_is_read_through_each_innermost_first() {
         ]
     );
 }
+
+#[test]
+fn alter_domain_refuses_a_not_null_or_a_check_the_values_held_break() {
+    // Each as PostgreSQL 18.6 and 19 RC1 took or refused it on 28818 and 28819 (2026-10-31): the
+    // values of the domain's columns and of a domain over it, a CHECK added NOT VALID checked
+    // when validated.
+    let path = made(
+        "domain-validated",
+        "CREATE DOMAIN s.loose AS integer;
+         CREATE DOMAIN s.looser AS s.loose;
+         CREATE TABLE s.dom (id integer PRIMARY KEY, v s.loose, w s.loose, x s.looser);",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(
+        &mut w,
+        "INSERT INTO s.dom (id, v, w, x) VALUES (1, 5, NULL, 0)",
+    );
+    let nulls = "column \"w\" of table \"dom\" contains null values";
+    let broken = |c: &str| {
+        format!("column \"{c}\" of table \"dom\" contains values that violate the new constraint")
+    };
+    for (sql, why) in [
+        ("ALTER DOMAIN s.loose SET NOT NULL", nulls.to_string()),
+        (
+            "ALTER DOMAIN s.loose ADD CONSTRAINT loose_pos CHECK (VALUE > 0)",
+            broken("x"),
+        ),
+    ] {
+        let e = w
+            .execute(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was taken"));
+        assert_eq!(e.to_string(), why, "{sql}");
+    }
+    run(
+        &mut w,
+        "ALTER DOMAIN s.loose ADD CONSTRAINT loose_pos CHECK (VALUE > 0) NOT VALID",
+    );
+    let e = w
+        .execute("ALTER DOMAIN s.loose VALIDATE CONSTRAINT loose_pos")
+        .unwrap_err();
+    assert_eq!(e.to_string(), broken("x"));
+    run(&mut w, "UPDATE s.dom SET x = 1 WHERE id = 1");
+    run(&mut w, "ALTER DOMAIN s.loose VALIDATE CONSTRAINT loose_pos");
+    run(&mut w, "UPDATE s.dom SET w = 2 WHERE id = 1");
+    run(&mut w, "ALTER DOMAIN s.loose SET NOT NULL");
+    let e = w
+        .execute("ALTER DOMAIN s.loose ADD CONSTRAINT loose_small CHECK (VALUE < 3)")
+        .unwrap_err();
+    assert_eq!(e.to_string(), broken("v"));
+    drop(w);
+    let s = Snail::open(&path).unwrap();
+    let d = s
+        .catalog
+        .domains
+        .iter()
+        .find(|d| d.name == "s.loose")
+        .unwrap();
+    assert!(d.not_null);
+    assert_eq!(
+        d.checks
+            .iter()
+            .map(|k| (k.name.as_str(), k.valid))
+            .collect::<Vec<_>>(),
+        [("loose_pos", true)]
+    );
+}
+
+#[test]
+fn an_insert_select_of_no_rows_or_of_a_column_of_no_value_is_typed_by_its_question() {
+    // As PostgreSQL 18.6 took or refused each on 28818 (2026-10-31): an answer of no rows, or a
+    // column holding only NULLs, takes the type its question gives it.
+    let path = made(
+        "insert-select-untyped",
+        "CREATE TABLE s.nn (id integer PRIMARY KEY, a integer, c varchar(80), e numeric(6,2));
+         CREATE TABLE s.dom (id integer PRIMARY KEY, v integer, w integer);",
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(
+        &mut w,
+        "INSERT INTO s.nn (id, a, c, e) VALUES (1, 2, NULL, 1.5)",
+    );
+    let varchar = "column \"w\" is of type integer but expression is of type character varying";
+    for sql in [
+        "INSERT INTO s.dom (id, v, w) SELECT n.id, n.a, n.c FROM s.nn n",
+        "INSERT INTO s.dom (id, v, w) SELECT n.id + 10, n.a, n.c FROM s.nn n WHERE n.id = 999",
+    ] {
+        let e = w
+            .execute(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was taken"));
+        assert_eq!(e.to_string(), varchar, "{sql}");
+    }
+    for sql in [
+        "INSERT INTO s.dom (id, v, w) SELECT n.id + 10, n.a, n.a FROM s.nn n WHERE n.id = 999",
+        "INSERT INTO s.dom (id, v, w) SELECT n.id + 20, n.a, n.e FROM s.nn n WHERE n.id = 999",
+        "INSERT INTO s.dom (id, v) SELECT n.id + 30, NULL FROM s.nn n",
+        "INSERT INTO s.dom (id, v, w) SELECT n.id + 40, n.a, n.a FROM s.nn n WHERE n.c IS NULL",
+    ] {
+        run(&mut w, sql);
+    }
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    assert_eq!(
+        rows(&mut s, "SELECT d.id, d.v, d.w FROM s.dom d"),
+        [row(&["31", "NULL", "NULL"]), row(&["41", "2", "2"])]
+    );
+}
