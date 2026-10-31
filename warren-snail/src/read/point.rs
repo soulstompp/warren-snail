@@ -2,21 +2,20 @@
 //! only as the rescan begins: a scan inside another engine's nested loop, run once for each of its
 //! outer rows.
 
-use super::question::Side;
-use super::walk::condition_columns;
+use super::question::{Cond, Interval, Side, TextCond};
+use super::walk::{condition_columns, Want};
 use super::Snail;
 use crate::catalog::{Level, Order, Shape, Table};
-use crate::directory::{decode_page, read_map};
+use crate::directory::{decode_page, read_map, Entry};
+use crate::places::{column_byte_key, KeyValue};
 use crate::{Error, Result};
 use std::ops::Bound;
 
-/// One rescan of a question, priced from the directory where each of a set of columns takes one value
-/// the rescan is given: along the order whose leading levels those values fix further than the
-/// question's own conditions do, a directory page on each level from its top down to the order's
-/// middle block, that block's page map, and of each leaf the round reads there its dictionary and
-/// the data page holding the block's middle row, as the value of that row is read where its rows lie
-/// in one data page; and the top of every other order, each of which a round prices. Nothing is
-/// held between rescans, so every rescan reads them all again.
+/// One rescan of a question, where each of a set of columns takes one value the rescan is given:
+/// the round for a key the order those values fix holds, priced from the directory as every round
+/// is, every order that serves the question priced from its top, the one read walked down to its
+/// blocks and predicted from their page maps. The order read, and its directory and column pages.
+/// Nothing is held between rescans, so every rescan reads its pages again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Point {
@@ -56,12 +55,80 @@ fn fixed_levels(order: &Order, table: &Table, side: &Side, given: &[usize]) -> u
     order.levels.iter().take_while(|&&l| equal(l)).count()
 }
 
+/// The keys the question's own equalities give the first `own` levels of `order`, as the order keys
+/// them.
+fn own_keys(order: &Order, table: &Table, side: &Side, own: usize) -> Vec<KeyValue> {
+    order.levels[..own]
+        .iter()
+        .map(|&l| {
+            let c = l.column();
+            let column = &table.columns[c];
+            if matches!(l, Level::Column(_))
+                && (column.ty.keyed_by_text() || column.ty.keyed_by_bytes())
+            {
+                let t = side.texts.iter().find(|t| t.column == c).unwrap();
+                let Bound::Included(v) = &t.lo else {
+                    unreachable!()
+                };
+                return column_byte_key(column, v);
+            }
+            let shape = match l {
+                Level::Column(c) => Shape::Column(c),
+                Level::MonthUtc(c) => Shape::MonthUtc(c),
+            };
+            let v = side
+                .conds
+                .iter()
+                .find(|x| x.shape == shape && x.is_range() && x.kept.lo == x.kept.hi)
+                .unwrap()
+                .kept
+                .lo;
+            if column.ty.is_wide() {
+                KeyValue::Wide(v)
+            } else {
+                KeyValue::Int(v as i64)
+            }
+        })
+        .collect()
+}
+
+/// The question's own conditions with a column fixed to one key, as a literal there fixes it.
+fn fixing(side: &mut Side, column: usize, key: &KeyValue) -> bool {
+    side.conds.retain(|x| x.shape != Shape::Column(column));
+    side.texts.retain(|t| t.column != column);
+    match key {
+        KeyValue::Int(v) => side.conds.push(Cond::new(
+            Shape::Column(column),
+            Interval::at(i128::from(*v)),
+        )),
+        KeyValue::Wide(v) => side
+            .conds
+            .push(Cond::new(Shape::Column(column), Interval::at(*v))),
+        KeyValue::Text(_) | KeyValue::Bytes(_) => {
+            let bytes = match key {
+                KeyValue::Text(s) => s.as_bytes().to_vec(),
+                KeyValue::Bytes(b) => b.to_vec(),
+                _ => unreachable!(),
+            };
+            side.texts.push(TextCond {
+                column,
+                lo: Bound::Included(bytes.clone()),
+                hi: Bound::Included(bytes),
+                except: Vec::new(),
+            })
+        }
+        KeyValue::Null { .. } => return false,
+    }
+    true
+}
+
 impl Snail {
     /// A question on one table priced as one rescan in which each column `given` names takes one
-    /// value, on the root the snail last read: along the order the values fix, a point read, priced
-    /// from the directory and the page map of the order's middle block. None where the values fix
-    /// no level of any order beyond the question's own conditions, or the table holds no row: each
-    /// rescan then reads what the question alone reads.
+    /// value, on the root the snail last read: along the order the values fix furthest, the round
+    /// for a key that order holds, from the directory alone. The key is the first of a data page in
+    /// the order's middle block among those holding the question's own values. None where the values
+    /// fix no level of any order beyond the question's own conditions, or no block holds the
+    /// question's own values: each rescan then reads what the question alone reads, or nothing.
     pub fn price_point(&self, sql: &str, given: &[&str]) -> Result<Option<Point>> {
         let q = self.one_table(sql)?;
         let (want, _) = self.want_of(&q);
@@ -88,85 +155,77 @@ impl Snail {
                 table.name
             )));
         }
-        let tops: Vec<u64> = served
+        // The order the values fix furthest, the fewest levels its own conditions fix first.
+        let fixed = served
             .iter()
-            .map(|&o| self.top_pages(table, o))
-            .collect::<Result<_>>()?;
-        let mut best: Option<Point> = None;
-        for (i, &o) in served.iter().enumerate() {
-            let order = &table.orders[o];
-            let levels = fixed_levels(order, table, want.side, &given);
-            if levels <= fixed_levels(order, table, want.side, &[]) {
-                continue;
-            }
-            let (head, mut entries, _) = self.top(table, o)?;
-            let mut directory_pages = tops[i];
-            for _ in 1..head.height {
-                let Some(middle) = entries.get(entries.len() / 2) else {
-                    break;
-                };
-                directory_pages += middle.child.pages();
-                entries = decode_page(&self.reader.read_extent(middle.child)?, &head)?;
-            }
-            let Some(block) = entries.get(entries.len() / 2) else {
-                continue;
+            .map(|&o| {
+                let order = &table.orders[o];
+                let own = fixed_levels(order, table, want.side, &[]);
+                (o, own, fixed_levels(order, table, want.side, &given))
+            })
+            .filter(|&(_, own, levels)| levels > own)
+            .max_by_key(|&(o, own, levels)| (levels - own, std::cmp::Reverse(o)));
+        let Some((o, own, levels)) = fixed else {
+            return Ok(None);
+        };
+        let order = &table.orders[o];
+        let keys = own_keys(order, table, want.side, own);
+        let holds = |e: &Entry| e.first[..own] <= keys[..] && keys[..] <= e.last[..own];
+        // Down the order to its middle block among those holding the question's own values.
+        let (head, mut entries, _) = self.top(table, o)?;
+        for _ in 1..head.height {
+            let held: Vec<&Entry> = entries.iter().filter(|e| holds(e)).collect();
+            let Some(middle) = held.get(held.len() / 2) else {
+                return Ok(None);
             };
-            let map = read_map(&self.reader, block, &head.level_text)?;
-            directory_pages += block.map_run().0.pages();
-            // A column read is each of its leaves read: those the answer takes, those the conditions
-            // test, and the levels the values fix, which a block read in part is searched on. Each
-            // is read in the data page holding the block's middle row, its dictionary beside it.
-            let mut columns = read.clone();
-            columns.extend(order.levels[..levels].iter().map(|l| l.column()));
-            let middle = map.sorted / 2;
-            let column_pages = order
-                .leaves(table)
-                .iter()
-                .enumerate()
-                .filter(|(_, (c, _))| columns.contains(c))
-                .map(|(s, _)| {
-                    let cp = &map.columns[s];
-                    cp.dictionary.map_or(0, |d| d.pages())
-                        + cp.pages
-                            .iter()
-                            .find(|p| p.first_row <= middle && middle < p.first_row + p.rows)
-                            .map_or(0, |p| p.at.pages())
-                })
-                .sum();
-            directory_pages += tops
-                .iter()
-                .enumerate()
-                .filter(|&(j, _)| j != i)
-                .map(|(_, p)| p)
-                .sum::<u64>();
-            let point = Point {
-                order: order.name.clone(),
-                levels,
-                unique: order.unique && levels == order.levels.len(),
-                directory_pages,
-                column_pages,
-            };
-            let pages = |p: &Point| p.directory_pages + p.column_pages;
-            if best.as_ref().is_none_or(|b| pages(&point) < pages(b)) {
-                best = Some(point);
+            entries = decode_page(&self.reader.read_extent(middle.child)?, &head)?;
+        }
+        let held: Vec<&Entry> = entries.iter().filter(|e| holds(e)).collect();
+        let Some(block) = held.get(held.len() / 2) else {
+            return Ok(None);
+        };
+        let map = read_map(&self.reader, block, &head.level_text)?;
+        // The key: the first of a data page beginning on the question's own values, the middle of
+        // them; where none begins on them, their values with the rest of the page they begin in,
+        // which lies in that page's range as every key on them does.
+        let firsts: Vec<&Vec<KeyValue>> = std::iter::once(&block.first)
+            .chain(
+                map.columns
+                    .first()
+                    .into_iter()
+                    .flat_map(|c| c.pages.iter().map(|p| &p.first)),
+            )
+            .filter(|k| k.len() >= levels)
+            .collect();
+        let on: Vec<&&Vec<KeyValue>> = firsts.iter().filter(|k| k[..own] == keys[..]).collect();
+        let rest = match on.get(on.len() / 2) {
+            Some(k) => &k[own..levels],
+            None => match firsts.iter().rev().find(|k| k[..own] < keys[..]) {
+                Some(k) => &k[own..levels],
+                None => return Ok(None),
+            },
+        };
+        let mut side = want.side.clone();
+        for (l, k) in order.levels[own..levels].iter().zip(rest) {
+            if !fixing(&mut side, l.column(), k) {
+                return Ok(None);
             }
         }
-        Ok(best)
-    }
-
-    /// The pages an order's top lies in, as the root names it.
-    fn top_pages(&self, table: &Table, order: usize) -> Result<u64> {
-        let name = &table.orders[order].name;
-        self.root
-            .orders
-            .iter()
-            .find(|(t, o, _)| *t == table.name && o == name)
-            .map(|(_, _, e)| e.pages())
-            .ok_or_else(|| {
-                Error::new(format!(
-                    "{}: the root names no directory for {name}",
-                    table.name
-                ))
-            })
+        let point = Want {
+            table,
+            side: &side,
+            columns: want.columns.clone(),
+            countable: want.countable,
+            keys: None,
+        };
+        let before = self.touched();
+        let part = self.part(&point, None)?;
+        Ok(Some(Point {
+            order: table.orders[part.plan.walk.order].name.clone(),
+            levels,
+            unique: order.unique && levels == order.levels.len(),
+            directory_pages: self.touched() - before,
+            column_pages: part.plan.column_pages,
+        }))
     }
 }

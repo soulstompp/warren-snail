@@ -112,20 +112,19 @@ fn a_value_that_fixes_no_further_level_prices_no_point() {
         ("readings_pkey", 1, true)
     );
     // A network fixed by the question: its station's value fixes the second level; the network's
-    // value fixes nothing the question does not.
-    let p = point(
-        "SELECT s.name FROM weather.stations s WHERE s.network_id = 7",
-        &["station_no"],
-    )
-    .unwrap();
+    // value fixes nothing the question does not. A network no station holds is in no block.
+    let network = stations_of(&s)[stations_of(&s).len() / 3].0;
+    let fixed = format!("SELECT s.name FROM weather.stations s WHERE s.network_id = {network}");
+    let p = point(&fixed, &["station_no"]).unwrap();
     assert_eq!(
         (p.order.as_str(), p.levels, p.unique),
         ("stations_pkey", 2, true)
     );
+    assert_eq!(point(&fixed, &["network_id"]), None);
     assert_eq!(
         point(
-            "SELECT s.name FROM weather.stations s WHERE s.network_id = 7",
-            &["network_id"]
+            "SELECT s.name FROM weather.stations s WHERE s.network_id = 0",
+            &["station_no"]
         ),
         None
     );
