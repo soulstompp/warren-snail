@@ -521,6 +521,8 @@ fn a_snapshot_is_its_xmin_its_xmax_and_its_transactions_compared_by_nothing() {
         "SELECT id FROM s.t ORDER BY w",
         "SELECT min(v) FROM s.t",
         "WITH t AS (SELECT id, v FROM s.t) SELECT id, CAST(v AS txid_snapshot) AS x FROM t",
+        // Nor a join's family.
+        "SELECT a.id FROM s.t AS a JOIN s.t AS b ON a.v = b.v",
     ] {
         assert!(snail.ask(q, None).is_err(), "{q}");
     }
