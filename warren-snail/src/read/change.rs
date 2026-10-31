@@ -1344,12 +1344,13 @@ impl Snail {
 
     /// The commit, at the root's turn: it begins from the newest root.
     fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
-        // A sequence's advance lands at once; a transaction's root carries its host's tag.
+        // A transaction's root carries its host's tag; a sequence's advance lands at once.
         let advance = self.advancing.is_some();
         let mut root = self.commit_pages(w, &[])?;
-        if !advance {
-            root.host = w.host_tag();
-        }
+        root.host = match w.host_tag() {
+            Some(_) if advance => Some(crate::carry::AT_ONCE),
+            tag => tag,
+        };
         // The root goes into the copy that does not hold the root it begins from.
         w.commit_into(&mut root, 1 - self.reader.root_copy())?;
         Ok(root)
@@ -1368,11 +1369,22 @@ impl Snail {
                 p.decider, p.at
             )));
         }
-        if let Some(tag) = self.reader.waiting_on().filter(|_| !self.reader.judged()) {
-            return Err(Error::new(format!(
-                "this snail's newest root waits on its host's word on its transaction {tag}: \
-                 write it through its host"
-            )));
+        // A snail written through a host is written only through it; and a host's transaction
+        // commits it once, besides the advances of its sequences.
+        if !self.reader.judged() && (root.host.is_some() || self.reader.waiting_on().is_some()) {
+            return Err(Error::new(
+                "this snail is written through its host, which decides which of its roots is \
+                 taken: write it through its host",
+            ));
+        }
+        if let Some(t) = w.host_tag().filter(|&t| t != crate::carry::AT_ONCE) {
+            let lies = root.host == Some(t) || self.reader.waiting_on() == Some(t);
+            if lies && self.advancing.is_none() {
+                return Err(Error::new(format!(
+                    "the host's transaction {t} commits this snail once, and its commit lies on \
+                     the root already"
+                )));
+            }
         }
         root.host = None;
         w.begin_commit(&root);

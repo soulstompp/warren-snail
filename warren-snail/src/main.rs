@@ -26,6 +26,7 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
                           [--release <14..19>] [--lc-monetary <locale>]
                           [--written <written.parquet>]
        warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
+                         [--host <command> --host-server <name>]
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
                          [--param <value>]... [--rounds <n>] [--hold <MiB>]
                          [--round <round.parquet>] [--text] [--with <file>]...
@@ -55,6 +56,12 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           and reused. Each --with opens one more snail with <file>, as one writer of them all: a
           statement writes the snail that holds its table, and a transaction's COMMIT commits
           every snail it wrote, one root deciding.
+          A snail PostgreSQL writes through its WAL is written only through PostgreSQL, its host:
+          --host names the command that carries each commit to it, psql for one, read a
+          statement at a time; the statements run as one transaction of the host's, under the
+          writers' lock PostgreSQL's writers take, the server warren_snail_pg names the snail
+          by --host-server deciding which of its roots is taken, logging the commit and writing
+          its root.
   read    the question's answer, as Parquet. Prints each round: the order it read along, and the
           pages it predicted and read. --order names the order to read along; each --param gives
           the next of $1, $2 and on, as text. --rounds asks it again on the one open snail, which
@@ -213,6 +220,220 @@ fn cmd_hold(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The line the host's command prints after each statement it is handed has run.
+const MARK: &str = "--warren-snail-ran--";
+
+/// The command that carries each commit of a snail written through its host: a process reading
+/// statements as they come, PostgreSQL's psql for one, its output read back up to a mark after each.
+struct Carrier {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// The bytes handed it, which the command writes beside the snail's pages.
+    written: u64,
+}
+
+impl Carrier {
+    fn start(command: &str) -> Result<Carrier> {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::new(format!("{command}: {e}")))?;
+        let stdin = child.stdin.take();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        Ok(Carrier {
+            child,
+            stdin,
+            stdout,
+            written: 0,
+        })
+    }
+
+    /// One statement run by the host, and the lines it printed; refused where the command ends
+    /// before the statement has run, as one that fails does.
+    fn run(&mut self, sql: &str) -> Result<Vec<String>> {
+        use std::io::{BufRead, Write};
+        let text = format!("{sql};\n\\echo {MARK}\n");
+        let ended = |e: std::io::Error| {
+            let shown: String = sql.chars().take(200).collect();
+            Error::new(format!("the host ended before it ran {shown}: {e}"))
+        };
+        let stdin = self.stdin.as_mut().expect("the host's input is open");
+        stdin
+            .write_all(text.as_bytes())
+            .and_then(|_| stdin.flush())
+            .map_err(ended)?;
+        self.written += text.len() as u64;
+        let mut out = Vec::new();
+        loop {
+            let mut line = String::new();
+            if self.stdout.read_line(&mut line).map_err(ended)? == 0 {
+                return Err(ended(std::io::Error::other("its output ended")));
+            }
+            let line = line.trim_end_matches('\n');
+            if line == MARK {
+                return Ok(out);
+            }
+            out.push(line.to_string());
+        }
+    }
+
+    /// The last line a statement printed.
+    fn one(&mut self, sql: &str) -> Result<String> {
+        Ok(self.run(sql)?.pop().unwrap_or_default())
+    }
+
+    /// The host's input closed, and the command ended, refused where it failed.
+    fn finish(mut self) -> Result<()> {
+        drop(self.stdin.take());
+        let status = self.child.wait()?;
+        if !status.success() {
+            return Err(Error::new(format!(
+                "the host's command ended with {status}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Carrier {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+/// A literal of the host's SQL.
+fn literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The host that carries each commit to the server and writes its root there: logged in the
+/// server's WAL, the root tagged with the server's transaction.
+struct Hosted {
+    carrier: Arc<std::sync::Mutex<Carrier>>,
+    server: String,
+    tag: u64,
+}
+
+impl warren_snail::carry::Host for Hosted {
+    fn carry(&mut self, commit: &warren_snail::carry::Commit) -> Result<()> {
+        let bytes = commit.encode();
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        let sql = format!(
+            "SELECT warren_snail_commit({}, decode('{hex}', 'hex'))",
+            literal(&self.server)
+        );
+        self.carrier.lock().unwrap().run(&sql).map(|_| ())
+    }
+
+    fn tag(&self) -> Option<u64> {
+        Some(self.tag)
+    }
+
+    fn keeps_root(&self) -> bool {
+        true
+    }
+}
+
+/// The judge the server is: whether the transaction a root's tag names committed.
+struct Asked(Arc<std::sync::Mutex<Carrier>>);
+
+impl warren_snail::carry::Judge for Asked {
+    fn taken(&self, tag: u64) -> Result<bool> {
+        let said = self
+            .0
+            .lock()
+            .unwrap()
+            .one(&format!("SELECT warren_snail_taken({tag})"))?;
+        Ok(said == "t")
+    }
+}
+
+/// The statements run as one transaction of the host's, on a snail its host writes: the host's
+/// command takes the writers' lock in a transaction of its own, the snail asks it which of its roots
+/// are taken, and its one commit is handed to it, the host writing the root; then the host's
+/// transaction commits. Each statement's account, the commit's last.
+fn exec_hosted(
+    file: &str,
+    statements: &[String],
+    command: &str,
+    server: &str,
+) -> Result<Vec<(warren_snail::read::Done, u64)>> {
+    for (i, st) in statements.iter().enumerate() {
+        let word = st
+            .trim_start()
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if [
+            "BEGIN",
+            "START",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "ABORT",
+            "SAVEPOINT",
+            "RELEASE",
+        ]
+        .contains(&word.as_str())
+        {
+            return Err(Error::new(format!(
+                "statement {}: under --host the statements run as one transaction of the host's: \
+                 {word} is refused",
+                i + 1
+            )));
+        }
+    }
+    let path = std::fs::canonicalize(file).map_err(|e| Error::new(format!("{file}: {e}")))?;
+    let carrier = Arc::new(std::sync::Mutex::new(Carrier::start(command)?));
+    carrier.lock().unwrap().run("BEGIN")?;
+    let tag: u64 = carrier
+        .lock()
+        .unwrap()
+        .one(&format!(
+            "SELECT warren_snail_writer({}, {})",
+            literal(server),
+            literal(&path.to_string_lossy())
+        ))?
+        .parse()
+        .map_err(|_| Error::new("the host gave no transaction's tag"))?;
+    let host = Hosted {
+        carrier: carrier.clone(),
+        server: server.to_string(),
+        tag,
+    };
+    let judge = std::rc::Rc::new(Asked(carrier.clone()));
+    let mut snail = Snail::open_carried(Path::new(file), Box::new(host), judge)?;
+    let handed = || carrier.lock().unwrap().written;
+    let mut done = Vec::with_capacity(statements.len() + 1);
+    snail.execute("BEGIN")?;
+    let all = statements.iter().map(String::as_str).chain(["COMMIT"]);
+    for (i, st) in all.enumerate() {
+        let (before, carried) = (wchar(), handed());
+        let d = snail
+            .execute(st)
+            .map_err(|e| Error::new(format!("statement {}: {e}", i + 1)))?;
+        done.push((d, wchar() - before - (handed() - carried)));
+    }
+    drop(snail);
+    carrier.lock().unwrap().run("COMMIT")?;
+    let carrier = Arc::try_unwrap(carrier)
+        .ok()
+        .expect("the snail let go of its host")
+        .into_inner()
+        .unwrap();
+    carrier.finish()?;
+    Ok(done)
+}
+
 fn cmd_exec(args: &[String]) -> Result<()> {
     let file = args.first().ok_or_else(|| Error::new(USAGE))?;
     let sql = args.get(1).ok_or_else(|| Error::new(USAGE))?;
@@ -221,25 +442,39 @@ fn cmd_exec(args: &[String]) -> Result<()> {
     // Each statement as written: the snail reads itself what sqlparser does not.
     let statements = warren_snail::read::statement::split(&text)?;
     let others = withs(args);
-    let mut opened = if others.is_empty() {
-        Opened::One(Snail::open_writing(Path::new(file))?)
-    } else {
-        let paths: Vec<&Path> = std::iter::once(file.as_str())
-            .chain(others)
-            .map(Path::new)
-            .collect();
-        Opened::Several(Snails::open_writing(&paths)?)
-    };
-    let mut done = Vec::with_capacity(statements.len());
-    for (i, st) in statements.iter().enumerate() {
-        let before = wchar();
-        let d = match &mut opened {
-            Opened::One(s) => s.execute(st),
-            Opened::Several(s) => s.execute(st),
+    let done = match flag(args, "--host") {
+        Some(command) => {
+            let server = flag(args, "--host-server").ok_or_else(|| {
+                Error::new("--host takes --host-server, the host's name for the snail")
+            })?;
+            if !others.is_empty() {
+                return Err(Error::new("--host writes one snail: --with is refused"));
+            }
+            exec_hosted(file, &statements, command, server)?
         }
-        .map_err(|e| Error::new(format!("statement {}: {e}", i + 1)))?;
-        done.push((d, wchar() - before));
-    }
+        None => {
+            let mut opened = if others.is_empty() {
+                Opened::One(Snail::open_writing(Path::new(file))?)
+            } else {
+                let paths: Vec<&Path> = std::iter::once(file.as_str())
+                    .chain(others)
+                    .map(Path::new)
+                    .collect();
+                Opened::Several(Snails::open_writing(&paths)?)
+            };
+            let mut done = Vec::with_capacity(statements.len());
+            for (i, st) in statements.iter().enumerate() {
+                let before = wchar();
+                let d = match &mut opened {
+                    Opened::One(s) => s.execute(st),
+                    Opened::Several(s) => s.execute(st),
+                }
+                .map_err(|e| Error::new(format!("statement {}: {e}", i + 1)))?;
+                done.push((d, wchar() - before));
+            }
+            done
+        }
+    };
     let system_agrees: Vec<bool> = done
         .iter()
         .map(|(d, bytes)| d.pages_written * PAGE as u64 == *bytes)

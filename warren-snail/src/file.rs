@@ -1309,7 +1309,7 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
             continue;
         };
         settled[c] = match r.host {
-            None => true,
+            None | Some(crate::carry::AT_ONCE) => true,
             Some(tag) => {
                 decoded[1 - c]
                     .as_ref()
@@ -1624,6 +1624,9 @@ impl Writer {
                 &bytes,
                 root.span,
             ))?;
+            if host.keeps_root() {
+                return Ok(());
+            }
         }
         match self.stop {
             Some(Stop::BeforeRoot) => return Err(Error::new("the commit stopped before the root")),

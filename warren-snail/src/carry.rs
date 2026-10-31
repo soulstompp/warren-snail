@@ -46,11 +46,22 @@ pub trait Host: Send {
 
     /// The tag of the host's transaction a transaction's root is written for, where the host
     /// decides whether it is taken: the root carries it, and is taken only where the host's judge
-    /// says that transaction committed. A sequence's advance lands at once, its root untagged.
+    /// says that transaction committed. A host's transaction commits a snail once. A sequence's
+    /// advance lands at once, its root tagged `AT_ONCE`.
     fn tag(&self) -> Option<u64> {
         None
     }
+
+    /// Whether the host keeps the root: it writes the commit's root itself, at its own word, before
+    /// `carry` returns, and the writer writes none.
+    fn keeps_root(&self) -> bool {
+        false
+    }
 }
+
+/// The tag of a root a host's writer wrote that lands at once, a sequence's advance: taken without
+/// asking, and marking the snail as one written through its host.
+pub const AT_ONCE: u64 = 0;
 
 /// What tells a round whether a root its host tagged is taken: whether the host's transaction the
 /// tag names committed, as the round asking sees it. An error refuses the round.
@@ -302,6 +313,16 @@ pub fn replay(
     let replayed = replayed?;
     given?;
     Ok(replayed)
+}
+
+/// `replay`, by a host that keeps the root, for a commit whose writer holds the root's turn while
+/// its host writes the root: the turn is not taken again.
+pub fn replay_held(
+    path: &Path,
+    commit: &Commit,
+    waiting: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<Replayed> {
+    replay_at_turn(&Files::open(path, true, false)?, commit, waiting)
 }
 
 fn replay_at_turn(

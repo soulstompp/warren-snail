@@ -150,7 +150,7 @@ const SEQUENCED: &str = "CREATE SEQUENCE shop.ids;\n\
      PRIMARY KEY (id));";
 
 #[test]
-fn a_sequences_advance_inside_a_host_lands_at_once_untagged() {
+fn a_sequences_advance_inside_a_host_lands_at_once() {
     let path = tmp("hosted-sequence.snail");
     let catalog = Catalog::parse(SEQUENCED).unwrap();
     write(&path, &catalog, &[]).unwrap();
@@ -161,7 +161,7 @@ fn a_sequences_advance_inside_a_host_lands_at_once_untagged() {
     drop(w);
     let carried = log.lock().unwrap().clone();
     let kinds: Vec<(u64, Option<u64>)> = carried.iter().map(|c| (c.generation, c.host())).collect();
-    assert_eq!(kinds, [(g + 1, None), (g + 2, Some(7))]);
+    assert_eq!(kinds, [(g + 1, Some(carry::AT_ONCE)), (g + 2, Some(7))]);
     // Transaction 7 never committed: its row is not there, the sequence's advance is.
     let s = Snail::open(&path).unwrap();
     assert_eq!(s.generation(), g + 1);
@@ -183,20 +183,102 @@ fn a_sequences_advance_inside_a_host_lands_at_once_untagged() {
 
 #[test]
 #[cfg(feature = "standalone")]
-fn a_writer_with_no_host_to_ask_refuses_a_snail_whose_newest_root_waits_on_its_host() {
+fn a_writer_with_no_host_to_ask_refuses_a_snail_written_through_a_host() {
     let s = sample(2_000);
     let path = snail("hosted-unjudged", &s);
     let said = Said::default();
     let (mut w, _) = hosted(&path, 7, &said);
     w.execute(&station(1, "Sagres 1")).unwrap();
     drop(w);
-    let mut plain = Snail::open_writing(&path).unwrap();
-    let e = plain.execute(&station(2, "Sagres 2")).unwrap_err();
-    assert!(
-        e.to_string()
-            .contains("waits on its host's word on its transaction 7"),
-        "{e}"
-    );
+    let refused = |path: &Path| {
+        let mut plain = Snail::open_writing(path).unwrap();
+        let e = plain.execute(&station(2, "Sagres 2")).unwrap_err();
+        assert!(e.to_string().contains("write it through its host"), "{e}");
+    };
+    // Its newest root waits on its host's word.
+    refused(&path);
+    // Taken, and with a root of the next generation beside it, its host's still.
+    said.committed(7);
+    let (mut w, _) = hosted(&path, 8, &said);
+    w.execute(&station(3, "Sagres 3")).unwrap();
+    drop(w);
+    said.committed(8);
+    refused(&path);
+    // A sequence's advance marks it so too.
+    let sequenced = tmp("hosted-unjudged-sequence.snail");
+    write(&sequenced, &Catalog::parse(SEQUENCED).unwrap(), &[]).unwrap();
+    let (mut w, _) = hosted(&sequenced, 9, &said);
+    w.execute("INSERT INTO shop.orders (v) VALUES (1)").unwrap();
+    drop(w);
+    let mut plain = Snail::open_writing(&sequenced).unwrap();
+    let e = plain
+        .execute("INSERT INTO shop.orders (id, v) VALUES (5, 1)")
+        .unwrap_err();
+    assert!(e.to_string().contains("write it through its host"), "{e}");
+}
+
+#[test]
+fn a_hosts_transaction_commits_a_snail_once() {
+    let s = sample(2_000);
+    let path = snail("hosted-once", &s);
+    let said = Said::default();
+    let (mut w, log) = hosted(&path, 7, &said);
+    w.execute(&station(1, "Sagres 1")).unwrap();
+    let e = w.execute(&station(2, "Sagres 2")).unwrap_err();
+    assert!(e.to_string().contains("commits this snail once"), "{e}");
+    drop(w);
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
+/// A host that keeps the root: it lands each commit itself, root and all, on the file, as a server
+/// lands an outside writer's.
+struct Keeping {
+    tag: u64,
+    path: PathBuf,
+    log: Arc<Mutex<Vec<Commit>>>,
+}
+
+impl Host for Keeping {
+    fn carry(&mut self, commit: &Commit) -> warren_snail::Result<()> {
+        assert_eq!(
+            carry::replay_held(&self.path, commit, &mut |_| Ok(()))?,
+            Replayed::Landed
+        );
+        self.log.lock().unwrap().push(commit.clone());
+        Ok(())
+    }
+
+    fn tag(&self) -> Option<u64> {
+        Some(self.tag)
+    }
+
+    fn keeps_root(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_host_that_keeps_the_root_writes_it_at_its_word_and_the_writer_writes_none() {
+    let s = sample(2_000);
+    let path = snail("hosted-kept", &s);
+    let g = Snail::open(&path).unwrap().generation();
+    let said = Said::default();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let host = Keeping {
+        tag: 7,
+        path: path.clone(),
+        log: log.clone(),
+    };
+    let mut w = Snail::open_carried(&path, Box::new(host), Rc::new(said.clone())).unwrap();
+    let done = w.execute(&station(1, "Sagres 1")).unwrap();
+    drop(w);
+    let c = log.lock().unwrap()[0].clone();
+    assert_eq!(done.pages_written, c.pages.len() as u64);
+    let both = std::fs::read(&path).unwrap();
+    let copy = (c.generation % 2) as usize * 4096;
+    assert_eq!(&both[copy..copy + c.root.len()], &c.root[..]);
+    said.committed(7);
+    assert_eq!(read_as(&path, Some(&said), "Sagres 1"), (g + 1, 1));
 }
 
 /// A log of commits made inside a host on a copy of `base`: a station, then each statement on its
