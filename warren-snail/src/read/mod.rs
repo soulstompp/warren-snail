@@ -7,6 +7,7 @@
 mod across;
 mod aggregates;
 mod answer;
+mod arrays;
 mod calls;
 mod change;
 mod clock;
@@ -14,14 +15,19 @@ pub(crate) mod fill;
 pub(crate) mod foreign;
 mod hash;
 mod join;
+mod json;
 mod level;
 mod out;
 pub(crate) mod partial;
 mod pipeline;
 mod point;
 mod question;
+mod ranges;
+mod rest;
+mod sets;
 pub mod statement;
 mod together;
+mod tsearch;
 mod typed;
 mod walk;
 

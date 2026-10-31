@@ -12,6 +12,19 @@ use crate::places::varying_part;
 use crate::{Error, Result};
 use std::cmp::Ordering;
 
+mod config;
+mod funcs;
+mod headline;
+mod parser;
+mod snowball;
+
+pub use config::{
+    phraseto_tsquery, plainto_tsquery, to_tsquery, to_tsvector, ts_debug, ts_lexize, ts_parse,
+    ts_token_type, websearch_to_tsquery, Debugged,
+};
+pub use funcs::*;
+pub use headline::ts_headline;
+
 /// The most bytes a lexeme holds: MAXSTRLEN.
 const LEXEME_MAX: usize = (1 << 11) - 1;
 
@@ -226,7 +239,13 @@ fn position(b: &[u8]) -> u16 {
 
 /// The next lexeme of `s` from byte `i`, as `gettoken_tsvector` (tsvector_parser.c) reads one for
 /// a tsvector, or for a tsquery where `query`: none at the end of `s`.
-fn token(s: &str, mut i: usize, query: bool) -> Result<Option<Token>> {
+fn token(s: &str, i: usize, query: bool) -> Result<Option<Token>> {
+    token_as(s, i, query, false)
+}
+
+/// The next lexeme as `token` reads it, or where `web` as `websearch_to_tsquery` has it read: `'`
+/// and `\` as any other character, and `"` ending it.
+fn token_as(s: &str, mut i: usize, query: bool, web: bool) -> Result<Option<Token>> {
     #[derive(Clone, Copy)]
     enum State {
         Word,
@@ -261,12 +280,12 @@ fn token(s: &str, mut i: usize, query: bool) -> Result<Option<Token>> {
             State::Word => {
                 if c == 0 {
                     return Ok(None);
-                } else if c == b'\'' {
+                } else if !web && c == b'\'' {
                     state = State::EndComplex;
-                } else if c == b'\\' {
+                } else if !web && c == b'\\' {
                     state = State::NextChar;
                     back = State::EndWord;
-                } else if query && is_operator(c) {
+                } else if (query && is_operator(c)) || (web && c == b'"') {
                     return Err(syntax());
                 } else if !is_space(c) {
                     copy(&mut word);
@@ -283,10 +302,10 @@ fn token(s: &str, mut i: usize, query: bool) -> Result<Option<Token>> {
                 state = back;
             }
             State::EndWord => {
-                if c == b'\\' {
+                if !web && c == b'\\' {
                     state = State::NextChar;
                     back = State::EndWord;
-                } else if is_space(c) || c == 0 || (query && is_operator(c)) {
+                } else if is_space(c) || c == 0 || (query && is_operator(c)) || (web && c == b'"') {
                     if word.is_empty() {
                         return Err(syntax());
                     }
@@ -1436,21 +1455,21 @@ fn phrase_output(
     }
 }
 
+/// How a tsquery's operand is checked, by its item's index: whether it is found, where it was put
+/// in `data` where asked for.
+type Condition<'a> = dyn Fn(usize, Option<&mut Found>) -> Ternary + Sync + 'a;
+
 /// A tsquery's items from `i` matched at or below a phrase operator, where they matched put in
 /// `data` where asked for: `TS_phrase_execute` (tsvector_op.c).
-fn phrase_execute(items: &[Item], i: usize, vector: &[Entry], data: Option<&mut Found>) -> Ternary {
+fn phrase_execute(items: &[Item], i: usize, cond: &Condition, data: Option<&mut Found>) -> Ternary {
     let (op, distance, left) = match &items[i] {
-        Item::Val {
-            word,
-            weight,
-            prefix,
-        } => return check_condition(vector, word, *weight, *prefix, data),
+        Item::Val { .. } => return cond(i, data),
         Item::Opr { op, distance, left } => (*op, *distance as i32, *left),
     };
     match op {
         Op::Not => {
             let d = data.expect("a NOT under a phrase is asked where it matched");
-            match phrase_execute(items, i + 1, vector, Some(&mut *d)) {
+            match phrase_execute(items, i + 1, cond, Some(&mut *d)) {
                 Ternary::No => {
                     d.negate = true;
                     Ternary::Yes
@@ -1470,11 +1489,11 @@ fn phrase_execute(items: &[Item], i: usize, vector: &[Entry], data: Option<&mut 
         Op::Phrase | Op::And => {
             let mut l = Found::default();
             let mut r = Found::default();
-            let lmatch = phrase_execute(items, i + left, vector, Some(&mut l));
+            let lmatch = phrase_execute(items, i + left, cond, Some(&mut l));
             if lmatch == Ternary::No {
                 return Ternary::No;
             }
-            let rmatch = phrase_execute(items, i + 1, vector, Some(&mut r));
+            let rmatch = phrase_execute(items, i + 1, cond, Some(&mut r));
             if rmatch == Ternary::No {
                 return Ternary::No;
             }
@@ -1519,8 +1538,8 @@ fn phrase_execute(items: &[Item], i: usize, vector: &[Entry], data: Option<&mut 
             let d = data.expect("an OR under a phrase is asked where it matched");
             let mut l = Found::default();
             let mut r = Found::default();
-            let lmatch = phrase_execute(items, i + left, vector, Some(&mut l));
-            let rmatch = phrase_execute(items, i + 1, vector, Some(&mut r));
+            let lmatch = phrase_execute(items, i + left, cond, Some(&mut l));
+            let rmatch = phrase_execute(items, i + 1, cond, Some(&mut r));
             if lmatch == Ternary::No && rmatch == Ternary::No {
                 return Ternary::No;
             }
@@ -1557,44 +1576,40 @@ fn phrase_execute(items: &[Item], i: usize, vector: &[Entry], data: Option<&mut 
 
 /// A tsquery's items from `i` matched above any phrase operator: `TS_execute_recurse`
 /// (tsvector_op.c) without its flags.
-fn execute(items: &[Item], i: usize, vector: &[Entry]) -> Ternary {
+fn execute(items: &[Item], i: usize, cond: &Condition) -> Ternary {
     let (op, left) = match &items[i] {
-        Item::Val {
-            word,
-            weight,
-            prefix,
-        } => return check_condition(vector, word, *weight, *prefix, None),
+        Item::Val { .. } => return cond(i, None),
         Item::Opr { op, left, .. } => (*op, *left),
     };
     match op {
-        Op::Not => match execute(items, i + 1, vector) {
+        Op::Not => match execute(items, i + 1, cond) {
             Ternary::No => Ternary::Yes,
             Ternary::Yes => Ternary::No,
             Ternary::Maybe => Ternary::Maybe,
         },
         Op::And => {
-            let lmatch = execute(items, i + left, vector);
+            let lmatch = execute(items, i + left, cond);
             if lmatch == Ternary::No {
                 return Ternary::No;
             }
-            match execute(items, i + 1, vector) {
+            match execute(items, i + 1, cond) {
                 Ternary::No => Ternary::No,
                 Ternary::Yes => lmatch,
                 Ternary::Maybe => Ternary::Maybe,
             }
         }
         Op::Or => {
-            let lmatch = execute(items, i + left, vector);
+            let lmatch = execute(items, i + left, cond);
             if lmatch == Ternary::Yes {
                 return Ternary::Yes;
             }
-            match execute(items, i + 1, vector) {
+            match execute(items, i + 1, cond) {
                 Ternary::No => lmatch,
                 Ternary::Yes => Ternary::Yes,
                 Ternary::Maybe => Ternary::Maybe,
             }
         }
-        Op::Phrase => match phrase_execute(items, i, vector, None) {
+        Op::Phrase => match phrase_execute(items, i, cond, None) {
             Ternary::Yes => Ternary::Yes,
             Ternary::No | Ternary::Maybe => Ternary::No,
         },
@@ -1638,17 +1653,30 @@ pub fn ts_match(vector: &str, query: &str) -> bool {
     if items.is_empty() {
         return false;
     }
-    let deep = depth(&items);
+    let cond = |k: usize, data: Option<&mut Found>| match &items[k] {
+        Item::Val {
+            word,
+            weight,
+            prefix,
+        } => check_condition(&vector, word, *weight, *prefix, data),
+        Item::Opr { .. } => Ternary::No,
+    };
+    on_stack(depth(&items), || execute(&items, 0, &cond) != Ternary::No)
+}
+
+/// `f` run on the caller's stack where a tsquery nests at most SHALLOW deep, else on a thread of
+/// its own with a stack to fit `deep`.
+fn on_stack<T: Send>(deep: usize, f: impl FnOnce() -> T + Send) -> T {
     if deep <= SHALLOW {
-        return execute(&items, 0, &vector) != Ternary::No;
+        return f();
     }
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size((1 << 20) + deep * 4096)
-            .spawn_scoped(s, || execute(&items, 0, &vector) != Ternary::No)
-            .expect("a thread to match a deep tsquery on")
+            .spawn_scoped(s, f)
+            .expect("a thread to walk a deep tsquery on")
             .join()
-            .expect("a match of a deep tsquery")
+            .expect("a walk of a deep tsquery")
     })
 }
 

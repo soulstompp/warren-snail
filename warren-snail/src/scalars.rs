@@ -124,7 +124,12 @@ fn ns_ascending() -> i64 {
 
 /// The version 7 uuid of instant `ns`, its last 8 bytes `rest` but its variant's.
 fn uuid_v7_at(ns: i64, rest: [u8; 8]) -> i128 {
-    let (ms, sub) = (ns / NS_PER_MS, ns % NS_PER_MS);
+    uuid_v7_of(ns / NS_PER_MS, ns % NS_PER_MS, rest)
+}
+
+/// The version 7 uuid of millisecond `ms` since 1970 UTC and `sub` nanoseconds into it, its last 8
+/// bytes `rest` but its variant's, as `generate_uuidv7` makes it.
+fn uuid_v7_of(ms: i64, sub: i64, rest: [u8; 8]) -> i128 {
     let mut bytes = [0u8; 16];
     bytes[..6].copy_from_slice(&(ms as u64).to_be_bytes()[2..]);
     let fraction = (sub * (1 << 12) / NS_PER_MS) as u16;
@@ -140,6 +145,24 @@ pub fn uuid_v7() -> Result<i128> {
     let mut rest = [0u8; 8];
     random(&mut rest)?;
     Ok(uuid_v7_at(ns, rest))
+}
+
+/// The last instant a version 7 uuid holds, in microseconds since 1970 UTC: the last of its 48
+/// bits of milliseconds.
+const V7_LAST_US: i64 = ((1 << 48) - 1) * 1000;
+
+/// A version 7 uuid as `uuidv7(interval)` hands one out: the machine's clock to the microsecond,
+/// moved by `shift` as a timestamptz in microseconds since 1970 UTC, its nanoseconds kept; refused
+/// where the instant falls before 1970 or past the 48 bits of milliseconds.
+pub fn uuid_v7_shifted(shift: impl FnOnce(i64) -> Result<i64>) -> Result<i128> {
+    let ns = ns_ascending();
+    let us = shift(ns / 1000)?;
+    if !(0..=V7_LAST_US).contains(&us) {
+        return Err(Error::new("timestamp out of range for UUID version 7"));
+    }
+    let mut rest = [0u8; 8];
+    random(&mut rest)?;
+    Ok(uuid_v7_of(us / 1000, (us % 1000) * 1000 + ns % 1000, rest))
 }
 
 /// The key of an unsigned number of `bits` bits: held in the signed range of its width, so its keys

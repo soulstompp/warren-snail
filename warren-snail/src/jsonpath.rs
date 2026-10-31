@@ -6,10 +6,28 @@
 use crate::numeric::Numeric;
 use crate::{Error, Result};
 
+mod exec;
+
+pub use exec::{
+    jsonb_path_exists, jsonb_path_exists_op, jsonb_path_match, jsonb_path_match_op,
+    jsonb_path_query, jsonb_path_query_array, jsonb_path_query_first,
+};
+
 /// A jsonpath as `jsonpath_in` reads it, written back as `jsonpath_out` writes it: `lax` dropped,
 /// `strict` kept, every key and variable quoted, each operation in parentheses where its priority
 /// asks for them, each number as `numeric_out` writes it. Refused with PostgreSQL's own words.
 pub fn jsonpath_in(s: &str) -> Result<String> {
+    let (lax, path) = read(s)?;
+    let mut out = Vec::with_capacity(s.len() + 8);
+    if !lax {
+        out.extend_from_slice(b"strict ");
+    }
+    print(&mut out, &path, true);
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// A jsonpath as `jsonpath_in` reads it: whether it is lax, and its items.
+fn read(s: &str) -> Result<(bool, Chain)> {
     let mut p = Parser {
         lex: Lexer {
             b: s.as_bytes(),
@@ -24,12 +42,7 @@ pub fn jsonpath_in(s: &str) -> Result<String> {
         )));
     };
     check(&path, 0, false)?;
-    let mut out = Vec::with_capacity(s.len() + 8);
-    if !lax {
-        out.extend_from_slice(b"strict ");
-    }
-    print(&mut out, &path, true);
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    Ok((lax, path))
 }
 
 // ---- The scanner: jsonpath_scan.l ----

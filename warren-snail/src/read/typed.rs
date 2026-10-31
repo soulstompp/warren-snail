@@ -121,6 +121,82 @@ fn arithmetic(a: Option<ColumnType>, b: Option<ColumnType>) -> Option<ColumnType
     }
 }
 
+/// The type PostgreSQL's select_common_type finds for expressions read together, `context` naming
+/// them in its refusal: an untyped literal takes the others' type, text where every one is untyped;
+/// of two numbers, or two instants, the one the other is implicitly cast to; of two strings, the
+/// first's; any other two only where they are one. Types that differ only in their modifier take
+/// none.
+pub(super) fn common_type(ts: &[Option<ColumnType>], context: &str) -> Result<ColumnType> {
+    use ColumnType as C;
+    let place = |t: ColumnType| -> Option<(u8, u8)> {
+        Some(match t {
+            C::Int2 => (0, 0),
+            C::Int4 => (0, 1),
+            C::Int8 => (0, 2),
+            t if t.is_numeric() => (0, 3),
+            C::Float4 => (0, 4),
+            C::Float8 => (0, 5),
+            C::Text(_) | C::Bpchar(_) | C::Name => (1, 0),
+            C::Date => (2, 0),
+            C::Timestamp(_) => (2, 1),
+            C::Timestamptz | C::TimestamptzRounded(_) => (2, 2),
+            C::Time(_) => (3, 0),
+            C::Timetz(_) => (3, 1),
+            _ => return None,
+        })
+    };
+    let unmodified = |t: ColumnType| match t {
+        C::Text(Some(_)) => C::Text(Some(C::VARCHAR)),
+        C::Bpchar(_) => C::Bpchar(None),
+        t if t.is_numeric() => NUMERIC,
+        t => super::clock::base(t),
+    };
+    let mut out: Option<ColumnType> = None;
+    for &t in ts.iter().flatten() {
+        let Some(p) = out else {
+            out = Some(t);
+            continue;
+        };
+        if p == t {
+            continue;
+        }
+        match (place(p), place(t)) {
+            (Some((a, x)), Some((b, y))) if a == b && y > x => out = Some(unmodified(t)),
+            (Some((a, x)), Some((b, y))) if a == b && (y < x || a == 1) => {
+                out = Some(unmodified(p))
+            }
+            _ if unmodified(p) == unmodified(t) => out = Some(unmodified(p)),
+            _ => {
+                return Err(Error::new(format!(
+                    "{context} types {} and {} cannot be matched",
+                    p.pg_name(),
+                    t.pg_name()
+                )))
+            }
+        }
+    }
+    Ok(out.unwrap_or(C::Text(None)))
+}
+
+/// An array of a type.
+pub(crate) fn array_of(element: ColumnType) -> ColumnType {
+    crate::composed::type_of(crate::composed::Composed::Array {
+        element,
+        domain: None,
+    })
+}
+
+/// An array type's element type.
+pub(crate) fn element_of(ty: ColumnType) -> Option<ColumnType> {
+    match ty {
+        ColumnType::Composed(r) => match r.def() {
+            crate::composed::Composed::Array { element, .. } => Some(*element),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The arguments of a call as expressions; none where they are not plain.
 fn call_args(f: &sqlparser::ast::Function) -> Option<Vec<&Expr>> {
     match &f.args {
@@ -177,10 +253,50 @@ impl Typing<'_> {
                 ..
             } => {
                 self.type_of(expr)?;
-                crate::catalog::held_type(data_type).ok()
+                crate::catalog::held_type(data_type)
+                    .ok()
+                    .or_else(|| crate::composed::resolve(data_type))
             }
             Expr::TypedString(t) => crate::catalog::held_type(&t.data_type).ok(),
             Expr::Interval(_) => Some(super::calls::full_interval()),
+            // An element of an array by its subscripts; a slice among them, the array.
+            Expr::CompoundFieldAccess { root, access_chain }
+                if access_chain
+                    .iter()
+                    .all(|a| matches!(a, sqlparser::ast::AccessExpr::Subscript(_))) =>
+            {
+                let t = self.type_of(root)?;
+                let sliced = access_chain.iter().any(|a| {
+                    matches!(
+                        a,
+                        sqlparser::ast::AccessExpr::Subscript(
+                            sqlparser::ast::Subscript::Slice { .. }
+                        )
+                    )
+                });
+                match t.and_then(element_of) {
+                    Some(_) if sliced => t,
+                    Some(e) => Some(e),
+                    None => None,
+                }
+            }
+            // An ARRAY's elements take one type; an array among them is a dimension of it.
+            Expr::Array(a) => {
+                let mut ts = Vec::with_capacity(a.elem.len());
+                for x in &a.elem {
+                    ts.push(self.type_of(x)?);
+                }
+                if a.elem.is_empty() {
+                    None
+                } else {
+                    let t = common_type(&ts, "ARRAY")?;
+                    Some(if element_of(t).is_some() {
+                        t
+                    } else {
+                        array_of(t)
+                    })
+                }
+            }
             // A number written with its minus is one constant, as PostgreSQL's grammar folds it.
             Expr::UnaryOp {
                 op: UnaryOperator::Minus,
@@ -361,16 +477,34 @@ impl Typing<'_> {
                 if f.over.is_some() {
                     return window(&name, &types, f.args_star());
                 }
+                if let Some(t) = super::rest::typed(&name, &types)? {
+                    return Ok(t);
+                }
                 if let Some(t) = numbers(&name, &types)? {
                     return Ok(t);
                 }
                 if let Some(t) = time(&name, &types)? {
                     return Ok(t);
                 }
+                if let Some(t) = super::tsearch::typed(&name, &types)? {
+                    return Ok(t);
+                }
+                if let Some(t) = super::ranges::typed(&name, &types)? {
+                    return Ok(t);
+                }
                 if let Some(t) = strings(&name, &types)? {
                     return Ok(t);
                 }
                 if let Some(t) = regexps(&name, &types)? {
+                    return Ok(t);
+                }
+                if let Some(t) = arrays(&name, &types)? {
+                    return Ok(t);
+                }
+                if let Some(t) = super::arrays::typed(&name, &types)? {
+                    return Ok(t);
+                }
+                if let Some(t) = super::json::typed(&name, &types)? {
                     return Ok(t);
                 }
                 crate::functions::refuse_server(&name, self.release)?;
@@ -396,6 +530,9 @@ impl Star for sqlparser::ast::Function {
 /// The type an aggregate the types carry returns over its argument's, or PostgreSQL's refusal where
 /// it has no form for it.
 fn aggregate(name: &str, args: &[Option<ColumnType>], star: bool) -> Result<Option<ColumnType>> {
+    if super::json::AGGREGATES.contains(&name) {
+        return Ok(super::json::typed(name, args)?.flatten());
+    }
     if name == "count" {
         return Ok(Some(ColumnType::Int8));
     }
@@ -745,6 +882,25 @@ fn further(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Option<Colu
             Some(_) => return refused(),
         },
         ("any_value", [t]) => *t,
+        ("range_agg", [t]) => match t {
+            Some(t) if multirange_range(*t).is_some() => Some(*t),
+            Some(t) if crate::composed::range_of(*t).is_some() => {
+                crate::composed::multirange_of(*t)
+            }
+            None => None,
+            Some(_) => return refused(),
+        },
+        ("range_intersect_agg", [t]) => match t {
+            Some(t) if crate::composed::range_of(*t).is_some() => Some(*t),
+            None => None,
+            Some(_) => return refused(),
+        },
+        // An array of its argument's type, one more dimension of an array's.
+        ("array_agg", [t]) => match t {
+            Some(t) if element_of(*t).is_some() => Some(*t),
+            Some(t) => Some(array_of(*t)),
+            None => None,
+        },
         ("string_agg", [t, _]) => match t {
             Some(C::Bytes) => Some(C::Bytes),
             None | Some(C::Text(_) | C::Bpchar(_) | C::Name) => Some(C::Text(None)),
@@ -775,13 +931,21 @@ fn ordered_set(
     };
     Ok(match (name, direct, within) {
         ("mode", [], [t]) => *t,
+        // Of an array of fractions, an array.
+        ("percentile_disc", [Some(f)], [t]) if element_of(*f).is_some() => t.map(array_of),
         ("percentile_disc", [_], [t]) => *t,
-        ("percentile_cont", [_], [t]) => match t.map(super::clock::base) {
-            Some(C::Interval { .. }) => Some(super::calls::full_interval()),
-            Some(t) if t.is_integer() || t.is_numeric() || t.is_float() => Some(C::Float8),
-            None => None,
-            Some(_) => return refused(),
-        },
+        ("percentile_cont", [f], [t]) => {
+            let one = match t.map(super::clock::base) {
+                Some(C::Interval { .. }) => Some(super::calls::full_interval()),
+                Some(t) if t.is_integer() || t.is_numeric() || t.is_float() => Some(C::Float8),
+                None => None,
+                Some(_) => return refused(),
+            };
+            match f {
+                Some(f) if element_of(*f).is_some() => one.map(array_of),
+                _ => one,
+            }
+        }
         ("rank" | "dense_rank", d, w) if d.len() == w.len() => Some(C::Int8),
         ("percent_rank" | "cume_dist", d, w) if d.len() == w.len() => Some(C::Float8),
         _ => return refused(),
@@ -871,4 +1035,33 @@ pub(super) fn regexps(
         "regexp_match" | "regexp_split_to_array" => super::calls::text_array(),
         _ => C::Text(None),
     })))
+}
+
+/// The type a function of arrays returns, or its refusal where it has no form for its arguments;
+/// none where the name is no function of arrays the snail answers.
+pub(super) fn arrays(
+    name: &str,
+    args: &[Option<ColumnType>],
+) -> Result<Option<Option<ColumnType>>> {
+    let array = |t: &Option<ColumnType>| t.and_then(element_of);
+    Ok(Some(match (name, args) {
+        ("unnest", [None]) => None,
+        ("unnest", [t]) => match (array(t), t.and_then(multirange_range)) {
+            (Some(e), _) | (_, Some(e)) => Some(e),
+            _ => return Err(no_form(name, args)),
+        },
+        ("range_minus_multi" | "multirange_minus_multi", [a, _]) => *a,
+        _ => return Ok(None),
+    }))
+}
+
+/// A multirange type's range type.
+pub(super) fn multirange_range(ty: ColumnType) -> Option<ColumnType> {
+    match ty {
+        ColumnType::Composed(r) => match r.def() {
+            crate::composed::Composed::Multirange { range, .. } => Some(*range),
+            _ => None,
+        },
+        _ => None,
+    }
 }

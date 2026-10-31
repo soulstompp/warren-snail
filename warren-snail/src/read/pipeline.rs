@@ -620,10 +620,15 @@ pub(super) fn column_of(e: &Expr) -> Option<(Option<String>, String)> {
 struct Calls<'q> {
     aggregates: Vec<&'q Expr>,
     windows: Vec<&'q Expr>,
+    /// The set-returning calls of its select list.
+    sets: Vec<&'q Expr>,
 }
 
-const AGGREGATES: [&str; 34] = [
+const AGGREGATES: [&str; 37] = [
     "string_agg",
+    "array_agg",
+    "range_agg",
+    "range_intersect_agg",
     "count",
     "sum",
     "min",
@@ -661,7 +666,7 @@ const AGGREGATES: [&str; 34] = [
 
 /// Whether a name is an aggregate a step folds.
 pub(super) fn is_aggregate(name: &str) -> bool {
-    AGGREGATES.contains(&name)
+    AGGREGATES.contains(&name) || super::json::AGGREGATES.contains(&name)
 }
 
 pub(super) fn function_name(f: &sqlparser::ast::Function) -> String {
@@ -678,9 +683,12 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
                 out.windows.push(e);
                 return;
             }
-            if AGGREGATES.contains(&function_name(f).as_str()) || !f.within_group.is_empty() {
+            if is_aggregate(&function_name(f)) || !f.within_group.is_empty() {
                 out.aggregates.push(e);
                 return;
+            }
+            if is_set_returning(&function_name(f)) {
+                out.sets.push(e);
             }
             if let FunctionArguments::List(l) = &f.args {
                 for a in &l.args {
@@ -728,6 +736,129 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
         }
         _ => {}
     }
+}
+
+/// The set-returning functions a step's select list reads.
+const SET_RETURNING: [&str; 9] = [
+    "unnest",
+    "range_minus_multi",
+    "multirange_minus_multi",
+    "generate_subscripts",
+    "aclexplode",
+    "pg_options_to_table",
+    "pg_snapshot_xip",
+    "txid_snapshot_xip",
+    "pg_get_keywords",
+];
+
+/// Whether a name is a set-returning function a step's select list reads.
+pub(super) fn is_set_returning(name: &str) -> bool {
+    SET_RETURNING.contains(&name)
+        || super::json::SETS.contains(&name)
+        || super::tsearch::SETS.contains(&name)
+}
+
+/// The expressions an expression reads directly.
+fn parts_of(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Function(f) => match &f.args {
+            FunctionArguments::List(l) => l
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(x))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(x),
+                        ..
+                    } => Some(x),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        Expr::BinaryOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => {
+            vec![left, right]
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr) => vec![expr],
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => operand
+            .iter()
+            .map(|o| o.as_ref())
+            .chain(conditions.iter().flat_map(|c| [&c.condition, &c.result]))
+            .chain(else_result.iter().map(|x| x.as_ref()))
+            .collect(),
+        Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
+        Expr::Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
+        Expr::Array(a) => a.elem.iter().collect(),
+        Expr::Tuple(xs) => xs.iter().collect(),
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => vec![expr, pattern],
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => vec![left, right],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an expression calls a set-returning function.
+fn holds_set(e: &Expr) -> bool {
+    matches!(e, Expr::Function(f) if f.over.is_none() && is_set_returning(&function_name(f)))
+        || parts_of(e).into_iter().any(holds_set)
+}
+
+/// A set-returning call where PostgreSQL's parser refuses one, refused as it refuses it: among an
+/// aggregate's or a window's arguments, in CASE or COALESCE; or where the step reads none, among
+/// another's arguments or inside an expression its set is not projected through.
+fn sets_placed(e: &Expr) -> Result<()> {
+    let refused = |what: &str| Err(Error::new(what.to_string()));
+    match e {
+        Expr::Function(f) => {
+            let name = function_name(f);
+            let inner = parts_of(e).into_iter().any(holds_set);
+            if inner && f.over.is_some() {
+                return refused(
+                    "window function calls cannot contain set-returning function calls",
+                );
+            }
+            if inner && (is_aggregate(&name) || !f.within_group.is_empty()) {
+                return refused(
+                    "aggregate function calls cannot contain set-returning function calls",
+                );
+            }
+            if inner && name == "coalesce" {
+                return refused("set-returning functions are not allowed in COALESCE");
+            }
+            if inner && is_set_returning(&name) {
+                return refused("a set-returning function among another's arguments is not read");
+            }
+        }
+        Expr::Case { .. } if parts_of(e).into_iter().any(holds_set) => {
+            return refused("set-returning functions are not allowed in CASE")
+        }
+        Expr::Array(_) | Expr::InList { .. } | Expr::AnyOp { .. } | Expr::AllOp { .. }
+            if parts_of(e).into_iter().any(holds_set) =>
+        {
+            return refused(&format!("a set-returning function inside {e} is not read"))
+        }
+        _ => {}
+    }
+    parts_of(e).into_iter().try_for_each(sets_placed)
 }
 
 /// The values a row's expressions see beyond its columns: each aggregate's and window's, by place.
@@ -937,6 +1068,45 @@ fn cast(
             match v {
                 Value::Composed(from, c) if from == ty => Value::Composed(from, c),
                 Value::Text(t) => composed_value(ty, &t)?,
+                // An array of one type to an array of another, each element cast, its shape kept.
+                Value::Composed(from, c)
+                    if super::typed::element_of(from).is_some()
+                        && super::typed::element_of(ty).is_some() =>
+                {
+                    let (from_element, element) = (
+                        super::typed::element_of(from).unwrap(),
+                        super::typed::element_of(ty).unwrap(),
+                    );
+                    let crate::composed::Item::Array {
+                        elements,
+                        dims,
+                        lower,
+                    } = &c.item
+                    else {
+                        return Ok(Value::Null);
+                    };
+                    let elements = elements
+                        .iter()
+                        .map(|p| {
+                            let v = cast(
+                                part_value(from_element, p),
+                                innermost(to),
+                                release,
+                                monetary,
+                                false,
+                            )?;
+                            part_of(element, v, false)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    composed(
+                        ty,
+                        crate::composed::Item::Array {
+                            elements,
+                            dims: dims.clone(),
+                            lower: lower.clone(),
+                        },
+                    )
+                }
                 other => {
                     return Err(Error::new(format!(
                         "cannot cast type {} to {}",
@@ -1118,6 +1288,30 @@ pub(super) fn kind_name(v: &Value) -> String {
         Value::Typed(ty, _) => ty.pg_name(),
         Value::Geometric(g) => g.kind().name().into(),
     }
+}
+
+/// The type a value is of, where it says: an integer's the narrowest of integer and bigint that
+/// holds it; none for NULL.
+pub(super) fn type_of_value(v: &Value) -> Option<ColumnType> {
+    Some(match v {
+        Value::Null => return None,
+        Value::Int(x) if i32::try_from(*x).is_ok() => ColumnType::Int4,
+        Value::Int(_) => ColumnType::Int8,
+        Value::Num(..) | Value::Numeric(_) => super::typed::NUMERIC,
+        Value::Text(_) => ColumnType::Text(None),
+        Value::Bytes(_) => ColumnType::Bytes,
+        Value::Bool(_) => ColumnType::Boolean,
+        Value::Uuid(_) => ColumnType::Uuid,
+        Value::Real(_) => ColumnType::Float4,
+        Value::Double(_) => ColumnType::Float8,
+        Value::Scalar(ty, _)
+        | Value::Str(ty, _)
+        | Value::Bits(ty, _)
+        | Value::Composed(ty, _)
+        | Value::Typed(ty, _) => *ty,
+        Value::Interval(_) => super::calls::full_interval(),
+        Value::Geometric(g) => ColumnType::Geometric(g.kind()),
+    })
 }
 
 /// A number rounded to whole units of `to` places from `from`, half away from zero.
@@ -1498,6 +1692,7 @@ fn typed_op(
                 | "?&"
                 | "#-"
                 | "@@"
+                | "@?"
                 | "<->"
         ) && (x.is_null() || y.is_null()))
         .then_some(Value::Null));
@@ -1564,6 +1759,20 @@ fn typed_op(
         };
         let text_of = |s: Option<String>| s.map_or(Value::Null, Value::Text);
         let doc_of = |s: String| Value::Typed(ColumnType::Textual(doc), s);
+        // A path beside a jsonb, a quoted literal read as one.
+        if jsonb && matches!(name.as_str(), "@?" | "@@") {
+            let path = match read(y, right, Textual::Jsonpath)? {
+                Value::Typed(ColumnType::Textual(Textual::Jsonpath), p) => p,
+                v if v.is_null() => return Ok(Some(Value::Null)),
+                _ => return Err(refused()),
+            };
+            let answer = if name == "@?" {
+                crate::jsonpath::jsonb_path_exists_op(a, &path)?
+            } else {
+                crate::jsonpath::jsonb_path_match_op(a, &path)?
+            };
+            return Ok(Some(answer.map_or(Value::Null, Value::Bool)));
+        }
         use crate::jsonb as j;
         return Ok(Some(match (name.as_str(), y) {
             (_, Value::Null) => Value::Null,
@@ -2138,7 +2347,7 @@ fn boolean_of(t: &str) -> Result<Value> {
 /// An arithmetic operator on two numbers, as PostgreSQL's integer and numeric operators compute
 /// it: two integers to an integer, any numeric to a numeric, at the scales numeric.c gives a sum, a
 /// difference, a product, a quotient and a remainder.
-fn arith(op: &BinaryOperator, a: &Value, b: &Value) -> Result<Value> {
+pub(super) fn arith(op: &BinaryOperator, a: &Value, b: &Value) -> Result<Value> {
     use BinaryOperator as B;
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
@@ -2228,7 +2437,7 @@ fn is_record(ty: ColumnType) -> bool {
 }
 
 /// A composed value read from its text by its type's input.
-fn composed_value(ty: ColumnType, t: &str) -> Result<Value> {
+pub(super) fn composed_value(ty: ColumnType, t: &str) -> Result<Value> {
     Ok(match crate::composed::scalar_in(ty, t)? {
         crate::read::statement::Datum::Compound(c) => Value::Composed(ty, c),
         d => super::fill::value_of(&d, ty),
@@ -2435,6 +2644,22 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             }
             other => return Err(Error::new(format!("the literal {other} is not read"))),
         },
+        // An ARRAY cast to an array type takes that type, each element cast to its element type.
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type,
+            ..
+        } if matches!(expr.as_ref(), Expr::Array(_))
+            && crate::composed::resolve(data_type)
+                .is_some_and(|t| super::typed::element_of(t).is_some()) =>
+        {
+            let Expr::Array(a) = expr.as_ref() else {
+                unreachable!()
+            };
+            let ty = crate::composed::resolve(data_type).unwrap();
+            array_cast(a, ty, data_type, row, frame, computed)?
+        }
         Expr::Cast {
             kind: CastKind::Cast | CastKind::DoubleColon,
             expr,
@@ -2447,6 +2672,17 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             frame.casings.monetary(),
             quoted(expr),
         )?,
+        Expr::Array(a) => {
+            let ty = frame
+                .type_of(e)
+                .ok_or_else(|| Error::new("cannot determine type of empty array"))?;
+            let values = a
+                .elem
+                .iter()
+                .map(|x| Ok((ev(x)?, quoted(x))))
+                .collect::<Result<Vec<_>>>()?;
+            array_value(ty, values, holds_arrays(a, frame))?
+        }
         // An interval written as `interval '…'` with no fields named, read by its input.
         Expr::Interval(i)
             if i.leading_field.is_none()
@@ -2880,7 +3116,8 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }
                 e => ev(e)?,
             };
-            if let Some(v) = composed_op(op, &x, &y, left, right)? {
+            let typed = [frame.type_of(left), frame.type_of(right)];
+            if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
                 return Ok(v);
             }
             if let Some(v) = geo_op(op, &x, &y, left, right)? {
@@ -3011,16 +3248,25 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             if let Some(x) = substring_for {
                 args.push(ev(x)?);
             }
+            let bits: Vec<_> = args.iter().map(|v| (v.clone(), false, None)).collect();
+            if let Some(v) = super::rest::call("substring", &bits)? {
+                return Ok(v);
+            }
             super::calls::strings("substr", &args, Casing::Libc)?
                 .ok_or_else(|| Error::new(format!("{e} is not read")))?
         }
         Expr::Position { expr, r#in } => {
+            let bits = [(ev(r#in)?, false, None), (ev(expr)?, false, None)];
+            if let Some(v) = super::rest::call("position", &bits)? {
+                return Ok(v);
+            }
             // Under the collation either side names, else the one the string carries.
             let explicit = [&**r#in, &**expr].into_iter().find(|x| names_collate(x));
             if let Some(casing) = frame.casings.implicit(explicit.unwrap_or(r#in))? {
                 super::calls::substring_search("position", casing)?;
             }
-            super::calls::position(ev(r#in)?, ev(expr)?)?
+            let [(s, ..), (sub, ..)] = bits;
+            super::calls::position(s, sub)?
         }
         Expr::Trim {
             expr,
@@ -3048,12 +3294,19 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             overlay_what,
             overlay_from,
             overlay_for,
-        } => super::calls::overlay(
-            ev(expr)?,
-            ev(overlay_what)?,
-            ev(overlay_from)?,
-            overlay_for.as_deref().map(&ev).transpose()?,
-        )?,
+        } => {
+            let (s, t, from) = (ev(expr)?, ev(overlay_what)?, ev(overlay_from)?);
+            let count = overlay_for.as_deref().map(&ev).transpose()?;
+            let given: Vec<_> = [&s, &t, &from]
+                .into_iter()
+                .chain(count.as_ref())
+                .map(|v| (v.clone(), false, None))
+                .collect();
+            if let Some(v) = super::rest::call("overlay", &given)? {
+                return Ok(v);
+            }
+            super::calls::overlay(s, t, from, count)?
+        }
         Expr::Extract { field, expr, .. } => {
             let unit = super::calls::field_unit(field);
             super::calls::extract(&unit, &ev(expr)?)?
@@ -3098,6 +3351,18 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                             name == "upper",
                             casing,
                         )?),
+                        // A range's or a multirange's bound.
+                        v @ Value::Composed(..) => {
+                            match super::ranges::ranges(&name, &[(v.clone(), false)])? {
+                                Some(b) => b,
+                                None => {
+                                    return Err(Error::new(format!(
+                                        "function {name}({}) does not exist",
+                                        kind_name(&v)
+                                    )))
+                                }
+                            }
+                        }
                         other => {
                             return Err(Error::new(format!(
                                 "function {name}({}) does not exist",
@@ -3111,6 +3376,32 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                     let values = a.iter().map(|x| ev(x)).collect::<Result<Vec<_>>>()?;
                     let types: Vec<Option<ColumnType>> =
                         a.iter().map(|x| frame.type_of(x)).collect();
+                    let given: Vec<(Value, bool)> = values
+                        .iter()
+                        .cloned()
+                        .zip(a.iter().map(|x| quoted(x)))
+                        .collect();
+                    let resolved: Vec<_> = given
+                        .iter()
+                        .cloned()
+                        .zip(&types)
+                        .map(|((v, q), t)| (v, q, *t))
+                        .collect();
+                    if let Some(v) = super::rest::call(&name, &resolved)? {
+                        return Ok(v);
+                    }
+                    if let Some(v) = super::ranges::ranges(&name, &given)? {
+                        return Ok(v);
+                    }
+                    if let Some(v) = super::tsearch::call(&name, &given)? {
+                        return Ok(v);
+                    }
+                    if let Some(v) = super::arrays::arrays(&name, &given, &types)? {
+                        return Ok(v);
+                    }
+                    if let Some(v) = super::json::call(&name, &given)? {
+                        return Ok(v);
+                    }
                     if let Some(v) =
                         super::calls::numbers(&name, &values, &types, frame.type_of(e))?
                     {
@@ -3509,7 +3800,7 @@ fn windows_whole(
             let n = ix.len();
             // An aggregate over the frame: folded a row at a time, or once over the partition.
             let mut acc = if aggregate {
-                let (acc, folds) = Acc::of(call)?;
+                let (acc, folds) = Acc::of(call, frame.types)?;
                 let under = folds
                     .args
                     .iter()
@@ -3725,7 +4016,7 @@ struct Folds<'q> {
 
 impl Acc {
     /// The aggregate a call folds, and what it folds from each row: no expression for count(*).
-    fn of(call: &Expr) -> Result<(Acc, Folds<'_>)> {
+    fn of<'e>(call: &'e Expr, types: &super::typed::Types) -> Result<(Acc, Folds<'e>)> {
         let Expr::Function(f) = call else {
             unreachable!()
         };
@@ -3795,6 +4086,13 @@ impl Acc {
             ("bool_and" | "every", [_]) => Acc::All(None),
             ("bool_or", [_]) => Acc::Any(None),
             ("avg", [_]) => Acc::Avg(0.0, 0.0, 0.0),
+            ("array_agg", [x]) => Acc::More(Box::new(super::aggregates::Agg::Collect {
+                ty: types.get(&(call as *const Expr)).copied(),
+                arrays: types
+                    .get(&(*x as *const Expr))
+                    .is_some_and(|t| super::typed::element_of(*t).is_some()),
+                values: Vec::new(),
+            })),
             (n, [_] | [_, _]) => match super::aggregates::Agg::of(n) {
                 Some(agg) => Acc::More(Box::new(agg)),
                 None => return Err(Error::new(format!("{call} is not read"))),
@@ -3864,9 +4162,11 @@ impl Acc {
                 seen,
                 values: kept,
                 under: kept_under,
-                ..
+                of,
             } => {
-                if values.iter().any(Value::is_null) {
+                if values.iter().any(Value::is_null)
+                    && !matches!(&**of, Acc::More(a) if a.keeps_nulls())
+                {
                     return Ok(());
                 }
                 kept_under.clear();
@@ -4218,6 +4518,13 @@ impl Acc {
                 let mut failed = None;
                 values.sort_by(|a, b| {
                     for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                        // A NULL, which an aggregate that keeps NULLs sees, sorts last.
+                        match (x.is_null(), y.is_null()) {
+                            (true, true) => continue,
+                            (true, false) => return Ordering::Greater,
+                            (false, true) => return Ordering::Less,
+                            _ => {}
+                        }
                         match compare_under(under.get(i).copied().flatten(), x, y) {
                             Ok(Some(Ordering::Equal)) | Ok(None) => {}
                             Ok(Some(o)) => return o,
@@ -4266,6 +4573,48 @@ struct Prepared<'q> {
     now: i64,
 }
 
+impl Prepared<'_> {
+    /// The rows its select list makes of one row: one, or, where it calls set-returning functions,
+    /// one for each value of the longest set they give, a shorter set NULL past its end, and none
+    /// where every set is empty, as PostgreSQL's ProjectSet makes them.
+    fn project(&self, row: &[Value], frame: &Frame, computed: Computed) -> Result<Vec<Vec<Value>>> {
+        let one = |c: &Computed| {
+            self.items
+                .iter()
+                .map(|(e, _)| eval(e, row, frame, c))
+                .collect::<Result<Vec<_>>>()
+        };
+        if self.calls.sets.is_empty() {
+            return Ok(vec![one(&computed)?]);
+        }
+        let sets = self
+            .calls
+            .sets
+            .iter()
+            .map(|&c| {
+                let Expr::Function(f) = c else { unreachable!() };
+                let values = args(f)?
+                    .into_iter()
+                    .map(|x| Ok((eval(x, row, frame, &computed)?, quoted(x))))
+                    .collect::<Result<Vec<_>>>()?;
+                super::sets::values(&function_name(f), values, frame.type_of(c))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let n = sets.iter().map(Vec::len).max().unwrap_or(0);
+        let mut computed = computed;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            for (&c, s) in self.calls.sets.iter().zip(&sets) {
+                computed
+                    .calls
+                    .insert(c as *const Expr, s.get(i).cloned().unwrap_or(Value::Null));
+            }
+            out.push(one(&computed)?);
+        }
+        Ok(out)
+    }
+}
+
 /// A step read before any row: its parts, each expression typed over the columns its FROM reads.
 fn prepare<'q>(
     q: &'q Query,
@@ -4294,12 +4643,23 @@ fn prepare<'q>(
         .collect::<Result<_>>()?;
     let mut calls = Calls::default();
     for (e, _) in &items {
+        sets_placed(e)?;
         find_calls(e, &mut calls);
+    }
+    if s.selection.as_ref().is_some_and(holds_set) {
+        return Err(Error::new(
+            "set-returning functions are not allowed in WHERE",
+        ));
     }
     let grouping = match &s.group_by {
         GroupByExpr::Expressions(g, m) if m.is_empty() => g.as_slice(),
         _ => return Err(Error::new("GROUP BY ALL is not read")),
     };
+    if grouping.iter().any(holds_set) {
+        return Err(Error::new(
+            "a set-returning function in GROUP BY is not read",
+        ));
+    }
     let grouped = !grouping.is_empty() || !calls.aggregates.is_empty();
     let calls_windows_whole = calls.windows.iter().any(|w| !streams(w));
     if grouped && !calls.windows.is_empty() {
@@ -4417,7 +4777,7 @@ impl<'q> StepRun<'q> {
             .calls
             .aggregates
             .iter()
-            .map(|&c| Acc::of(c).map(|(a, _)| a))
+            .map(|&c| Acc::of(c, &self.p.types).map(|(a, _)| a))
             .collect()
     }
 
@@ -4455,7 +4815,7 @@ impl<'q> StepRun<'q> {
                 .calls
                 .aggregates
                 .iter()
-                .map(|&c| Acc::of(c).map(|(_, f)| f))
+                .map(|&c| Acc::of(c, &self.p.types).map(|(_, f)| f))
                 .collect::<Result<_>>()?;
             let grouped_under = self
                 .p
@@ -4537,25 +4897,22 @@ impl<'q> StepRun<'q> {
                 calls: w,
                 _q: std::marker::PhantomData,
             };
-            out.rows.push(
-                self.p
-                    .items
-                    .iter()
-                    .map(|(e, _)| eval(e, row, &frame, &computed))
-                    .collect::<Result<_>>()?,
-            );
+            out.rows.extend(self.p.project(row, &frame, computed)?);
         }
         if self.p.distinct {
             let seen = &mut self.seen;
             out.rows
                 .retain(|r| seen.insert(r.iter().map(key).collect()));
         }
-        // The order holds where an item is the column that held it.
-        out.order = rel.order.and_then(|o| {
-            self.p.items.iter().position(|(e, _)| {
-                column_of(e).is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
-            })
-        });
+        // The order holds where an item is the column that held it, and no set repeats a row.
+        out.order = rel
+            .order
+            .filter(|_| self.p.calls.sets.is_empty())
+            .and_then(|o| {
+                self.p.items.iter().position(|(e, _)| {
+                    column_of(e).is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
+                })
+            });
         self.columns = frame.columns;
         if self.p.order_by.is_some() {
             self.rows.extend(out.rows);
@@ -4595,7 +4952,7 @@ impl<'q> StepRun<'q> {
                         .zip(accs)
                         .map(|(&c, a)| {
                             // A direct argument is read once a group, from no row where none came.
-                            let (_, f) = Acc::of(c)?;
+                            let (_, f) = Acc::of(c, &self.p.types)?;
                             if f.direct.is_empty() {
                                 return Ok((c as *const Expr, a.value()?));
                             }
@@ -4611,13 +4968,7 @@ impl<'q> StepRun<'q> {
                         .collect::<Result<_>>()?,
                     _q: std::marker::PhantomData,
                 };
-                out.rows.push(
-                    self.p
-                        .items
-                        .iter()
-                        .map(|(e, _)| eval(e, first, &frame, &computed))
-                        .collect::<Result<_>>()?,
-                );
+                out.rows.extend(self.p.project(first, &frame, computed)?);
             }
         }
         if self.p.whole_windows {
@@ -4636,19 +4987,17 @@ impl<'q> StepRun<'q> {
                     calls: w,
                     _q: std::marker::PhantomData,
                 };
-                out.rows.push(
-                    self.p
-                        .items
-                        .iter()
-                        .map(|(e, _)| eval(e, row, &frame, &computed))
-                        .collect::<Result<_>>()?,
-                );
+                out.rows.extend(self.p.project(row, &frame, computed)?);
             }
-            out.order = held.order.and_then(|o| {
-                self.p.items.iter().position(|(e, _)| {
-                    column_of(e).is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
-                })
-            });
+            out.order = held
+                .order
+                .filter(|_| self.p.calls.sets.is_empty())
+                .and_then(|o| {
+                    self.p.items.iter().position(|(e, _)| {
+                        column_of(e)
+                            .is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
+                    })
+                });
         }
         if self.p.grouped || self.p.whole_windows {
             out.rows = self.once(std::mem::take(&mut out.rows));
@@ -5920,8 +6269,184 @@ mod tests {
 }
 
 /// A part of a composed value as a value of its own type.
-fn part_value(ty: ColumnType, item: &crate::composed::Item) -> Value {
+pub(super) fn part_value(ty: ColumnType, item: &crate::composed::Item) -> Value {
     super::fill::value_of(&crate::composed::datum_of(ty, item), ty)
+}
+
+/// A value as a part of a composed value of type `ty`: a quoted literal read by the type's input,
+/// any other value assigned to it.
+pub(super) fn part_of(ty: ColumnType, v: Value, quoted: bool) -> Result<crate::composed::Item> {
+    use crate::composed::Item;
+    use crate::read::statement::Datum;
+    let d = match v {
+        Value::Null => return Ok(Item::Null),
+        v if v.is_null() => return Ok(Item::Null),
+        Value::Text(s) if quoted => crate::composed::scalar_in(ty, &s)?,
+        v => super::fill::assign_value(v, ty, "")?,
+    };
+    Ok(match d {
+        Datum::Null => Item::Null,
+        Datum::Compound(c) => c.item.clone(),
+        d => Item::Scalar(d),
+    })
+}
+
+/// A composed value of a type from its parts.
+pub(super) fn composed(ty: ColumnType, item: crate::composed::Item) -> Value {
+    Value::Composed(
+        ty,
+        std::sync::Arc::new(crate::composed::Compound::new(ty, item)),
+    )
+}
+
+/// The element type an array's type names, past every dimension.
+fn innermost(dt: &DataType) -> &DataType {
+    use sqlparser::ast::ArrayElemTypeDef as A;
+    match dt {
+        DataType::Array(A::SquareBracket(inner, _) | A::AngleBracket(inner)) => innermost(inner),
+        dt => dt,
+    }
+}
+
+/// An ARRAY cast to the array type `ty`: each element cast to `element`, an ARRAY among them cast
+/// so too, as PostgreSQL's parser hands the cast's type down to the elements.
+fn array_cast(
+    a: &sqlparser::ast::Array,
+    ty: ColumnType,
+    whole: &DataType,
+    row: &[Value],
+    frame: &Frame,
+    computed: &Computed,
+) -> Result<Value> {
+    let mut values = Vec::with_capacity(a.elem.len());
+    for x in &a.elem {
+        values.push(match x {
+            Expr::Array(inner) => (array_cast(inner, ty, whole, row, frame, computed)?, false),
+            x => (
+                cast(
+                    eval(x, row, frame, computed)?,
+                    match frame.type_of(x) {
+                        Some(t) if super::typed::element_of(t).is_some() => whole,
+                        _ => innermost(whole),
+                    },
+                    frame.release,
+                    frame.casings.monetary(),
+                    quoted(x),
+                )?,
+                false,
+            ),
+        });
+    }
+    array_value(ty, values, holds_arrays(a, frame))
+}
+
+/// Whether an ARRAY's elements are arrays, each a dimension of it.
+fn holds_arrays(a: &sqlparser::ast::Array, frame: &Frame) -> bool {
+    a.elem.iter().any(|x| {
+        matches!(x, Expr::Array(_))
+            || frame
+                .type_of(x)
+                .is_some_and(|t| super::typed::element_of(t).is_some())
+    })
+}
+
+/// An ARRAY of the array type `ty` from its elements' values, each with whether it is a quoted
+/// literal: one dimension of the elements, or, where they are arrays, one dimension more than
+/// theirs, a NULL or empty array among them passed over where every one is, as ExecEvalArrayExpr
+/// makes it.
+fn array_value(ty: ColumnType, values: Vec<(Value, bool)>, nested: bool) -> Result<Value> {
+    use crate::composed::Item;
+    let element = super::typed::element_of(ty)
+        .ok_or_else(|| Error::new(format!("{} is no array type", ty.pg_name())))?;
+    if !nested {
+        let n = values.len() as i32;
+        let elements = values
+            .into_iter()
+            .map(|(v, q)| part_of(element, v, q))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(composed(
+            ty,
+            Item::Array {
+                elements,
+                dims: vec![n],
+                lower: vec![1],
+            },
+        ));
+    }
+    let mismatch = || {
+        Error::new("multidimensional arrays must have array expressions with matching dimensions")
+    };
+    let mut shape: Option<(Vec<i32>, Vec<i32>)> = None;
+    let mut empty = false;
+    let mut outer = 0;
+    let mut elements = Vec::new();
+    for (v, _) in values {
+        let Value::Composed(from, c) = v else {
+            if v.is_null() {
+                empty = true;
+                continue;
+            }
+            return Err(Error::new(format!(
+                "ARRAY types {} and {} cannot be matched",
+                ty.pg_name(),
+                kind_name(&v)
+            )));
+        };
+        let Item::Array {
+            elements: parts,
+            dims,
+            lower,
+        } = &c.item
+        else {
+            empty = true;
+            continue;
+        };
+        if dims.is_empty() {
+            empty = true;
+            continue;
+        }
+        if dims.len() + 1 > 6 {
+            return Err(Error::new(format!(
+                "number of array dimensions ({}) exceeds the maximum allowed (6)",
+                dims.len() + 1
+            )));
+        }
+        match &shape {
+            None => shape = Some((dims.clone(), lower.clone())),
+            Some((d, l)) if d == dims && l == lower => {}
+            Some(_) => return Err(mismatch()),
+        }
+        let from_element = super::typed::element_of(from).unwrap_or(element);
+        for p in parts {
+            elements.push(if from_element == element {
+                p.clone()
+            } else {
+                part_of(element, part_value(from_element, p), false)?
+            });
+        }
+        outer += 1;
+    }
+    let Some((d, l)) = shape else {
+        return Ok(composed(
+            ty,
+            Item::Array {
+                elements: Vec::new(),
+                dims: Vec::new(),
+                lower: Vec::new(),
+            },
+        ));
+    };
+    if empty {
+        return Err(mismatch());
+    }
+    Ok(composed(
+        ty,
+        Item::Array {
+            elements,
+            dims: std::iter::once(outer).chain(d).collect(),
+            lower: std::iter::once(1).chain(l).collect(),
+        },
+    ))
 }
 
 /// The composed type a value is, or a quoted literal beside it is read as: a multirange's where
@@ -5945,7 +6470,12 @@ fn composed_op(
     y: &Value,
     left: &Expr,
     right: &Expr,
+    typed: [Option<ColumnType>; 2],
 ) -> Result<Option<Value>> {
+    // A NULL the step typed as a value other than an array is an element.
+    let element_null = |v: &Value, t: Option<ColumnType>| {
+        v.is_null() && t.is_some_and(|t| super::typed::element_of(t).is_none())
+    };
     use crate::composed::{Composed, Item};
     let Some(ty) = composed_beside(x, y) else {
         return Ok(None);
@@ -6040,11 +6570,11 @@ fn composed_op(
             if name == "||" {
                 let first = matches!(y, Value::Composed(..))
                     && a.is_none()
-                    && !x.is_null()
+                    && (!x.is_null() || element_null(x, typed[0]))
                     && !quoted(left);
                 let last = matches!(x, Value::Composed(..))
                     && b.is_none()
-                    && !y.is_null()
+                    && (!y.is_null() || element_null(y, typed[1]))
                     && !quoted(right);
                 if first {
                     let e = element_of(*element, x)?;

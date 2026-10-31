@@ -155,6 +155,23 @@ pub fn built_in(name: &str) -> Option<ColumnType> {
         })
 }
 
+/// The multirange type whose ranges are of a range type: a built-in range's, or one the DDL
+/// declared.
+pub fn multirange_of(range: ColumnType) -> Option<ColumnType> {
+    let ColumnType::Composed(r) = range else {
+        return None;
+    };
+    if let Composed::Range { name, .. } = r.def() {
+        if let Some(&(_, m, _, _)) = BUILT_IN_RANGES.iter().find(|b| b.0 == name) {
+            return built_in(m);
+        }
+    }
+    let all = held().read().unwrap();
+    all.iter()
+        .position(|d| matches!(d, Composed::Multirange { range: x, .. } if *x == range))
+        .map(|i| ColumnType::Composed(TypeRef(i as u32)))
+}
+
 impl Composed {
     /// The type as PostgreSQL's `format_type` names it.
     pub fn pg_name(&self) -> String {
@@ -3683,7 +3700,7 @@ impl Spanned {
 }
 
 /// The range from the lower bound of a multirange's first range to the upper bound of its last.
-fn span_of(ranges: &[Item]) -> Item {
+pub(crate) fn span_of(ranges: &[Item]) -> Item {
     match (ranges.first(), ranges.last()) {
         (
             Some(Item::Range {
@@ -3797,7 +3814,7 @@ pub fn multirange_op(ty: ColumnType, op: &str, a: &Spanned, b: &Spanned) -> Resu
 }
 
 /// The ranges of `x` less those of `y`, as `multirange_minus_internal` walks the two in order.
-fn multirange_minus(range: ColumnType, x: &[Item], y: &[Item]) -> Result<Vec<Item>> {
+pub(crate) fn multirange_minus(range: ColumnType, x: &[Item], y: &[Item]) -> Result<Vec<Item>> {
     use std::cmp::Ordering::{Greater, Less};
     let (subtype, discrete) = range_of(range).ok_or_else(|| Error::new("not a range"))?;
     let truth = |o: &str, a: &Item, b: &Item| -> Result<bool> {
@@ -3856,7 +3873,7 @@ fn multirange_minus(range: ColumnType, x: &[Item], y: &[Item]) -> Result<Vec<Ite
 }
 
 /// The ranges `x` and `y` both hold, as `multirange_intersect_internal` walks the two in order.
-fn multirange_intersect(range: ColumnType, x: &[Item], y: &[Item]) -> Result<Vec<Item>> {
+pub(crate) fn multirange_intersect(range: ColumnType, x: &[Item], y: &[Item]) -> Result<Vec<Item>> {
     let truth = |o: &str, a: &Item, b: &Item| -> Result<bool> {
         Ok(matches!(
             range_op(range, o, a, b)?,

@@ -3,11 +3,15 @@
 //! it, the parser's callbacks finding what they are asked for. A jsonb crosses this module as its
 //! normal text, the text `jsonb_out` writes, and is read again, whenever it is asked something,
 //! into the tokens `JsonbIteratorNext` walks: its containers with their counts, its keys in the
-//! order jsonb stores them, its scalars.
+//! order jsonb stores them, its scalars. Their functions, and json and jsonb built from values,
+//! are in `funcs`.
 
 use crate::numeric::Numeric;
 use crate::places::varying_part;
 use crate::{Error, Result};
+
+mod funcs;
+pub use funcs::*;
 
 /// The longest string a jsonb holds, in bytes: `JENTRY_OFFLENMASK`.
 pub const STRING_BYTES_MAX: usize = 0x0FFF_FFFF;

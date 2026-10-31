@@ -2218,6 +2218,114 @@ pub fn geo_cast(a: &Geo, to: GeoKind) -> Option<Result<Geo>> {
     Some(v)
 }
 
+/// An argument of a geometric function: a geometric value, a double precision or an integer.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum GeoArg<'a> {
+    Geo(&'a Geo),
+    Float(f64),
+    Int(i32),
+}
+
+/// The bytes `palloc` refuses past, `MaxAllocSize`.
+const MAX_ALLOC: i64 = 0x3fff_ffff;
+
+/// The function `name` on `args` as PostgreSQL's pg_proc holds it on 19 for those types, computed by
+/// its function: box_area, circle_area, path_area (NULL for an open path), box_center,
+/// circle_center, box_diagonal, circle_diameter, box_height, box_width, circle_radius,
+/// path_isclosed, path_isopen, path_close, path_open, point_slope, points_box, cr_circle,
+/// line_construct_pp, lseg_construct, construct_point and circle_poly; and those an operator
+/// shares (ishorizontal, isvertical, isparallel, isperp, length, npoints) by the operator's. None
+/// where PostgreSQL has no such function of these types.
+pub fn geo_function(name: &str, args: &[GeoArg]) -> Option<Result<GeoValue>> {
+    use Geo as G;
+    use GeoArg as A;
+    use GeoValue as V;
+    let v = match (name, args) {
+        ("area", [A::Geo(G::Box(b))]) => box_ar(b).map(V::Float),
+        ("area", [A::Geo(G::Circle(c))]) => circle_ar(c).map(V::Float),
+        ("area", [A::Geo(G::Path(p))]) => run(|| {
+            if !p.closed {
+                return Ok(V::Null);
+            }
+            let n = p.points.len();
+            let mut area = 0.0;
+            for i in 0..n {
+                let (a, b) = (&p.points[i], &p.points[(i + 1) % n]);
+                area = f8_pl(area, f8_mul(a.x, b.y)?)?;
+                area = f8_mi(area, f8_mul(a.y, b.x)?)?;
+            }
+            f8_div(area.abs(), 2.0).map(V::Float)
+        }),
+        ("center", [A::Geo(G::Box(b))]) => box_cn(b).map(point_value),
+        ("center", [A::Geo(G::Circle(c))]) => Ok(point_value(c.center)),
+        ("diagonal", [A::Geo(G::Box(b))]) => Ok(V::Geo(G::Lseg(lseg(b.high, b.low)))),
+        ("diameter", [A::Geo(G::Circle(c))]) => f8_mul(c.radius, 2.0).map(V::Float),
+        ("height", [A::Geo(G::Box(b))]) => f8_mi(b.high.y, b.low.y).map(V::Float),
+        ("width", [A::Geo(G::Box(b))]) => f8_mi(b.high.x, b.low.x).map(V::Float),
+        ("radius", [A::Geo(G::Circle(c))]) => Ok(V::Float(c.radius)),
+        ("isclosed", [A::Geo(G::Path(p))]) => Ok(V::Bool(p.closed)),
+        ("isopen", [A::Geo(G::Path(p))]) => Ok(V::Bool(!p.closed)),
+        ("pclose" | "popen", [A::Geo(G::Path(p))]) => Ok(V::Geo(G::Path(Path {
+            closed: name == "pclose",
+            points: p.points.clone(),
+        }))),
+        ("ishorizontal", [A::Geo(a)]) => return geo_unary("?-", a),
+        ("isvertical", [A::Geo(a)]) => return geo_unary("?|", a),
+        ("length", [A::Geo(a @ (G::Lseg(_) | G::Path(_)))]) => return geo_unary("@-@", a),
+        ("npoints", [A::Geo(a)]) => return geo_unary("#", a),
+        ("ishorizontal", [A::Geo(a @ G::Point(_)), A::Geo(b @ G::Point(_))]) => {
+            return geo_binary("?-", a, b)
+        }
+        ("isvertical", [A::Geo(a @ G::Point(_)), A::Geo(b @ G::Point(_))]) => {
+            return geo_binary("?|", a, b)
+        }
+        ("isparallel", [A::Geo(a), A::Geo(b)]) if a.kind() == b.kind() => {
+            return geo_binary("?||", a, b)
+        }
+        ("isperp", [A::Geo(a), A::Geo(b)]) if a.kind() == b.kind() => {
+            return geo_binary("?-|", a, b)
+        }
+        ("slope", [A::Geo(G::Point(p)), A::Geo(G::Point(q))]) => point_sl(p, q).map(V::Float),
+        ("box", [A::Geo(G::Point(p)), A::Geo(G::Point(q))]) => {
+            Ok(V::Geo(G::Box(box_construct(p, q))))
+        }
+        ("lseg", [A::Geo(G::Point(p)), A::Geo(G::Point(q))]) => Ok(V::Geo(G::Lseg(lseg(*p, *q)))),
+        ("line", [A::Geo(G::Point(p)), A::Geo(G::Point(q))]) => run(|| {
+            if point_eq_point(p, q) {
+                return Err(Error::new(
+                    "invalid line specification: must be two distinct points",
+                ));
+            }
+            Ok(V::Geo(G::Line(line_construct(p, point_sl(p, q)?)?)))
+        }),
+        ("circle", [A::Geo(G::Point(p)), A::Float(r)]) => Ok(V::Geo(G::Circle(Circle {
+            center: *p,
+            radius: *r,
+        }))),
+        ("point", [A::Float(x), A::Float(y)]) => Ok(point_value(Point { x: *x, y: *y })),
+        ("polygon", [A::Int(n), A::Geo(G::Circle(c))]) => run(|| {
+            if fp_zero(c.radius) || *n < 2 {
+                return circle_poly(*n, c).map(|p| V::Geo(G::Polygon(p)));
+            }
+            // The polygon's size as circle_poly_internal reckons it in an int.
+            let base = (16 * i64::from(*n)) as i32;
+            let size = (40 + i64::from(base)) as i32;
+            if base / *n != 16 || size <= base {
+                return Err(Error::new("too many points requested"));
+            }
+            if i64::from(size) > MAX_ALLOC {
+                return Err(Error::new(format!(
+                    "invalid memory alloc request size {size}"
+                )));
+            }
+            circle_poly(*n, c).map(|p| V::Geo(G::Polygon(p)))
+        }),
+        _ => return None,
+    };
+    Some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

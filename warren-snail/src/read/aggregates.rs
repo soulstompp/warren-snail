@@ -81,6 +81,19 @@ pub(super) enum Agg {
     AnyValue(Option<Value>),
     /// string_agg: the values not NULL so far, each after the delimiter given beside it.
     Concat(Option<Value>),
+    /// array_agg: every value, NULLs among them, and the array type it makes where the step
+    /// resolved it; `arrays` where it takes arrays, each a slice of one more dimension.
+    Collect {
+        ty: Option<ColumnType>,
+        arrays: bool,
+        values: Vec<Value>,
+    },
+    /// An aggregate of json or jsonb.
+    Json(Box<super::json::Fold>),
+    /// range_agg: the type of the ranges or multiranges folded, and every range of theirs so far.
+    RangeUnion(Option<(ColumnType, Vec<crate::composed::Item>)>),
+    /// range_intersect_agg: the range or multirange every one folded so far holds.
+    RangeIntersect(Option<Value>),
     /// An ordered-set or hypothetical-set aggregate: the rows it sorts, how it sorts them, and its
     /// direct arguments, read from the first row they are given on.
     Sorted {
@@ -126,6 +139,11 @@ impl Agg {
             "bit_xor" => Agg::Bitwise { op: '#', acc: None },
             "any_value" => Agg::AnyValue(None),
             "string_agg" => Agg::Concat(None),
+            "range_agg" => Agg::RangeUnion(None),
+            n if super::json::AGGREGATES.contains(&n) => {
+                Agg::Json(Box::new(super::json::Fold::of(n)?))
+            }
+            "range_intersect_agg" => Agg::RangeIntersect(None),
             _ => return None,
         })
     }
@@ -148,6 +166,11 @@ impl Agg {
             by,
             direct: None,
         })
+    }
+
+    /// Whether it folds a NULL in as a value, as array_agg does.
+    pub(super) fn keeps_nulls(&self) -> bool {
+        matches!(self, Agg::Collect { .. } | Agg::Json(_))
     }
 
     /// Its direct arguments, the first time they are given.
@@ -180,6 +203,11 @@ impl Agg {
                 }
                 return Ok(());
             }
+            Agg::Collect { values, .. } => {
+                values.push(args[0].clone());
+                return Ok(());
+            }
+            Agg::Json(fold) => return fold.add(args),
             Agg::Concat(acc) => {
                 let [v, d] = args else {
                     return Err(Error::new("string_agg takes a value and a delimiter"));
@@ -261,7 +289,32 @@ impl Agg {
             Agg::AnyValue(first) => {
                 first.get_or_insert_with(|| args[0].clone());
             }
-            Agg::RegrCount(_) | Agg::Sorted { .. } | Agg::Concat(_) => unreachable!(),
+            Agg::RangeUnion(acc) => {
+                let Value::Composed(ty, c) = &args[0] else {
+                    return Err(Error::new(format!(
+                        "function range_agg({}) does not exist",
+                        super::pipeline::kind_name(&args[0])
+                    )));
+                };
+                let ranges = &mut acc.get_or_insert_with(|| (*ty, Vec::new())).1;
+                match &c.item {
+                    crate::composed::Item::Multirange(rs) => ranges.extend(rs.iter().cloned()),
+                    r => ranges.push(r.clone()),
+                }
+            }
+            Agg::RangeIntersect(acc) => {
+                *acc = Some(match acc.take() {
+                    None => args[0].clone(),
+                    Some(a) => range_intersect(&a, &args[0])?,
+                });
+            }
+            Agg::RegrCount(_)
+            | Agg::Sorted { .. }
+            | Agg::Concat(_)
+            | Agg::Collect { .. }
+            | Agg::Json(_) => {
+                unreachable!()
+            }
         }
         Ok(())
     }
@@ -309,6 +362,28 @@ impl Agg {
                 by,
                 direct,
             } => sorted_value(*of, rows, by, direct.as_deref().unwrap_or(&[]))?,
+            Agg::Collect { ty, arrays, values } => collected(*ty, *arrays, values)?,
+            Agg::Json(fold) => fold.value()?,
+            Agg::RangeUnion(None) | Agg::RangeIntersect(None) => Value::Null,
+            Agg::RangeIntersect(Some(v)) => v.clone(),
+            Agg::RangeUnion(Some((ty, ranges))) => {
+                let (multi, range) = match super::typed::multirange_range(*ty) {
+                    Some(range) => (*ty, range),
+                    None => (
+                        crate::composed::multirange_of(*ty).ok_or_else(|| {
+                            Error::new(format!("{} has no multirange", ty.pg_name()))
+                        })?,
+                        *ty,
+                    ),
+                };
+                super::pipeline::composed(
+                    multi,
+                    crate::composed::Item::Multirange(crate::composed::canonical_ranges(
+                        range,
+                        ranges.clone(),
+                    )),
+                )
+            }
         })
     }
 }
@@ -694,6 +769,50 @@ fn sorted_value(
             }
             best.map_or(Value::Null, |(v, _)| v.clone())
         }
+        // Of an array of fractions, an array of the same shape, each fraction's value.
+        Sorted::PercentileDisc | Sorted::PercentileCont
+            if matches!(direct.first(), Some(Value::Composed(..))) =>
+        {
+            let Some(Value::Composed(ty, c)) = direct.first() else {
+                unreachable!()
+            };
+            let crate::composed::Item::Array {
+                elements,
+                dims,
+                lower,
+            } = &c.item
+            else {
+                return Ok(Value::Null);
+            };
+            if n == 0 {
+                return Ok(Value::Null);
+            }
+            let fraction_type = super::typed::element_of(*ty).unwrap_or(ColumnType::Float8);
+            let values = elements
+                .iter()
+                .map(|p| {
+                    let p = super::pipeline::part_value(fraction_type, p);
+                    sorted_value(of, &sorted, by, &[p])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let element = match (of, &sorted[0][0]) {
+                (Sorted::PercentileCont, Value::Interval(_)) => super::calls::full_interval(),
+                (Sorted::PercentileCont, _) => ColumnType::Float8,
+                (_, v) => super::pipeline::type_of_value(v).unwrap_or(ColumnType::Text(None)),
+            };
+            let elements = values
+                .into_iter()
+                .map(|v| super::pipeline::part_of(element, v, false))
+                .collect::<Result<Vec<_>>>()?;
+            super::pipeline::composed(
+                super::typed::array_of(element),
+                crate::composed::Item::Array {
+                    elements,
+                    dims: dims.clone(),
+                    lower: lower.clone(),
+                },
+            )
+        }
         Sorted::PercentileDisc => {
             let Some(p) = fraction(direct)? else {
                 return Ok(Value::Null);
@@ -781,5 +900,74 @@ fn sorted_value(
                 }
             }
         }
+    })
+}
+
+/// array_agg's answer: NULL over no rows; else the values as one dimension, or, of arrays, each a
+/// slice of one more dimension than theirs.
+fn collected(ty: Option<ColumnType>, arrays: bool, values: &[Value]) -> Result<Value> {
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    let found = values.iter().find_map(super::pipeline::type_of_value);
+    let arrays =
+        arrays || ty.is_none() && found.is_some_and(|t| super::typed::element_of(t).is_some());
+    let ty = match (ty, found) {
+        (Some(t), _) => t,
+        (None, Some(t)) if arrays => t,
+        (None, Some(t)) => super::typed::array_of(t),
+        (None, None) => super::typed::array_of(ColumnType::Text(None)),
+    };
+    let element = super::typed::element_of(ty)
+        .ok_or_else(|| Error::new(format!("{} is no array type", ty.pg_name())))?;
+    if arrays {
+        let mut stacked = crate::arrays::ArrayAgg::new();
+        for v in values {
+            match v {
+                Value::Composed(_, c) => stacked.push(&c.item)?,
+                _ => stacked.push(&crate::composed::Item::Null)?,
+            }
+        }
+        return Ok(super::pipeline::composed(ty, stacked.finish()?));
+    }
+    let elements = values
+        .iter()
+        .map(|v| super::pipeline::part_of(element, v.clone(), false))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(super::pipeline::composed(
+        ty,
+        crate::composed::Item::Array {
+            dims: vec![elements.len() as i32],
+            lower: vec![1],
+            elements,
+        },
+    ))
+}
+
+/// The range two ranges both hold, or the multirange two multiranges both hold.
+fn range_intersect(a: &Value, b: &Value) -> Result<Value> {
+    use crate::composed::{Composed, Item, RangeAnswer};
+    let (Value::Composed(ty, x), Value::Composed(_, y)) = (a, b) else {
+        return Err(Error::new(format!(
+            "function range_intersect_agg({}) does not exist",
+            super::pipeline::kind_name(b)
+        )));
+    };
+    let ColumnType::Composed(r) = ty else {
+        unreachable!()
+    };
+    Ok(match (r.def(), &x.item, &y.item) {
+        (Composed::Multirange { range, .. }, Item::Multirange(xs), Item::Multirange(ys)) => {
+            let both = if xs.is_empty() || ys.is_empty() {
+                Vec::new()
+            } else {
+                crate::composed::multirange_intersect(*range, xs, ys)?
+            };
+            super::pipeline::composed(*ty, Item::Multirange(both))
+        }
+        _ => match crate::composed::range_op(*ty, "*", &x.item, &y.item)? {
+            RangeAnswer::Range(i) => super::pipeline::composed(*ty, i),
+            RangeAnswer::Truth(_) => unreachable!(),
+        },
     })
 }

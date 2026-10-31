@@ -681,6 +681,167 @@ pub fn inet_text(text: &str) -> String {
     format!("{}/{}", v.ntop(v.max_bits()), v.bits)
 }
 
+/// What a function of network.c gives: an inet's text, a cidr's, a text, or an integer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NetValue {
+    Inet(String),
+    Cidr(String),
+    Text(String),
+    Int(i32),
+}
+
+/// A cidr's address written as `pg_inet_cidr_ntop` writes it with a mask of `bits`: IPv4's whole
+/// octets and the one the mask ends in, IPv6's words the mask reaches, then `/` and the mask.
+fn cidr_ntop(v: &Inet, bits: u8) -> String {
+    let src = &v.addr;
+    let bits = bits as usize;
+    if !v.v6 {
+        let mut out = String::new();
+        if bits == 0 {
+            out.push('0');
+        }
+        let mut s = 0;
+        for b in (1..=bits / 8).rev() {
+            out.push_str(&src[s].to_string());
+            s += 1;
+            if b > 1 {
+                out.push('.');
+            }
+        }
+        let b = bits % 8;
+        if b > 0 {
+            if !out.is_empty() {
+                out.push('.');
+            }
+            let m = (((1u32 << b) - 1) << (8 - b)) as u8;
+            out.push_str(&(src[s] & m).to_string());
+        }
+        out.push_str(&format!("/{bits}"));
+        return out;
+    }
+    let mut out = String::new();
+    if bits == 0 {
+        out.push_str("::");
+    } else {
+        let p = bits.div_ceil(8);
+        let mut s = [0u8; 16];
+        s[..p].copy_from_slice(&src[..p]);
+        if !bits.is_multiple_of(8) {
+            s[p - 1] &= 0xff << (8 - bits % 8);
+        }
+        let words = bits.div_ceil(16).max(2);
+        // The longest run of zero words, as the loop finds it.
+        let (mut zero_s, mut zero_l, mut tmp_s, mut tmp_l) = (0, 0, 0, 0);
+        for i in (0..words * 2).step_by(2) {
+            if s[i] | s[i + 1] == 0 {
+                if tmp_l == 0 {
+                    tmp_s = i / 2;
+                }
+                tmp_l += 1;
+            } else if tmp_l != 0 && zero_l < tmp_l {
+                zero_s = tmp_s;
+                zero_l = tmp_l;
+                tmp_l = 0;
+            }
+        }
+        if tmp_l != 0 && zero_l < tmp_l {
+            zero_s = tmp_s;
+            zero_l = tmp_l;
+        }
+        let is_ipv4 = zero_l != words
+            && zero_s == 0
+            && (zero_l == 6
+                || (zero_l == 5 && s[10] == 0xff && s[11] == 0xff)
+                || (zero_l == 7 && s[14] != 0 && s[15] != 1));
+        let mut at = 0;
+        for p in 0..words {
+            if zero_l != 0 && p >= zero_s && p < zero_s + zero_l {
+                if p == zero_s {
+                    out.push(':');
+                }
+                if p == words - 1 {
+                    out.push(':');
+                }
+                at += 2;
+                continue;
+            }
+            if is_ipv4 && p > 5 {
+                out.push(if p == 6 { ':' } else { '.' });
+                out.push_str(&s[at].to_string());
+                at += 1;
+                if p != 7 || bits > 120 {
+                    out.push('.');
+                    out.push_str(&s[at].to_string());
+                    at += 1;
+                }
+            } else {
+                if !out.is_empty() {
+                    out.push(':');
+                }
+                out.push_str(&format!("{:x}", u16::from_be_bytes([s[at], s[at + 1]])));
+                at += 2;
+            }
+        }
+    }
+    out.push_str(&format!("/{bits}"));
+    out
+}
+
+/// The function `name` of network.c on an inet or, where `cidr`, a cidr, held as `text`: abbrev
+/// (inet_abbrev, cidr_abbrev), broadcast, family, host, hostmask, masklen, netmask, network, and
+/// set_masklen to `bits` (inet_set_masklen, cidr_set_masklen), -1 the family's whole mask. None
+/// where network.c has no function of that name.
+pub fn inet_function(
+    name: &str,
+    text: &str,
+    cidr: bool,
+    bits: Option<i32>,
+) -> Option<Result<NetValue>> {
+    let v = held(text);
+    let with_bytes = |f: &dyn Fn(usize) -> u8, bits: u8| Inet {
+        v6: v.v6,
+        bits,
+        addr: std::array::from_fn(|i| if i < v.size() { f(i) } else { 0 }),
+    };
+    // Byte `i`'s mask: the bits of the first `n` of the address.
+    let mask = |n: usize, i: usize| -> u8 {
+        match n.saturating_sub(8 * i) {
+            0 => 0,
+            k if k >= 8 => 0xff,
+            k => 0xff << (8 - k),
+        }
+    };
+    let n = v.bits as usize;
+    let max = v.max_bits();
+    Some(Ok(match (name, bits) {
+        ("abbrev", None) if cidr => NetValue::Text(cidr_ntop(&v, v.bits)),
+        ("abbrev", None) => NetValue::Text(v.ntop(v.bits)),
+        ("broadcast", None) => {
+            NetValue::Inet(with_bytes(&|i| v.addr[i] | !mask(n, i), v.bits).out(false))
+        }
+        ("family", None) => NetValue::Int(if v.v6 { 6 } else { 4 }),
+        ("host", None) => NetValue::Text(v.ntop(max)),
+        ("hostmask", None) => NetValue::Inet(with_bytes(&|i| !mask(n, i), max).out(false)),
+        ("masklen", None) => NetValue::Int(i32::from(v.bits)),
+        ("netmask", None) => NetValue::Inet(with_bytes(&|i| mask(n, i), max).out(false)),
+        ("network", None) => NetValue::Cidr(v.network().out(true)),
+        ("set_masklen", Some(b)) => {
+            let b = if b == -1 { i32::from(max) } else { b };
+            if !(0..=i32::from(max)).contains(&b) {
+                return Some(Err(Error::new(format!("invalid mask length: {b}"))));
+            }
+            let set = Inet { bits: b as u8, ..v };
+            if cidr {
+                NetValue::Cidr(set.network().out(true))
+            } else {
+                NetValue::Inet(set.out(false))
+            }
+        }
+        _ => return None,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

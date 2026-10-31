@@ -696,6 +696,17 @@ fn num_prepare(num: &mut NumDesc, k: &KeyWord) -> Result<()> {
 
 /// parse_format: a template's nodes; for a number template, its description too.
 fn parse_format(s: &[u8], dch: bool, num: Option<&mut NumDesc>) -> Result<Vec<Node>> {
+    parse_format_mode(s, dch, num, false)
+}
+
+/// parse_format, in standard mode where `std` (`STD_FLAG`): outside its keywords and quoted text a
+/// template holds only the separators `-./,':; `, each a node of its own.
+fn parse_format_mode(
+    s: &[u8],
+    dch: bool,
+    num: Option<&mut NumDesc>,
+    std: bool,
+) -> Result<Vec<Node>> {
     let table: &'static [KeyWord] = if dch { &DCH_KEYWORDS } else { &NUM_KEYWORDS };
     let mut num = num;
     let mut out = Vec::new();
@@ -731,7 +742,25 @@ fn parse_format(s: &[u8], dch: bool, num: Option<&mut NumDesc>) -> Result<Vec<No
         if i >= s.len() {
             break;
         }
-        if s[i] == b'"' {
+        if std && s[i] != b'"' {
+            if !b"-./,':; ".contains(&s[i]) {
+                let len = mblen(s[i]).min(s.len() - i);
+                return Err(err(format!(
+                    "invalid datetime format separator: \"{}\"",
+                    text(&s[i..i + len])
+                )));
+            }
+            out.push(Node {
+                kind: if s[i] == b' ' {
+                    NodeKind::Space
+                } else {
+                    NodeKind::Separator
+                },
+                character: vec![s[i]],
+                suffix: 0,
+            });
+            i += 1;
+        } else if s[i] == b'"' {
             i += 1;
             while i < s.len() {
                 if s[i] == b'"' {
@@ -1709,10 +1738,12 @@ fn scan_y_yyy(s: &[u8]) -> Option<(i64, i64, usize)> {
     Some((a, if neg { -v } else { v }, i))
 }
 
-/// DCH_from_char: a text read as a template's nodes ask.
-fn dch_from_char(nodes: &[Node], s: &[u8]) -> Result<TmFromChar> {
+/// DCH_from_char: a text read as a template's nodes ask; in standard mode where `std`, in fixed
+/// format from the start, each separator and character matched exactly, and the text and the
+/// template ending together.
+fn dch_from_char(nodes: &[Node], s: &[u8], std: bool) -> Result<TmFromChar> {
     let mut out = TmFromChar::default();
-    let mut fx_mode = false;
+    let mut fx_mode = std;
     let mut extra_skip: i32 = 0;
     let mut pos = 0usize;
     let mut i = 0usize;
@@ -1727,7 +1758,16 @@ fn dch_from_char(nodes: &[Node], s: &[u8]) -> Result<TmFromChar> {
         }
         match n.kind {
             NodeKind::Space | NodeKind::Separator => {
-                if !fx_mode {
+                if std {
+                    if at(s, pos) == n.character[0] {
+                        pos += 1;
+                    } else {
+                        return Err(err(format!(
+                            "unmatched format separator \"{}\"",
+                            n.character[0] as char
+                        )));
+                    }
+                } else if !fx_mode {
                     extra_skip -= 1;
                     let c = at(s, pos);
                     if is_space(c) || is_separator_char(c) {
@@ -1748,7 +1788,22 @@ fn dch_from_char(nodes: &[Node], s: &[u8]) -> Result<TmFromChar> {
                         pos += mblen(s[pos]);
                     }
                 } else if at(s, pos) != 0 {
-                    pos += mblen(s[pos]);
+                    let len = mblen(s[pos]);
+                    if std {
+                        for k in 0..len {
+                            let c = at(s, pos + k);
+                            if c != n.character.get(k).copied().unwrap_or(0) {
+                                return Err(err(format!(
+                                    "unmatched format character \"{}\"",
+                                    text(&n.character)
+                                )));
+                            }
+                            if c == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    pos += len;
                 }
                 i += 1;
                 continue;
@@ -2009,6 +2064,19 @@ fn dch_from_char(nodes: &[Node], s: &[u8]) -> Result<TmFromChar> {
         }
         i += 1;
     }
+    if std {
+        if i < nodes.len() {
+            return Err(err("input string is too short for datetime format"));
+        }
+        while at(s, pos) != 0 && is_space(s[pos]) {
+            pos += 1;
+        }
+        if at(s, pos) != 0 {
+            return Err(err(
+                "trailing characters remain in input string after datetime format",
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -2034,7 +2102,7 @@ fn field_overflow(s: &str) -> Error {
 
 /// do_to_timestamp: a text read as a template asks into a date and time, its fraction of a second,
 /// its zone's offset where it names one (seconds west of UTC) and its fraction's precision.
-fn do_to_timestamp(input: &str, fmt: &str) -> Result<(PgTm, i32, Option<i32>, i32)> {
+fn do_to_timestamp(input: &str, fmt: &str, std: bool) -> Result<(PgTm, i32, Option<i32>, i32)> {
     let mut tm = PgTm {
         year: 0,
         mon: 1,
@@ -2047,8 +2115,8 @@ fn do_to_timestamp(input: &str, fmt: &str) -> Result<(PgTm, i32, Option<i32>, i3
     let mut fmask = 0u32;
     let mut tmfc = TmFromChar::default();
     if !fmt.is_empty() {
-        let nodes = parse_format(fmt.as_bytes(), true, None)?;
-        tmfc = dch_from_char(&nodes, input.as_bytes())?;
+        let nodes = parse_format_mode(fmt.as_bytes(), true, None, std)?;
+        tmfc = dch_from_char(&nodes, input.as_bytes(), std)?;
     }
     let overflow = || field_overflow(input);
     if tmfc.ssss != 0 {
@@ -2268,7 +2336,7 @@ fn do_to_timestamp(input: &str, fmt: &str) -> Result<(PgTm, i32, Option<i32>, i3
 
 /// `to_date(text, text)`: the date the text is under the template, in days since 1970-01-01.
 pub fn to_date(s: &str, fmt: &str) -> Result<i32> {
-    let (tm, _, _, _) = do_to_timestamp(s, fmt)?;
+    let (tm, _, _, _) = do_to_timestamp(s, fmt, false)?;
     let out = || err(format!("date out of range: \"{s}\""));
     if !valid_julian(tm.year, tm.mon) {
         return Err(out());
@@ -2310,7 +2378,7 @@ fn pg_instant_text(pg: i64) -> String {
 /// `to_timestamp(text, text)`: the instant the text is under the template, in microseconds since
 /// 1970-01-01 UTC; the zone the text names, else UTC.
 pub fn to_timestamp_text(s: &str, fmt: &str) -> Result<i64> {
-    let (tm, fsec, zone, fprec) = do_to_timestamp(s, fmt)?;
+    let (tm, fsec, zone, fprec) = do_to_timestamp(s, fmt, false)?;
     let tz = zone.unwrap_or(0);
     let out = || err("timestamp out of range");
     if !valid_julian(tm.year, tm.mon) {
@@ -2351,6 +2419,215 @@ pub fn to_timestamp_text(s: &str, fmt: &str) -> Result<i64> {
                 pg_instant_text(result)
             ))
         })
+}
+
+/// A date or a time as `parse_datetime` reads one, of the type its template's fields make it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Datetime {
+    /// Days since 1970-01-01.
+    Date(i32),
+    /// Microseconds since midnight.
+    Time(i64),
+    /// Microseconds since midnight, and the zone in seconds west of UTC.
+    TimeTz(i64, i32),
+    /// Microseconds since 1970-01-01 on its own clock.
+    Timestamp(i64),
+    /// Microseconds since 1970-01-01 UTC, and the zone the text named, in seconds west of UTC.
+    TimestampTz(i64, i32),
+}
+
+const DCH_DATED: u32 = 0x01;
+const DCH_TIMED: u32 = 0x02;
+const DCH_ZONED: u32 = 0x04;
+
+/// DCH_datetime_type: which of a date, a time and a zone a template's fields name.
+fn datetime_type(nodes: &[Node]) -> u32 {
+    let mut flags = 0;
+    for k in nodes.iter().filter_map(Node::key) {
+        flags |= match k.id {
+            K::A_M
+            | K::P_M
+            | K::a_m
+            | K::p_m
+            | K::AM
+            | K::PM
+            | K::am
+            | K::pm
+            | K::HH
+            | K::HH12
+            | K::HH24
+            | K::MI
+            | K::SS
+            | K::MS
+            | K::US
+            | K::FF1
+            | K::FF2
+            | K::FF3
+            | K::FF4
+            | K::FF5
+            | K::FF6
+            | K::SSSS => DCH_TIMED,
+            K::tz | K::TZ | K::OF | K::TZH | K::TZM => DCH_ZONED,
+            K::A_D
+            | K::B_C
+            | K::a_d
+            | K::b_c
+            | K::AD
+            | K::BC
+            | K::ad
+            | K::bc
+            | K::MONTH
+            | K::Month
+            | K::month
+            | K::MON
+            | K::Mon
+            | K::mon
+            | K::MM
+            | K::DAY
+            | K::Day
+            | K::day
+            | K::DY
+            | K::Dy
+            | K::dy
+            | K::DDD
+            | K::IDDD
+            | K::DD
+            | K::D
+            | K::ID
+            | K::WW
+            | K::Q
+            | K::CC
+            | K::Y_YYY
+            | K::YYYY
+            | K::IYYY
+            | K::YYY
+            | K::IYY
+            | K::YY
+            | K::IY
+            | K::Y
+            | K::I
+            | K::RM
+            | K::rm
+            | K::W
+            | K::J => DCH_DATED,
+            _ => 0,
+        };
+    }
+    flags
+}
+
+/// `parse_datetime` in standard mode, as the jsonpath methods call it: the text read under the
+/// template, every separator and character matched exactly, into a date, a time, a time with time
+/// zone, a timestamp or a timestamp with time zone as the template's fields name a date, a time
+/// and a zone. The outer refusal PostgreSQL throws whoever asks (a separator the standard does
+/// not name, or what the snail does not read); the inner error is one it reports softly, to a
+/// caller that may pass over it.
+pub fn parse_datetime(s: &str, fmt: &str) -> Result<std::result::Result<Datetime, Error>> {
+    let flags = if fmt.is_empty() {
+        0
+    } else {
+        datetime_type(&parse_format_mode(fmt.as_bytes(), true, None, true)?)
+    };
+    let (tm, fsec, zone, fprec) = match do_to_timestamp(s, fmt, true) {
+        Ok(r) => r,
+        Err(e) if e.0.contains("is not read") => return Err(e),
+        Err(e) => return Ok(Err(e)),
+    };
+    let soft = |m: String| Ok(Err(err(m)));
+    let instant = |tz: i32| -> Option<i64> {
+        if !valid_julian(tm.year, tm.mon) {
+            return None;
+        }
+        let date = i64::from(date2j(tm.year, tm.mon, tm.mday)) - POSTGRES_EPOCH_JDATE;
+        let time = ((i64::from(tm.hour) * 60 + i64::from(tm.min)) * 60 + i64::from(tm.sec))
+            * USECS_PER_SEC
+            + i64::from(fsec);
+        let r = date.checked_mul(USECS_PER_DAY)?.checked_add(time)? + i64::from(tz) * USECS_PER_SEC;
+        (MIN_TIMESTAMP..END_TIMESTAMP).contains(&r).then_some(r)
+    };
+    let time = ((i64::from(tm.hour) * 60 + i64::from(tm.min)) * 60 + i64::from(tm.sec))
+        * USECS_PER_SEC
+        + i64::from(fsec);
+    let typmod = (fprec > 0).then_some(fprec as u32);
+    let unix = |pg: i64| -> Result<i64> {
+        pg.checked_add(EPOCH_SHIFT)
+            .filter(|&t| t < i64::MAX)
+            .ok_or_else(|| {
+                err(format!(
+                    "the instant {} is past the snail's last instant, 294247-01-10 \
+                     04:00:54.775806+00, where Parquet's 64-bit timestamp ends",
+                    pg_instant_text(pg)
+                ))
+            })
+    };
+    let rounded = |pg: i64| -> std::result::Result<i64, Error> {
+        let Some(p) = typmod.filter(|&p| p < 6) else {
+            return Ok(pg);
+        };
+        const SCALES: [i64; 7] = [1_000_000, 100_000, 10_000, 1000, 100, 10, 1];
+        const OFFSETS: [i64; 7] = [500_000, 50_000, 5000, 500, 50, 5, 0];
+        let p = p as usize;
+        let r = if pg >= 0 {
+            (pg + OFFSETS[p]) / SCALES[p] * SCALES[p]
+        } else {
+            -(((-pg) + OFFSETS[p]) / SCALES[p] * SCALES[p])
+        };
+        if !(MIN_TIMESTAMP..END_TIMESTAMP).contains(&r) {
+            return Err(err("timestamp out of range"));
+        }
+        Ok(r)
+    };
+    let time_rounded = |t: i64| match typmod.filter(|&p| p < 6) {
+        Some(p) => crate::times::round_time(t, p),
+        None => t,
+    };
+    if flags & DCH_DATED != 0 {
+        if flags & DCH_TIMED != 0 {
+            if flags & DCH_ZONED != 0 {
+                let Some(tz) = zone else {
+                    return soft("missing time zone in input string for type timestamptz".into());
+                };
+                let Some(pg) = instant(tz) else {
+                    return soft("timestamptz out of range".into());
+                };
+                return Ok(match rounded(pg) {
+                    Ok(pg) => Ok(Datetime::TimestampTz(unix(pg)?, tz)),
+                    Err(e) => Err(e),
+                });
+            }
+            let Some(pg) = instant(0) else {
+                return soft("timestamp out of range".into());
+            };
+            return Ok(match rounded(pg) {
+                Ok(pg) => Ok(Datetime::Timestamp(unix(pg)?)),
+                Err(e) => Err(e),
+            });
+        }
+        if flags & DCH_ZONED != 0 {
+            return soft("datetime format is zoned but not timed".into());
+        }
+        let out = || soft(format!("date out of range: \"{s}\""));
+        if !valid_julian(tm.year, tm.mon) {
+            return out();
+        }
+        let result = i64::from(date2j(tm.year, tm.mon, tm.mday)) - POSTGRES_EPOCH_JDATE;
+        if !(-POSTGRES_EPOCH_JDATE..DATE_END_JULIAN - POSTGRES_EPOCH_JDATE).contains(&result) {
+            return out();
+        }
+        return Ok(Ok(Datetime::Date(
+            (result + POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) as i32,
+        )));
+    }
+    if flags & DCH_TIMED != 0 {
+        if flags & DCH_ZONED != 0 {
+            let Some(tz) = zone else {
+                return soft("missing time zone in input string for type timetz".into());
+            };
+            return Ok(Ok(Datetime::TimeTz(time_rounded(time), tz)));
+        }
+        return Ok(Ok(Datetime::Time(time_rounded(time))));
+    }
+    soft("datetime format is not dated and not timed".into())
 }
 
 // ---------------------------------------------------------------------------------------------
