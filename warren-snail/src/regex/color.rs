@@ -600,8 +600,8 @@ impl Vars {
     fn subcoloronerow(&mut self, rownum: i32, lp: StateId, rp: StateId, lastsubcolor: &mut Color) {
         let nfa = self.nfa;
         let cols = self.cm.hiarraycols as usize;
-        let mut pco = rownum as usize * cols;
-        for _ in 0..cols {
+        let first = rownum as usize * cols;
+        for pco in first..first + cols {
             let sco = self.subcolorhi(pco);
             if self.iserr() {
                 return;
@@ -613,7 +613,6 @@ impl Vars {
                 }
                 *lastsubcolor = sco;
             }
-            pco += 1;
         }
     }
 

@@ -2079,23 +2079,24 @@ impl Vars {
         // an arc labeled as refarc, or as any arc crossed to reach sclone, is met already: sto's
         // arcs are merged into sclone
         let (at, aco) = (ar!(self, a).typ, ar!(self, a).co);
-        let canmerge =
-            if refarc != NOARC && at == ar!(self, refarc).typ && aco == ar!(self, refarc).co {
-                true
-            } else {
-                let mut found = false;
-                let mut s = sclone;
-                while st!(self, s).ins != NOARC {
-                    let ins = st!(self, s).ins;
-                    if st!(self, s).nins == 1 && at == ar!(self, ins).typ && aco == ar!(self, ins).co
-                    {
-                        found = true;
-                        break;
-                    }
-                    s = ar!(self, ins).from;
+        let canmerge = if refarc != NOARC
+            && at == ar!(self, refarc).typ
+            && aco == ar!(self, refarc).co
+        {
+            true
+        } else {
+            let mut found = false;
+            let mut s = sclone;
+            while st!(self, s).ins != NOARC {
+                let ins = st!(self, s).ins;
+                if st!(self, s).nins == 1 && at == ar!(self, ins).typ && aco == ar!(self, ins).co {
+                    found = true;
+                    break;
                 }
-                found
-            };
+                s = ar!(self, ins).from;
+            }
+            found
+        };
 
         if canmerge {
             // the child clone, if any, is not needed
@@ -2390,8 +2391,8 @@ impl Vars {
                         f.result = false;
                         finish = true;
                     } else {
-                        for i in 0..DUPINF as usize {
-                            f.haspath[i + 1] |= next[i];
+                        for (i, &n) in next.iter().enumerate().take(DUPINF as usize) {
+                            f.haspath[i + 1] |= n;
                         }
                         // past DUPINF stays past it
                         f.haspath[top] |= next[top];

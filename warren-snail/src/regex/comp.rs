@@ -669,14 +669,7 @@ impl Vars {
         r
     }
 
-    fn parseqatom_(
-        &mut self,
-        stopper: i32,
-        typ: i32,
-        lp: StateId,
-        rp: StateId,
-        top: SrId,
-    ) -> SrId {
+    fn parseqatom_(&mut self, stopper: i32, typ: i32, lp: StateId, rp: StateId, top: SrId) -> SrId {
         // the atom or constraint; the contents of parentheses parsed here, so that the recursion
         // holds little
         let (atom, atomtype, subno) = match self.qatom_atom(typ, lp, rp, top) {
@@ -960,7 +953,14 @@ impl Vars {
     /// `parseqatom`'s capturing parentheses: the atom marked as capturing, or wrapped in a node that
     /// captures where it captures already.
     #[inline(never)]
-    fn qatom_capture(&mut self, atom: SrId, cap: bool, subno: i32, s: StateId, s2: StateId) -> SrId {
+    fn qatom_capture(
+        &mut self,
+        atom: SrId,
+        cap: bool,
+        subno: i32,
+        s: StateId,
+        s2: StateId,
+    ) -> SrId {
         let mut atom = atom;
         if cap {
             if sr!(self, atom).capno == 0 {
@@ -1161,8 +1161,7 @@ impl Vars {
         }
 
         // the quantifier
-        let s2: StateId;
-        if atomtype == BACKREF {
+        let s2 = if atomtype == BACKREF {
             // a back reference repeats itself
             let (ab, ae) = (sr!(self, atom).begin, sr!(self, atom).end);
             self.emptyarc(s, ab);
@@ -1171,7 +1170,7 @@ impl Vars {
             sr!(self, atom).max = n as i16;
             let af = sr!(self, atom).flags as i32;
             sr!(self, atom).flags |= combine_flags(qprefer, af) as u8;
-            s2 = ae;
+            ae
         } else if m == 1
             && n == 1
             && (qprefer == 0
@@ -1181,7 +1180,7 @@ impl Vars {
             // no quantifier, or one that changes nothing
             let (ab, ae) = (sr!(self, atom).begin, sr!(self, atom).end);
             self.emptyarc(s, ab);
-            s2 = ae;
+            ae
         } else if (aflags & (CAP | BACKR) as i32) == 0 {
             // with no captures nor back references inside, a plain node will do
             let (ab, ae) = (sr!(self, atom).begin, sr!(self, atom).end);
@@ -1192,7 +1191,7 @@ impl Vars {
             noerrn!();
             self.freesubre(atom);
             sr!(self, atomp).child = tt;
-            s2 = sr!(self, tt).end;
+            sr!(self, tt).end
         } else if m > 0 && (aflags & BACKR as i32) == 0 {
             // x{m,n} as x{m-1,n-1}x, capturing in the last x only
             let (ab, ae) = (sr!(self, atom).begin, sr!(self, atom).end);
@@ -1206,7 +1205,7 @@ impl Vars {
             noerrn!();
             sr!(self, c).sibling = atom;
             sr!(self, atomp).child = tt;
-            s2 = ae;
+            ae
         } else {
             // the general case: an iteration node
             let (ab, ae) = (sr!(self, atom).begin, sr!(self, atom).end);
@@ -1224,8 +1223,8 @@ impl Vars {
             sr!(self, tt).child = atom;
             sr!(self, atomp).child = tt;
             // the rest of the branch hangs from the iteration's end
-            s2 = ns2;
-        }
+            ns2
+        };
 
         // and the recursion that waited
         let t = sr!(self, sr!(self, top).child).sibling;
@@ -1770,37 +1769,29 @@ impl Vars {
         let nfa = self.nfa;
         let s1 = self.single_color_transition(begin, end);
         match latype {
-            LATYPE_AHEAD_POS => {
+            LATYPE_AHEAD_POS if s1 != NOSTATE => {
                 // colorset C ahead: AHEAD(C)
-                if s1 != NOSTATE {
-                    self.cloneouts(nfa, s1, lp, rp, AHEAD);
-                    return;
-                }
+                self.cloneouts(nfa, s1, lp, rp, AHEAD);
+                return;
             }
-            LATYPE_AHEAD_NEG => {
+            LATYPE_AHEAD_NEG if s1 != NOSTATE => {
                 // not colorset C ahead: AHEAD(^C)|$
-                if s1 != NOSTATE {
-                    self.colorcomplement(nfa, AHEAD, s1, lp, rp);
-                    self.newarc(nfa, b'$' as i32, 1, lp, rp);
-                    self.newarc(nfa, b'$' as i32, 0, lp, rp);
-                    return;
-                }
+                self.colorcomplement(nfa, AHEAD, s1, lp, rp);
+                self.newarc(nfa, b'$' as i32, 1, lp, rp);
+                self.newarc(nfa, b'$' as i32, 0, lp, rp);
+                return;
             }
-            LATYPE_BEHIND_POS => {
+            LATYPE_BEHIND_POS if s1 != NOSTATE => {
                 // colorset C behind: BEHIND(C)
-                if s1 != NOSTATE {
-                    self.cloneouts(nfa, s1, lp, rp, BEHIND);
-                    return;
-                }
+                self.cloneouts(nfa, s1, lp, rp, BEHIND);
+                return;
             }
-            LATYPE_BEHIND_NEG => {
+            LATYPE_BEHIND_NEG if s1 != NOSTATE => {
                 // not colorset C behind: BEHIND(^C)|^
-                if s1 != NOSTATE {
-                    self.colorcomplement(nfa, BEHIND, s1, lp, rp);
-                    self.newarc(nfa, b'^' as i32, 1, lp, rp);
-                    self.newarc(nfa, b'^' as i32, 0, lp, rp);
-                    return;
-                }
+                self.colorcomplement(nfa, BEHIND, s1, lp, rp);
+                self.newarc(nfa, b'^' as i32, 1, lp, rp);
+                self.newarc(nfa, b'^' as i32, 0, lp, rp);
+                return;
             }
             _ => {}
         }
@@ -2060,4 +2051,297 @@ pub(super) fn cclass_of(v: Chr) -> CharClass {
         K::Word,
     ];
     ALL[v as usize]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chrs(p: &str) -> Vec<Chr> {
+        p.chars().map(|c| c as Chr).collect()
+    }
+
+    fn compile_c(p: &str, cflags: i32) -> Result<Guts, RegError> {
+        compile(&chrs(p), cflags, Ctype::C)
+    }
+
+    /// Whether a compacted NFA reaches its end over the colors of a string between the colors of
+    /// its start and end, anywhere in it.
+    fn search_finds(g: &Guts, s: &str) -> bool {
+        let c = &g.search;
+        let mut colors = vec![c.bos[1]];
+        colors.extend(s.chars().map(|ch| g.cmap.getcolor(ch as Chr)));
+        colors.push(c.eos[1]);
+        let mut cur = vec![false; c.nstates];
+        cur[c.pre] = true;
+        for co in colors {
+            let mut next = vec![false; c.nstates];
+            for (st, on) in cur.iter().enumerate() {
+                if !on {
+                    continue;
+                }
+                let mut k = c.states[st];
+                while c.arcs[k].co != COLORLESS {
+                    let a = c.arcs[k];
+                    if a.co == co || (a.co == RAINBOW && !g.cmap.is_pseudo(co)) {
+                        next[a.to] = true;
+                    }
+                    k += 1;
+                }
+            }
+            if next[c.post] {
+                return true;
+            }
+            cur = next;
+        }
+        false
+    }
+
+    #[test]
+    fn subexpressions_and_notes_are_19_s() {
+        // each as test_regex.out shows it
+        let cases: &[(&str, i32, usize, i64)] = &[
+            ("abc", REG_ADVANCED, 0, 0),
+            (
+                "(.)\\1e",
+                REG_ADVANCED | REG_NOSUB,
+                1,
+                REG_UBACKREF | REG_UNONPOSIX,
+            ),
+            ("a{", REG_ADVANCED, 0, REG_UBRACES | REG_UUNSPEC),
+            ("x^", REG_ADVANCED, 0, REG_UIMPOSSIBLE),
+            (
+                "x(?=((foo)))",
+                REG_ADVANCED,
+                0,
+                REG_ULOOKAROUND | REG_UNONPOSIX,
+            ),
+            (
+                "\\Ma",
+                REG_ADVANCED,
+                0,
+                REG_UNONPOSIX | REG_ULOCALE | REG_UIMPOSSIBLE,
+            ),
+            (
+                "[^\\d\\D]",
+                REG_ADVANCED,
+                0,
+                REG_UBBS | REG_UNONPOSIX | REG_ULOCALE | REG_UIMPOSSIBLE,
+            ),
+            (
+                "(\\w+(?= )).*\\1",
+                REG_ADVANCED,
+                1,
+                REG_UBACKREF | REG_ULOOKAROUND | REG_UNONPOSIX | REG_ULOCALE,
+            ),
+            ("a)b", REG_EXTENDED, 0, REG_UPBOTCH),
+            ("a[\\]]b", REG_ADVANCED, 0, REG_UBBS | REG_UNONPOSIX),
+            ("ab+?", REG_ADVANCED, 0, REG_UNONPOSIX | REG_USHORTEST),
+            ("a*", REG_ADVANCED, 0, REG_UEMPTYMATCH),
+        ];
+        for &(p, cflags, nsub, info) in cases {
+            let g = compile_c(p, cflags).unwrap_or_else(|e| panic!("{p}: {}", e.message()));
+            assert_eq!((g.nsub, g.info), (nsub, info), "{p}");
+        }
+    }
+
+    #[test]
+    fn errors_are_19_s() {
+        // each as test_regex.out shows it
+        let cases: &[(&str, i32, &str)] = &[
+            ("(*)", REG_ADVANCED, "quantifier operand invalid"),
+            (
+                "a",
+                REG_QUOTE | REG_EXTENDED,
+                "invalid argument to regex function",
+            ),
+            ("a(b", REG_ADVANCED, "parentheses () not balanced"),
+            ("a{1", REG_ADVANCED, "braces {} not balanced"),
+            ("***?", REG_ADVANCED, "invalid regexp (reg version 0.8)"),
+            ("a{1,0}", REG_ADVANCED, "invalid repetition count(s)"),
+            ("a{257}", REG_ADVANCED, "invalid repetition count(s)"),
+            ("a[0-[=x=]]", REG_ADVANCED, "invalid character range"),
+            ("a[\\Z]b", REG_ADVANCED, "invalid escape \\ sequence"),
+            ("(?z)ab", REG_ADVANCED, "invalid embedded option"),
+            ("a[[:woopsie:]]", REG_ADVANCED, "invalid character class"),
+            ("a[[..]]b", REG_ADVANCED, "invalid collating element"),
+            (
+                "x(\\w)(?=(\\1))",
+                REG_ADVANCED,
+                "invalid backreference number",
+            ),
+            ("a(b)c\\2", REG_ADVANCED, "invalid backreference number"),
+            ("a[[.a", REG_ADVANCED, "brackets [] not balanced"),
+            ("***:***=a*b", REG_ADVANCED, "quantifier operand invalid"),
+        ];
+        for &(p, cflags, message) in cases {
+            match compile_c(p, cflags) {
+                Err(e) => assert_eq!(e.message(), message, "{p}"),
+                Ok(_) => panic!("{p} compiled"),
+            }
+        }
+    }
+
+    #[test]
+    fn too_complex_where_19_finds_it() {
+        // 19 compiles a literal of 43525 characters and refuses one of 43526: its stack
+        assert!(compile_c(&"a".repeat(43525), REG_ADVANCED).is_ok());
+        assert_eq!(
+            compile_c(&"a".repeat(43526), REG_ADVANCED).err(),
+            Some(RegError(REG_ETOOBIG))
+        );
+        // and refuses 2618 alternatives of a{255}: its space
+        let wide = format!("(?:{}a{{255}})", "a{255}|".repeat(2617));
+        assert_eq!(
+            compile_c(&wide, REG_ADVANCED).err(),
+            Some(RegError(REG_ETOOBIG))
+        );
+        // nesting past the compiler's own depth
+        let deep = format!("{}a{}", "(?:".repeat(1000), ")".repeat(1000));
+        assert_eq!(
+            compile_c(&deep, REG_ADVANCED).err(),
+            Some(RegError(REG_ETOOBIG))
+        );
+    }
+
+    #[test]
+    fn deep_patterns_keep_to_a_thread_s_stack() {
+        // just under the compiler's own depth, on a thread of 2 MiB
+        let h = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let nest = format!("{}a{}", "(".repeat(999), ")".repeat(999));
+                let seq = "(a)".repeat(1498);
+                (
+                    compile_c(&nest, REG_ADVANCED).map(|g| g.nsub),
+                    compile_c(&seq, REG_ADVANCED).map(|g| g.nsub),
+                )
+            })
+            .expect("a thread");
+        assert_eq!(h.join().expect("no overflow"), (Ok(999), Ok(1498)));
+    }
+
+    #[test]
+    fn the_search_nfa_finds_what_19_finds() {
+        // each as test_regex.out shows it: whether a row of a match follows
+        let cases: &[(&str, i32, &str, bool)] = &[
+            ("abc", REG_ADVANCED, "xyabxabce", true),
+            ("abc", REG_ADVANCED, "def", false),
+            ("^b", REG_ADVANCED, "^b", false),
+            ("a.b", REG_ADVANCED | REG_NEWLINE, "a\nb", false),
+            ("^a", REG_ADVANCED | REG_NEWLINE, "b\na", true),
+            ("x^", REG_ADVANCED, "x", false),
+        ];
+        for &(p, cflags, s, found) in cases {
+            let g = compile_c(p, cflags).expect(p);
+            assert_eq!(search_finds(&g, s), found, "{p} on {s:?}");
+        }
+    }
+
+    #[test]
+    fn compacted_nfas_have_their_shapes() {
+        // a plain literal: no lookaround, each state's arcs ended, in order of color
+        let g = compile_c("abc", REG_ADVANCED).expect("abc");
+        let c = &g.search;
+        assert_eq!(c.flags & (HASLACONS | MATCHALL), 0);
+        assert_eq!(c.states.len(), c.nstates);
+        assert_eq!(c.arcs.last().map(|a| a.co), Some(COLORLESS));
+        for s in 0..c.nstates {
+            let arcs: Vec<Color> = c.arcs[c.states[s]..]
+                .iter()
+                .map(|a| a.co)
+                .take_while(|&co| co != COLORLESS)
+                .collect();
+            assert!(arcs.windows(2).all(|w| w[0] <= w[1]), "state {s}");
+        }
+        assert_eq!(c.stflags[c.pre], CNFA_NOPROGRESS);
+
+        // a lookahead of more than one character: a LACON arc and its NFA
+        let g = compile_c("(?=ab)c", REG_ADVANCED).expect("lookahead");
+        assert_eq!(g.lacons.len(), 2);
+        assert_eq!(g.lacons[1].latype, LATYPE_AHEAD_POS);
+        assert!(!g.lacons[1].cnfa.is_null());
+        assert_ne!(g.search.flags & HASLACONS, 0);
+        // a lookahead of one character is an arc's color, and no LACON
+        let g = compile_c("(?=a)a", REG_ADVANCED).expect("one character");
+        assert!(g.lacons.is_empty());
+
+        // a lookbehind's NFA searches: its start loops on every color
+        let g = compile_c("(?<=ab)c", REG_ADVANCED).expect("lookbehind");
+        let la = &g.lacons[1];
+        assert_eq!(la.latype, LATYPE_BEHIND_POS);
+        let pre = la.cnfa.pre;
+        let mut k = la.cnfa.states[pre];
+        let mut loops = false;
+        while la.cnfa.arcs[k].co != COLORLESS {
+            loops |= la.cnfa.arcs[k].co == RAINBOW && la.cnfa.arcs[k].to == pre;
+            k += 1;
+        }
+        assert!(loops);
+
+        // lengths and nothing more: MATCHALL, the search's with no longest match
+        let g = compile_c(".{2,5}", REG_ADVANCED).expect("matchall");
+        let top = &g.subres[1].cnfa;
+        assert_ne!(top.flags & MATCHALL, 0);
+        assert_eq!((top.minmatchall, top.maxmatchall), (2, 5));
+        assert_eq!((g.search.minmatchall, g.search.maxmatchall), (2, DUPINF));
+        let g = compile_c("a.*", REG_ADVANCED).expect("not matchall");
+        assert_eq!((g.search.flags & MATCHALL, g.search.minmatchall), (0, -1));
+    }
+
+    #[test]
+    fn the_tree_is_numbered_as_19_numbers_it() {
+        // two captures: a concatenation of the two, numbered depth first from 1
+        let g = compile_c("(a)(b)", REG_ADVANCED).expect("captures");
+        assert_eq!(g.ntree, 4);
+        let top = &g.subres[1];
+        assert_eq!((top.op, top.child), (b'.', Some(2)));
+        let (first, second) = (&g.subres[2], &g.subres[3]);
+        assert_eq!((first.op, first.capno, first.sibling), (b'=', 1, Some(3)));
+        assert_eq!((second.op, second.capno, second.sibling), (b'=', 2, None));
+        assert_ne!(first.flags & CAP, 0);
+        // nothing messy: one plain node
+        let g = compile_c("a(?:b)c", REG_ADVANCED).expect("plain");
+        assert_eq!(
+            (g.ntree, g.subres[1].op, g.subres[1].child),
+            (2, b'=', None)
+        );
+        // a back reference repeated: its counts on its own node
+        let g = compile_c("(a)\\1{2,3}", REG_ADVANCED).expect("back reference");
+        let b = g
+            .subres
+            .iter()
+            .find(|n| n.op == b'b')
+            .expect("a back reference");
+        assert_eq!((b.backno, b.min, b.max), (1, 2, 3));
+    }
+
+    #[test]
+    fn the_high_colors_are_a_map_of_rows_and_columns() {
+        // README's example: \w a column of its own, U+1234 and U+1D100..U+1D1FF a row each
+        let t = Ctype::Libc { default: true };
+        if !t.available() {
+            return;
+        }
+        let g = compile(
+            &chrs("\\w\\u1234[\\U0001D100-\\U0001D1FF]"),
+            REG_ADVANCED,
+            t,
+        )
+        .expect("high colors");
+        let m = &g.cmap;
+        assert_eq!(m.hiarraycols, 2);
+        assert_eq!(m.classbits[CharClass::Word as usize], 1);
+        let ranges: Vec<(Chr, Chr, usize)> = m
+            .cmranges
+            .iter()
+            .map(|r| (r.cmin, r.cmax, r.rownum))
+            .collect();
+        assert_eq!(ranges, vec![(0x1234, 0x1234, 1), (0x1D100, 0x1D1FF, 2)]);
+        assert_eq!(m.hicolormap.len(), 3 * 2);
+        // the characters named, and a high letter, each a color of its own
+        let (a, b, c) = (m.getcolor(0x1234), m.getcolor(0x1D150), m.getcolor(0x4E00));
+        assert!(a != b && b != c && a != c);
+        assert_eq!(m.getcolor(0x4E01), c);
+    }
 }
