@@ -689,9 +689,13 @@ fn a_pattern_s_fixed_prefix_narrows_the_read_along_an_order_on_its_column_and_ch
             .contains("invalid regular expression: parentheses () not balanced"),
         "{e}"
     );
-    // A row on which the pattern fails fails the question, as in PostgreSQL.
+    // A row on which the pattern fails fails the question, as in PostgreSQL; a pattern ending in
+    // its escape narrows to the string before it, which no row holds, as PostgreSQL's plan along
+    // an index does.
+    let (a, _) = asked(&path, "SELECT id FROM s.p WHERE k LIKE 'p\\'", Some("p_k"));
+    assert!(a.is_empty());
     let e = fresh(&path)
-        .ask("SELECT id FROM s.p WHERE k LIKE 'p\\'", Some("p_k"))
+        .ask("SELECT id FROM s.p WHERE k LIKE 'p0%\\'", Some("p_k"))
         .unwrap_err();
     assert!(
         e.to_string()

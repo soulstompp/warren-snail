@@ -42,8 +42,9 @@ pub(super) fn like_fixed_prefix(pattern: &[u8]) -> Fixed {
         }
         if Some(b) == escape {
             pos += 1;
+            // A pattern ending in its escape is the one string before it, as the planner reads it.
             if pos >= pattern.len() {
-                return Fixed::of(prefix, false);
+                return Fixed::Exact(prefix);
             }
         }
         prefix.push(pattern[pos]);
@@ -72,7 +73,7 @@ pub(super) fn like_fixed_prefix_chars(
         if Some(c) == escape {
             pos += 1;
             if pos >= chars.len() {
-                return Fixed::of(prefix.into_bytes(), false);
+                return Fixed::Exact(prefix.into_bytes());
             }
         }
         if cased(chars[pos]) {
@@ -173,7 +174,8 @@ mod tests {
         assert_eq!(like(b""), Fixed::Exact(Vec::new()));
         assert_eq!(like(b"%abc"), Fixed::None);
         assert_eq!(like(b"a\\%b%"), Fixed::Partial(b"a%b".to_vec()));
-        assert_eq!(like(b"ab\\"), Fixed::Partial(b"ab".to_vec()));
+        assert_eq!(like(b"ab\\"), Fixed::Exact(b"ab".to_vec()));
+        assert_eq!(like(b"a%\\"), Fixed::Partial(b"a".to_vec()));
         assert_eq!(like(b"\xff\x00%"), Fixed::Partial(b"\xff\x00".to_vec()));
         let text = |p: &str, e: Option<char>| like_fixed_prefix_chars(p, e, |_| false);
         assert_eq!(text("a#%b%", Some('#')), Fixed::Partial(b"a%b".to_vec()));
