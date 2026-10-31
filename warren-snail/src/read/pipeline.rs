@@ -1141,7 +1141,6 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
     let key = match (&v, ty) {
         (Value::Null, _) => return Ok(Value::Null),
         (Value::Scalar(from, k), _) if *from == ty => *k,
-        (Value::Scalar(ColumnType::Money(_), k), ColumnType::Money(_)) => *k,
         // An oid and the reg* types are binary-coercible, as are a function's two and an operator's
         // two to each other.
         (Value::Scalar(ColumnType::Reg(a, _), k), ColumnType::Reg(b, _))
@@ -1172,11 +1171,10 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
             unsigned_key(u64::from(u), 32)
         }
         (Value::Int(x), ColumnType::Money(m)) => crate::monetary::of_integer(*x, m.conv())?,
-        (Value::Num(n, s), ColumnType::Money(m)) => {
-            i64::try_from(rounded(*n, *s, m.conv().points()))
-                .map_err(|_| Error::new("bigint out of range"))?
-        }
         // numeric_cash: its count, as numeric_int8 rounds it.
+        (Value::Num(n, s), ColumnType::Money(m)) => {
+            crate::monetary::of_numeric(&Numeric::of_units(*n, *s), m.conv())?
+        }
         (Value::Numeric(n), ColumnType::Money(m)) => crate::monetary::of_numeric(n, m.conv())?,
         (Value::Int(x), ColumnType::Char) if i32::try_from(*x).is_ok() => {
             let b = i8::try_from(*x).map_err(|_| Error::new("\"char\" out of range"))?;

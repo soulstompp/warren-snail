@@ -519,12 +519,8 @@ impl Snail {
                         .then(|| KeyValue::new(RELEASE_KEY.to_string(), table.release.to_string())),
                 )
                 .chain(
-                    (!table.monetary.is_c()
-                        && table
-                            .columns
-                            .iter()
-                            .any(|c| matches!(c.ty, ColumnType::Money(_))))
-                    .then(|| KeyValue::new(MONETARY_KEY.to_string(), table.monetary.name())),
+                    (!table.monetary.is_c() && table.columns.iter().any(|c| c.ty.holds_money()))
+                        .then(|| KeyValue::new(MONETARY_KEY.to_string(), table.monetary.name())),
                 )
                 .chain(
                     nan_columns(table, order, &blocks)

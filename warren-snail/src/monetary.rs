@@ -563,10 +563,13 @@ mod tests {
         assert_eq!(cash_out(-1234567, &yen), "-¥1,234,567");
         assert_eq!(cash_in("¥1,234.5", &yen).unwrap(), 1235);
         assert_eq!(to_numeric(1235, &yen).to_string(), "1235");
+        let n = |s: &str| crate::numeric::Numeric::parse(s).unwrap();
+        assert_eq!(of_numeric(&n("1234.5"), &yen).unwrap(), 1235);
         let dinar = us(&[("frac_digits", "3"), ("mon_grouping", "4")]);
         assert_eq!(cash_out(12345678, &dinar), "$1,2345.678");
         assert_eq!(cash_in("1.2345", &dinar).unwrap(), 1235);
         assert_eq!(of_integer(5, &dinar).unwrap(), 5000);
+        assert_eq!(of_numeric(&n("-1.2345"), &dinar).unwrap(), -1235);
         assert_eq!(to_numeric(-1235, &dinar).to_string(), "-1.235");
         // A decimal point of two bytes is a point; separators of two are taken whole.
         let wide = us(&[

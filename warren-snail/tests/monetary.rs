@@ -118,6 +118,30 @@ fn money_under_another_locale_is_refused_by_name_without_the_feature() {
     );
 }
 
+#[test]
+#[cfg(feature = "standalone")]
+fn a_table_made_on_a_snail_holding_no_money_records_its_money_under_c() {
+    let path = tmp("money-none.snail");
+    weather::write(
+        &path,
+        &Catalog::parse("CREATE TABLE s.n (id integer NOT NULL, PRIMARY KEY (id));").unwrap(),
+        &[],
+    )
+    .unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("CREATE TABLE s.u (id integer NOT NULL, m money, a money[], PRIMARY KEY (id))")
+        .unwrap();
+    drop(w);
+    let s = Snail::open(&path).unwrap();
+    assert_eq!(
+        s.monetary()
+            .iter()
+            .map(|(t, c, l)| format!("{t}.{c} {l}"))
+            .collect::<Vec<_>>(),
+        ["s.u.m C", "s.u.a C"]
+    );
+}
+
 #[cfg(feature = "collations")]
 mod under_a_locale {
     use super::*;
@@ -192,6 +216,7 @@ mod under_a_locale {
             ("v < '0'", vec![2, 5]),
             ("v >= '1.234.567,89'", vec![1]),
             ("v = 'kr. 1.234.567,889'", vec![1]),
+            ("v = CAST('-1,5' AS money)", vec![2]),
         ] {
             let (b, _) = s
                 .ask(
@@ -202,7 +227,9 @@ mod under_a_locale {
             assert_eq!(ids(&b), want, "{w}");
             let (b, _) = s
                 .ask(
-                    &format!("WITH x AS (SELECT id, v FROM s.t) SELECT id FROM x WHERE {w} ORDER BY id"),
+                    &format!(
+                        "WITH x AS (SELECT id, v FROM s.t) SELECT id FROM x WHERE {w} ORDER BY id"
+                    ),
                     None,
                 )
                 .unwrap();
@@ -245,7 +272,9 @@ mod under_a_locale {
                 "kr.-1,234.50"
             ])
         );
-        let (b, _) = s.ask("SELECT sum(t.v) AS m FROM s.t t WHERE t.id < 4", None).unwrap();
+        let (b, _) = s
+            .ask("SELECT sum(t.v) AS m FROM s.t t WHERE t.id < 4", None)
+            .unwrap();
         assert_eq!(shown(&b, 0), some(&["kr. 1.234.566,39"]));
     }
 
@@ -261,7 +290,10 @@ mod under_a_locale {
         let e = w.execute("SET lc_monetary = 'C'").unwrap_err().to_string();
         assert!(e.contains("lc_monetary en_IL.utf8"), "{e}");
         let (b, _) = w
-            .ask("SELECT t.id, t.v FROM s.t t WHERE t.id > 5 ORDER BY t.id", None)
+            .ask(
+                "SELECT t.id, t.v FROM s.t t WHERE t.id > 5 ORDER BY t.id",
+                None,
+            )
             .unwrap();
         assert_eq!(shown(&b, 1), some(&["₪ 2.50-", "₪ 3.00-"]));
         // A table made on the snail takes the file's lc_monetary for its money.
@@ -271,10 +303,7 @@ mod under_a_locale {
             .unwrap();
         drop(w);
         let mut s = Snail::open(&path).unwrap();
-        assert!(s
-            .monetary()
-            .iter()
-            .all(|(_, _, l)| l == "en_IL.utf8"));
+        assert!(s.monetary().iter().all(|(_, _, l)| l == "en_IL.utf8"));
         let (b, _) = s.ask("SELECT u.id, u.m FROM s.u u", None).unwrap();
         assert_eq!(shown(&b, 1), some(&["₪ 1,000.50"]));
     }
@@ -342,5 +371,41 @@ mod under_a_locale {
             .ask("SELECT t.id, t.v FROM s.t t WHERE t.id = 2", None)
             .unwrap();
         assert_eq!(shown(&b, 1), some(&["-£1.50"]));
+    }
+
+    #[test]
+    #[cfg(feature = "standalone")]
+    fn money_held_in_an_array_reads_and_prints_under_the_file_s_locale() {
+        // A file whose money lies in an array alone records it for that column.
+        let ddl = "CREATE TABLE s.a (id integer NOT NULL, a money[], PRIMARY KEY (id));";
+        let path = tmp("money-dk-array.snail");
+        write_carried(
+            &path,
+            &Catalog::parse(ddl).unwrap(),
+            &[],
+            &[],
+            span(),
+            warren_snail::regs::LATEST,
+            &carried(&[("s.a", "a", "en_DK.utf8")]),
+        )
+        .unwrap();
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("INSERT INTO s.a (id, a) VALUES (1, '{1.5,-2}')")
+            .unwrap();
+        // Each as PostgreSQL 18.6 printed it on 28818 under lc_monetary en_DK.utf8 (2026-10-31).
+        let (b, _) = w
+            .ask(
+                "WITH x AS (SELECT id, a FROM s.a) SELECT id, a::text AS t, \
+                 CAST('{1.5,-2}' AS money[])::text AS u FROM x",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            [shown(&b, 1), shown(&b, 2)].concat(),
+            some(&[
+                "{\"kr. 15,00\",\"kr. -2,00\"}",
+                "{\"kr. 15,00\",\"kr. -2,00\"}"
+            ])
+        );
     }
 }

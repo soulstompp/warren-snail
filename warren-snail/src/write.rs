@@ -761,10 +761,8 @@ fn write_made(
     }
     let mut named = catalog.clone();
     named.with_release(release)?;
-    named.with_monetary(&crate::file::monetary_of(
-        &named,
-        carried.map_or(&[], |c| &c.monetary),
-    ))?;
+    let monetary = crate::file::monetary_of(&named, carried.map_or(&[], |c| &c.monetary));
+    named.with_monetary(&monetary)?;
     let mut w = Writer::create_spanned(path, span)?;
     if let Some(f) = format {
         w.set_format(f);

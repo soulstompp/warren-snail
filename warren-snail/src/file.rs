@@ -433,19 +433,17 @@ pub struct Pending {
 /// The `lc_monetary` money is written under where nothing names another.
 pub const MONETARY: &str = "C";
 
-/// Each money column of a catalog with its `lc_monetary`: the one `had` records for it, or for a
-/// column it does not, the file's: the one `had` records for a money column the catalog holds, C
+/// Each column of a catalog holding money, with its `lc_monetary`: the one `had` records for it, or
+/// for a column it does not, the file's: the one `had` records for a column the catalog holds, C
 /// where it records none.
 pub fn monetary_of(
     catalog: &crate::catalog::Catalog,
     had: &[(String, String, String)],
 ) -> Vec<(String, String, String)> {
     let held = |t: &str, c: &str| {
-        catalog.table(t).is_some_and(|t| {
-            t.columns
-                .iter()
-                .any(|x| x.name == c && matches!(x.ty, crate::catalog::ColumnType::Money(_)))
-        })
+        catalog
+            .table(t)
+            .is_some_and(|t| t.columns.iter().any(|x| x.name == c && x.ty.holds_money()))
     };
     let file = had
         .iter()
@@ -453,11 +451,7 @@ pub fn monetary_of(
         .map_or(MONETARY, |m| m.2.as_str());
     let mut out = Vec::new();
     for t in &catalog.tables {
-        for c in t
-            .columns
-            .iter()
-            .filter(|c| matches!(c.ty, crate::catalog::ColumnType::Money(_)))
-        {
+        for c in t.columns.iter().filter(|c| c.ty.holds_money()) {
             let locale = had
                 .iter()
                 .find(|(a, b, _)| *a == t.name && *b == c.name)

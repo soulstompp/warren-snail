@@ -394,11 +394,7 @@ fn cmd_write(args: &[String]) -> Result<()> {
         Some(locale) => {
             let mut carried = warren_snail::write::Carried::default();
             for t in &catalog.tables {
-                for c in t
-                    .columns
-                    .iter()
-                    .filter(|c| matches!(c.ty, warren_snail::catalog::ColumnType::Money(_)))
-                {
+                for c in t.columns.iter().filter(|c| c.ty.holds_money()) {
                     carried
                         .monetary
                         .push((t.name.clone(), c.name.clone(), locale.to_string()));

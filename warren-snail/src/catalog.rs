@@ -424,6 +424,23 @@ impl ColumnType {
         }
     }
 
+    /// Whether a value of the type holds money: money itself, or a composed type with money among
+    /// its parts.
+    pub fn holds_money(self) -> bool {
+        use crate::composed::Composed;
+        match self {
+            ColumnType::Money(_) => true,
+            ColumnType::Composed(r) => match r.def() {
+                Composed::Array { element, .. } => element.holds_money(),
+                Composed::Record { fields, .. } => fields.iter().any(|f| f.ty.holds_money()),
+                Composed::Range { subtype, .. } => subtype.holds_money(),
+                Composed::Multirange { range, .. } => range.holds_money(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// The type with its money, and the money its parts hold, read and printed under `m`.
     pub fn with_monetary(self, m: crate::monetary::Monetary) -> ColumnType {
         use crate::composed::Composed;
@@ -2566,19 +2583,20 @@ impl Catalog {
     pub fn with_monetary(&mut self, recorded: &[(String, String, String)]) -> Result<()> {
         let mut file: Option<(String, &str)> = None;
         for t in &self.tables {
-            for c in t
-                .columns
-                .iter()
-                .filter(|c| matches!(c.ty, ColumnType::Money(_)))
-            {
+            for c in t.columns.iter().filter(|c| c.ty.holds_money()) {
                 let named = format!("{}.{}", t.name, c.name);
-                let Some((_, _, l)) = recorded
+                // A column holding money among its parts takes the file's where it records none.
+                let l = match recorded
                     .iter()
                     .find(|(a, b, _)| *a == t.name && *b == c.name)
-                else {
-                    return Err(Error::new(format!(
-                        "{named} is money, and the file records no lc_monetary for it"
-                    )));
+                {
+                    Some((_, _, l)) => l,
+                    None if matches!(c.ty, ColumnType::Money(_)) => {
+                        return Err(Error::new(format!(
+                            "{named} is money, and the file records no lc_monetary for it"
+                        )))
+                    }
+                    None => continue,
                 };
                 match &file {
                     Some((other, was)) if !crate::monetary::Monetary::names_same(was, l) => {
