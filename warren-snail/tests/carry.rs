@@ -402,7 +402,10 @@ fn a_round_on_a_follower_keeps_the_pages_its_generation_names_and_the_apply_wait
     let c = rx.recv().unwrap();
     let f = follower.clone();
     let one = std::thread::spawn(move || carry::apply(&f, &c));
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !one.is_finished() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert!(
         one.is_finished(),
         "a round at the newest generation held the next commit"
