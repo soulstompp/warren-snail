@@ -665,16 +665,26 @@ fn caltdissect(v: &mut Vars, t: usize, begin: usize, end: usize) -> i32 {
     REG_NOMATCH
 }
 
-/// The places C's array of a dissection's endpoints would take, refused where that passes
-/// PostgreSQL's greatest allocation.
-fn endpoints(n: usize) -> Option<Vec<usize>> {
+/// Room for the `n` endpoints of a dissection's iterations, the first `begin`; None where C's
+/// array of them would pass PostgreSQL's greatest allocation, or cannot be had.
+fn endpoints(n: usize, begin: usize) -> Option<Vec<usize>> {
     if n.checked_mul(8).is_none_or(|b| b > MAX_ALLOC_SIZE) {
         return None;
     }
     let mut endpts = Vec::new();
     endpts.try_reserve_exact(n).ok()?;
-    endpts.resize(n, 0);
+    endpts.push(begin);
     Some(endpts)
+}
+
+/// The k'th iteration's end recorded: the ends are found in order, so the k'th is one found
+/// already or the next.
+fn setend(endpts: &mut Vec<usize>, k: usize, e: usize) {
+    if k < endpts.len() {
+        endpts[k] = e;
+    } else {
+        endpts.push(e);
+    }
 }
 
 /// The fewest and most iterations an iteration node's dissection tries over `begin` to `end`,
@@ -701,10 +711,9 @@ fn citerdissect(v: &mut Vars, t: usize, begin: usize, end: usize) -> i32 {
         return REG_ASSERT;
     };
     let (min_matches, max_matches) = iteration_bounds(v, t, begin, end);
-    let Some(mut endpts) = endpoints(max_matches + 1) else {
+    let Some(mut endpts) = endpoints(max_matches + 1, begin) else {
         return REG_ESPACE;
     };
-    endpts[0] = begin;
 
     let Some(mut d) = getsubdfa(v, child) else {
         return v.err;
@@ -727,7 +736,7 @@ fn citerdissect_with(
     v: &mut Vars,
     child: usize,
     d: &mut Dfa,
-    endpts: &mut [usize],
+    endpts: &mut Vec<usize>,
     min_matches: usize,
     max_matches: usize,
     end: usize,
@@ -750,7 +759,7 @@ fn citerdissect_with(
                 k -= 1;
                 break 'try_k;
             };
-            endpts[ku] = e;
+            setend(endpts, ku, e);
 
             if nverified >= k {
                 nverified = k - 1;
@@ -829,10 +838,9 @@ fn creviterdissect(v: &mut Vars, t: usize, begin: usize, end: usize) -> i32 {
         return REG_OKAY;
     }
     let (min_matches, max_matches) = iteration_bounds(v, t, begin, end);
-    let Some(mut endpts) = endpoints(max_matches + 1) else {
+    let Some(mut endpts) = endpoints(max_matches + 1, begin) else {
         return REG_ESPACE;
     };
-    endpts[0] = begin;
 
     let Some(mut d) = getsubdfa(v, child) else {
         return v.err;
@@ -856,7 +864,7 @@ fn creviterdissect_with(
     v: &mut Vars,
     child: usize,
     d: &mut Dfa,
-    endpts: &mut [usize],
+    endpts: &mut Vec<usize>,
     min_matches: usize,
     max_matches: usize,
     begin: usize,
@@ -893,7 +901,7 @@ fn creviterdissect_with(
                 k -= 1;
                 break 'try_k;
             };
-            endpts[ku] = e;
+            setend(endpts, ku, e);
 
             if nverified >= k {
                 nverified = k - 1;
