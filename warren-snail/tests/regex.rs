@@ -130,7 +130,7 @@ fn the_regexp_functions_answer_as_postgresql_s() {
         ),
         (
             "regexp_substr(t, p, 1, 1, '', 1)",
-            ["a", "bar", "zz", "NULL", "o", "c", "É", "NULL", "NULL"],
+            ["a", "bar", "zz", "", "o", "c", "É", "NULL", "NULL"],
         ),
         (
             "regexp_split_to_array(t, p)",
