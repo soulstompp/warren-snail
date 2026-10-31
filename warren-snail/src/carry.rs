@@ -67,6 +67,50 @@ pub const AT_ONCE: u64 = 0;
 /// tag names committed, as the round asking sees it. An error refuses the round.
 pub trait Judge {
     fn taken(&self, tag: u64) -> Result<bool>;
+
+    /// Whether the round asking sees the host's transaction `tag` as ended, a transaction known
+    /// to have committed, since a root built on its own lies in the file. Where it does not, the
+    /// generation the round sees is no longer in the file (`Snail::unseen`). A round sees every
+    /// transaction that committed unless its judge says otherwise.
+    fn sees(&self, tag: u64) -> Result<bool> {
+        let _ = tag;
+        Ok(true)
+    }
+
+    /// The root the round takes, where the judge hands it rather than saying which copy is taken:
+    /// its page as it lies in the file (`taken_root`). The round takes that root, refused by name
+    /// where it lies in neither copy, and a writer takes its pages from its free map.
+    fn root(&self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
+
+/// The root a round takes from the snail at `path` as `judge` decides, its page as it lies in the
+/// file: what a host that keeps the root hands a writer outside it, which takes that root.
+pub fn taken_root(path: &Path, judge: &dyn Judge) -> Result<Vec<u8>> {
+    let files = Files::open(path, false, false)?;
+    let mut both = vec![0u8; 2 * PAGE];
+    files.first.read_exact_at(&mut both, 0)?;
+    let c = crate::file::copies(&both, Some(judge))?.copy as usize;
+    let mut page = both[c * PAGE..(c + 1) * PAGE].to_vec();
+    while page.last() == Some(&0) {
+        page.pop();
+    }
+    Ok(page)
+}
+
+/// The newest generation whose root lies whole in the snail at `path`, whether a round takes it or
+/// not.
+pub fn newest(path: &Path) -> Result<u64> {
+    let files = Files::open(path, false, false)?;
+    let mut both = vec![0u8; 2 * PAGE];
+    files.first.read_exact_at(&mut both, 0)?;
+    [Root::decode(&both[..PAGE]), Root::decode(&both[PAGE..])]
+        .into_iter()
+        .flatten()
+        .map(|(r, _)| r.generation)
+        .max()
+        .ok_or_else(|| Error::new("neither copy of the root is whole"))
 }
 
 impl Commit {

@@ -949,6 +949,9 @@ pub struct Reader {
     /// copy beside the root last read that it did not take, a root of the generation after it.
     judge: RefCell<Option<Rc<dyn crate::carry::Judge>>>,
     waiting: Cell<Option<u64>>,
+    /// The tag of a transaction whose commit the root last read holds and which the judge's round
+    /// does not see.
+    unseen: Cell<Option<u64>>,
     #[cfg(feature = "standalone")]
     held: RefCell<Held>,
     #[cfg(feature = "standalone")]
@@ -975,6 +978,7 @@ impl Reader {
             copy: Cell::new(0),
             judge: RefCell::new(None),
             waiting: Cell::new(None),
+            unseen: Cell::new(None),
             #[cfg(feature = "standalone")]
             held: RefCell::new(Held::new(0)),
             #[cfg(feature = "standalone")]
@@ -1161,10 +1165,12 @@ impl Reader {
             pending,
             copy,
             waiting,
+            unseen,
         } = self.copies()?;
         self.files.span.set(root.span);
         self.files.format.set(format);
         crate::lock::keep_generation(&self.files.first, from, root.generation)?;
+        self.unseen.set(unseen);
         self.round.set(Some(root.generation));
         self.forget_reused(&root);
         self.generation.set(root.generation);
@@ -1184,6 +1190,7 @@ impl Reader {
             pending,
             copy,
             waiting,
+            ..
         } = self.copies()?;
         self.files.span.set(root.span);
         self.files.format.set(format);
@@ -1195,11 +1202,14 @@ impl Reader {
     }
 
     /// The root's two copies read, and the root taken from them as the reader's judge, where it has
-    /// one, decides the roots a host tagged.
+    /// one, decides the roots a host tagged, or the root it hands.
     fn copies(&self) -> Result<Copies> {
         let both = self.read(0, 2)?;
         let judge = self.judge.borrow().clone();
-        copies(&both, judge.as_deref())
+        match judge.as_deref().map(|j| j.root()).transpose()?.flatten() {
+            Some(page) => handed(&both, &page),
+            None => copies(&both, judge.as_deref()),
+        }
     }
 
     /// Takes the roots a host tagged from now on only where `judge` says the host's transaction
@@ -1217,6 +1227,12 @@ impl Reader {
     /// tagged, where the round did not take it.
     pub fn waiting_on(&self) -> Option<u64> {
         self.waiting.get()
+    }
+
+    /// The tag of a transaction whose commit the root last read holds and which the judge's round
+    /// does not see, where there is one: the generation that round sees is no longer in the file.
+    pub fn unseen(&self) -> Option<u64> {
+        self.unseen.get()
     }
 
     /// The copy, 0 or 1, of the root's two that the root last read lies in.
@@ -1293,6 +1309,9 @@ pub(crate) struct Copies {
     /// The tag of the other copy, where it is a root of the generation after the root that its
     /// host tagged and the round did not take.
     pub(crate) waiting: Option<u64>,
+    /// The tag of a transaction whose commit the root holds and which the judge's round does not
+    /// see: the root's own, or its parent's beside it.
+    pub(crate) unseen: Option<u64>,
 }
 
 /// `newer`, the copy of the two it lies in, and the other copy where it is a pending one, written
@@ -1340,12 +1359,32 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
             .as_ref()
             .filter(|(r, _)| r.generation == root.generation + 1)
             .and_then(|(r, _)| r.host);
+        // The root holds its own commit and its parent's: the tag of either the judge's round does
+        // not see.
+        let mut unseen = None;
+        if let Some(j) = judge {
+            let parent = decoded[1 - copy as usize]
+                .as_ref()
+                .map(|(r, _)| r)
+                .filter(|r| r.generation + 1 == root.generation);
+            let tags = [Some(root), parent]
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.host);
+            for tag in tags {
+                if tag != crate::carry::AT_ONCE && !j.sees(tag)? {
+                    unseen = Some(tag);
+                    break;
+                }
+            }
+        }
         return Ok(Copies {
             root: root.clone(),
             format: *format,
             pending,
             copy,
             waiting,
+            unseen,
         });
     }
     if let Some((copy, (root, format))) =
@@ -1359,6 +1398,7 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
             pending: None,
             copy,
             waiting: None,
+            unseen: None,
         });
     }
     for copy in [&both[..PAGE], &both[PAGE..]] {
@@ -1372,6 +1412,37 @@ pub(crate) fn copies(both: &[u8], judge: Option<&dyn crate::carry::Judge>) -> Re
         }
     }
     Err(Error::new("neither copy of the root is whole"))
+}
+
+/// The root a judge hands a round, in place of its word on each copy: taken where it lies in
+/// either copy, and refused by name where it lies in neither.
+pub(crate) fn handed(both: &[u8], page: &[u8]) -> Result<Copies> {
+    let whole = || Error::new("the root the snail's host hands is no root, whole");
+    if page.len() > PAGE {
+        return Err(whole());
+    }
+    let mut page = page.to_vec();
+    page.resize(PAGE, 0);
+    let (root, format) = Root::decode(&page).ok_or_else(whole)?;
+    let copy = (0..2usize)
+        .find(|&c| both[c * PAGE..(c + 1) * PAGE] == page[..])
+        .ok_or_else(|| {
+            Error::new(format!(
+                "the root of generation {} the snail's host hands lies in neither copy of its root",
+                root.generation
+            ))
+        })?;
+    let other = Root::decode(&both[(1 - copy) * PAGE..(2 - copy) * PAGE])
+        .map(|(r, _)| r)
+        .filter(|r| r.generation == root.generation + 1);
+    Ok(Copies {
+        pending: other.clone().filter(|r| r.pending.is_some()),
+        waiting: other.and_then(|r| r.host),
+        root,
+        format,
+        copy: copy as u64,
+        unseen: None,
+    })
 }
 
 /// Where a commit stops short, for the tests of a crash: before the root, or halfway through it.

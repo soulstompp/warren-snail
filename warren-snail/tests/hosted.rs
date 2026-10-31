@@ -444,3 +444,125 @@ fn a_replay_waits_for_a_round_holding_a_generation_its_commit_frees_and_an_error
     );
     assert_eq!(calls, 0);
 }
+
+/// A round's judge as of one moment: the tags it takes, and those whose transactions it does not
+/// see though their host committed them.
+#[derive(Clone, Default)]
+struct AsOf {
+    taken: Vec<u64>,
+    unseen: Vec<u64>,
+}
+
+impl Judge for AsOf {
+    fn taken(&self, tag: u64) -> warren_snail::Result<bool> {
+        Ok(self.taken.contains(&tag))
+    }
+
+    fn sees(&self, tag: u64) -> warren_snail::Result<bool> {
+        Ok(!self.unseen.contains(&tag))
+    }
+}
+
+/// The generation a round takes as `judge` decides, and the tag it names unseen.
+fn taken_as(path: &Path, judge: AsOf) -> (u64, Option<u64>) {
+    let s = Snail::open_judged(path, Rc::new(judge)).unwrap();
+    (s.generation(), s.unseen())
+}
+
+#[test]
+fn a_root_holding_a_commit_its_judges_round_does_not_see_names_that_commit() {
+    let s = sample(2_000);
+    let path = snail("hosted-unseen", &s);
+    let g = Snail::open(&path).unwrap().generation();
+    let said = Said::default();
+    let (mut w, _) = hosted(&path, 7, &said);
+    w.execute(&station(1, "Sagres 1")).unwrap();
+    drop(w);
+    said.committed(7);
+    let (mut w, _) = hosted(&path, 8, &said);
+    w.execute(&station(2, "Sagres 2")).unwrap();
+    drop(w);
+    // 8's root lies beside 7's, which it began from: a round that sees neither takes 7's, a commit
+    // it does not see.
+    let as_of = |taken: &[u64], unseen: &[u64]| AsOf {
+        taken: taken.to_vec(),
+        unseen: unseen.to_vec(),
+    };
+    assert_eq!(taken_as(&path, as_of(&[], &[7, 8])), (g + 1, Some(7)));
+    assert_eq!(taken_as(&path, as_of(&[7], &[8])), (g + 1, None));
+    assert_eq!(taken_as(&path, as_of(&[7, 8], &[])), (g + 2, None));
+    // A judge that says nothing of what its round sees, and a round with no judge, name none.
+    assert_eq!(
+        Snail::open_judged(&path, Rc::new(said.clone()))
+            .unwrap()
+            .unseen(),
+        None
+    );
+    assert_eq!(Snail::open(&path).unwrap().unseen(), None);
+    // A sequence's advance landing at once on a transaction's root holds that transaction's commit.
+    let sequenced = tmp("hosted-unseen-sequence.snail");
+    write(&sequenced, &Catalog::parse(SEQUENCED).unwrap(), &[]).unwrap();
+    let g = Snail::open(&sequenced).unwrap().generation();
+    let (mut w, _) = hosted(&sequenced, 7, &said);
+    w.execute("INSERT INTO shop.orders (v) VALUES (1)").unwrap();
+    drop(w);
+    let (mut w, _) = hosted(&sequenced, 9, &said);
+    w.execute("BEGIN").unwrap();
+    w.execute("INSERT INTO shop.orders (v) VALUES (2)").unwrap();
+    drop(w);
+    assert_eq!(taken_as(&sequenced, as_of(&[], &[7])), (g + 3, Some(7)));
+    assert_eq!(taken_as(&sequenced, as_of(&[7], &[])), (g + 3, None));
+}
+
+/// A judge that hands the root its host takes, and says no word on a copy.
+struct Handing(Vec<u8>);
+
+impl Judge for Handing {
+    fn taken(&self, _tag: u64) -> warren_snail::Result<bool> {
+        Err(warren_snail::Error::new(
+            "a judge that hands the root is asked no word on a copy",
+        ))
+    }
+
+    fn root(&self) -> warren_snail::Result<Option<Vec<u8>>> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+#[test]
+fn a_writer_handed_the_root_its_host_takes_begins_from_it() {
+    let s = sample(2_000);
+    let path = snail("hosted-handed", &s);
+    let g = Snail::open(&path).unwrap().generation();
+    let said = Said::default();
+    let before = carry::taken_root(&path, &said).unwrap();
+    let (mut w, _) = hosted(&path, 7, &said);
+    w.execute(&station(1, "Sagres 1")).unwrap();
+    drop(w);
+    // Its host took 7's root: the newest the file holds, though a round with no judge reads the
+    // root before it.
+    said.committed(7);
+    assert_eq!(carry::newest(&path).unwrap(), g + 1);
+    assert_eq!(Snail::open(&path).unwrap().generation(), g);
+    let root = carry::taken_root(&path, &said).unwrap();
+    let handed = Snail::open_judged(&path, Rc::new(Handing(root.clone()))).unwrap();
+    assert_eq!(handed.generation(), g + 1);
+    drop(handed);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let host = Tagging {
+        tag: 8,
+        log: log.clone(),
+    };
+    let mut w = Snail::open_carried(&path, Box::new(host), Rc::new(Handing(root))).unwrap();
+    w.execute(&station(2, "Sagres 2")).unwrap();
+    drop(w);
+    assert_eq!(log.lock().unwrap()[0].parent, g + 1);
+    said.committed(8);
+    assert_eq!(read_as(&path, Some(&said), "Sagres 1"), (g + 2, 1));
+    assert_eq!(read_as(&path, Some(&said), "Sagres 2"), (g + 2, 1));
+    // A root the file no longer holds, handed, is refused by name.
+    let e = Snail::open_judged(&path, Rc::new(Handing(before)))
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("lies in neither copy"), "{e}");
+}

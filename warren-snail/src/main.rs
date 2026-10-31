@@ -60,8 +60,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           --host names the command that carries each commit to it, psql for one, read a
           statement at a time; the statements run as one transaction of the host's, under the
           writers' lock PostgreSQL's writers take, the server warren_snail_pg names the snail
-          by --host-server deciding which of its roots is taken, logging the commit and writing
-          its root.
+          by --host-server handing it the root it takes, logging the commit and writing its
+          root.
   read    the question's answer, as Parquet. Prints each round: the order it read along, and the
           pages it predicted and read. --order names the order to read along; each --param gives
           the next of $1, $2 and on, as text. --rounds asks it again on the one open snail, which
@@ -342,24 +342,44 @@ impl warren_snail::carry::Host for Hosted {
     }
 }
 
-/// The judge the server is: whether the transaction a root's tag names committed.
-struct Asked(Arc<std::sync::Mutex<Carrier>>);
+/// The judge the server is: it hands the writer the root it takes, the writer holding the writers'
+/// lock, and says no word on a copy.
+struct Asked {
+    carrier: Arc<std::sync::Mutex<Carrier>>,
+    server: String,
+}
 
 impl warren_snail::carry::Judge for Asked {
-    fn taken(&self, tag: u64) -> Result<bool> {
-        let said = self
-            .0
-            .lock()
-            .unwrap()
-            .one(&format!("SELECT warren_snail_taken({tag})"))?;
-        Ok(said == "t")
+    fn taken(&self, _tag: u64) -> Result<bool> {
+        Err(Error::new(
+            "the host hands the root it takes, and says no word on a copy",
+        ))
+    }
+
+    fn root(&self) -> Result<Option<Vec<u8>>> {
+        let hex = self.carrier.lock().unwrap().one(&format!(
+            "SELECT encode(warren_snail_root({}), 'hex')",
+            literal(&self.server)
+        ))?;
+        let bytes: Option<Vec<u8>> = (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                hex.get(i..i + 2)
+                    .and_then(|b| u8::from_str_radix(b, 16).ok())
+            })
+            .collect();
+        bytes
+            .filter(|b| !b.is_empty())
+            .map(Some)
+            .ok_or_else(|| Error::new("the host handed no root"))
     }
 }
 
 /// The statements run as one transaction of the host's, on a snail its host writes: the host's
-/// command takes the writers' lock in a transaction of its own, the snail asks it which of its roots
-/// are taken, and its one commit is handed to it, the host writing the root; then the host's
-/// transaction commits. Each statement's account, the commit's last.
+/// command takes the writers' lock in a transaction of its own and hands the snail the root it
+/// takes, the snail choosing its pages from that root's free map, and its one commit is handed to
+/// it, the host writing the root; then the host's transaction commits. Each statement's account, the
+/// commit's last.
 fn exec_hosted(
     file: &str,
     statements: &[String],
@@ -410,7 +430,10 @@ fn exec_hosted(
         server: server.to_string(),
         tag,
     };
-    let judge = std::rc::Rc::new(Asked(carrier.clone()));
+    let judge = std::rc::Rc::new(Asked {
+        carrier: carrier.clone(),
+        server: server.to_string(),
+    });
     let mut snail = Snail::open_carried(Path::new(file), Box::new(host), judge)?;
     let handed = || carrier.lock().unwrap().written;
     let mut done = Vec::with_capacity(statements.len() + 1);

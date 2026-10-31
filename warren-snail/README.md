@@ -491,13 +491,18 @@ may read waits for that round to end. With no host, a commit writes its root as 
 transaction for one, built with `standalone` or without. Each transaction's root carries the host's
 tag for it, `Host::tag`, and is taken only where the host's judge, `carry::Judge`, says that
 transaction committed; a sequence's advance lands at once. A host may keep the root, writing it
-itself at its own word. A host's transaction commits a snail once.
+itself at its own word, and a judge may hand a round the root it takes, `Judge::root`
+(`carry::taken_root`), in place of its word on each copy: a writer outside the host then chooses its
+pages from the root the host checks its commit against. A host's transaction commits a snail once.
 
 **The read it cancels.** A second commit deciding beside the host's: the host's own record of its
 transaction decides alone.
 
 **How it shows.** `Snail::open_judged` reads a snail as a judge decides its tagged roots; a round
-with no judge reads the root before a tagged one, whole, and `census` reads that one.
+with no judge reads the root before a tagged one, whole, and `census` reads that one. Where the root
+taken holds a commit of a transaction the judge's round does not see, `Judge::sees`, the generation
+that round sees is no longer in the file, and `Snail::unseen` names it. `carry::newest` is the newest
+generation the file holds whole, taken or not.
 
 **Where it stops.** A snail its host writes is written only through it: a writer with no judge is
 refused by name. A host's recovery reads its log of commits again with `carry::replay`, which lands
@@ -739,7 +744,9 @@ fn main() -> warren_snail::Result<()> {
 - `carried_by` gives a snail open to write its `carry::Host`; `carry::apply` and `carry::copy` keep
   a follower.
 - `open_carried` opens a snail to write inside a host that tags and decides its roots, and
-  `open_judged` reads one; `carry::replay` and `carry::replay_held` land a host's log of commits.
+  `open_judged` reads one, `unseen` naming a commit its judge's round does not see;
+  `carry::taken_root` is the root a judge hands a writer outside the host, `carry::newest` the newest
+  generation a file holds; `carry::replay` and `carry::replay_held` land a host's log of commits.
 
 ### The feature `standalone`
 

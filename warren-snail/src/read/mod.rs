@@ -575,6 +575,13 @@ impl Snail {
         self.root.generation
     }
 
+    /// The tag of a transaction whose commit the root the snail reads holds and which its judge's
+    /// round does not see, where there is one: the generation that round sees is no longer in the
+    /// file.
+    pub fn unseen(&self) -> Option<u64> {
+        self.reader.unseen()
+    }
+
     /// The PostgreSQL release the file's OIDs came from, whose catalog names its reg* values.
     pub fn release(&self) -> u8 {
         self.root.release
