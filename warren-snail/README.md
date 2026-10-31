@@ -321,9 +321,10 @@ it. Each `CHECK` is checked at the write, passing where it is NULL, and `NOT ENF
 nothing; each `UNIQUE` at the statement's end. Each `FOREIGN KEY` is checked where PostgreSQL checks
 it: at the statement's end, or at the commit where it is deferred, by its DDL or by `SET
 CONSTRAINTS`, on the rows the round wrote and the keys it took from a parent. A reference holding a
-NULL references nothing under `MATCH SIMPLE`, and under `MATCH FULL` holds only NULLs. A row written
-locks the parent's block that holds its key, and a key taken the child's blocks that hold a row
-referencing it. `CASCADE`, `SET NULL` and `SET DEFAULT` are written by the statement that takes the
+NULL references nothing under `MATCH SIMPLE`, and under `MATCH FULL` holds only NULLs. Under
+`PERIOD`, a child's period lies within its parent's periods together, and a parent's period taken
+leaves each child's period within it so held. A row written locks the parent's block that holds its
+key, and a key taken the child's blocks that hold a row referencing it. `CASCADE`, `SET NULL` and `SET DEFAULT` are written by the statement that takes the
 key, deferred or not, as `RESTRICT` is checked by it; `NOT ENFORCED` checks and does nothing. A
 commit whose deferred key finds an orphan rolls the transaction back. An `INSERT … SELECT` takes
 each value by PostgreSQL's assignment casts: an integer or numeric rounded and held to its
@@ -593,9 +594,12 @@ Each command exits 0, or prints why it refused and exits 1.
   ENFORCED`; `REFERENCES` and `FOREIGN KEY`, a primary key, a `UNIQUE` or a unique index of a
   table of the file referenced, `MATCH SIMPLE` or `FULL`, `ON DELETE` and `ON UPDATE` each `NO
   ACTION`, `RESTRICT`, `CASCADE`, `SET NULL` or `SET DEFAULT`, with the columns it sets, `DEFERRABLE`,
-  `INITIALLY DEFERRED`, `NOT ENFORCED`, and in `ALTER TABLE … ADD`, `NOT VALID`; a foreign key on a
-  `PERIOD` is not held yet. Unnamed keys, checks, foreign keys and sequences are named as PostgreSQL
-  names them. `write` checks each foreign key over the rows it is given, and says where its columns
+  `INITIALLY DEFERRED`, `NOT ENFORCED`, and in `ALTER TABLE … ADD`, `NOT VALID`; `PERIOD` before
+  the last column on both sides, under `NO ACTION`, referencing a key `WITHOUT OVERLAPS` or an
+  `EXCLUDE` whose last column it is. A `PRIMARY KEY` or `UNIQUE` whose last column, a range or a
+  multirange, is `WITHOUT OVERLAPS` is an `EXCLUDE USING gist`, `=` on its other columns and `&&` on
+  that one, an empty period refused; a primary key so written with no `CLUSTER ON` is the table's
+  order. Unnamed keys, checks, foreign keys and sequences are named as PostgreSQL names them. `write` checks each foreign key over the rows it is given, and says where its columns
   lead no order, so that a key taken from its parent reads the child whole.
 - `CREATE SEQUENCE` and `ALTER SEQUENCE`, their options as PostgreSQL reads them, a sequence's
   state kept in the file; `CREATE TYPE … AS ENUM`, a composite, `AS RANGE`, with `ALTER TYPE … ADD
