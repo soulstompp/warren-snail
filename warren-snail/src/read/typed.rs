@@ -417,7 +417,7 @@ fn aggregate(name: &str, args: &[Option<ColumnType>], star: bool) -> Result<Opti
             ColumnType::Int2 | ColumnType::Int4 => ColumnType::Int8,
             ColumnType::Int8 => NUMERIC,
             t if t.is_numeric() => NUMERIC,
-            ColumnType::Float4 | ColumnType::Float8 | ColumnType::Money => ty,
+            ColumnType::Float4 | ColumnType::Float8 | ColumnType::Money(_) => ty,
             ColumnType::Interval { .. } | ColumnType::Time(_) => ColumnType::Interval {
                 range: crate::times::INTERVAL_FULL_RANGE,
                 precision: None,

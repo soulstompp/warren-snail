@@ -410,7 +410,8 @@ struct Frame<'a> {
 /// How the columns a statement reads and makes map case, by their names, where not as the
 /// database's default does: a string column under a collation its DDL or a COLLATE names, a name
 /// under its own C; and the collations the DDL makes. A name two columns map differently by maps
-/// as the default.
+/// as the default. Beside them, the lc_monetary the statement's money reads and prints under: the
+/// file's.
 #[derive(Clone, Debug, Default)]
 pub struct Casings {
     columns: HashMap<String, Casing>,
@@ -419,9 +420,16 @@ pub struct Casings {
     unheld: HashMap<String, String>,
     /// Whether a column orders its text through a library, or names a collation that would.
     library: bool,
+    /// The file's lc_monetary.
+    monetary: crate::monetary::Monetary,
 }
 
 impl Casings {
+    /// The lc_monetary the statement's money reads and prints under.
+    pub(crate) fn monetary(&self) -> crate::monetary::Monetary {
+        self.monetary
+    }
+
     /// The casings of a table's columns, and the collations the DDL makes.
     pub fn of_table(
         table: &crate::catalog::Table,
@@ -432,6 +440,7 @@ impl Casings {
             declared: declared.to_vec(),
             unheld: HashMap::new(),
             library: false,
+            monetary: table.monetary,
         };
         for col in &table.columns {
             let named = match (&col.collation, col.ty) {
@@ -767,7 +776,13 @@ fn quoted(e: &Expr) -> bool {
     }
 }
 
-fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
+fn cast(
+    v: Value,
+    to: &DataType,
+    release: u8,
+    monetary: crate::monetary::Monetary,
+    literal: bool,
+) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -868,7 +883,7 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
         "numeric" | "decimal" => {
             let n = match v {
                 Value::Text(t) => Numeric::parse(&t)?,
-                Value::Scalar(ColumnType::Money, k) => Numeric::of_units(k as i128, 2),
+                Value::Scalar(ColumnType::Money(m), k) => crate::monetary::to_numeric(k, m.conv()),
                 Value::Real(f) => Numeric::of_float(f64::from(f), false),
                 Value::Double(d) => Numeric::of_float(d, true),
                 v => match v.to_numeric() {
@@ -907,7 +922,9 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
             other => return Err(Error::new(format!("{other:?} cast to uuid"))),
         },
         _ if crate::composed::resolve(to).is_some() => {
-            let ty = crate::composed::resolve(to).unwrap();
+            let ty = crate::composed::resolve(to)
+                .unwrap()
+                .with_monetary(monetary);
             match v {
                 Value::Composed(from, c) if from == ty => Value::Composed(from, c),
                 Value::Text(t) => composed_value(ty, &t)?,
@@ -942,7 +959,7 @@ fn cast(v: Value, to: &DataType, release: u8, literal: bool) -> Result<Value> {
             }
             Ok(ty) if super::clock::is_time(ty) => super::clock::cast(v, ty)?,
             Ok(ty @ (ColumnType::Textual(_) | ColumnType::Internal(_))) => typed_cast(v, ty)?,
-            Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty)?,
+            Ok(ty) if crate::scalars::is_scalar(ty) => scalar_cast(v, ty.with_monetary(monetary))?,
             Ok(ty @ (ColumnType::Bpchar(_) | ColumnType::Name)) => string_cast(v, ty, true)?,
             Ok(ty) if ty.is_bits() => bits_cast(v, ty, true)?,
             Ok(ty @ (ColumnType::Float4 | ColumnType::Float8)) => {
@@ -1124,6 +1141,7 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
     let key = match (&v, ty) {
         (Value::Null, _) => return Ok(Value::Null),
         (Value::Scalar(from, k), _) if *from == ty => *k,
+        (Value::Scalar(ColumnType::Money(_), k), ColumnType::Money(_)) => *k,
         // An oid and the reg* types are binary-coercible, as are a function's two and an operator's
         // two to each other.
         (Value::Scalar(ColumnType::Reg(a, _), k), ColumnType::Reg(b, _))
@@ -1153,17 +1171,13 @@ fn scalar_cast(v: Value, ty: ColumnType) -> Result<Value> {
             };
             unsigned_key(u64::from(u), 32)
         }
-        (Value::Int(x), ColumnType::Money) => x
-            .checked_mul(100)
-            .ok_or_else(|| Error::new("bigint out of range"))?,
-        (Value::Num(m, s), ColumnType::Money) => {
-            i64::try_from(rounded(*m, *s, 2)).map_err(|_| Error::new("bigint out of range"))?
+        (Value::Int(x), ColumnType::Money(m)) => crate::monetary::of_integer(*x, m.conv())?,
+        (Value::Num(n, s), ColumnType::Money(m)) => {
+            i64::try_from(rounded(*n, *s, m.conv().points()))
+                .map_err(|_| Error::new("bigint out of range"))?
         }
-        // numeric_cash: its cents, as numeric_int8 rounds them.
-        (Value::Numeric(n), ColumnType::Money) => {
-            n.mul(&Numeric::of_int(100))?
-                .to_integer(i64::MIN, i64::MAX, "bigint")?
-        }
+        // numeric_cash: its count, as numeric_int8 rounds it.
+        (Value::Numeric(n), ColumnType::Money(m)) => crate::monetary::of_numeric(n, m.conv())?,
         (Value::Int(x), ColumnType::Char) if i32::try_from(*x).is_ok() => {
             let b = i8::try_from(*x).map_err(|_| Error::new("\"char\" out of range"))?;
             unsigned_key(u64::from(b as u8), 8)
@@ -1280,8 +1294,8 @@ fn scalar_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Valu
     if x.is_null() || y.is_null() {
         return Ok(Some(Value::Null));
     }
-    let money = |r: Option<i64>| {
-        r.map(|v| Value::Scalar(Money, v))
+    let money = |m, r: Option<i64>| {
+        r.map(|v| Value::Scalar(Money(m), v))
             .ok_or_else(|| Error::new("money out of range"))
     };
     let lsn_plus = |l: i64, n: &Value, sign: i128| -> Result<Value> {
@@ -1292,15 +1306,19 @@ fn scalar_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Valu
         Ok(Value::Scalar(PgLsn, unsigned_key(u, 64)))
     };
     Ok(Some(match (op, x, y) {
-        (B::Plus, Value::Scalar(Money, a), Value::Scalar(Money, b)) => money(a.checked_add(*b))?,
-        (B::Minus, Value::Scalar(Money, a), Value::Scalar(Money, b)) => money(a.checked_sub(*b))?,
-        (B::Multiply, Value::Scalar(Money, a), Value::Int(b))
-        | (B::Multiply, Value::Int(b), Value::Scalar(Money, a)) => money(a.checked_mul(*b))?,
-        (B::Divide, Value::Scalar(Money, a), Value::Int(b)) => {
+        (B::Plus, Value::Scalar(Money(m), a), Value::Scalar(Money(_), b)) => {
+            money(*m, a.checked_add(*b))?
+        }
+        (B::Minus, Value::Scalar(Money(m), a), Value::Scalar(Money(_), b)) => {
+            money(*m, a.checked_sub(*b))?
+        }
+        (B::Multiply, Value::Scalar(Money(m), a), Value::Int(b))
+        | (B::Multiply, Value::Int(b), Value::Scalar(Money(m), a)) => money(*m, a.checked_mul(*b))?,
+        (B::Divide, Value::Scalar(Money(m), a), Value::Int(b)) => {
             if *b == 0 {
                 return Err(Error::new("division by zero"));
             }
-            money(a.checked_div(*b))?
+            money(*m, a.checked_div(*b))?
         }
         (B::BitwiseAnd | B::BitwiseOr, Value::Scalar(t, a), Value::Scalar(u, b))
             if t == u && t.fixed_bytes().is_some() =>
@@ -1914,21 +1932,25 @@ fn out_of_range(what: &str) -> Error {
 /// A float's operator, as PostgreSQL's float4 and float8 operators give it: two reals in real, any
 /// float beside a double, an integer or a numeric in double precision; refused where finite
 /// numbers make an infinity, where a product or quotient of numbers not zero is zero, and where
-/// it divides by zero. Money times or divided by a float, rounded to the cent, and money divided
-/// by money. None where neither side is a float.
+/// it divides by zero. Money times or divided by a float, rounded to its smallest unit, and money
+/// divided by money. None where neither side is a float.
 fn float_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>> {
     use BinaryOperator as B;
     let float = |v: &Value| matches!(v, Value::Real(_) | Value::Double(_));
-    let money = |v: &Value| matches!(v, Value::Scalar(ColumnType::Money, _));
+    let money = |v: &Value| matches!(v, Value::Scalar(ColumnType::Money(_), _));
     if !(float(x) || float(y) || (money(x) && money(y) && matches!(op, B::Divide))) {
         return Ok(None);
     }
     let with_money = match (x, y) {
-        (Value::Scalar(ColumnType::Money, c), f) if float(f) => Some((*c, as_double(f), true)),
-        (f, Value::Scalar(ColumnType::Money, c)) if float(f) => Some((*c, as_double(f), false)),
+        (Value::Scalar(ty @ ColumnType::Money(_), c), f) if float(f) => {
+            Some((*ty, *c, as_double(f), true))
+        }
+        (f, Value::Scalar(ty @ ColumnType::Money(_), c)) if float(f) => {
+            Some((*ty, *c, as_double(f), false))
+        }
         _ => None,
     };
-    if let Some((c, f, money_left)) = with_money {
+    if let Some((ty, c, f, money_left)) = with_money {
         let f = f.expect("a float is a double");
         let r = match op {
             B::Multiply => c as f64 * f,
@@ -1950,9 +1972,10 @@ fn float_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value
         if !(-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&r) {
             return Err(Error::new("money out of range"));
         }
-        return Ok(Some(Value::Scalar(ColumnType::Money, r as i64)));
+        return Ok(Some(Value::Scalar(ty, r as i64)));
     }
-    if let (Value::Scalar(ColumnType::Money, a), Value::Scalar(ColumnType::Money, b)) = (x, y) {
+    if let (Value::Scalar(ColumnType::Money(_), a), Value::Scalar(ColumnType::Money(_), b)) = (x, y)
+    {
         if *b == 0 {
             return Err(Error::new("division by zero"));
         }
@@ -2410,7 +2433,13 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             expr,
             data_type,
             ..
-        } => cast(ev(expr)?, data_type, frame.release, quoted(expr))?,
+        } => cast(
+            ev(expr)?,
+            data_type,
+            frame.release,
+            frame.casings.monetary(),
+            quoted(expr),
+        )?,
         // An interval written as `interval '…'` with no fields named, read by its input.
         Expr::Interval(i)
             if i.leading_field.is_none()
@@ -2430,7 +2459,13 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
         }
         // A constant written after its type is read as that type's input reads it.
         Expr::TypedString(t) => match t.value.value.clone().into_string() {
-            Some(s) => cast(Value::Text(s), &t.data_type, frame.release, true)?,
+            Some(s) => cast(
+                Value::Text(s),
+                &t.data_type,
+                frame.release,
+                frame.casings.monetary(),
+                true,
+            )?,
             None => return Err(Error::new(format!("{e} is not read"))),
         },
         // A number written with its minus is one constant, as PostgreSQL's grammar folds it.
@@ -3096,7 +3131,12 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                             return Ok(v);
                         }
                     }
-                    if let Some(v) = super::calls::formatting(&name, &values, &types)? {
+                    if let Some(v) = super::calls::formatting(
+                        &name,
+                        &values,
+                        &types,
+                        frame.casings.monetary().conv(),
+                    )? {
                         return Ok(v);
                     }
                     crate::functions::refuse_server(&name, frame.release)?;
@@ -3964,7 +4004,7 @@ impl Acc {
             }
             (Value::Scalar(ty, _), Acc::Sum(_) | Acc::Least(_) | Acc::Greatest(_))
                 if !(matches!(self, Acc::Sum(_))
-                    && matches!(ty, ColumnType::Money | ColumnType::Time(_))
+                    && matches!(ty, ColumnType::Money(_) | ColumnType::Time(_))
                     || !matches!(self, Acc::Sum(_))
                         && matches!(
                             ty,
@@ -3972,7 +4012,7 @@ impl Acc {
                                 | ColumnType::Oid8
                                 | ColumnType::Xid8
                                 | ColumnType::PgLsn
-                                | ColumnType::Money
+                                | ColumnType::Money(_)
                                 | ColumnType::Tid
                                 | ColumnType::Date
                                 | ColumnType::Time(_)

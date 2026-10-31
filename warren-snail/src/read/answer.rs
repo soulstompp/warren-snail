@@ -705,7 +705,7 @@ impl Answer {
                             let at = inputs.iter().position(|k| *k == Key::Column(*c)).unwrap();
                             if let Cell::Int(v) = cells[at] {
                                 let t = total.unwrap_or(0);
-                                *total = Some(if ty == Some(ColumnType::Money) {
+                                *total = Some(if matches!(ty, Some(ColumnType::Money(_))) {
                                     held_sum(t, v as i128 * n as i128)
                                 } else {
                                     t + v as i128 * n as i128
@@ -855,7 +855,7 @@ impl Answer {
         if self.typed.iter().flatten().any(|t| {
             matches!(
                 t,
-                ColumnType::Money | ColumnType::Char | ColumnType::Float4 | ColumnType::Float8
+                ColumnType::Money(_) | ColumnType::Char | ColumnType::Float4 | ColumnType::Float8
             )
         }) {
             return false;
@@ -1024,7 +1024,7 @@ impl Answer {
                 for accs in groups.values() {
                     for (item, acc) in items.iter().zip(accs) {
                         if let (Item::Sum(c), Acc::Sum(Some(t))) = (item, acc) {
-                            if tables[c.side].columns[c.column].ty == ColumnType::Money
+                            if matches!(tables[c.side].columns[c.column].ty, ColumnType::Money(_))
                                 && i64::try_from(*t).is_err()
                             {
                                 return Err(crate::Error::new("money out of range"));

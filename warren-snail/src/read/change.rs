@@ -2537,6 +2537,7 @@ impl Snail {
         let mut catalog = Catalog::parse_kept(&text, kept)?;
         super::old_names(&mut catalog, self.reader.format());
         catalog.with_release(self.root.release)?;
+        catalog.with_monetary(&crate::file::monetary_of(&catalog, &self.root.monetary))?;
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         crate::file::holds_catalog(self.reader.format(), &catalog)?;

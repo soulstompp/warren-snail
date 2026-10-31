@@ -294,7 +294,7 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             | ColumnType::Xid8
             | ColumnType::PgLsn
             | ColumnType::Oid8
-            | ColumnType::Money => 64,
+            | ColumnType::Money(_) => 64,
             ColumnType::Char => 8,
             ColumnType::Macaddr | ColumnType::Tid => 48,
             ColumnType::Macaddr8 => 64,
@@ -372,7 +372,7 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
             | ColumnType::Xid8
             | ColumnType::PgLsn
             | ColumnType::Char
-            | ColumnType::Money
+            | ColumnType::Money(_)
             | ColumnType::Macaddr
             | ColumnType::Macaddr8
             | ColumnType::Float4

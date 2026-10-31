@@ -639,6 +639,7 @@ fn scalar_literal(e: &Expr, ty: ColumnType, release: u8) -> Result<i64> {
                     Some(ColumnType::Reg(kind, release))
                 }
                 ColumnType::Oid if ty.is_oid() => Some(ColumnType::Oid),
+                ColumnType::Money(_) if matches!(ty, ColumnType::Money(_)) => Some(ty),
                 to if to == ty => Some(to),
                 _ => None,
             };
@@ -935,7 +936,7 @@ impl From<'_> {
                             | ColumnType::Int8
                             | ColumnType::Numeric { .. }
                             | ColumnType::NumericText(_)
-                            | ColumnType::Money
+                            | ColumnType::Money(_)
                             | ColumnType::Float4
                             | ColumnType::Float8
                             | ColumnType::Interval { .. }
@@ -987,7 +988,7 @@ impl From<'_> {
                     | ColumnType::Xid8
                     | ColumnType::PgLsn
                     | ColumnType::Char
-                    | ColumnType::Money
+                    | ColumnType::Money(_)
                     | ColumnType::Float4
                     | ColumnType::Float8
                     | ColumnType::Tid
@@ -1586,7 +1587,7 @@ fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
         | ColumnType::Xid8
         | ColumnType::PgLsn
         | ColumnType::Char
-        | ColumnType::Money
+        | ColumnType::Money(_)
         | ColumnType::Macaddr
         | ColumnType::Macaddr8
         | ColumnType::Float4

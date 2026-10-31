@@ -23,7 +23,8 @@ const USAGE: &str =
 PostgreSQL's SQL. It runs on Linux.
 
 usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
-                          [--release <14..19>] [--written <written.parquet>]
+                          [--release <14..19>] [--lc-monetary <locale>]
+                          [--written <written.parquet>]
        warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
                          [--param <value>]... [--rounds <n>] [--hold <MiB>]
@@ -43,7 +44,10 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           cuts it comes in by its pages as they lie. The pages lie in files of 1 GiB, <file>, then
           <file>.1 and on; --file-pages sets another size, in 4 KiB pages. --release names the
           PostgreSQL release the rows' OIDs came from, whose built-in objects name its reg* values:
-          19 unless given. --written records each order's columns as Parquet.
+          19 unless given. --lc-monetary names the lc_monetary the rows' money was written under,
+          which the snail reads and prints its money under: C unless given, any other locale
+          through glibc, with the feature collations. --written records each order's columns as
+          Parquet.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
           COMMIT and ROLLBACK; CREATE TABLE, and CREATE INDEX and ALTER TABLE … CLUSTER ON for a
           table that holds no rows. Outside a transaction each statement commits. --out records
@@ -386,7 +390,32 @@ fn cmd_write(args: &[String]) -> Result<()> {
             .map_err(|_| Error::new("--release takes PostgreSQL's major release, 14 to 19"))?,
         None => warren_snail::regs::LATEST,
     };
-    let written = write_released(Path::new(file), &catalog, &tables, &given, span, release)?;
+    let written = match flag(args, "--lc-monetary") {
+        Some(locale) => {
+            let mut carried = warren_snail::write::Carried::default();
+            for t in &catalog.tables {
+                for c in t
+                    .columns
+                    .iter()
+                    .filter(|c| matches!(c.ty, warren_snail::catalog::ColumnType::Money(_)))
+                {
+                    carried
+                        .monetary
+                        .push((t.name.clone(), c.name.clone(), locale.to_string()));
+                }
+            }
+            warren_snail::write::write_carried(
+                Path::new(file),
+                &catalog,
+                &tables,
+                &given,
+                span,
+                release,
+                &carried,
+            )?
+        }
+        None => write_released(Path::new(file), &catalog, &tables, &given, span, release)?,
+    };
     if let Some(out) = flag(args, "--written") {
         let rows: Vec<(
             &warren_snail::write::Written,

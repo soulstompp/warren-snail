@@ -46,8 +46,9 @@ pub enum ColumnType {
     PgLsn,
     /// `"char"`: one byte, compared unsigned.
     Char,
-    /// money: a count of its smallest unit, a cent under the C locale.
-    Money,
+    /// money: a count of its smallest unit, read and printed under the lc_monetary it was written
+    /// under.
+    Money(crate::monetary::Monetary),
     /// A MAC address of 6 bytes, compared byte by byte.
     Macaddr,
     /// A MAC address of 8 bytes, compared byte by byte.
@@ -136,7 +137,7 @@ impl ColumnType {
             | ColumnType::Numeric { .. }
             | ColumnType::Xid8
             | ColumnType::PgLsn
-            | ColumnType::Money
+            | ColumnType::Money(_)
             | ColumnType::Macaddr8
             | ColumnType::Oid8
             | ColumnType::Float8 => Some(8),
@@ -423,6 +424,45 @@ impl ColumnType {
         }
     }
 
+    /// The type with its money, and the money its parts hold, read and printed under `m`.
+    pub fn with_monetary(self, m: crate::monetary::Monetary) -> ColumnType {
+        use crate::composed::Composed;
+        match self {
+            ColumnType::Money(_) => ColumnType::Money(m),
+            ColumnType::Composed(r) => crate::composed::type_of(match r.def() {
+                Composed::Array { element, domain } => Composed::Array {
+                    element: element.with_monetary(m),
+                    domain: domain.clone(),
+                },
+                Composed::Record { name, fields } => Composed::Record {
+                    name: name.clone(),
+                    fields: fields
+                        .iter()
+                        .map(|f| crate::composed::Field {
+                            ty: f.ty.with_monetary(m),
+                            ..f.clone()
+                        })
+                        .collect(),
+                },
+                Composed::Range {
+                    name,
+                    subtype,
+                    discrete,
+                } => Composed::Range {
+                    name: name.clone(),
+                    subtype: subtype.with_monetary(m),
+                    discrete: *discrete,
+                },
+                Composed::Multirange { name, range } => Composed::Multirange {
+                    name: name.clone(),
+                    range: range.with_monetary(m),
+                },
+                other => other.clone(),
+            }),
+            ty => ty,
+        }
+    }
+
     /// The type as PostgreSQL's `format_type` names it.
     pub fn pg_name(self) -> String {
         match self {
@@ -444,7 +484,7 @@ impl ColumnType {
             ColumnType::Xid8 => "xid8".into(),
             ColumnType::PgLsn => "pg_lsn".into(),
             ColumnType::Char => "\"char\"".into(),
-            ColumnType::Money => "money".into(),
+            ColumnType::Money(_) => "money".into(),
             ColumnType::Macaddr => "macaddr".into(),
             ColumnType::Macaddr8 => "macaddr8".into(),
             ColumnType::Float4 => "real".into(),
@@ -497,7 +537,7 @@ impl ColumnType {
             ColumnType::Xid8 => "xid8_ops",
             ColumnType::PgLsn => "pg_lsn_ops",
             ColumnType::Char => "char_ops",
-            ColumnType::Money => "money_ops",
+            ColumnType::Money(_) => "money_ops",
             ColumnType::Macaddr => "macaddr_ops",
             ColumnType::Macaddr8 => "macaddr8_ops",
             ColumnType::Float4 => "float4_ops",
@@ -528,7 +568,7 @@ impl ColumnType {
     /// refcursor, the geometric types, and an array, a composite or a range of a part with none.
     pub fn hash_opclass(self) -> Option<&'static str> {
         Some(match self {
-            ColumnType::Money | ColumnType::Bit(_) | ColumnType::Varbit(_) => return None,
+            ColumnType::Money(_) | ColumnType::Bit(_) | ColumnType::Varbit(_) => return None,
             ColumnType::Geometric(_) => return None,
             ColumnType::Textual(crate::textual::Textual::Aclitem) => "aclitem_ops",
             ColumnType::Textual(t) => match t {
@@ -802,8 +842,8 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
             | (Uuid, Uuid)
             | (Int2 | Int4 | Int8 | Oid, Oid)
             | (Oid, Int4 | Int8)
-            | (Int4 | Int8 | Numeric { .. } | Money, Money)
-            | (Money, Numeric { .. })
+            | (Int4 | Int8 | Numeric { .. } | Money(_), Money(_))
+            | (Money(_), Numeric { .. })
             | (Text(_) | Bpchar(_) | Char, Char)
             | (Bit(_) | Varbit(_), Bit(_) | Varbit(_))
             | (Xid, Xid)
@@ -1180,6 +1220,8 @@ pub struct Table {
     pub release: u8,
     /// Its foreign keys, each referencing a table of the file.
     pub foreign_keys: Vec<ForeignKey>,
+    /// The lc_monetary its money reads and prints under: the file's.
+    pub monetary: crate::monetary::Monetary,
 }
 
 impl Table {
@@ -1665,6 +1707,9 @@ pub struct Catalog {
     pub collations: Vec<Collation>,
     /// The PostgreSQL release the file's OIDs came from, whose catalog names its reg* values.
     pub release: u8,
+    /// The lc_monetary the file's money was written under, which every money value a statement
+    /// reads or makes reads and prints under.
+    pub monetary: crate::monetary::Monetary,
 }
 
 /// A DDL read a statement at a time: the catalog of the statements taken, and each statement taken
@@ -2014,7 +2059,7 @@ pub fn held_type(dt: &DataType) -> Result<ColumnType> {
                 "pg_lsn" => ColumnType::PgLsn,
                 // Quoted, as unquoted it is the keyword for character(1).
                 "char" => ColumnType::Char,
-                "money" => ColumnType::Money,
+                "money" => ColumnType::Money(crate::monetary::Monetary::C),
                 "macaddr" => ColumnType::Macaddr,
                 "macaddr8" => ColumnType::Macaddr8,
                 "oid8" => ColumnType::Oid8,
@@ -2511,6 +2556,65 @@ impl Catalog {
                 crate::regs::check_release(Some(*kind), release)?;
                 *at = release;
             }
+        }
+        Ok(())
+    }
+
+    /// Every money value the catalog's columns, domains and functions hold, read and printed
+    /// under the lc_monetary `recorded` names for the file's money: refused where a money column has
+    /// none, where two name different locales, and where this build reads no such locale.
+    pub fn with_monetary(&mut self, recorded: &[(String, String, String)]) -> Result<()> {
+        let mut file: Option<(String, &str)> = None;
+        for t in &self.tables {
+            for c in t
+                .columns
+                .iter()
+                .filter(|c| matches!(c.ty, ColumnType::Money(_)))
+            {
+                let named = format!("{}.{}", t.name, c.name);
+                let Some((_, _, l)) = recorded
+                    .iter()
+                    .find(|(a, b, _)| *a == t.name && *b == c.name)
+                else {
+                    return Err(Error::new(format!(
+                        "{named} is money, and the file records no lc_monetary for it"
+                    )));
+                };
+                match &file {
+                    Some((other, was)) if !crate::monetary::Monetary::names_same(was, l) => {
+                        return Err(Error::new(format!(
+                            "{named} is money written under lc_monetary {l}, and {other} under \
+                             {was}: the snail answers under one"
+                        )))
+                    }
+                    Some(_) => {}
+                    None => file = Some((named, l)),
+                }
+            }
+        }
+        let m = match &file {
+            Some((named, l)) => crate::monetary::Monetary::open(l)
+                .map_err(|e| Error::new(format!("{named} is money: {e}")))?,
+            None => crate::monetary::Monetary::C,
+        };
+        self.monetary = m;
+        for t in &mut self.tables {
+            t.monetary = m;
+        }
+        // A DDL's money is C's as it is read.
+        if m.is_c() {
+            return Ok(());
+        }
+        let mut types: Vec<&mut ColumnType> = Vec::new();
+        for t in &mut self.tables {
+            types.extend(t.columns.iter_mut().map(|c| &mut c.ty));
+        }
+        for f in &mut self.functions {
+            types.extend(f.args.iter_mut());
+        }
+        types.extend(self.domains.iter_mut().filter_map(|d| d.base_type.as_mut()));
+        for ty in types {
+            *ty = ty.with_monetary(m);
         }
         Ok(())
     }

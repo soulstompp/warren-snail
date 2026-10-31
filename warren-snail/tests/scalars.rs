@@ -394,7 +394,11 @@ fn the_scalars_go_out_as_unsigned_integers_and_come_back() {
         )
         .unwrap();
     assert_eq!(ns(&b), [2]);
-    let key = scalar_parse(ColumnType::Money, "-92233720368547758.08").unwrap();
+    let key = scalar_parse(
+        ColumnType::Money(warren_snail::monetary::Monetary::C),
+        "-92233720368547758.08",
+    )
+    .unwrap();
     assert_eq!(key, i64::MIN);
 }
 

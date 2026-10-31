@@ -180,7 +180,7 @@ pub(crate) fn primitive(
                 is_signed: false,
             }),
         ),
-        ColumnType::Money => (PhysicalType::INT64, None),
+        ColumnType::Money(_) => (PhysicalType::INT64, None),
         ColumnType::Macaddr | ColumnType::Macaddr8 => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Float4 => (PhysicalType::FLOAT, None),
         ColumnType::Float8 => (PhysicalType::DOUBLE, None),
@@ -807,7 +807,7 @@ fn decode_as(
         | ColumnType::Xid8
         | ColumnType::PgLsn
         | ColumnType::Oid8
-        | ColumnType::Money => {
+        | ColumnType::Money(_) => {
             let mut r = get_typed_column_reader::<Int64Type>(column);
             let mut v: Vec<i64> = Vec::new();
             let (n, _, _) = r.read_records(

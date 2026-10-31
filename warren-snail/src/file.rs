@@ -430,67 +430,42 @@ pub struct Pending {
     pub at: u64,
 }
 
-/// The `lc_monetary` money is written under: C, the only one the snail reads until the collations
-/// feature's glibc does.
+/// The `lc_monetary` money is written under where nothing names another.
 pub const MONETARY: &str = "C";
 
-/// Each money column of a catalog with its `lc_monetary`: the one `had` records for it, or C for a
-/// column it does not.
+/// Each money column of a catalog with its `lc_monetary`: the one `had` records for it, or for a
+/// column it does not, the file's: the one `had` records for a money column the catalog holds, C
+/// where it records none.
 pub fn monetary_of(
     catalog: &crate::catalog::Catalog,
     had: &[(String, String, String)],
 ) -> Vec<(String, String, String)> {
+    let held = |t: &str, c: &str| {
+        catalog.table(t).is_some_and(|t| {
+            t.columns
+                .iter()
+                .any(|x| x.name == c && matches!(x.ty, crate::catalog::ColumnType::Money(_)))
+        })
+    };
+    let file = had
+        .iter()
+        .find(|(t, c, _)| held(t, c))
+        .map_or(MONETARY, |m| m.2.as_str());
     let mut out = Vec::new();
     for t in &catalog.tables {
         for c in t
             .columns
             .iter()
-            .filter(|c| c.ty == crate::catalog::ColumnType::Money)
+            .filter(|c| matches!(c.ty, crate::catalog::ColumnType::Money(_)))
         {
             let locale = had
                 .iter()
                 .find(|(a, b, _)| *a == t.name && *b == c.name)
-                .map_or(MONETARY.to_string(), |m| m.2.clone());
+                .map_or(file.to_string(), |m| m.2.clone());
             out.push((t.name.clone(), c.name.clone(), locale));
         }
     }
     out
-}
-
-/// Refuses a money column the file records no `lc_monetary` for, or one written under a locale
-/// other than C or POSIX.
-pub fn monetary_read(
-    catalog: &crate::catalog::Catalog,
-    recorded: &[(String, String, String)],
-) -> crate::Result<()> {
-    for t in &catalog.tables {
-        for c in t
-            .columns
-            .iter()
-            .filter(|c| c.ty == crate::catalog::ColumnType::Money)
-        {
-            match recorded
-                .iter()
-                .find(|(a, b, _)| *a == t.name && *b == c.name)
-            {
-                None => {
-                    return Err(crate::Error::new(format!(
-                        "{}.{} is money, and the file records no lc_monetary for it",
-                        t.name, c.name
-                    )))
-                }
-                Some((_, _, l)) if l != "C" && l != "POSIX" => {
-                    return Err(crate::Error::new(format!(
-                        "{}.{} is money written under lc_monetary {l}: this warren-snail reads \
-                         money under C and POSIX only",
-                        t.name, c.name
-                    )))
-                }
-                Some(_) => {}
-            }
-        }
-    }
-    Ok(())
 }
 
 /// A run of pages in the free map: free where its tag is 0, else freed once no round older than its

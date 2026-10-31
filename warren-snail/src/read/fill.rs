@@ -105,20 +105,6 @@ fn time_assign(d: Datum, from: ColumnType, to: ColumnType) -> Result<Datum> {
     })
 }
 
-/// A number rounded to `to` places from `from`, half away from zero, as PostgreSQL rounds a numeric.
-fn rescale(m: i128, from: u32, to: u32) -> i128 {
-    if to >= from {
-        return m * 10i128.pow(to - from);
-    }
-    let d = 10i128.pow(from - to);
-    let (q, r) = (m / d, (m % d).abs());
-    if r * 2 >= d {
-        q + m.signum()
-    } else {
-        q
-    }
-}
-
 /// A value of type `from` assigned to a column `what` of type `to`, as PostgreSQL's implicit and
 /// assignment casts take it: integers and numerics rounded and held to the column's range, any
 /// value written as text into a string column, held to its length; any other pair refused, as
@@ -203,8 +189,8 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
             let n = match (&d, from) {
                 (_, f) if f.is_numeric() => numeric_of(&d, from).ok_or_else(refused)?,
                 (Datum::Int(v), Int2 | Int4 | Int8) => crate::numeric::Numeric::of_int(*v),
-                (Datum::Int(cents), Money) if to.is_numeric() => {
-                    crate::numeric::Numeric::of_units(i128::from(*cents), 2)
+                (Datum::Int(count), Money(m)) if to.is_numeric() => {
+                    crate::monetary::to_numeric(*count, m.conv())
                 }
                 (Datum::Float4(b), Float4) => {
                     crate::numeric::Numeric::of_float(f64::from(f32::from_bits(*b)), false)
@@ -220,12 +206,8 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
                     let (lo, hi) = to.integer_range().unwrap();
                     Datum::Int(n.to_integer(lo, hi, &to.pg_name())?)
                 }
-                // numeric_cash: its cents, as numeric_int8 rounds them.
-                Money => Datum::Int(n.mul(&crate::numeric::Numeric::of_int(100))?.to_integer(
-                    i64::MIN,
-                    i64::MAX,
-                    "bigint",
-                )?),
+                // numeric_cash: its count, as numeric_int8 rounds it.
+                Money(m) => Datum::Int(crate::monetary::of_numeric(&n, m.conv())?),
                 Float4 | Float8 => {
                     let f = n.to_float(to == Float8)?;
                     if to == Float8 {
@@ -257,7 +239,7 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         | (Xid8, Xid8)
         | (PgLsn, PgLsn)
         | (Char, Char)
-        | (Money, Money)
+        | (Money(_), Money(_))
         | (Tid, Tid) => d,
         (Composed(a), Composed(b)) if a == b => d,
         // A reg* type is an oid to PostgreSQL's casts: from and to one, binary-coercible, as are a
@@ -321,12 +303,11 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
                 u as i64
             })
         }
-        (Int4 | Int8, Money) => {
+        (Int4 | Int8, Money(m)) => {
             let Datum::Int(v) = d else {
                 return Err(refused());
             };
-            let cents = rescale(v as i128, 0, 2);
-            Datum::Int(i64::try_from(cents).map_err(|_| Error::new("bigint out of range"))?)
+            Datum::Int(crate::monetary::of_integer(v, m.conv())?)
         }
         (Macaddr | Macaddr8, Macaddr | Macaddr8) => {
             let Datum::Int(v) = d else {

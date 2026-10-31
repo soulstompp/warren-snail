@@ -1,12 +1,14 @@
 //! The formatting functions, as PostgreSQL 19's formatting.c reads and writes them under the
-//! settings the snail answers under (lc_numeric, lc_monetary and lc_time C, TimeZone UTC,
-//! DateStyle ISO, MDY): to_char of the integers, the floats, numeric, timestamp, timestamptz and
-//! interval, to_number, to_date and to_timestamp of a text and its template.
+//! settings the snail answers under (lc_numeric and lc_time C, lc_monetary the one the file's money
+//! was written under, TimeZone UTC, DateStyle ISO, MDY): to_char of the integers, the floats,
+//! numeric, timestamp, timestamptz and interval, to_number, to_date and to_timestamp of a text and
+//! its template.
 //!
 //! A date is held as its days since 1970-01-01, a timestamptz as its microseconds since
 //! 1970-01-01 UTC, as `times.rs` holds them; the templates are read from their bytes as
 //! formatting.c reads them.
 
+use crate::monetary::Conv;
 use crate::numeric::Numeric;
 use crate::times::Interval;
 use crate::{Error, Result};
@@ -2373,12 +2375,60 @@ struct NumProc<'a> {
     inout_p: usize,
     input_len: usize,
     last_relevant: Option<usize>,
+    locale: Locale,
 }
 
-const L_NEGATIVE_SIGN: &[u8] = b"-";
-const L_POSITIVE_SIGN: &[u8] = b"+";
-const L_THOUSANDS_SEP: &[u8] = b",";
-const L_CURRENCY_SYMBOL: &[u8] = b" ";
+/// The symbols a number template reads and writes for its locale's patterns: S's signs, D's
+/// decimal point, G's separator and L's currency symbol.
+struct Locale {
+    negative_sign: Vec<u8>,
+    positive_sign: Vec<u8>,
+    decimal: Vec<u8>,
+    thousands_sep: Vec<u8>,
+    currency_symbol: Vec<u8>,
+}
+
+/// NUM_prepare_locale: each symbol from the conventions of lc_numeric and lc_monetary, its default
+/// where the locale gives none; the decimal point D's alone.
+fn num_prepare_locale(num: &NumDesc, conv: &Conv) -> Locale {
+    let or = |s: &str, d: &str| if s.is_empty() { d } else { s }.as_bytes().to_vec();
+    let decimal = if num.has(NUM_F_LDECIMAL) {
+        or(&conv.decimal_point, ".")
+    } else {
+        b".".to_vec()
+    };
+    let thousands_sep = if !conv.thousands_sep.is_empty() {
+        conv.thousands_sep.as_bytes().to_vec()
+    } else if decimal != b"," {
+        b",".to_vec()
+    } else {
+        b".".to_vec()
+    };
+    Locale {
+        negative_sign: or(&conv.negative_sign, "-"),
+        positive_sign: or(&conv.positive_sign, "+"),
+        decimal,
+        thousands_sep,
+        currency_symbol: or(&conv.currency_symbol, " "),
+    }
+}
+
+/// A locale's symbol as NUM_add_locale_symbol writes it: cut to its whole characters within
+/// NUM_MAX_ITEM_SIZ bytes.
+fn clipped(s: &[u8]) -> &[u8] {
+    if s.len() <= NUM_MAX_ITEM_SIZ {
+        return s;
+    }
+    let mut end = 0;
+    while end < s.len() {
+        let next = end + mblen(s[end]);
+        if next > NUM_MAX_ITEM_SIZ {
+            break;
+        }
+        end = next;
+    }
+    &s[..end]
+}
 
 impl NumProc<'_> {
     fn overload(&self) -> bool {
@@ -2427,8 +2477,30 @@ impl NumProc<'_> {
         !self.num.has(NUM_F_ZERO) && self.number_p == 0 && self.nb(0) == b'0' && self.num.post != 0
     }
 
-    fn decimal(&self) -> &'static [u8] {
-        b"."
+    fn decimal(&self) -> Vec<u8> {
+        self.locale.decimal.clone()
+    }
+
+    /// The locale's negative sign, or its positive one, where the text holds it next: its length.
+    fn reads_sign(&self, negative: bool) -> Option<usize> {
+        let s = if negative {
+            &self.locale.negative_sign
+        } else {
+            &self.locale.positive_sign
+        };
+        (!s.is_empty() && self.amount(s.len()) && self.inout[self.inout_p..].starts_with(s))
+            .then_some(s.len())
+    }
+
+    /// S's sign written as NUM_add_locale_symbol writes it: the locale's negative sign or its
+    /// positive one.
+    fn put_sign(&mut self) {
+        let s = if self.sign == b'-' {
+            self.locale.negative_sign.clone()
+        } else {
+            self.locale.positive_sign.clone()
+        };
+        self.put_str(clipped(&s));
     }
 
     fn numpart_from_char(&mut self, id: K) {
@@ -2445,11 +2517,11 @@ impl NumProc<'_> {
         if self.nb(0) == b' ' && (id == K::N0 || id == K::N9) && self.read_pre + self.read_post == 0
         {
             if self.num.has(NUM_F_LSIGN) && self.num.lsign == NUM_LSIGN_PRE {
-                if self.amount(1) && self.inout[self.inout_p] == L_NEGATIVE_SIGN[0] {
-                    self.inout_p += 1;
+                if let Some(x) = self.reads_sign(true) {
+                    self.inout_p += x;
                     self.number[0] = b'-';
-                } else if self.amount(1) && self.inout[self.inout_p] == L_POSITIVE_SIGN[0] {
-                    self.inout_p += 1;
+                } else if let Some(x) = self.reads_sign(false) {
+                    self.inout_p += x;
                     self.number[0] = b'+';
                 }
             } else if self.io() == b'-' || (self.num.has(NUM_F_BRACKET) && self.io() == b'<') {
@@ -2478,7 +2550,7 @@ impl NumProc<'_> {
             isread = true;
         } else if self.num.has(NUM_F_DECIMAL) && !self.read_dec {
             let d = self.decimal();
-            if self.amount(d.len()) && self.inout[self.inout_p..].starts_with(d) {
+            if self.amount(d.len()) && self.inout[self.inout_p..].starts_with(&d) {
                 self.inout_p += d.len() - 1;
                 self.number[self.number_p] = b'.';
                 self.number_p += 1;
@@ -2497,9 +2569,11 @@ impl NumProc<'_> {
             {
                 let tmp = self.inout_p;
                 self.inout_p += 1;
-                if self.amount(1) && self.inout[self.inout_p] == L_NEGATIVE_SIGN[0] {
+                if let Some(x) = self.reads_sign(true) {
+                    self.inout_p += x - 1;
                     self.number[0] = b'-';
-                } else if self.amount(1) && self.inout[self.inout_p] == L_POSITIVE_SIGN[0] {
+                } else if let Some(x) = self.reads_sign(false) {
+                    self.inout_p += x - 1;
                     self.number[0] = b'+';
                 }
                 if self.nb(0) == b' ' {
@@ -2530,12 +2604,7 @@ impl NumProc<'_> {
         {
             if self.num.has(NUM_F_LSIGN) {
                 if self.num.lsign == NUM_LSIGN_PRE {
-                    let s = if self.sign == b'-' {
-                        L_NEGATIVE_SIGN
-                    } else {
-                        L_POSITIVE_SIGN
-                    };
-                    self.put_str(s);
+                    self.put_sign();
                     self.sign_wrote = true;
                 }
             } else if self.num.has(NUM_F_BRACKET) {
@@ -2573,7 +2642,7 @@ impl NumProc<'_> {
                 if self.nb(self.number_p) == b'.' {
                     if !lr_is_dot || self.num.has(NUM_F_FILLMODE) {
                         let d = self.decimal();
-                        self.put_str(d);
+                        self.put_str(clipped(&d));
                     }
                 } else if self
                     .last_relevant
@@ -2608,12 +2677,7 @@ impl NumProc<'_> {
                     self.put(if self.sign == b'+' { b' ' } else { b'>' });
                     self.inout_p += 1;
                 } else if self.num.has(NUM_F_LSIGN) && self.num.lsign == NUM_LSIGN_POST {
-                    let s = if self.sign == b'-' {
-                        L_NEGATIVE_SIGN
-                    } else {
-                        L_POSITIVE_SIGN
-                    };
-                    self.put_str(s);
+                    self.put_sign();
                 }
             }
         }
@@ -2755,6 +2819,7 @@ fn num_processor(
     out_pre_spaces: i32,
     sign: u8,
     is_to_char: bool,
+    conv: &Conv,
 ) -> Result<Vec<u8>> {
     if num.zero_start != 0 {
         num.zero_start -= 1;
@@ -2765,6 +2830,7 @@ fn num_processor(
         }
         return Ok(cstr(&number, 0).to_vec());
     }
+    let locale = num_prepare_locale(num, conv);
     let mut np = NumProc {
         is_to_char,
         num,
@@ -2783,6 +2849,7 @@ fn num_processor(
         inout_p: 0,
         input_len,
         last_relevant: None,
+        locale,
     };
     if is_to_char {
         np.sign = sign;
@@ -2864,26 +2931,27 @@ fn num_processor(
                 }
             }
             K::NG => {
-                let pattern = L_THOUSANDS_SEP;
+                let pattern = np.locale.thousands_sep.clone();
                 if np.is_to_char {
+                    let shown = clipped(&pattern);
                     if !np.num_in {
                         if np.num.has(NUM_F_FILLMODE) {
                             continue;
                         }
-                        for _ in 0..pattern.len() {
+                        for _ in 0..text(shown).chars().count() {
                             np.put(b' ');
                             np.inout_p += 1;
                         }
                         np.inout_p -= 1;
                     } else {
-                        np.put_str(pattern);
+                        np.put_str(shown);
                         np.inout_p -= 1;
                     }
                 } else {
                     if !np.num_in && np.num.has(NUM_F_FILLMODE) {
                         continue;
                     }
-                    if np.amount(pattern.len()) && np.inout[np.inout_p..].starts_with(pattern) {
+                    if np.amount(pattern.len()) && np.inout[np.inout_p..].starts_with(&pattern) {
                         np.inout_p += pattern.len() - 1;
                     } else {
                         continue;
@@ -2891,12 +2959,12 @@ fn num_processor(
                 }
             }
             K::NL => {
-                let pattern = L_CURRENCY_SYMBOL;
+                let pattern = np.locale.currency_symbol.clone();
                 if np.is_to_char {
-                    np.put_str(pattern);
+                    np.put_str(clipped(&pattern));
                     np.inout_p -= 1;
                 } else {
-                    np.eat_non_data_chars(1);
+                    np.eat_non_data_chars(text(&pattern).chars().count());
                     continue;
                 }
             }
@@ -3052,6 +3120,7 @@ fn num_to_char(
     numstr: &[u8],
     out_pre_spaces: i32,
     sign: u8,
+    conv: &Conv,
 ) -> Result<String> {
     let mut number = numstr.to_vec();
     number.extend_from_slice(&[0; 4]);
@@ -3064,6 +3133,7 @@ fn num_to_char(
         out_pre_spaces,
         sign,
         true,
+        conv,
     )?;
     Ok(text(&out))
 }
@@ -3135,16 +3205,16 @@ fn number_template(fmt: &str) -> Result<Option<(Vec<Node>, NumDesc)>> {
 }
 
 /// `to_char(bigint, text)`.
-pub fn to_char_int8(v: i64, fmt: &str) -> Result<String> {
-    int_to_char(v, fmt, true)
+pub fn to_char_int8(v: i64, fmt: &str, conv: &Conv) -> Result<String> {
+    int_to_char(v, fmt, true, conv)
 }
 
 /// `to_char(integer, text)`.
-pub fn to_char_int4(v: i32, fmt: &str) -> Result<String> {
-    int_to_char(i64::from(v), fmt, false)
+pub fn to_char_int4(v: i32, fmt: &str, conv: &Conv) -> Result<String> {
+    int_to_char(i64::from(v), fmt, false, conv)
 }
 
-fn int_to_char(value: i64, fmt: &str, wide: bool) -> Result<String> {
+fn int_to_char(value: i64, fmt: &str, wide: bool, conv: &Conv) -> Result<String> {
     let Some((nodes, mut num)) = number_template(fmt)? else {
         return Ok(String::new());
     };
@@ -3210,7 +3280,15 @@ fn int_to_char(value: i64, fmt: &str, wide: bool) -> Result<String> {
         }
         numstr
     };
-    num_to_char(&nodes, &mut num, fmt.len(), &numstr, out_pre_spaces, sign)
+    num_to_char(
+        &nodes,
+        &mut num,
+        fmt.len(),
+        &numstr,
+        out_pre_spaces,
+        sign,
+        conv,
+    )
 }
 
 /// dtoi4 and dtoi8: a double rounded to an integer, refused below `least` or from its negation
@@ -3258,7 +3336,7 @@ fn sci(v: &Numeric, scale: i32) -> Result<String> {
 }
 
 /// `to_char(real, text)`.
-pub fn to_char_float4(value: f32, fmt: &str) -> Result<String> {
+pub fn to_char_float4(value: f32, fmt: &str, conv: &Conv) -> Result<String> {
     let Some((nodes, mut num)) = number_template(fmt)? else {
         return Ok(String::new());
     };
@@ -3297,7 +3375,15 @@ pub fn to_char_float4(value: f32, fmt: &str) -> Result<String> {
         out_pre_spaces = spaces;
         digits
     };
-    num_to_char(&nodes, &mut num, fmt.len(), &numstr, out_pre_spaces, sign)
+    num_to_char(
+        &nodes,
+        &mut num,
+        fmt.len(),
+        &numstr,
+        out_pre_spaces,
+        sign,
+        conv,
+    )
 }
 
 /// The #s EEEE writes for NaN or an infinity.
@@ -3313,7 +3399,7 @@ fn eeee_hashes(num: &NumDesc) -> Vec<u8> {
 }
 
 /// `to_char(double precision, text)`.
-pub fn to_char_float8(value: f64, fmt: &str) -> Result<String> {
+pub fn to_char_float8(value: f64, fmt: &str, conv: &Conv) -> Result<String> {
     let Some((nodes, mut num)) = number_template(fmt)? else {
         return Ok(String::new());
     };
@@ -3352,11 +3438,19 @@ pub fn to_char_float8(value: f64, fmt: &str) -> Result<String> {
         out_pre_spaces = spaces;
         digits
     };
-    num_to_char(&nodes, &mut num, fmt.len(), &numstr, out_pre_spaces, sign)
+    num_to_char(
+        &nodes,
+        &mut num,
+        fmt.len(),
+        &numstr,
+        out_pre_spaces,
+        sign,
+        conv,
+    )
 }
 
 /// `to_char(numeric, text)`.
-pub fn to_char_numeric(value: &Numeric, fmt: &str) -> Result<String> {
+pub fn to_char_numeric(value: &Numeric, fmt: &str, conv: &Conv) -> Result<String> {
     let Some((nodes, mut num)) = number_template(fmt)? else {
         return Ok(String::new());
     };
@@ -3389,7 +3483,15 @@ pub fn to_char_numeric(value: &Numeric, fmt: &str) -> Result<String> {
         out_pre_spaces = spaces;
         digits
     };
-    num_to_char(&nodes, &mut num, fmt.len(), &numstr, out_pre_spaces, sign)
+    num_to_char(
+        &nodes,
+        &mut num,
+        fmt.len(),
+        &numstr,
+        out_pre_spaces,
+        sign,
+        conv,
+    )
 }
 
 /// apply_typmod of numeric_in: a numeric held to a precision and scale.
@@ -3405,14 +3507,16 @@ fn held_to_typmod(n: Numeric, precision: i32, scale: i32) -> Result<Numeric> {
 
 /// `to_number(text, text)`: the numeric the text is under the template; none where the template
 /// is empty.
-pub fn to_number(s: &str, fmt: &str) -> Result<Option<Numeric>> {
+pub fn to_number(s: &str, fmt: &str, conv: &Conv) -> Result<Option<Numeric>> {
     let Some((nodes, mut num)) = number_template(fmt)? else {
         return Ok(None);
     };
     let input = s.as_bytes().to_vec();
     let input_len = input.len();
     let number = vec![0u8; fmt.len() * NUM_MAX_ITEM_SIZ + 2];
-    let numstr = num_processor(&nodes, &mut num, input, number, input_len, 0, 0, false)?;
+    let numstr = num_processor(
+        &nodes, &mut num, input, number, input_len, 0, 0, false, conv,
+    )?;
     let scale = num.post;
     let precision = num.pre + num.multi + scale;
     let text = String::from_utf8_lossy(&numstr).into_owned();
@@ -3455,20 +3559,50 @@ mod tests {
         );
     }
 
+    fn c() -> &'static Conv {
+        crate::monetary::Monetary::C.conv()
+    }
+
     #[test]
     fn a_number_is_written_as_its_template_asks() {
-        assert_eq!(to_char_int4(-1234, "9,999.99").unwrap(), "-1,234.00");
-        assert_eq!(to_char_int4(5, "FM999th").unwrap(), "5th");
-        assert_eq!(to_char_int4(1994, "RN").unwrap(), "        MCMXCIV");
-        assert_eq!(to_char_float8(-0.1, "S9.99").unwrap(), " -.10");
-        assert_eq!(to_char_float8(123.456, "9.99EEEE").unwrap(), " 1.23e+02");
-        assert_eq!(to_char_int4(12345, "99").unwrap(), " ##");
+        assert_eq!(to_char_int4(-1234, "9,999.99", c()).unwrap(), "-1,234.00");
+        assert_eq!(to_char_int4(5, "FM999th", c()).unwrap(), "5th");
+        assert_eq!(to_char_int4(1994, "RN", c()).unwrap(), "        MCMXCIV");
+        assert_eq!(to_char_float8(-0.1, "S9.99", c()).unwrap(), " -.10");
+        assert_eq!(
+            to_char_float8(123.456, "9.99EEEE", c()).unwrap(),
+            " 1.23e+02"
+        );
+        assert_eq!(to_char_int4(12345, "99", c()).unwrap(), " ##");
+    }
+
+    #[test]
+    fn l_writes_lc_monetary_s_currency_symbol_and_d_and_g_lc_numeric_s() {
+        let n = |s: &str| Numeric::parse(s).unwrap();
+        let at = |symbol: &str| {
+            Conv::of(&[
+                ("currency_symbol", symbol),
+                ("mon_decimal_point", ","),
+                ("mon_thousands_sep", "."),
+                ("negative_sign", "-"),
+            ])
+        };
+        let (dk, gb) = (at("kr."), at("£"));
+        let written = |v: &str, fmt: &str, conv: &Conv| to_char_numeric(&n(v), fmt, conv).unwrap();
+        assert_eq!(written("1234.5", "L9G999D99", &dk), "kr. 1,234.50");
+        assert_eq!(written("-1234.5", "L9G999D99S", &gb), "£1,234.50-");
+        assert_eq!(written("1234.5", "FML9,999.99", &gb), "£1,234.5");
+        assert_eq!(written("-1234.5", "L9G999D99S", c()), " 1,234.50-");
+        let read =
+            |s: &str, conv: &Conv| to_number(s, "L9G999D9", conv).unwrap().unwrap().to_string();
+        assert_eq!(read("kr. 1,234.5", &dk), "0.1");
+        assert_eq!(read("£1,234.5", &gb), "1234.5");
     }
 
     #[test]
     fn a_text_is_read_as_its_template_asks() {
         assert_eq!(
-            to_number("-12,454.8", "99G999D9S")
+            to_number("-12,454.8", "99G999D9S", c())
                 .unwrap()
                 .unwrap()
                 .to_string(),

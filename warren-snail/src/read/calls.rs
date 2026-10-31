@@ -2246,12 +2246,13 @@ pub(super) fn overlay(s: Value, t: Value, from: Value, count: Option<Value>) -> 
 }
 
 /// The value of a function of formatting, to_char, to_number, to_date and to_timestamp of two
-/// texts, as formatting.c gives it: `types` its arguments' types, where the step resolved them.
-/// None where the snail answers no such function.
+/// texts, as formatting.c gives it: `types` its arguments' types, where the step resolved them, and
+/// `conv` the conventions its locale's patterns read. None where the snail answers no such function.
 pub(super) fn formatting(
     name: &str,
     args: &[Value],
     types: &[Option<ColumnType>],
+    conv: &crate::monetary::Conv,
 ) -> Result<Option<Value>> {
     use crate::formatting as f;
     if !matches!(name, "to_char" | "to_number" | "to_date" | "to_timestamp") {
@@ -2269,7 +2270,7 @@ pub(super) fn formatting(
     let fmt = text_arg(fmt)?;
     let text = |s: String| Value::Text(s);
     Ok(Some(match (name, x) {
-        ("to_number", s) => match f::to_number(&text_arg(s)?, &fmt)? {
+        ("to_number", s) => match f::to_number(&text_arg(s)?, &fmt, conv)? {
             Some(n) => Value::of_numeric(n),
             None => Value::Null,
         },
@@ -2288,15 +2289,15 @@ pub(super) fn formatting(
                 _ => i32::try_from(*v).is_err(),
             };
             text(if wide {
-                f::to_char_int8(*v, &fmt)?
+                f::to_char_int8(*v, &fmt, conv)?
             } else {
-                f::to_char_int4(*v as i32, &fmt)?
+                f::to_char_int4(*v as i32, &fmt, conv)?
             })
         }
-        (_, Value::Real(v)) => text(f::to_char_float4(*v, &fmt)?),
-        (_, Value::Double(v)) => text(f::to_char_float8(*v, &fmt)?),
+        (_, Value::Real(v)) => text(f::to_char_float4(*v, &fmt, conv)?),
+        (_, Value::Double(v)) => text(f::to_char_float8(*v, &fmt, conv)?),
         (_, v @ (Value::Num(..) | Value::Numeric(_))) => {
-            text(f::to_char_numeric(&v.to_numeric().unwrap(), &fmt)?)
+            text(f::to_char_numeric(&v.to_numeric().unwrap(), &fmt, conv)?)
         }
         (_, Value::Interval(v)) => f::to_char_interval(*v, &fmt)?.map_or(Value::Null, text),
         (_, Value::Scalar(ty, k)) => match super::clock::base(*ty) {

@@ -26,7 +26,7 @@ mod walk;
 
 pub use across::{Snails, StopAcross};
 pub use change::Done;
-pub use out::{TableOut, DDL_KEY, NAN_KEY, RELEASE_KEY};
+pub use out::{TableOut, DDL_KEY, MONETARY_KEY, NAN_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 pub use point::Point;
 pub use together::{answer_together, at_one_moment, price_together, Priced, TablePrice};
@@ -599,7 +599,7 @@ impl Snail {
         let mut catalog = Catalog::parse_kept(&ddl, usize::MAX)?;
         old_names(&mut catalog, reader.format());
         catalog.with_release(root.release)?;
-        crate::file::monetary_read(&catalog, &root.monetary)?;
+        catalog.with_monetary(&root.monetary)?;
         Ok(catalog)
     }
 

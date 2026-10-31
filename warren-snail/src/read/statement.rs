@@ -370,7 +370,7 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
         | ColumnType::Xid8
         | ColumnType::PgLsn
         | ColumnType::Char
-        | ColumnType::Money
+        | ColumnType::Money(_)
         | ColumnType::Macaddr
         | ColumnType::Macaddr8
         | ColumnType::Tid
@@ -672,9 +672,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         Sql::Truncate { .. } => Err(refused("TRUNCATE")),
         Sql::Set(sqlparser::ast::Set::SingleAssignment {
             variable, values, ..
-        }) => setting(&object_name(variable), values),
+        }) => setting(&object_name(variable), values, catalog.monetary),
         Sql::Set(sqlparser::ast::Set::SetTimeZone { value, .. }) => {
-            setting("timezone", std::slice::from_ref(value))
+            setting("timezone", std::slice::from_ref(value), catalog.monetary)
         }
         other => Err(Error::new(format!(
             "{other} is not a statement the snail writes"
@@ -683,7 +683,8 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
 }
 
 /// The settings the snail answers under, each its name as PostgreSQL's SET takes it and its
-/// value: what PostgreSQL's side of a certificate runs under too.
+/// value: what PostgreSQL's side of a certificate runs under too. lc_monetary is the one the file's
+/// money was written under, C where it names no other.
 pub const SETTINGS: [(&str, &str); 9] = [
     ("timezone", "UTC"),
     ("datestyle", "ISO, MDY"),
@@ -697,9 +698,11 @@ pub const SETTINGS: [(&str, &str); 9] = [
 ];
 
 /// A SET of `name` to `values`: taken, changing nothing, where it sets the value the snail answers
-/// under, and refused by name where it sets another or a setting the snail does not read.
-fn setting(name: &str, values: &[Expr]) -> Result<Statement> {
+/// under, `monetary` lc_monetary's, and refused by name where it sets another or a setting the
+/// snail does not read.
+fn setting(name: &str, values: &[Expr], monetary: crate::monetary::Monetary) -> Result<Statement> {
     let name = name.to_lowercase();
+    let file = monetary.name();
     let Some(&(_, fixed)) = SETTINGS.iter().find(|(n, _)| *n == name) else {
         return Err(Error::new(format!(
             "SET {name} is not read: the snail answers under fixed settings"
@@ -743,10 +746,19 @@ fn setting(name: &str, values: &[Expr]) -> Result<Statement> {
                 "on" | "true" | "yes" | "1" | "default"
             )
         }
-        "lc_monetary" | "lc_numeric" | "lc_time" => {
+        "lc_monetary" => {
+            crate::monetary::Monetary::names_same(&joined, &file)
+                || joined.eq_ignore_ascii_case("default")
+        }
+        "lc_numeric" | "lc_time" => {
             matches!(joined.as_str(), "C" | "POSIX") || joined.eq_ignore_ascii_case("default")
         }
         _ => joined.eq_ignore_ascii_case(fixed) || joined.eq_ignore_ascii_case("default"),
+    };
+    let fixed = if name == "lc_monetary" {
+        file.as_str()
+    } else {
+        fixed
     };
     if !same {
         return Err(Error::new(format!(

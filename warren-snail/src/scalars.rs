@@ -399,97 +399,6 @@ fn lsn_out(v: u64) -> String {
     format!("{:X}/{:08X}", v >> 32, v as u32)
 }
 
-/// money as PostgreSQL's `cash_in` reads it under the C locale: white space, a `$`, a sign or an
-/// opening parenthesis, digits with commas among them, a point and two digits, the next digit
-/// rounding the last half up; then a closing parenthesis, a sign or a `$`.
-fn money_in(s: &str) -> Result<i64> {
-    let wrong = || Error::new(format!("invalid input syntax for type money: \"{s}\""));
-    let range = || Error::new(format!("value \"{s}\" is out of range for type money"));
-    let b = s.as_bytes();
-    let mut at = 0;
-    let skip = |at: &mut usize| {
-        while *at < b.len() && is_c_space(b[*at]) {
-            *at += 1;
-        }
-    };
-    let symbol = |at: &mut usize| {
-        if b.get(*at) == Some(&b'$') {
-            *at += 1;
-        }
-    };
-    skip(&mut at);
-    symbol(&mut at);
-    skip(&mut at);
-    let mut negative = false;
-    match b.get(at) {
-        Some(b'-') | Some(b'(') => {
-            negative = true;
-            at += 1;
-        }
-        Some(b'+') => at += 1,
-        _ => {}
-    }
-    skip(&mut at);
-    symbol(&mut at);
-    skip(&mut at);
-    // Built in the negative, as PostgreSQL builds it, so the most negative value is reached.
-    let (mut value, mut dec, mut dot) = (0i64, 0, false);
-    while at < b.len() {
-        let c = b[at];
-        if c.is_ascii_digit() && (!dot || dec < 2) {
-            value = value
-                .checked_mul(10)
-                .and_then(|v| v.checked_sub(i64::from(c - b'0')))
-                .ok_or_else(range)?;
-            if dot {
-                dec += 1;
-            }
-        } else if c == b'.' && !dot {
-            dot = true;
-        } else if c != b',' {
-            break;
-        }
-        at += 1;
-    }
-    if b.get(at).is_some_and(|&c| (b'5'..=b'9').contains(&c)) {
-        value = value.checked_sub(1).ok_or_else(range)?;
-    }
-    for _ in dec..2 {
-        value = value.checked_mul(10).ok_or_else(range)?;
-    }
-    while b.get(at).is_some_and(u8::is_ascii_digit) {
-        at += 1;
-    }
-    while at < b.len() {
-        match b[at] {
-            c if is_c_space(c) || c == b')' || c == b'+' || c == b'$' => {}
-            b'-' => negative = true,
-            _ => return Err(wrong()),
-        }
-        at += 1;
-    }
-    if negative {
-        Ok(value)
-    } else {
-        value.checked_neg().ok_or_else(range)
-    }
-}
-
-/// money as PostgreSQL's `cash_out` writes it under the C locale: a `$`, commas between thousands,
-/// a point and two digits, a minus sign before it all where it is negative.
-fn money_out(v: i64) -> String {
-    let u = v.unsigned_abs();
-    let whole = (u / 100).to_string();
-    let mut grouped = String::new();
-    for (i, c) in whole.chars().enumerate() {
-        if i > 0 && (whole.len() - i).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(c);
-    }
-    format!("{}${grouped}.{:02}", if v < 0 { "-" } else { "" }, u % 100)
-}
-
 /// One `%x` or `%2x` of glibc's `sscanf`: white space, a sign, `0x` where no width bounds it, then
 /// hex digits, at most `width` characters after the white space. The number as an int, and where
 /// the reading stopped; none where no digit was read.
@@ -1156,7 +1065,7 @@ pub fn scalar_text(ty: ColumnType, key: i64) -> String {
         }
         ColumnType::PgLsn => lsn_out(unsigned_of(key, 64)),
         ColumnType::Char => char_out(unsigned_of(key, 8) as u8),
-        ColumnType::Money => money_out(key),
+        ColumnType::Money(m) => crate::monetary::cash_out(key, m.conv()),
         ColumnType::Macaddr => mac_out(unsigned_of(key, 48), 6),
         ColumnType::Macaddr8 => mac_out(unsigned_of(key, 64), 8),
         ColumnType::Tid => tid_out(key),
@@ -1191,7 +1100,7 @@ pub fn scalar_parse(ty: ColumnType, s: &str) -> Result<i64> {
         }
         ColumnType::PgLsn => unsigned_key(lsn_in(s)?, 64),
         ColumnType::Char => unsigned_key(u64::from(char_in(s)), 8),
-        ColumnType::Money => money_in(s)?,
+        ColumnType::Money(m) => crate::monetary::cash_in(s, m.conv())?,
         ColumnType::Macaddr => unsigned_key(mac_in(s)?, 48),
         ColumnType::Macaddr8 => unsigned_key(mac8_in(s)?, 64),
         ColumnType::Tid => tid_in(s)?,
@@ -1222,6 +1131,10 @@ pub const PG_TYPE: &str = "pg_type";
 /// The key of an answer's field metadata that names the PostgreSQL release whose catalog names a
 /// reg* column's OIDs.
 pub const PG_RELEASE: &str = "pg_release";
+
+/// The key of an answer's field metadata that names the lc_monetary a money column reads and
+/// prints under, where it is not C.
+pub const PG_MONETARY: &str = "lc_monetary";
 
 /// A tid's two leaves as arrow's Parquet reader gives them: its block number and its offset.
 fn tid_fields() -> arrow::datatypes::Fields {
@@ -1495,6 +1408,11 @@ pub fn scalar_field(name: &str, ty: ColumnType, nullable: bool) -> arrow::dataty
     if let ColumnType::Reg(_, release) = ty {
         named.push((PG_RELEASE.to_string(), release.to_string()));
     }
+    if let ColumnType::Money(m) = ty {
+        if !m.is_c() {
+            named.push((PG_MONETARY.to_string(), m.name()));
+        }
+    }
     arrow::datatypes::Field::new(name, scalar_arrow(ty), nullable)
         .with_metadata(named.into_iter().collect())
 }
@@ -1511,6 +1429,14 @@ pub fn field_scalar(f: &arrow::datatypes::Field) -> Option<ColumnType> {
         let ty = ColumnType::Reg(kind, release);
         return (scalar_arrow(ty) == *f.data_type()).then_some(ty);
     }
+    if named == "money" {
+        let m = match f.metadata().get(PG_MONETARY) {
+            Some(l) => crate::monetary::Monetary::open(l).ok()?,
+            None => crate::monetary::Monetary::C,
+        };
+        let ty = ColumnType::Money(m);
+        return (scalar_arrow(ty) == *f.data_type()).then_some(ty);
+    }
     [
         ColumnType::Oid,
         ColumnType::Xid,
@@ -1518,7 +1444,6 @@ pub fn field_scalar(f: &arrow::datatypes::Field) -> Option<ColumnType> {
         ColumnType::Xid8,
         ColumnType::PgLsn,
         ColumnType::Char,
-        ColumnType::Money,
         ColumnType::Macaddr,
         ColumnType::Macaddr8,
         ColumnType::Oid8,
@@ -1585,7 +1510,7 @@ pub fn is_scalar(ty: ColumnType) -> bool {
             | ColumnType::Xid8
             | ColumnType::PgLsn
             | ColumnType::Char
-            | ColumnType::Money
+            | ColumnType::Money(_)
             | ColumnType::Macaddr
             | ColumnType::Macaddr8
             | ColumnType::Reg(..)
@@ -1601,6 +1526,7 @@ pub fn is_scalar(ty: ColumnType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const MONEY: ColumnType = ColumnType::Money(crate::monetary::Monetary::C);
 
     #[test]
     fn an_unsigned_number_s_key_sorts_as_the_number_and_gives_it_back() {
@@ -1873,8 +1799,7 @@ mod tests {
         for s in ["", "0/", "/0", "123456789/0", " 0/0", "0/0 ", "g/0"] {
             assert!(lsn(s).is_err(), "{s}");
         }
-        let money =
-            |s: &str| scalar_parse(ColumnType::Money, s).map(|k| scalar_text(ColumnType::Money, k));
+        let money = |s: &str| scalar_parse(MONEY, s).map(|k| scalar_text(MONEY, k));
         for (s, want) in [
             ("-1234567.891", "-$1,234,567.89"),
             ("0", "$0.00"),

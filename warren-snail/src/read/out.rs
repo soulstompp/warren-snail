@@ -29,6 +29,10 @@ pub const DDL_KEY: &str = "warren-snail.ddl";
 /// OIDs came from.
 pub const RELEASE_KEY: &str = "warren-snail.release";
 
+/// The key under which a file out of a table holding money names the lc_monetary its money was
+/// written under, where it is not C.
+pub const MONETARY_KEY: &str = "warren-snail.lc_monetary";
+
 /// The key under which a file out of a table names each numeric column holding a NaN, and the
 /// integer that stands for it: a line a column, its name, a tab, and the integer.
 pub const NAN_KEY: &str = "warren-snail.nan";
@@ -513,6 +517,14 @@ impl Snail {
                         .iter()
                         .any(|c| matches!(c.ty, ColumnType::Reg(..)))
                         .then(|| KeyValue::new(RELEASE_KEY.to_string(), table.release.to_string())),
+                )
+                .chain(
+                    (!table.monetary.is_c()
+                        && table
+                            .columns
+                            .iter()
+                            .any(|c| matches!(c.ty, ColumnType::Money(_))))
+                    .then(|| KeyValue::new(MONETARY_KEY.to_string(), table.monetary.name())),
                 )
                 .chain(
                     nan_columns(table, order, &blocks)

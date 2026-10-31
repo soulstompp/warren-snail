@@ -3550,6 +3550,7 @@ impl Draft {
                         checks: Vec::new(),
                         release: crate::regs::LATEST,
                         foreign_keys: Vec::new(),
+                        monetary: crate::monetary::Monetary::C,
                     }],
                     functions: self.functions.clone(),
                     types: self.types.clone(),
@@ -3557,6 +3558,7 @@ impl Draft {
                     sequences: self.sequences.clone(),
                     collations: self.collations.clone(),
                     release: crate::regs::LATEST,
+                    monetary: crate::monetary::Monetary::C,
                 };
                 let text = p.to_string();
                 let read = crate::read::partial::Predicate::read(&alone, &alone.tables[0], &text)
@@ -3885,6 +3887,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         checks: d.checks.clone(),
         release: crate::regs::LATEST,
         foreign_keys: d.foreign_keys.clone(),
+        monetary: crate::monetary::Monetary::C,
     })
 }
 
@@ -4533,6 +4536,7 @@ pub(crate) fn read_ddl_kept(ddl: &str, strict: bool, kept: usize) -> Result<Read
             sequences: draft.sequences,
             collations: draft.collations,
             release: crate::regs::LATEST,
+            monetary: crate::monetary::Monetary::C,
         },
         statements,
     })
