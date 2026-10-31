@@ -1424,9 +1424,11 @@ fn rest_status(
             _ if present == 0 => Some(0),
             _ if sum.max < iv.lo || sum.min > iv.hi => Some(0),
             _ if sum.min == sum.max => Some(if c.holds(Some(sum.min)) { present } else { 0 }),
+            _ if c.gap_holds(sum.min, sum.max) => Some(0),
             _ if iv.lo <= sum.min
                 && sum.max <= iv.hi
-                && !c.except.iter().any(|&x| sum.min <= x && x <= sum.max) =>
+                && !c.except.iter().any(|&x| sum.min <= x && x <= sum.max)
+                && c.clear_of_gaps(sum.min, sum.max) =>
             {
                 Some(present)
             }

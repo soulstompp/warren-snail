@@ -163,6 +163,9 @@ fn cond_within(c: &Cond, p: &Cond) -> bool {
         && p.except
             .iter()
             .all(|x| !c.kept.holds(*x) || c.except.contains(x))
+        && p.gaps
+            .iter()
+            .all(|g| g.hi < c.kept.lo || c.kept.hi < g.lo || c.gap_holds(g.lo, g.hi))
 }
 
 /// Whether a lower bound `a` keeps no value `b` leaves out: `a` at or above `b`.
@@ -194,4 +197,5 @@ fn text_within(t: &TextCond, p: &TextCond) -> bool {
     lower_within(&t.lo, &p.lo)
         && upper_within(&t.hi, &p.hi)
         && p.except.iter().all(|x| !t.holds(x) || t.except.contains(x))
+        && p.gaps.iter().all(|g| t.gaps.contains(g))
 }

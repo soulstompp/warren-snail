@@ -35,9 +35,9 @@ impl Interval {
     }
 }
 
-/// A condition on one column, or on its month: the values `kept` holds less those `except` names,
-/// and the column's NULLs too where `nulls`. `<>` keeps every value but one; IS NOT TRUE keeps
-/// false and NULL.
+/// A condition on one column, or on its month: the values `kept` holds less those `except` names
+/// and those in its `gaps`, and the column's NULLs too where `nulls`. `<>` keeps every value but
+/// one; NOT BETWEEN every value but a run; IS NOT TRUE keeps false and NULL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Cond {
@@ -45,6 +45,7 @@ pub struct Cond {
     pub kept: Interval,
     pub except: Vec<i128>,
     pub nulls: bool,
+    pub gaps: Vec<Interval>,
 }
 
 impl Cond {
@@ -54,20 +55,35 @@ impl Cond {
             kept,
             except: Vec::new(),
             nulls: false,
+            gaps: Vec::new(),
         }
     }
 
     /// Whether it keeps a run of values and nothing else, as a range on a level does.
     pub fn is_range(&self) -> bool {
-        self.except.is_empty() && !self.nulls
+        self.except.is_empty() && !self.nulls && self.gaps.is_empty()
     }
 
     /// Whether it keeps a row whose value is `v`, none for a NULL.
     pub fn holds(&self, v: Option<i128>) -> bool {
         match v {
             None => self.nulls,
-            Some(v) => self.kept.holds(v) && !self.except.contains(&v),
+            Some(v) => {
+                self.kept.holds(v)
+                    && !self.except.contains(&v)
+                    && !self.gaps.iter().any(|g| g.holds(v))
+            }
         }
+    }
+
+    /// Whether one of its gaps holds every value from `lo` to `hi`.
+    pub fn gap_holds(&self, lo: i128, hi: i128) -> bool {
+        self.gaps.iter().any(|g| g.lo <= lo && hi <= g.hi)
+    }
+
+    /// Whether none of its gaps holds a value from `lo` to `hi`.
+    pub fn clear_of_gaps(&self, lo: i128, hi: i128) -> bool {
+        self.gaps.iter().all(|g| g.hi < lo || hi < g.lo)
     }
 
     /// Whether it keeps no value, and no NULL.
@@ -176,7 +192,8 @@ impl Select {
 }
 
 /// A condition on a column of a string type, bytea or a bit string: its values between two bounds,
-/// compared by the bytes they are keyed by (`strings::key_bytes`), less those `except` names.
+/// compared by the bytes they are keyed by (`strings::key_bytes`), less those `except` names and
+/// those in its `gaps`, each a run between two bounds.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct TextCond {
@@ -184,25 +201,46 @@ pub struct TextCond {
     pub lo: Bound<Vec<u8>>,
     pub hi: Bound<Vec<u8>>,
     pub except: Vec<Vec<u8>>,
+    pub gaps: Vec<(Bound<Vec<u8>>, Bound<Vec<u8>>)>,
+}
+
+/// Whether `v` lies from `lo` to `hi`.
+pub fn bytes_within(v: &[u8], lo: &Bound<Vec<u8>>, hi: &Bound<Vec<u8>>) -> bool {
+    let above = match lo {
+        Included(l) => v >= l.as_slice(),
+        Excluded(l) => v > l.as_slice(),
+        Unbounded => true,
+    };
+    let below = match hi {
+        Included(h) => v <= h.as_slice(),
+        Excluded(h) => v < h.as_slice(),
+        Unbounded => true,
+    };
+    above && below
 }
 
 impl TextCond {
+    /// The values from `lo` to `hi`.
+    pub fn new(column: usize, lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>) -> TextCond {
+        TextCond {
+            column,
+            lo,
+            hi,
+            except: Vec::new(),
+            gaps: Vec::new(),
+        }
+    }
+
     /// Whether it keeps a value keyed by `v`.
     pub fn holds(&self, v: &[u8]) -> bool {
-        if self.except.iter().any(|x| x == v) {
-            return false;
-        }
-        let above = match &self.lo {
-            Included(l) => v >= l.as_slice(),
-            Excluded(l) => v > l.as_slice(),
-            Unbounded => true,
-        };
-        let below = match &self.hi {
-            Included(h) => v <= h.as_slice(),
-            Excluded(h) => v < h.as_slice(),
-            Unbounded => true,
-        };
-        above && below
+        !self.except.iter().any(|x| x == v)
+            && bytes_within(v, &self.lo, &self.hi)
+            && !self.gaps.iter().any(|(l, h)| bytes_within(v, l, h))
+    }
+
+    /// Whether it keeps a run of values and nothing else, as a range on a level does.
+    pub fn is_range(&self) -> bool {
+        self.except.is_empty() && self.gaps.is_empty()
     }
 
     fn is_empty(&self) -> bool {
@@ -284,15 +322,7 @@ impl Side {
         match piece {
             Piece::Cond(c) => merge(&mut self.conds, c),
             Piece::Text(t) => match self.texts.iter_mut().find(|x| x.column == t.column) {
-                Some(have) => {
-                    have.lo = tighter(std::mem::replace(&mut have.lo, Unbounded), t.lo, true);
-                    have.hi = tighter(std::mem::replace(&mut have.hi, Unbounded), t.hi, false);
-                    for x in t.except {
-                        if !have.except.contains(&x) {
-                            have.except.push(x);
-                        }
-                    }
-                }
+                Some(have) => both_texts(have, t),
                 None => self.texts.push(t),
             },
             Piece::Null(c, null) => {
@@ -783,10 +813,120 @@ fn merge(conds: &mut Vec<Cond>, c: Cond) {
                     have.except.push(v);
                 }
             }
+            for g in c.gaps {
+                if !have.gaps.contains(&g) {
+                    have.gaps.push(g);
+                }
+            }
             have.nulls &= c.nulls;
         }
         None => conds.push(c),
     }
+}
+
+/// A condition on text kept to another on the same column as well: the values both keep.
+fn both_texts(have: &mut TextCond, t: TextCond) {
+    have.lo = tighter(std::mem::replace(&mut have.lo, Unbounded), t.lo, true);
+    have.hi = tighter(std::mem::replace(&mut have.hi, Unbounded), t.hi, false);
+    for x in t.except {
+        if !have.except.contains(&x) {
+            have.except.push(x);
+        }
+    }
+    have.gaps.extend(t.gaps);
+}
+
+/// The values either of two ranges on one column keeps: the run from the lower's start to the
+/// further end, less the gap between them where they neither meet nor overlap. None where either
+/// keeps more than a run.
+fn either_conds(a: Cond, b: Cond) -> Option<Cond> {
+    if !a.is_range() || !b.is_range() {
+        return None;
+    }
+    let empty = |c: &Cond| c.kept.lo > c.kept.hi;
+    if empty(&a) {
+        return Some(b);
+    }
+    if empty(&b) {
+        return Some(a);
+    }
+    let (a, b) = if a.kept.lo <= b.kept.lo {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut c = Cond::new(
+        a.shape,
+        Interval {
+            lo: a.kept.lo,
+            hi: a.kept.hi.max(b.kept.hi),
+        },
+    );
+    if a.kept.hi.checked_add(1).is_some_and(|n| n < b.kept.lo) {
+        c.gaps.push(Interval {
+            lo: a.kept.hi + 1,
+            hi: b.kept.lo - 1,
+        });
+    }
+    Some(c)
+}
+
+/// Whether a lower bound keeps every value another keeps at its low end.
+fn lower_first(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> bool {
+    match (a, b) {
+        (Unbounded, _) => true,
+        (_, Unbounded) => false,
+        (Included(x), Excluded(y)) => x <= y,
+        (Included(x), Included(y)) | (Excluded(x), Excluded(y)) => x <= y,
+        (Excluded(x), Included(y)) => x < y,
+    }
+}
+
+/// The values either of two ranges on one text column keeps, as `either_conds` makes them of a
+/// number's.
+fn either_texts(a: TextCond, b: TextCond) -> Option<TextCond> {
+    if !a.is_range() || !b.is_range() {
+        return None;
+    }
+    if a.is_empty() {
+        return Some(b);
+    }
+    if b.is_empty() {
+        return Some(a);
+    }
+    let (a, b) = if lower_first(&a.lo, &b.lo) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let gap = match (&a.hi, &b.lo) {
+        (Included(h) | Excluded(h), Included(l) | Excluded(l)) if l > h => Some((
+            if matches!(a.hi, Included(_)) {
+                Excluded(h.clone())
+            } else {
+                Included(h.clone())
+            },
+            if matches!(b.lo, Included(_)) {
+                Excluded(l.clone())
+            } else {
+                Included(l.clone())
+            },
+        )),
+        (Excluded(h), Excluded(l)) if l == h => Some((Included(h.clone()), Included(h.clone()))),
+        _ => None,
+    };
+    // The further of the two upper bounds.
+    let a_further = match (&a.hi, &b.hi) {
+        (Unbounded, _) => true,
+        (_, Unbounded) => false,
+        (Included(x) | Excluded(x), Included(y) | Excluded(y)) => {
+            x > y || (x == y && matches!(a.hi, Included(_)))
+        }
+    };
+    let hi = if a_further { a.hi } else { b.hi };
+    let mut t = TextCond::new(a.column, a.lo, hi);
+    t.gaps.extend(gap);
+    Some(t)
 }
 
 /// A truth test on a boolean column: the column standing as a condition, alone or under NOT, or
@@ -1308,7 +1448,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
     let n = from.tables.len();
     let mut pool: Vec<Conj> = Vec::new();
     for p in wheres {
-        pool.push(conjunct(&from, p)?);
+        pool.extend(read_conjunct(&from, p)?);
     }
     let mut nullable = vec![false; n];
     let mut held: Vec<Vec<Conj>> = (0..n).map(|_| Vec::new()).collect();
@@ -1317,15 +1457,16 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         let side = k + 1;
         let mut read = Vec::new();
         for p in on {
-            let c = conjunct(&from, p)?;
-            // An ON reads only the tables of its FROM item joined by then.
-            if let Some(&s) = c.sides().iter().find(|&&s| s < start || s > side) {
-                return Err(Error::new(format!(
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    from.named(s)
-                )));
+            for c in read_conjunct(&from, p)? {
+                // An ON reads only the tables of its FROM item joined by then.
+                if let Some(&s) = c.sides().iter().find(|&&s| s < start || s > side) {
+                    return Err(Error::new(format!(
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        from.named(s)
+                    )));
+                }
+                read.push(c);
             }
-            read.push(c);
         }
         match joining {
             Joining::Inner => pool.extend(read),
@@ -1659,6 +1800,144 @@ fn comparable(
     Ok(())
 }
 
+/// What one conjunct says, as the conditions and comparisons PostgreSQL's analyser reads it as: a
+/// BETWEEN as its comparisons.
+fn read_conjunct(from: &From, p: &Expr) -> Result<Vec<Conj>> {
+    match p {
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => between(from, p, expr, *negated, low, high),
+        p => Ok(vec![conjunct(from, p)?]),
+    }
+}
+
+/// A BETWEEN's lower bound, and whether it is SYMMETRIC: `spelled` writes `BETWEEN SYMMETRIC x`
+/// and `BETWEEN ASYMMETRIC x` as a call of the keyword on `(x)`, which no function can be, the
+/// keyword being reserved.
+pub(super) fn between_low(low: &Expr) -> (&Expr, bool) {
+    if let Expr::Function(f) = low {
+        let word = match f.name.0.as_slice() {
+            [part] => part
+                .as_ident()
+                .filter(|i| i.quote_style.is_none())
+                .map(|i| i.value.to_ascii_uppercase()),
+            _ => None,
+        };
+        if let (Some(word), FunctionArguments::List(l)) = (word, &f.args) {
+            if let [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))] = l.args.as_slice() {
+                match word.as_str() {
+                    "SYMMETRIC" => return (x, true),
+                    "ASYMMETRIC" => return (x, false),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (low, false)
+}
+
+/// `x BETWEEN a AND b` as `x >= a AND x <= b`; NOT BETWEEN as `x < a OR x > b`; SYMMETRIC as both
+/// orders of the bounds or'd, and NOT BETWEEN SYMMETRIC as both orders' NOT BETWEEN and'd, as
+/// PostgreSQL's `transformAExprBetween` writes them. A BETWEEN is the two comparisons; the others
+/// are read where every comparison is of one column of one table with a value.
+fn between(
+    from: &From,
+    p: &Expr,
+    x: &Expr,
+    negated: bool,
+    low: &Expr,
+    high: &Expr,
+) -> Result<Vec<Conj>> {
+    let (low, symmetric) = between_low(low);
+    let compare = |op: BinaryOperator, bound: &Expr| {
+        conjunct(
+            from,
+            &Expr::BinaryOp {
+                left: Box::new(x.clone()),
+                op,
+                right: Box::new(bound.clone()),
+            },
+        )
+    };
+    if !negated && !symmetric {
+        return Ok(vec![
+            compare(BinaryOperator::GtEq, low)?,
+            compare(BinaryOperator::LtEq, high)?,
+        ]);
+    }
+    let unread = || {
+        Error::new(format!(
+            "{p}: NOT BETWEEN and BETWEEN SYMMETRIC are read of one table's column against values"
+        ))
+    };
+    // Each comparison as a condition on its column: its side, and the piece.
+    let piece = |op: BinaryOperator, bound: &Expr| -> Result<(usize, Piece)> {
+        match compare(op, bound)? {
+            Conj::One(side, p @ (Piece::Cond(_) | Piece::Text(_) | Piece::Empty)) => Ok((side, p)),
+            _ => Err(unread()),
+        }
+    };
+    let pieces = |a: BinaryOperator, b: BinaryOperator, first: &Expr, second: &Expr| {
+        Ok::<_, Error>([piece(a, first)?, piece(b, second)?])
+    };
+    let both = |[(sa, a), (sb, b)]: [(usize, Piece); 2]| -> Result<(usize, Piece)> {
+        if sa != sb {
+            return Err(unread());
+        }
+        Ok((
+            sa,
+            match (a, b) {
+                (Piece::Empty, _) | (_, Piece::Empty) => Piece::Empty,
+                (Piece::Cond(c), Piece::Cond(d)) if c.shape == d.shape => {
+                    let mut kept = vec![c];
+                    merge(&mut kept, d);
+                    Piece::Cond(kept.pop().unwrap())
+                }
+                (Piece::Text(mut t), Piece::Text(u)) if t.column == u.column => {
+                    both_texts(&mut t, u);
+                    Piece::Text(t)
+                }
+                _ => return Err(unread()),
+            },
+        ))
+    };
+    let either = |(sa, a): (usize, Piece), (sb, b): (usize, Piece)| -> Result<(usize, Piece)> {
+        if sa != sb {
+            return Err(unread());
+        }
+        Ok((
+            sa,
+            match (a, b) {
+                (Piece::Empty, p) | (p, Piece::Empty) => p,
+                (Piece::Cond(c), Piece::Cond(d)) if c.shape == d.shape => {
+                    Piece::Cond(either_conds(c, d).ok_or_else(unread)?)
+                }
+                (Piece::Text(t), Piece::Text(u)) if t.column == u.column => {
+                    Piece::Text(either_texts(t, u).ok_or_else(unread)?)
+                }
+                _ => return Err(unread()),
+            },
+        ))
+    };
+    use BinaryOperator::{Gt, GtEq, Lt, LtEq};
+    let outside = |a: &Expr, b: &Expr| -> Result<(usize, Piece)> {
+        let [lt, gt] = pieces(Lt, Gt, a, b)?;
+        either(lt, gt)
+    };
+    let read = match (negated, symmetric) {
+        (true, false) => outside(low, high)?,
+        (false, true) => either(
+            both(pieces(GtEq, LtEq, low, high)?)?,
+            both(pieces(GtEq, LtEq, high, low)?)?,
+        )?,
+        _ => both([outside(low, high)?, outside(high, low)?])?,
+    };
+    Ok(vec![Conj::One(read.0, read.1)])
+}
+
 /// What one conjunct says: a condition on one table's column, or two tables' columns compared.
 fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
     if let Some((side, cond)) = truth_test(from, p)? {
@@ -1886,10 +2165,8 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
             return Ok(Conj::One(
                 side,
                 Piece::Text(TextCond {
-                    column: c,
-                    lo,
-                    hi,
                     except,
+                    ..TextCond::new(c, lo, hi)
                 }),
             ));
         }

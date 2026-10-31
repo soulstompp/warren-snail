@@ -3239,44 +3239,108 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             expr,
             substring_from,
             substring_for,
+            shorthand,
             ..
         } => {
-            let from = match substring_from {
-                Some(x) => ev(x)?,
-                None => Value::Int(1),
-            };
-            // A text to start from is a pattern: substring(text, text), or with a text for its end,
-            // SQL's substring(text, text, text) by similar_escape.
-            if matches!(from, Value::Text(_) | Value::Str(..)) {
-                let esc = substring_for.as_deref().map(&ev).transpose()?;
-                if !matches!(esc, Some(Value::Int(_))) {
-                    let casing = match frame.casings.implicit(expr)? {
-                        Some(k) => k,
-                        None => substring_from
-                            .as_deref()
-                            .map(|x| frame.casings.implicit(x))
-                            .transpose()?
-                            .flatten()
-                            .unwrap_or(Casing::Libc),
-                    };
-                    return super::calls::substring_by_pattern(
-                        &ev(expr)?,
-                        &from,
-                        esc.as_ref(),
-                        casing,
-                    );
+            // Its form as PostgreSQL resolves it by its arguments' types: a string of text from a
+            // text is substring(text, text), by a POSIX pattern, and with a text for its end too
+            // substring(text, text, text), by a SIMILAR one; else a form of integers, a quoted
+            // literal read as an integer. `SUBSTRING(s FOR e)` is substring(s, 1, e::int4) (gram.y,
+            // substr_list), and SUBSTR a function of integers alone.
+            let string = ev(expr)?;
+            let parts: Vec<(Value, &Expr)> = [substring_from, substring_for]
+                .into_iter()
+                .flatten()
+                .map(|x| Ok((ev(x)?, x.as_ref())))
+                .collect::<Result<_>>()?;
+            let texty = |v: &Value| matches!(v, Value::Text(_) | Value::Str(..));
+            let named = |v: &Value, x: &Expr| {
+                if quoted(x) {
+                    "unknown".to_string()
+                } else {
+                    kind_name(v)
                 }
+            };
+            let missing = || {
+                let types: Vec<String> = std::iter::once(named(&string, expr))
+                    .chain(parts.iter().map(|(v, x)| named(v, x)))
+                    .collect();
+                Error::new(format!(
+                    "function {}({}) does not exist",
+                    if *shorthand {
+                        "substr"
+                    } else {
+                        "pg_catalog.substring"
+                    },
+                    types.join(", ")
+                ))
+            };
+            let of_text = matches!(string, Value::Text(_) | Value::Str(..) | Value::Null);
+            let integral = |v: &Value| matches!(v, Value::Int(x) if i32::try_from(*x).is_ok());
+            let by_pattern = !*shorthand
+                && of_text
+                && substring_from.is_some()
+                && parts.iter().all(|(v, _)| texty(v) || v.is_null())
+                && parts.iter().any(|(v, _)| texty(v));
+            if !by_pattern {
+                let held = matches!(
+                    string,
+                    Value::Text(_)
+                        | Value::Str(..)
+                        | Value::Null
+                        | Value::Bytes(_)
+                        | Value::Bits(..)
+                );
+                if !held || (matches!(string, Value::Bits(..)) && *shorthand) {
+                    return Err(missing());
+                }
+                // Each argument as an integer: a quoted literal read as int4 reads it, and FOR
+                // alone cast to int4.
+                let alone = substring_from.is_none();
+                let mut args = vec![string.clone()];
+                if alone {
+                    args.push(Value::Int(1));
+                }
+                for (v, x) in &parts {
+                    args.push(match v {
+                        Value::Null => Value::Null,
+                        v if integral(v) => v.clone(),
+                        Value::Text(t) | Value::Str(_, t) if quoted(x) || alone => {
+                            Value::Int(crate::composed::int_in(t, 32)?)
+                        }
+                        Value::Bool(b) if alone => Value::Int(i64::from(*b)),
+                        v if alone => cast(
+                            v.clone(),
+                            &sqlparser::ast::DataType::Int4(None),
+                            frame.release,
+                            frame.casings.monetary(),
+                            false,
+                        )?,
+                        _ => return Err(missing()),
+                    });
+                }
+                // A bit string's, as bitsubstr takes it.
+                let given: Vec<_> = args.iter().map(|v| (v.clone(), false, None)).collect();
+                if let Some(v) = super::rest::call("substring", &given)? {
+                    return Ok(v);
+                }
+                return super::calls::strings("substr", &args, Casing::Libc)?.ok_or_else(missing);
             }
-            let mut args = vec![ev(expr)?, from];
-            if let Some(x) = substring_for {
-                args.push(ev(x)?);
-            }
-            let bits: Vec<_> = args.iter().map(|v| (v.clone(), false, None)).collect();
-            if let Some(v) = super::rest::call("substring", &bits)? {
-                return Ok(v);
-            }
-            super::calls::strings("substr", &args, Casing::Libc)?
-                .ok_or_else(|| Error::new(format!("{e} is not read")))?
+            let casing = match frame.casings.implicit(expr)? {
+                Some(k) => k,
+                None => substring_from
+                    .as_deref()
+                    .map(|x| frame.casings.implicit(x))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(Casing::Libc),
+            };
+            super::calls::substring_by_pattern(
+                &string,
+                &parts[0].0,
+                parts.get(1).map(|(v, _)| v),
+                casing,
+            )?
         }
         Expr::Position { expr, r#in } => {
             let bits = [(ev(r#in)?, false, None), (ev(expr)?, false, None)];
@@ -5557,7 +5621,14 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::Floor { .. }
         | Expr::Extract { .. }
         | Expr::SimilarTo { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
         | Expr::Substring { .. } => true,
+        Expr::Between {
+            expr, low, high, ..
+        } => [expr, low, high]
+            .into_iter()
+            .any(|x| calls_beyond_the_question(x)),
         Expr::BinaryOp { left, op, right } => {
             matches!(
                 op,

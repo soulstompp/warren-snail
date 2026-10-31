@@ -114,12 +114,11 @@ fn fixing(side: &mut Side, column: usize, key: &KeyValue) -> bool {
                 KeyValue::Bytes(b) => b.to_vec(),
                 _ => unreachable!(),
             };
-            side.texts.push(TextCond {
+            side.texts.push(TextCond::new(
                 column,
-                lo: Bound::Included(bytes.clone()),
-                hi: Bound::Included(bytes),
-                except: Vec::new(),
-            })
+                Bound::Included(bytes.clone()),
+                Bound::Included(bytes),
+            ))
         }
         KeyValue::Null { .. } => return false,
     }
