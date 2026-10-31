@@ -1583,13 +1583,25 @@ mod tests {
         let mut p = full.clone();
         p.resize(PAGE, 0);
         assert_eq!(Root::decode(&p).unwrap().0.collation(), COLLATION);
-        let mut old = full[..full.len() - 4 - (4 + COLLATION.len())].to_vec();
+        // The decisions across snails come after the collation: no decision is a count and a flag.
+        let none = 4 + 1;
+        let mut old = full[..full.len() - 4 - none - (4 + COLLATION.len())].to_vec();
         let crc = crc32fast::hash(&old);
         old.extend_from_slice(&crc.to_le_bytes());
         old.resize(PAGE, 0);
         let (was, _) = Root::decode(&old).unwrap();
         assert_eq!((was.collation.as_str(), was.collation()), ("", COLLATION));
         assert_eq!(was.monetary, r.monetary);
+        // A root written before it held decisions across snails ends after its collation.
+        let mut old = full[..full.len() - 4 - none].to_vec();
+        let crc = crc32fast::hash(&old);
+        old.extend_from_slice(&crc.to_le_bytes());
+        old.resize(PAGE, 0);
+        let (was, _) = Root::decode(&old).unwrap();
+        assert_eq!(
+            (was.collation(), was.decided.len(), was.pending.is_none()),
+            (COLLATION, 0, true)
+        );
         assert_eq!((back.generation, back.span), (7, 64));
         assert_eq!((back.release, &back.monetary), (16, &r.monetary));
         assert_eq!(back.orders[0].2.pages(), 2);
