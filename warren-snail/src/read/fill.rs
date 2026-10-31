@@ -114,6 +114,12 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
     if d == Datum::Null {
         return Ok(Datum::Null);
     }
+    // A value is assigned to a string as its type's output writes it, where the snail writes it.
+    if let (Internal(t), Text(_) | Bpchar(_) | Name) = (from, to) {
+        if let Some(e) = t.unwritten() {
+            return Err(e);
+        }
+    }
     let refused = || {
         Error::new(format!(
             "column \"{what}\" is of type {} but expression is of type {}",

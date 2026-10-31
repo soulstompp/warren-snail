@@ -252,10 +252,14 @@ impl Typing<'_> {
                 data_type,
                 ..
             } => {
-                self.type_of(expr)?;
-                crate::catalog::held_type(data_type)
+                let from = self.type_of(expr)?;
+                let to = crate::catalog::held_type(data_type)
                     .ok()
-                    .or_else(|| crate::composed::resolve(data_type))
+                    .or_else(|| crate::composed::resolve(data_type));
+                if to != from && to != Some(ColumnType::Bytes) {
+                    written(from)?;
+                }
+                to
             }
             Expr::TypedString(t) => crate::catalog::held_type(&t.data_type).ok(),
             Expr::Interval(_) => Some(super::calls::full_interval()),
@@ -394,6 +398,10 @@ impl Typing<'_> {
             }
             Expr::BinaryOp { left, op, right } => {
                 let (a, b) = (self.type_of(left)?, self.type_of(right)?);
+                if matches!(op, BinaryOperator::StringConcat) {
+                    written(a)?;
+                    written(b)?;
+                }
                 if let Some(t) = range_operator(&op.to_string(), a, b)? {
                     return Ok(Some(t));
                 }
@@ -469,6 +477,11 @@ impl Typing<'_> {
                 let mut types = Vec::with_capacity(args.len());
                 for a in &args {
                     types.push(self.type_of(a)?);
+                }
+                if WRITING.contains(&name.as_str()) {
+                    for t in &types {
+                        written(*t)?;
+                    }
                 }
                 if f.over.is_none() && !f.within_group.is_empty() {
                     let mut within = Vec::with_capacity(f.within_group.len());
@@ -1070,6 +1083,41 @@ pub(super) fn multirange_range(ty: ColumnType) -> Option<ColumnType> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The functions that write an argument of any type as its type's output writes it.
+const WRITING: [&str; 22] = [
+    "concat",
+    "concat_ws",
+    "format",
+    "string_agg",
+    "to_json",
+    "to_jsonb",
+    "json_build_array",
+    "json_build_object",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "json_agg",
+    "jsonb_agg",
+    "json_agg_strict",
+    "jsonb_agg_strict",
+    "json_object_agg",
+    "jsonb_object_agg",
+    "json_object_agg_strict",
+    "jsonb_object_agg_strict",
+    "json_object_agg_unique",
+    "jsonb_object_agg_unique",
+    "json_object_agg_unique_strict",
+    "jsonb_object_agg_unique_strict",
+];
+
+/// Refused where an expression writes a value of a type as its output does, and the snail does not
+/// write that type's output as PostgreSQL's.
+fn written(t: Option<ColumnType>) -> Result<()> {
+    match t {
+        Some(ColumnType::Internal(i)) => i.unwritten().map_or(Ok(()), Err),
+        _ => Ok(()),
     }
 }
 

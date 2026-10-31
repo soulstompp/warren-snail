@@ -275,6 +275,102 @@ fn a_type_only_a_server_makes_is_refused_from_a_literal_and_held_null_only_where
     assert!(e.contains("cannot accept a value of type gtsvector"), "{e}");
 }
 
+/// Bytes from their hex digits.
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn the_planner_s_statistics_are_answered_as_their_bytes_their_output_refused_by_name() {
+    use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array};
+    use std::sync::Arc;
+    let ddl = "CREATE TABLE s.t (id integer NOT NULL, nd pg_ndistinct, dp pg_dependencies, \
+               mc pg_mcv_list, PRIMARY KEY (id));";
+    let catalog = Catalog::parse(ddl).unwrap();
+    // The statistics PostgreSQL 19 RC1 kept on two columns (28819, 2026-10-31), and some bytes for
+    // the list, whose output is bytea's.
+    let nd = unhex("a4bf52a3010000000100000000000000000024400200000001000200");
+    let dp =
+        unhex("2c9a54b40100000002000000000000000000f03f020001000200000000000000f03f020002000100");
+    let mc = unhex("c251a6e1010000000a000000");
+    let binary = |v: &[u8]| Arc::new(BinaryArray::from(vec![Some(v), None])) as ArrayRef;
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef),
+        ("nd", binary(&nd)),
+        ("dp", binary(&dp)),
+        ("mc", binary(&mc)),
+    ])
+    .unwrap();
+    let rows = Rows::from_batches(&catalog.tables[0], &[batch]).unwrap();
+    let path = tmp("statistics.snail");
+    write(&path, &catalog, &[("s.t".into(), rows)]).unwrap();
+    let mut s = Snail::open(&path).unwrap();
+    let step = "WITH q AS (SELECT id, nd, dp, mc FROM s.t)";
+    let (b, _) = s
+        .ask(&format!("{step} SELECT nd, dp FROM q WHERE id = 1"), None)
+        .unwrap();
+    let bytes = |c: usize| {
+        let a = b.column(c).as_any().downcast_ref::<BinaryArray>().unwrap();
+        a.value(0).to_vec()
+    };
+    assert_eq!((bytes(0), bytes(1)), (nd.clone(), dp.clone()));
+    let (b, _) = s
+        .ask(
+            &format!("{step} SELECT mc::text AS x FROM q WHERE id = 1"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        texts(b.column(0).as_ref()),
+        [Some("\\xc251a6e1010000000a000000".to_string())]
+    );
+    for (e, ty) in [
+        ("nd::text", "pg_ndistinct"),
+        ("dp::varchar", "pg_dependencies"),
+        ("nd::name", "pg_ndistinct"),
+        ("concat(nd)", "pg_ndistinct"),
+        ("format('%s', dp)", "pg_dependencies"),
+        ("to_json(nd)", "pg_ndistinct"),
+        ("json_agg(dp)", "pg_dependencies"),
+        ("nd || 'x'", "pg_ndistinct"),
+    ] {
+        let e = s
+            .ask(&format!("{step} SELECT {e} AS x FROM q"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with(&format!("the output of {ty} is not written")),
+            "{e}"
+        );
+    }
+    for e in ["nd::bytea", "count(nd)", "dp IS NULL", "encode(dp, 'hex')"] {
+        assert!(
+            s.ask(&format!("{step} SELECT {e} AS x FROM q"), None)
+                .is_ok(),
+            "{e}"
+        );
+    }
+    // Nor is one written into a string as its output, as an INSERT … SELECT assigns it.
+    #[cfg(feature = "standalone")]
+    {
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("CREATE TABLE s.x (id integer PRIMARY KEY, t text)")
+            .unwrap();
+        let e = w
+            .execute("INSERT INTO s.x SELECT id, nd FROM s.t")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("the output of pg_ndistinct is not written"),
+            "{e}"
+        );
+        w.execute("INSERT INTO s.x SELECT id, mc FROM s.t").unwrap();
+    }
+}
+
 #[cfg(feature = "standalone")]
 #[test]
 fn an_aclitem_is_three_leaves_its_roles_their_oids_and_names_no_role() {

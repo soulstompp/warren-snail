@@ -183,6 +183,19 @@ impl Internal {
         }
     }
 
+    /// Why its text is not written, where PostgreSQL's output writes another than the snail would:
+    /// pg_ndistinct's and pg_dependencies', which decode the statistics their bytes hold.
+    /// pg_mcv_list's output is bytea's, as the snail writes it.
+    pub fn unwritten(self) -> Option<Error> {
+        matches!(self, Internal::Ndistinct | Internal::Dependencies).then(|| {
+            Error::new(format!(
+                "the output of {} is not written: PostgreSQL's decodes the statistics the snail \
+                 holds as their bytes",
+                self.type_name()
+            ))
+        })
+    }
+
     /// Why a literal of it is refused, as PostgreSQL's input refuses one.
     pub fn refusal(self) -> Error {
         Error::new(match self {
