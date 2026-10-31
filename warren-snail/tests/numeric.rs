@@ -68,6 +68,54 @@ fn a_numeric_of_19_to_38_digits_is_cut_by_its_decimal_digits() {
 }
 
 #[test]
+fn a_condition_on_a_numeric_of_19_to_38_digits_off_the_levels_rules_blocks_out_by_its_leaves() {
+    // The same numbers beside an integer key, one NaN last: each block's least and greatest of the
+    // numeric are made from its decimal's and its kind's.
+    let path = tmp("numeric-wide-rest.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.w (id integer NOT NULL, w numeric(38,0), PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let step = 10i128.pow(20);
+    let rows = Rows {
+        columns: vec![
+            Values::Int((0..10_000).map(Some).collect()),
+            Values::Wide(
+                (0..10_000)
+                    .map(|i| {
+                        Some(if i == 9_999 {
+                            10i128.pow(38)
+                        } else {
+                            (i - 5000) * step
+                        })
+                    })
+                    .collect(),
+            ),
+        ],
+    };
+    write(&path, &catalog, &[("s.w".into(), rows)]).unwrap();
+    let mut s = Snail::open(&path).unwrap();
+    let blocks = blocks_of(&s.blocks().unwrap(), "w_pkey", "w.value").len() as u64;
+    assert!(blocks > 2, "{blocks}");
+    for (w, rows) in [
+        ("w >= 2000e20 AND w < 3000e20", 1000),
+        ("w < -4000e20", 1000),
+        ("w > 4900e20", 99),
+        ("w = 'NaN'", 1),
+    ] {
+        let (b, round) = s
+            .ask(&format!("SELECT count(*) AS n FROM s.w WHERE {w}"), None)
+            .unwrap();
+        assert_eq!(weather::ints64(b.column(0).as_ref()), [Some(rows)], "{w}");
+        assert!(
+            round.blocks_read < blocks,
+            "{w}: {} blocks",
+            round.blocks_read
+        );
+    }
+}
+
+#[test]
 fn a_numeric_held_as_its_text_is_cut_by_its_class_and_answers_its_own_text() {
     // Unconstrained: 1,000 numbers from -500.5 to 499.5, -0.5 not among them, each written three
     // ways, 1.5, 1.50 and 1.500 one class; the class key's digits cut the order, and each row
@@ -404,16 +452,18 @@ fn nan_in_an_array_or_a_composite_lies_on_its_element_s_kind_leaf() {
     let reader =
         parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&file).unwrap())
             .unwrap();
-    let leaves: Vec<String> = parquet::file::reader::FileReader::metadata(&reader)
+    let meta = parquet::file::reader::FileReader::metadata(&reader).clone();
+    let leaves: Vec<(usize, String)> = meta
         .file_metadata()
         .schema_descr()
         .columns()
         .iter()
         .map(|c| c.path().string())
-        .filter(|p| p.ends_with(".value") || p.ends_with(".nan"))
+        .enumerate()
+        .filter(|(_, p)| p.ends_with(".value") || p.ends_with(".nan"))
         .collect();
     assert_eq!(
-        leaves,
+        leaves.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(),
         [
             "p.n.value",
             "p.n.nan",
@@ -423,6 +473,11 @@ fn nan_in_an_array_or_a_composite_lies_on_its_element_s_kind_leaf() {
             "w.elements.list.element.nan"
         ]
     );
+    // Each kind leaf holds a NaN.
+    for (i, p) in leaves.iter().filter(|(_, p)| p.ends_with(".nan")) {
+        let stats = meta.row_group(0).column(*i).statistics().unwrap();
+        assert_eq!(stats.max_bytes_opt(), Some(&[1u8][..]), "{p}");
+    }
     let (batches, _) = weather::parquet_of(&file);
     let back = tmp("numeric-nan-composed-back.snail");
     write(
