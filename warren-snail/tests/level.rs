@@ -22,7 +22,7 @@ const ROWS: i64 = 20_000;
 
 /// Row `i`'s k: eight values, the lower ones the commoner, NULL on every ninth row.
 fn k_of(i: i64) -> Option<i64> {
-    (i % 9 != 0).then(|| [0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 4, 5, 6, 7][(i * 7 % 14) as usize])
+    (i % 9 != 0).then(|| [0, 0, 0, 0, 1, 1, 1, 2, 2, 3, 4, 5, 6, 7][(i % 14) as usize])
 }
 
 /// Row `i`'s w: 3,000 values, a few rows each.
