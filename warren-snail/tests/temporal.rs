@@ -625,8 +625,9 @@ mod writes {
     #[test]
     fn write_holds_a_child_s_period_to_its_parents_periods() {
         // A child's rows, read out of a snail as Arrow, given to `write` beside a parent with a key
-        // WITHOUT OVERLAPS, whose own rows `write` leaves to INSERT: a reference holding no NULL
-        // finds no period of the parent's, and one holding a NULL references nothing.
+        // WITHOUT OVERLAPS: held by the parent's periods given beside them, `write` then leaves the
+        // parent's rows to INSERT; given alone, a reference holding no NULL finds no period of the
+        // parent's, and one holding a NULL references nothing.
         let source = made(
             "temporal-write-source",
             "CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range);
@@ -659,9 +660,13 @@ mod writes {
             )
         };
         let target = tmp("temporal-write.snail");
-        let e = write(&target, &held, &[rows_of("s.p", &p)])
-            .unwrap_err()
-            .to_string();
+        let e = write(
+            &target,
+            &held,
+            &[rows_of("s.p", &p), rows_of("s.c", &b.slice(1, 1))],
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             e.contains("write does not hold its rows to the key WITHOUT OVERLAPS p_pkey"),
             "{e}"
