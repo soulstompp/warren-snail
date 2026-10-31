@@ -629,6 +629,8 @@ fn an_sp_gist_strand_on_an_inet_rules_out_a_block_whose_addresses_its_network_mi
             "SELECT id FROM s.t WHERE n && '10.15.0.0/16'",
             "SELECT id FROM s.t WHERE '10.7.0.0/16' >> n",
             "SELECT id FROM s.t WHERE n && '192.168.0.0/16'",
+            // Inside the last network of all, past its first address.
+            "SELECT id FROM s.t WHERE n >> '10.15.255.9'",
         ] {
             let along_key = ids(&mut s, q, "t_pkey");
             assert_eq!(ids(&mut s, q, "t_n"), along_key, "{q}");
@@ -637,6 +639,8 @@ fn an_sp_gist_strand_on_an_inet_rules_out_a_block_whose_addresses_its_network_mi
             .ask("SELECT id FROM s.t WHERE n << '10.7.0.0/16'", Some("t_n"))
             .unwrap();
         assert_eq!(along.blocks_read, 1, "{along:?}");
+        let last = "SELECT id FROM s.t WHERE n >> '10.15.255.9'";
+        assert_eq!(ids(&mut s, last, "t_n").len(), 1);
         let (_, none) = s
             .ask(
                 "SELECT id FROM s.t WHERE n && '192.168.0.0/16'",
@@ -693,6 +697,8 @@ fn a_gist_strand_on_a_multirange_keeps_the_span_of_its_ranges() {
         "SELECT id FROM s.t WHERE r <@ '{}'",
         "SELECT id FROM s.t WHERE r >> '{[204000,204010)}'",
         "SELECT id FROM s.t WHERE r -|- '{[100005,100010)}'",
+        // The last range of the last row of all.
+        "SELECT id FROM s.t WHERE r && '{[204794,204795)}'",
     ] {
         let along_key = ids(&mut s, q, "t_pkey");
         assert_eq!(ids(&mut s, q, "t_r"), along_key, "{q}");
@@ -714,6 +720,8 @@ fn a_gist_strand_on_a_multirange_keeps_the_span_of_its_ranges() {
         .len(),
         1
     );
+    let last = "SELECT id FROM s.t WHERE r && '{[204794,204795)}'";
+    assert_eq!(ids(&mut s, last, "t_r").len(), 1);
 }
 
 #[test]
