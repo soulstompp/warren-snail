@@ -125,6 +125,7 @@ pub const REG_ECOLORS: i32 = 20;
 
 /// An error of the engine, by its code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RegError(pub i32);
 
 impl RegError {
@@ -386,6 +387,7 @@ impl Guts {
 /// Where a subexpression matched: its start and its end, in characters from the string's start,
 /// or -1 and -1 where it matched nothing (`regmatch_t`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RegMatch {
     pub rm_so: i64,
     pub rm_eo: i64,

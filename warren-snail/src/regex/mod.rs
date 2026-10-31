@@ -13,13 +13,25 @@ mod comp;
 mod cvec;
 mod dfa;
 mod exec;
-pub mod guts;
+pub(crate) mod guts;
 mod lex;
-pub mod locale;
+mod locale;
 mod nfa;
 
 pub use guts::{Chr, RegError, RegMatch};
 pub use locale::Ctype;
+
+/// The flags a pattern is compiled under and a string searched under, and what the compiler notes
+/// of a pattern, as regex.h names them.
+pub mod flags {
+    pub use super::guts::{
+        REG_ADVANCED, REG_ADVF, REG_BASIC, REG_BOSONLY, REG_EXPANDED, REG_EXPECT, REG_EXTENDED,
+        REG_ICASE, REG_NEWLINE, REG_NLANCH, REG_NLSTOP, REG_NOSPEC, REG_NOSUB, REG_NOTBOL,
+        REG_NOTEOL, REG_QUOTE, REG_SMALL, REG_UBACKREF, REG_UBBS, REG_UBOUNDS, REG_UBRACES,
+        REG_UBSALNUM, REG_UEMPTYMATCH, REG_UIMPOSSIBLE, REG_ULOCALE, REG_ULOOKAROUND, REG_UNONPOSIX,
+        REG_UPBOTCH, REG_USHORTEST, REG_UUNPORT, REG_UUNSPEC,
+    };
+}
 
 /// A compiled regular expression.
 #[derive(Clone, Debug)]
