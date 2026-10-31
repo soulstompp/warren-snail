@@ -4,7 +4,7 @@
 
 mod weather;
 
-use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::array::{Array, AsArray};
 use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
 use warren_snail::write::Rows;

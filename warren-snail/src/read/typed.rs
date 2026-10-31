@@ -457,6 +457,9 @@ impl Typing<'_> {
             }
             Expr::Function(f) => {
                 let name = super::pipeline::function_name(f);
+                if let Some(e) = type_keyword(f) {
+                    return Err(e);
+                }
                 let Some(args) = call_args(f) else {
                     return Ok(None);
                 };
@@ -1005,14 +1008,15 @@ pub(super) fn regexps(
     if !super::calls::is_regexp_function(name) {
         return Ok(None);
     }
-    if super::calls::returns_a_set(name) {
-        return Err(super::calls::set_refused(name));
-    }
     // Each form, a letter an argument: t a string, i an integer.
     let forms: &[&str] = match name {
         "regexp_count" => &["tt", "tti", "ttit"],
         "regexp_instr" => &["tt", "tti", "ttii", "ttiii", "ttiiit", "ttiiiti"],
-        "regexp_like" | "regexp_match" | "regexp_split_to_array" => &["tt", "ttt"],
+        "regexp_like"
+        | "regexp_match"
+        | "regexp_split_to_array"
+        | "regexp_matches"
+        | "regexp_split_to_table" => &["tt", "ttt"],
         "regexp_replace" => &["ttt", "tttt", "ttti", "tttii", "tttiit"],
         "regexp_substr" => &["tt", "tti", "ttii", "ttiit", "ttiiti"],
         "similar_escape" => &["tt"],
@@ -1032,7 +1036,7 @@ pub(super) fn regexps(
     Ok(Some(Some(match name {
         "regexp_count" | "regexp_instr" => C::Int4,
         "regexp_like" => C::Boolean,
-        "regexp_match" | "regexp_split_to_array" => super::calls::text_array(),
+        "regexp_match" | "regexp_split_to_array" | "regexp_matches" => super::calls::text_array(),
         _ => C::Text(None),
     })))
 }
@@ -1064,4 +1068,51 @@ pub(super) fn multirange_range(ty: ColumnType) -> Option<ColumnType> {
         },
         _ => None,
     }
+}
+
+/// The keywords PostgreSQL's grammar reads as a type's, or as a clause's, never as a function's
+/// name where they are written unquoted: the column-name keywords that have no call syntax of their
+/// own.
+const TYPE_KEYWORDS: [&str; 26] = [
+    "between",
+    "bigint",
+    "bit",
+    "boolean",
+    "char",
+    "character",
+    "dec",
+    "decimal",
+    "float",
+    "inout",
+    "int",
+    "integer",
+    "interval",
+    "national",
+    "nchar",
+    "none",
+    "numeric",
+    "out",
+    "precision",
+    "real",
+    "setof",
+    "smallint",
+    "time",
+    "timestamp",
+    "values",
+    "varchar",
+];
+
+/// The refusal of a call named by a type's keyword written unquoted (`timestamp(d, t)`), which
+/// PostgreSQL's grammar takes for no function; quoted (`"timestamp"(d, t)`) it is one.
+fn type_keyword(f: &sqlparser::ast::Function) -> Option<Error> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(i)] = f.name.0.as_slice() else {
+        return None;
+    };
+    let name = i.value.to_lowercase();
+    (i.quote_style.is_none() && TYPE_KEYWORDS.contains(&name.as_str())).then(|| {
+        Error::new(format!(
+            "syntax error at or near \"(\": {name}, written unquoted, is a type's keyword and names \
+             no function"
+        ))
+    })
 }

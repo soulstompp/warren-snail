@@ -11,8 +11,12 @@ pub(super) fn values(
     name: &str,
     given: Vec<(Value, bool)>,
     ty: Option<ColumnType>,
+    casing: crate::catalog::Casing,
 ) -> Result<Vec<Value>> {
     let _ = ty;
+    if let Some(v) = regexps(name, &given, casing)? {
+        return Ok(v);
+    }
     if let Some(v) = super::json::sets(name, &given)? {
         return Ok(v);
     }
@@ -134,4 +138,74 @@ fn minus_multi(name: &str, a: &Value, b: &Value) -> Result<Vec<Value>> {
     } else {
         vec![super::pipeline::composed(*ty, Item::Multirange(left))]
     })
+}
+
+/// The rows of regexp_matches and regexp_split_to_table, under the collation the call's argument
+/// carries; none where the name is neither.
+fn regexps(
+    name: &str,
+    given: &[(Value, bool)],
+    casing: crate::catalog::Casing,
+) -> Result<Option<Vec<Value>>> {
+    if !matches!(name, "regexp_matches" | "regexp_split_to_table") {
+        return Ok(None);
+    }
+    let text = |v: &Value| -> Result<Option<String>> {
+        Ok(match v {
+            v if v.is_null() => None,
+            // A bpchar as it casts to text, its trailing blanks gone.
+            Value::Str(ColumnType::Bpchar(_), s) => Some(s.trim_end_matches(' ').to_string()),
+            Value::Text(s) | Value::Str(_, s) => Some(s.clone()),
+            other => {
+                return Err(Error::new(format!(
+                    "function {name}({}) does not exist",
+                    super::pipeline::kind_name(other)
+                )))
+            }
+        })
+    };
+    let (s, p, flags) = match given {
+        [(s, _), (p, _)] => (text(s)?, text(p)?, None),
+        [(s, _), (p, _), (f, _)] => match text(f)? {
+            Some(f) => (text(s)?, text(p)?, Some(f)),
+            None => return Ok(Some(Vec::new())),
+        },
+        _ => {
+            return Err(Error::new(format!(
+                "function {name} takes two or three arguments"
+            )))
+        }
+    };
+    let (Some(s), Some(p)) = (s, p) else {
+        return Ok(Some(Vec::new()));
+    };
+    let ctype = super::calls::ctype_of(casing)?;
+    Ok(Some(if name == "regexp_matches" {
+        crate::regexp::regexp_matches(&s, &p, flags.as_deref(), ctype)?
+            .into_iter()
+            .map(|m| {
+                let n = m.len() as i32;
+                super::pipeline::composed(
+                    super::calls::text_array(),
+                    Item::Array {
+                        elements: m
+                            .into_iter()
+                            .map(|x| {
+                                x.map_or(Item::Null, |x| {
+                                    Item::Scalar(crate::read::statement::Datum::Text(x))
+                                })
+                            })
+                            .collect(),
+                        dims: if n == 0 { Vec::new() } else { vec![n] },
+                        lower: if n == 0 { Vec::new() } else { vec![1] },
+                    },
+                )
+            })
+            .collect()
+    } else {
+        crate::regexp::regexp_split_to_table(&s, &p, flags.as_deref(), ctype)?
+            .into_iter()
+            .map(Value::Text)
+            .collect()
+    }))
 }

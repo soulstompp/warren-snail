@@ -4,7 +4,7 @@
 
 mod weather;
 
-use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::array::{Array, AsArray};
 use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
 use warren_snail::write::Rows;
@@ -130,5 +130,21 @@ fn the_aggregates_and_sets_of_json() {
     assert_eq!(
         (0..e.len()).map(|r| e.value(r)).collect::<Vec<_>>(),
         ["(a,1)", "(b,[2])"]
+    );
+}
+
+#[test]
+fn like_regex_runs_on_postgresql_s_engine_under_its_flags() {
+    let mut s = one_row("like-regex");
+    assert_eq!(
+        ask(
+            &mut s,
+            "jsonb_path_exists('\"a\\nb\"', '$ ? (@ like_regex \"a.b\")')::text, \
+             jsonb_path_exists('\"a\\nb\"', '$ ? (@ like_regex \"a.b\" flag \"s\")')::text, \
+             jsonb_path_query_array('[\"abc\", \"Abd\", 1, \"x\"]', \
+             '$[*] ? (@ like_regex \"^a\" flag \"i\")')::text"
+        )
+        .unwrap(),
+        some(&["false", "true", "[\"abc\", \"Abd\"]"])
     );
 }

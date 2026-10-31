@@ -6,7 +6,7 @@
 //! it. Lax and strict modes, the arithmetic, every item method, filters, `exists`, `starts with`,
 //! `is unknown`, `last`, ranges, `**` and variables are run as PostgreSQL runs them, each error in
 //! its words, under the settings the snail answers under: TimeZone UTC, the database's default
-//! collation libc's C.UTF-8. `like_regex` is refused by name, waiting for the regular expressions.
+//! collation libc's C.UTF-8; `like_regex` by PostgreSQL's own engine (`crate::regexp`).
 
 use super::{Chain, Item, Op};
 use crate::catalog::Casing;
@@ -1482,11 +1482,11 @@ fn bool_over(cx: &mut Cx, item: &Item, jb: &Val) -> Result<Jpb> {
             l,
             r,
         ) => execute_predicate(cx, Pred::Compare(*op), l, Some(r), jb, true)?,
-        Item::LikeRegex { .. } => {
-            return Err(Error::new(
-                "like_regex is not read yet: it waits for PostgreSQL's regular expressions",
-            ))
-        }
+        Item::LikeRegex {
+            expr,
+            pattern,
+            flags,
+        } => execute_predicate(cx, Pred::LikeRegex(pattern, *flags), expr, None, jb, false)?,
         Item::Exists(a) => {
             if !cx.lax {
                 let mut vals = Vec::new();
@@ -1523,9 +1523,11 @@ fn execute_nested_bool_item(cx: &mut Cx, jsp: &[Item], jb: &Val) -> Result<Jpb> 
 
 /// The predicates over pairs of items.
 #[derive(Clone, Copy)]
-enum Pred {
+enum Pred<'a> {
     Compare(Op),
     StartsWith,
+    /// like_regex: its pattern and its flags.
+    LikeRegex(&'a [u8], u32),
 }
 
 /// `executePredicate`: true where some pair of an item of the left and one of the right satisfies
@@ -1557,11 +1559,19 @@ fn execute_predicate(
                 break 'exit;
             }
         }
+        // Without a right argument, one pass a left item.
+        let rvals: Vec<Option<&Val>> = if rarg.is_some() {
+            rseq.iter().map(Some).collect()
+        } else {
+            vec![None]
+        };
         for lval in &lseq {
-            for rval in &rseq {
-                let res = match pred {
-                    Pred::Compare(op) => compare_items(op, lval, rval, cx.use_tz)?,
-                    Pred::StartsWith => starts_with(lval, rval),
+            for rval in &rvals {
+                let res = match (pred, rval) {
+                    (Pred::Compare(op), Some(rval)) => compare_items(op, lval, rval, cx.use_tz)?,
+                    (Pred::StartsWith, Some(rval)) => starts_with(lval, rval),
+                    (Pred::LikeRegex(pattern, flags), _) => like_regex(lval, pattern, flags)?,
+                    (_, None) => Jpb::Unknown,
                 };
                 if res == Jpb::Unknown {
                     error = true;
@@ -1585,6 +1595,24 @@ fn execute_predicate(
     } else {
         Jpb::False
     })
+}
+
+/// `executeLikeRegex`: whether a string matches the pattern under its flags; unknown of any other
+/// item.
+fn like_regex(v: &Val, pattern: &[u8], flags: u32) -> Result<Jpb> {
+    let Val::Str(s) = v else {
+        return Ok(Jpb::Unknown);
+    };
+    let p = String::from_utf8_lossy(pattern);
+    let found = crate::regexp::like_regex(
+        s,
+        &p,
+        flags & super::REGEX_ICASE != 0,
+        flags & super::REGEX_DOTALL != 0,
+        flags & super::REGEX_MLINE != 0,
+        flags & super::REGEX_QUOTE != 0,
+    )?;
+    Ok(if found { Jpb::True } else { Jpb::False })
 }
 
 /// `executeStartsWith`: whether the whole string begins with the initial one.

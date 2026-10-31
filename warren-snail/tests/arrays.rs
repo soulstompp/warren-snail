@@ -215,3 +215,26 @@ fn the_functions_of_arrays_take_their_arguments_types_and_defaults() {
         ["{NULL,NULL}|{NULL,3,1}|{a,b,NULL,c}|{1,2,NULL}|{1.5,2}|NULL"]
     );
 }
+
+#[test]
+fn the_regular_expressions_sets_make_a_row_a_match() {
+    let mut s = arrays("regexps");
+    assert_eq!(
+        ask_where(
+            &mut s,
+            "(regexp_matches('a1b22', '([a-z])([0-9]+)', 'g'))::text",
+            "id = 1"
+        )
+        .unwrap(),
+        ["{a,1}", "{b,22}"]
+    );
+    assert_eq!(
+        ask_where(
+            &mut s,
+            "regexp_split_to_table('one  two', '\\s+')",
+            "id = 1"
+        )
+        .unwrap(),
+        ["one", "two"]
+    );
+}

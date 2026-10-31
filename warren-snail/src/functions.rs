@@ -710,6 +710,10 @@ const HELD: &[&str] = &[
     "uuidv7()",
     "uuidv7(interval)",
     "width(box)",
+    "regexp_matches(text,text)",
+    "regexp_matches(text,text,text)",
+    "regexp_split_to_table(text,text)",
+    "regexp_split_to_table(text,text,text)",
 ];
 
 fn held() -> &'static std::collections::HashSet<&'static str> {

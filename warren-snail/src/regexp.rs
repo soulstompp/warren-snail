@@ -192,6 +192,35 @@ fn invalid_value(parameter: &str, value: i32) -> Error {
     ))
 }
 
+/// jsonpath's `like_regex`: whether the string matches the pattern under the flags it names, as
+/// `jspConvertRegexFlags` turns them into a pattern's and `executeLikeRegex` searches, under the
+/// database's default collation.
+pub fn like_regex(
+    s: &str,
+    p: &str,
+    icase: bool,
+    dotall: bool,
+    mline: bool,
+    quote: bool,
+) -> Result<bool> {
+    let mut cflags = REG_ADVANCED;
+    if icase {
+        cflags |= REG_ICASE;
+    }
+    if quote {
+        cflags &= !REG_ADVANCED;
+        cflags |= REG_QUOTE;
+    } else {
+        if !dotall {
+            cflags |= REG_NLSTOP;
+        }
+        if mline {
+            cflags |= REG_NLANCH;
+        }
+    }
+    Ok(re_compile_and_execute(p, s, cflags, Ctype::Libc { default: true }, 0)?.is_some())
+}
+
 /// `~` and, where `icase`, `~*` (`textregexeq`, `texticregexeq`); `!~` and `!~*` are their
 /// negations.
 pub fn textregexeq(s: &str, p: &str, icase: bool, ctype: Ctype) -> Result<bool> {

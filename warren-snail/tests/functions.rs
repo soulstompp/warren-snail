@@ -1053,3 +1053,46 @@ fn the_aggregates_and_windows_compare_strings_under_their_collation() {
         assert_eq!(ranks, ["1", "2", "1", "2", "1", "2", "1"].map(s), "{f}");
     }
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn an_integer_cast_is_held_to_its_type_s_range() {
+    let mut snail = numbers("cast-range");
+    // PostgreSQL 19's answers.
+    for (expr, refusal) in [
+        ("134217726::smallint", "smallint out of range"),
+        ("a::smallint", "smallint out of range"),
+        ("c::integer", "integer out of range"),
+        (
+            "'99999'::int2",
+            "value \"99999\" is out of range for type smallint",
+        ),
+        (
+            "((('{\"a\":99999}')::jsonb)->'a')::int2",
+            "smallint out of range",
+        ),
+    ] {
+        assert_eq!(refused(&mut snail, expr), refusal, "{expr}");
+    }
+    assert_eq!(
+        one(&mut snail, "32767::int2").unwrap().as_deref(),
+        Some("32767")
+    );
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_type_s_keyword_unquoted_names_no_function() {
+    let mut snail = numbers("type-keyword");
+    let e = refused(&mut snail, "timestamp('2024-01-01'::date, '00:00'::time)");
+    assert!(e.contains("syntax error"), "{e}");
+    assert_eq!(
+        one(
+            &mut snail,
+            "\"timestamp\"('2024-01-01'::date, '00:00'::time)"
+        )
+        .unwrap()
+        .as_deref(),
+        Some("2024-01-01 00:00:00")
+    );
+}

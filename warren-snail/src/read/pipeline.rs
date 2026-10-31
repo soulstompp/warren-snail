@@ -739,7 +739,7 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
 }
 
 /// The set-returning functions a step's select list reads.
-const SET_RETURNING: [&str; 9] = [
+const SET_RETURNING: [&str; 11] = [
     "unnest",
     "range_minus_multi",
     "multirange_minus_multi",
@@ -749,6 +749,8 @@ const SET_RETURNING: [&str; 9] = [
     "pg_snapshot_xip",
     "txid_snapshot_xip",
     "pg_get_keywords",
+    "regexp_matches",
+    "regexp_split_to_table",
 ];
 
 /// Whether a name is a set-returning function a step's select list reads.
@@ -968,7 +970,8 @@ fn cast(
             };
             return Ok(match target {
                 "smallint" | "integer" | "bigint" => {
-                    Value::Int(n.to_integer(i64::MIN, i64::MAX, target)?)
+                    let (name, lo, hi) = integer_range(target);
+                    Value::Int(n.to_integer(lo, hi, name)?)
                 }
                 "real" => Value::Real(n.to_float(false)? as f32),
                 "double precision" => Value::Double(n.to_float(true)?),
@@ -1005,17 +1008,29 @@ fn cast(
             Value::Bits(_, k) if matches!(base.as_str(), "bigint" | "int8") => {
                 bits_integer(&k, 64)?
             }
-            Value::Int(x) => Value::Int(x),
+            // Held to the type's range, as int84, int82 and int42 refuse what passes it.
+            Value::Int(x) => {
+                let (name, lo, hi) = integer_range(&base);
+                if !(lo..=hi).contains(&x) {
+                    return Err(Error::new(format!("{name} out of range")));
+                }
+                Value::Int(x)
+            }
             v @ (Value::Num(..) | Value::Numeric(_)) => {
-                let (name, lo, hi) = match base.as_str() {
-                    "smallint" | "int2" => ("smallint", i16::MIN as i64, i16::MAX as i64),
-                    "integer" | "int" | "int4" => ("integer", i32::MIN as i64, i32::MAX as i64),
-                    _ => ("bigint", i64::MIN, i64::MAX),
-                };
+                let (name, lo, hi) = integer_range(&base);
                 Value::Int(v.to_numeric().unwrap().to_integer(lo, hi, name)?)
             }
+            // Read by the type's input, which refuses a number past its range.
             Value::Text(t) => match numeric_literal(&t)? {
-                Value::Int(x) => Value::Int(x),
+                Value::Int(x) => {
+                    let (name, lo, hi) = integer_range(&base);
+                    if !(lo..=hi).contains(&x) {
+                        return Err(Error::new(format!(
+                            "value \"{t}\" is out of range for type {name}"
+                        )));
+                    }
+                    Value::Int(x)
+                }
                 _ => return Err(Error::new(format!("'{t}' is not an integer"))),
             },
             other => return Err(Error::new(format!("{other:?} cast to an integer"))),
@@ -1312,6 +1327,15 @@ pub(super) fn type_of_value(v: &Value) -> Option<ColumnType> {
         Value::Interval(_) => super::calls::full_interval(),
         Value::Geometric(g) => ColumnType::Geometric(g.kind()),
     })
+}
+
+/// An integer type's name, as PostgreSQL's errors write it, and its range, by the name a cast writes.
+fn integer_range(base: &str) -> (&'static str, i64, i64) {
+    match base {
+        "smallint" | "int2" => ("smallint", i64::from(i16::MIN), i64::from(i16::MAX)),
+        "integer" | "int" | "int4" => ("integer", i64::from(i32::MIN), i64::from(i32::MAX)),
+        _ => ("bigint", i64::MIN, i64::MAX),
+    }
 }
 
 /// A number rounded to whole units of `to` places from `from`, half away from zero.
@@ -4597,7 +4621,13 @@ impl Prepared<'_> {
                     .into_iter()
                     .map(|x| Ok((eval(x, row, frame, &computed)?, quoted(x))))
                     .collect::<Result<Vec<_>>>()?;
-                super::sets::values(&function_name(f), values, frame.type_of(c))
+                // Under the collation an argument names, else the one the first carries.
+                let a = args(f)?;
+                let casing = match a.iter().find(|x| names_collate(x)).or_else(|| a.first()) {
+                    Some(x) => frame.casings.implicit(x)?.unwrap_or(Casing::Libc),
+                    None => Casing::Libc,
+                };
+                super::sets::values(&function_name(f), values, frame.type_of(c), casing)
             })
             .collect::<Result<Vec<_>>>()?;
         let n = sets.iter().map(Vec::len).max().unwrap_or(0);
