@@ -317,3 +317,20 @@ fn a_question_on_similar_to_alone_is_handed_over() {
         .collect();
     assert_eq!(ids, ["2", "3", "5"]);
 }
+
+#[test]
+fn back_references_lookaround_and_the_preference_are_postgresql_s() {
+    let mut s = snail("regex_preference");
+    for (expr, want) in [
+        // A back reference under REG_ICASE compares in lower case.
+        ("regexp_match('aA', '(a)\\1', 'i')", "{a}"),
+        // The first quantifier's preference rules the match: shortest, then longest.
+        ("regexp_match('xabcabcy', '(a.*?)c')", "{ab}"),
+        ("regexp_match('xabcabcy', '(a.*)c')", "{abcab}"),
+        // A capture inside an iteration keeps its last turn's match, none where that turn missed it.
+        ("regexp_match('abab', '(?:(a)|b)+')", "{NULL}"),
+        ("regexp_match('foo123bar', '(?<=o)\\d+(?=b)')", "{123}"),
+    ] {
+        assert_eq!(one(&mut s, expr).unwrap().as_deref(), Some(want), "{expr}");
+    }
+}
