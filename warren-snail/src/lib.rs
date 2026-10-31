@@ -21,6 +21,7 @@ pub mod inet;
 pub mod jsonb;
 pub mod jsonpath;
 pub mod lock;
+mod methods;
 pub mod numeric;
 pub mod places;
 pub mod read;

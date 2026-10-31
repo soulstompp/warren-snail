@@ -523,6 +523,44 @@ impl ColumnType {
         }
     }
 
+    /// The hash operator class PostgreSQL takes for a key of this type where its index names none;
+    /// none where it has none: money, the bit strings, the text search types, json, jsonpath, xml,
+    /// refcursor, the geometric types, and an array, a composite or a range of a part with none.
+    pub fn hash_opclass(self) -> Option<&'static str> {
+        Some(match self {
+            ColumnType::Money | ColumnType::Bit(_) | ColumnType::Varbit(_) => return None,
+            ColumnType::Geometric(_) => return None,
+            ColumnType::Textual(crate::textual::Textual::Aclitem) => "aclitem_ops",
+            ColumnType::Textual(t) => match t {
+                crate::textual::Textual::Jsonb
+                | crate::textual::Textual::Inet
+                | crate::textual::Textual::Cidr => t.opclass()?,
+                _ => return None,
+            },
+            ColumnType::Composed(r) => {
+                use crate::composed::Composed;
+                let parts = match r.def() {
+                    Composed::Array { element, .. } => element.hash_opclass().is_some(),
+                    Composed::Record { fields, .. } => {
+                        fields.iter().all(|f| f.ty.hash_opclass().is_some())
+                    }
+                    Composed::Range { subtype, .. } => subtype.hash_opclass().is_some(),
+                    Composed::Multirange { range, .. } => range.hash_opclass().is_some(),
+                    Composed::Enum { .. } => true,
+                    Composed::Held(t) => t.hash_opclass().is_some(),
+                };
+                if !parts {
+                    return None;
+                }
+                r.def().default_opclass()
+            }
+            ty => match ty.default_opclass() {
+                "" => return None,
+                o => o,
+            },
+        })
+    }
+
     /// The bits of an integer type.
     pub fn integer_bits(self) -> u32 {
         match self {
@@ -908,10 +946,78 @@ pub struct KeyConstraint {
     pub deferrable: bool,
 }
 
+/// The access method an index names: the B-tree's, or another, whose strand is of its own kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Method {
+    Btree,
+    /// A strand on the key's B-tree order, `=` one place of it; aclitem, cid and xid on their
+    /// bytes.
+    Hash,
+    Gist,
+    Spgist,
+    Gin,
+    Brin,
+}
+
+impl Method {
+    pub const ALL: [Method; 6] = [
+        Method::Btree,
+        Method::Hash,
+        Method::Gist,
+        Method::Spgist,
+        Method::Gin,
+        Method::Brin,
+    ];
+
+    /// Its name, as `pg_am` holds it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Method::Btree => "btree",
+            Method::Hash => "hash",
+            Method::Gist => "gist",
+            Method::Spgist => "spgist",
+            Method::Gin => "gin",
+            Method::Brin => "brin",
+        }
+    }
+
+    pub fn of_name(name: &str) -> Option<Method> {
+        Method::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    /// Whether PostgreSQL's method holds a UNIQUE index (`amcanunique`).
+    pub fn unique(self) -> bool {
+        self == Method::Btree
+    }
+
+    /// Whether it takes more than one key (`amcanmulticol`).
+    pub fn several_keys(self) -> bool {
+        !matches!(self, Method::Hash | Method::Spgist)
+    }
+
+    /// Whether it takes INCLUDE (`amcaninclude`).
+    pub fn includes(self) -> bool {
+        matches!(self, Method::Btree | Method::Gist | Method::Spgist)
+    }
+
+    /// Whether it orders its keys, taking ASC, DESC and NULLS FIRST or LAST (`amcanorder`).
+    pub fn orders(self) -> bool {
+        self == Method::Btree
+    }
+
+    /// Whether a table may be clustered on it (`amclusterable`).
+    pub fn clusters(self) -> bool {
+        matches!(self, Method::Btree | Method::Gist)
+    }
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Order {
     pub name: String,
+    /// The access method its index names.
+    pub method: Method,
     pub levels: Vec<Level>,
     /// The table's columns held by position, in the order they are kept.
     pub columns: Vec<usize>,
@@ -2674,7 +2780,10 @@ mod tests {
             read[1]
         );
         assert_eq!(read[2].1, Some("ua is on s.u, which is refused"));
-        assert!(read[3].1.unwrap().contains("USING gin is not held yet"));
+        assert!(read[3]
+            .1
+            .unwrap()
+            .contains("data type integer has no default operator class for access method \"gin\""));
         assert!(read[4].1.unwrap().contains("a partial index, WHERE a > 0"));
         assert_eq!(read[5].1, None);
         assert_eq!(r.catalog.tables[0].order("tb").unwrap().desc, [true]);
@@ -2690,9 +2799,9 @@ mod tests {
         assert_eq!(again.facts(), r.catalog.facts());
         assert_eq!(again.tables[0].orders.len(), 2);
         let e = refused(
-            "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t USING hash (a);",
+            "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t USING foo (a);",
         );
-        assert!(e.contains("USING hash"), "{e}");
+        assert!(e.contains("access method \"foo\" does not exist"), "{e}");
     }
 
     #[test]

@@ -7,8 +7,8 @@
 use crate::catalog::{
     assignable, format_type, held_type, ident, level, object_name, shape, Action, Catalog, Check,
     Collation, Column, ColumnType, Domain, DomainCheck, Fact, ForeignKey, Function, Generated,
-    Identity, KeyConstraint, Level, Order, Reading, Sequence, SequenceType, Shape, StatementRead,
-    Table, Type, TypeKind, TEXT_OPCLASSES,
+    Identity, KeyConstraint, Level, Method, Order, Reading, Sequence, SequenceType, Shape,
+    StatementRead, Table, Type, TypeKind, TEXT_OPCLASSES,
 };
 use crate::{Error, Result};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -1729,6 +1729,7 @@ fn qualified(schema: &str, name: &str) -> String {
 #[derive(Clone, Debug)]
 struct Keyed {
     name: String,
+    method: Method,
     levels: Vec<Level>,
     include: Vec<usize>,
     unique: bool,
@@ -2196,10 +2197,19 @@ impl Draft {
             if t.clustered.is_some() {
                 return Err(Error::new(format!("{table} is clustered on two indexes")));
             }
-            if !t.keys().any(|k| k.name == index) {
-                return Err(Error::new(format!(
-                    "{table} is clustered on {index}, which is no index of it"
-                )));
+            match t.keys().find(|k| k.name == index) {
+                None => {
+                    return Err(Error::new(format!(
+                        "{table} is clustered on {index}, which is no index of it"
+                    )))
+                }
+                Some(k) if !k.method.clusters() => {
+                    return Err(Error::new(format!(
+                        "cannot cluster on index \"{index}\" because access method does not \
+                         support clustering"
+                    )))
+                }
+                Some(_) => {}
             }
             t.clustered = Some(index);
             return Ok(Vec::new());
@@ -3109,6 +3119,7 @@ impl Draft {
             };
             made.push(Keyed {
                 name: kname,
+                method: Method::Btree,
                 nulls_first: vec![false; levels.len()],
                 desc: vec![false; levels.len()],
                 keys: k.columns.clone(),
@@ -3418,23 +3429,33 @@ impl Draft {
         if i.r#async || !i.index_options.is_empty() || !i.alter_options.is_empty() {
             return Err(Error::new(format!("{shown}: {st} is not read")));
         }
-        if let Some(m) = &i.using {
-            let m = m.to_string().to_lowercase();
-            if m != "btree" {
-                return Err(Error::new(format!(
-                    "{shown}: USING {m} is not held yet; a B-tree is"
-                )));
+        let method = match &i.using {
+            None => Method::Btree,
+            Some(m) => {
+                let m = m.to_string().to_lowercase();
+                Method::of_name(&m)
+                    .ok_or_else(|| Error::new(format!("access method \"{m}\" does not exist")))?
             }
+        };
+        let am = method.name();
+        if i.unique && !method.unique() {
+            return Err(Error::new(format!(
+                "access method \"{am}\" does not support unique indexes"
+            )));
+        }
+        if !i.include.is_empty() && !method.includes() {
+            return Err(Error::new(format!(
+                "access method \"{am}\" does not support included columns"
+            )));
+        }
+        if i.columns.len() > 1 && !method.several_keys() {
+            return Err(Error::new(format!(
+                "access method \"{am}\" does not support multicolumn indexes"
+            )));
         }
         if let Some(p) = &i.predicate {
             return Err(Error::new(format!(
                 "{shown}: a partial index, WHERE {p}, is not held yet"
-            )));
-        }
-        if let Some((n, p)) = params.first() {
-            return Err(Error::new(format!(
-                "{shown}: the operator class of its key {} takes no parameters ({p})",
-                n + 1
             )));
         }
         let mut levels = Vec::new();
@@ -3442,7 +3463,7 @@ impl Draft {
         let mut nulls_first = Vec::new();
         let mut opclasses = Vec::new();
         let mut keys: Vec<Expr> = Vec::new();
-        for c in &i.columns {
+        for (n, c) in i.columns.iter().enumerate() {
             let s = shape(
                 &c.column.expr,
                 &table_name,
@@ -3474,7 +3495,19 @@ impl Draft {
                 Shape::Clock(_) => "timestamp_ops",
                 Shape::MonthUtc(_) => "int2_ops",
             };
+            let key_type = match s {
+                Shape::Column(k) => t.columns[k].ty,
+                Shape::Clock(_) => ColumnType::Timestamp(None),
+                Shape::MonthUtc(_) => ColumnType::Int2,
+            };
+            let named = c.operator_class.as_ref().map(|o| {
+                let o = object_name(o);
+                o.strip_prefix("pg_catalog.").unwrap_or(&o).to_string()
+            });
             let op = match &c.operator_class {
+                _ if method != Method::Btree => {
+                    crate::methods::opclass(method, key_type, named.as_deref())?
+                }
                 None => default.to_string(),
                 Some(o) => {
                     let o = object_name(o);
@@ -3501,6 +3534,21 @@ impl Draft {
                         c.column.expr
                     )));
                 }
+            }
+            if !method.orders() {
+                if c.column.options.sort.is_some() {
+                    return Err(Error::new(format!(
+                        "access method \"{am}\" does not support ASC/DESC options"
+                    )));
+                }
+                if c.column.options.nulls_first.is_some() {
+                    return Err(Error::new(format!(
+                        "access method \"{am}\" does not support NULLS FIRST/LAST options"
+                    )));
+                }
+            }
+            for (_, p) in params.iter().filter(|(k, _)| *k == n) {
+                crate::methods::opclass_params(method, &op, p)?;
             }
             if d {
                 notices.push(format!(
@@ -3539,23 +3587,12 @@ impl Draft {
                 } => (left.to_string().to_lowercase(), right.to_string()),
                 other => return Err(Error::new(format!("{shown}: WITH ({other}) is not read"))),
             };
-            match k.as_str() {
-                "fillfactor" => {
-                    let n: i64 = v.parse().map_err(|_| {
-                        Error::new(format!("{shown}: fillfactor is a number, not {v}"))
-                    })?;
-                    if !(10..=100).contains(&n) {
-                        return Err(Error::new(format!(
-                            "{shown}: value {v} out of bounds for option \"fillfactor\""
-                        )));
-                    }
-                }
-                "deduplicate_items" => {}
-                other => {
-                    return Err(Error::new(format!(
-                        "{shown}: unrecognized parameter \"{other}\""
-                    )))
-                }
+            let v = crate::methods::storage_param(method, &k, &v)
+                .map_err(|e| Error::new(format!("{shown}: {e}")))?;
+            if options.iter().any(|(x, _)| *x == k) {
+                return Err(Error::new(format!(
+                    "{shown}: parameter \"{k}\" specified more than once"
+                )));
             }
             options.push((k, v));
         }
@@ -3601,8 +3638,14 @@ impl Draft {
             }
             return Err(Error::new(format!("relation \"{name}\" already exists")));
         }
+        if !crate::methods::held(method) {
+            return Err(Error::new(format!(
+                "{shown}: USING {am} is not held yet; a B-tree and a hash are"
+            )));
+        }
         let keyed = Keyed {
             name,
+            method,
             levels,
             include,
             unique: i.unique,
@@ -3663,6 +3706,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
     let key: Vec<usize> = dedup(ordered.levels.iter().map(|l| l.column()));
     let mut orders = vec![Order {
         name: ordered.name,
+        method: ordered.method,
         levels: ordered.levels,
         columns: all,
         unique: ordered.unique,
@@ -3687,6 +3731,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         );
         orders.push(Order {
             name: s.name,
+            method: s.method,
             levels: s.levels,
             columns: held,
             unique: s.unique,
@@ -3704,7 +3749,8 @@ fn finish_table(d: &Declared) -> Result<Table> {
     }
     for o in &orders {
         // xid and cid have only a hash operator class, so PostgreSQL keys no B-tree on them.
-        if let Some(l) = o.levels.iter().find(|l| !columns[l.column()].ty.ordered()) {
+        let unordered = |l: &&Level| o.method == Method::Btree && !columns[l.column()].ty.ordered();
+        if let Some(l) = o.levels.iter().find(unordered) {
             return Err(Error::new(format!(
                 "data type {} has no default operator class for access method \"btree\"",
                 columns[l.column()].ty.pg_name()
@@ -3844,7 +3890,7 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                     );
                 }
             }
-            fact("index", &obj, "method", "btree".into());
+            fact("index", &obj, "method", o.method.name().into());
             fact("index", &obj, "unique", truth(o.unique));
             fact(
                 "index",
