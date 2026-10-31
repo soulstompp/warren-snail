@@ -1044,15 +1044,13 @@ impl Snail {
         }
         let t = &self.catalog.tables[ti];
         let o = &t.orders[oi];
-        // A row is told from another by the table's key, or by every column it stores where its
-        // order is no unique key.
+        // A row is told from another by the table's key, or by every column the strand holds where
+        // the table's order is no unique key.
         let own = t.orders.iter().find(|x| x.table_order).unwrap();
         let key: Vec<usize> = if own.unique {
             own.levels.iter().map(|l| l.column()).collect()
         } else {
-            (0..t.columns.len())
-                .filter(|&c| !t.columns[c].is_virtual())
-                .collect()
+            o.columns.clone()
         };
         let column = |c: usize| format!("r.\"{}\"", t.columns[c].name.replace('"', "\"\""));
         let conditions = columns

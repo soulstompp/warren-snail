@@ -26,7 +26,10 @@ fn a_key_without_overlaps_is_read_as_an_exclude_on_gist() {
              UNIQUE (id, valid WITHOUT OVERLAPS), UNIQUE (id, valid),
              CONSTRAINT p_n UNIQUE NULLS NOT DISTINCT (id, valid WITHOUT OVERLAPS));
          CREATE TABLE s.m (k int PRIMARY KEY, id int4multirange, valid tstzmultirange,
-             UNIQUE (id, valid WITHOUT OVERLAPS) INCLUDE (k) DEFERRABLE);",
+             UNIQUE (id, valid WITHOUT OVERLAPS) INCLUDE (k) DEFERRABLE);
+         CREATE TABLE s.g (id int4range, valid daterange, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+         CREATE INDEX g_i ON s.g USING gist (id, valid);
+         ALTER TABLE s.g CLUSTER ON g_i;",
     )
     .unwrap();
     let p = c.table("s.p").unwrap();
@@ -47,6 +50,9 @@ fn a_key_without_overlaps_is_read_as_an_exclude_on_gist() {
     assert_eq!(m.opclasses, ["multirange_ops", "multirange_ops"]);
     assert!(m.exclusion.as_ref().unwrap().deferrable);
     assert_eq!(m.include, [0]);
+    // Clustered on an index of the key's columns, the table's order is no unique key.
+    let g = c.table("s.g").unwrap();
+    assert!(g.orders[0].name == "g_i" && !g.orders[0].unique);
     // Its facts: a unique index, of a key on a period.
     let facts = c.facts();
     let fact = |object: &str, name: &str| {
@@ -104,7 +110,8 @@ const PARENTS: &str = "CREATE TABLE s.p (id int4range, valid daterange, PRIMARY 
     CREATE TABLE s.b (id int4range, valid daterange, PRIMARY KEY (id, valid));
     CREATE TABLE s.x (n int PRIMARY KEY, id int4range, valid daterange, EXCLUDE USING gist (id WITH =, valid WITH &&));
     CREATE TABLE s.y (n int PRIMARY KEY, id int4range, valid daterange, EXCLUDE USING gist (valid WITH &&, id WITH =));
-    CREATE TABLE s.q (id int4range, b int4range, valid daterange, PRIMARY KEY (id, b, valid WITHOUT OVERLAPS));";
+    CREATE TABLE s.q (id int4range, b int4range, valid daterange, PRIMARY KEY (id, b, valid WITHOUT OVERLAPS));
+    CREATE TABLE s.i (n int PRIMARY KEY, a int4range, ip inet, EXCLUDE USING gist (a WITH =, ip inet_ops WITH &&));";
 
 #[test]
 fn a_foreign_key_with_period_is_read_as_postgresql_reads_it() {
@@ -138,6 +145,12 @@ fn a_foreign_key_with_period_is_read_as_postgresql_reads_it() {
         ]
     );
     let q = c.table("s.q").unwrap();
+    let period = c
+        .facts()
+        .into_iter()
+        .find(|f| f.object == "s.c.c_pid_valid_fkey" && f.fact == "period")
+        .map(|f| f.value);
+    assert_eq!(period.as_deref(), Some("true"));
     assert_eq!(t.foreign_keys[2].parent_columns, [1, 0, 2]);
     assert_eq!(q.columns[t.foreign_keys[2].parent_columns[0]].name, "b");
     // Each refusal as PostgreSQL 18.6 and 19 RC1 gave it (28818 and 28819, 2026-10-31).
@@ -183,6 +196,10 @@ fn a_foreign_key_with_period_is_read_as_postgresql_reads_it() {
             "foreign key constraint \"k_pid_m_fkey\" cannot be implemented",
         ),
         (
+            "FOREIGN KEY (pid, PERIOD ip) REFERENCES s.i (a, PERIOD ip)",
+            "invalid type for PERIOD part of foreign key",
+        ),
+        (
             "FOREIGN KEY (pid, PERIOD valid) REFERENCES s.p ON DELETE CASCADE",
             "unsupported ON DELETE action for foreign key constraint using PERIOD",
         ),
@@ -193,9 +210,9 @@ fn a_foreign_key_with_period_is_read_as_postgresql_reads_it() {
     ] {
         let got = outcomes(&format!(
             "{PARENTS}
-             CREATE TABLE s.k (n int PRIMARY KEY, pid int4range, valid daterange, m datemultirange, {key});"
+             CREATE TABLE s.k (n int PRIMARY KEY, pid int4range, valid daterange, m datemultirange, ip inet, {key});"
         ));
-        let e = got[7]
+        let e = got[8]
             .as_deref()
             .unwrap_or_else(|| panic!("{key} was taken"));
         assert!(e.contains(why), "{key}: {e}");
@@ -307,6 +324,11 @@ mod writes {
             &mut w,
             "UPDATE s.p SET valid = '[4,6)' WHERE id = '[1,2)' AND valid = '[1,5)'",
             &format!("{CONFLICT} \"p_pkey\""),
+        );
+        refused(
+            &mut w,
+            "UPDATE s.p SET valid = 'empty' WHERE id = '[1,2)' AND valid = '[1,5)'",
+            "empty WITHOUT OVERLAPS value found in column \"valid\" in relation \"p\"",
         );
         run(
             &mut w,
@@ -582,6 +604,10 @@ mod writes {
         );
         run(&mut w, "UPDATE s.c SET valid = '[1,15)' WHERE n = 1");
         // A parent's period taken is checked only within it.
+        run(
+            &mut w,
+            "UPDATE s.p SET valid = '[0,5)' WHERE valid = '[1,5)'",
+        );
         refused(
             &mut w,
             "DELETE FROM s.p WHERE valid = '[5,10)'",
@@ -603,38 +629,72 @@ mod writes {
         // finds no period of the parent's, and one holding a NULL references nothing.
         let source = made(
             "temporal-write-source",
-            "CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range);",
+            "CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range);
+             CREATE TABLE s.p (n int PRIMARY KEY, id int4range, valid int4range);",
         );
         let mut w = Snail::open_writing(&source).unwrap();
         run(
             &mut w,
             "INSERT INTO s.c (n, pid, valid) VALUES (1, NULL, '[1,2)'), (2, '[1,2)', '[2,8)')",
         );
+        run(
+            &mut w,
+            "INSERT INTO s.p (n, id, valid) VALUES (1, '[1,2)', '[1,10)')",
+        );
         drop(w);
         let mut s = Snail::open(&source).unwrap();
         let (b, _) = s.ask("SELECT n, pid, valid FROM s.c", None).unwrap();
+        let (p, _) = s.ask("SELECT id, valid FROM s.p", None).unwrap();
         let held = Catalog::parse(
             "CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
              CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range,
                  FOREIGN KEY (pid, PERIOD valid) REFERENCES s.p);",
         )
         .unwrap();
-        let rows_of = |b: &RecordBatch| {
-            let t = held.table("s.c").unwrap();
+        let rows_of = |name: &str, b: &RecordBatch| {
+            let t = held.table(name).unwrap();
             (
-                "s.c".to_string(),
+                name.to_string(),
                 warren_snail::write::Rows::from_batches(t, std::slice::from_ref(b)).unwrap(),
             )
         };
         let target = tmp("temporal-write.snail");
-        let e = write(&target, &held, &[rows_of(&b)])
+        let e = write(&target, &held, &[rows_of("s.p", &p)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("write does not hold its rows to the key WITHOUT OVERLAPS p_pkey"),
+            "{e}"
+        );
+        let e = write(&target, &held, &[rows_of("s.c", &b)])
             .unwrap_err()
             .to_string();
         assert!(
             e.contains("Key (pid, valid)=([1,2), [2,8)) is not present in table \"p\""),
             "{e}"
         );
-        write(&target, &held, &[rows_of(&b.slice(0, 1))]).unwrap();
+        write(&target, &held, &[rows_of("s.c", &b.slice(0, 1))]).unwrap();
+    }
+
+    #[test]
+    fn an_exclude_tells_its_rows_apart_by_every_column_where_the_table_s_order_is_no_unique_key() {
+        let path = made(
+            "temporal-clustered",
+            "CREATE TABLE s.e (n int PRIMARY KEY, g int, r int4range, EXCLUDE USING gist (r WITH -|-));
+             CREATE INDEX e_g ON s.e (g);
+             ALTER TABLE s.e CLUSTER ON e_g;",
+        );
+        let mut w = Snail::open_writing(&path).unwrap();
+        // Each statement taken or refused as PostgreSQL 18.6 and 19 RC1 took or refused it (28818
+        // and 28819, 2026-10-31): a row of one place on the table's order with another, beside it,
+        // conflicts with it.
+        run(&mut w, "INSERT INTO s.e (n, g, r) VALUES (1, 7, '[1,5)')");
+        refused(
+            &mut w,
+            "INSERT INTO s.e (n, g, r) VALUES (2, 7, '[5,9)')",
+            &format!("{CONFLICT} \"e_r_excl\""),
+        );
+        run(&mut w, "INSERT INTO s.e (n, g, r) VALUES (3, 7, '[20,30)')");
     }
 
     /// A writer's statements run on a thread of its own, its results sent back when they end.
