@@ -1001,6 +1001,9 @@ impl From<'_> {
 
     /// What an expression reads, and of which table: the one table whose columns it names.
     fn resolve(&self, e: &Expr) -> Result<(usize, Shape)> {
+        if let Some(call) = undeclared(e, &self.catalog.functions) {
+            return Err(Error::new(format!("{call} is not read")));
+        }
         let mut found = Vec::new();
         let mut first_error = None;
         for (side, (ti, alias)) in self.tables.iter().enumerate() {
@@ -1206,6 +1209,41 @@ impl From<'_> {
     }
 }
 
+/// Whether an expression is a value written out: a literal, signed, cast or in parentheses.
+fn valued(e: &Expr) -> bool {
+    match e {
+        Expr::Value(_) | Expr::TypedString(_) => true,
+        Expr::Nested(x) | Expr::UnaryOp { expr: x, .. } | Expr::Cast { expr: x, .. } => valued(x),
+        _ => false,
+    }
+}
+
+/// The first call in an expression, outermost first, of a function the DDL does not declare: a
+/// level reads only the DDL's own.
+fn undeclared<'e>(e: &'e Expr, functions: &[crate::catalog::Function]) -> Option<&'e Expr> {
+    match e {
+        Expr::Function(f) => {
+            let name = object_name(&f.name);
+            if !functions.iter().any(|g| g.name == name) {
+                return Some(e);
+            }
+            match &f.args {
+                FunctionArguments::List(l) => l.args.iter().find_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => undeclared(x, functions),
+                    _ => None,
+                }),
+                _ => None,
+            }
+        }
+        Expr::Nested(x) | Expr::Collate { expr: x, .. } | Expr::Cast { expr: x, .. } => {
+            undeclared(x, functions)
+        }
+        Expr::AtTimeZone { timestamp, .. } => undeclared(timestamp, functions),
+        Expr::Extract { expr, .. } => undeclared(expr, functions),
+        _ => None,
+    }
+}
+
 fn relation(catalog: &Catalog, t: &TableFactor) -> Result<(usize, Option<String>)> {
     match t {
         TableFactor::Table { name, alias, .. } => {
@@ -1217,7 +1255,9 @@ fn relation(catalog: &Catalog, t: &TableFactor) -> Result<(usize, Option<String>
                 .ok_or_else(|| Error::new(format!("{name} is not in the snail")))?;
             Ok((ti, alias.as_ref().map(|a| ident(&a.name))))
         }
-        _ => Err(Error::new("a question reads tables")),
+        other => Err(Error::new(format!(
+            "{other} is not read: a question reads tables"
+        ))),
     }
 }
 
@@ -1304,15 +1344,38 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         _ => return Err(Error::new("a question is one SELECT")),
     };
     unlocked(q)?;
-    if q.with.is_some() || q.limit_clause.is_some() || q.fetch.is_some() {
-        return Err(Error::new("WITH, LIMIT and FETCH are not read"));
-    }
     let s = match q.body.as_ref() {
         SetExpr::Select(s) => s,
         _ => return Err(Error::new("set operations are not read")),
     };
-    if s.distinct.is_some() || s.having.is_some() {
-        return Err(Error::new("DISTINCT and HAVING are not read"));
+    // Each clause the question path does not read, by its name.
+    let over = match s.from.len() > 1 || s.from.iter().any(|t| !t.joins.is_empty()) {
+        true => " over a join",
+        false => "",
+    };
+    let limit = match &q.limit_clause {
+        Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit: None,
+            offset: Some(_),
+            ..
+        }) => Some("OFFSET"),
+        Some(_) => Some("LIMIT"),
+        None => None,
+    };
+    let distinct = match &s.distinct {
+        Some(sqlparser::ast::Distinct::Distinct) => Some("DISTINCT"),
+        Some(sqlparser::ast::Distinct::On(_)) => Some("DISTINCT ON"),
+        Some(sqlparser::ast::Distinct::All) | None => None,
+    };
+    let clause = [
+        q.with.as_ref().map(|_| "WITH"),
+        limit,
+        q.fetch.as_ref().map(|_| "FETCH"),
+        distinct,
+        s.having.as_ref().map(|_| "HAVING"),
+    ];
+    if let Some(clause) = clause.into_iter().flatten().next() {
+        return Err(Error::new(format!("{clause} is not read{over}")));
     }
     // Each table after the first, and how it is joined to those before it: its join, the conjuncts
     // of its ON, and the first table of its FROM item, before which its ON may read nothing.
@@ -1386,7 +1449,11 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         let (e, label) = match item {
             SelectItem::UnnamedExpr(e) => (e, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(ident(alias))),
-            _ => return Err(Error::new("name each column a question returns")),
+            other => {
+                return Err(Error::new(format!(
+                    "{other} is not read: name each column a question returns"
+                )))
+            }
         };
         let it = match from.aggregate(e)? {
             Some(a) => a,
@@ -2310,8 +2377,13 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
     let lit_left = from.resolve(left).is_err();
     let (side, s, lit, op) = match from.resolve(left) {
         Ok((side, s)) => (side, s, right, op),
-        Err(_) => {
-            let (side, s) = from.resolve(right)?;
+        Err(on_left) => {
+            // Neither side a level: the one that is no value is named.
+            let (side, s) = match from.resolve(right) {
+                Ok(found) => found,
+                Err(_) if !valued(left) => return Err(on_left),
+                Err(on_right) => return Err(on_right),
+            };
             let flipped = match op {
                 BinaryOperator::Lt => BinaryOperator::Gt,
                 BinaryOperator::LtEq => BinaryOperator::GtEq,

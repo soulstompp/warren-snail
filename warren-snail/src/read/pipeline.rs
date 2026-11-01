@@ -7032,33 +7032,47 @@ pub fn in_order(rel: &mut Relation, column: usize) -> Result<()> {
 
 /// The one table a pipeline reads, by name: every table its steps name that no step of the WITH is.
 pub fn table_named(q: &Query) -> Result<String> {
+    if q.with.as_ref().is_some_and(|w| w.recursive) {
+        return Err(Error::new("WITH RECURSIVE is not read"));
+    }
     let mut steps: Vec<String> = Vec::new();
     let mut tables: Vec<String> = Vec::new();
-    let mut note = |s: &sqlparser::ast::Select, steps: &[String]| {
+    let mut note = |body: &SetExpr, steps: &[String]| -> Result<()> {
+        let s = match body {
+            SetExpr::Select(s) => s,
+            SetExpr::SetOperation { .. } => {
+                return Err(Error::new("set operations are not read"));
+            }
+            other => {
+                return Err(Error::new(format!(
+                    "{other} is not read: a step is a SELECT"
+                )))
+            }
+        };
         for item in &s.from {
             let mut names = vec![&item.relation];
             names.extend(item.joins.iter().map(|j| &j.relation));
             for t in names {
-                if let TableFactor::Table { name, .. } = t {
-                    let n = crate::catalog::object_name(name);
-                    if !steps.contains(&n) && !tables.contains(&n) {
-                        tables.push(n);
-                    }
+                let TableFactor::Table { name, .. } = t else {
+                    return Err(Error::new(format!(
+                        "{t} is not read: a step reads tables and steps by name"
+                    )));
+                };
+                let n = crate::catalog::object_name(name);
+                if !steps.contains(&n) && !tables.contains(&n) {
+                    tables.push(n);
                 }
             }
         }
+        Ok(())
     };
     if let Some(with) = &q.with {
         for cte in &with.cte_tables {
-            if let SetExpr::Select(s) = cte.query.body.as_ref() {
-                note(s, &steps);
-            }
+            note(cte.query.body.as_ref(), &steps)?;
             steps.push(ident(&cte.alias.name));
         }
     }
-    if let SetExpr::Select(s) = q.body.as_ref() {
-        note(s, &steps);
-    }
+    note(q.body.as_ref(), &steps)?;
     match tables.as_slice() {
         [t] => Ok(t.clone()),
         [] => Err(Error::new("the question reads no table")),

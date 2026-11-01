@@ -266,3 +266,100 @@ fn an_insert_s_question_takes_no_lock_and_is_refused_naming_it() {
     let b = w.ask("SELECT count(*) FROM a.u u", None).unwrap().0;
     assert_eq!(weather::one(&b), 6);
 }
+
+#[test]
+fn a_refusal_names_the_clause_or_the_call_it_refuses() {
+    let path = snail("words");
+    let join = "FROM a.t t JOIN a.u u ON u.t_id = t.id";
+    for (q, words) in [
+        // A walk up a parent column, its last SELECT reading the walk alone: once "the question
+        // reads no table".
+        (
+            "WITH RECURSIVE up AS (SELECT t.id, t.g FROM a.t t WHERE t.id = 4 \
+             UNION SELECT q.id, q.g FROM a.t q JOIN up ON q.id = up.g) SELECT up.id FROM up"
+                .to_string(),
+            "WITH RECURSIVE is not read".to_string(),
+        ),
+        (
+            "WITH x AS (SELECT t.id FROM a.t t UNION SELECT u.id FROM a.u u) SELECT x.id FROM x"
+                .into(),
+            "set operations are not read".into(),
+        ),
+        (
+            "WITH x AS (SELECT t.id FROM a.t t) SELECT x.id FROM x UNION SELECT x.id FROM x".into(),
+            "set operations are not read".into(),
+        ),
+        (
+            "WITH x AS (VALUES (1)) SELECT x.column1 FROM x".into(),
+            "VALUES (1) is not read: a step is a SELECT".into(),
+        ),
+        (
+            "WITH x AS (SELECT d.id FROM (SELECT t.id FROM a.t t) d) SELECT x.id FROM x".into(),
+            "(SELECT t.id FROM a.t t) d is not read: a step reads tables and steps by name".into(),
+        ),
+        // A function over a join: once "… is no function the DDL declares".
+        (
+            format!("SELECT t.g, string_agg(t.s, ',' ORDER BY u.w) AS s {join} GROUP BY t.g"),
+            "string_agg(t.s, ',' ORDER BY u.w) is not read".into(),
+        ),
+        (
+            format!("SELECT coalesce(t.v, -1) AS c {join}"),
+            "coalesce(t.v, -1) is not read".into(),
+        ),
+        (
+            format!("SELECT t.id {join} WHERE abs(u.w) > 3"),
+            "abs(u.w) is not read".into(),
+        ),
+        // Each clause by its own name: once "DISTINCT and HAVING", "WITH, LIMIT and FETCH".
+        (
+            format!("SELECT DISTINCT t.g {join}"),
+            "DISTINCT is not read over a join".into(),
+        ),
+        (
+            format!("SELECT t.g, count(*) AS c {join} GROUP BY t.g HAVING count(*) > 1"),
+            "HAVING is not read over a join".into(),
+        ),
+        (
+            "SELECT t.g, count(*) AS c FROM a.t t GROUP BY t.g HAVING count(*) > 1".into(),
+            "HAVING is not read".into(),
+        ),
+        (
+            format!("SELECT t.id {join} ORDER BY t.id LIMIT 2"),
+            "LIMIT is not read over a join".into(),
+        ),
+        (
+            format!("SELECT t.id {join} ORDER BY t.id OFFSET 1"),
+            "OFFSET is not read over a join".into(),
+        ),
+        // A FROM item, by itself: once "a question reads tables".
+        (
+            "SELECT d.id FROM (SELECT t.id FROM a.t t) d".into(),
+            "(SELECT t.id FROM a.t t) d is not read: a question reads tables".into(),
+        ),
+        (
+            "SELECT t.id FROM a.t t JOIN (VALUES (1), (2)) v (x) ON v.x = t.id".into(),
+            "(VALUES (1), (2)) v (x) is not read: a question reads tables".into(),
+        ),
+        (
+            "SELECT t.id, g.g FROM a.t t, LATERAL generate_series(1, t.v) g".into(),
+            "LATERAL generate_series(1, t.v) g is not read: a question reads tables".into(),
+        ),
+        // A star, by itself: once "name each column a question returns".
+        (
+            "SELECT * FROM a.t t".into(),
+            "* is not read: name each column a question returns".into(),
+        ),
+        (
+            format!("SELECT t.*, u.w {join}"),
+            "t.* is not read: name each column a question returns".into(),
+        ),
+    ] {
+        assert_eq!(refused(&path, &q), words, "{q}");
+    }
+    // SELECT ALL is no DISTINCT: answered over a join as without it.
+    let b = ask(&path, &format!("SELECT ALL t.id {join} ORDER BY t.id"));
+    assert_eq!(
+        weather::ints64(b.column(0).as_ref()),
+        [Some(1), Some(1), Some(2), Some(4)]
+    );
+}
