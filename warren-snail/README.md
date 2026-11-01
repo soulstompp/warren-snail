@@ -734,6 +734,12 @@ command's alone.
   refused by name, and the catalog's facts as Parquet.
 - `functions [--release <14..19>] [--out <functions.parquet>]`: every function PostgreSQL defines,
   and whether the snail answers it.
+- `types [--release <14..19>] [--out <types.parquet>]`: every type PostgreSQL defines, and whether
+  the snail takes a table's column of it, or why not.
+- `operators [--release <14..19>] [--out <operators.parquet>] [--setup <setup.sql>]`: every
+  operator PostgreSQL defines, and whether a pipeline's step answers it, or why not.
+- `opclasses [--release <14..19>] [--out <opclasses.parquet>]`: every operator class PostgreSQL
+  defines, and whether the snail takes an index of it, or why not.
 - `hold <file> --seconds <n>`: the snail held open, as a round that long holds it.
 
 Each command exits 0, or prints why it refused and exits 1.
@@ -814,10 +820,11 @@ name.
   `GROUP BY` and `ORDER BY` naming an item of the select list by its place or its name; the
   windows `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
   `first_value`, `last_value`, `nth_value` and the aggregates; `CASE`, `IN`, casts, comparisons
-  and `IS [NOT] DISTINCT FROM`; the functions and operators `warren-snail functions` names held,
-  regular expressions among them, matching as PostgreSQL's own engine matches; parameters `$1` and
-  on. Each step's expressions are typed before any row is read, so a function or an aggregate
-  PostgreSQL has no form of for its arguments is refused over no rows too.
+  and `IS [NOT] DISTINCT FROM`; the functions `warren-snail functions` names held and the
+  operators `warren-snail operators` names held, regular expressions among them, matching as
+  PostgreSQL's own engine matches; parameters `$1` and on. Each step's expressions are typed before
+  any row is read, so a function or an aggregate PostgreSQL has no form of for its arguments is
+  refused over no rows too.
 - **A statement:** as `exec` above.
 
 Anything else is refused, with a sentence that says what is not read: among it `HAVING`, a

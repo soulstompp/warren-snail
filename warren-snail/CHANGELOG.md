@@ -49,6 +49,10 @@ at once, and a snail written inside a host that decides its commits.
   item by its place or its name; more windows and frames; the functions and operators of
   PostgreSQL's types, regular expressions matching as PostgreSQL's own engine matches; the command
   `functions` lists every function PostgreSQL defines and whether the snail answers it.
+- The commands `types`, `operators` and `opclasses` list every type, operator and operator class
+  PostgreSQL 14 to 19 defines, each held or refused in the snail's own words: a type by a table's
+  column of it, an operator by a pipeline's step over columns of its types, an operator class by
+  an index of it.
 - Writes: an `INSERT … SELECT` held to PostgreSQL's assignment casts, `SET CONSTRAINTS`, and the
   DDL above in `exec`; the `DEFAULT`s `now()`, `gen_random_uuid()`, `uuidv4()` and `uuidv7()`.
 - One clock a transaction: `now()`, `CURRENT_TIMESTAMP`, `transaction_timestamp()` and the literals
