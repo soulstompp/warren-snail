@@ -1099,6 +1099,67 @@ fn a_bpchar_written_is_keyed_on_its_class_so_a_unique_key_refuses_its_twin_of_ot
 }
 
 #[test]
+#[cfg(feature = "standalone")]
+fn a_bpchar_written_is_routed_to_the_block_its_class_lies_in() {
+    // 2,048 rows of 'a' and 2,048 of 'a\t' along (c, id): a block begins at 'a\t', after every
+    // row of 'a', which is held as 'a  '.
+    let n = 2048;
+    let path = snail_of(
+        "bpchar-route",
+        "CREATE TABLE s.t (c character(3) NOT NULL, id integer NOT NULL, PRIMARY KEY (c, id));",
+        vec![
+            Values::Text(
+                (0..2 * n)
+                    .map(|i| Some(if i < n { "a  " } else { "a\t " }.to_string()))
+                    .collect(),
+            ),
+            Values::Int((0..2 * n).map(|i| Some(i % n)).collect()),
+        ],
+    );
+    let blocks = Snail::open(&path).unwrap().blocks().unwrap();
+    let firsts: Vec<&str> = blocks_of(&blocks, "t_pkey", "c")
+        .iter()
+        .map(|r| r.first.as_str())
+        .collect();
+    assert!(firsts.iter().any(|f| f.contains('\t')), "{firsts:?}");
+    assert!(firsts.iter().any(|f| !f.contains('\t')), "{firsts:?}");
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("DELETE FROM s.t WHERE c = 'a' AND id = 5")
+        .unwrap();
+    w.execute("INSERT INTO s.t (c, id) VALUES ('a', 5000)")
+        .unwrap();
+    w.execute("UPDATE s.t SET id = 6000 WHERE c = 'a' AND id = 7")
+        .unwrap();
+    let count = |w: &mut Snail, q: &str| {
+        let (b, round) = w.ask(q, None).unwrap();
+        exact(q, &round);
+        one(&b)
+    };
+    assert_eq!(
+        count(&mut w, "SELECT count(*) FROM s.t t WHERE t.c = 'a'"),
+        n
+    );
+    assert_eq!(
+        count(
+            &mut w,
+            "SELECT count(*) FROM s.t t WHERE t.c = 'a' AND t.id = 5"
+        ),
+        0
+    );
+    assert_eq!(
+        count(&mut w, "SELECT count(*) FROM s.t t WHERE t.c = 'a\t'"),
+        n
+    );
+    let (b, _) = w
+        .ask(
+            "SELECT t.id FROM s.t t WHERE t.c = 'a' AND t.id >= 4000 ORDER BY t.id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(ids(&b), [5000, 6000]);
+}
+
+#[test]
 fn a_collation_is_derived_as_postgresql_derives_it_and_carried_by_each_column() {
     let ddl =
         "CREATE TABLE s.t (id integer NOT NULL, a text COLLATE \"C\", b text COLLATE \"POSIX\", \
