@@ -330,8 +330,10 @@ VALID`. Outside a transaction each statement commits on its own.
 **What a row is given.** An identity's or a serial's value, or a `DEFAULT nextval(…)`, is its
 sequence's next, drawn at the root's turn for the whole statement and never given back, as
 PostgreSQL's `nextval` is not: a statement rolled back leaves its values unused. A writer holds a
-sequence's `CACHE` values at a time. `now()`, `CURRENT_TIMESTAMP` and `transaction_timestamp()`
-read the transaction's clock, `statement_timestamp()` the statement's. `gen_random_uuid()` and
+sequence's `CACHE` values at a time. `now()`, `CURRENT_TIMESTAMP`, `transaction_timestamp()` and
+the literals `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` read one clock, the
+transaction's start, wherever they are written; `statement_timestamp()` reads the statement's, and
+`clock_timestamp()` the machine's. `gen_random_uuid()` and
 `uuidv4()` hand out a version 4 uuid, `uuidv7()` a version 7, and the version 7 uuids one writer
 hands out rise. A `STORED` generated column is computed at the write; a `VIRTUAL` one, PostgreSQL
 18's default, at the read, and no order holds it. Each `CHECK` is checked at the write, passing
@@ -620,8 +622,8 @@ file holds already or is past.
 
 **What it reads.** A question with a `WITH`, or a window, is read as a pipeline over one table,
 along its table's order, folded as the blocks come; so is a question on one table that calls a
-function, an operator or a pattern the question path does not read, or an aggregate `DISTINCT`,
-ordered or filtered.
+function, an operator or a pattern the question path does not read, an aggregate `DISTINCT`,
+ordered or filtered, or a `LIMIT`, an `OFFSET` or a `FETCH FIRST`.
 
 **The read it cancels.** The table held whole, and a sort for the window. The table's order is the
 window's order already, and each step holds only its running folds, its groups or the rows it
@@ -690,7 +692,9 @@ put the same rows in, and ask the same question. PostgreSQL's rows are the answe
 checked against. Text that names no collation is compared by its bytes, as PostgreSQL compares it
 under the `C` collation, so check against a database whose collation is `C`, or `C.UTF-8`. A
 column's own collation orders it as PostgreSQL orders it: one that orders by bytes in any build,
-and with the feature `collations` one of ICU's or the C library's.
+and with the feature `collations` one of ICU's or the C library's. Each expression's collation is
+derived as PostgreSQL derives it: a column's own, a literal's the default, a `COLLATE` over
+either, and two that conflict refused.
 
 [warren-snail-pg](https://github.com/soulstompp/warren-surveyor/tree/HEAD/warren-snail-pg) mounts
 a snail in PostgreSQL as a schema of foreign tables, so the snail's answers and PostgreSQL's are
@@ -806,20 +810,21 @@ name.
   prefix narrowing the read; `count(*)`; `sum`, `min`, `max` and `avg`; `GROUP BY`; `ORDER BY`.
 - **A pipeline,** a question with a `WITH` or a window, or one on one table the question path does
   not read (*A question read as it goes*): steps over one table and the steps before them, joined
-  by `CROSS JOIN`; `DISTINCT`; the windows `row_number`, `rank`, `dense_rank`, `percent_rank`,
-  `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` and the aggregates;
-  `CASE`, `IN`, casts, comparisons and `IS [NOT] DISTINCT FROM`; the functions and operators
-  `warren-snail functions` names held, regular expressions among them, matching as PostgreSQL's
-  own engine matches; parameters `$1` and on. Each step's expressions are typed before any row is
-  read, so a function or an aggregate PostgreSQL has no form of for its arguments is refused over
-  no rows too.
+  by `CROSS JOIN`; `DISTINCT`; `LIMIT`, `OFFSET` and `FETCH FIRST`, `WITH TIES` among them;
+  `GROUP BY` and `ORDER BY` naming an item of the select list by its place or its name; the
+  windows `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
+  `first_value`, `last_value`, `nth_value` and the aggregates; `CASE`, `IN`, casts, comparisons
+  and `IS [NOT] DISTINCT FROM`; the functions and operators `warren-snail functions` names held,
+  regular expressions among them, matching as PostgreSQL's own engine matches; parameters `$1` and
+  on. Each step's expressions are typed before any row is read, so a function or an aggregate
+  PostgreSQL has no form of for its arguments is refused over no rows too.
 - **A statement:** as `exec` above.
 
-Anything else is refused, with a sentence that says what is not read: among it `HAVING`, `LIMIT`,
-`OFFSET`, a subquery, a set operation, `WITH RECURSIVE`, and in a write `RETURNING`, `ON
-CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE` and a savepoint. A statement
-sqlparser reads otherwise than it is written is refused too, so nothing it declares is dropped
-without a word.
+Anything else is refused, with a sentence that says what is not read: among it `HAVING`, a
+subquery, a set operation, `WITH RECURSIVE`, a `LIMIT` over several tables, and in a write
+`RETURNING`, `ON CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE` and a
+savepoint. A statement sqlparser reads otherwise than it is written is refused too, so nothing it
+declares is dropped without a word.
 
 ### What the commands record
 

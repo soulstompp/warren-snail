@@ -44,11 +44,16 @@ at once, and a snail written inside a host that decides its commits.
   JOIN`, met by `=`, `<>`, `<`, `<=`, `>` or `>=`; the conditions `<>`, `BETWEEN`, `IS [NOT] NULL`,
   answered from the NULLs counted, and the truth tests; `LIKE`, `ILIKE`, `SIMILAR TO` and `~`, a
   pattern's fixed prefix narrowing the read; `min`, `max` and `avg` on the question path.
-- The pipeline: `DISTINCT`, more windows and frames, and the functions and operators of
+- The pipeline: `DISTINCT`; `LIMIT`, `OFFSET` and `FETCH FIRST`, `WITH TIES` among them, a question
+  on one table taking them read as a pipeline; `GROUP BY` and `ORDER BY` naming a select list's
+  item by its place or its name; more windows and frames; the functions and operators of
   PostgreSQL's types, regular expressions matching as PostgreSQL's own engine matches; the command
   `functions` lists every function PostgreSQL defines and whether the snail answers it.
 - Writes: an `INSERT … SELECT` held to PostgreSQL's assignment casts, `SET CONSTRAINTS`, and the
   DDL above in `exec`; the `DEFAULT`s `now()`, `gen_random_uuid()`, `uuidv4()` and `uuidv7()`.
+- One clock a transaction: `now()`, `CURRENT_TIMESTAMP`, `transaction_timestamp()` and the literals
+  `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` read the transaction's start wherever they are
+  written, `statement_timestamp()` the statement's, `clock_timestamp()` the machine's.
 - Several snails at once: `--with` on `read` and `exec`, and `read::Snails`: a round reads them at
   one moment, a question joins their tables, and a transaction that writes several commits them
   together, one root deciding; `read --round` records each snail's part as `snails`.
@@ -58,7 +63,8 @@ at once, and a snail written inside a host that decides its commits.
   `carry::replay`; and `exec --host`, a snail written through PostgreSQL's WAL.
 - The features `collations`, ICU's collations and the C library's locales, and `zones`, named time
   zones read from compiled zone files; the command `recut`, an order cut under its collation's
-  version written afresh.
+  version written afresh. Each expression's collation derived as PostgreSQL derives it, two that
+  conflict refused.
 - The commands `catalog`, what the snail reads of a DDL, a statement at a time; `read --text`;
   `write --release` and `--lc-monetary`, for a Parquet file that names neither, and refused where
   they disagree with one that does; each command's own `--help`.
