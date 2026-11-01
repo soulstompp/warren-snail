@@ -427,3 +427,116 @@ fn a_parameter_takes_the_type_its_context_gives_it() {
         [Some("10".to_string())]
     );
 }
+
+#[test]
+fn a_case_and_a_parameter_on_one_table_are_read_as_a_step_reads_them() {
+    let path = snail("handed");
+    // Once "CASE WHEN … END is not a level the snail reads".
+    let b = ask(
+        &path,
+        "SELECT t.id, CASE WHEN t.v > 15 THEN 1 ELSE 0 END AS c FROM a.t t ORDER BY t.id",
+    );
+    assert_eq!(
+        weather::ints64(b.column(1).as_ref()),
+        [Some(0), Some(1), Some(0), Some(1), Some(0)]
+    );
+    let b = ask(
+        &path,
+        "SELECT t.id FROM a.t t WHERE CASE WHEN t.v > 15 THEN true ELSE false END ORDER BY t.id",
+    );
+    assert_eq!(weather::ints64(b.column(0).as_ref()), [Some(2), Some(4)]);
+    let b = ask(
+        &path,
+        "SELECT CASE WHEN t.g = 1 THEN 1 ELSE 2 END AS k, count(*) AS n FROM a.t t GROUP BY 1 ORDER BY 1",
+    );
+    assert_eq!(weather::ints64(b.column(1).as_ref()), [Some(2), Some(3)]);
+    let b = ask(
+        &path,
+        "SELECT sum(CASE WHEN t.v > 15 THEN 1 ELSE 0 END) AS c FROM a.t t",
+    );
+    assert_eq!(bigints(&b, 0), [Some(2)]);
+    // Once "parameters are read only in a pipeline".
+    for (q, params, want) in [
+        (
+            "SELECT t.id FROM a.t t WHERE t.v > $1 ORDER BY t.id",
+            &["15"][..],
+            vec![Some(2), Some(4)],
+        ),
+        (
+            "SELECT t.id FROM a.t t WHERE t.s = $1",
+            &["c"],
+            vec![Some(3)],
+        ),
+        (
+            "SELECT t.id FROM a.t t WHERE t.id BETWEEN $1 AND $2 ORDER BY t.id",
+            &["2", "4"],
+            vec![Some(2), Some(3), Some(4)],
+        ),
+    ] {
+        assert_eq!(ids_with(&path, q, params), want, "{q}");
+    }
+    // Over a join, still refused by name.
+    let params = ["4".to_string()];
+    let e = fresh(&path)
+        .ask_with(
+            "SELECT t.id FROM a.t t JOIN a.u u ON u.t_id = t.id WHERE u.w > $1",
+            None,
+            &params,
+        )
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "parameters are read only in a question on one table");
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_document_s_arrows_on_one_table_are_read_as_a_step_reads_them() {
+    let path = tmp("answers-arrows.snail");
+    let catalog =
+        Catalog::parse("CREATE TABLE a.j (id integer NOT NULL, doc jsonb, PRIMARY KEY (id));")
+            .unwrap();
+    let empty = Rows {
+        columns: catalog.tables[0]
+            .columns
+            .iter()
+            .map(|c| Values::new(c.ty))
+            .collect(),
+    };
+    write(&path, &catalog, &[("a.j".into(), empty)]).unwrap();
+    let mut w = warren_snail::read::Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO a.j (id, doc) VALUES (1, '{\"Plan\": {\"Node Type\": \"Seq Scan\", \"Rows\": 5}}'), \
+         (2, '{\"Plan\": {\"Node Type\": \"Hash Join\"}}'), (3, '{\"x\": 1}'), (4, NULL)",
+    )
+    .unwrap();
+    // Once "j.doc -> 'Plan' ->> 'Node Type' is not a level the snail reads".
+    let (b, _) = w
+        .ask(
+            "SELECT j.id, j.doc -> 'Plan' ->> 'Node Type' AS n FROM a.j j ORDER BY j.id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        weather::texts(b.column(1).as_ref()),
+        [
+            Some("Seq Scan".into()),
+            Some("Hash Join".into()),
+            None,
+            None
+        ]
+    );
+    let (b, _) = w
+        .ask("SELECT j.id FROM a.j j WHERE j.doc ->> 'x' = '1'", None)
+        .unwrap();
+    assert_eq!(weather::ints64(b.column(0).as_ref()), [Some(3)]);
+    let (b, _) = w
+        .ask(
+            "SELECT j.id, j.doc #>> '{Plan,Rows}' AS r FROM a.j j ORDER BY j.id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        weather::texts(b.column(1).as_ref()),
+        [Some("5".into()), None, None, None]
+    );
+}

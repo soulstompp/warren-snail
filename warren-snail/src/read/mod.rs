@@ -1064,7 +1064,9 @@ impl Snail {
             }
         }
         if !params.is_empty() {
-            return Err(Error::new("parameters are read only in a pipeline"));
+            return Err(Error::new(
+                "parameters are read only in a question on one table",
+            ));
         }
         let q = question::parse(&self.catalog, sql)?;
         match q.sides.len() {

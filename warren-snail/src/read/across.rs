@@ -684,7 +684,9 @@ impl Snails {
             [i] => self.snails[*i].answer_with(sql, None, params)?,
             _ => {
                 if !params.is_empty() {
-                    return Err(Error::new("parameters are read only in a pipeline"));
+                    return Err(Error::new(
+                        "parameters are read only in a question on one table",
+                    ));
                 }
                 let q: Question = question::parse(&self.catalog, sql)?;
                 let at: Vec<(usize, usize)> = q.sides.iter().map(|s| self.at[s.table]).collect();

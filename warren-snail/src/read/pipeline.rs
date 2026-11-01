@@ -6419,7 +6419,8 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
 
 /// Whether a question on one table the question path does not read is handed to the pipeline: it
 /// returns each row once, or some of its rows (LIMIT, OFFSET, FETCH), or calls a function, an aggregate over each value once, filtered or
-/// ordered, or an operator on numbers, the question path does not read.
+/// ordered, or an operator on numbers or on a document, the question path does not read, or reads a
+/// CASE or a parameter.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
@@ -6448,8 +6449,9 @@ pub fn hands_over(q: &Query) -> bool {
     exprs.into_iter().any(calls_beyond_the_question)
 }
 
-/// Whether an expression calls a function, or an operator on numbers, the question path does not
-/// read: its aggregates and the functions a DDL names are its own.
+/// Whether an expression calls a function, or an operator on numbers or on a document, the question
+/// path does not read, or reads a CASE or a parameter: its aggregates and the functions a DDL names
+/// are its own.
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => {
@@ -6476,7 +6478,9 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::Like { .. }
         | Expr::ILike { .. }
         | Expr::Between { .. }
-        | Expr::Substring { .. } => true,
+        | Expr::Substring { .. }
+        | Expr::Case { .. } => true,
+        Expr::Value(v) => matches!(v.value, SqlValue::Placeholder(_)),
         Expr::BinaryOp { left, op, right } => {
             matches!(
                 op,
@@ -6485,6 +6489,10 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo
+                    | BinaryOperator::Arrow
+                    | BinaryOperator::LongArrow
+                    | BinaryOperator::HashArrow
+                    | BinaryOperator::HashLongArrow
                     | BinaryOperator::Overlaps
                     | BinaryOperator::PGRegexMatch
                     | BinaryOperator::PGRegexIMatch
