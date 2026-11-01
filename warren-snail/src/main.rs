@@ -92,6 +92,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           family and whether the snail answers it.
   hold    the snail held open for the seconds given, as a round that long would hold it.
 
+  A command given --help, or -h, prints its own usage and what it does.
+
   Built with the feature zones, SNAIL_ZONES names the directory compiled zones are read from: the
   machine's /usr/share/zoneinfo unless given.";
 
@@ -1267,12 +1269,74 @@ fn cmd_functions(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The commands, as `USAGE` names them.
+const COMMANDS: [&str; 10] = [
+    "write",
+    "exec",
+    "read",
+    "out",
+    "blocks",
+    "census",
+    "recut",
+    "catalog",
+    "functions",
+    "hold",
+];
+
+/// Whether a command's arguments ask for its help: `--help` or `-h`, other than as the value a
+/// flag takes. Every flag but `--text` takes the argument after it.
+fn asks_help(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        (a == "--help" || a == "-h")
+            && (i == 0 || {
+                let before = args[i - 1].as_str();
+                !before.starts_with("--") || before == "--text"
+            })
+    })
+}
+
+/// One command's part of `USAGE`: its usage lines, then what it does.
+fn usage_of(command: &str) -> String {
+    let lines: Vec<&str> = USAGE.lines().collect();
+    let named = format!("warren-snail {command} ");
+    // Every usage line holds its command at the same column, after `usage: ` or as many spaces.
+    let start = lines
+        .iter()
+        .position(|l| l.get(7..).is_some_and(|l| l.starts_with(&named)))
+        .expect("USAGE names every command");
+    let mut usage = vec![format!("usage: {}", &lines[start][7..])];
+    usage.extend(
+        lines[start + 1..]
+            .iter()
+            .take_while(|l| !l.trim().is_empty() && !l.trim_start().starts_with("warren-snail "))
+            .map(|l| l.to_string()),
+    );
+    let said = format!("  {command} ");
+    let what = lines
+        .iter()
+        .position(|l| l.starts_with(&said))
+        .expect("USAGE says what every command does");
+    let mut does = vec![lines[what]];
+    does.extend(
+        lines[what + 1..]
+            .iter()
+            .take_while(|l| l.starts_with("          ")),
+    );
+    format!("{}\n\n{}", usage.join("\n"), does.join("\n"))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Built with zones, SNAIL_ZONES names the directory of compiled zones read, a server's own.
     #[cfg(feature = "zones")]
     if let Some(dir) = std::env::var_os("SNAIL_ZONES") {
         warren_snail::zones::set_directory(dir.into());
+    }
+    if let Some(command) = args.first().filter(|c| COMMANDS.contains(&c.as_str())) {
+        if asks_help(&args[1..]) {
+            println!("{}", usage_of(command));
+            return ExitCode::SUCCESS;
+        }
     }
     let result = match args.first().map(String::as_str) {
         Some("write") => cmd_write(&args[1..]),

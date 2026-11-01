@@ -704,7 +704,8 @@ SQL in PostgreSQL's syntax, and the snail reads it as it reads any other questio
 
 ### The commands
 
-`warren-snail --help` prints each command and its flags.
+`warren-snail --help` prints each command and its flags, and `warren-snail <command> --help` that
+command's alone.
 
 - `write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
   [--release <14..19>] [--lc-monetary <locale>] [--written <written.parquet>]`: a new snail, where
