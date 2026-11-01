@@ -1120,12 +1120,24 @@ impl Snail {
             .map(|&c| table.columns[c].name.clone())
             .collect();
         let types = stored.iter().map(|&c| Some(table.columns[c].ty)).collect();
+        let primary: Vec<String> = table
+            .orders
+            .iter()
+            .find(|o| o.constraint.as_ref().is_some_and(|k| k.primary))
+            .map(|o| {
+                o.levels
+                    .iter()
+                    .map(|l| table.columns[l.column()].name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut stream = pipeline::Stream::new(
             q,
             &table.name,
             names,
             types,
             along,
+            &primary,
             params,
             table.release,
             pipeline::Casings::of_table(table, &self.catalog.collations),

@@ -335,7 +335,8 @@ fn the_planner_s_statistics_are_answered_as_their_bytes_their_output_refused_by_
         ("format('%s', dp)", "pg_dependencies"),
         ("to_json(nd)", "pg_ndistinct"),
         ("json_agg(dp)", "pg_dependencies"),
-        ("nd || 'x'", "pg_ndistinct"),
+        ("nd = 'x'", "pg_ndistinct"),
+        ("dp LIKE 'x%'", "pg_dependencies"),
     ] {
         let e = s
             .ask(&format!("{step} SELECT {e} AS x FROM q"), None)
@@ -353,6 +354,63 @@ fn the_planner_s_statistics_are_answered_as_their_bytes_their_output_refused_by_
             "{e}"
         );
     }
+    // Compared and joined as PostgreSQL 19 RC1 resolves them (28819, 2026-11-01): none of their
+    // own, each cast to text through its output beside a string, to bytea beside bytea.
+    for (e, refused) in [
+        (
+            "nd = nd",
+            "operator is not unique: pg_ndistinct = pg_ndistinct",
+        ),
+        (
+            "nd = dp",
+            "operator is not unique: pg_ndistinct = pg_dependencies",
+        ),
+        (
+            "nd || 'x'",
+            "operator is not unique: pg_ndistinct || unknown",
+        ),
+        (
+            "mc || 'x'::text",
+            "operator is not unique: pg_mcv_list || text",
+        ),
+        (
+            "mc IS DISTINCT FROM mc",
+            "operator is not unique: pg_mcv_list = pg_mcv_list",
+        ),
+        ("nd = 1", "operator does not exist: pg_ndistinct = integer"),
+    ] {
+        let got = s
+            .ask(&format!("{step} SELECT {e} AS x FROM q"), None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(got, refused, "{e}");
+    }
+    let one = |s: &mut Snail, e: &str| -> Option<String> {
+        let (b, _) = s
+            .ask(
+                &format!("{step} SELECT ({e})::text AS x FROM q WHERE id = 1"),
+                None,
+            )
+            .unwrap();
+        texts(b.column(0).as_ref()).remove(0)
+    };
+    for (e, want) in [
+        ("mc = 'x'", "false"),
+        ("mc = '\\xc251a6e1010000000a000000'", "true"),
+        ("mc = '\\xC251A6E1010000000A000000'", "false"),
+        ("mc = '\\xC251A6E1010000000A000000'::bytea", "true"),
+        ("nd = '\\x01'::bytea", "false"),
+        ("mc < 'x'", "true"),
+        ("mc ~ 'x'", "true"),
+        ("mc IN ('x', 'y')", "false"),
+        ("mc IS DISTINCT FROM 'x'", "true"),
+        ("mc || '\\x01'::bytea", "\\xc251a6e1010000000a00000001"),
+    ] {
+        assert_eq!(one(&mut s, e).as_deref(), Some(want), "{e}");
+    }
+    // Asked of the table itself, the pipeline reads it.
+    let (b, _) = s.ask("SELECT id FROM s.t WHERE mc <> 'x'", None).unwrap();
+    assert_eq!(ints64(b.column(0).as_ref()), [Some(1)]);
     // Nor is one written into a string as its output, as an INSERT … SELECT assigns it.
     #[cfg(feature = "standalone")]
     {

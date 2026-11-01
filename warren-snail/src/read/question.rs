@@ -1360,11 +1360,25 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 keys.push(k);
             }
         }
-        for (n, i) in &listed {
+        for (_, i) in &listed {
             if let Item::Key(k) = i {
                 if !keys.contains(k) {
+                    // Named as PostgreSQL names it: by its table's alias, or the table's own name.
+                    let c = k.col();
+                    let table = from.table(c.side);
+                    let named = match &from.tables[c.side].1 {
+                        Some(a) => a.clone(),
+                        None => table
+                            .name
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                    };
                     return Err(Error::new(format!(
-                        "{n} must appear in GROUP BY or be an aggregate"
+                        "column \"{named}.{}\" must appear in the GROUP BY clause or be used in an \
+                         aggregate function",
+                        table.columns[c.column].name
                     )));
                 }
             }

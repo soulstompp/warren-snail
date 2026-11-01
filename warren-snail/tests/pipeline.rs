@@ -317,3 +317,79 @@ fn a_step_s_ordinal_names_the_select_list_s_column() {
         assert_eq!(e.to_string(), refused, "{q}");
     }
 }
+
+#[test]
+fn a_step_groups_and_sorts_its_columns_as_postgresql_s_parser_reads_them() {
+    let s = sample(5_000);
+    let path = snail("pipeline-grouped", &s);
+    let mut snail = Snail::open(&path).unwrap();
+    let step = "WITH f AS (SELECT r.reading_id AS id, r.feed AS feed, r.station_no AS n \
+                FROM weather.readings r)";
+    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-11-01): a column read outside an
+    // aggregate that the step does not group by, in what it returns or in its ORDER BY.
+    for q in [
+        "SELECT feed, n FROM f GROUP BY feed",
+        "SELECT feed, count(*) AS k FROM f GROUP BY feed ORDER BY n",
+        "SELECT feed, n + count(*) AS k FROM f GROUP BY feed",
+    ] {
+        let e = snail.ask(&format!("{step} {q}"), None).unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("column \"f.n\" must appear in the GROUP BY clause"),
+            "{q}: {e}"
+        );
+    }
+    assert_eq!(
+        snail
+            .ask(
+                &format!("{step} SELECT DISTINCT feed FROM f ORDER BY n"),
+                None
+            )
+            .unwrap_err()
+            .to_string(),
+        "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+    );
+    // An expression grouped by stands, and a column the table's primary key decides.
+    for q in [
+        "SELECT n % 2 AS h, count(*) AS k FROM f GROUP BY n % 2",
+        "SELECT (n % 2) + 1 AS h FROM f GROUP BY n % 2",
+    ] {
+        assert!(snail.ask(&format!("{step} {q}"), None).is_ok(), "{q}");
+    }
+    assert!(snail
+        .ask(
+            "WITH f AS (SELECT r.reading_id, r.feed FROM weather.readings r GROUP BY r.reading_id) \
+             SELECT reading_id, feed FROM f",
+            None
+        )
+        .is_ok());
+    // An ORDER BY expression reads the FROM's column, though a column the step returns bears its
+    // name; a bare name, and an ordinal, the column the step returns.
+    let mut ordered = |q: &str| -> Vec<Vec<Option<String>>> {
+        let (b, _) = snail.ask(&format!("{step} {q}"), None).unwrap();
+        (0..b.num_rows())
+            .map(|r| {
+                (0..b.num_columns())
+                    .map(|c| cell(b.column(c).as_ref(), r))
+                    .collect()
+            })
+            .collect()
+    };
+    let by_input = ordered("SELECT id, -n AS n FROM f ORDER BY n + 0, id");
+    let by_output = ordered("SELECT id, -n AS n FROM f ORDER BY n, id");
+    let by_place = ordered("SELECT id, -n AS n FROM f ORDER BY 2, 1");
+    assert_eq!(by_output, by_place);
+    let mut reversed = by_input.clone();
+    reversed.sort_by_key(|r| {
+        (
+            r[1].as_ref().map(|v| -v.parse::<i64>().unwrap()),
+            r[0].as_ref().map(|v| v.parse::<i64>().unwrap()),
+        )
+    });
+    assert_eq!(by_input, reversed);
+    assert_ne!(by_input, by_output);
+    assert_eq!(
+        ordered("SELECT id FROM f ORDER BY n DESC, id").len(),
+        by_input.len()
+    );
+}

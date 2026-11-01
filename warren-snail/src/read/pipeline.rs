@@ -677,47 +677,13 @@ impl Casings {
         for g in &p.grouping {
             d.derive(g)?.keyed()?;
         }
-        // ORDER BY reads the columns the step returns: an item named, by its place or by its name,
-        // is that item, keyed as it was derived.
-        let nodes = d.nodes;
-        let outputs: Vec<(Option<String>, String, super::collate::Carried)> = p
-            .items
-            .iter()
-            .zip(&carried)
-            .map(|((_, n), c)| (None, n.clone(), c.clone()))
-            .collect();
-        let mut d = super::collate::Deriving {
-            columns: &outputs,
-            types: &p.types,
-            nodes,
-        };
-        if let Some(OrderByKind::Expressions(os)) = p.order_by.map(|o| &o.kind) {
-            for o in os {
-                let named = match &o.expr {
-                    Expr::Identifier(i) => {
-                        let n = ident(i);
-                        let mut at = (0..p.items.len()).filter(|&i| p.items[i].1 == n);
-                        match (at.next(), at.next()) {
-                            (Some(at), None) => Some(at),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                match ordinal(&o.expr, "ORDER BY", carried.len()) {
-                    Ok(Some(at)) => {
-                        outs[at].keyed()?;
-                    }
-                    Err(_) => {}
-                    Ok(None) => {
-                        let out = d.derive(&o.expr)?;
-                        match named {
-                            Some(at) => outs[at].keyed()?,
-                            None => out.keyed()?,
-                        };
-                    }
-                }
-            }
+        // ORDER BY sorts by an item it names, keyed as the item was derived, or by an expression
+        // over the FROM's columns.
+        for &at in &p.sorted {
+            match outs.get(at) {
+                Some(out) => out.keyed()?,
+                None => d.derive(p.hidden[at - outs.len()])?.keyed()?,
+            };
         }
         self.nodes = d.nodes;
         // Each collation the step names, resolved once.
@@ -2318,6 +2284,18 @@ fn like_of(
     }
 }
 
+/// A value of the planner's statistics types where it meets a string or an untyped literal: its
+/// text, as PostgreSQL casts it there through its output (the step's typing lets only
+/// pg_mcv_list's, bytea's, through); beside anything else, its bytes as they are.
+fn written_beside(frame: &Frame, e: &Expr, v: Value, other: &Expr) -> Value {
+    let statistics = matches!(frame.type_of(e), Some(ColumnType::Internal(i)) if i.casts());
+    let string = frame.type_of(other).is_none_or(|t| t.is_string());
+    match v {
+        Value::Bytes(_) if statistics && string => Value::Text(v.text().unwrap_or_default()),
+        v => v,
+    }
+}
+
 /// The casing a function of strings is called under: the collation its arguments settle, else the
 /// database's default. Where they settle none, a function that maps case or searches for a
 /// substring is refused in PostgreSQL's words, but where an argument is NULL, which it never reads;
@@ -3089,6 +3067,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 },
             };
             let (v, p) = (ev(expr)?, ev(pattern)?);
+            let v = written_beside(frame, expr, v, pattern);
             if v.is_null() || p.is_null() {
                 return Ok(Value::Null);
             }
@@ -3123,7 +3102,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             }
             let p = super::calls::regexps("similar_to_escape", &args, Casing::Libc)?
                 .unwrap_or(Value::Null);
-            let s = ev(expr)?;
+            let s = written_beside(frame, expr, ev(expr)?, pattern);
             let casing = regex_casing(frame, e, &[&s, &p])?;
             let op = if *negated {
                 BinaryOperator::PGRegexNotMatch
@@ -3260,7 +3239,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             }
             let mut unknown = false;
             for x in list {
-                let (a, b) = beside(v.clone(), ev(x)?, expr, x)?;
+                let (a, b) = beside(written_beside(frame, expr, v.clone(), x), ev(x)?, expr, x)?;
                 // Each value compared under the collation the list settles, a NULL under none.
                 let under = match b.is_null() {
                     true => None,
@@ -3288,7 +3267,11 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
         Expr::IsUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_none()),
         Expr::IsNotUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_some()),
         Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
-            let (x, y) = beside(ev(a)?, ev(b)?, a, b)?;
+            let (x, y) = (
+                written_beside(frame, a, ev(a)?, b),
+                written_beside(frame, b, ev(b)?, a),
+            );
+            let (x, y) = beside(x, y, a, b)?;
             let same = match (x.is_null(), y.is_null()) {
                 (true, true) => true,
                 (false, false) => {
@@ -3333,6 +3316,7 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                         BinaryOperator::PGRegexNotMatch | BinaryOperator::PGRegexNotIMatch
                     );
                     let (s, p) = (ev(left)?, ev(right)?);
+                    let s = written_beside(frame, left, s, right);
                     let casing = regex_casing(frame, e, &[&s, &p])?;
                     return regex_match(&s, &p, op, icase, not, casing);
                 }
@@ -3363,6 +3347,10 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }
                 e => ev(e)?,
             };
+            let (x, y) = (
+                written_beside(frame, left, x, right),
+                written_beside(frame, right, y, left),
+            );
             let typed = [frame.type_of(left), frame.type_of(right)];
             if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
                 return Ok(v);
@@ -3555,14 +3543,12 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 }
                 return super::calls::strings("substr", &args, Casing::Libc)?.ok_or_else(missing);
             }
-            let casing = match frame.casings.implicit(expr)? {
-                Some(k) => k,
-                None => substring_from
-                    .as_deref()
-                    .map(|x| frame.casings.implicit(x))
-                    .transpose()?
-                    .flatten()
-                    .unwrap_or(Casing::Libc),
+            // A pattern alone is a regular expression, under the collation the text and the pattern
+            // settle; with its escape it is SQL's, which PostgreSQL's function of SQL reads under
+            // the database's default whatever its arguments' collations.
+            let casing = match parts.get(1) {
+                Some(_) => Casing::Libc,
+                None => regex_casing(frame, e, &[&string, &parts[0].0])?,
             };
             super::calls::substring_by_pattern(
                 &string,
@@ -3576,11 +3562,10 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
             if let Some(v) = super::rest::call("position", &bits)? {
                 return Ok(v);
             }
-            // Under the collation either side names, else the one the string carries.
-            let explicit = [&**r#in, &**expr].into_iter().find(|x| names_collate(x));
-            if let Some(casing) = frame.casings.implicit(explicit.unwrap_or(r#in))? {
-                super::calls::substring_search("position", casing)?;
-            }
+            // Under the collation the string and the substring settle.
+            let values = [bits[0].0.clone(), bits[1].0.clone()];
+            let casing = string_casing(frame, e, "position", &values)?;
+            super::calls::substring_search("position", casing)?;
             let [(s, ..), (sub, ..)] = bits;
             super::calls::position(s, sub)?
         }
@@ -3803,6 +3788,33 @@ fn typed_from(
                 .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
             for (c, t) in names.iter().zip(types) {
                 out.push((Some(q.clone()), c.clone(), *t));
+            }
+        }
+    }
+    out
+}
+
+/// The names a FROM reads the table under: each alias it gives the table, or the table's own.
+fn base_qualifiers(
+    items: &[TableWithJoins],
+    typed: &HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)>,
+    table: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        for t in std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation)) {
+            let TableFactor::Table { name, alias, .. } = t else {
+                continue;
+            };
+            let n = crate::catalog::object_name(name);
+            let base = !typed.contains_key(&n) || n == table;
+            if base && (table == n || table.rsplit('.').next() == Some(n.as_str())) {
+                out.push(
+                    alias
+                        .as_ref()
+                        .map(|a| ident(&a.name))
+                        .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string()),
+                );
             }
         }
     }
@@ -4911,6 +4923,10 @@ struct Prepared<'q> {
     from: &'q [TableWithJoins],
     selection: Option<&'q Expr>,
     order_by: Option<&'q sqlparser::ast::OrderBy>,
+    /// The place, in each row it makes, of the value each ORDER BY item sorts by: a column it
+    /// returns, or after them each expression of `hidden`, made beside them until they are sorted.
+    sorted: Vec<usize>,
+    hidden: Vec<&'q Expr>,
     items: Vec<(&'q Expr, String)>,
     calls: Calls<'q>,
     grouping: Vec<&'q Expr>,
@@ -4930,14 +4946,17 @@ struct Prepared<'q> {
 }
 
 impl Prepared<'_> {
-    /// The rows its select list makes of one row: one, or, where it calls set-returning functions,
-    /// one for each value of the longest set they give, a shorter set NULL past its end, and none
-    /// where every set is empty, as PostgreSQL's ProjectSet makes them.
+    /// The rows its select list makes of one row, each with its ORDER BY's expressions after them:
+    /// one, or, where it calls set-returning functions, one for each value of the longest set they
+    /// give, a shorter set NULL past its end, and none where every set is empty, as PostgreSQL's
+    /// ProjectSet makes them.
     fn project(&self, row: &[Value], frame: &Frame, computed: Computed) -> Result<Vec<Vec<Value>>> {
         let one = |c: &Computed| {
             self.items
                 .iter()
-                .map(|(e, _)| eval(e, row, frame, c))
+                .map(|(e, _)| *e)
+                .chain(self.hidden.iter().copied())
+                .map(|e| eval(e, row, frame, c))
                 .collect::<Result<Vec<_>>>()
         };
         if self.calls.sets.is_empty() {
@@ -5056,10 +5075,91 @@ fn grouped_by<'q>(
     Ok(e)
 }
 
+/// The place in the select list an ORDER BY item names, as PostgreSQL's parser reads one: an
+/// ordinal's place; a bare name's item of that name, two different ones refused; an expression the
+/// select list writes as it is. None where it is an expression over the FROM's columns.
+fn sorted_by(e: &Expr, items: &[(&Expr, String)]) -> Result<Option<usize>> {
+    if let Some(at) = ordinal(e, "ORDER BY", items.len())? {
+        return Ok(Some(at));
+    }
+    let mut bare = e;
+    while let Expr::Nested(x) = bare {
+        bare = x;
+    }
+    if let Expr::Identifier(i) = bare {
+        let name = ident(i);
+        let mut found = items.iter().enumerate().filter(|(_, (_, n))| *n == name);
+        if let Some((at, (first, _))) = found.next() {
+            if found.any(|(_, (other, _))| other != first) {
+                return Err(Error::new(format!("ORDER BY \"{name}\" is ambiguous")));
+            }
+            return Ok(Some(at));
+        }
+    }
+    Ok(items.iter().position(|(x, _)| *x == e))
+}
+
+/// The column of the FROM a reference names, where it names one.
+fn resolved<'c>(
+    e: &Expr,
+    columns: &'c [super::typed::TypedColumn],
+) -> Option<&'c super::typed::TypedColumn> {
+    let (q, n) = column_of(e)?;
+    let mut found = columns
+        .iter()
+        .filter(|(cq, cn, _)| *cn == n && (q.is_none() || cq.as_deref() == q.as_deref()));
+    match (found.next(), found.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+/// The first column an expression of a grouped step reads that is neither grouped by, nor read
+/// inside an aggregate, nor of a table read under a name whose primary key is grouped by: by its
+/// relation's name and its own.
+fn ungrouped(
+    e: &Expr,
+    grouping: &[&Expr],
+    columns: &[super::typed::TypedColumn],
+    decided: &[&str],
+) -> Option<(String, String)> {
+    let same = |g: &Expr| {
+        g == e
+            || matches!((resolved(g, columns), resolved(e, columns)),
+                (Some(a), Some(b)) if std::ptr::eq(a, b))
+    };
+    if grouping.iter().any(|g| same(g)) {
+        return None;
+    }
+    match e {
+        Expr::Function(f)
+            if f.over.is_none()
+                && (is_aggregate(&function_name(f)) || !f.within_group.is_empty()) =>
+        {
+            None
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let (q, n, _) = resolved(e, columns)?;
+            let q = q.clone().unwrap_or_default();
+            (!decided.contains(&q.as_str())).then(|| (q, n.clone()))
+        }
+        _ => {
+            let mut parts = parts_of(e);
+            if parts.is_empty() {
+                parts = super::collate::children(e);
+            }
+            parts
+                .into_iter()
+                .find_map(|x| ungrouped(x, grouping, columns, decided))
+        }
+    }
+}
+
 /// A step read before any row: its parts, each expression typed over the columns its FROM reads.
 fn prepare<'q>(
     q: &'q Query,
     columns: &[super::typed::TypedColumn],
+    keyed: &[(String, Vec<String>)],
     release: u8,
     now: i64,
 ) -> Result<Prepared<'q>> {
@@ -5082,8 +5182,29 @@ fn prepare<'q>(
             _ => Err(Error::new("name each column a step returns")),
         })
         .collect::<Result<_>>()?;
+    // ORDER BY sorts by the select list's column an item names by its place or its bare name, or
+    // that it writes as it is; any other is an expression over the FROM's columns, whose values the
+    // step makes beside its own until they are sorted.
+    let mut sorted = Vec::new();
+    let mut hidden: Vec<&Expr> = Vec::new();
+    if let Some(OrderByKind::Expressions(os)) = q.order_by.as_ref().map(|o| &o.kind) {
+        for o in os {
+            sorted.push(match sorted_by(&o.expr, &items)? {
+                Some(at) => at,
+                None if s.distinct.is_some() => {
+                    return Err(Error::new(
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                    ))
+                }
+                None => {
+                    hidden.push(&o.expr);
+                    items.len() + hidden.len() - 1
+                }
+            });
+        }
+    }
     let mut calls = Calls::default();
-    for (e, _) in &items {
+    for e in items.iter().map(|(e, _)| *e).chain(hidden.iter().copied()) {
         sets_placed(e)?;
         find_calls(e, &mut calls);
     }
@@ -5110,6 +5231,32 @@ fn prepare<'q>(
     if grouped && !calls.windows.is_empty() {
         return Err(Error::new("a window over groups is not read"));
     }
+    // Where it groups, a column read outside an aggregate is one it groups by, or one its group by
+    // the table's primary key decides, as PostgreSQL's parser holds it.
+    if grouped {
+        let decided: Vec<&str> = keyed
+            .iter()
+            .filter(|(q, key)| {
+                !key.is_empty()
+                    && key.iter().all(|k| {
+                        grouping.iter().any(|g| {
+                            resolved(g, columns).is_some_and(|(cq, cn, _)| {
+                                cq.as_deref() == Some(q.as_str()) && cn == k
+                            })
+                        })
+                    })
+            })
+            .map(|(q, _)| q.as_str())
+            .collect();
+        for e in items.iter().map(|(e, _)| *e).chain(hidden.iter().copied()) {
+            if let Some((q, n)) = ungrouped(e, &grouping, columns, &decided) {
+                return Err(Error::new(format!(
+                    "column \"{q}.{n}\" must appear in the GROUP BY clause or be used in an \
+                     aggregate function"
+                )));
+            }
+        }
+    }
     let mut typing = super::typed::Typing {
         columns,
         release,
@@ -5125,10 +5272,15 @@ fn prepare<'q>(
     for g in &grouping {
         typing.type_of(g)?;
     }
+    for e in &hidden {
+        typing.type_of(e)?;
+    }
     Ok(Prepared {
         from: &s.from,
         selection: s.selection.as_ref(),
         order_by: q.order_by.as_ref(),
+        sorted,
+        hidden,
         items,
         calls,
         grouping,
@@ -5449,67 +5601,47 @@ impl<'q> StepRun<'q> {
             out.rows = self.once(std::mem::take(&mut out.rows));
         }
         if let Some(ob) = self.p.order_by {
-            sort(&mut out, ob, &self.p.carried, params, release, casings)?;
+            sort(&mut out, ob, &self.p, casings)?;
+            // The ORDER BY's own expressions go once the rows are sorted.
+            for r in &mut out.rows {
+                r.truncate(self.p.items.len());
+            }
         }
         Ok(out)
     }
 }
 
-/// A step's rows sorted as its ORDER BY says, on the step's own columns, each carrying its
-/// collation.
+/// A step's rows sorted as its ORDER BY says, by the values `Prepared::sorted` places: its own
+/// columns, each carrying its collation, and the expressions it makes beside them.
 fn sort(
     out: &mut Relation,
     ob: &sqlparser::ast::OrderBy,
-    carried: &[super::collate::Carried],
-    params: &[String],
-    release: u8,
+    p: &Prepared,
     casings: &Casings,
 ) -> Result<()> {
     let exprs = match &ob.kind {
         OrderByKind::Expressions(e) => e,
         _ => return Err(Error::new("ORDER BY ALL is not read")),
     };
-    let types = super::typed::Types::new();
-    let named = Frame {
-        columns: out.names.iter().map(|n| (None, n.clone())).collect(),
-        params,
-        release,
-        casings,
-        types: &types,
-        now: crate::scalars::transaction_clock(),
-    };
-    // An ordinal names the column at that place.
-    let at = exprs
+    // A string sorted under a library collation is sorted by the collation's key: a column's by
+    // the collation it carries, an expression's by its own.
+    let under = p
+        .sorted
         .iter()
-        .map(|o| ordinal(&o.expr, "ORDER BY", out.names.len()))
-        .collect::<Result<Vec<_>>>()?;
-    // A string sorted under a library collation is sorted by the collation's key.
-    let under = exprs
-        .iter()
-        .zip(&at)
-        .map(|(o, at)| match at.and_then(|c| carried.get(c)) {
+        .map(|&at| match p.carried.get(at) {
             Some(c) => casings.carried(c),
-            None => casings.keyed(&o.expr),
+            None => casings.keyed(p.hidden[at - p.items.len()]),
         })
         .collect::<Result<Vec<_>>>()?;
-    let none = computed_none();
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = std::mem::take(&mut out.rows)
         .into_iter()
         .map(|row| {
-            let k = exprs
+            let k = p
+                .sorted
                 .iter()
                 .enumerate()
-                .map(|(i, o)| {
-                    let v = match at[i] {
-                        Some(c) => row[c].clone(),
-                        None => {
-                            let e = match column_of(&o.expr) {
-                                Some((_, n)) => Expr::Identifier(sqlparser::ast::Ident::new(n)),
-                                None => o.expr.clone(),
-                            };
-                            eval(&e, &row, &named, &none)?
-                        }
-                    };
+                .map(|(i, &at)| {
+                    let v = row[at].clone();
                     match v {
                         Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
                             if !ty.ordered() =>
@@ -5669,8 +5801,8 @@ pub struct Stream<'q> {
 }
 
 impl<'q> Stream<'q> {
-    /// `names` are the table's columns, `types` their types, and `order` the one holding its
-    /// order's key, where the windows can read along it.
+    /// `names` are the table's columns, `types` their types, `order` the one holding its order's
+    /// key, where the windows can read along it, and `primary` its primary key's columns.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         q: &'q Query,
@@ -5678,6 +5810,7 @@ impl<'q> Stream<'q> {
         names: Vec<String>,
         types: Vec<Option<ColumnType>>,
         order: Option<usize>,
+        primary: &[String],
         params: &[String],
         release: u8,
         casings: Casings,
@@ -5739,7 +5872,15 @@ impl<'q> Stream<'q> {
                 SetExpr::Select(sel) => typed_from(&sel.from, &typed, &s.table.name),
                 _ => Vec::new(),
             };
-            let mut p = prepare(query, &columns, release, now)?;
+            // The table read under each name its FROM gives it, with its primary key.
+            let keyed: Vec<(String, Vec<String>)> = match query.body.as_ref() {
+                SetExpr::Select(sel) => base_qualifiers(&sel.from, &typed, &s.table.name)
+                    .into_iter()
+                    .map(|q| (q, primary.to_vec()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let mut p = prepare(query, &columns, &keyed, release, now)?;
             typed.insert(
                 name.clone(),
                 (
@@ -5932,6 +6073,7 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
         table.relation.names.clone(),
         vec![None; table.relation.names.len()],
         table.relation.order,
+        &[],
         params,
         crate::regs::LATEST,
         Casings::default(),
@@ -6707,6 +6849,7 @@ mod tests {
                 t.relation.names.clone(),
                 vec![None; t.relation.names.len()],
                 t.relation.order,
+                &[],
                 &[],
                 crate::regs::LATEST,
                 Casings::default(),

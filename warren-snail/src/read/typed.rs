@@ -342,9 +342,10 @@ impl Typing<'_> {
                 Some(ColumnType::Boolean)
             }
             Expr::InList { expr, list, .. } => {
-                self.type_of(expr)?;
+                let t = self.type_of(expr)?;
                 for x in list {
-                    self.type_of(x)?;
+                    let u = self.type_of(x)?;
+                    statistics_operator("=", t, u)?;
                 }
                 Some(ColumnType::Boolean)
             }
@@ -354,16 +355,44 @@ impl Typing<'_> {
                 escape_char,
                 ..
             } => {
-                self.type_of(expr)?;
-                self.type_of(pattern)?;
+                let (t, u) = (self.type_of(expr)?, self.type_of(pattern)?);
                 if let Some(c) = escape_char {
                     self.type_of(c)?;
                 }
+                statistics_operator("~", t, u)?;
+                Some(ColumnType::Boolean)
+            }
+            // A pattern of LIKE, or of ILIKE, is `~~` or `~~*`.
+            Expr::Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                ..
+            }
+            | Expr::ILike {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                ..
+            } => {
+                let (t, u) = (self.type_of(expr)?, self.type_of(pattern)?);
+                if let Some(c) = escape_char {
+                    self.type_of(c)?;
+                }
+                let op = match (matches!(e, Expr::ILike { .. }), *negated) {
+                    (false, false) => "~~",
+                    (false, true) => "!~~",
+                    (true, false) => "~~*",
+                    (true, true) => "!~~*",
+                };
+                statistics_operator(op, t, u)?;
                 Some(ColumnType::Boolean)
             }
             Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
-                self.type_of(a)?;
-                self.type_of(b)?;
+                let (t, u) = (self.type_of(a)?, self.type_of(b)?);
+                statistics_operator("=", t, u)?;
                 Some(ColumnType::Boolean)
             }
             // Untyped NULL beside ends of more than one type leaves PostgreSQL more than one form.
@@ -398,9 +427,8 @@ impl Typing<'_> {
             }
             Expr::BinaryOp { left, op, right } => {
                 let (a, b) = (self.type_of(left)?, self.type_of(right)?);
-                if matches!(op, BinaryOperator::StringConcat) {
-                    written(a)?;
-                    written(b)?;
+                if let Some(t) = statistics_operator(&op.to_string(), a, b)? {
+                    return Ok(Some(t));
                 }
                 if let Some(t) = range_operator(&op.to_string(), a, b)? {
                     return Ok(Some(t));
@@ -1083,6 +1111,63 @@ pub(super) fn multirange_range(ty: ColumnType) -> Option<ColumnType> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The type a comparison, a pattern or `||` returns beside a value of the planner's statistics
+/// types, as PostgreSQL resolves it: they have no operator of their own, and each casts implicitly
+/// to text, through its output, and to bytea, as its bytes. Beside bytea, bytea's form; beside a
+/// string or an untyped literal, text's for a comparison or a pattern, `||` no unique one; beside
+/// another of them, no unique form; beside any other type, none. Their kin that hold only NULL
+/// cast to neither, and have no comparison. None where neither side is one, or the operator is
+/// none of these.
+pub(super) fn statistics_operator(
+    op: &str,
+    a: Option<ColumnType>,
+    b: Option<ColumnType>,
+) -> Result<Option<ColumnType>> {
+    let statistics = |t: Option<ColumnType>| match t {
+        Some(ColumnType::Internal(i)) if i.is_bytes() => Some(i),
+        _ => None,
+    };
+    let (x, y) = (statistics(a), statistics(b));
+    let Some(s) = x.or(y) else {
+        return Ok(None);
+    };
+    let compare = ["=", "<>", "<", "<=", ">", ">="].contains(&op);
+    let like = ["~~", "!~~"].contains(&op);
+    let pattern = like || ["~~*", "!~~*", "~", "~*", "!~", "!~*"].contains(&op);
+    let concat = op == "||";
+    let refused = |why: &str| {
+        Err(Error::new(format!(
+            "operator {why}: {} {op} {}",
+            arg_name(a),
+            arg_name(b)
+        )))
+    };
+    if !s.casts() {
+        return match compare || pattern {
+            true => refused("does not exist"),
+            false => Ok(None),
+        };
+    }
+    if !compare && !pattern && !concat {
+        return Ok(None);
+    }
+    if x.is_some() && y.is_some() {
+        return refused("is not unique");
+    }
+    match if x.is_some() { b } else { a } {
+        Some(ColumnType::Bytes) if compare || like => Ok(Some(ColumnType::Boolean)),
+        Some(ColumnType::Bytes) if concat => Ok(Some(ColumnType::Bytes)),
+        o if o.is_none_or(|t| t.is_string()) => {
+            if concat {
+                return refused("is not unique");
+            }
+            written(Some(ColumnType::Internal(s)))?;
+            Ok(Some(ColumnType::Boolean))
+        }
+        _ => refused("does not exist"),
     }
 }
 

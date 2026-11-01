@@ -1138,6 +1138,14 @@ fn a_collation_is_derived_as_postgresql_derives_it_and_carried_by_each_column() 
             "could not determine which collation to use for regular expression",
         ),
         (
+            "SELECT id, substring(a from b) AS x FROM q",
+            "could not determine which collation to use for regular expression",
+        ),
+        (
+            "SELECT id, position(b in a)::text AS x FROM q",
+            "could not determine which collation to use for string comparison",
+        ),
+        (
             "SELECT id, (a IN (b, c))::text AS x FROM q",
             "could not determine which collation to use for string comparison",
         ),
@@ -1170,6 +1178,11 @@ fn a_collation_is_derived_as_postgresql_derives_it_and_carried_by_each_column() 
         ("SELECT id, upper(c || a) AS x FROM q ORDER BY id", vec![Some("éé"), Some("XA")]),
         ("SELECT id, (a < b COLLATE \"C\")::text AS x FROM q ORDER BY id", vec![Some("false"), None]),
         ("SELECT id, length(a || b)::text AS x FROM q ORDER BY id", vec![Some("2"), None]),
+        // SQL's SUBSTRING reads its pattern under the default whatever its text's collation; a
+        // pattern alone, under the text's.
+        ("SELECT id, substring(a similar '[[:alpha:]]' escape '#') AS x FROM q ORDER BY id", vec![Some("é"), Some("a")]),
+        ("SELECT id, substring(a from '[[:alpha:]]') AS x FROM q ORDER BY id", vec![None, Some("a")]),
+        ("SELECT id, substring(a similar b escape '#') AS x FROM q ORDER BY id", vec![None, None]),
         (", r AS (SELECT id, a || b AS x FROM q) SELECT id, upper(x || 'z') AS x FROM r ORDER BY id", vec![Some("ÉBZ"), None]),
         (", t1 AS (SELECT id, a AS x FROM q), t2 AS (SELECT id, c AS x FROM q) SELECT t1.id, upper(t1.x) || upper(t2.x) AS x FROM t1, t2 WHERE t1.id = t2.id ORDER BY t1.id", vec![Some("éÉ"), Some("AX")]),
     ] {

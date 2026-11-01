@@ -159,6 +159,15 @@ impl Internal {
         !matches!(self, Internal::NodeTree)
     }
 
+    /// Whether PostgreSQL casts it implicitly to text, through its output, and to bytea, as its
+    /// bytes: the planner's statistics; its kin that hold only NULL cast to neither.
+    pub fn casts(self) -> bool {
+        matches!(
+            self,
+            Internal::Ndistinct | Internal::Dependencies | Internal::McvList
+        )
+    }
+
     /// Whether a table can hold a value of it at all, copied from a column of its type; the others
     /// hold only NULL.
     pub fn copied(self) -> bool {

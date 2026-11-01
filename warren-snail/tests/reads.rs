@@ -571,7 +571,10 @@ fn grouping_on_one_table_is_the_rows_grouped_and_a_count_by_month_reads_no_colum
         .ask("SELECT r.feed, count(*) FROM weather.readings r", None)
         .unwrap_err()
         .to_string();
-    assert!(e.contains("must appear in GROUP BY"), "{e}");
+    assert_eq!(
+        e,
+        "column \"r.feed\" must appear in the GROUP BY clause or be used in an aggregate function"
+    );
 }
 
 /// A join's round: its reads exact, and within its bounds at its top.

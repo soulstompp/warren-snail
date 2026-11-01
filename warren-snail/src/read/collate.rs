@@ -437,7 +437,7 @@ impl Deriving<'_> {
 }
 
 /// The expressions an expression reads, where it is none `Deriving::node` reads by name.
-fn children(e: &Expr) -> Vec<&Expr> {
+pub(super) fn children(e: &Expr) -> Vec<&Expr> {
     match e {
         Expr::Extract { expr, .. }
         | Expr::Ceil { expr, .. }

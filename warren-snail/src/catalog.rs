@@ -257,11 +257,13 @@ impl ColumnType {
     }
 
     /// Whether PostgreSQL decides its comparisons a row at a time, so that only the pipeline reads
-    /// them: a geometric value's, and an array's whose elements' type has no equality, which `=`
-    /// refuses only where the two arrays are of one shape.
+    /// them: a geometric value's, an array's whose elements' type has no equality, which `=`
+    /// refuses only where the two arrays are of one shape, and the planner's statistics' and their
+    /// kin's, which compare as text or bytea by what they meet.
     pub fn compared_by_rows(self) -> bool {
         match self {
             ColumnType::Geometric(_) => true,
+            ColumnType::Internal(t) => t.is_bytes(),
             ColumnType::Composed(r) => {
                 matches!(r.def(), crate::composed::Composed::Array { element, .. } if !element.grouped())
             }
