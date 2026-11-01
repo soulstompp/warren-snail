@@ -1,6 +1,7 @@
 //! `warren-snail <command> …`: writes a snail from its DDL and Parquet rows, runs SQL statements
-//! on it, asks it a question, writes its tables out as Parquet, lists its blocks and its pages, and
-//! holds it open. Everything it records is typed Parquet.
+//! on it, asks it a question, writes its tables out as Parquet, lists its blocks and its pages,
+//! writes it afresh under its collations' versions, reads a DDL as the snail reads it, lists the
+//! functions PostgreSQL defines, and holds it open. Everything it records is typed Parquet.
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{Field, Schema};
@@ -50,12 +51,12 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           feature collations. A flag naming another than the files name is refused. --written
           records each order's columns as Parquet.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
-          COMMIT and ROLLBACK; CREATE TABLE, and CREATE INDEX and ALTER TABLE … CLUSTER ON for a
-          table that holds no rows. Outside a transaction each statement commits. --out records
-          each statement as Parquet: its rows, its generation, and the pages it read, wrote
-          and reused. Each --with opens one more snail with <file>, as one writer of them all: a
-          statement writes the snail that holds its table, and a transaction's COMMIT commits
-          every snail it wrote, one root deciding.
+          COMMIT, ROLLBACK and SET CONSTRAINTS; and the DDL `write` reads, a table's columns and
+          indexes changed only while it holds no rows. Outside a transaction each statement
+          commits. --out records each statement as Parquet: its rows, its generation, and the
+          pages it read, wrote and reused. Each --with opens one more snail with <file>, as one
+          writer of them all: a statement writes the snail that holds its table, and a
+          transaction's COMMIT commits every snail it wrote, one root deciding.
           A snail PostgreSQL writes through its WAL is written only through PostgreSQL, its host:
           --host names the command that carries each commit to it, psql for one, read a
           statement at a time; the statements run as one transaction of the host's, under the
@@ -86,7 +87,7 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           statement as Parquet, and --out each fact of the catalog: a row each, its kind, its
           object, the fact and its value.
   functions every function PostgreSQL defines, 19 unless --release names another release: a type's
-          the snail answers, a type's it does not answer yet, or the server's own, which it refuses
+          the snail answers, a type's it does not answer, or the server's own, which it refuses
           by name. Prints how many of each; --out records each as Parquet: its signature, class,
           family and whether the snail answers it.
   hold    the snail held open for the seconds given, as a round that long would hold it.

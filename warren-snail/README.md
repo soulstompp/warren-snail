@@ -1,7 +1,7 @@
 # warren-snail
 
 warren-snail keeps a database in one file and reads it a column at a time. You declare its tables
-with PostgreSQL's own DDL, and you ask it in PostgreSQL's SQL.
+with PostgreSQL's own DDL, of PostgreSQL's own types, and you ask it in PostgreSQL's SQL.
 
 Each table lies in one order: the index it is clustered on, or its primary key. Each of its other
 indexes is an order of its own, holding the columns the index names. Every order is cut into
@@ -9,7 +9,8 @@ blocks, and every block keeps counts of its rows on each place of its key. Befor
 page of a column, it adds those counts up. It skips a block that holds none of the rows a question
 asks for, answers a count from the counts alone, and of every other block reads only the pages
 that hold the question's rows. It says which pages those are before it reads them, then reads
-exactly those, and prints both.
+exactly those, and prints both. A question may join any number of tables: each is read so, the one
+its own conditions narrow first, and every other kept to the keys the tables before it hold.
 
 The answer comes back as Arrow record batches, or as a Parquet file from the command. The snail's
 pages are Parquet's own data pages, so a table goes out to a Parquet file, and comes back in, page
@@ -30,6 +31,15 @@ cargo install --locked warren-snail
 It needs Rust 1.88 or later. It installs one command, `warren-snail`, in `~/.cargo/bin`, and
 nothing else; `cargo uninstall warren-snail` takes it out again. The library is the same crate:
 `cargo add warren-snail`.
+
+Two features, off unless named, call a library of the machine's as PostgreSQL calls it:
+`collations`, for text under ICU's collations and the C library's locales, linking the machine's
+ICU, which pkg-config finds; and `zones`, for named time zones other than UTC, read from compiled
+zone files. Built without them, such a column or such a zone is refused by name.
+
+```sh
+cargo install --locked warren-snail --features collations,zones
+```
 
 A snail is the file you name; past 1 GiB, Parquet's size for one file of huge data, it goes on
 into `<file>.1`, `<file>.2` and on beside it. The snail is those files and nothing else: deleting
@@ -76,14 +86,16 @@ shop.orders orders_customer: 0 rows, 0 blocks, its directory 1 page in 1 level, 
     order_id       k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
     customer_id    k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
     placed_at      k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
-    total          k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
+    total.value    k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
+    total.nan      k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
 shop.orders orders_pkey: 0 rows, 0 blocks, its directory 1 page in 1 level, its page maps 0 pages
     order_id       k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
     customer_id    k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
     placed_at      k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
 shop.orders orders_month: 0 rows, 0 blocks, its directory 1 page in 1 level, its page maps 0 pages
     placed_at      k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
-    total          k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
+    total.value    k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
+    total.nan      k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
     customer_id    k  1       0 data pages       0 disk pages  dictionary in 0 blocks  moved 0 of 0 blocks
 ```
 
@@ -91,8 +103,10 @@ The table's order holds every column. The primary key's order holds `order_id`, 
 order's key; `orders_month` holds `placed_at`, the `total` it includes, and the rest of the table's
 order's key. Each order ends in that key, which places a row in the table's order.
 
-Each column's line counts its data pages, Parquet's own, and the disk pages they take. A disk page
-is the file's page, 4 KiB, and every count of pages from here on is of disk pages.
+`total` lies as two columns: `total.value`, its decimal, and `total.nan`, whether it is NaN, which
+PostgreSQL's `numeric(p, s)` may hold. Each column's line counts its data pages, Parquet's own, and
+the disk pages they take. A disk page is the file's page, 4 KiB, and every count of pages from here
+on is of disk pages.
 
 Put five orders in, from `orders.sql`:
 
@@ -110,7 +124,7 @@ warren-snail exec shop.snail orders.sql --out done.parquet
 ```
 
 ```text
-1 statement, 18 pages written, generation 2
+1 statement, 20 pages written, generation 2
 ```
 
 The statement wrote each of the three orders' new pages, and then the root, which names them. Each
@@ -128,31 +142,31 @@ warren-snail read shop.snail customer.sql --out answer.parquet
 
 ```text
 customer.sql, round 1: 2 rows, along orders_customer
-    pages: 3 as it began, 2 of the directory (0 held), 4 of columns predicted, 0 of them held and 4 read
-    from the file: 9 pages, 36864 bytes as the system counts them; 0 pages found held
+    pages: 3 as it began, 2 of the directory (0 held), 5 of columns predicted, 0 of them held and 5 read
+    from the file: 10 pages, 40960 bytes as the system counts them; 0 pages found held
     the directory's entries: 1 looked at, 0 holding none of its rows, 1 some, 0 all; 1 block read
-    orders_customer: 2 pages of its directory; 4 to 4 column pages by its directory, 4 predicted, 0 of them held
+    orders_customer: 2 pages of its directory; 5 to 5 column pages by its directory, 5 predicted, 0 of them held
 ```
 
-`answer.parquet` holds the two rows:
+`answer.parquet` holds the two rows, `total` as the same two parts:
 
-| order_id | placed_at | total |
-|---|---|---|
-| 1 | 2026-01-05 10:00:00+00 | 12.50 |
-| 3 | 2026-02-01 09:30:00+00 | 8.00 |
+| order_id | placed_at | total.value | total.nan |
+|---|---|---|---|
+| 1 | 2026-01-05 10:00:00+00 | 12.50 | false |
+| 3 | 2026-02-01 09:30:00+00 | 8.00 | false |
 
 The round read along `orders_customer`, the one order that holds every column the question reads.
 As it began, it read the root's two copies and the catalog: 3 pages. It read 2 pages of the
-order's directory, and from them it predicted that the question's rows lie in 4 column pages,
-before it read any. It read those 4. That is 9 pages from the file, and the system's own count of
-the bytes the program read agrees: 36,864 bytes.
+order's directory, and from them it predicted that the question's rows lie in 5 column pages,
+before it read any. It read those 5. That is 10 pages from the file, and the system's own count of
+the bytes the program read agrees: 40,960 bytes.
 
 ## The table's order, and its indexes
 
 The DDL says how each table lies. `ALTER TABLE … CLUSTER ON` names the index that is the table's
-order; a table with none lies in its primary key. Each of its other B-tree indexes is an order of
-its own, holding its key's columns and those it includes, then the table's order's key. A primary
-key that is not the table's order is one too, and keeps its key unique.
+order; a table with none lies in its primary key. Each of its other indexes is an order of its own,
+holding its key's columns and those it includes, then the table's order's key. A primary key that
+is not the table's order is one too, and keeps its key unique.
 
 A key column's NULLs lie on a run of their own after its values, as PostgreSQL's B-tree holds
 them, or before them under `NULLS FIRST`, and the run is cut on the key's columns after it. So an
@@ -168,12 +182,16 @@ an order it does not read along.
 **How it shows.** The first line of a round names the order it read along. `--order <name>` reads
 along another, where that one holds the question's columns.
 
-**Where it stops.** An index is held only as a B-tree, on columns or on the month of an instant on
-UTC's clock. A question that reads a column no order holds in the question's own order still reads
-along the table's order. Cluster each table on the index most of its questions lead with: a key
-handed out as rows arrive, such as a sequence or `uuidv7()`, lays the table out in the order the
-rows came, which few questions ask for, and `gen_random_uuid()` scatters the rows across the
-blocks.
+**Where it stops.** A B-tree is an order on its key: columns, an instant on UTC's clock, or that
+instant's month. A hash index is an order on its key as a B-tree on it would be. A GiST or an
+SP-GiST index on a range, a multirange, an `inet` or text is an order on the type's own order, each
+block keeping the span of the values it holds. A GIN or a BRIN index, and a GiST or an SP-GiST on
+any other type, is refused by name. A partial index, its `WHERE` comparing its columns with values,
+holds only the rows it names, and serves a question whose conditions imply its own. A question that
+reads a column no order holds in the question's own order still reads along the table's order.
+Cluster each table on the index most of its questions lead with: a key handed out as rows arrive,
+such as a sequence or `uuidv7()`, lays the table out in the order the rows came, which few
+questions ask for, and `gen_random_uuid()` scatters the rows across the blocks.
 
 ## Blocks, and the counts they keep
 
@@ -238,11 +256,11 @@ WHERE extract(month FROM shop.clock(o.placed_at))::smallint = 2
 
 ```text
 february.sql, round 1: 2 rows, along orders_customer
-    pages: 3 as it began, 4 of the directory (0 held), 2 of columns predicted, 0 of them held and 2 read
-    from the file: 9 pages, 36864 bytes as the system counts them; 0 pages found held
+    pages: 3 as it began, 4 of the directory (0 held), 3 of columns predicted, 0 of them held and 3 read
+    from the file: 10 pages, 40960 bytes as the system counts them; 0 pages found held
     the directory's entries: 1 looked at, 0 holding none of its rows, 1 some, 0 all; 1 block read
-    orders_customer: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 0 of them held
-    orders_month: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 0 of them held
+    orders_customer: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 0 of them held
+    orders_month: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 0 of them held
 ```
 
 ```sh
@@ -251,13 +269,13 @@ warren-snail read shop.snail february.sql --out february.parquet --order orders_
 
 ```text
 february.sql, round 1: 2 rows, along orders_month
-    pages: 3 as it began, 2 of the directory (0 held), 2 of columns predicted, 0 of them held and 2 read
-    from the file: 7 pages, 28672 bytes as the system counts them; 0 pages found held
+    pages: 3 as it began, 2 of the directory (0 held), 3 of columns predicted, 0 of them held and 3 read
+    from the file: 8 pages, 32768 bytes as the system counts them; 0 pages found held
     the directory's entries: 1 looked at, 0 holding none of its rows, 1 some, 0 all; 1 block read
-    orders_month: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 0 of them held
+    orders_month: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 0 of them held
 ```
 
-On five rows both orders come to 2 column pages. Where two tie, the fewer pages touched decide,
+On five rows both orders come to 3 column pages. Where two tie, the fewer pages touched decide,
 then the fewer pages of the directory, then the order named first.
 
 **Where it stops.** No statistics, no estimate: an order's price is its own pages, read from its
@@ -281,17 +299,17 @@ warren-snail read shop.snail february.sql --out february.parquet --rounds 2
 
 ```text
 february.sql, round 1: 2 rows, along orders_customer
-    pages: 3 as it began, 4 of the directory (0 held), 2 of columns predicted, 0 of them held and 2 read
-    from the file: 9 pages, 36864 bytes as the system counts them; 0 pages found held
+    pages: 3 as it began, 4 of the directory (0 held), 3 of columns predicted, 0 of them held and 3 read
+    from the file: 10 pages, 40960 bytes as the system counts them; 0 pages found held
     the directory's entries: 1 looked at, 0 holding none of its rows, 1 some, 0 all; 1 block read
-    orders_customer: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 0 of them held
-    orders_month: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 0 of them held
+    orders_customer: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 0 of them held
+    orders_month: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 0 of them held
 february.sql, round 2: 2 rows, along orders_customer
-    pages: 2 as it began, 4 of the directory (4 held), 2 of columns predicted, 2 of them held and 0 read
-    from the file: 2 pages, 8192 bytes as the system counts them; 6 pages found held
+    pages: 2 as it began, 4 of the directory (4 held), 3 of columns predicted, 3 of them held and 0 read
+    from the file: 2 pages, 8192 bytes as the system counts them; 7 pages found held
     the directory's entries: 1 looked at, 0 holding none of its rows, 1 some, 0 all; 1 block read
-    orders_customer: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 2 of them held
-    orders_month: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 0 of them held
+    orders_customer: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 3 of them held
+    orders_month: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 0 of them held
 ```
 
 The second round read the root's two copies from the file, and found the rest held.
@@ -304,10 +322,10 @@ pages of its own.
 
 `exec` runs each statement of a file in turn, as written: `INSERT`, from values or from a question,
 each column it leaves out or gives `DEFAULT` taking its `DEFAULT`; `UPDATE`, to values or to
-`DEFAULT`; `DELETE`; `BEGIN`, `COMMIT` and `ROLLBACK`; and the DDL below: `CREATE TABLE`, with
-`CREATE INDEX` and `ALTER TABLE … CLUSTER ON` for a table that holds no rows, `ALTER TABLE … ADD
-CHECK` and `ADD FOREIGN KEY`, each checked against the rows held unless `NOT VALID`, and `VALIDATE
-CONSTRAINT`; and `SET CONSTRAINTS`. Outside a transaction each statement commits on its own.
+`DEFAULT`; `DELETE`; `BEGIN`, `COMMIT` and `ROLLBACK`; `SET CONSTRAINTS`; and the DDL the snail
+reads (*The DDL it reads*), a table's columns and its indexes changed only while it holds no rows,
+and `ALTER TABLE … ADD CHECK` and `ADD FOREIGN KEY` each checked against the rows held unless `NOT
+VALID`. Outside a transaction each statement commits on its own.
 
 **What a row is given.** An identity's or a serial's value, or a `DEFAULT nextval(…)`, is its
 sequence's next, drawn at the root's turn for the whole statement and never given back, as
@@ -315,17 +333,17 @@ PostgreSQL's `nextval` is not: a statement rolled back leaves its values unused.
 sequence's `CACHE` values at a time. `now()`, `CURRENT_TIMESTAMP` and `transaction_timestamp()`
 read the transaction's clock, `statement_timestamp()` the statement's. `gen_random_uuid()` and
 `uuidv4()` hand out a version 4 uuid, `uuidv7()` a version 7, and the version 7 uuids one writer
-hands out rise. A `STORED` generated column
-is computed at the write; a `VIRTUAL` one, PostgreSQL 18's default, at the read, and no order holds
-it. Each `CHECK` is checked at the write, passing where it is NULL, and `NOT ENFORCED` checks
-nothing; each `UNIQUE` at the statement's end. Each `FOREIGN KEY` is checked where PostgreSQL checks
-it: at the statement's end, or at the commit where it is deferred, by its DDL or by `SET
-CONSTRAINTS`, on the rows the round wrote and the keys it took from a parent. A reference holding a
-NULL references nothing under `MATCH SIMPLE`, and under `MATCH FULL` holds only NULLs. Under
-`PERIOD`, a child's period lies within its parent's periods together, and a parent's period taken
-leaves each child's period within it so held. A row written locks the parent's block that holds its
-key, and a key taken the child's blocks that hold a row referencing it. `CASCADE`, `SET NULL` and `SET DEFAULT` are written by the statement that takes the
-key, deferred or not, as `RESTRICT` is checked by it; `NOT ENFORCED` checks and does nothing. A
+hands out rise. A `STORED` generated column is computed at the write; a `VIRTUAL` one, PostgreSQL
+18's default, at the read, and no order holds it. Each `CHECK` is checked at the write, passing
+where it is NULL, and `NOT ENFORCED` checks nothing; each `UNIQUE` and `EXCLUDE` at the statement's
+end. Each `FOREIGN KEY` is checked where PostgreSQL checks it: at the statement's end, or at the
+commit where it is deferred, by its DDL or by `SET CONSTRAINTS`, on the rows the round wrote and
+the keys it took from a parent. A reference holding a NULL references nothing under `MATCH SIMPLE`,
+and under `MATCH FULL` holds only NULLs. Under `PERIOD`, a child's period lies within its parent's
+periods together, and a parent's period taken leaves each child's period within it so held. A row
+written locks the parent's block that holds its key, and a key taken the child's blocks that hold a
+row referencing it. `CASCADE`, `SET NULL` and `SET DEFAULT` are written by the statement that takes
+the key, deferred or not, as `RESTRICT` is checked by it; `NOT ENFORCED` checks and does nothing. A
 commit whose deferred key finds an orphan rolls the transaction back. An `INSERT … SELECT` takes
 each value by PostgreSQL's assignment casts: an integer or numeric rounded and held to its
 column's range, any value as its text into a text column, a value into a column of its own type;
@@ -355,7 +373,7 @@ COMMIT;
 ```
 
 ```text
-6 statements, 50 pages written, generation 6
+6 statements, 56 pages written, generation 6
 ```
 
 Each customer's orders afterwards:
@@ -388,7 +406,7 @@ warren-snail census shop.snail
 ```
 
 ```text
-generation 6: 26 pages named, 0 free, 15 waiting to be freed
+generation 6: 30 pages named, 0 free, 17 waiting to be freed
 ```
 
 ## Parquet, out and back in
@@ -402,7 +420,7 @@ warren-snail out shop.snail --dir parquet
 ```
 
 ```text
-shop.orders: 5 rows in 1 row group in 1 file, 4 pages copied, 1 block pruned on the way: parquet/shop.orders.parquet
+shop.orders: 5 rows in 1 row group in 1 file, 5 pages copied, 1 block pruned on the way: parquet/shop.orders.parquet
 ```
 
 **The read it cancels.** A file's row groups already cut as the snail cuts them come back in by
@@ -418,14 +436,16 @@ shop.orders orders_customer: 5 rows, 1 block, its directory 1 page in 1 level, i
     order_id       k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 1 of 1 blocks
     customer_id    k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 1 of 1 blocks
     placed_at      k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 1 of 1 blocks
-    total          k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 1 of 1 blocks
+    total.value    k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 1 of 1 blocks
+    total.nan      k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 1 of 1 blocks
 shop.orders orders_pkey: 5 rows, 1 block, its directory 1 page in 1 level, its page maps 1 page
     order_id       k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
     customer_id    k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
     placed_at      k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
 shop.orders orders_month: 5 rows, 1 block, its directory 1 page in 1 level, its page maps 1 page
     placed_at      k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
-    total          k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
+    total.value    k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
+    total.nan      k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
     customer_id    k  1       1 data pages       1 disk pages  dictionary in 0 blocks  moved 0 of 1 blocks
 ```
 
@@ -439,7 +459,94 @@ place of the order's key in any block, within the Parquet library's caps.
 **Where it stops.** Pages stay uncompressed, and a column takes a dictionary only where that takes
 fewer pages than its plain values. A row group that is not one of the snail's blocks, a page
 compressed or larger than its column's `k`, or a column on a dictionary where the counts would take
-none, or the other way about, or whose dictionary ran out partway, is encoded afresh.
+none, or the other way about, or whose dictionary ran out partway, is encoded afresh. A file `out`
+wrote names the release of PostgreSQL its OIDs came from and the locale its money was written
+under, and `write` takes them from it.
+
+## Questions over several tables
+
+**What it reads.** A question may join any number of tables: by `JOIN` on their columns compared,
+by commas or `CROSS JOIN` met in `WHERE`, by `LEFT JOIN`, and by `RIGHT` or `FULL JOIN` as its first
+join. Each table is read along an order of its own, as a question on it alone is: the table its own
+conditions narrow first, then each other kept to the keys the tables read before it hold. The
+copy's customers, from `customers.sql`:
+
+```sql
+CREATE TABLE shop.customers (
+    customer_id integer NOT NULL,
+    name text NOT NULL,
+    PRIMARY KEY (customer_id)
+);
+INSERT INTO shop.customers (customer_id, name) VALUES (3, 'Ana'), (7, 'Bo'), (9, 'Cy');
+```
+
+```sh
+warren-snail exec copy.snail customers.sql --out customers.parquet
+```
+
+```text
+2 statements, 10 pages written, generation 3
+```
+
+Bo's orders, from `bo.sql`:
+
+```sql
+SELECT c.name, o.order_id, o.total FROM shop.customers c
+JOIN shop.orders o ON o.customer_id = c.customer_id
+WHERE c.name = 'Bo'
+```
+
+```sh
+warren-snail read copy.snail bo.sql --out bo.parquet
+```
+
+```text
+bo.sql, round 1: 3 rows, along customers_pkey+orders_customer
+    pages: 3 as it began, 4 of the directory (0 held), 6 of columns predicted, 0 of them held and 6 read
+    from the file: 13 pages, 53248 bytes as the system counts them; 0 pages found held
+    the directory's entries: 2 looked at, 0 holding none of its rows, 2 some, 0 all; 2 blocks read
+    customers_pkey: 2 pages of its directory; 2 to 2 column pages by its directory, 2 predicted, 0 of them held
+    orders_customer: 2 pages of its directory; 4 to 4 column pages by its directory, 4 predicted, 0 of them held
+```
+
+| name | order_id | total.value | total.nan |
+|---|---|---|---|
+| Bo | 1 | 12.50 | false |
+| Bo | 3 | 9.50 | false |
+| Bo | 6 | 21.00 | false |
+
+The round read the customers first, since its condition narrows them, then the orders along
+`orders_customer`, kept to Bo's `customer_id`.
+
+**The read it cancels.** Every block of a table the keys of the tables read before it rule out, as
+a condition on the table would rule it out.
+
+**How it shows.** The first line of the round names the orders it read along, joined by `+`, in the
+order it read them; below, a line for each order it priced.
+
+**Where it stops.** Two tables are met on their columns, by `=`, `<>`, `<`, `<=`, `>` or `>=`
+where PostgreSQL compares their types so, a `FULL JOIN` by one equality at least. `USING`,
+`NATURAL`, a subquery and a set operation are refused. The rows each table gives the answer are held
+while the round meets them. A table met more than once is read once for each, the second from the
+pages the first left held.
+
+## Several snails, one round
+
+**What it reads.** `--with <file>`, given as often as you like, opens one more snail beside the
+first. A round reads every snail at one moment, and a question over tables of several snails reads
+each table from its own, as one snail's tables are read.
+
+**The read it cancels.** A copy of the tables into one file: each stays in its own.
+
+**How it shows.** A line for each snail under the round: the pages of its root it read as the round
+began, the order it read along, and its column pages predicted, held and read. `read --round`
+records them as `snails`.
+
+**Where it stops.** The snails hold no two tables of one name, as one database holds none.
+`--order` is refused beside `--with`. In `exec`, each statement writes the snail that holds its
+table, an `INSERT … SELECT` reading that snail alone, and no DDL is run. A transaction that writes
+several snails commits them together, each of format 9, the first it wrote deciding: read together,
+they stand all as they were before the commit, or all as it left them.
 
 ## Files past 1 GiB
 
@@ -501,18 +608,20 @@ transaction decides alone.
 **How it shows.** `Snail::open_judged` reads a snail as a judge decides its tagged roots; a round
 with no judge reads the root before a tagged one, whole, and `census` reads that one. Where the root
 taken holds a commit of a transaction the judge's round does not see, `Judge::sees`, the generation
-that round sees is no longer in the file, and `Snail::unseen` names it. `carry::newest` is the newest
-generation the file holds whole, taken or not.
+that round sees is no longer in the file, and `Snail::unseen` names it. `carry::newest` is the
+newest generation the file holds whole, taken or not.
 
 **Where it stops.** A snail its host writes is written only through it: a writer with no judge is
 refused by name. A host's recovery reads its log of commits again with `carry::replay`, which lands
 a commit on its parent, over a root of the same generation the host never took, and leaves one the
 file holds already or is past.
 
-## A question read as it goes: WITH and windows
+## A question read as it goes: the pipeline
 
 **What it reads.** A question with a `WITH`, or a window, is read as a pipeline over one table,
-along its table's order, folded as the blocks come.
+along its table's order, folded as the blocks come; so is a question on one table that calls a
+function, an operator or a pattern the question path does not read, or an aggregate `DISTINCT`,
+ordered or filtered.
 
 **The read it cancels.** The table held whole, and a sort for the window. The table's order is the
 window's order already, and each step holds only its running folds, its groups or the rows it
@@ -552,10 +661,10 @@ FROM shop.payments p
 
 ```text
 balance.sql, round 1: 5 rows, along payments_pkey
-    pages: 3 as it began, 2 of the directory (0 held), 3 of columns predicted, 0 of them held and 3 read
-    from the file: 8 pages, 32768 bytes as the system counts them; 0 pages found held
+    pages: 3 as it began, 2 of the directory (0 held), 4 of columns predicted, 0 of them held and 4 read
+    from the file: 9 pages, 36864 bytes as the system counts them; 0 pages found held
     the directory's entries: 1 looked at, 0 holding none of its rows, 0 some, 1 all; 1 block read
-    payments_pkey: 2 pages of its directory; 3 to 3 column pages by its directory, 3 predicted, 0 of them held
+    payments_pkey: 2 pages of its directory; 4 to 4 column pages by its directory, 4 predicted, 0 of them held
 ```
 
 | seq | customer_id | paid_so_far |
@@ -566,23 +675,27 @@ balance.sql, round 1: 5 rows, along payments_pkey
 | 4 | 3 | 54.90 |
 | 5 | 9 | 48.00 |
 
-**Where it stops.** A window is read only along the table's order, ascending, where that order is
-one unique column. Its frame runs from the partition's first row to the current one. `--param`
-gives `$1`, `$2` and on to a pipeline, as text.
+**Where it stops.** A pipeline reads one table, and the steps before it, joined by `CROSS JOIN`. A
+window is read only along the table's order, ascending, where that order is one unique column, and
+its frame runs from the partition's first row to the current one, or to its last. `--param` gives
+`$1`, `$2` and on to a pipeline, as text. `warren-snail functions` counts the functions PostgreSQL
+defines: those the snail answers, those it does not read, and the server's own, which it refuses by
+name; `--out` lists each.
 
 ## Checking an answer against PostgreSQL
 
 The DDL is PostgreSQL's, and so is every question, so the same files run on
 [PostgreSQL](https://www.postgresql.org/): load the DDL into a database with the schema it names,
 put the same rows in, and ask the same question. PostgreSQL's rows are the answer the snail's are
-checked against. Text is compared by its bytes, as PostgreSQL compares it under the `C` collation,
-so check against a database whose collation is `C`, or `C.UTF-8`. A column that declares any
-collation but `C` or `POSIX` is refused.
+checked against. Text that names no collation is compared by its bytes, as PostgreSQL compares it
+under the `C` collation, so check against a database whose collation is `C`, or `C.UTF-8`. A
+column's own collation orders it as PostgreSQL orders it: one that orders by bytes in any build,
+and with the feature `collations` one of ICU's or the C library's.
 
 [warren-snail-pg](https://github.com/soulstompp/warren-surveyor/tree/HEAD/warren-snail-pg) mounts
-a snail in PostgreSQL as a schema of foreign tables, read only, so the snail's answers and
-PostgreSQL's are asked in one database. Each scan of one of its tables is a round of the snail's
-own, and `EXPLAIN` prints it.
+a snail in PostgreSQL as a schema of foreign tables, so the snail's answers and PostgreSQL's are
+asked in one database. Each scan of one of its tables is a round of the snail's own, and `EXPLAIN`
+prints it.
 
 The composed statement [sql-composer](https://github.com/soulstompp/sql-composer) writes is plain
 SQL in PostgreSQL's syntax, and the snail reads it as it reads any other question.
@@ -594,19 +707,29 @@ SQL in PostgreSQL's syntax, and the snail reads it as it reads any other questio
 `warren-snail --help` prints each command and its flags.
 
 - `write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
-  [--release <14..19>] [--written <written.parquet>]`: a new snail, where no file is yet. A table
-  given no rows is written empty. `--release` names the PostgreSQL release the rows' OIDs came
-  from, 19 unless given. `--written` records each order's columns as Parquet.
-- `exec <file> <statements.sql> --out <done.parquet>`: each statement in turn.
+  [--release <14..19>] [--lc-monetary <locale>] [--written <written.parquet>]`: a new snail, where
+  no file is yet. A table given no rows is written empty. The release of PostgreSQL the rows' OIDs
+  came from, and the locale their money was written under, are those the files name; where they
+  name none, `--release` and `--lc-monetary` give them, 19 and `C` unless given. `--written`
+  records each order's columns as Parquet.
+- `exec <file> <statements.sql> --out <done.parquet> [--with <file>]... [--host <command>
+  --host-server <name>]`: each statement in turn. `--host` writes a snail PostgreSQL writes through
+  its WAL, as one transaction of the server's (warren-snail-pg's *Writing through PostgreSQL*).
 - `read <file> <question.sql> --out <answer.parquet> [--order <name>] [--param <value>]...
-  [--rounds <n>] [--hold <MiB>] [--round <round.parquet>]`: the answer as Parquet, and each round.
+  [--rounds <n>] [--hold <MiB>] [--round <round.parquet>] [--text] [--with <file>]...`: the answer
+  as Parquet, and each round. `--text` writes each value of a time type, a scalar's and an
+  interval's, as PostgreSQL's output writes it.
 - `out <file> --dir <directory>`: each table as Parquet.
 - `blocks <file> --out <blocks.parquet>`: each column of each block, as the directory holds it.
 - `census <file>`: every page of the file, named by the newest root, free, or waiting.
-- `hold <file> --seconds <n>`: the snail held open, as a round that long holds it.
+- `recut <file> --to <new file>`: the snail written afresh, every order cut under the versions of
+  the collations this build reads.
 - `catalog (<file> | --ddl <ddl.sql> [--taken <taken.sql>] [--statements <statements.parquet>])
   [--out <catalog.parquet>]`: what the snail reads of a DDL, a statement at a time, each taken or
   refused by name, and the catalog's facts as Parquet.
+- `functions [--release <14..19>] [--out <functions.parquet>]`: every function PostgreSQL defines,
+  and whether the snail answers it.
+- `hold <file> --seconds <n>`: the snail held open, as a round that long holds it.
 
 Each command exits 0, or prints why it refused and exits 1.
 
@@ -615,75 +738,87 @@ Each command exits 0, or prints why it refused and exits 1.
 - `CREATE TABLE`, its columns `NOT NULL` or not, each with a `DEFAULT`, `GENERATED ALWAYS AS (…)
   STORED` or `VIRTUAL`, `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY (…)`, or of a serial type;
   a `PRIMARY KEY`; `UNIQUE`, `NULLS [NOT] DISTINCT`, `DEFERRABLE` and `INCLUDE`; `CHECK`, `NOT
-  ENFORCED`; `REFERENCES` and `FOREIGN KEY`, a primary key, a `UNIQUE` or a unique index of a
-  table of the file referenced, `MATCH SIMPLE` or `FULL`, `ON DELETE` and `ON UPDATE` each `NO
-  ACTION`, `RESTRICT`, `CASCADE`, `SET NULL` or `SET DEFAULT`, with the columns it sets, `DEFERRABLE`,
-  `INITIALLY DEFERRED`, `NOT ENFORCED`, and in `ALTER TABLE … ADD`, `NOT VALID`; `PERIOD` before
-  the last column on both sides, under `NO ACTION`, referencing a key `WITHOUT OVERLAPS` or an
-  `EXCLUDE` whose last column it is. A `PRIMARY KEY` or `UNIQUE` whose last column, a range or a
-  multirange, is `WITHOUT OVERLAPS` is an `EXCLUDE USING gist`, `=` on its other columns and `&&` on
-  that one, an empty period refused; a primary key so written with no `CLUSTER ON` is the table's
-  order. Unnamed keys, checks, foreign keys and sequences are named as PostgreSQL names them. `write` checks each foreign key over the rows it is given, and says where its columns
-  lead no order, so that a key taken from its parent reads the child whole.
+  ENFORCED`; `EXCLUDE`; `REFERENCES` and `FOREIGN KEY`, a primary key, a `UNIQUE` or a unique index
+  of a table of the file referenced, `MATCH SIMPLE` or `FULL`, `ON DELETE` and `ON UPDATE` each `NO
+  ACTION`, `RESTRICT`, `CASCADE`, `SET NULL` or `SET DEFAULT`, with the columns it sets,
+  `DEFERRABLE`, `INITIALLY DEFERRED`, `NOT ENFORCED`, and in `ALTER TABLE … ADD`, `NOT VALID`;
+  `PERIOD` before the last column on both sides, under `NO ACTION`, referencing a key `WITHOUT
+  OVERLAPS` or an `EXCLUDE` whose last column it is. A `PRIMARY KEY` or `UNIQUE` whose last column,
+  a range or a multirange, is `WITHOUT OVERLAPS` is an `EXCLUDE USING gist`, `=` on its other
+  columns and `&&` on that one, an empty period refused; a primary key so written with no `CLUSTER
+  ON` is the table's order. Unnamed keys, checks, foreign keys and sequences are named as
+  PostgreSQL names them. `write` checks each foreign key over the rows it is given, and says where
+  its columns lead no order, so that a key taken from its parent reads the child whole. A table
+  needs a primary key or a `CLUSTER ON`; a temporary or an unlogged table, a partitioned one and
+  one that inherits are refused.
 - `CREATE SEQUENCE` and `ALTER SEQUENCE`, their options as PostgreSQL reads them, a sequence's
   state kept in the file; `CREATE TYPE … AS ENUM`, a composite, `AS RANGE`, with `ALTER TYPE … ADD
-  VALUE` and `RENAME VALUE`; `CREATE DOMAIN` and `ALTER DOMAIN`; `CREATE COLLATION` of byte order.
-  The types and domains are kept; a column of one is not held yet.
-- Column types: `smallint`, `integer`, `bigint`; `numeric(p, s)` up to 18 digits, held as a
-  64-bit integer of its smallest unit; `text` and `varchar(n)`, compared by their bytes; `bytea`;
-  `timestamptz`, as microseconds on UTC's clock, its infinities among them; `boolean`, false
-  before true, written in any of PostgreSQL's spellings of it; `uuid`, its 16 bytes compared byte
-  by byte, written in any of PostgreSQL's spellings of it; `real` and `double precision`, each
-  value kept as its own bits, `-0` equal to `0` and every NaN equal and above `Infinity`, written
-  as PostgreSQL writes them, and a `real` compared with a number written out as a `double
-  precision`; `oid`, `xid8` and `pg_lsn`, unsigned; `xid`, compared only by `=` and `<>`, and
-  `cid`, only by `=`, neither keying an index; `"char"`, its byte unsigned; `money`, its cents,
-  under the C locale, which the file records for each money column; `macaddr` and `macaddr8`,
-  compared byte by byte; `oid8`, unsigned in 64 bits; the reg* types, `regclass`, `regtype`,
-  `regproc`, `regprocedure`, `regoper`, `regoperator`, `regnamespace`, `regrole`,
-  `regcollation`, `regconfig`, `regdictionary` and, from PostgreSQL 19, `regdatabase`, each an oid
-  compared as one, written and read as the name of a built-in object of the release the file's
-  OIDs came from, which the snail carries for 14 to 19, and any other OID, every role's among
-  them, bare; and `tid`, compared by its block number, then its offset, held as a group of two
-  leaves, its block number and its offset, and so put out as a Parquet group of the two. Each is
-  read and written in PostgreSQL's own spellings, assigned from another type as PostgreSQL's casts
-  take it.
-- `CREATE INDEX`, a B-tree, its key on columns, on an instant's month,
-  `(extract(month FROM <clock>(<column>))::smallint)`, and on the instant itself,
-  `(<clock>(<column>))`, where `<clock>` is a function the DDL declares whose body is
-  `$1 AT TIME ZONE 'UTC'`, as `shop.clock` above; `INCLUDE`; `UNIQUE`, which takes any number of
-  NULLs unless it says `NULLS NOT DISTINCT`; `USING btree` spelled out; each key's operator class,
-  its type's default or, on text, one comparing its bytes; `WITH (fillfactor = …)` and
-  `deduplicate_items`, read and doing nothing; a key column's `NULLS FIRST` or `NULLS LAST`; and
-  `DESC`, its values held rising all the same, giving the side its NULLs take, which `catalog`
-  names.
-- `ALTER TABLE … CLUSTER ON <index>`. The index a table is clustered on may include columns; the
-  table's order holds every column already.
+  VALUE` and `RENAME VALUE`; `CREATE DOMAIN` and `ALTER DOMAIN`; `CREATE COLLATION`, of byte order,
+  and with the feature `collations` of ICU or of the C library; `CREATE FUNCTION … LANGUAGE sql`
+  whose body is one expression.
+- `CREATE INDEX`: `USING btree`, `hash`, `gist` or `spgist`, as *The table's order, and its
+  indexes* says; a key on columns, on a column under its own `COLLATE`, on an instant on UTC's
+  clock, `(<column> AT TIME ZONE 'UTC')`, on its month, `(extract(month FROM
+  <clock>(<column>))::smallint)`, or on a function the DDL declares, read through its body, as
+  `shop.clock` above; `INCLUDE`; `UNIQUE`, which takes any number of NULLs unless it says `NULLS
+  NOT DISTINCT`; a `WHERE` comparing its columns with values, or testing them for NULL or truth;
+  each key's operator class, its type's default or, on text, one comparing its bytes; `WITH (…)`,
+  read and doing nothing; a key column's `NULLS FIRST` or `NULLS LAST`; and `DESC`, its values held
+  rising all the same, giving the side its NULLs take, which `catalog` names.
+- `ALTER TABLE … CLUSTER ON <index>`, a B-tree or a GiST index that is not partial. The index a
+  table is clustered on may include columns; the table's order holds every column already.
+
+### The types it holds
+
+Each type is read and written in PostgreSQL's own spellings, compared as PostgreSQL compares it,
+and assigned from another type as PostgreSQL's casts take it.
+
+- `smallint`, `integer`, `bigint` and the serial types; `real`, `double precision` and `float(p)`,
+  each value kept as its own bits, `-0` equal to `0` and every NaN equal and above `Infinity`;
+  `numeric(p, s)` up to 38 digits as a decimal beside whether it is NaN, and `numeric` of no limit,
+  or past 38 digits, as its text; `money`, its cents, under the locale its file records.
+- `text`, `varchar(n)`, `character(n)`, `name` and `"char"`; `bytea`; `bit(n)` and
+  `bit varying(n)`; `boolean`; `uuid`.
+- `date`, `time`, `timetz`, `timestamp`, `timestamptz`, each with its precision, and `interval`,
+  with its fields; an instant on UTC's clock, its infinities among them.
+- `oid`, `oid8`, `xid`, `xid8`, `cid`, `pg_lsn` and `tid`; the reg* types, `regclass`, `regtype`,
+  `regproc`, `regprocedure`, `regoper`, `regoperator`, `regnamespace`, `regrole`, `regcollation`,
+  `regconfig`, `regdictionary` and `regdatabase`, each written and read as the name of a built-in
+  object of the release the file's OIDs came from, which the snail carries for 14 to 19, and any
+  other OID bare.
+- `macaddr`, `macaddr8`, `inet` and `cidr`; `json`, `jsonb` and `jsonpath`; `xml`; `tsvector` and
+  `tsquery`; `refcursor`, `aclitem`, `pg_snapshot` and `txid_snapshot`; `point`, `line`, `lseg`,
+  `box`, `path`, `polygon` and `circle`; `pg_node_tree` and the planner's statistics types.
+- An array of any of them; an enum, a composite, a range and its multirange, as the DDL declares
+  them, and the built-in ranges and multiranges; a domain; a table's row type.
+
+`xid`, `cid`, the geometric types, `json` and `xml` key no B-tree. Any other type is refused by
+name.
 
 ### The SQL it reads
 
-- **A question:** `SELECT` from one table, or two joined by an inner `JOIN … ON` equal columns;
-  conditions joined by `AND`, each a column, or an instant's month on the clock, compared with a
-  value by `=`, `<>`, `<`, `<=`, `>` or `>=`, or a boolean column alone, under `NOT`, or under `IS
-  [NOT] TRUE`, `IS [NOT] FALSE` or `IS [NOT] UNKNOWN`, or a column under `IS NULL` or `IS NOT
-  NULL`; `count(*)`; `sum` of an integer, numeric, money or float column; `min` and `max` of a
-  column with a B-tree, a `"char"`'s by its text, a reg* type's an oid; `avg` of a float column;
-  `GROUP BY`; `ORDER BY`. A join reads the table its own conditions narrow first, then keeps the
-  other to the keys the first holds.
-- **A pipeline,** a question with a `WITH` or a window, or one on one table calling a function or an
-  operator on numbers the question path does not read: steps over one table and the steps before
-  them, joined by `CROSS JOIN`; the windows `lag`, `sum`, `count` and `row_number`; the aggregates
-  `count`, `sum`, `min`, `max`, `avg` of a float, `bool_and` and `bool_or`; `CASE`, `IN`, casts,
-  comparisons and `IS [NOT] DISTINCT FROM`; the arithmetic of floats and of money, an integer's held
-  to its type's range, a `pg_lsn` less another or a number of bytes, and `&`, `|` and `~` on a MAC
-  address; the functions of the numbers and of time (`warren-snail functions` lists each function
-  PostgreSQL defines, held, not read yet, or the server's own, refused by name); parameters `$1`
-  and on. Each step's expressions are typed before any row is read, so a function or an aggregate
-  PostgreSQL has no form of for its arguments is refused over no rows too.
+- **A question:** `SELECT` from one table or several (*Questions over several tables*); conditions
+  joined by `AND`, each a column, or an instant's month on the clock, compared with a value by `=`,
+  `<>`, `<`, `<=`, `>` or `>=`, `BETWEEN`, a boolean column alone, under `NOT`, or under `IS [NOT]
+  TRUE`, `IS [NOT] FALSE` or `IS [NOT] UNKNOWN`, a column under `IS NULL` or `IS NOT NULL`, or a
+  text column against a pattern written out by `LIKE`, `ILIKE`, `SIMILAR TO` or `~`, its fixed
+  prefix narrowing the read; `count(*)`; `sum`, `min`, `max` and `avg`; `GROUP BY`; `ORDER BY`.
+- **A pipeline,** a question with a `WITH` or a window, or one on one table the question path does
+  not read (*A question read as it goes*): steps over one table and the steps before them, joined
+  by `CROSS JOIN`; `DISTINCT`; the windows `row_number`, `rank`, `dense_rank`, `percent_rank`,
+  `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` and the aggregates;
+  `CASE`, `IN`, casts, comparisons and `IS [NOT] DISTINCT FROM`; the functions and operators
+  `warren-snail functions` names held, regular expressions among them, matching as PostgreSQL's
+  own engine matches; parameters `$1` and on. Each step's expressions are typed before any row is
+  read, so a function or an aggregate PostgreSQL has no form of for its arguments is refused over
+  no rows too.
 - **A statement:** as `exec` above.
 
-Anything else is refused, with a sentence that says what is not read. A statement sqlparser reads
-otherwise than it is written is refused too, so nothing it declares is dropped without a word.
+Anything else is refused, with a sentence that says what is not read: among it `HAVING`, `LIMIT`,
+`OFFSET`, a subquery, a set operation, `WITH RECURSIVE`, and in a write `RETURNING`, `ON
+CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE` and a savepoint. A statement
+sqlparser reads otherwise than it is written is refused too, so nothing it declares is dropped
+without a word.
 
 ### What the commands record
 
@@ -702,7 +837,8 @@ otherwise than it is written is refused too, so nothing it declares is dropped w
 - `entries`, `entries_none`, `entries_may` and `entries_must` (holding none of the question's rows,
   some, or all); `blocks_read`; `rows_held` (the most rows a pipeline held at once), `rows_walked`
   and `rows_taken` (rows the scan looked at one by one, and took in runs); `elapsed_us`, from
-  opening the file on the first round, and from the round's start after.
+  opening the file on the first round, and from the round's start after; `snails` (each snail's
+  part of a round across several, as `root pages:predicted:held:read`).
 
 `exec --out` writes one row a statement: `statement_no`, `statement`, `rows`, `generation`,
 `pages_read`, `pages_written`, `blocks_rewritten`, `pages_reused`, `wchar_bytes` (the bytes the
@@ -739,20 +875,33 @@ fn main() -> warren_snail::Result<()> {
   `Snail::open_writing` opens it to write as well.
 - `ask` answers a question along the cheapest order, or the one named, as an Arrow `RecordBatch`
   and the `Round` it took; `ask_with` takes the parameters of a pipeline.
-- `execute` runs one statement; `out`, `blocks` and `census` are the commands of those names.
+- `execute` runs one statement; `out`, `blocks`, `census` and `recut` are the commands of those
+  names.
+- `read::Snails` opens several snails together, to read (`open`, `open_holding`) or to write
+  (`open_writing`), and asks and executes as one snail does.
 - `write::write_from` writes a new snail from a `catalog::Catalog` and each table's `write::Rows`.
 - `carried_by` gives a snail open to write its `carry::Host`; `carry::apply` and `carry::copy` keep
   a follower.
 - `open_carried` opens a snail to write inside a host that tags and decides its roots, and
   `open_judged` reads one, `unseen` naming a commit its judge's round does not see;
-  `carry::taken_root` is the root a judge hands a writer outside the host, `carry::newest` the newest
-  generation a file holds; `carry::replay` and `carry::replay_held` land a host's log of commits.
+  `carry::taken_root` is the root a judge hands a writer outside the host, `carry::newest` the
+  newest generation a file holds; `carry::replay` and `carry::replay_held` land a host's log of
+  commits.
 
-### The feature `standalone`
+### The features
 
-On by default. With it, an open snail holds the pages its rounds read, and writes. Built without
-it (`default-features = false`), a snail holds no pages of its own and writes only inside a host,
-for a host that holds pages of its own.
+- `standalone`, on by default. With it, an open snail holds the pages its rounds read, and writes.
+  Built without it (`default-features = false`), a snail holds no pages of its own and writes only
+  inside a host, for a host that holds pages of its own.
+- `collations`, off by default: text under ICU's collations and the C library's locales, ordered as
+  PostgreSQL orders it, the machine's ICU linked as PostgreSQL links it; nondeterministic
+  collations with ICU's. Each order of such text is cut under the version of its collation, and an
+  order cut under another version is refused until `recut` writes the snail afresh. Without the
+  feature, a DDL naming such a collation is refused, a snail written with one is read but where its
+  order is needed, and money under a locale other than `C` or `POSIX` is refused.
+- `zones`, off by default: named time zones other than UTC, read from compiled zone files, the
+  machine's `/usr/share/zoneinfo` unless `SNAIL_ZONES` names another directory. Without it, a value
+  in such a zone is refused by name.
 
 ## The bench
 
