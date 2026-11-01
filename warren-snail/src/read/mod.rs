@@ -608,10 +608,13 @@ impl Snail {
         self.reader.unseen()
     }
 
-    /// The source the snail is marked a replica of, as the root it reads records it, where it is
-    /// marked one.
+    /// The source the snail is marked a replica of, where it is marked one: as the root it reads
+    /// records it, or as the transaction under way leaves it.
     pub fn replica(&self) -> Option<&str> {
-        self.root.replica.as_deref()
+        match &self.marking {
+            Some(m) => m.as_deref(),
+            None => self.root.replica.as_deref(),
+        }
     }
 
     /// The PostgreSQL release the file's OIDs came from, whose catalog names its reg* values.

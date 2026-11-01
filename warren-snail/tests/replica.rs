@@ -236,6 +236,8 @@ fn a_transaction_marks_the_replica_at_its_commit_and_a_rollback_leaves_the_mark_
     w.execute("BEGIN").unwrap();
     w.execute(&station(1, "Sagres 1")).unwrap();
     w.mark_replica(Some(SOURCE)).unwrap();
+    // The transaction reads the mark as it leaves it; a reader outside it, as it stood.
+    assert_eq!(w.replica(), Some(SOURCE));
     assert_eq!(Snail::open(&path).unwrap().replica(), None);
     // Within the transaction, another source's mark is refused as it is asked.
     let e = w.mark_replica(Some("mysql-other")).unwrap_err().to_string();
