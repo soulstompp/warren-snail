@@ -1121,11 +1121,15 @@ fn cast_typmod(to: &DataType) -> Result<Option<(u32, i32)>> {
     Ok(crate::catalog::held_type(to)?.numeric_typmod().flatten())
 }
 
-/// Whether an expression is a quoted literal: of unknown type, which a cast reads by the target's
-/// input.
+/// Whether an expression is a quoted literal or a parameter, given as text: of unknown type, which
+/// a cast reads by the target's input and an operator by the type it takes on that side, as
+/// PostgreSQL's parser types each.
 fn quoted(e: &Expr) -> bool {
     match e {
-        Expr::Value(v) => matches!(v.value, SqlValue::SingleQuotedString(_)),
+        Expr::Value(v) => matches!(
+            v.value,
+            SqlValue::SingleQuotedString(_) | SqlValue::Placeholder(_)
+        ),
         Expr::Nested(e) => quoted(e),
         _ => false,
     }
@@ -2731,7 +2735,7 @@ fn unbounded(ty: ColumnType) -> ColumnType {
 /// Two values compared, a quoted literal beside a boolean, a uuid or a numeric read as one, as
 /// PostgreSQL gives its unknown type the other side's.
 fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value)> {
-    let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_)));
+    let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_) | SqlValue::Placeholder(_)));
     Ok(match (&x, &y) {
         (Value::Bool(_), Value::Text(t)) if quoted(right) => {
             let t = boolean_of(t)?;
@@ -7457,7 +7461,7 @@ fn composed_op(
         BinaryOperator::Minus => "-",
         _ => return Ok(None),
     };
-    let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_)));
+    let quoted = |e: &Expr| matches!(e, Expr::Value(v) if matches!(v.value, SqlValue::SingleQuotedString(_) | SqlValue::Placeholder(_)));
     let ColumnType::Composed(r) = ty else {
         return Ok(None);
     };

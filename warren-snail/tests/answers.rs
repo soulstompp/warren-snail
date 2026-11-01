@@ -363,3 +363,67 @@ fn a_refusal_names_the_clause_or_the_call_it_refuses() {
         [Some(1), Some(1), Some(2), Some(4)]
     );
 }
+
+/// The ids a question with its parameters answers, in its order.
+fn ids_with(path: &std::path::Path, q: &str, params: &[&str]) -> Vec<Option<i64>> {
+    let params: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+    let (b, _) = fresh(path)
+        .ask_with(q, None, &params)
+        .unwrap_or_else(|e| panic!("{q}: {e}"));
+    weather::ints64(b.column(0).as_ref())
+}
+
+#[test]
+fn a_parameter_takes_the_type_its_context_gives_it() {
+    let path = snail("params");
+    let step = "WITH x AS (SELECT t.id, t.v, t.s FROM a.t t)";
+    for (q, params, want) in [
+        // Beside an integer, read as one, on either side: once "Int(10) and Text(\"10\") are not
+        // compared".
+        (format!("{step} SELECT x.id FROM x WHERE x.v = $1"), &["10"][..], vec![Some(1)]),
+        (
+            format!("{step} SELECT x.id FROM x WHERE $1 < x.v ORDER BY x.id"),
+            &["10"],
+            vec![Some(2), Some(4)],
+        ),
+        (
+            format!("{step} SELECT x.id FROM x WHERE x.v BETWEEN $1 AND $2 ORDER BY x.id"),
+            &["8", "30"],
+            vec![Some(1), Some(2)],
+        ),
+        (
+            format!("{step} SELECT x.id FROM x WHERE x.v IN ($1, $2) ORDER BY x.id"),
+            &["10", "40"],
+            vec![Some(1), Some(4)],
+        ),
+        (
+            format!("{step} SELECT x.v + $1 AS w FROM x WHERE x.id = 2"),
+            &["5"],
+            vec![Some(25)],
+        ),
+        (
+            "WITH x AS (SELECT b.id, b.n FROM a.big b) SELECT x.id FROM x WHERE x.n = $1 ORDER BY x.id"
+                .to_string(),
+            &["9223372036854775807"],
+            vec![Some(1), Some(2)],
+        ),
+        // Cast, and beside text, as before.
+        (format!("{step} SELECT x.id FROM x WHERE x.v = $1::integer"), &["20"], vec![Some(2)]),
+        (format!("{step} SELECT x.id FROM x WHERE x.s = $1"), &["c"], vec![Some(3)]),
+    ] {
+        assert_eq!(ids_with(&path, &q, params), want, "{q}");
+    }
+    // Alone in the select list it is text, as PostgreSQL resolves an unknown there.
+    let params = ["10".to_string()];
+    let (b, _) = fresh(&path)
+        .ask_with(
+            &format!("{step} SELECT $1 AS p FROM x WHERE x.id = 1"),
+            None,
+            &params,
+        )
+        .unwrap();
+    assert_eq!(
+        weather::texts(b.column(0).as_ref()),
+        [Some("10".to_string())]
+    );
+}
