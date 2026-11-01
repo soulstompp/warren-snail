@@ -377,6 +377,18 @@ fn grouped_key(v: &Value) -> Result<Key> {
     }
 }
 
+/// A row as the keys a set operation meets rows by: each value as a group's key, refused where
+/// PostgreSQL has no equality for it, a string under a library collation by that collation's key.
+pub(super) fn row_key(row: &[Value], under: &[Option<Casing>]) -> Result<Vec<Key>> {
+    row.iter()
+        .enumerate()
+        .map(|(i, v)| {
+            grouped_key(v)?;
+            Ok(key_under(v, under.get(i).copied().flatten()))
+        })
+        .collect()
+}
+
 /// A relation: its columns' names, each with the alias it was read under, and its rows; and which
 /// of its columns holds the table's order key where its rows lie in that order.
 #[derive(Clone, Debug, Default)]
@@ -557,6 +569,17 @@ impl Casings {
             Some(Ok(k)) => Ok(*k),
             Some(Err(e)) => Err(Error::new(e.clone())),
             None => self.resolve(name),
+        }
+    }
+
+    /// The library collation a relation's column is compared under where rows are met by their
+    /// values: the collation it carries, where that is one.
+    pub(super) fn carried_under(&self, c: &super::collate::Carried) -> Result<Option<Casing>> {
+        match c {
+            super::collate::Carried::Named(n) => {
+                Ok(Some(self.casing_named(n)?).filter(|k| matches!(k, Casing::Library(_))))
+            }
+            _ => Ok(None),
         }
     }
 

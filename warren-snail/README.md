@@ -533,10 +533,10 @@ order it read them; below, a line for each order it priced.
 **Where it stops.** Two tables are met on their columns, by `=`, `<>`, `<`, `<=`, `>` or `>=`
 where PostgreSQL compares their types so, a `FULL JOIN` by one equality at least. A join by `USING`
 or `NATURAL`, a `RIGHT` or `FULL JOIN` after the first, and what else the question path does not
-read over several tables is read as a pipeline (*A question read as it goes*); a subquery and a
-set operation are refused. The rows each table gives the answer are held while the round meets
-them. A table met more than once is read once for each, the second from the pages the first left
-held.
+read over several tables is read as a pipeline (*A question read as it goes*), and so is a set
+operation; a subquery is refused. The rows each table gives the answer are held while the round
+meets them. A table met more than once is read once for each, the second from the pages the first
+left held.
 
 ## Several snails, one round
 
@@ -657,7 +657,10 @@ ordered or filtered, or a `LIMIT`, an `OFFSET` or a `FETCH FIRST`. Over several 
 step's `FROM` is met as one relation first: a join of tables in one round, as a question on them
 is read, any other table alone by its own conditions; then steps, derived tables, `VALUES`, views
 and a set-returning function's rows, under `LATERAL` or not, met by `ON`, `USING` or `NATURAL`,
-`INNER`, `LEFT`, `RIGHT`, `FULL` or `CROSS`, and each step read over them.
+`INNER`, `LEFT`, `RIGHT`, `FULL` or `CROSS`, and each step read over them. A set operation,
+`UNION`, `INTERSECT` or `EXCEPT`, each with `ALL`, reads each arm as a step and meets their rows
+by their values, NULLs as not distinct, each column typed as PostgreSQL's parser types it; in a
+`WITH`, as a derived table, or sorted and limited over the whole.
 
 **The read it cancels.** The table held whole, and a sort for the window. The table's order is the
 window's order already, and each step holds only its running folds, its groups or the rows it
@@ -868,11 +871,11 @@ name.
 - **A statement:** as `exec` above.
 
 Anything else is refused, with a sentence that says what is not read: among it a subquery, a
-`LATERAL` subquery, a set operation, `WITH RECURSIVE`, a window over a join, a locking clause
-(`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON
-CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE`, a savepoint, and the isolation
-levels REPEATABLE READ and SERIALIZABLE. A statement sqlparser reads otherwise than it is written
-is refused too, so nothing it declares is dropped without a word.
+`LATERAL` subquery, `WITH RECURSIVE`, a window over a join, a locking clause (`FOR UPDATE`, `FOR
+NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON CONFLICT`,
+`UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE`, a savepoint, and the isolation levels
+REPEATABLE READ and SERIALIZABLE. A statement sqlparser reads otherwise than it is written is
+refused too, so nothing it declares is dropped without a word.
 
 ### What the commands record
 

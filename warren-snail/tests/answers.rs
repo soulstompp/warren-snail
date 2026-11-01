@@ -281,15 +281,6 @@ fn a_refusal_names_the_clause_or_the_call_it_refuses() {
             "WITH RECURSIVE is not read".to_string(),
         ),
         (
-            "WITH x AS (SELECT t.id FROM a.t t UNION SELECT u.id FROM a.u u) SELECT x.id FROM x"
-                .into(),
-            "set operations are not read".into(),
-        ),
-        (
-            "WITH x AS (SELECT t.id FROM a.t t) SELECT x.id FROM x UNION SELECT x.id FROM x".into(),
-            "set operations are not read".into(),
-        ),
-        (
             "SELECT t.id, d.n FROM a.t t, LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d"
                 .into(),
             "LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d is not read: a LATERAL \

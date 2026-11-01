@@ -108,21 +108,37 @@ pub(crate) fn old_names(catalog: &mut Catalog, format: u32) {
     }
 }
 
-/// Calls `f` on each table a query's FROMs name, in its steps and in its body.
+/// Calls `f` on each table a query's FROMs name, in its steps and in its body, each arm of a set
+/// operation among them.
 fn each_table(q: &mut sqlparser::ast::Query, f: &mut dyn FnMut(&mut sqlparser::ast::TableFactor)) {
-    use sqlparser::ast::SetExpr;
     if let Some(with) = q.with.as_mut() {
         for cte in &mut with.cte_tables {
             each_table(&mut cte.query, f);
         }
     }
-    if let SetExpr::Select(s) = q.body.as_mut() {
-        for item in &mut s.from {
-            f(&mut item.relation);
-            for j in &mut item.joins {
-                f(&mut j.relation);
+    each_table_of(q.body.as_mut(), f);
+}
+
+fn each_table_of(
+    body: &mut sqlparser::ast::SetExpr,
+    f: &mut dyn FnMut(&mut sqlparser::ast::TableFactor),
+) {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(s) => {
+            for item in &mut s.from {
+                f(&mut item.relation);
+                for j in &mut item.joins {
+                    f(&mut j.relation);
+                }
             }
         }
+        SetExpr::SetOperation { left, right, .. } => {
+            each_table_of(left, f);
+            each_table_of(right, f);
+        }
+        SetExpr::Query(q) => each_table(q, f),
+        _ => {}
     }
 }
 
@@ -1103,10 +1119,11 @@ impl Snail {
                 return self.ask_pipeline(&r, params);
             }
             if pipeline::is_pipeline(q)
+                || relations::is_set_operation(q)
                 || pipeline::tests_composite_null(&self.catalog, q)
                 || pipeline::reads_per_row(&self.catalog, q)
             {
-                if order.is_some() && pipeline::is_pipeline(q) {
+                if order.is_some() && (pipeline::is_pipeline(q) || relations::is_set_operation(q)) {
                     return Err(Error::new("a pipeline reads its table along its own order"));
                 }
                 return self.ask_pipeline(q, params);

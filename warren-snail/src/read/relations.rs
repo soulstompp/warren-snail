@@ -15,8 +15,8 @@ use crate::{Error, Result};
 use arrow::array::RecordBatch;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, JoinConstraint,
-    JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, TableAlias, TableFactor,
-    TableWithJoins,
+    JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, TableAlias, TableFactor, TableWithJoins, Value as SqlValue,
 };
 use std::collections::HashMap;
 
@@ -44,6 +44,8 @@ struct Step {
     renames: Vec<String>,
     /// The functions its FROM calls, each standing in its FROM under CALLED and its place here.
     calls: Vec<Call>,
+    /// A set operation's arms, where the step is one.
+    set: Option<Arm>,
 }
 
 /// A function a FROM reads the rows of.
@@ -118,7 +120,9 @@ fn lift(
                 return Err(Error::new("a VALUES list sorted or limited is not read"));
             }
         }
-        SetExpr::SetOperation { .. } => return Err(Error::new("set operations are not read")),
+        SetExpr::SetOperation { .. } => {
+            return lift_set(catalog, out, visible, name, query, renames)
+        }
         other => {
             return Err(Error::new(format!(
                 "{other} is not read: a step is a SELECT"
@@ -130,6 +134,7 @@ fn lift(
         query,
         renames,
         calls,
+        set: None,
     });
     Ok(())
 }
@@ -1799,6 +1804,390 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
     })
 }
 
+/// A set operation's arms: each a step of its own, two met by their operator.
+#[derive(Clone)]
+enum Arm {
+    /// A step, and what each of its columns is where an untyped literal or parameter makes it.
+    Leaf { name: String, untyped: Vec<Untyped> },
+    Op {
+        op: SetOperator,
+        all: bool,
+        left: Box<Arm>,
+        right: Box<Arm>,
+    },
+}
+
+/// A column of an arm that takes the type its set operation finds: none, a NULL or a parameter, or
+/// a quoted literal, read in that type.
+#[derive(Clone, Debug)]
+enum Untyped {
+    No,
+    Null,
+    Literal(String),
+}
+
+/// Whether a question is a set operation.
+pub(super) fn is_set_operation(q: &Query) -> bool {
+    matches!(q.body.as_ref(), SetExpr::SetOperation { .. })
+}
+
+/// A query of a body alone.
+fn query_of(body: SetExpr) -> Query {
+    let parsed =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, "SELECT 1")
+            .expect("a SELECT");
+    let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
+        unreachable!("one SELECT")
+    };
+    let mut q = (**q).clone();
+    q.body = Box::new(body);
+    q
+}
+
+/// A set operation as steps: each arm a step of its own, the operation one more under `name`;
+/// where it is sorted or limited, the operation under a name of its own, and `name` the step that
+/// sorts and limits it.
+fn lift_set(
+    catalog: &Catalog,
+    out: &mut Vec<Step>,
+    visible: &[String],
+    name: String,
+    query: Query,
+    renames: Vec<String>,
+) -> Result<()> {
+    if let Some(by) = &query.order_by {
+        let sqlparser::ast::OrderByKind::Expressions(items) = &by.kind else {
+            return Err(Error::new(format!("{by} is not read")));
+        };
+        for item in items {
+            let named = match &item.expr {
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+                Expr::Value(v) => matches!(v.value, SqlValue::Number(..)),
+                _ => false,
+            };
+            if !named {
+                return Err(Error::new(
+                    "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column names \
+                     can be used, not expressions or functions",
+                ));
+            }
+        }
+    }
+    let arm = arm_of(catalog, out, visible, &query.body)?;
+    let sorted = query.order_by.is_some() || query.limit_clause.is_some() || query.fetch.is_some();
+    if !sorted {
+        out.push(Step {
+            name,
+            query,
+            renames,
+            calls: Vec::new(),
+            set: Some(arm),
+        });
+        return Ok(());
+    }
+    let set = fresh(out, "set");
+    out.push(Step {
+        name: set.clone(),
+        query: query.clone(),
+        renames: Vec::new(),
+        calls: Vec::new(),
+        set: Some(arm),
+    });
+    let parsed = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        "SELECT * FROM x",
+    )?;
+    let [sqlparser::ast::Statement::Query(star)] = parsed.as_slice() else {
+        unreachable!("one SELECT")
+    };
+    let mut query = query;
+    query.body = star.body.clone();
+    if let SetExpr::Select(s) = query.body.as_mut() {
+        s.from[0].relation = plain(&set, None);
+    }
+    out.push(Step {
+        name,
+        query,
+        renames,
+        calls: Vec::new(),
+        set: None,
+    });
+    Ok(())
+}
+
+/// A set operation's arm: an operation met of its own arms, or a step lifted out.
+fn arm_of(
+    catalog: &Catalog,
+    out: &mut Vec<Step>,
+    visible: &[String],
+    body: &SetExpr,
+) -> Result<Arm> {
+    match body {
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } => {
+            let all = match set_quantifier {
+                SetQuantifier::All => true,
+                SetQuantifier::Distinct | SetQuantifier::None => false,
+                q => return Err(Error::new(format!("{op} {q} is not read"))),
+            };
+            if matches!(op, SetOperator::Minus) {
+                return Err(Error::new("MINUS is not read: write EXCEPT"));
+            }
+            let left = arm_of(catalog, out, visible, left)?;
+            let right = arm_of(catalog, out, visible, right)?;
+            Ok(Arm::Op {
+                op: *op,
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        SetExpr::Query(q)
+            if q.with.is_none()
+                && q.order_by.is_none()
+                && q.limit_clause.is_none()
+                && q.fetch.is_none()
+                && matches!(q.body.as_ref(), SetExpr::SetOperation { .. }) =>
+        {
+            arm_of(catalog, out, visible, &q.body)
+        }
+        _ => {
+            let query = match body {
+                SetExpr::Query(q) => (**q).clone(),
+                b => query_of(b.clone()),
+            };
+            let untyped = untyped_of(&query);
+            let name = fresh(out, "arm");
+            lift(catalog, out, visible, name.clone(), query, Vec::new())?;
+            Ok(Arm::Leaf { name, untyped })
+        }
+    }
+}
+
+/// What each column of an arm's SELECT is where an untyped literal or parameter makes it, as
+/// PostgreSQL leaves such an arm's output untyped; none where a star, a DISTINCT, a grouping or an
+/// ORDER BY reads them.
+fn untyped_of(q: &Query) -> Vec<Untyped> {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return Vec::new();
+    };
+    let grouped =
+        !matches!(&s.group_by, sqlparser::ast::GroupByExpr::Expressions(g, _) if g.is_empty());
+    if q.order_by.is_some()
+        || s.distinct.is_some()
+        || grouped
+        || s.projection.iter().any(|i| {
+            matches!(
+                i,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        })
+    {
+        return Vec::new();
+    }
+    fn of(e: &Expr) -> Untyped {
+        match e {
+            Expr::Nested(e) => of(e),
+            Expr::Value(v) => match &v.value {
+                SqlValue::SingleQuotedString(s) => Untyped::Literal(s.clone()),
+                SqlValue::Null | SqlValue::Placeholder(_) => Untyped::Null,
+                _ => Untyped::No,
+            },
+            _ => Untyped::No,
+        }
+    }
+    s.projection
+        .iter()
+        .map(|i| match i {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => of(e),
+            _ => Untyped::No,
+        })
+        .collect()
+}
+
+/// An arm's rows met: its columns' names, each column's type and collation, and which are untyped.
+struct Met {
+    names: Vec<String>,
+    types: Vec<Option<ColumnType>>,
+    untyped: Vec<Untyped>,
+    carried: Vec<Carried>,
+    rows: Vec<Vec<Value>>,
+}
+
+/// A set operation made: its arms met by their operators, each column typed as select_common_type
+/// types its two arms' columns, the leftmost arm's names its own.
+fn set_step(arm: &Arm, made: &HashMap<String, Made>, casings: &Casings) -> Result<Made> {
+    let m = met(arm, made, casings)?;
+    Ok(Made {
+        rel: Relation {
+            names: m.names,
+            rows: m.rows,
+            order: None,
+        },
+        types: m.types,
+        carried: m.carried,
+    })
+}
+
+fn met(arm: &Arm, made: &HashMap<String, Made>, casings: &Casings) -> Result<Met> {
+    let (op, all, left, right) = match arm {
+        Arm::Leaf { name, untyped } => {
+            let m = made
+                .get(name)
+                .ok_or_else(|| Error::new("a set operation's arm was not made"))?;
+            let n = m.rel.names.len();
+            return Ok(Met {
+                names: m.rel.names.clone(),
+                types: m.types.clone(),
+                untyped: (0..n)
+                    .map(|c| untyped.get(c).cloned().unwrap_or(Untyped::No))
+                    .collect(),
+                carried: m.carried.clone(),
+                rows: m.rel.rows.clone(),
+            });
+        }
+        Arm::Op {
+            op,
+            all,
+            left,
+            right,
+        } => (*op, *all, left, right),
+    };
+    let context = match op {
+        SetOperator::Union => "UNION",
+        SetOperator::Intersect => "INTERSECT",
+        _ => "EXCEPT",
+    };
+    let mut l = met(left, made, casings)?;
+    let mut r = met(right, made, casings)?;
+    let n = l.types.len();
+    if r.types.len() != n {
+        return Err(Error::new(format!(
+            "each {context} query must have the same number of columns"
+        )));
+    }
+    let concatenated = op == SetOperator::Union && all;
+    let mut types = Vec::with_capacity(n);
+    let mut carried = Vec::with_capacity(n);
+    for c in 0..n {
+        let side = |m: &Met| match m.untyped[c] {
+            Untyped::No => m.types[c],
+            _ => None,
+        };
+        let ty = typed::common_type(&[side(&l), side(&r)], context)?;
+        // A literal is read in the type found before any row, as PostgreSQL's parser reads it.
+        for m in [&l, &r] {
+            if let Untyped::Literal(s) = &m.untyped[c] {
+                coerce(Value::Text(s.clone()), ty, true)?;
+            }
+        }
+        if !concatenated && !ty.grouped() {
+            return Err(Error::new(format!(
+                "could not identify an equality operator for type {}",
+                ty.unequal_part().unwrap_or(ty).pg_name()
+            )));
+        }
+        let k = carried_met(&l.carried[c], &r.carried[c], concatenated)?;
+        carried.push(match k {
+            Carried::None => carried_of(Some(ty)),
+            k => k,
+        });
+        types.push(ty);
+    }
+    for m in [&mut l, &mut r] {
+        for (c, &ty) in types.iter().enumerate() {
+            let quoted = !matches!(m.untyped[c], Untyped::No);
+            if m.types[c] == Some(ty) && !quoted {
+                continue;
+            }
+            for row in &mut m.rows {
+                let v = std::mem::replace(&mut row[c], Value::Null);
+                row[c] = match v.is_null() {
+                    true => v,
+                    false => coerce(v, ty, quoted)?,
+                };
+            }
+        }
+    }
+    let rows = if concatenated {
+        let mut rows = l.rows;
+        rows.extend(r.rows);
+        rows
+    } else {
+        let under = carried
+            .iter()
+            .map(|k| casings.carried_under(k))
+            .collect::<Result<Vec<_>>>()?;
+        // Each distinct row, by its first coming, with how many times each arm holds it.
+        let mut at: HashMap<Vec<pipeline::Key>, usize> = HashMap::new();
+        let mut groups: Vec<(Vec<Value>, usize, usize)> = Vec::new();
+        for (side, rows) in [(0, l.rows), (1, r.rows)] {
+            for row in rows {
+                let k = pipeline::row_key(&row, &under)?;
+                let i = match at.get(&k) {
+                    Some(&i) => i,
+                    None => {
+                        at.insert(k, groups.len());
+                        groups.push((row, 0, 0));
+                        groups.len() - 1
+                    }
+                };
+                match side {
+                    0 => groups[i].1 += 1,
+                    _ => groups[i].2 += 1,
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for (row, x, y) in groups {
+            let times = match (op, all) {
+                (SetOperator::Union, _) => 1,
+                (SetOperator::Intersect, false) => usize::from(x > 0 && y > 0),
+                (SetOperator::Intersect, true) => x.min(y),
+                (_, false) => usize::from(x > 0 && y == 0),
+                (_, true) => x.saturating_sub(y),
+            };
+            for _ in 1..times {
+                rows.push(row.clone());
+            }
+            if times > 0 {
+                rows.push(row);
+            }
+        }
+        rows
+    };
+    Ok(Met {
+        names: l.names,
+        types: types.into_iter().map(Some).collect(),
+        untyped: vec![Untyped::No; n],
+        carried,
+        rows,
+    })
+}
+
+/// The collation a set operation's column carries, of its two arms' as PostgreSQL's
+/// select_common_collation finds it: a collation other than the default over the default, two
+/// others in conflict refused, or under UNION ALL left unsettled.
+fn carried_met(a: &Carried, b: &Carried, none_ok: bool) -> Result<Carried> {
+    let default = super::collate::DEFAULT;
+    Ok(match (a, b) {
+        (Carried::None, k) | (k, Carried::None) => k.clone(),
+        (Carried::Unsettled, _) | (_, Carried::Unsettled) => Carried::Unsettled,
+        (Carried::Named(x), Carried::Named(y)) if x == y || y == default => a.clone(),
+        (Carried::Named(x), _) if x == default => b.clone(),
+        _ if none_ok => Carried::Unsettled,
+        (Carried::Named(x), Carried::Named(y)) => {
+            return Err(Error::new(format!(
+                "collation mismatch between implicit collations \"{x}\" and \"{y}\""
+            )))
+        }
+    })
+}
+
 /// A question over several relations, answered: each step made in turn, its FROM met as one
 /// relation, then read as the pipeline reads a step. One round, of every table read.
 pub(super) fn answer(
@@ -1826,8 +2215,9 @@ pub(super) fn answer(
     };
     let mut held = 0usize;
     for step in &mut steps {
-        let m = match step.query.body.as_ref() {
-            SetExpr::Values(_) => values_step(step, params, release, &casings)?,
+        let m = match (&step.set, step.query.body.as_ref()) {
+            (Some(arm), _) => set_step(arm, &made, &casings)?,
+            (None, SetExpr::Values(_)) => values_step(step, params, release, &casings)?,
             _ => select_step(
                 reads,
                 step,

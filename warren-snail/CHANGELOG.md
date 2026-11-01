@@ -62,6 +62,11 @@ at once, and a snail written inside a host that decides its commits.
   and `NULLIF`; and over a join what the question path does not read, `DISTINCT`, an aggregate's
   own clauses, `LIMIT` and parameters among it, handed over. `CREATE VIEW` in the DDL and in
   `exec`, a view read as a step.
+- Set operations: `UNION`, `INTERSECT` and `EXCEPT`, each with `ALL`, nested and in parentheses,
+  each arm read as a step; their rows met by their values, NULLs as not distinct and arrays by their
+  elements; each column typed as PostgreSQL's `select_common_type` types it, a quoted literal or a
+  `NULL` read in the type found; sorted and limited over the whole, in a `WITH` and as a derived
+  table.
 - The commands `types`, `operators` and `opclasses` list every type, operator and operator class
   PostgreSQL 14 to 19 defines, each held or refused in the snail's own words: a type by a table's
   column of it, an operator by a pipeline's step over columns of its types, an operator class by
