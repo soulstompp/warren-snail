@@ -325,7 +325,11 @@ each column it leaves out or gives `DEFAULT` taking its `DEFAULT`; `UPDATE`, to 
 `DEFAULT`; `DELETE`; `BEGIN`, `COMMIT` and `ROLLBACK`; `SET CONSTRAINTS`; and the DDL the snail
 reads (*The DDL it reads*), a table's columns and its indexes changed only while it holds no rows,
 and `ALTER TABLE … ADD CHECK` and `ADD FOREIGN KEY` each checked against the rows held unless `NOT
-VALID`. Outside a transaction each statement commits on its own.
+VALID`. Outside a transaction each statement commits on its own. A transaction runs at READ
+COMMITTED, and so at READ UNCOMMITTED, which PostgreSQL runs as READ COMMITTED: `BEGIN` and `START
+TRANSACTION` may name either, `SET TRANSACTION` names one for the transaction begun, another only
+before its first statement that reads or writes, and `SET SESSION CHARACTERISTICS AS TRANSACTION`
+names one for the transactions after.
 
 **What a row is given.** An identity's or a serial's value, or a `DEFAULT nextval(…)`, is its
 sequence's next, drawn at the root's turn for the whole statement and never given back, as
@@ -828,9 +832,10 @@ name.
 - **A statement:** as `exec` above.
 
 Anything else is refused, with a sentence that says what is not read: among it `HAVING`, a
-subquery, a set operation, `WITH RECURSIVE`, a `LIMIT` over several tables, and in a write
-`RETURNING`, `ON CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE` and a
-savepoint. A statement sqlparser reads otherwise than it is written is refused too, so nothing it
+subquery, a set operation, `WITH RECURSIVE`, a `LIMIT` over several tables, a locking clause
+(`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON
+CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE`, a savepoint, and the isolation
+levels REPEATABLE READ and SERIALIZABLE. A statement sqlparser reads otherwise than it is written is refused too, so nothing it
 declares is dropped without a word.
 
 ### What the commands record

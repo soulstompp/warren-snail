@@ -21,6 +21,11 @@ at once, and a snail written inside a host that decides its commits.
   without `..`.
 - Two types of the question reader that no public path reaches changed too: `Interval`'s bounds
   are 128 bits, where they were 64, and `Side`'s conditions are a `Cond` each.
+- **A `bigint`'s sum is a numeric,** a `Decimal128(38, 0)` named `numeric`, as PostgreSQL's
+  `sum(bigint)` is, where 0.1.1 gave a `bigint` that wrapped past its range; a `smallint`'s and an
+  `integer`'s are `bigint`s, in a pipeline too.
+- **A locking clause is refused by name,** `FOR UPDATE` and the others, where 0.1.1 answered the
+  question and took no lock.
 
 ### Added
 
@@ -45,8 +50,9 @@ at once, and a snail written inside a host that decides its commits.
   answered from the NULLs counted, and the truth tests; `LIKE`, `ILIKE`, `SIMILAR TO` and `~`, a
   pattern's fixed prefix narrowing the read; `min`, `max` and `avg` on the question path.
 - The pipeline: `DISTINCT`; `LIMIT`, `OFFSET` and `FETCH FIRST`, `WITH TIES` among them, a question
-  on one table taking them read as a pipeline; `GROUP BY` and `ORDER BY` naming a select list's
-  item by its place or its name; more windows and frames; the functions and operators of
+  on one table taking them, or a `CASE`, a document's arrows or a parameter, read as a pipeline; a
+  parameter typed by its context, as a quoted literal is; `GROUP BY` and `ORDER BY` naming a select
+  list's item by its place or its name; more windows and frames; the functions and operators of
   PostgreSQL's types, regular expressions matching as PostgreSQL's own engine matches; the command
   `functions` lists every function PostgreSQL defines and whether the snail answers it.
 - The commands `types`, `operators` and `opclasses` list every type, operator and operator class
@@ -54,7 +60,9 @@ at once, and a snail written inside a host that decides its commits.
   column of it, an operator by a pipeline's step over columns of its types, an operator class by
   an index of it.
 - Writes: an `INSERT … SELECT` held to PostgreSQL's assignment casts, `SET CONSTRAINTS`, and the
-  DDL above in `exec`; the `DEFAULT`s `now()`, `gen_random_uuid()`, `uuidv4()` and `uuidv7()`.
+  DDL above in `exec`; the `DEFAULT`s `now()`, `gen_random_uuid()`, `uuidv4()` and `uuidv7()`;
+  READ COMMITTED, and READ UNCOMMITTED run as it, named by `BEGIN`, `START TRANSACTION`, `SET
+  TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION`.
 - One clock a transaction: `now()`, `CURRENT_TIMESTAMP`, `transaction_timestamp()` and the literals
   `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` read the transaction's start wherever they are
   written, `statement_timestamp()` the statement's, `clock_timestamp()` the machine's.

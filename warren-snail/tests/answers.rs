@@ -540,3 +540,124 @@ fn a_document_s_arrows_on_one_table_are_read_as_a_step_reads_them() {
         [Some("5".into()), None, None, None]
     );
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn the_level_the_snail_runs_is_taken_in_each_of_its_spellings() {
+    let path = snail("levels");
+    let mut w = warren_snail::read::Snail::open_writing(&path).unwrap();
+    let mut n = 100;
+    let mut insert = |w: &mut warren_snail::read::Snail| {
+        n += 1;
+        w.execute(&format!("INSERT INTO a.u (id, t_id, w) VALUES ({n}, 1, 1)"))
+    };
+    let count = |w: &mut warren_snail::read::Snail| {
+        weather::one(&w.ask("SELECT count(*) FROM a.u u", None).unwrap().0)
+    };
+    // Once each "… is not a statement the snail writes".
+    for begin in [
+        "BEGIN ISOLATION LEVEL READ COMMITTED",
+        "START TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ WRITE",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL READ COMMITTED",
+    ] {
+        assert_eq!(w.execute(begin).unwrap().statement, "BEGIN", "{begin}");
+        insert(&mut w).unwrap();
+        w.execute("COMMIT").unwrap();
+    }
+    assert_eq!(count(&mut w), 9);
+    // SET TRANSACTION: outside a transaction it does nothing; inside, the transaction's level,
+    // taken again after a read, and another refused after one, the transaction failed with it.
+    assert_eq!(
+        w.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .unwrap()
+            .statement,
+        "SET"
+    );
+    w.execute("BEGIN").unwrap();
+    w.execute("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+        .unwrap();
+    w.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .unwrap();
+    insert(&mut w).unwrap();
+    w.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .unwrap();
+    let e = w
+        .execute("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        e,
+        "SET TRANSACTION ISOLATION LEVEL must be called before any query"
+    );
+    assert!(insert(&mut w).is_err());
+    w.execute("ROLLBACK").unwrap();
+    assert_eq!(count(&mut w), 9);
+    // A read is a query too; READ UNCOMMITTED is a level of its own.
+    w.execute("BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap();
+    assert_eq!(count(&mut w), 9);
+    assert!(w
+        .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .is_err());
+    w.execute("ROLLBACK").unwrap();
+    // SET SESSION CHARACTERISTICS: the level of the transactions after, undone by a ROLLBACK.
+    w.execute("BEGIN").unwrap();
+    w.execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+        .unwrap();
+    w.execute("ROLLBACK").unwrap();
+    w.execute("BEGIN").unwrap();
+    insert(&mut w).unwrap();
+    w.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .unwrap();
+    w.execute("COMMIT").unwrap();
+    w.execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+        .unwrap();
+    w.execute("BEGIN").unwrap();
+    insert(&mut w).unwrap();
+    w.execute("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+        .unwrap();
+    assert!(w
+        .execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .is_err());
+    w.execute("ROLLBACK").unwrap();
+    assert_eq!(count(&mut w), 10);
+    // The levels the snail does not run, by name, the last a statement names deciding; READ ONLY.
+    for (s, why) in [
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "ISOLATION LEVEL REPEATABLE READ",
+        ),
+        (
+            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "ISOLATION LEVEL SERIALIZABLE",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL SERIALIZABLE",
+            "ISOLATION LEVEL SERIALIZABLE",
+        ),
+        (
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "ISOLATION LEVEL REPEATABLE READ",
+        ),
+        (
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "ISOLATION LEVEL SERIALIZABLE",
+        ),
+    ] {
+        assert_eq!(
+            w.execute(s).unwrap_err().to_string(),
+            format!("{why} is not read: the snail's transactions are READ COMMITTED"),
+            "{s}"
+        );
+    }
+    assert_eq!(
+        w.execute("BEGIN READ ONLY").unwrap_err().to_string(),
+        "READ ONLY is not read: a transaction of the snail's reads and writes"
+    );
+    assert_eq!(
+        w.execute("BEGIN ISOLATION LEVEL SNAPSHOT")
+            .unwrap_err()
+            .to_string(),
+        "syntax error at or near \"SNAPSHOT\""
+    );
+}

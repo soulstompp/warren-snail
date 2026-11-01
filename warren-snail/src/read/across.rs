@@ -680,6 +680,12 @@ impl Snails {
         for s in &self.snails {
             s.wasted.borrow_mut().clear();
         }
+        // A read in a transaction takes its first snapshot on each snail it reads.
+        if self.begun {
+            for &i in &read {
+                self.snails[i].levels.read();
+            }
+        }
         let (batch, mut round) = match read.as_slice() {
             [i] => self.snails[*i].answer_with(sql, None, params)?,
             _ => {
@@ -790,7 +796,11 @@ impl Snails {
             return Err(Error::new(super::change::ABORTED));
         }
         match st {
-            Statement::Begin => {
+            Statement::Begin
+            | Statement::Isolation {
+                at: statement::Isolated::Begin,
+                ..
+            } => {
                 if self.begun {
                     return Err(Error::new("a transaction is begun already"));
                 }
@@ -827,6 +837,14 @@ impl Snails {
                 "a table is declared on its own snail: open it alone to write",
             )),
             Statement::Setting { .. } => self.snails[0].execute(sql),
+            // Each snail holds the transaction's level, and refuses a change after its first read.
+            Statement::Isolation { .. } => {
+                let mut done = Done::default();
+                for i in 0..self.snails.len() {
+                    done = self.run(i, sql)?;
+                }
+                Ok(done)
+            }
             Statement::Constraints { names, deferred } => {
                 // Each snail takes the names it finds, as its own SET CONSTRAINTS finds them; a name
                 // none finds is refused by the snail naming its schema, or the first.
@@ -917,6 +935,7 @@ impl Snails {
             s.aborted = false;
             if let Some((root, _)) = s.begun.take() {
                 s.root = root;
+                s.levels.end(false);
             }
             let r = s.abandon();
             if first.is_ok() {

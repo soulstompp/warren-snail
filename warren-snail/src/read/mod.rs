@@ -241,6 +241,8 @@ pub struct Snail {
     begun: Option<(Root, bool)>,
     /// Whether a statement of the transaction under way failed: it is rolled back at its end.
     aborted: bool,
+    /// The isolation levels of its transactions, as they are named.
+    pub(crate) levels: statement::Levels,
     /// Where the snail is open to write, its writer's slot among the file's writers.
     slot: u64,
     /// The blocks a round read a page or more of waste in, which it prunes as it ends.
@@ -470,6 +472,7 @@ impl Snail {
             writer: None,
             begun: None,
             aborted: false,
+            levels: Default::default(),
             slot: 0,
             wasted: Default::default(),
             walked: Default::default(),
@@ -962,6 +965,8 @@ impl Snail {
         self.clock.1 = at;
         if self.begun.is_none() {
             self.clock.0 = at;
+        } else {
+            self.levels.read();
         }
         Ok(pages_at_start)
     }

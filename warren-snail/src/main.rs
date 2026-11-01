@@ -54,12 +54,14 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           feature collations. A flag naming another than the files name is refused. --written
           records each order's columns as Parquet.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
-          COMMIT, ROLLBACK and SET CONSTRAINTS; and the DDL `write` reads, a table's columns and
-          indexes changed only while it holds no rows. Outside a transaction each statement
-          commits. --out records each statement as Parquet: its rows, its generation, and the
-          pages it read, wrote and reused. Each --with opens one more snail with <file>, as one
-          writer of them all: a statement writes the snail that holds its table, and a
-          transaction's COMMIT commits every snail it wrote, one root deciding.
+          COMMIT, ROLLBACK and SET CONSTRAINTS; READ COMMITTED, and READ UNCOMMITTED run as it,
+          named by BEGIN, START TRANSACTION, SET TRANSACTION and SET SESSION CHARACTERISTICS; and
+          the DDL `write` reads, a table's columns and indexes changed only while it holds no
+          rows. Outside a transaction each statement commits. --out records each statement as
+          Parquet: its rows, its generation, and the pages it read, wrote and reused. Each --with
+          opens one more snail with <file>, as one writer of them all: a statement writes the
+          snail that holds its table, and a transaction's COMMIT commits every snail it wrote,
+          one root deciding.
           A snail PostgreSQL writes through its WAL is written only through PostgreSQL, its host:
           --host names the command that carries each commit to it, psql for one, read a
           statement at a time; the statements run as one transaction of the host's, under the

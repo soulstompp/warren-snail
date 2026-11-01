@@ -647,6 +647,7 @@ impl Snail {
                 Statement::Commit | Statement::Rollback => {
                     self.begun = None;
                     self.aborted = false;
+                    self.levels.end(false);
                     Ok(Done {
                         statement: "ROLLBACK",
                         generation: self.root.generation,
@@ -658,7 +659,10 @@ impl Snail {
         }
         let writes = !matches!(
             st,
-            Statement::Begin | Statement::Commit | Statement::Rollback
+            Statement::Begin
+                | Statement::Commit
+                | Statement::Rollback
+                | Statement::Isolation { .. }
         );
         // Each statement reads what was committed when it began; in a transaction, with the
         // transaction's own changes in place (PostgreSQL's READ COMMITTED).
@@ -675,11 +679,28 @@ impl Snail {
         };
         let changed = match st {
             Statement::Setting { .. } => false,
-            Statement::Begin => {
+            Statement::Begin
+            | Statement::Isolation {
+                at: statement::Isolated::Begin,
+                ..
+            } => {
                 if self.begun.is_some() {
                     return Err(Error::new("a transaction is begun already"));
                 }
                 self.begun = Some((self.root.clone(), false));
+                self.levels.begin(match st {
+                    Statement::Isolation { level, .. } => Some(level),
+                    _ => None,
+                });
+                false
+            }
+            // A level named for the transaction or the session; one changed after the
+            // transaction's first read fails the transaction, as PostgreSQL's does.
+            Statement::Isolation { level, at } => {
+                if let Err(e) = self.levels.set(level, at, self.begun.is_some()) {
+                    self.aborted = self.begun.is_some();
+                    return Err(e);
+                }
                 false
             }
             Statement::Commit => {
@@ -697,10 +718,12 @@ impl Snail {
                 if let Err(e) = checked {
                     let (began, _) = self.begun.take().expect("a transaction begun");
                     self.root = began;
+                    self.levels.end(false);
                     self.abandon()?;
                     return Err(e);
                 }
                 let (_, changed) = self.begun.take().expect("a transaction begun");
+                self.levels.end(true);
                 changed
             }
             Statement::Rollback => {
@@ -709,10 +732,16 @@ impl Snail {
                     .take()
                     .ok_or_else(|| Error::new("no transaction is begun"))?;
                 self.root = root;
+                self.levels.end(false);
                 self.abandon()?;
                 false
             }
             st => {
+                // A statement that reads and writes takes the transaction's first snapshot; SET
+                // CONSTRAINTS takes none.
+                if self.begun.is_some() && !matches!(st, Statement::Constraints { .. }) {
+                    self.levels.read();
+                }
                 self.touched = Touched::default();
                 let mark = self.mark();
                 // The rows the statement found when it began, which it keeps to if it runs again.
@@ -889,7 +918,8 @@ impl Snail {
             Statement::Begin
             | Statement::Commit
             | Statement::Rollback
-            | Statement::Setting { .. } => {
+            | Statement::Setting { .. }
+            | Statement::Isolation { .. } => {
                 unreachable!("a transaction's own statements and a setting write no rows")
             }
         })

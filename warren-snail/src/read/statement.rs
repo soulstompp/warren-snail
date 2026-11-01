@@ -114,12 +114,94 @@ pub enum Statement {
     Setting {
         name: String,
     },
+    /// An isolation level a transaction runs at, one the snail runs: named by the BEGIN or START
+    /// TRANSACTION that begins it, by SET TRANSACTION for the transaction begun, or by SET SESSION
+    /// CHARACTERISTICS AS TRANSACTION for the transactions after.
+    Isolation {
+        level: Isolation,
+        at: Isolated,
+    },
+}
+
+/// The isolation levels the snail runs, READ COMMITTED's: PostgreSQL runs READ UNCOMMITTED as READ
+/// COMMITTED and holds it as a level of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Isolation {
+    ReadUncommitted,
+    #[default]
+    ReadCommitted,
+}
+
+/// Where an isolation level is named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Isolated {
+    Begin,
+    Transaction,
+    Session,
+}
+
+/// The isolation levels of a writer's transactions: the session's, the transaction's, and whether
+/// a statement of the transaction has read, as PostgreSQL's first snapshot of a transaction is
+/// taken; and the session's when the transaction began, which a ROLLBACK puts back.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Levels {
+    session: Isolation,
+    transaction: Isolation,
+    read: bool,
+    session_at_begin: Isolation,
+}
+
+impl Levels {
+    /// A transaction begun, at the level named or else the session's.
+    pub(crate) fn begin(&mut self, level: Option<Isolation>) {
+        self.transaction = level.unwrap_or(self.session);
+        self.read = false;
+        self.session_at_begin = self.session;
+    }
+
+    /// A statement of the transaction that reads, or writes.
+    pub(crate) fn read(&mut self) {
+        self.read = true;
+    }
+
+    /// A level named outside BEGIN, `begun` whether a transaction is: SET TRANSACTION's, which
+    /// outside a transaction does nothing, and inside one only before its first read where it
+    /// changes the level; or SET SESSION CHARACTERISTICS's.
+    pub(crate) fn set(&mut self, level: Isolation, at: Isolated, begun: bool) -> Result<()> {
+        match at {
+            Isolated::Transaction if begun => {
+                if level != self.transaction && self.read {
+                    return Err(Error::new(
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                    ));
+                }
+                self.transaction = level;
+            }
+            Isolated::Session => self.session = level,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The transaction ended: committed, or rolled back, its SET SESSION undone.
+    pub(crate) fn end(&mut self, committed: bool) {
+        if !committed {
+            self.session = self.session_at_begin;
+        }
+    }
 }
 
 impl Statement {
     pub fn kind(&self) -> &'static str {
         match self {
             Statement::Begin => "BEGIN",
+            Statement::Isolation {
+                at: Isolated::Begin,
+                ..
+            } => "BEGIN",
+            Statement::Isolation { .. } => "SET",
             Statement::Commit => "COMMIT",
             Statement::Rollback => "ROLLBACK",
             Statement::Insert { .. } => "INSERT",
@@ -135,6 +217,36 @@ impl Statement {
 
 fn refused(what: &str) -> Error {
     Error::new(format!("{what} is not written"))
+}
+
+/// The isolation level a transaction's modes name, the last of them as PostgreSQL takes it; none
+/// where they name none. READ WRITE is a transaction of the snail's; READ ONLY, and a level the
+/// snail does not run, are refused by name.
+fn isolation(modes: &[sqlparser::ast::TransactionMode]) -> Result<Option<Isolation>> {
+    use sqlparser::ast::{
+        TransactionAccessMode, TransactionIsolationLevel as Level, TransactionMode,
+    };
+    let mut level = None;
+    for m in modes {
+        match m {
+            TransactionMode::AccessMode(TransactionAccessMode::ReadWrite) => {}
+            TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) => {
+                return Err(Error::new(
+                    "READ ONLY is not read: a transaction of the snail's reads and writes",
+                ))
+            }
+            TransactionMode::IsolationLevel(l) => level = Some(*l),
+        }
+    }
+    match level {
+        None => Ok(None),
+        Some(Level::ReadUncommitted) => Ok(Some(Isolation::ReadUncommitted)),
+        Some(Level::ReadCommitted) => Ok(Some(Isolation::ReadCommitted)),
+        Some(Level::Snapshot) => Err(Error::new("syntax error at or near \"SNAPSHOT\"")),
+        Some(other) => Err(Error::new(format!(
+            "ISOLATION LEVEL {other} is not read: the snail's transactions are READ COMMITTED"
+        ))),
+    }
 }
 
 fn table_index(catalog: &Catalog, name: &ObjectName) -> Result<usize> {
@@ -699,7 +811,32 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
     match s {
         Sql::StartTransaction {
             modes, statements, ..
-        } if modes.is_empty() && statements.is_empty() => Ok(Statement::Begin),
+        } if statements.is_empty() => Ok(match isolation(modes)? {
+            None => Statement::Begin,
+            Some(level) => Statement::Isolation {
+                level,
+                at: Isolated::Begin,
+            },
+        }),
+        Sql::Set(sqlparser::ast::Set::SetTransaction {
+            modes,
+            snapshot: None,
+            session,
+        }) => Ok(match isolation(modes)? {
+            None => Statement::Setting {
+                name: match session {
+                    true => "default_transaction_read_only".into(),
+                    false => "transaction_read_only".into(),
+                },
+            },
+            Some(level) => Statement::Isolation {
+                level,
+                at: match session {
+                    true => Isolated::Session,
+                    false => Isolated::Transaction,
+                },
+            },
+        }),
         Sql::Commit { chain: false, .. } => Ok(Statement::Commit),
         Sql::Rollback {
             chain: false,
