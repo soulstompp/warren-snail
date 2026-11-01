@@ -936,6 +936,10 @@ fn main() -> warren_snail::Result<()> {
   names.
 - `read::Snails` opens several snails together, to read (`open`, `open_holding`) or to write
   (`open_writing`), and asks and executes as one snail does.
+- `hand` gives a snail, or `Snails`, a function of the caller's, called from SQL by its name as any
+  function is: `read::handed::Function` makes a scalar, an aggregate (its `handed::Fold` taking a
+  group's rows in the order its `ORDER BY` gives) or a set-returning one, of the argument types it
+  names; `handed::row_type` names the row of several columns one returns.
 - `write::write_from` writes a new snail from a `catalog::Catalog` and each table's `write::Rows`.
 - `carried_by` gives a snail open to write its `carry::Host`; `carry::apply` and `carry::copy` keep
   a follower.

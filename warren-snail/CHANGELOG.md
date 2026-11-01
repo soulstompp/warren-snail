@@ -95,6 +95,11 @@ at once, and a snail written inside a host that decides its commits.
 - The commands `catalog`, what the snail reads of a DDL, a statement at a time; `read --text`;
   `write --release` and `--lc-monetary`, for a Parquet file that names neither, and refused where
   they disagree with one that does; each command's own `--help`.
+- Functions a caller hands in (`Snail::hand`, `Snails::hand`, `read::handed`): scalar, aggregate and
+  set-returning, a row of several columns among what they return, each call typed by its
+  signature before any row; an aggregate's rows in its `ORDER BY`'s order, rows that tie in the
+  order its step reads them. `jsonb_populate_record`, `json_populate_record`, their `recordset`
+  forms and `jsonb_populate_record_valid`; a `ROW(…)` cast to a table's row type or a composite.
 
 ## 0.1.1
 
