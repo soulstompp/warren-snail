@@ -205,7 +205,6 @@ pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::Ke
     BLOCKS + h.finish() % BLOCK_BYTES
 }
 
-
 /// The two bytes of a row's lock, its key's and the rest's, from its table's place in the catalog
 /// and its key's bytes, the same in every build of this version; they fall among the block bytes.
 pub(crate) fn row_bytes(table: usize, key: &[u8]) -> (u64, u64) {

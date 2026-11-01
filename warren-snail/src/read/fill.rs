@@ -1,7 +1,7 @@
 //! A row as a write fills it: a value assigned to a column of another type as PostgreSQL's
 //! assignment casts take it, a stored generated column computed, and a table's CHECKs checked.
 
-use super::pipeline::{eval_on, Casings, Value};
+use super::pipeline::{eval_on, eval_on_as, Casings, Value};
 use super::statement::{Datum, Row};
 use crate::catalog::{ColumnType, Table};
 use crate::numeric::Numeric;
@@ -481,6 +481,30 @@ pub fn generate(table: &Table, row: &mut Row) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The value an UPDATE sets column `c` of a row to: its expression read on the row's old values,
+/// the table's columns named as `by` names them or by their names alone, assigned to the column.
+pub fn set_to(
+    table: &Table,
+    row: &Row,
+    c: usize,
+    e: &sqlparser::ast::Expr,
+    by: &str,
+) -> Result<Datum> {
+    let col = &table.columns[c];
+    assign_value(
+        eval_on_as(
+            e,
+            Some(by),
+            &names(table),
+            &values(table, row),
+            table.release,
+            &Casings::of_table(table, &[]),
+        )?,
+        col.ty,
+        &col.name,
+    )
 }
 
 /// The row with its virtual columns computed, as a read gives it.

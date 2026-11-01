@@ -50,13 +50,15 @@ impl Datum {
 pub type Row = Vec<Datum>;
 
 /// Where an inserted row's value comes from: a literal, a column of the question's answer, or
-/// the column's DEFAULT, which an identity's sequence or its DDL hands out, or else NULL.
+/// the column's DEFAULT, which an identity's sequence or its DDL hands out, or else NULL; and
+/// where an UPDATE sets one to an expression, the expression, read on the row's old values.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Fill {
     Literal(Datum),
     Answer(usize),
     Default,
+    Expression(String),
 }
 
 #[derive(Clone, Debug)]
@@ -667,26 +669,14 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
     })
 }
 
-/// The question that finds a table's rows, every column it stores in the table's order, and after
-/// them each value `computed` gives, on the row's old values.
-fn finder(
-    table: &Table,
-    relation: &TableWithJoins,
-    selection: Option<&Expr>,
-    computed: &[&Expr],
-) -> String {
+/// The question that finds a table's rows, every column it stores in the table's order.
+fn finder(table: &Table, relation: &TableWithJoins, selection: Option<&Expr>) -> String {
     // Its stored columns: a virtual one is computed again from them.
     let columns = table
         .columns
         .iter()
         .filter(|c| !c.is_virtual())
         .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
-        .chain(
-            computed
-                .iter()
-                .enumerate()
-                .map(|(k, e)| format!("({e}) AS \"?set{}\"", k + 1)),
-        )
         .collect::<Vec<_>>()
         .join(", ");
     match selection {
@@ -885,7 +875,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         return Err(refused("OVERRIDING SYSTEM VALUE or USER VALUE"));
     }
     // A question with locking clauses is asked as it stands: sqlparser reads only two of them.
-    let first = tokens.iter().find(|t| !matches!(t, sqlparser::tokenizer::Token::Whitespace(_)));
+    let first = tokens
+        .iter()
+        .find(|t| !matches!(t, sqlparser::tokenizer::Token::Whitespace(_)));
     let select = matches!(first, Some(sqlparser::tokenizer::Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("select"));
     if select && super::locking::clauses(sql)?.is_some() {
         return Ok(Statement::Question {
@@ -946,8 +938,6 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             let ti = one_table(catalog, &u.table)?;
             let table = &catalog.tables[ti];
             let mut sets: Vec<(usize, Fill)> = Vec::new();
-            // A value set by an expression is the finder's answer, read on the row's old values.
-            let mut computed = Vec::new();
             for a in &u.assignments {
                 let c = match &a.target {
                     AssignmentTarget::ColumnName(n) => column_index(table, n)?,
@@ -966,14 +956,12 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                 {
                     sets.push((c, Fill::Literal(datum(&a.value, table, c)?)));
                 } else {
-                    sets.push((c, Fill::Answer(computed.len())));
-                    computed.push(&a.value);
+                    sets.push((c, Fill::Expression(a.value.to_string())));
                 }
             }
-            let find = finder(table, &u.table, u.selection.as_ref(), &computed);
             Ok(Statement::Set {
                 table: ti,
-                find,
+                find: finder(table, &u.table, u.selection.as_ref()),
                 sets,
             })
         }
@@ -999,7 +987,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             let ti = one_table(catalog, t)?;
             Ok(Statement::Delete {
                 table: ti,
-                find: finder(&catalog.tables[ti], t, d.selection.as_ref(), &[]),
+                find: finder(&catalog.tables[ti], t, d.selection.as_ref()),
             })
         }
         Sql::Query(_) => Ok(Statement::Question {
@@ -1161,15 +1149,14 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // A value an expression sets is the finder's answer after the row's columns.
+        // A value an expression sets is read on the row's old values the finder finds.
         match parse(&c, "UPDATE s.t SET b = b || 'z', a = a + $1 WHERE a = 1").unwrap() {
             Statement::Set { find, sets, .. } => {
-                assert_eq!(
-                    find,
-                    "SELECT \"a\", \"b\", \"at\", (b || 'z') AS \"?set1\", (a + $1) AS \"?set2\" \
-                     FROM s.t WHERE a = 1"
-                );
-                assert!(matches!(&sets[..], [(1, Fill::Answer(0)), (0, Fill::Answer(1))]));
+                assert_eq!(find, "SELECT \"a\", \"b\", \"at\" FROM s.t WHERE a = 1");
+                assert!(matches!(
+                    &sets[..],
+                    [(1, Fill::Expression(b)), (0, Fill::Expression(a))] if b == "b || 'z'" && a == "a + $1"
+                ));
             }
             other => panic!("{other:?}"),
         }
@@ -1207,7 +1194,10 @@ mod tests {
                 "INSERT INTO s.t (a) OVERRIDING SYSTEM VALUE VALUES (1)",
                 "OVERRIDING",
             ),
-            ("UPDATE s.t SET b = 'x', b = 'y' WHERE a = 1", "multiple assignments"),
+            (
+                "UPDATE s.t SET b = 'x', b = 'y' WHERE a = 1",
+                "multiple assignments",
+            ),
             ("INSERT INTO s.u (n, a) VALUES (70000, 1)", "out of range"),
             ("TRUNCATE s.t", "TRUNCATE"),
             ("BEGIN; COMMIT", "one statement at a time"),

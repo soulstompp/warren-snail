@@ -5917,9 +5917,24 @@ pub(crate) fn eval_on(
     release: u8,
     casings: &Casings,
 ) -> Result<Value> {
+    eval_on_as(e, None, names, row, release, casings)
+}
+
+/// An expression on one row, its columns named as `by` names them, or by their names alone.
+pub(crate) fn eval_on_as(
+    e: &Expr,
+    by: Option<&str>,
+    names: &[String],
+    row: &[Value],
+    release: u8,
+    casings: &Casings,
+) -> Result<Value> {
     let types = super::typed::Types::new();
     let frame = Frame {
-        columns: names.iter().map(|n| (None, n.clone())).collect(),
+        columns: names
+            .iter()
+            .map(|n| (by.map(str::to_string), n.clone()))
+            .collect(),
         params: &[],
         release,
         casings,

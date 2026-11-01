@@ -107,7 +107,11 @@ pub(crate) fn clauses(sql: &str) -> Result<Option<Locking>> {
         }
         out
     };
-    let at = |i: usize, w: &str| words.get(i).is_some_and(|x| x.0 == 0 && x.1.as_deref() == Some(w));
+    let at = |i: usize, w: &str| {
+        words
+            .get(i)
+            .is_some_and(|x| x.0 == 0 && x.1.as_deref() == Some(w))
+    };
     let mut clauses = Vec::new();
     let mut cut: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -306,10 +310,18 @@ fn count(e: &Expr, params: &[String], what: &str) -> Result<Option<u64>> {
                     .cloned()
                     .ok_or_else(|| Error::new(format!("there is no parameter {p}")))?
             }
-            _ => return Err(Error::new(format!("{what} {e} is not read beside a locking clause"))),
+            _ => {
+                return Err(Error::new(format!(
+                    "{what} {e} is not read beside a locking clause"
+                )))
+            }
         },
         Expr::Identifier(i) if i.value.eq_ignore_ascii_case("all") => return Ok(None),
-        _ => return Err(Error::new(format!("{what} {e} is not read beside a locking clause"))),
+        _ => {
+            return Err(Error::new(format!(
+                "{what} {e} is not read beside a locking clause"
+            )))
+        }
     };
     let n: i64 = text
         .trim()
@@ -348,17 +360,23 @@ impl Snail {
             _ => return Err(Error::new(format!("{first} is read only on a SELECT"))),
         };
         if s.distinct.is_some() {
-            return Err(Error::new(format!("{first} is not allowed with DISTINCT clause")));
+            return Err(Error::new(format!(
+                "{first} is not allowed with DISTINCT clause"
+            )));
         }
         let grouped = !matches!(
             &s.group_by,
             sqlparser::ast::GroupByExpr::Expressions(e, m) if e.is_empty() && m.is_empty()
         );
         if grouped {
-            return Err(Error::new(format!("{first} is not allowed with GROUP BY clause")));
+            return Err(Error::new(format!(
+                "{first} is not allowed with GROUP BY clause"
+            )));
         }
         if s.having.is_some() {
-            return Err(Error::new(format!("{first} is not allowed with HAVING clause")));
+            return Err(Error::new(format!(
+                "{first} is not allowed with HAVING clause"
+            )));
         }
         let items: Vec<&Expr> = s
             .projection
@@ -371,10 +389,14 @@ impl Snail {
         let calls: Vec<(bool, bool, bool)> =
             items.iter().map(|e| super::pipeline::calls_in(e)).collect();
         if calls.iter().any(|c| c.0) {
-            return Err(Error::new(format!("{first} is not allowed with aggregate functions")));
+            return Err(Error::new(format!(
+                "{first} is not allowed with aggregate functions"
+            )));
         }
         if calls.iter().any(|c| c.1) {
-            return Err(Error::new(format!("{first} is not allowed with window functions")));
+            return Err(Error::new(format!(
+                "{first} is not allowed with window functions"
+            )));
         }
         if calls.iter().any(|c| c.2) {
             return Err(Error::new(format!(
@@ -462,7 +484,12 @@ impl Snail {
             };
             locked.push(Locked {
                 table: *ti,
-                name: table.name.rsplit('.').next().unwrap_or(&table.name).to_string(),
+                name: table
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&table.name)
+                    .to_string(),
                 strength,
                 waits: named.iter().map(|c| c.waits).max().unwrap_or(Waits::Wait),
                 key: key
@@ -500,9 +527,7 @@ impl Snail {
                     offset = count(&o.value, params, "OFFSET")?.unwrap_or(0);
                 }
             }
-            Some(other) => {
-                return Err(Error::new(format!("{other} is not read beside {first}")))
-            }
+            Some(other) => return Err(Error::new(format!("{other} is not read beside {first}"))),
         }
         Ok(Plan {
             asked: q.to_string(),
@@ -549,7 +574,12 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let repeatable = self.levels.repeatable(self.begun.is_some());
         let plan = self.lock_plan(l, params, repeatable)?;
-        let file = self.writer.as_ref().expect("a snail open to write").file().try_clone()?;
+        let file = self
+            .writer
+            .as_ref()
+            .expect("a snail open to write")
+            .file()
+            .try_clone()?;
         for t in &plan.locked {
             self.take_bytes(&[(lock::lockers_byte(t.table), true)], Waiting::Try)?;
         }
@@ -557,15 +587,16 @@ impl Snail {
         'round: loop {
             let base = self.root.generation;
             let (batch, round) = self.answer_with(&plan.asked, order, params)?;
-            let rows: Vec<Row> = rows_of(
-                &batch.project(&(plan.width..batch.num_columns()).collect::<Vec<_>>())?,
-            )?;
+            let rows: Vec<Row> =
+                rows_of(&batch.project(&(plan.width..batch.num_columns()).collect::<Vec<_>>())?)?;
             let kept: Vec<usize> = match &found {
                 None => {
                     found = Some(rows.iter().cloned().collect());
                     (0..rows.len()).collect()
                 }
-                Some(first) => (0..rows.len()).filter(|&r| first.contains(&rows[r])).collect(),
+                Some(first) => (0..rows.len())
+                    .filter(|&r| first.contains(&rows[r]))
+                    .collect(),
             };
             // A table a writer changed rows of without naming them: its rows wait for that writer.
             let mut skipped = vec![false; plan.locked.len()];
@@ -666,11 +697,10 @@ impl Snail {
             .and_then(|_| self.answer_with(&plan.asked, order, params));
         (self.root, self.catalog) = (root, catalog);
         let (batch, _) = asked?;
-        let now: HashSet<Row> = rows_of(
-            &batch.project(&(plan.width..batch.num_columns()).collect::<Vec<_>>())?,
-        )?
-        .into_iter()
-        .collect();
+        let now: HashSet<Row> =
+            rows_of(&batch.project(&(plan.width..batch.num_columns()).collect::<Vec<_>>())?)?
+                .into_iter()
+                .collect();
         if locked.iter().any(|&r| !now.contains(&rows[r])) {
             return Err(Error::new(
                 "could not serialize access due to concurrent update",

@@ -879,9 +879,9 @@ impl Snails {
                 "a table is declared on its own snail: open it alone to write",
             )),
             Statement::Setting { .. } => self.snails[0].execute(sql),
-            Statement::Question { .. } => Err(Error::new(
-                "a SELECT across snails is a question: ask it",
-            )),
+            Statement::Question { .. } => {
+                Err(Error::new("a SELECT across snails is a question: ask it"))
+            }
             // Each snail holds the transaction's level, and refuses a change after its first read.
             Statement::Isolation { .. } => {
                 let mut done = Done::default();

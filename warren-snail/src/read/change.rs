@@ -408,6 +408,31 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
     })
 }
 
+/// The relation a finder reads, as written, and the name it reads the table by: its alias, or the
+/// last part of its name.
+fn finder_relation(find: &str) -> Result<(String, String)> {
+    use sqlparser::ast::{ObjectNamePart, SetExpr, Statement as Sql, TableFactor};
+    let parsed =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, find)?;
+    if let [Sql::Query(q)] = parsed.as_slice() {
+        if let SetExpr::Select(s) = q.body.as_ref() {
+            if let Some(TableFactor::Table { name, alias, .. }) =
+                s.from.first().map(|f| &f.relation)
+            {
+                let by = match alias {
+                    Some(a) => crate::catalog::ident(&a.name),
+                    None => match name.0.last() {
+                        Some(ObjectNamePart::Identifier(i)) => crate::catalog::ident(i),
+                        _ => crate::catalog::object_name(name),
+                    },
+                };
+                return Ok((s.from[0].relation.to_string(), by));
+            }
+        }
+    }
+    Err(Error::new("an UPDATE names a table"))
+}
+
 /// The type of each column of a question's answer, as the snail answers a column of that type;
 /// refused where one that `fills` names, each a column of table `ti` and the answer's column that
 /// fills it, is not assigned to its column by PostgreSQL's assignment casts. They are checked
@@ -747,7 +772,10 @@ impl Snail {
             self.renew_in_transaction()?;
             // At REPEATABLE READ, the generation the first read takes is the transaction's.
             self.held = self.levels.repeatable(true)
-                && !matches!(st, Statement::Setting { .. } | Statement::Constraints { .. });
+                && !matches!(
+                    st,
+                    Statement::Setting { .. } | Statement::Constraints { .. }
+                );
         }
         self.rounds += 1;
         let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);
@@ -1037,7 +1065,8 @@ impl Snail {
                                 _ => None,
                             })
                             .collect();
-                        let types = assigned_types(&self.catalog, &question, &batch, table, &fills)?;
+                        let types =
+                            assigned_types(&self.catalog, &question, &batch, table, &fills)?;
                         let t = &self.catalog.tables[table];
                         let mut given = Vec::new();
                         for a in rows_of(&batch)? {
@@ -1095,7 +1124,9 @@ impl Snail {
             | Statement::Setting { .. }
             | Statement::Isolation { .. }
             | Statement::Question { .. } => {
-                unreachable!("a transaction's own statements, a setting and a question write no rows")
+                unreachable!(
+                    "a transaction's own statements, a setting and a question write no rows"
+                )
             }
         })
     }
@@ -1121,39 +1152,41 @@ impl Snail {
                 )));
             }
         }
-        let (batch, _) = self.answer(&find, None)?;
-        // The finder's answer holds the row's stored columns, then each value an expression sets,
-        // read on the row's old values.
-        let stored = t.columns.iter().filter(|c| !c.is_virtual()).count();
-        let fills: Vec<(usize, usize)> = sets
-            .iter()
-            .filter_map(|(c, f)| match f {
-                Fill::Answer(i) => Some((*c, stored + i)),
-                _ => None,
-            })
-            .collect();
-        let types = assigned_types(&self.catalog, &find, &batch, table, &fills)?;
-        // Where the pipeline answered the finder, each stored column is taken back to its column's own
-        // type, as the table holds it.
-        let columns: Vec<usize> = (0..t.columns.len())
-            .filter(|&c| !t.columns[c].is_virtual())
-            .collect();
-        let mut rows: Vec<Row> = Vec::new();
-        for mut r in rows_of(&batch)? {
-            let computed = r.split_off(stored);
-            if !fills.is_empty() {
-                for (i, &c) in columns.iter().enumerate() {
-                    if types[i] != t.columns[c].ty {
-                        let d = std::mem::replace(&mut r[i], Datum::Null);
-                        r[i] = fill::assign(d, types[i], t.columns[c].ty, &t.columns[c].name)?;
-                    }
+        // Each expression a column is set to, typed before any row is read, as PostgreSQL types it
+        // against the column: read on the finder's relation, by the name it reads the table by.
+        let (relation, by) = finder_relation(&find)?;
+        let mut computed: Vec<(usize, sqlparser::ast::Expr)> = Vec::new();
+        for (c, f) in &sets {
+            if let Fill::Expression(text) = f {
+                let e = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+                    .try_with_sql(text)?
+                    .parse_expr()?;
+                computed.push((*c, e));
+            }
+        }
+        if !computed.is_empty() {
+            let typing = format!(
+                "SELECT {} FROM {relation}",
+                computed
+                    .iter()
+                    .map(|(_, e)| format!("({e})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for ((c, _), from) in computed.iter().zip(stated_types(&self.catalog, &typing)) {
+                let col = &t.columns[*c];
+                if let Some(from) = from.filter(|&from| !assignable(from, col.ty)) {
+                    return Err(Error::new(format!(
+                        "column \"{}\" is of type {} but expression is of type {}",
+                        col.name,
+                        col.ty.pg_name(),
+                        from.pg_name().split('(').next().unwrap_or_default()
+                    )));
                 }
             }
-            let mut row = widen(&t, vec![r]).remove(0);
-            row.extend(computed);
-            rows.push(row);
         }
-        let old = self.kept_to(table, rows, found)?;
+        let (batch, _) = self.answer(&find, None)?;
+        let old = self.kept_to(table, widen(&t, rows_of(&batch)?), found)?;
         done.rows = old.len() as u64;
         let defaults: Vec<usize> = sets
             .iter()
@@ -1161,21 +1194,21 @@ impl Snail {
             .map(|(c, _)| *c)
             .collect();
         let mut drawn = self.draws(&t, defaults.iter().map(|&c| (c, old.len())))?;
-        let width = t.columns.len();
         let mut changes = Vec::with_capacity(old.len());
-        for mut o in old {
-            let computed = o.split_off(width);
+        for o in old {
             let mut n = o.clone();
             for (c, f) in &sets {
                 n[*c] = match f {
                     Fill::Literal(d) => d.clone(),
-                    Fill::Answer(i) => fill::assign(
-                        computed[*i].clone(),
-                        types[stored + i],
-                        t.columns[*c].ty,
-                        &t.columns[*c].name,
-                    )?,
-                    Fill::Default => self.default_of(&t, *c, &mut drawn)?,
+                    Fill::Expression(_) => {
+                        let e = &computed
+                            .iter()
+                            .find(|(k, _)| k == c)
+                            .expect("an expression")
+                            .1;
+                        fill::set_to(&t, &o, *c, e, &by)?
+                    }
+                    _ => self.default_of(&t, *c, &mut drawn)?,
                 };
             }
             fill::generate(&t, &mut n)?;
@@ -2502,7 +2535,15 @@ impl Snail {
                 if entry.child != b.child || replaced.contains_key(&path) {
                     continue;
                 }
-                // A block another writer has locked, or has written since, is read as it is.
+                // A block another writer has locked, or has written since, is read as it is; and so, in a
+                // transaction, is one the transaction does not hold, so that its read holds no writer
+                // to its end.
+                let held = self
+                    .locks
+                    .contains(&lock::block_byte_of(ti, oi, &entry.first));
+                if self.begun.is_some() && !held {
+                    continue;
+                }
                 if !self.lock_blocks(ti, oi, vec![entry.clone()], Waiting::Try)? {
                     continue;
                 }

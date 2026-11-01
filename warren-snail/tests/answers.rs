@@ -190,19 +190,47 @@ fn a_locking_clause_is_refused_by_name_on_every_read_path() {
     const OPENED: &str = "is not read on a snail opened to read: open it to write, and its rows \
                           are locked";
     for (q, lock, words) in [
-        ("SELECT t.id FROM a.t t WHERE t.id = 1 FOR UPDATE", "FOR UPDATE", OPENED),
+        (
+            "SELECT t.id FROM a.t t WHERE t.id = 1 FOR UPDATE",
+            "FOR UPDATE",
+            OPENED,
+        ),
         ("SELECT t.id FROM a.t t FOR SHARE", "FOR SHARE", OPENED),
-        ("SELECT t.id FROM a.t t FOR NO KEY UPDATE", "FOR NO KEY UPDATE", OPENED),
-        ("SELECT t.id FROM a.t t FOR KEY SHARE NOWAIT", "FOR KEY SHARE", OPENED),
-        ("SELECT t.id FROM a.t t FOR UPDATE NOWAIT", "FOR UPDATE", OPENED),
-        ("SELECT t.id FROM a.t t FOR SHARE SKIP LOCKED", "FOR SHARE", OPENED),
-        ("SELECT t.id FROM a.t t FOR UPDATE FOR SHARE", "FOR UPDATE", OPENED),
+        (
+            "SELECT t.id FROM a.t t FOR NO KEY UPDATE",
+            "FOR NO KEY UPDATE",
+            OPENED,
+        ),
+        (
+            "SELECT t.id FROM a.t t FOR KEY SHARE NOWAIT",
+            "FOR KEY SHARE",
+            OPENED,
+        ),
+        (
+            "SELECT t.id FROM a.t t FOR UPDATE NOWAIT",
+            "FOR UPDATE",
+            OPENED,
+        ),
+        (
+            "SELECT t.id FROM a.t t FOR SHARE SKIP LOCKED",
+            "FOR SHARE",
+            OPENED,
+        ),
+        (
+            "SELECT t.id FROM a.t t FOR UPDATE FOR SHARE",
+            "FOR UPDATE",
+            OPENED,
+        ),
         (
             "SELECT t.id, u.w FROM a.t t JOIN a.u u ON u.t_id = t.id FOR UPDATE OF t",
             "FOR UPDATE",
             OPENED,
         ),
-        ("SELECT abs(t.v) FROM a.t t FOR UPDATE", "FOR UPDATE", OPENED),
+        (
+            "SELECT abs(t.v) FROM a.t t FOR UPDATE",
+            "FOR UPDATE",
+            OPENED,
+        ),
         (
             "WITH x AS (SELECT t.id FROM a.t t) SELECT x.id FROM x FOR UPDATE",
             "FOR UPDATE",
