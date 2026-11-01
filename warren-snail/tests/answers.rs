@@ -71,7 +71,12 @@ fn ask(path: &std::path::Path, q: &str) -> RecordBatch {
 
 /// Column `c` as bigints, its type Int64.
 fn bigints(b: &RecordBatch, c: usize) -> Vec<Option<i64>> {
-    assert_eq!(b.column(c).data_type(), &DataType::Int64, "{:?}", b.schema());
+    assert_eq!(
+        b.column(c).data_type(),
+        &DataType::Int64,
+        "{:?}",
+        b.schema()
+    );
     let a = b.column(c).as_any().downcast_ref::<Int64Array>().unwrap();
     a.iter().collect()
 }
@@ -101,7 +106,11 @@ fn a_sum_is_a_bigint_of_smaller_integers_and_a_numeric_of_bigints() {
     let b = ask(&path, "SELECT sum(b.n) AS s FROM a.big b");
     assert_eq!(numerics(&b, 0), [Some(twice + 5)]);
     assert_eq!(
-        b.schema().field(0).metadata().get("pg_type").map(String::as_str),
+        b.schema()
+            .field(0)
+            .metadata()
+            .get("pg_type")
+            .map(String::as_str),
         Some("numeric")
     );
     let b = ask(
@@ -137,7 +146,10 @@ fn a_sum_is_a_bigint_of_smaller_integers_and_a_numeric_of_bigints() {
     assert_eq!(bigints(&b, 2), [Some(32767), Some(2), None]);
     let b = ask(&path, "SELECT sum(abs(t.sm)) AS s FROM a.t t");
     assert_eq!(bigints(&b, 0), [Some(65542)]);
-    let b = ask(&path, "WITH x AS (SELECT b.n FROM a.big b) SELECT sum(x.n) AS s FROM x");
+    let b = ask(
+        &path,
+        "WITH x AS (SELECT b.n FROM a.big b) SELECT sum(x.n) AS s FROM x",
+    );
     assert_eq!(numerics(&b, 0), [Some(twice + 5)]);
     let b = ask(
         &path,
@@ -158,4 +170,99 @@ fn a_sum_is_a_bigint_of_smaller_integers_and_a_numeric_of_bigints() {
         numerics(&b, 1),
         [Some(i128::from(MAX)), Some(twice), Some(twice + 5)]
     );
+}
+
+/// The words a question is refused in.
+fn refused(path: &std::path::Path, q: &str) -> String {
+    match fresh(path).ask(q, None) {
+        Ok(_) => panic!("{q}: answered"),
+        Err(e) => e.to_string(),
+    }
+}
+
+const NO_LOCK: &str = "is not read: a question takes no lock on the rows it reads";
+
+#[test]
+fn a_locking_clause_is_refused_by_name_on_every_read_path() {
+    let path = snail("locks");
+    for (q, lock) in [
+        (
+            "SELECT t.id FROM a.t t WHERE t.id = 1 FOR UPDATE",
+            "FOR UPDATE",
+        ),
+        ("SELECT t.id FROM a.t t FOR SHARE", "FOR SHARE"),
+        (
+            "SELECT t.id FROM a.t t FOR NO KEY UPDATE",
+            "FOR NO KEY UPDATE",
+        ),
+        (
+            "SELECT t.id FROM a.t t FOR KEY SHARE NOWAIT",
+            "FOR KEY SHARE",
+        ),
+        (
+            "SELECT t.id FROM a.t t FOR UPDATE NOWAIT",
+            "FOR UPDATE NOWAIT",
+        ),
+        (
+            "SELECT t.id FROM a.t t FOR SHARE SKIP LOCKED",
+            "FOR SHARE SKIP LOCKED",
+        ),
+        ("SELECT t.id FROM a.t t FOR UPDATE FOR SHARE", "FOR UPDATE"),
+        (
+            "SELECT t.id, u.w FROM a.t t JOIN a.u u ON u.t_id = t.id FOR UPDATE OF t",
+            "FOR UPDATE OF t",
+        ),
+        (
+            "SELECT t.g, count(*) FROM a.t t JOIN a.u u ON u.t_id = t.id GROUP BY t.g FOR SHARE",
+            "FOR SHARE",
+        ),
+        ("SELECT abs(t.v) FROM a.t t FOR UPDATE", "FOR UPDATE"),
+        (
+            "WITH x AS (SELECT t.id FROM a.t t) SELECT x.id FROM x FOR UPDATE",
+            "FOR UPDATE",
+        ),
+        (
+            "WITH x AS (SELECT t.id FROM a.t t FOR SHARE) SELECT x.id FROM x",
+            "FOR SHARE",
+        ),
+        (
+            "SELECT t.id, sum(t.v) OVER (ORDER BY t.id) FROM a.t t FOR KEY SHARE",
+            "FOR KEY SHARE",
+        ),
+    ] {
+        assert_eq!(refused(&path, q), format!("{lock} {NO_LOCK}"), "{q}");
+    }
+    // The words in a string or a name are no clause.
+    let b = ask(
+        &path,
+        "SELECT t.id AS \"for key share\" FROM a.t t WHERE t.s = 'for no key update'",
+    );
+    assert_eq!(b.num_rows(), 0);
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn an_insert_s_question_takes_no_lock_and_is_refused_naming_it() {
+    let path = snail("locks-insert");
+    let mut w = warren_snail::read::Snail::open_writing(&path).unwrap();
+    for (s, lock) in [
+        (
+            "INSERT INTO a.u (id, t_id, w) SELECT t.id + 100, t.id, t.v FROM a.t t FOR UPDATE",
+            "FOR UPDATE",
+        ),
+        (
+            "INSERT INTO a.u (id, t_id, w) SELECT t.id + 100, t.id, t.v FROM a.t t FOR KEY SHARE",
+            "FOR KEY SHARE",
+        ),
+    ] {
+        let e = w.execute(s).unwrap_err().to_string();
+        assert_eq!(e, format!("{lock} {NO_LOCK}"), "{s}");
+    }
+    // Without the clause the rows are written.
+    w.execute(
+        "INSERT INTO a.u (id, t_id, w) SELECT t.id + 100, t.id, t.v FROM a.t t WHERE t.id = 1",
+    )
+    .unwrap();
+    let b = w.ask("SELECT count(*) FROM a.u u", None).unwrap().0;
+    assert_eq!(weather::one(&b), 6);
 }

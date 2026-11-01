@@ -1032,10 +1032,12 @@ impl Snail {
         order: Option<&str>,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
+        question::unlocked_words(sql)?;
         let sql = &*spelled::spelled(sql)?;
         let parsed =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
         if let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() {
+            question::unlocked(q)?;
             if let Some(r) = computed(&self.catalog, q)? {
                 if order.is_some() {
                     return Err(Error::new(

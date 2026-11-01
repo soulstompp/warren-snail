@@ -1221,12 +1221,89 @@ fn relation(catalog: &Catalog, t: &TableFactor) -> Result<(usize, Option<String>
     }
 }
 
+/// A locking clause refused by name, here and in each step and subquery of a FROM: a question takes
+/// no lock on the rows it reads.
+pub(crate) fn unlocked(q: &sqlparser::ast::Query) -> Result<()> {
+    if let Some(lock) = q.locks.first() {
+        return Err(Error::new(format!(
+            "{lock} is not read: a question takes no lock on the rows it reads"
+        )));
+    }
+    if let Some(with) = &q.with {
+        for cte in &with.cte_tables {
+            unlocked(&cte.query)?;
+        }
+    }
+    unlocked_body(&q.body)
+}
+
+fn unlocked_body(body: &SetExpr) -> Result<()> {
+    match body {
+        SetExpr::Query(q) => unlocked(q),
+        SetExpr::SetOperation { left, right, .. } => {
+            unlocked_body(left)?;
+            unlocked_body(right)
+        }
+        SetExpr::Select(s) => {
+            for t in &s.from {
+                for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+                    if let TableFactor::Derived { subquery, .. } = f {
+                        unlocked(subquery)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The locking clauses sqlparser does not read, `FOR NO KEY UPDATE` and `FOR KEY SHARE`, refused by
+/// name before it parses the statement, as `unlocked` refuses the others.
+pub(crate) fn unlocked_words(sql: &str) -> Result<()> {
+    let lower = sql.to_ascii_lowercase();
+    if !(lower.contains("for") && lower.contains("key")) {
+        return Ok(());
+    }
+    let Ok(tokens) = sqlparser::tokenizer::Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize()
+    else {
+        return Ok(());
+    };
+    let words: Vec<Option<String>> = tokens
+        .iter()
+        .filter(|t| !matches!(t, sqlparser::tokenizer::Token::Whitespace(_)))
+        .map(|t| match t {
+            sqlparser::tokenizer::Token::Word(w) if w.quote_style.is_none() => {
+                Some(w.value.to_ascii_uppercase())
+            }
+            _ => None,
+        })
+        .collect();
+    let at = |i: usize, w: &str| words.get(i).and_then(Option::as_deref) == Some(w);
+    for i in 0..words.len() {
+        let strength = if at(i, "FOR") && at(i + 1, "NO") && at(i + 2, "KEY") && at(i + 3, "UPDATE")
+        {
+            "FOR NO KEY UPDATE"
+        } else if at(i, "FOR") && at(i + 1, "KEY") && at(i + 2, "SHARE") {
+            "FOR KEY SHARE"
+        } else {
+            continue;
+        };
+        return Err(Error::new(format!(
+            "{strength} is not read: a question takes no lock on the rows it reads"
+        )));
+    }
+    Ok(())
+}
+
 pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
+    unlocked_words(sql)?;
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
     let q = match statements.as_slice() {
         [Statement::Query(q)] => q,
         _ => return Err(Error::new("a question is one SELECT")),
     };
+    unlocked(q)?;
     if q.with.is_some() || q.limit_clause.is_some() || q.fetch.is_some() {
         return Err(Error::new("WITH, LIMIT and FETCH are not read"));
     }

@@ -597,6 +597,7 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         .source
         .as_deref()
         .ok_or_else(|| Error::new("an INSERT gives its rows"))?;
+    super::question::unlocked(q)?;
     if q.with.is_some() {
         return Err(refused("a write inside WITH"));
     }
@@ -689,6 +690,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
     if tokens.iter().any(|t| matches!(t, sqlparser::tokenizer::Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("overriding"))) {
         return Err(refused("OVERRIDING SYSTEM VALUE or USER VALUE"));
     }
+    super::question::unlocked_words(sql)?;
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
     let s = match statements.as_slice() {
         [s] => s,
