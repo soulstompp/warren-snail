@@ -1509,6 +1509,7 @@ pub(crate) fn head(tokens: &[Token]) -> (String, String) {
     let skip = [
         "OR",
         "REPLACE",
+        "MATERIALIZED",
         "UNIQUE",
         "TEMP",
         "TEMPORARY",
@@ -4526,6 +4527,20 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
         if let Some(r) = &k.rules {
             fact("collation", &k.name, "rules", r.clone());
         }
+    }
+    // Each view's columns, by the names its column list gives and its question returns.
+    for v in &c.views {
+        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &v.query);
+        let made = match parsed.as_deref() {
+            Ok([Statement::Query(q)]) => crate::read::view_columns(c, q).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let named: Vec<String> = made
+            .iter()
+            .enumerate()
+            .map(|(i, n)| v.columns.get(i).unwrap_or(n).clone())
+            .collect();
+        fact("view", &v.name, "columns", named.join(","));
     }
     out.sort();
     out
