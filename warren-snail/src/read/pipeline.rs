@@ -663,8 +663,33 @@ impl Casings {
                     None => self.implicit(then)?,
                 }
             }
+            // A pattern's, a distinctness's and an IN list's operands as a comparison's.
+            Expr::Like { expr, pattern, .. }
+            | Expr::ILike { expr, pattern, .. }
+            | Expr::SimilarTo { expr, pattern, .. } => self.operands(&[expr, pattern])?,
+            Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => self.operands(&[a, b])?,
+            Expr::InList { expr, list, .. } => {
+                let xs: Vec<&Expr> = std::iter::once(&**expr).chain(list).collect();
+                self.operands(&xs)?
+            }
             _ => None,
         })
+    }
+
+    /// The casing an operator's operands take, read alone: an explicit COLLATE's on any of them,
+    /// else the first a column or a function of one names.
+    fn operands(&self, xs: &[&Expr]) -> Result<Option<Casing>> {
+        for x in xs.iter().filter(|x| names_collate(x)) {
+            if let Some(k) = self.implicit(x)? {
+                return Ok(Some(k));
+            }
+        }
+        for x in xs {
+            if let Some(k) = self.implicit(x)? {
+                return Ok(Some(k));
+            }
+        }
+        Ok(None)
     }
 
     /// A step's collations derived before any row, over the columns its FROM reads: each of its
