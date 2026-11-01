@@ -539,6 +539,16 @@ fn a_document_s_arrows_on_one_table_are_read_as_a_step_reads_them() {
         weather::texts(b.column(1).as_ref()),
         [Some("5".into()), None, None, None]
     );
+    // A parameter beside a document is read as one, as a quoted literal is.
+    let params = [r#"{"x": 1}"#.to_string()];
+    let (b, _) = w
+        .ask_with(
+            "WITH x AS (SELECT j.id, j.doc FROM a.j j) SELECT x.id FROM x WHERE x.doc @> $1",
+            None,
+            &params,
+        )
+        .unwrap();
+    assert_eq!(weather::ints64(b.column(0).as_ref()), [Some(3)]);
 }
 
 #[test]
