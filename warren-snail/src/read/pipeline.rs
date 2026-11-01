@@ -420,6 +420,47 @@ pub(super) struct Frame<'a> {
     pub(super) types: &'a super::typed::Types,
     /// The statement's clock, in microseconds since 1970 UTC.
     pub(super) now: i64,
+    /// What answers the step's subqueries, where it has any.
+    pub(super) subqueries: Option<&'a dyn Subqueries>,
+}
+
+/// What answers a subquery an expression holds (a scalar subquery, EXISTS, IN, ANY or ALL over
+/// one), for the row the expression is read on.
+pub(super) trait Subqueries {
+    fn value(&self, e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Value>;
+}
+
+/// Whether an expression is one a subquery answers: a scalar subquery, EXISTS, IN or ANY or ALL
+/// over one.
+pub(super) fn is_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => {
+            matches!(right.as_ref(), Expr::Subquery(_))
+        }
+        _ => false,
+    }
+}
+
+/// How an expression's subqueries are found: those it holds outside any other, outermost first.
+pub(super) fn subqueries_in<'q>(e: &'q Expr, out: &mut Vec<&'q Expr>) {
+    if is_subquery(e) {
+        if let Expr::InSubquery { expr, .. }
+        | Expr::AnyOp { left: expr, .. }
+        | Expr::AllOp { left: expr, .. } = e
+        {
+            subqueries_in(expr, out);
+        }
+        out.push(e);
+        return;
+    }
+    let mut parts = parts_of(e);
+    if parts.is_empty() {
+        parts = super::collate::children(e);
+    }
+    for p in parts {
+        subqueries_in(p, out);
+    }
 }
 
 /// How the columns a statement reads and makes map case and order text, where not as the
@@ -893,15 +934,25 @@ pub(super) const MERGED: char = '\0';
 /// reference to the function's name reads that column, as PostgreSQL reads its whole row.
 pub(super) const SCALAR: char = '\u{1}';
 
+/// What marks the qualifier of a column of a query around a subquery, once for each query out: a
+/// reference finds it only where no nearer query has a column it names.
+pub(super) const OUTER: char = '\u{2}';
+
 /// A qualifier without its marks: the name of the relation it answers to.
 pub(super) fn unmarked(q: &str) -> &str {
-    q.trim_start_matches([MERGED, SCALAR])
+    q.trim_start_matches([MERGED, SCALAR, OUTER])
 }
 
-/// The places of the columns of a FROM a reference names: the one a star's reference names by its
-/// place; else each of that name, under the qualifier where the reference has one, a bare name
-/// passing over the columns a USING or NATURAL join merged away; else, for a bare name, the one
-/// column of the function in FROM of that name returning a scalar.
+/// How many queries out a column's relation stands.
+pub(super) fn outer_level(q: Option<&str>) -> usize {
+    q.map_or(0, |q| q.chars().take_while(|&c| c == OUTER).count())
+}
+
+/// The places of the columns of a FROM a reference names, in the nearest query that has one: the
+/// one a star's reference names by its place; else each of that name, under the qualifier where
+/// the reference has one, a bare name passing over the columns a USING or NATURAL join merged away;
+/// else, for a bare name, the one column of the function in FROM of that name returning a scalar.
+/// A qualified reference stays in the nearest query holding a relation of its qualifier.
 pub(super) fn naming<'c>(
     columns: impl Iterator<Item = (Option<&'c str>, &'c str)> + Clone,
     qualifier: Option<&str>,
@@ -910,26 +961,53 @@ pub(super) fn naming<'c>(
     if let (None, Some(at)) = (qualifier, name.strip_prefix(MERGED)) {
         return at.parse().map(|i| vec![i]).unwrap_or_default();
     }
-    let found: Vec<usize> = columns
+    let levels = columns
         .clone()
-        .enumerate()
-        .filter(|(_, (q, n))| {
-            *n == name
-                && match qualifier {
-                    Some(want) => q.map(unmarked) == Some(want),
-                    None => !q.is_some_and(|q| q.starts_with(MERGED)),
-                }
-        })
-        .map(|(i, _)| i)
-        .collect();
-    if !found.is_empty() || qualifier.is_some() {
-        return found;
+        .map(|(q, _)| outer_level(q))
+        .max()
+        .unwrap_or(0);
+    for level in 0..=levels {
+        let at = |q: Option<&str>| outer_level(q) == level;
+        let found: Vec<usize> = columns
+            .clone()
+            .enumerate()
+            .filter(|(_, (q, n))| {
+                at(*q)
+                    && *n == name
+                    && match qualifier {
+                        Some(want) => q.map(unmarked) == Some(want),
+                        None => !q.is_some_and(|q| q.trim_start_matches(OUTER).starts_with(MERGED)),
+                    }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+        if let Some(want) = qualifier {
+            if columns
+                .clone()
+                .any(|(q, _)| at(q) && q.map(unmarked) == Some(want))
+            {
+                return found;
+            }
+            continue;
+        }
+        let scalar: Vec<usize> = columns
+            .clone()
+            .enumerate()
+            .filter(|(_, (q, _))| {
+                at(*q)
+                    && q.and_then(|q| q.trim_start_matches(OUTER).strip_prefix(SCALAR))
+                        == Some(name)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !scalar.is_empty() {
+            return scalar;
+        }
     }
-    columns
-        .enumerate()
-        .filter(|(_, (q, _))| q.and_then(|q| q.strip_prefix(SCALAR)) == Some(name))
-        .map(|(i, _)| i)
-        .collect()
+    Vec::new()
 }
 
 /// The column an expression names, where it names one.
@@ -1047,6 +1125,11 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
         }
         // A field of a composite an aggregate or a function gives.
         Expr::CompoundFieldAccess { root, .. } => find_calls(root, out),
+        // What a subquery is compared with is the step's; the subquery's own calls are its own.
+        Expr::InSubquery { expr, .. } => find_calls(expr, out),
+        Expr::AnyOp { left, .. } | Expr::AllOp { left, .. } if is_subquery(e) => {
+            find_calls(left, out)
+        }
         Expr::Case {
             operand,
             conditions,
@@ -1093,7 +1176,7 @@ pub(super) fn is_set_returning(name: &str) -> bool {
 }
 
 /// The expressions an expression reads directly.
-fn parts_of(e: &Expr) -> Vec<&Expr> {
+pub(super) fn parts_of(e: &Expr) -> Vec<&Expr> {
     match e {
         Expr::Function(f) => match &f.args {
             FunctionArguments::List(l) => l
@@ -1145,7 +1228,14 @@ fn parts_of(e: &Expr) -> Vec<&Expr> {
         Expr::Array(a) => a.elem.iter().collect(),
         Expr::Tuple(xs) => xs.iter().collect(),
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => vec![expr, pattern],
+        // A subquery's own columns are its query's, read where it is answered.
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. }
+            if matches!(right.as_ref(), Expr::Subquery(_)) =>
+        {
+            vec![left]
+        }
         Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => vec![left, right],
+        Expr::InSubquery { expr, .. } => vec![expr],
         _ => Vec::new(),
     }
 }
@@ -3028,6 +3118,12 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
         return Ok(v.clone());
     }
     let ev = |x: &Expr| eval(x, row, frame, computed);
+    if is_subquery(e) {
+        return match frame.subqueries {
+            Some(s) => s.value(e, row, frame, computed),
+            None => Err(Error::new(format!("{e} is not read here"))),
+        };
+    }
     Ok(match e {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             let (q, n) = column_of(e).ok_or_else(|| Error::new(format!("{e} is not read")))?;
@@ -4997,7 +5093,12 @@ pub(super) struct Prepared<'q> {
     now: i64,
 }
 
-impl Prepared<'_> {
+impl<'q> Prepared<'q> {
+    /// The aggregates it folds.
+    pub(super) fn aggregates(&self) -> &[&'q Expr] {
+        &self.calls.aggregates
+    }
+
     /// The columns its expressions read of its FROM's: its select list's, its WHERE's, its HAVING's,
     /// its ORDER BY's own, its windows' partitions and orders, and those its FROM reads its
     /// relations by.
@@ -5365,6 +5466,10 @@ fn ungrouped(
         }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             let (q, n, _) = resolved(e, columns)?;
+            // A column of the query around a subquery is one value for each of its groups.
+            if outer_level(q.as_deref()) > 0 {
+                return None;
+            }
             let q = q.as_deref().map_or("", unmarked).to_string();
             (!decided.contains(&q.as_str())).then(|| (q, n.clone()))
         }
@@ -5599,6 +5704,8 @@ pub(super) fn prepare<'q>(
     release: u8,
     now: i64,
     joined: &[&'q Expr],
+    seeded: super::typed::Types,
+    around: &[usize],
 ) -> Result<Prepared<'q>> {
     let s = match q.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -5710,11 +5817,20 @@ pub(super) fn prepare<'q>(
                 )));
             }
         }
+        // A subquery read on each group reads only what is one value for it.
+        for &at in around {
+            let e = Expr::Identifier(sqlparser::ast::Ident::new(format!("{MERGED}{at}")));
+            if let Some((q, n)) = ungrouped(&e, &grouping, columns, &decided) {
+                return Err(Error::new(format!(
+                    "subquery uses ungrouped column \"{q}.{n}\" from outer query"
+                )));
+            }
+        }
     }
     let mut typing = super::typed::Typing {
         columns,
         release,
-        types: super::typed::Types::new(),
+        types: seeded,
     };
     let returns = items
         .iter()
@@ -5779,6 +5895,7 @@ pub(crate) fn eval_on(
         casings,
         types: &types,
         now: crate::scalars::transaction_clock(),
+        subqueries: None,
     };
     eval(e, row, &frame, &computed_none())
 }
@@ -5808,6 +5925,11 @@ pub(super) struct StepRun<'q> {
     seen: std::collections::HashSet<Vec<Key>>,
     /// The columns the step's FROM reads, as the last chunk gave them.
     columns: Columns,
+    /// What answers its subqueries, where it has any.
+    pub(super) subqueries: Option<&'q dyn Subqueries>,
+    /// The row a step that groups with no GROUP BY folds no row into reads its columns from: NULL,
+    /// where none is given.
+    pub(super) empty_row: Option<Vec<Value>>,
 }
 
 impl<'q> StepRun<'q> {
@@ -5821,6 +5943,8 @@ impl<'q> StepRun<'q> {
             held: Relation::default(),
             seen: Default::default(),
             columns: Vec::new(),
+            subqueries: None,
+            empty_row: None,
         }
     }
 
@@ -5864,6 +5988,7 @@ impl<'q> StepRun<'q> {
             casings,
             types: &self.p.types,
             now: self.p.now,
+            subqueries: self.subqueries,
         };
         let none = computed_none();
         if let Some(w) = self.p.selection {
@@ -6012,8 +6137,11 @@ impl<'q> StepRun<'q> {
         if self.p.grouped {
             if self.groups.is_empty() && self.p.grouping.is_empty() {
                 let accs = self.fresh()?;
-                self.groups
-                    .push((vec![Value::Null; self.columns.len()], accs));
+                let row = self
+                    .empty_row
+                    .take()
+                    .unwrap_or_else(|| vec![Value::Null; self.columns.len()]);
+                self.groups.push((row, accs));
             }
             let frame = Frame {
                 columns: std::mem::take(&mut self.columns),
@@ -6022,6 +6150,7 @@ impl<'q> StepRun<'q> {
                 casings,
                 types: &self.p.types,
                 now: self.p.now,
+                subqueries: self.subqueries,
             };
             for (first, accs) in &self.groups {
                 let computed = Computed {
@@ -6065,6 +6194,7 @@ impl<'q> StepRun<'q> {
                 casings,
                 types: &self.p.types,
                 now: self.p.now,
+                subqueries: self.subqueries,
             };
             let held = std::mem::take(&mut self.held);
             let per_row = windows::values(&self.p.calls.windows, &held, &frame)?;
@@ -6100,6 +6230,7 @@ impl<'q> StepRun<'q> {
                 casings,
                 types: &self.p.types,
                 now: self.p.now,
+                subqueries: self.subqueries,
             };
             l.cut(&mut out.rows, &keys, &frame)?;
         }
@@ -6385,7 +6516,16 @@ impl<'q> Stream<'q> {
                     .collect(),
                 _ => Vec::new(),
             };
-            let mut p = prepare(query, &columns, &keyed, release, now, &[])?;
+            let mut p = prepare(
+                query,
+                &columns,
+                &keyed,
+                release,
+                now,
+                &[],
+                Default::default(),
+                &[],
+            )?;
             // Its windows fold as the rows come only along the order of the one relation it reads.
             let input = match (streamed.as_slice(), query.body.as_ref()) {
                 ([only], SetExpr::Select(sel))
@@ -7958,9 +8098,26 @@ fn any_all(op: &BinaryOperator, x: Value, arr: Value, left: &Expr, any: bool) ->
     let Item::Array { elements, .. } = &c.item else {
         return Ok(Value::Null);
     };
+    compared_each(
+        op,
+        x,
+        elements.iter().map(|e| part_value(*element, e)),
+        left,
+        any,
+    )
+}
+
+/// `x op ANY` or `x op ALL` over values: each compared with `x`, true where one (or each) holds,
+/// NULL where none (or not every one) holds and one compared NULL; over none, false (or true).
+pub(super) fn compared_each(
+    op: &BinaryOperator,
+    x: Value,
+    values: impl Iterator<Item = Value>,
+    left: &Expr,
+    any: bool,
+) -> Result<Value> {
     let mut unknown = false;
-    for e in elements {
-        let v = part_value(*element, e);
+    for v in values {
         let (a, b) = beside(x.clone(), v, left, &Expr::value(SqlValue::Null))?;
         let t = match compare(&a, &b)? {
             None => None,

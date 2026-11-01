@@ -32,6 +32,7 @@ mod rest;
 mod sets;
 mod spelled;
 pub mod statement;
+mod subqueries;
 mod together;
 mod tsearch;
 mod typed;
@@ -111,7 +112,7 @@ pub(crate) fn old_names(catalog: &mut Catalog, format: u32) {
 }
 
 /// Calls `f` on each table a query's FROMs name, in its steps and in its body, each arm of a set
-/// operation among them.
+/// operation among them, and in its derived tables and subqueries.
 fn each_table(q: &mut sqlparser::ast::Query, f: &mut dyn FnMut(&mut sqlparser::ast::TableFactor)) {
     if let Some(with) = q.with.as_mut() {
         for cte in &mut with.cte_tables {
@@ -125,14 +126,40 @@ fn each_table_of(
     body: &mut sqlparser::ast::SetExpr,
     f: &mut dyn FnMut(&mut sqlparser::ast::TableFactor),
 ) {
-    use sqlparser::ast::SetExpr;
+    use sqlparser::ast::{SelectItem, SetExpr, TableFactor};
+    fn factor(t: &mut TableFactor, f: &mut dyn FnMut(&mut TableFactor)) {
+        f(t);
+        match t {
+            TableFactor::Derived { subquery, .. } => each_table(subquery, f),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                factor(&mut table_with_joins.relation, f);
+                for j in &mut table_with_joins.joins {
+                    factor(&mut j.relation, f);
+                }
+            }
+            _ => {}
+        }
+    }
     match body {
         SetExpr::Select(s) => {
             for item in &mut s.from {
-                f(&mut item.relation);
+                factor(&mut item.relation, f);
                 for j in &mut item.joins {
-                    f(&mut j.relation);
+                    factor(&mut j.relation, f);
                 }
+            }
+            let mut exprs: Vec<&mut sqlparser::ast::Expr> = Vec::new();
+            for p in &mut s.projection {
+                if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = p {
+                    exprs.push(e);
+                }
+            }
+            exprs.extend(s.selection.as_mut());
+            exprs.extend(s.having.as_mut());
+            for e in exprs {
+                subqueries::each_query_mut(e, &mut |q| each_table(q, f));
             }
         }
         SetExpr::SetOperation { left, right, .. } => {
@@ -1131,6 +1158,15 @@ impl Snail {
                 }
                 return self.ask_pipeline(&r, params);
             }
+            // A subquery is read by the pipeline over several relations.
+            if subqueries::held(q) {
+                if order.is_some() {
+                    return Err(Error::new(
+                        "a question holding a subquery chooses its orders itself",
+                    ));
+                }
+                return self.ask_pipeline(q, params);
+            }
             if pipeline::is_pipeline(q)
                 || relations::is_set_operation(q)
                 || pipeline::tests_composite_null(&self.catalog, q)
@@ -1175,7 +1211,7 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let _rows = handed::rows_of(&self.catalog);
         let q = &pipeline::windows::written(&spelled::between_written(q))?;
-        if relations::several(&self.catalog, q) {
+        if relations::several(&self.catalog, q) || subqueries::held(q) {
             return relations::answer(self, q, params);
         }
         let name = pipeline::table_named(q)?;

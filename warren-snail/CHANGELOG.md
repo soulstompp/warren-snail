@@ -69,6 +69,10 @@ at once, and a snail written inside a host that decides its commits.
   elements; each column typed as PostgreSQL's `select_common_type` types it, a quoted literal or a
   `NULL` read in the type found; sorted and limited over the whole, in a `WITH` and as a derived
   table.
+- Subqueries: scalar, `EXISTS`, `IN`, `ANY` and `ALL`, uncorrelated and correlated, in the select
+  list, `WHERE`, `HAVING` and `ORDER BY`, a row compared with one, and `LATERAL` in `FROM`; one
+  reading the query around it met with each row by the `=`s that tie them; `NOT IN` and `ALL` as
+  PostgreSQL answers them, and its refusals in its words.
 - The commands `types`, `operators` and `opclasses` list every type, operator and operator class
   PostgreSQL 14 to 19 defines, each held or refused in the snail's own words: a type by a table's
   column of it, an operator by a pipeline's step over columns of its types, an operator class by

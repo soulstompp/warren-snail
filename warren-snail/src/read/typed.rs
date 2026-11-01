@@ -241,6 +241,20 @@ impl Typing<'_> {
 
     fn resolve(&mut self, e: &Expr) -> Result<Option<ColumnType>> {
         Ok(match e {
+            // A scalar subquery's type is its column's, given before the step is typed; EXISTS, and
+            // IN, ANY or ALL over a subquery, are truths.
+            Expr::Subquery(_) => self.types.get(&(e as *const Expr)).copied(),
+            Expr::Exists { .. } => Some(ColumnType::Boolean),
+            Expr::InSubquery { expr, .. } => {
+                self.type_of(expr)?;
+                Some(ColumnType::Boolean)
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. }
+                if matches!(right.as_ref(), Expr::Subquery(_)) =>
+            {
+                self.type_of(left)?;
+                Some(ColumnType::Boolean)
+            }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => self.column(e),
             Expr::Nested(x) => self.type_of(x)?,
             Expr::Collate { expr, .. } => self.type_of(expr)?,

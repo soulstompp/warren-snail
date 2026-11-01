@@ -19,6 +19,7 @@ use sqlparser::ast::{
     SetQuantifier, TableAlias, TableFactor, TableWithJoins, Value as SqlValue,
 };
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Where the tables a question reads are read: one snail, or several opened together.
 pub(super) trait Reads {
@@ -34,6 +35,9 @@ pub(super) trait Reads {
 /// The mark a function's place in a FROM is named by, once lifted out of it.
 const CALLED: &str = "\0call";
 
+/// The mark a LATERAL subquery's place in a FROM is named by, once lifted out of it.
+const LATERAL: &str = "\0lateral";
+
 /// A relation the statement makes before its last SELECT, under the name its FROM reads it by: a
 /// WITH query, or a derived table, a VALUES list or a view lifted out of a FROM; last, the
 /// question itself, under no name.
@@ -46,6 +50,9 @@ struct Step {
     calls: Vec<Call>,
     /// A set operation's arms, where the step is one.
     set: Option<Arm>,
+    /// The LATERAL subqueries its FROM reads, each standing in its FROM under LATERAL and its place
+    /// here, with what its reads keep between the rows before it.
+    laterals: Vec<(Query, super::subqueries::Kept)>,
 }
 
 /// A function a FROM reads the rows of.
@@ -56,17 +63,59 @@ struct Call {
 }
 
 /// What a step made: its rows, and the type and the collation of each of its columns.
-struct Made {
-    rel: Relation,
-    types: Vec<Option<ColumnType>>,
+#[derive(Clone)]
+pub(super) struct Made {
+    pub(super) rel: Relation,
+    pub(super) types: Vec<Option<ColumnType>>,
     carried: Vec<Carried>,
+}
+
+/// The relations a statement made before a step, by the names its FROM reads them by.
+pub(super) type Steps = HashMap<String, Rc<Made>>;
+
+/// What every step of a statement reads by: the snail, the parameters, the release whose catalog
+/// names a reg* value, and the statement's clock.
+#[derive(Clone, Copy)]
+pub(super) struct Asked<'a> {
+    pub(super) reads: &'a dyn Reads,
+    pub(super) params: &'a [String],
+    pub(super) release: u8,
+    pub(super) now: i64,
+}
+
+/// The columns of the queries around a subquery, each qualifier marked once more for each query
+/// out, their values on the row it is answered for, and what its reads keep between rows.
+pub(super) struct Outer<'o> {
+    pub(super) columns: Vec<Col>,
+    pub(super) values: Vec<Value>,
+    pub(super) kept: &'o super::subqueries::Kept,
+}
+
+/// A column of a query, marked as one of the query around a subquery.
+pub(super) fn marked(c: &Col) -> Col {
+    Col {
+        qualifier: Some(format!(
+            "{}{}",
+            pipeline::OUTER,
+            c.qualifier.as_deref().unwrap_or_default()
+        )),
+        ..c.clone()
+    }
+}
+
+/// A step's FROM rows read once for every row a subquery is answered for, where they read nothing of
+/// the query around it, and their places by the keys of the =s that tie them to it.
+pub(super) struct Parted {
+    rows: Vec<Vec<Value>>,
+    order: Option<usize>,
+    index: Option<HashMap<Vec<pipeline::Key>, Vec<usize>>>,
 }
 
 /// The steps a question makes, in the order they are read: each WITH query, each relation lifted
 /// out of a FROM before the step that reads it, and the question last.
-fn steps(catalog: &Catalog, q: &Query) -> Result<Vec<Step>> {
+fn steps(catalog: &Catalog, q: &Query, before: &[String]) -> Result<Vec<Step>> {
     let mut out = Vec::new();
-    let mut visible: Vec<String> = Vec::new();
+    let mut visible: Vec<String> = before.to_vec();
     if let Some(with) = &q.with {
         if with.recursive {
             return Err(Error::new("WITH RECURSIVE is not read"));
@@ -108,11 +157,11 @@ fn lift(
     if query.with.is_some() {
         return Err(Error::new("a WITH inside a step is not read"));
     }
-    let mut calls = Vec::new();
+    let mut lifted = Lifted::default();
     match query.body.as_mut() {
         SetExpr::Select(s) => {
             for item in &mut s.from {
-                lift_join(catalog, out, visible, item, &mut calls)?;
+                lift_join(catalog, out, visible, item, &mut lifted)?;
             }
         }
         SetExpr::Values(_) => {
@@ -133,10 +182,23 @@ fn lift(
         name,
         query,
         renames,
-        calls,
+        calls: lifted.calls,
         set: None,
+        laterals: lifted
+            .laterals
+            .into_iter()
+            .map(|q| (q, Default::default()))
+            .collect(),
     });
     Ok(())
+}
+
+/// What a FROM keeps beside its step once lifted out of it: the functions it calls and the LATERAL
+/// subqueries it reads.
+#[derive(Default)]
+struct Lifted {
+    calls: Vec<Call>,
+    laterals: Vec<Query>,
 }
 
 fn lift_join(
@@ -144,11 +206,11 @@ fn lift_join(
     out: &mut Vec<Step>,
     visible: &[String],
     item: &mut TableWithJoins,
-    calls: &mut Vec<Call>,
+    lifted: &mut Lifted,
 ) -> Result<()> {
-    lift_factor(catalog, out, visible, &mut item.relation, calls)?;
+    lift_factor(catalog, out, visible, &mut item.relation, lifted)?;
     for j in &mut item.joins {
-        lift_factor(catalog, out, visible, &mut j.relation, calls)?;
+        lift_factor(catalog, out, visible, &mut j.relation, lifted)?;
     }
     Ok(())
 }
@@ -194,7 +256,7 @@ fn lift_factor(
     out: &mut Vec<Step>,
     visible: &[String],
     t: &mut TableFactor,
-    calls: &mut Vec<Call>,
+    lifted: &mut Lifted,
 ) -> Result<()> {
     let call = |name: &ObjectName, args: Vec<FunctionArg>| {
         Expr::Function(sqlparser::ast::Function {
@@ -310,19 +372,25 @@ fn lift_factor(
             *t = plain(&step, kept);
             return Ok(());
         }
-        TableFactor::Derived { lateral: true, .. } => {
-            return Err(Error::new(format!(
-                "{t} is not read: a LATERAL subquery reads the rows before it"
-            )))
+        TableFactor::Derived {
+            lateral: true,
+            subquery,
+            alias,
+            sample: None,
+        } => {
+            lifted.laterals.push((**subquery).clone());
+            let at = lifted.laterals.len() - 1;
+            *t = plain(&format!("{LATERAL}{at}"), alias.take());
+            return Ok(());
         }
         TableFactor::NestedJoin {
             table_with_joins,
             alias: None,
-        } => return lift_join(catalog, out, visible, table_with_joins, calls),
+        } => return lift_join(catalog, out, visible, table_with_joins, lifted),
         other => return Err(Error::new(format!("{other} is not read in FROM"))),
     };
-    calls.push(Call { expr, ordinality });
-    *t = plain(&format!("{CALLED}{}", calls.len() - 1), alias);
+    lifted.calls.push(Call { expr, ordinality });
+    *t = plain(&format!("{CALLED}{}", lifted.calls.len() - 1), alias);
     Ok(())
 }
 
@@ -355,10 +423,10 @@ enum Kind {
 /// A column of a FROM: the name of the relation it answers to, marked where a USING or NATURAL
 /// join merged it away from a bare name, its own name, its type and the collation it carries.
 #[derive(Clone, Debug)]
-struct Col {
-    qualifier: Option<String>,
-    name: String,
-    ty: Option<ColumnType>,
+pub(super) struct Col {
+    pub(super) qualifier: Option<String>,
+    pub(super) name: String,
+    pub(super) ty: Option<ColumnType>,
     carried: Carried,
 }
 
@@ -388,6 +456,9 @@ enum What {
     Made { name: String, qualifier: String },
     /// A function's rows, made for each row of the relations before it.
     Call { call: Call, qualifier: String },
+    /// A LATERAL subquery's rows, by its place among the step's, made for each row of the relations
+    /// before it.
+    Lateral { at: usize, qualifier: String },
     Join {
         left: Box<Node>,
         right: Box<Node>,
@@ -403,7 +474,8 @@ impl Node {
         match &self.what {
             What::Table { qualifier, .. }
             | What::Made { qualifier, .. }
-            | What::Call { qualifier, .. } => Some(qualifier),
+            | What::Call { qualifier, .. }
+            | What::Lateral { qualifier, .. } => Some(qualifier),
             What::Join { .. } => None,
         }
     }
@@ -419,10 +491,11 @@ impl Node {
         }
     }
 
-    /// Whether its rows are made for each row before it: its leftmost relation is a function's.
+    /// Whether its rows are made for each row before it: its leftmost relation is a function's or a
+    /// LATERAL subquery's.
     fn lateral(&self) -> bool {
         match &self.what {
-            What::Call { .. } => true,
+            What::Call { .. } | What::Lateral { .. } => true,
             What::Join { left, .. } => left.lateral(),
             _ => false,
         }
@@ -434,6 +507,8 @@ impl Node {
 struct From {
     columns: Vec<Col>,
     items: Vec<Node>,
+    /// Where the columns of the query around it begin, where it is a subquery's: after its own.
+    outer_at: usize,
 }
 
 impl From {
@@ -456,11 +531,16 @@ impl From {
     }
 }
 
-/// What laying a FROM out reads: the catalog, the steps made before, the step's functions.
+/// What laying a FROM out reads: the catalog, the steps made before, the step's functions and
+/// LATERAL subqueries, and the columns of the query around it, where it is a subquery's.
 struct Laying<'a> {
     catalog: &'a Catalog,
-    made: &'a HashMap<String, Made>,
+    made: &'a Steps,
     calls: &'a [Call],
+    laterals: &'a [(Query, super::subqueries::Kept)],
+    asked: Asked<'a>,
+    casings: &'a Casings,
+    outer: Option<&'a Outer<'a>>,
     release: u8,
     columns: Vec<Col>,
 }
@@ -488,6 +568,9 @@ impl Laying<'_> {
         if let Some(i) = n.strip_prefix(CALLED) {
             let call = self.calls[i.parse::<usize>().unwrap()].clone();
             return self.call(call, alias, renames);
+        }
+        if let Some(i) = n.strip_prefix(LATERAL) {
+            return self.lateral(i.parse::<usize>().unwrap(), alias, renames);
         }
         let (what, cols): (What, Vec<Col>) = if let Some(m) = self.made.get(&n) {
             let q = qualifier(&n);
@@ -647,6 +730,76 @@ impl Laying<'_> {
             at,
             width,
             star: (at..at + width).collect(),
+        })
+    }
+
+    /// A LATERAL subquery's rows: the columns its question returns, read over tables holding no
+    /// rows with the columns laid before it, and the query's around the step, as the query around
+    /// it.
+    fn lateral(
+        &mut self,
+        at: usize,
+        alias: &Option<TableAlias>,
+        renames: Vec<String>,
+    ) -> Result<Node> {
+        let place = self.columns.len();
+        let kept = super::subqueries::Kept::default();
+        let mut columns: Vec<Col> = self.columns.iter().map(marked).collect();
+        if let Some(o) = self.outer {
+            columns.extend(o.columns.iter().map(marked));
+        }
+        let outer = Outer {
+            values: vec![Value::Null; columns.len()],
+            columns,
+            kept: &kept,
+        };
+        let empty = Empty(self.catalog);
+        let asked = Asked {
+            reads: &empty,
+            ..self.asked
+        };
+        let (m, _) = made_by(
+            asked,
+            &self.laterals[at].0,
+            self.made,
+            self.casings,
+            Some(&outer),
+            &mut Accrued::default(),
+        )?;
+        let qualifier = alias
+            .as_ref()
+            .map(|a| crate::catalog::ident(&a.name))
+            .unwrap_or_else(|| format!("\u{3}lateral{at}"));
+        let mut cols: Vec<Col> = m
+            .rel
+            .names
+            .iter()
+            .zip(&m.types)
+            .zip(&m.carried)
+            .map(|((n, t), k)| Col {
+                qualifier: Some(qualifier.clone()),
+                name: n.clone(),
+                ty: *t,
+                carried: k.clone(),
+            })
+            .collect();
+        if renames.len() > cols.len() {
+            return Err(Error::new(format!(
+                "table \"{qualifier}\" has {} columns available but {} columns specified",
+                cols.len(),
+                renames.len()
+            )));
+        }
+        for (c, r) in cols.iter_mut().zip(&renames) {
+            c.name = r.clone();
+        }
+        let width = cols.len();
+        self.columns.extend(cols);
+        Ok(Node {
+            what: What::Lateral { at, qualifier },
+            at: place,
+            width,
+            star: (place..place + width).collect(),
         })
     }
 
@@ -925,7 +1078,7 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
 
 /// The words of a text as sqlparser's tokenizer reads them: a bare word folded, a quoted one as it
 /// is.
-fn words(text: &str) -> Vec<String> {
+pub(super) fn words(text: &str) -> Vec<String> {
     sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, text)
         .tokenize()
         .unwrap_or_default()
@@ -955,8 +1108,13 @@ struct Reading<'a> {
     casings: &'a Casings,
     types: &'a typed::Types,
     now: i64,
-    made: &'a HashMap<String, Made>,
+    made: &'a Steps,
     accrued: &'a mut Accrued,
+    /// What a LATERAL subquery reads by, its question and what it keeps, and the query around the
+    /// step, where it is a subquery's.
+    asked: Asked<'a>,
+    laterals: &'a [(Query, super::subqueries::Kept)],
+    outer: Option<&'a Outer<'a>>,
     /// What a node's read made, where it is read once.
     cached: HashMap<*const Node, Vec<Vec<Value>>>,
     /// Whether the rows a node makes keep their table's order, at a column of theirs.
@@ -965,13 +1123,17 @@ struct Reading<'a> {
 
 /// What the rounds a statement reads have read, in all and on each snail.
 #[derive(Default)]
-struct Accrued {
+pub(super) struct Accrued {
     round: Round,
     parts: Vec<Round>,
 }
 
 impl Accrued {
+    /// A round's reads added; a question read before and kept, read along no order, adds nothing.
     fn add(&mut self, r: &Round) {
+        if r.order.is_empty() {
+            return;
+        }
         let order = r.order.clone();
         self.round.add_table(r, &order);
         self.round.rows_walked += r.rows_walked;
@@ -1044,6 +1206,7 @@ impl Reading<'_> {
                 r
             }
             What::Call { call, .. } => self.called(node, call, before)?,
+            What::Lateral { at, .. } => self.laterally(node, *at, before)?,
             What::Join {
                 left,
                 right,
@@ -1392,6 +1555,49 @@ impl Reading<'_> {
         Ok(())
     }
 
+    /// A LATERAL subquery's rows for the row before it, its columns and the query's around the
+    /// step read as the query around it, each of its tables read from the file once.
+    fn laterally(
+        &mut self,
+        node: &Node,
+        at: usize,
+        before: Option<(usize, &[Value])>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (start, row): (usize, &[Value]) = before.unwrap_or((node.at, &[]));
+        let (q, kept) = &self.laterals[at];
+        let mut columns: Vec<Col> = self.from.columns[start..start + row.len()]
+            .iter()
+            .map(marked)
+            .collect();
+        let mut values = row.to_vec();
+        if let Some(o) = self.outer {
+            columns.extend(o.columns.iter().map(marked));
+            values.extend(o.values.iter().cloned());
+        }
+        let outer = Outer {
+            columns,
+            values,
+            kept,
+        };
+        let cached = super::subqueries::Cached {
+            reads: self.asked.reads,
+            kept,
+        };
+        let asked = Asked {
+            reads: &cached,
+            ..self.asked
+        };
+        let (m, _) = made_by(
+            asked,
+            q,
+            self.made,
+            self.casings,
+            Some(&outer),
+            self.accrued,
+        )?;
+        Ok(m.rel.rows)
+    }
+
     /// A function's rows for the row before it, or for none where nothing comes before it.
     fn called(
         &mut self,
@@ -1407,6 +1613,7 @@ impl Reading<'_> {
             casings: self.casings,
             types: self.types,
             now: self.now,
+            subqueries: None,
         };
         let values = pipeline::call_rows(&call.expr, row, &frame)?;
         let fields = node.width - call.ordinality as usize;
@@ -1451,6 +1658,7 @@ impl Reading<'_> {
             casings: self.casings,
             types: self.types,
             now: self.now,
+            subqueries: None,
         };
         let none = pipeline::computed_none();
         // The pairs of places a USING meets, compared by =.
@@ -1778,6 +1986,7 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
         casings,
         types: &typing.types,
         now: crate::scalars::transaction_clock(),
+        subqueries: None,
     };
     let none = pipeline::computed_none();
     let mut made = Vec::with_capacity(rows.len());
@@ -1882,6 +2091,7 @@ fn lift_set(
             renames,
             calls: Vec::new(),
             set: Some(arm),
+            laterals: Vec::new(),
         });
         return Ok(());
     }
@@ -1892,6 +2102,7 @@ fn lift_set(
         renames: Vec::new(),
         calls: Vec::new(),
         set: Some(arm),
+        laterals: Vec::new(),
     });
     let parsed = sqlparser::parser::Parser::parse_sql(
         &sqlparser::dialect::PostgreSqlDialect {},
@@ -1911,6 +2122,7 @@ fn lift_set(
         renames,
         calls: Vec::new(),
         set: None,
+        laterals: Vec::new(),
     });
     Ok(())
 }
@@ -2020,7 +2232,7 @@ struct Met {
 
 /// A set operation made: its arms met by their operators, each column typed as select_common_type
 /// types its two arms' columns, the leftmost arm's names its own.
-fn set_step(arm: &Arm, made: &HashMap<String, Made>, casings: &Casings) -> Result<Made> {
+fn set_step(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Made> {
     let m = met(arm, made, casings)?;
     Ok(Made {
         rel: Relation {
@@ -2033,7 +2245,7 @@ fn set_step(arm: &Arm, made: &HashMap<String, Made>, casings: &Casings) -> Resul
     })
 }
 
-fn met(arm: &Arm, made: &HashMap<String, Made>, casings: &Casings) -> Result<Met> {
+fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
     let (op, all, left, right) = match arm {
         Arm::Leaf { name, untyped } => {
             let m = made
@@ -2197,12 +2409,14 @@ pub(super) fn answer(
 ) -> Result<(RecordBatch, Round)> {
     let catalog = reads.catalog();
     let _rows = super::handed::rows_of(catalog);
-    let mut steps = steps(catalog, q)?;
-    let release = catalog.release;
-    let now = crate::scalars::transaction_clock();
+    let asked = Asked {
+        reads,
+        params,
+        release: catalog.release,
+        now: crate::scalars::transaction_clock(),
+    };
     let tables: Vec<&Table> = catalog.tables.iter().collect();
-    let mut casings = Casings::of_tables(&tables, &catalog.collations);
-    let mut made: HashMap<String, Made> = HashMap::new();
+    let casings = Casings::of_tables(&tables, &catalog.collations);
     let mut accrued = Accrued {
         round: Round::default(),
         parts: vec![
@@ -2214,21 +2428,39 @@ pub(super) fn answer(
             }
         ],
     };
+    let (last, held) = made_by(asked, q, &Steps::new(), &casings, None, &mut accrued)?;
+    let batch = pipeline::batch_of(&last.rel)?;
+    let mut round = accrued.round;
+    round.rows = batch.num_rows() as u64;
+    round.rows_held = held as u64;
+    if reads.snails() > 1 {
+        round.snails = accrued.parts;
+    }
+    Ok((batch, round))
+}
+
+/// What a question makes: each of its steps in turn, after the relations made before it, and its
+/// last returned, with the rows they made in all. A subquery's is made so, the columns of the query
+/// around it read after each of its steps' own.
+pub(super) fn made_by(
+    asked: Asked,
+    q: &Query,
+    before: &Steps,
+    casings: &Casings,
+    outer: Option<&Outer>,
+    accrued: &mut Accrued,
+) -> Result<(Made, usize)> {
+    let catalog = asked.reads.catalog();
+    let visible: Vec<String> = before.keys().cloned().collect();
+    let mut steps = steps(catalog, q, &visible)?;
+    let mut casings = casings.clone();
+    let mut made = before.clone();
     let mut held = 0usize;
     for step in &mut steps {
         let m = match (&step.set, step.query.body.as_ref()) {
             (Some(arm), _) => set_step(arm, &made, &casings)?,
-            (None, SetExpr::Values(_)) => values_step(step, params, release, &casings)?,
-            _ => select_step(
-                reads,
-                step,
-                &made,
-                &mut casings,
-                params,
-                release,
-                now,
-                &mut accrued,
-            )?,
+            (None, SetExpr::Values(_)) => values_step(step, asked.params, asked.release, &casings)?,
+            _ => select_step(asked, step, &made, &mut casings, outer, accrued)?,
         };
         let mut m = m;
         if step.renames.len() > m.rel.names.len() {
@@ -2244,36 +2476,160 @@ pub(super) fn answer(
         }
         casings.renamed(&step.name, &step.renames);
         held += m.rel.rows.len();
-        made.insert(step.name.clone(), m);
+        made.insert(step.name.clone(), Rc::new(m));
     }
     let last = made
         .remove("")
         .ok_or_else(|| Error::new("the question returned nothing"))?;
-    let batch = pipeline::batch_of(&last.rel)?;
-    let mut round = accrued.round;
-    round.rows = batch.num_rows() as u64;
-    round.rows_held = held as u64;
-    if reads.snails() > 1 {
-        round.snails = accrued.parts;
-    }
-    Ok((batch, round))
+    Ok((Rc::try_unwrap(last).unwrap_or_else(|m| (*m).clone()), held))
 }
 
-/// One SELECT of the statement, its FROM met as one relation, then read as the pipeline reads it.
+/// The =s of a subquery's WHERE that tie a column of its FROM to an expression of the query around
+/// it alone, each as that column and that expression, in one type whose keys are its =.
+fn ties<'e>(
+    wheres: &[&'e Expr],
+    from: &From,
+    types: &typed::Types,
+    casings: &Casings,
+) -> Vec<(&'e Expr, &'e Expr)> {
+    let around = |e: &Expr| -> Option<bool> {
+        let mut read = Vec::new();
+        pipeline::columns_read(e, &mut read);
+        let mut sides = read.iter().map(|(q, n)| {
+            match pipeline::naming(
+                from.columns
+                    .iter()
+                    .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+                q.as_deref(),
+                n,
+            )
+            .as_slice()
+            {
+                [i] => Some(*i >= from.outer_at),
+                _ => None,
+            }
+        });
+        let first = sides.next()??;
+        sides.all(|s| s == Some(first)).then_some(first)
+    };
+    let mut out = Vec::new();
+    for &c in wheres {
+        let Expr::BinaryOp {
+            left: a,
+            op: BinaryOperator::Eq,
+            right: b,
+        } = c
+        else {
+            continue;
+        };
+        let same = match (
+            types.get(&(&**a as *const Expr)),
+            types.get(&(&**b as *const Expr)),
+        ) {
+            (Some(x), Some(y)) => x == y || (x.is_integer() && y.is_integer()),
+            _ => false,
+        };
+        if !same || casings.compared_under_library(c) {
+            continue;
+        }
+        let column = |e: &Expr| pipeline::column_of(e).is_some();
+        match (around(a), around(b)) {
+            (Some(false), Some(true)) if column(a) => out.push((&**a, &**b)),
+            (Some(true), Some(false)) if column(b) => out.push((&**b, &**a)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A step's FROM read into its rows, as the round reads the tables in it, and the column holding
+/// its first table's order where its rows keep it.
 #[allow(clippy::too_many_arguments)]
+fn read_from(
+    asked: Asked,
+    from: &From,
+    words: &[String],
+    wheres: Vec<&Expr>,
+    casings: &Casings,
+    types: &typed::Types,
+    made: &Steps,
+    accrued: &mut Accrued,
+    laterals: &[(Query, super::subqueries::Kept)],
+    outer: Option<&Outer>,
+) -> Result<(Vec<Vec<Value>>, Option<usize>)> {
+    let mut reading = Reading {
+        reads: asked.reads,
+        from,
+        words,
+        wheres,
+        params: asked.params,
+        release: asked.release,
+        casings,
+        types,
+        now: asked.now,
+        made,
+        accrued,
+        asked,
+        laterals,
+        outer,
+        cached: HashMap::new(),
+        order: None,
+    };
+    let mut rows: Vec<Vec<Value>> = vec![Vec::new()];
+    let mut order = None;
+    for (k, item) in from.items.iter().enumerate() {
+        reading.order = None;
+        let next = if item.lateral() && k > 0 {
+            let mut out = Vec::new();
+            for r in &rows {
+                for x in reading.rows(item, Some((0, r)), true)? {
+                    let mut row = r.clone();
+                    row.extend(x);
+                    out.push(row);
+                }
+            }
+            out
+        } else {
+            let xs = reading.rows(item, None, true)?;
+            let mut out = Vec::with_capacity(rows.len() * xs.len());
+            for r in &rows {
+                for x in &xs {
+                    let mut row = r.clone();
+                    row.extend(x.iter().cloned());
+                    out.push(row);
+                }
+            }
+            out
+        };
+        // The order holds where the first relation is read alone in it and the rest give one
+        // row.
+        if k == 0 {
+            order = reading.order;
+        } else if next.len() != rows.len() {
+            order = None;
+        }
+        rows = next;
+    }
+    if from.items.is_empty() {
+        order = None;
+    }
+    Ok((rows, order))
+}
+
+/// One SELECT of the statement, its FROM met as one relation, then read as the pipeline reads it;
+/// a subquery's with the columns of the query around it after its FROM's.
 fn select_step(
-    reads: &dyn Reads,
+    asked: Asked,
     step: &mut Step,
-    made: &HashMap<String, Made>,
+    made: &Steps,
     casings: &mut Casings,
-    params: &[String],
-    release: u8,
-    now: i64,
+    outer: Option<&Outer>,
     accrued: &mut Accrued,
 ) -> Result<Made> {
-    let catalog = reads.catalog();
+    let catalog = asked.reads.catalog();
+    let (params, release, now) = (asked.params, asked.release, asked.now);
     // The FROM laid out, and its stars read as its columns.
-    let from = {
+    let mut from = {
         let SetExpr::Select(s) = step.query.body.as_ref() else {
             return Err(Error::new("a step is a SELECT"));
         };
@@ -2281,6 +2637,10 @@ fn select_step(
             catalog,
             made,
             calls: &step.calls,
+            laterals: &step.laterals,
+            asked,
+            casings,
+            outer,
             release,
             columns: Vec::new(),
         };
@@ -2291,6 +2651,7 @@ fn select_step(
         From {
             columns: laying.columns,
             items,
+            outer_at: 0,
         }
     };
     {
@@ -2310,7 +2671,13 @@ fn select_step(
     if let SetExpr::Select(s) = step.query.body.as_mut() {
         starred(&mut s.projection, &from)?;
     }
+    from.outer_at = from.columns.len();
+    if let Some(o) = outer {
+        from.columns.extend(o.columns.iter().cloned());
+    }
     let step = &*step;
+    let (plans, seeded) =
+        super::subqueries::Plans::of(asked, &step.query, &from.columns, made, casings)?;
     let typed = from.typed();
     let mut keyed: Vec<(String, Vec<String>)> = Vec::new();
     let mut joined: Vec<&Expr> = Vec::new();
@@ -2356,17 +2723,44 @@ fn select_step(
             ons(n, &mut joined);
         }
     }
-    let mut p = pipeline::prepare(&step.query, &typed, &keyed, release, now, &joined)?;
-    // Each column it reads is one of its FROM's, refused before any row as PostgreSQL's parser
-    // refuses one it finds none or two of.
-    for (q, n) in p.reads() {
-        let found = pipeline::naming(
+    let mut p = pipeline::prepare(
+        &step.query,
+        &typed,
+        &keyed,
+        release,
+        now,
+        &joined,
+        seeded,
+        plans.around(),
+    )?;
+    let place = |q: &Option<String>, n: &str| {
+        pipeline::naming(
             from.columns
                 .iter()
                 .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
             q.as_deref(),
-            &n,
-        );
+            n,
+        )
+    };
+    // An aggregate of the query's around a subquery alone is that query's.
+    if outer.is_some() {
+        for a in p.aggregates() {
+            let mut read = Vec::new();
+            pipeline::columns_read(a, &mut read);
+            let around = |(q, n): &(Option<String>, String)| {
+                place(q, n).first().is_some_and(|&i| i >= from.outer_at)
+            };
+            if !read.is_empty() && read.iter().all(around) {
+                return Err(Error::new(format!(
+                    "{a} is not read: an aggregate of the query around a subquery"
+                )));
+            }
+        }
+    }
+    // Each column it reads is one of its FROM's, refused before any row as PostgreSQL's parser
+    // refuses one it finds none or two of.
+    for (q, n) in p.reads() {
+        let found = place(&q, &n);
         match (found.len(), q) {
             (1, _) => {}
             (0, Some(q))
@@ -2389,10 +2783,12 @@ fn select_step(
         .map(|c| (c.qualifier.clone(), c.name.clone(), c.carried.clone()))
         .collect();
     p.carried = casings.add_step(&step.name, &p, &carried)?;
+    let casings: &Casings = casings;
     // The FROM's rows.
-    // The words it writes, its functions' calls among them.
+    // The words it writes, its functions' calls and LATERAL subqueries among them.
     let text = std::iter::once(step.query.to_string())
         .chain(step.calls.iter().map(|c| c.expr.to_string()))
+        .chain(step.laterals.iter().map(|(q, _)| q.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
     let ws = words(&text);
@@ -2402,62 +2798,140 @@ fn select_step(
             conjuncts(w, &mut wheres);
         }
     }
-    let (rows, order) = {
-        let mut reading = Reading {
-            reads,
-            from: &from,
-            words: &ws,
-            wheres,
+    let tied = ties(&wheres, &from, &p.types, casings);
+    // A conjunct reading no column, its subqueries reading nothing of the query around it, is read
+    // once before any row, as PostgreSQL's one-time filter is: where it does not hold, the FROM gives
+    // no rows.
+    let mut shut = false;
+    let gates: Vec<&Expr> = wheres
+        .iter()
+        .copied()
+        .filter(|w| {
+            let mut read = Vec::new();
+            pipeline::columns_read(w, &mut read);
+            read.is_empty() && plans.only_once(w)
+        })
+        .collect();
+    if !gates.is_empty() {
+        let subs =
+            super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
+        let frame = pipeline::Frame {
+            columns: from.frame_columns(0, from.columns.len()),
             params,
             release,
             casings,
             types: &p.types,
             now,
+            subqueries: Some(&subs),
+        };
+        let row = vec![Value::Null; from.columns.len()];
+        for g in gates {
+            let v = pipeline::eval(g, &row, &frame, &pipeline::computed_none())?;
+            if pipeline::truth(&v)? != Some(true) {
+                shut = true;
+                break;
+            }
+        }
+    }
+    // A conjunct naming the query around it is the pipeline's alone.
+    let around: Vec<&str> = from.columns[from.outer_at..]
+        .iter()
+        .flat_map(|c| {
+            std::iter::once(c.name.as_str()).chain(c.qualifier.as_deref().map(pipeline::unmarked))
+        })
+        .collect();
+    wheres.retain(|w| {
+        !words(&w.to_string())
+            .iter()
+            .any(|x| around.contains(&x.as_str()))
+    });
+    let mut leaves = Vec::new();
+    for n in &from.items {
+        n.leaves(&mut leaves);
+    }
+    let kept = outer.filter(|_| leaves.iter().all(|l| matches!(l.what, What::Table { .. })));
+    let (mut rows, order) = match kept {
+        _ if shut => (Vec::new(), None),
+        // A subquery's FROM of tables alone reads nothing of the query around it: read once, and
+        // met with each row by the =s that tie them.
+        Some(o) => {
+            let found = o.kept.rows.borrow().get(&step.name).cloned();
+            let parted = match found {
+                Some(p) => p,
+                None => {
+                    let (rows, order) = read_from(
+                        asked,
+                        &from,
+                        &ws,
+                        wheres,
+                        casings,
+                        &p.types,
+                        made,
+                        accrued,
+                        &step.laterals,
+                        outer,
+                    )?;
+                    let index = match tied.is_empty() {
+                        true => None,
+                        false => Some(tie_index(&rows, &tied, &from, asked, casings, &p.types)?),
+                    };
+                    let parted = Rc::new(Parted { rows, order, index });
+                    o.kept
+                        .rows
+                        .borrow_mut()
+                        .insert(step.name.clone(), parted.clone());
+                    parted
+                }
+            };
+            let rows = match &parted.index {
+                Some(index) => {
+                    let frame = pipeline::Frame {
+                        columns: from.frame_columns(0, from.columns.len()),
+                        params,
+                        release,
+                        casings,
+                        types: &p.types,
+                        now,
+                        subqueries: None,
+                    };
+                    let none = pipeline::computed_none();
+                    let mut row = vec![Value::Null; from.outer_at];
+                    row.extend(o.values.iter().cloned());
+                    let mut k = Vec::with_capacity(tied.len());
+                    for (_, b) in &tied {
+                        let v = pipeline::eval(b, &row, &frame, &none)?;
+                        if v.is_null() {
+                            break;
+                        }
+                        k.push(pipeline::key(&v));
+                    }
+                    match (k.len() == tied.len()).then(|| index.get(&k)).flatten() {
+                        Some(at) => at.iter().map(|&i| parted.rows[i].clone()).collect(),
+                        None => Vec::new(),
+                    }
+                }
+                None => parted.rows.clone(),
+            };
+            (rows, parted.order)
+        }
+        None => read_from(
+            asked,
+            &from,
+            &ws,
+            wheres,
+            casings,
+            &p.types,
             made,
             accrued,
-            cached: HashMap::new(),
-            order: None,
-        };
-        let mut rows: Vec<Vec<Value>> = vec![Vec::new()];
-        let mut order = None;
-        for (k, item) in from.items.iter().enumerate() {
-            reading.order = None;
-            let next = if item.lateral() && k > 0 {
-                let mut out = Vec::new();
-                for r in &rows {
-                    for x in reading.rows(item, Some((0, r)), true)? {
-                        let mut row = r.clone();
-                        row.extend(x);
-                        out.push(row);
-                    }
-                }
-                out
-            } else {
-                let xs = reading.rows(item, None, true)?;
-                let mut out = Vec::with_capacity(rows.len() * xs.len());
-                for r in &rows {
-                    for x in &xs {
-                        let mut row = r.clone();
-                        row.extend(x.iter().cloned());
-                        out.push(row);
-                    }
-                }
-                out
-            };
-            // The order holds where the first relation is read alone in it and the rest give one
-            // row.
-            if k == 0 {
-                order = reading.order;
-            } else if next.len() != rows.len() {
-                order = None;
-            }
-            rows = next;
-        }
-        if from.items.is_empty() {
-            order = None;
-        }
-        (rows, order)
+            &step.laterals,
+            outer,
+        )?,
     };
+    if let Some(o) = outer {
+        for r in &mut rows {
+            r.extend(o.values.iter().cloned());
+        }
+    }
     let rel = Relation {
         names: from.columns.iter().map(|c| c.name.clone()).collect(),
         rows,
@@ -2470,7 +2944,16 @@ fn select_step(
         .collect();
     let types = p.returns.clone();
     let carried = p.carried.clone();
+    let subs = super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
     let mut run = pipeline::StepRun::new(p);
+    if !plans.is_empty() {
+        run.subqueries = Some(&subs);
+    }
+    if let Some(o) = outer {
+        let mut row = vec![Value::Null; from.outer_at];
+        row.extend(o.values.iter().cloned());
+        run.empty_row = Some(row);
+    }
     let rel = match run.feed(rel, columns, params, release, casings)? {
         Some(out) => out,
         None => run.finish(params, release, casings)?,
@@ -2480,6 +2963,44 @@ fn select_step(
         types,
         carried,
     })
+}
+
+/// The places of a subquery's FROM rows by the keys of the columns its =s tie to the query around
+/// it; a row with a NULL among them is met by none.
+fn tie_index(
+    rows: &[Vec<Value>],
+    tied: &[(&Expr, &Expr)],
+    from: &From,
+    asked: Asked,
+    casings: &Casings,
+    types: &typed::Types,
+) -> Result<HashMap<Vec<pipeline::Key>, Vec<usize>>> {
+    let frame = pipeline::Frame {
+        columns: from.frame_columns(0, from.columns.len()),
+        params: asked.params,
+        release: asked.release,
+        casings,
+        types,
+        now: asked.now,
+        subqueries: None,
+    };
+    let none = pipeline::computed_none();
+    let pad = vec![Value::Null; from.columns.len() - from.outer_at];
+    let mut index: HashMap<Vec<pipeline::Key>, Vec<usize>> = HashMap::new();
+    'rows: for (i, r) in rows.iter().enumerate() {
+        let mut row = r.clone();
+        row.extend(pad.iter().cloned());
+        let mut k = Vec::with_capacity(tied.len());
+        for (a, _) in tied {
+            let v = pipeline::eval(a, &row, &frame, &none)?;
+            if v.is_null() {
+                continue 'rows;
+            }
+            k.push(pipeline::key(&v));
+        }
+        index.entry(k).or_default().push(i);
+    }
+    Ok(index)
 }
 
 /// Whether a question reads what only the pipeline over several relations reads: no table, or more
@@ -2565,7 +3086,7 @@ pub(super) fn names_a_view(catalog: &Catalog, q: &Query) -> bool {
 }
 
 /// A catalog whose tables are read as holding no rows: what a view's question is checked over.
-struct Empty<'c>(&'c Catalog);
+pub(super) struct Empty<'c>(pub(super) &'c Catalog);
 
 impl Reads for Empty<'_> {
     fn catalog(&self) -> &Catalog {
@@ -2627,5 +3148,19 @@ impl Reads for Across<'_> {
 
     fn snails(&self) -> usize {
         self.snails.len()
+    }
+}
+
+/// The ON a join meets its relations by, where it has one.
+pub(super) fn join_on(j: &JoinOperator) -> Option<&Expr> {
+    match j {
+        JoinOperator::Join(JoinConstraint::On(e))
+        | JoinOperator::Inner(JoinConstraint::On(e))
+        | JoinOperator::Left(JoinConstraint::On(e))
+        | JoinOperator::LeftOuter(JoinConstraint::On(e))
+        | JoinOperator::Right(JoinConstraint::On(e))
+        | JoinOperator::RightOuter(JoinConstraint::On(e))
+        | JoinOperator::FullOuter(JoinConstraint::On(e)) => Some(e),
+        _ => None,
     }
 }
