@@ -231,10 +231,19 @@ fn a_transaction_marks_the_replica_at_its_commit_and_a_rollback_leaves_the_mark_
     let path = snail("replica-transaction", &s);
     let g = Snail::open(&path).unwrap().generation();
     let mut w = Snail::open_writing(&path).unwrap();
+    let e = w.mark_replica(Some("")).unwrap_err().to_string();
+    assert!(e.contains("the name is empty"), "{e}");
     w.execute("BEGIN").unwrap();
     w.execute(&station(1, "Sagres 1")).unwrap();
     w.mark_replica(Some(SOURCE)).unwrap();
     assert_eq!(Snail::open(&path).unwrap().replica(), None);
+    // Within the transaction, another source's mark is refused as it is asked.
+    let e = w.mark_replica(Some("mysql-other")).unwrap_err().to_string();
+    assert!(e.contains("clear the mark"), "{e}");
+    w.execute("ROLLBACK").unwrap();
+    w.execute("BEGIN").unwrap();
+    w.execute(&station(1, "Sagres 1")).unwrap();
+    w.mark_replica(Some(SOURCE)).unwrap();
     w.execute("COMMIT").unwrap();
     let now = Snail::open(&path).unwrap();
     assert_eq!((now.generation(), now.replica()), (g + 1, Some(SOURCE)));
@@ -252,6 +261,19 @@ fn a_transaction_marks_the_replica_at_its_commit_and_a_rollback_leaves_the_mark_
     let now = Snail::open(&path).unwrap();
     assert_eq!((now.generation(), now.replica()), (g + 2, None));
     assert_eq!(named(&path, "Sagres 2"), 1);
+    // A transaction marking the snail, another source's mark landing first: refused at its COMMIT,
+    // at the root's turn.
+    let mut other = Snail::open_writing(&path).unwrap();
+    w.execute("BEGIN").unwrap();
+    w.mark_replica(Some(SOURCE)).unwrap();
+    other.mark_replica(Some("mysql-other")).unwrap();
+    let e = w.execute("COMMIT").unwrap_err().to_string();
+    assert!(
+        e.contains("is marked a replica of 'mysql-other': clear the mark"),
+        "{e}"
+    );
+    assert_eq!(Snail::open(&path).unwrap().replica(), Some("mysql-other"));
+    other.mark_replica(None).unwrap();
     // A transaction refused by the mark takes nothing but its end.
     w.mark_replica(Some(SOURCE)).unwrap();
     w.execute("BEGIN").unwrap();
@@ -259,6 +281,39 @@ fn a_transaction_marks_the_replica_at_its_commit_and_a_rollback_leaves_the_mark_
     assert!(w.mark_replica(None).is_err());
     w.execute("ROLLBACK").unwrap();
     assert_eq!(Snail::open(&path).unwrap().replica(), Some(SOURCE));
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_sequences_advance_lands_ahead_of_the_transaction_that_marks_the_replica() {
+    use warren_snail::catalog::Catalog;
+    let path = tmp("replica-sequence.snail");
+    let catalog = Catalog::parse(
+        "CREATE SEQUENCE s.ids START 100;
+         CREATE TABLE s.q (id bigint NOT NULL DEFAULT nextval('s.ids'), v integer, PRIMARY KEY (id));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let g = Snail::open(&path).unwrap().generation();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.applying(SOURCE).unwrap();
+    w.execute("BEGIN").unwrap();
+    w.mark_replica(Some(SOURCE)).unwrap();
+    w.execute("INSERT INTO s.q (v) VALUES (1)").unwrap();
+    // The advance landed at once, unmarked; rolled back, the mark never lands.
+    let now = Snail::open(&path).unwrap();
+    assert_eq!((now.generation(), now.replica()), (g + 1, None));
+    w.execute("ROLLBACK").unwrap();
+    let now = Snail::open(&path).unwrap();
+    assert_eq!((now.generation(), now.replica()), (g + 1, None));
+    // Marked, the applier's advances land as its writes do, and another writer's are refused.
+    w.mark_replica(Some(SOURCE)).unwrap();
+    w.execute("INSERT INTO s.q (v) VALUES (2)").unwrap();
+    let mut other = Snail::open_writing(&path).unwrap();
+    other.execute("BEGIN").unwrap();
+    assert!(refused(
+        other.execute("INSERT INTO s.q (v) VALUES (3)").unwrap_err()
+    ));
 }
 
 /// A table of 3,000 rows on (a, b), a always 1 and b counting from 0.
@@ -400,6 +455,10 @@ fn a_snail_of_format_seven_or_eight_is_marked_no_replica() {
             )),
             "{e}"
         );
+        // Refused as it is asked, in a transaction too.
+        w.execute("BEGIN").unwrap();
+        assert!(w.mark_replica(Some(SOURCE)).is_err());
+        w.execute("ROLLBACK").unwrap();
         assert_eq!(w.mark_replica(None).unwrap().pages_written, 0);
     }
 }

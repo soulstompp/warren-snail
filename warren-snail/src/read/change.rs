@@ -819,6 +819,16 @@ impl Snail {
         if self.aborted {
             return Err(Error::new(ABORTED));
         }
+        // Refused in a transaction, it fails the transaction, as a statement refused does.
+        let marked = self.marked(source);
+        if marked.is_err() && self.begun.is_some() {
+            self.abandon()?;
+            self.aborted = true;
+        }
+        marked
+    }
+
+    fn marked(&mut self, source: Option<&str>) -> Result<Done> {
         if source == Some("") {
             return Err(Error::new("a replica's source is named: the name is empty"));
         }
