@@ -638,6 +638,7 @@ impl Snail {
         if self.begun.is_none() {
             self.clock.0 = at;
         }
+        let _handed = super::handed::holding(&self.functions);
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let st = statement::parse(&self.catalog, sql)?;
         // A transaction one of whose statements failed takes no statement but its end, which rolls

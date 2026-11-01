@@ -571,7 +571,7 @@ impl Laying<'_> {
             unreachable!("a call")
         };
         let name = pipeline::function_name(f);
-        if !pipeline::is_set_returning(&name) {
+        if !pipeline::is_set_returning(&name) && !pipeline::gives_a_row(f) {
             return Err(Error::new(format!(
                 "{}: a function in FROM is read where it returns a set the snail makes",
                 call.expr
@@ -2196,6 +2196,7 @@ pub(super) fn answer(
     params: &[String],
 ) -> Result<(RecordBatch, Round)> {
     let catalog = reads.catalog();
+    let _rows = super::handed::rows_of(catalog);
     let mut steps = steps(catalog, q)?;
     let release = catalog.release;
     let now = crate::scalars::transaction_clock();

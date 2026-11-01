@@ -163,6 +163,8 @@ pub struct Snails {
     /// of a commit landing between the passes.
     between: Option<Box<dyn FnMut()>>,
     writing: bool,
+    /// The functions their caller has handed them, which their questions call.
+    functions: std::rc::Rc<Vec<std::rc::Rc<super::handed::Function>>>,
 }
 
 impl Snails {
@@ -261,6 +263,7 @@ impl Snails {
             stop: None,
             between: None,
             writing,
+            functions: Default::default(),
         })
     }
 
@@ -653,6 +656,16 @@ impl Snails {
         self.ask_with(sql, &[])
     }
 
+    /// Hands the snails a function of their caller's, which their questions and statements then
+    /// call by its name as any function, as `Snail::hand` hands it to one.
+    pub fn hand(&mut self, f: super::handed::Function) -> Result<()> {
+        super::handed::hand(&mut self.functions, &self.catalog, f)?;
+        for s in &mut self.snails {
+            s.functions = self.functions.clone();
+        }
+        Ok(())
+    }
+
     /// Answers a question with its parameters, `$1` and on, given as text: one round across them.
     /// A question on one snail's tables is read as that snail reads it; one on several snails'
     /// tables is read as a join, each table from its own snail.
@@ -674,6 +687,7 @@ impl Snails {
             },
             at,
         );
+        let _handed = super::handed::holding(&self.functions);
         let mut read = self.snails_named(sql)?;
         if read.is_empty() {
             read.push(0);

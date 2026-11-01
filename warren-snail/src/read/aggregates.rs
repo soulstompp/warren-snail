@@ -102,6 +102,12 @@ pub(super) enum Agg {
         by: Vec<Direction>,
         direct: Option<Vec<Value>>,
     },
+    /// An aggregate a caller handed the snail: its form, and each row given it so far, its arguments
+    /// in the types its signature names, in the order they came.
+    Handed {
+        form: std::rc::Rc<super::handed::Function>,
+        rows: Vec<Vec<Value>>,
+    },
 }
 
 impl Agg {
@@ -170,7 +176,7 @@ impl Agg {
 
     /// Whether it folds a NULL in as a value, as array_agg does.
     pub(super) fn keeps_nulls(&self) -> bool {
-        matches!(self, Agg::Collect { .. } | Agg::Json(_))
+        matches!(self, Agg::Collect { .. } | Agg::Json(_)) || matches!(self, Agg::Handed { .. })
     }
 
     /// Its direct arguments, the first time they are given.
@@ -183,6 +189,10 @@ impl Agg {
     /// Folds in one row's arguments, each compared under the collation `under` gives it.
     pub(super) fn add(&mut self, args: &[Value], under: &[Option<Casing>]) -> Result<()> {
         match self {
+            Agg::Handed { form, rows } => {
+                rows.push(super::handed::fold_row(form, args)?);
+                return Ok(());
+            }
             Agg::Sorted { of, rows, by, .. } => {
                 for (d, u) in by.iter_mut().zip(under) {
                     d.under = *u;
@@ -312,7 +322,8 @@ impl Agg {
             | Agg::Sorted { .. }
             | Agg::Concat(_)
             | Agg::Collect { .. }
-            | Agg::Json(_) => {
+            | Agg::Json(_)
+            | Agg::Handed { .. } => {
                 unreachable!()
             }
         }
@@ -322,6 +333,7 @@ impl Agg {
     /// Its answer over the rows folded.
     pub(super) fn value(&self) -> Result<Value> {
         Ok(match self {
+            Agg::Handed { form, rows } => super::handed::folded(form, rows)?,
             Agg::Spread {
                 n,
                 sum,

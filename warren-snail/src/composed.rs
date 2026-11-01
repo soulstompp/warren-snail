@@ -3244,8 +3244,8 @@ pub fn enum_array(
 }
 
 /// The composed type a data type names outside a DDL, as a cast names it: an array of a type held,
-/// a range built in, or a type a DDL this process read declares, by its name, where one alone has
-/// it.
+/// a range built in, the row type of a table the pipeline under way reads, or a type a DDL this
+/// process read declares, by its name, where one alone has it.
 pub fn resolve(dt: &sqlparser::ast::DataType) -> Option<ColumnType> {
     use sqlparser::ast::{ArrayElemTypeDef, DataType};
     match dt {
@@ -3271,6 +3271,9 @@ pub fn resolve(dt: &sqlparser::ast::DataType) -> Option<ColumnType> {
         DataType::Custom(name, args) if args.is_empty() => {
             let n = crate::catalog::object_name(name);
             if let Some(t) = built_in(&n) {
+                return Some(t);
+            }
+            if let Some(t) = crate::read::handed::table_row(&n) {
                 return Some(t);
             }
             let all = held().read().unwrap();

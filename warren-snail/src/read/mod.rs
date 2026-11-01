@@ -14,6 +14,7 @@ mod clock;
 mod collate;
 pub(crate) mod fill;
 pub(crate) mod foreign;
+pub mod handed;
 mod hash;
 mod join;
 mod json;
@@ -22,6 +23,7 @@ mod out;
 pub(crate) mod partial;
 mod pipeline;
 mod point;
+mod populate;
 mod prefix;
 mod question;
 mod ranges;
@@ -325,6 +327,8 @@ pub struct Snail {
     applier: Option<String>,
     /// The replica mark the statement or the transaction under way sets, or clears.
     marking: Option<Option<String>>,
+    /// The functions its caller has handed it, which its questions call.
+    functions: std::rc::Rc<Vec<std::rc::Rc<handed::Function>>>,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -536,6 +540,7 @@ impl Snail {
             modes: Default::default(),
             applier: None,
             marking: None,
+            functions: Default::default(),
         })
     }
 
@@ -1074,6 +1079,13 @@ impl Snail {
         self.ask_with(sql, order, &[])
     }
 
+    /// Hands the snail a function of its caller's, which its questions and statements then call by
+    /// its name as any function: refused where PostgreSQL or the snail's DDL has a function of its
+    /// name, or a form of the same arguments is handed already.
+    pub fn hand(&mut self, f: handed::Function) -> Result<()> {
+        handed::hand(&mut self.functions, &self.catalog, f)
+    }
+
     /// Answers a question with its parameters, `$1` and on, given as text: one round.
     pub fn ask_with(
         &mut self,
@@ -1083,6 +1095,7 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
+        let _handed = handed::holding(&self.functions);
         self.wasted.borrow_mut().clear();
         let (batch, mut round) = self.answer_with(sql, order, params)?;
         round.pages_at_start = pages_at_start;
@@ -1161,6 +1174,7 @@ impl Snail {
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
         let q = &spelled::between_written(q);
+        let _rows = handed::rows_of(&self.catalog);
         if relations::several(&self.catalog, q) {
             return relations::answer(self, q, params);
         }

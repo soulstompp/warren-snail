@@ -991,6 +991,7 @@ const AGGREGATES: [&str; 37] = [
 /// Whether a name is an aggregate a step folds.
 pub(super) fn is_aggregate(name: &str) -> bool {
     AGGREGATES.contains(&name) || super::json::AGGREGATES.contains(&name)
+        || super::handed::is_aggregate(name)
 }
 
 pub(super) fn function_name(f: &sqlparser::ast::Function) -> String {
@@ -1041,6 +1042,8 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
             find_calls(a, out);
             find_calls(b, out);
         }
+        // A field of a composite an aggregate or a function gives.
+        Expr::CompoundFieldAccess { root, .. } => find_calls(root, out),
         Expr::Case {
             operand,
             conditions,
@@ -1082,6 +1085,8 @@ pub(super) fn is_set_returning(name: &str) -> bool {
     SET_RETURNING.contains(&name)
         || super::json::SETS.contains(&name)
         || super::tsearch::SETS.contains(&name)
+        || super::handed::is_set_returning(name)
+        || super::populate::SETS.contains(&name)
 }
 
 /// The expressions an expression reads directly.
@@ -2842,6 +2847,17 @@ fn is_record(ty: ColumnType) -> bool {
     matches!(ty, ColumnType::Composed(r) if matches!(r.def(), crate::composed::Composed::Record { .. }))
 }
 
+/// The values a row constructor, `ROW(…)` or `(…, …)`, is made of; none where it is none.
+fn row_parts(e: &Expr) -> Option<Result<Vec<&Expr>>> {
+    match e {
+        Expr::Tuple(xs) => Some(Ok(xs.iter().collect())),
+        Expr::Function(f) if crate::catalog::object_name(&f.name).eq_ignore_ascii_case("row") => {
+            Some(args(f))
+        }
+        _ => None,
+    }
+}
+
 /// A composed value read from its text by its type's input.
 pub(super) fn composed_value(ty: ColumnType, t: &str) -> Result<Value> {
     Ok(match crate::composed::scalar_in(ty, t)? {
@@ -3065,6 +3081,35 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             };
             let ty = crate::composed::resolve(data_type).unwrap();
             array_cast(a, ty, data_type, row, frame, computed)?
+        }
+        // A row constructor cast to a row type, a composite's or a table's: each value in its
+        // field's type.
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type,
+            ..
+        } if row_parts(expr).is_some() && crate::composed::resolve(data_type).is_some_and(is_record) => {
+            let ty = crate::composed::resolve(data_type).unwrap();
+            let parts = row_parts(expr).unwrap()?;
+            let crate::composed::Composed::Record { fields, .. } = (match ty {
+                ColumnType::Composed(r) => r.def(),
+                _ => unreachable!(),
+            }) else {
+                unreachable!()
+            };
+            if parts.len() != fields.len() {
+                return Err(Error::new(format!(
+                    "cannot cast type record to {}",
+                    ty.pg_name()
+                )));
+            }
+            let items = parts
+                .iter()
+                .zip(fields)
+                .map(|(x, f)| part_of(f.ty, ev(x)?, quoted(x)))
+                .collect::<Result<Vec<_>>>()?;
+            composed(ty, crate::composed::Item::Record(items))
         }
         Expr::Cast {
             kind: CastKind::Cast | CastKind::DoubleColon,
@@ -3827,6 +3872,16 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 );
             }
             let a = args(f)?;
+            if super::handed::is_handed(f) {
+                let given = a
+                    .iter()
+                    .map(|x| Ok((ev(x)?, quoted(x))))
+                    .collect::<Result<Vec<_>>>()?;
+                let types: Vec<_> = a.iter().map(|x| frame.type_of(x)).collect();
+                if let Some(v) = super::handed::call(f, given, &types)? {
+                    return Ok(v);
+                }
+            }
             if f.name.0.len() == 1 {
                 if let Some(v) = chosen(e, &name, &a, row, frame, computed)? {
                     return Ok(v);
@@ -3891,6 +3946,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                         return Ok(v);
                     }
                     if let Some(v) = super::arrays::arrays(&name, &given, &types)? {
+                        return Ok(v);
+                    }
+                    if let Some(v) = super::populate::call(&name, &given, &types)? {
                         return Ok(v);
                     }
                     if let Some(v) = super::json::call(&name, &given)? {
@@ -4647,7 +4705,16 @@ impl Acc {
             };
             return Ok((Acc::More(Box::new(agg)), folds));
         }
+        let arg_types: Vec<_> = a.iter().map(|x| types.get(&(*x as *const Expr)).copied()).collect();
+        let handed = match super::handed::is_handed(f) {
+            true => super::handed::aggregate(f, &arg_types)?,
+            false => None,
+        };
         let acc = match (name.as_str(), a.as_slice()) {
+            _ if handed.is_some() => Acc::More(Box::new(super::aggregates::Agg::Handed {
+                form: handed.unwrap(),
+                rows: Vec::new(),
+            })),
             ("count", [_]) => Acc::Count(0),
             ("sum", [_]) if types.get(&(call as *const Expr)) == Some(&ColumnType::Int8) => {
                 Acc::IntSum(None)
@@ -5324,11 +5391,21 @@ fn set_values(c: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
     let Expr::Function(f) = c else {
         return Err(Error::new(format!("{c} is not read")));
     };
-    let values = args(f)?
-        .into_iter()
+    let a = args(f)?;
+    let values = a
+        .iter()
         .map(|x| Ok((eval(x, row, frame, computed)?, quoted(x))))
         .collect::<Result<Vec<_>>>()?;
+    if super::handed::is_handed(f) {
+        let types: Vec<_> = a.iter().map(|x| frame.type_of(x)).collect();
+        if let Some(v) = super::handed::rows(f, values.clone(), &types)? {
+            return Ok(v);
+        }
+    }
     let name = function_name(f);
+    if let Some(v) = super::populate::sets(&name, &values, frame.type_of(c))? {
+        return Ok(v);
+    }
     let casing = match super::calls::is_regexp_function(&name) {
         true => regex_casing(frame, c, &values.iter().map(|(v, _)| v).collect::<Vec<_>>())?,
         false => string_casing(frame, c, &name, &[])?,
@@ -5336,9 +5413,20 @@ fn set_values(c: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
     super::sets::values(&name, values, frame.type_of(c), casing)
 }
 
+/// Whether a function in FROM gives one row a call: a scalar function handed in, or one making a
+/// value of a row type.
+pub(super) fn gives_a_row(f: &sqlparser::ast::Function) -> bool {
+    let name = function_name(f);
+    !is_set_returning(&name)
+        && (super::handed::is_handed(f) || super::populate::ROWS.contains(&name.as_str()))
+}
+
 /// The values a function in FROM gives for one row of the relations before it.
 pub(super) fn call_rows(c: &Expr, row: &[Value], frame: &Frame) -> Result<Vec<Value>> {
-    set_values(c, row, frame, &computed_none())
+    match c {
+        Expr::Function(f) if gives_a_row(f) => Ok(vec![eval(c, row, frame, &computed_none())?]),
+        _ => set_values(c, row, frame, &computed_none()),
+    }
 }
 
 /// A record's fields, each a value of its own type; NULLs where the record is one.
@@ -6833,7 +6921,7 @@ pub fn hands_over(q: &Query) -> bool {
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => {
-            let own = f.name.0.len() > 1
+            let own = !super::handed::is_handed(f) && f.name.0.len() > 1
                 || matches!(function_name(f).as_str(), "sum" | "min" | "max" | "avg")
                 || function_name(f) == "count" && is_count_star(f);
             // An aggregate of its own but over each value once, filtered or ordered, is not.
@@ -6882,6 +6970,7 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::Cast { expr: x, .. }
         | Expr::IsNull(x)
         | Expr::IsNotNull(x) => calls_beyond_the_question(x),
+        Expr::CompoundFieldAccess { root, .. } => calls_beyond_the_question(root),
         _ => false,
     }
 }

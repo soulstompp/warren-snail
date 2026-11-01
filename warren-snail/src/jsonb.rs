@@ -817,7 +817,7 @@ impl Doc {
 
 /// A string written as `escape_json` writes it: in quotes, `"`, `\` and the control characters
 /// escaped, every other character as it is.
-fn escape_json(out: &mut String, s: &str) {
+pub(crate) fn escape_json(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {

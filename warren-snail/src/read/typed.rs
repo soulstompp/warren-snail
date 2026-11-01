@@ -266,6 +266,36 @@ impl Typing<'_> {
             }
             Expr::TypedString(t) => crate::catalog::held_type(&t.data_type).ok(),
             Expr::Interval(_) => Some(super::calls::full_interval()),
+            // A field of a composite by its name.
+            Expr::CompoundFieldAccess { root, access_chain }
+                if matches!(
+                    access_chain.as_slice(),
+                    [sqlparser::ast::AccessExpr::Dot(Expr::Identifier(_))]
+                ) =>
+            {
+                let t = self.type_of(root)?;
+                let [sqlparser::ast::AccessExpr::Dot(Expr::Identifier(i))] = access_chain.as_slice()
+                else {
+                    unreachable!()
+                };
+                match t {
+                    Some(ColumnType::Composed(r)) => match r.def() {
+                        crate::composed::Composed::Record { name, fields } => {
+                            let n = crate::catalog::ident(i);
+                            match fields.iter().find(|f| f.name == n) {
+                                Some(f) => Some(f.ty),
+                                None => {
+                                    return Err(Error::new(format!(
+                                        "column \"{n}\" not found in data type {name}"
+                                    )))
+                                }
+                            }
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
             // An element of an array by its subscripts; a slice among them, the array.
             Expr::CompoundFieldAccess { root, access_chain }
                 if access_chain
@@ -513,6 +543,14 @@ impl Typing<'_> {
                     for t in &types {
                         written(*t)?;
                     }
+                }
+                if super::handed::is_handed(f) {
+                    if let Some(t) = super::handed::typed(f, &types)? {
+                        return Ok(Some(t));
+                    }
+                }
+                if let Some(t) = super::populate::typed(&name, &types, self.release)? {
+                    return Ok(t);
                 }
                 if f.name.0.len() == 1 && f.over.is_none() {
                     if let Some(t) = chosen(&name, &args, &types)? {
