@@ -531,10 +531,12 @@ a condition on the table would rule it out.
 order it read them; below, a line for each order it priced.
 
 **Where it stops.** Two tables are met on their columns, by `=`, `<>`, `<`, `<=`, `>` or `>=`
-where PostgreSQL compares their types so, a `FULL JOIN` by one equality at least. `USING`,
-`NATURAL`, a subquery and a set operation are refused. The rows each table gives the answer are held
-while the round meets them. A table met more than once is read once for each, the second from the
-pages the first left held.
+where PostgreSQL compares their types so, a `FULL JOIN` by one equality at least. A join by `USING`
+or `NATURAL`, a `RIGHT` or `FULL JOIN` after the first, and what else the question path does not
+read over several tables is read as a pipeline (*A question read as it goes*); a subquery and a
+set operation are refused. The rows each table gives the answer are held while the round meets
+them. A table met more than once is read once for each, the second from the pages the first left
+held.
 
 ## Several snails, one round
 
@@ -651,7 +653,11 @@ privileges, or the file's own, say who may write at all.
 **What it reads.** A question with a `WITH`, or a window, is read as a pipeline over one table,
 along its table's order, folded as the blocks come; so is a question on one table that calls a
 function, an operator or a pattern the question path does not read, an aggregate `DISTINCT`,
-ordered or filtered, or a `LIMIT`, an `OFFSET` or a `FETCH FIRST`.
+ordered or filtered, or a `LIMIT`, an `OFFSET` or a `FETCH FIRST`. Over several relations, each
+step's `FROM` is met as one relation first: a join of tables in one round, as a question on them
+is read, any other table alone by its own conditions; then steps, derived tables, `VALUES`, views
+and a set-returning function's rows, under `LATERAL` or not, met by `ON`, `USING` or `NATURAL`,
+`INNER`, `LEFT`, `RIGHT`, `FULL` or `CROSS`, and each step read over them.
 
 **The read it cancels.** The table held whole, and a sort for the window. The table's order is the
 window's order already, and each step holds only its running folds, its groups or the rows it
@@ -705,12 +711,11 @@ balance.sql, round 1: 5 rows, along payments_pkey
 | 4 | 3 | 54.90 |
 | 5 | 9 | 48.00 |
 
-**Where it stops.** A pipeline reads one table, and the steps before it, joined by `CROSS JOIN`. A
-window is read only along the table's order, ascending, where that order is one unique column, and
-its frame runs from the partition's first row to the current one, or to its last. `--param` gives
-`$1`, `$2` and on to a pipeline, as text. `warren-snail functions` counts the functions PostgreSQL
-defines: those the snail answers, those it does not read, and the server's own, which it refuses by
-name; `--out` lists each.
+**Where it stops.** A window is read only along a table's order, where a step reads that table
+alone, ascending, where that order is one unique column, and its frame runs from the partition's
+first row to the current one, or to its last. `--param` gives `$1`, `$2` and on to a pipeline, as
+text. `warren-snail functions` counts the functions PostgreSQL defines: those the snail answers,
+those it does not read, and the server's own, which it refuses by name; `--out` lists each.
 
 ## Checking an answer against PostgreSQL
 
@@ -797,7 +802,9 @@ Each command exits 0, or prints why it refused and exits 1.
   state kept in the file; `CREATE TYPE … AS ENUM`, a composite, `AS RANGE`, with `ALTER TYPE … ADD
   VALUE` and `RENAME VALUE`; `CREATE DOMAIN` and `ALTER DOMAIN`; `CREATE COLLATION`, of byte order,
   and with the feature `collations` of ICU or of the C library; `CREATE FUNCTION … LANGUAGE sql`
-  whose body is one expression.
+  whose body is one expression; `CREATE VIEW`, with its column list, its question read over the
+  tables and views before it as the view is made, and read as a step of each question that names
+  it.
 - `CREATE INDEX`: `USING btree`, `hash`, `gist` or `spgist`, as *The table's order, and its
   indexes* says; a key on columns, on a column under its own `COLLATE`, on an instant on UTC's
   clock, `(<column> AT TIME ZONE 'UTC')`, on its month, `(extract(month FROM
@@ -845,21 +852,23 @@ name.
   TRUE`, `IS [NOT] FALSE` or `IS [NOT] UNKNOWN`, a column under `IS NULL` or `IS NOT NULL`, or a
   text column against a pattern written out by `LIKE`, `ILIKE`, `SIMILAR TO` or `~`, its fixed
   prefix narrowing the read; `count(*)`; `sum`, `min`, `max` and `avg`; `GROUP BY`; `ORDER BY`.
-- **A pipeline,** a question with a `WITH` or a window, or one on one table the question path does
-  not read (*A question read as it goes*): steps over one table and the steps before them, joined
-  by `CROSS JOIN`; `DISTINCT`; `LIMIT`, `OFFSET` and `FETCH FIRST`, `WITH TIES` among them;
-  `GROUP BY` and `ORDER BY` naming an item of the select list by its place or its name; the
-  windows `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`,
-  `first_value`, `last_value`, `nth_value` and the aggregates; `CASE`, `IN`, casts, comparisons
-  and `IS [NOT] DISTINCT FROM`; the functions `warren-snail functions` names held and the
-  operators `warren-snail operators` names held, regular expressions among them, matching as
-  PostgreSQL's own engine matches; parameters `$1` and on. Each step's expressions are typed before
+- **A pipeline,** a question with a `WITH` or a window, or one the question path does not read (*A
+  question read as it goes*): steps over tables, the steps before them, derived tables, `VALUES`,
+  views and set-returning functions in `FROM`, met by `ON`, `USING` or `NATURAL`; `*` and `t.*`;
+  `DISTINCT`; `HAVING`; `LIMIT`, `OFFSET` and `FETCH FIRST`, `WITH TIES` among them; `GROUP BY` and
+  `ORDER BY` naming an item of the select list by its place or its name, `ORDER BY` an expression
+  it does not return; the windows `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`,
+  `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` and the aggregates; `CASE`,
+  `COALESCE`, `LEAST`, `GREATEST`, `NULLIF`, `IN`, casts, comparisons and `IS [NOT] DISTINCT FROM`;
+  the functions `warren-snail functions` names held and the operators `warren-snail operators`
+  names held, regular expressions among them, matching as PostgreSQL's own engine matches;
+  parameters `$1` and on. Each step's expressions are typed before
   any row is read, so a function or an aggregate PostgreSQL has no form of for its arguments is
   refused over no rows too.
 - **A statement:** as `exec` above.
 
-Anything else is refused, with a sentence that says what is not read: among it `HAVING`, a
-subquery, a set operation, `WITH RECURSIVE`, a `LIMIT` over several tables, a locking clause
+Anything else is refused, with a sentence that says what is not read: among it a subquery, a
+`LATERAL` subquery, a set operation, `WITH RECURSIVE`, a window over a join, a locking clause
 (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON
 CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE`, a savepoint, and the isolation
 levels REPEATABLE READ and SERIALIZABLE. A statement sqlparser reads otherwise than it is written

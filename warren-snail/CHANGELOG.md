@@ -55,6 +55,13 @@ at once, and a snail written inside a host that decides its commits.
   list's item by its place or its name; more windows and frames; the functions and operators of
   PostgreSQL's types, regular expressions matching as PostgreSQL's own engine matches; the command
   `functions` lists every function PostgreSQL defines and whether the snail answers it.
+- A pipeline over several relations: each step's `FROM` met as one relation, a join of tables in
+  one round as a question on them is read, any other table alone; steps, derived tables, `VALUES`,
+  views and set-returning functions under `LATERAL` met by `ON`, `USING` or `NATURAL`, `RIGHT` and
+  `FULL JOIN` after the first among them; `*` and `t.*`; `HAVING`; `COALESCE`, `LEAST`, `GREATEST`
+  and `NULLIF`; and over a join what the question path does not read, `DISTINCT`, an aggregate's
+  own clauses, `LIMIT` and parameters among it, handed over. `CREATE VIEW` in the DDL and in
+  `exec`, a view read as a step.
 - The commands `types`, `operators` and `opclasses` list every type, operator and operator class
   PostgreSQL 14 to 19 defines, each held or refused in the snail's own words: a type by a table's
   column of it, an operator by a pipeline's step over columns of its types, an operator class by
