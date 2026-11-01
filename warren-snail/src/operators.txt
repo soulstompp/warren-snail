@@ -1,0 +1,810 @@
+!!(NONE,tsquery)		user-defined types
+!~(character,text)		string types
+!~(name,text)		string types
+!~(text,text)		string types
+!~*(character,text)		string types
+!~*(name,text)		string types
+!~*(text,text)		string types
+!~~(bytea,bytea)		user-defined types
+!~~(character,text)		string types
+!~~(name,text)		string types
+!~~(text,text)		string types
+!~~*(character,text)		string types
+!~~*(name,text)		string types
+!~~*(text,text)		string types
+##(line,box)	14	geometric types
+##(line,lseg)		geometric types
+##(lseg,box)		geometric types
+##(lseg,line)	14	geometric types
+##(lseg,lseg)		geometric types
+##(point,box)		geometric types
+##(point,line)		geometric types
+##(point,lseg)		geometric types
+#(NONE,path)		geometric types
+#(NONE,polygon)		geometric types
+#(bigint,bigint)		numeric types
+#(bit,bit)		bit-string types
+#(box,box)		geometric types
+#(integer,integer)		numeric types
+#(line,line)		geometric types
+#(lseg,lseg)		geometric types
+#(smallint,smallint)		numeric types
+#-(jsonb,text[])		user-defined types
+#>(json,text[])		user-defined types
+#>(jsonb,text[])		user-defined types
+#>>(json,text[])		user-defined types
+#>>(jsonb,text[])		user-defined types
+%(bigint,bigint)		numeric types
+%(integer,integer)		numeric types
+%(numeric,numeric)		numeric types
+%(smallint,smallint)		numeric types
+&&(anyarray,anyarray)		array types
+&&(anymultirange,anymultirange)		range types
+&&(anymultirange,anyrange)		range types
+&&(anyrange,anymultirange)		range types
+&&(anyrange,anyrange)		range types
+&&(box,box)		geometric types
+&&(circle,circle)		geometric types
+&&(inet,inet)		network address types
+&&(polygon,polygon)		geometric types
+&&(tsquery,tsquery)		user-defined types
+&(bigint,bigint)		numeric types
+&(bit,bit)		bit-string types
+&(inet,inet)		network address types
+&(integer,integer)		numeric types
+&(macaddr,macaddr)		user-defined types
+&(macaddr8,macaddr8)		user-defined types
+&(smallint,smallint)		numeric types
+&<(anymultirange,anymultirange)		range types
+&<(anymultirange,anyrange)		range types
+&<(anyrange,anymultirange)		range types
+&<(anyrange,anyrange)		range types
+&<(box,box)		geometric types
+&<(circle,circle)		geometric types
+&<(polygon,polygon)		geometric types
+&<|(box,box)		geometric types
+&<|(circle,circle)		geometric types
+&<|(polygon,polygon)		geometric types
+&>(anymultirange,anymultirange)		range types
+&>(anymultirange,anyrange)		range types
+&>(anyrange,anymultirange)		range types
+&>(anyrange,anyrange)		range types
+&>(box,box)		geometric types
+&>(circle,circle)		geometric types
+&>(polygon,polygon)		geometric types
+*(anymultirange,anymultirange)		range types
+*(anyrange,anyrange)		range types
+*(bigint,bigint)		numeric types
+*(bigint,integer)		numeric types
+*(bigint,money)		numeric types
+*(bigint,smallint)		numeric types
+*(box,point)		geometric types
+*(circle,point)		geometric types
+*(double precision,double precision)		numeric types
+*(double precision,interval)		numeric types
+*(double precision,money)		numeric types
+*(double precision,real)		numeric types
+*(integer,bigint)		numeric types
+*(integer,integer)		numeric types
+*(integer,money)		numeric types
+*(integer,smallint)		numeric types
+*(interval,double precision)		timespan types
+*(money,bigint)		numeric types
+*(money,double precision)		numeric types
+*(money,integer)		numeric types
+*(money,real)		numeric types
+*(money,smallint)		numeric types
+*(numeric,numeric)		numeric types
+*(path,point)		geometric types
+*(point,point)		geometric types
+*(real,double precision)		numeric types
+*(real,money)		numeric types
+*(real,real)		numeric types
+*(smallint,bigint)		numeric types
+*(smallint,integer)		numeric types
+*(smallint,money)		numeric types
+*(smallint,smallint)		numeric types
+*<(record,record)		composite types
+*<=(record,record)		composite types
+*<>(record,record)		composite types
+*=(record,record)		composite types
+*>(record,record)		composite types
+*>=(record,record)		composite types
++(NONE,bigint)		numeric types
++(NONE,double precision)		numeric types
++(NONE,integer)		numeric types
++(NONE,numeric)		numeric types
++(NONE,real)		numeric types
++(NONE,smallint)		numeric types
++(aclitem[],aclitem)		array types
++(anymultirange,anymultirange)		range types
++(anyrange,anyrange)		range types
++(bigint,bigint)		numeric types
++(bigint,inet)		numeric types
++(bigint,integer)		numeric types
++(bigint,smallint)		numeric types
++(box,point)		geometric types
++(circle,point)		geometric types
++(date,integer)		date/time types
++(date,interval)		date/time types
++(date,time with time zone)		date/time types
++(date,time without time zone)		date/time types
++(double precision,double precision)		numeric types
++(double precision,real)		numeric types
++(inet,bigint)		network address types
++(integer,bigint)		numeric types
++(integer,date)		numeric types
++(integer,integer)		numeric types
++(integer,smallint)		numeric types
++(interval,date)		timespan types
++(interval,interval)		timespan types
++(interval,time with time zone)		timespan types
++(interval,time without time zone)		timespan types
++(interval,timestamp with time zone)		timespan types
++(interval,timestamp without time zone)		timespan types
++(money,money)		numeric types
++(numeric,numeric)		numeric types
++(numeric,pg_lsn)		numeric types
++(path,path)		geometric types
++(path,point)		geometric types
++(pg_lsn,numeric)		user-defined types
++(point,point)		geometric types
++(real,double precision)		numeric types
++(real,real)		numeric types
++(smallint,bigint)		numeric types
++(smallint,integer)		numeric types
++(smallint,smallint)		numeric types
++(time with time zone,date)		date/time types
++(time with time zone,interval)		date/time types
++(time without time zone,date)		date/time types
++(time without time zone,interval)		date/time types
++(timestamp with time zone,interval)		date/time types
++(timestamp without time zone,interval)		date/time types
+-(NONE,bigint)		numeric types
+-(NONE,double precision)		numeric types
+-(NONE,integer)		numeric types
+-(NONE,interval)		timespan types
+-(NONE,numeric)		numeric types
+-(NONE,real)		numeric types
+-(NONE,smallint)		numeric types
+-(aclitem[],aclitem)		array types
+-(anymultirange,anymultirange)		range types
+-(anyrange,anyrange)		range types
+-(bigint,bigint)		numeric types
+-(bigint,integer)		numeric types
+-(bigint,smallint)		numeric types
+-(box,point)		geometric types
+-(circle,point)		geometric types
+-(date,date)		date/time types
+-(date,integer)		date/time types
+-(date,interval)		date/time types
+-(double precision,double precision)		numeric types
+-(double precision,real)		numeric types
+-(inet,bigint)		network address types
+-(inet,inet)		network address types
+-(integer,bigint)		numeric types
+-(integer,integer)		numeric types
+-(integer,smallint)		numeric types
+-(interval,interval)		timespan types
+-(jsonb,integer)		user-defined types
+-(jsonb,text)		user-defined types
+-(jsonb,text[])		user-defined types
+-(money,money)		numeric types
+-(numeric,numeric)		numeric types
+-(path,point)		geometric types
+-(pg_lsn,numeric)		user-defined types
+-(pg_lsn,pg_lsn)		user-defined types
+-(point,point)		geometric types
+-(real,double precision)		numeric types
+-(real,real)		numeric types
+-(smallint,bigint)		numeric types
+-(smallint,integer)		numeric types
+-(smallint,smallint)		numeric types
+-(time with time zone,interval)		date/time types
+-(time without time zone,interval)		date/time types
+-(time without time zone,time without time zone)		date/time types
+-(timestamp with time zone,interval)		date/time types
+-(timestamp with time zone,timestamp with time zone)		date/time types
+-(timestamp without time zone,interval)		date/time types
+-(timestamp without time zone,timestamp without time zone)		date/time types
+->(json,integer)		user-defined types
+->(json,text)		user-defined types
+->(jsonb,integer)		user-defined types
+->(jsonb,text)		user-defined types
+->>(json,integer)		user-defined types
+->>(json,text)		user-defined types
+->>(jsonb,integer)		user-defined types
+->>(jsonb,text)		user-defined types
+-|-(anymultirange,anymultirange)		range types
+-|-(anymultirange,anyrange)		range types
+-|-(anyrange,anymultirange)		range types
+-|-(anyrange,anyrange)		range types
+/(bigint,bigint)		numeric types
+/(bigint,integer)		numeric types
+/(bigint,smallint)		numeric types
+/(box,point)		geometric types
+/(circle,point)		geometric types
+/(double precision,double precision)		numeric types
+/(double precision,real)		numeric types
+/(integer,bigint)		numeric types
+/(integer,integer)		numeric types
+/(integer,smallint)		numeric types
+/(interval,double precision)		timespan types
+/(money,bigint)		numeric types
+/(money,double precision)		numeric types
+/(money,integer)		numeric types
+/(money,money)		numeric types
+/(money,real)		numeric types
+/(money,smallint)		numeric types
+/(numeric,numeric)		numeric types
+/(path,point)		geometric types
+/(point,point)		geometric types
+/(real,double precision)		numeric types
+/(real,real)		numeric types
+/(smallint,bigint)		numeric types
+/(smallint,integer)		numeric types
+/(smallint,smallint)		numeric types
+<("char","char")		internal-use types
+<(anyarray,anyarray)		array types
+<(anyenum,anyenum)		enum types
+<(anymultirange,anymultirange)		range types
+<(anyrange,anyrange)		range types
+<(bigint,bigint)		numeric types
+<(bigint,integer)		numeric types
+<(bigint,smallint)		numeric types
+<(bit varying,bit varying)		bit-string types
+<(bit,bit)		bit-string types
+<(boolean,boolean)		boolean types
+<(box,box)		geometric types
+<(bytea,bytea)		user-defined types
+<(character,character)		string types
+<(circle,circle)		geometric types
+<(date,date)		date/time types
+<(date,timestamp with time zone)		date/time types
+<(date,timestamp without time zone)		date/time types
+<(double precision,double precision)		numeric types
+<(double precision,real)		numeric types
+<(inet,inet)		network address types
+<(integer,bigint)		numeric types
+<(integer,integer)		numeric types
+<(integer,smallint)		numeric types
+<(interval,interval)		timespan types
+<(jsonb,jsonb)		user-defined types
+<(lseg,lseg)		geometric types
+<(macaddr,macaddr)		user-defined types
+<(macaddr8,macaddr8)		user-defined types
+<(money,money)		numeric types
+<(name,name)		string types
+<(name,text)		string types
+<(numeric,numeric)		numeric types
+<(oid,oid)		numeric types
+<(oid8,oid8)	19	numeric types
+<(oidvector,oidvector)		array types
+<(path,path)		geometric types
+<(pg_lsn,pg_lsn)		user-defined types
+<(real,double precision)		numeric types
+<(real,real)		numeric types
+<(record,record)		composite types
+<(smallint,bigint)		numeric types
+<(smallint,integer)		numeric types
+<(smallint,smallint)		numeric types
+<(text,name)		string types
+<(text,text)		string types
+<(tid,tid)		user-defined types
+<(time with time zone,time with time zone)		date/time types
+<(time without time zone,time without time zone)		date/time types
+<(timestamp with time zone,date)		date/time types
+<(timestamp with time zone,timestamp with time zone)		date/time types
+<(timestamp with time zone,timestamp without time zone)		date/time types
+<(timestamp without time zone,date)		date/time types
+<(timestamp without time zone,timestamp with time zone)		date/time types
+<(timestamp without time zone,timestamp without time zone)		date/time types
+<(tsquery,tsquery)		user-defined types
+<(tsvector,tsvector)		user-defined types
+<(uuid,uuid)		user-defined types
+<(xid8,xid8)		user-defined types
+<->(box,box)		geometric types
+<->(box,line)	14	geometric types
+<->(box,lseg)		geometric types
+<->(box,point)		geometric types
+<->(circle,circle)		geometric types
+<->(circle,point)		geometric types
+<->(circle,polygon)		geometric types
+<->(line,box)	14	geometric types
+<->(line,line)		geometric types
+<->(line,lseg)		geometric types
+<->(line,point)		geometric types
+<->(lseg,box)		geometric types
+<->(lseg,line)		geometric types
+<->(lseg,lseg)		geometric types
+<->(lseg,point)		geometric types
+<->(path,path)		geometric types
+<->(path,point)		geometric types
+<->(point,box)		geometric types
+<->(point,circle)		geometric types
+<->(point,line)		geometric types
+<->(point,lseg)		geometric types
+<->(point,path)		geometric types
+<->(point,point)		geometric types
+<->(point,polygon)		geometric types
+<->(polygon,circle)		geometric types
+<->(polygon,point)		geometric types
+<->(polygon,polygon)		geometric types
+<->(tsquery,tsquery)		user-defined types
+<<(anymultirange,anymultirange)		range types
+<<(anymultirange,anyrange)		range types
+<<(anyrange,anymultirange)		range types
+<<(anyrange,anyrange)		range types
+<<(bigint,integer)		numeric types
+<<(bit,integer)		bit-string types
+<<(box,box)		geometric types
+<<(circle,circle)		geometric types
+<<(inet,inet)		network address types
+<<(integer,integer)		numeric types
+<<(point,point)		geometric types
+<<(polygon,polygon)		geometric types
+<<(smallint,integer)		numeric types
+<<=(inet,inet)		network address types
+<<|(box,box)		geometric types
+<<|(circle,circle)		geometric types
+<<|(point,point)		geometric types
+<<|(polygon,polygon)		geometric types
+<=("char","char")		internal-use types
+<=(anyarray,anyarray)		array types
+<=(anyenum,anyenum)		enum types
+<=(anymultirange,anymultirange)		range types
+<=(anyrange,anyrange)		range types
+<=(bigint,bigint)		numeric types
+<=(bigint,integer)		numeric types
+<=(bigint,smallint)		numeric types
+<=(bit varying,bit varying)		bit-string types
+<=(bit,bit)		bit-string types
+<=(boolean,boolean)		boolean types
+<=(box,box)		geometric types
+<=(bytea,bytea)		user-defined types
+<=(character,character)		string types
+<=(circle,circle)		geometric types
+<=(date,date)		date/time types
+<=(date,timestamp with time zone)		date/time types
+<=(date,timestamp without time zone)		date/time types
+<=(double precision,double precision)		numeric types
+<=(double precision,real)		numeric types
+<=(inet,inet)		network address types
+<=(integer,bigint)		numeric types
+<=(integer,integer)		numeric types
+<=(integer,smallint)		numeric types
+<=(interval,interval)		timespan types
+<=(jsonb,jsonb)		user-defined types
+<=(lseg,lseg)		geometric types
+<=(macaddr,macaddr)		user-defined types
+<=(macaddr8,macaddr8)		user-defined types
+<=(money,money)		numeric types
+<=(name,name)		string types
+<=(name,text)		string types
+<=(numeric,numeric)		numeric types
+<=(oid,oid)		numeric types
+<=(oid8,oid8)	19	numeric types
+<=(oidvector,oidvector)		array types
+<=(path,path)		geometric types
+<=(pg_lsn,pg_lsn)		user-defined types
+<=(real,double precision)		numeric types
+<=(real,real)		numeric types
+<=(record,record)		composite types
+<=(smallint,bigint)		numeric types
+<=(smallint,integer)		numeric types
+<=(smallint,smallint)		numeric types
+<=(text,name)		string types
+<=(text,text)		string types
+<=(tid,tid)		user-defined types
+<=(time with time zone,time with time zone)		date/time types
+<=(time without time zone,time without time zone)		date/time types
+<=(timestamp with time zone,date)		date/time types
+<=(timestamp with time zone,timestamp with time zone)		date/time types
+<=(timestamp with time zone,timestamp without time zone)		date/time types
+<=(timestamp without time zone,date)		date/time types
+<=(timestamp without time zone,timestamp with time zone)		date/time types
+<=(timestamp without time zone,timestamp without time zone)		date/time types
+<=(tsquery,tsquery)		user-defined types
+<=(tsvector,tsvector)		user-defined types
+<=(uuid,uuid)		user-defined types
+<=(xid8,xid8)		user-defined types
+<>("char","char")		internal-use types
+<>(anyarray,anyarray)		array types
+<>(anyenum,anyenum)		enum types
+<>(anymultirange,anymultirange)		range types
+<>(anyrange,anyrange)		range types
+<>(bigint,bigint)		numeric types
+<>(bigint,integer)		numeric types
+<>(bigint,smallint)		numeric types
+<>(bit varying,bit varying)		bit-string types
+<>(bit,bit)		bit-string types
+<>(boolean,boolean)		boolean types
+<>(bytea,bytea)		user-defined types
+<>(character,character)		string types
+<>(circle,circle)		geometric types
+<>(date,date)		date/time types
+<>(date,timestamp with time zone)		date/time types
+<>(date,timestamp without time zone)		date/time types
+<>(double precision,double precision)		numeric types
+<>(double precision,real)		numeric types
+<>(inet,inet)		network address types
+<>(integer,bigint)		numeric types
+<>(integer,integer)		numeric types
+<>(integer,smallint)		numeric types
+<>(interval,interval)		timespan types
+<>(jsonb,jsonb)		user-defined types
+<>(lseg,lseg)		geometric types
+<>(macaddr,macaddr)		user-defined types
+<>(macaddr8,macaddr8)		user-defined types
+<>(money,money)		numeric types
+<>(name,name)		string types
+<>(name,text)		string types
+<>(numeric,numeric)		numeric types
+<>(oid,oid)		numeric types
+<>(oid8,oid8)	19	numeric types
+<>(oidvector,oidvector)		array types
+<>(pg_lsn,pg_lsn)		user-defined types
+<>(point,point)		geometric types
+<>(real,double precision)		numeric types
+<>(real,real)		numeric types
+<>(record,record)		composite types
+<>(smallint,bigint)		numeric types
+<>(smallint,integer)		numeric types
+<>(smallint,smallint)		numeric types
+<>(text,name)		string types
+<>(text,text)		string types
+<>(tid,tid)		user-defined types
+<>(time with time zone,time with time zone)		date/time types
+<>(time without time zone,time without time zone)		date/time types
+<>(timestamp with time zone,date)		date/time types
+<>(timestamp with time zone,timestamp with time zone)		date/time types
+<>(timestamp with time zone,timestamp without time zone)		date/time types
+<>(timestamp without time zone,date)		date/time types
+<>(timestamp without time zone,timestamp with time zone)		date/time types
+<>(timestamp without time zone,timestamp without time zone)		date/time types
+<>(tsquery,tsquery)		user-defined types
+<>(tsvector,tsvector)		user-defined types
+<>(uuid,uuid)		user-defined types
+<>(xid,integer)		user-defined types
+<>(xid,xid)		user-defined types
+<>(xid8,xid8)		user-defined types
+<@(anyarray,anyarray)		array types
+<@(anyelement,anymultirange)		range types
+<@(anyelement,anyrange)		range types
+<@(anymultirange,anymultirange)		range types
+<@(anymultirange,anyrange)		range types
+<@(anyrange,anymultirange)		range types
+<@(anyrange,anyrange)		range types
+<@(box,box)		geometric types
+<@(circle,circle)		geometric types
+<@(jsonb,jsonb)		user-defined types
+<@(lseg,box)		geometric types
+<@(lseg,line)		geometric types
+<@(point,box)		geometric types
+<@(point,circle)		geometric types
+<@(point,line)		geometric types
+<@(point,lseg)		geometric types
+<@(point,path)		geometric types
+<@(point,polygon)		geometric types
+<@(polygon,polygon)		geometric types
+<@(tsquery,tsquery)		user-defined types
+<^(box,box)		geometric types
+<^(point,point)		geometric types
+=("char","char")		internal-use types
+=(aclitem,aclitem)		user-defined types
+=(anyarray,anyarray)		array types
+=(anyenum,anyenum)		enum types
+=(anymultirange,anymultirange)		range types
+=(anyrange,anyrange)		range types
+=(bigint,bigint)		numeric types
+=(bigint,integer)		numeric types
+=(bigint,smallint)		numeric types
+=(bit varying,bit varying)		bit-string types
+=(bit,bit)		bit-string types
+=(boolean,boolean)		boolean types
+=(box,box)		geometric types
+=(bytea,bytea)		user-defined types
+=(character,character)		string types
+=(cid,cid)		user-defined types
+=(circle,circle)		geometric types
+=(date,date)		date/time types
+=(date,timestamp with time zone)		date/time types
+=(date,timestamp without time zone)		date/time types
+=(double precision,double precision)		numeric types
+=(double precision,real)		numeric types
+=(inet,inet)		network address types
+=(integer,bigint)		numeric types
+=(integer,integer)		numeric types
+=(integer,smallint)		numeric types
+=(interval,interval)		timespan types
+=(jsonb,jsonb)		user-defined types
+=(line,line)		geometric types
+=(lseg,lseg)		geometric types
+=(macaddr,macaddr)		user-defined types
+=(macaddr8,macaddr8)		user-defined types
+=(money,money)		numeric types
+=(name,name)		string types
+=(name,text)		string types
+=(numeric,numeric)		numeric types
+=(oid,oid)		numeric types
+=(oid8,oid8)	19	numeric types
+=(oidvector,oidvector)		array types
+=(path,path)		geometric types
+=(pg_lsn,pg_lsn)		user-defined types
+=(real,double precision)		numeric types
+=(real,real)		numeric types
+=(record,record)		composite types
+=(smallint,bigint)		numeric types
+=(smallint,integer)		numeric types
+=(smallint,smallint)		numeric types
+=(text,name)		string types
+=(text,text)		string types
+=(tid,tid)		user-defined types
+=(time with time zone,time with time zone)		date/time types
+=(time without time zone,time without time zone)		date/time types
+=(timestamp with time zone,date)		date/time types
+=(timestamp with time zone,timestamp with time zone)		date/time types
+=(timestamp with time zone,timestamp without time zone)		date/time types
+=(timestamp without time zone,date)		date/time types
+=(timestamp without time zone,timestamp with time zone)		date/time types
+=(timestamp without time zone,timestamp without time zone)		date/time types
+=(tsquery,tsquery)		user-defined types
+=(tsvector,tsvector)		user-defined types
+=(uuid,uuid)		user-defined types
+=(xid,integer)		user-defined types
+=(xid,xid)		user-defined types
+=(xid8,xid8)		user-defined types
+>("char","char")		internal-use types
+>(anyarray,anyarray)		array types
+>(anyenum,anyenum)		enum types
+>(anymultirange,anymultirange)		range types
+>(anyrange,anyrange)		range types
+>(bigint,bigint)		numeric types
+>(bigint,integer)		numeric types
+>(bigint,smallint)		numeric types
+>(bit varying,bit varying)		bit-string types
+>(bit,bit)		bit-string types
+>(boolean,boolean)		boolean types
+>(box,box)		geometric types
+>(bytea,bytea)		user-defined types
+>(character,character)		string types
+>(circle,circle)		geometric types
+>(date,date)		date/time types
+>(date,timestamp with time zone)		date/time types
+>(date,timestamp without time zone)		date/time types
+>(double precision,double precision)		numeric types
+>(double precision,real)		numeric types
+>(inet,inet)		network address types
+>(integer,bigint)		numeric types
+>(integer,integer)		numeric types
+>(integer,smallint)		numeric types
+>(interval,interval)		timespan types
+>(jsonb,jsonb)		user-defined types
+>(lseg,lseg)		geometric types
+>(macaddr,macaddr)		user-defined types
+>(macaddr8,macaddr8)		user-defined types
+>(money,money)		numeric types
+>(name,name)		string types
+>(name,text)		string types
+>(numeric,numeric)		numeric types
+>(oid,oid)		numeric types
+>(oid8,oid8)	19	numeric types
+>(oidvector,oidvector)		array types
+>(path,path)		geometric types
+>(pg_lsn,pg_lsn)		user-defined types
+>(real,double precision)		numeric types
+>(real,real)		numeric types
+>(record,record)		composite types
+>(smallint,bigint)		numeric types
+>(smallint,integer)		numeric types
+>(smallint,smallint)		numeric types
+>(text,name)		string types
+>(text,text)		string types
+>(tid,tid)		user-defined types
+>(time with time zone,time with time zone)		date/time types
+>(time without time zone,time without time zone)		date/time types
+>(timestamp with time zone,date)		date/time types
+>(timestamp with time zone,timestamp with time zone)		date/time types
+>(timestamp with time zone,timestamp without time zone)		date/time types
+>(timestamp without time zone,date)		date/time types
+>(timestamp without time zone,timestamp with time zone)		date/time types
+>(timestamp without time zone,timestamp without time zone)		date/time types
+>(tsquery,tsquery)		user-defined types
+>(tsvector,tsvector)		user-defined types
+>(uuid,uuid)		user-defined types
+>(xid8,xid8)		user-defined types
+>=("char","char")		internal-use types
+>=(anyarray,anyarray)		array types
+>=(anyenum,anyenum)		enum types
+>=(anymultirange,anymultirange)		range types
+>=(anyrange,anyrange)		range types
+>=(bigint,bigint)		numeric types
+>=(bigint,integer)		numeric types
+>=(bigint,smallint)		numeric types
+>=(bit varying,bit varying)		bit-string types
+>=(bit,bit)		bit-string types
+>=(boolean,boolean)		boolean types
+>=(box,box)		geometric types
+>=(bytea,bytea)		user-defined types
+>=(character,character)		string types
+>=(circle,circle)		geometric types
+>=(date,date)		date/time types
+>=(date,timestamp with time zone)		date/time types
+>=(date,timestamp without time zone)		date/time types
+>=(double precision,double precision)		numeric types
+>=(double precision,real)		numeric types
+>=(inet,inet)		network address types
+>=(integer,bigint)		numeric types
+>=(integer,integer)		numeric types
+>=(integer,smallint)		numeric types
+>=(interval,interval)		timespan types
+>=(jsonb,jsonb)		user-defined types
+>=(lseg,lseg)		geometric types
+>=(macaddr,macaddr)		user-defined types
+>=(macaddr8,macaddr8)		user-defined types
+>=(money,money)		numeric types
+>=(name,name)		string types
+>=(name,text)		string types
+>=(numeric,numeric)		numeric types
+>=(oid,oid)		numeric types
+>=(oid8,oid8)	19	numeric types
+>=(oidvector,oidvector)		array types
+>=(path,path)		geometric types
+>=(pg_lsn,pg_lsn)		user-defined types
+>=(real,double precision)		numeric types
+>=(real,real)		numeric types
+>=(record,record)		composite types
+>=(smallint,bigint)		numeric types
+>=(smallint,integer)		numeric types
+>=(smallint,smallint)		numeric types
+>=(text,name)		string types
+>=(text,text)		string types
+>=(tid,tid)		user-defined types
+>=(time with time zone,time with time zone)		date/time types
+>=(time without time zone,time without time zone)		date/time types
+>=(timestamp with time zone,date)		date/time types
+>=(timestamp with time zone,timestamp with time zone)		date/time types
+>=(timestamp with time zone,timestamp without time zone)		date/time types
+>=(timestamp without time zone,date)		date/time types
+>=(timestamp without time zone,timestamp with time zone)		date/time types
+>=(timestamp without time zone,timestamp without time zone)		date/time types
+>=(tsquery,tsquery)		user-defined types
+>=(tsvector,tsvector)		user-defined types
+>=(uuid,uuid)		user-defined types
+>=(xid8,xid8)		user-defined types
+>>(anymultirange,anymultirange)		range types
+>>(anymultirange,anyrange)		range types
+>>(anyrange,anymultirange)		range types
+>>(anyrange,anyrange)		range types
+>>(bigint,integer)		numeric types
+>>(bit,integer)		bit-string types
+>>(box,box)		geometric types
+>>(circle,circle)		geometric types
+>>(inet,inet)		network address types
+>>(integer,integer)		numeric types
+>>(point,point)		geometric types
+>>(polygon,polygon)		geometric types
+>>(smallint,integer)		numeric types
+>>=(inet,inet)		network address types
+>^(box,box)		geometric types
+>^(point,point)		geometric types
+?#(box,box)		geometric types
+?#(line,box)		geometric types
+?#(line,line)		geometric types
+?#(lseg,box)		geometric types
+?#(lseg,line)		geometric types
+?#(lseg,lseg)		geometric types
+?#(path,path)		geometric types
+?&(jsonb,text[])		user-defined types
+?(jsonb,text)		user-defined types
+?-(NONE,line)		geometric types
+?-(NONE,lseg)		geometric types
+?-(point,point)		geometric types
+?-|(line,line)		geometric types
+?-|(lseg,lseg)		geometric types
+?|(NONE,line)		geometric types
+?|(NONE,lseg)		geometric types
+?|(jsonb,text[])		user-defined types
+?|(point,point)		geometric types
+?||(line,line)		geometric types
+?||(lseg,lseg)		geometric types
+@(NONE,bigint)		numeric types
+@(NONE,double precision)		numeric types
+@(NONE,integer)		numeric types
+@(NONE,numeric)		numeric types
+@(NONE,real)		numeric types
+@(NONE,smallint)		numeric types
+@-@(NONE,lseg)		geometric types
+@-@(NONE,path)		geometric types
+@>(aclitem[],aclitem)		array types
+@>(anyarray,anyarray)		array types
+@>(anymultirange,anyelement)		range types
+@>(anymultirange,anymultirange)		range types
+@>(anymultirange,anyrange)		range types
+@>(anyrange,anyelement)		range types
+@>(anyrange,anymultirange)		range types
+@>(anyrange,anyrange)		range types
+@>(box,box)		geometric types
+@>(box,point)		geometric types
+@>(circle,circle)		geometric types
+@>(circle,point)		geometric types
+@>(jsonb,jsonb)		user-defined types
+@>(path,point)		geometric types
+@>(polygon,point)		geometric types
+@>(polygon,polygon)		geometric types
+@>(tsquery,tsquery)		user-defined types
+@?(jsonb,jsonpath)		user-defined types
+@@(NONE,box)		geometric types
+@@(NONE,circle)		geometric types
+@@(NONE,lseg)		geometric types
+@@(NONE,path)	14	geometric types
+@@(NONE,polygon)		geometric types
+@@(jsonb,jsonpath)		user-defined types
+@@(text,text)		string types
+@@(text,tsquery)		string types
+@@(tsquery,tsvector)		user-defined types
+@@(tsvector,tsquery)		user-defined types
+@@@(tsquery,tsvector)		user-defined types
+@@@(tsvector,tsquery)		user-defined types
+^(double precision,double precision)		numeric types
+^(numeric,numeric)		numeric types
+^@(text,text)		string types
+|&>(box,box)		geometric types
+|&>(circle,circle)		geometric types
+|&>(polygon,polygon)		geometric types
+|(bigint,bigint)		numeric types
+|(bit,bit)		bit-string types
+|(inet,inet)		network address types
+|(integer,integer)		numeric types
+|(macaddr,macaddr)		user-defined types
+|(macaddr8,macaddr8)		user-defined types
+|(smallint,smallint)		numeric types
+|/(NONE,double precision)		numeric types
+|>>(box,box)		geometric types
+|>>(circle,circle)		geometric types
+|>>(point,point)		geometric types
+|>>(polygon,polygon)		geometric types
+||(anycompatible,anycompatiblearray)		array types
+||(anycompatiblearray,anycompatible)		array types
+||(anycompatiblearray,anycompatiblearray)		array types
+||(anynonarray,text)		string types
+||(bit varying,bit varying)		bit-string types
+||(bytea,bytea)		user-defined types
+||(jsonb,jsonb)		user-defined types
+||(text,anynonarray)		string types
+||(text,text)		string types
+||(tsquery,tsquery)		user-defined types
+||(tsvector,tsvector)		user-defined types
+||/(NONE,double precision)		numeric types
+~(NONE,bigint)		numeric types
+~(NONE,bit)		bit-string types
+~(NONE,inet)		network address types
+~(NONE,integer)		numeric types
+~(NONE,macaddr)		user-defined types
+~(NONE,macaddr8)		user-defined types
+~(NONE,smallint)		numeric types
+~(character,text)		string types
+~(name,text)		string types
+~(text,text)		string types
+~*(character,text)		string types
+~*(name,text)		string types
+~*(text,text)		string types
+~<=~(character,character)		string types
+~<=~(text,text)		string types
+~<~(character,character)		string types
+~<~(text,text)		string types
+~=(box,box)		geometric types
+~=(circle,circle)		geometric types
+~=(point,point)		geometric types
+~=(polygon,polygon)		geometric types
+~>=~(character,character)		string types
+~>=~(text,text)		string types
+~>~(character,character)		string types
+~>~(text,text)		string types
+~~(bytea,bytea)		user-defined types
+~~(character,text)		string types
+~~(name,text)		string types
+~~(text,text)		string types
+~~*(character,text)		string types
+~~*(name,text)		string types
+~~*(text,text)		string types

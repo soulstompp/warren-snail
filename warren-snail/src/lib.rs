@@ -21,6 +21,7 @@ pub mod held;
 pub mod inet;
 pub mod jsonb;
 pub mod jsonpath;
+pub mod lists;
 pub mod lock;
 mod methods;
 pub mod monetary;

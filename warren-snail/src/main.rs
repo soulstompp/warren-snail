@@ -37,6 +37,9 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
        warren-snail catalog (<file> | --ddl <ddl.sql> [--taken <taken.sql>]
                             [--statements <statements.parquet>]) [--out <catalog.parquet>]
        warren-snail functions [--release <14..19>] [--out <functions.parquet>]
+       warren-snail types [--release <14..19>] [--out <types.parquet>]
+       warren-snail operators [--release <14..19>] [--out <operators.parquet>] [--setup <setup.sql>]
+       warren-snail opclasses [--release <14..19>] [--out <opclasses.parquet>]
        warren-snail hold <file> --seconds <n>
 
   write   a new snail at <file>, where no file may be yet, from the DDL: each table given its rows
@@ -90,6 +93,16 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           the snail answers, a type's it does not answer, or the server's own, which it refuses
           by name. Prints how many of each; --out records each as Parquet: its signature, class,
           family and whether the snail answers it.
+  types   every type PostgreSQL defines, 19 unless --release names another release: held, where the
+          snail takes a table's column of it, or refused, in the snail's words. Prints how many of
+          each; --out records each as Parquet: its name, family, whether the snail holds it, its
+          refusal and the statements it was probed by.
+  operators every operator PostgreSQL defines, as types lists the types: held where a pipeline's
+          step answers it over columns of its operands' types, in a snail written for the probe
+          among the system's temporary files and removed after. --setup writes the statements that
+          make that table whole, a column and a value of each type, as PostgreSQL may be given them.
+  opclasses every operator class PostgreSQL defines, as types lists the types: held where the snail
+          takes an index of its method and it on a column of its key's type.
   hold    the snail held open for the seconds given, as a round that long would hold it.
 
   A command given --help, or -h, prints its own usage and what it does.
@@ -1211,16 +1224,21 @@ fn cmd_blocks(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_functions(args: &[String]) -> Result<()> {
-    use warren_snail::functions::{all, Class};
-    let release = match flag(args, "--release") {
+/// The release --release names, 19 unless named.
+fn release_flag(args: &[String]) -> Result<u8> {
+    match flag(args, "--release") {
         Some(r) => r
             .parse()
             .ok()
             .filter(|r| warren_snail::regs::RELEASES.contains(r))
-            .ok_or_else(|| Error::new(format!("--release {r}: the list holds 14 to 19")))?,
-        None => warren_snail::regs::LATEST,
-    };
+            .ok_or_else(|| Error::new(format!("--release {r}: the list holds 14 to 19"))),
+        None => Ok(warren_snail::regs::LATEST),
+    }
+}
+
+fn cmd_functions(args: &[String]) -> Result<()> {
+    use warren_snail::functions::{all, Class};
+    let release = release_flag(args)?;
     let of: Vec<_> = all().iter().filter(|f| f.in_release(release)).collect();
     let state = |f: &warren_snail::functions::Function| match (f.class, f.held()) {
         (Class::Server, _) => "refused",
@@ -1270,7 +1288,7 @@ fn cmd_functions(args: &[String]) -> Result<()> {
 }
 
 /// The commands, as `USAGE` names them.
-const COMMANDS: [&str; 10] = [
+const COMMANDS: [&str; 13] = [
     "write",
     "exec",
     "read",
@@ -1280,6 +1298,9 @@ const COMMANDS: [&str; 10] = [
     "recut",
     "catalog",
     "functions",
+    "types",
+    "operators",
+    "opclasses",
     "hold",
 ];
 
@@ -1325,6 +1346,80 @@ fn usage_of(command: &str) -> String {
     format!("{}\n\n{}", usage.join("\n"), does.join("\n"))
 }
 
+/// The operators of a release as the snail answers them, probed in a snail written among the
+/// system's temporary files and removed after; and the statements that make the probes' table whole.
+#[cfg(feature = "standalone")]
+fn operators_of(release: u8) -> Result<(Vec<warren_snail::lists::Probed>, Vec<String>)> {
+    let scratch = std::env::temp_dir().join(format!(
+        "warren-snail-operators-{}.snail",
+        std::process::id()
+    ));
+    let probed = warren_snail::lists::operators(release, &scratch);
+    let _ = std::fs::remove_file(&scratch);
+    probed
+}
+
+#[cfg(not(feature = "standalone"))]
+fn operators_of(_: u8) -> Result<(Vec<warren_snail::lists::Probed>, Vec<String>)> {
+    Err(Error::new(
+        "operators: a build without `standalone` writes no snail to probe them in",
+    ))
+}
+
+fn cmd_listed(kind: warren_snail::lists::Kind, args: &[String]) -> Result<()> {
+    use warren_snail::lists::{opclasses, types, Kind};
+    let release = release_flag(args)?;
+    let (probed, setup, noun) = match kind {
+        Kind::Type => (types(release), Vec::new(), "types"),
+        Kind::Opclass => (opclasses(release), Vec::new(), "operator classes"),
+        _ => {
+            let (p, s) = operators_of(release)?;
+            (p, s, "operators")
+        }
+    };
+    let held = probed.iter().filter(|p| p.refused.is_none()).count();
+    println!("held      {held}");
+    println!("refused   {}", probed.len() - held);
+    println!("in all    {} {noun} of {release}", probed.len());
+    if let Some(out) = flag(args, "--out") {
+        let text = |f: &dyn Fn(&warren_snail::lists::Probed) -> String| {
+            texts(probed.iter().map(f).collect())
+        };
+        let batch = table(vec![
+            ("name", text(&|p| p.listed.name.to_string())),
+            ("family", text(&|p| p.listed.family.to_string())),
+            ("input", text(&|p| p.listed.input.to_string())),
+            (
+                "state",
+                text(&|p| {
+                    if p.refused.is_none() {
+                        "held"
+                    } else {
+                        "refused"
+                    }
+                    .to_string()
+                }),
+            ),
+            (
+                "reason",
+                Arc::new(
+                    probed
+                        .iter()
+                        .map(|p| p.refused.clone())
+                        .collect::<StringArray>(),
+                ) as ArrayRef,
+            ),
+            ("probe", text(&|p| p.probe.clone())),
+        ])?;
+        save(out, &batch)?;
+    }
+    if let Some(path) = flag(args, "--setup") {
+        std::fs::write(path, setup.join("\n") + "\n")
+            .map_err(|e| Error::new(format!("{path}: {e}")))?;
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Built with zones, SNAIL_ZONES names the directory of compiled zones read, a server's own.
@@ -1349,6 +1444,9 @@ fn main() -> ExitCode {
         Some("blocks") => cmd_blocks(&args[1..]),
         Some("catalog") => cmd_catalog(&args[1..]),
         Some("functions") => cmd_functions(&args[1..]),
+        Some("types") => cmd_listed(warren_snail::lists::Kind::Type, &args[1..]),
+        Some("operators") => cmd_listed(warren_snail::lists::Kind::Operator, &args[1..]),
+        Some("opclasses") => cmd_listed(warren_snail::lists::Kind::Opclass, &args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())

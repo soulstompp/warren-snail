@@ -1,0 +1,489 @@
+"any"		pseudo-types
+"char"		internal-use types
+"char"[]		array types
+aclitem		user-defined types
+aclitem[]		array types
+anyarray		pseudo-types
+anycompatible		pseudo-types
+anycompatiblearray		pseudo-types
+anycompatiblemultirange		pseudo-types
+anycompatiblenonarray		pseudo-types
+anycompatiblerange		pseudo-types
+anyelement		pseudo-types
+anyenum		pseudo-types
+anymultirange		pseudo-types
+anynonarray		pseudo-types
+anyrange		pseudo-types
+bigint		numeric types
+bigint[]		array types
+bit		bit-string types
+bit varying		bit-string types
+bit varying[]		array types
+bit[]		array types
+boolean		boolean types
+boolean[]		array types
+box		geometric types
+box[]		array types
+bytea		user-defined types
+bytea[]		array types
+character		string types
+character varying		string types
+character varying[]		array types
+character[]		array types
+cid		user-defined types
+cid[]		array types
+cidr		network address types
+cidr[]		array types
+circle		geometric types
+circle[]		array types
+cstring		pseudo-types
+cstring[]		array types
+date		date/time types
+date[]		array types
+datemultirange		range types
+datemultirange[]		array types
+daterange		range types
+daterange[]		array types
+double precision		numeric types
+double precision[]		array types
+event_trigger		pseudo-types
+fdw_handler		pseudo-types
+gtsvector		user-defined types
+gtsvector[]		array types
+index_am_handler		pseudo-types
+inet		network address types
+inet[]		array types
+int2vector		array types
+int2vector[]		array types
+int4multirange		range types
+int4multirange[]		array types
+int4range		range types
+int4range[]		array types
+int8multirange		range types
+int8multirange[]		array types
+int8range		range types
+int8range[]		array types
+integer		numeric types
+integer[]		array types
+internal		pseudo-types
+interval		timespan types
+interval[]		array types
+json		user-defined types
+json[]		array types
+jsonb		user-defined types
+jsonb[]		array types
+jsonpath		user-defined types
+jsonpath[]		array types
+language_handler		pseudo-types
+line		geometric types
+line[]		array types
+lseg		geometric types
+lseg[]		array types
+macaddr		user-defined types
+macaddr8		user-defined types
+macaddr8[]		array types
+macaddr[]		array types
+money		numeric types
+money[]		array types
+name		string types
+name[]		array types
+numeric		numeric types
+numeric[]		array types
+nummultirange		range types
+nummultirange[]		array types
+numrange		range types
+numrange[]		array types
+oid		numeric types
+oid8	19	numeric types
+oid8[]	19	array types
+oid[]		array types
+oidvector		array types
+oidvector[]		array types
+path		geometric types
+path[]		array types
+pg_aggregate		composite types
+pg_aggregate[]		array types
+pg_aios	18-19	composite types
+pg_aios[]	18-19	array types
+pg_am		composite types
+pg_am[]		array types
+pg_amop		composite types
+pg_amop[]		array types
+pg_amproc		composite types
+pg_amproc[]		array types
+pg_attrdef		composite types
+pg_attrdef[]		array types
+pg_attribute		composite types
+pg_attribute[]		array types
+pg_auth_members		composite types
+pg_auth_members[]		array types
+pg_authid		composite types
+pg_authid[]		array types
+pg_available_extension_versions		composite types
+pg_available_extension_versions[]		array types
+pg_available_extensions		composite types
+pg_available_extensions[]		array types
+pg_backend_memory_contexts		composite types
+pg_backend_memory_contexts[]		array types
+pg_brin_bloom_summary		internal-use types
+pg_brin_minmax_multi_summary		internal-use types
+pg_cast		composite types
+pg_cast[]		array types
+pg_class		composite types
+pg_class[]		array types
+pg_collation		composite types
+pg_collation[]		array types
+pg_config		composite types
+pg_config[]		array types
+pg_constraint		composite types
+pg_constraint[]		array types
+pg_conversion		composite types
+pg_conversion[]		array types
+pg_cursors		composite types
+pg_cursors[]		array types
+pg_database		composite types
+pg_database[]		array types
+pg_db_role_setting		composite types
+pg_db_role_setting[]		array types
+pg_ddl_command		pseudo-types
+pg_default_acl		composite types
+pg_default_acl[]		array types
+pg_depend		composite types
+pg_depend[]		array types
+pg_dependencies		internal-use types
+pg_description		composite types
+pg_description[]		array types
+pg_dsm_registry_allocations	19	composite types
+pg_dsm_registry_allocations[]	19	array types
+pg_enum		composite types
+pg_enum[]		array types
+pg_event_trigger		composite types
+pg_event_trigger[]		array types
+pg_extension		composite types
+pg_extension[]		array types
+pg_file_settings		composite types
+pg_file_settings[]		array types
+pg_foreign_data_wrapper		composite types
+pg_foreign_data_wrapper[]		array types
+pg_foreign_server		composite types
+pg_foreign_server[]		array types
+pg_foreign_table		composite types
+pg_foreign_table[]		array types
+pg_group		composite types
+pg_group[]		array types
+pg_hba_file_rules		composite types
+pg_hba_file_rules[]		array types
+pg_ident_file_mappings	15-19	composite types
+pg_ident_file_mappings[]	15-19	array types
+pg_index		composite types
+pg_index[]		array types
+pg_indexes		composite types
+pg_indexes[]		array types
+pg_inherits		composite types
+pg_inherits[]		array types
+pg_init_privs		composite types
+pg_init_privs[]		array types
+pg_language		composite types
+pg_language[]		array types
+pg_largeobject		composite types
+pg_largeobject[]		array types
+pg_largeobject_metadata		composite types
+pg_largeobject_metadata[]		array types
+pg_locks		composite types
+pg_locks[]		array types
+pg_lsn		user-defined types
+pg_lsn[]		array types
+pg_matviews		composite types
+pg_matviews[]		array types
+pg_mcv_list		internal-use types
+pg_namespace		composite types
+pg_namespace[]		array types
+pg_ndistinct		internal-use types
+pg_node_tree		internal-use types
+pg_opclass		composite types
+pg_opclass[]		array types
+pg_operator		composite types
+pg_operator[]		array types
+pg_opfamily		composite types
+pg_opfamily[]		array types
+pg_parameter_acl	15-19	composite types
+pg_parameter_acl[]	15-19	array types
+pg_partitioned_table		composite types
+pg_partitioned_table[]		array types
+pg_policies		composite types
+pg_policies[]		array types
+pg_policy		composite types
+pg_policy[]		array types
+pg_prepared_statements		composite types
+pg_prepared_statements[]		array types
+pg_prepared_xacts		composite types
+pg_prepared_xacts[]		array types
+pg_proc		composite types
+pg_proc[]		array types
+pg_publication		composite types
+pg_publication[]		array types
+pg_publication_namespace	15-19	composite types
+pg_publication_namespace[]	15-19	array types
+pg_publication_rel		composite types
+pg_publication_rel[]		array types
+pg_publication_sequences	19	composite types
+pg_publication_sequences[]	19	array types
+pg_publication_tables		composite types
+pg_publication_tables[]		array types
+pg_range		composite types
+pg_range[]		array types
+pg_replication_origin		composite types
+pg_replication_origin[]		array types
+pg_replication_origin_status		composite types
+pg_replication_origin_status[]		array types
+pg_replication_slots		composite types
+pg_replication_slots[]		array types
+pg_rewrite		composite types
+pg_rewrite[]		array types
+pg_roles		composite types
+pg_roles[]		array types
+pg_rules		composite types
+pg_rules[]		array types
+pg_seclabel		composite types
+pg_seclabel[]		array types
+pg_seclabels		composite types
+pg_seclabels[]		array types
+pg_sequence		composite types
+pg_sequence[]		array types
+pg_sequences		composite types
+pg_sequences[]		array types
+pg_settings		composite types
+pg_settings[]		array types
+pg_shadow		composite types
+pg_shadow[]		array types
+pg_shdepend		composite types
+pg_shdepend[]		array types
+pg_shdescription		composite types
+pg_shdescription[]		array types
+pg_shmem_allocations		composite types
+pg_shmem_allocations[]		array types
+pg_shmem_allocations_numa	18-19	composite types
+pg_shmem_allocations_numa[]	18-19	array types
+pg_shseclabel		composite types
+pg_shseclabel[]		array types
+pg_snapshot		user-defined types
+pg_snapshot[]		array types
+pg_stat_activity		composite types
+pg_stat_activity[]		array types
+pg_stat_all_indexes		composite types
+pg_stat_all_indexes[]		array types
+pg_stat_all_tables		composite types
+pg_stat_all_tables[]		array types
+pg_stat_archiver		composite types
+pg_stat_archiver[]		array types
+pg_stat_autovacuum_scores	19	composite types
+pg_stat_autovacuum_scores[]	19	array types
+pg_stat_bgwriter		composite types
+pg_stat_bgwriter[]		array types
+pg_stat_checkpointer	17-19	composite types
+pg_stat_checkpointer[]	17-19	array types
+pg_stat_database		composite types
+pg_stat_database[]		array types
+pg_stat_database_conflicts		composite types
+pg_stat_database_conflicts[]		array types
+pg_stat_gssapi		composite types
+pg_stat_gssapi[]		array types
+pg_stat_io	16-19	composite types
+pg_stat_io[]	16-19	array types
+pg_stat_lock	19	composite types
+pg_stat_lock[]	19	array types
+pg_stat_progress_analyze		composite types
+pg_stat_progress_analyze[]		array types
+pg_stat_progress_basebackup		composite types
+pg_stat_progress_basebackup[]		array types
+pg_stat_progress_cluster		composite types
+pg_stat_progress_cluster[]		array types
+pg_stat_progress_copy		composite types
+pg_stat_progress_copy[]		array types
+pg_stat_progress_create_index		composite types
+pg_stat_progress_create_index[]		array types
+pg_stat_progress_repack	19	composite types
+pg_stat_progress_repack[]	19	array types
+pg_stat_progress_vacuum		composite types
+pg_stat_progress_vacuum[]		array types
+pg_stat_recovery	19	composite types
+pg_stat_recovery[]	19	array types
+pg_stat_recovery_prefetch	15-19	composite types
+pg_stat_recovery_prefetch[]	15-19	array types
+pg_stat_replication		composite types
+pg_stat_replication[]		array types
+pg_stat_replication_slots		composite types
+pg_stat_replication_slots[]		array types
+pg_stat_slru		composite types
+pg_stat_slru[]		array types
+pg_stat_ssl		composite types
+pg_stat_ssl[]		array types
+pg_stat_subscription		composite types
+pg_stat_subscription[]		array types
+pg_stat_subscription_stats	15-19	composite types
+pg_stat_subscription_stats[]	15-19	array types
+pg_stat_sys_indexes		composite types
+pg_stat_sys_indexes[]		array types
+pg_stat_sys_tables		composite types
+pg_stat_sys_tables[]		array types
+pg_stat_user_functions		composite types
+pg_stat_user_functions[]		array types
+pg_stat_user_indexes		composite types
+pg_stat_user_indexes[]		array types
+pg_stat_user_tables		composite types
+pg_stat_user_tables[]		array types
+pg_stat_wal		composite types
+pg_stat_wal[]		array types
+pg_stat_wal_receiver		composite types
+pg_stat_wal_receiver[]		array types
+pg_stat_xact_all_tables		composite types
+pg_stat_xact_all_tables[]		array types
+pg_stat_xact_sys_tables		composite types
+pg_stat_xact_sys_tables[]		array types
+pg_stat_xact_user_functions		composite types
+pg_stat_xact_user_functions[]		array types
+pg_stat_xact_user_tables		composite types
+pg_stat_xact_user_tables[]		array types
+pg_statio_all_indexes		composite types
+pg_statio_all_indexes[]		array types
+pg_statio_all_sequences		composite types
+pg_statio_all_sequences[]		array types
+pg_statio_all_tables		composite types
+pg_statio_all_tables[]		array types
+pg_statio_sys_indexes		composite types
+pg_statio_sys_indexes[]		array types
+pg_statio_sys_sequences		composite types
+pg_statio_sys_sequences[]		array types
+pg_statio_sys_tables		composite types
+pg_statio_sys_tables[]		array types
+pg_statio_user_indexes		composite types
+pg_statio_user_indexes[]		array types
+pg_statio_user_sequences		composite types
+pg_statio_user_sequences[]		array types
+pg_statio_user_tables		composite types
+pg_statio_user_tables[]		array types
+pg_statistic		composite types
+pg_statistic[]		array types
+pg_statistic_ext		composite types
+pg_statistic_ext[]		array types
+pg_statistic_ext_data		composite types
+pg_statistic_ext_data[]		array types
+pg_stats		composite types
+pg_stats[]		array types
+pg_stats_ext		composite types
+pg_stats_ext[]		array types
+pg_stats_ext_exprs		composite types
+pg_stats_ext_exprs[]		array types
+pg_subscription		composite types
+pg_subscription[]		array types
+pg_subscription_rel		composite types
+pg_subscription_rel[]		array types
+pg_tables		composite types
+pg_tables[]		array types
+pg_tablespace		composite types
+pg_tablespace[]		array types
+pg_timezone_abbrevs		composite types
+pg_timezone_abbrevs[]		array types
+pg_timezone_names		composite types
+pg_timezone_names[]		array types
+pg_transform		composite types
+pg_transform[]		array types
+pg_trigger		composite types
+pg_trigger[]		array types
+pg_ts_config		composite types
+pg_ts_config[]		array types
+pg_ts_config_map		composite types
+pg_ts_config_map[]		array types
+pg_ts_dict		composite types
+pg_ts_dict[]		array types
+pg_ts_parser		composite types
+pg_ts_parser[]		array types
+pg_ts_template		composite types
+pg_ts_template[]		array types
+pg_type		composite types
+pg_type[]		array types
+pg_user		composite types
+pg_user[]		array types
+pg_user_mapping		composite types
+pg_user_mapping[]		array types
+pg_user_mappings		composite types
+pg_user_mappings[]		array types
+pg_views		composite types
+pg_views[]		array types
+pg_wait_events	17-19	composite types
+pg_wait_events[]	17-19	array types
+point		geometric types
+point[]		array types
+polygon		geometric types
+polygon[]		array types
+real		numeric types
+real[]		array types
+record		pseudo-types
+record[]		pseudo-types
+refcursor		user-defined types
+refcursor[]		array types
+regclass		numeric types
+regclass[]		array types
+regcollation		numeric types
+regcollation[]		array types
+regconfig		numeric types
+regconfig[]		array types
+regdatabase	19	numeric types
+regdatabase[]	19	array types
+regdictionary		numeric types
+regdictionary[]		array types
+regnamespace		numeric types
+regnamespace[]		array types
+regoper		numeric types
+regoper[]		array types
+regoperator		numeric types
+regoperator[]		array types
+regproc		numeric types
+regproc[]		array types
+regprocedure		numeric types
+regprocedure[]		array types
+regrole		numeric types
+regrole[]		array types
+regtype		numeric types
+regtype[]		array types
+smallint		numeric types
+smallint[]		array types
+table_am_handler		pseudo-types
+text		string types
+text[]		array types
+tid		user-defined types
+tid[]		array types
+time with time zone		date/time types
+time with time zone[]		array types
+time without time zone		date/time types
+time without time zone[]		array types
+timestamp with time zone		date/time types
+timestamp with time zone[]		array types
+timestamp without time zone		date/time types
+timestamp without time zone[]		array types
+trigger		pseudo-types
+tsm_handler		pseudo-types
+tsmultirange		range types
+tsmultirange[]		array types
+tsquery		user-defined types
+tsquery[]		array types
+tsrange		range types
+tsrange[]		array types
+tstzmultirange		range types
+tstzmultirange[]		array types
+tstzrange		range types
+tstzrange[]		array types
+tsvector		user-defined types
+tsvector[]		array types
+txid_snapshot		user-defined types
+txid_snapshot[]		array types
+unknown		unknown type
+uuid		user-defined types
+uuid[]		array types
+void		pseudo-types
+xid		user-defined types
+xid8		user-defined types
+xid8[]		array types
+xid[]		array types
+xml		user-defined types
+xml[]		array types

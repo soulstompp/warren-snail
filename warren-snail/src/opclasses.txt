@@ -1,0 +1,179 @@
+aclitem_ops USING hash		hash	aclitem
+array_ops USING btree		btree	anyarray
+array_ops USING gin		gin	anyarray
+array_ops USING hash		hash	anyarray
+bit_minmax_ops USING brin		brin	bit
+bit_ops USING btree		btree	bit
+bool_ops USING btree		btree	boolean
+bool_ops USING hash		hash	boolean
+box_inclusion_ops USING brin		brin	box
+box_ops USING gist		gist	box
+box_ops USING spgist		spgist	box
+bpchar_bloom_ops USING brin		brin	character
+bpchar_minmax_ops USING brin		brin	character
+bpchar_ops USING btree		btree	character
+bpchar_ops USING hash		hash	character
+bpchar_pattern_ops USING btree		btree	character
+bpchar_pattern_ops USING hash		hash	character
+bytea_bloom_ops USING brin		brin	bytea
+bytea_minmax_ops USING brin		brin	bytea
+bytea_ops USING btree		btree	bytea
+bytea_ops USING hash		hash	bytea
+char_bloom_ops USING brin		brin	"char"
+char_minmax_ops USING brin		brin	"char"
+char_ops USING btree		btree	"char"
+char_ops USING hash		hash	"char"
+cid_ops USING hash		hash	cid
+cidr_ops USING btree		btree	inet
+cidr_ops USING hash		hash	inet
+circle_ops USING gist		gist	circle
+date_bloom_ops USING brin		brin	date
+date_minmax_multi_ops USING brin		brin	date
+date_minmax_ops USING brin		brin	date
+date_ops USING btree		btree	date
+date_ops USING hash		hash	date
+enum_ops USING btree		btree	anyenum
+enum_ops USING hash		hash	anyenum
+float4_bloom_ops USING brin		brin	real
+float4_minmax_multi_ops USING brin		brin	real
+float4_minmax_ops USING brin		brin	real
+float4_ops USING btree		btree	real
+float4_ops USING hash		hash	real
+float8_bloom_ops USING brin		brin	double precision
+float8_minmax_multi_ops USING brin		brin	double precision
+float8_minmax_ops USING brin		brin	double precision
+float8_ops USING btree		btree	double precision
+float8_ops USING hash		hash	double precision
+inet_bloom_ops USING brin		brin	inet
+inet_inclusion_ops USING brin		brin	inet
+inet_minmax_multi_ops USING brin		brin	inet
+inet_minmax_ops USING brin		brin	inet
+inet_ops USING btree		btree	inet
+inet_ops USING gist		gist	inet
+inet_ops USING hash		hash	inet
+inet_ops USING spgist		spgist	inet
+int2_bloom_ops USING brin		brin	smallint
+int2_minmax_multi_ops USING brin		brin	smallint
+int2_minmax_ops USING brin		brin	smallint
+int2_ops USING btree		btree	smallint
+int2_ops USING hash		hash	smallint
+int4_bloom_ops USING brin		brin	integer
+int4_minmax_multi_ops USING brin		brin	integer
+int4_minmax_ops USING brin		brin	integer
+int4_ops USING btree		btree	integer
+int4_ops USING hash		hash	integer
+int8_bloom_ops USING brin		brin	bigint
+int8_minmax_multi_ops USING brin		brin	bigint
+int8_minmax_ops USING brin		brin	bigint
+int8_ops USING btree		btree	bigint
+int8_ops USING hash		hash	bigint
+interval_bloom_ops USING brin		brin	interval
+interval_minmax_multi_ops USING brin		brin	interval
+interval_minmax_ops USING brin		brin	interval
+interval_ops USING btree		btree	interval
+interval_ops USING hash		hash	interval
+jsonb_ops USING btree		btree	jsonb
+jsonb_ops USING gin		gin	jsonb
+jsonb_ops USING hash		hash	jsonb
+jsonb_path_ops USING gin		gin	jsonb
+kd_point_ops USING spgist		spgist	point
+macaddr8_bloom_ops USING brin		brin	macaddr8
+macaddr8_minmax_multi_ops USING brin		brin	macaddr8
+macaddr8_minmax_ops USING brin		brin	macaddr8
+macaddr8_ops USING btree		btree	macaddr8
+macaddr8_ops USING hash		hash	macaddr8
+macaddr_bloom_ops USING brin		brin	macaddr
+macaddr_minmax_multi_ops USING brin		brin	macaddr
+macaddr_minmax_ops USING brin		brin	macaddr
+macaddr_ops USING btree		btree	macaddr
+macaddr_ops USING hash		hash	macaddr
+money_ops USING btree		btree	money
+multirange_ops USING btree		btree	anymultirange
+multirange_ops USING gist		gist	anymultirange
+multirange_ops USING hash		hash	anymultirange
+name_bloom_ops USING brin		brin	name
+name_minmax_ops USING brin		brin	name
+name_ops USING btree		btree	name
+name_ops USING hash		hash	name
+numeric_bloom_ops USING brin		brin	numeric
+numeric_minmax_multi_ops USING brin		brin	numeric
+numeric_minmax_ops USING brin		brin	numeric
+numeric_ops USING btree		btree	numeric
+numeric_ops USING hash		hash	numeric
+oid8_ops USING btree	19	btree	oid8
+oid8_ops USING hash	19	hash	oid8
+oid_bloom_ops USING brin		brin	oid
+oid_minmax_multi_ops USING brin		brin	oid
+oid_minmax_ops USING brin		brin	oid
+oid_ops USING btree		btree	oid
+oid_ops USING hash		hash	oid
+oidvector_ops USING btree		btree	oidvector
+oidvector_ops USING hash		hash	oidvector
+pg_lsn_bloom_ops USING brin		brin	pg_lsn
+pg_lsn_minmax_multi_ops USING brin		brin	pg_lsn
+pg_lsn_minmax_ops USING brin		brin	pg_lsn
+pg_lsn_ops USING btree		btree	pg_lsn
+pg_lsn_ops USING hash		hash	pg_lsn
+point_ops USING gist		gist	point
+poly_ops USING gist		gist	polygon
+poly_ops USING spgist		spgist	polygon
+quad_point_ops USING spgist		spgist	point
+range_inclusion_ops USING brin		brin	anyrange
+range_ops USING btree		btree	anyrange
+range_ops USING gist		gist	anyrange
+range_ops USING hash		hash	anyrange
+range_ops USING spgist		spgist	anyrange
+record_image_ops USING btree		btree	record
+record_ops USING btree		btree	record
+record_ops USING hash		hash	record
+text_bloom_ops USING brin		brin	text
+text_minmax_ops USING brin		brin	text
+text_ops USING btree		btree	text
+text_ops USING hash		hash	text
+text_ops USING spgist		spgist	text
+text_pattern_ops USING btree		btree	text
+text_pattern_ops USING hash		hash	text
+tid_bloom_ops USING brin		brin	tid
+tid_minmax_multi_ops USING brin		brin	tid
+tid_minmax_ops USING brin		brin	tid
+tid_ops USING btree		btree	tid
+tid_ops USING hash		hash	tid
+time_bloom_ops USING brin		brin	time without time zone
+time_minmax_multi_ops USING brin		brin	time without time zone
+time_minmax_ops USING brin		brin	time without time zone
+time_ops USING btree		btree	time without time zone
+time_ops USING hash		hash	time without time zone
+timestamp_bloom_ops USING brin		brin	timestamp without time zone
+timestamp_minmax_multi_ops USING brin		brin	timestamp without time zone
+timestamp_minmax_ops USING brin		brin	timestamp without time zone
+timestamp_ops USING btree		btree	timestamp without time zone
+timestamp_ops USING hash		hash	timestamp without time zone
+timestamptz_bloom_ops USING brin		brin	timestamp with time zone
+timestamptz_minmax_multi_ops USING brin		brin	timestamp with time zone
+timestamptz_minmax_ops USING brin		brin	timestamp with time zone
+timestamptz_ops USING btree		btree	timestamp with time zone
+timestamptz_ops USING hash		hash	timestamp with time zone
+timetz_bloom_ops USING brin		brin	time with time zone
+timetz_minmax_multi_ops USING brin		brin	time with time zone
+timetz_minmax_ops USING brin		brin	time with time zone
+timetz_ops USING btree		btree	time with time zone
+timetz_ops USING hash		hash	time with time zone
+tsquery_ops USING btree		btree	tsquery
+tsquery_ops USING gist		gist	tsquery
+tsvector_ops USING btree		btree	tsvector
+tsvector_ops USING gin		gin	tsvector
+tsvector_ops USING gist		gist	tsvector
+uuid_bloom_ops USING brin		brin	uuid
+uuid_minmax_multi_ops USING brin		brin	uuid
+uuid_minmax_ops USING brin		brin	uuid
+uuid_ops USING btree		btree	uuid
+uuid_ops USING hash		hash	uuid
+varbit_minmax_ops USING brin		brin	bit varying
+varbit_ops USING btree		btree	bit varying
+varchar_ops USING btree		btree	text
+varchar_ops USING hash		hash	text
+varchar_pattern_ops USING btree		btree	text
+varchar_pattern_ops USING hash		hash	text
+xid8_ops USING btree		btree	xid8
+xid8_ops USING hash		hash	xid8
+xid_ops USING hash		hash	xid
