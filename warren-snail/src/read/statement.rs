@@ -709,7 +709,6 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         .source
         .as_deref()
         .ok_or_else(|| Error::new("an INSERT gives its rows"))?;
-    super::question::unlocked(q)?;
     if q.with.is_some() {
         return Err(refused("a write inside WITH"));
     }
