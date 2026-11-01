@@ -393,3 +393,127 @@ fn a_step_groups_and_sorts_its_columns_as_postgresql_s_parser_reads_them() {
         by_input.len()
     );
 }
+
+#[test]
+fn a_step_returns_the_rows_its_limit_offset_and_fetch_say_as_postgresql_reads_them() {
+    let s = sample(5_000);
+    let path = snail("pipeline-limited", &s);
+    let mut snail = Snail::open(&path).unwrap();
+    let step = "WITH f AS (SELECT r.reading_id AS id, r.station_no AS n FROM weather.readings r)";
+    let mut rows = |q: &str| -> Vec<Vec<Option<String>>> {
+        let (b, _) = snail.ask(q, None).unwrap();
+        (0..b.num_rows())
+            .map(|r| {
+                (0..b.num_columns())
+                    .map(|c| cell(b.column(c).as_ref(), r))
+                    .collect()
+            })
+            .collect()
+    };
+    let all = rows(&format!("{step} SELECT n, id FROM f ORDER BY n, id"));
+    assert!(all.len() > 10);
+    // Past the OFFSET, as many as the count, however the clauses are written; a NULL count all,
+    // a NULL offset none; a FETCH FIRST with no count one.
+    for (q, from, to) in [
+        ("FETCH FIRST 3 ROWS ONLY", 0, 3),
+        ("FETCH NEXT ROW ONLY", 0, 1),
+        ("LIMIT 2 OFFSET 3", 3, 5),
+        ("OFFSET 3 ROWS LIMIT 2", 3, 5),
+        ("OFFSET 3 ROWS FETCH FIRST 2 ROWS ONLY", 3, 5),
+        ("FETCH FIRST 2 ROWS ONLY OFFSET 3", 3, 5),
+        ("LIMIT 2.5", 0, 3),
+        ("LIMIT 2.5::float8", 0, 2),
+        ("LIMIT '2'", 0, 2),
+        ("LIMIT 0", 0, 0),
+        ("LIMIT NULL OFFSET NULL", 0, all.len()),
+        ("LIMIT ALL OFFSET 1.5", 2, all.len()),
+    ] {
+        assert_eq!(
+            rows(&format!("{step} SELECT n, id FROM f ORDER BY n, id {q}")),
+            all[from..to],
+            "{q}"
+        );
+    }
+    // WITH TIES: each row after the last that sorts with it.
+    let ties = all.iter().filter(|r| r[0] == all[2][0]).count()
+        + all.iter().take_while(|r| r[0] != all[2][0]).count();
+    assert_eq!(
+        rows(&format!(
+            "{step} SELECT n, id FROM f ORDER BY n FETCH FIRST 3 ROWS WITH TIES"
+        ))
+        .len(),
+        ties
+    );
+    // In a step before the last, over groups, and on a question the question path hands over.
+    assert_eq!(
+        rows(&format!("{step}, g AS (SELECT n, id FROM f ORDER BY n, id LIMIT 4) SELECT n, id FROM g ORDER BY n, id")),
+        all[..4]
+    );
+    assert_eq!(
+        rows(&format!("{step}, g AS (SELECT n, count(*) AS k FROM f GROUP BY n ORDER BY n LIMIT 2) SELECT count(*) AS k FROM g"))[0][0]
+            .as_deref(),
+        Some("2")
+    );
+    // A step with no ORDER BY returns as many of the rows it reads.
+    assert_eq!(
+        rows(&format!(
+            "{step}, g AS (SELECT id FROM f LIMIT 7) SELECT count(*) AS k FROM g"
+        ))[0][0]
+            .as_deref(),
+        Some("7")
+    );
+    let ids = rows(&format!("{step} SELECT id FROM f ORDER BY id"));
+    assert_eq!(
+        rows("SELECT r.reading_id FROM weather.readings r ORDER BY r.reading_id DESC FETCH FIRST 2 ROWS ONLY"),
+        ids.iter().rev().take(2).cloned().collect::<Vec<_>>()
+    );
+    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-11-01).
+    for (q, refused) in [
+        ("LIMIT -1", "LIMIT must not be negative"),
+        ("OFFSET -1 LIMIT -1", "OFFSET must not be negative"),
+        (
+            "LIMIT 'x'::text",
+            "argument of LIMIT must be type bigint, not type text",
+        ),
+        (
+            "OFFSET true",
+            "argument of OFFSET must be type bigint, not type boolean",
+        ),
+        (
+            "LIMIT '2.5'",
+            "invalid input syntax for type bigint: \"2.5\"",
+        ),
+        ("LIMIT 1e20", "bigint out of range"),
+        ("LIMIT n", "argument of LIMIT must not contain variables"),
+        (
+            "LIMIT count(*)",
+            "aggregate functions are not allowed in LIMIT",
+        ),
+        (
+            "FETCH FIRST NULL ROWS WITH TIES",
+            "row count cannot be null in FETCH FIRST ... WITH TIES clause",
+        ),
+        (
+            "LIMIT 1 FETCH FIRST 1 ROW ONLY",
+            "syntax error at or near \"FETCH\"",
+        ),
+    ] {
+        let e = snail
+            .ask(
+                &format!("{step} SELECT n, id FROM f ORDER BY n, id {q}"),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(e.to_string(), refused, "{q}");
+    }
+    assert_eq!(
+        snail
+            .ask(
+                &format!("{step} SELECT n FROM f FETCH FIRST 1 ROW WITH TIES"),
+                None
+            )
+            .unwrap_err()
+            .to_string(),
+        "WITH TIES cannot be specified without ORDER BY clause"
+    );
+}

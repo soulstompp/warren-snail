@@ -1207,19 +1207,25 @@ fn cast(
                 let (name, lo, hi) = integer_range(&base);
                 Value::Int(v.to_numeric().unwrap().to_integer(lo, hi, name)?)
             }
-            // Read by the type's input, which refuses a number past its range.
-            Value::Text(t) => match numeric_literal(&t)? {
-                Value::Int(x) => {
-                    let (name, lo, hi) = integer_range(&base);
-                    if !(lo..=hi).contains(&x) {
+            // Read by the type's input, which refuses a number past its range, and in its words
+            // anything else that is not an integer.
+            Value::Text(t) => {
+                let (name, lo, hi) = integer_range(&base);
+                let digits = t.trim().trim_start_matches(['+', '-']);
+                match numeric_literal(&t) {
+                    Ok(Value::Int(x)) if (lo..=hi).contains(&x) => Value::Int(x),
+                    Ok(_) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
                         return Err(Error::new(format!(
                             "value \"{t}\" is out of range for type {name}"
-                        )));
+                        )))
                     }
-                    Value::Int(x)
+                    _ => {
+                        return Err(Error::new(format!(
+                            "invalid input syntax for type {name}: \"{t}\""
+                        )))
+                    }
                 }
-                _ => return Err(Error::new(format!("'{t}' is not an integer"))),
-            },
+            }
             other => return Err(Error::new(format!("{other:?} cast to an integer"))),
         },
         "numeric" | "decimal" => {
@@ -4971,6 +4977,8 @@ struct Prepared<'q> {
     grouped: bool,
     /// Whether it returns each row once (SELECT DISTINCT).
     distinct: bool,
+    /// The rows it returns of those it makes, where it says.
+    limit: Option<Limit<'q>>,
     /// Whether a window reads its partition whole: the step then holds its rows until they have
     /// all come.
     whole_windows: bool,
@@ -5193,6 +5201,216 @@ fn ungrouped(
     }
 }
 
+/// The rows a step returns of those it makes: its LIMIT's or FETCH FIRST's count, its OFFSET, and
+/// whether the rows that tie by its ORDER BY with the last it returns come too (WITH TIES).
+struct Limit<'q> {
+    count: Count<'q>,
+    offset: Option<&'q Expr>,
+    ties: bool,
+}
+
+/// How many rows a step returns at most: all, one (a FETCH FIRST that gives no count), or as many
+/// as an expression says.
+enum Count<'q> {
+    All,
+    One,
+    Of(&'q Expr),
+}
+
+impl<'q> Limit<'q> {
+    /// A step's LIMIT, FETCH FIRST and OFFSET, as PostgreSQL's grammar reads them; none where it
+    /// has neither a count nor an offset.
+    fn of(q: &'q Query) -> Result<Option<Limit<'q>>> {
+        let (count, offset) = match &q.limit_clause {
+            None => (Count::All, None),
+            Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            }) => {
+                if !limit_by.is_empty() {
+                    return Err(Error::new("syntax error at or near \"BY\""));
+                }
+                (
+                    limit.as_ref().map_or(Count::All, Count::Of),
+                    offset.as_ref().map(|o| &o.value),
+                )
+            }
+            Some(sqlparser::ast::LimitClause::OffsetCommaLimit { .. }) => {
+                return Err(Error::new("LIMIT #,# syntax is not supported"))
+            }
+        };
+        let (count, ties) = match &q.fetch {
+            None => (count, false),
+            Some(_) if !matches!(count, Count::All) => {
+                return Err(Error::new("syntax error at or near \"FETCH\""))
+            }
+            Some(f) if f.percent => return Err(Error::new("syntax error at or near \"PERCENT\"")),
+            Some(f) => {
+                if f.with_ties && q.order_by.is_none() {
+                    return Err(Error::new(
+                        "WITH TIES cannot be specified without ORDER BY clause",
+                    ));
+                }
+                if f.with_ties
+                    && matches!(&f.quantity, Some(Expr::Value(v)) if matches!(v.value, SqlValue::Null))
+                {
+                    return Err(Error::new(
+                        "row count cannot be null in FETCH FIRST ... WITH TIES clause",
+                    ));
+                }
+                (
+                    f.quantity.as_ref().map_or(Count::One, Count::Of),
+                    f.with_ties,
+                )
+            }
+        };
+        if matches!(count, Count::All) && offset.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Limit {
+            count,
+            offset,
+            ties,
+        }))
+    }
+
+    /// Its expressions, each with the clause PostgreSQL names it by.
+    fn exprs(&self) -> impl Iterator<Item = (&'q Expr, &'static str)> {
+        let count = match self.count {
+            Count::Of(e) => Some((e, "LIMIT")),
+            _ => None,
+        };
+        self.offset.map(|e| (e, "OFFSET")).into_iter().chain(count)
+    }
+
+    /// Each of its expressions refused as PostgreSQL's parser refuses one: an aggregate, a window
+    /// or a function returning a set in it; a type no assignment casts to bigint; a column.
+    fn check(&self, typing: &mut super::typed::Typing) -> Result<()> {
+        for (e, what) in self.exprs() {
+            let mut calls = Calls::default();
+            find_calls(e, &mut calls);
+            if !calls.aggregates.is_empty() {
+                return Err(Error::new(format!(
+                    "aggregate functions are not allowed in {what}"
+                )));
+            }
+            if !calls.windows.is_empty() {
+                return Err(Error::new(format!(
+                    "window functions are not allowed in {what}"
+                )));
+            }
+            if holds_set(e) {
+                return Err(Error::new(format!(
+                    "set-returning functions are not allowed in {what}"
+                )));
+            }
+            match typing.type_of(e)? {
+                None
+                | Some(
+                    ColumnType::Int2
+                    | ColumnType::Int4
+                    | ColumnType::Int8
+                    | ColumnType::Numeric { .. }
+                    | ColumnType::NumericText(_)
+                    | ColumnType::Float4
+                    | ColumnType::Float8
+                    | ColumnType::Oid,
+                ) => {}
+                Some(t) => {
+                    return Err(Error::new(format!(
+                        "argument of {what} must be type bigint, not type {}",
+                        t.pg_name()
+                    )))
+                }
+            }
+            if reads_a_column(e) {
+                return Err(Error::new(format!(
+                    "argument of {what} must not contain variables"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows it keeps of rows made and sorted, `keys` the values each was sorted by: past its
+    /// OFFSET, as many as its count, and where it keeps ties, each after them that sorts with the
+    /// last. Its OFFSET read first, then its count, each cast to bigint; a NULL no offset, or no
+    /// count.
+    fn cut(&self, rows: &mut Vec<Vec<Value>>, keys: &[Vec<Value>], frame: &Frame) -> Result<()> {
+        let read = |e: &Expr| -> Result<Option<i64>> {
+            let v = eval(e, &[], frame, &computed_none())?;
+            match cast(
+                v,
+                &DataType::BigInt(None),
+                frame.release,
+                frame.casings.monetary(),
+                quoted(e),
+            )? {
+                Value::Int(n) => Ok(Some(n)),
+                _ => Ok(None),
+            }
+        };
+        let offset = match self.offset.map(read).transpose()?.flatten() {
+            Some(n) if n < 0 => return Err(Error::new("OFFSET must not be negative")),
+            n => n.unwrap_or(0),
+        };
+        let count = match self.count {
+            Count::All => None,
+            Count::One => Some(1),
+            Count::Of(e) => match read(e)? {
+                Some(n) if n < 0 => return Err(Error::new("LIMIT must not be negative")),
+                n => n,
+            },
+        };
+        let from = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(rows.len());
+        let mut to = match count {
+            None => rows.len(),
+            Some(n) => from
+                .saturating_add(usize::try_from(n).unwrap_or(usize::MAX))
+                .min(rows.len()),
+        };
+        if self.ties && to > from {
+            while to < rows.len()
+                && keys
+                    .get(to)
+                    .zip(keys.get(to - 1))
+                    .is_some_and(|(a, b)| tie(a, b))
+            {
+                to += 1;
+            }
+        }
+        rows.truncate(to);
+        rows.drain(..from);
+        Ok(())
+    }
+}
+
+/// Whether two rows' sort keys tie: each pair NULL alike or equal.
+fn tie(a: &[Value], b: &[Value]) -> bool {
+    a.iter()
+        .zip(b)
+        .all(|(x, y)| match (x.is_null(), y.is_null()) {
+            (true, true) => true,
+            (false, false) => matches!(compare(x, y), Ok(Some(Ordering::Equal))),
+            _ => false,
+        })
+}
+
+/// Whether an expression reads a column.
+fn reads_a_column(e: &Expr) -> bool {
+    if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+        return true;
+    }
+    let mut parts = parts_of(e);
+    if parts.is_empty() {
+        parts = super::collate::children(e);
+    }
+    parts.into_iter().any(reads_a_column)
+}
+
 /// A step read before any row: its parts, each expression typed over the columns its FROM reads.
 fn prepare<'q>(
     q: &'q Query,
@@ -5208,9 +5426,10 @@ fn prepare<'q>(
     if matches!(s.distinct, Some(sqlparser::ast::Distinct::On(_))) {
         return Err(Error::new("DISTINCT ON is not read in a step"));
     }
-    if s.having.is_some() || q.limit_clause.is_some() {
-        return Err(Error::new("HAVING and LIMIT are not read in a step"));
+    if s.having.is_some() {
+        return Err(Error::new("HAVING is not read in a step"));
     }
+    let limit = Limit::of(q)?;
     let items: Vec<(&Expr, String)> = s
         .projection
         .iter()
@@ -5313,6 +5532,9 @@ fn prepare<'q>(
     for e in &hidden {
         typing.type_of(e)?;
     }
+    if let Some(l) = &limit {
+        l.check(&mut typing)?;
+    }
     Ok(Prepared {
         from: &s.from,
         selection: s.selection.as_ref(),
@@ -5325,6 +5547,7 @@ fn prepare<'q>(
         grouped,
         whole_windows: calls_windows_whole,
         distinct: s.distinct.is_some(),
+        limit,
         types: typing.types,
         returns,
         carried: Vec::new(),
@@ -5553,7 +5776,7 @@ impl<'q> StepRun<'q> {
                 })
             });
         self.columns = frame.columns;
-        if self.p.order_by.is_some() {
+        if self.p.order_by.is_some() || self.p.limit.is_some() {
             self.rows.extend(out.rows);
             return Ok(None);
         }
@@ -5641,25 +5864,38 @@ impl<'q> StepRun<'q> {
         if self.p.grouped || self.p.whole_windows {
             out.rows = self.once(std::mem::take(&mut out.rows));
         }
-        if let Some(ob) = self.p.order_by {
-            sort(&mut out, ob, &self.p, casings)?;
-            // The ORDER BY's own expressions go once the rows are sorted.
-            for r in &mut out.rows {
-                r.truncate(self.p.items.len());
-            }
+        let keys = match self.p.order_by {
+            Some(ob) => sort(&mut out, ob, &self.p, casings)?,
+            None => Vec::new(),
+        };
+        if let Some(l) = &self.p.limit {
+            let frame = Frame {
+                columns: Vec::new(),
+                params,
+                release,
+                casings,
+                types: &self.p.types,
+                now: self.p.now,
+            };
+            l.cut(&mut out.rows, &keys, &frame)?;
+        }
+        // The ORDER BY's own expressions go once the rows are sorted and cut.
+        for r in &mut out.rows {
+            r.truncate(self.p.items.len());
         }
         Ok(out)
     }
 }
 
 /// A step's rows sorted as its ORDER BY says, by the values `Prepared::sorted` places: its own
-/// columns, each carrying its collation, and the expressions it makes beside them.
+/// columns, each carrying its collation, and the expressions it makes beside them. The values
+/// each row was sorted by, in their order.
 fn sort(
     out: &mut Relation,
     ob: &sqlparser::ast::OrderBy,
     p: &Prepared,
     casings: &Casings,
-) -> Result<()> {
+) -> Result<Vec<Vec<Value>>> {
     let exprs = match &ob.kind {
         OrderByKind::Expressions(e) => e,
         _ => return Err(Error::new("ORDER BY ALL is not read")),
@@ -5753,9 +5989,10 @@ fn sort(
     if let Some(e) = failed {
         return Err(e);
     }
-    out.rows = keyed.into_iter().map(|(_, r)| r).collect();
+    let (keys, rows) = keyed.into_iter().unzip();
+    out.rows = rows;
     out.order = None;
-    Ok(())
+    Ok(keys)
 }
 
 /// One SELECT read whole, over the steps before it and the table.
@@ -5946,7 +6183,7 @@ impl<'q> Stream<'q> {
                 }
                 Kind::After
             } else if !streamed.is_empty() {
-                if p.grouped || p.order_by.is_some() || p.whole_windows {
+                if p.grouped || p.order_by.is_some() || p.whole_windows || p.limit.is_some() {
                     Kind::Folded
                 } else {
                     Kind::Streamed
@@ -6124,7 +6361,7 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
 }
 
 /// Whether a question on one table the question path does not read is handed to the pipeline: it
-/// returns each row once, or calls a function, an aggregate over each value once, filtered or
+/// returns each row once, or some of its rows (LIMIT, OFFSET, FETCH), or calls a function, an aggregate over each value once, filtered or
 /// ordered, or an operator on numbers, the question path does not read.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
@@ -6133,7 +6370,7 @@ pub fn hands_over(q: &Query) -> bool {
     if q.with.is_some() || s.from.len() != 1 || !s.from[0].joins.is_empty() {
         return false;
     }
-    if s.distinct.is_some() {
+    if s.distinct.is_some() || q.limit_clause.is_some() || q.fetch.is_some() {
         return true;
     }
     let mut exprs: Vec<&Expr> = s
