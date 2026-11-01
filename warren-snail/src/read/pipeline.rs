@@ -4061,9 +4061,22 @@ fn windows(
                 }
                 ("sum", [x]) => {
                     let v = eval(x, row, frame, &none)?;
+                    // A bigint's sum is a numeric; a smallint's and an integer's a bigint, added
+                    // as PostgreSQL's int2_sum and int4_sum add.
+                    let v = match v {
+                        Value::Int(i)
+                            if frame.types.get(&(call as *const Expr))
+                                == Some(&super::typed::NUMERIC) =>
+                        {
+                            Value::Num(i128::from(i), 0)
+                        }
+                        v => v,
+                    };
                     if !v.is_null() {
                         *state = if state.is_null() {
                             v
+                        } else if let (Value::Int(a), Value::Int(b)) = (&*state, &v) {
+                            Value::Int(a.wrapping_add(*b))
                         } else if let Some(s) = float_arith(&BinaryOperator::Plus, state, &v)? {
                             s
                         } else if let Some(s) = scalar_arith(&BinaryOperator::Plus, state, &v)? {
@@ -4391,6 +4404,8 @@ fn default_name(e: &Expr) -> String {
 enum Acc {
     Count(i64),
     Sum(Value),
+    /// sum of a smallint or an integer: a bigint, added as PostgreSQL's int2_sum and int4_sum add.
+    IntSum(Option<i64>),
     Least(Option<Value>),
     Greatest(Option<Value>),
     All(Option<bool>),
@@ -4499,6 +4514,9 @@ impl Acc {
         }
         let acc = match (name.as_str(), a.as_slice()) {
             ("count", [_]) => Acc::Count(0),
+            ("sum", [_]) if types.get(&(call as *const Expr)) == Some(&ColumnType::Int8) => {
+                Acc::IntSum(None)
+            }
             ("sum", [_]) => Acc::Sum(Value::Null),
             ("min", [_]) => Acc::Least(None),
             ("max", [_]) => Acc::Greatest(None),
@@ -4802,6 +4820,15 @@ impl Acc {
         }
         match self {
             Acc::Count(n) => *n += 1,
+            Acc::IntSum(total) => match v {
+                Value::Int(x) => *total = Some(total.map_or(x, |t| t.wrapping_add(x))),
+                other => {
+                    return Err(Error::new(format!(
+                        "function sum({}) does not exist",
+                        kind_name(&other)
+                    )))
+                }
+            },
             // The sum of whole numbers is a numeric of scale 0, as PostgreSQL writes it.
             Acc::Sum(acc) => {
                 *acc = if acc.is_null() {
@@ -4907,6 +4934,7 @@ impl Acc {
         Ok(match self {
             Acc::Count(n) => Value::Int(*n),
             Acc::Sum(v) => v.clone(),
+            Acc::IntSum(t) => t.map_or(Value::Null, Value::Int),
             Acc::Least(b) | Acc::Greatest(b) => b.clone().unwrap_or(Value::Null),
             Acc::All(a) | Acc::Any(a) => a.map_or(Value::Null, Value::Bool),
             Acc::Avg(n, sx, _) if *n > 0.0 => Value::Double(sx / n),

@@ -180,7 +180,8 @@ fn is_classed(ty: Option<ColumnType>) -> bool {
 }
 
 /// Where an item of the answer is a numeric: the type it is written from, and whether it takes
-/// NULL. A numeric column itself, its min, max and sum; an integer's or a numeric's mean.
+/// NULL. A numeric column itself, its min, max and sum; a bigint's sum, at scale 0; an integer's or
+/// a numeric's mean.
 fn numeric_output(item: &Item, tables: &[&Table]) -> Option<(ColumnType, bool)> {
     let col = |c: &super::question::Col| &tables[c.side].columns[c.column];
     match item {
@@ -188,6 +189,13 @@ fn numeric_output(item: &Item, tables: &[&Table]) -> Option<(ColumnType, bool)> 
         Item::Least(c) | Item::Greatest(c) | Item::Sum(c) if col(c).ty.is_numeric() => {
             Some((col(c).ty, true))
         }
+        Item::Sum(c) if col(c).ty == ColumnType::Int8 => Some((
+            ColumnType::Numeric {
+                precision: 38,
+                scale: 0,
+            },
+            true,
+        )),
         Item::Avg(c) if col(c).ty.is_numeric() || col(c).ty.is_integer() => {
             Some((ColumnType::NumericText(None), true))
         }
@@ -1066,6 +1074,21 @@ impl Answer {
                                     key[key_list.iter().position(|x| x == k).unwrap()].clone()
                                 }
                                 (_, Acc::Count(n)) => Cell::Int(n as i64),
+                                // A bigint's sum is a numeric; a smallint's and an integer's a
+                                // bigint, wrapping as PostgreSQL's int2_sum and int4_sum add.
+                                (Item::Sum(c), Acc::Sum(total))
+                                    if tables[c.side].columns[c.column].ty == ColumnType::Int8 =>
+                                {
+                                    total.map_or(Cell::Null, |t| {
+                                        if t.unsigned_abs() < 10u128.pow(38) {
+                                            Cell::Wide(t)
+                                        } else {
+                                            Cell::of_numeric(&crate::numeric::Numeric::of_units(
+                                                t, 0,
+                                            ))
+                                        }
+                                    })
+                                }
                                 (_, Acc::Sum(total)) => {
                                     total.map_or(Cell::Null, |t| Cell::Int(t as i64))
                                 }
