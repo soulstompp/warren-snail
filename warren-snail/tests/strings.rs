@@ -1165,6 +1165,20 @@ fn a_collation_is_derived_as_postgresql_derives_it_and_carried_by_each_column() 
             ", r AS (SELECT id, a || b AS x FROM q) SELECT id, upper(x) AS y FROM r",
             "could not determine which collation to use for upper() function",
         ),
+        // min and max compare two values under it, refused at the row; an aggregate that reads
+        // each value once sorts them, refused as a key is.
+        (
+            "SELECT min(a || CASE WHEN b IS NULL THEN 'z' ELSE b END) AS x FROM q",
+            "could not determine which collation to use for string comparison",
+        ),
+        (
+            "SELECT id, min(a || CASE WHEN b IS NULL THEN 'z' ELSE b END) OVER (ORDER BY id) AS x FROM q",
+            "could not determine which collation to use for string comparison",
+        ),
+        (
+            "SELECT count(DISTINCT a || b) AS x FROM q",
+            "collation mismatch between implicit collations \"C\" and \"POSIX\"",
+        ),
     ] {
         let sql = format!("{step}{}{q}", if q.starts_with(',') { "" } else { " " });
         assert_eq!(s.ask(&sql, None).unwrap_err().to_string(), refused, "{q}");
@@ -1183,6 +1197,11 @@ fn a_collation_is_derived_as_postgresql_derives_it_and_carried_by_each_column() 
         ("SELECT id, substring(a similar '[[:alpha:]]' escape '#') AS x FROM q ORDER BY id", vec![Some("é"), Some("a")]),
         ("SELECT id, substring(a from '[[:alpha:]]') AS x FROM q ORDER BY id", vec![None, Some("a")]),
         ("SELECT id, substring(a similar b escape '#') AS x FROM q ORDER BY id", vec![None, None]),
+        // An aggregate that compares no two values needs no collation.
+        ("SELECT 1 AS id, min(a || b) AS x FROM q", vec![Some("éb")]),
+        ("SELECT 1 AS id, string_agg(a || CASE WHEN b IS NULL THEN 'z' ELSE b END, ',' ORDER BY id) AS x FROM q", vec![Some("éb,az")]),
+        ("SELECT id, max(a || CASE WHEN b IS NULL THEN 'z' ELSE b END) AS x FROM q GROUP BY id ORDER BY id", vec![Some("éb"), Some("az")]),
+        ("SELECT id, max(a || CASE WHEN b IS NULL THEN 'z' ELSE b END) OVER (PARTITION BY id) AS x FROM q ORDER BY id", vec![Some("éb"), Some("az")]),
         (", r AS (SELECT id, a || b AS x FROM q) SELECT id, upper(x || 'z') AS x FROM r ORDER BY id", vec![Some("ÉBZ"), None]),
         (", t1 AS (SELECT id, a AS x FROM q), t2 AS (SELECT id, c AS x FROM q) SELECT t1.id, upper(t1.x) || upper(t2.x) AS x FROM t1, t2 WHERE t1.id = t2.id ORDER BY t1.id", vec![Some("éÉ"), Some("AX")]),
     ] {

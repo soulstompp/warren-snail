@@ -583,6 +583,31 @@ impl Casings {
         }
     }
 
+    /// The library collation each argument of an aggregate is compared under, where one is. Where
+    /// the aggregate reads each value once, two implicit collations met in one refused at once, as
+    /// PostgreSQL's parser sorts them; otherwise none, and the words min and max refuse it in at
+    /// the first two values they compare, as PostgreSQL's comparison refuses it at the row.
+    fn folded(&self, call: &Expr, args: &[&Expr]) -> Result<(Vec<Option<Casing>>, Option<String>)> {
+        let distinct = matches!(call, Expr::Function(f) if matches!(&f.args,
+            FunctionArguments::List(l) if l.duplicate_treatment == Some(sqlparser::ast::DuplicateTreatment::Distinct)));
+        let mut refused = None;
+        let mut under = Vec::with_capacity(args.len());
+        for &x in args {
+            let unsettled = match self.nodes.get(&(x as *const Expr)) {
+                Some((out, _)) if !distinct => out.settled("string comparison").err(),
+                _ => None,
+            };
+            match unsettled {
+                Some(e) => {
+                    refused.get_or_insert(e.to_string());
+                    under.push(None);
+                }
+                None => under.push(self.keyed(x)?),
+            }
+        }
+        Ok((under, refused))
+    }
+
     /// The library collation a column a step makes is compared under, by what it carries.
     fn carried(&self, c: &super::collate::Carried) -> Result<Option<Casing>> {
         Ok(match c {
@@ -4167,12 +4192,8 @@ fn windows_whole(
             // An aggregate over the frame: folded a row at a time, or once over the partition.
             let mut acc = if aggregate {
                 let (acc, folds) = Acc::of(call, frame.types)?;
-                let under = folds
-                    .args
-                    .iter()
-                    .map(|x| frame.casings.keyed(x))
-                    .collect::<Result<Vec<_>>>()?;
-                Some((acc, folds, under))
+                let (under, refused) = frame.casings.folded(call, &folds.args)?;
+                Some((acc, folds, under, refused))
             } else {
                 None
             };
@@ -4182,7 +4203,7 @@ fn windows_whole(
                 let to = if whole { n - 1 } else { i };
                 let value = match (name.as_str(), a.as_slice()) {
                     _ if aggregate => {
-                        let (acc, folds, under) = acc.as_mut().unwrap();
+                        let (acc, folds, under, refused) = acc.as_mut().unwrap();
                         while folded <= to {
                             let row = ix[folded];
                             folded += 1;
@@ -4191,14 +4212,15 @@ fn windows_whole(
                                     continue;
                                 }
                             }
-                            acc.add_row(
-                                folds
-                                    .args
-                                    .iter()
-                                    .map(|x| at(x, row))
-                                    .collect::<Result<_>>()?,
-                                under,
-                            )?;
+                            let values: Vec<Value> = folds
+                                .args
+                                .iter()
+                                .map(|x| at(x, row))
+                                .collect::<Result<_>>()?;
+                            if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
+                                return Err(Error::new(e.clone()));
+                            }
+                            acc.add_row(values, under)?;
                         }
                         acc.value()?
                     }
@@ -4501,6 +4523,22 @@ impl Acc {
             direct: Vec::new(),
         };
         Ok((acc, folds))
+    }
+
+    /// Whether folding in a row's arguments compares its value with one folded before: min's or
+    /// max's second value that is not NULL, in the order an ORDER BY gives them or not.
+    fn compares(&self, values: &[Value]) -> bool {
+        if values.first().is_none_or(Value::is_null) {
+            return false;
+        }
+        match self {
+            Acc::Least(Some(_)) | Acc::Greatest(Some(_)) => true,
+            Acc::Ordered { of, rows, .. } => {
+                matches!(**of, Acc::Least(_) | Acc::Greatest(_))
+                    && rows.iter().any(|r| r.first().is_some_and(|v| !v.is_null()))
+            }
+            _ => false,
+        }
     }
 
     /// Folds in one row's arguments, none for count(*), each compared under the collation `under`
@@ -5421,14 +5459,13 @@ impl<'q> StepRun<'q> {
                 .iter()
                 .map(|g| frame.casings.keyed(g))
                 .collect::<Result<Vec<_>>>()?;
-            let folded_under = folded
+            let folded_under = self
+                .p
+                .calls
+                .aggregates
                 .iter()
-                .map(|f| {
-                    f.args
-                        .iter()
-                        .map(|x| frame.casings.keyed(x))
-                        .collect::<Result<Vec<_>>>()
-                })
+                .zip(&folded)
+                .map(|(&c, f)| frame.casings.folded(c, &f.args))
                 .collect::<Result<Vec<_>>>()?;
             for row in rel.rows {
                 let k: Vec<Key> = self
@@ -5452,7 +5489,9 @@ impl<'q> StepRun<'q> {
                         self.groups.len() - 1
                     }
                 };
-                for ((acc, f), u) in self.groups[i].1.iter_mut().zip(&folded).zip(&folded_under) {
+                for ((acc, f), (u, refused)) in
+                    self.groups[i].1.iter_mut().zip(&folded).zip(&folded_under)
+                {
                     if let Some(w) = f.filter {
                         if truth(&eval(w, &row, &frame, &none)?)? != Some(true) {
                             continue;
@@ -5466,13 +5505,15 @@ impl<'q> StepRun<'q> {
                                 .collect::<Result<_>>()?,
                         );
                     }
-                    acc.add_row(
-                        f.args
-                            .iter()
-                            .map(|x| eval(x, &row, &frame, &none))
-                            .collect::<Result<_>>()?,
-                        u,
-                    )?;
+                    let values: Vec<Value> = f
+                        .args
+                        .iter()
+                        .map(|x| eval(x, &row, &frame, &none))
+                        .collect::<Result<_>>()?;
+                    if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
+                        return Err(Error::new(e.clone()));
+                    }
+                    acc.add_row(values, u)?;
                 }
             }
             self.columns = frame.columns;
