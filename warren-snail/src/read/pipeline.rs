@@ -5390,13 +5390,13 @@ impl<'q> Limit<'q> {
 
 /// Whether two rows' sort keys tie: each pair NULL alike or equal.
 fn tie(a: &[Value], b: &[Value]) -> bool {
-    a.iter()
-        .zip(b)
-        .all(|(x, y)| match (x.is_null(), y.is_null()) {
-            (true, true) => true,
-            (false, false) => matches!(compare(x, y), Ok(Some(Ordering::Equal))),
-            _ => false,
-        })
+    a.iter().zip(b).all(|(x, y)| {
+        if x.is_null() || y.is_null() {
+            x.is_null() == y.is_null()
+        } else {
+            matches!(compare(x, y), Ok(Some(Ordering::Equal)))
+        }
+    })
 }
 
 /// Whether an expression reads a column.
