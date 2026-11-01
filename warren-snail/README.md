@@ -835,8 +835,8 @@ Anything else is refused, with a sentence that says what is not read: among it `
 subquery, a set operation, `WITH RECURSIVE`, a `LIMIT` over several tables, a locking clause
 (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON
 CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE`, a savepoint, and the isolation
-levels REPEATABLE READ and SERIALIZABLE. A statement sqlparser reads otherwise than it is written is refused too, so nothing it
-declares is dropped without a word.
+levels REPEATABLE READ and SERIALIZABLE. A statement sqlparser reads otherwise than it is written
+is refused too, so nothing it declares is dropped without a word.
 
 ### What the commands record
 
