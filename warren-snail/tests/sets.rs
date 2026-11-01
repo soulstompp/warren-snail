@@ -283,16 +283,6 @@ fn rows_of_arrays_are_met_by_their_elements() {
 }
 
 #[test]
-fn with_recursive_stays_refused_by_name() {
-    let path = snail("recursive");
-    let e = refused(
-        &path,
-        "WITH RECURSIVE r (n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
-    );
-    assert_eq!(e, "WITH RECURSIVE is not read");
-}
-
-#[test]
 fn arms_read_tables_of_several_snails() {
     let one = snail("several-one");
     let two = tmp("sets-several-two.snail");

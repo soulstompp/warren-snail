@@ -5,6 +5,10 @@
 //! derived table, VALUES or a view lifted to a step of its own, a function's rows) are met by their
 //! ON, USING or NATURAL, a function's rows made for each row of the relations before it.
 
+mod recursive;
+
+pub(super) use recursive::unread_clauses;
+
 use super::collate::Carried;
 use super::pipeline::{self, Casings, Columns, Relation, Value, MERGED};
 use super::question::{self, Question};
@@ -53,6 +57,8 @@ struct Step {
     /// The LATERAL subqueries its FROM reads, each standing in its FROM under LATERAL and its place
     /// here, with what its reads keep between the rows before it.
     laterals: Vec<(Query, super::subqueries::Kept)>,
+    /// A recursive WITH query's terms, where the step is one.
+    recursion: Option<recursive::Recursion>,
 }
 
 /// A function a FROM reads the rows of.
@@ -117,10 +123,13 @@ fn steps(catalog: &Catalog, q: &Query, before: &[String]) -> Result<Vec<Step>> {
     let mut out = Vec::new();
     let mut visible: Vec<String> = before.to_vec();
     if let Some(with) = &q.with {
-        if with.recursive {
-            return Err(Error::new("WITH RECURSIVE is not read"));
-        }
-        for cte in &with.cte_tables {
+        // Under RECURSIVE each query reads any other, so they are made in the order they read
+        // each other, a query reading itself as its recursion.
+        let ordered = match with.recursive {
+            true => recursive::ordered(&with.cte_tables)?,
+            false => with.cte_tables.iter().map(|c| (c, false)).collect(),
+        };
+        for (cte, recursion) in ordered {
             let name = crate::catalog::ident(&cte.alias.name);
             let renames = cte
                 .alias
@@ -128,14 +137,11 @@ fn steps(catalog: &Catalog, q: &Query, before: &[String]) -> Result<Vec<Step>> {
                 .iter()
                 .map(|c| crate::catalog::ident(&c.name))
                 .collect();
-            lift(
-                catalog,
-                &mut out,
-                &visible,
-                name.clone(),
-                (*cte.query).clone(),
-                renames,
-            )?;
+            let query = (*cte.query).clone();
+            match recursion {
+                true => recursive::lift(catalog, &mut out, &visible, name.clone(), query, renames)?,
+                false => lift(catalog, &mut out, &visible, name.clone(), query, renames)?,
+            }
             visible.push(name);
         }
     }
@@ -189,6 +195,7 @@ fn lift(
             .into_iter()
             .map(|q| (q, Default::default()))
             .collect(),
+        recursion: None,
     });
     Ok(())
 }
@@ -2092,6 +2099,7 @@ fn lift_set(
             calls: Vec::new(),
             set: Some(arm),
             laterals: Vec::new(),
+            recursion: None,
         });
         return Ok(());
     }
@@ -2103,6 +2111,7 @@ fn lift_set(
         calls: Vec::new(),
         set: Some(arm),
         laterals: Vec::new(),
+        recursion: None,
     });
     let parsed = sqlparser::parser::Parser::parse_sql(
         &sqlparser::dialect::PostgreSqlDialect {},
@@ -2123,6 +2132,7 @@ fn lift_set(
         calls: Vec::new(),
         set: None,
         laterals: Vec::new(),
+        recursion: None,
     });
     Ok(())
 }
@@ -2453,16 +2463,75 @@ pub(super) fn made_by(
     let catalog = asked.reads.catalog();
     let visible: Vec<String> = before.keys().cloned().collect();
     let mut steps = steps(catalog, q, &visible)?;
-    let mut casings = casings.clone();
-    let mut made = before.clone();
-    let mut held = 0usize;
-    for step in &mut steps {
+    let mut making = Making {
+        asked,
+        made: before.clone(),
+        casings: casings.clone(),
+        outer,
+        accrued,
+        held: 0,
+    };
+    // A recursion's own steps are made in each of its rounds, by the recursion.
+    let theirs: Vec<usize> = steps
+        .iter()
+        .filter_map(|s| s.recursion.as_ref())
+        .flat_map(|r| r.body.clone())
+        .collect();
+    for i in 0..steps.len() {
+        if theirs.contains(&i) {
+            continue;
+        }
+        if steps[i].recursion.is_some() {
+            let (before, rest) = steps.split_at_mut(i);
+            let m = recursive::make(&mut making, &rest[0], before)?;
+            making.keep(&rest[0], m)?;
+            continue;
+        }
+        making.make(&mut steps[i])?;
+    }
+    let last = making
+        .made
+        .remove("")
+        .ok_or_else(|| Error::new("the question returned nothing"))?;
+    Ok((
+        Rc::try_unwrap(last).unwrap_or_else(|m| (*m).clone()),
+        making.held,
+    ))
+}
+
+/// What making a statement's steps reads, and what it keeps: each relation made, by its name.
+struct Making<'a, 'o> {
+    asked: Asked<'a>,
+    made: Steps,
+    casings: Casings,
+    outer: Option<&'o Outer<'o>>,
+    accrued: &'o mut Accrued,
+    held: usize,
+}
+
+impl Making<'_, '_> {
+    /// One step made and kept.
+    fn make(&mut self, step: &mut Step) -> Result<()> {
+        let asked = self.asked;
         let m = match (&step.set, step.query.body.as_ref()) {
-            (Some(arm), _) => set_step(arm, &made, &casings)?,
-            (None, SetExpr::Values(_)) => values_step(step, asked.params, asked.release, &casings)?,
-            _ => select_step(asked, step, &made, &mut casings, outer, accrued)?,
+            (Some(arm), _) => set_step(arm, &self.made, &self.casings)?,
+            (None, SetExpr::Values(_)) => {
+                values_step(step, asked.params, asked.release, &self.casings)?
+            }
+            _ => select_step(
+                asked,
+                step,
+                &self.made,
+                &mut self.casings,
+                self.outer,
+                self.accrued,
+            )?,
         };
-        let mut m = m;
+        self.keep(step, m)
+    }
+
+    /// A step's relation kept under its name, its columns under the names its alias gives them.
+    fn keep(&mut self, step: &Step, mut m: Made) -> Result<()> {
         if step.renames.len() > m.rel.names.len() {
             return Err(Error::new(format!(
                 "WITH query \"{}\" has {} columns available but {} columns specified",
@@ -2474,14 +2543,11 @@ pub(super) fn made_by(
         for (n, r) in m.rel.names.iter_mut().zip(&step.renames) {
             *n = r.clone();
         }
-        casings.renamed(&step.name, &step.renames);
-        held += m.rel.rows.len();
-        made.insert(step.name.clone(), Rc::new(m));
+        self.casings.renamed(&step.name, &step.renames);
+        self.held += m.rel.rows.len();
+        self.made.insert(step.name.clone(), Rc::new(m));
+        Ok(())
     }
-    let last = made
-        .remove("")
-        .ok_or_else(|| Error::new("the question returned nothing"))?;
-    Ok((Rc::try_unwrap(last).unwrap_or_else(|m| (*m).clone()), held))
 }
 
 /// The =s of a subquery's WHERE that tie a column of its FROM to an expression of the query around
@@ -3055,7 +3121,7 @@ pub(super) fn several(catalog: &Catalog, q: &Query) -> bool {
     };
     if let Some(with) = &q.with {
         if with.recursive {
-            return false;
+            return true;
         }
         for cte in &with.cte_tables {
             note(cte.query.body.as_ref(), &steps, &mut tables);

@@ -272,20 +272,12 @@ fn a_refusal_names_the_clause_or_the_call_it_refuses() {
     let path = snail("words");
     let join = "FROM a.t t JOIN a.u u ON u.t_id = t.id";
     for (q, words) in [
-        // A walk up a parent column, its last SELECT reading the walk alone: once "the question
-        // reads no table".
-        (
-            "WITH RECURSIVE up AS (SELECT t.id, t.g FROM a.t t WHERE t.id = 4 \
-             UNION SELECT q.id, q.g FROM a.t q JOIN up ON q.id = up.g) SELECT up.id FROM up"
-                .to_string(),
-            "WITH RECURSIVE is not read".to_string(),
-        ),
         (
             "SELECT t.id, d.n FROM a.t t, LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d"
                 .into(),
             "LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d is not read: a LATERAL \
              subquery reads the rows before it"
-                .into(),
+                .to_string(),
         ),
         // A function over a join: once "… is no function the DDL declares".
         (

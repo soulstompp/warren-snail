@@ -1082,6 +1082,20 @@ pub(super) fn function_name(f: &sqlparser::ast::Function) -> String {
     }
 }
 
+/// Whether a SELECT's list or HAVING calls an aggregate.
+pub(super) fn aggregates(s: &sqlparser::ast::Select) -> bool {
+    let mut calls = Calls::default();
+    for i in &s.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = i {
+            find_calls(e, &mut calls);
+        }
+    }
+    if let Some(h) = &s.having {
+        find_calls(h, &mut calls);
+    }
+    !calls.aggregates.is_empty()
+}
+
 fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
     match e {
         Expr::Function(f) => {

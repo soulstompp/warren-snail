@@ -663,7 +663,12 @@ by their values, NULLs as not distinct, each column typed as PostgreSQL's parser
 `IN`, `ANY` or `ALL`, and `LATERAL` in `FROM`) that reads nothing of the query around it is made
 once; one that reads it is made for each row's values of what it names, its tables read once and
 its rows met with each row by the `=`s that tie them, as PostgreSQL answers it, `NOT IN` beside a
-NULL and `ALL` over no rows among it.
+NULL and `ALL` over no rows among it. `WITH RECURSIVE` makes a query that reads itself round by
+round, as PostgreSQL does: its non-recursive term once, then its recursive term over the rows the
+round before added, until a round adds none, `UNION` keeping only rows not made before; each
+column typed by the non-recursive term; its queries made in the order they read each other. A
+recursion that makes more than 1,048,576 rows, a row group's, is refused by name, as are its
+`SEARCH` and `CYCLE` clauses.
 
 **The read it cancels.** The table held whole, and a sort for the window. The table's order is the
 window's order already, and each step holds only its running folds, its groups or the rows it
@@ -880,12 +885,12 @@ name.
   refused over no rows too.
 - **A statement:** as `exec` above.
 
-Anything else is refused, with a sentence that says what is not read: among it `WITH RECURSIVE`, a
-window over groups, a locking clause (`FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY
-SHARE`), and in a write `RETURNING`, `ON CONFLICT`, `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`,
-`MERGE`, a savepoint, and the isolation levels REPEATABLE READ and SERIALIZABLE. A statement
-sqlparser reads otherwise than it is written is refused too, so nothing it declares is dropped
-without a word.
+Anything else is refused, with a sentence that says what is not read: among it a recursive query's
+`SEARCH` and `CYCLE` clauses, a window over groups, a locking clause (`FOR UPDATE`, `FOR NO KEY
+UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON CONFLICT`, `UPDATE …
+FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE`, a savepoint, and the isolation levels REPEATABLE READ
+and SERIALIZABLE. A statement sqlparser reads otherwise than it is written is refused too, so
+nothing it declares is dropped without a word.
 
 ### What the commands record
 

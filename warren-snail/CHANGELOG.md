@@ -73,6 +73,11 @@ at once, and a snail written inside a host that decides its commits.
   list, `WHERE`, `HAVING` and `ORDER BY`, a row compared with one, and `LATERAL` in `FROM`; one
   reading the query around it met with each row by the `=`s that tie them; `NOT IN` and `ALL` as
   PostgreSQL answers them, and its refusals in its words.
+- `WITH RECURSIVE`: a query reading itself made round by round, `UNION` stopping on repeats and
+  `UNION ALL` once a round adds nothing; each column typed by the non-recursive term; recursive and
+  ordinary queries side by side, made in the order they read each other; what PostgreSQL's parser
+  refuses in a recursion refused in its words; a recursion past 1,048,576 rows, and the `SEARCH`
+  and `CYCLE` clauses, refused by name.
 - The commands `types`, `operators` and `opclasses` list every type, operator and operator class
   PostgreSQL 14 to 19 defines, each held or refused in the snail's own words: a type by a table's
   column of it, an operator by a pipeline's step over columns of its types, an operator class by

@@ -1145,6 +1145,7 @@ impl Snail {
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
         question::unlocked_words(sql)?;
+        relations::unread_clauses(sql)?;
         let sql = &*spelled::spelled(sql)?;
         let parsed =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;

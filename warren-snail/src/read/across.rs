@@ -671,6 +671,7 @@ impl Snails {
     /// tables is read as a join, each table from its own snail.
     pub fn ask_with(&mut self, sql: &str, params: &[String]) -> Result<(RecordBatch, Round)> {
         question::unlocked_words(sql)?;
+        super::relations::unread_clauses(sql)?;
         if self.writing {
             self.resolve()?;
         }
