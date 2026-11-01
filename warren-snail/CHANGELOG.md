@@ -73,6 +73,9 @@ at once, and a snail written inside a host that decides its commits.
   commit to other copies of the file.
 - A host that decides its commits: `Snail::open_carried`, `Snail::open_judged`, `carry::Judge`,
   `carry::replay`; and `exec --host`, a snail written through PostgreSQL's WAL.
+- A replica of a named source: `Snail::mark_replica`, `Snail::replica`, `Snail::applying` and
+  `Commit::replica`; the command `replica` and `exec --applier`. While the mark stands, every writer
+  is refused by name but the source's applier.
 - The features `collations`, ICU's collations and the C library's locales, and `zones`, named time
   zones read from compiled zone files; the command `recut`, an order cut under its collation's
   version written afresh. Each expression's collation derived as PostgreSQL derives it, two that

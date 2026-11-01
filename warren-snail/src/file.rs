@@ -385,6 +385,9 @@ pub struct Root {
     /// generation lies beside it; a round with no host to ask reads the copy beside it. Format 9
     /// only.
     pub host: Option<u64>,
+    /// The source the snail is a replica of, where it is marked one: every writer but the applier
+    /// presenting that source is refused while the mark stands. Format 9 only.
+    pub replica: Option<String>,
 }
 
 /// The default collation a file names where it names none: libc C.UTF-8, which orders text by its
@@ -616,9 +619,28 @@ impl Root {
                     o.u64(p.at);
                 }
             }
-            if let Some(tag) = self.host {
-                o.u64(tag);
+            // A root marked a replica carries its source, then whether its host tagged it.
+            match &self.replica {
+                None => {
+                    if let Some(tag) = self.host {
+                        o.u64(tag);
+                    }
+                }
+                Some(source) => {
+                    o.str(source);
+                    match self.host {
+                        None => o.u8(0),
+                        Some(tag) => {
+                            o.u8(1);
+                            o.u64(tag);
+                        }
+                    }
+                }
             }
+        } else if self.replica.is_some() {
+            return Err(Error::new(format!(
+                "a snail of format {format} is marked a replica of no source: `out`, then `write`"
+            )));
         } else if self.host.is_some() {
             return Err(Error::new(format!(
                 "a snail of format {format} is written through no host that tags its roots: `out`, \
@@ -678,12 +700,12 @@ impl Root {
         };
         // A root written before format 9 named its default collation ends here, its CRC next; one
         // written before it held decisions across snails ends after its collation.
-        let ended = |i: &In| {
-            let at = i.at();
+        let ended_at = |at: usize| {
             page.get(at..at + 4).is_some_and(|c| {
                 u32::from_le_bytes(c.try_into().unwrap()) == crc32fast::hash(&page[..at])
             })
         };
+        let ended = |i: &In| ended_at(i.at());
         let collation = if format >= FORMAT && !ended(&i) {
             i.str().ok()?
         } else {
@@ -717,11 +739,19 @@ impl Root {
         } else {
             (Vec::new(), None)
         };
-        // A root its host tagged carries the tag last.
-        let host = if format >= FORMAT && !ended(&i) {
-            Some(i.u64().ok()?)
+        // A root its host tagged carries the tag last; one marked a replica carries its source,
+        // then whether its host tagged it.
+        let (replica, host) = if format < FORMAT || ended(&i) {
+            (None, None)
+        } else if ended_at(i.at() + 8) {
+            (None, Some(i.u64().ok()?))
         } else {
-            None
+            let source = i.str().ok()?;
+            let host = match i.u8().ok()? {
+                0 => None,
+                _ => Some(i.u64().ok()?),
+            };
+            (Some(source), host)
         };
         let end = i.at();
         let crc = i.u32().ok()?;
@@ -742,6 +772,7 @@ impl Root {
                 decided,
                 pending,
                 host,
+                replica,
             },
             format,
         ))
@@ -1502,6 +1533,18 @@ impl Writer {
         if span < 2 {
             return Err(Error::new("a file holds at least the root's two pages"));
         }
+        // A snail marked a replica is written by its source's applier alone, and never afresh.
+        if let Some(source) = Reader::open(path)
+            .and_then(|r| r.root())
+            .ok()
+            .and_then(|r| r.replica)
+        {
+            return Err(Error::new(format!(
+                "{}: the snail there is marked a replica of '{source}', which only its applier \
+                 writes; a new snail is written where no file is yet",
+                path.display()
+            )));
+        }
         let files = Files::open(path, true, true)?;
         files.span.set(span);
         files.first.write_all_at(&vec![0u8; 2 * PAGE], 0)?;
@@ -2075,6 +2118,63 @@ mod tests {
         }
         .encode(FORMAT_EIGHT)
         .is_err());
+    }
+
+    #[test]
+    fn a_root_marked_a_replica_reads_back_its_source_with_its_tag_or_none() {
+        let marked = |replica: Option<&str>, host: Option<u64>| {
+            let mut p = Root {
+                generation: 5,
+                host,
+                replica: replica.map(str::to_string),
+                ..Default::default()
+            }
+            .encode(FORMAT)
+            .unwrap();
+            p.resize(PAGE, 0);
+            Root::decode(&p).map(|(r, _)| (r.replica, r.host))
+        };
+        for host in [None, Some(0), Some(9), Some(1 << 40 | 7)] {
+            for replica in [None, Some("mysql-1"), Some("a"), Some("primário 3306")] {
+                assert_eq!(
+                    marked(replica, host),
+                    Some((replica.map(str::to_string), host)),
+                    "{replica:?} {host:?}"
+                );
+            }
+        }
+        // A root marked no replica is written as before the mark was: its tag, where it has one,
+        // last before its checksum.
+        let bare = |host: Option<u64>| {
+            Root {
+                generation: 5,
+                host,
+                ..Default::default()
+            }
+            .encode(FORMAT)
+            .unwrap()
+        };
+        let (untagged, tagged_9) = (bare(None), bare(Some(9)));
+        assert_eq!(tagged_9.len(), untagged.len() + 8);
+        assert_eq!(
+            tagged_9[..untagged.len() - 4],
+            untagged[..untagged.len() - 4]
+        );
+        assert_eq!(
+            tagged_9[untagged.len() - 4..untagged.len() + 4],
+            9u64.to_le_bytes()
+        );
+        // Formats 7 and 8 hold no mark.
+        for format in [FORMAT_SEVEN, FORMAT_EIGHT] {
+            let e = Root {
+                replica: Some("mysql-1".into()),
+                ..Default::default()
+            }
+            .encode(format)
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("is marked a replica of no source"), "{e}");
+        }
     }
 
     #[test]

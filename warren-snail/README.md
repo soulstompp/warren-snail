@@ -622,6 +622,30 @@ refused by name. A host's recovery reads its log of commits again with `carry::r
 a commit on its parent, over a root of the same generation the host never took, and leaves one the
 file holds already or is past.
 
+## A replica of a named source
+
+**What it writes.** `Snail::mark_replica(Some(source))` marks a snail a replica of a source, by its
+name: the mark lies in the root, written by a commit of its own, or by the transaction under way at
+its COMMIT, and every commit after it carries it on. `mark_replica(None)` clears it, at cutover or
+once the applier is gone for good. The command is `warren-snail replica`; a snail PostgreSQL writes
+through its WAL is marked through PostgreSQL, so the mark reaches its standbys as any commit does.
+
+**The read it cancels.** A second writer on a replica: while the mark stands, every writer is
+refused by name, at its statement and again at its commit, where it reads the mark from the newest
+root at the root's turn, but the one that presents itself as the source's applier,
+`Snail::applying(source)` (`exec --applier`). A writer's read on a replica is pruned by the
+applier's reads alone, and a block holding dead rows goes `out` only once they have been.
+
+**How it shows.** `Snail::replica` names the source the root records; `warren-snail replica <file>`
+prints it. A follower is its leader's generation byte for byte, so a leader's mark is its
+followers', and `carry::apply` lands the leader's commits while a stray writer there is refused.
+
+**Where it stops.** A snail marked a replica of one source is refused another's mark until it is
+cleared; marking it as it is marked, or clearing a mark it does not hold, writes nothing. `recut`
+carries the mark; `write` makes no snail where a replica lies. A snail of format 7 or 8 holds no
+mark. The mark names a writer, and a source's name is presented by whoever writes it: PostgreSQL's
+privileges, or the file's own, say who may write at all.
+
 ## A question read as it goes: the pipeline
 
 **What it reads.** A question with a `WITH`, or a window, is read as a pipeline over one table,
@@ -722,8 +746,11 @@ command's alone.
   name none, `--release` and `--lc-monetary` give them, 19 and `C` unless given. `--written`
   records each order's columns as Parquet.
 - `exec <file> <statements.sql> --out <done.parquet> [--with <file>]... [--host <command>
-  --host-server <name>]`: each statement in turn. `--host` writes a snail PostgreSQL writes through
-  its WAL, as one transaction of the server's (warren-snail-pg's *Writing through PostgreSQL*).
+  --host-server <name>] [--applier <source>]`: each statement in turn. `--host` writes a snail
+  PostgreSQL writes through its WAL, as one transaction of the server's (warren-snail-pg's *Writing
+  through PostgreSQL*); `--applier` writes as a source's applier, the one writer of its replica.
+- `replica <file> [--of <source> | --clear]`: the source the snail is marked a replica of; `--of`
+  marks it, `--clear` clears it.
 - `read <file> <question.sql> --out <answer.parquet> [--order <name>] [--param <value>]...
   [--rounds <n>] [--hold <MiB>] [--round <round.parquet>] [--text] [--with <file>]...`: the answer
   as Parquet, and each round. `--text` writes each value of a time type, a scalar's and an
@@ -905,6 +932,9 @@ fn main() -> warren_snail::Result<()> {
   `carry::taken_root` is the root a judge hands a writer outside the host, `carry::newest` the
   newest generation a file holds; `carry::replay` and `carry::replay_held` land a host's log of
   commits.
+- `mark_replica` marks a snail a replica of a source, or clears the mark; `replica` names it;
+  `applying` makes a writer that source's applier; `Commit::replica` is the mark a commit's root
+  carries.
 
 ### The features
 

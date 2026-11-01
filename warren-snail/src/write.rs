@@ -832,12 +832,14 @@ pub fn write_released(
 }
 
 /// What a snail written afresh from another carries over of it beyond its rows: where its
-/// sequences stand, and the `lc_monetary` each money column was written under.
+/// sequences stand, the `lc_monetary` each money column was written under, and the source it is a
+/// replica of.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct Carried {
     pub sequences: Vec<crate::file::SequenceState>,
     pub monetary: Vec<(String, String, String)>,
+    pub replica: Option<String>,
 }
 
 /// A new snail as `write_released` writes it, carrying over what `carried` holds of the snail its
@@ -958,6 +960,7 @@ fn write_tables(
         generation: 1,
         release: catalog.release,
         monetary: crate::file::monetary_of(catalog, carried.map_or(&[], |c| &c.monetary)),
+        replica: carried.and_then(|c| c.replica.clone()),
         ..Default::default()
     };
     crate::file::holds_catalog(w.format(), catalog)?;

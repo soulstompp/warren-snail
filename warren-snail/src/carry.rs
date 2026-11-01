@@ -167,6 +167,13 @@ impl Commit {
         Root::decode(&page).and_then(|(r, _)| r.host)
     }
 
+    /// The source the commit's root marks the snail a replica of, where it marks it one.
+    pub fn replica(&self) -> Option<String> {
+        let mut page = self.root.clone();
+        page.resize(PAGE, 0);
+        Root::decode(&page).and_then(|(r, _)| r.replica)
+    }
+
     /// The commit `encode` wrote, refused where its bytes are not whole.
     pub fn decode(bytes: &[u8]) -> Result<Commit> {
         let n = bytes.len();

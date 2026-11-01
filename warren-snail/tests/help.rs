@@ -3,9 +3,10 @@
 use std::process::{Command, Output};
 
 /// The commands the help names.
-const COMMANDS: [&str; 13] = [
+const COMMANDS: [&str; 14] = [
     "write",
     "exec",
+    "replica",
     "read",
     "out",
     "blocks",

@@ -281,6 +281,10 @@ pub struct Snail {
     touched: foreign::Touched,
     pending: foreign::Touched,
     modes: std::collections::BTreeMap<(usize, usize), bool>,
+    /// The source whose applier the writer presents itself as, where it does.
+    applier: Option<String>,
+    /// The replica mark the statement or the transaction under way sets, or clears.
+    marking: Option<Option<String>>,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -490,6 +494,8 @@ impl Snail {
             touched: Default::default(),
             pending: Default::default(),
             modes: Default::default(),
+            applier: None,
+            marking: None,
         })
     }
 
@@ -556,6 +562,18 @@ impl Snail {
         Ok(snail)
     }
 
+    /// Writes from now on as the applier of `source`: on a snail marked a replica of `source`, the
+    /// one writer it takes; on any other, a writer as any.
+    pub fn applying(&mut self, source: &str) -> Result<()> {
+        if self.writer.is_none() {
+            return Err(Error::new(
+                "this snail was opened to read; open it to write",
+            ));
+        }
+        self.applier = Some(source.to_string());
+        Ok(())
+    }
+
     fn catalog(reader: &Reader, root: &Root) -> Result<Catalog> {
         let ddl = String::from_utf8(reader.read_extent(root.catalog)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
@@ -588,6 +606,12 @@ impl Snail {
     /// file.
     pub fn unseen(&self) -> Option<u64> {
         self.reader.unseen()
+    }
+
+    /// The source the snail is marked a replica of, as the root it reads records it, where it is
+    /// marked one.
+    pub fn replica(&self) -> Option<&str> {
+        self.root.replica.as_deref()
     }
 
     /// The PostgreSQL release the file's OIDs came from, whose catalog names its reg* values.

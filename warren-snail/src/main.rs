@@ -26,7 +26,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
                           [--release <14..19>] [--lc-monetary <locale>]
                           [--written <written.parquet>]
        warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
-                         [--host <command> --host-server <name>]
+                         [--host <command> --host-server <name>] [--applier <source>]
+       warren-snail replica <file> [--of <source> | --clear]
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
                          [--param <value>]... [--rounds <n>] [--hold <MiB>]
                          [--round <round.parquet>] [--text] [--with <file>]...
@@ -68,6 +69,14 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           writers' lock PostgreSQL's writers take, the server warren_snail_pg names the snail
           by --host-server handing it the root it takes, logging the commit and writing its
           root.
+          A snail marked a replica is written only by its source's applier: --applier writes as
+          the applier of <source>, under --host presenting it to the host too.
+  replica the source the snail is marked a replica of, or none. --of marks it a replica of
+          <source>, a commit of its own: while the mark stands every writer is refused but the
+          one exec's --applier names that source's applier. --clear clears it, at cutover or once
+          the applier is gone for good. A snail marked a replica of another source is refused a
+          mark until it is cleared. A snail PostgreSQL writes through its WAL is marked through
+          PostgreSQL, by warren_snail_mark_replica and warren_snail_clear_replica.
   read    the question's answer, as Parquet. Prints each round: the order it read along, and the
           pages it predicted and read. --order names the order to read along; each --param gives
           the next of $1, $2 and on, as text. --rounds asks it again on the one open snail, which
@@ -396,13 +405,15 @@ impl warren_snail::carry::Judge for Asked {
 /// The statements run as one transaction of the host's, on a snail its host writes: the host's
 /// command takes the writers' lock in a transaction of its own and hands the snail the root it
 /// takes, the snail choosing its pages from that root's free map, and its one commit is handed to
-/// it, the host writing the root; then the host's transaction commits. Each statement's account, the
+/// it, the host writing the root; then the host's transaction commits. A writer that is a source's
+/// applier presents itself so to the host as it takes the lock. Each statement's account, the
 /// commit's last.
 fn exec_hosted(
     file: &str,
     statements: &[String],
     command: &str,
     server: &str,
+    applier: Option<&str>,
 ) -> Result<Vec<(warren_snail::read::Done, u64)>> {
     for (i, st) in statements.iter().enumerate() {
         let word = st
@@ -433,11 +444,12 @@ fn exec_hosted(
     let path = std::fs::canonicalize(file).map_err(|e| Error::new(format!("{file}: {e}")))?;
     let carrier = Arc::new(std::sync::Mutex::new(Carrier::start(command)?));
     carrier.lock().unwrap().run("BEGIN")?;
+    let presented = applier.map_or(String::new(), |a| format!(", {}", literal(a)));
     let tag: u64 = carrier
         .lock()
         .unwrap()
         .one(&format!(
-            "SELECT warren_snail_writer({}, {})",
+            "SELECT warren_snail_writer({}, {}{presented})",
             literal(server),
             literal(&path.to_string_lossy())
         ))?
@@ -453,6 +465,9 @@ fn exec_hosted(
         server: server.to_string(),
     });
     let mut snail = Snail::open_carried(Path::new(file), Box::new(host), judge)?;
+    if let Some(a) = applier {
+        snail.applying(a)?;
+    }
     let handed = || carrier.lock().unwrap().written;
     let mut done = Vec::with_capacity(statements.len() + 1);
     snail.execute("BEGIN")?;
@@ -483,6 +498,12 @@ fn cmd_exec(args: &[String]) -> Result<()> {
     // Each statement as written: the snail reads itself what sqlparser does not.
     let statements = warren_snail::read::statement::split(&text)?;
     let others = withs(args);
+    let applier = flag(args, "--applier");
+    if applier.is_some() && !others.is_empty() {
+        return Err(Error::new(
+            "--applier writes one snail, its source's replica: --with is refused",
+        ));
+    }
     let done = match flag(args, "--host") {
         Some(command) => {
             let server = flag(args, "--host-server").ok_or_else(|| {
@@ -491,11 +512,15 @@ fn cmd_exec(args: &[String]) -> Result<()> {
             if !others.is_empty() {
                 return Err(Error::new("--host writes one snail: --with is refused"));
             }
-            exec_hosted(file, &statements, command, server)?
+            exec_hosted(file, &statements, command, server, applier)?
         }
         None => {
             let mut opened = if others.is_empty() {
-                Opened::One(Snail::open_writing(Path::new(file))?)
+                let mut snail = Snail::open_writing(Path::new(file))?;
+                if let Some(a) = applier {
+                    snail.applying(a)?;
+                }
+                Opened::One(snail)
             } else {
                 let paths: Vec<&Path> = std::iter::once(file.as_str())
                     .chain(others)
@@ -569,6 +594,32 @@ fn cmd_exec(args: &[String]) -> Result<()> {
             "a statement's pages written differ from the bytes the system counted",
         ));
     }
+    Ok(())
+}
+
+fn cmd_replica(args: &[String]) -> Result<()> {
+    let file = args.first().ok_or_else(|| Error::new(USAGE))?;
+    let of = flag(args, "--of");
+    let clear = args.iter().any(|a| a == "--clear");
+    let said = |mark: Option<&str>| match mark {
+        Some(source) => format!("a replica of {source}"),
+        None => "no replica".to_string(),
+    };
+    if of.is_none() && !clear {
+        println!("{}", said(Snail::open(Path::new(file))?.replica()));
+        return Ok(());
+    }
+    if of.is_some() && clear {
+        return Err(Error::new("replica takes --of or --clear, not both"));
+    }
+    let mut snail = Snail::open_writing(Path::new(file))?;
+    let done = snail.mark_replica(of)?;
+    println!(
+        "{}, {} written, generation {}",
+        said(snail.replica()),
+        n(done.pages_written, "page"),
+        done.generation
+    );
     Ok(())
 }
 
@@ -1290,9 +1341,10 @@ fn cmd_functions(args: &[String]) -> Result<()> {
 }
 
 /// The commands, as `USAGE` names them.
-const COMMANDS: [&str; 13] = [
+const COMMANDS: [&str; 14] = [
     "write",
     "exec",
+    "replica",
     "read",
     "out",
     "blocks",
@@ -1307,13 +1359,13 @@ const COMMANDS: [&str; 13] = [
 ];
 
 /// Whether a command's arguments ask for its help: `--help` or `-h`, other than as the value a
-/// flag takes. Every flag but `--text` takes the argument after it.
+/// flag takes. Every flag but `--text` and `--clear` takes the argument after it.
 fn asks_help(args: &[String]) -> bool {
     args.iter().enumerate().any(|(i, a)| {
         (a == "--help" || a == "-h")
             && (i == 0 || {
                 let before = args[i - 1].as_str();
-                !before.starts_with("--") || before == "--text"
+                !before.starts_with("--") || before == "--text" || before == "--clear"
             })
     })
 }
@@ -1439,6 +1491,7 @@ fn main() -> ExitCode {
         Some("write") => cmd_write(&args[1..]),
         Some("read") => cmd_read(&args[1..]),
         Some("exec") => cmd_exec(&args[1..]),
+        Some("replica") => cmd_replica(&args[1..]),
         Some("out") => cmd_out(&args[1..]),
         Some("hold") => cmd_hold(&args[1..]),
         Some("census") => cmd_census(&args[1..]),

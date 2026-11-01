@@ -310,6 +310,7 @@ impl Snail {
         let carried = crate::write::Carried {
             sequences,
             monetary: self.root.monetary.clone(),
+            replica: self.root.replica.clone(),
         };
         crate::write::write_carried(
             to,
@@ -341,6 +342,13 @@ impl Snail {
                     return Err(Error::new(format!(
                         "{}: {pruned} blocks hold dead rows or rows out of place, which a Parquet \
                          file cannot carry; a snail open to write prunes them on their way out",
+                        table.name
+                    )));
+                }
+                if let Err(e) = self.writes_marked(&self.root) {
+                    return Err(Error::new(format!(
+                        "{}: {pruned} blocks hold dead rows or rows out of place, which a Parquet \
+                         file cannot carry, and only a writer prunes them on their way out: {e}",
                         table.name
                     )));
                 }

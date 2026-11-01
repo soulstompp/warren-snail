@@ -737,6 +737,15 @@ impl Snail {
                 false
             }
             st => {
+                // A snail marked a replica takes writes from the applier presenting its source
+                // alone.
+                if !matches!(st, Statement::Constraints { .. }) {
+                    if let Err(e) = self.writes_marked(&self.root) {
+                        self.abandon()?;
+                        self.aborted = self.begun.is_some();
+                        return Err(e);
+                    }
+                }
                 // A statement that reads and writes takes the transaction's first snapshot; SET
                 // CONSTRAINTS takes none.
                 if self.begun.is_some() && !matches!(st, Statement::Constraints { .. }) {
@@ -794,6 +803,83 @@ impl Snail {
         done.pages_written = self.written() - written0;
         done.pages_reused = self.reused - reused0;
         Ok(done)
+    }
+
+    /// Marks the snail a replica of `source`, or clears the mark with `None`: a commit of its own,
+    /// or the transaction's under way, at its COMMIT. While the mark stands, every writer but the
+    /// one presenting itself as `source`'s applier is refused. A snail marked a replica of another
+    /// source is refused a mark until it is cleared; marking it as it is marked, or clearing a mark
+    /// it does not hold, writes nothing.
+    pub fn mark_replica(&mut self, source: Option<&str>) -> Result<Done> {
+        if self.writer.is_none() {
+            return Err(Error::new(
+                "this snail was opened to read; open it to write",
+            ));
+        }
+        if self.aborted {
+            return Err(Error::new(ABORTED));
+        }
+        if source == Some("") {
+            return Err(Error::new("a replica's source is named: the name is empty"));
+        }
+        if source.is_some() && self.reader.format() < crate::file::FORMAT {
+            return Err(Error::new(format!(
+                "a snail of format {} is marked a replica of no source: `out`, then `write`",
+                self.reader.format()
+            )));
+        }
+        if self.begun.is_none() && self.rounds > 0 {
+            self.renew()?;
+        } else if self.begun.is_some() {
+            self.renew_in_transaction()?;
+        }
+        self.rounds += 1;
+        let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);
+        let stands = match &self.marking {
+            Some(m) => m.clone(),
+            None => self.root.replica.clone(),
+        };
+        let wanted = source.map(str::to_string);
+        if let (Some(stands), Some(new)) = (&stands, &wanted) {
+            if stands != new {
+                return Err(Error::new(format!(
+                    "this snail is marked a replica of '{stands}': clear the mark before marking it \
+                     a replica of '{new}'"
+                )));
+            }
+        }
+        if stands != wanted {
+            self.marking = Some(wanted);
+            match self.begun.as_mut() {
+                Some((_, any)) => *any = true,
+                None => self.commit()?,
+            }
+        }
+        Ok(Done {
+            statement: "REPLICA",
+            generation: self.root.generation,
+            pages_read: self.reader.pages_read() - read0,
+            pages_written: self.written() - written0,
+            pages_reused: self.reused - reused0,
+            ..Default::default()
+        })
+    }
+
+    /// Refuses a write on a snail marked a replica of a source whose applier this writer does not
+    /// present itself as: the mark `root` holds, or the one the statement or the transaction under
+    /// way sets or clears.
+    pub(super) fn writes_marked(&self, root: &Root) -> Result<()> {
+        let mark = match &self.marking {
+            Some(m) => m.as_ref(),
+            None => root.replica.as_ref(),
+        };
+        match mark {
+            Some(source) if self.applier.as_ref() != Some(source) => Err(Error::new(format!(
+                "this snail is marked a replica of '{source}': only the applier presenting \
+                 '{source}' writes it, until the mark is cleared"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// The rows an INSERT, UPDATE or DELETE writes, staged. Returns whether it changed any. `found`
@@ -1336,6 +1422,7 @@ impl Snail {
     pub(super) fn abandon(&mut self) -> Result<()> {
         self.rebased.clear();
         self.deciding = None;
+        self.marking = None;
         self.reader.clear_staged();
         self.touched = Touched::default();
         self.pending = Touched::default();
@@ -1458,6 +1545,25 @@ impl Snail {
                     "the host's transaction {t} commits this snail once, and its commit lies on \
                      the root already"
                 )));
+            }
+        }
+        // A snail marked a replica is written by the applier presenting its source alone, but for
+        // the commit that sets or clears the mark, at the root's turn; a sequence's advance lands
+        // ahead of the transaction that sets it.
+        if self.marking.is_none() {
+            self.writes_marked(&root)?;
+        }
+        if self.advancing.is_none() {
+            if let Some(m) = self.marking.take() {
+                if let (Some(stands), Some(new)) = (&root.replica, &m) {
+                    if stands != new {
+                        return Err(Error::new(format!(
+                            "this snail is marked a replica of '{stands}': clear the mark before \
+                             marking it a replica of '{new}'"
+                        )));
+                    }
+                }
+                root.replica = m;
             }
         }
         root.host = None;
@@ -2168,6 +2274,10 @@ impl Snail {
     /// rows dropped, and cut again; then committed as a write is, or within the transaction begun.
     /// Returns the blocks pruned and the pages written.
     pub(super) fn prune(&mut self, wasted: Vec<Wasted>) -> Result<(u64, u64)> {
+        // A snail marked a replica is pruned by its applier's reads alone.
+        if self.writes_marked(&self.root).is_err() {
+            return Ok((0, 0));
+        }
         let written = self.written();
         let mut stage = self.reader.stage();
         let pruned = self.prune_with(&mut stage, wasted)?;
