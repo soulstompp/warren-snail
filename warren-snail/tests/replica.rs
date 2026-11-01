@@ -455,9 +455,14 @@ fn a_snail_of_format_seven_or_eight_is_marked_no_replica() {
             )),
             "{e}"
         );
-        // Refused as it is asked, in a transaction too.
+        // Refused as it is asked, in a transaction too, which then takes nothing but its end.
         w.execute("BEGIN").unwrap();
         assert!(w.mark_replica(Some(SOURCE)).is_err());
+        let e = w
+            .execute("INSERT INTO s.t (a, b) VALUES (1, 1)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("aborted"), "{e}");
         w.execute("ROLLBACK").unwrap();
         assert_eq!(w.mark_replica(None).unwrap().pages_written, 0);
     }
