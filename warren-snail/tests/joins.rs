@@ -749,22 +749,8 @@ fn what_a_join_does_not_read_is_refused_with_its_reason() {
     let mut snail = fresh(&path);
     for (q, why) in [
         (
-            "SELECT count(*) FROM j.sets s JOIN j.owned o ON o.set_num = s.set_num \
-             RIGHT JOIN j.buys b ON b.builder_id = o.builder_id",
-            "first join",
-        ),
-        (
-            "SELECT count(*) FROM j.sets s JOIN j.themes t ON t.theme_id = s.theme_id \
-             FULL JOIN j.owned o ON o.set_num = s.set_num",
-            "first join",
-        ),
-        (
             "SELECT count(*) FROM j.themes t FULL JOIN j.sets s ON s.theme_id < t.theme_id",
             "hash-joinable",
-        ),
-        (
-            "SELECT count(*) FROM j.sets s JOIN j.owned o USING (set_num)",
-            "USING",
         ),
         (
             "SELECT count(*) FROM j.sets s JOIN j.owned o ON o.set_num = s.set_num JOIN j.themes t ON s.year = 3",
@@ -861,4 +847,132 @@ fn a_structured_type_postgresql_has_no_key_for_is_refused_as_postgresql_refuses_
         let e = snail.ask(&q, None).unwrap_err().to_string();
         assert!(e.contains(why), "{q}: {e}");
     }
+}
+
+#[test]
+fn a_join_s_forms_past_the_question_path_are_read_by_the_pipeline() {
+    let d = data();
+    let path = snail("joins_handed", &d);
+    let mut snail = fresh(&path);
+    let by_builder = |b: i64| d.owned.iter().filter(|o| o.builder == b).count();
+    // A RIGHT JOIN after the first join: every buy, beside each pair of a set and a row owned by
+    // its builder, or beside NULLs.
+    let n: usize = d.buys.iter().map(|b| by_builder(b.builder).max(1)).sum();
+    let q = "SELECT count(*) FROM j.sets s JOIN j.owned o ON o.set_num = s.set_num \
+             RIGHT JOIN j.buys b ON b.builder_id = o.builder_id";
+    same(&mut snail, q, vec![vec![s(n)]]);
+    // A FULL JOIN after the first join: each set of a theme beside its rows owned, or NULLs; each
+    // row owned of a set of no theme beside NULLs.
+    let themed: BTreeSet<&str> = d
+        .sets
+        .iter()
+        .filter(|x| d.themes.iter().any(|t| t.id == x.theme))
+        .map(|x| x.num.as_str())
+        .collect();
+    let owning = |set: &str| d.owned.iter().filter(|o| o.set == set).count();
+    let n: usize = themed.iter().map(|x| owning(x).max(1)).sum::<usize>()
+        + d.owned
+            .iter()
+            .filter(|o| !themed.contains(o.set.as_str()))
+            .count();
+    let q = "SELECT count(*) FROM j.sets s JOIN j.themes t ON t.theme_id = s.theme_id \
+             FULL JOIN j.owned o ON o.set_num = s.set_num";
+    same(&mut snail, q, vec![vec![s(n)]]);
+    // USING and NATURAL: the column they meet on read once, under its bare name.
+    let q = "SELECT count(*), count(DISTINCT set_num) FROM j.sets s JOIN j.owned o USING (set_num)";
+    let sets: BTreeSet<&str> = d.owned.iter().map(|o| o.set.as_str()).collect();
+    same(&mut snail, q, vec![vec![s(d.owned.len()), s(sets.len())]]);
+    let q = "SELECT count(*) FROM j.owned o NATURAL JOIN j.buys b";
+    let n: usize = d
+        .buys
+        .iter()
+        .filter(|b| {
+            d.owned
+                .iter()
+                .any(|o| o.builder == b.builder && o.row == b.row)
+        })
+        .count();
+    same(&mut snail, q, vec![vec![s(n)]]);
+    // Its words, where PostgreSQL refuses: a FULL JOIN on nothing it meets the rows by.
+    let e = snail
+        .ask(
+            "SELECT count(*) FROM j.sets s JOIN j.themes t ON t.theme_id = s.theme_id \
+             FULL JOIN j.owned o ON o.set_num < s.set_num",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("hash-joinable"), "{e}");
+}
+
+#[test]
+fn a_step_reads_its_tables_as_the_question_path_reads_them() {
+    let d = data();
+    let path = snail("joins_steps", &d);
+    let mut snail = fresh(&path);
+    let theme = 7;
+    let years: Vec<i64> = d
+        .sets
+        .iter()
+        .filter(|x| x.theme == theme)
+        .map(|x| x.year)
+        .collect();
+    // A step reading a join of tables reads it in the question path's one round: the sets kept to
+    // the theme's key, along their index on it.
+    let joined = format!(
+        "SELECT s.set_num, s.year FROM j.themes t JOIN j.sets s ON s.theme_id = t.theme_id \
+         WHERE t.theme_id = {theme}"
+    );
+    let alone = same(
+        &mut snail,
+        &joined,
+        d.sets
+            .iter()
+            .filter(|x| x.theme == theme)
+            .map(|x| vec![s(&x.num), s(x.year)])
+            .collect(),
+    );
+    let q = format!("WITH x AS ({joined}) SELECT count(*), min(x.year) FROM x");
+    let round = same(
+        &mut snail,
+        &q,
+        vec![vec![s(years.len()), s(years.iter().min().unwrap())]],
+    );
+    assert_eq!(round.order, alone.order);
+    assert_eq!(round.column_pages_predicted, alone.column_pages_predicted);
+    // A table a step reads alone is read by its own conditions: the sets of the theme along their
+    // index on it, the rows owned whole; then met by the step.
+    let sets = format!("SELECT s.set_num FROM j.sets s WHERE s.theme_id = {theme}");
+    let first = same(
+        &mut snail,
+        &sets,
+        d.sets
+            .iter()
+            .filter(|x| x.theme == theme)
+            .map(|x| vec![s(&x.num)])
+            .collect(),
+    );
+    let all: Vec<Row> = d.owned.iter().map(|o| vec![s(&o.set)]).collect();
+    let second = same(&mut snail, "SELECT o.set_num FROM j.owned o", all);
+    let mine: BTreeSet<&str> = d
+        .sets
+        .iter()
+        .filter(|x| x.theme == theme)
+        .map(|x| x.num.as_str())
+        .collect();
+    let n = d
+        .owned
+        .iter()
+        .filter(|o| mine.contains(o.set.as_str()))
+        .count();
+    let q = format!(
+        "WITH x AS ({sets}), y AS (SELECT o.set_num FROM j.owned o) \
+         SELECT count(*) FROM x JOIN y ON y.set_num = x.set_num"
+    );
+    let round = same(&mut snail, &q, vec![vec![s(n)]]);
+    assert_eq!(
+        round.column_pages_predicted,
+        first.column_pages_predicted + second.column_pages_predicted,
+        "{round:?}"
+    );
 }

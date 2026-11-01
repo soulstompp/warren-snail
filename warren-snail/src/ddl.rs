@@ -8,7 +8,7 @@ use crate::catalog::{
     assignable, format_type, held_type, ident, level, object_name, shape, Action, Catalog, Check,
     Collation, Column, ColumnType, Domain, DomainCheck, Fact, ForeignKey, Function, Generated,
     Identity, KeyConstraint, Level, Method, Order, Reading, Sequence, SequenceType, Shape,
-    StatementRead, Table, Type, TypeKind, TEXT_OPCLASSES,
+    StatementRead, Table, Type, TypeKind, View, TEXT_OPCLASSES,
 };
 use crate::{Error, Result};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -1809,6 +1809,7 @@ impl Declared {
 #[derive(Clone, Debug, Default)]
 struct Draft {
     functions: Vec<Function>,
+    views: Vec<View>,
     tables: Vec<Declared>,
     types: Vec<Type>,
     domains: Vec<Domain>,
@@ -1852,6 +1853,10 @@ impl Draft {
             .sequences
             .iter()
             .any(|s| schema_of(&s.name) == schema && bare(&s.name) == name)
+            || self
+                .views
+                .iter()
+                .any(|v| schema_of(&v.name) == schema && bare(&v.name) == name)
     }
 
     /// Whether a constraint of that name lies in the schema: a key's or a CHECK's.
@@ -2293,9 +2298,94 @@ impl Draft {
                 self.functions.push(f);
                 Ok(Vec::new())
             }
+            Statement::CreateView(v) => {
+                read_as_written(tokens, &st, &format!("{kind} {object}"))?;
+                self.create_view(v)
+            }
             _ => Err(Error::new(format!(
                 "the statement {kind} {object} is not read"
             ))),
+        }
+    }
+
+    /// A view: its question read over the tables and the views declared before it, as
+    /// PostgreSQL's parser reads it when the view is made, and kept as written.
+    fn create_view(&mut self, v: &sqlparser::ast::CreateView) -> Result<Vec<String>> {
+        let name = object_name(&v.name);
+        let what = format!("CREATE VIEW {name}");
+        let refused = |clause: &str| Err(Error::new(format!("{what}: {clause} is not read")));
+        if v.materialized {
+            return refused("MATERIALIZED");
+        }
+        if v.temporary {
+            return refused("TEMPORARY");
+        }
+        if v.or_alter
+            || v.secure
+            || v.to.is_some()
+            || v.params.is_some()
+            || !v.cluster_by.is_empty()
+            || v.comment.is_some()
+            || v.with_no_schema_binding
+            || v.copy_grants
+            || v.if_not_exists
+            || !matches!(v.options, sqlparser::ast::CreateTableOptions::None)
+        {
+            return refused("a clause beside its name, its columns and its question");
+        }
+        if self.relation(schema_of(&name), bare(&name)) {
+            if v.or_replace && self.views.iter().any(|x| x.name == name) {
+                return refused("OR REPLACE of a view that exists");
+            }
+            return Err(Error::new(format!("relation \"{name}\" already exists")));
+        }
+        let columns = v
+            .columns
+            .iter()
+            .map(|c| match (&c.data_type, &c.options) {
+                (None, None) => Ok(ident(&c.name)),
+                _ => Err(Error::new(format!("{what}: the column {c} is not read"))),
+            })
+            .collect::<Result<Vec<String>>>()?;
+        let made = crate::read::view_columns(&self.so_far(), &v.query)?;
+        if columns.len() > made.len() {
+            return Err(Error::new(
+                "CREATE VIEW specifies more column names than columns",
+            ));
+        }
+        let mut named = made;
+        for (n, c) in named.iter_mut().zip(&columns) {
+            *n = c.clone();
+        }
+        if let Some(n) =
+            (0..named.len()).find_map(|i| named[..i].contains(&named[i]).then_some(&named[i]))
+        {
+            return Err(Error::new(format!(
+                "column \"{n}\" specified more than once"
+            )));
+        }
+        self.views.push(View {
+            name,
+            columns,
+            query: v.query.to_string(),
+        });
+        Ok(Vec::new())
+    }
+
+    /// The catalog as the DDL has declared it so far: the tables that are whole, and every other
+    /// object.
+    fn so_far(&self) -> Catalog {
+        Catalog {
+            ddl: String::new(),
+            tables: self.finish().into_iter().filter_map(|t| t.ok()).collect(),
+            functions: self.functions.clone(),
+            types: self.types.clone(),
+            domains: self.domains.clone(),
+            sequences: self.sequences.clone(),
+            collations: self.collations.clone(),
+            views: self.views.clone(),
+            release: crate::regs::LATEST,
+            monetary: crate::monetary::Monetary::C,
         }
     }
 
@@ -3740,6 +3830,7 @@ impl Draft {
                     domains: self.domains.clone(),
                     sequences: self.sequences.clone(),
                     collations: self.collations.clone(),
+                    views: Vec::new(),
                     release: crate::regs::LATEST,
                     monetary: crate::monetary::Monetary::C,
                 };
@@ -4801,6 +4892,7 @@ pub(crate) fn read_ddl_kept(ddl: &str, strict: bool, kept: usize) -> Result<Read
             domains: draft.domains,
             sequences: draft.sequences,
             collations: draft.collations,
+            views: draft.views,
             release: crate::regs::LATEST,
             monetary: crate::monetary::Monetary::C,
         },
@@ -4848,7 +4940,7 @@ pub(crate) fn set_constraints(tokens: &[Token]) -> Option<Result<(Option<Vec<Str
 }
 
 /// What a statement declares, where it declares something the catalog holds: CREATE TABLE, INDEX,
-/// SEQUENCE, TYPE, DOMAIN or COLLATION, or ALTER TABLE, SEQUENCE, TYPE or DOMAIN.
+/// SEQUENCE, TYPE, DOMAIN, COLLATION or VIEW, or ALTER TABLE, SEQUENCE, TYPE or DOMAIN.
 pub(crate) fn declares(sql: &str) -> Option<&'static str> {
     let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize().ok()?;
     let (kind, _) = head(&tokens);
@@ -4863,6 +4955,7 @@ pub(crate) fn declares(sql: &str) -> Option<&'static str> {
         "ALTER SEQUENCE" => "ALTER SEQUENCE",
         "ALTER TYPE" => "ALTER TYPE",
         "ALTER DOMAIN" => "ALTER DOMAIN",
+        "CREATE VIEW" | "CREATE OR REPLACE VIEW" => "CREATE VIEW",
         _ => return None,
     })
 }

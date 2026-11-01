@@ -290,71 +290,49 @@ fn a_refusal_names_the_clause_or_the_call_it_refuses() {
             "set operations are not read".into(),
         ),
         (
-            "WITH x AS (VALUES (1)) SELECT x.column1 FROM x".into(),
-            "VALUES (1) is not read: a step is a SELECT".into(),
-        ),
-        (
-            "WITH x AS (SELECT d.id FROM (SELECT t.id FROM a.t t) d) SELECT x.id FROM x".into(),
-            "(SELECT t.id FROM a.t t) d is not read: a step reads tables and steps by name".into(),
+            "SELECT t.id, d.n FROM a.t t, LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d"
+                .into(),
+            "LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d is not read: a LATERAL \
+             subquery reads the rows before it"
+                .into(),
         ),
         // A function over a join: once "… is no function the DDL declares".
         (
-            format!("SELECT t.g, string_agg(t.s, ',' ORDER BY u.w) AS s {join} GROUP BY t.g"),
-            "string_agg(t.s, ',' ORDER BY u.w) is not read".into(),
-        ),
-        (
-            format!("SELECT coalesce(t.v, -1) AS c {join}"),
-            "coalesce(t.v, -1) is not read".into(),
-        ),
-        (
-            format!("SELECT t.id {join} WHERE abs(u.w) > 3"),
-            "abs(u.w) is not read".into(),
-        ),
-        // Each clause by its own name: once "DISTINCT and HAVING", "WITH, LIMIT and FETCH".
-        (
-            format!("SELECT DISTINCT t.g {join}"),
-            "DISTINCT is not read over a join".into(),
-        ),
-        (
-            format!("SELECT t.g, count(*) AS c {join} GROUP BY t.g HAVING count(*) > 1"),
-            "HAVING is not read over a join".into(),
-        ),
-        (
-            "SELECT t.g, count(*) AS c FROM a.t t GROUP BY t.g HAVING count(*) > 1".into(),
-            "HAVING is not read".into(),
-        ),
-        (
-            format!("SELECT t.id {join} ORDER BY t.id LIMIT 2"),
-            "LIMIT is not read over a join".into(),
-        ),
-        (
-            format!("SELECT t.id {join} ORDER BY t.id OFFSET 1"),
-            "OFFSET is not read over a join".into(),
-        ),
-        // A FROM item, by itself: once "a question reads tables".
-        (
-            "SELECT d.id FROM (SELECT t.id FROM a.t t) d".into(),
-            "(SELECT t.id FROM a.t t) d is not read: a question reads tables".into(),
-        ),
-        (
-            "SELECT t.id FROM a.t t JOIN (VALUES (1), (2)) v (x) ON v.x = t.id".into(),
-            "(VALUES (1), (2)) v (x) is not read: a question reads tables".into(),
-        ),
-        (
-            "SELECT t.id, g.g FROM a.t t, LATERAL generate_series(1, t.v) g".into(),
-            "LATERAL generate_series(1, t.v) g is not read: a question reads tables".into(),
-        ),
-        // A star, by itself: once "name each column a question returns".
-        (
-            "SELECT * FROM a.t t".into(),
-            "* is not read: name each column a question returns".into(),
-        ),
-        (
-            format!("SELECT t.*, u.w {join}"),
-            "t.* is not read: name each column a question returns".into(),
+            format!("SELECT a.nothing(t.v) AS c {join}"),
+            "a.nothing(t.v) is not read".into(),
         ),
     ] {
         assert_eq!(refused(&path, &q), words, "{q}");
+    }
+    // Priced alone, as the wrapper prices a scan, a question names each clause and FROM item it
+    // does not read by itself: once "DISTINCT and HAVING", "WITH, LIMIT and FETCH", "a question
+    // reads tables" and "name each column a question returns".
+    let s = fresh(&path);
+    for (q, words) in [
+        ("SELECT DISTINCT t.g FROM a.t t", "DISTINCT is not read"),
+        (
+            "SELECT t.g, count(*) AS c FROM a.t t GROUP BY t.g HAVING count(*) > 1",
+            "HAVING is not read",
+        ),
+        (
+            "SELECT t.id FROM a.t t ORDER BY t.id LIMIT 2",
+            "LIMIT is not read",
+        ),
+        (
+            "SELECT t.id FROM a.t t ORDER BY t.id OFFSET 1",
+            "OFFSET is not read",
+        ),
+        (
+            "SELECT d.id FROM (SELECT t.id FROM a.t t) d",
+            "(SELECT t.id FROM a.t t) d is not read: a question reads tables",
+        ),
+        (
+            "SELECT * FROM a.t t",
+            "* is not read: name each column a question returns",
+        ),
+    ] {
+        let e = s.price(q, None).err().map(|e| e.to_string());
+        assert_eq!(e.as_deref(), Some(words), "{q}");
     }
     // SELECT ALL is no DISTINCT: answered over a join as without it.
     let b = ask(&path, &format!("SELECT ALL t.id {join} ORDER BY t.id"));
@@ -475,17 +453,15 @@ fn a_case_and_a_parameter_on_one_table_are_read_as_a_step_reads_them() {
     ] {
         assert_eq!(ids_with(&path, q, params), want, "{q}");
     }
-    // Over a join, still refused by name.
-    let params = ["4".to_string()];
-    let e = fresh(&path)
-        .ask_with(
-            "SELECT t.id FROM a.t t JOIN a.u u ON u.t_id = t.id WHERE u.w > $1",
-            None,
-            &params,
-        )
-        .unwrap_err()
-        .to_string();
-    assert_eq!(e, "parameters are read only in a question on one table");
+    // Over a join too, once "parameters are read only in a question on one table".
+    assert_eq!(
+        ids_with(
+            &path,
+            "SELECT t.id FROM a.t t JOIN a.u u ON u.t_id = t.id WHERE u.w > $1 ORDER BY t.id",
+            &["4"]
+        ),
+        [Some(1), Some(1), Some(2)]
+    );
 }
 
 #[test]

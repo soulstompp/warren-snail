@@ -210,13 +210,20 @@ impl Deriving<'_> {
         let Some((q, n)) = super::pipeline::column_of(e) else {
             return Derived::none();
         };
-        let mut found = self
-            .columns
-            .iter()
-            .filter(|(cq, cn, _)| *cn == n && (q.is_none() || cq.as_deref() == q.as_deref()));
-        match (found.next(), found.next()) {
-            (Some((_, _, Carried::Named(c))), None) => Derived::of(Strength::Implicit, c),
-            (Some((_, _, Carried::Unsettled)), None) => Derived {
+        let found = super::pipeline::naming(
+            self.columns
+                .iter()
+                .map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+            q.as_deref(),
+            &n,
+        );
+        let carried = match found.as_slice() {
+            [i] => self.columns.get(*i).map(|c| &c.2),
+            _ => None,
+        };
+        match carried {
+            Some(Carried::Named(c)) => Derived::of(Strength::Implicit, c),
+            Some(Carried::Unsettled) => Derived {
                 unsettled: true,
                 ..Derived::none()
             },

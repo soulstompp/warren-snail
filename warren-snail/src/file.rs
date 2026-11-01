@@ -164,6 +164,8 @@ pub(crate) fn holds_catalog(format: u32, catalog: &crate::catalog::Catalog) -> c
         format!("the sequence {}", s.name)
     } else if let Some(k) = catalog.collations.first() {
         format!("the collation {}", k.name)
+    } else if let Some(v) = catalog.views.first() {
+        format!("the view {}", v.name)
     } else {
         return Ok(());
     };

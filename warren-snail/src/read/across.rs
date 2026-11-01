@@ -291,6 +291,7 @@ impl Snails {
         for (i, s) in snails.iter().enumerate() {
             let c = &s.catalog;
             let mut names: Vec<String> = c.sequences.iter().map(|q| q.name.clone()).collect();
+            names.extend(c.views.iter().map(|v| v.name.clone()));
             for t in &c.tables {
                 names.push(t.name.clone());
                 let schema = t.name.rsplit_once('.').map_or("", |(s, _)| s);
@@ -362,6 +363,7 @@ impl Snails {
                 at.push((i, t));
             }
             catalog.sequences.extend(c.sequences.iter().cloned());
+            catalog.views.extend(c.views.iter().cloned());
             for t in &c.types {
                 if !catalog.types.iter().any(|x| x.name == t.name) {
                     catalog.types.push(t.clone());
@@ -689,15 +691,37 @@ impl Snails {
         let (batch, mut round) = match read.as_slice() {
             [i] => self.snails[*i].answer_with(sql, None, params)?,
             _ => {
-                if !params.is_empty() {
-                    return Err(Error::new(
-                        "parameters are read only in a question on one table",
-                    ));
-                }
-                let q: Question = question::parse(&self.catalog, sql)?;
-                let at: Vec<(usize, usize)> = q.sides.iter().map(|s| self.at[s.table]).collect();
                 let refs: Vec<&Snail> = self.snails.iter().collect();
-                join::ask_join_across(&refs, &at, &q)?
+                match question::parse(&self.catalog, sql) {
+                    Ok(q) if params.is_empty() => {
+                        let q: Question = q;
+                        let at: Vec<(usize, usize)> =
+                            q.sides.iter().map(|s| self.at[s.table]).collect();
+                        join::ask_join_across(&refs, &at, &q)?
+                    }
+                    // What the question path does not read, a pipeline over the snails' relations
+                    // reads.
+                    read => {
+                        let sql = &*super::spelled::spelled(sql)?;
+                        let parsed = sqlparser::parser::Parser::parse_sql(
+                            &sqlparser::dialect::PostgreSqlDialect {},
+                            sql,
+                        )?;
+                        let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
+                            return Err(read
+                                .err()
+                                .unwrap_or_else(|| Error::new("a question is one SELECT")));
+                        };
+                        let q = super::spelled::between_written(q);
+                        let q = super::computed(&self.catalog, &q)?.unwrap_or(q);
+                        let across = super::relations::Across {
+                            snails: refs,
+                            at: &self.at,
+                            catalog: &self.catalog,
+                        };
+                        super::relations::answer(&across, &q, params)?
+                    }
+                }
             }
         };
         if self.snails.len() > 1 && round.snails.is_empty() {
@@ -736,6 +760,10 @@ impl Snails {
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
         let mut names = Vec::new();
         if let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() {
+            // A view's tables may lie in any of them.
+            if super::relations::names_a_view(&self.catalog, q) {
+                return Ok((0..self.snails.len()).collect());
+            }
             let mut q = (**q).clone();
             super::each_table(&mut q, &mut |t| {
                 if let sqlparser::ast::TableFactor::Table { name, .. } = t {

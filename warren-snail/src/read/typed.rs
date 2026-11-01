@@ -216,15 +216,18 @@ fn call_args(f: &sqlparser::ast::Function) -> Option<Vec<&Expr>> {
 impl Typing<'_> {
     fn column(&self, e: &Expr) -> Option<ColumnType> {
         let (q, n) = super::pipeline::column_of(e)?;
-        let mut found = self
-            .columns
-            .iter()
-            .filter(|(cq, cn, _)| *cn == n && (q.is_none() || cq.as_deref() == q.as_deref()));
-        let first = found.next()?;
-        if found.next().is_some() {
-            return None;
+        match super::pipeline::naming(
+            self.columns
+                .iter()
+                .map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+            q.as_deref(),
+            &n,
+        )
+        .as_slice()
+        {
+            [i] => self.columns.get(*i)?.2,
+            _ => None,
         }
-        first.2
     }
 
     /// An expression's type, where the snail resolves it, each sub-expression's recorded.
@@ -509,6 +512,11 @@ impl Typing<'_> {
                 if WRITING.contains(&name.as_str()) {
                     for t in &types {
                         written(*t)?;
+                    }
+                }
+                if f.name.0.len() == 1 && f.over.is_none() {
+                    if let Some(t) = chosen(&name, &args, &types)? {
+                        return Ok(Some(t));
                     }
                 }
                 if f.over.is_none() && !f.within_group.is_empty() {
@@ -1316,4 +1324,43 @@ fn type_keyword(f: &sqlparser::ast::Function) -> Option<Error> {
              no function"
         ))
     })
+}
+
+/// The type COALESCE, LEAST, GREATEST and NULLIF take, as PostgreSQL's parser types them: the
+/// first three their arguments' as select_common_type finds it; NULLIF the type of the left side of
+/// the = it compares by, its first argument's, a number promoted to the other's where it is wider in
+/// kind. A quoted literal among them is read in that type, refused here where it reads as none. None
+/// for any other call.
+fn chosen(name: &str, args: &[&Expr], types: &[Option<ColumnType>]) -> Result<Option<ColumnType>> {
+    let ty = match (name, types) {
+        ("coalesce" | "least" | "greatest", _) => common_type(types, &name.to_uppercase())?,
+        ("nullif", [a, b]) => match (*a, *b) {
+            (Some(x), Some(y))
+                if x == y
+                    || (x.is_integer() && y.is_integer())
+                    || (x.is_float() && y.is_float()) =>
+            {
+                x
+            }
+            (Some(x), None) => x,
+            (None, Some(y)) => y,
+            (None, None) => ColumnType::Text(None),
+            (Some(x), Some(y)) => common_type(&[Some(x), Some(y)], "NULLIF").map_err(|_| {
+                Error::new(format!(
+                    "operator does not exist: {} = {}",
+                    arg_name(Some(x)),
+                    arg_name(Some(y))
+                ))
+            })?,
+        },
+        _ => return Ok(None),
+    };
+    for (a, t) in args.iter().zip(types) {
+        if let (None, Expr::Value(v)) = (t, a) {
+            if let SqlValue::SingleQuotedString(s) = &v.value {
+                super::pipeline::part_of(ty, super::pipeline::Value::Text(s.clone()), true)?;
+            }
+        }
+    }
+    Ok(Some(ty))
 }

@@ -302,7 +302,7 @@ fn key_under(v: &Value, under: Option<Casing>) -> Key {
 
 /// A value as a key that groups and partitions: equal values, at any scale, are one key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Key {
+pub(super) enum Key {
     Null,
     Num(i128, u32),
     Text(String),
@@ -318,7 +318,7 @@ enum Key {
     Interval(i128),
 }
 
-fn key(v: &Value) -> Key {
+pub(super) fn key(v: &Value) -> Key {
     match v {
         Value::Null => Key::Null,
         Value::Int(_) | Value::Num(..) => {
@@ -394,17 +394,17 @@ pub struct Table {
 
 /// What a step's expressions see: the columns of the relations its FROM reads, each under its
 /// qualifier, and the parameters.
-struct Frame<'a> {
-    columns: Vec<(Option<String>, String)>,
-    params: &'a [String],
+pub(super) struct Frame<'a> {
+    pub(super) columns: Vec<(Option<String>, String)>,
+    pub(super) params: &'a [String],
     /// The release whose catalog names a reg* value.
-    release: u8,
+    pub(super) release: u8,
     /// How the columns map case, by their names.
-    casings: &'a Casings,
+    pub(super) casings: &'a Casings,
     /// Each expression's type, where the step resolves it.
-    types: &'a super::typed::Types,
+    pub(super) types: &'a super::typed::Types,
     /// The statement's clock, in microseconds since 1970 UTC.
-    now: i64,
+    pub(super) now: i64,
 }
 
 /// How the columns a statement reads and makes map case and order text, where not as the
@@ -443,6 +443,43 @@ impl Casings {
         Casings {
             monetary,
             ..Casings::default()
+        }
+    }
+
+    /// The casings of several tables' columns, each table's collations carried under its name, and
+    /// the collations the DDL makes.
+    pub(super) fn of_tables(
+        tables: &[&crate::catalog::Table],
+        declared: &[crate::catalog::Collation],
+    ) -> Casings {
+        let mut c = Casings {
+            declared: declared.to_vec(),
+            monetary: tables.first().map(|t| t.monetary).unwrap_or_default(),
+            ..Casings::default()
+        };
+        for t in tables {
+            let one = Casings::of_table(t, declared);
+            for (n, k) in one.columns {
+                c.columns.entry(n).or_insert(k);
+            }
+            c.unheld.extend(one.unheld);
+            c.library |= one.library;
+            c.relations.extend(one.relations);
+        }
+        c
+    }
+
+    /// The collation each column of a relation carries, by the relation's name.
+    pub(super) fn relation(&self, name: &str) -> Option<&[(String, super::collate::Carried)]> {
+        self.relations.get(name).map(Vec::as_slice)
+    }
+
+    /// A relation's columns renamed, each keeping the collation it carries.
+    pub(super) fn renamed(&mut self, name: &str, names: &[String]) {
+        if let Some(r) = self.relations.get_mut(name) {
+            for ((n, _), to) in r.iter_mut().zip(names) {
+                *n = to.clone();
+            }
         }
     }
 
@@ -557,6 +594,11 @@ impl Casings {
         self.nodes
             .get(&(e as *const Expr))
             .is_some_and(|(_, input)| input.settled("").is_err())
+    }
+
+    /// Whether a comparison is made under a library collation, or under none its inputs settle.
+    pub(super) fn compared_under_library(&self, e: &Expr) -> bool {
+        !matches!(self.compared(e, "string comparison"), Ok(None))
     }
 
     /// The library collation a comparison is made under, where one is, as `input` settles it.
@@ -696,7 +738,7 @@ impl Casings {
     /// expressions', the relation it makes carrying each item's under the step's name; a key it
     /// sorts, groups or partitions by, or returns once each, refused where two implicit collations
     /// meet in it, as PostgreSQL's parser refuses one. The collation each of its columns carries.
-    fn add_step(
+    pub(super) fn add_step(
         &mut self,
         name: &str,
         p: &Prepared,
@@ -721,7 +763,7 @@ impl Casings {
             carried.push(out.carried(collatable));
             outs.push(out);
         }
-        if let Some(w) = p.selection {
+        for w in p.selection.iter().chain(&p.having).chain(&p.joined) {
             d.derive(w)?;
         }
         for g in &p.grouping {
@@ -796,19 +838,17 @@ impl Frame<'_> {
         }
     }
 
-    fn find(&self, qualifier: Option<&str>, name: &str) -> Result<usize> {
-        let found: Vec<usize> = self
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, (q, n))| n == name && (qualifier.is_none() || q.as_deref() == qualifier))
-            .map(|(i, _)| i)
-            .collect();
+    pub(super) fn find(&self, qualifier: Option<&str>, name: &str) -> Result<usize> {
+        let found = naming(
+            self.columns.iter().map(|(q, n)| (q.as_deref(), n.as_str())),
+            qualifier,
+            name,
+        );
         match found.as_slice() {
             [i] => Ok(*i),
             [] => Err(Error::new(format!("{name} is no column the step reads"))),
             _ => Err(Error::new(format!(
-                "{name} could name more than one column: qualify it"
+                "column reference \"{name}\" is ambiguous"
             ))),
         }
     }
@@ -816,6 +856,54 @@ impl Frame<'_> {
 
 fn ident(i: &sqlparser::ast::Ident) -> String {
     crate::catalog::ident(i)
+}
+
+/// What marks a column's qualifier where a USING or NATURAL join has merged the column away from
+/// a bare name: it answers only to its relation's name. A reference a star is read as names its
+/// column by its place after the mark.
+pub(super) const MERGED: char = '\0';
+
+/// What marks the qualifier of the one column of a function in FROM returning a scalar: a bare
+/// reference to the function's name reads that column, as PostgreSQL reads its whole row.
+pub(super) const SCALAR: char = '\u{1}';
+
+/// A qualifier without its marks: the name of the relation it answers to.
+pub(super) fn unmarked(q: &str) -> &str {
+    q.trim_start_matches([MERGED, SCALAR])
+}
+
+/// The places of the columns of a FROM a reference names: the one a star's reference names by its
+/// place; else each of that name, under the qualifier where the reference has one, a bare name
+/// passing over the columns a USING or NATURAL join merged away; else, for a bare name, the one
+/// column of the function in FROM of that name returning a scalar.
+pub(super) fn naming<'c>(
+    columns: impl Iterator<Item = (Option<&'c str>, &'c str)> + Clone,
+    qualifier: Option<&str>,
+    name: &str,
+) -> Vec<usize> {
+    if let (None, Some(at)) = (qualifier, name.strip_prefix(MERGED)) {
+        return at.parse().map(|i| vec![i]).unwrap_or_default();
+    }
+    let found: Vec<usize> = columns
+        .clone()
+        .enumerate()
+        .filter(|(_, (q, n))| {
+            *n == name
+                && match qualifier {
+                    Some(want) => q.map(unmarked) == Some(want),
+                    None => !q.is_some_and(|q| q.starts_with(MERGED)),
+                }
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if !found.is_empty() || qualifier.is_some() {
+        return found;
+    }
+    columns
+        .enumerate()
+        .filter(|(_, (q, _))| q.and_then(|q| q.strip_prefix(SCALAR)) == Some(name))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// The column an expression names, where it names one.
@@ -1031,6 +1119,21 @@ fn parts_of(e: &Expr) -> Vec<&Expr> {
     }
 }
 
+/// The columns an expression reads, by their qualifier and name, each as often as it is read.
+pub(super) fn columns_read(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    if let Some(c) = column_of(e) {
+        out.push(c);
+        return;
+    }
+    let mut parts = parts_of(e);
+    if parts.is_empty() {
+        parts = super::collate::children(e);
+    }
+    for p in parts {
+        columns_read(p, out);
+    }
+}
+
 /// Whether an expression calls a set-returning function.
 fn holds_set(e: &Expr) -> bool {
     matches!(e, Expr::Function(f) if f.over.is_none() && is_set_returning(&function_name(f)))
@@ -1077,7 +1180,7 @@ fn sets_placed(e: &Expr) -> Result<()> {
 }
 
 /// The values a row's expressions see beyond its columns: each aggregate's and window's, by place.
-struct Computed<'q> {
+pub(super) struct Computed<'q> {
     calls: HashMap<*const Expr, Value>,
     _q: std::marker::PhantomData<&'q ()>,
 }
@@ -1124,7 +1227,7 @@ fn cast_typmod(to: &DataType) -> Result<Option<(u32, i32)>> {
 /// Whether an expression is a quoted literal or a parameter, given as text: of unknown type, which
 /// a cast reads by the target's input and an operator by the type it takes on that side, as
 /// PostgreSQL's parser types each.
-fn quoted(e: &Expr) -> bool {
+pub(super) fn quoted(e: &Expr) -> bool {
     match e {
         Expr::Value(v) => matches!(
             v.value,
@@ -2692,7 +2795,7 @@ pub(super) fn arith(op: &BinaryOperator, a: &Value, b: &Value) -> Result<Value> 
     }?))
 }
 
-fn truth(v: &Value) -> Result<Option<bool>> {
+pub(super) fn truth(v: &Value) -> Result<Option<bool>> {
     match v {
         v if v.is_null() => Ok(None),
         Value::Bool(b) => Ok(Some(*b)),
@@ -2878,7 +2981,7 @@ fn literal_interval() -> ColumnType {
 }
 
 /// Evaluates an expression on one row of a frame, its aggregates' and windows' values computed.
-fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Value> {
+pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Value> {
     if let Some(v) = computed.calls.get(&(e as *const Expr)) {
         return Ok(v.clone());
     }
@@ -3701,6 +3804,11 @@ fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<V
                 );
             }
             let a = args(f)?;
+            if f.name.0.len() == 1 {
+                if let Some(v) = chosen(e, &name, &a, row, frame, computed)? {
+                    return Ok(v);
+                }
+            }
             match (name.as_str(), a.as_slice()) {
                 // Under the collation its argument carries, the database's default where none.
                 ("upper" | "lower", [x]) => {
@@ -3924,7 +4032,7 @@ fn carried_from(
 }
 
 /// Columns by their qualifier and name.
-type Columns = Vec<(Option<String>, String)>;
+pub(super) type Columns = Vec<(Option<String>, String)>;
 
 /// The rows a FROM reads: one relation, or several crossed, each under its alias.
 fn from(
@@ -4391,7 +4499,7 @@ fn windows_whole(
 }
 
 /// The output name PostgreSQL gives an item it is not told.
-fn default_name(e: &Expr) -> String {
+pub(super) fn default_name(e: &Expr) -> String {
     match e {
         Expr::Identifier(i) => ident(i),
         Expr::CompoundIdentifier(p) => ident(p.last().unwrap()),
@@ -5020,9 +5128,13 @@ type Running = HashMap<*const Expr, HashMap<Vec<Key>, Value>>;
 
 /// A SELECT of the pipeline as it is read: what it returns, its windows and aggregates, and how it
 /// groups.
-struct Prepared<'q> {
+pub(super) struct Prepared<'q> {
     from: &'q [TableWithJoins],
     selection: Option<&'q Expr>,
+    /// The condition each group it makes is kept by.
+    having: Option<&'q Expr>,
+    /// The expressions its FROM reads its relations by: each join's ON, each function's call.
+    pub(super) joined: Vec<&'q Expr>,
     order_by: Option<&'q sqlparser::ast::OrderBy>,
     /// The place, in each row it makes, of the value each ORDER BY item sorts by: a column it
     /// returns, or after them each expression of `hidden`, made beside them until they are sorted.
@@ -5040,15 +5152,33 @@ struct Prepared<'q> {
     /// all come.
     whole_windows: bool,
     /// Each expression's type, where the step resolves it, and the type of each column it returns.
-    types: super::typed::Types,
-    returns: Vec<Option<ColumnType>>,
+    pub(super) types: super::typed::Types,
+    pub(super) returns: Vec<Option<ColumnType>>,
     /// The collation each column it returns carries.
-    carried: Vec<super::collate::Carried>,
+    pub(super) carried: Vec<super::collate::Carried>,
     /// The clock its statement reads.
     now: i64,
 }
 
 impl Prepared<'_> {
+    /// The columns its expressions read of its FROM's: its select list's, its WHERE's, its HAVING's,
+    /// its ORDER BY's own and those its FROM reads its relations by.
+    pub(super) fn reads(&self) -> Vec<(Option<String>, String)> {
+        let mut out = Vec::new();
+        for e in self
+            .items
+            .iter()
+            .map(|(e, _)| *e)
+            .chain(self.selection)
+            .chain(self.having)
+            .chain(self.hidden.iter().copied())
+            .chain(self.joined.iter().copied())
+        {
+            columns_read(e, &mut out);
+        }
+        out
+    }
+
     /// The rows its select list makes of one row, each with its ORDER BY's expressions after them:
     /// one, or, where it calls set-returning functions, one for each value of the longest set they
     /// give, a shorter set NULL past its end, and none where every set is empty, as PostgreSQL's
@@ -5069,23 +5199,7 @@ impl Prepared<'_> {
             .calls
             .sets
             .iter()
-            .map(|&c| {
-                let Expr::Function(f) = c else { unreachable!() };
-                let values = args(f)?
-                    .into_iter()
-                    .map(|x| Ok((eval(x, row, frame, &computed)?, quoted(x))))
-                    .collect::<Result<Vec<_>>>()?;
-                // Under the collation its arguments settle; a regular expression's refused where
-                // they settle none.
-                let name = function_name(f);
-                let casing = match super::calls::is_regexp_function(&name) {
-                    true => {
-                        regex_casing(frame, c, &values.iter().map(|(v, _)| v).collect::<Vec<_>>())?
-                    }
-                    false => string_casing(frame, c, &name, &[])?,
-                };
-                super::sets::values(&name, values, frame.type_of(c), casing)
-            })
+            .map(|&c| set_values(c, row, frame, &computed))
             .collect::<Result<Vec<_>>>()?;
         let n = sets.iter().map(Vec::len).max().unwrap_or(0);
         let mut computed = computed;
@@ -5100,6 +5214,137 @@ impl Prepared<'_> {
         }
         Ok(out)
     }
+}
+
+/// COALESCE, LEAST, GREATEST and NULLIF, each in the type the step resolved it to: COALESCE its
+/// first argument not NULL, read in turn and no further; LEAST and GREATEST the least and the
+/// greatest of those not NULL, under the collation their arguments settle; NULLIF its first
+/// argument, NULL where = holds of the two. None for any other call.
+fn chosen(
+    e: &Expr,
+    name: &str,
+    a: &[&Expr],
+    row: &[Value],
+    frame: &Frame,
+    computed: &Computed,
+) -> Result<Option<Value>> {
+    let ev = |x: &Expr| eval(x, row, frame, computed);
+    let ty = frame.type_of(e);
+    let typed = |v: Value, x: &Expr| -> Result<Value> {
+        match ty {
+            Some(t) if !v.is_null() => Ok(part_value(t, &part_of(t, v, quoted(x))?)),
+            _ => Ok(v),
+        }
+    };
+    Ok(Some(match (name, a) {
+        ("coalesce", _) => {
+            for &x in a {
+                let v = ev(x)?;
+                if !v.is_null() {
+                    return Ok(Some(typed(v, x)?));
+                }
+            }
+            Value::Null
+        }
+        ("least" | "greatest", _) => {
+            let mut best: Option<Value> = None;
+            for &x in a {
+                let v = ev(x)?;
+                if v.is_null() {
+                    continue;
+                }
+                let v = typed(v, x)?;
+                best = Some(match best {
+                    None => v,
+                    Some(b) => {
+                        let under = frame.casings.compared(e, "string comparison")?;
+                        let wanted = match name {
+                            "least" => Ordering::Less,
+                            _ => Ordering::Greater,
+                        };
+                        match compare_under(under, &v, &b)? == Some(wanted) {
+                            true => v,
+                            false => b,
+                        }
+                    }
+                });
+            }
+            best.unwrap_or(Value::Null)
+        }
+        ("nullif", [x, y]) => {
+            let v = ev(x)?;
+            if v.is_null() {
+                return Ok(Some(Value::Null));
+            }
+            let v = typed(v, x)?;
+            let w = ev(y)?;
+            if w.is_null() {
+                return Ok(Some(v));
+            }
+            let w = match quoted(y) {
+                true => typed(w, y)?,
+                false => w,
+            };
+            let under = frame.casings.compared(e, "string comparison")?;
+            match compare_under(under, &v, &w)? == Some(Ordering::Equal) {
+                true => Value::Null,
+                false => v,
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// The values a set-returning call gives over one row, under the collation its arguments settle; a
+/// regular expression's refused where they settle none.
+fn set_values(c: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Vec<Value>> {
+    let Expr::Function(f) = c else {
+        return Err(Error::new(format!("{c} is not read")));
+    };
+    let values = args(f)?
+        .into_iter()
+        .map(|x| Ok((eval(x, row, frame, computed)?, quoted(x))))
+        .collect::<Result<Vec<_>>>()?;
+    let name = function_name(f);
+    let casing = match super::calls::is_regexp_function(&name) {
+        true => regex_casing(frame, c, &values.iter().map(|(v, _)| v).collect::<Vec<_>>())?,
+        false => string_casing(frame, c, &name, &[])?,
+    };
+    super::sets::values(&name, values, frame.type_of(c), casing)
+}
+
+/// The values a function in FROM gives for one row of the relations before it.
+pub(super) fn call_rows(c: &Expr, row: &[Value], frame: &Frame) -> Result<Vec<Value>> {
+    set_values(c, row, frame, &computed_none())
+}
+
+/// A record's fields, each a value of its own type; NULLs where the record is one.
+pub(super) fn record_values(v: &Value, n: usize) -> Result<Vec<Value>> {
+    use crate::composed::{Composed, Item};
+    if let Value::Composed(ColumnType::Composed(r), c) = v {
+        if let (Composed::Record { fields, .. }, Item::Record(items)) = (r.def(), &c.item) {
+            return Ok(fields
+                .iter()
+                .zip(items)
+                .map(|(f, i)| part_value(f.ty, i))
+                .collect());
+        }
+        if c.item.is_null() {
+            return Ok(vec![Value::Null; n]);
+        }
+    }
+    Err(Error::new(format!(
+        "{} is no record of {n} columns",
+        kind_name(v)
+    )))
+}
+
+/// Whether two values are equal, as = compares them; unknown where either is NULL.
+pub(super) fn equal(a: &Value, b: &Value) -> Result<Option<bool>> {
+    if a.is_null() || b.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(compare(a, b)? == Some(Ordering::Equal)))
 }
 
 /// The position in the select list a GROUP BY or ORDER BY item names, counted from 0, as
@@ -5208,11 +5453,16 @@ fn resolved<'c>(
     columns: &'c [super::typed::TypedColumn],
 ) -> Option<&'c super::typed::TypedColumn> {
     let (q, n) = column_of(e)?;
-    let mut found = columns
-        .iter()
-        .filter(|(cq, cn, _)| *cn == n && (q.is_none() || cq.as_deref() == q.as_deref()));
-    match (found.next(), found.next()) {
-        (Some(c), None) => Some(c),
+    match naming(
+        columns
+            .iter()
+            .map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+        q.as_deref(),
+        &n,
+    )
+    .as_slice()
+    {
+        [i] => columns.get(*i),
         _ => None,
     }
 }
@@ -5243,7 +5493,7 @@ fn ungrouped(
         }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             let (q, n, _) = resolved(e, columns)?;
-            let q = q.clone().unwrap_or_default();
+            let q = q.as_deref().map_or("", unmarked).to_string();
             (!decided.contains(&q.as_str())).then(|| (q, n.clone()))
         }
         _ => {
@@ -5468,13 +5718,15 @@ fn reads_a_column(e: &Expr) -> bool {
     parts.into_iter().any(reads_a_column)
 }
 
-/// A step read before any row: its parts, each expression typed over the columns its FROM reads.
-fn prepare<'q>(
+/// A step read before any row: its parts, each expression typed over the columns its FROM reads,
+/// the expressions its FROM reads its relations by (`joined`) among them.
+pub(super) fn prepare<'q>(
     q: &'q Query,
     columns: &[super::typed::TypedColumn],
     keyed: &[(String, Vec<String>)],
     release: u8,
     now: i64,
+    joined: &[&'q Expr],
 ) -> Result<Prepared<'q>> {
     let s = match q.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -5482,9 +5734,6 @@ fn prepare<'q>(
     };
     if matches!(s.distinct, Some(sqlparser::ast::Distinct::On(_))) {
         return Err(Error::new("DISTINCT ON is not read in a step"));
-    }
-    if s.having.is_some() {
-        return Err(Error::new("HAVING is not read in a step"));
     }
     let limit = Limit::of(q)?;
     let items: Vec<(&Expr, String)> = s
@@ -5527,6 +5776,20 @@ fn prepare<'q>(
             "set-returning functions are not allowed in WHERE",
         ));
     }
+    // HAVING keeps the groups its condition holds of, its aggregates folded with the others'.
+    let having = s.having.as_ref();
+    if let Some(h) = having {
+        if holds_set(h) {
+            return Err(Error::new(
+                "set-returning functions are not allowed in HAVING",
+            ));
+        }
+        let windows = calls.windows.len();
+        find_calls(h, &mut calls);
+        if calls.windows.len() > windows {
+            return Err(Error::new("window functions are not allowed in HAVING"));
+        }
+    }
     let grouping = match &s.group_by {
         GroupByExpr::Expressions(g, m) if m.is_empty() => g.as_slice(),
         _ => return Err(Error::new("GROUP BY ALL is not read")),
@@ -5540,7 +5803,7 @@ fn prepare<'q>(
             "a set-returning function in GROUP BY is not read",
         ));
     }
-    let grouped = !grouping.is_empty() || !calls.aggregates.is_empty();
+    let grouped = !grouping.is_empty() || !calls.aggregates.is_empty() || having.is_some();
     let calls_windows_whole = calls.windows.iter().any(|w| !streams(w));
     if grouped && !calls.windows.is_empty() {
         return Err(Error::new("a window over groups is not read"));
@@ -5555,14 +5818,19 @@ fn prepare<'q>(
                     && key.iter().all(|k| {
                         grouping.iter().any(|g| {
                             resolved(g, columns).is_some_and(|(cq, cn, _)| {
-                                cq.as_deref() == Some(q.as_str()) && cn == k
+                                cq.as_deref().map(unmarked) == Some(q.as_str()) && cn == k
                             })
                         })
                     })
             })
             .map(|(q, _)| q.as_str())
             .collect();
-        for e in items.iter().map(|(e, _)| *e).chain(hidden.iter().copied()) {
+        for e in items
+            .iter()
+            .map(|(e, _)| *e)
+            .chain(hidden.iter().copied())
+            .chain(having)
+        {
             if let Some((q, n)) = ungrouped(e, &grouping, columns, &decided) {
                 return Err(Error::new(format!(
                     "column \"{q}.{n}\" must appear in the GROUP BY clause or be used in an \
@@ -5589,12 +5857,20 @@ fn prepare<'q>(
     for e in &hidden {
         typing.type_of(e)?;
     }
+    if let Some(h) = having {
+        typing.type_of(h)?;
+    }
+    for e in joined {
+        typing.type_of(e)?;
+    }
     if let Some(l) = &limit {
         l.check(&mut typing)?;
     }
     Ok(Prepared {
         from: &s.from,
         selection: s.selection.as_ref(),
+        having,
+        joined: joined.to_vec(),
         order_by: q.order_by.as_ref(),
         sorted,
         hidden,
@@ -5634,7 +5910,7 @@ pub(crate) fn eval_on(
 }
 
 /// The values of a row's aggregates and windows: none.
-fn computed_none<'q>() -> Computed<'q> {
+pub(super) fn computed_none<'q>() -> Computed<'q> {
     Computed {
         calls: HashMap::new(),
         _q: std::marker::PhantomData,
@@ -5643,7 +5919,7 @@ fn computed_none<'q>() -> Computed<'q> {
 
 /// One SELECT read over rows given a chunk at a time, in the order: its windows' running folds and
 /// its groups kept from chunk to chunk. A step that neither groups nor sorts hands each chunk on.
-struct StepRun<'q> {
+pub(super) struct StepRun<'q> {
     p: Prepared<'q>,
     running: Running,
     at: HashMap<Vec<Key>, usize>,
@@ -5661,7 +5937,7 @@ struct StepRun<'q> {
 }
 
 impl<'q> StepRun<'q> {
-    fn new(p: Prepared<'q>) -> StepRun<'q> {
+    pub(super) fn new(p: Prepared<'q>) -> StepRun<'q> {
         StepRun {
             p,
             running: HashMap::new(),
@@ -5699,7 +5975,7 @@ impl<'q> StepRun<'q> {
 
     /// Reads one chunk of the rows its FROM gives: the rows the step returns for it, unless the step
     /// groups or sorts, which hold them until `finish`.
-    fn feed(
+    pub(super) fn feed(
         &mut self,
         mut rel: Relation,
         columns: Columns,
@@ -5841,7 +6117,12 @@ impl<'q> StepRun<'q> {
     }
 
     /// The rows a step that groups or sorts returns, once every chunk is read.
-    fn finish(mut self, params: &[String], release: u8, casings: &Casings) -> Result<Relation> {
+    pub(super) fn finish(
+        mut self,
+        params: &[String],
+        release: u8,
+        casings: &Casings,
+    ) -> Result<Relation> {
         let mut out = Relation {
             names: self.names(),
             rows: std::mem::take(&mut self.rows),
@@ -5887,6 +6168,11 @@ impl<'q> StepRun<'q> {
                         .collect::<Result<_>>()?,
                     _q: std::marker::PhantomData,
                 };
+                if let Some(h) = self.p.having {
+                    if truth(&eval(h, first, &frame, &computed)?)? != Some(true) {
+                        continue;
+                    }
+                }
                 out.rows.extend(self.p.project(first, &frame, computed)?);
             }
         }
@@ -6215,7 +6501,7 @@ impl<'q> Stream<'q> {
                     .collect(),
                 _ => Vec::new(),
             };
-            let mut p = prepare(query, &columns, &keyed, release, now)?;
+            let mut p = prepare(query, &columns, &keyed, release, now, &[])?;
             typed.insert(
                 name.clone(),
                 (
@@ -6417,19 +6703,61 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
     s.finish()
 }
 
-/// Whether a question on one table the question path does not read is handed to the pipeline: it
-/// returns each row once, or some of its rows (LIMIT, OFFSET, FETCH), or calls a function, an aggregate over each value once, filtered or
-/// ordered, or an operator on numbers or on a document, the question path does not read, or reads a
-/// CASE or a parameter.
+/// Whether a question the question path does not read is handed to the pipeline: it reads no
+/// table; it returns each row once, or some of its rows (LIMIT, OFFSET, FETCH), or keeps the groups
+/// HAVING holds of; it returns a star, or reads a relation other than a table, a join by USING or
+/// NATURAL, or a RIGHT or FULL JOIN after the first join; it groups by a name its select list gives
+/// or orders by what it does not return; or it calls a function, an aggregate of a column's values
+/// counted, or over each value once, filtered or ordered, or an operator on numbers or on a document,
+/// the question path does not read, or reads a CASE or a parameter.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
     };
-    if q.with.is_some() || s.from.len() != 1 || !s.from[0].joins.is_empty() {
+    if q.with.is_some() {
         return false;
     }
-    if s.distinct.is_some() || q.limit_clause.is_some() || q.fetch.is_some() {
+    if s.from.is_empty()
+        || s.distinct.is_some()
+        || q.limit_clause.is_some()
+        || q.fetch.is_some()
+        || s.having.is_some()
+        || s.projection.iter().any(|i| {
+            matches!(
+                i,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            )
+        })
+    {
         return true;
+    }
+    for (n, item) in s.from.iter().enumerate() {
+        if !matches!(item.relation, TableFactor::Table { args: None, .. }) {
+            return true;
+        }
+        for (k, j) in item.joins.iter().enumerate() {
+            if !matches!(j.relation, TableFactor::Table { args: None, .. }) {
+                return true;
+            }
+            let (constraint, keeps_left) = match &j.join_operator {
+                JoinOperator::Join(c)
+                | JoinOperator::Inner(c)
+                | JoinOperator::Left(c)
+                | JoinOperator::LeftOuter(c)
+                | JoinOperator::CrossJoin(c) => (c, false),
+                JoinOperator::Right(c)
+                | JoinOperator::RightOuter(c)
+                | JoinOperator::FullOuter(c) => (c, true),
+                _ => return false,
+            };
+            if matches!(
+                constraint,
+                sqlparser::ast::JoinConstraint::Using(_) | sqlparser::ast::JoinConstraint::Natural
+            ) || keeps_left && (n > 0 || k > 0)
+            {
+                return true;
+            }
+        }
     }
     let mut exprs: Vec<&Expr> = s
         .projection
@@ -6439,11 +6767,38 @@ pub fn hands_over(q: &Query) -> bool {
             _ => None,
         })
         .collect();
+    let returned = exprs.clone();
     exprs.extend(s.selection.iter());
     if let GroupByExpr::Expressions(g, _) = &s.group_by {
+        // A GROUP BY item naming a column the select list names.
+        let aliased = |e: &Expr| {
+            matches!(e, Expr::Identifier(i) if s.projection.iter().any(|p| matches!(p,
+                SelectItem::ExprWithAlias { alias, .. } if ident(alias) == ident(i))))
+        };
+        if g.iter().any(aliased) {
+            return true;
+        }
         exprs.extend(g.iter());
     }
     if let Some(OrderByKind::Expressions(o)) = q.order_by.as_ref().map(|o| &o.kind) {
+        // An ORDER BY item neither a place, nor a name the select list gives, nor an item of it.
+        let named: Vec<String> = s
+            .projection
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::ExprWithAlias { alias, .. } => Some(ident(alias)),
+                SelectItem::UnnamedExpr(e) => Some(default_name(e)),
+                _ => None,
+            })
+            .collect();
+        let unreturned = o.iter().any(|x| {
+            !matches!(&x.expr, Expr::Value(_))
+                && !returned.contains(&&x.expr)
+                && !matches!(&x.expr, Expr::Identifier(i) if named.contains(&ident(i)))
+        });
+        if unreturned {
+            return true;
+        }
         exprs.extend(o.iter().map(|x| &x.expr));
     }
     exprs.into_iter().any(calls_beyond_the_question)
@@ -6456,10 +6811,8 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => {
             let own = f.name.0.len() > 1
-                || matches!(
-                    function_name(f).as_str(),
-                    "count" | "sum" | "min" | "max" | "avg"
-                );
+                || matches!(function_name(f).as_str(), "sum" | "min" | "max" | "avg")
+                || function_name(f) == "count" && is_count_star(f);
             // An aggregate of its own but over each value once, filtered or ordered, is not.
             let plain = f.filter.is_none()
                 && f.within_group.is_empty()

@@ -714,7 +714,6 @@ fn a_join_keeps_each_side_to_the_keys_the_other_holds() {
     // What a join does not read is refused with its reason.
     for (q, why) in [
         ("SELECT count(*) FROM weather.readings r JOIN weather.stations s ON s.name = r.observed_at", "through a cast"),
-        ("SELECT count(*) FROM weather.readings r LEFT JOIN weather.stations s USING (network_id)", "USING"),
         ("SELECT network_id FROM weather.readings r JOIN weather.stations s ON s.network_id = r.network_id", "qualify it"),
         ("SELECT count(*) FROM weather.readings r JOIN weather.stations s ON r.station_no = 3", "joined on no key"),
     ] {

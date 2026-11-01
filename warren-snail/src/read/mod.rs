@@ -25,6 +25,7 @@ mod point;
 mod prefix;
 mod question;
 mod ranges;
+mod relations;
 mod rest;
 mod sets;
 mod spelled;
@@ -45,6 +46,29 @@ pub use together::{answer_together, at_one_moment, price_together, Priced, Table
 /// An answer's rows as values, as a pipeline reads them.
 pub fn pipeline_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>> {
     Ok(pipeline::relation_of(batch)?.rows)
+}
+
+/// The names of the columns a view's question returns, read over the catalog as PostgreSQL's
+/// parser reads it as the view is made: no row read.
+pub(crate) fn view_columns(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Vec<String>> {
+    relations::checked(catalog, q)
+}
+
+impl relations::Reads for Snail {
+    fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    fn read(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)> {
+        match q.sides.len() {
+            1 => self.ask_one(q, order),
+            _ => self.ask_join(q),
+        }
+    }
+
+    fn snails(&self) -> usize {
+        1
+    }
 }
 pub use question::{instant, truth};
 
@@ -1087,8 +1111,12 @@ impl Snail {
                 }
                 return self.ask_pipeline(q, params);
             }
-            // What the question path does not read, a pipeline reads.
-            if pipeline::hands_over(q) && question::parse(&self.catalog, sql).is_err() {
+            // What the question path does not read, a pipeline reads: a view, and parameters, among
+            // them.
+            if relations::names_a_view(&self.catalog, q)
+                || !params.is_empty()
+                || pipeline::hands_over(q) && question::parse(&self.catalog, sql).is_err()
+            {
                 if order.is_some() {
                     return Err(Error::new("a pipeline reads its table along its own order"));
                 }
@@ -1108,13 +1136,17 @@ impl Snail {
         }
     }
 
-    /// A question read as a pipeline: its one table read whole along its own order, then its steps.
+    /// A question read as a pipeline: its one table read whole along its own order, then its steps;
+    /// one over several relations, each step's FROM met as one.
     fn ask_pipeline(
         &self,
         q: &sqlparser::ast::Query,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
         let q = &spelled::between_written(q);
+        if relations::several(&self.catalog, q) {
+            return relations::answer(self, q, params);
+        }
         let name = pipeline::table_named(q)?;
         let table = self
             .catalog

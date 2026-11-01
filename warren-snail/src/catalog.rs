@@ -1779,6 +1779,15 @@ pub fn library_spec(name: &str, declared: &[Collation]) -> Option<crate::collati
     Some(Spec::libc(&l, &l))
 }
 
+/// A view: its name, the names its column list gives its columns, and its question as written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct View {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub query: String,
+}
+
 /// A function written in SQL whose body is one expression over its arguments.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -1800,6 +1809,8 @@ pub struct Catalog {
     pub domains: Vec<Domain>,
     pub sequences: Vec<Sequence>,
     pub collations: Vec<Collation>,
+    /// The views the DDL creates, each read as a step of the question that names it.
+    pub views: Vec<View>,
     /// The PostgreSQL release the file's OIDs came from, whose catalog names its reg* values.
     pub release: u8,
     /// The lc_monetary the file's money was written under, which every money value a statement
@@ -2630,6 +2641,15 @@ impl Catalog {
 
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// A view by its name, or the last part of it.
+    pub fn view(&self, name: &str) -> Option<&View> {
+        self.views.iter().find(|v| v.name == name).or_else(|| {
+            self.views
+                .iter()
+                .find(|v| v.name.rsplit('.').next() == Some(name))
+        })
     }
 
     /// Whether a schema of that name is the database's own, or one an object of the file names.

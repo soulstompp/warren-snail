@@ -132,7 +132,7 @@ pub enum Item {
     Avg(Col),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Select {
     /// Rows, as they are.
@@ -454,7 +454,7 @@ pub enum Test {
 
 /// A table an outer join may leave NULL, and its ON: it meets the tables before it on `meets`, each
 /// written from its own column, and a pair of rows joins only where `tests` hold too.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Outer {
     pub side: usize,
@@ -462,7 +462,7 @@ pub struct Outer {
     pub tests: Vec<Test>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Question {
     pub sides: Vec<Side>,
