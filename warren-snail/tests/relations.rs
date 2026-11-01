@@ -142,6 +142,12 @@ fn relations_a_from_names_meet_by_their_on() {
         &format!("{steps} SELECT a.id, b.w FROM a JOIN b ON b.t_id = a.id ORDER BY 1, 2"),
         &["1,5", "1,7", "4,-"],
     );
+    // The = written either way round.
+    same(
+        &path,
+        &format!("{steps} SELECT a.id, b.w FROM a JOIN b ON a.id = b.t_id ORDER BY 1, 2"),
+        &["1,5", "1,7", "4,-"],
+    );
     same(
         &path,
         &format!("{steps} SELECT a.id, b.w FROM a LEFT JOIN b ON b.t_id = a.id ORDER BY 1, 2"),

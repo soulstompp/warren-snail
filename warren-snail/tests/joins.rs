@@ -893,11 +893,12 @@ fn a_join_s_forms_past_the_question_path_are_read_by_the_pipeline() {
         })
         .count();
     same(&mut snail, q, vec![vec![s(n)]]);
-    // Its words, where PostgreSQL refuses: a FULL JOIN on nothing it meets the rows by.
+    // Its words, where PostgreSQL refuses: a FULL JOIN on nothing it meets the rows by. Met with the
+    // themes, the fewest rows, so that a join read in place of the refusal answers at once.
     let e = snail
         .ask(
             "SELECT count(*) FROM j.sets s JOIN j.themes t ON t.theme_id = s.theme_id \
-             FULL JOIN j.owned o ON o.set_num < s.set_num",
+             FULL JOIN j.themes u ON u.theme_id < s.theme_id",
             None,
         )
         .unwrap_err()
