@@ -1096,6 +1096,22 @@ pub(super) fn aggregates(s: &sqlparser::ast::Select) -> bool {
     !calls.aggregates.is_empty()
 }
 
+/// Whether an expression calls an aggregate, a window function or a set-returning function, as a
+/// step reads its calls.
+pub(super) fn calls_in(e: &Expr) -> (bool, bool, bool) {
+    let mut c = Calls {
+        aggregates: Vec::new(),
+        windows: Vec::new(),
+        sets: Vec::new(),
+    };
+    find_calls(e, &mut c);
+    (
+        !c.aggregates.is_empty(),
+        !c.windows.is_empty(),
+        !c.sets.is_empty(),
+    )
+}
+
 fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
     match e {
         Expr::Function(f) => {

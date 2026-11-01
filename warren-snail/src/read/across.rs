@@ -99,46 +99,43 @@ impl Group {
     /// several marks it beside the file the walk stands in.
     pub(crate) fn ring(&self, me: usize, b: u64) -> Result<bool> {
         let mut reached = Vec::new();
-        let mut at = (me, b);
+        let mut todo = vec![(me, b)];
         let mut seen = std::collections::BTreeSet::new();
-        loop {
-            let (f, byte) = at;
-            let Some(holder) = lock::holder(&self.seen(&reached, f).file, byte)? else {
-                return Ok(false);
-            };
-            if f < self.files.len() && holder == self.slot {
-                return Ok(true);
-            }
-            let of = lock::writer_of(&self.seen(&reached, f).file, holder)?;
-            let who = match of {
-                Some(id) => (Some(id), (0, 0), 0),
-                None => (None, self.seen(&reached, f).at, holder),
-            };
-            if !seen.insert(who) {
-                return Ok(false);
-            }
-            // A writer of one snail waits only in its file; a writer of several, the same slot in
-            // each of their files, waits in this one or in one it marks beside it here.
-            let mut next = lock::awaited(&self.seen(&reached, f).file, holder)?.map(|a| (f, a));
-            if let (None, Some(id)) = (next, of) {
-                for path in lock::beside(&self.seen(&reached, f).file, holder)? {
-                    let Some(g) = self.reach(&mut reached, &path) else {
-                        continue;
-                    };
-                    let file = &self.seen(&reached, g).file;
-                    if lock::writer_of(file, holder)? == Some(id) {
-                        if let Some(a) = lock::awaited(file, holder)? {
-                            next = Some((g, a));
-                            break;
+        // A byte held shared has a holder for each writer sharing it, and the walk follows each.
+        while let Some((f, byte)) = todo.pop() {
+            for holder in lock::holders(&self.seen(&reached, f).file, byte)? {
+                if f < self.files.len() && holder == self.slot {
+                    return Ok(true);
+                }
+                let of = lock::writer_of(&self.seen(&reached, f).file, holder)?;
+                let who = match of {
+                    Some(id) => (Some(id), (0, 0), 0),
+                    None => (None, self.seen(&reached, f).at, holder),
+                };
+                if !seen.insert(who) {
+                    continue;
+                }
+                // A writer of one snail waits only in its file; a writer of several, the same slot
+                // in each of their files, waits in this one or in one it marks beside it here.
+                let mut next = lock::awaited(&self.seen(&reached, f).file, holder)?.map(|a| (f, a));
+                if let (None, Some(id)) = (next, of) {
+                    for path in lock::beside(&self.seen(&reached, f).file, holder)? {
+                        let Some(g) = self.reach(&mut reached, &path) else {
+                            continue;
+                        };
+                        let file = &self.seen(&reached, g).file;
+                        if lock::writer_of(file, holder)? == Some(id) {
+                            if let Some(a) = lock::awaited(file, holder)? {
+                                next = Some((g, a));
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            match next {
-                Some(n) => at = n,
-                None => return Ok(false),
+                todo.extend(next);
             }
         }
+        Ok(false)
     }
 }
 
@@ -882,6 +879,9 @@ impl Snails {
                 "a table is declared on its own snail: open it alone to write",
             )),
             Statement::Setting { .. } => self.snails[0].execute(sql),
+            Statement::Question { .. } => Err(Error::new(
+                "a SELECT across snails is a question: ask it",
+            )),
             // Each snail holds the transaction's level, and refuses a change after its first read.
             Statement::Isolation { .. } => {
                 let mut done = Done::default();

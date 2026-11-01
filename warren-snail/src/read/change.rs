@@ -57,6 +57,8 @@ pub struct Done {
     pub orders: u64,
     /// Of the pages written, those written into pages freed before.
     pub pages_reused: u64,
+    /// A question's answer.
+    pub answer: Option<RecordBatch>,
 }
 
 /// How a writer takes a block's lock: waiting while another writer has it, as long as it takes,
@@ -406,6 +408,60 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
     })
 }
 
+/// The type of each column of a question's answer, as the snail answers a column of that type;
+/// refused where one that `fills` names, each a column of table `ti` and the answer's column that
+/// fills it, is not assigned to its column by PostgreSQL's assignment casts. They are checked
+/// before any row is read, as PostgreSQL checks them: a column of the answer holding no value,
+/// every column of an answer of no rows, is given no type by its values, and takes the type its
+/// question gives it, or where none is known fills only NULLs.
+fn assigned_types(
+    catalog: &Catalog,
+    question: &str,
+    batch: &RecordBatch,
+    ti: usize,
+    fills: &[(usize, usize)],
+) -> Result<Vec<ColumnType>> {
+    let types: Vec<ColumnType> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            match crate::composed::field_composed(f)
+                .or_else(|| crate::scalars::field_scalar(f))
+                .or_else(|| crate::strings::field_string(f))
+            {
+                Some(ty) => Ok(ty),
+                None if crate::numeric::is_numeric_field(f)
+                    && matches!(f.data_type(), arrow::datatypes::DataType::Utf8) =>
+                {
+                    Ok(ColumnType::NumericText(None))
+                }
+                None => answer_type(f.data_type()),
+            }
+        })
+        .collect::<Result<_>>()?;
+    let stated = stated_types(catalog, question);
+    let t = &catalog.tables[ti];
+    for &(c, i) in fills {
+        let col = &t.columns[c];
+        let typed = batch.column(i).null_count() < batch.num_rows();
+        let from = if typed {
+            Some(types[i])
+        } else {
+            stated.get(i).copied().flatten()
+        };
+        if let Some(from) = from.filter(|&from| !assignable(from, col.ty)) {
+            return Err(Error::new(format!(
+                "column \"{}\" is of type {} but expression is of type {}",
+                col.name,
+                col.ty.pg_name(),
+                from.pg_name().split('(').next().unwrap_or_default()
+            )));
+        }
+    }
+    Ok(types)
+}
+
 /// Rows of a table's stored columns widened to all its columns, a virtual one NULL.
 pub(super) fn widen(table: &Table, rows: Vec<Row>) -> Vec<Row> {
     if !table.columns.iter().any(|c| c.is_virtual()) {
@@ -626,6 +682,13 @@ impl Snail {
     /// statement commits; inside one, its pages wait for the COMMIT, and its rows are what the
     /// transaction's later statements read.
     pub fn execute(&mut self, sql: &str) -> Result<Done> {
+        self.execute_with(sql, &[])
+    }
+
+    /// Runs one statement with its parameters, `$1` and on, given as text, each read as a quoted
+    /// literal is, by its context. A question among the statements is answered as `ask_with`
+    /// answers it, its answer in what it did.
+    pub fn execute_with(&mut self, sql: &str, params: &[String]) -> Result<Done> {
         if self.writer.is_none() {
             return Err(Error::new(
                 "this snail was opened to read; open it to write",
@@ -640,7 +703,15 @@ impl Snail {
         }
         let _handed = super::handed::holding(&self.functions);
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
-        let st = statement::parse(&self.catalog, sql)?;
+        let written_out;
+        let text = match params.is_empty() {
+            true => sql,
+            false => {
+                written_out = statement::with_params(sql, params)?;
+                written_out.as_str()
+            }
+        };
+        let st = statement::parse(&self.catalog, text)?;
         // A transaction one of whose statements failed takes no statement but its end, which rolls
         // it back, as PostgreSQL does.
         if self.aborted {
@@ -658,6 +729,9 @@ impl Snail {
                 _ => Err(Error::new(ABORTED)),
             };
         }
+        if let Statement::Question { .. } = st {
+            return self.answered(sql, params);
+        }
         let writes = !matches!(
             st,
             Statement::Begin
@@ -669,8 +743,11 @@ impl Snail {
         // transaction's own changes in place (PostgreSQL's READ COMMITTED).
         if self.begun.is_none() && self.rounds > 0 {
             self.renew()?;
-        } else if self.begun.is_some() && writes {
+        } else if self.begun.is_some() && writes && !self.held {
             self.renew_in_transaction()?;
+            // At REPEATABLE READ, the generation the first read takes is the transaction's.
+            self.held = self.levels.repeatable(true)
+                && !matches!(st, Statement::Setting { .. } | Statement::Constraints { .. });
         }
         self.rounds += 1;
         let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);
@@ -777,8 +854,13 @@ impl Snail {
                             // runs again on the newest root, kept to the rows it found, each in its
                             // newest version and still meeting its conditions, as PostgreSQL checks
                             // a row changed meanwhile again. The blocks it locked stay locked.
+                            // At REPEATABLE READ it finds its rows again on the newest root too, read
+                            // beside the generation the transaction holds, and is refused.
                             self.back_to(&mark);
-                            if self.begun.is_some() {
+                            if self.held {
+                                let newest = self.reader.peek_root()?;
+                                self.in_transaction_on(newest)?;
+                            } else if self.begun.is_some() {
                                 self.renew_in_transaction()?;
                             } else {
                                 self.renew()?;
@@ -798,12 +880,43 @@ impl Snail {
             *any |= changed;
         } else if changed {
             self.commit()?;
+        } else {
+            // A statement alone, or a transaction's end, that wrote nothing lets go of what it
+            // locked.
+            self.let_go_blocks()?;
         }
         done.generation = self.root.generation;
         done.pages_read = self.reader.pages_read() - read0;
         done.pages_written = self.written() - written0;
         done.pages_reused = self.reused - reused0;
         Ok(done)
+    }
+
+    /// A question among a writer's statements, answered as `ask_with` answers it; in a
+    /// transaction, one that fails fails the transaction.
+    fn answered(&mut self, sql: &str, params: &[String]) -> Result<Done> {
+        let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);
+        let question = sql.trim().trim_end_matches(';').trim_end();
+        let batch = match self.ask_with(question, None, params) {
+            Ok((batch, _)) => batch,
+            Err(e) => {
+                if self.begun.is_some() && !self.aborted {
+                    self.abandon()?;
+                    self.aborted = true;
+                }
+                return Err(e);
+            }
+        };
+        Ok(Done {
+            statement: "SELECT",
+            rows: batch.num_rows() as u64,
+            generation: self.root.generation,
+            pages_read: self.reader.pages_read() - read0,
+            pages_written: self.written() - written0,
+            pages_reused: self.reused - reused0,
+            answer: Some(batch),
+            ..Default::default()
+        })
     }
 
     /// Marks the snail a replica of `source`, or clears the mark with `None`: a commit of its own,
@@ -916,52 +1029,16 @@ impl Snail {
                     (Source::Filled(rows), None) => self.filled(table, rows)?,
                     (Source::Select { question, fill }, None) => {
                         let (batch, _) = self.answer(&question, None)?;
-                        let types: Vec<ColumnType> = batch
-                            .schema()
-                            .fields()
+                        let fills: Vec<(usize, usize)> = fill
                             .iter()
-                            .map(|f| {
-                                match crate::composed::field_composed(f)
-                                    .or_else(|| crate::scalars::field_scalar(f))
-                                    .or_else(|| crate::strings::field_string(f))
-                                {
-                                    Some(ty) => Ok(ty),
-                                    None if crate::numeric::is_numeric_field(f)
-                                        && matches!(
-                                            f.data_type(),
-                                            arrow::datatypes::DataType::Utf8
-                                        ) =>
-                                    {
-                                        Ok(ColumnType::NumericText(None))
-                                    }
-                                    None => answer_type(f.data_type()),
-                                }
+                            .enumerate()
+                            .filter_map(|(c, f)| match f {
+                                Fill::Answer(i) => Some((c, *i)),
+                                _ => None,
                             })
-                            .collect::<Result<_>>()?;
-                        // Each column the answer fills takes its value by PostgreSQL's assignment
-                        // casts, checked before any row is read, as PostgreSQL checks them. A column
-                        // of the answer holding no value, every column of an answer of no rows, is
-                        // given no type by its values: it takes the type its question gives it, and
-                        // where none is known fills only NULLs.
-                        let stated = stated_types(&self.catalog, &question);
+                            .collect();
+                        let types = assigned_types(&self.catalog, &question, &batch, table, &fills)?;
                         let t = &self.catalog.tables[table];
-                        for (col, f) in t.columns.iter().zip(&fill) {
-                            let Fill::Answer(i) = f else { continue };
-                            let typed = batch.column(*i).null_count() < batch.num_rows();
-                            let from = if typed {
-                                Some(types[*i])
-                            } else {
-                                stated.get(*i).copied().flatten()
-                            };
-                            if let Some(from) = from.filter(|&from| !assignable(from, col.ty)) {
-                                return Err(Error::new(format!(
-                                    "column \"{}\" is of type {} but expression is of type {}",
-                                    col.name,
-                                    col.ty.pg_name(),
-                                    from.pg_name().split('(').next().unwrap_or_default()
-                                )));
-                            }
-                        }
                         let mut given = Vec::new();
                         for a in rows_of(&batch)? {
                             let mut row = Vec::with_capacity(fill.len());
@@ -998,7 +1075,7 @@ impl Snail {
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
                 let t = &self.catalog.tables[table];
-                let old = self.kept_to(table, widen(t, rows_of(&batch)?), found);
+                let old = self.kept_to(table, widen(t, rows_of(&batch)?), found)?;
                 done.rows = old.len() as u64;
                 (done.rewritten, done.orders) =
                     self.apply(table, old.into_iter().map(Change::Delete).collect())?;
@@ -1016,8 +1093,9 @@ impl Snail {
             | Statement::Commit
             | Statement::Rollback
             | Statement::Setting { .. }
-            | Statement::Isolation { .. } => {
-                unreachable!("a transaction's own statements and a setting write no rows")
+            | Statement::Isolation { .. }
+            | Statement::Question { .. } => {
+                unreachable!("a transaction's own statements, a setting and a question write no rows")
             }
         })
     }
@@ -1044,7 +1122,38 @@ impl Snail {
             }
         }
         let (batch, _) = self.answer(&find, None)?;
-        let old = self.kept_to(table, widen(&t, rows_of(&batch)?), found);
+        // The finder's answer holds the row's stored columns, then each value an expression sets,
+        // read on the row's old values.
+        let stored = t.columns.iter().filter(|c| !c.is_virtual()).count();
+        let fills: Vec<(usize, usize)> = sets
+            .iter()
+            .filter_map(|(c, f)| match f {
+                Fill::Answer(i) => Some((*c, stored + i)),
+                _ => None,
+            })
+            .collect();
+        let types = assigned_types(&self.catalog, &find, &batch, table, &fills)?;
+        // Where the pipeline answered the finder, each stored column is taken back to its column's own
+        // type, as the table holds it.
+        let columns: Vec<usize> = (0..t.columns.len())
+            .filter(|&c| !t.columns[c].is_virtual())
+            .collect();
+        let mut rows: Vec<Row> = Vec::new();
+        for mut r in rows_of(&batch)? {
+            let computed = r.split_off(stored);
+            if !fills.is_empty() {
+                for (i, &c) in columns.iter().enumerate() {
+                    if types[i] != t.columns[c].ty {
+                        let d = std::mem::replace(&mut r[i], Datum::Null);
+                        r[i] = fill::assign(d, types[i], t.columns[c].ty, &t.columns[c].name)?;
+                    }
+                }
+            }
+            let mut row = widen(&t, vec![r]).remove(0);
+            row.extend(computed);
+            rows.push(row);
+        }
+        let old = self.kept_to(table, rows, found)?;
         done.rows = old.len() as u64;
         let defaults: Vec<usize> = sets
             .iter()
@@ -1052,13 +1161,21 @@ impl Snail {
             .map(|(c, _)| *c)
             .collect();
         let mut drawn = self.draws(&t, defaults.iter().map(|&c| (c, old.len())))?;
+        let width = t.columns.len();
         let mut changes = Vec::with_capacity(old.len());
-        for o in old {
+        for mut o in old {
+            let computed = o.split_off(width);
             let mut n = o.clone();
             for (c, f) in &sets {
                 n[*c] = match f {
                     Fill::Literal(d) => d.clone(),
-                    _ => self.default_of(&t, *c, &mut drawn)?,
+                    Fill::Answer(i) => fill::assign(
+                        computed[*i].clone(),
+                        types[stored + i],
+                        t.columns[*c].ty,
+                        &t.columns[*c].name,
+                    )?,
+                    Fill::Default => self.default_of(&t, *c, &mut drawn)?,
                 };
             }
             fill::generate(&t, &mut n)?;
@@ -1309,10 +1426,10 @@ impl Snail {
     /// The rows an UPDATE or a DELETE finds: the first time, every one, kept as `found`; run again,
     /// only those whose key, on the table's first unique order of plain NOT NULL columns or else
     /// every column, is a key it found the first time.
-    fn kept_to(&self, ti: usize, now: Vec<Row>, found: &mut Option<Vec<Row>>) -> Vec<Row> {
+    fn kept_to(&self, ti: usize, now: Vec<Row>, found: &mut Option<Vec<Row>>) -> Result<Vec<Row>> {
         let Some(first) = found.as_ref() else {
             *found = Some(now.clone());
-            return now;
+            return Ok(now);
         };
         let table = &self.catalog.tables[ti];
         let columns: Vec<usize> = table
@@ -1330,8 +1447,37 @@ impl Snail {
             })
             .unwrap_or_else(|| (0..table.columns.len()).collect());
         let key = |r: &Row| -> Vec<Datum> { columns.iter().map(|&c| r[c].clone()).collect() };
+        // At REPEATABLE READ a row found that another transaction changed or deleted since the
+        // transaction's generation is refused, in PostgreSQL's words, SQLSTATE 40001.
+        if self.levels.repeatable(self.begun.is_some()) {
+            let width = table.columns.len();
+            let newest: std::collections::HashMap<Vec<Datum>, &Row> =
+                now.iter().map(|r| (key(r), r)).collect();
+            for f in first {
+                match newest.get(&key(f)) {
+                    None => {
+                        return Err(Error::new(
+                            "could not serialize access due to concurrent delete",
+                        ))
+                    }
+                    Some(r) if r[..width] != f[..width] => {
+                        return Err(Error::new(
+                            "could not serialize access due to concurrent update",
+                        ))
+                    }
+                    Some(_) => {}
+                }
+            }
+            // In a transaction holding its generation, a block another wrote since is refused too:
+            // its rows would be read from two generations.
+            if self.held {
+                return Err(Error::new(
+                    "could not serialize access due to concurrent update",
+                ));
+            }
+        }
         let keys: std::collections::HashSet<Vec<Datum>> = first.iter().map(key).collect();
-        now.into_iter().filter(|r| keys.contains(&key(r))).collect()
+        Ok(now.into_iter().filter(|r| keys.contains(&key(r))).collect())
     }
 
     /// Where the statement under way began: what it had staged and the root it read, so that it
@@ -1444,15 +1590,22 @@ impl Snail {
         self.let_go_blocks()
     }
 
-    fn let_go_blocks(&mut self) -> Result<()> {
+    /// Lets go of every block and row it locked, and of its marks on the tables whose rows it
+    /// locked or changed.
+    pub(super) fn let_go_blocks(&mut self) -> Result<()> {
         for b in std::mem::take(&mut self.locks) {
             self.unlock_byte(b)?;
         }
+        for b in std::mem::take(&mut self.row_locks).into_keys() {
+            self.unlock_byte(b)?;
+        }
+        self.unnamed.clear();
+        self.held = false;
         Ok(())
     }
 
     /// Lets go of one block's lock, no longer marked held first.
-    fn unlock_byte(&self, b: u64) -> Result<()> {
+    pub(super) fn unlock_byte(&self, b: u64) -> Result<()> {
         if let Some(w) = self.writer.as_ref() {
             lock::mark_held(w.file(), self.slot, b, false)?;
             lock::unlock_block(w.file(), b)?;
@@ -1465,8 +1618,13 @@ impl Snail {
     /// holds, and waits as long as it takes unless they come back to a block this writer holds: a
     /// ring, which PostgreSQL ends by failing one of its transactions, as this one fails.
     pub(super) fn lock_byte(&self, b: u64, waiting: Waiting) -> Result<bool> {
+        self.lock_byte_as(b, false, waiting)
+    }
+
+    /// Takes one byte's lock, shared or alone, and marks it held, as `lock_byte` takes a block's.
+    pub(super) fn lock_byte_as(&self, b: u64, shared: bool, waiting: Waiting) -> Result<bool> {
         let file = self.writer.as_ref().expect("a snail open to write").file();
-        if !lock::lock_block(file, b, false)? {
+        if !lock::lock_as(file, b, shared, false)? {
             if waiting == Waiting::Try {
                 return Ok(false);
             }
@@ -1481,7 +1639,7 @@ impl Snail {
                      in a ring, for a block this writer holds",
                 ));
             }
-            let taken = lock::lock_block(file, b, true);
+            let taken = lock::lock_as(file, b, shared, true);
             lock::mark_waiting(file, self.slot, b, false)?;
             taken?;
         }
@@ -1992,6 +2150,16 @@ impl Snail {
                 Change::Delete(_) => {}
             }
         }
+        // The rows it deletes or replaces, named before any block is locked.
+        let named: Vec<(&Row, bool)> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::Replace(o, n) => Some((o, super::locking::key_changed(&table, o, n))),
+                Change::Delete(r) => Some((r, true)),
+                Change::Insert(_) => None,
+            })
+            .collect();
+        self.name_rows(ti, &named)?;
         let mut stage = self.reader.stage();
         let applied: Vec<u64> = (0..table.orders.len())
             .map(|oi| self.apply_order(&mut stage, ti, &table, oi, &changes))

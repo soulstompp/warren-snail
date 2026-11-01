@@ -97,8 +97,9 @@ pub enum Statement {
         ddl: String,
         kind: &'static str,
     },
-    /// An UPDATE: the question that finds the rows, every column of the table in its order, and
-    /// each column set, to a value written out or to its DEFAULT.
+    /// An UPDATE: the question that finds the rows, every column of the table in its order and
+    /// after them each value an expression sets, and each column set, to a value written out, to
+    /// its DEFAULT, or to the finder's answer after the row's columns.
     Set {
         table: usize,
         find: String,
@@ -121,16 +122,22 @@ pub enum Statement {
         level: Isolation,
         at: Isolated,
     },
+    /// A question asked among a writer's statements: in a transaction, it reads the transaction's own
+    /// rows; with a locking clause, it locks the rows it returns.
+    Question {
+        question: String,
+    },
 }
 
-/// The isolation levels the snail runs, READ COMMITTED's: PostgreSQL runs READ UNCOMMITTED as READ
-/// COMMITTED and holds it as a level of its own.
+/// The isolation levels the snail runs: READ COMMITTED, which PostgreSQL also runs READ UNCOMMITTED
+/// as and holds as a level of its own, and REPEATABLE READ.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Isolation {
     ReadUncommitted,
     #[default]
     ReadCommitted,
+    RepeatableRead,
 }
 
 /// Where an isolation level is named.
@@ -185,6 +192,15 @@ impl Levels {
         Ok(())
     }
 
+    /// Whether a statement reads as REPEATABLE READ does: in a transaction, at the transaction's
+    /// level; alone, at the session's.
+    pub(crate) fn repeatable(&self, begun: bool) -> bool {
+        match begun {
+            true => self.transaction == Isolation::RepeatableRead,
+            false => self.session == Isolation::RepeatableRead,
+        }
+    }
+
     /// The transaction ended: committed, or rolled back, its SET SESSION undone.
     pub(crate) fn end(&mut self, committed: bool) {
         if !committed {
@@ -211,6 +227,7 @@ impl Statement {
             Statement::Set { .. } => "UPDATE",
             Statement::Constraints { .. } => "SET CONSTRAINTS",
             Statement::Setting { .. } => "SET",
+            Statement::Question { .. } => "SELECT",
         }
     }
 }
@@ -242,9 +259,11 @@ fn isolation(modes: &[sqlparser::ast::TransactionMode]) -> Result<Option<Isolati
         None => Ok(None),
         Some(Level::ReadUncommitted) => Ok(Some(Isolation::ReadUncommitted)),
         Some(Level::ReadCommitted) => Ok(Some(Isolation::ReadCommitted)),
+        Some(Level::RepeatableRead) => Ok(Some(Isolation::RepeatableRead)),
         Some(Level::Snapshot) => Err(Error::new("syntax error at or near \"SNAPSHOT\"")),
         Some(other) => Err(Error::new(format!(
-            "ISOLATION LEVEL {other} is not read: the snail's transactions are READ COMMITTED"
+            "ISOLATION LEVEL {other} is not read: the snail's transactions are READ COMMITTED or \
+             REPEATABLE READ"
         ))),
     }
 }
@@ -648,14 +667,26 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
     })
 }
 
-/// The question that finds a table's rows, every column it stores in the table's order.
-fn finder(table: &Table, relation: &TableWithJoins, selection: Option<&Expr>) -> String {
+/// The question that finds a table's rows, every column it stores in the table's order, and after
+/// them each value `computed` gives, on the row's old values.
+fn finder(
+    table: &Table,
+    relation: &TableWithJoins,
+    selection: Option<&Expr>,
+    computed: &[&Expr],
+) -> String {
     // Its stored columns: a virtual one is computed again from them.
     let columns = table
         .columns
         .iter()
         .filter(|c| !c.is_virtual())
         .map(|c| format!("\"{}\"", c.name.replace('"', "\"\"")))
+        .chain(
+            computed
+                .iter()
+                .enumerate()
+                .map(|(k, e)| format!("({e}) AS \"?set{}\"", k + 1)),
+        )
         .collect::<Vec<_>>()
         .join(", ");
     match selection {
@@ -776,6 +807,58 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     Ok(Statement::Insert { table: ti, source })
 }
 
+/// The tokens of a statement, each with where it begins and ends in the text, in bytes.
+pub(crate) fn spans(sql: &str) -> Result<Vec<(sqlparser::tokenizer::Token, usize, usize)>> {
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&PostgreSqlDialect {}, sql)
+        .tokenize_with_location()?;
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let at = |l: sqlparser::tokenizer::Location| -> usize {
+        let line = starts
+            .get(l.line.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or(sql.len());
+        sql[line..]
+            .char_indices()
+            .nth(l.column.saturating_sub(1) as usize)
+            .map_or(sql.len(), |(i, _)| line + i)
+    };
+    Ok(tokens
+        .into_iter()
+        .map(|t| {
+            let (a, b) = (at(t.span.start), at(t.span.end));
+            (t.token, a, b)
+        })
+        .collect())
+}
+
+/// A statement with each parameter, `$1` and on, written where it stands as a quoted literal of
+/// its text: unknown-typed, as PostgreSQL types a parameter a driver sends with no type, and read
+/// by its context.
+pub(crate) fn with_params(sql: &str, params: &[String]) -> Result<String> {
+    let mut out = String::with_capacity(sql.len());
+    let mut from = 0;
+    for (t, a, b) in spans(sql)? {
+        let sqlparser::tokenizer::Token::Placeholder(p) = t else {
+            continue;
+        };
+        let Some(n) = p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) else {
+            continue;
+        };
+        let given = params
+            .get(n.wrapping_sub(1))
+            .ok_or_else(|| Error::new(format!("there is no parameter ${n}")))?;
+        out.push_str(&sql[from..a]);
+        out.push('\'');
+        out.push_str(&given.replace('\'', "''"));
+        out.push('\'');
+        from = b;
+    }
+    out.push_str(&sql[from..]);
+    Ok(out)
+}
+
 /// The statements of a text, each as written, split on their semicolons by sqlparser's tokenizer.
 pub fn split(text: &str) -> Result<Vec<String>> {
     Ok(crate::ddl::statements(text)?
@@ -800,6 +883,14 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
     }
     if tokens.iter().any(|t| matches!(t, sqlparser::tokenizer::Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("overriding"))) {
         return Err(refused("OVERRIDING SYSTEM VALUE or USER VALUE"));
+    }
+    // A question with locking clauses is asked as it stands: sqlparser reads only two of them.
+    let first = tokens.iter().find(|t| !matches!(t, sqlparser::tokenizer::Token::Whitespace(_)));
+    let select = matches!(first, Some(sqlparser::tokenizer::Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("select"));
+    if select && super::locking::clauses(sql)?.is_some() {
+        return Ok(Statement::Question {
+            question: sql.trim().trim_end_matches(';').trim_end().to_string(),
+        });
     }
     super::question::unlocked_words(sql)?;
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
@@ -854,29 +945,35 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             }
             let ti = one_table(catalog, &u.table)?;
             let table = &catalog.tables[ti];
-            let mut sets = Vec::new();
+            let mut sets: Vec<(usize, Fill)> = Vec::new();
+            // A value set by an expression is the finder's answer, read on the row's old values.
+            let mut computed = Vec::new();
             for a in &u.assignments {
                 let c = match &a.target {
                     AssignmentTarget::ColumnName(n) => column_index(table, n)?,
                     AssignmentTarget::Tuple(_) => return Err(refused("an UPDATE of a tuple")),
                 };
-                if is_default(&a.value) {
-                    sets.push((c, Fill::Default));
-                    continue;
-                }
-                if !is_literal(&a.value)
-                    && !crate::composed::constructs(table.columns[c].ty, &a.value)
-                {
+                if sets.iter().any(|(s, _)| *s == c) {
                     return Err(Error::new(format!(
-                        "{}: an UPDATE sets a value written out",
-                        a.value
+                        "multiple assignments to same column \"{}\"",
+                        table.columns[c].name
                     )));
                 }
-                sets.push((c, Fill::Literal(datum(&a.value, table, c)?)));
+                if is_default(&a.value) {
+                    sets.push((c, Fill::Default));
+                } else if is_literal(&a.value)
+                    || crate::composed::constructs(table.columns[c].ty, &a.value)
+                {
+                    sets.push((c, Fill::Literal(datum(&a.value, table, c)?)));
+                } else {
+                    sets.push((c, Fill::Answer(computed.len())));
+                    computed.push(&a.value);
+                }
             }
+            let find = finder(table, &u.table, u.selection.as_ref(), &computed);
             Ok(Statement::Set {
                 table: ti,
-                find: finder(table, &u.table, u.selection.as_ref()),
+                find,
                 sets,
             })
         }
@@ -902,10 +999,12 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             let ti = one_table(catalog, t)?;
             Ok(Statement::Delete {
                 table: ti,
-                find: finder(&catalog.tables[ti], t, d.selection.as_ref()),
+                find: finder(&catalog.tables[ti], t, d.selection.as_ref(), &[]),
             })
         }
-        Sql::Query(_) => Err(Error::new("a SELECT is a question: ask it")),
+        Sql::Query(_) => Ok(Statement::Question {
+            question: sql.trim().trim_end_matches(';').trim_end().to_string(),
+        }),
         Sql::Truncate { .. } => Err(refused("TRUNCATE")),
         Sql::Set(sqlparser::ast::Set::SingleAssignment {
             variable, values, ..
@@ -1062,6 +1161,18 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // A value an expression sets is the finder's answer after the row's columns.
+        match parse(&c, "UPDATE s.t SET b = b || 'z', a = a + $1 WHERE a = 1").unwrap() {
+            Statement::Set { find, sets, .. } => {
+                assert_eq!(
+                    find,
+                    "SELECT \"a\", \"b\", \"at\", (b || 'z') AS \"?set1\", (a + $1) AS \"?set2\" \
+                     FROM s.t WHERE a = 1"
+                );
+                assert!(matches!(&sets[..], [(1, Fill::Answer(0)), (0, Fill::Answer(1))]));
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(
             parse(&c, "DELETE FROM s.u").unwrap(),
             Statement::Delete { table: 1, .. }
@@ -1096,10 +1207,9 @@ mod tests {
                 "INSERT INTO s.t (a) OVERRIDING SYSTEM VALUE VALUES (1)",
                 "OVERRIDING",
             ),
-            ("UPDATE s.t SET b = b WHERE a = 1", "a value written out"),
+            ("UPDATE s.t SET b = 'x', b = 'y' WHERE a = 1", "multiple assignments"),
             ("INSERT INTO s.u (n, a) VALUES (70000, 1)", "out of range"),
             ("TRUNCATE s.t", "TRUNCATE"),
-            ("SELECT a FROM s.t", "ask it"),
             ("BEGIN; COMMIT", "one statement at a time"),
         ] {
             let e = parse(&c, sql).unwrap_err().to_string();

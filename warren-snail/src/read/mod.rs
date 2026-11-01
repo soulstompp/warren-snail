@@ -17,6 +17,7 @@ pub(crate) mod foreign;
 pub mod handed;
 mod hash;
 mod join;
+mod locking;
 mod json;
 mod level;
 mod out;
@@ -323,6 +324,14 @@ pub struct Snail {
     /// whether the statement found one written since the root it read.
     locks: std::collections::BTreeSet<u64>,
     stale: bool,
+    /// The bytes of the rows the transaction under way has locked, each with whether it is held
+    /// shared, and of the tables whose rows it locked or changed; and the tables whose rows it
+    /// changed without naming them.
+    row_locks: std::collections::BTreeMap<u64, bool>,
+    unnamed: std::collections::BTreeSet<usize>,
+    /// Whether the transaction under way, at REPEATABLE READ, holds the generation its first read
+    /// took.
+    held: bool,
     /// The pages its commits have written into pages freed before.
     reused: u64,
     /// The catalog the statement or the transaction under way has declared.
@@ -554,6 +563,9 @@ impl Snail {
             taken: Default::default(),
             rebased: Default::default(),
             locks: Default::default(),
+            row_locks: Default::default(),
+            unnamed: Default::default(),
+            held: false,
             stale: false,
             reused: 0,
             declared: None,
@@ -1053,8 +1065,11 @@ impl Snail {
         }
         let pages_at_start = if self.rounds > 0 && self.begun.is_none() {
             self.renew()?
-        } else if self.rounds > 0 {
-            self.renew_in_transaction()?
+        } else if self.rounds > 0 && !self.held {
+            let pages = self.renew_in_transaction()?;
+            // At REPEATABLE READ, the generation the first read takes is the transaction's.
+            self.held = self.levels.repeatable(true);
+            pages
         } else {
             0
         };
@@ -1124,7 +1139,10 @@ impl Snail {
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _handed = handed::holding(&self.functions);
         self.wasted.borrow_mut().clear();
-        let (batch, mut round) = self.answer_with(sql, order, params)?;
+        let (batch, mut round) = match locking::clauses(sql)? {
+            Some(l) => self.ask_locking(l, order, params)?,
+            None => self.answer_with(sql, order, params)?,
+        };
         round.pages_at_start = pages_at_start;
         let wasted = self.wasted.take();
         if !wasted.is_empty() {

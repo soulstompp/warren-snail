@@ -185,52 +185,41 @@ const NO_LOCK: &str = "is not read: a question takes no lock on the rows it read
 #[test]
 fn a_locking_clause_is_refused_by_name_on_every_read_path() {
     let path = snail("locks");
-    for (q, lock) in [
-        (
-            "SELECT t.id FROM a.t t WHERE t.id = 1 FOR UPDATE",
-            "FOR UPDATE",
-        ),
-        ("SELECT t.id FROM a.t t FOR SHARE", "FOR SHARE"),
-        (
-            "SELECT t.id FROM a.t t FOR NO KEY UPDATE",
-            "FOR NO KEY UPDATE",
-        ),
-        (
-            "SELECT t.id FROM a.t t FOR KEY SHARE NOWAIT",
-            "FOR KEY SHARE",
-        ),
-        (
-            "SELECT t.id FROM a.t t FOR UPDATE NOWAIT",
-            "FOR UPDATE NOWAIT",
-        ),
-        (
-            "SELECT t.id FROM a.t t FOR SHARE SKIP LOCKED",
-            "FOR SHARE SKIP LOCKED",
-        ),
-        ("SELECT t.id FROM a.t t FOR UPDATE FOR SHARE", "FOR UPDATE"),
+    // On a snail opened to read, a question's own locking clauses are refused by the strength of
+    // the first; one inside a step is the question's, and takes no lock.
+    const OPENED: &str = "is not read on a snail opened to read: open it to write, and its rows \
+                          are locked";
+    for (q, lock, words) in [
+        ("SELECT t.id FROM a.t t WHERE t.id = 1 FOR UPDATE", "FOR UPDATE", OPENED),
+        ("SELECT t.id FROM a.t t FOR SHARE", "FOR SHARE", OPENED),
+        ("SELECT t.id FROM a.t t FOR NO KEY UPDATE", "FOR NO KEY UPDATE", OPENED),
+        ("SELECT t.id FROM a.t t FOR KEY SHARE NOWAIT", "FOR KEY SHARE", OPENED),
+        ("SELECT t.id FROM a.t t FOR UPDATE NOWAIT", "FOR UPDATE", OPENED),
+        ("SELECT t.id FROM a.t t FOR SHARE SKIP LOCKED", "FOR SHARE", OPENED),
+        ("SELECT t.id FROM a.t t FOR UPDATE FOR SHARE", "FOR UPDATE", OPENED),
         (
             "SELECT t.id, u.w FROM a.t t JOIN a.u u ON u.t_id = t.id FOR UPDATE OF t",
-            "FOR UPDATE OF t",
+            "FOR UPDATE",
+            OPENED,
         ),
-        (
-            "SELECT t.g, count(*) FROM a.t t JOIN a.u u ON u.t_id = t.id GROUP BY t.g FOR SHARE",
-            "FOR SHARE",
-        ),
-        ("SELECT abs(t.v) FROM a.t t FOR UPDATE", "FOR UPDATE"),
+        ("SELECT abs(t.v) FROM a.t t FOR UPDATE", "FOR UPDATE", OPENED),
         (
             "WITH x AS (SELECT t.id FROM a.t t) SELECT x.id FROM x FOR UPDATE",
             "FOR UPDATE",
+            OPENED,
         ),
         (
             "WITH x AS (SELECT t.id FROM a.t t FOR SHARE) SELECT x.id FROM x",
             "FOR SHARE",
+            NO_LOCK,
         ),
         (
-            "SELECT t.id, sum(t.v) OVER (ORDER BY t.id) FROM a.t t FOR KEY SHARE",
+            "SELECT x.id FROM (SELECT t.id FROM a.t t FOR KEY SHARE) x",
             "FOR KEY SHARE",
+            NO_LOCK,
         ),
     ] {
-        assert_eq!(refused(&path, q), format!("{lock} {NO_LOCK}"), "{q}");
+        assert_eq!(refused(&path, q), format!("{lock} {words}"), "{q}");
     }
     // The words in a string or a name are no clause.
     let b = ask(
@@ -593,10 +582,6 @@ fn the_level_the_snail_runs_is_taken_in_each_of_its_spellings() {
     // The levels the snail does not run, by name, the last a statement names deciding; READ ONLY.
     for (s, why) in [
         (
-            "BEGIN ISOLATION LEVEL REPEATABLE READ",
-            "ISOLATION LEVEL REPEATABLE READ",
-        ),
-        (
             "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
             "ISOLATION LEVEL SERIALIZABLE",
         ),
@@ -605,17 +590,15 @@ fn the_level_the_snail_runs_is_taken_in_each_of_its_spellings() {
             "ISOLATION LEVEL SERIALIZABLE",
         ),
         (
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-            "ISOLATION LEVEL REPEATABLE READ",
-        ),
-        (
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
             "ISOLATION LEVEL SERIALIZABLE",
         ),
     ] {
         assert_eq!(
             w.execute(s).unwrap_err().to_string(),
-            format!("{why} is not read: the snail's transactions are READ COMMITTED"),
+            format!(
+                "{why} is not read: the snail's transactions are READ COMMITTED or REPEATABLE READ"
+            ),
             "{s}"
         );
     }

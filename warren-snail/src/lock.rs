@@ -205,6 +205,43 @@ pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::Ke
     BLOCKS + h.finish() % BLOCK_BYTES
 }
 
+
+/// The two bytes of a row's lock, its key's and the rest's, from its table's place in the catalog
+/// and its key's bytes, the same in every build of this version; they fall among the block bytes.
+pub(crate) fn row_bytes(table: usize, key: &[u8]) -> (u64, u64) {
+    use std::hash::Hasher;
+    let mut h = Fnv::default();
+    h.write(b"row");
+    h.write(&(table as u64).to_le_bytes());
+    h.write(&(key.len() as u64).to_le_bytes());
+    h.write(key);
+    let k = BLOCKS + (h.finish() % (BLOCK_BYTES / 2)) * 2;
+    (k, k + 1)
+}
+
+/// The byte a table's lockers hold, shared: rows of it are locked by a question, so its writers
+/// name the rows they change.
+pub(crate) fn lockers_byte(table: usize) -> u64 {
+    block_byte(&(table as u64, "lockers"))
+}
+
+/// The byte a table's writers hold, shared, while rows they changed are not named by their own
+/// bytes.
+pub(crate) fn unnamed_byte(table: usize) -> u64 {
+    block_byte(&(table as u64, "unnamed"))
+}
+
+/// Takes a lock on one byte, shared or alone, waiting for it where `wait`. Returns false where it
+/// does not wait and another file holds a lock in its way.
+pub(crate) fn lock_as(file: &File, byte: u64, shared: bool, wait: bool) -> Result<bool> {
+    let kind = if shared { Kind::Shared } else { Kind::Alone };
+    take(file, kind, byte, 1, wait)
+}
+
+/// Whether another file holds a lock on `byte`, shared or alone. It never waits.
+pub(crate) fn held_by_other(file: &File, byte: u64) -> Result<bool> {
+    Ok(held_at(file, byte, 1)?.is_some())
+}
 /// Takes a slot for a writer open on the file, held until the file is closed: the first slot no
 /// other writer holds.
 pub(crate) fn take_slot(file: &File) -> Result<u64> {
@@ -362,9 +399,28 @@ fn held_at(file: &File, start: u64, len: u64) -> Result<Option<(u64, u64)>> {
     Ok((f.l_type != libc::F_UNLCK as libc::c_short).then(|| (f.l_start as u64, f.l_len as u64)))
 }
 
+#[cfg(test)]
 /// The slot of the other writer that holds the block of lock byte `byte`, if one does.
 pub(crate) fn holder(file: &File, byte: u64) -> Result<Option<u64>> {
     first_held(file, HOLDS + ((byte - BLOCKS) << 16), WRITER_SLOTS)
+}
+
+/// The slots of the other writers that hold the block or row of lock byte `byte`: one where it is
+/// held alone, any number where it is shared.
+pub(crate) fn holders(file: &File, byte: u64) -> Result<Vec<u64>> {
+    let start = HOLDS + ((byte - BLOCKS) << 16);
+    let mut out = Vec::new();
+    let mut from = 0;
+    while from < WRITER_SLOTS {
+        match held_at(file, start + from, WRITER_SLOTS - from)? {
+            Some((at, n)) => {
+                out.push(at - start);
+                from = at - start + n.max(1);
+            }
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 /// The lock byte of the block the writer in another file's `slot` waits for, if it waits.
