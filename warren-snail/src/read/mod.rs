@@ -1173,8 +1173,8 @@ impl Snail {
         q: &sqlparser::ast::Query,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
-        let q = &spelled::between_written(q);
         let _rows = handed::rows_of(&self.catalog);
+        let q = &pipeline::windows::written(&spelled::between_written(q))?;
         if relations::several(&self.catalog, q) {
             return relations::answer(self, q, params);
         }

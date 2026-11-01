@@ -2,8 +2,9 @@
 //! otherwise. Before sqlparser parses it: SQL's `SUBSTRING(s SIMILAR p ESCAPE e)` and
 //! `SUBSTRING(s FOR e FROM p)` written in the words of the one call PostgreSQL's grammar makes of
 //! each, and `BETWEEN SYMMETRIC x` and `BETWEEN ASYMMETRIC x` with their bound in parentheses, which
-//! sqlparser reads as a call of the keyword. After: each BETWEEN of a pipeline's statement written
-//! as the comparisons PostgreSQL's analyser makes of it.
+//! sqlparser reads as a call of the keyword; and a window frame's EXCLUDE, which sqlparser does not
+//! read, carried in the window's name (`EXCLUDED`). After: each BETWEEN of a pipeline's statement
+//! written as the comparisons PostgreSQL's analyser makes of it.
 
 use crate::{Error, Result};
 use sqlparser::ast::{
@@ -18,14 +19,112 @@ use std::borrow::Cow;
 /// The statement with each rewrite made, one at a time until none is left.
 pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
     let lower = sql.to_ascii_lowercase();
-    if !lower.contains("substring") && !lower.contains("symmetric") {
-        return Ok(Cow::Borrowed(sql));
-    }
     let mut out = Cow::Borrowed(sql);
+    if lower.contains("exclude") {
+        while let Some(next) = excluded_once(&out)? {
+            out = Cow::Owned(next);
+        }
+    }
+    if !lower.contains("substring") && !lower.contains("symmetric") {
+        return Ok(out);
+    }
     while let Some(next) = rewrite_once(&out)? {
         out = Cow::Owned(next);
     }
     Ok(out)
+}
+
+/// What marks a window's name as carrying its frame's EXCLUDE: the name is this character, the
+/// exclusion's words, this character again, and the window it names, if any.
+pub(super) const EXCLUDED: char = '\u{1}';
+
+/// The statement with its first frame's EXCLUDE moved into its window's name, or none where no
+/// frame excludes: `OVER (w ORDER BY x ROWS … EXCLUDE TIES)` is written
+/// `OVER ("\u{1}ties\u{1}w" ORDER BY x ROWS …)`, and `EXCLUDE NO OTHERS`, the default, is dropped.
+fn excluded_once(sql: &str) -> Result<Option<String>> {
+    let tokens =
+        Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql).tokenize_with_location()?;
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(sql.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset = |l: Location| -> usize {
+        let start = starts[l.line as usize - 1];
+        start
+            + sql[start..]
+                .chars()
+                .take(l.column as usize - 1)
+                .map(char::len_utf8)
+                .sum::<usize>()
+    };
+    let solid: Vec<&TokenWithSpan> = tokens
+        .iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize| match solid.get(i).map(|t| &t.token) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+        _ => None,
+    };
+    let start = |i: usize| offset(solid[i].span.start);
+    let end = |i: usize| offset(solid[i].span.end);
+    let mut opened: Vec<usize> = Vec::new();
+    for i in 0..solid.len() {
+        match solid[i].token {
+            Token::LParen => opened.push(i),
+            Token::RParen => {
+                opened.pop();
+            }
+            _ => {}
+        }
+        if word(i).as_deref() != Some("EXCLUDE")
+            || !matches!(
+                i.checked_sub(1).and_then(word).as_deref(),
+                Some("PRECEDING" | "FOLLOWING" | "ROW")
+            )
+        {
+            continue;
+        }
+        let (kind, last) = match (word(i + 1).as_deref(), word(i + 2).as_deref()) {
+            (Some("CURRENT"), Some("ROW")) => (Some("current row"), i + 2),
+            (Some("GROUP"), _) => (Some("group"), i + 1),
+            (Some("TIES"), _) => (Some("ties"), i + 1),
+            (Some("NO"), Some("OTHERS")) => (None, i + 2),
+            _ => continue,
+        };
+        let Some(&open) = opened.last() else {
+            continue;
+        };
+        if !matches!(solid.get(last + 1).map(|t| &t.token), Some(Token::RParen)) {
+            continue;
+        }
+        // The window the spelling names, its identifier folded as PostgreSQL's parser folds it.
+        let named = match &solid[open + 1].token {
+            Token::Word(w) if w.keyword == Keyword::NoKeyword => Some(match w.quote_style {
+                None => w.value.to_ascii_lowercase(),
+                Some(_) => w.value.clone(),
+            }),
+            _ => None,
+        };
+        let after = if named.is_some() {
+            end(open + 1)
+        } else {
+            end(open)
+        };
+        let mark = match (kind, named) {
+            (Some(k), n) => format!(
+                " \"{EXCLUDED}{k}{EXCLUDED}{}\"",
+                n.unwrap_or_default().replace('"', "\"\"")
+            ),
+            (None, Some(n)) => format!(" \"{}\"", n.replace('"', "\"\"")),
+            (None, None) => String::new(),
+        };
+        return Ok(Some(format!(
+            "{}{mark}{}{}",
+            &sql[..end(open)],
+            &sql[after..start(i)],
+            &sql[end(last)..]
+        )));
+    }
+    Ok(None)
 }
 
 /// A group the words open: a parenthesis, a SUBSTRING call's among them, a bracket, or a CASE.

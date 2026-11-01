@@ -1,8 +1,9 @@
 //! A question read as a pipeline over one table in its order: each step of a WITH, and the question
-//! itself, a SELECT over the table or a step before it. A window is read only along the table's own
-//! order, folded as the rows come; a step keeps the order while it carries the order's key and
-//! groups nothing. The expressions it reads are CASE, mod, abs, casts, comparisons, IS [NOT]
-//! DISTINCT FROM, and the aggregates count, sum, min, max, bool_and and bool_or.
+//! itself, a SELECT over the table or a step before it. A window along the table's own order folds
+//! as the rows come; a window on any other order holds its step's rows and reads them whole
+//! (`windows`). A step keeps the order while it carries the order's key and groups nothing. The
+//! expressions it reads are CASE, mod, abs, casts, comparisons, IS [NOT] DISTINCT FROM, and the
+//! aggregates count, sum, min, max, bool_and and bool_or.
 
 use crate::catalog::{Casing, ColumnType};
 use crate::numeric::Numeric;
@@ -15,6 +16,8 @@ use sqlparser::ast::{
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
+
+pub(super) mod windows;
 
 /// One value of a row: a number whole or with its scale, text, bytes, a truth, or a uuid.
 #[derive(Clone, Debug)]
@@ -4297,7 +4300,7 @@ fn windows(
 }
 
 /// Whether a window call folds as the rows come: lag of one argument, sum, count(*) and row_number,
-/// along the order, over the rows from the partition's first to the current.
+/// along the order, over the rows from the partition's first to the current, none left out.
 fn streams(call: &Expr) -> bool {
     let Expr::Function(f) = call else {
         return false;
@@ -4308,9 +4311,11 @@ fn streams(call: &Expr) -> bool {
     let to_current = spec.window_frame.as_ref().is_none_or(|fr| {
         matches!(fr.start_bound, WindowFrameBound::Preceding(None))
             && matches!(fr.end_bound, None | Some(WindowFrameBound::CurrentRow))
+            && matches!(fr.units, WindowFrameUnits::Rows | WindowFrameUnits::Range)
     });
     let name = function_name(f);
     !spec.order_by.is_empty()
+        && spec.window_name.is_none()
         && to_current
         && f.filter.is_none()
         && f.null_treatment.is_none()
@@ -4319,264 +4324,6 @@ fn streams(call: &Expr) -> bool {
                 (name.as_str(), args(f).map(|a| a.len())),
                 ("lag", Ok(1)) | ("sum", Ok(1)) | ("row_number", Ok(0))
             ))
-}
-
-/// Each window call's value on each row of a relation read whole, the rows in the table's order:
-/// each partition's rows known before any of its values, so a window reads its rows ahead too.
-fn windows_whole(
-    calls: &[&Expr],
-    rel: &Relation,
-    frame: &Frame,
-) -> Result<Vec<HashMap<*const Expr, Value>>> {
-    let mut out: Vec<HashMap<*const Expr, Value>> = vec![HashMap::new(); rel.rows.len()];
-    let none = computed_none();
-    let at = |e: &Expr, r: usize| eval(e, &rel.rows[r], frame, &none);
-    for &call in calls {
-        let Expr::Function(f) = call else {
-            unreachable!()
-        };
-        let spec = match &f.over {
-            Some(WindowType::WindowSpec(s)) => s,
-            _ => return Err(Error::new(format!("{call}: a named window is not read"))),
-        };
-        if matches!(
-            f.null_treatment,
-            Some(sqlparser::ast::NullTreatment::IgnoreNulls)
-        ) {
-            return Err(Error::new(format!("{call}: IGNORE NULLS is not read")));
-        }
-        // Its rows in the table's order, or in no order: then every row of a partition its peer.
-        let ordered = match spec.order_by.as_slice() {
-            [] => false,
-            [o] if !matches!(o.options.sort, Some(OrderBySort::Desc))
-                && o.options.nulls_first != Some(true)
-                && rel.order.is_some_and(|order| {
-                    column_of(&o.expr)
-                        .is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(order))
-                }) =>
-            {
-                true
-            }
-            _ => {
-                return Err(Error::new(format!(
-                    "{call}: a window is read only along the table's order, ascending, its \
-                     NULLs last"
-                )))
-            }
-        };
-        // Its frame: from the partition's first row to the current, or to its last.
-        let whole = match &spec.window_frame {
-            None => !ordered,
-            Some(fr) => {
-                if !matches!(fr.start_bound, WindowFrameBound::Preceding(None)) {
-                    return Err(Error::new(format!(
-                        "{call}: only a frame from the partition's first row is read"
-                    )));
-                }
-                match fr.end_bound {
-                    None | Some(WindowFrameBound::CurrentRow) => {
-                        !ordered && matches!(fr.units, WindowFrameUnits::Range)
-                    }
-                    Some(WindowFrameBound::Following(None)) => true,
-                    _ => {
-                        return Err(Error::new(format!(
-                            "{call}: only a frame to the current row or the partition's last is \
-                             read"
-                        )))
-                    }
-                }
-            }
-        };
-        let name = function_name(f);
-        let a = if is_count_star(f) {
-            Vec::new()
-        } else {
-            args(f)?
-        };
-        // The partitions, each its rows in order.
-        let mut parts: Vec<Vec<usize>> = Vec::new();
-        let mut index: HashMap<Vec<Key>, usize> = HashMap::new();
-        let parted_under = spec
-            .partition_by
-            .iter()
-            .map(|p| frame.casings.keyed(p))
-            .collect::<Result<Vec<_>>>()?;
-        for r in 0..rel.rows.len() {
-            let k: Vec<Key> = spec
-                .partition_by
-                .iter()
-                .zip(&parted_under)
-                .map(|(p, &u)| at(p, r).map(|v| key_under(&v, u)))
-                .collect::<Result<_>>()?;
-            let i = *index.entry(k).or_insert_with(|| {
-                parts.push(Vec::new());
-                parts.len() - 1
-            });
-            parts[i].push(r);
-        }
-        let aggregate = AGGREGATES.contains(&name.as_str()) || is_count_star(f);
-        if aggregate {
-            if let FunctionArguments::List(l) = &f.args {
-                if l.duplicate_treatment.is_some() {
-                    return Err(Error::new(
-                        "DISTINCT is not implemented for window functions",
-                    ));
-                }
-            }
-        }
-        for ix in &parts {
-            let n = ix.len();
-            // An aggregate over the frame: folded a row at a time, or once over the partition.
-            let mut acc = if aggregate {
-                let (acc, folds) = Acc::of(call, frame.types)?;
-                let (under, refused) = frame.casings.folded(call, &folds.args)?;
-                Some((acc, folds, under, refused))
-            } else {
-                None
-            };
-            let mut folded = 0;
-            let mut ntile: Option<(i64, i64, i64, i64)> = None;
-            for (i, &r) in ix.iter().enumerate() {
-                let to = if whole { n - 1 } else { i };
-                let value = match (name.as_str(), a.as_slice()) {
-                    _ if aggregate => {
-                        let (acc, folds, under, refused) = acc.as_mut().unwrap();
-                        while folded <= to {
-                            let row = ix[folded];
-                            folded += 1;
-                            if let Some(w) = folds.filter {
-                                if truth(&at(w, row)?)? != Some(true) {
-                                    continue;
-                                }
-                            }
-                            let values: Vec<Value> = folds
-                                .args
-                                .iter()
-                                .map(|x| at(x, row))
-                                .collect::<Result<_>>()?;
-                            if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
-                                return Err(Error::new(e.clone()));
-                            }
-                            acc.add_row(values, under)?;
-                        }
-                        acc.value()?
-                    }
-                    ("row_number", []) => Value::Int(i as i64 + 1),
-                    ("rank" | "dense_rank", []) => {
-                        Value::Int(if ordered { i as i64 + 1 } else { 1 })
-                    }
-                    ("percent_rank", []) => Value::Double(if ordered && n > 1 {
-                        i as f64 / (n - 1) as f64
-                    } else {
-                        0.0
-                    }),
-                    ("cume_dist", []) => Value::Double(if ordered {
-                        (i + 1) as f64 / n as f64
-                    } else {
-                        1.0
-                    }),
-                    ("ntile", [k]) => {
-                        if ntile.is_none() {
-                            match at(k, r)? {
-                                Value::Null => {
-                                    out[r].insert(call as *const Expr, Value::Null);
-                                    continue;
-                                }
-                                Value::Int(b) if b <= 0 => {
-                                    return Err(Error::new(
-                                        "argument of ntile must be greater than zero",
-                                    ))
-                                }
-                                Value::Int(b) => {
-                                    let total = n as i64;
-                                    let mut boundary = total / b;
-                                    let mut remainder = 0;
-                                    if boundary <= 0 {
-                                        boundary = 1;
-                                    } else {
-                                        remainder = total % b;
-                                        if remainder != 0 {
-                                            boundary += 1;
-                                        }
-                                    }
-                                    ntile = Some((1, 0, boundary, remainder));
-                                }
-                                other => {
-                                    return Err(Error::new(format!(
-                                        "function ntile({}) does not exist",
-                                        kind_name(&other)
-                                    )))
-                                }
-                            }
-                        }
-                        let (tile, per, boundary, remainder) = ntile.as_mut().unwrap();
-                        *per += 1;
-                        if *boundary < *per {
-                            if *remainder != 0 && *tile == *remainder {
-                                *remainder = 0;
-                                *boundary -= 1;
-                            }
-                            *tile += 1;
-                            *per = 1;
-                        }
-                        Value::Int(*tile)
-                    }
-                    ("lag" | "lead", [x, rest @ ..]) if rest.len() <= 2 => {
-                        let offset = match rest.first() {
-                            None => 1,
-                            Some(k) => match at(k, r)? {
-                                Value::Null => {
-                                    out[r].insert(call as *const Expr, Value::Null);
-                                    continue;
-                                }
-                                Value::Int(k) => k,
-                                other => {
-                                    return Err(Error::new(format!(
-                                        "function {name}(…, {}) does not exist",
-                                        kind_name(&other)
-                                    )))
-                                }
-                            },
-                        };
-                        let target = if name == "lag" {
-                            i as i64 - offset
-                        } else {
-                            i as i64 + offset
-                        };
-                        if (0..n as i64).contains(&target) {
-                            at(x, ix[target as usize])?
-                        } else {
-                            match rest.get(1) {
-                                Some(d) => at(d, r)?,
-                                None => Value::Null,
-                            }
-                        }
-                    }
-                    ("first_value", [x]) => at(x, ix[0])?,
-                    ("last_value", [x]) => at(x, ix[to])?,
-                    ("nth_value", [x, k]) => match at(k, r)? {
-                        Value::Null => Value::Null,
-                        Value::Int(k) if k <= 0 => {
-                            return Err(Error::new(
-                                "argument of nth_value must be greater than zero",
-                            ))
-                        }
-                        Value::Int(k) if (k - 1) as usize <= to => at(x, ix[(k - 1) as usize])?,
-                        Value::Int(_) => Value::Null,
-                        other => {
-                            return Err(Error::new(format!(
-                                "function nth_value(…, {}) does not exist",
-                                kind_name(&other)
-                            )))
-                        }
-                    },
-                    _ => return Err(Error::new(format!("the window {call} is not read"))),
-                };
-                out[r].insert(call as *const Expr, value);
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// The output name PostgreSQL gives an item it is not told.
@@ -5252,9 +4999,22 @@ pub(super) struct Prepared<'q> {
 
 impl Prepared<'_> {
     /// The columns its expressions read of its FROM's: its select list's, its WHERE's, its HAVING's,
-    /// its ORDER BY's own and those its FROM reads its relations by.
+    /// its ORDER BY's own, its windows' partitions and orders, and those its FROM reads its
+    /// relations by.
     pub(super) fn reads(&self) -> Vec<(Option<String>, String)> {
         let mut out = Vec::new();
+        let windowed = self.calls.windows.iter().flat_map(|w| match w {
+            Expr::Function(f) => match &f.over {
+                Some(WindowType::WindowSpec(s)) => s
+                    .partition_by
+                    .iter()
+                    .chain(s.order_by.iter().map(|o| &o.expr))
+                    .chain(f.filter.as_deref())
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        });
         for e in self
             .items
             .iter()
@@ -5263,6 +5023,7 @@ impl Prepared<'_> {
             .chain(self.having)
             .chain(self.hidden.iter().copied())
             .chain(self.joined.iter().copied())
+            .chain(windowed)
         {
             columns_read(e, &mut out);
         }
@@ -5977,6 +5738,8 @@ pub(super) fn prepare<'q>(
     if let Some(l) = &limit {
         l.check(&mut typing)?;
     }
+    let listed: Vec<&Expr> = items.iter().map(|(e, _)| *e).collect();
+    windows::checked(&calls.windows, &listed, &mut typing, release)?;
     Ok(Prepared {
         from: &s.from,
         selection: s.selection.as_ref(),
@@ -6186,6 +5949,13 @@ impl<'q> StepRun<'q> {
             self.columns = frame.columns;
             return Ok(None);
         }
+        // A window on another order than the one the rows come in reads them whole.
+        if !self.p.whole_windows
+            && self.running.is_empty()
+            && !windows::along(&self.p.calls.windows, &rel, &frame)
+        {
+            self.p.whole_windows = true;
+        }
         if self.p.whole_windows {
             self.held.order = self.held.order.or(rel.order);
             self.held.rows.extend(rel.rows);
@@ -6297,7 +6067,7 @@ impl<'q> StepRun<'q> {
                 now: self.p.now,
             };
             let held = std::mem::take(&mut self.held);
-            let per_row = windows_whole(&self.p.calls.windows, &held, &frame)?;
+            let per_row = windows::values(&self.p.calls.windows, &held, &frame)?;
             for (row, w) in held.rows.iter().zip(per_row) {
                 let computed = Computed {
                     calls: w,
@@ -6584,6 +6354,9 @@ impl<'q> Stream<'q> {
             s.table.name.clone(),
             (s.table.relation.names.clone(), types),
         );
+        // The column holding the table's order in each relation that streams in it.
+        let mut orders: HashMap<String, Option<usize>> = HashMap::new();
+        orders.insert(s.table.name.clone(), s.table.relation.order);
         for (name, query) in queries {
             let mut streamed = Vec::new();
             let mut after = false;
@@ -6613,6 +6386,29 @@ impl<'q> Stream<'q> {
                 _ => Vec::new(),
             };
             let mut p = prepare(query, &columns, &keyed, release, now, &[])?;
+            // Its windows fold as the rows come only along the order of the one relation it reads.
+            let input = match (streamed.as_slice(), query.body.as_ref()) {
+                ([only], SetExpr::Select(sel))
+                    if sel.from.len() == 1 && sel.from[0].joins.is_empty() =>
+                {
+                    orders.get(only).copied().flatten()
+                }
+                _ => None,
+            };
+            if !windows::along_columns(&p.calls.windows, &columns, input) {
+                p.whole_windows = true;
+            }
+            let order = input.filter(|_| p.calls.sets.is_empty()).and_then(|o| {
+                p.items.iter().position(|(e, _)| {
+                    column_of(e).is_some_and(|(q, n)| {
+                        naming(
+                            columns.iter().map(|(q, n, _)| (q.as_deref(), n.as_str())),
+                            q.as_deref(),
+                            &n,
+                        ) == [o]
+                    })
+                })
+            });
             typed.insert(
                 name.clone(),
                 (
@@ -6662,6 +6458,7 @@ impl<'q> Stream<'q> {
                 _ => None,
             });
             s.later.push(p.filter(|_| kind == Kind::After));
+            orders.insert(name.clone(), order.filter(|_| kind == Kind::Streamed));
             s.steps.push((name, query, kind));
         }
         // The question's own rows are gathered where they stream.
@@ -7692,17 +7489,36 @@ mod tests {
     }
 
     #[test]
-    fn a_window_off_the_order_or_descending_is_refused() {
-        for (sql, why) in [
-            ("SELECT lag(seq) OVER (ORDER BY g) FROM t", "along the table's order"),
-            ("SELECT lag(seq) OVER (ORDER BY seq DESC) FROM t", "ascending"),
+    fn a_window_off_the_order_descending_or_offset_reads_its_rows_whole() {
+        let text = |r: &Relation| -> Vec<Vec<Option<String>>> {
+            r.rows
+                .iter()
+                .map(|row| row.iter().map(Value::text).collect())
+                .collect()
+        };
+        let num = |m: i128| Value::Num(m, 2);
+        for (sql, want) in [
+            // Peers in the order the rows came: seq 1, 2 and 4 under 'a', then 3 and 5.
             (
-                "SELECT sum(amount) OVER (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-                "partition's first",
+                "SELECT seq, lag(seq) OVER (ORDER BY g) AS x FROM t",
+                [Value::Null, Value::Int(1), Value::Int(4), Value::Int(2), Value::Int(3)],
+            ),
+            (
+                "SELECT seq, lag(seq) OVER (ORDER BY seq DESC) AS x FROM t",
+                [Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(5), Value::Null],
+            ),
+            (
+                "SELECT seq, sum(amount) OVER (ORDER BY seq ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS x FROM t",
+                [num(150), num(375), num(150), num(25), num(250)],
             ),
         ] {
-            let e = run(&query(sql), &table(), &[]).unwrap_err().to_string();
-            assert!(e.contains(why), "{sql}: {e}");
+            let out = run(&query(sql), &table(), &[]).unwrap();
+            let expected: Vec<Vec<Option<String>>> = want
+                .iter()
+                .enumerate()
+                .map(|(i, v)| vec![Value::Int(i as i64 + 1).text(), v.text()])
+                .collect();
+            assert_eq!(text(&out), expected, "{sql}");
         }
     }
 }

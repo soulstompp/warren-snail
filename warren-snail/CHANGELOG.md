@@ -52,7 +52,9 @@ at once, and a snail written inside a host that decides its commits.
 - The pipeline: `DISTINCT`; `LIMIT`, `OFFSET` and `FETCH FIRST`, `WITH TIES` among them, a question
   on one table taking them, or a `CASE`, a document's arrows or a parameter, read as a pipeline; a
   parameter typed by its context, as a quoted literal is; `GROUP BY` and `ORDER BY` naming a select
-  list's item by its place or its name; more windows and frames; the functions and operators of
+  list's item by its place or its name; windows on any order, partitioned or named, their frames
+  `ROWS`, `RANGE` and `GROUPS` offset from the current row, `EXCLUDE`, and 19's `RESPECT` and
+  `IGNORE NULLS`, refused in 18's words on a file of 18; the functions and operators of
   PostgreSQL's types, regular expressions matching as PostgreSQL's own engine matches; the command
   `functions` lists every function PostgreSQL defines and whether the snail answers it.
 - A pipeline over several relations: each step's `FROM` met as one relation, a join of tables in

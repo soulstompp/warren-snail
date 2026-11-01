@@ -664,7 +664,8 @@ by their values, NULLs as not distinct, each column typed as PostgreSQL's parser
 
 **The read it cancels.** The table held whole, and a sort for the window. The table's order is the
 window's order already, and each step holds only its running folds, its groups or the rows it
-sorts.
+sorts. A window on any other order holds its step's rows and sorts each partition on its own
+order.
 
 **How it shows.** The round reads along the table's order, and `--round` records `rows_held`, the
 most rows the pipeline held at once. A payments log, `payments.sql`:
@@ -714,11 +715,14 @@ balance.sql, round 1: 5 rows, along payments_pkey
 | 4 | 3 | 54.90 |
 | 5 | 9 | 48.00 |
 
-**Where it stops.** A window is read only along a table's order, where a step reads that table
-alone, ascending, where that order is one unique column, and its frame runs from the partition's
-first row to the current one, or to its last. `--param` gives `$1`, `$2` and on to a pipeline, as
-text. `warren-snail functions` counts the functions PostgreSQL defines: those the snail answers,
-those it does not read, and the server's own, which it refuses by name; `--out` lists each.
+**Where it stops.** A window folds as the blocks come only along a table's order, where a step
+reads that table alone, ascending, where that order is one unique column, and its frame runs from
+the partition's first row to the current one; any other window, on another order, `DESC` or
+`NULLS FIRST`, over a join, a frame offset from the current row, `GROUPS` or `EXCLUDE`, reads its
+step's rows whole. A window over a grouped step is refused by name. `--param` gives `$1`, `$2` and
+on to a pipeline, as text. `warren-snail functions` counts the functions PostgreSQL defines: those
+the snail answers, those it does not read, and the server's own, which it refuses by name; `--out`
+lists each.
 
 ## Checking an answer against PostgreSQL
 
@@ -861,8 +865,11 @@ name.
   `DISTINCT`; `HAVING`; `LIMIT`, `OFFSET` and `FETCH FIRST`, `WITH TIES` among them; `GROUP BY` and
   `ORDER BY` naming an item of the select list by its place or its name, `ORDER BY` an expression
   it does not return; the windows `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`,
-  `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` and the aggregates; `CASE`,
-  `COALESCE`, `LEAST`, `GREATEST`, `NULLIF`, `IN`, casts, comparisons and `IS [NOT] DISTINCT FROM`;
+  `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` and the aggregates, on any order,
+  partitioned or not, named in a `WINDOW` clause, their frames `ROWS`, `RANGE` and `GROUPS` offset
+  from the current row, whole partitions and `EXCLUDE`, and in a file of release 19 `RESPECT` and
+  `IGNORE NULLS`; `CASE`, `COALESCE`, `LEAST`, `GREATEST`, `NULLIF`, `IN`, casts, comparisons and
+  `IS [NOT] DISTINCT FROM`;
   the functions `warren-snail functions` names held and the operators `warren-snail operators`
   names held, regular expressions among them, matching as PostgreSQL's own engine matches;
   parameters `$1` and on. Each step's expressions are typed before
@@ -871,7 +878,7 @@ name.
 - **A statement:** as `exec` above.
 
 Anything else is refused, with a sentence that says what is not read: among it a subquery, a
-`LATERAL` subquery, `WITH RECURSIVE`, a window over a join, a locking clause (`FOR UPDATE`, `FOR
+`LATERAL` subquery, `WITH RECURSIVE`, a window over groups, a locking clause (`FOR UPDATE`, `FOR
 NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON CONFLICT`,
 `UPDATE … FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE`, a savepoint, and the isolation levels
 REPEATABLE READ and SERIALIZABLE. A statement sqlparser reads otherwise than it is written is

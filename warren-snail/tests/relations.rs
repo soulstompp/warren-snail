@@ -580,11 +580,11 @@ fn a_function_in_from_makes_rows_for_each_row_before_it() {
         "SELECT coalesce(t.id, t.v / 0) AS c FROM a.t t ORDER BY 1",
         &["1", "2", "3", "4", "5"],
     );
-    // A join's rows keep no table's order, so a window over them is refused by name.
-    assert!(refused(
+    // A join's rows keep no table's order, so a window over them reads them whole.
+    same(
         &path,
-        "WITH x AS (SELECT u.t_id FROM a.u u) SELECT t.id, row_number() OVER (ORDER BY t.id) AS n \
-         FROM a.t t JOIN x ON x.t_id = t.id"
-    )
-    .contains("a window is read only along the table's order"));
+        "WITH x AS (SELECT u.t_id FROM a.u u) SELECT t.id, rank() OVER (ORDER BY t.id) AS n \
+         FROM a.t t JOIN x ON x.t_id = t.id ORDER BY 1, 2",
+        &["1,1", "1,1", "2,3", "4,4"],
+    );
 }

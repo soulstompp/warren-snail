@@ -641,11 +641,21 @@ fn counted_along(s: &mut Snail, nulls: &str) -> Result<Vec<Counted>, String> {
 fn a_window_is_read_along_an_order_only_where_every_row_is_its_own_peer() {
     // A window folds its rows one at a time along the table's order, each its own peer. Two NULL
     // keys are peers where the order takes them as distinct, and NULLs first are not where the
-    // window's ascending order puts them.
-    let taken = |s: &mut Snail| counted_along(s, "");
+    // window's ascending order puts them: there the window reads the rows whole, sorted on its own
+    // order, and counts the same.
+    let sorted = |mut v: Vec<Counted>| {
+        v.sort();
+        v
+    };
+    let last = [
+        (None, Some(4)),
+        (Some(1), Some(1)),
+        (Some(2), Some(2)),
+        (Some(3), Some(3)),
+    ];
     let mut s = Snail::open(&window_snail("null-window", "(k) NULLS NOT DISTINCT")).unwrap();
     assert_eq!(
-        taken(&mut s).unwrap(),
+        counted_along(&mut s, "").unwrap(),
         [
             (Some(1), Some(1)),
             (Some(2), Some(2)),
@@ -653,13 +663,18 @@ fn a_window_is_read_along_an_order_only_where_every_row_is_its_own_peer() {
             (None, Some(4))
         ]
     );
-    let e = counted_along(&mut s, " NULLS FIRST").err().unwrap();
-    assert!(e.contains("a window is read only along"), "{e}");
+    assert_eq!(
+        sorted(counted_along(&mut s, " NULLS FIRST").unwrap()),
+        [
+            (None, Some(1)),
+            (Some(1), Some(2)),
+            (Some(2), Some(3)),
+            (Some(3), Some(4))
+        ]
+    );
     for index in ["(k)", "(k NULLS FIRST) NULLS NOT DISTINCT"] {
-        let e = taken(&mut Snail::open(&window_snail("null-window-refused", index)).unwrap())
-            .err()
-            .unwrap();
-        assert!(e.contains("a window is read only along"), "{index}: {e}");
+        let mut s = Snail::open(&window_snail("null-window-whole", index)).unwrap();
+        assert_eq!(sorted(counted_along(&mut s, "").unwrap()), last, "{index}");
     }
 }
 

@@ -726,7 +726,8 @@ impl Snails {
                                 .err()
                                 .unwrap_or_else(|| Error::new("a question is one SELECT")));
                         };
-                        let q = super::spelled::between_written(q);
+                        let q =
+                            super::pipeline::windows::written(&super::spelled::between_written(q))?;
                         let q = super::computed(&self.catalog, &q)?.unwrap_or(q);
                         let across = super::relations::Across {
                             snails: refs,
@@ -770,6 +771,7 @@ impl Snails {
 
     /// The snails whose tables a question names, in the order they were opened.
     fn snails_named(&self, sql: &str) -> Result<Vec<usize>> {
+        let sql = &*super::spelled::spelled(sql)?;
         let parsed =
             sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
         let mut names = Vec::new();
