@@ -63,18 +63,82 @@ impl Keep {
     }
 }
 
-/// The value a level of `column` keys from a value, where a kept read finds rows by it: an integer,
-/// or text compared by its bytes.
+/// The value a level of `column` keys from a value, where a kept read finds rows by it: none where
+/// no value of the level is it.
 fn kept_value(v: &Value, c: &Column) -> Option<KeyValue> {
-    match (v, c.ty) {
-        (Value::Int(x), ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8) => {
-            Some(KeyValue::Int(*x))
-        }
-        (Value::Text(s), ColumnType::Text(_)) if !c.collated() => Some(column_byte_key(
-            c,
-            &crate::strings::key_bytes(c.ty, s.as_bytes()),
+    let ty = c.ty;
+    let of_bytes = |b: &[u8]| -> Option<KeyValue> {
+        let key = crate::strings::column_key(ty, c.orderer().ok()?, b);
+        Some(column_byte_key(c, &key))
+    };
+    match v {
+        Value::Null | Value::Geometric(_) => None,
+        Value::Int(_) | Value::Num(..) if ty.is_numeric() => numeric_key(v, ty),
+        Value::Numeric(n) if ty.is_numeric() => match ty {
+            ColumnType::NumericText(_) => of_bytes(n.to_string().as_bytes()),
+            _ => numeric_key(&Value::of_numeric(n.clone()), ty),
+        },
+        Value::Int(x) if ty.is_integer() => Some(KeyValue::Int(*x)),
+        Value::Text(_) | Value::Str(..) if ty.is_string() => of_bytes(v.string_key()?),
+        Value::Bytes(b) if ty.keyed_by_bytes() => Some(crate::places::byte_key(ty, b)),
+        Value::Bits(_, k) if ty.is_bits() => Some(crate::places::byte_key(ty, k)),
+        Value::Typed(_, s) if ty.keyed_by_bytes() => Some(crate::places::byte_key(
+            ty,
+            &crate::strings::key_bytes(ty, s.as_bytes()),
         )),
+        Value::Typed(_, s) if ty.keyed_by_text() => of_bytes(s.as_bytes()),
+        Value::Bool(b) if ty == ColumnType::Boolean => Some(KeyValue::Int(i64::from(*b))),
+        Value::Uuid(k) if ty == ColumnType::Uuid => Some(KeyValue::Wide(*k)),
+        Value::Scalar(t, k) if *t == ty => Some(KeyValue::Int(*k)),
+        Value::Real(f) if ty == ColumnType::Float4 => {
+            Some(KeyValue::Int(crate::scalars::float4_key(f.to_bits())))
+        }
+        Value::Double(d) if ty == ColumnType::Float8 => {
+            Some(KeyValue::Int(crate::scalars::float8_key(d.to_bits())))
+        }
+        Value::Interval(i) if matches!(ty, ColumnType::Interval { .. }) => {
+            Some(KeyValue::Wide(i.total()))
+        }
+        Value::Composed(t, x) if *t == ty && !x.item.is_null() => match &x.item {
+            crate::composed::Item::Scalar(crate::read::statement::Datum::Int(rank)) if !ty.is_nested() => {
+                Some(KeyValue::Int(*rank))
+            }
+            _ if ty.is_nested() => Some(crate::places::byte_key(ty, x.hex.as_bytes())),
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+/// A number's key on a numeric(p, s) level: the integer of its smallest unit; a numeric of no fixed
+/// scale by its class's text. None where no value of the level is it.
+fn numeric_key(v: &Value, ty: ColumnType) -> Option<KeyValue> {
+    let (m, s) = v.numeric()?;
+    match ty {
+        ColumnType::Numeric { scale, .. } => {
+            let mut m = m;
+            let to = u32::try_from(scale).ok()?;
+            if s > to {
+                let d = 10i128.checked_pow(s - to)?;
+                if m % d != 0 {
+                    return None;
+                }
+                m /= d;
+            } else {
+                m = m.checked_mul(10i128.checked_pow(to - s)?)?;
+            }
+            match ty.is_wide() {
+                true => Some(KeyValue::Wide(m)),
+                false => Some(KeyValue::Int(i64::try_from(m).ok()?)),
+            }
+        }
+        _ => {
+            let n = v.to_numeric()?;
+            Some(crate::places::byte_key(
+                ty,
+                &crate::strings::key_bytes(ty, n.to_string().as_bytes()),
+            ))
+        }
     }
 }
 

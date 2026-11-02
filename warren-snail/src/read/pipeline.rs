@@ -97,7 +97,7 @@ impl Value {
     }
 
     /// The value as a numeric: its digits and scale.
-    fn numeric(&self) -> Option<(i128, u32)> {
+    pub(super) fn numeric(&self) -> Option<(i128, u32)> {
         match self {
             Value::Int(v) => Some((*v as i128, 0)),
             Value::Num(m, s) => Some((*m, *s)),
@@ -139,7 +139,7 @@ impl Value {
 
     /// The bytes a string is compared by, beside another string: text's and a name's own, a
     /// bpchar's without its trailing blanks.
-    fn string_key(&self) -> Option<&[u8]> {
+    pub(super) fn string_key(&self) -> Option<&[u8]> {
         match self {
             Value::Text(t) => Some(t.as_bytes()),
             Value::Str(ty, s) => Some(crate::strings::text_of(*ty, s).as_bytes()),
