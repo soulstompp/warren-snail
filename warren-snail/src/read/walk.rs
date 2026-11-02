@@ -588,6 +588,10 @@ pub fn s_column(s: Shape) -> usize {
     }
 }
 
+/// What an OR or a NOT reads of a block: its columns' names, and those past its first, each with its
+/// type and where its values start.
+type OpBeside<'a> = (Vec<String>, Vec<(ColumnType, usize, &'a Values)>);
+
 /// The columns a side's own conditions read.
 pub fn condition_columns(side: &Side) -> Vec<usize> {
     side.conds
@@ -596,6 +600,7 @@ pub fn condition_columns(side: &Side) -> Vec<usize> {
         .chain(side.texts.iter().map(|t| t.column))
         .chain(side.nulls.iter().map(|&(c, _)| c))
         .chain(side.ops.iter().map(|o| o.column))
+        .chain(side.ops.iter().flat_map(|o| o.beside.iter().map(|b| b.0)))
         .collect()
 }
 
@@ -1301,6 +1306,22 @@ impl Snail {
                         (o, table.columns[o.column].ty, start, v)
                     })
                     .collect();
+                let beside: Vec<OpBeside> = ops
+                    .iter()
+                    .map(|(o, ..)| {
+                        let mut names = vec![o.name.clone()];
+                        names.extend(o.beside.iter().map(|b| b.1.clone()));
+                        let others = o
+                            .beside
+                            .iter()
+                            .map(|b| {
+                                let (start, v) = column(b.0);
+                                (table.columns[b.0].ty, start, v)
+                            })
+                            .collect();
+                        (names, others)
+                    })
+                    .collect();
                 let outs: Vec<(bool, bool, usize, &Values)> = columns
                     .iter()
                     .map(|&(c, month)| {
@@ -1447,19 +1468,24 @@ impl Snail {
                             continue;
                         }
                         // A condition by an operator or a pattern, held as a pipeline holds it; one
-                        // it cannot hold fails the question. Every such condition is strict: a NULL
-                        // fails it.
+                        // it cannot hold fails the question. Every such condition but an OR's or a
+                        // NOT's is strict: a NULL fails it.
                         let mut kept = true;
-                        for &(o, ty, start, v) in &ops {
-                            if v.is_null(r - start) {
+                        for (&(o, ty, start, v), (names, others)) in ops.iter().zip(&beside) {
+                            if o.arms.is_none() && v.is_null(r - start) {
                                 kept = false;
                                 break;
                             }
                             let d = crate::values::datum_of(v, r - start, ty);
+                            let mut values = vec![super::fill::value_of(&d, ty)];
+                            for &(ty, start, v) in others {
+                                let d = crate::values::datum_of(v, r - start, ty);
+                                values.push(super::fill::value_of(&d, ty));
+                            }
                             let held = super::pipeline::eval_on(
                                 &o.expr,
-                                std::slice::from_ref(&o.name),
-                                &[super::fill::value_of(&d, ty)],
+                                names,
+                                &values,
                                 table.release,
                                 &casings,
                             )?;
@@ -1882,11 +1908,12 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             .position(|&s| s as usize == slot)
             .and_then(|k| e.spans.get(k));
         let inet = crate::spans::is_inet(table.columns[o.column].ty);
-        let ruled_out = e.columns[slot].nulls == e.rows
-            || o.probe.as_ref().is_some_and(|probe| {
-                span.is_some_and(|span| !crate::spans::may_hold(&o.op, span, probe, inet))
-                    || !crate::spans::box_may_hold(&o.op, probe, &e.columns[slot..])
-            });
+        let ruled_out = o.arms.is_none()
+            && (e.columns[slot].nulls == e.rows
+                || o.probe.as_ref().is_some_and(|probe| {
+                    span.is_some_and(|span| !crate::spans::may_hold(&o.op, span, probe, inet))
+                        || !crate::spans::box_may_hold(&o.op, probe, &e.columns[slot..])
+                }));
         if ruled_out {
             status = Status::None;
         } else {
@@ -1987,6 +2014,9 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     }
     for &oi in &op_may {
         need(side.ops[oi].column);
+        for b in &side.ops[oi].beside {
+            need(b.0);
+        }
     }
     for &ni in &null_may {
         need(side.nulls[ni].0);

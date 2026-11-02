@@ -1639,6 +1639,36 @@ pub fn gin_key(key: &str) -> Vec<u8> {
     element_bytes(&Tok::Key(key.to_string()), true)
 }
 
+/// A scalar a jsonpath compares with, as a jsonb holds it.
+pub(crate) enum GinScalar<'a> {
+    Null,
+    Bool(bool),
+    Num(&'a Numeric),
+    Str(&'a str),
+}
+
+/// The element a scalar is under `jsonb_ops`, a string as a key or as a value.
+pub(crate) fn gin_scalar(s: &GinScalar, as_key: bool) -> Vec<u8> {
+    let t = match s {
+        GinScalar::Null => Tok::Null,
+        GinScalar::Bool(b) => Tok::Bool(*b),
+        GinScalar::Num(n) => Tok::Num((*n).clone()),
+        GinScalar::Str(x) => Tok::Str(x.to_string()),
+    };
+    element_bytes(&t, as_key)
+}
+
+/// The element a scalar is under `jsonb_path_ops`, with the keys on its way down.
+pub(crate) fn gin_path_element(keys: &[&str], s: &GinScalar) -> Vec<u8> {
+    let mut out = Vec::new();
+    for k in keys {
+        out.extend_from_slice(k.as_bytes());
+        out.push(0);
+    }
+    out.extend(gin_scalar(s, false));
+    out
+}
+
 /// jsonb `?`, as `jsonb_exists` asks it: whether the key is a key of the object at the top, or a
 /// string element of the array there.
 pub fn jsonb_exists(doc: &str, key: &str) -> Result<bool> {

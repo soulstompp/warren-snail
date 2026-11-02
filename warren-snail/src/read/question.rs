@@ -319,6 +319,24 @@ pub struct OpCond {
     pub probe: Option<crate::spans::Probe>,
     /// The value it compares with, where an element strand may answer it.
     pub value: Option<super::statement::Datum>,
+    /// An OR or a NOT over conditions of this table: what its parts ask of the element strands. It
+    /// is held to a row with its NULLs, and reads the other columns `beside` names.
+    pub arms: Option<Arm>,
+    pub beside: Vec<(usize, String)>,
+}
+
+/// What a part of an OR or a NOT over conditions of one table asks of the element strands.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum Arm {
+    /// A condition an element strand may answer.
+    Op(Box<OpCond>),
+    /// A condition an order may answer, its rows found by their keys where it rules blocks out.
+    Read(Box<Side>),
+    /// A condition held a row at a time, asking nothing of a strand.
+    Held,
+    All(Vec<Arm>),
+    Any(Vec<Arm>),
 }
 
 impl Side {
@@ -371,7 +389,8 @@ impl Piece {
         match self {
             Piece::Cond(c) => !c.nulls,
             Piece::Null(_, null) => !null,
-            Piece::Text(_) | Piece::Empty | Piece::Op(_) => true,
+            Piece::Op(o) => o.arms.is_none(),
+            Piece::Text(_) | Piece::Empty => true,
         }
     }
 
@@ -1979,9 +1998,216 @@ fn comparable(
     Ok(())
 }
 
+/// A part of an OR or a NOT read on one table: what it asks of the element strands, the condition a
+/// row is held to, the columns it reads, and whether an operator a strand may answer stands in it.
+struct Arms {
+    side: usize,
+    arm: Arm,
+    expr: Expr,
+    columns: Vec<usize>,
+    element: bool,
+}
+
+/// The names of a condition read as its table's columns, written bare; false where it holds what a
+/// row is not held to here.
+fn own_names(e: &mut Expr, table: &Table, columns: &mut Vec<usize>) -> bool {
+    let mut one = |e: &mut Expr| own_names(e, table, columns);
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let name = match e {
+                Expr::Identifier(i) => ident(i),
+                Expr::CompoundIdentifier(p) => ident(p.last().expect("a name has a last part")),
+                _ => unreachable!("a name is one of these"),
+            };
+            let Some(c) = table.columns.iter().position(|x| x.name == name) else {
+                return false;
+            };
+            if !columns.contains(&c) {
+                columns.push(c);
+            }
+            *e = Expr::Identifier(sqlparser::ast::Ident::with_quote('"', name));
+            true
+        }
+        Expr::Value(_) => true,
+        Expr::Nested(x)
+        | Expr::UnaryOp { expr: x, .. }
+        | Expr::Cast { expr: x, .. }
+        | Expr::IsNull(x)
+        | Expr::IsNotNull(x)
+        | Expr::IsTrue(x)
+        | Expr::IsFalse(x)
+        | Expr::IsNotTrue(x)
+        | Expr::IsNotFalse(x)
+        | Expr::IsUnknown(x)
+        | Expr::IsNotUnknown(x) => one(x),
+        Expr::BinaryOp { left, right, .. }
+        | Expr::Like {
+            expr: left,
+            pattern: right,
+            ..
+        }
+        | Expr::ILike {
+            expr: left,
+            pattern: right,
+            ..
+        }
+        | Expr::SimilarTo {
+            expr: left,
+            pattern: right,
+            ..
+        } => one(left) && one(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => one(expr) && one(low) && one(high),
+        Expr::InList { expr, list, .. } => one(expr) && list.iter_mut().all(one),
+        _ => false,
+    }
+}
+
+/// An OR, a NOT or what stands under one, read on one table.
+fn arms_of(from: &From, e: &Expr) -> Result<Arms> {
+    let not_one = || Error::new(format!("{e} reads more than one table"));
+    match e {
+        Expr::Nested(x) => {
+            let mut a = arms_of(from, x)?;
+            a.expr = Expr::Nested(Box::new(a.expr));
+            Ok(a)
+        }
+        Expr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            right,
+        } => {
+            let (l, r) = (arms_of(from, left)?, arms_of(from, right)?);
+            if l.side != r.side {
+                return Err(not_one());
+            }
+            let mut columns = l.columns;
+            columns.extend(r.columns);
+            columns.sort_unstable();
+            columns.dedup();
+            Ok(Arms {
+                side: l.side,
+                arm: match op {
+                    BinaryOperator::And => Arm::All(vec![l.arm, r.arm]),
+                    _ => Arm::Any(vec![l.arm, r.arm]),
+                },
+                expr: Expr::BinaryOp {
+                    left: Box::new(l.expr),
+                    op: op.clone(),
+                    right: Box::new(r.expr),
+                },
+                columns,
+                element: l.element || r.element,
+            })
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => {
+            let inner = arms_of(from, expr)?;
+            Ok(Arms {
+                arm: Arm::Held,
+                expr: Expr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(inner.expr),
+                },
+                ..inner
+            })
+        }
+        e => {
+            let read = read_conjunct(from, e)?;
+            let side = match read.as_slice() {
+                [Conj::One(s, _), rest @ ..]
+                    if rest.iter().all(|c| matches!(c, Conj::One(t, _) if t == s)) =>
+                {
+                    *s
+                }
+                _ => return Err(not_one()),
+            };
+            if let [Conj::One(_, Piece::Op(o))] = read.as_slice() {
+                if o.value.is_some() {
+                    return Ok(Arms {
+                        side,
+                        arm: Arm::Op(Box::new(o.clone())),
+                        expr: o.expr.clone(),
+                        columns: vec![o.column],
+                        element: true,
+                    });
+                }
+            }
+            let (mut expr, mut columns) = (e.clone(), Vec::new());
+            if !own_names(&mut expr, from.table(side), &mut columns) {
+                return Err(Error::new(format!("{e} is not held a row at a time here")));
+            }
+            let mut own = Side {
+                table: from.tables[side].0,
+                goes_by: String::new(),
+                conds: Vec::new(),
+                texts: Vec::new(),
+                nulls: Vec::new(),
+                empty: false,
+                ops: Vec::new(),
+            };
+            for c in read {
+                if let Conj::One(_, piece) = c {
+                    own.take(piece, from.table(side));
+                }
+            }
+            Ok(Arms {
+                side,
+                arm: Arm::Read(Box::new(own)),
+                expr,
+                columns,
+                element: false,
+            })
+        }
+    }
+}
+
+/// An OR or a NOT over conditions of one table with an operator a strand may answer among them; none
+/// where it is any other, or reads what is not held a row at a time here.
+fn over_operators(from: &From, p: &Expr) -> Option<Conj> {
+    let mut e = p;
+    while let Expr::Nested(x) = e {
+        e = x;
+    }
+    if !matches!(
+        e,
+        Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            ..
+        } | Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let a = arms_of(from, e).ok().filter(|a| a.element)?;
+    let table = from.table(a.side);
+    let name = |c: usize| table.columns[c].name.clone();
+    Some(Conj::One(
+        a.side,
+        Piece::Op(OpCond {
+            column: a.columns[0],
+            expr: a.expr,
+            name: name(a.columns[0]),
+            op: String::new(),
+            probe: None,
+            value: None,
+            arms: Some(a.arm),
+            beside: a.columns[1..].iter().map(|&c| (c, name(c))).collect(),
+        }),
+    ))
+}
+
 /// What one conjunct says, as the conditions and comparisons PostgreSQL's analyser reads it as: a
 /// BETWEEN as its comparisons; a pattern as itself, and the keys its fixed prefix narrows to.
 fn read_conjunct(from: &From, p: &Expr) -> Result<Vec<Conj>> {
+    if let Some(read) = over_operators(from, p) {
+        return Ok(vec![read]);
+    }
     if let Some(read) = pattern(from, p)? {
         return Ok(read);
     }
@@ -2198,6 +2424,8 @@ fn pattern(from: &From, p: &Expr) -> Result<Option<Vec<Conj>>> {
             op: String::new(),
             probe: None,
             value: None,
+            arms: None,
+            beside: Vec::new(),
         }),
     )];
     if let Some(t) = super::prefix::narrowing(c, column, fixed)? {
@@ -2331,7 +2559,46 @@ fn between(
 }
 
 /// What one conjunct says: a condition on one table's column, or two tables' columns compared.
+/// `x @@@ y` as the `@@` it is on a tsvector and a tsquery; refused on a column of any other type, as
+/// PostgreSQL refuses it.
+fn three_ats(from: &From, p: &Expr) -> Result<Option<Expr>> {
+    let Expr::BinaryOp {
+        left,
+        op: op @ BinaryOperator::AtAt,
+        right,
+    } = p
+    else {
+        return Ok(None);
+    };
+    let Some(inner) = super::spelled::right_of_three_ats(right) else {
+        return Ok(None);
+    };
+    for e in [left.as_ref(), inner] {
+        if let Ok((side, Shape::Column(c))) = from.resolve(e) {
+            let ty = from.table(side).columns[c].ty;
+            if !matches!(
+                ty,
+                ColumnType::Textual(
+                    crate::textual::Textual::Tsvector | crate::textual::Textual::Tsquery
+                )
+            ) {
+                return Err(Error::new(format!(
+                    "operator does not exist: {} @@@ unknown",
+                    ty.pg_name()
+                )));
+            }
+        }
+    }
+    Ok(Some(Expr::BinaryOp {
+        left: left.clone(),
+        op: op.clone(),
+        right: Box::new(inner.clone()),
+    }))
+}
+
 fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
+    let matched = three_ats(from, p)?;
+    let p = matched.as_ref().unwrap_or(p);
     if let Some((side, cond)) = truth_test(from, p)? {
         return Ok(Conj::One(side, Piece::Cond(cond)));
     }
@@ -2774,6 +3041,8 @@ fn op_cond(
         op: seen.unwrap_or_default().to_string(),
         probe: seen.and(probe),
         value: None,
+        arms: None,
+        beside: Vec::new(),
     }))
 }
 

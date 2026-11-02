@@ -1080,6 +1080,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         });
     }
     super::question::unlocked_words(sql)?;
+    super::spelled::at_at_spaced(sql)?;
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
     let s = match statements.as_slice() {
         [s] => s,

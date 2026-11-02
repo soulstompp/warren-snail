@@ -4073,11 +4073,6 @@ impl Draft {
             .iter()
             .filter(|o| crate::methods::holds_elements(method, o))
             .count();
-        if elements > 0 && elements < opclasses.len() {
-            return Err(Error::new(format!(
-                "{shown}: a key held as an element strand beside a key of another kind is not held"
-            )));
-        }
         if elements > 0 {
             if !include.is_empty() {
                 notices.push(format!(
@@ -4191,27 +4186,41 @@ fn finish_table(d: &Declared) -> Result<Table> {
         }
     }
     let mut element_keys = Vec::new();
-    strands.retain(|s| {
-        if !s
+    strands.retain_mut(|s| {
+        let holds: Vec<bool> = s
             .opclasses
             .iter()
-            .any(|o| crate::methods::holds_elements(s.method, o))
-        {
+            .map(|o| crate::methods::holds_elements(s.method, o))
+            .collect();
+        if !holds.contains(&true) {
             return true;
         }
         for (n, (l, o)) in s.levels.iter().zip(&s.opclasses).enumerate() {
-            element_keys.push(crate::catalog::ElementKey {
-                index: s.name.clone(),
-                method: s.method,
-                column: l.column(),
-                opclass: o.clone(),
-                include: s.include.clone(),
-                options: s.options.clone(),
-                predicate: s.predicate.clone(),
-                strand: crate::read::elements::strand_name(name, &s.name, n),
-            });
+            if holds[n] {
+                element_keys.push(crate::catalog::ElementKey {
+                    index: s.name.clone(),
+                    method: s.method,
+                    column: l.column(),
+                    opclass: o.clone(),
+                    include: s.include.clone(),
+                    options: s.options.clone(),
+                    predicate: s.predicate.clone(),
+                    strand: crate::read::elements::strand_name(name, &s.name, n),
+                    key: n,
+                });
+            }
         }
-        false
+        // Keys of another kind beside them are a strand of their own.
+        let others: Vec<usize> = (0..holds.len()).filter(|&n| !holds[n]).collect();
+        fn kept<T: Clone>(v: &[T], at: &[usize]) -> Vec<T> {
+            at.iter().map(|&n| v[n].clone()).collect()
+        }
+        s.levels = kept(&s.levels, &others);
+        s.keys = kept(&s.keys, &others);
+        s.opclasses = kept(&s.opclasses, &others);
+        s.nulls_first = kept(&s.nulls_first, &others);
+        s.desc = kept(&s.desc, &others);
+        !others.is_empty()
     });
     let key: Vec<usize> = dedup(ordered.levels.iter().map(|l| l.column()));
     let mut orders = vec![Order {
@@ -4394,7 +4403,11 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        for o in &t.orders {
+        for o in t
+            .orders
+            .iter()
+            .filter(|o| !t.element_keys.iter().any(|k| k.index == o.name))
+        {
             let obj = format!("{}.{}", t.name, o.name);
             if let Some(k) = &o.constraint {
                 let ty = if k.primary { "p" } else { "u" };
@@ -4482,13 +4495,29 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 .filter(|x| x.index == k.index)
                 .collect();
             let obj = format!("{}.{}", t.name, k.index);
-            let each = |v: &str| vec![v; all.len()].join(",");
             let names = |c: &[usize]| {
                 let n: Vec<&str> = c.iter().map(|&i| t.columns[i].name.as_str()).collect();
                 n.join(",")
             };
-            let keys: Vec<usize> = all.iter().map(|x| x.column).collect();
-            let classes: Vec<&str> = all.iter().map(|x| x.opclass.as_str()).collect();
+            // Each key in its place: the elements', and those of another kind beside them.
+            let other = t.orders.iter().find(|o| o.name == k.index);
+            let mut others = other.iter().flat_map(|o| o.levels.iter().zip(&o.opclasses));
+            let total = all.len() + other.map_or(0, |o| o.levels.len());
+            let each = |v: &str| vec![v; total].join(",");
+            let (mut keys, mut classes): (Vec<usize>, Vec<&str>) = (Vec::new(), Vec::new());
+            for n in 0..total {
+                match all.iter().find(|x| x.key == n) {
+                    Some(x) => {
+                        keys.push(x.column);
+                        classes.push(&x.opclass);
+                    }
+                    None => {
+                        let (l, o) = others.next().expect("a key of another kind in its place");
+                        keys.push(l.column());
+                        classes.push(o);
+                    }
+                }
+            }
             let options: Vec<String> = k.options.iter().map(|(a, b)| format!("{a}={b}")).collect();
             fact("index", &obj, "method", k.method.name().into());
             fact("index", &obj, "unique", truth(false));

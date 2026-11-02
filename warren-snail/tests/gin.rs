@@ -377,14 +377,6 @@ fn a_gin_index_is_read_or_refused_as_postgresql_reads_it() {
         let got = outcomes(&format!("{table}\n{statement};"));
         assert_eq!(got[1], None, "{statement}");
     }
-    let got = outcomes(&format!(
-        "{table}\nCREATE INDEX e ON s.t USING gist (v, r);"
-    ));
-    let e = got[1].as_deref().unwrap();
-    assert!(
-        e.contains("beside a key of another kind is not held"),
-        "{e}"
-    );
     // A table refused takes its strands with it.
     let r = Catalog::read(
         "CREATE TABLE s.p (id int PRIMARY KEY, g geometry); \
@@ -494,6 +486,15 @@ fn a_table_is_not_clustered_on_an_element_strand() {
 
 /// A snail of `n` rows the function makes, each a text a column, its table `s.t` made from `ddl`.
 fn snail_of(name: &str, ddl: &str, n: i64, row: impl Fn(i64) -> Vec<Option<String>>) -> Snail {
+    fresh(&snail_at(name, ddl, n, row))
+}
+
+fn snail_at(
+    name: &str,
+    ddl: &str,
+    n: i64,
+    row: impl Fn(i64) -> Vec<Option<String>>,
+) -> std::path::PathBuf {
     let catalog = Catalog::parse(ddl).unwrap();
     let t = &catalog.tables[0];
     let mut columns: Vec<Values> = t.columns.iter().map(|c| Values::new(c.ty)).collect();
@@ -514,7 +515,7 @@ fn snail_of(name: &str, ddl: &str, n: i64, row: impl Fn(i64) -> Vec<Option<Strin
     }
     let path = tmp(&format!("{name}.snail"));
     write(&path, &catalog, &[("s.t".into(), Rows { columns })]).unwrap();
-    fresh(&path)
+    path
 }
 
 /// Each condition answered alike along each order named and by its pages; each round's pages as
@@ -1556,4 +1557,1439 @@ fn an_empty_array_lies_on_the_strand_where_no_array_holds_a_null() {
     let (all, round) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{}'", Some("t_a"));
     assert_eq!(all.len(), (0..n).filter(|i| i % 1000 != 0).count());
     assert_eq!(round.order, "t_pkey", "{round:?}");
+}
+
+/// The column pages each read of a round read, the strands' first, each by the order it went along.
+fn reads_of(round: &Round) -> Vec<(String, u64)> {
+    round
+        .reads
+        .iter()
+        .map(|r| (r.order.clone(), r.column_pages_read))
+        .collect()
+}
+
+const PATHS: &str = "CREATE TABLE s.t (id int NOT NULL, j jsonb, pad bigint, PRIMARY KEY (id)); \
+                     CREATE INDEX t_o ON s.t USING gin (j); \
+                     CREATE INDEX t_p ON s.t USING gin (j jsonb_path_ops);";
+
+/// Row `i`'s jsonb: an object of a few of many values, one whose key holds an array, one nested, and
+/// every 256th a scalar or an array at the top.
+fn path_doc(i: i64) -> Option<String> {
+    if i % 256 == 3 {
+        return Some(format!("\"k{}\"", i % 5));
+    }
+    if i % 256 == 7 {
+        return Some(format!("[\"k{}\", \"m{}\"]", i % 5, i % 9));
+    }
+    if i % 256 == 11 {
+        return None;
+    }
+    Some(match i % 3 {
+        0 => format!(
+            "{{\"a\": {}, \"b\": {}, \"z\": [{{\"y\": \"s{}\"}}]}}",
+            i % 7,
+            i % 997,
+            i % 13
+        ),
+        1 => format!(
+            "{{\"a\": [\"x{}\", {}.0], \"s\": [\"x{}\"]}}",
+            i % 11,
+            i % 5,
+            i % 11
+        ),
+        _ => format!(
+            "{{\"c\": {{\"d\": \"v{}\", \"e\": null, \"f\": true}}}}",
+            i % 13
+        ),
+    })
+}
+
+fn path_row(i: i64) -> Vec<Option<String>> {
+    vec![Some(i.to_string()), path_doc(i), Some(i.to_string())]
+}
+
+/// The rows of `n` holding what `f` asks of `i`, the three shapes above each its own.
+fn path_kept(n: i64, f: impl Fn(i64) -> bool) -> Vec<i32> {
+    (0..n)
+        .filter(|&i| ![3, 7, 11].contains(&(i % 256)) && f(i))
+        .map(|i| i as i32)
+        .collect()
+}
+
+#[test]
+fn a_path_s_equalities_read_its_strand_under_either_operator_class() {
+    let n = 20480;
+    let mut s = snail_of("gin-paths", PATHS, n, path_row);
+    let b = |i: i64, v: i64| i % 3 == 0 && i % 997 == v;
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        ("j @@ '$.b == 100'", path_kept(n, |i| b(i, 100))),
+        ("j @@ '100 == $.b'", path_kept(n, |i| b(i, 100))),
+        ("j @@ '$.b == 100.0'", path_kept(n, |i| b(i, 100))),
+        ("j @@ '$.b == 100'::jsonpath", path_kept(n, |i| b(i, 100))),
+        ("j @? '$ ? (@.b == 100)'", path_kept(n, |i| b(i, 100))),
+        ("j @? '$.b ? (@ == 100)'", path_kept(n, |i| b(i, 100))),
+        (
+            "j @@ 'exists($.b ? (@ == 100))'",
+            path_kept(n, |i| b(i, 100)),
+        ),
+        (
+            "j @@ '$.b == 100 || $.b == 101'",
+            path_kept(n, |i| b(i, 100) || b(i, 101)),
+        ),
+        (
+            "j @@ '$.b == 100 && $.a == 2'",
+            path_kept(n, |i| b(i, 100) && i % 7 == 2),
+        ),
+        (
+            "j @@ '$.b == 100 && $.a != 2'",
+            path_kept(n, |i| b(i, 100) && i % 7 != 2),
+        ),
+        (
+            "j @@ '$.b == 100 && $.a > 2'",
+            path_kept(n, |i| b(i, 100) && i % 7 > 2),
+        ),
+        (
+            "j @@ '!(!($.b == 100) || !($.a == 2))'",
+            path_kept(n, |i| b(i, 100) && i % 7 == 2),
+        ),
+        (
+            "j @@ '!(!($.b == 100) && !($.b == 101))'",
+            path_kept(n, |i| b(i, 100) || b(i, 101)),
+        ),
+        (
+            "j @@ '$.c.d == \"v5\"'",
+            path_kept(n, |i| i % 3 == 2 && i % 13 == 5),
+        ),
+        (
+            "j @@ 'strict $.c.d == \"v5\"'",
+            path_kept(n, |i| i % 3 == 2 && i % 13 == 5),
+        ),
+        ("j @@ '$.c.e == null'", path_kept(n, |i| i % 3 == 2)),
+        ("j @@ '$.c.f == true'", path_kept(n, |i| i % 3 == 2)),
+        ("j @@ '$.c.f == false'", Vec::new()),
+        (
+            "j @@ '$.a[*] == \"x5\"'",
+            path_kept(n, |i| i % 3 == 1 && i % 11 == 5),
+        ),
+        (
+            "j @@ 'strict $.s[*] == \"x5\"'",
+            path_kept(n, |i| i % 3 == 1 && i % 11 == 5),
+        ),
+        (
+            "j @@ 'strict $.s[0] == \"x5\"'",
+            path_kept(n, |i| i % 3 == 1 && i % 11 == 5),
+        ),
+        (
+            "j @@ '$.z[*].y == \"s5\"'",
+            path_kept(n, |i| i % 3 == 0 && i % 13 == 5),
+        ),
+        (
+            "j @@ '$.z.y == \"s5\"'",
+            path_kept(n, |i| i % 3 == 0 && i % 13 == 5),
+        ),
+        (
+            "j @? '$.z[*] ? (@.y == \"s5\").y'",
+            path_kept(n, |i| i % 3 == 0 && i % 13 == 5),
+        ),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert_eq!(
+            &ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        for strand in ["t_o", "t_p"] {
+            let (got, round) = ids(&mut s, &q, Some(strand));
+            assert_eq!(&got, want, "{q} along {strand}");
+            assert!(
+                round.order.starts_with(strand),
+                "{q} along {strand}: {round:?}"
+            );
+        }
+        assert_eq!(&ids(&mut s, &q, None).0, want, "{q} by its pages");
+    }
+    // Under `jsonb_ops` alone: an accessor `jsonb_path_ops` cannot follow.
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        (
+            "j @@ '$.c.* == \"v5\"'",
+            path_kept(n, |i| i % 3 == 2 && i % 13 == 5),
+        ),
+        (
+            "j @@ '$.c.** == \"v5\"'",
+            path_kept(n, |i| i % 3 == 2 && i % 13 == 5),
+        ),
+        (
+            "j @@ 'strict $.**.d == \"v5\"'",
+            path_kept(n, |i| i % 3 == 2 && i % 13 == 5),
+        ),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert_eq!(
+            &ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        let (got, round) = ids(&mut s, &q, Some("t_o"));
+        assert_eq!(&got, want, "{q} along t_o");
+        assert!(round.order.starts_with("t_o"), "{q}: {round:?}");
+        let (got, round) = ids(&mut s, &q, Some("t_p"));
+        assert_eq!(&got, want, "{q} along t_p");
+        assert_eq!(round.order, "t_pkey", "{q}: {round:?}");
+    }
+    // Each read's pages: the strand reading fewest, the table's order kept to the keys it found.
+    for (w, want) in [
+        ("j @@ '$.b == 100'", [("t_p", 3), ("t_pkey", 49)]),
+        (
+            "j @@ '$.b == 100 || $.b == 101'",
+            [("t_p", 3), ("t_pkey", 98)],
+        ),
+        ("j @@ '$.c.* == \"v5\"'", [("t_o", 27), ("t_pkey", 160)]),
+        ("j @@ '$.c.e == null'", [("t_p", 20), ("t_pkey", 160)]),
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let (_, round) = ids(&mut s, &q, None);
+        let want: Vec<(String, u64)> = want.iter().map(|(o, n)| (o.to_string(), *n)).collect();
+        assert_eq!(reads_of(&round), want, "{q}");
+    }
+    let (_, whole) = ids(&mut s, "SELECT id FROM s.t WHERE j @? '$'", None);
+    assert_eq!(
+        (whole.order.as_str(), whole.column_pages_read),
+        ("t_pkey", 160)
+    );
+}
+
+#[test]
+fn a_path_nothing_can_be_asked_from_reads_the_table_s_order() {
+    let n = 20480;
+    let mut s = snail_of("gin-paths-none", PATHS, n, path_row);
+    let (_, whole) = ids(&mut s, "SELECT id FROM s.t WHERE j @? '$'", Some("t_pkey"));
+    let cases = [
+        "j @? '$.a'",
+        "j @? '$.b ? (@ > 100)'",
+        "j @? '$.b == 100'",
+        "j @@ '$.b != 100'",
+        "j @@ '$.b > 100'",
+        "j @@ '!($.b == 100)'",
+        "j @@ '!($.b == 100 && $.a == 2)'",
+        "j @@ '!($.b == 100 || $.a == 2)'",
+        "j @@ '$.b == 100 || $.a > 2'",
+        "j @@ '$.b == $.a'",
+        "j @@ '$.a.type() == \"number\"'",
+        "j @@ '1 == 1'",
+        "j @@ '$.b'",
+        "j @@ '($.b == 100) is unknown'",
+        "j @@ '$.c.d like_regex \"^v5\"'",
+        "j @@ '$.c.d starts with \"v5\"'",
+    ];
+    for w in cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let (want, along) = ids(&mut s, &q, Some("t_pkey"));
+        assert_eq!(
+            along.column_pages_read, whole.column_pages_read,
+            "{q}: {along:?}"
+        );
+        let (got, round) = ids(&mut s, &q, None);
+        assert_eq!(got, want, "{q}");
+        assert_eq!(round.order, "t_pkey", "{q}: {round:?}");
+        assert_eq!(
+            round.column_pages_read, whole.column_pages_read,
+            "{q}: {round:?}"
+        );
+        for strand in ["t_o", "t_p"] {
+            let (got, round) = ids(&mut s, &q, Some(strand));
+            assert_eq!(got, want, "{q} along {strand}");
+            assert_eq!(round.order, "t_pkey", "{q} along {strand}: {round:?}");
+        }
+    }
+}
+
+/// A row the path passes on which each strand must not miss.
+#[test]
+fn what_must_hold_of_a_path_keeps_the_rows_postgresql_s_index_misses() {
+    let n = 20480;
+    let mut s = snail_of("gin-paths-misses", PATHS, n, path_row);
+    let raw = |i: i64, k: i64| i % 256 == 3 && i % 5 == k;
+    let in_array = |i: i64, k: i64| i % 256 == 7 && i % 5 == k;
+    let a_is = |i: i64, v: i64| ![3, 7, 11].contains(&(i % 256)) && i % 3 == 0 && i % 7 == v;
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        (
+            "j @@ 'strict $ == \"k1\"'",
+            (0..n).filter(|&i| raw(i, 1)).map(|i| i as i32).collect(),
+        ),
+        (
+            "j @? 'strict $ ? (@ == \"k1\")'",
+            (0..n).filter(|&i| raw(i, 1)).map(|i| i as i32).collect(),
+        ),
+        (
+            "j @@ '$ == \"k1\"'",
+            (0..n)
+                .filter(|&i| raw(i, 1) || in_array(i, 1))
+                .map(|i| i as i32)
+                .collect(),
+        ),
+        (
+            "j @@ 'strict $[*] == \"k1\"'",
+            (0..n)
+                .filter(|&i| in_array(i, 1))
+                .map(|i| i as i32)
+                .collect(),
+        ),
+        (
+            "j @@ '$.a == (-2).abs()'",
+            (0..n)
+                .filter(|&i| a_is(i, 2))
+                .map(|i| i as i32)
+                .chain((0..n).filter_map(|i| {
+                    (![3, 7, 11].contains(&(i % 256)) && i % 3 == 1 && i % 5 == 2)
+                        .then_some(i as i32)
+                }))
+                .collect::<std::collections::BTreeSet<i32>>()
+                .into_iter()
+                .collect(),
+        ),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert_eq!(
+            &ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        assert_eq!(&ids(&mut s, &q, Some("t_o")).0, want, "{q} along t_o");
+        assert_eq!(&ids(&mut s, &q, Some("t_p")).0, want, "{q} along t_p");
+        assert_eq!(&ids(&mut s, &q, None).0, want, "{q} by its pages");
+    }
+    // A NOT over an AND asks neither side of what it negates.
+    let q = "SELECT id FROM s.t WHERE j @@ '!(!($.b == 100) && $.a == 2)'";
+    let (want, _) = ids(&mut s, q, Some("t_pkey"));
+    let expect: Vec<i32> = (0..n)
+        .filter(|&i| {
+            let doc = ![3, 7, 11].contains(&(i % 256));
+            let (b, a) = (
+                doc && i % 3 == 0 && i % 997 == 100,
+                doc && i % 3 == 0 && i % 7 == 2,
+            );
+            // Its array beside a number compares a string with one: unknown, and no answer.
+            let unknown = doc && i % 3 == 1;
+            i % 256 != 11 && !unknown && (b || !a)
+        })
+        .map(|i| i as i32)
+        .collect();
+    assert_eq!(want, expect);
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, want);
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+}
+
+#[test]
+fn what_a_path_asks_is_what_each_operator_class_holds() {
+    use warren_snail::jsonb::{gin_elements, gin_key, gin_path_elements};
+    use warren_snail::jsonpath::{gin_asks, jsonpath_in, Asks};
+    let held = |p: &str| jsonpath_in(p).unwrap();
+    let ops = |p: &str, exists: bool| gin_asks(&held(p), exists, false).unwrap();
+    let path = |p: &str, exists: bool| gin_asks(&held(p), exists, true).unwrap();
+    let one = |doc: &str| gin_elements(doc).unwrap().remove(0);
+    let last = |doc: &str| gin_elements(doc).unwrap().pop().unwrap();
+    let on_path = |doc: &str| gin_path_elements(doc).unwrap().remove(0);
+    // A string in lax mode may stand in an array, a key to `jsonb_ops`, or under a key.
+    let string = |s: &str| {
+        Asks::Any(vec![
+            Asks::At(gin_key(s)),
+            Asks::At(last(&format!("{{\"k\": \"{s}\"}}"))),
+        ])
+    };
+    assert_eq!(
+        ops("$.a == \"x\"", false),
+        Some(Asks::All(vec![Asks::At(gin_key("a")), string("x")]))
+    );
+    assert_eq!(
+        ops("$.a.b == 1", false),
+        Some(Asks::All(vec![
+            Asks::At(gin_key("b")),
+            Asks::At(gin_key("a")),
+            Asks::At(last("{\"a\": 1}"))
+        ]))
+    );
+    assert_eq!(
+        ops("strict $.a == \"x\"", false),
+        Some(Asks::All(vec![
+            Asks::At(gin_key("a")),
+            Asks::At(last("{\"a\": \"x\"}"))
+        ]))
+    );
+    assert_eq!(
+        ops("strict $.a[*] == \"x\"", false),
+        Some(Asks::All(vec![
+            Asks::At(gin_key("a")),
+            Asks::At(gin_key("x"))
+        ]))
+    );
+    assert_eq!(ops("strict $.** == \"x\"", false), Some(string("x")));
+    assert_eq!(
+        ops("strict $.* == \"x\"", false),
+        Some(Asks::At(last("{\"a\": \"x\"}")))
+    );
+    // A jsonb that is one string holds it as a key.
+    assert_eq!(
+        ops("strict $ == \"x\"", false),
+        Some(Asks::At(one("\"x\"")))
+    );
+    assert_eq!(one("\"x\""), gin_key("x"));
+    // The keys on the way down, each scalar with them, an array adding nothing.
+    assert_eq!(
+        path("$.a[*].b == 1", false),
+        Some(Asks::At(on_path("{\"a\": {\"b\": 1}}")))
+    );
+    assert_eq!(
+        path("$.a == \"x\"", false),
+        Some(Asks::At(on_path("{\"a\": \"x\"}")))
+    );
+    assert_eq!(path("$ == true", false), Some(Asks::At(on_path("true"))));
+    assert_eq!(path("$.* == 1", false), None);
+    assert_eq!(path("$.** == 1", false), None);
+    // A filter asks what its condition asks, under the path so far.
+    assert_eq!(
+        path("$.a ? (@.b == 1).c == 2", false),
+        Some(Asks::All(vec![
+            Asks::At(on_path("{\"a\": {\"b\": 1}}")),
+            Asks::At(on_path("{\"a\": {\"c\": 2}}"))
+        ]))
+    );
+    assert_eq!(path("$.a.type() ? (@ == 1)", false), None);
+    assert_eq!(
+        path("$.a ? (@.b == 1).type() == 1", false),
+        Some(Asks::At(on_path("{\"a\": {\"b\": 1}}")))
+    );
+    // `@?` asks what a path's filters ask, and an existence nothing; `@@` asks of a predicate.
+    assert_eq!(ops("$.a", true), None);
+    assert_eq!(path("$.a", true), None);
+    assert_eq!(ops("$.a", false), None);
+    assert_eq!(ops("$.a == 1", true), None);
+    assert_eq!(
+        path("exists($.a ? (@ == 1))", false),
+        Some(Asks::At(on_path("{\"a\": 1}")))
+    );
+    // A numeral's scale is no matter; what is applied to a scalar makes it no scalar.
+    assert_eq!(
+        path("$.a == 1.50", false),
+        Some(Asks::At(on_path("{\"a\": 1.5}")))
+    );
+    assert_eq!(ops("$.a == (-1).abs()", false), None);
+    assert_eq!(ops("(-1).abs() == $.a", false), None);
+    assert_eq!(ops("($.a == 1).boolean()", false), None);
+    // An AND keeps what it can ask of one side; an OR needs both.
+    assert_eq!(
+        path("$.a == 1 && $.b > 1", false),
+        Some(Asks::At(on_path("{\"a\": 1}")))
+    );
+    assert_eq!(path("$.a == 1 || $.b > 1", false), None);
+    assert_eq!(
+        path("$.a == 1 || $.b == 2", false),
+        Some(Asks::Any(vec![
+            Asks::At(on_path("{\"a\": 1}")),
+            Asks::At(on_path("{\"b\": 2}"))
+        ]))
+    );
+    // A NOT turns them over, and asks nothing of what it negates.
+    assert_eq!(path("!($.a == 1)", false), None);
+    assert_eq!(path("!(exists($.a ? (@ == 1)))", false), None);
+    assert_eq!(
+        path("!(!($.a == 1))", false),
+        Some(Asks::At(on_path("{\"a\": 1}")))
+    );
+    assert_eq!(
+        path("!(!($.a == 1) || !($.b == 2))", false),
+        Some(Asks::All(vec![
+            Asks::At(on_path("{\"a\": 1}")),
+            Asks::At(on_path("{\"b\": 2}"))
+        ]))
+    );
+    assert_eq!(
+        path("!(!($.a == 1) && !($.b == 2))", false),
+        Some(Asks::Any(vec![
+            Asks::At(on_path("{\"a\": 1}")),
+            Asks::At(on_path("{\"b\": 2}"))
+        ]))
+    );
+    assert_eq!(path("!(!($.a == 1) && $.b == 2)", false), None);
+    assert_eq!(
+        path("!(!($.a == 1) || $.b == 2)", false),
+        Some(Asks::At(on_path("{\"a\": 1}")))
+    );
+    assert_eq!(
+        path("$.b == 1 && !($.a == 1)", false),
+        Some(Asks::At(on_path("{\"b\": 1}")))
+    );
+    // `$` starts over.
+    assert_eq!(
+        path("$.a ? ($.b == 1)", true),
+        Some(Asks::At(on_path("{\"b\": 1}")))
+    );
+}
+
+const OVER: &str =
+    "CREATE TABLE s.t (id int NOT NULL, a int[], v tsvector, n int, PRIMARY KEY (id)); \
+                    CREATE INDEX t_a ON s.t USING gin (a); \
+                    CREATE INDEX t_v ON s.t USING gin (v);";
+const OVER_ROWS: i64 = 20480;
+
+/// Row `i`'s array of a common element, a rare one and one whose rows lie together, a NULL every
+/// 50th; its tsvector the same, every 51st; `n` of ten, a NULL every 11th.
+fn over_row(i: i64) -> Vec<Option<String>> {
+    vec![
+        Some(i.to_string()),
+        (i % 50 != 0).then(|| format!("{{{},{},{}}}", i % 7, i % 997 + 100, 2000 + i / 256)),
+        (i % 51 != 0).then(|| format!("'w{}':1 'word{}':2 'z{}':3", i % 7, i % 997, i / 256)),
+        (i % 11 != 0).then(|| (i % 10).to_string()),
+    ]
+}
+
+fn over_kept(f: impl Fn(i64) -> bool) -> Vec<i32> {
+    (0..OVER_ROWS).filter(|&i| f(i)).map(|i| i as i32).collect()
+}
+
+/// Whether row `i`'s array, its tsvector, hold the element or the word: none where the column is NULL.
+fn rare_a(i: i64, x: i64) -> Option<bool> {
+    (i % 50 != 0).then_some(i % 997 + 100 == x)
+}
+fn rare_v(i: i64, x: i64) -> Option<bool> {
+    (i % 51 != 0).then_some(i % 997 == x)
+}
+fn or(a: Option<bool>, b: Option<bool>) -> bool {
+    a == Some(true) || b == Some(true)
+}
+
+#[test]
+fn an_or_over_a_strand_s_operators_reads_it_where_its_pages_are_fewer() {
+    let mut s = snail_of("gin-or", OVER, OVER_ROWS, over_row);
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        (
+            "a @> '{150}' OR a @> '{151}'",
+            over_kept(|i| or(rare_a(i, 150), rare_a(i, 151))),
+        ),
+        (
+            "a && '{150}' OR a @> '{151}'",
+            over_kept(|i| or(rare_a(i, 150), rare_a(i, 151))),
+        ),
+        (
+            "(a @> '{150}' OR a @> '{151}') OR a @> '{152}'",
+            over_kept(|i| or(rare_a(i, 150), rare_a(i, 151)) || rare_a(i, 152) == Some(true)),
+        ),
+        (
+            "a @> '{150,NULL}' OR a @> '{151}'",
+            over_kept(|i| rare_a(i, 151) == Some(true)),
+        ),
+        (
+            "a @> '{150}' OR a @> '{150}'",
+            over_kept(|i| rare_a(i, 150) == Some(true)),
+        ),
+        (
+            "(a @> '{150}' OR a @> '{151}') AND n > 3",
+            over_kept(|i| or(rare_a(i, 150), rare_a(i, 151)) && i % 11 != 0 && i % 10 > 3),
+        ),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert_eq!(
+            &ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        let (got, round) = ids(&mut s, &q, Some("t_a"));
+        assert_eq!(&got, want, "{q} along t_a");
+        assert!(round.order.starts_with("t_a+"), "{q}: {round:?}");
+        let (got, round) = ids(&mut s, &q, None);
+        assert_eq!(&got, want, "{q} by its pages");
+        assert!(round.order.starts_with("t_a+"), "{q}: {round:?}");
+    }
+    // Across two strands, each read for its own, the rows met by their keys.
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        (
+            "a @> '{150}' OR v @@ 'word60'",
+            over_kept(|i| or(rare_a(i, 150), rare_v(i, 60))),
+        ),
+        (
+            "v @@ 'word60' OR a @> '{150}'",
+            over_kept(|i| or(rare_a(i, 150), rare_v(i, 60))),
+        ),
+        (
+            "(a @> '{150}' AND v @@ 'word50') OR v @@ 'word60'",
+            over_kept(|i| {
+                rare_a(i, 150) == Some(true) && rare_v(i, 50) == Some(true)
+                    || rare_v(i, 60) == Some(true)
+            }),
+        ),
+        (
+            "(a @> '{150}' OR v @@ 'word60') AND (a @> '{3}' OR v @@ 'w3')",
+            over_kept(|i| {
+                or(rare_a(i, 150), rare_v(i, 60)) && i % 7 == 3 && (i % 50 != 0 || i % 51 != 0)
+            }),
+        ),
+        (
+            "(a @> '{150}' OR v @@ 'word60') AND v @@ 'w3'",
+            over_kept(|i| or(rare_a(i, 150), rare_v(i, 60)) && i % 7 == 3 && i % 51 != 0),
+        ),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert_eq!(
+            &ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        let (got, round) = ids(&mut s, &q, None);
+        assert_eq!(&got, want, "{q} by its pages");
+        assert!(
+            round.order.contains("t_pkey") && round.reads.len() >= 2,
+            "{q}: {round:?}"
+        );
+    }
+    // Named one strand of the two, the table's order is read, the other arm's rows being past it.
+    let q = "SELECT id FROM s.t WHERE a @> '{150}' OR v @@ 'word60'";
+    let (got, round) = ids(&mut s, q, Some("t_a"));
+    assert_eq!(got, over_kept(|i| or(rare_a(i, 150), rare_v(i, 60))));
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+    // Each read's pages, an element whose rows lie together, one spread over the table, none held.
+    let (_, whole) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE a IS NOT NULL",
+        Some("t_pkey"),
+    );
+    assert_eq!(whole.column_pages_read, 140);
+    for (w, want) in [
+        ("a @> '{2005}'", vec![("t_a", 3), ("t_pkey", 5)]),
+        (
+            "a @> '{2005}' OR a @> '{2006}'",
+            vec![("t_a", 3), ("t_pkey", 5)],
+        ),
+        (
+            "a @> '{2005}' OR a @> '{2070}'",
+            vec![("t_a", 6), ("t_pkey", 10)],
+        ),
+        (
+            "a @> '{2005}' OR v @@ 'z70'",
+            vec![("t_a", 3), ("t_v", 3), ("t_pkey", 16)],
+        ),
+        (
+            "(a @> '{2005}' OR a @> '{2006}') AND n > 3",
+            vec![("t_a", 3), ("t_pkey", 6)],
+        ),
+        (
+            "(a @> '{2005}' OR v @@ 'z70') AND v @@ 'w3'",
+            vec![("t_a", 3), ("t_v", 11), ("t_pkey", 16)],
+        ),
+        // Common elements read at most the table and their strand, as one element's do.
+        (
+            "a @> '{3}' OR a @> '{4}'",
+            vec![("t_a", 16), ("t_pkey", 140)],
+        ),
+        // No row holds them: nothing past the directory.
+        (
+            "a @> '{99999}' OR v @@ 'absent'",
+            vec![("t_a", 0), ("t_v", 0), ("t_pkey", 0)],
+        ),
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let (_, round) = ids(&mut s, &q, None);
+        let want: Vec<(String, u64)> = want.iter().map(|(o, n)| (o.to_string(), *n)).collect();
+        assert_eq!(reads_of(&round), want, "{q}");
+    }
+}
+
+#[test]
+fn an_or_that_could_pass_a_row_holding_nothing_reads_the_table_s_order() {
+    let mut s = snail_of("gin-or-whole", OVER, OVER_ROWS, over_row);
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        (
+            "a @> '{150}' OR n = 3",
+            over_kept(|i| rare_a(i, 150) == Some(true) || (i % 11 != 0 && i % 10 == 3)),
+        ),
+        (
+            "a @> '{150}' OR a IS NULL",
+            over_kept(|i| rare_a(i, 150) != Some(false)),
+        ),
+        (
+            "a IS NULL OR v @@ 'word60'",
+            over_kept(|i| i % 50 == 0 || rare_v(i, 60) == Some(true)),
+        ),
+        (
+            "a @> '{150}' OR n IS NULL",
+            over_kept(|i| rare_a(i, 150) == Some(true) || i % 11 == 0),
+        ),
+        (
+            "a @> '{150}' OR v @@ '!word60'",
+            over_kept(|i| rare_a(i, 150) == Some(true) || rare_v(i, 60) == Some(false)),
+        ),
+        (
+            "a @> '{150}' OR NOT v @@ 'word60'",
+            over_kept(|i| rare_a(i, 150) == Some(true) || rare_v(i, 60) == Some(false)),
+        ),
+        ("a @> '{150}' OR a @> '{}'", over_kept(|i| i % 50 != 0)),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let (got, along) = ids(&mut s, &q, Some("t_pkey"));
+        assert_eq!(&got, want, "{q} along the table's order");
+        let (got, round) = ids(&mut s, &q, None);
+        assert_eq!(&got, want, "{q} by its pages");
+        assert_eq!(round.order, "t_pkey", "{q}: {round:?}");
+        assert_eq!(round.column_pages_read, along.column_pages_read, "{q}");
+    }
+}
+
+#[test]
+fn a_tsquery_s_own_operators_read_the_strand_as_an_or_of_its_words_does() {
+    let mut s = snail_of("gin-tsquery-ops", OVER, OVER_ROWS, over_row);
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        (
+            "v @@ 'word60 | word61'",
+            over_kept(|i| or(rare_v(i, 60), rare_v(i, 61))),
+        ),
+        (
+            "v @@ 'word60 & w4'",
+            over_kept(|i| rare_v(i, 60) == Some(true) && i % 7 == 4),
+        ),
+        (
+            "v @@ 'word60 & !w4'",
+            over_kept(|i| rare_v(i, 60) == Some(true) && i % 7 != 4),
+        ),
+        (
+            "v @@ 'w4 <-> word60'",
+            over_kept(|i| rare_v(i, 60) == Some(true) && i % 7 == 4),
+        ),
+        (
+            "v @@ '(word60 | word61) & !(w4 | w5)'",
+            over_kept(|i| or(rare_v(i, 60), rare_v(i, 61)) && i % 7 != 4 && i % 7 != 5),
+        ),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert_eq!(
+            &ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        let (got, round) = ids(&mut s, &q, Some("t_v"));
+        assert_eq!(&got, want, "{q} along t_v");
+        assert!(round.order.starts_with("t_v+"), "{q}: {round:?}");
+        let (got, round) = ids(&mut s, &q, None);
+        assert_eq!(&got, want, "{q} by its pages");
+        assert!(round.order.starts_with("t_v+"), "{q}: {round:?}");
+    }
+    for (w, want) in [
+        ("v @@ 'z5 | z6'", [("t_v", 7), ("t_pkey", 6)]),
+        ("v @@ 'z5 & w4'", [("t_v", 11), ("t_pkey", 4)]),
+        ("v @@ 'z5 & !w4'", [("t_v", 3), ("t_pkey", 4)]),
+        ("v @@ 'w4 <-> word60'", [("t_v", 11), ("t_pkey", 6)]),
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let (_, round) = ids(&mut s, &q, None);
+        let want: Vec<(String, u64)> = want.iter().map(|(o, n)| (o.to_string(), *n)).collect();
+        assert_eq!(reads_of(&round), want, "{q}");
+    }
+    let (_, one) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE v @@ 'word60 | word61'",
+        None,
+    );
+    let (_, two) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE v @@ 'word60' OR v @@ 'word61'",
+        None,
+    );
+    assert_eq!(reads_of(&one), reads_of(&two));
+    // What asks nothing of any word reads the table's order, the strand named or not.
+    for w in [
+        "v @@ '!word60'",
+        "v @@ 'word60 | !word61'",
+        "v @@ '!(word60 & word61)'",
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let (want, _) = ids(&mut s, &q, Some("t_pkey"));
+        for along in [Some("t_v"), None] {
+            let (got, round) = ids(&mut s, &q, along);
+            assert_eq!(got, want, "{q}");
+            assert_eq!(round.order, "t_pkey", "{q}: {round:?}");
+        }
+    }
+}
+
+#[test]
+fn a_not_on_its_own_reads_the_table_s_order_and_beside_a_condition_is_held_to_each_row() {
+    let mut s = snail_of("gin-not", OVER, OVER_ROWS, over_row);
+    let (_, whole_a) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE a IS NOT NULL",
+        Some("t_pkey"),
+    );
+    assert_eq!(whole_a.column_pages_read, 140);
+    let cases: Vec<(&str, Vec<i32>)> = vec![
+        (
+            "NOT a @> '{150}'",
+            over_kept(|i| rare_a(i, 150) == Some(false)),
+        ),
+        (
+            "NOT (a @> '{150}' OR a @> '{151}')",
+            over_kept(|i| i % 50 != 0 && !or(rare_a(i, 150), rare_a(i, 151))),
+        ),
+        (
+            "NOT (a @> '{150}' AND a @> '{3}')",
+            over_kept(|i| i % 50 != 0 && !(rare_a(i, 150) == Some(true) && i % 7 == 3)),
+        ),
+    ];
+    for (w, want) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        for along in [Some("t_pkey"), Some("t_a"), None] {
+            let (got, round) = ids(&mut s, &q, along);
+            assert_eq!(&got, want, "{q} along {along:?}");
+            assert_eq!(round.order, "t_pkey", "{q} along {along:?}: {round:?}");
+            assert!(
+                round.reads.iter().all(|r| !r.order.starts_with("t_a")),
+                "{round:?}"
+            );
+            assert_eq!(
+                round.column_pages_read, whole_a.column_pages_read,
+                "{q}: {round:?}"
+            );
+        }
+    }
+    // Beside a condition a strand answers, the strand is read and the NOT held to its rows.
+    let q = "SELECT id FROM s.t WHERE a @> '{2005}' AND NOT a @> '{3}'";
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(
+        got,
+        over_kept(|i| i % 50 != 0 && i / 256 == 5 && i % 7 != 3)
+    );
+    assert_eq!(
+        reads_of(&round),
+        [("t_a".to_string(), 3), ("t_pkey".to_string(), 5)]
+    );
+    // Beside a condition on the table's key, its range is read.
+    let q = "SELECT id FROM s.t WHERE id < 1000 AND NOT a @> '{3}'";
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, over_kept(|i| i < 1000 && i % 50 != 0 && i % 7 != 3));
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+    assert!(
+        round.column_pages_read * 5 < whole_a.column_pages_read,
+        "{round:?}"
+    );
+    // A NULL is no answer to a NOT, nor to an OR of nothing but NULLs and falses.
+    let q = "SELECT id FROM s.t WHERE NOT v @@ 'word60' OR NOT a @> '{150}'";
+    let (got, _) = ids(&mut s, q, None);
+    assert_eq!(
+        got,
+        over_kept(|i| rare_v(i, 60) == Some(false) || rare_a(i, 150) == Some(false))
+    );
+}
+
+#[test]
+fn an_or_is_priced_and_scanned_along_its_strands() {
+    let mut s = snail_of("gin-or-scan", OVER, OVER_ROWS, over_row);
+    let q = "SELECT id FROM s.t WHERE a @> '{150}' OR v @@ 'word60'";
+    let (want, round) = ids(&mut s, q, None);
+    let price = s.price(q, None).unwrap();
+    assert_eq!(price.order, "t_a+t_v+t_pkey", "{price:?}");
+    assert!(
+        price.column_pages >= round.column_pages_read,
+        "{price:?} {round:?}"
+    );
+    assert!(price.rows_low as usize <= want.len() && want.len() as u64 <= price.rows_high);
+    let mut scan = s.scan(q, None).unwrap();
+    let mut got = Vec::new();
+    while let Some(b) = s.next_block(&mut scan).unwrap() {
+        got.extend(ids_of(&b));
+    }
+    got.sort_unstable();
+    assert_eq!(got, want);
+    let r = scan.round();
+    assert!(r.order.contains("t_a") && r.order.contains("t_v"), "{r:?}");
+    exact(q, &r);
+    // A count is no element's count: its arms may hold one row twice.
+    let q = "SELECT count(*) FROM s.t WHERE a @> '{150}' OR a @> '{151}'";
+    let (c, round) = count(&mut s, q, None);
+    assert_eq!(
+        c as usize,
+        over_kept(|i| or(rare_a(i, 150), rare_a(i, 151))).len()
+    );
+    assert!(round.order.starts_with("t_a+"), "{round:?}");
+    // A condition by a NOT reads its column though no answer asks it; another column besides.
+    let q = "SELECT count(*) FROM s.t WHERE NOT a @> '{150}' OR n = 3";
+    let (c, _) = count(&mut s, q, None);
+    assert_eq!(
+        c as usize,
+        over_kept(|i| rare_a(i, 150) == Some(false) || (i % 11 != 0 && i % 10 == 3)).len()
+    );
+    // Its price reads the table's order where the strands would not pay.
+    let q = "SELECT id FROM s.t WHERE a @> '{150}' OR n = 3";
+    assert_eq!(s.price(q, None).unwrap().order, "t_pkey");
+}
+
+#[test]
+fn a_join_reads_a_side_s_or_along_its_strands() {
+    let ddl = format!("{OVER} CREATE TABLE s.u (id int NOT NULL, x bigint, PRIMARY KEY (id));");
+    let catalog = Catalog::parse(&ddl).unwrap();
+    let n = 8192i64;
+    let t = catalog.table("s.t").unwrap();
+    let mut columns: Vec<Values> = t.columns.iter().map(|c| Values::new(c.ty)).collect();
+    for i in 0..n {
+        for ((v, c), x) in columns.iter_mut().zip(&t.columns).zip(&over_row(i)) {
+            match (v, c.ty, x) {
+                (Values::Int(a), _, x) => a.push(x.as_ref().map(|s| s.parse().unwrap())),
+                (Values::Composed(a), ty, x) => a.push(composed(ty, x.as_deref())),
+                (v, ColumnType::Textual(t), Some(x)) => push_datum(
+                    v,
+                    &Datum::Text(warren_snail::textual::text_in(t, x).unwrap()),
+                ),
+                (v, _, _) => v.push_null(),
+            }
+        }
+    }
+    let path = tmp("gin-or-join.snail");
+    write(
+        &path,
+        &catalog,
+        &[
+            ("s.t".into(), Rows { columns }),
+            (
+                "s.u".into(),
+                Rows {
+                    columns: vec![
+                        Values::Int((0..n).map(Some).collect()),
+                        Values::Int((0..n).map(|i| Some(i * 2)).collect()),
+                    ],
+                },
+            ),
+        ],
+    )
+    .unwrap();
+    let mut s = fresh(&path);
+    let q = "SELECT x.id, u.x FROM s.t x JOIN s.u u ON x.id = u.id \
+             WHERE x.a @> '{150}' OR x.v @@ 'word60'";
+    let (b, round) = s.ask(q, None).unwrap();
+    exact(q, &round);
+    let want = (0..n)
+        .filter(|&i| or(rare_a(i, 150), rare_v(i, 60)))
+        .count();
+    assert_eq!(b.num_rows(), want);
+    assert!(
+        round.order.contains("t_a") && round.order.contains("t_v"),
+        "{round:?}"
+    );
+    // Written whole, one side's own name on each part.
+    let q = "SELECT s.t.id FROM s.t JOIN s.u ON s.t.id = s.u.id \
+             WHERE (s.t.a @> '{150}' OR s.t.n = 3) AND s.t.v @@ 'w3'";
+    let (b, round) = s.ask(q, None).unwrap();
+    exact(q, &round);
+    let want = (0..n)
+        .filter(|&i| {
+            (rare_a(i, 150) == Some(true) || (i % 11 != 0 && i % 10 == 3))
+                && i % 51 != 0
+                && i % 7 == 3
+        })
+        .count();
+    assert_eq!(b.num_rows(), want);
+}
+
+const THREE_ATS: &str =
+    "CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, t text, j jsonb, n int, \
+                         PRIMARY KEY (id)); \
+                         CREATE INDEX t_v ON s.t USING gin (v); \
+                         CREATE INDEX t_q ON s.t USING gist (q);";
+
+fn three_ats_row(i: i64) -> Vec<Option<String>> {
+    vec![
+        Some(i.to_string()),
+        (i % 13 != 0).then(|| format!("'w{}':1 'word{}':2", i % 7, i % 397)),
+        Some(format!("'word{}'", i % 397)),
+        Some(format!("word{}", i % 397)),
+        Some(format!("{{\"a\": {}}}", i % 7)),
+        Some((i % 10).to_string()),
+    ]
+}
+
+#[test]
+fn three_ats_read_as_the_match_they_are_where_they_can_be_told_apart() {
+    let n = 8192;
+    let mut s = snail_of("gin-three-ats", THREE_ATS, n, three_ats_row);
+    let word = |i: i64, w: i64| i % 13 != 0 && i % 397 == w;
+    for w in [
+        "v @@@ 'word60'",
+        "'word60' @@@ v",
+        "v @@@ 'word60'::tsquery",
+        "'word60'::tsquery @@@ v",
+        "v @@@ to_tsquery('simple', 'word60')",
+        "v @@@ 'word60' AND n >= 0",
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let want: Vec<i32> = (0..n).filter(|&i| word(i, 60)).map(|i| i as i32).collect();
+        assert_eq!(
+            ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        assert_eq!(ids(&mut s, &q, Some("t_v")).0, want, "{q} along t_v");
+        let (got, round) = ids(&mut s, &q, None);
+        assert_eq!(got, want, "{q} by its pages");
+        assert!(round.order.starts_with("t_v"), "{q}: {round:?}");
+    }
+    // As `@@`, a word for word: the same reads, its count closed.
+    let (_, three) = ids(&mut s, "SELECT id FROM s.t WHERE v @@@ 'word60'", None);
+    let (_, two) = ids(&mut s, "SELECT id FROM s.t WHERE v @@ 'word60'", None);
+    assert_eq!(reads_of(&three), reads_of(&two));
+    let (c, round) = count(
+        &mut s,
+        "SELECT count(*) FROM s.t WHERE v @@@ 'word60'",
+        None,
+    );
+    assert_eq!(c as usize, (0..n).filter(|&i| word(i, 60)).count());
+    assert_eq!(round.order, "t_v", "{round:?}");
+    // Under an OR and a NOT, each row is held to it.
+    let (got, round) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE v @@@ 'word60' OR v @@@ 'word61'",
+        None,
+    );
+    let want: Vec<i32> = (0..n)
+        .filter(|&i| word(i, 60) || word(i, 61))
+        .map(|i| i as i32)
+        .collect();
+    assert_eq!(got, want);
+    assert!(round.order.starts_with("t_v+"), "{round:?}");
+    let (got, _) = ids(&mut s, "SELECT id FROM s.t WHERE NOT v @@@ 'word60'", None);
+    assert_eq!(
+        got.len(),
+        (0..n).filter(|&i| i % 13 != 0 && i % 397 != 60).count()
+    );
+    // Two columns, and a tsquery on its left: a row at a time.
+    let rows = |s: &mut Snail, q: &str| s.ask(q, None).unwrap().0.num_rows();
+    let q = "SELECT id FROM s.t WHERE v @@@ q";
+    assert_eq!(rows(&mut s, q), (0..n).filter(|&i| i % 13 != 0).count());
+    let q = "SELECT id FROM s.t WHERE q @@@ v";
+    assert_eq!(rows(&mut s, q), (0..n).filter(|&i| i % 13 != 0).count());
+    let q = "SELECT id FROM s.t WHERE q @@@ 'word60'";
+    assert_eq!(rows(&mut s, q), (0..n).filter(|&i| i % 397 == 60).count());
+    let (b, _) = s
+        .ask(
+            "WITH h AS (SELECT id, v, q FROM s.t) SELECT id, v @@@ q AS m FROM h WHERE id < 3",
+            None,
+        )
+        .unwrap();
+    assert_eq!(b.num_rows(), 3);
+    // On no text search type, no such operator.
+    for w in [
+        "t @@@ 'word60'",
+        "'word60' @@@ t",
+        "j @@@ '$.a == 1'",
+        "n @@@ 'x'",
+        "'a' @@@ 'b'",
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert!(s.ask(&q, None).is_err(), "{q}");
+    }
+    // `@@` and a prefix `@` written apart are two operators, each refused as PostgreSQL refuses it.
+    for w in ["v @@ @ 'word60'", "v @@  @ 1", "v @@\n@ 'word60'"] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let e = s
+            .ask(&q, None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("operator"), "{q}: {e}");
+    }
+    // A string or a comment holding them is no operator.
+    let (got, _) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE t = '@@ @ ' /* @@ @ */",
+        None,
+    );
+    assert!(got.is_empty());
+}
+
+const BESIDE: &str =
+    "CREATE TABLE s.t (id int NOT NULL, v tsvector, r int4range, n int, PRIMARY KEY (id)); \
+                      CREATE INDEX t_vr ON s.t USING gist (v, r);";
+
+fn beside_row(i: i64) -> Vec<Option<String>> {
+    vec![
+        Some(i.to_string()),
+        (i % 13 != 0).then(|| format!("'w{}':1 'word{}':2", i % 7, i % 997)),
+        (i % 17 != 0).then(|| format!("[{i},{})", i + 3)),
+        Some((i % 10).to_string()),
+    ]
+}
+
+#[test]
+fn a_gist_index_beside_a_key_of_another_kind_holds_a_strand_of_each() {
+    let table =
+        "CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, r int4range, m int4multirange, \
+                 i inet, n int, PRIMARY KEY (id));";
+    let c = Catalog::parse(&format!(
+        "{table}\nCREATE INDEX e ON s.t USING gist (v, r);"
+    ))
+    .unwrap();
+    let t = c.table("s.t").unwrap();
+    // The range's keys an order on the table; the tsvector a strand of its own.
+    let order = t.orders.iter().find(|o| o.name == "e").unwrap();
+    assert_eq!(order.levels.len(), 1);
+    assert_eq!(order.keys, ["r"]);
+    assert_eq!(order.opclasses, ["range_ops"]);
+    assert_eq!(t.element_keys.len(), 1);
+    assert_eq!(t.element_keys[0].key, 0);
+    assert_eq!(t.element_keys[0].opclass, "tsvector_ops");
+    assert!(c.table(&t.element_keys[0].strand).is_some());
+    // One index to the catalog, its keys in their places.
+    let facts = c.facts();
+    let told = |object: &str, fact: &str| -> Vec<String> {
+        facts
+            .iter()
+            .filter(|f| f.object == object && f.fact == fact)
+            .map(|f| f.value.clone())
+            .collect()
+    };
+    assert_eq!(told("s.t.e", "keys"), ["v,r"]);
+    assert_eq!(told("s.t.e", "opclasses"), ["tsvector_ops,range_ops"]);
+    assert_eq!(told("s.t.e", "method"), ["gist"]);
+    assert_eq!(told("s.t.e", "desc"), ["false,false"]);
+    assert_eq!(told("s.t.e", "nulls_first"), ["false,false"]);
+    let c = Catalog::parse(&format!(
+        "{table}\nCREATE INDEX e ON s.t USING gist (r, v, m, q) WHERE n > 0;"
+    ))
+    .unwrap();
+    let t = c.table("s.t").unwrap();
+    let order = t.orders.iter().find(|o| o.name == "e").unwrap();
+    assert_eq!(order.keys, ["r", "m"]);
+    assert!(order.predicate.is_some());
+    assert_eq!(
+        t.element_keys.iter().map(|k| k.key).collect::<Vec<_>>(),
+        [1, 3]
+    );
+    assert!(t.element_keys.iter().all(|k| k.predicate.is_some()));
+    let facts = c.facts();
+    let told = |fact: &str| -> String {
+        facts
+            .iter()
+            .find(|f| f.object == "s.t.e" && f.fact == fact)
+            .map(|f| f.value.clone())
+            .unwrap()
+    };
+    assert_eq!(told("keys"), "r,v,m,q");
+    assert_eq!(
+        told("opclasses"),
+        "range_ops,tsvector_ops,multirange_ops,tsquery_ops"
+    );
+    // Refused as ever: a key no GiST holds, a key PostgreSQL refuses.
+    let got = outcomes(&format!(
+        "{table}\nCREATE INDEX e ON s.t USING gist (v, n);"
+    ));
+    assert!(
+        got[1]
+            .as_deref()
+            .unwrap()
+            .contains("no default operator class"),
+        "{got:?}"
+    );
+    // Clustered on it, the table has no order one row a place.
+    let got = outcomes(&format!(
+        "{table}\nCREATE INDEX e ON s.t USING gist (v, r);\nALTER TABLE s.t CLUSTER ON e;"
+    ));
+    assert!(got[2].as_deref().unwrap().contains("element"), "{got:?}");
+    // A format with no strands refuses it by name.
+    let path = tmp("gin-beside-eight.snail");
+    let e = warren_snail::write::write_format_eight(
+        &path,
+        &Catalog::parse(&format!(
+            "{table}\nCREATE INDEX e ON s.t USING gist (v, r);"
+        ))
+        .unwrap(),
+        &[],
+        weather::span(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(
+        e.contains("the gist index e, which a snail of format 8"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_gist_index_beside_another_kind_reads_each_key_where_it_serves() {
+    let n = 20480;
+    let mut s = snail_of("gin-beside", BESIDE, n, beside_row);
+    let word = |i: i64, w: i64| i % 13 != 0 && i % 997 == w;
+    let span = |i: i64, lo: i64, hi: i64| i % 17 != 0 && i < hi && i + 3 > lo;
+    let kept = |f: &dyn Fn(i64) -> bool| -> Vec<i32> {
+        (0..n).filter(|&i| f(i)).map(|i| i as i32).collect()
+    };
+    // On the range alone: its order, by its bounds.
+    let q = "SELECT id FROM s.t WHERE r && '[5000,5040)'";
+    let want = kept(&|i| span(i, 5000, 5040));
+    assert_eq!(ids(&mut s, q, Some("t_pkey")).0, want);
+    let (got, along) = ids(&mut s, q, Some("t_vr"));
+    assert_eq!(got, want);
+    assert_eq!(along.order, "t_vr", "{along:?}");
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, want);
+    assert_eq!(round.order, "t_vr", "{round:?}");
+    assert_eq!(
+        (along.column_pages_read, along.blocks_read),
+        (11, 1),
+        "{along:?}"
+    );
+    // On the tsvector alone: its strand, the rows by their keys.
+    let q = "SELECT id FROM s.t WHERE v @@ 'word60'";
+    let want = kept(&|i| word(i, 60));
+    assert_eq!(ids(&mut s, q, Some("t_pkey")).0, want);
+    let (got, along) = ids(&mut s, q, Some("t_vr"));
+    assert_eq!(got, want);
+    assert!(along.order.starts_with("t_vr+"), "{along:?}");
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, want);
+    assert!(round.order.starts_with("t_vr+"), "{round:?}");
+    assert_eq!(
+        reads_of(&round),
+        [("t_vr".to_string(), 3), ("t_pkey".to_string(), 38)]
+    );
+    // On both: one read, or the other kept to its keys, each row held to both.
+    let q = "SELECT id FROM s.t WHERE v @@ 'word60' AND r && '[0,10000)'";
+    let want = kept(&|i| word(i, 60) && span(i, 0, 10000));
+    assert_eq!(ids(&mut s, q, Some("t_pkey")).0, want);
+    assert_eq!(ids(&mut s, q, Some("t_vr")).0, want);
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, want);
+    assert_eq!(
+        reads_of(&round),
+        [
+            ("t_vr".to_string(), 55),
+            ("t_vr".to_string(), 3),
+            ("t_pkey".to_string(), 45)
+        ]
+    );
+    let q = "SELECT id FROM s.t WHERE v @@ 'word60' AND r && '[5000,5040)'";
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, kept(&|i| word(i, 60) && span(i, 5000, 5040)));
+    assert_eq!(
+        reads_of(&round),
+        [
+            ("t_vr".to_string(), 11),
+            ("t_vr".to_string(), 3),
+            ("t_pkey".to_string(), 0)
+        ]
+    );
+    // The tsvector's condition asks nothing: the table's order holds it, named or not.
+    let q = "SELECT id FROM s.t WHERE v @@ '!word60'";
+    let want = kept(&|i| i % 13 != 0 && i % 997 != 60);
+    assert_eq!(ids(&mut s, q, Some("t_pkey")).0, want);
+    let (got, round) = ids(&mut s, q, Some("t_vr"));
+    assert_eq!(got, want);
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+    assert_eq!(ids(&mut s, q, None).0, want);
+    // A count on one word closes on its counts; a price names the strand or the order it reads.
+    let (c, round) = count(&mut s, "SELECT count(*) FROM s.t WHERE v @@ 'word60'", None);
+    assert_eq!(c as usize, kept(&|i| word(i, 60)).len());
+    assert_eq!(round.order, "t_vr", "{round:?}");
+    let price = s
+        .price("SELECT id FROM s.t WHERE v @@ 'word60'", None)
+        .unwrap();
+    assert!(price.order.starts_with("t_vr+"), "{price:?}");
+    let price = s
+        .price("SELECT id FROM s.t WHERE r && '[5000,5040)'", None)
+        .unwrap();
+    assert_eq!(price.order, "t_vr", "{price:?}");
+    // Each order and strand holds its rows: the range's non-NULL and NULL rows, a word a row.
+    let rows = s.blocks().unwrap();
+    assert_eq!(
+        strand_rows(&rows, "t_vr", "id"),
+        n as u64 + (0..n).filter(|i| i % 13 != 0).count() as u64 * 2
+    );
+}
+
+#[cfg(feature = "standalone")]
+mod beside_writers {
+    use super::*;
+
+    #[test]
+    fn a_statement_writes_each_key_of_an_index_beside_another_kind() {
+        let n = 4096;
+        let path = snail_at("gin-beside-writes", BESIDE, n, beside_row);
+        let mut s = Snail::open_writing(&path).unwrap();
+        let along = |s: &mut Snail, w: &str| {
+            let q = format!("SELECT id FROM s.t WHERE {w}");
+            let (want, _) = ids(s, &q, Some("t_pkey"));
+            assert_eq!(ids(s, &q, Some("t_vr")).0, want, "{q} along t_vr");
+            assert_eq!(ids(s, &q, None).0, want, "{q} by its pages");
+            s.census().unwrap();
+            want
+        };
+        for st in [
+            "INSERT INTO s.t (id, v, r, n) VALUES (9000, 'word7777', '[9000,9003)', 1)",
+            "UPDATE s.t SET r = '[9100,9103)' WHERE id = 9000",
+            "UPDATE s.t SET v = 'word7778' WHERE id = 9000",
+            "UPDATE s.t SET v = 'word7779', r = '[9200,9203)' WHERE id = 100",
+            "UPDATE s.t SET id = 9500 WHERE id = 200",
+        ] {
+            s.execute(st).unwrap_or_else(|e| panic!("{st}: {e}"));
+        }
+        assert_eq!(along(&mut s, "v @@ 'word7777'"), Vec::<i32>::new());
+        assert_eq!(along(&mut s, "v @@ 'word7778'"), [9000]);
+        assert_eq!(along(&mut s, "v @@ 'word7779'"), [100]);
+        assert_eq!(along(&mut s, "r && '[9100,9101)'"), [9000]);
+        assert_eq!(along(&mut s, "r && '[9000,9001)'"), Vec::<i32>::new());
+        assert_eq!(along(&mut s, "r && '[9200,9201)'"), [100]);
+        assert_eq!(along(&mut s, "r && '[200,201)'"), [198, 199, 9500]);
+        s.execute("DELETE FROM s.t WHERE v @@ 'word7778' OR r && '[9200,9201)'")
+            .unwrap();
+        assert_eq!(along(&mut s, "v @@ 'word7778'"), Vec::<i32>::new());
+        assert_eq!(along(&mut s, "r && '[9200,9201)'"), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn a_statement_finds_its_rows_by_an_or_along_the_strands() {
+        let n = 8192;
+        let path = snail_at("gin-or-writes", OVER, n, over_row);
+        let mut s = Snail::open_writing(&path).unwrap();
+        let in_a = |x: i64| (0..n).filter(move |&i| i % 50 != 0 && i % 997 + 100 == x);
+        let moved = in_a(150).chain(in_a(151)).count() as u64;
+        let d = s
+            .execute("UPDATE s.t SET a = '{7777}' WHERE a @> '{150}' OR a @> '{151}'")
+            .unwrap();
+        assert_eq!(d.rows, moved);
+        let (got, round) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{7777}'", None);
+        assert_eq!(got.len() as u64, moved);
+        assert!(round.order.starts_with("t_a"), "{round:?}");
+        let gone = in_a(152).count() as u64;
+        let d = s
+            .execute("DELETE FROM s.t WHERE a @> '{152}' OR v @@ 'nothing'")
+            .unwrap();
+        assert_eq!(d.rows, gone);
+        let (got, _) = ids(
+            &mut s,
+            "SELECT id FROM s.t WHERE a @> '{152}'",
+            Some("t_pkey"),
+        );
+        assert!(got.is_empty());
+        // A NOT beside the strand's own, in a transaction that sees its own rows.
+        s.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+        s.execute("INSERT INTO s.t (id, a, v, n) VALUES (9000, '{7777,3}', 'w3', 1), (9001, '{7777}', 'w4', 1)")
+            .unwrap();
+        let (got, _) = ids(
+            &mut s,
+            "SELECT id FROM s.t WHERE a @> '{7777}' AND NOT a @> '{3}' AND id >= 9000",
+            None,
+        );
+        assert_eq!(got, [9001]);
+        let (got, _) = ids(
+            &mut s,
+            "SELECT id FROM s.t WHERE (a @> '{7777}' OR v @@ 'w4') AND id >= 9000",
+            None,
+        );
+        assert_eq!(got, [9000, 9001]);
+        s.execute("COMMIT").unwrap();
+        s.census().unwrap();
+        // Writers beside `@@@`.
+        let d = s
+            .execute("DELETE FROM s.t WHERE v @@@ 'w4' AND id >= 9000")
+            .unwrap();
+        assert_eq!(d.rows, 1);
+    }
+}
+
+const ARMS: &str = "CREATE TABLE s.t (id int NOT NULL, a int[], v tsvector, r int4range, m int, pad bigint, PRIMARY KEY (id)); \
+                    CREATE INDEX t_a ON s.t USING gin (a); \
+                    CREATE INDEX t_vr ON s.t USING gist (v, r); \
+                    CREATE INDEX t_m ON s.t (m);";
+
+fn arms_row(i: i64) -> Vec<Option<String>> {
+    vec![
+        Some(i.to_string()),
+        Some(format!("{{{},{}}}", i % 7, 2000 + i / 256)),
+        Some(format!("'w{}':1 'z{}':2", i % 7, i / 256)),
+        Some(format!("[{i},{})", i + 3)),
+        Some((i % 997).to_string()),
+        Some(i.to_string()),
+    ]
+}
+
+/// The rows of an element and of a condition an order answers: `2000 + i / 256` lying together, `id`, `m`
+/// of 997 and `r` each the table's own order or a strand's.
+#[test]
+fn an_or_reads_an_arm_an_order_answers_as_postgresql_s_bitmap_or_would() {
+    let n = 20480;
+    let mut s = snail_of("gin-arms", ARMS, n, arms_row);
+    let kept = |f: &dyn Fn(i64) -> bool| -> Vec<i32> {
+        (0..n).filter(|&i| f(i)).map(|i| i as i32).collect()
+    };
+    let z = |i: i64, k: i64| i / 256 == k;
+    let r = |i: i64, lo: i64, hi: i64| i < hi && i + 3 > lo;
+    let cases: Vec<(&str, Vec<i32>, Vec<(&str, u64)>)> = vec![
+        (
+            "a @> '{2005}' OR id < 50",
+            kept(&|i| z(i, 5) || i < 50),
+            vec![("t_pkey", 1), ("t_a", 2), ("t_pkey", 9)],
+        ),
+        (
+            "a @> '{2005}' OR m = 5",
+            kept(&|i| z(i, 5) || i % 997 == 5),
+            vec![("t_m", 2), ("t_a", 2), ("t_pkey", 124)],
+        ),
+        (
+            "a @> '{2005}' OR r && '[15000,15040)'",
+            kept(&|i| z(i, 5) || r(i, 15000, 15040)),
+            vec![("t_vr", 8), ("t_a", 2), ("t_pkey", 16)],
+        ),
+        (
+            "v @@ 'z5' OR r && '[15000,15040)'",
+            kept(&|i| z(i, 5) || r(i, 15000, 15040)),
+            vec![("t_vr", 8), ("t_vr", 3), ("t_pkey", 12)],
+        ),
+        (
+            "v @@ 'z5' AND r && '[1500,1510)'",
+            kept(&|i| z(i, 5) && r(i, 1500, 1510)),
+            vec![("t_vr", 8), ("t_vr", 3), ("t_pkey", 6)],
+        ),
+        (
+            "(a @> '{2005}' OR v @@ 'z70') AND r && '[1500,1510)'",
+            kept(&|i| (z(i, 5) || z(i, 70)) && r(i, 1500, 1510)),
+            vec![("t_vr", 8), ("t_a", 2), ("t_vr", 3), ("t_pkey", 10)],
+        ),
+    ];
+    for (w, want, reads) in &cases {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert_eq!(
+            &ids(&mut s, &q, Some("t_pkey")).0,
+            want,
+            "{q} along the table's order"
+        );
+        let (got, round) = ids(&mut s, &q, None);
+        assert_eq!(&got, want, "{q} by its pages");
+        let reads: Vec<(String, u64)> = reads.iter().map(|(o, n)| (o.to_string(), *n)).collect();
+        assert_eq!(reads_of(&round), reads, "{q}");
+    }
+    // Named: the index with both keys reads them both; one of another column is no reader of this.
+    let q = "SELECT id FROM s.t WHERE v @@ 'z5' OR r && '[15000,15040)'";
+    let (got, round) = ids(&mut s, q, Some("t_vr"));
+    assert_eq!(got, kept(&|i| z(i, 5) || r(i, 15000, 15040)));
+    assert!(round.order.starts_with("t_vr+"), "{round:?}");
+    assert!(s.ask(q, Some("t_a")).is_err());
+    // An arm no order narrows asks nothing: the table's order is read, each row held to the OR.
+    let q = "SELECT id FROM s.t WHERE a @> '{2005}' OR m > 5";
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, kept(&|i| z(i, 5) || i % 997 > 5));
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+    // No row can pass the arm: the other's rows alone.
+    let q = "SELECT id FROM s.t WHERE a @> '{2005}' OR m = NULL";
+    let (got, round) = ids(&mut s, q, None);
+    assert_eq!(got, kept(&|i| z(i, 5)));
+    assert_eq!(
+        reads_of(&round),
+        [("t_a".to_string(), 2), ("t_pkey".to_string(), 6)],
+        "{q}"
+    );
+    let price = s
+        .price("SELECT id FROM s.t WHERE a @> '{2005}' OR id < 50", None)
+        .unwrap();
+    assert_eq!(price.order, "t_a+t_pkey", "{price:?}");
 }

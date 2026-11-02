@@ -3795,6 +3795,36 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             Value::Bool(same == matches!(e, Expr::IsNotDistinctFrom(..)))
         }
         Expr::BinaryOp { left, op, right } => {
+            if let (BinaryOperator::AtAt, Some(inner)) =
+                (op, super::spelled::right_of_three_ats(right))
+            {
+                let (x, y) = (ev(left)?, ev(inner)?);
+                let searched = |v: &Value| {
+                    matches!(
+                        v,
+                        Value::Typed(
+                            ColumnType::Textual(
+                                crate::textual::Textual::Tsvector
+                                    | crate::textual::Textual::Tsquery
+                            ),
+                            _
+                        )
+                    )
+                };
+                if !searched(&x) && !searched(&y) && !x.is_null() && !y.is_null() {
+                    return Err(Error::new(format!(
+                        "operator does not exist: {} @@@ {}",
+                        kind_name(&x),
+                        kind_name(&y)
+                    )));
+                }
+                let matched = Expr::BinaryOp {
+                    left: left.clone(),
+                    op: op.clone(),
+                    right: Box::new(inner.clone()),
+                };
+                return eval(&matched, row, frame, computed);
+            }
             match op {
                 BinaryOperator::And | BinaryOperator::Or => {
                     let (x, y) = (truth(&ev(left)?)?, truth(&ev(right)?)?);

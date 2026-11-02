@@ -1209,6 +1209,8 @@ pub struct ElementKey {
     pub predicate: Option<String>,
     /// The name of the table holding its strand.
     pub strand: String,
+    /// Its place among its index's keys.
+    pub key: usize,
 }
 
 /// An EXCLUDE constraint: no two rows whose values each level's operator finds conflicting, a row

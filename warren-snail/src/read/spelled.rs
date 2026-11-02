@@ -10,7 +10,7 @@ use crate::{Error, Result};
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
     FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderByKind, Query, SelectItem,
-    SetExpr, Subscript, TableFactor, WindowType,
+    SetExpr, Subscript, TableFactor, UnaryOperator, WindowType,
 };
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
@@ -18,6 +18,7 @@ use std::borrow::Cow;
 
 /// The statement with each rewrite made, one at a time until none is left.
 pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
+    at_at_spaced(sql)?;
     let lower = sql.to_ascii_lowercase();
     let mut out = Cow::Borrowed(sql);
     if lower.contains("exclude") {
@@ -32,6 +33,54 @@ pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
         out = Cow::Owned(next);
     }
     Ok(out)
+}
+
+/// What stands on the right of `@@@`, which sqlparser reads as `@@` and a prefix `@`.
+pub(super) fn right_of_three_ats(right: &Expr) -> Option<&Expr> {
+    match right {
+        Expr::UnaryOp {
+            op: UnaryOperator::PGAbs,
+            expr,
+        } => Some(expr),
+        _ => None,
+    }
+}
+
+/// `@@` and `@` written apart are two operators to PostgreSQL, and no prefix `@` gives what a `@@`
+/// reads; together they are `@@@`, and sqlparser reads the two alike. Refused here, where they can
+/// be told apart: a statement printed from what sqlparser read writes `@@@` as `@@ @x`.
+pub(super) fn at_at_spaced(sql: &str) -> Result<()> {
+    if !sql.contains("@@") {
+        return Ok(());
+    }
+    let tokens = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql).tokenize()?;
+    for (i, _) in tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == Token::AtAt)
+    {
+        let next = tokens[i + 1..]
+            .iter()
+            .position(|t| !matches!(t, Token::Whitespace(_)))
+            .map(|n| n + i + 1);
+        let apart = |&n: &usize| {
+            n > i + 1
+                && tokens[n] == Token::AtSign
+                && matches!(tokens.get(n + 1), Some(Token::Whitespace(_)))
+        };
+        if let Some(n) = next.filter(apart) {
+            let operand = tokens[n + 1..]
+                .iter()
+                .find(|t| !matches!(t, Token::Whitespace(_)));
+            return Err(Error::new(match operand {
+                Some(Token::SingleQuotedString(_)) => {
+                    "operator is not unique: @ unknown".to_string()
+                }
+                _ => "operator does not exist: @@ with a prefix @ on its right".to_string(),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// What marks a window's name as carrying its frame's EXCLUDE: the name is this character, the

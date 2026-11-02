@@ -5,7 +5,7 @@
 use super::change::{level_key, push, rows_of, Change};
 use super::pipeline::{self, Value};
 use super::question::{
-    Col, Cond, Countable, Interval, Key, OpCond, Question, Select, Side, TextCond,
+    Arm, Col, Cond, Countable, Interval, Key, OpCond, Question, Select, Side, TextCond,
 };
 use super::statement::{Datum, Row};
 use super::walk::{KeySet, Want};
@@ -433,6 +433,15 @@ fn need_of_asked(a: Asked) -> Need {
     }
 }
 
+fn need_of_path(a: crate::jsonpath::Asks) -> Need {
+    use crate::jsonpath::Asks;
+    match a {
+        Asks::At(b) => Need::At(Datum::Bytes(b)),
+        Asks::All(v) => Need::all(v.into_iter().map(need_of_path).collect()),
+        Asks::Any(v) => Need::any(v.into_iter().map(need_of_path).collect()),
+    }
+}
+
 /// What a condition, the column on the operator's left, asks of a key's strand, as the operator
 /// class's `extractQuery` reads it: no row is asked of where the value holds what no row can pass.
 fn need_of(kind: Kind, ty: ColumnType, op: &str, value: &Datum) -> Result<Need> {
@@ -497,6 +506,12 @@ fn need_of(kind: Kind, ty: ColumnType, op: &str, value: &Datum) -> Result<Need> 
         (Kind::Jsonb, "?", Datum::Text(k)) => Need::At(Datum::Bytes(crate::jsonb::gin_key(k))),
         (Kind::Jsonb, "?|", _) => Need::any(keys()),
         (Kind::Jsonb, "?&", _) => Need::all(keys()),
+        (Kind::Jsonb | Kind::JsonbPath, "@?" | "@@", Datum::Text(p)) => {
+            match crate::jsonpath::gin_asks(p, op == "@?", kind == Kind::JsonbPath)? {
+                Some(a) => need_of_path(a),
+                None => Need::Every,
+            }
+        }
         (Kind::Tsvector, "@@", Datum::Text(q)) => need_of_asked(crate::tsearch::query_asks(q)),
         (Kind::Tsquery, "@>", Datum::Text(q)) => Need::all(
             crate::tsearch::query_words(q)
@@ -530,8 +545,8 @@ fn closes(kind: Kind, op: &str, value: &Datum) -> bool {
 fn answers(kind: Kind, op: &str) -> bool {
     match kind {
         Kind::Array => matches!(op, "&&" | "@>" | "<@" | "="),
-        Kind::Jsonb => matches!(op, "?" | "?|" | "?&" | "@>" | "<@"),
-        Kind::JsonbPath => op == "@>",
+        Kind::Jsonb => matches!(op, "?" | "?|" | "?&" | "@>" | "<@" | "@?" | "@@"),
+        Kind::JsonbPath => matches!(op, "@>" | "@?" | "@@"),
         Kind::Tsvector => op == "@@",
         Kind::Tsquery => matches!(op, "@>" | "<@"),
     }
@@ -542,6 +557,7 @@ fn value_type(kind: Kind, ty: ColumnType, op: &str) -> Option<ColumnType> {
     Some(match (kind, op) {
         (Kind::Array, _) => ty,
         (Kind::Jsonb | Kind::JsonbPath, "@>" | "<@") => ty,
+        (Kind::Jsonb | Kind::JsonbPath, "@?" | "@@") => ColumnType::Textual(Textual::Jsonpath),
         (Kind::Jsonb, "?") => ColumnType::Text(None),
         (Kind::Jsonb, _) => super::typed::array_of(ColumnType::Text(None)),
         (Kind::Tsvector | Kind::Tsquery, _) => ColumnType::Textual(Textual::Tsquery),
@@ -646,6 +662,10 @@ pub(super) fn element_cond(
     let Some(seen) = seen else {
         return Ok(None);
     };
+    // A jsonb has no `@@` with its path on the left.
+    if lit_left && seen == "@@" && matches!(kind_of_type(ty), Some(Kind::Jsonb)) {
+        return Ok(None);
+    }
     let keyed = table
         .element_keys
         .iter()
@@ -705,6 +725,8 @@ pub(super) fn element_cond(
         op: seen.to_string(),
         probe: None,
         value: Some(value),
+        arms: None,
+        beside: Vec::new(),
     }))
 }
 
@@ -738,11 +760,12 @@ fn value_as(table: &Table, lit: &Expr, ty: ColumnType) -> Option<Datum> {
     }
 }
 
-/// Where a condition's value lies on a strand.
-#[derive(Clone, Debug, PartialEq)]
+/// Where a condition's value lies on a strand; or a condition an order of the table answers.
+#[derive(Clone, Debug)]
 enum Spot {
     Key(KeyValue),
     Prefix(Vec<u8>),
+    Read(Box<Side>),
 }
 
 /// One place of one strand the round reads.
@@ -754,10 +777,15 @@ struct Probe {
 
 /// A place of a strand among the probes, each place once.
 fn one(probes: &mut Vec<Probe>, strand: usize, spot: Spot) -> Ask {
-    if let Some(at) = probes
-        .iter()
-        .position(|p| p.strand == strand && p.spot == spot)
-    {
+    let same = |p: &Probe| {
+        p.strand == strand
+            && match (&p.spot, &spot) {
+                (Spot::Key(a), Spot::Key(b)) => a == b,
+                (Spot::Prefix(a), Spot::Prefix(b)) => a == b,
+                _ => false,
+            }
+    };
+    if let Some(at) = probes.iter().position(same) {
         return Ask::One(at);
     }
     probes.push(Probe { strand, spot });
@@ -840,8 +868,20 @@ fn spot_side(ti: usize, ty: ColumnType, spot: &Spot) -> (Side, Option<KeySet>) {
                 .push(TextCond::new(0, Included(b.to_vec()), Included(b.to_vec())));
         }
         Spot::Key(k) => kept = Some(KeySet::new(vec![0], vec![vec![k.clone()]])),
+        Spot::Read(_) => unreachable!("a condition on the table is read on the table"),
     }
     (side, kept)
+}
+
+/// A table's keys, kept to a condition.
+fn keys_wanted<'a>(table: &'a Table, side: &'a Side) -> Want<'a> {
+    Want {
+        table,
+        side,
+        columns: order_columns(table),
+        countable: None,
+        keys: None,
+    }
 }
 
 /// The rows of a strand, every column, as a question.
@@ -910,6 +950,14 @@ impl Snail {
 
     fn asking_of(&self, probe: &Probe) -> Result<Asking> {
         let strand = &self.catalog.tables[probe.strand];
+        if let Spot::Read(side) = &probe.spot {
+            let part = self.part(&keys_wanted(strand, side), None)?;
+            return Ok(Asking {
+                pages: part.plan.column_pages - part.plan.held,
+                rows: part.rows,
+                estimate: part.plan.rows_estimate,
+            });
+        }
         let (side, kept) = spot_side(probe.strand, strand.columns[0].ty, &probe.spot);
         let want = Want {
             table: strand,
@@ -981,6 +1029,177 @@ impl Snail {
         })
     }
 
+    /// What a condition asks of the strand reading it in the fewest pages: its members, what they
+    /// come to, and the strand's index; none where no strand may answer it.
+    fn best_ask(
+        &self,
+        want: &Want,
+        o: &OpCond,
+        named: Option<&str>,
+        probes: &mut Vec<Probe>,
+    ) -> Result<Option<(Vec<Ask>, Asking, String)>> {
+        let (table, side) = (want.table, want.side);
+        let Some(value) = &o.value else {
+            // A condition by an operator a strand of the table answers: its keys, read by that strand,
+            // where no order holding all a question reads already answers it.
+            if o.probe.is_none() {
+                return Ok(None);
+            }
+            let served = match named {
+                Some(n) => {
+                    let at = table.orders.iter().position(|x| x.name == n);
+                    at.is_some_and(|at| self.serving(want).is_ok_and(|s| s.contains(&at)))
+                }
+                None => self.part(want, None)?.plan.walk.order != 0,
+            };
+            if served {
+                return Ok(None);
+            }
+            let own = Side {
+                table: side.table,
+                goes_by: String::new(),
+                conds: Vec::new(),
+                texts: Vec::new(),
+                nulls: Vec::new(),
+                empty: false,
+                ops: vec![o.clone()],
+            };
+            let Some((ask, index)) = self.read_ask(want, &own, named, probes)? else {
+                return Ok(None);
+            };
+            // The table's own order is read kept to the condition already.
+            if index.is_empty() {
+                return Ok(None);
+            }
+            let asking = self.asking(&ask, probes)?;
+            return Ok(Some((vec![ask], asking, index.join("+"))));
+        };
+        let ty = table.columns[o.column].ty;
+        let mut best: Option<(Vec<Ask>, Asking, String)> = None;
+        for key in table
+            .element_keys
+            .iter()
+            .filter(|k| k.column == o.column && named.is_none_or(|n| k.index == n))
+        {
+            let kind = kind_of(key, ty);
+            if !answers(kind, &o.op) {
+                continue;
+            }
+            if let Some(p) = &key.predicate {
+                let p = super::partial::Predicate::read(&self.catalog, table, p)?;
+                if !p.implied_by(side) {
+                    continue;
+                }
+            }
+            let need = need_of(kind, ty, &o.op, value)?;
+            if matches!(need, Need::Every) {
+                continue;
+            }
+            let ti = self.strand_at(key)?;
+            let ask = self.ask_of(ti, &need, probes)?;
+            let asks = match ask {
+                Ask::All(v) => v,
+                a => vec![a],
+            };
+            let mut asking = Asking {
+                pages: 0,
+                rows: (0, u64::MAX),
+                estimate: 0.0,
+            };
+            for a in &asks {
+                let x = self.asking(a, probes)?;
+                asking.pages += x.pages;
+                asking.rows.1 = asking.rows.1.min(x.rows.1);
+                asking.estimate += x.estimate;
+            }
+            if asks.len() == 1 {
+                asking = self.asking(&asks[0], probes)?;
+            }
+            if best.as_ref().is_none_or(|b| asking.pages < b.1.pages) {
+                best = Some((asks, asking, key.index.clone()));
+            }
+        }
+        Ok(best)
+    }
+
+    /// What a condition on the table asks of the order that reads it in the fewest pages, and the
+    /// order, where another is named none: none where that read rules no block out, so that a row
+    /// could pass in every one.
+    fn read_ask(
+        &self,
+        want: &Want,
+        own: &Side,
+        named: Option<&str>,
+        probes: &mut Vec<Probe>,
+    ) -> Result<Option<(Ask, Vec<String>)>> {
+        let table = want.table;
+        if own.empty {
+            return Ok(Some((Ask::Any(Vec::new()), Vec::new())));
+        }
+        let part = self.part(&keys_wanted(table, own), None)?;
+        let w = &part.plan.walk;
+        let name = &table.orders[w.order].name;
+        if w.statuses.0 == 0 || named.is_some_and(|n| n != name) {
+            return Ok(None);
+        }
+        let spot = Spot::Read(Box::new(own.clone()));
+        probes.push(Probe {
+            strand: own.table,
+            spot,
+        });
+        let index = match w.order {
+            0 => Vec::new(),
+            _ => vec![name.clone()],
+        };
+        Ok(Some((Ask::One(probes.len() - 1), index)))
+    }
+
+    /// What a part of an OR or a NOT asks of the strands, and the indexes it reads: none where it may
+    /// pass a row that holds nothing a strand could find.
+    fn arm_ask(
+        &self,
+        want: &Want,
+        arm: &Arm,
+        named: Option<&str>,
+        probes: &mut Vec<Probe>,
+    ) -> Result<Option<(Ask, Vec<String>)>> {
+        let mut index = Vec::new();
+        let mut asks = Vec::new();
+        let (parts, every) = match arm {
+            Arm::Held => return Ok(None),
+            Arm::Read(own) => return self.read_ask(want, own, named, probes),
+            Arm::Op(o) => {
+                return Ok(self.best_ask(want, o, named, probes)?.map(|(mut v, _, i)| {
+                    let ask = match v.len() {
+                        1 => v.remove(0),
+                        _ => Ask::All(v),
+                    };
+                    (ask, vec![i])
+                }))
+            }
+            Arm::All(v) => (v, false),
+            Arm::Any(v) => (v, true),
+        };
+        for part in parts {
+            match self.arm_ask(want, part, named, probes)? {
+                Some((a, i)) => {
+                    asks.push(a);
+                    index.extend(i);
+                }
+                None if every => return Ok(None),
+                None => {}
+            }
+        }
+        index.sort_unstable();
+        index.dedup();
+        Ok(match (asks.len(), every) {
+            (0, _) => None,
+            (_, true) => Some((Ask::Any(asks), index)),
+            (1, false) => Some((asks.remove(0), index)),
+            (_, false) => Some((Ask::All(asks), index)),
+        })
+    }
+
     /// What a round on one table makes of its element strands: the rows found along them where that
     /// reads the fewest pages, or along `order` where it names one's index.
     pub(super) fn along_elements(
@@ -1005,55 +1224,14 @@ impl Snail {
         let mut probes = Vec::new();
         let mut children: Vec<(Ask, Asking, String, Option<&OpCond>)> = Vec::new();
         for o in side.ops.iter().filter(|_| keyed && !side.empty) {
-            let Some(value) = &o.value else {
+            if let Some(arm) = &o.arms {
+                if let Some((ask, index)) = self.arm_ask(want, arm, named, &mut probes)? {
+                    let x = self.asking(&ask, &probes)?;
+                    children.push((ask, x, index.join("+"), None));
+                }
                 continue;
-            };
-            let ty = table.columns[o.column].ty;
-            let mut best: Option<(Vec<Ask>, Asking, String)> = None;
-            for key in table
-                .element_keys
-                .iter()
-                .filter(|k| k.column == o.column && named.is_none_or(|n| k.index == n))
-            {
-                let kind = kind_of(key, ty);
-                if !answers(kind, &o.op) {
-                    continue;
-                }
-                if let Some(p) = &key.predicate {
-                    let p = super::partial::Predicate::read(&self.catalog, table, p)?;
-                    if !p.implied_by(side) {
-                        continue;
-                    }
-                }
-                let need = need_of(kind, ty, &o.op, value)?;
-                if matches!(need, Need::Every) {
-                    continue;
-                }
-                let ti = self.strand_at(key)?;
-                let ask = self.ask_of(ti, &need, &mut probes)?;
-                let asks = match ask {
-                    Ask::All(v) => v,
-                    a => vec![a],
-                };
-                let mut asking = Asking {
-                    pages: 0,
-                    rows: (0, u64::MAX),
-                    estimate: 0.0,
-                };
-                for a in &asks {
-                    let x = self.asking(a, &probes)?;
-                    asking.pages += x.pages;
-                    asking.rows.1 = asking.rows.1.min(x.rows.1);
-                    asking.estimate += x.estimate;
-                }
-                if asks.len() == 1 {
-                    asking = self.asking(&asks[0], &probes)?;
-                }
-                if best.as_ref().is_none_or(|b| asking.pages < b.1.pages) {
-                    best = Some((asks, asking, key.index.clone()));
-                }
             }
-            if let Some((asks, asking, index)) = best {
+            if let Some((asks, asking, index)) = self.best_ask(want, o, named, &mut probes)? {
                 if asks.len() == 1 {
                     children.push((asks.into_iter().next().unwrap(), asking, index, Some(o)));
                 } else {
@@ -1066,12 +1244,22 @@ impl Snail {
         }
         if children.is_empty() {
             if let Some(n) = named {
-                let column = table
+                // Keys of another kind beside the elements are an order the question may read.
+                if let Some(o) = table.orders.iter().position(|o| o.name == n) {
+                    if self.serving(want)?.contains(&o) {
+                        return Ok(Along::Not);
+                    }
+                }
+                let columns: Vec<usize> = table
                     .element_keys
                     .iter()
-                    .find(|k| k.index == n)
-                    .map(|k| k.column);
-                if !side.ops.iter().any(|o| Some(o.column) == column) {
+                    .filter(|k| k.index == n)
+                    .map(|k| k.column)
+                    .collect();
+                let reads = |o: &OpCond| {
+                    columns.contains(&o.column) || o.beside.iter().any(|b| columns.contains(&b.0))
+                };
+                if !side.ops.iter().any(reads) {
                     return Err(Error::new(format!(
                         "{n} does not hold every column the question reads"
                     )));
@@ -1223,10 +1411,112 @@ impl Snail {
         let mut held = crate::room::holding(0);
         let mut round = Round::default();
         // Each strand read once for the elements it is asked for, a prefix on its own.
-        let mut strands: Vec<usize> = used.iter().map(|&p| c.probes[p].strand).collect();
+        let mut strands: Vec<usize> = used
+            .iter()
+            .filter(|&&p| !matches!(c.probes[p].spot, Spot::Read(_)))
+            .map(|&p| c.probes[p].strand)
+            .collect();
         strands.sort_unstable();
         strands.dedup();
         let mut past = false;
+        // A condition on the table: the keys of its rows, from the order that reads them.
+        for &p in &used {
+            let Spot::Read(own) = &c.probes[p].spot else {
+                continue;
+            };
+            let want = keys_wanted(table, own);
+            let select = Select::Rows(
+                columns
+                    .iter()
+                    .map(|&k| {
+                        (
+                            table.columns[k].name.clone(),
+                            Key::Column(Col { side: 0, column: k }),
+                        )
+                    })
+                    .collect(),
+            );
+            let q = Question {
+                sides: vec![(**own).clone()],
+                meets: Vec::new(),
+                outer: Vec::new(),
+                full: false,
+                after: Vec::new(),
+                select,
+                order: Vec::new(),
+            };
+            let mut blocks = Blocks {
+                table,
+                q: &q,
+                answer: super::answer::Answer::new(&q.select).typed(&[table]),
+                most: None,
+                feed: |batch: arrow::array::RecordBatch| {
+                    for row in rows_of(&batch)? {
+                        let key: Vec<KeyValue> = levels
+                            .iter()
+                            .zip(&collators)
+                            .enumerate()
+                            .map(|(li, ((_, col), coll))| {
+                                level_key(
+                                    col,
+                                    *coll,
+                                    order.levels[li],
+                                    &row[li],
+                                    null_key(order, li),
+                                )
+                            })
+                            .collect();
+                        let next = keys.len() as u32;
+                        let id = match keys.get(&key) {
+                            Some(&id) => id,
+                            None => {
+                                let bytes =
+                                    key.iter().map(|k| k.to_string().len() as u64 + 32).sum();
+                                if !held.fits(bytes) {
+                                    return Err(Error::new(KEYS_PAST_THE_ROOM));
+                                }
+                                keys.insert(key, next);
+                                next
+                            }
+                        };
+                        sets[p].push(id);
+                    }
+                    Ok(())
+                },
+            };
+            let pages = self.reader.pages_read();
+            let (before, held_before) = (self.touched(), self.pages_held());
+            let part = self.part(&want, None)?;
+            let name = table.orders[part.plan.walk.order].name.clone();
+            let columns_read: Vec<(usize, bool)> = columns.iter().map(|&k| (k, false)).collect();
+            match self.scan_part(&want, &columns_read, part, &mut blocks, before, held_before) {
+                Ok((r, _, _)) => {
+                    round.add_table(&r, &name);
+                    round.reads.push(r.clone());
+                    round.rows_walked += r.rows_walked;
+                    round.rows_taken += r.rows_taken;
+                }
+                Err(e) if e.0 == KEYS_PAST_THE_ROOM => {
+                    self.reader.read_done();
+                    let read = self.reader.pages_read() - pages;
+                    let r = Round {
+                        order: name,
+                        column_pages_predicted: read,
+                        column_pages_read: read,
+                        column_pages_high: read,
+                        ..Default::default()
+                    };
+                    round.add_table(&r, &r.order);
+                    round.reads.push(r);
+                    past = true;
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if past {
+            return Ok((None, round, crate::room::holding(0)));
+        }
         for ti in strands {
             let strand = &self.catalog.tables[ti];
             let mut at: HashMap<KeyValue, usize> = HashMap::new();
@@ -1240,6 +1530,7 @@ impl Snail {
                     Spot::Key(k) => {
                         at.insert(k.clone(), p);
                     }
+                    Spot::Read(_) => unreachable!("a condition on the table is read on the table"),
                 }
             }
             match at.len() {

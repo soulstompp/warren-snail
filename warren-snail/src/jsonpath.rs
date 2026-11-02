@@ -7,6 +7,9 @@ use crate::numeric::Numeric;
 use crate::{Error, Result};
 
 mod exec;
+mod gin;
+
+pub use gin::{gin_asks, Asks};
 
 pub use exec::{
     jsonb_path_exists, jsonb_path_exists_op, jsonb_path_match, jsonb_path_match_op,
