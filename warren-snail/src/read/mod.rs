@@ -466,9 +466,11 @@ pub struct Round {
     /// The pages read from the file as the round began, after the first round of an open snail: the
     /// root's two copies, and the catalog on a new generation. The first round's are the open's.
     pub pages_at_start: u64,
-    /// The directory pages the round touched, and of them, those found held.
+    /// The directory pages the round touched, and of them, those found held; and those it was to touch,
+    /// known before it read a column page: its blocks' maps it reads as it reaches them among them.
     pub directory_pages: u64,
     pub directory_pages_held: u64,
+    pub directory_pages_predicted: u64,
     /// The fewest and the most column pages the order's directory allowed: at its top, and at its
     /// blocks before their page maps.
     pub column_pages_top_low: u64,
@@ -523,6 +525,7 @@ impl Round {
         self.consulted.extend(table.consulted.iter().cloned());
         self.directory_pages += table.directory_pages;
         self.directory_pages_held += table.directory_pages_held;
+        self.directory_pages_predicted += table.directory_pages_predicted;
         self.column_pages_top_low += table.column_pages_top_low;
         self.column_pages_top_high += table.column_pages_top_high;
         self.column_pages_low += table.column_pages_low;
@@ -570,9 +573,10 @@ pub struct Price {
     /// text level that keeps more than a run, as `<>` does. The estimate takes the blocks they open
     /// whole.
     pub keyless: Vec<String>,
-    /// The directory pages the pricing read, page maps among them, and the column pages a round
-    /// along the order reads, exactly.
+    /// The directory pages the pricing read, page maps among them; those a round along the order goes
+    /// on to read of the maps of the blocks it reaches; and the column pages it reads, exactly.
     pub directory_pages: u64,
+    pub map_pages: u64,
     pub column_pages: u64,
     pub blocks: u64,
     /// The bytes a round holds of a row it reads: 0 where it reads no column page.
@@ -980,29 +984,33 @@ impl Snail {
                 continue;
             }
             let plan = self.predict(walk, want)?;
-            let held = self.reader.held_among(plan.disk_pages());
             consulted.push(Consulted {
                 order: name,
                 directory_pages: plan.walk.directory_pages,
                 low: plan.walk.low,
                 high: plan.walk.high,
                 exact: Some(plan.column_pages),
-                held,
+                held: plan.held,
             });
-            plans.push((plan, held));
+            plans.push(plan);
         }
         // The fewest pages from the file win; then the fewest touched, then the fewest directory pages.
         let best = (0..plans.len())
             .min_by_key(|&i| {
-                let (p, held) = &plans[i];
+                let p = &plans[i];
                 (
-                    p.column_pages - held,
+                    p.column_pages - p.held,
                     p.column_pages,
-                    p.walk.directory_pages,
+                    p.walk.directory_pages + p.map_pages,
                 )
             })
             .unwrap();
-        let (plan, _) = plans.swap_remove(best);
+        let plan = plans.swap_remove(best);
+        // The order it reads goes on to read the maps of its blocks as it reaches them.
+        let order_read = &table.orders[plan.walk.order].name;
+        if let Some(c) = consulted.iter_mut().find(|c| &c.order == order_read) {
+            c.directory_pages += plan.map_pages;
+        }
         Ok(Part {
             plan,
             served: served
@@ -1041,6 +1049,7 @@ impl Snail {
                 .map(|&i| want.table.columns[want.side.texts[i].column].name.clone())
                 .collect(),
             directory_pages: self.touched() - before,
+            map_pages: part.plan.map_pages,
             column_pages: part.plan.column_pages,
             blocks: part.plan.blocks_read(),
         })
@@ -1061,6 +1070,7 @@ impl Snail {
             consulted: part.consulted.clone(),
             directory_pages: self.touched() - before,
             directory_pages_held: self.pages_held() - held_before,
+            directory_pages_predicted: self.touched() - before + part.plan.map_pages,
             column_pages_top_low: w.top.0,
             column_pages_top_high: w.top.1,
             column_pages_low: w.low,
@@ -1119,7 +1129,14 @@ impl Snail {
             )));
         }
         let live = scan.plan.live_rows();
-        scan.plan.keep(&drawn(live, rows, random));
+        let (touched, held) = (self.touched(), self.pages_held());
+        {
+            let (want, _) = self.want_of(&scan.q);
+            self.keep_rows(&mut scan.plan, &drawn(live, rows, random), &want)?;
+        }
+        scan.round.directory_pages += self.touched() - touched;
+        scan.round.directory_pages_held += self.pages_held() - held;
+        scan.round.directory_pages_predicted = scan.round.directory_pages + scan.plan.map_pages;
         scan.round.column_pages_predicted = scan.plan.column_pages;
         scan.round.blocks_read = scan.plan.blocks_read();
         Ok((scan, live))
@@ -1148,6 +1165,7 @@ impl Snail {
             self.walked.get(),
             self.taken.get(),
         );
+        let maps0 = scan.plan.maps_read();
         let mut answer = Answer::new(&scan.q.select).typed(&[table]);
         let range = if scan.whole {
             scan.next..blocks
@@ -1166,7 +1184,11 @@ impl Snail {
         }
         let batch = answer.finish(&[table], &scan.q.select, &scan.q.order)?;
         let r = &mut scan.round;
-        r.column_pages_read += self.reader.pages_read() - read0;
+        let maps = scan.plan.maps_read();
+        r.column_pages_read += self.reader.pages_read() - read0 - (maps.file - maps0.file);
+        r.column_pages_held = scan.plan.held_read();
+        r.directory_pages += maps.touched - maps0.touched;
+        r.directory_pages_held += maps.held - maps0.held;
         r.rows += batch.num_rows() as u64;
         r.rows_walked += self.walked.get() - walked;
         r.rows_taken += self.taken.get() - taken;
@@ -1544,6 +1566,7 @@ impl Snail {
         };
         let (mut round, _, _) = self.scan_one(&base, Some(read_along), None, &mut blocks)?;
         round.directory_pages += priced.0;
+        round.directory_pages_predicted += priced.0;
         round.directory_pages_held += priced.1;
         drop(blocks);
         round.rows_held = stream.most_held() as u64;
@@ -1628,13 +1651,18 @@ impl Snail {
         self.mark_read(want.side.table, &part.plan.walk)?;
         let directory_pages = self.touched() - before;
         let directory_pages_held = self.pages_held() - held_before;
-        let column_pages_held = self.reader.keep_for_round(part.plan.disk_pages());
+        self.keep_held(&part.plan, &want)?;
         let mid = self.reader.pages_read();
         let (walked, taken) = (self.walked.get(), self.taken.get());
         sink.rows_most(part.rows.1);
         let read = self.read_plan(&part.plan, &want, &columns, sink);
         self.reader.read_done();
-        let column_pages_read = self.reader.pages_read() - mid;
+        let maps = part.plan.maps_read();
+        let column_pages_read = self.reader.pages_read() - mid - maps.file;
+        let column_pages_held = part.plan.held_read();
+        let directory_pages_predicted = directory_pages + part.plan.map_pages;
+        let directory_pages = directory_pages + maps.touched;
+        let directory_pages_held = directory_pages_held + maps.held;
         let w = &part.plan.walk;
         if let Err(e) = read {
             if join::past_the_room(&e) {
@@ -1642,7 +1670,9 @@ impl Snail {
                     order: table.orders[w.order].name.clone(),
                     directory_pages,
                     directory_pages_held,
+                    directory_pages_predicted: directory_pages,
                     column_pages_predicted: column_pages_read,
+                    column_pages_held,
                     column_pages_read,
                     ..Default::default()
                 });
@@ -1656,6 +1686,7 @@ impl Snail {
             pages_at_start: 0,
             directory_pages,
             directory_pages_held,
+            directory_pages_predicted,
             column_pages_top_low: w.top.0,
             column_pages_top_high: w.top.1,
             column_pages_low: w.low,

@@ -84,7 +84,7 @@ fn a_question_priced_reads_no_column_page_and_bounds_its_rows() {
         assert_eq!(
             (
                 price.order.as_str(),
-                price.directory_pages,
+                price.directory_pages + price.map_pages,
                 price.column_pages
             ),
             (

@@ -978,6 +978,10 @@ fn cmd_read(args: &[String]) -> Result<()> {
             ("pages_at_open", each(&|d| d.pages_at_open)),
             ("directory_pages", each(&|d| d.round.directory_pages)),
             (
+                "directory_pages_predicted",
+                each(&|d| d.round.directory_pages_predicted),
+            ),
+            (
                 "directory_pages_held",
                 each(&|d| d.round.directory_pages_held),
             ),

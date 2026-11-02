@@ -81,12 +81,9 @@ fn snail(n: i64) -> Snail {
     fresh(&path)
 }
 
-/// What the plan of a read holds of a block: its entry and its page map, whichever way the rows lie.
-const PLAN: u64 = 4 << 10;
-
-/// The most the round allocated past what stood before it and what its plan holds, all its answer
-/// handed out; and the rows it answered.
-fn most_held(snail: &Snail, room: u64) -> (u64, u64) {
+/// The most the round allocated past what stood before it, all its answer handed out; the blocks it
+/// read; the directory pages it touched and those it was to touch; and the rows it answered.
+fn most_held(snail: &Snail, room: u64) -> (u64, u64, (u64, u64), u64) {
     let before = NOW.load(Ordering::Relaxed);
     MOST.store(before, Ordering::Relaxed);
     let mut a = begin_together(&[snail], JOIN, Sizes::of(room)).unwrap();
@@ -95,22 +92,38 @@ fn most_held(snail: &Snail, room: u64) -> (u64, u64) {
         rows += b.num_rows() as u64;
     }
     let most = (MOST.load(Ordering::Relaxed) - before) as u64;
-    assert!(a.round().spill_pages_written > 0 || room > 16 << 20);
-    let blocks = a.round().blocks_read;
+    let r = a.round();
+    assert!(r.spill_pages_written > 0 || room > 16 << 20);
     drop(a);
-    (most.saturating_sub(blocks * PLAN), rows)
+    (
+        most,
+        r.blocks_read,
+        (r.directory_pages, r.directory_pages_predicted),
+        rows,
+    )
 }
+
+/// What a plan goes on holding of a block it reads in part, when the room has let its map go: where
+/// the map lies, its rows and pages, and its last key; and the plan's own bookkeeping of a read.
+const BLOCK: u64 = 100;
+const BOOKKEEPING: u64 = 32 << 10;
 
 #[test]
 fn the_room_bounds_what_a_round_holds_however_many_rows_it_answers() {
     let room = 256u64 << 10;
-    let small = snail(1 << 16);
-    let large = snail(1 << 18);
-    let (a, rows_a) = most_held(&small, room);
-    let (b, rows_b) = most_held(&large, room);
-    assert_eq!((rows_a, rows_b), (1 << 16, 1 << 18));
-    assert!(a <= 2 * room && b <= 2 * room, "{a} and {b} bytes at most");
+    for n in [1i64 << 16, 1 << 18, 1 << 20] {
+        let large = snail(n);
+        let (most, blocks, (touched, predicted), rows) = most_held(&large, room);
+        assert_eq!(rows, n as u64);
+        assert_eq!(touched, predicted, "{n}");
+        // The plan as well as the rows: the rows take about twice the room, their cells' own bytes
+        // beside their held widths, and the plan a hundred bytes a block.
+        assert!(
+            most <= 2 * room + BOOKKEEPING + blocks * BLOCK,
+            "{n} rows, {blocks} blocks: {most} bytes at most"
+        );
+    }
     // Held whole, they grow with the rows.
-    let (whole, _) = most_held(&large, 1 << 30);
+    let (whole, ..) = most_held(&snail(1 << 18), 1 << 30);
     assert!(whole > 4 * room, "{whole} bytes held whole");
 }

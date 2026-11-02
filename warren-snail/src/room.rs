@@ -511,6 +511,55 @@ impl Drop for Flying {
     }
 }
 
+/// Bytes a place holds in a room of its own naming, as long as it lives, whichever round is under way
+/// as it goes.
+pub struct HeldIn {
+    room: Rc<Room>,
+    bytes: Cell<u64>,
+}
+
+impl HeldIn {
+    pub fn new(room: Rc<Room>) -> HeldIn {
+        HeldIn {
+            room,
+            bytes: Cell::new(0),
+        }
+    }
+
+    /// Adds `bytes` that cannot be let go.
+    pub fn more(&self, bytes: u64) {
+        self.room.hold_anyway(bytes);
+        self.bytes.set(self.bytes.get() + bytes);
+    }
+
+    /// Adds `bytes` where the room has room for them: whether it has.
+    pub fn fits(&self, bytes: u64) -> bool {
+        let fits = self.room.hold(bytes);
+        if fits {
+            self.bytes.set(self.bytes.get() + bytes);
+        }
+        fits
+    }
+
+    /// Lets `bytes` of what it holds go.
+    pub fn less(&self, bytes: u64) {
+        let bytes = bytes.min(self.bytes.get());
+        self.room.let_go(bytes);
+        self.bytes.set(self.bytes.get() - bytes);
+    }
+
+    /// The bytes its room holds, at most.
+    pub fn size(&self) -> u64 {
+        self.room.sizes().bytes
+    }
+}
+
+impl Drop for HeldIn {
+    fn drop(&mut self) {
+        self.room.let_go(self.bytes.get());
+    }
+}
+
 /// Counts `bytes` held at a place that cannot write them, as long as the guard lives.
 pub struct Holding(u64);
 

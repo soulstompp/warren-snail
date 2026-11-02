@@ -507,7 +507,8 @@ pub(super) fn ask_join_within(
         }
         mine.directory_pages = snail.touched() - before;
         mine.directory_pages_held = snail.pages_held() - held_before;
-        mine.column_pages_held = snail.reader.keep_for_round(part.plan.disk_pages());
+        mine.directory_pages_predicted = mine.directory_pages + part.plan.map_pages;
+        snail.keep_held(&part.plan, &want)?;
         let mid = snail.reader.pages_read();
         let mut read = Ok(());
         if streamed {
@@ -572,7 +573,11 @@ pub(super) fn ask_join_within(
             t.held[side] = held;
         }
         snail.reader.read_done();
-        mine.column_pages_read = snail.reader.pages_read() - mid;
+        let maps = part.plan.maps_read();
+        mine.column_pages_read = snail.reader.pages_read() - mid - maps.file;
+        mine.column_pages_held = part.plan.held_read();
+        mine.directory_pages += maps.touched;
+        mine.directory_pages_held += maps.held;
         let w = &part.plan.walk;
         let name = table.orders[w.order].name.clone();
         mine.consulted = part.consulted;
@@ -590,6 +595,7 @@ pub(super) fn ask_join_within(
         let stopped = read.as_ref().err().is_some_and(past_the_room);
         if stopped {
             mine.column_pages_predicted = mine.column_pages_read;
+            mine.directory_pages_predicted = mine.directory_pages;
         }
         for r in [&mut round, &mut parts[at_snail]] {
             r.add_table(&mine, &name);

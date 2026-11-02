@@ -269,8 +269,7 @@ impl Snail {
             return Ok(true);
         }
         let by = self.part(&want, Some(&table.orders[strand].name))?;
-        let from_file =
-            |p: &Part| p.plan.column_pages - self.reader.held_among(p.plan.disk_pages());
+        let from_file = |p: &Part| p.plan.column_pages - p.plan.held;
         let width: u64 = want
             .columns
             .iter()

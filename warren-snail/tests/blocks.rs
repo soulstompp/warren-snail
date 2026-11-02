@@ -35,10 +35,10 @@ fn text_narrower_than_the_key_decides_the_cut_on_write() {
 fn an_order_is_out_once_the_directory_pages_it_reads_next_pass_another_order_s_every_page() {
     // `k` holds 50 values of 601 bytes that differ only in their last, 1,200 rows each, so the index
     // on it is 50 blocks, each entry keeping a separator of all 601: 32 bytes, 605 of the separator,
-    // 72 of three summaries and 4 of k's bytes, 713 in all, five to a page; the first entry keeps its
-    // key cut to 8 bytes a level, 128 bytes, and its page holds six. So 10 leaf pages, 2 above them
-    // and a top: 13 pages, three levels. A point read on the primary key may find its row in any of
-    // the index's blocks.
+    // 72 of three summaries, 4 of k's bytes and 114 of k's least and greatest, which keep 64 bytes each
+    // where they never part, 827 in all, four to a page; the first entry keeps its key cut to 64 bytes,
+    // 298 bytes, and its page holds five. So 13 leaf pages, 3 above them and a top: 17 pages, three
+    // levels. A point read on the primary key may find its row in any of the index's blocks.
     let path = tmp("deep.snail");
     let catalog = Catalog::parse(
         "CREATE TABLE s.t (a integer NOT NULL, b integer NOT NULL, k text NOT NULL, PRIMARY KEY (a));
@@ -66,7 +66,7 @@ fn an_order_is_out_once_the_directory_pages_it_reads_next_pass_another_order_s_e
         .find(|w| w.order == "s_k")
         .unwrap()
         .index_pages;
-    assert_eq!(pages, 13, "{written:?}");
+    assert_eq!(pages, 17, "{written:?}");
     let mut snail = fresh(&path);
     let q = "SELECT t.b FROM s.t t WHERE t.a = 5";
     let (b, round) = snail.ask(q, None).unwrap();

@@ -69,6 +69,10 @@ fn each_read_exact(q: &str, round: &Round) {
     let (mut predicted, mut held, mut read) = (0, 0, 0);
     for (i, r) in round.reads.iter().enumerate() {
         assert_eq!(
+            r.directory_pages, r.directory_pages_predicted,
+            "{q}: read {i}: {r:?}"
+        );
+        assert_eq!(
             r.column_pages_read,
             r.column_pages_predicted - r.column_pages_held,
             "{q}: read {i}: {r:?}"
@@ -300,7 +304,8 @@ fn a_step_past_the_round_s_room_writes_the_rows_past_it_once_and_reads_them_back
     let path = tree("spill");
     let dir = spill_dir("step");
     // The step holds every node, two integers a row, 9 bytes each as held: 18 bytes a row. A room
-    // of 65,536 bytes holds 3,640 of them; the other 12,743, 229,374 bytes, are 56 pages.
+    // of 65,536 bytes holds 3,640 of them; the other 12,743, 229,374 bytes, are 56 pages, 2 bytes
+    // short; the read's plan takes part of the room, so one more page is written.
     let room: u64 = 65_536;
     let row = 18;
     let held = room / row;
@@ -315,13 +320,13 @@ fn a_step_past_the_round_s_room_writes_the_rows_past_it_once_and_reads_them_back
     assert_eq!(one(&b), N * (N + 1) / 2, "{q}");
     assert_eq!(
         (round.spill_pages_written, round.spill_pages_read),
-        (pages, pages),
+        (pages + 1, pages + 1),
         "{q}: {round:?}"
     );
     // The step reading it is handed its FROM a chunk at a time: the most held is the room, and what
     // one chunk holds, the rows of a block of the table or of four pages of the spill.
     assert!(
-        round.bytes_held >= held * row + 4 * 4096
+        round.bytes_held >= held * row + 3 * 4096
             && round.bytes_held <= room + one_chunk(&path, row),
         "{q}: {round:?}"
     );
@@ -366,14 +371,15 @@ fn a_window_past_the_round_s_room_holds_every_partition_whole_and_writes_the_row
     let q = "SELECT t.id, row_number() OVER (PARTITION BY t.id % 64 ORDER BY t.id) FROM s.t t";
     let rank = |i: i64| (i - i % 64) / 64 + i64::from(i % 64 != 0);
     // The step held whole is every row as the table's read gives it, its two integers 18 bytes:
-    // 196,608 bytes of room hold 10,922, the other 5,461 are 98,298 bytes, 24 pages, and fewer than
-    // the room holds, so they are written once.
+    // 196,608 bytes of room hold 10,922, the other 5,461 are 98,298 bytes, 24 pages, 6 bytes short, and
+    // fewer than the room holds, so they are written once; the read's plan takes part of the room, so
+    // one more page is written.
     let room: u64 = 196_608;
     let held = room / 18;
     let pages = ((N as u64 - held) * 18).div_ceil(4096);
     assert_eq!((held, pages), (10_922, 24));
     for (sizes, written) in [
-        (Sizes::of(room).in_dir(&dir), pages),
+        (Sizes::of(room).in_dir(&dir), pages + 1),
         (Sizes::default().in_dir(&dir), 0),
     ] {
         let size = sizes.bytes;
@@ -753,10 +759,10 @@ fn a_set_operation_s_image_past_the_room_is_met_in_passes_each_key_whole_in_one(
         assert_eq!(one(&b), want, "{q}");
         assert!(round.spill_pages_written > 0, "{q}: {round:?}");
         // Each pass's pages are read back once; a second arm kept to the first's keys reads the
-        // first's 20 pages once more for them.
+        // first's 21 pages once more for them, the read's plan taking part of the room.
         assert!(
             round.spill_pages_read >= round.spill_pages_written
-                && round.spill_pages_read <= round.spill_pages_written + 20,
+                && round.spill_pages_read <= round.spill_pages_written + 21,
             "{q}: {round:?}"
         );
         assert!(round.bytes_held <= room + one_chunk(&path, 18), "{q}: {round:?}");
@@ -767,7 +773,8 @@ fn a_set_operation_s_image_past_the_room_is_met_in_passes_each_key_whole_in_one(
         assert_eq!(round.spill_pages_written, 0, "{q}");
     }
     // A UNION ALL's arms lie one after the other, its rows written once, read back once: the
-    // first arm's 7,281 held, the rest of its 16,383 and all the second's at 9 bytes a row, 20 + 36.
+    // first arm's 7,281 held, the rest of its 16,383 and all the second's at 9 bytes a row, 20 + 36, and
+    // one more for the room the plan's blocks take from the first arm.
     let q = "SELECT count(*) FROM (SELECT t.id FROM s.t t UNION ALL SELECT u.id FROM s.t u) x";
     let mut snail = Snail::open(&path).unwrap();
     snail.size_rounds(Sizes::of(room).in_dir(&dir));
@@ -776,7 +783,7 @@ fn a_set_operation_s_image_past_the_room_is_met_in_passes_each_key_whole_in_one(
     assert_eq!(one(&b), 2 * N, "{q}");
     assert_eq!(
         (round.spill_pages_written, round.spill_pages_read),
-        (56, 56),
+        (57, 57),
         "{q}: {round:?}"
     );
     assert!(

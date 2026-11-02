@@ -1177,16 +1177,21 @@ impl Entry {
     /// in the two halves of the bytes it names; a map that begins its run, as every map of format 7
     /// does, lies alone in it.
     pub(crate) fn map_run(&self) -> (Extent, usize) {
-        let at = (self.child.bytes >> 32) as usize;
-        let bytes = self.child.bytes & u64::from(u32::MAX);
-        (
-            Extent {
-                start: self.child.start,
-                bytes: at as u64 + bytes,
-            },
-            at,
-        )
+        map_run_of(self.child)
     }
+}
+
+/// `Entry::map_run`, from what a block's entry names of its page map.
+pub(crate) fn map_run_of(child: Extent) -> (Extent, usize) {
+    let at = (child.bytes >> 32) as usize;
+    let bytes = child.bytes & u64::from(u32::MAX);
+    (
+        Extent {
+            start: child.start,
+            bytes: at as u64 + bytes,
+        },
+        at,
+    )
 }
 
 /// What a block's entry names of its page map: the first page of the run that holds it, where in the

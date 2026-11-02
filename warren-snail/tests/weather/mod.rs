@@ -211,9 +211,13 @@ pub fn snail_bytes(path: &Path) -> u64 {
     total
 }
 
-/// A round read exactly the column pages it predicted, less those it held, and predicted them within
-/// its order's bounds.
+/// A round read exactly the column pages it predicted, less those it held, predicted them within its
+/// order's bounds, and touched the directory pages it predicted.
 pub fn exact(q: &str, round: &Round) {
+    assert_eq!(
+        round.directory_pages, round.directory_pages_predicted,
+        "{q}: {round:?}"
+    );
     assert_eq!(
         round.column_pages_read,
         round.column_pages_predicted - round.column_pages_held,

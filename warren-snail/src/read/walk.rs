@@ -6,15 +6,21 @@ use super::question::{Cond, Countable, OpCond, Side, TextCond};
 use super::{Snail, Wasted};
 use crate::catalog::{ColumnType, Level, Order, Shape, Table};
 use crate::directory::{
-    below_least, decode_page, decode_top, past_greatest, Entry, Head, PageMap, Summary, Tail,
+    below_least, decode_page, decode_top, map_run_of, past_greatest, Entry, Head, PageMap, Summary,
+    Tail,
 };
 use crate::encode::decode_leaf_with;
+use crate::cut::PAGE;
 use crate::file::Extent;
 use crate::places::{level_key, month_of, null_key, KeyValue};
+use crate::room::{HeldIn, Room};
 use crate::values::Values;
 use crate::{Error, Result};
+use std::cell::{Cell as Counted, RefCell};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::rc::Rc;
 
 /// A column's collator, where a library orders its text.
 type Coll = Option<&'static crate::collations::Collator>;
@@ -132,9 +138,9 @@ enum Status {
     Must,
 }
 
-/// An entry the round reads below, or at the blocks reads the pages of, and what of it is left open.
-struct Open {
-    entry: Entry,
+/// What of an entry the round reads is left open, the same for most entries in a row, which share one.
+#[derive(PartialEq)]
+struct Reading {
     interval_may: bool,
     /// The conditions off the leading levels that the entry's counts leave open.
     rest_may: Vec<usize>,
@@ -146,6 +152,49 @@ struct Open {
     op_may: Vec<usize>,
     /// The columns the round reads under it.
     slots: Vec<usize>,
+}
+
+/// An entry's keys, where the round goes on needing them: above the blocks, and at a block whose pages
+/// are chosen by them or which a writer may prune.
+struct Ends {
+    first: Vec<KeyValue>,
+    last: Vec<KeyValue>,
+    open: bool,
+}
+
+/// The bytes a key holds.
+fn key_bytes(key: &[KeyValue]) -> u64 {
+    let held: usize = key
+        .iter()
+        .map(|v| match v {
+            KeyValue::Text(s) => s.len(),
+            KeyValue::Bytes(b) => b.len(),
+            _ => 0,
+        })
+        .sum();
+    (key.len() * std::mem::size_of::<KeyValue>() + held) as u64
+}
+
+/// An entry the round reads below, or at the blocks reads the pages of.
+struct Open {
+    reading: Rc<Reading>,
+    /// The directory page below it, or at the blocks what it names of the block's page map.
+    child: Extent,
+    rows: u32,
+    /// At the blocks, the disk pages of the columns it reads.
+    pages: u32,
+    /// At the blocks, the share of its rows the conditions off the leading levels cover.
+    share: f64,
+    ends: Option<Box<Ends>>,
+}
+
+impl Open {
+    /// The bytes it holds past its place among the entries left open.
+    fn held_past(&self) -> u64 {
+        self.ends.as_ref().map_or(0, |e| {
+            (std::mem::size_of::<Ends>()) as u64 + key_bytes(&e.first) + key_bytes(&e.last)
+        })
+    }
 }
 
 /// One order, as a round walks down its directory from the top.
@@ -194,6 +243,17 @@ pub struct Walk {
     pub(super) marks: Vec<Vec<KeyValue>>,
     pub(super) upper: bool,
     pub(super) empty: bool,
+    /// Whether the round may prune what it reads, so its blocks' first keys go on being needed.
+    writing: bool,
+    /// What it reads of the entry last left open.
+    reading: Option<Rc<Reading>>,
+    /// The bytes of each leaf under the blocks left open that it reads whole, as their entries give them,
+    /// and each leaf's width where it has one.
+    whole_bytes: Vec<u64>,
+    widths: Vec<Option<u64>>,
+    /// What the entries left open hold, and then the plan, counted in the round's room.
+    held: HeldIn,
+    open_bytes: u64,
 }
 
 impl Walk {
@@ -221,21 +281,16 @@ impl Walk {
         self.over(k.cmp(self.hi.as_slice()))
     }
 
-    /// `before` and `past`, holding the run's ends alone.
-    fn bounds(&self) -> (impl Fn(&[KeyValue]) -> bool, impl Fn(&[KeyValue]) -> bool) {
-        let (lo, hi, (lo_open, hi_open)) = (self.lo.clone(), self.hi.clone(), self.ends_open);
-        (
-            move |k: &[KeyValue]| match k.cmp(lo.as_slice()) {
-                Ordering::Less => true,
-                Ordering::Equal => lo_open,
-                Ordering::Greater => false,
-            },
-            move |k: &[KeyValue]| match k.cmp(hi.as_slice()) {
-                Ordering::Greater => true,
-                Ordering::Equal => hi_open,
-                Ordering::Less => false,
-            },
-        )
+    /// Counts what the entries left open hold now in the round's room.
+    fn count_open(&mut self) {
+        let now = (self.open.capacity() * std::mem::size_of::<Open>()) as u64
+            + self.open.iter().map(Open::held_past).sum::<u64>();
+        if now > self.open_bytes {
+            self.held.more(now - self.open_bytes);
+        } else {
+            self.held.less(self.open_bytes - now);
+        }
+        self.open_bytes = now;
     }
 
     /// The directory pages the round reads next, under the entries left open: a directory page each
@@ -246,9 +301,9 @@ impl Walk {
             .iter()
             .flat_map(|o| {
                 let run = if self.level == 1 {
-                    o.entry.map_run().0
+                    map_run_of(o.child).0
                 } else {
-                    o.entry.child
+                    o.child
                 };
                 run.start..run.start + run.pages()
             })
@@ -257,17 +312,40 @@ impl Walk {
     }
 }
 
-struct BlockRead {
-    map: PageMap,
-    interval_may: bool,
-    rest_may: Vec<usize>,
-    text_may: Vec<usize>,
-    null_may: Vec<usize>,
-    op_may: Vec<usize>,
-    /// For every column read, its slot and the pages read of it, ascending.
-    reads: Vec<(usize, Vec<usize>)>,
-    /// The rows of the block a sample keeps, ascending: none where it keeps every row it reads.
+/// What a block read in part goes on needing: its last key, where its pages are chosen by keys, and
+/// the rows a sample keeps.
+struct Partly {
+    last: Vec<KeyValue>,
     only: Option<Vec<u32>>,
+}
+
+/// A block a plan reads: what of it is left open, where its page map lies, its live rows and the disk
+/// pages its reads take. Its map is read when it is reached, and the pages to read chosen again from it.
+struct BlockRead {
+    reading: Rc<Reading>,
+    child: Extent,
+    rows: u32,
+    pages: u32,
+    partly: Option<Box<Partly>>,
+}
+
+impl BlockRead {
+    fn last(&self) -> &[KeyValue] {
+        self.partly.as_ref().map_or(&[][..], |p| &p.last)
+    }
+
+    fn only(&self) -> Option<&[u32]> {
+        self.partly.as_ref().and_then(|p| p.only.as_deref())
+    }
+}
+
+/// The directory pages of its page maps a read touched as its blocks were reached: all of them, those
+/// found held, and those read from the file.
+#[derive(Clone, Copy, Default)]
+pub(super) struct MapsRead {
+    pub(super) touched: u64,
+    pub(super) held: u64,
+    pub(super) file: u64,
 }
 
 pub struct Plan {
@@ -277,102 +355,205 @@ pub struct Plan {
     /// The rows the question holds, estimated from the blocks' page maps: those the counts closed on,
     /// and of each block read in part, its rows by the share of it each open condition covers.
     pub rows_estimate: f64,
+    /// The pages of page maps the plan holds, as long as its round's room lets it, and those read last
+    /// as a block was reached.
+    maps: RefCell<MapPagesHeld>,
+    /// The directory pages the read touches of page maps as its blocks are reached, known before it
+    /// reads a column page, and what it has touched so far.
+    pub map_pages: u64,
+    maps_read: Counted<MapsRead>,
+    /// Of the column pages, those held when the plan was made, and those found held as the read reached
+    /// them.
+    pub held: u64,
+    held_read: Counted<u64>,
+    /// The bytes of the pages it reads of each leaf.
+    written: Vec<u64>,
 }
 
 impl Plan {
     /// The bytes a row of the blocks the plan reads holds of the held leaves `slots`, as it writes them.
     pub(super) fn bytes_a_row(&self, slots: std::ops::Range<usize>) -> u64 {
-        let bytes: u64 = self
-            .reads
-            .iter()
-            .flat_map(|br| {
-                br.reads
-                    .iter()
-                    .filter(|(slot, _)| slots.contains(slot))
-                    .flat_map(move |(slot, pages)| {
-                        pages
-                            .iter()
-                            .map(move |&p| br.map.columns[*slot].pages[p].at.bytes)
-                    })
-            })
-            .sum();
+        let bytes: u64 = self.written[slots].iter().sum();
         bytes / self.live_rows().max(1)
     }
 
     /// The live rows of the blocks the plan reads.
     pub(super) fn live_rows(&self) -> u64 {
-        self.reads
-            .iter()
-            .map(|br| u64::from(br.map.rows()) - br.map.dead.len() as u64)
-            .sum()
-    }
-
-    /// The plan kept to the live rows `picks` names, ascending, each counted from the first live row
-    /// of the first block it reads: each block holding none of them left unread, and of every other,
-    /// each column's pages that hold one.
-    pub(super) fn keep(&mut self, picks: &[u64]) {
-        let mut before = 0u64;
-        let mut at = 0;
-        let mut kept = Vec::new();
-        for mut br in std::mem::take(&mut self.reads) {
-            let live = u64::from(br.map.rows()) - br.map.dead.len() as u64;
-            let mut mine = Vec::new();
-            while at < picks.len() && picks[at] < before + live {
-                mine.push(picks[at] - before);
-                at += 1;
-            }
-            before += live;
-            if mine.is_empty() {
-                continue;
-            }
-            // Each live ordinal as the row it is, past the dead rows before it.
-            let mut rows = Vec::with_capacity(mine.len());
-            let (mut d, mut seen) = (0, 0u64);
-            for r in 0..br.map.rows() {
-                if br.map.dead.get(d) == Some(&r) {
-                    d += 1;
-                    continue;
-                }
-                if rows.len() < mine.len() && mine[rows.len()] == seen {
-                    rows.push(r);
-                }
-                seen += 1;
-            }
-            for (s, chosen) in &mut br.reads {
-                let pages = &br.map.columns[*s].pages;
-                chosen.retain(|&p| {
-                    let (a, z) = (pages[p].first_row, pages[p].first_row + pages[p].rows);
-                    rows.iter().any(|&r| a <= r && r < z)
-                });
-            }
-            br.only = Some(rows);
-            kept.push(br);
-        }
-        self.reads = kept;
-        let disk = self.disk_pages().count() as u64;
-        self.column_pages = disk;
+        self.reads.iter().map(|br| u64::from(br.rows)).sum()
     }
 
     pub fn blocks_read(&self) -> u64 {
         self.reads.len() as u64
     }
 
-    /// Every disk page the plan's column reads take, the dictionaries' among them.
-    pub fn disk_pages(&self) -> impl Iterator<Item = u64> + '_ {
-        let span = |e: Extent| e.start..e.start + e.pages();
-        self.reads.iter().flat_map(move |br| {
-            br.reads
-                .iter()
-                .filter(|(_, chosen)| !chosen.is_empty())
-                .flat_map(move |(s, chosen)| {
-                    let cp = &br.map.columns[*s];
-                    cp.dictionary
-                        .into_iter()
-                        .flat_map(span)
-                        .chain(chosen.iter().flat_map(move |&p| span(cp.pages[p].at)))
-                })
-        })
+    /// The directory pages its read has touched of page maps so far.
+    pub(super) fn maps_read(&self) -> MapsRead {
+        self.maps_read.get()
     }
+
+    /// The column pages its read has found held so far.
+    pub(super) fn held_read(&self) -> u64 {
+        self.held_read.get()
+    }
+
+    /// The directory pages reaching its blocks touches, each block's map found among those the plan
+    /// holds or those last read.
+    fn count_map_pages(&mut self) {
+        let mut last: Option<(u64, u64)> = None;
+        let mut n = 0;
+        let maps = &self.maps.get_mut().pages;
+        for br in &self.reads {
+            let run = map_run_of(br.child).0;
+            let pages = run.pages();
+            let enough = pages * PAGE as u64;
+            let held = maps
+                .get(&run.start)
+                .is_some_and(|b| b.len() as u64 >= enough);
+            if held || matches!(last, Some((s, p)) if s == run.start && p >= pages) {
+                continue;
+            }
+            n += pages;
+            last = Some((run.start, pages));
+        }
+        self.map_pages = n;
+    }
+}
+
+/// The pages of a block's map a read reads of a leaf, ascending, and the disk pages among them read
+/// only for rows written after the sorted ones: a page holding such rows is read whenever the block
+/// is, and a page's next key bounds it only while that key is a sorted row's. A page of the tail holds
+/// no sorted row, so no key range brings a read to it.
+fn leaf_pages(
+    map: &PageMap,
+    slot: usize,
+    interval_may: bool,
+    walk: &Walk,
+    keys: Option<&KeySet>,
+    last: &[KeyValue],
+) -> (Vec<usize>, u64) {
+    let (m, j) = (walk.m, walk.keyed);
+    let pages = &map.columns[slot].pages;
+    let unsorted = |p: usize| pages[p].first_row + pages[p].rows > map.sorted;
+    let next = |p: usize| {
+        if p + 1 < pages.len() && !unsorted(p) && pages[p + 1].first_row < map.sorted {
+            &pages[p + 1].first[..]
+        } else {
+            last
+        }
+    };
+    let fits = |p: usize| {
+        pages[p].first_row < map.sorted
+            && (!interval_may
+                || (!walk.past(&pages[p].first[..m]) && !walk.before(&next(p)[..m])))
+            && (j == 0
+                || keys
+                    .unwrap()
+                    .meets(&pages[p].first[..j], &next(p)[..j], false))
+    };
+    let chosen: Vec<usize> = (0..pages.len())
+        .filter(|&p| unsorted(p) || fits(p))
+        .collect();
+    let extra = chosen
+        .iter()
+        .filter(|&&p| !fits(p))
+        .map(|&p| pages[p].at.pages())
+        .sum();
+    (chosen, extra)
+}
+
+/// Whether a page holds one of these rows.
+fn holds_any(page: &crate::directory::PageEntry, rows: &[u32]) -> bool {
+    let (a, z) = (page.first_row, page.first_row + page.rows);
+    rows.iter().any(|&r| a <= r && r < z)
+}
+
+/// For every column a block's read reads, its slot and the pages read of it, ascending.
+fn pages_read_of(
+    map: &PageMap,
+    br: &BlockRead,
+    walk: &Walk,
+    keys: Option<&KeySet>,
+) -> Vec<(usize, Vec<usize>)> {
+    br.reading
+        .slots
+        .iter()
+        .map(|&s| {
+            let (mut chosen, _) =
+                leaf_pages(map, s, br.reading.interval_may, walk, keys, br.last());
+            if let Some(rows) = br.only() {
+                chosen.retain(|&p| holds_any(&map.columns[s].pages[p], rows));
+            }
+            (s, chosen)
+        })
+        .collect()
+}
+
+/// Every disk page these reads of a block's columns take, the dictionaries' among them.
+fn disk_pages<'a>(
+    map: &'a PageMap,
+    reads: &'a [(usize, Vec<usize>)],
+) -> impl Iterator<Item = u64> + 'a {
+    let span = |e: Extent| e.start..e.start + e.pages();
+    reads
+        .iter()
+        .filter(|(_, chosen)| !chosen.is_empty())
+        .flat_map(move |(s, chosen)| {
+            let cp = &map.columns[*s];
+            cp.dictionary
+                .into_iter()
+                .flat_map(span)
+                .chain(chosen.iter().flat_map(move |&p| span(cp.pages[p].at)))
+        })
+}
+
+/// The share of a plan's room the page maps it holds may take, the rest kept for the rows it reads.
+const MAPS_SHARE: u64 = 4;
+
+/// What the plan's read counts of a page map's pages: those it holds, by their first, and those last
+/// read.
+#[derive(Default)]
+struct MapPagesHeld {
+    pages: BTreeMap<u64, Vec<u8>>,
+    bytes: u64,
+    last: Option<(u64, Vec<u8>)>,
+}
+
+impl MapPagesHeld {
+    /// The bytes of the run a map lies in, where they are held.
+    fn found(&self, start: u64, pages: u64) -> Option<&[u8]> {
+        let enough = pages as usize * PAGE;
+        self.pages
+            .get(&start)
+            .filter(|b| b.len() >= enough)
+            .map(|b| &b[..])
+            .or_else(|| {
+                self.last
+                    .as_ref()
+                    .filter(|(s, b)| *s == start && b.len() >= enough)
+                    .map(|(_, b)| &b[..])
+            })
+    }
+
+    /// Holds the bytes of a run just read, as long as the room lets it; or as the last read.
+    fn take(&mut self, start: u64, bytes: Vec<u8>, held: &HeldIn) {
+        let cost = bytes.len() as u64;
+        if self.bytes + cost <= held.size() / MAPS_SHARE && held.fits(cost) {
+            self.bytes += cost;
+            self.pages.insert(start, bytes);
+        } else {
+            self.last = Some((start, bytes));
+        }
+    }
+}
+
+/// The bytes a block read holds in a plan.
+fn block_held(br: &BlockRead) -> u64 {
+    std::mem::size_of::<BlockRead>() as u64
+        + br.partly.as_ref().map_or(0, |p| {
+            std::mem::size_of::<Partly>() as u64
+                + key_bytes(&p.last)
+                + p.only.as_ref().map_or(0, |o| 4 * o.len() as u64)
+        })
 }
 
 /// Of the orders that can read one level further down, given with their fewest pages, the one whose
@@ -550,6 +731,12 @@ impl Snail {
             _ => 0,
         };
         let level = head.height;
+        let whole_bytes = vec![0; head.units.len()];
+        let widths = order
+            .leaves(want.table)
+            .iter()
+            .map(|(_, l)| l.ty.width().map(|w| w as u64))
+            .collect();
         let mut walk = Walk {
             order: oi,
             head,
@@ -578,10 +765,19 @@ impl Snail {
             marks: Vec::new(),
             upper: false,
             empty: want.side.empty,
+            writing: self.writer.is_some(),
+            reading: None,
+            whole_bytes,
+            widths,
+            held: HeldIn::new(
+                crate::room::current().unwrap_or_else(|| Room::new(self.reader.room().sizes())),
+            ),
+            open_bytes: 0,
         };
         for e in entries {
             assess(&mut walk, e, order, want);
         }
+        walk.count_open();
         walk.top = (walk.low, walk.high);
         Ok(walk)
     }
@@ -596,75 +792,76 @@ impl Snail {
         walk.rows_low = 0;
         walk.rows_high = 0;
         for o in open {
+            let ends = o.ends.as_ref().expect("an entry above the blocks keeps its last key");
             let entries = decode_page(
-                &self.reader.read_extent(o.entry.child)?,
+                &self.reader.read_extent(o.child)?,
                 &walk.head,
-                o.entry.bound(),
+                (&ends.last, ends.open),
             )?;
-            walk.directory_pages += o.entry.child.pages();
+            walk.directory_pages += o.child.pages();
             for e in entries {
                 assess(walk, e, order, want);
             }
         }
+        walk.count_open();
         Ok(())
     }
 
-    /// The column pages a round along an order walked down to its blocks reads, exactly, from the
-    /// page maps of the blocks it reads.
+    /// The column pages a round along an order walked down to its blocks reads, exactly: of a block
+    /// read whole, the pages its entry lists; of one read in part, those its page map names. A snail
+    /// open to write prunes by what each map says, and where pages of the order are held, which ones
+    /// is known from the maps, so there every block's is read now.
     pub(super) fn predict(&self, mut walk: Walk, want: &Want) -> Result<Plan> {
+        let table = want.side.table;
+        let maps_now =
+            self.writer.is_some() || self.reader.held_under(super::order_tag(table, walk.order)) > 0;
+        let mut written: Vec<u64> = match maps_now {
+            true => vec![0; walk.whole_bytes.len()],
+            false => walk.whole_bytes.clone(),
+        };
         let mut column_pages = 0u64;
+        let mut held = 0u64;
         let mut rows_estimate = walk.rows_closed as f64;
-        let mut reads = Vec::with_capacity(walk.open.len());
-        // The pages that hold the page maps last read: blocks side by side share them.
-        let mut held: Option<(u64, Vec<u8>)> = None;
-        for o in std::mem::take(&mut walk.open) {
-            let (m, j) = (walk.m, walk.keyed);
-            let (before, past) = walk.bounds();
-            let b = &o.entry;
-            let (run, at) = b.map_run();
-            let pages = run.pages();
-            if !matches!(&held, Some((start, buf)) if *start == run.start && buf.len() as u64 >= pages * crate::cut::PAGE as u64)
-            {
-                held = Some((run.start, self.reader.read(run.start, pages)?));
-                walk.directory_pages += pages;
+        let open = std::mem::take(&mut walk.open);
+        let mut reads = Vec::with_capacity(open.len());
+        let mut maps = MapPagesHeld::default();
+        walk.held
+            .more((open.len() * std::mem::size_of::<BlockRead>()) as u64);
+        for o in open {
+            let by_keys = o.reading.interval_may || walk.keyed > 0;
+            let rows = o.rows as f64 * o.share;
+            if !by_keys && !maps_now {
+                column_pages += u64::from(o.pages);
+                rows_estimate += rows;
+                reads.push(BlockRead {
+                    reading: o.reading,
+                    child: o.child,
+                    rows: o.rows,
+                    pages: o.pages,
+                    partly: None,
+                });
+                continue;
             }
-            let map = PageMap::decode(&held.as_ref().unwrap().1[at..], &walk.head.level_text)?;
-            rows_estimate += estimate(&o, &map, &walk, want.table, &want.side.nulls);
-            let mut block_reads = Vec::new();
-            let mut waste = 0u64;
-            for &s in &o.slots {
+            let (run, at) = map_run_of(o.child);
+            if maps.found(run.start, run.pages()).is_none() {
+                let bytes = self.reader.read(run.start, run.pages())?;
+                walk.directory_pages += run.pages();
+                maps.take(run.start, bytes, &walk.held);
+            }
+            let map = PageMap::decode(
+                &maps.found(run.start, run.pages()).unwrap()[at..],
+                &walk.head.level_text,
+            )?;
+            let last = o.ends.as_ref().map_or(&[][..], |e| &e.last[..]);
+            rows_estimate += rows * interval_share(&o.reading, &map, &walk, last);
+            let mut block_reads = Vec::with_capacity(o.reading.slots.len());
+            let (mut pages_of_block, mut waste) = (0u64, 0u64);
+            for &s in &o.reading.slots {
+                let (chosen, extra) =
+                    leaf_pages(&map, s, o.reading.interval_may, &walk, want.keys, last);
                 let pages = &map.columns[s].pages;
-                // A page holding rows written after the sorted ones is read whenever the block is,
-                // and a page's next key bounds it only while that key is a sorted row's. A page of
-                // the tail holds no sorted row, so no key range brings a read to it.
-                let unsorted = |p: usize| pages[p].first_row + pages[p].rows > map.sorted;
-                let next = |p: usize| {
-                    if p + 1 < pages.len() && !unsorted(p) && pages[p + 1].first_row < map.sorted {
-                        &pages[p + 1].first
-                    } else {
-                        &b.last
-                    }
-                };
-                let fits = |p: usize| {
-                    pages[p].first_row < map.sorted
-                        && (!o.interval_may
-                            || (!past(&pages[p].first[..m]) && !before(&next(p)[..m])))
-                        && (j == 0
-                            || want
-                                .keys
-                                .unwrap()
-                                .meets(&pages[p].first[..j], &next(p)[..j], false))
-                };
-                let chosen: Vec<usize> = (0..pages.len())
-                    .filter(|&p| unsorted(p) || fits(p))
-                    .collect();
-                // The column's waste: the pages read only for rows written after the sorted ones,
-                // and the pages the dead rows among those read fill.
-                let extra: u64 = chosen
-                    .iter()
-                    .filter(|&&p| !fits(p))
-                    .map(|&p| pages[p].at.pages())
-                    .sum();
+                // The column's waste: the pages read only for rows written after the sorted ones, and
+                // the pages the dead rows among those read fill.
                 let (mut rows, mut dead, mut disk) = (0u64, 0u64, 0u64);
                 for &p in &chosen {
                     let (a, z) = (pages[p].first_row, pages[p].first_row + pages[p].rows);
@@ -672,6 +869,7 @@ impl Snail {
                     dead += (map.dead.partition_point(|&x| x < z)
                         - map.dead.partition_point(|&x| x < a)) as u64;
                     disk += pages[p].at.pages();
+                    written[s] += pages[p].at.bytes;
                 }
                 let live = if rows == 0 {
                     0
@@ -680,36 +878,166 @@ impl Snail {
                 };
                 waste = waste.max(extra + disk - live);
                 if !chosen.is_empty() {
-                    column_pages += map.columns[s].dictionary.map_or(0, Extent::pages);
-                    column_pages += chosen.iter().map(|&p| pages[p].at.pages()).sum::<u64>();
+                    pages_of_block += map.columns[s].dictionary.map_or(0, Extent::pages);
+                    pages_of_block += disk;
                 }
                 block_reads.push((s, chosen));
             }
             if waste >= 1 && self.writer.is_some() {
+                let ends = o.ends.as_ref().expect("a writer keeps a block's first key");
                 self.wasted.borrow_mut().push(Wasted {
-                    table: want.side.table,
+                    table,
                     order: walk.order,
-                    first: b.first.clone(),
-                    child: b.child,
+                    first: ends.first.clone(),
+                    child: o.child,
                 });
             }
-            reads.push(BlockRead {
-                map,
-                interval_may: o.interval_may,
-                rest_may: o.rest_may,
-                text_may: o.text_may,
-                null_may: o.null_may,
-                op_may: o.op_may,
-                reads: block_reads,
-                only: None,
+            if maps_now {
+                held += self.reader.held_among(disk_pages(&map, &block_reads));
+            }
+            column_pages += pages_of_block;
+            let partly = by_keys.then(|| {
+                let last = o.ends.map_or_else(Vec::new, |e| e.last);
+                Box::new(Partly { last, only: None })
             });
+            let read = BlockRead {
+                reading: o.reading,
+                child: o.child,
+                rows: o.rows,
+                pages: pages_of_block as u32,
+                partly,
+            };
+            walk.held
+                .more(block_held(&read) - std::mem::size_of::<BlockRead>() as u64);
+            reads.push(read);
         }
-        Ok(Plan {
+        walk.count_open();
+        maps.last = None;
+        let mut plan = Plan {
             walk,
             reads,
             column_pages,
             rows_estimate,
-        })
+            maps: RefCell::new(maps),
+            map_pages: 0,
+            maps_read: Default::default(),
+            held,
+            held_read: Default::default(),
+            written,
+        };
+        plan.count_map_pages();
+        Ok(plan)
+    }
+
+    /// The plan kept to the live rows `picks` names, ascending, each counted from the first live row
+    /// of the first block it reads: each block holding none of them left unread, and of every other,
+    /// each column's pages that hold one.
+    pub(super) fn keep_rows(&self, plan: &mut Plan, picks: &[u64], want: &Want) -> Result<()> {
+        let mut before = 0u64;
+        let mut at = 0;
+        let mut kept = Vec::new();
+        let mut column_pages = 0u64;
+        let mut maps = std::mem::take(plan.maps.get_mut());
+        for mut br in std::mem::take(&mut plan.reads) {
+            let live = u64::from(br.rows);
+            let mut mine = Vec::new();
+            while at < picks.len() && picks[at] < before + live {
+                mine.push(picks[at] - before);
+                at += 1;
+            }
+            before += live;
+            if mine.is_empty() {
+                continue;
+            }
+            let (run, start) = map_run_of(br.child);
+            if maps.found(run.start, run.pages()).is_none() {
+                let bytes = self.reader.read(run.start, run.pages())?;
+                plan.walk.directory_pages += run.pages();
+                maps.take(run.start, bytes, &plan.walk.held);
+            }
+            let map = PageMap::decode(
+                &maps.found(run.start, run.pages()).unwrap()[start..],
+                &plan.walk.head.level_text,
+            )?;
+            // Each live ordinal as the row it is, past the dead rows before it.
+            let mut rows = Vec::with_capacity(mine.len());
+            let (mut d, mut seen) = (0, 0u64);
+            for r in 0..map.rows() {
+                if map.dead.get(d) == Some(&r) {
+                    d += 1;
+                    continue;
+                }
+                if rows.len() < mine.len() && mine[rows.len()] == seen {
+                    rows.push(r);
+                }
+                seen += 1;
+            }
+            br.partly = Some(Box::new(Partly {
+                last: br.partly.take().map_or_else(Vec::new, |p| p.last),
+                only: Some(rows),
+            }));
+            let reads = pages_read_of(&map, &br, &plan.walk, want.keys);
+            let pages = disk_pages(&map, &reads).count() as u64;
+            br.pages = pages as u32;
+            column_pages += pages;
+            plan.walk.held.more(block_held(&br) - std::mem::size_of::<BlockRead>() as u64);
+            kept.push(br);
+        }
+        maps.last = None;
+        *plan.maps.get_mut() = maps;
+        plan.reads = kept;
+        plan.column_pages = column_pages;
+        plan.count_map_pages();
+        Ok(())
+    }
+
+    /// Of the pages a plan's read will read that are known now, those held the round keeps until the
+    /// read ends: those of the blocks whose maps the plan holds, where any of the order's are held.
+    pub(super) fn keep_held(&self, plan: &Plan, want: &Want) -> Result<()> {
+        let maps = plan.maps.borrow();
+        if maps.pages.is_empty()
+            || self
+                .reader
+                .held_under(super::order_tag(want.side.table, plan.walk.order))
+                == 0
+                && self.writer.is_none()
+        {
+            return Ok(());
+        }
+        for br in &plan.reads {
+            let (run, at) = map_run_of(br.child);
+            if let Some(bytes) = maps.pages.get(&run.start) {
+                if bytes.len() as u64 >= run.pages() * PAGE as u64 {
+                    let map = PageMap::decode(&bytes[at..], &plan.walk.head.level_text)?;
+                    let reads = pages_read_of(&map, br, &plan.walk, want.keys);
+                    self.reader.keep_for_round(disk_pages(&map, &reads));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A block's page map as a read reaches it: from the pages the plan holds, or those last read, or
+    /// read now, counted as directory pages and never under the read's tag.
+    fn reached_map(&self, plan: &Plan, br: &BlockRead, tag: u32) -> Result<PageMap> {
+        let (run, at) = map_run_of(br.child);
+        let mut maps = plan.maps.borrow_mut();
+        if maps.found(run.start, run.pages()).is_none() {
+            let (file, held) = (self.reader.pages_read(), self.reader.pages_held());
+            self.reader.tag_reads(None);
+            let bytes = self.reader.read(run.start, run.pages());
+            self.reader.tag_reads(Some(tag));
+            let mut read = plan.maps_read.get();
+            read.touched += run.pages();
+            read.held += self.reader.pages_held() - held;
+            read.file += self.reader.pages_read() - file;
+            plan.maps_read.set(read);
+            maps.last = Some((run.start, bytes?));
+        }
+        PageMap::decode(
+            &maps.found(run.start, run.pages()).unwrap()[at..],
+            &plan.walk.head.level_text,
+        )
     }
 
     /// Hands each row the plan keeps to `each`, as the values of `columns`, in the order's order. The
@@ -768,12 +1096,18 @@ impl Snail {
             orderers[c] = table.columns[c].orderer()?;
         }
         let descs = crate::write::leaf_descriptors(table, order)?;
+        let tag = super::order_tag(want.side.table, plan.walk.order);
         for br in &plan.reads[blocks] {
+            let map = self.reached_map(plan, br, tag)?;
+            let reads = pages_read_of(&map, br, walk, want.keys);
+            debug_assert_eq!(disk_pages(&map, &reads).count() as u32, br.pages);
+            plan.held_read
+                .set(plan.held_read.get() + self.reader.keep_for_round(disk_pages(&map, &reads)));
             // For every leaf read, its runs of pages decoded: (slot, [(first row, values)]).
             let mut held: Vec<(usize, Vec<(usize, Values)>)> = Vec::new();
-            for (s, chosen) in &br.reads {
+            for (s, chosen) in &reads {
                 let leaf = &leaves[*s].1;
-                let cp = &br.map.columns[*s];
+                let cp = &map.columns[*s];
                 let mut runs = Vec::new();
                 if !chosen.is_empty() {
                     let dictionary = match cp.dictionary {
@@ -824,8 +1158,8 @@ impl Snail {
                 held.push((*s, runs));
             }
             // The rows every leaf read holds. Within one of these ranges each leaf is one run.
-            let mut rows: Vec<(usize, usize)> = vec![(0, br.map.rows() as usize)];
-            let dead = &br.map.dead;
+            let mut rows: Vec<(usize, usize)> = vec![(0, map.rows() as usize)];
+            let dead = &map.dead;
             for (_, runs) in &held {
                 let mut kept = Vec::new();
                 for &(a, z) in &rows {
@@ -839,7 +1173,7 @@ impl Snail {
                 rows = kept;
             }
             // A sample keeps its own rows alone.
-            if let Some(only) = &br.only {
+            if let Some(only) = br.only() {
                 rows = only
                     .iter()
                     .map(|&r| r as usize)
@@ -849,7 +1183,7 @@ impl Snail {
             }
             // The columns read whose values are a group of leaves.
             let mut groups: Vec<usize> = Vec::new();
-            for (s, _) in &br.reads {
+            for (s, _) in &reads {
                 let c = leaves[*s].0;
                 if table.is_group(c) && !groups.contains(&c) {
                     groups.push(c);
@@ -887,7 +1221,7 @@ impl Snail {
                         None => run(order.leaf_slot(table, c).unwrap()),
                     }
                 };
-                let fixed = if br.interval_may {
+                let fixed = if br.reading.interval_may {
                     &order.levels[..walk.m]
                 } else {
                     &[][..]
@@ -906,6 +1240,7 @@ impl Snail {
                     })
                     .collect();
                 let rests: Vec<(&Cond, usize, &Values)> = br
+                    .reading
                     .rest_may
                     .iter()
                     .map(|&ri| {
@@ -915,6 +1250,7 @@ impl Snail {
                     })
                     .collect();
                 let texts: Vec<(&TextCond, ColumnType, usize, &Values, Coll)> = br
+                    .reading
                     .text_may
                     .iter()
                     .map(|&ti| {
@@ -924,6 +1260,7 @@ impl Snail {
                     })
                     .collect();
                 let nulls: Vec<(bool, usize, &Values)> = br
+                    .reading
                     .null_may
                     .iter()
                     .map(|&ni| {
@@ -933,6 +1270,7 @@ impl Snail {
                     })
                     .collect();
                 let ops: Vec<(&OpCond, ColumnType, usize, &Values)> = br
+                    .reading
                     .op_may
                     .iter()
                     .map(|&oi| {
@@ -1030,7 +1368,7 @@ impl Snail {
                         &order.nulls_first[..walk.keyed],
                         from,
                         to,
-                        br.map.sorted as usize,
+                        map.sorted as usize,
                     ),
                     _ => vec![(from, to)],
                 };
@@ -1038,7 +1376,7 @@ impl Snail {
                     let mut d = dead.partition_point(|&x| (x as usize) < a);
                     // A run every row of which is wanted goes to the sink at once, where it takes it.
                     if lead == 0
-                        && !br.interval_may
+                        && !br.reading.interval_may
                         && rests.is_empty()
                         && texts.is_empty()
                         && nulls.is_empty()
@@ -1056,7 +1394,7 @@ impl Snail {
                             d += 1;
                             continue;
                         }
-                        if br.interval_may
+                        if br.reading.interval_may
                             && (walk.short_of(against(r, &walk.lo))
                                 || walk.over(against(r, &walk.hi)))
                         {
@@ -1676,14 +2014,62 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             _ => walk.rows_high += rows,
         }
     }
-    walk.open.push(Open {
-        entry: e,
+    let reading = Reading {
         interval_may: interval == Status::May,
         rest_may,
         text_may,
         null_may,
         op_may,
         slots,
+    };
+    let reading = match &walk.reading {
+        Some(r) if **r == reading => r.clone(),
+        _ => {
+            let r = Rc::new(reading);
+            walk.reading = Some(r.clone());
+            r
+        }
+    };
+    let at_blocks = walk.level == 1;
+    let by_keys = reading.interval_may || j > 0;
+    let (pages, share) = if at_blocks {
+        if !by_keys {
+            for &s in &reading.slots {
+                let (sum, text) = (&e.columns[s], walk.head.text_slots.iter().position(|&t| t as usize == s));
+                let values = u64::from(e.rows.saturating_sub(sum.nulls));
+                walk.whole_bytes[s] += match (text, walk.widths[s]) {
+                    (Some(t), _) => u64::from(e.bytes[t]) + 4 * values,
+                    (None, Some(w)) => w * values,
+                    (None, None) => u64::from(sum.pages) * PAGE as u64,
+                };
+            }
+        }
+        (whole as u32, off_level_share(&reading, &e, walk, want))
+    } else {
+        (0, 1.0)
+    };
+    let ends = (!at_blocks || by_keys || walk.writing).then(|| {
+        Box::new(Ends {
+            first: if at_blocks && walk.writing {
+                e.first.clone()
+            } else {
+                Vec::new()
+            },
+            last: if !at_blocks || by_keys {
+                e.last.clone()
+            } else {
+                Vec::new()
+            },
+            open: e.open,
+        })
+    });
+    walk.open.push(Open {
+        reading,
+        child: e.child,
+        rows: e.rows,
+        pages,
+        share,
+        ends,
     });
 }
 
@@ -1886,52 +2272,57 @@ fn rest_status(
     }
 }
 
-/// The rows of the question an open block holds, estimated. The leading levels' range covers the
-/// block page by page, each page's rows taken as lying evenly across its keys; each condition off
-/// the levels covers the block by the share of its least to greatest it takes, or by its count
-/// where the counts give one, and a test for NULL by the NULLs counted; a condition on text off the
-/// levels leaves the block whole.
-fn estimate(o: &Open, map: &PageMap, walk: &Walk, table: &Table, nulls: &[(usize, bool)]) -> f64 {
-    let order = &table.orders[walk.order];
-    let e = &o.entry;
-    let mut share = 1.0;
-    if o.interval_may {
-        let m = walk.m;
-        let finest = o
-            .slots
-            .iter()
-            .copied()
-            .max_by_key(|&s| map.columns[s].pages.len());
-        if let Some(s) = finest {
-            let pages = &map.columns[s].pages;
-            let keyed = |p: usize| map.sorted > pages[p].first_row;
-            let (mut covered, mut all) = (0.0, 0.0);
-            for p in (0..pages.len()).filter(|&p| keyed(p)) {
-                let rows = pages[p].rows as f64;
-                let (next, last) = if p + 1 < pages.len() && keyed(p + 1) {
-                    (&pages[p + 1].first[..m], false)
-                } else {
-                    (&e.last[..m], true)
-                };
-                all += rows;
-                covered += rows * page_share(&pages[p].first[..m], next, last, &walk.lo, &walk.hi);
-            }
-            if all > 0.0 {
-                share *= covered / all;
-            }
+/// The share of an open block's rows the leading levels' range covers, page by page, each page's
+/// rows taken as lying evenly across its keys.
+fn interval_share(reading: &Reading, map: &PageMap, walk: &Walk, block_last: &[KeyValue]) -> f64 {
+    if !reading.interval_may {
+        return 1.0;
+    }
+    let m = walk.m;
+    let finest = reading
+        .slots
+        .iter()
+        .copied()
+        .max_by_key(|&s| map.columns[s].pages.len());
+    if let Some(s) = finest {
+        let pages = &map.columns[s].pages;
+        let keyed = |p: usize| map.sorted > pages[p].first_row;
+        let (mut covered, mut all) = (0.0, 0.0);
+        for p in (0..pages.len()).filter(|&p| keyed(p)) {
+            let rows = pages[p].rows as f64;
+            let (next, last) = if p + 1 < pages.len() && keyed(p + 1) {
+                (&pages[p + 1].first[..m], false)
+            } else {
+                (&block_last[..m], true)
+            };
+            all += rows;
+            covered += rows * page_share(&pages[p].first[..m], next, last, &walk.lo, &walk.hi);
+        }
+        if all > 0.0 {
+            return covered / all;
         }
     }
-    for &ri in &o.rest_may {
+    1.0
+}
+
+/// The share of an open block's rows the conditions off the levels cover: each by the share of its
+/// least to greatest it takes, or by its count where the counts give one, and a test for NULL by the
+/// NULLs counted; a condition on text off the levels leaves the block whole.
+fn off_level_share(reading: &Reading, e: &Entry, walk: &Walk, want: &Want) -> f64 {
+    let table = want.table;
+    let order = &table.orders[walk.order];
+    let mut share = 1.0;
+    for &ri in &reading.rest_may {
         let c = &walk.rest[ri];
         let (sum, slot) = summary_of(table, order, c, e);
         share *= rest_share(sum, slot, c, e, &walk.head);
     }
-    for &ni in &o.null_may {
-        let (c, null) = nulls[ni];
+    for &ni in &reading.null_may {
+        let (c, null) = want.side.nulls[ni];
         let n = e.columns[order.leaf_slot(table, c).unwrap()].nulls as f64;
         share *= if null { n } else { e.rows as f64 - n } / (e.rows as f64).max(1.0);
     }
-    e.rows as f64 * share
+    share
 }
 
 /// The share of a page's rows the range `lo` to `hi` covers, the page holding the keys from `first`
