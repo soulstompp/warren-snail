@@ -160,6 +160,37 @@ pub fn numeric_text(m: i128, s: u32) -> String {
     format!("{sign}{whole}.{frac}")
 }
 
+/// Each row of a block read along an order put in its place among the rows before it, by the
+/// values at `at` in turn, a NULL after every value: the rows written after its sorted ones among
+/// them.
+pub(super) fn in_place(rows: &mut [Vec<Value>], at: &[usize]) -> Result<()> {
+    let mut failed = None;
+    rows.sort_by(|a, b| {
+        for &i in at {
+            let o = match (a[i].is_null(), b[i].is_null()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                _ => match compare_values(&a[i], &b[i], None) {
+                    Ok(o) => o.unwrap_or(Ordering::Equal),
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                        Ordering::Equal
+                    }
+                },
+            };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        Ordering::Equal
+    });
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Two values compared as PostgreSQL compares values of one kind, two strings under `under`; none
 /// where either is NULL.
 pub(super) fn compare_values(
@@ -5968,6 +5999,44 @@ pub(super) fn computed_none<'q>() -> Computed<'q> {
     }
 }
 
+/// A row's partition, as its windows' PARTITION BY keys it.
+fn partition_key(by: &[Expr], row: &[Value], frame: &Frame) -> Result<Vec<Key>> {
+    let none = computed_none();
+    by.iter()
+        .map(|p| {
+            let v = eval(p, row, frame, &none)?;
+            grouped_key(&v)?;
+            Ok(key_under(&v, frame.casings.keyed(p)?))
+        })
+        .collect()
+}
+
+/// One partition's rows folded by a step's windows, and the rows the step returns for them.
+fn fold_partition(
+    p: &Prepared,
+    rows: Vec<Vec<Value>>,
+    frame: &Frame,
+    out: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let rel = Relation {
+        names: Vec::new(),
+        rows,
+        order: None,
+    };
+    let per_row = windows::values(&p.calls.windows, &rel, frame)?;
+    for (row, w) in rel.rows.iter().zip(per_row) {
+        let computed = Computed {
+            calls: w,
+            _q: std::marker::PhantomData,
+        };
+        out.extend(p.project(row, frame, computed)?);
+    }
+    Ok(())
+}
+
 /// One SELECT read over rows given a chunk at a time, in the order: its windows' running folds and
 /// its groups kept from chunk to chunk. A step that neither groups nor sorts hands each chunk on.
 pub(super) struct StepRun<'q> {
@@ -5985,6 +6054,13 @@ pub(super) struct StepRun<'q> {
     seen: std::collections::HashSet<Vec<Key>>,
     /// What its aggregates keep of the rows they are given, in the round's room.
     kept: crate::room::Holding,
+    /// Where its rows come in the order of its windows' PARTITION BY and ORDER BY: the partition
+    /// coming, its rows held in the round's room, and the rows the partitions before it returned.
+    along_partitions: bool,
+    partition: Option<Vec<Key>>,
+    partition_rows: Vec<Vec<Value>>,
+    partition_held: crate::room::Holding,
+    partitions_out: Vec<Vec<Value>>,
     /// The columns the step's FROM reads, as the last chunk gave them.
     columns: Columns,
     /// What answers its subqueries, where it has any.
@@ -6005,10 +6081,21 @@ impl<'q> StepRun<'q> {
             held: parted::Parted::new(),
             seen: Default::default(),
             kept: crate::room::holding(0),
+            along_partitions: false,
+            partition: None,
+            partition_rows: Vec::new(),
+            partition_held: crate::room::holding(0),
+            partitions_out: Vec::new(),
             columns: Vec::new(),
             subqueries: None,
             empty_row: None,
         }
+    }
+
+    /// Reads its rows as coming in the order of its windows' PARTITION BY and ORDER BY, each
+    /// partition folded once its rows have come.
+    pub(super) fn along_partitions(&mut self) {
+        self.along_partitions = true;
     }
 
     /// A DISTINCT step's rows, each the first time it comes; any other step's as they are.
@@ -6140,6 +6227,23 @@ impl<'q> StepRun<'q> {
             self.columns = frame.columns;
             return Ok(None);
         }
+        // Rows that come in its windows' order are folded a partition at a time.
+        if self.along_partitions {
+            let by = windows::shared_partition(&self.p.calls.windows);
+            for row in rel.rows {
+                let k = partition_key(by, &row, &frame)?;
+                if self.partition.as_ref() != Some(&k) && !self.partition_rows.is_empty() {
+                    let rows = std::mem::take(&mut self.partition_rows);
+                    fold_partition(&self.p, rows, &frame, &mut self.partitions_out)?;
+                    self.partition_held = crate::room::holding(0);
+                }
+                self.partition = Some(k);
+                self.partition_held.more(super::spill::row_width(&row));
+                self.partition_rows.push(row);
+            }
+            self.columns = frame.columns;
+            return Ok(None);
+        }
         // A window on another order than the one the rows come in reads them whole.
         if !self.p.whole_windows
             && self.running.is_empty()
@@ -6256,7 +6360,21 @@ impl<'q> StepRun<'q> {
                 out.rows.extend(self.p.project(first, &frame, computed)?);
             }
         }
-        if self.p.whole_windows {
+        if self.along_partitions {
+            let frame = Frame {
+                columns: std::mem::take(&mut self.columns),
+                params,
+                release,
+                casings,
+                types: &self.p.types,
+                now: self.p.now,
+                subqueries: self.subqueries,
+            };
+            let rows = std::mem::take(&mut self.partition_rows);
+            fold_partition(&self.p, rows, &frame, &mut self.partitions_out)?;
+            self.partition_held = crate::room::holding(0);
+            out.rows.extend(std::mem::take(&mut self.partitions_out));
+        } else if self.p.whole_windows {
             let frame = Frame {
                 columns: std::mem::take(&mut self.columns),
                 params,
@@ -6292,7 +6410,7 @@ impl<'q> StepRun<'q> {
                     })
                 });
         }
-        if self.p.grouped || self.p.whole_windows {
+        if self.p.grouped || self.p.whole_windows || self.along_partitions {
             out.rows = self.once(std::mem::take(&mut out.rows));
         }
         let keys = match self.p.order_by {
@@ -6690,6 +6808,14 @@ impl<'q> Stream<'q> {
             );
         }
         Ok(s)
+    }
+
+    /// Its question's own windows read the rows as coming in their PARTITION BY and ORDER BY's
+    /// order, a partition at a time.
+    pub fn along_partitions(&mut self) {
+        if let Some(Some(r)) = self.runs.last_mut() {
+            r.along_partitions();
+        }
     }
 
     /// The most rows the stream held at once as the rows came.

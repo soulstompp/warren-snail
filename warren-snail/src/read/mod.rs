@@ -33,6 +33,7 @@ mod rest;
 mod sets;
 mod spill;
 mod spelled;
+mod strands;
 pub mod statement;
 mod subqueries;
 mod together;
@@ -1329,6 +1330,16 @@ impl Snail {
                     .collect()
             })
             .unwrap_or_default();
+        // A strand the question's windows read along, a partition at a time, where its pages are
+        // fewer than the table's own order's with the sort it saves; the rows of each block in
+        // their place among its sorted rows.
+        let priced = (self.touched(), self.pages_held());
+        let strand = match strands::of_windows(q, table, &stored) {
+            Some((o, at)) if self.strand_wins(&base, table, o, order, &stored)? => Some((o, at)),
+            _ => None,
+        };
+        let priced = (self.touched() - priced.0, self.pages_held() - priced.1);
+        let along = along.filter(|_| strand.is_none());
         let mut stream = pipeline::Stream::new(
             q,
             &table.name,
@@ -1340,6 +1351,10 @@ impl Snail {
             table.release,
             pipeline::Casings::of_table(table, &self.catalog.collations),
         )?;
+        if strand.is_some() {
+            stream.along_partitions();
+        }
+        let sorted_at = strand.as_ref().map(|(_, at)| at.clone());
         // Each block's rows go to the pipeline as the scan reads them, in the order.
         let mut blocks = Blocks {
             table,
@@ -1350,10 +1365,19 @@ impl Snail {
                 if let Some(c) = along {
                     pipeline::in_order(&mut rel, c)?;
                 }
+                if let Some(at) = &sorted_at {
+                    pipeline::in_place(&mut rel.rows, at)?;
+                }
                 stream.feed(rel)
             },
         };
-        let (mut round, _, _) = self.scan_one(&base, Some(&order.name), None, &mut blocks)?;
+        let read_along = match &strand {
+            Some((o, _)) => &table.orders[*o].name,
+            None => &order.name,
+        };
+        let (mut round, _, _) = self.scan_one(&base, Some(read_along), None, &mut blocks)?;
+        round.directory_pages += priced.0;
+        round.directory_pages_held += priced.1;
         drop(blocks);
         round.rows_held = stream.most_held() as u64;
         let out = stream.finish()?;

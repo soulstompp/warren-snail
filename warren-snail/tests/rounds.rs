@@ -341,3 +341,134 @@ fn a_window_past_the_round_s_room_holds_every_partition_whole_and_writes_the_row
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }
+
+/// Purchases: 16,384, each of one of 512 owners spread over them, at its own moment.
+const P_DDL: &str = "CREATE TABLE s.p (id bigint NOT NULL, owner bigint NOT NULL, at bigint NOT NULL, \
+                     PRIMARY KEY (id)); CREATE INDEX p_owner ON s.p (owner, at) INCLUDE (id);";
+const PURCHASES: i64 = 1 << 14;
+
+fn owner(i: i64) -> i64 {
+    i * 7919 % 512
+}
+
+fn purchases(name: &str) -> PathBuf {
+    let path = tmp(&format!("rounds-{name}.snail"));
+    let catalog = Catalog::parse(P_DDL).unwrap();
+    let table = catalog.table("s.p").unwrap();
+    let columns = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(c, col)| {
+            let mut v = Values::new(col.ty);
+            for i in 0..PURCHASES {
+                let x = match c {
+                    0 => i,
+                    1 => owner(i),
+                    _ => PURCHASES - i,
+                };
+                push_datum(
+                    &mut v,
+                    &warren_snail::composed::scalar_in(col.ty, &x.to_string()).unwrap(),
+                );
+            }
+            v
+        })
+        .collect();
+    write(&path, &catalog, &[("s.p".into(), Rows { columns })]).unwrap();
+    path
+}
+
+/// Each purchase's place among its owner's by moment, as (id, place), in id order.
+fn places(rows: &[(i64, i64, i64)]) -> Vec<Vec<i64>> {
+    let mut by: std::collections::BTreeMap<i64, Vec<(i64, i64)>> = Default::default();
+    for &(id, o, at) in rows {
+        by.entry(o).or_default().push((at, id));
+    }
+    let mut out = Vec::new();
+    for (_, mut v) in by {
+        v.sort();
+        for (k, (_, id)) in v.into_iter().enumerate() {
+            out.push(vec![id, k as i64 + 1]);
+        }
+    }
+    out.sort();
+    out
+}
+
+const BY_OWNER: &str =
+    "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) FROM s.p p";
+
+#[test]
+fn a_window_a_strand_gives_is_read_along_it_a_partition_at_a_time_where_its_price_is_fewest() {
+    let path = purchases("strand");
+    let dir = spill_dir("strand");
+    let rows: Vec<(i64, i64, i64)> = (0..PURCHASES)
+        .map(|i| (i, owner(i), PURCHASES - i))
+        .collect();
+    let want = places(&rows);
+    // Each order's pages for every column, from its directory.
+    let base = "SELECT p.id, p.owner, p.at FROM s.p p";
+    let pages = |order: &str| {
+        Snail::open(&path)
+            .unwrap()
+            .price(base, Some(order))
+            .unwrap()
+            .column_pages
+    };
+    let (own, strand) = (pages("p_pkey"), pages("p_owner"));
+    // Held whole along the table's own order, every purchase is three integers, 27 bytes.
+    let held = PURCHASES as u64 * 27;
+    for room in [64 << 10, 128 << 20] {
+        let sort = 2 * held.saturating_sub(room).div_ceil(4096);
+        let wins = strand < own + sort;
+        let mut snail = Snail::open(&path).unwrap();
+        snail.size_rounds(Sizes::of(room).in_dir(&dir));
+        let (b, round) = snail.ask(BY_OWNER, None).unwrap();
+        weather::exact(BY_OWNER, &round);
+        let mut got = ints(&b);
+        got.sort();
+        assert_eq!(got, want, "{room}");
+        assert_eq!(
+            round.order,
+            if wins { "p_owner" } else { "p_pkey" },
+            "{room}: {own} against {strand} with {sort}"
+        );
+        if wins {
+            // One owner's purchases held at a time, nothing written.
+            assert_eq!((round.spill_pages_written, round.spill_pages_read), (0, 0));
+            assert!(round.bytes_held <= room, "{round:?}");
+        }
+        eprintln!(
+            "{room}: own {own}, strand {strand}, sort {sort}: read along {}, {} pages, held {}",
+            round.order, round.column_pages_predicted, round.bytes_held
+        );
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_strand_s_rows_written_after_its_blocks_were_cut_are_put_in_their_place_first() {
+    let path = purchases("tails");
+    let mut rows: Vec<(i64, i64, i64)> = (0..PURCHASES)
+        .map(|i| (i, owner(i), PURCHASES - i))
+        .collect();
+    // Purchases made after the cut, each at a moment before every one its owner had: they go after
+    // each block's sorted rows, and come first in their partitions.
+    let mut w = Snail::open_writing(&path).unwrap();
+    for k in 0..64 {
+        let (id, o, at) = (PURCHASES + k, (k * 37) % 512, -k);
+        w.execute(&format!("INSERT INTO s.p VALUES ({id}, {o}, {at})"))
+            .unwrap();
+        rows.push((id, o, at));
+    }
+    drop(w);
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(64 << 10));
+    let (b, round) = snail.ask(BY_OWNER, None).unwrap();
+    weather::exact(BY_OWNER, &round);
+    assert_eq!(round.order, "p_owner");
+    let mut got = ints(&b);
+    got.sort();
+    assert_eq!(got, places(&rows));
+}
