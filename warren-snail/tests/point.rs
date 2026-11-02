@@ -143,3 +143,63 @@ fn a_value_that_fixes_no_further_level_prices_no_point() {
         .price_point("SELECT s.name FROM weather.stations s", &["colour"])
         .is_err());
 }
+
+const BUYS: &str = "CREATE FUNCTION s.clock(timestamptz) RETURNS timestamp IMMUTABLE LANGUAGE sql \
+                    AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
+                    CREATE TABLE s.b (buy_id bigint NOT NULL, set_id integer NOT NULL, paid integer, \
+                    at timestamptz NOT NULL, PRIMARY KEY (buy_id));
+                    CREATE INDEX b_set ON s.b (set_id, buy_id);
+                    ALTER TABLE s.b CLUSTER ON b_set;
+                    CREATE INDEX b_month ON s.b ((extract(month FROM s.clock(at))::smallint), at);";
+
+/// Rows `n`: each buy's set a hash of it, about thirteen rows a set of 3,000.
+fn buys() -> warren_snail::write::Rows {
+    let n = 40_000i64;
+    warren_snail::write::Rows {
+        columns: vec![
+            warren_snail::values::Values::Int((1..=n).map(Some).collect()),
+            warren_snail::values::Values::Int(
+                (1..=n)
+                    .map(|i| Some((i * 2_654_435_761 & 0x7fff_ffff) % 3000 + 1))
+                    .collect(),
+            ),
+            warren_snail::values::Values::Int(
+                (1..=n).map(|i| (i % 7 != 0).then_some(i % 100)).collect(),
+            ),
+            warren_snail::values::Values::Int((1..=n).map(|i| Some(i * 2_220_000_000)).collect()),
+        ],
+    }
+}
+
+/// A rescan is priced on a key of the block the order's middle row lies in, however its directory
+/// packs its entries, so that the price is what a rescan reads and the last block, holding the
+/// thin keys joined at the order's end, never stands for the rest. In format 9, whose entries are
+/// smaller, and in format 8.
+#[test]
+fn a_rescan_is_priced_where_the_order_s_middle_row_lies_in_either_format() {
+    let catalog = warren_snail::catalog::Catalog::parse(BUYS).unwrap();
+    let nine = tmp("point-buys-9.snail");
+    write(&nine, &catalog, &[("s.b".into(), buys())]).unwrap();
+    let eight = tmp("point-buys-8.snail");
+    warren_snail::write::write_format_eight(&eight, &catalog, &[("s.b".into(), buys())], span())
+        .unwrap();
+    for (path, format) in [(nine, 9), (eight, 8)] {
+        let snail = fresh(&path);
+        let mut rounds = std::collections::BTreeMap::<u64, u64>::new();
+        for k in 1..=3000 {
+            let q = format!("SELECT b.set_id FROM s.b b WHERE b.set_id = {k}");
+            *rounds
+                .entry(snail.price(&q, None).unwrap().column_pages)
+                .or_insert(0) += 1;
+        }
+        let commonest = rounds.iter().max_by_key(|(_, keys)| **keys).unwrap().0;
+        let point = snail
+            .price_point("SELECT b.set_id FROM s.b b", &["set_id"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            point.column_pages, *commonest,
+            "format {format}: {point:?} {rounds:?}"
+        );
+    }
+}

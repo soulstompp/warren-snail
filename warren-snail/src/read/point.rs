@@ -60,6 +60,20 @@ fn fixed_levels(order: &Order, table: &Table, side: &Side, given: &[usize]) -> u
     order.levels.iter().take_while(|&&l| equal(l)).count()
 }
 
+/// The entry among `held` the middle of their rows lies under; where they count none, the first.
+fn middle_entry<'a>(held: impl Iterator<Item = &'a Entry>) -> Option<&'a Entry> {
+    let held: Vec<&Entry> = held.collect();
+    let rows: u64 = held.iter().map(|e| e.rows as u64).sum();
+    let mut seen = 0;
+    held.iter()
+        .copied()
+        .find(|e| {
+            seen += e.rows as u64;
+            seen * 2 > rows
+        })
+        .or(held.first().copied())
+}
+
 /// The keys the question's own equalities give the first `own` levels of `order`, as the order keys
 /// them.
 fn own_keys(order: &Order, table: &Table, side: &Side, own: usize) -> Vec<KeyValue> {
@@ -191,11 +205,11 @@ impl Snail {
                     keys[..] <= last[..own]
                 }
         };
-        // Down the order to its middle block among those holding the question's own values.
+        // Down the order to its middle block among those holding the question's own values: the one
+        // their middle row lies in, as each entry counts the rows under it.
         let (head, mut entries, _) = self.top(table, o)?;
         for _ in 1..head.height {
-            let held: Vec<&Entry> = entries.iter().filter(|e| holds(e)).collect();
-            let Some(middle) = held.get(held.len() / 2) else {
+            let Some(middle) = middle_entry(entries.iter().filter(|e| holds(e))) else {
                 return Ok(None);
             };
             entries = decode_page(
@@ -204,8 +218,7 @@ impl Snail {
                 middle.bound(),
             )?;
         }
-        let held: Vec<&Entry> = entries.iter().filter(|e| holds(e)).collect();
-        let Some(block) = held.get(held.len() / 2) else {
+        let Some(block) = middle_entry(entries.iter().filter(|e| holds(e))) else {
             return Ok(None);
         };
         let map = read_map(&self.reader, block, &head.level_text)?;
