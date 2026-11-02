@@ -544,14 +544,23 @@ fn the_level_the_snail_runs_is_taken_in_each_of_its_spellings() {
         weather::one(&w.ask("SELECT count(*) FROM a.u u", None).unwrap().0)
     };
     // Once each "… is not a statement the snail writes".
-    for begin in [
-        "BEGIN ISOLATION LEVEL READ COMMITTED",
-        "START TRANSACTION ISOLATION LEVEL READ COMMITTED",
-        "BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ WRITE",
-        "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL READ COMMITTED",
+    for (begin, level) in [
+        ("BEGIN ISOLATION LEVEL READ COMMITTED", "READ COMMITTED"),
+        ("START TRANSACTION ISOLATION LEVEL READ COMMITTED", "READ COMMITTED"),
+        (
+            "BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ WRITE",
+            "READ UNCOMMITTED",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL READ COMMITTED",
+            "READ COMMITTED",
+        ),
     ] {
         assert_eq!(w.execute(begin).unwrap().statement, "BEGIN", "{begin}");
         insert(&mut w).unwrap();
+        // The last a statement names is its level, which alone is taken again after a write.
+        w.execute(&format!("SET TRANSACTION ISOLATION LEVEL {level}"))
+            .unwrap();
         w.execute("COMMIT").unwrap();
     }
     assert_eq!(count(&mut w), 9);
