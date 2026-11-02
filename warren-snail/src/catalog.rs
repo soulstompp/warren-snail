@@ -956,14 +956,14 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
         (NumericText(_), t) => assignable(ColumnType::numeric(Some((9, 2))), t),
         (f, NumericText(_)) => assignable(f, ColumnType::numeric(Some((9, 2)))),
         (Reg(a, _), Reg(b, _)) => a == b || crate::regs::casts_between(a, b),
-        // A vector to an array, as its elements are; nothing but itself to a vector.
+        // An array or a vector to an array, as its elements are; nothing but itself to a vector.
         (Composed(a), Composed(b)) => {
-            a == b || (crate::composed::is_vector(from) && !crate::composed::is_vector(to) && {
-                match (crate::read::element_type(from), crate::read::element_type(to)) {
-                    (Some(x), Some(y)) => assignable(x, y),
-                    _ => false,
-                }
-            })
+            a == b
+                || (!crate::composed::is_vector(to)
+                    && match (crate::read::element_type(from), crate::read::element_type(to)) {
+                        (Some(x), Some(y)) => assignable(x, y),
+                        _ => false,
+                    })
         }
         // text to regclass is regclass(text), an implicit cast; to any other reg* only explicit.
         (Text(_), Reg(crate::regs::RegKind::Class, _)) => true,

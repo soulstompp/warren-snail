@@ -251,8 +251,8 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         | (Money(_), Money(_))
         | (Tid, Tid) => d,
         (Composed(a), Composed(b)) if a == b => d,
-        // A vector to an array, each element by its own assignment, its shape kept.
-        (Composed(_), Composed(_)) if crate::composed::is_vector(from) => {
+        // An array or a vector to an array, each element by its own assignment, its shape kept.
+        (Composed(_), Composed(_)) => {
             let (Datum::Compound(c), Some(x), Some(y)) = (
                 &d,
                 super::typed::element_of(from),

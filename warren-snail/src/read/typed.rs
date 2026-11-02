@@ -165,6 +165,14 @@ pub(super) fn common_type(ts: &[Option<ColumnType>], context: &str) -> Result<Co
             out = Some(t);
             continue;
         }
+        // An oid is the preferred type its integers are cast to.
+        if p == C::Oid && t.is_integer() {
+            continue;
+        }
+        if t == C::Oid && p.is_integer() {
+            out = Some(t);
+            continue;
+        }
         // A vector meets its elements' array as that array.
         if crate::composed::array_type(p) == t {
             out = Some(t);
@@ -662,7 +670,7 @@ pub(super) fn concat_form(t: ColumnType) -> Option<ColumnType> {
         ColumnType::Bytes
         | ColumnType::Textual(Textual::Jsonb | Textual::Tsvector | Textual::Tsquery) => Some(t),
         ColumnType::Bit(_) | ColumnType::Varbit(_) => Some(ColumnType::Varbit(None)),
-        t if element_of(t).is_some() => Some(t),
+        t if element_of(t).is_some() => Some(crate::composed::array_type(t)),
         _ => None,
     }
 }

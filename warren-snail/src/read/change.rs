@@ -2980,8 +2980,8 @@ impl Snail {
                     last.first_row + last.rows
                 } as usize;
                 let mut fresh = Vec::new();
-                let k = if cp.unit != 0 { cp.unit } else { head.units[s] };
-                for p in tail_pages(&descs[s], ty, &values, k as usize)?.pages {
+                // A value wider than the block's unit takes the page it needs, within the caps.
+                for p in tail_pages(&descs[s], ty, &values, crate::cut::DATA_PAGE_PAGES)?.pages {
                     let row = base + p.first_row;
                     fresh.push(PageEntry {
                         at: w.place(&p.bytes)?,

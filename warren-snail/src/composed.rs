@@ -3570,7 +3570,11 @@ fn leaf_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<Datu
     };
     let any = a.as_any();
     Some(match ty {
-        ColumnType::Interval { .. } => Datum::Interval(crate::scalars::interval_at(a, r)?),
+        // As an answer holds it, or as arrow's Parquet reader gives its one leaf of 16 bytes.
+        ColumnType::Interval { .. } => match any.downcast_ref::<FixedSizeBinaryArray>() {
+            Some(b) => Datum::Interval(crate::times::Interval::from_bytes(b.value(r))?),
+            None => Datum::Interval(crate::scalars::interval_at(a, r)?),
+        },
         ColumnType::Int2 => Datum::Int(any.downcast_ref::<Int16Array>()?.value(r) as i64),
         ColumnType::Int4 => Datum::Int(any.downcast_ref::<Int32Array>()?.value(r) as i64),
         ColumnType::Int8 => Datum::Int(any.downcast_ref::<Int64Array>()?.value(r)),
@@ -3797,6 +3801,24 @@ pub fn compared(ty: ColumnType, e: &sqlparser::ast::Expr) -> Result<Datum> {
     literal(ty, e)
 }
 
+/// Whether a constructor's parts name a column.
+fn names_column(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Nested(x) | Expr::Cast { expr: x, .. } => names_column(x),
+        Expr::Array(a) => a.elem.iter().any(names_column),
+        Expr::Tuple(xs) => xs.iter().any(names_column),
+        Expr::Function(f) => match &f.args {
+            FunctionArguments::List(l) => l.args.iter().any(|a| {
+                matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) if names_column(x))
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether an expression writes out a value of type `ty` by its constructor: an array as
 /// `ARRAY[…]`, a composite as `ROW(…)` or `(…)`, a range or a multirange as its type's function of
 /// its name.
@@ -3805,6 +3827,10 @@ pub fn constructs(ty: ColumnType, e: &sqlparser::ast::Expr) -> bool {
     let ColumnType::Composed(r) = ty else {
         return false;
     };
+    // One that names a column is an expression a row at a time.
+    if names_column(e) {
+        return false;
+    }
     match (r.def(), e) {
         (_, Expr::Nested(x)) | (_, Expr::Cast { expr: x, .. }) => constructs(ty, x),
         (Composed::Array { .. }, Expr::Array(_)) => true,
@@ -4572,14 +4598,15 @@ pub fn concat(
     let _ = ty;
     let (ea, da, la) = shape(a);
     let (eb, db, lb) = shape(b);
-    if ea.is_empty() {
+    // As array_cat takes them: an array of no dimensions gives way; a vector of no elements has one.
+    if da.is_empty() {
         return Ok(b.cloned().unwrap_or(Item::Array {
             elements: eb,
             dims: db,
             lower: lb,
         }));
     }
-    if eb.is_empty() {
+    if db.is_empty() {
         return Ok(a.cloned().unwrap_or(Item::Array {
             elements: ea,
             dims: da,

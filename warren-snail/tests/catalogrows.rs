@@ -345,7 +345,8 @@ fn a_row_type_a_release_does_not_define_is_refused_under_it() {
 #[test]
 fn a_type_of_the_file_s_release_reaches_every_part_that_names_a_catalog() {
     // The name of OID 3813 is another function's by release, through an array and a row type.
-    let ddl = "CREATE TABLE s.t (k integer PRIMARY KEY, a regproc[], c pg_am, d pg_am[]);";
+    let ddl = "CREATE TYPE s.p AS (r regproc);
+         CREATE TABLE s.t (k integer PRIMARY KEY, a regproc[], c pg_am, d pg_am[], e s.p);";
     for (release, shown) in [
         (14u8, "pg_is_in_backup"),
         (15, "3813"),
@@ -366,6 +367,9 @@ fn a_type_of_the_file_s_release_reaches_every_part_that_names_a_catalog() {
             format!("{{\"(1,a,{shown},i)\"}}"),
             "{release}"
         );
+        let ty = catalog.tables[0].columns[4].ty;
+        let item = text_in(ty, "(3813)").unwrap();
+        assert_eq!(text_out(ty, &item), format!("({shown})"), "{release}");
     }
 }
 
@@ -429,6 +433,12 @@ mod written {
             ("array_remove(a, 2::smallint)", [Some("[0:1]={1,3}"), Some("{}"), None]),
             ("array_reverse(a)", [Some("3 2 1"), Some(""), None]),
             ("o::oid[]::text", [Some("[0:1]={4,5}"), Some("{}"), None]),
+            ("array_dims(a::integer[])", [Some("[0:2]"), None, None]),
+            ("array_dims(a::smallint[])", [Some("[0:2]"), Some("[0:-1]"), None]),
+            ("a || ARRAY[9::smallint]", [Some("[0:3]={1,2,3,9}"), Some("[0:0]={9}"), Some("{9}")]),
+            ("o || 9", [Some("[0:2]={4,5,9}"), Some("[0:0]={9}"), Some("{9}")]),
+            ("ARRAY[a, a]", [Some("{\"1 2 3\",\"1 2 3\"}"), Some("{\"\",\"\"}"), Some("{NULL,NULL}")]),
+            ("coalesce(a, '{7}'::smallint[])", [Some("[0:2]={1,2,3}"), Some("{}"), Some("{7}")]),
         ] {
             let got = asked(&path, &at(e));
             let want: Vec<Option<String>> = want.iter().map(|w| w.map(str::to_string)).collect();
@@ -454,6 +464,163 @@ mod written {
             };
             assert!(refused(&path, &q).contains(words), "{e}: {}", refused(&path, &q));
         }
+    }
+
+    #[test]
+    fn min_and_max_of_a_vector_are_an_array_s_and_its_order_its_own() {
+        let path = snail_at(
+            "vector-extremes.snail",
+            "CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);",
+            19,
+            &[],
+        );
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("INSERT INTO s.t VALUES (1, '1 2', '1 2'), (2, '3', '3')")
+            .unwrap();
+        drop(w);
+        let plain = |q: &str| -> Vec<Option<String>> { asked(&path, q) };
+        // min and max of an oidvector, by elements; its ORDER BY, by its length first.
+        assert_eq!(plain("WITH t AS (SELECT o FROM s.t) SELECT min(o)::text AS x FROM t"), [Some("1 2".to_string())]);
+        assert_eq!(plain("WITH t AS (SELECT o FROM s.t) SELECT max(o)::text AS x FROM t"), [Some("3".to_string())]);
+        let (b, _) = Snail::open(&path).unwrap().ask("SELECT min(o) FROM s.t", None).unwrap();
+        let t = warren_snail::composed::compound_at(oidvector(), b.column(0).as_ref(), 0).unwrap();
+        assert_eq!(text_out(oidvector(), &t.item), "1 2");
+        let (b, _) = Snail::open(&path).unwrap().ask("SELECT id FROM s.t ORDER BY o", None).unwrap();
+        assert_eq!(ints64(b.column(0).as_ref()), [Some(2), Some(1)]);
+        let (b, _) = Snail::open(&path).unwrap().ask("SELECT id FROM s.t ORDER BY a", None).unwrap();
+        assert_eq!(ints64(b.column(0).as_ref()), [Some(1), Some(2)]);
+        // A condition reads the same order.
+        let (b, _) = Snail::open(&path).unwrap().ask("SELECT id FROM s.t WHERE o > '3'", None).unwrap();
+        assert_eq!(ints64(b.column(0).as_ref()), [Some(1)]);
+        let (b, _) = Snail::open(&path).unwrap().ask("SELECT id FROM s.t WHERE a > '3'", None).unwrap();
+        assert!(ints64(b.column(0).as_ref()).is_empty());
+        // oidvectortypes names each by the file's catalog, 0 `-`, an OID it does not name `???`.
+        assert_eq!(
+            plain("SELECT oidvectortypes('23 25 0 2'::oidvector) AS x"),
+            [Some("integer, text, -, ???".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_index_takes_array_ops_on_either_vector_and_oidvector_ops_on_oidvector_alone() {
+        let table = "CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);";
+        for (index, words) in [
+            ("CREATE INDEX i ON s.t (o array_ops)", None),
+            ("CREATE INDEX i ON s.t (a array_ops)", None),
+            ("CREATE INDEX i ON s.t USING hash (o oidvector_ops)", None),
+            ("CREATE INDEX i ON s.t USING hash (a)", None),
+            ("CREATE UNIQUE INDEX i ON s.t (o)", None),
+            (
+                "CREATE INDEX i ON s.t (a oidvector_ops)",
+                Some("the operator class oidvector_ops is not read on a"),
+            ),
+        ] {
+            let got = Catalog::parse(&format!("{table}\n{index};")).map(|_| ());
+            match words {
+                None => got.unwrap_or_else(|e| panic!("{index}: {e}")),
+                Some(w) => assert!(got.unwrap_err().to_string().contains(w), "{index}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_named_as_a_row_type_leaves_the_type_the_catalog_s() {
+        let ddl = "CREATE TABLE pg_am (x integer PRIMARY KEY);
+             CREATE TABLE s.t (id integer PRIMARY KEY, c pg_am);";
+        let catalog = Catalog::parse(ddl).unwrap();
+        let t = catalog.table("s.t").unwrap();
+        assert_eq!(t.columns[1].ty, row_type_at("pg_am", 19).unwrap());
+    }
+
+    #[test]
+    fn an_interval_inside_a_composed_value_comes_back_from_its_file() {
+        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, v interval[], c pg_timezone_names);";
+        let path = snail_at("interval-out.snail", ddl, 19, &[]);
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("INSERT INTO s.t VALUES (1, '{1 day,NULL}', '(a,b,1 mon 2 days,t)'), (2, NULL, NULL)")
+            .unwrap();
+        let dir = tmp("interval-out");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        w.out(&dir).unwrap();
+        drop(w);
+        let back = tmp("interval-back.snail");
+        warren_snail::write::write_parquet(
+            &back,
+            &Catalog::parse(ddl).unwrap(),
+            &[("s.t".to_string(), dir.join("s.t.parquet"))],
+            weather::span(),
+            None,
+            None,
+        )
+        .unwrap();
+        let q = "WITH t AS (SELECT id, v, c FROM s.t) SELECT v::text AS x FROM t ORDER BY id";
+        assert_eq!(asked(&back, q), [Some("{\"1 day\",NULL}".to_string()), None]);
+        let q = "WITH t AS (SELECT id, v, c FROM s.t) SELECT (c).utc_offset::text AS x FROM t ORDER BY id";
+        assert_eq!(asked(&back, q), [Some("1 mon 2 days".to_string()), None]);
+    }
+
+    #[test]
+    fn a_file_of_another_release_s_fields_is_no_value_of_the_row_type() {
+        let (old, new) = (
+            row_type_at("pg_database", 14).unwrap(),
+            row_type_at("pg_database", 19).unwrap(),
+        );
+        let ColumnType::Composed(r) = old else { panic!() };
+        let Composed::Record { fields, .. } = r.def() else {
+            panic!()
+        };
+        let item = Item::Record(fields.iter().map(|_| Item::Null).collect());
+        let held = Compound::new(old, item);
+        let answer = warren_snail::composed::arrow_array(old, std::iter::once(Some(&held))).unwrap();
+        assert!(warren_snail::composed::compound_at(new, answer.as_ref(), 0).is_none());
+        assert!(warren_snail::composed::compound_at(old, answer.as_ref(), 0).is_some());
+    }
+
+    #[test]
+    fn a_value_wider_than_its_block_s_unit_is_written_into_its_tail() {
+        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, v text, c pg_attrdef);";
+        let path = snail_at("wide-tail.snail", ddl, 19, &[]);
+        let wide = "x".repeat(9_000);
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("INSERT INTO s.t (id, v) VALUES (1, 'a')").unwrap();
+        w.execute(&format!("INSERT INTO s.t (id, v) VALUES (2, '{wide}')"))
+            .unwrap();
+        w.execute("INSERT INTO s.t (id, v) VALUES (3, 'b')").unwrap();
+        drop(w);
+        let q = "WITH t AS (SELECT id, v FROM s.t) SELECT length(v)::text AS x FROM t ORDER BY id";
+        assert_eq!(
+            asked(&path, q),
+            [Some("1".to_string()), Some("9000".to_string()), Some("1".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_row_made_of_columns_is_read_a_row_at_a_time() {
+        let ddl = "CREATE TABLE s.src (id integer PRIMARY KEY, n pg_node_tree, r oid);
+             CREATE TABLE s.t (id integer PRIMARY KEY, c pg_attrdef);";
+        let tree = "({QUERY :commandType 1})";
+        let path = snail_at(
+            "row-of-columns.snail",
+            ddl,
+            19,
+            &[(
+                "s.src".to_string(),
+                Rows {
+                    columns: vec![
+                        Values::Int(vec![Some(1)]),
+                        Values::Text(vec![Some(tree.into())]),
+                        Values::Int(vec![Some(warren_snail::scalars::unsigned_key(7, 32))]),
+                    ],
+                },
+            )],
+        );
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("INSERT INTO s.t (id, c) SELECT q.id, ROW(q.r, 2, 3, q.n)::pg_attrdef FROM (SELECT id, r, n FROM s.src) q")
+            .unwrap();
+        drop(w);
+        let q = "WITH t AS (SELECT id, c FROM s.t) SELECT c::text AS x FROM t";
+        assert_eq!(asked(&path, q), [Some(format!("(7,2,3,\"{tree}\")"))]);
     }
 
     #[test]
@@ -589,6 +756,27 @@ mod written {
                 .to_string();
             assert!(e.contains(words), "{e}");
         }
+        // A literal cast to the one vector, into the other.
+        let e = w
+            .execute("INSERT INTO s.u (id, o) VALUES (100, '1 2'::int2vector)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("column \"o\" is of type oidvector but expression is of type int2vector"),
+            "{e}"
+        );
+        // An array of another element, a vector's no elements cast too.
+        w.execute("INSERT INTO s.t VALUES (2, '', '')").unwrap();
+        w.execute("INSERT INTO s.u (id, b, s) SELECT 200, a, a FROM s.t WHERE id = 2").unwrap();
+        w.execute("INSERT INTO s.u (id, s) VALUES (201, '{5}')").unwrap();
+        w.execute("INSERT INTO s.u (id, b) SELECT 202, s FROM s.u WHERE id = 201").unwrap();
+        let q = "WITH t AS (SELECT id, b, s FROM s.u) SELECT array_dims(b) AS x, array_dims(s) AS y, b::text AS z FROM t WHERE id IN (200, 202) ORDER BY id";
+        let (b, _) = w.ask(q, None).unwrap();
+        assert_eq!(texts(b.column(0).as_ref()), [None, Some("[1:1]".to_string())]);
+        assert_eq!(texts(b.column(1).as_ref()), [Some("[0:-1]".to_string()), None]);
+        assert_eq!(texts(b.column(2).as_ref()), [Some("{}".to_string()), Some("{5}".to_string())]);
+        w.execute("DELETE FROM s.u WHERE id >= 200").unwrap();
+        w.execute("DELETE FROM s.t WHERE id = 2").unwrap();
         drop(w);
         let q = "WITH t AS (SELECT id, a, o, s, i, x, b, y FROM s.u) SELECT coalesce(a::text, s::text, i::text, x, b::text, y::text) AS x FROM t ORDER BY id";
         let want = [
@@ -757,6 +945,10 @@ mod written {
             .ask("SELECT id FROM s.t WHERE n < '(50,a,10,)'::pg_namespace ORDER BY id", None)
             .unwrap();
         assert_eq!(ints64(b.column(0).as_ref()), [Some(1), Some(3)]);
+        assert_eq!(
+            asked(&path, &format!("{step} SELECT min(n)::text AS x FROM t WHERE id < 3")),
+            [Some("(11,a,10,)".to_string())]
+        );
         // Or they reach it.
         for q in [
             format!("{step} SELECT (a.n < b.n)::text AS x FROM t a JOIN t b ON a.id = 1 AND b.id = 3"),

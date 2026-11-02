@@ -34,8 +34,8 @@ at once, and a snail written inside a host that decides its commits.
   and time types and `interval`; `oid`, `oid8`, `xid`, `xid8`, `cid`, `pg_lsn`, `tid` and the reg*
   types, named by the release of 14 to 19 the file's OIDs came from; the network types, JSON,
   `jsonpath`, XML, text search, the geometric types, the snapshots, `aclitem` and the planner's
-  statistics types; arrays, enums, composites, ranges and multiranges, domains and a table's row
-  type.
+  statistics types; arrays, `int2vector` and `oidvector`, enums, composites, ranges and multiranges,
+  domains, a table's row type and the catalog's row types, each with the fields of the file's release.
 - The DDL, read a statement at a time, each statement taken or refused by name, and one sqlparser
   reads otherwise than it is written refused: `DEFAULT`, identities, serials and sequences, a
   sequence's state kept in the file; `STORED` and `VIRTUAL` generated columns; `CHECK`, `NOT

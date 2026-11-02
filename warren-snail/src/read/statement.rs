@@ -604,6 +604,9 @@ fn cast_through(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
 
 /// Whether two array types' elements, or theirs in turn, are assigned one to the other.
 fn elements_assignable(from: ColumnType, to: ColumnType) -> bool {
+    if crate::composed::is_vector(to) {
+        return false;
+    }
     let element = |ty: ColumnType| match ty {
         ColumnType::Composed(r) => match r.def() {
             crate::composed::Composed::Array { element, .. }

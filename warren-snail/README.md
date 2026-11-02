@@ -911,8 +911,11 @@ and assigned from another type as PostgreSQL's casts take it.
 - `macaddr`, `macaddr8`, `inet` and `cidr`; `json`, `jsonb` and `jsonpath`; `xml`; `tsvector` and
   `tsquery`; `refcursor`, `aclitem`, `pg_snapshot` and `txid_snapshot`; `point`, `line`, `lseg`,
   `box`, `path`, `polygon` and `circle`; `pg_node_tree` and the planner's statistics types.
-- An array of any of them; an enum, a composite, a range and its multirange, as the DDL declares
-  them, and the built-in ranges and multiranges; a domain; a table's row type.
+- An array of any of them; `int2vector` and `oidvector`, arrays counted from 0 in their own text;
+  an enum, a composite, a range and its multirange, as the DDL declares them, and the built-in
+  ranges and multiranges; a domain; a table's row type; and each composite in `pg_catalog`, with
+  the fields of the release the file's OIDs came from, but those holding a pseudo-type, which
+  PostgreSQL refuses too.
 
 `xid`, `cid`, the geometric types, `json` and `xml` key no B-tree. Any other type is refused by
 name.
