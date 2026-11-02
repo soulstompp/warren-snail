@@ -793,6 +793,7 @@ struct Asking {
 fn spot_side(ti: usize, ty: ColumnType, spot: &Spot) -> (Side, Option<KeySet>) {
     let mut side = Side {
         table: ti,
+        goes_by: String::new(),
         conds: Vec::new(),
         texts: Vec::new(),
         nulls: Vec::new(),
