@@ -270,6 +270,23 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The bytes a row of the blocks the plan reads holds of the held leaves `slots`, as it writes them.
+    pub(super) fn bytes_a_row(&self, slots: std::ops::Range<usize>) -> u64 {
+        let bytes: u64 = self
+            .reads
+            .iter()
+            .flat_map(|br| {
+                br.reads
+                    .iter()
+                    .filter(|(slot, _)| slots.contains(slot))
+                    .flat_map(move |(slot, pages)| {
+                        pages.iter().map(move |&p| br.map.columns[*slot].pages[p].at.bytes)
+                    })
+            })
+            .sum();
+        bytes / self.live_rows().max(1)
+    }
+
     /// The live rows of the blocks the plan reads.
     pub(super) fn live_rows(&self) -> u64 {
         self.reads

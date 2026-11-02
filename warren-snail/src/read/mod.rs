@@ -554,6 +554,25 @@ pub struct Price {
     pub directory_pages: u64,
     pub column_pages: u64,
     pub blocks: u64,
+    /// The bytes a round holds of a row it reads: 0 where it reads no column page.
+    pub row_bytes: u64,
+}
+
+/// The bytes a round holds of a row of `table` a plan reads, of `columns`: each at its held width, or
+/// the bytes a row takes of it in the pages read where those are more. None where it reads no page.
+fn row_bytes(plan: &Plan, table: &Table, columns: impl Iterator<Item = usize>) -> u64 {
+    if plan.column_pages == 0 {
+        return 0;
+    }
+    let order = &table.orders[plan.walk.order];
+    columns
+        .map(|c| {
+            let written = order
+                .slots(table, c)
+                .map_or(0, |slots| plan.bytes_a_row(slots));
+            strands::held_width(table.columns[c].ty).max(written)
+        })
+        .sum()
 }
 
 /// A round handed out a block at a time: `Snail::scan` begins it on the root the snail last read,
@@ -979,7 +998,9 @@ impl Snail {
         let (want, _) = self.want_of(&q);
         let before = self.touched();
         let part = self.part(&want, order)?;
+        let row_bytes = row_bytes(&part.plan, want.table, want.columns.iter().copied());
         Ok(Price {
+            row_bytes,
             order: want.table.orders[part.plan.walk.order].name.clone(),
             served: part.served,
             consulted: part.consulted,

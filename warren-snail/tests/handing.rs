@@ -432,8 +432,8 @@ fn what_a_round_holds_keeps_to_its_room() {
     assert!(a.round().bytes_held > room);
 }
 
-/// Each table's bytes at most: its rows at their held width, no fewer than its column pages'; a table
-/// read from the counts alone, none.
+/// Each table's bytes at most: its rows at their held width, or the bytes they take in the pages read
+/// where those are more; a table read from the counts alone, none.
 #[test]
 fn a_table_is_priced_at_the_bytes_a_round_holds_of_it() {
     let path = one("held");
@@ -442,15 +442,15 @@ fn a_table_is_priced_at_the_bytes_a_round_holds_of_it() {
     let p = price_together(&refs, "SELECT count(*) AS c1 FROM s.b").unwrap();
     assert_eq!(p.tables[0].held_bytes, 0);
     let p = price_together(&refs, "SELECT a_id AS c1, count(*) AS c2 FROM s.b GROUP BY a_id").unwrap();
-    assert_eq!(
-        p.tables[0].held_bytes,
-        (B as u64 * 9).max(p.tables[0].column_pages_high * 4096)
-    );
+    assert_eq!(p.tables[0].held_bytes, B as u64 * 9);
     let p = price_together(&refs, JOIN).unwrap();
     for t in &p.tables {
-        let least = t.rows_high * if t.table == "s.a" { 9 + 9 + 5 } else { 9 + 9 + 9 };
-        assert!(t.held_bytes >= least);
-        assert!(t.held_bytes >= t.column_pages_high * 4096);
+        // A name past its floor of 5 bytes takes what the pages give it: its bytes and their length.
+        let row = t.held_bytes / t.rows_high;
+        match t.table.as_str() {
+            "s.a" => assert!((9 + 9..=9 + 13).contains(&row), "{row}"),
+            _ => assert_eq!(row, 9 + 9 + 9),
+        }
     }
 }
 

@@ -6,11 +6,9 @@ use super::across::{carried_root, Snails};
 use super::join::{self, ask_join_within, core_of, needed_of, read_order, reading};
 use super::pipeline::{self, batch_of, relation_of, Relation};
 use super::spill::{rows_width, Handed, Rows, Run};
-use super::strands::held_width;
 use super::walk::Want;
-use super::{computed, question, relations, spelled, subqueries, Round, Snail};
+use super::{computed, question, relations, row_bytes, spelled, subqueries, Round, Snail};
 use crate::catalog::Table;
-use crate::cut::PAGE;
 use crate::file::Root;
 use crate::room::{Room, Sizes};
 use crate::{Error, Result};
@@ -370,8 +368,8 @@ pub struct TablePrice {
     pub rows_high: u64,
     pub rows_estimate: u64,
     pub table_rows: u64,
-    /// The bytes a round holds of it at most: the most rows at their held width, no fewer than its
-    /// column pages'; none where it reads no column page.
+    /// The bytes a round holds of it at most: the most rows, each at its columns' held widths, or the
+    /// bytes they take in the pages it reads where those are more; none where it reads no column page.
     pub held_bytes: u64,
 }
 
@@ -381,17 +379,6 @@ pub struct TablePrice {
 #[non_exhaustive]
 pub struct Priced {
     pub tables: Vec<TablePrice>,
-}
-
-/// The bytes a round holds of a table at most: `rows` at `width`, no fewer than its `pages`' bytes;
-/// none where it reads no page.
-fn held_most(rows: u64, width: u64, pages: u64) -> u64 {
-    match pages {
-        0 => 0,
-        _ => rows
-            .saturating_mul(width)
-            .max(pages.saturating_mul(PAGE as u64)),
-    }
 }
 
 impl Priced {
@@ -430,13 +417,6 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
     let at: Vec<(usize, usize)> = q.sides.iter().map(|s| at[s.table]).collect();
     if let [(s, _)] = at.as_slice() {
         let p = snails[*s].price(sql, None)?;
-        let table = &snails[*s].catalog.tables[at[0].1];
-        let width: u64 = q
-            .select
-            .inputs()
-            .iter()
-            .map(|k| held_width(table.columns[k.col().column].ty))
-            .sum();
         return Ok(Priced {
             tables: vec![TablePrice {
                 table: catalog.tables[q.sides[0].table].name.clone(),
@@ -453,7 +433,7 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
                 rows_high: p.rows_high,
                 rows_estimate: p.rows_estimate,
                 table_rows: p.table_rows,
-                held_bytes: held_most(p.rows_high, width, p.column_pages),
+                held_bytes: p.rows_high.saturating_mul(p.row_bytes),
             }],
         });
     }
@@ -491,7 +471,6 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
         let before = snail.touched();
         let part = snail.part(&want, None)?;
         let own = part.plan.column_pages;
-        let width: u64 = r.columns.iter().map(|c| held_width(table.columns[c.0].ty)).sum();
         rows[side] = (part.plan.rows_estimate.round() as u64).clamp(part.rows.0, part.rows.1);
         let point = match (r.by.first(), r.led.as_ref()) {
             (Some(&(by, _)), Some(meets)) => {
@@ -524,7 +503,10 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
             rows_high: part.rows.1,
             rows_estimate: rows[side],
             table_rows: part.table_rows,
-            held_bytes: held_most(part.rows.1, width, own),
+            held_bytes: part
+                .rows
+                .1
+                .saturating_mul(row_bytes(&part.plan, table, r.columns.iter().map(|c| c.0))),
         });
     }
     Ok(Priced { tables: out })
