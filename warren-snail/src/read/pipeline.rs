@@ -4668,6 +4668,15 @@ impl Acc {
 
     /// Folds in one row's arguments, none for count(*), each compared under the collation `under`
     /// gives it.
+    /// Whether it keeps the rows it is given until its group ends.
+    fn keeps_rows(&self) -> bool {
+        match self {
+            Acc::Distinct { .. } | Acc::Ordered { .. } => true,
+            Acc::More(agg) => agg.keeps_rows(),
+            _ => false,
+        }
+    }
+
     fn add_row(&mut self, values: Vec<Value>, under: &[Option<Casing>]) -> Result<()> {
         match self {
             Acc::More(agg) => agg.add(&values, under),
@@ -5974,6 +5983,8 @@ pub(super) struct StepRun<'q> {
     held: parted::Parted,
     /// The rows a DISTINCT step has returned, by their keys.
     seen: std::collections::HashSet<Vec<Key>>,
+    /// What its aggregates keep of the rows they are given, in the round's room.
+    kept: crate::room::Holding,
     /// The columns the step's FROM reads, as the last chunk gave them.
     columns: Columns,
     /// What answers its subqueries, where it has any.
@@ -5993,6 +6004,7 @@ impl<'q> StepRun<'q> {
             rows: Vec::new(),
             held: parted::Parted::new(),
             seen: Default::default(),
+            kept: crate::room::holding(0),
             columns: Vec::new(),
             subqueries: None,
             empty_row: None,
@@ -6118,6 +6130,9 @@ impl<'q> StepRun<'q> {
                         .collect::<Result<_>>()?;
                     if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
                         return Err(Error::new(e.clone()));
+                    }
+                    if acc.keeps_rows() {
+                        self.kept.more(super::spill::row_width(&values));
                     }
                     acc.add_row(values, u)?;
                 }

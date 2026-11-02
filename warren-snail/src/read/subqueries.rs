@@ -82,11 +82,14 @@ enum Asks<'q> {
 struct Returned {
     rows: Vec<Vec<Value>>,
     keys: OnceCell<(HashSet<Key>, bool)>,
+    /// What they hold in the round's room.
+    _held: crate::room::Holding,
 }
 
 impl Returned {
     fn new(rows: Vec<Vec<Value>>) -> Rc<Returned> {
         Rc::new(Returned {
+            _held: crate::room::holding(super::spill::rows_width(&rows)),
             rows,
             keys: OnceCell::new(),
         })

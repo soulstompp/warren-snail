@@ -143,6 +143,8 @@ pub(super) struct Parted {
     rows: Vec<Vec<Value>>,
     order: Option<usize>,
     index: Option<HashMap<Vec<pipeline::Key>, Vec<usize>>>,
+    /// What they hold in the round's room.
+    _held: crate::room::Holding,
 }
 
 /// The steps a question makes, in the order they are read: each WITH query, each relation lifted
@@ -1319,6 +1321,11 @@ impl Reading<'_> {
                         (lrows?, Some(rrows))
                     }
                 };
+                // The two sides are held while they are met.
+                let _sides = crate::room::holding(
+                    super::spill::rows_width(&lrows)
+                        + rrows.as_deref().map_or(0, super::spill::rows_width),
+                );
                 let rows = self.met(
                     node,
                     left,
@@ -2332,6 +2339,7 @@ struct Met {
 /// types its two arms' columns, the leftmost arm's names its own.
 fn set_step(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Made> {
     let m = met(arm, made, casings)?;
+    let _image = crate::room::holding(super::spill::rows_width(&m.rows));
     Ok(Made::of(
         Relation {
             names: m.names,
@@ -3166,7 +3174,13 @@ fn select_step(
                         true => None,
                         false => Some(tie_index(&rows, &tied, &from, asked, casings, &p.types)?),
                     };
-                    let parted = Rc::new(Parted { rows, order, index });
+                    let _held = crate::room::holding(super::spill::rows_width(&rows));
+                    let parted = Rc::new(Parted {
+                        rows,
+                        order,
+                        index,
+                        _held,
+                    });
                     o.kept
                         .rows
                         .borrow_mut()
@@ -3234,6 +3248,8 @@ fn select_step(
             r.extend(o.values.iter().cloned());
         }
     }
+    // The FROM's rows are held until the step has read them.
+    let from_held = crate::room::holding(super::spill::rows_width(&rows));
     let rel = Relation {
         names: from.columns.iter().map(|c| c.name.clone()).collect(),
         rows,
@@ -3257,6 +3273,8 @@ fn select_step(
         row.extend(o.values.iter().cloned());
         run.empty_row = Some(row);
     }
+    // The step holds what it keeps of them as it reads them.
+    drop(from_held);
     let rel = match run.feed(rel, columns, params, release, casings)? {
         Some(out) => out,
         None => run.finish(params, release, casings)?,

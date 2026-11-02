@@ -264,7 +264,13 @@ fn a_step_past_the_round_s_room_writes_the_rows_past_it_once_and_reads_them_back
         (pages, pages),
         "{q}: {round:?}"
     );
-    assert!(round.bytes_held <= room, "{q}: {round:?}");
+    // The step reading it makes its FROM whole before it reads it: the most held is every row, as
+    // it is read back, beside what the room keeps.
+    assert!(
+        round.bytes_held >= N as u64 * row + held * row
+            && round.bytes_held <= N as u64 * row + room,
+        "{q}: {round:?}"
+    );
     assert_eq!(
         std::fs::read_dir(&dir).unwrap().count(),
         0,

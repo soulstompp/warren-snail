@@ -542,6 +542,8 @@ pub(in crate::read) fn make(
     let rows = assigned(seed.rows, &seed.types, &seed.untyped, &types)?;
     let mut working = fresh(rows)?;
     let mut all_rows = working.clone();
+    // Every row made, and the working table, held in the round's room.
+    let mut held = crate::room::holding(crate::read::spill::rows_width(&all_rows));
     loop {
         making.made.insert(
             name.clone(),
@@ -615,6 +617,7 @@ pub(in crate::read) fn make(
                  only where it ends within a row group's rows"
             )));
         }
+        held.more(crate::read::spill::rows_width(&added));
         all_rows.extend(added.iter().cloned());
         working = added;
     }

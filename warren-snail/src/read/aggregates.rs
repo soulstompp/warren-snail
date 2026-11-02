@@ -174,6 +174,18 @@ impl Agg {
         })
     }
 
+    /// Whether it keeps the rows it is given until its group ends.
+    pub(super) fn keeps_rows(&self) -> bool {
+        matches!(
+            self,
+            Agg::Collect { .. }
+                | Agg::Json(_)
+                | Agg::Handed { .. }
+                | Agg::Sorted { .. }
+                | Agg::RangeUnion(_)
+        )
+    }
+
     /// Whether it folds a NULL in as a value, as array_agg does.
     pub(super) fn keeps_nulls(&self) -> bool {
         matches!(self, Agg::Collect { .. } | Agg::Json(_)) || matches!(self, Agg::Handed { .. })
