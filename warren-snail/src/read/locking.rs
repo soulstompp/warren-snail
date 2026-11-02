@@ -4,7 +4,7 @@
 //! shared or alone as the strength takes them, to the transaction's end; the writers of a table
 //! whose rows are locked name the rows they change by the same bytes.
 
-use super::change::{rows_of, Waiting};
+use super::change::{rows_of, widen, Waiting};
 use super::statement::{Datum, Row};
 use super::{Round, Snail};
 use crate::catalog::Table;
@@ -670,7 +670,7 @@ impl Snail {
                     self.renew_for_question()?;
                     continue;
                 }
-                self.unchanged_since(&plan, &rows, &locked_rows, order, params)?;
+                self.unchanged_since(&plan, &rows, &locked_rows)?;
             }
             let picked = arrow::array::UInt32Array::from(chosen);
             let columns = (0..plan.width)
@@ -686,33 +686,47 @@ impl Snail {
     }
 
     /// At REPEATABLE READ, refuses the rows a question locked where one of them is not, column for
-    /// column, in the question's answer on the newest root: another transaction changed it since
-    /// the generation the round read.
-    fn unchanged_since(
-        &mut self,
-        plan: &Plan,
-        rows: &[Row],
-        locked: &[usize],
-        order: Option<&str>,
-        params: &[String],
-    ) -> Result<()> {
-        let (root, catalog) = (self.root.clone(), self.catalog.clone());
-        let newest = self.reader.peek_root()?;
-        self.serial_comparing(true);
-        let asked = self
-            .in_transaction_on(newest)
-            .and_then(|_| self.answer_with(&plan.asked, order, params));
-        self.serial_comparing(false);
-        (self.root, self.catalog) = (root, catalog);
-        let (batch, _) = asked?;
-        let now: HashSet<Row> =
-            rows_of(&batch.project(&(plan.width..batch.num_columns()).collect::<Vec<_>>())?)?
-                .into_iter()
-                .collect();
-        if locked.iter().any(|&r| !now.contains(&rows[r])) {
-            return Err(Error::new(
-                "could not serialize access due to concurrent update",
-            ));
+    /// column, as the newest root holds it: another transaction changed it since the generation the
+    /// round read. A row the transaction wrote lies only in the version it reads.
+    fn unchanged_since(&mut self, plan: &Plan, rows: &[Row], locked: &[usize]) -> Result<()> {
+        let mut at = 0;
+        for t in &plan.locked {
+            let table = &self.catalog.tables[t.table];
+            let own = self.own.get(&table.name);
+            let full: Vec<Row> = widen(
+                table,
+                locked
+                    .iter()
+                    .map(|&r| rows[r][at..at + t.read.len()].to_vec())
+                    .collect(),
+            )
+            .into_iter()
+            .filter(|r| !own.is_some_and(|o| o.holds(r)))
+            .collect();
+            at += t.read.len();
+            let found: Vec<&Row> = full.iter().collect();
+            if self.changed_since(t.table, &found)? != super::beside::Since::Same {
+                return Err(super::beside::concurrent_update());
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows of a parent a foreign key's check found held against a writer that would take their
+    /// key, as PostgreSQL's FOR KEY SHARE holds them, to the transaction's end; while the transaction
+    /// names at most `NAMED` bytes: past them, its commit checks the key under the parent's block.
+    pub(super) fn key_shared(&mut self, ti: usize, rows: &[Row]) -> Result<()> {
+        let table = self.catalog.tables[ti].clone();
+        let key = key_columns(&table);
+        for r in rows {
+            if self.row_locks.len() >= NAMED {
+                return Ok(());
+            }
+            let k: Vec<Datum> = key.iter().map(|&c| r[c].clone()).collect();
+            self.take_bytes(
+                &Strength::KeyShare.bytes(lock::row_bytes(ti, &key_bytes(&k))),
+                Waiting::Wait,
+            )?;
         }
         Ok(())
     }
@@ -797,7 +811,7 @@ impl Snail {
 }
 
 /// The bytes of rows a transaction names, at most, beside a table no question locks rows of.
-const NAMED: usize = 512;
+pub(super) const NAMED: usize = 512;
 
 /// PostgreSQL's words where NOWAIT finds a row locked, SQLSTATE 55P03.
 fn not_obtained(relation: &str) -> Error {

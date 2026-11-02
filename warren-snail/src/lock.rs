@@ -205,6 +205,12 @@ pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::Ke
     BLOCKS + h.finish() % BLOCK_BYTES
 }
 
+/// The byte a transaction of one snapshot holds for a key of a unique order it writes or takes: it
+/// falls among the block bytes, apart from any block's.
+pub(crate) fn key_byte(table: usize, order: usize, key: &[crate::places::KeyValue]) -> u64 {
+    block_byte(&(table as u64, order as u64, "key", key))
+}
+
 /// The two bytes of a row's lock, its key's and the rest's, from its table's place in the catalog
 /// and its key's bytes, the same in every build of this version; they fall among the block bytes.
 pub(crate) fn row_bytes(table: usize, key: &[u8]) -> (u64, u64) {
@@ -478,6 +484,8 @@ const SERIAL_PREPARED: u64 = SERIAL + (7 << 56);
 /// The byte whose lock is the turn at the marks: an edge and its test, a commit's test, and a
 /// transaction's end, one at a time.
 const SERIAL_TURN: u64 = SERIAL + (8 << 56);
+/// A byte for each block and slot: the transaction in that slot wrote the block, its lock taken or not.
+const WROTE_MARKS: u64 = SERIAL + (9 << 56);
 const SERIAL_NAMES: u64 = 1 << 40;
 
 /// The byte of an order's own mark, which a read holds for all of it and a writer of any of it.
@@ -509,6 +517,20 @@ pub(crate) fn mark_read(file: &File, slot: u64, byte: u64, on: bool) -> Result<(
 /// The slots of the other transactions that read the block of lock byte `byte`.
 pub(crate) fn readers(file: &File, byte: u64) -> Result<Vec<u64>> {
     let start = READ_MARKS + ((byte - BLOCKS) << 16);
+    let mut out = Vec::new();
+    all_held(file, start, WRITER_SLOTS, &mut |at| out.push(at - start))?;
+    Ok(out)
+}
+
+/// Marks that the transaction in `slot` wrote the block or the order of lock byte `byte`, or no longer
+/// does.
+pub(crate) fn mark_wrote(file: &File, slot: u64, byte: u64, on: bool) -> Result<()> {
+    mark(file, WROTE_MARKS + ((byte - BLOCKS) << 16) + slot, on)
+}
+
+/// The slots of the other transactions that wrote the block or the order of lock byte `byte`.
+pub(crate) fn writers(file: &File, byte: u64) -> Result<Vec<u64>> {
+    let start = WROTE_MARKS + ((byte - BLOCKS) << 16);
     let mut out = Vec::new();
     all_held(file, start, WRITER_SLOTS, &mut |at| out.push(at - start))?;
     Ok(out)

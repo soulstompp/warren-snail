@@ -350,6 +350,9 @@ impl Snail {
                 return Ok(());
             }
             self.stale = false;
+            if self.held {
+                return Err(super::beside::concurrent_update());
+            }
             self.renew_in_transaction()?;
             if self.root.generation == generation {
                 return Err(Error::new(
@@ -521,7 +524,7 @@ impl Snail {
     /// Checks the changes given: each row written has its parent, unless its reference holds a
     /// NULL; each key taken is held again, under NO ACTION and SET DEFAULT, or no row references
     /// it. Returns false where the round must run again.
-    fn keys_checked(&mut self, t: &Touched) -> Result<bool> {
+    pub(super) fn keys_checked(&mut self, t: &Touched) -> Result<bool> {
         for (&(ci, fi), rows) in &t.written {
             let k = self.catalog.tables[ci].foreign_keys[fi].clone();
             let child = &self.catalog.tables[ci];
@@ -629,6 +632,9 @@ impl Snail {
             .iter()
             .position(|t| t.name == k.parent)
             .expect("a foreign key's parent is in the file");
+        if self.held {
+            return self.holds_key_beside(pi, k, key).map(Some);
+        }
         let p = &self.catalog.tables[pi];
         let oi = p
             .orders
@@ -656,6 +662,43 @@ impl Snail {
         Ok(Some(true))
     }
 
+    /// Whether the parent holds a key, at REPEATABLE READ or SERIALIZABLE: as the transaction's snapshot
+    /// reads it, its rows held against a writer that would take it; and refused where another took it
+    /// since.
+    fn holds_key_beside(&mut self, pi: usize, k: &ForeignKey, key: &[Datum]) -> Result<bool> {
+        let rows = self.rows_where(pi, &k.parent_columns, key, false)?;
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let name = &self.catalog.tables[pi].name;
+        let own = self.own.get(name);
+        if rows.iter().any(|r| own.is_some_and(|o| o.holds(r))) {
+            return Ok(true);
+        }
+        self.key_shared(pi, &rows)?;
+        let held = self.on_newest(|s| s.count_where(pi, &k.parent_columns, key))?;
+        if held == 0 {
+            return Err(super::beside::concurrent_update());
+        }
+        Ok(true)
+    }
+
+    /// Whether a child's row references a key, at REPEATABLE READ or SERIALIZABLE: as the transaction's
+    /// snapshot reads it; and refused where another wrote one since, as PostgreSQL's check finds a row
+    /// its snapshot does not see.
+    fn referenced_beside(&mut self, ci: usize, k: &ForeignKey, key: &[Datum]) -> Result<bool> {
+        if !self.rows_where(ci, &k.columns, key, false)?.is_empty() {
+            return Ok(true);
+        }
+        let since = self.on_newest(|s| s.rows_where(ci, &k.columns, key, false))?;
+        let own = self.own.get(&self.catalog.tables[ci].name);
+        let taken: Vec<&Row> = own.map_or(Vec::new(), |o| o.taken().collect());
+        if since.iter().any(|r| !taken.contains(&r)) {
+            return Err(super::beside::concurrent_update());
+        }
+        Ok(false)
+    }
+
     /// Whether the blocks of an order the round reads are the newest root's: where the round reads
     /// none, whether the order holds none in the newest root, or is one the round itself emptied.
     fn fresh(&self, ti: usize, oi: usize, blocks: &[Entry]) -> Result<bool> {
@@ -673,6 +716,9 @@ impl Snail {
     /// reads it once no writer can add or take one it does not see. None where the round must run
     /// again.
     fn referenced(&mut self, ci: usize, k: &ForeignKey, key: &[Datum]) -> Result<Option<bool>> {
+        if self.held {
+            return self.referenced_beside(ci, k, key).map(Some);
+        }
         let t = &self.catalog.tables[ci];
         if let Some(oi) = t.order_led_by(&k.columns) {
             let (lo, hi) = self.run_of(ci, oi, k, key)?;
@@ -697,6 +743,10 @@ impl Snail {
     /// the round's root; the blocks that hold one locked. Under a PERIOD, the rows whose PERIOD
     /// meets the key's, along an order its other columns lead. None where the round must run again.
     fn children(&mut self, ci: usize, k: &ForeignKey, key: &[Datum]) -> Result<Option<Vec<Row>>> {
+        // At one snapshot, those it reads; another's written since meets its commit's check.
+        if self.held {
+            return self.rows_where(ci, &k.columns, key, k.period).map(Some);
+        }
         let t = &self.catalog.tables[ci];
         let (oi, blocks) = match t.order_led_by(k.equal_columns()) {
             Some(oi) => {
@@ -1055,13 +1105,15 @@ impl Snail {
                 self.lock_byte(b, Waiting::Wait)?;
                 self.locks.insert(b);
                 // Another writer of the strand committed while it waited: run again on the newest root.
-                if self.root.generation != self.reader.peek_root()?.generation {
+                if !self.held && self.root.generation != self.reader.peek_root()?.generation {
                     self.stale = true;
                     return Ok(false);
                 }
             }
             for r in rows {
-                if !self.excluded_row(ti, oi, r)? {
+                if self.held {
+                    self.excluded_beside(ti, oi, r)?;
+                } else if !self.excluded_row(ti, oi, r)? {
                     return Ok(false);
                 }
             }
@@ -1069,33 +1121,31 @@ impl Snail {
         Ok(true)
     }
 
-    /// One row held against an EXCLUDE's strand: none conflicting, a row holding a NULL in one of
-    /// its levels, or one its predicate does not admit, conflicting with none. Under a UNIQUE NULLS
-    /// NOT DISTINCT WITHOUT OVERLAPS, a NULL conflicts with a NULL in its level.
-    fn excluded_row(&mut self, ti: usize, oi: usize, r: &Row) -> Result<bool> {
+    /// Whether a row is held against an EXCLUDE's strand at all: a row holding a NULL in one of its
+    /// levels, or one its predicate does not admit, conflicts with none. Under a UNIQUE NULLS NOT
+    /// DISTINCT WITHOUT OVERLAPS, a NULL conflicts with a NULL in its level.
+    fn excludes(&self, ti: usize, oi: usize, r: &Row) -> Result<bool> {
         let t = &self.catalog.tables[ti];
         let o = &t.orders[oi];
-        let operators = o.exclusion.as_ref().unwrap().operators.clone();
-        let columns: Vec<usize> = o.levels.iter().map(|l| l.column()).collect();
-        if o.nulls_distinct && columns.iter().any(|&c| r[c] == Datum::Null) {
-            return Ok(true);
+        if o.nulls_distinct && o.levels.iter().any(|l| r[l.column()] == Datum::Null) {
+            return Ok(false);
         }
         if let Some(p) = super::partial::Predicate::of(&self.catalog, t, o)? {
             if !p.admits(t, r) {
-                return Ok(true);
+                return Ok(false);
             }
         }
-        let blocks = self.spanning(ti, oi, r, &operators)?;
-        // Locked as a statement locks the blocks it changes: those the round staged lie under the
-        // locks of the blocks they began from.
-        if !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
-            self.stale = true;
-            return Ok(false);
-        }
+        Ok(true)
+    }
+
+    /// The question that finds the rows conflicting with a row on an EXCLUDE's strand, and the
+    /// columns it returns, which tell a row from another: the table's key, or every column the strand
+    /// holds where the table's order is no unique key.
+    fn exclusion_asked(&self, ti: usize, oi: usize, r: &Row) -> (String, Vec<usize>) {
         let t = &self.catalog.tables[ti];
         let o = &t.orders[oi];
-        // A row is told from another by the table's key, or by every column the strand holds where
-        // the table's order is no unique key.
+        let operators = &o.exclusion.as_ref().unwrap().operators;
+        let columns: Vec<usize> = o.levels.iter().map(|l| l.column()).collect();
         let own = t.orders.iter().find(|x| x.table_order).unwrap();
         let key: Vec<usize> = if own.unique {
             own.levels.iter().map(|l| l.column()).collect()
@@ -1105,7 +1155,7 @@ impl Snail {
         let column = |c: usize| format!("r.\"{}\"", t.columns[c].name.replace('"', "\"\""));
         let conditions = columns
             .iter()
-            .zip(&operators)
+            .zip(operators)
             .map(|(&c, op)| match &r[c] {
                 Datum::Null => format!("{} IS NULL", column(c)),
                 d => format!("{} {op} {}", column(c), literal(d, t.columns[c].ty)),
@@ -1125,6 +1175,29 @@ impl Snail {
                 .join(", "),
             quoted(&t.name)
         );
+        (sql, key)
+    }
+
+    /// One row held against an EXCLUDE's strand.
+    fn excluded_row(&mut self, ti: usize, oi: usize, r: &Row) -> Result<bool> {
+        if !self.excludes(ti, oi, r)? {
+            return Ok(true);
+        }
+        let operators = self.catalog.tables[ti].orders[oi]
+            .exclusion
+            .as_ref()
+            .unwrap()
+            .operators
+            .clone();
+        let blocks = self.spanning(ti, oi, r, &operators)?;
+        // Locked as a statement locks the blocks it changes: those the round staged lie under the
+        // locks of the blocks they began from.
+        if !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
+            self.stale = true;
+            return Ok(false);
+        }
+        let (sql, key) = self.exclusion_asked(ti, oi, r);
+        let o = &self.catalog.tables[ti].orders[oi];
         let (b, _) = self.answer(&sql, Some(&o.name))?;
         let mine: Vec<Datum> = key.iter().map(|&c| r[c].clone()).collect();
         let mut held = rows_of(&b)?;
@@ -1138,6 +1211,32 @@ impl Snail {
             )));
         }
         Ok(true)
+    }
+
+    /// One row held against an EXCLUDE's strand, at REPEATABLE READ or SERIALIZABLE, as PostgreSQL's
+    /// check sees what is committed whatever the snapshot: the rows the newest root holds that the
+    /// transaction did not take, and the rows it wrote.
+    fn excluded_beside(&mut self, ti: usize, oi: usize, r: &Row) -> Result<()> {
+        if !self.excludes(ti, oi, r)? {
+            return Ok(());
+        }
+        let (sql, key) = self.exclusion_asked(ti, oi, r);
+        let name = self.catalog.tables[ti].orders[oi].name.clone();
+        let newest = self.on_newest(|s| rows_of(&s.answer(&sql, Some(&name))?.0))?;
+        let seen = rows_of(&self.answer(&sql, Some(&name))?.0)?;
+        let keyed = |x: &Row| -> Vec<Datum> { key.iter().map(|&c| x[c].clone()).collect() };
+        let mine = keyed(r);
+        let own = self.own.get(&self.catalog.tables[ti].name);
+        let taken: Vec<Vec<Datum>> = own.map_or(Vec::new(), |o| o.taken().map(keyed).collect());
+        let wrote: Vec<Vec<Datum>> = own.map_or(Vec::new(), |o| o.wrote().map(keyed).collect());
+        let met = newest.iter().any(|k| *k != mine && !taken.contains(k))
+            || seen.iter().any(|k| *k != mine && wrote.contains(k));
+        if met {
+            return Err(Error::new(format!(
+                "conflicting key value violates exclusion constraint \"{name}\""
+            )));
+        }
+        Ok(())
     }
 
     /// The blocks of an EXCLUDE's strand whose rows may conflict with a row: each spanned level's

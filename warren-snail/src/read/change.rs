@@ -69,6 +69,15 @@ pub(super) enum Waiting {
     Try,
 }
 
+/// How a block's rows are written: its effects on it as it stands; the block rewritten in order; or
+/// its effects on the version a transaction of one snapshot reads, which only that transaction reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Writing {
+    Effects,
+    Rewritten,
+    Beside,
+}
+
 /// One row's change on a table.
 #[derive(Clone)]
 pub(super) enum Change {
@@ -79,11 +88,11 @@ pub(super) enum Change {
 
 /// One row's change on one order: its key there, the values the order holds, and for a row
 /// replaced, the key of the row that replaced it.
-struct Effect {
-    key: Vec<KeyValue>,
-    values: Vec<Datum>,
-    delete: bool,
-    chain: Option<Vec<KeyValue>>,
+pub(super) struct Effect {
+    pub(super) key: Vec<KeyValue>,
+    pub(super) values: Vec<Datum>,
+    pub(super) delete: bool,
+    pub(super) chain: Option<Vec<KeyValue>>,
 }
 
 /// A block a transaction began from, by its first key and its page map then, and the entries that
@@ -110,7 +119,7 @@ impl Rebased {
 }
 
 /// What a statement under way had staged when it began, and what its foreign keys had recorded.
-struct Mark {
+pub(super) struct Mark {
     rebased: BTreeMap<(usize, usize), Vec<Rebased>>,
     staged: u64,
     touched: Touched,
@@ -128,13 +137,20 @@ pub(super) struct Declared {
     resets: Vec<String>,
 }
 
+impl Declared {
+    /// The orders it made, by table and name.
+    pub(super) fn made(&self) -> &[(String, String)] {
+        &self.made
+    }
+}
+
 /// A directory page read on the way down, and the pages under it read too.
-struct Node {
-    entries: Vec<Entry>,
-    height: u32,
-    kids: BTreeMap<usize, Node>,
+pub(super) struct Node {
+    pub(super) entries: Vec<Entry>,
+    pub(super) height: u32,
+    pub(super) kids: BTreeMap<usize, Node>,
     /// The page it was read from; none at the top.
-    at: Extent,
+    pub(super) at: Extent,
 }
 
 /// The entry, among an ordered page's, whose rows a key belongs with: the last whose first key is at
@@ -172,7 +188,7 @@ pub(super) fn datum_typed(v: &Values, i: usize, ty: ColumnType) -> Datum {
 
 /// A value's key on a level of `column`, from the value: a number's, a string's or bytes'; a
 /// string's under a library collation, by `collator`'s key.
-fn level_key(
+pub(super) fn level_key(
     column: &crate::catalog::Column,
     collator: Option<&crate::collations::Collator>,
     level: Level,
@@ -869,15 +885,10 @@ impl Snail {
                 if self.begun.is_none() {
                     return Err(Error::new("no transaction is begun"));
                 }
-                // The foreign keys deferred to the commit are checked on the newest root; one that
-                // fails rolls the transaction back, as PostgreSQL's COMMIT does.
-                let checked = match self.pending.is_empty() {
-                    true => Ok(()),
-                    false => self
-                        .renew_in_transaction()
-                        .and_then(|_| self.keys_at_commit()),
-                };
-                if let Err(e) = checked {
+                // The foreign keys deferred to the commit are checked on the newest root, and a
+                // transaction of one snapshot's rows written there; one that fails rolls the
+                // transaction back, as PostgreSQL's COMMIT does.
+                if let Err(e) = self.commit_checked() {
                     let (began, _) = self.begun.take().expect("a transaction begun");
                     self.root = began;
                     self.levels.end(false);
@@ -938,27 +949,16 @@ impl Snail {
                             // runs again on the newest root, kept to the rows it found, each in its
                             // newest version and still meeting its conditions, as PostgreSQL checks
                             // a row changed meanwhile again. The blocks it locked stay locked.
-                            // At REPEATABLE READ it finds its rows again on the newest root too, read
-                            // beside the generation the transaction holds, and is refused; a row
-                            // written goes into a block it cannot read beside that generation.
+                            // A transaction of one snapshot, whose rows are written beside the
+                            // newest, comes here only by a key's check it reads no newer than its
+                            // block, and is refused.
                             self.back_to(&mark);
                             if self.held {
-                                if let Statement::Insert { table, .. } = &st {
-                                    let orders = self.catalog.tables[*table].orders.len();
-                                    let tested = (0..orders)
-                                        .try_for_each(|oi| self.mark_wrote(*table, oi, &[]));
-                                    self.abandon()?;
-                                    self.aborted = self.begun.is_some();
-                                    return Err(tested.err().unwrap_or_else(|| {
-                                        Error::new(
-                                            "could not serialize access due to concurrent update",
-                                        )
-                                    }));
-                                }
-                                let newest = self.reader.peek_root()?;
-                                self.in_transaction_on(newest)?;
-                                self.serial_comparing(true);
-                            } else if self.begun.is_some() {
+                                self.abandon()?;
+                                self.aborted = self.begun.is_some();
+                                return Err(super::beside::concurrent_update());
+                            }
+                            if self.begun.is_some() {
                                 self.renew_in_transaction()?;
                             } else {
                                 self.renew()?;
@@ -1588,13 +1588,6 @@ impl Snail {
                     Some(_) => {}
                 }
             }
-            // In a transaction holding its generation, a block another wrote since is refused too:
-            // its rows would be read from two generations.
-            if self.held {
-                return Err(Error::new(
-                    "could not serialize access due to concurrent update",
-                ));
-            }
         }
         let keys: std::collections::HashSet<Vec<Datum>> = first.iter().map(key).collect();
         Ok(now.into_iter().filter(|r| keys.contains(&key(r))).collect())
@@ -1602,7 +1595,7 @@ impl Snail {
 
     /// Where the statement under way began: what it had staged and the root it read, so that it
     /// can run again from there.
-    fn mark(&self) -> Mark {
+    pub(super) fn mark(&self) -> Mark {
         Mark {
             rebased: self.rebased.clone(),
             staged: self.reader.staged_mark(),
@@ -1612,7 +1605,7 @@ impl Snail {
         }
     }
 
-    fn back_to(&mut self, mark: &Mark) {
+    pub(super) fn back_to(&mut self, mark: &Mark) {
         self.rebased = mark.rebased.clone();
         self.reader.staged_back_to(mark.staged);
         self.touched = mark.touched.clone();
@@ -1699,6 +1692,9 @@ impl Snail {
     /// lets go of the blocks it locked.
     pub(super) fn abandon(&mut self) -> Result<()> {
         self.rebased.clear();
+        self.own.clear();
+        self.own_from = None;
+        self.first_bytes.clear();
         self.deciding = None;
         self.marking = None;
         self.reader.clear_staged();
@@ -2289,6 +2285,10 @@ impl Snail {
             })
             .collect();
         self.name_rows(ti, &named)?;
+        // A transaction of one snapshot writes the version it reads; its commit writes the newest.
+        if self.held {
+            return self.apply_beside(ti, &table, changes);
+        }
         let mut stage = self.reader.stage();
         let applied: Vec<u64> = (0..table.orders.len())
             .map(|oi| self.apply_order(&mut stage, ti, &table, oi, &changes))
@@ -2303,25 +2303,18 @@ impl Snail {
         Ok((applied.iter().sum(), applied.len() as u64))
     }
 
-    /// One order's part of a statement: its effects routed to their blocks, each block written
-    /// afresh, then the directory above them up to a new top. Returns the blocks rewritten in order,
-    /// or none where the order holds no column the statement changed.
-    fn apply_order(
-        &mut self,
-        w: &mut dyn Place,
-        ti: usize,
+    /// What a statement's changes come to on one order: for each row, the row taken from it and the
+    /// row written into it, keys and values as the order holds them. A partial strand takes the rows
+    /// its predicate admits: a row replaced by one it does not admit leaves it, and one it did not
+    /// admit comes in when its replacement passes.
+    pub(super) fn effects_on(
+        &self,
         table: &Table,
-        oi: usize,
+        order: &Order,
         changes: &[Change],
-    ) -> Result<Option<u64>> {
-        if self.stale {
-            return Ok(None);
-        }
-        let order = &table.orders[oi];
+    ) -> Result<Vec<Effect>> {
         let held =
             |r: &Row| -> Vec<Datum> { order.columns.iter().map(|&c| r[c].clone()).collect() };
-        // A partial strand takes the rows its predicate admits: a row replaced by one it does not
-        // admit leaves it, and one it did not admit comes in when its replacement passes.
         let predicate = super::partial::Predicate::of(&self.catalog, table, order)?;
         let admits = |r: &Row| predicate.as_ref().is_none_or(|p| p.admits(table, r));
         let routed: Vec<Change>;
@@ -2378,6 +2371,25 @@ impl Snail {
                 }
             }
         }
+        Ok(effects)
+    }
+
+    /// One order's part of a statement: its effects routed to their blocks, each block written
+    /// afresh, then the directory above them up to a new top. Returns the blocks rewritten in order,
+    /// or none where the order holds no column the statement changed.
+    fn apply_order(
+        &mut self,
+        w: &mut dyn Place,
+        ti: usize,
+        table: &Table,
+        oi: usize,
+        changes: &[Change],
+    ) -> Result<Option<u64>> {
+        if self.stale {
+            return Ok(None);
+        }
+        let order = &table.orders[oi];
+        let effects = self.effects_on(table, order, changes)?;
         if effects.is_empty() {
             return Ok(None);
         }
@@ -2455,8 +2467,15 @@ impl Snail {
             self.mark_wrote(ti, oi, &bytes)?;
             for (path, effects) in by_block {
                 let entry = entry_at(&top, &path).clone();
-                let (new, rewrote) =
-                    self.write_block_afresh(w, table, order, &head, &entry, effects, false)?;
+                let (new, rewrote) = self.write_block_afresh(
+                    w,
+                    table,
+                    order,
+                    &head,
+                    &entry,
+                    effects,
+                    Writing::Effects,
+                )?;
                 pruned += rewrote as u64;
                 self.rebase((ti, oi), &entry, &new)?;
                 replaced.insert(path, new);
@@ -2558,7 +2577,7 @@ impl Snail {
     }
 
     /// Reads down the directory to the block a key belongs with, keeping the pages read.
-    fn locate(
+    pub(super) fn locate(
         &self,
         node: &mut Node,
         head: &Head,
@@ -2593,8 +2612,9 @@ impl Snail {
     /// rows dropped, and cut again; then committed as a write is, or within the transaction begun.
     /// Returns the blocks pruned and the pages written.
     pub(super) fn prune(&mut self, wasted: Vec<Wasted>) -> Result<(u64, u64)> {
-        // A snail marked a replica is pruned by its applier's reads alone.
-        if self.writes_marked(&self.root).is_err() {
+        // A snail marked a replica is pruned by its applier's reads alone; and the version a
+        // transaction of one snapshot reads goes with it.
+        if self.writes_marked(&self.root).is_err() || self.held {
             return Ok((0, 0));
         }
         let written = self.written();
@@ -2654,8 +2674,15 @@ impl Snail {
                 if !self.lock_blocks(ti, oi, vec![entry.clone()], Waiting::Try)? {
                     continue;
                 }
-                let (new, _) =
-                    self.write_block_afresh(w, &table, order, &head, &entry, Vec::new(), true)?;
+                let (new, _) = self.write_block_afresh(
+                    w,
+                    &table,
+                    order,
+                    &head,
+                    &entry,
+                    Vec::new(),
+                    Writing::Rewritten,
+                )?;
                 self.rebase((ti, oi), &entry, &new)?;
                 replaced.insert(path, new);
                 pruned += 1;
@@ -2677,26 +2704,17 @@ impl Snail {
         Ok(pruned)
     }
 
-    /// One block's effects written: the dead marked and the new rows written after each column's
-    /// last rows; or the block rewritten in order, where `rewrite` asks it, where it would hold more
-    /// rows than a row group, or where rows come and the cut of its rows would make it more than one
-    /// block. Returns the entries that stand for it now, and whether it was rewritten.
-    #[allow(clippy::too_many_arguments)]
-    fn write_block_afresh(
+    /// Every column of a block, whole: each of its leaves decoded, and the column made of them, in
+    /// the order's columns' order.
+    pub(super) fn block_columns(
         &self,
-        w: &mut dyn Place,
         table: &Table,
         order: &Order,
-        head: &Head,
-        entry: &Entry,
-        effects: Vec<Effect>,
-        rewrite: bool,
-    ) -> Result<(Vec<Entry>, bool)> {
-        let mut map = read_map(&self.reader, entry, &head.level_text)?;
+        map: &PageMap,
+    ) -> Result<Vec<Values>> {
         let positions = map.rows() as usize;
         let leaves = order.leaves(table);
         let descs = leaf_descriptors(table, order)?;
-        // Every column of the block, whole: each of its leaves decoded, and the column made of them.
         let mut columns = Vec::with_capacity(order.columns.len());
         for &c in &order.columns {
             let mut parts = Vec::new();
@@ -2722,6 +2740,31 @@ impl Snail {
             }
             columns.push(Values::from_leaves(table.columns[c].ty, parts));
         }
+        Ok(columns)
+    }
+
+    /// One block's effects written: the dead marked and the new rows written after each column's
+    /// last rows; or the block rewritten in order, where `writing` asks it, where it would hold more
+    /// rows than a row group, or where rows come and the cut of its rows would make it more than one
+    /// block. On the version a transaction of one snapshot reads, its rows stay after the block's
+    /// last, whatever its cut, and the newest version alone says whether a unique key is shared.
+    /// Returns the entries that stand for it now, and whether it was rewritten.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn write_block_afresh(
+        &self,
+        w: &mut dyn Place,
+        table: &Table,
+        order: &Order,
+        head: &Head,
+        entry: &Entry,
+        effects: Vec<Effect>,
+        writing: Writing,
+    ) -> Result<(Vec<Entry>, bool)> {
+        let mut map = read_map(&self.reader, entry, &head.level_text)?;
+        let positions = map.rows() as usize;
+        let leaves = order.leaves(table);
+        let descs = leaf_descriptors(table, order)?;
+        let columns = self.block_columns(table, order, &map)?;
         let mut dead: std::collections::BTreeSet<u32> = map.dead.iter().copied().collect();
         let types: Vec<ColumnType> = order.columns.iter().map(|&c| table.columns[c].ty).collect();
         let holds = |p: usize, values: &[Datum]| -> bool {
@@ -2743,6 +2786,11 @@ impl Snail {
                 let p = (0..positions)
                     .find(|&p| !dead.contains(&(p as u32)) && holds(p, &e.values))
                     .ok_or_else(|| {
+                        // A commit's rows, found on its snapshot, met one changed since by a writer
+                        // it did not wait for.
+                        if self.committing {
+                            return super::beside::concurrent_update();
+                        }
                         Error::new(format!(
                             "{}: a row the statement found is not in {}",
                             table.name, order.name
@@ -2787,7 +2835,7 @@ impl Snail {
             rows
         };
         let mut rows = None;
-        let split = !added.is_empty() && {
+        let split = !added.is_empty() && writing != Writing::Beside && {
             let r = rows_now();
             let cut = laid_out(
                 table,
@@ -2802,7 +2850,10 @@ impl Snail {
             rows = Some(r);
             cut
         };
-        if rewrite || split || positions + added.len() > ROW_GROUP_ROWS {
+        if writing == Writing::Rewritten
+            || split
+            || (writing != Writing::Beside && positions + added.len() > ROW_GROUP_ROWS)
+        {
             // Written in order, and cut by the counts as a block written afresh is.
             let rows = rows.unwrap_or_else(rows_now);
             let mut written = self.blocks_written(w, table, order, head, &rows)?;
@@ -3132,7 +3183,7 @@ impl Snail {
 
     /// The rows an empty order is given, as its first blocks, and the head they give the order: its
     /// units and its text levels' sublevels, as a snail written from them would hold.
-    fn written_in_order(
+    pub(super) fn written_in_order(
         &self,
         w: &mut dyn Place,
         table: &Table,
@@ -3403,7 +3454,7 @@ impl Snail {
     }
 }
 
-fn entry_at<'a>(node: &'a Node, path: &[usize]) -> &'a Entry {
+pub(super) fn entry_at<'a>(node: &'a Node, path: &[usize]) -> &'a Entry {
     match path {
         [i] => &node.entries[*i],
         [i, rest @ ..] => entry_at(&node.kids[i], rest),
@@ -3426,7 +3477,7 @@ fn following<'a>(node: &'a Node, path: &[usize]) -> Option<&'a [KeyValue]> {
 /// the entries that stand for it now, and each page read on the way down written afresh, split where
 /// it no longer fits a page. Leaves `node`'s own entries as they stand now; the pages written over
 /// are added to `gone`.
-fn settle(
+pub(super) fn settle(
     node: &mut Node,
     path: &mut Vec<usize>,
     replaced: &BTreeMap<Vec<usize>, Vec<Entry>>,

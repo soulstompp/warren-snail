@@ -1159,6 +1159,23 @@ pub(crate) struct Laid {
     pub blocks: Vec<Block>,
 }
 
+/// The refusal of two rows sharing a unique order's key.
+pub(crate) fn key_shared(table: &Table, order: &Order, key: &[KeyValue]) -> Error {
+    Error::new(format!(
+        "{}: two rows share the value {} of {}, which is unique",
+        table.name,
+        crate::places::shown_as(
+            key,
+            &order
+                .levels
+                .iter()
+                .map(|l| table.columns[l.column()].ty)
+                .collect::<Vec<_>>()
+        ),
+        order.name
+    ))
+}
+
 /// Sorts rows on an order and cuts them into blocks. A text level is cut on the sublevels `given`, or,
 /// where none are given, on its longest value's bytes and one more.
 pub(crate) fn laid_out(
@@ -1243,19 +1260,7 @@ pub(crate) fn laid_out(
             a == b && !(order.nulls_distinct && a.iter().any(KeyValue::is_null))
         };
         if let Some(p) = perm.windows(2).find(|p| shared(row(p[0]), row(p[1]))) {
-            return Err(Error::new(format!(
-                "{}: two rows share the value {} of {}, which is unique",
-                table.name,
-                crate::places::shown_as(
-                    row(p[0]),
-                    &order
-                        .levels
-                        .iter()
-                        .map(|l| table.columns[l.column()].ty)
-                        .collect::<Vec<_>>()
-                ),
-                order.name
-            )));
+            return Err(key_shared(table, order, row(p[0])));
         }
     }
     let keys = Keys {

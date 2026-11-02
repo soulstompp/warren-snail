@@ -1062,10 +1062,7 @@ impl Snails {
         // rolls the whole transaction back.
         for &i in &written {
             let s = &mut self.snails[i];
-            if s.pending.is_empty() {
-                continue;
-            }
-            if let Err(e) = s.renew_in_transaction().and_then(|_| s.keys_at_commit()) {
+            if let Err(e) = s.commit_checked() {
                 self.end_all()?;
                 return Err(e);
             }

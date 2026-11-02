@@ -8,6 +8,7 @@ mod across;
 mod aggregates;
 mod answer;
 mod arrays;
+mod beside;
 mod calls;
 mod change;
 mod clock;
@@ -429,6 +430,13 @@ pub struct Snail {
     /// Whether the round under way reads the newest root only to compare a statement's rows with it,
     /// the statement to be refused or to go on as it found them: it reads nothing of its own.
     comparing: std::cell::Cell<bool>,
+    /// What a transaction of one snapshot has changed so far, by table, which its commit writes into
+    /// the newest root; its snapshot as it took it; whether that commit is under way; and for each block of the version it reads
+    /// whose first key its rows lowered, the lock byte of the first key its snapshot gives it.
+    own: std::collections::BTreeMap<String, beside::OwnRows>,
+    own_from: Option<Root>,
+    committing: bool,
+    first_bytes: std::collections::BTreeMap<u64, u64>,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -680,6 +688,10 @@ impl Snail {
             ending: None,
             monitor: None,
             comparing: Default::default(),
+            own: Default::default(),
+            own_from: None,
+            committing: false,
+            first_bytes: Default::default(),
         })
     }
 
@@ -1376,7 +1388,7 @@ impl Snail {
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _handed = handed::holding(&self.functions);
         let room = self.reader.room();
-        let _room = crate::room::entered(&room);
+        let _room = self.entered_round(&room);
         self.wasted.borrow_mut().clear();
         let (batch, mut round) = match locking::clauses(sql)? {
             Some(l) => self.ask_locking(l, order, params)?,
@@ -1402,7 +1414,7 @@ impl Snail {
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
         let room = self.reader.room();
-        let entered = crate::room::entered(&room);
+        let entered = self.entered_round(&room);
         let (batch, mut round) = self.answer_in_room(sql, order, params)?;
         let room = crate::room::current().expect("a round under way has its room");
         round.bytes_held = room.most();

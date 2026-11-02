@@ -1276,6 +1276,25 @@ pub struct Table {
 }
 
 impl Table {
+    /// Whether another reading of the table holds the same columns and orders: a row written for one
+    /// is written the same for the other.
+    pub(crate) fn same_shape(&self, other: &Table) -> bool {
+        self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(&other.columns)
+                .all(|(a, b)| a.name == b.name && a.ty == b.ty && a.not_null == b.not_null)
+            && self.orders.len() == other.orders.len()
+            && self.orders.iter().zip(&other.orders).all(|(a, b)| {
+                a.name == b.name
+                    && a.levels == b.levels
+                    && a.columns == b.columns
+                    && a.unique == b.unique
+                    && a.table_order == b.table_order
+            })
+    }
+
     /// The leaves of its columns, in its columns' order, each with its column.
     pub fn leaves(&self) -> Vec<(usize, Leaf)> {
         (0..self.columns.len())

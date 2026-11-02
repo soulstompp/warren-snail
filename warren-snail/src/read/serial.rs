@@ -172,6 +172,22 @@ impl View {
         }
     }
 
+    /// A block's byte, and every byte of a block it was cut from or that was cut from it: what a mark on
+    /// one means on the others, whichever generation each was named under.
+    fn related(&self, byte: u64) -> Vec<u64> {
+        let mut out = self.with_parents(byte);
+        let mut at = 0;
+        while at < out.len() {
+            for (child, parents) in &self.parents {
+                if parents.contains(&out[at]) && !out.contains(child) {
+                    out.push(*child);
+                }
+            }
+            at += 1;
+        }
+        out
+    }
+
     /// A block's byte and every byte of a block it was cut from.
     fn with_parents(&self, byte: u64) -> Vec<u64> {
         let mut out = vec![byte];
@@ -372,7 +388,7 @@ impl Snail {
             lock::mark_read(file, self.slot, lock::order_byte(ti, oi), false)?;
         }
         for &b in &s.wrote {
-            lock::mark_held(file, self.slot, b, false)?;
+            lock::mark_wrote(file, self.slot, b, false)?;
         }
         for &o in &s.outs {
             lock::mark_edge(file, self.slot, true, o, false)?;
@@ -611,7 +627,7 @@ impl Snail {
                 m.read(
                     &t.name,
                     &order.name,
-                    Some(lock::block_byte_of(table, walk.order, first)),
+                    Some(self.block_read_byte(table, walk.order, first)),
                 )?;
             }
         }
@@ -654,7 +670,7 @@ impl Snail {
             if !whole {
                 let held = s.marks.entry(key).or_default();
                 for first in &walk.marks {
-                    let b = lock::block_byte_of(table, walk.order, first);
+                    let b = self.block_read_byte(table, walk.order, first);
                     if held.insert(b) {
                         lock::mark_read(file, self.slot, b, true)?;
                         fresh.push(b);
@@ -674,8 +690,9 @@ impl Snail {
         // Each writer of what it newly marked: one running holds the block, and a commit since its
         // snapshot named it, or a block cut from it.
         let mut met: BTreeSet<u64> = BTreeSet::new();
-        for &b in &fresh {
-            for slot in lock::holders(file, b)? {
+        let meets: BTreeSet<u64> = fresh.iter().flat_map(|&b| v.related(b)).collect();
+        for &b in &meets {
+            for slot in lock::writers(file, b)? {
                 if let Some((_, id)) = v.running.iter().find(|(x, _)| *x == slot) {
                     met.insert(*id);
                 }
@@ -690,11 +707,7 @@ impl Snail {
             {
                 continue;
             }
-            let lies_under = r
-                .wrote
-                .iter()
-                .any(|w| v.with_parents(*w).iter().any(|b| fresh.contains(b)));
-            if lies_under {
+            if r.wrote.iter().any(|w| meets.contains(w)) {
                 met.insert(r.id);
             }
         }
@@ -721,6 +734,9 @@ impl Snail {
     /// A write of the transaction changes these blocks of an order: each block's marks tested, and the
     /// marks on what it was cut from and on the order whole. A transaction someone doomed fails here.
     pub(super) fn mark_wrote(&self, table: usize, order: usize, blocks: &[u64]) -> Result<()> {
+        if self.committing {
+            return self.wrote_at_commit(blocks);
+        }
         if let Some(m) = &self.monitor {
             let t = &self.catalog.tables[table];
             for &b in blocks {
@@ -755,13 +771,15 @@ impl Snail {
         s.did_write = true;
         let order_byte = lock::order_byte(table, order);
         if s.wrote.insert(order_byte) {
-            lock::mark_held(file, self.slot, order_byte, true)?;
+            lock::mark_wrote(file, self.slot, order_byte, true)?;
         }
         // What lands anywhere in the order lands in the gaps of a block a commit let go.
         let mut tests: BTreeSet<u64> = v.with_parents(order_byte).into_iter().collect();
         for &b in blocks {
-            s.wrote.insert(b);
-            tests.extend(v.with_parents(b));
+            if s.wrote.insert(b) {
+                lock::mark_wrote(file, self.slot, b, true)?;
+            }
+            tests.extend(v.related(b));
         }
         let mut readers: BTreeSet<u64> = BTreeSet::new();
         for &b in &tests {
@@ -789,10 +807,23 @@ impl Snail {
         Ok(())
     }
 
-    /// A round reads the newest root from here on only to compare a statement's rows with it, or no
-    /// longer does.
-    pub(super) fn serial_comparing(&self, comparing: bool) {
-        self.comparing.set(comparing);
+    /// The blocks a transaction's commit writes its rows into, which its statements tested: named among
+    /// those it wrote, for a read after its commit.
+    fn wrote_at_commit(&self, blocks: &[u64]) -> Result<()> {
+        let mut guard = self.serial.borrow_mut();
+        let Some(s) = guard.as_mut().filter(|s| s.active) else {
+            return Ok(());
+        };
+        let file = self.the_writer_file()?;
+        lock::take_serial_turn(&file)?;
+        let mut marked = Ok(());
+        for &b in blocks {
+            if marked.is_ok() && s.wrote.insert(b) {
+                marked = lock::mark_wrote(&file, self.slot, b, true);
+            }
+        }
+        lock::give_serial_turn(&file)?;
+        marked
     }
 
     /// Whether the transaction's commit writes its records though it wrote nothing: another

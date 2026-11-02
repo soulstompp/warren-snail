@@ -2,7 +2,7 @@
 //! overlapping transactions found from both sides, and two in a row refused where PostgreSQL's
 //! monitor refuses them, in its words; READ ONLY and DEFERRABLE; the records a commit leaves; the
 //! older formats and a replica refused by name; and every interleaving of two transactions over two
-//! blocks held to some serial order.
+//! blocks and within one held to some serial order.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -25,6 +25,9 @@ const DDL: &str = "CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PR
 const ROWS: i32 = 2048;
 const A: i32 = 1600;
 const B: i32 = 32000;
+/// Two rows of the second block, read apart: `C` by the block's rows up to it, `D` by those after.
+const C: i32 = 17600;
+const D: i32 = 17616;
 
 fn made(name: &str) -> PathBuf {
     let path = tmp(&format!("serial-{name}.snail"));
@@ -371,7 +374,12 @@ enum Step {
 
 impl Step {
     fn swapped(self) -> Step {
-        let other = |x: i32| if x == A { B } else { A };
+        let other = |x: i32| match x {
+            A => B,
+            B => A,
+            C => D,
+            _ => C,
+        };
         match self {
             Step::Read(x) => Step::Read(other(x)),
             Step::Write(x) => Step::Write(other(x)),
@@ -390,9 +398,11 @@ fn inserted_at(x: i32, t: usize, k: usize) -> i32 {
 }
 
 fn range_of(x: i32) -> (i32, i32) {
-    match x == A {
-        true => (0, 16_383),
-        false => (16_384, 16 * ROWS),
+    match x {
+        A => (0, 16_383),
+        B => (16_384, 16 * ROWS),
+        C => (16_384, C + 8),
+        _ => (C + 9, 16 * ROWS),
     }
 }
 
@@ -750,12 +760,14 @@ fn walk(
     (shard, of): (usize, usize),
     jobs: usize,
 ) -> Walked {
-    let base = tmp(&format!(
-        "serial-walk-{n}-{}.snail",
-        level.replace(' ', "-")
-    ));
+    let tag = format!(
+        "{n}-{}-{}",
+        level.replace(' ', "-"),
+        i32::from(statements.contains(&Step::Read(C)))
+    );
+    let base = tmp(&format!("serial-walk-{tag}.snail"));
     {
-        let made = made(&format!("walk-base-{n}-{}", level.replace(' ', "-")));
+        let made = made(&format!("walk-base-{tag}"));
         std::fs::copy(&made, &base).unwrap();
     }
     let mut work: Vec<(Vec<Vec<Step>>, Vec<u8>)> = Vec::new();
@@ -778,12 +790,11 @@ fn walk(
     };
     std::thread::scope(|scope| {
         for job in 0..jobs {
-            let (work, at, found, base, dir) = (&work, &at, &found, &base, &dir);
+            let (work, at, found, base, dir, tag) = (&work, &at, &found, &base, &dir, &tag);
             scope.spawn(move || {
                 let file = dir.join(format!(
-                    "warren-snail-serial-{}-{n}-{job}-{}.snail",
-                    std::process::id(),
-                    level.replace(' ', "-")
+                    "warren-snail-serial-{}-{job}-{tag}.snail",
+                    std::process::id()
                 ));
                 loop {
                     let i = at.fetch_add(1, Ordering::Relaxed);
@@ -820,6 +831,17 @@ const AND_INSERTS: [Step; 6] = [
     Step::Insert(B),
 ];
 
+/// The same over one block: each transaction's rows lie in the second block, read apart.
+const IN_ONE_BLOCK: [Step; 4] = [Step::Read(C), Step::Read(D), Step::Write(C), Step::Write(D)];
+const IN_ONE_BLOCK_AND_INSERTS: [Step; 6] = [
+    Step::Read(C),
+    Step::Read(D),
+    Step::Write(C),
+    Step::Write(D),
+    Step::Insert(C),
+    Step::Insert(D),
+];
+
 /// How much of a walk a run takes: `SNAIL_SERIAL_SHARD` as `k/n`, one in `n` of its schedules.
 fn shard() -> (usize, usize) {
     std::env::var("SNAIL_SERIAL_SHARD")
@@ -854,6 +876,70 @@ fn at_repeatable_read_the_same_walk_finds_histories_no_serial_order_gives() {
     assert!(w.broken_count > 0, "{w:?}");
 }
 
+#[test]
+fn every_interleaving_of_two_transactions_in_one_block_is_some_serial_order() {
+    let w = walk(2, &IN_ONE_BLOCK_AND_INSERTS, "SERIALIZABLE", (0, 1), jobs());
+    println!("{w:?}");
+    assert_eq!(w.broken_count, 0, "{:#?}", w.broken);
+    assert_eq!(w.schedules, 5772);
+    assert!(w.committed > 0 && w.refused > 0, "{w:?}");
+}
+
+#[test]
+fn at_repeatable_read_the_walk_in_one_block_finds_histories_no_serial_order_gives() {
+    let w = walk(2, &IN_ONE_BLOCK, "REPEATABLE READ", (0, 1), jobs());
+    println!("{w:?}");
+    assert!(w.broken_count > 0, "{w:?}");
+}
+
+/// Every order of two transactions writing rows of their own in one block, each of one or two
+/// statements: every one commits, at `level`, and the rows after are every row's.
+fn own_rows_all_commit(firsts: &[Vec<Step>], seconds: &[Vec<Step>], level: &str) {
+    let base = made(&format!("own-rows-{}", level.replace(' ', "-")));
+    let at = tmp(&format!("serial-own-rows-{}-run.snail", level.replace(' ', "-")));
+    for a in firsts {
+        for b in seconds {
+            let set = vec![a.clone(), b.clone()];
+            for order in interleavings(&[a.len() + 1, b.len() + 1]) {
+                let (ran, rows) = run_interleaving(&base, &at, &set, &order, level);
+                assert!(
+                    ran.iter().all(|r| r.0),
+                    "{level}: {set:?} {order:?} {ran:?}"
+                );
+                assert!(
+                    some_serial_order(&set, &ran, rows),
+                    "{level}: {set:?} {order:?} {ran:?} {rows:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn writers_of_rows_of_their_own_in_one_block_all_commit_in_every_order() {
+    own_rows_all_commit(
+        &[
+            vec![Step::Write(C)],
+            vec![Step::Insert(C)],
+            vec![Step::Write(C), Step::Insert(C)],
+            vec![Step::Read(C), Step::Write(C)],
+        ],
+        &[
+            vec![Step::Write(D)],
+            vec![Step::Insert(D)],
+            vec![Step::Insert(D), Step::Write(D)],
+            vec![Step::Read(D), Step::Write(D)],
+        ],
+        "REPEATABLE READ",
+    );
+    // INSERTs read nothing, so at SERIALIZABLE the block's marks meet nothing.
+    own_rows_all_commit(
+        &[vec![Step::Insert(C)]],
+        &[vec![Step::Insert(D)]],
+        "SERIALIZABLE",
+    );
+}
+
 /// The certificate's own walk, `serial.nu`: three transactions, at SERIALIZABLE.
 #[test]
 #[ignore]
@@ -864,11 +950,30 @@ fn every_interleaving_of_three_transactions_over_two_blocks_is_some_serial_order
     assert!(w.schedules > 0 && w.committed > 0, "{w:?}");
 }
 
+/// The same, every transaction's rows in one block.
+#[test]
+#[ignore]
+fn every_interleaving_of_three_transactions_in_one_block_is_some_serial_order() {
+    let w = walk(3, &IN_ONE_BLOCK, "SERIALIZABLE", shard(), jobs());
+    println!("{w:?}");
+    assert_eq!(w.broken_count, 0, "{:#?}", w.broken);
+    assert!(w.schedules > 0 && w.committed > 0, "{w:?}");
+}
+
 /// Its seeded pass: at REPEATABLE READ three transactions break.
 #[test]
 #[ignore]
 fn at_repeatable_read_three_transactions_break() {
     let w = walk(3, &READS_AND_WRITES, "REPEATABLE READ", shard(), jobs());
+    println!("{w:?}");
+    assert!(w.broken_count > 0, "{w:?}");
+}
+
+/// The same, every transaction's rows in one block.
+#[test]
+#[ignore]
+fn at_repeatable_read_three_transactions_in_one_block_break() {
+    let w = walk(3, &IN_ONE_BLOCK, "REPEATABLE READ", shard(), jobs());
     println!("{w:?}");
     assert!(w.broken_count > 0, "{w:?}");
 }
@@ -1160,34 +1265,6 @@ fn a_transaction_at_serializable_reads_one_snapshot_and_its_own_writes() {
     assert_eq!(read(&mut a, B), -8);
     set(&mut a, B, -10).unwrap();
     assert_eq!(read(&mut a, B), -10);
-}
-
-#[test]
-fn a_block_written_since_by_another_refuses_a_row_written_into_it_never_a_mixed_answer() {
-    let path = made("mixed");
-    let (mut a, mut b) = (open(&path), open(&path));
-    for (v, level) in [(-1, "REPEATABLE READ"), (-2, "SERIALIZABLE")] {
-        run(&mut a, &format!("BEGIN ISOLATION LEVEL {level}"));
-        let id = A + 1;
-        let count = |w: &mut Snail| {
-            one(&w
-                .ask("SELECT count(*) FROM s.t t WHERE t.id < 16384", None)
-                .unwrap()
-                .0)
-        };
-        let before = count(&mut a);
-        set(&mut b, A, v).unwrap();
-        let e = a
-            .execute(&format!("INSERT INTO s.t (id, v) VALUES ({id}, 1)"))
-            .unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "could not serialize access due to concurrent update",
-            "{level}"
-        );
-        run(&mut a, "ROLLBACK");
-        assert_eq!(count(&mut a), before);
-    }
 }
 
 #[test]
