@@ -12,7 +12,9 @@ use crate::directory::{
 };
 use crate::encode::decode_leaf_with;
 use crate::file::Extent;
+use crate::geo::{GeoKind, Point};
 use crate::places::{level_key, month_of, null_key, KeyValue};
+use crate::plane::Near;
 use crate::room::{HeldIn, Room};
 use crate::values::Values;
 use crate::{Error, Result};
@@ -256,6 +258,10 @@ pub struct Walk {
     /// What the entries left open hold, and then the plan, counted in the round's room.
     held: HeldIn,
     open_bytes: u64,
+    /// Where it walks a strand nearest first: the point and its box's place in an entry; and how near
+    /// each entry left open may lie.
+    nearest: Option<Nearest>,
+    near: Vec<Near>,
 }
 
 impl Walk {
@@ -311,6 +317,68 @@ impl Walk {
             })
             .collect();
         pages.into_iter()
+    }
+}
+
+/// A strand's walk nearest first: the point, its column's kind, and where an entry keeps its box.
+struct Nearest {
+    point: Point,
+    kind: GeoKind,
+    span_at: usize,
+}
+
+/// A strand's entries as a walk nearest first has them left: each by how near it may lie, then the
+/// lower level, then as they came.
+pub(super) struct Best {
+    walk: Option<Walk>,
+    queue: BTreeMap<(Near, u32, u64), Open>,
+    seq: u64,
+    /// What the walk held in the round's room as it made the plan under way.
+    before_plan: u64,
+}
+
+/// The bytes an entry takes in the queue.
+fn queued_bytes(o: &Open) -> u64 {
+    (std::mem::size_of::<(Near, u32, u64)>() + std::mem::size_of::<Open>()) as u64 + o.held_past()
+}
+
+impl Best {
+    /// How near the nearest entry left may lie.
+    pub(super) fn next(&self) -> Option<Near> {
+        self.queue.keys().next().map(|k| k.0)
+    }
+
+    /// The walk under way.
+    pub(super) fn walk(&self) -> &Walk {
+        self.walk.as_ref().expect("a walk under way")
+    }
+
+    /// The walk under way, which marks the order whole: a block it leaves unread may take a row nearer
+    /// than the rows it finds.
+    pub(super) fn mark_whole(&mut self) -> &Walk {
+        let w = self.walk.as_mut().expect("a walk under way");
+        w.upper = true;
+        w
+    }
+
+    /// The walk back from a plan read, what the plan held let go.
+    pub(super) fn read(&mut self, plan: Plan) {
+        let w = plan.walk;
+        w.held.less(w.held.holds().saturating_sub(self.before_plan));
+        self.walk = Some(w);
+    }
+
+    /// The entries the walk has just left open, queued.
+    fn queue_open(&mut self) {
+        let w = self.walk.as_mut().expect("a walk under way");
+        let open = std::mem::take(&mut w.open);
+        let near = std::mem::take(&mut w.near);
+        w.count_open();
+        for (o, n) in open.into_iter().zip(near) {
+            self.seq += 1;
+            w.held.more(queued_bytes(&o));
+            self.queue.insert((n, w.level, self.seq), o);
+        }
     }
 }
 
@@ -625,6 +693,17 @@ impl Snail {
 
     /// A round along one order, begun at its directory's top.
     pub(super) fn start(&self, oi: usize, want: &Want) -> Result<Walk> {
+        self.start_near(oi, want, None)
+    }
+
+    /// A round along one order begun at its top, each entry left open weighed by how near a point it
+    /// may lie, where a point of a column of the plane is given.
+    fn start_near(
+        &self,
+        oi: usize,
+        want: &Want,
+        point: Option<(usize, Point)>,
+    ) -> Result<Walk> {
         let order = &want.table.orders[oi];
         let (head, entries, pages) = self.top(want.table, oi)?;
         crate::write::cut_checked(want.table, order, &head)?;
@@ -750,6 +829,18 @@ impl Snail {
         };
         let level = head.height;
         let whole_bytes = vec![0; head.units.len()];
+        let nearest = point.and_then(|(c, point)| {
+            let slot = order.leaf_slot(want.table, c)? as u32;
+            let span_at = head.span_slots.iter().position(|&s| s == slot)?;
+            match want.table.columns[c].ty {
+                ColumnType::Geometric(kind) => Some(Nearest {
+                    point,
+                    kind,
+                    span_at,
+                }),
+                _ => None,
+            }
+        });
         let widths = order
             .leaves(want.table)
             .iter()
@@ -795,6 +886,8 @@ impl Snail {
                 crate::room::current().unwrap_or_else(|| Room::new(self.reader.room().sizes())),
             ),
             open_bytes: 0,
+            nearest,
+            near: Vec::new(),
         };
         for e in entries {
             assess(&mut walk, e, order, want);
@@ -802,6 +895,88 @@ impl Snail {
         walk.count_open();
         walk.top = (walk.low, walk.high);
         Ok(walk)
+    }
+
+    /// A strand of a column of the plane walked nearest first from `point`, begun at its top.
+    pub(super) fn best_first(
+        &self,
+        oi: usize,
+        want: &Want,
+        column: usize,
+        point: Point,
+    ) -> Result<Best> {
+        let walk = self.start_near(oi, want, Some((column, point)))?;
+        let mut best = Best {
+            walk: Some(walk),
+            queue: BTreeMap::new(),
+            seq: 0,
+            before_plan: 0,
+        };
+        best.queue_open();
+        Ok(best)
+    }
+
+    /// The entries under one above the blocks, read from the file and queued.
+    fn best_down(&self, best: &mut Best, level: u32, o: Open, want: &Want) -> Result<()> {
+        let w = best.walk.as_mut().expect("a walk under way");
+        w.held.less(queued_bytes(&o));
+        let ends = o
+            .ends
+            .as_ref()
+            .expect("an entry above the blocks keeps its last key");
+        let entries = decode_page(
+            &self.reader.read_extent(o.child)?,
+            &w.head,
+            (&ends.last, ends.open),
+        )?;
+        w.directory_pages += o.child.pages();
+        w.level = level - 1;
+        let order = &want.table.orders[w.order];
+        for e in entries {
+            assess(w, e, order, want);
+        }
+        best.queue_open();
+        Ok(())
+    }
+
+    /// The pages of the nearest blocks whose live rows come to `rows`, nothing read but the directory
+    /// above them: the fewest a walk that stops at that many rows reads.
+    pub(super) fn best_fewest(&self, best: &mut Best, want: &Want, rows: u64) -> Result<u64> {
+        let (mut low, mut found) = (0u64, 0u64);
+        let mut aside = Vec::new();
+        while found < rows {
+            let Some((k, o)) = best.queue.pop_first() else {
+                break;
+            };
+            if k.1 > 1 {
+                self.best_down(best, k.1, o, want)?;
+                continue;
+            }
+            low += u64::from(o.pages);
+            found += u64::from(o.rows);
+            aside.push((k, o));
+        }
+        best.queue.extend(aside);
+        Ok(low)
+    }
+
+    /// The walk's next step: the directory page under the nearest entry, read, which gives no plan; or
+    /// the nearest block's plan, its pages known now.
+    pub(super) fn best_step(&self, best: &mut Best, want: &Want) -> Result<Option<Plan>> {
+        let Some((k, o)) = best.queue.pop_first() else {
+            return Ok(None);
+        };
+        if k.1 > 1 {
+            self.best_down(best, k.1, o, want)?;
+            return Ok(None);
+        }
+        let mut w = best.walk.take().expect("a walk under way");
+        w.held.less(queued_bytes(&o));
+        best.before_plan = w.held.holds();
+        w.level = 1;
+        w.open.push(o);
+        w.near.clear();
+        self.predict(w, want).map(Some)
     }
 
     /// Reads one level further down: the page under every entry left open.
@@ -2119,6 +2294,12 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             open: e.open,
         })
     });
+    if let Some(n) = &walk.nearest {
+        let near = e.spans.get(n.span_at).map_or(Near::of(0.0), |span| {
+            crate::plane::least_near(n.kind, span, &n.point)
+        });
+        walk.near.push(near);
+    }
     walk.open.push(Open {
         reading,
         child: e.child,

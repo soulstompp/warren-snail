@@ -9,7 +9,7 @@ mod kept;
 mod met;
 mod recursive;
 
-pub(super) use kept::Keep;
+pub(super) use kept::{Keep, Kept};
 pub(super) use recursive::unread_clauses;
 
 use super::collate::Carried;
@@ -1405,17 +1405,17 @@ fn table_of(catalog: &Catalog, n: &str) -> Result<usize> {
 }
 
 /// A name quoted as SQL writes it.
-fn quote(s: &str) -> String {
+pub(super) fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// A table's name as SQL writes it, each part quoted.
-fn quote_name(s: &str) -> String {
+pub(super) fn quote_name(s: &str) -> String {
     s.split('.').map(quote).collect::<Vec<_>>().join(".")
 }
 
 /// The conjuncts of a condition.
-fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+pub(super) fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
     match e {
         Expr::BinaryOp {
             left,
@@ -1518,6 +1518,35 @@ impl Named {
             || qualifier.map(pipeline::unmarked).is_some_and(|q| {
                 self.starred.contains(q) || self.qualified.get(q).is_some_and(|n| n.contains(name))
             })
+    }
+}
+
+/// The question the question path reads: the select list, the FROM and as many of the conditions as
+/// it reads together; with none, where it reads them not.
+pub(super) fn parsed(
+    catalog: &Catalog,
+    select: &str,
+    from: &str,
+    conds: &[&Expr],
+) -> Result<Question> {
+    let text = |cs: &[&Expr]| match cs {
+        [] => format!("SELECT {select} FROM {from}"),
+        cs => format!(
+            "SELECT {select} FROM {from} WHERE {}",
+            cs.iter()
+                .map(|c| format!("({c})"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        ),
+    };
+    let read: Vec<&Expr> = conds
+        .iter()
+        .copied()
+        .filter(|c| question::parse(catalog, &text(&[c])).is_ok())
+        .collect();
+    match question::parse(catalog, &text(&read)) {
+        Ok(q) => Ok(q),
+        Err(_) => question::parse(catalog, &text(&[])),
     }
 }
 
@@ -1936,26 +1965,7 @@ impl Reading<'_> {
     /// The question the question path reads: the select list, the FROM and as many of the
     /// conditions as it reads together; with none, where it reads them not.
     fn parsed(&self, select: &str, from: &str, conds: &[&Expr]) -> Result<Question> {
-        let catalog = self.reads.catalog();
-        let text = |cs: &[&Expr]| match cs {
-            [] => format!("SELECT {select} FROM {from}"),
-            cs => format!(
-                "SELECT {select} FROM {from} WHERE {}",
-                cs.iter()
-                    .map(|c| format!("({c})"))
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
-            ),
-        };
-        let read: Vec<&Expr> = conds
-            .iter()
-            .copied()
-            .filter(|c| question::parse(catalog, &text(&[c])).is_ok())
-            .collect();
-        match question::parse(catalog, &text(&read)) {
-            Ok(q) => Ok(q),
-            Err(_) => question::parse(catalog, &text(&[])),
-        }
+        parsed(self.reads.catalog(), select, from, conds)
     }
 
     /// A join whose every relation is a table, read as C1's round meets them where the question

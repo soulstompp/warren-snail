@@ -552,6 +552,11 @@ impl HeldIn {
     pub fn size(&self) -> u64 {
         self.room.sizes().bytes
     }
+
+    /// The bytes it holds.
+    pub fn holds(&self) -> u64 {
+        self.bytes.get()
+    }
 }
 
 impl Drop for HeldIn {

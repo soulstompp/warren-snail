@@ -26,6 +26,20 @@ pub(in crate::read) struct Keep {
 }
 
 impl Keep {
+    /// These values of the columns at `places`, kept as they are given.
+    pub(in crate::read) fn of_values(places: Vec<usize>, values: Vec<Vec<Value>>) -> Keep {
+        let held: u64 = values
+            .iter()
+            .map(|v| 3 * crate::read::spill::row_width(v))
+            .sum();
+        Keep {
+            places,
+            values: Rc::new(values),
+            nulls_meet: true,
+            _held: Rc::new(crate::room::holding(held)),
+        }
+    }
+
     /// What `made` holds, each row `of` read on it, each set of values once: none where they do not
     /// fit the round's room, a key set being held three ways as the walk finds rows by it.
     pub(in crate::read) fn of_rows(
@@ -147,15 +161,15 @@ fn numeric_key(v: &Value, ty: ColumnType) -> Option<KeyValue> {
 /// The keys a table's read is kept to: the key set its walk finds them by, where an order of the
 /// table leads with columns they all hold; the keys every row it keeps holds, of its places from
 /// the node's first.
-pub(super) struct Kept {
-    pub(super) set: Option<KeySet>,
+pub(in crate::read) struct Kept {
+    pub(in crate::read) set: Option<KeySet>,
     keys: HashSet<Vec<Key>>,
     at: Vec<usize>,
     nulls_meet: bool,
 }
 
 impl Kept {
-    pub(super) fn of(keep: &Keep, node_at: usize, table: &Table) -> Kept {
+    pub(in crate::read) fn of(keep: &Keep, node_at: usize, table: &Table) -> Kept {
         let columns: Vec<usize> = stored(table).collect();
         let cols: Vec<usize> = keep.places.iter().map(|p| columns[p - node_at]).collect();
         let keyable: Vec<bool> = (0..cols.len())
@@ -211,7 +225,7 @@ impl Kept {
 
     /// Whether a row the table's read gives, its places from the node's first, meets a row made
     /// before it.
-    pub(super) fn admits(&self, row: &[Value]) -> bool {
+    pub(in crate::read) fn admits(&self, row: &[Value]) -> bool {
         if !self.nulls_meet && self.at.iter().any(|&i| row[i].is_null()) {
             return false;
         }

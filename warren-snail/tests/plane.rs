@@ -683,7 +683,7 @@ fn a_shape_within_postgresql_s_fuzz_of_a_value_is_found_along_every_order() {
 }
 
 #[test]
-fn a_distance_is_answered_as_a_row_at_a_time_and_a_condition_beside_it_keeps_its_strand() {
+fn a_distance_beside_a_condition_finds_its_nearest_rows_along_its_strand() {
     let path = table_of(
         "plane-distance",
         "point",
@@ -1727,4 +1727,480 @@ fn a_partial_strand_on_the_plane_holds_the_rows_it_admits_and_serves_what_implie
     assert!(s.ask(q, Some("t_v")).is_err());
     let (_, chosen) = s.ask(q, None).unwrap();
     assert_eq!(chosen.order, "t_pkey", "{chosen:?}");
+}
+
+/// The ids of a question's answer, in its order.
+fn in_order(b: &arrow::array::RecordBatch) -> Vec<i64> {
+    if b.num_rows() == 0 {
+        return Vec::new();
+    }
+    let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    (0..a.len()).map(|i| a.value(i)).collect()
+}
+
+/// The row of the grid at a cell, as `grid` lays them out.
+fn grid_id(x: i64, y: i64) -> i64 {
+    let n = 1024i64 * 1024;
+    let j = (x - 1024) * 1024 + (y - 1024);
+    (0..n).find(|&i| (i * 7919) % n == j).unwrap()
+}
+
+#[test]
+fn a_distance_on_the_grid_reads_the_strand_s_nearest_blocks_as_their_pages_say() {
+    let mut s = fresh(&grid("plane-near"));
+    // 20 by 20 cells round the point: the box that holds its five nearest.
+    let boxed = "SELECT id FROM s.t WHERE p <@ box '((1490,1490),(1509,1509))'";
+    let (b, by_box) = s.ask(boxed, Some("t_p")).unwrap();
+    exact(boxed, &by_box);
+    assert_eq!(b.num_rows(), 400);
+    assert_eq!(
+        (by_box.column_pages_read, by_box.directory_pages - by_box.directory_pages_held),
+        (24, 8),
+        "{by_box:?}"
+    );
+    let mut s = fresh(&grid("plane-near-2"));
+    let q = "SELECT id FROM s.t ORDER BY p <-> point '(1500,1500)' LIMIT 5";
+    let (b, near) = s.ask(q, None).unwrap();
+    exact(q, &near);
+    assert_eq!(near.order, "t_p", "{near:?}");
+    assert_eq!(
+        (near.column_pages_read, near.directory_pages - near.directory_pages_held),
+        (6, 8),
+        "{near:?}"
+    );
+    assert_eq!(near.blocks_read, 1, "{near:?}");
+    let mut got = in_order(&b);
+    got.sort();
+    let mut five: Vec<i64> = [(1500, 1500), (1499, 1500), (1501, 1500), (1500, 1499), (1500, 1501)]
+        .iter()
+        .map(|&(x, y)| grid_id(x, y))
+        .collect();
+    five.sort();
+    assert_eq!(got, five);
+    assert_eq!(in_order(&b)[0], grid_id(1500, 1500));
+    // Along the table's own key: every block, and every page.
+    let mut s = fresh(&grid("plane-near-3"));
+    let (b, whole) = s.ask(q, Some("t_pkey")).unwrap();
+    assert_eq!(whole.column_pages_read, 12_288, "{whole:?}");
+    assert_eq!(whole.directory_pages, 197, "{whole:?}");
+    let mut own = in_order(&b);
+    own.sort();
+    assert_eq!(own, five);
+}
+
+/// The ids of a question asked along an order, in its order, its reads exactly what they predicted.
+fn along(s: &mut Snail, q: &str, order: Option<&str>) -> (Vec<i64>, warren_snail::read::Round) {
+    let (b, round) = s.ask(q, order).unwrap_or_else(|e| panic!("{q}: {e}"));
+    exact(q, &round);
+    (in_order(&b), round)
+}
+
+/// A point's distance from a point, past where a NaN and the infinities come.
+fn apart(x: f64, y: f64, qx: f64, qy: f64) -> (u8, f64) {
+    let d = (x - qx).hypot(y - qy);
+    if d.is_nan() {
+        (1, 0.0)
+    } else {
+        (0, d)
+    }
+}
+
+#[test]
+fn a_nan_an_infinity_and_a_null_come_as_an_order_by_sorts_them_at_their_own_ends() {
+    // A grid of 4,096 points, every hundredth NULL, and the first rows past every cell.
+    let special = |i: i64| match i {
+        1 => Some("(NaN,1100)".to_string()),
+        2 => Some("(1100,NaN)".to_string()),
+        3 => Some("(Infinity,1100)".to_string()),
+        4 => Some("(-Infinity,-Infinity)".to_string()),
+        5 => Some("(NaN,Infinity)".to_string()),
+        i if i % 100 == 0 => None,
+        i => Some(format!("({},{})", 1024 + (i * 7919) % 64, 1024 + i % 64)),
+    };
+    let path = table_of("plane-near-ends", "point", GeoKind::Point, &["gist"], 4096, special);
+    let (qx, qy) = (1030.0, 1030.0);
+    let values: Vec<(i64, Option<(f64, f64)>)> = (0..4096)
+        .map(|i| {
+            let xy = special(i).map(|t| {
+                let (x, y) = t[1..t.len() - 1].split_once(',').unwrap();
+                (x.parse::<f64>().unwrap(), y.parse::<f64>().unwrap())
+            });
+            (i, xy)
+        })
+        .collect();
+    let mut sorted: Vec<(u8, (u8, f64), i64)> = values
+        .iter()
+        .map(|&(i, xy)| match xy {
+            Some((x, y)) => (0, apart(x, y, qx, qy), i),
+            None => (1, (0, 0.0), i),
+        })
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let ids = |n: usize| sorted[..n].iter().map(|r| r.2).collect::<Vec<i64>>();
+    let finite = sorted
+        .iter()
+        .filter(|r| r.0 == 0 && r.1 .0 == 0 && r.1 .1.is_finite())
+        .count();
+    let nans = sorted.iter().filter(|r| r.0 == 0 && r.1 .0 == 1).count();
+    let nulls = sorted.iter().filter(|r| r.0 == 1).count();
+    assert_eq!((nans, nulls), (2, 41));
+    for n in [1, 40, finite, finite + 1, finite + 3, finite + 3 + nans, 4096 - nulls + 1, 4096] {
+        let q = format!("SELECT id FROM s.t ORDER BY v <-> point '(1030,1030)', id LIMIT {n}");
+        let mut s = fresh(&path);
+        let (got, round) = along(&mut s, &q, Some("t_gist"));
+        assert_eq!(got, ids(n), "{q}");
+        assert_eq!(round.order, "t_gist");
+    }
+    // Its nearest rows read no block of the NaN, the infinities or the NULLs alone.
+    let mut s = fresh(&path);
+    let q = "SELECT id FROM s.t ORDER BY v <-> point '(1030,1030)', id LIMIT 3";
+    let (got, round) = along(&mut s, q, Some("t_gist"));
+    assert_eq!(got, ids(3));
+    let whole = s
+        .blocks()
+        .unwrap()
+        .iter()
+        .filter(|r| r.order == "t_gist" && r.column == "v.x")
+        .count() as u64;
+    assert!(round.blocks_read < whole, "{round:?}");
+    // A point asked from beyond the finite is left to the table's own read.
+    for value in ["(NaN,1)", "(Infinity,1)"] {
+        let q = format!("SELECT id FROM s.t ORDER BY v <-> point '{value}', id LIMIT 3");
+        let (_, round) = along(&mut fresh(&path), &q, None);
+        assert_eq!(round.order, "t_pkey", "{q}");
+    }
+}
+
+/// Rows of each type, on a coarse grid, a NaN, an infinity and a NULL among them.
+fn shape_of(kind: GeoKind, i: i64) -> Option<String> {
+    if i % 100 == 0 {
+        return None;
+    }
+    let (x, y) = cell(i);
+    Some(match (kind, i) {
+        (GeoKind::Point, 1) => "(NaN,1100)".into(),
+        (GeoKind::Point, 2) => "(Infinity,1100)".into(),
+        (GeoKind::Point, _) => format!("({x},{y})"),
+        (GeoKind::Box, 1) => "((NaN,1100),(1104,1104))".into(),
+        (GeoKind::Box, 2) => "((-Infinity,-Infinity),(Infinity,Infinity))".into(),
+        (GeoKind::Box, _) => format!("(({x},{y}),({},{}))", x + 4, y + 4),
+        (GeoKind::Polygon, 1) => "((NaN,1100),(1104,1104),(1100,1104))".into(),
+        (GeoKind::Polygon, 2) => "((Infinity,1100),(1104,1104),(1100,1104))".into(),
+        (GeoKind::Polygon, _) => format!("(({x},{y}),({},{y}),({},{}))", x + 4, x + 4, y + 4),
+        (GeoKind::Circle, 1) => "<(NaN,1100),4>".into(),
+        (GeoKind::Circle, 2) => "<(1100,1100),Infinity>".into(),
+        (_, _) => format!("<({x},{y}),{}>", 1 + i % 4),
+    })
+}
+
+#[test]
+fn every_type_and_class_with_a_distance_answers_along_its_strand_as_along_the_table_s_key() {
+    for (kind, ty, methods) in [
+        (GeoKind::Point, "point", &["gist", "spgist"][..]),
+        (GeoKind::Box, "box", &["gist", "spgist"][..]),
+        (GeoKind::Polygon, "polygon", &["gist", "spgist"][..]),
+        (GeoKind::Circle, "circle", &["gist"][..]),
+    ] {
+        let path = table_of(&format!("plane-near-{ty}"), ty, kind, methods, 16384, |i| {
+            shape_of(kind, i)
+        });
+        for (value, n) in [
+            ("(1500,1500)", 1),
+            ("(1500,1500)", 7),
+            ("(1502.5,1097.25)", 100),
+            ("(0,0)", 3),
+            ("(3000,3000)", 16_000),
+            ("(1500,1500)", 16_384),
+        ] {
+            let q = format!(
+                "SELECT id FROM s.t ORDER BY v <-> point '{value}', id LIMIT {n}"
+            );
+            let (key, whole) = along(&mut fresh(&path), &q, Some("t_pkey"));
+            assert_eq!(whole.order, "t_pkey");
+            for m in methods {
+                let name = format!("t_{m}");
+                let (got, round) = along(&mut fresh(&path), &q, Some(&name));
+                assert_eq!(got, key, "{q} along {name}");
+                assert_eq!(round.order, name);
+                assert!(round.column_pages_read <= whole.column_pages_read + 16, "{round:?}");
+            }
+            let (chosen, _) = along(&mut fresh(&path), &q, None);
+            assert_eq!(chosen, key, "{q}");
+        }
+        // Written with the point on the left, by an alias and by a place.
+        let by_key = "SELECT id, v <-> point '(1500,1500)' AS d FROM s.t ORDER BY d, id LIMIT 6";
+        let (key, _) = along(&mut fresh(&path), by_key, Some("t_pkey"));
+        let name = format!("t_{}", methods[0]);
+        for q in [
+            "SELECT id FROM s.t ORDER BY point '(1500,1500)' <-> v, id LIMIT 6",
+            "SELECT id, v <-> point '(1500,1500)' AS d FROM s.t ORDER BY d, id LIMIT 6",
+            "SELECT id, v <-> point '(1500,1500)' FROM s.t ORDER BY 2, id LIMIT 6",
+            "SELECT t.id FROM s.t t ORDER BY (t.v <-> point(1500, 1500)), t.id LIMIT 6",
+        ] {
+            let (got, round) = along(&mut fresh(&path), q, None);
+            assert_eq!(got, key, "{q}");
+            assert_eq!(round.order, name, "{q}");
+        }
+    }
+}
+
+#[test]
+fn a_tie_is_read_only_where_the_question_can_mean_it_and_with_ties_keeps_them_all() {
+    // Two points at one distance from the point, straight off each side, in two blocks.
+    let path = table_of("plane-near-ties", "point", GeoKind::Point, &["gist"], 16384, |i| {
+        Some(format!("({},{})", cell(i).0, cell(i).1))
+    });
+    let centre = "(1532,1528)";
+    let plain = format!("SELECT v <-> point '{centre}' FROM s.t ORDER BY v <-> point '{centre}' LIMIT 1");
+    let later = format!("SELECT id FROM s.t ORDER BY v <-> point '{centre}', id LIMIT 1");
+    let (_, first) = along_any(&mut fresh(&path), &plain);
+    let (_, broken) = along(&mut fresh(&path), &later, None);
+    assert_eq!(first.order, "t_gist");
+    // The first row is its own answer where the distance is all it orders by; every row of its
+    // distance is met before the id can choose.
+    assert!(first.blocks_read < broken.blocks_read, "{first:?} {broken:?}");
+    let (key, _) = along(&mut fresh(&path), &later, Some("t_pkey"));
+    let (got, _) = along(&mut fresh(&path), &later, None);
+    assert_eq!(got, key);
+    let fetch = format!(
+        "SELECT id FROM s.t ORDER BY v <-> point '{centre}' FETCH FIRST 1 ROW WITH TIES"
+    );
+    let sorted = |mut v: Vec<i64>| {
+        v.sort();
+        v
+    };
+    let (keyed, _) = along(&mut fresh(&path), &fetch, Some("t_pkey"));
+    let (got, round) = along(&mut fresh(&path), &fetch, None);
+    assert_eq!(round.order, "t_gist");
+    assert!(keyed.len() > 1, "{keyed:?}");
+    assert_eq!(sorted(got), sorted(keyed));
+    // OFFSET counts, and LIMIT 0 reads no column page.
+    let off = format!("SELECT id FROM s.t ORDER BY v <-> point '{centre}', id LIMIT 3 OFFSET 2");
+    let (key, _) = along(&mut fresh(&path), &off, Some("t_pkey"));
+    assert_eq!(along(&mut fresh(&path), &off, None).0, key);
+    let none = format!("SELECT id FROM s.t ORDER BY v <-> point '{centre}' LIMIT 0");
+    let (got, round) = along_any(&mut fresh(&path), &none);
+    assert_eq!((got, round.column_pages_read), (0, 0));
+}
+
+/// The rows of a question's answer and its round, reads exactly what they predicted.
+fn along_any(s: &mut Snail, q: &str) -> (usize, warren_snail::read::Round) {
+    let (b, round) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+    exact(q, &round);
+    (b.num_rows(), round)
+}
+
+#[test]
+fn a_question_with_no_limit_or_as_many_rows_as_the_table_goes_by_pages_and_its_room() {
+    let path = table_of("plane-near-all", "point", GeoKind::Point, &["gist"], 16384, |i| {
+        Some(format!("({},{})", cell(i).0, cell(i).1))
+    });
+    let q = "SELECT id FROM s.t ORDER BY v <-> point '(1500,1500)', id";
+    let (key, whole) = along(&mut fresh(&path), q, None);
+    // A sort that fits costs no page, and the strand reads as many: the table's own.
+    assert_eq!(whole.order, "t_pkey", "{whole:?}");
+    let every = "SELECT id FROM s.t ORDER BY v <-> point '(1500,1500)', id LIMIT 16384";
+    let (got, round) = along(&mut fresh(&path), every, None);
+    assert_eq!((got, round.order.as_str()), (key.clone(), "t_pkey"));
+    // Past its room a sort spills, and the strand reads nothing more and holds a ring of blocks.
+    let dir = tmp("plane-near-all-spill");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = fresh(&path);
+    s.size_rounds(warren_snail::room::Sizes::of(131_072).in_dir(&dir));
+    let (got, round) = along(&mut s, q, None);
+    assert_eq!(got, key);
+    assert_eq!(round.order, "t_gist", "{round:?}");
+    assert_eq!(round.column_pages_read, whole.column_pages_read, "{round:?}");
+    assert_eq!(round.spill_pages_written, round.spill_pages_read, "{round:?}");
+    let mut s = fresh(&path);
+    s.size_rounds(warren_snail::room::Sizes::of(131_072).in_dir(&dir));
+    let (got, by_key) = along(&mut s, q, Some("t_pkey"));
+    assert_eq!(got, key);
+    assert!(by_key.spill_pages_written > round.spill_pages_written, "{by_key:?} {round:?}");
+    // At a room smaller than a block's rows what the walk holds is written, once, and read back once.
+    let mut s = fresh(&path);
+    s.size_rounds(warren_snail::room::Sizes::of(16_384).in_dir(&dir));
+    let (got, tight) = along(&mut s, q, Some("t_gist"));
+    assert_eq!(got, key);
+    assert!(tight.spill_pages_written > 0, "{tight:?}");
+    assert_eq!(tight.spill_pages_written, tight.spill_pages_read, "{tight:?}");
+    // A condition the strand rules blocks out by goes along it, however few rows the box holds.
+    let boxed = "SELECT id FROM s.t WHERE v <@ box '((1490,1490),(1540,1540))' \
+                 ORDER BY v <-> point '(1500,1500)', id";
+    let (key, whole) = along(&mut fresh(&path), boxed, Some("t_pkey"));
+    let (got, round) = along(&mut fresh(&path), boxed, None);
+    assert_eq!(got, key);
+    assert_eq!(round.order, "t_gist");
+    assert!(round.column_pages_read * 4 < whole.column_pages_read, "{round:?} {whole:?}");
+}
+
+#[test]
+fn a_descending_distance_or_its_nulls_first_is_left_to_the_table_s_read() {
+    let path = table_of("plane-near-desc", "point", GeoKind::Point, &["gist"], 4096, |i| {
+        (i % 100 != 0).then(|| format!("({},{})", 1024 + (i * 7919) % 64, 1024 + i % 64))
+    });
+    for q in [
+        "SELECT id FROM s.t ORDER BY v <-> point '(1030,1030)' DESC, id LIMIT 5",
+        "SELECT id FROM s.t ORDER BY v <-> point '(1030,1030)' NULLS FIRST, id LIMIT 5",
+        "SELECT id FROM s.t ORDER BY id, v <-> point '(1030,1030)' LIMIT 5",
+        "SELECT id FROM s.t ORDER BY (v <-> point '(1030,1030)') + 1, id LIMIT 5",
+        "SELECT id FROM s.t ORDER BY v <-> point(id, 0), id LIMIT 5",
+    ] {
+        let (_, round) = along_any(&mut fresh(&path), q);
+        assert_eq!(round.order, "t_pkey", "{q}");
+    }
+    let (b, round) = fresh(&path)
+        .ask(
+            "SELECT id, count(*) FROM s.t GROUP BY id ORDER BY id LIMIT 1",
+            None,
+        )
+        .unwrap();
+    assert_eq!((b.num_rows() as u64, round.rows), (1, 1));
+}
+
+#[test]
+fn a_column_off_the_strand_is_read_after_the_table_kept_to_the_keys_the_walk_found() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id bigint NOT NULL, v point, w bigint, z bigint, PRIMARY KEY (id)); \
+         CREATE INDEX t_v ON s.t USING gist (v); \
+         CREATE INDEX t_vw ON s.t USING gist (v) INCLUDE (w);",
+    )
+    .unwrap();
+    let n = 16384;
+    let path = tmp("plane-near-off.snail");
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![
+                    Values::Int((0..n).map(Some).collect()),
+                    shapes(
+                        GeoKind::Point,
+                        (0..n).map(|i| Some(format!("({},{})", cell(i).0, cell(i).1))),
+                    ),
+                    Values::Int((0..n).map(|i| Some(i * 2)).collect()),
+                    Values::Int((0..n).map(|i| Some(i * 3)).collect()),
+                ],
+            },
+        )],
+    )
+    .unwrap();
+    let keyed = "SELECT id, z FROM s.t ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (key, whole) = along(&mut fresh(&path), keyed, Some("t_pkey"));
+    let (got, round) = along(&mut fresh(&path), keyed, None);
+    assert_eq!(got, key);
+    assert_eq!(round.order, "t_v+t_pkey", "{round:?}");
+    assert_eq!(round.reads.len(), 2, "{round:?}");
+    // Its fifth row ties with seven more: twelve keys, each a block of the table's, four leaves' pages.
+    assert_eq!(whole.column_pages_read, 320, "{whole:?}");
+    assert_eq!(round.reads[0].column_pages_read, 6, "{round:?}");
+    assert_eq!(round.reads[1].blocks_read, 12, "{round:?}");
+    assert_eq!(round.reads[1].column_pages_read, 48, "{round:?}");
+    assert_eq!(round.column_pages_read, 54, "{round:?}");
+    // With the distance all it orders by, five keys are enough.
+    let cut = "SELECT id, z FROM s.t ORDER BY v <-> point '(1500,1500)' LIMIT 5";
+    let (b, round) = fresh(&path).ask(cut, None).unwrap();
+    exact(cut, &round);
+    assert_eq!(b.num_rows(), 5);
+    assert_eq!(round.reads[1].blocks_read, 5, "{round:?}");
+    assert_eq!(round.column_pages_read, 26, "{round:?}");
+    // The answer's own columns are the table's.
+    let (b, _) = fresh(&path).ask(keyed, None).unwrap();
+    let z = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    for (i, id) in key.iter().enumerate() {
+        assert_eq!(z.value(i), id * 3);
+    }
+    // A star reads every column so; INCLUDE holds what it names on the strand alone.
+    let star = "SELECT * FROM s.t ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (b, round) = fresh(&path).ask(star, None).unwrap();
+    exact(star, &round);
+    assert_eq!(in_order(&b), key);
+    assert_eq!(round.order, "t_v+t_pkey", "{round:?}");
+    assert_eq!(b.num_columns(), 4);
+    let included = "SELECT id, w FROM s.t ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (got, round) = along(&mut fresh(&path), included, None);
+    assert_eq!(got, key);
+    assert_eq!(round.order, "t_vw", "{round:?}");
+    // A condition reading a column off every strand leaves it to the table's read; on one, it goes on.
+    let off = "SELECT id FROM s.t WHERE z % 2 = 0 ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (_, round) = along(&mut fresh(&path), off, None);
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+    let on = "SELECT id, z FROM s.t WHERE w % 4 = 0 ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (key, _) = along(&mut fresh(&path), on, Some("t_pkey"));
+    let (got, round) = along(&mut fresh(&path), on, None);
+    assert_eq!(got, key);
+    assert_eq!(round.order, "t_vw+t_pkey", "{round:?}");
+}
+
+#[test]
+fn a_condition_keeps_a_row_from_the_rows_asked_for_and_the_walk_goes_on_past_it() {
+    let path = table_of("plane-near-cond", "point", GeoKind::Point, &["gist"], 16384, |i| {
+        Some(format!("({},{})", cell(i).0, cell(i).1))
+    });
+    for q in [
+        "SELECT id FROM s.t WHERE id % 2 = 0 ORDER BY v <-> point '(1500,1500)', id LIMIT 7",
+        "SELECT id FROM s.t WHERE id % 1000 = 0 ORDER BY v <-> point '(1500,1500)', id LIMIT 7",
+        "SELECT id FROM s.t WHERE v <@ box '((1024,1024),(1100,1100))' \
+         ORDER BY v <-> point '(1500,1500)', id LIMIT 7",
+        "SELECT id FROM s.t WHERE v IS NOT NULL ORDER BY v <-> point '(1500,1500)', id LIMIT 7",
+        "SELECT id FROM s.t WHERE id = 5 ORDER BY v <-> point '(1500,1500)', id LIMIT 7",
+        "SELECT id FROM s.t WHERE id < 0 ORDER BY v <-> point '(1500,1500)', id LIMIT 7",
+    ] {
+        let (key, _) = along(&mut fresh(&path), q, Some("t_pkey"));
+        let (got, round) = along(&mut fresh(&path), q, Some("t_gist"));
+        assert_eq!(got, key, "{q}");
+        assert_eq!(round.order, "t_gist");
+    }
+    // Asked with a parameter for its point or its count, as a statement's binds reach it.
+    let q = "SELECT id FROM s.t ORDER BY v <-> $1, id LIMIT $2";
+    let (b, round) = fresh(&path)
+        .ask_with(q, None, &["(1500,1500)".into(), "5".into()])
+        .unwrap();
+    let plain = "SELECT id FROM s.t ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (key, _) = along(&mut fresh(&path), plain, Some("t_pkey"));
+    assert_eq!(in_order(&b), key);
+    assert_eq!(round.order, "t_gist", "{round:?}");
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_row_written_comes_where_its_distance_puts_it_and_a_page_held_is_read_from_no_file() {
+    let path = table_of("plane-near-writes", "point", GeoKind::Point, &["gist"], 16384, |i| {
+        Some(format!("({},{})", cell(i).0, cell(i).1))
+    });
+    let mut w = Snail::open_writing(&path).unwrap();
+    let q = "SELECT id FROM s.t ORDER BY v <-> point '(1500.5,1500.5)', id LIMIT 3";
+    // Nearer than any, a row in a block whose box it widens.
+    w.execute("INSERT INTO s.t VALUES (100000, '(1500.5,1500.5)')").unwrap();
+    w.execute("UPDATE s.t SET v = '(1500.5,1501.5)' WHERE id = 7").unwrap();
+    let (key, _) = along(&mut fresh(&path), q, Some("t_pkey"));
+    let (got, round) = along(&mut fresh(&path), q, Some("t_gist"));
+    assert_eq!(got, key);
+    assert_eq!(got[0], 100000);
+    assert_eq!(got[1], 7);
+    assert!(round.blocks_read < 32, "{round:?}");
+    w.execute("DELETE FROM s.t WHERE id = 100000").unwrap();
+    let (key, _) = along(&mut fresh(&path), q, Some("t_pkey"));
+    let (got, _) = along(&mut fresh(&path), q, Some("t_gist"));
+    assert_eq!(got, key);
+    assert_eq!(got[0], 7);
+    // A transaction reads its own rows; and what it wrote is gone once it rolls back.
+    w.execute("BEGIN").unwrap();
+    w.execute("INSERT INTO s.t VALUES (100001, '(1500.5,1500.5)')").unwrap();
+    let (b, _) = w.ask(q, Some("t_gist")).unwrap();
+    assert_eq!(in_order(&b)[0], 100001);
+    w.execute("ROLLBACK").unwrap();
+    let (b, _) = w.ask(q, Some("t_gist")).unwrap();
+    assert_eq!(in_order(&b)[0], 7);
+    drop(w);
+    // Asked again on one open snail, its pages are found held.
+    let mut s = Snail::open(&path).unwrap();
+    let (first, round) = along(&mut s, q, Some("t_gist"));
+    assert!(round.column_pages_read > 0, "{round:?}");
+    let (again, round) = along(&mut s, q, Some("t_gist"));
+    assert_eq!(again, first);
+    assert_eq!(round.column_pages_read, 0, "{round:?}");
+    assert_eq!(round.column_pages_held, round.column_pages_predicted, "{round:?}");
 }

@@ -474,6 +474,11 @@ impl Cut {
         })
     }
 
+    /// The rows as they come it reaches: its OFFSET's and its count; none where it has no count.
+    pub(super) fn reached(&self) -> Option<u64> {
+        self.left.map(|n| n.saturating_add(self.skip))
+    }
+
     /// Of `rows` as they come, with the values each sorts by where it keeps ties, those it keeps.
     pub(super) fn take(&mut self, rows: Vec<Vec<Value>>, keys: &[Vec<Value>]) -> Vec<Vec<Value>> {
         let mut out = Vec::new();

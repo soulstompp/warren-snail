@@ -343,6 +343,69 @@ fn circles(op: &str, b: &GeoBox, value: &Geo) -> bool {
     }
 }
 
+/// Where a distance from a point sorts as an ORDER BY sorts it: a number by its class, NaN above
+/// Infinity, then NULL, then nothing at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Near(u8, i64);
+
+impl Near {
+    pub(crate) const NULL: Near = Near(1, 0);
+    pub(crate) const PAST: Near = Near(2, 0);
+
+    pub(crate) fn of(distance: f64) -> Near {
+        Near(0, crate::scalars::float8_key(distance.to_bits()))
+    }
+
+    /// The distance it sorts as; none for NULL.
+    pub(crate) fn distance(self) -> Option<f64> {
+        (self.0 == 0).then(|| crate::places::float8_of_key(self.1))
+    }
+}
+
+/// The least a row of a block whose column's values lie within `span` can come to under `<->` with a
+/// finite point: its distance from the block's box less what `geo_ops.c` rounds and fuzzes on the way.
+/// A block holding only NULLs comes last; one holding a shape with a NaN coordinate, a point or a circle
+/// no nearer than it says of the rest, for such a row's distance is Infinity or NaN, a box or a polygon
+/// at nothing, for a side of such a shape may still be finite.
+pub(crate) fn least_near(column: GeoKind, span: &Span, q: &Point) -> Near {
+    use GeoKind::{Box, Circle, Polygon};
+    if !span.present {
+        return match (span.empty, column) {
+            (false, _) => Near::NULL,
+            (true, Box | Polygon) => Near::of(0.0),
+            (true, _) => Near::of(f64::INFINITY),
+        };
+    }
+    if span.empty && matches!(column, Box | Polygon) {
+        return Near::of(0.0);
+    }
+    let ([lx, ly], [hx, hy]) = (corner(&span.lo), corner(&span.hi));
+    let side = |l: f64, h: f64, v: f64| {
+        if v < l {
+            l - v
+        } else if v > h {
+            v - h
+        } else {
+            0.0
+        }
+    };
+    let (dx, dy) = (side(lx, hx, q.x), side(ly, hy, q.y));
+    let (a, b) = (dx.max(dy), dx.min(dy));
+    let rounded = if b == 0.0 || a < 1024.0 * f64::MIN_POSITIVE {
+        a
+    } else {
+        a.max(a * (1.0 + (b / a) * (b / a)).sqrt() * (1.0 - 8.0 * f64::EPSILON))
+    };
+    let values = [lx, ly, hx, hy, q.x, q.y];
+    let by = match column {
+        Box => margin(&values),
+        Polygon => margin(&values) + (2.0 * ((hx - lx) + (hy - ly)) * EPSILON).sqrt() / 2.0,
+        Circle => 8.0 * f64::EPSILON * values.iter().map(|v| v.abs()).sum::<f64>(),
+        _ => 0.0,
+    };
+    Near::of((rounded - by).max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +644,178 @@ mod tests {
             &plain,
             &point("(1.00000000001,1)")
         ));
+    }
+
+    /// The least a block of a few shapes can come to, against what each of them comes to: a seeded walk
+    /// of shapes near each other and near the fuzz, and of finite points near them.
+    #[test]
+    fn a_block_s_least_distance_never_passes_what_a_row_of_it_comes_to() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let eps = EPSILON;
+        let picks = [
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            1.0 + eps,
+            1.0 - eps,
+            2.0 + 2.0 * eps,
+            3.0 - 3.0 * eps,
+            1.0 + eps / 2.0,
+            1e10,
+            1e10 + 1e-5,
+            -1.0,
+            -2.5,
+            1e-300,
+            0.1,
+            1.0 / 3.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        let finite = |v: &&f64| v.is_finite();
+        let values: Vec<f64> = picks.iter().filter(finite).copied().collect();
+        let kinds = [
+            GeoKind::Point,
+            GeoKind::Box,
+            GeoKind::Polygon,
+            GeoKind::Circle,
+        ];
+        let pick = |next: &mut dyn FnMut() -> u64| picks[(next() % picks.len() as u64) as usize];
+        let shape = |kind: GeoKind, next: &mut dyn FnMut() -> u64| -> Geo {
+            let s = match kind {
+                GeoKind::Point => format!("({},{})", pick(next), pick(next)),
+                GeoKind::Box => format!(
+                    "(({},{}),({},{}))",
+                    pick(next),
+                    pick(next),
+                    pick(next),
+                    pick(next)
+                ),
+                GeoKind::Polygon => format!(
+                    "(({},{}),({},{}),({},{}))",
+                    pick(next),
+                    pick(next),
+                    pick(next),
+                    pick(next),
+                    pick(next),
+                    pick(next)
+                ),
+                _ => format!("<({},{}),{}>", pick(next), pick(next), pick(next).abs()),
+            };
+            geo_in(kind, &s.replace("inf", "Infinity")).unwrap()
+        };
+        let (mut checked, mut apart) = (0u64, 0u64);
+        for _ in 0..200_000 {
+            let kind = kinds[(next() % 4) as usize];
+            let rows: Vec<Geo> = (0..(1 + next() % 4))
+                .map(|_| shape(kind, &mut next))
+                .collect();
+            let mut span = Span {
+                plane: true,
+                ..Span::default()
+            };
+            for r in &rows {
+                match bounds(r) {
+                    Some((l, h)) => span.widen(Some((&l, &h))),
+                    None => span.widen(None),
+                }
+            }
+            let q = Point {
+                x: values[(next() % values.len() as u64) as usize],
+                y: values[(next() % values.len() as u64) as usize],
+            };
+            let least = least_near(kind, &span, &q);
+            apart += u64::from(least > Near::of(1.0));
+            for r in &rows {
+                let Some(Ok(crate::geo::GeoValue::Float(d))) =
+                    crate::geo::geo_binary("<->", r, &Geo::Point(q))
+                else {
+                    continue;
+                };
+                checked += 1;
+                assert!(
+                    least <= Near::of(d),
+                    "{q:?}: {r:?} comes to {d}, the block of {rows:?} to at least {least:?}"
+                );
+            }
+        }
+        assert!(checked > 100_000 && apart > 10_000, "{checked} {apart}");
+    }
+
+    #[test]
+    fn a_distance_sorts_as_an_order_by_sorts_it_and_a_block_is_as_near_as_its_box() {
+        let walk = [
+            Near::of(0.0),
+            Near::of(1.5),
+            Near::of(f64::INFINITY),
+            Near::of(f64::NAN),
+            Near::NULL,
+            Near::PAST,
+        ];
+        assert!(walk.windows(2).all(|w| w[0] < w[1]), "{walk:?}");
+        assert_eq!(Near::of(-0.0), Near::of(0.0));
+        assert_eq!(Near::of(2.5).distance(), Some(2.5));
+        assert_eq!(Near::NULL.distance(), None);
+        let span_of = |lo: &str, hi: &str| {
+            let (l, _) = bounds(&point(lo)).unwrap();
+            let (h, _) = bounds(&point(hi)).unwrap();
+            Span {
+                plane: true,
+                present: true,
+                lo: l,
+                hi: h,
+                ..Span::default()
+            }
+        };
+        let q = |s: &str| {
+            let Geo::Point(p) = point(s) else { unreachable!() };
+            p
+        };
+        let span = span_of("(0,0)", "(10,10)");
+        let near = |k, p: &str| least_near(k, &span, &q(p));
+        // Inside, and straight off a side, exactly, on a point.
+        assert_eq!(near(GeoKind::Point, "(5,5)"), Near::of(0.0));
+        assert_eq!(near(GeoKind::Point, "(13,5)"), Near::of(3.0));
+        assert_eq!(near(GeoKind::Point, "(5,-4)"), Near::of(4.0));
+        // Off a corner, within what a hypotenuse rounds.
+        let corner = near(GeoKind::Point, "(13,14)").distance().unwrap();
+        assert!(corner <= 5.0 && 5.0 - corner < 1e-14, "{corner}");
+        // A box and a polygon by the fuzz, a circle by what it rounds.
+        for k in [GeoKind::Box, GeoKind::Polygon] {
+            let by = near(k, "(13,5)").distance().unwrap();
+            assert!(by < 3.0 && 3.0 - by < 1e-1, "{by}");
+        }
+        let by = near(GeoKind::Circle, "(13,5)").distance().unwrap();
+        assert!(by < 3.0 && 3.0 - by < 1e-12, "{by}");
+        // Nothing held but NULLs, and a NaN alone.
+        let none = Span {
+            plane: true,
+            ..Span::default()
+        };
+        assert_eq!(least_near(GeoKind::Point, &none, &q("(1,1)")), Near::NULL);
+        let nan = Span {
+            plane: true,
+            empty: true,
+            ..Span::default()
+        };
+        let inf = Near::of(f64::INFINITY);
+        assert_eq!(least_near(GeoKind::Point, &nan, &q("(1,1)")), inf);
+        assert_eq!(least_near(GeoKind::Circle, &nan, &q("(1,1)")), inf);
+        assert_eq!(least_near(GeoKind::Box, &nan, &q("(1,1)")), Near::of(0.0));
+        assert_eq!(least_near(GeoKind::Polygon, &nan, &q("(1,1)")), Near::of(0.0));
+        // Beside a NaN a point keeps its box, a box keeps nothing.
+        let mixed = Span {
+            empty: true,
+            ..span_of("(10,0)", "(20,0)")
+        };
+        assert_eq!(least_near(GeoKind::Point, &mixed, &q("(0,0)")), Near::of(10.0));
+        assert_eq!(least_near(GeoKind::Box, &mixed, &q("(0,0)")), Near::of(0.0));
     }
 }

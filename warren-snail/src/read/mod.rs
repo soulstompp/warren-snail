@@ -23,6 +23,7 @@ mod join;
 mod json;
 mod level;
 mod locking;
+mod nearest;
 mod out;
 pub(crate) mod partial;
 mod pipeline;
@@ -1507,6 +1508,19 @@ impl Snail {
                     ));
                 }
                 return self.ask_pipeline(q, params);
+            }
+            // Ordered by a distance from a point: along a strand on the plane, or left to the read below.
+            let priced = match self.ask_nearest(q, order, params)? {
+                nearest::Nearest::Answered(batch, round) => return Ok((batch, round)),
+                nearest::Nearest::Table(touched, held) => Some((touched, held)),
+                nearest::Nearest::Not => None,
+            };
+            if let Some((touched, held)) = priced {
+                let (batch, mut round) = self.ask_pipeline(q, params)?;
+                round.directory_pages += touched;
+                round.directory_pages_held += held;
+                round.directory_pages_predicted += touched;
+                return Ok((batch, round));
             }
             if pipeline::is_pipeline(q)
                 || relations::is_set_operation(q)

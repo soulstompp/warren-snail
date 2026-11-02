@@ -6689,6 +6689,33 @@ impl<'q> StepRun<'q> {
         }))
     }
 
+    /// Sorts the rows it holds and hands on those its LIMIT keeps, every row to come sorting after them.
+    fn sort_so_far(&mut self, params: &[String], release: u8, casings: &Casings) -> Result<()> {
+        let Some(sorter) = self.going.sorter.take() else {
+            return Ok(());
+        };
+        if let (None, Some(l)) = (&self.going.cut, &self.p.limit) {
+            let frame = Frame {
+                columns: self.columns.clone(),
+                params,
+                release,
+                casings,
+                types: &self.p.types,
+                now: self.p.now,
+                subqueries: self.subqueries,
+            };
+            self.going.cut = Some(sorted::Cut::of(l, &frame)?);
+        }
+        let (cut, out) = (&mut self.going.cut, &mut self.partitions_out);
+        sorter.finish(&mut |rows, keys| {
+            out.extend(match cut {
+                Some(c) => c.take(rows, &keys),
+                None => rows,
+            });
+            Ok(())
+        })
+    }
+
     /// The rows a step that groups or sorts returns, once every chunk is read, handed to `each` as
     /// they are made: its columns' names, and the column holding the table's order where they keep it.
     pub(super) fn finish_each(
@@ -7246,6 +7273,96 @@ impl<'q> Stream<'q> {
     pub(super) fn along(&mut self, led: super::strands::Led) {
         if let Some(Some(r)) = self.runs.last_mut() {
             r.along(led);
+        }
+    }
+
+    /// Its question's own step, where it reads the table's rows as they come.
+    fn own_step(&self) -> Option<&StepRun<'q>> {
+        self.runs.last()?.as_ref()
+    }
+
+    /// Whether its question is one SELECT that sorts the table's rows and returns one row for each it
+    /// keeps.
+    pub(super) fn one_row_each(&self) -> bool {
+        self.steps.len() == 1
+            && self.own_step().is_some_and(|r| {
+                let p = &r.p;
+                p.order_by.is_some()
+                    && !p.grouped
+                    && !p.distinct
+                    && !p.whole_windows
+                    && p.calls.sets.is_empty()
+                    && p.calls.windows.is_empty()
+                    && p.calls.aggregates.is_empty()
+            })
+    }
+
+    /// What its question's own step reads an expression by, on the table's columns.
+    fn own_frame(&self) -> Result<Frame<'_>> {
+        let run = self
+            .own_step()
+            .ok_or_else(|| Error::new("the question reads no table"))?;
+        let table = Table {
+            name: self.table.name.clone(),
+            relation: Relation {
+                names: self.table.relation.names.clone(),
+                rows: Vec::new(),
+                order: None,
+            },
+        };
+        let (_, columns) = from(run.p.from, &self.view, &table)?;
+        Ok(Frame {
+            columns,
+            params: &self.params,
+            release: self.release,
+            casings: &self.casings,
+            types: &run.p.types,
+            now: run.p.now,
+            subqueries: run.subqueries,
+        })
+    }
+
+    /// What an expression that reads no column comes to.
+    pub(super) fn constant(&self, e: &Expr) -> Result<Value> {
+        eval(e, &[], &self.own_frame()?, &computed_none())
+    }
+
+    /// The rows its LIMIT and OFFSET can reach, where they say; and whether it keeps the ties of its last.
+    pub(super) fn rows_reached(&self) -> Result<(Option<u64>, bool)> {
+        let frame = self.own_frame()?;
+        match self.own_step().and_then(|r| r.p.limit.as_ref()) {
+            Some(l) => Ok((sorted::Cut::of(l, &frame)?.reached(), l.ties)),
+            None => Ok((None, false)),
+        }
+    }
+
+    /// Of rows of the table, those its question's WHERE keeps, each with what `e` comes to on it.
+    pub(super) fn kept_with(
+        &self,
+        rows: Vec<Vec<Value>>,
+        e: &Expr,
+    ) -> Result<Vec<(Value, Vec<Value>)>> {
+        let frame = self.own_frame()?;
+        let none = computed_none();
+        let selection = self.own_step().and_then(|r| r.p.selection);
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(w) = selection {
+                if truth(&eval(w, &row, &frame, &none)?)? != Some(true) {
+                    continue;
+                }
+            }
+            out.push((eval(e, &row, &frame, &none)?, row));
+        }
+        Ok(out)
+    }
+
+    /// Sorts what it holds and hands that on: every row to come sorts after it.
+    pub(super) fn sort_so_far(&mut self) -> Result<()> {
+        let (params, release, casings) = (&self.params, self.release, &self.casings);
+        match self.runs.last_mut() {
+            Some(Some(run)) => run.sort_so_far(params, release, casings),
+            _ => Ok(()),
         }
     }
 
