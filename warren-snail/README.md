@@ -194,8 +194,10 @@ an operator finds its rows' keys there and the rows by them on the table's order
 the fewest pages, and one element's count comes from its counts. A BRIN index, on any of its operator
 classes, stores no order of its own: each block of the table's order, and each directory entry above
 the blocks, keeps a summary of the key, its least and greatest, its span, its runs of values, or its
-bloom filter, and a block no value of which can hold the question's condition is never read. A partial
-index, its `WHERE` comparing its columns with values,
+bloom filter, and a block no value of which can hold the question's condition is never read. A
+condition on a box column is read alike on any table: a block is ruled out by what it keeps of the
+column, a strand's bounding box or the least and greatest of the box's corners every block keeps. A
+partial index, its `WHERE` comparing its columns with values,
 holds only the rows it names, and serves a question whose conditions imply its own. A question that
 reads a column no order holds in the question's own order still reads along the table's order.
 Cluster each table on the index most of its questions lead with: a key handed out as rows arrive,

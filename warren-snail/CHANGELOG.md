@@ -51,6 +51,8 @@ at once, and a snail written inside a host that decides its commits.
   entry and each entry above the blocks keeping the operator class's summary (its least and greatest,
   a span, runs of values, or a bloom filter of a power of two of bits), a block ruled out of a
   condition no value it sums can hold. `pages_per_range` and `autosummarize` are read and do nothing.
+  A condition on a box column is read alike on any table, a block ruled out by its strand's bounding
+  box or by the least and greatest of the box's corners every block keeps.
 - The questions: any number of tables, by `JOIN`, commas, `CROSS JOIN`, `LEFT`, `RIGHT` and `FULL
   JOIN`, met by `=`, `<>`, `<`, `<=`, `>` or `>=`; the conditions `<>`, `BETWEEN`, `IS [NOT] NULL`,
   answered from the NULLs counted, and the truth tests; `LIKE`, `ILIKE`, `SIMILAR TO` and `~`, a
