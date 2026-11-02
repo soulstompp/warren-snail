@@ -46,7 +46,8 @@ at once, and a snail written inside a host that decides its commits.
 - The indexes: hash, and GiST and SP-GiST on a range, a multirange, an `inet`, text, a point, a box, a
   polygon or a circle, each an order the counts read; a partial index, read where a question implies
   its `WHERE`; GIN on an array, a `jsonb` or a `tsvector`, and GiST on a `tsvector` or a `tsquery`,
-  each a strand of the elements its rows hold.
+  each a strand of the elements its rows hold, read for every operator of their classes and under an
+  `OR`; a GiST index with such a key beside a key of another kind, a strand of each.
 - BRIN, on all 72 of PostgreSQL 19's operator classes: no order of its own, each block's directory
   entry and each entry above the blocks keeping the operator class's summary (its least and greatest,
   a span, runs of values, or a bloom filter of a power of two of bits), a block ruled out of a

@@ -1456,7 +1456,7 @@ fn a_jsonb_s_operators_are_read_on_its_column_with_no_strand_to_ask() {
     assert_eq!(ans.is_empty(), false);
     let (ans, _) = ids(&mut s, "SELECT id FROM s.t WHERE v @@ 'w1'", None);
     assert_eq!(ans.len(), (0..1024).filter(|i| i % 7 == 1).count());
-    // Under OR and NOT, the question path reading neither, each row is held to it.
+    // Under OR and NOT, each row is held to it.
     let (b, _) = s
         .ask("SELECT id FROM s.t WHERE v @@ 'w1' OR j ? 'z'", None)
         .unwrap();
@@ -1747,6 +1747,7 @@ fn a_path_s_equalities_read_its_strand_under_either_operator_class() {
         ),
         ("j @@ '$.c.* == \"v5\"'", [("t_o", 27), ("t_pkey", 160)]),
         ("j @@ '$.c.e == null'", [("t_p", 20), ("t_pkey", 160)]),
+        ("j @? '$ ? (@.b == 100)'", [("t_p", 3), ("t_pkey", 49)]),
     ] {
         let q = format!("SELECT id FROM s.t WHERE {w}");
         let (_, round) = ids(&mut s, &q, None);
@@ -1764,6 +1765,16 @@ fn a_path_s_equalities_read_its_strand_under_either_operator_class() {
 fn a_path_nothing_can_be_asked_from_reads_the_table_s_order() {
     let n = 20480;
     let mut s = snail_of("gin-paths-none", PATHS, n, path_row);
+    // A jsonb has no `@@` with its path on its left, nor `@?` either way round.
+    for w in [
+        "'$.b == 100' @@ j",
+        "'$.b == 100' @? j",
+        "j @? 1",
+        "j @@ '$.b ++'",
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        assert!(s.ask(&q, None).is_err(), "{q}");
+    }
     let (_, whole) = ids(&mut s, "SELECT id FROM s.t WHERE j @? '$'", Some("t_pkey"));
     let cases = [
         "j @? '$.a'",
@@ -2171,6 +2182,10 @@ fn an_or_over_a_strand_s_operators_reads_it_where_its_pages_are_fewer() {
         (
             "a @> '{2005}' OR v @@ 'z70'",
             vec![("t_a", 3), ("t_v", 3), ("t_pkey", 16)],
+        ),
+        (
+            "(a @> '{2005}' AND v @@ 'w3') OR v @@ 'z70'",
+            vec![("t_a", 3), ("t_v", 11), ("t_pkey", 16)],
         ),
         (
             "(a @> '{2005}' OR a @> '{2006}') AND n > 3",
@@ -2799,6 +2814,17 @@ fn a_gist_index_beside_another_kind_reads_each_key_where_it_serves() {
         .price("SELECT id FROM s.t WHERE r && '[5000,5040)'", None)
         .unwrap();
     assert_eq!(price.order, "t_vr", "{price:?}");
+    // A count beside what its order cannot read: no element's counts close it.
+    let (c, round) = count(
+        &mut s,
+        "SELECT count(*) FROM s.t WHERE r && '[5000,5040)' AND n = 3",
+        None,
+    );
+    assert_eq!(
+        c as usize,
+        kept(&|i| span(i, 5000, 5040) && i % 10 == 3).len()
+    );
+    assert!(round.order.contains("t_vr"), "{round:?}");
     // Each order and strand holds its rows: the range's non-NULL and NULL rows, a word a row.
     let rows = s.blocks().unwrap();
     assert_eq!(
@@ -2889,6 +2915,8 @@ mod beside_writers {
         assert_eq!(got, [9000, 9001]);
         s.execute("COMMIT").unwrap();
         s.census().unwrap();
+        // `@@` and a prefix `@` written apart are refused in a statement too, `@@@` not.
+        assert!(s.execute("DELETE FROM s.t WHERE v @@ @ 'w4'").is_err());
         // Writers beside `@@@`.
         let d = s
             .execute("DELETE FROM s.t WHERE v @@@ 'w4' AND id >= 9000")
@@ -2974,6 +3002,11 @@ fn an_or_reads_an_arm_an_order_answers_as_postgresql_s_bitmap_or_would() {
     assert_eq!(got, kept(&|i| z(i, 5) || r(i, 15000, 15040)));
     assert!(round.order.starts_with("t_vr+"), "{round:?}");
     assert!(s.ask(q, Some("t_a")).is_err());
+    // Named the strand of one arm, an arm of an order's asks what is not it: the table's order.
+    let q = "SELECT id FROM s.t WHERE a @> '{2005}' OR id < 50";
+    let (got, round) = ids(&mut s, q, Some("t_a"));
+    assert_eq!(got, kept(&|i| z(i, 5) || i < 50));
+    assert_eq!(round.order, "t_pkey", "{round:?}");
     // An arm no order narrows asks nothing: the table's order is read, each row held to the OR.
     let q = "SELECT id FROM s.t WHERE a @> '{2005}' OR m > 5";
     let (got, round) = ids(&mut s, q, None);
@@ -2992,4 +3025,204 @@ fn an_or_reads_an_arm_an_order_answers_as_postgresql_s_bitmap_or_would() {
         .price("SELECT id FROM s.t WHERE a @> '{2005}' OR id < 50", None)
         .unwrap();
     assert_eq!(price.order, "t_a+t_pkey", "{price:?}");
+}
+
+#[test]
+fn an_or_is_held_to_each_row_of_a_block_its_first_column_holds_nothing_of() {
+    let n = 8192;
+    // A block's worth and more with no array: the OR's first column all NULL there.
+    let mut s = snail_of("gin-or-nulls", OVER, n, |i| {
+        let mut r = over_row(i);
+        if i < 4096 {
+            r[1] = None;
+        }
+        r
+    });
+    let q = "SELECT id FROM s.t WHERE a @> '{150}' OR n = 3";
+    let want: Vec<i32> = (0..n)
+        .filter(|&i| {
+            (i >= 4096 && i % 50 != 0 && i % 997 + 100 == 150) || (i % 11 != 0 && i % 10 == 3)
+        })
+        .map(|i| i as i32)
+        .collect();
+    let (got, _) = ids(&mut s, q, None);
+    assert_eq!(got, want);
+    let (got, _) = ids(&mut s, q, Some("t_pkey"));
+    assert_eq!(got, want);
+    // Named a strand on a column only beside the first, what it cannot answer reads the table's order.
+    let q = "SELECT id FROM s.t WHERE a IS NULL OR v @@ '!word60'";
+    let (got, round) = ids(&mut s, q, Some("t_v"));
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+    let (want, _) = ids(&mut s, q, Some("t_pkey"));
+    assert_eq!(got, want);
+    assert_eq!(
+        want.len(),
+        (0..n)
+            .filter(|&i| i < 4096 || i % 50 == 0 || rare_v(i, 60) == Some(false))
+            .count()
+    );
+}
+
+#[test]
+fn an_or_on_a_table_an_outer_join_leaves_null_keeps_the_rows_it_leaves() {
+    let ddl = format!("{OVER} CREATE TABLE s.u (id int NOT NULL, x bigint, PRIMARY KEY (id));");
+    let catalog = Catalog::parse(&ddl).unwrap();
+    let n = 2048i64;
+    let t = catalog.table("s.t").unwrap();
+    // `s.t` holds the even ids of `s.u`, so a LEFT JOIN from `s.u` leaves the odd ones NULL.
+    let mut columns: Vec<Values> = t.columns.iter().map(|c| Values::new(c.ty)).collect();
+    for i in (0..n).step_by(2) {
+        for ((v, c), x) in columns.iter_mut().zip(&t.columns).zip(&over_row(i)) {
+            match (v, c.ty, x) {
+                (Values::Int(a), _, x) => a.push(x.as_ref().map(|s| s.parse().unwrap())),
+                (Values::Composed(a), ty, x) => a.push(composed(ty, x.as_deref())),
+                (v, ColumnType::Textual(t), Some(x)) => push_datum(
+                    v,
+                    &Datum::Text(warren_snail::textual::text_in(t, x).unwrap()),
+                ),
+                (v, _, _) => v.push_null(),
+            }
+        }
+    }
+    let path = tmp("gin-or-outer.snail");
+    write(
+        &path,
+        &catalog,
+        &[
+            ("s.t".into(), Rows { columns }),
+            (
+                "s.u".into(),
+                Rows {
+                    columns: vec![
+                        Values::Int((0..n).map(Some).collect()),
+                        Values::Int((0..n).map(Some).collect()),
+                    ],
+                },
+            ),
+        ],
+    )
+    .unwrap();
+    let mut s = fresh(&path);
+    let q = "SELECT u.id FROM s.u u LEFT JOIN s.t x ON u.id = x.id \
+             WHERE x.a @> '{150}' OR x.id IS NULL";
+    // Refused, or the rows PostgreSQL gives: never those of an inner join.
+    if let Ok((b, _)) = s.ask(q, None) {
+        let want = (0..n)
+            .filter(|&i| i % 2 == 1 || (i % 50 != 0 && i % 997 + 100 == 150))
+            .count();
+        assert_eq!(b.num_rows(), want);
+    }
+}
+
+#[test]
+fn a_condition_on_the_table_s_own_order_is_read_with_it_not_before_it() {
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], r int4range, pad bigint); \
+               CREATE INDEX t_r ON s.t USING gist (r); \
+               ALTER TABLE s.t CLUSTER ON t_r; \
+               CREATE INDEX t_a ON s.t USING gin (a);";
+    let n = 8192;
+    let mut s = snail_of("gin-on-order", ddl, n, |i| {
+        vec![
+            Some(i.to_string()),
+            Some(format!("{{{},{}}}", i % 7, 2000 + i / 256)),
+            Some(format!("[{i},{})", i + 3)),
+            Some(i.to_string()),
+        ]
+    });
+    let q = "SELECT id FROM s.t WHERE a @> '{2005}' AND r && '[1200,1500)'";
+    let (got, round) = ids(&mut s, q, None);
+    let want: Vec<i32> = (0..n)
+        .filter(|&i| i / 256 == 5 && i < 1500 && i + 3 > 1200)
+        .map(|i| i as i32)
+        .collect();
+    assert_eq!(got.len(), want.len());
+    assert!(
+        round.reads.iter().filter(|r| r.order == "t_r").count() <= 1,
+        "{round:?}"
+    );
+}
+
+#[test]
+fn an_or_reads_a_partial_strand_where_what_stands_beside_its_arm_implies_its_predicate() {
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], p int[], n int, PRIMARY KEY (id)); \
+               CREATE INDEX t_a ON s.t USING gin (a); \
+               CREATE INDEX t_p ON s.t USING gin (p) WHERE n > 5;";
+    let n = 20480;
+    let mut s = snail_of("gin-or-partial", ddl, n, |i| {
+        let z = 2000 + i / 256;
+        vec![
+            Some(i.to_string()),
+            Some(format!("{{{z}}}")),
+            Some(format!("{{{z}}}")),
+            Some((i % 10).to_string()),
+        ]
+    });
+    let z = |i: i64, k: i64| i / 256 == k;
+    let q = "SELECT id FROM s.t WHERE (p @> '{2005}' AND n > 6) OR a @> '{2070}'";
+    let (got, round) = ids(&mut s, q, None);
+    let want: Vec<i32> = (0..n)
+        .filter(|&i| (z(i, 5) && i % 10 > 6) || z(i, 70))
+        .map(|i| i as i32)
+        .collect();
+    assert_eq!(got, want);
+    assert!(
+        round.order.contains("t_p") && round.order.contains("t_a"),
+        "{round:?}"
+    );
+    // Beside nothing that implies it, the strand is not asked, and every row may hold the arm.
+    let q = "SELECT id FROM s.t WHERE p @> '{2005}' OR a @> '{2070}'";
+    let (got, round) = ids(&mut s, q, None);
+    let want: Vec<i32> = (0..n)
+        .filter(|&i| z(i, 5) || z(i, 70))
+        .map(|i| i as i32)
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+    let q = "SELECT id FROM s.t WHERE (p @> '{2005}' AND n > 4) OR a @> '{2070}'";
+    let (got, round) = ids(&mut s, q, None);
+    let want: Vec<i32> = (0..n)
+        .filter(|&i| (z(i, 5) && i % 10 > 4) || z(i, 70))
+        .map(|i| i as i32)
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(round.order, "t_pkey", "{round:?}");
+}
+
+#[test]
+fn an_or_and_a_not_over_a_strand_s_spans_are_read_with_no_element_key_on_the_table() {
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, r int4range, n int, PRIMARY KEY (id)); \
+               CREATE INDEX t_r ON s.t USING gist (r);";
+    let n = 8192;
+    let mut s = snail_of("gin-spans", ddl, n, |i| {
+        vec![
+            Some(i.to_string()),
+            (i % 13 != 0).then(|| format!("[{i},{})", i + 3)),
+            Some((i % 10).to_string()),
+        ]
+    });
+    let r = |i: i64, lo: i64, hi: i64| i % 13 != 0 && i < hi && i + 3 > lo;
+    let kept = |f: &dyn Fn(i64) -> bool| -> Vec<i32> {
+        (0..n).filter(|&i| f(i)).map(|i| i as i32).collect()
+    };
+    let (got, _) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE r && '[100,110)' OR r && '[5000,5010)'",
+        None,
+    );
+    assert_eq!(got, kept(&|i| r(i, 100, 110) || r(i, 5000, 5010)));
+    let (got, _) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE r && '[100,110)' OR id = 5",
+        None,
+    );
+    assert_eq!(got, kept(&|i| r(i, 100, 110) || i == 5));
+    let (got, _) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE NOT r && '[100,8000)' AND n = 3",
+        None,
+    );
+    assert_eq!(
+        got,
+        kept(&|i| i % 13 != 0 && !r(i, 100, 8000) && i % 10 == 3)
+    );
 }

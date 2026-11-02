@@ -529,6 +529,9 @@ pub fn exclusion_operator(method: Method, opclass: &str, ty: ColumnType, op: &st
     } else {
         bare_name(ty)
     };
+    if op == "@@" && matches!(opclass, "tsvector_ops" | "tsquery_ops") {
+        return Err(Error::new(format!("operator does not exist: {t} @@ {t}")));
+    }
     if !["=", "<>", "&&", "-|-", "~="].contains(&op) {
         return Err(Error::new(format!(
             "operator {op}({t},{t}) is not commutative"

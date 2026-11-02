@@ -191,7 +191,10 @@ keeping the bounding box of the shapes it holds, so that a box reads the blocks 
 others. A GIN index on an array, a `jsonb` or a `tsvector`, and a GiST index on a `tsvector` or a
 `tsquery`, is a strand of what each row holds, an element and the row's key, on the element's order:
 an operator finds its rows' keys there and the rows by them on the table's order, where that reads
-the fewest pages, and one element's count comes from its counts. A BRIN index, on any of its operator
+the fewest pages, and one element's count comes from its counts. Every operator of those classes
+reads so: a jsonpath's `@?` and `@@` by what must hold of a row it passes, a tsquery's `|`, `&`, `!`
+and `<->`, an `OR` over them, `NOT` being held to each row. A GiST index with such a key beside a key
+of another kind holds a strand of each. A BRIN index, on any of its operator
 classes, stores no order of its own: each block of the table's order, and each directory entry above
 the blocks, keeps a summary of the key, its least and greatest, its span, its runs of values, or its
 bloom filter, and a block no value of which can hold the question's condition is never read. A

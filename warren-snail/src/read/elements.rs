@@ -604,7 +604,7 @@ fn array_written(e: &Expr) -> bool {
 }
 
 /// Whether a WHERE on one table names a column whose operators `element_cond` reads: where the question
-/// path reads the WHERE no other way, as under OR or NOT, a pipeline holds each row to it.
+/// path reads the WHERE no other way, as where two columns meet, a pipeline holds each row to it.
 pub(super) fn read_a_row_at_a_time(catalog: &Catalog, q: &sqlparser::ast::Query) -> bool {
     fn names(e: &Expr, of: &[&str]) -> bool {
         match e {
@@ -1036,6 +1036,7 @@ impl Snail {
         want: &Want,
         o: &OpCond,
         named: Option<&str>,
+        beside: &Side,
         probes: &mut Vec<Probe>,
     ) -> Result<Option<(Vec<Ask>, Asking, String)>> {
         let (table, side) = (want.table, want.side);
@@ -1087,7 +1088,7 @@ impl Snail {
             }
             if let Some(p) = &key.predicate {
                 let p = super::partial::Predicate::read(&self.catalog, table, p)?;
-                if !p.implied_by(side) {
+                if !p.implied_by(beside) {
                     continue;
                 }
             }
@@ -1155,12 +1156,14 @@ impl Snail {
     }
 
     /// What a part of an OR or a NOT asks of the strands, and the indexes it reads: none where it may
-    /// pass a row that holds nothing a strand could find.
+    /// pass a row that holds nothing a strand could find. `beside` holds the conditions that stand
+    /// with it, for a partial strand's predicate.
     fn arm_ask(
         &self,
         want: &Want,
         arm: &Arm,
         named: Option<&str>,
+        beside: &Side,
         probes: &mut Vec<Probe>,
     ) -> Result<Option<(Ask, Vec<String>)>> {
         let mut index = Vec::new();
@@ -1169,19 +1172,31 @@ impl Snail {
             Arm::Held => return Ok(None),
             Arm::Read(own) => return self.read_ask(want, own, named, probes),
             Arm::Op(o) => {
-                return Ok(self.best_ask(want, o, named, probes)?.map(|(mut v, _, i)| {
-                    let ask = match v.len() {
-                        1 => v.remove(0),
-                        _ => Ask::All(v),
-                    };
-                    (ask, vec![i])
-                }))
+                return Ok(self
+                    .best_ask(want, o, named, beside, probes)?
+                    .map(|(mut v, _, i)| {
+                        let ask = match v.len() {
+                            1 => v.remove(0),
+                            _ => Ask::All(v),
+                        };
+                        (ask, vec![i])
+                    }))
             }
             Arm::All(v) => (v, false),
             Arm::Any(v) => (v, true),
         };
+        let mut with = beside.clone();
+        if !every {
+            for part in parts {
+                if let Arm::Read(own) = part {
+                    with.conds.extend(own.conds.iter().cloned());
+                    with.texts.extend(own.texts.iter().cloned());
+                    with.nulls.extend(own.nulls.iter().copied());
+                }
+            }
+        }
         for part in parts {
-            match self.arm_ask(want, part, named, probes)? {
+            match self.arm_ask(want, part, named, &with, probes)? {
                 Some((a, i)) => {
                     asks.push(a);
                     index.extend(i);
@@ -1225,13 +1240,13 @@ impl Snail {
         let mut children: Vec<(Ask, Asking, String, Option<&OpCond>)> = Vec::new();
         for o in side.ops.iter().filter(|_| keyed && !side.empty) {
             if let Some(arm) = &o.arms {
-                if let Some((ask, index)) = self.arm_ask(want, arm, named, &mut probes)? {
+                if let Some((ask, index)) = self.arm_ask(want, arm, named, side, &mut probes)? {
                     let x = self.asking(&ask, &probes)?;
                     children.push((ask, x, index.join("+"), None));
                 }
                 continue;
             }
-            if let Some((asks, asking, index)) = self.best_ask(want, o, named, &mut probes)? {
+            if let Some((asks, asking, index)) = self.best_ask(want, o, named, side, &mut probes)? {
                 if asks.len() == 1 {
                     children.push((asks.into_iter().next().unwrap(), asking, index, Some(o)));
                 } else {
@@ -1276,8 +1291,10 @@ impl Snail {
             None => Some(self.part(want, None)?),
         };
         // A count an element's counts close, its strand's pages fewest.
-        if let ([(Ask::One(p), _, index, Some(o))], Some(Countable::Total)) =
-            (children.as_slice(), want.countable)
+        if let (
+            [(Ask::One(p), _, index, Some(o @ OpCond { value: Some(_), .. }))],
+            Some(Countable::Total),
+        ) = (children.as_slice(), want.countable)
         {
             let lone = side.ops.len() == 1
                 && side.conds.is_empty()
