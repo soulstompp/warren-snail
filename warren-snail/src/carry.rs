@@ -98,6 +98,9 @@ pub trait Monitor {
 
     /// A commit cut the block `from`, or laid it out afresh: what `to` holds lay in it.
     fn cut(&self, table: &str, order: &str, from: u64, to: u64) -> Result<()>;
+
+    /// A commit let the block go, holding no row: what lands in its gaps lands in another of the order.
+    fn let_go(&self, table: &str, order: &str, block: u64) -> Result<()>;
 }
 
 /// The root a round takes from the snail at `path` as `judge` decides, its page as it lies in the

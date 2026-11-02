@@ -1415,12 +1415,15 @@ fn a_statement_that_waited_for_a_commit_that_doomed_it_is_refused_as_concurrent_
         let mut b = open(&q);
         b.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
         set(&mut b, A, -2).unwrap();
-        tx.send(set(&mut b, B, -3).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        tx.send(set(&mut b, B, -3).map(|_| ()).map_err(|e| e.to_string()))
+            .unwrap();
     });
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     run(&mut a, "COMMIT");
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap_err(),
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap_err(),
         "could not serialize access due to concurrent update"
     );
     t.join().unwrap();
@@ -1448,9 +1451,7 @@ fn skew_read_by(name: &str, reading: fn(&mut Snail, i32)) {
 fn a_join_s_reads_are_marked() {
     skew_read_by("join", |s, x| {
         s.ask(
-            &format!(
-                "SELECT count(*) FROM s.t p JOIN s.t q ON p.id = q.id WHERE p.id = {x}"
-            ),
+            &format!("SELECT count(*) FROM s.t p JOIN s.t q ON p.id = q.id WHERE p.id = {x}"),
             None,
         )
         .unwrap();
@@ -1619,20 +1620,31 @@ fn a_block_a_prune_lets_go_leaves_its_mark_on_the_order() {
     let path = made("gone");
     let (mut a, mut w) = (open(&path), open(&path));
     let row = 16_000;
+    run(
+        &mut w,
+        "CREATE TABLE s.o (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&mut w, "INSERT INTO s.o (id, v) VALUES (1, 1)");
     run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     assert_eq!(read(&mut a, row), i64::from(row));
     // Outside the level, every row of the first block goes, and the block with them.
     let mut x = open(&path);
     run(&mut x, "DELETE FROM s.t WHERE id < 16384");
-    let answered = x.ask("SELECT count(*) FROM s.t t", None);
-    assert!(answered.is_ok());
-    let left = blocks_of(&path);
-    assert_eq!(left.iter().sum::<u64>(), 1024, "{left:?}");
+    x.ask("SELECT sum(t.v) FROM s.t t", None).unwrap();
+    assert_eq!(
+        blocks_of(&path),
+        [1024],
+        "the read pruned the first block away"
+    );
     // A row written where the first block's rows lay lies in the block that remains.
     run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");
-    read(&mut w, B);
-    run(&mut w, &format!("INSERT INTO s.t (id, v) VALUES ({row}, 1)"));
-    set(&mut a, B, -2).unwrap();
+    w.ask("SELECT sum(o.v) FROM s.o o WHERE o.id = 1", None)
+        .unwrap();
+    run(
+        &mut w,
+        &format!("INSERT INTO s.t (id, v) VALUES ({row}, 1)"),
+    );
+    run(&mut a, "UPDATE s.o SET v = -2 WHERE id = 1");
     run(&mut w, "COMMIT");
     assert_eq!(
         reason(&a.execute("COMMIT").unwrap_err()),

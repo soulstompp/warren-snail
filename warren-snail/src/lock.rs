@@ -528,17 +528,6 @@ pub(crate) fn serials(file: &File) -> Result<Vec<(u64, u64)>> {
     Ok(out)
 }
 
-/// Waits until the serializable transaction `id` in another file's `slot` has ended, as long as it
-/// takes, holding no lock.
-pub(crate) fn wait_serial_end(file: &File, slot: u64, id: u64) -> Result<()> {
-    let mut nap = std::time::Duration::from_millis(1);
-    while held_at(file, SERIAL_OF + (slot << 40) + id, 1)?.is_some() {
-        std::thread::sleep(nap);
-        nap = (nap * 2).min(std::time::Duration::from_millis(50));
-    }
-    Ok(())
-}
-
 /// Marks the snapshot of the transaction in `slot`, or lets it go.
 pub(crate) fn mark_snapshot(file: &File, slot: u64, generation: u64, on: bool) -> Result<()> {
     mark(file, SERIAL_SNAPSHOT + (slot << 40) + generation, on)

@@ -589,6 +589,11 @@ impl carry::Monitor for Told {
         self.0.borrow_mut().push(format!("cut {table} {order}"));
         Ok(())
     }
+
+    fn let_go(&self, table: &str, order: &str, _block: u64) -> warren_snail::Result<()> {
+        self.0.borrow_mut().push(format!("let go {table} {order}"));
+        Ok(())
+    }
 }
 
 const COUNTED: &str =
@@ -640,6 +645,19 @@ fn a_host_s_monitor_is_told_of_each_block_and_the_file_keeps_no_marks() {
             .serial_records_kept()
             .unwrap(),
         0
+    );
+    // A block that holds no row once its dead rows go is let go.
+    let (mut w, _) = hosted(&path, 9, &said);
+    w.execute("DELETE FROM s.t WHERE id < 1024").unwrap();
+    drop(w);
+    said.committed(9);
+    let (mut w, _) = hosted(&path, 10, &said);
+    w.monitored_by(Rc::new(Told(told.clone())));
+    told.borrow_mut().clear();
+    w.ask("SELECT sum(t.v) FROM s.t t", None).unwrap();
+    assert!(
+        told.borrow().iter().any(|t| t == "let go s.t t_pkey"),
+        "{told:?}"
     );
 }
 

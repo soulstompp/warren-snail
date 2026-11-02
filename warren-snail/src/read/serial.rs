@@ -306,11 +306,18 @@ impl Snail {
                 *self.serial.borrow_mut() = Some(serial);
                 return Ok(());
             }
+            // It waits as long as it takes, holding no lock, until each beside it has ended or one has
+            // shown the snapshot unsafe.
             if deferrable {
-                for &(slot, other) in &serial.possible {
-                    lock::wait_serial_end(&file, slot, other)?;
+                let mut nap = std::time::Duration::from_millis(1);
+                loop {
+                    self.settle_read_only(&file, &mut serial)?;
+                    if serial.not_safe || !serial.active {
+                        break;
+                    }
+                    std::thread::sleep(nap);
+                    nap = (nap * 2).min(std::time::Duration::from_millis(50));
                 }
-                self.settle_read_only(&file, &mut serial)?;
                 if serial.not_safe {
                     self.release_marks(&file, &mut serial)?;
                     continue;
@@ -750,8 +757,8 @@ impl Snail {
         if s.wrote.insert(order_byte) {
             lock::mark_held(file, self.slot, order_byte, true)?;
         }
-        let mut tests: BTreeSet<u64> = BTreeSet::new();
-        tests.insert(order_byte);
+        // What lands anywhere in the order lands in the gaps of a block a commit let go.
+        let mut tests: BTreeSet<u64> = v.with_parents(order_byte).into_iter().collect();
         for &b in blocks {
             s.wrote.insert(b);
             tests.extend(v.with_parents(b));
@@ -976,6 +983,9 @@ impl Snail {
             let o = &t.orders[*oi];
             for b in blocks {
                 let from = lock::block_byte_of(*ti, *oi, b.first_key());
+                if b.staged_entries().is_empty() {
+                    m.let_go(&t.name, &o.name, from)?;
+                }
                 for e in b.staged_entries() {
                     let to = lock::block_byte_of(*ti, *oi, &e.first);
                     if to != from {
