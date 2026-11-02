@@ -568,7 +568,9 @@ fn the_command_reads_a_handed_round_as_its_host_does() {
     ] {
         let snail = fresh(&path);
         let mut a = begin_together(&[&snail], sql, Sizes::of(room)).unwrap();
-        assert_eq!(drained(&mut a).0.len(), rows);
+        let (answer, batches, _) = drained(&mut a);
+        assert_eq!(answer.len(), rows);
+        assert!(batches > 2, "{name}: {batches}");
         let host = a.round();
         assert!(host.spill_pages_written > 0, "{name}");
         let bytes = room.to_string();
