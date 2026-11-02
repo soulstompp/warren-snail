@@ -1565,7 +1565,7 @@ pub(crate) fn bound_slots(table: &Table, order: &Order, format: u32) -> Vec<u32>
     order
         .columns
         .iter()
-        .filter(|&&c| bounded(table, c))
+        .filter(|&&c| bounded(table, c) && table.columns[c].orderer().is_ok())
         .filter_map(|&c| order.leaf_slot(table, c).map(|s| s as u32))
         .collect()
 }
@@ -1893,7 +1893,9 @@ pub(crate) fn write_block(
     // first leaf's summary.
     if current {
         for &c in order.columns.iter().filter(|&&c| bounded(table, c)) {
-            let orderer = table.columns[c].orderer()?;
+            let Ok(orderer) = table.columns[c].orderer() else {
+                continue;
+            };
             let ty = table.columns[c].ty;
             let bounds = perm[b.start..b.end]
                 .iter()

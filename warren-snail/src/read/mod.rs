@@ -1047,7 +1047,9 @@ impl Snail {
     ) -> Result<(Scan, u64)> {
         let mut scan = self.scan(sql, None)?;
         if !scan.q.sides[0].is_whole() {
-            return Err(Error::new(format!("a sample is drawn from a whole table: {sql}")));
+            return Err(Error::new(format!(
+                "a sample is drawn from a whole table: {sql}"
+            )));
         }
         let live = scan.plan.live_rows();
         scan.plan.keep(&drawn(live, rows, random));
