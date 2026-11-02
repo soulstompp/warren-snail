@@ -144,6 +144,13 @@ at once, and a snail written inside a host that decides its commits.
   signature before any row; an aggregate's rows in its `ORDER BY`'s order, rows that tie in the
   order its step reads them. `jsonb_populate_record`, `json_populate_record`, their `recordset`
   forms and `jsonb_populate_record_valid`; a `ROW(…)` cast to a table's row type or a composite.
+- `*=` and `*<>` over whole records, each field compared by its own bytes as `record_image_eq` and
+  `record_image_ne` compare them, before `ANY`, `SOME` and `ALL` over an array too; a `ROW(…)` or a
+  `(…, …)` standing alone, an anonymous record. `*<`, `*<=`, `*>`, `*>=` and `record_image_ops` are
+  refused by name: their order is PostgreSQL's in-memory layout of each type.
+- B-tree `cidr_ops`, the order `inet_ops` gives; text's operator classes on a `pg_node_tree` and
+  bytea's on `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`, by each method, through the casts
+  PostgreSQL's catalog holds as bytes.
 
 ## 0.1.1
 

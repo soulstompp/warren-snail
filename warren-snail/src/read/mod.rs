@@ -1512,7 +1512,7 @@ impl Snail {
                 || relations::is_set_operation(q)
                 || pipeline::tests_composite_null(&self.catalog, q)
                 || pipeline::reads_per_row(&self.catalog, q)
-                || image::names_an_operator(sql)
+                || image::asks_an_operator(sql)
             {
                 if order.is_some() && (pipeline::is_pipeline(q) || relations::is_set_operation(q)) {
                     return Err(Error::new("a pipeline reads its table along its own order"));

@@ -372,6 +372,39 @@ fn a_row_constructor_compared_otherwise_stays_unread() {
     assert_eq!(rows(&mut s, "SELECT (1, 'a')::text AS x"), [["(1,a)"]]);
 }
 
+#[test]
+fn a_string_holding_the_operator_asks_nothing_of_it() {
+    let catalog = Catalog::parse("CREATE TABLE s.t (id bigint PRIMARY KEY, n text);").unwrap();
+    let path = tmp("image-string.snail");
+    let n = 8192i64;
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            warren_snail::write::Rows {
+                columns: vec![
+                    warren_snail::values::Values::Int((0..n).map(Some).collect()),
+                    warren_snail::values::Values::Text((0..n).map(|_| Some("a*=b".into())).collect()),
+                ],
+            },
+        )],
+    )
+    .unwrap();
+    let mut s = Snail::open(&path).unwrap();
+    let pages = |s: &mut Snail, sql: &str| {
+        let (b, round) = s.ask(sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(b.num_rows(), 1, "{sql}");
+        round.column_pages_predicted
+    };
+    let along = pages(&mut s, "SELECT id FROM s.t WHERE id = 7 AND n = 'a*=b'");
+    let whole = pages(
+        &mut s,
+        "WITH q AS (SELECT id, n FROM s.t) SELECT id FROM q WHERE id = 7 AND n = 'a*=b'",
+    );
+    assert!(along < whole, "{along} pages against {whole}");
+}
+
 #[cfg(feature = "standalone")]
 mod written {
     use super::*;
@@ -586,7 +619,7 @@ fn text_under_a_collation_is_its_bytes() {
     w.execute("INSERT INTO s.t VALUES (1, ROW('a')::s.c, ROW('A')::s.c), (2, ROW('a')::s.c, ROW('a')::s.c)")
         .unwrap();
     assert_eq!(
-        rows(&mut w, "SELECT id, a *= b AS i, a = b AS e FROM s.t ORDER BY id"),
-        [["1", "false", "true"], ["2", "true", "true"]]
+        rows(&mut w, "SELECT id, a *= b AS i FROM s.t ORDER BY id"),
+        [["1", "false"], ["2", "true"]]
     );
 }

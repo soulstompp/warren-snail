@@ -951,7 +951,7 @@ name.
 
 Anything else is refused, with a sentence that says what is not read: among it a recursive query's
 `SEARCH` and `CYCLE` clauses, a window over groups, a locking clause (`FOR UPDATE`, `FOR NO KEY
-UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), and in a write `RETURNING`, `ON CONFLICT`, `UPDATE …
+UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), the record image's order (`*<`, `*<=`, `*>`, `*>=` and `record_image_ops`), which is PostgreSQL's in-memory layout of each type, and in a write `RETURNING`, `ON CONFLICT`, `UPDATE …
 FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE` and a savepoint. A statement sqlparser reads otherwise than it is written is refused too, so
 nothing it declares is dropped without a word.
 

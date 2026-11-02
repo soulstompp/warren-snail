@@ -29,6 +29,15 @@ fn joined(next: &Token) -> Option<&'static str> {
     })
 }
 
+/// Whether a token sqlparser reads as `<>` is written `!=`.
+fn written_bang(sql: &str, t: &TokenWithSpan) -> bool {
+    let at = t.span.start;
+    t.token == Token::Neq
+        && sql.lines().nth(at.line as usize - 1).is_some_and(|l| {
+            l.chars().nth(at.column as usize - 1) == Some('!')
+        })
+}
+
 /// A statement's tokens, `*` and the comparison written against it one operator, as PostgreSQL's
 /// lexer reads them. sqlparser reads `!=` as `<>`, and `*!=` is no operator: it stays two tokens.
 pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, TokenizerError> {
@@ -36,11 +45,10 @@ pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, Token
     if !names_an_operator(sql) {
         return Ok(tokens);
     }
-    let unequal = !sql.contains("*!=");
     let mut out: Vec<TokenWithSpan> = Vec::with_capacity(tokens.len());
     for t in tokens {
         let name = match (out.last().map(|l| &l.token), joined(&t.token)) {
-            (Some(Token::Mul), Some(n)) if unequal || t.token != Token::Neq => Some(n),
+            (Some(Token::Mul), Some(n)) if !written_bang(sql, &t) => Some(n),
             _ => None,
         };
         match name {
@@ -138,8 +146,20 @@ fn joined_name(name: &str) -> bool {
 }
 
 /// Whether a statement's text may hold one of these operators.
-pub(super) fn names_an_operator(sql: &str) -> bool {
-    ["*=", "*<", "*>", "*!=", "\u{1}*"].iter().any(|s| sql.contains(s))
+fn names_an_operator(sql: &str) -> bool {
+    ["*=", "*<", "*>", "\u{1}*"].iter().any(|s| sql.contains(s))
+}
+
+/// Whether a statement holds one of these operators, outside a string.
+pub(super) fn asks_an_operator(sql: &str) -> bool {
+    names_an_operator(sql)
+        && tokens(sql).is_ok_and(|t| {
+            t.iter().any(|t| match &t.token {
+                Token::CustomBinaryOperator(n) => joined_name(n),
+                Token::Word(w) => w.quote_style.is_some() && w.value.starts_with(MARK),
+                _ => false,
+            })
+        })
 }
 
 /// The statements of `sql`, as sqlparser's PostgreSQL dialect reads them, these operators among them.
