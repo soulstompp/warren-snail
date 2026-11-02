@@ -935,6 +935,139 @@ fn a_box_s_inclusion_rules_out_a_block_by_its_leaves_for_every_operator_it_takes
     assert_eq!(with.blocks_read, 0, "{with:?}");
 }
 
+/// A box's condition on a table holding a strand's box of each block, BRIN's and the leaves every
+/// block keeps, and on its twin declaring nothing: read once, each read its predicted pages, along each
+/// order the rows a row at a time finds, NaN, the infinities and NULLs among them.
+#[test]
+fn a_box_s_condition_is_one_whichever_summary_a_block_keeps_and_rules_out_no_row_it_takes() {
+    let n = 4096;
+    let value = |i: i64| {
+        (i % 97 != 0).then(|| {
+            let j = (i * 7919) % n;
+            let (x, y) = (1024 + 4 * (j / 64), 1024 + 4 * (j % 64));
+            match i {
+                1 => "(1104,1104),(NaN,1100)".to_string(),
+                2 => "(1100,1104),(-Infinity,1100)".to_string(),
+                3 => "(Infinity,Infinity),(1100,1100)".to_string(),
+                _ => format!("({},{}),({x},{y})", x + 3, y + 3),
+            }
+        })
+    };
+    let (a, b) = twins(
+        "box-one",
+        "box",
+        "CREATE INDEX t_gist ON s.t USING gist (v);
+         CREATE INDEX t_spgist ON s.t USING spgist (v);
+         CREATE INDEX t_v ON s.t USING brin (v box_inclusion_ops);",
+        n,
+        &value,
+    );
+    let (mut s, mut t) = (fresh(&a), fresh(&b));
+    let boxes = [
+        "'(1100,1100),(1040,1040)'",
+        "box '(1104,1104),(1100,1100)'",
+        "box '(1100,1100),(1100,1100)'",
+        "'(Infinity,Infinity),(-Infinity,-Infinity)'::box",
+        "box '(1104,1104),(NaN,1100)'",
+        "box '(1,1),(0,0)'",
+        "box(point(1040, 1040), point(1100, 1100))",
+    ];
+    let ops = [
+        "<<", "&<", "&&", "&>", ">>", "~=", "@>", "<@", "&<|", "<<|", "|>>", "|&>",
+    ];
+    let mut conditions: Vec<String> = Vec::new();
+    for op in ops {
+        for q in boxes {
+            conditions.push(format!("v {op} {q}"));
+            conditions.push(format!("{q} {op} v"));
+        }
+    }
+    for p in [
+        "point '(1101,1101)'",
+        "'(1101,1101)'::point",
+        "point(1101, 1101)",
+        "point '(NaN,1101)'",
+        "point '(1,1)'",
+    ] {
+        conditions.push(format!("v @> {p}"));
+        conditions.push(format!("{p} <@ v"));
+    }
+    let mut found = 0;
+    for c in &conditions {
+        let row_at_a_time = format!("SELECT id FROM s.t WHERE NOT (NOT ({c}))");
+        let (b, _) = t
+            .ask(&row_at_a_time, None)
+            .unwrap_or_else(|e| panic!("{c}: {e}"));
+        let truth = rows_of(&b);
+        found += truth.len();
+        let q = format!("SELECT id FROM s.t WHERE {c}");
+        for order in ["t_pkey", "t_gist", "t_spgist"] {
+            let (b, round) = s
+                .ask(&q, Some(order))
+                .unwrap_or_else(|e| panic!("{q} along {order}: {e}"));
+            exact(&q, &round);
+            assert_eq!(rows_of(&b), truth, "{q} along {order}");
+        }
+        assert_eq!(ids(&mut t, &q).0, truth, "{q} on the twin");
+    }
+    assert!(found > 10_000, "{found}");
+    // A point inside one box reads few of a strand's blocks, by its bounds or its leaves.
+    let all = t
+        .ask(
+            "SELECT id FROM s.t WHERE NOT (NOT (v @> point '(1101,1101)'))",
+            Some("t_pkey"),
+        )
+        .unwrap()
+        .1
+        .blocks_read;
+    for c in ["v @> point '(1101,1101)'", "point '(1101,1101)' <@ v"] {
+        let q = format!("SELECT id FROM s.t WHERE {c}");
+        let (b, along) = s.ask(&q, Some("t_gist")).unwrap();
+        assert!(b.num_rows() >= 1, "{q}");
+        assert!(along.blocks_read * 3 <= all, "{q}: {along:?} of {all}");
+    }
+    // A point past every box: no block is read, one a NaN keeps its strand's box from ruling out among them.
+    for order in ["t_pkey", "t_gist", "t_spgist"] {
+        let (_, along) = s
+            .ask("SELECT id FROM s.t WHERE v @> point '(1,1)'", Some(order))
+            .unwrap();
+        assert_eq!(along.blocks_read, 0, "{order}: {along:?}");
+    }
+    let (_, twin) = t
+        .ask("SELECT id FROM s.t WHERE v @> point '(1,1)'", None)
+        .unwrap();
+    assert_eq!(twin.blocks_read, 0, "{twin:?}");
+}
+
+/// Boxes wider than the blocks' places: a strand's bounding box of each block overlaps what its leaves
+/// rule out, so a block is read only where every summary it keeps says it may hold a row.
+#[test]
+fn a_strand_s_block_is_ruled_out_by_its_leaves_where_its_bounding_box_would_keep_it() {
+    let path = snail_of(
+        "box-wide",
+        "box",
+        "CREATE INDEX t_gist ON s.t USING gist (v);",
+        8192,
+        &|i: i64| Some(format!("({},1),({},0)", i + 1000, i - 1000)),
+    );
+    let mut s = fresh(&path);
+    for (c, rows) in [
+        // Every box's high x is at least 1000, its low x from -1000.
+        ("v << box '(501,1),(500,0)'", 0),
+        // Every box's low x is at most 7191, its high x to 9191.
+        ("v >> box '(8001,1),(8000,0)'", 0),
+        ("v @> box '(1001,1),(1000,0)'", 2000),
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {c}");
+        let (b, round) = s.ask(&q, Some("t_gist")).unwrap();
+        exact(&q, &round);
+        assert_eq!(b.num_rows(), rows, "{q}");
+        if rows == 0 {
+            assert_eq!(round.blocks_read, 0, "{q}: {round:?}");
+        }
+    }
+}
+
 #[test]
 fn a_filter_folded_above_the_blocks_rules_out_a_page_of_entries_unread() {
     // Few values a block, against a filter sized for its rows: an entry above folds them unfilled.
@@ -1668,6 +1801,64 @@ mod written {
                 }
             }
         }
+    }
+
+    /// A box written into a block's tail, on a strand and along the table's order, moved and deleted:
+    /// each summary widens to hold it, and a condition finds it along every order.
+    #[test]
+    fn a_box_written_widens_every_summary_a_block_keeps_of_it() {
+        let path = snail_of(
+            "box-written",
+            "box",
+            "CREATE INDEX t_gist ON s.t USING gist (v);
+             CREATE INDEX t_v ON s.t USING brin (v box_inclusion_ops);",
+            4096,
+            &|i: i64| {
+                let (x, y) = (1024 + i / 64, 1024 + i % 64);
+                Some(format!("({},{}),({x},{y})", x + 1, y + 1))
+            },
+        );
+        let mut w = Snail::open_writing(&path).unwrap();
+        let found = |w: &mut Snail, c: &str| -> Vec<Vec<i64>> {
+            ["t_pkey", "t_gist"]
+                .iter()
+                .map(|order| {
+                    let q = format!("SELECT id FROM s.t WHERE {c}");
+                    let (b, round) = w
+                        .ask(&q, Some(order))
+                        .unwrap_or_else(|e| panic!("{q} along {order}: {e}"));
+                    exact(&q, &round);
+                    rows_of(&b)
+                })
+                .collect()
+        };
+        for (c, want) in [
+            ("v @> point '(5,5)'", vec![]),
+            ("point '(5,5)' <@ v", vec![]),
+            ("v && box '(6,6),(4,4)'", vec![]),
+            ("v << box '(1000,1000),(1000,1000)'", vec![]),
+        ] {
+            assert_eq!(found(&mut w, c), vec![want.clone(), want], "{c}");
+        }
+        run(&mut w, "INSERT INTO s.t VALUES (9000, '(6,6),(4,4)')");
+        for c in [
+            "v @> point '(5,5)'",
+            "point '(5,5)' <@ v",
+            "v && box '(6,6),(4,4)'",
+            "v << box '(1000,1000),(1000,1000)'",
+        ] {
+            assert_eq!(found(&mut w, c), vec![vec![9000], vec![9000]], "{c}");
+        }
+        run(&mut w, "UPDATE s.t SET v = '(9,9),(8,8)' WHERE id = 7");
+        assert_eq!(
+            found(&mut w, "v @> point '(8.5,8.5)'"),
+            vec![vec![7], vec![7]]
+        );
+        run(&mut w, "DELETE FROM s.t WHERE id = 9000");
+        assert_eq!(
+            found(&mut w, "v @> point '(5,5)'"),
+            vec![Vec::<i64>::new(), Vec::new()]
+        );
     }
 
     #[test]
