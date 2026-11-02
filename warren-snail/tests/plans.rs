@@ -237,3 +237,19 @@ fn a_scan_handed_out_a_block_at_a_time_keeps_its_plan_to_the_room_its_snail_give
         r.directory_pages + r.column_pages_read
     );
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_writer_s_whole_read_reads_each_map_for_what_its_dead_rows_waste() {
+    let (path, _) = shop("pruned");
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("DELETE FROM s.b WHERE id < 2048").unwrap();
+    drop(w);
+    // Nothing held: the writer's first read, read whole, prunes what the deletes wasted.
+    let mut w = Snail::open_writing(&path).unwrap();
+    let q = "SELECT b.id FROM s.b b";
+    let (b, r) = w.ask(q, Some("b_pkey")).unwrap();
+    exact(q, &r);
+    assert_eq!(b.num_rows() as i64, N - 2048);
+    assert!(r.blocks_pruned >= 1, "{r:?}");
+}

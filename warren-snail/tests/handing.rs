@@ -673,11 +673,12 @@ fn a_round_stopped_for_its_room_reads_no_more_than_the_most_its_price_gives() {
     ] {
         let priced = price_together(&refs, q).unwrap();
         let (low, high, _) = priced.column_pages();
-        let stopped = price_stopped(&refs, q, &priced).unwrap();
-        let most = stopped.column_pages_most;
-        assert!(most >= high, "{q}: {most} under {high}");
         let mut worst = 0;
         for room in [4u64, 8, 16, 32, 64, 128, 192, 256, 512, 1024, 128 << 10].map(|k| k << 10) {
+            let most = price_stopped(&refs, q, &priced, room)
+                .unwrap()
+                .column_pages_most;
+            assert!(most >= high, "{q}: {most} under {high}");
             let mut a = begin_together(&refs, q, Sizes::of(room)).unwrap();
             let _ = drained(&mut a);
             let r = a.round();
@@ -700,9 +701,16 @@ fn a_round_stopped_for_its_room_reads_no_more_than_the_most_its_price_gives() {
     let priced = price_together(&refs, JOIN).unwrap();
     assert_eq!(priced.column_pages().1, 162);
     assert_eq!(
-        price_stopped(&refs, JOIN, &priced)
+        price_stopped(&refs, JOIN, &priced, 64 << 10)
             .unwrap()
             .column_pages_most,
         184
+    );
+    // A room that holds what the counts say it may hold is no stop.
+    assert_eq!(
+        price_stopped(&refs, JOIN, &priced, 128 << 20)
+            .unwrap()
+            .column_pages_most,
+        162
     );
 }

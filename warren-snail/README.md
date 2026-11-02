@@ -928,7 +928,7 @@ nothing it declares is dropped without a word.
   `served` (the orders that hold the question's columns), and `consulted` (each order priced, as
   `order:directory pages:fewest-most:predicted:held`);
 - `rows`; `pages_at_open` (the root and the catalog, or the root alone after the first round);
-  `directory_pages` and `directory_pages_held`;
+  `directory_pages`, `directory_pages_predicted` and `directory_pages_held`;
 - `column_pages_top_low` and `column_pages_top_high` (the order's price at its directory's top),
   `column_pages_low` and `column_pages_high` (at its blocks), `column_pages_predicted`,
   `column_pages_held` and `column_pages_read`;

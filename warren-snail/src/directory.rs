@@ -529,9 +529,9 @@ pub fn widened(e: &mut Entry, key: &[KeyValue], separated: bool) {
 }
 
 /// What an entry above the blocks keeps past the first 8 bytes of the `k`-th column its head bounds,
-/// its leaf `slot`: its entries' lowest least and highest greatest, a greatest that ends before
-/// another's bytes standing for all it heads, cut to what it takes the two to part; none where their
-/// first 8 bytes part them.
+/// its leaf `slot`: its entries' lowest least and highest greatest, cut to what it takes the two to
+/// part, which brings a greatest back to what an entry cut short kept of it; none where their first 8
+/// bytes part them.
 fn over_tail(entries: &[Entry], k: usize, slot: usize) -> Tail {
     let mut held: Option<(i128, Vec<u8>, i128, Vec<u8>)> = None;
     for x in entries {
@@ -547,16 +547,8 @@ fn over_tail(entries: &[Entry], k: usize, slot: usize) -> Tail {
                 } else {
                     (min, lo)
                 };
-                let (max, hi) = if c.max != max {
-                    if c.max > max {
-                        (c.max, t.hi.clone())
-                    } else {
-                        (max, hi)
-                    }
-                } else if t.hi.starts_with(&hi) {
-                    (max, hi)
-                } else if hi.starts_with(&t.hi) || t.hi > hi {
-                    (max, t.hi.clone())
+                let (max, hi) = if (c.max, t.hi.as_slice()) > (max, hi.as_slice()) {
+                    (c.max, t.hi.clone())
                 } else {
                     (max, hi)
                 };
@@ -2039,6 +2031,29 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_greatest_cut_short_stands_for_all_it_heads_above_a_longer_one() {
+        let bound = |a: &[u8], z: &[u8]| {
+            let mut e = block(1, 3, 1);
+            e.columns = vec![Summary {
+                pages: 1,
+                ..Summary::default()
+            }];
+            e.tails = vec![bounds_of(&mut e.columns[0], a, z)];
+            e
+        };
+        // The first keeps `ab` past its first 8 bytes, the second `ab5`: above them both, `ab`, under
+        // which the first's greatest lies, whichever comes first.
+        let cut = bound(b"abcdefghaa1", b"abcdefghabz");
+        let long = bound(b"abcdefghab1", b"abcdefghab5");
+        for page in [[cut.clone(), long.clone()], [long, cut]] {
+            let e = Entry::over(&page, Extent::default(), &[0]).unwrap();
+            assert_eq!(e.tail(0).hi, b"ab", "{:?}", e.tail(0));
+            assert!(!past_greatest(&e.columns[0], e.tail(0), b"abcdefghabz"));
+            assert!(past_greatest(&e.columns[0], e.tail(0), b"abcdefghac"));
         }
     }
 

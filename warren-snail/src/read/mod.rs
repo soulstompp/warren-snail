@@ -857,6 +857,44 @@ impl Snail {
         self.reader.pages_read() + self.reader.pages_held()
     }
 
+    /// The orders of a table that hold every column a question reads, by their place.
+    fn serving(&self, want: &Want) -> Result<Vec<usize>> {
+        let table = want.table;
+        let mut needed = condition_columns(want.side);
+        needed.extend(want.columns.iter().copied());
+        if let Some(k) = want.keys {
+            needed.extend(k.columns.iter().copied());
+        }
+        let mut served = Vec::new();
+        for o in 0..table.orders.len() {
+            if needed.iter().all(|&c| table.orders[o].slot(c).is_some()) {
+                let predicate = partial::Predicate::of(&self.catalog, table, &table.orders[o])?;
+                if predicate.is_none_or(|p| p.implied_by(want.side)) {
+                    served.push(o);
+                }
+            }
+        }
+        Ok(served)
+    }
+
+    /// The fewest of what each order that serves a question says at its top it reads at most, and the
+    /// directory pages that read.
+    pub(super) fn most_at_tops(&self, want: &Want) -> Result<(u64, u64)> {
+        let (mut most, mut read) = (u64::MAX, 0);
+        for o in self.serving(want)? {
+            let walk = self.start(o, want)?;
+            most = most.min(walk.top.1);
+            read += walk.directory_pages;
+        }
+        if most == u64::MAX {
+            return Err(Error::new(format!(
+                "no order of {} holds every column the question reads",
+                want.table.name
+            )));
+        }
+        Ok((most, read))
+    }
+
     /// One table's round: every order that serves it priced from its top, each walked one level
     /// further down while another order's bounds overlap its own, and the one whose exact pages are
     /// fewest read.

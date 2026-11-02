@@ -806,9 +806,9 @@ fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in
             round.spill_pages_read, round.spill_pages_written,
             "{q}: {round:?}"
         );
-        // Beside the room, a chunk and a page for each of the 4 runs being merged.
+        // Beside the room, a chunk and a page for each of the 8 runs a merge takes at most.
         assert!(
-            round.bytes_held <= room + one_chunk(&path, 18) + 4 * 4096,
+            round.bytes_held <= room + one_chunk(&path, 18) + 8 * 4096,
             "{q}: {round:?}"
         );
         (ints(&b), round)

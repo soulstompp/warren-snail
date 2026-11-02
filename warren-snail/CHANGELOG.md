@@ -100,6 +100,13 @@ at once, and a snail written inside a host that decides its commits.
   together, one root deciding; `read --round` records each snail's part as `snails`.
 - `read --room <bytes>`, a round's room, and `--handed`, a round read as a host reads it; `read`'s
   `--round` Parquet says what each round wrote past its room and held at most.
+- A read's plan counts in its round's room: a block read whole is priced from its entry, and its page
+  map read once, as the block comes; a block read in part keeps its map's pages while the room lets it
+  and reads them again when it is reached. `Price::map_pages`, `TablePrice::map_pages` and
+  `Priced::map_pages` say what a round goes on to read so; `Round::directory_pages` counts them, and
+  `Round::directory_pages_predicted` says them before any column page is read.
+- `read::price_stopped`: the most a question reads in a room, where its round may stop for it, a side
+  read again among it.
 - A host's round: `read::begin_together` reads a question on the snails given in a room of its own,
   `room::Sizes` naming its bytes and, by `written_to`, a `room::RoundFile` of the host's for the rows
   past them, and hands its answer out a batch at a time (`read::Answering`). `Priced`'s tables say the

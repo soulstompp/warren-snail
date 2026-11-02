@@ -716,3 +716,26 @@ fn a_key_written_at_the_order_s_greatest_end_is_found() {
     let (b, _) = Snail::open(&path).unwrap().ask(q, None).unwrap();
     assert_eq!(weather::one(&b), 3);
 }
+
+#[test]
+fn a_literal_between_a_separator_and_its_block_s_least_reads_no_block() {
+    // The first half of the keys begin with 12 `l`s, the rest with 12 `m`s: the separator between them
+    // is `m`, and a block of `m`s keeps its least, so `mm`, past the separator and before the least,
+    // reads no block.
+    let code = |i: i64| {
+        let c = if i < ROWS / 2 { "l" } else { "m" };
+        format!("{}{i:06}", c.repeat(12))
+    };
+    let path = written(
+        "between",
+        "CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));",
+        vec![each(code)],
+    );
+    let q = "SELECT count(*) FROM s.t t WHERE t.t = 'mm'";
+    let (b, round) = Snail::open(&path).unwrap().ask(q, None).unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (0, 0), "{round:?}");
+    // On either side of the one bound its key lies in, the keys themselves are found.
+    let q = format!("SELECT count(*) FROM s.t t WHERE t.t = '{}'", code(ROWS / 2));
+    let (b, round) = Snail::open(&path).unwrap().ask(&q, None).unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (1, 1), "{round:?}");
+}

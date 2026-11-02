@@ -68,14 +68,24 @@ Under PostgreSQL's notice (src/ of this crate, from the sources named under Post
   read/pipeline/windows.rs          executor/nodeWindowAgg.c, utils/adt/windowfuncs.c, and in_range
                                     of utils/adt/int.c, int8.c, numeric.c, float.c, date.c, timestamp.c
   read/pipeline.rs                  how parser/gram.y reads the forms it names, and numeric.c
+  read/typed.rs, read/fill.rs       how parser/parse_oper.c, parse_func.c and parse_coerce.c type an
+                                    expression and assign a value: their rules
+  read/spelled.rs, read/locking.rs  how parser/gram.y reads what they read
+  read/aggregates.rs                the transition and final functions of the aggregates it folds:
+                                    utils/adt/numeric.c, float.c, orderedsetaggs.c, json.c, jsonb.c
+  read/clock.rs                     utils/adt/timestamp.c, date.c: the functions of the statement's clock
+  read/foreign.rs                   utils/adt/ri_triggers.c: how a key is read and its actions taken
+  read/relations/recursive.rs       executor/nodeRecursiveunion.c: how a recursive query is run
+  read/serial.rs                    storage/lmgr/predicate.c: the test of two in a row, and its words
   zones.rs                          timezone/localtime.c, whose own header says it is in the public
                                     domain; how PostgreSQL's pgtz.c finds a zone's file by its name
   ddl.rs, catalog.rs                what PostgreSQL's parser/parse_utilcmd.c, commands/tablecmds.c,
                                     and the commands beside them accept and refuse, in their words
   regs.txt, regs.rs, functions.txt, the built-in objects of PostgreSQL 14 to 19, drawn from each
-  operators.txt, opclasses.txt,     release's catalog (include/catalog/*.dat), and its keywords
-  types.txt, kwlist.txt,            (include/parser/kwlist.h), each held as a list; the code reads
-  keywords.txt                      them as data
+  functions.rs, operators.txt,      release's catalog (include/catalog/*.dat), and its keywords
+  opclasses.txt, types.txt,         (include/parser/kwlist.h), each held as a list; the code reads
+  lists.rs, methods.rs, kwlist.txt, them as data
+  keywords.txt
   the words of a refusal            throughout the crate, a refusal that PostgreSQL also makes is in
                                     PostgreSQL's words
 

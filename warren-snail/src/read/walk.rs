@@ -172,7 +172,7 @@ fn key_bytes(key: &[KeyValue]) -> u64 {
             _ => 0,
         })
         .sum();
-    (key.len() * std::mem::size_of::<KeyValue>() + held) as u64
+    (std::mem::size_of_val(key) + held) as u64
 }
 
 /// An entry the round reads below, or at the blocks reads the pages of.
@@ -2087,7 +2087,9 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
 fn bound_bytes(v: &[u8], ty: ColumnType) -> std::borrow::Cow<'_, [u8]> {
     if ty.is_nested() {
         let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
-        v.chunks_exact(2)
+        v.as_chunks::<2>()
+            .0
+            .iter()
             .take(64)
             .map(|h| d(h[0]) << 4 | d(h[1]))
             .collect()
