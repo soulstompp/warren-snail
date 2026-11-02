@@ -26,6 +26,9 @@ use std::rc::Rc;
 pub(super) struct Kept {
     read: RefCell<HashMap<String, RecordBatch>>,
     pub(super) rows: RefCell<HashMap<String, Rc<relations::Parted>>>,
+    /// Each set of values the rows that may ask for it give what it names, where they are known
+    /// before the first asks: its tables are kept to their keys.
+    pub(super) around: RefCell<Option<Vec<Vec<Value>>>>,
 }
 
 /// The snail's tables read through what a subquery keeps: each question from the file once, then
@@ -48,6 +51,10 @@ impl Reads for Cached<'_> {
         let (b, r) = self.reads.read(q, order)?;
         self.kept.read.borrow_mut().insert(key, b.clone());
         Ok((b, r))
+    }
+
+    fn read_kept(&self, q: &Question, kept: &super::walk::KeySet) -> Result<(RecordBatch, Round)> {
+        self.reads.read_kept(q, kept)
     }
 
     fn snails(&self) -> usize {
@@ -332,6 +339,25 @@ impl<'a, 'q> Subs<'a, 'q> {
             casings,
             columns,
             accrued: RefCell::new(accrued),
+        }
+    }
+
+    /// Before any row asks: each set of values `rows` give what each subquery reading the query
+    /// around it names.
+    pub(super) fn foresee(&self, rows: &[Vec<Value>]) {
+        for plan in self.plans.plans.values() {
+            let Some(places) = &plan.around else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            let mut sets = Vec::new();
+            for r in rows {
+                let set: Vec<Value> = places.iter().map(|&i| r[i].clone()).collect();
+                if seen.insert(set.iter().map(pipeline::key).collect::<Vec<Key>>()) {
+                    sets.push(set);
+                }
+            }
+            *plan.kept.around.borrow_mut() = Some(sets);
         }
     }
 

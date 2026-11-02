@@ -71,6 +71,10 @@ impl relations::Reads for Snail {
         }
     }
 
+    fn read_kept(&self, q: &Question, kept: &KeySet) -> Result<(RecordBatch, Round)> {
+        self.ask_one_kept(q, None, Some(kept))
+    }
+
     fn snails(&self) -> usize {
         1
     }
@@ -87,7 +91,7 @@ use answer::{Answer, Cell, Dict};
 use arrow::array::RecordBatch;
 use question::{Key, Question};
 use std::path::Path;
-use walk::{condition_columns, next_down, ruled_out, Plan, Sink, Want};
+use walk::{condition_columns, next_down, ruled_out, KeySet, Plan, Sink, Want};
 
 /// What an open snail holds between rounds unless told otherwise: PostgreSQL's default
 /// `shared_buffers`.
@@ -1346,7 +1350,7 @@ impl Snail {
                 stream.feed(rel)
             },
         };
-        let (mut round, _, _) = self.scan_one(&base, Some(&order.name), &mut blocks)?;
+        let (mut round, _, _) = self.scan_one(&base, Some(&order.name), None, &mut blocks)?;
         drop(blocks);
         round.rows_held = stream.most_held() as u64;
         let out = stream.finish()?;
@@ -1356,9 +1360,20 @@ impl Snail {
     }
 
     fn ask_one(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)> {
+        self.ask_one_kept(q, order, None)
+    }
+
+    /// A question on one table, kept to the keys `kept` holds where it is given them: the round
+    /// along the order whose pages are fewest, those keys known before it is priced.
+    pub(super) fn ask_one_kept(
+        &self,
+        q: &Question,
+        order: Option<&str>,
+        kept: Option<&KeySet>,
+    ) -> Result<(RecordBatch, Round)> {
         let table = &self.catalog.tables[q.sides[0].table];
         let mut answer = Answer::new(&q.select).typed(&[table]);
-        let (mut round, counted, months) = self.scan_one(q, order, &mut answer)?;
+        let (mut round, counted, months) = self.scan_one(q, order, kept, &mut answer)?;
         answer.counted(counted, &months, q.select.countable());
         let batch = answer.finish(&[table], &q.select, &q.order)?;
         round.rows = batch.num_rows() as u64;
@@ -1371,6 +1386,7 @@ impl Snail {
         &self,
         q: &Question,
         order: Option<&str>,
+        kept: Option<&KeySet>,
         sink: &mut dyn Sink,
     ) -> Result<(Round, u64, [u64; 12])> {
         let table = &self.catalog.tables[q.sides[0].table];
@@ -1383,8 +1399,8 @@ impl Snail {
             table,
             side: &q.sides[0],
             columns: columns.iter().map(|c| c.0).collect(),
-            countable: q.select.countable(),
-            keys: None,
+            countable: q.select.countable().filter(|_| kept.is_none()),
+            keys: kept,
         };
         let (before, held_before) = (self.touched(), self.pages_held());
         let part = self.part(&want, order)?;

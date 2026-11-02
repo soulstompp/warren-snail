@@ -25,8 +25,8 @@ const MOST_ROWS: usize = 1 << 20;
 /// A recursive query's two terms: the non-recursive term, an arm made once, and the recursive
 /// term, an arm made each round from its own steps, by their places among the statement's.
 pub(in crate::read) struct Recursion {
-    left: Arm,
-    right: Arm,
+    pub(super) left: Arm,
+    pub(super) right: Arm,
     all: bool,
     pub(super) body: Range<usize>,
 }
@@ -545,15 +545,15 @@ pub(in crate::read) fn make(
     loop {
         making.made.insert(
             name.clone(),
-            std::rc::Rc::new(Made {
-                rel: Relation {
+            std::rc::Rc::new(Made::of(
+                Relation {
                     names: names.clone(),
                     rows: std::mem::take(&mut working),
                     order: None,
                 },
-                types: types.iter().map(|&t| Some(t)).collect(),
-                carried: carried.clone(),
-            }),
+                types.iter().map(|&t| Some(t)).collect(),
+                carried.clone(),
+            )),
         );
         for s in &mut before[rec.body.clone()] {
             making.make(s)?;
@@ -618,15 +618,15 @@ pub(in crate::read) fn make(
         all_rows.extend(added.iter().cloned());
         working = added;
     }
-    Ok(Made {
-        rel: Relation {
+    Ok(Made::of(
+        Relation {
             names,
             rows: all_rows,
             order: None,
         },
-        types: types.into_iter().map(Some).collect(),
+        types.into_iter().map(Some).collect(),
         carried,
-    })
+    ))
 }
 
 /// A term's rows in the recursion's types, each value of another type or written as a literal

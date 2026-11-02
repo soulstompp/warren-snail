@@ -5,14 +5,17 @@
 //! derived table, VALUES or a view lifted to a step of its own, a function's rows) are met by their
 //! ON, USING or NATURAL, a function's rows made for each row of the relations before it.
 
+mod kept;
 mod recursive;
 
+pub(super) use kept::Keep;
 pub(super) use recursive::unread_clauses;
 
 use super::collate::Carried;
 use super::pipeline::{self, Casings, Columns, Relation, Value, MERGED};
 use super::question::{self, Question};
 use super::typed::{self, TypedColumn};
+use super::walk::KeySet;
 use super::Round;
 use crate::catalog::{Catalog, ColumnType, Table};
 use crate::{Error, Result};
@@ -32,6 +35,9 @@ pub(super) trait Reads {
     /// A question the question path reads, over the catalog's tables: one round, each snail's part
     /// of it in its `snails` where there are several.
     fn read(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)>;
+    /// A question on one table the question path reads, kept to the keys `kept` holds of its
+    /// columns: those of the rows made before it that it meets.
+    fn read_kept(&self, q: &Question, kept: &KeySet) -> Result<(RecordBatch, Round)>;
     /// How many snails the tables lie in.
     fn snails(&self) -> usize;
 }
@@ -74,6 +80,28 @@ pub(super) struct Made {
     pub(super) rel: Relation,
     pub(super) types: Vec<Option<ColumnType>>,
     carried: Vec<Carried>,
+    /// Where the step is kept for the steps after it, its rows in the round's room, those past it
+    /// written: `rel` then holds none.
+    kept: Option<Rc<super::spill::Run>>,
+}
+
+impl Made {
+    fn of(rel: Relation, types: Vec<Option<ColumnType>>, carried: Vec<Carried>) -> Made {
+        Made {
+            rel,
+            types,
+            carried,
+            kept: None,
+        }
+    }
+
+    /// Its rows, in order: those written past the room read back.
+    pub(super) fn rows(&self) -> Result<Vec<Vec<Value>>> {
+        match &self.kept {
+            Some(run) => run.rows(),
+            None => Ok(self.rel.rows.clone()),
+        }
+    }
 }
 
 /// The relations a statement made before a step, by the names its FROM reads them by.
@@ -1126,6 +1154,9 @@ struct Reading<'a> {
     cached: HashMap<*const Node, Vec<Vec<Value>>>,
     /// Whether the rows a node makes keep their table's order, at a column of theirs.
     order: Option<usize>,
+    /// What rows made before a table hold of the columns it meets them on, which its read is kept
+    /// to.
+    kept: Vec<Keep>,
 }
 
 /// What the rounds a statement reads have read, in all and on each snail.
@@ -1208,7 +1239,7 @@ impl Reading<'_> {
                 r
             }
             What::Made { name, .. } => {
-                let r = self.made[name].rel.rows.clone();
+                let r = self.made[name].rows()?;
                 self.cached.insert(node, r.clone());
                 r
             }
@@ -1233,11 +1264,59 @@ impl Reading<'_> {
                     Kind::Right => preserved && !side,
                     Kind::Full => false,
                 };
-                let lrows = self.rows(left, before, keep(true))?;
+                // A table met with rows made before it is kept to their keys: the side no join
+                // keeps whole, made after the other side; the table, where only one side is one.
                 let rlateral = right.lateral();
-                let rrows = match rlateral {
-                    true => None,
-                    false => Some(self.rows(right, before, keep(false))?),
+                let table = |n: &Node| matches!(n.what, What::Table { .. });
+                let left_first = !(table(left) && !table(right))
+                    || !matches!(kind, Kind::Inner | Kind::Right)
+                    || rlateral;
+                let (lrows, rrows) = match left_first {
+                    true => {
+                        let lrows = self.rows(left, before, keep(true))?;
+                        let rrows = match rlateral {
+                            true => None,
+                            false => {
+                                let k = match (table(right), kind) {
+                                    (true, Kind::Inner | Kind::Left) => self.keep_for_join(
+                                        node,
+                                        on.as_ref(),
+                                        merged,
+                                        right,
+                                        &lrows,
+                                        left.at,
+                                    ),
+                                    _ => None,
+                                };
+                                let pushed = k.is_some();
+                                self.kept.extend(k);
+                                let rrows = self.rows(right, before, keep(false));
+                                if pushed {
+                                    self.kept.pop();
+                                }
+                                Some(rrows?)
+                            }
+                        };
+                        (lrows, rrows)
+                    }
+                    false => {
+                        let rrows = self.rows(right, before, keep(false))?;
+                        let k = self.keep_for_join(
+                            node,
+                            on.as_ref(),
+                            merged,
+                            left,
+                            &rrows,
+                            right.at,
+                        );
+                        let pushed = k.is_some();
+                        self.kept.extend(k);
+                        let lrows = self.rows(left, before, keep(true));
+                        if pushed {
+                            self.kept.pop();
+                        }
+                        (lrows?, Some(rrows))
+                    }
                 };
                 let rows = self.met(
                     node,
@@ -1269,8 +1348,9 @@ impl Reading<'_> {
     ) -> Result<Vec<Vec<Value>>> {
         let catalog = self.reads.catalog();
         let t = &catalog.tables[table];
+        let keep = self.keep_of(node).cloned();
         let mut wanted: Vec<usize> = (node.at..node.at + node.width)
-            .filter(|&p| self.needed(p))
+            .filter(|&p| self.needed(p) || keep.as_ref().is_some_and(|k| k.places.contains(&p)))
             .collect();
         if wanted.is_empty() {
             wanted.push(node.at);
@@ -1294,7 +1374,13 @@ impl Reading<'_> {
             false => Vec::new(),
         };
         let q = self.parsed(&select, &from, &conds)?;
-        let (batch, round) = self.reads.read(&q, None)?;
+        // Kept to the keys of the rows made before it, its read is priced once they are known, and
+        // only the rows that meet them are held.
+        let kept = keep.as_ref().map(|k| kept::Kept::of(k, node.at, t));
+        let (batch, round) = match kept.as_ref().and_then(|k| k.set.as_ref()) {
+            Some(set) => self.reads.read_kept(&q, set)?,
+            None => self.reads.read(&q, None)?,
+        };
         self.accrued.add(&round);
         let rel = pipeline::relation_of(&batch)?;
         let mut rows: Vec<Vec<Value>> = rel
@@ -1307,6 +1393,7 @@ impl Reading<'_> {
                 }
                 row
             })
+            .filter(|row| kept.as_ref().is_none_or(|k| k.admits(row)))
             .collect();
         // Its rows in the table's order, where that order is one unique column it holds: a window
         // reads along it.
@@ -2009,15 +2096,15 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
         made.push(row);
     }
     let names = (1..=n).map(|i| format!("column{i}")).collect();
-    Ok(Made {
-        rel: Relation {
+    Ok(Made::of(
+        Relation {
             names,
             rows: made,
             order: None,
         },
-        types: types.iter().map(|&t| Some(t)).collect(),
-        carried: types.iter().map(|&t| carried_of(Some(t))).collect(),
-    })
+        types.iter().map(|&t| Some(t)).collect(),
+        types.iter().map(|&t| carried_of(Some(t))).collect(),
+    ))
 }
 
 /// A set operation's arms: each a step of its own, two met by their operator.
@@ -2244,15 +2331,15 @@ struct Met {
 /// types its two arms' columns, the leftmost arm's names its own.
 fn set_step(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Made> {
     let m = met(arm, made, casings)?;
-    Ok(Made {
-        rel: Relation {
+    Ok(Made::of(
+        Relation {
             names: m.names,
             rows: m.rows,
             order: None,
         },
-        types: m.types,
-        carried: m.carried,
-    })
+        m.types,
+        m.carried,
+    ))
 }
 
 fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
@@ -2269,7 +2356,7 @@ fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
                     .map(|c| untyped.get(c).cloned().unwrap_or(Untyped::No))
                     .collect(),
                 carried: m.carried.clone(),
-                rows: m.rel.rows.clone(),
+                rows: m.rows()?,
             });
         }
         Arm::Op {
@@ -2463,6 +2550,12 @@ pub(super) fn made_by(
     let catalog = asked.reads.catalog();
     let visible: Vec<String> = before.keys().cloned().collect();
     let mut steps = steps(catalog, q, &visible)?;
+    let mut arms = HashMap::new();
+    for s in &steps {
+        if let Some(a) = &s.set {
+            kept_arms(a, &mut arms);
+        }
+    }
     let mut making = Making {
         asked,
         made: before.clone(),
@@ -2470,6 +2563,7 @@ pub(super) fn made_by(
         outer,
         accrued,
         held: 0,
+        arms,
     };
     // A recursion's own steps are made in each of its rounds, by the recursion.
     let theirs: Vec<usize> = steps
@@ -2477,6 +2571,35 @@ pub(super) fn made_by(
         .filter_map(|s| s.recursion.as_ref())
         .flat_map(|r| r.body.clone())
         .collect();
+    // Each step's readers among the steps after it, a recursion reading what its own steps read:
+    // a step is let go once the last of them is made.
+    let body_of = |i: usize| -> Vec<usize> {
+        steps[i]
+            .recursion
+            .as_ref()
+            .map(|r| r.body.clone().collect())
+            .unwrap_or_default()
+    };
+    let read: Vec<std::collections::HashSet<String>> = (0..steps.len())
+        .map(|j| {
+            std::iter::once(j)
+                .chain(body_of(j))
+                .flat_map(|k| step_words(&steps[k]))
+                .collect()
+        })
+        .collect();
+    let mut readers: HashMap<String, usize> = HashMap::new();
+    for (i, s) in steps.iter().enumerate() {
+        if s.name.is_empty() || theirs.contains(&i) || before.contains_key(&s.name) {
+            continue;
+        }
+        let n = (i + 1..steps.len())
+            .filter(|j| !theirs.contains(j) && read[*j].contains(&s.name))
+            .count();
+        if n > 0 {
+            readers.insert(s.name.clone(), n);
+        }
+    }
     for i in 0..steps.len() {
         if theirs.contains(&i) {
             continue;
@@ -2485,9 +2608,10 @@ pub(super) fn made_by(
             let (before, rest) = steps.split_at_mut(i);
             let m = recursive::make(&mut making, &rest[0], before)?;
             making.keep(&rest[0], m)?;
-            continue;
+        } else {
+            making.make(&mut steps[i])?;
         }
-        making.make(&mut steps[i])?;
+        making.read_by(&mut readers, &steps[i].name, &read[i]);
     }
     let last = making
         .made
@@ -2507,6 +2631,55 @@ struct Making<'a, 'o> {
     outer: Option<&'o Outer<'o>>,
     accrued: &'o mut Accrued,
     held: usize,
+    /// The second arm of each INTERSECT and EXCEPT of two steps, by its first: kept to its keys.
+    arms: HashMap<String, String>,
+}
+
+/// The words a step's text names: its query's, its functions' calls', its LATERAL subqueries' and
+/// its arms' steps.
+fn step_words(step: &Step) -> Vec<String> {
+    let mut text = step.query.to_string();
+    for c in &step.calls {
+        text.push(' ');
+        text.push_str(&c.expr.to_string());
+    }
+    for (q, _) in &step.laterals {
+        text.push(' ');
+        text.push_str(&q.to_string());
+    }
+    let mut ws = words(&text);
+    fn leaves(a: &Arm, out: &mut Vec<String>) {
+        match a {
+            Arm::Leaf { name, .. } => out.push(name.clone()),
+            Arm::Op { left, right, .. } => {
+                leaves(left, out);
+                leaves(right, out);
+            }
+        }
+    }
+    if let Some(a) = &step.set {
+        leaves(a, &mut ws);
+    }
+    if let Some(r) = &step.recursion {
+        leaves(&r.right, &mut ws);
+    }
+    ws
+}
+
+/// Each INTERSECT and EXCEPT of two steps in an arm: its second step by its first.
+fn kept_arms(arm: &Arm, out: &mut HashMap<String, String>) {
+    if let Arm::Op {
+        op, left, right, ..
+    } = arm
+    {
+        if matches!(op, SetOperator::Intersect | SetOperator::Except) {
+            if let (Arm::Leaf { name: l, .. }, Arm::Leaf { name: r, .. }) = (&**left, &**right) {
+                out.insert(r.clone(), l.clone());
+            }
+        }
+        kept_arms(left, out);
+        kept_arms(right, out);
+    }
 }
 
 impl Making<'_, '_> {
@@ -2518,14 +2691,22 @@ impl Making<'_, '_> {
             (None, SetExpr::Values(_)) => {
                 values_step(step, asked.params, asked.release, &self.casings)?
             }
-            _ => select_step(
-                asked,
-                step,
-                &self.made,
-                &mut self.casings,
-                self.outer,
-                self.accrued,
-            )?,
+            _ => {
+                let before = self
+                    .arms
+                    .get(&step.name)
+                    .and_then(|l| self.made.get(l))
+                    .cloned();
+                select_step(
+                    asked,
+                    step,
+                    &self.made,
+                    &mut self.casings,
+                    self.outer,
+                    self.accrued,
+                    before.as_deref(),
+                )?
+            }
         };
         self.keep(step, m)
     }
@@ -2545,8 +2726,36 @@ impl Making<'_, '_> {
         }
         self.casings.renamed(&step.name, &step.renames);
         self.held += m.rel.rows.len();
+        // A step the steps after it read is kept in the round's room, the rows past it written; the
+        // answer is the caller's.
+        if !step.name.is_empty() && m.kept.is_none() {
+            let rows = std::mem::take(&mut m.rel.rows);
+            m.kept = Some(Rc::new(super::spill::Run::of(m.rel.names.len(), rows)?));
+        }
         self.made.insert(step.name.clone(), Rc::new(m));
         Ok(())
+    }
+
+    /// Lets go each step made here whose last reader is the step just made, `name`, which names
+    /// `ws`.
+    fn read_by(
+        &mut self,
+        readers: &mut HashMap<String, usize>,
+        name: &str,
+        ws: &std::collections::HashSet<String>,
+    ) {
+        let done: Vec<String> = readers
+            .iter_mut()
+            .filter(|(n, _)| n.as_str() != name && ws.contains(n.as_str()))
+            .filter_map(|(n, left)| {
+                *left -= 1;
+                (*left == 0).then(|| n.clone())
+            })
+            .collect();
+        for n in done {
+            readers.remove(&n);
+            self.made.remove(&n);
+        }
     }
 }
 
@@ -2622,6 +2831,7 @@ fn read_from(
     accrued: &mut Accrued,
     laterals: &[(Query, super::subqueries::Kept)],
     outer: Option<&Outer>,
+    kept: Vec<Keep>,
 ) -> Result<(Vec<Vec<Value>>, Option<usize>)> {
     let mut reading = Reading {
         reads: asked.reads,
@@ -2640,11 +2850,19 @@ fn read_from(
         outer,
         cached: HashMap::new(),
         order: None,
+        kept,
     };
     let mut rows: Vec<Vec<Value>> = vec![Vec::new()];
     let mut order = None;
     for (k, item) in from.items.iter().enumerate() {
         reading.order = None;
+        // A table after the first, met by WHERE with the rows made before it, is kept to their keys.
+        let k_item = match (k > 0 && !item.lateral(), &item.what) {
+            (true, What::Table { .. }) => reading.keep_for_item(item, &rows),
+            _ => None,
+        };
+        let pushed = k_item.is_some();
+        reading.kept.extend(k_item);
         let next = if item.lateral() && k > 0 {
             let mut out = Vec::new();
             for r in &rows {
@@ -2667,6 +2885,9 @@ fn read_from(
             }
             out
         };
+        if pushed {
+            reading.kept.pop();
+        }
         // The order holds where the first relation is read alone in it and the rest give one
         // row.
         if k == 0 {
@@ -2691,6 +2912,7 @@ fn select_step(
     casings: &mut Casings,
     outer: Option<&Outer>,
     accrued: &mut Accrued,
+    arm_before: Option<&Made>,
 ) -> Result<Made> {
     let catalog = asked.reads.catalog();
     let (params, release, now) = (asked.params, asked.release, asked.now);
@@ -2925,6 +3147,7 @@ fn select_step(
             let parted = match found {
                 Some(p) => p,
                 None => {
+                    let keeps = tied_keeps(&tied, &from, o, asked, casings, &p.types)?;
                     let (rows, order) = read_from(
                         asked,
                         &from,
@@ -2936,6 +3159,7 @@ fn select_step(
                         accrued,
                         &step.laterals,
                         outer,
+                        keeps,
                     )?;
                     let index = match tied.is_empty() {
                         true => None,
@@ -2980,18 +3204,29 @@ fn select_step(
             };
             (rows, parted.order)
         }
-        None => read_from(
-            asked,
-            &from,
-            &ws,
-            wheres,
-            casings,
-            &p.types,
-            made,
-            accrued,
-            &step.laterals,
-            outer,
-        )?,
+        None => {
+            let keeps = match arm_before {
+                Some(m) if p.windows().is_empty() && step.query.limit_clause.is_none()
+                    && step.query.fetch.is_none() =>
+                {
+                    arm_keeps(&step.query, &from, m)?
+                }
+                _ => Vec::new(),
+            };
+            read_from(
+                asked,
+                &from,
+                &ws,
+                wheres,
+                casings,
+                &p.types,
+                made,
+                accrued,
+                &step.laterals,
+                outer,
+                keeps,
+            )?
+        }
     };
     if let Some(o) = outer {
         for r in &mut rows {
@@ -3011,6 +3246,7 @@ fn select_step(
     let types = p.returns.clone();
     let carried = p.carried.clone();
     let subs = super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
+    subs.foresee(&rel.rows);
     let mut run = pipeline::StepRun::new(p);
     if !plans.is_empty() {
         run.subqueries = Some(&subs);
@@ -3024,11 +3260,113 @@ fn select_step(
         Some(out) => out,
         None => run.finish(params, release, casings)?,
     };
-    Ok(Made {
-        rel,
+    Ok(Made::of(rel, types, carried))
+}
+
+/// What the rows that ask for a subquery hold of the columns its =s tie to the query around it:
+/// each set of values they give what it names, the tie's expression read on it.
+fn tied_keeps(
+    tied: &[(&Expr, &Expr)],
+    from: &From,
+    o: &Outer,
+    asked: Asked,
+    casings: &Casings,
+    types: &typed::Types,
+) -> Result<Vec<Keep>> {
+    let Some(sets) = o.kept.around.borrow().clone() else {
+        return Ok(Vec::new());
+    };
+    let mut places = Vec::new();
+    let mut exprs = Vec::new();
+    for (a, b) in tied {
+        let Some((q, n)) = pipeline::column_of(a) else {
+            continue;
+        };
+        let found = pipeline::naming(
+            from.columns[..from.outer_at]
+                .iter()
+                .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+            q.as_deref(),
+            &n,
+        );
+        if let [i] = found.as_slice() {
+            places.push(*i);
+            exprs.push(*b);
+        }
+    }
+    if places.is_empty() {
+        return Ok(Vec::new());
+    }
+    let frame = pipeline::Frame {
+        columns: from.frame_columns(0, from.columns.len()),
+        params: asked.params,
+        release: asked.release,
+        casings,
         types,
-        carried,
-    })
+        now: asked.now,
+        subqueries: None,
+    };
+    let none = pipeline::computed_none();
+    let mut values = Vec::with_capacity(sets.len());
+    for set in &sets {
+        let mut row = vec![Value::Null; from.outer_at];
+        row.extend(set.iter().cloned());
+        values.push(
+            exprs
+                .iter()
+                .map(|e| pipeline::eval(e, &row, &frame, &none))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    Ok(vec![Keep {
+        places,
+        values,
+        nulls_meet: false,
+    }])
+}
+
+/// What a set operation's first arm holds of the columns of the table its second arm, a SELECT of
+/// one table, returns as its own, by their places among the arm's columns. NULLs meet, as the
+/// operation meets its arms' rows.
+fn arm_keeps(q: &Query, from: &From, before: &Made) -> Result<Vec<Keep>> {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if from.items.len() != 1 || !matches!(from.items[0].what, What::Table { .. }) {
+        return Ok(Vec::new());
+    }
+    let mut pairs = Vec::new();
+    for (i, item) in s.projection.iter().enumerate() {
+        let e = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => return Ok(Vec::new()),
+        };
+        let Some((q, n)) = pipeline::column_of(e) else {
+            continue;
+        };
+        let found = pipeline::naming(
+            from.columns[..from.outer_at]
+                .iter()
+                .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+            q.as_deref(),
+            &n,
+        );
+        if let [p] = found.as_slice() {
+            pairs.push((*p, i));
+        }
+    }
+    if pairs.is_empty() || before.rel.names.len() != s.projection.len() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![Keep {
+        places: pairs.iter().map(|p| p.0).collect(),
+        values: before
+            .rows()?
+            .iter()
+            .map(|r| pairs.iter().map(|p| r[p.1].clone()).collect())
+            .collect(),
+        nulls_meet: true,
+    }])
 }
 
 /// The places of a subquery's FROM rows by the keys of the columns its =s tie to the query around
@@ -3159,6 +3497,10 @@ impl Reads for Empty<'_> {
         self.0
     }
 
+    fn read_kept(&self, q: &Question, _kept: &KeySet) -> Result<(RecordBatch, Round)> {
+        self.read(q, None)
+    }
+
     fn read(&self, q: &Question, _order: Option<&str>) -> Result<(RecordBatch, Round)> {
         let tables: Vec<&Table> = q.sides.iter().map(|s| &self.0.tables[s.table]).collect();
         let batch = super::answer::Answer::new(&q.select)
@@ -3210,6 +3552,18 @@ impl Reads for Across<'_> {
         }
         let at: Vec<(usize, usize)> = q.sides.iter().map(|s| self.at[s.table]).collect();
         super::join::ask_join_across(&self.snails, &at, q)
+    }
+
+    fn read_kept(&self, q: &Question, kept: &KeySet) -> Result<(RecordBatch, Round)> {
+        let (s, t) = self.at[q.sides[0].table];
+        let mut local = q.clone();
+        local.sides[0].table = t;
+        let (b, r) = self.snails[s].ask_one_kept(&local, None, Some(kept))?;
+        let mut parts = vec![Round::default(); self.snails.len()];
+        parts[s] = r.clone();
+        let mut r = r;
+        r.snails = parts;
+        Ok((b, r))
     }
 
     fn snails(&self) -> usize {

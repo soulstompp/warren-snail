@@ -5129,6 +5129,11 @@ impl<'q> Prepared<'q> {
         &self.calls.aggregates
     }
 
+    /// The windows it calls.
+    pub(super) fn windows(&self) -> &[&'q Expr] {
+        &self.calls.windows
+    }
+
     /// The columns its expressions read of its FROM's: its select list's, its WHERE's, its HAVING's,
     /// its ORDER BY's own, its windows' partitions and orders, and those its FROM reads its
     /// relations by.
