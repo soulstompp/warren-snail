@@ -117,11 +117,11 @@ pub enum Statement {
     Setting {
         name: String,
     },
-    /// An isolation level a transaction runs at, one the snail runs: named by the BEGIN or START
-    /// TRANSACTION that begins it, by SET TRANSACTION for the transaction begun, or by SET SESSION
-    /// CHARACTERISTICS AS TRANSACTION for the transactions after.
+    /// What a transaction runs as, its isolation level, READ ONLY or READ WRITE, DEFERRABLE or not:
+    /// named by the BEGIN or START TRANSACTION that begins it, by SET TRANSACTION for the transaction
+    /// begun, or by SET SESSION CHARACTERISTICS AS TRANSACTION for the transactions after.
     Isolation {
-        level: Isolation,
+        modes: Modes,
         at: Isolated,
     },
     /// A question asked among a writer's statements: in a transaction, it reads the transaction's own
@@ -132,7 +132,7 @@ pub enum Statement {
 }
 
 /// The isolation levels the snail runs: READ COMMITTED, which PostgreSQL also runs READ UNCOMMITTED
-/// as and holds as a level of its own, and REPEATABLE READ.
+/// as and holds as a level of its own, REPEATABLE READ and SERIALIZABLE.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Isolation {
@@ -140,6 +140,16 @@ pub enum Isolation {
     #[default]
     ReadCommitted,
     RepeatableRead,
+    Serializable,
+}
+
+/// What a statement names of a transaction's modes, each the last it names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Modes {
+    pub level: Option<Isolation>,
+    pub read_only: Option<bool>,
+    pub deferrable: Option<bool>,
 }
 
 /// Where an isolation level is named.
@@ -151,21 +161,38 @@ pub enum Isolated {
     Session,
 }
 
-/// The isolation levels of a writer's transactions: the session's, the transaction's, and whether
-/// a statement of the transaction has read, as PostgreSQL's first snapshot of a transaction is
-/// taken; and the session's when the transaction began, which a ROLLBACK puts back.
+/// What a transaction runs as.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Mode {
+    level: Isolation,
+    read_only: bool,
+    deferrable: bool,
+}
+
+impl Mode {
+    fn with(mut self, modes: Modes) -> Mode {
+        self.level = modes.level.unwrap_or(self.level);
+        self.read_only = modes.read_only.unwrap_or(self.read_only);
+        self.deferrable = modes.deferrable.unwrap_or(self.deferrable);
+        self
+    }
+}
+
+/// What a writer's transactions run as: the session's, the transaction's, and whether a statement
+/// of the transaction has read, as PostgreSQL's first snapshot of a transaction is taken; and the
+/// session's when the transaction began, which a ROLLBACK puts back.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Levels {
-    session: Isolation,
-    transaction: Isolation,
+    session: Mode,
+    transaction: Mode,
     read: bool,
-    session_at_begin: Isolation,
+    session_at_begin: Mode,
 }
 
 impl Levels {
-    /// A transaction begun, at the level named or else the session's.
-    pub(crate) fn begin(&mut self, level: Option<Isolation>) {
-        self.transaction = level.unwrap_or(self.session);
+    /// A transaction begun, as named or else as the session's.
+    pub(crate) fn begin(&mut self, modes: Modes) {
+        self.transaction = self.session.with(modes);
         self.read = false;
         self.session_at_begin = self.session;
     }
@@ -175,32 +202,66 @@ impl Levels {
         self.read = true;
     }
 
-    /// A level named outside BEGIN, `begun` whether a transaction is: SET TRANSACTION's, which
-    /// outside a transaction does nothing, and inside one only before its first read where it
-    /// changes the level; or SET SESSION CHARACTERISTICS's.
-    pub(crate) fn set(&mut self, level: Isolation, at: Isolated, begun: bool) -> Result<()> {
+    /// Modes named outside BEGIN, `begun` whether a transaction is: SET TRANSACTION's, which outside
+    /// a transaction does nothing, and inside one, after its first read, changes neither its level
+    /// nor READ ONLY to READ WRITE, and takes no [NOT] DEFERRABLE; or SET SESSION CHARACTERISTICS's.
+    pub(crate) fn set(&mut self, modes: Modes, at: Isolated, begun: bool) -> Result<()> {
         match at {
             Isolated::Transaction if begun => {
-                if level != self.transaction && self.read {
-                    return Err(Error::new(
-                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
-                    ));
+                if self.read {
+                    if modes.level.is_some_and(|l| l != self.transaction.level) {
+                        return Err(Error::new(
+                            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                        ));
+                    }
+                    if modes.read_only == Some(false) && self.transaction.read_only {
+                        return Err(Error::new(
+                            "transaction read-write mode must be set before any query",
+                        ));
+                    }
+                    if modes.deferrable.is_some() {
+                        return Err(Error::new(
+                            "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+                        ));
+                    }
                 }
-                self.transaction = level;
+                self.transaction = self.transaction.with(modes);
             }
-            Isolated::Session => self.session = level,
+            Isolated::Session => self.session = self.session.with(modes),
             _ => {}
         }
         Ok(())
     }
 
-    /// Whether a statement reads as REPEATABLE READ does: in a transaction, at the transaction's
-    /// level; alone, at the session's.
-    pub(crate) fn repeatable(&self, begun: bool) -> bool {
+    fn of(&self, begun: bool) -> Mode {
         match begun {
-            true => self.transaction == Isolation::RepeatableRead,
-            false => self.session == Isolation::RepeatableRead,
+            true => self.transaction,
+            false => self.session,
         }
+    }
+
+    /// Whether a statement reads one snapshot for its transaction's life, as REPEATABLE READ and
+    /// SERIALIZABLE do: in a transaction, at the transaction's level; alone, at the session's.
+    pub(crate) fn repeatable(&self, begun: bool) -> bool {
+        matches!(
+            self.of(begun).level,
+            Isolation::RepeatableRead | Isolation::Serializable
+        )
+    }
+
+    /// Whether a statement runs at SERIALIZABLE.
+    pub(crate) fn serializable(&self, begun: bool) -> bool {
+        self.of(begun).level == Isolation::Serializable
+    }
+
+    /// Whether a statement runs READ ONLY.
+    pub(crate) fn read_only(&self, begun: bool) -> bool {
+        self.of(begun).read_only
+    }
+
+    /// Whether a statement runs DEFERRABLE.
+    pub(crate) fn deferrable(&self, begun: bool) -> bool {
+        self.of(begun).deferrable
     }
 
     /// The transaction ended: committed, or rolled back, its SET SESSION undone.
@@ -238,36 +299,162 @@ fn refused(what: &str) -> Error {
     Error::new(format!("{what} is not written"))
 }
 
-/// The isolation level a transaction's modes name, the last of them as PostgreSQL takes it; none
-/// where they name none. READ WRITE is a transaction of the snail's; READ ONLY, and a level the
-/// snail does not run, are refused by name.
-fn isolation(modes: &[sqlparser::ast::TransactionMode]) -> Result<Option<Isolation>> {
-    use sqlparser::ast::{
-        TransactionAccessMode, TransactionIsolationLevel as Level, TransactionMode,
+/// BEGIN, START TRANSACTION, SET TRANSACTION and SET SESSION CHARACTERISTICS with their modes, read
+/// off their words as PostgreSQL's grammar takes them, sqlparser reading no [NOT] DEFERRABLE: none
+/// where the words are no such statement.
+fn transaction_statement(tokens: &[sqlparser::tokenizer::Token]) -> Result<Option<Statement>> {
+    use sqlparser::tokenizer::Token;
+    let mut words = tokens
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .peekable();
+    let keyword = |t: Option<&&Token>| match t.copied() {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_uppercase(),
+        _ => String::new(),
     };
-    let mut level = None;
-    for m in modes {
-        match m {
-            TransactionMode::AccessMode(TransactionAccessMode::ReadWrite) => {}
-            TransactionMode::AccessMode(TransactionAccessMode::ReadOnly) => {
-                return Err(Error::new(
-                    "READ ONLY is not read: a transaction of the snail's reads and writes",
-                ))
+    let at = match keyword(words.peek()).as_str() {
+        "BEGIN" => {
+            words.next();
+            if matches!(keyword(words.peek()).as_str(), "WORK" | "TRANSACTION") {
+                words.next();
             }
-            TransactionMode::IsolationLevel(l) => level = Some(*l),
+            Isolated::Begin
         }
+        "START" => {
+            words.next();
+            if keyword(words.peek()) != "TRANSACTION" {
+                return Ok(None);
+            }
+            words.next();
+            Isolated::Begin
+        }
+        "SET" => {
+            words.next();
+            if matches!(keyword(words.peek()).as_str(), "LOCAL" | "SESSION") {
+                let mut after = words.clone();
+                after.next();
+                if matches!(keyword(after.peek()).as_str(), "TRANSACTION" | "SESSION") {
+                    words = after;
+                }
+            }
+            match keyword(words.peek()).as_str() {
+                "TRANSACTION" => {
+                    words.next();
+                    if keyword(words.peek()) == "SNAPSHOT" {
+                        return Ok(None);
+                    }
+                    Isolated::Transaction
+                }
+                "SESSION" => {
+                    words.next();
+                    if keyword(words.peek()) != "CHARACTERISTICS" {
+                        return Ok(None);
+                    }
+                    words.next();
+                    for w in ["AS", "TRANSACTION"] {
+                        if keyword(words.peek()) != w {
+                            return Ok(None);
+                        }
+                        words.next();
+                    }
+                    Isolated::Session
+                }
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    let syntax = |t: Option<&Token>| {
+        Error::new(match t {
+            Some(t) => format!("syntax error at or near \"{t}\""),
+            None => "syntax error at end of input".to_string(),
+        })
+    };
+    let mut modes = Modes::default();
+    let mut any = false;
+    loop {
+        let mut t = words.next();
+        match t {
+            None | Some(Token::EOF) => break,
+            Some(Token::SemiColon) => {
+                if words.any(|t| !matches!(t, Token::EOF)) {
+                    return Err(Error::new("one statement at a time"));
+                }
+                break;
+            }
+            Some(Token::Comma) if any => t = words.next(),
+            _ => {}
+        }
+        read_mode(t, &mut words, &mut modes, &syntax)?;
+        any = true;
     }
-    match level {
-        None => Ok(None),
-        Some(Level::ReadUncommitted) => Ok(Some(Isolation::ReadUncommitted)),
-        Some(Level::ReadCommitted) => Ok(Some(Isolation::ReadCommitted)),
-        Some(Level::RepeatableRead) => Ok(Some(Isolation::RepeatableRead)),
-        Some(Level::Snapshot) => Err(Error::new("syntax error at or near \"SNAPSHOT\"")),
-        Some(other) => Err(Error::new(format!(
-            "ISOLATION LEVEL {other} is not read: the snail's transactions are READ COMMITTED or \
-             REPEATABLE READ"
-        ))),
+    if !any && at != Isolated::Begin {
+        return Err(syntax(None));
     }
+    Ok(Some(match (any, at) {
+        (false, _) => Statement::Begin,
+        (true, at) => Statement::Isolation { modes, at },
+    }))
+}
+
+/// One of a transaction's modes, its first word `first`.
+fn read_mode<'a>(
+    first: Option<&'a sqlparser::tokenizer::Token>,
+    words: &mut (impl Iterator<Item = &'a sqlparser::tokenizer::Token> + Clone),
+    modes: &mut Modes,
+    syntax: &dyn Fn(Option<&sqlparser::tokenizer::Token>) -> Error,
+) -> Result<()> {
+    use sqlparser::tokenizer::Token;
+    let keyword = |t: Option<&Token>| match t {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_uppercase(),
+        _ => String::new(),
+    };
+    match keyword(first).as_str() {
+        "ISOLATION" => {
+            let t = words.next();
+            if keyword(t) != "LEVEL" {
+                return Err(syntax(t));
+            }
+            let t = words.next();
+            modes.level = Some(match keyword(t).as_str() {
+                "SERIALIZABLE" => Isolation::Serializable,
+                "REPEATABLE" => {
+                    let r = words.next();
+                    if keyword(r) != "READ" {
+                        return Err(syntax(r));
+                    }
+                    Isolation::RepeatableRead
+                }
+                "READ" => {
+                    let r = words.next();
+                    match keyword(r).as_str() {
+                        "COMMITTED" => Isolation::ReadCommitted,
+                        "UNCOMMITTED" => Isolation::ReadUncommitted,
+                        _ => return Err(syntax(r)),
+                    }
+                }
+                _ => return Err(syntax(t)),
+            });
+        }
+        "READ" => {
+            let t = words.next();
+            modes.read_only = Some(match keyword(t).as_str() {
+                "ONLY" => true,
+                "WRITE" => false,
+                _ => return Err(syntax(t)),
+            });
+        }
+        "DEFERRABLE" => modes.deferrable = Some(true),
+        "NOT" => {
+            let t = words.next();
+            if keyword(t) != "DEFERRABLE" {
+                return Err(syntax(t));
+            }
+            modes.deferrable = Some(false);
+        }
+        _ => return Err(syntax(first)),
+    }
+    Ok(())
 }
 
 fn table_index(catalog: &Catalog, name: &ObjectName) -> Result<usize> {
@@ -867,6 +1054,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         return Ok(Statement::Declare { ddl, kind });
     }
     let tokens = sqlparser::tokenizer::Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize()?;
+    if let Some(st) = transaction_statement(&tokens)? {
+        return Ok(st);
+    }
     if let Some(read) = crate::ddl::set_constraints(&tokens) {
         let (names, deferred) = read?;
         return Ok(Statement::Constraints { names, deferred });
@@ -891,34 +1081,6 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         _ => return Err(Error::new("one statement at a time")),
     };
     match s {
-        Sql::StartTransaction {
-            modes, statements, ..
-        } if statements.is_empty() => Ok(match isolation(modes)? {
-            None => Statement::Begin,
-            Some(level) => Statement::Isolation {
-                level,
-                at: Isolated::Begin,
-            },
-        }),
-        Sql::Set(sqlparser::ast::Set::SetTransaction {
-            modes,
-            snapshot: None,
-            session,
-        }) => Ok(match isolation(modes)? {
-            None => Statement::Setting {
-                name: match session {
-                    true => "default_transaction_read_only".into(),
-                    false => "transaction_read_only".into(),
-                },
-            },
-            Some(level) => Statement::Isolation {
-                level,
-                at: match session {
-                    true => Isolated::Session,
-                    false => Isolated::Transaction,
-                },
-            },
-        }),
         Sql::Commit { chain: false, .. } => Ok(Statement::Commit),
         Sql::Rollback {
             chain: false,

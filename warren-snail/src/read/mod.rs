@@ -30,6 +30,7 @@ mod question;
 mod ranges;
 mod relations;
 mod rest;
+mod serial;
 mod sets;
 mod spill;
 mod spelled;
@@ -419,6 +420,11 @@ pub struct Snail {
     marking: Option<Option<String>>,
     /// The functions its caller has handed it, which its questions call.
     functions: std::rc::Rc<Vec<std::rc::Rc<handed::Function>>>,
+    /// The serializable transaction under way, and what the next commit writes for one rolled back;
+    /// or the host's monitor that is told of its rounds, the file keeping no marks.
+    serial: std::cell::RefCell<Option<serial::Serial>>,
+    ending: Option<serial::Record>,
+    monitor: Option<std::rc::Rc<dyn crate::carry::Monitor>>,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -662,6 +668,9 @@ impl Snail {
             applier: None,
             marking: None,
             functions: Default::default(),
+            serial: Default::default(),
+            ending: None,
+            monitor: None,
         })
     }
 
@@ -1040,6 +1049,7 @@ impl Snail {
         let (want, columns) = self.want_of(&q);
         let (before, held_before) = (self.touched(), self.pages_held());
         let part = self.part(&want, order)?;
+        self.mark_read(want.side.table, &part.plan.walk)?;
         let w = &part.plan.walk;
         let round = Round {
             order: want.table.orders[w.order].name.clone(),
@@ -1175,6 +1185,7 @@ impl Snail {
         }
         let mut round = scan.round();
         round.pages_at_start = pages_at_start;
+        self.serial_alone_ends()?;
         Ok(round)
     }
 
@@ -1184,7 +1195,13 @@ impl Snail {
         if self.aborted {
             return Err(Error::new(change::ABORTED));
         }
-        let pages_at_start = if self.rounds > 0 && self.begun.is_none() {
+        let begun = self.begun.is_some();
+        let pages_at_start = if self.writer.is_some() && self.levels.serializable(begun) {
+            let before = self.reader.pages_read();
+            self.serial_snapshot(begun)?;
+            self.held = begun;
+            self.reader.pages_read() - before
+        } else if self.rounds > 0 && self.begun.is_none() {
             self.renew()?
         } else if self.rounds > 0 && !self.held {
             let pages = self.renew_in_transaction()?;
@@ -1263,6 +1280,28 @@ impl Snail {
 
     /// Answers a question with its parameters, `$1` and on, given as text: one round.
     pub fn ask_with(
+        &mut self,
+        sql: &str,
+        order: Option<&str>,
+        params: &[String],
+    ) -> Result<(RecordBatch, Round)> {
+        let asked = self.round_asked(sql, order, params);
+        // At SERIALIZABLE a round that fails fails its transaction.
+        let begun = self.begun.is_some();
+        match &asked {
+            Err(_) if self.levels.serializable(begun) && self.writer.is_some() => {
+                if !self.aborted {
+                    self.abandon()?;
+                    self.aborted = begun;
+                }
+            }
+            Err(_) => {}
+            Ok(_) => self.serial_alone_ends()?,
+        }
+        asked
+    }
+
+    fn round_asked(
         &mut self,
         sql: &str,
         order: Option<&str>,
@@ -1582,6 +1621,7 @@ impl Snail {
         };
         let (before, held_before) = (self.touched(), self.pages_held());
         let part = self.part(&want, order)?;
+        self.mark_read(want.side.table, &part.plan.walk)?;
         let directory_pages = self.touched() - before;
         let directory_pages_held = self.pages_held() - held_before;
         let column_pages_held = self.reader.keep_for_round(part.plan.disk_pages());

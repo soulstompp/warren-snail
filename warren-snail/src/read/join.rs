@@ -490,6 +490,7 @@ pub(super) fn ask_join_within(
         let mut mine = Round::default();
         let (before, held_before) = (snail.touched(), snail.pages_held());
         let part = snail.part(&want, None)?;
+        snail.mark_read(want.side.table, &part.plan.walk)?;
         let width: u64 = columns
             .iter()
             .map(|c| super::strands::held_width(table.columns[c.0].ty))

@@ -184,6 +184,14 @@ pub struct Walk {
     pub high: u64,
     pub top: (u64, u64),
     pub statuses: (u64, u64, u64),
+    /// Whether the round marks what it looks at; each block it looked at, by its first key, that a
+    /// key the question holds belongs with, whether or not it reads a row of it; whether it stopped
+    /// above the blocks anywhere, so that it marks the order whole; and whether its conditions hold
+    /// no row whatever the table holds.
+    marking: bool,
+    pub(super) marks: Vec<Vec<KeyValue>>,
+    pub(super) upper: bool,
+    pub(super) empty: bool,
 }
 
 impl Walk {
@@ -564,6 +572,10 @@ impl Snail {
             high: 0,
             top: (0, 0),
             statuses: (0, 0, 0),
+            marking: self.marking(),
+            marks: Vec::new(),
+            upper: false,
+            empty: want.side.empty,
         };
         for e in entries {
             assess(&mut walk, e, order, want);
@@ -1356,11 +1368,57 @@ fn leads_by_its_own(e: &Entry, order: &Order, table: &Table, levels: usize) -> b
     }
 }
 
+/// Whether a key the question holds belongs with an entry, its gaps counted: within its first and the
+/// last the next entry's separator leaves it, whatever its leaves' least and greatest rule out.
+fn belongs(walk: &Walk, e: &Entry, want: &Want) -> bool {
+    if want.side.empty {
+        return false;
+    }
+    let m = walk.m;
+    if m > 0 {
+        let (first, last) = (&e.first[..m], &e.last[..m]);
+        let short = if e.open && crate::directory::kept_len(&e.last) <= m {
+            last <= walk.lo.as_slice()
+        } else {
+            walk.before(last)
+        };
+        if short || walk.past(first) {
+            return false;
+        }
+    }
+    let j = walk.keyed;
+    match want.keys {
+        Some(k) if j > 0 => {
+            let open = e.open && crate::directory::kept_len(&e.last) <= j;
+            k.meets(&e.first[..j], &e.last[..j], open)
+        }
+        _ => true,
+    }
+}
+
+/// One entry on the walk's level, marked where the walk marks: a block a key the question holds
+/// belongs with; above the blocks, an entry it does not go down under marks the order whole.
+fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
+    if !walk.marking {
+        return assess_entry(walk, e, order, want);
+    }
+    let first = belongs(walk, &e, want).then(|| e.first.clone());
+    let open = walk.open.len();
+    assess_entry(walk, e, order, want);
+    if let Some(first) = first {
+        if walk.level == 1 {
+            walk.marks.push(first);
+        } else if walk.open.len() == open {
+            walk.upper = true;
+        }
+    }
+}
+
 /// What a question makes of one entry on the walk's level: none of its rows, so it is skipped; all of
 /// a count, taken from its counts; or rows the round reads under it, left open with the columns it
 /// reads. An open entry adds its columns' pages to the walk's bounds. Above the blocks the fewest are
 /// those pages only where every row under the entry is read whole, since a block under it may hold none.
-fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
+fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let m = walk.m;
     let side = want.side;
     let bounds = narrowed(&e, order, want.table);

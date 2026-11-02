@@ -521,12 +521,6 @@ fn repeatable_read_reads_the_first_statement_s_snapshot_and_refuses_a_row_change
     assert_eq!(rows(&mut a, count), ["4"]);
     run(&mut a, "COMMIT");
     assert_eq!(rows(&mut a, count), ["5"]);
-    // SERIALIZABLE stays refused by name.
-    let e = refused(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
-    assert!(
-        e.starts_with("ISOLATION LEVEL SERIALIZABLE is not read"),
-        "{e}"
-    );
 }
 
 #[test]

@@ -556,7 +556,13 @@ impl Snail {
                 l.clauses[0].strength.words()
             )));
         }
-        let answered = self.locked_answer(&l, order, params);
+        let answered = match self.levels.read_only(self.begun.is_some()) {
+            true => Err(Error::new(format!(
+                "cannot execute SELECT {} in a read-only transaction",
+                l.clauses[0].strength.words()
+            ))),
+            false => self.locked_answer(&l, order, params),
+        };
         if answered.is_err() && self.begun.is_some() {
             self.abandon()?;
             self.aborted = true;

@@ -857,6 +857,15 @@ impl Snails {
         if self.aborted && !matches!(st, Statement::Commit | Statement::Rollback) {
             return Err(Error::new(super::change::ABORTED));
         }
+        if let Statement::Isolation { modes, .. } = &st {
+            if modes.level == Some(statement::Isolation::Serializable) {
+                return Err(Error::new(
+                    "SERIALIZABLE across several snails is not run: a commit's place among another \
+                     snail's generations is known to neither; open each alone, or mount them in \
+                     PostgreSQL, whose monitor sees them all",
+                ));
+            }
+        }
         match st {
             Statement::Begin
             | Statement::Isolation {

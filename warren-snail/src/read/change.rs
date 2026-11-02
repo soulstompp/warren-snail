@@ -97,6 +97,18 @@ pub(super) struct Rebased {
     head: Option<Head>,
 }
 
+impl Rebased {
+    /// The block's first key as it began from it.
+    pub(super) fn first_key(&self) -> &[KeyValue] {
+        &self.first
+    }
+
+    /// The entries that stand for it now.
+    pub(super) fn staged_entries(&self) -> &[Entry] {
+        &self.entries
+    }
+}
+
 /// What a statement under way had staged when it began, and what its foreign keys had recorded.
 struct Mark {
     rebased: BTreeMap<(usize, usize), Vec<Rebased>>,
@@ -757,6 +769,26 @@ impl Snail {
         if let Statement::Question { .. } = st {
             return self.answered(sql, params);
         }
+        // A transaction READ ONLY takes no write, in PostgreSQL's words.
+        let begun = self.begun.is_some();
+        if self.levels.read_only(begun) {
+            let what = match &st {
+                Statement::Insert { .. } => Some("INSERT"),
+                Statement::Update { .. } | Statement::Set { .. } => Some("UPDATE"),
+                Statement::Delete { .. } => Some("DELETE"),
+                Statement::Declare { kind, .. } => Some(*kind),
+                _ => None,
+            };
+            if let Some(what) = what {
+                if begun {
+                    self.abandon()?;
+                    self.aborted = true;
+                }
+                return Err(Error::new(format!(
+                    "cannot execute {what} in a read-only transaction"
+                )));
+            }
+        }
         let writes = !matches!(
             st,
             Statement::Begin
@@ -764,9 +796,22 @@ impl Snail {
                 | Statement::Rollback
                 | Statement::Isolation { .. }
         );
+        let snapshot = writes
+            && !matches!(
+                st,
+                Statement::Setting { .. } | Statement::Constraints { .. }
+            );
         // Each statement reads what was committed when it began; in a transaction, with the
-        // transaction's own changes in place (PostgreSQL's READ COMMITTED).
-        if self.begun.is_none() && self.rounds > 0 {
+        // transaction's own changes in place (PostgreSQL's READ COMMITTED). At SERIALIZABLE the first
+        // that reads takes the transaction's snapshot, its marks with it.
+        if snapshot && self.levels.serializable(begun) {
+            if let Err(e) = self.serial_snapshot(begun) {
+                self.abandon()?;
+                self.aborted = begun;
+                return Err(e);
+            }
+            self.held = begun;
+        } else if self.begun.is_none() && self.rounds > 0 {
             self.renew()?;
         } else if self.begun.is_some() && writes && !self.held {
             self.renew_in_transaction()?;
@@ -793,18 +838,29 @@ impl Snail {
                 if self.begun.is_some() {
                     return Err(Error::new("a transaction is begun already"));
                 }
+                let modes = match st {
+                    Statement::Isolation { modes, .. } => modes,
+                    _ => Default::default(),
+                };
+                if modes.level == Some(statement::Isolation::Serializable) {
+                    self.serial_allowed(true)?;
+                }
                 self.begun = Some((self.root.clone(), false));
-                self.levels.begin(match st {
-                    Statement::Isolation { level, .. } => Some(level),
-                    _ => None,
-                });
+                self.levels.begin(modes);
                 false
             }
-            // A level named for the transaction or the session; one changed after the
+            // Modes named for the transaction or the session; a level changed after the
             // transaction's first read fails the transaction, as PostgreSQL's does.
-            Statement::Isolation { level, at } => {
-                if let Err(e) = self.levels.set(level, at, self.begun.is_some()) {
-                    self.aborted = self.begun.is_some();
+            Statement::Isolation { modes, at } => {
+                let begun = self.begun.is_some();
+                let set = (if modes.level == Some(statement::Isolation::Serializable) {
+                    self.serial_allowed(at == statement::Isolated::Transaction && begun)
+                } else {
+                    Ok(())
+                })
+                .and_then(|_| self.levels.set(modes, at, begun));
+                if let Err(e) = set {
+                    self.aborted = begun;
                     return Err(e);
                 }
                 false
@@ -883,9 +939,17 @@ impl Snail {
                             // newest version and still meeting its conditions, as PostgreSQL checks
                             // a row changed meanwhile again. The blocks it locked stay locked.
                             // At REPEATABLE READ it finds its rows again on the newest root too, read
-                            // beside the generation the transaction holds, and is refused.
+                            // beside the generation the transaction holds, and is refused; a row
+                            // written goes into a block it cannot read beside that generation.
                             self.back_to(&mark);
                             if self.held {
+                                if matches!(st, Statement::Insert { .. }) {
+                                    self.abandon()?;
+                                    self.aborted = self.begun.is_some();
+                                    return Err(Error::new(
+                                        "could not serialize access due to concurrent update",
+                                    ));
+                                }
                                 let newest = self.reader.peek_root()?;
                                 self.in_transaction_on(newest)?;
                             } else if self.begun.is_some() {
@@ -906,17 +970,34 @@ impl Snail {
         };
         if let Some((_, any)) = self.begun.as_mut() {
             *any |= changed;
-        } else if changed {
+        } else if changed || self.serial_records()? {
             self.commit()?;
         } else {
             // A statement alone, or a transaction's end, that wrote nothing lets go of what it
-            // locked.
+            // locked, tested first at SERIALIZABLE.
+            let tested = self.serial_tested_alone();
             self.let_go_blocks()?;
+            self.serial_end()?;
+            tested?;
         }
         done.generation = self.root.generation;
         done.pages_read = self.reader.pages_read() - read0;
         done.pages_written = self.written() - written0;
         done.pages_reused = self.reused - reused0;
+        Ok(done)
+    }
+
+    /// Begins a transaction that reads one snapshot, as REPEATABLE READ does, on the root `other`
+    /// reads: inside a host, a writer's transaction on the generation the host's transaction holds.
+    pub fn begin_on(&mut self, other: &Snail) -> Result<Done> {
+        let done = self.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")?;
+        self.root = other.root.clone();
+        self.catalog = other.catalog.clone();
+        if let Some((began, _)) = self.begun.as_mut() {
+            *began = other.root.clone();
+        }
+        self.held = true;
+        self.levels.read();
         Ok(done)
     }
 
@@ -1621,7 +1702,8 @@ impl Snail {
         if self.declared.take().is_some() {
             self.catalog = Snail::catalog(&self.reader, &self.root)?;
         }
-        self.let_go_blocks()
+        self.let_go_blocks()?;
+        self.serial_end()
     }
 
     /// Lets go of every block and row it locked, and of its marks on the tables whose rows it
@@ -1688,10 +1770,12 @@ impl Snail {
     /// Commits what the statement, or the transaction, staged: each block it wrote spliced into the
     /// newest directory in place of the block it began from, its staged pages written into the file,
     /// the directory pages above them afresh, then the root.
-    fn commit(&mut self) -> Result<()> {
+    pub(super) fn commit(&mut self) -> Result<()> {
         let mut w = self.writer.take().expect("a snail open to write");
         let turn = lock::take_root_turn(w.file());
-        let committed = turn.and_then(|_| self.commit_with(&mut w));
+        let committed = turn
+            .and_then(|_| self.serial_tested(w.file()))
+            .and_then(|_| self.commit_with(&mut w));
         let given = lock::give_root_turn(w.file());
         self.writer = Some(w);
         match committed {
@@ -1707,7 +1791,7 @@ impl Snail {
     }
 
     /// The commit, at the root's turn: it begins from the newest root.
-    fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
+    pub(super) fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
         // A transaction's root carries its host's tag; a sequence's advance lands at once.
         let advance = self.advancing.is_some();
         let mut root = self.commit_pages(w, &[])?;
@@ -1874,6 +1958,9 @@ impl Snail {
                 carried,
             });
         }
+        // The serializable transactions' records, and what the host's monitor is told of its cuts.
+        self.tell_cuts()?;
+        self.records_at_commit(w, &mut root, generation, &mut gone)?;
         let rebased = std::mem::take(&mut self.rebased);
         for ((ti, oi), blocks) in rebased {
             let table = &self.catalog.tables[ti];
@@ -2325,6 +2412,7 @@ impl Snail {
                     return Ok(None);
                 }
             }
+            self.mark_wrote(ti, oi, &[b])?;
             let rows: Vec<Vec<Datum>> = effects.into_iter().map(|e| e.values).collect();
             let (entries, first) = self.written_in_order(w, table, order, rows)?;
             top.entries = entries;
@@ -2348,10 +2436,16 @@ impl Snail {
                 by_block.entry(path).or_default().push(e);
             }
             let blocks: Vec<Entry> = by_block.keys().map(|p| entry_at(&top, p).clone()).collect();
+            let bytes: Vec<u64> = blocks
+                .iter()
+                .filter(|e| e.child.start < STAGED)
+                .map(|e| lock::block_byte_of(ti, oi, &e.first))
+                .collect();
             if !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
                 self.stale = true;
                 return Ok(None);
             }
+            self.mark_wrote(ti, oi, &bytes)?;
             for (path, effects) in by_block {
                 let entry = entry_at(&top, &path).clone();
                 let (new, rewrote) =

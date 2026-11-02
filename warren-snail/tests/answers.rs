@@ -610,37 +610,32 @@ fn the_level_the_snail_runs_is_taken_in_each_of_its_spellings() {
         .is_err());
     w.execute("ROLLBACK").unwrap();
     assert_eq!(count(&mut w), 10);
-    // The levels the snail does not run, by name, the last a statement names deciding; READ ONLY.
-    for (s, why) in [
-        (
-            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-            "ISOLATION LEVEL SERIALIZABLE",
-        ),
-        (
-            "BEGIN ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL SERIALIZABLE",
-            "ISOLATION LEVEL SERIALIZABLE",
-        ),
-        (
-            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-            "ISOLATION LEVEL SERIALIZABLE",
-        ),
+    // The modes as PostgreSQL's grammar takes them, the last of each deciding; and those it does not.
+    for s in [
+        "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN WORK ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN READ ONLY",
+        "BEGIN READ ONLY, READ WRITE NOT DEFERRABLE, DEFERRABLE",
     ] {
-        assert_eq!(
-            w.execute(s).unwrap_err().to_string(),
-            format!(
-                "{why} is not read: the snail's transactions are READ COMMITTED or REPEATABLE READ"
-            ),
-            "{s}"
-        );
+        assert_eq!(w.execute(s).unwrap().statement, "BEGIN", "{s}");
+        w.execute("ROLLBACK").unwrap();
+    }
+    for (s, near) in [
+        ("BEGIN ISOLATION LEVEL SNAPSHOT", "SNAPSHOT"),
+        ("BEGIN DEFERRED", "DEFERRED"),
+        ("BEGIN READ", ""),
+        ("BEGIN ISOLATION READ ONLY", "READ"),
+        ("BEGIN, READ ONLY", ","),
+        ("BEGIN READ ONLY,", ""),
+    ] {
+        let e = w.execute(s).unwrap_err().to_string();
+        match near {
+            "" => assert_eq!(e, "syntax error at end of input", "{s}"),
+            near => assert_eq!(e, format!("syntax error at or near \"{near}\""), "{s}"),
+        }
     }
     assert_eq!(
-        w.execute("BEGIN READ ONLY").unwrap_err().to_string(),
-        "READ ONLY is not read: a transaction of the snail's reads and writes"
-    );
-    assert_eq!(
-        w.execute("BEGIN ISOLATION LEVEL SNAPSHOT")
-            .unwrap_err()
-            .to_string(),
-        "syntax error at or near \"SNAPSHOT\""
+        w.execute("SET TRANSACTION").unwrap_err().to_string(),
+        "syntax error at end of input"
     );
 }

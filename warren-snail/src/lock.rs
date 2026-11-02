@@ -409,17 +409,26 @@ pub(crate) fn holder(file: &File, byte: u64) -> Result<Option<u64>> {
 pub(crate) fn holders(file: &File, byte: u64) -> Result<Vec<u64>> {
     let start = HOLDS + ((byte - BLOCKS) << 16);
     let mut out = Vec::new();
-    let mut from = 0;
-    while from < WRITER_SLOTS {
-        match held_at(file, start + from, WRITER_SLOTS - from)? {
-            Some((at, n)) => {
-                out.push(at - start);
-                from = at - start + n.max(1);
-            }
-            None => break,
-        }
-    }
+    all_held(file, start, WRITER_SLOTS, &mut |at| out.push(at - start))?;
     Ok(out)
+}
+
+/// Every lock another file holds on `start..start + len`, by its first byte: the kernel answers with
+/// any one of them, so the run is asked again on each side of it.
+fn all_held(file: &File, start: u64, len: u64, each: &mut dyn FnMut(u64)) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let Some((at, n)) = held_at(file, start, len)? else {
+        return Ok(());
+    };
+    let at = at.max(start);
+    let end = at.saturating_add(n.max(1)).min(start + len);
+    all_held(file, start, at - start, each)?;
+    for byte in at..end {
+        each(byte);
+    }
+    all_held(file, end, start + len - end, each)
 }
 
 /// The lock byte of the block the writer in another file's `slot` waits for, if it waits.
@@ -444,6 +453,161 @@ pub fn take_root_turn(file: &File) -> Result<()> {
 
 pub fn give_root_turn(file: &File) -> Result<()> {
     give(file, ROOT_TURN, 1)
+}
+
+/// The bytes of a serializable transaction's marks, a run each: what it has read and who it is, the
+/// edges it found and the transactions it doomed. Each goes with the file that holds it.
+const SERIAL: u64 = (1 << 62) + (1 << 60);
+/// A byte for each block and slot: the transaction in that slot read the block, gaps and all.
+const READ_MARKS: u64 = SERIAL;
+/// A byte for each slot and transaction: the serializable transaction in that slot.
+const SERIAL_OF: u64 = SERIAL + (1 << 56);
+/// A byte for each slot and generation: the snapshot of the transaction in that slot.
+const SERIAL_SNAPSHOT: u64 = SERIAL + (2 << 56);
+/// A byte for each slot: the transaction in that slot was not declared READ ONLY.
+const SERIAL_WRITES: u64 = SERIAL + (3 << 56);
+/// A byte for each slot and transaction: the transaction in that slot read what the other wrote.
+const EDGE_OUT: u64 = SERIAL + (4 << 56);
+/// A byte for each slot and transaction: the other read what the transaction in that slot wrote.
+const EDGE_IN: u64 = SERIAL + (5 << 56);
+/// A byte for each slot and transaction: the transaction in that slot doomed the other.
+const DOOMS: u64 = SERIAL + (6 << 56);
+/// A byte for each slot and generation: the transaction in that slot passed its commit's test and
+/// its commit is that generation.
+const SERIAL_PREPARED: u64 = SERIAL + (7 << 56);
+/// The byte whose lock is the turn at the marks: an edge and its test, a commit's test, and a
+/// transaction's end, one at a time.
+const SERIAL_TURN: u64 = SERIAL + (8 << 56);
+const SERIAL_NAMES: u64 = 1 << 40;
+
+/// The byte of an order's own mark, which a read holds for all of it and a writer of any of it.
+pub(crate) fn order_byte(table: usize, order: usize) -> u64 {
+    block_byte(&(table as u64, order as u64, "order"))
+}
+
+/// A serializable transaction's mark among those of every process now running: its process and its
+/// count there.
+pub(crate) fn serial_id() -> u64 {
+    static BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = BEGUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ((u64::from(std::process::id()) << 18) | (n & 0x3_ffff)) % SERIAL_NAMES
+}
+
+/// Takes or lets go of a mark on one byte.
+fn mark(file: &File, byte: u64, on: bool) -> Result<()> {
+    match on {
+        true => take(file, Kind::Alone, byte, 1, false).map(|_| ()),
+        false => give(file, byte, 1),
+    }
+}
+
+/// Marks that the transaction in `slot` read the block of lock byte `byte`, or no longer does.
+pub(crate) fn mark_read(file: &File, slot: u64, byte: u64, on: bool) -> Result<()> {
+    mark(file, READ_MARKS + ((byte - BLOCKS) << 16) + slot, on)
+}
+
+/// The slots of the other transactions that read the block of lock byte `byte`.
+pub(crate) fn readers(file: &File, byte: u64) -> Result<Vec<u64>> {
+    let start = READ_MARKS + ((byte - BLOCKS) << 16);
+    let mut out = Vec::new();
+    all_held(file, start, WRITER_SLOTS, &mut |at| out.push(at - start))?;
+    Ok(out)
+}
+
+/// Marks the serializable transaction `id` in `slot`, or lets it go.
+pub(crate) fn mark_serial(file: &File, slot: u64, id: u64, on: bool) -> Result<()> {
+    mark(file, SERIAL_OF + (slot << 40) + id, on)
+}
+
+/// Every other serializable transaction running on the file: its slot and its mark.
+pub(crate) fn serials(file: &File) -> Result<Vec<(u64, u64)>> {
+    let mut out = Vec::new();
+    all_held(file, SERIAL_OF, WRITER_SLOTS << 40, &mut |at| {
+        out.push(((at - SERIAL_OF) >> 40, (at - SERIAL_OF) % SERIAL_NAMES))
+    })?;
+    Ok(out)
+}
+
+/// Waits until the serializable transaction `id` in another file's `slot` has ended, as long as it
+/// takes, holding no lock.
+pub(crate) fn wait_serial_end(file: &File, slot: u64, id: u64) -> Result<()> {
+    let mut nap = std::time::Duration::from_millis(1);
+    while held_at(file, SERIAL_OF + (slot << 40) + id, 1)?.is_some() {
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// Marks the snapshot of the transaction in `slot`, or lets it go.
+pub(crate) fn mark_snapshot(file: &File, slot: u64, generation: u64, on: bool) -> Result<()> {
+    mark(file, SERIAL_SNAPSHOT + (slot << 40) + generation, on)
+}
+
+/// The snapshot of the transaction in another file's `slot`.
+pub(crate) fn snapshot_of(file: &File, slot: u64) -> Result<Option<u64>> {
+    first_held(file, SERIAL_SNAPSHOT + (slot << 40), SERIAL_NAMES)
+}
+
+/// Marks that the transaction in `slot` was not declared READ ONLY, or lets it go.
+pub(crate) fn mark_writes(file: &File, slot: u64, on: bool) -> Result<()> {
+    mark(file, SERIAL_WRITES + slot, on)
+}
+
+/// Whether the transaction in another file's `slot` was not declared READ ONLY.
+pub(crate) fn writes_in(file: &File, slot: u64) -> Result<bool> {
+    Ok(first_held(file, SERIAL_WRITES + slot, 1)?.is_some())
+}
+
+/// Marks an edge the transaction in `slot` found, out to or in from the transaction `other`, or lets
+/// it go.
+pub(crate) fn mark_edge(file: &File, slot: u64, out: bool, other: u64, on: bool) -> Result<()> {
+    let run = if out { EDGE_OUT } else { EDGE_IN };
+    mark(file, run + (slot << 40) + other, on)
+}
+
+/// The transactions another file's `slot` found edges with, out to them or in from them.
+pub(crate) fn edges_in_slot(file: &File, slot: u64, out: bool) -> Result<Vec<u64>> {
+    let start = (if out { EDGE_OUT } else { EDGE_IN }) + (slot << 40);
+    let mut found = Vec::new();
+    all_held(file, start, SERIAL_NAMES, &mut |at| found.push(at - start))?;
+    Ok(found)
+}
+
+/// Whether another file's `slot` found an edge with the transaction `other`, out to it or in from it.
+pub(crate) fn edge_with(file: &File, slot: u64, out: bool, other: u64) -> Result<bool> {
+    let run = if out { EDGE_OUT } else { EDGE_IN };
+    Ok(first_held(file, run + (slot << 40) + other, 1)?.is_some())
+}
+
+/// Marks that the transaction in `slot` doomed the transaction `other`, or lets it go.
+pub(crate) fn mark_doom(file: &File, slot: u64, other: u64, on: bool) -> Result<()> {
+    mark(file, DOOMS + (slot << 40) + other, on)
+}
+
+/// Whether another file's `slot` doomed the transaction `other`.
+pub(crate) fn doomed_by(file: &File, slot: u64, other: u64) -> Result<bool> {
+    Ok(first_held(file, DOOMS + (slot << 40) + other, 1)?.is_some())
+}
+
+/// Marks that the transaction in `slot` passed its commit's test, its commit being `generation`, or
+/// lets it go.
+pub(crate) fn mark_prepared(file: &File, slot: u64, generation: u64, on: bool) -> Result<()> {
+    mark(file, SERIAL_PREPARED + (slot << 40) + generation, on)
+}
+
+/// The commit of the transaction in another file's `slot`, where it passed its test.
+pub(crate) fn prepared_of(file: &File, slot: u64) -> Result<Option<u64>> {
+    first_held(file, SERIAL_PREPARED + (slot << 40), SERIAL_NAMES)
+}
+
+/// Waits for the turn at the marks, as short as an edge's test or a commit's.
+pub(crate) fn take_serial_turn(file: &File) -> Result<()> {
+    take(file, Kind::Alone, SERIAL_TURN, 1, true).map(|_| ())
+}
+
+pub(crate) fn give_serial_turn(file: &File) -> Result<()> {
+    give(file, SERIAL_TURN, 1)
 }
 
 #[cfg(test)]

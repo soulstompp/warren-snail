@@ -404,6 +404,18 @@ pub struct Root {
     /// The source the snail is a replica of, where it is marked one: every writer but the applier
     /// presenting that source is refused while the mark stands. Format 9 only.
     pub replica: Option<String>,
+    /// The serializable transactions' records: each committed one's marks and edges, kept while a
+    /// round older than its commit runs. Format 9 only.
+    pub serial: Extent,
+}
+
+/// What a snail of a format older than this build's says of a serializable transaction: its root
+/// holds no records of one.
+pub(crate) fn serial_refused(format: u32) -> Error {
+    Error::new(format!(
+        "a snail of format {format} runs no SERIALIZABLE transaction, its root holding no records of \
+         one: put the snail `out` and `write` it afresh, in format {FORMAT}"
+    ))
 }
 
 /// The default collation a file names where it names none: libc C.UTF-8, which orders text by its
@@ -627,13 +639,19 @@ impl Root {
                     o.u32(w.crc);
                 }
             }
+            // Whether a transaction across snails is pending, and whether the serializable
+            // transactions' records follow.
+            let records = if self.serial.bytes > 0 { 2 } else { 0 };
             match &self.pending {
-                None => o.u8(0),
+                None => o.u8(records),
                 Some(p) => {
-                    o.u8(1);
+                    o.u8(1 + records);
                     o.str(&p.decider);
                     o.u64(p.at);
                 }
+            }
+            if self.serial.bytes > 0 {
+                o.extent(self.serial);
             }
             // A root marked a replica carries its source, then whether its host tagged it.
             match &self.replica {
@@ -667,6 +685,8 @@ impl Root {
                 "a snail of format {format} is written by no transaction across snails: `out`, \
                  then `write`"
             )));
+        } else if self.serial.bytes > 0 {
+            return Err(serial_refused(format));
         }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
@@ -727,7 +747,7 @@ impl Root {
         } else {
             String::new()
         };
-        let (decided, pending) = if format >= FORMAT && !ended(&i) {
+        let (decided, pending, serial) = if format >= FORMAT && !ended(&i) {
             let n = i.u32().ok()? as usize;
             let mut decided = Vec::with_capacity(n.min(256));
             for _ in 0..n {
@@ -744,16 +764,21 @@ impl Root {
                 }
                 decided.push(Decision { at, roots, carried });
             }
-            let pending = match i.u8().ok()? {
+            let marks = i.u8().ok()?;
+            let pending = match marks & 1 {
                 0 => None,
                 _ => Some(Pending {
                     decider: i.str().ok()?,
                     at: i.u64().ok()?,
                 }),
             };
-            (decided, pending)
+            let serial = match marks & 2 {
+                0 => Extent::default(),
+                _ => i.extent().ok()?,
+            };
+            (decided, pending, serial)
         } else {
-            (Vec::new(), None)
+            (Vec::new(), None, Extent::default())
         };
         // A root its host tagged carries the tag last; one marked a replica carries its source,
         // then whether its host tagged it.
@@ -789,6 +814,7 @@ impl Root {
                 pending,
                 host,
                 replica,
+                serial,
             },
             format,
         ))

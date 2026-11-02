@@ -85,6 +85,21 @@ pub trait Judge {
     }
 }
 
+/// What is told, inside a host with a monitor of its own, of each place a round reads and each block a
+/// write changes, so that the host's monitor is the one monitor: the file keeps no marks. A block
+/// comes by its lock's byte, an order by its table's and its own names; its top is every place of it.
+/// An error refuses the round.
+pub trait Monitor {
+    /// A round read the block, gaps and all; or, with none, every place of the order.
+    fn read(&self, table: &str, order: &str, block: Option<u64>) -> Result<()>;
+
+    /// A write changes the block.
+    fn wrote(&self, table: &str, order: &str, block: u64) -> Result<()>;
+
+    /// A commit cut the block `from`, or laid it out afresh: what `to` holds lay in it.
+    fn cut(&self, table: &str, order: &str, from: u64, to: u64) -> Result<()>;
+}
+
 /// The root a round takes from the snail at `path` as `judge` decides, its page as it lies in the
 /// file: what a host that keeps the root hands a writer outside it, which takes that root.
 pub fn taken_root(path: &Path, judge: &dyn Judge) -> Result<Vec<u8>> {
