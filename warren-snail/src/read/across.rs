@@ -512,6 +512,13 @@ impl Snails {
     /// The root pages each snail read.
     fn moment(&mut self) -> Result<Vec<u64>> {
         let n = self.snails.len();
+        // A transaction of one snapshot took its moment with its first statement.
+        if self.snails.iter().all(|s| s.held) {
+            for s in &mut self.snails {
+                s.rounds += 1;
+            }
+            return Ok(vec![0; n]);
+        }
         let before: Vec<u64> = self.snails.iter().map(Snail::pages_read).collect();
         loop {
             for i in 0..n {
@@ -685,6 +692,54 @@ impl Snails {
         if self.aborted {
             return Err(Error::new(super::change::ABORTED));
         }
+        // A question alone, at a session's SERIALIZABLE, is a transaction that ends with it.
+        if self.writing && !self.begun && self.snails[0].levels.serializable(false) {
+            self.execute_across("BEGIN")?;
+            let asked = self.asked(sql, params);
+            let end = if asked.is_ok() { "COMMIT" } else { "ROLLBACK" };
+            let ended = self.execute_across(end);
+            let answer = asked?;
+            ended?;
+            return Ok(answer);
+        }
+        let asked = self.asked(sql, params);
+        // At SERIALIZABLE a round that fails fails its transaction.
+        if asked.is_err() && self.begun && self.snails[0].levels.serializable(true) {
+            self.aborted = true;
+            for s in &mut self.snails {
+                s.aborted = true;
+            }
+        }
+        asked
+    }
+
+    /// A transaction of one snapshot's first statement: its one moment on every snail, held for its
+    /// life; at SERIALIZABLE, its marks taken on each.
+    fn one_snapshot(&mut self) -> Result<()> {
+        if !self.begun {
+            return Ok(());
+        }
+        if self.snails[0].levels.serializable(true) {
+            if self.snails[0].serial.borrow().is_none() {
+                let mut all: Vec<&mut Snail> = self.snails.iter_mut().collect();
+                super::serial::snapshot_taken(&mut all, true)?;
+                for s in &mut self.snails {
+                    s.held = true;
+                    s.rounds += 1;
+                    s.levels.read();
+                }
+            }
+        } else if self.snails[0].levels.repeatable(true) && !self.snails[0].held {
+            self.moment()?;
+            for s in &mut self.snails {
+                s.held = true;
+                s.levels.read();
+            }
+        }
+        Ok(())
+    }
+
+    fn asked(&mut self, sql: &str, params: &[String]) -> Result<(RecordBatch, Round)> {
         // Its clock is the transaction's across the snails, begun at BEGIN or with the round alone.
         let at = super::change::wall_micros();
         let _clocked = crate::scalars::clocked(
@@ -697,11 +752,17 @@ impl Snails {
         );
         let _handed = super::handed::holding(&self.functions);
         let room = self.snails[0].reader.room();
-        let _room = crate::room::entered(&room);
+        let entered = crate::room::entered(&room);
+        if entered.outermost() {
+            for s in &self.snails {
+                room.hold_anyway(s.own_bytes());
+            }
+        }
         let mut read = self.snails_named(sql)?;
         if read.is_empty() {
             read.push(0);
         }
+        self.one_snapshot()?;
         let at_start = self.moment()?;
         for s in &self.snails {
             s.wasted.borrow_mut().clear();
@@ -857,14 +918,24 @@ impl Snails {
         if self.aborted && !matches!(st, Statement::Commit | Statement::Rollback) {
             return Err(Error::new(super::change::ABORTED));
         }
-        if let Statement::Isolation { modes, .. } = &st {
-            if modes.level == Some(statement::Isolation::Serializable) {
-                return Err(Error::new(
-                    "SERIALIZABLE across several snails is not run: a commit's place among another \
-                     snail's generations is known to neither; open each alone, or mount them in \
-                     PostgreSQL, whose monitor sees them all",
-                ));
-            }
+        // A statement alone, at a session's SERIALIZABLE, is a transaction that ends with it.
+        if !self.begun
+            && self.snails[0].levels.serializable(false)
+            && matches!(
+                st,
+                Statement::Insert { .. }
+                    | Statement::Update { .. }
+                    | Statement::Delete { .. }
+                    | Statement::Set { .. }
+            )
+        {
+            self.execute_across("BEGIN")?;
+            let done = self.execute_across(sql);
+            let end = if done.is_ok() { "COMMIT" } else { "ROLLBACK" };
+            let ended = self.execute_across(end);
+            let done = done?;
+            ended?;
+            return Ok(done);
         }
         match st {
             Statement::Begin
@@ -977,6 +1048,13 @@ impl Snails {
                         )));
                     }
                 }
+                if let Err(e) = self.one_snapshot() {
+                    self.aborted = self.begun;
+                    for s in &mut self.snails {
+                        s.aborted = self.aborted;
+                    }
+                    return Err(e);
+                }
                 let done = self.run(i, sql)?;
                 if self.begun && !self.written.contains(&i) {
                     self.written.push(i);
@@ -1030,9 +1108,11 @@ impl Snails {
             });
         }
         let mut written = std::mem::take(&mut self.written);
-        // A prune in the transaction writes its snail too.
+        // A prune in the transaction writes its snail too, and a serializable transaction's record each
+        // file where another could meet what it read.
         for (i, s) in self.snails.iter().enumerate() {
-            if s.begun.as_ref().is_some_and(|b| b.1) && !written.contains(&i) {
+            let wrote = s.begun.as_ref().is_some_and(|b| b.1);
+            if (wrote || s.serial_records()?) && !written.contains(&i) {
                 written.push(i);
             }
         }
@@ -1097,7 +1177,10 @@ impl Snails {
             }
         }
         if landed.is_ok() {
-            landed = self.land(&written, &names, &mut writers);
+            landed = written
+                .iter()
+                .try_for_each(|&i| self.snails[i].serial_tested())
+                .and_then(|_| self.land(&written, &names, &mut writers));
         }
         let mut given = Ok(());
         for &i in taken.iter().rev() {

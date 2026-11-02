@@ -756,3 +756,139 @@ fn an_older_format_refuses_a_write_of_a_block_written_since_by_name() {
     let mut r = Snail::open(&path).unwrap();
     assert_eq!((value(&mut r, C), value(&mut r, D)), (2, 3));
 }
+
+#[test]
+fn a_child_written_beside_a_key_taken_is_refused_at_the_commit() {
+    let path = tmp("beside-keys-commit.snail");
+    let ddl = "CREATE TABLE s.p (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p (id), PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut b, "INSERT INTO s.p (id, v) VALUES (1, 1), (2, 2)");
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    run(&mut a, "DELETE FROM s.p WHERE id = 1");
+    // A writer at READ COMMITTED reads the key as the newest root holds it.
+    run(&mut b, "INSERT INTO s.c (id, r) VALUES (1, 1)");
+    assert_eq!(
+        refused(&mut a, "COMMIT"),
+        "could not serialize access due to concurrent update"
+    );
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.p p"), 2);
+}
+
+#[test]
+fn a_row_past_the_bytes_a_transaction_names_is_met_at_its_commit() {
+    let path = made("past-named");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    run(&mut a, "UPDATE s.t SET v = -1 WHERE id >= 16384");
+    // Its rows are not named: another's commit of one of them does not wait.
+    run(&mut b, &format!("UPDATE s.t SET v = -2 WHERE id = {C}"));
+    assert_eq!(
+        refused(&mut a, "COMMIT"),
+        "could not serialize access due to concurrent update"
+    );
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!((value(&mut r, C), value(&mut r, D)), (-2, i64::from(D)));
+}
+
+#[test]
+fn a_table_another_declared_an_order_of_since_refuses_its_rows() {
+    let path = tmp("beside-declared.snail");
+    let ddl = "CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.e (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.t t"), 0);
+    run(&mut b, "CREATE INDEX e_v ON s.e (v)");
+    run(&mut a, "INSERT INTO s.e (id, v) VALUES (1, 1)");
+    assert_eq!(
+        refused(&mut a, "COMMIT"),
+        "could not serialize access due to concurrent update"
+    );
+    // On a table it left as it was, another's DDL does not stand in the way.
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.t t"), 0);
+    run(&mut b, "CREATE INDEX e_id ON s.e (id, v)");
+    run(&mut a, "INSERT INTO s.t (id, v) VALUES (1, 1)");
+    run(&mut a, "COMMIT");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.t t"), 1);
+}
+
+#[test]
+fn a_table_declared_in_the_transaction_takes_its_rows_at_its_commit() {
+    let path = made("declared-here");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, SECOND_BLOCK), 1024);
+    run(&mut a, &format!("INSERT INTO s.t (id, v) VALUES ({}, 1)", C + 1));
+    run(
+        &mut a,
+        "CREATE TABLE s.n (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&mut a, "INSERT INTO s.n (id, v) VALUES (1, 1), (2, 2)");
+    run(&mut b, &format!("UPDATE s.t SET v = 5 WHERE id = {D}"));
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.n n"), 2);
+    run(&mut a, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.n n"), 2);
+    assert_eq!((value(&mut r, C + 1), value(&mut r, D)), (1, 5));
+}
+
+#[test]
+fn rows_of_every_kind_of_value_are_found_on_the_newest_version_by_their_values() {
+    let path = tmp("beside-kinds.snail");
+    let ddl = "CREATE TABLE s.k (id integer NOT NULL, t text, n numeric(30, 2), u uuid, a integer[], \
+               i interval, f double precision, d timestamptz, r int4range, j jsonb, PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    let row = |id: i32| {
+        format!(
+            "({id}, 'x{id}', {id}.25, '00000000-0000-0000-0000-00000000000{}', '{{1,{id}}}', \
+             '{id} days', {id}.5, '2026-01-0{} 00:00:00+00', '[1,{}]', '{{\"a\": {id}}}')",
+            id % 10,
+            1 + id % 9,
+            id + 1
+        )
+    };
+    let values: Vec<String> = (1..=8).map(row).collect();
+    run(
+        &mut b,
+        &format!(
+            "INSERT INTO s.k (id, t, n, u, a, i, f, d, r, j) VALUES {}",
+            values.join(", ")
+        ),
+    );
+    run(&mut b, "INSERT INTO s.k (id) VALUES (9)");
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.k k"), 9);
+    // Another's row of the block changed since; rows of every kind of value, and one all NULLs.
+    run(&mut b, "UPDATE s.k SET t = 'changed' WHERE id = 2");
+    run(&mut a, "UPDATE s.k SET t = 'mine' WHERE id = 3");
+    run(&mut a, "DELETE FROM s.k WHERE id = 4");
+    run(&mut a, "UPDATE s.k SET t = 'mine' WHERE id = 9");
+    assert_eq!(
+        refused(&mut a, "UPDATE s.k SET t = 'mine' WHERE id = 2"),
+        "could not serialize access due to concurrent update"
+    );
+    run(&mut a, "ROLLBACK");
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.k k"), 9);
+    run(&mut b, "UPDATE s.k SET t = 'changed' WHERE id = 1");
+    run(&mut a, "UPDATE s.k SET t = 'mine' WHERE id = 3");
+    run(&mut a, "DELETE FROM s.k WHERE id = 4");
+    run(&mut a, "UPDATE s.k SET t = 'mine' WHERE id = 9");
+    run(&mut a, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.k k"), 8);
+    assert_eq!(
+        count(&mut r, "SELECT count(*) FROM s.k k WHERE k.t = 'mine'"),
+        2
+    );
+    assert_eq!(
+        count(&mut r, "SELECT count(*) FROM s.k k WHERE k.t = 'changed'"),
+        2
+    );
+}

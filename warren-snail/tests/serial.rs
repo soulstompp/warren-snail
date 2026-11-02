@@ -14,7 +14,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
 use warren_snail::catalog::Catalog;
-use warren_snail::read::{Done, Snail};
+use warren_snail::read::{Done, Snail, Snails};
 use warren_snail::values::{push_datum, Values};
 use warren_snail::write::Rows;
 use weather::{one, tmp, write};
@@ -406,15 +406,29 @@ fn range_of(x: i32) -> (i32, i32) {
     }
 }
 
-fn statement(step: Step, t: usize, k: usize) -> String {
+/// The table a walk's row `x` lies in: on several snails, `B`'s block lies in a snail of its own.
+fn table_of(x: i32, several: bool) -> &'static str {
+    match several && x == B {
+        true => "o.t",
+        false => "s.t",
+    }
+}
+
+fn statement(step: Step, t: usize, k: usize, several: bool) -> String {
     match step {
         Step::Read(x) => {
             let (a, z) = range_of(x);
-            format!("SELECT sum(t.v), count(*) FROM s.t t WHERE t.id >= {a} AND t.id <= {z}")
+            let table = table_of(x, several);
+            format!("SELECT sum(t.v), count(*) FROM {table} t WHERE t.id >= {a} AND t.id <= {z}")
         }
-        Step::Write(x) => format!("UPDATE s.t SET v = {} WHERE id = {x}", value_of(t, k)),
+        Step::Write(x) => format!(
+            "UPDATE {} SET v = {} WHERE id = {x}",
+            table_of(x, several),
+            value_of(t, k)
+        ),
         Step::Insert(x) => format!(
-            "INSERT INTO s.t (id, v) VALUES ({}, {})",
+            "INSERT INTO {} (id, v) VALUES ({}, {})",
+            table_of(x, several),
             inserted_at(x, t, k),
             value_of(t, k)
         ),
@@ -470,15 +484,50 @@ type Ran = (bool, Vec<Answered>);
 /// What one step of a transaction came to: its read's answer, or none, or the words of its failure.
 type Came = Result<Answered, String>;
 
+/// A writer of one snail, or of several opened together.
+enum Session {
+    One(Snail),
+    Several(Snails),
+}
+
+impl Session {
+    fn open(paths: &[PathBuf]) -> Session {
+        match paths {
+            [one] => Session::One(Snail::open_writing(one).unwrap()),
+            _ => {
+                let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+                Session::Several(Snails::open_writing(&refs).unwrap())
+            }
+        }
+    }
+
+    fn ask(
+        &mut self,
+        sql: &str,
+    ) -> warren_snail::Result<(arrow::array::RecordBatch, warren_snail::read::Round)> {
+        match self {
+            Session::One(s) => s.ask(sql, None),
+            Session::Several(s) => s.ask(sql),
+        }
+    }
+
+    fn execute(&mut self, sql: &str) -> warren_snail::Result<Done> {
+        match self {
+            Session::One(s) => s.execute(sql),
+            Session::Several(s) => s.execute(sql),
+        }
+    }
+}
+
 /// A transaction on a thread of its own: statements in, outcomes out.
-fn transaction(path: PathBuf) -> (Sender<String>, Receiver<Came>) {
+fn transaction(paths: Vec<PathBuf>) -> (Sender<String>, Receiver<Came>) {
     let (to, rx) = channel::<String>();
     let (tx, from) = channel();
     std::thread::spawn(move || {
-        let mut s = Snail::open_writing(&path).unwrap();
+        let mut s = Session::open(&paths);
         for st in rx {
             let came = if st.starts_with("SELECT") {
-                s.ask(&st, None)
+                s.ask(&st)
                     .map(|(b, _)| {
                         let column = |c: usize| {
                             let a = b.column(c);
@@ -519,16 +568,22 @@ fn transaction(path: PathBuf) -> (Sender<String>, Receiver<Came>) {
 /// what each of its reads answered, and the rows after; panics on a failure no serializable
 /// transaction meets.
 fn run_interleaving(
-    base: &Path,
-    at: &Path,
+    base: &[PathBuf],
+    at: &[PathBuf],
     transactions: &[Vec<Step>],
     order: &[u8],
     level: &str,
 ) -> (Vec<Ran>, [(i64, i64); 2]) {
-    std::fs::copy(base, at).unwrap();
-    let seen = std::fs::File::open(at).unwrap();
+    for (b, a) in base.iter().zip(at) {
+        std::fs::copy(b, a).unwrap();
+    }
+    let several = at.len() > 1;
+    let seen: Vec<std::fs::File> = at
+        .iter()
+        .map(|a| std::fs::File::open(a).unwrap())
+        .collect();
     let n = transactions.len();
-    let sessions: Vec<_> = (0..n).map(|_| transaction(at.to_path_buf())).collect();
+    let sessions: Vec<_> = (0..n).map(|_| transaction(at.to_vec())).collect();
     let mut answers: Vec<Vec<Answered>> = vec![Vec::new(); n];
     let mut failed = vec![false; n];
     let mut committed = vec![false; n];
@@ -569,9 +624,11 @@ fn run_interleaving(
                 }
             }
             let running = pending.iter().filter(|p| !p.is_empty()).count() as u64;
-            if running == 0
-                || (!to_the_end && running == warren_snail::lock::waiting(&seen).unwrap())
-            {
+            let waiting: u64 = seen
+                .iter()
+                .map(|f| warren_snail::lock::waiting(f).unwrap())
+                .sum();
+            if running == 0 || (!to_the_end && running == waiting) {
                 return;
             }
             assert!(
@@ -586,7 +643,7 @@ fn run_interleaving(
         let k = next[t];
         next[t] += 1;
         let st = match transactions[t].get(k) {
-            Some(step) => statement(*step, t, k),
+            Some(step) => statement(*step, t, k, several),
             None => "COMMIT".to_string(),
         };
         pending[t].push(k);
@@ -607,14 +664,15 @@ fn run_interleaving(
         true,
     );
     drop(sessions);
-    let mut after = Snail::open(at).unwrap();
+    let refs: Vec<&Path> = at.iter().map(PathBuf::as_path).collect();
+    let mut after = Snails::open(&refs).unwrap();
     let mut block = |x: i32| {
         let (a, z) = range_of(x);
+        let table = table_of(x, several);
         let (b, _) = after
-            .ask(
-                &format!("SELECT sum(t.v), count(*) FROM s.t t WHERE t.id >= {a} AND t.id <= {z}"),
-                None,
-            )
+            .ask(&format!(
+                "SELECT sum(t.v), count(*) FROM {table} t WHERE t.id >= {a} AND t.id <= {z}"
+            ))
             .unwrap();
         let v = |c: usize| {
             b.column(c)
@@ -757,7 +815,7 @@ fn walk(
     n: usize,
     statements: &[Step],
     level: &str,
-    (shard, of): (usize, usize),
+    shard_of: (usize, usize),
     jobs: usize,
 ) -> Walked {
     let tag = format!(
@@ -765,11 +823,24 @@ fn walk(
         level.replace(' ', "-"),
         i32::from(statements.contains(&Step::Read(C)))
     );
-    let base = tmp(&format!("serial-walk-{tag}.snail"));
-    {
-        let made = made(&format!("walk-base-{tag}"));
-        std::fs::copy(&made, &base).unwrap();
-    }
+    walk_on(vec![made(&format!("walk-base-{tag}"))], n, statements, level, shard_of, jobs)
+}
+
+/// The same on the snails `base`, each of its own.
+fn walk_on(
+    base: Vec<PathBuf>,
+    n: usize,
+    statements: &[Step],
+    level: &str,
+    (shard, of): (usize, usize),
+    jobs: usize,
+) -> Walked {
+    let tag = format!(
+        "{n}-{}-{}-{}",
+        level.replace(' ', "-"),
+        i32::from(statements.contains(&Step::Read(C))),
+        base.len()
+    );
     let mut work: Vec<(Vec<Vec<Step>>, Vec<u8>)> = Vec::new();
     let mut count = 0;
     for set in sets(&shapes(statements), n) {
@@ -792,16 +863,20 @@ fn walk(
         for job in 0..jobs {
             let (work, at, found, base, dir, tag) = (&work, &at, &found, &base, &dir, &tag);
             scope.spawn(move || {
-                let file = dir.join(format!(
-                    "warren-snail-serial-{}-{job}-{tag}.snail",
-                    std::process::id()
-                ));
+                let files: Vec<PathBuf> = (0..base.len())
+                    .map(|b| {
+                        dir.join(format!(
+                            "warren-snail-serial-{}-{job}-{tag}-{b}.snail",
+                            std::process::id()
+                        ))
+                    })
+                    .collect();
                 loop {
                     let i = at.fetch_add(1, Ordering::Relaxed);
                     let Some((set, order)) = work.get(i) else {
                         break;
                     };
-                    let (ran, rows) = run_interleaving(base, &file, set, order, level);
+                    let (ran, rows) = run_interleaving(base, &files, set, order, level);
                     let serial = some_serial_order(set, &ran, rows);
                     let mut f = found.lock().unwrap();
                     f.schedules += 1;
@@ -814,7 +889,9 @@ fn walk(
                         }
                     }
                 }
-                let _ = std::fs::remove_file(&file);
+                for file in &files {
+                    let _ = std::fs::remove_file(file);
+                }
             });
         }
     });
@@ -895,8 +972,11 @@ fn at_repeatable_read_the_walk_in_one_block_finds_histories_no_serial_order_give
 /// Every order of two transactions writing rows of their own in one block, each of one or two
 /// statements: every one commits, at `level`, and the rows after are every row's.
 fn own_rows_all_commit(firsts: &[Vec<Step>], seconds: &[Vec<Step>], level: &str) {
-    let base = made(&format!("own-rows-{}", level.replace(' ', "-")));
-    let at = tmp(&format!("serial-own-rows-{}-run.snail", level.replace(' ', "-")));
+    let base = [made(&format!("own-rows-{}", level.replace(' ', "-")))];
+    let at = [tmp(&format!(
+        "serial-own-rows-{}-run.snail",
+        level.replace(' ', "-")
+    ))];
     for a in firsts {
         for b in seconds {
             let set = vec![a.clone(), b.clone()];
@@ -1037,28 +1117,243 @@ fn the_older_formats_refuse_the_level_by_name_with_the_way_across() {
     }
 }
 
-#[test]
-fn across_several_snails_the_level_is_refused_by_name() {
-    let (one, two) = (made("across-one"), made("across-two"));
+/// Two snails, `s.t` as `made` holds it and `o.t` the same rows.
+fn two_snails(name: &str) -> (PathBuf, PathBuf) {
+    let one = made(&format!("{name}-one"));
+    let path = tmp(&format!("serial-{name}-two.snail"));
     let catalog = Catalog::parse(
-        "CREATE TABLE o.other (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));",
+        "CREATE TABLE o.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));",
     )
     .unwrap();
-    let two_catalog = tmp("serial-across-other.snail");
-    write(&two_catalog, &catalog, &[]).unwrap();
-    let _ = two;
-    let mut w =
-        warren_snail::read::Snails::open_writing(&[one.as_path(), two_catalog.as_path()]).unwrap();
+    let table = catalog.table("o.t").unwrap();
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| {
+            let mut v = Values::new(c.ty);
+            for i in 0..ROWS {
+                push_datum(
+                    &mut v,
+                    &warren_snail::composed::scalar_in(c.ty, &(i * 16).to_string()).unwrap(),
+                );
+            }
+            v
+        })
+        .collect();
+    write(&path, &catalog, &[("o.t".into(), Rows { columns })]).unwrap();
+    (one, path)
+}
+
+fn both(one: &Path, two: &Path) -> Snails {
+    Snails::open_writing(&[one, two]).unwrap()
+}
+
+fn run_across(w: &mut Snails, sql: &str) -> Done {
+    w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+fn read_across(w: &mut Snails, table: &str, id: i32) -> i64 {
+    let sql = format!("SELECT sum(t.v) FROM {table} t WHERE t.id = {id}");
+    one(&w.ask(&sql).unwrap_or_else(|e| panic!("{sql}: {e}")).0)
+}
+
+#[test]
+fn a_cycle_through_two_snails_is_refused_in_postgresql_s_words() {
+    let (p, q) = two_snails("cycle");
+    let (mut a, mut b) = (both(&p, &q), both(&p, &q));
+    run_across(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run_across(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read_across(&mut a, "s.t", A), i64::from(A));
+    assert_eq!(read_across(&mut b, "o.t", B), i64::from(B));
+    run_across(&mut a, &format!("UPDATE o.t SET v = -1 WHERE id = {B}"));
+    run_across(&mut b, &format!("UPDATE s.t SET v = -2 WHERE id = {A}"));
+    run_across(&mut a, "COMMIT");
+    assert_eq!(
+        reason(&b.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+    let mut c = both(&p, &q);
+    assert_eq!(read_across(&mut c, "o.t", B), -1);
+    assert_eq!(read_across(&mut c, "s.t", A), i64::from(A));
+}
+
+#[test]
+fn transactions_of_blocks_apart_on_two_snails_each_commit_and_read_one_moment() {
+    let (p, q) = two_snails("apart-across");
+    let (mut a, mut b, mut x) = (both(&p, &q), both(&p, &q), both(&p, &q));
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        run_across(&mut a, &format!("BEGIN ISOLATION LEVEL {level}"));
+        run_across(&mut b, &format!("BEGIN ISOLATION LEVEL {level}"));
+        let (s, o) = (read_across(&mut a, "s.t", A), read_across(&mut a, "o.t", A));
+        read_across(&mut b, "s.t", B);
+        // A commit outside them lands on both; neither transaction's later reads see it.
+        run_across(&mut x, &format!("UPDATE s.t SET v = v - 1 WHERE id = {A}"));
+        run_across(&mut x, &format!("UPDATE o.t SET v = v - 1 WHERE id = {A}"));
+        assert_eq!((read_across(&mut a, "s.t", A), read_across(&mut a, "o.t", A)), (s, o));
+        run_across(&mut a, &format!("UPDATE o.t SET v = -3 WHERE id = {B}"));
+        run_across(&mut b, &format!("UPDATE s.t SET v = -4 WHERE id = {B}"));
+        assert_eq!(read_across(&mut a, "o.t", B), -3);
+        assert_eq!(read_across(&mut a, "s.t", A), s);
+        run_across(&mut a, "COMMIT");
+        run_across(&mut b, "COMMIT");
+        let mut c = both(&p, &q);
+        assert_eq!(read_across(&mut c, "o.t", B), -3);
+        assert_eq!(read_across(&mut c, "s.t", B), -4);
+    }
+}
+
+#[test]
+fn a_transaction_across_two_snails_commits_one_root_deciding_its_records_in_each() {
+    let (p, q) = two_snails("deciding");
+    let (mut a, mut other) = (both(&p, &q), both(&p, &q));
+    run_across(&mut other, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read_across(&mut other, "s.t", 3200);
+    run_across(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run_across(&mut a, &format!("UPDATE s.t SET v = -1 WHERE id = {A}"));
+    run_across(&mut a, &format!("UPDATE o.t SET v = -1 WHERE id = {B}"));
+    let (g, h) = (Snail::open(&p).unwrap().generation(), Snail::open(&q).unwrap().generation());
+    run_across(&mut a, "COMMIT");
+    assert_eq!(
+        (Snail::open(&p).unwrap().generation(), Snail::open(&q).unwrap().generation()),
+        (g + 1, h + 1)
+    );
+    // The deciding root names the other's; every snail's root holds its record.
+    assert_eq!(Snail::open(&p).unwrap().serial_records_kept().unwrap(), 1);
+    assert_eq!(Snail::open(&q).unwrap().serial_records_kept().unwrap(), 1);
+    run_across(&mut other, "ROLLBACK");
+}
+
+#[test]
+fn a_snail_a_transaction_only_read_keeps_its_record_for_a_later_writer_there() {
+    let (p, q) = two_snails("read-there");
+    let (mut a, mut b) = (both(&p, &q), both(&p, &q));
+    run_across(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run_across(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    // a reads s.t and writes o.t; b reads o.t, then, a committed, writes what a read.
+    read_across(&mut a, "s.t", A);
+    read_across(&mut b, "o.t", B);
+    run_across(&mut a, &format!("UPDATE o.t SET v = -1 WHERE id = {B}"));
+    run_across(&mut a, "COMMIT");
+    let e = b
+        .execute(&format!("UPDATE s.t SET v = -2 WHERE id = {A}"))
+        .unwrap_err();
+    assert_eq!(
+        reason(&e),
+        "Canceled on identification as a pivot, during write."
+    );
+    run_across(&mut b, "ROLLBACK");
+}
+
+#[test]
+fn writers_of_one_snail_beside_a_writer_of_two_meet_through_the_files_they_share() {
+    let (p, q) = two_snails("beside");
+    // The pivot runs on both; a reader of what it writes lies in one, the writer of what it reads in
+    // the other.
+    let (mut pivot, mut reader, mut out) = (both(&p, &q), open(&p), open(&q));
+    run_across(&mut pivot, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read_across(&mut pivot, "o.t", B);
+    run_across(&mut pivot, &format!("UPDATE s.t SET v = -1 WHERE id = {A}"));
+    assert_eq!(read(&mut reader, A), i64::from(A));
+    let o = "UPDATE o.t SET v = -2 WHERE id = 32000";
+    run(&mut out, o);
+    run(&mut out, "COMMIT");
+    // The reader, on a file the edge out never lay in, reached it through the pivot; its commit dooms
+    // nothing, and the pivot fails at its commit, as a pivot whose edge out committed first.
+    run(&mut reader, "COMMIT");
+    assert_eq!(
+        reason(&pivot.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn a_reader_of_one_snail_finds_an_edge_lying_in_a_file_it_never_opened() {
+    let (p, q) = two_snails("reached");
+    let (mut pivot, mut reader, mut out) = (both(&p, &q), open(&p), open(&q));
+    run_across(&mut pivot, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    // The pivot writes what the reader will read, and has read what `out` writes: the edge out is
+    // `out`'s to find, in its own file, which the reader never opened.
+    run_across(&mut pivot, &format!("UPDATE s.t SET v = -1 WHERE id = {A}"));
+    read_across(&mut pivot, "o.t", B);
+    run(&mut out, "UPDATE o.t SET v = -2 WHERE id = 32000");
+    run(&mut out, "COMMIT");
+    // Two in a row, the far one committed first: the reader dooms the pivot.
+    assert_eq!(read(&mut reader, A), i64::from(A));
+    assert_eq!(
+        reason(&pivot.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+    run(&mut reader, "COMMIT");
+}
+
+#[test]
+fn a_session_s_level_across_snails_makes_each_statement_a_transaction() {
+    let (p, q) = two_snails("session");
+    let mut a = both(&p, &q);
+    run_across(
+        &mut a,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    );
+    assert_eq!(read_across(&mut a, "s.t", A), i64::from(A));
+    run_across(&mut a, &format!("UPDATE o.t SET v = -1 WHERE id = {B}"));
+    assert_eq!(read_across(&mut a, "o.t", B), -1);
+    run_across(&mut a, "BEGIN READ ONLY");
+    assert_eq!(read_across(&mut a, "o.t", B), -1);
+    let e = a.execute(&format!("UPDATE o.t SET v = -2 WHERE id = {B}")).unwrap_err();
+    assert_eq!(e.to_string(), "cannot execute UPDATE in a read-only transaction");
+    run_across(&mut a, "ROLLBACK");
+}
+
+#[test]
+fn an_older_format_among_several_refuses_the_level_by_name() {
+    let (_, q) = two_snails("older-across");
+    let path = tmp("serial-older-across.snail");
+    let catalog = Catalog::parse(DDL).unwrap();
+    let table = catalog.table("s.t").unwrap();
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| {
+            let mut v = Values::new(c.ty);
+            push_datum(&mut v, &warren_snail::composed::scalar_in(c.ty, "1").unwrap());
+            v
+        })
+        .collect();
+    warren_snail::write::write_format_eight(
+        &path,
+        &catalog,
+        &[("s.t".to_string(), Rows { columns })],
+        weather::span(),
+    )
+    .unwrap();
+    let mut w = both(&path, &q);
     let e = w
         .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
         .unwrap_err()
         .to_string();
-    assert!(
-        e.starts_with("SERIALIZABLE across several snails is not run"),
-        "{e}"
-    );
-    w.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
-    w.execute("ROLLBACK").unwrap();
+    assert!(e.starts_with("a snail of format 8 runs no SERIALIZABLE transaction"), "{e}");
+}
+
+#[test]
+fn every_interleaving_of_two_transactions_across_two_snails_is_some_serial_order() {
+    let (p, q) = two_snails("walk-across");
+    let w = walk_on(vec![p, q], 2, &AND_INSERTS, "SERIALIZABLE", (0, 1), jobs());
+    println!("{w:?}");
+    assert_eq!(w.broken_count, 0, "{:#?}", w.broken);
+    assert_eq!(w.schedules, 5772);
+    assert!(w.committed > 0 && w.refused > 0, "{w:?}");
+}
+
+#[test]
+fn at_repeatable_read_the_walk_across_two_snails_finds_histories_no_serial_order_gives() {
+    let (p, q) = two_snails("walk-across-repeatable");
+    let w = walk_on(vec![p, q], 2, &READS_AND_WRITES, "REPEATABLE READ", (0, 1), jobs());
+    println!("{w:?}");
+    assert!(w.broken_count > 0, "{w:?}");
 }
 
 /// A snail of the table, each block's rows spread so that a commit's rows cut one block in two.
@@ -1656,6 +1951,45 @@ fn a_read_of_a_block_as_it_was_before_a_cut_meets_a_write_of_a_block_cut_from_it
     assert_eq!(
         reason(&e),
         "Canceled on identification as a pivot, during write."
+    );
+}
+
+#[test]
+fn a_read_of_a_block_before_a_cut_meets_a_running_writer_of_a_part_of_it() {
+    let path = made("read-part");
+    let (mut a, mut w) = (open(&path), open(&path));
+    let row = 16_000;
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read(&mut a, B), i64::from(B));
+    cut_by(&path);
+    run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut w, 32016);
+    set(&mut w, row, -1).unwrap();
+    // a reads the block whole, as its snapshot holds it; a part of it is w's, still running.
+    assert_eq!(read(&mut a, row), i64::from(row));
+    set(&mut a, 32016, -2).unwrap();
+    run(&mut w, "COMMIT");
+    assert_eq!(
+        reason(&a.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn a_read_of_a_block_whose_first_key_its_own_rows_lowered_marks_the_block_its_snapshot_names() {
+    let path = made("lowered");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut a, "INSERT INTO s.t (id, v) VALUES (-5, 1)");
+    assert_eq!(read(&mut a, 0), 0);
+    assert_eq!(read(&mut b, B), i64::from(B));
+    set(&mut b, 16, -1).unwrap();
+    set(&mut a, B, -2).unwrap();
+    run(&mut b, "COMMIT");
+    assert_eq!(
+        reason(&a.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
     );
 }
 

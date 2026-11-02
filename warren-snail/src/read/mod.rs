@@ -31,7 +31,7 @@ mod question;
 mod ranges;
 mod relations;
 mod rest;
-mod serial;
+pub(crate) mod serial;
 mod sets;
 mod spill;
 mod spelled;

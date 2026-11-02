@@ -181,11 +181,21 @@ impl Snail {
     /// it: their values, and the pages of the version it reads that hold them.
     pub(super) fn entered_round(&self, room: &std::rc::Rc<crate::room::Room>) -> crate::room::Entered {
         let entered = crate::room::entered(room);
-        if entered.outermost() && !self.own.is_empty() {
-            let rows: u64 = self.own.values().map(|o| o.bytes).sum();
-            room.hold_anyway(rows + self.reader.staged_mark() * crate::cut::PAGE as u64);
+        if entered.outermost() {
+            room.hold_anyway(self.own_bytes());
         }
         entered
+    }
+
+    /// What a transaction of one snapshot keeps of its own rows.
+    pub(super) fn own_bytes(&self) -> u64 {
+        match self.own.is_empty() {
+            true => 0,
+            false => {
+                self.own.values().map(|o| o.bytes).sum::<u64>()
+                    + self.reader.staged_mark() * crate::cut::PAGE as u64
+            }
+        }
     }
 
     /// Runs `f` reading the newest root as it stands, nothing of the transaction's own in it and

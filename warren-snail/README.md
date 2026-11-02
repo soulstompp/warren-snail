@@ -417,6 +417,20 @@ warren-snail census shop.snail
 generation 6: 30 pages named, 0 free, 17 waiting to be freed
 ```
 
+### REPEATABLE READ
+
+A transaction at `REPEATABLE READ` keeps its first statement's snapshot to its end, and holds that
+generation, so the file grows while it runs. It reads each block as its snapshot holds it, with its
+own rows, and its commit writes those same rows into the newest version of the block, so two
+transactions writing different rows of one block both commit, neither waiting for the other. Only
+the same row changed since the snapshot is refused, found by the table's key, SQLSTATE `40001`, in
+PostgreSQL's words (`could not serialize access due to concurrent update`, or `delete`); a key another
+holds is waited for, as PostgreSQL's unique check waits, and refused once that writer commits. What it
+keeps of its rows until its commit counts in each round's room. A row changed and changed back since
+the snapshot, or set to the value it held, is no change to the snail, where PostgreSQL refuses it.
+A snail of format 7 or 8 holds a block in one version: a row written into a block another wrote since
+the snapshot is refused by name, with the way across.
+
 ### SERIALIZABLE
 
 A transaction at `SERIALIZABLE` reads one snapshot, as at `REPEATABLE READ`, and a monitor beside it
@@ -434,13 +448,16 @@ transaction's first read, which waits for a snapshot no transaction beside it ca
 marks each block its rounds look at, gaps and all, or an order whole past 32 of its blocks or where a
 round read no block of it, as PostgreSQL's locks on pages and relations. Blocks are coarser than
 PostgreSQL's tuples, so a transaction may be refused where a plan of PostgreSQL's that took its index
-would commit, as one that scanned the table is refused, and a write into a block another committed
-since the snapshot is refused as `concurrent update`, the row unchanged or not. A marked read costs
-no page: the marks are locks on bytes past the file's pages. A committed transaction's lie in records
+would commit, as one that scanned the table is refused: two `UPDATE`s by key of rows of one block
+mark it, each its own scan, and the second to commit is refused; two `INSERT`s of one block read
+nothing, and both commit. A marked read costs no page: the marks are locks on bytes past the file's pages. A committed transaction's lie in records
 its root names, about a page a commit, while a round older than its commit runs; one that only read
 writes them only where a transaction that can write at the level is open. The level is refused by
-name on a snail of format 7 or 8, with the way across, on a snail marked a replica, in PostgreSQL's
-words, and across several snails opened together, which a mount in PostgreSQL has instead.
+name on a snail of format 7 or 8, with the way across, and on a snail marked a replica, in PostgreSQL's
+words. Across several snails opened together it holds as on one: the transaction takes its snapshot on
+all of them at one moment, its marks and edges lie in each of their files, the test walks every file
+the transactions it meets write, so a cycle through two snails is refused in the same words, and
+commits take one order from a clock their roots share.
 
 ## Parquet, out and back in
 

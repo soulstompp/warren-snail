@@ -393,7 +393,7 @@ pub(crate) fn mark_waiting(file: &File, slot: u64, byte: u64, waits: bool) -> Re
 
 /// The first of another file's locks on `start..start + len`, as its first byte's place in the run.
 fn first_held(file: &File, start: u64, len: u64) -> Result<Option<u64>> {
-    Ok(held_at(file, start, len)?.map(|(at, _)| at - start))
+    Ok(held_at(file, start, len)?.map(|(at, _)| at.max(start) - start))
 }
 
 /// The first of another file's locks on `start..start + len`, by its first byte and its length.
@@ -468,7 +468,8 @@ const SERIAL: u64 = (1 << 62) + (1 << 60);
 const READ_MARKS: u64 = SERIAL;
 /// A byte for each slot and transaction: the serializable transaction in that slot.
 const SERIAL_OF: u64 = SERIAL + (1 << 56);
-/// A byte for each slot and generation: the snapshot of the transaction in that slot.
+/// A byte for each slot and number: where the snapshot of the transaction in that slot stands on the
+/// records' clock, its low bits here and the rest in `SNAPSHOT_HIGH`.
 const SERIAL_SNAPSHOT: u64 = SERIAL + (2 << 56);
 /// A byte for each slot: the transaction in that slot was not declared READ ONLY.
 const SERIAL_WRITES: u64 = SERIAL + (3 << 56);
@@ -478,14 +479,18 @@ const EDGE_OUT: u64 = SERIAL + (4 << 56);
 const EDGE_IN: u64 = SERIAL + (5 << 56);
 /// A byte for each slot and transaction: the transaction in that slot doomed the other.
 const DOOMS: u64 = SERIAL + (6 << 56);
-/// A byte for each slot and generation: the transaction in that slot passed its commit's test and
-/// its commit is that generation.
+/// A byte for each slot and number: the transaction in that slot passed its commit's test, and its
+/// commit stands so on the records' clock, its low bits here and the rest in `PREPARED_HIGH`.
 const SERIAL_PREPARED: u64 = SERIAL + (7 << 56);
 /// The byte whose lock is the turn at the marks: an edge and its test, a commit's test, and a
 /// transaction's end, one at a time.
 const SERIAL_TURN: u64 = SERIAL + (8 << 56);
 /// A byte for each block and slot: the transaction in that slot wrote the block, its lock taken or not.
 const WROTE_MARKS: u64 = SERIAL + (9 << 56);
+const SNAPSHOT_HIGH: u64 = SERIAL + (10 << 56);
+const PREPARED_HIGH: u64 = SERIAL + (11 << 56);
+/// The low bits of a place on the clock the run of `SERIAL_SNAPSHOT` or `SERIAL_PREPARED` holds.
+const ORDER_LOW: u64 = 1 << 24;
 const SERIAL_NAMES: u64 = 1 << 40;
 
 /// The byte of an order's own mark, which a read holds for all of it and a writer of any of it.
@@ -550,14 +555,30 @@ pub(crate) fn serials(file: &File) -> Result<Vec<(u64, u64)>> {
     Ok(out)
 }
 
-/// Marks the snapshot of the transaction in `slot`, or lets it go.
-pub(crate) fn mark_snapshot(file: &File, slot: u64, generation: u64, on: bool) -> Result<()> {
-    mark(file, SERIAL_SNAPSHOT + (slot << 40) + generation, on)
+/// Marks where the transaction in `slot` stands on the records' clock, or lets it go: its commit,
+/// where `commit`, once it passed its commit's test; else its snapshot.
+pub(crate) fn mark_order(file: &File, slot: u64, commit: bool, at: u64, on: bool) -> Result<()> {
+    let (low, high) = order_runs(commit);
+    mark(file, low + (slot << 40) + at % ORDER_LOW, on)?;
+    mark(file, high + (slot << 40) + at / ORDER_LOW, on)
 }
 
-/// The snapshot of the transaction in another file's `slot`.
-pub(crate) fn snapshot_of(file: &File, slot: u64) -> Result<Option<u64>> {
-    first_held(file, SERIAL_SNAPSHOT + (slot << 40), SERIAL_NAMES)
+fn order_runs(commit: bool) -> (u64, u64) {
+    match commit {
+        true => (SERIAL_PREPARED, PREPARED_HIGH),
+        false => (SERIAL_SNAPSHOT, SNAPSHOT_HIGH),
+    }
+}
+
+/// Where the transaction in another file's `slot` stands on the records' clock: its commit, where
+/// `commit` and it passed its test; else its snapshot.
+pub(crate) fn order_of(file: &File, slot: u64, commit: bool) -> Result<Option<u64>> {
+    let (low, high) = order_runs(commit);
+    let Some(l) = first_held(file, low + (slot << 40), ORDER_LOW)? else {
+        return Ok(None);
+    };
+    let h = first_held(file, high + (slot << 40), SERIAL_NAMES)?.unwrap_or(0);
+    Ok(Some(h * ORDER_LOW + l))
 }
 
 /// Marks that the transaction in `slot` was not declared READ ONLY, or lets it go.
@@ -599,17 +620,6 @@ pub(crate) fn mark_doom(file: &File, slot: u64, other: u64, on: bool) -> Result<
 /// Whether another file's `slot` doomed the transaction `other`.
 pub(crate) fn doomed_by(file: &File, slot: u64, other: u64) -> Result<bool> {
     Ok(first_held(file, DOOMS + (slot << 40) + other, 1)?.is_some())
-}
-
-/// Marks that the transaction in `slot` passed its commit's test, its commit being `generation`, or
-/// lets it go.
-pub(crate) fn mark_prepared(file: &File, slot: u64, generation: u64, on: bool) -> Result<()> {
-    mark(file, SERIAL_PREPARED + (slot << 40) + generation, on)
-}
-
-/// The commit of the transaction in another file's `slot`, where it passed its test.
-pub(crate) fn prepared_of(file: &File, slot: u64) -> Result<Option<u64>> {
-    first_held(file, SERIAL_PREPARED + (slot << 40), SERIAL_NAMES)
 }
 
 /// Waits for the turn at the marks, as short as an edge's test or a commit's.

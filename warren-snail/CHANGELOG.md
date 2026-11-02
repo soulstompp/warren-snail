@@ -92,6 +92,11 @@ at once, and a snail written inside a host that decides its commits.
   PostgreSQL's words; a committed transaction's marks lie in records its root names; a host's own
   monitor is told instead, by `carry::Monitor` and `Snail::monitored_by`, and the file keeps none.
   `Snail::begin_on` begins a host's writer on a generation its reader holds.
+- REPEATABLE READ and SERIALIZABLE write as PostgreSQL has them: a transaction reads the version of
+  each block its snapshot holds with its own rows, and its commit writes the newest version with
+  them, so two transactions writing different rows of one block both commit, and only the same row
+  changed since the snapshot is refused. SERIALIZABLE runs across several snails opened together,
+  their commits taking one order from a clock their roots share.
 - One clock a transaction: `now()`, `CURRENT_TIMESTAMP`, `transaction_timestamp()` and the literals
   `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` read the transaction's start wherever they are
   written, `statement_timestamp()` the statement's, `clock_timestamp()` the machine's.

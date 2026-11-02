@@ -407,6 +407,9 @@ pub struct Root {
     /// The serializable transactions' records: each committed one's marks and edges, kept while a
     /// round older than its commit runs. Format 9 only.
     pub serial: Extent,
+    /// Where the last of them stands on the clock the records of snails opened together share, so that
+    /// commits have one order: format 9 only, 0 where none has been.
+    pub clock: u64,
 }
 
 /// What a snail of a format older than this build's says of a serializable transaction: its root
@@ -641,7 +644,7 @@ impl Root {
             }
             // Whether a transaction across snails is pending, and whether the serializable
             // transactions' records follow.
-            let records = if self.serial.bytes > 0 { 2 } else { 0 };
+            let records = u8::from(self.serial.bytes > 0) * 2 + u8::from(self.clock > 0) * 4;
             match &self.pending {
                 None => o.u8(records),
                 Some(p) => {
@@ -652,6 +655,9 @@ impl Root {
             }
             if self.serial.bytes > 0 {
                 o.extent(self.serial);
+            }
+            if self.clock > 0 {
+                o.u64(self.clock);
             }
             // A root marked a replica carries its source, then whether its host tagged it.
             match &self.replica {
@@ -747,7 +753,7 @@ impl Root {
         } else {
             String::new()
         };
-        let (decided, pending, serial) = if format >= FORMAT && !ended(&i) {
+        let (decided, pending, serial, clock) = if format >= FORMAT && !ended(&i) {
             let n = i.u32().ok()? as usize;
             let mut decided = Vec::with_capacity(n.min(256));
             for _ in 0..n {
@@ -776,9 +782,13 @@ impl Root {
                 0 => Extent::default(),
                 _ => i.extent().ok()?,
             };
-            (decided, pending, serial)
+            let clock = match marks & 4 {
+                0 => 0,
+                _ => i.u64().ok()?,
+            };
+            (decided, pending, serial, clock)
         } else {
-            (Vec::new(), None, Extent::default())
+            (Vec::new(), None, Extent::default(), 0)
         };
         // A root its host tagged carries the tag last; one marked a replica carries its source,
         // then whether its host tagged it.
@@ -815,6 +825,7 @@ impl Root {
                 host,
                 replica,
                 serial,
+                clock,
             },
             format,
         ))

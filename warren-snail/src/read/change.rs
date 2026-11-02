@@ -1777,7 +1777,7 @@ impl Snail {
         let mut w = self.writer.take().expect("a snail open to write");
         let turn = lock::take_root_turn(w.file());
         let committed = turn
-            .and_then(|_| self.serial_tested(w.file()))
+            .and_then(|_| self.serial_tested())
             .and_then(|_| self.commit_with(&mut w));
         let given = lock::give_root_turn(w.file());
         self.writer = Some(w);
@@ -2612,8 +2612,8 @@ impl Snail {
     /// rows dropped, and cut again; then committed as a write is, or within the transaction begun.
     /// Returns the blocks pruned and the pages written.
     pub(super) fn prune(&mut self, wasted: Vec<Wasted>) -> Result<(u64, u64)> {
-        // A snail marked a replica is pruned by its applier's reads alone; and the version a
-        // transaction of one snapshot reads goes with it.
+        // A snail marked a replica is pruned by its applier's reads alone; the version a transaction of
+        // one snapshot reads goes with it unpruned.
         if self.writes_marked(&self.root).is_err() || self.held {
             return Ok((0, 0));
         }
