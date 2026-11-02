@@ -641,7 +641,7 @@ impl Snail {
             &replaced,
             w,
             &mut Vec::new(),
-            head.separated,
+            &head,
         )?;
         let (bytes, _) = build_from(head, top.entries, top.height, &mut |b| w.place(b))?;
         self.root.orders[at].2 = w.place(&bytes)?;
