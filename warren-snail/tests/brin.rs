@@ -267,6 +267,39 @@ fn rising(ty: &str, j: i64) -> String {
     }
 }
 
+/// Each type a BRIN class takes beside its prefix, whether it has a minmax-multi, and a bloom.
+const TYPES: [(&str, &str, bool, bool); 29] = [
+    ("smallint", "int2", true, true),
+    ("integer", "int4", true, true),
+    ("bigint", "int8", true, true),
+    ("real", "float4", true, true),
+    ("double precision", "float8", true, true),
+    ("numeric", "numeric", true, true),
+    ("numeric(10,2)", "numeric", true, true),
+    ("numeric(30,2)", "numeric", true, true),
+    ("date", "date", true, true),
+    ("timestamp", "timestamp", true, true),
+    ("timestamptz", "timestamptz", true, true),
+    ("time", "time", true, true),
+    ("timetz", "timetz", true, true),
+    ("interval", "interval", true, true),
+    ("uuid", "uuid", true, true),
+    ("oid", "oid", true, true),
+    ("pg_lsn", "pg_lsn", true, true),
+    ("macaddr", "macaddr", true, true),
+    ("macaddr8", "macaddr8", true, true),
+    ("inet", "inet", true, true),
+    ("text", "text", false, true),
+    ("varchar(20)", "text", false, true),
+    ("char(12)", "bpchar", false, true),
+    ("name", "name", false, true),
+    ("bytea", "bytea", false, true),
+    ("\"char\"", "char", false, true),
+    ("bit(32)", "bit", false, false),
+    ("bit varying", "varbit", false, false),
+    ("tid", "tid", true, true),
+];
+
 /// Every operator class a type takes, by its prefix.
 fn classes(prefix: &str, multi: bool, bloom: bool) -> Vec<String> {
     let mut out = vec![format!("{prefix}_minmax_ops")];
@@ -281,39 +314,8 @@ fn classes(prefix: &str, multi: bool, bloom: bool) -> Vec<String> {
 
 #[test]
 fn each_operator_class_rules_a_block_out_by_its_summary_and_answers_as_its_twin() {
-    let types: [(&str, &str, bool, bool); 29] = [
-        ("smallint", "int2", true, true),
-        ("integer", "int4", true, true),
-        ("bigint", "int8", true, true),
-        ("real", "float4", true, true),
-        ("double precision", "float8", true, true),
-        ("numeric", "numeric", true, true),
-        ("numeric(10,2)", "numeric", true, true),
-        ("numeric(30,2)", "numeric", true, true),
-        ("date", "date", true, true),
-        ("timestamp", "timestamp", true, true),
-        ("timestamptz", "timestamptz", true, true),
-        ("time", "time", true, true),
-        ("timetz", "timetz", true, true),
-        ("interval", "interval", true, true),
-        ("uuid", "uuid", true, true),
-        ("oid", "oid", true, true),
-        ("pg_lsn", "pg_lsn", true, true),
-        ("macaddr", "macaddr", true, true),
-        ("macaddr8", "macaddr8", true, true),
-        ("inet", "inet", true, true),
-        ("text", "text", false, true),
-        ("varchar(20)", "text", false, true),
-        ("char(12)", "bpchar", false, true),
-        ("name", "name", false, true),
-        ("bytea", "bytea", false, true),
-        ("\"char\"", "char", false, true),
-        ("bit(32)", "bit", false, false),
-        ("bit varying", "varbit", false, false),
-        ("tid", "tid", true, true),
-    ];
     let n = 4096;
-    for (k, (ty, prefix, multi, bloom)) in types.iter().enumerate() {
+    for (k, (ty, prefix, multi, bloom)) in TYPES.iter().enumerate() {
         // Every tenth row NULL.
         let value = |i: i64| (i % 10 != 3).then(|| rising(ty, i));
         let twin = snail_of(&format!("each-{k}-twin"), ty, "", n, &value);
@@ -910,10 +912,18 @@ fn a_box_s_inclusion_rules_out_a_block_by_its_leaves_for_every_operator_it_takes
     assert!(with.blocks_read <= 2, "{with:?}");
     assert!(with.blocks_read <= without.blocks_read);
     // A box past every box.
-    let (rows, with, _) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE v @> point '(5001,393)'");
+    let (rows, with, _) = both(
+        &mut s,
+        &mut t,
+        "SELECT id FROM s.t WHERE v @> point '(5001,393)'",
+    );
     assert!(!rows.is_empty());
     assert!(with.blocks_read <= 2, "{with:?}");
-    let (rows, with, _) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE '(10,10),(0,0)' |>> v");
+    let (rows, with, _) = both(
+        &mut s,
+        &mut t,
+        "SELECT id FROM s.t WHERE '(10,10),(0,0)' |>> v",
+    );
     assert!(rows.is_empty() || rows.iter().all(|&i| i % 512 < 8));
     assert!(with.blocks_read <= without.blocks_read);
     let (rows, with, _) = both(
@@ -1035,6 +1045,30 @@ fn a_summary_of_a_month_or_a_scaled_key_reads_the_conditions_on_it() {
     let (rows, with) = ids(&mut s, "SELECT id FROM s.t WHERE floor(f * 1000) = 5250");
     assert_eq!(rows.len(), 1024);
     assert!(with.blocks_read <= 2, "{with:?}");
+}
+
+#[test]
+fn a_summary_read_keeps_to_the_round_s_room() {
+    // Filters of 4,096 bytes an entry: read and let go at each entry, none kept past it.
+    let (a, b) = twins(
+        "room",
+        "integer",
+        "CREATE INDEX t_v ON s.t USING brin (v int4_bloom_ops (n_distinct_per_range = -1, \
+         false_positive_rate = 0.0001));",
+        16384,
+        &|i: i64| Some((i * 2).to_string()),
+    );
+    let (mut s, mut t) = (fresh(&a), fresh(&b));
+    let sizes = || warren_snail::room::Sizes::of(1 << 20);
+    s.size_rounds(sizes());
+    t.size_rounds(sizes());
+    for q in [
+        "SELECT id FROM s.t WHERE v >= 0",
+        "SELECT id FROM s.t WHERE v = 8000",
+    ] {
+        let (_, with, _) = both(&mut s, &mut t, q);
+        assert!(with.bytes_held <= 1 << 20, "{q}: {with:?}");
+    }
 }
 
 #[test]
@@ -1475,7 +1509,10 @@ mod written {
 
     #[test]
     fn a_block_holding_only_nulls_sums_its_first_value_written() {
-        for (k, class) in ["int4_bloom_ops", "int4_minmax_multi_ops"].iter().enumerate() {
+        for (k, class) in ["int4_bloom_ops", "int4_minmax_multi_ops"]
+            .iter()
+            .enumerate()
+        {
             let path = snail_of(
                 &format!("first-{k}"),
                 "integer",
@@ -1486,11 +1523,19 @@ mod written {
             let mut w = Snail::open_writing(&path).unwrap();
             let q = "SELECT id FROM s.t WHERE v = 5";
             let (b, round) = w.ask(q, None).unwrap();
-            assert_eq!((b.num_rows(), round.blocks_read), (0, 0), "{class}: {round:?}");
+            assert_eq!(
+                (b.num_rows(), round.blocks_read),
+                (0, 0),
+                "{class}: {round:?}"
+            );
             run(&mut w, "UPDATE s.t SET v = 5 WHERE id = 100");
             let (b, round) = w.ask(q, None).unwrap();
             exact(q, &round);
-            assert_eq!((b.num_rows(), round.blocks_read), (1, 1), "{class}: {round:?}");
+            assert_eq!(
+                (b.num_rows(), round.blocks_read),
+                (1, 1),
+                "{class}: {round:?}"
+            );
         }
     }
 
@@ -1590,6 +1635,42 @@ mod written {
     }
 
     #[test]
+    fn a_row_added_to_a_block_is_summed_for_every_type_a_class_takes() {
+        for (k, (ty, prefix, multi, bloom)) in TYPES.iter().enumerate() {
+            for (c, class) in classes(prefix, *multi, *bloom).iter().enumerate() {
+                let path = snail_of(
+                    &format!("added-{k}-{c}"),
+                    ty,
+                    &format!("CREATE INDEX t_v ON s.t USING brin (v {class});"),
+                    2048,
+                    &|i: i64| Some(rising(ty, i)),
+                );
+                let mut w = Snail::open_writing(&path).unwrap();
+                // A value past every value the table holds, in the last block's tail, and one set on a
+                // row of its first; each found, and the rows it was not given are not.
+                let (past, again) = (rising(ty, 3000), rising(ty, 3001));
+                let literal = |v: &str| v.replace('\'', "''");
+                run(
+                    &mut w,
+                    &format!("INSERT INTO s.t VALUES (5000, '{}')", literal(&past)),
+                );
+                run(
+                    &mut w,
+                    &format!("UPDATE s.t SET v = '{}' WHERE id = 1", literal(&again)),
+                );
+                for v in [&past, &again] {
+                    let q = format!("SELECT id FROM s.t WHERE v = '{}'", literal(v));
+                    let (b, round) = w
+                        .ask(&q, None)
+                        .unwrap_or_else(|e| panic!("{ty} {class}: {e}"));
+                    assert!(b.num_rows() >= 1, "{ty} {class}: {q}");
+                    assert!(round.blocks_read >= 1, "{ty} {class}: {q}: {round:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_table_another_declared_a_brin_of_since_refuses_its_rows() {
         let path = tmp("brin-declared-since.snail");
         write(
@@ -1640,7 +1721,15 @@ mod written {
         .unwrap();
         let mut r = fresh(&back);
         let (mut s, _) = (Snail::open_writing(&path).unwrap(), ());
-        asked(&mut r, &mut s, &[]);
+        asked(
+            &mut r,
+            &mut s,
+            &["b = 1010", "m = 10", "m = 1000010", "x = 'x0012'"],
+        );
+        for q in ["b = 1010", "m = 10", "m = 1000010", "x = 'x0012'"] {
+            let q = format!("SELECT id FROM s.t WHERE {q}");
+            assert!(r.ask(&q, None).unwrap().0.num_rows() > 0, "{q}");
+        }
         let (_, round) = r.ask("SELECT id FROM s.t WHERE m = 500000", None).unwrap();
         assert_eq!(round.blocks_read, 0, "{round:?}");
     }

@@ -41,6 +41,7 @@ impl Datum {
             Datum::Float4(b) => Some(crate::scalars::float4_key(*b) as i128),
             Datum::Float8(b) => Some(crate::scalars::float8_key(*b) as i128),
             Datum::Wide(k) => Some(*k),
+            Datum::Interval(v) => Some(v.total()),
             _ => None,
         }
     }

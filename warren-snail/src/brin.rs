@@ -663,6 +663,40 @@ mod tests {
     }
 
     #[test]
+    fn a_fold_tests_only_what_each_child_set_for_every_smallint() {
+        // A block of a hundred rows and one of three thousand, each repeating a value or two: filters
+        // of unlike bits and hashes, folded unfilled, every value of the walk present.
+        let repeated = |v: i64, rows: usize| vec![key(v); rows];
+        for v in i16::MIN as i64..=i16::MAX as i64 {
+            let small = Sum::of(BLOOM, repeated(v, 100));
+            let large = Sum::of(BLOOM, repeated(v + 70000, 3000));
+            let (
+                Sum::Filter {
+                    bits: a, hashes: h, ..
+                },
+                Sum::Filter {
+                    bits: b, hashes: k, ..
+                },
+            ) = (&small, &large)
+            else {
+                panic!("{small:?}")
+            };
+            assert!(a < b && h > k, "{a} {b} {h} {k}");
+            let mut over = Sum::Nothing;
+            over.join(&small).unwrap();
+            over.join(&large).unwrap();
+            assert!(
+                over.filter_has(&key(v)) && over.filter_has(&key(v + 70000)),
+                "{v}"
+            );
+            // And the other way round, the larger first.
+            let mut other = large.clone();
+            other.join(&small).unwrap();
+            assert_eq!(other, over, "{v}");
+        }
+    }
+
+    #[test]
     fn every_smallint_lies_in_its_block_s_runs_and_every_union_above_them() {
         walked_at_every_level(Kind::Multi(8), &[100, 700, 3000], 3);
         walked_at_every_level(Kind::Multi(32), &[1, 2, 40], 16);
