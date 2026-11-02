@@ -1393,5 +1393,249 @@ fn read_only_found_safe_beside_writers_that_ended_marks_nothing_more() {
         Snail::open(&path).unwrap().serial_records_kept().unwrap(),
         1
     );
+    // Beside another writer open, it writes no records at its commit.
+    run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut w, A);
+    let generation = warren_snail::carry::newest(&path).unwrap();
     run(&mut ro, "COMMIT");
+    assert_eq!(warren_snail::carry::newest(&path).unwrap(), generation);
+    run(&mut w, "COMMIT");
+}
+
+#[test]
+fn a_statement_that_waited_for_a_commit_that_doomed_it_is_refused_as_concurrent_update() {
+    let path = made("waited");
+    let mut a = open(&path);
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut a, A);
+    set(&mut a, B, -1).unwrap();
+    let q = path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        let mut b = open(&q);
+        b.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        set(&mut b, A, -2).unwrap();
+        tx.send(set(&mut b, B, -3).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    run(&mut a, "COMMIT");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap_err(),
+        "could not serialize access due to concurrent update"
+    );
+    t.join().unwrap();
+}
+
+/// Each side of write skew reads by `reading`, the rows it reads and the row the other writes the
+/// same.
+fn skew_read_by(name: &str, reading: fn(&mut Snail, i32)) {
+    let path = made(name);
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    reading(&mut a, A);
+    reading(&mut b, B);
+    set(&mut a, B, -1).unwrap();
+    set(&mut b, A, -2).unwrap();
+    run(&mut a, "COMMIT");
+    assert_eq!(
+        reason(&b.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn a_join_s_reads_are_marked() {
+    skew_read_by("join", |s, x| {
+        s.ask(
+            &format!(
+                "SELECT count(*) FROM s.t p JOIN s.t q ON p.id = q.id WHERE p.id = {x}"
+            ),
+            None,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn a_round_handed_out_a_block_at_a_time_is_marked() {
+    skew_read_by("each", |s, x| {
+        s.ask_each(
+            &format!("SELECT t.v FROM s.t t WHERE t.id = {x}"),
+            None,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn a_pipeline_s_reads_are_marked() {
+    skew_read_by("pipeline", |s, x| {
+        s.ask(
+            &format!("WITH q AS (SELECT t.v FROM s.t t WHERE t.id = {x}) SELECT q.v FROM q"),
+            None,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn a_snapshot_taken_after_a_commit_meets_nothing_of_it() {
+    let path = made("after");
+    let (mut w, mut out, mut later) = (open(&path), open(&path), open(&path));
+    // w commits having read over out's commit, its edge out to a commit before its own.
+    run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut w, A);
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    set(&mut out, A, -2).unwrap();
+    run(&mut out, "COMMIT");
+    set(&mut w, B, -1).unwrap();
+    run(&mut w, "COMMIT");
+    // A transaction after them both reads what w wrote: no edge at all.
+    run(&mut later, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read(&mut later, B), -1);
+    run(&mut later, "COMMIT");
+}
+
+#[test]
+fn a_read_of_a_writer_whose_edge_out_came_after_its_commit_stands() {
+    let path = made("order");
+    let (mut w, mut t2, mut r) = (open(&path), open(&path), open(&path));
+    for s in [&mut w, &mut t2, &mut r] {
+        run(s, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    }
+    read(&mut r, 3200);
+    read(&mut w, A);
+    set(&mut w, B, -1).unwrap();
+    run(&mut w, "COMMIT");
+    // t2 commits after w: w's edge out reaches a commit after its own, so r, reading w, stands.
+    set(&mut t2, A, -2).unwrap();
+    run(&mut t2, "COMMIT");
+    assert_eq!(read(&mut r, B), i64::from(B));
+    run(&mut r, "COMMIT");
+}
+
+#[test]
+fn a_reader_with_an_edge_in_that_reads_a_commit_it_cannot_see_is_refused_there() {
+    let path = made("reader-pivot");
+    let (mut r, mut t0, mut w) = (open(&path), open(&path), open(&path));
+    for s in [&mut r, &mut t0, &mut w] {
+        run(s, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    }
+    set(&mut r, A, -1).unwrap();
+    // t0 reads what r wrote and cannot see; w writes what r reads next.
+    assert_eq!(read(&mut t0, A), i64::from(A));
+    set(&mut w, B, -2).unwrap();
+    run(&mut w, "COMMIT");
+    let sql = format!("SELECT sum(t.v) FROM s.t t WHERE t.id = {B}");
+    let said = reason(&r.ask(&sql, None).map(|_| ()).unwrap_err());
+    assert!(
+        said.starts_with("Canceled on conflict out to pivot ") && said.ends_with(", during read."),
+        "{said}"
+    );
+    run(&mut r, "ROLLBACK");
+    run(&mut t0, "COMMIT");
+}
+
+#[test]
+fn a_commit_dooms_no_pivot_whose_other_edge_comes_from_read_only() {
+    let path = made("far-read-only");
+    let (mut p, mut out, mut ro) = (open(&path), open(&path), open(&path));
+    run(&mut p, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut p, A);
+    set(&mut p, B, -1).unwrap();
+    run(&mut ro, "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY");
+    assert_eq!(read(&mut ro, B), i64::from(B));
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    set(&mut out, A, -2).unwrap();
+    run(&mut out, "COMMIT");
+    run(&mut ro, "COMMIT");
+    run(&mut p, "COMMIT");
+}
+
+#[test]
+fn a_read_of_a_block_as_it_was_before_a_cut_meets_a_write_of_a_block_cut_from_it() {
+    let path = made("read-parent");
+    let (mut a, mut w) = (open(&path), open(&path));
+    let row = 16_000;
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read(&mut a, B), i64::from(B));
+    // A commit outside the level cuts the first block; a writer at the level writes a part of it and
+    // reads what a writes.
+    cut_by(&path);
+    run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut w, 32016);
+    set(&mut w, row, -1).unwrap();
+    run(&mut w, "COMMIT");
+    // a reads the block as its snapshot holds it, whole: it did not see w's write, and writes what w
+    // read.
+    assert_eq!(read(&mut a, row), i64::from(row));
+    let e = set(&mut a, 32016, -2).unwrap_err();
+    assert_eq!(
+        reason(&e),
+        "Canceled on identification as a pivot, during write."
+    );
+}
+
+#[test]
+fn a_read_of_an_order_whole_after_a_write_finds_its_writer() {
+    let path = tmp("serial-whole-after.snail");
+    let catalog = Catalog::parse(DDL).unwrap();
+    let table = catalog.table("s.t").unwrap();
+    let rows: i32 = 256 * 1024;
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| {
+            let mut v = Values::new(c.ty);
+            for i in 0..rows {
+                push_datum(
+                    &mut v,
+                    &warren_snail::composed::scalar_in(c.ty, &i.to_string()).unwrap(),
+                );
+            }
+            v
+        })
+        .collect();
+    write(&path, &catalog, &[("s.t".into(), Rows { columns })]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut b, 5);
+    set(&mut b, rows / 2, -1).unwrap();
+    let (_, round) = a.ask("SELECT count(*) FROM s.t t", None).unwrap();
+    assert_eq!(round.column_pages_read, 0, "the directory answered it");
+    set(&mut a, 5, -2).unwrap();
+    run(&mut b, "COMMIT");
+    assert_eq!(
+        reason(&a.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn a_block_a_prune_lets_go_leaves_its_mark_on_the_order() {
+    let path = made("gone");
+    let (mut a, mut w) = (open(&path), open(&path));
+    let row = 16_000;
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read(&mut a, row), i64::from(row));
+    // Outside the level, every row of the first block goes, and the block with them.
+    let mut x = open(&path);
+    run(&mut x, "DELETE FROM s.t WHERE id < 16384");
+    let answered = x.ask("SELECT count(*) FROM s.t t", None);
+    assert!(answered.is_ok());
+    let left = blocks_of(&path);
+    assert_eq!(left.iter().sum::<u64>(), 1024, "{left:?}");
+    // A row written where the first block's rows lay lies in the block that remains.
+    run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut w, B);
+    run(&mut w, &format!("INSERT INTO s.t (id, v) VALUES ({row}, 1)"));
+    set(&mut a, B, -2).unwrap();
+    run(&mut w, "COMMIT");
+    assert_eq!(
+        reason(&a.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
 }
