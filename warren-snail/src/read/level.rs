@@ -77,8 +77,9 @@ impl Counted {
 
 impl Snail {
     /// The rows on each place of the level `column` leads an order of `table` with, on the root the
-    /// snail last read, reading at most `pages` directory pages below the order's top. None where no
-    /// order of the table leads with the column itself.
+    /// snail last read, reading at most `pages` pages below the order's top: directory pages, and a
+    /// block's last column page where its greatest key is read there. None where no order of the
+    /// table leads with the column itself.
     pub fn level_counts(
         &self,
         table: &str,
