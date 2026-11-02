@@ -66,6 +66,7 @@ fn set(w: &mut Snail, id: i32, v: i32) -> warren_snail::Result<Done> {
 }
 
 fn reason(e: &warren_snail::Error) -> String {
+    assert_eq!(e.sqlstate(), Some("40001"), "{e}");
     let e = e.to_string();
     let mut lines = e.lines();
     assert_eq!(
@@ -268,6 +269,7 @@ fn read_only_takes_no_write_and_beside_no_writer_marks_nothing() {
         e.to_string(),
         "cannot execute UPDATE in a read-only transaction"
     );
+    assert_eq!(e.sqlstate(), Some("25006"));
     run(
         &mut a,
         "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
@@ -294,14 +296,19 @@ fn deferrable_waits_for_a_safe_snapshot_and_then_marks_nothing() {
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     set(&mut w, B, -7).unwrap();
     run(&mut w, "COMMIT");
-    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), i64::from(B));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        i64::from(B)
+    );
     t.join().unwrap();
     // DEFERRABLE is set before any query, and a transaction not READ ONLY takes it and waits for
     // nothing.
     run(&mut w, "BEGIN");
     read(&mut w, A);
     assert_eq!(
-        w.execute("SET TRANSACTION DEFERRABLE").unwrap_err().to_string(),
+        w.execute("SET TRANSACTION DEFERRABLE")
+            .unwrap_err()
+            .to_string(),
         "SET TRANSACTION [NOT] DEFERRABLE must be called before any query"
     );
     run(&mut w, "ROLLBACK");
@@ -327,12 +334,16 @@ fn a_replica_refuses_the_level_as_a_hot_standby_does() {
         e,
         "cannot use serializable mode in a hot standby\nHINT:  You can use REPEATABLE READ instead."
     );
+    assert_eq!(warren_snail::Error::new(e).sqlstate(), Some("0A000"));
     run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
     let e = a
         .execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         .unwrap_err()
         .to_string();
-    assert!(e.starts_with("cannot use serializable mode in a hot standby"), "{e}");
+    assert!(
+        e.starts_with("cannot use serializable mode in a hot standby"),
+        "{e}"
+    );
     run(&mut a, "ROLLBACK");
     run(
         &mut a,
@@ -459,7 +470,9 @@ fn transaction(path: PathBuf) -> (Sender<String>, Receiver<Came>) {
                                 .as_any()
                                 .downcast_ref::<arrow::array::Int64Array>()
                                 .expect("a sum or a count");
-                            arrow::array::Array::is_valid(a, 0).then(|| a.value(0)).unwrap_or(0)
+                            arrow::array::Array::is_valid(a, 0)
+                                .then(|| a.value(0))
+                                .unwrap_or(0)
                         };
                         Some((column(0), column(1)))
                     })
@@ -509,10 +522,10 @@ fn run_interleaving(
         assert!(s.1.recv().unwrap().is_ok());
     }
     let settle = |pending: &mut Vec<Vec<usize>>,
-                      answers: &mut Vec<Vec<Option<(i64, i64)>>>,
-                      failed: &mut Vec<bool>,
-                      committed: &mut Vec<bool>,
-                      to_the_end: bool| {
+                  answers: &mut Vec<Vec<Option<(i64, i64)>>>,
+                  failed: &mut Vec<bool>,
+                  committed: &mut Vec<bool>,
+                  to_the_end: bool| {
         let started = std::time::Instant::now();
         loop {
             for (t, s) in sessions.iter().enumerate() {
@@ -539,7 +552,8 @@ fn run_interleaving(
                 }
             }
             let running = pending.iter().filter(|p| !p.is_empty()).count() as u64;
-            if running == 0 || (!to_the_end && running == warren_snail::lock::waiting(&seen).unwrap())
+            if running == 0
+                || (!to_the_end && running == warren_snail::lock::waiting(&seen).unwrap())
             {
                 return;
             }
@@ -560,18 +574,28 @@ fn run_interleaving(
         };
         pending[t].push(k);
         sessions[t].0.send(st).unwrap();
-        settle(&mut pending, &mut answers, &mut failed, &mut committed, false);
+        settle(
+            &mut pending,
+            &mut answers,
+            &mut failed,
+            &mut committed,
+            false,
+        );
     }
-    settle(&mut pending, &mut answers, &mut failed, &mut committed, true);
+    settle(
+        &mut pending,
+        &mut answers,
+        &mut failed,
+        &mut committed,
+        true,
+    );
     drop(sessions);
     let mut after = Snail::open(at).unwrap();
     let mut block = |x: i32| {
         let (a, z) = range_of(x);
         let (b, _) = after
             .ask(
-                &format!(
-                    "SELECT sum(t.v), count(*) FROM s.t t WHERE t.id >= {a} AND t.id <= {z}"
-                ),
+                &format!("SELECT sum(t.v), count(*) FROM s.t t WHERE t.id >= {a} AND t.id <= {z}"),
                 None,
             )
             .unwrap();
@@ -666,7 +690,13 @@ fn shapes(statements: &[Step]) -> Vec<Vec<Step>> {
 
 /// Every set of `n` transactions of those shapes, a set and its image with the blocks swapped once.
 fn sets(all: &[Vec<Step>], n: usize) -> Vec<Vec<Vec<Step>>> {
-    fn go(all: &[Vec<Step>], from: usize, n: usize, now: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+    fn go(
+        all: &[Vec<Step>],
+        from: usize,
+        n: usize,
+        now: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
         if now.len() == n {
             out.push(now.clone());
             return;
@@ -710,8 +740,17 @@ struct Walked {
 
 /// Walks every interleaving of every set of `n` transactions of `statements`, at `level`, those of
 /// `shard` among `of`.
-fn walk(n: usize, statements: &[Step], level: &str, (shard, of): (usize, usize), jobs: usize) -> Walked {
-    let base = tmp(&format!("serial-walk-{n}-{}.snail", level.replace(' ', "-")));
+fn walk(
+    n: usize,
+    statements: &[Step],
+    level: &str,
+    (shard, of): (usize, usize),
+    jobs: usize,
+) -> Walked {
+    let base = tmp(&format!(
+        "serial-walk-{n}-{}.snail",
+        level.replace(' ', "-")
+    ));
     {
         let made = made(&format!("walk-base-{n}-{}", level.replace(' ', "-")));
         std::fs::copy(&made, &base).unwrap();
@@ -829,4 +868,530 @@ fn at_repeatable_read_three_transactions_break() {
     let w = walk(3, &READS_AND_WRITES, "REPEATABLE READ", shard(), jobs());
     println!("{w:?}");
     assert!(w.broken_count > 0, "{w:?}");
+}
+
+#[test]
+fn the_older_formats_refuse_the_level_by_name_with_the_way_across() {
+    let catalog = Catalog::parse(DDL).unwrap();
+    let rows = || {
+        let table = catalog.table("s.t").unwrap();
+        Rows {
+            columns: table
+                .columns
+                .iter()
+                .map(|c| {
+                    let mut v = Values::new(c.ty);
+                    push_datum(
+                        &mut v,
+                        &warren_snail::composed::scalar_in(c.ty, "1").unwrap(),
+                    );
+                    v
+                })
+                .collect(),
+        }
+    };
+    for (format, path) in [
+        (8, tmp("serial-format-eight.snail")),
+        (7, tmp("serial-format-seven.snail")),
+    ] {
+        let tables = [("s.t".to_string(), rows())];
+        match format {
+            8 => warren_snail::write::write_format_eight(&path, &catalog, &tables, weather::span()),
+            _ => warren_snail::write::write_format_seven(&path, &catalog, &tables, weather::span()),
+        }
+        .unwrap();
+        let mut w = open(&path);
+        let said = format!(
+            "a snail of format {format} runs no SERIALIZABLE transaction, its root holding no \
+             records of one: put the snail `out` and `write` it afresh, in format 9"
+        );
+        for sql in [
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        ] {
+            assert_eq!(w.execute(sql).unwrap_err().to_string(), said, "{sql}");
+        }
+        run(&mut w, "BEGIN");
+        assert_eq!(
+            w.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .unwrap_err()
+                .to_string(),
+            said
+        );
+        run(&mut w, "ROLLBACK");
+        // The levels it holds no records for are taken, READ ONLY and DEFERRABLE among them.
+        run(
+            &mut w,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY DEFERRABLE",
+        );
+        assert_eq!(read(&mut w, 1), 1);
+        run(&mut w, "COMMIT");
+    }
+}
+
+#[test]
+fn across_several_snails_the_level_is_refused_by_name() {
+    let (one, two) = (made("across-one"), made("across-two"));
+    let catalog = Catalog::parse(
+        "CREATE TABLE o.other (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let two_catalog = tmp("serial-across-other.snail");
+    write(&two_catalog, &catalog, &[]).unwrap();
+    let _ = two;
+    let mut w =
+        warren_snail::read::Snails::open_writing(&[one.as_path(), two_catalog.as_path()]).unwrap();
+    let e = w
+        .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.starts_with("SERIALIZABLE across several snails is not run"),
+        "{e}"
+    );
+    w.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    w.execute("ROLLBACK").unwrap();
+}
+
+/// A snail of the table, each block's rows spread so that a commit's rows cut one block in two.
+fn cut_by(path: &Path) -> Done {
+    let mut x = open(path);
+    let values: Vec<String> = (0..1024).map(|i| format!("({}, 0)", 1 + i * 16)).collect();
+    run(
+        &mut x,
+        &format!("INSERT INTO s.t (id, v) VALUES {}", values.join(", ")),
+    )
+}
+
+fn blocks_of(path: &Path) -> Vec<u64> {
+    Snail::open(path)
+        .unwrap()
+        .blocks()
+        .unwrap()
+        .iter()
+        .filter(|r| r.column == "id" && r.order == "t_pkey")
+        .map(|r| r.rows)
+        .collect()
+}
+
+#[test]
+fn a_mark_follows_the_block_a_commit_at_read_committed_cut() {
+    let path = made("cut");
+    assert_eq!(blocks_of(&path), [1024, 1024]);
+    let (mut reader, mut writer) = (open(&path), open(&path));
+    let (row, heap) = (16_000, B);
+    run(&mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read(&mut reader, row), i64::from(row));
+    // A commit outside the level cuts the block the reader marked: the row lies in the second part.
+    cut_by(&path);
+    assert_eq!(blocks_of(&path), [1024, 1024, 1024]);
+    run(&mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read(&mut writer, heap), i64::from(heap));
+    set(&mut writer, row, -1).unwrap();
+    set(&mut reader, heap, -2).unwrap();
+    run(&mut writer, "COMMIT");
+    assert_eq!(
+        reason(&reader.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn a_mark_on_an_empty_order_meets_its_first_rows() {
+    let path = tmp("serial-empty.snail");
+    write(&path, &Catalog::parse(DDL).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    let count = "SELECT count(*) FROM s.t t";
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(one(&a.ask(count, None).unwrap().0), 0);
+    assert_eq!(one(&b.ask(count, None).unwrap().0), 0);
+    run(&mut a, "INSERT INTO s.t (id, v) VALUES (1, 1)");
+    run(&mut a, "COMMIT");
+    // b counted none, a's row among them; a counted none, b's among them.
+    let e = b
+        .execute("INSERT INTO s.t (id, v) VALUES (2, 2)")
+        .unwrap_err();
+    assert_eq!(
+        reason(&e),
+        "Canceled on identification as a pivot, during write."
+    );
+}
+
+#[test]
+fn a_condition_that_holds_no_row_marks_nothing() {
+    let path = made("nothing");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    let none = "SELECT count(*) FROM s.t t WHERE t.id = 1 AND t.id = 2";
+    assert_eq!(one(&a.ask(none, None).unwrap().0), 0);
+    assert_eq!(one(&b.ask(none, None).unwrap().0), 0);
+    set(&mut a, B, -1).unwrap();
+    set(&mut b, A, -2).unwrap();
+    run(&mut a, "COMMIT");
+    run(&mut b, "COMMIT");
+}
+
+#[test]
+fn a_read_past_the_rows_marks_the_block_its_key_belongs_with_and_a_gap_is_met() {
+    let path = made("gap");
+    let (mut a, mut b) = (open(&path), open(&path));
+    let (gap, past) = (A + 1, 16 * ROWS + 100);
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    // a looks for a key that is not there, in the first block's gap; b past the last row.
+    let at = |k: i32| format!("SELECT count(*) FROM s.t t WHERE t.id = {k}");
+    assert_eq!(one(&a.ask(&at(gap), None).unwrap().0), 0);
+    assert_eq!(one(&b.ask(&at(past), None).unwrap().0), 0);
+    run(
+        &mut a,
+        &format!("INSERT INTO s.t (id, v) VALUES ({past}, 1)"),
+    );
+    run(
+        &mut b,
+        &format!("INSERT INTO s.t (id, v) VALUES ({gap}, 2)"),
+    );
+    run(&mut a, "COMMIT");
+    assert_eq!(
+        reason(&b.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn past_its_marks_on_an_order_a_transaction_marks_it_whole() {
+    let path = tmp("serial-whole.snail");
+    let catalog = Catalog::parse(DDL).unwrap();
+    let table = catalog.table("s.t").unwrap();
+    let rows: i32 = 64 * 1024;
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| {
+            let mut v = Values::new(c.ty);
+            for i in 0..rows {
+                push_datum(
+                    &mut v,
+                    &warren_snail::composed::scalar_in(c.ty, &i.to_string()).unwrap(),
+                );
+            }
+            v
+        })
+        .collect();
+    write(&path, &catalog, &[("s.t".into(), Rows { columns })]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    // Every block but the last, 63 of them, read by key: the last holds no key read.
+    let upto = 63 * 1024 - 1;
+    let count = format!("SELECT count(*), sum(t.v) FROM s.t t WHERE t.id <= {upto}");
+    a.ask(&count, None).unwrap();
+    assert_eq!(read(&mut b, 0), 0);
+    // A write in the last block meets a's mark on the order whole; a write in a block read meets b's.
+    set(&mut b, rows - 1, -1).unwrap();
+    set(&mut a, 0, -2).unwrap();
+    run(&mut b, "COMMIT");
+    assert_eq!(
+        reason(&a.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn the_records_are_let_go_once_no_round_older_than_their_commit_runs() {
+    let path = made("records");
+    let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut a, A);
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut b, B);
+    set(&mut b, B, -1).unwrap();
+    run(&mut b, "COMMIT");
+    // a's snapshot is older than b's commit: the records hold it.
+    let held = Snail::open(&path).unwrap().serial_records_kept().unwrap();
+    assert_eq!(held, 1);
+    run(&mut a, "COMMIT");
+    // A commit beside no round older lets them go.
+    drop(a);
+    drop(b);
+    let mut c = open(&path);
+    set(&mut c, A, -2).unwrap();
+    assert_eq!(
+        Snail::open(&path).unwrap().serial_records_kept().unwrap(),
+        0
+    );
+    assert!(size(&path) > 0);
+}
+
+#[test]
+fn a_transaction_at_serializable_reads_one_snapshot_and_its_own_writes() {
+    let path = made("snapshot");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, &format!("UPDATE s.t SET v = -5 WHERE id = {A}"));
+    assert_eq!(read(&mut a, A), -5);
+    run(&mut b, &format!("UPDATE s.t SET v = -6 WHERE id = {A}"));
+    assert_eq!(read(&mut a, A), -5);
+    set(&mut a, B, -7).unwrap();
+    assert_eq!(read(&mut a, B), -7);
+    assert_eq!(read(&mut b, B), i64::from(B));
+    run(&mut a, "COMMIT");
+    assert_eq!(read(&mut a, A), -6);
+    // A row another changed since is refused as at REPEATABLE READ.
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut a, B);
+    set(&mut b, B, -8).unwrap();
+    let e = set(&mut a, B, -9).unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "could not serialize access due to concurrent update"
+    );
+    run(&mut a, "ROLLBACK");
+    // The transaction's own statement alone, under a session's level, ends with itself.
+    run(
+        &mut a,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    );
+    assert_eq!(read(&mut a, B), -8);
+    set(&mut a, B, -10).unwrap();
+    assert_eq!(read(&mut a, B), -10);
+}
+
+#[test]
+fn a_block_written_since_by_another_refuses_a_row_written_into_it_never_a_mixed_answer() {
+    let path = made("mixed");
+    let (mut a, mut b) = (open(&path), open(&path));
+    for (v, level) in [(-1, "REPEATABLE READ"), (-2, "SERIALIZABLE")] {
+        run(&mut a, &format!("BEGIN ISOLATION LEVEL {level}"));
+        let id = A + 1;
+        let count = |w: &mut Snail| {
+            one(&w
+                .ask("SELECT count(*) FROM s.t t WHERE t.id < 16384", None)
+                .unwrap()
+                .0)
+        };
+        let before = count(&mut a);
+        set(&mut b, A, v).unwrap();
+        let e = a
+            .execute(&format!("INSERT INTO s.t (id, v) VALUES ({id}, 1)"))
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "could not serialize access due to concurrent update",
+            "{level}"
+        );
+        run(&mut a, "ROLLBACK");
+        assert_eq!(count(&mut a), before);
+    }
+}
+
+#[test]
+fn a_count_the_directory_answers_above_the_blocks_marks_the_order_whole() {
+    let path = tmp("serial-count.snail");
+    let catalog = Catalog::parse(DDL).unwrap();
+    let table = catalog.table("s.t").unwrap();
+    let rows: i32 = 256 * 1024;
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| {
+            let mut v = Values::new(c.ty);
+            for i in 0..rows {
+                push_datum(
+                    &mut v,
+                    &warren_snail::composed::scalar_in(c.ty, &i.to_string()).unwrap(),
+                );
+            }
+            v
+        })
+        .collect();
+    write(&path, &catalog, &[("s.t".into(), Rows { columns })]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    let (counted, round) = a.ask("SELECT count(*) FROM s.t t", None).unwrap();
+    assert_eq!(one(&counted), i64::from(rows));
+    assert_eq!(round.column_pages_read, 0, "the directory answered it");
+    assert_eq!(read(&mut b, 5), 5);
+    set(&mut b, rows / 2, -1).unwrap();
+    set(&mut a, 5, -2).unwrap();
+    run(&mut b, "COMMIT");
+    assert_eq!(
+        reason(&a.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn a_read_of_a_block_a_running_writer_holds_finds_its_edge() {
+    let path = made("holder");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut a, A);
+    set(&mut a, B, -1).unwrap();
+    // b reads what a holds uncommitted: the edge is the read's to find, a having written first.
+    assert_eq!(read(&mut b, B), i64::from(B));
+    set(&mut b, A, -2).unwrap();
+    run(&mut a, "COMMIT");
+    assert_eq!(
+        reason(&b.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+/// The three that make a pivot: 0 read what 1 writes, 2 read what 0 writes.
+fn pivot_of_three(path: &Path) -> (Snail, Snail, Snail) {
+    let (mut p, mut out, mut inn) = (open(path), open(path), open(path));
+    for s in [&mut p, &mut out, &mut inn] {
+        run(s, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    }
+    read(&mut p, A);
+    set(&mut out, A, -2).unwrap();
+    read(&mut inn, B);
+    set(&mut p, B, -1).unwrap();
+    (p, out, inn)
+}
+
+#[test]
+fn each_failure_comes_where_postgresql_s_monitor_fires_it_in_its_words() {
+    // A commit dooms the pivot beside its other edge; the pivot fails at its next read.
+    let path = made("reasons-read");
+    let (mut p, mut out, mut inn) = pivot_of_three(&path);
+    run(&mut out, "COMMIT");
+    let sql = format!("SELECT sum(t.v) FROM s.t t WHERE t.id = {A}");
+    assert_eq!(
+        reason(&p.ask(&sql, None).map(|_| ()).unwrap_err()),
+        "Canceled on identification as a pivot, during conflict out checking."
+    );
+    assert!(p.ask(&sql, None).is_err());
+    run(&mut p, "ROLLBACK");
+    run(&mut inn, "COMMIT");
+    // At its next write.
+    let path = made("reasons-write");
+    let (mut p, mut out, mut inn) = pivot_of_three(&path);
+    run(&mut out, "COMMIT");
+    let e = p
+        .execute(&format!("INSERT INTO s.t (id, v) VALUES ({}, 3)", B + 3))
+        .unwrap_err();
+    assert_eq!(
+        reason(&e),
+        "Canceled on identification as a pivot, during conflict in checking."
+    );
+    run(&mut p, "ROLLBACK");
+    run(&mut inn, "COMMIT");
+    // At its commit; and the transaction that read it goes on.
+    let path = made("reasons-commit");
+    let (mut p, mut out, mut inn) = pivot_of_three(&path);
+    run(&mut out, "COMMIT");
+    run(&mut inn, "COMMIT");
+    assert_eq!(
+        reason(&p.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+    // A doom outlives its doomer's rollback: a read beside a running pivot dooms it, one commit out.
+    let path = made("reasons-rollback");
+    let (mut p, mut out, mut inn) = (open(&path), open(&path), open(&path));
+    for s in [&mut p, &mut out, &mut inn] {
+        run(s, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    }
+    read(&mut inn, A);
+    read(&mut p, A);
+    set(&mut out, A, -2).unwrap();
+    set(&mut p, B, -1).unwrap();
+    run(&mut out, "COMMIT");
+    read(&mut inn, B);
+    run(&mut inn, "ROLLBACK");
+    assert_eq!(
+        reason(&p.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+    // A read meeting a pivot that committed reading over a commit before it is refused itself.
+    let path = made("reasons-conflict-out");
+    let (mut p, mut out, mut inn) = (open(&path), open(&path), open(&path));
+    for s in [&mut p, &mut out, &mut inn] {
+        run(s, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    }
+    read(&mut inn, A);
+    read(&mut p, A);
+    set(&mut out, A, -2).unwrap();
+    run(&mut out, "COMMIT");
+    set(&mut p, B, -1).unwrap();
+    run(&mut p, "COMMIT");
+    let sql = format!("SELECT sum(t.v) FROM s.t t WHERE t.id = {B}");
+    let said = reason(&inn.ask(&sql, None).map(|_| ()).unwrap_err());
+    assert!(
+        said.starts_with("Canceled on conflict out to pivot ") && said.ends_with(", during read."),
+        "{said}"
+    );
+    run(&mut inn, "ROLLBACK");
+}
+
+#[test]
+fn a_reader_read_only_before_the_commit_it_would_need_stands_and_the_pivot_too() {
+    let path = made("before");
+    let (mut p, mut out, mut ro) = (open(&path), open(&path), open(&path));
+    run(&mut p, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut p, A);
+    set(&mut p, B, -1).unwrap();
+    run(&mut ro, "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY");
+    read(&mut ro, A);
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    set(&mut out, A, -2).unwrap();
+    run(&mut out, "COMMIT");
+    assert_eq!(read(&mut ro, B), i64::from(B));
+    run(&mut ro, "COMMIT");
+    run(&mut p, "COMMIT");
+}
+
+#[test]
+fn deferrable_beside_a_writer_that_read_over_a_commit_takes_a_new_snapshot() {
+    let path = made("unsafe");
+    let (mut p, mut out) = (open(&path), open(&path));
+    run(&mut p, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut p, A);
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    set(&mut out, A, -2).unwrap();
+    run(&mut out, "COMMIT");
+    let q = path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        let mut d = open(&q);
+        d.execute("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE")
+            .unwrap();
+        tx.send(read(&mut d, B)).unwrap();
+        d.execute("COMMIT").unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    // p commits having read over out's commit, which came before the first snapshot: it is unsafe,
+    // and a new one, with p's commit in it, is taken.
+    set(&mut p, B, -1).unwrap();
+    run(&mut p, "COMMIT");
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), -1);
+    t.join().unwrap();
+}
+
+#[test]
+fn read_only_found_safe_beside_writers_that_ended_marks_nothing_more() {
+    let path = made("safe");
+    let (mut w, mut ro, mut x) = (open(&path), open(&path), open(&path));
+    run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut w, A);
+    run(&mut ro, "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY");
+    read(&mut ro, A);
+    run(&mut w, "COMMIT");
+    // The writer beside it ended with no edge out: the reader is safe, and a later read marks nothing,
+    // nor does a writer of what it read meet it.
+    read(&mut ro, B);
+    run(&mut x, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut x, B);
+    set(&mut x, A, -1).unwrap();
+    run(&mut x, "COMMIT");
+    assert_eq!(
+        Snail::open(&path).unwrap().serial_records_kept().unwrap(),
+        1
+    );
+    run(&mut ro, "COMMIT");
 }

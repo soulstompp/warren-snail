@@ -943,15 +943,21 @@ impl Snail {
                             // written goes into a block it cannot read beside that generation.
                             self.back_to(&mark);
                             if self.held {
-                                if matches!(st, Statement::Insert { .. }) {
+                                if let Statement::Insert { table, .. } = &st {
+                                    let orders = self.catalog.tables[*table].orders.len();
+                                    let tested = (0..orders)
+                                        .try_for_each(|oi| self.mark_wrote(*table, oi, &[]));
                                     self.abandon()?;
                                     self.aborted = self.begun.is_some();
-                                    return Err(Error::new(
-                                        "could not serialize access due to concurrent update",
-                                    ));
+                                    return Err(tested.err().unwrap_or_else(|| {
+                                        Error::new(
+                                            "could not serialize access due to concurrent update",
+                                        )
+                                    }));
                                 }
                                 let newest = self.reader.peek_root()?;
                                 self.in_transaction_on(newest)?;
+                                self.serial_comparing(true);
                             } else if self.begun.is_some() {
                                 self.renew_in_transaction()?;
                             } else {
@@ -1717,6 +1723,7 @@ impl Snail {
         }
         self.unnamed.clear();
         self.held = false;
+        self.comparing.set(false);
         Ok(())
     }
 
@@ -2042,7 +2049,14 @@ impl Snail {
                 }
                 replaced.insert(path, entries);
             }
-            settle(&mut top, &mut Vec::new(), &replaced, w, &mut gone, head.separated)?;
+            settle(
+                &mut top,
+                &mut Vec::new(),
+                &replaced,
+                w,
+                &mut gone,
+                head.separated,
+            )?;
             gone.push(root.orders[at].2);
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| w.place(x))?;
             root.orders[at].2 = w.place(&bytes)?;
@@ -2456,7 +2470,14 @@ impl Snail {
             }
         }
         let mut path = Vec::new();
-        settle(&mut top, &mut path, &replaced, w, &mut Vec::new(), head.separated)?;
+        settle(
+            &mut top,
+            &mut path,
+            &replaced,
+            w,
+            &mut Vec::new(),
+            head.separated,
+        )?;
         let (bytes, _) = build_from(head, top.entries, top.height, &mut |b| w.place(b))?;
         let extent = w.place(&bytes)?;
         self.root.orders[at].2 = extent;

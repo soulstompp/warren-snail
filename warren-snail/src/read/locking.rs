@@ -698,9 +698,11 @@ impl Snail {
     ) -> Result<()> {
         let (root, catalog) = (self.root.clone(), self.catalog.clone());
         let newest = self.reader.peek_root()?;
+        self.serial_comparing(true);
         let asked = self
             .in_transaction_on(newest)
             .and_then(|_| self.answer_with(&plan.asked, order, params));
+        self.serial_comparing(false);
         (self.root, self.catalog) = (root, catalog);
         let (batch, _) = asked?;
         let now: HashSet<Row> =

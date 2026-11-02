@@ -326,10 +326,12 @@ each column it leaves out or gives `DEFAULT` taking its `DEFAULT`; `UPDATE`, to 
 reads (*The DDL it reads*), a table's columns and its indexes changed only while it holds no rows,
 and `ALTER TABLE … ADD CHECK` and `ADD FOREIGN KEY` each checked against the rows held unless `NOT
 VALID`. Outside a transaction each statement commits on its own. A transaction runs at READ
-COMMITTED, and so at READ UNCOMMITTED, which PostgreSQL runs as READ COMMITTED: `BEGIN` and `START
-TRANSACTION` may name either, `SET TRANSACTION` names one for the transaction begun, another only
-before its first statement that reads or writes, and `SET SESSION CHARACTERISTICS AS TRANSACTION`
-names one for the transactions after.
+COMMITTED unless told otherwise, as PostgreSQL has each level: READ UNCOMMITTED run as READ
+COMMITTED, REPEATABLE READ, and SERIALIZABLE (below). `BEGIN` and `START TRANSACTION` may name one,
+`SET TRANSACTION` names one for the transaction begun, another only before its first statement that
+reads or writes, and `SET SESSION CHARACTERISTICS AS TRANSACTION` names one for the transactions
+after; each takes `READ ONLY` or `READ WRITE`, a write in a transaction `READ ONLY` refused in
+PostgreSQL's words, and `[NOT] DEFERRABLE`.
 
 **What a row is given.** An identity's or a serial's value, or a `DEFAULT nextval(…)`, is its
 sequence's next, drawn at the root's turn for the whole statement and never given back, as
@@ -414,6 +416,31 @@ warren-snail census shop.snail
 ```text
 generation 6: 30 pages named, 0 free, 17 waiting to be freed
 ```
+
+### SERIALIZABLE
+
+A transaction at `SERIALIZABLE` reads one snapshot, as at `REPEATABLE READ`, and a monitor beside it
+refuses the one that would keep the committed transactions from composing as one serial order, as
+PostgreSQL's does, SQLSTATE `40001`, the failing statement and its words the same:
+
+```text
+could not serialize access due to read/write dependencies among transactions
+DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+HINT:  The transaction might succeed if retried.
+```
+
+A retry is the application's, as on PostgreSQL. It blocks nothing but a `READ ONLY DEFERRABLE`
+transaction's first read, which waits for a snapshot no transaction beside it can hurt. A transaction
+marks each block its rounds look at, gaps and all, or an order whole past 32 of its blocks or where a
+round read no block of it, as PostgreSQL's locks on pages and relations. Blocks are coarser than
+PostgreSQL's tuples, so a transaction may be refused where a plan of PostgreSQL's that took its index
+would commit, as one that scanned the table is refused, and a write into a block another committed
+since the snapshot is refused as `concurrent update`, the row unchanged or not. A marked read costs
+no page: the marks are locks on bytes past the file's pages. A committed transaction's lie in records
+its root names, about a page a commit, while a round older than its commit runs; one that only read
+writes them only where a transaction that can write at the level is open. The level is refused by
+name on a snail of format 7 or 8, with the way across, on a snail marked a replica, in PostgreSQL's
+words, and across several snails opened together, which a mount in PostgreSQL has instead.
 
 ## Parquet, out and back in
 

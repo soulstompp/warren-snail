@@ -1246,7 +1246,10 @@ impl Reader {
     /// Of the pages a read will read, those held, which the round now keeps until the read ends.
     pub fn keep_for_round(&self, pages: impl Iterator<Item = u64>) -> u64 {
         let room = self.round_room();
-        let kept = |n: u64| room.as_ref().is_some_and(|r| r.pin(self.id, std::iter::once(n)) == 1);
+        let kept = |n: u64| {
+            room.as_ref()
+                .is_some_and(|r| r.pin(self.id, std::iter::once(n)) == 1)
+        };
         #[cfg(feature = "standalone")]
         let mut held = self.held.borrow_mut();
         #[cfg(feature = "standalone")]

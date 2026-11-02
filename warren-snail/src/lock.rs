@@ -685,6 +685,42 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn every_lock_on_a_run_is_found_whichever_file_holds_it_and_however_it_lies() {
+        let (path, a, b) = file("all");
+        let seen = File::open(&path).unwrap();
+        let (x, y) = (
+            block_byte(&(0usize, 1usize, "x")),
+            block_byte(&(0usize, 1usize, "y")),
+        );
+        mark_held(&a, 9, x, true).unwrap();
+        mark_held(&b, 3, x, true).unwrap();
+        mark_held(&a, 2, x, true).unwrap();
+        mark_held(&a, 10, x, true).unwrap();
+        mark_held(&a, 4, y, true).unwrap();
+        let mut slots = holders(&seen, x).unwrap();
+        slots.sort_unstable();
+        assert_eq!(slots, [2, 3, 9, 10]);
+        mark_read(&b, 9, x, true).unwrap();
+        mark_read(&a, 3, x, true).unwrap();
+        let mut slots = readers(&seen, x).unwrap();
+        slots.sort_unstable();
+        assert_eq!(slots, [3, 9]);
+        mark_serial(&a, 7, 77, true).unwrap();
+        mark_serial(&b, 2, 22, true).unwrap();
+        let mut running = serials(&seen).unwrap();
+        running.sort_unstable();
+        assert_eq!(running, [(2, 22), (7, 77)]);
+        assert_eq!(serials(&a).unwrap(), [(2, 22)], "a file's own marks");
+        drop(b);
+        assert_eq!(
+            serials(&seen).unwrap(),
+            [(7, 77)],
+            "a closed file's marks go"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// The lock byte of block (5, 'x') of the third order of the second table.
     const GOLDEN: u64 = 2_305_843_784_697_650_849;
 

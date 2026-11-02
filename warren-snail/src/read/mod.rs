@@ -425,6 +425,9 @@ pub struct Snail {
     serial: std::cell::RefCell<Option<serial::Serial>>,
     ending: Option<serial::Record>,
     monitor: Option<std::rc::Rc<dyn crate::carry::Monitor>>,
+    /// Whether the round under way reads the newest root only to compare a statement's rows with it,
+    /// the statement to be refused or to go on as it found them: it reads nothing of its own.
+    comparing: std::cell::Cell<bool>,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -671,6 +674,7 @@ impl Snail {
             serial: Default::default(),
             ending: None,
             monitor: None,
+            comparing: Default::default(),
         })
     }
 
@@ -1697,6 +1701,10 @@ impl Snail {
         // Where the sequences stand, once one has handed out a value.
         if self.root.sequences.bytes > 0 {
             mark(self.root.sequences, 1)?;
+        }
+        // The serializable transactions' records, while a round older than their commits runs.
+        if self.root.serial.bytes > 0 {
+            mark(self.root.serial, 1)?;
         }
         // The roots each decision across snails carries.
         for d in &self.root.decided {

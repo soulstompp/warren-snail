@@ -566,3 +566,109 @@ fn a_writer_handed_the_root_its_host_takes_begins_from_it() {
         .unwrap();
     assert!(e.to_string().contains("lies in neither copy"), "{e}");
 }
+
+/// A monitor that keeps what it is told.
+struct Told(Rc<RefCell<Vec<String>>>);
+
+impl carry::Monitor for Told {
+    fn read(&self, table: &str, order: &str, block: Option<u64>) -> warren_snail::Result<()> {
+        let what = block.map_or("whole", |_| "block");
+        self.0
+            .borrow_mut()
+            .push(format!("read {table} {order} {what}"));
+        Ok(())
+    }
+
+    fn wrote(&self, table: &str, order: &str, _block: u64) -> warren_snail::Result<()> {
+        self.0.borrow_mut().push(format!("wrote {table} {order}"));
+        Ok(())
+    }
+
+    fn cut(&self, table: &str, order: &str, from: u64, to: u64) -> warren_snail::Result<()> {
+        assert_ne!(from, to);
+        self.0.borrow_mut().push(format!("cut {table} {order}"));
+        Ok(())
+    }
+}
+
+const COUNTED: &str =
+    "CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
+
+/// A host's monitor is the one monitor: told of each block a round reads and each a write changes,
+/// and of a cut as its commit lands; the file's records hold none of it.
+#[test]
+fn a_host_s_monitor_is_told_of_each_block_and_the_file_keeps_no_marks() {
+    let path = tmp("hosted-monitor.snail");
+    write(&path, &Catalog::parse(COUNTED).unwrap(), &[]).unwrap();
+    let told = Rc::new(RefCell::new(Vec::new()));
+    let said = Said::default();
+    let (mut w, _) = hosted(&path, 7, &said);
+    w.monitored_by(Rc::new(Told(told.clone())));
+    w.execute("BEGIN").unwrap();
+    // An order that holds no row is read whole.
+    w.ask("SELECT count(*) FROM s.t t", None).unwrap();
+    let rows: Vec<String> = (0..2048).map(|i| format!("({i}, {i})")).collect();
+    w.execute(&format!(
+        "INSERT INTO s.t (id, v) VALUES {}",
+        rows.join(", ")
+    ))
+    .unwrap();
+    assert!(told.borrow().iter().any(|t| t == "read s.t t_pkey whole"));
+    assert!(told.borrow().iter().any(|t| t == "wrote s.t t_pkey"));
+    told.borrow_mut().clear();
+    w.ask("SELECT sum(t.v) FROM s.t t WHERE t.id = 5", None)
+        .unwrap();
+    assert_eq!(told.borrow().as_slice(), ["read s.t t_pkey block"]);
+    w.execute("COMMIT").unwrap();
+    said.committed(7);
+    // The rows a block cannot hold cut it, told at the commit.
+    let (mut w, _) = hosted(&path, 8, &said);
+    w.monitored_by(Rc::new(Told(told.clone())));
+    told.borrow_mut().clear();
+    let more: Vec<String> = (0..1100).map(|i| format!("({}, 0)", 100_000 + i)).collect();
+    w.execute(&format!(
+        "INSERT INTO s.t (id, v) VALUES {}",
+        more.join(", ")
+    ))
+    .unwrap();
+    assert!(told.borrow().iter().any(|t| t == "wrote s.t t_pkey"));
+    assert!(told.borrow().iter().any(|t| t == "cut s.t t_pkey"));
+    said.committed(8);
+    assert_eq!(
+        Snail::open_judged(&path, Rc::new(said.clone()))
+            .unwrap()
+            .serial_records_kept()
+            .unwrap(),
+        0
+    );
+}
+
+/// A writer begun on the root a reader holds reads and writes as of it, and meets a block written
+/// since as a transaction of one snapshot does.
+#[test]
+fn a_writer_begun_on_a_reader_s_root_reads_as_of_its_generation() {
+    let path = tmp("hosted-begun.snail");
+    write(&path, &Catalog::parse(COUNTED).unwrap(), &[]).unwrap();
+    let said = Said::default();
+    let (mut w, _) = hosted(&path, 1, &said);
+    w.execute("INSERT INTO s.t (id, v) VALUES (1, 1), (2, 2)")
+        .unwrap();
+    drop(w);
+    said.committed(1);
+    let reader = Snail::open_judged(&path, Rc::new(said.clone())).unwrap();
+    let (mut other, _) = hosted(&path, 2, &said);
+    other
+        .execute("INSERT INTO s.t (id, v) VALUES (3, 3)")
+        .unwrap();
+    drop(other);
+    said.committed(2);
+    let (mut w, _) = hosted(&path, 3, &said);
+    w.begin_on(&reader).unwrap();
+    assert_eq!(count(&mut w, "SELECT count(*) FROM s.t t"), 2);
+    let e = w.execute("UPDATE s.t SET v = 9 WHERE id = 1").unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "could not serialize access due to concurrent update"
+    );
+    w.execute("ROLLBACK").unwrap();
+}

@@ -191,6 +191,12 @@ impl View {
 }
 
 impl Snail {
+    /// The records the root the snail reads names: for the tests of when they go.
+    #[doc(hidden)]
+    pub fn serial_records_kept(&self) -> Result<usize> {
+        Ok(self.records_at(self.root.serial)?.len())
+    }
+
     /// Whether the rounds of this snail mark what they read.
     pub(super) fn marking(&self) -> bool {
         self.monitor.is_some() || self.serial.borrow().as_ref().is_some_and(|s| s.active)
@@ -269,7 +275,14 @@ impl Snail {
                 Ok::<_, Error>((snapshot, possible))
             })();
             let given = lock::give_root_turn(&file);
-            let (snapshot, possible) = taken?;
+            let (snapshot, possible) = match taken {
+                Ok(took) => took,
+                Err(e) => {
+                    lock::mark_writes(&file, self.slot, false)?;
+                    lock::mark_serial(&file, self.slot, id, false)?;
+                    return Err(e);
+                }
+            };
             given?;
             let mut serial = Serial {
                 active: !(read_only && possible.is_empty()),
@@ -578,6 +591,9 @@ impl Snail {
     /// order whole, and an edge found to each writer of what it marked. A transaction someone doomed
     /// fails here, as PostgreSQL's does at its next read.
     pub(super) fn mark_read(&self, table: usize, walk: &Walk) -> Result<()> {
+        if self.comparing.get() {
+            return Ok(());
+        }
         if let Some(m) = &self.monitor {
             let t = &self.catalog.tables[table];
             let order = &t.orders[walk.order];
@@ -614,6 +630,9 @@ impl Snail {
         table: usize,
         walk: &Walk,
     ) -> Result<()> {
+        if walk.empty {
+            return Ok(());
+        }
         let v = self.view(file, s.id)?;
         if self.doomed(file, &v, s, s.id)? {
             return Err(failed(
@@ -761,6 +780,12 @@ impl Snail {
             }
         }
         Ok(())
+    }
+
+    /// A round reads the newest root from here on only to compare a statement's rows with it, or no
+    /// longer does.
+    pub(super) fn serial_comparing(&self, comparing: bool) {
+        self.comparing.set(comparing);
     }
 
     /// Whether the transaction's commit writes its records though it wrote nothing: another

@@ -84,8 +84,14 @@ at once, and a snail written inside a host that decides its commits.
   an index of it.
 - Writes: an `INSERT … SELECT` held to PostgreSQL's assignment casts, `SET CONSTRAINTS`, and the
   DDL above in `exec`; the `DEFAULT`s `now()`, `gen_random_uuid()`, `uuidv4()` and `uuidv7()`;
-  READ COMMITTED, and READ UNCOMMITTED run as it, named by `BEGIN`, `START TRANSACTION`, `SET
+  READ COMMITTED, and READ UNCOMMITTED run as it, REPEATABLE READ and SERIALIZABLE, each as
+  PostgreSQL has it, and READ ONLY and DEFERRABLE, named by `BEGIN`, `START TRANSACTION`, `SET
   TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION`.
+- SERIALIZABLE in a file of format 9: PostgreSQL's monitor on the snail's places. Each transaction's
+  committed set composes as one serial order, one that would not is refused, SQLSTATE 40001, in
+  PostgreSQL's words; a committed transaction's marks lie in records its root names; a host's own
+  monitor is told instead, by `carry::Monitor` and `Snail::monitored_by`, and the file keeps none.
+  `Snail::begin_on` begins a host's writer on a generation its reader holds.
 - One clock a transaction: `now()`, `CURRENT_TIMESTAMP`, `transaction_timestamp()` and the literals
   `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` read the transaction's start wherever they are
   written, `statement_timestamp()` the statement's, `clock_timestamp()` the machine's.
