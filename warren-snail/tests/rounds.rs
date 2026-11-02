@@ -472,3 +472,59 @@ fn a_strand_s_rows_written_after_its_blocks_were_cut_are_put_in_their_place_firs
     got.sort();
     assert_eq!(got, places(&rows));
 }
+
+#[test]
+fn a_table_kept_to_a_few_keys_reads_their_block_in_part() {
+    // Beside the tree, 16,384 rows keyed by a 4-byte integer, a page of it 1,024 rows, so a block is
+    // 1,024 rows; its two 8-byte columns take 2 pages each in every block.
+    let path = tmp("rounds-part.snail");
+    let ddl = format!(
+        "{DDL} CREATE TABLE s.w (k integer NOT NULL, v bigint NOT NULL, x bigint NOT NULL, \
+         PRIMARY KEY (k));"
+    );
+    let catalog = Catalog::parse(&ddl).unwrap();
+    let column = |table: &str, c: usize, f: &dyn Fn(i64) -> i64, n: std::ops::RangeInclusive<i64>| {
+        let col = &catalog.table(table).unwrap().columns[c];
+        let mut v = Values::new(col.ty);
+        for i in n {
+            push_datum(
+                &mut v,
+                &warren_snail::composed::scalar_in(col.ty, &f(i).to_string()).unwrap(),
+            );
+        }
+        v
+    };
+    let parent = |id: i64| if id == 1 { ROOT_PARENT } else { id / 2 };
+    let tree = Rows {
+        columns: vec![
+            column("s.t", 0, &parent, 1..=N),
+            column("s.t", 1, &|i| i, 1..=N),
+        ],
+    };
+    let wide = Rows {
+        columns: vec![
+            column("s.w", 0, &|i| i, 0..=(1 << 14) - 1),
+            column("s.w", 1, &|i| 3 * i, 0..=(1 << 14) - 1),
+            column("s.w", 2, &|i| -i, 0..=(1 << 14) - 1),
+        ],
+    };
+    write(
+        &path,
+        &catalog,
+        &[("s.t".into(), tree), ("s.w".into(), wide)],
+    )
+    .unwrap();
+    // Node 3000's children, 6000 and 6001, lie in the block of 5,120 to 6,143, at its 880th and 881st
+    // rows: the key's one page and the second of v's two.
+    let q = "SELECT sum(w.v) FROM (SELECT t.id FROM s.t t WHERE t.parent = 3000) k \
+             JOIN s.w w ON w.k = k.id";
+    let (got, round) = asked(&path, q);
+    assert_eq!(got, 3 * (6000 + 6001));
+    let kept = &round.reads[1];
+    assert_eq!(
+        (kept.blocks_read, kept.column_pages_predicted),
+        (1, 2),
+        "{q}: {kept:?}"
+    );
+    assert!(kept.column_pages_high > 2, "{q}: more than it reads: {kept:?}");
+}
