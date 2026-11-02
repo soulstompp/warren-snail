@@ -197,14 +197,21 @@ fn a_table_met_with_rows_made_before_it_is_kept_to_their_keys_in_each_place() {
             kept.blocks_read > 0 && kept.column_pages_predicted < table / 4,
             "{q}: {kept:?}"
         );
-        eprintln!(
-            "{q}\n  kept read: predicted {} held {} read {}, blocks {}",
-            kept.column_pages_predicted,
-            kept.column_pages_held,
-            kept.column_pages_read,
-            kept.blocks_read
-        );
     }
+    // A table a RIGHT JOIN keeps whole is never kept to the other side's keys: every node, four of
+    // them met.
+    let right = "SELECT count(*), count(k.id) FROM (SELECT t.id FROM s.t t WHERE t.parent = 3000) k \
+                 RIGHT JOIN s.t u ON u.parent = k.id";
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(right, None).unwrap();
+    each_read_exact(right, &round);
+    let rows = warren_snail::read::pipeline_rows(&b).unwrap();
+    assert_eq!(
+        format!("{rows:?}"),
+        format!("{:?}", [[warren_snail::read::Value::Int(N), warren_snail::read::Value::Int(4)]]),
+        "{right}"
+    );
+    assert_eq!(round.reads[1].column_pages_predicted, table, "{right}: {round:?}");
 }
 
 #[test]
@@ -223,6 +230,18 @@ fn a_page_read_once_in_a_round_is_not_read_again() {
         (table / 2, 0),
         "{q}: {round:?}"
     );
+    // With nothing held between rounds, the round's room keeps them.
+    #[cfg(feature = "standalone")]
+    {
+        let mut snail = Snail::open_holding(&path, 0).unwrap();
+        let (_, round) = snail.ask(q, None).unwrap();
+        each_read_exact(q, &round);
+        assert_eq!(
+            (round.reads[1].column_pages_held, round.column_pages_read),
+            (table / 2, table / 2),
+            "{q}: {round:?}"
+        );
+    }
     // With no room to keep them in, and none held between rounds, the second reads them again.
     #[cfg(feature = "standalone")]
     let mut snail = Snail::open_holding(&path, 0).unwrap();
