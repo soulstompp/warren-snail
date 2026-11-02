@@ -578,10 +578,7 @@ fn run_interleaving(
         std::fs::copy(b, a).unwrap();
     }
     let several = at.len() > 1;
-    let seen: Vec<std::fs::File> = at
-        .iter()
-        .map(|a| std::fs::File::open(a).unwrap())
-        .collect();
+    let seen: Vec<std::fs::File> = at.iter().map(|a| std::fs::File::open(a).unwrap()).collect();
     let n = transactions.len();
     let sessions: Vec<_> = (0..n).map(|_| transaction(at.to_vec())).collect();
     let mut answers: Vec<Vec<Answered>> = vec![Vec::new(); n];
@@ -823,7 +820,14 @@ fn walk(
         level.replace(' ', "-"),
         i32::from(statements.contains(&Step::Read(C)))
     );
-    walk_on(vec![made(&format!("walk-base-{tag}"))], n, statements, level, shard_of, jobs)
+    walk_on(
+        vec![made(&format!("walk-base-{tag}"))],
+        n,
+        statements,
+        level,
+        shard_of,
+        jobs,
+    )
 }
 
 /// The same on the snails `base`, each of its own.
@@ -1189,7 +1193,10 @@ fn transactions_of_blocks_apart_on_two_snails_each_commit_and_read_one_moment() 
         // A commit outside them lands on both; neither transaction's later reads see it.
         run_across(&mut x, &format!("UPDATE s.t SET v = v - 1 WHERE id = {A}"));
         run_across(&mut x, &format!("UPDATE o.t SET v = v - 1 WHERE id = {A}"));
-        assert_eq!((read_across(&mut a, "s.t", A), read_across(&mut a, "o.t", A)), (s, o));
+        assert_eq!(
+            (read_across(&mut a, "s.t", A), read_across(&mut a, "o.t", A)),
+            (s, o)
+        );
         run_across(&mut a, &format!("UPDATE o.t SET v = -3 WHERE id = {B}"));
         run_across(&mut b, &format!("UPDATE s.t SET v = -4 WHERE id = {B}"));
         assert_eq!(read_across(&mut a, "o.t", B), -3);
@@ -1211,10 +1218,16 @@ fn a_transaction_across_two_snails_commits_one_root_deciding_its_records_in_each
     run_across(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     run_across(&mut a, &format!("UPDATE s.t SET v = -1 WHERE id = {A}"));
     run_across(&mut a, &format!("UPDATE o.t SET v = -1 WHERE id = {B}"));
-    let (g, h) = (Snail::open(&p).unwrap().generation(), Snail::open(&q).unwrap().generation());
+    let (g, h) = (
+        Snail::open(&p).unwrap().generation(),
+        Snail::open(&q).unwrap().generation(),
+    );
     run_across(&mut a, "COMMIT");
     assert_eq!(
-        (Snail::open(&p).unwrap().generation(), Snail::open(&q).unwrap().generation()),
+        (
+            Snail::open(&p).unwrap().generation(),
+            Snail::open(&q).unwrap().generation()
+        ),
         (g + 1, h + 1)
     );
     // The deciding root names the other's; every snail's root holds its record.
@@ -1349,8 +1362,13 @@ fn a_session_s_level_across_snails_makes_each_statement_a_transaction() {
     assert_eq!(read_across(&mut a, "o.t", B), -1);
     run_across(&mut a, "BEGIN READ ONLY");
     assert_eq!(read_across(&mut a, "o.t", B), -1);
-    let e = a.execute(&format!("UPDATE o.t SET v = -2 WHERE id = {B}")).unwrap_err();
-    assert_eq!(e.to_string(), "cannot execute UPDATE in a read-only transaction");
+    let e = a
+        .execute(&format!("UPDATE o.t SET v = -2 WHERE id = {B}"))
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "cannot execute UPDATE in a read-only transaction"
+    );
     run_across(&mut a, "ROLLBACK");
 }
 
@@ -1365,7 +1383,10 @@ fn an_older_format_among_several_refuses_the_level_by_name() {
         .iter()
         .map(|c| {
             let mut v = Values::new(c.ty);
-            push_datum(&mut v, &warren_snail::composed::scalar_in(c.ty, "1").unwrap());
+            push_datum(
+                &mut v,
+                &warren_snail::composed::scalar_in(c.ty, "1").unwrap(),
+            );
             v
         })
         .collect();
@@ -1381,7 +1402,10 @@ fn an_older_format_among_several_refuses_the_level_by_name() {
         .execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
         .unwrap_err()
         .to_string();
-    assert!(e.starts_with("a snail of format 8 runs no SERIALIZABLE transaction"), "{e}");
+    assert!(
+        e.starts_with("a snail of format 8 runs no SERIALIZABLE transaction"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -1397,7 +1421,14 @@ fn every_interleaving_of_two_transactions_across_two_snails_is_some_serial_order
 #[test]
 fn at_repeatable_read_the_walk_across_two_snails_finds_histories_no_serial_order_gives() {
     let (p, q) = two_snails("walk-across-repeatable");
-    let w = walk_on(vec![p, q], 2, &READS_AND_WRITES, "REPEATABLE READ", (0, 1), jobs());
+    let w = walk_on(
+        vec![p, q],
+        2,
+        &READS_AND_WRITES,
+        "REPEATABLE READ",
+        (0, 1),
+        jobs(),
+    );
     println!("{w:?}");
     assert!(w.broken_count > 0, "{w:?}");
 }

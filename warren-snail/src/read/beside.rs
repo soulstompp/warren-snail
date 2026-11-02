@@ -179,7 +179,10 @@ impl Snail {
 
     /// Enters the round's room, what the transaction of one snapshot keeps of its own rows counted in
     /// it: their values, and the pages of the version it reads that hold them.
-    pub(super) fn entered_round(&self, room: &std::rc::Rc<crate::room::Room>) -> crate::room::Entered {
+    pub(super) fn entered_round(
+        &self,
+        room: &std::rc::Rc<crate::room::Room>,
+    ) -> crate::room::Entered {
         let entered = crate::room::entered(room);
         if entered.outermost() {
             room.hold_anyway(self.own_bytes());
@@ -336,7 +339,8 @@ impl Snail {
             }
             by_block.entry(path).or_default().push(r);
         }
-        let held = |r: &Row| -> Vec<Datum> { order.columns.iter().map(|&c| r[c].clone()).collect() };
+        let held =
+            |r: &Row| -> Vec<Datum> { order.columns.iter().map(|&c| r[c].clone()).collect() };
         let identity: Vec<usize> = super::locking::key_columns(table)
             .into_iter()
             .filter_map(|c| order.slot(c))
@@ -451,7 +455,13 @@ impl Snail {
             .iter()
             .enumerate()
             .filter(|(_, o)| o.unique)
-            .map(|(oi, o)| Ok((oi, o, super::partial::Predicate::of(&self.catalog, table, o)?)))
+            .map(|(oi, o)| {
+                Ok((
+                    oi,
+                    o,
+                    super::partial::Predicate::of(&self.catalog, table, o)?,
+                ))
+            })
             .collect::<Result<_>>()?;
         let own = self.own.entry(table.name.clone()).or_default();
         for c in changes {
@@ -463,14 +473,10 @@ impl Snail {
             for (oi, order, predicate) in &unique {
                 let admits = |r: &Row| predicate.as_ref().is_none_or(|p| p.admits(table, r));
                 if let Some(o) = old.filter(|o| own.holds(o) && admits(o)) {
-                    *own.keys
-                        .entry((*oi, key_of(table, order, o)?))
-                        .or_default() -= 1;
+                    *own.keys.entry((*oi, key_of(table, order, o)?)).or_default() -= 1;
                 }
                 if let Some(n) = new.filter(|n| admits(n)) {
-                    *own.keys
-                        .entry((*oi, key_of(table, order, n)?))
-                        .or_default() += 1;
+                    *own.keys.entry((*oi, key_of(table, order, n)?)).or_default() += 1;
                 }
             }
             own.add(c.clone());
@@ -724,11 +730,7 @@ impl Snail {
                         .expect("an order it declared");
                     let top =
                         stage.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
-                    match root
-                        .orders
-                        .iter_mut()
-                        .find(|(a, b, _)| a == tn && b == on)
-                    {
+                    match root.orders.iter_mut().find(|(a, b, _)| a == tn && b == on) {
                         Some(named) => named.2 = top,
                         None => root.orders.push((tn.clone(), on.clone(), top)),
                     }

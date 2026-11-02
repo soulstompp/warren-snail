@@ -505,7 +505,10 @@ impl Snail {
         let order = txn.order;
         let mut not_safe = false;
         txn.possible.retain(|p| {
-            if v.files.iter().any(|f| f.running.iter().any(|(_, x)| x == p)) {
+            if v.files
+                .iter()
+                .any(|f| f.running.iter().any(|(_, x)| x == p))
+            {
                 return true;
             }
             for f in &v.files {
@@ -630,10 +633,7 @@ impl Snail {
                 None => self.records_now(),
             })?);
         }
-        Ok(View {
-            me: txn.id,
-            files,
-        })
+        Ok(View { me: txn.id, files })
     }
 
     /// The monitor as the transaction reads it: its own files, and each file another running beside it
@@ -676,11 +676,7 @@ impl Snail {
 
     /// Runs `f` at the turn at the marks of every file the transaction reaches, taken in their order on
     /// the machine, each file a test may read held still until it ends.
-    fn at_turn<T>(
-        &self,
-        t: &Rc<RefCell<Txn>>,
-        f: impl FnOnce(&View) -> Result<T>,
-    ) -> Result<T> {
+    fn at_turn<T>(&self, t: &Rc<RefCell<Txn>>, f: impl FnOnce(&View) -> Result<T>) -> Result<T> {
         loop {
             let mut turns: Vec<std::fs::File> = Vec::new();
             {
@@ -854,8 +850,7 @@ impl Snail {
                     continue;
                 }
                 if committed(t0).is_none_or(|c| c >= w)
-                    && (!self.is_read_only(v, &txn, t0)?
-                        || self.snapshot_of(v, &txn, t0)? >= w)
+                    && (!self.is_read_only(v, &txn, t0)? || self.snapshot_of(v, &txn, t0)? >= w)
                 {
                     failure = true;
                     break;

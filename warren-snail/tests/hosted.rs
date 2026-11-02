@@ -688,9 +688,7 @@ fn a_writer_begun_on_a_reader_s_root_reads_as_of_its_generation() {
     assert_eq!(count(&mut w, "SELECT count(*) FROM s.t t"), 2);
     w.execute("ROLLBACK").unwrap();
     let (mut other, _) = hosted(&path, 4, &said);
-    other
-        .execute("UPDATE s.t SET v = 8 WHERE id = 2")
-        .unwrap();
+    other.execute("UPDATE s.t SET v = 8 WHERE id = 2").unwrap();
     drop(other);
     said.committed(4);
     let (mut w, _) = hosted(&path, 5, &said);
