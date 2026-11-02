@@ -88,6 +88,12 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             k.index
         )));
     }
+    if let Some(b) = table.brins.first() {
+        return Err(crate::Error::new(format!(
+            "{}: the brin index {}, {way}",
+            table.name, b.name
+        )));
+    }
     if let Some(o) = table.orders.iter().find(|o| o.predicate.is_some()) {
         return Err(crate::Error::new(format!(
             "{}: the partial index {}, {way}",

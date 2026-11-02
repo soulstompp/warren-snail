@@ -212,6 +212,8 @@ pub struct Walk {
     pub(super) texts: Vec<usize>,
     /// The tests for NULL no level fixes, by their place among the side's.
     nulls: Vec<usize>,
+    /// The key of each BRIN summary its entries keep.
+    summed: Vec<Level>,
     /// How many leading levels are the join's columns another table's keys restrict, or 0.
     keyed: usize,
     /// The entries left open, all on one level.
@@ -758,6 +760,10 @@ impl Snail {
             rest,
             texts,
             nulls,
+            summed: crate::brin::kept(want.table, order)
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect(),
             keyed,
             open: Vec::new(),
             level,
@@ -1863,8 +1869,9 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             text_may.push(ti);
         }
     }
-    // A condition by an operator rules the entry out where the column holds no value there, or where
-    // its span, kept on a GiST or SP-GiST strand, says no value there can hold it.
+    // A condition by an operator rules the entry out where the column holds no value there, or where a
+    // summary the entry keeps of it says no value there can hold it: its span, kept on a GiST or SP-GiST
+    // strand or for a BRIN inclusion, or a box's leaves.
     let mut op_may = Vec::new();
     for (oi, o) in side.ops.iter().enumerate() {
         let slot = order.leaf_slot(table, o.column).unwrap();
@@ -1874,21 +1881,21 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             .iter()
             .position(|&s| s as usize == slot)
             .and_then(|k| e.spans.get(k));
+        let inet = crate::spans::is_inet(table.columns[o.column].ty);
         let ruled_out = e.columns[slot].nulls == e.rows
-            || match (span, &o.probe) {
-                (Some(span), Some(probe)) => !crate::spans::may_hold(
-                    &o.op,
-                    span,
-                    probe,
-                    crate::spans::is_inet(table.columns[o.column].ty),
-                ),
-                _ => false,
-            };
+            || o.probe.as_ref().is_some_and(|probe| {
+                span.is_some_and(|span| !crate::spans::may_hold(&o.op, span, probe, inet))
+                    || !crate::spans::box_may_hold(&o.op, probe, &e.columns[slot..])
+            });
         if ruled_out {
             status = Status::None;
         } else {
             op_may.push(oi);
         }
+    }
+    // A BRIN summary rules the entry out where no value it sums can hold a condition on its key.
+    if super::summed::rules_out(&walk.summed, &e.summed, side) {
+        status = Status::None;
     }
     let may = rest_may.len() + null_may.len();
     if status != Status::None && (may > 0 || !text_may.is_empty() || !op_may.is_empty() || keys_may)
@@ -2479,6 +2486,7 @@ mod tests {
             ends: vec![[0, 0]],
             bytes: vec![],
             spans: Vec::new(),
+            summed: Vec::new(),
             tails: Vec::new(),
             child: Extent::default(),
         };
@@ -2521,6 +2529,7 @@ mod tests {
             ends: vec![],
             bytes: vec![],
             spans: Vec::new(),
+            summed: Vec::new(),
             tails: Vec::new(),
             child: Extent::default(),
         };
@@ -2559,6 +2568,7 @@ mod tests {
             ends: vec![],
             bytes: vec![],
             spans: Vec::new(),
+            summed: Vec::new(),
             tails: Vec::new(),
             child: Extent::default(),
         };

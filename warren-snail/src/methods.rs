@@ -9,11 +9,11 @@ use crate::textual::Textual;
 use crate::{Error, Result};
 
 /// Whether the snail holds an index of the method with a key of the operator class: a B-tree and a
-/// hash on any; a GiST or an SP-GiST on a range, a multirange, an inet, text, or a shape on the plane; a
-/// key held as an element strand.
+/// hash and a BRIN on any; a GiST or an SP-GiST on a range, a multirange, an inet, text, or a shape on
+/// the plane; a key held as an element strand.
 pub fn held(method: Method, opclass: &str) -> bool {
     match method {
-        Method::Btree | Method::Hash => true,
+        Method::Btree | Method::Hash | Method::Brin => true,
         _ if holds_elements(method, opclass) => true,
         Method::Gist => matches!(
             opclass,
@@ -352,12 +352,16 @@ enum Param {
     Buffering,
 }
 
-/// A value as written in a parameter list: unquoted, its doubled quotes made one.
+/// A value as written in a parameter list: unquoted, its doubled quotes made one, a sign against its
+/// number.
 fn unquoted(v: &str) -> String {
     let v = v.trim();
     match v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) {
         Some(x) => x.replace("''", "'"),
-        None => v.to_string(),
+        None => match v.strip_prefix('-') {
+            Some(n) => format!("-{}", n.trim_start()),
+            None => v.to_string(),
+        },
     }
 }
 
@@ -471,6 +475,14 @@ pub fn opclass_params(method: Method, opclass: &str, written: &str) -> Result<()
         seen.push(name);
     }
     Ok(())
+}
+
+/// A parameter's value in an operator class's parameters as written, unquoted.
+pub(crate) fn opclass_param(written: &str, name: &str) -> Option<String> {
+    written.split(',').find_map(|p| {
+        let (n, v) = p.split_once('=')?;
+        (n.trim().eq_ignore_ascii_case(name)).then(|| unquoted(v))
+    })
 }
 
 /// A type as PostgreSQL's `format_type_be` names it in a refusal: without its modifier.

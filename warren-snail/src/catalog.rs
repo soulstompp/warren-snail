@@ -1198,6 +1198,24 @@ impl Order {
     }
 }
 
+/// A BRIN index: no strand, each block of the table's order keeping a summary of each of its keys.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Brin {
+    pub name: String,
+    pub levels: Vec<Level>,
+    /// Each key as the index writes it.
+    pub keys: Vec<String>,
+    /// Each key's operator class.
+    pub opclasses: Vec<String>,
+    /// Each key's operator class's parameters, as written.
+    pub params: Vec<Option<String>>,
+    /// The storage parameters its index sets, as written: read, and nothing in a snail.
+    pub options: Vec<(String, String)>,
+    /// A partial index's predicate, as written: every row is summed all the same.
+    pub predicate: Option<String>,
+}
+
 /// A CHECK on a table's row.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -1291,6 +1309,8 @@ pub struct Table {
     pub foreign_keys: Vec<ForeignKey>,
     /// The lc_monetary its money reads and prints under: the file's.
     pub monetary: crate::monetary::Monetary,
+    /// Its BRIN indexes, which no order stands for.
+    pub brins: Vec<Brin>,
     /// The format of the file it lies in, whose leaves its columns are held as.
     pub format: u32,
     /// The keys of its indexes held as element strands, each index's keys in turn.
@@ -1314,6 +1334,7 @@ impl Table {
                 .iter()
                 .zip(&other.columns)
                 .all(|(a, b)| a.name == b.name && a.ty == b.ty && a.not_null == b.not_null)
+            && self.brins == other.brins
             && self.orders.len() == other.orders.len()
             && self.orders.iter().zip(&other.orders).all(|(a, b)| {
                 a.name == b.name

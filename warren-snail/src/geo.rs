@@ -1165,6 +1165,70 @@ pub(crate) fn box_contain_box(outer: &GeoBox, inner: &GeoBox) -> bool {
         && fp_le(outer.low.y, inner.low.y)
 }
 
+/// The greatest of a leaf that may hold a NaN, which sorts last: it stands for every value.
+fn past_nan(greatest: f64) -> f64 {
+    if greatest.is_nan() {
+        f64::INFINITY
+    } else {
+        greatest
+    }
+}
+
+/// Whether a box among those whose high x, high y, low x and low y lie within the least and greatest
+/// given may pass `box op q`, by the comparisons PostgreSQL's operator makes.
+pub(crate) fn box_may_hold(op: &str, leaves: [(f64, f64); 4], q: &GeoBox) -> bool {
+    let [hx, hy, lx, ly] = leaves;
+    let (hx_top, hy_top, lx_top, ly_top) = (
+        past_nan(hx.1),
+        past_nan(hy.1),
+        past_nan(lx.1),
+        past_nan(ly.1),
+    );
+    match op {
+        "&&" => {
+            fp_le(lx.0, q.high.x)
+                && fp_le(q.low.x, hx_top)
+                && fp_le(ly.0, q.high.y)
+                && fp_le(q.low.y, hy_top)
+        }
+        "<<" => fp_lt(hx.0, q.low.x),
+        "&<" => fp_le(hx.0, q.high.x),
+        ">>" => fp_gt(lx_top, q.high.x),
+        "&>" => fp_ge(lx_top, q.low.x),
+        "<<|" => fp_lt(hy.0, q.low.y),
+        "&<|" => fp_le(hy.0, q.high.y),
+        "|>>" => fp_gt(ly_top, q.high.y),
+        "|&>" => fp_ge(ly_top, q.low.y),
+        "@>" => {
+            fp_ge(hx_top, q.high.x)
+                && fp_le(lx.0, q.low.x)
+                && fp_ge(hy_top, q.high.y)
+                && fp_le(ly.0, q.low.y)
+        }
+        "<@" => {
+            fp_ge(q.high.x, hx.0)
+                && fp_le(q.low.x, lx_top)
+                && fp_ge(q.high.y, hy.0)
+                && fp_le(q.low.y, ly_top)
+        }
+        "~=" => {
+            let near = |(least, greatest): (f64, f64), v: f64| {
+                v.is_nan()
+                    || greatest.is_nan()
+                    || (least - 2.0 * EPSILON <= v && v <= greatest + 2.0 * EPSILON)
+            };
+            near(hx, q.high.x) && near(hy, q.high.y) && near(lx, q.low.x) && near(ly, q.low.y)
+        }
+        _ => true,
+    }
+}
+
+/// Whether a box among those whose leaves lie so may hold the point, as `box_may_hold` asks.
+pub(crate) fn box_may_hold_point(leaves: [(f64, f64); 4], p: &Point) -> bool {
+    let [hx, hy, lx, ly] = leaves;
+    past_nan(hx.1) >= p.x && lx.0 <= p.x && past_nan(hy.1) >= p.y && ly.0 <= p.y
+}
+
 /// `box_ar`.
 fn box_ar(b: &GeoBox) -> Result<f64> {
     f8_mul(f8_mi(b.high.x, b.low.x)?, f8_mi(b.high.y, b.low.y)?)
@@ -2329,6 +2393,105 @@ pub fn geo_function(name: &str, args: &[GeoArg]) -> Option<Result<GeoValue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Boxes of the coordinates given, a coordinate each from the list, high above low unless a NaN.
+    fn box_of(v: [f64; 4]) -> GeoBox {
+        GeoBox {
+            high: Point {
+                x: v[0].max(v[2]),
+                y: v[1].max(v[3]),
+            },
+            low: Point {
+                x: v[0].min(v[2]),
+                y: v[1].min(v[3]),
+            },
+        }
+    }
+
+    #[test]
+    fn a_block_s_leaves_never_rule_out_a_box_an_operator_keeps() {
+        // PostgreSQL's fuzzy comparisons are held at their edge: a walk of coordinates either side of
+        // EPSILON, and past the ends, on blocks of two boxes and every operator.
+        let near = [
+            -1.0,
+            -EPSILON,
+            -EPSILON / 2.0,
+            0.0,
+            EPSILON / 2.0,
+            EPSILON,
+            1.0,
+        ];
+        let far = [f64::NEG_INFINITY, f64::INFINITY, 1e300, f64::NAN];
+        let all: Vec<f64> = near.iter().chain(&far).copied().collect();
+        // A seeded walk of the boxes: every quadruple would ask too many pairs.
+        let mut at = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            at ^= at << 13;
+            at ^= at >> 7;
+            at ^= at << 17;
+            all[(at % all.len() as u64) as usize]
+        };
+        let keep = |raw: [f64; 4]| -> GeoBox {
+            // A NaN stays where it is written, as box_in leaves it.
+            if raw.iter().any(|x| x.is_nan()) {
+                GeoBox {
+                    high: Point {
+                        x: raw[0],
+                        y: raw[1],
+                    },
+                    low: Point {
+                        x: raw[2],
+                        y: raw[3],
+                    },
+                }
+            } else {
+                box_of(raw)
+            }
+        };
+        let mut kept = 0u64;
+        for _ in 0..200_000 {
+            let mut draw = || keep([next(), next(), next(), next()]);
+            let (a, b, q) = (draw(), draw(), draw());
+            let of = |f: fn(&GeoBox) -> f64| {
+                let key = |x: f64| crate::scalars::float8_key(x.to_bits());
+                let (x, y) = (f(&a), f(&b));
+                let least = if key(x) <= key(y) { x } else { y };
+                let greatest = if key(x) >= key(y) { x } else { y };
+                (least, greatest)
+            };
+            let leaves = [
+                of(|b| b.high.x),
+                of(|b| b.high.y),
+                of(|b| b.low.x),
+                of(|b| b.low.y),
+            ];
+            for op in [
+                "<<", "&<", "&&", "&>", ">>", "~=", "@>", "<@", "&<|", "<<|", "|>>", "|&>",
+            ] {
+                for row in [&a, &b] {
+                    let held = geo_binary(op, &Geo::Box(row.clone()), &Geo::Box(q.clone()));
+                    if matches!(held, Some(Ok(GeoValue::Bool(true)))) {
+                        kept += 1;
+                        assert!(
+                            box_may_hold(op, leaves, &q),
+                            "{op}: {row:?} against {q:?} ruled out by {leaves:?}"
+                        );
+                    }
+                }
+            }
+            let p = Point {
+                x: q.high.x,
+                y: q.low.y,
+            };
+            for row in [&a, &b] {
+                if box_contain_point(row, &p) {
+                    assert!(box_may_hold_point(leaves, &p), "{row:?} {p:?}");
+                }
+            }
+        }
+        // A walk that kept nothing would hold nothing.
+        assert!(kept > 100_000, "{kept}");
+    }
 
     /// What PostgreSQL 19 answered, one question a line, tab separated: `in`, a type and a text
     /// read as it; `un`, a prefix operator, a type and a text; `cast`, a type, a text and the type

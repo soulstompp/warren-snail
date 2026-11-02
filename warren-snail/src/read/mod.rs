@@ -37,6 +37,7 @@ mod sets;
 mod spill;
 mod spelled;
 mod strands;
+mod summed;
 pub mod statement;
 mod subqueries;
 mod together;

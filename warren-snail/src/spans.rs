@@ -1,7 +1,7 @@
-//! The span a GiST or SP-GiST strand keeps of each column it names, block by block: a range's and a
-//! multirange's least lower bound and greatest upper bound, an inet's first and last address, a
-//! shape's bounding box; and whether a block of that span may hold a row an operator's condition
-//! keeps.
+//! The span a GiST or SP-GiST strand keeps of each column it names, and the table's order of each a
+//! BRIN inclusion names, block by block: a range's and a multirange's least lower bound and greatest
+//! upper bound, an inet's first and last address, a shape's bounding box; and whether a block of that
+//! span, or of a box's leaves, may hold a row an operator's condition keeps.
 
 use crate::catalog::{ColumnType, Method, Order, Table};
 use crate::composed::Composed;
@@ -33,12 +33,18 @@ pub(crate) fn is_inet(ty: ColumnType) -> bool {
 }
 
 /// The columns whose span an order keeps: its levels of a range, a multirange, an inet or a shape on
-/// the plane, where its index is a GiST or an SP-GiST.
+/// the plane, where its index is a GiST or an SP-GiST, and on the table's order those a BRIN inclusion
+/// names.
 pub(crate) fn columns(table: &Table, order: &Order) -> Vec<usize> {
     let mut out: Vec<usize> = Vec::new();
     for l in &order.levels {
         let c = l.column();
         if spanned(order.method, table.columns[c].ty) && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    for c in crate::brin::spanned(table, order) {
+        if !out.contains(&c) {
             out.push(c);
         }
     }
@@ -154,5 +160,26 @@ pub(crate) fn may_hold(op: &str, span: &Span, probe: &Probe, inet: bool) -> bool
                 _ => true,
             }
         }
+    }
+}
+
+/// Whether a block whose box column's four leaves keep `leaves`' least and greatest may hold a row
+/// that `column op probe` keeps; any other probe says nothing here.
+pub(crate) fn box_may_hold(op: &str, probe: &Probe, leaves: &[crate::directory::Summary]) -> bool {
+    use crate::geo::{Geo, GeoKind};
+    let bounds = |s: &crate::directory::Summary| {
+        (
+            crate::places::float8_of_key(s.min as i64),
+            crate::places::float8_of_key(s.max as i64),
+        )
+    };
+    match (probe, leaves) {
+        (Probe::Plane(GeoKind::Box, Geo::Box(q)), [hx, hy, lx, ly, ..]) => {
+            crate::geo::box_may_hold(op, [bounds(hx), bounds(hy), bounds(lx), bounds(ly)], q)
+        }
+        (Probe::Plane(GeoKind::Box, Geo::Point(p)), [hx, hy, lx, ly, ..]) => {
+            crate::geo::box_may_hold_point([bounds(hx), bounds(hy), bounds(lx), bounds(ly)], p)
+        }
+        _ => true,
     }
 }

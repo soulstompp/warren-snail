@@ -191,7 +191,11 @@ keeping the bounding box of the shapes it holds, so that a box reads the blocks 
 others. A GIN index on an array, a `jsonb` or a `tsvector`, and a GiST index on a `tsvector` or a
 `tsquery`, is a strand of what each row holds, an element and the row's key, on the element's order:
 an operator finds its rows' keys there and the rows by them on the table's order, where that reads
-the fewest pages, and one element's count comes from its counts. A BRIN index is refused by name. A partial index, its `WHERE` comparing its columns with values,
+the fewest pages, and one element's count comes from its counts. A BRIN index, on any of its operator
+classes, stores no order of its own: each block of the table's order, and each directory entry above
+the blocks, keeps a summary of the key, its least and greatest, its span, its runs of values, or its
+bloom filter, and a block no value of which can hold the question's condition is never read. A partial
+index, its `WHERE` comparing its columns with values,
 holds only the rows it names, and serves a question whose conditions imply its own. A question that
 reads a column no order holds in the question's own order still reads along the table's order.
 Cluster each table on the index most of its questions lead with: a key handed out as rows arrive,
@@ -871,7 +875,7 @@ Each command exits 0, or prints why it refused and exits 1.
   whose body is one expression; `CREATE VIEW`, with its column list, its question read over the
   tables and views before it as the view is made, and read as a step of each question that names
   it.
-- `CREATE INDEX`: `USING btree`, `hash`, `gist` or `spgist`, as *The table's order, and its
+- `CREATE INDEX`: `USING btree`, `hash`, `gist`, `spgist`, `gin` or `brin`, as *The table's order, and its
   indexes* says; a key on columns, on a column under its own `COLLATE`, on an instant on UTC's
   clock, `(<column> AT TIME ZONE 'UTC')`, on its month, `(extract(month FROM
   <clock>(<column>))::smallint)`, or on a function the DDL declares, read through its body, as

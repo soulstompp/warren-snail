@@ -140,13 +140,14 @@ pub(crate) fn widen_corners(lo: &mut Vec<u8>, hi: &mut Vec<u8>, l: &[u8], h: &[u
 }
 
 /// The operators the plane's operator classes take, by the column's type and the value's: each
-/// operator of `pg_amop` for `point_ops`, `quad_point_ops`, `kd_point_ops`, `box_ops`, `circle_ops`
-/// and `poly_ops` but `<->`.
+/// operator of `pg_amop` for `point_ops`, `quad_point_ops`, `kd_point_ops`, `box_ops`, `circle_ops`,
+/// `poly_ops` and BRIN's `box_inclusion_ops` but `<->`.
 pub(crate) fn takes(column: GeoKind, op: &str, value: GeoKind) -> bool {
     use GeoKind::{Box, Circle, Point, Polygon};
     match (column, value) {
         (Point, Point) => ["<<", ">>", "~=", "<<|", "|>>", "<^", ">^"].contains(&op),
         (Point, Box | Polygon | Circle) => op == "<@",
+        (Box, Point) => op == "@>",
         (Box, Box) | (Polygon, Polygon) | (Circle, Circle) => [
             "<<", "&<", "&&", "&>", ">>", "~=", "@>", "<@", "&<|", "<<|", "|>>", "|&>",
         ]
@@ -261,6 +262,8 @@ pub(crate) fn may_hold(column: GeoKind, op: &str, span: &Span, value: &Geo) -> b
                 || c.center.y - hy > c.radius)
         }
         (GeoKind::Box, Geo::Box(q)) => boxes(op, &block, q),
+        // Compared exactly, by `box_contain_point`.
+        (GeoKind::Box, Geo::Point(q)) => hx >= q.x && lx <= q.x && hy >= q.y && ly <= q.y,
         (GeoKind::Polygon, Geo::Polygon(q)) => polygons(op, &block, &q.bound),
         (GeoKind::Circle, Geo::Circle(_)) => circles(op, &block, value),
         _ => true,
@@ -516,8 +519,8 @@ mod tests {
             }
             let values: &[GeoKind] = match kind {
                 GeoKind::Point => &kinds,
+                GeoKind::Box => &kinds[..2],
                 k => std::slice::from_ref(match k {
-                    GeoKind::Box => &kinds[1],
                     GeoKind::Polygon => &kinds[2],
                     _ => &kinds[3],
                 }),

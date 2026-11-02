@@ -1569,6 +1569,7 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize, forma
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
         bound_slots: bound_slots(table, order, format),
+        summed: crate::brin::slots(table, order),
         separated: format >= crate::file::FORMAT,
     }
 }
@@ -1623,6 +1624,7 @@ pub(crate) fn empty_head(table: &Table, order: &Order, format: u32) -> Head {
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
         bound_slots: bound_slots(table, order, format),
+        summed: crate::brin::slots(table, order),
         separated: format >= crate::file::FORMAT,
     }
 }
@@ -1810,6 +1812,7 @@ fn write_order(
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
         bound_slots: bound_slots(table, order, format),
+        summed: crate::brin::slots(table, order),
         separated: format >= crate::file::FORMAT,
     };
     let (top, below) = build(head, entries, &mut |bytes| w.place(bytes))?;
@@ -1860,6 +1863,7 @@ pub(crate) fn write_block(
             crate::spans::of_rows(table.columns[c].ty, &rows.columns[c], &perm[b.start..b.end])
         })
         .collect();
+    let summed = crate::brin::summed(table, order, &rows.columns, &perm[b.start..b.end])?;
     let block_leaves = order
         .columns
         .iter()
@@ -2003,6 +2007,7 @@ pub(crate) fn write_block(
         bytes,
         spans,
         tails,
+        summed,
         child,
     };
     Ok((entry, encoded, moved))

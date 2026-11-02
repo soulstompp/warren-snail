@@ -5,10 +5,10 @@
 //! rest. Each form refuses by name what it does not know.
 
 use crate::catalog::{
-    assignable, format_type, held_type, ident, level, object_name, shape, Action, Catalog, Check,
-    Collation, Column, ColumnType, Domain, DomainCheck, Fact, ForeignKey, Function, Generated,
-    Identity, KeyConstraint, Level, Method, Order, Reading, Sequence, SequenceType, Shape,
-    StatementRead, Table, Type, TypeKind, View, TEXT_OPCLASSES,
+    assignable, format_type, held_type, ident, level, object_name, shape, Action, Brin, Catalog,
+    Check, Collation, Column, ColumnType, Domain, DomainCheck, Fact, ForeignKey, Function,
+    Generated, Identity, KeyConstraint, Level, Method, Order, Reading, Sequence, SequenceType,
+    Shape, StatementRead, Table, Type, TypeKind, View, TEXT_OPCLASSES,
 };
 use crate::{Error, Result};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
@@ -1779,6 +1779,8 @@ struct Keyed {
     nulls_distinct: bool,
     desc: Vec<bool>,
     keys: Vec<String>,
+    /// Each key's operator class's parameters, as written.
+    params: Vec<Option<String>>,
     opclasses: Vec<String>,
     options: Vec<(String, String)>,
     constraint: Option<KeyConstraint>,
@@ -3355,6 +3357,7 @@ impl Draft {
                 include,
                 nulls_distinct: k.nulls_distinct,
                 options: Vec::new(),
+                params: Vec::new(),
                 constraint: Some(KeyConstraint {
                     primary: k.primary,
                     deferrable: k.deferrable,
@@ -3838,6 +3841,7 @@ impl Draft {
                         release: crate::regs::LATEST,
                         foreign_keys: Vec::new(),
                         monetary: crate::monetary::Monetary::C,
+                        brins: Vec::new(),
                         format: crate::file::FORMAT,
                         element_keys: Vec::new(),
                         elements_of: None,
@@ -3868,6 +3872,7 @@ impl Draft {
         let mut desc = Vec::new();
         let mut nulls_first = Vec::new();
         let mut opclasses = Vec::new();
+        let mut written = Vec::new();
         let mut keys: Vec<Expr> = Vec::new();
         for (n, c) in i.columns.iter().enumerate() {
             let s = shape(
@@ -3958,6 +3963,7 @@ impl Draft {
             for (_, p) in params.iter().filter(|(k, _)| *k == n) {
                 crate::methods::opclass_params(method, &op, p)?;
             }
+            written.push(params.iter().find(|(k, _)| *k == n).map(|(_, p)| p.clone()));
             if d {
                 notices.push(format!(
                     "{shown}: {} DESC is held rising, its NULLs where PostgreSQL's index read \
@@ -4090,6 +4096,7 @@ impl Draft {
             keys: keys.iter().map(|k| k.to_string()).collect(),
             opclasses,
             options,
+            params: written,
             constraint: None,
         };
         self.table_mut(&table_name).unwrap().indexes.push(keyed);
@@ -4133,6 +4140,20 @@ fn finish_table(d: &Declared) -> Result<Table> {
         .filter(|&c| !columns[c].is_virtual())
         .collect();
     let mut strands: Vec<Keyed> = d.uniques.iter().chain(d.indexes.iter()).cloned().collect();
+    let brins = strands
+        .iter()
+        .filter(|s| s.method == Method::Brin)
+        .map(|s| Brin {
+            name: s.name.clone(),
+            levels: s.levels.clone(),
+            keys: s.keys.clone(),
+            opclasses: s.opclasses.clone(),
+            params: s.params.clone(),
+            options: s.options.clone(),
+            predicate: s.predicate.clone(),
+        })
+        .collect();
+    strands.retain(|s| s.method != Method::Brin);
     let ordered = match &d.clustered {
         Some(c) if d.primary.as_ref().is_some_and(|p| &p.name == c) => d.primary.clone().unwrap(),
         Some(c) => {
@@ -4255,6 +4276,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         format: crate::file::FORMAT,
         element_keys,
         elements_of: None,
+        brins,
     })
 }
 
@@ -4470,6 +4492,30 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
             fact("index", &obj, "opclasses", classes.join(","));
             fact("index", &obj, "include", names(&k.include));
             fact("index", &obj, "options", options.join(","));
+            fact("index", &obj, "nulls_distinct", truth(true));
+            fact("index", &obj, "clustered", truth(false));
+        }
+        for b in &t.brins {
+            let obj = format!("{}.{}", t.name, b.name);
+            let none = || vec![truth(false); b.levels.len()].join(",");
+            fact("index", &obj, "method", Method::Brin.name().into());
+            fact("index", &obj, "unique", truth(false));
+            fact("index", &obj, "primary", truth(false));
+            fact("index", &obj, "keys", b.keys.join(","));
+            fact("index", &obj, "desc", none());
+            fact("index", &obj, "nulls_first", none());
+            fact("index", &obj, "opclasses", b.opclasses.join(","));
+            fact("index", &obj, "include", String::new());
+            fact(
+                "index",
+                &obj,
+                "options",
+                b.options
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             fact("index", &obj, "nulls_distinct", truth(true));
             fact("index", &obj, "clustered", truth(false));
         }

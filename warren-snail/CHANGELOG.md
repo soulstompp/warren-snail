@@ -47,6 +47,10 @@ at once, and a snail written inside a host that decides its commits.
   polygon or a circle, each an order the counts read; a partial index, read where a question implies
   its `WHERE`; GIN on an array, a `jsonb` or a `tsvector`, and GiST on a `tsvector` or a `tsquery`,
   each a strand of the elements its rows hold.
+- BRIN, on all 72 of PostgreSQL 19's operator classes: no order of its own, each block's directory
+  entry and each entry above the blocks keeping the operator class's summary (its least and greatest,
+  a span, runs of values, or a bloom filter of a power of two of bits), a block ruled out of a
+  condition no value it sums can hold. `pages_per_range` and `autosummarize` are read and do nothing.
 - The questions: any number of tables, by `JOIN`, commas, `CROSS JOIN`, `LEFT`, `RIGHT` and `FULL
   JOIN`, met by `=`, `<>`, `<`, `<=`, `>` or `>=`; the conditions `<>`, `BETWEEN`, `IS [NOT] NULL`,
   answered from the NULLs counted, and the truth tests; `LIKE`, `ILIKE`, `SIMILAR TO` and `~`, a

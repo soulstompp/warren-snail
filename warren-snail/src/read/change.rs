@@ -3121,6 +3121,20 @@ impl Snail {
                 crate::spans::widen(&mut entry.spans[k], table.columns[c].ty, &values[at]);
             }
         }
+        // A BRIN summary sums each row added; a row gone leaves it as it was.
+        for (k, (level, kind)) in crate::brin::kept(table, order).into_iter().enumerate() {
+            let at = order.slot(level.column()).unwrap();
+            for (_, values) in &added {
+                crate::brin::add_row(
+                    &mut entry.summed[k],
+                    table,
+                    level,
+                    kind,
+                    &values[at],
+                    entry.rows,
+                )?;
+            }
+        }
         entry.tails = tails;
         entry.child = w.place(&map.encode())?;
         Ok((vec![entry], false))
@@ -3330,6 +3344,7 @@ impl Snail {
                             && w.columns == o.columns
                             && w.unique == o.unique
                             && w.table_order == o.table_order
+                            && (!o.table_order || old.is_some_and(|x| x.brins == t.brins))
                     });
                 if same {
                     kept.push((t.name.clone(), o.name.clone()));

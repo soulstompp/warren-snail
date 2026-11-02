@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod arrays;
+pub mod brin;
 pub mod bytes;
 pub mod carry;
 pub mod catalog;

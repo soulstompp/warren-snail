@@ -219,6 +219,8 @@ pub struct Entry {
     /// What it keeps past the first 8 bytes of each column the head's `bound_slots` list, where those
     /// do not part its least and greatest: none where every one's first 8 do.
     pub tails: Vec<Tail>,
+    /// What it sums of each BRIN key the head's `summed` lists, beyond what it keeps already.
+    pub summed: Vec<crate::brin::Sum>,
     /// A block's page map, or the directory page below an entry above the blocks.
     pub child: Extent,
 }
@@ -251,6 +253,8 @@ pub struct Head {
     /// each entry keeps, its first 8 bytes in the leaf's summary and any past them in its tail, by
     /// their place among the held leaves.
     pub bound_slots: Vec<u32>,
+    /// The first leaves of the columns whose BRIN summary each entry keeps, a summary each.
+    pub summed: Vec<u32>,
     /// Whether each entry keeps one key, the separator below it, as format 9 keeps an order: its upper
     /// bound read from the separator above it.
     pub separated: bool,
@@ -290,6 +294,10 @@ const HEAD_BOUNDS: u32 = 1 << 28;
 /// the page's, or for the top's last the order's greatest end, which follows the bounds' slots. A
 /// head without it keeps each entry's first and last keys whole.
 const HEAD_SEPARATED: u32 = 1 << 27;
+
+/// The bit of a head's height set where each entry keeps a BRIN summary: the slots follow the bounds'.
+/// A head with none is written as before.
+const HEAD_SUMMED: u32 = 1 << 26;
 
 /// The least a level holds, which pads a key whose later levels are dropped.
 const LEAST: KeyValue = KeyValue::Null { first: true };
@@ -645,6 +653,11 @@ impl Entry {
             } else {
                 0
             }
+            + self
+                .summed
+                .iter()
+                .map(crate::brin::Sum::size)
+                .sum::<usize>()
     }
 
     /// The entry for a directory page: the counts of the entries it holds, summed.
@@ -673,6 +686,7 @@ impl Entry {
             bytes: vec![0u32; first.bytes.len()],
             spans: vec![Span::default(); first.spans.len()],
             tails: Vec::new(),
+            summed: vec![crate::brin::Sum::Nothing; first.summed.len()],
             child,
         };
         let mut seen = vec![false; e.columns.len()];
@@ -709,6 +723,9 @@ impl Entry {
             }
             for (s, span) in x.spans.iter().enumerate() {
                 e.spans[s].join(span);
+            }
+            for (s, sum) in x.summed.iter().enumerate() {
+                e.summed[s].join(sum)?;
             }
         }
         for (k, &slot) in bound_slots.iter().enumerate() {
@@ -772,6 +789,9 @@ impl Entry {
                 o.u8(t.hi.len() as u8);
                 o.0.extend_from_slice(&t.hi);
             }
+        }
+        for s in &self.summed {
+            s.encode(o);
         }
         o.extent(self.child);
     }
@@ -855,6 +875,9 @@ impl Entry {
         } else {
             Vec::new()
         };
+        let summed = (0..head.summed.len())
+            .map(|_| crate::brin::Sum::decode(i))
+            .collect::<Result<Vec<_>>>()?;
         let child = i.extent()?;
         Ok(Entry {
             open: false,
@@ -869,6 +892,7 @@ impl Entry {
             bytes,
             spans,
             tails,
+            summed,
             child,
         })
     }
@@ -976,6 +1000,9 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     if !head.bound_slots.is_empty() {
         height |= HEAD_BOUNDS;
     }
+    if !head.summed.is_empty() {
+        height |= HEAD_SUMMED;
+    }
     if head.separated {
         height |= HEAD_SEPARATED;
     }
@@ -994,6 +1021,9 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     }
     if !head.bound_slots.is_empty() {
         u32s(&mut o, &head.bound_slots);
+    }
+    if !head.summed.is_empty() {
+        u32s(&mut o, &head.summed);
     }
     if head.separated {
         keys_out(
@@ -1033,16 +1063,23 @@ pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
     } else {
         Vec::new()
     };
+    let summed = if height & HEAD_SUMMED != 0 {
+        read_u32s(&mut i)?
+    } else {
+        Vec::new()
+    };
     let head = Head {
         units,
         month_slots,
         text_slots,
         level_text,
-        height: height & !(HEAD_WIDE | HEAD_CUT | HEAD_SPANS | HEAD_BOUNDS | HEAD_SEPARATED),
+        height: height
+            & !(HEAD_WIDE | HEAD_CUT | HEAD_SPANS | HEAD_BOUNDS | HEAD_SEPARATED | HEAD_SUMMED),
         wide_slots,
         cut_under,
         span_slots,
         bound_slots,
+        summed,
         separated: height & HEAD_SEPARATED != 0,
     };
     // Where each entry keeps one key, the top's last is bounded by the order's greatest end.
@@ -1140,7 +1177,7 @@ pub fn pack(entries: Vec<Entry>, separated: bool) -> Result<Vec<Vec<Entry>>> {
             pages.push(std::mem::take(&mut page));
             used = 4;
         }
-        if page.is_empty() && used + size > PAGE {
+        if !separated && page.is_empty() && used + size > PAGE {
             return Err(Error::new("a directory entry does not fit a page"));
         }
         used += size;
@@ -1426,6 +1463,7 @@ mod tests {
             wide_slots: vec![],
             cut_under: vec![String::new(); 2],
             span_slots: Vec::new(),
+            summed: Vec::new(),
             bound_slots: Vec::new(),
             separated: false,
         }
@@ -1466,6 +1504,7 @@ mod tests {
             ends: vec![[0, 0]],
             bytes: vec![10 * rows],
             spans: Vec::new(),
+            summed: Vec::new(),
             tails: Vec::new(),
             child: Extent {
                 start: child,
@@ -1607,6 +1646,7 @@ mod tests {
             wide_slots: vec![0],
             cut_under: vec![String::new()],
             span_slots: Vec::new(),
+            summed: Vec::new(),
             bound_slots: Vec::new(),
             separated: false,
         };
@@ -1638,6 +1678,7 @@ mod tests {
             ends: vec![],
             bytes: vec![],
             spans: Vec::new(),
+            summed: Vec::new(),
             tails: Vec::new(),
             child: Extent {
                 start: 7,
@@ -2185,7 +2226,10 @@ mod tests {
         ends[1].last = t("sharedxxx9999");
         separate(&mut ends, &[1 | BITS_LEVEL], None, None);
         assert_eq!(ends[0].first, t("sharedxxx1"));
-        assert_eq!((ends[1].last.clone(), ends[1].open), (t("sharedxxx:"), true));
+        assert_eq!(
+            (ends[1].last.clone(), ends[1].open),
+            (t("sharedxxx:"), true)
+        );
         assert_eq!(text_past("\u{D7FF}"), Some("\u{E000}".into()));
         assert_eq!(text_past("a\u{10FFFF}"), Some("b".into()));
         assert_eq!(text_past("\u{10FFFF}"), None);
