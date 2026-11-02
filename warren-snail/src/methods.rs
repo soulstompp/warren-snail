@@ -9,13 +9,37 @@ use crate::textual::Textual;
 use crate::{Error, Result};
 
 /// Whether the snail holds an index of the method with a key of the operator class: a B-tree and a
-/// hash on any; a GiST or an SP-GiST on a range, a multirange, an inet, or text.
+/// hash on any; a GiST or an SP-GiST on a range, a multirange, an inet, or text; a key held as an
+/// element strand.
 pub fn held(method: Method, opclass: &str) -> bool {
     match method {
         Method::Btree | Method::Hash => true,
+        _ if holds_elements(method, opclass) => true,
         Method::Gist => matches!(opclass, "range_ops" | "multirange_ops" | "inet_ops"),
         Method::Spgist => matches!(opclass, "range_ops" | "inet_ops" | "text_ops"),
         _ => false,
+    }
+}
+
+/// Whether a key of the operator class is held as an element strand: a GIN index's, and a GiST
+/// index's on a tsvector or a tsquery.
+pub fn holds_elements(method: Method, opclass: &str) -> bool {
+    method == Method::Gin
+        || (method == Method::Gist && matches!(opclass, "tsvector_ops" | "tsquery_ops"))
+}
+
+/// Why a GIN index on an array refuses its elements' type: it has no B-tree to order them.
+pub fn elements_refused(method: Method, opclass: &str, ty: ColumnType) -> Option<Error> {
+    match composed(ty) {
+        Some(Composed::Array { element, .. })
+            if method == Method::Gin && opclass == "array_ops" && !element.ordered() =>
+        {
+            Some(Error::new(format!(
+                "could not identify a comparison function for type {}",
+                bare_name(*element)
+            )))
+        }
+        _ => None,
     }
 }
 

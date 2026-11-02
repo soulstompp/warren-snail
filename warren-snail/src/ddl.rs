@@ -1822,6 +1822,10 @@ struct Draft {
     /// Whether the statement now read is the file's own, which a build without the feature
     /// `collations` reads naming a library collation, refusing that collation only where used.
     kept: bool,
+    /// Each index held as element strands, with the number of tables declared before it: its
+    /// strands lie among the tables where its statement stands, so that no later statement moves a
+    /// table.
+    strands_at: Vec<(usize, String, String)>,
 }
 
 /// A key a CREATE TABLE writes, before its name is chosen.
@@ -2261,6 +2265,16 @@ impl Draft {
                 Some(k) if k.predicate.is_some() => {
                     return Err(Error::new(format!(
                         "cannot cluster on partial index \"{index}\""
+                    )))
+                }
+                Some(k)
+                    if k.opclasses
+                        .iter()
+                        .any(|o| crate::methods::holds_elements(k.method, o)) =>
+                {
+                    return Err(Error::new(format!(
+                        "{table} cannot be clustered on {index}: its strand holds a row once per \
+                         element, and the table's order holds it once"
                     )))
                 }
                 Some(_) => {}
@@ -3825,6 +3839,8 @@ impl Draft {
                         foreign_keys: Vec::new(),
                         monetary: crate::monetary::Monetary::C,
                         format: crate::file::FORMAT,
+                        element_keys: Vec::new(),
+                        elements_of: None,
                     }],
                     functions: self.functions.clone(),
                     types: self.types.clone(),
@@ -4035,6 +4051,30 @@ impl Draft {
                 "{shown}: USING {am} with the operator class {o} is not held yet"
             )));
         }
+        for (o, l) in opclasses.iter().zip(&levels) {
+            if let Some(e) = crate::methods::elements_refused(method, o, t.columns[l.column()].ty) {
+                return Err(e);
+            }
+        }
+        let elements = opclasses
+            .iter()
+            .filter(|o| crate::methods::holds_elements(method, o))
+            .count();
+        if elements > 0 && elements < opclasses.len() {
+            return Err(Error::new(format!(
+                "{shown}: a key held as an element strand beside a key of another kind is not held"
+            )));
+        }
+        if elements > 0 {
+            if !include.is_empty() {
+                notices.push(format!(
+                    "{shown}: INCLUDE is read, and does nothing: an element strand ends in the \
+                     table's key, and its rows are found by it"
+                ));
+            }
+            self.strands_at
+                .push((self.tables.len(), table_name.clone(), name.clone()));
+        }
         let keyed = Keyed {
             name,
             method,
@@ -4058,10 +4098,31 @@ impl Draft {
 
     /// The tables, each given its order and its indexes; a table with no order is refused.
     fn finish(&self) -> Vec<std::result::Result<Table, (String, Error)>> {
-        self.tables
+        let tables: Vec<_> = self
+            .tables
             .iter()
             .map(|d| finish_table(d).map_err(|e| (d.name.clone(), e)))
-            .collect()
+            .collect();
+        let mut strands: Vec<(usize, Table)> = Vec::new();
+        for (at, on, index) in &self.strands_at {
+            let finished = tables.iter().filter_map(|t| t.as_ref().ok());
+            let Some(t) = finished.into_iter().find(|t| t.name == *on) else {
+                continue;
+            };
+            for k in t.element_keys.iter().filter(|k| k.index == *index) {
+                strands.push((*at, crate::read::elements::strand_table(t, k)));
+            }
+        }
+        let mut strands = strands.into_iter().peekable();
+        let mut out = Vec::new();
+        for (i, t) in tables.into_iter().enumerate() {
+            while let Some((_, s)) = strands.next_if(|(at, _)| *at <= i) {
+                out.push(Ok(s));
+            }
+            out.push(t);
+        }
+        out.extend(strands.map(|(_, s)| Ok(s)));
+        out
     }
 }
 
@@ -4101,6 +4162,29 @@ fn finish_table(d: &Declared) -> Result<Table> {
             }
         }
     }
+    let mut element_keys = Vec::new();
+    strands.retain(|s| {
+        if !s
+            .opclasses
+            .iter()
+            .any(|o| crate::methods::holds_elements(s.method, o))
+        {
+            return true;
+        }
+        for (n, (l, o)) in s.levels.iter().zip(&s.opclasses).enumerate() {
+            element_keys.push(crate::catalog::ElementKey {
+                index: s.name.clone(),
+                method: s.method,
+                column: l.column(),
+                opclass: o.clone(),
+                include: s.include.clone(),
+                options: s.options.clone(),
+                predicate: s.predicate.clone(),
+                strand: crate::read::elements::strand_name(name, &s.name, n),
+            });
+        }
+        false
+    });
     let key: Vec<usize> = dedup(ordered.levels.iter().map(|l| l.column()));
     let mut orders = vec![Order {
         name: ordered.name,
@@ -4169,6 +4253,8 @@ fn finish_table(d: &Declared) -> Result<Table> {
         foreign_keys: d.foreign_keys.clone(),
         monetary: crate::monetary::Monetary::C,
         format: crate::file::FORMAT,
+        element_keys,
+        elements_of: None,
     })
 }
 
@@ -4239,7 +4325,7 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
             value,
         })
     };
-    for t in &c.tables {
+    for t in c.tables.iter().filter(|t| t.declared()) {
         fact("table", &t.name, "columns", t.columns.len().to_string());
         for (i, col) in t.columns.iter().enumerate() {
             let o = format!("{}.{}", t.name, col.name);
@@ -4354,6 +4440,38 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
             );
             fact("index", &obj, "nulls_distinct", truth(o.nulls_distinct));
             fact("index", &obj, "clustered", truth(o.clustered));
+        }
+        let mut told: Vec<&str> = Vec::new();
+        for k in &t.element_keys {
+            if told.contains(&k.index.as_str()) {
+                continue;
+            }
+            told.push(&k.index);
+            let all: Vec<_> = t
+                .element_keys
+                .iter()
+                .filter(|x| x.index == k.index)
+                .collect();
+            let obj = format!("{}.{}", t.name, k.index);
+            let each = |v: &str| vec![v; all.len()].join(",");
+            let names = |c: &[usize]| {
+                let n: Vec<&str> = c.iter().map(|&i| t.columns[i].name.as_str()).collect();
+                n.join(",")
+            };
+            let keys: Vec<usize> = all.iter().map(|x| x.column).collect();
+            let classes: Vec<&str> = all.iter().map(|x| x.opclass.as_str()).collect();
+            let options: Vec<String> = k.options.iter().map(|(a, b)| format!("{a}={b}")).collect();
+            fact("index", &obj, "method", k.method.name().into());
+            fact("index", &obj, "unique", truth(false));
+            fact("index", &obj, "primary", truth(false));
+            fact("index", &obj, "keys", names(&keys));
+            fact("index", &obj, "desc", each("false"));
+            fact("index", &obj, "nulls_first", each("false"));
+            fact("index", &obj, "opclasses", classes.join(","));
+            fact("index", &obj, "include", names(&k.include));
+            fact("index", &obj, "options", options.join(","));
+            fact("index", &obj, "nulls_distinct", truth(true));
+            fact("index", &obj, "clustered", truth(false));
         }
         for k in &t.checks {
             let obj = format!("{}.{}", t.name, k.name);
@@ -4891,6 +5009,8 @@ pub(crate) fn read_ddl_kept(ddl: &str, strict: bool, kept: usize) -> Result<Read
             }
         }
     }
+    let names: Vec<String> = tables.iter().map(|t: &Table| t.name.clone()).collect();
+    tables.retain(|t| t.elements_of.as_ref().is_none_or(|of| names.contains(of)));
     let taken: Vec<String> = statements
         .iter()
         .filter(|s| s.refused.is_none())

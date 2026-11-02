@@ -317,6 +317,8 @@ pub struct OpCond {
     /// rules a block out by it.
     pub op: String,
     pub probe: Option<crate::spans::Probe>,
+    /// The value it compares with, where an element strand may answer it.
+    pub value: Option<super::statement::Datum>,
 }
 
 impl Side {
@@ -2195,6 +2197,7 @@ fn pattern(from: &From, p: &Expr) -> Result<Option<Vec<Conj>>> {
             name: column.name.clone(),
             op: String::new(),
             probe: None,
+            value: None,
         }),
     )];
     if let Some(t) = super::prefix::narrowing(c, column, fixed)? {
@@ -2657,6 +2660,9 @@ fn op_cond(
     lit_left: bool,
 ) -> Result<Option<OpCond>> {
     use crate::composed::{Composed, Item};
+    if let Some(o) = super::elements::element_cond(table, c, op, lit, lit_left)? {
+        return Ok(Some(o));
+    }
     let ty = table.columns[c].ty;
     let name = op.to_string();
     let def = match ty {
@@ -2764,6 +2770,7 @@ fn op_cond(
         name: column,
         op: seen.unwrap_or_default().to_string(),
         probe: seen.and(probe),
+        value: None,
     }))
 }
 

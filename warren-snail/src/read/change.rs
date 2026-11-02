@@ -2296,11 +2296,15 @@ impl Snail {
             .into_iter()
             .flatten()
             .collect();
+        let (rewritten, orders) = self.apply_to_strands(&table, &changes)?;
         if !self.stale {
             self.touch(ti, &changes);
             self.touch_exclusions(ti, &changes);
         }
-        Ok((applied.iter().sum(), applied.len() as u64))
+        Ok((
+            applied.iter().sum::<u64>() + rewritten,
+            applied.len() as u64 + orders,
+        ))
     }
 
     /// What a statement's changes come to on one order: for each row, the row taken from it and the
@@ -2377,7 +2381,7 @@ impl Snail {
     /// One order's part of a statement: its effects routed to their blocks, each block written
     /// afresh, then the directory above them up to a new top. Returns the blocks rewritten in order,
     /// or none where the order holds no column the statement changed.
-    fn apply_order(
+    pub(super) fn apply_order(
         &mut self,
         w: &mut dyn Place,
         ti: usize,
@@ -3298,6 +3302,16 @@ impl Snail {
         for t in &catalog.tables {
             crate::file::holds(self.reader.format(), t)?;
             let old = self.catalog.tables.iter().find(|x| x.name == t.name);
+            // A strand made new is a change to the table it is of.
+            if let (None, Some(of)) = (old, &t.elements_of) {
+                if let Some(o) = self.catalog.table(of) {
+                    if self.holds_rows(o)? {
+                        return Err(Error::new(format!(
+                            "{of}: it holds rows, so its columns and orders stay as written"
+                        )));
+                    }
+                }
+            }
             let columns_same = old.is_some_and(|o| {
                 o.columns.len() == t.columns.len()
                     && o.columns

@@ -13,6 +13,7 @@ mod calls;
 mod change;
 mod clock;
 mod collate;
+pub(crate) mod elements;
 pub(crate) mod fill;
 pub(crate) mod foreign;
 pub mod handed;
@@ -113,6 +114,7 @@ use crate::places::{shown, Sublevels};
 use crate::{Error, Result};
 use answer::{Answer, Cell, Dict};
 use arrow::array::RecordBatch;
+use elements::Along;
 use question::{Key, Question};
 use std::path::Path;
 use walk::{condition_columns, next_down, ruled_out, KeySet, Plan, Sink, Want};
@@ -615,6 +617,9 @@ fn row_bytes(plan: &Plan, table: &Table, columns: impl Iterator<Item = usize>) -
 #[non_exhaustive]
 pub struct Scan {
     q: Question,
+    /// The keys its element strands found, which it is kept to, and their round.
+    kept: Option<KeySet>,
+    strands: Round,
     plan: Plan,
     columns: Vec<(usize, bool)>,
     next: usize,
@@ -628,7 +633,17 @@ pub struct Scan {
 impl Scan {
     /// What the round has read so far, and the rows it has handed out.
     pub fn round(&self) -> Round {
-        self.round.clone()
+        if self.strands.order.is_empty() {
+            return self.round.clone();
+        }
+        let mut r = self.strands.clone();
+        r.add_table(&self.round, &self.round.order);
+        r.served = self.round.served.clone();
+        r.rows = self.round.rows;
+        r.rows_walked += self.round.rows_walked;
+        r.rows_taken += self.round.rows_taken;
+        r.reads.push(self.round.clone());
+        r
     }
 }
 
@@ -1081,11 +1096,27 @@ impl Snail {
         let q = self.one_table(sql)?;
         let (want, _) = self.want_of(&q);
         let before = self.touched();
-        let part = self.part(&want, order)?;
+        let mut shown = want.table;
+        let part = match self.along_elements(&q, &want, order)? {
+            Along::Not => self.part(&want, order)?,
+            Along::Table(part) => part,
+            Along::Count(asked) => {
+                shown = &self.catalog.tables[asked.sides[0].table];
+                let w = Want {
+                    table: shown,
+                    side: &asked.sides[0],
+                    columns: Vec::new(),
+                    countable: asked.select.countable(),
+                    keys: None,
+                };
+                self.part(&w, None)?
+            }
+            Along::Strands(chosen) => return self.price_along(&want, *chosen, before),
+        };
         let row_bytes = row_bytes(&part.plan, want.table, want.columns.iter().copied());
         Ok(Price {
             row_bytes,
-            order: want.table.orders[part.plan.walk.order].name.clone(),
+            order: shown.orders[part.plan.walk.order].name.clone(),
             served: part.served,
             consulted: part.consulted,
             table_rows: part.table_rows,
@@ -1109,10 +1140,30 @@ impl Snail {
     /// Begins a round on one table on the root the snail last read, its blocks handed out one at a
     /// time by `next_block`.
     pub fn scan(&self, sql: &str, order: Option<&str>) -> Result<Scan> {
-        let q = self.one_table(sql)?;
+        self.scan_question(self.one_table(sql)?, order)
+    }
+
+    fn scan_question(&self, q: Question, order: Option<&str>) -> Result<Scan> {
         let (want, columns) = self.want_of(&q);
-        let (before, held_before) = (self.touched(), self.pages_held());
-        let part = self.part(&want, order)?;
+        let (mut before, mut held_before) = (self.touched(), self.pages_held());
+        let (part, kept, strands) = match self.along_elements(&q, &want, order)? {
+            Along::Not => (self.part(&want, order)?, None, Round::default()),
+            Along::Table(part) => (part, None, Round::default()),
+            Along::Count(asked) => return self.scan_question(*asked, None),
+            Along::Strands(chosen) => {
+                let (kept, strands) = self.keys_of(want.table, &chosen)?;
+                (before, held_before) = (self.touched(), self.pages_held());
+                let w = Want {
+                    table: want.table,
+                    side: want.side,
+                    columns: want.columns.clone(),
+                    countable: want.countable.filter(|_| kept.is_none()),
+                    keys: kept.as_ref(),
+                };
+                let part = self.part(&w, None)?;
+                (part, kept, strands)
+            }
+        };
         self.mark_read(want.side.table, &part.plan.walk)?;
         let w = &part.plan.walk;
         let round = Round {
@@ -1152,6 +1203,8 @@ impl Snail {
         let counted = (w.counted, w.counted_months);
         Ok(Scan {
             q,
+            kept,
+            strands,
             plan: part.plan,
             columns,
             next: 0,
@@ -1207,8 +1260,8 @@ impl Snail {
             table,
             side: &scan.q.sides[0],
             columns: scan.columns.iter().map(|c| c.0).collect(),
-            countable: scan.q.select.countable(),
-            keys: None,
+            countable: scan.q.select.countable().filter(|_| scan.kept.is_none()),
+            keys: scan.kept.as_ref(),
         };
         let blocks = scan.plan.blocks_read() as usize;
         let (read0, walked, taken) = (
@@ -1453,10 +1506,15 @@ impl Snail {
                 }
                 return self.ask_pipeline(q, params);
             }
+            // A round asked along an order, where an element strand may answer it, reads that order.
+            let along = order.is_some()
+                && question::parse(&self.catalog, sql).is_ok_and(|p| {
+                    p.sides.len() == 1 && p.sides[0].ops.iter().any(|o| o.value.is_some())
+                });
             if pipeline::is_pipeline(q)
                 || relations::is_set_operation(q)
                 || pipeline::tests_composite_null(&self.catalog, q)
-                || pipeline::reads_per_row(&self.catalog, q)
+                || (pipeline::reads_per_row(&self.catalog, q) && !along)
             {
                 if order.is_some() && (pipeline::is_pipeline(q) || relations::is_set_operation(q)) {
                     return Err(Error::new("a pipeline reads its table along its own order"));
@@ -1698,15 +1756,58 @@ impl Snail {
             keys: kept,
         };
         let (before, held_before) = (self.touched(), self.pages_held());
-        let part = self.part(&want, order)?;
+        let along = match kept {
+            None => self.along_elements(q, &want, order)?,
+            Some(_) => Along::Not,
+        };
+        let part = match along {
+            Along::Not => self.part(&want, order)?,
+            Along::Table(part) => part,
+            Along::Count(asked) => return self.scan_one(&asked, None, None, sink),
+            Along::Strands(chosen) => {
+                let (keys, mut strands) = self.keys_of(table, &chosen)?;
+                let want = Want {
+                    table,
+                    side: want.side,
+                    columns: want.columns,
+                    countable: want.countable.filter(|_| keys.is_none()),
+                    keys: keys.as_ref(),
+                };
+                let (before, held_before) = (self.touched(), self.pages_held());
+                let part = self.part(&want, None)?;
+                let (r, counted, months) =
+                    self.scan_part(&want, &columns, part, sink, before, held_before)?;
+                strands.add_table(&r, &r.order);
+                strands.served = r.served.clone();
+                strands.rows_walked += r.rows_walked;
+                strands.rows_taken += r.rows_taken;
+                strands.reads.push(r);
+                return Ok((strands, counted, months));
+            }
+        };
+        self.scan_part(&want, &columns, part, sink, before, held_before)
+    }
+
+    /// A table's read along the order priced: the round, and what the directory counted, in all and
+    /// by month.
+    fn scan_part(
+        &self,
+        want: &Want,
+        columns: &[(usize, bool)],
+        part: Part,
+        sink: &mut dyn Sink,
+        before: u64,
+        held_before: u64,
+    ) -> Result<(Round, u64, [u64; 12])> {
+        let table = want.table;
         self.mark_read(want.side.table, &part.plan.walk)?;
         let directory_pages = self.touched() - before;
         let directory_pages_held = self.pages_held() - held_before;
-        self.keep_held(&part.plan, &want)?;
+        self.keep_held(&part.plan, want)?;
         let mid = self.reader.pages_read();
         let (walked, taken) = (self.walked.get(), self.taken.get());
         sink.rows_most(part.rows.1);
-        let read = self.read_plan(&part.plan, &want, &columns, sink);
+        let read = self.read_plan(&part.plan, want, columns, sink);
         self.reader.read_done();
         let maps = part.plan.maps_read();
         let column_pages_read = self.reader.pages_read() - mid - maps.file;

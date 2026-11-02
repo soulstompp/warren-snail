@@ -80,6 +80,14 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             o.name
         )));
     }
+    if let Some(k) = table.element_keys.first() {
+        return Err(crate::Error::new(format!(
+            "{}: the {} index {}, {way}",
+            table.name,
+            k.method.name(),
+            k.index
+        )));
+    }
     if let Some(o) = table.orders.iter().find(|o| o.predicate.is_some()) {
         return Err(crate::Error::new(format!(
             "{}: the partial index {}, {way}",

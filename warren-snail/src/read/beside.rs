@@ -251,6 +251,7 @@ impl Snail {
         for oi in 0..table.orders.len() {
             orders += u64::from(self.view_order(&mut stage, ti, table, oi, &changes)?);
         }
+        orders += self.apply_to_strands(table, &changes)?.1;
         self.touch(ti, &changes);
         self.touch_exclusions(ti, &changes);
         Ok((0, orders))
@@ -384,7 +385,12 @@ impl Snail {
 
     /// Tells the monitor of the blocks a statement's rows fall in on the newest root, on each order
     /// holding a column they change.
-    fn told_of_writes(&self, ti: usize, table: &Table, changes: &[Change]) -> Result<()> {
+    pub(super) fn told_of_writes(
+        &self,
+        ti: usize,
+        table: &Table,
+        changes: &[Change],
+    ) -> Result<()> {
         if !self.marking() {
             return Ok(());
         }
@@ -564,7 +570,7 @@ impl Snail {
 
     /// One order's part of a statement on the version the transaction reads. Returns whether the
     /// statement changed a column it holds.
-    fn view_order(
+    pub(super) fn view_order(
         &mut self,
         w: &mut dyn Place,
         ti: usize,

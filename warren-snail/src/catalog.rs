@@ -1129,6 +1129,26 @@ pub struct Order {
     pub exclusion: Option<Exclusion>,
 }
 
+/// A key of an index held as an element strand, a GIN index's or a GiST index's on a tsvector or a
+/// tsquery: a table of the catalog holds the strand, a row per element and row.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ElementKey {
+    pub index: String,
+    pub method: Method,
+    pub column: usize,
+    pub opclass: String,
+    /// The columns its INCLUDE names: read, and carried by no strand.
+    pub include: Vec<usize>,
+    /// The storage parameters its index sets, as written: read, and nothing in a snail.
+    pub options: Vec<(String, String)>,
+    /// A partial index's predicate, as written: the strand holds only the elements of the rows it
+    /// admits.
+    pub predicate: Option<String>,
+    /// The name of the table holding its strand.
+    pub strand: String,
+}
+
 /// An EXCLUDE constraint: no two rows whose values each level's operator finds conflicting, a row
 /// holding a NULL in one conflicting with none.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1273,9 +1293,18 @@ pub struct Table {
     pub monetary: crate::monetary::Monetary,
     /// The format of the file it lies in, whose leaves its columns are held as.
     pub format: u32,
+    /// The keys of its indexes held as element strands, each index's keys in turn.
+    pub element_keys: Vec<ElementKey>,
+    /// Whose element strand it is, where it is one: the table an index names.
+    pub elements_of: Option<String>,
 }
 
 impl Table {
+    /// Whether it is a table a DDL names, rather than an index's element strand.
+    pub fn declared(&self) -> bool {
+        self.elements_of.is_none()
+    }
+
     /// Whether another reading of the table holds the same columns and orders: a row written for one
     /// is written the same for the other.
     pub(crate) fn same_shape(&self, other: &Table) -> bool {

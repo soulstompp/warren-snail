@@ -1271,6 +1271,68 @@ pub fn tsq_mcontains(a: &str, b: &str) -> bool {
     words(b).is_subset(&words(a))
 }
 
+/// What a tsquery asks of a tsvector's lexemes, as far as they can say: every row may match, or a
+/// lexeme, a prefix, all or any of what the operands ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Asked {
+    Every,
+    Word(String),
+    Prefix(String),
+    All(Vec<Asked>),
+    Any(Vec<Asked>),
+}
+
+/// What a tsquery asks, as `tsquery_requires_match` (tsginidx.c) reads it: nothing is required
+/// beneath a NOT, a phrase asks what an AND does, and the empty tsquery asks what no row holds.
+pub fn query_asks(held: &str) -> Asked {
+    fn asks(items: &[Item], i: usize) -> Asked {
+        match &items[i] {
+            Item::Val { word, prefix, .. } => match prefix {
+                true => Asked::Prefix(word.clone()),
+                false => Asked::Word(word.clone()),
+            },
+            Item::Opr { op: Op::Not, .. } => Asked::Every,
+            Item::Opr {
+                op: Op::Or, left, ..
+            } => Asked::Any(vec![asks(items, i + 1), asks(items, i + left)]),
+            Item::Opr { left, .. } => Asked::All(vec![asks(items, i + 1), asks(items, i + left)]),
+        }
+    }
+    let items = held_query(held);
+    match items.is_empty() {
+        true => Asked::Any(Vec::new()),
+        false => asks(&items, 0),
+    }
+}
+
+/// Whether a tsquery is one lexeme, no weight and no prefix: a tsvector matches it where it holds it.
+pub fn query_is_one_word(held: &str) -> bool {
+    matches!(
+        held_query(held).as_slice(),
+        [Item::Val {
+            weight: 0,
+            prefix: false,
+            ..
+        }]
+    )
+}
+
+/// The lexemes a tsvector holds.
+pub fn vector_words(text: &str) -> Vec<String> {
+    held_vector(text).into_iter().map(|e| e.word).collect()
+}
+
+/// The lexemes a tsquery names, as `tsq_mcontains` reads them.
+pub fn query_words(held: &str) -> Vec<String> {
+    held_query(held)
+        .into_iter()
+        .filter_map(|it| match it {
+            Item::Val { word, .. } => Some(word),
+            Item::Opr { .. } => None,
+        })
+        .collect()
+}
+
 /// A match's answer that may not be known without positions: TSTernaryValue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ternary {

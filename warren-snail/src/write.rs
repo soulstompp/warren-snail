@@ -1006,11 +1006,13 @@ fn write_tables(
     };
     crate::file::holds_catalog(w.format(), catalog)?;
     crate::read::foreign::rows_held(catalog, tables)?;
+    let strands = crate::read::elements::strands_of(catalog, tables)?;
     let mut out = Vec::new();
     for table in &catalog.tables {
         crate::file::holds(w.format(), table)?;
         let Some(rows) = tables
             .iter()
+            .chain(&strands)
             .find(|(n, _)| *n == table.name)
             .map(|(_, r)| r)
         else {

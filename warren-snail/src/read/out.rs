@@ -275,7 +275,7 @@ impl Snail {
         let catalog = crate::catalog::Catalog::parse_kept(&self.catalog.ddl, usize::MAX)?;
         let mut tables = Vec::new();
         let mut sources = Vec::new();
-        for t in &catalog.tables {
+        for t in catalog.tables.iter().filter(|t| t.declared()) {
             let files = crate::write::parquet_files(&parts.join(format!("{}.parquet", t.name)))?;
             let mut batches = Vec::new();
             for f in &files {
@@ -322,6 +322,9 @@ impl Snail {
         let mut out = Vec::new();
         for ti in 0..self.catalog.tables.len() {
             let table = self.catalog.tables[ti].clone();
+            if !table.declared() {
+                continue;
+            }
             let oi = table
                 .orders
                 .iter()

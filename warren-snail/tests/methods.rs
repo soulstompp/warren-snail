@@ -488,7 +488,8 @@ fn a_gist_or_sp_gist_index_is_held_on_a_range_a_multirange_an_inet_and_text_alon
          CREATE INDEX t_q ON s.t USING spgist (p kd_point_ops);"
     ));
     assert_eq!(got[1..7], [None, None, None, None, None, None], "{got:?}");
-    for (at, op) in [(7, "point_ops"), (8, "tsvector_ops"), (9, "kd_point_ops")] {
+    assert_eq!(got[8], None, "{got:?}");
+    for (at, op) in [(7, "point_ops"), (9, "kd_point_ops")] {
         assert!(
             got[at].as_deref().is_some_and(
                 |e| e.contains(&format!("with the operator class {op} is not held yet"))

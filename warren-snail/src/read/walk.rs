@@ -382,6 +382,18 @@ impl Plan {
         self.reads.iter().map(|br| u64::from(br.rows)).sum()
     }
 
+    /// Of the blocks it reads, the most rows one holds, and the most and the fewest of their pages it
+    /// reads.
+    pub(super) fn block_bounds(&self) -> (u32, u32, u32) {
+        let rows = self.reads.iter().map(|br| br.rows).max().unwrap_or(0);
+        let pages = self.reads.iter().map(|br| br.pages);
+        (
+            rows,
+            pages.clone().max().unwrap_or(0),
+            pages.min().unwrap_or(0),
+        )
+    }
+
     pub fn blocks_read(&self) -> u64 {
         self.reads.len() as u64
     }

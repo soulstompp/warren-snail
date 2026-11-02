@@ -1558,6 +1558,87 @@ fn has_key(d: &Doc, key: &str) -> bool {
     }
 }
 
+/// The bytes a key or a scalar of a jsonb is an element by, as `make_scalar_key` (jsonb_gin.c) keys it:
+/// its kind's flag, then its text, a number normalized as `numeric_normalize` leaves it; a string
+/// element of an array counting as a key. No long string is hashed.
+fn element_bytes(t: &Tok, as_key: bool) -> Vec<u8> {
+    let flagged = |flag: u8, s: &str| {
+        let mut out = Vec::with_capacity(s.len() + 1);
+        out.push(flag);
+        out.extend_from_slice(s.as_bytes());
+        out
+    };
+    match t {
+        Tok::Key(s) => flagged(0x01, s),
+        Tok::Null => flagged(0x02, ""),
+        Tok::Bool(b) => flagged(0x03, if *b { "t" } else { "f" }),
+        Tok::Num(n) => {
+            let text = n.to_string();
+            let bare = match text.contains('.') {
+                true => text.trim_end_matches('0').trim_end_matches('.'),
+                false => &text,
+            };
+            flagged(0x04, bare)
+        }
+        Tok::Str(s) => flagged(if as_key { 0x01 } else { 0x05 }, s),
+        _ => unreachable!("a key or a scalar is an element"),
+    }
+}
+
+/// A jsonb's elements under `jsonb_ops`, as `gin_extract_jsonb` walks them: every key and every
+/// scalar, at every depth, a string element of an array as a key, each as many times as it stands.
+pub fn gin_elements(doc: &str) -> Result<Vec<Vec<u8>>> {
+    let d = Doc::read(doc)?;
+    let mut out = Vec::new();
+    let mut arrays = Vec::new();
+    for t in &d.toks {
+        match t {
+            Tok::Array { .. } => arrays.push(true),
+            Tok::Object { .. } => arrays.push(false),
+            Tok::EndArray | Tok::EndObject => {
+                arrays.pop();
+            }
+            t => out.push(element_bytes(t, arrays.last() == Some(&true))),
+        }
+    }
+    Ok(out)
+}
+
+/// A jsonb's elements under `jsonb_path_ops`, as `gin_extract_jsonb_path` walks them: each scalar
+/// with the keys on its way down, written out where PostgreSQL hashes them, an array adding nothing
+/// to the path.
+pub fn gin_path_elements(doc: &str) -> Result<Vec<Vec<u8>>> {
+    let d = Doc::read(doc)?;
+    let mut out = Vec::new();
+    let mut paths: Vec<Vec<u8>> = Vec::new();
+    let mut path: Vec<u8> = Vec::new();
+    for t in &d.toks {
+        match t {
+            Tok::Array { .. } | Tok::Object { .. } => paths.push(path.clone()),
+            Tok::EndArray | Tok::EndObject => {
+                paths.pop();
+                path = paths.last().cloned().unwrap_or_default();
+            }
+            Tok::Key(k) => {
+                path.extend_from_slice(k.as_bytes());
+                path.push(0);
+            }
+            t => {
+                let mut whole = path.clone();
+                whole.extend(element_bytes(t, false));
+                out.push(whole);
+                path = paths.last().cloned().unwrap_or_default();
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A text as the key `jsonb_ops` holds it under: what `?`, `?|` and `?&` ask for.
+pub fn gin_key(key: &str) -> Vec<u8> {
+    element_bytes(&Tok::Key(key.to_string()), true)
+}
+
 /// jsonb `?`, as `jsonb_exists` asks it: whether the key is a key of the object at the top, or a
 /// string element of the array there.
 pub fn jsonb_exists(doc: &str, key: &str) -> Result<bool> {
