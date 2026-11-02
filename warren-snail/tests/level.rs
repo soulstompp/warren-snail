@@ -148,6 +148,9 @@ fn a_level_whose_places_lie_several_to_a_page_is_bounded_by_its_pages() {
     }
     let (low, high): (u64, u64) = places.iter().fold((0, 0), |a, p| (a.0 + p.1, a.1 + p.2));
     assert!(low <= ROWS as u64 && ROWS as u64 <= high, "{low} {high}");
+    // Each page's rows count once, on the place it begins on.
+    let run: u64 = l.places.as_ref().unwrap().iter().map(|p| p.run).sum();
+    assert_eq!(run, ROWS as u64);
     // Its blocks lie below the top: given none of their pages, the places are not read.
     let none = snail.level_counts("s.t", "w", 0).unwrap().unwrap();
     assert_eq!((none.places, none.rows, none.nulls), (None, ROWS as u64, 0));
@@ -586,4 +589,25 @@ fn a_long_text_at_a_block_s_end_is_exact_only_where_its_last_page_is_read() {
         bracketed |= l.places.is_some() && !l.whole;
     }
     assert!(was_whole && bracketed);
+}
+
+/// A column under a library this build holds none for, no order keying it, keeps no bounds, so its
+/// table is written and read as ever; its values are what a read of them refuses by name.
+#[test]
+#[cfg(not(feature = "collations"))]
+fn a_column_under_a_library_this_build_holds_none_for_is_carried_without_bounds() {
+    let ddl = "CREATE TABLE s.c (id bigint NOT NULL, u text COLLATE \"und-x-icu\", \
+               PRIMARY KEY (id));";
+    let catalog = Catalog::parse_kept(ddl, usize::MAX).unwrap();
+    let rows = Rows {
+        columns: vec![
+            Values::Int(vec![Some(1), Some(2)]),
+            Values::Text(vec![Some("a".into()), None]),
+        ],
+    };
+    let path = tmp("level-unbuilt.snail");
+    write(&path, &catalog, &[("s.c".into(), rows)]).unwrap();
+    let mut snail = fresh(&path);
+    let (b, _) = snail.ask("SELECT c.id FROM s.c c", None).unwrap();
+    assert_eq!(ints64(b.column(0).as_ref()), vec![Some(1), Some(2)]);
 }
