@@ -6,9 +6,9 @@
 //!
 //! A transaction across several snails is one transaction in each of their files: what is its own
 //! whatever it reads, who it is and the edges it found, lies in every one of them, and what it marked
-//! in the file of what it read. Its test walks every file the transactions it meets write, so that
-//! two in a row are found whichever file each lies in, and the commits it compares take one order
-//! from the clock their records share.
+//! in the file of what it read. Its test walks every file those running beside it run on, so that two
+//! in a row are found whichever file each lies in, and the commits it compares take one order from
+//! the clock their records share.
 
 use super::walk::Walk;
 use super::Snail;
@@ -58,8 +58,6 @@ pub(super) struct Record {
     dooms: Vec<u64>,
     /// Each block cut, a block whose rows lay in another: it, and that other.
     cuts: Vec<(u64, u64)>,
-    /// The other files it ran on, by their paths.
-    beside: Vec<Vec<u8>>,
 }
 
 fn encode(records: &[Record]) -> Vec<u8> {
@@ -83,13 +81,6 @@ fn encode(records: &[Record]) -> Vec<u8> {
             o.u64(*a);
             o.u64(*b);
         }
-        o.u32(r.beside.len() as u32);
-        for p in &r.beside {
-            o.u32(p.len() as u32);
-            for b in p {
-                o.u8(*b);
-            }
-        }
     }
     o.0
 }
@@ -109,9 +100,6 @@ fn decode(buf: &[u8]) -> Result<Vec<Record>> {
             let cuts = (0..i.u32()?)
                 .map(|_| Ok((i.u64()?, i.u64()?)))
                 .collect::<Result<_>>()?;
-            let beside = (0..i.u32()?)
-                .map(|_| (0..i.u32()?).map(|_| i.u8()).collect::<Result<Vec<u8>>>())
-                .collect::<Result<_>>()?;
             let dooms = lists.pop().unwrap();
             let outs = lists.pop().unwrap();
             let ins = lists.pop().unwrap();
@@ -130,7 +118,6 @@ fn decode(buf: &[u8]) -> Result<Vec<Record>> {
                 outs,
                 dooms,
                 cuts,
-                beside,
             })
         })
         .collect()
@@ -649,8 +636,8 @@ impl Snail {
         })
     }
 
-    /// The monitor as the transaction reads it: its own files, and each file another that it reads
-    /// or read runs on. Returns what it found, and the paths of the files it has yet to reach.
+    /// The monitor as the transaction reads it: its own files, and each file another running beside it
+    /// runs on. Returns what it found, and the paths of the files it has yet to reach.
     fn view(&self, txn: &Txn) -> Result<(View, Vec<Vec<u8>>)> {
         let mut v = self.view_of_own(txn)?;
         for f in &txn.reached {
@@ -681,11 +668,6 @@ impl Snail {
             for (slot, _) in &f.running {
                 for path in lock::beside(&f.file, *slot)? {
                     note(&path);
-                }
-            }
-            for r in &f.records {
-                for path in &r.beside {
-                    note(path);
                 }
             }
         }
@@ -1304,20 +1286,6 @@ impl Snail {
                 outs: txn.outs.iter().copied().collect(),
                 dooms: txn.dooms.iter().copied().collect(),
                 cuts: Vec::new(),
-                beside: txn
-                    .files
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != s.place)
-                    .map(|(_, f)| {
-                        use std::os::unix::ffi::OsStrExt;
-                        std::fs::canonicalize(&f.path)
-                            .unwrap_or_else(|_| f.path.clone())
-                            .as_os_str()
-                            .as_bytes()
-                            .to_vec()
-                    })
-                    .collect(),
             })
         });
         let open = {

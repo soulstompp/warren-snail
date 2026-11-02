@@ -742,6 +742,28 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn a_place_on_the_clock_is_read_back_whole_and_a_mark_beside_another_is_found() {
+        let (path, a, b) = file("orders");
+        let at = (1u64 << 51) + 123_456_789;
+        assert_eq!(order_of(&b, 7, false).unwrap(), None);
+        mark_order(&a, 7, false, at, true).unwrap();
+        mark_order(&a, 7, true, at + 1, true).unwrap();
+        assert_eq!(order_of(&b, 7, false).unwrap(), Some(at));
+        assert_eq!(order_of(&b, 7, true).unwrap(), Some(at + 1));
+        mark_order(&a, 7, true, at + 1, false).unwrap();
+        assert_eq!(order_of(&b, 7, true).unwrap(), None);
+        // Two marks side by side are one lock, its first byte before the second's.
+        mark_edge(&a, 3, true, 40, true).unwrap();
+        mark_edge(&a, 3, true, 41, true).unwrap();
+        assert!(edge_with(&b, 3, true, 41).unwrap());
+        assert!(!edge_with(&b, 3, true, 42).unwrap());
+        let mut found = edges_in_slot(&b, 3, true).unwrap();
+        found.sort_unstable();
+        assert_eq!(found, [40, 41]);
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// The lock byte of block (5, 'x') of the third order of the second table.
     const GOLDEN: u64 = 2_305_843_784_697_650_849;
 

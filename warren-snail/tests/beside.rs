@@ -607,7 +607,7 @@ fn a_transaction_s_rows_count_in_the_round_s_room() {
 
 #[test]
 fn a_foreign_key_at_one_snapshot_meets_rows_by_their_keys() {
-    let path = tmp("beside-keys.snail");
+    let path = tmp("beside-foreign.snail");
     let ddl = "CREATE TABLE s.p (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
                CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p (id), PRIMARY KEY (id));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
@@ -891,4 +891,69 @@ fn rows_of_every_kind_of_value_are_found_on_the_newest_version_by_their_values()
         count(&mut r, "SELECT count(*) FROM s.k k WHERE k.t = 'changed'"),
         2
     );
+}
+
+#[test]
+fn a_period_key_on_a_block_written_since_is_refused_by_the_block() {
+    let path = tmp("beside-period.snail");
+    let ddl = "CREATE TABLE s.tp (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS)); \
+               CREATE TABLE s.tc (id integer NOT NULL, pid int4range, valid int4range, PRIMARY KEY (id), \
+               FOREIGN KEY (pid, PERIOD valid) REFERENCES s.tp);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(
+        &mut b,
+        "INSERT INTO s.tp (id, valid) VALUES ('[1,2)', '[1,10)'), ('[5,6)', '[1,10)')",
+    );
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.tp p"), 2);
+    run(&mut b, "UPDATE s.tp SET valid = '[1,20)' WHERE id = '[5,6)'");
+    assert_eq!(
+        refused(
+            &mut a,
+            "INSERT INTO s.tc (id, pid, valid) VALUES (1, '[1,2)', '[2,4)')"
+        ),
+        "could not serialize access due to concurrent update"
+    );
+    run(&mut a, "ROLLBACK");
+    // Beside a block no commit wrote, it is taken.
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    run(
+        &mut a,
+        "INSERT INTO s.tc (id, pid, valid) VALUES (1, '[1,2)', '[2,4)')",
+    );
+    run(&mut a, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.tc c"), 1);
+}
+
+#[test]
+fn a_cascade_at_one_snapshot_takes_the_children_it_reads_and_its_commit_meets_another_s() {
+    let path = tmp("beside-cascade.snail");
+    let ddl = "CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p (id) ON DELETE CASCADE, \
+               PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut b, "INSERT INTO s.p (id) VALUES (1), (2), (3)");
+    run(&mut b, "INSERT INTO s.c (id, r) VALUES (1, 1), (2, 1), (3, 2)");
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.c c"), 3);
+    // Another's child of another key, in the block of the children it takes.
+    run(&mut b, "INSERT INTO s.c (id, r) VALUES (4, 2)");
+    run(&mut a, "DELETE FROM s.p WHERE id = 1");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.c c"), 1);
+    run(&mut a, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.c c"), 2);
+    // Another's child of the key it takes, written since: met by its commit.
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.c c"), 2);
+    run(&mut a, "DELETE FROM s.p WHERE id = 3");
+    run(&mut b, "INSERT INTO s.c (id, r) VALUES (5, 3)");
+    assert_eq!(
+        refused(&mut a, "COMMIT"),
+        "could not serialize access due to concurrent update"
+    );
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.c c"), 3);
 }

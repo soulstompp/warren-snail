@@ -2,7 +2,7 @@
 //! overlapping transactions found from both sides, and two in a row refused where PostgreSQL's
 //! monitor refuses them, in its words; READ ONLY and DEFERRABLE; the records a commit leaves; the
 //! older formats and a replica refused by name; and every interleaving of two transactions over two
-//! blocks and within one held to some serial order.
+//! blocks, within one and across two snails held to some serial order.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -1291,6 +1291,52 @@ fn a_reader_of_one_snail_finds_an_edge_lying_in_a_file_it_never_opened() {
 }
 
 #[test]
+fn a_reader_of_one_snail_finds_the_edge_a_writer_of_two_found_in_the_other() {
+    let (p, q) = two_snails("found-there");
+    let (mut pivot, mut reader, mut out) = (both(&p, &q), open(&p), open(&q));
+    run_across(&mut pivot, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut reader, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read_across(&mut pivot, "s.t", 3200);
+    run(&mut out, "UPDATE o.t SET v = -2 WHERE id = 32000");
+    run(&mut out, "COMMIT");
+    // The pivot finds its edge out in the file of what it read: it stands in the file it writes too.
+    assert_eq!(read_across(&mut pivot, "o.t", B), i64::from(B));
+    run_across(&mut pivot, &format!("UPDATE s.t SET v = -1 WHERE id = {A}"));
+    assert_eq!(read(&mut reader, A), i64::from(A));
+    assert_eq!(
+        reason(&pivot.execute("COMMIT").unwrap_err()),
+        "Canceled on identification as a pivot, during commit attempt."
+    );
+    run(&mut reader, "COMMIT");
+}
+
+#[test]
+fn a_record_of_a_snail_only_read_goes_with_the_commit_one_root_deciding() {
+    let (p, q) = two_snails("record-deciding");
+    let (mut a, mut other) = (both(&p, &q), both(&p, &q));
+    run_across(&mut other, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read_across(&mut other, "s.t", 3200);
+    run_across(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read_across(&mut a, "s.t", A);
+    run_across(&mut a, &format!("UPDATE o.t SET v = -1 WHERE id = {B}"));
+    let (g, h) = (
+        Snail::open(&p).unwrap().generation(),
+        Snail::open(&q).unwrap().generation(),
+    );
+    a.stop_at(Some(warren_snail::read::StopAcross::BeforeDecision));
+    assert!(a.execute("COMMIT").is_err());
+    assert_eq!(
+        (
+            Snail::open(&p).unwrap().generation(),
+            Snail::open(&q).unwrap().generation()
+        ),
+        (g, h)
+    );
+    run_across(&mut other, "ROLLBACK");
+}
+
+#[test]
 fn a_session_s_level_across_snails_makes_each_statement_a_transaction() {
     let (p, q) = two_snails("session");
     let mut a = both(&p, &q);
@@ -1990,6 +2036,25 @@ fn a_read_of_a_block_whose_first_key_its_own_rows_lowered_marks_the_block_its_sn
     assert_eq!(
         reason(&a.execute("COMMIT").unwrap_err()),
         "Canceled on identification as a pivot, during commit attempt."
+    );
+}
+
+#[test]
+fn a_statement_alone_at_the_level_meets_the_reader_of_its_block() {
+    let path = made("alone");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(read(&mut a, A), i64::from(A));
+    run(
+        &mut b,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    );
+    set(&mut b, A, -1).unwrap();
+    // a read what b wrote, and b, committed first, read what a writes.
+    let e = set(&mut a, 3200, -2).unwrap_err();
+    assert_eq!(
+        reason(&e),
+        "Canceled on identification as a pivot, during write."
     );
 }
 
