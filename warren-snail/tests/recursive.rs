@@ -273,7 +273,61 @@ fn columns_typed_by_the_non_recursive_term() {
          SELECT x FROM t",
         "a ab abb",
     );
+    // `||` and upper are text, which a column of no length takes and text itself is.
+    for q in [
+        "WITH RECURSIVE t(x) AS (SELECT 'a'::varchar UNION ALL SELECT x || 'b' FROM t WHERE length(x) < 3) \
+         SELECT x FROM t",
+        "WITH RECURSIVE t(x) AS (SELECT 'a'::name UNION ALL SELECT x || 'b' FROM t WHERE length(x) < 3) \
+         SELECT x FROM t",
+        "WITH RECURSIVE t(x) AS (SELECT 'a'::text UNION ALL SELECT x || 'b' FROM t WHERE length(x) < 3) \
+         SELECT x FROM t",
+        "WITH RECURSIVE t(x) AS (SELECT 'a'::varchar(3) UNION ALL SELECT (x || 'b')::varchar(3) FROM t \
+         WHERE length(x) < 3) SELECT x FROM t",
+    ] {
+        same(&path, q, "a ab abb");
+    }
+    same(
+        &path,
+        "WITH RECURSIVE t(x) AS (SELECT 'a'::text UNION ALL SELECT upper(x) || 'b' FROM t WHERE length(x) < 3) \
+         SELECT x FROM t",
+        "a Ab ABb",
+    );
+    same(
+        &path,
+        "WITH RECURSIVE t(x) AS (SELECT 'a' UNION ALL SELECT x || 1 FROM t WHERE length(x) < 3) \
+         SELECT x FROM t",
+        "a a1 a11",
+    );
     for (q, words) in [
+        (
+            "WITH RECURSIVE t(x) AS (SELECT 'a'::varchar(3) UNION ALL SELECT x || 'b' FROM t \
+             WHERE length(x) < 3) SELECT x FROM t",
+            "recursive query \"t\" column 1 has type character varying(3) in non-recursive term \
+             but type character varying overall",
+        ),
+        (
+            "WITH RECURSIVE t(x) AS (SELECT 'a'::varchar(3) UNION ALL SELECT upper(x) FROM t \
+             WHERE length(x) < 1) SELECT x FROM t",
+            "recursive query \"t\" column 1 has type character varying(3) in non-recursive term \
+             but type character varying overall",
+        ),
+        (
+            "WITH RECURSIVE t(x) AS (SELECT 'a'::varchar(3) UNION ALL SELECT lower(x) FROM t \
+             WHERE false) SELECT x FROM t",
+            "recursive query \"t\" column 1 has type character varying(3) in non-recursive term \
+             but type character varying overall",
+        ),
+        (
+            "WITH RECURSIVE t(x) AS (SELECT 'a'::char(3) UNION ALL SELECT x || 'b' FROM t \
+             WHERE length(x) < 3) SELECT x FROM t",
+            "recursive query \"t\" column 1 has type character(3) in non-recursive term but \
+             type bpchar overall",
+        ),
+        (
+            "WITH RECURSIVE t(x) AS (SELECT 1 UNION ALL SELECT x || 'b' FROM t WHERE x < 3) \
+             SELECT x FROM t",
+            "UNION types integer and text cannot be matched",
+        ),
         (
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1.5 FROM t WHERE n < 3) \
              SELECT n FROM t",

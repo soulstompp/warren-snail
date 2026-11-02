@@ -480,6 +480,9 @@ impl Typing<'_> {
                 if let Some(t) = range_operator(&op.to_string(), a, b)? {
                     return Ok(Some(t));
                 }
+                if *op == BinaryOperator::StringConcat {
+                    return concatenated(a, b, left, right);
+                }
                 match op {
                     BinaryOperator::Plus
                     | BinaryOperator::Minus
@@ -599,6 +602,12 @@ impl Typing<'_> {
                 if let Some(t) = super::ranges::typed(&name, &types)? {
                     return Ok(t);
                 }
+                // upper and lower also take a range, which an argument not resolved may be.
+                if matches!(name.as_str(), "upper" | "lower")
+                    && matches!((args.as_slice(), types.as_slice()), ([x], [None]) if untyped(x).is_none())
+                {
+                    return Ok(None);
+                }
                 if let Some(t) = strings(&name, &types)? {
                     return Ok(t);
                 }
@@ -620,6 +629,98 @@ impl Typing<'_> {
             _ => None,
         })
     }
+}
+
+/// A side written as a quoted literal, NULL or a parameter, of no type yet: the literal's text, where
+/// it has one. None where the side is written any other way.
+pub(super) fn untyped(e: &Expr) -> Option<Option<&str>> {
+    match e {
+        Expr::Nested(e) => untyped(e),
+        Expr::Value(v) => match &v.value {
+            SqlValue::SingleQuotedString(s) | SqlValue::EscapedStringLiteral(s) => Some(Some(s)),
+            SqlValue::DollarQuotedString(d) => Some(Some(&d.value)),
+            SqlValue::Null | SqlValue::Placeholder(_) => Some(None),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The form of `||` a type has of its own, where it has one: what that form returns.
+pub(super) fn concat_form(t: ColumnType) -> Option<ColumnType> {
+    use crate::textual::Textual;
+    match t {
+        ColumnType::Bytes
+        | ColumnType::Textual(Textual::Jsonb | Textual::Tsvector | Textual::Tsquery) => Some(t),
+        ColumnType::Bit(_) | ColumnType::Varbit(_) => Some(ColumnType::Varbit(None)),
+        t if element_of(t).is_some() => Some(t),
+        _ => None,
+    }
+}
+
+/// The type `||` returns over its sides, as PostgreSQL resolves its forms: beside a literal, a
+/// type's own form with the literal read in that type before any row, else text's; two arrays, or an
+/// array and an element, in the array of their common type; two of one type's own form, that form;
+/// a string beside anything else, text's. `"char"` casts to text unasked, so where text's form and a
+/// string's both take it PostgreSQL cannot choose. Refused where no form takes them; none where a
+/// side is not resolved.
+fn concatenated(
+    a: Option<ColumnType>,
+    b: Option<ColumnType>,
+    left: &Expr,
+    right: &Expr,
+) -> Result<Option<ColumnType>> {
+    use ColumnType as C;
+    let (l, r) = (untyped(left), untyped(right));
+    if (a.is_none() && l.is_none()) || (b.is_none() && r.is_none()) {
+        return Ok(None);
+    }
+    let refused = |why: &str| {
+        Err(Error::new(format!(
+            "operator {why}: {} || {}",
+            arg_name(a),
+            arg_name(b)
+        )))
+    };
+    Ok(Some(match (a, b) {
+        (Some(t), None) | (None, Some(t)) => {
+            if t == C::Char {
+                return refused("is not unique");
+            }
+            match concat_form(t) {
+                Some(form) => {
+                    if let Some(Some(s)) = l.or(r) {
+                        super::pipeline::part_of(
+                            form,
+                            super::pipeline::Value::Text(s.to_string()),
+                            true,
+                        )?;
+                    }
+                    form
+                }
+                None => C::Text(None),
+            }
+        }
+        (Some(x), Some(y)) => {
+            let (ex, ey) = (element_of(x), element_of(y));
+            if ex.is_some() || ey.is_some() {
+                return match common_type(&[ex.or(a), ey.or(b)], "||") {
+                    Ok(t) => Ok(Some(array_of(t))),
+                    Err(_) => refused("does not exist"),
+                };
+            }
+            let string = |t: ColumnType| t.is_string() || t == C::Char;
+            match (concat_form(x), concat_form(y)) {
+                (Some(p), Some(q)) if p == q => p,
+                _ if string(x) && string(y) && (x == C::Char || y == C::Char) => {
+                    return refused("is not unique")
+                }
+                _ if string(x) || string(y) => C::Text(None),
+                _ => return refused("does not exist"),
+            }
+        }
+        (None, None) => C::Text(None),
+    }))
 }
 
 /// Whether a call is `f(*)`.
@@ -1066,6 +1167,13 @@ pub(super) fn strings(
     args: &[Option<ColumnType>],
 ) -> Result<Option<Option<ColumnType>>> {
     use ColumnType as C;
+    if matches!(name, "upper" | "lower") {
+        return match args {
+            [None] => Ok(Some(Some(C::Text(None)))),
+            [Some(t)] if t.is_string() || *t == C::Char => Ok(Some(Some(C::Text(None)))),
+            _ => Err(no_form(name, args)),
+        };
+    }
     if !super::calls::is_string_function(name) {
         return Ok(None);
     }

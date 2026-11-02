@@ -2190,6 +2190,42 @@ fn concat_of_own(v: &Value) -> bool {
     )
 }
 
+/// Whether `||` between two values is text's, each side written as its type writes it: a literal
+/// beside a type with no form of its own, or a string beside anything but an array.
+fn concat_is_text(
+    x: &Value,
+    y: &Value,
+    left: &Expr,
+    right: &Expr,
+    typed: [Option<ColumnType>; 2],
+) -> bool {
+    let array = |v: &Value, t: Option<ColumnType>| {
+        matches!(v, Value::Composed(ty, _) if super::typed::element_of(*ty).is_some())
+            || t.is_some_and(|t| super::typed::element_of(t).is_some())
+    };
+    let own = |v: &Value, t: Option<ColumnType>| {
+        array(v, t)
+            || concat_of_own(v)
+            || matches!(v, Value::Bytes(_) | Value::Bits(..))
+            || t.is_some_and(|t| super::typed::concat_form(t).is_some())
+    };
+    let string = |v: &Value, t: Option<ColumnType>| {
+        matches!(
+            v,
+            Value::Text(_) | Value::Str(..) | Value::Scalar(ColumnType::Char, _)
+        ) || t.is_some_and(|t| t.is_string() || t == ColumnType::Char)
+    };
+    let literal = |e: &Expr| super::typed::untyped(e).is_some();
+    match (literal(left), literal(right)) {
+        (true, true) => true,
+        (true, false) => !own(y, typed[1]),
+        (false, true) => !own(x, typed[0]),
+        (false, false) => {
+            string(x, typed[0]) && !array(y, typed[1]) || string(y, typed[1]) && !array(x, typed[0])
+        }
+    }
+}
+
 /// An operator on a type held as its text, as PostgreSQL defines it on that type: inet's and
 /// cidr's containment, overlap, bitwise and arithmetic. A comparison of a type PostgreSQL does not
 /// order is refused, whatever stands beside it. None where neither side is such a value, or for a
@@ -2537,12 +2573,6 @@ fn string_op(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>>
         }
         (B::StringConcat, Value::Bits(_, a), Value::Bits(_, b)) => {
             Value::Bits(ColumnType::Varbit(None), bits_cat(a, b))
-        }
-        (B::StringConcat, a, b)
-            if matches!(a, Value::Text(_) | Value::Str(..))
-                || matches!(b, Value::Text(_) | Value::Str(..)) =>
-        {
-            Value::Text(text_part(a) + &text_part(b))
         }
         (B::BitwiseAnd, Value::Bits(_, a), Value::Bits(_, b)) => {
             bit(bits_each(a, b, "AND", |p, q| p && q)?)
@@ -3745,6 +3775,19 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 written_beside(frame, right, y, left),
             );
             let typed = [frame.type_of(left), frame.type_of(right)];
+            if *op == BinaryOperator::StringConcat && concat_is_text(&x, &y, left, right, typed) {
+                return Ok(match x.is_null() || y.is_null() {
+                    true => Value::Null,
+                    false => Value::Text(text_part(&x) + &text_part(&y)),
+                });
+            }
+            // An array's `||` is in the array of its sides' common type.
+            let (x, y) = match frame.type_of(e) {
+                Some(t) if *op == BinaryOperator::StringConcat => {
+                    (array_as(x, t)?, array_as(y, t)?)
+                }
+                _ => (x, y),
+            };
             if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
                 return Ok(v);
             }
@@ -3756,14 +3799,7 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             if let Some(v) = typed_op(op, &x, &y, left, right)? {
                 return Ok(v);
             }
-            // `||` beside a type held as its text with none of its own reads a literal as text.
-            let as_text = *op == BinaryOperator::StringConcat
-                && (matches!(x, Value::Typed(..)) || matches!(y, Value::Typed(..)));
-            let (x, y) = if as_text {
-                (x, y)
-            } else {
-                beside(x, y, left, right)?
-            };
+            let (x, y) = beside(x, y, left, right)?;
             if let Some(v) = string_op(op, &x, &y)? {
                 return Ok(v);
             }
@@ -4062,6 +4098,13 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                                 .input(e, &format!("{name}() function"))?
                                 .unwrap_or(Casing::Libc),
                         )?),
+                        v @ Value::Scalar(ColumnType::Char, _) => {
+                            Value::Text(crate::strings::case(
+                                &v.text().unwrap_or_default(),
+                                name == "upper",
+                                Casing::Libc,
+                            )?)
+                        }
                         // A range's or a multirange's bound.
                         v @ Value::Composed(..) => {
                             match super::ranges::ranges(&name, &[(v.clone(), false)])? {
@@ -7362,6 +7405,7 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo
+                    | BinaryOperator::StringConcat
                     | BinaryOperator::Arrow
                     | BinaryOperator::LongArrow
                     | BinaryOperator::HashArrow
@@ -8205,6 +8249,41 @@ fn array_cast(
         });
     }
     array_value(ty, values, holds_arrays(a, frame))
+}
+
+/// An array value as the array type `ty`, each element assigned to its element type; any other
+/// value, or an array already of `ty`, as it is.
+fn array_as(v: Value, ty: ColumnType) -> Result<Value> {
+    use crate::composed::Item;
+    let (Value::Composed(from, c), Some(to)) = (&v, super::typed::element_of(ty)) else {
+        return Ok(v);
+    };
+    let Some(was) = super::typed::element_of(*from).filter(|_| *from != ty) else {
+        return Ok(v);
+    };
+    let Item::Array {
+        elements,
+        dims,
+        lower,
+    } = &c.item
+    else {
+        return Ok(composed(ty, c.item.clone()));
+    };
+    let elements = elements
+        .iter()
+        .map(|i| match i {
+            Item::Scalar(d) => part_of(to, super::fill::value_of(d, was), false),
+            other => Ok(other.clone()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(composed(
+        ty,
+        Item::Array {
+            elements,
+            dims: dims.clone(),
+            lower: lower.clone(),
+        },
+    ))
 }
 
 /// Whether an ARRAY's elements are arrays, each a dimension of it.
