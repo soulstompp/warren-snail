@@ -582,7 +582,7 @@ pub fn without_overlaps(table: &Table, row: &Row) -> Result<()> {
             let ty = table.columns[l.column()].ty;
             if let (true, Datum::Bytes(b)) = (crate::plane::on_plane(ty), &row[l.column()]) {
                 if let Some(g) = crate::plane::of_bytes(ty, b) {
-                    crate::plane::taken(o.method, &g)?;
+                    crate::plane::taken(o, &g)?;
                 }
             }
         }

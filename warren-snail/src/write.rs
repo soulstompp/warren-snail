@@ -1215,7 +1215,7 @@ pub(crate) fn laid_out(
             ) {
                 let g = crate::plane::of_bytes(table.columns[l.column()].ty, held.data())
                     .ok_or_else(|| Error::new("a shape read from its bytes"))?;
-                crate::plane::taken(order.method, &g)?;
+                crate::plane::taken(order, &g)?;
                 unsorted.push(KeyValue::Wide(crate::plane::key(&g)));
                 continue;
             }

@@ -473,7 +473,7 @@ fn a_statement_routes_a_row_into_a_partial_strand_and_out_as_its_predicate_says(
 }
 
 #[test]
-fn a_gist_or_sp_gist_index_is_held_on_a_range_a_multirange_an_inet_and_text_alone() {
+fn a_gist_or_sp_gist_index_is_held_on_a_range_a_multirange_an_inet_text_and_the_plane() {
     let table = "CREATE TABLE s.t (id int PRIMARY KEY, r int4range, m int4multirange, n inet, \
                  tx text, p point, v tsvector);";
     let got = outcomes(&format!(
@@ -487,16 +487,11 @@ fn a_gist_or_sp_gist_index_is_held_on_a_range_a_multirange_an_inet_and_text_alon
          CREATE INDEX t_v ON s.t USING gist (v);\n\
          CREATE INDEX t_q ON s.t USING spgist (p kd_point_ops);"
     ));
-    assert_eq!(got[1..7], [None, None, None, None, None, None], "{got:?}");
-    assert_eq!(got[8], None, "{got:?}");
-    for (at, op) in [(7, "point_ops"), (9, "kd_point_ops")] {
-        assert!(
-            got[at].as_deref().is_some_and(
-                |e| e.contains(&format!("with the operator class {op} is not held yet"))
-            ),
-            "{got:?}"
-        );
-    }
+    assert_eq!(
+        got[1..10],
+        [None, None, None, None, None, None, None, None, None],
+        "{got:?}"
+    );
 }
 
 /// A table of `n` rows, row i's range [10j, 10j + 5) for j = 7919i mod n, so that neighbours on the

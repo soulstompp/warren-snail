@@ -43,10 +43,10 @@ at once, and a snail written inside a host that decides its commits.
   OVERLAPS`; foreign keys, `MATCH SIMPLE` and `FULL`, every action, deferred or not, and `PERIOD`;
   `CREATE TYPE`, `CREATE DOMAIN`, `CREATE COLLATION`, `CREATE FUNCTION … LANGUAGE sql`; operator
   classes, `WITH`, `NULLS FIRST` and `DESC`.
-- The indexes: hash, and GiST and SP-GiST on a range, a multirange, an `inet` or text, each an
-  order the counts read; a partial index, read where a question implies its `WHERE`; GIN on an array,
-  a `jsonb` or a `tsvector`, and GiST on a `tsvector` or a `tsquery`, each a strand of the elements
-  its rows hold.
+- The indexes: hash, and GiST and SP-GiST on a range, a multirange, an `inet`, text, a point, a box, a
+  polygon or a circle, each an order the counts read; a partial index, read where a question implies
+  its `WHERE`; GIN on an array, a `jsonb` or a `tsvector`, and GiST on a `tsvector` or a `tsquery`,
+  each a strand of the elements its rows hold.
 - The questions: any number of tables, by `JOIN`, commas, `CROSS JOIN`, `LEFT`, `RIGHT` and `FULL
   JOIN`, met by `=`, `<>`, `<`, `<=`, `>` or `>=`; the conditions `<>`, `BETWEEN`, `IS [NOT] NULL`,
   answered from the NULLs counted, and the truth tests; `LIKE`, `ILIKE`, `SIMILAR TO` and `~`, a

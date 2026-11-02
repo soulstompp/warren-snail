@@ -185,11 +185,13 @@ along another, where that one holds the question's columns.
 **Where it stops.** A B-tree is an order on its key: columns, an instant on UTC's clock, or that
 instant's month. A hash index is an order on its key as a B-tree on it would be. A GiST or an
 SP-GiST index on a range, a multirange, an `inet` or text is an order on the type's own order, each
-block keeping the span of the values it holds. A GIN index on an array, a `jsonb` or a `tsvector`, and
-a GiST index on a `tsvector` or a `tsquery`, is a strand of what each row holds, an element and the
-row's key, on the element's order: an operator finds its rows' keys there and the rows by them on the
-table's order, where that reads the fewest pages, and one element's count comes from its counts. A
-BRIN index, and a GiST or an SP-GiST on any other type, is refused by name. A partial index, its `WHERE` comparing its columns with values,
+block keeping the span of the values it holds. One on a point, a box, a polygon or a circle is an
+order on x's and y's bits taken in turn, a shape by the centre of its bounding box, each block
+keeping the bounding box of the shapes it holds, so that a box reads the blocks it meets and no
+others. A GIN index on an array, a `jsonb` or a `tsvector`, and a GiST index on a `tsvector` or a
+`tsquery`, is a strand of what each row holds, an element and the row's key, on the element's order:
+an operator finds its rows' keys there and the rows by them on the table's order, where that reads
+the fewest pages, and one element's count comes from its counts. A BRIN index is refused by name. A partial index, its `WHERE` comparing its columns with values,
 holds only the rows it names, and serves a question whose conditions imply its own. A question that
 reads a column no order holds in the question's own order still reads along the table's order.
 Cluster each table on the index most of its questions lead with: a key handed out as rows arrive,

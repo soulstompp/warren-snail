@@ -3,7 +3,7 @@
 //! each block keeping its bounding box; and whether a block of a bounding box may hold a row an
 //! operator's condition keeps.
 
-use crate::catalog::{ColumnType, Method};
+use crate::catalog::{ColumnType, Method, Order};
 use crate::directory::Span;
 use crate::geo::{
     box_contain_box, box_ov, fp_ge, fp_gt, fp_le, fp_lt, Geo, GeoBox, GeoKind, Point,
@@ -81,10 +81,17 @@ pub(crate) fn key_of_bytes(ty: ColumnType, b: &[u8]) -> Option<i128> {
     of_bytes(ty, b).map(|g| key(&g))
 }
 
-/// Refuses a value PostgreSQL's method does not take: a circle whose bounding box overflows, which
-/// GiST's compress function computes as `float8_pl` and `float8_mi` do.
-pub(crate) fn taken(method: Method, g: &Geo) -> Result<()> {
-    if let (Method::Gist, Geo::Circle(c)) = (method, g) {
+/// Refuses a value PostgreSQL's strand of `order` does not take: a circle whose bounding box overflows,
+/// which GiST's compress function computes as `float8_pl` and `float8_mi` do; any box or polygon under an
+/// EXCLUDE on SP-GiST, whose scan `geo_spgist.c` refuses.
+pub(crate) fn taken(order: &Order, g: &Geo) -> Result<()> {
+    if order.method == Method::Spgist
+        && order.exclusion.is_some()
+        && matches!(g, Geo::Box(_) | Geo::Polygon(_))
+    {
+        return Err(Error::new("unrecognized scankey subtype: 0"));
+    }
+    if let (Method::Gist, Geo::Circle(c)) = (order.method, g) {
         let over =
             |v: f64, r: f64, sum: f64| sum.is_infinite() && !v.is_infinite() && !r.is_infinite();
         let [lx, ly, hx, hy] = bounding(g);
@@ -350,7 +357,7 @@ mod tests {
 
     #[test]
     fn a_key_interleaves_x_s_and_y_s_sortable_bits_x_first() {
-        let bits = |v: f64| (crate::scalars::float8_key(v.to_bits()) as u64) ^ (1 << 63);
+        let sortable = |v: f64| (crate::scalars::float8_key(v.to_bits()) as u64) ^ (1 << 63);
         for (x, y) in [
             (0.0, 0.0),
             (1.0, -1.0),
@@ -361,10 +368,14 @@ mod tests {
             let p = Geo::Point(crate::geo::Point { x, y });
             let r = rungs(key(&p));
             for i in 0..64 {
-                assert_eq!(r[2 * i], ((bits(x) >> (63 - i)) & 1) as u8, "{x} rung {i}");
+                assert_eq!(
+                    r[2 * i],
+                    ((sortable(x) >> (63 - i)) & 1) as u8,
+                    "{x} rung {i}"
+                );
                 assert_eq!(
                     r[2 * i + 1],
-                    ((bits(y) >> (63 - i)) & 1) as u8,
+                    ((sortable(y) >> (63 - i)) & 1) as u8,
                     "{y} rung {i}"
                 );
             }
@@ -411,11 +422,19 @@ mod tests {
 
     #[test]
     fn a_circle_whose_bounding_box_overflows_is_refused_by_gist_as_postgresql_refuses_it() {
+        let catalog = crate::catalog::Catalog::parse(
+            "CREATE TABLE s.t (id int PRIMARY KEY, c circle, p point); \
+             CREATE INDEX t_c ON s.t USING gist (c); \
+             CREATE INDEX t_p ON s.t USING gist (p);",
+        )
+        .unwrap();
+        let t = catalog.table("s.t").unwrap();
+        let (c, p) = (t.order("t_c").unwrap(), t.order("t_p").unwrap());
         let huge = geo_in(GeoKind::Circle, "<(1e308,0),1e308>").unwrap();
-        assert!(taken(Method::Gist, &huge).is_err());
+        assert!(taken(c, &huge).is_err());
         let fine = geo_in(GeoKind::Circle, "<(Infinity,0),1>").unwrap();
-        assert!(taken(Method::Gist, &fine).is_ok());
-        assert!(taken(Method::Gist, &point("(1e308,1e308)")).is_ok());
+        assert!(taken(c, &fine).is_ok());
+        assert!(taken(p, &point("(1e308,1e308)")).is_ok());
     }
 
     /// Every rule against the operator it stands for: a seeded walk of blocks of a few shapes each, and

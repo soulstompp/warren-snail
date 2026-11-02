@@ -90,6 +90,14 @@ fn a_grid_of_points_is_cut_one_bit_a_rung_and_a_box_reads_the_blocks_the_arithme
     // Three leaves a block, id and p's two, each 512 values and its page's own bytes: two disk pages.
     assert_eq!(along.column_pages_read, 6 * 28, "{along:?}");
     assert_eq!(along.rows_walked, 14_336, "{along:?}");
+    // x's bit first: a box 100 cells wide and 16 tall reads 7 blocks of 16 by 32, where 16 by 32 the
+    // other way about would read 8.
+    let wide = "SELECT id FROM s.t WHERE p <@ box '((1034,1034),(1133,1049))'";
+    let (b, across) = s.ask(wide, Some("t_p")).unwrap();
+    exact(wide, &across);
+    assert_eq!((b.num_rows(), across.blocks_read), (1_600, 7), "{across:?}");
+    // The counts name no place of a level whose key is no value of its column.
+    assert_eq!(s.level_counts("s.t", "p", 1_000).unwrap(), None);
     // Asked with no order named, the strand's fewer pages are chosen.
     let (c, chosen) = s.ask(q, None).unwrap();
     assert_eq!(c.num_rows(), 10_000);
@@ -410,6 +418,22 @@ fn every_point_operator_holds_along_each_strand_of_a_point_and_rules_blocks_out(
             "circle '<(1100,1100),40>'",
             "circle '<(1100,1100),0>'",
         ],
+    );
+    // A value a statement draws is no value to rule a block out by.
+    let drawn =
+        "SELECT id FROM s.t WHERE v <@ box(point(random() * 0 + 1040, 1040), point(1100, 1100))";
+    assert!(s.ask(drawn, Some("t_gist")).is_err());
+    assert_eq!(
+        ids(
+            &mut s,
+            "SELECT id FROM s.t WHERE v <@ box(point(1040, 1040), point(1100, 1100))",
+            "t_gist"
+        ),
+        ids(
+            &mut s,
+            "SELECT id FROM s.t WHERE v <@ box '((1040,1040),(1100,1100))'",
+            "t_pkey"
+        ),
     );
     // The value on the left, through the operator's other form.
     for (q, r) in [
@@ -996,7 +1020,7 @@ fn exclusions(name: &str) -> std::path::PathBuf {
         "CREATE TABLE s.t (id integer NOT NULL, p point, b box, g polygon, c circle, PRIMARY KEY (id), \
          EXCLUDE USING gist (p WITH ~=), \
          EXCLUDE USING gist (b WITH &&), \
-         EXCLUDE USING spgist (g WITH &&), \
+         EXCLUDE USING gist (g WITH &&), \
          EXCLUDE USING gist (c WITH &&));",
     )
     .unwrap();
@@ -1059,6 +1083,30 @@ fn an_exclude_on_the_plane_refuses_a_shape_that_conflicts_as_postgresql_refuses_
     );
     run(&mut w, "DELETE FROM s.t WHERE id = 1");
     run(&mut w, "UPDATE s.t SET b = '((1,1),(5,5))' WHERE id = 5");
+    // On SP-GiST, PostgreSQL takes the constraint and refuses every box or polygon it meets (geo_spgist.c).
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.u (id integer NOT NULL, b box, g polygon, p point, PRIMARY KEY (id), \
+         EXCLUDE USING spgist (b WITH &&), EXCLUDE USING spgist (g WITH ~=), \
+         EXCLUDE USING spgist (p kd_point_ops WITH ~=));",
+    )
+    .unwrap();
+    let path = tmp("plane-exclude-spgist.snail");
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(&mut w, "INSERT INTO s.u (id) VALUES (1)");
+    for sql in [
+        "INSERT INTO s.u (id, b) VALUES (2, '((0,0),(1,1))')",
+        "INSERT INTO s.u (id, g) VALUES (2, '((0,0),(1,1),(1,0))')",
+        "UPDATE s.u SET b = '((0,0),(1,1))' WHERE id = 1",
+    ] {
+        refused(&mut w, sql, "unrecognized scankey subtype: 0");
+    }
+    run(&mut w, "INSERT INTO s.u (id, p) VALUES (2, '(1,1)')");
+    refused(
+        &mut w,
+        "INSERT INTO s.u (id, p) VALUES (3, '(1,1)')",
+        "exclusion constraint \"u_p_excl\"",
+    );
 }
 
 #[cfg(feature = "standalone")]
@@ -1136,6 +1184,76 @@ fn at_one_snapshot_two_writers_of_one_block_of_the_plane_both_commit_and_the_blo
 
 #[cfg(feature = "standalone")]
 #[test]
+fn at_repeatable_read_two_writers_of_one_block_update_and_delete_their_own_rows_and_a_prune_keeps_the_box(
+) {
+    let path = shapes_snail("plane-beside-updates");
+    let mut a = Snail::open_writing(&path).unwrap();
+    let mut b = Snail::open_writing(&path).unwrap();
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    run(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    // Rows 0 and 64 of the grid's first cells lie in one block of the strand.
+    run(
+        &mut a,
+        "UPDATE s.t SET p = '(1024.5,1024.5)' WHERE p ~= '(1024,1024)'",
+    );
+    run(&mut b, "DELETE FROM s.t WHERE p ~= '(1024,1032)'");
+    run(&mut a, "COMMIT");
+    run(&mut b, "COMMIT");
+    assert_eq!(
+        ids(&mut a, "SELECT id FROM s.t WHERE p ~= '(1024,1032)'", "t_p"),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        ids(
+            &mut a,
+            "SELECT id FROM s.t WHERE p ~= '(1024.5,1024.5)'",
+            "t_p"
+        ),
+        [0]
+    );
+    // The same row changed since the snapshot is refused, in PostgreSQL's words.
+    run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(
+        ids(
+            &mut a,
+            "SELECT id FROM s.t WHERE p ~= '(1024.5,1024.5)'",
+            "t_p"
+        ),
+        [0]
+    );
+    run(&mut b, "UPDATE s.t SET p = '(1025.5,1025.5)' WHERE id = 0");
+    refused(
+        &mut a,
+        "UPDATE s.t SET p = '(1026.5,1026.5)' WHERE p ~= '(1024.5,1024.5)'",
+        "could not serialize access due to concurrent update",
+    );
+    run(&mut a, "ROLLBACK");
+    // Many rows moved within the block's places waste its pages: a read along the strand prunes it, and
+    // the box it keeps still holds what it holds.
+    let mut pruned = 0;
+    for round in 0..12 {
+        for id in 0..64 {
+            run(
+                &mut a,
+                &format!(
+                    "UPDATE s.t SET p = '({},{})' WHERE id = {id}",
+                    1024 + round,
+                    1024 + id
+                ),
+            );
+        }
+        let q = format!("SELECT id FROM s.t WHERE p ~= '({},1024)'", 1024 + round);
+        let (_, r) = a.ask(&q, Some("t_p")).unwrap();
+        pruned += r.blocks_pruned;
+        assert_eq!(ids(&mut a, &q, "t_p"), ids(&mut a, &q, "t_pkey"), "{q}");
+    }
+    assert!(pruned > 0, "no read along the strand pruned");
+    let q = "SELECT id FROM s.t WHERE p <@ box '((1024,1024),(1035,1087))'";
+    assert_eq!(ids(&mut a, q, "t_p"), ids(&mut a, q, "t_pkey"));
+}
+
+#[cfg(feature = "standalone")]
+#[test]
 fn at_serializable_a_read_along_the_plane_meets_a_row_written_into_a_block_it_ruled_out() {
     let path = shapes_snail("plane-marks");
     let mut a = Snail::open_writing(&path).unwrap();
@@ -1174,4 +1292,111 @@ fn at_serializable_a_read_along_the_plane_meets_a_row_written_into_a_block_it_ru
         "INSERT INTO s.t (id, p) VALUES (9002, '(9200,9200)')",
     );
     run(&mut c, "COMMIT");
+}
+
+#[test]
+fn a_join_reads_its_side_along_the_plane_and_a_comparison_of_two_columns_is_a_row_s() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id bigint NOT NULL, v box, PRIMARY KEY (id)); \
+         CREATE INDEX t_v ON s.t USING gist (v); \
+         CREATE TABLE s.u (id bigint NOT NULL, t_id bigint NOT NULL, w box, PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let n = 16384i64;
+    let boxes = |f: &dyn Fn(i64) -> i64| {
+        shapes(
+            GeoKind::Box,
+            (0..n).map(|i| {
+                let (x, y) = cell(f(i));
+                Some(format!("(({x},{y}),({},{}))", x + 4, y + 4))
+            }),
+        )
+    };
+    let t = Rows {
+        columns: vec![Values::Int((0..n).map(Some).collect()), boxes(&|i| i)],
+    };
+    let u = Rows {
+        columns: vec![
+            Values::Int((0..n).map(Some).collect()),
+            Values::Int((0..n).map(|i| Some((i * 3) % n)).collect()),
+            boxes(&|i| i + 1),
+        ],
+    };
+    let path = tmp("plane-join.snail");
+    write(&path, &catalog, &[("s.t".into(), t), ("s.u".into(), u)]).unwrap();
+    let mut s = fresh(&path);
+    let want = |pass: &dyn Fn(i64) -> bool| -> Vec<i64> {
+        let mut v: Vec<i64> = (0..n).filter(|&i| pass(i)).map(|i| i).collect();
+        v.sort();
+        v
+    };
+    let in_box = |i: i64| {
+        let (x, y) = cell(i);
+        x <= 1100 && x + 4 >= 1040 && y <= 1100 && y + 4 >= 1040
+    };
+    let q = "SELECT u.id FROM s.t JOIN s.u ON t.id = u.t_id WHERE t.v && box '((1040,1040),(1100,1100))'";
+    let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+    let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut got: Vec<i64> = (0..a.len()).map(|i| a.value(i)).collect();
+    got.sort();
+    assert_eq!(got, want(&|i| in_box((i * 3) % n)));
+    // A box's `=` is its area, which no key reads: a join on it is refused by name, as before the strand.
+    let q = "SELECT count(*) FROM s.t a JOIN s.t b ON a.v = b.v WHERE a.id < 3 AND b.id < 3";
+    let e = s.ask(q, None).err().unwrap().to_string();
+    assert!(e.contains("a join on box is not read"), "{e}");
+    // Two columns of one table, and a condition the operator's rule cannot read: a row's.
+    let q = "SELECT id FROM s.u WHERE w && box '((1040,1040),(1100,1100))' OR id = 0";
+    let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+    assert!(b.num_rows() > 1);
+    let q = "SELECT count(*) FROM s.t WHERE NOT (v && box '((1040,1040),(1100,1100))')";
+    let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+    assert_eq!(
+        weather::one(&b),
+        (0..n).filter(|&i| !in_box(i)).count() as i64
+    );
+    let q = "SELECT count(*) FROM s.t WHERE v && box '((1040,1040),(1100,1100))'";
+    let (b, round) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+    exact(q, &round);
+    assert_eq!(
+        weather::one(&b),
+        (0..n).filter(|&i| in_box(i)).count() as i64
+    );
+    assert_eq!(round.order, "t_v", "{round:?}");
+}
+
+#[test]
+fn a_read_along_the_plane_and_a_distance_s_sort_keep_to_the_round_s_room() {
+    let path = table_of(
+        "plane-room",
+        "point",
+        GeoKind::Point,
+        &["gist"],
+        16384,
+        |i| Some(format!("({},{})", cell(i).0, cell(i).1)),
+    );
+    let along = "SELECT id, v FROM s.t WHERE v <@ box '((1024,1024),(2047,2047))'";
+    let nearest =
+        "SELECT id, v <-> point '(1500,1500)' FROM s.t ORDER BY v <-> point '(1500,1500)', id";
+    let mut s = fresh(&path);
+    let wide = [
+        s.ask(along, Some("t_gist")).unwrap(),
+        s.ask(nearest, None).unwrap(),
+    ];
+    assert_eq!(wide[1].1.spill_pages_written, 0, "{:?}", wide[1].1);
+    let room: u64 = 65_536;
+    let dir = tmp("plane-room-spill");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = fresh(&path);
+    s.size_rounds(warren_snail::room::Sizes::of(room).in_dir(&dir));
+    let (b, round) = s.ask(along, Some("t_gist")).unwrap();
+    exact(along, &round);
+    assert_eq!(b.num_rows(), wide[0].0.num_rows());
+    assert_eq!(round.column_pages_read, wide[0].1.column_pages_read);
+    let (b, round) = s.ask(nearest, None).unwrap();
+    assert_eq!(weather::bag(&b), weather::bag(&wide[1].0));
+    assert!(
+        round.spill_pages_written > 0 && round.spill_pages_written == round.spill_pages_read,
+        "{round:?}"
+    );
+    assert!(round.bytes_held < wide[1].1.bytes_held, "{round:?}");
 }
