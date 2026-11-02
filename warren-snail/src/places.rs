@@ -366,7 +366,10 @@ fn decimal_digit(k: i128, r: usize) -> i64 {
 }
 
 fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize, bits: bool) -> i64 {
-    let bit = |b: &[u8]| b.get(r / 8).map_or(-1, |&x| ((x >> (7 - r % 8)) & 1) as i64);
+    let bit = |b: &[u8]| {
+        b.get(r / 8)
+            .map_or(-1, |&x| ((x >> (7 - r % 8)) & 1) as i64)
+    };
     match key {
         KeyValue::Text(s) if bits => {
             return match ty {
@@ -1006,10 +1009,12 @@ mod tests {
                 byte_key(ty, crate::composed::Compound::new(ty, item).hex.as_bytes())
             })
             .collect();
-        let text = keys.iter().fold(crate::directory::BITS_LEVEL | 1, |had, k| match k {
-            KeyValue::Text(s) => rungs_for(ty, s.as_bytes(), had),
-            _ => had,
-        });
+        let text = keys
+            .iter()
+            .fold(crate::directory::BITS_LEVEL | 1, |had, k| match k {
+                KeyValue::Text(s) => rungs_for(ty, s.as_bytes(), had),
+                _ => had,
+            });
         let sublevels = Sublevels::new(&t.orders[0], t, &[text]);
         keys.iter()
             .map(|k| {
@@ -1025,9 +1030,11 @@ mod tests {
         let c = Catalog::parse("CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
         let t = &c.tables[0];
         let values = ["", "a", "a\u{1}", "ab", "b", "\u{7f}", "\u{80}"];
-        let text = values.iter().fold(crate::directory::BITS_LEVEL | 1, |had, v| {
-            rungs_for(t.columns[0].ty, v.as_bytes(), had)
-        });
+        let text = values
+            .iter()
+            .fold(crate::directory::BITS_LEVEL | 1, |had, v| {
+                rungs_for(t.columns[0].ty, v.as_bytes(), had)
+            });
         assert_eq!(text & !crate::directory::BITS_LEVEL, 8 * 2 + 1);
         let sublevels = Sublevels::new(&t.orders[0], t, &[text]);
         let rungs: Vec<Vec<i64>> = values
@@ -1052,7 +1059,8 @@ mod tests {
         );
         assert_eq!(ints[0][..2], [0, -1]);
         assert_eq!(ints[3].len(), 1 + 2 * (1 + 32 + 1) + 1);
-        let bits = |v: i64| (0..32).map(move |r| (((v as i128 + (1 << 31)) >> (31 - r)) & 1) as i64);
+        let bits =
+            |v: i64| (0..32).map(move |r| (((v as i128 + (1 << 31)) >> (31 - r)) & 1) as i64);
         assert!(ints[3][2..34].iter().copied().eq(bits(0)));
         assert!(ints[4][36..68].iter().copied().eq(bits(7)));
         assert!(ints.windows(2).all(|w| w[0] < w[1]));
@@ -1081,7 +1089,11 @@ mod tests {
         assert!(arrays.windows(2).all(|w| w[0] < w[1]));
         let dates = rungs_of(
             "CREATE TABLE s.t (a date[] NOT NULL, PRIMARY KEY (a));",
-            &["{2017-12-31}", "{2018-01-01,1999-01-01}", "{2018-01-01,2000-01-01}"],
+            &[
+                "{2017-12-31}",
+                "{2018-01-01,1999-01-01}",
+                "{2018-01-01,2000-01-01}",
+            ],
         );
         assert_eq!(dates[1][..8], [1, 2018, 1, 1, 1, 1999, 1, 1]);
         assert!(dates.windows(2).all(|w| w[0] < w[1]));

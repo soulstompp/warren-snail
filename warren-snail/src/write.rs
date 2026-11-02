@@ -158,6 +158,18 @@ impl Rows {
                             });
                         }
                     }
+                    // An interval as the snail writes it out, its own 16 bytes.
+                    (
+                        Values::Interval(out),
+                        ColumnType::Interval { .. },
+                        DataType::FixedSizeBinary(16),
+                    ) => {
+                        let a = a.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+                        out.extend(
+                            a.iter()
+                                .map(|v| v.and_then(crate::times::Interval::from_bytes)),
+                        );
+                    }
                     (Values::Interval(out), ColumnType::Interval { .. }, DataType::Struct(_)) => {
                         let s = a
                             .as_any()
@@ -1615,7 +1627,11 @@ fn write_order(
     let block_units: Vec<Vec<usize>> = if kept {
         largest_places(&keys, &blocks, order, table, &widths)
             .iter()
-            .map(|m| (0..widths.0.len()).map(|s| widths.unit(s, m[s], n)).collect())
+            .map(|m| {
+                (0..widths.0.len())
+                    .map(|s| widths.unit(s, m[s], n))
+                    .collect()
+            })
             .collect()
     } else {
         vec![units.clone(); blocks.len()]

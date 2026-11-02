@@ -1,7 +1,8 @@
 //! The composed types over every element type held: a value held as a group of leaves (a timetz,
-//! an interval, a bit varying) and a bit string as a part of a composed value, each keyed as its own
-//! type is and back from its leaves' pages; daterange made canonical by a day; a composite of no
-//! fields; and the multiranges' operators and array slices, each answered as PostgreSQL answers it.
+//! a bit varying), an interval held as its own 16 bytes and a bit string as a part of a composed
+//! value, each keyed as its own type is and back from its leaves' pages; daterange made canonical
+//! by a day; a composite of no fields; and the multiranges' operators and array slices, each
+//! answered as PostgreSQL answers it.
 
 use std::cmp::Ordering;
 use std::sync::Arc;

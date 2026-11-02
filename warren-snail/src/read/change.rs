@@ -1848,7 +1848,8 @@ impl Snail {
             for (tn, on) in &d.made {
                 if let Some(t) = self.catalog.table(tn) {
                     if let Some(o) = t.orders.iter().find(|x| x.name == *on) {
-                        let top = w.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
+                        let top =
+                            w.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
                         orders.push((tn.clone(), on.clone(), top));
                     }
                 }
@@ -2675,9 +2676,15 @@ impl Snail {
         let mut rows = None;
         let split = !added.is_empty() && {
             let r = rows_now();
-            let cut = laid_out(table, order, &r, Some(&head.level_text), self.reader.format())?
-                .blocks
-                .len()
+            let cut = laid_out(
+                table,
+                order,
+                &r,
+                Some(&head.level_text),
+                self.reader.format(),
+            )?
+            .blocks
+            .len()
                 > 1;
             rows = Some(r);
             cut
@@ -2918,7 +2925,13 @@ impl Snail {
             blocks,
             widths,
             ..
-        } = laid_out(table, order, rows, Some(&head.level_text), self.reader.format())?;
+        } = laid_out(
+            table,
+            order,
+            rows,
+            Some(&head.level_text),
+            self.reader.format(),
+        )?;
         let descs = leaf_descriptors(table, order)?;
         // In format 9 each block takes the unit of its own furthest-out place.
         let kept = self.reader.format() >= crate::file::FORMAT;

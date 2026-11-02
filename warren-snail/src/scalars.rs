@@ -1212,7 +1212,7 @@ fn timetz_fields() -> arrow::datatypes::Fields {
     .into()
 }
 
-/// An interval's three leaves as arrow's Parquet reader gives them.
+/// An interval's three fields, as an answer holds them.
 fn interval_fields() -> arrow::datatypes::Fields {
     use arrow::datatypes::{DataType as A, Field};
     vec![
@@ -1223,7 +1223,7 @@ fn interval_fields() -> arrow::datatypes::Fields {
     .into()
 }
 
-/// A column of intervals as an answer holds it: a struct of its three leaves.
+/// A column of intervals as an answer holds it: a struct of its three fields.
 pub fn interval_array(
     values: impl Iterator<Item = Option<crate::times::Interval>>,
 ) -> arrow::array::ArrayRef {
@@ -1248,7 +1248,7 @@ pub fn interval_array(
             vec![Arc::new(months), Arc::new(days), Arc::new(micros)],
             Some(values.iter().map(Option::is_some).collect()),
         )
-        .expect("an interval takes its three leaves"),
+        .expect("an interval takes its three fields"),
     )
 }
 

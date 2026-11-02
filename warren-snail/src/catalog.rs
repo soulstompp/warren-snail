@@ -95,8 +95,8 @@ pub enum ColumnType {
     /// A timestamp: microseconds since 1970-01-01 on a clock of no zone, its infinities the ends
     /// of 64 bits.
     Timestamp(Option<u8>),
-    /// An interval: months, days and microseconds, a group of three leaves, compared by its total
-    /// of 30-day months and 24-hour days; `range` its fields as PostgreSQL's typmod masks them.
+    /// An interval: months, days and microseconds, held as one leaf of its 16 bytes, compared by its
+    /// total of 30-day months and 24-hour days; `range` its fields as PostgreSQL's typmod masks them.
     Interval {
         range: u16,
         precision: Option<u8>,
@@ -690,11 +690,6 @@ impl ColumnType {
             ColumnType::Timetz(_) => &[
                 ("time", ColumnType::Time(None), 0),
                 ("zone", ColumnType::Int4, 0),
-            ],
-            ColumnType::Interval { .. } => &[
-                ("months", ColumnType::Int4, 0),
-                ("days", ColumnType::Int4, 0),
-                ("micros", ColumnType::Int8, 0),
             ],
             _ => &[],
         }

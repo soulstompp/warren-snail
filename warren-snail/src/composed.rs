@@ -1798,7 +1798,7 @@ impl Node {
         }
         let def = match ty {
             ColumnType::Composed(r) => r.def(),
-            // A value held as a group of leaves, a tid, a timetz, an interval or a bit varying: a group
+            // A value held as a group of leaves, a tid, a timetz or a bit varying: a group
             // of its own.
             _ if ty.leaf_count() > 1 => {
                 return Node::Group {
@@ -3258,6 +3258,12 @@ fn leaf_array(ty: ColumnType, values: Vec<Option<&Datum>>) -> Result<arrow::arra
                 })
                 .collect::<Float64Array>(),
         ),
+        ColumnType::Interval { .. } => {
+            crate::scalars::interval_array(values.iter().map(|d| match d {
+                Some(Datum::Interval(i)) => Some(*i),
+                _ => None,
+            }))
+        }
         ty => crate::scalars::scalar_array(ty, values.iter().map(int)),
     })
 }
@@ -3270,6 +3276,7 @@ fn leaf_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<Datu
     };
     let any = a.as_any();
     Some(match ty {
+        ColumnType::Interval { .. } => Datum::Interval(crate::scalars::interval_at(a, r)?),
         ColumnType::Int2 => Datum::Int(any.downcast_ref::<Int16Array>()?.value(r) as i64),
         ColumnType::Int4 => Datum::Int(any.downcast_ref::<Int32Array>()?.value(r) as i64),
         ColumnType::Int8 => Datum::Int(any.downcast_ref::<Int64Array>()?.value(r)),

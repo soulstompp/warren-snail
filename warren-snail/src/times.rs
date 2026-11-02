@@ -51,6 +51,25 @@ pub struct Interval {
 }
 
 impl Interval {
+    /// Its own 16 bytes: its microseconds, then its days and its months, each big-endian.
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&self.micros.to_be_bytes());
+        b[8..12].copy_from_slice(&self.days.to_be_bytes());
+        b[12..].copy_from_slice(&self.months.to_be_bytes());
+        b
+    }
+
+    /// An interval from its own 16 bytes, as `to_bytes` writes them.
+    pub fn from_bytes(b: &[u8]) -> Option<Interval> {
+        let b: &[u8; 16] = b.try_into().ok()?;
+        Some(Interval {
+            micros: i64::from_be_bytes(b[..8].try_into().unwrap()),
+            days: i32::from_be_bytes(b[8..12].try_into().unwrap()),
+            months: i32::from_be_bytes(b[12..].try_into().unwrap()),
+        })
+    }
+
     /// `infinity`: every field at its greatest.
     pub const INFINITY: Interval = Interval {
         months: i32::MAX,

@@ -694,6 +694,7 @@ pub fn push_datum(v: &mut Values, d: &Datum) {
         (Values::Wide(x), Datum::Wide(k)) => x.push(Some(*k)),
         (Values::Float4(x), Datum::Float4(b)) => x.push(Some(*b)),
         (Values::Float8(x), Datum::Float8(b)) => x.push(Some(*b)),
+        (Values::Interval(x), Datum::Interval(i)) => x.push(Some(*i)),
         (Values::Composed(x), Datum::Compound(c)) => x.push(Some(c.clone())),
         _ => panic!("a value pushed onto a column of another kind"),
     }
@@ -707,6 +708,7 @@ pub fn datum_of(v: &Values, i: usize, ty: ColumnType) -> Datum {
         Values::Wide(x) => x[i].map_or(Datum::Null, Datum::Wide),
         Values::Float4(x) => x[i].map_or(Datum::Null, Datum::Float4),
         Values::Float8(x) => x[i].map_or(Datum::Null, Datum::Float8),
+        Values::Interval(x) => x[i].map_or(Datum::Null, Datum::Interval),
         Values::Composed(x) => x[i].clone().map_or(Datum::Null, Datum::Compound),
         Values::Nested(_) => panic!("a leaf's value read without its levels"),
         _ if ty == ColumnType::Bytes || ty.is_bits() => v

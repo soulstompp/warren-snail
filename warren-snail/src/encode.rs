@@ -162,6 +162,8 @@ pub(crate) fn primitive(
         ),
         ColumnType::Boolean => (PhysicalType::BOOLEAN, None),
         ColumnType::Uuid => (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Uuid)),
+        // An interval as one leaf of its own 16 bytes: its microseconds, days and months, big-endian.
+        ColumnType::Interval { .. } => (PhysicalType::FIXED_LEN_BYTE_ARRAY, None),
         ColumnType::Oid
         | ColumnType::Reg(..)
         | ColumnType::Xid
@@ -207,7 +209,6 @@ pub(crate) fn primitive(
         | ColumnType::Varbit(_)
         | ColumnType::Composed(_)
         | ColumnType::Timetz(_)
-        | ColumnType::Interval { .. }
         | ColumnType::Geometric(_) => {
             return Err(Error::new(format!(
                 "{name} is {}, held as a group of leaves",
@@ -389,6 +390,16 @@ fn write(
             write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, levels, |&k| {
                 FixedLenByteArray::from(k.to_be_bytes()[16 - n..].to_vec())
             })?
+        }
+        (Values::Interval(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
+            write_typed::<FixedLenByteArrayType, crate::times::Interval>(
+                desc,
+                p,
+                v,
+                rows_per_page,
+                levels,
+                |i| FixedLenByteArray::from(i.to_bytes().to_vec()),
+            )?
         }
         (Values::Wide(v), PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
             write_typed::<FixedLenByteArrayType, i128>(desc, p, v, rows_per_page, levels, |&k| {
@@ -688,8 +699,29 @@ fn decode_as(
         ColumnType::Tid
         | ColumnType::Varbit(_)
         | ColumnType::Timetz(_)
-        | ColumnType::Interval { .. }
         | ColumnType::Geometric(_) => return Err(group(desc.name(), ty)),
+        ColumnType::Interval { .. } => {
+            let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
+            let mut v: Vec<FixedLenByteArray> = Vec::new();
+            let (n, _, _) = r.read_records(
+                rows,
+                nullable.then_some(&mut defs),
+                repeated.then_some(&mut reps),
+                &mut v,
+            )?;
+            if n != rows {
+                return Err(short(n));
+            }
+            let held = v
+                .iter()
+                .map(|b| {
+                    crate::times::Interval::from_bytes(b.data()).ok_or_else(|| {
+                        Error::new(format!("{}: an interval of {} bytes", desc.name(), b.len()))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Values::Interval(spread(held.into_iter(), &defs, max_def))
+        }
         ColumnType::Bit(n) => {
             let mut r = get_typed_column_reader::<FixedLenByteArrayType>(column);
             let mut v: Vec<FixedLenByteArray> = Vec::new();
