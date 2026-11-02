@@ -17,7 +17,7 @@ use crate::places::{null_key, KeyValue};
 use crate::values::Values;
 use crate::write::empty_head;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// PostgreSQL's words for a row another changed since the transaction's snapshot.
 pub(super) fn concurrent_update() -> Error {
@@ -357,10 +357,12 @@ impl Snail {
                     .map(|(v, &ty)| datum_typed(v, p, ty))
                     .collect()
             };
-            let dead = |p: usize| map.dead.contains(&(p as u32));
+            let gone: HashSet<u32> = map.dead.iter().copied().collect();
+            let dead = |p: usize| gone.contains(&(p as u32));
+            let live: HashSet<Vec<Datum>> = (0..positions).filter(|&p| !dead(p)).map(at).collect();
             for r in rows {
                 let values = held(r);
-                if (0..positions).any(|p| !dead(p) && at(p) == values) {
+                if live.contains(&values) {
                     continue;
                 }
                 let same_key = |p: usize| {
@@ -535,11 +537,13 @@ impl Snail {
             for (path, keys) in by_block {
                 let map = read_map(&self.reader, entry_at(&top, &path), &head.level_text)?;
                 let columns = self.block_columns(table, order, &map)?;
+                let gone: HashSet<u32> = map.dead.iter().copied().collect();
+                let asked: HashSet<&Vec<KeyValue>> = keys.iter().collect();
                 let mut live: HashMap<Vec<KeyValue>, i64> = HashMap::new();
                 for p in 0..map.rows() as usize {
-                    if !map.dead.contains(&(p as u32)) {
+                    if !gone.contains(&(p as u32)) {
                         let k = key_at(table, order, &columns, p)?;
-                        if keys.contains(&k) {
+                        if asked.contains(&k) {
                             *live.entry(k).or_default() += 1;
                         }
                     }
