@@ -317,7 +317,7 @@ impl Snail {
 /// The greatest key a block holds on its order's first level, where its entry says it: its last
 /// key, kept whole where the order keeps both keys or at the order's end; a number's greatest its
 /// leaves keep, `last`; a numeric's that may hold NaN, its decimal's greatest where the block holds
-/// no NaN, else NaN's; or text whose greatest its leaves keep cut to 8 bytes is shorter.
+/// no NaN, else NaN's; or text whose greatest ends within the first 8 bytes its leaves keep.
 fn greatest(on: (&Table, &Order), head: &Head, e: &Entry, last: &KeyValue) -> Option<KeyValue> {
     let (table, order) = on;
     let c = order.levels[0].column();
@@ -345,7 +345,8 @@ fn greatest(on: (&Table, &Order), head: &Head, e: &Entry, last: &KeyValue) -> Op
             false => KeyValue::Int(greatest as i64),
         });
     }
-    // The order's greatest end, which a level keyed by its bytes keeps whole up to 8 bytes.
+    // The order's greatest end, which a level keyed by its bytes keeps whole where it ends within what
+    // it takes to part from the first.
     if bounded && !e.open && !matches!(last, KeyValue::Null { .. }) {
         return Some(last.clone());
     }

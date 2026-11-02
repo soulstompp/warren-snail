@@ -1889,9 +1889,11 @@ pub(crate) fn write_block(
             }
         }
     }
-    // In format 9, a column keyed by its bytes: its least and greatest key, cut to 8 bytes, in its
-    // first leaf's summary.
+    // In format 9, a column keyed by its bytes: its least and greatest key, the first 8 bytes in its
+    // first leaf's summary, as many past them as it takes the two to part in the entry's tail.
+    let mut tails = Vec::new();
     if current {
+        let slots = bound_slots(table, order, crate::file::FORMAT);
         for &c in order.columns.iter().filter(|&&c| bounded(table, c)) {
             let Ok(orderer) = table.columns[c].orderer() else {
                 continue;
@@ -1899,14 +1901,22 @@ pub(crate) fn write_block(
             let ty = table.columns[c].ty;
             let bounds = perm[b.start..b.end]
                 .iter()
-                .filter_map(|&r| compared_key(ty, orderer, &rows.columns[c], r))
-                .map(|k| crate::directory::prefix_bound(&k));
-            if let Some((lo, hi)) = bounds.fold(None, |m: Option<(i128, i128)>, v| {
-                Some(m.map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v))))
+                .filter_map(|&r| compared_key(ty, orderer, &rows.columns[c], r));
+            if let Some((lo, hi)) = bounds.fold(None, |m: Option<(Vec<u8>, Vec<u8>)>, v| {
+                Some(match m {
+                    None => (v.clone(), v),
+                    Some((lo, hi)) if v < lo => (v, hi),
+                    Some((lo, hi)) if v > hi => (lo, v),
+                    held => held.unwrap(),
+                })
             }) {
                 let s = order.leaf_slot(table, c).unwrap();
-                summaries[s].min = lo;
-                summaries[s].max = hi;
+                let tail = crate::directory::bounds_of(&mut summaries[s], &lo, &hi);
+                if tail != Default::default() {
+                    let k = slots.iter().position(|&x| x as usize == s).unwrap();
+                    tails.resize(slots.len(), Default::default());
+                    tails[k] = tail;
+                }
             }
         }
     }
@@ -1975,6 +1985,7 @@ pub(crate) fn write_block(
         ends,
         bytes,
         spans,
+        tails,
         child,
     };
     Ok((entry, encoded, moved))

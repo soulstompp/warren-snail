@@ -1686,7 +1686,7 @@ impl Snail {
                 &replaced,
                 &mut stage,
                 &mut Vec::new(),
-                head.separated,
+                &head,
             )?;
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| stage.place(x))?;
             root.orders[at].2 = stage.place(&bytes)?;
@@ -2055,7 +2055,7 @@ impl Snail {
                 &replaced,
                 w,
                 &mut gone,
-                head.separated,
+                &head,
             )?;
             gone.push(root.orders[at].2);
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| w.place(x))?;
@@ -2476,7 +2476,7 @@ impl Snail {
             &replaced,
             w,
             &mut Vec::new(),
-            head.separated,
+            &head,
         )?;
         let (bytes, _) = build_from(head, top.entries, top.height, &mut |b| w.place(b))?;
         let extent = w.place(&bytes)?;
@@ -2683,7 +2683,7 @@ impl Snail {
                 &replaced,
                 w,
                 &mut Vec::new(),
-                head.separated,
+                &head,
             )?;
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| w.place(x))?;
             self.root.orders[at].2 = w.place(&bytes)?;
@@ -2825,7 +2825,7 @@ impl Snail {
                     &mut written,
                     &head.level_text,
                     Some(&entry.first),
-                    Some(&entry.last),
+                    Some(entry.bound()),
                 );
             }
             return Ok((written, true));
@@ -2972,6 +2972,7 @@ impl Snail {
         for (key, _) in &added {
             crate::directory::widened(&mut entry, key, head.separated);
         }
+        let mut tails = std::mem::take(&mut entry.tails);
         for s in 0..leaves.len() {
             let sum = &mut entry.columns[s];
             let mut first_value = valueless[s];
@@ -2997,8 +2998,9 @@ impl Snail {
                     sum.nulls -= 1;
                 }
             }
-            // A column keyed by its bytes widens its bounds, kept in its first leaf's, by each row added.
-            if head.bound_slots.contains(&(s as u32)) {
+            // A column keyed by its bytes widens its bounds, its first 8 bytes kept in its first leaf's,
+            // by each row added.
+            if let Some(k) = head.bound_slots.iter().position(|&x| x as usize == s) {
                 let ci = order
                     .columns
                     .iter()
@@ -3019,12 +3021,15 @@ impl Snail {
                         }
                         _ => None,
                     };
-                    if let Some(v) = key.map(|k| crate::directory::prefix_bound(&k)) {
+                    if let Some(v) = key {
+                        if tails.len() <= k {
+                            tails.resize(head.bound_slots.len(), Default::default());
+                        }
                         if first_value {
-                            (sum.min, sum.max) = (v, v);
+                            tails[k] = crate::directory::bounds_of(sum, &v, &v);
                             first_value = false;
                         } else {
-                            (sum.min, sum.max) = (sum.min.min(v), sum.max.max(v));
+                            crate::directory::bounds_widened(sum, &mut tails[k], &v);
                         }
                     }
                 }
@@ -3072,6 +3077,7 @@ impl Snail {
                 crate::spans::widen(&mut entry.spans[k], table.columns[c].ty, &values[at]);
             }
         }
+        entry.tails = tails;
         entry.child = w.place(&map.encode())?;
         Ok((vec![entry], false))
     }
@@ -3440,19 +3446,19 @@ fn settle(
     replaced: &BTreeMap<Vec<usize>, Vec<Entry>>,
     w: &mut dyn Place,
     gone: &mut Vec<Extent>,
-    separated: bool,
+    head: &Head,
 ) -> Result<()> {
     let kids: Vec<usize> = node.kids.keys().rev().copied().collect();
     for i in kids {
         let mut kid = node.kids.remove(&i).unwrap();
         path.push(i);
-        settle(&mut kid, path, replaced, w, gone, separated)?;
+        settle(&mut kid, path, replaced, w, gone, head)?;
         path.pop();
         gone.push(kid.at);
         let mut parents = Vec::new();
-        for page in pack(kid.entries, separated)? {
-            let at = w.place(&encode_page(&page, separated))?;
-            parents.push(Entry::over(&page, at)?);
+        for page in pack(kid.entries, head.separated)? {
+            let at = w.place(&encode_page(&page, head.separated))?;
+            parents.push(Entry::over(&page, at, &head.bound_slots)?);
         }
         node.entries.splice(i..i + 1, parents);
     }

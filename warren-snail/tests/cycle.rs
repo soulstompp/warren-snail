@@ -3,8 +3,9 @@
 //! address) on its own rungs, an enclosing one (an array, a range, a record, jsonb) on its
 //! structure, each part on its own rungs; each block's unit from its own furthest-out place; the
 //! interval as one leaf of 16 bytes; and a column keyed by its bytes ruled out by its entries'
-//! bounds, cut to 8 bytes. Each table holds 16,384 rows spread evenly on their own places, and each
-//! round reads the pages it predicted.
+//! bounds, at least 8 bytes each and as long as it takes the two to part, 64 at most. Each table holds
+//! 16,384 rows spread evenly on their own places, unless it says otherwise, and each round reads the
+//! pages it predicted.
 
 mod weather;
 
@@ -420,7 +421,7 @@ fn a_bit_string_is_cut_by_its_bits() {
 }
 
 #[test]
-fn a_text_carried_rules_blocks_out_by_its_bounds_cut_to_8_bytes() {
+fn a_text_carried_rules_blocks_out_by_its_bounds() {
     // The text rises with the key, so each block's least and greatest name a run of its own: an
     // equality reads the one block whose bounds hold it, and a value past every bound reads none.
     let path = written(
@@ -525,4 +526,153 @@ fn a_row_written_into_a_block_widens_its_bounds() {
     let (b, round) = snail.ask(q, None).unwrap();
     exact(q, &round);
     assert_eq!((b.num_rows(), round.blocks_read), (1, 1));
+}
+
+#[test]
+fn a_literal_on_codes_sharing_their_first_9_bytes_reads_one_block() {
+    // `snail.nu bounds`: 2^20 codes of 17 bytes, rising in hexadecimal with a bigint's order, 512 rows
+    // a block, 3 pages a block of the code. Each block's least and greatest part at their 15th byte, so
+    // its entry keeps that much of each, and an equality reads the one block whose bounds hold it.
+    let n = 1i64 << 20;
+    let code = |i: i64| format!("sharedxxx{i:08x}");
+    let path = tmp("cycle-codes.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (k bigint NOT NULL, code text NOT NULL, PRIMARY KEY (k));",
+    )
+    .unwrap();
+    let t = catalog.table("s.t").unwrap();
+    let mut keys = Values::new(t.columns[0].ty);
+    let mut codes = Values::new(t.columns[1].ty);
+    for i in 0..n {
+        push_datum(
+            &mut keys,
+            &warren_snail::composed::scalar_in(t.columns[0].ty, &i.to_string()).unwrap(),
+        );
+        push_datum(
+            &mut codes,
+            &warren_snail::composed::scalar_in(t.columns[1].ty, &code(i)).unwrap(),
+        );
+    }
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![keys, codes],
+            },
+        )],
+    )
+    .unwrap();
+    let snail = Snail::open(&path).unwrap();
+    let blocks = snail.blocks().unwrap();
+    assert_eq!(blocks_of(&blocks, "t_pkey").len(), 2048);
+    let q = format!(
+        "SELECT count(*) FROM s.t t WHERE t.code = '{}'",
+        code(700_000)
+    );
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(&q, None).unwrap();
+    exact(&q, &round);
+    assert_eq!(weather::one(&b), 1);
+    assert_eq!(
+        (round.blocks_read, round.column_pages_predicted),
+        (1, 3),
+        "{round:?}"
+    );
+    // Past every code, and below: no block.
+    for v in ["sharedxxy", "sharedxxx99999999", "sharedxxw"] {
+        let q = format!("SELECT count(*) FROM s.t t WHERE t.code = '{v}'");
+        let (b, round) = snail.ask(&q, None).unwrap();
+        assert_eq!((weather::one(&b), round.blocks_read), (0, 0), "{q}");
+    }
+}
+
+#[test]
+fn an_order_keyed_by_its_bytes_rules_out_a_literal_past_either_end() {
+    // Text of 26 bytes, the order's only level, sharing its first 12: a value past the last key or
+    // below the first, within what their first 8 bytes say, reads no block.
+    let code = |i: i64| format!("sharedxxxxxx{i:014}");
+    let path = written(
+        "ends",
+        "CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));",
+        vec![each(code)],
+    );
+    let q = |v: &str| format!("SELECT count(*) FROM s.t t WHERE t.t = '{v}'");
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(&q(&code(ROWS - 1)), None).unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (1, 1));
+    let (b, round) = snail.ask(&q(&code(0)), None).unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (1, 1));
+    for v in ["sharedxxxxxx9", "sharedxxxxx", "sharedxxxxxw"] {
+        let (b, round) = snail.ask(&q(v), None).unwrap();
+        assert_eq!((weather::one(&b), round.blocks_read), (0, 0), "{v}: {round:?}");
+    }
+    // A range past either end reads none, and one across the last reads what it holds.
+    let (b, round) = snail
+        .ask(
+            "SELECT count(*) FROM s.t t WHERE t.t > 'sharedxxxxxx9'",
+            None,
+        )
+        .unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (0, 0), "{round:?}");
+    let q = format!("SELECT count(*) FROM s.t t WHERE t.t >= '{}'", code(ROWS - 1));
+    let (b, round) = snail.ask(&q, None).unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (1, 1), "{round:?}");
+}
+
+#[test]
+fn a_key_past_64_bytes_shared_is_kept_to_64_and_answers_whole() {
+    // Text sharing its first 80 bytes, the order's only level and a column carried beside a number:
+    // what an entry keeps stops at 64 bytes, so nothing rules a block out on what lies past them, and
+    // every answer holds.
+    let long = |i: i64| format!("{}{i:06}", "x".repeat(80));
+    let path = written(
+        "long-bounds",
+        "CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
+        vec![each(|i| i.to_string()), each(long)],
+    );
+    let q = |v: &str| format!("SELECT count(*) FROM s.t t WHERE t.t = '{v}'");
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(&q(&long(9_000)), None).unwrap();
+    exact(&q(&long(9_000)), &round);
+    assert_eq!(weather::one(&b), 1);
+    let blocks = blocks_of(&snail.blocks().unwrap(), "t_pkey").len() as u64;
+    assert_eq!(round.blocks_read, blocks, "{round:?}");
+    // Past the 64 kept, none can be ruled out; before them, every one is.
+    let (b, round) = snail
+        .ask(&q(&format!("{}z", "x".repeat(70))), None)
+        .unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (0, blocks));
+    let (b, round) = snail
+        .ask(&q(&format!("{}z", "x".repeat(60))), None)
+        .unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (0, 0));
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_row_written_past_a_block_s_bounds_is_found_and_they_keep_less() {
+    // Codes sharing their first 9 bytes, rising in hexadecimal. A row written after the last block's
+    // rows, its code below what that block's bounds keep: the block's bounds widen, the first bytes
+    // parting them, and the code is found; the block's other codes are too.
+    let code = |i: i64| format!("sharedxxx{i:08x}");
+    let path = written(
+        "bounds-past",
+        "CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
+        vec![each(|i| i.to_string()), each(code)],
+    );
+    let q = |v: &str| format!("SELECT count(*) FROM s.t t WHERE t.t = '{v}'");
+    let (_, before) = Snail::open(&path).unwrap().ask(&q("sharedxxx00000005"), None).unwrap();
+    assert_eq!(before.blocks_read, 1);
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.t (k, t) VALUES (16384, 'sharedxxx00000005')")
+        .unwrap();
+    drop(w);
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(&q("sharedxxx00000005"), None).unwrap();
+    exact(&q("sharedxxx00000005"), &round);
+    assert_eq!((weather::one(&b), round.blocks_read), (2, 2), "{round:?}");
+    let (b, round) = snail.ask(&q(&code(16_000)), None).unwrap();
+    assert_eq!((weather::one(&b), round.blocks_read), (1, 1), "{round:?}");
 }

@@ -5,7 +5,9 @@ use super::answer::{same, Answer, Cell, Dict, Text};
 use super::question::{Cond, Countable, OpCond, Side, TextCond};
 use super::{Snail, Wasted};
 use crate::catalog::{ColumnType, Level, Order, Shape, Table};
-use crate::directory::{decode_page, decode_top, Entry, Head, PageMap, Summary};
+use crate::directory::{
+    below_least, decode_page, decode_top, past_greatest, Entry, Head, PageMap, Summary, Tail,
+};
 use crate::encode::decode_leaf_with;
 use crate::file::Extent;
 use crate::places::{level_key, month_of, null_key, KeyValue};
@@ -1493,10 +1495,14 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         let t = &side.texts[ti];
         let slot = order.leaf_slot(table, t.column).unwrap();
         let sum = &e.columns[slot];
-        // Where the entry keeps the column's least and greatest cut to 8 bytes, a value whose first 8
-        // lie outside them is none of the entry's.
-        let outside = walk.head.bound_slots.contains(&(slot as u32))
-            && !within_bounds(t, table.columns[t.column].ty, sum);
+        // Where the entry keeps the column's least and greatest, a value outside what it keeps of them
+        // is none of the entry's.
+        let outside = walk
+            .head
+            .bound_slots
+            .iter()
+            .position(|&b| b as usize == slot)
+            .is_some_and(|k| !within_bounds(t, table.columns[t.column].ty, sum, e.tail(k)));
         if sum.nulls == e.rows || outside {
             status = Status::None;
         } else {
@@ -1683,23 +1689,27 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
 
 /// What an entry keeps of the column a condition reads: its one leaf's summary, or the one its
 /// leaves' summaries make; and the slot of its first leaf.
-/// Whether the run the walk's leading levels fix lies outside an entry's least and greatest of a
-/// level keyed by its bytes, each cut to 8 bytes: at the first level, or one whose levels before it
-/// the run fixes at one value.
+/// A composed value's key, its bytes written as hex, as far as an entry's bounds keep it; any other
+/// value's bytes as they are.
+fn bound_bytes(v: &[u8], ty: ColumnType) -> std::borrow::Cow<'_, [u8]> {
+    if ty.is_nested() {
+        let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+        v.chunks_exact(2)
+            .take(64)
+            .map(|h| d(h[0]) << 4 | d(h[1]))
+            .collect()
+    } else {
+        v.into()
+    }
+}
+
+/// Whether the run the walk's leading levels fix lies outside what an entry keeps of its least and
+/// greatest of a level keyed by its bytes: at the first level, or one whose levels before it the run
+/// fixes at one value.
 fn outside_bounds(walk: &Walk, e: &Entry, order: &Order, table: &Table) -> bool {
-    let bound = |v: &KeyValue, ty: ColumnType| match v {
-        KeyValue::Text(s) if ty.is_nested() => {
-            let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
-            let key: Vec<u8> = s
-                .as_bytes()
-                .chunks(2)
-                .take(8)
-                .map(|h| d(h[0]) << 4 | d(h[1]))
-                .collect();
-            Some(crate::directory::prefix_bound(&key))
-        }
-        KeyValue::Text(s) => Some(crate::directory::prefix_bound(s.as_bytes())),
-        KeyValue::Bytes(b) => Some(crate::directory::prefix_bound(b)),
+    let bytes = |v: &KeyValue| match v {
+        KeyValue::Text(s) => Some(s.as_bytes().to_vec()),
+        KeyValue::Bytes(b) => Some(b.to_vec()),
         _ => None,
     };
     for li in 0..walk.m.min(walk.lo.len()).min(walk.hi.len()) {
@@ -1710,12 +1720,15 @@ fn outside_bounds(walk: &Walk, e: &Entry, order: &Order, table: &Table) -> bool 
         let Some(slot) = order.leaf_slot(table, c) else {
             break;
         };
-        if !walk.head.bound_slots.contains(&(slot as u32)) || e.columns[slot].nulls > 0 {
+        let Some(k) = walk.head.bound_slots.iter().position(|&b| b as usize == slot) else {
+            continue;
+        };
+        if e.columns[slot].nulls > 0 {
             continue;
         }
-        let (sum, ty) = (&e.columns[slot], table.columns[c].ty);
-        if bound(&walk.lo[li], ty).is_some_and(|b| b > sum.max)
-            || bound(&walk.hi[li], ty).is_some_and(|b| b < sum.min)
+        let (sum, ty, tail) = (&e.columns[slot], table.columns[c].ty, e.tail(k));
+        if bytes(&walk.lo[li]).is_some_and(|v| past_greatest(sum, tail, &bound_bytes(&v, ty)))
+            || bytes(&walk.hi[li]).is_some_and(|v| below_least(sum, tail, &bound_bytes(&v, ty)))
         {
             return true;
         }
@@ -1723,28 +1736,15 @@ fn outside_bounds(walk: &Walk, e: &Entry, order: &Order, table: &Table) -> bool 
     false
 }
 
-/// Whether a value `t` keeps may lie within an entry's least and greatest of its column, each its key cut
-/// to 8 bytes; a composed value's bounds in `t` written as hex.
-fn within_bounds(t: &TextCond, ty: ColumnType, sum: &Summary) -> bool {
-    let bound = |v: &[u8]| {
-        if ty.is_nested() {
-            let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
-            let key: Vec<u8> = v
-                .chunks(2)
-                .take(8)
-                .map(|h| d(h[0]) << 4 | d(h[1]))
-                .collect();
-            crate::directory::prefix_bound(&key)
-        } else {
-            crate::directory::prefix_bound(v)
-        }
-    };
+/// Whether a value `t` keeps may lie within what an entry keeps of its column's least and greatest; a
+/// composed value's bounds in `t` written as hex.
+fn within_bounds(t: &TextCond, ty: ColumnType, sum: &Summary, tail: &Tail) -> bool {
     let above = match &t.lo {
-        Bound::Included(l) | Bound::Excluded(l) => bound(l) <= sum.max,
+        Bound::Included(l) | Bound::Excluded(l) => !past_greatest(sum, tail, &bound_bytes(l, ty)),
         Bound::Unbounded => true,
     };
     let below = match &t.hi {
-        Bound::Included(h) | Bound::Excluded(h) => bound(h) >= sum.min,
+        Bound::Included(h) | Bound::Excluded(h) => !below_least(sum, tail, &bound_bytes(h, ty)),
         Bound::Unbounded => true,
     };
     above && below
@@ -2062,6 +2062,7 @@ mod tests {
             ends: vec![[0, 0]],
             bytes: vec![],
             spans: Vec::new(),
+            tails: Vec::new(),
             child: Extent::default(),
         };
         let head = Head {
@@ -2103,6 +2104,7 @@ mod tests {
             ends: vec![],
             bytes: vec![],
             spans: Vec::new(),
+            tails: Vec::new(),
             child: Extent::default(),
         };
         let head = Head::default();
@@ -2140,6 +2142,7 @@ mod tests {
             ends: vec![],
             bytes: vec![],
             spans: Vec::new(),
+            tails: Vec::new(),
             child: Extent::default(),
         };
         let head = Head::default();

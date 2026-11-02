@@ -32,6 +32,102 @@ impl Summary {
     }
 }
 
+/// The most bytes an entry keeps of a column's least and greatest, where it takes them to part, and
+/// the fewest: the first 8 lie in the leaf's summary.
+const BOUND_MOST: usize = 64;
+const BOUND_LEAST: usize = 8;
+
+/// What an entry keeps past the first 8 bytes of a column's least and greatest, where those 8 do not
+/// part them: as long as it takes the two to part, up to 64 bytes in all. Both are empty where 8 bytes
+/// part them, or end before they do.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Tail {
+    pub lo: Vec<u8>,
+    pub hi: Vec<u8>,
+}
+
+static NO_TAIL: Tail = Tail {
+    lo: Vec::new(),
+    hi: Vec::new(),
+};
+
+impl Tail {
+    /// The bytes it takes in its entry.
+    fn size(&self) -> usize {
+        2 + self.lo.len() + self.hi.len()
+    }
+
+    /// Cut to what it takes the two to part, past bytes both share or kept whole.
+    fn parted(&mut self) {
+        let shared = common(&self.lo, &self.hi);
+        let keep = (shared + 1).min(BOUND_MOST - BOUND_LEAST);
+        self.lo.truncate(keep);
+        self.hi.truncate(keep);
+    }
+}
+
+/// How many bytes two share from their first.
+fn common(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// The bytes of a value past the first 8 a summary keeps.
+fn past_kept(key: &[u8]) -> &[u8] {
+    key.get(BOUND_LEAST..).unwrap_or(&[])
+}
+
+/// A column's bounds in a leaf's summary and its tail, from the least and greatest of its keys.
+pub fn bounds_of(sum: &mut Summary, least: &[u8], greatest: &[u8]) -> Tail {
+    sum.min = prefix_bound(least);
+    sum.max = prefix_bound(greatest);
+    let kept = (common(least, greatest) + 1).clamp(BOUND_LEAST, BOUND_MOST);
+    if kept == BOUND_LEAST {
+        return Tail::default();
+    }
+    let cut = |k: &[u8]| k[BOUND_LEAST..kept.min(k.len())].to_vec();
+    Tail {
+        lo: cut(least),
+        hi: cut(greatest),
+    }
+}
+
+/// A column's bounds widened to hold a key written into its block: it can only shorten what they
+/// keep past the first 8 bytes.
+pub fn bounds_widened(sum: &mut Summary, tail: &mut Tail, key: &[u8]) {
+    let (v, past) = (prefix_bound(key), past_kept(key));
+    if below_least(sum, tail, key) {
+        sum.min = v;
+        tail.lo = past.to_vec();
+    }
+    if past_greatest(sum, tail, key) {
+        sum.max = v;
+        tail.hi = past.to_vec();
+    }
+    if sum.min == sum.max {
+        tail.parted();
+    } else {
+        *tail = Tail::default();
+    }
+}
+
+/// Whether a key sorts before every value its column's bounds hold.
+pub fn below_least(sum: &Summary, tail: &Tail, key: &[u8]) -> bool {
+    let v = prefix_bound(key);
+    v < sum.min || (v == sum.min && past_kept(key) < tail.lo.as_slice())
+}
+
+/// Whether a key sorts after every value its column's bounds hold: its bytes as far as the bound keeps
+/// any lie past the bound's.
+pub fn past_greatest(sum: &Summary, tail: &Tail, key: &[u8]) -> bool {
+    let v = prefix_bound(key);
+    let past = past_kept(key);
+    v > sum.max
+        || (v == sum.max
+            && !tail.hi.is_empty()
+            && &past[..past.len().min(tail.hi.len())] > tail.hi.as_slice())
+}
+
 /// What an entry keeps of a column a GiST or SP-GiST strand names: the least lower bound and the
 /// greatest upper bound of its values, as bytes that sort as the bounds do, and whether it holds an
 /// empty value.
@@ -112,6 +208,9 @@ pub struct Entry {
     pub bytes: Vec<u32>,
     /// The span of each column a GiST or SP-GiST strand names, as the head's `span_slots` list them.
     pub spans: Vec<Span>,
+    /// What it keeps past the first 8 bytes of each column the head's `bound_slots` list, where those
+    /// do not part its least and greatest: none where every one's first 8 do.
+    pub tails: Vec<Tail>,
     /// A block's page map, or the directory page below an entry above the blocks.
     pub child: Extent,
 }
@@ -141,7 +240,8 @@ pub struct Head {
     /// among the held leaves.
     pub span_slots: Vec<u32>,
     /// Which of the held leaves are the first of a column keyed by its bytes whose least and greatest
-    /// each entry keeps, cut to 8 bytes, by their place among the held leaves.
+    /// each entry keeps, its first 8 bytes in the leaf's summary and any past them in its tail, by
+    /// their place among the held leaves.
     pub bound_slots: Vec<u32>,
     /// Whether each entry keeps one key, the separator below it, as format 9 keeps an order: its upper
     /// bound read from the separator above it.
@@ -173,7 +273,7 @@ const HEAD_CUT: u32 = 1 << 30;
 const HEAD_SPANS: u32 = 1 << 29;
 
 /// The bit of a head's height set where each entry keeps the least and greatest of a column keyed by
-/// its bytes, cut to 8 bytes, in its first leaf's: the slots follow the spans'. A head with none is
+/// its bytes, its first 8 bytes in its first leaf's: the slots follow the spans'. A head with none is
 /// written as before.
 const HEAD_BOUNDS: u32 = 1 << 28;
 
@@ -257,54 +357,125 @@ pub fn below(s: &[KeyValue], level_text: &[u32]) -> (Vec<KeyValue>, bool) {
     (padded(out, s.len(), GREATEST), false)
 }
 
-/// A key cut to bound from below what it heads: each level of bytes or text past 8 bytes cut to its
-/// first 8, text at a character's end, and its later levels the least a level holds.
-fn cut_below(key: &[KeyValue]) -> Vec<KeyValue> {
-    let mut out = Vec::with_capacity(key.len());
-    for v in key {
-        match v {
-            KeyValue::Text(s) if s.len() > 8 => {
-                let mut j = 8;
-                while !s.is_char_boundary(j) {
-                    j -= 1;
-                }
-                out.push(KeyValue::Text(s[..j].into()));
-                return padded(out, key.len(), LEAST);
+/// The bytes a level of bytes or text keeps.
+fn level_bytes(v: &KeyValue) -> Option<&[u8]> {
+    match v {
+        KeyValue::Text(s) => Some(s.as_bytes()),
+        KeyValue::Bytes(b) => Some(b),
+        _ => None,
+    }
+}
+
+/// How many of a level's bytes an end of an order keeps, where it keeps fewer than the level holds:
+/// at least 8, and as long as it takes to part from the other end's level, where the levels before
+/// them are the same, capped at 64; text at a character's end.
+fn end_kept(v: &KeyValue, other: Option<&KeyValue>) -> Option<usize> {
+    let bytes = level_bytes(v)?;
+    let parted = other.and_then(level_bytes).map_or(0, |o| common(bytes, o) + 1);
+    let kept = parted.clamp(BOUND_LEAST, BOUND_MOST);
+    let at = match v {
+        KeyValue::Text(s) => {
+            let up = (kept..=s.len()).find(|&j| s.is_char_boundary(j));
+            match up {
+                Some(j) if j <= BOUND_MOST => j,
+                _ if kept >= s.len() => kept,
+                _ => (0..=kept).rev().find(|&j| s.is_char_boundary(j)).unwrap_or(0),
             }
-            KeyValue::Bytes(b) if b.len() > 8 => {
-                out.push(KeyValue::Bytes(b[..8].into()));
-                return padded(out, key.len(), LEAST);
-            }
-            v => out.push(v.clone()),
         }
+        _ => kept,
+    };
+    (at < bytes.len()).then_some(at)
+}
+
+/// A key cut to bound from below what it heads, beside the order's other end `other`: each level as
+/// `end_kept` keeps it, and past the first it cuts, the least a level holds.
+fn cut_below(key: &[KeyValue], other: &[KeyValue]) -> Vec<KeyValue> {
+    let mut out = Vec::with_capacity(key.len());
+    let mut same = true;
+    for (d, v) in key.iter().enumerate() {
+        let across = other.get(d).filter(|_| same);
+        if let Some(at) = end_kept(v, across) {
+            out.push(match v {
+                KeyValue::Text(s) => KeyValue::Text(s[..at].into()),
+                KeyValue::Bytes(b) => KeyValue::Bytes(b[..at].into()),
+                _ => unreachable!("only bytes and text are cut"),
+            });
+            return padded(out, key.len(), LEAST);
+        }
+        same = same && across == Some(v);
+        out.push(v.clone());
     }
     out
 }
 
-/// A key widened to bound from above what sorts before it: from its first level of bytes or text
-/// past 8 bytes on, the greatest a level holds.
-fn cut_above(key: &[KeyValue]) -> Vec<KeyValue> {
-    match key.iter().position(|v| match v {
-        KeyValue::Text(s) => s.len() > 8,
-        KeyValue::Bytes(b) => b.len() > 8,
-        _ => false,
-    }) {
-        Some(d) => padded(key[..d].to_vec(), key.len(), GREATEST),
-        None => key.to_vec(),
+/// The least text past every text `prefix` heads: its last character that has a next one, moved on to
+/// it; none where every character is the last there is.
+fn text_past(prefix: &str) -> Option<Box<str>> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(c) = chars.pop() {
+        let next = match c {
+            '\u{D7FF}' => Some('\u{E000}'),
+            c => char::from_u32(c as u32 + 1),
+        };
+        if let Some(n) = next {
+            chars.push(n);
+            return Some(chars.into_iter().collect());
+        }
     }
+    None
+}
+
+/// The least bytes past all that `prefix` heads: its last byte under 255 moved on by one, the rest
+/// dropped; none where every byte is 255.
+fn bytes_past(prefix: &[u8]) -> Option<Box<[u8]>> {
+    let n = prefix.iter().rposition(|&b| b < 255)?;
+    let mut out = prefix[..=n].to_vec();
+    out[n] += 1;
+    Some(out.into())
+}
+
+/// A key widened to bound from above what sorts up to it, beside the order's other end `other`: each
+/// level as `end_kept` keeps it; a level it cuts, the least value past all its bytes head, under which
+/// every key sorts, or where none is, the greatest a level holds; and whether every key sorts before
+/// what it gives.
+fn cut_above(key: &[KeyValue], other: &[KeyValue]) -> (Vec<KeyValue>, bool) {
+    let mut out = Vec::with_capacity(key.len());
+    let mut same = true;
+    for (d, v) in key.iter().enumerate() {
+        let across = other.get(d).filter(|_| same);
+        if let Some(at) = end_kept(v, across) {
+            let past = match v {
+                KeyValue::Text(s) => text_past(&s[..at]).map(KeyValue::Text),
+                KeyValue::Bytes(b) => bytes_past(&b[..at]).map(KeyValue::Bytes),
+                _ => unreachable!("only bytes and text are cut"),
+            };
+            return match past {
+                Some(p) => {
+                    out.push(p);
+                    (padded(out, key.len(), LEAST), true)
+                }
+                None => (padded(out, key.len(), GREATEST), false),
+            };
+        }
+        same = same && across == Some(v);
+        out.push(v.clone());
+    }
+    (out, false)
 }
 
 /// Neighbouring blocks written afresh, their first and last keys whole, given the bounds between
 /// them: each block's first the separator below it, its last the greatest key the separator above
-/// it leaves it. The first block's lower bound is `lower`, or its first key cut to 8 bytes a level;
-/// the last block's upper `upper`, or its last key widened from its first level past 8 bytes; each
-/// of the two its key's where that lies beyond it.
+/// it leaves it. The first block's lower bound is `lower`, or its first key as `cut_below` cuts it
+/// beside the last block's last; the last block's upper `upper`, with whether every key sorts before
+/// it, or its last key as `cut_above` widens it beside the first block's first; each of the two its
+/// key's where that lies beyond it.
 pub fn separate(
     entries: &mut [Entry],
     level_text: &[u32],
     lower: Option<&[KeyValue]>,
-    upper: Option<&[KeyValue]>,
+    upper: Option<(&[KeyValue], bool)>,
 ) {
+
     let n = entries.len();
     if n == 0 {
         return;
@@ -312,13 +483,20 @@ pub fn separate(
     let seps: Vec<Vec<KeyValue>> = (1..n)
         .map(|i| separator(&entries[i - 1].last, &entries[i].first))
         .collect();
-    let first = cut_below(&entries[0].first);
+    let first = cut_below(&entries[0].first, &entries[n - 1].last);
     let first = lower.map_or(first.clone(), |l| first.min(l.to_vec()));
-    let last = cut_above(&entries[n - 1].last);
-    let last = upper.map_or(last.clone(), |u| last.max(u.to_vec()));
+    let (last, open) = cut_above(&entries[n - 1].last, &entries[0].first);
+    let (last, open) = match upper {
+        Some((u, under)) => match u.cmp(last.as_slice()) {
+            std::cmp::Ordering::Greater => (u.to_vec(), under),
+            std::cmp::Ordering::Equal => (last, open && under),
+            std::cmp::Ordering::Less => (last, open),
+        },
+        None => (last, open),
+    };
     entries[0].first = first;
     entries[n - 1].last = last;
-    entries[n - 1].open = false;
+    entries[n - 1].open = open;
     for (i, s) in seps.into_iter().enumerate() {
         (entries[i].last, entries[i].open) = below(&s, level_text);
         entries[i + 1].first = s;
@@ -326,23 +504,69 @@ pub fn separate(
 }
 
 /// A block's bounds after a key written into it, where its order keeps one separator between
-/// blocks: its first key lowered, cut to 8 bytes a level, or its last raised, widened from its first
-/// level past 8 bytes, where the key lies beyond them; whole where it keeps both keys.
+/// blocks: its first key lowered, as `cut_below` cuts it, or its last raised, as `cut_above` widens
+/// it, each beside the bound it leaves, where the key lies beyond them; whole where it keeps both
+/// keys.
 pub fn widened(e: &mut Entry, key: &[KeyValue], separated: bool) {
     if key < e.first.as_slice() {
         e.first = if separated {
-            cut_below(key)
+            cut_below(key, &e.last)
         } else {
             key.to_vec()
         };
     }
-    if key > e.last.as_slice() {
-        e.open = false;
-        e.last = if separated {
-            cut_above(key)
+    if key > e.last.as_slice() || (e.open && key == e.last.as_slice()) {
+        (e.last, e.open) = if separated {
+            cut_above(key, &e.first)
         } else {
-            key.to_vec()
+            (key.to_vec(), false)
         };
+    }
+}
+
+/// What an entry above the blocks keeps past the first 8 bytes of the `k`-th column its head bounds,
+/// its leaf `slot`: its entries' lowest least and highest greatest, a greatest that ends before
+/// another's bytes standing for all it heads, cut to what it takes the two to part; none where their
+/// first 8 bytes part them.
+fn over_tail(entries: &[Entry], k: usize, slot: usize) -> Tail {
+    let mut held: Option<(i128, Vec<u8>, i128, Vec<u8>)> = None;
+    for x in entries {
+        let (c, t) = (&x.columns[slot], x.tail(k));
+        if c.nulls == x.rows {
+            continue;
+        }
+        held = Some(match held {
+            None => (c.min, t.lo.clone(), c.max, t.hi.clone()),
+            Some((min, lo, max, hi)) => {
+                let (min, lo) = if (c.min, t.lo.as_slice()) < (min, lo.as_slice()) {
+                    (c.min, t.lo.clone())
+                } else {
+                    (min, lo)
+                };
+                let (max, hi) = if c.max != max {
+                    if c.max > max {
+                        (c.max, t.hi.clone())
+                    } else {
+                        (max, hi)
+                    }
+                } else if t.hi.starts_with(&hi) {
+                    (max, hi)
+                } else if hi.starts_with(&t.hi) || t.hi > hi {
+                    (max, t.hi.clone())
+                } else {
+                    (max, hi)
+                };
+                (min, lo, max, hi)
+            }
+        });
+    }
+    match held {
+        Some((min, lo, max, hi)) if min == max => {
+            let mut tail = Tail { lo, hi };
+            tail.parted();
+            tail
+        }
+        _ => Tail::default(),
     }
 }
 
@@ -364,10 +588,24 @@ fn add(a: u32, b: u32) -> Result<u32> {
 /// counts at each end follow their months. An entry holding none is written as format 8 writes it.
 const ENTRY_ENDS: u32 = 1 << 31;
 
+/// The next bit, set where a column's least and greatest take more than 8 bytes to part: what it keeps
+/// past them follows the spans. An entry with none is written as before.
+const ENTRY_TAILS: u32 = 1 << 30;
+
 impl Entry {
     /// Whether any of its month columns holds an infinite instant.
     fn has_ends(&self) -> bool {
         self.ends.iter().any(|e| e[0] > 0 || e[1] > 0)
+    }
+
+    /// Whether a column's least and greatest take more than 8 bytes to part.
+    fn has_tails(&self) -> bool {
+        self.tails.iter().any(|t| !t.lo.is_empty() || !t.hi.is_empty())
+    }
+
+    /// What it keeps past the first 8 bytes of the `k`-th column the head's `bound_slots` list.
+    pub fn tail(&self, k: usize) -> &Tail {
+        self.tails.get(k).unwrap_or(&NO_TAIL)
     }
 
     /// Its last key, and whether every key under it sorts before it.
@@ -396,10 +634,15 @@ impl Entry {
             }
             + 4 * self.bytes.len()
             + self.spans.iter().map(Span::size).sum::<usize>()
+            + if self.has_tails() {
+                self.tails.iter().map(Tail::size).sum()
+            } else {
+                0
+            }
     }
 
     /// The entry for a directory page: the counts of the entries it holds, summed.
-    pub fn over(entries: &[Entry], child: Extent) -> Result<Entry> {
+    pub fn over(entries: &[Entry], child: Extent, bound_slots: &[u32]) -> Result<Entry> {
         let (first, last) = match (entries.first(), entries.last()) {
             (Some(f), Some(l)) => (f, l),
             _ => return Err(Error::new("a directory page holds no entry")),
@@ -423,6 +666,7 @@ impl Entry {
             ends: vec![[0u32; 2]; first.months.len()],
             bytes: vec![0u32; first.bytes.len()],
             spans: vec![Span::default(); first.spans.len()],
+            tails: Vec::new(),
             child,
         };
         let mut seen = vec![false; e.columns.len()];
@@ -461,12 +705,20 @@ impl Entry {
                 e.spans[s].join(span);
             }
         }
+        for (k, &slot) in bound_slots.iter().enumerate() {
+            let tail = over_tail(entries, k, slot as usize);
+            if tail != Tail::default() {
+                e.tails.resize(bound_slots.len(), Tail::default());
+                e.tails[k] = tail;
+            }
+        }
         Ok(e)
     }
 
     fn encode(&self, o: &mut Out, separated: bool) {
         let ends = self.has_ends();
-        o.u32(self.depth | if ends { ENTRY_ENDS } else { 0 });
+        let tails = self.has_tails();
+        o.u32(self.depth | if ends { ENTRY_ENDS } else { 0 } | if tails { ENTRY_TAILS } else { 0 });
         o.u32(self.rows);
         o.u32(self.dead);
         if separated {
@@ -507,12 +759,21 @@ impl Entry {
                 o.bytes(&s.hi);
             }
         }
+        if tails {
+            for t in &self.tails {
+                o.u8(t.lo.len() as u8);
+                o.0.extend_from_slice(&t.lo);
+                o.u8(t.hi.len() as u8);
+                o.0.extend_from_slice(&t.hi);
+            }
+        }
         o.extent(self.child);
     }
 
     fn decode(i: &mut In, head: &Head) -> Result<Entry> {
         let depth = i.u32()?;
-        let (depth, ends) = (depth & !ENTRY_ENDS, depth & ENTRY_ENDS != 0);
+        let (ends, tails) = (depth & ENTRY_ENDS != 0, depth & ENTRY_TAILS != 0);
+        let depth = depth & !(ENTRY_ENDS | ENTRY_TAILS);
         let rows = i.u32()?;
         let dead = i.u32()?;
         let levels = head.level_text.len();
@@ -574,6 +835,19 @@ impl Entry {
                 empty: flags & 2 != 0,
             });
         }
+        let tails = if tails {
+            (0..head.bound_slots.len())
+                .map(|_| {
+                    let lo = i.u8()? as usize;
+                    let lo = i.take(lo)?.to_vec();
+                    let hi = i.u8()? as usize;
+                    let hi = i.take(hi)?.to_vec();
+                    Ok(Tail { lo, hi })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let child = i.extent()?;
         Ok(Entry {
             open: false,
@@ -587,6 +861,7 @@ impl Entry {
             ends: at_ends,
             bytes,
             spans,
+            tails,
             child,
         })
     }
@@ -718,6 +993,7 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
             &mut o,
             entries.last().map_or(&[][..], |e| e.last.as_slice()),
         );
+        o.u8(entries.last().is_some_and(|e| e.open) as u8);
     }
     o.0.extend_from_slice(&encode_page(entries, head.separated));
     o.0
@@ -768,7 +1044,8 @@ pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
     } else {
         Vec::new()
     };
-    let entries = decode_page(&buf[i.at()..], &head, (&greatest, false))?;
+    let open = head.separated && i.u8()? != 0;
+    let entries = decode_page(&buf[i.at()..], &head, (&greatest, open))?;
     Ok((head, entries))
 }
 
@@ -836,7 +1113,7 @@ pub fn build_from(
         for page in pack(level, head.separated)? {
             let at = place(&encode_page(&page, head.separated))?;
             below += at.pages();
-            parents.push(Entry::over(&page, at)?);
+            parents.push(Entry::over(&page, at, &head.bound_slots)?);
         }
         level = parents;
         head.height += 1;
@@ -1177,6 +1454,7 @@ mod tests {
             ends: vec![[0, 0]],
             bytes: vec![10 * rows],
             spans: Vec::new(),
+            tails: Vec::new(),
             child: Extent {
                 start: child,
                 bytes: 300,
@@ -1196,7 +1474,7 @@ mod tests {
         a.spans = vec![span(5, 9, false)];
         let mut b = block(2, 10, 1);
         b.spans = vec![span(2, 6, true)];
-        let over = Entry::over(&[a.clone(), b], Extent::default()).unwrap();
+        let over = Entry::over(&[a.clone(), b], Extent::default(), &[]).unwrap();
         assert_eq!(over.spans, [span(2, 9, true)]);
         // Written with a head that names the span's column, read back the same.
         let head = Head {
@@ -1307,6 +1585,7 @@ mod tests {
             ends: vec![],
             bytes: vec![],
             spans: Vec::new(),
+            tails: Vec::new(),
             child: Extent {
                 start: 7,
                 bytes: 64,
@@ -1419,6 +1698,7 @@ mod tests {
                 start: 9,
                 bytes: 4096,
             },
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1455,6 +1735,7 @@ mod tests {
                 start: 9,
                 bytes: 4096,
             },
+            &[],
         )
         .unwrap();
         assert_eq!((e.depth, e.rows, e.dead), (0, 30, 0));
@@ -1623,5 +1904,221 @@ mod tests {
             (entries[1].size_in(true), o.0.len()),
             (entries[1].size() - 16, 164)
         );
+    }
+
+    /// Byte strings of every length to 11 over three bytes, sharing their first bytes so that the
+    /// first 8 do not part them: every value a block's bounds could meet.
+    fn walked() -> Vec<Vec<u8>> {
+        let mut out = vec![Vec::new()];
+        for head in 1..=7 {
+            out.push(b"abcdefg"[..head].to_vec());
+        }
+        let mut tails: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..4 {
+            let last: Vec<Vec<u8>> = tails.clone();
+            for t in last {
+                for b in [0u8, 1, 255] {
+                    let mut v = t.clone();
+                    v.push(b);
+                    if !tails.contains(&v) {
+                        tails.push(v);
+                    }
+                }
+            }
+        }
+        for t in tails {
+            let mut v = b"abcdefg".to_vec();
+            v.extend(t);
+            out.push(v);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn a_bound_holds_every_value_between_its_least_and_greatest_and_rules_out_what_it_parts() {
+        let values = walked();
+        let mut ruled_out = 0u64;
+        for (i, a) in values.iter().enumerate().step_by(3) {
+            for (j, z) in values.iter().enumerate().skip(i).step_by(5) {
+                let mut sum = Summary::default();
+                let tail = bounds_of(&mut sum, a, z);
+                for (n, v) in values.iter().enumerate() {
+                    let (low, high) = (below_least(&sum, &tail, v), past_greatest(&sum, &tail, v));
+                    if i <= n && n <= j {
+                        assert!(!low && !high, "{a:?} {z:?}: {v:?} ruled out");
+                    }
+                    if low {
+                        assert!(v < a, "{a:?} {z:?}: {v:?} below");
+                    }
+                    if high {
+                        assert!(v > z, "{a:?} {z:?}: {v:?} past");
+                    }
+                    ruled_out += (low || high) as u64;
+                }
+            }
+        }
+        assert!(ruled_out > 0);
+        // What it takes to part them, no more: 15 bytes where they share 14.
+        let (a, z) = (b"abcdefghijklmnA".to_vec(), b"abcdefghijklmnZ!!".to_vec());
+        let mut sum = Summary::default();
+        let tail = bounds_of(&mut sum, &a, &z);
+        assert_eq!((tail.lo.len(), tail.hi.len()), (7, 7));
+        assert!(past_greatest(&sum, &tail, b"abcdefghijklmnZ!!z"[..14].iter().chain(b"[").copied().collect::<Vec<_>>().as_slice()));
+        assert!(!past_greatest(&sum, &tail, b"abcdefghijklmnZzzzz"));
+        // 8 bytes part them: nothing past them is kept, and nothing grows.
+        let tail = bounds_of(&mut sum, b"abcdefgA-long", b"abcdefgZ-long");
+        assert_eq!(tail, Tail::default());
+        // Sharing past the cap, each keeps 64 bytes.
+        let long = |c: char| format!("{}{c}", "x".repeat(80));
+        let tail = bounds_of(&mut sum, long('a').as_bytes(), long('b').as_bytes());
+        assert_eq!((tail.lo.len(), tail.hi.len()), (56, 56));
+    }
+
+    #[test]
+    fn a_key_written_into_a_block_widens_its_bound_and_can_only_shorten_it() {
+        let values = walked();
+        for a in values.iter().step_by(17) {
+            for z in values.iter().filter(|z| *z >= a).step_by(23) {
+                for key in values.iter().step_by(11) {
+                    let mut sum = Summary::default();
+                    let mut tail = bounds_of(&mut sum, a, z);
+                    let kept = tail.lo.len().max(tail.hi.len());
+                    bounds_widened(&mut sum, &mut tail, key);
+                    assert!(tail.lo.len().max(tail.hi.len()) <= kept, "{a:?} {z:?} {key:?}");
+                    let (lo, hi) = (a.min(key), z.max(key));
+                    for v in values.iter().filter(|v| *v >= lo && *v <= hi) {
+                        assert!(
+                            !below_least(&sum, &tail, v) && !past_greatest(&sum, &tail, v),
+                            "{a:?} {z:?} {key:?}: {v:?} ruled out"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_entry_above_its_blocks_bounds_all_they_hold() {
+        let values = walked();
+        let block = |a: &[u8], z: &[u8]| {
+            let mut e = block(1, 3, 1);
+            e.columns = vec![Summary {
+                pages: 1,
+                ..Summary::default()
+            }];
+            e.tails = vec![bounds_of(&mut e.columns[0], a, z)];
+            e
+        };
+        for (i, a) in values.iter().enumerate().step_by(29) {
+            let z = &values[(i + 7).min(values.len() - 1)];
+            for (j, b) in values.iter().enumerate().skip(i).step_by(31) {
+                let y = &values[(j + 3).min(values.len() - 1)];
+                let (x, w) = (block(a, z), block(b, y));
+                let e = Entry::over(&[x, w], Extent::default(), &[0]).unwrap();
+                for v in [a, z, b, y] {
+                    assert!(
+                        !below_least(&e.columns[0], e.tail(0), v)
+                            && !past_greatest(&e.columns[0], e.tail(0), v),
+                        "{a:?} {z:?} {b:?} {y:?}: {v:?} ruled out"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_order_s_two_ends_bound_all_between_them_a_level_at_a_time() {
+        let keyed = |b: &[u8]| KeyValue::Bytes(b.into());
+        let text = |b: &[u8]| {
+            let s: String = b.iter().map(|&c| char::from(c.min(127))).collect();
+            KeyValue::Text(s.into())
+        };
+        let values = walked();
+        for wrap in [&keyed as &dyn Fn(&[u8]) -> KeyValue, &text] {
+            let keys: Vec<Vec<KeyValue>> = values
+                .iter()
+                .map(|v| vec![wrap(v), KeyValue::Int(v.len() as i64)])
+                .collect();
+            let mut keys = keys;
+            keys.sort();
+            keys.dedup();
+            for (i, a) in keys.iter().enumerate().step_by(7) {
+                for (j, z) in keys.iter().enumerate().skip(i).step_by(11) {
+                    let low = cut_below(a, z);
+                    let (high, open) = cut_above(z, a);
+                    assert!(low <= *a, "{a:?} {low:?}");
+                    for v in &keys[i..=j] {
+                        assert!(low <= *v, "{a:?} {z:?}: {low:?} above {v:?}");
+                        assert!(
+                            if open { *v < high } else { *v <= high },
+                            "{a:?} {z:?}: {v:?} past {high:?} {open}"
+                        );
+                    }
+                }
+            }
+        }
+        // The rule's figures: 8 bytes where they part, as long as it takes where they do not, 64 at most.
+        let t = |s: &str| vec![KeyValue::Text(s.into())];
+        assert_eq!(cut_below(&t("abcdefghijkl"), &t("abcdefgzijkl")), t("abcdefgh"));
+        assert_eq!(cut_below(&t("sharedxxx1234"), &t("sharedxxx9999")), t("sharedxxx1"));
+        assert_eq!(
+            cut_above(&t("sharedxxx9999"), &t("sharedxxx1234")),
+            (t("sharedxxx:"), true)
+        );
+        let long = |c: char| format!("{}{c}", "x".repeat(80));
+        assert_eq!(
+            cut_below(&t(&long('a')), &t(&long('b'))),
+            t(&"x".repeat(64))
+        );
+        assert_eq!(
+            cut_above(&t(&long('b')), &t(&long('a'))),
+            (t(&format!("{}y", "x".repeat(63))), true)
+        );
+        // A level the two share is kept whole, and the next level is cut beside its fellow.
+        let two = |a: &str, b: &str| vec![KeyValue::Text(a.into()), KeyValue::Text(b.into())];
+        assert_eq!(
+            cut_below(&two("same", "abcdefghijA"), &two("same", "abcdefghijZ")),
+            two("same", "abcdefghijA")
+        );
+        // Past a level they part on, 8 bytes a level.
+        assert_eq!(
+            cut_below(&two("a", "abcdefghijA"), &two("b", "abcdefghijZ")),
+            vec![KeyValue::Text("a".into()), KeyValue::Text("abcdefgh".into())]
+        );
+        // Text is cut at a character's end, and past the last character there is nothing.
+        assert_eq!(cut_below(&t("aaaaaaaéb"), &t("aaaaaaaéc")), t("aaaaaaaéb"));
+        assert_eq!(text_past("\u{D7FF}"), Some("\u{E000}".into()));
+        assert_eq!(text_past("a\u{10FFFF}"), Some("b".into()));
+        assert_eq!(text_past("\u{10FFFF}"), None);
+        assert_eq!(bytes_past(&[1, 255]), Some(vec![2u8].into()));
+        assert_eq!(bytes_past(&[255, 255]), None);
+    }
+
+    #[test]
+    fn a_top_keeps_whether_every_key_sorts_before_its_greatest_end() {
+        let mut entries = vec![block(1, 3, 50)];
+        entries[0].first = vec![KeyValue::Text("sharedxxx1".into())];
+        entries[0].last = vec![KeyValue::Text("sharedxxx:".into())];
+        entries[0].open = true;
+        entries[0].tails = vec![Tail {
+            lo: b"x1".to_vec(),
+            hi: b"x:".to_vec(),
+        }];
+        entries[0].columns[1].min = 5;
+        entries[0].columns[1].max = 5;
+        let h = Head {
+            separated: true,
+            level_text: vec![1 | BITS_LEVEL],
+            bound_slots: vec![1],
+            cut_under: vec![String::new()],
+            ..head()
+        };
+        let (read, got) = decode_top(&encode_top(&h, &entries)).unwrap();
+        assert_eq!((read, got), (h, entries.clone()));
+        let mut o = Out::default();
+        entries[0].encode(&mut o, true);
+        assert_eq!(entries[0].size_in(true), o.0.len());
     }
 }
