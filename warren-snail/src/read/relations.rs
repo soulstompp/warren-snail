@@ -3413,6 +3413,7 @@ fn select_step(
     };
     let subs = super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
     let mut run = pipeline::StepRun::new(p);
+    run.hands_on = true;
     if !plans.is_empty() {
         run.subqueries = Some(&subs);
     }
@@ -3563,11 +3564,10 @@ fn select_step(
     if !fed.get() {
         feed(Vec::new(), None)?;
     }
-    let tail = run.finish(params, release, casings)?;
-    order_out = order_out.or(tail.order);
-    put(tail.rows)?;
+    let (names_out, tail_order) = run.finish_each(params, release, casings, &mut put)?;
+    order_out = order_out.or(tail_order);
     let rel = Relation {
-        names: tail.names,
+        names: names_out,
         rows: gathered,
         order: order_out,
     };

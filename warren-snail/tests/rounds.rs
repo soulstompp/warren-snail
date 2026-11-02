@@ -264,8 +264,11 @@ fn one_chunk(path: &PathBuf, row: u64) -> u64 {
         .map(|b| b.rows)
         .max()
         .unwrap();
-    (block * row).max((4 * 4096u64).div_ceil(row) * row)
+    (block * row).max((4 * 4096u64).div_ceil(row) * row) + FOLD
 }
+
+/// What a fold of no GROUP BY holds beside: its one group's first row and folds, at most.
+const FOLD: u64 = 64;
 
 /// A directory of the test's own, for a round's spill.
 fn spill_dir(name: &str) -> PathBuf {
@@ -733,6 +736,75 @@ fn a_set_operation_s_image_past_the_room_is_met_in_passes_each_key_whole_in_one(
     assert!(round.bytes_held <= room + one_chunk(&path, 9), "{q}: {round:?}");
 }
 
+#[test]
+fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in_order() {
+    let path = tree("sort");
+    let dir = spill_dir("sort");
+    let room: u64 = 32 << 10;
+    let ints_of = |q: &str| {
+        let mut snail = Snail::open(&path).unwrap();
+        snail.size_rounds(Sizes::of(room).in_dir(&dir));
+        let (b, round) = snail.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+        weather::exact(q, &round);
+        assert_eq!(round.spill_pages_read, round.spill_pages_written, "{q}: {round:?}");
+        assert!(round.bytes_held <= room + one_chunk(&path, 18), "{q}: {round:?}");
+        (ints(&b), round)
+    };
+    // Every node, last first: each pass of 3,640 rows of 9 bytes hands on the greatest left.
+    let (got, round) = ints_of("SELECT x.id FROM (SELECT t.id FROM s.t t ORDER BY t.id DESC) x");
+    let want: Vec<Vec<i64>> = (1..=N).rev().map(|i| vec![i]).collect();
+    assert_eq!(got, want);
+    assert!(round.spill_pages_written > 0, "{round:?}");
+    // Its OFFSET and LIMIT across the passes; and its ties: two rows a parent.
+    let (got, _) = ints_of("SELECT t.id FROM s.t t ORDER BY t.id DESC OFFSET 8000 LIMIT 3");
+    assert_eq!(got, [[N - 8000], [N - 8001], [N - 8002]]);
+    let (got, _) = ints_of("SELECT t.parent FROM s.t t ORDER BY t.parent FETCH FIRST 3 ROWS WITH TIES");
+    assert_eq!(got, [[1], [1], [2], [2]]);
+    // Sorted in a step, read back in that order by the one after it.
+    let (got, _) = ints_of(
+        "SELECT x.id FROM (SELECT t.parent, t.id FROM s.t t ORDER BY t.parent DESC, t.id DESC) x \
+         LIMIT 2",
+    );
+    // The root's parent sorts first, then node 8,191's two children.
+    assert_eq!(got, [[1], [16_383]]);
+}
+
+#[test]
+fn a_grouping_and_a_distinct_past_the_room_write_the_rows_of_groups_none_has_come_for() {
+    let path = tree("groups");
+    let dir = spill_dir("groups");
+    let room: u64 = 32 << 10;
+    // Every node its own group; two rows a parent; the parents, 8,191 and the root's.
+    for (q, want) in [
+        (
+            "SELECT count(*), sum(x.n) FROM (SELECT t.id, count(*) AS n FROM s.t t GROUP BY t.id) x",
+            vec![N, N],
+        ),
+        (
+            "SELECT count(*), sum(x.n) FROM (SELECT t.parent, count(*) AS n FROM s.t t GROUP BY t.parent) x",
+            vec![8_192, N],
+        ),
+        (
+            "SELECT count(*), sum(x.parent) FROM (SELECT DISTINCT t.parent FROM s.t t) x",
+            vec![8_192, 8_191 * 8_192 / 2 + ROOT_PARENT],
+        ),
+    ] {
+        let mut snail = Snail::open(&path).unwrap();
+        snail.size_rounds(Sizes::of(room).in_dir(&dir));
+        let (b, round) = snail.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+        each_read_exact(q, &round);
+        assert_eq!(ints_or_nums(&b), want, "{q}");
+        assert!(round.spill_pages_written > 0, "{q}: {round:?}");
+        assert_eq!(round.spill_pages_read, round.spill_pages_written, "{q}: {round:?}");
+        assert!(round.bytes_held <= room + one_chunk(&path, 18), "{q}: {round:?}");
+        let mut snail = Snail::open(&path).unwrap();
+        snail.size_rounds(Sizes::default().in_dir(&dir));
+        let (b, round) = snail.ask(q, None).unwrap();
+        assert_eq!(ints_or_nums(&b), want, "{q}");
+        assert_eq!(round.spill_pages_written, 0, "{q}");
+    }
+}
+
 /// Purchases, beside a table of their 512 owners.
 fn owned(name: &str) -> PathBuf {
     let path = tmp(&format!("rounds-{name}.snail"));
@@ -813,7 +885,8 @@ fn a_subquery_s_kept_table_past_the_room_is_read_back_in_the_order_of_its_keys_h
     // A LATERAL's table past the room is read a chunk at a time by each row before it.
     let q = format!(
         "SELECT sum(d.n) FROM {OWNERS}, LATERAL (SELECT count(*) AS n FROM s.p p WHERE p.owner = o.k) d"
-    );
+    )
+    .replace("{}", "");
     let mut snail = Snail::open(&path).unwrap();
     snail.size_rounds(Sizes::of(room).in_dir(&dir));
     let (b, round) = snail.ask(&q, None).unwrap();

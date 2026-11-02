@@ -1409,6 +1409,10 @@ impl Snail {
             table.release,
             pipeline::Casings::of_table(table, &self.catalog.collations),
         )?;
+        if stream.holds_steps() {
+            drop(stream);
+            return relations::answer(self, q, params);
+        }
         if strand.is_some() {
             stream.along_partitions();
         }

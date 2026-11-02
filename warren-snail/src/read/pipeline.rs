@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 pub(super) mod parted;
+mod sorted;
 pub(super) mod windows;
 
 /// One value of a row: a number whole or with its scale, text, bytes, a truth, or a uuid.
@@ -5693,59 +5694,6 @@ impl<'q> Limit<'q> {
         Ok(())
     }
 
-    /// The rows it keeps of rows made and sorted, `keys` the values each was sorted by: past its
-    /// OFFSET, as many as its count, and where it keeps ties, each after them that sorts with the
-    /// last. Its OFFSET read first, then its count, each cast to bigint; a NULL no offset, or no
-    /// count.
-    fn cut(&self, rows: &mut Vec<Vec<Value>>, keys: &[Vec<Value>], frame: &Frame) -> Result<()> {
-        let read = |e: &Expr| -> Result<Option<i64>> {
-            let v = eval(e, &[], frame, &computed_none())?;
-            match cast(
-                v,
-                &DataType::BigInt(None),
-                frame.release,
-                frame.casings.monetary(),
-                quoted(e),
-            )? {
-                Value::Int(n) => Ok(Some(n)),
-                _ => Ok(None),
-            }
-        };
-        let offset = match self.offset.map(read).transpose()?.flatten() {
-            Some(n) if n < 0 => return Err(Error::new("OFFSET must not be negative")),
-            n => n.unwrap_or(0),
-        };
-        let count = match self.count {
-            Count::All => None,
-            Count::One => Some(1),
-            Count::Of(e) => match read(e)? {
-                Some(n) if n < 0 => return Err(Error::new("LIMIT must not be negative")),
-                n => n,
-            },
-        };
-        let from = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(rows.len());
-        let mut to = match count {
-            None => rows.len(),
-            Some(n) => from
-                .saturating_add(usize::try_from(n).unwrap_or(usize::MAX))
-                .min(rows.len()),
-        };
-        if self.ties && to > from {
-            while to < rows.len()
-                && keys
-                    .get(to)
-                    .zip(keys.get(to - 1))
-                    .is_some_and(|(a, b)| tie(a, b))
-            {
-                to += 1;
-            }
-        }
-        rows.truncate(to);
-        rows.drain(..from);
-        Ok(())
-    }
 }
 
 /// Whether two rows' sort keys tie: each pair NULL alike or equal.
@@ -6037,23 +5985,236 @@ fn fold_partition(
     Ok(())
 }
 
+/// A step's groups: each one's first row and its aggregates' folds, its key's place among them, and
+/// past the room, the rows of the groups none has come for yet, written for a pass of their own.
+struct Groups {
+    at: HashMap<Vec<Key>, usize>,
+    list: Vec<(Vec<Value>, Vec<Acc>)>,
+    held: crate::room::Holding,
+    past: Option<super::spill::Run>,
+    closed: bool,
+    /// What its aggregates keep of the rows they are given, in the round's room.
+    kept: crate::room::Holding,
+}
+
+impl Groups {
+    fn new() -> Groups {
+        Groups {
+            at: HashMap::new(),
+            list: Vec::new(),
+            held: crate::room::holding(0),
+            past: None,
+            closed: false,
+            kept: crate::room::holding(0),
+        }
+    }
+
+    fn fresh(p: &Prepared) -> Result<Vec<Acc>> {
+        p.calls
+            .aggregates
+            .iter()
+            .map(|&c| Acc::of(c, &p.types).map(|(a, _)| a))
+            .collect()
+    }
+
+    /// Rows folded into their groups: a group none has come for, past the room, its rows written.
+    fn fold(&mut self, p: &Prepared, rows: Vec<Vec<Value>>, frame: &Frame) -> Result<()> {
+        let none = computed_none();
+        let folded: Vec<Folds> = p
+            .calls
+            .aggregates
+            .iter()
+            .map(|&c| Acc::of(c, &p.types).map(|(_, f)| f))
+            .collect::<Result<_>>()?;
+        let grouped_under = p
+            .grouping
+            .iter()
+            .map(|g| frame.casings.keyed(g))
+            .collect::<Result<Vec<_>>>()?;
+        let folded_under = p
+            .calls
+            .aggregates
+            .iter()
+            .zip(&folded)
+            .map(|(&c, f)| frame.casings.folded(c, &f.args))
+            .collect::<Result<Vec<_>>>()?;
+        let group_bytes = 32 * p.calls.aggregates.len() as u64;
+        for row in rows {
+            let k: Vec<Key> = p
+                .grouping
+                .iter()
+                .zip(&grouped_under)
+                .map(|(g, &u)| {
+                    eval(g, &row, frame, &none).and_then(|v| {
+                        grouped_key(&v)?;
+                        Ok(key_under(&v, u))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let i = match self.at.get(&k) {
+                Some(&i) => i,
+                None => {
+                    let w = super::spill::row_width(&row) + group_bytes;
+                    if !self.list.is_empty() && (self.closed || !self.held.fits(w)) {
+                        self.closed = true;
+                        self.past
+                            .get_or_insert_with(super::spill::Run::past)
+                            .push(row)?;
+                        continue;
+                    }
+                    if self.list.is_empty() {
+                        self.held.more(w);
+                    }
+                    self.list.push((row.clone(), Self::fresh(p)?));
+                    self.at.insert(k, self.list.len() - 1);
+                    self.list.len() - 1
+                }
+            };
+            for ((acc, f), (u, refused)) in
+                self.list[i].1.iter_mut().zip(&folded).zip(&folded_under)
+            {
+                if let Some(w) = f.filter {
+                    if truth(&eval(w, &row, frame, &none)?)? != Some(true) {
+                        continue;
+                    }
+                }
+                if !f.direct.is_empty() {
+                    acc.direct(
+                        f.direct
+                            .iter()
+                            .map(|x| eval(x, &row, frame, &none))
+                            .collect::<Result<_>>()?,
+                    );
+                }
+                let values: Vec<Value> = f
+                    .args
+                    .iter()
+                    .map(|x| eval(x, &row, frame, &none))
+                    .collect::<Result<_>>()?;
+                if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
+                    return Err(Error::new(e.clone()));
+                }
+                if acc.keeps_rows() {
+                    self.kept.more(super::spill::row_width(&values));
+                }
+                acc.add_row(values, u)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows the groups held return, then their room let go.
+    fn project(
+        &mut self,
+        p: &Prepared,
+        frame: &Frame,
+        out: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<()> {
+        for (first, accs) in std::mem::take(&mut self.list) {
+            let computed = Computed {
+                calls: p
+                    .calls
+                    .aggregates
+                    .iter()
+                    .zip(&accs)
+                    .map(|(&c, a)| {
+                        // A direct argument is read once a group, from no row where none came.
+                        let (_, f) = Acc::of(c, &p.types)?;
+                        if f.direct.is_empty() {
+                            return Ok((c as *const Expr, a.value()?));
+                        }
+                        let mut a = a.clone();
+                        a.direct(
+                            f.direct
+                                .iter()
+                                .map(|x| eval(x, &first, frame, &computed_none()))
+                                .collect::<Result<_>>()?,
+                        );
+                        Ok((c as *const Expr, a.value()?))
+                    })
+                    .collect::<Result<_>>()?,
+                _q: std::marker::PhantomData,
+            };
+            if let Some(h) = p.having {
+                if truth(&eval(h, &first, frame, &computed)?)? != Some(true) {
+                    continue;
+                }
+            }
+            out(p.project(&first, frame, computed)?)?;
+        }
+        self.at.clear();
+        self.closed = false;
+        self.held = crate::room::holding(0);
+        self.kept = crate::room::holding(0);
+        Ok(())
+    }
+}
+
+/// A step's rows on their way out: each DISTINCT row once, past the room those it cannot yet say
+/// are new written for a pass of their own; then held for its ORDER BY or LIMIT, or handed on.
+struct Going {
+    distinct: bool,
+    seen: std::collections::HashSet<Vec<Key>>,
+    seen_held: crate::room::Holding,
+    seen_past: Option<super::spill::Run>,
+    closed: bool,
+    sorter: Option<sorted::Sorter>,
+    sorts: bool,
+}
+
+impl Going {
+    /// Of rows the step returns, those to hand on now.
+    fn take(
+        &mut self,
+        p: &Prepared,
+        casings: &Casings,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let rows = if self.distinct {
+            let mut new = Vec::with_capacity(rows.len());
+            for r in rows {
+                let k: Vec<Key> = r.iter().map(key).collect();
+                if self.seen.contains(&k) {
+                    continue;
+                }
+                if self.closed || !self.seen_held.fits(super::spill::row_width(&r)) {
+                    self.closed = true;
+                    self.seen_past
+                        .get_or_insert_with(super::spill::Run::past)
+                        .push(r)?;
+                    continue;
+                }
+                self.seen.insert(k);
+                new.push(r);
+            }
+            new
+        } else {
+            rows
+        };
+        if !self.sorts {
+            return Ok(rows);
+        }
+        if self.sorter.is_none() {
+            self.sorter = Some(sorted::Sorter::new(p, casings)?);
+        }
+        let s = self.sorter.as_mut().expect("just made");
+        for r in rows {
+            s.push(r)?;
+        }
+        Ok(Vec::new())
+    }
+}
+
 /// One SELECT read over rows given a chunk at a time, in the order: its windows' running folds and
 /// its groups kept from chunk to chunk. A step that neither groups nor sorts hands each chunk on.
 pub(super) struct StepRun<'q> {
     p: Prepared<'q>,
     running: Running,
-    at: HashMap<Vec<Key>, usize>,
-    /// Each group's first row and its aggregates' folds.
-    groups: Vec<(Vec<Value>, Vec<Acc>)>,
-    /// The rows held for an ORDER BY.
-    rows: Vec<Vec<Value>>,
+    groups: Groups,
+    going: Going,
     /// The rows its FROM gives, held for a window that reads its partition whole, and the column
     /// holding the table's order among them.
     held: parted::Parted,
-    /// The rows a DISTINCT step has returned, by their keys.
-    seen: std::collections::HashSet<Vec<Key>>,
-    /// What its aggregates keep of the rows they are given, in the round's room.
-    kept: crate::room::Holding,
     /// Where its rows come in the order of its windows' PARTITION BY and ORDER BY: the partition
     /// coming, its rows held in the round's room, and the rows the partitions before it returned.
     along_partitions: bool,
@@ -6061,6 +6222,12 @@ pub(super) struct StepRun<'q> {
     partition_rows: Vec<Vec<Value>>,
     partition_held: crate::room::Holding,
     partitions_out: Vec<Vec<Value>>,
+    /// Whether its rows come in the order of its ORDER BY, so they are handed on as they come; and
+    /// what its LIMIT keeps of them.
+    along_order: bool,
+    cut: Option<sorted::Cut>,
+    /// Whether whoever reads it takes its rows as they are made, rather than all at the end.
+    pub(super) hands_on: bool,
     /// The columns the step's FROM reads, as the last chunk gave them.
     columns: Columns,
     /// What answers its subqueries, where it has any.
@@ -6072,20 +6239,29 @@ pub(super) struct StepRun<'q> {
 
 impl<'q> StepRun<'q> {
     pub(super) fn new(p: Prepared<'q>) -> StepRun<'q> {
+        let going = Going {
+            distinct: p.distinct,
+            seen: Default::default(),
+            seen_held: crate::room::holding(0),
+            seen_past: None,
+            closed: false,
+            sorter: None,
+            sorts: p.order_by.is_some() || p.limit.is_some(),
+        };
         StepRun {
             p,
             running: HashMap::new(),
-            at: HashMap::new(),
-            groups: Vec::new(),
-            rows: Vec::new(),
+            groups: Groups::new(),
+            going,
             held: parted::Parted::new(),
-            seen: Default::default(),
-            kept: crate::room::holding(0),
             along_partitions: false,
             partition: None,
             partition_rows: Vec::new(),
             partition_held: crate::room::holding(0),
             partitions_out: Vec::new(),
+            along_order: false,
+            cut: None,
+            hands_on: false,
             columns: Vec::new(),
             subqueries: None,
             empty_row: None,
@@ -6098,27 +6274,8 @@ impl<'q> StepRun<'q> {
         self.along_partitions = true;
     }
 
-    /// A DISTINCT step's rows, each the first time it comes; any other step's as they are.
-    fn once(&mut self, rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
-        if !self.p.distinct {
-            return rows;
-        }
-        rows.into_iter()
-            .filter(|r| self.seen.insert(r.iter().map(key).collect()))
-            .collect()
-    }
-
     fn names(&self) -> Vec<String> {
         self.p.items.iter().map(|(_, n)| n.clone()).collect()
-    }
-
-    fn fresh(&self) -> Result<Vec<Acc>> {
-        self.p
-            .calls
-            .aggregates
-            .iter()
-            .map(|&c| Acc::of(c, &self.p.types).map(|(a, _)| a))
-            .collect()
     }
 
     /// Reads one chunk of the rows its FROM gives: the rows the step returns for it, unless the step
@@ -6151,97 +6308,36 @@ impl<'q> StepRun<'q> {
             rel.rows = kept;
         }
         if self.p.grouped {
-            let folded: Vec<Folds> = self
-                .p
-                .calls
-                .aggregates
-                .iter()
-                .map(|&c| Acc::of(c, &self.p.types).map(|(_, f)| f))
-                .collect::<Result<_>>()?;
-            let grouped_under = self
-                .p
-                .grouping
-                .iter()
-                .map(|g| frame.casings.keyed(g))
-                .collect::<Result<Vec<_>>>()?;
-            let folded_under = self
-                .p
-                .calls
-                .aggregates
-                .iter()
-                .zip(&folded)
-                .map(|(&c, f)| frame.casings.folded(c, &f.args))
-                .collect::<Result<Vec<_>>>()?;
-            for row in rel.rows {
-                let k: Vec<Key> = self
-                    .p
-                    .grouping
-                    .iter()
-                    .zip(&grouped_under)
-                    .map(|(g, &u)| {
-                        eval(g, &row, &frame, &none).and_then(|v| {
-                            grouped_key(&v)?;
-                            Ok(key_under(&v, u))
-                        })
-                    })
-                    .collect::<Result<_>>()?;
-                let i = match self.at.get(&k) {
-                    Some(&i) => i,
-                    None => {
-                        let accs = self.fresh()?;
-                        self.groups.push((row.clone(), accs));
-                        self.at.insert(k, self.groups.len() - 1);
-                        self.groups.len() - 1
-                    }
-                };
-                for ((acc, f), (u, refused)) in
-                    self.groups[i].1.iter_mut().zip(&folded).zip(&folded_under)
-                {
-                    if let Some(w) = f.filter {
-                        if truth(&eval(w, &row, &frame, &none)?)? != Some(true) {
-                            continue;
-                        }
-                    }
-                    if !f.direct.is_empty() {
-                        acc.direct(
-                            f.direct
-                                .iter()
-                                .map(|x| eval(x, &row, &frame, &none))
-                                .collect::<Result<_>>()?,
-                        );
-                    }
-                    let values: Vec<Value> = f
-                        .args
-                        .iter()
-                        .map(|x| eval(x, &row, &frame, &none))
-                        .collect::<Result<_>>()?;
-                    if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
-                        return Err(Error::new(e.clone()));
-                    }
-                    if acc.keeps_rows() {
-                        self.kept.more(super::spill::row_width(&values));
-                    }
-                    acc.add_row(values, u)?;
-                }
-            }
+            self.groups.fold(&self.p, rel.rows, &frame)?;
             self.columns = frame.columns;
             return Ok(None);
         }
         // Rows that come in its windows' order are folded a partition at a time.
         if self.along_partitions {
             let by = windows::shared_partition(&self.p.calls.windows);
+            let mut made = Vec::new();
             for row in rel.rows {
                 let k = partition_key(by, &row, &frame)?;
                 if self.partition.as_ref() != Some(&k) && !self.partition_rows.is_empty() {
                     let rows = std::mem::take(&mut self.partition_rows);
-                    fold_partition(&self.p, rows, &frame, &mut self.partitions_out)?;
+                    fold_partition(&self.p, rows, &frame, &mut made)?;
                     self.partition_held = crate::room::holding(0);
                 }
                 self.partition = Some(k);
                 self.partition_held.more(super::spill::row_width(&row));
                 self.partition_rows.push(row);
             }
+            let handed = self.going.take(&self.p, casings, made)?;
+            let names = self.names();
             self.columns = frame.columns;
+            if self.hands_on {
+                return Ok(Some(Relation {
+                    names,
+                    rows: truncated(handed, self.p.items.len()),
+                    order: None,
+                }));
+            }
+            self.partitions_out.extend(handed);
             return Ok(None);
         }
         // A window on another order than the one the rows come in reads them whole.
@@ -6262,25 +6358,16 @@ impl<'q> StepRun<'q> {
             return Ok(None);
         }
         let per_row = windows(&self.p.calls.windows, &rel, &frame, &mut self.running)?;
-        let mut out = Relation {
-            names: self.names(),
-            rows: Vec::with_capacity(rel.rows.len()),
-            order: None,
-        };
+        let mut rows = Vec::with_capacity(rel.rows.len());
         for (row, w) in rel.rows.iter().zip(per_row) {
             let computed = Computed {
                 calls: w,
                 _q: std::marker::PhantomData,
             };
-            out.rows.extend(self.p.project(row, &frame, computed)?);
-        }
-        if self.p.distinct {
-            let seen = &mut self.seen;
-            out.rows
-                .retain(|r| seen.insert(r.iter().map(key).collect()));
+            rows.extend(self.p.project(row, &frame, computed)?);
         }
         // The order holds where an item is the column that held it, and no set repeats a row.
-        out.order = rel
+        let order = rel
             .order
             .filter(|_| self.p.calls.sets.is_empty())
             .and_then(|o| {
@@ -6288,109 +6375,123 @@ impl<'q> StepRun<'q> {
                     column_of(e).is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
                 })
             });
+        let names = self.names();
+        // Rows that come in its ORDER BY's order need no sort: what its LIMIT keeps goes on.
+        if self.along_order {
+            let keys = match self.p.limit.as_ref().is_some_and(|l| l.ties) {
+                true => {
+                    let under = sorted::sort_under(&self.p, casings)?;
+                    rows.iter()
+                        .map(|r| sorted::sort_key(r, &self.p.sorted, &under))
+                        .collect::<Result<Vec<_>>>()?
+                }
+                false => Vec::new(),
+            };
+            if self.cut.is_none() {
+                if let Some(l) = &self.p.limit {
+                    self.cut = Some(sorted::Cut::of(l, &frame)?);
+                }
+            }
+            if let Some(c) = &mut self.cut {
+                rows = c.take(rows, &keys);
+            }
+        }
+        let was_sorting = self.going.sorts;
+        if self.along_order {
+            self.going.sorts = false;
+        }
+        let rows = self.going.take(&self.p, casings, rows)?;
+        self.going.sorts = was_sorting;
         self.columns = frame.columns;
-        if self.p.order_by.is_some() || self.p.limit.is_some() {
-            self.rows.extend(out.rows);
+        if self.going.sorts && !self.along_order {
             return Ok(None);
         }
-        Ok(Some(out))
+        if self.p.distinct && !self.hands_on {
+            self.partitions_out.extend(rows);
+            return Ok(None);
+        }
+        Ok(Some(Relation {
+            names,
+            rows: truncated(rows, self.p.items.len()),
+            order: order.filter(|_| !self.p.distinct || self.going.seen_past.is_none()),
+        }))
     }
 
-    /// The rows a step that groups or sorts returns, once every chunk is read.
-    pub(super) fn finish(
+    /// The rows a step that groups or sorts returns, once every chunk is read, handed to `each` as
+    /// they are made: its columns' names, and the column holding the table's order where they keep it.
+    pub(super) fn finish_each(
         mut self,
         params: &[String],
         release: u8,
         casings: &Casings,
-    ) -> Result<Relation> {
-        let mut out = Relation {
-            names: self.names(),
-            rows: std::mem::take(&mut self.rows),
-            order: None,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<(Vec<String>, Option<usize>)> {
+        let names = self.names();
+        let width = self.p.items.len();
+        let mut order_out = None;
+        let frame = Frame {
+            columns: std::mem::take(&mut self.columns),
+            params,
+            release,
+            casings,
+            types: &self.p.types,
+            now: self.p.now,
+            subqueries: self.subqueries,
         };
-        if self.p.grouped {
-            if self.groups.is_empty() && self.p.grouping.is_empty() {
-                let accs = self.fresh()?;
+        if !self.partitions_out.is_empty() {
+            each(truncated(
+                std::mem::take(&mut self.partitions_out),
+                width,
+            ))?;
+        }
+        let p = &self.p;
+        let going = &mut self.going;
+        let along_order = self.along_order;
+        let mut emit = |rows: Vec<Vec<Value>>,
+                        going: &mut Going|
+         -> Result<()> {
+            let sorts = going.sorts && !along_order;
+            let saved = going.sorts;
+            going.sorts = sorts;
+            let rows = going.take(p, casings, rows);
+            going.sorts = saved;
+            let rows = rows?;
+            if !rows.is_empty() {
+                each(truncated(rows, width))?;
+            }
+            Ok(())
+        };
+        if p.grouped {
+            if self.groups.list.is_empty() && p.grouping.is_empty() {
                 let row = self
                     .empty_row
                     .take()
-                    .unwrap_or_else(|| vec![Value::Null; self.columns.len()]);
-                self.groups.push((row, accs));
+                    .unwrap_or_else(|| vec![Value::Null; frame.columns.len()]);
+                self.groups.list.push((row, Groups::fresh(p)?));
             }
-            let frame = Frame {
-                columns: std::mem::take(&mut self.columns),
-                params,
-                release,
-                casings,
-                types: &self.p.types,
-                now: self.p.now,
-                subqueries: self.subqueries,
-            };
-            for (first, accs) in &self.groups {
-                let computed = Computed {
-                    calls: self
-                        .p
-                        .calls
-                        .aggregates
-                        .iter()
-                        .zip(accs)
-                        .map(|(&c, a)| {
-                            // A direct argument is read once a group, from no row where none came.
-                            let (_, f) = Acc::of(c, &self.p.types)?;
-                            if f.direct.is_empty() {
-                                return Ok((c as *const Expr, a.value()?));
-                            }
-                            let mut a = a.clone();
-                            a.direct(
-                                f.direct
-                                    .iter()
-                                    .map(|x| eval(x, first, &frame, &computed_none()))
-                                    .collect::<Result<_>>()?,
-                            );
-                            Ok((c as *const Expr, a.value()?))
-                        })
-                        .collect::<Result<_>>()?,
-                    _q: std::marker::PhantomData,
+            loop {
+                self.groups.project(p, &frame, &mut |rows| emit(rows, going))?;
+                let Some(past) = self.groups.past.take() else {
+                    break;
                 };
-                if let Some(h) = self.p.having {
-                    if truth(&eval(h, first, &frame, &computed)?)? != Some(true) {
-                        continue;
-                    }
-                }
-                out.rows.extend(self.p.project(first, &frame, computed)?);
+                past.seal()?;
+                let groups = &mut self.groups;
+                past.each_chunk(&mut |c| groups.fold(p, c, &frame))?;
             }
         }
         if self.along_partitions {
-            let frame = Frame {
-                columns: std::mem::take(&mut self.columns),
-                params,
-                release,
-                casings,
-                types: &self.p.types,
-                now: self.p.now,
-                subqueries: self.subqueries,
-            };
             let rows = std::mem::take(&mut self.partition_rows);
-            fold_partition(&self.p, rows, &frame, &mut self.partitions_out)?;
+            let mut made = Vec::new();
+            fold_partition(p, rows, &frame, &mut made)?;
             self.partition_held = crate::room::holding(0);
-            out.rows.extend(std::mem::take(&mut self.partitions_out));
-        } else if self.p.whole_windows {
-            let frame = Frame {
-                columns: std::mem::take(&mut self.columns),
-                params,
-                release,
-                casings,
-                types: &self.p.types,
-                now: self.p.now,
-                subqueries: self.subqueries,
-            };
+            emit(made, going)?;
+        } else if p.whole_windows {
             let held = std::mem::replace(&mut self.held, parted::Parted::new());
-            let by = windows::shared_partition(&self.p.calls.windows);
+            let by = windows::shared_partition(&p.calls.windows);
             let mut order = None;
-            let p = &self.p;
-            let rows = &mut out.rows;
             held.finish(&|r| parted::partition_hash(by, r, &frame), &mut |rel| {
                 let per_row = windows::values(&p.calls.windows, &rel, &frame)?;
+                let mut rows = Vec::with_capacity(rel.rows.len());
                 for (row, w) in rel.rows.iter().zip(per_row) {
                     let computed = Computed {
                         calls: w,
@@ -6399,150 +6500,70 @@ impl<'q> StepRun<'q> {
                     rows.extend(p.project(row, &frame, computed)?);
                 }
                 order = rel.order;
-                Ok(())
+                emit(rows, going)
             })?;
-            out.order = order
-                .filter(|_| self.p.calls.sets.is_empty())
+            order_out = order
+                .filter(|_| p.calls.sets.is_empty() && p.order_by.is_none())
                 .and_then(|o| {
-                    self.p.items.iter().position(|(e, _)| {
+                    p.items.iter().position(|(e, _)| {
                         column_of(e)
                             .is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
                     })
                 });
         }
-        if self.p.grouped || self.p.whole_windows || self.along_partitions {
-            out.rows = self.once(std::mem::take(&mut out.rows));
+        // Each pass of the DISTINCT rows past the room.
+        while let Some(past) = going.seen_past.take() {
+            past.seal()?;
+            going.seen.clear();
+            going.closed = false;
+            going.seen_held = crate::room::holding(0);
+            past.each_chunk(&mut |c| emit(c, going))?;
         }
-        let keys = match self.p.order_by {
-            Some(ob) => sort(&mut out, ob, &self.p, casings)?,
-            None => Vec::new(),
-        };
-        if let Some(l) = &self.p.limit {
-            let frame = Frame {
-                columns: Vec::new(),
-                params,
-                release,
-                casings,
-                types: &self.p.types,
-                now: self.p.now,
-                subqueries: self.subqueries,
+        if going.sorts && !along_order {
+            let sorter = match going.sorter.take() {
+                Some(s) => s,
+                None => sorted::Sorter::new(p, casings)?,
             };
-            l.cut(&mut out.rows, &keys, &frame)?;
+            let mut cut = match &p.limit {
+                Some(l) => Some(sorted::Cut::of(l, &frame)?),
+                None => None,
+            };
+            sorter.finish(&mut |rows, keys| {
+                let rows = match &mut cut {
+                    Some(c) => c.take(rows, &keys),
+                    None => rows,
+                };
+                if !rows.is_empty() {
+                    each(truncated(rows, width))?;
+                }
+                Ok(())
+            })?;
         }
-        // The ORDER BY's own expressions go once the rows are sorted and cut.
-        for r in &mut out.rows {
-            r.truncate(self.p.items.len());
-        }
-        Ok(out)
+        Ok((names, order_out))
+    }
+
+    /// The rows a step that groups or sorts returns, once every chunk is read.
+    pub(super) fn finish(
+        self,
+        params: &[String],
+        release: u8,
+        casings: &Casings,
+    ) -> Result<Relation> {
+        let mut rows = Vec::new();
+        let (names, order) = self.finish_each(params, release, casings, &mut |c| {
+            rows.extend(c);
+            Ok(())
+        })?;
+        Ok(Relation { names, rows, order })
     }
 }
 
-/// A step's rows sorted as its ORDER BY says, by the values `Prepared::sorted` places: its own
-/// columns, each carrying its collation, and the expressions it makes beside them. The values
-/// each row was sorted by, in their order.
-fn sort(
-    out: &mut Relation,
-    ob: &sqlparser::ast::OrderBy,
-    p: &Prepared,
-    casings: &Casings,
-) -> Result<Vec<Vec<Value>>> {
-    let exprs = match &ob.kind {
-        OrderByKind::Expressions(e) => e,
-        _ => return Err(Error::new("ORDER BY ALL is not read")),
-    };
-    // A string sorted under a library collation is sorted by the collation's key: a column's by
-    // the collation it carries, an expression's by its own.
-    let under = p
-        .sorted
-        .iter()
-        .map(|&at| match p.carried.get(at) {
-            Some(c) => casings.carried(c),
-            None => casings.keyed(p.hidden[at - p.items.len()]),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = std::mem::take(&mut out.rows)
-        .into_iter()
-        .map(|row| {
-            let k = p
-                .sorted
-                .iter()
-                .enumerate()
-                .map(|(i, &at)| {
-                    let v = row[at].clone();
-                    match v {
-                        Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
-                            if !ty.ordered() =>
-                        {
-                            Err(Error::new(format!(
-                                "could not identify an ordering operator for type {}",
-                                ty.pg_name()
-                            )))
-                        }
-                        Value::Geometric(g) => Err(Error::new(format!(
-                            "could not identify an ordering operator for type {}",
-                            g.kind().name()
-                        ))),
-                        v => Ok(match (under[i], v.string_key()) {
-                            (Some(Casing::Library(id)), Some(s)) => {
-                                Value::Bytes(crate::collations::get(id).key(s))
-                            }
-                            _ => v,
-                        }),
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok((k, row))
-        })
-        .collect::<Result<_>>()?;
-    let mut failed = None;
-    keyed.sort_by(|a, b| {
-        for (i, o) in exprs.iter().enumerate() {
-            let desc = matches!(o.options.sort, Some(OrderBySort::Desc));
-            let nulls_first = o.options.nulls_first.unwrap_or(desc);
-            let ord = match (a.0[i].is_null(), b.0[i].is_null()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => {
-                    if nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (false, true) => {
-                    if nulls_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (false, false) => match compare(&a.0[i], &b.0[i]) {
-                    Ok(Some(o)) => {
-                        if desc {
-                            o.reverse()
-                        } else {
-                            o
-                        }
-                    }
-                    Ok(None) => Ordering::Equal,
-                    Err(e) => {
-                        failed.get_or_insert(e);
-                        Ordering::Equal
-                    }
-                },
-            };
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        Ordering::Equal
-    });
-    if let Some(e) = failed {
-        return Err(e);
+/// Rows with the ORDER BY's own expressions gone, now they are sorted and cut.
+fn truncated(mut rows: Vec<Vec<Value>>, width: usize) -> Vec<Vec<Value>> {
+    for r in &mut rows {
+        r.truncate(width);
     }
-    let (keys, rows) = keyed.into_iter().unzip();
-    out.rows = rows;
-    out.order = None;
-    Ok(keys)
+    rows
 }
 
 /// One SELECT read whole, over the steps before it and the table.
@@ -6768,7 +6789,12 @@ impl<'q> Stream<'q> {
                 }
                 Kind::After
             } else if !streamed.is_empty() {
-                if p.grouped || p.order_by.is_some() || p.whole_windows || p.limit.is_some() {
+                if p.grouped
+                    || p.order_by.is_some()
+                    || p.whole_windows
+                    || p.limit.is_some()
+                    || p.distinct
+                {
                     Kind::Folded
                 } else {
                     Kind::Streamed
@@ -6818,6 +6844,12 @@ impl<'q> Stream<'q> {
         }
     }
 
+    /// Whether a step read once every row has come reads the rows of a step or of the table, held
+    /// until it is: for the pipeline over several relations, whose steps lie in the round's room.
+    pub fn holds_steps(&self) -> bool {
+        self.kept.keys().any(|n| !n.is_empty())
+    }
+
     /// The most rows the stream held at once as the rows came.
     pub fn most_held(&self) -> usize {
         self.most
@@ -6859,8 +6891,9 @@ impl<'q> Stream<'q> {
                 .iter()
                 .flatten()
                 .map(|r| {
-                    r.groups.len()
-                        + r.rows.len()
+                    r.groups.list.len()
+                        + r.going.sorter.as_ref().map_or(0, |s| s.held())
+                        + r.partitions_out.len()
                         + r.running.values().map(HashMap::len).sum::<usize>()
                 })
                 .sum::<usize>();
