@@ -989,6 +989,21 @@ fn a_table_clustered_on_the_plane_takes_statements_as_any_order_does() {
     )
     .unwrap();
     let mut w = Snail::open_writing(&path).unwrap();
+    // A row past every point lands in the last block of the table's own order.
+    let rows_of = |w: &Snail| -> Vec<u64> {
+        w.blocks()
+            .unwrap()
+            .iter()
+            .filter(|r| r.order == "t_v" && r.column == "v.x")
+            .map(|r| r.rows)
+            .collect()
+    };
+    let before = rows_of(&w);
+    run(&mut w, "INSERT INTO s.t VALUES (8000, '(6000,6000)')");
+    let mut grown = before.clone();
+    *grown.last_mut().unwrap() += 1;
+    assert_eq!(rows_of(&w), grown);
+    run(&mut w, "DELETE FROM s.t WHERE id = 8000");
     run(&mut w, "UPDATE s.t SET v = '(5000,5000)' WHERE id = 0");
     run(&mut w, "DELETE FROM s.t WHERE id = 3");
     run(
@@ -1276,7 +1291,7 @@ fn at_serializable_a_read_along_the_plane_meets_a_row_written_into_a_block_it_ru
     assert_eq!(ids(&mut b, &inside(9100), "t_p"), Vec::<i64>::new());
     run(
         &mut a,
-        "INSERT INTO s.t (id, p) VALUES (9000, '(9100,9100)')",
+        "INSERT INTO s.t (id, p) VALUES (-5000, '(9100,9100)')",
     );
     run(
         &mut b,
