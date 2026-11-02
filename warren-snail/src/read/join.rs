@@ -324,6 +324,25 @@ impl Snail {
     }
 }
 
+/// What a round says where a table it would hold in memory may not fit the room: the pipeline over
+/// several relations reads the question, its rows lying in the room and past it written.
+const PAST_THE_ROOM: &str = "a join's rows lie past the round's room";
+
+thread_local! {
+    /// The reads of a round that stopped so, for the round that takes it up.
+    static STOPPED: std::cell::RefCell<Option<Round>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether a round stopped for its room.
+pub(super) fn past_the_room(e: &crate::Error) -> bool {
+    e.0 == PAST_THE_ROOM
+}
+
+/// The reads of the round that stopped for its room.
+pub(super) fn stopped_reads() -> Option<Round> {
+    STOPPED.with(|s| s.borrow_mut().take())
+}
+
 /// A question on several tables, each read from the snail that holds it: `at` names, for each of
 /// the question's tables, its snail among `snails` and its place among that snail's tables. One
 /// round, each snail's part of it in the round's `snails` where there is more than one.
@@ -331,6 +350,17 @@ pub(super) fn ask_join_across(
     snails: &[&Snail],
     at: &[(usize, usize)],
     q: &Question,
+) -> Result<(RecordBatch, Round)> {
+    ask_join_within(snails, at, q, true)
+}
+
+/// The same, where `may_stop`, stopped by name before a table it would hold that its counts say may
+/// not fit the round's room.
+pub(super) fn ask_join_within(
+    snails: &[&Snail],
+    at: &[(usize, usize)],
+    q: &Question,
+    may_stop: bool,
 ) -> Result<(RecordBatch, Round)> {
     let n = q.sides.len();
     let tables: Vec<&Table> = at
@@ -367,6 +397,7 @@ pub(super) fn ask_join_across(
         .map(|s| (s.walked.get(), s.taken.get()))
         .collect();
     let mut answer = Answer::new(&q.select).typed(&tables);
+    let mut sides_held = crate::room::holding(0);
     for (i, &side) in order.iter().enumerate() {
         let (at_snail, _) = at[side];
         let snail = snails[at_snail];
@@ -408,6 +439,20 @@ pub(super) fn ask_join_across(
         let mut mine = Round::default();
         let (before, held_before) = (snail.touched(), snail.pages_held());
         let part = snail.part(&want, None)?;
+        let width: u64 = columns
+            .iter()
+            .map(|c| super::strands::held_width(table.columns[c.0].ty))
+            .sum();
+        if may_stop && !streamed {
+            let free = crate::room::current().map_or(u64::MAX, |r| r.free_bytes());
+            if part.rows.1.saturating_mul(width) > free {
+                if snails.len() > 1 {
+                    round.snails = parts;
+                }
+                STOPPED.with(|s| *s.borrow_mut() = Some(round));
+                return Err(crate::Error::new(PAST_THE_ROOM));
+            }
+        }
         mine.directory_pages = snail.touched() - before;
         mine.directory_pages_held = snail.pages_held() - held_before;
         mine.column_pages_held = snail.reader.keep_for_round(part.plan.disk_pages());
@@ -458,6 +503,7 @@ pub(super) fn ask_join_across(
                 probe: Vec::new(),
             };
             snail.read_plan(&part.plan, &want, &columns, &mut sink)?;
+            sides_held.more(held.cells.len() as u64 * width);
             t.held[side] = held;
         }
         snail.reader.read_done();

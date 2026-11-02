@@ -3,7 +3,7 @@
 //! hold, and priced from their directories alone, no column page read.
 
 use super::across::{carried_root, Snails};
-use super::join::{ask_join_across, core_of, needed_of, read_order, reading};
+use super::join::{ask_join_within, core_of, needed_of, read_order, reading};
 use super::question;
 use super::walk::Want;
 use super::{Round, Snail};
@@ -101,7 +101,7 @@ pub fn answer_together(snails: &[&Snail], sql: &str) -> Result<(RecordBatch, Rou
     read.dedup();
     match read.as_slice() {
         [one] => snails[*one].answer(sql, None),
-        _ => ask_join_across(snails, &at, &q),
+        _ => ask_join_within(snails, &at, &q, false),
     }
 }
 

@@ -12,7 +12,7 @@ use sqlparser::ast::{Expr, GroupByExpr, OrderBySort, Query, SelectItem, SetExpr,
 
 /// The bytes a value of a column is held at, at least: a fixed type's as the spill writes it, any
 /// other's its length's.
-fn held_width(ty: ColumnType) -> u64 {
+pub(super) fn held_width(ty: ColumnType) -> u64 {
     match ty {
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 | ColumnType::Timestamptz => 9,
         ColumnType::Float8 => 9,

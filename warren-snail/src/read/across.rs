@@ -10,7 +10,7 @@
 //! beside its root. A round across them takes a pending copy the deciding root names as written;
 //! one open to write writes it, and lets go of one the deciding root never came to name.
 
-use super::question::{self, Question};
+use super::question;
 use super::statement::{self, Statement};
 use super::{join, Done, Round, Snail};
 use crate::catalog::Catalog;
@@ -716,16 +716,22 @@ impl Snails {
             [i] => self.snails[*i].answer_with(sql, None, params)?,
             _ => {
                 let refs: Vec<&Snail> = self.snails.iter().collect();
-                match question::parse(&self.catalog, sql) {
+                let parsed = question::parse(&self.catalog, sql);
+                let first = match &parsed {
                     Ok(q) if params.is_empty() => {
-                        let q: Question = q;
                         let at: Vec<(usize, usize)> =
                             q.sides.iter().map(|s| self.at[s.table]).collect();
-                        join::ask_join_across(&refs, &at, &q)?
+                        Some(join::ask_join_across(&refs, &at, q))
                     }
-                    // What the question path does not read, a pipeline over the snails' relations
-                    // reads.
-                    read => {
+                    _ => None,
+                };
+                match first {
+                    Some(Err(e)) if !join::past_the_room(&e) => return Err(e),
+                    Some(Ok(done)) => done,
+                    // What the question path does not read, and a join past the round's room, a
+                    // pipeline over the snails' relations reads.
+                    _ => {
+                        let read = parsed;
                         let sql = &*super::spelled::spelled(sql)?;
                         let parsed = sqlparser::parser::Parser::parse_sql(
                             &sqlparser::dialect::PostgreSqlDialect {},

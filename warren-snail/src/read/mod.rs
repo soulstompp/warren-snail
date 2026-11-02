@@ -1320,7 +1320,12 @@ impl Snail {
         match q.sides.len() {
             1 => self.ask_one(&q, order),
             _ if order.is_some() => Err(Error::new("a join chooses its orders itself")),
-            _ => self.ask_join(&q),
+            _ => match (self.ask_join(&q), parsed.as_slice()) {
+                (Err(e), [sqlparser::ast::Statement::Query(q)]) if join::past_the_room(&e) => {
+                    self.ask_pipeline(q, params)
+                }
+                (r, _) => r,
+            },
         }
     }
 

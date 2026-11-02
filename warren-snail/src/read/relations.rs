@@ -1832,7 +1832,15 @@ impl Reading<'_> {
             Ok(q) => q,
             Err(_) => return Ok(None),
         };
-        let (batch, round) = self.reads.read(&q, None)?;
+        let (batch, round) = match self.reads.read(&q, None) {
+            Err(e) if super::join::past_the_room(&e) => {
+                if let Some(r) = super::join::stopped_reads() {
+                    self.accrued.add(&r);
+                }
+                return Ok(None);
+            }
+            read => read?,
+        };
         self.accrued.add(&round);
         let rel = pipeline::relation_of(&batch)?;
         let mut rows = Vec::with_capacity(rel.rows.len());
@@ -2729,6 +2737,9 @@ pub(super) fn answer(
             }
         ]),
     };
+    if let Some(r) = super::join::stopped_reads() {
+        accrued.add(&r);
+    }
     let (last, held) = made_by(asked, q, &Steps::new(), &casings, None, &accrued)?;
     let batch = pipeline::batch_of(&last.rel)?;
     let mut round = accrued.round.into_inner();

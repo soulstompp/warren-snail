@@ -805,6 +805,29 @@ fn a_grouping_and_a_distinct_past_the_room_write_the_rows_of_groups_none_has_com
     }
 }
 
+#[test]
+fn a_join_of_tables_whose_counts_may_not_fit_the_room_is_met_as_rows_in_it() {
+    let path = owned("c1");
+    let dir = spill_dir("c1");
+    // The first side read is held: all 16,384 purchases, at 9 bytes the id.
+    let q = "SELECT sum(p.id) FROM s.p p JOIN s.p q ON q.id = p.id";
+    let want = PURCHASES * (PURCHASES - 1) / 2;
+    // With room for it, one round of the question path, no read of its own.
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(q, None).unwrap();
+    assert_eq!(one(&b), want);
+    assert!(round.reads.is_empty(), "{round:?}");
+    assert_eq!(round.spill_pages_written, 0);
+    // In 32 KiB they are met by the pipeline, each read exact.
+    let room = 32 << 10;
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    each_read_exact(q, &round);
+    assert_eq!(one(&b), want);
+    assert!(round.bytes_held <= room + one_chunk(&path, 27), "{q}: {round:?}");
+}
+
 /// Purchases, beside a table of their 512 owners.
 fn owned(name: &str) -> PathBuf {
     let path = tmp(&format!("rounds-{name}.snail"));
