@@ -2832,6 +2832,7 @@ fn plane_cond(
         name: column,
         op: seen.unwrap_or_default().to_string(),
         probe: seen.map(|_| crate::spans::Probe::Plane(kind, value)),
+        value: None,
     }))
 }
 
