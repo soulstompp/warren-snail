@@ -1242,7 +1242,11 @@ impl Snail {
             if let Some(arm) = &o.arms {
                 if let Some((ask, index)) = self.arm_ask(want, arm, named, side, &mut probes)? {
                     let x = self.asking(&ask, &probes)?;
-                    children.push((ask, x, index.join("+"), None));
+                    let name = match index.is_empty() {
+                        true => table.orders[0].name.clone(),
+                        false => index.join("+"),
+                    };
+                    children.push((ask, x, name, None));
                 }
                 continue;
             }

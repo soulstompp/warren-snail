@@ -1768,6 +1768,7 @@ fn a_path_nothing_can_be_asked_from_reads_the_table_s_order() {
     // A jsonb has no `@@` with its path on its left, nor `@?` either way round.
     for w in [
         "'$.b == 100' @@ j",
+        "'$.absent == 100' @@ j",
         "'$.b == 100' @? j",
         "j @? 1",
         "j @@ '$.b ++'",
@@ -3032,6 +3033,11 @@ fn an_or_reads_an_arm_an_order_answers_as_postgresql_s_bitmap_or_would() {
         [("t_a".to_string(), 2), ("t_pkey".to_string(), 6)],
         "{q}"
     );
+    // Every arm read along the table's own order: named by it.
+    let q = "SELECT id FROM s.t WHERE id < 5 OR (id > 100 AND id < 120 AND NOT a @> '{3}')";
+    let (got, _) = ids(&mut s, q, None);
+    assert_eq!(got, kept(&|i| i < 5 || (i > 100 && i < 120 && i % 7 != 3)));
+    assert_eq!(s.price(q, None).unwrap().order, "t_pkey+t_pkey");
     let price = s
         .price("SELECT id FROM s.t WHERE a @> '{2005}' OR id < 50", None)
         .unwrap();
@@ -3127,7 +3133,7 @@ fn an_or_on_a_table_an_outer_join_leaves_null_keeps_the_rows_it_leaves() {
 
 #[test]
 fn a_condition_on_the_table_s_own_order_is_read_with_it_not_before_it() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], r int4range, pad bigint); \
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], r int4range, p1 bigint, p2 bigint, p3 bigint); \
                CREATE INDEX t_r ON s.t USING gist (r); \
                ALTER TABLE s.t CLUSTER ON t_r; \
                CREATE INDEX t_a ON s.t USING gin (a);";
@@ -3138,19 +3144,19 @@ fn a_condition_on_the_table_s_own_order_is_read_with_it_not_before_it() {
             Some(format!("{{{},{}}}", i % 7, 2000 + i / 256)),
             Some(format!("[{i},{})", i + 3)),
             Some(i.to_string()),
+            Some(i.to_string()),
+            Some(i.to_string()),
         ]
     });
-    let q = "SELECT id FROM s.t WHERE a @> '{2005}' AND r && '[1200,1500)'";
+    let q = "SELECT id, p1, p2, p3 FROM s.t WHERE a @> '{3}' AND r && '[1200,1210)'";
     let (got, round) = ids(&mut s, q, None);
     let want: Vec<i32> = (0..n)
-        .filter(|&i| i / 256 == 5 && i < 1500 && i + 3 > 1200)
+        .filter(|&i| i % 7 == 3 && i < 1210 && i + 3 > 1200)
         .map(|i| i as i32)
         .collect();
-    assert_eq!(got.len(), want.len());
-    assert!(
-        round.reads.iter().filter(|r| r.order == "t_r").count() <= 1,
-        "{round:?}"
-    );
+    assert_eq!(got, want);
+    assert_eq!(round.order, "t_r", "{round:?}");
+    assert!(round.reads.is_empty(), "{round:?}");
 }
 
 #[test]
