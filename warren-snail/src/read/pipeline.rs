@@ -2217,12 +2217,12 @@ fn concat_is_text(
     };
     let literal = |e: &Expr| super::typed::untyped(e).is_some();
     match (literal(left), literal(right)) {
-        (true, true) => true,
         (true, false) => !own(y, typed[1]),
         (false, true) => !own(x, typed[0]),
         (false, false) => {
             string(x, typed[0]) && !array(y, typed[1]) || string(y, typed[1]) && !array(x, typed[0])
         }
+        _ => true,
     }
 }
 
