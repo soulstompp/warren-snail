@@ -3468,6 +3468,10 @@ pub fn resolve(dt: &sqlparser::ast::DataType) -> Option<ColumnType> {
             if let Some(t) = built_in(&n) {
                 return Some(t);
             }
+            // A built-in type's name is the built-in type, as PostgreSQL searches pg_catalog first.
+            if crate::catalog::held_type(dt).is_ok_and(|t| !matches!(t, ColumnType::Composed(_))) {
+                return None;
+            }
             if let Some(t) = crate::read::handed::table_row(&n) {
                 return Some(t);
             }

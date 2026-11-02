@@ -754,3 +754,35 @@ fn jsonb_populate_record_is_refused_in_postgresql_s_words() {
         assert_eq!(refused(&mut s, q), e, "{q}");
     }
 }
+
+#[test]
+fn a_built_in_type_s_name_casts_to_the_built_in_type_beside_a_table_of_that_name() {
+    // Tables named as oid, money and inet are: a cast names the built-in type, as PostgreSQL finds
+    // pg_catalog's first, and a table's row type only where no built-in type has its name; money
+    // answers its count of cents.
+    let path = tmp("handed-built-in-names.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.oid (id integer NOT NULL, PRIMARY KEY (id));
+         CREATE TABLE s.money (id integer NOT NULL, PRIMARY KEY (id));
+         CREATE TABLE s.inet (id integer NOT NULL, PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let rows = |t: &str| {
+        (
+            t.to_string(),
+            Rows {
+                columns: vec![int(&[7])],
+            },
+        )
+    };
+    write(&path, &catalog, &[rows("s.oid"), rows("s.money"), rows("s.inet")]).unwrap();
+    let mut snail = fresh(&path);
+    for (q, want) in [
+        ("WITH t AS (SELECT id FROM s.oid) SELECT CAST(id AS oid) AS x FROM t", "7"),
+        ("WITH t AS (SELECT id FROM s.money) SELECT CAST(7.5 AS money) AS x FROM t", "750"),
+        ("WITH t AS (SELECT id FROM s.inet) SELECT CAST('10.0.0.7' AS inet) AS x FROM t", "10.0.0.7"),
+    ] {
+        let (b, _) = snail.ask(q, None).unwrap();
+        assert_eq!(array_value_to_string(b.column(0), 0).unwrap(), want, "{q}");
+    }
+}
