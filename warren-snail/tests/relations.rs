@@ -554,6 +554,36 @@ fn several_snails_relations_meet_as_one_snail_s_do() {
 }
 
 #[test]
+fn a_scalar_function_s_alias_reads_its_column_under_any_name_the_column_has() {
+    let path = snail("alias");
+    same(
+        &path,
+        "SELECT x FROM unnest(ARRAY[3, 1]) x (n)",
+        &["3", "1"],
+    );
+    same(
+        &path,
+        "SELECT n FROM unnest(ARRAY[3, 1]) x (n)",
+        &["3", "1"],
+    );
+    same(
+        &path,
+        "SELECT x.n FROM unnest(ARRAY[3, 1]) x (n)",
+        &["3", "1"],
+    );
+    // A function that names its column itself.
+    same(
+        &path,
+        "SELECT v FROM jsonb_array_elements_text('[3, 1]') v",
+        &["3", "1"],
+    );
+    assert_eq!(
+        refused(&path, "SELECT y FROM unnest(ARRAY[3, 1]) x (n)"),
+        "column \"y\" does not exist"
+    );
+}
+
+#[test]
 fn a_function_in_from_makes_rows_for_each_row_before_it() {
     let path = snail("calls");
     // A bare reference to a function returning a scalar reads its one column.
