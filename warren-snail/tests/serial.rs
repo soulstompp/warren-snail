@@ -451,8 +451,14 @@ impl Rows2 {
     }
 }
 
+/// What a read answered: a block's sum and count; none for a statement that reads nothing of its own.
+type Answered = Option<(i64, i64)>;
+
+/// Whether a transaction committed, and what each of its statements answered.
+type Ran = (bool, Vec<Answered>);
+
 /// What one step of a transaction came to: its read's answer, or none, or the words of its failure.
-type Came = Result<Option<(i64, i64)>, String>;
+type Came = Result<Answered, String>;
 
 /// A transaction on a thread of its own: statements in, outcomes out.
 fn transaction(path: PathBuf) -> (Sender<String>, Receiver<Came>) {
@@ -470,9 +476,10 @@ fn transaction(path: PathBuf) -> (Sender<String>, Receiver<Came>) {
                                 .as_any()
                                 .downcast_ref::<arrow::array::Int64Array>()
                                 .expect("a sum or a count");
-                            arrow::array::Array::is_valid(a, 0)
-                                .then(|| a.value(0))
-                                .unwrap_or(0)
+                            match arrow::array::Array::is_valid(a, 0) {
+                                true => a.value(0),
+                                false => 0,
+                            }
                         };
                         Some((column(0), column(1)))
                     })
@@ -507,12 +514,12 @@ fn run_interleaving(
     transactions: &[Vec<Step>],
     order: &[u8],
     level: &str,
-) -> (Vec<(bool, Vec<Option<(i64, i64)>>)>, [(i64, i64); 2]) {
+) -> (Vec<Ran>, [(i64, i64); 2]) {
     std::fs::copy(base, at).unwrap();
     let seen = std::fs::File::open(at).unwrap();
     let n = transactions.len();
     let sessions: Vec<_> = (0..n).map(|_| transaction(at.to_path_buf())).collect();
-    let mut answers: Vec<Vec<Option<(i64, i64)>>> = vec![Vec::new(); n];
+    let mut answers: Vec<Vec<Answered>> = vec![Vec::new(); n];
     let mut failed = vec![false; n];
     let mut committed = vec![false; n];
     let mut next = vec![0; n];
@@ -522,7 +529,7 @@ fn run_interleaving(
         assert!(s.1.recv().unwrap().is_ok());
     }
     let settle = |pending: &mut Vec<Vec<usize>>,
-                  answers: &mut Vec<Vec<Option<(i64, i64)>>>,
+                  answers: &mut Vec<Vec<Answered>>,
                   failed: &mut Vec<bool>,
                   committed: &mut Vec<bool>,
                   to_the_end: bool| {
@@ -614,11 +621,7 @@ fn run_interleaving(
 
 /// Whether the committed transactions, in some serial order, answer as they answered and leave the
 /// rows as they stand.
-fn some_serial_order(
-    transactions: &[Vec<Step>],
-    ran: &[(bool, Vec<Option<(i64, i64)>>)],
-    rows: [(i64, i64); 2],
-) -> bool {
+fn some_serial_order(transactions: &[Vec<Step>], ran: &[Ran], rows: [(i64, i64); 2]) -> bool {
     fn orders(items: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
         if k == items.len() {
             out.push(items.clone());
@@ -1650,4 +1653,45 @@ fn a_block_a_prune_lets_go_leaves_its_mark_on_the_order() {
         reason(&a.execute("COMMIT").unwrap_err()),
         "Canceled on identification as a pivot, during commit attempt."
     );
+}
+
+#[test]
+fn deferrable_takes_its_new_snapshot_as_soon_as_one_shows_it_unsafe() {
+    let path = made("unsafe-at-once");
+    let (mut p, mut out, mut y) = (open(&path), open(&path), open(&path));
+    run(
+        &mut y,
+        "CREATE TABLE s.o (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&mut y, "INSERT INTO s.o (id, v) VALUES (1, 1)");
+    run(&mut p, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    read(&mut p, A);
+    run(&mut y, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    y.ask("SELECT sum(o.v) FROM s.o o WHERE o.id = 1", None)
+        .unwrap();
+    run(&mut out, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    set(&mut out, A, -2).unwrap();
+    run(&mut out, "COMMIT");
+    let q = path.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        let mut d = open(&q);
+        d.execute("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE")
+            .unwrap();
+        let (b, _) = d
+            .ask("SELECT sum(o.v) FROM s.o o WHERE o.id = 1", None)
+            .unwrap();
+        tx.send(one(&b)).unwrap();
+        d.execute("COMMIT").unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    // p shows the first snapshot unsafe: the new one is taken at once, y still open beside it.
+    set(&mut p, B, -1).unwrap();
+    run(&mut p, "COMMIT");
+    std::thread::sleep(Duration::from_millis(300));
+    run(&mut y, "UPDATE s.o SET v = 7 WHERE id = 1");
+    run(&mut y, "COMMIT");
+    // It waited for y's end all the same, and reads as of the snapshot before it.
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+    t.join().unwrap();
 }
