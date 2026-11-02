@@ -3105,6 +3105,8 @@ fn plane_cond(
         op: seen.unwrap_or_default().to_string(),
         probe: seen.map(|_| crate::spans::Probe::Plane(kind, value)),
         value: None,
+        arms: None,
+        beside: Vec::new(),
     }))
 }
 
