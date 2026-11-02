@@ -1393,7 +1393,15 @@ fn a_read_along_the_plane_and_a_distance_s_sort_keep_to_the_round_s_room() {
     assert_eq!(b.num_rows(), wide[0].0.num_rows());
     assert_eq!(round.column_pages_read, wide[0].1.column_pages_read);
     let (b, round) = s.ask(nearest, None).unwrap();
-    assert_eq!(weather::bag(&b), weather::bag(&wide[1].0));
+    let rows = |b: &arrow::array::RecordBatch| -> Vec<(i64, u64)> {
+        let id = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let d = b.column(1).as_any();
+        let d = d.downcast_ref::<arrow::array::Float64Array>().unwrap();
+        (0..b.num_rows())
+            .map(|i| (id.value(i), d.value(i).to_bits()))
+            .collect()
+    };
+    assert_eq!(rows(&b), rows(&wide[1].0));
     assert!(
         round.spill_pages_written > 0 && round.spill_pages_written == round.spill_pages_read,
         "{round:?}"

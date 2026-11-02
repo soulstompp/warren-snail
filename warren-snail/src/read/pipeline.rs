@@ -7533,7 +7533,15 @@ pub fn reads_per_row(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
                 matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if names(e, &unordered))
             })
     });
+    // What it returns computed from such a column, a distance among them.
+    let computed = s.projection.iter().any(|i| match i {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            matches!(e, Expr::BinaryOp { .. }) && names(e, &by_rows)
+        }
+        _ => false,
+    });
     extreme
+        || computed
         || s.selection
             .as_ref()
             .is_some_and(|w| !by_rows.is_empty() && operated(w, &by_rows, table))
