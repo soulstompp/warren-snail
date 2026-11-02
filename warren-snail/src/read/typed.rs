@@ -602,12 +602,6 @@ impl Typing<'_> {
                 if let Some(t) = super::ranges::typed(&name, &types)? {
                     return Ok(t);
                 }
-                // upper and lower also take a range, which an argument not resolved may be.
-                if matches!(name.as_str(), "upper" | "lower")
-                    && matches!((args.as_slice(), types.as_slice()), ([x], [None]) if untyped(x).is_none())
-                {
-                    return Ok(None);
-                }
                 if let Some(t) = strings(&name, &types)? {
                     return Ok(t);
                 }
