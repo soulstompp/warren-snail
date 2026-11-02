@@ -2793,7 +2793,8 @@ impl Snail {
                     last.first_row + last.rows
                 } as usize;
                 let mut fresh = Vec::new();
-                for p in tail_pages(&descs[s], ty, &values, head.units[s] as usize)?.pages {
+                let k = if cp.unit != 0 { cp.unit } else { head.units[s] };
+                for p in tail_pages(&descs[s], ty, &values, k as usize)?.pages {
                     let row = base + p.first_row;
                     fresh.push(PageEntry {
                         at: w.place(&p.bytes)?,
@@ -2912,14 +2913,31 @@ impl Snail {
         rows: &Rows,
     ) -> Result<Vec<Entry>> {
         let Laid {
-            perm, keys, blocks, ..
+            perm,
+            keys,
+            blocks,
+            widths,
+            ..
         } = laid_out(table, order, rows, Some(&head.level_text), self.reader.format())?;
         let descs = leaf_descriptors(table, order)?;
-        let units: Vec<usize> = head.units.iter().map(|&k| k as usize).collect();
+        // In format 9 each block takes the unit of its own furthest-out place.
+        let kept = self.reader.format() >= crate::file::FORMAT;
+        let block_units: Vec<Vec<usize>> = if kept {
+            crate::cut::largest_places(&keys, &blocks, order, table, &widths)
+                .iter()
+                .map(|m| {
+                    (0..widths.0.len())
+                        .map(|s| widths.unit(s, m[s], rows.len()))
+                        .collect()
+                })
+                .collect()
+        } else {
+            vec![head.units.iter().map(|&k| k as usize).collect(); blocks.len()]
+        };
         let month_slots: Vec<usize> = head.month_slots.iter().map(|&s| s as usize).collect();
         let text_slots: Vec<usize> = head.text_slots.iter().map(|&s| s as usize).collect();
         let mut entries = Vec::with_capacity(blocks.len());
-        for b in &blocks {
+        for (b, units) in blocks.iter().zip(&block_units) {
             let (entry, _, _) = write_block(
                 w,
                 table,
@@ -2929,11 +2947,12 @@ impl Snail {
                 &keys,
                 b,
                 &descs,
-                &units,
+                units,
                 &month_slots,
                 &text_slots,
                 &[],
                 &mut MapPages::new(false),
+                kept,
             )?;
             entries.push(entry);
         }

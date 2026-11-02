@@ -1546,7 +1546,7 @@ impl Snail {
                             rows: b.rows as u64,
                             map_pages: map_run.pages(),
                             column: leaf.name(&table.columns[*c].name),
-                            k: head.units[s] as u64,
+                            k: if cp.unit != 0 { cp.unit } else { head.units[s] } as u64,
                             dictionary_pages: cp.dictionary.map_or(0, Extent::pages),
                             data_pages: cp.pages.len() as u64,
                             disk_pages: cp.dictionary.map_or(0, Extent::pages)

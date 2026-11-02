@@ -3,7 +3,7 @@
 //! the root.
 
 use crate::catalog::{Catalog, ColumnType, Order, Table};
-use crate::cut::{cut, largest_place, Block, Width, Widths};
+use crate::cut::{cut, largest_place, largest_places, Block, Width, Widths};
 use crate::directory::{
     build, decode_top, encode_top, ColumnPages, Entry, Head, MapPages, PageEntry, PageMap, Summary,
     WIDE_LEVEL,
@@ -1610,6 +1610,16 @@ fn write_order(
     let units: Vec<usize> = (0..widths.0.len())
         .map(|s| widths.unit(s, most[s], n))
         .collect();
+    // In format 9 each block takes the unit of its own furthest-out place.
+    let kept = format >= crate::file::FORMAT;
+    let block_units: Vec<Vec<usize>> = if kept {
+        largest_places(&keys, &blocks, order, table, &widths)
+            .iter()
+            .map(|m| (0..widths.0.len()).map(|s| widths.unit(s, m[s], n)).collect())
+            .collect()
+    } else {
+        vec![units.clone(); blocks.len()]
+    };
     let descs = leaf_descriptors(table, order)?;
     let (month_slots, text_slots) = slots(table, order);
     let month_slots: Vec<usize> = month_slots.into_iter().map(|s| s as usize).collect();
@@ -1629,7 +1639,8 @@ fn write_order(
             first..first + table.leaf_count(c)
         })
         .collect();
-    for b in &blocks {
+    for (bi, b) in blocks.iter().enumerate() {
+        let units = &block_units[bi];
         let given: Vec<Option<Encoded>> = match in_order.and_then(|s| {
             s.groups
                 .iter()
@@ -1664,11 +1675,12 @@ fn write_order(
             &keys,
             b,
             &descs,
-            &units,
+            units,
             &month_slots,
             &text_slots,
             &given,
             &mut maps,
+            kept,
         )?;
         for (s, (cw, e)) in columns.iter_mut().zip(&encoded).enumerate() {
             cw.moved_blocks += moved[s] as usize;
@@ -1726,6 +1738,7 @@ pub(crate) fn write_block(
     text_slots: &[usize],
     given: &[Option<Encoded>],
     maps: &mut MapPages,
+    keep_units: bool,
 ) -> Result<(Entry, Vec<Encoded>, Vec<bool>)> {
     let leaves = order.leaves(table);
     let mut summaries = Vec::with_capacity(leaves.len());
@@ -1799,7 +1812,9 @@ pub(crate) fn write_block(
         PageMap {
             columns: encoded
                 .iter()
-                .map(|e| ColumnPages {
+                .enumerate()
+                .map(|(s, e)| ColumnPages {
+                    unit: if keep_units { units[s] as u32 } else { 0 },
                     dictionary: e.dictionary.as_ref().map(|d| place(d.len())),
                     pages: e
                         .pages

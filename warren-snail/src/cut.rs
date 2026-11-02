@@ -312,13 +312,31 @@ pub fn largest_place(
     table: &Table,
     widths: &Widths,
 ) -> Vec<u64> {
+    let mut most = vec![0u64; widths.0.len()];
+    for b in largest_places(keys, blocks, order, table, widths) {
+        for (m, x) in most.iter_mut().zip(b) {
+            *m = (*m).max(x);
+        }
+    }
+    most
+}
+
+/// The most plain bytes one place takes, as `largest_place` reads it, in each block on its own.
+pub fn largest_places(
+    keys: &Keys,
+    blocks: &[Block],
+    order: &Order,
+    table: &Table,
+    widths: &Widths,
+) -> Vec<Vec<u64>> {
     let prefix = order
         .levels
         .iter()
         .take_while(|&&l| by_equality(l, table))
         .count();
-    let mut most = vec![0u64; widths.0.len()];
+    let mut out = Vec::with_capacity(blocks.len());
     for b in blocks {
+        let mut most = vec![0u64; widths.0.len()];
         let mut i = b.start;
         while i < b.end {
             let mut j = i + 1;
@@ -334,8 +352,9 @@ pub fn largest_place(
             }
             i = j;
         }
+        out.push(most);
     }
-    most
+    out
 }
 
 #[cfg(test)]

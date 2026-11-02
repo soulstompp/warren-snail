@@ -616,7 +616,13 @@ pub struct PageEntry {
 pub struct ColumnPages {
     pub dictionary: Option<Extent>,
     pub pages: Vec<PageEntry>,
+    /// The leaf's counting unit in the block, in disk pages, where its map keeps one, as a map of
+    /// format 9 does; 0 where the order's head gives it.
+    pub unit: u32,
 }
+
+/// The bit a page map sets on its count of leaves where it keeps each leaf's unit.
+const UNITS_KEPT: u32 = 1 << 31;
 
 /// The bytes a run of page maps begins with, in a snail of the current format: how many maps it holds.
 pub(crate) const MAP_HEAD: usize = 4;
@@ -774,7 +780,8 @@ impl PageMap {
 impl PageMap {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Out::default();
-        o.u32(self.columns.len() as u32);
+        let kept = self.columns.iter().any(|c| c.unit != 0);
+        o.u32(self.columns.len() as u32 | if kept { UNITS_KEPT } else { 0 });
         for c in &self.columns {
             match c.dictionary {
                 Some(d) => {
@@ -782,6 +789,9 @@ impl PageMap {
                     o.extent(d);
                 }
                 None => o.u8(0),
+            }
+            if kept {
+                o.u32(c.unit);
             }
             o.u32(c.pages.len() as u32);
             for p in &c.pages {
@@ -805,6 +815,8 @@ impl PageMap {
     pub fn decode(buf: &[u8], level_text: &[u32]) -> Result<PageMap> {
         let mut i = In::new(buf);
         let n = i.u32()?;
+        let kept = n & UNITS_KEPT != 0;
+        let n = n & !UNITS_KEPT;
         let mut columns = Vec::with_capacity(n as usize);
         for _ in 0..n {
             let dictionary = if i.u8()? == 1 {
@@ -812,6 +824,7 @@ impl PageMap {
             } else {
                 None
             };
+            let unit = if kept { i.u32()? } else { 0 };
             let m = i.u32()?;
             let mut pages = Vec::with_capacity(m as usize);
             for _ in 0..m {
@@ -822,7 +835,11 @@ impl PageMap {
                     first: keys_in(&mut i, level_text)?,
                 });
             }
-            columns.push(ColumnPages { dictionary, pages });
+            columns.push(ColumnPages {
+                dictionary,
+                pages,
+                unit,
+            });
         }
         let sorted = i.u32()?;
         let dead = read_u32s(&mut i)?;
@@ -949,12 +966,17 @@ mod tests {
                     rows: 3892,
                     first: ints([12, -5]),
                 }],
+                unit: 0,
             }],
             sorted: 3890,
             dead: vec![4, 3891],
             chains: vec![(4, ints([12, 7]))],
         };
         assert_eq!(PageMap::decode(&map.encode(), &[0, 0]).unwrap(), map);
+        let mut kept = map.clone();
+        kept.columns[0].unit = 12;
+        assert_eq!(kept.encode().len(), map.encode().len() + 4);
+        assert_eq!(PageMap::decode(&kept.encode(), &[0, 0]).unwrap(), kept);
     }
 
     #[test]
