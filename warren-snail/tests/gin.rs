@@ -1236,6 +1236,11 @@ fn a_scan_begun_along_a_strand_hands_its_blocks_as_a_round_does() {
     let r = scan.round();
     assert!(r.order.starts_with("t_a+"), "{r:?}");
     exact(q, &r);
+    // Beside a condition on the table's key, the rows it can hold are the fewer.
+    let narrow = s
+        .price("SELECT id FROM s.t WHERE a @> '{9000}' AND id < 10", None)
+        .unwrap();
+    assert!(narrow.rows_low <= narrow.rows_high, "{narrow:?}");
     // A count its counts close, through the scan and the price.
     let q = "SELECT count(*) FROM s.t WHERE a @> '{500}'";
     let price = s.price(q, None).unwrap();
@@ -1519,4 +1524,36 @@ fn a_join_handed_over_is_priced_with_the_strand_it_reads() {
         along.column_pages_high > along.column_pages_estimate,
         "{along:?}"
     );
+}
+
+#[test]
+fn an_empty_array_lies_on_the_strand_where_no_array_holds_a_null() {
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+               CREATE INDEX t_a ON s.t USING gin (a);";
+    let n = 20480;
+    let mut s = snail_of("gin-empty", ddl, n, |i| {
+        let a = match i % 1000 {
+            0 => None,
+            1 => Some("{}".to_string()),
+            _ => Some(format!("{{{}}}", i % 7)),
+        };
+        vec![Some(i.to_string()), a]
+    });
+    let want: Vec<i32> = (0..n as i32).filter(|i| i % 1000 == 1).collect();
+    for w in ["a = '{}'", "a <@ '{}'", "'{}' = a", "'{}' @> a"] {
+        let q = format!("SELECT id FROM s.t WHERE {w}");
+        let (found, round) = ids(&mut s, &q, Some("t_a"));
+        assert_eq!(found, want, "{q}");
+        // The strand's place, and the blocks of its keys, at most one a key.
+        assert!(round.blocks_read as usize <= 1 + want.len(), "{round:?}");
+    }
+    // A NULL column holds no place of the strand; `a @> '{}'` is every array, by the table's order.
+    let rows = s.blocks().unwrap();
+    assert_eq!(
+        strand_rows(&rows, "t_a", "id"),
+        (0..n).filter(|i| i % 1000 != 0).count() as u64
+    );
+    let (all, round) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{}'", Some("t_a"));
+    assert_eq!(all.len(), (0..n).filter(|i| i % 1000 != 0).count());
+    assert_eq!(round.order, "t_pkey", "{round:?}");
 }

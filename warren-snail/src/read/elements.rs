@@ -883,7 +883,7 @@ pub(super) struct Chosen {
     asking: Asking,
     /// The table's own read, where the strands were priced against it.
     table: Option<Part>,
-    /// Whether the table's order has the keys lead.
+    /// The index or indexes it reads, as a round names them.
     index: String,
 }
 
@@ -1368,7 +1368,8 @@ impl Snail {
             None => self.part(want, None)?,
         };
         let (_, most_pages, _) = part.plan.block_bounds();
-        let rows = (c.asking.rows.0, part.rows.1.min(c.asking.rows.1));
+        let high = part.rows.1.min(c.asking.rows.1);
+        let rows = (c.asking.rows.0.min(high), high);
         let most = rows
             .1
             .saturating_mul(u64::from(most_pages))
