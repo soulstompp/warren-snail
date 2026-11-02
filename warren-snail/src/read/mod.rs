@@ -47,7 +47,9 @@ pub use level::{held_of_key, LevelCounts, PlaceRows};
 pub use out::{TableOut, DDL_KEY, MONETARY_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 pub use point::Point;
-pub use together::{answer_together, at_one_moment, price_together, Priced, TablePrice};
+pub use together::{
+    answer_together, at_one_moment, begin_together, price_together, Answering, Priced, TablePrice,
+};
 
 /// An answer's rows as values, as a pipeline reads them.
 pub fn pipeline_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>> {
@@ -1555,9 +1557,21 @@ impl Snail {
         sink.rows_most(part.rows.1);
         let read = self.read_plan(&part.plan, &want, &columns, sink);
         self.reader.read_done();
-        read?;
         let column_pages_read = self.reader.pages_read() - mid;
         let w = &part.plan.walk;
+        if let Err(e) = read {
+            if join::past_the_room(&e) {
+                join::stop_with(Round {
+                    order: table.orders[w.order].name.clone(),
+                    directory_pages,
+                    directory_pages_held,
+                    column_pages_predicted: column_pages_read,
+                    column_pages_read,
+                    ..Default::default()
+                });
+            }
+            return Err(e);
+        }
         let round = Round {
             order: table.orders[w.order].name.clone(),
             served: part.served.clone(),

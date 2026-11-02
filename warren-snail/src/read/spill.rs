@@ -738,6 +738,45 @@ impl<'e> Chunk<'e> {
 #[derive(Clone, Default)]
 pub(super) struct Rows(Vec<Rc<Run>>);
 
+/// A place's rows handed out a chunk at a time to a caller asking for them, once they are all made.
+pub(super) struct Handed {
+    runs: std::collections::VecDeque<Rc<Run>>,
+    at: usize,
+    back: Option<Back>,
+}
+
+impl Handed {
+    /// The next chunk of its rows, in order; none once every row has come.
+    pub(super) fn next_chunk(&mut self) -> Result<Option<Vec<Vec<Value>>>> {
+        let (mut out, mut bytes) = (Vec::new(), 0);
+        while bytes < CHUNK {
+            let Some(run) = self.runs.front() else {
+                break;
+            };
+            let held = run.stored.borrow().rows.get(self.at).cloned();
+            let row = match held {
+                Some(r) => {
+                    self.at += 1;
+                    Some(r)
+                }
+                None => self.back.get_or_insert_with(|| run.back()).next_row()?,
+            };
+            match row {
+                Some(r) => {
+                    bytes += row_width(&r);
+                    out.push(r);
+                }
+                None => {
+                    self.runs.pop_front();
+                    self.at = 0;
+                    self.back = None;
+                }
+            }
+        }
+        Ok((!out.is_empty()).then_some(out))
+    }
+}
+
 impl Rows {
     pub(super) fn one(run: Run) -> Rows {
         Rows(vec![Rc::new(run)])
@@ -745,6 +784,15 @@ impl Rows {
 
     pub(super) fn of(rows: Vec<Vec<Value>>) -> Result<Rows> {
         Ok(Rows::one(Run::of(rows)?))
+    }
+
+    /// Its rows, to hand out a chunk at a time.
+    pub(super) fn handed(self) -> Handed {
+        Handed {
+            runs: self.0.into(),
+            at: 0,
+            back: None,
+        }
     }
 
     /// Those of `other` after these.

@@ -1,7 +1,7 @@
 //! The room a round holds its rows in, beside the pages it keeps for its later reads, and the file
 //! it writes the rows past its room to: a file of the round's own, in a directory its opener may
-//! name, removed as soon as it is opened, never the snail's. Past the most its opener lets it write
-//! there, the round is refused by name.
+//! name, removed as soon as it is opened, never the snail's; or one its opener makes. Past the most
+//! its opener lets it write there, the round is refused by name.
 
 use crate::cut::PAGE;
 use crate::{Error, Result};
@@ -16,15 +16,78 @@ use std::rc::Rc;
 /// pages between rounds.
 pub const ROUND_BYTES: u64 = 128 << 20;
 
+/// A file a round's rows past its room lie in that its opener makes: each page written once, in
+/// turn, and read back by its place.
+pub trait RoundFile {
+    /// Writes the page at place `at`, one past the last written.
+    fn write_page(&mut self, at: u64, page: &[u8]) -> Result<()>;
+    /// Reads back the page at place `at`.
+    fn read_page(&mut self, at: u64, buf: &mut [u8]) -> Result<()>;
+}
+
+/// What makes a round's file at its first page written.
+#[derive(Clone)]
+pub struct RoundFiles(Rc<dyn Fn() -> Result<Box<dyn RoundFile>>>);
+
+impl RoundFiles {
+    pub fn new(make: impl Fn() -> Result<Box<dyn RoundFile>> + 'static) -> RoundFiles {
+        RoundFiles(Rc::new(make))
+    }
+}
+
+impl std::fmt::Debug for RoundFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RoundFiles")
+    }
+}
+
+/// A file of the round's own, removed as soon as it is opened.
+struct OwnFile(File);
+
+impl OwnFile {
+    fn make(dir: Option<PathBuf>) -> Result<OwnFile> {
+        let dir = dir.unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!(
+            "warren-snail-round-{}-{}",
+            std::process::id(),
+            SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| {
+                Error::new(format!(
+                    "the round's spill in {} is not made: {e}",
+                    dir.display()
+                ))
+            })?;
+        std::fs::remove_file(&path)?;
+        Ok(OwnFile(file))
+    }
+}
+
+impl RoundFile for OwnFile {
+    fn write_page(&mut self, at: u64, page: &[u8]) -> Result<()> {
+        Ok(self.0.write_all_at(page, at * PAGE as u64)?)
+    }
+
+    fn read_page(&mut self, at: u64, buf: &mut [u8]) -> Result<()> {
+        Ok(self.0.read_exact_at(buf, at * PAGE as u64)?)
+    }
+}
+
 /// What an opener gives each round: the bytes it holds its rows and kept pages in, the directory
-/// its spill lies in (the system's temporary directory where none is named), and the most it may
-/// write there (none: as much as the disk takes).
+/// its spill lies in (the system's temporary directory where none is named) or what makes the file
+/// where its opener makes it, and the most it may write there (none: as much as the disk takes).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Sizes {
     pub bytes: u64,
     pub dir: Option<PathBuf>,
     pub disk: Option<u64>,
+    pub files: Option<RoundFiles>,
 }
 
 impl Default for Sizes {
@@ -33,6 +96,7 @@ impl Default for Sizes {
             bytes: ROUND_BYTES,
             dir: None,
             disk: None,
+            files: None,
         }
     }
 }
@@ -55,6 +119,12 @@ impl Sizes {
     /// The same, its spill refused past `bytes`.
     pub fn at_most(mut self, bytes: u64) -> Sizes {
         self.disk = Some(bytes);
+        self
+    }
+
+    /// The same, its spill in the file `files` makes.
+    pub fn written_to(mut self, files: RoundFiles) -> Sizes {
+        self.files = Some(files);
         self
     }
 }
@@ -94,10 +164,14 @@ pub struct Room {
     flying: Cell<u64>,
     most: Cell<u64>,
     pages: RefCell<Pages>,
-    spill: RefCell<Option<File>>,
+    spill: RefCell<Option<Box<dyn RoundFile>>>,
     spill_pages: Cell<u64>,
     written: Cell<u64>,
     read: Cell<u64>,
+    /// Whether what the round answers counts in it, its caller taking the answer a batch at a time.
+    answer_held: Cell<bool>,
+    /// Whether a join read along its tables' orders has just stopped for this room.
+    stopped: Cell<bool>,
 }
 
 static SPILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -114,6 +188,8 @@ impl Room {
             spill_pages: Cell::new(0),
             written: Cell::new(0),
             read: Cell::new(0),
+            answer_held: Cell::new(false),
+            stopped: Cell::new(false),
         })
     }
 
@@ -310,30 +386,15 @@ impl Room {
         }
         let mut spill = self.spill.borrow_mut();
         if spill.is_none() {
-            let dir = sizes.dir.unwrap_or_else(std::env::temp_dir);
-            let path = dir.join(format!(
-                "warren-snail-round-{}-{}",
-                std::process::id(),
-                SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|e| {
-                    Error::new(format!(
-                        "the round's spill in {} is not made: {e}",
-                        dir.display()
-                    ))
-                })?;
-            std::fs::remove_file(&path)?;
-            *spill = Some(file);
+            *spill = Some(match sizes.files {
+                Some(files) => (files.0)()?,
+                None => Box::new(OwnFile::make(sizes.dir)?),
+            });
         }
         spill
-            .as_ref()
+            .as_mut()
             .expect("the spill is made")
-            .write_all_at(page, at * PAGE as u64)?;
+            .write_page(at, page)?;
         self.spill_pages.set(at + 1);
         self.written.set(self.written.get() + 1);
         Ok(at)
@@ -341,11 +402,11 @@ impl Room {
 
     /// Reads back one page of the round's spill.
     pub fn spilled_page(&self, at: u64, buf: &mut [u8]) -> Result<()> {
-        let spill = self.spill.borrow();
-        let file = spill
-            .as_ref()
-            .ok_or_else(|| Error::new("the round has no spill"))?;
-        file.read_exact_at(buf, at * PAGE as u64)?;
+        let mut spill = self.spill.borrow_mut();
+        spill
+            .as_mut()
+            .ok_or_else(|| Error::new("the round has no spill"))?
+            .read_page(at, buf)?;
         self.read.set(self.read.get() + 1);
         Ok(())
     }
@@ -353,6 +414,45 @@ impl Room {
     /// The pages the round wrote to its spill, and those it read back.
     pub fn spill_pages(&self) -> (u64, u64) {
         (self.written.get(), self.read.get())
+    }
+
+    /// Closes the round's spill, every row on it read or let go.
+    pub fn close_spill(&self) {
+        *self.spill.borrow_mut() = None;
+    }
+
+    /// Lets go the pages kept for the round's later reads: it reads no more.
+    pub fn let_go_pages(&self) {
+        *self.pages.borrow_mut() = Pages::default();
+    }
+
+    /// From now on what the round answers counts in it: its caller takes the answer a batch at a time.
+    pub(crate) fn hold_answer(&self) {
+        self.answer_held.set(true);
+    }
+
+    /// Whether `bytes` of an answer would pass the room, where the answer counts in it.
+    pub(crate) fn answer_past(&self, bytes: u64) -> bool {
+        self.answer_held.get() && bytes > self.free_bytes()
+    }
+
+    /// A join read along its tables' orders has stopped for this room.
+    pub(crate) fn stop(&self) {
+        self.stopped.set(true);
+    }
+
+    /// Whether a join has just stopped for this room: the question that takes it up does not ask again.
+    pub(crate) fn take_stop(&self) -> bool {
+        self.stopped.replace(false)
+    }
+
+    /// `bytes` of rows in the caller's hand, counted in the most the round holds until `landed`.
+    pub(crate) fn handed(&self, bytes: u64) {
+        self.fly(bytes);
+    }
+
+    pub(crate) fn landed(&self, bytes: u64) {
+        self.land(bytes);
     }
 }
 

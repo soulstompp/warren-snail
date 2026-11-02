@@ -57,6 +57,10 @@ impl Sink for Answer {
     fn run(&mut self, outs: &[(bool, bool, usize, &Values)], from: usize, to: usize) -> bool {
         Answer::run(self, outs, from, to)
     }
+
+    fn block_end(&mut self) -> Result<()> {
+        self.within_room()
+    }
 }
 
 /// What a round along one table reads.

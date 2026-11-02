@@ -1881,6 +1881,10 @@ impl Reading<'_> {
         if leaves.iter().any(|l| !matches!(l.what, What::Table { .. })) {
             return Ok(false);
         }
+        // Stopped for its room, the round has asked this already.
+        if crate::room::current().is_some_and(|r| r.take_stop()) {
+            return Ok(false);
+        }
         let Some(from) = self.written(node, true)? else {
             return Ok(false);
         };
@@ -1937,6 +1941,9 @@ impl Reading<'_> {
             Err(e) if super::join::past_the_room(&e) => {
                 if let Some(r) = super::join::stopped_reads() {
                     self.accrued.add(&r);
+                }
+                if let Some(r) = crate::room::current() {
+                    r.take_stop();
                 }
                 Ok(false)
             }
@@ -2899,6 +2906,42 @@ pub(super) fn answer(
     q: &Query,
     params: &[String],
 ) -> Result<(RecordBatch, Round)> {
+    let (last, held, accrued) = answered(reads, q, params, false)?;
+    let batch = pipeline::batch_of(&last.rel)?;
+    let mut round = accrued.round.into_inner();
+    round.rows = batch.num_rows() as u64;
+    round.rows_held = held as u64;
+    if reads.snails() > 1 {
+        round.snails = accrued.parts.into_inner();
+    }
+    Ok((batch, round))
+}
+
+/// The same, what it answers lying in the round's room, those rows past it written, for its caller to
+/// take a chunk at a time: those rows, and their columns' names.
+pub(super) fn answer_rows(
+    reads: &dyn Reads,
+    q: &Query,
+    params: &[String],
+) -> Result<(Rows, Vec<String>, Round)> {
+    let (last, held, accrued) = answered(reads, q, params, true)?;
+    let names = last.rel.names.clone();
+    let rows = last.into_rows()?;
+    let mut round = accrued.round.into_inner();
+    round.rows = rows.len() as u64;
+    round.rows_held = held as u64;
+    if reads.snails() > 1 {
+        round.snails = accrued.parts.into_inner();
+    }
+    Ok((rows, names, round))
+}
+
+fn answered(
+    reads: &dyn Reads,
+    q: &Query,
+    params: &[String],
+    answer_kept: bool,
+) -> Result<(Made, usize, Accrued)> {
     let catalog = reads.catalog();
     let _rows = super::handed::rows_of(catalog);
     let asked = Asked {
@@ -2906,7 +2949,7 @@ pub(super) fn answer(
         params,
         release: catalog.release,
         now: crate::scalars::transaction_clock(),
-        answer_kept: false,
+        answer_kept,
     };
     let tables: Vec<&Table> = catalog.tables.iter().collect();
     let casings = Casings::of_tables(&tables, &catalog.collations);
@@ -2925,14 +2968,7 @@ pub(super) fn answer(
         accrued.add(&r);
     }
     let (last, held) = made_by(asked, q, &Steps::new(), &casings, None, &accrued)?;
-    let batch = pipeline::batch_of(&last.rel)?;
-    let mut round = accrued.round.into_inner();
-    round.rows = batch.num_rows() as u64;
-    round.rows_held = held as u64;
-    if reads.snails() > 1 {
-        round.snails = accrued.parts.into_inner();
-    }
-    Ok((batch, round))
+    Ok((last, held, accrued))
 }
 
 /// What a question makes: each of its steps in turn, after the relations made before it, and its

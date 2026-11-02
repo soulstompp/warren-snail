@@ -3,14 +3,20 @@
 //! hold, and priced from their directories alone, no column page read.
 
 use super::across::{carried_root, Snails};
-use super::join::{ask_join_within, core_of, needed_of, read_order, reading};
-use super::question;
+use super::join::{self, ask_join_within, core_of, needed_of, read_order, reading};
+use super::pipeline::{self, batch_of, relation_of, Relation};
+use super::spill::{rows_width, Handed, Rows, Run};
+use super::strands::held_width;
 use super::walk::Want;
-use super::{Round, Snail};
+use super::{computed, question, relations, spelled, subqueries, Round, Snail};
 use crate::catalog::Table;
+use crate::cut::PAGE;
 use crate::file::Root;
-use crate::Result;
+use crate::room::{Room, Sizes};
+use crate::{Error, Result};
 use arrow::array::RecordBatch;
+use std::collections::VecDeque;
+use std::rc::Rc;
 
 /// The file a snail was opened on, as a refusal names it.
 fn shown(snails: &[&Snail], i: usize) -> String {
@@ -105,6 +111,237 @@ pub fn answer_together(snails: &[&Snail], sql: &str) -> Result<(RecordBatch, Rou
     }
 }
 
+/// What a round makes of its answer, as it makes it: the batches its room holds, and the rows past it
+/// written, or those a pipeline left lying in the room and past it.
+struct Lying {
+    room: Rc<Room>,
+    batches: VecDeque<(RecordBatch, u64)>,
+    past: Option<Run>,
+    rows: Option<Rows>,
+    names: Vec<String>,
+}
+
+impl Lying {
+    /// A batch of the answer: held where the room has room for it and no row before it was written;
+    /// its rows written otherwise.
+    fn take(&mut self, b: RecordBatch) -> Result<()> {
+        if b.num_rows() == 0 {
+            return Ok(());
+        }
+        if self.names.is_empty() {
+            self.names = b.schema().fields().iter().map(|f| f.name().clone()).collect();
+        }
+        let bytes = b.get_array_memory_size() as u64;
+        if self.past.is_none() && self.room.hold(bytes) {
+            self.batches.push_back((b, bytes));
+            return Ok(());
+        }
+        let run = self.past.get_or_insert_with(Run::past);
+        for row in relation_of(&b)?.rows {
+            run.push(row)?;
+        }
+        Ok(())
+    }
+
+    /// Those rows written, ready to read back after the batches held.
+    fn done(mut self) -> Result<Answers> {
+        let mut rows = self.rows.take();
+        if let Some(run) = self.past.take() {
+            run.seal()?;
+            rows = Some(Rows::one(run));
+        }
+        Ok(Answers {
+            batches: self.batches,
+            rows: rows.map(Rows::handed),
+            names: self.names,
+        })
+    }
+}
+
+/// A round's answer once it is made: the batches its room holds, then its rows in the room and past
+/// it, a chunk at a time.
+struct Answers {
+    batches: VecDeque<(RecordBatch, u64)>,
+    rows: Option<Handed>,
+    names: Vec<String>,
+}
+
+/// A round's answer handed out a batch at a time, its reads done: `next_batch` hands out each, read
+/// back from what the round's room holds and from what it wrote past it, and `round` says what it has
+/// read and written so far. The round's spill closes as this is dropped.
+#[non_exhaustive]
+pub struct Answering {
+    room: Rc<Room>,
+    round: Round,
+    answers: Answers,
+    in_hand: u64,
+}
+
+impl Answering {
+    /// The next batch of the answer; none once every row has come.
+    pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.room.landed(std::mem::take(&mut self.in_hand));
+        if let Some((b, bytes)) = self.answers.batches.pop_front() {
+            self.room.let_go(bytes);
+            self.room.handed(bytes);
+            self.in_hand = bytes;
+            return Ok(Some(b));
+        }
+        let Some(rows) = self.answers.rows.as_mut() else {
+            return Ok(None);
+        };
+        let Some(rows) = rows.next_chunk()? else {
+            return Ok(None);
+        };
+        self.in_hand = rows_width(&rows);
+        self.room.handed(self.in_hand);
+        batch_of(&Relation {
+            names: self.answers.names.clone(),
+            rows,
+            order: None,
+        })
+        .map(Some)
+    }
+
+    /// What the round has read, the most it has held, and the pages it has written past its room and
+    /// read back.
+    pub fn round(&self) -> Round {
+        let mut round = self.round.clone();
+        round.bytes_held = self.room.most();
+        (round.spill_pages_written, round.spill_pages_read) = self.room.spill_pages();
+        round
+    }
+}
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        self.room.close_spill();
+    }
+}
+
+/// A question on the tables of snails read together, on the roots they hold: one round in a room of
+/// its own that `sizes` gives, read whole before this returns, what it holds of its answer counted in
+/// that room and the rest written past it. A second round may begin while its answer is handed out.
+pub fn begin_together(snails: &[&Snail], sql: &str, sizes: Sizes) -> Result<Answering> {
+    let room = Room::new(sizes);
+    room.hold_answer();
+    let _rooms = InRoom::of(snails, &room);
+    let entered = crate::room::entered(&room);
+    let mut lying = Lying {
+        room: room.clone(),
+        batches: VecDeque::new(),
+        past: None,
+        rows: None,
+        names: Vec::new(),
+    };
+    let round = answer_lying(snails, sql, &mut lying)?;
+    let answers = lying.done()?;
+    room.let_go_pages();
+    drop(entered);
+    Ok(Answering {
+        room,
+        round,
+        answers,
+        in_hand: 0,
+    })
+}
+
+/// While it lives, snails read in a room given: each its own again as it goes.
+struct InRoom<'s>(Vec<(&'s Snail, Rc<Room>)>);
+
+impl<'s> InRoom<'s> {
+    fn of(snails: &[&'s Snail], room: &Rc<Room>) -> InRoom<'s> {
+        InRoom(
+            snails
+                .iter()
+                .map(|&s| {
+                    let own = s.reader.room();
+                    s.reader.hold_rounds_in(room.clone());
+                    (s, own)
+                })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for InRoom<'_> {
+    fn drop(&mut self) {
+        for (s, own) in self.0.drain(..) {
+            s.reader.hold_rounds_in(own);
+        }
+    }
+}
+
+/// A question read as the snail reads it, its answer laid in `lying`. Where it reads as a round on its
+/// tables' orders it is read so, a join's rows laid out a block's at a time, and a grouping's stopping
+/// should its groups pass the room; what it does not read so, and what stops, a pipeline over the
+/// snails' relations reads.
+fn answer_lying(snails: &[&Snail], sql: &str, lying: &mut Lying) -> Result<Round> {
+    question::unlocked_words(sql)?;
+    relations::unread_clauses(sql)?;
+    let sql = &*spelled::spelled(sql)?;
+    let parsed =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
+    let [sqlparser::ast::Statement::Query(asked)] = parsed.as_slice() else {
+        return Err(Error::new("a question is one SELECT"));
+    };
+    question::unlocked(asked)?;
+    let (catalog, tables_at) = Snails::merged(snails, &|i| shown(snails, i))?;
+    let by_pipeline = computed(&catalog, asked)?.is_some()
+        || subqueries::held(asked)
+        || pipeline::is_pipeline(asked)
+        || relations::is_set_operation(asked)
+        || pipeline::tests_composite_null(&catalog, asked)
+        || pipeline::reads_per_row(&catalog, asked)
+        || relations::names_a_view(&catalog, asked);
+    if let (false, Ok(q)) = (by_pipeline, question::parse(&catalog, sql)) {
+        let grouped = matches!(q.select, question::Select::Groups { .. });
+        if grouped || (q.order.is_empty() && q.sides.len() > 1) {
+            let at: Vec<(usize, usize)> = q.sides.iter().map(|s| tables_at[s.table]).collect();
+            match read_lying(snails, &at, q, grouped, lying) {
+                Err(e) if join::past_the_room(&e) => {}
+                done => return done,
+            }
+        }
+    }
+    let written = pipeline::windows::written(&spelled::between_written(asked))?;
+    let written = computed(&catalog, &written)?.unwrap_or(written);
+    let across = relations::Across {
+        snails: snails.to_vec(),
+        at: &tables_at,
+        catalog: &catalog,
+    };
+    let (rows, names, round) = relations::answer_rows(&across, &written, &[])?;
+    lying.rows = Some(rows);
+    lying.names = names;
+    Ok(round)
+}
+
+/// A grouping, or a join's rows, read along its tables' orders: a join's rows laid out as they are
+/// made, a grouping's one batch once its groups are made.
+fn read_lying(
+    snails: &[&Snail],
+    at: &[(usize, usize)],
+    mut q: question::Question,
+    grouped: bool,
+    lying: &mut Lying,
+) -> Result<Round> {
+    let (batch, round) = match (grouped, q.sides.len()) {
+        (true, 1) => {
+            let (snail, table) = at[0];
+            q.sides[0].table = table;
+            snails[snail].ask_one(&q, None)?
+        }
+        (true, _) => ask_join_within(snails, at, &q, true, None)?,
+        (false, _) => {
+            let mut lay = |b: RecordBatch| lying.take(b);
+            ask_join_within(snails, at, &q, true, Some(&mut lay))?
+        }
+    };
+    lying.take(batch)?;
+    Ok(round)
+}
+
 /// One table's part of a round priced from its directory alone: the order it would be read along
 /// by its own conditions, the directory pages the pricing read, and its column pages. A table read
 /// by its own conditions is priced exactly. A table kept to the keys of a table read before it is
@@ -133,6 +370,9 @@ pub struct TablePrice {
     pub rows_high: u64,
     pub rows_estimate: u64,
     pub table_rows: u64,
+    /// The bytes a round holds of it at most: the most rows at their held width, no fewer than its
+    /// column pages'; none where it reads no column page.
+    pub held_bytes: u64,
 }
 
 /// A question on the tables of snails read together, priced from their directories alone, on the
@@ -141,6 +381,17 @@ pub struct TablePrice {
 #[non_exhaustive]
 pub struct Priced {
     pub tables: Vec<TablePrice>,
+}
+
+/// The bytes a round holds of a table at most: `rows` at `width`, no fewer than its `pages`' bytes;
+/// none where it reads no page.
+fn held_most(rows: u64, width: u64, pages: u64) -> u64 {
+    match pages {
+        0 => 0,
+        _ => rows
+            .saturating_mul(width)
+            .max(pages.saturating_mul(PAGE as u64)),
+    }
 }
 
 impl Priced {
@@ -179,6 +430,13 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
     let at: Vec<(usize, usize)> = q.sides.iter().map(|s| at[s.table]).collect();
     if let [(s, _)] = at.as_slice() {
         let p = snails[*s].price(sql, None)?;
+        let table = &snails[*s].catalog.tables[at[0].1];
+        let width: u64 = q
+            .select
+            .inputs()
+            .iter()
+            .map(|k| held_width(table.columns[k.col().column].ty))
+            .sum();
         return Ok(Priced {
             tables: vec![TablePrice {
                 table: catalog.tables[q.sides[0].table].name.clone(),
@@ -195,6 +453,7 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
                 rows_high: p.rows_high,
                 rows_estimate: p.rows_estimate,
                 table_rows: p.table_rows,
+                held_bytes: held_most(p.rows_high, width, p.column_pages),
             }],
         });
     }
@@ -232,6 +491,7 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
         let before = snail.touched();
         let part = snail.part(&want, None)?;
         let own = part.plan.column_pages;
+        let width: u64 = r.columns.iter().map(|c| held_width(table.columns[c.0].ty)).sum();
         rows[side] = (part.plan.rows_estimate.round() as u64).clamp(part.rows.0, part.rows.1);
         let point = match (r.by.first(), r.led.as_ref()) {
             (Some(&(by, _)), Some(meets)) => {
@@ -264,6 +524,7 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
             rows_high: part.rows.1,
             rows_estimate: rows[side],
             table_rows: part.table_rows,
+            held_bytes: held_most(part.rows.1, width, own),
         });
     }
     Ok(Priced { tables: out })

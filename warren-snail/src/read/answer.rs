@@ -572,6 +572,42 @@ impl Answer {
         }
     }
 
+    /// The bytes the groups it holds take at least: 32 a key and an aggregate, beside the text of a
+    /// few of their keys taken for all.
+    fn groups_bytes(&self) -> u64 {
+        let Body::Groups {
+            keys,
+            items,
+            groups,
+            local,
+            by_code,
+            ..
+        } = &self.body
+        else {
+            return 0;
+        };
+        let n = groups.len() + local.len() + by_code.iter().flatten().count();
+        let text: usize = groups
+            .keys()
+            .take(8)
+            .flatten()
+            .map(|c| match c {
+                Cell::Text(t) => t.0.len(),
+                _ => 0,
+            })
+            .sum();
+        let seen = groups.len().clamp(1, 8);
+        n as u64 * (32 * (keys + items.len()) as u64 + (text / seen) as u64)
+    }
+
+    /// Refused for its room, where the round's answer counts in it and the groups it holds pass it.
+    pub(super) fn within_room(&self) -> Result<()> {
+        match crate::room::current() {
+            Some(r) if r.answer_past(self.groups_bytes()) => Err(super::join::stopped_for_room()),
+            _ => Ok(()),
+        }
+    }
+
     fn fresh(items: &[Item], typed: &[Option<ColumnType>]) -> Vec<Acc> {
         items
             .iter()

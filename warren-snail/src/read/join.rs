@@ -333,6 +333,19 @@ thread_local! {
     static STOPPED: std::cell::RefCell<Option<Round>> = const { std::cell::RefCell::new(None) };
 }
 
+/// What a round says where the rows it holds pass the room.
+pub(super) fn stopped_for_room() -> crate::Error {
+    crate::Error::new(PAST_THE_ROOM)
+}
+
+/// A round that stopped for its room, its reads so far kept for the round that takes it up.
+pub(super) fn stop_with(round: Round) {
+    if let Some(room) = crate::room::current() {
+        room.stop();
+    }
+    STOPPED.with(|s| *s.borrow_mut() = Some(round));
+}
+
 /// Whether a round stopped for its room.
 pub(super) fn past_the_room(e: &crate::Error) -> bool {
     e.0 == PAST_THE_ROOM
@@ -487,7 +500,7 @@ pub(super) fn ask_join_within(
                 if snails.len() > 1 {
                     round.snails = parts;
                 }
-                STOPPED.with(|s| *s.borrow_mut() = Some(round));
+                stop_with(round);
                 return Err(crate::Error::new(PAST_THE_ROOM));
             }
         }
@@ -495,6 +508,7 @@ pub(super) fn ask_join_within(
         mine.directory_pages_held = snail.pages_held() - held_before;
         mine.column_pages_held = snail.reader.keep_for_round(part.plan.disk_pages());
         let mid = snail.reader.pages_read();
+        let mut read = Ok(());
         if streamed {
             let joined = meet_core(q, &t, &core[..core.len() - 1]);
             sides_held.more(joined.rows.len() as u64 * 4);
@@ -503,14 +517,14 @@ pub(super) fn ask_join_within(
                 if snails.len() > 1 {
                     round.snails = parts;
                 }
-                STOPPED.with(|s| *s.borrow_mut() = Some(round));
+                stop_with(round);
                 return Err(crate::Error::new(PAST_THE_ROOM));
             }
             let mut sink = Probe::new(q, &t, &joined, side, &probe, &inputs, &mut answer);
             sink.hand_on = hand_on
                 .as_mut()
                 .map(|h| h as &mut dyn FnMut(&mut Answer) -> Result<()>);
-            snail.read_plan(&part.plan, &want, &columns, &mut sink)?;
+            read = snail.read_plan(&part.plan, &want, &columns, &mut sink);
         } else {
             let filters: Vec<Filter> = by
                 .iter()
@@ -571,10 +585,24 @@ pub(super) fn ask_join_within(
         mine.entries_may = w.statuses.1;
         mine.entries_must = w.statuses.2;
         mine.blocks_read = part.plan.blocks_read();
+        // Stopped for its room partway, the read counts what it read and no more.
+        let stopped = read.as_ref().err().is_some_and(past_the_room);
+        if stopped {
+            mine.column_pages_predicted = mine.column_pages_read;
+        }
         for r in [&mut round, &mut parts[at_snail]] {
             r.add_table(&mine, &name);
         }
         names.push(name);
+        if let Err(e) = read {
+            if stopped {
+                if snails.len() > 1 {
+                    round.snails = parts;
+                }
+                stop_with(round);
+            }
+            return Err(e);
+        }
     }
     if !stream {
         let mut joined = if q.full {
@@ -602,7 +630,7 @@ pub(super) fn ask_join_within(
             if snails.len() > 1 {
                 round.snails = parts;
             }
-            STOPPED.with(|s| *s.borrow_mut() = Some(round));
+            stop_with(round);
             return Err(crate::Error::new(PAST_THE_ROOM));
         }
         let mut cells = vec![Cell::Null; inputs.len()];
@@ -619,8 +647,17 @@ pub(super) fn ask_join_within(
             }
             answer.add_times(&cells, joined.weights[i]);
             if i % 1024 == 1023 {
-                if let Some(h) = &mut hand_on {
-                    h(&mut answer)?;
+                match &mut hand_on {
+                    Some(h) => h(&mut answer)?,
+                    None => {
+                        if let Err(e) = answer.within_room() {
+                            if snails.len() > 1 {
+                                round.snails = parts;
+                            }
+                            stop_with(round);
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -807,7 +844,7 @@ impl Sink for Probe<'_> {
     fn block_end(&mut self) -> Result<()> {
         match &mut self.hand_on {
             Some(h) => h(self.answer),
-            None => Ok(()),
+            None => self.answer.within_room(),
         }
     }
 
