@@ -105,6 +105,13 @@ fn a_subquery_reading_nothing_around_it_is_a_step_run_once() {
     );
     // The subquery's table read once, after the table around it.
     assert_eq!(round.order, "t_pkey+u_pkey");
+    // A recursion inside a subquery, as PostgreSQL 18.6 answers it over these rows.
+    same(
+        &path,
+        "SELECT t.id FROM a.t t WHERE t.id IN \
+         (WITH RECURSIVE r (n) AS (SELECT 1) SELECT r.n FROM r)",
+        &["1"],
+    );
     same(
         &path,
         "SELECT t.id FROM a.t t WHERE t.id IN (SELECT u.t_id FROM a.u u) ORDER BY t.id",
@@ -427,12 +434,6 @@ fn a_subquery_s_refusals_are_postgresql_s() {
     ] {
         assert_eq!(refused(&path, q), why, "{q}");
     }
-    // A shape another milestone reads, refused by name inside a subquery too.
-    assert!(refused(
-        &path,
-        "SELECT t.id FROM a.t t WHERE t.id IN (WITH RECURSIVE r (n) AS (SELECT 1) SELECT r.n FROM r)"
-    )
-    .contains("WITH RECURSIVE"));
 }
 
 #[test]

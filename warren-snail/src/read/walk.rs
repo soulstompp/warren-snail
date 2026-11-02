@@ -1305,6 +1305,32 @@ pub(crate) fn narrowed(
     }
 }
 
+/// Whether an entry's bounds on the first `levels` of its order are keys it holds, so that a block
+/// they meet holds a page they reach: one level at most, a number of one leaf, a month by its
+/// instants' within a year.
+fn leads_by_its_own(e: &Entry, order: &Order, table: &Table, levels: usize) -> bool {
+    if levels > 1 {
+        return false;
+    }
+    let Some(&l) = order.levels.first() else {
+        return true;
+    };
+    let c = l.column();
+    let Some(slot) = order.leaf_slot(table, c) else {
+        return false;
+    };
+    if table.leaf_count(c) != 1 || crate::write::bounded(table, c) {
+        return false;
+    }
+    let s = &e.columns[slot];
+    match l {
+        Level::MonthUtc(_) => {
+            crate::times::civil(s.min as i64).0 == crate::times::civil(s.max as i64).0
+        }
+        _ => true,
+    }
+}
+
 /// What a question makes of one entry on the walk's level: none of its rows, so it is skipped; all of
 /// a count, taken from its counts; or rows the round reads under it, left open with the columns it
 /// reads. An open entry adds its columns' pages to the walk's bounds. Above the blocks the fewest are
@@ -1534,6 +1560,8 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
         }
     } else if interval == Status::Must && j == 0 {
         whole
+    } else if walk.head.separated && !leads_by_its_own(&e, order, want.table, m.max(j)) {
+        0
     } else {
         slots.len() as u64
     };

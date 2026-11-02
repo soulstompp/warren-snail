@@ -288,18 +288,21 @@ fn an_insert_s_question_takes_no_lock_and_is_refused_naming_it() {
 fn a_refusal_names_the_clause_or_the_call_it_refuses() {
     let path = snail("words");
     let join = "FROM a.t t JOIN a.u u ON u.t_id = t.id";
+    // A LATERAL subquery, answered as PostgreSQL 18.6 answers it over these rows.
+    let b = ask(
+        &path,
+        "SELECT t.id, d.n FROM a.t t, LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d \
+         ORDER BY t.id",
+    );
+    assert_eq!(
+        weather::ints64(b.column(1).as_ref()),
+        [Some(2), Some(1), Some(0), Some(1), Some(0)]
+    );
     for (q, words) in [
-        (
-            "SELECT t.id, d.n FROM a.t t, LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d"
-                .into(),
-            "LATERAL (SELECT count(*) AS n FROM a.u u WHERE u.t_id = t.id) d is not read: a LATERAL \
-             subquery reads the rows before it"
-                .to_string(),
-        ),
         // A function over a join: once "… is no function the DDL declares".
         (
             format!("SELECT a.nothing(t.v) AS c {join}"),
-            "a.nothing(t.v) is not read".into(),
+            "a.nothing(t.v) is not read".to_string(),
         ),
     ] {
         assert_eq!(refused(&path, &q), words, "{q}");

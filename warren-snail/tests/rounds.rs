@@ -561,3 +561,16 @@ fn a_table_kept_to_a_few_keys_reads_their_block_in_part() {
     );
     assert!(kept.column_pages_high > 2, "{q}: more than it reads: {kept:?}");
 }
+
+#[test]
+fn a_lateral_subquery_s_reads_are_the_round_s() {
+    let path = tree("lateral");
+    let table = whole(&path);
+    // Node 3000's two children, 6000 and 6001, each with two children of its own.
+    let q = "SELECT sum(d.n) FROM (SELECT t.id FROM s.t t WHERE t.parent = 3000) k, \
+             LATERAL (SELECT count(*) AS n FROM s.t u WHERE u.parent = k.id) d";
+    let (got, round) = asked(&path, q);
+    assert_eq!(got, 4, "{q}");
+    eprintln!("{table} {:#?}", round.reads.iter().map(|r| (r.order.clone(), r.column_pages_predicted, r.column_pages_held, r.column_pages_read)).collect::<Vec<_>>());
+    assert_eq!(round.reads.len(), 2, "{q}: {round:?}");
+}
