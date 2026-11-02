@@ -580,6 +580,30 @@ fn the_command_reads_a_handed_round_as_its_host_does() {
         recorded_as(&round, &host);
         assert_eq!(counted(&round, "pages_held"), snail.pages_held(), "{name}");
     }
+    // Across two snails, each opened with `--with`.
+    let (a, b) = two("command-with");
+    let snails = opened(&[&a, &b]);
+    let refs: Vec<&Snail> = snails.iter().collect();
+    let room = 64u64 << 10;
+    let mut at = begin_together(&refs, JOIN, Sizes::of(room)).unwrap();
+    assert_eq!(drained(&mut at).0.len(), B as usize);
+    let host = at.round();
+    assert!(host.spill_pages_written > 0);
+    let bytes = room.to_string();
+    let flags = [
+        "--with",
+        b.to_str().unwrap(),
+        "--room",
+        bytes.as_str(),
+        "--handed",
+    ];
+    let (answered, round) = command_reads(&a, "with", JOIN, &flags).unwrap();
+    assert_eq!(answered, B as usize);
+    recorded_as(&round, &host);
+    assert_eq!(
+        counted(&round, "pages_held"),
+        snails.iter().map(Snail::pages_held).sum::<u64>()
+    );
     // Two rooms: the groups a round not counting its answer holds, where a host's stops for them.
     let at = |flags: &[&str]| command_reads(&path, "groups-at", many, flags).unwrap().1;
     let room = (32u64 << 10).to_string();
