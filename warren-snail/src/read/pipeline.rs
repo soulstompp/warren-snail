@@ -17,7 +17,7 @@ use sqlparser::ast::{
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-mod parted;
+pub(super) mod parted;
 pub(super) mod windows;
 
 /// One value of a row: a number whole or with its scale, text, bytes, a truth, or a uuid.

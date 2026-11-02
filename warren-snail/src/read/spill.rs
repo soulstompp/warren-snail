@@ -8,6 +8,7 @@ use crate::cut::PAGE;
 use crate::geo::GeoKind;
 use crate::room::{current, Room};
 use crate::{Error, Result};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const NULL: u8 = 0;
@@ -260,46 +261,66 @@ fn decode(b: &mut Bytes, named: &Named) -> Result<Value> {
     })
 }
 
-/// A place's rows: those the room holds, in order, then those past it, on the round's spill.
-pub(super) struct Run {
-    room: Option<Rc<Room>>,
-    width: usize,
+/// One row, its `width` values, as the spill wrote it.
+fn decode_row(b: &mut Bytes, width: usize, named: &Named) -> Result<Vec<Value>> {
+    let mut row = Vec::with_capacity(width);
+    for _ in 0..width {
+        row.push(decode(b, named)?);
+    }
+    Ok(row)
+}
+
+/// The bytes of rows a place hands on at a time, past its first row: as a block's rows are.
+pub(super) const CHUNK: u64 = 4 * PAGE as u64;
+
+/// A place's rows as they lie: those the room holds, then those written.
+#[derive(Default)]
+struct Stored {
     rows: Vec<Vec<Value>>,
     bytes: u64,
     named: Named,
-    pages: Vec<u64>,
+    /// Each page written, and the bytes of rows it holds.
+    pages: Vec<(u64, u16)>,
     tail: Vec<u8>,
     spilled: usize,
+}
+
+/// A place's rows: those the room holds, in order, then those past it, on the round's spill.
+pub(super) struct Run {
+    room: Option<Rc<Room>>,
+    width: Cell<usize>,
     /// Whether every row is written, a place's rows past the room alone.
     past: bool,
+    stored: RefCell<Stored>,
+    /// Whether the step reading it now is its last, so the rows it holds may be written to make
+    /// room, and how many readers are handing on its rows.
+    last: Cell<bool>,
+    reading: Cell<u32>,
 }
 
 impl Run {
-    /// An empty place of rows `width` values wide, in the room of the round under way.
-    pub(super) fn new(width: usize) -> Run {
+    /// An empty place of rows, in the room of the round under way.
+    pub(super) fn new() -> Run {
         Run {
             room: current(),
-            width,
-            rows: Vec::new(),
-            bytes: 0,
-            named: Named::default(),
-            pages: Vec::new(),
-            tail: Vec::new(),
-            spilled: 0,
+            width: Cell::new(0),
             past: false,
+            stored: RefCell::default(),
+            last: Cell::new(false),
+            reading: Cell::new(0),
         }
     }
 
     /// An empty place of rows past the room, every row written.
-    pub(super) fn past(width: usize) -> Run {
-        let mut run = Run::new(width);
+    pub(super) fn past() -> Run {
+        let mut run = Run::new();
         run.past = true;
         run
     }
 
     /// The rows `rows` held as a place: as many as the room has room for, the rest written.
-    pub(super) fn of(width: usize, rows: Vec<Vec<Value>>) -> Result<Run> {
-        let mut run = Run::new(width);
+    pub(super) fn of(rows: Vec<Vec<Value>>) -> Result<Run> {
+        let run = Run::new();
         for r in rows {
             run.push(r)?;
         }
@@ -309,98 +330,170 @@ impl Run {
 
     /// One row more: held where the room has room for it and no row before it was written, so the
     /// rows keep their order; written otherwise.
-    pub(super) fn push(&mut self, row: Vec<Value>) -> Result<()> {
+    pub(super) fn push(&self, row: Vec<Value>) -> Result<()> {
+        self.width.set(row.len());
         let w = row_width(&row);
+        let mut s = self.stored.borrow_mut();
         let room = match &self.room {
             Some(r) => r,
             None => {
-                self.rows.push(row);
+                s.rows.push(row);
                 return Ok(());
             }
         };
-        if !self.past && self.spilled == 0 && room.hold(w) {
-            self.bytes += w;
-            self.rows.push(row);
+        if !self.past && s.spilled == 0 && room.hold(w) {
+            s.bytes += w;
+            s.rows.push(row);
             return Ok(());
         }
+        let s = &mut *s;
         for v in &row {
-            encode(v, &mut self.named, &mut self.tail);
+            encode(v, &mut s.named, &mut s.tail);
         }
-        self.spilled += 1;
-        while self.tail.len() >= PAGE {
-            let at = room.spill_page(&self.tail[..PAGE])?;
-            self.pages.push(at);
-            self.tail.drain(..PAGE);
+        s.spilled += 1;
+        while s.tail.len() >= PAGE {
+            let at = room.spill_page(&s.tail[..PAGE])?;
+            s.pages.push((at, PAGE as u16));
+            s.tail.drain(..PAGE);
         }
         Ok(())
     }
 
-    /// Writes the rows past the room not yet written, the last page padded.
-    pub(super) fn seal(&mut self) -> Result<()> {
-        if self.tail.is_empty() {
+    /// Writes the rows past the room not yet written, the last page filled with nothing.
+    pub(super) fn seal(&self) -> Result<()> {
+        let mut s = self.stored.borrow_mut();
+        if s.tail.is_empty() {
             return Ok(());
         }
         let room = self.room.as_ref().expect("a run that writes has a room");
-        self.tail.resize(PAGE, 0);
-        let at = room.spill_page(&self.tail)?;
-        self.pages.push(at);
-        self.tail.clear();
+        let valid = s.tail.len() as u16;
+        s.tail.resize(PAGE, 0);
+        let at = room.spill_page(&s.tail)?;
+        s.pages.push((at, valid));
+        s.tail.clear();
         Ok(())
     }
 
     pub(super) fn len(&self) -> usize {
-        self.rows.len() + self.spilled
+        let s = self.stored.borrow();
+        s.rows.len() + s.spilled
     }
 
     /// The rows written past the room.
-    #[cfg(test)]
     pub(super) fn spilled(&self) -> usize {
-        self.spilled
+        self.stored.borrow().spilled
     }
 
     /// The rows held in the room.
     #[cfg(test)]
-    pub(super) fn held(&self) -> &[Vec<Value>] {
-        &self.rows
+    pub(super) fn held(&self) -> std::cell::Ref<'_, Vec<Vec<Value>>> {
+        std::cell::Ref::map(self.stored.borrow(), |s| &s.rows)
     }
 
-    /// The rows written past the room, read back.
-    pub(super) fn read_back(&self) -> Result<Vec<Vec<Value>>> {
-        if self.spilled == 0 {
-            return Ok(Vec::new());
+    /// Reads as the last reader of the rows reads them, so the rows it holds may be written.
+    pub(super) fn last_reader(&self) {
+        self.last.set(true);
+    }
+
+    /// Writes the rows it holds and lets their room go, where the step reading them is the last and
+    /// no reader is handing them on.
+    pub(super) fn write_held(&self) -> Result<()> {
+        if !self.last.get() || self.reading.get() > 0 || self.room.is_none() {
+            return Ok(());
+        }
+        let (rows, bytes) = {
+            let mut s = self.stored.borrow_mut();
+            (std::mem::take(&mut s.rows), std::mem::take(&mut s.bytes))
+        };
+        let room = self.room.as_ref().expect("a run that writes has a room");
+        room.let_go(bytes);
+        {
+            let mut s = self.stored.borrow_mut();
+            let s = &mut *s;
+            for row in &rows {
+                for v in row {
+                    encode(v, &mut s.named, &mut s.tail);
+                }
+                s.spilled += 1;
+                while s.tail.len() >= PAGE {
+                    let at = room.spill_page(&s.tail[..PAGE])?;
+                    s.pages.push((at, PAGE as u16));
+                    s.tail.drain(..PAGE);
+                }
+            }
+        }
+        self.seal()
+    }
+
+    /// Hands `each` its rows, in order, a chunk at a time: those held as copies, those written read
+    /// back, one chunk in memory at a time.
+    pub(super) fn each_chunk(
+        &self,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<()> {
+        self.reading.set(self.reading.get() + 1);
+        let done = self.chunks(each);
+        self.reading.set(self.reading.get() - 1);
+        done
+    }
+
+    fn chunks(&self, each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>) -> Result<()> {
+        let held = self.stored.borrow().rows.len();
+        let mut chunk = Chunk::new(each);
+        for i in 0..held {
+            let row = self.stored.borrow().rows[i].clone();
+            chunk.push(row)?;
+        }
+        let (pages, tail, named, spilled) = {
+            let s = self.stored.borrow();
+            (s.pages.clone(), s.tail.clone(), s.named.clone(), s.spilled)
+        };
+        if spilled == 0 {
+            return chunk.finish();
         }
         let room = self.room.as_ref().expect("a run that writes has a room");
-        let mut all = Vec::with_capacity(self.pages.len() * PAGE + self.tail.len());
+        let width = self.width.get();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut at = 0;
+        let mut next = 0;
         let mut page = vec![0u8; PAGE];
-        for &at in &self.pages {
-            room.spilled_page(at, &mut page)?;
-            all.extend_from_slice(&page);
+        for _ in 0..spilled {
+            let row = loop {
+                let mut b = Bytes { b: &bytes, at };
+                match decode_row(&mut b, width, &named) {
+                    Ok(row) => {
+                        at = b.at;
+                        break row;
+                    }
+                    Err(e) => {
+                        bytes.drain(..at);
+                        at = 0;
+                        if next < pages.len() {
+                            let (p, valid) = pages[next];
+                            room.spilled_page(p, &mut page)?;
+                            bytes.extend_from_slice(&page[..valid as usize]);
+                            next += 1;
+                        } else if next == pages.len() && !tail.is_empty() {
+                            bytes.extend_from_slice(&tail);
+                            next += 1;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            };
+            chunk.push(row)?;
         }
-        all.extend_from_slice(&self.tail);
-        let mut b = Bytes { b: &all, at: 0 };
-        let mut out = Vec::with_capacity(self.spilled);
-        for _ in 0..self.spilled {
-            let mut row = Vec::with_capacity(self.width);
-            for _ in 0..self.width {
-                row.push(decode(&mut b, &self.named)?);
-            }
-            out.push(row);
-        }
-        Ok(out)
+        chunk.finish()
     }
 
     /// Every row, in order: those held, then those written, read back.
     pub(super) fn rows(&self) -> Result<Vec<Vec<Value>>> {
-        let mut out = self.rows.clone();
-        out.extend(self.read_back()?);
-        Ok(out)
-    }
-
-    /// Every row, in order, the room they held let go.
-    pub(super) fn into_rows(mut self) -> Result<Vec<Vec<Value>>> {
-        let back = self.read_back()?;
-        let mut out = std::mem::take(&mut self.rows);
-        out.extend(back);
+        let mut out = Vec::with_capacity(self.len());
+        self.each_chunk(&mut |c| {
+            out.extend(c);
+            Ok(())
+        })?;
         Ok(out)
     }
 }
@@ -408,8 +501,122 @@ impl Run {
 impl Drop for Run {
     fn drop(&mut self) {
         if let Some(r) = &self.room {
-            r.let_go(self.bytes);
+            r.let_go(self.stored.borrow().bytes);
         }
+    }
+}
+
+/// Rows gathered into chunks and handed on as each fills, what one holds counted while it is handed.
+pub(super) struct Chunk<'e> {
+    rows: Vec<Vec<Value>>,
+    bytes: u64,
+    each: &'e mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+}
+
+impl<'e> Chunk<'e> {
+    pub(super) fn new(each: &'e mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>) -> Chunk<'e> {
+        Chunk {
+            rows: Vec::new(),
+            bytes: 0,
+            each,
+        }
+    }
+
+    pub(super) fn push(&mut self, row: Vec<Value>) -> Result<()> {
+        self.bytes += row_width(&row);
+        self.rows.push(row);
+        if self.bytes >= CHUNK {
+            self.hand()?;
+        }
+        Ok(())
+    }
+
+    fn hand(&mut self) -> Result<()> {
+        let _flying = crate::room::flying(self.bytes);
+        self.bytes = 0;
+        (self.each)(std::mem::take(&mut self.rows))
+    }
+
+    /// Hands on the rows gathered.
+    pub(super) fn finish(mut self) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        self.hand()
+    }
+}
+
+/// A place's rows as a chain of runs one after another: arms a UNION ALL appends, or a recursion's
+/// runs, none copied.
+#[derive(Clone, Default)]
+pub(super) struct Rows(Vec<Rc<Run>>);
+
+impl Rows {
+    pub(super) fn one(run: Run) -> Rows {
+        Rows(vec![Rc::new(run)])
+    }
+
+    pub(super) fn of(rows: Vec<Vec<Value>>) -> Result<Rows> {
+        Ok(Rows::one(Run::of(rows)?))
+    }
+
+    /// Those of `other` after these.
+    pub(super) fn then(mut self, other: Rows) -> Rows {
+        self.0.extend(other.0);
+        self
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.iter().map(|r| r.len()).sum()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.iter().all(|r| r.len() == 0)
+    }
+
+    /// Whether every row is held in the room.
+    pub(super) fn held_whole(&self) -> bool {
+        self.0.iter().all(|r| r.spilled() == 0)
+    }
+
+    /// Reads as the last reader of the rows reads them.
+    pub(super) fn last_reader(&self) {
+        self.0.iter().for_each(|r| r.last_reader());
+    }
+
+    /// Writes the rows held and lets their room go, where the step reading them is the last.
+    pub(super) fn write_held(&self) -> Result<()> {
+        for r in &self.0 {
+            r.write_held()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn each_chunk(
+        &self,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<()> {
+        for r in &self.0 {
+            r.each_chunk(each)?;
+        }
+        Ok(())
+    }
+
+    /// Every row, in order.
+    pub(super) fn all(&self) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::with_capacity(self.len());
+        self.each_chunk(&mut |c| {
+            out.extend(c);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Calls `f` with the rows held, each run's in turn, where every row is held.
+    pub(super) fn with_held<T>(&self, f: impl FnOnce(&[&Vec<Value>]) -> T) -> T {
+        let guards: Vec<_> = self.0.iter().map(|r| r.stored.borrow()).collect();
+        let rows: Vec<&Vec<Value>> = guards.iter().flat_map(|g| g.rows.iter()).collect();
+        f(&rows)
     }
 }
 
@@ -437,13 +644,13 @@ mod tests {
         for i in 0..100 {
             many.push(vec![Value::Int(i % 10), Value::Text(format!("row {}", i % 10))]);
         }
-        let run = Run::of(2, many.clone()).unwrap();
+        let run = Run::of(many.clone()).unwrap();
         assert_eq!((run.held().len(), run.spilled()), (52, 48));
         assert_eq!(room.spill_pages(), (1, 0));
+        assert_eq!(room.most(), 52 * 19);
         let shown = |r: &[Vec<Value>]| format!("{r:?}");
         assert_eq!(shown(&run.rows().unwrap()), shown(&many));
         assert_eq!(room.spill_pages(), (1, 1));
-        assert_eq!(room.most(), 52 * 19);
         drop(run);
         assert!(room.hold(1000), "the room is let go with the place");
     }
@@ -469,7 +676,7 @@ mod tests {
             }),
             Value::Numeric(crate::numeric::Numeric::parse("NaN").unwrap()),
         ];
-        let run = Run::of(row.len(), vec![row.clone(), row.clone()]).unwrap();
+        let run = Run::of(vec![row.clone(), row.clone()]).unwrap();
         assert_eq!(run.spilled(), 2);
         let back = run.rows().unwrap();
         assert_eq!(back.len(), 2);

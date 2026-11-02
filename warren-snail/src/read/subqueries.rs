@@ -8,6 +8,7 @@
 use super::pipeline::{self, Casings, Computed, Frame, Key, Value};
 use super::question::Question;
 use super::relations::{self, Accrued, Asked, Col, Outer, Reads, Steps};
+use super::spill::{Rows, Run};
 use super::typed::Types;
 use super::Round;
 use crate::catalog::{Catalog, ColumnType};
@@ -29,6 +30,9 @@ pub(super) struct Kept {
     /// Each set of values the rows that may ask for it give what it names, where they are known
     /// before the first asks: its tables are kept to their keys.
     pub(super) around: RefCell<Option<Vec<Vec<Value>>>>,
+    around_held: RefCell<Option<crate::room::Holding>>,
+    /// Each question's rows, kept in the round's room as they are read.
+    places: RefCell<HashMap<String, Rows>>,
 }
 
 /// The snail's tables read through what a subquery keeps: each question from the file once, then
@@ -53,8 +57,33 @@ impl Reads for Cached<'_> {
         Ok((b, r))
     }
 
-    fn read_kept(&self, q: &Question, kept: &super::walk::KeySet) -> Result<(RecordBatch, Round)> {
-        self.reads.read_kept(q, kept)
+    fn read_each(
+        &self,
+        q: &Question,
+        kept: Option<&super::walk::KeySet>,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round> {
+        if kept.is_some() {
+            return self.reads.read_each(q, kept, each);
+        }
+        let key = format!("{q:?}");
+        let found = self.kept.places.borrow().get(&key).cloned();
+        if let Some(rows) = found {
+            rows.each_chunk(each)?;
+            return Ok(Round::default());
+        }
+        let run = Run::new();
+        let round = self.reads.read_each(q, None, &mut |rows| {
+            let mut copy = Vec::with_capacity(rows.len());
+            for r in &rows {
+                copy.push(r.clone());
+            }
+            copy.into_iter().try_for_each(|r| run.push(r))?;
+            each(rows)
+        })?;
+        run.seal()?;
+        self.kept.places.borrow_mut().insert(key, Rows::one(run));
+        Ok(round)
     }
 
     fn snails(&self) -> usize {
@@ -269,10 +298,10 @@ impl<'q> Plan<'q> {
                 made,
                 casings,
                 Some(&outer),
-                &mut Accrued::default(),
+                &Accrued::default(),
             )
         };
-        let none = relations::made_by(probe, query, made, casings, None, &mut Accrued::default());
+        let none = relations::made_by(probe, query, made, casings, None, &Accrued::default());
         let (m, around, reads_around) = match none {
             Ok((m, _)) => (m, None, Vec::new()),
             Err(_) => {
@@ -323,7 +352,7 @@ pub(super) struct Subs<'a, 'q> {
     casings: &'a Casings,
     /// The step's columns, those of the query around it among them.
     columns: &'a [Col],
-    accrued: RefCell<&'a mut Accrued>,
+    accrued: &'a Accrued,
 }
 
 impl<'a, 'q> Subs<'a, 'q> {
@@ -333,7 +362,7 @@ impl<'a, 'q> Subs<'a, 'q> {
         made: &'a Steps,
         casings: &'a Casings,
         columns: &'a [Col],
-        accrued: &'a mut Accrued,
+        accrued: &'a Accrued,
     ) -> Subs<'a, 'q> {
         Subs {
             plans,
@@ -341,27 +370,43 @@ impl<'a, 'q> Subs<'a, 'q> {
             made,
             casings,
             columns,
-            accrued: RefCell::new(accrued),
+            accrued,
         }
     }
 
     /// Before any row asks: each set of values `rows` give what each subquery reading the query
     /// around it names.
-    pub(super) fn foresee(&self, rows: &[Vec<Value>]) {
+    pub(super) fn foresee(&self, rows: &Rows) -> Result<()> {
         for plan in self.plans.plans.values() {
             let Some(places) = &plan.around else {
                 continue;
             };
             let mut seen = HashSet::new();
             let mut sets = Vec::new();
-            for r in rows {
-                let set: Vec<Value> = places.iter().map(|&i| r[i].clone()).collect();
-                if seen.insert(set.iter().map(pipeline::key).collect::<Vec<Key>>()) {
-                    sets.push(set);
+            let mut held = crate::room::holding(0);
+            let mut over = false;
+            rows.each_chunk(&mut |c| {
+                for r in &c {
+                    if over {
+                        break;
+                    }
+                    let set: Vec<Value> = places.iter().map(|&i| r[i].clone()).collect();
+                    if seen.insert(set.iter().map(pipeline::key).collect::<Vec<Key>>()) {
+                        if !held.fits(2 * super::spill::row_width(&set)) {
+                            over = true;
+                            break;
+                        }
+                        sets.push(set);
+                    }
                 }
+                Ok(())
+            })?;
+            if !over {
+                *plan.kept.around.borrow_mut() = Some(sets);
+                *plan.kept.around_held.borrow_mut() = Some(held);
             }
-            *plan.kept.around.borrow_mut() = Some(sets);
         }
+        Ok(())
     }
 
     /// What a subquery returns for a row: once, where it reads nothing of the query around it; else
@@ -371,14 +416,13 @@ impl<'a, 'q> Subs<'a, 'q> {
             if let Some(r) = plan.once.borrow().as_ref() {
                 return Ok(r.clone());
             }
-            let mut accrued = self.accrued.borrow_mut();
             let (m, _) = relations::made_by(
                 self.asked,
                 plan.query,
                 self.made,
                 self.casings,
                 None,
-                &mut accrued,
+                self.accrued,
             )?;
             let r = Returned::new(m.rel.rows);
             *plan.once.borrow_mut() = Some(r.clone());
@@ -408,14 +452,13 @@ impl<'a, 'q> Subs<'a, 'q> {
             reads: &cached,
             ..self.asked
         };
-        let mut accrued = self.accrued.borrow_mut();
         let (m, _) = relations::made_by(
             asked,
             plan.query,
             self.made,
             self.casings,
             Some(&outer),
-            &mut accrued,
+            self.accrued,
         )?;
         let r = Returned::new(m.rel.rows);
         plan.by_values.borrow_mut().insert(key, r.clone());

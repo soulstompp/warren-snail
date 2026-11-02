@@ -3,11 +3,12 @@
 //! term over the working table, and the rows it adds, every row under UNION ALL and under UNION
 //! only those not yet made, are the next; the query is every row made, once a round adds none.
 
-use super::{arm_of, carried_met, carried_of, coerce, met, Arm, Made, Making};
+use super::{arm_of, carried_met, carried_of, coerce, in_types, met, Arm, Made, Making};
 use super::{Step, Untyped};
 use crate::catalog::{Catalog, ColumnType};
 use crate::read::collate::Carried;
 use crate::read::pipeline::{self, Relation, Value};
+use crate::read::spill::{Rows, Run};
 use crate::{Error, Result};
 use sqlparser::ast::{
     Cte, JoinOperator, LimitClause, ObjectName, ObjectNamePart, Query, SetExpr, SetOperator,
@@ -527,36 +528,46 @@ pub(in crate::read) fn make(
         .map(|k| making.casings.carried_under(k))
         .collect::<Result<Vec<_>>>()?;
     let mut seen: HashSet<Vec<pipeline::Key>> = HashSet::new();
-    let mut fresh = |rows: Vec<Vec<Value>>| -> Result<Vec<Vec<Value>>> {
-        if rec.all {
-            return Ok(rows);
-        }
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows {
-            if seen.insert(pipeline::row_key(&row, &under)?) {
-                kept.push(row);
+    let mut seen_held = crate::room::holding(0);
+    // Each row of a term in the recursion's types, where it is new: a place of its own.
+    let mut fresh = |rows: &Rows, from: &[Option<ColumnType>], untyped: &[Untyped]| -> Result<Run> {
+        let run = Run::new();
+        rows.each_chunk(&mut |c| {
+            for mut row in c {
+                in_types(&mut row, from, untyped, &types)?;
+                if !rec.all {
+                    let k = pipeline::row_key(&row, &under)?;
+                    if seen.contains(&k) {
+                        continue;
+                    }
+                    seen_held.more(crate::read::spill::row_width(&row));
+                    seen.insert(k);
+                }
+                run.push(row)?;
             }
-        }
-        Ok(kept)
+            Ok(())
+        })?;
+        run.seal()?;
+        Ok(run)
     };
-    let rows = assigned(seed.rows, &seed.types, &seed.untyped, &types)?;
-    let mut working = fresh(rows)?;
-    let mut all_rows = working.clone();
-    // Every row made, and the working table, held in the round's room.
-    let mut held = crate::room::holding(crate::read::spill::rows_width(&all_rows));
+    let mut working = fresh(&seed.rows, &seed.types, &seed.untyped)?;
+    let mut total = working.len();
+    // Every run's working table one after another, none copied.
+    let mut all = Rows::default();
     loop {
-        making.made.insert(
-            name.clone(),
-            std::rc::Rc::new(Made::of(
-                Relation {
-                    names: names.clone(),
-                    rows: std::mem::take(&mut working),
-                    order: None,
-                },
-                types.iter().map(|&t| Some(t)).collect(),
-                carried.clone(),
-            )),
+        let run = Rows::one(working);
+        all = all.then(run.clone());
+        let mut table = Made::of(
+            Relation {
+                names: names.clone(),
+                rows: Vec::new(),
+                order: None,
+            },
+            types.iter().map(|&t| Some(t)).collect(),
+            carried.clone(),
         );
+        table.kept = Some(run);
+        making.made.insert(name.clone(), std::rc::Rc::new(table));
         for s in &mut before[rec.body.clone()] {
             making.make(s)?;
         }
@@ -607,51 +618,29 @@ pub(in crate::read) fn make(
                 }
             }
         }
-        let added = fresh(assigned(r.rows, &r.types, &r.untyped, &types)?)?;
-        if added.is_empty() {
+        let added = fresh(&r.rows, &r.types, &r.untyped)?;
+        if added.len() == 0 {
             break;
         }
-        if all_rows.len() + added.len() > MOST_ROWS {
+        total += added.len();
+        if total > MOST_ROWS {
             return Err(Error::new(format!(
                 "recursive query \"{name}\" made more than {MOST_ROWS} rows: a recursion is read \
                  only where it ends within a row group's rows"
             )));
         }
-        held.more(crate::read::spill::rows_width(&added));
-        all_rows.extend(added.iter().cloned());
         working = added;
     }
-    Ok(Made::of(
+    let mut made = Made::of(
         Relation {
             names,
-            rows: all_rows,
+            rows: Vec::new(),
             order: None,
         },
         types.into_iter().map(Some).collect(),
         carried,
-    ))
+    );
+    made.kept = Some(all);
+    Ok(made)
 }
 
-/// A term's rows in the recursion's types, each value of another type or written as a literal
-/// assigned to its column's.
-fn assigned(
-    mut rows: Vec<Vec<Value>>,
-    from: &[Option<ColumnType>],
-    untyped: &[Untyped],
-    types: &[ColumnType],
-) -> Result<Vec<Vec<Value>>> {
-    for (c, &ty) in types.iter().enumerate() {
-        let quoted = !matches!(untyped[c], Untyped::No);
-        if from[c] == Some(ty) && !quoted {
-            continue;
-        }
-        for row in &mut rows {
-            let v = std::mem::replace(&mut row[c], Value::Null);
-            row[c] = match v.is_null() {
-                true => v,
-                false => coerce(v, ty, quoted)?,
-            };
-        }
-    }
-    Ok(rows)
-}

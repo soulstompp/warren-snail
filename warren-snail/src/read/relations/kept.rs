@@ -6,9 +6,12 @@ use super::{conjuncts, stored, Merged, Node, Reading};
 use crate::catalog::{Column, ColumnType, Level, Table};
 use crate::places::{column_byte_key, KeyValue};
 use crate::read::pipeline::{self, Key, Value};
+use crate::read::spill::Rows;
 use crate::read::walk::KeySet;
+use crate::Result;
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::HashSet;
+use std::rc::Rc;
 
 /// What rows made before a table hold of the columns it meets them on: the table's places in the
 /// FROM, each row's values there, and whether a NULL meets a NULL, as a set operation's arms meet;
@@ -16,8 +19,48 @@ use std::collections::HashSet;
 #[derive(Clone)]
 pub(in crate::read) struct Keep {
     pub(in crate::read) places: Vec<usize>,
-    pub(in crate::read) values: Vec<Vec<Value>>,
+    pub(in crate::read) values: Rc<Vec<Vec<Value>>>,
     pub(in crate::read) nulls_meet: bool,
+    /// What the keys hold in the round's room.
+    _held: Rc<crate::room::Holding>,
+}
+
+impl Keep {
+    /// What `made` holds, each row `of` read on it, each set of values once: none where they do not
+    /// fit the round's room, a key set being held three ways as the walk finds rows by it.
+    pub(in crate::read) fn of_rows(
+        places: Vec<usize>,
+        made: &Rows,
+        nulls_meet: bool,
+        of: &mut dyn FnMut(&[Value]) -> Result<Vec<Value>>,
+    ) -> Result<Option<Keep>> {
+        let mut seen: HashSet<Vec<Key>> = HashSet::new();
+        let mut values = Vec::new();
+        let mut held = crate::room::holding(0);
+        let mut over = false;
+        made.each_chunk(&mut |c| {
+            for r in &c {
+                if over {
+                    break;
+                }
+                let v = of(r)?;
+                if seen.insert(v.iter().map(pipeline::key).collect()) {
+                    if !held.fits(3 * crate::read::spill::row_width(&v)) {
+                        over = true;
+                        break;
+                    }
+                    values.push(v);
+                }
+            }
+            Ok(())
+        })?;
+        Ok((!over).then(|| Keep {
+            places,
+            values: Rc::new(values),
+            nulls_meet,
+            _held: Rc::new(held),
+        }))
+    }
 }
 
 /// The value a level of `column` keys from a value, where a kept read finds rows by it: an integer,
@@ -185,9 +228,9 @@ impl Reading<'_> {
         on: Option<&Expr>,
         merged: &[Merged],
         table: &Node,
-        made: &[Vec<Value>],
+        made: &Rows,
         made_at: usize,
-    ) -> Option<Keep> {
+    ) -> Result<Option<Keep>> {
         let mut conds = Vec::new();
         if let Some(e) = on {
             conjuncts(e, &mut conds);
@@ -208,7 +251,7 @@ impl Reading<'_> {
 
     /// What the FROM's rows made so far hold of the columns of a table among its items that a
     /// conjunct of WHERE meets them on by =: `made` the rows of the items before it.
-    pub(super) fn keep_for_item(&self, table: &Node, made: &[Vec<Value>]) -> Option<Keep> {
+    pub(super) fn keep_for_item(&self, table: &Node, made: &Rows) -> Result<Option<Keep>> {
         let conds = self.wheres.clone();
         let pairs: Vec<(usize, usize)> = self
             .equal_places(&conds, 0, self.from.outer_at)
@@ -228,20 +271,18 @@ impl Reading<'_> {
     fn keep_of_pairs(
         &self,
         pairs: &[(usize, usize)],
-        made: &[Vec<Value>],
+        made: &Rows,
         made_at: usize,
         nulls_meet: bool,
-    ) -> Option<Keep> {
+    ) -> Result<Option<Keep>> {
         if pairs.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(Keep {
-            places: pairs.iter().map(|p| p.0).collect(),
-            values: made
-                .iter()
-                .map(|r| pairs.iter().map(|p| r[p.1 - made_at].clone()).collect())
-                .collect(),
+        Keep::of_rows(
+            pairs.iter().map(|p| p.0).collect(),
+            made,
             nulls_meet,
-        })
+            &mut |r| Ok(pairs.iter().map(|p| r[p.1 - made_at].clone()).collect()),
+        )
     }
 }

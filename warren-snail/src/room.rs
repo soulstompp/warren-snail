@@ -91,6 +91,7 @@ impl Pages {
 pub struct Room {
     sizes: RefCell<Sizes>,
     held: Cell<u64>,
+    flying: Cell<u64>,
     most: Cell<u64>,
     pages: RefCell<Pages>,
     spill: RefCell<Option<File>>,
@@ -106,6 +107,7 @@ impl Room {
         Rc::new(Room {
             sizes: RefCell::new(sizes),
             held: Cell::new(0),
+            flying: Cell::new(0),
             most: Cell::new(0),
             pages: Default::default(),
             spill: RefCell::new(None),
@@ -126,6 +128,7 @@ impl Room {
     /// Begins a round: nothing held, no page kept, and no spill.
     pub fn begin(&self) {
         self.held.set(0);
+        self.flying.set(0);
         self.most.set(0);
         *self.pages.borrow_mut() = Pages::default();
         *self.spill.borrow_mut() = None;
@@ -139,10 +142,21 @@ impl Room {
     }
 
     fn noted(&self) {
-        let now = self.held.get() + self.page_bytes();
+        let now = self.held.get() + self.page_bytes() + self.flying.get();
         if now > self.most.get() {
             self.most.set(now);
         }
+    }
+
+    /// Rows handed from place to place, a chunk at a time: counted in the most the round holds, and
+    /// taking no room from the places that hold rows.
+    fn fly(&self, bytes: u64) {
+        self.flying.set(self.flying.get() + bytes);
+        self.noted();
+    }
+
+    fn land(&self, bytes: u64) {
+        self.flying.set(self.flying.get().saturating_sub(bytes));
     }
 
     /// Whether `bytes` more rows fit, the pages kept for later reads let go, the longest unused
@@ -376,6 +390,24 @@ impl Drop for Entered {
     }
 }
 
+/// Counts `bytes` of rows handed from place to place, as long as the guard lives.
+pub struct Flying(u64);
+
+pub fn flying(bytes: u64) -> Flying {
+    if let Some(r) = current() {
+        r.fly(bytes);
+    }
+    Flying(bytes)
+}
+
+impl Drop for Flying {
+    fn drop(&mut self) {
+        if let Some(r) = current() {
+            r.land(self.0);
+        }
+    }
+}
+
 /// Counts `bytes` held at a place that cannot write them, as long as the guard lives.
 pub struct Holding(u64);
 
@@ -390,6 +422,20 @@ pub fn holding(bytes: u64) -> Holding {
 }
 
 impl Holding {
+    /// Adds `bytes` to what the place holds where the room has room for them: whether it has.
+    pub fn fits(&mut self, bytes: u64) -> bool {
+        match current() {
+            Some(r) => {
+                let fits = r.hold(bytes);
+                if fits {
+                    self.0 += bytes;
+                }
+                fits
+            }
+            None => true,
+        }
+    }
+
     /// Adds `bytes` to what the place holds.
     pub fn more(&mut self, bytes: u64) {
         if let Some(r) = current() {

@@ -253,6 +253,20 @@ fn a_page_read_once_in_a_round_is_not_read_again() {
     assert_eq!(round.column_pages_read, table, "{q}: {round:?}");
 }
 
+/// What one chunk of rows of `row` bytes holds, at most: a block's rows as the table hands them on, or
+/// the rows that first pass four pages, handed back from the spill.
+fn one_chunk(path: &PathBuf, row: u64) -> u64 {
+    let block = Snail::open(path)
+        .unwrap()
+        .blocks()
+        .unwrap()
+        .iter()
+        .map(|b| b.rows)
+        .max()
+        .unwrap();
+    (block * row).max((4 * 4096u64).div_ceil(row) * row)
+}
+
 /// A directory of the test's own, for a round's spill.
 fn spill_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("rounds-spill-{name}"));
@@ -283,11 +297,10 @@ fn a_step_past_the_round_s_room_writes_the_rows_past_it_once_and_reads_them_back
         (pages, pages),
         "{q}: {round:?}"
     );
-    // The step reading it makes its FROM whole before it reads it: the most held is every row, as
-    // it is read back, beside what the room keeps.
+    // The step reading it is handed its FROM a chunk at a time: the most held is the room, and what
+    // one chunk holds, the rows of a block of the table or of four pages of the spill.
     assert!(
-        round.bytes_held >= N as u64 * row + held * row
-            && round.bytes_held <= N as u64 * row + room,
+        round.bytes_held >= held * row && round.bytes_held <= room + one_chunk(&path, row),
         "{q}: {round:?}"
     );
     assert_eq!(

@@ -72,8 +72,13 @@ impl relations::Reads for Snail {
         }
     }
 
-    fn read_kept(&self, q: &Question, kept: &KeySet) -> Result<(RecordBatch, Round)> {
-        self.ask_one_kept(q, None, Some(kept))
+    fn read_each(
+        &self,
+        q: &Question,
+        kept: Option<&KeySet>,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round> {
+        self.read_blocks(q, kept, each)
     }
 
     fn snails(&self) -> usize {
@@ -1443,9 +1448,7 @@ impl Snail {
         self.ask_one_kept(q, order, None)
     }
 
-    /// A question on one table, kept to the keys `kept` holds where it is given them: the round
-    /// along the order whose pages are fewest, those keys known before it is priced.
-    pub(super) fn ask_one_kept(
+    fn ask_one_kept(
         &self,
         q: &Question,
         order: Option<&str>,
@@ -1458,6 +1461,32 @@ impl Snail {
         let batch = answer.finish(&[table], &q.select, &q.order)?;
         round.rows = batch.num_rows() as u64;
         Ok((batch, round))
+    }
+
+    /// A question of rows on one table, kept to the keys `kept` holds where it is given them: the
+    /// round along the order whose pages are fewest, those keys known before it is priced, its rows
+    /// handed to `each` a block at a time as they are read.
+    pub(super) fn read_blocks(
+        &self,
+        q: &Question,
+        kept: Option<&KeySet>,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round> {
+        let table = &self.catalog.tables[q.sides[0].table];
+        let mut rows = 0u64;
+        let mut blocks = Blocks {
+            table,
+            q,
+            answer: Answer::new(&q.select).typed(&[table]),
+            feed: |batch: RecordBatch| {
+                rows += batch.num_rows() as u64;
+                each(pipeline::relation_of(&batch)?.rows)
+            },
+        };
+        let (mut round, _, _) = self.scan_one(q, None, kept, &mut blocks)?;
+        drop(blocks);
+        round.rows = rows;
+        Ok(round)
     }
 
     /// A question on one table read along an order into a sink: the round, and what the directory
