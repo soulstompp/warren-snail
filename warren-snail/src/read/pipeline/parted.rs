@@ -1,11 +1,12 @@
 //! A place's rows held by a hash of their keys, in the round's room. Past it, the rows of the keys
 //! that come last, by that hash, are written, a row at a time, so that every key's rows are whole
 //! among the rows of one pass: the rows held of every key but the last held, then, read back with the
-//! rows of that one, the next. Held for windows that read their partitions whole, and for a hash a
-//! join or a subquery meets rows by.
+//! rows of that one, the next. Rows within two rooms are written as one part; past that as many as
+//! each fits the room, each row written once and read back once. Held for windows that read their
+//! partitions whole, and for a subquery's table met by its keys.
 
 use super::{eval, grouped_key, key_under, Frame, Key, Relation, Value};
-use crate::read::spill::{row_width, Run, CHUNK};
+use crate::read::spill::{row_width, Parts, Queue, CHUNK};
 use crate::room::{current, Room};
 use crate::Result;
 use sqlparser::ast::Expr;
@@ -46,9 +47,15 @@ pub(in crate::read) struct Parted {
     free: Vec<usize>,
     /// The rows held by their keys' hashes, the greatest first, and their places among them.
     heap: BinaryHeap<(u64, usize)>,
-    past: Option<Run>,
-    /// What the pass given last left: the rows of the last key held, and the rows written.
-    after: Option<(Vec<Held>, Run)>,
+    /// The rows being written of the hashes being read, those to come known as bytes where they are.
+    writing: Option<Parts>,
+    range: (u64, u64),
+    expected: Option<u64>,
+    /// How many rows are to come, where known, its bytes read from the first row written.
+    pub(in crate::read) rows_to_come: Option<u64>,
+    /// The parts written and still to read; the rows of the last key held, kept for the next pass.
+    queue: Queue,
+    carried: Vec<Held>,
     seq: u64,
     pub(super) order: Option<usize>,
 }
@@ -86,8 +93,12 @@ impl Parted {
             held_bytes: 0,
             free: Vec::new(),
             heap: BinaryHeap::new(),
-            past: None,
-            after: None,
+            writing: None,
+            range: (0, u64::MAX),
+            expected: None,
+            rows_to_come: None,
+            queue: Queue::default(),
+            carried: Vec::new(),
             seq: 0,
             order: None,
         }
@@ -109,6 +120,9 @@ impl Parted {
                     room.hold_anyway(bytes);
                     break;
                 }
+                if self.expected.is_none() {
+                    self.expected = self.rows_to_come.map(|n| n * bytes);
+                }
                 match self.heap.peek() {
                     Some(&(top, _)) if hash < top => {
                         let (_, at) = self.heap.pop().expect("a row is held");
@@ -116,9 +130,9 @@ impl Parted {
                         self.free.push(at);
                         self.held_bytes -= h.bytes;
                         room.let_go(h.bytes);
-                        self.write(h.row)?;
+                        self.write(h.hash, h.row)?;
                     }
-                    _ => return self.write(row),
+                    _ => return self.write(hash, row),
                 }
             }
         }
@@ -143,31 +157,47 @@ impl Parted {
         Ok(())
     }
 
-    fn write(&mut self, row: Vec<Value>) -> Result<()> {
-        self.past.get_or_insert_with(Run::past).push(row)
+    fn write(&mut self, hash: u64, row: Vec<Value>) -> Result<()> {
+        let (lo, hi) = self.range;
+        let expected = self.expected;
+        self.writing
+            .get_or_insert_with(|| Parts::new(lo, hi, expected))
+            .push(hash, row)
     }
 
     /// The next pass: every row where none was written; else the rows held of every key but the
-    /// last held, that one's kept for the next pass with the rows read back. Where the last key
+    /// last held, that one's kept for the next pass with the parts read back next. Where the last key
     /// held is all a pass holds, it is past the room by itself, and is held whole.
     pub(in crate::read) fn pass(
         &mut self,
         hash_of: &mut dyn FnMut(&[Value]) -> Result<u64>,
     ) -> Result<Option<Pass>> {
-        if let Some((carried, past)) = self.after.take() {
+        // The rows of the key the pass before kept, and the next parts as many as the room holds.
+        let carried = std::mem::take(&mut self.carried);
+        let carrying = !carried.is_empty() || self.writing.is_none();
+        if carrying && self.heap.is_empty() {
+            let bytes = bytes_of(&carried);
             if let Some(r) = &self.room {
-                r.let_go(bytes_of(&carried));
+                r.let_go(bytes);
             }
+            let free = self.room.as_ref().map_or(u64::MAX, |r| r.free_bytes());
+            let next = self.queue.next(free.saturating_sub(bytes).max(CHUNK));
             for h in carried {
                 self.push(h.hash, h.row)?;
             }
-            past.each_chunk(&mut |c| {
-                for r in c {
-                    let h = hash_of(&r)?;
-                    self.push(h, r)?;
+            if let Some((lo, hi, total, runs)) = next {
+                self.range = (lo, hi);
+                self.expected = Some(total + bytes);
+                for run in runs {
+                    run.each_chunk(&mut |c| {
+                        for r in c {
+                            let h = hash_of(&r)?;
+                            self.push(h, r)?;
+                        }
+                        Ok(())
+                    })?;
                 }
-                Ok(())
-            })?;
+            }
         }
         let mut rows: Vec<Held> = self.held.drain(..).flatten().collect();
         self.heap.clear();
@@ -180,42 +210,52 @@ impl Parted {
             below,
             room: room.clone(),
         };
-        let Some(past) = self.past.take() else {
-            if rows.is_empty() {
+        let Some(written) = self.writing.take() else {
+            if rows.is_empty() && self.queue.is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(pass(rows, None, &self.room)));
+            // Nothing written with them: the next part's first hash bounds them.
+            let below = self.queue.front().map(|(lo, _)| lo);
+            return Ok(Some(pass(rows, below, &self.room)));
         };
-        past.seal()?;
+        written.into_queue(self.range.1, &mut self.queue)?;
         let last = rows.iter().map(|h| h.hash).max();
         let (done, carried): (Vec<Held>, Vec<Held>) =
             rows.into_iter().partition(|h| Some(h.hash) != last);
         if !done.is_empty() {
-            self.after = Some((carried, past));
+            self.carried = carried;
             return Ok(Some(pass(done, last, &self.room)));
         }
+        // One key past the room by itself: its rows held whole, the rest of its part read again.
         let mut whole = carried;
         let mut last = last;
-        past.each_chunk(&mut |c| {
-            for r in c {
-                let hash = hash_of(&r)?;
-                if *last.get_or_insert(hash) == hash {
-                    let bytes = row_width(&r);
-                    if let Some(room) = &self.room {
-                        room.hold_anyway(bytes);
+        let Some((lo, hi, total, runs)) = self.queue.next(0) else {
+            return Ok(Some(pass(whole, None, &self.room)));
+        };
+        self.range = (lo, hi);
+        self.expected = Some(total);
+        for run in runs {
+            run.each_chunk(&mut |c| {
+                for r in c {
+                    let hash = hash_of(&r)?;
+                    if *last.get_or_insert(hash) == hash {
+                        let bytes = row_width(&r);
+                        if let Some(room) = &self.room {
+                            room.hold_anyway(bytes);
+                        }
+                        whole.push(Held {
+                            hash,
+                            seq: 0,
+                            row: r,
+                            bytes,
+                        });
+                    } else {
+                        self.push(hash, r)?;
                     }
-                    whole.push(Held {
-                        hash,
-                        seq: 0,
-                        row: r,
-                        bytes,
-                    });
-                } else {
-                    self.push(hash, r)?;
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
         let below = last.map(|h| h.saturating_add(1));
         Ok(Some(pass(whole, below, &self.room)))
     }

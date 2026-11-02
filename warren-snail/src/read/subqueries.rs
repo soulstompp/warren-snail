@@ -13,7 +13,6 @@ use super::typed::Types;
 use super::Round;
 use crate::catalog::{Catalog, ColumnType};
 use crate::{Error, Result};
-use arrow::array::RecordBatch;
 use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, OrderByKind, Query, SelectItem, SetExpr, TableFactor,
 };
@@ -25,7 +24,6 @@ use std::rc::Rc;
 /// path read, and each of its steps' FROM rows where they read nothing of the query around it.
 #[derive(Default)]
 pub(super) struct Kept {
-    read: RefCell<HashMap<String, RecordBatch>>,
     pub(super) rows: RefCell<HashMap<String, Rc<relations::Parted>>>,
     /// Each set of values the rows that may ask for it give what it names, where they are known
     /// before the first asks: its tables are kept to their keys.
@@ -53,14 +51,27 @@ impl Reads for Cached<'_> {
         self.reads.catalog()
     }
 
-    fn read(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)> {
-        let key = format!("{order:?} {q:?}");
-        if let Some(b) = self.kept.read.borrow().get(&key) {
-            return Ok((b.clone(), Round::default()));
+    fn read_join(
+        &self,
+        q: &Question,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round> {
+        let key = format!("{q:?}");
+        let found = self.kept.places.borrow().get(&key).cloned();
+        if let Some(rows) = found {
+            rows.each_chunk(each)?;
+            return Ok(Round::default());
         }
-        let (b, r) = self.reads.read(q, order)?;
-        self.kept.read.borrow_mut().insert(key, b.clone());
-        Ok((b, r))
+        let run = Run::new();
+        let round = self.reads.read_join(q, &mut |rows| {
+            for r in &rows {
+                run.push(r.clone())?;
+            }
+            each(rows)
+        })?;
+        run.seal()?;
+        self.kept.places.borrow_mut().insert(key, Rows::one(run));
+        Ok(round)
     }
 
     fn strand_wins(&self, q: &Question, strand: &str) -> Result<bool> {
@@ -72,19 +83,21 @@ impl Reads for Cached<'_> {
         q: &Question,
         order: Option<&str>,
         kept: Option<&super::walk::KeySet>,
+        most: &std::cell::Cell<Option<u64>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         if kept.is_some() || order.is_some() {
-            return self.reads.read_each(q, order, kept, each);
+            return self.reads.read_each(q, order, kept, most, each);
         }
         let key = format!("{q:?}");
         let found = self.kept.places.borrow().get(&key).cloned();
         if let Some(rows) = found {
+            most.set(Some(rows.len() as u64));
             rows.each_chunk(each)?;
             return Ok(Round::default());
         }
         let run = Run::new();
-        let round = self.reads.read_each(q, None, None, &mut |rows| {
+        let round = self.reads.read_each(q, None, None, most, &mut |rows| {
             let mut copy = Vec::with_capacity(rows.len());
             for r in &rows {
                 copy.push(r.clone());

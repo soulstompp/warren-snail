@@ -5991,7 +5991,11 @@ struct Groups {
     at: HashMap<Vec<Key>, usize>,
     list: Vec<(Vec<Value>, Vec<Acc>)>,
     held: crate::room::Holding,
-    past: Option<super::spill::Run>,
+    past: Option<super::spill::Parts>,
+    queue: super::spill::Queue,
+    range: (u64, u64),
+    expected: Option<u64>,
+    rows_to_come: Option<u64>,
     closed: bool,
     /// What its aggregates keep of the rows they are given, in the round's room.
     kept: crate::room::Holding,
@@ -6004,6 +6008,10 @@ impl Groups {
             list: Vec::new(),
             held: crate::room::holding(0),
             past: None,
+            queue: Default::default(),
+            range: (0, u64::MAX),
+            expected: None,
+            rows_to_come: None,
             closed: false,
             kept: crate::room::holding(0),
         }
@@ -6069,9 +6077,13 @@ impl Groups {
                     let w = super::spill::row_width(&row) + group_bytes;
                     if !self.list.is_empty() && (self.closed || !self.held.fits(w)) {
                         self.closed = true;
+                        if self.expected.is_none() {
+                            self.expected = self.rows_to_come.map(|n| n * w);
+                        }
+                        let (lo, hi, expected) = (self.range.0, self.range.1, self.expected);
                         self.past
-                            .get_or_insert_with(super::spill::Run::past)
-                            .push(row)?;
+                            .get_or_insert_with(|| super::spill::Parts::new(lo, hi, expected))
+                            .push(parted::key_hash(&k, 0), row)?;
                         continue;
                     }
                     if self.list.is_empty() {
@@ -6168,7 +6180,11 @@ struct Going {
     distinct: bool,
     seen: std::collections::HashSet<Vec<Key>>,
     seen_held: crate::room::Holding,
-    seen_past: Option<super::spill::Run>,
+    seen_past: Option<super::spill::Parts>,
+    queue: super::spill::Queue,
+    range: (u64, u64),
+    expected: Option<u64>,
+    rows_to_come: Option<u64>,
     closed: bool,
     sorter: Option<sorted::Sorter>,
     /// Whether it sorts them; where they come in their order, what its LIMIT keeps of them.
@@ -6194,9 +6210,15 @@ impl Going {
                 }
                 if self.closed || !self.seen_held.fits(super::spill::row_width(&r)) {
                     self.closed = true;
+                    if self.expected.is_none() {
+                        self.expected = self
+                            .rows_to_come
+                            .map(|n| n * super::spill::row_width(&r));
+                    }
+                    let (lo, hi, expected) = (self.range.0, self.range.1, self.expected);
                     self.seen_past
-                        .get_or_insert_with(super::spill::Run::past)
-                        .push(r)?;
+                        .get_or_insert_with(|| super::spill::Parts::new(lo, hi, expected))
+                        .push(parted::key_hash(&k, 0), r)?;
                     continue;
                 }
                 self.seen.insert(k);
@@ -6225,7 +6247,9 @@ impl Going {
             return Ok(self.cut.as_mut().expect("just made").take(rows, &keys));
         }
         if self.sorter.is_none() {
-            self.sorter = Some(sorted::Sorter::new(p, casings)?);
+            let mut s = sorted::Sorter::new(p, casings)?;
+            s.rows_to_come = self.rows_to_come;
+            self.sorter = Some(s);
         }
         let s = self.sorter.as_mut().expect("just made");
         for r in rows {
@@ -6272,6 +6296,10 @@ impl<'q> StepRun<'q> {
             seen: Default::default(),
             seen_held: crate::room::holding(0),
             seen_past: None,
+            queue: Default::default(),
+            range: (0, u64::MAX),
+            expected: None,
+            rows_to_come: None,
             closed: false,
             sorter: None,
             sorts: p.order_by.is_some(),
@@ -6294,6 +6322,13 @@ impl<'q> StepRun<'q> {
             subqueries: None,
             empty_row: None,
         }
+    }
+
+    /// Told how many rows its FROM gives, at most, before the first comes.
+    pub(super) fn expect_rows(&mut self, n: u64) {
+        self.held.rows_to_come = Some(n);
+        self.groups.rows_to_come = Some(n);
+        self.going.rows_to_come = Some(n);
     }
 
     /// Reads its rows as coming in the order a strand gives it: its windows' partitions each folded
@@ -6491,12 +6526,18 @@ impl<'q> StepRun<'q> {
             }
             loop {
                 self.groups.project(p, &frame, &mut |rows| emit(rows, going))?;
-                let Some(past) = self.groups.past.take() else {
+                let groups = &mut self.groups;
+                if let Some(past) = groups.past.take() {
+                    past.into_queue(groups.range.1, &mut groups.queue)?;
+                }
+                let Some((lo, hi, total, runs)) = groups.queue.next(0) else {
                     break;
                 };
-                past.seal()?;
-                let groups = &mut self.groups;
-                past.each_chunk(&mut |c| groups.fold(p, c, &frame, None))?;
+                groups.range = (lo, hi);
+                groups.expected = Some(total);
+                for run in runs {
+                    run.each_chunk(&mut |c| groups.fold(p, c, &frame, None))?;
+                }
             }
         }
         if self.along_partitions {
@@ -6532,12 +6573,22 @@ impl<'q> StepRun<'q> {
                 });
         }
         // Each pass of the DISTINCT rows past the room.
-        while let Some(past) = going.seen_past.take() {
-            past.seal()?;
+        loop {
+            if let Some(past) = going.seen_past.take() {
+                past.into_queue(going.range.1, &mut going.queue)?;
+            }
             going.seen.clear();
             going.closed = false;
             going.seen_held = crate::room::holding(0);
-            past.each_chunk(&mut |c| emit(c, going))?;
+            let free = crate::room::current().map_or(u64::MAX, |r| r.free_bytes());
+            let Some((lo, hi, total, runs)) = going.queue.next(free) else {
+                break;
+            };
+            going.range = (lo, hi);
+            going.expected = Some(total);
+            for run in runs {
+                run.each_chunk(&mut |c| emit(c, going))?;
+            }
         }
         if going.sorts {
             let sorter = match going.sorter.take() {
@@ -6612,6 +6663,122 @@ fn select(
         Some(out) => Ok(out),
         None => run.finish(params, release, casings),
     }
+}
+
+/// A step's rows kept in the round's room for a step read after it.
+struct Place {
+    names: Vec<String>,
+    rows: super::spill::Rows,
+}
+
+/// One relation a step read once every row has come crosses: a step read whole, or one in the room.
+enum Crossed {
+    Whole(Relation),
+    Kept(super::spill::Rows),
+}
+
+/// Each row of `left` with each of the relations from `at`, handed to `each` a chunk at a time.
+fn crossed(
+    parts: &[Crossed],
+    at: usize,
+    left: &[Vec<Value>],
+    each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+) -> Result<()> {
+    let Some(part) = parts.get(at) else {
+        return each(left.to_vec());
+    };
+    let mut with = |right: &[Vec<Value>]| -> Result<()> {
+        let mut rows = Vec::with_capacity(left.len() * right.len());
+        for l in left {
+            for r in right {
+                let mut row = l.clone();
+                row.extend(r.iter().cloned());
+                rows.push(row);
+            }
+        }
+        crossed(parts, at + 1, &rows, each)
+    };
+    match part {
+        Crossed::Whole(r) => with(&r.rows),
+        Crossed::Kept(rows) => rows.each_chunk(&mut |c| with(&c)),
+    }
+}
+
+/// One SELECT read once every row has come, over the relations before it, a chunk at a time, the rows
+/// it returns handed to `put`: its columns' names, and the column holding the table's order where they
+/// keep it.
+#[allow(clippy::too_many_arguments)]
+fn select_each(
+    p: Prepared<'_>,
+    whole: &HashMap<String, Relation>,
+    places: &HashMap<String, Place>,
+    table: &Table,
+    params: &[String],
+    release: u8,
+    casings: &Casings,
+    put: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+) -> Result<(Vec<String>, Option<usize>)> {
+    let mut parts: Vec<Crossed> = Vec::new();
+    let mut columns: Columns = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    {
+        let mut add = |t: &TableFactor| -> Result<()> {
+            let TableFactor::Table { name, alias, .. } = t else {
+                return Err(Error::new("a step reads tables and steps by name"));
+            };
+            let n = crate::catalog::object_name(name);
+            let q = alias
+                .as_ref()
+                .map(|a| ident(&a.name))
+                .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+            let (part, ns) = match places.get(&n) {
+                Some(place) => (Crossed::Kept(place.rows.clone()), place.names.clone()),
+                None => {
+                    let r = relation(&n, whole, table)?.clone();
+                    let ns = r.names.clone();
+                    (Crossed::Whole(r), ns)
+                }
+            };
+            columns.extend(ns.iter().map(|c| (Some(q.clone()), c.clone())));
+            names.extend(ns);
+            parts.push(part);
+            Ok(())
+        };
+        for item in p.from {
+            add(&item.relation)?;
+            for j in &item.joins {
+                match j.join_operator {
+                    JoinOperator::CrossJoin(_) => add(&j.relation)?,
+                    _ => return Err(Error::new("a step joins only with CROSS JOIN")),
+                }
+            }
+        }
+    }
+    let mut rows_known = 1u64;
+    for part in &parts {
+        rows_known = rows_known.saturating_mul(match part {
+            Crossed::Whole(r) => r.rows.len() as u64,
+            Crossed::Kept(rows) => rows.len() as u64,
+        });
+    }
+    let mut run = StepRun::new(p);
+    run.hands_on = true;
+    run.expect_rows(rows_known);
+    let mut order = None;
+    crossed(&parts, 0, &[Vec::new()], &mut |rows| {
+        let rel = Relation {
+            names: names.clone(),
+            rows,
+            order: None,
+        };
+        if let Some(out) = run.feed(rel, columns.clone(), params, release, casings)? {
+            order = out.order;
+            put(out.rows)?;
+        }
+        Ok(())
+    })?;
+    let (out_names, tail) = run.finish_each(params, release, casings, put)?;
+    Ok((out_names, order.or(tail)))
 }
 
 /// The names a SELECT's FROM reads.
@@ -6856,6 +7023,13 @@ impl<'q> Stream<'q> {
         Ok(s)
     }
 
+    /// Told how many rows the table may give, before the first comes.
+    pub(super) fn expect_rows(&mut self, n: u64) {
+        for r in self.runs.iter_mut().flatten() {
+            r.expect_rows(n);
+        }
+    }
+
     /// Its question's own step reads the rows as coming in the order a strand gives it.
     pub(super) fn along(&mut self, led: super::strands::Led) {
         if let Some(Some(r)) = self.runs.last_mut() {
@@ -6949,28 +7123,71 @@ impl<'q> Stream<'q> {
             }),
         };
         let steps = std::mem::take(&mut self.steps);
+        let last = steps.len().saturating_sub(1);
+        // A step a later step reads lies in the round's room, the rows past it written; the answer
+        // is the caller's.
+        let mut places: HashMap<String, Place> = HashMap::new();
         for (i, (name, _, kind)) in steps.into_iter().enumerate() {
-            let r = match kind {
-                Kind::Fixed => continue,
-                Kind::Streamed => match self.kept.remove(&name) {
-                    Some(k) => k,
-                    None => continue,
-                },
-                Kind::Folded => self.runs[i].take().unwrap().finish(
+            if kind == Kind::Fixed {
+                continue;
+            }
+            if kind == Kind::Streamed {
+                if let Some(k) = self.kept.remove(&name) {
+                    whole.insert(name, k);
+                }
+                continue;
+            }
+            let run_out = (i != last).then(super::spill::Run::new);
+            let mut gathered: Vec<Vec<Value>> = Vec::new();
+            let mut put = |rows: Vec<Vec<Value>>| -> Result<()> {
+                match &run_out {
+                    Some(run) => rows.into_iter().try_for_each(|r| run.push(r)),
+                    None => {
+                        gathered.extend(rows);
+                        Ok(())
+                    }
+                }
+            };
+            let (names, order) = match kind {
+                Kind::Folded => self.runs[i].take().unwrap().finish_each(
                     &self.params,
                     self.release,
                     &self.casings,
+                    &mut put,
                 )?,
-                Kind::After => select(
+                _ => select_each(
                     self.later[i].take().unwrap(),
                     &whole,
+                    &places,
                     &table,
                     &self.params,
                     self.release,
                     &self.casings,
+                    &mut put,
                 )?,
             };
-            whole.insert(name, r);
+            match run_out {
+                Some(run) => {
+                    run.seal()?;
+                    places.insert(
+                        name,
+                        Place {
+                            names,
+                            rows: super::spill::Rows::one(run),
+                        },
+                    );
+                }
+                None => {
+                    whole.insert(
+                        name,
+                        Relation {
+                            names,
+                            rows: gathered,
+                            order,
+                        },
+                    );
+                }
+            }
         }
         whole
             .remove("")

@@ -351,16 +351,32 @@ pub(super) fn ask_join_across(
     at: &[(usize, usize)],
     q: &Question,
 ) -> Result<(RecordBatch, Round)> {
-    ask_join_within(snails, at, q, true)
+    ask_join_within(snails, at, q, true, None)
+}
+
+/// A question on several tables whose rows are read as a place of the pipeline: its rows go to `each`
+/// a block's at a time.
+pub(super) fn read_join(
+    snails: &[&Snail],
+    at: &[(usize, usize)],
+    q: &Question,
+    each: &mut dyn FnMut(Vec<Vec<super::pipeline::Value>>) -> Result<()>,
+) -> Result<Round> {
+    let mut hand = |b: RecordBatch| each(super::pipeline::relation_of(&b)?.rows);
+    let (last, round) = ask_join_within(snails, at, q, true, Some(&mut hand))?;
+    hand(last)?;
+    Ok(round)
 }
 
 /// The same, where `may_stop`, stopped by name before a table it would hold that its counts say may
-/// not fit the round's room.
+/// not fit the round's room. Where `each` is given, the rows it makes go to it as they are made, a
+/// block's at a time, and what it returns is the last of them.
 pub(super) fn ask_join_within(
     snails: &[&Snail],
     at: &[(usize, usize)],
     q: &Question,
     may_stop: bool,
+    each: Option<&mut dyn FnMut(RecordBatch) -> Result<()>>,
 ) -> Result<(RecordBatch, Round)> {
     let n = q.sides.len();
     let tables: Vec<&Table> = at
@@ -396,8 +412,30 @@ pub(super) fn ask_join_within(
         .iter()
         .map(|s| (s.walked.get(), s.taken.get()))
         .collect();
+    // A table that may stand NULL gives the answer NULLs, whatever its columns hold.
+    let shown: Vec<Table> = (0..n)
+        .map(|s| {
+            let mut table = tables[s].clone();
+            if q.nullable(s) {
+                for c in &mut table.columns {
+                    c.not_null = false;
+                }
+            }
+            table
+        })
+        .collect();
+    let shown: Vec<&Table> = shown.iter().collect();
     let mut answer = Answer::new(&q.select).typed(&tables);
     let mut sides_held = crate::room::holding(0);
+    let mut hand_on = each.map(|each| {
+        let (select, order, tables, shown) = (&q.select, &q.order, &tables, &shown);
+        move |answer: &mut Answer| -> Result<()> {
+            let done = std::mem::replace(answer, Answer::new(select).typed(tables));
+            each(done.finish(shown, select, order)?)
+        }
+    });
+    // Rows a join holds are counted, a round that may stop stopping before they pass the room.
+    let room_over = || may_stop && crate::room::current().is_some_and(|r| r.over());
     for (i, &side) in order.iter().enumerate() {
         let (at_snail, _) = at[side];
         let snail = snails[at_snail];
@@ -459,7 +497,19 @@ pub(super) fn ask_join_within(
         let mid = snail.reader.pages_read();
         if streamed {
             let joined = meet_core(q, &t, &core[..core.len() - 1]);
+            sides_held.more(joined.rows.len() as u64 * 4);
+            if room_over() {
+                snail.reader.read_done();
+                if snails.len() > 1 {
+                    round.snails = parts;
+                }
+                STOPPED.with(|s| *s.borrow_mut() = Some(round));
+                return Err(crate::Error::new(PAST_THE_ROOM));
+            }
             let mut sink = Probe::new(q, &t, &joined, side, &probe, &inputs, &mut answer);
+            sink.hand_on = hand_on
+                .as_mut()
+                .map(|h| h as &mut dyn FnMut(&mut Answer) -> Result<()>);
             snail.read_plan(&part.plan, &want, &columns, &mut sink)?;
         } else {
             let filters: Vec<Filter> = by
@@ -547,6 +597,14 @@ pub(super) fn ask_join_within(
         for o in q.outer.iter().skip(q.full as usize) {
             joined = t.join(&joined, o.side, &o.meets, &o.tests, true);
         }
+        sides_held.more(joined.rows.len() as u64 * 4);
+        if room_over() {
+            if snails.len() > 1 {
+                round.snails = parts;
+            }
+            STOPPED.with(|s| *s.borrow_mut() = Some(round));
+            return Err(crate::Error::new(PAST_THE_ROOM));
+        }
         let mut cells = vec![Cell::Null; inputs.len()];
         for i in 0..joined.len() {
             let row = joined.row(i);
@@ -560,21 +618,14 @@ pub(super) fn ask_join_within(
                     .clone();
             }
             answer.add_times(&cells, joined.weights[i]);
-        }
-    }
-    // A table that may stand NULL gives the answer NULLs, whatever its columns hold.
-    let shown: Vec<Table> = (0..n)
-        .map(|s| {
-            let mut table = tables[s].clone();
-            if q.nullable(s) {
-                for c in &mut table.columns {
-                    c.not_null = false;
+            if i % 1024 == 1023 {
+                if let Some(h) = &mut hand_on {
+                    h(&mut answer)?;
                 }
             }
-            table
-        })
-        .collect();
-    let shown: Vec<&Table> = shown.iter().collect();
+        }
+    }
+    drop(hand_on);
     let batch = answer.finish(&shown, &q.select, &q.order)?;
     round.order = names.join("+");
     round.rows = batch.num_rows() as u64;
@@ -690,6 +741,8 @@ struct Probe<'a> {
     dicts: Vec<Dict>,
     probe: Vec<Part>,
     cells: Vec<Cell>,
+    /// What hands the rows made so far on, at each block's end.
+    hand_on: Option<&'a mut dyn FnMut(&mut Answer) -> Result<()>>,
 }
 
 impl<'a> Probe<'a> {
@@ -741,6 +794,7 @@ impl<'a> Probe<'a> {
             dicts: Vec::new(),
             probe: Vec::new(),
             cells: vec![Cell::Null; inputs.len()],
+            hand_on: None,
         }
     }
 
@@ -750,6 +804,13 @@ impl<'a> Probe<'a> {
 }
 
 impl Sink for Probe<'_> {
+    fn block_end(&mut self) -> Result<()> {
+        match &mut self.hand_on {
+            Some(h) => h(self.answer),
+            None => Ok(()),
+        }
+    }
+
     fn dictionaries(&mut self, dicts: &[Dict]) {
         self.dicts = dicts.to_vec();
         let mine: Vec<Dict> = self

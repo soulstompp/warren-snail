@@ -799,8 +799,9 @@ fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in
             round.spill_pages_read, round.spill_pages_written,
             "{q}: {round:?}"
         );
+        // Beside the room, a chunk and a page for each of the 4 runs being merged.
         assert!(
-            round.bytes_held <= room + one_chunk(&path, 18),
+            round.bytes_held <= room + one_chunk(&path, 18) + 4 * 4096,
             "{q}: {round:?}"
         );
         (ints(&b), round)
@@ -852,7 +853,11 @@ fn a_grouping_and_a_distinct_past_the_room_write_the_rows_of_groups_none_has_com
         assert_eq!(ints_or_nums(&b), want, "{q}");
         assert!(round.spill_pages_written > 0, "{q}: {round:?}");
         assert_eq!(round.spill_pages_read, round.spill_pages_written, "{q}: {round:?}");
-        assert!(round.bytes_held <= room + one_chunk(&path, 18), "{q}: {round:?}");
+        // Beside the room, a page for each part being filled, 8 at most.
+        assert!(
+            round.bytes_held <= room + one_chunk(&path, 18) + 8 * 4096,
+            "{q}: {round:?}"
+        );
         let mut snail = Snail::open(&path).unwrap();
         snail.size_rounds(Sizes::default().in_dir(&dir));
         let (b, round) = snail.ask(q, None).unwrap();
@@ -928,7 +933,8 @@ fn a_subquery_s_kept_table_past_the_room_is_read_back_in_the_order_of_its_keys_h
     let room: u64 = 64 << 10;
     // A subquery is read while the chunk of rows that asks is handed on: the owners' 512 at 9 bytes.
     let asking = 512 * 9;
-    let most = room + one_chunk(&path, 27) + asking;
+    // And the page each of its parts is filling.
+    let most = room + one_chunk(&path, 27) + asking + 2 * 4096;
     for (q, want) in [
         (
             format!("SELECT sum((SELECT count(*) FROM s.p p WHERE p.owner = o.k)) FROM {OWNERS}"),
@@ -1204,4 +1210,212 @@ fn a_window_over_a_join_along_its_first_table_s_strand_holds_one_partition_at_a_
     got.sort();
     assert_eq!(got, want, "{q}");
     assert_eq!(round.spill_pages_written, 0, "{q}");
+}
+
+/// A question asked past `room`, its rows' ids and their other integers in order.
+fn past_room(path: &PathBuf, dir: &PathBuf, room: u64, q: &str) -> (Vec<Vec<i64>>, Round) {
+    let mut snail = Snail::open(path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(dir));
+    let (b, round) = snail.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
+    weather::exact(q, &round);
+    assert_eq!(
+        round.spill_pages_read, round.spill_pages_written,
+        "{q}: every page written is read back once: {round:?}"
+    );
+    (ints(&b), round)
+}
+
+#[test]
+fn rows_past_several_rooms_are_written_once_and_read_back_once_at_each_place() {
+    let path = owned("rooms");
+    let dir = spill_dir("rooms");
+    let n = PURCHASES as u64;
+    let room: u64 = 64 << 10;
+    // A window over every purchase on an order no strand gives, its three integers 27 bytes: 442,368
+    // bytes, 6.75 rooms, cut at once into 8 parts of whole partitions. The 2,427 rows the room holds are
+    // never written; the other 13,957, 376,839 bytes, are 93 pages, a part page more in each part at
+    // most. Written again each pass they would be 312. Its moments fall as its ids rise.
+    let q = "SELECT p.id, row_number() OVER (PARTITION BY p.id % 64 ORDER BY p.at) FROM s.p p";
+    let rank = |i: i64| 256 - i / 64;
+    let (mut got, round) = past_room(&path, &dir, room, q);
+    got.sort();
+    let want: Vec<Vec<i64>> = (0..PURCHASES).map(|i| vec![i, rank(i)]).collect();
+    assert_eq!(got, want, "{q}");
+    let least = ((n - room / 27) * 27).div_ceil(4096);
+    assert!(
+        round.spill_pages_written >= least && round.spill_pages_written <= least + 8,
+        "{q}: {least}: {round:?}"
+    );
+    assert!(
+        round.bytes_held <= room + one_chunk(&path, 27) + 8 * 4096,
+        "{q}: {round:?}"
+    );
+    // The same over a join, how many rows come not known before the first write, each row its four
+    // columns, 36 bytes: 589,824 bytes, 9 rooms, in the 8 parts a room this size lets it fill. A part
+    // past the room goes round again: at most half as many pages again as the 128 past it; written
+    // again each pass, 576.
+    let q = "SELECT p.id, row_number() OVER (PARTITION BY p.id % 64 ORDER BY p.at) \
+             FROM s.o o JOIN s.p p ON p.owner = o.k";
+    let (mut got, round) = past_room(&path, &dir, room, q);
+    got.sort();
+    assert_eq!(got, want, "{q}");
+    assert!(round.spill_pages_written > 0, "{q}: {round:?}");
+    let past = (n * 36 - room).div_ceil(4096);
+    assert!(
+        round.spill_pages_written >= past && round.spill_pages_written <= past * 3 / 2,
+        "{q}: {round:?}"
+    );
+    // A grouping, in 128 KiB: each group its first row, 27 bytes, and 32 of its fold: 966,656 bytes,
+    // 7.4 rooms, cut at once into 9 parts. The 2,221 groups the room holds write nothing; the other
+    // 14,163 rows are 382,401 bytes, 94 pages, a part page more in each at most.
+    let groups: u64 = 128 << 10;
+    let q = "SELECT p.id, count(*) FROM s.p p GROUP BY p.id LIMIT 100000";
+    let (mut got, round) = past_room(&path, &dir, groups, q);
+    got.sort();
+    let once: Vec<Vec<i64>> = (0..PURCHASES).map(|i| vec![i, 1]).collect();
+    assert_eq!(got, once, "{q}");
+    let least = ((n - groups / 59) * 27).div_ceil(4096);
+    assert!(
+        round.spill_pages_written >= least && round.spill_pages_written <= least + 9,
+        "{q}: {least}: {round:?}"
+    );
+    // A DISTINCT, in 32 KiB: every purchase's id at 9 bytes, 147,456 bytes, 4.5 rooms, cut at once into
+    // 5 parts. The 3,640 the room holds write nothing; the other 12,744 are 28 pages, a part page more
+    // in each at most.
+    let distinct: u64 = 32 << 10;
+    let q = "SELECT DISTINCT p.id FROM s.p p LIMIT 100000";
+    let (mut got, round) = past_room(&path, &dir, distinct, q);
+    got.sort();
+    let ids: Vec<Vec<i64>> = (0..PURCHASES).map(|i| vec![i]).collect();
+    assert_eq!(got, ids, "{q}");
+    let least = ((n - distinct / 9) * 9).div_ceil(4096);
+    assert!(
+        round.spill_pages_written >= least && round.spill_pages_written <= least + 5,
+        "{q}: {least}: {round:?}"
+    );
+    // A sort, in 32 KiB: the same 147,456 bytes known past two rooms, cut into runs of 3,640 rows,
+    // 8 pages each: 4 of them, the last 1,824 rows held and merged with them. Each page read back once.
+    let q = "SELECT p.id FROM s.p p ORDER BY p.id DESC LIMIT 100000";
+    let (got, round) = past_room(&path, &dir, distinct, q);
+    let down: Vec<Vec<i64>> = (0..PURCHASES).rev().map(|i| vec![i]).collect();
+    assert_eq!(got, down, "{q}");
+    assert_eq!(round.spill_pages_written, 4 * 8, "{q}: {round:?}");
+    assert!(
+        round.bytes_held <= distinct + one_chunk(&path, 9) + 4 * 4096,
+        "{q}: {round:?}"
+    );
+    // Over a join, not known: once a room of them is written they are cut into runs, the rows written
+    // standing as one part, held for the merge; every row written once, 147,456 bytes, 37 pages,
+    // a part page more in each run at most.
+    let q = "SELECT p.id FROM s.o o JOIN s.p p ON p.owner = o.k ORDER BY p.id DESC LIMIT 100000";
+    let (got, round) = past_room(&path, &dir, distinct, q);
+    assert_eq!(got, down, "{q}");
+    assert!(
+        round.spill_pages_written >= 28 && round.spill_pages_written <= 37 + 5,
+        "{q}: {round:?}"
+    );
+}
+
+#[test]
+fn a_step_read_after_a_fold_over_one_table_holds_its_rows_in_the_room() {
+    let path = owned("after");
+    let dir = spill_dir("after");
+    // Each purchase its own group, its id and count 18 bytes as a step: 294,912 bytes past 32 KiB,
+    // read by the step after it a chunk at a time.
+    let room: u64 = 32 << 10;
+    let q = "WITH g AS (SELECT p.id, count(*) AS n FROM s.p p GROUP BY p.id) \
+             SELECT sum(g.n), max(g.id) FROM g";
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    weather::exact(q, &round);
+    assert_eq!(ints_or_nums(&b), [PURCHASES, PURCHASES - 1], "{q}");
+    assert!(round.spill_pages_written > 0, "{q}: {round:?}");
+    assert!(
+        round.bytes_held <= room + one_chunk(&path, 27) + room / 2,
+        "{q}: {round:?}"
+    );
+    // With room for it, none written, the same answer.
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(q, None).unwrap();
+    assert_eq!(ints_or_nums(&b), [PURCHASES, PURCHASES - 1], "{q}");
+    assert_eq!(round.spill_pages_written, 0, "{q}");
+    // A sort read by the step after it: 147,456 bytes in 64 KiB are 2 runs of 16 pages, and its rows
+    // as a step lie past the room as well: more than the runs' 32 pages are written.
+    let room: u64 = 64 << 10;
+    let q = "WITH g AS (SELECT p.id FROM s.p p ORDER BY p.id LIMIT 100000) SELECT sum(g.id) FROM g";
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    weather::exact(q, &round);
+    assert_eq!(ints_or_nums(&b), [PURCHASES * (PURCHASES - 1) / 2], "{q}");
+    assert!(round.spill_pages_written > 32, "{q}: {round:?}");
+    assert_eq!(
+        round.spill_pages_read, round.spill_pages_written,
+        "{q}: {round:?}"
+    );
+    assert!(
+        round.bytes_held <= room + one_chunk(&path, 27) + 2 * 4096,
+        "{q}: {round:?}"
+    );
+}
+
+#[test]
+fn a_join_s_rows_read_as_a_place_go_on_a_block_s_at_a_time() {
+    let path = owned("c1-rows");
+    let dir = spill_dir("c1-rows");
+    // A join of tables the question path reads, kept as a step: its 16,384 rows past 16 KiB lie in the
+    // step's place, written, none held whole in between; the side it holds fits.
+    let room: u64 = 32 << 10;
+    let q = "SELECT sum(x.id) FROM (SELECT p.id, o.k FROM s.o o JOIN s.p p ON p.owner = o.k) x";
+    let want = PURCHASES * (PURCHASES - 1) / 2;
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    each_read_exact(q, &round);
+    assert_eq!(one(&b), want, "{q}");
+    assert!(
+        round.reads[0].order.contains('+'),
+        "{q}: one round: {round:?}"
+    );
+    // The side it holds takes 512 owners at 9 bytes and their 8 bytes of a join's row: 8,704 bytes of
+    // the room. Its rows are 18 bytes: past the rest, written once and read back once.
+    let pages = ((PURCHASES as u64 - (room - 8_704) / 18) * 18).div_ceil(4096);
+    assert_eq!(
+        (round.spill_pages_written, round.spill_pages_read),
+        (pages, pages),
+        "{q}: {round:?}"
+    );
+    assert!(
+        round.bytes_held <= room + 2 * one_chunk(&path, 27),
+        "{q}: {round:?}"
+    );
+}
+
+#[test]
+fn an_alias_hides_its_table_s_own_name() {
+    let path = owned("alias");
+    let want = PURCHASES * (PURCHASES - 1) / 2;
+    // As PostgreSQL 18.6 reads them: `p` is the alias of the first, `q` hides the second's name, and
+    // where the first takes none its own name names it.
+    for q in [
+        "SELECT sum(p.id) FROM s.p p JOIN s.p q ON q.id = p.id",
+        "SELECT sum(q.id) FROM s.p p JOIN s.p q ON q.id = p.id",
+        "SELECT sum(p.id) FROM s.p JOIN s.p q ON q.id = p.id",
+        "SELECT sum(p.id) FROM s.p, s.p q WHERE q.id = p.id",
+    ] {
+        let (b, round) = Snail::open(&path).unwrap().ask(q, None).unwrap();
+        weather::exact(q, &round);
+        assert_eq!(one(&b), want, "{q}");
+    }
+    // A name an alias hides names nothing.
+    let e = Snail::open(&path)
+        .unwrap()
+        .ask(
+            "SELECT sum(p.id) FROM s.p a JOIN s.p b ON b.id = a.id",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("names no table"), "{e}");
 }

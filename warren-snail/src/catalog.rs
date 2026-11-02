@@ -2426,7 +2426,12 @@ pub fn shape(
                 .collect::<Vec<_>>()
                 .join(".");
             let name = ident(&parts[parts.len() - 1]);
-            if Some(qualifier.as_str()) == alias || qualifier == bare || qualifier == table {
+            // An alias hides the table's own name, as PostgreSQL reads it.
+            let named = match alias {
+                Some(a) => qualifier == a,
+                None => qualifier == bare || qualifier == table,
+            };
+            if named {
                 column(&name)
             } else {
                 Err(Error::new(format!(

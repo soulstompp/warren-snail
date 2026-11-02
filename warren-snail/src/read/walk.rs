@@ -19,6 +19,8 @@ type Coll = Option<&'static crate::collations::Collator>;
 
 /// Where a scan hands the rows it keeps.
 pub trait Sink {
+    /// The rows the counts say the round may give at most, told before its first.
+    fn rows_most(&mut self, _n: u64) {}
     /// The dictionaries the codes of the rows that follow index, one for each column scanned.
     fn dictionaries(&mut self, dicts: &[Dict]);
     /// How many of the columns scanned, from the first, `admits` looks at.

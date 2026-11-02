@@ -34,9 +34,13 @@ use std::rc::Rc;
 pub(super) trait Reads {
     /// The catalog naming the tables.
     fn catalog(&self) -> &Catalog;
-    /// A question the question path reads, over the catalog's tables: one round, each snail's part
-    /// of it in its `snails` where there are several.
-    fn read(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)>;
+    /// A join the question path reads, over the catalog's tables: one round, each snail's part of it
+    /// in its `snails` where there are several, the rows it makes handed to `each` as they are made.
+    fn read_join(
+        &self,
+        q: &Question,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round>;
     /// A question on one table the question path reads, of rows alone, kept to the keys `kept` holds
     /// of its columns where it is given them, those of the rows made before it that it meets: its
     /// rows handed to `each` a block at a time as they are read.
@@ -45,6 +49,7 @@ pub(super) trait Reads {
         q: &Question,
         order: Option<&str>,
         kept: Option<&KeySet>,
+        most: &std::cell::Cell<Option<u64>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round>;
     /// Whether a question's pages along a strand are fewer than along its order of fewest, with the
@@ -274,7 +279,12 @@ impl Tie<'_, '_> {
 
 impl Parted {
     /// The rows `read` hands on, held as the room lets them be.
-    fn read(tie: &Tie, in_passes: bool, read: impl FnOnce(Each) -> Result<()>) -> Result<Parted> {
+    fn read(
+        tie: &Tie,
+        in_passes: bool,
+        rows_known: &std::cell::Cell<Option<u64>>,
+        read: impl FnOnce(Each) -> Result<()>,
+    ) -> Result<Parted> {
         let mut order = None;
         let frame = tie.frame();
         let index_of = |rows: &[&Vec<Value>]| -> Result<_> {
@@ -290,6 +300,7 @@ impl Parted {
             let mut hashed = pipeline::parted::Parted::new();
             read(&mut |c, at| {
                 order = at;
+                hashed.rows_to_come = rows_known.get();
                 for r in c {
                     hashed.push(tie.hash_of_row(&r, &frame)?, r)?;
                 }
@@ -1461,6 +1472,9 @@ struct Reading<'a> {
     in_order: Option<&'a std::cell::Cell<Option<super::strands::Led>>>,
     /// The strand the FROM's first table is read along, where the step's rows come in its order.
     along: Option<Along>,
+    /// How many rows the step's FROM gives, told where it is one relation, and that relation.
+    rows_known: &'a std::cell::Cell<Option<u64>>,
+    whole_from: Option<*const Node>,
 }
 
 /// A FROM's first table read along a strand: its node, the strand, the places in its rows of the
@@ -1553,9 +1567,13 @@ impl Reading<'_> {
             What::Table { table, qualifier } => {
                 self.alone(node, *table, qualifier, preserved, each)
             }
-            What::Made { name, .. } => self.made[name]
-                .rows_of()?
-                .each_chunk(&mut |c| each(c, None)),
+            What::Made { name, .. } => {
+                let rows = self.made[name].rows_of()?;
+                if self.whole_from.is_some_and(|n| std::ptr::eq(n, node)) {
+                    self.rows_known.set(Some(rows.len() as u64));
+                }
+                rows.each_chunk(&mut |c| each(c, None))
+            }
             What::Call { call, .. } => {
                 let rows = self.called(node, call, before)?;
                 each(rows, None)
@@ -1658,13 +1676,8 @@ impl Reading<'_> {
                 &mut hand,
             );
         }
-        if let Some(r) = self.together(node, preserved)? {
-            let mut hand = |c: Vec<Vec<Value>>| each(c, None);
-            let mut chunk = Chunk::new(&mut hand);
-            for row in r {
-                chunk.push(row)?;
-            }
-            return chunk.finish();
+        if self.together(node, preserved, &mut |c| each(c, None))? {
+            return Ok(());
         }
         let keep = |side: bool| match kind {
             Kind::Inner | Kind::Cross => preserved,
@@ -1790,10 +1803,14 @@ impl Reading<'_> {
         self.order = at.map(|p| node.at + p);
         let order = self.order;
         let width = node.width;
+        let told = std::cell::Cell::new(None);
+        let whole_from = self.whole_from.is_some_and(|n| std::ptr::eq(n, node));
+        let rows_known = self.rows_known;
         let round = self.reads.read_each(
             &q,
             strand.as_ref().map(|s| s.0.as_str()),
             kept.as_ref().and_then(|k| k.set.as_ref()),
+            if whole_from { rows_known } else { &told },
             &mut |rows| {
                 let mut rows: Vec<Vec<Value>> = rows
                     .into_iter()
@@ -1853,14 +1870,19 @@ impl Reading<'_> {
 
     /// A join whose every relation is a table, read as C1's round meets them where the question
     /// path reads the join; none where it does not.
-    fn together(&mut self, node: &Node, preserved: bool) -> Result<Option<Vec<Vec<Value>>>> {
+    fn together(
+        &mut self,
+        node: &Node,
+        preserved: bool,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<bool> {
         let mut leaves = Vec::new();
         node.leaves(&mut leaves);
         if leaves.iter().any(|l| !matches!(l.what, What::Table { .. })) {
-            return Ok(None);
+            return Ok(false);
         }
         let Some(from) = self.written(node, true)? else {
-            return Ok(None);
+            return Ok(false);
         };
         let catalog = self.reads.catalog();
         let mut wanted: Vec<(usize, String, String)> = Vec::new();
@@ -1896,29 +1918,33 @@ impl Reading<'_> {
         };
         let q = match self.parsed(&select, &from, &conds) {
             Ok(q) => q,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(false),
         };
-        let (batch, round) = match self.reads.read(&q, None) {
+        let read = self.reads.read_join(&q, &mut |rs| {
+            let mut rows = Vec::with_capacity(rs.len());
+            for r in rs {
+                let mut row = vec![Value::Null; node.width];
+                for (v, (p, _, _)) in r.into_iter().zip(&wanted) {
+                    row[p - node.at] = v;
+                }
+                Self::merge(node, node.at, &mut row)?;
+                rows.push(row);
+            }
+            let _flying = crate::room::flying(super::spill::rows_width(&rows));
+            each(rows)
+        });
+        match read {
             Err(e) if super::join::past_the_room(&e) => {
                 if let Some(r) = super::join::stopped_reads() {
                     self.accrued.add(&r);
                 }
-                return Ok(None);
+                Ok(false)
             }
-            read => read?,
-        };
-        self.accrued.add(&round);
-        let rel = pipeline::relation_of(&batch)?;
-        let mut rows = Vec::with_capacity(rel.rows.len());
-        for r in rel.rows {
-            let mut row = vec![Value::Null; node.width];
-            for (v, (p, _, _)) in r.into_iter().zip(&wanted) {
-                row[p - node.at] = v;
+            read => {
+                self.accrued.add(&read?);
+                Ok(true)
             }
-            Self::merge(node, node.at, &mut row)?;
-            rows.push(row);
         }
-        Ok(Some(rows))
     }
 
     /// The strand a FROM's first table is read along where it gives what the step wants, its pages
@@ -3215,6 +3241,7 @@ fn read_from(
     laterals: &[(Query, super::subqueries::Kept)],
     outer: Option<&Outer>,
     kept: Vec<Keep>,
+    rows_known: &std::cell::Cell<Option<u64>>,
     along: Option<(
         &super::strands::Wants,
         &std::cell::Cell<Option<super::strands::Led>>,
@@ -3246,6 +3273,8 @@ fn read_from(
         kept,
         in_order: along.map(|a| a.1),
         along: None,
+        rows_known,
+        whole_from: None,
     };
     let (first, rest) = match from.items.split_first() {
         None => return each(vec![Vec::new()], None),
@@ -3258,6 +3287,7 @@ fn read_from(
         }
     }
     if rest.is_empty() {
+        reading.whole_from = Some(first);
         return reading.flow(first, None, true, each);
     }
     let mut rows = reading.place(first, None, true)?;
@@ -3614,10 +3644,14 @@ fn select_step(
     let in_order: std::cell::Cell<Option<super::strands::Led>> =
         std::cell::Cell::new(wanted_along.as_ref().map(|w| w.led));
     let along_wanted = wanted_along.as_ref().map(|w| (w, &in_order));
+    let rows_known: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
     let mut feed = |mut rows: Vec<Vec<Value>>, order: Option<usize>| -> Result<()> {
         if !fed.get() {
             if let Some(led) = in_order.get() {
                 run.along(led);
+            }
+            if let Some(n) = rows_known.get() {
+                run.expect_rows(n);
             }
         }
         fed.set(true);
@@ -3671,11 +3705,12 @@ fn select_step(
                             &step.laterals,
                             outer,
                             keeps.clone(),
+                            &rows_known,
                             None,
                             each,
                         )
                     };
-                    let parted = Rc::new(Parted::read(&tie, in_passes, read)?);
+                    let parted = Rc::new(Parted::read(&tie, in_passes, &rows_known, read)?);
                     o.kept
                         .rows
                         .borrow_mut()
@@ -3727,6 +3762,7 @@ fn select_step(
                     &step.laterals,
                     outer,
                     keeps,
+                    &rows_known,
                     along_wanted,
                     &mut feed,
                 )?,
@@ -3745,6 +3781,7 @@ fn select_step(
                         &step.laterals,
                         outer,
                         keeps,
+                        &rows_known,
                         along_wanted,
                         &mut |c, at| {
                             order = at;
@@ -3753,6 +3790,7 @@ fn select_step(
                     )?;
                     place.seal()?;
                     let place = super::spill::Rows::one(place);
+                    rows_known.set(Some(place.len() as u64));
                     subs.foresee(&place)?;
                     place.each_chunk(&mut |c| feed(c, order))?;
                 }
@@ -3972,6 +4010,7 @@ impl Reads for Empty<'_> {
         _q: &Question,
         _order: Option<&str>,
         _kept: Option<&KeySet>,
+        _most: &std::cell::Cell<Option<u64>>,
         _each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         Ok(Round::default())
@@ -3981,12 +4020,12 @@ impl Reads for Empty<'_> {
         Ok(false)
     }
 
-    fn read(&self, q: &Question, _order: Option<&str>) -> Result<(RecordBatch, Round)> {
-        let tables: Vec<&Table> = q.sides.iter().map(|s| &self.0.tables[s.table]).collect();
-        let batch = super::answer::Answer::new(&q.select)
-            .typed(&tables)
-            .finish(&tables, &q.select, &q.order)?;
-        Ok((batch, Round::default()))
+    fn read_join(
+        &self,
+        _q: &Question,
+        _each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round> {
+        Ok(Round::default())
     }
 
     fn snails(&self) -> usize {
@@ -4018,20 +4057,13 @@ impl Reads for Across<'_> {
         self.catalog
     }
 
-    fn read(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)> {
-        if let [side] = q.sides.as_slice() {
-            let (s, t) = self.at[side.table];
-            let mut local = q.clone();
-            local.sides[0].table = t;
-            let (b, r) = self.snails[s].ask_one(&local, order)?;
-            let mut parts = vec![Round::default(); self.snails.len()];
-            parts[s] = r.clone();
-            let mut r = r;
-            r.snails = parts;
-            return Ok((b, r));
-        }
+    fn read_join(
+        &self,
+        q: &Question,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round> {
         let at: Vec<(usize, usize)> = q.sides.iter().map(|s| self.at[s.table]).collect();
-        super::join::ask_join_across(&self.snails, &at, q)
+        super::join::read_join(&self.snails, &at, q, each)
     }
 
     fn strand_wins(&self, q: &Question, strand: &str) -> Result<bool> {
@@ -4046,12 +4078,13 @@ impl Reads for Across<'_> {
         q: &Question,
         order: Option<&str>,
         kept: Option<&KeySet>,
+        most: &std::cell::Cell<Option<u64>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         let (s, t) = self.at[q.sides[0].table];
         let mut local = q.clone();
         local.sides[0].table = t;
-        let mut r = self.snails[s].read_blocks(&local, order, kept, each)?;
+        let mut r = self.snails[s].read_blocks(&local, order, kept, most, each)?;
         let mut parts = vec![Round::default(); self.snails.len()];
         parts[s] = r.clone();
         r.snails = parts;

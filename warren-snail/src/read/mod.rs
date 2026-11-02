@@ -65,11 +65,13 @@ impl relations::Reads for Snail {
         &self.catalog
     }
 
-    fn read(&self, q: &Question, order: Option<&str>) -> Result<(RecordBatch, Round)> {
-        match q.sides.len() {
-            1 => self.ask_one(q, order),
-            _ => self.ask_join(q),
-        }
+    fn read_join(
+        &self,
+        q: &Question,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<Round> {
+        let at: Vec<(usize, usize)> = q.sides.iter().map(|s| (0, s.table)).collect();
+        join::read_join(&[self], &at, q, each)
     }
 
     fn read_each(
@@ -77,9 +79,10 @@ impl relations::Reads for Snail {
         q: &Question,
         order: Option<&str>,
         kept: Option<&KeySet>,
+        most: &std::cell::Cell<Option<u64>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
-        self.read_blocks(q, order, kept, each)
+        self.read_blocks(q, order, kept, most, each)
     }
 
     fn strand_wins(&self, q: &Question, strand: &str) -> Result<bool> {
@@ -1433,11 +1436,20 @@ impl Snail {
         }
         let sorted_at = strand.as_ref().map(|(_, at, _)| at.clone());
         // Each block's rows go to the pipeline as the scan reads them, in the order.
+        let most = std::cell::Cell::new(None);
+        let mut told = false;
         let mut blocks = Blocks {
             table,
             q: &base,
             answer: Answer::new(&base.select),
+            most: Some(&most),
             feed: |batch: RecordBatch| {
+                if !told {
+                    told = true;
+                    if let Some(n) = most.get() {
+                        stream.expect_rows(n);
+                    }
+                }
                 let mut rel = pipeline::relation_of(&batch)?;
                 if let Some(c) = along {
                     pipeline::in_order(&mut rel, c)?;
@@ -1490,6 +1502,7 @@ impl Snail {
         q: &Question,
         order: Option<&str>,
         kept: Option<&KeySet>,
+        most: &std::cell::Cell<Option<u64>>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
         let table = &self.catalog.tables[q.sides[0].table];
@@ -1498,6 +1511,7 @@ impl Snail {
             table,
             q,
             answer: Answer::new(&q.select).typed(&[table]),
+            most: Some(most),
             feed: |batch: RecordBatch| {
                 rows += batch.num_rows() as u64;
                 each(pipeline::relation_of(&batch)?.rows)
@@ -1538,6 +1552,7 @@ impl Snail {
         let column_pages_held = self.reader.keep_for_round(part.plan.disk_pages());
         let mid = self.reader.pages_read();
         let (walked, taken) = (self.walked.get(), self.taken.get());
+        sink.rows_most(part.rows.1);
         let read = self.read_plan(&part.plan, &want, &columns, sink);
         self.reader.read_done();
         read?;
@@ -1779,10 +1794,18 @@ struct Blocks<'a, F: FnMut(RecordBatch) -> Result<()>> {
     table: &'a Table,
     q: &'a Question,
     answer: Answer,
+    /// Told the rows the counts say the round may give, before its first block.
+    most: Option<&'a std::cell::Cell<Option<u64>>>,
     feed: F,
 }
 
 impl<F: FnMut(RecordBatch) -> Result<()>> Sink for Blocks<'_, F> {
+    fn rows_most(&mut self, n: u64) {
+        if let Some(m) = self.most {
+            m.set(Some(n));
+        }
+    }
+
     fn dictionaries(&mut self, dicts: &[Dict]) {
         self.answer.dictionaries(dicts);
     }

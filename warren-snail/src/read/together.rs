@@ -101,7 +101,7 @@ pub fn answer_together(snails: &[&Snail], sql: &str) -> Result<(RecordBatch, Rou
     read.dedup();
     match read.as_slice() {
         [one] => snails[*one].answer(sql, None),
-        _ => ask_join_within(snails, &at, &q, false),
+        _ => ask_join_within(snails, &at, &q, false, None),
     }
 }
 

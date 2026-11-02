@@ -382,6 +382,11 @@ impl Run {
         s.rows.len() + s.spilled
     }
 
+    /// The bytes all its rows are held at.
+    pub(super) fn total(&self) -> u64 {
+        self.stored.borrow().total
+    }
+
     /// The rows written past the room.
     pub(super) fn spilled(&self) -> usize {
         self.stored.borrow().spilled
@@ -447,47 +452,27 @@ impl Run {
             let row = self.stored.borrow().rows[i].clone();
             chunk.push(row)?;
         }
-        let (pages, tail, named, spilled) = {
-            let s = self.stored.borrow();
-            (s.pages.clone(), s.tail.clone(), s.named.clone(), s.spilled)
-        };
-        if spilled == 0 {
-            return chunk.finish();
-        }
-        let room = self.room.as_ref().expect("a run that writes has a room");
-        let width = self.width.get();
-        let mut bytes: Vec<u8> = Vec::new();
-        let mut at = 0;
-        let mut next = 0;
-        let mut page = vec![0u8; PAGE];
-        for _ in 0..spilled {
-            let row = loop {
-                let mut b = Bytes { b: &bytes, at };
-                match decode_row(&mut b, width, &named) {
-                    Ok(row) => {
-                        at = b.at;
-                        break row;
-                    }
-                    Err(e) => {
-                        bytes.drain(..at);
-                        at = 0;
-                        if next < pages.len() {
-                            let (p, valid) = pages[next];
-                            room.spilled_page(p, &mut page)?;
-                            bytes.extend_from_slice(&page[..valid as usize]);
-                            next += 1;
-                        } else if next == pages.len() && !tail.is_empty() {
-                            bytes.extend_from_slice(&tail);
-                            next += 1;
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-            };
+        let mut back = self.back();
+        while let Some(row) = back.next_row()? {
             chunk.push(row)?;
         }
         chunk.finish()
+    }
+
+    /// Its written rows, read back a row at a time, a page in memory.
+    pub(super) fn back(&self) -> Back {
+        let s = self.stored.borrow();
+        Back {
+            room: self.room.clone(),
+            width: self.width.get(),
+            pages: s.pages.clone(),
+            tail: s.tail.clone(),
+            named: s.named.clone(),
+            left: s.spilled,
+            next: 0,
+            bytes: Vec::new(),
+            at: 0,
+        }
     }
 
     /// Every row, in order: those held, then those written, read back.
@@ -559,6 +544,152 @@ impl Drop for Run {
         if let Some(r) = &self.room {
             r.let_go(self.stored.borrow().bytes);
         }
+    }
+}
+
+/// A run's written rows read back a row at a time, a page in memory.
+pub(super) struct Back {
+    room: Option<Rc<Room>>,
+    width: usize,
+    pages: Vec<(u64, u16)>,
+    tail: Vec<u8>,
+    named: Named,
+    left: usize,
+    next: usize,
+    bytes: Vec<u8>,
+    at: usize,
+}
+
+impl Back {
+    /// The next row; none once every row has come.
+    pub(super) fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        self.left -= 1;
+        loop {
+            let mut b = Bytes {
+                b: &self.bytes,
+                at: self.at,
+            };
+            match decode_row(&mut b, self.width, &self.named) {
+                Ok(row) => {
+                    self.at = b.at;
+                    return Ok(Some(row));
+                }
+                Err(e) => {
+                    self.bytes.drain(..self.at);
+                    self.at = 0;
+                    if self.next < self.pages.len() {
+                        let (p, valid) = self.pages[self.next];
+                        let mut page = vec![0u8; PAGE];
+                        self.room
+                            .as_ref()
+                            .expect("a run that writes has a room")
+                            .spilled_page(p, &mut page)?;
+                        self.bytes.extend_from_slice(&page[..valid as usize]);
+                        self.next += 1;
+                    } else if self.next == self.pages.len() && !self.tail.is_empty() {
+                        self.bytes.extend_from_slice(&self.tail);
+                        self.next += 1;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How many parts rows past the room are cut into where how many there are is not known.
+const PARTS_UNKNOWN: u64 = 16;
+
+/// Rows past the room by a hash of their keys, every row of a key in one part. Where the rows to come
+/// are within two rooms, one part: those past the room are written once and read back once. Past
+/// that, or where they are not known, as many parts as each fits the room, so each row is written
+/// once and read back once wherever its part fits.
+pub(in crate::read) struct Parts {
+    lo: u64,
+    step: u64,
+    runs: Vec<Run>,
+    /// The page each part is filling.
+    _filling: crate::room::Flying,
+}
+
+impl Parts {
+    /// Parts of the hashes from `lo` to `hi`, the rows to come `expected` bytes in all where known.
+    pub(in crate::read) fn new(lo: u64, hi: u64, expected: Option<u64>) -> Parts {
+        let room = current().map_or(u64::MAX, |r| r.sizes().bytes).max(CHUNK);
+        let most = (room / (2 * PAGE as u64)).max(8);
+        let n = match expected {
+            Some(b) if b <= room.saturating_mul(2) => 1,
+            Some(b) => (b - room).div_ceil(room / 4 * 3).clamp(1, most),
+            None => PARTS_UNKNOWN.min(most),
+        };
+        let step = ((hi - lo) / n).max(1);
+        Parts {
+            lo,
+            step,
+            runs: (0..n).map(|_| Run::past()).collect(),
+            _filling: crate::room::flying(if n > 1 { n * PAGE as u64 } else { 0 }),
+        }
+    }
+
+    pub(in crate::read) fn push(&self, hash: u64, row: Vec<Value>) -> Result<()> {
+        let i = ((hash.saturating_sub(self.lo)) / self.step).min(self.runs.len() as u64 - 1);
+        self.runs[i as usize].push(row)
+    }
+
+    /// Its parts written, on the front of `queue` in the order of their hashes: the last goes up to
+    /// `hi`.
+    pub(in crate::read) fn into_queue(self, hi: u64, queue: &mut Queue) -> Result<()> {
+        let n = self.runs.len() as u64;
+        let mut parts = Vec::with_capacity(self.runs.len());
+        for (i, run) in self.runs.into_iter().enumerate() {
+            run.seal()?;
+            let lo = self.lo + i as u64 * self.step;
+            let top = match i as u64 + 1 == n {
+                true => hi,
+                false => lo + self.step - 1,
+            };
+            if run.len() > 0 {
+                parts.push((lo, top, run));
+            }
+        }
+        for p in parts.into_iter().rev() {
+            queue.0.push_front(p);
+        }
+        Ok(())
+    }
+}
+
+/// Parts of rows past the room still to come, in the order of their hashes.
+#[derive(Default)]
+pub(in crate::read) struct Queue(std::collections::VecDeque<(u64, u64, Run)>);
+
+impl Queue {
+    pub(in crate::read) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The hashes the first part begins and ends at.
+    pub(in crate::read) fn front(&self) -> Option<(u64, u64)> {
+        self.0.front().map(|p| (p.0, p.1))
+    }
+
+    /// The next parts to read together: the first, and those after it while together they fit
+    /// `bytes`: their hashes' first and last, the bytes they hold, and each part.
+    pub(in crate::read) fn next(&mut self, bytes: u64) -> Option<(u64, u64, u64, Vec<Run>)> {
+        let (lo, mut hi, first) = self.0.pop_front()?;
+        let mut total = first.total();
+        let mut runs = vec![first];
+        while self.0.front().is_some_and(|p| total + p.2.total() <= bytes) {
+            let (_, top, run) = self.0.pop_front().expect("a part is there");
+            total += run.total();
+            hi = top;
+            runs.push(run);
+        }
+        Some((lo, hi, total, runs))
     }
 }
 
