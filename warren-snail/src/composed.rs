@@ -9,7 +9,9 @@
 //! an array its elements as one list in storage order, its dimensions and lower bounds beside them
 //! where it is not one-dimensional from 1; a composite a leaf a field; a range its two bounds in the
 //! subtype's own form and its flags; a multirange a list of its ranges. An enum is its label, keyed
-//! by its rank among the labels its DDL declares.
+//! by its rank among the labels its DDL declares. A vector, int2vector or oidvector, is an array of
+//! one dimension counted from 0 and no NULLs, its text its elements between blanks, its page form the
+//! list of its elements alone.
 
 use crate::catalog::ColumnType;
 use crate::read::statement::Datum;
@@ -69,6 +71,9 @@ pub enum Composed {
     Multirange { name: String, range: ColumnType },
     /// An enum: its labels in the order its DDL gives them.
     Enum { name: String, labels: Vec<String> },
+    /// A vector: int2vector, of smallints, or oidvector, of oids. One dimension counted from 0, and
+    /// no NULLs.
+    Vector { element: ColumnType },
     /// No composed type: the tree of leaves a type held as a tree of its own is held as, a path's,
     /// a polygon's or a snapshot's, by which its column's leaves are found as a composed column's
     /// are. A column is never of it.
@@ -134,6 +139,9 @@ pub const BUILT_IN_RANGES: [(&str, &str, ColumnType, bool); 6] = [
 /// A range type built in, by its name or its multirange's.
 pub fn built_in(name: &str) -> Option<ColumnType> {
     let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    if let Some(element) = vector_element(name) {
+        return Some(type_of(Composed::Vector { element }));
+    }
     BUILT_IN_RANGES
         .iter()
         .find_map(|&(r, m, subtype, discrete)| {
@@ -153,6 +161,34 @@ pub fn built_in(name: &str) -> Option<ColumnType> {
                 None
             }
         })
+}
+
+/// A vector's element, by the vector's name.
+fn vector_element(name: &str) -> Option<ColumnType> {
+    match name {
+        "int2vector" => Some(ColumnType::Int2),
+        "oidvector" => Some(ColumnType::Oid),
+        _ => None,
+    }
+}
+
+/// Whether a type is a vector.
+pub fn is_vector(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Composed(r) if matches!(r.def(), Composed::Vector { .. }))
+}
+
+/// The array type a function of arrays finds for a vector, its elements'; any other type as it is.
+pub fn array_type(ty: ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::Composed(r) => match r.def() {
+            Composed::Vector { element } => type_of(Composed::Array {
+                element: *element,
+                domain: None,
+            }),
+            _ => ty,
+        },
+        _ => ty,
+    }
 }
 
 /// The multirange type whose ranges are of a range type: a built-in range's, or one the DDL
@@ -184,6 +220,8 @@ impl Composed {
             | Composed::Range { name, .. }
             | Composed::Multirange { name, .. }
             | Composed::Enum { name, .. } => name.clone(),
+            Composed::Vector { element: ColumnType::Oid } => "oidvector".into(),
+            Composed::Vector { .. } => "int2vector".into(),
             Composed::Held(ty) => ty.pg_name(),
         }
     }
@@ -192,6 +230,8 @@ impl Composed {
     pub fn default_opclass(&self) -> &'static str {
         match self {
             Composed::Array { .. } => "array_ops",
+            Composed::Vector { element: ColumnType::Oid } => "oidvector_ops",
+            Composed::Vector { .. } => "array_ops",
             Composed::Record { .. } => "record_ops",
             Composed::Range { .. } => "range_ops",
             Composed::Multirange { .. } => "multirange_ops",
@@ -380,24 +420,23 @@ fn key_into(out: &mut Vec<u8>, ty: ColumnType, item: &Item) {
                 dims,
                 lower,
             },
-        ) => {
+        ) => array_key(out, *element, elements, dims, lower),
+        // btoidvectorcmp's order: its length first, then its elements.
+        (Some(Composed::Vector { element: element @ ColumnType::Oid }), Item::Array { elements, .. }) => {
+            key32(out, elements.len() as i32);
             for e in elements {
-                if e.is_null() {
-                    out.push(2);
-                } else {
-                    out.push(1);
-                    key_into(out, *element, e);
-                }
-            }
-            out.push(0);
-            out.push(dims.len() as u8);
-            for &d in dims {
-                key32(out, d);
-            }
-            for &l in lower {
-                key32(out, l);
+                key_into(out, *element, e);
             }
         }
+        // int2vector has no comparison of its own: it is compared as an array.
+        (
+            Some(Composed::Vector { element }),
+            Item::Array {
+                elements,
+                dims,
+                lower,
+            },
+        ) => array_key(out, *element, elements, dims, lower),
         (Some(Composed::Record { fields, .. }), Item::Record(values)) => {
             for (f, v) in fields.iter().zip(values) {
                 if v.is_null() {
@@ -434,6 +473,48 @@ fn key_into(out: &mut Vec<u8>, ty: ColumnType, item: &Item) {
         (_, other) => {
             debug_assert!(false, "{other:?} is not a value of {}", ty.pg_name());
         }
+    }
+}
+
+/// An array's key: each element marked, an ended value first, then its shape.
+fn array_key(out: &mut Vec<u8>, element: ColumnType, elements: &[Item], dims: &[i32], lower: &[i32]) {
+    for e in elements {
+        if e.is_null() {
+            out.push(2);
+        } else {
+            out.push(1);
+            key_into(out, element, e);
+        }
+    }
+    out.push(0);
+    out.push(dims.len() as u8);
+    for &d in dims {
+        key32(out, d);
+    }
+    for &l in lower {
+        key32(out, l);
+    }
+}
+
+/// The key a vector or an array is compared by as an array, whichever comparison its own type has:
+/// what min and max order it by.
+pub fn array_order_key(ty: ColumnType, c: &Compound) -> Vec<u8> {
+    match (ty, &c.item) {
+        (
+            ColumnType::Composed(r),
+            Item::Array {
+                elements,
+                dims,
+                lower,
+            },
+        ) if matches!(r.def(), Composed::Vector { .. }) => {
+            let mut out = Vec::new();
+            if let Composed::Vector { element } = r.def() {
+                array_key(&mut out, *element, elements, dims, lower);
+            }
+            out
+        }
+        _ => c.key.to_vec(),
     }
 }
 
@@ -496,8 +577,22 @@ pub fn item_of_key(ty: ColumnType, key: &[u8]) -> Option<Item> {
     let ColumnType::Composed(r) = ty else {
         return None;
     };
-    let Composed::Array { element, .. } = r.def() else {
-        return None;
+    let element = match r.def() {
+        Composed::Array { element, .. } => element,
+        Composed::Vector { element } if *element != ColumnType::Oid => element,
+        Composed::Vector { element } => {
+            let n = i32::from_be_bytes(key.get(..4)?.try_into().ok()?) ^ i32::MIN;
+            let mut at = 4;
+            let elements = (0..n)
+                .map(|_| scalar_of_key(*element, key, &mut at).map(Item::Scalar))
+                .collect::<Option<Vec<Item>>>()?;
+            return (at == key.len()).then_some(Item::Array {
+                elements,
+                dims: vec![n],
+                lower: vec![0],
+            });
+        }
+        _ => return None,
     };
     let mut at = 0;
     let mut elements = Vec::new();
@@ -694,7 +789,17 @@ impl Walk<'_> {
         let int = |v: u128| KeyValue::Int((v as u64 ^ (1 << 63)) as i64);
         match ty {
             ColumnType::Composed(r) => match r.def() {
-                Composed::Array { element, .. } => {
+                Composed::Vector {
+                    element: element @ ColumnType::Oid,
+                } => {
+                    let n = (self.fixed(4)? as u32 ^ (1 << 31)) as i32;
+                    self.rungs_of(ColumnType::Int4, KeyValue::Int(n as i64))?;
+                    for _ in 0..n {
+                        self.value(*element)?;
+                    }
+                    Some(())
+                }
+                Composed::Array { element, .. } | Composed::Vector { element } => {
                     loop {
                         match self.mark()? {
                             0 => break,
@@ -833,6 +938,29 @@ pub fn int_in(s: &str, bits: u32) -> Result<i64> {
     }
 }
 
+/// The first field of a composite `record_cmp` reaches with no comparison function for it: one all
+/// the fields before which are equal in the two, a pair of NULLs among them; none where the two part
+/// before any, or where the type is no composite.
+pub fn compare_reaches(ty: ColumnType, a: &Item, b: &Item) -> Option<ColumnType> {
+    let (ColumnType::Composed(r), Item::Record(x), Item::Record(y)) = (ty, a, b) else {
+        return None;
+    };
+    let Composed::Record { fields, .. } = r.def() else {
+        return None;
+    };
+    for ((f, x), y) in fields.iter().zip(x).zip(y) {
+        if !f.ty.ordered() {
+            return Some(f.ty);
+        }
+        match (x.is_null(), y.is_null()) {
+            (true, true) => {}
+            (false, false) if key(f.ty, x) == key(f.ty, y) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// A value of an element type read from its text, as the type's input function reads it.
 pub fn scalar_in(ty: ColumnType, s: &str) -> Result<Datum> {
     Ok(match ty {
@@ -873,6 +1001,8 @@ pub fn scalar_in(ty: ColumnType, s: &str) -> Result<Datum> {
         // A type held as its text, by its input.
         ColumnType::Textual(t) => Datum::Text(crate::textual::text_in(t, s)?),
         ColumnType::Geometric(k) => Datum::Bytes(crate::geo::geo_bytes(&crate::geo::geo_in(k, s)?)),
+        // One only a server makes: no input reads it.
+        ColumnType::Internal(t) => return Err(t.refusal()),
         ColumnType::Interval { range, precision } => Datum::Interval(crate::times::interval_in(
             s,
             range,
@@ -945,6 +1075,7 @@ pub fn text_in(ty: ColumnType, s: &str) -> Result<Item> {
     };
     match r.def() {
         Composed::Array { element, .. } => array_in(*element, s),
+        Composed::Vector { element } => vector_in(*element, s),
         Composed::Record { fields, .. } => record_in(fields, s),
         Composed::Range {
             subtype, discrete, ..
@@ -953,6 +1084,34 @@ pub fn text_in(ty: ColumnType, s: &str) -> Result<Item> {
         Composed::Enum { .. } => Ok(Item::Scalar(scalar_in(ty, s)?)),
         Composed::Held(t) => Ok(Item::Scalar(scalar_in(*t, s)?)),
     }
+}
+
+/// A vector's text as `int2vectorin` and `oidvectorin` read it: its elements with white space before
+/// each; an int2vector's each in base 10 and followed by a blank or nothing, an oidvector's as `oidin`
+/// reads its number, followed by anything.
+fn vector_in(element: ColumnType, s: &str) -> Result<Item> {
+    let b = s.as_bytes();
+    let mut at = 0;
+    let mut elements = Vec::new();
+    loop {
+        while at < b.len() && is_space(b[at]) {
+            at += 1;
+        }
+        if at == b.len() {
+            break;
+        }
+        let (value, end) = match element {
+            ColumnType::Oid => crate::scalars::oid_prefix(&s[at..])?,
+            _ => crate::scalars::int2_prefix(&s[at..])?,
+        };
+        elements.push(Item::Scalar(Datum::Int(value)));
+        at += end;
+    }
+    Ok(Item::Array {
+        dims: vec![elements.len() as i32],
+        lower: vec![0],
+        elements,
+    })
 }
 
 /// An array's text read as `array_in` reads it: its dimensions written `[l:u]` before `=`, or found
@@ -1747,6 +1906,11 @@ pub fn text_out(ty: ColumnType, item: &Item) -> String {
             nest(&mut out, &texts, dims, delimiter(*element) as char);
             out
         }
+        (Composed::Vector { element }, Item::Array { elements, .. }) => elements
+            .iter()
+            .map(|e| part_text(*element, e))
+            .collect::<Vec<String>>()
+            .join(" "),
         (Composed::Record { fields, .. }, Item::Record(values)) => {
             let mut out = String::from("(");
             for (i, (f, v)) in fields.iter().zip(values).enumerate() {
@@ -1941,6 +2105,11 @@ impl Node {
                         element: Box::new(leaf("element", ColumnType::Int4, false, true)),
                     },
                 ],
+            },
+            Composed::Vector { element } => Node::List {
+                name: name.into(),
+                optional,
+                element: Box::new(Node::of("element", *element, false)),
             },
             // A composite of no fields holds one leaf, a boolean always NULL, which carries the
             // composite's own NULL in its levels: Parquet has no group of no fields.
@@ -2352,6 +2521,9 @@ fn tree_of(ty: ColumnType, item: &Item) -> Tree {
                 if plain { Tree::Null } else { ints(lower) },
             ])
         }
+        (Some(Composed::Vector { element }), Item::Array { elements, .. }) => {
+            Tree::List(elements.iter().map(|e| tree_of(*element, e)).collect())
+        }
         (Some(Composed::Record { fields, .. }), Item::Record(_)) if fields.is_empty() => {
             Tree::Group(vec![Tree::Null])
         }
@@ -2424,6 +2596,11 @@ fn item_of(ty: ColumnType, t: Tree) -> Item {
                 lower,
             }
         }
+        (Some(Composed::Vector { element }), Tree::List(v)) => Item::Array {
+            dims: vec![v.len() as i32],
+            lower: vec![0],
+            elements: v.into_iter().map(|e| item_of(*element, e)).collect(),
+        },
         (Some(Composed::Record { fields, .. }), Tree::Group(parts)) => Item::Record(
             fields
                 .iter()
@@ -3096,7 +3273,8 @@ fn leaf_arrow(ty: ColumnType) -> arrow::datatypes::DataType {
         | ColumnType::Name
         | ColumnType::NumericText(_)
         | ColumnType::Textual(_) => A::Utf8,
-        ColumnType::Bytes | ColumnType::Composed(_) => A::Binary,
+        ColumnType::Internal(t) if !t.is_bytes() => A::Utf8,
+        ColumnType::Bytes | ColumnType::Composed(_) | ColumnType::Internal(_) => A::Binary,
         ColumnType::Bit(_) => crate::strings::string_arrow(ty),
         ColumnType::Numeric { precision, scale } => A::Decimal128(precision, scale as i8),
         ColumnType::Uuid => A::FixedSizeBinary(16),
@@ -3231,6 +3409,12 @@ impl Node {
             Node::Leaf { ty, .. } => Tree::Leaf(leaf_at(*ty, a, r)?),
             Node::Group { children, .. } => {
                 let s = a.as_any().downcast_ref::<StructArray>()?;
+                // A group of other fields is another type's: a row type's of another release.
+                if s.num_columns() != children.len()
+                    || s.column_names().iter().zip(children).any(|(n, c)| *n != c.name())
+                {
+                    return None;
+                }
                 Tree::Group(
                     children
                         .iter()
@@ -3302,7 +3486,16 @@ fn leaf_array(ty: ColumnType, values: Vec<Option<&Datum>>) -> Result<arrow::arra
                 })
                 .collect::<StringArray>(),
         ),
-        ColumnType::Bytes => Arc::new(
+        ColumnType::Internal(t) if !t.is_bytes() => Arc::new(
+            values
+                .iter()
+                .map(|d| match d {
+                    Some(Datum::Text(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect::<StringArray>(),
+        ),
+        ColumnType::Bytes | ColumnType::Internal(_) => Arc::new(
             values
                 .iter()
                 .map(|d| match d {
@@ -3392,7 +3585,12 @@ fn leaf_at(ty: ColumnType, a: &dyn arrow::array::Array, r: usize) -> Option<Datu
         | ColumnType::Textual(_) => {
             Datum::Text(any.downcast_ref::<StringArray>()?.value(r).to_string())
         }
-        ColumnType::Bytes => Datum::Bytes(any.downcast_ref::<BinaryArray>()?.value(r).to_vec()),
+        ColumnType::Internal(t) if !t.is_bytes() => {
+            Datum::Text(any.downcast_ref::<StringArray>()?.value(r).to_string())
+        }
+        ColumnType::Bytes | ColumnType::Internal(_) => {
+            Datum::Bytes(any.downcast_ref::<BinaryArray>()?.value(r).to_vec())
+        }
         ColumnType::Bit(_) => Datum::Bytes(crate::strings::bits_key_at(ty, a, r)?),
         ColumnType::Composed(_) => {
             let b = any.downcast_ref::<BinaryArray>()?.value(r);
@@ -3561,6 +3759,9 @@ pub fn resolve(dt: &sqlparser::ast::DataType) -> Option<ColumnType> {
             // A built-in type's name is the built-in type, as PostgreSQL searches pg_catalog first.
             if crate::catalog::held_type(dt).is_ok_and(|t| !matches!(t, ColumnType::Composed(_))) {
                 return None;
+            }
+            if crate::rowtypes::is_row_type(&n) {
+                return crate::rowtypes::row_type_at(&n, crate::read::handed::release_held()).ok();
             }
             if let Some(t) = crate::read::handed::table_row(&n) {
                 return Some(t);
@@ -4291,7 +4492,7 @@ fn element_keys(element: ColumnType, a: &Item) -> Vec<Option<Vec<u8>>> {
 /// An array operator on two arrays of type `ty`: `@>`, `<@` and `&&`, as `array_contains`,
 /// `array_contained` and `arrayoverlap` answer them, a NULL element matching nothing.
 pub fn array_op(ty: ColumnType, op: &str, a: &Item, b: &Item) -> Result<bool> {
-    let Some(Composed::Array { element, .. }) = (match ty {
+    let Some(Composed::Array { element, .. } | Composed::Vector { element }) = (match ty {
         ColumnType::Composed(r) => Some(r.def()),
         _ => None,
     }) else {
@@ -4505,6 +4706,6 @@ pub fn replace(ty: ColumnType, from: ColumnType, to: ColumnType) -> ColumnType {
             name,
             range: replace(range, from, to),
         },
-        e @ (Composed::Enum { .. } | Composed::Held(_)) => e,
+        e @ (Composed::Enum { .. } | Composed::Held(_) | Composed::Vector { .. }) => e,
     })
 }

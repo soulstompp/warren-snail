@@ -70,8 +70,8 @@ fn a_type_is_held_where_a_table_s_column_of_it_is_taken() {
     assert_eq!(named(&of, "integer").refused, None);
     assert_eq!(named(&of, "timestamp with time zone[]").refused, None);
     assert_eq!(
-        named(&of, "int2vector").refused.as_deref(),
-        Some("census.t.c: the type int2vector is not held")
+        named(&of, "pg_attribute").refused.as_deref(),
+        Some("census.t.c: column \"attmissingval\" has pseudo-type anyarray")
     );
     assert!(named(&of, "anyelement").refused.is_some());
     assert_eq!(named(&of, "integer").listed.family, "numeric types");
@@ -103,7 +103,7 @@ fn an_operator_class_is_held_where_an_index_of_it_is_taken() {
         .starts_with("CREATE TYPE census.e AS ENUM ('a', 'b');"));
     assert_eq!(
         named(&of, "oidvector_ops USING btree").refused.as_deref(),
-        Some("census.t.c: the type oidvector is not held")
+        None
     );
     assert_eq!(
         named_listed(Kind::Opclass, "int4_ops USING btree").input,
@@ -137,11 +137,7 @@ fn an_operator_is_held_where_a_pipeline_s_step_answers_it_over_columns_of_its_ty
         named(&of, "+(aclitem[],aclitem)").refused.as_deref(),
         Some("aclinsert is no longer supported")
     );
-    // An operand type the snail refuses as a column refuses the operator in the DDL reader's words.
-    assert_eq!(
-        named(&of, "=(oidvector,oidvector)").refused.as_deref(),
-        Some("census.t.v_oidvector: the type oidvector is not held")
-    );
+    assert_eq!(named(&of, "=(oidvector,oidvector)").refused, None);
     // The setup makes the table whole for PostgreSQL: a column and a value of every operand type.
     assert!(setup.iter().any(|s| s.contains(" v_oidvector oidvector")));
     assert!(setup.contains(&"UPDATE census.t SET v_oidvector = '1 2' WHERE k = 1;".to_string()));

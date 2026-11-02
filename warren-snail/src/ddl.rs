@@ -1926,6 +1926,12 @@ impl Draft {
             if args.is_empty() {
                 let n = object_name(name);
                 let n = n.strip_prefix("pg_catalog.").unwrap_or(&n).to_string();
+                // As PostgreSQL searches pg_catalog first.
+                if let Some(t) = crate::rowtypes::row_type(&n)
+                    .map_err(|e| Error::new(format!("{what}: {e}")))?
+                {
+                    return Ok((t, None));
+                }
                 if let Some(t) = self.types.iter().find(|t| t.name == n) {
                     return Ok((self.declared_type(t, what)?, None));
                 }
@@ -3930,6 +3936,7 @@ impl Draft {
                     if o != default
                         && !(text && TEXT_OPCLASSES.contains(&o.as_str()))
                         && !(bpchar && o == "bpchar_pattern_ops")
+                        && !(o == "array_ops" && crate::composed::is_vector(key_type))
                     {
                         return Err(Error::new(format!(
                             "{shown}: the operator class {o} is not read on {}",
@@ -5514,7 +5521,7 @@ mod tests {
 
 /// A type written as text, as sqlparser reads it: a composite's field's, a domain's base, a range's
 /// subtype.
-fn parse_type(text: &str) -> Result<DataType> {
+pub(crate) fn parse_type(text: &str) -> Result<DataType> {
     let tokens = Tokenizer::new(&PostgreSqlDialect {}, text).tokenize()?;
     let tokens: Vec<Token> = tokens
         .into_iter()

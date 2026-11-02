@@ -1,0 +1,3004 @@
+= pg_aggregate
+aggfnoid	regproc
+aggkind	"char"
+aggnumdirectargs	smallint
+aggtransfn	regproc
+aggfinalfn	regproc
+aggcombinefn	regproc
+aggserialfn	regproc
+aggdeserialfn	regproc
+aggmtransfn	regproc
+aggminvtransfn	regproc
+aggmfinalfn	regproc
+aggfinalextra	boolean
+aggmfinalextra	boolean
+aggfinalmodify	"char"
+aggmfinalmodify	"char"
+aggsortop	oid
+aggtranstype	oid
+aggtransspace	integer
+aggmtranstype	oid
+aggmtransspace	integer
+agginitval	text
+aggminitval	text
+= pg_aios 18-19
+pid	integer
+io_id	integer
+io_generation	bigint
+state	text
+operation	text
+off	bigint
+length	bigint
+target	text
+handle_data_len	smallint
+raw_result	integer
+result	text
+target_desc	text
+f_sync	boolean
+f_localmem	boolean
+f_buffered	boolean
+= pg_am
+oid	oid
+amname	name
+amhandler	regproc
+amtype	"char"
+= pg_amop
+oid	oid
+amopfamily	oid
+amoplefttype	oid
+amoprighttype	oid
+amopstrategy	smallint
+amoppurpose	"char"
+amopopr	oid
+amopmethod	oid
+amopsortfamily	oid
+= pg_amproc
+oid	oid
+amprocfamily	oid
+amproclefttype	oid
+amprocrighttype	oid
+amprocnum	smallint
+amproc	regproc
+= pg_attrdef
+oid	oid
+adrelid	oid
+adnum	smallint
+adbin	pg_node_tree
+= pg_attribute 14-15
+attrelid	oid
+attname	name
+atttypid	oid
+attstattarget	integer
+attlen	smallint
+attnum	smallint
+attndims	integer
+attcacheoff	integer
+atttypmod	integer
+attbyval	boolean
+attalign	"char"
+attstorage	"char"
+attcompression	"char"
+attnotnull	boolean
+atthasdef	boolean
+atthasmissing	boolean
+attidentity	"char"
+attgenerated	"char"
+attisdropped	boolean
+attislocal	boolean
+attinhcount	integer
+attcollation	oid
+attacl	aclitem[]
+attoptions	text[]
+attfdwoptions	text[]
+attmissingval	anyarray
+= pg_attribute 16
+attrelid	oid
+attname	name
+atttypid	oid
+attlen	smallint
+attnum	smallint
+attcacheoff	integer
+atttypmod	integer
+attndims	smallint
+attbyval	boolean
+attalign	"char"
+attstorage	"char"
+attcompression	"char"
+attnotnull	boolean
+atthasdef	boolean
+atthasmissing	boolean
+attidentity	"char"
+attgenerated	"char"
+attisdropped	boolean
+attislocal	boolean
+attinhcount	smallint
+attstattarget	smallint
+attcollation	oid
+attacl	aclitem[]
+attoptions	text[]
+attfdwoptions	text[]
+attmissingval	anyarray
+= pg_attribute 17
+attrelid	oid
+attname	name
+atttypid	oid
+attlen	smallint
+attnum	smallint
+attcacheoff	integer
+atttypmod	integer
+attndims	smallint
+attbyval	boolean
+attalign	"char"
+attstorage	"char"
+attcompression	"char"
+attnotnull	boolean
+atthasdef	boolean
+atthasmissing	boolean
+attidentity	"char"
+attgenerated	"char"
+attisdropped	boolean
+attislocal	boolean
+attinhcount	smallint
+attcollation	oid
+attstattarget	smallint
+attacl	aclitem[]
+attoptions	text[]
+attfdwoptions	text[]
+attmissingval	anyarray
+= pg_attribute 18-19
+attrelid	oid
+attname	name
+atttypid	oid
+attlen	smallint
+attnum	smallint
+atttypmod	integer
+attndims	smallint
+attbyval	boolean
+attalign	"char"
+attstorage	"char"
+attcompression	"char"
+attnotnull	boolean
+atthasdef	boolean
+atthasmissing	boolean
+attidentity	"char"
+attgenerated	"char"
+attisdropped	boolean
+attislocal	boolean
+attinhcount	smallint
+attcollation	oid
+attstattarget	smallint
+attacl	aclitem[]
+attoptions	text[]
+attfdwoptions	text[]
+attmissingval	anyarray
+= pg_auth_members 14-15
+roleid	oid
+member	oid
+grantor	oid
+admin_option	boolean
+= pg_auth_members 16-19
+oid	oid
+roleid	oid
+member	oid
+grantor	oid
+admin_option	boolean
+inherit_option	boolean
+set_option	boolean
+= pg_authid
+oid	oid
+rolname	name
+rolsuper	boolean
+rolinherit	boolean
+rolcreaterole	boolean
+rolcreatedb	boolean
+rolcanlogin	boolean
+rolreplication	boolean
+rolbypassrls	boolean
+rolconnlimit	integer
+rolpassword	text
+rolvaliduntil	timestamp with time zone
+= pg_available_extension_versions 14-18
+name	name
+version	text
+installed	boolean
+superuser	boolean
+trusted	boolean
+relocatable	boolean
+schema	name
+requires	name[]
+comment	text
+= pg_available_extension_versions 19
+name	name
+version	text
+installed	boolean
+superuser	boolean
+trusted	boolean
+relocatable	boolean
+schema	name
+requires	name[]
+location	text
+comment	text
+= pg_available_extensions 14-18
+name	name
+default_version	text
+installed_version	text
+comment	text
+= pg_available_extensions 19
+name	name
+default_version	text
+installed_version	text
+location	text
+comment	text
+= pg_backend_memory_contexts 14-17
+name	text
+ident	text
+parent	text
+level	integer
+total_bytes	bigint
+total_nblocks	bigint
+free_bytes	bigint
+free_chunks	bigint
+used_bytes	bigint
+= pg_backend_memory_contexts 18-19
+name	text
+ident	text
+type	text
+level	integer
+path	integer[]
+total_bytes	bigint
+total_nblocks	bigint
+free_bytes	bigint
+free_chunks	bigint
+used_bytes	bigint
+= pg_cast
+oid	oid
+castsource	oid
+casttarget	oid
+castfunc	oid
+castcontext	"char"
+castmethod	"char"
+= pg_class 14-17
+oid	oid
+relname	name
+relnamespace	oid
+reltype	oid
+reloftype	oid
+relowner	oid
+relam	oid
+relfilenode	oid
+reltablespace	oid
+relpages	integer
+reltuples	real
+relallvisible	integer
+reltoastrelid	oid
+relhasindex	boolean
+relisshared	boolean
+relpersistence	"char"
+relkind	"char"
+relnatts	smallint
+relchecks	smallint
+relhasrules	boolean
+relhastriggers	boolean
+relhassubclass	boolean
+relrowsecurity	boolean
+relforcerowsecurity	boolean
+relispopulated	boolean
+relreplident	"char"
+relispartition	boolean
+relrewrite	oid
+relfrozenxid	xid
+relminmxid	xid
+relacl	aclitem[]
+reloptions	text[]
+relpartbound	pg_node_tree
+= pg_class 18-19
+oid	oid
+relname	name
+relnamespace	oid
+reltype	oid
+reloftype	oid
+relowner	oid
+relam	oid
+relfilenode	oid
+reltablespace	oid
+relpages	integer
+reltuples	real
+relallvisible	integer
+relallfrozen	integer
+reltoastrelid	oid
+relhasindex	boolean
+relisshared	boolean
+relpersistence	"char"
+relkind	"char"
+relnatts	smallint
+relchecks	smallint
+relhasrules	boolean
+relhastriggers	boolean
+relhassubclass	boolean
+relrowsecurity	boolean
+relforcerowsecurity	boolean
+relispopulated	boolean
+relreplident	"char"
+relispartition	boolean
+relrewrite	oid
+relfrozenxid	xid
+relminmxid	xid
+relacl	aclitem[]
+reloptions	text[]
+relpartbound	pg_node_tree
+= pg_collation 14
+oid	oid
+collname	name
+collnamespace	oid
+collowner	oid
+collprovider	"char"
+collisdeterministic	boolean
+collencoding	integer
+collcollate	name
+collctype	name
+collversion	text
+= pg_collation 15
+oid	oid
+collname	name
+collnamespace	oid
+collowner	oid
+collprovider	"char"
+collisdeterministic	boolean
+collencoding	integer
+collcollate	text
+collctype	text
+colliculocale	text
+collversion	text
+= pg_collation 16
+oid	oid
+collname	name
+collnamespace	oid
+collowner	oid
+collprovider	"char"
+collisdeterministic	boolean
+collencoding	integer
+collcollate	text
+collctype	text
+colliculocale	text
+collicurules	text
+collversion	text
+= pg_collation 17-19
+oid	oid
+collname	name
+collnamespace	oid
+collowner	oid
+collprovider	"char"
+collisdeterministic	boolean
+collencoding	integer
+collcollate	text
+collctype	text
+colllocale	text
+collicurules	text
+collversion	text
+= pg_config
+name	text
+setting	text
+= pg_constraint 14
+oid	oid
+conname	name
+connamespace	oid
+contype	"char"
+condeferrable	boolean
+condeferred	boolean
+convalidated	boolean
+conrelid	oid
+contypid	oid
+conindid	oid
+conparentid	oid
+confrelid	oid
+confupdtype	"char"
+confdeltype	"char"
+confmatchtype	"char"
+conislocal	boolean
+coninhcount	integer
+connoinherit	boolean
+conkey	smallint[]
+confkey	smallint[]
+conpfeqop	oid[]
+conppeqop	oid[]
+conffeqop	oid[]
+conexclop	oid[]
+conbin	pg_node_tree
+= pg_constraint 15
+oid	oid
+conname	name
+connamespace	oid
+contype	"char"
+condeferrable	boolean
+condeferred	boolean
+convalidated	boolean
+conrelid	oid
+contypid	oid
+conindid	oid
+conparentid	oid
+confrelid	oid
+confupdtype	"char"
+confdeltype	"char"
+confmatchtype	"char"
+conislocal	boolean
+coninhcount	integer
+connoinherit	boolean
+conkey	smallint[]
+confkey	smallint[]
+conpfeqop	oid[]
+conppeqop	oid[]
+conffeqop	oid[]
+confdelsetcols	smallint[]
+conexclop	oid[]
+conbin	pg_node_tree
+= pg_constraint 16-17
+oid	oid
+conname	name
+connamespace	oid
+contype	"char"
+condeferrable	boolean
+condeferred	boolean
+convalidated	boolean
+conrelid	oid
+contypid	oid
+conindid	oid
+conparentid	oid
+confrelid	oid
+confupdtype	"char"
+confdeltype	"char"
+confmatchtype	"char"
+conislocal	boolean
+coninhcount	smallint
+connoinherit	boolean
+conkey	smallint[]
+confkey	smallint[]
+conpfeqop	oid[]
+conppeqop	oid[]
+conffeqop	oid[]
+confdelsetcols	smallint[]
+conexclop	oid[]
+conbin	pg_node_tree
+= pg_constraint 18-19
+oid	oid
+conname	name
+connamespace	oid
+contype	"char"
+condeferrable	boolean
+condeferred	boolean
+conenforced	boolean
+convalidated	boolean
+conrelid	oid
+contypid	oid
+conindid	oid
+conparentid	oid
+confrelid	oid
+confupdtype	"char"
+confdeltype	"char"
+confmatchtype	"char"
+conislocal	boolean
+coninhcount	smallint
+connoinherit	boolean
+conperiod	boolean
+conkey	smallint[]
+confkey	smallint[]
+conpfeqop	oid[]
+conppeqop	oid[]
+conffeqop	oid[]
+confdelsetcols	smallint[]
+conexclop	oid[]
+conbin	pg_node_tree
+= pg_conversion
+oid	oid
+conname	name
+connamespace	oid
+conowner	oid
+conforencoding	integer
+contoencoding	integer
+conproc	regproc
+condefault	boolean
+= pg_cursors
+name	text
+statement	text
+is_holdable	boolean
+is_binary	boolean
+is_scrollable	boolean
+creation_time	timestamp with time zone
+= pg_database 14
+oid	oid
+datname	name
+datdba	oid
+encoding	integer
+datcollate	name
+datctype	name
+datistemplate	boolean
+datallowconn	boolean
+datconnlimit	integer
+datlastsysoid	oid
+datfrozenxid	xid
+datminmxid	xid
+dattablespace	oid
+datacl	aclitem[]
+= pg_database 15
+oid	oid
+datname	name
+datdba	oid
+encoding	integer
+datlocprovider	"char"
+datistemplate	boolean
+datallowconn	boolean
+datconnlimit	integer
+datfrozenxid	xid
+datminmxid	xid
+dattablespace	oid
+datcollate	text
+datctype	text
+daticulocale	text
+datcollversion	text
+datacl	aclitem[]
+= pg_database 16
+oid	oid
+datname	name
+datdba	oid
+encoding	integer
+datlocprovider	"char"
+datistemplate	boolean
+datallowconn	boolean
+datconnlimit	integer
+datfrozenxid	xid
+datminmxid	xid
+dattablespace	oid
+datcollate	text
+datctype	text
+daticulocale	text
+daticurules	text
+datcollversion	text
+datacl	aclitem[]
+= pg_database 17-19
+oid	oid
+datname	name
+datdba	oid
+encoding	integer
+datlocprovider	"char"
+datistemplate	boolean
+datallowconn	boolean
+dathasloginevt	boolean
+datconnlimit	integer
+datfrozenxid	xid
+datminmxid	xid
+dattablespace	oid
+datcollate	text
+datctype	text
+datlocale	text
+daticurules	text
+datcollversion	text
+datacl	aclitem[]
+= pg_db_role_setting
+setdatabase	oid
+setrole	oid
+setconfig	text[]
+= pg_default_acl
+oid	oid
+defaclrole	oid
+defaclnamespace	oid
+defaclobjtype	"char"
+defaclacl	aclitem[]
+= pg_depend
+classid	oid
+objid	oid
+objsubid	integer
+refclassid	oid
+refobjid	oid
+refobjsubid	integer
+deptype	"char"
+= pg_description
+objoid	oid
+classoid	oid
+objsubid	integer
+description	text
+= pg_dsm_registry_allocations 19
+name	text
+type	text
+size	bigint
+= pg_enum
+oid	oid
+enumtypid	oid
+enumsortorder	real
+enumlabel	name
+= pg_event_trigger
+oid	oid
+evtname	name
+evtevent	name
+evtowner	oid
+evtfoid	oid
+evtenabled	"char"
+evttags	text[]
+= pg_extension
+oid	oid
+extname	name
+extowner	oid
+extnamespace	oid
+extrelocatable	boolean
+extversion	text
+extconfig	oid[]
+extcondition	text[]
+= pg_file_settings
+sourcefile	text
+sourceline	integer
+seqno	integer
+name	text
+setting	text
+applied	boolean
+error	text
+= pg_foreign_data_wrapper 14-18
+oid	oid
+fdwname	name
+fdwowner	oid
+fdwhandler	oid
+fdwvalidator	oid
+fdwacl	aclitem[]
+fdwoptions	text[]
+= pg_foreign_data_wrapper 19
+oid	oid
+fdwname	name
+fdwowner	oid
+fdwhandler	oid
+fdwvalidator	oid
+fdwconnection	oid
+fdwacl	aclitem[]
+fdwoptions	text[]
+= pg_foreign_server
+oid	oid
+srvname	name
+srvowner	oid
+srvfdw	oid
+srvtype	text
+srvversion	text
+srvacl	aclitem[]
+srvoptions	text[]
+= pg_foreign_table
+ftrelid	oid
+ftserver	oid
+ftoptions	text[]
+= pg_group
+groname	name
+grosysid	oid
+grolist	oid[]
+= pg_hba_file_rules 14-15
+line_number	integer
+type	text
+database	text[]
+user_name	text[]
+address	text
+netmask	text
+auth_method	text
+options	text[]
+error	text
+= pg_hba_file_rules 16-19
+rule_number	integer
+file_name	text
+line_number	integer
+type	text
+database	text[]
+user_name	text[]
+address	text
+netmask	text
+auth_method	text
+options	text[]
+error	text
+= pg_ident_file_mappings 15
+line_number	integer
+map_name	text
+sys_name	text
+pg_username	text
+error	text
+= pg_ident_file_mappings 16-19
+map_number	integer
+file_name	text
+line_number	integer
+map_name	text
+sys_name	text
+pg_username	text
+error	text
+= pg_index 14
+indexrelid	oid
+indrelid	oid
+indnatts	smallint
+indnkeyatts	smallint
+indisunique	boolean
+indisprimary	boolean
+indisexclusion	boolean
+indimmediate	boolean
+indisclustered	boolean
+indisvalid	boolean
+indcheckxmin	boolean
+indisready	boolean
+indislive	boolean
+indisreplident	boolean
+indkey	int2vector
+indcollation	oidvector
+indclass	oidvector
+indoption	int2vector
+indexprs	pg_node_tree
+indpred	pg_node_tree
+= pg_index 15-19
+indexrelid	oid
+indrelid	oid
+indnatts	smallint
+indnkeyatts	smallint
+indisunique	boolean
+indnullsnotdistinct	boolean
+indisprimary	boolean
+indisexclusion	boolean
+indimmediate	boolean
+indisclustered	boolean
+indisvalid	boolean
+indcheckxmin	boolean
+indisready	boolean
+indislive	boolean
+indisreplident	boolean
+indkey	int2vector
+indcollation	oidvector
+indclass	oidvector
+indoption	int2vector
+indexprs	pg_node_tree
+indpred	pg_node_tree
+= pg_indexes
+schemaname	name
+tablename	name
+indexname	name
+tablespace	name
+indexdef	text
+= pg_inherits
+inhrelid	oid
+inhparent	oid
+inhseqno	integer
+inhdetachpending	boolean
+= pg_init_privs
+objoid	oid
+classoid	oid
+objsubid	integer
+privtype	"char"
+initprivs	aclitem[]
+= pg_language
+oid	oid
+lanname	name
+lanowner	oid
+lanispl	boolean
+lanpltrusted	boolean
+lanplcallfoid	oid
+laninline	oid
+lanvalidator	oid
+lanacl	aclitem[]
+= pg_largeobject
+loid	oid
+pageno	integer
+data	bytea
+= pg_largeobject_metadata
+oid	oid
+lomowner	oid
+lomacl	aclitem[]
+= pg_locks
+locktype	text
+database	oid
+relation	oid
+page	integer
+tuple	smallint
+virtualxid	text
+transactionid	xid
+classid	oid
+objid	oid
+objsubid	smallint
+virtualtransaction	text
+pid	integer
+mode	text
+granted	boolean
+fastpath	boolean
+waitstart	timestamp with time zone
+= pg_matviews
+schemaname	name
+matviewname	name
+matviewowner	name
+tablespace	name
+hasindexes	boolean
+ispopulated	boolean
+definition	text
+= pg_namespace
+oid	oid
+nspname	name
+nspowner	oid
+nspacl	aclitem[]
+= pg_opclass
+oid	oid
+opcmethod	oid
+opcname	name
+opcnamespace	oid
+opcowner	oid
+opcfamily	oid
+opcintype	oid
+opcdefault	boolean
+opckeytype	oid
+= pg_operator
+oid	oid
+oprname	name
+oprnamespace	oid
+oprowner	oid
+oprkind	"char"
+oprcanmerge	boolean
+oprcanhash	boolean
+oprleft	oid
+oprright	oid
+oprresult	oid
+oprcom	oid
+oprnegate	oid
+oprcode	regproc
+oprrest	regproc
+oprjoin	regproc
+= pg_opfamily
+oid	oid
+opfmethod	oid
+opfname	name
+opfnamespace	oid
+opfowner	oid
+= pg_parameter_acl 15-19
+oid	oid
+parname	text
+paracl	aclitem[]
+= pg_partitioned_table
+partrelid	oid
+partstrat	"char"
+partnatts	smallint
+partdefid	oid
+partattrs	int2vector
+partclass	oidvector
+partcollation	oidvector
+partexprs	pg_node_tree
+= pg_policies
+schemaname	name
+tablename	name
+policyname	name
+permissive	text
+roles	name[]
+cmd	text
+qual	text
+with_check	text
+= pg_policy
+oid	oid
+polname	name
+polrelid	oid
+polcmd	"char"
+polpermissive	boolean
+polroles	oid[]
+polqual	pg_node_tree
+polwithcheck	pg_node_tree
+= pg_prepared_statements 14-15
+name	text
+statement	text
+prepare_time	timestamp with time zone
+parameter_types	regtype[]
+from_sql	boolean
+generic_plans	bigint
+custom_plans	bigint
+= pg_prepared_statements 16-19
+name	text
+statement	text
+prepare_time	timestamp with time zone
+parameter_types	regtype[]
+result_types	regtype[]
+from_sql	boolean
+generic_plans	bigint
+custom_plans	bigint
+= pg_prepared_xacts
+transaction	xid
+gid	text
+prepared	timestamp with time zone
+owner	name
+database	name
+= pg_proc
+oid	oid
+proname	name
+pronamespace	oid
+proowner	oid
+prolang	oid
+procost	real
+prorows	real
+provariadic	oid
+prosupport	regproc
+prokind	"char"
+prosecdef	boolean
+proleakproof	boolean
+proisstrict	boolean
+proretset	boolean
+provolatile	"char"
+proparallel	"char"
+pronargs	smallint
+pronargdefaults	smallint
+prorettype	oid
+proargtypes	oidvector
+proallargtypes	oid[]
+proargmodes	"char"[]
+proargnames	text[]
+proargdefaults	pg_node_tree
+protrftypes	oid[]
+prosrc	text
+probin	text
+prosqlbody	pg_node_tree
+proconfig	text[]
+proacl	aclitem[]
+= pg_publication 14-17
+oid	oid
+pubname	name
+pubowner	oid
+puballtables	boolean
+pubinsert	boolean
+pubupdate	boolean
+pubdelete	boolean
+pubtruncate	boolean
+pubviaroot	boolean
+= pg_publication 18
+oid	oid
+pubname	name
+pubowner	oid
+puballtables	boolean
+pubinsert	boolean
+pubupdate	boolean
+pubdelete	boolean
+pubtruncate	boolean
+pubviaroot	boolean
+pubgencols	"char"
+= pg_publication 19
+oid	oid
+pubname	name
+pubowner	oid
+puballtables	boolean
+puballsequences	boolean
+pubinsert	boolean
+pubupdate	boolean
+pubdelete	boolean
+pubtruncate	boolean
+pubviaroot	boolean
+pubgencols	"char"
+= pg_publication_namespace 15-19
+oid	oid
+pnpubid	oid
+pnnspid	oid
+= pg_publication_rel 14
+oid	oid
+prpubid	oid
+prrelid	oid
+= pg_publication_rel 15-18
+oid	oid
+prpubid	oid
+prrelid	oid
+prqual	pg_node_tree
+prattrs	int2vector
+= pg_publication_rel 19
+oid	oid
+prpubid	oid
+prrelid	oid
+prexcept	boolean
+prqual	pg_node_tree
+prattrs	int2vector
+= pg_publication_sequences 19
+pubname	name
+schemaname	name
+sequencename	name
+= pg_publication_tables 14
+pubname	name
+schemaname	name
+tablename	name
+= pg_publication_tables 15-19
+pubname	name
+schemaname	name
+tablename	name
+attnames	name[]
+rowfilter	text
+= pg_range 14-18
+rngtypid	oid
+rngsubtype	oid
+rngmultitypid	oid
+rngcollation	oid
+rngsubopc	oid
+rngcanonical	regproc
+rngsubdiff	regproc
+= pg_range 19
+rngtypid	oid
+rngsubtype	oid
+rngmultitypid	oid
+rngcollation	oid
+rngsubopc	oid
+rngconstruct2	regproc
+rngconstruct3	regproc
+rngmltconstruct0	regproc
+rngmltconstruct1	regproc
+rngmltconstruct2	regproc
+rngcanonical	regproc
+rngsubdiff	regproc
+= pg_replication_origin
+roident	oid
+roname	text
+= pg_replication_origin_status
+local_id	oid
+external_id	text
+remote_lsn	pg_lsn
+local_lsn	pg_lsn
+= pg_replication_slots 14-15
+slot_name	name
+plugin	name
+slot_type	text
+datoid	oid
+database	name
+temporary	boolean
+active	boolean
+active_pid	integer
+xmin	xid
+catalog_xmin	xid
+restart_lsn	pg_lsn
+confirmed_flush_lsn	pg_lsn
+wal_status	text
+safe_wal_size	bigint
+two_phase	boolean
+= pg_replication_slots 16
+slot_name	name
+plugin	name
+slot_type	text
+datoid	oid
+database	name
+temporary	boolean
+active	boolean
+active_pid	integer
+xmin	xid
+catalog_xmin	xid
+restart_lsn	pg_lsn
+confirmed_flush_lsn	pg_lsn
+wal_status	text
+safe_wal_size	bigint
+two_phase	boolean
+conflicting	boolean
+= pg_replication_slots 17
+slot_name	name
+plugin	name
+slot_type	text
+datoid	oid
+database	name
+temporary	boolean
+active	boolean
+active_pid	integer
+xmin	xid
+catalog_xmin	xid
+restart_lsn	pg_lsn
+confirmed_flush_lsn	pg_lsn
+wal_status	text
+safe_wal_size	bigint
+two_phase	boolean
+inactive_since	timestamp with time zone
+conflicting	boolean
+invalidation_reason	text
+failover	boolean
+synced	boolean
+= pg_replication_slots 18
+slot_name	name
+plugin	name
+slot_type	text
+datoid	oid
+database	name
+temporary	boolean
+active	boolean
+active_pid	integer
+xmin	xid
+catalog_xmin	xid
+restart_lsn	pg_lsn
+confirmed_flush_lsn	pg_lsn
+wal_status	text
+safe_wal_size	bigint
+two_phase	boolean
+two_phase_at	pg_lsn
+inactive_since	timestamp with time zone
+conflicting	boolean
+invalidation_reason	text
+failover	boolean
+synced	boolean
+= pg_replication_slots 19
+slot_name	name
+plugin	name
+slot_type	text
+datoid	oid
+database	name
+temporary	boolean
+active	boolean
+active_pid	integer
+xmin	xid
+catalog_xmin	xid
+restart_lsn	pg_lsn
+confirmed_flush_lsn	pg_lsn
+wal_status	text
+safe_wal_size	bigint
+two_phase	boolean
+two_phase_at	pg_lsn
+inactive_since	timestamp with time zone
+conflicting	boolean
+invalidation_reason	text
+failover	boolean
+synced	boolean
+slotsync_skip_reason	text
+= pg_rewrite
+oid	oid
+rulename	name
+ev_class	oid
+ev_type	"char"
+ev_enabled	"char"
+is_instead	boolean
+ev_qual	pg_node_tree
+ev_action	pg_node_tree
+= pg_roles
+rolname	name
+rolsuper	boolean
+rolinherit	boolean
+rolcreaterole	boolean
+rolcreatedb	boolean
+rolcanlogin	boolean
+rolreplication	boolean
+rolconnlimit	integer
+rolpassword	text
+rolvaliduntil	timestamp with time zone
+rolbypassrls	boolean
+rolconfig	text[]
+oid	oid
+= pg_rules
+schemaname	name
+tablename	name
+rulename	name
+definition	text
+= pg_seclabel
+objoid	oid
+classoid	oid
+objsubid	integer
+provider	text
+label	text
+= pg_seclabels
+objoid	oid
+classoid	oid
+objsubid	integer
+objtype	text
+objnamespace	oid
+objname	text
+provider	text
+label	text
+= pg_sequence
+seqrelid	oid
+seqtypid	oid
+seqstart	bigint
+seqincrement	bigint
+seqmax	bigint
+seqmin	bigint
+seqcache	bigint
+seqcycle	boolean
+= pg_sequences
+schemaname	name
+sequencename	name
+sequenceowner	name
+data_type	regtype
+start_value	bigint
+min_value	bigint
+max_value	bigint
+increment_by	bigint
+cycle	boolean
+cache_size	bigint
+last_value	bigint
+= pg_settings
+name	text
+setting	text
+unit	text
+category	text
+short_desc	text
+extra_desc	text
+context	text
+vartype	text
+source	text
+min_val	text
+max_val	text
+enumvals	text[]
+boot_val	text
+reset_val	text
+sourcefile	text
+sourceline	integer
+pending_restart	boolean
+= pg_shadow
+usename	name
+usesysid	oid
+usecreatedb	boolean
+usesuper	boolean
+userepl	boolean
+usebypassrls	boolean
+passwd	text
+valuntil	timestamp with time zone
+useconfig	text[]
+= pg_shdepend
+dbid	oid
+classid	oid
+objid	oid
+objsubid	integer
+refclassid	oid
+refobjid	oid
+deptype	"char"
+= pg_shdescription
+objoid	oid
+classoid	oid
+description	text
+= pg_shmem_allocations
+name	text
+off	bigint
+size	bigint
+allocated_size	bigint
+= pg_shmem_allocations_numa 18-19
+name	text
+numa_node	integer
+size	bigint
+= pg_shseclabel
+objoid	oid
+classoid	oid
+provider	text
+label	text
+= pg_stat_activity
+datid	oid
+datname	name
+pid	integer
+leader_pid	integer
+usesysid	oid
+usename	name
+application_name	text
+client_addr	inet
+client_hostname	text
+client_port	integer
+backend_start	timestamp with time zone
+xact_start	timestamp with time zone
+query_start	timestamp with time zone
+state_change	timestamp with time zone
+wait_event_type	text
+wait_event	text
+state	text
+backend_xid	xid
+backend_xmin	xid
+query_id	bigint
+query	text
+backend_type	text
+= pg_stat_all_indexes 14-15
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+= pg_stat_all_indexes 16-18
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+= pg_stat_all_indexes 19
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+stats_reset	timestamp with time zone
+= pg_stat_all_tables 14-15
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+= pg_stat_all_tables 16-17
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+= pg_stat_all_tables 18
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+total_vacuum_time	double precision
+total_autovacuum_time	double precision
+total_analyze_time	double precision
+total_autoanalyze_time	double precision
+= pg_stat_all_tables 19
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+total_vacuum_time	double precision
+total_autovacuum_time	double precision
+total_analyze_time	double precision
+total_autoanalyze_time	double precision
+stats_reset	timestamp with time zone
+= pg_stat_archiver
+archived_count	bigint
+last_archived_wal	text
+last_archived_time	timestamp with time zone
+failed_count	bigint
+last_failed_wal	text
+last_failed_time	timestamp with time zone
+stats_reset	timestamp with time zone
+= pg_stat_autovacuum_scores 19
+relid	oid
+schemaname	name
+relname	name
+score	double precision
+xid_score	double precision
+mxid_score	double precision
+vacuum_score	double precision
+vacuum_insert_score	double precision
+analyze_score	double precision
+do_vacuum	boolean
+do_analyze	boolean
+for_wraparound	boolean
+= pg_stat_bgwriter 14-16
+checkpoints_timed	bigint
+checkpoints_req	bigint
+checkpoint_write_time	double precision
+checkpoint_sync_time	double precision
+buffers_checkpoint	bigint
+buffers_clean	bigint
+maxwritten_clean	bigint
+buffers_backend	bigint
+buffers_backend_fsync	bigint
+buffers_alloc	bigint
+stats_reset	timestamp with time zone
+= pg_stat_bgwriter 17-19
+buffers_clean	bigint
+maxwritten_clean	bigint
+buffers_alloc	bigint
+stats_reset	timestamp with time zone
+= pg_stat_checkpointer 17
+num_timed	bigint
+num_requested	bigint
+restartpoints_timed	bigint
+restartpoints_req	bigint
+restartpoints_done	bigint
+write_time	double precision
+sync_time	double precision
+buffers_written	bigint
+stats_reset	timestamp with time zone
+= pg_stat_checkpointer 18-19
+num_timed	bigint
+num_requested	bigint
+num_done	bigint
+restartpoints_timed	bigint
+restartpoints_req	bigint
+restartpoints_done	bigint
+write_time	double precision
+sync_time	double precision
+buffers_written	bigint
+slru_written	bigint
+stats_reset	timestamp with time zone
+= pg_stat_database 14-17
+datid	oid
+datname	name
+numbackends	integer
+xact_commit	bigint
+xact_rollback	bigint
+blks_read	bigint
+blks_hit	bigint
+tup_returned	bigint
+tup_fetched	bigint
+tup_inserted	bigint
+tup_updated	bigint
+tup_deleted	bigint
+conflicts	bigint
+temp_files	bigint
+temp_bytes	bigint
+deadlocks	bigint
+checksum_failures	bigint
+checksum_last_failure	timestamp with time zone
+blk_read_time	double precision
+blk_write_time	double precision
+session_time	double precision
+active_time	double precision
+idle_in_transaction_time	double precision
+sessions	bigint
+sessions_abandoned	bigint
+sessions_fatal	bigint
+sessions_killed	bigint
+stats_reset	timestamp with time zone
+= pg_stat_database 18-19
+datid	oid
+datname	name
+numbackends	integer
+xact_commit	bigint
+xact_rollback	bigint
+blks_read	bigint
+blks_hit	bigint
+tup_returned	bigint
+tup_fetched	bigint
+tup_inserted	bigint
+tup_updated	bigint
+tup_deleted	bigint
+conflicts	bigint
+temp_files	bigint
+temp_bytes	bigint
+deadlocks	bigint
+checksum_failures	bigint
+checksum_last_failure	timestamp with time zone
+blk_read_time	double precision
+blk_write_time	double precision
+session_time	double precision
+active_time	double precision
+idle_in_transaction_time	double precision
+sessions	bigint
+sessions_abandoned	bigint
+sessions_fatal	bigint
+sessions_killed	bigint
+parallel_workers_to_launch	bigint
+parallel_workers_launched	bigint
+stats_reset	timestamp with time zone
+= pg_stat_database_conflicts 14-15
+datid	oid
+datname	name
+confl_tablespace	bigint
+confl_lock	bigint
+confl_snapshot	bigint
+confl_bufferpin	bigint
+confl_deadlock	bigint
+= pg_stat_database_conflicts 16-18
+datid	oid
+datname	name
+confl_tablespace	bigint
+confl_lock	bigint
+confl_snapshot	bigint
+confl_bufferpin	bigint
+confl_deadlock	bigint
+confl_active_logicalslot	bigint
+= pg_stat_database_conflicts 19
+datid	oid
+datname	name
+confl_tablespace	bigint
+confl_lock	bigint
+confl_snapshot	bigint
+confl_bufferpin	bigint
+confl_deadlock	bigint
+confl_active_logicalslot	bigint
+stats_reset	timestamp with time zone
+= pg_stat_gssapi 14-15
+pid	integer
+gss_authenticated	boolean
+principal	text
+encrypted	boolean
+= pg_stat_gssapi 16-19
+pid	integer
+gss_authenticated	boolean
+principal	text
+encrypted	boolean
+credentials_delegated	boolean
+= pg_stat_io 16-17
+backend_type	text
+object	text
+context	text
+reads	bigint
+read_time	double precision
+writes	bigint
+write_time	double precision
+writebacks	bigint
+writeback_time	double precision
+extends	bigint
+extend_time	double precision
+op_bytes	bigint
+hits	bigint
+evictions	bigint
+reuses	bigint
+fsyncs	bigint
+fsync_time	double precision
+stats_reset	timestamp with time zone
+= pg_stat_io 18-19
+backend_type	text
+object	text
+context	text
+reads	bigint
+read_bytes	numeric
+read_time	double precision
+writes	bigint
+write_bytes	numeric
+write_time	double precision
+writebacks	bigint
+writeback_time	double precision
+extends	bigint
+extend_bytes	numeric
+extend_time	double precision
+hits	bigint
+evictions	bigint
+reuses	bigint
+fsyncs	bigint
+fsync_time	double precision
+stats_reset	timestamp with time zone
+= pg_stat_lock 19
+locktype	text
+waits	bigint
+wait_time	double precision
+fastpath_exceeded	bigint
+stats_reset	timestamp with time zone
+= pg_stat_progress_analyze 14-17
+pid	integer
+datid	oid
+datname	name
+relid	oid
+phase	text
+sample_blks_total	bigint
+sample_blks_scanned	bigint
+ext_stats_total	bigint
+ext_stats_computed	bigint
+child_tables_total	bigint
+child_tables_done	bigint
+current_child_table_relid	oid
+= pg_stat_progress_analyze 18
+pid	integer
+datid	oid
+datname	name
+relid	oid
+phase	text
+sample_blks_total	bigint
+sample_blks_scanned	bigint
+ext_stats_total	bigint
+ext_stats_computed	bigint
+child_tables_total	bigint
+child_tables_done	bigint
+current_child_table_relid	oid
+delay_time	double precision
+= pg_stat_progress_analyze 19
+pid	integer
+datid	oid
+datname	name
+relid	oid
+phase	text
+sample_blks_total	bigint
+sample_blks_scanned	bigint
+ext_stats_total	bigint
+ext_stats_computed	bigint
+child_tables_total	bigint
+child_tables_done	bigint
+current_child_table_relid	oid
+delay_time	double precision
+started_by	text
+= pg_stat_progress_basebackup 14-18
+pid	integer
+phase	text
+backup_total	bigint
+backup_streamed	bigint
+tablespaces_total	bigint
+tablespaces_streamed	bigint
+= pg_stat_progress_basebackup 19
+pid	integer
+phase	text
+backup_total	bigint
+backup_streamed	bigint
+tablespaces_total	bigint
+tablespaces_streamed	bigint
+backup_type	text
+= pg_stat_progress_cluster
+pid	integer
+datid	oid
+datname	name
+relid	oid
+command	text
+phase	text
+cluster_index_relid	oid
+heap_tuples_scanned	bigint
+heap_tuples_written	bigint
+heap_blks_total	bigint
+heap_blks_scanned	bigint
+index_rebuild_count	bigint
+= pg_stat_progress_copy 14-16
+pid	integer
+datid	oid
+datname	name
+relid	oid
+command	text
+type	text
+bytes_processed	bigint
+bytes_total	bigint
+tuples_processed	bigint
+tuples_excluded	bigint
+= pg_stat_progress_copy 17-19
+pid	integer
+datid	oid
+datname	name
+relid	oid
+command	text
+type	text
+bytes_processed	bigint
+bytes_total	bigint
+tuples_processed	bigint
+tuples_excluded	bigint
+tuples_skipped	bigint
+= pg_stat_progress_create_index
+pid	integer
+datid	oid
+datname	name
+relid	oid
+index_relid	oid
+command	text
+phase	text
+lockers_total	bigint
+lockers_done	bigint
+current_locker_pid	bigint
+blocks_total	bigint
+blocks_done	bigint
+tuples_total	bigint
+tuples_done	bigint
+partitions_total	bigint
+partitions_done	bigint
+= pg_stat_progress_repack 19
+pid	integer
+datid	oid
+datname	name
+relid	oid
+command	text
+phase	text
+repack_index_relid	oid
+heap_tuples_scanned	bigint
+heap_tuples_inserted	bigint
+heap_tuples_updated	bigint
+heap_tuples_deleted	bigint
+heap_blks_total	bigint
+heap_blks_scanned	bigint
+index_rebuild_count	bigint
+= pg_stat_progress_vacuum 14-16
+pid	integer
+datid	oid
+datname	name
+relid	oid
+phase	text
+heap_blks_total	bigint
+heap_blks_scanned	bigint
+heap_blks_vacuumed	bigint
+index_vacuum_count	bigint
+max_dead_tuples	bigint
+num_dead_tuples	bigint
+= pg_stat_progress_vacuum 17
+pid	integer
+datid	oid
+datname	name
+relid	oid
+phase	text
+heap_blks_total	bigint
+heap_blks_scanned	bigint
+heap_blks_vacuumed	bigint
+index_vacuum_count	bigint
+max_dead_tuple_bytes	bigint
+dead_tuple_bytes	bigint
+num_dead_item_ids	bigint
+indexes_total	bigint
+indexes_processed	bigint
+= pg_stat_progress_vacuum 18
+pid	integer
+datid	oid
+datname	name
+relid	oid
+phase	text
+heap_blks_total	bigint
+heap_blks_scanned	bigint
+heap_blks_vacuumed	bigint
+index_vacuum_count	bigint
+max_dead_tuple_bytes	bigint
+dead_tuple_bytes	bigint
+num_dead_item_ids	bigint
+indexes_total	bigint
+indexes_processed	bigint
+delay_time	double precision
+= pg_stat_progress_vacuum 19
+pid	integer
+datid	oid
+datname	name
+relid	oid
+phase	text
+heap_blks_total	bigint
+heap_blks_scanned	bigint
+heap_blks_vacuumed	bigint
+index_vacuum_count	bigint
+max_dead_tuple_bytes	bigint
+dead_tuple_bytes	bigint
+num_dead_item_ids	bigint
+indexes_total	bigint
+indexes_processed	bigint
+delay_time	double precision
+mode	text
+started_by	text
+= pg_stat_recovery 19
+promote_triggered	boolean
+last_replayed_read_lsn	pg_lsn
+last_replayed_end_lsn	pg_lsn
+last_replayed_tli	integer
+replay_end_lsn	pg_lsn
+replay_end_tli	integer
+recovery_last_xact_time	timestamp with time zone
+current_chunk_start_time	timestamp with time zone
+pause_state	text
+= pg_stat_recovery_prefetch 15-19
+stats_reset	timestamp with time zone
+prefetch	bigint
+hit	bigint
+skip_init	bigint
+skip_new	bigint
+skip_fpw	bigint
+skip_rep	bigint
+wal_distance	integer
+block_distance	integer
+io_depth	integer
+= pg_stat_replication
+pid	integer
+usesysid	oid
+usename	name
+application_name	text
+client_addr	inet
+client_hostname	text
+client_port	integer
+backend_start	timestamp with time zone
+backend_xmin	xid
+state	text
+sent_lsn	pg_lsn
+write_lsn	pg_lsn
+flush_lsn	pg_lsn
+replay_lsn	pg_lsn
+write_lag	interval
+flush_lag	interval
+replay_lag	interval
+sync_priority	integer
+sync_state	text
+reply_time	timestamp with time zone
+= pg_stat_replication_slots 14-18
+slot_name	text
+spill_txns	bigint
+spill_count	bigint
+spill_bytes	bigint
+stream_txns	bigint
+stream_count	bigint
+stream_bytes	bigint
+total_txns	bigint
+total_bytes	bigint
+stats_reset	timestamp with time zone
+= pg_stat_replication_slots 19
+slot_name	text
+spill_txns	bigint
+spill_count	bigint
+spill_bytes	bigint
+stream_txns	bigint
+stream_count	bigint
+stream_bytes	bigint
+mem_exceeded_count	bigint
+total_txns	bigint
+total_bytes	bigint
+slotsync_skip_count	bigint
+slotsync_last_skip	timestamp with time zone
+stats_reset	timestamp with time zone
+= pg_stat_slru
+name	text
+blks_zeroed	bigint
+blks_hit	bigint
+blks_read	bigint
+blks_written	bigint
+blks_exists	bigint
+flushes	bigint
+truncates	bigint
+stats_reset	timestamp with time zone
+= pg_stat_ssl
+pid	integer
+ssl	boolean
+version	text
+cipher	text
+bits	integer
+client_dn	text
+client_serial	numeric
+issuer_dn	text
+= pg_stat_subscription 14-15
+subid	oid
+subname	name
+pid	integer
+relid	oid
+received_lsn	pg_lsn
+last_msg_send_time	timestamp with time zone
+last_msg_receipt_time	timestamp with time zone
+latest_end_lsn	pg_lsn
+latest_end_time	timestamp with time zone
+= pg_stat_subscription 16
+subid	oid
+subname	name
+pid	integer
+leader_pid	integer
+relid	oid
+received_lsn	pg_lsn
+last_msg_send_time	timestamp with time zone
+last_msg_receipt_time	timestamp with time zone
+latest_end_lsn	pg_lsn
+latest_end_time	timestamp with time zone
+= pg_stat_subscription 17-19
+subid	oid
+subname	name
+worker_type	text
+pid	integer
+leader_pid	integer
+relid	oid
+received_lsn	pg_lsn
+last_msg_send_time	timestamp with time zone
+last_msg_receipt_time	timestamp with time zone
+latest_end_lsn	pg_lsn
+latest_end_time	timestamp with time zone
+= pg_stat_subscription_stats 15-17
+subid	oid
+subname	name
+apply_error_count	bigint
+sync_error_count	bigint
+stats_reset	timestamp with time zone
+= pg_stat_subscription_stats 18
+subid	oid
+subname	name
+apply_error_count	bigint
+sync_error_count	bigint
+confl_insert_exists	bigint
+confl_update_origin_differs	bigint
+confl_update_exists	bigint
+confl_update_missing	bigint
+confl_delete_origin_differs	bigint
+confl_delete_missing	bigint
+confl_multiple_unique_conflicts	bigint
+stats_reset	timestamp with time zone
+= pg_stat_subscription_stats 19
+subid	oid
+subname	name
+apply_error_count	bigint
+sync_seq_error_count	bigint
+sync_table_error_count	bigint
+confl_insert_exists	bigint
+confl_update_origin_differs	bigint
+confl_update_exists	bigint
+confl_update_deleted	bigint
+confl_update_missing	bigint
+confl_delete_origin_differs	bigint
+confl_delete_missing	bigint
+confl_multiple_unique_conflicts	bigint
+stats_reset	timestamp with time zone
+= pg_stat_sys_indexes 14-15
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+= pg_stat_sys_indexes 16-18
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+= pg_stat_sys_indexes 19
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+stats_reset	timestamp with time zone
+= pg_stat_sys_tables 14-15
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+= pg_stat_sys_tables 16-17
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+= pg_stat_sys_tables 18
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+total_vacuum_time	double precision
+total_autovacuum_time	double precision
+total_analyze_time	double precision
+total_autoanalyze_time	double precision
+= pg_stat_sys_tables 19
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+total_vacuum_time	double precision
+total_autovacuum_time	double precision
+total_analyze_time	double precision
+total_autoanalyze_time	double precision
+stats_reset	timestamp with time zone
+= pg_stat_user_functions 14-18
+funcid	oid
+schemaname	name
+funcname	name
+calls	bigint
+total_time	double precision
+self_time	double precision
+= pg_stat_user_functions 19
+funcid	oid
+schemaname	name
+funcname	name
+calls	bigint
+total_time	double precision
+self_time	double precision
+stats_reset	timestamp with time zone
+= pg_stat_user_indexes 14-15
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+= pg_stat_user_indexes 16-18
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+= pg_stat_user_indexes 19
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_read	bigint
+idx_tup_fetch	bigint
+stats_reset	timestamp with time zone
+= pg_stat_user_tables 14-15
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+= pg_stat_user_tables 16-17
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+= pg_stat_user_tables 18
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+total_vacuum_time	double precision
+total_autovacuum_time	double precision
+total_analyze_time	double precision
+total_autoanalyze_time	double precision
+= pg_stat_user_tables 19
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+last_seq_scan	timestamp with time zone
+seq_tup_read	bigint
+idx_scan	bigint
+last_idx_scan	timestamp with time zone
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+n_live_tup	bigint
+n_dead_tup	bigint
+n_mod_since_analyze	bigint
+n_ins_since_vacuum	bigint
+last_vacuum	timestamp with time zone
+last_autovacuum	timestamp with time zone
+last_analyze	timestamp with time zone
+last_autoanalyze	timestamp with time zone
+vacuum_count	bigint
+autovacuum_count	bigint
+analyze_count	bigint
+autoanalyze_count	bigint
+total_vacuum_time	double precision
+total_autovacuum_time	double precision
+total_analyze_time	double precision
+total_autoanalyze_time	double precision
+stats_reset	timestamp with time zone
+= pg_stat_wal 14-17
+wal_records	bigint
+wal_fpi	bigint
+wal_bytes	numeric
+wal_buffers_full	bigint
+wal_write	bigint
+wal_sync	bigint
+wal_write_time	double precision
+wal_sync_time	double precision
+stats_reset	timestamp with time zone
+= pg_stat_wal 18
+wal_records	bigint
+wal_fpi	bigint
+wal_bytes	numeric
+wal_buffers_full	bigint
+stats_reset	timestamp with time zone
+= pg_stat_wal 19
+wal_records	bigint
+wal_fpi	bigint
+wal_bytes	numeric
+wal_fpi_bytes	numeric
+wal_buffers_full	bigint
+stats_reset	timestamp with time zone
+= pg_stat_wal_receiver
+pid	integer
+status	text
+receive_start_lsn	pg_lsn
+receive_start_tli	integer
+written_lsn	pg_lsn
+flushed_lsn	pg_lsn
+received_tli	integer
+last_msg_send_time	timestamp with time zone
+last_msg_receipt_time	timestamp with time zone
+latest_end_lsn	pg_lsn
+latest_end_time	timestamp with time zone
+slot_name	text
+sender_host	text
+sender_port	integer
+conninfo	text
+= pg_stat_xact_all_tables 14-15
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+= pg_stat_xact_all_tables 16-19
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+= pg_stat_xact_sys_tables 14-15
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+= pg_stat_xact_sys_tables 16-19
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+= pg_stat_xact_user_functions
+funcid	oid
+schemaname	name
+funcname	name
+calls	bigint
+total_time	double precision
+self_time	double precision
+= pg_stat_xact_user_tables 14-15
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+= pg_stat_xact_user_tables 16-19
+relid	oid
+schemaname	name
+relname	name
+seq_scan	bigint
+seq_tup_read	bigint
+idx_scan	bigint
+idx_tup_fetch	bigint
+n_tup_ins	bigint
+n_tup_upd	bigint
+n_tup_del	bigint
+n_tup_hot_upd	bigint
+n_tup_newpage_upd	bigint
+= pg_statio_all_indexes 14-18
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_blks_read	bigint
+idx_blks_hit	bigint
+= pg_statio_all_indexes 19
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_blks_read	bigint
+idx_blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_all_sequences 14-18
+relid	oid
+schemaname	name
+relname	name
+blks_read	bigint
+blks_hit	bigint
+= pg_statio_all_sequences 19
+relid	oid
+schemaname	name
+relname	name
+blks_read	bigint
+blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_all_tables 14-18
+relid	oid
+schemaname	name
+relname	name
+heap_blks_read	bigint
+heap_blks_hit	bigint
+idx_blks_read	bigint
+idx_blks_hit	bigint
+toast_blks_read	bigint
+toast_blks_hit	bigint
+tidx_blks_read	bigint
+tidx_blks_hit	bigint
+= pg_statio_all_tables 19
+relid	oid
+schemaname	name
+relname	name
+heap_blks_read	bigint
+heap_blks_hit	bigint
+idx_blks_read	bigint
+idx_blks_hit	bigint
+toast_blks_read	bigint
+toast_blks_hit	bigint
+tidx_blks_read	bigint
+tidx_blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_sys_indexes 14-18
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_blks_read	bigint
+idx_blks_hit	bigint
+= pg_statio_sys_indexes 19
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_blks_read	bigint
+idx_blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_sys_sequences 14-18
+relid	oid
+schemaname	name
+relname	name
+blks_read	bigint
+blks_hit	bigint
+= pg_statio_sys_sequences 19
+relid	oid
+schemaname	name
+relname	name
+blks_read	bigint
+blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_sys_tables 14-18
+relid	oid
+schemaname	name
+relname	name
+heap_blks_read	bigint
+heap_blks_hit	bigint
+idx_blks_read	bigint
+idx_blks_hit	bigint
+toast_blks_read	bigint
+toast_blks_hit	bigint
+tidx_blks_read	bigint
+tidx_blks_hit	bigint
+= pg_statio_sys_tables 19
+relid	oid
+schemaname	name
+relname	name
+heap_blks_read	bigint
+heap_blks_hit	bigint
+idx_blks_read	bigint
+idx_blks_hit	bigint
+toast_blks_read	bigint
+toast_blks_hit	bigint
+tidx_blks_read	bigint
+tidx_blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_user_indexes 14-18
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_blks_read	bigint
+idx_blks_hit	bigint
+= pg_statio_user_indexes 19
+relid	oid
+indexrelid	oid
+schemaname	name
+relname	name
+indexrelname	name
+idx_blks_read	bigint
+idx_blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_user_sequences 14-18
+relid	oid
+schemaname	name
+relname	name
+blks_read	bigint
+blks_hit	bigint
+= pg_statio_user_sequences 19
+relid	oid
+schemaname	name
+relname	name
+blks_read	bigint
+blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statio_user_tables 14-18
+relid	oid
+schemaname	name
+relname	name
+heap_blks_read	bigint
+heap_blks_hit	bigint
+idx_blks_read	bigint
+idx_blks_hit	bigint
+toast_blks_read	bigint
+toast_blks_hit	bigint
+tidx_blks_read	bigint
+tidx_blks_hit	bigint
+= pg_statio_user_tables 19
+relid	oid
+schemaname	name
+relname	name
+heap_blks_read	bigint
+heap_blks_hit	bigint
+idx_blks_read	bigint
+idx_blks_hit	bigint
+toast_blks_read	bigint
+toast_blks_hit	bigint
+tidx_blks_read	bigint
+tidx_blks_hit	bigint
+stats_reset	timestamp with time zone
+= pg_statistic
+starelid	oid
+staattnum	smallint
+stainherit	boolean
+stanullfrac	real
+stawidth	integer
+stadistinct	real
+stakind1	smallint
+stakind2	smallint
+stakind3	smallint
+stakind4	smallint
+stakind5	smallint
+staop1	oid
+staop2	oid
+staop3	oid
+staop4	oid
+staop5	oid
+stacoll1	oid
+stacoll2	oid
+stacoll3	oid
+stacoll4	oid
+stacoll5	oid
+stanumbers1	real[]
+stanumbers2	real[]
+stanumbers3	real[]
+stanumbers4	real[]
+stanumbers5	real[]
+stavalues1	anyarray
+stavalues2	anyarray
+stavalues3	anyarray
+stavalues4	anyarray
+stavalues5	anyarray
+= pg_statistic_ext 14-16
+oid	oid
+stxrelid	oid
+stxname	name
+stxnamespace	oid
+stxowner	oid
+stxstattarget	integer
+stxkeys	int2vector
+stxkind	"char"[]
+stxexprs	pg_node_tree
+= pg_statistic_ext 17-19
+oid	oid
+stxrelid	oid
+stxname	name
+stxnamespace	oid
+stxowner	oid
+stxkeys	int2vector
+stxstattarget	smallint
+stxkind	"char"[]
+stxexprs	pg_node_tree
+= pg_statistic_ext_data 14
+stxoid	oid
+stxdndistinct	pg_ndistinct
+stxddependencies	pg_dependencies
+stxdmcv	pg_mcv_list
+stxdexpr	pg_statistic[]
+= pg_statistic_ext_data 15-19
+stxoid	oid
+stxdinherit	boolean
+stxdndistinct	pg_ndistinct
+stxddependencies	pg_dependencies
+stxdmcv	pg_mcv_list
+stxdexpr	pg_statistic[]
+= pg_stats 14-16
+schemaname	name
+tablename	name
+attname	name
+inherited	boolean
+null_frac	real
+avg_width	integer
+n_distinct	real
+most_common_vals	anyarray
+most_common_freqs	real[]
+histogram_bounds	anyarray
+correlation	real
+most_common_elems	anyarray
+most_common_elem_freqs	real[]
+elem_count_histogram	real[]
+= pg_stats 17-18
+schemaname	name
+tablename	name
+attname	name
+inherited	boolean
+null_frac	real
+avg_width	integer
+n_distinct	real
+most_common_vals	anyarray
+most_common_freqs	real[]
+histogram_bounds	anyarray
+correlation	real
+most_common_elems	anyarray
+most_common_elem_freqs	real[]
+elem_count_histogram	real[]
+range_length_histogram	anyarray
+range_empty_frac	real
+range_bounds_histogram	anyarray
+= pg_stats 19
+schemaname	name
+tablename	name
+tableid	oid
+attname	name
+attnum	smallint
+inherited	boolean
+null_frac	real
+avg_width	integer
+n_distinct	real
+most_common_vals	anyarray
+most_common_freqs	real[]
+histogram_bounds	anyarray
+correlation	real
+most_common_elems	anyarray
+most_common_elem_freqs	real[]
+elem_count_histogram	real[]
+range_length_histogram	anyarray
+range_empty_frac	real
+range_bounds_histogram	anyarray
+= pg_stats_ext 14
+schemaname	name
+tablename	name
+statistics_schemaname	name
+statistics_name	name
+statistics_owner	name
+attnames	name[]
+exprs	text[]
+kinds	"char"[]
+n_distinct	pg_ndistinct
+dependencies	pg_dependencies
+most_common_vals	text[]
+most_common_val_nulls	boolean[]
+most_common_freqs	double precision[]
+most_common_base_freqs	double precision[]
+= pg_stats_ext 15-18
+schemaname	name
+tablename	name
+statistics_schemaname	name
+statistics_name	name
+statistics_owner	name
+attnames	name[]
+exprs	text[]
+kinds	"char"[]
+inherited	boolean
+n_distinct	pg_ndistinct
+dependencies	pg_dependencies
+most_common_vals	text[]
+most_common_val_nulls	boolean[]
+most_common_freqs	double precision[]
+most_common_base_freqs	double precision[]
+= pg_stats_ext 19
+schemaname	name
+tablename	name
+tableid	oid
+statistics_schemaname	name
+statistics_name	name
+statistics_id	oid
+statistics_owner	name
+attnames	name[]
+exprs	text[]
+kinds	"char"[]
+inherited	boolean
+n_distinct	pg_ndistinct
+dependencies	pg_dependencies
+most_common_vals	text[]
+most_common_val_nulls	boolean[]
+most_common_freqs	double precision[]
+most_common_base_freqs	double precision[]
+= pg_stats_ext_exprs 14
+schemaname	name
+tablename	name
+statistics_schemaname	name
+statistics_name	name
+statistics_owner	name
+expr	text
+null_frac	real
+avg_width	integer
+n_distinct	real
+most_common_vals	anyarray
+most_common_freqs	real[]
+histogram_bounds	anyarray
+correlation	real
+most_common_elems	anyarray
+most_common_elem_freqs	real[]
+elem_count_histogram	real[]
+= pg_stats_ext_exprs 15-18
+schemaname	name
+tablename	name
+statistics_schemaname	name
+statistics_name	name
+statistics_owner	name
+expr	text
+inherited	boolean
+null_frac	real
+avg_width	integer
+n_distinct	real
+most_common_vals	anyarray
+most_common_freqs	real[]
+histogram_bounds	anyarray
+correlation	real
+most_common_elems	anyarray
+most_common_elem_freqs	real[]
+elem_count_histogram	real[]
+= pg_stats_ext_exprs 19
+schemaname	name
+tablename	name
+tableid	oid
+statistics_schemaname	name
+statistics_name	name
+statistics_id	oid
+statistics_owner	name
+expr	text
+inherited	boolean
+null_frac	real
+avg_width	integer
+n_distinct	real
+most_common_vals	anyarray
+most_common_freqs	real[]
+histogram_bounds	anyarray
+correlation	real
+most_common_elems	anyarray
+most_common_elem_freqs	real[]
+elem_count_histogram	real[]
+range_length_histogram	anyarray
+range_empty_frac	real
+range_bounds_histogram	anyarray
+= pg_subscription 14
+oid	oid
+subdbid	oid
+subname	name
+subowner	oid
+subenabled	boolean
+subbinary	boolean
+substream	boolean
+subconninfo	text
+subslotname	name
+subsynccommit	text
+subpublications	text[]
+= pg_subscription 15
+oid	oid
+subdbid	oid
+subskiplsn	pg_lsn
+subname	name
+subowner	oid
+subenabled	boolean
+subbinary	boolean
+substream	boolean
+subtwophasestate	"char"
+subdisableonerr	boolean
+subconninfo	text
+subslotname	name
+subsynccommit	text
+subpublications	text[]
+= pg_subscription 16
+oid	oid
+subdbid	oid
+subskiplsn	pg_lsn
+subname	name
+subowner	oid
+subenabled	boolean
+subbinary	boolean
+substream	"char"
+subtwophasestate	"char"
+subdisableonerr	boolean
+subpasswordrequired	boolean
+subrunasowner	boolean
+subconninfo	text
+subslotname	name
+subsynccommit	text
+subpublications	text[]
+suborigin	text
+= pg_subscription 17-18
+oid	oid
+subdbid	oid
+subskiplsn	pg_lsn
+subname	name
+subowner	oid
+subenabled	boolean
+subbinary	boolean
+substream	"char"
+subtwophasestate	"char"
+subdisableonerr	boolean
+subpasswordrequired	boolean
+subrunasowner	boolean
+subfailover	boolean
+subconninfo	text
+subslotname	name
+subsynccommit	text
+subpublications	text[]
+suborigin	text
+= pg_subscription 19
+oid	oid
+subdbid	oid
+subskiplsn	pg_lsn
+subname	name
+subowner	oid
+subenabled	boolean
+subbinary	boolean
+substream	"char"
+subtwophasestate	"char"
+subdisableonerr	boolean
+subpasswordrequired	boolean
+subrunasowner	boolean
+subfailover	boolean
+subretaindeadtuples	boolean
+submaxretention	integer
+subretentionactive	boolean
+subserver	oid
+subconninfo	text
+subslotname	name
+subsynccommit	text
+subwalrcvtimeout	text
+subpublications	text[]
+suborigin	text
+= pg_subscription_rel
+srsubid	oid
+srrelid	oid
+srsubstate	"char"
+srsublsn	pg_lsn
+= pg_tables
+schemaname	name
+tablename	name
+tableowner	name
+tablespace	name
+hasindexes	boolean
+hasrules	boolean
+hastriggers	boolean
+rowsecurity	boolean
+= pg_tablespace
+oid	oid
+spcname	name
+spcowner	oid
+spcacl	aclitem[]
+spcoptions	text[]
+= pg_timezone_abbrevs
+abbrev	text
+utc_offset	interval
+is_dst	boolean
+= pg_timezone_names
+name	text
+abbrev	text
+utc_offset	interval
+is_dst	boolean
+= pg_transform
+oid	oid
+trftype	oid
+trflang	oid
+trffromsql	regproc
+trftosql	regproc
+= pg_trigger
+oid	oid
+tgrelid	oid
+tgparentid	oid
+tgname	name
+tgfoid	oid
+tgtype	smallint
+tgenabled	"char"
+tgisinternal	boolean
+tgconstrrelid	oid
+tgconstrindid	oid
+tgconstraint	oid
+tgdeferrable	boolean
+tginitdeferred	boolean
+tgnargs	smallint
+tgattr	int2vector
+tgargs	bytea
+tgqual	pg_node_tree
+tgoldtable	name
+tgnewtable	name
+= pg_ts_config
+oid	oid
+cfgname	name
+cfgnamespace	oid
+cfgowner	oid
+cfgparser	oid
+= pg_ts_config_map
+mapcfg	oid
+maptokentype	integer
+mapseqno	integer
+mapdict	oid
+= pg_ts_dict
+oid	oid
+dictname	name
+dictnamespace	oid
+dictowner	oid
+dicttemplate	oid
+dictinitoption	text
+= pg_ts_parser
+oid	oid
+prsname	name
+prsnamespace	oid
+prsstart	regproc
+prstoken	regproc
+prsend	regproc
+prsheadline	regproc
+prslextype	regproc
+= pg_ts_template
+oid	oid
+tmplname	name
+tmplnamespace	oid
+tmplinit	regproc
+tmpllexize	regproc
+= pg_type
+oid	oid
+typname	name
+typnamespace	oid
+typowner	oid
+typlen	smallint
+typbyval	boolean
+typtype	"char"
+typcategory	"char"
+typispreferred	boolean
+typisdefined	boolean
+typdelim	"char"
+typrelid	oid
+typsubscript	regproc
+typelem	oid
+typarray	oid
+typinput	regproc
+typoutput	regproc
+typreceive	regproc
+typsend	regproc
+typmodin	regproc
+typmodout	regproc
+typanalyze	regproc
+typalign	"char"
+typstorage	"char"
+typnotnull	boolean
+typbasetype	oid
+typtypmod	integer
+typndims	integer
+typcollation	oid
+typdefaultbin	pg_node_tree
+typdefault	text
+typacl	aclitem[]
+= pg_user
+usename	name
+usesysid	oid
+usecreatedb	boolean
+usesuper	boolean
+userepl	boolean
+usebypassrls	boolean
+passwd	text
+valuntil	timestamp with time zone
+useconfig	text[]
+= pg_user_mapping
+oid	oid
+umuser	oid
+umserver	oid
+umoptions	text[]
+= pg_user_mappings
+umid	oid
+srvid	oid
+srvname	name
+umuser	oid
+usename	name
+umoptions	text[]
+= pg_views
+schemaname	name
+viewname	name
+viewowner	name
+definition	text
+= pg_wait_events 17-19
+type	text
+name	text
+description	text

@@ -77,7 +77,10 @@ fn is_multirange(ty: ColumnType) -> bool {
 }
 
 fn is_array(ty: ColumnType) -> bool {
-    matches!(composed(ty), Some(Composed::Array { .. }))
+    matches!(
+        composed(ty),
+        Some(Composed::Array { .. } | Composed::Vector { .. })
+    )
 }
 
 fn is_inet(ty: ColumnType) -> bool {

@@ -714,7 +714,14 @@ pub fn write_parquet_in(
     let mut sourced = Vec::new();
     let mut names = Vec::new();
     for (name, p) in given {
-        let t = catalog
+        names.push((name.clone(), named(name, &parquet_files(p)?)?));
+    }
+    let (release, lc_monetary) = settled(&names, release, lc_monetary)?;
+    // A row type's fields are those of the release the files take.
+    let mut at_release = catalog.clone();
+    at_release.with_release(release)?;
+    for (name, p) in given {
+        let t = at_release
             .table(name)
             .ok_or_else(|| Error::new(format!("{name} is not in the DDL")))?;
         let files = parquet_files(p)?;
@@ -730,9 +737,7 @@ pub fn write_parquet_in(
         }
         tables.push((name.clone(), Rows::from_batches(t, &batches)?));
         sourced.push((name.clone(), sources(&files, t)?));
-        names.push((name.clone(), named(name, &files)?));
     }
-    let (release, lc_monetary) = settled(&names, release, lc_monetary)?;
     let mut carried = Carried::default();
     if let Some(l) = lc_monetary {
         for t in &catalog.tables {

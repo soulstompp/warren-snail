@@ -71,6 +71,7 @@ pub(super) fn typed(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Op
     let no_form = || Err(super::typed::no_form(name, args));
     Ok(Some(match name {
         "string_to_array" | "parse_ident" => text_array,
+        "oidvectortypes" if args.len() == 1 => Some(ColumnType::Text(None)),
         "acldefault" => Some(aclitem_array()),
         "aclexplode" | "pg_options_to_table" => record(name),
         "generate_subscripts"
@@ -89,8 +90,11 @@ pub(super) fn typed(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Op
             Some(ColumnType::Text(None))
         }
         "array_fill" => first.map(array_of),
-        "array_remove" | "array_replace" | "array_reverse" | "array_sort" | "trim_array"
-        | "array_shuffle" | "array_sample"
+        // A vector's is its elements' array's, as anycompatiblearray finds it.
+        "array_remove" | "array_replace" if array.is_some() || first.is_none() => {
+            array.map(crate::composed::array_type)
+        }
+        "array_reverse" | "array_sort" | "trim_array" | "array_shuffle" | "array_sample"
             if array.is_some() || first.is_none() =>
         {
             array
@@ -99,6 +103,34 @@ pub(super) fn typed(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Op
         _ if is_array_function(name) => return no_form(),
         _ => return Ok(None),
     }))
+}
+
+fn oidvector() -> ColumnType {
+    crate::composed::built_in("oidvector").expect("oidvector is built in")
+}
+
+/// `oidvectortypes`: each OID's type named as `format_type` names it, 0 `-`, an OID the release's
+/// catalog does not name `???`.
+fn oid_types(item: &Item, release: u8) -> String {
+    let Item::Array { elements, .. } = item else {
+        return String::new();
+    };
+    elements
+        .iter()
+        .map(|e| match e {
+            Item::Scalar(Datum::Int(k)) => {
+                let oid = crate::scalars::unsigned_of(*k, 32) as u32;
+                let text = crate::regs::reg_text(crate::regs::RegKind::Type, oid, release);
+                if oid != 0 && text == oid.to_string() {
+                    "???".to_string()
+                } else {
+                    text
+                }
+            }
+            _ => String::new(),
+        })
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// A draw of a uniform integer below `bound`, from the machine's own random source.
@@ -261,10 +293,18 @@ pub(super) fn arrays(
                 a::acldefault(kind.bytes().next().unwrap_or(0), owner)?,
             )
         }
-        ("oidvectortypes", _) => {
-            return Err(Error::new(format!(
-                "{name}: oidvector is not a type the snail holds"
-            )))
+        ("oidvectortypes", [(v, _)]) => {
+            let v = match v {
+                Value::Text(s) => super::pipeline::composed_value(oidvector(), s)?,
+                v => v.clone(),
+            };
+            match (&v, v.is_null()) {
+                (_, true) => Value::Null,
+                (Value::Composed(ty, c), _) if *ty == oidvector() => {
+                    Value::Text(oid_types(&c.item, super::handed::release_held()))
+                }
+                _ => return Err(no_such(name, std::slice::from_ref(&v))),
+            }
         }
         ("array_fill", [(v, q), (d, _)]) | ("array_fill", [(v, q), (d, _), _]) => {
             // The element's type is the step's, a NULL's too; an untyped literal has none.
@@ -330,10 +370,14 @@ pub(super) fn arrays(
                     super::typed::array_of(ColumnType::Int4),
                     a::positions(elem, item, &element(1)?)?,
                 ),
-                ("array_remove", 2) => out(ty, a::remove(elem, item, &element(1)?)?),
-                ("array_replace", 3) => {
-                    out(ty, a::replace(elem, item, &element(1)?, &element(2)?)?)
-                }
+                ("array_remove", 2) => out(
+                    crate::composed::array_type(ty),
+                    a::remove(elem, item, &element(1)?)?,
+                ),
+                ("array_replace", 3) => out(
+                    crate::composed::array_type(ty),
+                    a::replace(elem, item, &element(1)?, &element(2)?)?,
+                ),
                 ("array_reverse", 1) => out(ty, a::reverse(item)),
                 ("array_sort", 1..=3) => {
                     let descending = match values.get(1) {

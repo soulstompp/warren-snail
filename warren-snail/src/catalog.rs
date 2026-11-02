@@ -259,15 +259,19 @@ impl ColumnType {
 
     /// Whether PostgreSQL decides its comparisons a row at a time, so that only the pipeline reads
     /// them: a geometric value's, an array's whose elements' type has no equality, which `=`
-    /// refuses only where the two arrays are of one shape, and the planner's statistics' and their
-    /// kin's, which compare as text or bytea by what they meet.
+    /// refuses only where the two arrays are of one shape, a composite's holding a field of no
+    /// B-tree, and the planner's statistics' and their kin's, which compare as text or bytea by what
+    /// they meet.
     pub fn compared_by_rows(self) -> bool {
         match self {
             ColumnType::Geometric(_) => true,
             ColumnType::Internal(t) => t.is_bytes(),
-            ColumnType::Composed(r) => {
-                matches!(r.def(), crate::composed::Composed::Array { element, .. } if !element.grouped())
-            }
+            ColumnType::Composed(r) => match r.def() {
+                crate::composed::Composed::Array { element, .. } => !element.grouped(),
+                // record_cmp is refused only where two values reach a field of no B-tree.
+                crate::composed::Composed::Record { .. } => !self.ordered(),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -446,6 +450,55 @@ impl ColumnType {
         }
     }
 
+    /// The type under the release a file's OIDs came from: its reg* values, and those its parts hold,
+    /// named by that release's catalog, a row type of the catalog with the fields it defines. Refused
+    /// where the release has no such type.
+    pub fn at_release(self, release: u8) -> Result<ColumnType> {
+        use crate::composed::Composed;
+        let ColumnType::Composed(r) = self else {
+            if let ColumnType::Reg(kind, _) = self {
+                crate::regs::check_release(Some(kind), release)?;
+                return Ok(ColumnType::Reg(kind, release));
+            }
+            return Ok(self);
+        };
+        Ok(crate::composed::type_of(match r.def() {
+            Composed::Record { name, .. } if crate::rowtypes::is_row_type(name) => {
+                return crate::rowtypes::row_type_at(name, release)
+            }
+            Composed::Array { element, domain } => Composed::Array {
+                element: element.at_release(release)?,
+                domain: domain.clone(),
+            },
+            Composed::Record { name, fields } => Composed::Record {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|f| {
+                        Ok(crate::composed::Field {
+                            ty: f.ty.at_release(release)?,
+                            ..f.clone()
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Composed::Range {
+                name,
+                subtype,
+                discrete,
+            } => Composed::Range {
+                name: name.clone(),
+                subtype: subtype.at_release(release)?,
+                discrete: *discrete,
+            },
+            Composed::Multirange { name, range } => Composed::Multirange {
+                name: name.clone(),
+                range: range.at_release(release)?,
+            },
+            _ => return Ok(self),
+        }))
+    }
+
     /// The type with its money, and the money its parts hold, read and printed under `m`.
     pub fn with_monetary(self, m: crate::monetary::Monetary) -> ColumnType {
         use crate::composed::Composed;
@@ -603,6 +656,7 @@ impl ColumnType {
                 use crate::composed::Composed;
                 let parts = match r.def() {
                     Composed::Array { element, .. } => element.hash_opclass().is_some(),
+                    Composed::Vector { .. } => true,
                     Composed::Record { fields, .. } => {
                         fields.iter().all(|f| f.ty.hash_opclass().is_some())
                     }
@@ -902,7 +956,15 @@ pub fn assignable(from: ColumnType, to: ColumnType) -> bool {
         (NumericText(_), t) => assignable(ColumnType::numeric(Some((9, 2))), t),
         (f, NumericText(_)) => assignable(f, ColumnType::numeric(Some((9, 2)))),
         (Reg(a, _), Reg(b, _)) => a == b || crate::regs::casts_between(a, b),
-        (Composed(a), Composed(b)) => a == b,
+        // A vector to an array, as its elements are; nothing but itself to a vector.
+        (Composed(a), Composed(b)) => {
+            a == b || (crate::composed::is_vector(from) && !crate::composed::is_vector(to) && {
+                match (crate::read::element_type(from), crate::read::element_type(to)) {
+                    (Some(x), Some(y)) => assignable(x, y),
+                    _ => false,
+                }
+            })
+        }
         // text to regclass is regclass(text), an implicit cast; to any other reg* only explicit.
         (Text(_), Reg(crate::regs::RegKind::Class, _)) => true,
         (Textual(a), Textual(b)) => crate::textual::assignable(a, b),
@@ -2796,8 +2858,8 @@ impl Catalog {
             || self.functions.iter().any(|f| named(&f.name))
     }
 
-    /// Each reg* type its columns, its functions' arguments and its domains name, named by the
-    /// catalog of `release`: refused where the release has no such type.
+    /// Each type its columns, its functions' arguments and its domains name, under `release`: refused
+    /// where the release has no such type.
     pub fn with_release(&mut self, release: u8) -> Result<()> {
         crate::regs::check_release(None, release)?;
         self.release = release;
@@ -2811,10 +2873,7 @@ impl Catalog {
         }
         types.extend(self.domains.iter_mut().filter_map(|d| d.base_type.as_mut()));
         for ty in types {
-            if let ColumnType::Reg(kind, at) = ty {
-                crate::regs::check_release(Some(*kind), release)?;
-                *at = release;
-            }
+            *ty = ty.at_release(release)?;
         }
         Ok(())
     }
@@ -3012,7 +3071,7 @@ mod tests {
 
     #[test]
     fn a_type_not_held_is_refused() {
-        let e = refused("CREATE TABLE s.t (a int2vector NOT NULL, PRIMARY KEY (a));");
+        let e = refused("CREATE TABLE s.t (a trigger NOT NULL, PRIMARY KEY (a));");
         assert!(e.contains("is not held"), "{e}");
     }
 

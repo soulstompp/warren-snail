@@ -952,6 +952,13 @@ fn collected(ty: Option<ColumnType>, arrays: bool, values: &[Value]) -> Result<V
                 _ => stacked.push(&crate::composed::Item::Null)?,
             }
         }
+        // array_agg's result is of its argument's type, and two dimensions make no vector.
+        if crate::composed::is_vector(ty) {
+            return Err(Error::new(format!(
+                "array is not a valid {}",
+                ty.pg_name()
+            )));
+        }
         return Ok(super::pipeline::composed(ty, stacked.finish()?));
     }
     let elements = values

@@ -149,7 +149,7 @@ pub(super) fn json_value(v: &Value) -> JsonValue {
         Value::Typed(ColumnType::Textual(Textual::Jsonb), s) => JsonValue::Jsonb(s.clone()),
         Value::Composed(ty, c) => match (ty, &c.item) {
             (ColumnType::Composed(r), Item::Array { elements, dims, .. }) => {
-                let Composed::Array { element, .. } = r.def() else {
+                let (Composed::Array { element, .. } | Composed::Vector { element }) = r.def() else {
                     return JsonValue::Other(v.text().unwrap_or_default());
                 };
                 JsonValue::Array {

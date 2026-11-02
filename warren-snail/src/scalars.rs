@@ -289,6 +289,48 @@ pub(crate) fn unsigned_in(s: &str, bits: u32, name: &str) -> Result<u64> {
     Ok(v)
 }
 
+/// An oid at the start of a text, as `oidvectorin` reads each of its elements: its key, and where the
+/// reading stopped.
+pub(crate) fn oid_prefix(s: &str) -> Result<(i64, usize)> {
+    let wrong = || Error::new(format!("invalid input syntax for type oid: \"{s}\""));
+    let range = || Error::new(format!("value \"{s}\" is out of range for type oid"));
+    let (v, over, end) = strtoul(s.as_bytes()).ok_or_else(wrong)?;
+    let r = v as u32;
+    if over || (v != u64::from(r) && v != (r as i32) as i64 as u64) {
+        return Err(range());
+    }
+    Ok((unsigned_key(u64::from(r), 32), end))
+}
+
+/// A smallint at the start of a text, as `int2vectorin` reads each of its elements: in base 10, a
+/// blank or nothing after it; the number, and where the reading stopped.
+pub(crate) fn int2_prefix(s: &str) -> Result<(i64, usize)> {
+    let wrong = || Error::new(format!("invalid input syntax for type smallint: \"{s}\""));
+    let range = || Error::new(format!("value \"{s}\" is out of range for type smallint"));
+    let b = s.as_bytes();
+    let neg = b.first() == Some(&b'-');
+    let digits = usize::from(matches!(b.first(), Some(b'-' | b'+')));
+    let end = digits + b[digits..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if end == digits {
+        return Err(wrong());
+    }
+    let v = s[digits..end].bytes().try_fold(0i64, |v, c| {
+        v.checked_mul(10)?.checked_add(i64::from(c - b'0'))
+    });
+    let v = match v {
+        Some(v) if neg => -v,
+        Some(v) => v,
+        None => return Err(range()),
+    };
+    if !(i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&v) {
+        return Err(range());
+    }
+    if !matches!(b.get(end), None | Some(b' ')) {
+        return Err(wrong());
+    }
+    Ok((v, end))
+}
+
 /// A `"char"` as PostgreSQL's `charin` reads it: a backslash and three octal digits, or else the
 /// first byte, none for the empty string.
 fn char_in(s: &str) -> u8 {

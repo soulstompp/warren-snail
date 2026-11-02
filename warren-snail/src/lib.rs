@@ -34,6 +34,7 @@ pub mod regex;
 pub mod regexp;
 pub mod regs;
 pub mod room;
+pub mod rowtypes;
 pub mod scalars;
 pub(crate) mod spans;
 pub mod strings;

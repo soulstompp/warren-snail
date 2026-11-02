@@ -202,6 +202,27 @@ pub(super) fn compare_values(
     compare_under(under, a, b)
 }
 
+/// Two values in the order min and max keep them: a vector's as an array's, as `array_smaller` and
+/// `array_larger` take it, whatever comparison its own type has.
+fn extreme_order(under: Option<Casing>, a: &Value, b: &Value) -> Result<Option<Ordering>> {
+    if let (Value::Composed(ty, x), Value::Composed(_, y)) = (a, b) {
+        if crate::composed::is_vector(*ty) {
+            let (x, y) = (
+                crate::composed::array_order_key(*ty, x),
+                crate::composed::array_order_key(*ty, y),
+            );
+            return Ok(Some(x.cmp(&y)));
+        }
+        if let Some(part) = crate::composed::compare_reaches(*ty, &x.item, &y.item) {
+            return Err(Error::new(format!(
+                "could not identify a comparison function for type {}",
+                part.pg_name()
+            )));
+        }
+    }
+    compare_under(under, a, b)
+}
+
 /// Two values compared as PostgreSQL compares values of one kind; none where either is NULL.
 fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
     if a.is_null() || b.is_null() {
@@ -1434,6 +1455,17 @@ fn cast(
     }
     let name = to.to_string().to_lowercase();
     let base = name.split('(').next().unwrap_or("").trim().to_string();
+    // A vector is cast to an array or a string, and to nothing else.
+    if let Value::Composed(from, _) = &v {
+        let to_string = matches!(crate::catalog::held_type(to), Ok(t) if t.is_string());
+        if crate::composed::is_vector(*from) && !to_string && crate::composed::resolve(to).is_none() {
+            return Err(Error::new(format!(
+                "cannot cast type {} to {}",
+                from.pg_name(),
+                crate::catalog::format_type(to)
+            )));
+        }
+    }
     // A geometric type by its cast from another, or by its input from text.
     if let Some(k) = crate::geo::GeoKind::of_name(base.as_str()) {
         return Ok(match v {
@@ -1592,10 +1624,12 @@ fn cast(
             match v {
                 Value::Composed(from, c) if from == ty => Value::Composed(from, c),
                 Value::Text(t) => composed_value(ty, &t)?,
-                // An array of one type to an array of another, each element cast, its shape kept.
+                // An array of one type to an array of another, each element cast, its shape kept;
+                // a vector is cast from, and to no other.
                 Value::Composed(from, c)
                     if super::typed::element_of(from).is_some()
-                        && super::typed::element_of(ty).is_some() =>
+                        && super::typed::element_of(ty).is_some()
+                        && !crate::composed::is_vector(ty) =>
                 {
                     let (from_element, element) = (
                         super::typed::element_of(from).unwrap(),
@@ -1621,13 +1655,31 @@ fn cast(
                             )?;
                             part_of(element, v, false)
                         })
-                        .collect::<Result<Vec<_>>>()?;
+                        .collect::<Result<Vec<_>>>()
+                        .map_err(|e| {
+                            if crate::composed::is_vector(from) {
+                                Error::new(format!(
+                                    "cannot cast type {} to {}",
+                                    from.pg_name(),
+                                    ty.pg_name()
+                                ))
+                            } else {
+                                e
+                            }
+                        })?;
+                    // A cast of no elements leaves an empty array, of no dimensions, but where a
+                    // vector keeps its elements' type.
+                    let (dims, lower) = if elements.is_empty() && from_element != element {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        (dims.clone(), lower.clone())
+                    };
                     composed(
                         ty,
                         crate::composed::Item::Array {
                             elements,
-                            dims: dims.clone(),
-                            lower: lower.clone(),
+                            dims,
+                            lower,
                         },
                     )
                 }
@@ -1965,6 +2017,18 @@ fn compared(op: &BinaryOperator, x: &Value, y: &Value) -> Result<()> {
     if let (Value::Composed(ty, _), _) | (_, Value::Composed(ty, _)) = (x, y) {
         let both = !x.is_null() && !y.is_null();
         let equal = matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq);
+        // A composite is refused only where the two reach a field of no B-tree.
+        if let (Value::Composed(ty, a), Value::Composed(_, b)) = (x, y) {
+            if is_record(*ty) && !equal {
+                return match crate::composed::compare_reaches(*ty, &a.item, &b.item) {
+                    Some(part) => Err(Error::new(format!(
+                        "could not identify a comparison function for type {}",
+                        part.pg_name()
+                    ))),
+                    None => Ok(()),
+                };
+            }
+        }
         if !ty.ordered() && both && !equal {
             return Err(Error::new(format!(
                 "could not identify a comparison function for type {}",
@@ -3642,7 +3706,18 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                                     crate::composed::slice(&c.item, &slices),
                                 )),
                             ),
-                            crate::composed::Composed::Array { element, .. } => {
+                            crate::composed::Composed::Vector { element } if sliced => {
+                                let array = super::typed::array_of(*element);
+                                Value::Composed(
+                                    array,
+                                    std::sync::Arc::new(crate::composed::Compound::new(
+                                        array,
+                                        crate::composed::slice(&c.item, &slices),
+                                    )),
+                                )
+                            }
+                            crate::composed::Composed::Array { element, .. }
+                            | crate::composed::Composed::Vector { element } => {
                                 part_value(*element, &crate::composed::subscript(&c.item, &at))
                             }
                             _ => {
@@ -4701,6 +4776,17 @@ impl Acc {
             },
             _ => return Err(Error::new(format!("{call} is not read"))),
         };
+        // A DISTINCT sorts what it folds.
+        if distinct {
+            for x in &a {
+                if let Some(t) = types.get(&(*x as *const Expr)).filter(|t| !t.ordered()) {
+                    return Err(Error::new(format!(
+                        "could not identify an ordering operator for type {}",
+                        t.pg_name()
+                    )));
+                }
+            }
+        }
         let acc = if distinct {
             Acc::Distinct {
                 seen: Default::default(),
@@ -4872,6 +4958,7 @@ impl Acc {
             // Of a type with no B-tree, refused where a second value meets the first, as
             // PostgreSQL's array_smaller and array_larger are first called on two.
             if !ty.ordered()
+                && !is_record(*ty)
                 && !v.is_null()
                 && matches!(self, Acc::Least(Some(_)) | Acc::Greatest(Some(_)))
             {
@@ -5023,7 +5110,7 @@ impl Acc {
                 let later = v.to_numeric().is_some();
                 let better = match best {
                     None => true,
-                    Some(b) => match compare_under(under, &v, b)? {
+                    Some(b) => match extreme_order(under, &v, b)? {
                         Some(Ordering::Less) => true,
                         Some(Ordering::Equal) => later,
                         _ => false,
@@ -5037,7 +5124,7 @@ impl Acc {
                 let later = v.to_numeric().is_some();
                 let better = match best {
                     None => true,
-                    Some(b) => match compare_under(under, &v, b)? {
+                    Some(b) => match extreme_order(under, &v, b)? {
                         Some(Ordering::Greater) => true,
                         Some(Ordering::Equal) => later,
                         _ => false,
@@ -7507,7 +7594,7 @@ pub fn reads_per_row(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
     let unordered: Vec<&str> = table
         .columns
         .iter()
-        .filter(|c| c.ty.is_nested() && !c.ty.ordered())
+        .filter(|c| (c.ty.is_nested() && !c.ty.ordered()) || crate::composed::is_vector(c.ty))
         .map(|c| c.name.as_str())
         .collect();
     fn called(e: &Expr) -> Option<&sqlparser::ast::Function> {
@@ -8306,6 +8393,12 @@ fn array_as(v: Value, ty: ColumnType) -> Result<Value> {
             other => Ok(other.clone()),
         })
         .collect::<Result<Vec<_>>>()?;
+    // A cast of no elements leaves an empty array, of no dimensions, as a vector's may be not.
+    let (dims, lower) = if elements.is_empty() && was != to {
+        (&Vec::new(), &Vec::new())
+    } else {
+        (dims, lower)
+    };
     Ok(composed(
         ty,
         Item::Array {
@@ -8322,7 +8415,9 @@ fn holds_arrays(a: &sqlparser::ast::Array, frame: &Frame) -> bool {
         matches!(x, Expr::Array(_))
             || frame
                 .type_of(x)
-                .is_some_and(|t| super::typed::element_of(t).is_some())
+                .is_some_and(|t| {
+                    super::typed::element_of(t).is_some() && !crate::composed::is_vector(t)
+                })
     })
 }
 
@@ -8436,6 +8531,42 @@ fn composed_beside(x: &Value, y: &Value) -> Option<ColumnType> {
     }
 }
 
+/// A vector's element, where a value is a vector.
+fn vector_of(v: &Value) -> Option<ColumnType> {
+    match v {
+        Value::Composed(ColumnType::Composed(r), _) => match r.def() {
+            crate::composed::Composed::Vector { element } => Some(*element),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A value with a vector made its elements' array, counted from 0 as it is; one of no elements, an
+/// array of no dimensions where the other side's type makes it cast.
+fn array_of_vector(v: &Value, other: Option<ColumnType>) -> Value {
+    match (vector_of(v), v) {
+        (Some(element), Value::Composed(_, c)) => {
+            let array = super::typed::array_of(element);
+            let cast = other.is_some_and(|t| super::typed::element_of(t).unwrap_or(t) != element);
+            match &c.item {
+                crate::composed::Item::Array { elements, .. } if elements.is_empty() && cast => {
+                    composed(
+                        array,
+                        crate::composed::Item::Array {
+                            elements: Vec::new(),
+                            dims: Vec::new(),
+                            lower: Vec::new(),
+                        },
+                    )
+                }
+                item => composed(array, item.clone()),
+            }
+        }
+        _ => v.clone(),
+    }
+}
+
 /// An operator of the composed types, where either side is one: an array's `||`, `@>`, `<@` and
 /// `&&`; a range's `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`, `+`, `*` and `-`, beside a
 /// range or, for `@>` and `<@`, an element of its subtype; a multirange's, beside a multirange, a
@@ -8475,6 +8606,14 @@ fn composed_op(
     let ColumnType::Composed(r) = ty else {
         return Ok(None);
     };
+    // A vector's `||` is its elements' array's.
+    if name == "||" && (vector_of(x).is_some() || vector_of(y).is_some()) {
+        let (a, b) = (
+            array_of_vector(x, typed[1].or(type_of_value(y))),
+            array_of_vector(y, typed[0].or(type_of_value(x))),
+        );
+        return composed_op(op, &a, &b, left, right, typed);
+    }
     // A value as the composed type, a quoted literal read by its input; or as an element of it.
     let whole = |v: &Value, e: &Expr| -> Result<Option<Item>> {
         Ok(match v {
@@ -8541,7 +8680,7 @@ fn composed_op(
                 }
             }
         }
-        Composed::Array { element, .. } => {
+        Composed::Array { element, .. } | Composed::Vector { element } => {
             let (a, b) = (whole(x, left)?, whole(y, right)?);
             if name == "||" {
                 let first = matches!(y, Value::Composed(..))
@@ -8671,7 +8810,7 @@ fn any_all(op: &BinaryOperator, x: Value, arr: Value, left: &Expr, any: bool) ->
     let ColumnType::Composed(r) = ty else {
         unreachable!()
     };
-    let Composed::Array { element, .. } = r.def() else {
+    let (Composed::Array { element, .. } | Composed::Vector { element }) = r.def() else {
         return Err(Error::new(
             "op ANY/ALL (array) requires array on right side",
         ));

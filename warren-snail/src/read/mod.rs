@@ -106,6 +106,7 @@ impl relations::Reads for Snail {
     }
 }
 pub use question::{instant, truth};
+pub(crate) use typed::element_of as element_type;
 
 use crate::catalog::{Catalog, Table};
 use crate::cut::PAGE;

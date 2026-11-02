@@ -251,6 +251,47 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
         | (Money(_), Money(_))
         | (Tid, Tid) => d,
         (Composed(a), Composed(b)) if a == b => d,
+        // A vector to an array, each element by its own assignment, its shape kept.
+        (Composed(_), Composed(_)) if crate::composed::is_vector(from) => {
+            let (Datum::Compound(c), Some(x), Some(y)) = (
+                &d,
+                super::typed::element_of(from),
+                super::typed::element_of(to),
+            ) else {
+                return Err(refused());
+            };
+            let crate::composed::Item::Array {
+                elements,
+                dims,
+                lower,
+            } = &c.item
+            else {
+                return Err(refused());
+            };
+            let elements = elements
+                .iter()
+                .map(|e| {
+                    Ok(match assign(crate::composed::datum_of(x, e), x, y, what)? {
+                        Datum::Null => crate::composed::Item::Null,
+                        Datum::Compound(c) => c.item.clone(),
+                        d => crate::composed::Item::Scalar(d),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (dims, lower) = if elements.is_empty() && x != y {
+                (Vec::new(), Vec::new())
+            } else {
+                (dims.clone(), lower.clone())
+            };
+            Datum::Compound(std::sync::Arc::new(crate::composed::Compound::new(
+                to,
+                crate::composed::Item::Array {
+                    elements,
+                    dims,
+                    lower,
+                },
+            )))
+        }
         // A reg* type is an oid to PostgreSQL's casts: from and to one, binary-coercible, as are a
         // function's two and an operator's two to each other.
         (Oid | Reg(..), Oid | Reg(..))

@@ -606,7 +606,8 @@ fn cast_through(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
 fn elements_assignable(from: ColumnType, to: ColumnType) -> bool {
     let element = |ty: ColumnType| match ty {
         ColumnType::Composed(r) => match r.def() {
-            crate::composed::Composed::Array { element, .. } => Some(*element),
+            crate::composed::Composed::Array { element, .. }
+            | crate::composed::Composed::Vector { element } => Some(*element),
             _ => None,
         },
         _ => None,

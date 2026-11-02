@@ -165,6 +165,14 @@ pub(super) fn common_type(ts: &[Option<ColumnType>], context: &str) -> Result<Co
             out = Some(t);
             continue;
         }
+        // A vector meets its elements' array as that array.
+        if crate::composed::array_type(p) == t {
+            out = Some(t);
+            continue;
+        }
+        if crate::composed::array_type(t) == p {
+            continue;
+        }
         match (place(p), place(t)) {
             (Some((a, x)), Some((b, y))) if a == b && y > x => out = Some(unmodified(t)),
             (Some((a, x)), Some((b, y))) if a == b && (y < x || a == 1) => {
@@ -195,7 +203,8 @@ pub(crate) fn array_of(element: ColumnType) -> ColumnType {
 pub(crate) fn element_of(ty: ColumnType) -> Option<ColumnType> {
     match ty {
         ColumnType::Composed(r) => match r.def() {
-            crate::composed::Composed::Array { element, .. } => Some(*element),
+            crate::composed::Composed::Array { element, .. }
+            | crate::composed::Composed::Vector { element } => Some(*element),
             _ => None,
         },
         _ => None,
@@ -331,7 +340,7 @@ impl Typing<'_> {
                     )
                 });
                 match t.and_then(element_of) {
-                    Some(_) if sliced => t,
+                    Some(e) if sliced => Some(array_of(e)),
                     Some(e) => Some(e),
                     None => None,
                 }
@@ -346,7 +355,8 @@ impl Typing<'_> {
                     None
                 } else {
                     let t = common_type(&ts, "ARRAY")?;
-                    Some(if element_of(t).is_some() {
+                    // A vector among them is an element, as PostgreSQL's parser takes it.
+                    Some(if element_of(t).is_some() && !crate::composed::is_vector(t) {
                         t
                     } else {
                         array_of(t)

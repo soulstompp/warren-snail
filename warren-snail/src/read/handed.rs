@@ -305,6 +305,8 @@ thread_local! {
     static HANDED: RefCell<Rc<Vec<Rc<Function>>>> = RefCell::new(Rc::new(Vec::new()));
     /// The tables of the snail the round under way reads.
     static ROWS: RefCell<Tables> = RefCell::new(Rc::new(Vec::new()));
+    /// The release of the snail the round under way reads.
+    static RELEASE: std::cell::Cell<u8> = const { std::cell::Cell::new(crate::regs::LATEST) };
 }
 
 /// The functions a round is handed, read by all it evaluates while it is held; those before come
@@ -324,7 +326,7 @@ impl Drop for Holding {
 }
 
 /// The row types a pipeline reads its tables' names as, held while it runs.
-pub(crate) struct Rows(Tables);
+pub(crate) struct Rows(Tables, u8);
 
 /// Holds the row types of a catalog's tables.
 pub(crate) fn rows_of(catalog: &crate::catalog::Catalog) -> Rows {
@@ -344,14 +346,23 @@ pub(crate) fn rows_of(catalog: &crate::catalog::Catalog) -> Rows {
             (t.name.clone(), fields)
         })
         .collect();
-    Rows(ROWS.with(|r| r.replace(Rc::new(rows))))
+    Rows(
+        ROWS.with(|r| r.replace(Rc::new(rows))),
+        RELEASE.with(|r| r.replace(catalog.release)),
+    )
 }
 
 impl Drop for Rows {
     fn drop(&mut self) {
         let before = std::mem::take(&mut self.0);
         ROWS.with(|r| *r.borrow_mut() = before);
+        RELEASE.with(|r| r.set(self.1));
     }
+}
+
+/// The release of the snail the round under way reads.
+pub(crate) fn release_held() -> u8 {
+    RELEASE.with(|r| r.get())
 }
 
 /// A table's row type, by the table's name or the last part of it, where the pipeline under way

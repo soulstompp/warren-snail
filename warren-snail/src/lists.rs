@@ -115,10 +115,15 @@ const DECLARED: [(&str, &str); 2] = [
     ("census.c", "CREATE TYPE census.c AS (a integer)"),
 ];
 
-/// Why the snail refuses a DDL, read a statement at a time, where it refuses a statement of it.
-fn ddl_refused(ddl: &str) -> Option<String> {
+/// Why the snail refuses a DDL under a release, read a statement at a time, where it refuses a
+/// statement of it, or where the release has a type it names otherwise.
+fn ddl_refused(ddl: &str, release: u8) -> Option<String> {
     match Catalog::read(ddl) {
-        Ok(r) => r.statements.into_iter().find_map(|s| s.refused),
+        Ok(mut r) => r
+            .statements
+            .iter()
+            .find_map(|s| s.refused.clone())
+            .or_else(|| r.catalog.with_release(release).err().map(|e| e.to_string())),
         Err(e) => Some(e.to_string()),
     }
 }
@@ -147,7 +152,7 @@ pub fn types(release: u8) -> Vec<Probed> {
             let probe = table_ddl(&[("c".into(), t.name)]);
             Probed {
                 listed: t,
-                refused: ddl_refused(&probe),
+                refused: ddl_refused(&probe, release),
                 probe,
             }
         })
@@ -168,7 +173,7 @@ pub fn opclasses(release: u8) -> Vec<Probed> {
             );
             Probed {
                 listed: c,
-                refused: ddl_refused(&probe),
+                refused: ddl_refused(&probe, release),
                 probe,
             }
         })
@@ -255,18 +260,29 @@ pub fn operators(
     release: u8,
     scratch: &std::path::Path,
 ) -> crate::Result<(Vec<Probed>, Vec<String>)> {
-    use crate::read::Snail;
-    use crate::Error;
     let ops: Vec<&'static Listed> = all(Kind::Operator)
         .iter()
         .filter(|o| o.in_release(release))
         .collect();
+    operators_over(ops, VALUES, release, scratch)
+}
+
+/// Each operator given as `operators` answers it, a value of each operand type read from `values`.
+#[cfg(feature = "standalone")]
+fn operators_over(
+    ops: Vec<&'static Listed>,
+    values: &[(&str, &str)],
+    release: u8,
+    scratch: &std::path::Path,
+) -> crate::Result<(Vec<Probed>, Vec<String>)> {
+    use crate::read::Snail;
+    use crate::Error;
     let mut wanted: Vec<(String, &'static str, String)> = Vec::new();
     for o in &ops {
         let (_, left, right) = o.operands();
         for t in left.into_iter().chain([right]).map(concrete) {
             if wanted.iter().all(|(_, w, _)| *w != t) {
-                let value = VALUES
+                let value = values
                     .iter()
                     .find(|(v, _)| *v == t)
                     .map(|(_, v)| v.replace('\'', "''"))
@@ -287,7 +303,7 @@ pub fn operators(
     let mut why: Vec<(&str, String)> = Vec::new();
     let mut columns: Vec<(String, &str)> = Vec::new();
     for (c, t, _) in &wanted {
-        match ddl_refused(&table_ddl(&[(c.clone(), *t)])) {
+        match ddl_refused(&table_ddl(&[(c.clone(), *t)]), release) {
             Some(r) => why.push((*t, r)),
             None => columns.push((c.clone(), *t)),
         }
@@ -345,4 +361,41 @@ pub fn operators(
         })
         .collect();
     Ok((probed, setup))
+}
+
+#[cfg(all(test, feature = "standalone"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_operand_type_the_snail_refuses_refuses_its_operators_in_the_ddl_reader_s_words() {
+        let held: &'static Listed = Box::leak(Box::new(Listed {
+            name: "=(integer,integer)",
+            family: "numeric types",
+            input: "",
+            releases: 0xff,
+        }));
+        let refused: &'static Listed = Box::leak(Box::new(Listed {
+            name: "=(pg_attribute,pg_attribute)",
+            family: "composite types",
+            input: "",
+            releases: 0xff,
+        }));
+        let path = std::env::temp_dir().join(format!("lists-refused-{}.snail", std::process::id()));
+        let (of, setup) = operators_over(
+            vec![held, refused],
+            &[("integer", "2"), ("pg_attribute", "(1)")],
+            19,
+            &path,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(of[0].refused, None);
+        assert_eq!(
+            of[1].refused.as_deref(),
+            Some("census.t.v_pg_attribute: column \"attmissingval\" has pseudo-type anyarray")
+        );
+        // The setup makes the table whole for PostgreSQL all the same.
+        assert!(setup.iter().any(|s| s.contains(" v_pg_attribute pg_attribute")));
+    }
 }
