@@ -446,6 +446,10 @@ fn every_point_operator_holds_along_each_strand_of_a_point_and_rules_blocks_out(
             "SELECT id FROM s.t WHERE v << '(1040,1040)'",
         ),
         (
+            "SELECT id FROM s.t WHERE '(2000,2000)' >> v",
+            "SELECT id FROM s.t WHERE v << '(2000,2000)'",
+        ),
+        (
             "SELECT id FROM s.t WHERE '(1040,1040)' |>> v",
             "SELECT id FROM s.t WHERE v <<| '(1040,1040)'",
         ),
@@ -1407,4 +1411,123 @@ fn a_read_along_the_plane_and_a_distance_s_sort_keep_to_the_round_s_room() {
         "{round:?}"
     );
     assert!(round.bytes_held < wide[1].1.bytes_held, "{round:?}");
+}
+
+#[test]
+fn what_a_mount_asks_holds_on_the_plane_its_price_its_scan_its_sample_and_its_shapes_as_answers() {
+    let path = table_of(
+        "plane-mount",
+        "point",
+        GeoKind::Point,
+        &["gist"],
+        16384,
+        |i| (i % 100 != 0).then(|| format!("({},{})", cell(i).0, cell(i).1)),
+    );
+    let mut s = fresh(&path);
+    let q = "SELECT t.id FROM s.t t WHERE t.v <@ box '((1040,1040),(1100,1100))'";
+    let p = s.price(q, None).unwrap();
+    assert_eq!(p.order, "t_gist");
+    let mut scan = s.scan(q, None).unwrap();
+    let mut n = 0;
+    while let Some(b) = s.next_block(&mut scan).unwrap() {
+        n += b.num_rows() as u64;
+    }
+    let round = scan.round();
+    assert!(p.rows_low <= n && n <= p.rows_high, "{n} {p:?}");
+    assert_eq!(round.column_pages_read, p.column_pages, "{round:?} {p:?}");
+    exact(q, &round);
+    // A sample of a table whose own order is the plane's reads its rows' pages, whichever.
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+         CREATE INDEX t_v ON s.t USING gist (v); \
+         ALTER TABLE s.t CLUSTER ON t_v;",
+    )
+    .unwrap();
+    let clustered = tmp("plane-mount-clustered.snail");
+    write(
+        &clustered,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![
+                    Values::Int((0..16384).map(Some).collect()),
+                    shapes(
+                        GeoKind::Point,
+                        (0..16384).map(|i| Some(format!("({},{})", cell(i).0, cell(i).1))),
+                    ),
+                ],
+            },
+        )],
+    )
+    .unwrap();
+    let c = fresh(&clustered);
+    let mut draws = 0.0f64;
+    let mut draw = move || {
+        draws = (draws + 0.618_033_988_75) % 1.0;
+        draws
+    };
+    let (mut scan, live) = c.sample("SELECT t.id FROM s.t t", 30, &mut draw).unwrap();
+    assert_eq!(live, 16384);
+    let mut got = 0;
+    while let Some(b) = c.next_block(&mut scan).unwrap() {
+        got += b.num_rows();
+    }
+    assert_eq!(got, 30);
+    assert_eq!(
+        scan.round().column_pages_read,
+        scan.round().column_pages_predicted
+    );
+    // A shape handed back along the strand is the one the table's key hands back.
+    let q = "SELECT id, v FROM s.t WHERE v <@ box '((1040,1040),(1100,1100))' ORDER BY id";
+    let (along, _) = s.ask(q, Some("t_gist")).unwrap();
+    let (key, _) = s.ask(q, Some("t_pkey")).unwrap();
+    assert!(along.num_rows() > 0);
+    assert_eq!(along, key);
+}
+
+/// A commit rebuilds the entries above the blocks it wrote: each keeps every block's box, a block's
+/// highest y and lowest x not lying at one corner.
+#[cfg(feature = "standalone")]
+#[test]
+fn a_commit_rebuilds_the_boxes_above_its_blocks_a_coordinate_at_a_time() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+         CREATE INDEX t_v ON s.t USING gist (v);",
+    )
+    .unwrap();
+    let side = 256i64;
+    let n = side * side;
+    let at = |i: i64| (1024 + (i * 7919 % n) / side, 1024 + (i * 7919 % n) % side);
+    let path = tmp("plane-above.snail");
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![
+                    Values::Int((0..n).map(Some).collect()),
+                    shapes(
+                        GeoKind::Point,
+                        (0..n).map(|i| Some(format!("({},{})", at(i).0, at(i).1))),
+                    ),
+                ],
+            },
+        )],
+    )
+    .unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    assert!(blocks_of(&w.blocks().unwrap(), "t_v", "v.x").len() >= 64);
+    run(&mut w, "INSERT INTO s.t VALUES (900000, '(1024,1024)')");
+    // Every eighth point of the grid, each found along the strand.
+    let mut found = 0;
+    for x in (1024..1280).step_by(8) {
+        for y in (1024..1280).step_by(8) {
+            let q = format!("SELECT count(*) FROM s.t WHERE v ~= '({x},{y})'");
+            let (b, _) = w.ask(&q, Some("t_v")).unwrap();
+            found += weather::one(&b);
+        }
+    }
+    assert_eq!(found, 1025);
 }

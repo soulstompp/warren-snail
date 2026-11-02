@@ -1475,6 +1475,46 @@ mod tests {
     }
 
     #[test]
+    fn a_block_s_box_on_the_plane_is_each_coordinate_s_least_and_greatest_and_is_read_back_so() {
+        let bytes = |x: f64, y: f64| {
+            let mut b = x.to_bits().to_be_bytes().to_vec();
+            b.extend_from_slice(&y.to_bits().to_be_bytes());
+            b
+        };
+        let mut one = Span {
+            plane: true,
+            ..Span::default()
+        };
+        for (l, h) in [
+            ((1.0, 9.0), (2.0, 10.0)),
+            ((0.0, 5.0), (8.0, 5.0)),
+            ((5.0, 1.0), (6.0, 2.0)),
+        ] {
+            one.widen(Some((&bytes(l.0, l.1), &bytes(h.0, h.1))));
+        }
+        assert_eq!((one.lo.clone(), one.hi.clone()), (bytes(0.0, 1.0), bytes(8.0, 10.0)));
+        // A negative coordinate's bytes sort above a positive's: compared as numbers.
+        let mut other = Span {
+            plane: true,
+            ..Span::default()
+        };
+        other.widen(Some((&bytes(-3.0, 20.0), &bytes(-1.0, 30.0))));
+        let mut sum = Span::default();
+        sum.join(&one);
+        sum.join(&other);
+        assert_eq!((sum.lo.clone(), sum.hi.clone()), (bytes(-3.0, 1.0), bytes(8.0, 30.0)));
+        let mut a = block(1, 10, 0);
+        a.spans = vec![one];
+        let head = Head {
+            span_slots: vec![0],
+            ..head()
+        };
+        let (_, entries) = decode_top(&encode_top(&head, &[a.clone()])).unwrap();
+        assert_eq!(entries[0].spans, a.spans);
+        assert!(entries[0].spans[0].plane);
+    }
+
+    #[test]
     fn an_entry_above_the_blocks_keeps_the_span_of_every_block_under_it() {
         let span = |lo: u8, hi: u8, empty: bool| Span {
             present: true,
