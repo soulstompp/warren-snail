@@ -932,6 +932,64 @@ pub fn jsonb_key(text: &str) -> Vec<u8> {
     k
 }
 
+/// A jsonb's normal text from the key of its class, as `jsonb_key` writes it, each number written
+/// with the digits its class holds; none where it is no such key.
+pub fn jsonb_of_key(key: &[u8]) -> Option<String> {
+    fn part(key: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+        let rest = key.get(*at..)?;
+        let (part, after) = crate::places::split_varying(rest);
+        *at = key.len() - after.len();
+        Some(part)
+    }
+    fn count(key: &[u8], at: &mut usize) -> Option<usize> {
+        let n = u32::from_be_bytes(key.get(*at..*at + 4)?.try_into().ok()?);
+        *at += 4;
+        Some(n as usize)
+    }
+    fn value(key: &[u8], at: &mut usize, toks: &mut Vec<Tok>) -> Option<()> {
+        let code = *key.get(*at)?;
+        *at += 1;
+        match code {
+            0x10 => {
+                let n = count(key, at)?;
+                let raw = *key.get(*at)? == 0;
+                *at += 1;
+                toks.push(Tok::Array { count: n, raw });
+                for _ in 0..n {
+                    value(key, at, toks)?;
+                }
+                toks.push(Tok::EndArray);
+            }
+            0x11 => {
+                let n = count(key, at)?;
+                toks.push(Tok::Object { count: n });
+                for _ in 0..n {
+                    toks.push(Tok::Key(String::from_utf8(part(key, at)?).ok()?));
+                    value(key, at, toks)?;
+                }
+                toks.push(Tok::EndObject);
+            }
+            0x00 => toks.push(Tok::Null),
+            0x01 => toks.push(Tok::Str(String::from_utf8(part(key, at)?).ok()?)),
+            0x02 => {
+                let class = String::from_utf8(part(key, at)?).ok()?;
+                let text = crate::numeric::text_of_class(&class)?;
+                toks.push(Tok::Num(Numeric::parse(&text).ok()?));
+            }
+            0x03 => {
+                toks.push(Tok::Bool(*key.get(*at)? != 0));
+                *at += 1;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let mut toks = Vec::new();
+    let mut at = 0;
+    value(key, &mut at, &mut toks)?;
+    (at == key.len()).then(|| Doc::of(toks).out())
+}
+
 /// The integer `strtoint` reads in base 10, where it reads the whole text (blanks first and a sign
 /// allowed) and the integer fits 32 bits.
 fn strtoint(s: &str) -> Option<i32> {

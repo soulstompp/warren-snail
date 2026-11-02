@@ -87,6 +87,26 @@ impl Interval {
         self != Interval::INFINITY && self != Interval::NEG_INFINITY
     }
 
+    /// An interval of `total` as `total` gives it: the infinities as they are; any other as whole
+    /// months of 30 days, then days, then microseconds, its fields each within their own range.
+    pub fn of_total(total: i128) -> Interval {
+        if total == Interval::INFINITY.total() {
+            return Interval::INFINITY;
+        }
+        if total == Interval::NEG_INFINITY.total() {
+            return Interval::NEG_INFINITY;
+        }
+        let day = i128::from(MICROS_PER_DAY);
+        let months = (total / (30 * day)).clamp(i128::from(i32::MIN) + 1, i128::from(i32::MAX) - 1);
+        let rest = total - months * 30 * day;
+        let days = (rest / day).clamp(i128::from(i32::MIN) + 1, i128::from(i32::MAX) - 1);
+        Interval {
+            months: months as i32,
+            days: days as i32,
+            micros: (rest - days * day) as i64,
+        }
+    }
+
     /// The one number PostgreSQL compares intervals by: the microseconds, with a month counted as
     /// 30 days and a day as 24 hours.
     pub fn total(self) -> i128 {

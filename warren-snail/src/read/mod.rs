@@ -43,7 +43,7 @@ mod walk;
 
 pub use across::{Snails, StopAcross};
 pub use change::Done;
-pub use level::{LevelCounts, PlaceRows};
+pub use level::{held_of_key, LevelCounts, PlaceRows};
 pub use out::{TableOut, DDL_KEY, MONETARY_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 pub use point::Point;

@@ -1159,6 +1159,55 @@ impl Ord for Numeric {
     }
 }
 
+/// A numeric's text from the key of its class, as `class_key` writes it: its digits to its last
+/// nonzero one, at their place; none where it is no such key.
+pub fn text_of_class(key: &str) -> Option<String> {
+    let (kind, rest) = (key.get(..1)?, key.get(1..)?);
+    let (negative, place, digits) = match kind {
+        "0" => return Some("-Infinity".into()),
+        "4" => return Some("Infinity".into()),
+        "5" => return Some("NaN".into()),
+        "2" => return Some("0".into()),
+        "3" => (
+            false,
+            rest.get(..6)?.parse::<i64>().ok()?,
+            rest.get(6..)?.to_string(),
+        ),
+        "1" => {
+            let digits = rest.get(6..)?.strip_suffix(':')?;
+            let place = 999_999 - rest.get(..6)?.parse::<i64>().ok()?;
+            let digits = digits
+                .bytes()
+                .map(|c| (b'9' - (c - b'0')) as char)
+                .collect::<String>();
+            (true, place, digits)
+        }
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // The first digit's power of ten.
+    let top = place - 500_000;
+    let mut out = String::from(if negative { "-" } else { "" });
+    if top < 0 {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', (-top - 1) as usize));
+        out.push_str(&digits);
+    } else {
+        let whole = (top + 1) as usize;
+        if digits.len() <= whole {
+            out.push_str(&digits);
+            out.extend(std::iter::repeat_n('0', whole - digits.len()));
+        } else {
+            out.push_str(&digits[..whole]);
+            out.push('.');
+            out.push_str(&digits[whole..]);
+        }
+    }
+    Some(out)
+}
+
 /// The key NaN takes in a numeric(p, s) column, beside its integers: `10^p`, the least past its
 /// digits.
 pub fn nan_units(precision: u8) -> i128 {

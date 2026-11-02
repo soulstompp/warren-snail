@@ -505,6 +505,26 @@ pub fn inet_in(s: &str, cidr: bool) -> Result<String> {
     Ok(read(s, cidr)?.out(cidr))
 }
 
+/// An inet's text, or where `cidr` a cidr's, from its key as `inet_key` writes it; none where it is
+/// no such key.
+pub fn inet_of_key(key: &[u8], cidr: bool) -> Option<String> {
+    let v6 = match key.first()? {
+        4 => false,
+        6 => true,
+        _ => return None,
+    };
+    let bits = key[1..].iter().position(|&b| b == 0)?;
+    let bytes = &key[2 + bits..];
+    let mut v = Inet {
+        v6,
+        bits: u8::try_from(bits).ok()?,
+        addr: [0; 16],
+    };
+    (bytes.len() == v.size() && bits <= 8 * v.size()).then_some(())?;
+    v.addr[..bytes.len()].copy_from_slice(bytes);
+    Some(v.out(cidr))
+}
+
 /// The key of an inet or a cidr: its family, 4 before 6; each bit of its address up to its mask, a
 /// byte each, 1 for a zero bit and 2 for a one; a zero; then its address's bytes. Its keys sort as
 /// `network_cmp` orders the values, and are equal where it finds them equal.

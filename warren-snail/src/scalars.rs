@@ -615,6 +615,15 @@ pub fn float4_key(bits: u32) -> i64 {
     i64::from(if s >= 0 { s } else { s ^ 0x7fff_ffff })
 }
 
+/// A real's bits from its key: `0` for the class of `-0` and `0`, the quiet NaN for every NaN's.
+pub fn float4_of_key(key: i64) -> u32 {
+    if key == 0x7f80_0001 {
+        return f32::NAN.to_bits();
+    }
+    let s = key as i32;
+    (if s >= 0 { s } else { s ^ 0x7fff_ffff }) as u32
+}
+
 /// The key of a double precision's bits, as `float4_key` keys a real's.
 pub fn float8_key(bits: u64) -> i64 {
     if f64::from_bits(bits).is_nan() {

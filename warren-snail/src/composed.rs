@@ -437,6 +437,96 @@ fn key_into(out: &mut Vec<u8>, ty: ColumnType, item: &Item) {
     }
 }
 
+/// A value of a type keyed by bytes from those bytes, as `scalar_key` and a level of the type key
+/// it: a string's text, bytea's or a bit string's bytes, a numeric's, a jsonb's, an inet's or a
+/// cidr's text from its class's key; none for any other type held as its text, whose key is no text
+/// of it.
+pub fn scalar_of_key_bytes(ty: ColumnType, b: &[u8]) -> Option<Datum> {
+    use crate::textual::Textual;
+    match crate::values::Values::new(ty) {
+        crate::values::Values::Text(_) => Some(Datum::Text(match ty {
+            ColumnType::NumericText(_) => {
+                crate::numeric::text_of_class(std::str::from_utf8(b).ok()?)?
+            }
+            ColumnType::Textual(Textual::Jsonb) => crate::jsonb::jsonb_of_key(b)?,
+            ColumnType::Textual(t @ (Textual::Inet | Textual::Cidr)) => {
+                crate::inet::inet_of_key(b, t == Textual::Cidr)?
+            }
+            ColumnType::Textual(_) | ColumnType::Internal(_) => return None,
+            _ => String::from_utf8(b.to_vec()).ok()?,
+        })),
+        crate::values::Values::Utf8(_) if !matches!(ty, ColumnType::Geometric(_)) => {
+            Some(Datum::Bytes(b.to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// A value of an element type from its key at `at`, as `scalar_key` writes it, `at` moved past it;
+/// none where the key does not name one value of it.
+fn scalar_of_key(ty: ColumnType, key: &[u8], at: &mut usize) -> Option<Datum> {
+    use crate::values::Values;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let b = key.get(*at..*at + n)?;
+        *at += n;
+        Some(b)
+    };
+    let wide = |b: &[u8]| (u128::from_be_bytes(b.try_into().unwrap()) ^ (1 << 127)) as i128;
+    let narrow = |b: &[u8]| (u64::from_be_bytes(b.try_into().unwrap()) ^ (1 << 63)) as i64;
+    Some(match Values::new(ty) {
+        Values::Int(_) => Datum::Int(narrow(take(8)?)),
+        Values::Float4(_) => Datum::Float4(crate::scalars::float4_of_key(narrow(take(8)?))),
+        Values::Float8(_) => {
+            Datum::Float8(crate::places::float8_of_key(narrow(take(8)?)).to_bits())
+        }
+        Values::Wide(_) => Datum::Wide(wide(take(16)?)),
+        Values::Interval(_) => Datum::Interval(crate::times::Interval::of_total(wide(take(16)?))),
+        Values::Text(_) | Values::Utf8(_) => {
+            let (part, rest) = crate::places::split_varying(key.get(*at..)?);
+            *at = key.len() - rest.len();
+            scalar_of_key_bytes(ty, &part)?
+        }
+        _ => return None,
+    })
+}
+
+/// An array of `ty` from its key, as `key` writes it: its elements, each a value of an element type
+/// whose key names one value; none for any other composed value.
+pub fn item_of_key(ty: ColumnType, key: &[u8]) -> Option<Item> {
+    let ColumnType::Composed(r) = ty else {
+        return None;
+    };
+    let Composed::Array { element, .. } = r.def() else {
+        return None;
+    };
+    let mut at = 0;
+    let mut elements = Vec::new();
+    loop {
+        let mark = *key.get(at)?;
+        at += 1;
+        match mark {
+            0 => break,
+            1 => elements.push(Item::Scalar(scalar_of_key(*element, key, &mut at)?)),
+            2 => elements.push(Item::Null),
+            _ => return None,
+        }
+    }
+    let n = *key.get(at)? as usize;
+    at += 1;
+    let mut read = || -> Option<i32> {
+        let b = key.get(at..at + 4)?;
+        at += 4;
+        Some((u32::from_be_bytes(b.try_into().unwrap()) ^ (1 << 31)) as i32)
+    };
+    let dims = (0..n).map(|_| read()).collect::<Option<Vec<i32>>>()?;
+    let lower = (0..n).map(|_| read()).collect::<Option<Vec<i32>>>()?;
+    (at == key.len()).then_some(Item::Array {
+        elements,
+        dims,
+        lower,
+    })
+}
+
 fn range_key(
     out: &mut Vec<u8>,
     subtype: ColumnType,

@@ -163,7 +163,10 @@ const GAPS: &str = "CREATE TABLE s.g (id bigint NOT NULL, g integer NOT NULL, d 
 /// Row `i`'s g: ten values ten apart, 2,000 rows each; its d: five values a week apart, the last
 /// the rarest.
 fn gap_of(i: i64) -> (i64, i64) {
-    (10 * (i / 2000), 18_000 + 7 * [0, 0, 1, 1, 2, 2, 3, 3, 3, 4][(i % 10) as usize])
+    (
+        10 * (i / 2000),
+        18_000 + 7 * [0, 0, 1, 1, 2, 2, 3, 3, 3, 4][(i % 10) as usize],
+    )
 }
 
 /// A level whose places each fill blocks of their own, the next block's value never the next
@@ -194,7 +197,10 @@ fn places_apart_are_counted_exactly_from_the_leaves_least_and_greatest() {
             ("g", plain((0..ROWS).map(|i| gap_of(i).0))),
             ("d", plain((0..ROWS).map(|i| gap_of(i).1))),
         ] {
-            let l = snail.level_counts("s.g", column, u64::MAX).unwrap().unwrap();
+            let l = snail
+                .level_counts("s.g", column, u64::MAX)
+                .unwrap()
+                .unwrap();
             assert!(l.whole, "{format} {column}: {l:?}");
             let counted: BTreeMap<i64, u64> = keyed(&l)
                 .into_iter()
@@ -388,4 +394,196 @@ fn dead_rows_are_no_place_s_and_new_rows_may_be_any_of_their_block_s() {
         let n = held[&v];
         assert!(low <= n && n <= high, "{v}: {low} {n} {high}");
     }
+}
+
+const KINDS: &str = "CREATE TABLE s.k (id bigint NOT NULL, t text NOT NULL, b bytea NOT NULL, \
+                     u uuid NOT NULL, n numeric(10, 2) NOT NULL, x numeric NOT NULL, \
+                     z timestamptz NOT NULL, d date NOT NULL, v interval NOT NULL, \
+                     f real NOT NULL, g double precision NOT NULL, j jsonb NOT NULL, \
+                     a inet NOT NULL, r integer[] NOT NULL, PRIMARY KEY (id));";
+
+/// Each column of `KINDS` but its key, with its five values written as PostgreSQL reads them.
+const VALUES: [(&str, [&str; 5]); 13] = [
+    (
+        "t",
+        [
+            "a station past eight bytes",
+            "another long name",
+            "b",
+            "café du coin",
+            "zz top of the list",
+        ],
+    ),
+    (
+        "b",
+        [
+            "\\x00",
+            "\\x0001",
+            "\\xdeadbeef00112233aa",
+            "\\xff",
+            "\\xffff",
+        ],
+    ),
+    (
+        "u",
+        [
+            "00000000-0000-0000-0000-000000000000",
+            "0f0e0d0c-0b0a-0908-0706-050403020100",
+            "7fffffff-ffff-ffff-ffff-ffffffffffff",
+            "80000000-0000-0000-0000-000000000001",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ],
+    ),
+    ("n", ["-1.25", "0.00", "3.10", "12.50", "99999.99"]),
+    (
+        "x",
+        [
+            "-0.5",
+            "0",
+            "0.0000001",
+            "12.5",
+            "123456789012345678901234567890",
+        ],
+    ),
+    (
+        "z",
+        [
+            "-infinity",
+            "1999-12-31 23:59:59.5+00",
+            "2020-02-29 12:00:00+00",
+            "2026-11-02 00:00:00+00",
+            "infinity",
+        ],
+    ),
+    (
+        "d",
+        [
+            "-infinity",
+            "0001-01-01",
+            "2000-01-01",
+            "2026-11-02",
+            "infinity",
+        ],
+    ),
+    (
+        "v",
+        [
+            "-1 days",
+            "00:00:01",
+            "1 day 02:00:00",
+            "3 days",
+            "29 days 23:59:59",
+        ],
+    ),
+    ("f", ["-1.5", "0", "0.1", "3.25", "NaN"]),
+    (
+        "g",
+        ["-Infinity", "-2.5", "0", "1e+300", "3.141592653589793"],
+    ),
+    (
+        "j",
+        [
+            "null",
+            "1",
+            "\"text\"",
+            "[1, 2, \"three\"]",
+            "{\"a\": 1, \"b\": [true, false]}",
+        ],
+    ),
+    (
+        "a",
+        [
+            "10.0.0.0/8",
+            "10.1.2.3",
+            "192.168.0.1/24",
+            "::1",
+            "2001:db8::/32",
+        ],
+    ),
+    ("r", ["{}", "{1}", "{1,2,3}", "{NULL,2}", "[0:1]={5,6}"]),
+];
+
+/// Which of its column's five values row `i` holds: the fourth the commonest, the fifth the rarest.
+fn kind_of(i: i64) -> usize {
+    [0, 0, 1, 1, 2, 2, 3, 3, 3, 4][(i % 10) as usize]
+}
+
+/// A snail of `KINDS`, an index leading with each column but its key.
+fn kinds(name: &str) -> std::path::PathBuf {
+    let mut ddl = KINDS.to_string();
+    for (c, _) in VALUES {
+        ddl.push_str(&format!("\nCREATE INDEX k_{c} ON s.k ({c}, id);"));
+    }
+    let catalog = Catalog::parse(&ddl).unwrap();
+    let table = catalog.table("s.k").unwrap();
+    let mut columns = vec![Values::Int((0..ROWS).map(Some).collect())];
+    for (c, texts) in VALUES {
+        let ty = table.columns.iter().find(|x| x.name == c).unwrap().ty;
+        let mut v = Values::new(ty);
+        for i in 0..ROWS {
+            let d = warren_snail::composed::scalar_in(ty, texts[kind_of(i)]).unwrap();
+            warren_snail::values::push_datum(&mut v, &d);
+        }
+        columns.push(v);
+    }
+    let path = tmp(name);
+    write(&path, &catalog, &[("s.k".into(), Rows { columns })]).unwrap();
+    path
+}
+
+/// Every type's level names its values: each place's key, read back as the column's own value,
+/// is one of the values written, with as many rows as it was written on, each counted exactly.
+#[test]
+fn each_type_s_places_name_its_values_in_the_column_s_own_form() {
+    let path = kinds("level-kinds.snail");
+    let snail = fresh(&path);
+    let catalog = Catalog::parse(KINDS).unwrap();
+    let table = catalog.table("s.k").unwrap();
+    for (c, texts) in VALUES {
+        let column = table.columns.iter().find(|x| x.name == c).unwrap();
+        let out = |t: &str| {
+            warren_snail::composed::scalar_out(
+                column.ty,
+                &warren_snail::composed::scalar_in(column.ty, t).unwrap(),
+            )
+        };
+        let mut held: BTreeMap<String, u64> = BTreeMap::new();
+        for i in 0..ROWS {
+            *held.entry(out(texts[kind_of(i)])).or_insert(0) += 1;
+        }
+        let l = snail.level_counts("s.k", c, u64::MAX).unwrap().unwrap();
+        assert!(l.whole, "{c}: {l:?}");
+        let counted: BTreeMap<String, u64> = l
+            .places
+            .unwrap()
+            .iter()
+            .map(|p| {
+                assert_eq!((p.low, p.run), (p.high, p.high), "{c} {:?}", p.key);
+                let d = warren_snail::read::held_of_key(column, &p.key)
+                    .unwrap_or_else(|| panic!("{c}: {:?} names no value", p.key));
+                (warren_snail::composed::scalar_out(column.ty, &d), p.low)
+            })
+            .collect();
+        assert_eq!(counted, held, "{c}");
+    }
+}
+
+/// A text past 8 bytes at a block's end is counted exactly only where that block's last page is
+/// read within the pages given: given every page the count reads, every place is exact; given fewer,
+/// a count whose page maps were all read lists its places, some bracketed.
+#[test]
+fn a_long_text_at_a_block_s_end_is_exact_only_where_its_last_page_is_read() {
+    let path = kinds("level-long.snail");
+    let snail = fresh(&path);
+    let full = snail.level_counts("s.k", "t", u64::MAX).unwrap().unwrap();
+    assert!(full.whole, "{full:?}");
+    let mut bracketed = false;
+    let mut was_whole = false;
+    for pages in 0..=full.directory_pages {
+        let l = snail.level_counts("s.k", "t", pages).unwrap().unwrap();
+        assert!(!was_whole || l.whole, "{pages}");
+        was_whole = l.whole;
+        bracketed |= l.places.is_some() && !l.whole;
+    }
+    assert!(was_whole && bracketed);
 }
