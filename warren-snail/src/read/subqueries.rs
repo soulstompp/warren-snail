@@ -7,7 +7,7 @@
 
 use super::pipeline::{self, Casings, Computed, Frame, Key, Value};
 use super::question::Question;
-use super::relations::{self, Accrued, Asked, Col, Outer, Reads, Steps};
+use super::relations::{self, Accrued, Asked, Col, Made, Outer, Reads, Steps};
 use super::spill::{Rows, Run};
 use super::typed::Types;
 use super::Round;
@@ -33,6 +33,12 @@ pub(super) struct Kept {
     around_held: RefCell<Option<crate::room::Holding>>,
     /// Each question's rows, kept in the round's room as they are read.
     places: RefCell<HashMap<String, Rows>>,
+    /// Whether its answers may be made in the order of a hash of what ties it to the query around
+    /// it: it is one step, answered for each set of values once.
+    pub(super) in_order: std::cell::Cell<bool>,
+    /// Whether a kept table found past the room asks for that: its rows of the keys that hash lowest
+    /// are held, so the answers are made now, lowest first.
+    pub(super) answers_now: std::cell::Cell<bool>,
 }
 
 /// The snail's tables read through what a subquery keeps: each question from the file once, then
@@ -107,22 +113,128 @@ enum Asks<'q> {
     },
 }
 
-/// The rows a subquery returned, and the keys of its one column, where an = compares by them.
+/// The rows a subquery returned: those its place reads, held; past the room, in a place of their own,
+/// read a chunk at a time by each row that asks; and the keys of its one column, where an = compares
+/// by them and they fit the room.
 struct Returned {
     rows: Vec<Vec<Value>>,
-    keys: OnceCell<(HashSet<Key>, bool)>,
+    past: Option<Rows>,
+    keys: OnceCell<Option<(HashSet<Key>, bool, crate::room::Holding)>>,
     /// What they hold in the round's room.
     _held: crate::room::Holding,
 }
 
 impl Returned {
-    fn new(rows: Vec<Vec<Value>>) -> Rc<Returned> {
+    fn of(asks: &Asks, m: Made) -> Result<Rc<Returned>> {
+        let rows = m.into_rows()?;
+        let most = match asks {
+            Asks::Exists { .. } => Some(1),
+            Asks::Scalar => Some(2),
+            Asks::Compared { .. } => None,
+        };
+        let (held, past) = match most {
+            Some(n) => (rows.first(n)?, None),
+            None if rows.held_whole() => (rows.all()?, None),
+            None => (Vec::new(), Some(rows)),
+        };
+        Ok(Rc::new(Returned {
+            _held: crate::room::holding(super::spill::rows_width(&held)),
+            rows: held,
+            past,
+            keys: OnceCell::new(),
+        }))
+    }
+
+    fn of_rows(rows: Vec<Vec<Value>>) -> Rc<Returned> {
         Rc::new(Returned {
             _held: crate::room::holding(super::spill::rows_width(&rows)),
             rows,
+            past: None,
             keys: OnceCell::new(),
         })
     }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.past.is_none()
+    }
+
+    /// The keys of its one column, and whether a NULL lies among them; none where they do not fit
+    /// the room.
+    fn keys(&self) -> Option<(&HashSet<Key>, bool)> {
+        let built = self.keys.get_or_init(|| {
+            let mut held = crate::room::holding(0);
+            let mut keys = HashSet::new();
+            let mut nulls = false;
+            let mut add = |c: &[Vec<Value>]| -> bool {
+                for r in c {
+                    match r[0].is_null() {
+                        true => nulls = true,
+                        false => {
+                            if !held.fits(super::spill::width(&r[0])) {
+                                return false;
+                            }
+                            keys.insert(pipeline::key(&r[0]));
+                        }
+                    }
+                }
+                true
+            };
+            let fits = match &self.past {
+                None => {
+                    // Held already: its keys are counted beside its rows.
+                    add(&self.rows)
+                }
+                Some(rows) => {
+                    let mut fits = true;
+                    let read = rows.each_chunk(&mut |c| {
+                        fits = fits && add(&c);
+                        Ok(())
+                    });
+                    fits && read.is_ok()
+                }
+            };
+            fits.then_some((keys, nulls, held))
+        });
+        built.as_ref().map(|(k, n, _)| (k, *n))
+    }
+
+    /// `one` read on its rows, chunk by chunk past the room: as `any` or all of its rows comparing so
+    /// would be.
+    fn compared(
+        &self,
+        any: bool,
+        one: &mut dyn FnMut(&[Vec<Value>]) -> Result<Value>,
+    ) -> Result<Value> {
+        let Some(rows) = &self.past else {
+            return one(&self.rows);
+        };
+        let mut unknown = false;
+        let mut decided = None;
+        rows.each_chunk(&mut |c| {
+            if decided.is_none() {
+                match one(&c)? {
+                    Value::Bool(b) if b == any => decided = Some(b),
+                    Value::Bool(_) => {}
+                    _ => unknown = true,
+                }
+            }
+            Ok(())
+        })?;
+        Ok(match decided {
+            Some(b) => Value::Bool(b),
+            None if unknown => Value::Null,
+            None => Value::Bool(!any),
+        })
+    }
+}
+
+/// Answers past the room, a subquery's for each set of values, where its kept table's rows are
+/// gone by the time a row asks: written once, and read back for each row that asks.
+#[derive(Default)]
+struct Answers {
+    run: Option<Run>,
+    at: HashMap<String, (u64, u32)>,
+    _held: Option<crate::room::Holding>,
 }
 
 /// A subquery of a step, as its place asks it.
@@ -139,6 +251,9 @@ struct Plan<'q> {
     /// values of what it names.
     once: RefCell<Option<Rc<Returned>>>,
     by_values: RefCell<HashMap<String, Rc<Returned>>>,
+    /// Those past the room, and each refused for a set of values, said when a row asks.
+    written: RefCell<Answers>,
+    refused: RefCell<HashMap<String, String>>,
     kept: Kept,
 }
 
@@ -339,7 +454,14 @@ impl<'q> Plan<'q> {
             reads_around,
             once: RefCell::new(None),
             by_values: RefCell::new(HashMap::new()),
-            kept: Kept::default(),
+            written: RefCell::default(),
+            refused: RefCell::default(),
+            kept: Kept {
+                in_order: std::cell::Cell::new(
+                    query.with.is_none() && matches!(query.body.as_ref(), SetExpr::Select(_)),
+                ),
+                ..Kept::default()
+            },
         })
     }
 }
@@ -353,6 +475,41 @@ pub(super) struct Subs<'a, 'q> {
     /// The step's columns, those of the query around it among them.
     columns: &'a [Col],
     accrued: &'a Accrued,
+}
+
+impl Kept {
+    /// Each set of values `rows` give, `of` read on each, where they fit the room.
+    pub(super) fn foresee(
+        &self,
+        rows: &Rows,
+        of: &mut dyn FnMut(&[Value]) -> Vec<Value>,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut sets = Vec::new();
+        let mut held = crate::room::holding(0);
+        let mut over = false;
+        rows.each_chunk(&mut |c| {
+            for r in &c {
+                if over {
+                    break;
+                }
+                let set = of(r);
+                if seen.insert(set.iter().map(pipeline::key).collect::<Vec<Key>>()) {
+                    if !held.fits(2 * super::spill::row_width(&set)) {
+                        over = true;
+                        break;
+                    }
+                    sets.push(set);
+                }
+            }
+            Ok(())
+        })?;
+        if !over {
+            *self.around.borrow_mut() = Some(sets);
+            *self.around_held.borrow_mut() = Some(held);
+        }
+        Ok(())
+    }
 }
 
 impl<'a, 'q> Subs<'a, 'q> {
@@ -381,30 +538,8 @@ impl<'a, 'q> Subs<'a, 'q> {
             let Some(places) = &plan.around else {
                 continue;
             };
-            let mut seen = HashSet::new();
-            let mut sets = Vec::new();
-            let mut held = crate::room::holding(0);
-            let mut over = false;
-            rows.each_chunk(&mut |c| {
-                for r in &c {
-                    if over {
-                        break;
-                    }
-                    let set: Vec<Value> = places.iter().map(|&i| r[i].clone()).collect();
-                    if seen.insert(set.iter().map(pipeline::key).collect::<Vec<Key>>()) {
-                        if !held.fits(2 * super::spill::row_width(&set)) {
-                            over = true;
-                            break;
-                        }
-                        sets.push(set);
-                    }
-                }
-                Ok(())
-            })?;
-            if !over {
-                *plan.kept.around.borrow_mut() = Some(sets);
-                *plan.kept.around_held.borrow_mut() = Some(held);
-            }
+            plan.kept
+                .foresee(rows, &mut |r| places.iter().map(|&i| r[i].clone()).collect())?;
         }
         Ok(())
     }
@@ -412,36 +547,70 @@ impl<'a, 'q> Subs<'a, 'q> {
     /// What a subquery returns for a row: once, where it reads nothing of the query around it; else
     /// for the values the row gives what it names, the query around it read from those alone.
     fn returned(&self, plan: &Plan, row: &[Value]) -> Result<Rc<Returned>> {
+        let asked = Asked {
+            answer_kept: true,
+            ..self.asked
+        };
         let Some(places) = &plan.around else {
             if let Some(r) = plan.once.borrow().as_ref() {
                 return Ok(r.clone());
             }
-            let (m, _) = relations::made_by(
-                self.asked,
-                plan.query,
-                self.made,
-                self.casings,
-                None,
-                self.accrued,
-            )?;
-            let r = Returned::new(m.rel.rows);
+            let (m, _) =
+                relations::made_by(asked, plan.query, self.made, self.casings, None, self.accrued)?;
+            let r = Returned::of(&plan.asks, m)?;
             *plan.once.borrow_mut() = Some(r.clone());
             return Ok(r);
         };
-        let key = places
-            .iter()
-            .map(|&i| format!("{:?}", row[i]))
-            .collect::<Vec<_>>()
-            .join("\0");
-        if let Some(r) = plan.by_values.borrow().get(&key) {
-            return Ok(r.clone());
+        let values: Vec<Value> = places.iter().map(|&i| row[i].clone()).collect();
+        let key = values_key(&values);
+        if let Some(r) = self.answered(plan, &key)? {
+            return Ok(r);
         }
+        let r = self.answer_for(plan, values)?;
+        if plan.kept.answers_now.replace(false) {
+            // Its table lies past the room: every answer is made now, in the order of its rows.
+            let sets = plan.kept.around.borrow().clone().unwrap_or_default();
+            for set in sets {
+                let k = values_key(&set);
+                match self.answer_for(plan, set) {
+                    Ok(r) => self.keep_answer(plan, k, r, true)?,
+                    Err(e) => {
+                        plan.refused.borrow_mut().insert(k, e.to_string());
+                    }
+                }
+            }
+            return self
+                .answered(plan, &key)?
+                .ok_or_else(|| Error::new("a subquery's answer was not foreseen"));
+        }
+        self.keep_answer(plan, key, r.clone(), false)?;
+        Ok(r)
+    }
+
+    /// The answer kept for a set of values, read back where it was written.
+    fn answered(&self, plan: &Plan, key: &str) -> Result<Option<Rc<Returned>>> {
+        if let Some(r) = plan.by_values.borrow().get(key) {
+            return Ok(Some(r.clone()));
+        }
+        if let Some(e) = plan.refused.borrow().get(key) {
+            return Err(Error::new(e.clone()));
+        }
+        let written = plan.written.borrow();
+        let (Some(run), Some(&(at, n))) = (&written.run, written.at.get(key)) else {
+            return Ok(None);
+        };
+        Ok(Some(Returned::of_rows(run.read_at(at, n)?)))
+    }
+
+    /// The subquery made for a set of values.
+    fn answer_for(&self, plan: &Plan, values: Vec<Value>) -> Result<Rc<Returned>> {
+        let places = plan.around.as_ref().expect("a subquery reading around it");
         let outer = Outer {
             columns: places
                 .iter()
                 .map(|&i| relations::marked(&self.columns[i]))
                 .collect(),
-            values: places.iter().map(|&i| row[i].clone()).collect(),
+            values,
             kept: &plan.kept,
         };
         let cached = Cached {
@@ -450,6 +619,7 @@ impl<'a, 'q> Subs<'a, 'q> {
         };
         let asked = Asked {
             reads: &cached,
+            answer_kept: true,
             ..self.asked
         };
         let (m, _) = relations::made_by(
@@ -460,10 +630,42 @@ impl<'a, 'q> Subs<'a, 'q> {
             Some(&outer),
             self.accrued,
         )?;
-        let r = Returned::new(m.rel.rows);
-        plan.by_values.borrow_mut().insert(key, r.clone());
-        Ok(r)
+        Returned::of(&plan.asks, m)
     }
+
+    /// An answer kept for the rows that ask for its values again, where the room has room for it;
+    /// past it, written where nothing could make it again, else made again for each that asks.
+    fn keep_answer(&self, plan: &Plan, key: String, r: Rc<Returned>, must: bool) -> Result<()> {
+        if crate::room::current().is_none_or(|room| !room.over()) {
+            plan.by_values.borrow_mut().insert(key, r);
+            return Ok(());
+        }
+        if !must {
+            return Ok(());
+        }
+        let mut written = plan.written.borrow_mut();
+        let w = &mut *written;
+        let run = w.run.get_or_insert_with(Run::past);
+        let rows = match &r.past {
+            Some(p) => p.all()?,
+            None => r.rows.clone(),
+        };
+        let at = run.write_at(&rows)?;
+        w._held
+            .get_or_insert_with(|| crate::room::holding(0))
+            .more(key.len() as u64 + 12);
+        w.at.insert(key, (at, rows.len() as u32));
+        Ok(())
+    }
+}
+
+/// A set of values, as answers are kept by.
+fn values_key(values: &[Value]) -> String {
+    values
+        .iter()
+        .map(|v| format!("{v:?}"))
+        .collect::<Vec<_>>()
+        .join("\0")
 }
 
 /// A truth's negation, NULL staying NULL.
@@ -552,7 +754,7 @@ impl pipeline::Subqueries for Subs<'_, '_> {
                     "more than one row returned by a subquery used as an expression",
                 )),
             },
-            Asks::Exists { negated } => Ok(Value::Bool(rows.is_empty() == *negated)),
+            Asks::Exists { negated } => Ok(Value::Bool(returned.is_empty() == *negated)),
             Asks::Compared {
                 left,
                 op,
@@ -565,40 +767,34 @@ impl pipeline::Subqueries for Subs<'_, '_> {
                             .iter()
                             .map(|x| pipeline::eval(x, row, frame, computed))
                             .collect::<Result<Vec<_>>>()?;
-                        rows_compared(op, &xs, lefts, rows, *any)?
+                        returned.compared(*any, &mut |c| rows_compared(op, &xs, lefts, c, *any))?
                     }
                     _ => {
                         let x = pipeline::eval(left, row, frame, computed)?;
                         let left_type = frame.types.get(&(*left as *const Expr)).copied();
-                        if *op == BinaryOperator::Eq && *any && keyed_alike(left_type, plan.first) {
-                            let (keys, nulls) = returned.keys.get_or_init(|| {
-                                let mut keys = HashSet::new();
-                                let mut nulls = false;
-                                for r in rows {
-                                    match r[0].is_null() {
-                                        true => nulls = true,
-                                        false => {
-                                            keys.insert(pipeline::key(&r[0]));
-                                        }
-                                    }
-                                }
-                                (keys, nulls)
-                            });
+                        let keyed = (*op == BinaryOperator::Eq
+                            && *any
+                            && keyed_alike(left_type, plan.first))
+                        .then(|| returned.keys())
+                        .flatten();
+                        if let Some((keys, nulls)) = keyed {
                             match () {
-                                _ if rows.is_empty() => Value::Bool(false),
+                                _ if returned.is_empty() => Value::Bool(false),
                                 _ if x.is_null() => Value::Null,
                                 _ if keys.contains(&pipeline::key(&x)) => Value::Bool(true),
-                                _ if *nulls => Value::Null,
+                                _ if nulls => Value::Null,
                                 _ => Value::Bool(false),
                             }
                         } else {
-                            pipeline::compared_each(
-                                op,
-                                x,
-                                rows.iter().map(|r| r[0].clone()),
-                                left,
-                                *any,
-                            )?
+                            returned.compared(*any, &mut |c| {
+                                pipeline::compared_each(
+                                    op,
+                                    x.clone(),
+                                    c.iter().map(|r| r[0].clone()),
+                                    left,
+                                    *any,
+                                )
+                            })?
                         }
                     }
                 };

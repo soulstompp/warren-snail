@@ -184,6 +184,16 @@ impl Room {
         true
     }
 
+    /// The bytes more rows may hold, the pages kept for later reads let go for them.
+    pub fn free_bytes(&self) -> u64 {
+        self.sizes.borrow().bytes.saturating_sub(self.held.get())
+    }
+
+    /// Whether the rows held are past the room.
+    pub fn over(&self) -> bool {
+        self.held.get() > self.sizes.borrow().bytes
+    }
+
     /// Rows held past the room, where a place holding them cannot write them: counted, so the most
     /// the round holds says so.
     pub fn hold_anyway(&self, bytes: u64) {

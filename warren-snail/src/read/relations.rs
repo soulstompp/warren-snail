@@ -103,6 +103,14 @@ impl Made {
         }
     }
 
+    /// Its rows as a place of their own.
+    pub(super) fn into_rows(self) -> Result<Rows> {
+        match self.kept {
+            Some(run) => Ok(run),
+            None => Rows::of(self.rel.rows),
+        }
+    }
+
     /// Its rows as a place.
     pub(super) fn rows_of(&self) -> Result<Rows> {
         match &self.kept {
@@ -124,6 +132,9 @@ pub(super) struct Asked<'a> {
     pub(super) params: &'a [String],
     pub(super) release: u8,
     pub(super) now: i64,
+    /// Whether what the question returns is read by the statement around it, so it lies in the
+    /// round's room.
+    pub(super) answer_kept: bool,
 }
 
 /// The columns of the queries around a subquery, each qualifier marked once more for each query
@@ -147,13 +158,280 @@ pub(super) fn marked(c: &Col) -> Col {
 }
 
 /// A step's FROM rows read once for every row a subquery is answered for, where they read nothing of
-/// the query around it, and their places by the keys of the =s that tie them to it.
+/// the query around it, by the keys of the =s that tie them to it. Where the room holds them, a hash
+/// over them; past it, the rows of the keys that hash lowest held and the others written, a pass at
+/// a time, where the answers come in that order; else each row that asks reads them a chunk at a
+/// time.
 pub(super) struct Parted {
-    rows: Vec<Vec<Value>>,
     order: Option<usize>,
-    index: Option<HashMap<Vec<pipeline::Key>, Vec<usize>>>,
-    /// What they hold in the round's room.
-    _held: crate::room::Holding,
+    held: PartedRows,
+}
+
+enum PartedRows {
+    Whole {
+        rows: Vec<Vec<Value>>,
+        index: Option<HashMap<Vec<pipeline::Key>, Vec<usize>>>,
+        _held: Option<pipeline::parted::Pass>,
+        _counted: crate::room::Holding,
+    },
+    Passes(std::cell::RefCell<Passes>),
+    Scanned(Rows),
+}
+
+struct Passes {
+    hashed: pipeline::parted::Parted,
+    pass: Option<pipeline::parted::Pass>,
+    index: HashMap<Vec<pipeline::Key>, Vec<usize>>,
+    begun: bool,
+}
+
+/// What ties a subquery's FROM rows to the query around it.
+struct Tie<'t, 'e> {
+    tied: &'t [(&'e Expr, &'e Expr)],
+    from: &'t From,
+    asked: Asked<'t>,
+    casings: &'t Casings,
+    types: &'t typed::Types,
+}
+
+impl Tie<'_, '_> {
+    fn frame(&self) -> pipeline::Frame<'_> {
+        pipeline::Frame {
+            columns: self.from.frame_columns(0, self.from.columns.len()),
+            params: self.asked.params,
+            release: self.asked.release,
+            casings: self.casings,
+            types: self.types,
+            now: self.asked.now,
+            subqueries: None,
+        }
+    }
+
+    /// The keys of a FROM row's columns the =s tie; none where one is NULL, which none meets.
+    fn of_row(&self, r: &[Value], frame: &pipeline::Frame) -> Result<Option<Vec<pipeline::Key>>> {
+        let none = pipeline::computed_none();
+        let mut row = r.to_vec();
+        row.resize(self.from.columns.len(), Value::Null);
+        let mut k = Vec::with_capacity(self.tied.len());
+        for (a, _) in self.tied {
+            let v = pipeline::eval(a, &row, frame, &none)?;
+            if v.is_null() {
+                return Ok(None);
+            }
+            k.push(pipeline::key(&v));
+        }
+        Ok(Some(k))
+    }
+
+    /// The key a set of values the row asking gives asks for; none where one is NULL.
+    fn of_values(
+        &self,
+        values: &[Value],
+        frame: &pipeline::Frame,
+    ) -> Result<Option<Vec<pipeline::Key>>> {
+        let none = pipeline::computed_none();
+        let mut row = vec![Value::Null; self.from.outer_at];
+        row.extend(values.iter().cloned());
+        let mut k = Vec::with_capacity(self.tied.len());
+        for (_, b) in self.tied {
+            let v = pipeline::eval(b, &row, frame, &none)?;
+            if v.is_null() {
+                return Ok(None);
+            }
+            k.push(pipeline::key(&v));
+        }
+        Ok(Some(k))
+    }
+
+    fn hash_of_row(&self, r: &[Value], frame: &pipeline::Frame) -> Result<u64> {
+        Ok(self
+            .of_row(r, frame)?
+            .map_or(0, |k| pipeline::parted::key_hash(&k, 0)))
+    }
+
+    /// Puts the sets of values the rows asking give in the order of their keys' hashes.
+    fn in_hash_order(&self, o: &Outer) -> Result<()> {
+        let frame = self.frame();
+        let mut around = o.kept.around.borrow_mut();
+        if let Some(sets) = around.as_mut() {
+            let mut hashed = Vec::with_capacity(sets.len());
+            for set in sets.drain(..) {
+                let h = self
+                    .of_values(&set, &frame)?
+                    .map_or(0, |k| pipeline::parted::key_hash(&k, 0));
+                hashed.push((h, set));
+            }
+            hashed.sort_by_key(|(h, _)| *h);
+            sets.extend(hashed.into_iter().map(|(_, s)| s));
+        }
+        Ok(())
+    }
+}
+
+impl Parted {
+    /// The rows `read` hands on, held as the room lets them be.
+    fn read(tie: &Tie, in_passes: bool, read: impl FnOnce(Each) -> Result<()>) -> Result<Parted> {
+        let mut order = None;
+        let frame = tie.frame();
+        let index_of = |rows: &[&Vec<Value>]| -> Result<_> {
+            let mut index: HashMap<Vec<pipeline::Key>, Vec<usize>> = HashMap::new();
+            for (i, r) in rows.iter().enumerate() {
+                if let Some(k) = tie.of_row(r, &frame)? {
+                    index.entry(k).or_default().push(i);
+                }
+            }
+            Ok(index)
+        };
+        if in_passes {
+            let mut hashed = pipeline::parted::Parted::new();
+            read(&mut |c, at| {
+                order = at;
+                for r in c {
+                    hashed.push(tie.hash_of_row(&r, &frame)?, r)?;
+                }
+                Ok(())
+            })?;
+            let pass = hashed.pass(&mut |r| tie.hash_of_row(r, &frame))?;
+            let held = match pass {
+                Some(p) if p.below.is_none() => {
+                    let rows: Vec<Vec<Value>> = p.rows.iter().map(|(_, r)| r.clone()).collect();
+                    let refs: Vec<&Vec<Value>> = rows.iter().collect();
+                    let index = Some(index_of(&refs)?);
+                    PartedRows::Whole {
+                        rows,
+                        index,
+                        _held: Some(p),
+                        _counted: crate::room::holding(0),
+                    }
+                }
+                None => PartedRows::Whole {
+                    rows: Vec::new(),
+                    index: Some(HashMap::new()),
+                    _held: None,
+                    _counted: crate::room::holding(0),
+                },
+                pass => {
+                    let index = match &pass {
+                        Some(p) => {
+                            let refs: Vec<&Vec<Value>> = p.rows.iter().map(|(_, r)| r).collect();
+                            index_of(&refs)?
+                        }
+                        None => HashMap::new(),
+                    };
+                    PartedRows::Passes(std::cell::RefCell::new(Passes {
+                        hashed,
+                        pass,
+                        index,
+                        begun: true,
+                    }))
+                }
+            };
+            return Ok(Parted { order, held });
+        }
+        let run = Run::new();
+        read(&mut |c, at| {
+            order = at;
+            c.into_iter().try_for_each(|r| run.push(r))
+        })?;
+        run.seal()?;
+        let rows = Rows::one(run);
+        if !rows.held_whole() {
+            return Ok(Parted {
+                order,
+                held: PartedRows::Scanned(rows),
+            });
+        }
+        let index = match tie.tied.is_empty() {
+            true => None,
+            false => Some(rows.with_held(|r| index_of(r))?),
+        };
+        let all = rows.all()?;
+        let _counted = crate::room::holding(super::spill::rows_width(&all));
+        Ok(Parted {
+            order,
+            held: PartedRows::Whole {
+                rows: all,
+                index,
+                _held: None,
+                _counted,
+            },
+        })
+    }
+
+    fn in_passes(&self) -> bool {
+        matches!(self.held, PartedRows::Passes(_))
+    }
+
+    /// Hands `feed` the rows a row of the query around it meets, where it gives `o`'s values.
+    fn rows_for(
+        &self,
+        tie: &Tie,
+        o: &Outer,
+        feed: &mut dyn FnMut(Vec<Vec<Value>>, Option<usize>) -> Result<()>,
+    ) -> Result<()> {
+        let frame = tie.frame();
+        let asked = match tie.tied.is_empty() {
+            true => None,
+            false => Some(tie.of_values(&o.values, &frame)?),
+        };
+        match &self.held {
+            PartedRows::Whole { rows, index, .. } => match (index, asked) {
+                (Some(index), Some(k)) => {
+                    let found = k.and_then(|k| index.get(&k));
+                    let rows = found.map_or(Vec::new(), |at| {
+                        at.iter().map(|&i| rows[i].clone()).collect()
+                    });
+                    feed(rows, self.order)
+                }
+                _ => feed(rows.clone(), self.order),
+            },
+            PartedRows::Passes(p) => {
+                let Some(k) = asked.flatten() else {
+                    return feed(Vec::new(), self.order);
+                };
+                let hash = pipeline::parted::key_hash(&k, 0);
+                let mut p = p.borrow_mut();
+                let p = &mut *p;
+                while p.begun
+                    && p.pass
+                        .as_ref()
+                        .is_some_and(|x| x.below.is_some_and(|b| hash >= b))
+                {
+                    p.pass = None;
+                    p.pass = p.hashed.pass(&mut |r| tie.hash_of_row(r, &frame))?;
+                    p.index.clear();
+                    if let Some(x) = &p.pass {
+                        for (i, (_, r)) in x.rows.iter().enumerate() {
+                            if let Some(k) = tie.of_row(r, &frame)? {
+                                p.index.entry(k).or_default().push(i);
+                            }
+                        }
+                    }
+                }
+                let rows = match (&p.pass, p.index.get(&k)) {
+                    (Some(x), Some(at)) => at.iter().map(|&i| x.rows[i].1.clone()).collect(),
+                    _ => Vec::new(),
+                };
+                feed(rows, self.order)
+            }
+            PartedRows::Scanned(rows) => {
+                let order = self.order;
+                rows.each_chunk(&mut |c| match &asked {
+                    None => feed(c, order),
+                    Some(None) => Ok(()),
+                    Some(Some(k)) => {
+                        let mut met = Vec::new();
+                        for r in c {
+                            if tie.of_row(&r, &frame)?.as_ref() == Some(k) {
+                                met.push(r);
+                            }
+                        }
+                        feed(met, order)
+                    }
+                })
+            }
+        }
+    }
 }
 
 /// The steps a question makes, in the order they are read: each WITH query, each relation lifted
@@ -1265,10 +1543,9 @@ impl Reading<'_> {
                 let rows = self.called(node, call, before)?;
                 each(rows, None)
             }
-            What::Lateral { at, .. } => {
-                let rows = self.laterally(node, *at, before)?;
-                each(rows, None)
-            }
+            What::Lateral { at, .. } => self
+                .laterally(node, *at, before)?
+                .each_chunk(&mut |c| each(c, None)),
             What::Join { .. } => self.joined(node, before, preserved, each),
         }
     }
@@ -1718,6 +1995,25 @@ impl Reading<'_> {
         Ok(())
     }
 
+    /// Before a LATERAL subquery is made for the rows before it: each set of values they give it,
+    /// which its tables are kept to the keys of, where they fit the room.
+    fn foresee_lateral(&self, node: &Node, rows: &Rows, prefix: &[Value]) -> Result<()> {
+        let What::Lateral { at, .. } = &node.what else {
+            return Ok(());
+        };
+        let kept = &self.laterals[*at].1;
+        if kept.around.borrow().is_some() {
+            return Ok(());
+        }
+        let around: &[Value] = self.outer.map_or(&[], |o| &o.values);
+        kept.foresee(rows, &mut |r| {
+            let mut set = prefix.to_vec();
+            set.extend(r.iter().cloned());
+            set.extend(around.iter().cloned());
+            set
+        })
+    }
+
     /// A LATERAL subquery's rows for the row before it, its columns and the query's around the
     /// step read as the query around it, each of its tables read from the file once.
     fn laterally(
@@ -1725,7 +2021,7 @@ impl Reading<'_> {
         node: &Node,
         at: usize,
         before: Option<(usize, &[Value])>,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<Rows> {
         let (start, row): (usize, &[Value]) = before.unwrap_or((node.at, &[]));
         let (q, kept) = &self.laterals[at];
         let mut columns: Vec<Col> = self.from.columns[start..start + row.len()]
@@ -1748,6 +2044,7 @@ impl Reading<'_> {
         };
         let asked = Asked {
             reads: &cached,
+            answer_kept: true,
             ..self.asked
         };
         let (m, _) = made_by(
@@ -1758,7 +2055,7 @@ impl Reading<'_> {
             Some(&outer),
             self.accrued,
         )?;
-        Ok(m.rel.rows)
+        m.into_rows()
     }
 
     /// A function's rows for the row before it, or for none where nothing comes before it.
@@ -2216,7 +2513,11 @@ fn image(
     under: &[Option<crate::catalog::Casing>],
     mut sides: [Rows; 2],
 ) -> Result<Rows> {
+    if !sides.iter().all(Rows::held_whole) {
+        sides.iter().try_for_each(Rows::write_held)?;
+    }
     let out = Run::new();
+    out.last_reader();
     let room = crate::room::current();
     loop {
         // Each distinct row, by its first coming, with how many times each arm holds it.
@@ -2288,6 +2589,8 @@ fn image(
         a.seal()?;
         b.seal()?;
         sides = [Rows::one(a), Rows::one(b)];
+        // The pass to come holds its image in the room, those rows made before it written.
+        out.write_held()?;
     }
     out.seal()?;
     Ok(Rows::one(out))
@@ -2411,6 +2714,7 @@ pub(super) fn answer(
         params,
         release: catalog.release,
         now: crate::scalars::transaction_clock(),
+        answer_kept: false,
     };
     let tables: Vec<&Table> = catalog.tables.iter().collect();
     let casings = Casings::of_tables(&tables, &catalog.collations);
@@ -2504,6 +2808,13 @@ pub(super) fn made_by(
         if theirs.contains(&i) {
             continue;
         }
+        for (n, left) in &readers {
+            if *left == 1 && read[i].contains(n) {
+                if let Some(rows) = making.made.get(n).and_then(|m| m.kept.as_ref()) {
+                    rows.last_reader();
+                }
+            }
+        }
         if steps[i].recursion.is_some() {
             let (before, rest) = steps.split_at_mut(i);
             let m = recursive::make(&mut making, &rest[0], before)?;
@@ -2518,8 +2829,10 @@ pub(super) fn made_by(
         .remove("")
         .ok_or_else(|| Error::new("the question returned nothing"))?;
     let mut last = Rc::try_unwrap(last).unwrap_or_else(|m| (*m).clone());
-    if let Some(rows) = last.kept.take() {
-        last.rel.rows = rows.all()?;
+    if !asked.answer_kept {
+        if let Some(rows) = last.kept.take() {
+            last.rel.rows = rows.all()?;
+        }
     }
     Ok((last, making.held))
 }
@@ -2771,6 +3084,7 @@ fn read_from(
     for (k, item) in rest.iter().enumerate() {
         reading.order = None;
         if item.lateral() {
+            reading.foresee_lateral(item, &rows, &[])?;
             let run = Run::new();
             rows.clone().each_chunk(&mut |c| {
                 for r in c {
@@ -3086,7 +3400,7 @@ fn select_step(
     let carried = p.carried.clone();
     // A step the steps after it read keeps its rows in the round's room as it makes them, those past
     // it written; the answer is the caller's.
-    let run_out = (!step.name.is_empty()).then(super::spill::Run::new);
+    let run_out = (!step.name.is_empty() || asked.answer_kept).then(super::spill::Run::new);
     let mut gathered: Vec<Vec<Value>> = Vec::new();
     let mut put = |rows: Vec<Vec<Value>>| -> Result<()> {
         match &run_out {
@@ -3133,78 +3447,62 @@ fn select_step(
         // met with each row by the =s that tie them.
         Some(o) => {
             let found = o.kept.rows.borrow().get(&step.name).cloned();
+            let tie = Tie {
+                tied: &tied,
+                from: &from,
+                asked,
+                casings,
+                types: &run_types,
+            };
             let parted = match found {
                 Some(p) => p,
                 None => {
                     let keeps = tied_keeps(&tied, &from, o, asked, casings, &run_types)?;
-                    let mut rows = Vec::new();
-                    let mut order = None;
-                    read_from(
-                        asked,
-                        &from,
-                        &ws,
-                        wheres,
-                        casings,
-                        &run_types,
-                        made,
-                        accrued,
-                        &step.laterals,
-                        outer,
-                        keeps,
-                        &mut |c, at| {
-                            order = at;
-                            rows.extend(c);
-                            Ok(())
-                        },
-                    )?;
-                    let index = match tied.is_empty() {
-                        true => None,
-                        false => Some(tie_index(&rows, &tied, &from, asked, casings, &run_types)?),
+                    let in_passes = !tied.is_empty()
+                        && o.kept.in_order.get()
+                        && o.kept.around.borrow().is_some()
+                        && o.kept.rows.borrow().is_empty();
+                    let read = |each: Each| {
+                        read_from(
+                            asked,
+                            &from,
+                            &ws,
+                            wheres.clone(),
+                            casings,
+                            &run_types,
+                            made,
+                            accrued,
+                            &step.laterals,
+                            outer,
+                            keeps.clone(),
+                            each,
+                        )
                     };
-                    let _held = crate::room::holding(super::spill::rows_width(&rows));
-                    let parted = Rc::new(Parted {
-                        rows,
-                        order,
-                        index,
-                        _held,
-                    });
+                    let parted = Rc::new(Parted::read(&tie, in_passes, read)?);
                     o.kept
                         .rows
                         .borrow_mut()
                         .insert(step.name.clone(), parted.clone());
+                    // Past the room, the answers are made in the order of the keys' hashes: this
+                    // row's among them.
+                    if parted.in_passes() {
+                        tie.in_hash_order(o)?;
+                        o.kept.answers_now.set(true);
+                        feed(Vec::new(), None)?;
+                        return Ok(Made::of(
+                            Relation {
+                                names: Vec::new(),
+                                rows: Vec::new(),
+                                order: None,
+                            },
+                            types,
+                            carried,
+                        ));
+                    }
                     parted
                 }
             };
-            let rows = match &parted.index {
-                Some(index) => {
-                    let frame = pipeline::Frame {
-                        columns: from.frame_columns(0, from.columns.len()),
-                        params,
-                        release,
-                        casings,
-                        types: &run_types,
-                        now,
-                        subqueries: None,
-                    };
-                    let none = pipeline::computed_none();
-                    let mut row = vec![Value::Null; from.outer_at];
-                    row.extend(o.values.iter().cloned());
-                    let mut k = Vec::with_capacity(tied.len());
-                    for (_, b) in &tied {
-                        let v = pipeline::eval(b, &row, &frame, &none)?;
-                        if v.is_null() {
-                            break;
-                        }
-                        k.push(pipeline::key(&v));
-                    }
-                    match (k.len() == tied.len()).then(|| index.get(&k)).flatten() {
-                        Some(at) => at.iter().map(|&i| parted.rows[i].clone()).collect(),
-                        None => Vec::new(),
-                    }
-                }
-                None => parted.rows.clone(),
-            };
-            feed(rows, parted.order)?;
+            parted.rows_for(&tie, o, &mut feed)?;
         }
         None => {
             let keeps = match arm_before {
@@ -3379,44 +3677,6 @@ fn arm_keeps(q: &Query, from: &From, before: &Made) -> Result<Vec<Keep>> {
     )?
     .into_iter()
     .collect())
-}
-
-/// The places of a subquery's FROM rows by the keys of the columns its =s tie to the query around
-/// it; a row with a NULL among them is met by none.
-fn tie_index(
-    rows: &[Vec<Value>],
-    tied: &[(&Expr, &Expr)],
-    from: &From,
-    asked: Asked,
-    casings: &Casings,
-    types: &typed::Types,
-) -> Result<HashMap<Vec<pipeline::Key>, Vec<usize>>> {
-    let frame = pipeline::Frame {
-        columns: from.frame_columns(0, from.columns.len()),
-        params: asked.params,
-        release: asked.release,
-        casings,
-        types,
-        now: asked.now,
-        subqueries: None,
-    };
-    let none = pipeline::computed_none();
-    let pad = vec![Value::Null; from.columns.len() - from.outer_at];
-    let mut index: HashMap<Vec<pipeline::Key>, Vec<usize>> = HashMap::new();
-    'rows: for (i, r) in rows.iter().enumerate() {
-        let mut row = r.clone();
-        row.extend(pad.iter().cloned());
-        let mut k = Vec::with_capacity(tied.len());
-        for (a, _) in tied {
-            let v = pipeline::eval(a, &row, &frame, &none)?;
-            if v.is_null() {
-                continue 'rows;
-            }
-            k.push(pipeline::key(&v));
-        }
-        index.entry(k).or_default().push(i);
-    }
-    Ok(index)
 }
 
 /// Whether a question reads what only the pipeline over several relations reads: no table, or more

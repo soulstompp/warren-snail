@@ -283,6 +283,8 @@ struct Stored {
     pages: Vec<(u64, u16)>,
     tail: Vec<u8>,
     spilled: usize,
+    /// The bytes all its rows are held at.
+    total: u64,
 }
 
 /// A place's rows: those the room holds, in order, then those past it, on the round's spill.
@@ -334,6 +336,7 @@ impl Run {
         self.width.set(row.len());
         let w = row_width(&row);
         let mut s = self.stored.borrow_mut();
+        s.total += w;
         let room = match &self.room {
             Some(r) => r,
             None => {
@@ -488,12 +491,62 @@ impl Run {
     }
 
     /// Every row, in order: those held, then those written, read back.
+    #[cfg(test)]
     pub(super) fn rows(&self) -> Result<Vec<Vec<Value>>> {
         let mut out = Vec::with_capacity(self.len());
         self.each_chunk(&mut |c| {
             out.extend(c);
             Ok(())
         })?;
+        Ok(out)
+    }
+
+    /// Writes `rows`, a place every row of which is written, and where they begin: read back whole
+    /// from there by `read_at`.
+    pub(super) fn write_at(&self, rows: &[Vec<Value>]) -> Result<u64> {
+        let at = {
+            let s = self.stored.borrow();
+            s.pages.len() as u64 * PAGE as u64 + s.tail.len() as u64
+        };
+        for r in rows {
+            self.push(r.clone())?;
+        }
+        Ok(at)
+    }
+
+    /// The `n` rows `write_at` wrote from `at`.
+    pub(super) fn read_at(&self, at: u64, n: u32) -> Result<Vec<Vec<Value>>> {
+        let s = self.stored.borrow();
+        let room = self.room.as_ref().expect("a run that writes has a room");
+        let width = self.width.get();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut next = (at / PAGE as u64) as usize;
+        let mut from = (at % PAGE as u64) as usize;
+        let mut page = vec![0u8; PAGE];
+        let mut out = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let row = loop {
+                let mut b = Bytes { b: &bytes, at: from };
+                match decode_row(&mut b, width, &s.named) {
+                    Ok(row) => {
+                        from = b.at;
+                        break row;
+                    }
+                    Err(e) => {
+                        if next < s.pages.len() {
+                            room.spilled_page(s.pages[next].0, &mut page)?;
+                            bytes.extend_from_slice(&page);
+                        } else if next == s.pages.len() {
+                            bytes.extend_from_slice(&s.tail);
+                        } else {
+                            return Err(e);
+                        }
+                        next += 1;
+                    }
+                }
+            };
+            out.push(row);
+        }
         Ok(out)
     }
 }
@@ -570,8 +623,9 @@ impl Rows {
         self.0.iter().map(|r| r.len()).sum()
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.0.iter().all(|r| r.len() == 0)
+    /// The bytes its rows are held at, those written among them.
+    pub(super) fn bytes(&self) -> u64 {
+        self.0.iter().map(|r| r.stored.borrow().total).sum()
     }
 
     /// Whether every row is held in the room.
@@ -600,6 +654,17 @@ impl Rows {
             r.each_chunk(each)?;
         }
         Ok(())
+    }
+
+    /// Its first `n` rows.
+    pub(super) fn first(&self, n: usize) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::with_capacity(n);
+        self.each_chunk(&mut |c| {
+            let left = n - out.len();
+            out.extend(c.into_iter().take(left));
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     /// Every row, in order.

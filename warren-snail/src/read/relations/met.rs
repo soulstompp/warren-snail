@@ -1,12 +1,12 @@
 //! Two relations met: each pair of their rows the ON holds of, or every pair; a row of the side an
 //! outer join keeps that meets none, beside NULLs; then the columns the USING merges. Where the ON
 //! compares a column of each side by =, a hash on one side's keys, the other's rows reading it a chunk
-//! at a time. Past the room the side the hash holds comes in passes by a hash of its keys, the other
-//! side's rows of the keys still to come written and read back with their pass.
+//! at a time. Where neither side's rows are held whole, each side's are written into batches by a hash
+//! of their keys, and each batch met in turn.
 
 use super::{conjuncts, Kind, Merged, Node, Reading};
 use crate::read::pipeline::{self, parted, Key, Value};
-use crate::read::spill::{Chunk, Rows, Run};
+use crate::read::spill::{Chunk, Rows, Run, CHUNK};
 use crate::{Error, Result};
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::HashMap;
@@ -97,8 +97,7 @@ impl Pairs<'_> {
     }
 }
 
-/// One pass of a hash join: `build`'s rows hashed, `probe`'s read a chunk at a time, those whose keys
-/// hash at `below` or past it written for a pass to come.
+/// One pass of a hash join: `build`'s rows hashed, `probe`'s read a chunk at a time.
 #[allow(clippy::too_many_arguments)]
 fn probe_pass(
     keys: &JoinKeys,
@@ -106,11 +105,10 @@ fn probe_pass(
     build: &[&Vec<Value>],
     build_right: bool,
     probe: &Rows,
-    below: Option<u64>,
     keeps_probe: bool,
     keeps_build: bool,
     out: &mut Chunk,
-) -> Result<Rows> {
+) -> Result<()> {
     let mut map: HashMap<Vec<Key>, Vec<usize>> = HashMap::new();
     for (i, r) in build.iter().enumerate() {
         if let Some(k) = keys.side(r, build_right)? {
@@ -118,18 +116,10 @@ fn probe_pass(
         }
     }
     let mut met = vec![false; build.len()];
-    let later = Run::past();
     probe.each_chunk(&mut |c| {
         for p in c {
-            let k = keys.side(&p, !build_right)?;
-            if let (Some(k), Some(b)) = (&k, below) {
-                if parted::key_hash(k) >= b {
-                    later.push(p)?;
-                    continue;
-                }
-            }
             let mut any = false;
-            if let Some(found) = k.and_then(|k| map.get(&k)) {
+            if let Some(found) = keys.side(&p, !build_right)?.and_then(|k| map.get(&k)) {
                 for &i in found {
                     let pair = match build_right {
                         true => pairs.pair(&p, build[i]),
@@ -161,12 +151,83 @@ fn probe_pass(
             }
         }
     }
-    later.seal()?;
-    Ok(Rows::one(later))
+    Ok(())
 }
 
-/// The two sides met by a hash: on the side the room holds whole, the left side's first; where
-/// neither fits, on the right side's in passes.
+/// How many times a batch past the room is cut into batches again, before it is held whole: its rows
+/// are then one key's, past the room by itself.
+const CUTS: u32 = 8;
+
+/// Two sides past the room met in batches: the side of fewer bytes hashed where the room holds it;
+/// else both written again into batches by a hash of their keys, each batch met in turn, so each
+/// row is written once more and read back once where its batch fits.
+#[allow(clippy::too_many_arguments)]
+fn batches(
+    keys: &JoinKeys,
+    pairs: &Pairs,
+    keeps_left: bool,
+    keeps_right: bool,
+    lrows: &Rows,
+    rrows: &Rows,
+    cut: u32,
+    out: &mut Chunk,
+) -> Result<()> {
+    let build_right = rrows.bytes() <= lrows.bytes();
+    let (build, probe, keeps_probe, keeps_build) = match build_right {
+        true => (rrows, lrows, keeps_left, keeps_right),
+        false => (lrows, rrows, keeps_right, keeps_left),
+    };
+    let free = crate::room::current()
+        .map_or(u64::MAX, |r| r.free_bytes())
+        .max(CHUNK);
+    if build.bytes() <= free || cut == CUTS {
+        let _held = crate::room::holding(build.bytes());
+        let rows = build.all()?;
+        let rows: Vec<&Vec<Value>> = rows.iter().collect();
+        return probe_pass(
+            keys, pairs, &rows, build_right, probe, keeps_probe, keeps_build, out,
+        );
+    }
+    let n = (build.bytes() / free.div_ceil(2)).max(1) as usize + 1;
+    let of_side = |rows: &Rows, right: bool, keeps: bool, out: &mut Chunk| -> Result<Vec<Run>> {
+        let runs: Vec<Run> = (0..n).map(|_| Run::past()).collect();
+        rows.each_chunk(&mut |c| {
+            for r in c {
+                match keys.side(&r, right)? {
+                    Some(k) => {
+                        runs[parted::key_hash(&k, cut) as usize % n].push(r)?;
+                    }
+                    None if keeps => out.push(match right {
+                        true => pairs.right_alone(&r)?,
+                        false => pairs.left_alone(&r)?,
+                    })?,
+                    None => {}
+                }
+            }
+            Ok(())
+        })?;
+        runs.iter().try_for_each(Run::seal)?;
+        Ok(runs)
+    };
+    let ls = of_side(lrows, false, keeps_left, out)?;
+    let rs = of_side(rrows, true, keeps_right, out)?;
+    for (l, r) in ls.into_iter().zip(rs) {
+        batches(
+            keys,
+            pairs,
+            keeps_left,
+            keeps_right,
+            &Rows::one(l),
+            &Rows::one(r),
+            cut + 1,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// The two sides met by a hash: on the side the room holds whole, the right side's first; where
+/// neither is, in batches.
 fn hash_join(
     keys: &JoinKeys,
     pairs: &Pairs,
@@ -179,45 +240,17 @@ fn hash_join(
     let keeps_right = matches!(kind, Kind::Right | Kind::Full);
     if rrows.held_whole() {
         return rrows.with_held(|rs| {
-            probe_pass(keys, pairs, rs, true, lrows, None, keeps_left, keeps_right, out)
-                .map(|_| ())
+            probe_pass(keys, pairs, rs, true, lrows, keeps_left, keeps_right, out)
         });
     }
     if lrows.held_whole() {
         return lrows.with_held(|ls| {
-            probe_pass(keys, pairs, ls, false, rrows, None, keeps_right, keeps_left, out)
-                .map(|_| ())
+            probe_pass(keys, pairs, ls, false, rrows, keeps_right, keeps_left, out)
         });
     }
     lrows.write_held()?;
     rrows.write_held()?;
-    let hash_of = |r: &[Value]| -> Result<u64> {
-        Ok(keys.right(r)?.map_or(0, |k| parted::key_hash(&k)))
-    };
-    let mut hashed = parted::Parted::new();
-    rrows.each_chunk(&mut |c| {
-        for r in c {
-            let k = keys.right(&r)?;
-            if k.is_none() && !keeps_right {
-                continue;
-            }
-            hashed.push(k.map_or(0, |k| parted::key_hash(&k)), r)?;
-        }
-        Ok(())
-    })?;
-    let mut probe = lrows.clone();
-    let mut ran = false;
-    while let Some(pass) = hashed.pass(&mut |r| hash_of(r))? {
-        ran = true;
-        let build: Vec<&Vec<Value>> = pass.rows.iter().map(|(_, r)| r).collect();
-        probe = probe_pass(
-            keys, pairs, &build, true, &probe, pass.below, keeps_left, keeps_right, out,
-        )?;
-    }
-    if !ran {
-        probe_pass(keys, pairs, &[], true, &probe, None, keeps_left, keeps_right, out)?;
-    }
-    Ok(())
+    batches(keys, pairs, keeps_left, keeps_right, lrows, rrows, 0, out)
 }
 
 /// The two sides met pair by pair: each chunk of the left with each of the right, the right's rows
@@ -366,6 +399,7 @@ impl Reading<'_> {
                          function",
                     ));
                 }
+                self.foresee_lateral(right, &lrows, before.map_or(&[], |(_, r)| r))?;
                 lrows.each_chunk(&mut |c| {
                     for l in c {
                         // The rows before it, and the left side's.

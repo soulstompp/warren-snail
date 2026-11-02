@@ -66,9 +66,10 @@ pub(super) fn partition_hash(by: &[Expr], row: &[Value], frame: &Frame) -> Resul
     Ok(h.finish())
 }
 
-/// The hash of a key.
-pub(in crate::read) fn key_hash(k: &[Key]) -> u64 {
+/// The hash of a key, salted by how many times its rows were cut into batches.
+pub(in crate::read) fn key_hash(k: &[Key], salt: u32) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
+    salt.hash(&mut h);
     k.hash(&mut h);
     h.finish()
 }
@@ -90,12 +91,6 @@ impl Parted {
             seq: 0,
             order: None,
         }
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.heap.is_empty()
-            && self.after.is_none()
-            && self.past.as_ref().is_none_or(|p| p.len() == 0)
     }
 
     /// A row more, its key's hash `hash`: held where the room has room for it, or while a pass holds
