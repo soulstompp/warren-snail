@@ -499,10 +499,10 @@ impl Snail {
                     RELEASE_KEY.to_string(),
                     table.release.to_string(),
                 )))
-                .chain(std::iter::once(KeyValue::new(
+                .chain([KeyValue::new(
                     TEXT_SEARCH_KEY.to_string(),
                     table.text_search.name().to_string(),
-                )))
+                )])
                 .chain(
                     table
                         .columns

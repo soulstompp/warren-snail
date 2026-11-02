@@ -3937,6 +3937,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 return super::ops::power(x, y, typed, frame.type_of(e));
             }
             if *op == BinaryOperator::PGStartsWith {
+                if [&x, &y].into_iter().any(Value::is_null) {
+                    return Ok(Value::Null);
+                }
                 let values = [super::ops::char_as_text(x), super::ops::char_as_text(y)];
                 let casing = string_casing(frame, e, "starts_with", &values)?;
                 return Ok(super::calls::strings("starts_with", &values, casing)?
