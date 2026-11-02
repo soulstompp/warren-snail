@@ -747,9 +747,15 @@ fn a_column_named_as_an_alias_is_read_as_a_column() {
     );
     read(
         &path,
-        "SELECT x.id + 1 FROM s.c x JOIN s.a a ON a.id = x.id WHERE a.g = 3 AND x.id < 100",
-        &["4"],
-        4,
+        "SELECT count(x.id + 1) FROM s.c x JOIN s.a AS a ON a.id = x.id",
+        &["1000"],
+        7,
+    );
+    // Written with no AS, an alias counts as a name by itself: a column too many, and the same answer.
+    same(
+        &path,
+        "SELECT count(x.id + 1) FROM s.c x JOIN s.a a ON a.id = x.id",
+        &["1000"],
     );
 }
 
