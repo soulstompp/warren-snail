@@ -1159,26 +1159,26 @@ fn at_one_snapshot_two_writers_of_one_block_of_the_plane_both_commit_and_the_blo
         let mut b = Snail::open_writing(&path).unwrap();
         run(&mut a, &format!("BEGIN ISOLATION LEVEL {level}"));
         run(&mut b, &format!("BEGIN ISOLATION LEVEL {level}"));
-        // Both on a point of one block of the strand, each past the other's box.
+        // Both past the box of the strand's first block, which holds them, each past the other's.
         run(
             &mut a,
-            "INSERT INTO s.t (id, p) VALUES (9000, '(1024.5,1024.5)')",
+            "INSERT INTO s.t (id, p) VALUES (9000, '(1023.5,1023.5)')",
         );
         run(
             &mut b,
-            "INSERT INTO s.t (id, p) VALUES (9001, '(1024.25,1024.25)')",
+            "INSERT INTO s.t (id, p) VALUES (9001, '(1023.25,1023.25)')",
         );
         // At SERIALIZABLE a read marks what the other writes, so only the snapshot's level reads here.
         if level == "REPEATABLE READ" {
-            let q = "SELECT id FROM s.t WHERE p ~= '(1024.25,1024.25)'";
+            let q = "SELECT id FROM s.t WHERE p ~= '(1023.25,1023.25)'";
             assert_eq!(ids(&mut a, q, "t_p"), Vec::<i64>::new());
             assert_eq!(ids(&mut b, q, "t_p"), [9001]);
         }
         run(&mut a, "COMMIT");
         run(&mut b, "COMMIT");
         for (q, want) in [
-            ("SELECT id FROM s.t WHERE p ~= '(1024.5,1024.5)'", 9000),
-            ("SELECT id FROM s.t WHERE p ~= '(1024.25,1024.25)'", 9001),
+            ("SELECT id FROM s.t WHERE p ~= '(1023.5,1023.5)'", 9000),
+            ("SELECT id FROM s.t WHERE p ~= '(1023.25,1023.25)'", 9001),
         ] {
             assert_eq!(ids(&mut a, q, "t_p"), [want], "{level}: {q}");
             assert_eq!(ids(&mut a, q, "t_ps"), [want], "{level}: {q}");
@@ -1530,4 +1530,112 @@ fn a_commit_rebuilds_the_boxes_above_its_blocks_a_coordinate_at_a_time() {
         }
     }
     assert_eq!(found, 1025);
+}
+
+#[test]
+fn a_strand_of_several_levels_keeps_the_box_of_each_and_reads_a_condition_on_any() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id bigint NOT NULL, p point, b box, r int4range, PRIMARY KEY (id)); \
+         CREATE INDEX t_pb ON s.t USING gist (p, b) INCLUDE (r); \
+         CREATE INDEX t_rp ON s.t USING gist (r, p);",
+    )
+    .unwrap();
+    let n = 8192i64;
+    let ranges = warren_snail::composed::built_in("int4range").unwrap();
+    let columns = vec![
+        Values::Int((0..n).map(Some).collect()),
+        shapes(
+            GeoKind::Point,
+            (0..n).map(|i| (i % 50 != 0).then(|| format!("({},{})", cell(i).0, cell(i).1))),
+        ),
+        shapes(
+            GeoKind::Box,
+            (0..n).map(|i| {
+                let (x, y) = cell(i * 3);
+                Some(format!("(({x},{y}),({},{}))", x + 4, y + 4))
+            }),
+        ),
+        Values::Composed(
+            (0..n)
+                .map(|i| {
+                    Some(std::sync::Arc::new(warren_snail::composed::Compound::new(
+                        ranges,
+                        warren_snail::composed::text_in(ranges, &format!("[{i},{})", i + 4))
+                            .unwrap(),
+                    )))
+                })
+                .collect(),
+        ),
+    ];
+    let path = tmp("plane-levels.snail");
+    write(&path, &catalog, &[("s.t".into(), Rows { columns })]).unwrap();
+    let mut s = fresh(&path);
+    for (q, orders) in [
+        (
+            "p <@ box '((1040,1040),(1100,1100))'",
+            &["t_pb", "t_rp"][..],
+        ),
+        ("b && box '((1040,1040),(1100,1100))'", &["t_pb"][..]),
+        ("r && '[100,120)'", &["t_pb", "t_rp"][..]),
+        (
+            "r && '[100,120)' AND p <^ '(2000,2000)'",
+            &["t_pb", "t_rp"][..],
+        ),
+        (
+            "p <@ box '((1040,1040),(1100,1100))' AND b >> box '((1024,1024),(1030,1030))'",
+            &["t_pb"][..],
+        ),
+        ("p IS NULL", &["t_pb", "t_rp"][..]),
+    ] {
+        let q = format!("SELECT id FROM s.t WHERE {q}");
+        let along_key = ids(&mut s, &q, "t_pkey");
+        assert!(!along_key.is_empty(), "{q}");
+        for order in orders {
+            assert_eq!(ids(&mut s, &q, order), along_key, "{q} along {order}");
+        }
+    }
+    // A condition on the second level alone rules its blocks out by that level's box.
+    let (_, narrow) = s
+        .ask(
+            "SELECT id FROM s.t WHERE b && box '((3000,3000),(4000,4000))'",
+            Some("t_pb"),
+        )
+        .unwrap();
+    assert_eq!(narrow.blocks_read, 0, "{narrow:?}");
+}
+
+#[test]
+fn a_partial_strand_on_the_plane_holds_the_rows_it_admits_and_serves_what_implies_it() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+         CREATE INDEX t_v ON s.t USING gist (v) WHERE id >= 1000;",
+    )
+    .unwrap();
+    let n = 8192i64;
+    let v = shapes(
+        GeoKind::Point,
+        (0..n).map(|i| Some(format!("({},{})", cell(i).0, cell(i).1))),
+    );
+    let path = tmp("plane-partial.snail");
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![Values::Int((0..n).map(Some).collect()), v],
+            },
+        )],
+    )
+    .unwrap();
+    let mut s = fresh(&path);
+    let q = "SELECT id FROM s.t WHERE v <@ box '((1040,1040),(1100,1100))' AND id >= 2000";
+    let along = ids(&mut s, q, "t_v");
+    assert!(!along.is_empty());
+    assert_eq!(along, ids(&mut s, q, "t_pkey"));
+    // A question that does not imply the predicate is not read along its strand.
+    let q = "SELECT id FROM s.t WHERE v <@ box '((1040,1040),(1100,1100))'";
+    assert!(s.ask(q, Some("t_v")).is_err());
+    let (_, chosen) = s.ask(q, None).unwrap();
+    assert_eq!(chosen.order, "t_pkey", "{chosen:?}");
 }

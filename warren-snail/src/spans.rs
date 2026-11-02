@@ -79,10 +79,7 @@ pub(crate) fn widen(span: &mut Span, ty: ColumnType, d: &Datum) {
 
 /// The span of a column's values at the rows given.
 pub(crate) fn of_rows(ty: ColumnType, v: &Values, rows: &[usize]) -> Span {
-    let mut span = Span {
-        plane: crate::plane::on_plane(ty),
-        ..Span::default()
-    };
+    let mut span = Span::default();
     for &r in rows {
         widen(&mut span, ty, &crate::values::datum_of(v, r, ty));
     }

@@ -243,8 +243,7 @@ pub(crate) fn may_hold(column: GeoKind, op: &str, span: &Span, value: &Geo) -> b
         (GeoKind::Point, Geo::Box(q)) => {
             lx <= q.high.x && hx >= q.low.x && ly <= q.high.y && hy >= q.low.y
         }
-        // `point_inside` finds nothing where the point lies more than the fuzz off every vertex on a
-        // side, each vertex finite.
+        // Against the polygon's bounding box, as `point_inside` compares, where every vertex is finite.
         (GeoKind::Point, Geo::Polygon(q)) => {
             q.points
                 .iter()
@@ -254,7 +253,7 @@ pub(crate) fn may_hold(column: GeoKind, op: &str, span: &Span, value: &Geo) -> b
                     || fp_lt(q.bound.high.y - ly, 0.0)
                     || fp_gt(q.bound.low.y - hy, 0.0))
         }
-        // A point's distance from the center is at least either coordinate's.
+        // Against the center, a coordinate at a time.
         (GeoKind::Point, Geo::Circle(c)) => {
             !(lx - c.center.x > c.radius
                 || c.center.x - hx > c.radius
