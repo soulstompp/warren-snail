@@ -63,14 +63,19 @@ impl Reads for Cached<'_> {
         Ok((b, r))
     }
 
+    fn strand_wins(&self, q: &Question, strand: &str) -> Result<bool> {
+        self.reads.strand_wins(q, strand)
+    }
+
     fn read_each(
         &self,
         q: &Question,
+        order: Option<&str>,
         kept: Option<&super::walk::KeySet>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
-        if kept.is_some() {
-            return self.reads.read_each(q, kept, each);
+        if kept.is_some() || order.is_some() {
+            return self.reads.read_each(q, order, kept, each);
         }
         let key = format!("{q:?}");
         let found = self.kept.places.borrow().get(&key).cloned();
@@ -79,7 +84,7 @@ impl Reads for Cached<'_> {
             return Ok(Round::default());
         }
         let run = Run::new();
-        let round = self.reads.read_each(q, None, &mut |rows| {
+        let round = self.reads.read_each(q, None, None, &mut |rows| {
             let mut copy = Vec::with_capacity(rows.len());
             for r in &rows {
                 copy.push(r.clone());

@@ -926,3 +926,169 @@ fn a_subquery_s_kept_table_past_the_room_is_read_back_in_the_order_of_its_keys_h
     assert_eq!(one(&b), 4, "{q}");
     assert!(round.bytes_held <= 4096 + one_chunk(&path, 27) + 4 * 27, "{q}: {round:?}");
 }
+
+/// Each purchase, as (id, owner, moment), by the owners and moments it reads in.
+fn all_purchases() -> Vec<(i64, i64, i64)> {
+    (0..PURCHASES).map(|i| (i, owner(i), PURCHASES - i)).collect()
+}
+
+#[test]
+fn an_order_by_a_strand_gives_is_read_along_it_where_its_price_is_fewest() {
+    let path = purchases("order-by");
+    let dir = spill_dir("order-by");
+    // Sorted as the strand leads, its first four rows.
+    let mut rows = all_purchases();
+    rows.sort_by_key(|&(_, o, at)| (o, at));
+    let want: Vec<Vec<i64>> = rows[..4].iter().map(|&(id, _, _)| vec![id]).collect();
+    let q = "SELECT p.id FROM s.p p ORDER BY p.owner, p.at LIMIT 4";
+    // Past a room of 64 KiB the sort would spill 184 pages: the strand's 192 against the table's
+    // own 192 with them. Nothing is written; at 128 MB the table's own order is read and sorted.
+    for (room, order) in [(64u64 << 10, "p_owner"), (128 << 20, "p_pkey")] {
+        let mut snail = Snail::open(&path).unwrap();
+        snail.size_rounds(Sizes::of(room).in_dir(&dir));
+        let (b, round) = snail.ask(q, None).unwrap();
+        weather::exact(q, &round);
+        assert_eq!(ints(&b), want, "{room}");
+        assert_eq!(round.order, order, "{room}");
+        assert_eq!((round.spill_pages_written, round.spill_pages_read), (0, 0), "{round:?}");
+    }
+    // A step's ORDER BY, read along the strand: its rows past the room are its own, 27 bytes each,
+    // written once and read back once in that order.
+    let q = "SELECT y.id FROM (SELECT p.owner, p.at, p.id FROM s.p p ORDER BY p.owner, p.at) y LIMIT 4";
+    let room: u64 = 64 << 10;
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    each_read_exact(q, &round);
+    assert_eq!(ints(&b), want, "{q}");
+    assert_eq!(round.reads[0].order, "p_owner", "{q}: {round:?}");
+    let pages = ((PURCHASES as u64 - room / 27) * 27).div_ceil(4096);
+    assert_eq!(
+        (round.spill_pages_written, round.spill_pages_read),
+        (pages, pages),
+        "{q}: {round:?}"
+    );
+    // A DESC or a column another name hides is no strand's: sorted, the same rows.
+    let q = "SELECT p.id AS at, p.at AS id FROM s.p p ORDER BY id LIMIT 1";
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    assert_eq!(ints(&b), [[PURCHASES - 1, 1]], "{q}");
+    assert_eq!(round.order, "p_pkey", "{q}");
+}
+
+/// The id of the last row a group gives it, in the order it gives them.
+struct LastOf(i64);
+
+impl warren_snail::read::handed::Fold for LastOf {
+    fn add(&mut self, args: &[warren_snail::read::Value]) -> warren_snail::Result<()> {
+        if let warren_snail::read::Value::Int(x) = args[0] {
+            self.0 = x;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> warren_snail::Result<warren_snail::read::Value> {
+        Ok(warren_snail::read::Value::Int(self.0))
+    }
+}
+
+#[test]
+fn a_caller_s_ordered_aggregate_along_a_strand_lets_each_group_go_as_its_key_changes() {
+    use warren_snail::read::handed::{self, Function};
+    let path = purchases("groups-along");
+    let dir = spill_dir("groups-along");
+    let ty = handed::type_named("bigint").unwrap();
+    let q = "SELECT p.owner, last_of(p.id ORDER BY p.at) FROM s.p p GROUP BY p.owner";
+    // Each owner's id at its greatest moment.
+    let mut best: std::collections::BTreeMap<i64, (i64, i64)> = Default::default();
+    for (id, o, at) in all_purchases() {
+        let e = best.entry(o).or_insert((at, id));
+        if at > e.0 {
+            *e = (at, id);
+        }
+    }
+    let want: Vec<Vec<i64>> = best.iter().map(|(&o, &(_, id))| vec![o, id]).collect();
+    for (room, order) in [(64u64 << 10, "p_owner"), (128 << 20, "p_pkey")] {
+        let mut snail = Snail::open(&path).unwrap();
+        snail
+            .hand(Function::aggregate("last_of", &[ty], ty, || Box::new(LastOf(0))))
+            .unwrap();
+        snail.size_rounds(Sizes::of(room).in_dir(&dir));
+        let (b, round) = snail.ask(q, None).unwrap();
+        weather::exact(q, &round);
+        let mut got = ints(&b);
+        got.sort();
+        assert_eq!(got, want, "{room}");
+        assert_eq!(round.order, order, "{room}");
+        assert_eq!(round.spill_pages_written, 0, "{room}: {round:?}");
+        if order == "p_owner" {
+            // A block's rows handed on, and one owner's 32 rows' 18 bytes kept at a time.
+            assert!(round.bytes_held <= room, "{round:?}");
+        }
+    }
+    // Over a join the same, its first table read along the strand.
+    let q = "SELECT p.owner, last_of(p.id ORDER BY p.at) FROM s.p p JOIN s.o o ON o.k = p.owner \
+             GROUP BY p.owner";
+    let path = owned("groups-join");
+    let room = 64u64 << 10;
+    let mut snail = Snail::open(&path).unwrap();
+    snail
+        .hand(Function::aggregate("last_of", &[ty], ty, || Box::new(LastOf(0))))
+        .unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    each_read_exact(q, &round);
+    let mut got = ints(&b);
+    got.sort();
+    assert_eq!(got, want, "{q}");
+    assert!(round.reads.iter().any(|r| r.order == "p_owner"), "{round:?}");
+    assert_eq!(round.spill_pages_written, 0, "{round:?}");
+}
+
+#[test]
+fn a_window_over_a_join_along_its_first_table_s_strand_holds_one_partition_at_a_time() {
+    let path = owned("window-join");
+    let dir = spill_dir("window-join");
+    let want = places(&all_purchases());
+    let q = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
+             FROM s.p p JOIN s.o o ON o.k = p.owner";
+    let room: u64 = 64 << 10;
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    each_read_exact(q, &round);
+    let mut got = ints(&b);
+    got.sort();
+    assert_eq!(got, want, "{q}");
+    assert!(round.reads.iter().any(|r| r.order == "p_owner"), "{round:?}");
+    assert_eq!(
+        (round.spill_pages_written, round.spill_pages_read),
+        (0, 0),
+        "{q}: {round:?}"
+    );
+    // A chunk, the owners' hash and one owner's 32 rows.
+    assert!(round.bytes_held <= room, "{q}: {round:?}");
+    // With the other side past the room, its order is lost: the partitions held whole, and every
+    // answer the same.
+    let q = "WITH o AS (SELECT p.owner AS k, p.id AS tag FROM s.p p) \
+             SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
+             FROM s.p p JOIN (SELECT DISTINCT o.k FROM o) d ON d.k = p.owner";
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(2048).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    each_read_exact(q, &round);
+    let mut got = ints(&b);
+    got.sort();
+    assert_eq!(got, want, "{q}");
+    // At 128 MB the sort fits: read as the join's round reads it, nothing written.
+    let q = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
+             FROM s.p p JOIN s.o o ON o.k = p.owner";
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::default().in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    let mut got = ints(&b);
+    got.sort();
+    assert_eq!(got, want, "{q}");
+    assert_eq!(round.spill_pages_written, 0, "{q}");
+}

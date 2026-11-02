@@ -430,6 +430,110 @@ impl Reading<'_> {
         out.finish()
     }
 
+    /// A join's left side handed through as it comes, the right side's rows held whole: its rows
+    /// come as the left side's do.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn met_flowing(
+        &mut self,
+        node: &Node,
+        left: &Node,
+        right: &Node,
+        kind: Kind,
+        on: Option<&Expr>,
+        merged: &[Merged],
+        rrows: Rows,
+        before: Option<(usize, &[Value])>,
+        preserved: bool,
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<()> {
+        let frame_columns = self.from.frame_columns(node.at, left.width + right.width);
+        let frame = pipeline::Frame {
+            columns: frame_columns,
+            params: self.params,
+            release: self.release,
+            casings: self.casings,
+            types: self.types,
+            now: self.now,
+            subqueries: None,
+        };
+        let none = pipeline::computed_none();
+        let usings: Vec<(usize, usize)> = merged
+            .iter()
+            .map(|m| (m.left - node.at, m.right - node.at))
+            .collect();
+        let width = left.width + right.width;
+        let holds = |pair: &[Value]| -> Result<bool> {
+            for &(a, b) in &usings {
+                if pipeline::equal(&pair[a], &pair[b])? != Some(true) {
+                    return Ok(false);
+                }
+            }
+            match on {
+                Some(e) => {
+                    Ok(pipeline::truth(&pipeline::eval(e, pair, &frame, &none)?)? == Some(true))
+                }
+                None => Ok(true),
+            }
+        };
+        let finish = |mut pair: Vec<Value>| -> Result<Vec<Value>> {
+            pair.resize(node.width, Value::Null);
+            Self::merge(node, node.at, &mut pair)?;
+            Ok(pair)
+        };
+        let pairs = Pairs {
+            holds: &holds,
+            finish: &finish,
+            lw: left.width,
+            width,
+        };
+        let keys = self.join_keys(left, on, &usings, &frame);
+        let keeps_left = kind == Kind::Left;
+        let keep_left = matches!(kind, Kind::Inner | Kind::Cross | Kind::Left) && preserved;
+        let mut out = Chunk::new(each);
+        rrows.with_held(|rs| -> Result<()> {
+            let mut map: HashMap<Vec<Key>, Vec<usize>> = HashMap::new();
+            if let Some(keys) = &keys {
+                for (i, r) in rs.iter().enumerate() {
+                    if let Some(k) = keys.right(r)? {
+                        map.entry(k).or_default().push(i);
+                    }
+                }
+            }
+            self.flow(left, before, keep_left, &mut |c, _| {
+                for l in c {
+                    let mut any = false;
+                    let mut meet = |r: &Vec<Value>, out: &mut Chunk| -> Result<()> {
+                        let pair = pairs.pair(&l, r);
+                        if (pairs.holds)(&pair)? {
+                            any = true;
+                            out.push((pairs.finish)(pair)?)?;
+                        }
+                        Ok(())
+                    };
+                    match &keys {
+                        Some(keys) => {
+                            if let Some(found) = keys.left(&l)?.and_then(|k| map.get(&k)) {
+                                for &i in found {
+                                    meet(rs[i], &mut out)?;
+                                }
+                            }
+                        }
+                        None => {
+                            for r in rs {
+                                meet(r, &mut out)?;
+                            }
+                        }
+                    }
+                    if !any && keeps_left {
+                        out.push(pairs.left_alone(&l)?)?;
+                    }
+                }
+                Ok(())
+            })
+        })?;
+        out.finish()
+    }
+
     /// The key each conjunct of the ON comparing a column of each side by = gives, with the USING's;
     /// none where no conjunct is one, or one of them compares under a library's collation or across
     /// types whose keys differ.

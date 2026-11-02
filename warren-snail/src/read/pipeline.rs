@@ -6018,7 +6018,14 @@ impl Groups {
     }
 
     /// Rows folded into their groups: a group none has come for, past the room, its rows written.
-    fn fold(&mut self, p: &Prepared, rows: Vec<Vec<Value>>, frame: &Frame) -> Result<()> {
+    /// Where `along` is given, rows come in the order of their groups, each ended as its key changes.
+    fn fold(
+        &mut self,
+        p: &Prepared,
+        rows: Vec<Vec<Value>>,
+        frame: &Frame,
+        mut along: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>>,
+    ) -> Result<()> {
         let none = computed_none();
         let folded: Vec<Folds> = p
             .calls
@@ -6051,6 +6058,11 @@ impl Groups {
                     })
                 })
                 .collect::<Result<_>>()?;
+            if let Some(end) = &mut along {
+                if !self.list.is_empty() && !self.at.contains_key(&k) {
+                    self.project(p, frame, end)?;
+                }
+            }
             let i = match self.at.get(&k) {
                 Some(&i) => i,
                 None => {
@@ -6159,7 +6171,9 @@ struct Going {
     seen_past: Option<super::spill::Run>,
     closed: bool,
     sorter: Option<sorted::Sorter>,
+    /// Whether it sorts them; where they come in their order, what its LIMIT keeps of them.
     sorts: bool,
+    cut: Option<sorted::Cut>,
 }
 
 impl Going {
@@ -6167,9 +6181,10 @@ impl Going {
     fn take(
         &mut self,
         p: &Prepared,
-        casings: &Casings,
+        frame: &Frame,
         rows: Vec<Vec<Value>>,
     ) -> Result<Vec<Vec<Value>>> {
+        let casings = frame.casings;
         let rows = if self.distinct {
             let mut new = Vec::with_capacity(rows.len());
             for r in rows {
@@ -6192,7 +6207,22 @@ impl Going {
             rows
         };
         if !self.sorts {
-            return Ok(rows);
+            let Some(l) = &p.limit else {
+                return Ok(rows);
+            };
+            let keys = match l.ties {
+                true => {
+                    let under = sorted::sort_under(p, casings)?;
+                    rows.iter()
+                        .map(|r| sorted::sort_key(r, &p.sorted, &under))
+                        .collect::<Result<Vec<_>>>()?
+                }
+                false => Vec::new(),
+            };
+            if self.cut.is_none() {
+                self.cut = Some(sorted::Cut::of(l, frame)?);
+            }
+            return Ok(self.cut.as_mut().expect("just made").take(rows, &keys));
         }
         if self.sorter.is_none() {
             self.sorter = Some(sorted::Sorter::new(p, casings)?);
@@ -6222,10 +6252,8 @@ pub(super) struct StepRun<'q> {
     partition_rows: Vec<Vec<Value>>,
     partition_held: crate::room::Holding,
     partitions_out: Vec<Vec<Value>>,
-    /// Whether its rows come in the order of its ORDER BY, so they are handed on as they come; and
-    /// what its LIMIT keeps of them.
-    along_order: bool,
-    cut: Option<sorted::Cut>,
+    /// Whether its rows come in the order of its GROUP BY, each group ended as its key changes.
+    along_groups: bool,
     /// Whether whoever reads it takes its rows as they are made, rather than all at the end.
     pub(super) hands_on: bool,
     /// The columns the step's FROM reads, as the last chunk gave them.
@@ -6246,7 +6274,8 @@ impl<'q> StepRun<'q> {
             seen_past: None,
             closed: false,
             sorter: None,
-            sorts: p.order_by.is_some() || p.limit.is_some(),
+            sorts: p.order_by.is_some(),
+            cut: None,
         };
         StepRun {
             p,
@@ -6259,8 +6288,7 @@ impl<'q> StepRun<'q> {
             partition_rows: Vec::new(),
             partition_held: crate::room::holding(0),
             partitions_out: Vec::new(),
-            along_order: false,
-            cut: None,
+            along_groups: false,
             hands_on: false,
             columns: Vec::new(),
             subqueries: None,
@@ -6268,10 +6296,15 @@ impl<'q> StepRun<'q> {
         }
     }
 
-    /// Reads its rows as coming in the order of its windows' PARTITION BY and ORDER BY, each
-    /// partition folded once its rows have come.
-    pub(super) fn along_partitions(&mut self) {
-        self.along_partitions = true;
+    /// Reads its rows as coming in the order a strand gives it: its windows' partitions each folded
+    /// once its rows have come, its ORDER BY holding none, its groups ending as their keys change.
+    pub(super) fn along(&mut self, led: super::strands::Led) {
+        use super::strands::Led;
+        match led {
+            Led::Partitions => self.along_partitions = true,
+            Led::Ordered => self.going.sorts = false,
+            Led::Groups => self.along_groups = true,
+        }
     }
 
     fn names(&self) -> Vec<String> {
@@ -6308,8 +6341,25 @@ impl<'q> StepRun<'q> {
             rel.rows = kept;
         }
         if self.p.grouped {
-            self.groups.fold(&self.p, rel.rows, &frame)?;
+            let mut ended = Vec::new();
+            let mut end = |rows: Vec<Vec<Value>>| -> Result<()> {
+                ended.extend(rows);
+                Ok(())
+            };
+            let along: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>> =
+                self.along_groups.then_some(&mut end);
+            self.groups.fold(&self.p, rel.rows, &frame, along)?;
+            let names = self.names();
+            let handed = self.going.take(&self.p, &frame, ended)?;
             self.columns = frame.columns;
+            if self.hands_on && !handed.is_empty() {
+                return Ok(Some(Relation {
+                    names,
+                    rows: truncated(handed, self.p.items.len()),
+                    order: None,
+                }));
+            }
+            self.partitions_out.extend(handed);
             return Ok(None);
         }
         // Rows that come in its windows' order are folded a partition at a time.
@@ -6327,7 +6377,7 @@ impl<'q> StepRun<'q> {
                 self.partition_held.more(super::spill::row_width(&row));
                 self.partition_rows.push(row);
             }
-            let handed = self.going.take(&self.p, casings, made)?;
+            let handed = self.going.take(&self.p, &frame, made)?;
             let names = self.names();
             self.columns = frame.columns;
             if self.hands_on {
@@ -6376,37 +6426,12 @@ impl<'q> StepRun<'q> {
                 })
             });
         let names = self.names();
-        // Rows that come in its ORDER BY's order need no sort: what its LIMIT keeps goes on.
-        if self.along_order {
-            let keys = match self.p.limit.as_ref().is_some_and(|l| l.ties) {
-                true => {
-                    let under = sorted::sort_under(&self.p, casings)?;
-                    rows.iter()
-                        .map(|r| sorted::sort_key(r, &self.p.sorted, &under))
-                        .collect::<Result<Vec<_>>>()?
-                }
-                false => Vec::new(),
-            };
-            if self.cut.is_none() {
-                if let Some(l) = &self.p.limit {
-                    self.cut = Some(sorted::Cut::of(l, &frame)?);
-                }
-            }
-            if let Some(c) = &mut self.cut {
-                rows = c.take(rows, &keys);
-            }
-        }
-        let was_sorting = self.going.sorts;
-        if self.along_order {
-            self.going.sorts = false;
-        }
-        let rows = self.going.take(&self.p, casings, rows)?;
-        self.going.sorts = was_sorting;
+        let rows = self.going.take(&self.p, &frame, rows)?;
         self.columns = frame.columns;
-        if self.going.sorts && !self.along_order {
+        if self.going.sorts {
             return Ok(None);
         }
-        if self.p.distinct && !self.hands_on {
+        if (self.p.distinct || self.p.limit.is_some() || self.p.order_by.is_some()) && !self.hands_on {
             self.partitions_out.extend(rows);
             return Ok(None);
         }
@@ -6446,16 +6471,11 @@ impl<'q> StepRun<'q> {
         }
         let p = &self.p;
         let going = &mut self.going;
-        let along_order = self.along_order;
+        let frame_ref = &frame;
         let mut emit = |rows: Vec<Vec<Value>>,
                         going: &mut Going|
          -> Result<()> {
-            let sorts = going.sorts && !along_order;
-            let saved = going.sorts;
-            going.sorts = sorts;
-            let rows = going.take(p, casings, rows);
-            going.sorts = saved;
-            let rows = rows?;
+            let rows = going.take(p, frame_ref, rows)?;
             if !rows.is_empty() {
                 each(truncated(rows, width))?;
             }
@@ -6476,7 +6496,7 @@ impl<'q> StepRun<'q> {
                 };
                 past.seal()?;
                 let groups = &mut self.groups;
-                past.each_chunk(&mut |c| groups.fold(p, c, &frame))?;
+                past.each_chunk(&mut |c| groups.fold(p, c, &frame, None))?;
             }
         }
         if self.along_partitions {
@@ -6519,7 +6539,7 @@ impl<'q> StepRun<'q> {
             going.seen_held = crate::room::holding(0);
             past.each_chunk(&mut |c| emit(c, going))?;
         }
-        if going.sorts && !along_order {
+        if going.sorts {
             let sorter = match going.sorter.take() {
                 Some(s) => s,
                 None => sorted::Sorter::new(p, casings)?,
@@ -6836,11 +6856,10 @@ impl<'q> Stream<'q> {
         Ok(s)
     }
 
-    /// Its question's own windows read the rows as coming in their PARTITION BY and ORDER BY's
-    /// order, a partition at a time.
-    pub fn along_partitions(&mut self) {
+    /// Its question's own step reads the rows as coming in the order a strand gives it.
+    pub(super) fn along(&mut self, led: super::strands::Led) {
         if let Some(Some(r)) = self.runs.last_mut() {
-            r.along_partitions();
+            r.along(led);
         }
     }
 

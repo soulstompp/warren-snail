@@ -75,10 +75,20 @@ impl relations::Reads for Snail {
     fn read_each(
         &self,
         q: &Question,
+        order: Option<&str>,
         kept: Option<&KeySet>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
-        self.read_blocks(q, kept, each)
+        self.read_blocks(q, order, kept, each)
+    }
+
+    fn strand_wins(&self, q: &Question, strand: &str) -> Result<bool> {
+        let table = &self.catalog.tables[q.sides[0].table];
+        let o = table.orders.iter().position(|o| o.name == strand);
+        match o {
+            Some(o) => Snail::strand_wins(self, q, table, o, None),
+            None => Ok(false),
+        }
     }
 
     fn snails(&self) -> usize {
@@ -1397,8 +1407,8 @@ impl Snail {
         // fewer than the table's own order's with the sort it saves; the rows of each block in
         // their place among its sorted rows.
         let priced = (self.touched(), self.pages_held());
-        let strand = match strands::of_windows(q, table, &stored) {
-            Some((o, at)) if self.strand_wins(&base, table, o, order, &stored)? => Some((o, at)),
+        let strand = match strands::of_step(q, table, &stored) {
+            Some(s) if self.strand_wins(&base, table, s.0, Some(&order.name))? => Some(s),
             _ => None,
         };
         let priced = (self.touched() - priced.0, self.pages_held() - priced.1);
@@ -1418,10 +1428,10 @@ impl Snail {
             drop(stream);
             return relations::answer(self, q, params);
         }
-        if strand.is_some() {
-            stream.along_partitions();
+        if let Some((_, _, led)) = &strand {
+            stream.along(*led);
         }
-        let sorted_at = strand.as_ref().map(|(_, at)| at.clone());
+        let sorted_at = strand.as_ref().map(|(_, at, _)| at.clone());
         // Each block's rows go to the pipeline as the scan reads them, in the order.
         let mut blocks = Blocks {
             table,
@@ -1439,7 +1449,7 @@ impl Snail {
             },
         };
         let read_along = match &strand {
-            Some((o, _)) => &table.orders[*o].name,
+            Some((o, _, _)) => &table.orders[*o].name,
             None => &order.name,
         };
         let (mut round, _, _) = self.scan_one(&base, Some(read_along), None, &mut blocks)?;
@@ -1478,6 +1488,7 @@ impl Snail {
     pub(super) fn read_blocks(
         &self,
         q: &Question,
+        order: Option<&str>,
         kept: Option<&KeySet>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<Round> {
@@ -1492,7 +1503,7 @@ impl Snail {
                 each(pipeline::relation_of(&batch)?.rows)
             },
         };
-        let (mut round, _, _) = self.scan_one(q, None, kept, &mut blocks)?;
+        let (mut round, _, _) = self.scan_one(q, order, kept, &mut blocks)?;
         drop(blocks);
         round.rows = rows;
         Ok(round)
