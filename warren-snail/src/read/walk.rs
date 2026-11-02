@@ -299,7 +299,7 @@ pub fn ruled_out(ranges: &[(u64, u64)]) -> Vec<bool> {
 
 pub fn s_column(s: Shape) -> usize {
     match s {
-        Shape::Column(c) | Shape::Clock(c) | Shape::MonthUtc(c) => c,
+        Shape::Column(c) | Shape::Clock(c) | Shape::MonthUtc(c) | Shape::Scaled(c, _) => c,
     }
 }
 
@@ -403,6 +403,7 @@ impl Snail {
             let wanted = match *l {
                 Level::Column(c) => Shape::Column(c),
                 Level::MonthUtc(c) => Shape::MonthUtc(c),
+                Level::Scaled(c, k) => Shape::Scaled(c, k),
             };
             // A level is fixed by a range on it; `<>`, and a test that keeps NULLs, stay
             // conditions to read.
@@ -962,6 +963,9 @@ impl Snail {
                                 Shape::MonthUtc(_) => {
                                     v.int(r - start).and_then(month_of).map(i128::from)
                                 }
+                                Shape::Scaled(_, k) => v
+                                    .int(r - start)
+                                    .map(|x| i128::from(crate::places::scaled_key(x, k))),
                                 _ => v.wide(r - start),
                             };
                             c.holds(x)
@@ -1201,6 +1205,10 @@ pub(crate) fn narrowed(
             match l {
                 Level::Column(_) if ty.is_wide() => (KeyValue::Wide(s.min), KeyValue::Wide(s.max)),
                 Level::Column(_) => (KeyValue::Int(s.min as i64), KeyValue::Int(s.max as i64)),
+                Level::Scaled(_, k) => (
+                    KeyValue::Int(crate::places::scaled_key(s.min as i64, *k)),
+                    KeyValue::Int(crate::places::scaled_key(s.max as i64, *k)),
+                ),
                 Level::MonthUtc(_) => match (month_of(s.min as i64), month_of(s.max as i64)) {
                     (Some(a), Some(b))
                         if crate::times::civil(s.min as i64).0
@@ -1572,6 +1580,16 @@ fn summary_of(table: &Table, order: &Order, c: &Cond, e: &Entry) -> (Summary, us
         .expect("an order holds the columns read along it");
     let leaves = &e.columns[slots.clone()];
     if let [one] = leaves {
+        // A count of a double precision's places, from its least and greatest.
+        if let Shape::Scaled(_, k) = c.shape {
+            let scaled = |x: i128| i128::from(crate::places::scaled_key(x as i64, k));
+            let sum = Summary {
+                min: scaled(one.min),
+                max: scaled(one.max),
+                ..*one
+            };
+            return (sum, slots.start);
+        }
         return (*one, slots.start);
     }
     // A group's least and greatest: its leaves' least, and its leaves' greatest, each made into

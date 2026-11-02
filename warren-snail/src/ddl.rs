@@ -3569,7 +3569,7 @@ impl Draft {
                     for l in &k.levels {
                         match l {
                             Level::Column(c) => on.push(*c),
-                            Level::MonthUtc(_) => on.clear(),
+                            Level::MonthUtc(_) | Level::Scaled(..) => on.clear(),
                         }
                     }
                     let mut a = on.clone();
@@ -3884,11 +3884,13 @@ impl Draft {
                 Shape::Column(k) => t.columns[k].ty.default_opclass(),
                 Shape::Clock(_) => "timestamp_ops",
                 Shape::MonthUtc(_) => "int2_ops",
+                Shape::Scaled(..) => "float8_ops",
             };
             let key_type = match s {
                 Shape::Column(k) => t.columns[k].ty,
                 Shape::Clock(_) => ColumnType::Timestamp(None),
                 Shape::MonthUtc(_) => ColumnType::Int2,
+                Shape::Scaled(..) => ColumnType::Float8,
             };
             let named = c.operator_class.as_ref().map(|o| {
                 let o = object_name(o);

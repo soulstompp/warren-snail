@@ -7,8 +7,9 @@
 
 use crate::{Error, Result};
 use sqlparser::ast::{
-    CastKind, CharacterLength, DataType, DateTimeField, ExactNumberInfo, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, TimezoneInfo, Value,
+    BinaryOperator, CastKind, CeilFloorKind, CharacterLength, DataType, DateTimeField,
+    ExactNumberInfo, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    ObjectNamePart, TimezoneInfo, Value,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1001,13 +1002,16 @@ impl Column {
 pub enum Level {
     Column(usize),
     MonthUtc(usize),
+    /// A double precision column times 10 to the power given, floored: a count of its places' units,
+    /// as a DBA's `floor(latitude * 1000)` keys thousandths of a degree.
+    Scaled(usize, u32),
 }
 
 impl Level {
     /// The table column the level is read from.
     pub fn column(self) -> usize {
         match self {
-            Level::Column(c) | Level::MonthUtc(c) => c,
+            Level::Column(c) | Level::MonthUtc(c) | Level::Scaled(c, _) => c,
         }
     }
 }
@@ -1398,7 +1402,7 @@ impl Table {
                 .take(want.len())
                 .filter_map(|l| match l {
                     Level::Column(c) => Some(*c),
-                    Level::MonthUtc(_) => None,
+                    Level::MonthUtc(_) | Level::Scaled(..) => None,
                 })
                 .collect();
             lead.sort_unstable();
@@ -1858,6 +1862,8 @@ pub enum Shape {
     /// A timestamptz column at time zone 'UTC'.
     Clock(usize),
     MonthUtc(usize),
+    /// A double precision column times 10 to the power given, floored.
+    Scaled(usize, u32),
 }
 
 impl Sequence {
@@ -2465,6 +2471,11 @@ pub fn shape(
                 .ok_or_else(|| Error::new(format!("{p} is no argument of the function read"))),
             other => Err(Error::new(format!("{other} is a value, not a level"))),
         },
+        // floor(column * 10^k), a double precision column counted in its places' units.
+        Expr::Floor {
+            expr: inner,
+            field: CeilFloorKind::DateTimeField(DateTimeField::NoDateTime),
+        } => scaled(expr, inner, table, alias, columns, functions, env),
         Expr::Function(f) => {
             let name = object_name(&f.name);
             let function = functions
@@ -2575,11 +2586,61 @@ pub fn shape(
     }
 }
 
+/// The shape of `floor(column * 10^k)` on a double precision column, k from 1 to 9: a count of its
+/// k places' units.
+fn scaled(
+    f: &Expr,
+    arg: &Expr,
+    table: &str,
+    alias: Option<&str>,
+    columns: &[Column],
+    functions: &[Function],
+    env: &[Shape],
+) -> Result<Shape> {
+    let refused = || {
+        Error::new(format!(
+            "{f} is not a level the snail reads: floor of a double precision column times a \
+             power of ten is"
+        ))
+    };
+    let mut arg = arg;
+    while let Expr::Nested(e) = arg {
+        arg = e;
+    }
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Multiply,
+        right,
+    } = arg
+    else {
+        return Err(refused());
+    };
+    let power = |e: &Expr| match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => {
+                (1..=9u32).find(|&k| *n == format!("1{}", "0".repeat(k as usize)))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let (column, k) = match (power(left), power(right)) {
+        (None, Some(k)) => (left, k),
+        (Some(k), None) => (right, k),
+        _ => return Err(refused()),
+    };
+    match shape(column, table, alias, columns, functions, env)? {
+        Shape::Column(c) if columns[c].ty == ColumnType::Float8 => Ok(Shape::Scaled(c, k)),
+        _ => Err(refused()),
+    }
+}
+
 /// The level a key's expression is. A timestamptz column on the UTC clock keys as the column itself.
 pub(crate) fn level(s: Shape) -> Level {
     match s {
         Shape::Column(c) | Shape::Clock(c) => Level::Column(c),
         Shape::MonthUtc(c) => Level::MonthUtc(c),
+        Shape::Scaled(c, k) => Level::Scaled(c, k),
     }
 }
 

@@ -181,8 +181,8 @@ fn level_key(
         ),
         Datum::Bytes(b) => byte_key(ty, b),
         Datum::Wide(k) => KeyValue::Wide(*k),
-        Datum::Float4(b) => KeyValue::Int(crate::scalars::float4_key(*b)),
-        Datum::Float8(b) => KeyValue::Int(crate::scalars::float8_key(*b)),
+        Datum::Float4(b) => key(level, crate::scalars::float4_key(*b)),
+        Datum::Float8(b) => key(level, crate::scalars::float8_key(*b)),
         // A composed value by its key, written as text that sorts as the key does.
         Datum::Compound(c) => KeyValue::Text(c.hex.clone()),
         Datum::Null => null,

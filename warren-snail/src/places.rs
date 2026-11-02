@@ -276,7 +276,57 @@ pub fn key(level: Level, value: i64) -> KeyValue {
     match level {
         Level::Column(_) => KeyValue::Int(value),
         Level::MonthUtc(_) => KeyValue::Int(month_utc(value)),
+        Level::Scaled(_, k) => KeyValue::Int(scaled_key(value, k)),
     }
+}
+
+/// The key of a double precision keyed `class` (`scalars::float8_key`) times 10 to the `k`, floored,
+/// as PostgreSQL's float8mul and floor compute it.
+pub fn scaled_key(class: i64, k: u32) -> i64 {
+    let f = float8_of_key(class);
+    crate::scalars::float8_key((f * 10f64.powi(k as i32)).floor().to_bits())
+}
+
+/// The double precision a class key (`scalars::float8_key`) stands for, `-0` as `0`.
+pub fn float8_of_key(class: i64) -> f64 {
+    if class == 0x7ff0_0000_0000_0001 {
+        return f64::NAN;
+    }
+    let s = if class >= 0 {
+        class
+    } else {
+        class ^ 0x7fff_ffff_ffff_ffff
+    };
+    f64::from_bits(s as u64)
+}
+
+/// Rung `r` of a count of `k` places' units keyed `class`: the whole unit (a degree) first, then each
+/// place's digit as two rungs, its half of the ten and its place in that half; an infinity a place at
+/// either end, NaN past the top.
+fn scaled_rung(class: i64, k: u32, r: usize) -> i64 {
+    let f = float8_of_key(class);
+    if !f.is_finite() {
+        let at = if f.is_nan() {
+            i64::MAX
+        } else if f > 0.0 {
+            i64::MAX - 1
+        } else {
+            i64::MIN + 1
+        };
+        return if r == 0 { at } else { 0 };
+    }
+    let n = f as i128;
+    let unit = 10i128.pow(k);
+    if r == 0 {
+        return n.div_euclid(unit) as i64;
+    }
+    let place = (r - 1) / 2;
+    let digit = (n.rem_euclid(unit) / 10i128.pow(k - 1 - place as u32)) % 10;
+    (if (r - 1) % 2 == 0 {
+        digit / 5
+    } else {
+        digit % 5
+    }) as i64
 }
 
 /// The value level `li` of an order keys, from its column's value: an infinite instant's month is
@@ -292,6 +342,7 @@ pub fn level_key(order: &Order, li: usize, value: i64) -> KeyValue {
 pub fn by_equality(level: Level, table: &Table) -> bool {
     match level {
         Level::MonthUtc(_) => true,
+        Level::Scaled(..) => true,
         Level::Column(c) => !matches!(
             table.columns[c].ty,
             ColumnType::Timestamptz
@@ -306,6 +357,7 @@ pub fn by_equality(level: Level, table: &Table) -> bool {
 fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
     match level {
         Level::MonthUtc(_) => 2,
+        Level::Scaled(_, k) => 1 + 2 * k as usize,
         Level::Column(_) => match ty {
             ColumnType::Int2 => 16,
             ColumnType::Int4
@@ -400,6 +452,7 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize, bits: boo
             0 => (key - 1) / 6,
             _ => key,
         },
+        Level::Scaled(_, k) => scaled_rung(key, k, r),
         Level::Column(_) => match ty {
             ColumnType::Int2
             | ColumnType::Int4
@@ -1047,6 +1100,25 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_count_of_thousandths_rises_on_its_degree_then_each_place_in_halves_of_5() {
+        let key = |x: f64| crate::scalars::float8_key(x.to_bits());
+        let rungs = |x: f64| -> Vec<i64> { (0..7).map(|r| scaled_rung(key(x), 3, r)).collect() };
+        assert_eq!(rungs(51_507.0), [51, 1, 0, 0, 0, 1, 2]);
+        assert_eq!(rungs(-0.0), [0; 7]);
+        assert_eq!(rungs(-1.0), [-1, 1, 4, 1, 4, 1, 4]);
+        let mut all = vec![f64::NEG_INFINITY];
+        all.extend((-2_100..2_100).map(f64::from));
+        all.extend([f64::INFINITY, f64::NAN]);
+        let by_rungs: Vec<Vec<i64>> = all.iter().map(|&x| rungs(x)).collect();
+        assert!(by_rungs.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(
+            scaled_key(key(51.5074), 3),
+            key(51_507.0),
+            "floor(51.5074 * 1000)"
+        );
     }
 
     #[test]

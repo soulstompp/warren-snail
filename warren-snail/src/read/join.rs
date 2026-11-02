@@ -990,6 +990,7 @@ fn fixed(table: &Table, side: &super::question::Side) -> bool {
     side.empty
         || side.conds.iter().any(|c| match c.shape {
             crate::catalog::Shape::MonthUtc(x) => on_level(Level::MonthUtc(x)),
+            crate::catalog::Shape::Scaled(x, k) => on_level(Level::Scaled(x, k)),
             crate::catalog::Shape::Column(x) | crate::catalog::Shape::Clock(x) => {
                 on_level(Level::Column(x))
             }

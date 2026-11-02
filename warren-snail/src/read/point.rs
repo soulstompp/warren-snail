@@ -51,6 +51,7 @@ fn fixed_levels(order: &Order, table: &Table, side: &Side, given: &[usize]) -> u
         let shape = match l {
             Level::Column(c) => Shape::Column(c),
             Level::MonthUtc(c) => Shape::MonthUtc(c),
+            Level::Scaled(c, k) => Shape::Scaled(c, k),
         };
         side.conds
             .iter()
@@ -79,6 +80,7 @@ fn own_keys(order: &Order, table: &Table, side: &Side, own: usize) -> Vec<KeyVal
             let shape = match l {
                 Level::Column(c) => Shape::Column(c),
                 Level::MonthUtc(c) => Shape::MonthUtc(c),
+                Level::Scaled(c, k) => Shape::Scaled(c, k),
             };
             let v = side
                 .conds

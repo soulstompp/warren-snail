@@ -367,7 +367,7 @@ impl Piece {
         match self {
             Piece::Cond(c) => Some(match c.shape {
                 Shape::MonthUtc(x) => (x, true),
-                Shape::Column(x) | Shape::Clock(x) => (x, false),
+                Shape::Column(x) | Shape::Clock(x) | Shape::Scaled(x, _) => (x, false),
             }),
             Piece::Text(t) => Some((t.column, false)),
             Piece::Null(c, _) => Some((*c, false)),
@@ -589,6 +589,8 @@ fn uncast_to<'e>(e: &'e Expr, name: &str) -> &'e Expr {
 fn literal_i64(e: &Expr, s: Shape, table: &Table) -> Result<i64> {
     match s {
         Shape::MonthUtc(_) => number(e).ok_or_else(|| Error::new(format!("{e} is not a month"))),
+        // A count of a double precision's places is a double precision.
+        Shape::Scaled(c, _) => literal_i64(e, Shape::Column(c), table),
         Shape::Column(c) => match table.columns[c].ty {
             ty if crate::scalars::is_scalar(ty) => scalar_literal(e, ty, table.release),
             ty @ (ColumnType::Float4 | ColumnType::Float8) => {
@@ -959,6 +961,7 @@ fn truth_test(from: &From, e: &Expr) -> Result<Option<(usize, Cond)>> {
                 (_, Shape::Column(c)) | (_, Shape::Clock(c)) =>
                     from.table(side).columns[c].ty.pg_name(),
                 (_, Shape::MonthUtc(_)) => "smallint".into(),
+                (_, Shape::Scaled(..)) => "double precision".into(),
             }
         ))),
         _ => Ok(None),
@@ -1041,7 +1044,7 @@ impl From<'_> {
         match self.resolve(e)? {
             (side, Shape::Column(column)) => Ok(Key::Column(Col { side, column })),
             (side, Shape::MonthUtc(column)) => Ok(Key::Month(Col { side, column })),
-            (_, Shape::Clock(_)) => Err(Error::new(format!(
+            (_, Shape::Clock(_) | Shape::Scaled(..)) => Err(Error::new(format!(
                 "{e}: return the column itself, or its month"
             ))),
         }

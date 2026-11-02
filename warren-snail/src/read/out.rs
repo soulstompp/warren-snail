@@ -481,7 +481,7 @@ impl Snail {
                     }
                     Some(on)
                 }
-                Level::MonthUtc(_) => None,
+                Level::MonthUtc(_) | Level::Scaled(..) => None,
             })
             .collect::<Option<Vec<_>>>()
             .map(|levels| levels.concat());

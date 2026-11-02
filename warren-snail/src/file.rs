@@ -166,6 +166,20 @@ pub(crate) fn holds_catalog(format: u32, catalog: &crate::catalog::Catalog) -> c
         format!("the collation {}", k.name)
     } else if let Some(v) = catalog.views.first() {
         format!("the view {}", v.name)
+    } else if let Some((t, o)) = catalog.tables.iter().find_map(|t| {
+        t.orders
+            .iter()
+            .find(|o| {
+                o.levels
+                    .iter()
+                    .any(|l| matches!(l, crate::catalog::Level::Scaled(..)))
+            })
+            .map(|o| (t, o))
+    }) {
+        format!(
+            "{}'s {}, a level of a double precision's places",
+            t.name, o.name
+        )
     } else {
         return Ok(());
     };

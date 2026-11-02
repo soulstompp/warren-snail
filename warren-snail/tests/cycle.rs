@@ -473,3 +473,35 @@ fn a_key_as_long_as_postgresql_takes_is_held_between_separators() {
         .value(0);
     assert_eq!((n, round.blocks_read), (1, 1));
 }
+
+#[test]
+fn a_dba_s_thousandths_of_a_degree_are_cut_on_their_decimal_places_inside_the_degree() {
+    // 16,000 builders, 16 to each thousandth of 51°: the degree one place, its tenths in halves of 5
+    // and then each, 1,600 rows a tenth, its hundredths' halves 800, under the 1,024 a page of the
+    // 4-byte id holds: each tenth is a block.
+    let path = written(
+        "geo",
+        "CREATE TABLE s.t (id integer NOT NULL, latitude double precision NOT NULL, PRIMARY KEY (id));
+         CREATE INDEX t_cell ON s.t ((floor(latitude * 1000)), id);
+         ALTER TABLE s.t CLUSTER ON t_cell;",
+        vec![
+            (0..16_000).map(|i| Some(i.to_string())).collect(),
+            (0..16_000)
+                .map(|i| Some((51.0 + (i / 16) as f64 * 0.001 + 0.0004).to_string()))
+                .collect(),
+        ],
+    );
+    let blocks = Snail::open(&path).unwrap().blocks().unwrap();
+    assert_eq!(blocks_of(&blocks, "t_cell"), [1600; 10]);
+    let q = "SELECT count(*) FROM s.t t WHERE floor(t.latitude * 1000) = 51123";
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(q, Some("t_cell")).unwrap();
+    exact(q, &round);
+    let n = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!((n, round.blocks_read), (16, 1));
+}

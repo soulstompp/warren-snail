@@ -70,6 +70,9 @@ impl Predicate {
             let (v, i) = value(super::walk::s_column(c.shape));
             let x = match c.shape {
                 Shape::MonthUtc(_) => v.int(i).and_then(month_of).map(i128::from),
+                Shape::Scaled(_, k) => v
+                    .int(i)
+                    .map(|x| i128::from(crate::places::scaled_key(x, k))),
                 _ => v.wide(i),
             };
             c.holds(x)
