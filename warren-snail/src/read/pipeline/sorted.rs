@@ -92,7 +92,11 @@ impl Ord for Held {
 }
 
 /// The values a row is sorted by, refused where its type has no ordering.
-pub(super) fn sort_key(row: &[Value], sorted: &[usize], under: &[Option<Casing>]) -> Result<Vec<Value>> {
+pub(super) fn sort_key(
+    row: &[Value],
+    sorted: &[usize],
+    under: &[Option<Casing>],
+) -> Result<Vec<Value>> {
     sorted
         .iter()
         .enumerate()

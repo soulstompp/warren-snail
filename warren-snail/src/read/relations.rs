@@ -297,8 +297,9 @@ impl Parted {
             })?;
             let pass = hashed.pass(&mut |r| tie.hash_of_row(r, &frame))?;
             let held = match pass {
-                Some(p) if p.below.is_none() => {
-                    let rows: Vec<Vec<Value>> = p.rows.iter().map(|(_, r)| r.clone()).collect();
+                Some(mut p) if p.below.is_none() => {
+                    let rows: Vec<Vec<Value>> =
+                        std::mem::take(&mut p.rows).into_iter().map(|(_, r)| r).collect();
                     let refs: Vec<&Vec<Value>> = rows.iter().collect();
                     let index = Some(index_of(&refs)?);
                     PartedRows::Whole {

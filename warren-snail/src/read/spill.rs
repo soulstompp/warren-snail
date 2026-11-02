@@ -526,7 +526,10 @@ impl Run {
         let mut out = Vec::with_capacity(n as usize);
         for _ in 0..n {
             let row = loop {
-                let mut b = Bytes { b: &bytes, at: from };
+                let mut b = Bytes {
+                    b: &bytes,
+                    at: from,
+                };
                 match decode_row(&mut b, width, &s.named) {
                     Ok(row) => {
                         from = b.at;
@@ -707,7 +710,10 @@ mod tests {
         assert_eq!(w, 190);
         let mut many = Vec::new();
         for i in 0..100 {
-            many.push(vec![Value::Int(i % 10), Value::Text(format!("row {}", i % 10))]);
+            many.push(vec![
+                Value::Int(i % 10),
+                Value::Text(format!("row {}", i % 10)),
+            ]);
         }
         let run = Run::of(many.clone()).unwrap();
         assert_eq!((run.held().len(), run.spilled()), (52, 48));

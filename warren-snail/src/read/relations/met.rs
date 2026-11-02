@@ -185,7 +185,14 @@ fn batches(
         let rows = build.all()?;
         let rows: Vec<&Vec<Value>> = rows.iter().collect();
         return probe_pass(
-            keys, pairs, &rows, build_right, probe, keeps_probe, keeps_build, out,
+            keys,
+            pairs,
+            &rows,
+            build_right,
+            probe,
+            keeps_probe,
+            keeps_build,
+            out,
         );
     }
     let n = (build.bytes() / free.div_ceil(2)).max(1) as usize + 1;

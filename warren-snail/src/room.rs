@@ -168,12 +168,7 @@ impl Room {
         }
         let mut p = self.pages.borrow_mut();
         while self.held.get() + bytes + p.kept.len() as u64 * PAGE as u64 > size {
-            let Some(at) = p
-                .by_use
-                .values()
-                .find(|at| !p.pinned.contains(at))
-                .copied()
-            else {
+            let Some(at) = p.by_use.values().find(|at| !p.pinned.contains(at)).copied() else {
                 return false;
             };
             p.drop_at(at);
@@ -327,7 +322,10 @@ impl Room {
                 .create_new(true)
                 .open(&path)
                 .map_err(|e| {
-                    Error::new(format!("the round's spill in {} is not made: {e}", dir.display()))
+                    Error::new(format!(
+                        "the round's spill in {} is not made: {e}",
+                        dir.display()
+                    ))
                 })?;
             std::fs::remove_file(&path)?;
             *spill = Some(file);

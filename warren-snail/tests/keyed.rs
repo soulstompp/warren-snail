@@ -21,7 +21,8 @@ const FOUND: &str = "t.x BETWEEN 7000 AND 7001";
 /// The table with its key in `ty`, each row's key from `key`, its `x` the row's number.
 fn table(name: &str, types: &str, ty: &str, key: impl Fn(i64) -> String) -> std::path::PathBuf {
     let path = tmp(&format!("keyed-{name}.snail"));
-    let ddl = format!("{types} CREATE TABLE s.t (v {ty} NOT NULL, x bigint NOT NULL, PRIMARY KEY (v));");
+    let ddl =
+        format!("{types} CREATE TABLE s.t (v {ty} NOT NULL, x bigint NOT NULL, PRIMARY KEY (v));");
     let catalog = Catalog::parse(&ddl).unwrap();
     let t = catalog.table("s.t").unwrap();
     let mut v = Values::new(t.columns[0].ty);
@@ -40,7 +41,12 @@ fn table(name: &str, types: &str, ty: &str, key: impl Fn(i64) -> String) -> std:
     write(
         &path,
         &catalog,
-        &[("s.t".into(), Rows { columns: vec![v, x] })],
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![v, x],
+            },
+        )],
     )
     .unwrap();
     path
@@ -117,7 +123,9 @@ fn four(name: &str, types: &str, ty: &str, key: impl Fn(i64) -> String) {
         ),
     ] {
         let mut snail = Snail::open(&path).unwrap();
-        let (b, round) = snail.ask(&q, None).unwrap_or_else(|e| panic!("{name}: {q}: {e}"));
+        let (b, round) = snail
+            .ask(&q, None)
+            .unwrap_or_else(|e| panic!("{name}: {q}: {e}"));
         assert_eq!(one(&b, name), want, "{name}: {q}");
         kept(name, &q, &round, all);
     }
@@ -160,7 +168,9 @@ fn a_string_and_bytes_are_kept_to_their_keys() {
     four("name", "", "name", nibbles);
     four("bytea", "", "bytea", |i| format!("\\x{:04x}", i));
     four("bit", "", "bit(32)", |i| format!("{:032b}", i));
-    four("varbit", "", "bit varying", |i| format!("{:b}", i + (1 << 14)));
+    four("varbit", "", "bit varying", |i| {
+        format!("{:b}", i + (1 << 14))
+    });
 }
 
 #[test]
@@ -171,7 +181,9 @@ fn a_moment_and_a_span_are_kept_to_their_keys() {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string()
     };
-    four("timestamptz", "", "timestamptz", |i| format!("{}+00", at(i)));
+    four("timestamptz", "", "timestamptz", |i| {
+        format!("{}+00", at(i))
+    });
     four("timestamp", "", "timestamp", at);
     four("date", "", "date", |i| {
         chrono::DateTime::from_timestamp(1_514_764_800 + i * 86_400, 0)
@@ -216,8 +228,12 @@ fn the_scalars_are_kept_to_their_keys() {
 
 #[test]
 fn a_composed_value_and_the_types_kept_as_text_are_kept_to_their_keys() {
-    four("int4_array", "", "integer[]", |i| format!("{{{i},{}}}", i + 1));
-    four("text_array", "", "text[]", |i| format!("{{{}}}", nibbles(i)));
+    four("int4_array", "", "integer[]", |i| {
+        format!("{{{i},{}}}", i + 1)
+    });
+    four("text_array", "", "text[]", |i| {
+        format!("{{{}}}", nibbles(i))
+    });
     four("int4range", "", "int4range", |i| format!("[{i},{})", i + 1));
     four("int4multirange", "", "int4multirange", |i| {
         format!("{{[{i},{})}}", i + 1)

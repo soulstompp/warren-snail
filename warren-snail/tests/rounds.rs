@@ -21,7 +21,8 @@ const N: i64 = (1 << 14) - 1;
 /// The root's parent, past every id, so the root lies last.
 const ROOT_PARENT: i64 = 1 << 14;
 
-const DDL: &str = "CREATE TABLE s.t (parent bigint NOT NULL, id bigint NOT NULL, PRIMARY KEY (parent, id));";
+const DDL: &str =
+    "CREATE TABLE s.t (parent bigint NOT NULL, id bigint NOT NULL, PRIMARY KEY (parent, id));";
 
 /// The tree, as a snail of its own.
 fn tree(name: &str) -> PathBuf {
@@ -95,9 +96,7 @@ fn each_read_exact(q: &str, round: &Round) {
 /// The column pages of the whole table, as a read of every row reads them.
 fn whole(path: &PathBuf) -> u64 {
     let mut snail = Snail::open(path).unwrap();
-    let (_, r) = snail
-        .ask("SELECT t.parent, t.id FROM s.t t", None)
-        .unwrap();
+    let (_, r) = snail.ask("SELECT t.parent, t.id FROM s.t t", None).unwrap();
     r.column_pages_predicted
 }
 
@@ -177,9 +176,11 @@ fn a_table_met_with_rows_made_before_it_is_kept_to_their_keys_in_each_place() {
                     AND EXISTS (SELECT 1 FROM s.t u WHERE u.parent = t.id)";
     // The children of 100 to 110, 200 to 221, are parents: an INTERSECT keeps the 22; an EXCEPT of
     // the children of 8000 to 8191, 16000 to 16383, keeps all 384, none of them a parent.
-    let intersect = "SELECT count(*) FROM (SELECT t.id FROM s.t t WHERE t.parent BETWEEN 100 AND 110 \
+    let intersect =
+        "SELECT count(*) FROM (SELECT t.id FROM s.t t WHERE t.parent BETWEEN 100 AND 110 \
                      INTERSECT SELECT u.parent FROM s.t u) x";
-    let except = "SELECT count(*) FROM (SELECT t.id FROM s.t t WHERE t.parent BETWEEN 8000 AND 8191 \
+    let except =
+        "SELECT count(*) FROM (SELECT t.id FROM s.t t WHERE t.parent BETWEEN 8000 AND 8191 \
                   EXCEPT SELECT u.parent FROM s.t u) x";
     for (q, want, reads) in [
         (step, 48_006, 2),
@@ -200,7 +201,8 @@ fn a_table_met_with_rows_made_before_it_is_kept_to_their_keys_in_each_place() {
     }
     // A table a RIGHT JOIN keeps whole is never kept to the other side's keys: every node, four of
     // them met.
-    let right = "SELECT count(*), count(k.id) FROM (SELECT t.id FROM s.t t WHERE t.parent = 3000) k \
+    let right =
+        "SELECT count(*), count(k.id) FROM (SELECT t.id FROM s.t t WHERE t.parent = 3000) k \
                  RIGHT JOIN s.t u ON u.parent = k.id";
     let mut snail = Snail::open(&path).unwrap();
     let (b, round) = snail.ask(right, None).unwrap();
@@ -208,10 +210,19 @@ fn a_table_met_with_rows_made_before_it_is_kept_to_their_keys_in_each_place() {
     let rows = warren_snail::read::pipeline_rows(&b).unwrap();
     assert_eq!(
         format!("{rows:?}"),
-        format!("{:?}", [[warren_snail::read::Value::Int(N), warren_snail::read::Value::Int(4)]]),
+        format!(
+            "{:?}",
+            [[
+                warren_snail::read::Value::Int(N),
+                warren_snail::read::Value::Int(4)
+            ]]
+        ),
         "{right}"
     );
-    assert_eq!(round.reads[1].column_pages_predicted, table, "{right}: {round:?}");
+    assert_eq!(
+        round.reads[1].column_pages_predicted, table,
+        "{right}: {round:?}"
+    );
 }
 
 #[test]
@@ -224,9 +235,16 @@ fn a_page_read_once_in_a_round_is_not_read_again() {
     let (got, round) = asked(&path, q);
     assert_eq!(got, 2 * N);
     assert_eq!(round.reads.len(), 2);
-    assert_eq!(round.reads[0].column_pages_read, table / 2, "{q}: {round:?}");
     assert_eq!(
-        (round.reads[1].column_pages_held, round.reads[1].column_pages_read),
+        round.reads[0].column_pages_read,
+        table / 2,
+        "{q}: {round:?}"
+    );
+    assert_eq!(
+        (
+            round.reads[1].column_pages_held,
+            round.reads[1].column_pages_read
+        ),
         (table / 2, 0),
         "{q}: {round:?}"
     );
@@ -303,9 +321,11 @@ fn a_step_past_the_round_s_room_writes_the_rows_past_it_once_and_reads_them_back
     // The step reading it is handed its FROM a chunk at a time: the most held is the room, and what
     // one chunk holds, the rows of a block of the table or of four pages of the spill.
     assert!(
-        round.bytes_held >= held * row + 4 * 4096 && round.bytes_held <= room + one_chunk(&path, row),
+        round.bytes_held >= held * row + 4 * 4096
+            && round.bytes_held <= room + one_chunk(&path, row),
         "{q}: {round:?}"
     );
+    eprintln!("room {room}: most held {}", round.bytes_held);
     assert_eq!(
         std::fs::read_dir(&dir).unwrap().count(),
         0,
@@ -378,7 +398,8 @@ fn a_window_past_the_round_s_room_holds_every_partition_whole_and_writes_the_row
 }
 
 /// Purchases: 16,384, each of one of 512 owners spread over them, at its own moment.
-const P_DDL: &str = "CREATE TABLE s.p (id bigint NOT NULL, owner bigint NOT NULL, at bigint NOT NULL, \
+const P_DDL: &str =
+    "CREATE TABLE s.p (id bigint NOT NULL, owner bigint NOT NULL, at bigint NOT NULL, \
                      PRIMARY KEY (id)); CREATE INDEX p_owner ON s.p (owner, at) INCLUDE (id);";
 const PURCHASES: i64 = 1 << 14;
 
@@ -532,17 +553,18 @@ fn a_table_kept_to_a_few_keys_reads_their_block_in_part() {
          PRIMARY KEY (k));"
     );
     let catalog = Catalog::parse(&ddl).unwrap();
-    let column = |table: &str, c: usize, f: &dyn Fn(i64) -> i64, n: std::ops::RangeInclusive<i64>| {
-        let col = &catalog.table(table).unwrap().columns[c];
-        let mut v = Values::new(col.ty);
-        for i in n {
-            push_datum(
-                &mut v,
-                &warren_snail::composed::scalar_in(col.ty, &f(i).to_string()).unwrap(),
-            );
-        }
-        v
-    };
+    let column =
+        |table: &str, c: usize, f: &dyn Fn(i64) -> i64, n: std::ops::RangeInclusive<i64>| {
+            let col = &catalog.table(table).unwrap().columns[c];
+            let mut v = Values::new(col.ty);
+            for i in n {
+                push_datum(
+                    &mut v,
+                    &warren_snail::composed::scalar_in(col.ty, &f(i).to_string()).unwrap(),
+                );
+            }
+            v
+        };
     let parent = |id: i64| if id == 1 { ROOT_PARENT } else { id / 2 };
     let tree = Rows {
         columns: vec![
@@ -575,7 +597,10 @@ fn a_table_kept_to_a_few_keys_reads_their_block_in_part() {
         (1, 2),
         "{q}: {kept:?}"
     );
-    assert!(kept.column_pages_high > 2, "{q}: more than it reads: {kept:?}");
+    assert!(
+        kept.column_pages_high > 2,
+        "{q}: more than it reads: {kept:?}"
+    );
 }
 
 #[test]
@@ -637,15 +662,29 @@ fn a_join_of_two_sides_past_the_room_is_met_in_batches_each_row_read_back_once()
             round.spill_pages_written >= least && round.spill_pages_written <= least + 18,
             "{q}: {round:?}"
         );
-        assert_eq!(round.spill_pages_read, round.spill_pages_written, "{q}: {round:?}");
-        assert!(round.bytes_held <= room + one_chunk(&path, row), "{q}: {round:?}");
+        assert_eq!(
+            round.spill_pages_read, round.spill_pages_written,
+            "{q}: {round:?}"
+        );
+        assert!(
+            round.bytes_held <= room + one_chunk(&path, row),
+            "{q}: {round:?}"
+        );
+        eprintln!(
+            "{q}: {} pages written, most held {}",
+            round.spill_pages_written, round.bytes_held
+        );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         // With room for it all, nothing is written.
         let mut snail = Snail::open(&path).unwrap();
         snail.size_rounds(Sizes::default().in_dir(&dir));
         let (b, round) = snail.ask(&q, None).unwrap();
         assert_eq!(ints_or_nums(&b), want, "{q}");
-        assert_eq!((round.spill_pages_written, round.spill_pages_read), (0, 0), "{q}");
+        assert_eq!(
+            (round.spill_pages_written, round.spill_pages_read),
+            (0, 0),
+            "{q}"
+        );
     }
 }
 
@@ -671,7 +710,10 @@ fn a_join_of_a_side_the_room_holds_hashes_it_and_reads_the_other_a_chunk_at_a_ti
         (past, past),
         "{q}: {round:?}"
     );
-    assert!(round.bytes_held <= room + one_chunk(&path, 18), "{q}: {round:?}");
+    assert!(
+        round.bytes_held <= room + one_chunk(&path, 18),
+        "{q}: {round:?}"
+    );
 }
 
 /// The integers of an answer's one row.
@@ -732,8 +774,15 @@ fn a_set_operation_s_image_past_the_room_is_met_in_passes_each_key_whole_in_one(
     let (b, round) = snail.ask(q, None).unwrap();
     each_read_exact(q, &round);
     assert_eq!(one(&b), 2 * N, "{q}");
-    assert_eq!((round.spill_pages_written, round.spill_pages_read), (56, 56), "{q}: {round:?}");
-    assert!(round.bytes_held <= room + one_chunk(&path, 9), "{q}: {round:?}");
+    assert_eq!(
+        (round.spill_pages_written, round.spill_pages_read),
+        (56, 56),
+        "{q}: {round:?}"
+    );
+    assert!(
+        round.bytes_held <= room + one_chunk(&path, 9),
+        "{q}: {round:?}"
+    );
 }
 
 #[test]
@@ -746,8 +795,14 @@ fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in
         snail.size_rounds(Sizes::of(room).in_dir(&dir));
         let (b, round) = snail.ask(q, None).unwrap_or_else(|e| panic!("{q}: {e}"));
         weather::exact(q, &round);
-        assert_eq!(round.spill_pages_read, round.spill_pages_written, "{q}: {round:?}");
-        assert!(round.bytes_held <= room + one_chunk(&path, 18), "{q}: {round:?}");
+        assert_eq!(
+            round.spill_pages_read, round.spill_pages_written,
+            "{q}: {round:?}"
+        );
+        assert!(
+            round.bytes_held <= room + one_chunk(&path, 18),
+            "{q}: {round:?}"
+        );
         (ints(&b), round)
     };
     // Every node, last first: each pass of 3,640 rows of 9 bytes hands on the greatest left.
@@ -758,7 +813,8 @@ fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in
     // Its OFFSET and LIMIT across the passes; and its ties: two rows a parent.
     let (got, _) = ints_of("SELECT t.id FROM s.t t ORDER BY t.id DESC OFFSET 8000 LIMIT 3");
     assert_eq!(got, [[N - 8000], [N - 8001], [N - 8002]]);
-    let (got, _) = ints_of("SELECT t.parent FROM s.t t ORDER BY t.parent FETCH FIRST 3 ROWS WITH TIES");
+    let (got, _) =
+        ints_of("SELECT t.parent FROM s.t t ORDER BY t.parent FETCH FIRST 3 ROWS WITH TIES");
     assert_eq!(got, [[1], [1], [2], [2]]);
     // Sorted in a step, read back in that order by the one after it.
     let (got, _) = ints_of(
@@ -825,7 +881,10 @@ fn a_join_of_tables_whose_counts_may_not_fit_the_room_is_met_as_rows_in_it() {
     let (b, round) = snail.ask(q, None).unwrap();
     each_read_exact(q, &round);
     assert_eq!(one(&b), want);
-    assert!(round.bytes_held <= room + one_chunk(&path, 27), "{q}: {round:?}");
+    assert!(
+        round.bytes_held <= room + one_chunk(&path, 27),
+        "{q}: {round:?}"
+    );
 }
 
 /// Purchases, beside a table of their 512 owners.
@@ -914,8 +973,14 @@ fn a_subquery_s_kept_table_past_the_room_is_read_back_in_the_order_of_its_keys_h
     let (b, round) = snail.ask(q, None).unwrap();
     each_read_exact(q, &round);
     assert_eq!(one(&b), 512, "{q}");
-    assert!(round.spill_pages_read > round.spill_pages_written, "{q}: {round:?}");
-    assert!(round.bytes_held <= 4096 + one_chunk(&path, 27) + 16 * 9, "{q}: {round:?}");
+    assert!(
+        round.spill_pages_read > round.spill_pages_written,
+        "{q}: {round:?}"
+    );
+    assert!(
+        round.bytes_held <= 4096 + one_chunk(&path, 27) + 16 * 9,
+        "{q}: {round:?}"
+    );
     // An uncorrelated IN's rows past the room, their keys fitting no room, are read by each row.
     let q = "SELECT count(*) FROM s.p p WHERE p.id < 4 AND p.id IN (SELECT q.owner FROM s.p q)";
     let mut snail = Snail::open(&path).unwrap();
@@ -924,12 +989,17 @@ fn a_subquery_s_kept_table_past_the_room_is_read_back_in_the_order_of_its_keys_h
     each_read_exact(q, &round);
     // Ids 0 to 3 are each some purchase's owner: 7,919 is prime to 512.
     assert_eq!(one(&b), 4, "{q}");
-    assert!(round.bytes_held <= 4096 + one_chunk(&path, 27) + 4 * 27, "{q}: {round:?}");
+    assert!(
+        round.bytes_held <= 4096 + one_chunk(&path, 27) + 4 * 27,
+        "{q}: {round:?}"
+    );
 }
 
 /// Each purchase, as (id, owner, moment), by the owners and moments it reads in.
 fn all_purchases() -> Vec<(i64, i64, i64)> {
-    (0..PURCHASES).map(|i| (i, owner(i), PURCHASES - i)).collect()
+    (0..PURCHASES)
+        .map(|i| (i, owner(i), PURCHASES - i))
+        .collect()
 }
 
 #[test]
@@ -950,11 +1020,16 @@ fn an_order_by_a_strand_gives_is_read_along_it_where_its_price_is_fewest() {
         weather::exact(q, &round);
         assert_eq!(ints(&b), want, "{room}");
         assert_eq!(round.order, order, "{room}");
-        assert_eq!((round.spill_pages_written, round.spill_pages_read), (0, 0), "{round:?}");
+        assert_eq!(
+            (round.spill_pages_written, round.spill_pages_read),
+            (0, 0),
+            "{round:?}"
+        );
     }
     // A step's ORDER BY, read along the strand: its rows past the room are its own, 27 bytes each,
     // written once and read back once in that order.
-    let q = "SELECT y.id FROM (SELECT p.owner, p.at, p.id FROM s.p p ORDER BY p.owner, p.at) y LIMIT 4";
+    let q =
+        "SELECT y.id FROM (SELECT p.owner, p.at, p.id FROM s.p p ORDER BY p.owner, p.at) y LIMIT 4";
     let room: u64 = 64 << 10;
     let mut snail = Snail::open(&path).unwrap();
     snail.size_rounds(Sizes::of(room).in_dir(&dir));
@@ -1021,7 +1096,9 @@ fn a_caller_s_ordered_aggregate_along_a_strand_lets_each_group_go_as_its_key_cha
     for (room, order) in [(64u64 << 10, "p_owner"), (128 << 20, "p_pkey")] {
         let mut snail = Snail::open(&path).unwrap();
         snail
-            .hand(Function::aggregate("last_of", &[ty], ty, || Box::new(LastOf(0))))
+            .hand(Function::aggregate("last_of", &[ty], ty, || {
+                Box::new(LastOf(0))
+            }))
             .unwrap();
         snail.size_rounds(Sizes::of(room).in_dir(&dir));
         let (b, round) = snail.ask(q, None).unwrap();
@@ -1043,7 +1120,9 @@ fn a_caller_s_ordered_aggregate_along_a_strand_lets_each_group_go_as_its_key_cha
     let room = 64u64 << 10;
     let mut snail = Snail::open(&path).unwrap();
     snail
-        .hand(Function::aggregate("last_of", &[ty], ty, || Box::new(LastOf(0))))
+        .hand(Function::aggregate("last_of", &[ty], ty, || {
+            Box::new(LastOf(0))
+        }))
         .unwrap();
     snail.size_rounds(Sizes::of(room).in_dir(&dir));
     let (b, round) = snail.ask(q, None).unwrap();
@@ -1051,7 +1130,10 @@ fn a_caller_s_ordered_aggregate_along_a_strand_lets_each_group_go_as_its_key_cha
     let mut got = ints(&b);
     got.sort();
     assert_eq!(got, want, "{q}");
-    assert!(round.reads.iter().any(|r| r.order == "p_owner"), "{round:?}");
+    assert!(
+        round.reads.iter().any(|r| r.order == "p_owner"),
+        "{round:?}"
+    );
     assert_eq!(round.spill_pages_written, 0, "{round:?}");
 }
 
@@ -1070,14 +1152,20 @@ fn a_window_over_a_join_along_its_first_table_s_strand_holds_one_partition_at_a_
     let mut got = ints(&b);
     got.sort();
     assert_eq!(got, want, "{q}");
-    assert!(round.reads.iter().any(|r| r.order == "p_owner"), "{round:?}");
+    assert!(
+        round.reads.iter().any(|r| r.order == "p_owner"),
+        "{round:?}"
+    );
     assert_eq!(
         (round.spill_pages_written, round.spill_pages_read),
         (0, 0),
         "{q}: {round:?}"
     );
     // Beside the room, a block of the table in hand and a chunk of the rows it makes.
-    assert!(round.bytes_held <= room + 2 * one_chunk(&path, 27), "{q}: {round:?}");
+    assert!(
+        round.bytes_held <= room + 2 * one_chunk(&path, 27),
+        "{q}: {round:?}"
+    );
     // A LEFT JOIN keeps each row of its first table, those that meet none among them: the owners
     // from 256 on meet none.
     let left = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
@@ -1089,7 +1177,10 @@ fn a_window_over_a_join_along_its_first_table_s_strand_holds_one_partition_at_a_
     let mut got = ints(&b);
     got.sort();
     assert_eq!(got, want, "{left}");
-    assert!(round.reads.iter().any(|r| r.order == "p_owner"), "{round:?}");
+    assert!(
+        round.reads.iter().any(|r| r.order == "p_owner"),
+        "{round:?}"
+    );
     // With the other side past the room, 512 owners at 9 bytes in 4 KiB, its order is lost: the
     // partitions held whole, and the answer the same over the first 32 owners' purchases.
     let q = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \

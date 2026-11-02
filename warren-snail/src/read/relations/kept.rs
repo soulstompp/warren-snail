@@ -100,7 +100,9 @@ fn kept_value(v: &Value, c: &Column) -> Option<KeyValue> {
             Some(KeyValue::Wide(i.total()))
         }
         Value::Composed(t, x) if *t == ty && !x.item.is_null() => match &x.item {
-            crate::composed::Item::Scalar(crate::read::statement::Datum::Int(rank)) if !ty.is_nested() => {
+            crate::composed::Item::Scalar(crate::read::statement::Datum::Int(rank))
+                if !ty.is_nested() =>
+            {
                 Some(KeyValue::Int(*rank))
             }
             _ if ty.is_nested() => Some(crate::places::byte_key(ty, x.hex.as_bytes())),
@@ -155,11 +157,7 @@ pub(super) struct Kept {
 impl Kept {
     pub(super) fn of(keep: &Keep, node_at: usize, table: &Table) -> Kept {
         let columns: Vec<usize> = stored(table).collect();
-        let cols: Vec<usize> = keep
-            .places
-            .iter()
-            .map(|p| columns[p - node_at])
-            .collect();
+        let cols: Vec<usize> = keep.places.iter().map(|p| columns[p - node_at]).collect();
         let keyable: Vec<bool> = (0..cols.len())
             .map(|i| {
                 keep.values.iter().all(|r| match r[i].is_null() {

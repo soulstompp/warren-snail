@@ -78,8 +78,10 @@ fn of_windows(s: &Select) -> Option<Wants<'_>> {
     }
     let first = *specs.first()?;
     let text = |es: &mut dyn Iterator<Item = String>| es.collect::<Vec<_>>();
-    let parts = |s: &sqlparser::ast::WindowSpec| text(&mut s.partition_by.iter().map(|e| e.to_string()));
-    let orders = |s: &sqlparser::ast::WindowSpec| text(&mut s.order_by.iter().map(|e| e.to_string()));
+    let parts =
+        |s: &sqlparser::ast::WindowSpec| text(&mut s.partition_by.iter().map(|e| e.to_string()));
+    let orders =
+        |s: &sqlparser::ast::WindowSpec| text(&mut s.order_by.iter().map(|e| e.to_string()));
     if specs
         .iter()
         .any(|s| parts(s) != parts(first) || orders(s) != orders(first))
@@ -119,7 +121,11 @@ fn of_groups<'q>(s: &'q Select, grouping: &'q [Expr]) -> Option<Wants<'q>> {
             }
         }
         match &ordered {
-            Some(o) if o.iter().map(|e| e.to_string()).ne(this.iter().map(|e| e.to_string())) => {
+            Some(o)
+                if o.iter()
+                    .map(|e| e.to_string())
+                    .ne(this.iter().map(|e| e.to_string())) =>
+            {
                 return None
             }
             _ => ordered = Some(this),
@@ -193,7 +199,9 @@ pub(super) fn led_by(
         o.method == Method::Btree
             && o.predicate.is_none()
             && o.levels.len() >= lead
-            && (0..lead).all(|i| !o.desc[i] && !o.nulls_first[i])
+            && (0..lead).all(|i| {
+                !o.desc[i] && !o.nulls_first[i] && !table.columns[o.levels[i].column()].collated()
+            })
             && o.levels[..by.len()].iter().all(|l| match l {
                 Level::Column(c) => by.contains(c),
                 _ => false,
@@ -269,9 +277,10 @@ impl Snail {
             .map(|&c| held_width(table.columns[c].ty))
             .sum();
         let room = self.reader.room().sizes().bytes;
-        let sort = 2 * (along.rows.1 * width)
-            .saturating_sub(room)
-            .div_ceil(PAGE as u64);
+        let sort = 2
+            * (along.rows.1 * width)
+                .saturating_sub(room)
+                .div_ceil(PAGE as u64);
         Ok(from_file(&by) < from_file(&along) + sort)
     }
 }
