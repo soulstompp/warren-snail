@@ -1,9 +1,11 @@
 //! The rows on each place of the level an order leads with, read from its directory: each entry
 //! whose rows all lie on one place counted whole, and below the entries that hold several, each
-//! page by the place it begins on, down to the page.
+//! page by the place it begins on, down to the page. An entry's places are bounded by its keys and
+//! by the least and greatest its leaves keep.
 
+use super::walk::narrowed;
 use super::Snail;
-use crate::catalog::Level as Leading;
+use crate::catalog::{Level as Leading, Order, Table};
 use crate::directory::{decode_page, read_map, Entry, Head};
 use crate::places::KeyValue;
 use crate::{Error, Result};
@@ -110,6 +112,7 @@ impl Snail {
         };
         let within = !unique
             && self.count(
+                (t, order),
                 &head,
                 &entries,
                 head.height,
@@ -131,6 +134,7 @@ impl Snail {
     /// where reading below them would pass `until` pages touched.
     fn count(
         &self,
+        on: (&Table, &Order),
         head: &Head,
         entries: &[Entry],
         height: u32,
@@ -138,7 +142,8 @@ impl Snail {
         until: u64,
     ) -> Result<bool> {
         for e in entries {
-            let (Some(first), Some(last)) = (e.first.first(), e.last.first()) else {
+            let (lo, hi, _) = narrowed(e, on.1, on.0);
+            let (Some(first), Some(last)) = (lo.first(), hi.first()) else {
                 counted.whole = false;
                 continue;
             };
@@ -151,20 +156,27 @@ impl Snail {
             }
             if height > 1 {
                 let below = decode_page(&self.reader.read_extent(e.child)?, head, e.bound())?;
-                if !self.count(head, &below, height - 1, counted, until)? {
+                if !self.count(on, head, &below, height - 1, counted, until)? {
                     return Ok(false);
                 }
             } else {
-                self.count_block(head, e, counted)?;
+                self.count_block(head, e, last, counted)?;
             }
         }
         Ok(true)
     }
 
     /// Counts a block's places by its page map: a page whose first row and the next page's lie on
-    /// one place holds that place alone; any other holds rows of both and of whatever lies between,
-    /// as do the rows written after the block's sorted rows, wherever their keys lie in it.
-    fn count_block(&self, head: &Head, e: &Entry, counted: &mut Counted) -> Result<()> {
+    /// one place holds that place alone, the last page's next its block's `last`; any other holds
+    /// rows of both and of whatever lies between, as do the rows written after the block's sorted
+    /// rows, wherever their keys lie in it.
+    fn count_block(
+        &self,
+        head: &Head,
+        e: &Entry,
+        last: &KeyValue,
+        counted: &mut Counted,
+    ) -> Result<()> {
         let map = read_map(&self.reader, e, &head.level_text)?;
         let Some(pages) = map.columns.iter().map(|c| &c.pages).max_by_key(|p| p.len()) else {
             counted.whole = false;
@@ -199,7 +211,7 @@ impl Snail {
                 .get(i + 1)
                 .filter(|n| n.first_row < sorted)
                 .and_then(|n| n.first.first())
-                .or(e.last.first());
+                .or(Some(last));
             match (p.first.first(), next) {
                 (Some(a), Some(b)) if a == b => add(a, live, live),
                 (Some(a), Some(b)) => {

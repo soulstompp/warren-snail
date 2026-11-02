@@ -9,7 +9,7 @@ use warren_snail::places::KeyValue;
 use warren_snail::read::{LevelCounts, Snail};
 use warren_snail::values::Values;
 use warren_snail::write::Rows;
-use weather::{fresh, ints64, tmp, write};
+use weather::{fresh, ints64, span, tmp, write};
 
 const DDL: &str = "CREATE TABLE s.t (id bigint NOT NULL, k integer, w integer NOT NULL, \
                    m integer NOT NULL, PRIMARY KEY (id));
@@ -152,6 +152,60 @@ fn a_level_whose_places_lie_several_to_a_page_is_bounded_by_its_pages() {
     let none = snail.level_counts("s.t", "w", 0).unwrap().unwrap();
     assert_eq!((none.places, none.rows, none.nulls), (None, ROWS as u64, 0));
     assert!(none.directory_pages < l.directory_pages);
+}
+
+const GAPS: &str = "CREATE TABLE s.g (id bigint NOT NULL, g integer NOT NULL, d bigint NOT NULL, \
+                    PRIMARY KEY (id));
+                    CREATE INDEX g_g ON s.g (g, id);
+                    ALTER TABLE s.g CLUSTER ON g_g;
+                    CREATE INDEX g_d ON s.g (d, id);";
+
+/// Row `i`'s g: ten values ten apart, 2,000 rows each; its d: five values a week apart, the last
+/// the rarest.
+fn gap_of(i: i64) -> (i64, i64) {
+    (10 * (i / 2000), 18_000 + 7 * [0, 0, 1, 1, 2, 2, 3, 3, 3, 4][(i % 10) as usize])
+}
+
+/// A level whose places each fill blocks of their own, the next block's value never the next
+/// value, is counted exactly from the entries' least and greatest, in format 9 as in format 8, on
+/// the table's order and on a strand; and a date's level so in format 9, which a snail of format 8
+/// does not hold.
+#[test]
+fn places_apart_are_counted_exactly_from_the_leaves_least_and_greatest() {
+    let rows = || Rows {
+        columns: vec![
+            Values::Int((0..ROWS).map(Some).collect()),
+            Values::Int((0..ROWS).map(|i| Some(gap_of(i).0)).collect()),
+            Values::Int((0..ROWS).map(|i| Some(gap_of(i).1)).collect()),
+        ],
+    };
+    let catalog = Catalog::parse(GAPS).unwrap();
+    let dated = Catalog::parse(&GAPS.replace("d bigint", "d date")).unwrap();
+    let nine = tmp("level-gaps-9.snail");
+    write(&nine, &catalog, &[("s.g".into(), rows())]).unwrap();
+    let eight = tmp("level-gaps-8.snail");
+    warren_snail::write::write_format_eight(&eight, &catalog, &[("s.g".into(), rows())], span())
+        .unwrap();
+    let date = tmp("level-gaps-date.snail");
+    write(&date, &dated, &[("s.g".into(), rows())]).unwrap();
+    for (path, format) in [(nine, "9"), (eight, "8"), (date, "9, a date")] {
+        let snail = fresh(&path);
+        for (column, held) in [
+            ("g", plain((0..ROWS).map(|i| gap_of(i).0))),
+            ("d", plain((0..ROWS).map(|i| gap_of(i).1))),
+        ] {
+            let l = snail.level_counts("s.g", column, u64::MAX).unwrap().unwrap();
+            assert!(l.whole, "{format} {column}: {l:?}");
+            let counted: BTreeMap<i64, u64> = keyed(&l)
+                .into_iter()
+                .map(|(v, low, high)| {
+                    assert_eq!(low, high, "{format} {column} {v}");
+                    (v, low)
+                })
+                .collect();
+            assert_eq!(counted, held, "{format} {column}");
+        }
+    }
 }
 
 /// A column that is a key alone is not walked: every row holds its own value.
