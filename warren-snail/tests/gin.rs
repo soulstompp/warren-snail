@@ -2705,6 +2705,17 @@ fn a_gist_index_beside_a_key_of_another_kind_holds_a_strand_of_each() {
             .contains("no default operator class"),
         "{got:?}"
     );
+    let got = outcomes(
+        "CREATE TABLE s.x (id int PRIMARY KEY, v tsvector, r int4range, \
+         EXCLUDE USING gist (v WITH @@, r WITH &&));",
+    );
+    assert!(
+        got[0]
+            .as_deref()
+            .unwrap()
+            .contains("operator does not exist: tsvector @@ tsvector"),
+        "{got:?}"
+    );
     // Clustered on it, the table has no order one row a place.
     let got = outcomes(&format!(
         "{table}\nCREATE INDEX e ON s.t USING gist (v, r);\nALTER TABLE s.t CLUSTER ON e;"

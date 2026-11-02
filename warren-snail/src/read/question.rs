@@ -2137,7 +2137,8 @@ fn arms_of(from: &From, e: &Expr) -> Result<Arms> {
                 }
             }
             // A condition a strand of the table answers by its span stands as one an element's does.
-            let element = matches!(read.as_slice(), [Conj::One(_, Piece::Op(o))] if o.probe.is_some());
+            let element =
+                matches!(read.as_slice(), [Conj::One(_, Piece::Op(o))] if o.probe.is_some());
             let (mut expr, mut columns) = (e.clone(), Vec::new());
             if !own_names(&mut expr, from.table(side), &mut columns) {
                 return Err(Error::new(format!("{e} is not held a row at a time here")));
