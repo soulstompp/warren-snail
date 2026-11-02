@@ -59,7 +59,7 @@ pub struct TableOut {
 
 /// The columns of `table` holding an extreme, by the least and greatest each block of `order` keeps
 /// of their leaves: an infinity at the ends of its leaf, a time's 24:00:00, an interval's infinity
-/// with each of its leaves at an end.
+/// at the ends of its one leaf.
 fn held_extremes(table: &Table, order: &crate::catalog::Order, blocks: &[Entry]) -> Vec<String> {
     use crate::times::TIME_END;
     let mut out = Vec::new();
@@ -84,18 +84,10 @@ fn held_extremes(table: &Table, order: &crate::catalog::Order, blocks: &[Entry])
             ColumnType::Time(_) | ColumnType::Timetz(_) => {
                 holds(&|s| s[0].max == i128::from(TIME_END))
             }
-            ColumnType::Interval { .. } => holds(&|s| {
-                let at = |pick: fn(&crate::directory::Summary) -> i128, e: [i128; 3]| {
-                    s.iter().zip(e).all(|(x, e)| pick(x) == e)
-                };
-                at(
-                    |x| x.max,
-                    [i32::MAX.into(), i32::MAX.into(), i64::MAX.into()],
-                ) || at(
-                    |x| x.min,
-                    [i32::MIN.into(), i32::MIN.into(), i64::MIN.into()],
-                )
-            }),
+            ColumnType::Interval { .. } => holds(&ends(
+                crate::times::Interval::NEG_INFINITY.total(),
+                crate::times::Interval::INFINITY.total(),
+            )),
             _ => false,
         };
         if found {
