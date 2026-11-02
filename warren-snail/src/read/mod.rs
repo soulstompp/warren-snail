@@ -1433,7 +1433,7 @@ impl Snail {
                     let mut below = Vec::new();
                     for e in &level {
                         mark(e.child, 1)?;
-                        below.extend(decode_page(&self.reader.read_extent(e.child)?, &head)?);
+                        below.extend(decode_page(&self.reader.read_extent(e.child)?, &head, e.bound())?);
                     }
                     level = below;
                 }
@@ -1522,15 +1522,22 @@ impl Snail {
                 for _ in 1..head.height {
                     let mut below = Vec::new();
                     for e in &level {
-                        below.extend(decode_page(&self.reader.read_extent(e.child)?, &head)?);
+                        below.extend(decode_page(&self.reader.read_extent(e.child)?, &head, e.bound())?);
                     }
                     level = below;
                 }
                 let sublevels = Sublevels::new(order, table, &head.level_text);
                 for (bi, b) in level.iter().enumerate() {
-                    let mut place = sublevels.all(&b.first);
-                    place.truncate(b.depth as usize);
                     let map = read_map(&self.reader, b, &head.level_text)?;
+                    // The block's first key, as its first page names it: an entry may keep only the
+                    // separator below it.
+                    let first = map
+                        .columns
+                        .first()
+                        .and_then(|c| c.pages.first())
+                        .map_or(&b.first, |p| &p.first);
+                    let mut place = sublevels.all(first);
+                    place.truncate(b.depth as usize);
                     let (map_run, _) = b.map_run();
                     for (s, (c, leaf)) in order.leaves(table).iter().enumerate() {
                         let cp = &map.columns[s];
@@ -1540,8 +1547,8 @@ impl Snail {
                             block: bi as u64,
                             depth: b.depth as u64,
                             place: format!("{:?}", place),
-                            first: shown(&b.first),
-                            last: shown(&b.last),
+                            first: shown(first),
+                            last: shown(&walk::narrowed(b, order, table).1),
                             rows: b.rows as u64,
                             map_pages: map_run.pages(),
                             column: leaf.name(&table.columns[*c].name),
@@ -1627,7 +1634,10 @@ pub struct BlockRow {
     pub block: u64,
     pub depth: u64,
     pub place: String,
+    /// The block's first key.
     pub first: String,
+    /// Its last key; where its order keeps one separator between blocks, the greatest key the
+    /// separator above it leaves it.
     pub last: String,
     pub rows: u64,
     pub map_pages: u64,

@@ -1523,6 +1523,7 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize, forma
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
         bound_slots: bound_slots(table, order, format),
+        separated: format >= crate::file::FORMAT,
     }
 }
 
@@ -1576,6 +1577,7 @@ pub(crate) fn empty_head(table: &Table, order: &Order, format: u32) -> Head {
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
         bound_slots: bound_slots(table, order, format),
+        separated: format >= crate::file::FORMAT,
     }
 }
 
@@ -1747,6 +1749,9 @@ fn write_order(
         }
         entries.push(entry);
     }
+    if kept {
+        crate::directory::separate(&mut entries, &text_sublevels, None, None);
+    }
     maps.finish(w)?;
     let map_pages = maps.pages;
     let head = Head {
@@ -1759,6 +1764,7 @@ fn write_order(
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
         bound_slots: bound_slots(table, order, format),
+        separated: format >= crate::file::FORMAT,
     };
     let (top, below) = build(head, entries, &mut |bytes| w.place(bytes))?;
     let levels = decode_top(&top)?.0.height;
@@ -1927,6 +1933,7 @@ pub(crate) fn write_block(
         }
     }
     let entry = Entry {
+        open: false,
         depth: b.place.len() as u32,
         rows: b.rows() as u32,
         dead: 0,

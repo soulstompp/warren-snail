@@ -180,7 +180,15 @@ impl Snail {
         };
         let order = &table.orders[o];
         let keys = own_keys(order, table, want.side, own);
-        let holds = |e: &Entry| e.first[..own] <= keys[..] && keys[..] <= e.last[..own];
+        let holds = |e: &Entry| {
+            let (first, last, open) = super::walk::narrowed(e, order, table);
+            first[..own] <= keys[..]
+                && if open && crate::directory::kept_len(&last) <= own {
+                    keys[..] < last[..own]
+                } else {
+                    keys[..] <= last[..own]
+                }
+        };
         // Down the order to its middle block among those holding the question's own values.
         let (head, mut entries, _) = self.top(table, o)?;
         for _ in 1..head.height {
@@ -188,7 +196,11 @@ impl Snail {
             let Some(middle) = held.get(held.len() / 2) else {
                 return Ok(None);
             };
-            entries = decode_page(&self.reader.read_extent(middle.child)?, &head)?;
+            entries = decode_page(
+                &self.reader.read_extent(middle.child)?,
+                &head,
+                middle.bound(),
+            )?;
         }
         let held: Vec<&Entry> = entries.iter().filter(|e| holds(e)).collect();
         let Some(block) = held.get(held.len() / 2) else {

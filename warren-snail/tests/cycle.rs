@@ -437,3 +437,39 @@ fn a_text_carried_rules_blocks_out_by_its_bounds_cut_to_8_bytes() {
     assert_eq!(read(&path, &q("!")), 0);
     assert_eq!(read(&path, &q(&chars(9000))), 1);
 }
+
+#[test]
+fn a_key_as_long_as_postgresql_takes_is_held_between_separators() {
+    // Keys of 2,694 bytes sharing their first 2,690, which an entry of both whole keys could not
+    // hold: each entry keeps the separator below its block, the shortest prefix of the block's
+    // first key that sorts after the key before it.
+    let long = |i: i64| format!("{}{}", "x".repeat(2690), nibbles(i));
+    let path = tmp("cycle-long.snail");
+    let catalog = Catalog::parse("CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
+    let mut v = Values::new(catalog.tables[0].columns[0].ty);
+    for i in 0..1024 {
+        push_datum(
+            &mut v,
+            &warren_snail::composed::scalar_in(catalog.tables[0].columns[0].ty, &long(i)).unwrap(),
+        );
+    }
+    write(
+        &path,
+        &catalog,
+        &[("s.t".into(), Rows { columns: vec![v] })],
+    )
+    .unwrap();
+    let blocks = Snail::open(&path).unwrap().blocks().unwrap();
+    assert_eq!(blocks_of(&blocks, "t_pkey").iter().sum::<u64>(), 1024);
+    let q = format!("SELECT count(*) FROM s.t t WHERE t.a = '{}'", long(700));
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(&q, None).unwrap();
+    exact(&q, &round);
+    let n = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!((n, round.blocks_read), (1, 1));
+}

@@ -150,7 +150,7 @@ impl Snail {
                 return Ok(false);
             }
             if height > 1 {
-                let below = decode_page(&self.reader.read_extent(e.child)?, head)?;
+                let below = decode_page(&self.reader.read_extent(e.child)?, head, e.bound())?;
                 if !self.count(head, &below, height - 1, counted, until)? {
                     return Ok(false);
                 }

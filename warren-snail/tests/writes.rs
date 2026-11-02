@@ -735,7 +735,7 @@ fn block_entries(path: &std::path::Path) -> Vec<warren_snail::directory::Entry> 
         for _ in 1..head.height {
             level = level
                 .iter()
-                .flat_map(|e| decode_page(&reader.read_extent(e.child).unwrap(), &head).unwrap())
+                .flat_map(|e| decode_page(&reader.read_extent(e.child).unwrap(), &head, e.bound()).unwrap())
                 .collect();
         }
         out.extend(level);

@@ -847,16 +847,17 @@ fn text_keys_an_index_and_an_equality_on_it_reads_only_its_place() {
     }
     let (_, round) = snail.ask(&q, None).unwrap();
     assert_eq!(round.order, "s_name", "{round:?}");
-    // The index is cut on the name's bytes past the first: some place's second sublevel is a byte of
-    // a name, where a cut on the first byte alone goes on to the network's bits.
-    let second: Vec<i64> = snail
+    // The index is cut on the name's bits past its first byte: some place reaches a bit of the second,
+    // its ninth sublevel, each a bit of the name.
+    let places: Vec<Vec<i64>> = snail
         .blocks()
         .unwrap()
         .iter()
         .filter(|b| b.order == "s_name" && b.column == "name")
-        .filter_map(|b| numbers(&b.place).get(1).copied())
+        .map(|b| numbers(&b.place))
         .collect();
-    assert!(second.iter().any(|&b| b >= b'-' as i64), "{second:?}");
+    assert!(places.iter().any(|p| p.len() > 8), "{places:?}");
+    assert!(places.iter().flatten().all(|&b| b == 0 || b == 1), "{places:?}");
 
     // A name no station has reads no column page.
     let q = "SELECT s.network_id FROM weather.stations s WHERE s.name = 'no such station'";

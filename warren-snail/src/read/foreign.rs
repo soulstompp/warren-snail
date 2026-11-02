@@ -933,7 +933,7 @@ impl Snail {
         let (a, b) = (pick(&entries, lo), pick(&entries, hi));
         for e in &entries[a..=b] {
             if height > 1 {
-                let below = decode_page(&self.reader.read_extent(e.child)?, head)?;
+                let below = decode_page(&self.reader.read_extent(e.child)?, head, e.bound())?;
                 self.covering_below(head, below, height - 1, lo, hi, out)?;
             } else {
                 out.push(e.clone());
@@ -1174,7 +1174,14 @@ impl Snail {
             })
             .collect();
         let meets = |e: &Entry| {
-            let first = operators[0] != "=" || (e.first[..1] <= at[..1] && at[..1] <= e.last[..1]);
+            let (lo, hi, open) = super::walk::narrowed(e, order, table);
+            let first = operators[0] != "="
+                || (lo[..1] <= at[..1]
+                    && if open && crate::directory::kept_len(&hi) <= 1 {
+                        at[..1] < hi[..1]
+                    } else {
+                        at[..1] <= hi[..1]
+                    });
             first
                 && probes.iter().zip(operators).all(|(p, op)| match p {
                     Some((k, probe, inet)) => {
@@ -1189,7 +1196,7 @@ impl Snail {
             for e in entries.into_iter().filter(|e| meets(e)) {
                 if height > 1 {
                     level.push((
-                        decode_page(&self.reader.read_extent(e.child)?, &head)?,
+                        decode_page(&self.reader.read_extent(e.child)?, &head, e.bound())?,
                         height - 1,
                     ));
                 } else {

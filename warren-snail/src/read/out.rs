@@ -371,7 +371,7 @@ impl Snail {
         for _ in 1..head.height {
             let mut below = Vec::new();
             for e in &level {
-                below.extend(decode_page(&self.reader.read_extent(e.child)?, &head)?);
+                below.extend(decode_page(&self.reader.read_extent(e.child)?, &head, e.bound())?);
             }
             level = below;
         }

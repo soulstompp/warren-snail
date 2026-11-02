@@ -98,7 +98,7 @@ impl KeySet {
     }
 
     /// Whether some key lies from `first` to `last`, both read on their first `j` values.
-    fn meets(&self, first: &[KeyValue], last: &[KeyValue]) -> bool {
+    fn meets(&self, first: &[KeyValue], last: &[KeyValue], open: bool) -> bool {
         let (mut lo, mut hi) = (0, self.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -108,7 +108,12 @@ impl KeySet {
                 hi = mid;
             }
         }
-        lo < self.len() && self.key(lo) <= last
+        lo < self.len()
+            && if open {
+                self.key(lo) < last
+            } else {
+                self.key(lo) <= last
+            }
     }
 }
 
@@ -495,7 +500,11 @@ impl Snail {
         walk.rows_low = 0;
         walk.rows_high = 0;
         for o in open {
-            let entries = decode_page(&self.reader.read_extent(o.entry.child)?, &walk.head)?;
+            let entries = decode_page(
+                &self.reader.read_extent(o.entry.child)?,
+                &walk.head,
+                o.entry.bound(),
+            )?;
             walk.directory_pages += o.entry.child.pages();
             for e in entries {
                 assess(walk, e, order, want);
@@ -548,7 +557,7 @@ impl Snail {
                             || want
                                 .keys
                                 .unwrap()
-                                .meets(&pages[p].first[..j], &next(p)[..j]))
+                                .meets(&pages[p].first[..j], &next(p)[..j], false))
                 };
                 let chosen: Vec<usize> = (0..pages.len())
                     .filter(|&p| unsorted(p) || fits(p))
@@ -1164,6 +1173,64 @@ pub(super) fn against_key(
     }
 }
 
+/// An entry's bounds: its first and last keys, each narrowed by the least and greatest its leaves keep
+/// of each leading level a number of one leaf keys, a month by its instants' within a year, a level's
+/// NULLs on their side; and whether every key under it sorts before its last.
+pub(crate) fn narrowed(
+    e: &Entry,
+    order: &Order,
+    table: &Table,
+) -> (Vec<KeyValue>, Vec<KeyValue>, bool) {
+    let (mut lo, mut hi) = (Vec::new(), Vec::new());
+    for (li, l) in order.levels.iter().enumerate() {
+        let c = l.column();
+        let ty = table.columns[c].ty;
+        let Some(slot) = order.leaf_slot(table, c) else {
+            break;
+        };
+        if table.leaf_count(c) != 1 || crate::write::bounded(table, c) {
+            break;
+        }
+        let s = &e.columns[slot];
+        let null = KeyValue::Null {
+            first: order.nulls_first[li],
+        };
+        let (a, b) = if s.nulls == e.rows {
+            (null.clone(), null.clone())
+        } else {
+            match l {
+                Level::Column(_) if ty.is_wide() => (KeyValue::Wide(s.min), KeyValue::Wide(s.max)),
+                Level::Column(_) => (KeyValue::Int(s.min as i64), KeyValue::Int(s.max as i64)),
+                Level::MonthUtc(_) => match (month_of(s.min as i64), month_of(s.max as i64)) {
+                    (Some(a), Some(b))
+                        if crate::times::civil(s.min as i64).0
+                            == crate::times::civil(s.max as i64).0 =>
+                    {
+                        (KeyValue::Int(a), KeyValue::Int(b))
+                    }
+                    _ => break,
+                },
+            }
+        };
+        let (a, b) = match (s.nulls > 0 && s.nulls < e.rows, order.nulls_first[li]) {
+            (true, true) => (null, b),
+            (true, false) => (a, null),
+            _ => (a, b),
+        };
+        lo.push(a);
+        hi.push(b);
+    }
+    let levels = order.levels.len();
+    lo.resize(levels, KeyValue::Null { first: true });
+    hi.resize(levels, KeyValue::Null { first: false });
+    let first = e.first.clone().max(lo);
+    if hi < e.last {
+        (first, hi, false)
+    } else {
+        (first, e.last.clone(), e.open)
+    }
+}
+
 /// What a question makes of one entry on the walk's level: none of its rows, so it is skipped; all of
 /// a count, taken from its counts; or rows the round reads under it, left open with the columns it
 /// reads. An open entry adds its columns' pages to the walk's bounds. Above the blocks the fewest are
@@ -1171,13 +1238,20 @@ pub(super) fn against_key(
 fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let m = walk.m;
     let side = want.side;
+    let bounds = narrowed(&e, order, want.table);
     let mut interval = if side.empty {
         Status::None
     } else if m == 0 {
         Status::Must
     } else {
-        let (pf, pl) = (&e.first[..m], &e.last[..m]);
-        if walk.before(pl) || walk.past(pf) {
+        let (pf, pl) = (&bounds.0[..m], &bounds.1[..m]);
+        // Every key under an entry whose last is the separator above it sorts before that.
+        let short = if bounds.2 && crate::directory::kept_len(&bounds.1) <= m {
+            pl <= walk.lo.as_slice()
+        } else {
+            walk.before(pl)
+        };
+        if short || walk.past(pf) || outside_bounds(walk, &e, order, want.table) {
             Status::None
         } else if !walk.before(pf) && !walk.past(pl) {
             Status::Must
@@ -1188,7 +1262,8 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let j = walk.keyed;
     let keys_may = match want.keys {
         Some(k) if j > 0 => {
-            if !k.meets(&e.first[..j], &e.last[..j]) {
+            let open = bounds.2 && crate::directory::kept_len(&bounds.1) <= j;
+            if !k.meets(&bounds.0[..j], &bounds.1[..j], open) {
                 interval = Status::None;
             }
             true
@@ -1423,6 +1498,46 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
 
 /// What an entry keeps of the column a condition reads: its one leaf's summary, or the one its
 /// leaves' summaries make; and the slot of its first leaf.
+/// Whether the run the walk's leading levels fix lies outside an entry's least and greatest of a
+/// level keyed by its bytes, each cut to 8 bytes: at the first level, or one whose levels before it
+/// the run fixes at one value.
+fn outside_bounds(walk: &Walk, e: &Entry, order: &Order, table: &Table) -> bool {
+    let bound = |v: &KeyValue, ty: ColumnType| match v {
+        KeyValue::Text(s) if ty.is_nested() => {
+            let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            let key: Vec<u8> = s
+                .as_bytes()
+                .chunks(2)
+                .take(8)
+                .map(|h| d(h[0]) << 4 | d(h[1]))
+                .collect();
+            Some(crate::directory::prefix_bound(&key))
+        }
+        KeyValue::Text(s) => Some(crate::directory::prefix_bound(s.as_bytes())),
+        KeyValue::Bytes(b) => Some(crate::directory::prefix_bound(b)),
+        _ => None,
+    };
+    for li in 0..walk.m.min(walk.lo.len()).min(walk.hi.len()) {
+        if walk.lo[..li] != walk.hi[..li] {
+            break;
+        }
+        let c = order.levels[li].column();
+        let Some(slot) = order.leaf_slot(table, c) else {
+            break;
+        };
+        if !walk.head.bound_slots.contains(&(slot as u32)) || e.columns[slot].nulls > 0 {
+            continue;
+        }
+        let (sum, ty) = (&e.columns[slot], table.columns[c].ty);
+        if bound(&walk.lo[li], ty).is_some_and(|b| b > sum.max)
+            || bound(&walk.hi[li], ty).is_some_and(|b| b < sum.min)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether a value `t` keeps may lie within an entry's least and greatest of its column, each its key cut
 /// to 8 bytes; a composed value's bounds in `t` written as hex.
 fn within_bounds(t: &TextCond, ty: ColumnType, sum: &Summary) -> bool {
@@ -1732,6 +1847,7 @@ mod tests {
         let mut months = [9u32; 12];
         months[11] = 21;
         let block = Entry {
+            open: false,
             depth: 1,
             rows: 120,
             dead: 0,
@@ -1775,6 +1891,7 @@ mod tests {
     fn a_comparison_every_value_passes_is_counted_less_the_nulls() {
         // 100 rows, `nulls` of them NULL, the rest from 1 to 50.
         let block = |nulls: u32| Entry {
+            open: false,
             depth: 1,
             rows: 100,
             dead: 0,
@@ -1811,6 +1928,7 @@ mod tests {
     fn unequal_and_a_test_keeping_nulls_are_counted_where_the_counts_close() {
         // 100 rows, 20 of them NULL, the rest from 1 to 50.
         let block = |min: i128, max: i128, nulls: u32| Entry {
+            open: false,
             depth: 1,
             rows: 100,
             dead: 0,
@@ -1891,10 +2009,10 @@ mod tests {
             vec![0, 1],
             [ints([3, 1]), ints([7, 2]), ints([3, 9]), ints([3, 1])],
         );
-        assert!(keys.meets(&ints([3, 0]), &ints([3, 1])));
-        assert!(keys.meets(&ints([3, 1]), &ints([3, 1])));
-        assert!(keys.meets(&ints([3, 2]), &ints([5, 0])));
-        assert!(!keys.meets(&ints([3, 2]), &ints([3, 8])));
-        assert!(!keys.meets(&ints([7, 3]), &ints([9, 9])));
+        assert!(keys.meets(&ints([3, 0]), &ints([3, 1]), false));
+        assert!(keys.meets(&ints([3, 1]), &ints([3, 1]), false));
+        assert!(keys.meets(&ints([3, 2]), &ints([5, 0]), false));
+        assert!(!keys.meets(&ints([3, 2]), &ints([3, 8]), false));
+        assert!(!keys.meets(&ints([7, 3]), &ints([9, 9]), false));
     }
 }

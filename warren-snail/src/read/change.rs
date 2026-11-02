@@ -1599,6 +1599,7 @@ impl Snail {
                 &replaced,
                 &mut stage,
                 &mut Vec::new(),
+                head.separated,
             )?;
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| stage.place(x))?;
             root.orders[at].2 = stage.place(&bytes)?;
@@ -1954,7 +1955,7 @@ impl Snail {
                 }
                 replaced.insert(path, entries);
             }
-            settle(&mut top, &mut Vec::new(), &replaced, w, &mut gone)?;
+            settle(&mut top, &mut Vec::new(), &replaced, w, &mut gone, head.separated)?;
             gone.push(root.orders[at].2);
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| w.place(x))?;
             root.orders[at].2 = w.place(&bytes)?;
@@ -2361,7 +2362,7 @@ impl Snail {
             }
         }
         let mut path = Vec::new();
-        settle(&mut top, &mut path, &replaced, w, &mut Vec::new())?;
+        settle(&mut top, &mut path, &replaced, w, &mut Vec::new(), head.separated)?;
         let (bytes, _) = build_from(head, top.entries, top.height, &mut |b| w.place(b))?;
         let extent = w.place(&bytes)?;
         self.root.orders[at].2 = extent;
@@ -2467,7 +2468,11 @@ impl Snail {
         path.push(i);
         if node.height > 1 {
             if !node.kids.contains_key(&i) {
-                let entries = decode_page(&self.reader.read_extent(node.entries[i].child)?, head)?;
+                let entries = decode_page(
+                    &self.reader.read_extent(node.entries[i].child)?,
+                    head,
+                    node.entries[i].bound(),
+                )?;
                 node.kids.insert(
                     i,
                     Node {
@@ -2557,7 +2562,14 @@ impl Snail {
             if replaced.is_empty() {
                 continue;
             }
-            settle(&mut top, &mut Vec::new(), &replaced, w, &mut Vec::new())?;
+            settle(
+                &mut top,
+                &mut Vec::new(),
+                &replaced,
+                w,
+                &mut Vec::new(),
+                head.separated,
+            )?;
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| w.place(x))?;
             self.root.orders[at].2 = w.place(&bytes)?;
         }
@@ -2692,7 +2704,16 @@ impl Snail {
         if rewrite || split || positions + added.len() > ROW_GROUP_ROWS {
             // Written in order, and cut by the counts as a block written afresh is.
             let rows = rows.unwrap_or_else(rows_now);
-            return Ok((self.blocks_written(w, table, order, head, &rows)?, true));
+            let mut written = self.blocks_written(w, table, order, head, &rows)?;
+            if head.separated {
+                crate::directory::separate(
+                    &mut written,
+                    &head.level_text,
+                    Some(&entry.first),
+                    Some(&entry.last),
+                );
+            }
+            return Ok((written, true));
         }
         // The new rows go after the block's last, into its tail: plain pages of one disk page, each
         // written afresh as rows come, the k-page pages before them left as they lie.
@@ -2834,12 +2855,7 @@ impl Snail {
         entry.rows = entry.rows + added.len() as u32 - gone.len() as u32;
         entry.dead += gone.len() as u32;
         for (key, _) in &added {
-            if *key < entry.first {
-                entry.first = key.clone();
-            }
-            if *key > entry.last {
-                entry.last = key.clone();
-            }
+            crate::directory::widened(&mut entry, key, head.separated);
         }
         for s in 0..leaves.len() {
             let sum = &mut entry.columns[s];
@@ -3026,7 +3042,11 @@ impl Snail {
         }
         let laid = laid_out(table, order, &rows, None, self.reader.format())?;
         let head = head_of(table, order, &laid, held.len(), self.reader.format());
-        Ok((self.blocks_written(w, table, order, &head, &rows)?, head))
+        let mut written = self.blocks_written(w, table, order, &head, &rows)?;
+        if head.separated {
+            crate::directory::separate(&mut written, &head.level_text, None, None);
+        }
+        Ok((written, head))
     }
 
     /// A table, an index or a table's order declared: the catalog read again with it, and each order
@@ -3305,17 +3325,18 @@ fn settle(
     replaced: &BTreeMap<Vec<usize>, Vec<Entry>>,
     w: &mut dyn Place,
     gone: &mut Vec<Extent>,
+    separated: bool,
 ) -> Result<()> {
     let kids: Vec<usize> = node.kids.keys().rev().copied().collect();
     for i in kids {
         let mut kid = node.kids.remove(&i).unwrap();
         path.push(i);
-        settle(&mut kid, path, replaced, w, gone)?;
+        settle(&mut kid, path, replaced, w, gone, separated)?;
         path.pop();
         gone.push(kid.at);
         let mut parents = Vec::new();
-        for page in pack(kid.entries)? {
-            let at = w.place(&encode_page(&page))?;
+        for page in pack(kid.entries, separated)? {
+            let at = w.place(&encode_page(&page, separated))?;
             parents.push(Entry::over(&page, at)?);
         }
         node.entries.splice(i..i + 1, parents);

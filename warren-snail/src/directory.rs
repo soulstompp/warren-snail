@@ -97,6 +97,9 @@ pub struct Entry {
     /// The first and last row's key, one value a level.
     pub first: Vec<KeyValue>,
     pub last: Vec<KeyValue>,
+    /// Whether every key under it sorts before its last, the separator above it, where its order
+    /// keeps one separator between blocks and no key just below the separator can be named.
+    pub open: bool,
     /// One for each leaf the order holds, each column's in turn.
     pub columns: Vec<Summary>,
     /// The rows on each month, January first, for each of the order's month columns.
@@ -140,6 +143,9 @@ pub struct Head {
     /// Which of the held leaves are the first of a column keyed by its bytes whose least and greatest
     /// each entry keeps, cut to 8 bytes, by their place among the held leaves.
     pub bound_slots: Vec<u32>,
+    /// Whether each entry keeps one key, the separator below it, as format 9 keeps an order: its upper
+    /// bound read from the separator above it.
+    pub separated: bool,
 }
 
 /// What `Head::level_text` holds for a level keyed in 128 bits.
@@ -171,6 +177,175 @@ const HEAD_SPANS: u32 = 1 << 29;
 /// written as before.
 const HEAD_BOUNDS: u32 = 1 << 28;
 
+/// The bit of a head's height set where each entry keeps one key, the separator below it, its
+/// upper bound the separator above it: the next entry's, or for a page's last the entry above
+/// the page's, or for the top's last the order's greatest end, which follows the bounds' slots. A
+/// head without it keeps each entry's first and last keys whole.
+const HEAD_SEPARATED: u32 = 1 << 27;
+
+/// The least a level holds, which pads a key whose later levels are dropped.
+const LEAST: KeyValue = KeyValue::Null { first: true };
+/// The greatest a level holds.
+const GREATEST: KeyValue = KeyValue::Null { first: false };
+
+/// How many levels of a key are kept, its later levels holding the least a level holds.
+pub fn kept_len(key: &[KeyValue]) -> usize {
+    kept(key).len()
+}
+
+/// A key less its later levels that hold the least a level holds.
+fn kept(key: &[KeyValue]) -> &[KeyValue] {
+    let n = key.len() - key.iter().rev().take_while(|v| **v == LEAST).count();
+    &key[..n]
+}
+
+/// A key of `levels` levels, its dropped ones holding `pad`.
+fn padded(mut key: Vec<KeyValue>, levels: usize, pad: KeyValue) -> Vec<KeyValue> {
+    key.resize(levels.max(key.len()), pad);
+    key
+}
+
+/// The separator between two neighbouring blocks: the shortest prefix of the next block's first
+/// key that sorts after the last key before it, a level of bytes or text cut to its first bytes
+/// that do, text at a character's end; its dropped levels the least a level holds.
+pub fn separator(last: &[KeyValue], next: &[KeyValue]) -> Vec<KeyValue> {
+    let d = match last.iter().zip(next).position(|(a, b)| a != b) {
+        Some(d) => d,
+        None => return next.to_vec(),
+    };
+    let common = |a: &[u8], b: &[u8]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let cut = match (&last[d], &next[d]) {
+        (KeyValue::Text(a), KeyValue::Text(b)) => {
+            let mut j = (common(a.as_bytes(), b.as_bytes()) + 1).min(b.len());
+            while !b.is_char_boundary(j) {
+                j += 1;
+            }
+            KeyValue::Text(b[..j].into())
+        }
+        (KeyValue::Bytes(a), KeyValue::Bytes(b)) => {
+            let j = (common(a, b) + 1).min(b.len());
+            KeyValue::Bytes(b[..j].into())
+        }
+        (_, v) => v.clone(),
+    };
+    let mut s = next[..d].to_vec();
+    s.push(cut);
+    padded(s, next.len(), LEAST)
+}
+
+/// The greatest key a block holds, as its upper separator `s` (every key it holds sorts before
+/// it) gives it: `s` less one at its last level kept where that level is a number, its later levels
+/// the greatest; else `s` itself, and whether it is `s`, which no key the block holds reaches.
+pub fn below(s: &[KeyValue], level_text: &[u32]) -> (Vec<KeyValue>, bool) {
+    let k = kept(s);
+    let Some((v, outer)) = k.split_last() else {
+        return (s.to_vec(), true);
+    };
+    let wide = level_text.get(outer.len()) == Some(&WIDE_LEVEL);
+    let less = match v {
+        KeyValue::Int(x) if *x > i64::MIN => KeyValue::Int(x - 1),
+        KeyValue::Wide(x) if *x > i128::MIN => KeyValue::Wide(x - 1),
+        KeyValue::Int(_) | KeyValue::Wide(_) => LEAST,
+        KeyValue::Null { first: false } if level_text.get(outer.len()) == Some(&0) => {
+            KeyValue::Int(i64::MAX)
+        }
+        KeyValue::Null { first: false } if wide => KeyValue::Wide(i128::MAX),
+        _ => return (s.to_vec(), true),
+    };
+    let mut out = outer.to_vec();
+    out.push(less);
+    (padded(out, s.len(), GREATEST), false)
+}
+
+/// A key cut to bound from below what it heads: each level of bytes or text past 8 bytes cut to its
+/// first 8, text at a character's end, and its later levels the least a level holds.
+fn cut_below(key: &[KeyValue]) -> Vec<KeyValue> {
+    let mut out = Vec::with_capacity(key.len());
+    for v in key {
+        match v {
+            KeyValue::Text(s) if s.len() > 8 => {
+                let mut j = 8;
+                while !s.is_char_boundary(j) {
+                    j -= 1;
+                }
+                out.push(KeyValue::Text(s[..j].into()));
+                return padded(out, key.len(), LEAST);
+            }
+            KeyValue::Bytes(b) if b.len() > 8 => {
+                out.push(KeyValue::Bytes(b[..8].into()));
+                return padded(out, key.len(), LEAST);
+            }
+            v => out.push(v.clone()),
+        }
+    }
+    out
+}
+
+/// A key widened to bound from above what sorts before it: from its first level of bytes or text
+/// past 8 bytes on, the greatest a level holds.
+fn cut_above(key: &[KeyValue]) -> Vec<KeyValue> {
+    match key.iter().position(|v| match v {
+        KeyValue::Text(s) => s.len() > 8,
+        KeyValue::Bytes(b) => b.len() > 8,
+        _ => false,
+    }) {
+        Some(d) => padded(key[..d].to_vec(), key.len(), GREATEST),
+        None => key.to_vec(),
+    }
+}
+
+/// Neighbouring blocks written afresh, their first and last keys whole, given the bounds between
+/// them: each block's first the separator below it, its last the greatest key the separator above
+/// it leaves it. The first block's lower bound is `lower`, or its first key cut to 8 bytes a level;
+/// the last block's upper `upper`, or its last key widened from its first level past 8 bytes; each
+/// of the two its key's where that lies beyond it.
+pub fn separate(
+    entries: &mut [Entry],
+    level_text: &[u32],
+    lower: Option<&[KeyValue]>,
+    upper: Option<&[KeyValue]>,
+) {
+    let n = entries.len();
+    if n == 0 {
+        return;
+    }
+    let seps: Vec<Vec<KeyValue>> = (1..n)
+        .map(|i| separator(&entries[i - 1].last, &entries[i].first))
+        .collect();
+    let first = cut_below(&entries[0].first);
+    let first = lower.map_or(first.clone(), |l| first.min(l.to_vec()));
+    let last = cut_above(&entries[n - 1].last);
+    let last = upper.map_or(last.clone(), |u| last.max(u.to_vec()));
+    entries[0].first = first;
+    entries[n - 1].last = last;
+    entries[n - 1].open = false;
+    for (i, s) in seps.into_iter().enumerate() {
+        (entries[i].last, entries[i].open) = below(&s, level_text);
+        entries[i + 1].first = s;
+    }
+}
+
+/// A block's bounds after a key written into it, where its order keeps one separator between
+/// blocks: its first key lowered, cut to 8 bytes a level, or its last raised, widened from its first
+/// level past 8 bytes, where the key lies beyond them; whole where it keeps both keys.
+pub fn widened(e: &mut Entry, key: &[KeyValue], separated: bool) {
+    if key < e.first.as_slice() {
+        e.first = if separated {
+            cut_below(key)
+        } else {
+            key.to_vec()
+        };
+    }
+    if key > e.last.as_slice() {
+        e.open = false;
+        e.last = if separated {
+            cut_above(key)
+        } else {
+            key.to_vec()
+        };
+    }
+}
+
 /// The bound an entry keeps of a value keyed by `bytes`: its first 8, a missing byte as 0, as a number
 /// that sorts as they do.
 pub fn prefix_bound(bytes: &[u8]) -> i128 {
@@ -195,11 +370,24 @@ impl Entry {
         self.ends.iter().any(|e| e[0] > 0 || e[1] > 0)
     }
 
+    /// Its last key, and whether every key under it sorts before it.
+    pub fn bound(&self) -> (&[KeyValue], bool) {
+        (&self.last, self.open)
+    }
+
     /// The bytes the entry takes in its page.
     pub fn size(&self) -> usize {
-        36 + keys_len(&self.first)
-            + keys_len(&self.last)
-            + self.columns.iter().map(Summary::size).sum::<usize>()
+        self.size_in(false)
+    }
+
+    /// The bytes the entry takes in its page, as one key, its separator, where `separated`.
+    pub fn size_in(&self, separated: bool) -> usize {
+        let keys = if separated {
+            32 + keys_len(kept(&self.first))
+        } else {
+            36 + keys_len(&self.first) + keys_len(&self.last)
+        };
+        keys + self.columns.iter().map(Summary::size).sum::<usize>()
             + 48 * self.months.len()
             + if self.has_ends() {
                 8 * self.ends.len()
@@ -217,6 +405,7 @@ impl Entry {
             _ => return Err(Error::new("a directory page holds no entry")),
         };
         let mut e = Entry {
+            open: last.open,
             depth: 0,
             rows: 0,
             dead: 0,
@@ -275,13 +464,17 @@ impl Entry {
         Ok(e)
     }
 
-    fn encode(&self, o: &mut Out) {
+    fn encode(&self, o: &mut Out, separated: bool) {
         let ends = self.has_ends();
         o.u32(self.depth | if ends { ENTRY_ENDS } else { 0 });
         o.u32(self.rows);
         o.u32(self.dead);
-        keys_out(o, &self.first);
-        keys_out(o, &self.last);
+        if separated {
+            keys_out(o, kept(&self.first));
+        } else {
+            keys_out(o, &self.first);
+            keys_out(o, &self.last);
+        }
         for c in &self.columns {
             o.u32(c.nulls);
             if c.wide {
@@ -322,8 +515,15 @@ impl Entry {
         let (depth, ends) = (depth & !ENTRY_ENDS, depth & ENTRY_ENDS != 0);
         let rows = i.u32()?;
         let dead = i.u32()?;
-        let first = keys_in(i, &head.level_text)?;
-        let last = keys_in(i, &head.level_text)?;
+        let levels = head.level_text.len();
+        let (first, last) = if head.separated {
+            (
+                padded(keys_in(i, &head.level_text)?, levels, LEAST),
+                Vec::new(),
+            )
+        } else {
+            (keys_in(i, &head.level_text)?, keys_in(i, &head.level_text)?)
+        };
         let mut columns = Vec::with_capacity(head.units.len());
         for s in 0..head.units.len() {
             let wide = head.wide_slots.contains(&(s as u32));
@@ -376,6 +576,7 @@ impl Entry {
         }
         let child = i.extent()?;
         Ok(Entry {
+            open: false,
             depth,
             rows,
             dead,
@@ -493,6 +694,9 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     if !head.bound_slots.is_empty() {
         height |= HEAD_BOUNDS;
     }
+    if head.separated {
+        height |= HEAD_SEPARATED;
+    }
     o.u32(height);
     if !head.wide_slots.is_empty() {
         u32s(&mut o, &head.wide_slots);
@@ -509,7 +713,13 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     if !head.bound_slots.is_empty() {
         u32s(&mut o, &head.bound_slots);
     }
-    o.0.extend_from_slice(&encode_page(entries));
+    if head.separated {
+        keys_out(
+            &mut o,
+            entries.last().map_or(&[][..], |e| e.last.as_slice()),
+        );
+    }
+    o.0.extend_from_slice(&encode_page(entries, head.separated));
     o.0
 }
 
@@ -545,29 +755,53 @@ pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
         month_slots,
         text_slots,
         level_text,
-        height: height & !(HEAD_WIDE | HEAD_CUT | HEAD_SPANS | HEAD_BOUNDS),
+        height: height & !(HEAD_WIDE | HEAD_CUT | HEAD_SPANS | HEAD_BOUNDS | HEAD_SEPARATED),
         wide_slots,
         cut_under,
         span_slots,
         bound_slots,
+        separated: height & HEAD_SEPARATED != 0,
     };
-    let entries = decode_page(&buf[i.at()..], &head)?;
+    // Where each entry keeps one key, the top's last is bounded by the order's greatest end.
+    let greatest = if head.separated {
+        keys_in(&mut i, &head.level_text)?
+    } else {
+        Vec::new()
+    };
+    let entries = decode_page(&buf[i.at()..], &head, (&greatest, false))?;
     Ok((head, entries))
 }
 
 /// A directory page: how many entries it holds, then the entries.
-pub fn encode_page(entries: &[Entry]) -> Vec<u8> {
+pub fn encode_page(entries: &[Entry], separated: bool) -> Vec<u8> {
     let mut o = Out::default();
     o.u32(entries.len() as u32);
     for e in entries {
-        e.encode(&mut o);
+        e.encode(&mut o, separated);
     }
     o.0
 }
 
-pub fn decode_page(buf: &[u8], head: &Head) -> Result<Vec<Entry>> {
+/// A directory page, its entries' kinds told by `head`. Where each entry keeps one key, an entry's
+/// last is the greatest the next entry's separator leaves it, and the page's last entry's `upper`,
+/// the last of the entry above the page.
+pub fn decode_page(buf: &[u8], head: &Head, upper: (&[KeyValue], bool)) -> Result<Vec<Entry>> {
     let mut i = In::new(buf);
-    (0..i.u32()?).map(|_| Entry::decode(&mut i, head)).collect()
+    let mut entries = (0..i.u32()?)
+        .map(|_| Entry::decode(&mut i, head))
+        .collect::<Result<Vec<_>>>()?;
+    if head.separated {
+        for k in 0..entries.len() {
+            (entries[k].last, entries[k].open) = match entries.get(k + 1) {
+                Some(next) => below(&next.first, &head.level_text),
+                None => (
+                    padded(upper.0.to_vec(), head.level_text.len(), GREATEST),
+                    upper.1,
+                ),
+            };
+        }
+    }
+    Ok(entries)
 }
 
 /// Packs the blocks' entries whole into directory pages, level by level, until one page holds the
@@ -594,12 +828,13 @@ pub fn build_from(
     head.height = height;
     loop {
         let top = encode_top(&head, &level);
-        if top.len() <= PAGE {
+        // Where each entry keeps one key, a top of two entries or fewer is the top, a page or more.
+        if top.len() <= PAGE || (head.separated && level.len() <= 2) {
             return Ok((top, below));
         }
         let mut parents = Vec::new();
-        for page in pack(level)? {
-            let at = place(&encode_page(&page))?;
+        for page in pack(level, head.separated)? {
+            let at = place(&encode_page(&page, head.separated))?;
             below += at.pages();
             parents.push(Entry::over(&page, at)?);
         }
@@ -608,20 +843,23 @@ pub fn build_from(
     }
 }
 
-/// Entries packed whole into directory pages, in their order, each page as full as it goes.
-pub fn pack(entries: Vec<Entry>) -> Result<Vec<Vec<Entry>>> {
+/// Entries packed whole into directory pages, in their order, each page as full as it goes. Where each
+/// entry keeps one key, a page holds two entries at least, and takes the disk pages they need.
+pub fn pack(entries: Vec<Entry>, separated: bool) -> Result<Vec<Vec<Entry>>> {
     let mut pages = Vec::new();
     let mut page: Vec<Entry> = Vec::new();
     let mut used = 4;
+    let least = if separated { 2 } else { 1 };
     for e in entries {
-        if used + e.size() > PAGE && !page.is_empty() {
+        let size = e.size_in(separated);
+        if used + size > PAGE && page.len() >= least {
             pages.push(std::mem::take(&mut page));
             used = 4;
         }
-        if used + e.size() > PAGE {
+        if page.is_empty() && used + size > PAGE {
             return Err(Error::new("a directory entry does not fit a page"));
         }
-        used += e.size();
+        used += size;
         page.push(e);
     }
     if !page.is_empty() {
@@ -900,11 +1138,13 @@ mod tests {
             cut_under: vec![String::new(); 2],
             span_slots: Vec::new(),
             bound_slots: Vec::new(),
+            separated: false,
         }
     }
 
     fn block(i: i64, rows: u32, child: u64) -> Entry {
         Entry {
+            open: false,
             depth: 24,
             rows,
             dead: 0,
@@ -975,13 +1215,16 @@ mod tests {
         let h = head();
         let entries = vec![block(1, 3892, 40), block(2, 7, 41)];
         let mut o = Out::default();
-        entries[0].encode(&mut o);
+        entries[0].encode(&mut o, false);
         assert_eq!(entries[0].size(), o.0.len());
         assert_eq!(
             decode_top(&encode_top(&h, &entries)).unwrap(),
             (h.clone(), entries.clone())
         );
-        assert_eq!(decode_page(&encode_page(&entries), &h).unwrap(), entries);
+        assert_eq!(
+            decode_page(&encode_page(&entries, false), &h, (&[], false)).unwrap(),
+            entries
+        );
         let map = PageMap {
             columns: vec![ColumnPages {
                 dictionary: Some(Extent {
@@ -1021,7 +1264,7 @@ mod tests {
         u32s(&mut before, &h.text_slots);
         u32s(&mut before, &h.level_text);
         before.u32(h.height);
-        before.0.extend_from_slice(&encode_page(&entries));
+        before.0.extend_from_slice(&encode_page(&entries, false));
         assert_eq!(encode_top(&h, &entries), before.0);
         // A uuid level and a uuid column held beside an integer.
         let wide = Head {
@@ -1034,9 +1277,11 @@ mod tests {
             cut_under: vec![String::new()],
             span_slots: Vec::new(),
             bound_slots: Vec::new(),
+            separated: false,
         };
         let key = |k: i128| vec![KeyValue::Wide(k)];
         let e = Entry {
+            open: false,
             depth: 3,
             rows: 256,
             dead: 0,
@@ -1068,7 +1313,7 @@ mod tests {
             },
         };
         let mut o = Out::default();
-        e.encode(&mut o);
+        e.encode(&mut o, false);
         assert_eq!(e.size(), o.0.len());
         assert_eq!(
             decode_top(&encode_top(&wide, std::slice::from_ref(&e))).unwrap(),
@@ -1266,7 +1511,7 @@ mod tests {
         // The leaves, read back in order, are the blocks as written.
         let leaves: Vec<Entry> = pages[..48]
             .iter()
-            .flat_map(|p| decode_page(p, &h).unwrap())
+            .flat_map(|p| decode_page(p, &h, (&[], false)).unwrap())
             .collect();
         assert_eq!(leaves, blocks);
 
@@ -1280,5 +1525,103 @@ mod tests {
         .unwrap();
         assert!(top.len() <= PAGE);
         assert_eq!((decode_top(&top).unwrap().0.height, below), (2, 2));
+    }
+
+    /// Every key of a level of bytes, of up to three over 0x00, 0x01 and 0xff, and a numeric level
+    /// after it of -1, 0 or 1, ascending.
+    fn every_key() -> Vec<Vec<KeyValue>> {
+        let mut bytes: Vec<Vec<u8>> = vec![Vec::new()];
+        for len in 1..=3 {
+            let mut more = Vec::new();
+            for b in bytes.iter().filter(|b| b.len() == len - 1) {
+                for x in [0u8, 1, 0xff] {
+                    let mut c = b.clone();
+                    c.push(x);
+                    more.push(c);
+                }
+            }
+            bytes.extend(more);
+        }
+        let mut keys: Vec<Vec<KeyValue>> = bytes
+            .iter()
+            .flat_map(|b| {
+                [-1, 0, 1].map(|n| vec![KeyValue::Bytes(b.clone().into()), KeyValue::Int(n)])
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn a_separator_bounds_the_blocks_either_side_of_it_its_prefix_heading_what_follows() {
+        // Every two keys `a` before `b` of the walk, as the last key of one block and the first of
+        // the next: the separator sorts after `a` and at most `b`, a prefix of `b`'s level; every
+        // key at most `a` sorts before it and under the greatest it leaves the block before; every
+        // key from `b` on sorts at or after it, a prefix sorting before what it heads, an ended
+        // value first.
+        let keys = every_key();
+        let level_text = [BYTES_LEVEL | 4, 0];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                let s = separator(a, b);
+                let (under, open) = below(&s, &level_text);
+                assert!(a < &s && s <= *b, "{a:?} {b:?} {s:?}");
+                if let (KeyValue::Bytes(p), KeyValue::Bytes(q)) = (&s[0], &b[0]) {
+                    assert!(q.starts_with(p), "{s:?} heads {b:?}");
+                }
+                assert!(a <= &under, "{a:?} {under:?}");
+                for v in &keys {
+                    if v <= a {
+                        assert!(v < &s, "{v:?} {s:?}");
+                        assert!(
+                            if open { v < &under } else { v <= &under },
+                            "{v:?} {under:?}"
+                        );
+                    }
+                    if v >= b {
+                        assert!(v >= &s && (open || v > &under), "{v:?} {s:?} {under:?}");
+                    }
+                }
+            }
+        }
+        // Text is cut at a character's end.
+        let t = |s: &str| vec![KeyValue::Text(s.into())];
+        assert_eq!(separator(&t("ab"), &t("aé")), t("aé"));
+        assert_eq!(separator(&t("a"), &t("abc")), t("ab"));
+    }
+
+    #[test]
+    fn an_order_kept_one_separator_an_entry_reads_back_its_bounds_from_its_neighbours() {
+        let mut entries = vec![block(1, 30, 50), block(3, 20, 51), block(7, 10, 52)];
+        let level_text = [0, 0];
+        separate(&mut entries, &level_text, None, None);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.first.clone(), e.last.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (ints([1, 0]), vec![KeyValue::Int(2), GREATEST]),
+                (
+                    vec![KeyValue::Int(3), LEAST],
+                    vec![KeyValue::Int(6), GREATEST]
+                ),
+                (vec![KeyValue::Int(7), LEAST], ints([7, 9])),
+            ]
+        );
+        let h = Head {
+            separated: true,
+            level_text: level_text.to_vec(),
+            ..head()
+        };
+        let top = encode_top(&h, &entries);
+        assert_eq!(decode_top(&top).unwrap(), (h, entries.clone()));
+        // Each entry keeps one key, its separator less its dropped levels.
+        let mut o = Out::default();
+        entries[1].encode(&mut o, true);
+        assert_eq!(
+            (entries[1].size_in(true), o.0.len()),
+            (entries[1].size() - 16, 164)
+        );
     }
 }
