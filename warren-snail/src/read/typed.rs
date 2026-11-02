@@ -124,8 +124,9 @@ fn arithmetic(a: Option<ColumnType>, b: Option<ColumnType>) -> Option<ColumnType
 /// The type PostgreSQL's select_common_type finds for expressions read together, `context` naming
 /// them in its refusal: an untyped literal takes the others' type, text where every one is untyped;
 /// of two numbers, or two instants, the one the other is implicitly cast to; of two strings, the
-/// first's; any other two only where they are one. Types that differ only in their modifier take
-/// none.
+/// first's, but `name` over a varchar or a bpchar, which casts to it unasked where it casts back only
+/// on assignment; any other two only where they are one. Types that differ only in their modifier
+/// take none.
 pub(super) fn common_type(ts: &[Option<ColumnType>], context: &str) -> Result<ColumnType> {
     use ColumnType as C;
     let place = |t: ColumnType| -> Option<(u8, u8)> {
@@ -158,6 +159,10 @@ pub(super) fn common_type(ts: &[Option<ColumnType>], context: &str) -> Result<Co
             continue;
         };
         if p == t {
+            continue;
+        }
+        if t == C::Name && matches!(p, C::Text(Some(_)) | C::Bpchar(_)) {
+            out = Some(t);
             continue;
         }
         match (place(p), place(t)) {

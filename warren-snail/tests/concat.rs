@@ -424,3 +424,72 @@ fn where_no_form_takes_them_or_two_do_the_refusal_is_postgresql_s_before_any_row
         refused(&path, q, words);
     }
 }
+
+/// A varchar and a bpchar of 70 bytes beside a name.
+fn long_strings(name: &str) -> std::path::PathBuf {
+    let path = tmp(&format!("concat-{name}.snail"));
+    let ddl = "CREATE TABLE c.u (id integer NOT NULL, v varchar, p char(70), m name, s text, \
+               PRIMARY KEY (id));";
+    let text = |v: String| Values::Text(vec![Some(v)]);
+    write(
+        &path,
+        &Catalog::parse(ddl).unwrap(),
+        &[(
+            "c.u".into(),
+            Rows {
+                columns: vec![
+                    Values::Int(vec![Some(1)]),
+                    text("a".repeat(70)),
+                    text("b".repeat(70)),
+                    text("nm".into()),
+                    text("st".into()),
+                ],
+            },
+        )],
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn a_name_is_the_common_type_of_itself_and_a_varchar_or_a_bpchar() {
+    let path = long_strings("name");
+    for (e, ty) in [
+        ("coalesce(t.v, t.m)", "name"),
+        ("coalesce(t.p, t.m)", "name"),
+        ("coalesce(t.m, t.v)", "name"),
+        ("coalesce(t.m, t.p)", "name"),
+        ("coalesce(t.m, t.s)", "name"),
+        ("coalesce(t.s, t.m)", "text"),
+        ("coalesce(t.v, t.s, t.m)", "name"),
+        ("coalesce(t.v, t.m, t.s)", "name"),
+        ("coalesce(t.v, t.s)", "character varying"),
+        ("coalesce(t.p, t.s)", "character"),
+        ("coalesce(t.p, t.v)", "character"),
+        ("coalesce(t.v, t.p)", "character varying"),
+    ] {
+        same(
+            &path,
+            &format!("SELECT pg_typeof({e})::text AS t FROM c.u t"),
+            &[ty],
+        );
+    }
+    // A set operation and a VALUES list, each value in the type found: a name holds 63 bytes.
+    same(
+        &path,
+        "SELECT pg_typeof(x.c)::text AS t, length(x.c) AS l FROM \
+         (SELECT t.v AS c FROM c.u t UNION ALL SELECT t.m FROM c.u t) x ORDER BY l DESC",
+        &["name|63", "name|2"],
+    );
+    same(
+        &path,
+        "SELECT pg_typeof(x.c)::text AS t, length(x.c) AS l FROM \
+         (SELECT t.m AS c FROM c.u t UNION ALL SELECT t.p FROM c.u t) x ORDER BY l DESC",
+        &["name|63", "name|2"],
+    );
+    same(
+        &path,
+        "SELECT pg_typeof(x.c)::text AS t FROM (VALUES ('a'::varchar), ('b'::name)) x (c) LIMIT 1",
+        &["name"],
+    );
+}
