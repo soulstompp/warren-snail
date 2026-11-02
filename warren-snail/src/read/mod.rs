@@ -1151,7 +1151,7 @@ impl Snail {
             Along::Table(part) => (part, None, Round::default()),
             Along::Count(asked) => return self.scan_question(*asked, None),
             Along::Strands(chosen) => {
-                let (kept, strands) = self.keys_of(want.table, &chosen)?;
+                let (kept, strands, _) = self.keys_of(want.table, &chosen)?;
                 (before, held_before) = (self.touched(), self.pages_held());
                 let w = Want {
                     table: want.table,
@@ -1506,15 +1506,10 @@ impl Snail {
                 }
                 return self.ask_pipeline(q, params);
             }
-            // A round asked along an order, where an element strand may answer it, reads that order.
-            let along = order.is_some()
-                && question::parse(&self.catalog, sql).is_ok_and(|p| {
-                    p.sides.len() == 1 && p.sides[0].ops.iter().any(|o| o.value.is_some())
-                });
             if pipeline::is_pipeline(q)
                 || relations::is_set_operation(q)
                 || pipeline::tests_composite_null(&self.catalog, q)
-                || (pipeline::reads_per_row(&self.catalog, q) && !along)
+                || pipeline::reads_per_row(&self.catalog, q)
             {
                 if order.is_some() && (pipeline::is_pipeline(q) || relations::is_set_operation(q)) {
                     return Err(Error::new("a pipeline reads its table along its own order"));
@@ -1525,7 +1520,8 @@ impl Snail {
             // them.
             if relations::names_a_view(&self.catalog, q)
                 || !params.is_empty()
-                || pipeline::hands_over(q) && question::parse(&self.catalog, sql).is_err()
+                || (pipeline::hands_over(q) || elements::read_a_row_at_a_time(&self.catalog, q))
+                    && question::parse(&self.catalog, sql).is_err()
             {
                 if order.is_some() {
                     return Err(Error::new("a pipeline reads its table along its own order"));
@@ -1765,7 +1761,7 @@ impl Snail {
             Along::Table(part) => part,
             Along::Count(asked) => return self.scan_one(&asked, None, None, sink),
             Along::Strands(chosen) => {
-                let (keys, mut strands) = self.keys_of(table, &chosen)?;
+                let (keys, mut strands, _held) = self.keys_of(table, &chosen)?;
                 let want = Want {
                     table,
                     side: want.side,

@@ -146,6 +146,8 @@ fn an_array_s_operators_answer_alike_along_its_element_strand_and_the_table_s_or
         ("'{500}' <@ a".into(), kept(n, |v| has(v, 500))),
         ("a @> '{}'".into(), kept(n, |_| true)),
         ("a @> '{3,NULL}'".into(), Vec::new()),
+        ("a @> '{500,500}'".into(), kept(n, |v| has(v, 500))),
+        ("a @> ARRAY[500]".into(), kept(n, |v| has(v, 500))),
         (
             "a && '{500,501}'".into(),
             kept(n, |v| has(v, 500) || has(v, 501)),
@@ -234,6 +236,28 @@ fn a_rare_element_reads_few_pages_and_a_common_one_the_table_s_order() {
     );
     // Rows of few keys read few blocks of the table's order.
     assert!(along.blocks_read < whole.blocks_read, "{along:?} {whole:?}");
+    // A value no row passes reads no page.
+    let (none, round) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE a @> '{3,NULL}'",
+        Some("t_a"),
+    );
+    assert!(none.is_empty());
+    assert_eq!(round.column_pages_read, 0, "{round:?}");
+    // Two elements, one in every row and one in few: the first is not worth its pages.
+    let (_, both) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{9000,500}'", None);
+    let (_, one) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{500}'", None);
+    assert_eq!(
+        both.column_pages_read, one.column_pages_read,
+        "{both:?} {one:?}"
+    );
+    // Named, the strand is read even where the table's order reads fewer.
+    let (_, named) = ids(
+        &mut s,
+        "SELECT id FROM s.t WHERE a @> '{9000}'",
+        Some("t_a"),
+    );
+    assert!(named.order.starts_with("t_a+"), "{named:?}");
     // Every array holds it: what the strand would cost, should its keys lie in every block, is more
     // than it would save, so the table's order is read and the strand left unread.
     let q = "SELECT id FROM s.t WHERE a @> '{9000}'";
@@ -253,6 +277,20 @@ fn a_count_of_one_element_is_answered_from_its_counts() {
     let (c, round) = count(&mut s, "SELECT count(*) FROM s.t WHERE a && '{500}'", None);
     assert_eq!(c, want(500));
     assert_eq!(round.order, "t_a", "{round:?}");
+    // Beside another condition its count closes nothing.
+    let (c, round) = count(
+        &mut s,
+        "SELECT count(*) FROM s.t WHERE a @> '{500}' AND id < 3000",
+        None,
+    );
+    assert_eq!(
+        c,
+        kept(n, |v| v.contains(&Some(500)))
+            .into_iter()
+            .filter(|&i| i < 3000)
+            .count() as i64
+    );
+    assert!(round.order != "t_a", "{round:?}");
     let (c, _) = count(
         &mut s,
         "SELECT count(*) FROM s.t WHERE a @> '{3,500}'",
@@ -339,6 +377,22 @@ fn a_gin_index_is_read_or_refused_as_postgresql_reads_it() {
         let got = outcomes(&format!("{table}\n{statement};"));
         assert_eq!(got[1], None, "{statement}");
     }
+    let got = outcomes(&format!(
+        "{table}\nCREATE INDEX e ON s.t USING gist (v, r);"
+    ));
+    let e = got[1].as_deref().unwrap();
+    assert!(
+        e.contains("beside a key of another kind is not held"),
+        "{e}"
+    );
+    // A table refused takes its strands with it.
+    let r = Catalog::read(
+        "CREATE TABLE s.p (id int PRIMARY KEY, g geometry); \
+         CREATE TABLE s.c (id int PRIMARY KEY, a int[], p int REFERENCES s.p); \
+         CREATE INDEX e ON s.c USING gin (a);",
+    )
+    .unwrap();
+    assert!(r.catalog.tables.is_empty(), "{:?}", r.catalog.tables.len());
     // Several keys are a strand each, of one index.
     let c = Catalog::parse(&format!(
         "{table}\nCREATE INDEX e ON s.t USING gin (a, tx) WITH (fastupdate = off);"
@@ -514,6 +568,7 @@ fn a_jsonb_s_operators_answer_alike_along_its_strands() {
             "j ?| '{k1,k2}'",
             "j ?| '{}'",
             "j ?| ARRAY['n7', NULL]",
+            "j ?| '{k1,k2}'::text[]",
             "j ?& '{k1,z}'",
             "j ?& '{}'",
         ],
@@ -624,6 +679,12 @@ fn a_tsvector_s_match_and_a_tsquery_s_containment_answer_alike_along_their_stran
     let (c, round) = count(&mut s, q, None);
     assert_eq!(round.order.split('+').count(), 1, "{round:?}");
     assert_eq!(c, count(&mut s, q, Some("t_pkey")).0);
+    // A weight or a prefix is held to each row: their counts are no element's.
+    for w in ["w1:B", "word1:*", "w1 & word7"] {
+        let q = format!("SELECT count(*) FROM s.t WHERE v @@ '{w}'");
+        let (by_pages, _) = count(&mut s, &q, None);
+        assert_eq!(by_pages, count(&mut s, &q, Some("t_pkey")).0, "{q}");
+    }
     // A condition that asks nothing of a strand reads the table's order, named or not.
     let (_, round) = ids(
         &mut s,
@@ -1134,11 +1195,17 @@ fn the_round_s_room_holds_the_keys_or_the_round_reads_the_table_s_order() {
     let mut s = fresh(&arrays("gin-room", n));
     let q = "SELECT id FROM s.t WHERE a @> '{3}'";
     let (want, _) = ids(&mut s, q, Some("t_pkey"));
+    let (_, roomy) = ids(&mut s, q, Some("t_a"));
+    let read = roomy.reads[0].column_pages_read;
     s.size_rounds(warren_snail::room::Sizes::of(4096));
     let (b, round) = s.ask(q, Some("t_a")).unwrap();
     assert_eq!(ids_of(&b), want);
     // It stopped reading the strand where the keys passed the room, and read the table's order.
     assert!(round.order.contains("t_a"), "{round:?}");
+    assert!(
+        round.reads[0].column_pages_read < read,
+        "{round:?} {roomy:?}"
+    );
     assert_eq!(
         round.column_pages_read,
         round.reads.iter().map(|r| r.column_pages_read).sum::<u64>()
@@ -1217,4 +1284,239 @@ fn a_join_finds_a_table_s_rows_along_its_strand() {
     exact(q, &round);
     assert_eq!(b.num_rows(), (0..n).filter(|i| i % 397 == 9).count());
     assert!(round.order.contains("t_a"), "{round:?}");
+}
+
+#[test]
+fn a_count_on_blocks_wholly_of_one_element_reads_no_column_page_of_them() {
+    let n = 40960;
+    let mut s = fresh(&arrays("gin-closes", n));
+    let q = "SELECT count(*) FROM s.t WHERE a @> '{9000}'";
+    let (c, round) = count(&mut s, q, None);
+    assert_eq!(c, kept(n, |v| v.contains(&Some(9000))).len() as i64);
+    assert_eq!(round.order, "t_a", "{round:?}");
+    // The blocks wholly on it are closed by their counts: at most the two where it starts and ends.
+    assert!(round.blocks_read <= 2, "{round:?}");
+    assert!(round.entries_must > 0, "{round:?}");
+    let (c, whole) = count(&mut s, q, Some("t_pkey"));
+    assert_eq!(c, kept(n, |v| v.contains(&Some(9000))).len() as i64);
+    assert!(
+        round.column_pages_read * 10 < whole.column_pages_read,
+        "{round:?} {whole:?}"
+    );
+}
+
+#[test]
+fn a_gist_on_a_tsquery_answers_as_its_scan_where_postgresql_s_index_misses_an_empty_value() {
+    let mut s = snail_of("gin-misses", TEXTS, 8192, text_row);
+    let empty = (0..8192).filter(|i| i % 17 == 1).count();
+    let some = (0..8192).filter(|i| i % 17 != 0).count();
+    assert_eq!(
+        ids(&mut s, "SELECT id FROM s.t WHERE q <@ ''", Some("t_q"))
+            .0
+            .len(),
+        empty
+    );
+    assert_eq!(
+        ids(&mut s, "SELECT id FROM s.t WHERE q @> ''", Some("t_q"))
+            .0
+            .len(),
+        some
+    );
+}
+
+#[cfg(feature = "standalone")]
+mod beside {
+    use super::*;
+    use std::time::Duration;
+    use warren_snail::read::Snails;
+
+    fn empty(name: &str, ddl: &str) -> std::path::PathBuf {
+        let catalog = Catalog::parse(ddl).unwrap();
+        let tables: Vec<(String, Rows)> = catalog
+            .tables
+            .iter()
+            .filter(|t| t.declared())
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    Rows {
+                        columns: t.columns.iter().map(|c| Values::new(c.ty)).collect(),
+                    },
+                )
+            })
+            .collect();
+        let path = tmp(&format!("{name}.snail"));
+        write(&path, &catalog, &tables).unwrap();
+        path
+    }
+
+    #[test]
+    fn writers_of_one_block_of_a_strand_take_turns_at_read_committed() {
+        let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+                   CREATE INDEX t_a ON s.t USING gin (a);";
+        let path = empty("gin-turns", ddl);
+        let mut a = Snail::open_writing(&path).unwrap();
+        // Rows far apart on the table's order, one element between them, and a block of each order.
+        let values: Vec<String> = (1..=8000).map(|i| format!("({i}, '{{7}}')")).collect();
+        a.execute(&format!(
+            "INSERT INTO s.t (id, a) VALUES {}",
+            values.join(", ")
+        ))
+        .unwrap();
+        a.execute("BEGIN").unwrap();
+        a.execute("UPDATE s.t SET a = '{7,8}' WHERE id = 1")
+            .unwrap();
+        let again = path.clone();
+        let other = std::thread::spawn(move || {
+            let mut b = Snail::open_writing(&again).unwrap();
+            b.execute("UPDATE s.t SET a = '{7,8}' WHERE id = 8000")
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !other.is_finished(),
+            "a writer of the strand's block waits its turn"
+        );
+        a.execute("COMMIT").unwrap();
+        other.join().unwrap();
+        let (found, _) = ids(&mut a, "SELECT id FROM s.t WHERE a @> '{8}'", Some("t_a"));
+        assert_eq!(found, [1, 8000]);
+    }
+
+    #[test]
+    fn a_stored_generated_column_is_routed_as_any_column_is() {
+        let ddl = "CREATE TABLE s.t (id int NOT NULL, c text, v tsvector GENERATED ALWAYS AS \
+                   (to_tsvector('simple', c)) STORED, PRIMARY KEY (id)); \
+                   CREATE INDEX t_v ON s.t USING gin (v);";
+        let path = empty("gin-generated", ddl);
+        let mut s = Snail::open_writing(&path).unwrap();
+        s.execute("INSERT INTO s.t (id, c) VALUES (1, 'the red fox'), (2, 'a blue fox')")
+            .unwrap();
+        s.execute("UPDATE s.t SET c = 'a blue hen' WHERE id = 2")
+            .unwrap();
+        let q = |w: &str| format!("SELECT id FROM s.t WHERE v @@ '{w}'");
+        assert_eq!(ids(&mut s, &q("fox"), Some("t_v")).0, [1]);
+        assert_eq!(ids(&mut s, &q("hen"), Some("t_v")).0, [2]);
+        assert!(ids(&mut s, &q("absent"), Some("t_v")).0.is_empty());
+    }
+
+    #[test]
+    fn a_transaction_across_snails_writes_each_strand_and_a_round_reads_them_together() {
+        let one = empty(
+            "gin-across-a",
+            "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+             CREATE INDEX t_a ON s.t USING gin (a);",
+        );
+        let two = empty(
+            "gin-across-b",
+            "CREATE TABLE s.u (id int NOT NULL, j jsonb, PRIMARY KEY (id)); \
+             CREATE INDEX u_j ON s.u USING gin (j);",
+        );
+        let mut w = Snails::open_writing(&[&one, &two]).unwrap();
+        w.execute("BEGIN").unwrap();
+        let rows =
+            |f: &dyn Fn(i64) -> String| (1..=8000).map(|i| f(i)).collect::<Vec<_>>().join(", ");
+        w.execute(&format!(
+            "INSERT INTO s.t (id, a) VALUES {}",
+            rows(&|i| format!("({i}, '{{{}}}')", i % 397))
+        ))
+        .unwrap();
+        w.execute(&format!(
+            "INSERT INTO s.u (id, j) VALUES {}",
+            rows(&|i| format!("({i}, '{{\"k{}\": 1}}')", i % 3))
+        ))
+        .unwrap();
+        w.execute("COMMIT").unwrap();
+        let q =
+            "SELECT t.id FROM s.t t JOIN s.u u ON t.id = u.id WHERE t.a @> '{5}' AND u.j ? 'k1'";
+        let (b, round) = w.ask(q).unwrap();
+        let want: Vec<i32> = (1..=8000).filter(|i| i % 397 == 5 && i % 3 == 1).collect();
+        assert_eq!(ids_of(&b), want);
+        assert!(round.order.contains("t_a"), "{round:?}");
+    }
+}
+
+#[test]
+fn a_jsonb_s_operators_are_read_on_its_column_with_no_strand_to_ask() {
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, j jsonb, v tsvector, PRIMARY KEY (id));";
+    let mut s = snail_of("gin-bare", ddl, 1024, |i| {
+        let mut r = jsonb_row(i);
+        r.push(Some(format!("'w{}'", i % 7)));
+        r
+    });
+    let (ans, _) = ids(&mut s, "SELECT id FROM s.t WHERE j ? 'z'", None);
+    assert_eq!(ans.len(), (0..1024).filter(|i| i % 11 > 6).count());
+    let (ans, _) = ids(&mut s, "SELECT id FROM s.t WHERE j @> '{\"k1\": 1}'", None);
+    assert_eq!(ans.is_empty(), false);
+    let (ans, _) = ids(&mut s, "SELECT id FROM s.t WHERE v @@ 'w1'", None);
+    assert_eq!(ans.len(), (0..1024).filter(|i| i % 7 == 1).count());
+    // Under OR and NOT, the question path reading neither, each row is held to it.
+    let (b, _) = s
+        .ask("SELECT id FROM s.t WHERE v @@ 'w1' OR j ? 'z'", None)
+        .unwrap();
+    assert_eq!(
+        b.num_rows(),
+        (0..1024).filter(|i| i % 7 == 1 || i % 11 > 6).count()
+    );
+    let (b, _) = s
+        .ask("SELECT id FROM s.t WHERE NOT v @@ 'w1'", None)
+        .unwrap();
+    assert_eq!(b.num_rows(), (0..1024).filter(|i| i % 7 != 1).count());
+}
+
+#[test]
+fn a_join_handed_over_is_priced_with_the_strand_it_reads() {
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+               CREATE INDEX t_a ON s.t USING gin (a); \
+               CREATE TABLE s.u (id int NOT NULL, x bigint, PRIMARY KEY (id));";
+    let catalog = Catalog::parse(ddl).unwrap();
+    let n = 8192i64;
+    let t = catalog.table("s.t").unwrap();
+    let path = tmp("gin-priced.snail");
+    write(
+        &path,
+        &catalog,
+        &[
+            (
+                "s.t".into(),
+                Rows {
+                    columns: vec![
+                        Values::Int((0..n).map(Some).collect()),
+                        Values::Composed(
+                            (0..n)
+                                .map(|i| {
+                                    composed(t.columns[1].ty, Some(&format!("{{{}}}", i % 397)))
+                                })
+                                .collect(),
+                        ),
+                    ],
+                },
+            ),
+            (
+                "s.u".into(),
+                Rows {
+                    columns: vec![
+                        Values::Int((0..n).map(Some).collect()),
+                        Values::Int((0..n).collect::<Vec<_>>().into_iter().map(Some).collect()),
+                    ],
+                },
+            ),
+        ],
+    )
+    .unwrap();
+    let s = fresh(&path);
+    let q = "SELECT t.id, u.x FROM s.t t JOIN s.u u ON t.id = u.id WHERE t.a @> '{9}'";
+    let priced = warren_snail::read::price_together(&[&s], q).unwrap();
+    let (_, round) = fresh(&path).ask(q, None).unwrap();
+    let most: u64 = priced.tables.iter().map(|t| t.column_pages_high).sum();
+    let fewest: u64 = priced.tables.iter().map(|t| t.column_pages_low).sum();
+    assert!(
+        fewest <= round.column_pages_read && round.column_pages_read <= most,
+        "{priced:?} {round:?}"
+    );
+    let along = priced.tables.iter().find(|t| t.table == "s.t").unwrap();
+    assert!(
+        along.column_pages_high > along.column_pages_estimate,
+        "{along:?}"
+    );
 }

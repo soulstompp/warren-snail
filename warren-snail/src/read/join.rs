@@ -481,6 +481,7 @@ pub(super) fn ask_join_within(
         });
         t.columns[side] = columns.clone();
         let mut keys = keys;
+        let mut _held_keys = None;
         if keys.is_none() {
             let alone = Want {
                 table,
@@ -490,8 +491,9 @@ pub(super) fn ask_join_within(
                 keys: None,
             };
             if let super::elements::Along::Strands(c) = snail.along_elements(q, &alone, None)? {
-                let (found, strands) = snail.keys_of(table, &c)?;
+                let (found, strands, held) = snail.keys_of(table, &c)?;
                 keys = found;
+                _held_keys = Some(held);
                 for r in [&mut round, &mut parts[at_snail]] {
                     r.add_table(&strands, &strands.order);
                 }

@@ -508,8 +508,14 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
             }
             _ => None,
         };
+        // Its element strands, where a round reads them first, then the rows by their keys.
+        let strand = match (&point, snail.along_elements(&q, &want, None)?) {
+            (None, super::elements::Along::Strands(c)) => c.strand_pages(),
+            _ => 0,
+        };
         let (low, estimate) = match &point {
             Some((by, one, _)) => (0, rows[*by].saturating_mul(*one).min(own)),
+            None if strand > 0 => (strand.min(own), own),
             None => (own, own),
         };
         out.push(TablePrice {
@@ -524,7 +530,7 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
             directory_pages: snail.touched() - before,
             map_pages: part.plan.map_pages,
             column_pages_low: low,
-            column_pages_high: own,
+            column_pages_high: own + strand,
             column_pages_estimate: estimate,
             key_column_pages: point.as_ref().map(|p| p.1),
             rows_low: part.rows.0,

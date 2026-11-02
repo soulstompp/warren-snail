@@ -43,6 +43,17 @@ enum Kind {
     Tsquery,
 }
 
+/// What the operators of a column of its type read, with no operator class named.
+fn kind_of_type(ty: ColumnType) -> Option<Kind> {
+    match ty {
+        ColumnType::Textual(Textual::Jsonb) => Some(Kind::Jsonb),
+        ColumnType::Textual(Textual::Tsvector) => Some(Kind::Tsvector),
+        ColumnType::Textual(Textual::Tsquery) => Some(Kind::Tsquery),
+        ColumnType::Composed(r) if matches!(r.def(), Composed::Array { .. }) => Some(Kind::Array),
+        _ => None,
+    }
+}
+
 fn kind_of(key: &ElementKey, ty: ColumnType) -> Kind {
     match (key.opclass.as_str(), ty) {
         ("jsonb_ops", _) => Kind::Jsonb,
@@ -567,6 +578,49 @@ fn fixed(e: &Expr) -> bool {
     }
 }
 
+fn array_written(e: &Expr) -> bool {
+    match e {
+        Expr::Array(_) => true,
+        Expr::Cast { expr, .. } | Expr::Nested(expr) => array_written(expr),
+        _ => false,
+    }
+}
+
+/// Whether a WHERE on one table names a column whose operators `element_cond` reads: where the question
+/// path reads the WHERE no other way, as under OR or NOT, a pipeline holds each row to it.
+pub(super) fn read_a_row_at_a_time(catalog: &Catalog, q: &sqlparser::ast::Query) -> bool {
+    fn names(e: &Expr, of: &[&str]) -> bool {
+        match e {
+            Expr::Identifier(i) => of.contains(&crate::catalog::ident(i).as_str()),
+            Expr::CompoundIdentifier(p) => p
+                .last()
+                .is_some_and(|i| of.contains(&crate::catalog::ident(i).as_str())),
+            Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => names(e, of),
+            Expr::BinaryOp { left, right, .. } => names(left, of) || names(right, of),
+            _ => false,
+        }
+    }
+    let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    let ([from], Some(w)) = (s.from.as_slice(), &s.selection) else {
+        return false;
+    };
+    let sqlparser::ast::TableFactor::Table { name, .. } = &from.relation else {
+        return false;
+    };
+    let Some(table) = catalog.table(&crate::catalog::object_name(name)) else {
+        return false;
+    };
+    let of: Vec<&str> = table
+        .columns
+        .iter()
+        .filter(|c| kind_of_type(c.ty).is_some())
+        .map(|c| c.name.as_str())
+        .collect();
+    names(w, &of)
+}
+
 /// A condition on a column an element strand keys, by an operator its operator class answers, on a
 /// value of that operator's type: none where it is another.
 pub(super) fn element_cond(
@@ -597,14 +651,10 @@ pub(super) fn element_cond(
         .filter(|k| k.column == c)
         .map(|k| kind_of(k, ty))
         .find(|&k| answers(k, seen));
-    // On these types the operator is read a row at a time with no strand to ask.
-    let bare = match ty {
-        ColumnType::Textual(Textual::Jsonb) => Some(Kind::Jsonb),
-        ColumnType::Textual(Textual::Tsvector) => Some(Kind::Tsvector),
-        ColumnType::Textual(Textual::Tsquery) => Some(Kind::Tsquery),
-        _ => None,
-    };
-    let Some(kind) = keyed.or(bare.filter(|&k| answers(k, seen))) else {
+    // On these types the operator is read a row at a time with no strand to ask; an array's `=` is
+    // compared by its key, as it was.
+    let bare = kind_of_type(ty).filter(|&k| answers(k, seen) && (k != Kind::Array || seen != "="));
+    let Some(kind) = keyed.or(bare) else {
         return Ok(None);
     };
     if !fixed(lit) {
@@ -631,10 +681,17 @@ pub(super) fn element_cond(
         '"',
         table.columns[c].name.clone(),
     )));
+    // An array written out is held to each row as the literal of its value.
+    let written = match (&value, array_written(lit)) {
+        (Datum::Compound(k), true) => Box::new(Expr::value(SqlValue::SingleQuotedString(
+            crate::composed::text_out(right, &k.item),
+        ))),
+        _ => Box::new(lit.clone()),
+    };
     let (left, right) = if lit_left {
-        (Box::new(lit.clone()), own)
+        (written, own)
     } else {
-        (own, Box::new(lit.clone()))
+        (own, written)
     };
     Ok(Some(OpCond {
         column: c,
@@ -681,7 +738,7 @@ fn value_as(table: &Table, lit: &Expr, ty: ColumnType) -> Option<Datum> {
 }
 
 /// Where a condition's value lies on a strand.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Spot {
     Key(KeyValue),
     Prefix(Vec<u8>),
@@ -692,6 +749,18 @@ enum Spot {
 struct Probe {
     strand: usize,
     spot: Spot,
+}
+
+/// A place of a strand among the probes, each place once.
+fn one(probes: &mut Vec<Probe>, strand: usize, spot: Spot) -> Ask {
+    if let Some(at) = probes
+        .iter()
+        .position(|p| p.strand == strand && p.spot == spot)
+    {
+        return Ask::One(at);
+    }
+    probes.push(Probe { strand, spot });
+    Ask::One(probes.len() - 1)
 }
 
 /// A condition's need, its elements as probes.
@@ -818,6 +887,13 @@ pub(super) struct Chosen {
     index: String,
 }
 
+impl Chosen {
+    /// The column pages its strands read from the file.
+    pub(super) fn strand_pages(&self) -> u64 {
+        self.asking.pages
+    }
+}
+
 const KEYS_PAST_THE_ROOM: &str = "an element strand's keys lie past the round's room";
 
 impl Snail {
@@ -888,20 +964,8 @@ impl Snail {
         let strand = &self.catalog.tables[ti];
         Ok(match need {
             Need::Every => unreachable!("a condition asking nothing of a strand is not read on it"),
-            Need::At(d) => {
-                probes.push(Probe {
-                    strand: ti,
-                    spot: Spot::Key(element_key(strand, d)?),
-                });
-                Ask::One(probes.len() - 1)
-            }
-            Need::Prefix(w) => {
-                probes.push(Probe {
-                    strand: ti,
-                    spot: Spot::Prefix(w.as_bytes().to_vec()),
-                });
-                Ask::One(probes.len() - 1)
-            }
+            Need::At(d) => one(probes, ti, Spot::Key(element_key(strand, d)?)),
+            Need::Prefix(w) => one(probes, ti, Spot::Prefix(w.as_bytes().to_vec())),
             Need::All(v) => Ask::All(
                 v.iter()
                     .map(|n| self.ask_of(ti, n, probes))
@@ -1068,7 +1132,7 @@ impl Snail {
         // lie in every block, is no more than what it saves should they lie together.
         let bounds = first.as_ref().map(|f| {
             let t = f.plan.column_pages - f.plan.held;
-            (t, f.plan.block_bounds())
+            (t, f.plan.block_bounds(), f.table_rows)
         });
         let mut chosen: Vec<Ask> = Vec::new();
         let mut asking = Asking {
@@ -1078,9 +1142,11 @@ impl Snail {
         };
         let index = children[0].2.clone();
         for (a, x, _, _) in &children {
-            if let (false, Some((t, b))) = (chosen.is_empty(), &bounds) {
+            // The next is read while its pages are under what the rows it leaves out could save.
+            if let (false, Some((t, b, n))) = (chosen.is_empty(), &bounds) {
                 let most = asking.rows.1.saturating_mul(u64::from(b.1)).min(*t);
-                if x.pages >= most {
+                let out = 1.0 - (x.estimate / (*n).max(1) as f64).min(1.0);
+                if x.pages as f64 >= most as f64 * out {
                     break;
                 }
             }
@@ -1093,7 +1159,7 @@ impl Snail {
             }
             asking.estimate = asking.estimate.min(x.estimate);
         }
-        if let Some((t, b)) = &bounds {
+        if let Some((t, b, _)) = &bounds {
             let fewest = asking
                 .rows
                 .0
@@ -1133,7 +1199,11 @@ impl Snail {
 
     /// The keys of the rows the strands say may pass, read from them, and their round; none where
     /// they pass the room, the round then reading the table's order alone.
-    pub(super) fn keys_of(&self, table: &Table, c: &Chosen) -> Result<(Option<KeySet>, Round)> {
+    pub(super) fn keys_of(
+        &self,
+        table: &Table,
+        c: &Chosen,
+    ) -> Result<(Option<KeySet>, Round, crate::room::Holding)> {
         let mut used = Vec::new();
         c.ask.probes(&mut used);
         used.sort_unstable();
@@ -1269,7 +1339,7 @@ impl Snail {
             }
         }
         if past {
-            return Ok((None, round));
+            return Ok((None, round, crate::room::holding(0)));
         }
         fn kept(ask: &Ask, sets: &[Vec<u32>]) -> HashSet<u32> {
             match ask {
@@ -1288,7 +1358,7 @@ impl Snail {
             .filter(|(_, id)| wanted.contains(id))
             .map(|(k, _)| k)
             .collect();
-        Ok((Some(KeySet::new(columns, found)), round))
+        Ok((Some(KeySet::new(columns, found)), round, held))
     }
 
     /// A round priced along the strands: its pages at the most the keys can read of the table.

@@ -185,8 +185,11 @@ along another, where that one holds the question's columns.
 **Where it stops.** A B-tree is an order on its key: columns, an instant on UTC's clock, or that
 instant's month. A hash index is an order on its key as a B-tree on it would be. A GiST or an
 SP-GiST index on a range, a multirange, an `inet` or text is an order on the type's own order, each
-block keeping the span of the values it holds. A GIN or a BRIN index, and a GiST or an SP-GiST on
-any other type, is refused by name. A partial index, its `WHERE` comparing its columns with values,
+block keeping the span of the values it holds. A GIN index on an array, a `jsonb` or a `tsvector`, and
+a GiST index on a `tsvector` or a `tsquery`, is a strand of what each row holds, an element and the
+row's key, on the element's order: an operator finds its rows' keys there and the rows by them on the
+table's order, where that reads the fewest pages, and one element's count comes from its counts. A
+BRIN index, and a GiST or an SP-GiST on any other type, is refused by name. A partial index, its `WHERE` comparing its columns with values,
 holds only the rows it names, and serves a question whose conditions imply its own. A question that
 reads a column no order holds in the question's own order still reads along the table's order.
 Cluster each table on the index most of its questions lead with: a key handed out as rows arrive,
@@ -875,7 +878,8 @@ Each command exits 0, or prints why it refused and exits 1.
   each key's operator class, its type's default or, on text, one comparing its bytes; `WITH (…)`,
   read and doing nothing; a key column's `NULLS FIRST` or `NULLS LAST`; and `DESC`, its values held
   rising all the same, giving the side its NULLs take, which `catalog` names.
-- `ALTER TABLE … CLUSTER ON <index>`, a B-tree or a GiST index that is not partial. The index a
+- `ALTER TABLE … CLUSTER ON <index>`, a B-tree or a GiST index that is not partial, and not on a
+  `tsvector` or a `tsquery`, whose strand holds a row once per element. The index a
   table is clustered on may include columns; the table's order holds every column already.
 
 ### The types it holds

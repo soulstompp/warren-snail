@@ -2320,6 +2320,20 @@ fn typed_op(
                 Value::Text(t) if quoted(right) || matches!(right, Expr::Array(_)) => {
                     crate::textual::text_array_in(t).map(Some)
                 }
+                Value::Composed(ty, c) if *ty == super::typed::array_of(ColumnType::Text(None)) => {
+                    let crate::composed::Item::Array { elements, .. } = &c.item else {
+                        return Ok(None);
+                    };
+                    Ok(Some(
+                        elements
+                            .iter()
+                            .map(|e| match e {
+                                crate::composed::Item::Scalar(crate::read::statement::Datum::Text(t)) => Some(t.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                    ))
+                }
                 _ => Err(refused()),
             }
         };
