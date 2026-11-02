@@ -1076,8 +1076,8 @@ fn a_window_over_a_join_along_its_first_table_s_strand_holds_one_partition_at_a_
         (0, 0),
         "{q}: {round:?}"
     );
-    // A chunk, the owners' hash and one owner's 32 rows.
-    assert!(round.bytes_held <= room + one_chunk(&path, 27), "{q}: {round:?}");
+    // Beside the room, a block of the table in hand and a chunk of the rows it makes.
+    assert!(round.bytes_held <= room + 2 * one_chunk(&path, 27), "{q}: {round:?}");
     // A LEFT JOIN keeps each row of its first table, those that meet none among them: the owners
     // from 256 on meet none.
     let left = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
