@@ -186,6 +186,50 @@ fn the_runs_rule_out_a_value_between_them_that_a_least_and_greatest_would_keep()
     assert!(!rows.is_empty());
     let (rows, _, _) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE v <> 500000");
     assert_eq!(rows.len(), 16384);
+    // A block's few values stay points, a value between them in no run.
+    let (a, b) = twins(
+        "multi-points",
+        "integer",
+        "CREATE INDEX t_v ON s.t USING brin (v int4_minmax_multi_ops (values_per_range = 8));",
+        4096,
+        &|i: i64| Some(((i % 4 + 1) * 10).to_string()),
+    );
+    let (mut s, mut t) = (fresh(&a), fresh(&b));
+    let (rows, with, without) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE v = 25");
+    assert!(rows.is_empty());
+    assert!(without.blocks_read > 1, "{without:?}");
+    assert_eq!(with.blocks_read, 0, "{with:?}");
+    let (rows, _, _) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE v = 30");
+    assert_eq!(rows.len(), 1024);
+    // On a value keyed by its bytes, runs and points alike.
+    let (a, b) = twins(
+        "multi-inet",
+        "inet",
+        "CREATE INDEX t_v ON s.t USING brin (v inet_minmax_multi_ops (values_per_range = 8));",
+        4096,
+        &|i: i64| {
+            Some(if i % 2 == 0 {
+                format!("10.0.{}.1", i % 8)
+            } else {
+                format!("192.168.{}.{}", i / 256, i % 256)
+            })
+        },
+    );
+    let (mut s, mut t) = (fresh(&a), fresh(&b));
+    for (q, some) in [
+        ("v = '10.0.2.1'", true),
+        ("v = '192.168.1.1'", true),
+        ("v = '172.16.0.1'", false),
+        ("v > '172.16.0.1'", true),
+        ("v > '172.16.0.1' AND v < '172.16.0.9'", false),
+    ] {
+        let (rows, with, without) = both(&mut s, &mut t, &format!("SELECT id FROM s.t WHERE {q}"));
+        assert_eq!(!rows.is_empty(), some, "{q}");
+        if !some {
+            assert!(without.blocks_read > 1, "{q}: {without:?}");
+            assert_eq!(with.blocks_read, 0, "{q}: {with:?}");
+        }
+    }
 }
 
 /// A value of each type a BRIN operator class takes, rising with `j`.
@@ -850,6 +894,8 @@ fn a_box_s_inclusion_rules_out_a_block_by_its_leaves_for_every_operator_it_takes
         format!("{q1} && v"),
         format!("{q1} @> v"),
         format!("{q1} >> v"),
+        format!("{q1} <<| v"),
+        format!("{q1} |>> v"),
         "v && box '(10,10),(0,0)'".to_string(),
         "v && '(Infinity,Infinity),(-Infinity,-Infinity)'::box".to_string(),
     ] {
@@ -864,6 +910,12 @@ fn a_box_s_inclusion_rules_out_a_block_by_its_leaves_for_every_operator_it_takes
     assert!(with.blocks_read <= 2, "{with:?}");
     assert!(with.blocks_read <= without.blocks_read);
     // A box past every box.
+    let (rows, with, _) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE v @> point '(5001,393)'");
+    assert!(!rows.is_empty());
+    assert!(with.blocks_read <= 2, "{with:?}");
+    let (rows, with, _) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE '(10,10),(0,0)' |>> v");
+    assert!(rows.is_empty() || rows.iter().all(|&i| i % 512 < 8));
+    assert!(with.blocks_read <= without.blocks_read);
     let (rows, with, _) = both(
         &mut s,
         &mut t,
@@ -905,6 +957,10 @@ fn a_filter_folded_above_the_blocks_rules_out_a_page_of_entries_unread() {
         with.directory_pages < without.directory_pages,
         "{with:?} against {without:?}"
     );
+    // A value a block holds is found under the folded filters above it.
+    let (rows, with, _) = both(&mut s, &mut t, "SELECT id FROM s.t WHERE v = 4004");
+    assert!(!rows.is_empty());
+    assert!(with.blocks_read <= 3, "{with:?}");
     // The filters' bytes lie in the directory, counted: read whole, its pages are its predicted.
     let (_, whole, whole_twin) = both(&mut s, &mut t, "SELECT id FROM s.t");
     assert!(whole.directory_pages > whole_twin.directory_pages);
@@ -1192,7 +1248,7 @@ fn a_summary_under_a_library_s_collation_sums_each_value_s_key() {
              CREATE INDEX t_v ON s.t USING brin (v text_bloom_ops);"
         ))
         .unwrap();
-        let ids = Values::Int((0..4096).map(Some).collect());
+        let keys = Values::Int((0..4096).map(Some).collect());
         let v = Values::Text(
             (0..4096)
                 .map(|i| {
@@ -1210,7 +1266,7 @@ fn a_summary_under_a_library_s_collation_sums_each_value_s_key() {
             &[(
                 "s.t".into(),
                 Rows {
-                    columns: vec![ids, v],
+                    columns: vec![keys, v],
                 },
             )],
         )
@@ -1376,6 +1432,7 @@ mod written {
             );
         }
         asked(&mut s, &mut t, &["b = 12010", "m = 200", "x = 'x0100'"]);
+        s.census().unwrap();
     }
 
     #[test]
@@ -1413,6 +1470,27 @@ mod written {
                 (0, 0),
                 "{class}: {round:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_block_holding_only_nulls_sums_its_first_value_written() {
+        for (k, class) in ["int4_bloom_ops", "int4_minmax_multi_ops"].iter().enumerate() {
+            let path = snail_of(
+                &format!("first-{k}"),
+                "integer",
+                &format!("CREATE INDEX t_v ON s.t USING brin (v {class});"),
+                4096,
+                &|_| None,
+            );
+            let mut w = Snail::open_writing(&path).unwrap();
+            let q = "SELECT id FROM s.t WHERE v = 5";
+            let (b, round) = w.ask(q, None).unwrap();
+            assert_eq!((b.num_rows(), round.blocks_read), (0, 0), "{class}: {round:?}");
+            run(&mut w, "UPDATE s.t SET v = 5 WHERE id = 100");
+            let (b, round) = w.ask(q, None).unwrap();
+            exact(q, &round);
+            assert_eq!((b.num_rows(), round.blocks_read), (1, 1), "{class}: {round:?}");
         }
     }
 
