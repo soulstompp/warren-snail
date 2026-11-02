@@ -147,6 +147,15 @@ fn each_table(q: &mut sqlparser::ast::Query, f: &mut dyn FnMut(&mut sqlparser::a
         }
     }
     each_table_of(q.body.as_mut(), f);
+    if let Some(sqlparser::ast::OrderBy {
+        kind: sqlparser::ast::OrderByKind::Expressions(sorts),
+        ..
+    }) = q.order_by.as_mut()
+    {
+        for s in sorts {
+            subqueries::each_query_mut(&mut s.expr, &mut |q| each_table(q, f));
+        }
+    }
 }
 
 fn each_table_of(
@@ -185,6 +194,9 @@ fn each_table_of(
             }
             exprs.extend(s.selection.as_mut());
             exprs.extend(s.having.as_mut());
+            if let sqlparser::ast::GroupByExpr::Expressions(by, _) = &mut s.group_by {
+                exprs.extend(by.iter_mut());
+            }
             for e in exprs {
                 subqueries::each_query_mut(e, &mut |q| each_table(q, f));
             }

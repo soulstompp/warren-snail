@@ -277,6 +277,143 @@ fn snails_read_together_answer_as_snails_opened_together_and_their_join_is_price
 }
 
 #[test]
+fn a_table_named_anywhere_in_a_question_is_read_from_the_snail_holding_it() {
+    let int = |v: &[Option<i64>]| warren_snail::values::Values::Int(v.to_vec());
+    let ints = |v: [i64; 5]| int(&v.map(Some));
+    let (t_ddl, u_ddl) = (
+        "CREATE TABLE a.t (id integer NOT NULL, g integer, v integer, PRIMARY KEY (id));",
+        "CREATE TABLE b.u (id integer NOT NULL, t_id integer, w integer, PRIMARY KEY (id));",
+    );
+    let t = || Rows {
+        columns: vec![
+            ints([1, 2, 3, 4, 5]),
+            ints([1, 1, 2, 2, 3]),
+            int(&[Some(10), None, Some(30), Some(40), None]),
+        ],
+    };
+    let u = || Rows {
+        columns: vec![
+            int(&[Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]),
+            int(&[Some(1), Some(1), Some(2), Some(4), Some(9), None]),
+            int(&[Some(5), Some(7), Some(9), None, Some(11), Some(2)]),
+        ],
+    };
+    let first = tmp("across-named-t.snail");
+    let second = tmp("across-named-u.snail");
+    let both = tmp("across-named-both.snail");
+    write(
+        &first,
+        &Catalog::parse(t_ddl).unwrap(),
+        &[("a.t".into(), t())],
+    )
+    .unwrap();
+    write(
+        &second,
+        &Catalog::parse(u_ddl).unwrap(),
+        &[("b.u".into(), u())],
+    )
+    .unwrap();
+    write(
+        &both,
+        &Catalog::parse(&format!("{t_ddl}\n{u_ddl}")).unwrap(),
+        &[("a.t".into(), t()), ("b.u".into(), u())],
+    )
+    .unwrap();
+    let shown = |b: &arrow::array::RecordBatch| {
+        use arrow::array::Array;
+        (0..b.num_rows())
+            .map(|r| {
+                b.columns()
+                    .iter()
+                    .map(|c| match c.is_null(r) {
+                        true => String::new(),
+                        false => arrow::util::display::array_value_to_string(c, r).unwrap(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // Each answer is PostgreSQL 18.6's over the same rows.
+    for (q, want) in [
+        // A derived table's, alone and beside the other snail's.
+        ("SELECT d.c FROM (SELECT count(*) AS c FROM b.u) d", "6"),
+        (
+            "SELECT e.c FROM (SELECT d.c FROM (SELECT count(*) AS c FROM b.u) d) e",
+            "6",
+        ),
+        (
+            "SELECT t.id, d.w FROM a.t t JOIN (SELECT u.t_id, u.w FROM b.u u) d ON d.t_id = t.id \
+             ORDER BY 1, 2",
+            "1|5 1|7 2|9 4|",
+        ),
+        (
+            "SELECT d.id FROM (SELECT t.id FROM a.t t WHERE t.id < 3 UNION ALL SELECT u.id FROM b.u u \
+             WHERE u.id < 3) d ORDER BY 1",
+            "1 1 2 2",
+        ),
+        (
+            "WITH x AS (SELECT i.id FROM (SELECT u.id FROM b.u u) i) SELECT count(*) AS c FROM x",
+            "6",
+        ),
+        (
+            "SELECT t.id, l.w FROM a.t t, LATERAL (SELECT u.w FROM b.u u WHERE u.t_id = t.id) l \
+             ORDER BY 1, 2",
+            "1|5 1|7 2|9 4|",
+        ),
+        (
+            "SELECT (SELECT i.c FROM (SELECT count(*) AS c FROM b.u u) i) AS n",
+            "6",
+        ),
+        // A subquery's under ORDER BY and GROUP BY.
+        (
+            "SELECT t.id FROM a.t t ORDER BY (SELECT max(u.w) FROM b.u u), t.id",
+            "1 2 3 4 5",
+        ),
+        (
+            "SELECT t.id FROM a.t t ORDER BY EXISTS (SELECT 1 FROM b.u u WHERE u.t_id = t.id), t.id",
+            "3 5 1 2 4",
+        ),
+        (
+            "SELECT t.id FROM a.t t GROUP BY t.id, (SELECT max(u.w) FROM b.u u) ORDER BY 1",
+            "1 2 3 4 5",
+        ),
+        (
+            "SELECT e.id FROM (SELECT t.id FROM a.t t ORDER BY (SELECT max(u.w) FROM b.u u), t.id \
+             LIMIT 2) e",
+            "1 2",
+        ),
+        (
+            "WITH c AS (SELECT t.id FROM a.t t ORDER BY (SELECT max(u.w) FROM b.u u), t.id LIMIT 2) \
+             SELECT c.id FROM c",
+            "1 2",
+        ),
+        (
+            "SELECT t.id FROM a.t t WHERE t.id < 3 UNION ALL (SELECT t2.id FROM a.t t2 \
+             ORDER BY (SELECT max(u.w) FROM b.u u), t2.id LIMIT 1) ORDER BY 1",
+            "1 1 2",
+        ),
+    ] {
+        #[cfg(feature = "standalone")]
+        let mut across = Snails::open_holding(&[first.as_path(), second.as_path()], 0).unwrap();
+        #[cfg(not(feature = "standalone"))]
+        let mut across = Snails::open(&[first.as_path(), second.as_path()]).unwrap();
+        let (b, round) = across.ask(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        assert_eq!(shown(&b), want, "{q}");
+        for part in &round.snails {
+            assert_eq!(
+                part.column_pages_read,
+                part.column_pages_predicted - part.column_pages_held,
+                "{q}: {round:?}"
+            );
+        }
+        let (one, _) = fresh(&both).ask(q, None).unwrap();
+        assert_eq!(shown(&one), want, "{q}: one snail holding both");
+    }
+}
+
+#[test]
 fn two_snails_holding_one_name_are_refused_when_opened_together() {
     let s = sample(500);
     let split = split("across-names", &s);
