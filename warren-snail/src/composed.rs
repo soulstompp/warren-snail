@@ -480,6 +480,183 @@ fn bounds_key(
     }
 }
 
+/// Rung `want` of a value of `ty` cut on its structure, from its key, `at(i)` its i-th byte: each
+/// mark of the key one rung, each part on its own type's rungs, a part of varying length by the
+/// bits of its bytes; -1 past its last.
+pub fn structure_rung(ty: ColumnType, at: &dyn Fn(usize) -> Option<u8>, want: usize) -> i64 {
+    let mut w = Walk {
+        at,
+        pos: 0,
+        want,
+        seen: 0,
+        got: None,
+    };
+    let _ = w.value(ty);
+    w.got.unwrap_or(-1)
+}
+
+/// The rungs a value of `ty` is cut on, from its key, `at(i)` its i-th byte.
+pub fn structure_rungs(ty: ColumnType, at: &dyn Fn(usize) -> Option<u8>) -> usize {
+    let mut w = Walk {
+        at,
+        pos: 0,
+        want: usize::MAX,
+        seen: 0,
+        got: None,
+    };
+    let _ = w.value(ty);
+    w.seen
+}
+
+/// A walk of a composed value's key, as `key_into` writes it, to the rung it wants.
+struct Walk<'a> {
+    at: &'a dyn Fn(usize) -> Option<u8>,
+    pos: usize,
+    want: usize,
+    seen: usize,
+    got: Option<i64>,
+}
+
+impl Walk<'_> {
+    fn emit(&mut self, v: i64) -> Option<()> {
+        if self.seen == self.want {
+            self.got = Some(v);
+            return None;
+        }
+        self.seen += 1;
+        Some(())
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        let b = (self.at)(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn mark(&mut self) -> Option<u8> {
+        let b = self.byte()?;
+        self.emit(b as i64)?;
+        Some(b)
+    }
+
+    fn fixed(&mut self, n: usize) -> Option<u128> {
+        let mut v = 0u128;
+        for _ in 0..n {
+            v = (v << 8) | self.byte()? as u128;
+        }
+        Some(v)
+    }
+
+    /// A part's own rungs, as a level of its type is cut.
+    fn rungs_of(&mut self, ty: ColumnType, key: crate::places::KeyValue) -> Option<()> {
+        for r in 0..crate::places::part_rungs(ty) {
+            self.emit(crate::places::part_rung(ty, &key, r))?;
+        }
+        Some(())
+    }
+
+    fn bits(&mut self, b: u8) -> Option<()> {
+        for i in 0..8 {
+            self.emit(((b >> (7 - i)) & 1) as i64)?;
+        }
+        Some(())
+    }
+
+    fn ended(&mut self) -> Option<()> {
+        loop {
+            let b = self.byte()?;
+            self.bits(b)?;
+            if b == 0 {
+                let n = self.byte()?;
+                self.bits(n)?;
+                if n == 0 {
+                    return Some(());
+                }
+            }
+        }
+    }
+
+    fn bounds(&mut self, subtype: ColumnType) -> Option<()> {
+        if self.mark()? == 1 {
+            self.value(subtype)?;
+            self.mark()?;
+        }
+        if self.mark()? == 1 {
+            self.value(subtype)?;
+            self.mark()?;
+        }
+        Some(())
+    }
+
+    fn value(&mut self, ty: ColumnType) -> Option<()> {
+        use crate::places::KeyValue;
+        let int = |v: u128| KeyValue::Int((v as u64 ^ (1 << 63)) as i64);
+        match ty {
+            ColumnType::Composed(r) => match r.def() {
+                Composed::Array { element, .. } => {
+                    loop {
+                        match self.mark()? {
+                            0 => break,
+                            1 => self.value(*element)?,
+                            _ => {}
+                        }
+                    }
+                    let dims = self.mark()?;
+                    for _ in 0..2 * dims as usize {
+                        let v = (self.fixed(4)? as u32 ^ (1 << 31)) as i32;
+                        self.rungs_of(ColumnType::Int4, KeyValue::Int(v as i64))?;
+                    }
+                    Some(())
+                }
+                Composed::Record { fields, .. } => {
+                    for f in fields {
+                        if self.mark()? == 1 {
+                            self.value(f.ty)?;
+                        }
+                    }
+                    Some(())
+                }
+                Composed::Range { subtype, .. } => {
+                    if self.mark()? == 1 {
+                        self.bounds(*subtype)?;
+                    }
+                    Some(())
+                }
+                Composed::Multirange { range, .. } => {
+                    let subtype = range_of(*range).map_or(ColumnType::Int4, |r| r.0);
+                    while self.mark()? == 1 {
+                        self.bounds(subtype)?;
+                    }
+                    Some(())
+                }
+                Composed::Held(t) => self.value(*t),
+                Composed::Enum { .. } => {
+                    let v = self.fixed(8)?;
+                    self.rungs_of(ty, int(v))
+                }
+            },
+            ColumnType::Text(_)
+            | ColumnType::Bpchar(_)
+            | ColumnType::Name
+            | ColumnType::Bytes
+            | ColumnType::Bit(_)
+            | ColumnType::Varbit(_)
+            | ColumnType::Geometric(_)
+            | ColumnType::Textual(_)
+            | ColumnType::Internal(_)
+            | ColumnType::NumericText(_) => self.ended(),
+            t if t.is_wide() => {
+                let v = self.fixed(16)?;
+                self.rungs_of(ty, KeyValue::Wide((v ^ (1 << 127)) as i128))
+            }
+            _ => {
+                let v = self.fixed(8)?;
+                self.rungs_of(ty, int(v))
+            }
+        }
+    }
+}
+
 /// White space as PostgreSQL's scanner and C's `isspace` see it.
 pub(crate) fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)

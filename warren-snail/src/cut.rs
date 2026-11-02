@@ -146,6 +146,31 @@ fn go(
     place: &mut Vec<i64>,
     out: &mut Vec<Block>,
 ) {
+    // Rows that all lie on one part that fills are that part: the place goes on down unsplit.
+    let (held, mut r) = (place.len(), r);
+    while r < sublevels.len() {
+        let v = sublevels.value(keys.row(start), r);
+        if sublevels.value(keys.row(end - 1), r) != v || !widths.fill(start, end) {
+            break;
+        }
+        place.push(v);
+        r += 1;
+    }
+    split(keys, sublevels, widths, start, end, r, place, out);
+    place.truncate(held);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split(
+    keys: &Keys,
+    sublevels: &Sublevels,
+    widths: &Widths,
+    start: usize,
+    end: usize,
+    r: usize,
+    place: &mut Vec<i64>,
+    out: &mut Vec<Block>,
+) {
     if r == sublevels.len() {
         out.push(Block {
             place: place.clone(),

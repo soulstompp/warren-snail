@@ -231,19 +231,44 @@ pub fn column_byte_key(column: &crate::catalog::Column, key: &[u8]) -> KeyValue 
 /// The sublevels a level of a string type, bytea or a bit string is cut on so that a value keyed
 /// by `key` lies whole on them, at least `had`: one more than its bytes, or than a bit varying's
 /// bits; `BYTES_LEVEL` beside them for a level keyed by bytes, as `had` says of a string under a
-/// library collation.
+/// library collation. Where `had` holds `BITS_LEVEL`, a bit a rung, a composed value's on its
+/// structure, its key written as hex.
 pub fn rungs_for(ty: ColumnType, key: &[u8], had: u32) -> u32 {
+    use crate::directory::{BITS_LEVEL, BYTES_LEVEL};
+    let bits = had & BITS_LEVEL != 0;
     let n = match ty {
         ColumnType::Bit(n) => n,
         ColumnType::Varbit(_) => crate::strings::bits_of_key(key).0 + 1,
+        ColumnType::Composed(r) if bits && crate::composed::is_nested(r) => {
+            crate::composed::structure_rungs(ty, &|i| hex_byte(key, i)) as u32 + 1
+        }
+        _ if bits => 8 * key.len() as u32 + 1,
         _ => key.len() as u32 + 1,
     };
-    let n = n.max(had & !crate::directory::BYTES_LEVEL);
-    if ty.keyed_by_bytes() || had & crate::directory::BYTES_LEVEL != 0 {
-        n | crate::directory::BYTES_LEVEL
+    let n = n.max(had & !(BYTES_LEVEL | BITS_LEVEL));
+    let n = if bits { n | BITS_LEVEL } else { n };
+    if ty.keyed_by_bytes() || had & BYTES_LEVEL != 0 {
+        n | BYTES_LEVEL
     } else {
         n
     }
+}
+
+/// Byte `i` of a key written as hex, two digits a byte.
+fn hex_byte(hex: &[u8], i: usize) -> Option<u8> {
+    let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+    let h = hex.get(2 * i..2 * i + 2)?;
+    Some(d(h[0]) << 4 | d(h[1]))
+}
+
+/// The rungs a part of a composed value of type `ty` is cut on, as a level of the type is.
+pub fn part_rungs(ty: ColumnType) -> usize {
+    sublevel_count(Level::Column(0), ty, 0)
+}
+
+/// Rung `r` of a part of a composed value of type `ty` keyed `key`, as a level of the type is cut.
+pub fn part_rung(ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
+    sublevel_of(Level::Column(0), ty, key, r, false)
 }
 
 /// The value a numeric level keys, from its column's value.
@@ -319,10 +344,13 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             | ColumnType::Textual(_)
             | ColumnType::Internal(_)
             | ColumnType::Geometric(_) => {
-                (text_sublevels & !crate::directory::BYTES_LEVEL) as usize
+                (text_sublevels & !(crate::directory::BYTES_LEVEL | crate::directory::BITS_LEVEL))
+                    as usize
             }
             // An enum by its rank's bits; any other composed type by its key written as text.
-            ColumnType::Composed(r) if crate::composed::is_nested(r) => text_sublevels as usize,
+            ColumnType::Composed(r) if crate::composed::is_nested(r) => {
+                (text_sublevels & !crate::directory::BITS_LEVEL) as usize
+            }
             ColumnType::Composed(_) => 32,
         },
     }
@@ -337,8 +365,17 @@ fn decimal_digit(k: i128, r: usize) -> i64 {
     ((biased / 10u128.pow(WIDE_DECIMAL_DIGITS - 1 - r as u32)) % 10) as i64
 }
 
-fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
+fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize, bits: bool) -> i64 {
+    let bit = |b: &[u8]| b.get(r / 8).map_or(-1, |&x| ((x >> (7 - r % 8)) & 1) as i64);
     match key {
+        KeyValue::Text(s) if bits => {
+            return match ty {
+                ColumnType::Composed(t) if crate::composed::is_nested(t) => {
+                    crate::composed::structure_rung(ty, &|i| hex_byte(s.as_bytes(), i), r)
+                }
+                _ => bit(s.as_bytes()),
+            }
+        }
         KeyValue::Text(s) => return s.as_bytes().get(r).map_or(-1, |&b| b as i64),
         KeyValue::Null { first: true } => return i64::MIN,
         KeyValue::Null { first: false } => return i64::MAX,
@@ -350,6 +387,7 @@ fn sublevel_of(level: Level, ty: ColumnType, key: &KeyValue, r: usize) -> i64 {
         // A bit string is cut by its bits, each a place of three, an ended one first; bytea by its
         // bytes, as text is.
         KeyValue::Bytes(b) if ty.is_bits() => return crate::strings::bit_of_key(b, r),
+        KeyValue::Bytes(b) if bits => return bit(b),
         KeyValue::Bytes(b) => return b.get(r).map_or(-1, |&x| x as i64),
         KeyValue::Int(_) => {}
     }
@@ -487,20 +525,26 @@ fn interval_rung(total: i128, r: usize) -> i64 {
 /// The sublevels an order's blocks are cut on, outermost first, each a sublevel of one of its levels.
 pub struct Sublevels {
     map: Vec<(usize, usize)>,
-    levels: Vec<(Level, ColumnType)>,
+    levels: Vec<(Level, ColumnType, bool)>,
 }
 
 impl Sublevels {
     /// `text_sublevels` holds, for each level, the sublevels a text level is cut on (its longest value's bytes
     /// and one more), and 0 for a numeric level, whose sublevels its type gives.
     pub fn new(order: &Order, table: &Table, text_sublevels: &[u32]) -> Sublevels {
-        let levels: Vec<(Level, ColumnType)> = order
+        let levels: Vec<(Level, ColumnType, bool)> = order
             .levels
             .iter()
-            .map(|&l| (l, table.columns[l.column()].ty))
+            .enumerate()
+            .map(|(i, &l)| {
+                let text = text_sublevels.get(i).copied().unwrap_or(0);
+                let bits = text != crate::directory::WIDE_LEVEL
+                    && text & crate::directory::BITS_LEVEL != 0;
+                (l, table.columns[l.column()].ty, bits)
+            })
             .collect();
         let mut map = Vec::new();
-        for (i, &(l, ty)) in levels.iter().enumerate() {
+        for (i, &(l, ty, _)) in levels.iter().enumerate() {
             for r in 0..sublevel_count(l, ty, text_sublevels.get(i).copied().unwrap_or(0)) {
                 map.push((i, r));
             }
@@ -519,8 +563,8 @@ impl Sublevels {
     /// The value at sublevel `r` for a row whose levels key `key`.
     pub fn value(&self, key: &[KeyValue], r: usize) -> i64 {
         let (i, sub) = self.map[r];
-        let (l, ty) = self.levels[i];
-        sublevel_of(l, ty, &key[i], sub)
+        let (l, ty, bits) = self.levels[i];
+        sublevel_of(l, ty, &key[i], sub, bits)
     }
 }
 
@@ -947,5 +991,99 @@ mod tests {
             let (b, end) = split_varying(rest);
             assert_eq!((a.as_slice(), b.as_slice(), end), (x.0, x.1, &[][..]));
         }
+    }
+
+    /// Every rung of one level of type `ddl`'s column, cut on `text` rungs, for each value read from its
+    /// text.
+    fn rungs_of(ddl: &str, values: &[&str]) -> Vec<Vec<i64>> {
+        let c = Catalog::parse(ddl).unwrap();
+        let t = &c.tables[0];
+        let ty = t.columns[0].ty;
+        let keys: Vec<KeyValue> = values
+            .iter()
+            .map(|s| {
+                let item = crate::composed::text_in(ty, s).unwrap();
+                byte_key(ty, crate::composed::Compound::new(ty, item).hex.as_bytes())
+            })
+            .collect();
+        let text = keys.iter().fold(crate::directory::BITS_LEVEL | 1, |had, k| match k {
+            KeyValue::Text(s) => rungs_for(ty, s.as_bytes(), had),
+            _ => had,
+        });
+        let sublevels = Sublevels::new(&t.orders[0], t, &[text]);
+        keys.iter()
+            .map(|k| {
+                (0..sublevels.len())
+                    .map(|r| sublevels.value(std::slice::from_ref(k), r))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_of_format_nine_is_cut_a_bit_a_rung_an_ended_value_first() {
+        let c = Catalog::parse("CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
+        let t = &c.tables[0];
+        let values = ["", "a", "a\u{1}", "ab", "b", "\u{7f}", "\u{80}"];
+        let text = values.iter().fold(crate::directory::BITS_LEVEL | 1, |had, v| {
+            rungs_for(t.columns[0].ty, v.as_bytes(), had)
+        });
+        assert_eq!(text & !crate::directory::BITS_LEVEL, 8 * 2 + 1);
+        let sublevels = Sublevels::new(&t.orders[0], t, &[text]);
+        let rungs: Vec<Vec<i64>> = values
+            .iter()
+            .map(|v| {
+                (0..sublevels.len())
+                    .map(|r| sublevels.value(&[KeyValue::Text((*v).into())], r))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rungs[1][..9], [0, 1, 1, 0, 0, 0, 0, 1, -1]);
+        assert!(rungs.windows(2).all(|w| w[0] < w[1]));
+        assert!(rungs.iter().flatten().all(|v| (-1..=1).contains(v)));
+    }
+
+    #[test]
+    fn a_range_is_cut_on_its_structure_its_bounds_each_on_its_own_rungs() {
+        // An int4range: its mark, its lower bound's mark, 32 bits and its mark, the upper's the same.
+        let ints = rungs_of(
+            "CREATE TABLE s.t (r int4range NOT NULL, PRIMARY KEY (r));",
+            &["empty", "(,3)", "[-2,3)", "[0,1)", "[0,7)", "[5,)"],
+        );
+        assert_eq!(ints[0][..2], [0, -1]);
+        assert_eq!(ints[3].len(), 1 + 2 * (1 + 32 + 1) + 1);
+        let bits = |v: i64| (0..32).map(move |r| (((v as i128 + (1 << 31)) >> (31 - r)) & 1) as i64);
+        assert!(ints[3][2..34].iter().copied().eq(bits(0)));
+        assert!(ints[4][36..68].iter().copied().eq(bits(7)));
+        assert!(ints.windows(2).all(|w| w[0] < w[1]));
+        // A tstzrange's bounds on the calendar, year first.
+        let instants = rungs_of(
+            "CREATE TABLE s.t (r tstzrange NOT NULL, PRIMARY KEY (r));",
+            &[
+                "[-infinity,2019-06-01 00:00:00+00)",
+                "[2017-12-31 23:59:59.5+00,2018-01-01 00:00:00+00)",
+                "[2018-02-03 04:05:06.000007+00,infinity)",
+            ],
+        );
+        assert_eq!(instants[2][2..9], [2018, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(instants[1][11..14], [2018, 1, 1]);
+        assert!(instants.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn an_array_of_text_is_cut_by_the_bits_of_its_elements_bytes_in_postgresql_s_order() {
+        let arrays = rungs_of(
+            "CREATE TABLE s.t (a text[] NOT NULL, PRIMARY KEY (a));",
+            &["{}", "{a,b}", "{a,NULL}", "{ab}", "{b}", "{b,a}"],
+        );
+        // A mark, then the element's byte as eight bits, then the bits of its end.
+        assert_eq!(arrays[1][..9], [1, 0, 1, 1, 0, 0, 0, 0, 1]);
+        assert!(arrays.windows(2).all(|w| w[0] < w[1]));
+        let dates = rungs_of(
+            "CREATE TABLE s.t (a date[] NOT NULL, PRIMARY KEY (a));",
+            &["{2017-12-31}", "{2018-01-01,1999-01-01}", "{2018-01-01,2000-01-01}"],
+        );
+        assert_eq!(dates[1][..8], [1, 2018, 1, 1, 1, 1999, 1, 1]);
+        assert!(dates.windows(2).all(|w| w[0] < w[1]));
     }
 }

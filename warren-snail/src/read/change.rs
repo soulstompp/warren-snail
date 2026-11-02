@@ -1848,7 +1848,7 @@ impl Snail {
             for (tn, on) in &d.made {
                 if let Some(t) = self.catalog.table(tn) {
                     if let Some(o) = t.orders.iter().find(|x| x.name == *on) {
-                        let top = w.place(&encode_top(&empty_head(t, o), &[]))?;
+                        let top = w.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
                         orders.push((tn.clone(), on.clone(), top));
                     }
                 }
@@ -2675,7 +2675,7 @@ impl Snail {
         let mut rows = None;
         let split = !added.is_empty() && {
             let r = rows_now();
-            let cut = laid_out(table, order, &r, Some(&head.level_text))?
+            let cut = laid_out(table, order, &r, Some(&head.level_text), self.reader.format())?
                 .blocks
                 .len()
                 > 1;
@@ -2913,7 +2913,7 @@ impl Snail {
     ) -> Result<Vec<Entry>> {
         let Laid {
             perm, keys, blocks, ..
-        } = laid_out(table, order, rows, Some(&head.level_text))?;
+        } = laid_out(table, order, rows, Some(&head.level_text), self.reader.format())?;
         let descs = leaf_descriptors(table, order)?;
         let units: Vec<usize> = head.units.iter().map(|&k| k as usize).collect();
         let month_slots: Vec<usize> = head.month_slots.iter().map(|&s| s as usize).collect();
@@ -2957,7 +2957,7 @@ impl Snail {
                 push(values, order.slot(c).map_or(&Datum::Null, |s| &r[s]));
             }
         }
-        let laid = laid_out(table, order, &rows, None)?;
+        let laid = laid_out(table, order, &rows, None, self.reader.format())?;
         let head = head_of(table, order, &laid, held.len());
         Ok((self.blocks_written(w, table, order, &head, &rows)?, head))
     }
@@ -3157,7 +3157,7 @@ impl Snail {
         for (tn, on) in &made {
             let t = catalog.table(tn).expect("a table the catalog names");
             let o = t.orders.iter().find(|x| x.name == *on).unwrap();
-            let top = stage.place(&encode_top(&empty_head(t, o), &[]))?;
+            let top = stage.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
             orders.push((tn.clone(), on.clone(), top));
         }
         let from = self.declared.as_ref().map_or(self.root.catalog, |d| d.from);

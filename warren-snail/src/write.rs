@@ -974,7 +974,8 @@ fn write_tables(
             .map(|(_, r)| r)
         else {
             for order in &table.orders {
-                let (extent, written) = empty_order(&mut w, table, order)?;
+                let format = w.format();
+                let (extent, written) = empty_order(&mut w, table, order, format)?;
                 root.orders
                     .push((table.name.clone(), order.name.clone(), extent));
                 out.push(written);
@@ -1078,7 +1079,9 @@ fn write_tables(
                 crate::file::keys_null(w.format(), table, order)?;
             }
             let packed = w.format() != FORMAT_SEVEN;
-            let (extent, written) = write_order(&mut w, table, order, rows, source, packed)?;
+            let format = w.format();
+            let (extent, written) =
+                write_order(&mut w, table, order, rows, source, packed, format)?;
             root.orders
                 .push((table.name.clone(), order.name.clone(), extent));
             out.push(written);
@@ -1122,13 +1125,14 @@ pub(crate) fn laid_out(
     order: &Order,
     rows: &Rows,
     given: Option<&[u32]>,
+    format: u32,
 ) -> Result<Laid> {
     let n = rows.len();
     let stride = order.levels.len();
     let mut unsorted: Vec<KeyValue> = Vec::with_capacity(n * stride);
     // For each level, the sublevels a text level is cut on: its longest value's bytes and one more;
     // at least one, as an empty order's, where it holds only NULLs.
-    let mut text_sublevels = level_kinds(table, order);
+    let mut text_sublevels = level_kinds(table, order, format);
     let fixed = given.is_some();
     if let Some(g) = given {
         text_sublevels = g.to_vec();
@@ -1299,19 +1303,27 @@ fn width(leaf: &crate::catalog::Leaf, values: &Values, perm: &[usize]) -> Width 
 }
 
 /// What each level of an order holds before any row is laid on it: a text level cut on one
-/// sublevel, a level keyed in 128 bits marked so, and a number 0.
-pub(crate) fn level_kinds(table: &Table, order: &Order) -> Vec<u32> {
+/// sublevel, a level keyed in 128 bits marked so, and a number 0; in a snail of format 9 a level keyed
+/// by its bytes or its text marked to be cut a bit a rung, or on its structure.
+pub(crate) fn level_kinds(table: &Table, order: &Order, format: u32) -> Vec<u32> {
     order
         .levels
         .iter()
         .map(|l| {
             let ty = table.columns[l.column()].ty;
+            let bits = if format >= crate::file::FORMAT && !ty.is_bits() {
+                crate::directory::BITS_LEVEL
+            } else {
+                0
+            };
             if ty.is_wide() {
                 WIDE_LEVEL
             } else if ty.keyed_by_bytes() || table.columns[l.column()].collated() {
-                crate::directory::BYTES_LEVEL | 1
+                crate::directory::BYTES_LEVEL | bits | 1
+            } else if ty.keyed_by_text() {
+                bits | 1
             } else {
-                ty.keyed_by_text() as u32
+                0
             }
         })
         .collect()
@@ -1503,13 +1515,13 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> He
 
 /// The head of an order that holds no row yet: a unit of one disk page, and each text level cut on
 /// its first byte, until rows come.
-pub(crate) fn empty_head(table: &Table, order: &Order) -> Head {
+pub(crate) fn empty_head(table: &Table, order: &Order, format: u32) -> Head {
     let (month_slots, text_slots) = slots(table, order);
     Head {
         units: vec![1; order.leaves(table).len()],
         month_slots,
         text_slots,
-        level_text: level_kinds(table, order),
+        level_text: level_kinds(table, order, format),
         height: 1,
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
@@ -1537,8 +1549,13 @@ fn leaves_written(table: &Table, order: &Order, units: &[usize]) -> Vec<ColumnWr
 }
 
 /// An order that holds no row yet: its top alone.
-fn empty_order(w: &mut dyn Place, table: &Table, order: &Order) -> Result<(Extent, Written)> {
-    let head = empty_head(table, order);
+fn empty_order(
+    w: &mut dyn Place,
+    table: &Table,
+    order: &Order,
+    format: u32,
+) -> Result<(Extent, Written)> {
+    let head = empty_head(table, order, format);
     let top = w.place(&encode_top(&head, &[]))?;
     let units: Vec<usize> = head.units.iter().map(|&k| k as usize).collect();
     let columns = leaves_written(table, order, &units);
@@ -1579,6 +1596,7 @@ fn write_order(
     rows: &Rows,
     source: Option<&Source>,
     packed: bool,
+    format: u32,
 ) -> Result<(Extent, Written)> {
     let n = rows.len();
     let Laid {
@@ -1587,7 +1605,7 @@ fn write_order(
         text_sublevels,
         widths,
         blocks,
-    } = laid_out(table, order, rows, None)?;
+    } = laid_out(table, order, rows, None, format)?;
     let most = largest_place(&keys, &blocks, order, table, &widths);
     let units: Vec<usize> = (0..widths.0.len())
         .map(|s| widths.unit(s, most[s], n))

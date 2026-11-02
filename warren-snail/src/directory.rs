@@ -146,6 +146,10 @@ pub const WIDE_LEVEL: u32 = 1 << 31;
 /// be text: a bytea's, a bit string's.
 pub const BYTES_LEVEL: u32 = 1 << 30;
 
+/// The bit `Head::level_text` sets beside its sublevels for a level of format 9 cut a bit a rung, or
+/// on its structure where it is composed, rather than a byte a rung.
+pub const BITS_LEVEL: u32 = 1 << 29;
+
 /// The top bit of a head's height, set where the order holds a column keyed in 128 bits: the
 /// columns' places follow it. A head holding none is written as before.
 const HEAD_WIDE: u32 = 1 << 31;
