@@ -694,6 +694,21 @@ pub fn write_parquet(
     release: Option<u8>,
     lc_monetary: Option<&str>,
 ) -> Result<Vec<Written>> {
+    write_parquet_in(path, catalog, given, span, release, lc_monetary, None)
+}
+
+/// A new snail as `write_parquet` writes it, in format 7 or 8 where `format` names one, as
+/// warren-snail 0.1.0 or 0.1.1 made it: for the checks that hold this build to them.
+#[doc(hidden)]
+pub fn write_parquet_in(
+    path: &Path,
+    catalog: &Catalog,
+    given: &[(String, std::path::PathBuf)],
+    span: u64,
+    release: Option<u8>,
+    lc_monetary: Option<&str>,
+    format: Option<u32>,
+) -> Result<Vec<Written>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let mut tables = Vec::new();
     let mut sourced = Vec::new();
@@ -728,7 +743,21 @@ pub fn write_parquet(
             }
         }
     }
-    write_carried(path, catalog, &tables, &sourced, span, release, &carried)
+    if let Some(f) = format.filter(|&f| f != FORMAT_SEVEN && f != FORMAT_EIGHT) {
+        return Err(Error::new(format!(
+            "--format takes {FORMAT_SEVEN} or {FORMAT_EIGHT}, a format before this build's, not {f}"
+        )));
+    }
+    write_made(
+        path,
+        catalog,
+        &tables,
+        &sourced,
+        span,
+        format,
+        release,
+        Some(&carried),
+    )
 }
 
 /// A column chunk's pages, where they can come in as they lie: the chunk of a leaf the snail

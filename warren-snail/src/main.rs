@@ -15,7 +15,7 @@ use warren_snail::cut::PAGE;
 #[cfg(feature = "standalone")]
 use warren_snail::read::HELD_BYTES;
 use warren_snail::read::{Round, Snail, Snails};
-use warren_snail::write::write_parquet;
+use warren_snail::write::write_parquet_in;
 use warren_snail::{Error, Result};
 
 const USAGE: &str =
@@ -24,7 +24,7 @@ PostgreSQL's SQL. It runs on Linux.
 
 usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
                           [--release <14..19>] [--lc-monetary <locale>]
-                          [--written <written.parquet>]
+                          [--written <written.parquet>] [--format <7|8>]
        warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
                          [--host <command> --host-server <name>] [--applier <source>]
        warren-snail replica <file> [--of <source> | --clear]
@@ -53,7 +53,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           the files name, as `out` names them; where they name none, --release and --lc-monetary
           give them, 19 and C unless given, any locale but C and POSIX through glibc, with the
           feature collations. A flag naming another than the files name is refused. --written
-          records each order's columns as Parquet.
+          records each order's columns as Parquet. --format writes the snail in format 7 or 8, as
+          warren-snail 0.1.0 or 0.1.1 made it, for the checks that hold this build to them.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
           COMMIT, ROLLBACK and SET CONSTRAINTS; READ COMMITTED, and READ UNCOMMITTED run as it,
           named by BEGIN, START TRANSACTION, SET TRANSACTION and SET SESSION CHARACTERISTICS; and
@@ -706,13 +707,20 @@ fn cmd_write(args: &[String]) -> Result<()> {
                 .map_err(|_| Error::new("--release takes PostgreSQL's major release, 14 to 19"))
         })
         .transpose()?;
-    let written = write_parquet(
+    let format = flag(args, "--format")
+        .map(|f| {
+            f.parse()
+                .map_err(|_| Error::new("--format takes a format before this build's, 7 or 8"))
+        })
+        .transpose()?;
+    let written = write_parquet_in(
         Path::new(file),
         &catalog,
         &given,
         span,
         release,
         flag(args, "--lc-monetary"),
+        format,
     )?;
     if let Some(out) = flag(args, "--written") {
         let rows: Vec<(
