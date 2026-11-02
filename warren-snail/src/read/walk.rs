@@ -280,7 +280,9 @@ impl Plan {
                     .iter()
                     .filter(|(slot, _)| slots.contains(slot))
                     .flat_map(move |(slot, pages)| {
-                        pages.iter().map(move |&p| br.map.columns[*slot].pages[p].at.bytes)
+                        pages
+                            .iter()
+                            .map(move |&p| br.map.columns[*slot].pages[p].at.bytes)
                     })
             })
             .sum();

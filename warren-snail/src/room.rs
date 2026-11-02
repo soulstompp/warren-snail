@@ -416,11 +416,6 @@ impl Room {
         (self.written.get(), self.read.get())
     }
 
-    /// Closes the round's spill, every row on it read or let go.
-    pub fn close_spill(&self) {
-        *self.spill.borrow_mut() = None;
-    }
-
     /// Lets go the pages kept for the round's later reads: it reads no more.
     pub fn let_go_pages(&self) {
         *self.pages.borrow_mut() = Pages::default();

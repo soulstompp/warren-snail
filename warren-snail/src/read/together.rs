@@ -127,7 +127,12 @@ impl Lying {
             return Ok(());
         }
         if self.names.is_empty() {
-            self.names = b.schema().fields().iter().map(|f| f.name().clone()).collect();
+            self.names = b
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
         }
         let bytes = b.get_array_memory_size() as u64;
         if self.past.is_none() && self.room.hold(bytes) {
@@ -166,7 +171,7 @@ struct Answers {
 
 /// A round's answer handed out a batch at a time, its reads done: `next_batch` hands out each, read
 /// back from what the round's room holds and from what it wrote past it, and `round` says what it has
-/// read and written so far. The round's spill closes as this is dropped.
+/// read and written so far. The round's spill closes as this goes.
 #[non_exhaustive]
 pub struct Answering {
     room: Rc<Room>,
@@ -208,12 +213,6 @@ impl Answering {
         round.bytes_held = self.room.most();
         (round.spill_pages_written, round.spill_pages_read) = self.room.spill_pages();
         round
-    }
-}
-
-impl Drop for Answering {
-    fn drop(&mut self) {
-        self.room.close_spill();
     }
 }
 
@@ -503,10 +502,11 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
             rows_high: part.rows.1,
             rows_estimate: rows[side],
             table_rows: part.table_rows,
-            held_bytes: part
-                .rows
-                .1
-                .saturating_mul(row_bytes(&part.plan, table, r.columns.iter().map(|c| c.0))),
+            held_bytes: part.rows.1.saturating_mul(row_bytes(
+                &part.plan,
+                table,
+                r.columns.iter().map(|c| c.0),
+            )),
         });
     }
     Ok(Priced { tables: out })

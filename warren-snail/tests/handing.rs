@@ -5,7 +5,7 @@
 mod weather;
 
 use arrow::array::RecordBatch;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use warren_snail::catalog::Catalog;
@@ -23,7 +23,8 @@ const B: i64 = 16_384;
 
 const A_DDL: &str = "CREATE TABLE s.a (id bigint NOT NULL, g bigint NOT NULL, name text NOT NULL, \
                      PRIMARY KEY (id));";
-const B_DDL: &str = "CREATE TABLE s.b (id bigint NOT NULL, a_id bigint NOT NULL, v bigint NOT NULL, \
+const B_DDL: &str =
+    "CREATE TABLE s.b (id bigint NOT NULL, a_id bigint NOT NULL, v bigint NOT NULL, \
                      PRIMARY KEY (id)); CREATE INDEX b_a ON s.b (a_id, id) INCLUDE (v);";
 
 fn a_rows() -> Vec<Vec<String>> {
@@ -34,13 +35,7 @@ fn a_rows() -> Vec<Vec<String>> {
 
 fn b_rows() -> Vec<Vec<String>> {
     (0..B)
-        .map(|i| {
-            vec![
-                i.to_string(),
-                (i * 31 % A).to_string(),
-                (B - i).to_string(),
-            ]
-        })
+        .map(|i| vec![i.to_string(), (i * 31 % A).to_string(), (B - i).to_string()])
         .collect()
 }
 
@@ -239,6 +234,10 @@ fn a_join_past_its_room_reads_back_exactly_what_it_wrote() {
     let (rows, _, _) = drained(&mut a);
     assert_eq!(alike(rows), alike(want));
     let r = a.round();
+    assert_eq!(
+        r.order, "a_pkey+a_pkey+b_a",
+        "the join asked once, then taken up"
+    );
     assert!(r.spill_pages_written > 0);
     assert!(r.spill_pages_read >= r.spill_pages_written);
     assert!(r.spill_pages_read <= r.spill_pages_written + 32);
@@ -441,7 +440,11 @@ fn a_table_is_priced_at_the_bytes_a_round_holds_of_it() {
     let refs: Vec<&Snail> = snails.iter().collect();
     let p = price_together(&refs, "SELECT count(*) AS c1 FROM s.b").unwrap();
     assert_eq!(p.tables[0].held_bytes, 0);
-    let p = price_together(&refs, "SELECT a_id AS c1, count(*) AS c2 FROM s.b GROUP BY a_id").unwrap();
+    let p = price_together(
+        &refs,
+        "SELECT a_id AS c1, count(*) AS c2 FROM s.b GROUP BY a_id",
+    )
+    .unwrap();
     assert_eq!(p.tables[0].held_bytes, B as u64 * 9);
     let p = price_together(&refs, JOIN).unwrap();
     for t in &p.tables {
@@ -454,7 +457,7 @@ fn a_table_is_priced_at_the_bytes_a_round_holds_of_it() {
     }
 }
 
-/// A round's own file holds each page the same: `Cell` only so the test reads as the others do.
+/// With no host's file a round writes a file of its own, removed as soon as it is opened.
 #[test]
 fn with_no_host_its_own_file_takes_the_pages() {
     let path = one("own");
@@ -463,12 +466,16 @@ fn with_no_host_its_own_file_takes_the_pages() {
     let dir = tmp("handing-own-spill");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let seen = Cell::new(0u64);
+    let mut seen = 0;
     let mut a = begin_together(&refs, JOIN, Sizes::of(64 << 10).in_dir(&dir)).unwrap();
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "removed at once");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "removed at once"
+    );
     while let Some(b) = a.next_batch().unwrap() {
-        seen.set(seen.get() + b.num_rows() as u64);
+        seen += b.num_rows() as u64;
     }
-    assert_eq!(seen.get(), B as u64);
+    assert_eq!(seen, B as u64);
     assert!(a.round().spill_pages_written > 0);
 }
