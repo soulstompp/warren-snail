@@ -313,7 +313,7 @@ pub(crate) fn expression(tokens: &[Token]) -> Result<Expr> {
             text(&tokens[p.index()..])
         )));
     }
-    Ok(e)
+    Ok(crate::grammar::expression(e))
 }
 
 /// A statement the snail reads itself.
@@ -2412,6 +2412,7 @@ impl Draft {
             views: self.views.clone(),
             release: crate::regs::LATEST,
             monetary: crate::monetary::Monetary::C,
+            text_search: crate::tsearch::TextSearch::Simple,
         }
     }
 
@@ -2992,7 +2993,7 @@ impl Draft {
                                 "multiple default values specified for column \"{cname}\" of table \"{name}\""
                             )));
                         }
-                        col.default = Some(e.clone());
+                        col.default = Some(crate::grammar::expression(e.clone()));
                     }
                     ColumnOption::PrimaryKey(p) => keys.push(KeySpec {
                         name: given.or_else(|| p.name.as_ref().map(ident)),
@@ -3021,7 +3022,7 @@ impl Draft {
                         }
                         checks.push((
                             given.or_else(|| k.name.as_ref().map(ident)),
-                            (*k.expr).clone(),
+                            crate::grammar::expression((*k.expr).clone()),
                             k.enforced != Some(false),
                         ));
                     }
@@ -3147,7 +3148,7 @@ impl Draft {
                     }
                     checks.push((
                         c.name.as_ref().map(ident),
-                        (*c.expr).clone(),
+                        crate::grammar::expression((*c.expr).clone()),
                         c.enforced != Some(false),
                     ))
                 }
@@ -3856,6 +3857,7 @@ impl Draft {
                         foreign_keys: Vec::new(),
                         monetary: crate::monetary::Monetary::C,
                         brins: Vec::new(),
+                        text_search: crate::tsearch::TextSearch::Simple,
                         format: crate::file::FORMAT,
                         element_keys: Vec::new(),
                         elements_of: None,
@@ -3868,6 +3870,7 @@ impl Draft {
                     views: Vec::new(),
                     release: crate::regs::LATEST,
                     monetary: crate::monetary::Monetary::C,
+                    text_search: crate::tsearch::TextSearch::Simple,
                 };
                 let text = p.to_string();
                 let read = crate::read::partial::Predicate::read(&alone, &alone.tables[0], &text)
@@ -4305,6 +4308,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         release: crate::regs::LATEST,
         foreign_keys: d.foreign_keys.clone(),
         monetary: crate::monetary::Monetary::C,
+        text_search: crate::tsearch::TextSearch::Simple,
         format: crate::file::FORMAT,
         element_keys,
         elements_of: None,
@@ -5130,6 +5134,7 @@ pub(crate) fn read_ddl_kept(ddl: &str, strict: bool, kept: usize) -> Result<Read
             views: draft.views,
             release: crate::regs::LATEST,
             monetary: crate::monetary::Monetary::C,
+            text_search: crate::tsearch::TextSearch::Simple,
         },
         statements,
     })

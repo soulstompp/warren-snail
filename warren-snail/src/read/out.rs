@@ -33,6 +33,10 @@ pub const RELEASE_KEY: &str = "warren-snail.release";
 /// written under, which `write` takes.
 pub const MONETARY_KEY: &str = "warren-snail.lc_monetary";
 
+/// The key under which a file out of a table names the `default_text_search_config` its snail reads
+/// under.
+pub const TEXT_SEARCH_KEY: &str = "warren-snail.default_text_search_config";
+
 /// The key under which a file out names the columns holding an extreme kept for a value its page
 /// form has no value of its own for: an infinity, or a time's 24:00:00. A reader reads each as the
 /// number it lies as.
@@ -302,6 +306,7 @@ impl Snail {
         let carried = crate::write::Carried {
             sequences,
             monetary: self.root.monetary.clone(),
+            text_search: self.root.text_search().to_string(),
             replica: self.root.replica.clone(),
         };
         crate::write::write_carried(
@@ -493,6 +498,10 @@ impl Snail {
                 .chain(std::iter::once(KeyValue::new(
                     RELEASE_KEY.to_string(),
                     table.release.to_string(),
+                )))
+                .chain(std::iter::once(KeyValue::new(
+                    TEXT_SEARCH_KEY.to_string(),
+                    table.text_search.name().to_string(),
                 )))
                 .chain(
                     table

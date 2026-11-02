@@ -94,8 +94,16 @@ at once, and a snail written inside a host that decides its commits.
   and `CYCLE` clauses, refused by name.
 - The commands `types`, `operators` and `opclasses` list every type, operator and operator class
   PostgreSQL 14 to 19 defines, each held or refused in the snail's own words: a type by a table's
-  column of it, an operator by a pipeline's step over columns of its types, an operator class by
-  an index of it.
+  column of it, an operator by a pipeline's step, a plain question and a WHERE over columns of its
+  types, an operator class by an index of it.
+- Every operator of the numbers, the strings and the documents by its own name, in a plain question,
+  a `WHERE` and a `WITH` step alike: prefix `@`, `+`, `|/`, `||/` and `~`; `^`; the integers' `&`,
+  `|`, `#`, `<<` and `>>`; `~~` and its kin as `LIKE` and `ILIKE`, and `^@`, a fixed prefix narrowing
+  the read; `~<~`, `~<=~`, `~>=~` and `~>~` narrowing it along an index of `text_pattern_ops` or
+  `bpchar_pattern_ops`; JSON's with a `text[]` column on the right. A statement's operators bind as
+  PostgreSQL's grammar binds them, `@ a + b` as `@ (a + b)` and `-a ^ b` as `(-a) ^ b`.
+- A file records `default_text_search_config`, `write --text-search-config`, `simple` unless told
+  otherwise: `@@` of text, and the one-argument `to_tsvector`, `to_tsquery` and the rest, read it.
 - Writes: an `INSERT … SELECT` held to PostgreSQL's assignment casts, `SET CONSTRAINTS`, and the
   DDL above in `exec`; the `DEFAULT`s `now()`, `gen_random_uuid()`, `uuidv4()` and `uuidv7()`;
   READ COMMITTED, and READ UNCOMMITTED run as it, REPEATABLE READ and SERIALIZABLE, each as

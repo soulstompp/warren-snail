@@ -75,11 +75,11 @@ fn a_text_is_searched_under_the_configuration_its_call_names() {
             "3"
         ])
     );
-    // A call naming no configuration reads a setting the snail does not answer under.
-    let e = ask(&mut s, "to_tsvector('fat cats')::text")
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("default_text_search_config"), "{e}");
+    // A call naming no configuration reads the file's, here the default.
+    assert_eq!(
+        ask(&mut s, "to_tsvector('fat cats')::text, get_current_ts_config()::text").unwrap(),
+        some(&["'cats':2 'fat':1", "simple"])
+    );
 }
 
 #[test]

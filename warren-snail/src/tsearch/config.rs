@@ -24,6 +24,43 @@ pub(crate) enum Config {
     English,
 }
 
+/// What a file records of `default_text_search_config`: the configuration a call naming none reads,
+/// `pg_catalog.simple` unless the file names another, PostgreSQL's built-in default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TextSearch {
+    #[default]
+    Simple,
+    English,
+}
+
+impl TextSearch {
+    /// The configuration named, as PostgreSQL takes it for the setting; refused by name where the
+    /// snail reads no such configuration.
+    pub fn open(name: &str) -> Result<TextSearch> {
+        Ok(match config_of(name)? {
+            Config::Simple => TextSearch::Simple,
+            Config::English => TextSearch::English,
+        })
+    }
+
+    /// Its name as the setting prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            TextSearch::Simple => "pg_catalog.simple",
+            TextSearch::English => "pg_catalog.english",
+        }
+    }
+
+    /// Its name as `regconfigout` prints it.
+    pub fn config(self) -> &'static str {
+        match self {
+            TextSearch::Simple => "simple",
+            TextSearch::English => "english",
+        }
+    }
+}
+
 /// A dictionary the snail reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Dict {

@@ -24,6 +24,7 @@ mod json;
 mod level;
 mod locking;
 mod nearest;
+mod ops;
 mod out;
 pub(crate) mod partial;
 mod pipeline;
@@ -50,7 +51,7 @@ mod walk;
 pub use across::{Snails, StopAcross};
 pub use change::Done;
 pub use level::{held_of_key, LevelCounts, PlaceRows};
-pub use out::{TableOut, DDL_KEY, MONETARY_KEY, RELEASE_KEY};
+pub use out::{TableOut, DDL_KEY, MONETARY_KEY, RELEASE_KEY, TEXT_SEARCH_KEY};
 pub use pipeline::{numeric_text, Value};
 pub use point::Point;
 pub use together::{
@@ -796,6 +797,7 @@ impl Snail {
         old_names(&mut catalog, reader.format());
         catalog.with_release(root.release)?;
         catalog.with_monetary(&root.monetary)?;
+        catalog.with_text_search(root.text_search())?;
         Ok(catalog)
     }
 
@@ -841,6 +843,11 @@ impl Snail {
     /// locale.
     pub fn monetary(&self) -> &[(String, String, String)] {
         &self.root.monetary
+    }
+
+    /// The file's `default_text_search_config`: the configuration a call naming none reads.
+    pub fn text_search(&self) -> &str {
+        self.root.text_search()
     }
 
     /// The transactions across snails whose commit this snail's root wrote, each naming the root it

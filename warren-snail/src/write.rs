@@ -574,12 +574,13 @@ pub fn parquet_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
 pub struct Named {
     pub release: Option<u8>,
     pub lc_monetary: Option<String>,
+    pub text_search: Option<String>,
 }
 
 /// What a table's files name, each by its key-value metadata: refused where two of them name
 /// different ones, and where a release is no number.
 pub fn named(table: &str, paths: &[std::path::PathBuf]) -> Result<Named> {
-    use crate::read::{MONETARY_KEY, RELEASE_KEY};
+    use crate::read::{MONETARY_KEY, RELEASE_KEY, TEXT_SEARCH_KEY};
     let mut out = Named::default();
     for p in paths {
         let file =
@@ -615,6 +616,17 @@ pub fn named(table: &str, paths: &[std::path::PathBuf]) -> Result<Named> {
                     )))
                 }
                 _ => out.lc_monetary = Some(l),
+            }
+        }
+        if let Some(c) = value(TEXT_SEARCH_KEY) {
+            match &out.text_search {
+                Some(was) if *was != c => {
+                    return Err(Error::new(format!(
+                        "{table}: its files name the configurations {was} and {c} under \
+                         {TEXT_SEARCH_KEY}"
+                    )))
+                }
+                _ => out.text_search = Some(c),
             }
         }
     }
@@ -682,6 +694,43 @@ pub fn settled(
     Ok((release, lc_monetary))
 }
 
+/// The `default_text_search_config` a write from Parquet files takes: what its tables' files name,
+/// alike in each; else what `--text-search-config` gives; else `pg_catalog.simple`. A flag naming
+/// another than the files name, and a configuration the snail does not read, are refused by name.
+pub fn settled_text_search(named: &[(String, Named)], flag: Option<&str>) -> Result<String> {
+    use crate::read::TEXT_SEARCH_KEY;
+    use crate::tsearch::TextSearch;
+    let flag = flag.map(TextSearch::open).transpose()?;
+    let mut file: Option<(&str, &str)> = None;
+    for (table, n) in named {
+        if let Some(c) = n.text_search.as_deref() {
+            match file {
+                Some((other, was)) if was != c => {
+                    return Err(Error::new(format!(
+                        "{table}'s file names the configuration {c} under {TEXT_SEARCH_KEY}, and \
+                         {other}'s {was}: the snail answers under one"
+                    )))
+                }
+                Some(_) => {}
+                None => file = Some((table, c)),
+            }
+        }
+    }
+    let settled = match (file, flag) {
+        (Some((table, was)), Some(f)) if TextSearch::open(was)? != f => {
+            return Err(Error::new(format!(
+                "--text-search-config {}, and {table}'s file names the configuration {was} under \
+                 {TEXT_SEARCH_KEY}: write takes the configuration its files name",
+                f.name()
+            )))
+        }
+        (Some((_, was)), _) => TextSearch::open(was)?,
+        (None, Some(f)) => f,
+        (None, None) => TextSearch::default(),
+    };
+    Ok(settled.name().to_string())
+}
+
 /// A new snail from Parquet files, as the command's `write` takes them: each table's rows from its
 /// file, or the files of a directory as `out` writes a table past the span, a row group cut as the
 /// snail cuts it coming in by its pages; under the release and the lc_monetary `settled` gives,
@@ -694,7 +743,7 @@ pub fn write_parquet(
     release: Option<u8>,
     lc_monetary: Option<&str>,
 ) -> Result<Vec<Written>> {
-    write_parquet_in(path, catalog, given, span, release, lc_monetary, None)
+    write_parquet_in(path, catalog, given, span, release, lc_monetary, None, None)
 }
 
 /// A new snail as `write_parquet` writes it, in format 7 or 8 where `format` names one, as
@@ -707,6 +756,7 @@ pub fn write_parquet_in(
     span: u64,
     release: Option<u8>,
     lc_monetary: Option<&str>,
+    text_search: Option<&str>,
     format: Option<u32>,
 ) -> Result<Vec<Written>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -738,7 +788,10 @@ pub fn write_parquet_in(
         tables.push((name.clone(), Rows::from_batches(t, &batches)?));
         sourced.push((name.clone(), sources(&files, t)?));
     }
-    let mut carried = Carried::default();
+    let mut carried = Carried {
+        text_search: settled_text_search(&names, text_search)?,
+        ..Carried::default()
+    };
     if let Some(l) = lc_monetary {
         for t in &catalog.tables {
             for c in t.columns.iter().filter(|c| c.ty.holds_money()) {
@@ -878,13 +931,15 @@ pub fn write_released(
 }
 
 /// What a snail written afresh from another carries over of it beyond its rows: where its
-/// sequences stand, the `lc_monetary` each money column was written under, and the source it is a
-/// replica of.
+/// sequences stand, the `lc_monetary` each money column was written under, the
+/// `default_text_search_config` it reads under, and the source it is a replica of.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct Carried {
     pub sequences: Vec<crate::file::SequenceState>,
     pub monetary: Vec<(String, String, String)>,
+    /// The file's `default_text_search_config`; `pg_catalog.simple` where it names none.
+    pub text_search: String,
     pub replica: Option<String>,
 }
 
@@ -973,6 +1028,12 @@ fn write_made(
     named.with_release(release)?;
     let monetary = crate::file::monetary_of(&named, carried.map_or(&[], |c| &c.monetary));
     named.with_monetary(&monetary)?;
+    named.with_text_search(
+        carried
+            .map(|c| c.text_search.as_str())
+            .filter(|c| !c.is_empty())
+            .unwrap_or(crate::file::TEXT_SEARCH),
+    )?;
     let mut w = Writer::create_spanned(path, span)?;
     if let Some(f) = format {
         w.set_format(f);
@@ -1006,6 +1067,7 @@ fn write_tables(
         generation: 1,
         release: catalog.release,
         monetary: crate::file::monetary_of(catalog, carried.map_or(&[], |c| &c.monetary)),
+        text_search: catalog.text_search.name().to_string(),
         replica: carried.and_then(|c| c.replica.clone()),
         ..Default::default()
     };

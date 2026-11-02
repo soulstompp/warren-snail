@@ -1,6 +1,7 @@
 //! The lists of types, operators and operator classes PostgreSQL defines from 14 to 19, each object
 //! held or refused by name as the snail's own paths answer it: a type by a table's column of it, an
-//! operator class by an index of it, an operator by a pipeline's step over columns of its types.
+//! operator class by an index of it, an operator by a pipeline's step, a plain question and a WHERE
+//! over columns of its types.
 
 #[cfg(feature = "standalone")]
 mod weather;
@@ -78,6 +79,64 @@ fn a_type_is_held_where_a_table_s_column_of_it_is_taken() {
     assert_eq!(named(&of, "\"char\"").listed.family, "internal-use types");
 }
 
+
+#[test]
+#[cfg(feature = "standalone")]
+fn an_operator_only_its_name_or_a_setting_kept_out_is_held_in_a_step_a_plain_question_and_a_where() {
+    let path = weather::tmp("lists-names.snail");
+    let (of, _) = warren_snail::lists::operators(19, &path).unwrap();
+    let numbers = ["smallint", "integer", "bigint", "real", "double precision", "numeric"];
+    let integers = ["smallint", "integer", "bigint"];
+    let mut names: Vec<String> = Vec::new();
+    for t in numbers {
+        names.push(format!("@(NONE,{t})"));
+        names.push(format!("+(NONE,{t})"));
+    }
+    for name in [
+        "|/(NONE,double precision)",
+        "||/(NONE,double precision)",
+        "^(double precision,double precision)",
+        "^(numeric,numeric)",
+        "^@(text,text)",
+        "~~(bytea,bytea)",
+        "!~~(bytea,bytea)",
+        "#>(json,text[])",
+        "#>(jsonb,text[])",
+        "#>>(json,text[])",
+        "#>>(jsonb,text[])",
+        "#-(jsonb,text[])",
+        "-(jsonb,text[])",
+        "?|(jsonb,text[])",
+        "?&(jsonb,text[])",
+        "@@(text,text)",
+        "@@(text,tsquery)",
+    ] {
+        names.push(name.to_string());
+    }
+    for op in ["~~", "!~~", "~~*", "!~~*"] {
+        for t in ["text", "character", "name"] {
+            names.push(format!("{op}({t},text)"));
+        }
+    }
+    for t in integers {
+        for op in ["&", "|", "#"] {
+            names.push(format!("{op}({t},{t})"));
+        }
+        for op in ["<<", ">>"] {
+            names.push(format!("{op}({t},integer)"));
+        }
+        names.push(format!("~(NONE,{t})"));
+    }
+    for op in ["~<~", "~<=~", "~>=~", "~>~"] {
+        for t in ["text", "character"] {
+            names.push(format!("{op}({t},{t})"));
+        }
+    }
+    assert_eq!(names.len(), 67);
+    for name in &names {
+        assert_eq!(named(&of, name).refused, None, "{name}");
+    }
+}
 #[test]
 fn an_operator_class_is_held_where_an_index_of_it_is_taken() {
     let of = opclasses(19);

@@ -1372,7 +1372,8 @@ pub(crate) fn unlocked_words(sql: &str) -> Result<()> {
 
 pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
     unlocked_words(sql)?;
-    let statements = super::image::parse_sql(sql)?;
+    let bound = crate::grammar::bound(sql);
+    let statements = super::image::parse_sql(bound.as_deref().unwrap_or(sql))?;
     let q = match statements.as_slice() {
         [Statement::Query(q)] => q,
         _ => return Err(Error::new("a question is one SELECT")),
@@ -2224,14 +2225,15 @@ fn read_conjunct(from: &From, p: &Expr) -> Result<Vec<Conj>> {
     }
 }
 
-/// How a pattern matches: LIKE, ILIKE, SIMILAR TO, or a regular expression, `~*` and `!~*`
-/// ignoring case.
+/// How a pattern matches: LIKE, ILIKE, SIMILAR TO, a regular expression, `~*` and `!~*` ignoring
+/// case, or `^@`, its right side a prefix.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Matched {
     Like,
     ILike,
     Similar,
     Regex { icase: bool },
+    Prefix,
 }
 
 /// The casing a column's text takes, as a pipeline's `Casings` gives it: its collation's, a name's
@@ -2295,6 +2297,7 @@ fn pattern(from: &From, p: &Expr) -> Result<Option<Vec<Conj>>> {
                     ),
                 },
             ),
+            BinaryOperator::PGStartsWith => (left, right, &None, false, Matched::Prefix),
             _ => return Ok(None),
         },
         _ => return Ok(None),
@@ -2344,6 +2347,8 @@ fn pattern(from: &From, p: &Expr) -> Result<Option<Vec<Conj>>> {
                 fixed
             }
         }
+        Matched::Prefix if text.is_empty() => super::prefix::Fixed::None,
+        Matched::Prefix => super::prefix::Fixed::Partial(text.into_bytes()),
         _ if negated => super::prefix::Fixed::None,
         Matched::Like if column.ty == ColumnType::Bytes => match escape {
             None => super::prefix::like_fixed_prefix(&crate::strings::bytea_in(&text)?),
@@ -2664,6 +2669,12 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
             b: Col { side: b, column: y },
         }));
     }
+    // A pattern comparison of text keyed by its bytes is the comparison of its key.
+    let op = match super::ops::pattern_comparison(&op) {
+        Some(cmp) if pattern_on_key(from, left, right) || pattern_on_key(from, right, left) => cmp,
+        Some(_) => return Err(Error::new(format!("{p} is read a row at a time"))),
+        None => op,
+    };
     let lit_left = from.resolve(left).is_err();
     let (side, s, lit, op) = match from.resolve(left) {
         Ok((side, s)) => (side, s, right, op),
@@ -2918,6 +2929,20 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
     Ok(Conj::One(side, Piece::Cond(cond)))
 }
 
+/// Whether `x` is a column of text or bpchar keyed by its bytes, and `lit` a quoted literal, which
+/// a pattern comparison reads as of its type, or NULL.
+fn pattern_on_key(from: &From, x: &Expr, lit: &Expr) -> bool {
+    let literal = matches!(lit, Expr::Value(v)
+        if matches!(v.value, Value::SingleQuotedString(_) | Value::Null));
+    match from.resolve(x) {
+        Ok((side, Shape::Column(c))) if literal => {
+            let column = &from.table(side).columns[c];
+            (column.ty.is_text() || matches!(column.ty, ColumnType::Bpchar(_))) && !column.collated()
+        }
+        _ => false,
+    }
+}
+
 /// A condition by an operator a GiST or SP-GiST strand answers, on column `c` and the value `lit`,
 /// the column on the operator's left unless `lit_left`; none where `op` is no such operator on the
 /// column's type.
@@ -3069,7 +3094,7 @@ fn plane_cond(
         Some(name.as_str())
     };
     let quoted = matches!(lit, Expr::Value(v) if matches!(v.value, Value::SingleQuotedString(_)));
-    let casings = Casings::under(table.monetary);
+    let casings = Casings::under(table);
     let value = match eval_on(lit, &[], &[], table.release, &casings)? {
         Held::Geometric(g) => g,
         Held::Text(t)

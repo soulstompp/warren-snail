@@ -533,6 +533,9 @@ pub struct Casings {
     library: bool,
     /// The file's lc_monetary.
     monetary: crate::monetary::Monetary,
+    /// The file's default_text_search_config, and whether tables of files naming two are met.
+    text_search: crate::tsearch::TextSearch,
+    text_search_split: bool,
     /// The collation each relation's columns carry, by the relation's name.
     relations: HashMap<String, Vec<(String, super::collate::Carried)>>,
     /// Each step expression's collation, and the one it is called under.
@@ -547,11 +550,22 @@ impl Casings {
         self.monetary
     }
 
-    /// No column's casing, and money read and printed under `monetary`: what an expression naming
-    /// no column of a table reads, a domain's CHECK or a DEFAULT.
-    pub(crate) fn under(monetary: crate::monetary::Monetary) -> Casings {
+    /// The configuration a call naming none reads: refused by name across files naming two.
+    pub(crate) fn text_search(&self) -> Result<crate::tsearch::TextSearch> {
+        if self.text_search_split {
+            return Err(Error::new(
+                "default_text_search_config is read across snails recording different ones",
+            ));
+        }
+        Ok(self.text_search)
+    }
+
+    /// No column's casing, money read and printed and a text search read under the table's file's:
+    /// what an expression naming no column of a table reads, a domain's CHECK or a DEFAULT.
+    pub(crate) fn under(table: &crate::catalog::Table) -> Casings {
         Casings {
-            monetary,
+            monetary: table.monetary,
+            text_search: table.text_search,
             ..Casings::default()
         }
     }
@@ -565,6 +579,8 @@ impl Casings {
         let mut c = Casings {
             declared: declared.to_vec(),
             monetary: tables.first().map(|t| t.monetary).unwrap_or_default(),
+            text_search: tables.first().map(|t| t.text_search).unwrap_or_default(),
+            text_search_split: tables.windows(2).any(|w| w[0].text_search != w[1].text_search),
             ..Casings::default()
         };
         for t in tables {
@@ -604,6 +620,8 @@ impl Casings {
             unheld: HashMap::new(),
             library: false,
             monetary: table.monetary,
+            text_search: table.text_search,
+            text_search_split: false,
             relations: HashMap::new(),
             nodes: HashMap::new(),
             resolved: HashMap::new(),
@@ -2381,28 +2399,19 @@ fn typed_op(
         let Value::Typed(_, a) = x else {
             unreachable!("a json document")
         };
-        let texts = || -> Result<Option<Vec<Option<String>>>> {
+        let texts = || -> Result<Option<(Vec<Option<String>>, usize)>> {
             match y {
-                Value::Null => Ok(None),
-                Value::Text(t) if quoted(right) || matches!(right, Expr::Array(_)) => {
-                    crate::textual::text_array_in(t).map(Some)
-                }
-                Value::Composed(ty, c) if *ty == super::typed::array_of(ColumnType::Text(None)) => {
-                    let crate::composed::Item::Array { elements, .. } = &c.item else {
-                        return Ok(None);
-                    };
-                    Ok(Some(
-                        elements
-                            .iter()
-                            .map(|e| match e {
-                                crate::composed::Item::Scalar(crate::read::statement::Datum::Text(t)) => Some(t.clone()),
-                                _ => None,
-                            })
-                            .collect(),
-                    ))
-                }
-                _ => Err(refused()),
+                y if y.is_null() => Ok(None),
+                Value::Text(t) if quoted(right) => super::ops::text_array_literal(t).map(Some),
+                y => match super::ops::text_items(y) {
+                    Some(items) => Ok(Some(items)),
+                    None => Err(refused()),
+                },
             }
+        };
+        let flat = |dims: usize| match dims > 1 {
+            true => Err(Error::new("wrong number of array subscripts")),
+            false => Ok(()),
         };
         let json_of = |s: Option<String>| {
             s.map_or(Value::Null, |s| Value::Typed(ColumnType::Textual(doc), s))
@@ -2447,7 +2456,7 @@ fn typed_op(
                 j::json_element_text(a, *i)?
             }),
             ("#>" | "#>>", _) => {
-                let Some(path) = texts()? else {
+                let Some((path, _)) = texts()? else {
                     return Ok(Some(Value::Null));
                 };
                 match (name.as_str(), jsonb) {
@@ -2461,18 +2470,25 @@ fn typed_op(
                 Value::Bool(j::jsonb_exists(a, k)?)
             }
             ("?|" | "?&" | "#-", _) if jsonb => {
-                let Some(keys) = texts()? else {
+                let Some((keys, dims)) = texts()? else {
                     return Ok(Some(Value::Null));
                 };
                 match name.as_str() {
                     "?|" => Value::Bool(j::jsonb_exists_any(a, &keys)?),
                     "?&" => Value::Bool(j::jsonb_exists_all(a, &keys)?),
-                    _ => doc_of(j::jsonb_delete_path(a, &keys)?),
+                    _ => {
+                        flat(dims)?;
+                        doc_of(j::jsonb_delete_path(a, &keys)?)
+                    }
                 }
             }
             ("-", Value::Int(i)) if jsonb => doc_of(j::jsonb_delete_index(a, *i)?),
-            ("-", Value::Text(_)) if jsonb && matches!(right, Expr::Array(_)) => {
-                doc_of(j::jsonb_delete_keys(a, &texts()?.unwrap_or_default())?)
+            ("-", Value::Composed(..)) if jsonb => {
+                let Some((keys, dims)) = texts()? else {
+                    return Ok(Some(Value::Null));
+                };
+                flat(dims)?;
+                doc_of(j::jsonb_delete_keys(a, &keys)?)
             }
             ("-", Value::Text(k)) if jsonb => doc_of(j::jsonb_delete_key(a, k)?),
             ("@>" | "<@" | "||", _) if jsonb => {
@@ -3468,10 +3484,20 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             other => return Err(Error::new(format!("-{other:?} is not a number"))),
         },
         Expr::UnaryOp {
+            op:
+                op @ (UnaryOperator::Plus
+                | UnaryOperator::PGAbs
+                | UnaryOperator::PGSquareRoot
+                | UnaryOperator::PGCubeRoot),
+            expr,
+        } => super::ops::prefix(op, ev(expr)?, frame.type_of(expr), frame.type_of(e))?
+            .unwrap_or(Value::Null),
+        Expr::UnaryOp {
             op: UnaryOperator::BitwiseNot,
             expr,
         } => match ev(expr)? {
             Value::Null => Value::Null,
+            Value::Int(x) => Value::Int(!x),
             Value::Bits(_, k) => {
                 let k = crate::strings::bits_not(&k);
                 Value::Bits(ColumnType::Bit(crate::strings::bits_of_key(&k).0), k)
@@ -3570,8 +3596,8 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     }
                 },
             };
-            let (v, p) = (ev(expr)?, ev(pattern)?);
-            let v = written_beside(frame, expr, v, pattern);
+            let (v, p) = (ev(expr)?, super::ops::char_as_text(ev(pattern)?));
+            let v = super::ops::char_as_text(written_beside(frame, expr, v, pattern));
             if v.is_null() || p.is_null() {
                 return Ok(Value::Null);
             }
@@ -3847,8 +3873,15 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             }
             match op {
                 BinaryOperator::And | BinaryOperator::Or => {
-                    let (x, y) = (truth(&ev(left)?)?, truth(&ev(right)?)?);
                     let and = matches!(op, BinaryOperator::And);
+                    // Its right side read only where its left does not settle it, as the executor
+                    // reads a list of conditions; a pattern written out PostgreSQL's planner reads
+                    // before any row.
+                    let x = truth(&ev(left)?)?;
+                    if x == Some(!and) && !super::ops::pattern_written(right) {
+                        return Ok(Value::Bool(!and));
+                    }
+                    let y = truth(&ev(right)?)?;
                     return Ok(match (x, y) {
                         (Some(a), Some(b)) => Value::Bool(if and { a && b } else { a || b }),
                         (Some(false), None) | (None, Some(false)) if and => Value::Bool(false),
@@ -3885,35 +3918,30 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 _ => {}
             }
             let x = ev(left)?;
-            // An ARRAY of values beside a json document, or a NULL, as the text of a text[].
-            let y = match right.as_ref() {
-                Expr::Array(a)
-                    if x.is_null()
-                        && matches!(op.to_string().as_str(), "#>" | "#>>" | "?|" | "?&" | "#-")
-                        || matches!(
-                            x,
-                            Value::Typed(
-                                ColumnType::Textual(
-                                    crate::textual::Textual::Json | crate::textual::Textual::Jsonb
-                                ),
-                                _
-                            )
-                        ) =>
-                {
-                    Value::Text(crate::textual::text_array_out(
-                        &a.elem
-                            .iter()
-                            .map(|e| ev(e).map(|v| v.text()))
-                            .collect::<Result<Vec<_>>>()?,
-                    ))
-                }
-                e => ev(e)?,
-            };
+            let y = ev(right)?;
             let (x, y) = (
                 written_beside(frame, left, x, right),
                 written_beside(frame, right, y, left),
             );
             let typed = [frame.type_of(left), frame.type_of(right)];
+            if let Some(v) = super::ops::of_integers(op, &x, &y, left, right, typed)? {
+                return Ok(v);
+            }
+            if let Some(v) = super::ops::pattern_compared(op, &x, &y, left, right, typed)? {
+                return Ok(v);
+            }
+            if let Some(v) = super::ops::text_matched(op, &x, &y, left, right, &frame.casings)? {
+                return Ok(v);
+            }
+            if *op == BinaryOperator::PGExp {
+                return super::ops::power(x, y, typed, frame.type_of(e));
+            }
+            if *op == BinaryOperator::PGStartsWith {
+                let values = [super::ops::char_as_text(x), super::ops::char_as_text(y)];
+                let casing = string_casing(frame, e, "starts_with", &values)?;
+                return Ok(super::calls::strings("starts_with", &values, casing)?
+                    .unwrap_or(Value::Null));
+            }
             if *op == BinaryOperator::StringConcat && concat_is_text(&x, &y, left, right, typed) {
                 return Ok(match x.is_null() || y.is_null() {
                     true => Value::Null,
@@ -3927,8 +3955,12 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 }
                 _ => (x, y),
             };
-            if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
-                return Ok(v);
+            let x = super::ops::document_literal(op, x, left, frame.type_of(e))?;
+            let y = super::ops::shift_count(op, &x, y, right)?;
+            if !super::ops::deletes_keys(op, &x, &y) {
+                if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
+                    return Ok(v);
+                }
             }
             if let Some(v) = geo_op(op, &x, &y, left, right, frame.release)? {
                 return Ok(v);
@@ -4295,6 +4327,10 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                         .cloned()
                         .zip(a.iter().map(|x| quoted(x)))
                         .collect();
+                    if let Some(v) = super::tsearch::setting(&name, &given, &frame.casings)? {
+                        return Ok(v);
+                    }
+                    let given = super::tsearch::named_setting(&name, given, &frame.casings)?;
                     let resolved: Vec<_> = given
                         .iter()
                         .cloned()
@@ -5564,6 +5600,7 @@ fn set_values(c: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
         true => regex_casing(frame, c, &values.iter().map(|(v, _)| v).collect::<Vec<_>>())?,
         false => string_casing(frame, c, &name, &[])?,
     };
+    let values = super::tsearch::named_setting(&name, values, &frame.casings)?;
     super::sets::values(&name, values, frame.type_of(c), casing)
 }
 
@@ -7583,6 +7620,7 @@ pub fn hands_over(q: &Query) -> bool {
     {
         return true;
     }
+    let mut on: Vec<&Expr> = Vec::new();
     for (n, item) in s.from.iter().enumerate() {
         if !matches!(item.relation, TableFactor::Table { args: None, .. }) {
             return true;
@@ -7609,6 +7647,9 @@ pub fn hands_over(q: &Query) -> bool {
             {
                 return true;
             }
+            if let sqlparser::ast::JoinConstraint::On(e) = constraint {
+                on.push(e);
+            }
         }
     }
     let mut exprs: Vec<&Expr> = s
@@ -7620,7 +7661,14 @@ pub fn hands_over(q: &Query) -> bool {
         })
         .collect();
     let returned = exprs.clone();
+    let one_table = matches!(s.from.as_slice(), [only] if only.joins.is_empty());
+    if returned.iter().any(|e| compares_no_constant(e))
+        || one_table && s.selection.as_ref().is_some_and(compares_no_constant)
+    {
+        return true;
+    }
     exprs.extend(s.selection.iter());
+    exprs.extend(on);
     if let GroupByExpr::Expressions(g, _) = &s.group_by {
         // A GROUP BY item naming a column the select list names.
         let aliased = |e: &Expr| {
@@ -7688,32 +7736,81 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::Case { .. } => true,
         Expr::Value(v) => matches!(v.value, SqlValue::Placeholder(_)),
         Expr::BinaryOp { left, op, right } => {
-            matches!(
-                op,
-                BinaryOperator::Plus
-                    | BinaryOperator::Minus
-                    | BinaryOperator::Multiply
-                    | BinaryOperator::Divide
-                    | BinaryOperator::Modulo
-                    | BinaryOperator::StringConcat
-                    | BinaryOperator::Arrow
-                    | BinaryOperator::LongArrow
-                    | BinaryOperator::HashArrow
-                    | BinaryOperator::HashLongArrow
-                    | BinaryOperator::Overlaps
-                    | BinaryOperator::PGRegexMatch
-                    | BinaryOperator::PGRegexIMatch
-                    | BinaryOperator::PGRegexNotMatch
-                    | BinaryOperator::PGRegexNotIMatch
-            ) || calls_beyond_the_question(left)
+            !(matches!(op, BinaryOperator::And | BinaryOperator::Or) || is_comparison(op))
+                || calls_beyond_the_question(left)
                 || calls_beyond_the_question(right)
+        }
+        Expr::UnaryOp { op, expr: x } => {
+            !matches!(op, UnaryOperator::Not) || calls_beyond_the_question(x)
+        }
+        Expr::Nested(x)
+        | Expr::Cast { expr: x, .. }
+        | Expr::Collate { expr: x, .. }
+        | Expr::IsNull(x)
+        | Expr::IsNotNull(x)
+        | Expr::IsTrue(x)
+        | Expr::IsNotTrue(x)
+        | Expr::IsFalse(x)
+        | Expr::IsNotFalse(x)
+        | Expr::IsUnknown(x)
+        | Expr::IsNotUnknown(x) => calls_beyond_the_question(x),
+        Expr::IsDistinctFrom(a, b)
+        | Expr::IsNotDistinctFrom(a, b)
+        | Expr::AnyOp {
+            left: a, right: b, ..
+        }
+        | Expr::AllOp {
+            left: a, right: b, ..
+        } => calls_beyond_the_question(a) || calls_beyond_the_question(b),
+        Expr::InList { expr, list, .. } => {
+            calls_beyond_the_question(expr) || list.iter().any(calls_beyond_the_question)
+        }
+        Expr::Array(a) => a.elem.iter().any(calls_beyond_the_question),
+        Expr::CompoundFieldAccess { root, .. } => calls_beyond_the_question(root),
+        _ => false,
+    }
+}
+
+fn is_comparison(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    )
+}
+
+/// Whether an expression compares two values neither of them a constant: what the question path keys
+/// on no level, and reads only between two tables' columns.
+fn compares_no_constant(e: &Expr) -> bool {
+    let constant = |e: &Expr| match e {
+        Expr::Value(_) | Expr::TypedString(_) => true,
+        Expr::Cast { expr, .. } | Expr::Nested(expr) | Expr::UnaryOp { expr, .. } => {
+            matches!(expr.as_ref(), Expr::Value(_))
+        }
+        _ => false,
+    };
+    match e {
+        Expr::BinaryOp { left, op, right } if is_comparison(op) => {
+            !constant(left) && !constant(right)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            compares_no_constant(left) || compares_no_constant(right)
         }
         Expr::Nested(x)
         | Expr::UnaryOp { expr: x, .. }
         | Expr::Cast { expr: x, .. }
         | Expr::IsNull(x)
-        | Expr::IsNotNull(x) => calls_beyond_the_question(x),
-        Expr::CompoundFieldAccess { root, .. } => calls_beyond_the_question(root),
+        | Expr::IsNotNull(x)
+        | Expr::IsTrue(x)
+        | Expr::IsNotTrue(x)
+        | Expr::IsFalse(x)
+        | Expr::IsNotFalse(x)
+        | Expr::IsUnknown(x)
+        | Expr::IsNotUnknown(x) => compares_no_constant(x),
         _ => false,
     }
 }

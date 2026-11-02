@@ -821,11 +821,13 @@ SQL in PostgreSQL's syntax, and the snail reads it as it reads any other questio
 command's alone.
 
 - `write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
-  [--release <14..19>] [--lc-monetary <locale>] [--written <written.parquet>]`: a new snail, where
-  no file is yet. A table given no rows is written empty. The release of PostgreSQL the rows' OIDs
-  came from, and the locale their money was written under, are those the files name; where they
-  name none, `--release` and `--lc-monetary` give them, 19 and `C` unless given. `--written`
-  records each order's columns as Parquet.
+  [--release <14..19>] [--lc-monetary <locale>] [--text-search-config <name>]
+  [--written <written.parquet>]`: a new snail, where no file is yet. A table given no rows is
+  written empty. The release of PostgreSQL the rows' OIDs came from, the locale their money was
+  written under and the `default_text_search_config` every round answers under are those the files
+  name; where they name none, `--release`, `--lc-monetary` and `--text-search-config` give them, 19,
+  `C` and `pg_catalog.simple` unless given, a configuration the snail does not read refused by
+  name. `--written` records each order's columns as Parquet.
 - `exec <file> <statements.sql> --out <done.parquet> [--with <file>]... [--host <command>
   --host-server <name>] [--applier <source>]`: each statement in turn. `--host` writes a snail
   PostgreSQL writes through its WAL, as one transaction of the server's (warren-snail-pg's *Writing
@@ -851,7 +853,8 @@ command's alone.
 - `types [--release <14..19>] [--out <types.parquet>]`: every type PostgreSQL defines, and whether
   the snail takes a table's column of it, or why not.
 - `operators [--release <14..19>] [--out <operators.parquet>] [--setup <setup.sql>]`: every
-  operator PostgreSQL defines, and whether a pipeline's step answers it, or why not.
+  operator PostgreSQL defines, and whether a pipeline's step, a plain question and a WHERE each
+  answer it, or why not.
 - `opclasses [--release <14..19>] [--out <opclasses.parquet>]`: every operator class PostgreSQL
   defines, and whether the snail takes an index of it, or why not.
 - `hold <file> --seconds <n>`: the snail held open, as a round that long holds it.

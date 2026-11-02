@@ -632,7 +632,8 @@ fn lift_factor(
                 return Ok(());
             }
             if let Some(v) = catalog.view(&n) {
-                let parsed = super::image::parse_sql(&v.query)?;
+                let bound = crate::grammar::bound(&v.query);
+                let parsed = super::image::parse_sql(bound.as_deref().unwrap_or(&v.query))?;
                 let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
                     return Err(Error::new(format!("the view {} is no question", v.name)));
                 };

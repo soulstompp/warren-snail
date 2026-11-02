@@ -403,6 +403,9 @@ pub struct Root {
     /// The file's own default collation, as a database's, which jsonb's strings sort under: format 9
     /// only; libc C.UTF-8 where it names none.
     pub collation: String,
+    /// The file's `default_text_search_config`: format 9 only; `pg_catalog.simple` where it names
+    /// none.
+    pub text_search: String,
     /// The transactions across snails this root's writes decided, each until a round across them
     /// finds every other snail's root written: format 9 only.
     pub decided: Vec<Decision>,
@@ -440,6 +443,15 @@ pub(crate) fn serial_refused(format: u32) -> Error {
 pub const COLLATION: &str = "C.UTF-8";
 
 impl Root {
+    /// The file's `default_text_search_config`: `pg_catalog.simple` where it names none.
+    pub fn text_search(&self) -> &str {
+        if self.text_search.is_empty() {
+            TEXT_SEARCH
+        } else {
+            &self.text_search
+        }
+    }
+
     /// The file's own default collation.
     pub fn collation(&self) -> &str {
         if self.collation.is_empty() {
@@ -496,6 +508,9 @@ pub struct Pending {
 
 /// The `lc_monetary` money is written under where nothing names another.
 pub const MONETARY: &str = "C";
+
+/// The `default_text_search_config` a file reads under where nothing names another.
+pub const TEXT_SEARCH: &str = "pg_catalog.simple";
 
 /// Each column of a catalog holding money, with its `lc_monetary`: the one `had` records for it, or
 /// for a column it does not, the file's: the one `had` records for a column the catalog holds, C
@@ -658,7 +673,10 @@ impl Root {
             }
             // Whether a transaction across snails is pending, and whether the serializable
             // transactions' records follow.
-            let records = u8::from(self.serial.bytes > 0) * 2 + u8::from(self.clock > 0) * 4;
+            let searched = self.text_search() != TEXT_SEARCH;
+            let records = u8::from(self.serial.bytes > 0) * 2
+                + u8::from(self.clock > 0) * 4
+                + u8::from(searched) * 8;
             match &self.pending {
                 None => o.u8(records),
                 Some(p) => {
@@ -672,6 +690,9 @@ impl Root {
             }
             if self.clock > 0 {
                 o.u64(self.clock);
+            }
+            if searched {
+                o.str(self.text_search());
             }
             // A root marked a replica carries its source, then whether its host tagged it.
             match &self.replica {
@@ -691,6 +712,11 @@ impl Root {
                     }
                 }
             }
+        } else if self.text_search() != TEXT_SEARCH {
+            return Err(Error::new(format!(
+                "a snail of format {format} reads under default_text_search_config {TEXT_SEARCH} \
+                 and takes no other: `out`, then `write`"
+            )));
         } else if self.replica.is_some() {
             return Err(Error::new(format!(
                 "a snail of format {format} is marked a replica of no source: `out`, then `write`"
@@ -767,7 +793,7 @@ impl Root {
         } else {
             String::new()
         };
-        let (decided, pending, serial, clock) = if format >= FORMAT && !ended(&i) {
+        let (decided, pending, serial, clock, text_search) = if format >= FORMAT && !ended(&i) {
             let n = i.u32().ok()? as usize;
             let mut decided = Vec::with_capacity(n.min(256));
             for _ in 0..n {
@@ -800,9 +826,13 @@ impl Root {
                 0 => 0,
                 _ => i.u64().ok()?,
             };
-            (decided, pending, serial, clock)
+            let text_search = match marks & 8 {
+                0 => String::new(),
+                _ => i.str().ok()?,
+            };
+            (decided, pending, serial, clock, text_search)
         } else {
-            (Vec::new(), None, Extent::default(), 0)
+            (Vec::new(), None, Extent::default(), 0, String::new())
         };
         // A root its host tagged carries the tag last; one marked a replica carries its source,
         // then whether its host tagged it.
@@ -834,6 +864,7 @@ impl Root {
                 release,
                 monetary,
                 collation,
+                text_search,
                 decided,
                 pending,
                 host,
@@ -1906,6 +1937,31 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_names_its_configuration_only_where_it_is_another_and_format_nine_alone_takes_one() {
+        let r = Root {
+            text_search: "pg_catalog.english".into(),
+            ..Default::default()
+        };
+        let mut bytes = r.encode(FORMAT).unwrap();
+        bytes.resize(PAGE, 0);
+        let (back, _) = Root::decode(&bytes).unwrap();
+        assert_eq!(back.text_search(), "pg_catalog.english");
+        let plain = Root::default().encode(FORMAT).unwrap();
+        let simple = Root {
+            text_search: TEXT_SEARCH.into(),
+            ..Default::default()
+        };
+        assert_eq!(simple.encode(FORMAT).unwrap(), plain);
+        let e = r.encode(FORMAT_EIGHT).unwrap_err().to_string();
+        assert!(
+            e.contains("reads under default_text_search_config pg_catalog.simple")
+                && e.contains("takes no other"),
+            "{e}"
+        );
+        assert!(Root::default().encode(FORMAT_EIGHT).is_ok());
+    }
 
     #[test]
     fn the_newer_whole_root_is_read_and_a_torn_one_is_not() {

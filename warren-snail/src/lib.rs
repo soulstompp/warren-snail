@@ -17,6 +17,7 @@ pub mod file;
 pub mod formatting;
 pub mod functions;
 pub mod geo;
+mod grammar;
 #[cfg(feature = "standalone")]
 pub mod held;
 pub mod inet;

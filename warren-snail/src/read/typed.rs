@@ -76,7 +76,7 @@ pub(super) fn no_form(name: &str, args: &[Option<ColumnType>]) -> Error {
 }
 
 /// The wider of two integers, as PostgreSQL's operators across integer widths return.
-fn wider(a: ColumnType, b: ColumnType) -> ColumnType {
+pub(super) fn wider(a: ColumnType, b: ColumnType) -> ColumnType {
     let rank = |t: ColumnType| match t {
         ColumnType::Int2 => 0,
         ColumnType::Int4 => 1,
@@ -395,7 +395,19 @@ impl Typing<'_> {
                 Some(number_type(&format!("-{s}")))
             }
             Expr::UnaryOp {
-                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                op:
+                    op @ (UnaryOperator::Plus
+                    | UnaryOperator::PGAbs
+                    | UnaryOperator::PGSquareRoot
+                    | UnaryOperator::PGCubeRoot
+                    | UnaryOperator::BitwiseNot),
+                expr,
+            } => {
+                let t = self.type_of(expr)?;
+                super::ops::prefix_type(op, t, expr)?
+            }
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
                 expr,
             } => {
                 let t = self.type_of(expr)?;
@@ -467,6 +479,7 @@ impl Typing<'_> {
                     (true, true) => "!~~*",
                 };
                 statistics_operator(op, t, u)?;
+                super::ops::like_form(op, t, u, expr, pattern)?;
                 Some(ColumnType::Boolean)
             }
             Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
@@ -529,6 +542,9 @@ impl Typing<'_> {
                     return Ok(Some(t));
                 }
                 if let Some(t) = range_operator(&op.to_string(), a, b)? {
+                    return Ok(Some(t));
+                }
+                if let Some(t) = super::ops::binary_type(op, a, b, left, right)? {
                     return Ok(Some(t));
                 }
                 if *op == BinaryOperator::StringConcat {

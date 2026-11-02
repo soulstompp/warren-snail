@@ -1,6 +1,6 @@
 //! The functions of text search a pipeline answers by name, over `crate::tsearch`: those of
-//! tsvector and tsquery, and those that read a configuration named beside the text, under
-//! `simple` and `english`.
+//! tsvector and tsquery, and those that read a configuration, named beside the text or the file's
+//! `default_text_search_config`, under `simple` and `english`.
 
 use super::pipeline::{composed, Value};
 use crate::catalog::ColumnType;
@@ -17,20 +17,12 @@ const TEXT: ColumnType = ColumnType::Text(None);
 /// The set-returning functions of text search.
 pub(super) const SETS: [&str; 3] = ["ts_parse", "ts_token_type", "ts_debug"];
 
-/// The functions of text search that read what the snail does not: the setting that names the
-/// configuration where a call names none, and a query run by its text.
+/// The functions of text search that read what the snail does not: a query run by its text.
 fn unread(name: &str, args: &[Option<ColumnType>]) -> Option<Error> {
-    let setting = || {
-        Error::new(format!(
-            "{name} without a configuration reads default_text_search_config, a setting the snail \
-             does not answer under"
-        ))
-    };
     let json = args
         .iter()
         .any(|t| matches!(t, Some(ColumnType::Textual(Textual::Json | Textual::Jsonb))));
     match name {
-        "get_current_ts_config" => Some(setting()),
         "ts_stat" => Some(Error::new(
             "ts_stat runs a query by its text: it is not read",
         )),
@@ -43,19 +35,78 @@ fn unread(name: &str, args: &[Option<ColumnType>]) -> Option<Error> {
         "to_tsvector" | "ts_headline" if json => {
             Some(Error::new(format!("{name} of a json is not read yet")))
         }
-        "to_tsvector"
-        | "to_tsquery"
-        | "plainto_tsquery"
-        | "phraseto_tsquery"
-        | "websearch_to_tsquery"
-            if args.len() == 1 =>
-        {
-            Some(setting())
-        }
-        // Its forms without a configuration take the query second.
-        "ts_headline" if args.len() == 2 || args.get(1) == Some(&Some(TSQUERY)) => Some(setting()),
         _ => None,
     }
+}
+
+/// Whether a call names no configuration, so that it reads the file's: `ts_headline`'s forms without
+/// one take the query second.
+fn names_none(name: &str, types: &[Option<ColumnType>]) -> bool {
+    match name {
+        "to_tsvector" | "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery"
+        | "websearch_to_tsquery" | "ts_debug" => types.len() == 1,
+        "ts_headline" => types.len() == 2 || types.get(1) == Some(&Some(TSQUERY)),
+        _ => false,
+    }
+}
+
+/// A call's arguments, the file's configuration before them where it names none.
+pub(super) fn named_setting(
+    name: &str,
+    given: Vec<(Value, bool)>,
+    casings: &super::pipeline::Casings,
+) -> Result<Vec<(Value, bool)>> {
+    let types: Vec<Option<ColumnType>> = given
+        .iter()
+        .map(|(v, _)| super::pipeline::type_of_value(v))
+        .collect();
+    if !names_none(name, &types) {
+        return Ok(given);
+    }
+    let config = Value::Text(casings.text_search()?.config().to_string());
+    Ok(std::iter::once((config, true)).chain(given).collect())
+}
+
+/// `get_current_ts_config`, and `current_setting` and `set_config` of `default_text_search_config`:
+/// the file's, a value set to another refused by name. None where a call is none of them.
+pub(super) fn setting(
+    name: &str,
+    given: &[(Value, bool)],
+    casings: &super::pipeline::Casings,
+) -> Result<Option<Value>> {
+    let named = |i: usize| given.get(i).and_then(|(v, _)| v.text());
+    let of_setting = || {
+        named(0).is_some_and(|n| n.eq_ignore_ascii_case("default_text_search_config"))
+    };
+    Ok(Some(match name {
+        "get_current_ts_config" if given.is_empty() => {
+            Value::Text(casings.text_search()?.config().to_string())
+        }
+        "current_setting" if of_setting() => Value::Text(casings.text_search()?.name().to_string()),
+        "set_config" if of_setting() => {
+            let file = casings.text_search()?;
+            match named(1) {
+                Some(value) if ts::TextSearch::open(&value).is_ok_and(|t| t == file) => {
+                    Value::Text(file.name().to_string())
+                }
+                Some(value) => {
+                    return Err(Error::new(format!(
+                        "set_config: setting \"default_text_search_config\" to \"{value}\": the \
+                         snail answers under default_text_search_config {} only",
+                        file.name()
+                    )))
+                }
+                None => {
+                    return Err(Error::new(format!(
+                        "set_config: resetting \"default_text_search_config\" takes the server's \
+                         default, and the snail answers under default_text_search_config {} only",
+                        file.name()
+                    )))
+                }
+            }
+        }
+        _ => return Ok(None),
+    }))
 }
 
 /// The record type of a set's rows.
@@ -101,7 +152,11 @@ pub(super) fn typed(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Op
     if let Some(e) = unread(name, args) {
         return Err(e);
     }
+    if names_none(name, args) && !args[0].is_none_or(|t| t.is_string()) {
+        return Err(super::typed::no_form(name, args));
+    }
     Ok(Some(Some(match name {
+        "get_current_ts_config" => TEXT,
         "length" if vector => ColumnType::Int4,
         "unnest" if vector => record("unnest"),
         "numnode" => ColumnType::Int4,
@@ -376,12 +431,6 @@ pub(super) fn sets(name: &str, args: &[(Value, bool)]) -> Result<Option<Vec<Valu
                 ])
             })
             .collect(),
-        ("ts_debug", 1) => {
-            return Err(Error::new(format!(
-                "{name} without a configuration reads default_text_search_config, a setting the \
-                 snail does not answer under"
-            )))
-        }
         _ => {
             return Err(Error::new(format!(
                 "function {name}({} arguments) does not exist",

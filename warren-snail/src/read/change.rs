@@ -1424,7 +1424,7 @@ impl Snail {
                 &[],
                 &[],
                 t.release,
-                &super::pipeline::Casings::under(t.monetary),
+                &super::pipeline::Casings::under(t),
             )?,
             col.ty,
             &col.name,
@@ -3310,6 +3310,7 @@ impl Snail {
         super::old_names(&mut catalog, self.reader.format());
         catalog.with_release(self.root.release)?;
         catalog.with_monetary(&crate::file::monetary_of(&catalog, &self.root.monetary))?;
+        catalog.with_text_search(self.root.text_search())?;
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         crate::file::holds_catalog(self.reader.format(), &catalog)?;

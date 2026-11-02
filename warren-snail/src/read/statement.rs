@@ -573,7 +573,7 @@ fn cast_through(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
         &[],
         &[],
         table.release,
-        &super::pipeline::Casings::under(table.monetary),
+        &super::pipeline::Casings::under(table),
     )?;
     let held = crate::catalog::held_type(to)
         .ok()
@@ -1080,7 +1080,8 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
     }
     super::question::unlocked_words(sql)?;
     super::spelled::at_at_spaced(sql)?;
-    let statements = super::image::parse_sql(sql)?;
+    let bound = crate::grammar::bound(sql);
+    let statements = super::image::parse_sql(bound.as_deref().unwrap_or(sql))?;
     let s = match statements.as_slice() {
         [s] => s,
         _ => return Err(Error::new("one statement at a time")),
@@ -1163,9 +1164,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         Sql::Truncate { .. } => Err(refused("TRUNCATE")),
         Sql::Set(sqlparser::ast::Set::SingleAssignment {
             variable, values, ..
-        }) => setting(&object_name(variable), values, catalog.monetary),
+        }) => setting(&object_name(variable), values, catalog),
         Sql::Set(sqlparser::ast::Set::SetTimeZone { value, .. }) => {
-            setting("timezone", std::slice::from_ref(value), catalog.monetary)
+            setting("timezone", std::slice::from_ref(value), catalog)
         }
         other => Err(Error::new(format!(
             "{other} is not a statement the snail writes"
@@ -1175,8 +1176,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
 
 /// The settings the snail answers under, each its name as PostgreSQL's SET takes it and its
 /// value: what PostgreSQL's side of a certificate runs under too. lc_monetary is the one the file's
-/// money was written under, C where it names no other.
-pub const SETTINGS: [(&str, &str); 9] = [
+/// money was written under, C where it names no other; default_text_search_config the file's,
+/// pg_catalog.simple where it names no other.
+pub const SETTINGS: [(&str, &str); 10] = [
     ("timezone", "UTC"),
     ("datestyle", "ISO, MDY"),
     ("intervalstyle", "postgres"),
@@ -1186,14 +1188,15 @@ pub const SETTINGS: [(&str, &str); 9] = [
     ("lc_monetary", "C"),
     ("lc_numeric", "C"),
     ("lc_time", "C"),
+    ("default_text_search_config", crate::file::TEXT_SEARCH),
 ];
 
 /// A SET of `name` to `values`: taken, changing nothing, where it sets the value the snail answers
-/// under, `monetary` lc_monetary's, and refused by name where it sets another or a setting the
-/// snail does not read.
-fn setting(name: &str, values: &[Expr], monetary: crate::monetary::Monetary) -> Result<Statement> {
+/// under, the file's lc_monetary and default_text_search_config among them, and refused by name
+/// where it sets another or a setting the snail does not read.
+fn setting(name: &str, values: &[Expr], catalog: &Catalog) -> Result<Statement> {
     let name = name.to_lowercase();
-    let file = monetary.name();
+    let file = catalog.monetary.name();
     let Some(&(_, fixed)) = SETTINGS.iter().find(|(n, _)| *n == name) else {
         return Err(Error::new(format!(
             "SET {name} is not read: the snail answers under fixed settings"
@@ -1244,12 +1247,16 @@ fn setting(name: &str, values: &[Expr], monetary: crate::monetary::Monetary) -> 
         "lc_numeric" | "lc_time" => {
             matches!(joined.as_str(), "C" | "POSIX") || joined.eq_ignore_ascii_case("default")
         }
+        "default_text_search_config" => {
+            crate::tsearch::TextSearch::open(&joined).is_ok_and(|t| t == catalog.text_search)
+                || joined.eq_ignore_ascii_case("default")
+        }
         _ => joined.eq_ignore_ascii_case(fixed) || joined.eq_ignore_ascii_case("default"),
     };
-    let fixed = if name == "lc_monetary" {
-        file.as_str()
-    } else {
-        fixed
+    let fixed = match name.as_str() {
+        "lc_monetary" => file.as_str(),
+        "default_text_search_config" => catalog.text_search.name(),
+        _ => fixed,
     };
     if !same {
         return Err(Error::new(format!(

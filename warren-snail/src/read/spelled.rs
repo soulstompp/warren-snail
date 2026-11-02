@@ -26,10 +26,12 @@ pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
             out = Cow::Owned(next);
         }
     }
-    if !lower.contains("substring") && !lower.contains("symmetric") {
-        return Ok(out);
+    if lower.contains("substring") || lower.contains("symmetric") {
+        while let Some(next) = rewrite_once(&out)? {
+            out = Cow::Owned(next);
+        }
     }
-    while let Some(next) = rewrite_once(&out)? {
+    if let Some(next) = crate::grammar::bound(&out) {
         out = Cow::Owned(next);
     }
     Ok(out)

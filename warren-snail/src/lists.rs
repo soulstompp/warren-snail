@@ -2,7 +2,7 @@
 //! `operators.txt` and `opclasses.txt`, drawn from each release's catalog), each held or refused by
 //! name as the snail's own paths answer it: a type where a table's column of it is taken and an
 //! operator class where an index of it is, as the DDL reader reads them; an operator where a
-//! pipeline's step answers it over columns of its types.
+//! pipeline's step, a plain question and a WHERE each answer it over columns of its types.
 
 use crate::catalog::Catalog;
 use std::sync::OnceLock;
@@ -250,8 +250,9 @@ fn column_of(ty: &str) -> String {
     format!("v_{n}")
 }
 
-/// The operators a release defines, each probed by a pipeline's step over the columns of a table
-/// holding a value of each of its operands' types, in a snail written afresh at `scratch`; and the
+/// The operators a release defines, each probed by a pipeline's step, a plain question and a WHERE
+/// over the columns of a table holding a value of each of its operands' types, in a snail written
+/// afresh at `scratch`, the probe named the step's; and the
 /// statements that make the table whole, a column and a value of each type, for PostgreSQL to make
 /// the same. The snail's table holds the columns and values it takes: an operator of a type whose
 /// column or value it refuses is refused in those words.
@@ -351,7 +352,13 @@ fn operators_over(
                 .find_map(|t| why.iter().find(|(w, _)| *w == t))
             {
                 Some((_, r)) => Some(r.clone()),
-                None => snail.ask(&probe, None).err().map(|e| e.to_string()),
+                None => [
+                    probe.clone(),
+                    format!("SELECT {expr} AS x FROM {SCHEMA}.t"),
+                    format!("SELECT 1 AS x FROM {SCHEMA}.t WHERE ({expr}) IS NOT NULL"),
+                ]
+                .iter()
+                .find_map(|q| snail.ask(q, None).err().map(|e| e.to_string())),
             };
             Probed {
                 listed: o,

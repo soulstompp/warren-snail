@@ -20,7 +20,7 @@ mod snowball;
 
 pub use config::{
     phraseto_tsquery, plainto_tsquery, to_tsquery, to_tsvector, ts_debug, ts_lexize, ts_parse,
-    ts_token_type, websearch_to_tsquery, Debugged,
+    ts_token_type, websearch_to_tsquery, Debugged, TextSearch,
 };
 pub use funcs::*;
 pub use headline::ts_headline;

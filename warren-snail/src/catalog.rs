@@ -1375,6 +1375,8 @@ pub struct Table {
     pub monetary: crate::monetary::Monetary,
     /// Its BRIN indexes, which no order stands for.
     pub brins: Vec<Brin>,
+    /// The configuration a call naming none reads: the file's.
+    pub text_search: crate::tsearch::TextSearch,
     /// The format of the file it lies in, whose leaves its columns are held as.
     pub format: u32,
     /// The keys of its indexes held as element strands, each index's keys in turn.
@@ -1948,6 +1950,8 @@ pub struct Catalog {
     /// The lc_monetary the file's money was written under, which every money value a statement
     /// reads or makes reads and prints under.
     pub monetary: crate::monetary::Monetary,
+    /// The file's default_text_search_config, the configuration a call naming none reads.
+    pub text_search: crate::tsearch::TextSearch,
 }
 
 /// A DDL read a statement at a time: the catalog of the statements taken, and each statement taken
@@ -2876,6 +2880,17 @@ impl Catalog {
         types.extend(self.domains.iter_mut().filter_map(|d| d.base_type.as_mut()));
         for ty in types {
             *ty = ty.at_release(release)?;
+        }
+        Ok(())
+    }
+
+    /// Every call naming no text search configuration read under the one `recorded` names; refused
+    /// where the snail reads no such configuration.
+    pub fn with_text_search(&mut self, recorded: &str) -> Result<()> {
+        let s = crate::tsearch::TextSearch::open(recorded)?;
+        self.text_search = s;
+        for t in &mut self.tables {
+            t.text_search = s;
         }
         Ok(())
     }

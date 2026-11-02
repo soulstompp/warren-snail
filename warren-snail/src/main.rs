@@ -25,6 +25,7 @@ PostgreSQL's SQL. It runs on Linux.
 
 usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--file-pages <n>]
                           [--release <14..19>] [--lc-monetary <locale>]
+                          [--text-search-config <name>]
                           [--written <written.parquet>] [--format <7|8>]
        warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
                          [--host <command> --host-server <name>] [--applier <source>]
@@ -53,7 +54,11 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           money was written under, which the snail reads and prints its money under, are those
           the files name, as `out` names them; where they name none, --release and --lc-monetary
           give them, 19 and C unless given, any locale but C and POSIX through glibc, with the
-          feature collations. A flag naming another than the files name is refused. --written
+          feature collations. A flag naming another than the files name is refused. The
+          default_text_search_config every round answers under, the configuration a call naming
+          none reads, is likewise what the files name, else --text-search-config, else
+          pg_catalog.simple: a configuration the snail reads, simple or english, any other refused
+          by name. --written
           records each order's columns as Parquet. --format writes the snail in format 7 or 8, as
           warren-snail 0.1.0 or 0.1.1 made it, for the checks that hold this build to them.
   exec    each statement in turn, on the snail open to write: INSERT, UPDATE and DELETE; BEGIN,
@@ -114,8 +119,9 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           each; --out records each as Parquet: its name, family, whether the snail holds it, its
           refusal and the statements it was probed by.
   operators every operator PostgreSQL defines, as types lists the types: held where a pipeline's
-          step answers it over columns of its operands' types, in a snail written for the probe
-          among the system's temporary files and removed after. --setup writes the statements that
+          step, a plain question and a WHERE each answer it over columns of its operands' types,
+          in a snail written for the probe among the system's temporary files and removed after.
+          --setup writes the statements that
           make that table whole, a column and a value of each type, as PostgreSQL may be given them.
   opclasses every operator class PostgreSQL defines, as types lists the types: held where the snail
           takes an index of its method and it on a column of its key's type.
@@ -724,6 +730,7 @@ fn cmd_write(args: &[String]) -> Result<()> {
         span,
         release,
         flag(args, "--lc-monetary"),
+        flag(args, "--text-search-config"),
         format,
     )?;
     if let Some(out) = flag(args, "--written") {

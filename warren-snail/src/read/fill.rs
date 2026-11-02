@@ -734,7 +734,7 @@ pub(super) fn check_holds(
         &["value".to_string()],
         &[value_of(d, ty)],
         table.release,
-        &Casings::under(table.monetary),
+        &Casings::under(table),
     )?;
     Ok(!matches!(v, Value::Bool(false)))
 }
@@ -827,7 +827,7 @@ fn meets_parts(
 /// an array's element or a composite's field names does not. A domain's CHECK reads its money
 /// under the file's lc_monetary.
 pub fn check_domains(domains: &[crate::catalog::Domain], table: &Table, row: &Row) -> Result<()> {
-    let casings = Casings::under(table.monetary);
+    let casings = Casings::under(table);
     for (col, d) in table.columns.iter().zip(row) {
         if let Some(name) = &col.domain {
             meets_domain(domains, name, col.ty, d, table.release, &casings)?;
