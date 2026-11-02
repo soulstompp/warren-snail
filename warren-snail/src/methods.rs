@@ -5,7 +5,7 @@
 use crate::catalog::{ColumnType, Method};
 use crate::composed::Composed;
 use crate::geo::GeoKind;
-use crate::textual::Textual;
+use crate::textual::{Internal, Textual};
 use crate::{Error, Result};
 
 /// Whether the snail holds an index of the method with a key of the operator class: a B-tree and a
@@ -83,11 +83,17 @@ fn is_array(ty: ColumnType) -> bool {
     )
 }
 
-fn is_inet(ty: ColumnType) -> bool {
+pub(crate) fn is_inet(ty: ColumnType) -> bool {
     matches!(
         ty,
         ColumnType::Textual(Textual::Inet) | ColumnType::Textual(Textual::Cidr)
     )
+}
+
+/// Whether a key takes text's operator classes: text, and pg_node_tree, which PostgreSQL's catalog casts
+/// to text as its bytes.
+pub(crate) fn read_as_text(ty: ColumnType) -> bool {
+    ty.is_text() || ty == ColumnType::Internal(Internal::NodeTree)
 }
 
 fn geo(ty: ColumnType, kind: GeoKind) -> bool {
@@ -121,7 +127,7 @@ const SPGIST: [Class; 7] = [
     ("poly_ops", true, |t| geo(t, GeoKind::Polygon)),
     ("quad_point_ops", true, |t| geo(t, GeoKind::Point)),
     ("range_ops", true, is_range),
-    ("text_ops", true, |t| t.is_text()),
+    ("text_ops", true, read_as_text),
 ];
 
 const GIN: [Class; 4] = [
@@ -139,9 +145,9 @@ const GIN: [Class; 4] = [
 
 /// The hash operator classes besides each type's default: the pattern ones, varchar's, cidr's.
 const HASH_NAMED: [(&str, fn(ColumnType) -> bool); 5] = [
-    ("text_pattern_ops", |t| t.is_text()),
-    ("varchar_ops", |t| t.is_text()),
-    ("varchar_pattern_ops", |t| t.is_text()),
+    ("text_pattern_ops", read_as_text),
+    ("varchar_ops", read_as_text),
+    ("varchar_pattern_ops", read_as_text),
     ("bpchar_pattern_ops", |t| matches!(t, ColumnType::Bpchar(_))),
     ("cidr_ops", is_inet),
 ];
@@ -228,7 +234,10 @@ fn brin_prefix(ty: ColumnType) -> Option<&'static str> {
         ColumnType::Bit(_) => "bit",
         ColumnType::Varbit(_) => "varbit",
         ColumnType::Bpchar(_) => "bpchar",
-        ColumnType::Bytes => "bytea",
+        ColumnType::Bytes
+        | ColumnType::Internal(Internal::Ndistinct | Internal::Dependencies | Internal::McvList) => {
+            "bytea"
+        }
         ColumnType::Char => "char",
         ColumnType::Date => "date",
         ColumnType::Float4 => "float4",
@@ -244,7 +253,7 @@ fn brin_prefix(ty: ColumnType) -> Option<&'static str> {
         ColumnType::Numeric { .. } | ColumnType::NumericText(_) => "numeric",
         ColumnType::Oid | ColumnType::Reg(..) => "oid",
         ColumnType::PgLsn => "pg_lsn",
-        ColumnType::Text(_) => "text",
+        t if read_as_text(t) => "text",
         ColumnType::Tid => "tid",
         ColumnType::Time(_) => "time",
         ColumnType::Timestamp(_) => "timestamp",
@@ -540,7 +549,7 @@ pub fn exclusion_operator(method: Method, opclass: &str, ty: ColumnType, op: &st
     if !members.contains(&op) {
         let family = match opclass {
             "int2_ops" | "int4_ops" | "int8_ops" => "integer_ops",
-            "inet_ops" => "network_ops",
+            "inet_ops" | "cidr_ops" => "network_ops",
             o => o,
         };
         return Err(Error::new(format!(

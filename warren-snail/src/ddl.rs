@@ -3931,12 +3931,20 @@ impl Draft {
                 Some(o) => {
                     let o = object_name(o);
                     let o = o.strip_prefix("pg_catalog.").unwrap_or(&o).to_string();
-                    let text = matches!(s, Shape::Column(k) if t.columns[k].ty.is_text());
+                    let text = matches!(s, Shape::Column(k) if crate::methods::read_as_text(t.columns[k].ty));
                     let bpchar = matches!(s, Shape::Column(k) if matches!(t.columns[k].ty, ColumnType::Bpchar(_)));
+                    if o == "record_image_ops" {
+                        return Err(Error::new(format!(
+                            "{shown}: the operator class record_image_ops is not read: it orders \
+                             records by PostgreSQL's in-memory layout of each type, which the \
+                             snail does not keep"
+                        )));
+                    }
                     if o != default
                         && !(text && TEXT_OPCLASSES.contains(&o.as_str()))
                         && !(bpchar && o == "bpchar_pattern_ops")
                         && !(o == "array_ops" && crate::composed::is_vector(key_type))
+                        && !(o == "cidr_ops" && crate::methods::is_inet(key_type))
                     {
                         return Err(Error::new(format!(
                             "{shown}: the operator class {o} is not read on {}",
@@ -5571,9 +5579,12 @@ fn collatable(ty: ColumnType) -> bool {
 }
 
 /// The collation a column of the type takes where its DDL names none: name's own, C; any other
-/// string type's the database's default; an array's its element's.
+/// string type's the database's default, and pg_node_tree's, the planner's statistics' and the BRIN
+/// summaries'; an array's its element's.
 fn collation_of(ty: ColumnType) -> Option<&'static str> {
     match ty {
+        ColumnType::Internal(crate::textual::Internal::Gtsvector) => None,
+        ColumnType::Internal(_) => Some("default"),
         ColumnType::Composed(r) => match r.def() {
             crate::composed::Composed::Array { element, .. } => collation_of(*element),
             _ => None,
