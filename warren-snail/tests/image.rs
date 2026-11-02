@@ -127,6 +127,7 @@ fn values_both_their_bytes_and_their_class_part_are_parted() {
         ("'{1,2}'::int[]", "'[0:1]={1,2}'::int[]"),
         ("'{1,2}'::int[]", "'{{1,2}}'::int[]"),
         ("'[1,2)'::int4range", "'[1,2]'::int4range"),
+        ("'(1,2)'::numrange", "'[1,2]'::numrange"),
         ("'{1,NULL}'::int[]", "'{1,2}'::int[]"),
         ("'{}'::int[]", "'{NULL}'::int[]"),
         ("'empty'::int4range", "'[1,2)'::int4range"),
@@ -318,6 +319,43 @@ fn the_order_of_the_image_is_refused_by_name() {
 }
 
 #[test]
+fn before_any_some_and_all_over_an_array_it_is_asked_of_each_element() {
+    let mut s = empty("quantified");
+    let on = "(SELECT ROW(1.0) AS a, ROW(1.00) AS b) q";
+    for (form, want) in [
+        ("a *= ANY(ARRAY[b])", "false"),
+        ("a *= ANY(ARRAY[b, a])", "true"),
+        ("a *= SOME(ARRAY[a])", "true"),
+        ("a *= ALL(ARRAY[b, a])", "false"),
+        ("a *= ALL(ARRAY[a, a])", "true"),
+        ("a *<> ANY(ARRAY[a, b])", "true"),
+        ("a *<> ANY(ARRAY[a])", "false"),
+        ("a *<> ALL(ARRAY[b])", "true"),
+        ("a *<> ALL(ARRAY[a, b])", "false"),
+        ("a *= ANY(ARRAY[b, NULL])", "NULL"),
+        ("a *= ANY(ARRAY[a, NULL])", "true"),
+        ("a *= ALL(ARRAY[a, NULL])", "NULL"),
+        ("a *= ALL(ARRAY[b, NULL])", "false"),
+        ("a *= ANY(NULL)", "NULL"),
+        ("NULL *= ANY(ARRAY[a])", "NULL"),
+        ("a *= ANY('{}')", "false"),
+        ("a *= ALL('{}')", "true"),
+    ] {
+        assert_eq!(rows(&mut s, &format!("SELECT {form} AS x FROM {on}")), [[want]], "{form}");
+    }
+    for (sql, why) in [
+        ("SELECT 1 *= ANY(ARRAY[1]) AS x", "operator does not exist: integer *= integer"),
+        ("SELECT ROW(1) *= ANY(ARRAY[1]) AS x", "operator does not exist: record *= integer"),
+        ("SELECT ROW(1) *= ANY(ROW(1)) AS x", "op ANY/ALL (array) requires array on right side"),
+        ("SELECT ROW(1) *= ALL(1) AS x", "op ANY/ALL (array) requires array on right side"),
+    ] {
+        assert_eq!(refused(&mut s, sql), why, "{sql}");
+    }
+    assert!(refused(&mut s, "SELECT ROW(1) *< ANY(ARRAY[ROW(1)]) AS x").contains("in-memory layout"));
+    assert!(refused(&mut s, "SELECT ROW(1) *= ANY(SELECT ROW(1)) AS x").contains("found: *="));
+}
+
+#[test]
 fn a_row_constructor_compared_otherwise_stays_unread() {
     let mut s = empty("otherwise");
     for sql in [
@@ -417,6 +455,11 @@ mod written {
             refused(&mut s, "SELECT a *= ROW(1) AS i FROM s.t WHERE id = 1"),
             "cannot compare dissimilar column types numeric and integer at record column 1"
         );
+        // A row constructor standing alone, in a question of one table.
+        assert_eq!(
+            rows(&mut s, "SELECT (a, b)::text AS x FROM s.t WHERE id = 1"),
+            [["(\"(1.0)\",\"(1.00)\")"]]
+        );
         // Over two tables' columns.
         assert_eq!(
             rows(
@@ -487,6 +530,33 @@ mod written {
             rows(&mut w, "SELECT g *= h AS i FROM s.t WHERE id = 1"),
             [["true"]]
         );
+    }
+
+    #[test]
+    fn two_snails_read_the_operator_across() {
+        let (a, b) = (
+            made("across-a", "CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.a (id integer PRIMARY KEY, v s.c);"),
+            made("across-b", "CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.b (id integer PRIMARY KEY, v s.c);"),
+        );
+        Snail::open_writing(&a)
+            .unwrap()
+            .execute("INSERT INTO s.a VALUES (1, ROW(1.0)::s.c), (2, ROW(2.0)::s.c)")
+            .unwrap();
+        Snail::open_writing(&b)
+            .unwrap()
+            .execute("INSERT INTO s.b VALUES (1, ROW(1.00)::s.c), (2, ROW(2.0)::s.c)")
+            .unwrap();
+        let mut s = warren_snail::read::Snails::open(&[a.as_path(), b.as_path()]).unwrap();
+        let (r, _) = s
+            .ask("SELECT x.id FROM s.a x JOIN s.b y ON x.id = y.id WHERE x.v *= y.v")
+            .unwrap();
+        assert_eq!(r.num_rows(), 1);
+        let (r, _) = s.ask("SELECT x.id FROM s.a x WHERE x.v *<> ROW(1.0)").unwrap();
+        assert_eq!(r.num_rows(), 1);
+        let (r, _) = s
+            .ask("WITH q AS (SELECT id, v FROM s.b) SELECT id FROM q WHERE v *= ROW(2.0)")
+            .unwrap();
+        assert_eq!(r.num_rows(), 1);
     }
 
     #[test]

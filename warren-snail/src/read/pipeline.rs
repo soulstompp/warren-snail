@@ -3612,6 +3612,13 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             };
             regex_match(&s, &p, &op, false, *negated, casing)?
         }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. }
+            if super::image::marked(right).is_some() =>
+        {
+            let (name, array) = super::image::marked(right).unwrap();
+            let any = matches!(e, Expr::AnyOp { .. });
+            super::image::over_array(name, ev(left)?, ev(array)?, left, array, any)?
+        }
         Expr::AnyOp {
             left,
             compare_op,

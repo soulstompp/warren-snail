@@ -1,7 +1,8 @@
 //! The record image operators: `*=` and `*<>`, each record's fields compared by their own bytes, as
 //! `record_image_eq` and `record_image_ne` compare them; and `*<`, `*<=`, `*>` and `*>=`, refused by
 //! name. sqlparser reads each of them as `*` and a comparison, so a statement's tokens are joined here
-//! before it parses them.
+//! before it parses them; and it reads no operator of its own before ANY, SOME or ALL, so an array
+//! there is handed to `=` inside a call whose name carries the operator.
 
 use super::pipeline::{kind_name, quoted, row_parts, Value};
 use super::statement::Datum;
@@ -9,10 +10,11 @@ use crate::catalog::ColumnType;
 use crate::composed::{Composed, Field, Item};
 use crate::methods::bare_name;
 use crate::{Error, Result};
-use sqlparser::ast::{BinaryOperator, Expr, Statement};
+use sqlparser::ast::{BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, TokenizerError};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, TokenizerError, Word};
 
 /// What follows `*` to make one of these operators: its name.
 fn joined(next: &Token) -> Option<&'static str> {
@@ -52,12 +54,92 @@ pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, Token
             None => out.push(t),
         }
     }
-    Ok(out)
+    Ok(over_arrays(out))
+}
+
+/// What marks a call as carrying an operator before ANY, SOME or ALL: its name is this character and
+/// the operator's.
+const MARK: char = '\u{1}';
+
+/// Each of these operators before ANY, SOME or ALL over an array: `=`, the array inside the call that
+/// names it. Over a subquery it stays as it is, and sqlparser refuses it, naming it.
+fn over_arrays(mut t: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    let solid = |t: &[TokenWithSpan], from: usize| {
+        (from..t.len()).find(|&i| !matches!(t[i].token, Token::Whitespace(_)))
+    };
+    let call = |text: String| Word {
+        value: text,
+        quote_style: Some('"'),
+        keyword: Keyword::NoKeyword,
+    };
+    let mut i = 0;
+    while i < t.len() {
+        let name = match &t[i].token {
+            Token::CustomBinaryOperator(n) if joined_name(n) => n.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        i += 1;
+        let Some(word) = solid(&t, i) else { break };
+        let Some(open) = solid(&t, word + 1) else { break };
+        let Some(first) = solid(&t, open + 1) else { break };
+        let quantified = matches!(&t[word].token, Token::Word(w)
+            if w.quote_style.is_none() && matches!(w.keyword, Keyword::ANY | Keyword::SOME | Keyword::ALL));
+        let over_a_query = matches!(&t[first].token, Token::Word(w)
+            if w.quote_style.is_none() && matches!(w.keyword, Keyword::SELECT | Keyword::WITH | Keyword::VALUES));
+        if !quantified || t[open].token != Token::LParen || over_a_query {
+            continue;
+        }
+        let mut depth = 0;
+        let Some(close) = (open..t.len()).find(|&k| {
+            match t[k].token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        }) else {
+            break;
+        };
+        let at = |token: Token, like: &TokenWithSpan| TokenWithSpan::new(token, like.span);
+        t[i - 1].token = Token::Eq;
+        let closing = at(Token::RParen, &t[close]);
+        t.insert(close, closing);
+        let opening = at(Token::LParen, &t[open]);
+        t.insert(open + 1, opening);
+        let named = at(Token::Word(call(format!("{MARK}{name}"))), &t[open]);
+        t.insert(open + 1, named);
+    }
+    t
+}
+
+/// The operator and the array a call carries before ANY, SOME or ALL.
+pub(super) fn marked(right: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Function(f) = right else {
+        return None;
+    };
+    let [part] = f.name.0.as_slice() else {
+        return None;
+    };
+    let name = part.as_ident()?.value.strip_prefix(MARK)?;
+    let FunctionArguments::List(l) = &f.args else {
+        return None;
+    };
+    match l.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(x))] => Some((name, x)),
+        _ => None,
+    }
+}
+
+fn joined_name(name: &str) -> bool {
+    matches!(name, "*=" | "*<>" | "*<" | "*<=" | "*>" | "*>=")
 }
 
 /// Whether a statement's text may hold one of these operators.
 pub(super) fn names_an_operator(sql: &str) -> bool {
-    ["*=", "*<", "*>", "*!="].iter().any(|s| sql.contains(s))
+    ["*=", "*<", "*>", "*!=", "\u{1}*"].iter().any(|s| sql.contains(s))
 }
 
 /// The statements of `sql`, as sqlparser's PostgreSQL dialect reads them, these operators among them.
@@ -77,11 +159,7 @@ pub(super) fn parse_expr(sql: &str) -> std::result::Result<Expr, ParserError> {
 /// The name of one of these operators.
 pub(super) fn operator(op: &BinaryOperator) -> Option<&str> {
     match op {
-        BinaryOperator::Custom(s)
-            if matches!(s.as_str(), "*=" | "*<>" | "*<" | "*<=" | "*>" | "*>=") =>
-        {
-            Some(s)
-        }
+        BinaryOperator::Custom(s) if joined_name(s) => Some(s),
         _ => None,
     }
 }
@@ -215,6 +293,93 @@ fn pair(
     };
     let same = records_same(*a, &p.item, *b, &q.item)?;
     Ok(Value::Bool(same == (name == "*=")))
+}
+
+/// What PostgreSQL's parser asks of an operator before ANY, SOME or ALL: an array on its right, whose
+/// element it asks as a right operand.
+pub(super) fn over_array_operands(
+    name: &str,
+    a: Option<ColumnType>,
+    b: Option<ColumnType>,
+    left: &Expr,
+    array: &Expr,
+) -> Result<()> {
+    let element = match b {
+        Some(t) => match super::typed::element_of(t) {
+            Some(e) => Some(e),
+            None => return Err(not_an_array()),
+        },
+        None => None,
+    };
+    let other = |t: Option<ColumnType>| t.is_some_and(|t| !is_record(t));
+    if element.is_some() && (other(a) || other(element)) {
+        return operands(name, a, element, left, array);
+    }
+    if other(a) && unknown(array) {
+        return Err(not_an_array());
+    }
+    Ok(())
+}
+
+fn not_an_array() -> Error {
+    Error::new("op ANY/ALL (array) requires array on right side")
+}
+
+/// The operator between a value and each element of an array, ANY's or ALL's: true where one, or
+/// every one, answers it, NULL where none does and one is NULL, as PostgreSQL's strict operators over
+/// an array are; over no element false, or true.
+pub(super) fn over_array(
+    name: &str,
+    x: Value,
+    array: Value,
+    left: &Expr,
+    right: &Expr,
+    any: bool,
+) -> Result<Value> {
+    ordered(name)?;
+    if quoted(left) {
+        literal_refused(left, right)?;
+    }
+    let (ty, c) = match array {
+        Value::Null => return Ok(Value::Null),
+        Value::Composed(ty, c) if super::typed::element_of(ty).is_some() => (ty, c),
+        Value::Text(s) if quoted(right) && s.trim() == "{}" => return Ok(Value::Bool(!any)),
+        Value::Text(_) if quoted(right) => {
+            return Err(Error::new(
+                "input of anonymous composite types is not implemented",
+            ))
+        }
+        _ => return Err(not_an_array()),
+    };
+    let element = super::typed::element_of(ty).expect("an array's element");
+    let Item::Array { elements, .. } = &c.item else {
+        return Ok(Value::Null);
+    };
+    if elements.is_empty() {
+        return Ok(Value::Bool(!any));
+    }
+    if x.is_null() {
+        return Ok(Value::Null);
+    }
+    let (Value::Composed(a, p), true) = (&x, is_record(element)) else {
+        return Err(Error::new(format!(
+            "operator does not exist: {} {name} {}",
+            kind_name(&x),
+            element.pg_name()
+        )));
+    };
+    let mut none = false;
+    for e in elements {
+        if e.is_null() {
+            none = true;
+            continue;
+        }
+        let answer = records_same(*a, &p.item, element, e)? == (name == "*=");
+        if answer == any {
+            return Ok(Value::Bool(any));
+        }
+    }
+    Ok(if none { Value::Null } else { Value::Bool(!any) })
 }
 
 fn fields(ty: ColumnType) -> &'static [Field] {

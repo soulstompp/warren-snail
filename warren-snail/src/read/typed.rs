@@ -272,6 +272,15 @@ impl Typing<'_> {
                 Some(ColumnType::Boolean)
             }
             Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. }
+                if super::image::marked(right).is_some() =>
+            {
+                let (name, array) = super::image::marked(right).unwrap();
+                super::image::ordered(name)?;
+                let (a, b) = (self.type_of(left)?, self.type_of(array)?);
+                super::image::over_array_operands(name, a, b, left, array)?;
+                Some(ColumnType::Boolean)
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. }
                 if matches!(right.as_ref(), Expr::Subquery(_)) =>
             {
                 self.type_of(left)?;
