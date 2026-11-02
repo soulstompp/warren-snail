@@ -92,6 +92,8 @@ at once, and a snail written inside a host that decides its commits.
 - Several snails at once: `--with` on `read` and `exec`, and `read::Snails`: a round reads them at
   one moment, a question joins their tables, and a transaction that writes several commits them
   together, one root deciding; `read --round` records each snail's part as `snails`.
+- `read --room <bytes>`, a round's room, and `--handed`, a round read as a host reads it; `read`'s
+  `--round` Parquet says what each round wrote past its room and held at most.
 - A host's round: `read::begin_together` reads a question on the snails given in a room of its own,
   `room::Sizes` naming its bytes and, by `written_to`, a `room::RoundFile` of the host's for the rows
   past them, and hands its answer out a batch at a time (`read::Answering`). `Priced`'s tables say the

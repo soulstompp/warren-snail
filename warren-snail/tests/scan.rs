@@ -230,3 +230,55 @@ fn a_question_priced_names_the_columns_it_holds_no_key_for() {
     )
     .is_empty());
 }
+
+/// A question with an ORDER BY, told the order a host told its scan, reads as that scan does.
+#[test]
+fn a_question_told_the_order_its_scan_was_told_reads_as_the_scan_does() {
+    let s = sample(20_000);
+    let path = snail("scanned-ordered", &s);
+    for (order, q) in [
+        (
+            "s_name",
+            "SELECT s.name, s.network_id, s.station_no FROM weather.stations s \
+             ORDER BY s.name, s.network_id, s.station_no",
+        ),
+        (
+            "s_name",
+            "SELECT s.name, s.network_id FROM weather.stations s ORDER BY s.name",
+        ),
+        (
+            "r_station",
+            "SELECT r.network_id, r.station_no, r.feed FROM weather.readings r \
+             ORDER BY r.network_id, r.station_no",
+        ),
+    ] {
+        let (want, asked) = fresh(&path).ask(q, Some(order)).unwrap();
+        let snail = fresh(&path);
+        let mut scan = snail.scan(q, Some(order)).unwrap();
+        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        while let Some(b) = snail.next_block(&mut scan).unwrap() {
+            rows.extend(bag(&b));
+        }
+        rows.sort();
+        assert_eq!(rows, bag(&want), "{q}");
+        let round = scan.round();
+        assert_eq!(asked.order, order, "{q}");
+        assert_eq!(
+            (
+                round.order.as_str(),
+                round.directory_pages,
+                round.column_pages_predicted,
+                round.column_pages_read,
+            ),
+            (
+                asked.order.as_str(),
+                asked.directory_pages,
+                asked.column_pages_predicted,
+                asked.column_pages_read,
+            ),
+            "{q}"
+        );
+        let price = fresh(&path).price(q, Some(order)).unwrap();
+        assert_eq!(price.column_pages, asked.column_pages_predicted, "{q}");
+    }
+}

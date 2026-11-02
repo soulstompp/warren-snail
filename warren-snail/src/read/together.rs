@@ -206,6 +206,26 @@ impl Answering {
         .map(Some)
     }
 
+    /// The rest of the answer as one batch, for a caller that holds its answer whole.
+    pub fn whole(&mut self) -> Result<RecordBatch> {
+        let Some(first) = self.next_batch()? else {
+            return batch_of(&Relation {
+                names: self.answers.names.clone(),
+                rows: Vec::new(),
+                order: None,
+            });
+        };
+        let Some(second) = self.next_batch()? else {
+            return Ok(first);
+        };
+        let mut whole = relation_of(&first)?;
+        whole.rows.extend(relation_of(&second)?.rows);
+        while let Some(b) = self.next_batch()? {
+            whole.rows.extend(relation_of(&b)?.rows);
+        }
+        batch_of(&whole)
+    }
+
     /// What the round has read, the most it has held, and the pages it has written past its room and
     /// read back.
     pub fn round(&self) -> Round {

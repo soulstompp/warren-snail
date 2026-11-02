@@ -479,3 +479,147 @@ fn with_no_host_its_own_file_takes_the_pages() {
     assert_eq!(seen, B as u64);
     assert!(a.round().spill_pages_written > 0);
 }
+
+/// A round's Parquet, as `warren-snail read` records it: one row, a value of a count's column.
+fn counted(round: &RecordBatch, column: &str) -> u64 {
+    use arrow::array::{Array, UInt64Array};
+    let c = round.column_by_name(column).unwrap();
+    let c = c.as_any().downcast_ref::<UInt64Array>().unwrap();
+    assert_eq!(c.len(), 1);
+    c.value(0)
+}
+
+/// `warren-snail read` of a question: its answer's rows and its round's row, or what it was refused.
+fn command_reads(
+    path: &Path,
+    name: &str,
+    sql: &str,
+    flags: &[&str],
+) -> Result<(usize, RecordBatch)> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let (q, answer, round) = (
+        tmp(&format!("handing-{name}.sql")),
+        tmp(&format!("handing-{name}-answer.parquet")),
+        tmp(&format!("handing-{name}-round.parquet")),
+    );
+    std::fs::write(&q, sql).unwrap();
+    let held: &[&str] = if cfg!(feature = "standalone") {
+        &["--hold", "0"]
+    } else {
+        &[]
+    };
+    let done = std::process::Command::new(env!("CARGO_BIN_EXE_warren-snail"))
+        .args([
+            "read",
+            path.to_str().unwrap(),
+            q.to_str().unwrap(),
+            "--out",
+            answer.to_str().unwrap(),
+            "--round",
+            round.to_str().unwrap(),
+        ])
+        .args(held)
+        .args(flags)
+        .output()
+        .unwrap();
+    if !done.status.success() {
+        return Err(Error::new(String::from_utf8_lossy(&done.stderr).trim()));
+    }
+    let batches = |p: &Path| {
+        ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(p).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect::<Vec<_>>()
+    };
+    let rows = batches(&answer).iter().map(|b| b.num_rows()).sum();
+    Ok((rows, batches(&round).remove(0)))
+}
+
+/// What the command recorded of a round is what the round was.
+fn recorded_as(recorded: &RecordBatch, r: &Round) {
+    use arrow::array::{Array, StringArray};
+    let order = recorded.column_by_name("order").unwrap();
+    let order = order.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(order.value(0), r.order);
+    for (column, value) in [
+        ("directory_pages", r.directory_pages),
+        ("column_pages_predicted", r.column_pages_predicted),
+        ("column_pages_held", r.column_pages_held),
+        ("column_pages_read", r.column_pages_read),
+        ("spill_pages_written", r.spill_pages_written),
+        ("spill_pages_read", r.spill_pages_read),
+        ("bytes_held", r.bytes_held),
+    ] {
+        assert_eq!(counted(recorded, column), value, "{column}");
+    }
+}
+
+/// `--handed` in a room reads as a host's round in that room does, its answer whole; a grouping whose
+/// groups pass the room among them, which stops where a round that does not count its answer goes on.
+#[test]
+fn the_command_reads_a_handed_round_as_its_host_does() {
+    let path = one("command");
+    let many = "SELECT id AS c1, count(*) AS c2 FROM s.b GROUP BY id";
+    for (name, sql, room, rows) in [
+        ("join", JOIN, 64u64 << 10, B as usize),
+        ("groups", many, 32 << 10, B as usize),
+    ] {
+        let snail = fresh(&path);
+        let mut a = begin_together(&[&snail], sql, Sizes::of(room)).unwrap();
+        assert_eq!(drained(&mut a).0.len(), rows);
+        let host = a.round();
+        assert!(host.spill_pages_written > 0, "{name}");
+        let bytes = room.to_string();
+        let flags = ["--room", bytes.as_str(), "--handed"];
+        let (answered, round) = command_reads(&path, name, sql, &flags).unwrap();
+        assert_eq!(answered, rows, "{name}");
+        recorded_as(&round, &host);
+        assert_eq!(counted(&round, "pages_held"), snail.pages_held(), "{name}");
+    }
+    // Two rooms: the groups a round not counting its answer holds, where a host's stops for them.
+    let at = |flags: &[&str]| command_reads(&path, "groups-at", many, flags).unwrap().1;
+    let room = (32u64 << 10).to_string();
+    let (plain, handed) = (at(&["--room", &room]), at(&["--room", &room, "--handed"]));
+    assert_ne!(
+        counted(&plain, "spill_pages_written"),
+        counted(&handed, "spill_pages_written"),
+    );
+}
+
+/// `--room` alone gives each round that room, as `Snail::size_rounds` does; a room is in bytes, and
+/// what a handed round cannot take is refused by name.
+#[test]
+fn the_command_gives_a_round_the_room_it_names() {
+    let path = one("command-room");
+    let room = 64u64 << 10;
+    let mut snail = fresh(&path);
+    snail.size_rounds(Sizes::of(room));
+    let (b, sized) = snail.ask(JOIN, None).unwrap();
+    assert!(sized.spill_pages_written > 0);
+    let (answered, round) =
+        command_reads(&path, "room", JOIN, &["--room", &room.to_string()]).unwrap();
+    assert_eq!(answered, b.num_rows());
+    recorded_as(&round, &sized);
+    // Unsized, nothing goes past it.
+    let (answered, round) = command_reads(&path, "unsized", JOIN, &[]).unwrap();
+    assert_eq!(answered, b.num_rows());
+    assert_eq!(counted(&round, "spill_pages_written"), 0);
+    for (flags, words) in [
+        (&["--room", "64MB"][..], "--room takes bytes"),
+        (
+            &["--handed", "--order", "a_pkey"][..],
+            "--order and --param are refused with --handed",
+        ),
+        (
+            &["--handed", "--param", "1"][..],
+            "--order and --param are refused with --handed",
+        ),
+    ] {
+        let said = command_reads(&path, "refused", JOIN, flags)
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains(words), "{flags:?}: {said}");
+    }
+}

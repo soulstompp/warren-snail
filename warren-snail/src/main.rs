@@ -14,7 +14,8 @@ use warren_snail::catalog::Catalog;
 use warren_snail::cut::PAGE;
 #[cfg(feature = "standalone")]
 use warren_snail::read::HELD_BYTES;
-use warren_snail::read::{Round, Snail, Snails};
+use warren_snail::read::{begin_together, Round, Snail, Snails};
+use warren_snail::room::Sizes;
 use warren_snail::write::write_parquet_in;
 use warren_snail::{Error, Result};
 
@@ -29,8 +30,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
                          [--host <command> --host-server <name>] [--applier <source>]
        warren-snail replica <file> [--of <source> | --clear]
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
-                         [--param <value>]... [--rounds <n>] [--hold <MiB>]
-                         [--round <round.parquet>] [--text] [--with <file>]...
+                         [--param <value>]... [--rounds <n>] [--hold <MiB>] [--room <bytes>]
+                         [--handed] [--round <round.parquet>] [--text] [--with <file>]...
        warren-snail out <file> --dir <directory>
        warren-snail blocks <file> --out <blocks.parquet>
        warren-snail census <file>
@@ -81,8 +82,11 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
   read    the question's answer, as Parquet. Prints each round: the order it read along, and the
           pages it predicted and read. --order names the order to read along; each --param gives
           the next of $1, $2 and on, as text. --rounds asks it again on the one open snail, which
-          holds the pages its rounds read, --hold MiB of them (128 unless given). --round records
-          each round as Parquet. --text writes each value of a time type, a scalar's and an
+          holds the pages its rounds read, --hold MiB of them (128 unless given). --room gives each
+          round that many bytes for its rows and the pages it keeps (128 MB unless given), the rows
+          past them written once and read back once. --handed reads it as a host hands it: what it
+          holds of its answer counted in that room, the round read whole before its answer comes,
+          --order and --param refused. --round records each round as Parquet. --text writes each value of a time type, a scalar's and an
           interval's, as PostgreSQL's output writes it, text exactly as the value. Each --with
           opens one more snail with <file>, each holding --hold MiB: every round reads one moment
           of them all, and a join of their tables reads each table from its own snail.
@@ -856,6 +860,26 @@ fn cmd_read(args: &[String]) -> Result<()> {
             "a round across several snails chooses its orders itself: --order is refused with --with",
         ));
     }
+    let sizes = match flag(args, "--room") {
+        Some(bytes) => bytes
+            .parse()
+            .map(Sizes::of)
+            .map_err(|_| Error::new("--room takes bytes"))?,
+        None => Sizes::default(),
+    };
+    let handed = args.iter().any(|a| a == "--handed");
+    if handed && (flag(args, "--order").is_some() || !params.is_empty()) {
+        return Err(Error::new(
+            "a round read as a host hands it chooses its orders itself and takes no parameters: \
+             --order and --param are refused with --handed",
+        ));
+    }
+    if !handed {
+        match &mut snail {
+            Opened::One(s) => s.size_rounds(sizes.clone()),
+            Opened::Several(s) => s.size_rounds(sizes.clone()),
+        }
+    }
     let mut first: Option<RecordBatch> = None;
     let mut done: Vec<Done> = Vec::new();
     for n in 1..=rounds {
@@ -869,6 +893,7 @@ fn cmd_read(args: &[String]) -> Result<()> {
             (snail.pages_read(), snail.pages_held())
         };
         let (answer, round) = match &mut snail {
+            opened if handed => ask_handed(opened, &sql, sizes.clone())?,
             Opened::One(s) => s.ask_with(&sql, flag(args, "--order"), &params)?,
             Opened::Several(s) => s.ask_with(&sql, &params)?,
         };
@@ -972,6 +997,12 @@ fn cmd_read(args: &[String]) -> Result<()> {
             ),
             ("column_pages_held", each(&|d| d.round.column_pages_held)),
             ("column_pages_read", each(&|d| d.round.column_pages_read)),
+            (
+                "spill_pages_written",
+                each(&|d| d.round.spill_pages_written),
+            ),
+            ("spill_pages_read", each(&|d| d.round.spill_pages_read)),
+            ("bytes_held", each(&|d| d.round.bytes_held)),
             ("pages_counted", each(&|d| d.counted)),
             ("pages_held", each(&|d| d.held)),
             ("rchar_bytes", each(&|d| d.bytes)),
@@ -1019,6 +1050,17 @@ fn cmd_read(args: &[String]) -> Result<()> {
         save(path, &batch)?;
     }
     Ok(())
+}
+
+/// A question read as a host hands it: one round in a room `sizes` gives, its answer taken whole.
+fn ask_handed(opened: &Opened, sql: &str, sizes: Sizes) -> Result<(RecordBatch, Round)> {
+    let snails: Vec<&Snail> = match opened {
+        Opened::One(s) => vec![s],
+        Opened::Several(s) => s.snails().iter().collect(),
+    };
+    let mut answering = begin_together(&snails, sql, sizes)?;
+    let answer = answering.whole()?;
+    Ok((answer, answering.round()))
 }
 
 /// The snails each `--with` names.
@@ -1145,6 +1187,14 @@ fn print_round(question: &str, d: &Done) {
                 "{e} predicted, {} of them held",
                 c.held
             ))
+        );
+    }
+    if r.spill_pages_written > 0 {
+        println!(
+            "    past its room: {} written, {} read back, {} bytes held at most",
+            n(r.spill_pages_written, "page"),
+            n(r.spill_pages_read, "page"),
+            r.bytes_held
         );
     }
     for (i, p) in r.snails.iter().enumerate() {

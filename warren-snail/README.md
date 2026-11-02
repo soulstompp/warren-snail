@@ -772,9 +772,11 @@ command's alone.
 - `replica <file> [--of <source> | --clear]`: the source the snail is marked a replica of; `--of`
   marks it, `--clear` clears it.
 - `read <file> <question.sql> --out <answer.parquet> [--order <name>] [--param <value>]...
-  [--rounds <n>] [--hold <MiB>] [--round <round.parquet>] [--text] [--with <file>]...`: the answer
-  as Parquet, and each round. `--text` writes each value of a time type, a scalar's and an
-  interval's, as PostgreSQL's output writes it.
+  [--rounds <n>] [--hold <MiB>] [--room <bytes>] [--handed] [--round <round.parquet>] [--text]
+  [--with <file>]...`: the answer as Parquet, and each round. `--room` gives each round that many
+  bytes for its rows and the pages it keeps, the rows past them written once and read back once.
+  `--handed` reads it as a host hands it, what it holds of its answer counted in that room. `--text`
+  writes each value of a time type, a scalar's and an interval's, as PostgreSQL's output writes it.
 - `out <file> --dir <directory>`: each table as Parquet.
 - `blocks <file> --out <blocks.parquet>`: each column of each block, as the directory holds it.
 - `census <file>`: every page of the file, named by the newest root, free, or waiting.
