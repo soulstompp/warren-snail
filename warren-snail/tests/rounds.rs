@@ -204,7 +204,7 @@ fn a_table_met_with_rows_made_before_it_is_kept_to_their_keys_in_each_place() {
         );
     }
     // A table a RIGHT JOIN keeps whole is never kept to the other side's keys: every node, four of
-    // them met.
+    // them met, read of the one column of its the question names.
     let right =
         "SELECT count(*), count(k.id) FROM (SELECT t.id FROM s.t t WHERE t.parent = 3000) k \
                  RIGHT JOIN s.t u ON u.parent = k.id";
@@ -224,7 +224,8 @@ fn a_table_met_with_rows_made_before_it_is_kept_to_their_keys_in_each_place() {
         "{right}"
     );
     assert_eq!(
-        round.reads[1].column_pages_predicted, table,
+        round.reads[1].column_pages_predicted,
+        table / 2,
         "{right}: {round:?}"
     );
 }
@@ -618,16 +619,16 @@ fn a_lateral_subquery_s_reads_are_the_round_s_and_kept_to_the_rows_before_it() {
     let (got, round) = asked(&path, q);
     assert_eq!(got, 4, "{q}");
     // Its table is read once, in its reads, kept to the two keys: the one block they lie in, one page
-    // of each of the two columns its words name.
+    // of the one column of its its words name.
     assert_eq!(round.reads.len(), 2, "{q}: {round:?}");
     assert_eq!(round.reads[1].blocks_read, 1, "{q}: {round:?}");
-    assert_eq!(round.reads[1].column_pages_predicted, 2, "{q}: {round:?}");
+    assert_eq!(round.reads[1].column_pages_predicted, 1, "{q}: {round:?}");
     // The same under a JOIN.
     let q = "SELECT sum(d.n) FROM (SELECT t.id FROM s.t t WHERE t.parent = 3000) k JOIN \
              LATERAL (SELECT count(*) AS n FROM s.t u WHERE u.parent = k.id) d ON true";
     let (got, round) = asked(&path, q);
     assert_eq!(got, 4, "{q}");
-    assert_eq!(round.reads[1].column_pages_predicted, 2, "{q}: {round:?}");
+    assert_eq!(round.reads[1].column_pages_predicted, 1, "{q}: {round:?}");
 }
 
 /// Every node, twice over, each a step of its own, 18 bytes a row.

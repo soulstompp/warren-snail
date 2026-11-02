@@ -287,6 +287,8 @@ pub struct Sort {
 #[non_exhaustive]
 pub struct Side {
     pub table: usize,
+    /// The name it goes by in the question: its alias, or its own without its schema.
+    pub(crate) goes_by: String,
     pub conds: Vec<Cond>,
     pub texts: Vec<TextCond>,
     /// Each column a condition keeps to its NULLs, IS NULL (true), or to its values, IS NOT NULL
@@ -1678,8 +1680,12 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
     let mut sides: Vec<Side> = from
         .tables
         .iter()
-        .map(|(ti, _)| Side {
+        .map(|(ti, alias)| Side {
             table: *ti,
+            goes_by: alias.clone().unwrap_or_else(|| {
+                let name = &catalog.tables[*ti].name;
+                name.rsplit('.').next().unwrap_or(name).to_string()
+            }),
             conds: Vec::new(),
             texts: Vec::new(),
             nulls: Vec::new(),

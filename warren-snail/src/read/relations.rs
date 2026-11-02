@@ -27,7 +27,7 @@ use sqlparser::ast::{
     JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
     SetQuantifier, TableAlias, TableFactor, TableWithJoins, Value as SqlValue,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Where the tables a question reads are read: one snail, or several opened together.
@@ -809,6 +809,23 @@ enum What {
 }
 
 impl Node {
+    /// Whether a USING or NATURAL of this node, or of one under it, meets the column at a place.
+    fn meets(&self, place: usize) -> bool {
+        match &self.what {
+            What::Join {
+                left,
+                right,
+                merged,
+                ..
+            } => {
+                merged.iter().any(|m| m.left == place || m.right == place)
+                    || left.meets(place)
+                    || right.meets(place)
+            }
+            _ => false,
+        }
+    }
+
     /// The relation a qualified star or a single name reads, where the node is one.
     fn leaf_named(&self) -> Option<&str> {
         match &self.what {
@@ -1416,6 +1433,14 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
     }
 }
 
+/// A word as a name: a bare word folded, a quoted one as it is.
+fn folded(w: &sqlparser::tokenizer::Word) -> String {
+    match w.quote_style {
+        Some(_) => w.value.clone(),
+        None => w.value.to_lowercase(),
+    }
+}
+
 /// The words of a text as sqlparser's tokenizer reads them: a bare word folded, a quoted one as it
 /// is.
 pub(super) fn words(text: &str) -> Vec<String> {
@@ -1424,14 +1449,79 @@ pub(super) fn words(text: &str) -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|t| match t {
-            sqlparser::tokenizer::Token::Word(w) => Some(match w.quote_style {
-                Some(_) => w.value,
-                None => w.value.to_lowercase(),
-            }),
+            sqlparser::tokenizer::Token::Word(w) => Some(folded(&w)),
             sqlparser::tokenizer::Token::Placeholder(p) => Some(p),
             _ => None,
         })
         .collect()
+}
+
+/// The columns a text can mean, as sqlparser's tokenizer reads it.
+#[derive(Default)]
+pub(super) struct Named {
+    /// Each name written alone, or after anything but a relation's name: any relation's of that
+    /// name. A label after AS and a relation's name before a dot are none.
+    bare: HashSet<String>,
+    /// Each name written after a relation's name: that relation's alone.
+    qualified: HashMap<String, HashSet<String>>,
+    /// Each relation written with a star: every column of it.
+    starred: HashSet<String>,
+    /// The tokenizer read none of it: any column.
+    unread: bool,
+}
+
+impl Named {
+    pub(super) fn of(text: &str) -> Named {
+        use sqlparser::keywords::Keyword;
+        use sqlparser::tokenizer::Token;
+        let mut named = Named::default();
+        let Ok(tokens) =
+            sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, text)
+                .tokenize()
+        else {
+            named.unread = true;
+            return named;
+        };
+        let tokens: Vec<Token> = tokens
+            .into_iter()
+            .filter(|t| !matches!(t, Token::Whitespace(_)))
+            .collect();
+        for (i, t) in tokens.iter().enumerate() {
+            let before = |n: usize| i.checked_sub(n).map(|k| &tokens[k]);
+            let dotted = matches!(before(1), Some(Token::Period));
+            let relation = match before(2) {
+                Some(Token::Word(q)) if dotted => Some(folded(q)),
+                _ => None,
+            };
+            match (t, relation) {
+                (Token::Mul, Some(q)) => {
+                    named.starred.insert(q);
+                }
+                (Token::Word(w), Some(q)) => {
+                    named.qualified.entry(q).or_default().insert(folded(w));
+                }
+                (Token::Word(w), None) => {
+                    let label = matches!(before(1), Some(Token::Word(x))
+                        if x.quote_style.is_none() && x.keyword == Keyword::AS);
+                    let qualifier = matches!(tokens.get(i + 1), Some(Token::Period));
+                    if !label && !qualifier {
+                        named.bare.insert(folded(w));
+                    }
+                }
+                _ => {}
+            }
+        }
+        named
+    }
+
+    /// Whether the text can mean a column of this name of the relation going by `qualifier`.
+    pub(super) fn names(&self, qualifier: Option<&str>, name: &str) -> bool {
+        self.unread
+            || self.bare.contains(name)
+            || qualifier.map(pipeline::unmarked).is_some_and(|q| {
+                self.starred.contains(q) || self.qualified.get(q).is_some_and(|n| n.contains(name))
+            })
+    }
 }
 
 /// What a place hands its rows on to, a chunk at a time, with the column holding its table's order
@@ -1442,8 +1532,8 @@ type Each<'e> = &'e mut dyn FnMut(Vec<Vec<Value>>, Option<usize>) -> Result<()>;
 struct Reading<'a> {
     reads: &'a dyn Reads,
     from: &'a From,
-    /// The words the step writes: a column none names is not read.
-    words: &'a [String],
+    /// What the step writes: a column it cannot mean is not read.
+    named: &'a Named,
     /// The conjuncts of its WHERE, which a table read alone or a join read as C1's takes where it
     /// reads them.
     wheres: Vec<&'a Expr>,
@@ -1518,10 +1608,13 @@ impl Accrued {
 }
 
 impl Reading<'_> {
-    /// Whether a column at a place is one the step names, by its name or by its place.
+    /// Whether a column at a place is one the step can mean, by its name or by its place, or one a
+    /// USING or NATURAL meets.
     fn needed(&self, place: usize) -> bool {
         let c = &self.from.columns[place];
-        self.words.contains(&c.name) || self.words.contains(&format!("{MERGED}{place}"))
+        self.named.names(c.qualifier.as_deref(), &c.name)
+            || self.named.names(None, &format!("{MERGED}{place}"))
+            || self.from.items.iter().any(|n| n.meets(place))
     }
 
     /// The conjuncts of WHERE a table read alone may take: those that name no other relation's
@@ -1897,7 +1990,7 @@ impl Reading<'_> {
             let t = &catalog.tables[*table];
             let names: Vec<String> = stored(t).map(|c| t.columns[c].name.clone()).collect();
             for p in l.at..l.at + l.width {
-                if self.needed(p) || self.merges(node, p) {
+                if self.needed(p) {
                     wanted.push((p, qualifier.clone(), names[p - l.at].clone()));
                 }
             }
@@ -2039,31 +2132,7 @@ impl Reading<'_> {
         if !self.reads.strand_wins(&q, &strand)? {
             return Ok(None);
         }
-        Ok(Some(Along {
-            node,
-            strand,
-            at,
-        }))
-    }
-
-    /// Whether a column at a place is one a USING of the node merges, read so its merged column can
-    /// be made.
-    fn merges(&self, node: &Node, place: usize) -> bool {
-        match &node.what {
-            What::Join {
-                left,
-                right,
-                merged,
-                ..
-            } => {
-                merged
-                    .iter()
-                    .any(|m| (m.left == place || m.right == place) && self.needed(m.at))
-                    || self.merges(left, place)
-                    || self.merges(right, place)
-            }
-            _ => false,
-        }
+        Ok(Some(Along { node, strand, at }))
     }
 
     /// A join of tables as the question path reads it, each USING written as its ON: none where it
@@ -3268,7 +3337,7 @@ fn ties<'e>(
 fn read_from(
     asked: Asked,
     from: &From,
-    words: &[String],
+    named: &Named,
     wheres: Vec<&Expr>,
     casings: &Casings,
     types: &typed::Types,
@@ -3287,7 +3356,7 @@ fn read_from(
     let mut reading = Reading {
         reads: asked.reads,
         from,
-        words,
+        named,
         wheres,
         params: asked.params,
         release: asked.release,
@@ -3576,7 +3645,7 @@ fn select_step(
         .chain(step.laterals.iter().map(|(q, _)| q.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
-    let ws = words(&text);
+    let named = Named::of(&text);
     let mut wheres = Vec::new();
     if let SetExpr::Select(s) = step.query.body.as_ref() {
         if let Some(w) = &s.selection {
@@ -3732,7 +3801,7 @@ fn select_step(
                         read_from(
                             asked,
                             &from,
-                            &ws,
+                            &named,
                             wheres.clone(),
                             casings,
                             &run_types,
@@ -3789,7 +3858,7 @@ fn select_step(
                 true => read_from(
                     asked,
                     &from,
-                    &ws,
+                    &named,
                     wheres,
                     casings,
                     &run_types,
@@ -3808,7 +3877,7 @@ fn select_step(
                     read_from(
                         asked,
                         &from,
-                        &ws,
+                        &named,
                         wheres,
                         casings,
                         &run_types,
@@ -4143,5 +4212,76 @@ pub(super) fn join_on(j: &JoinOperator) -> Option<&Expr> {
         | JoinOperator::RightOuter(JoinConstraint::On(e))
         | JoinOperator::FullOuter(JoinConstraint::On(e)) => Some(e),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Named;
+    use crate::read::pipeline::{MERGED, OUTER};
+
+    #[test]
+    fn a_name_after_a_relation_s_name_is_that_relation_s_alone() {
+        let n = Named::of("SELECT a.id, b . /* a comment */ v, s.c.w FROM a");
+        assert!(n.names(Some("a"), "id"));
+        assert!(!n.names(Some("b"), "id"));
+        assert!(!n.names(None, "id"));
+        assert!(n.names(Some("b"), "v"));
+        assert!(!n.names(Some("a"), "v"));
+        // A schema's name stands before a relation's.
+        assert!(n.names(Some("c"), "w"));
+        assert!(!n.names(Some("s"), "w"));
+        // Its mark is no part of the name it goes by.
+        assert!(n.names(Some(&format!("{MERGED}a")), "id"));
+        assert!(n.names(Some(&format!("{OUTER}a")), "id"));
+    }
+
+    #[test]
+    fn a_name_alone_is_every_relation_s_and_a_label_or_a_qualifier_is_none() {
+        let n = Named::of("SELECT id, x AS y, CAST(z AS t), q.r, (u).f, \"as\" FROM a AS d");
+        assert!(n.names(Some("a"), "id"));
+        assert!(n.names(Some("b"), "id"));
+        assert!(n.names(None, "id"));
+        assert!(n.names(Some("b"), "x"));
+        assert!(!n.names(Some("b"), "y"));
+        assert!(!n.names(Some("b"), "d"));
+        assert!(!n.names(Some("b"), "t"));
+        assert!(!n.names(Some("b"), "q"));
+        // What follows anything but a relation's name counts as a name alone.
+        assert!(n.names(Some("b"), "f"));
+        assert!(n.names(Some("b"), "u"));
+        // AS only where it is the keyword.
+        assert!(n.names(Some("b"), "as"));
+        let n = Named::of("SELECT \"as\" y");
+        assert!(n.names(Some("b"), "y"));
+    }
+
+    #[test]
+    fn a_name_is_folded_where_it_is_bare_and_kept_where_it_is_quoted() {
+        let n = Named::of("SELECT A.ID, \"B\".\"V\", c.\"W\", D FROM t");
+        assert!(n.names(Some("a"), "id"));
+        assert!(!n.names(Some("A"), "id"));
+        assert!(n.names(Some("B"), "V"));
+        assert!(!n.names(Some("b"), "V"));
+        assert!(!n.names(Some("B"), "v"));
+        assert!(n.names(Some("c"), "W"));
+        assert!(!n.names(Some("c"), "w"));
+        assert!(n.names(Some("x"), "d"));
+        assert!(!n.names(Some("x"), "D"));
+    }
+
+    #[test]
+    fn a_star_after_a_relation_s_name_is_every_column_of_it_and_any_other_star_none() {
+        let n = Named::of("SELECT a.*, count(*), 2 * x.y FROM t");
+        assert!(n.names(Some("a"), "anything"));
+        assert!(!n.names(Some("b"), "anything"));
+        assert!(!n.names(None, "anything"));
+    }
+
+    #[test]
+    fn a_text_the_tokenizer_does_not_read_may_mean_any_column() {
+        let n = Named::of("SELECT 'open");
+        assert!(n.names(Some("a"), "id"));
+        assert!(n.names(None, "id"));
     }
 }

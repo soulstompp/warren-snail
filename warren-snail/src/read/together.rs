@@ -602,7 +602,7 @@ pub fn price_stopped(snails: &[&Snail], sql: &str, priced: &Priced, room: u64) -
         &sqlparser::dialect::PostgreSqlDialect {},
         &spelled::spelled(sql)?,
     )?;
-    let names = relations::words(
+    let named = relations::Named::of(
         &parsed
             .iter()
             .map(ToString::to_string)
@@ -618,6 +618,7 @@ pub fn price_stopped(snails: &[&Snail], sql: &str, priced: &Priced, room: u64) -
         if q.nullable(side) {
             own = question::Side {
                 table: t,
+                goes_by: own.goes_by,
                 conds: Vec::new(),
                 texts: Vec::new(),
                 nulls: Vec::new(),
@@ -626,7 +627,7 @@ pub fn price_stopped(snails: &[&Snail], sql: &str, priced: &Priced, room: u64) -
             };
         }
         let mut columns: Vec<usize> = relations::stored(table)
-            .filter(|&c| names.contains(&table.columns[c].name))
+            .filter(|&c| named.names(Some(&q.sides[side].goes_by), &table.columns[c].name))
             .collect();
         if columns.is_empty() {
             columns.extend(relations::stored(table).next());

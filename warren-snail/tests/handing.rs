@@ -665,9 +665,9 @@ fn a_round_stopped_for_its_room_reads_no_more_than_the_most_its_price_gives() {
     let outer = "SELECT a.id AS c1, b.v AS c2 FROM s.a a LEFT JOIN s.b b ON b.a_id = a.id";
     for (q, read_again) in [
         (JOIN, 184),
-        (by_name, 133),
+        (by_name, 86),
         (by_group, 173),
-        (outer, 160),
+        (outer, 113),
         ("SELECT id AS c1, count(*) AS c2 FROM s.b GROUP BY id", 79),
         ("SELECT g AS c1, count(*) AS c2 FROM s.a GROUP BY g", 12),
     ] {
