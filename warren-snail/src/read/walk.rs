@@ -5,12 +5,12 @@ use super::answer::{same, Answer, Cell, Dict, Text};
 use super::question::{Cond, Countable, OpCond, Side, TextCond};
 use super::{Snail, Wasted};
 use crate::catalog::{ColumnType, Level, Order, Shape, Table};
+use crate::cut::PAGE;
 use crate::directory::{
     below_least, decode_page, decode_top, map_run_of, past_greatest, Entry, Head, PageMap, Summary,
     Tail,
 };
 use crate::encode::decode_leaf_with;
-use crate::cut::PAGE;
 use crate::file::Extent;
 use crate::places::{level_key, month_of, null_key, KeyValue};
 use crate::room::{HeldIn, Room};
@@ -443,8 +443,7 @@ fn leaf_pages(
     };
     let fits = |p: usize| {
         pages[p].first_row < map.sorted
-            && (!interval_may
-                || (!walk.past(&pages[p].first[..m]) && !walk.before(&next(p)[..m])))
+            && (!interval_may || (!walk.past(&pages[p].first[..m]) && !walk.before(&next(p)[..m])))
             && (j == 0
                 || keys
                     .unwrap()
@@ -792,7 +791,10 @@ impl Snail {
         walk.rows_low = 0;
         walk.rows_high = 0;
         for o in open {
-            let ends = o.ends.as_ref().expect("an entry above the blocks keeps its last key");
+            let ends = o
+                .ends
+                .as_ref()
+                .expect("an entry above the blocks keeps its last key");
             let entries = decode_page(
                 &self.reader.read_extent(o.child)?,
                 &walk.head,
@@ -813,8 +815,8 @@ impl Snail {
     /// is known from the maps, so there every block's is read now.
     pub(super) fn predict(&self, mut walk: Walk, want: &Want) -> Result<Plan> {
         let table = want.side.table;
-        let maps_now =
-            self.writer.is_some() || self.reader.held_under(super::order_tag(table, walk.order)) > 0;
+        let maps_now = self.writer.is_some()
+            || self.reader.held_under(super::order_tag(table, walk.order)) > 0;
         let mut written: Vec<u64> = match maps_now {
             true => vec![0; walk.whole_bytes.len()],
             false => walk.whole_bytes.clone(),
@@ -980,7 +982,9 @@ impl Snail {
             let pages = disk_pages(&map, &reads).count() as u64;
             br.pages = pages as u32;
             column_pages += pages;
-            plan.walk.held.more(block_held(&br) - std::mem::size_of::<BlockRead>() as u64);
+            plan.walk
+                .held
+                .more(block_held(&br) - std::mem::size_of::<BlockRead>() as u64);
             kept.push(br);
         }
         maps.last = None;
@@ -2035,7 +2039,10 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let (pages, share) = if at_blocks {
         if !by_keys {
             for &s in &reading.slots {
-                let (sum, text) = (&e.columns[s], walk.head.text_slots.iter().position(|&t| t as usize == s));
+                let (sum, text) = (
+                    &e.columns[s],
+                    walk.head.text_slots.iter().position(|&t| t as usize == s),
+                );
                 let values = u64::from(e.rows.saturating_sub(sum.nulls));
                 walk.whole_bytes[s] += match (text, walk.widths[s]) {
                     (Some(t), _) => u64::from(e.bytes[t]) + 4 * values,
@@ -2106,7 +2113,12 @@ fn outside_bounds(walk: &Walk, e: &Entry, order: &Order, table: &Table) -> bool 
         let Some(slot) = order.leaf_slot(table, c) else {
             break;
         };
-        let Some(k) = walk.head.bound_slots.iter().position(|&b| b as usize == slot) else {
+        let Some(k) = walk
+            .head
+            .bound_slots
+            .iter()
+            .position(|&b| b as usize == slot)
+        else {
             continue;
         };
         if e.columns[slot].nulls > 0 {

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use warren_snail::catalog::Catalog;
 use warren_snail::read::{
-    answer_together, begin_together, price_together, Answering, Round, Snail,
+    answer_together, begin_together, price_stopped, price_together, Answering, Round, Snail,
 };
 use warren_snail::room::{RoundFile, RoundFiles, Sizes};
 use warren_snail::values::{push_datum, Values};
@@ -648,4 +648,61 @@ fn the_command_gives_a_round_the_room_it_names() {
             .to_string();
         assert!(said.contains(words), "{flags:?}: {said}");
     }
+}
+
+/// A round that stops for its room reads a side again, and its price's most counts that: at every room
+/// from one that stops before its first side to one that never stops, its pages lie between the fewest
+/// and the most.
+#[test]
+fn a_round_stopped_for_its_room_reads_no_more_than_the_most_its_price_gives() {
+    let path = one("stopped");
+    let snails = opened(&[&path]);
+    let refs: Vec<&Snail> = snails.iter().collect();
+    let by_group = "SELECT b.id AS c1, count(*) AS c2 FROM s.a a JOIN s.b b ON b.a_id = a.id \
+                    GROUP BY b.id";
+    let by_name = "SELECT a.g AS c1, count(*) AS c2 FROM s.a a JOIN s.b b ON b.a_id = a.id \
+                   GROUP BY a.g";
+    let outer = "SELECT a.id AS c1, b.v AS c2 FROM s.a a LEFT JOIN s.b b ON b.a_id = a.id";
+    for (q, read_again) in [
+        (JOIN, 184),
+        (by_name, 133),
+        (by_group, 173),
+        (outer, 160),
+        ("SELECT id AS c1, count(*) AS c2 FROM s.b GROUP BY id", 79),
+        ("SELECT g AS c1, count(*) AS c2 FROM s.a GROUP BY g", 12),
+    ] {
+        let priced = price_together(&refs, q).unwrap();
+        let (low, high, _) = priced.column_pages();
+        let stopped = price_stopped(&refs, q, &priced).unwrap();
+        let most = stopped.column_pages_most;
+        assert!(most >= high, "{q}: {most} under {high}");
+        let mut worst = 0;
+        for room in [4u64, 8, 16, 32, 64, 128, 192, 256, 512, 1024, 128 << 10].map(|k| k << 10) {
+            let mut a = begin_together(&refs, q, Sizes::of(room)).unwrap();
+            let _ = drained(&mut a);
+            let r = a.round();
+            assert!(
+                low <= r.column_pages_predicted && r.column_pages_predicted <= most,
+                "{q} in {room}: {low} to {most}, {} predicted",
+                r.column_pages_predicted
+            );
+            assert_eq!(
+                r.column_pages_read,
+                r.column_pages_predicted - r.column_pages_held,
+                "{q} in {room}"
+            );
+            worst = worst.max(r.column_pages_predicted);
+        }
+        // The most any of these rooms read: past `high`, where a side was read again.
+        assert_eq!(worst, read_again, "{q}");
+    }
+    // A join met as it reads stops before its last side: the one read again is its first, exactly.
+    let priced = price_together(&refs, JOIN).unwrap();
+    assert_eq!(priced.column_pages().1, 162);
+    assert_eq!(
+        price_stopped(&refs, JOIN, &priced)
+            .unwrap()
+            .column_pages_most,
+        184
+    );
 }

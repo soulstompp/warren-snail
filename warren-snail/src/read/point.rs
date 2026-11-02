@@ -261,7 +261,7 @@ impl Snail {
             order: table.orders[part.plan.walk.order].name.clone(),
             levels,
             unique: order.unique && levels == order.levels.len(),
-            directory_pages: self.touched() - before,
+            directory_pages: self.touched() - before + part.plan.map_pages,
             column_pages: part.plan.column_pages,
             rows_low: part.rows.0,
             rows_high: part.rows.1,

@@ -1371,7 +1371,7 @@ fn carried_of(ty: Option<ColumnType>) -> Carried {
 }
 
 /// The columns a table stores: a step computes each virtual one from them.
-fn stored(table: &Table) -> impl Iterator<Item = usize> + '_ {
+pub(super) fn stored(table: &Table) -> impl Iterator<Item = usize> + '_ {
     (0..table.columns.len()).filter(|&c| !table.columns[c].is_virtual())
 }
 

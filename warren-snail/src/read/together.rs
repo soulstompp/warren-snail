@@ -377,6 +377,8 @@ pub struct TablePrice {
     /// Whether it is kept to the keys of a table read before it, its walk narrowed by them.
     pub kept: bool,
     pub directory_pages: u64,
+    /// The directory pages a round goes on to read of the maps of the blocks it reaches.
+    pub map_pages: u64,
     pub column_pages_low: u64,
     pub column_pages_high: u64,
     pub column_pages_estimate: u64,
@@ -405,6 +407,11 @@ impl Priced {
     /// column pages.
     pub fn directory_pages(&self) -> u64 {
         self.tables.iter().map(|t| t.directory_pages).sum()
+    }
+
+    /// The directory pages a round goes on to read of the maps of the blocks it reaches.
+    pub fn map_pages(&self) -> u64 {
+        self.tables.iter().map(|t| t.map_pages).sum()
     }
 
     pub fn column_pages(&self) -> (u64, u64, u64) {
@@ -444,6 +451,7 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
                 order: p.order,
                 kept: false,
                 directory_pages: p.directory_pages,
+                map_pages: p.map_pages,
                 column_pages_low: p.column_pages,
                 column_pages_high: p.column_pages,
                 column_pages_estimate: p.column_pages,
@@ -514,6 +522,7 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
             },
             kept: point.is_some(),
             directory_pages: snail.touched() - before,
+            map_pages: part.plan.map_pages,
             column_pages_low: low,
             column_pages_high: own,
             column_pages_estimate: estimate,
@@ -530,4 +539,94 @@ pub fn price_together(snails: &[&Snail], sql: &str) -> Result<Priced> {
         });
     }
     Ok(Priced { tables: out })
+}
+
+/// The most a round priced so reads where it may stop for its room, and the directory pages this
+/// pricing read: a round stopped reads what it has read already again, a pipeline over its tables
+/// taking it up, and that reads of each table the columns the question names alike.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stopped {
+    pub column_pages_most: u64,
+    pub directory_pages: u64,
+}
+
+/// What a question on the tables of snails read together reads at most where its round stops for its
+/// room. Each table it may read before it stops, at the most `priced` gives; then each table as the
+/// pipeline reads it, by the columns the question names and its own conditions where no outer join
+/// may leave it NULL, at the fewest pages of its orders, no key keeping it. The last table a join
+/// meets as it reads is never read before a stop, where the round is no grouping, and a question that
+/// orders its join goes to the pipeline first.
+pub fn price_stopped(snails: &[&Snail], sql: &str, priced: &Priced) -> Result<Stopped> {
+    let (catalog, tables_at) = Snails::merged(snails, &|i| shown(snails, i))?;
+    let q = question::parse(&catalog, sql)?;
+    let at: Vec<(usize, usize)> = q.sides.iter().map(|s| tables_at[s.table]).collect();
+    let tables: Vec<&Table> = at
+        .iter()
+        .map(|&(s, t)| &snails[s].catalog.tables[t])
+        .collect();
+    let grouped = matches!(q.select, question::Select::Groups { .. });
+    let order = read_order(&q, &tables);
+    let (_, stream) = core_of(&q, &order);
+    let last = *order.last().unwrap();
+    let meets_as_it_reads = stream && q.sides.len() > 1 && !grouped;
+    let before_a_stop = grouped || (q.order.is_empty() && q.sides.len() > 1);
+    let mut first = 0u64;
+    if before_a_stop {
+        for t in &priced.tables {
+            if !(meets_as_it_reads && t.side == last) {
+                first += t.column_pages_high;
+            }
+        }
+    }
+    let parsed = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        &*spelled::spelled(sql)?,
+    )?;
+    let names = relations::words(
+        &parsed
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let mut most = first;
+    let mut directory_pages = 0;
+    for (side, &(s, t)) in at.iter().enumerate() {
+        let snail = snails[s];
+        let table = &snail.catalog.tables[t];
+        let mut own = q.sides[side].clone();
+        own.table = t;
+        if q.nullable(side) {
+            own = question::Side {
+                table: t,
+                conds: Vec::new(),
+                texts: Vec::new(),
+                nulls: Vec::new(),
+                empty: false,
+                ops: Vec::new(),
+            };
+        }
+        let mut columns: Vec<usize> = relations::stored(table)
+            .filter(|&c| names.contains(&table.columns[c].name))
+            .collect();
+        if columns.is_empty() {
+            columns.extend(relations::stored(table).next());
+        }
+        let want = Want {
+            table,
+            side: &own,
+            columns,
+            countable: None,
+            keys: None,
+        };
+        let before = snail.touched();
+        let part = snail.part(&want, None)?;
+        directory_pages += snail.touched() - before;
+        most += part.plan.column_pages;
+    }
+    Ok(Stopped {
+        column_pages_most: most.max(priced.column_pages().1),
+        directory_pages,
+    })
 }

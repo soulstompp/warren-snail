@@ -49,7 +49,8 @@ pub use out::{TableOut, DDL_KEY, MONETARY_KEY, RELEASE_KEY};
 pub use pipeline::{numeric_text, Value};
 pub use point::Point;
 pub use together::{
-    answer_together, at_one_moment, begin_together, price_together, Answering, Priced, TablePrice,
+    answer_together, at_one_moment, begin_together, price_stopped, price_together, Answering,
+    Priced, Stopped, TablePrice,
 };
 
 /// An answer's rows as values, as a pipeline reads them.

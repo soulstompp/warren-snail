@@ -371,7 +371,9 @@ fn level_bytes(v: &KeyValue) -> Option<&[u8]> {
 /// them are the same, capped at 64; text at a character's end.
 fn end_kept(v: &KeyValue, other: Option<&KeyValue>) -> Option<usize> {
     let bytes = level_bytes(v)?;
-    let parted = other.and_then(level_bytes).map_or(0, |o| common(bytes, o) + 1);
+    let parted = other
+        .and_then(level_bytes)
+        .map_or(0, |o| common(bytes, o) + 1);
     let kept = parted.clamp(BOUND_LEAST, BOUND_MOST);
     let at = match v {
         KeyValue::Text(s) => {
@@ -379,7 +381,10 @@ fn end_kept(v: &KeyValue, other: Option<&KeyValue>) -> Option<usize> {
             match up {
                 Some(j) if j <= BOUND_MOST => j,
                 _ if kept >= s.len() => kept,
-                _ => (0..=kept).rev().find(|&j| s.is_char_boundary(j)).unwrap_or(0),
+                _ => (0..=kept)
+                    .rev()
+                    .find(|&j| s.is_char_boundary(j))
+                    .unwrap_or(0),
             }
         }
         _ => kept,
@@ -475,7 +480,6 @@ pub fn separate(
     lower: Option<&[KeyValue]>,
     upper: Option<(&[KeyValue], bool)>,
 ) {
-
     let n = entries.len();
     if n == 0 {
         return;
@@ -600,7 +604,9 @@ impl Entry {
 
     /// Whether a column's least and greatest take more than 8 bytes to part.
     fn has_tails(&self) -> bool {
-        self.tails.iter().any(|t| !t.lo.is_empty() || !t.hi.is_empty())
+        self.tails
+            .iter()
+            .any(|t| !t.lo.is_empty() || !t.hi.is_empty())
     }
 
     /// What it keeps past the first 8 bytes of the `k`-th column the head's `bound_slots` list.
@@ -1970,7 +1976,7 @@ mod tests {
         let mut sum = Summary::default();
         let tail = bounds_of(&mut sum, &a, &z);
         assert_eq!((tail.lo.len(), tail.hi.len()), (7, 7));
-        assert!(past_greatest(&sum, &tail, b"abcdefghijklmnZ!!z"[..14].iter().chain(b"[").copied().collect::<Vec<_>>().as_slice()));
+        assert!(past_greatest(&sum, &tail, b"abcdefghijklmn["));
         assert!(!past_greatest(&sum, &tail, b"abcdefghijklmnZzzzz"));
         // 8 bytes part them: nothing past them is kept, and nothing grows.
         let tail = bounds_of(&mut sum, b"abcdefgA-long", b"abcdefgZ-long");
@@ -1991,7 +1997,10 @@ mod tests {
                     let mut tail = bounds_of(&mut sum, a, z);
                     let kept = tail.lo.len().max(tail.hi.len());
                     bounds_widened(&mut sum, &mut tail, key);
-                    assert!(tail.lo.len().max(tail.hi.len()) <= kept, "{a:?} {z:?} {key:?}");
+                    assert!(
+                        tail.lo.len().max(tail.hi.len()) <= kept,
+                        "{a:?} {z:?} {key:?}"
+                    );
                     let (lo, hi) = (a.min(key), z.max(key));
                     for v in values.iter().filter(|v| *v >= lo && *v <= hi) {
                         assert!(
@@ -2066,8 +2075,14 @@ mod tests {
         }
         // The rule's figures: 8 bytes where they part, as long as it takes where they do not, 64 at most.
         let t = |s: &str| vec![KeyValue::Text(s.into())];
-        assert_eq!(cut_below(&t("abcdefghijkl"), &t("abcdefgzijkl")), t("abcdefgh"));
-        assert_eq!(cut_below(&t("sharedxxx1234"), &t("sharedxxx9999")), t("sharedxxx1"));
+        assert_eq!(
+            cut_below(&t("abcdefghijkl"), &t("abcdefgzijkl")),
+            t("abcdefgh")
+        );
+        assert_eq!(
+            cut_below(&t("sharedxxx1234"), &t("sharedxxx9999")),
+            t("sharedxxx1")
+        );
         assert_eq!(
             cut_above(&t("sharedxxx9999"), &t("sharedxxx1234")),
             (t("sharedxxx:"), true)
@@ -2090,10 +2105,22 @@ mod tests {
         // Past a level they part on, 8 bytes a level.
         assert_eq!(
             cut_below(&two("a", "abcdefghijA"), &two("b", "abcdefghijZ")),
-            vec![KeyValue::Text("a".into()), KeyValue::Text("abcdefgh".into())]
+            vec![
+                KeyValue::Text("a".into()),
+                KeyValue::Text("abcdefgh".into())
+            ]
         );
         // Text is cut at a character's end, and past the last character there is nothing.
         assert_eq!(cut_below(&t("aaaaaaaéb"), &t("aaaaaaaéc")), t("aaaaaaaéb"));
+        // Written across neighbouring blocks, the order's greatest end is that bound, read as open.
+        let mut ends = vec![block(1, 3, 50), block(2, 3, 51)];
+        ends[0].first = t("sharedxxx1234");
+        ends[0].last = t("sharedxxx4");
+        ends[1].first = t("sharedxxx5");
+        ends[1].last = t("sharedxxx9999");
+        separate(&mut ends, &[1 | BITS_LEVEL], None, None);
+        assert_eq!(ends[0].first, t("sharedxxx1"));
+        assert_eq!((ends[1].last.clone(), ends[1].open), (t("sharedxxx:"), true));
         assert_eq!(text_past("\u{D7FF}"), Some("\u{E000}".into()));
         assert_eq!(text_past("a\u{10FFFF}"), Some("b".into()));
         assert_eq!(text_past("\u{10FFFF}"), None);

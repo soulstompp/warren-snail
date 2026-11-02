@@ -2049,14 +2049,7 @@ impl Snail {
                 }
                 replaced.insert(path, entries);
             }
-            settle(
-                &mut top,
-                &mut Vec::new(),
-                &replaced,
-                w,
-                &mut gone,
-                &head,
-            )?;
+            settle(&mut top, &mut Vec::new(), &replaced, w, &mut gone, &head)?;
             gone.push(root.orders[at].2);
             let (bytes, _) = build_from(head, top.entries, top.height, &mut |x| w.place(x))?;
             root.orders[at].2 = w.place(&bytes)?;
@@ -2470,14 +2463,7 @@ impl Snail {
             }
         }
         let mut path = Vec::new();
-        settle(
-            &mut top,
-            &mut path,
-            &replaced,
-            w,
-            &mut Vec::new(),
-            &head,
-        )?;
+        settle(&mut top, &mut path, &replaced, w, &mut Vec::new(), &head)?;
         let (bytes, _) = build_from(head, top.entries, top.height, &mut |b| w.place(b))?;
         let extent = w.place(&bytes)?;
         self.root.orders[at].2 = extent;

@@ -142,8 +142,16 @@ fn past_the_room_a_read_in_part_lets_its_maps_go_and_reads_them_again_when_it_re
     exact(KEPT, &small);
     assert_eq!(b.num_rows(), answer.num_rows());
     assert_eq!(
-        (small.order.as_str(), small.column_pages_predicted, small.blocks_read),
-        (whole.order.as_str(), whole.column_pages_predicted, whole.blocks_read),
+        (
+            small.order.as_str(),
+            small.column_pages_predicted,
+            small.blocks_read
+        ),
+        (
+            whole.order.as_str(),
+            whole.column_pages_predicted,
+            whole.blocks_read
+        ),
         "{small:?}"
     );
     // Each read again is known before it is read, counted among the directory pages, and read from
@@ -160,6 +168,37 @@ fn past_the_room_a_read_in_part_lets_its_maps_go_and_reads_them_again_when_it_re
     let (_, r) = none.ask(KEPT, None).unwrap();
     exact(KEPT, &r);
     assert!(r.directory_pages >= small.directory_pages, "{r:?}");
+}
+
+#[test]
+fn a_sample_reads_the_maps_of_the_blocks_its_rows_lie_in() {
+    let (path, _) = shop("sample");
+    let q = "SELECT b.id, b.v FROM s.b b";
+    let snail = fresh(&path);
+    let before = snail.pages_read();
+    let (mut scan, live) = snail
+        .sample(q, 30, &mut {
+            let mut x = 0.25f64;
+            move || {
+                x = (x * 1.618_033_988_749).fract();
+                x
+            }
+        })
+        .unwrap();
+    assert_eq!(live as i64, N);
+    let mut rows = 0;
+    while let Some(b) = snail.next_block(&mut scan).unwrap() {
+        rows += b.num_rows();
+    }
+    let r = scan.round();
+    assert_eq!(rows, 30);
+    assert_eq!(r.directory_pages, r.directory_pages_predicted, "{r:?}");
+    assert_eq!(r.column_pages_read, r.column_pages_predicted, "{r:?}");
+    assert_eq!(
+        snail.pages_read() - before,
+        r.directory_pages + r.column_pages_read,
+        "{r:?}"
+    );
 }
 
 #[test]
@@ -193,5 +232,8 @@ fn a_scan_handed_out_a_block_at_a_time_keeps_its_plan_to_the_room_its_snail_give
     assert_eq!(r.directory_pages, w.index_pages + w.map_pages, "{r:?}");
     assert_eq!(r.directory_pages, r.directory_pages_predicted, "{r:?}");
     assert_eq!(r.column_pages_read, r.column_pages_predicted, "{r:?}");
-    assert_eq!(snail.pages_read() - before, r.directory_pages + r.column_pages_read);
+    assert_eq!(
+        snail.pages_read() - before,
+        r.directory_pages + r.column_pages_read
+    );
 }

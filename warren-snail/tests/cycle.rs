@@ -606,7 +606,11 @@ fn an_order_keyed_by_its_bytes_rules_out_a_literal_past_either_end() {
     assert_eq!((weather::one(&b), round.blocks_read), (1, 1));
     for v in ["sharedxxxxxx9", "sharedxxxxx", "sharedxxxxxw"] {
         let (b, round) = snail.ask(&q(v), None).unwrap();
-        assert_eq!((weather::one(&b), round.blocks_read), (0, 0), "{v}: {round:?}");
+        assert_eq!(
+            (weather::one(&b), round.blocks_read),
+            (0, 0),
+            "{v}: {round:?}"
+        );
     }
     // A range past either end reads none, and one across the last reads what it holds.
     let (b, round) = snail
@@ -616,7 +620,10 @@ fn an_order_keyed_by_its_bytes_rules_out_a_literal_past_either_end() {
         )
         .unwrap();
     assert_eq!((weather::one(&b), round.blocks_read), (0, 0), "{round:?}");
-    let q = format!("SELECT count(*) FROM s.t t WHERE t.t >= '{}'", code(ROWS - 1));
+    let q = format!(
+        "SELECT count(*) FROM s.t t WHERE t.t >= '{}'",
+        code(ROWS - 1)
+    );
     let (b, round) = snail.ask(&q, None).unwrap();
     assert_eq!((weather::one(&b), round.blocks_read), (1, 1), "{round:?}");
 }
@@ -663,7 +670,10 @@ fn a_row_written_past_a_block_s_bounds_is_found_and_they_keep_less() {
         vec![each(|i| i.to_string()), each(code)],
     );
     let q = |v: &str| format!("SELECT count(*) FROM s.t t WHERE t.t = '{v}'");
-    let (_, before) = Snail::open(&path).unwrap().ask(&q("sharedxxx00000005"), None).unwrap();
+    let (_, before) = Snail::open(&path)
+        .unwrap()
+        .ask(&q("sharedxxx00000005"), None)
+        .unwrap();
     assert_eq!(before.blocks_read, 1);
     let mut w = Snail::open_writing(&path).unwrap();
     w.execute("INSERT INTO s.t (k, t) VALUES (16384, 'sharedxxx00000005')")
@@ -675,4 +685,34 @@ fn a_row_written_past_a_block_s_bounds_is_found_and_they_keep_less() {
     assert_eq!((weather::one(&b), round.blocks_read), (2, 2), "{round:?}");
     let (b, round) = snail.ask(&q(&code(16_000)), None).unwrap();
     assert_eq!((weather::one(&b), round.blocks_read), (1, 1), "{round:?}");
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_key_written_at_the_order_s_greatest_end_is_found() {
+    // Two keys sharing their first 9 bytes, past 10: the order's greatest end is the bound past what
+    // the last keeps, under which every key sorts. A key written at that bound passes it.
+    let path = tmp("cycle-end.snail");
+    let catalog = Catalog::parse("CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));").unwrap();
+    let ty = catalog.tables[0].columns[0].ty;
+    let mut v = Values::new(ty);
+    for t in ["aaaaaaaaaaX-long", "aaaaaaaaabY-long"] {
+        push_datum(&mut v, &warren_snail::composed::scalar_in(ty, t).unwrap());
+    }
+    write(
+        &path,
+        &catalog,
+        &[("s.t".into(), Rows { columns: vec![v] })],
+    )
+    .unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.t (t) VALUES ('aaaaaaaaac')")
+        .unwrap();
+    drop(w);
+    let q = "SELECT count(*) FROM s.t t WHERE t.t = 'aaaaaaaaac'";
+    let (b, _) = Snail::open(&path).unwrap().ask(q, None).unwrap();
+    assert_eq!(weather::one(&b), 1);
+    let q = "SELECT count(*) FROM s.t t";
+    let (b, _) = Snail::open(&path).unwrap().ask(q, None).unwrap();
+    assert_eq!(weather::one(&b), 3);
 }
