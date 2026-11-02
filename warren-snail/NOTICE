@@ -1,0 +1,250 @@
+warren-snail
+Copyright (C) Kenneth Allen Flegal
+
+warren-snail is licensed under the GNU General Public License, version 3 or (at your option) any
+later version: see LICENSE. Portions of it are translated from other people's code and stay under
+the notices below, each given whole.
+
+
+WHAT IS TRANSLATED, AND WHAT WAS DONE TO IT
+
+warren-snail answers as PostgreSQL does, so where PostgreSQL's own steps define the answer, its C
+source (releases 18.6 and 19 RC1) was translated into Rust, its steps kept in their order. Everywhere
+below, the nature of the modification is the same: the code is translated from C into Rust; memory
+and errors are Rust's (an error returned by value in PostgreSQL's words, where the C raises it);
+values cross in the crate's own forms (a date as days from 1970, a jsonb as its text); PostgreSQL's
+page layouts, memory contexts and catalog lookups are left out; and only the settings the snail
+answers under are read (DateStyle ISO, MDY; IntervalStyle postgres; TimeZone UTC unless the feature
+`zones` is on; lc_numeric and lc_time C). What differs from that is said beside the file.
+
+Under PostgreSQL's notice (src/ of this crate, from the sources named under PostgreSQL's tree):
+
+  numeric.rs, numeric/funcs.rs      utils/adt/numeric.c
+  times.rs, times/funcs.rs          utils/adt/date.c, timestamp.c, datetime.c
+  formatting.rs                     utils/adt/formatting.c
+  monetary.rs                       utils/adt/cash.c, utils/adt/pg_locale.c, port/pg_localeconv_r.c
+  scalars.rs                        the input and output of the fixed scalars: utils/adt/int.c,
+                                    int8.c, oid.c, xid.c, pg_lsn.c, char.c, mac.c, mac8.c, uuid.c,
+                                    cash.c, float.c, tid.c
+  strings.rs                        utils/adt/varchar.c, varbit.c, varlena.c, name.c
+  bytes.rs                          utils/adt/encode.c, varlena.c, and the encodings' table of
+                                    common/encnames.c, common/wchar.c. Its digests are written
+                                    from their published standards, not from PostgreSQL's code.
+  arrays.rs                         utils/adt/arrayfuncs.c, array_userfuncs.c, varlena.c, misc.c,
+                                    acl.c, foreign/foreign.c
+  composed.rs                       utils/adt/arrayfuncs.c, rowtypes.c, rangetypes.c,
+                                    multirangetypes.c, enum.c
+  read/ranges.rs                    utils/adt/rangetypes.c, multirangetypes.c
+  geo.rs                            utils/adt/geo_ops.c, include/utils/geo_decls.h
+  inet.rs                           utils/adt/network.c, include/utils/inet.h
+  xml.rs                            utils/adt/xml.c: what its input and output functions read and
+                                    write. libxml2 is not translated: the reading of a document
+                                    is the crate's own, and what it does not read is refused.
+  jsonb.rs, jsonb/funcs.rs          utils/adt/json.c, jsonb.c, jsonb_util.c, jsonfuncs.c,
+                                    common/jsonapi.c
+  read/populate.rs                  utils/adt/jsonfuncs.c
+  jsonpath.rs, jsonpath/exec.rs     utils/adt/jsonpath.c, jsonpath_scan.l, jsonpath_gram.y,
+                                    jsonpath_exec.c
+  textual.rs                        the input and output functions of the types it holds
+  tsearch.rs                        utils/adt/tsvector.c, tsvector_parser.c, tsvector_op.c,
+                                    tsquery.c, tsquery_op.c, tsquery_util.c, and the legacy CRC-32
+                                    of utils/hash/pg_crc.c
+  tsearch/funcs.rs                  utils/adt/tsvector_op.c, tsquery_op.c, tsquery_cleanup.c,
+                                    tsquery_rewrite.c, tsquery_util.c, tsrank.c
+  tsearch/parser.rs                 tsearch/wparser_def.c, tsearch/ts_locale.c
+  tsearch/config.rs                 tsearch/ts_parse.c, to_tsany.c, dict.c, dict_simple.c, wparser.c,
+                                    snowball/dict_snowball.c, utils/adt/tsquery.c, tsquery_cleanup.c
+  tsearch/headline.rs               tsearch/ts_parse.c, wparser.c, wparser_def.c, commands/tsearchcmds.c
+  regexp.rs                         utils/adt/regexp.c
+  categories.rs, categories.txt,    common/unicode_category.c and the Unicode tables PostgreSQL
+  cases.txt                         generates, read off its source by inner-warren's tools
+  collations.rs                     utils/adt/pg_locale_icu.c, pg_locale_libc.c: how each library is
+                                    called. ICU and glibc are called, not translated.
+  read/collate.rs                   parser/parse_collate.c
+  read/prefix.rs                    utils/adt/like_support.c
+  read/rest.rs, read/calls.rs       utils/adt/mac.c, mac8.c, uuid.c, enum.c, varbit.c, network.c,
+                                    geo_ops.c, float.c, numeric.c, formatting.c, regexp.c and
+                                    utils/misc/guc_funcs.c: those functions' answers and refusals
+  read/pipeline/windows.rs          executor/nodeWindowAgg.c, utils/adt/windowfuncs.c, and in_range
+                                    of utils/adt/int.c, int8.c, numeric.c, float.c, date.c, timestamp.c
+  read/pipeline.rs                  how parser/gram.y reads the forms it names, and numeric.c
+  zones.rs                          timezone/localtime.c, whose own header says it is in the public
+                                    domain; how PostgreSQL's pgtz.c finds a zone's file by its name
+  ddl.rs, catalog.rs                what PostgreSQL's parser/parse_utilcmd.c, commands/tablecmds.c,
+                                    and the commands beside them accept and refuse, in their words
+  regs.txt, regs.rs, functions.txt, the built-in objects of PostgreSQL 14 to 19, drawn from each
+  operators.txt, opclasses.txt,     release's catalog (include/catalog/*.dat), and its keywords
+  types.txt, kwlist.txt,            (include/parser/kwlist.h), each held as a list; the code reads
+  keywords.txt                      them as data
+  the words of a refusal            throughout the crate, a refusal that PostgreSQL also makes is in
+                                    PostgreSQL's words
+
+Under the regular expression package's notices (src/regex/, all of it translated from
+backend/regex/ of PostgreSQL 19 RC1, function by function, the same steps in the same order; a color
+map, an NFA and the DFA's memory are Rust's vectors, and the pg_wc_* class functions are `locale.rs`,
+read from PostgreSQL's own tables, the C library or ICU; these translations are under
+GPL-3.0-or-later):
+
+  regex/comp.rs                     regcomp.c
+  regex/lex.rs                      regc_lex.c
+  regex/color.rs                    regc_color.c
+  regex/nfa.rs                      regc_nfa.c
+  regex/cvec.rs                     regc_cvec.c
+  regex/classes.rs                  regc_locale.c (Tcl's notice)
+  regex/locale.rs                   regc_pg_locale.c, regc_locale.c (Tcl's notice)
+  regex/exec.rs                     regexec.c
+  regex/dfa.rs                      rege_dfa.c
+  regex/prefix.rs                   regprefix.c
+  regex/guts.rs                     include/regex/regguts.h, regex.h, regerrs.h
+
+Under Snowball's notice:
+
+  tsearch/snowball.rs               backend/snowball/libstemmer/stem_UTF_8_english.c (generated from
+                                    english.sbl by Snowball 3.0.0), utilities.c and api.c: the
+                                    English stemmer alone, its generated C translated into Rust, its
+                                    cursors still counting bytes of UTF-8.
+  tsearch/config.rs                 ENGLISH_STOP, the stop words of backend/snowball/stopwords/english.stop,
+                                    sorted.
+
+
+POSTGRESQL'S NOTICE (COPYRIGHT, at the top of PostgreSQL's tree)
+
+PostgreSQL Database Management System
+(also known as Postgres, formerly known as Postgres95)
+
+Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+
+Portions Copyright (c) 1994, The Regents of the University of California
+
+Permission to use, copy, modify, and distribute this software and its
+documentation for any purpose, without fee, and without a written agreement
+is hereby granted, provided that the above copyright notice and this
+paragraph and the following two paragraphs appear in all copies.
+
+IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO ANY PARTY FOR
+DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
+DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,
+INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ON AN "AS IS" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO
+PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+
+
+THE REGULAR EXPRESSION PACKAGE'S NOTICES (src/backend/regex/COPYRIGHT, in PostgreSQL's tree)
+
+This regular expression package was originally developed by Henry Spencer.
+It bears the following copyright notice:
+
+**********************************************************************
+
+Copyright (c) 1998, 1999 Henry Spencer.  All rights reserved.
+
+Development of this software was funded, in part, by Cray Research Inc.,
+UUNET Communications Services Inc., Sun Microsystems Inc., and Scriptics
+Corporation, none of whom are responsible for the results.  The author
+thanks all of them. 
+
+Redistribution and use in source and binary forms -- with or without
+modification -- are permitted for any purpose, provided that
+redistributions in source form retain this entire copyright notice and
+indicate the origin and nature of any modifications.
+
+I'd appreciate being given credit for this package in the documentation
+of software which uses it, but that is not a requirement.
+
+THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES,
+INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL
+HENRY SPENCER BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+**********************************************************************
+
+PostgreSQL adopted the code out of Tcl 8.4.1.  Portions of regc_locale.c
+and re_syntax.n were developed by Tcl developers other than Henry; these
+files bear the Tcl copyright and license notice:
+
+**********************************************************************
+
+This software is copyrighted by the Regents of the University of
+California, Sun Microsystems, Inc., Scriptics Corporation, ActiveState
+Corporation and other parties.  The following terms apply to all files
+associated with the software unless explicitly disclaimed in
+individual files.
+
+The authors hereby grant permission to use, copy, modify, distribute,
+and license this software and its documentation for any purpose, provided
+that existing copyright notices are retained in all copies and that this
+notice is included verbatim in any distributions. No written agreement,
+license, or royalty fee is required for any of the authorized uses.
+Modifications to this software may be copyrighted by their authors
+and need not follow the licensing terms described here, provided that
+the new terms are clearly indicated on the first page of each file where
+they apply.
+
+IN NO EVENT SHALL THE AUTHORS OR DISTRIBUTORS BE LIABLE TO ANY PARTY
+FOR DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ARISING OUT OF THE USE OF THIS SOFTWARE, ITS DOCUMENTATION, OR ANY
+DERIVATIVES THEREOF, EVEN IF THE AUTHORS HAVE BEEN ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+THE AUTHORS AND DISTRIBUTORS SPECIFICALLY DISCLAIM ANY WARRANTIES,
+INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.  THIS SOFTWARE
+IS PROVIDED ON AN "AS IS" BASIS, AND THE AUTHORS AND DISTRIBUTORS HAVE
+NO OBLIGATION TO PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR
+MODIFICATIONS.
+
+GOVERNMENT USE: If you are acquiring this software on behalf of the
+U.S. government, the Government shall have only "Restricted Rights"
+in the software and related documentation as defined in the Federal 
+Acquisition Regulations (FARs) in Clause 52.227.19 (c) (2).  If you
+are acquiring the software on behalf of the Department of Defense, the
+software shall be classified as "Commercial Computer Software" and the
+Government shall have only "Restricted Rights" as defined in Clause
+252.227-7013 (c) (1) of DFARs.  Notwithstanding the foregoing, the
+authors grant the U.S. Government and others acting in its behalf
+permission to use and distribute the software in accordance with the
+terms specified in this license. 
+
+**********************************************************************
+
+Subsequent modifications to the code by the PostgreSQL project follow
+the same license terms as the rest of PostgreSQL.
+
+
+SNOWBALL'S NOTICE (https://snowballstem.org/license.html)
+
+Except where explicitly noted, all the software given out on this Snowball site
+is covered by the 3-clause BSD License:
+
+Copyright (c) 2001, Dr Martin Porter,
+Copyright (c) 2002, Richard Boulton.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Essentially, all this means is that you can do what you like with the code,
+except claim another Copyright for it, or claim that it is issued under a different
+license. The software is also issued without warranties, which means that if anyone
+suffers through its use, they cannot come back and sue you.
+
+You also have to alert anyone to whom you give the Snowball
+software to the fact that it is covered by the BSD license.

@@ -1,6 +1,7 @@
-//! Regular expressions, by PostgreSQL 19's own engine (Henry Spencer's, `src/backend/regex/`),
-//! ported: a pattern of characters compiled under its flags and its collation's classes, then a
-//! string searched for it, each subexpression's match given back as PostgreSQL's gives it.
+//! Regular expressions, by PostgreSQL 19's own engine (Henry Spencer's, `src/backend/regex/`, its
+//! notices in NOTICE), ported: a pattern of characters compiled under its flags and its collation's
+//! classes, then a string searched for it, each subexpression's match given back as PostgreSQL's
+//! gives it.
 //!
 //! The compiler is `comp.rs` (regcomp.c) with what it includes: the lexer (`lex.rs`), the colors
 //! (`color.rs`), the NFA (`nfa.rs`), the character vectors (`cvec.rs`) and the classes and

@@ -1,3 +1,6 @@
+// Translated from PostgreSQL's regc_locale.c, whose notice is in NOTICE; this translation is under
+// GPL-3.0-or-later.
+
 //! The classes, collating elements and case counterparts (regc_locale.c): the names of ASCII's
 //! characters and of the classes, ranges with their other cases, and each class's members by the
 //! collation's classes (`locale.rs`).

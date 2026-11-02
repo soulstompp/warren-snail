@@ -1018,4 +1018,6 @@ DBA's indexes it puts on, every answer checked first.
 
 ## Licence
 
-GPL-3.0-or-later. Copyright © Kenneth Allen Flegal.
+GPL-3.0-or-later. Copyright © Kenneth Allen Flegal. Portions are under the notices in
+[NOTICE](NOTICE), each given whole: what the crate translates from PostgreSQL, the regular
+expression package PostgreSQL holds, and Snowball.

@@ -10,7 +10,7 @@ repository = "https://github.com/soulstompp/warren-snail"
 readme = "README.md"
 keywords = ["database", "parquet", "postgresql", "sql", "columnar"]
 categories = ["database-implementations", "command-line-utilities"]
-include = ["build.rs", "src/**", "tests/**", "README.md", "CHANGELOG.md", "LICENSE"]
+include = ["build.rs", "src/**", "tests/**", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"]
 
 [lib]
 name = "warren_snail"

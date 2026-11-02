@@ -1,3 +1,6 @@
+// Translated from PostgreSQL's regc_pg_locale.c and regc_locale.c, whose notices are in NOTICE; this translation is
+// under GPL-3.0-or-later.
+
 //! The character classes and the case mapping a regular expression is compiled and run under, by
 //! its collation, as PostgreSQL 19's `regc_pg_locale.c` reads them: under C, POSIX and ucs_basic
 //! ASCII's classes alone, from PostgreSQL's own table; under glibc's C.UTF-8 the C library's;
