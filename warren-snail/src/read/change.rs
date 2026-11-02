@@ -207,7 +207,10 @@ pub(super) fn level_key(
             column,
             &crate::strings::column_key(ty, collator, t.as_bytes()),
         ),
-        Datum::Bytes(b) => byte_key(ty, b),
+        Datum::Bytes(b) => match crate::plane::on_plane(ty) {
+            true => KeyValue::Wide(crate::plane::key_of_bytes(ty, b).unwrap_or(i128::MAX)),
+            false => byte_key(ty, b),
+        },
         Datum::Wide(k) => KeyValue::Wide(*k),
         Datum::Float4(b) => key(level, crate::scalars::float4_key(*b)),
         Datum::Float8(b) => key(level, crate::scalars::float8_key(*b)),

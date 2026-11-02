@@ -7484,15 +7484,23 @@ pub fn reads_per_row(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
             _ => false,
         }
     }
-    fn operated(e: &Expr, by_rows: &[&str]) -> bool {
+    fn operated(e: &Expr, by_rows: &[&str], table: &crate::catalog::Table) -> bool {
         match e {
             Expr::BinaryOp {
                 left,
-                op: BinaryOperator::And | BinaryOperator::Or,
+                op: BinaryOperator::And,
                 right,
-            } => operated(left, by_rows) || operated(right, by_rows),
-            Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => operated(e, by_rows),
-            Expr::BinaryOp { .. } => names(e, by_rows),
+            } => operated(left, by_rows, table) || operated(right, by_rows, table),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => names(left, by_rows) || names(right, by_rows),
+            Expr::Nested(e) => operated(e, by_rows, table),
+            Expr::UnaryOp { expr: e, .. } => names(e, by_rows),
+            Expr::BinaryOp { .. } => {
+                names(e, by_rows) && !super::question::plane_condition(table, e)
+            }
             _ => false,
         }
     }
@@ -7528,7 +7536,7 @@ pub fn reads_per_row(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
     extreme
         || s.selection
             .as_ref()
-            .is_some_and(|w| !by_rows.is_empty() && operated(w, &by_rows))
+            .is_some_and(|w| !by_rows.is_empty() && operated(w, &by_rows, table))
 }
 
 pub fn is_pipeline(q: &Query) -> bool {

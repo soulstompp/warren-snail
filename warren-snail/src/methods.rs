@@ -9,14 +9,32 @@ use crate::textual::Textual;
 use crate::{Error, Result};
 
 /// Whether the snail holds an index of the method with a key of the operator class: a B-tree and a
-/// hash on any; a GiST or an SP-GiST on a range, a multirange, an inet, or text; a key held as an
-/// element strand.
+/// hash on any; a GiST or an SP-GiST on a range, a multirange, an inet, text, or a shape on the plane; a
+/// key held as an element strand.
 pub fn held(method: Method, opclass: &str) -> bool {
     match method {
         Method::Btree | Method::Hash => true,
         _ if holds_elements(method, opclass) => true,
-        Method::Gist => matches!(opclass, "range_ops" | "multirange_ops" | "inet_ops"),
-        Method::Spgist => matches!(opclass, "range_ops" | "inet_ops" | "text_ops"),
+        Method::Gist => matches!(
+            opclass,
+            "range_ops"
+                | "multirange_ops"
+                | "inet_ops"
+                | "point_ops"
+                | "box_ops"
+                | "circle_ops"
+                | "poly_ops"
+        ),
+        Method::Spgist => matches!(
+            opclass,
+            "range_ops"
+                | "inet_ops"
+                | "text_ops"
+                | "quad_point_ops"
+                | "kd_point_ops"
+                | "box_ops"
+                | "poly_ops"
+        ),
         _ => false,
     }
 }
@@ -478,6 +496,9 @@ pub(crate) fn bare_name(ty: ColumnType) -> String {
 /// Whether an EXCLUDE's element may name an operator, as PostgreSQL's `ComputeIndexAttrs` asks:
 /// commutative, and of the element's operator class's family.
 pub fn exclusion_operator(method: Method, opclass: &str, ty: ColumnType, op: &str) -> Result<()> {
+    if crate::plane::on_plane(ty) {
+        return crate::plane::exclusion_operator(opclass, ty, op);
+    }
     let members: &[&str] = match (method, opclass) {
         (Method::Btree | Method::Hash, _) => &["="],
         (_, "range_ops" | "multirange_ops") => &["&&", "=", "-|-"],

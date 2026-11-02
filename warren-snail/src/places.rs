@@ -385,7 +385,7 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             ColumnType::Timetz(_) => 5,
             ColumnType::Interval { .. } => 6,
             ColumnType::Boolean => 1,
-            ColumnType::Uuid => 128,
+            ColumnType::Uuid | ColumnType::Geometric(_) => 128,
             ColumnType::Bit(n) => n as usize,
             ColumnType::Text(_)
             | ColumnType::Bpchar(_)
@@ -394,8 +394,7 @@ fn sublevel_count(level: Level, ty: ColumnType, text_sublevels: u32) -> usize {
             | ColumnType::Bytes
             | ColumnType::Varbit(_)
             | ColumnType::Textual(_)
-            | ColumnType::Internal(_)
-            | ColumnType::Geometric(_) => {
+            | ColumnType::Internal(_) => {
                 (text_sublevels & !(crate::directory::BYTES_LEVEL | crate::directory::BITS_LEVEL))
                     as usize
             }

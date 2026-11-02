@@ -138,8 +138,12 @@ pub struct Span {
     pub present: bool,
     pub lo: Vec<u8>,
     pub hi: Vec<u8>,
-    /// Whether it holds an empty value: an empty range or multirange.
+    /// Whether it holds an empty value: an empty range or multirange; on the plane, a shape a
+    /// coordinate of which is NaN, which no box holds.
     pub empty: bool,
+    /// Whether `lo` and `hi` are the corners of a bounding box on the plane, each coordinate widened
+    /// on its own.
+    pub plane: bool,
 }
 
 impl Span {
@@ -161,6 +165,9 @@ impl Span {
                 self.lo = lo.to_vec();
                 self.hi = hi.to_vec();
             }
+            Some((lo, hi)) if self.plane => {
+                crate::plane::widen_corners(&mut self.lo, &mut self.hi, lo, hi);
+            }
             Some((lo, hi)) => {
                 if lo < self.lo.as_slice() {
                     self.lo = lo.to_vec();
@@ -174,6 +181,7 @@ impl Span {
 
     /// It widened to hold every value another holds.
     pub fn join(&mut self, other: &Span) {
+        self.plane |= other.plane;
         if other.present {
             self.widen(Some((&other.lo, &other.hi)));
         }
@@ -751,7 +759,7 @@ impl Entry {
             o.u32(n);
         }
         for s in &self.spans {
-            o.u8(u8::from(s.present) | (u8::from(s.empty) << 1));
+            o.u8(u8::from(s.present) | (u8::from(s.empty) << 1) | (u8::from(s.plane) << 2));
             if s.present {
                 o.bytes(&s.lo);
                 o.bytes(&s.hi);
@@ -831,6 +839,7 @@ impl Entry {
                 lo,
                 hi,
                 empty: flags & 2 != 0,
+                plane: flags & 4 != 0,
             });
         }
         let tails = if tails {
@@ -1472,6 +1481,7 @@ mod tests {
             lo: vec![1, lo],
             hi: vec![1, hi],
             empty,
+            plane: false,
         };
         let mut a = block(1, 10, 0);
         a.spans = vec![span(5, 9, false)];

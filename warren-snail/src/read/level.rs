@@ -98,7 +98,10 @@ impl Snail {
             .position(|x| x.name == column)
             .ok_or_else(|| Error::new(format!("{table} has no column {column}")))?;
         let leading: Vec<usize> = (0..t.orders.len())
-            .filter(|&o| t.orders[o].levels.first() == Some(&Leading::Column(c)))
+            .filter(|&o| {
+                t.orders[o].levels.first() == Some(&Leading::Column(c))
+                    && !crate::plane::on_plane(t.columns[c].ty)
+            })
             .collect();
         let alone = |o: &usize| t.orders[*o].unique && t.orders[*o].levels.len() == 1;
         let Some(o) = leading

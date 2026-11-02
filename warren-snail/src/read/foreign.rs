@@ -1265,10 +1265,7 @@ impl Snail {
                 let c = l.column();
                 let slot = order.leaf_slot(table, c)?;
                 let k = head.span_slots.iter().position(|&s| s as usize == slot)?;
-                let probe = match crate::spans::bounds(table.columns[c].ty, &r[c])? {
-                    None => crate::spans::Probe::Empty,
-                    Some((lo, hi)) => crate::spans::Probe::Span(lo, hi),
-                };
+                let probe = crate::spans::probe_of(table.columns[c].ty, &r[c])?;
                 Some((k, probe, crate::spans::is_inet(table.columns[c].ty)))
             })
             .collect();

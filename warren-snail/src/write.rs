@@ -1209,6 +1209,16 @@ pub(crate) fn laid_out(
                 unsorted.push(null_key(order, li));
                 continue;
             }
+            if let (true, Some(held)) = (
+                crate::plane::on_plane(table.columns[l.column()].ty),
+                column.text_value(r),
+            ) {
+                let g = crate::plane::of_bytes(table.columns[l.column()].ty, held.data())
+                    .ok_or_else(|| Error::new("a shape read from its bytes"))?;
+                crate::plane::taken(order.method, &g)?;
+                unsorted.push(KeyValue::Wide(crate::plane::key(&g)));
+                continue;
+            }
             let v = match column {
                 // A composed value by its key, written as text that sorts as the key does.
                 Values::Composed(x) => {
@@ -1364,7 +1374,7 @@ pub(crate) fn level_kinds(table: &Table, order: &Order, format: u32) -> Vec<u32>
             } else {
                 0
             };
-            if ty.is_wide() {
+            if ty.is_wide() || crate::plane::on_plane(ty) {
                 WIDE_LEVEL
             } else if ty.keyed_by_bytes() || table.columns[l.column()].collated() {
                 crate::directory::BYTES_LEVEL | bits | 1

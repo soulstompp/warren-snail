@@ -2664,6 +2664,9 @@ fn op_cond(
         return Ok(Some(o));
     }
     let ty = table.columns[c].ty;
+    if crate::plane::on_plane(ty) {
+        return plane_cond(table, c, op, lit, lit_left);
+    }
     let name = op.to_string();
     let def = match ty {
         ColumnType::Composed(r) => Some(r.def()),
@@ -2772,6 +2775,86 @@ fn op_cond(
         probe: seen.and(probe),
         value: None,
     }))
+}
+
+/// A condition on a column of the plane by an operator its operator classes take, with a constant:
+/// a value on the left read through the operator's other form, where it has one. A string literal is
+/// read as the column's type, but beside a point's `<@`, where it is no one type.
+fn plane_cond(
+    table: &Table,
+    c: usize,
+    op: &BinaryOperator,
+    lit: &Expr,
+    lit_left: bool,
+) -> Result<Option<OpCond>> {
+    use super::pipeline::{eval_on, Casings, Value as Held};
+    let ColumnType::Geometric(kind) = table.columns[c].ty else {
+        return Ok(None);
+    };
+    let name = op.to_string();
+    let seen = if lit_left {
+        crate::plane::commuted(&name)
+    } else {
+        Some(name.as_str())
+    };
+    let quoted = matches!(lit, Expr::Value(v) if matches!(v.value, Value::SingleQuotedString(_)));
+    let casings = Casings::under(table.monetary);
+    let value = match eval_on(lit, &[], &[], table.release, &casings)? {
+        Held::Geometric(g) => g,
+        Held::Text(t)
+            if quoted && (kind != crate::geo::GeoKind::Point || name != "<@" && name != "@>") =>
+        {
+            crate::geo::geo_in(kind, &t)?
+        }
+        _ => return Ok(None),
+    };
+    // `&<`, `&>`, `&<|` and `|&>` have no other side: read with no rule, as a range's are.
+    if !crate::plane::takes(kind, seen.unwrap_or(&name), value.kind()) {
+        return Ok(None);
+    }
+    let column = table.columns[c].name.clone();
+    let own = Box::new(Expr::Identifier(sqlparser::ast::Ident::with_quote(
+        '"',
+        column.clone(),
+    )));
+    let (left, right) = if lit_left {
+        (Box::new(lit.clone()), own)
+    } else {
+        (own, Box::new(lit.clone()))
+    };
+    Ok(Some(OpCond {
+        column: c,
+        expr: Expr::BinaryOp {
+            left,
+            op: op.clone(),
+            right,
+        },
+        name: column,
+        op: seen.unwrap_or_default().to_string(),
+        probe: seen.map(|_| crate::spans::Probe::Plane(kind, value)),
+    }))
+}
+
+/// Whether a condition on one table reads a column of the plane by an operator its operator classes
+/// take, with a constant, so that the question path rules blocks out by it.
+pub(super) fn plane_condition(table: &Table, e: &Expr) -> bool {
+    let Expr::BinaryOp { left, op, right } = e else {
+        return false;
+    };
+    let column = |x: &Expr| {
+        let name = match x {
+            Expr::Identifier(i) => crate::catalog::ident(i),
+            Expr::CompoundIdentifier(parts) => crate::catalog::ident(parts.last()?),
+            _ => return None,
+        };
+        table.columns.iter().position(|c| c.name == name)
+    };
+    let cond = match (column(left), column(right)) {
+        (Some(c), None) => plane_cond(table, c, op, right, false),
+        (None, Some(c)) => plane_cond(table, c, op, left, true),
+        _ => return false,
+    };
+    matches!(cond, Ok(Some(_)))
 }
 
 #[cfg(test)]

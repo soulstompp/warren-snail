@@ -1,6 +1,7 @@
 //! The span a GiST or SP-GiST strand keeps of each column it names, block by block: a range's and a
-//! multirange's least lower bound and greatest upper bound, an inet's first and last address; and
-//! whether a block of that span may hold a row an operator's condition keeps.
+//! multirange's least lower bound and greatest upper bound, an inet's first and last address, a
+//! shape's bounding box; and whether a block of that span may hold a row an operator's condition
+//! keeps.
 
 use crate::catalog::{ColumnType, Method, Order, Table};
 use crate::composed::Composed;
@@ -11,7 +12,8 @@ use crate::values::Values;
 
 /// Whether a strand of `method` keeps a span of a column of type `ty`.
 fn spanned(method: Method, ty: ColumnType) -> bool {
-    matches!(method, Method::Gist | Method::Spgist) && (is_inet(ty) || is_period(ty))
+    matches!(method, Method::Gist | Method::Spgist)
+        && (is_inet(ty) || is_period(ty) || crate::plane::on_plane(ty))
 }
 
 /// Whether a column may be a key's period: a range or a multirange.
@@ -30,8 +32,8 @@ pub(crate) fn is_inet(ty: ColumnType) -> bool {
     )
 }
 
-/// The columns whose span an order keeps: its levels of a range, a multirange or an inet, where
-/// its index is a GiST or an SP-GiST.
+/// The columns whose span an order keeps: its levels of a range, a multirange, an inet or a shape on
+/// the plane, where its index is a GiST or an SP-GiST.
 pub(crate) fn columns(table: &Table, order: &Order) -> Vec<usize> {
     let mut out: Vec<usize> = Vec::new();
     for l in &order.levels {
@@ -52,11 +54,14 @@ pub(crate) fn slots(table: &Table, order: &Order) -> Vec<u32> {
         .collect()
 }
 
-/// A value's bounds: none for NULL; an empty value's, none within.
+/// A value's bounds: none for NULL; an empty value's or a shape's holding a NaN, none within.
 pub(crate) fn bounds(ty: ColumnType, d: &Datum) -> Option<Option<(Vec<u8>, Vec<u8>)>> {
     match d {
         Datum::Null => None,
         Datum::Text(t) if is_inet(ty) => Some(Some(crate::inet::inet_span(t))),
+        Datum::Bytes(b) if crate::plane::on_plane(ty) => {
+            Some(crate::plane::of_bytes(ty, b).and_then(|g| crate::plane::bounds(&g)))
+        }
         Datum::Compound(c) => Some(crate::composed::span_bounds(ty, &c.item)),
         _ => Some(Some((Vec::new(), vec![u8::MAX]))),
     }
@@ -64,6 +69,7 @@ pub(crate) fn bounds(ty: ColumnType, d: &Datum) -> Option<Option<(Vec<u8>, Vec<u
 
 /// A span widened to hold a value.
 pub(crate) fn widen(span: &mut Span, ty: ColumnType, d: &Datum) {
+    span.plane |= crate::plane::on_plane(ty);
     match bounds(ty, d) {
         None => {}
         Some(None) => span.widen(None),
@@ -73,18 +79,34 @@ pub(crate) fn widen(span: &mut Span, ty: ColumnType, d: &Datum) {
 
 /// The span of a column's values at the rows given.
 pub(crate) fn of_rows(ty: ColumnType, v: &Values, rows: &[usize]) -> Span {
-    let mut span = Span::default();
+    let mut span = Span {
+        plane: crate::plane::on_plane(ty),
+        ..Span::default()
+    };
     for &r in rows {
         widen(&mut span, ty, &crate::values::datum_of(v, r, ty));
     }
     span
 }
 
-/// The value a condition compares a spanned column with, as a span: none where it is empty.
+/// The value a condition compares a spanned column with, as a span: none where it is empty; on the
+/// plane, the column's type and the value itself.
 #[derive(Clone, Debug)]
 pub(crate) enum Probe {
     Empty,
     Span(Vec<u8>, Vec<u8>),
+    Plane(crate::geo::GeoKind, crate::geo::Geo),
+}
+
+/// A value a row holds, as the value a condition compares a spanned column with; none for NULL.
+pub(crate) fn probe_of(ty: ColumnType, d: &Datum) -> Option<Probe> {
+    if let (ColumnType::Geometric(k), Datum::Bytes(b)) = (ty, d) {
+        return crate::plane::of_bytes(ty, b).map(|g| Probe::Plane(k, g));
+    }
+    Some(match bounds(ty, d)? {
+        None => Probe::Empty,
+        Some((lo, hi)) => Probe::Span(lo, hi),
+    })
 }
 
 /// The bytes of a bound at its value, whichever side it bounds.
@@ -95,8 +117,11 @@ fn value_of(b: &[u8]) -> &[u8] {
 /// Whether a block whose column spans `span` may hold a row that `column op probe` keeps, as
 /// PostgreSQL's GiST asks an inner entry: a range's and a multirange's `&&`, `@>`, `<@`, `=`,
 /// `<<`, `>>`, `&<`, `&>` and `-|-`; an inet's `&&`, `<<`, `<<=`, `>>` and `>>=`, each of which
-/// asks that the networks share an address.
+/// asks that the networks share an address; on the plane, by its bounding box.
 pub(crate) fn may_hold(op: &str, span: &Span, probe: &Probe, inet: bool) -> bool {
+    if let Probe::Plane(column, value) = probe {
+        return crate::plane::may_hold(*column, op, span, value);
+    }
     let hull = span
         .present
         .then_some((span.lo.as_slice(), span.hi.as_slice()));
@@ -115,7 +140,7 @@ pub(crate) fn may_hold(op: &str, span: &Span, probe: &Probe, inet: bool) -> bool
         }
         ("=", Probe::Empty) => span.empty,
         ("<@", q) => span.empty || overlap(q),
-        (_, Probe::Empty) => false,
+        (_, Probe::Empty | Probe::Plane(..)) => false,
         (op, Probe::Span(ql, qu)) => {
             let Some((l, u)) = hull else {
                 return false;

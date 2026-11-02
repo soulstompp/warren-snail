@@ -289,22 +289,22 @@ fn fp_ne(a: f64, b: f64) -> bool {
 }
 
 /// `FPlt`.
-fn fp_lt(a: f64, b: f64) -> bool {
+pub(crate) fn fp_lt(a: f64, b: f64) -> bool {
     a + EPSILON < b
 }
 
 /// `FPle`.
-fn fp_le(a: f64, b: f64) -> bool {
+pub(crate) fn fp_le(a: f64, b: f64) -> bool {
     a <= b + EPSILON
 }
 
 /// `FPgt`.
-fn fp_gt(a: f64, b: f64) -> bool {
+pub(crate) fn fp_gt(a: f64, b: f64) -> bool {
     a > b + EPSILON
 }
 
 /// `FPge`.
-fn fp_ge(a: f64, b: f64) -> bool {
+pub(crate) fn fp_ge(a: f64, b: f64) -> bool {
     a + EPSILON >= b
 }
 
@@ -1150,7 +1150,7 @@ fn box_construct(p1: &Point, p2: &Point) -> GeoBox {
 }
 
 /// `box_ov`.
-fn box_ov(b1: &GeoBox, b2: &GeoBox) -> bool {
+pub(crate) fn box_ov(b1: &GeoBox, b2: &GeoBox) -> bool {
     fp_le(b1.low.x, b2.high.x)
         && fp_le(b2.low.x, b1.high.x)
         && fp_le(b1.low.y, b2.high.y)
@@ -1158,7 +1158,7 @@ fn box_ov(b1: &GeoBox, b2: &GeoBox) -> bool {
 }
 
 /// `box_contain_box`: `inner` in `outer` or on its border.
-fn box_contain_box(outer: &GeoBox, inner: &GeoBox) -> bool {
+pub(crate) fn box_contain_box(outer: &GeoBox, inner: &GeoBox) -> bool {
     fp_ge(outer.high.x, inner.high.x)
         && fp_le(outer.low.x, inner.low.x)
         && fp_ge(outer.high.y, inner.high.y)

@@ -69,6 +69,9 @@ pub(crate) fn text_of(d: &Datum, from: ColumnType) -> Option<String> {
         }
         (Datum::Text(s), _) => s.clone(),
         (Datum::Bytes(k), ty) if ty.is_bits() => crate::strings::bits_text(k),
+        (Datum::Bytes(b), ColumnType::Geometric(k)) => {
+            crate::geo::geo_out(&crate::geo::geo_of_bytes(k, b).ok()?)
+        }
         (Datum::Bytes(b), _) => Value::Bytes(b.clone()).text().unwrap_or_default(),
         (Datum::Wide(k), _) => crate::scalars::uuid_text(*k),
         (Datum::Float4(b), _) => crate::scalars::float_text(u64::from(*b), false),
@@ -572,8 +575,18 @@ pub fn check(table: &Table, row: &Row) -> Result<()> {
 }
 
 /// Refuses a row whose period of a key WITHOUT OVERLAPS is empty, as PostgreSQL refuses it where
-/// the row enters the key's index.
+/// the row enters the key's index; and a shape a GiST strand does not take.
 pub fn without_overlaps(table: &Table, row: &Row) -> Result<()> {
+    for o in table.orders.iter().filter(|o| o.predicate.is_none()) {
+        for l in &o.levels {
+            let ty = table.columns[l.column()].ty;
+            if let (true, Datum::Bytes(b)) = (crate::plane::on_plane(ty), &row[l.column()]) {
+                if let Some(g) = crate::plane::of_bytes(ty, b) {
+                    crate::plane::taken(o.method, &g)?;
+                }
+            }
+        }
+    }
     for o in table.orders.iter().filter(|o| o.without_overlaps()) {
         let c = o.levels[o.levels.len() - 1].column();
         if matches!(

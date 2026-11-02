@@ -711,7 +711,7 @@ pub fn datum_of(v: &Values, i: usize, ty: ColumnType) -> Datum {
         Values::Interval(x) => x[i].map_or(Datum::Null, Datum::Interval),
         Values::Composed(x) => x[i].clone().map_or(Datum::Null, Datum::Compound),
         Values::Nested(_) => panic!("a leaf's value read without its levels"),
-        _ if ty == ColumnType::Bytes || ty.is_bits() => v
+        _ if ty == ColumnType::Bytes || ty.is_bits() || matches!(ty, ColumnType::Geometric(_)) => v
             .text_value(i)
             .map_or(Datum::Null, |b| Datum::Bytes(b.data().to_vec())),
         _ => v
