@@ -1174,6 +1174,7 @@ impl Accrued {
         }
         let order = r.order.clone();
         self.round.add_table(r, &order);
+        self.round.reads.push(r.clone());
         self.round.rows_walked += r.rows_walked;
         self.round.rows_taken += r.rows_taken;
         if self.parts.len() < r.snails.len() {

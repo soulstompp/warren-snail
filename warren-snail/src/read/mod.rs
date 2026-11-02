@@ -450,6 +450,9 @@ pub struct Round {
     /// The pages the round wrote to its spill, the rows past its room, and those it read back.
     pub spill_pages_written: u64,
     pub spill_pages_read: u64,
+    /// For a question read as a pipeline over several relations, each of its reads in the order it
+    /// made them, each priced before its pages were read: the round's pages are their sum.
+    pub reads: Vec<Round>,
 }
 
 impl Round {
