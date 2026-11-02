@@ -3304,12 +3304,11 @@ impl Snail {
             let old = self.catalog.tables.iter().find(|x| x.name == t.name);
             // A strand made new is a change to the table it is of.
             if let (None, Some(of)) = (old, &t.elements_of) {
-                if let Some(o) = self.catalog.table(of) {
-                    if self.holds_rows(o)? {
-                        return Err(Error::new(format!(
-                            "{of}: it holds rows, so its columns and orders stay as written"
-                        )));
-                    }
+                let source = self.catalog.table(of);
+                if source.map(|o| self.holds_rows(o)).transpose()? == Some(true) {
+                    return Err(Error::new(format!(
+                        "{of}: it holds rows, so its columns and orders stay as written"
+                    )));
                 }
             }
             let columns_same = old.is_some_and(|o| {

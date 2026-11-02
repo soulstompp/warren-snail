@@ -494,9 +494,8 @@ pub(super) fn ask_join_within(
                 let (found, strands, held) = snail.keys_of(table, &c)?;
                 keys = found;
                 _held_keys = Some(held);
-                for r in [&mut round, &mut parts[at_snail]] {
-                    r.add_table(&strands, &strands.order);
-                }
+                round.add_table(&strands, &strands.order);
+                parts[at_snail].add_table(&strands, &strands.order);
                 names.push(strands.order);
             }
         }

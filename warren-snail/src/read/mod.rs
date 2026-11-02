@@ -1520,7 +1520,8 @@ impl Snail {
             // them.
             if relations::names_a_view(&self.catalog, q)
                 || !params.is_empty()
-                || (pipeline::hands_over(q) || elements::read_a_row_at_a_time(&self.catalog, q))
+                || pipeline::hands_over(q) && question::parse(&self.catalog, sql).is_err()
+                || elements::read_a_row_at_a_time(&self.catalog, q)
                     && question::parse(&self.catalog, sql).is_err()
             {
                 if order.is_some() {
