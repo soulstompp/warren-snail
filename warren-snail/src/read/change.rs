@@ -2847,7 +2847,10 @@ impl Snail {
             for row in &added_leaves {
                 if row[s] == Datum::Null {
                     sum.nulls += 1;
-                } else if let Some(v) = row[s].wide() {
+                } else if let Some(v) = row[s]
+                    .wide()
+                    .filter(|_| !head.bound_slots.contains(&(s as u32)))
+                {
                     if first_value {
                         sum.min = v;
                         sum.max = v;
@@ -2861,6 +2864,38 @@ impl Snail {
             for values in &gone_leaves {
                 if values[s] == Datum::Null {
                     sum.nulls -= 1;
+                }
+            }
+            // A column keyed by its bytes widens its bounds, kept in its first leaf's, by each row added.
+            if head.bound_slots.contains(&(s as u32)) {
+                let ci = order
+                    .columns
+                    .iter()
+                    .position(|&c| order.leaf_slot(table, c) == Some(s))
+                    .unwrap();
+                let column = &table.columns[order.columns[ci]];
+                let orderer = column.orderer()?;
+                let mut first_value = valueless[s];
+                for (_, row) in &added {
+                    let key = match &row[ci] {
+                        Datum::Compound(c) => Some(c.key.to_vec()),
+                        Datum::Text(t) => Some(
+                            crate::strings::column_key(column.ty, orderer, t.as_bytes())
+                                .into_owned(),
+                        ),
+                        Datum::Bytes(b) => {
+                            Some(crate::strings::column_key(column.ty, orderer, b).into_owned())
+                        }
+                        _ => None,
+                    };
+                    if let Some(v) = key.map(|k| crate::directory::prefix_bound(&k)) {
+                        if first_value {
+                            (sum.min, sum.max) = (v, v);
+                            first_value = false;
+                        } else {
+                            (sum.min, sum.max) = (sum.min.min(v), sum.max.max(v));
+                        }
+                    }
                 }
             }
             let cp = &map.columns[s];
@@ -2990,7 +3025,7 @@ impl Snail {
             }
         }
         let laid = laid_out(table, order, &rows, None, self.reader.format())?;
-        let head = head_of(table, order, &laid, held.len());
+        let head = head_of(table, order, &laid, held.len(), self.reader.format());
         Ok((self.blocks_written(w, table, order, &head, &rows)?, head))
     }
 

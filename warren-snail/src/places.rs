@@ -569,6 +569,30 @@ impl Sublevels {
         let (l, ty, bits) = self.levels[i];
         sublevel_of(l, ty, &key[i], sub, bits)
     }
+
+    /// The values at every sublevel for a row whose levels key `key`, a composed level's read in one
+    /// walk of its key.
+    pub fn all(&self, key: &[KeyValue]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(self.map.len());
+        for (r, &(i, sub)) in self.map.iter().enumerate() {
+            let (l, ty, bits) = self.levels[i];
+            match (&key[i], ty) {
+                (KeyValue::Text(s), ColumnType::Composed(t))
+                    if bits && sub == 0 && crate::composed::is_nested(t) =>
+                {
+                    let n = self.map[r..].iter().take_while(|m| m.0 == i).count();
+                    let mut walk =
+                        crate::composed::structure_all(ty, &|b| hex_byte(s.as_bytes(), b));
+                    walk.resize(n, -1);
+                    out.extend(walk);
+                }
+                (KeyValue::Text(_), ColumnType::Composed(t))
+                    if bits && crate::composed::is_nested(t) => {}
+                _ => out.push(sublevel_of(l, ty, &key[i], sub, bits)),
+            }
+        }
+        out
+    }
 }
 
 /// Rows' keys, one per level of an order, laid flat.

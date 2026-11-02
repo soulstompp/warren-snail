@@ -1233,7 +1233,13 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
     let mut text_may = Vec::new();
     for &ti in &walk.texts {
         let t = &side.texts[ti];
-        if e.columns[order.leaf_slot(table, t.column).unwrap()].nulls == e.rows {
+        let slot = order.leaf_slot(table, t.column).unwrap();
+        let sum = &e.columns[slot];
+        // Where the entry keeps the column's least and greatest cut to 8 bytes, a value whose first 8
+        // lie outside them is none of the entry's.
+        let outside = walk.head.bound_slots.contains(&(slot as u32))
+            && !within_bounds(t, table.columns[t.column].ty, sum);
+        if sum.nulls == e.rows || outside {
             status = Status::None;
         } else {
             text_may.push(ti);
@@ -1417,6 +1423,33 @@ fn assess(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
 
 /// What an entry keeps of the column a condition reads: its one leaf's summary, or the one its
 /// leaves' summaries make; and the slot of its first leaf.
+/// Whether a value `t` keeps may lie within an entry's least and greatest of its column, each its key cut
+/// to 8 bytes; a composed value's bounds in `t` written as hex.
+fn within_bounds(t: &TextCond, ty: ColumnType, sum: &Summary) -> bool {
+    let bound = |v: &[u8]| {
+        if ty.is_nested() {
+            let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            let key: Vec<u8> = v
+                .chunks(2)
+                .take(8)
+                .map(|h| d(h[0]) << 4 | d(h[1]))
+                .collect();
+            crate::directory::prefix_bound(&key)
+        } else {
+            crate::directory::prefix_bound(v)
+        }
+    };
+    let above = match &t.lo {
+        Bound::Included(l) | Bound::Excluded(l) => bound(l) <= sum.max,
+        Bound::Unbounded => true,
+    };
+    let below = match &t.hi {
+        Bound::Included(h) | Bound::Excluded(h) => bound(h) >= sum.min,
+        Bound::Unbounded => true,
+    };
+    above && below
+}
+
 fn summary_of(table: &Table, order: &Order, c: &Cond, e: &Entry) -> (Summary, usize) {
     let column = s_column(c.shape);
     let slots = order

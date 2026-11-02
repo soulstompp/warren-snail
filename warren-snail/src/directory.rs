@@ -137,6 +137,9 @@ pub struct Head {
     /// Which of the held leaves are the first of a column whose span each entry keeps, by their place
     /// among the held leaves.
     pub span_slots: Vec<u32>,
+    /// Which of the held leaves are the first of a column keyed by its bytes whose least and greatest
+    /// each entry keeps, cut to 8 bytes, by their place among the held leaves.
+    pub bound_slots: Vec<u32>,
 }
 
 /// What `Head::level_text` holds for a level keyed in 128 bits.
@@ -162,6 +165,20 @@ const HEAD_CUT: u32 = 1 << 30;
 /// strand names: the slots follow what each level was cut under, and each entry keeps a span for
 /// each. A head with none is written as before.
 const HEAD_SPANS: u32 = 1 << 29;
+
+/// The bit of a head's height set where each entry keeps the least and greatest of a column keyed by
+/// its bytes, cut to 8 bytes, in its first leaf's: the slots follow the spans'. A head with none is
+/// written as before.
+const HEAD_BOUNDS: u32 = 1 << 28;
+
+/// The bound an entry keeps of a value keyed by `bytes`: its first 8, a missing byte as 0, as a number
+/// that sorts as they do.
+pub fn prefix_bound(bytes: &[u8]) -> i128 {
+    let mut b = [0u8; 8];
+    let n = bytes.len().min(8);
+    b[..n].copy_from_slice(&bytes[..n]);
+    (u64::from_be_bytes(b) ^ (1 << 63)) as i64 as i128
+}
 
 fn add(a: u32, b: u32) -> Result<u32> {
     a.checked_add(b)
@@ -473,6 +490,9 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     if !head.span_slots.is_empty() {
         height |= HEAD_SPANS;
     }
+    if !head.bound_slots.is_empty() {
+        height |= HEAD_BOUNDS;
+    }
     o.u32(height);
     if !head.wide_slots.is_empty() {
         u32s(&mut o, &head.wide_slots);
@@ -485,6 +505,9 @@ pub fn encode_top(head: &Head, entries: &[Entry]) -> Vec<u8> {
     }
     if !head.span_slots.is_empty() {
         u32s(&mut o, &head.span_slots);
+    }
+    if !head.bound_slots.is_empty() {
+        u32s(&mut o, &head.bound_slots);
     }
     o.0.extend_from_slice(&encode_page(entries));
     o.0
@@ -512,15 +535,21 @@ pub fn decode_top(buf: &[u8]) -> Result<(Head, Vec<Entry>)> {
     } else {
         Vec::new()
     };
+    let bound_slots = if height & HEAD_BOUNDS != 0 {
+        read_u32s(&mut i)?
+    } else {
+        Vec::new()
+    };
     let head = Head {
         units,
         month_slots,
         text_slots,
         level_text,
-        height: height & !(HEAD_WIDE | HEAD_CUT | HEAD_SPANS),
+        height: height & !(HEAD_WIDE | HEAD_CUT | HEAD_SPANS | HEAD_BOUNDS),
         wide_slots,
         cut_under,
         span_slots,
+        bound_slots,
     };
     let entries = decode_page(&buf[i.at()..], &head)?;
     Ok((head, entries))
@@ -870,6 +899,7 @@ mod tests {
             wide_slots: vec![],
             cut_under: vec![String::new(); 2],
             span_slots: Vec::new(),
+            bound_slots: Vec::new(),
         }
     }
 
@@ -931,10 +961,11 @@ mod tests {
         // Written with a head that names the span's column, read back the same.
         let head = Head {
             span_slots: vec![0],
+            bound_slots: vec![1],
             ..head()
         };
         let (read, entries) = decode_top(&encode_top(&head, &[a.clone(), over])).unwrap();
-        assert_eq!(read.span_slots, [0]);
+        assert_eq!((read.span_slots, read.bound_slots), (vec![0], vec![1]));
         assert_eq!(entries[0].spans, a.spans);
         assert_eq!(entries[1].spans, [span(2, 9, true)]);
     }
@@ -1002,6 +1033,7 @@ mod tests {
             wide_slots: vec![0],
             cut_under: vec![String::new()],
             span_slots: Vec::new(),
+            bound_slots: Vec::new(),
         };
         let key = |k: i128| vec![KeyValue::Wide(k)];
         let e = Entry {

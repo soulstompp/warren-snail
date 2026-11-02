@@ -146,8 +146,13 @@ fn go(
     place: &mut Vec<i64>,
     out: &mut Vec<Block>,
 ) {
-    // Rows that all lie on one part that fills are that part: the place goes on down unsplit.
+    // Rows that all lie on one part that fills are that part: the place goes on down unsplit, a
+    // single row's to its end at once.
     let (held, mut r) = (place.len(), r);
+    if end - start == 1 && widths.fill(start, end) {
+        place.extend_from_slice(&sublevels.all(keys.row(start))[r..]);
+        r = sublevels.len();
+    }
     while r < sublevels.len() {
         let v = sublevels.value(keys.row(start), r);
         if sublevels.value(keys.row(end - 1), r) != v || !widths.fill(start, end) {

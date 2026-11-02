@@ -1508,7 +1508,7 @@ pub(crate) fn slots(table: &Table, order: &Order) -> (Vec<u32>, Vec<u32>) {
 
 /// The head of an order's directory for `n` rows laid out on it: each leaf's unit from its
 /// furthest-out place, the month and text leaves, and each text level's sublevels.
-pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> Head {
+pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize, format: u32) -> Head {
     let most = largest_place(&laid.keys, &laid.blocks, order, table, &laid.widths);
     let (month_slots, text_slots) = slots(table, order);
     Head {
@@ -1522,10 +1522,47 @@ pub(crate) fn head_of(table: &Table, order: &Order, laid: &Laid, n: usize) -> He
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
+        bound_slots: bound_slots(table, order, format),
     }
 }
 
-/// The head of an order that holds no row yet: a unit of one disk page, and each text level cut on
+/// Which of an order's held leaves are the first of a column keyed by its bytes, whose least and
+/// greatest each entry keeps cut to 8 bytes in a snail of format 9.
+pub(crate) fn bound_slots(table: &Table, order: &Order, format: u32) -> Vec<u32> {
+    if format < crate::file::FORMAT {
+        return Vec::new();
+    }
+    order
+        .columns
+        .iter()
+        .filter(|&&c| bounded(table, c))
+        .filter_map(|&c| order.leaf_slot(table, c).map(|s| s as u32))
+        .collect()
+}
+
+/// The bytes row `r` of a column of type `ty` is compared by: a composed value's key, a string's key
+/// under its column's collation; none for a NULL.
+pub(crate) fn compared_key(
+    ty: ColumnType,
+    orderer: Option<&crate::collations::Collator>,
+    values: &Values,
+    r: usize,
+) -> Option<Vec<u8>> {
+    match values {
+        Values::Composed(x) => x[r].as_ref().map(|c| c.key.to_vec()),
+        _ => values
+            .text_value(r)
+            .map(|h| crate::strings::column_key(ty, orderer, h.data()).into_owned()),
+    }
+}
+
+/// Whether a column is keyed by its bytes, so that an entry bounds it by its key cut to 8 bytes.
+pub(crate) fn bounded(table: &Table, c: usize) -> bool {
+    let ty = table.columns[c].ty;
+    ty.keyed_by_text() || ty.keyed_by_bytes() || table.columns[c].collated()
+}
+
+/// The head of an order that holds no row yet): a unit of one disk page, and each text level cut on
 /// its first byte, until rows come.
 pub(crate) fn empty_head(table: &Table, order: &Order, format: u32) -> Head {
     let (month_slots, text_slots) = slots(table, order);
@@ -1538,6 +1575,7 @@ pub(crate) fn empty_head(table: &Table, order: &Order, format: u32) -> Head {
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
+        bound_slots: bound_slots(table, order, format),
     }
 }
 
@@ -1720,6 +1758,7 @@ fn write_order(
         wide_slots: wide_slots(table, order),
         cut_under: cut_under_of(table, order),
         span_slots: crate::spans::slots(table, order),
+        bound_slots: bound_slots(table, order, format),
     };
     let (top, below) = build(head, entries, &mut |bytes| w.place(bytes))?;
     let levels = decode_top(&top)?.0.height;
@@ -1754,7 +1793,7 @@ pub(crate) fn write_block(
     text_slots: &[usize],
     given: &[Option<Encoded>],
     maps: &mut MapPages,
-    keep_units: bool,
+    current: bool,
 ) -> Result<(Entry, Vec<Encoded>, Vec<bool>)> {
     let leaves = order.leaves(table);
     let mut summaries = Vec::with_capacity(leaves.len());
@@ -1815,6 +1854,25 @@ pub(crate) fn write_block(
             }
         }
     }
+    // In format 9, a column keyed by its bytes: its least and greatest key, cut to 8 bytes, in its
+    // first leaf's summary.
+    if current {
+        for &c in order.columns.iter().filter(|&&c| bounded(table, c)) {
+            let orderer = table.columns[c].orderer()?;
+            let ty = table.columns[c].ty;
+            let bounds = perm[b.start..b.end]
+                .iter()
+                .filter_map(|&r| compared_key(ty, orderer, &rows.columns[c], r))
+                .map(|k| crate::directory::prefix_bound(&k));
+            if let Some((lo, hi)) = bounds.fold(None, |m: Option<(i128, i128)>, v| {
+                Some(m.map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v))))
+            }) {
+                let s = order.leaf_slot(table, c).unwrap();
+                summaries[s].min = lo;
+                summaries[s].max = hi;
+            }
+        }
+    }
     let map_at = |start: u64| -> PageMap {
         let mut at = start;
         let mut place = |bytes: usize| {
@@ -1830,7 +1888,7 @@ pub(crate) fn write_block(
                 .iter()
                 .enumerate()
                 .map(|(s, e)| ColumnPages {
-                    unit: if keep_units { units[s] as u32 } else { 0 },
+                    unit: if current { units[s] as u32 } else { 0 },
                     dictionary: e.dictionary.as_ref().map(|d| place(d.len())),
                     pages: e
                         .pages

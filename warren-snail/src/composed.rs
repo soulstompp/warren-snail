@@ -490,6 +490,7 @@ pub fn structure_rung(ty: ColumnType, at: &dyn Fn(usize) -> Option<u8>, want: us
         want,
         seen: 0,
         got: None,
+        all: None,
     };
     let _ = w.value(ty);
     w.got.unwrap_or(-1)
@@ -497,15 +498,21 @@ pub fn structure_rung(ty: ColumnType, at: &dyn Fn(usize) -> Option<u8>, want: us
 
 /// The rungs a value of `ty` is cut on, from its key, `at(i)` its i-th byte.
 pub fn structure_rungs(ty: ColumnType, at: &dyn Fn(usize) -> Option<u8>) -> usize {
+    structure_all(ty, at).len()
+}
+
+/// Every rung of a value of `ty` cut on its structure, from its key, `at(i)` its i-th byte.
+pub fn structure_all(ty: ColumnType, at: &dyn Fn(usize) -> Option<u8>) -> Vec<i64> {
     let mut w = Walk {
         at,
         pos: 0,
         want: usize::MAX,
         seen: 0,
         got: None,
+        all: Some(Vec::new()),
     };
     let _ = w.value(ty);
-    w.seen
+    w.all.unwrap_or_default()
 }
 
 /// A walk of a composed value's key, as `key_into` writes it, to the rung it wants.
@@ -515,10 +522,14 @@ struct Walk<'a> {
     want: usize,
     seen: usize,
     got: Option<i64>,
+    all: Option<Vec<i64>>,
 }
 
 impl Walk<'_> {
     fn emit(&mut self, v: i64) -> Option<()> {
+        if let Some(all) = &mut self.all {
+            all.push(v);
+        }
         if self.seen == self.want {
             self.got = Some(v);
             return None;

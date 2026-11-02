@@ -1528,9 +1528,8 @@ impl Snail {
                 }
                 let sublevels = Sublevels::new(order, table, &head.level_text);
                 for (bi, b) in level.iter().enumerate() {
-                    let place: Vec<i64> = (0..b.depth as usize)
-                        .map(|r| sublevels.value(&b.first, r))
-                        .collect();
+                    let mut place = sublevels.all(&b.first);
+                    place.truncate(b.depth as usize);
                     let map = read_map(&self.reader, b, &head.level_text)?;
                     let (map_run, _) = b.map_run();
                     for (s, (c, leaf)) in order.leaves(table).iter().enumerate() {
