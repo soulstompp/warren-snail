@@ -460,6 +460,7 @@ pub(super) fn ask_join_across(
             snail.read_plan(&part.plan, &want, &columns, &mut sink)?;
             t.held[side] = held;
         }
+        snail.reader.read_done();
         mine.column_pages_read = snail.reader.pages_read() - mid;
         let w = &part.plan.walk;
         let name = table.orders[w.order].name.clone();

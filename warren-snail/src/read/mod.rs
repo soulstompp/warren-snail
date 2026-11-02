@@ -31,6 +31,7 @@ mod ranges;
 mod relations;
 mod rest;
 mod sets;
+mod spill;
 mod spelled;
 pub mod statement;
 mod subqueries;
@@ -439,6 +440,12 @@ pub struct Round {
     /// For a round across several snails, each snail's part of it, in the order they were opened:
     /// the root pages it read as the round began, and what it read of each of its tables.
     pub snails: Vec<Round>,
+    /// The most bytes the round held at once: the rows its places held, at their held width, and
+    /// the pages it kept for its later reads.
+    pub bytes_held: u64,
+    /// The pages the round wrote to its spill, the rows past its room, and those it read back.
+    pub spill_pages_written: u64,
+    pub spill_pages_read: u64,
 }
 
 impl Round {
@@ -1121,6 +1128,18 @@ impl Snail {
         self.ask_with(sql, order, &[])
     }
 
+    /// Gives each round from now on the room `sizes` names: the bytes it holds its rows and the pages
+    /// it keeps for its later reads in, 128 MB unless told otherwise; the directory it writes the rows
+    /// past them to, a file of its own removed as soon as it is opened; and the most it writes there.
+    pub fn size_rounds(&mut self, sizes: crate::room::Sizes) {
+        self.reader.room().set_sizes(sizes);
+    }
+
+    /// The room each round is given.
+    pub fn round_sizes(&self) -> crate::room::Sizes {
+        self.reader.room().sizes()
+    }
+
     /// Hands the snail a function of its caller's, which its questions and statements then call by
     /// its name as any function: refused where PostgreSQL or the snail's DDL has a function of its
     /// name, or a form of the same arguments is handed already.
@@ -1138,6 +1157,8 @@ impl Snail {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _handed = handed::holding(&self.functions);
+        let room = self.reader.room();
+        let _room = crate::room::entered(&room);
         self.wasted.borrow_mut().clear();
         let (batch, mut round) = match locking::clauses(sql)? {
             Some(l) => self.ask_locking(l, order, params)?,
@@ -1157,6 +1178,22 @@ impl Snail {
     }
 
     fn answer_with(
+        &self,
+        sql: &str,
+        order: Option<&str>,
+        params: &[String],
+    ) -> Result<(RecordBatch, Round)> {
+        let room = self.reader.room();
+        let entered = crate::room::entered(&room);
+        let (batch, mut round) = self.answer_in_room(sql, order, params)?;
+        let room = crate::room::current().expect("a round under way has its room");
+        round.bytes_held = room.most();
+        (round.spill_pages_written, round.spill_pages_read) = room.spill_pages();
+        drop(entered);
+        Ok((batch, round))
+    }
+
+    fn answer_in_room(
         &self,
         sql: &str,
         order: Option<&str>,
@@ -1356,7 +1393,9 @@ impl Snail {
         let column_pages_held = self.reader.keep_for_round(part.plan.disk_pages());
         let mid = self.reader.pages_read();
         let (walked, taken) = (self.walked.get(), self.taken.get());
-        self.read_plan(&part.plan, &want, &columns, sink)?;
+        let read = self.read_plan(&part.plan, &want, &columns, sink);
+        self.reader.read_done();
+        read?;
         let column_pages_read = self.reader.pages_read() - mid;
         let w = &part.plan.walk;
         let round = Round {
@@ -1385,6 +1424,7 @@ impl Snail {
             rows_walked: self.walked.get() - walked,
             rows_taken: self.taken.get() - taken,
             snails: Vec::new(),
+            ..Default::default()
         };
         Ok((round, w.counted, w.counted_months))
     }

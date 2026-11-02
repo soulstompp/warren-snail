@@ -249,6 +249,10 @@ impl Snails {
             let refs: Vec<&Snail> = snails.iter().collect();
             Snails::merged(&refs, &|i| paths[i].display().to_string())?
         };
+        // A round across them holds its rows and the pages it keeps in one room.
+        for s in &snails[1..] {
+            s.reader.hold_rounds_in(snails[0].reader.room());
+        }
         Ok(Snails {
             snails,
             paths: paths.iter().map(|p| p.to_path_buf()).collect(),
@@ -648,6 +652,12 @@ impl Snails {
         Ok(keyed.into_iter().map(|(_, i)| i).collect())
     }
 
+    /// Gives each round across them from now on the room `sizes` names, as `Snail::size_rounds`
+    /// gives one snail's.
+    pub fn size_rounds(&mut self, sizes: crate::room::Sizes) {
+        self.snails[0].reader.room().set_sizes(sizes);
+    }
+
     /// Answers a question on the snails' tables: one round across them.
     pub fn ask(&mut self, sql: &str) -> Result<(RecordBatch, Round)> {
         self.ask_with(sql, &[])
@@ -686,6 +696,8 @@ impl Snails {
             at,
         );
         let _handed = super::handed::holding(&self.functions);
+        let room = self.snails[0].reader.room();
+        let _room = crate::room::entered(&room);
         let mut read = self.snails_named(sql)?;
         if read.is_empty() {
             read.push(0);
@@ -764,6 +776,8 @@ impl Snails {
                 part.pages_written = written;
             }
         }
+        round.bytes_held = room.most();
+        (round.spill_pages_written, round.spill_pages_read) = room.spill_pages();
         Ok((batch, round))
     }
 

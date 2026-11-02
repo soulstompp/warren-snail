@@ -4,7 +4,7 @@
 
 use crate::cut::PAGE;
 #[cfg(feature = "standalone")]
-use crate::held::{Held, UNTAGGED};
+use crate::held::Held;
 use crate::{Error, Result};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -807,7 +807,6 @@ impl Root {
 }
 
 /// The pages that hold the root's two copies, read afresh by every round and never held.
-#[cfg(feature = "standalone")]
 const ROOT_PAGES: u64 = 2;
 
 /// The first number of a page staged in memory, far past any page a file holds.
@@ -1024,11 +1023,18 @@ pub struct Reader {
     unseen: Cell<Option<u64>>,
     #[cfg(feature = "standalone")]
     held: RefCell<Held>,
-    #[cfg(feature = "standalone")]
     hits: Cell<u64>,
-    #[cfg(feature = "standalone")]
     tag: Cell<u32>,
+    /// The room of the reader's rounds, which keeps the pages a round has read for its later reads,
+    /// and the reader's name there.
+    room: RefCell<Rc<crate::room::Room>>,
+    id: u64,
 }
+
+static READERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The tag of a page read under none.
+const NO_TAG: u32 = u32::MAX;
 
 impl Reader {
     /// The file the reader was opened on.
@@ -1051,10 +1057,10 @@ impl Reader {
             unseen: Cell::new(None),
             #[cfg(feature = "standalone")]
             held: RefCell::new(Held::new(0)),
-            #[cfg(feature = "standalone")]
             hits: Cell::new(0),
-            #[cfg(feature = "standalone")]
-            tag: Cell::new(UNTAGGED),
+            tag: Cell::new(NO_TAG),
+            room: RefCell::new(crate::room::Room::new(Default::default())),
+            id: READERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -1072,12 +1078,25 @@ impl Reader {
         self.pages.get()
     }
 
-    /// The pages found held, rather than read from the file.
+    /// The pages found held, rather than read from the file: held between rounds, or kept by the
+    /// round for its later reads.
     pub fn pages_held(&self) -> u64 {
-        #[cfg(feature = "standalone")]
-        return self.hits.get();
-        #[cfg(not(feature = "standalone"))]
-        0
+        self.hits.get()
+    }
+
+    /// The room of the reader's rounds.
+    pub fn room(&self) -> Rc<crate::room::Room> {
+        self.room.borrow().clone()
+    }
+
+    /// Holds the reader's rounds in `room`, which several readers may share.
+    pub fn hold_rounds_in(&self, room: Rc<crate::room::Room>) {
+        *self.room.borrow_mut() = room;
+    }
+
+    /// The room of the round under way, where it is the reader's.
+    fn round_room(&self) -> Option<Rc<crate::room::Room>> {
+        crate::room::current().filter(|r| Rc::ptr_eq(r, &self.room.borrow()))
     }
 
     /// A place that stages pages in this reader's memory, where its reads find them.
@@ -1114,98 +1133,109 @@ impl Reader {
                     .ok_or_else(|| Error::new("a page staged is missing"))?;
                 buf[i as usize * PAGE..(i as usize + 1) * PAGE].copy_from_slice(page);
             }
-            #[cfg(feature = "standalone")]
             self.hits.set(self.hits.get() + pages);
             return Ok(buf);
         }
+        // A page is found held between rounds, or kept by the round under way; the rest are read,
+        // and kept so where they fit.
+        let room = self.round_room();
         #[cfg(feature = "standalone")]
-        {
-            let mut held = self.held.borrow_mut();
-            let mut missing = Vec::new();
-            for i in 0..pages as usize {
+        let mut held = self.held.borrow_mut();
+        let mut missing = Vec::new();
+        for i in 0..pages as usize {
+            let n = start + i as u64;
+            let page = &mut buf[i * PAGE..(i + 1) * PAGE];
+            #[cfg(feature = "standalone")]
+            if let Some(p) = held.touch(n) {
+                page.copy_from_slice(p);
+                self.hits.set(self.hits.get() + 1);
+                continue;
+            }
+            match room.as_ref().is_some_and(|r| r.page(self.id, n, page)) {
+                true => self.hits.set(self.hits.get() + 1),
+                false => missing.push(i),
+            }
+        }
+        let mut k = 0;
+        while k < missing.len() {
+            let mut z = k + 1;
+            while z < missing.len() && missing[z] == missing[z - 1] + 1 {
+                z += 1;
+            }
+            let (a, b) = (missing[k], missing[z - 1] + 1);
+            self.files
+                .read_at(&mut buf[a * PAGE..b * PAGE], start + a as u64)?;
+            self.pages.set(self.pages.get() + (b - a) as u64);
+            for i in a..b {
                 let n = start + i as u64;
-                match held.touch(n) {
-                    Some(page) => {
-                        buf[i * PAGE..(i + 1) * PAGE].copy_from_slice(page);
-                        self.hits.set(self.hits.get() + 1);
-                    }
-                    None => missing.push(i),
+                if n < ROOT_PAGES {
+                    continue;
                 }
-            }
-            let mut k = 0;
-            while k < missing.len() {
-                let mut z = k + 1;
-                while z < missing.len() && missing[z] == missing[z - 1] + 1 {
-                    z += 1;
-                }
-                let (a, b) = (missing[k], missing[z - 1] + 1);
-                self.files
-                    .read_at(&mut buf[a * PAGE..b * PAGE], start + a as u64)?;
-                self.pages.set(self.pages.get() + (b - a) as u64);
-                for i in a..b {
-                    let n = start + i as u64;
-                    if n >= ROOT_PAGES {
-                        held.keep(n, &buf[i * PAGE..(i + 1) * PAGE], self.tag.get());
+                let page = &buf[i * PAGE..(i + 1) * PAGE];
+                #[cfg(feature = "standalone")]
+                {
+                    held.keep(n, page, self.tag.get());
+                    if held.holds(n) {
+                        continue;
                     }
                 }
-                k = z;
+                if let Some(r) = &room {
+                    r.keep_page(self.id, n, page, self.tag.get());
+                }
             }
-            Ok(buf)
+            k = z;
         }
-        #[cfg(not(feature = "standalone"))]
-        {
-            self.files.read_at(&mut buf, start)?;
-            self.pages.set(self.pages.get() + pages);
-            Ok(buf)
-        }
+        Ok(buf)
     }
 
     /// Tags the pages read from now on, until tagged otherwise; `None` leaves them untagged.
     pub fn tag_reads(&self, tag: Option<u32>) {
-        #[cfg(feature = "standalone")]
-        self.tag.set(tag.unwrap_or(UNTAGGED));
-        #[cfg(not(feature = "standalone"))]
-        let _ = tag;
+        self.tag.set(tag.unwrap_or(NO_TAG));
     }
 
-    /// The pages held that were read under `tag`.
+    /// The pages held that were read under `tag`: between rounds, and kept by the round.
     pub fn held_under(&self, tag: u32) -> u64 {
+        let kept = self.round_room().map_or(0, |r| r.tagged(self.id, tag));
         #[cfg(feature = "standalone")]
-        return self.held.borrow().tagged(tag);
+        return self.held.borrow().tagged(tag) + kept;
         #[cfg(not(feature = "standalone"))]
-        {
-            let _ = tag;
-            0
-        }
+        kept
     }
 
     /// Of these pages, those held, their use left as it was.
     pub fn held_among(&self, pages: impl Iterator<Item = u64>) -> u64 {
+        let room = self.round_room();
+        let kept = |n: u64| room.as_ref().is_some_and(|r| r.keeps(self.id, n));
         #[cfg(feature = "standalone")]
-        {
-            let held = self.held.borrow();
-            pages.filter(|&n| n >= STAGED || held.holds(n)).count() as u64
-        }
+        let held = self.held.borrow();
+        #[cfg(feature = "standalone")]
+        let between = |n: u64| held.holds(n);
         #[cfg(not(feature = "standalone"))]
-        {
-            let _ = pages;
-            0
-        }
+        let between = |_: u64| false;
+        pages
+            .filter(|&n| n >= STAGED || between(n) || kept(n))
+            .count() as u64
     }
 
-    /// Of the pages a round will read, those held, which the round now keeps until it ends.
+    /// Of the pages a read will read, those held, which the round now keeps until the read ends.
     pub fn keep_for_round(&self, pages: impl Iterator<Item = u64>) -> u64 {
+        let room = self.round_room();
+        let kept = |n: u64| room.as_ref().is_some_and(|r| r.pin(self.id, std::iter::once(n)) == 1);
         #[cfg(feature = "standalone")]
-        {
-            let mut held = self.held.borrow_mut();
-            pages
-                .filter(|&n| n >= STAGED || (n >= ROOT_PAGES && held.touch(n).is_some()))
-                .count() as u64
-        }
+        let mut held = self.held.borrow_mut();
+        #[cfg(feature = "standalone")]
+        let mut between = |n: u64| held.touch(n).is_some();
         #[cfg(not(feature = "standalone"))]
-        {
-            let _ = pages;
-            0
+        let between = |_: u64| false;
+        pages
+            .filter(|&n| n >= STAGED || (n >= ROOT_PAGES && (between(n) || kept(n))))
+            .count() as u64
+    }
+
+    /// Lets the pages a read kept go with the round's room again, the read done.
+    pub fn read_done(&self) {
+        if let Some(r) = self.round_room() {
+            r.unpin();
         }
     }
 
@@ -1337,8 +1367,17 @@ impl Reader {
                 }
             }
         }
-        #[cfg(not(feature = "standalone"))]
-        let _ = root;
+        let last = self.generation.get();
+        let room = self.room.borrow();
+        if last < root.reused_from {
+            room.forget_file(self.id);
+        } else {
+            for &(g, start, pages) in &root.reused {
+                if g > last {
+                    room.forget(self.id, start, pages);
+                }
+            }
+        }
     }
 
     /// Drops the held copies of the pages in `start..start + pages`, which are about to be written
@@ -1346,8 +1385,7 @@ impl Reader {
     pub fn forget(&self, start: u64, pages: u64) {
         #[cfg(feature = "standalone")]
         self.held.borrow_mut().forget(start, pages);
-        #[cfg(not(feature = "standalone"))]
-        let _ = (start, pages);
+        self.room.borrow().forget(self.id, start, pages);
     }
 
     /// The first file the reader reads, whose locks its round holds.
