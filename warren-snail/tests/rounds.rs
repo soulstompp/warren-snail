@@ -303,7 +303,7 @@ fn a_step_past_the_round_s_room_writes_the_rows_past_it_once_and_reads_them_back
     // The step reading it is handed its FROM a chunk at a time: the most held is the room, and what
     // one chunk holds, the rows of a block of the table or of four pages of the spill.
     assert!(
-        round.bytes_held >= held * row && round.bytes_held <= room + one_chunk(&path, row),
+        round.bytes_held >= held * row + 4 * 4096 && round.bytes_held <= room + one_chunk(&path, row),
         "{q}: {round:?}"
     );
     assert_eq!(
@@ -906,16 +906,16 @@ fn a_subquery_s_kept_table_past_the_room_is_read_back_in_the_order_of_its_keys_h
         assert_eq!(round.spill_pages_written, 0, "{q}");
     }
     // A LATERAL's table past the room is read a chunk at a time by each row before it.
-    let q = format!(
-        "SELECT sum(d.n) FROM {OWNERS}, LATERAL (SELECT count(*) AS n FROM s.p p WHERE p.owner = o.k) d"
-    )
-    .replace("{}", "");
+    // The first 16 owners' 512 purchases, at 9 bytes the column named, past a room of 4 KiB.
+    let q = "SELECT sum(d.n) FROM (SELECT o.k FROM s.o o WHERE o.k < 16) o, \
+             LATERAL (SELECT count(*) AS n FROM s.p p WHERE p.owner = o.k) d";
     let mut snail = Snail::open(&path).unwrap();
-    snail.size_rounds(Sizes::of(room).in_dir(&dir));
-    let (b, round) = snail.ask(&q, None).unwrap();
-    each_read_exact(&q, &round);
-    assert_eq!(one(&b), PURCHASES, "{q}");
-    assert!(round.bytes_held <= most, "{q}: {round:?}");
+    snail.size_rounds(Sizes::of(4096).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    each_read_exact(q, &round);
+    assert_eq!(one(&b), 512, "{q}");
+    assert!(round.spill_pages_read > round.spill_pages_written, "{q}: {round:?}");
+    assert!(round.bytes_held <= 4096 + one_chunk(&path, 27) + 16 * 9, "{q}: {round:?}");
     // An uncorrelated IN's rows past the room, their keys fitting no room, are read by each row.
     let q = "SELECT count(*) FROM s.p p WHERE p.id < 4 AND p.id IN (SELECT q.owner FROM s.p q)";
     let mut snail = Snail::open(&path).unwrap();
@@ -968,7 +968,16 @@ fn an_order_by_a_strand_gives_is_read_along_it_where_its_price_is_fewest() {
         (pages, pages),
         "{q}: {round:?}"
     );
-    // A DESC or a column another name hides is no strand's: sorted, the same rows.
+    // A DESC is no strand's, its rows read along the table's own order and sorted.
+    let q = "SELECT p.id FROM s.p p ORDER BY p.owner DESC, p.at DESC LIMIT 2";
+    let mut last = all_purchases();
+    last.sort_by_key(|&(_, o, at)| std::cmp::Reverse((o, at)));
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(q, None).unwrap();
+    assert_eq!(ints(&b), [[last[0].0], [last[1].0]], "{q}");
+    assert_eq!(round.order, "p_pkey", "{q}");
+    // Nor a name an item takes as its alias, read as that item.
     let q = "SELECT p.id AS at, p.at AS id FROM s.p p ORDER BY id LIMIT 1";
     let mut snail = Snail::open(&path).unwrap();
     snail.size_rounds(Sizes::of(room).in_dir(&dir));
@@ -1068,19 +1077,32 @@ fn a_window_over_a_join_along_its_first_table_s_strand_holds_one_partition_at_a_
         "{q}: {round:?}"
     );
     // A chunk, the owners' hash and one owner's 32 rows.
-    assert!(round.bytes_held <= room, "{q}: {round:?}");
-    // With the other side past the room, its order is lost: the partitions held whole, and every
-    // answer the same.
-    let q = "WITH o AS (SELECT p.owner AS k, p.id AS tag FROM s.p p) \
-             SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
-             FROM s.p p JOIN (SELECT DISTINCT o.k FROM o) d ON d.k = p.owner";
+    assert!(round.bytes_held <= room + one_chunk(&path, 27), "{q}: {round:?}");
+    // A LEFT JOIN keeps each row of its first table, those that meet none among them: the owners
+    // from 256 on meet none.
+    let left = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
+                FROM s.p p LEFT JOIN (SELECT o.k FROM s.o o WHERE o.k < 256) d ON d.k = p.owner";
     let mut snail = Snail::open(&path).unwrap();
-    snail.size_rounds(Sizes::of(2048).in_dir(&dir));
+    snail.size_rounds(Sizes::of(room).in_dir(&dir));
+    let (b, round) = snail.ask(left, None).unwrap();
+    each_read_exact(left, &round);
+    let mut got = ints(&b);
+    got.sort();
+    assert_eq!(got, want, "{left}");
+    assert!(round.reads.iter().any(|r| r.order == "p_owner"), "{round:?}");
+    // With the other side past the room, 512 owners at 9 bytes in 4 KiB, its order is lost: the
+    // partitions held whole, and the answer the same over the first 32 owners' purchases.
+    let q = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
+             FROM s.p p JOIN (SELECT o.k FROM s.o o ORDER BY o.k) d ON d.k = p.owner \
+             WHERE p.owner < 32";
+    let few: Vec<(i64, i64, i64)> = all_purchases().into_iter().filter(|r| r.1 < 32).collect();
+    let mut snail = Snail::open(&path).unwrap();
+    snail.size_rounds(Sizes::of(4096).in_dir(&dir));
     let (b, round) = snail.ask(q, None).unwrap();
     each_read_exact(q, &round);
     let mut got = ints(&b);
     got.sort();
-    assert_eq!(got, want, "{q}");
+    assert_eq!(got, places(&few), "{q}");
     // At 128 MB the sort fits: read as the join's round reads it, nothing written.
     let q = "SELECT p.id, row_number() OVER (PARTITION BY p.owner ORDER BY p.at) \
              FROM s.p p JOIN s.o o ON o.k = p.owner";
