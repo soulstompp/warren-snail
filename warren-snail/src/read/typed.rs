@@ -495,6 +495,25 @@ impl Typing<'_> {
                 }
                 Some(ColumnType::Boolean)
             }
+            Expr::BinaryOp { left, op, right } if super::image::operator(op).is_some() => {
+                let name = super::image::operator(op).unwrap_or_default();
+                super::image::ordered(name)?;
+                if let (Some(l), Some(r)) = (
+                    super::pipeline::row_parts(left),
+                    super::pipeline::row_parts(right),
+                ) {
+                    let (l, r) = (l?, r?);
+                    super::image::rows_agree(l.len(), r.len())?;
+                    for (x, y) in l.iter().zip(&r) {
+                        let (a, b) = (self.type_of(x)?, self.type_of(y)?);
+                        super::image::operands(name, a, b, x, y)?;
+                    }
+                } else {
+                    let (a, b) = (self.type_of(left)?, self.type_of(right)?);
+                    super::image::operands(name, a, b, left, right)?;
+                }
+                Some(ColumnType::Boolean)
+            }
             Expr::BinaryOp { left, op, right } => {
                 let (a, b) = (self.type_of(left)?, self.type_of(right)?);
                 if let Some(t) = statistics_operator(&op.to_string(), a, b)? {
@@ -566,6 +585,14 @@ impl Typing<'_> {
                     "floor"
                 };
                 numbers(name, &[t])?.flatten()
+            }
+            Expr::Tuple(_) | Expr::Function(_) if super::pipeline::row_parts(e).is_some() => {
+                let parts = super::pipeline::row_parts(e).unwrap()?;
+                let mut types = Vec::with_capacity(parts.len());
+                for x in &parts {
+                    types.push(self.type_of(x)?);
+                }
+                super::image::field_types(&parts, &types).map(|f| super::image::anonymous(&f))
             }
             Expr::Function(f) => {
                 let name = super::pipeline::function_name(f);

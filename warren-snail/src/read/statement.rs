@@ -10,7 +10,6 @@ use sqlparser::ast::{
     SetExpr, Statement as Sql, TableFactor, TableObject, TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
 
 /// One value of a row.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1081,7 +1080,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
     }
     super::question::unlocked_words(sql)?;
     super::spelled::at_at_spaced(sql)?;
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
+    let statements = super::image::parse_sql(sql)?;
     let s = match statements.as_slice() {
         [s] => s,
         _ => return Err(Error::new("one statement at a time")),

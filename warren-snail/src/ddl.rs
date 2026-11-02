@@ -1428,9 +1428,9 @@ pub(crate) fn index_extras(tokens: &[Token]) -> Result<IndexExtras> {
 
 /// The statements of a DDL, split on their semicolons by sqlparser's PostgreSQL tokenizer.
 pub(crate) fn statements(ddl: &str) -> Result<Vec<Vec<Token>>> {
-    let tokens = Tokenizer::new(&PostgreSqlDialect {}, ddl).tokenize()?;
+    let tokens = crate::read::image::tokens(ddl)?;
     let mut out = vec![Vec::new()];
-    for t in tokens {
+    for t in tokens.into_iter().map(|t| t.token) {
         if t == Token::SemiColon {
             out.push(Vec::new());
         } else {
@@ -1587,7 +1587,10 @@ fn words(tokens: &[Token]) -> Vec<String> {
 /// other words than it, so nothing it declares is dropped without a word. The words are compared
 /// as a whole, in any order, since sqlparser prints a statement's clauses in an order of its own.
 pub(crate) fn read_as_written(tokens: &[Token], st: &Statement, what: &str) -> Result<()> {
-    let back = Tokenizer::new(&PostgreSqlDialect {}, &st.to_string()).tokenize()?;
+    let back: Vec<Token> = crate::read::image::tokens(&st.to_string())?
+        .into_iter()
+        .map(|t| t.token)
+        .collect();
     let (a, b) = (words(tokens), words(&back));
     if a == b {
         return Ok(());
@@ -2895,8 +2898,13 @@ impl Draft {
                 .build(),
         );
         if plain.to_string() != st.to_string() {
-            let a = Tokenizer::new(&PostgreSqlDialect {}, &st.to_string()).tokenize()?;
-            let b = Tokenizer::new(&PostgreSqlDialect {}, &plain.to_string()).tokenize()?;
+            let spoken = |s: &Statement| -> Result<Vec<Token>> {
+                Ok(crate::read::image::tokens(&s.to_string())?
+                    .into_iter()
+                    .map(|t| t.token)
+                    .collect())
+            };
+            let (a, b) = (spoken(&st)?, spoken(&plain)?);
             let (a, b) = (Cursor::new(&a).t, Cursor::new(&b).t);
             let at = a
                 .iter()
@@ -4740,7 +4748,7 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
     }
     // Each view's columns, by the names its column list gives and its question returns.
     for v in &c.views {
-        let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &v.query);
+        let parsed = crate::read::image::parse_sql(&v.query);
         let made = match parsed.as_deref() {
             Ok([Statement::Query(q)]) => crate::read::view_columns(c, q).unwrap_or_default(),
             _ => Vec::new(),
@@ -4963,7 +4971,7 @@ fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
         },
         _ => String::new(),
     };
-    let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &text)
+    let parsed = crate::read::image::parse_sql(&text)
         .map_err(|e| Error::new(format!("{name}: its body: {e}")))?;
     let body = match parsed.as_slice() {
         [Statement::Query(q)] => match q.body.as_ref() {

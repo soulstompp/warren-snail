@@ -18,6 +18,7 @@ pub(crate) mod fill;
 pub(crate) mod foreign;
 pub mod handed;
 mod hash;
+pub(crate) mod image;
 mod join;
 mod json;
 mod level;
@@ -329,7 +330,7 @@ fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlpa
         }
         None => format!("WITH {} {q}", with.join(", ")),
     };
-    match sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &rest)?
+    match image::parse_sql(&rest)?
         .as_slice()
     {
         [sqlparser::ast::Statement::Query(q)] => Ok(Some((**q).clone())),
@@ -1487,8 +1488,7 @@ impl Snail {
         question::unlocked_words(sql)?;
         relations::unread_clauses(sql)?;
         let sql = &*spelled::spelled(sql)?;
-        let parsed =
-            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
+        let parsed = image::parse_sql(sql)?;
         if let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() {
             question::unlocked(q)?;
             if let Some(r) = computed(&self.catalog, q)? {
@@ -1512,6 +1512,7 @@ impl Snail {
                 || relations::is_set_operation(q)
                 || pipeline::tests_composite_null(&self.catalog, q)
                 || pipeline::reads_per_row(&self.catalog, q)
+                || image::names_an_operator(sql)
             {
                 if order.is_some() && (pipeline::is_pipeline(q) || relations::is_set_operation(q)) {
                     return Err(Error::new("a pipeline reads its table along its own order"));

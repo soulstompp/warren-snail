@@ -286,8 +286,7 @@ pub(super) fn key_of(table: &Table, order: &Order, row: &Row) -> Result<Vec<KeyV
 /// column's from its table, an expression's as the pipeline types it; none where it is not known.
 fn stated_types(catalog: &Catalog, question: &str) -> Vec<Option<ColumnType>> {
     use sqlparser::ast::{SelectItem, SetExpr, Statement as Sql, TableFactor};
-    let dialect = sqlparser::dialect::PostgreSqlDialect {};
-    let Ok(parsed) = sqlparser::parser::Parser::parse_sql(&dialect, question) else {
+    let Ok(parsed) = super::image::parse_sql(question) else {
         return Vec::new();
     };
     let [Sql::Query(q)] = parsed.as_slice() else {
@@ -443,8 +442,7 @@ fn answer_type(dt: &arrow::datatypes::DataType) -> Result<ColumnType> {
 /// last part of its name.
 fn finder_relation(find: &str) -> Result<(String, String)> {
     use sqlparser::ast::{ObjectNamePart, SetExpr, Statement as Sql, TableFactor};
-    let parsed =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, find)?;
+    let parsed = super::image::parse_sql(find)?;
     if let [Sql::Query(q)] = parsed.as_slice() {
         if let SetExpr::Select(s) = q.body.as_ref() {
             if let Some(TableFactor::Table { name, alias, .. }) =
@@ -1248,10 +1246,7 @@ impl Snail {
         let mut computed: Vec<(usize, sqlparser::ast::Expr)> = Vec::new();
         for (c, f) in &sets {
             if let Fill::Expression(text) = f {
-                let e = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
-                    .try_with_sql(text)?
-                    .parse_expr()?;
-                computed.push((*c, e));
+                computed.push((*c, super::image::parse_expr(text)?));
             }
         }
         if !computed.is_empty() {
@@ -2359,7 +2354,7 @@ impl Snail {
                     chain: None,
                 }),
                 Change::Replace(o, n) => {
-                    if held(o) == held(n) {
+                    if super::image::held_alike(&held(o), &held(n)) {
                         continue;
                     }
                     let to = key_of(table, order, n)?;
@@ -2779,7 +2774,9 @@ impl Snail {
                 .iter()
                 .zip(values)
                 .zip(&types)
-                .all(|((v, d), &ty)| datum_typed(v, p, ty) == *d)
+                .all(|((v, d), &ty)| {
+                    super::image::held_alike(&[datum_typed(v, p, ty)], std::slice::from_ref(d))
+                })
         };
         let level_slots: Vec<usize> = order
             .levels

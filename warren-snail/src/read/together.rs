@@ -297,8 +297,7 @@ fn answer_lying(snails: &[&Snail], sql: &str, lying: &mut Lying) -> Result<Round
     question::unlocked_words(sql)?;
     relations::unread_clauses(sql)?;
     let sql = &*spelled::spelled(sql)?;
-    let parsed =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
+    let parsed = super::image::parse_sql(sql)?;
     let [sqlparser::ast::Statement::Query(asked)] = parsed.as_slice() else {
         return Err(Error::new("a question is one SELECT"));
     };
@@ -604,10 +603,7 @@ pub fn price_stopped(snails: &[&Snail], sql: &str, priced: &Priced, room: u64) -
             }
         }
     }
-    let parsed = sqlparser::parser::Parser::parse_sql(
-        &sqlparser::dialect::PostgreSqlDialect {},
-        &spelled::spelled(sql)?,
-    )?;
+    let parsed = super::image::parse_sql(&spelled::spelled(sql)?)?;
     let named = relations::Named::of(
         &parsed
             .iter()

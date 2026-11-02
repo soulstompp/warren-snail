@@ -3112,7 +3112,7 @@ fn is_record(ty: ColumnType) -> bool {
 }
 
 /// The values a row constructor, `ROW(…)` or `(…, …)`, is made of; none where it is none.
-fn row_parts(e: &Expr) -> Option<Result<Vec<&Expr>>> {
+pub(super) fn row_parts(e: &Expr) -> Option<Result<Vec<&Expr>>> {
     match e {
         Expr::Tuple(xs) => Some(Ok(xs.iter().collect())),
         Expr::Function(f) if crate::catalog::object_name(&f.name).eq_ignore_ascii_case("row") => {
@@ -3745,6 +3745,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             list,
             negated,
         } => {
+            if row_parts(expr).is_some() {
+                return Err(Error::new(format!("{expr} is not read")));
+            }
             let v = ev(expr)?;
             if v.is_null() {
                 return Ok(Value::Null);
@@ -3794,6 +3797,10 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             };
             Value::Bool(same == matches!(e, Expr::IsNotDistinctFrom(..)))
         }
+        Expr::BinaryOp { left, op, right } if super::image::operator(op).is_some() => {
+            let name = super::image::operator(op).unwrap_or_default();
+            super::image::answer(name, left, right, &ev)?
+        }
         Expr::BinaryOp { left, op, right } => {
             if let (BinaryOperator::AtAt, Some(inner)) =
                 (op, super::spelled::right_of_three_ats(right))
@@ -3824,6 +3831,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     right: Box::new(inner.clone()),
                 };
                 return eval(&matched, row, frame, computed);
+            }
+            if row_parts(left).is_some() && row_parts(right).is_some() && !matches!(op, BinaryOperator::Overlaps) {
+                return Err(Error::new(format!("{left} is not read")));
             }
             match op {
                 BinaryOperator::And | BinaryOperator::Or => {
@@ -4178,6 +4188,27 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             };
             super::calls::numbers(name, &[ev(expr)?], &[frame.type_of(expr)], frame.type_of(e))?
                 .ok_or_else(|| Error::new(format!("{e} is not read")))?
+        }
+        Expr::Tuple(_) | Expr::Function(_) if row_parts(e).is_some() => {
+            let parts = row_parts(e).unwrap()?;
+            let values = parts.iter().map(|x| ev(x)).collect::<Result<Vec<_>>>()?;
+            let told: Vec<_> = parts
+                .iter()
+                .zip(&values)
+                .map(|(x, v)| {
+                    frame
+                        .type_of(x)
+                        .or_else(|| (!super::image::unknown(x)).then(|| type_of_value(v)).flatten())
+                })
+                .collect();
+            let fields = super::image::field_types(&parts, &told).ok_or_else(|| Error::new(format!("{e} is not read")))?;
+            let items = values
+                .into_iter()
+                .zip(&fields)
+                .zip(&parts)
+                .map(|((v, f), x)| part_of(f.0, v, quoted(x)))
+                .collect::<Result<Vec<_>>>()?;
+            composed(super::image::anonymous(&fields), crate::composed::Item::Record(items))
         }
         Expr::Function(f) => {
             let name = function_name(f);
@@ -7526,6 +7557,7 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::ILike { .. }
         | Expr::Between { .. }
         | Expr::Substring { .. }
+        | Expr::Tuple(_)
         | Expr::Case { .. } => true,
         Expr::Value(v) => matches!(v.value, SqlValue::Placeholder(_)),
         Expr::BinaryOp { left, op, right } => {

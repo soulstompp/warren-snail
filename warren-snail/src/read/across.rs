@@ -794,10 +794,7 @@ impl Snails {
                     _ => {
                         let read = parsed;
                         let sql = &*super::spelled::spelled(sql)?;
-                        let parsed = sqlparser::parser::Parser::parse_sql(
-                            &sqlparser::dialect::PostgreSqlDialect {},
-                            sql,
-                        )?;
+                        let parsed = super::image::parse_sql(sql)?;
                         let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
                             return Err(read
                                 .err()
@@ -851,8 +848,7 @@ impl Snails {
     /// The snails whose tables a question names, in the order they were opened.
     fn snails_named(&self, sql: &str) -> Result<Vec<usize>> {
         let sql = &*super::spelled::spelled(sql)?;
-        let parsed =
-            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)?;
+        let parsed = super::image::parse_sql(sql)?;
         let mut names = Vec::new();
         if let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() {
             // A view's tables may lie in any of them.

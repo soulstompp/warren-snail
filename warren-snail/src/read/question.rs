@@ -9,7 +9,6 @@ use sqlparser::ast::{
     TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
 /// Values from `lo` to `hi`, both included, as their keys.
@@ -1373,7 +1372,7 @@ pub(crate) fn unlocked_words(sql: &str) -> Result<()> {
 
 pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
     unlocked_words(sql)?;
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
+    let statements = super::image::parse_sql(sql)?;
     let q = match statements.as_slice() {
         [Statement::Query(q)] => q,
         _ => return Err(Error::new("a question is one SELECT")),
