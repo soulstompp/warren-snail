@@ -298,6 +298,22 @@ fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlpa
     }
 }
 
+/// `n` of the ordinals below `total`, each set of `n` as likely as any other, ascending; every one
+/// where `n` is no fewer. `random` draws a number from 0 up to 1.
+fn drawn(total: u64, n: u64, random: &mut dyn FnMut() -> f64) -> Vec<u64> {
+    if n >= total {
+        return (0..total).collect();
+    }
+    let mut picked = std::collections::BTreeSet::new();
+    for j in total - n..total {
+        let t = ((random() * (j + 1) as f64) as u64).min(j);
+        if !picked.insert(t) {
+            picked.insert(j);
+        }
+    }
+    picked.into_iter().collect()
+}
+
 /// The tag of the pages read for one order of one table.
 fn order_tag(table: usize, order: usize) -> u32 {
     (table as u32) << 16 | order as u32
@@ -1017,6 +1033,27 @@ impl Snail {
             counted,
             round,
         })
+    }
+
+    /// Begins a round on one table, a question with no condition, that hands out `rows` of its live
+    /// rows, each set of them as likely as any other by the counts, its blocks one at a time by
+    /// `next_block`, reading only the column pages that hold them; with the live rows the table
+    /// holds. `random` draws a number from 0 up to 1.
+    pub fn sample(
+        &self,
+        sql: &str,
+        rows: u64,
+        random: &mut dyn FnMut() -> f64,
+    ) -> Result<(Scan, u64)> {
+        let mut scan = self.scan(sql, None)?;
+        if !scan.q.sides[0].is_whole() {
+            return Err(Error::new(format!("a sample is drawn from a whole table: {sql}")));
+        }
+        let live = scan.plan.live_rows();
+        scan.plan.keep(&drawn(live, rows, random));
+        scan.round.column_pages_predicted = scan.plan.column_pages;
+        scan.round.blocks_read = scan.plan.blocks_read();
+        Ok((scan, live))
     }
 
     /// The next block's rows of a round `scan` began, or none once every block has come. A question

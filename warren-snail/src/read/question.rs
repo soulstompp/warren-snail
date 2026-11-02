@@ -318,6 +318,15 @@ pub struct OpCond {
 }
 
 impl Side {
+    /// Whether it keeps every row of its table: no condition on it.
+    pub fn is_whole(&self) -> bool {
+        self.conds.is_empty()
+            && self.texts.is_empty()
+            && self.nulls.is_empty()
+            && self.ops.is_empty()
+            && !self.empty
+    }
+
     /// A condition on this table alone, kept beside the ones it has.
     fn take(&mut self, piece: Piece, table: &Table) {
         match piece {

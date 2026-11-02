@@ -250,6 +250,8 @@ struct BlockRead {
     op_may: Vec<usize>,
     /// For every column read, its slot and the pages read of it, ascending.
     reads: Vec<(usize, Vec<usize>)>,
+    /// The rows of the block a sample keeps, ascending: none where it keeps every row it reads.
+    only: Option<Vec<u32>>,
 }
 
 pub struct Plan {
@@ -262,6 +264,60 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The live rows of the blocks the plan reads.
+    pub(super) fn live_rows(&self) -> u64 {
+        self.reads
+            .iter()
+            .map(|br| u64::from(br.map.rows()) - br.map.dead.len() as u64)
+            .sum()
+    }
+
+    /// The plan kept to the live rows `picks` names, ascending, each counted from the first live row
+    /// of the first block it reads: each block holding none of them left unread, and of every other,
+    /// each column's pages that hold one.
+    pub(super) fn keep(&mut self, picks: &[u64]) {
+        let mut before = 0u64;
+        let mut at = 0;
+        let mut kept = Vec::new();
+        for mut br in std::mem::take(&mut self.reads) {
+            let live = u64::from(br.map.rows()) - br.map.dead.len() as u64;
+            let mut mine = Vec::new();
+            while at < picks.len() && picks[at] < before + live {
+                mine.push(picks[at] - before);
+                at += 1;
+            }
+            before += live;
+            if mine.is_empty() {
+                continue;
+            }
+            // Each live ordinal as the row it is, past the dead rows before it.
+            let mut rows = Vec::with_capacity(mine.len());
+            let (mut d, mut seen) = (0, 0u64);
+            for r in 0..br.map.rows() {
+                if br.map.dead.get(d) == Some(&r) {
+                    d += 1;
+                    continue;
+                }
+                if rows.len() < mine.len() && mine[rows.len()] == seen {
+                    rows.push(r);
+                }
+                seen += 1;
+            }
+            for (s, chosen) in &mut br.reads {
+                let pages = &br.map.columns[*s].pages;
+                chosen.retain(|&p| {
+                    let (a, z) = (pages[p].first_row, pages[p].first_row + pages[p].rows);
+                    rows.iter().any(|&r| a <= r && r < z)
+                });
+            }
+            br.only = Some(rows);
+            kept.push(br);
+        }
+        self.reads = kept;
+        let disk = self.disk_pages().count() as u64;
+        self.column_pages = disk;
+    }
+
     pub fn blocks_read(&self) -> u64 {
         self.reads.len() as u64
     }
@@ -606,6 +662,7 @@ impl Snail {
                 null_may: o.null_may,
                 op_may: o.op_may,
                 reads: block_reads,
+                only: None,
             });
         }
         Ok(Plan {
@@ -741,6 +798,15 @@ impl Snail {
                     }
                 }
                 rows = kept;
+            }
+            // A sample keeps its own rows alone.
+            if let Some(only) = &br.only {
+                rows = only
+                    .iter()
+                    .map(|&r| r as usize)
+                    .filter(|r| rows.iter().any(|&(a, z)| a <= *r && *r < z))
+                    .map(|r| (r, r + 1))
+                    .collect();
             }
             // The columns read whose values are a group of leaves.
             let mut groups: Vec<usize> = Vec::new();
