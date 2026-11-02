@@ -149,10 +149,9 @@ fn read(path: &Path, q: &str, want: &[&str], pages: u64) {
     assert_eq!(round.column_pages_predicted, pages, "{q}: {round:?}");
 }
 
-fn refused(path: &Path, q: &str) -> String {
-    match fresh(path).ask(q, None) {
-        Ok((b, _)) => panic!("{q}: answered {:?}", sorted(&[b])),
-        Err(e) => e.to_string(),
+fn refused(path: &Path, q: &str) {
+    if let Ok((b, _)) = fresh(path).ask(q, None) {
+        panic!("{q}: answered {:?}", sorted(&[b]));
     }
 }
 
@@ -420,6 +419,11 @@ fn a_whole_row_is_refused_so_no_column_of_it_goes_unread() {
         "SELECT a.id FROM s.a a WHERE a.id < 3 AND EXISTS (SELECT a.*)",
         "SELECT (SELECT count(a) FROM s.b b WHERE b.id < 2) FROM s.a a WHERE a.id < 2",
         "SELECT a.id FROM s.a a WHERE a.id < 3 ORDER BY a.*",
+        "SELECT a.id FROM s.a a WHERE a.id < 3 ORDER BY a",
+        "SELECT count(*) FROM s.a a GROUP BY a",
+        "SELECT DISTINCT a FROM s.a a WHERE a.id < 3",
+        "SELECT a = a FROM s.a a WHERE a.id < 3",
+        "SELECT a.name, row_number() OVER (ORDER BY a) FROM s.a a WHERE a.id < 3",
     ] {
         refused(&path, q);
     }
