@@ -11,7 +11,7 @@ use crate::{Error, Result};
 use std::f64::consts::PI;
 
 /// The tolerance of PostgreSQL's fuzzy comparisons, geo_decls.h's `EPSILON`.
-const EPSILON: f64 = 1.0E-06;
+pub(crate) const EPSILON: f64 = 1.0E-06;
 
 /// What `lseg_crossing` answers where the segment holds the point.
 const POINT_ON_POLYGON: i32 = i32::MAX;

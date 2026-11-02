@@ -634,6 +634,54 @@ fn every_polygon_and_circle_operator_holds_along_its_strands_each_by_its_boundin
     assert!(over.blocks_read * 3 <= blocks, "{over:?}");
 }
 
+/// The last row of each table lies at the far corner of the plane, each value half of PostgreSQL's
+/// EPSILON past it: no block's box holds the value, and the operator takes the row.
+#[test]
+fn a_shape_within_postgresql_s_fuzz_of_a_value_is_found_along_every_order() {
+    let n = 4096;
+    let tables: [(&str, GeoKind, &[&str], fn(i64) -> String, &[&str]); 3] = [
+        (
+            "point",
+            GeoKind::Point,
+            &["gist", "spgist"],
+            |i| format!("({i},{i})"),
+            &["v ~= point '(4095.0000005,4095.0000005)'"],
+        ),
+        (
+            "box",
+            GeoKind::Box,
+            &["gist", "spgist"],
+            |i| format!("(({i},{i}),({},{}))", i + 1, i + 1),
+            &["v ~= box '((4095.0000005,4095),(4096.0000005,4096))'"],
+        ),
+        (
+            "circle",
+            GeoKind::Circle,
+            &["gist"],
+            |i| format!("<({i},{i}),1>"),
+            &[
+                "v ~= circle '<(4095.0000005,4095),1>'",
+                "v @> circle '<(4095.0000005,4095),1>'",
+                "v <@ circle '<(4095.0000005,4095),1>'",
+                "v && circle '<(4097.0000005,4095),1>'",
+            ],
+        ),
+    ];
+    for (ty, kind, methods, row, conditions) in tables {
+        let path = table_of(&format!("plane-fuzz-{ty}"), ty, kind, methods, n, |i| {
+            Some(row(i))
+        });
+        let mut s = fresh(&path);
+        for c in conditions {
+            let q = format!("SELECT id FROM s.t WHERE {c}");
+            assert_eq!(ids(&mut s, &q, "t_pkey"), vec![n - 1], "{q}");
+            for m in methods {
+                assert_eq!(ids(&mut s, &q, &format!("t_{m}")), vec![n - 1], "{q} {m}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_distance_is_answered_as_a_row_at_a_time_and_a_condition_beside_it_keeps_its_strand() {
     let path = table_of(

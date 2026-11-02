@@ -6,7 +6,7 @@
 use crate::catalog::{ColumnType, Method, Order};
 use crate::directory::Span;
 use crate::geo::{
-    box_contain_box, box_ov, fp_ge, fp_gt, fp_le, fp_lt, Geo, GeoBox, GeoKind, Point,
+    box_contain_box, box_ov, fp_ge, fp_gt, fp_le, fp_lt, Geo, GeoBox, GeoKind, Point, EPSILON,
 };
 use crate::{Error, Result};
 
@@ -216,7 +216,7 @@ pub(crate) fn exclusion_operator(opclass: &str, ty: ColumnType, op: &str) -> Res
 /// rounded sums and distances: twice the fuzz, and eight of the double's steps at the largest value
 /// it adds.
 fn margin(values: &[f64]) -> f64 {
-    4e-10 + 8.0 * f64::EPSILON * values.iter().map(|v| v.abs()).sum::<f64>()
+    2.0 * EPSILON + 8.0 * f64::EPSILON * values.iter().map(|v| v.abs()).sum::<f64>()
 }
 
 /// Whether a block whose column's values lie within `span` may hold a row `column op value` keeps,
@@ -237,7 +237,7 @@ pub(crate) fn may_hold(column: GeoKind, op: &str, span: &Span, value: &Geo) -> b
             ">>" => fp_gt(hx, q.x),
             "<<|" | "<^" => fp_lt(ly, q.y),
             "|>>" | ">^" => fp_gt(hy, q.y),
-            "~=" => within(&block, q.x, q.y, q.x, q.y, 4e-10),
+            "~=" => within(&block, q.x, q.y, q.x, q.y, 2.0 * EPSILON),
             _ => true,
         },
         // Compared exactly, by `box_contain_point`.
@@ -297,7 +297,7 @@ fn boxes(op: &str, b: &GeoBox, q: &GeoBox) -> bool {
         "|&>" => fp_ge(b.high.y, q.low.y),
         "&&" | "<@" => box_ov(b, q),
         "@>" => box_contain_box(b, q),
-        "~=" => within(b, q.low.x, q.low.y, q.high.x, q.high.y, 4e-10),
+        "~=" => within(b, q.low.x, q.low.y, q.high.x, q.high.y, 2.0 * EPSILON),
         _ => true,
     }
 }
@@ -450,7 +450,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let eps = 1e-10;
+        let eps = EPSILON;
         let picks = [
             0.0,
             1.0,
@@ -463,9 +463,11 @@ mod tests {
             3.0 - 3.0 * eps,
             1e10,
             1e10 + 1e-5,
+            1.0 + eps / 2.0,
+            3.0 - eps / 2.0,
             -1.0,
             -2.5,
-            1e-11,
+            eps / 2.0,
             f64::INFINITY,
             f64::NEG_INFINITY,
             f64::NAN,
