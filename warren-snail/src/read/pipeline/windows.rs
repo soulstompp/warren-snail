@@ -502,6 +502,27 @@ fn along_by(
     })
 }
 
+/// The PARTITION BY every window a step calls shares, none where they part their rows otherwise.
+pub(super) fn shared_partition<'q>(calls: &[&'q Expr]) -> &'q [Expr] {
+    let by = |call: &&'q Expr| -> Option<&'q [Expr]> {
+        let Expr::Function(f) = call else {
+            return None;
+        };
+        match &f.over {
+            Some(WindowType::WindowSpec(spec)) => Some(&spec.partition_by),
+            _ => None,
+        }
+    };
+    let Some(first) = calls.first().and_then(by) else {
+        return &[];
+    };
+    let text = |p: &[Expr]| p.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+    match calls.iter().all(|c| by(c).is_some_and(|p| text(p) == text(first))) {
+        true => first,
+        false => &[],
+    }
+}
+
 /// Whether the windows fold along the order a relation's rows come in.
 pub(super) fn along(calls: &[&Expr], rel: &Relation, frame: &Frame) -> bool {
     along_by(calls, rel.order, |q, n| frame.find(q, n).ok())

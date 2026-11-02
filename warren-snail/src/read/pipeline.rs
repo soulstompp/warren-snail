@@ -17,6 +17,7 @@ use sqlparser::ast::{
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+mod parted;
 pub(super) mod windows;
 
 /// One value of a row: a number whole or with its scale, text, bytes, a truth, or a uuid.
@@ -5970,7 +5971,7 @@ pub(super) struct StepRun<'q> {
     rows: Vec<Vec<Value>>,
     /// The rows its FROM gives, held for a window that reads its partition whole, and the column
     /// holding the table's order among them.
-    held: Relation,
+    held: parted::Parted,
     /// The rows a DISTINCT step has returned, by their keys.
     seen: std::collections::HashSet<Vec<Key>>,
     /// The columns the step's FROM reads, as the last chunk gave them.
@@ -5990,7 +5991,7 @@ impl<'q> StepRun<'q> {
             at: HashMap::new(),
             groups: Vec::new(),
             rows: Vec::new(),
-            held: Relation::default(),
+            held: parted::Parted::new(),
             seen: Default::default(),
             columns: Vec::new(),
             subqueries: None,
@@ -6133,7 +6134,11 @@ impl<'q> StepRun<'q> {
         }
         if self.p.whole_windows {
             self.held.order = self.held.order.or(rel.order);
-            self.held.rows.extend(rel.rows);
+            let by = windows::shared_partition(&self.p.calls.windows);
+            for row in rel.rows {
+                let h = parted::partition_hash(by, &row, &frame)?;
+                self.held.push(h, row)?;
+            }
             self.columns = frame.columns;
             return Ok(None);
         }
@@ -6246,17 +6251,24 @@ impl<'q> StepRun<'q> {
                 now: self.p.now,
                 subqueries: self.subqueries,
             };
-            let held = std::mem::take(&mut self.held);
-            let per_row = windows::values(&self.p.calls.windows, &held, &frame)?;
-            for (row, w) in held.rows.iter().zip(per_row) {
-                let computed = Computed {
-                    calls: w,
-                    _q: std::marker::PhantomData,
-                };
-                out.rows.extend(self.p.project(row, &frame, computed)?);
-            }
-            out.order = held
-                .order
+            let held = std::mem::replace(&mut self.held, parted::Parted::new());
+            let by = windows::shared_partition(&self.p.calls.windows);
+            let mut order = None;
+            let p = &self.p;
+            let rows = &mut out.rows;
+            held.finish(&|r| parted::partition_hash(by, r, &frame), &mut |rel| {
+                let per_row = windows::values(&p.calls.windows, &rel, &frame)?;
+                for (row, w) in rel.rows.iter().zip(per_row) {
+                    let computed = Computed {
+                        calls: w,
+                        _q: std::marker::PhantomData,
+                    };
+                    rows.extend(p.project(row, &frame, computed)?);
+                }
+                order = rel.order;
+                Ok(())
+            })?;
+            out.order = order
                 .filter(|_| self.p.calls.sets.is_empty())
                 .and_then(|o| {
                     self.p.items.iter().position(|(e, _)| {

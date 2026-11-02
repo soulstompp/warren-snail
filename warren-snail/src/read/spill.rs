@@ -270,6 +270,8 @@ pub(super) struct Run {
     pages: Vec<u64>,
     tail: Vec<u8>,
     spilled: usize,
+    /// Whether every row is written, a place's rows past the room alone.
+    past: bool,
 }
 
 impl Run {
@@ -284,7 +286,15 @@ impl Run {
             pages: Vec::new(),
             tail: Vec::new(),
             spilled: 0,
+            past: false,
         }
+    }
+
+    /// An empty place of rows past the room, every row written.
+    pub(super) fn past(width: usize) -> Run {
+        let mut run = Run::new(width);
+        run.past = true;
+        run
     }
 
     /// The rows `rows` held as a place: as many as the room has room for, the rest written.
@@ -308,7 +318,7 @@ impl Run {
                 return Ok(());
             }
         };
-        if self.spilled == 0 && room.hold(w) {
+        if !self.past && self.spilled == 0 && room.hold(w) {
             self.bytes += w;
             self.rows.push(row);
             return Ok(());

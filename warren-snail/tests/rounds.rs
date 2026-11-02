@@ -279,3 +279,59 @@ fn a_step_past_the_round_s_room_writes_the_rows_past_it_once_and_reads_them_back
     let refused = snail.ask(q, None).unwrap_err().to_string();
     assert!(refused.contains("lets it spill"), "{refused}");
 }
+
+/// Each row's integers.
+fn ints(b: &arrow::array::RecordBatch) -> Vec<Vec<i64>> {
+    warren_snail::read::pipeline_rows(b)
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|v| match v {
+                    warren_snail::read::Value::Int(x) => x,
+                    other => panic!("an integer: {other:?}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn a_window_past_the_round_s_room_holds_every_partition_whole_and_writes_the_rows_past_it_once() {
+    let path = tree("window");
+    let dir = spill_dir("window");
+    // Every node, partitioned by its id modulo 64 and numbered by id: node i is the
+    // ((i - i % 64) / 64)-th of its partition, one more where i % 64 is not 0.
+    let q = "SELECT t.id, row_number() OVER (PARTITION BY t.id % 64 ORDER BY t.id) FROM s.t t";
+    let rank = |i: i64| (i - i % 64) / 64 + i64::from(i % 64 != 0);
+    // The step held whole is every row as the table's read gives it, its two integers 18 bytes:
+    // 196,608 bytes of room hold 10,922, the other 5,461 are 98,298 bytes, 24 pages, and fewer than
+    // the room holds, so they are written once.
+    let room: u64 = 196_608;
+    let held = room / 18;
+    let pages = ((N as u64 - held) * 18).div_ceil(4096);
+    assert_eq!((held, pages), (10_922, 24));
+    for (sizes, written) in [
+        (Sizes::of(room).in_dir(&dir), pages),
+        (Sizes::default().in_dir(&dir), 0),
+    ] {
+        let size = sizes.bytes;
+        let mut snail = Snail::open(&path).unwrap();
+        snail.size_rounds(sizes);
+        let (b, round) = snail.ask(q, None).unwrap();
+        weather::exact(q, &round);
+        let mut got = ints(&b);
+        got.sort();
+        assert_eq!(got.len() as i64, N);
+        for (k, r) in got.iter().enumerate() {
+            assert_eq!(r, &vec![k as i64 + 1, rank(k as i64 + 1)], "{q}");
+        }
+        assert_eq!(
+            (round.spill_pages_written, round.spill_pages_read),
+            (written, written),
+            "{q}: {round:?}"
+        );
+        assert!(round.bytes_held <= size, "{q}: {round:?}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+}
