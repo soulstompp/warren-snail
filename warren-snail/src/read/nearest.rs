@@ -432,6 +432,18 @@ impl Snail {
             crate::catalog::ColumnType::Geometric(k) => k,
             _ => return Ok(Nearest::Not),
         };
+        let is_strand = |o: usize| {
+            let order = &table.orders[o];
+            matches!(order.method, Method::Gist | Method::Spgist)
+                && crate::spans::columns(table, order).contains(&a.column)
+        };
+        match order {
+            Some(n) if table.orders[own].name == n && !is_strand(own) => {
+                return Ok(Nearest::Table(0, 0))
+            }
+            Some(n) if !table.orders.iter().any(|o| o.name == n) => return Ok(Nearest::Not),
+            _ => {}
+        }
         let point = match stream.constant(a.value) {
             Ok(Value::Geometric(Geo::Point(p))) => p,
             Ok(Value::Text(t)) if kind == GeoKind::Point => match crate::geo::geo_in(kind, &t) {
@@ -447,18 +459,6 @@ impl Snail {
             return Ok(Nearest::Not);
         }
         let strict = a.more || ties;
-        let is_strand = |o: usize| {
-            let order = &table.orders[o];
-            matches!(order.method, Method::Gist | Method::Spgist)
-                && crate::spans::columns(table, order).contains(&a.column)
-        };
-        match order {
-            Some(n) if table.orders[own].name == n && !is_strand(own) => {
-                return Ok(Nearest::Table(0, 0))
-            }
-            Some(n) if !table.orders.iter().any(|o| o.name == n) => return Ok(Nearest::Not),
-            _ => {}
-        }
         let named = |o: usize| order.is_none_or(|n| table.orders[o].name == n);
 
         // What the question can mean of the table, on the conditions the question path reads.
@@ -853,5 +853,35 @@ impl Snail {
         }
         read.rows_held = frontier.most;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expr(text: &str) -> Expr {
+        sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+            .try_with_sql(text)
+            .unwrap()
+            .parse_expr()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_value_is_fixed_where_it_reads_no_column_and_nothing_a_statement_draws() {
+        for text in [
+            "point '(1,2)'",
+            "'(1,2)'::point",
+            "(point '(1,2)')",
+            "point(1, 2)",
+            "point(1 + 1, -2)",
+            "$1",
+        ] {
+            assert!(fixed(&expr(text)), "{text}");
+        }
+        for text in ["v", "t.v", "point(id, 0)", "point(random(), 0)", "clock_timestamp()"] {
+            assert!(!fixed(&expr(text)), "{text}");
+        }
     }
 }

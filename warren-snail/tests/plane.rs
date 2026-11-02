@@ -1769,6 +1769,7 @@ fn a_distance_on_the_grid_reads_the_strand_s_nearest_blocks_as_their_pages_say()
         "{near:?}"
     );
     assert_eq!(near.blocks_read, 1, "{near:?}");
+    assert_eq!(near.column_pages_low, 6, "{near:?}");
     let mut got = in_order(&b);
     got.sort();
     let mut five: Vec<i64> = [(1500, 1500), (1499, 1500), (1501, 1500), (1500, 1499), (1500, 1501)]
@@ -1797,11 +1798,16 @@ fn along(s: &mut Snail, q: &str, order: Option<&str>) -> (Vec<i64>, warren_snail
 
 /// A point's distance from a point, past where a NaN and the infinities come.
 fn apart(x: f64, y: f64, qx: f64, qy: f64) -> (u8, f64) {
-    let d = (x - qx).hypot(y - qy);
-    if d.is_nan() {
+    let (a, b) = ((x - qx).abs(), (y - qy).abs());
+    let (a, b) = (a.max(b), a.min(b));
+    if a.is_infinite() || b.is_infinite() {
+        (0, f64::INFINITY)
+    } else if a.is_nan() || b.is_nan() || (x - qx).is_nan() || (y - qy).is_nan() {
         (1, 0.0)
+    } else if b == 0.0 {
+        (0, a)
     } else {
-        (0, d)
+        (0, a * (1.0 + (b / a) * (b / a)).sqrt())
     }
 }
 
@@ -2045,6 +2051,7 @@ fn a_descending_distance_or_its_nulls_first_is_left_to_the_table_s_read() {
         "SELECT id FROM s.t ORDER BY id, v <-> point '(1030,1030)' LIMIT 5",
         "SELECT id FROM s.t ORDER BY (v <-> point '(1030,1030)') + 1, id LIMIT 5",
         "SELECT id FROM s.t ORDER BY v <-> point(id, 0), id LIMIT 5",
+        "SELECT id, unnest(ARRAY[id, id + 1]) AS g FROM s.t ORDER BY v <-> point '(1030,1030)', id, g LIMIT 5",
     ] {
         let (_, round) = along_any(&mut fresh(&path), q);
         assert_eq!(round.order, "t_pkey", "{q}");
@@ -2099,6 +2106,7 @@ fn a_column_off_the_strand_is_read_after_the_table_kept_to_the_keys_the_walk_fou
     assert_eq!(round.reads[1].blocks_read, 12, "{round:?}");
     assert_eq!(round.reads[1].column_pages_read, 48, "{round:?}");
     assert_eq!(round.column_pages_read, 54, "{round:?}");
+    assert!(round.rows_held <= 512, "{round:?}");
     // With the distance all it orders by, five keys are enough.
     let cut = "SELECT id, z FROM s.t ORDER BY v <-> point '(1500,1500)' LIMIT 5";
     let (b, round) = fresh(&path).ask(cut, None).unwrap();
@@ -2203,4 +2211,120 @@ fn a_row_written_comes_where_its_distance_puts_it_and_a_page_held_is_read_from_n
     assert_eq!(again, first);
     assert_eq!(round.column_pages_read, 0, "{round:?}");
     assert_eq!(round.column_pages_held, round.column_pages_predicted, "{round:?}");
+}
+
+#[test]
+fn a_strand_of_several_levels_and_a_partial_one_give_a_distance_where_they_hold_what_it_reads() {
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.t (id bigint NOT NULL, v point, b box, PRIMARY KEY (id)); \
+         CREATE INDEX t_vb ON s.t USING gist (v, b); \
+         CREATE INDEX t_part ON s.t USING gist (v) WHERE id >= 1000;",
+    )
+    .unwrap();
+    let n = 16384;
+    let path = tmp("plane-near-levels.snail");
+    write(
+        &path,
+        &catalog,
+        &[(
+            "s.t".into(),
+            Rows {
+                columns: vec![
+                    Values::Int((0..n).map(Some).collect()),
+                    shapes(
+                        GeoKind::Point,
+                        (0..n).map(|i| Some(format!("({},{})", cell(i).0, cell(i).1))),
+                    ),
+                    shapes(
+                        GeoKind::Box,
+                        (0..n).map(|i| {
+                            let (x, y) = cell(i);
+                            Some(format!("(({x},{y}),({},{}))", x + 4, y + 4))
+                        }),
+                    ),
+                ],
+            },
+        )],
+    )
+    .unwrap();
+    // Either level of the strand keeps its box; the second's cut is the first's.
+    for q in [
+        "SELECT id FROM s.t ORDER BY v <-> point '(1500,1500)', id LIMIT 5",
+        "SELECT id FROM s.t ORDER BY b <-> point '(1500,1500)', id LIMIT 5",
+    ] {
+        let (key, whole) = along(&mut fresh(&path), q, Some("t_pkey"));
+        let (got, round) = along(&mut fresh(&path), q, None);
+        assert_eq!(got, key, "{q}");
+        assert_eq!(round.order, "t_vb", "{round:?}");
+        assert!(round.column_pages_read < whole.column_pages_read / 4, "{round:?}");
+    }
+    // The partial strand serves what implies its predicate, and nothing else.
+    let q = "SELECT id FROM s.t WHERE id >= 2000 ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (key, _) = along(&mut fresh(&path), q, Some("t_pkey"));
+    let (got, round) = along(&mut fresh(&path), q, Some("t_part"));
+    assert_eq!(got, key);
+    assert_eq!(round.order, "t_part", "{round:?}");
+    let q = "SELECT id FROM s.t WHERE id >= 500 ORDER BY v <-> point '(1500,1500)', id LIMIT 5";
+    let (_, round) = along(&mut fresh(&path), q, None);
+    assert_eq!(round.order, "t_vb", "{round:?}");
+    let e = fresh(&path).ask(q, Some("t_part")).unwrap_err().to_string();
+    assert!(e.contains("a pipeline reads its table along its own order"), "{e}");
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn at_serializable_a_distance_read_marks_the_strand_whole_so_a_nearer_row_written_is_met() {
+    let path = table_of("plane-near-serial", "point", GeoKind::Point, &["gist"], 16384, |i| {
+        Some(format!("({},{})", cell(i).0, cell(i).1))
+    });
+    let mut a = Snail::open_writing(&path).unwrap();
+    let mut b = Snail::open_writing(&path).unwrap();
+    let serial = "BEGIN ISOLATION LEVEL SERIALIZABLE";
+    a.execute(serial).unwrap();
+    b.execute(serial).unwrap();
+    let near_a = "SELECT id FROM s.t ORDER BY v <-> point '(1100.5,1100.5)', id LIMIT 3";
+    let near_b = "SELECT id FROM s.t ORDER BY v <-> point '(1900.5,1900.5)', id LIMIT 3";
+    let (_, round) = a.ask(near_a, Some("t_gist")).unwrap();
+    assert_eq!(round.order, "t_gist");
+    b.ask(near_b, Some("t_gist")).unwrap();
+    // Each writes a row nearer than the other read, in a block neither read.
+    a.execute("INSERT INTO s.t VALUES (100000, '(1900.5,1900.5)')").unwrap();
+    b.execute("INSERT INTO s.t VALUES (100001, '(1100.5,1100.5)')").unwrap();
+    a.execute("COMMIT").unwrap();
+    let e = b.execute("COMMIT").unwrap_err().to_string();
+    assert!(e.contains("could not serialize access"), "{e}");
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_distance_rounds_as_the_release_the_file_records_rounds_it() {
+    let answer = |release: Option<u8>| -> u64 {
+        let catalog = Catalog::parse(
+            "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+             CREATE INDEX t_v ON s.t USING gist (v);",
+        )
+        .unwrap();
+        let path = tmp(&format!("plane-near-release-{release:?}.snail"));
+        warren_snail::write::write_parquet(
+            &path,
+            &catalog,
+            &[],
+            warren_snail::file::FILE_PAGES,
+            release,
+            None,
+        )
+        .unwrap();
+        let mut s = Snail::open_writing(&path).unwrap();
+        s.execute("INSERT INTO s.t VALUES (1, \'(1e150,1e150)\')").unwrap();
+        let (b, _) = s.ask("SELECT v <-> point \'(0,0)\' FROM s.t", None).unwrap();
+        let d = b.column(0).as_any();
+        d.downcast_ref::<arrow::array::Float64Array>()
+            .unwrap()
+            .value(0)
+            .to_bits()
+    };
+    // As 18.6 and 19 RC1 each answer (28818, 28819, 2026-11-02), where they part on this row.
+    assert_eq!(answer(Some(18)), 1.4142135623730951e150f64.to_bits());
+    assert_eq!(answer(Some(19)), 1.414213562373095e150f64.to_bits());
+    assert_eq!(answer(None), 1.414213562373095e150f64.to_bits());
 }

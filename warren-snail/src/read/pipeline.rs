@@ -2181,6 +2181,7 @@ fn geo_op(
     y: &Value,
     left: &Expr,
     right: &Expr,
+    release: u8,
 ) -> Result<Option<Value>> {
     let read = |v: &Value, e: &Expr, beside: &Value| -> Result<Value> {
         Ok(match (v, beside) {
@@ -2220,10 +2221,12 @@ fn geo_op(
         ))
     };
     match (&x, &y) {
-        (Value::Geometric(a), Value::Geometric(b)) => match crate::geo::geo_binary(&name, a, b) {
-            Some(v) => Ok(Some(of_geo(v?))),
-            None => Err(refused()),
-        },
+        (Value::Geometric(a), Value::Geometric(b)) => {
+            match crate::geo::at_release(release, || crate::geo::geo_binary(&name, a, b)) {
+                Some(v) => Ok(Some(of_geo(v?))),
+                None => Err(refused()),
+            }
+        }
         // Over a NULL, NULL: a NULL written out, where the type has the operator beside its own.
         (Value::Geometric(g), Value::Null) | (Value::Null, Value::Geometric(g)) => {
             let written = |e: &Expr| matches!(e, Expr::Value(v) if v.value == SqlValue::Null);
@@ -3927,7 +3930,7 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
                 return Ok(v);
             }
-            if let Some(v) = geo_op(op, &x, &y, left, right)? {
+            if let Some(v) = geo_op(op, &x, &y, left, right, frame.release)? {
                 return Ok(v);
             }
             // An operator on a type held as its text reads a literal beside it as the operator

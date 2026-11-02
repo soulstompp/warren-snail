@@ -308,9 +308,44 @@ pub(crate) fn fp_ge(a: f64, b: f64) -> bool {
     a + EPSILON >= b
 }
 
-/// The C library's `hypot`, as geo_ops.c calls it.
-fn hypot(x: f64, y: f64) -> f64 {
-    x.hypot(y)
+thread_local! {
+    /// Whether a hypotenuse is computed as releases up to 18 compute it.
+    static OWN_HYPOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What `f` comes to as a release computes it: up to 18 geo_ops.c's `pg_hypot`, from 19 the C library's.
+pub(crate) fn at_release<T>(release: u8, f: impl FnOnce() -> T) -> T {
+    let before = OWN_HYPOT.replace(release <= 18);
+    let out = f();
+    OWN_HYPOT.set(before);
+    out
+}
+
+/// `HYPOT`, as the release the value is read under computes it: `hypot`, or `pg_hypot`, which rounds
+/// otherwise and refuses what passes a double.
+fn hypot(x: f64, y: f64) -> Result<f64> {
+    if !OWN_HYPOT.get() {
+        return Ok(x.hypot(y));
+    }
+    if x.is_infinite() || y.is_infinite() {
+        return Ok(f64::INFINITY);
+    }
+    if x.is_nan() || y.is_nan() {
+        return Ok(f64::NAN);
+    }
+    let (x, y) = (x.abs().max(y.abs()), x.abs().min(y.abs()));
+    if y == 0.0 {
+        return Ok(x);
+    }
+    let yx = y / x;
+    let result = x * (1.0 + yx * yx).sqrt();
+    if result.is_infinite() {
+        return Err(overflow());
+    }
+    if result == 0.0 {
+        return Err(underflow());
+    }
+    Ok(result)
 }
 
 /// White space as C's `isspace` takes it under the C locale.
@@ -815,7 +850,7 @@ fn point_eq_point(p1: &Point, p2: &Point) -> bool {
 fn point_dt(p1: &Point, p2: &Point) -> Result<f64> {
     let x = f8_mi(p1.x, p2.x)?;
     let y = f8_mi(p1.y, p2.y)?;
-    Ok(hypot(x, y))
+    hypot(x, y)
 }
 
 /// `point_sl`: Infinity where the x are equal, 0 where the y are.
@@ -1022,7 +1057,7 @@ fn line_distance(l1: &Line, l2: &Line) -> Result<f64> {
     } else {
         1.0
     };
-    f8_div(f8_mi(l1.c, f8_mul(ratio, l2.c)?)?.abs(), hypot(l1.a, l1.b))
+    f8_div(f8_mi(l1.c, f8_mul(ratio, l2.c)?)?.abs(), hypot(l1.a, l1.b)?)
 }
 
 fn lseg(p0: Point, p1: Point) -> Lseg {
@@ -2137,12 +2172,12 @@ pub fn geo_binary(op: &str, a: &Geo, b: &Geo) -> Option<Result<GeoValue>> {
         }),
         ("*", G::Circle(c), G::Point(p)) => run(|| {
             let center = point_mul(&c.center, p)?;
-            let radius = f8_mul(c.radius, hypot(p.x, p.y))?;
+            let radius = f8_mul(c.radius, hypot(p.x, p.y)?)?;
             Ok(V::Geo(G::Circle(Circle { center, radius })))
         }),
         ("/", G::Circle(c), G::Point(p)) => run(|| {
             let center = point_div(&c.center, p)?;
-            let radius = f8_div(c.radius, hypot(p.x, p.y))?;
+            let radius = f8_div(c.radius, hypot(p.x, p.y)?)?;
             Ok(V::Geo(G::Circle(Circle { center, radius })))
         }),
 
@@ -2393,6 +2428,24 @@ pub fn geo_function(name: &str, args: &[GeoArg]) -> Option<Result<GeoValue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_distance_rounds_as_the_release_it_is_read_under_rounds_it() {
+        let at = |x, y| point_dt(&Point { x, y }, &Point { x: 0.0, y: 0.0 });
+        let of_18 = |x, y| at_release(18, || at(x, y));
+        // As 18.6 and 19 RC1 each answer it (28818, 28819, 2026-11-02).
+        assert_eq!(of_18(1e150, 1e150).unwrap(), 1.4142135623730951e150);
+        assert_eq!(at(1e150, 1e150).unwrap(), 1.414213562373095e150);
+        assert_eq!(at_release(19, || at(1e150, 1e150)).unwrap(), 1.414213562373095e150);
+        assert_eq!(of_18(3.0, 4.0).unwrap(), 5.0);
+        assert_eq!(of_18(f64::INFINITY, f64::NAN).unwrap(), f64::INFINITY);
+        assert!(of_18(f64::NAN, 1.0).unwrap().is_nan());
+        assert_eq!(of_18(1e308, 1e308).unwrap(), 1.4142135623730951e308);
+        assert!(of_18(1.7e308, 1.7e308).unwrap_err().to_string().contains("overflow"));
+        assert!(at(1.7e308, 1.7e308).unwrap().is_infinite());
+        // Past the call, as it was.
+        assert_eq!(at(1e150, 1e150).unwrap(), 1.414213562373095e150);
+    }
 
     /// Boxes of the coordinates given, a coordinate each from the list, high above low unless a NaN.
     fn box_of(v: [f64; 4]) -> GeoBox {
