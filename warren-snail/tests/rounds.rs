@@ -490,6 +490,20 @@ fn a_strand_s_rows_written_after_its_blocks_were_cut_are_put_in_their_place_firs
     let mut got = ints(&b);
     got.sort();
     assert_eq!(got, places(&rows));
+    // A scan along the strand, ordered as it leads, hands out each block's rows in order: block by
+    // block, every row in its place.
+    let q = "SELECT p.owner, p.at, p.id FROM s.p p ORDER BY p.owner, p.at";
+    let mut scan = snail.scan(q, Some("p_owner")).unwrap();
+    let mut blocks = 0;
+    let mut all = Vec::new();
+    while let Some(b) = snail.next_block(&mut scan).unwrap() {
+        blocks += 1;
+        all.extend(ints(&b));
+    }
+    let mut want: Vec<Vec<i64>> = rows.iter().map(|&(id, o, at)| vec![o, at, id]).collect();
+    want.sort();
+    assert!(blocks > 1, "{blocks}");
+    assert_eq!(all, want);
 }
 
 #[test]

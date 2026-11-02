@@ -990,7 +990,21 @@ impl Snail {
             blocks_read: part.plan.blocks_read(),
             ..Default::default()
         };
-        let whole = !(matches!(q.select, question::Select::Rows(_)) && q.order.is_empty());
+        // Ordered as the order it reads leads, each block's rows come in their order, those written
+        // after its sorted ones put in their place: a block at a time.
+        let o = &want.table.orders[w.order];
+        let inputs = q.select.inputs();
+        let led = q.order.len() <= o.levels.len()
+            && q.order.iter().enumerate().all(|(i, s)| {
+                inputs.get(s.at).is_some_and(|k| {
+                    !matches!(k, Key::Month(_))
+                        && o.levels[i] == crate::catalog::Level::Column(k.col().column)
+                        && o.desc[i] == s.desc
+                        && o.nulls_first[i] == s.nulls_first
+                })
+            });
+        let whole =
+            !(matches!(q.select, question::Select::Rows(_)) && (q.order.is_empty() || led));
         let counted = (w.counted, w.counted_months);
         Ok(Scan {
             q,
