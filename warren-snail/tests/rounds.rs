@@ -810,7 +810,7 @@ fn a_join_of_tables_whose_counts_may_not_fit_the_room_is_met_as_rows_in_it() {
     let path = owned("c1");
     let dir = spill_dir("c1");
     // The first side read is held: all 16,384 purchases, at 9 bytes the id.
-    let q = "SELECT sum(p.id) FROM s.p p JOIN s.p q ON q.id = p.id";
+    let q = "SELECT sum(a.id) FROM s.p a JOIN s.p b ON b.id = a.id";
     let want = PURCHASES * (PURCHASES - 1) / 2;
     // With room for it, one round of the question path, no read of its own.
     let mut snail = Snail::open(&path).unwrap();
