@@ -1269,6 +1269,32 @@ fn at_repeatable_read_two_writers_of_one_block_update_and_delete_their_own_rows_
     assert!(pruned > 0, "no read along the strand pruned");
     let q = "SELECT id FROM s.t WHERE p <@ box '((1024,1024),(1035,1087))'";
     assert_eq!(ids(&mut a, q, "t_p"), ids(&mut a, q, "t_pkey"));
+    // A block pruned since a snapshot takes the row its transaction wrote, in the box it keeps.
+    run(&mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    run(
+        &mut b,
+        "INSERT INTO s.t (id, p) VALUES (9100, '(1023.75,1023.75)')",
+    );
+    for id in 0..64 {
+        run(
+            &mut a,
+            &format!(
+                "UPDATE s.t SET p = '(1024.5,{})' WHERE id = {id}",
+                1024 + id
+            ),
+        );
+    }
+    let (_, r) = a
+        .ask(
+            "SELECT id FROM s.t WHERE p <@ box '((1024,1024),(1035,1087))'",
+            Some("t_p"),
+        )
+        .unwrap();
+    assert!(r.blocks_pruned > 0, "{r:?}");
+    run(&mut b, "COMMIT");
+    let q = "SELECT id FROM s.t WHERE p ~= '(1023.75,1023.75)'";
+    assert_eq!(ids(&mut a, q, "t_p"), [9100]);
+    assert_eq!(ids(&mut a, q, "t_pkey"), [9100]);
 }
 
 #[cfg(feature = "standalone")]
@@ -1345,7 +1371,7 @@ fn a_join_reads_its_side_along_the_plane_and_a_comparison_of_two_columns_is_a_ro
     write(&path, &catalog, &[("s.t".into(), t), ("s.u".into(), u)]).unwrap();
     let mut s = fresh(&path);
     let want = |pass: &dyn Fn(i64) -> bool| -> Vec<i64> {
-        let mut v: Vec<i64> = (0..n).filter(|&i| pass(i)).map(|i| i).collect();
+        let mut v: Vec<i64> = (0..n).filter(|&i| pass(i)).collect();
         v.sort();
         v
     };
