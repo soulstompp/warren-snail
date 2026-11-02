@@ -353,11 +353,13 @@ impl Run {
     }
 
     /// The rows written past the room.
+    #[cfg(test)]
     pub(super) fn spilled(&self) -> usize {
         self.spilled
     }
 
     /// The rows held in the room.
+    #[cfg(test)]
     pub(super) fn held(&self) -> &[Vec<Value>] {
         &self.rows
     }
