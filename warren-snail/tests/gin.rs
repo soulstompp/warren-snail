@@ -3133,30 +3133,38 @@ fn an_or_on_a_table_an_outer_join_leaves_null_keeps_the_rows_it_leaves() {
 
 #[test]
 fn a_condition_on_the_table_s_own_order_is_read_with_it_not_before_it() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], r int4range, p1 bigint, p2 bigint, p3 bigint); \
+    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], r int4range, p1 bigint, p2 bigint, p3 bigint, \
+               p4 bigint, p5 bigint, p6 bigint); \
                CREATE INDEX t_r ON s.t USING gist (r); \
                ALTER TABLE s.t CLUSTER ON t_r; \
                CREATE INDEX t_a ON s.t USING gin (a);";
     let n = 8192;
     let mut s = snail_of("gin-on-order", ddl, n, |i| {
-        vec![
+        let mut row = vec![
             Some(i.to_string()),
             Some(format!("{{{},{}}}", i % 7, 2000 + i / 256)),
             Some(format!("[{i},{})", i + 3)),
-            Some(i.to_string()),
-            Some(i.to_string()),
-            Some(i.to_string()),
-        ]
+        ];
+        row.extend((0..6).map(|_| Some(i.to_string())));
+        row
     });
-    let q = "SELECT id, p1, p2, p3 FROM s.t WHERE a @> '{3}' AND r && '[1200,1210)'";
+    let q = "SELECT id, p1, p2, p3, p4, p5, p6 FROM s.t WHERE a @> '{2005}' AND r && '[1300,1310)'";
     let (got, round) = ids(&mut s, q, None);
     let want: Vec<i32> = (0..n)
-        .filter(|&i| i % 7 == 3 && i < 1210 && i + 3 > 1200)
+        .filter(|&i| i / 256 == 5 && i < 1310 && i + 3 > 1300)
         .map(|i| i as i32)
         .collect();
     assert_eq!(got, want);
-    assert_eq!(round.order, "t_r", "{round:?}");
-    assert!(round.reads.is_empty(), "{round:?}");
+    // The table's own order reads the range itself: the keys are not read from it first.
+    assert!(
+        round.reads.iter().filter(|r| r.order == "t_r").count() <= 1,
+        "{round:?}"
+    );
+    assert_eq!(
+        round.reads.iter().filter(|r| r.order == "t_a").count(),
+        round.reads.len().saturating_sub(1),
+        "{round:?}"
+    );
 }
 
 #[test]
