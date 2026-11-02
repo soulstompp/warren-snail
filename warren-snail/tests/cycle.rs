@@ -505,3 +505,24 @@ fn a_dba_s_thousandths_of_a_degree_are_cut_on_their_decimal_places_inside_the_de
         .value(0);
     assert_eq!((n, round.blocks_read), (16, 1));
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_row_written_into_a_block_widens_its_bounds() {
+    // A row written after the last block's rows, its text below every bound: the block's bounds
+    // widen to hold it, and an equality on it finds it.
+    let path = written(
+        "bounds-written",
+        "CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
+        vec![each(|i| i.to_string()), each(chars)],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.t (k, t) VALUES (16384, '!')")
+        .unwrap();
+    drop(w);
+    let q = "SELECT t.k FROM s.t t WHERE t.t = '!'";
+    let mut snail = Snail::open(&path).unwrap();
+    let (b, round) = snail.ask(q, None).unwrap();
+    exact(q, &round);
+    assert_eq!((b.num_rows(), round.blocks_read), (1, 1));
+}
