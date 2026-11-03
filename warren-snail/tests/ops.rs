@@ -1771,6 +1771,15 @@ fn a_view_binds_its_operators_as_a_statement_does() {
         .ask("SELECT a, b, c FROM s.v ORDER BY id", None)
         .unwrap();
     assert_eq!(rows(&b), strs(&["4|true|true", "6|false|false"]));
+    // Beside the record image's operators, which PostgreSQL's lexer joins, `@ (n - 10) > 4`.
+    let (b, _) = snail
+        .ask(
+            "SELECT id FROM s.t WHERE ROW(ROW(id), ROW(t)) *= ROW(ROW(id), ROW(t)) \
+             AND @ n - 10 > 4 ORDER BY id",
+            None,
+        )
+        .unwrap();
+    assert_eq!(rows(&b), strs(&["1", "2"]));
     // Made, it is read as PostgreSQL's parser reads it: `(t ~~ 'a') & 1`.
     let e = Catalog::parse(
         "CREATE TABLE s.t (id integer PRIMARY KEY, n integer, t text);
