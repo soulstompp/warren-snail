@@ -313,7 +313,7 @@ pub(crate) fn expression(tokens: &[Token]) -> Result<Expr> {
             text(&tokens[p.index()..])
         )));
     }
-    Ok(crate::grammar::expression(e))
+    Ok(crate::grammar::expression_of(tokens).unwrap_or(e))
 }
 
 /// A statement the snail reads itself.
@@ -2373,7 +2373,7 @@ impl Draft {
                 _ => Err(Error::new(format!("{what}: the column {c} is not read"))),
             })
             .collect::<Result<Vec<String>>>()?;
-        let made = crate::read::view_columns(&self.so_far(), &v.query)?;
+        let made = crate::read::view_columns(&self.so_far(), &crate::grammar::query(&v.query))?;
         if columns.len() > made.len() {
             return Err(Error::new(
                 "CREATE VIEW specifies more column names than columns",
@@ -4752,7 +4752,8 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
     }
     // Each view's columns, by the names its column list gives and its question returns.
     for v in &c.views {
-        let parsed = crate::read::image::parse_sql(&v.query);
+        let bound = crate::grammar::bound(&v.query);
+        let parsed = crate::read::image::parse_sql(bound.as_deref().unwrap_or(&v.query));
         let made = match parsed.as_deref() {
             Ok([Statement::Query(q)]) => crate::read::view_columns(c, q).unwrap_or_default(),
             _ => Vec::new(),
@@ -4975,7 +4976,8 @@ fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
         },
         _ => String::new(),
     };
-    let parsed = crate::read::image::parse_sql(&text)
+    let bound = crate::grammar::bound(&text);
+    let parsed = crate::read::image::parse_sql(bound.as_deref().unwrap_or(&text))
         .map_err(|e| Error::new(format!("{name}: its body: {e}")))?;
     let body = match parsed.as_slice() {
         [Statement::Query(q)] => match q.body.as_ref() {

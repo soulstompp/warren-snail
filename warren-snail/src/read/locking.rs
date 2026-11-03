@@ -337,7 +337,8 @@ impl Snail {
     /// The plan of a locking question, refused in PostgreSQL's words where PostgreSQL refuses it.
     fn lock_plan(&self, l: &Locking, params: &[String], whole: bool) -> Result<Plan> {
         let first = l.clauses[0].strength.words();
-        let parsed = super::image::parse_sql(&l.question)?;
+        let bound = crate::grammar::bound(&l.question);
+        let parsed = super::image::parse_sql(bound.as_deref().unwrap_or(&l.question))?;
         let mut q = match parsed.as_slice() {
             [Sql::Query(q)] => (**q).clone(),
             _ => return Err(Error::new(format!("{first} is read only on a SELECT"))),

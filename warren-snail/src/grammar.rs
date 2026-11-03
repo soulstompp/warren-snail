@@ -301,6 +301,26 @@ pub(crate) fn expression(e: Expr) -> Expr {
         .unwrap_or(e)
 }
 
+/// An expression's tokens as PostgreSQL's grammar binds them; none where they read no expression.
+pub(crate) fn expression_of(tokens: &[Token]) -> Option<Expr> {
+    let grammar = Grammar {
+        parenthesized: true,
+        ..Grammar::default()
+    };
+    let mut p = Parser::new(&grammar).with_tokens(tokens.to_vec());
+    let e = p.parse_expr().ok()?;
+    (p.index() >= tokens.len()).then_some(e)
+}
+
+/// A question PostgreSQL's dialect in sqlparser read, as PostgreSQL's grammar binds it.
+pub(crate) fn query(q: &sqlparser::ast::Query) -> sqlparser::ast::Query {
+    let read = bound(&q.to_string()).and_then(|b| crate::read::image::parse_sql(&b).ok());
+    match read.as_deref() {
+        Some([sqlparser::ast::Statement::Query(b)]) => (**b).clone(),
+        _ => q.clone(),
+    }
+}
+
 /// The statements of `sql` as `grammar` reads them, its tokens the record image operators' reading.
 fn parsed(
     grammar: &Grammar,

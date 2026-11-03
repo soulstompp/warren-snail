@@ -101,9 +101,12 @@ at once, and a snail written inside a host that decides its commits.
   `|`, `#`, `<<` and `>>`; `~~` and its kin as `LIKE` and `ILIKE`, and `^@`, a fixed prefix narrowing
   the read; `~<~`, `~<=~`, `~>=~` and `~>~` narrowing it along an index of `text_pattern_ops` or
   `bpchar_pattern_ops`; JSON's with a `text[]` column on the right. A statement's operators bind as
-  PostgreSQL's grammar binds them, `@ a + b` as `@ (a + b)` and `-a ^ b` as `(-a) ^ b`.
+  PostgreSQL's grammar binds them, `@ a + b` as `@ (a + b)` and `-a ^ b` as `(-a) ^ b`: in a
+  question, a write, a locking question, a view, and the DDL's `CHECK`s, `DEFAULT`s, domains,
+  generated columns and functions.
 - A file records `default_text_search_config`, `write --text-search-config`, `simple` unless told
   otherwise: `@@` of text, and the one-argument `to_tsvector`, `to_tsquery` and the rest, read it.
+  A `SET` of it to the file's does nothing, and to another is refused by name.
 - Writes: an `INSERT … SELECT` held to PostgreSQL's assignment casts, `SET CONSTRAINTS`, and the
   DDL above in `exec`; the `DEFAULT`s `now()`, `gen_random_uuid()`, `uuidv4()` and `uuidv7()`;
   READ COMMITTED, and READ UNCOMMITTED run as it, REPEATABLE READ and SERIALIZABLE, each as

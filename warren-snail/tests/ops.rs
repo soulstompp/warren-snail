@@ -1210,6 +1210,63 @@ fn an_operator_reads_in_a_write_s_conditions_and_values_a_check_and_a_generated_
         )
         .unwrap();
     assert_eq!(rows(&b), strs(&["8", "14", "1"]));
+    // A question that locks its rows binds as one that locks none, `- (@ (n - 10)) < -4`, and
+    // locks the rows it answers.
+    snail.execute("BEGIN").unwrap();
+    let d = snail
+        .execute("SELECT id FROM s.w WHERE - @ n - 10 < -4 ORDER BY id FOR UPDATE")
+        .unwrap();
+    assert_eq!(rows(d.answer.as_ref().unwrap()), strs(&["3", "4"]));
+    let mut other = Snail::open_writing(&path).unwrap();
+    for id in [3, 4] {
+        let e = other
+            .execute(&format!(
+                "SELECT id FROM s.w WHERE id = {id} FOR UPDATE NOWAIT"
+            ))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "could not obtain lock on row in relation \"w\"", "{id}");
+        other.execute("ROLLBACK").ok();
+    }
+    snail.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_domain_s_check_and_a_generated_column_bind_a_prefix_operator_beside_a_sign() {
+    use warren_snail::read::Snail;
+    let path = tmp("ops-signed.snail");
+    let catalog = Catalog::parse(
+        "CREATE DOMAIN s.dd AS integer CHECK (- @ VALUE - 1 >= - 1);
+         CREATE TABLE s.w (id integer PRIMARY KEY, n integer, e s.dd, \
+         g integer GENERATED ALWAYS AS (- @ n - 1) STORED);",
+    )
+    .unwrap();
+    let empty = Rows {
+        columns: catalog.tables[0]
+            .columns
+            .iter()
+            .map(|c| Values::new(c.ty))
+            .collect(),
+    };
+    write(&path, &catalog, &[("s.w".into(), empty)]).unwrap();
+    let mut snail = Snail::open_writing(&path).unwrap();
+    // `- @ VALUE - 1` is `- (@ (VALUE - 1))`, which 2 passes and `(- @ VALUE) - 1` refuses.
+    snail
+        .execute("INSERT INTO s.w (id, n, e) VALUES (1, 3, 2), (2, 0, 0)")
+        .unwrap();
+    let e = snail
+        .execute("INSERT INTO s.w (id, n, e) VALUES (3, 3, 3)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("value for domain s.dd violates check constraint \"dd_check\""),
+        "{e}"
+    );
+    let (b, _) = snail
+        .ask("SELECT id, n, e, g FROM s.w ORDER BY id", None)
+        .unwrap();
+    assert_eq!(rows(&b), strs(&["1|3|2|-2", "2|0|0|-1"]));
 }
 
 /// A snail of `s.d`, written recording `config` where it names one, its table's rows the words.
@@ -1714,6 +1771,17 @@ fn a_view_binds_its_operators_as_a_statement_does() {
         .ask("SELECT a, b, c FROM s.v ORDER BY id", None)
         .unwrap();
     assert_eq!(rows(&b), strs(&["4|true|true", "6|false|false"]));
+    // Made, it is read as PostgreSQL's parser reads it: `(t ~~ 'a') & 1`.
+    let e = Catalog::parse(
+        "CREATE TABLE s.t (id integer PRIMARY KEY, n integer, t text);
+         CREATE VIEW s.v AS SELECT id, t ~~ 'a' & 1 AS a FROM s.t;",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        e.contains("operator does not exist: boolean & integer"),
+        "{e}"
+    );
 }
 
 #[test]
