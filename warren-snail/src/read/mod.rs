@@ -16,6 +16,7 @@ mod collate;
 mod copy;
 mod cursor;
 pub(crate) mod elements;
+mod explain;
 pub(crate) mod fill;
 pub(crate) mod foreign;
 pub mod handed;

@@ -487,3 +487,41 @@ fn copy_writes_rows_out_and_reads_them_back_in_text_and_csv() {
     assert!(w.execute("COPY s.t FROM STDIN").is_err());
     fresh(&path).census().unwrap();
 }
+
+#[test]
+fn explain_prints_the_snails_round() {
+    let s = sample(2_000);
+    let path = snail("session-explain", &s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let (network, station) = busiest(&s);
+    let q = format!(
+        "SELECT r.reading_id FROM weather.readings r WHERE r.network_id = {network} AND r.station_no = {station}"
+    );
+    let lines = |w: &mut Snail, st: &str| -> Vec<String> {
+        let d = w.execute(st).unwrap();
+        assert_eq!(d.answer.as_ref().unwrap().schema().field(0).name(), "QUERY PLAN");
+        column0(&d).into_iter().map(Option::unwrap).collect()
+    };
+    let priced = lines(&mut w, &format!("EXPLAIN {q}"));
+    assert!(priced[0].starts_with("Snail round along r_station:"), "{priced:?}");
+    let p = fresh(&path).price(&q, None).unwrap();
+    assert!(priced[1].contains(&format!("{} of columns predicted", p.column_pages)));
+    let ran = lines(&mut w, &format!("EXPLAIN (ANALYZE, VERBOSE) {q}"));
+    let (_, round) = fresh(&path).ask(&q, None).unwrap();
+    assert_eq!(
+        ran[0],
+        format!("Snail round along r_station: {} rows", round.rows)
+    );
+    assert!(ran.iter().any(|l| l.starts_with("  Order r_station:")), "{ran:?}");
+    assert!(ran.last().unwrap().starts_with("Execution Time: "));
+    let json = lines(&mut w, &format!("EXPLAIN (FORMAT JSON) {q}"));
+    assert_eq!(json.len(), 1);
+    assert!(json[0].starts_with("[\"Snail round along r_station:"));
+    // A write runs under ANALYZE, and is refused without it.
+    assert!(w
+        .execute("EXPLAIN DELETE FROM weather.stations WHERE network_id = -1")
+        .is_err());
+    let wrote = lines(&mut w, "EXPLAIN ANALYZE DELETE FROM weather.stations WHERE network_id = -1");
+    assert_eq!(wrote[0], "Snail write: DELETE 0 rows");
+    assert!(w.execute("EXPLAIN (FORMAT XML) SELECT 1").is_err());
+}

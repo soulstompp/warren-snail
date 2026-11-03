@@ -66,6 +66,8 @@ pub enum Said {
     Close { name: Option<String> },
     /// COPY.
     Copy(Box<super::copy::Copy>),
+    /// EXPLAIN.
+    Explain(Box<super::explain::Explain>),
 }
 
 /// The words of a statement but its white space and its last semicolon.
@@ -304,6 +306,7 @@ impl Said {
             Said::Fetch { .. } => "MOVE",
             Said::Close { .. } => "CLOSE CURSOR",
             Said::Copy(_) => "COPY",
+            Said::Explain(_) => "EXPLAIN",
         }
     }
 }
@@ -354,6 +357,9 @@ pub(super) fn said(
             direction,
             name,
         }));
+    }
+    if let Some(read) = super::explain::parse_explain(sql) {
+        return Ok(Some(Said::Explain(Box::new(read?))));
     }
     if let Some(read) = super::copy::parse_copy(catalog, sql) {
         return Ok(Some(Said::Copy(Box::new(read?))));
@@ -582,6 +588,7 @@ impl super::Snail {
                 name,
             } => return self.fetch(fetch, &direction, &name),
             Said::Close { name } => self.close_cursor(name.as_deref())?,
+            Said::Explain(e) => return self.explain(&e),
             Said::Copy(c) => {
                 return match c.from_stdin() || !c.to() {
                     true => {
