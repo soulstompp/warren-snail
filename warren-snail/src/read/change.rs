@@ -290,7 +290,7 @@ pub(super) fn key_of(table: &Table, order: &Order, row: &Row) -> Result<Vec<KeyV
 
 /// The type each column a question returns takes before any row is read, as PostgreSQL types it: a
 /// column's from its table, an expression's as the pipeline types it; none where it is not known.
-fn stated_types(catalog: &Catalog, question: &str) -> Vec<Option<ColumnType>> {
+pub(super) fn stated_types(catalog: &Catalog, question: &str) -> Vec<Option<ColumnType>> {
     use sqlparser::ast::{SelectItem, SetExpr, Statement as Sql, TableFactor};
     let Ok(parsed) = super::image::parse_sql(question) else {
         return Vec::new();

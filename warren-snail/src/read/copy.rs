@@ -800,7 +800,20 @@ fn csv_rows(data: &str, c: &Copy) -> Result<Vec<Vec<(String, bool)>>> {
             _ => unreachable!("COPY names a table or a question"),
         };
         let batch = ask(&question)?;
-        let types = super::change::answer_types(&batch)?;
+        // Each column's type as the answer holds it, an integer's as PostgreSQL types the question.
+        let stated = super::change::stated_types(catalog, &question);
+        let types: Vec<crate::catalog::ColumnType> = super::change::answer_types(&batch)?
+            .into_iter()
+            .enumerate()
+            .map(|(k, held)| match (held, stated.get(k).copied().flatten()) {
+                // An integer the answer holds in 64 bits is written in its own width.
+                (
+                    crate::catalog::ColumnType::Int8,
+                    Some(s @ (crate::catalog::ColumnType::Int2 | crate::catalog::ColumnType::Int4)),
+                ) => s,
+                _ => held,
+            })
+            .collect();
         let rows = super::change::rows_of(&batch)?;
         let names: Vec<String> = match names.is_empty() {
             true => batch.schema().fields().iter().map(|f| f.name().clone()).collect(),
