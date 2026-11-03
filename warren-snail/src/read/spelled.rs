@@ -44,10 +44,10 @@ pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
 pub(crate) const SAMPLED: char = '\u{2}';
 
 /// The statement as PostgreSQL's scanner and grammar read its words, where sqlparser's tokenizer
-/// reads them otherwise, under `release`: a number in its bases and with its underscores, or refused
-/// as trailing junk, from 16 on; strings a newline apart as one string; `x ISNULL` and `x NOTNULL`;
-/// `interval(p) '…'`'s precision; a TABLESAMPLE clause carried in a call's name (`SAMPLED`); and what
-/// sqlparser takes and PostgreSQL's grammar does not, refused.
+/// reads them otherwise, under `release`: a number in its bases and with its underscores from 16 on,
+/// a name written against it refused as trailing junk from 15 on; strings a newline apart as one string;
+/// `x ISNULL` and `x NOTNULL`; `interval(p) '…'`'s precision; a TABLESAMPLE clause carried in a call's name
+/// (`SAMPLED`); and what sqlparser takes and PostgreSQL's grammar does not, refused.
 pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
     let mut out = numbered(sql, release)?;
     if let Some(next) = worded(&out)? {
@@ -381,6 +381,17 @@ fn numbered(sql: &str, release: u8) -> Result<Cow<'_, str>> {
                 } else {
                     let end = number_before_16(b, i);
                     if b.get(end).copied().is_some_and(ident_start) {
+                        // 15 refuses a name written against a number, 14 reads it as the next word.
+                        if release == 15 {
+                            let mut j = end;
+                            while b.get(j).copied().is_some_and(ident_cont) {
+                                j += 1;
+                            }
+                            return Err(Error::new(format!(
+                                "trailing junk after numeric literal at or near \"{}\"",
+                                &sql[i..j]
+                            )));
+                        }
                         swap(&mut out, end, end, " ", &mut copied);
                     }
                     i = end;

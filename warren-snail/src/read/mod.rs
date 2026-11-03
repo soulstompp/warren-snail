@@ -45,6 +45,7 @@ mod summed;
 pub mod statement;
 mod subqueries;
 mod together;
+mod unread;
 mod tsearch;
 mod typed;
 mod walk;

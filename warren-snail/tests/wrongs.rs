@@ -113,6 +113,108 @@ fn order_by_using_sorts_as_its_operator_does_wherever_it_stands() {
 }
 
 #[test]
+fn words_are_read_as_postgresql_s_scanner_reads_them() {
+    let mut s = Snail::open(&made("scanned")).unwrap();
+    for (sql, pg) in [
+        (
+            "SELECT 0x10 AS a, 0o17 AS b, 0b101 AS c, 1_000 AS d, 0x7FFFFFFFFFFFFFFF AS e",
+            "16|15|5|1000|9223372036854775807",
+        ),
+        ("SELECT id FROM s.a WHERE id = 0x2", "2"),
+        ("SELECT id FROM s.a ORDER BY id LIMIT 0b10", "1,2"),
+        ("WITH q AS (SELECT 'a'\n'b' AS x, 'c'  -- note\n 'd' AS y) SELECT * FROM q", "ab|cd"),
+        ("SELECT id FROM s.t WHERE n ISNULL", "4"),
+        ("SELECT id FROM s.t WHERE n NOTNULL ORDER BY id", "1,2,3,5"),
+        (
+            "WITH q AS (SELECT id, n ISNULL AS x, n NOTNULL AS y FROM s.t) SELECT * FROM q ORDER BY id",
+            "1|false|true,2|false|true,3|false|true,4|true|false,5|false|true",
+        ),
+        (
+            "WITH q AS (SELECT interval(3) '1.23456' AS x, interval(0) '1.5' AS y) \
+             SELECT x::text AS x, y::text AS y FROM q",
+            "00:00:01.235|00:00:02",
+        ),
+    ] {
+        assert_eq!(column(&mut s, sql), pg, "{sql}");
+    }
+    for (sql, pg) in [
+        ("SELECT 0x", "invalid hexadecimal integer at or near \"0x\""),
+        ("SELECT 0b", "invalid binary integer at or near \"0b\""),
+        ("SELECT 0x1g", "trailing junk after numeric literal at or near \"0x1g\""),
+        ("SELECT 123abc", "trailing junk after numeric literal at or near \"123abc\""),
+        ("SELECT 1__0", "trailing junk after numeric literal at or near \"1__0\""),
+        ("SELECT $1abc", "trailing junk after parameter at or near \"$1abc\""),
+        ("SELECT interval(3) '1.23456' second", "syntax error at or near \"second\""),
+    ] {
+        assert_eq!(refused(&mut s, sql), pg, "{sql}");
+    }
+    // Before 16 a number is its decimal digits: 15 refuses a name written against one, and 14
+    // reads the name as the next word (the release notes of 15 and 16).
+    for release in [14, 15] {
+        let path = tmp(&format!("wrongs-scanned-{release}.snail"));
+        let catalog = Catalog::parse(DDL).unwrap();
+        warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), release)
+            .unwrap();
+        let mut s = Snail::open(&path).unwrap();
+        match release {
+            14 => {
+                assert_eq!(column(&mut s, "SELECT 0x10"), "0");
+                assert_eq!(column(&mut s, "SELECT 1_000"), "1");
+            }
+            _ => {
+                for n in ["0x10", "1_000"] {
+                    assert_eq!(
+                        refused(&mut s, &format!("SELECT {n}")),
+                        format!("trailing junk after numeric literal at or near \"{n}\"")
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn what_sqlparser_takes_past_postgresql_s_grammar_is_refused_in_its_words() {
+    let mut s = Snail::open(&made("grammar")).unwrap();
+    let near = |w: &str| format!("syntax error at or near \"{w}\"");
+    for (sql, pg) in [
+        ("SELECT TOP 1 id FROM s.a", near("1")),
+        ("SELECT id FROM (SELECT TOP 1 id FROM s.a) y", near("1")),
+        ("SELECT id FROM s.a WHERE id IN (SELECT TOP 1 id FROM s.a)", near("1")),
+        ("SELECT id FROM s.a LATERAL VIEW explode(x) t AS y", near("LATERAL")),
+        ("SELECT id FROM s.a CONNECT BY PRIOR id = g", near("BY")),
+        ("SELECT id FROM s.a FOR XML PATH", near("XML")),
+        ("SELECT id FROM s.a FOR JSON AUTO", near("JSON")),
+        ("SELECT id FROM s.a FOR BROWSE", near("BROWSE")),
+        ("SELECT id FROM s.a WITH (NOLOCK)", near("WITH")),
+        ("SELECT x.id FROM s.a x ANTI JOIN s.t ON true", near("ANTI")),
+        // A string is never a label.
+        ("SELECT 'a' 'b'", near("'b'")),
+        ("SELECT 'a' /* c */\n'b'", near("'b'")),
+        ("SELECT id AS 'x' FROM s.a", near("'x'")),
+        ("SELECT name AS 'x' FROM s.a", near("'x'")),
+        ("SELECT id FROM s.a 'x'", near("'x'")),
+        ("SELECT * FROM (SELECT 1 INTO q) x", "SELECT ... INTO is not allowed here".into()),
+    ] {
+        assert_eq!(refused(&mut s, sql), pg, "{sql}");
+    }
+    assert!(refused(&mut s, "SELECT id FROM s.a QUALIFY row_number() OVER () = 1")
+        .starts_with("QUALIFY row_number() OVER () = 1 is not read"));
+    for sql in ["SELECT id, g INTO q FROM s.a", "SELECT 1 INTO q", "SELECT id INTO TEMP q FROM s.a"] {
+        assert!(refused(&mut s, sql).starts_with("SELECT … INTO is not read"), "{sql}");
+    }
+    // A name then a string is a literal of the type it names; SEMI and ANTI before JOIN an alias.
+    assert_eq!(
+        column(&mut s, "WITH q AS (SELECT id, name 'x' FROM s.a) SELECT * FROM q ORDER BY id LIMIT 2"),
+        "1|x,2|x"
+    );
+    assert_eq!(
+        column(&mut s, "SELECT semi.id FROM s.a SEMI JOIN s.t ON s.t.id = semi.id ORDER BY 1"),
+        "1,2,3,4,5"
+    );
+}
+
+#[test]
 fn gist_takes_inet_s_class_unnamed_only_from_release_19() {
     let gist = "no default operator class for access method \"gist\"";
     for (ddl, refused) in [
@@ -149,6 +251,17 @@ fn gist_takes_inet_s_class_unnamed_only_from_release_19() {
 #[cfg(feature = "standalone")]
 mod written {
     use super::*;
+
+    #[test]
+    fn select_into_makes_no_table_and_says_why() {
+        let mut w = Snail::open_writing(&made("into")).unwrap();
+        for sql in ["SELECT id, g INTO q FROM s.a", "SELECT id INTO UNLOGGED TABLE q FROM s.a"] {
+            let e = w.execute(sql).err().unwrap().to_string();
+            assert!(e.starts_with("SELECT … INTO is not read"), "{sql}: {e}");
+        }
+        assert!(w.catalog.table("q").is_none());
+        assert_eq!(column(&mut w, "SELECT count(*) FROM s.a"), "6");
+    }
 
     #[test]
     fn a_row_a_pipeline_finds_is_its_block_s_whatever_numeric_it_holds() {

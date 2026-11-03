@@ -162,11 +162,14 @@ pub(super) fn asks_an_operator(sql: &str) -> bool {
         })
 }
 
-/// The statements of `sql`, as sqlparser's PostgreSQL dialect reads them, these operators among them.
-pub(crate) fn parse_sql(sql: &str) -> std::result::Result<Vec<Statement>, ParserError> {
-    Parser::new(&PostgreSqlDialect {})
-        .with_tokens_with_locations(tokens(sql)?)
-        .parse_statements()
+/// The statements of `sql`, as sqlparser's PostgreSQL dialect reads them, these operators among them,
+/// and what it takes past PostgreSQL's grammar refused by name (`unread`).
+pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
+    let mut statements = Parser::new(&PostgreSqlDialect {})
+        .with_tokens_with_locations(tokens(sql).map_err(ParserError::from)?)
+        .parse_statements()?;
+    super::unread::checked(sql, &mut statements)?;
+    Ok(statements)
 }
 
 /// An expression's text as `parse_sql` reads it.
