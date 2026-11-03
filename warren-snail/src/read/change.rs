@@ -539,6 +539,35 @@ pub(super) fn widen(table: &Table, rows: Vec<Row>) -> Vec<Row> {
         .collect()
 }
 
+/// The rows a statement found, each value in the form its table holds it: an answer gives a numeric
+/// at the precision the path that read it computes, which need not be its column's own.
+pub(super) fn found_rows(table: &Table, batch: &RecordBatch) -> Result<Vec<Row>> {
+    let mut rows = widen(table, rows_of(batch)?);
+    let stored = (0..table.columns.len()).filter(|&c| !table.columns[c].is_virtual());
+    for (field, c) in batch.schema().fields().iter().zip(stored) {
+        let to = table.columns[c].ty;
+        if !to.is_numeric() {
+            continue;
+        }
+        let from = match crate::numeric::is_numeric_field(field)
+            && matches!(field.data_type(), arrow::datatypes::DataType::Utf8)
+        {
+            true => ColumnType::NumericText(None),
+            false => answer_type(field.data_type())?,
+        };
+        for row in &mut rows {
+            if row[c] == Datum::Null {
+                continue;
+            }
+            let n = fill::numeric_of(&row[c], from).ok_or_else(|| {
+                Error::new(format!("{}.{}: a row found holds no numeric", table.name, field.name()))
+            })?;
+            row[c] = fill::numeric_datum(n, to)?;
+        }
+    }
+    Ok(rows)
+}
+
 /// The sequence a column's DEFAULT draws from: its identity's, or its DEFAULT's nextval.
 fn sequence_of(catalog: &Catalog, col: &crate::catalog::Column) -> Option<String> {
     if let Some(i) = &col.identity {
@@ -1192,7 +1221,7 @@ impl Snail {
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
                 let t = &self.catalog.tables[table];
-                let old = self.kept_to(table, widen(t, rows_of(&batch)?), found)?;
+                let old = self.kept_to(table, found_rows(t, &batch)?, found)?;
                 done.rows = old.len() as u64;
                 (done.rewritten, done.orders) =
                     self.apply(table, old.into_iter().map(Change::Delete).collect())?;
@@ -1271,7 +1300,7 @@ impl Snail {
             }
         }
         let (batch, _) = self.answer(&find, None)?;
-        let old = self.kept_to(table, widen(&t, rows_of(&batch)?), found)?;
+        let old = self.kept_to(table, found_rows(&t, &batch)?, found)?;
         done.rows = old.len() as u64;
         let defaults: Vec<usize> = sets
             .iter()

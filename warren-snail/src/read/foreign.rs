@@ -11,7 +11,7 @@
 //! and those that hold one locked. A block written since the root the round reads runs the
 //! statement again, as a block it writes does.
 
-use super::change::{datum_typed, key_of, pick, rows_of, widen, Change, Waiting};
+use super::change::{datum_typed, found_rows, key_of, pick, rows_of, Change, Waiting};
 use super::fill;
 use super::statement::{Datum, Row};
 use super::Snail;
@@ -1058,7 +1058,7 @@ impl Snail {
             )
         };
         let (b, _) = self.answer(&sql, None)?;
-        Ok(widen(t, rows_of(&b)?))
+        found_rows(t, &b)
     }
 
     /// Checks every row of a child against a foreign key made valid on a table that holds rows:
