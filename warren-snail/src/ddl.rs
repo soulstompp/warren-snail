@@ -5078,6 +5078,10 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
             break;
         }
     }
+    // Each type the DDL declares is held whether a column names it or not, so a cast can name it.
+    for t in &draft.types {
+        let _ = draft.declared_type(t, &t.name);
+    }
     let mut finished = draft.finish();
     // A table whose foreign key references a table refused is refused for it, in turn.
     loop {

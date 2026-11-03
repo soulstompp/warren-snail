@@ -309,6 +309,33 @@ fn what_sqlparser_takes_past_postgresql_s_grammar_is_refused_in_its_words() {
 }
 
 #[test]
+fn a_record_of_one_field_made_in_from_is_its_field_and_a_declared_type_is_named_alone() {
+    let path = tmp("wrongs-populate.snail");
+    let ddl = "CREATE TYPE s.tc AS (a integer);\nCREATE TYPE s.c2 AS (a integer, b text);\n\
+               CREATE TABLE s.one (a integer PRIMARY KEY);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut s = Snail::open(&path).unwrap();
+    for (sql, pg) in [
+        ("SELECT y.a FROM jsonb_populate_record(NULL::s.one, '{\"a\":7}') AS y", "7"),
+        ("SELECT * FROM jsonb_populate_record(NULL::s.one, '{\"a\":7}') AS y", "7"),
+        ("SELECT * FROM jsonb_populate_recordset(NULL::s.one, '[{\"a\":7},{\"a\":8}]') AS y", "7,8"),
+        ("SELECT x FROM json_populate_record(NULL::s.one, '{\"a\":7}') AS y(x)", "7"),
+        (
+            "SELECT y.a, n FROM jsonb_populate_recordset(NULL::s.one, '[{\"a\":7},{\"a\":8}]') \
+             WITH ORDINALITY AS y(a, n)",
+            "7|1,8|2",
+        ),
+        ("SELECT * FROM jsonb_populate_record(NULL::s.one, NULL) AS y", "NULL"),
+        // A type the DDL declares and no column names.
+        ("SELECT y.a FROM jsonb_populate_record(NULL::s.tc, '{\"a\":7}') AS y", "7"),
+        ("SELECT y.a, y.b FROM json_populate_record(NULL::s.c2, '{\"a\":7,\"b\":\"x\"}') AS y", "7|x"),
+        ("WITH q AS (SELECT ROW(7)::s.tc AS x) SELECT (x).a FROM q", "7"),
+    ] {
+        assert_eq!(column(&mut s, sql), pg, "{sql}");
+    }
+}
+
+#[test]
 fn gist_takes_inet_s_class_unnamed_only_from_release_19() {
     let gist = "no default operator class for access method \"gist\"";
     for (ddl, refused) in [

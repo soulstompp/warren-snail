@@ -802,7 +802,12 @@ enum What {
     /// A step made before.
     Made { name: String, qualifier: String },
     /// A function's rows, made for each row of the relations before it.
-    Call { call: Call, qualifier: String },
+    Call {
+        call: Call,
+        qualifier: String,
+        /// Whether its record is spread into its fields, one field among them.
+        spread: bool,
+    },
     /// A LATERAL subquery's rows, by its place among the step's, made for each row of the relations
     /// before it.
     Lateral { at: usize, qualifier: String },
@@ -1050,6 +1055,7 @@ impl Laying<'_> {
             .map(|a| crate::catalog::ident(&a.name))
             .unwrap_or_else(|| name.clone());
         let fields = ty.and_then(record_fields);
+        let spread = fields.is_some();
         let mut cols: Vec<Col> = match fields {
             Some(fields) => fields
                 .into_iter()
@@ -1100,7 +1106,11 @@ impl Laying<'_> {
         let width = cols.len();
         self.columns.extend(cols);
         Ok(Node {
-            what: What::Call { call, qualifier: q },
+            what: What::Call {
+                call,
+                qualifier: q,
+                spread,
+            },
             at,
             width,
             star: (at..at + width).collect(),
@@ -1713,8 +1723,8 @@ impl Reading<'_> {
                 }
                 rows.each_chunk(&mut |c| each(c, None))
             }
-            What::Call { call, .. } => {
-                let rows = self.called(node, call, before)?;
+            What::Call { call, spread, .. } => {
+                let rows = self.called(node, call, *spread, before)?;
                 each(rows, None)
             }
             What::Lateral { at, .. } => self
@@ -2372,6 +2382,7 @@ impl Reading<'_> {
         &mut self,
         node: &Node,
         call: &Call,
+        spread: bool,
         before: Option<(usize, &[Value])>,
     ) -> Result<Vec<Vec<Value>>> {
         let (start, row) = before.unwrap_or((node.at, &[]));
@@ -2391,7 +2402,7 @@ impl Reading<'_> {
             .enumerate()
             .map(|(i, v)| {
                 let mut out = match (fields, &v) {
-                    (1, _) => vec![v],
+                    (1, _) if !spread => vec![v],
                     (_, Value::Null) => vec![Value::Null; fields],
                     (_, v) => pipeline::record_values(v, fields)?,
                 };
