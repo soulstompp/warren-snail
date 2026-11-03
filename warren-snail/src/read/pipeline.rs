@@ -4604,8 +4604,7 @@ fn windows(
             ))
         })?;
         match spec.order_by.as_slice() {
-            [o] if !matches!(o.options.sort, Some(OrderBySort::Desc))
-                && o.options.nulls_first != Some(true)
+            [o] if super::ordering::ascending(&o.options)
                 && column_of(&o.expr)
                     .is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(order)) => {}
             _ => {
@@ -4836,11 +4835,12 @@ impl Acc {
                 .within_group
                 .iter()
                 .map(|o| {
-                    let desc = matches!(o.options.sort, Some(OrderBySort::Desc));
+                    let desc = super::ordering::descends(&o.options);
                     super::aggregates::Direction {
                         desc,
                         nulls_first: o.options.nulls_first.unwrap_or(desc),
                         under: None,
+                        bytes: super::ordering::by_bytes(&o.options),
                     }
                 })
                 .collect();
@@ -4909,11 +4909,12 @@ impl Acc {
                 by: by
                     .iter()
                     .map(|o| {
-                        let desc = matches!(o.options.sort, Some(OrderBySort::Desc));
+                        let desc = super::ordering::descends(&o.options);
                         super::aggregates::Direction {
                             desc,
                             nulls_first: o.options.nulls_first.unwrap_or(desc),
                             under: None,
+                            bytes: super::ordering::by_bytes(&o.options),
                         }
                     })
                     .collect(),
@@ -6132,6 +6133,33 @@ pub(super) fn prepare<'q>(
     }
     if let Some(l) = &limit {
         l.check(&mut typing)?;
+    }
+    if let Some(OrderByKind::Expressions(os)) = q.order_by.as_ref().map(|o| &o.kind) {
+        for (o, &at) in os.iter().zip(&sorted) {
+            let ty = match returns.get(at) {
+                Some(t) => *t,
+                None => typing.type_of(hidden[at - items.len()])?,
+            };
+            super::ordering::checked(&o.options, ty)?;
+        }
+    }
+    for call in calls.aggregates.iter().chain(calls.windows.iter()) {
+        if let Expr::Function(f) = call {
+            let mut by: Vec<&sqlparser::ast::OrderByExpr> = f.within_group.iter().collect();
+            if let FunctionArguments::List(l) = &f.args {
+                for c in &l.clauses {
+                    if let sqlparser::ast::FunctionArgumentClause::OrderBy(o) = c {
+                        by.extend(o);
+                    }
+                }
+            }
+            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
+                by.extend(&spec.order_by);
+            }
+            for o in by {
+                super::ordering::checked(&o.options, typing.type_of(&o.expr)?)?;
+            }
+        }
     }
     let listed: Vec<&Expr> = items.iter().map(|(e, _)| *e).collect();
     windows::checked(&calls.windows, &listed, &mut typing, release)?;
@@ -7620,6 +7648,9 @@ pub fn hands_over(q: &Query) -> bool {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
             )
         })
+        || matches!(q.order_by.as_ref().map(|o| &o.kind),
+            Some(OrderByKind::Expressions(os))
+                if os.iter().any(|o| matches!(o.options.sort, Some(OrderBySort::Using(_)))))
     {
         return true;
     }

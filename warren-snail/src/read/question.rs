@@ -1607,12 +1607,19 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     }
                 }
             };
-            let desc = match &o.options.sort {
-                None | Some(OrderBySort::Asc) => false,
-                Some(OrderBySort::Desc) => true,
-                Some(_) => {
+            let desc = match (&o.options.sort, &listed[at]) {
+                (None | Some(OrderBySort::Asc), _) => false,
+                (Some(OrderBySort::Desc), _) => true,
+                (Some(_), (_, Item::Key(Key::Column(c)))) => {
+                    let ty = from.table(c.side).columns[c.column].ty;
+                    super::ordering::checked(&o.options, Some(ty))?;
+                    super::ordering::along_a_key(&o.options).ok_or_else(|| {
+                        Error::new(format!("ORDER BY {}: its operator is read in a step", o.expr))
+                    })?
+                }
+                (Some(_), _) => {
                     return Err(Error::new(format!(
-                        "ORDER BY {}: USING is not read",
+                        "ORDER BY {}: USING is read in a step",
                         o.expr
                     )))
                 }

@@ -11,7 +11,7 @@ use crate::cut::PAGE;
 use crate::Result;
 use sqlparser::ast::{
     Expr, FunctionArgumentClause, FunctionArguments, GroupByExpr, OrderByExpr, OrderByKind,
-    OrderBySort, Query, Select, SelectItem, SetExpr, WindowType,
+    Query, Select, SelectItem, SetExpr, WindowType,
 };
 
 /// The bytes a value of a column is held at, at least: a fixed type's as the spill writes it, any
@@ -49,9 +49,7 @@ pub(super) struct Wants<'q> {
 fn ascending(es: &[OrderByExpr]) -> Option<Vec<&Expr>> {
     es.iter()
         .map(|o| {
-            let asc = !matches!(o.options.sort, Some(OrderBySort::Desc))
-                && o.options.nulls_first != Some(true);
-            asc.then_some(&o.expr)
+            super::ordering::ascending(&o.options).then_some(&o.expr)
         })
         .collect()
 }

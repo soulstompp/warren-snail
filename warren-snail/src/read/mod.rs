@@ -25,6 +25,7 @@ mod level;
 mod locking;
 mod nearest;
 mod ops;
+mod ordering;
 mod out;
 pub(crate) mod partial;
 mod pipeline;

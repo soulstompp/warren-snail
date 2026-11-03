@@ -8,7 +8,7 @@ use crate::cut::PAGE;
 use crate::read::spill::{row_width, Back, Run, CHUNK};
 use crate::room::{current, Room};
 use crate::{Error, Result};
-use sqlparser::ast::{OrderByKind, OrderBySort};
+use sqlparser::ast::OrderByKind;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -129,9 +129,17 @@ pub(super) fn sort_key(
 
 /// What a step's ORDER BY reads a row by: its places and the collations they are sorted under.
 pub(super) fn sort_under(p: &Prepared, casings: &Casings) -> Result<Vec<Option<Casing>>> {
+    let bytes = |i: usize| match p.order_by.map(|ob| &ob.kind) {
+        Some(OrderByKind::Expressions(e)) => e
+            .get(i)
+            .is_some_and(|o| crate::read::ordering::by_bytes(&o.options)),
+        _ => false,
+    };
     p.sorted
         .iter()
-        .map(|&at| match p.carried.get(at) {
+        .enumerate()
+        .map(|(i, &at)| match p.carried.get(at) {
+            _ if bytes(i) => Ok(None),
             Some(c) => casings.carried(c),
             None => casings.keyed(p.hidden[at - p.items.len()]),
         })
@@ -166,7 +174,7 @@ impl Sorter {
             Some(OrderByKind::Expressions(e)) => e
                 .iter()
                 .map(|o| {
-                    let desc = matches!(o.options.sort, Some(OrderBySort::Desc));
+                    let desc = crate::read::ordering::descends(&o.options);
                     (desc, o.options.nulls_first.unwrap_or(desc))
                 })
                 .collect(),

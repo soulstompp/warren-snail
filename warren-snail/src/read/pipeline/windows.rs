@@ -13,7 +13,7 @@ use crate::catalog::{Casing, ColumnType};
 use crate::{Error, Result};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments,
-    Ident, NamedWindowExpr, NullTreatment, OrderByExpr, OrderByKind, OrderBySort, Query, Select,
+    Ident, NamedWindowExpr, NullTreatment, OrderByExpr, OrderByKind, Query, Select,
     SelectItem, SetExpr, TableFactor, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 use std::cmp::Ordering;
@@ -471,7 +471,7 @@ fn stepped_by(column: ColumnType, offset: Option<ColumnType>) -> Result<()> {
 
 /// The item of a window's ORDER BY that is a column, ascending, its NULLs last.
 fn plain_column(o: &OrderByExpr) -> Option<(Option<String>, String)> {
-    if matches!(o.options.sort, Some(OrderBySort::Desc)) || o.options.nulls_first == Some(true) {
+    if !crate::read::ordering::ascending(&o.options) {
         return None;
     }
     column_of(&o.expr)
@@ -803,7 +803,7 @@ struct Sorted {
 /// Two rows' ORDER BY values compared as the window's ORDER BY sorts them.
 fn ordered(a: &[Value], b: &[Value], items: &[OrderByExpr]) -> Result<Ordering> {
     for (i, o) in items.iter().enumerate() {
-        let desc = matches!(o.options.sort, Some(OrderBySort::Desc));
+        let desc = crate::read::ordering::descends(&o.options);
         let nulls_first = o.options.nulls_first.unwrap_or(desc);
         let ord = match (a[i].is_null(), b[i].is_null()) {
             (true, true) => Ordering::Equal,
@@ -900,7 +900,10 @@ pub(super) fn values(
         let ordered_under = spec
             .order_by
             .iter()
-            .map(|o| frame.casings.keyed(&o.expr))
+            .map(|o| match crate::read::ordering::by_bytes(&o.options) {
+                true => Ok(None),
+                false => frame.casings.keyed(&o.expr),
+            })
             .collect::<Result<Vec<_>>>()?;
         let folding = if aggregate {
             let (acc, folds) = Acc::of(call, frame.types)?;
@@ -1209,7 +1212,7 @@ fn frames(shape: &Shape, s: &Sorted, spec: &WindowSpec) -> Result<Vec<(usize, us
     let desc = spec
         .order_by
         .first()
-        .is_some_and(|o| matches!(o.options.sort, Some(OrderBySort::Desc)));
+        .is_some_and(|o| crate::read::ordering::descends(&o.options));
     let nulls_first = spec
         .order_by
         .first()

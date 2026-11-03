@@ -50,6 +50,8 @@ pub(super) struct Direction {
     pub desc: bool,
     pub nulls_first: bool,
     pub under: Option<Casing>,
+    /// Whether it compares strings by their bytes, whatever their collation.
+    pub bytes: bool,
 }
 
 /// One aggregate past those the types carry, as it folds.
@@ -207,7 +209,7 @@ impl Agg {
             }
             Agg::Sorted { of, rows, by, .. } => {
                 for (d, u) in by.iter_mut().zip(under) {
-                    d.under = *u;
+                    d.under = u.filter(|_| !d.bytes);
                 }
                 // The ordered-set aggregates pass over NULL; a hypothetical set sorts them too.
                 let hypothetical = !matches!(
