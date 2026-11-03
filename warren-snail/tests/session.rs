@@ -261,3 +261,172 @@ fn set_config_and_current_setting_read_and_write_the_sessions_settings() {
         .execute("SELECT set_config('statement_timeout', '5s', false)")
         .is_err());
 }
+
+/// The first column of an answer, its values as text.
+fn column0(d: &warren_snail::read::Done) -> Vec<Option<String>> {
+    let b = d.answer.as_ref().expect("an answer");
+    (0..b.num_rows()).map(|r| cell(b.column(0).as_ref(), r)).collect()
+}
+
+fn ids(v: &[i64]) -> Vec<Option<String>> {
+    v.iter().map(|x| Some(x.to_string())).collect()
+}
+
+#[test]
+fn a_prepared_statement_runs_with_its_parameters_typed_as_postgresql_types_them() {
+    let s = sample(500);
+    let path = snail("session-prepared", &s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let (network, station) = stations_of(&s)[0];
+    w.execute("PREPARE st (integer, integer) AS SELECT s.name FROM weather.stations s WHERE s.network_id = $1 AND s.station_no = $2")
+        .unwrap();
+    let d = w.execute(&format!("EXECUTE st({network}, {station})")).unwrap();
+    assert_eq!(d.statement, "SELECT");
+    assert_eq!(column0(&d), [Some(name(network, station))]);
+    // An expression is worked out and cast to the parameter's type, as an assignment is.
+    let d = w
+        .execute(&format!("EXECUTE st({network} + 0, {station}.4)"))
+        .unwrap();
+    assert_eq!(column0(&d), [Some(name(network, station))]);
+    // A parameter PREPARE leaves untyped takes its column's type.
+    w.execute("PREPARE ins AS INSERT INTO weather.stations (network_id, station_no, name) VALUES ($1, $2, $3)")
+        .unwrap();
+    assert_eq!(w.execute("EXECUTE ins(9400, 1, 'Evora')").unwrap().rows, 1);
+    w.execute("PREPARE up AS UPDATE weather.stations SET name = $1 WHERE network_id = $2 AND station_no = $3")
+        .unwrap();
+    assert_eq!(w.execute("EXECUTE up('Beja', 9400, 1)").unwrap().rows, 1);
+    let d = w.execute("EXECUTE st(9400, 1)").unwrap();
+    assert_eq!(column0(&d), [Some("Beja".into())]);
+    w.execute("PREPARE echo AS SELECT $1").unwrap();
+    let d = w.execute("EXECUTE echo('x''y')").unwrap();
+    assert_eq!(column0(&d), [Some("x'y".into())]);
+    // A prepared statement outlives a rollback.
+    w.execute("BEGIN").unwrap();
+    w.execute("PREPARE kept AS SELECT 1").unwrap();
+    w.execute("ROLLBACK").unwrap();
+    w.execute("EXECUTE kept").unwrap();
+    for (st, said) in [
+        ("PREPARE st AS SELECT 1", "prepared statement \"st\" already exists"),
+        ("EXECUTE nope", "prepared statement \"nope\" does not exist"),
+        ("EXECUTE st(1)", "wrong number of parameters for prepared statement \"st\""),
+        ("EXECUTE st('a', 1)", "invalid input syntax for type integer: \"a\""),
+        ("DEALLOCATE nope", "prepared statement \"nope\" does not exist"),
+    ] {
+        assert_eq!(refused(&mut w, st), said, "{st}");
+    }
+    w.execute("DEALLOCATE PREPARE st").unwrap();
+    assert!(w.execute(&format!("EXECUTE st({network}, {station})")).is_err());
+    w.execute("DEALLOCATE ALL").unwrap();
+    assert!(w.execute("EXECUTE ins(9400, 2, 'x')").is_err());
+}
+
+#[test]
+fn a_cursor_reads_the_generation_its_declaration_read_and_moves_as_postgresqls_does() {
+    let s = sample(500);
+    let mut sorted = s.reading_id.clone();
+    sorted.sort();
+    let k = &sorted[..5];
+    let ids = |v: &[usize]| -> Vec<Option<String>> { v.iter().map(|&i| Some(k[i - 1].to_string())).collect() };
+    let path = snail("session-cursor", &s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let e = refused(&mut w, "DECLARE c CURSOR FOR SELECT 1");
+    assert_eq!(e, "DECLARE CURSOR can only be used in transaction blocks");
+    w.execute("BEGIN").unwrap();
+    w.execute(&format!("DECLARE c SCROLL CURSOR FOR SELECT r.reading_id FROM weather.readings r WHERE r.reading_id <= {} ORDER BY r.reading_id", k[4]))
+        .unwrap();
+    // A reading written after the declaration is not the cursor's.
+    Snail::open_writing(&path)
+        .unwrap()
+        .execute(&format!("DELETE FROM weather.readings WHERE reading_id = {}", k[2]))
+        .unwrap();
+    let mut fetch = |st: &str| column0(&w.execute(st).unwrap());
+    assert_eq!(fetch("FETCH c"), ids(&[1]));
+    assert_eq!(fetch("FETCH 2 FROM c"), ids(&[2, 3]));
+    assert_eq!(fetch("FETCH PRIOR FROM c"), ids(&[2]));
+    assert_eq!(fetch("FETCH LAST IN c"), ids(&[5]));
+    assert_eq!(fetch("FETCH NEXT FROM c"), ids(&[]));
+    assert_eq!(fetch("FETCH BACKWARD 2 FROM c"), ids(&[5, 4]));
+    assert_eq!(fetch("FETCH ABSOLUTE -1 FROM c"), ids(&[5]));
+    assert_eq!(fetch("FETCH ABSOLUTE 2 FROM c"), ids(&[2]));
+    assert_eq!(fetch("FETCH RELATIVE 0 FROM c"), ids(&[2]));
+    assert_eq!(fetch("FETCH RELATIVE 2 FROM c"), ids(&[4]));
+    assert_eq!(fetch("FETCH FIRST FROM c"), ids(&[1]));
+    assert_eq!(fetch("FETCH ALL FROM c"), ids(&[2, 3, 4, 5]));
+    assert_eq!(fetch("FETCH BACKWARD ALL FROM c"), ids(&[5, 4, 3, 2, 1]));
+    assert_eq!(fetch("FETCH FORWARD FROM c"), ids(&[1]));
+    let d = w.execute("MOVE FORWARD 3 IN c").unwrap();
+    assert_eq!((d.statement, d.rows, d.answer.is_none()), ("MOVE", 3, true));
+    assert_eq!(column0(&w.execute("FETCH c").unwrap()), ids(&[5]));
+    w.execute("CLOSE c").unwrap();
+    assert_eq!(refused(&mut w, "FETCH c"), "cursor \"c\" does not exist");
+    w.execute("ROLLBACK").unwrap();
+    // NO SCROLL reads forward alone.
+    w.execute("BEGIN").unwrap();
+    w.execute("DECLARE f NO SCROLL CURSOR FOR SELECT r.reading_id FROM weather.readings r ORDER BY r.reading_id")
+        .unwrap();
+    w.execute("FETCH 2 FROM f").unwrap();
+    assert_eq!(refused(&mut w, "FETCH PRIOR FROM f"), "cursor can only scan forward");
+    w.execute("ROLLBACK").unwrap();
+    // WITH HOLD outlives the commit; a rollback closes those the transaction declared.
+    w.execute("BEGIN").unwrap();
+    w.execute("DECLARE h CURSOR WITH HOLD FOR SELECT r.reading_id FROM weather.readings r ORDER BY r.reading_id")
+        .unwrap();
+    w.execute("DECLARE g CURSOR FOR SELECT 1").unwrap();
+    w.execute("COMMIT").unwrap();
+    assert_eq!(column0(&w.execute("FETCH 1 FROM h").unwrap()), ids(&[1]));
+    assert!(w.execute("FETCH g").is_err());
+    w.execute("BEGIN").unwrap();
+    w.execute("SAVEPOINT a").unwrap();
+    w.execute("DECLARE k CURSOR FOR SELECT 1").unwrap();
+    w.execute("ROLLBACK TO a").unwrap();
+    assert!(w.execute("FETCH k").is_err());
+    w.execute("ROLLBACK").unwrap();
+    assert_eq!(column0(&w.execute("FETCH 1 FROM h").unwrap()), ids(&[2]));
+    w.execute("CLOSE ALL").unwrap();
+}
+
+#[test]
+fn where_current_of_writes_the_row_the_cursor_stands_on() {
+    let s = sample(500);
+    let mut sorted = s.reading_id.clone();
+    sorted.sort();
+    let (a, b) = (sorted[6], sorted[7]);
+    let declare = format!("DECLARE c CURSOR FOR SELECT r.feed FROM weather.readings r WHERE r.reading_id >= {a} AND r.reading_id <= {b} ORDER BY r.reading_id FOR UPDATE");
+    let path = snail("session-current-of", &s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("BEGIN").unwrap();
+    w.execute("DECLARE c CURSOR FOR SELECT r.feed FROM weather.readings r WHERE r.reading_id IN (SELECT 7 UNION SELECT 8) FOR UPDATE")
+        .ok();
+    w.execute("ROLLBACK").unwrap();
+    w.execute("BEGIN").unwrap();
+    w.execute(&declare).unwrap();
+    assert_eq!(
+        refused(&mut w, "UPDATE weather.readings SET feed = 'x' WHERE CURRENT OF c"),
+        "cursor \"c\" is not positioned on a row"
+    );
+    w.execute("ROLLBACK").unwrap();
+    w.execute("BEGIN").unwrap();
+    w.execute(&declare).unwrap();
+    w.execute("FETCH c").unwrap();
+    let d = w
+        .execute("UPDATE weather.readings SET feed = 'AWS Spare' WHERE CURRENT OF c")
+        .unwrap();
+    assert_eq!(d.rows, 1);
+    w.execute("FETCH c").unwrap();
+    assert_eq!(
+        w.execute("DELETE FROM weather.readings WHERE CURRENT OF c")
+            .unwrap()
+            .rows,
+        1
+    );
+    w.execute("COMMIT").unwrap();
+    let mut r = fresh(&path);
+    assert_eq!(feed_of(&mut r, a), "AWS Spare");
+    assert_eq!(
+        one(&r
+            .ask(&format!("SELECT count(*) FROM weather.readings r WHERE r.reading_id = {b}"), None)
+            .unwrap()
+            .0),
+        0
+    );
+}

@@ -44,6 +44,26 @@ pub enum Said {
     Reset {
         name: Option<String>,
     },
+    /// PREPARE: its name, its parameters' types as it names them, and its statement.
+    Prepare {
+        name: String,
+        types: Vec<Option<String>>,
+        statement: String,
+    },
+    /// EXECUTE: the prepared statement's name and each parameter's expression.
+    Execute { name: String, args: Vec<String> },
+    /// DEALLOCATE of a prepared statement, or of them all.
+    Deallocate { name: Option<String> },
+    /// DECLARE of a cursor.
+    Declare(super::cursor::Declaration),
+    /// FETCH, or MOVE where `fetch` is false: where it takes the cursor, and the cursor's name.
+    Fetch {
+        fetch: bool,
+        direction: super::cursor::Direction,
+        name: String,
+    },
+    /// CLOSE of a cursor, or of them all.
+    Close { name: Option<String> },
 }
 
 /// The words of a statement but its white space and its last semicolon.
@@ -274,6 +294,13 @@ impl Said {
             Said::Set { .. } => "SET",
             Said::Show { .. } => "SHOW",
             Said::Reset { .. } => "RESET",
+            Said::Prepare { .. } => "PREPARE",
+            Said::Execute { .. } => "EXECUTE",
+            Said::Deallocate { .. } => "DEALLOCATE",
+            Said::Declare(_) => "DECLARE CURSOR",
+            Said::Fetch { fetch: true, .. } => "FETCH",
+            Said::Fetch { .. } => "MOVE",
+            Said::Close { .. } => "CLOSE CURSOR",
         }
     }
 }
@@ -282,7 +309,7 @@ impl Said {
 /// PostgreSQL does: none where it is no such statement.
 pub(super) fn said(
     catalog: &Catalog,
-    _sql: &str,
+    sql: &str,
     tokens: &[sqlparser::tokenizer::Token],
 ) -> Result<Option<Said>> {
     if let Some(read) = super::tablelock::parse_lock(tokens) {
@@ -306,6 +333,28 @@ pub(super) fn said(
     if let Some(read) = parse_setting(tokens) {
         return read.map(Some);
     }
+    if let Some(read) = super::prepared::parse_prepare(sql) {
+        let (name, types, statement) = read?;
+        return Ok(Some(Said::Prepare {
+            name,
+            types,
+            statement,
+        }));
+    }
+    if let Some(read) = super::cursor::parse_declare(sql) {
+        return Ok(Some(Said::Declare(read?)));
+    }
+    if let Some(read) = super::cursor::parse_fetch(tokens) {
+        let (fetch, direction, name) = read?;
+        return Ok(Some(Said::Fetch {
+            fetch,
+            direction,
+            name,
+        }));
+    }
+    if let Some(read) = parse_execute(sql) {
+        return read.map(Some);
+    }
     Ok(None)
 }
 
@@ -316,6 +365,8 @@ pub(super) struct Session {
     pub(super) prepared: BTreeMap<String, super::prepared::Prepared>,
     pub(super) cursors: Vec<super::cursor::Cursor>,
     pub(super) table_locks: BTreeSet<(usize, Mode)>,
+    /// The cursors declared so far, which numbers each.
+    pub(super) cursor_count: u64,
 }
 
 /// What a savepoint keeps of the session: the settings, which cursors were open, and the tables'
@@ -347,7 +398,13 @@ impl Session {
     /// closed but those declared WITH HOLD where it committed.
     pub(super) fn end(&mut self, committed: bool) {
         self.settings.end(committed);
-        self.cursors.retain(|c| committed && c.hold);
+        // A rollback closes the cursors the transaction declared, held or not, and leaves those held
+        // from before it.
+        self.cursors
+            .retain(|c| c.hold && (committed || !c.fresh));
+        for c in &mut self.cursors {
+            c.fresh = false;
+        }
     }
 }
 
@@ -508,6 +565,20 @@ impl super::Snail {
                 });
             }
             Said::Reset { name: Some(name) } => self.set_setting(&name, None, false)?,
+            Said::Prepare {
+                name,
+                types,
+                statement,
+            } => self.prepare(&name, types, &statement)?,
+            Said::Execute { name, args } => return self.execute_prepared(&name, &args),
+            Said::Deallocate { name } => self.deallocate(name.as_deref())?,
+            Said::Declare(d) => self.declare_cursor(d)?,
+            Said::Fetch {
+                fetch,
+                direction,
+                name,
+            } => return self.fetch(fetch, &direction, &name),
+            Said::Close { name } => self.close_cursor(name.as_deref())?,
             Said::Reset { name: None } => {
                 let begun = self.begun.is_some();
                 self.session.settings.reset_all(begun);
@@ -599,5 +670,95 @@ impl super::Snail {
             ));
         };
         super::settings::shown(&self.settings_view(), name)
+    }
+}
+
+/// EXECUTE name [(expression, …)], DEALLOCATE [PREPARE] {name | ALL} and CLOSE {name | ALL},
+/// read off their words: none where the words are no such statement.
+fn parse_execute(sql: &str) -> Option<Result<Said>> {
+    use sqlparser::tokenizer::Token;
+    let spans = super::statement::spans(sql).ok()?;
+    let words: Vec<&(Token, usize, usize)> = spans
+        .iter()
+        .filter(|(t, _, _)| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    let kw = |i: usize| match words.get(i).map(|w| &w.0) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_uppercase(),
+        _ => String::new(),
+    };
+    let mut end = words.len();
+    if matches!(words.last().map(|w| &w.0), Some(Token::SemiColon)) {
+        end -= 1;
+    }
+    let syntax = |i: usize| {
+        Some(Err(Error::new(match words.get(i) {
+            Some((t, _, _)) => format!("syntax error at or near \"{t}\""),
+            None => "syntax error at end of input".into(),
+        })))
+    };
+    let name_at = |i: usize| match words.get(i).map(|w| &w.0) {
+        Some(Token::Word(w)) => Some(match w.quote_style {
+            Some(_) => w.value.clone(),
+            None => w.value.to_lowercase(),
+        }),
+        _ => None,
+    };
+    match kw(0).as_str() {
+        "EXECUTE" => {
+            let Some(name) = name_at(1) else {
+                return syntax(1);
+            };
+            let mut args = Vec::new();
+            if 2 < end {
+                if !matches!(words[2].0, Token::LParen) || !matches!(words[end - 1].0, Token::RParen)
+                {
+                    return syntax(2);
+                }
+                let mut depth = 0;
+                let mut from = words[2].2;
+                for w in &words[3..end] {
+                    match w.0 {
+                        Token::LParen | Token::LBracket => depth += 1,
+                        Token::RParen | Token::RBracket if depth > 0 => depth -= 1,
+                        Token::Comma | Token::RParen if depth == 0 => {
+                            let a = sql[from..w.1].trim();
+                            if a.is_empty() {
+                                return syntax(2);
+                            }
+                            args.push(a.to_string());
+                            from = w.2;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some(Ok(Said::Execute { name, args }))
+        }
+        "DEALLOCATE" => {
+            let i = if kw(1) == "PREPARE" { 2 } else { 1 };
+            if i + 1 != end {
+                return syntax(i + 1);
+            }
+            match kw(i).as_str() {
+                "ALL" => Some(Ok(Said::Deallocate { name: None })),
+                _ => match name_at(i) {
+                    Some(n) => Some(Ok(Said::Deallocate { name: Some(n) })),
+                    None => syntax(i),
+                },
+            }
+        }
+        "CLOSE" => {
+            if end != 2 {
+                return syntax(2);
+            }
+            match kw(1).as_str() {
+                "ALL" => Some(Ok(Said::Close { name: None })),
+                _ => match name_at(1) {
+                    Some(n) => Some(Ok(Said::Close { name: Some(n) })),
+                    None => syntax(1),
+                },
+            }
+        }
+        _ => None,
     }
 }

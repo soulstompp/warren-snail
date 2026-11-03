@@ -1168,6 +1168,15 @@ impl Snails {
             // The session's settings stand alike on every snail.
             Said::Set { .. } | Said::Reset { .. } => every(self),
             Said::Show { .. } => self.snails[0].execute(sql),
+            Said::Prepare { .. }
+            | Said::Execute { .. }
+            | Said::Deallocate { .. }
+            | Said::Declare(_)
+            | Said::Fetch { .. }
+            | Said::Close { .. } => Err(Error::new(
+                "prepared statements and cursors are a session's on one snail: open it alone to \
+                 write",
+            )),
             Said::Lock {
                 tables,
                 mode,
