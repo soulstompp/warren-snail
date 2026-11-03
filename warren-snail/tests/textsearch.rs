@@ -77,7 +77,11 @@ fn a_text_is_searched_under_the_configuration_its_call_names() {
     );
     // A call naming no configuration reads the file's, here the default.
     assert_eq!(
-        ask(&mut s, "to_tsvector('fat cats')::text, get_current_ts_config()::text").unwrap(),
+        ask(
+            &mut s,
+            "to_tsvector('fat cats')::text, get_current_ts_config()::text"
+        )
+        .unwrap(),
         some(&["'cats':2 'fat':1", "simple"])
     );
 }

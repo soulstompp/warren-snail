@@ -79,13 +79,20 @@ fn a_type_is_held_where_a_table_s_column_of_it_is_taken() {
     assert_eq!(named(&of, "\"char\"").listed.family, "internal-use types");
 }
 
-
 #[test]
 #[cfg(feature = "standalone")]
-fn an_operator_only_its_name_or_a_setting_kept_out_is_held_in_a_step_a_plain_question_and_a_where() {
+fn an_operator_only_its_name_or_a_setting_kept_out_is_held_in_a_step_a_plain_question_and_a_where()
+{
     let path = weather::tmp("lists-names.snail");
     let (of, _) = warren_snail::lists::operators(19, &path).unwrap();
-    let numbers = ["smallint", "integer", "bigint", "real", "double precision", "numeric"];
+    let numbers = [
+        "smallint",
+        "integer",
+        "bigint",
+        "real",
+        "double precision",
+        "numeric",
+    ];
     let integers = ["smallint", "integer", "bigint"];
     let mut names: Vec<String> = Vec::new();
     for t in numbers {
