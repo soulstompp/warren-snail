@@ -548,6 +548,21 @@ pub(super) fn held_alike(a: &[Datum], b: &[Datum]) -> bool {
 /// The record a row constructor makes of its values: its fields named as PostgreSQL names them, each
 /// of its value's type, a literal's kept apart as `unknown`, which is no other type.
 pub(super) fn anonymous(types: &[(ColumnType, bool)]) -> ColumnType {
+    anonymous_of(types, &[])
+}
+
+/// Whether a type is a row constructor's record whose fields are of `fields`' types.
+pub(super) fn is_anonymous(ty: ColumnType, fields: &[(ColumnType, bool)]) -> bool {
+    matches!(ty, ColumnType::Composed(r)
+        if matches!(r.def(), Composed::Record { name, fields: f }
+            if name == "record"
+                && f.len() == fields.len()
+                && f.iter().zip(fields).all(|(a, b)| a.ty == b.0)))
+}
+
+/// The record a row constructor makes, each field of the domain its value's column is of, where
+/// `domains` names one.
+pub(super) fn anonymous_of(types: &[(ColumnType, bool)], domains: &[Option<String>]) -> ColumnType {
     crate::composed::type_of(Composed::Record {
         name: "record".into(),
         fields: types
@@ -557,6 +572,8 @@ pub(super) fn anonymous(types: &[(ColumnType, bool)]) -> ColumnType {
                 let mut f = Field::new(&format!("f{}", i + 1), ty);
                 if literal {
                     f.domain = Some("unknown".into());
+                } else if let Some(Some(d)) = domains.get(i) {
+                    f.domain = Some(d.clone());
                 }
                 f
             })

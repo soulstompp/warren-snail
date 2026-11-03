@@ -3629,6 +3629,35 @@ fn select_step(
             ons(n, &mut joined);
         }
     }
+    // Each column of a table of the FROM of the domain its DDL gives it, for a row made of it.
+    let mut domains: Vec<Option<String>> = vec![None; typed.len()];
+    {
+        let mut leaves = Vec::new();
+        for n in &from.items {
+            n.leaves(&mut leaves);
+        }
+        for l in leaves {
+            match &l.what {
+                What::Table { table, .. } => {
+                    let t = &catalog.tables[*table];
+                    for (k, c) in stored(t).enumerate() {
+                        if let Some(d) = domains.get_mut(l.at + k) {
+                            d.clone_from(&t.columns[c].domain);
+                        }
+                    }
+                }
+                What::Made { name, .. } => {
+                    for (k, m) in super::handed::step_domains(name).into_iter().flatten().enumerate() {
+                        if let Some(d) = domains.get_mut(l.at + k) {
+                            *d = m;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let _domains = typed::domains_held(domains);
     let mut p = pipeline::prepare(
         &step.query,
         &typed,
@@ -3639,6 +3668,20 @@ fn select_step(
         seeded,
         plans.around(),
     )?;
+    // A column it returns as it reads it, or cast to a domain, is of that domain for what reads it.
+    if let SetExpr::Select(s) = step.query.body.as_ref() {
+        let out = s
+            .projection
+            .iter()
+            .map(|i| match i {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    typed::domain_in(e, &typed)
+                }
+                _ => None,
+            })
+            .collect();
+        super::handed::step_made(&step.name, out);
+    }
     let place = |q: &Option<String>, n: &str| {
         pipeline::naming(
             from.columns

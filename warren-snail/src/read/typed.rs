@@ -21,6 +21,55 @@ pub(super) type TypedColumn = (Option<String>, String, Option<ColumnType>);
 /// An unconstrained numeric, the type of what numeric's operators and functions return.
 pub(super) const NUMERIC: ColumnType = ColumnType::NumericText(None);
 
+thread_local! {
+    /// The domain each column of the step being typed is of, by its place, where its table's DDL
+    /// gives it one.
+    static DOMAINS: std::cell::RefCell<Vec<Option<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The domains of a step's columns, held while it is typed.
+pub(super) struct Domains(Vec<Option<String>>);
+
+/// Holds the domains of the columns of the step about to be typed.
+pub(super) fn domains_held(domains: Vec<Option<String>>) -> Domains {
+    Domains(DOMAINS.with(|d| d.replace(domains)))
+}
+
+impl Drop for Domains {
+    fn drop(&mut self) {
+        let before = std::mem::take(&mut self.0);
+        DOMAINS.with(|d| *d.borrow_mut() = before);
+    }
+}
+
+/// The domain the value of an expression over a step's columns is of: a column's of a domain, or a
+/// cast to one; none for anything else.
+pub(super) fn domain_in(e: &Expr, columns: &[TypedColumn]) -> Option<String> {
+    match e {
+        Expr::Nested(x) => return domain_in(x, columns),
+        Expr::Cast { data_type, .. } => {
+            return super::handed::domain_named(data_type).map(|(d, _)| d.name)
+        }
+        _ => {}
+    }
+    let (q, n) = super::pipeline::column_of(e)?;
+    let found = super::pipeline::naming(
+        columns.iter().map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+        q.as_deref(),
+        &n,
+    );
+    let [i] = found.as_slice() else {
+        return None;
+    };
+    DOMAINS.with(|d| {
+        let d = d.borrow();
+        match d.len() == columns.len() {
+            true => d[*i].clone(),
+            false => None,
+        }
+    })
+}
+
 /// What the typing of a step reads: its columns, and the release whose functions it resolves.
 pub(super) struct Typing<'a> {
     pub columns: &'a [TypedColumn],
@@ -252,6 +301,11 @@ impl Typing<'_> {
         }
     }
 
+    /// The domain a column an expression names is of, where its table's DDL gives it one.
+    fn domain(&self, e: &Expr) -> Option<String> {
+        domain_in(e, self.columns)
+    }
+
     /// An expression's type, where the snail resolves it, each sub-expression's recorded.
     pub fn type_of(&mut self, e: &Expr) -> Result<Option<ColumnType>> {
         let t = self.resolve(e)?;
@@ -303,7 +357,8 @@ impl Typing<'_> {
                 let from = self.type_of(expr)?;
                 let to = crate::catalog::held_type(data_type)
                     .ok()
-                    .or_else(|| crate::composed::resolve(data_type));
+                    .or_else(|| crate::composed::resolve(data_type))
+                    .or_else(|| super::handed::domain_named(data_type).and_then(|(d, _)| d.base_type));
                 if to != from && to != Some(ColumnType::Bytes) {
                     written(from)?;
                 }
@@ -630,7 +685,9 @@ impl Typing<'_> {
                 for x in &parts {
                     types.push(self.type_of(x)?);
                 }
-                super::image::field_types(&parts, &types).map(|f| super::image::anonymous(&f))
+                let domains: Vec<Option<String>> = parts.iter().map(|x| self.domain(x)).collect();
+                super::image::field_types(&parts, &types)
+                    .map(|f| super::image::anonymous_of(&f, &domains))
             }
             Expr::Function(f) => {
                 let name = super::pipeline::function_name(f);

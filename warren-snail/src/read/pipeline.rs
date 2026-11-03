@@ -1468,6 +1468,37 @@ fn cast(
     monetary: crate::monetary::Monetary,
     literal: bool,
 ) -> Result<Value> {
+    // A domain of the file's: its base type's cast, then its NOT NULL and its CHECKs, those of the
+    // domain it is made from first.
+    if let Some((dom, _)) = super::handed::domain_named(to) {
+        let base = crate::ddl::parse_type(&dom.base)?;
+        let v = cast(v, &base, release, monetary, literal)?;
+        if dom.not_null && v.is_null() {
+            return Err(Error::new(format!(
+                "domain {} does not allow null values",
+                dom.name
+            )));
+        }
+        for k in &dom.checks {
+            let held = eval_on(
+                &k.check,
+                &["value".to_string()],
+                std::slice::from_ref(&v),
+                release,
+                &Casings {
+                    monetary,
+                    ..Casings::default()
+                },
+            )?;
+            if matches!(held, Value::Bool(false)) {
+                return Err(Error::new(format!(
+                    "value for domain {} violates check constraint \"{}\"",
+                    dom.name, k.name
+                )));
+            }
+        }
+        return Ok(v);
+    }
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -4253,7 +4284,12 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 .zip(&parts)
                 .map(|((v, f), x)| part_of(f.0, v, quoted(x)))
                 .collect::<Result<Vec<_>>>()?;
-            composed(super::image::anonymous(&fields), crate::composed::Item::Record(items))
+            // Its type as the step's typing made it, its fields' domains among it.
+            let ty = frame
+                .type_of(e)
+                .filter(|t| super::image::is_anonymous(*t, &fields))
+                .unwrap_or_else(|| super::image::anonymous(&fields));
+            composed(ty, crate::composed::Item::Record(items))
         }
         Expr::Function(f) => {
             let name = function_name(f);
@@ -7221,6 +7257,33 @@ impl<'q> Stream<'q> {
                 SetExpr::Select(sel) => typed_from(&sel.from, &typed, &s.table.name),
                 _ => Vec::new(),
             };
+            // The table's own columns of the domain its DDL gives each, for a row made of them.
+            let domains = match query.body.as_ref() {
+                SetExpr::Select(sel) => sel
+                    .from
+                    .iter()
+                    .flat_map(|t| std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)))
+                    .filter_map(|t| match t {
+                        TableFactor::Table { name, .. } => Some(crate::catalog::object_name(name)),
+                        _ => None,
+                    })
+                    .filter_map(|n| {
+                        let (names, _) = typed.get(&n).or_else(|| {
+                            s.is_table(&n).then(|| typed.get(&s.table.name)).flatten()
+                        })?;
+                        let of_table = n == s.table.name || s.is_table(&n) && !typed.contains_key(&n);
+                        let table = s.table.name.clone();
+                        let made = super::handed::step_domains(&n).filter(|_| !of_table);
+                        Some(names.iter().enumerate().map(move |(i, c)| match of_table {
+                            true => super::handed::column_domain(&table, c),
+                            false => made.as_ref().and_then(|m| m.get(i).cloned().flatten()),
+                        }))
+                    })
+                    .flatten()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let _domains = super::typed::domains_held(domains);
             // The table read under each name its FROM gives it, with its primary key.
             let keyed: Vec<(String, Vec<String>)> = match query.body.as_ref() {
                 SetExpr::Select(sel) => base_qualifiers(&sel.from, &typed, &s.table.name)
@@ -7268,6 +7331,13 @@ impl<'q> Stream<'q> {
                     p.items.iter().map(|(_, n)| n.clone()).collect(),
                     p.returns.clone(),
                 ),
+            );
+            super::handed::step_made(
+                &name,
+                p.items
+                    .iter()
+                    .map(|(e, _)| super::typed::domain_in(e, &columns))
+                    .collect(),
             );
             let carried = match query.body.as_ref() {
                 SetExpr::Select(sel) => {

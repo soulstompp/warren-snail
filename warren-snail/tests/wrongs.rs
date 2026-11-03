@@ -374,6 +374,47 @@ mod written {
     use super::*;
 
     #[test]
+    fn a_domain_is_cast_to_and_a_row_of_a_domain_s_column_keeps_its_domain() {
+        let path = tmp("wrongs-domain.snail");
+        let ddl = "CREATE DOMAIN s.posint AS integer CHECK (VALUE > 0);\n\
+                   CREATE DOMAIN s.nn AS integer NOT NULL;\n\
+                   CREATE TYPE s.rp AS (d s.posint);\n\
+                   CREATE TABLE s.dt (id integer PRIMARY KEY, d s.posint, r s.rp);";
+        write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("INSERT INTO s.dt VALUES (1, 1, ROW(1)), (2, 5, ROW(5)), (3, NULL, NULL)")
+            .unwrap();
+        let dissimilar = "cannot compare dissimilar column types s.posint and integer at record column 1";
+        for (sql, pg) in [
+            ("WITH q AS (SELECT id::s.posint AS x FROM s.dt) SELECT * FROM q ORDER BY x", Ok("1,2,3")),
+            ("SELECT '5'::s.posint AS x", Ok("5")),
+            ("WITH q AS (SELECT NULL::s.posint AS x) SELECT * FROM q", Ok("NULL")),
+            (
+                "WITH q AS (SELECT (id - 2)::s.posint AS x FROM s.dt) SELECT * FROM q",
+                Err("value for domain s.posint violates check constraint \"posint_check\""),
+            ),
+            ("WITH q AS (SELECT NULL::s.nn AS x) SELECT * FROM q", Err("domain s.nn does not allow null values")),
+            // A row of a domain's column: its field of the domain, through the steps that pass it on.
+            ("SELECT r *= ROW(d) AS i FROM s.dt WHERE id = 1", Ok("true")),
+            ("SELECT id FROM s.dt WHERE r *= ROW(d) ORDER BY id", Ok("1,2")),
+            ("WITH q AS (SELECT d, r FROM s.dt WHERE id = 1) SELECT r *= ROW(d) AS i FROM q", Ok("true")),
+            ("WITH q AS (SELECT id::s.posint AS e, r FROM s.dt WHERE id = 1) SELECT r *= ROW(e) AS i FROM q", Ok("true")),
+            ("SELECT x *= y AS i FROM (SELECT ROW(d) AS x, ROW(1::s.posint) AS y FROM s.dt WHERE id = 1) q", Ok("true")),
+            ("SELECT x *= y AS i FROM (SELECT ROW(d) AS x, ROW(id) AS y FROM s.dt WHERE id = 1) q", Err(dissimilar)),
+            (
+                "WITH q AS (SELECT d, id FROM s.dt WHERE id = 1) \
+                 SELECT x *= y AS i FROM (SELECT ROW(d) AS x, ROW(id) AS y FROM q) z",
+                Err(dissimilar),
+            ),
+        ] {
+            match pg {
+                Ok(a) => assert_eq!(column(&mut w, sql), a, "{sql}"),
+                Err(e) => assert_eq!(refused(&mut w, sql), e, "{sql}"),
+            }
+        }
+    }
+
+    #[test]
     fn select_into_makes_no_table_and_says_why() {
         let mut w = Snail::open_writing(&made("into")).unwrap();
         for sql in ["SELECT id, g INTO q FROM s.a", "SELECT id INTO UNLOGGED TABLE q FROM s.a"] {

@@ -307,6 +307,43 @@ thread_local! {
     static ROWS: RefCell<Tables> = RefCell::new(Rc::new(Vec::new()));
     /// The release of the snail the round under way reads.
     static RELEASE: std::cell::Cell<u8> = const { std::cell::Cell::new(crate::regs::LATEST) };
+    /// The domains of the snail the round under way reads.
+    static DOMAINS: RefCell<Rc<Vec<crate::catalog::Domain>>> = RefCell::new(Rc::new(Vec::new()));
+    /// The domain each column of each step the round has made is of, by the step's name.
+    static STEPS: RefCell<std::collections::HashMap<String, Vec<Option<String>>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Records the domain each column of a step is of, for the steps that read it.
+pub(crate) fn step_made(name: &str, domains: Vec<Option<String>>) {
+    STEPS.with(|s| s.borrow_mut().insert(name.to_string(), domains));
+}
+
+/// The domain each column of a step the round made is of.
+pub(crate) fn step_domains(name: &str) -> Option<Vec<Option<String>>> {
+    STEPS.with(|s| s.borrow().get(name).cloned())
+}
+
+/// A domain of the snail the pipeline under way reads, by the name a type names, and the domains
+/// beside it.
+pub(crate) fn domain_named(
+    dt: &sqlparser::ast::DataType,
+) -> Option<(crate::catalog::Domain, Rc<Vec<crate::catalog::Domain>>)> {
+    let sqlparser::ast::DataType::Custom(name, args) = dt else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let n = crate::catalog::object_name(name);
+    DOMAINS.with(|d| {
+        let all = d.borrow().clone();
+        let mut found = all
+            .iter()
+            .filter(|x| x.name == n || x.name.rsplit('.').next() == Some(n.as_str()));
+        let one = found.next()?.clone();
+        found.next().is_none().then_some((one, all))
+    })
 }
 
 /// The functions a round is handed, read by all it evaluates while it is held; those before come
@@ -325,8 +362,14 @@ impl Drop for Holding {
     }
 }
 
-/// The row types a pipeline reads its tables' names as, held while it runs.
-pub(crate) struct Rows(Tables, u8);
+/// The row types a pipeline reads its tables' names as, and the domains it casts to, held while it
+/// runs.
+pub(crate) struct Rows(
+    Tables,
+    u8,
+    Rc<Vec<crate::catalog::Domain>>,
+    std::collections::HashMap<String, Vec<Option<String>>>,
+);
 
 /// Holds the row types of a catalog's tables.
 pub(crate) fn rows_of(catalog: &crate::catalog::Catalog) -> Rows {
@@ -349,6 +392,8 @@ pub(crate) fn rows_of(catalog: &crate::catalog::Catalog) -> Rows {
     Rows(
         ROWS.with(|r| r.replace(Rc::new(rows))),
         RELEASE.with(|r| r.replace(catalog.release)),
+        DOMAINS.with(|d| d.replace(Rc::new(catalog.domains.clone()))),
+        STEPS.with(|s| std::mem::take(&mut *s.borrow_mut())),
     )
 }
 
@@ -357,6 +402,10 @@ impl Drop for Rows {
         let before = std::mem::take(&mut self.0);
         ROWS.with(|r| *r.borrow_mut() = before);
         RELEASE.with(|r| r.set(self.1));
+        let domains = std::mem::take(&mut self.2);
+        DOMAINS.with(|d| *d.borrow_mut() = domains);
+        let steps = std::mem::take(&mut self.3);
+        STEPS.with(|s| *s.borrow_mut() = steps);
     }
 }
 
@@ -381,6 +430,18 @@ pub(crate) fn table_row(name: &str) -> Option<ColumnType> {
             name: n.clone(),
             fields: fields.clone(),
         }))
+    })
+}
+
+/// The domain a column of a table of the snail the pipeline under way reads is of, where its DDL
+/// gives it one.
+pub(crate) fn column_domain(table: &str, column: &str) -> Option<String> {
+    ROWS.with(|r| {
+        let r = r.borrow();
+        let (_, fields) = r
+            .iter()
+            .find(|(n, _)| n == table || n.rsplit('.').next() == Some(table))?;
+        fields.iter().find(|f| f.name == column)?.domain.clone()
     })
 }
 
