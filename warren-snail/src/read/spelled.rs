@@ -37,6 +37,646 @@ pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
     Ok(out)
 }
 
+
+/// What marks a function name as a TABLESAMPLE clause's, its method and whether it has a REPEATABLE:
+/// this character, `r` or `n`, this character again, the method as named. A REPEATABLE's seed is the
+/// call's last argument.
+pub(crate) const SAMPLED: char = '\u{2}';
+
+/// The statement as PostgreSQL's scanner and grammar read its words, where sqlparser's tokenizer
+/// reads them otherwise, under `release`: a number in its bases and with its underscores, or refused
+/// as trailing junk, from 16 on; strings a newline apart as one string; `x ISNULL` and `x NOTNULL`;
+/// `interval(p) '…'`'s precision; a TABLESAMPLE clause carried in a call's name (`SAMPLED`); and what
+/// sqlparser takes and PostgreSQL's grammar does not, refused.
+pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
+    let mut out = numbered(sql, release)?;
+    if let Some(next) = worded(&out)? {
+        out = Cow::Owned(next);
+    }
+    Ok(out)
+}
+
+fn ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || c >= 0x80
+}
+
+fn ident_cont(c: u8) -> bool {
+    ident_start(c) || c.is_ascii_digit() || c == b'$'
+}
+
+/// Where a string's whitespace_with_newline ends, where a quote there goes on with the string: past
+/// the closing quote at `at`.
+fn continued(b: &[u8], at: usize) -> Option<usize> {
+    let comment = |mut i: usize| {
+        while i < b.len() && !matches!(b[i], b'\n' | b'\r') {
+            i += 1;
+        }
+        i
+    };
+    let mut i = at;
+    let mut newline = false;
+    while i < b.len() {
+        match b[i] {
+            b'\n' | b'\r' => {
+                newline = true;
+                i += 1;
+            }
+            b' ' | b'\t' | 0x0c | 0x0b => i += 1,
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                i = comment(i);
+                // A comment there is whitespace only before a newline.
+                if i >= b.len() {
+                    return None;
+                }
+            }
+            b'\'' if newline => return Some(i),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The end of `{decdigit}(_?{decdigit})*` from `i`, where one starts there.
+fn decimal_end(b: &[u8], i: usize) -> Option<usize> {
+    if !b.get(i)?.is_ascii_digit() {
+        return None;
+    }
+    let mut j = i + 1;
+    loop {
+        match b.get(j) {
+            Some(c) if c.is_ascii_digit() => j += 1,
+            Some(b'_') if b.get(j + 1).is_some_and(u8::is_ascii_digit) => j += 2,
+            _ => return Some(j),
+        }
+    }
+}
+
+/// The end of `{numeric}` from `i`, where one starts there.
+fn numeric_end(b: &[u8], i: usize) -> Option<usize> {
+    match decimal_end(b, i) {
+        Some(d) if b.get(d) == Some(&b'.') => Some(decimal_end(b, d + 1).unwrap_or(d + 1)),
+        Some(_) => None,
+        None if b.get(i) == Some(&b'.') => decimal_end(b, i + 1),
+        None => None,
+    }
+}
+
+/// The end of the digits of a base's integer after its `0x`, `0o` or `0b`, each maybe after one
+/// underscore; and the end of its prefix and that underscore, what a prefix alone reads as.
+fn radix_ends(b: &[u8], i: usize, letter: u8, digit: fn(u8) -> bool) -> Option<(Option<usize>, usize)> {
+    if b.get(i) != Some(&b'0') || !b.get(i + 1)?.eq_ignore_ascii_case(&letter) {
+        return None;
+    }
+    let mut j = i + 2;
+    let mut end = None;
+    loop {
+        match b.get(j) {
+            Some(&c) if digit(c) => {
+                j += 1;
+                end = Some(j);
+            }
+            Some(b'_') if b.get(j + 1).is_some_and(|&c| digit(c)) => j += 1,
+            _ => break,
+        }
+    }
+    let fail = i + 2 + usize::from(b.get(i + 2) == Some(&b'_'));
+    Some((end, fail))
+}
+
+/// The digits of an integer in a base, as a decimal.
+fn in_decimal(digits: &[u8], base: u32) -> String {
+    const LIMB: u64 = 1_000_000_000;
+    let mut limbs: Vec<u64> = vec![0];
+    for &c in digits.iter().filter(|c| **c != b'_') {
+        let mut carry = u64::from((c as char).to_digit(base).unwrap_or(0));
+        for l in &mut limbs {
+            let v = *l * u64::from(base) + carry;
+            *l = v % LIMB;
+            carry = v / LIMB;
+        }
+        if carry > 0 {
+            limbs.push(carry);
+        }
+    }
+    let mut out = limbs.last().unwrap().to_string();
+    for l in limbs.iter().rev().skip(1) {
+        out.push_str(&format!("{l:09}"));
+    }
+    out
+}
+
+/// The number at `i`: where it ends, and what stands for it in the text.
+fn number_at(b: &[u8], i: usize, text: &str) -> Result<(usize, Cow<'static, str>)> {
+    let junk = |end: usize| {
+        let mut j = end;
+        if !b.get(j).copied().is_some_and(ident_start) {
+            return None;
+        }
+        while b.get(j).copied().is_some_and(ident_cont) {
+            j += 1;
+        }
+        Some(j)
+    };
+    let real = |from: Option<usize>| -> (Option<usize>, Option<usize>) {
+        let Some(m) = from.filter(|&m| matches!(b.get(m), Some(b'e' | b'E'))) else {
+            return (None, None);
+        };
+        let sign = usize::from(matches!(b.get(m + 1), Some(b'-' | b'+')));
+        match decimal_end(b, m + 1 + sign) {
+            Some(e) => (Some(e), None),
+            None if sign == 1 => (None, Some(m + 2)),
+            None => (None, None),
+        }
+    };
+    let integer = decimal_end(b, i);
+    let numeric = numeric_end(b, i);
+    let (real_i, fail_i) = real(integer);
+    let (real_n, fail_n) = real(numeric);
+    let real_end = real_i.or(real_n);
+    let hex = radix_ends(b, i, b'x', |c| c.is_ascii_hexdigit());
+    let oct = radix_ends(b, i, b'o', |c| matches!(c, b'0'..=b'7'));
+    let bin = radix_ends(b, i, b'b', |c| matches!(c, b'0' | b'1'));
+    let numeric_fail = integer.filter(|&d| b.get(d) == Some(&b'.') && b.get(d + 1) == Some(&b'.'));
+    // The rules of scan.l in their order: the longest match, the first of those.
+    #[derive(Clone, Copy)]
+    enum Rule {
+        Plain,
+        Radix(usize, u32),
+        Failed(&'static str),
+        Integer,
+        Junk,
+    }
+    let mut rules: Vec<(Option<usize>, Rule)> = vec![
+        (integer, Rule::Plain),
+        (hex.and_then(|h| h.0), Rule::Radix(2, 16)),
+        (oct.and_then(|h| h.0), Rule::Radix(2, 8)),
+        (bin.and_then(|h| h.0), Rule::Radix(2, 2)),
+        (hex.map(|h| h.1), Rule::Failed("hexadecimal")),
+        (oct.map(|h| h.1), Rule::Failed("octal")),
+        (bin.map(|h| h.1), Rule::Failed("binary")),
+        (numeric, Rule::Plain),
+        (numeric_fail.map(|d| d + 2), Rule::Integer),
+        (real_end, Rule::Plain),
+        (fail_i.or(fail_n), Rule::Junk),
+    ];
+    rules.push((integer.and_then(junk), Rule::Junk));
+    rules.push((numeric.and_then(junk), Rule::Junk));
+    rules.push((real_end.and_then(junk), Rule::Junk));
+    let (mut end, mut rule) = (i, Rule::Plain);
+    for (e, r) in rules {
+        if let Some(e) = e.filter(|&e| e > end) {
+            (end, rule) = (e, r);
+        }
+    }
+    let spelled = &text[i..end];
+    match rule {
+        Rule::Plain if spelled.contains('_') => Ok((end, spelled.replace('_', "").into())),
+        Rule::Plain => Ok((end, spelled.to_string().into())),
+        Rule::Radix(skip, base) => Ok((end, in_decimal(&b[i + skip..end], base).into())),
+        Rule::Failed(kind) => Err(Error::new(format!(
+            "invalid {kind} integer at or near \"{spelled}\""
+        ))),
+        Rule::Integer => {
+            let d = integer.unwrap_or(i);
+            Ok((d, text[i..d].replace('_', "").into()))
+        }
+        Rule::Junk => Err(Error::new(format!(
+            "trailing junk after numeric literal at or near \"{spelled}\""
+        ))),
+    }
+}
+
+/// The number at `i` as PostgreSQL before 16 reads it: its digits alone, a name after it its own.
+fn number_before_16(b: &[u8], i: usize) -> usize {
+    let digits = |mut j: usize| {
+        while b.get(j).is_some_and(u8::is_ascii_digit) {
+            j += 1;
+        }
+        j
+    };
+    let mut end = digits(i);
+    if b.get(end) == Some(&b'.') && !(b.get(end + 1) == Some(&b'.')) {
+        end = digits(end + 1);
+    }
+    if matches!(b.get(end), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(b.get(end + 1), Some(b'-' | b'+')));
+        if b.get(end + 1 + sign).is_some_and(u8::is_ascii_digit) {
+            end = digits(end + 1 + sign);
+        }
+    }
+    end
+}
+
+/// The statement with its numbers and its strings as PostgreSQL's scanner reads them.
+fn numbered(sql: &str, release: u8) -> Result<Cow<'_, str>> {
+    let b = sql.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    let swap = |out: &mut String, from: usize, to: usize, with: &str, copied: &mut usize| {
+        out.push_str(&sql[*copied..from]);
+        out.push_str(with);
+        *copied = to;
+    };
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'\'' => {
+                // A string's prefix `E` makes a backslash escape what follows it.
+                let escapes = i > 0
+                    && matches!(b[i - 1], b'e' | b'E')
+                    && !(i > 1 && ident_cont(b[i - 2]));
+                let mut j = i + 1;
+                loop {
+                    match b.get(j) {
+                        None => return Ok(finish(sql, out, copied)),
+                        Some(b'\\') if escapes => j += 2,
+                        Some(b'\'') if b.get(j + 1) == Some(&b'\'') => j += 2,
+                        Some(b'\'') => match continued(b, j + 1) {
+                            Some(next) => {
+                                swap(&mut out, j, next + 1, "", &mut copied);
+                                j = next + 1;
+                            }
+                            None => break,
+                        },
+                        Some(_) => j += 1,
+                    }
+                }
+                i = j + 1;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                loop {
+                    match b.get(j) {
+                        None => return Ok(finish(sql, out, copied)),
+                        Some(b'"') if b.get(j + 1) == Some(&b'"') => j += 2,
+                        Some(b'"') => break,
+                        Some(_) => j += 1,
+                    }
+                }
+                i = j + 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && !matches!(b[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => {
+                let mut j = i + 1;
+                if b.get(j).is_some_and(u8::is_ascii_digit) {
+                    while b.get(j).is_some_and(u8::is_ascii_digit) {
+                        j += 1;
+                    }
+                    if b.get(j).copied().is_some_and(ident_start) {
+                        let digits = j;
+                        while b.get(j).copied().is_some_and(ident_cont) {
+                            j += 1;
+                        }
+                        if release >= 16 {
+                            return Err(Error::new(format!(
+                                "trailing junk after parameter at or near \"{}\"",
+                                &sql[i..j]
+                            )));
+                        }
+                        swap(&mut out, digits, digits, " ", &mut copied);
+                    }
+                    i = j;
+                } else {
+                    while b.get(j).copied().is_some_and(|c| ident_cont(c) && c != b'$') {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'$') {
+                        let tag = &sql[i..=j];
+                        match sql[j + 1..].find(tag) {
+                            Some(at) => i = j + 1 + at + tag.len(),
+                            None => return Ok(finish(sql, out, copied)),
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            c if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) => {
+                if release >= 16 {
+                    let (end, with) = number_at(b, i, sql)?;
+                    if with != sql[i..end] {
+                        swap(&mut out, i, end, &with, &mut copied);
+                    }
+                    i = end;
+                } else {
+                    let end = number_before_16(b, i);
+                    if b.get(end).copied().is_some_and(ident_start) {
+                        swap(&mut out, end, end, " ", &mut copied);
+                    }
+                    i = end;
+                }
+            }
+            c if ident_start(c) => {
+                while b.get(i).copied().is_some_and(ident_cont) {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(finish(sql, out, copied))
+}
+
+/// A statement's text with what was swapped in it, and the rest after.
+fn finish(sql: &str, mut out: String, copied: usize) -> Cow<'_, str> {
+    if copied == 0 && out.is_empty() {
+        return Cow::Borrowed(sql);
+    }
+    out.push_str(&sql[copied..]);
+    Cow::Owned(out)
+}
+
+/// The statement with its words as PostgreSQL's grammar reads them; none where it needs none, or
+/// where sqlparser's tokenizer refuses it, which its parser says.
+fn worded(sql: &str) -> Result<Option<String>> {
+    let lower = sql.to_ascii_lowercase();
+    if !["isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>"]
+        .iter()
+        .any(|w| lower.contains(w))
+    {
+        return Ok(None);
+    }
+    let Ok(tokens) = super::statement::spans(sql) else {
+        return Ok(None);
+    };
+    let solid: Vec<&(Token, usize, usize)> = tokens
+        .iter()
+        .filter(|t| !matches!(t.0, Token::Whitespace(_)))
+        .collect();
+    let word = |i: usize| match solid.get(i).map(|t| &t.0) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+        _ => None,
+    };
+    let near = |i: usize| match solid.get(i).filter(|t| !matches!(t.0, Token::EOF)) {
+        Some(t) => Error::new(format!("syntax error at or near \"{}\"", &sql[t.1..t.2])),
+        None => Error::new("syntax error at end of input"),
+    };
+    let string = |i: usize| {
+        matches!(
+            solid.get(i).map(|t| &t.0),
+            Some(
+                Token::SingleQuotedString(_)
+                    | Token::EscapedStringLiteral(_)
+                    | Token::NationalStringLiteral(_)
+                    | Token::UnicodeStringLiteral(_)
+                    | Token::HexStringLiteral(_)
+            )
+        )
+    };
+    // Past a parenthesis or bracket opened at `i`, the place after the one that closes it.
+    let closed = |i: usize, open: Token, close: Token| -> Option<usize> {
+        let mut depth = 0i32;
+        for (j, t) in solid.iter().enumerate().skip(i) {
+            if t.0 == open {
+                depth += 1;
+            } else if t.0 == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+        }
+        None
+    };
+    let mut swaps: Vec<(usize, usize, String)> = Vec::new();
+    let mut brackets = 0i32;
+    let mut array_closes: Vec<i32> = Vec::new();
+    for i in 0..solid.len() {
+        let prev_as = i > 0 && (word(i - 1).as_deref() == Some("AS") || solid[i - 1].0 == Token::Period);
+        match &solid[i].0 {
+            // Touching an operator's characters before it, it ends a longer operator, the parser's.
+            Token::DoubleEq
+                if !(i > 0
+                    && solid[i - 1].2 == solid[i].1
+                    && !matches!(
+                        solid[i - 1].0,
+                        Token::Word(_)
+                            | Token::Number(..)
+                            | Token::RParen
+                            | Token::RBracket
+                            | Token::SingleQuotedString(_)
+                            | Token::Placeholder(_)
+                    )) =>
+            {
+                return Err(Error::new("operator does not exist: =="));
+            }
+            Token::LBracket => {
+                if brackets == 0 && i > 0 && !ends_a_value(&solid[i - 1].0) {
+                    return Err(near(i));
+                }
+                brackets += 1;
+                if word(i.wrapping_sub(1)).as_deref() == Some("ARRAY") {
+                    array_closes.push(brackets);
+                }
+            }
+            Token::RBracket => {
+                if array_closes.last() == Some(&brackets) {
+                    array_closes.pop();
+                    // An array's constructor takes a subscript only in parentheses.
+                    if matches!(solid.get(i + 1).map(|t| &t.0), Some(Token::LBracket)) {
+                        return Err(near(i + 1));
+                    }
+                }
+                brackets -= 1;
+            }
+            Token::Mul
+                if i > 0
+                    && word(i - 1).as_deref() == Some("USING")
+                    && matches!(solid.get(i + 1).map(|t| &t.0), Some(Token::Lt | Token::Gt))
+                    && solid[i + 1].1 == solid[i].2 =>
+            {
+                return Err(Error::new(format!(
+                    "ORDER BY … USING *{} is not read: it orders a row by the bytes PostgreSQL's \
+                     heap holds it in",
+                    solid[i + 1].0
+                )));
+            }
+            _ => {}
+        }
+        match word(i).as_deref() {
+            Some(w @ ("ISNULL" | "NOTNULL"))
+                if !prev_as && !matches!(solid.get(i + 1).map(|t| &t.0), Some(Token::LParen)) =>
+            {
+                let with = if w == "ISNULL" { "IS NULL" } else { "IS NOT NULL" };
+                swaps.push((solid[i].1, solid[i].2, with.to_string()));
+            }
+            Some("INTERVAL")
+                if matches!(solid.get(i + 1).map(|t| &t.0), Some(Token::LParen))
+                    && matches!(solid.get(i + 2).map(|t| &t.0), Some(Token::Number(..)))
+                    && matches!(solid.get(i + 3).map(|t| &t.0), Some(Token::RParen))
+                    && string(i + 4) =>
+            {
+                if matches!(
+                    word(i + 5).as_deref(),
+                    Some("YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND")
+                ) {
+                    return Err(near(i + 5));
+                }
+                let (at, end) = (solid[i].1, solid[i + 4].2);
+                let literal = &sql[solid[i + 4].1..end];
+                let p = &sql[solid[i + 2].1..solid[i + 2].2];
+                swaps.push((at, end, format!("{literal}::interval({p})")));
+            }
+            Some("FORMAT")
+                if string(i + 1)
+                    && i > 0
+                    && !matches!(solid[i - 1].0, Token::Comma | Token::LParen) =>
+            {
+                return Err(near(i));
+            }
+            Some("TABLESAMPLE") if !prev_as => {
+                swaps.push(sampled_clause(sql, &solid, i, &near, &closed)?);
+            }
+            _ => {}
+        }
+    }
+    if swaps.is_empty() {
+        return Ok(None);
+    }
+    swaps.sort_by_key(|s| s.0);
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for (from, to, with) in swaps {
+        out.push_str(&sql[copied..from]);
+        out.push_str(&with);
+        copied = to;
+    }
+    out.push_str(&sql[copied..]);
+    Ok(Some(out))
+}
+
+/// A word of PostgreSQL's grammar: its category, and whether it may stand as a label without AS.
+pub(super) fn keyword(word: &str) -> Option<(char, bool)> {
+    static WORDS: std::sync::OnceLock<std::collections::HashMap<&'static str, (char, bool)>> =
+        std::sync::OnceLock::new();
+    WORDS
+        .get_or_init(|| {
+            include_str!("../kwlist.txt")
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.split('\t');
+                    let (w, c, b) = (f.next()?, f.next()?, f.next()?);
+                    Some((w, (c.chars().next()?, b == "t")))
+                })
+                .collect()
+        })
+        .get(word.to_ascii_lowercase().as_str())
+        .copied()
+}
+
+/// Whether a value can end at a token, so that a bracket after it is a subscript or a type's.
+fn ends_a_value(t: &Token) -> bool {
+    match t {
+        Token::RParen
+        | Token::RBracket
+        | Token::SingleQuotedString(_)
+        | Token::Number(..)
+        | Token::Placeholder(_) => true,
+        Token::Word(w) => {
+            w.quote_style.is_some()
+                || w.value.eq_ignore_ascii_case("array")
+                || !matches!(keyword(&w.value), Some(('R', _)))
+        }
+        _ => false,
+    }
+}
+
+/// A TABLESAMPLE clause as PostgreSQL's grammar has it, written as a call of a name that carries its
+/// method: `TABLESAMPLE m (a, b) REPEATABLE (s)` as `TABLESAMPLE "\u{2}r\u{2}m"(a, b, (s))`.
+fn sampled_clause(
+    sql: &str,
+    solid: &[&(Token, usize, usize)],
+    i: usize,
+    near: &dyn Fn(usize) -> Error,
+    closed: &dyn Fn(usize, Token, Token) -> Option<usize>,
+) -> Result<(usize, usize, String)> {
+    let part = |j: usize| match solid.get(j).map(|t| &t.0) {
+        Some(Token::Word(w)) => Some(match w.quote_style {
+            Some(_) => w.value.clone(),
+            None => w.value.to_lowercase(),
+        }),
+        _ => None,
+    };
+    // Written so already.
+    if part(i + 1).is_some_and(|p| p.starts_with(SAMPLED)) {
+        return Ok((solid[i].1, solid[i].2, sql[solid[i].1..solid[i].2].to_string()));
+    }
+    let Some(mut method) = part(i + 1) else {
+        return Err(near(i + 1));
+    };
+    let mut j = i + 2;
+    while matches!(solid.get(j).map(|t| &t.0), Some(Token::Period)) {
+        let Some(p) = part(j + 1) else {
+            return Err(near(j + 1));
+        };
+        method.push('.');
+        method.push_str(&p);
+        j += 2;
+    }
+    if !matches!(solid.get(j).map(|t| &t.0), Some(Token::LParen)) {
+        return Err(near(j));
+    }
+    // `ROW` opens a row, and takes no parenthesis as a function's name.
+    if method == "row" && j == i + 2 {
+        return Err(near(j));
+    }
+    if matches!(solid.get(j + 1).map(|t| &t.0), Some(Token::RParen)) {
+        return Err(near(j + 1));
+    }
+    let Some(after) = closed(j, Token::LParen, Token::RParen) else {
+        return Err(near(solid.len()));
+    };
+    let args = sql[solid[j + 1].1..solid[after - 2].2].to_string();
+    let repeatable = matches!(
+        solid.get(after).map(|t| &t.0),
+        Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("repeatable")
+    );
+    let (kind, seed, end) = if repeatable {
+        if !matches!(solid.get(after + 1).map(|t| &t.0), Some(Token::LParen)) {
+            return Err(near(after + 1));
+        }
+        let Some(last) = closed(after + 1, Token::LParen, Token::RParen) else {
+            return Err(near(solid.len()));
+        };
+        if last == after + 3 {
+            return Err(near(after + 2));
+        }
+        (
+            'r',
+            format!(", ({})", &sql[solid[after + 2].1..solid[last - 2].2]),
+            solid[last - 1].2,
+        )
+    } else {
+        ('n', String::new(), solid[after - 1].2)
+    };
+    let name = format!("{SAMPLED}{kind}{SAMPLED}{method}").replace('"', "\"\"");
+    Ok((
+        solid[i].1,
+        end,
+        format!("TABLESAMPLE \"{name}\"({args}{seed})"),
+    ))
+}
+
 /// What stands on the right of `@@@`, which sqlparser reads as `@@` and a prefix `@`.
 pub(super) fn right_of_three_ats(right: &Expr) -> Option<&Expr> {
     match right {

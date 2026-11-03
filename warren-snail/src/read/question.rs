@@ -1371,6 +1371,7 @@ pub(crate) fn unlocked_words(sql: &str) -> Result<()> {
 }
 
 pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
+    let sql = &*super::spelled::scanned(sql, catalog.release)?;
     unlocked_words(sql)?;
     let bound = crate::grammar::bound(sql);
     let statements = super::image::parse_sql(bound.as_deref().unwrap_or(sql))?;

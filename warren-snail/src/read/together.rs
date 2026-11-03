@@ -294,6 +294,7 @@ impl Drop for InRoom<'_> {
 /// should its groups pass the room; what it does not read so, and what stops, a pipeline over the
 /// snails' relations reads.
 fn answer_lying(snails: &[&Snail], sql: &str, lying: &mut Lying) -> Result<Round> {
+    let sql = &*spelled::scanned(sql, snails[0].catalog.release)?;
     question::unlocked_words(sql)?;
     relations::unread_clauses(sql)?;
     let sql = &*spelled::spelled(sql)?;

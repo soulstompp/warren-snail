@@ -109,6 +109,7 @@ impl relations::Reads for Snail {
     }
 }
 pub use question::{instant, truth};
+pub(crate) use spelled::scanned;
 pub(crate) use typed::element_of as element_type;
 
 use crate::catalog::{Catalog, Table};
@@ -1493,6 +1494,7 @@ impl Snail {
         order: Option<&str>,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
+        let sql = &*spelled::scanned(sql, self.catalog.release)?;
         question::unlocked_words(sql)?;
         relations::unread_clauses(sql)?;
         let sql = &*spelled::spelled(sql)?;

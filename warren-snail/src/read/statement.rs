@@ -1049,6 +1049,7 @@ pub fn split(text: &str) -> Result<Vec<String>> {
 }
 
 pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
+    let sql = &*super::spelled::scanned(sql, catalog.release)?;
     // A declaration goes to the catalog as written, where the snail reads what sqlparser does not.
     if let Some(kind) = crate::ddl::declares(sql) {
         let ddl = sql.trim().trim_end_matches(';').trim_end().to_string();

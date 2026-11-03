@@ -684,6 +684,7 @@ impl Snails {
     /// A question on one snail's tables is read as that snail reads it; one on several snails'
     /// tables is read as a join, each table from its own snail.
     pub fn ask_with(&mut self, sql: &str, params: &[String]) -> Result<(RecordBatch, Round)> {
+        let sql = &*super::spelled::scanned(sql, self.snails[0].catalog.release)?;
         question::unlocked_words(sql)?;
         super::relations::unread_clauses(sql)?;
         if self.writing {
