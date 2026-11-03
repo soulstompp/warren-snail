@@ -1225,6 +1225,7 @@ impl Snails {
                     &catalog,
                     begun,
                     d,
+                    None,
                     &mut |q| self.ask(q).map(|(b, _)| b),
                 );
                 self.session.cursors = cursors;

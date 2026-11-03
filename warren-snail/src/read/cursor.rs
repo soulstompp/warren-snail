@@ -21,6 +21,9 @@ pub(super) struct Cursor {
     /// key there, by the table's key columns.
     answer: RecordBatch,
     keys: Option<(usize, Vec<usize>, RecordBatch)>,
+    /// Where its question is read a block at a time: a snail holding the generation the declaration
+    /// read, the round under way on it, and its question; none once every block has come.
+    lazy: Option<Box<(Snail, super::Scan, String)>>,
     /// Where it stands: 0 before the first row, the rows' count and one after the last.
     at: usize,
 }
@@ -242,6 +245,66 @@ impl Cursor {
         self.answer.num_rows()
     }
 
+    /// The rows a direction needs read before it is taken: those up to a place, or every one.
+    fn needs(&self, d: &Direction) -> Option<usize> {
+        match d {
+            Direction::Next | Direction::First => Some(self.at + 1),
+            Direction::Prior | Direction::Backward(_) => Some(self.at),
+            Direction::Absolute(k) if *k >= 0 => Some(*k as usize),
+            Direction::Relative(k) if *k >= 0 => Some(self.at + *k as usize),
+            Direction::Relative(_) => Some(self.at),
+            Direction::Forward(Some(k)) if *k >= 0 => Some(self.at + *k as usize),
+            Direction::Forward(Some(_)) => Some(self.at),
+            _ => None,
+        }
+    }
+
+    /// Its round read on, a block at a time, until it holds `rows` rows or every block has come.
+    fn read_up_to(&mut self, rows: Option<usize>) -> Result<u64> {
+        let mut pages = 0;
+        while self.lazy.is_some() && rows.is_none_or(|n| self.rows() < n) {
+            let (snail, scan, question) = &mut **self.lazy.as_mut().unwrap();
+            let before = snail.pages_read();
+            let block = snail.next_block(scan);
+            pages += snail.pages_read() - before;
+            match block? {
+                Some(b) if b.num_rows() > 0 => {
+                    let (answer, keys) = match &self.keys {
+                        Some((_, key, _)) => {
+                            let width = b.num_columns() - key.len();
+                            (
+                                b.project(&(0..width).collect::<Vec<_>>())?,
+                                Some(b.project(&(width..b.num_columns()).collect::<Vec<_>>())?),
+                            )
+                        }
+                        None => (b, None),
+                    };
+                    self.answer = match self.answer.num_columns() {
+                        0 => answer,
+                        _ => arrow::compute::concat_batches(&self.answer.schema(), [&self.answer, &answer])?,
+                    };
+                    if let (Some((_, _, held)), Some(k)) = (self.keys.as_mut(), keys) {
+                        *held = match held.num_columns() {
+                            0 => k,
+                            _ => arrow::compute::concat_batches(&held.schema(), [&*held, &k])?,
+                        };
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    // An answer of no rows takes its columns from the question read whole.
+                    if self.answer.num_columns() == 0 {
+                        let b = snail.ask(question, None)?.0;
+                        let width = b.num_columns() - self.keys.as_ref().map_or(0, |k| k.1.len());
+                        self.answer = b.project(&(0..width).collect::<Vec<_>>())?;
+                    }
+                    self.lazy = None;
+                }
+            }
+        }
+        Ok(pages)
+    }
+
     /// The rows a FETCH takes, as their places in the answer in the order it returns them, and the
     /// cursor moved where it then stands.
     fn take(&mut self, d: &Direction) -> Result<Vec<usize>> {
@@ -334,6 +397,7 @@ impl Cursor {
         catalog: &crate::catalog::Catalog,
         begun: bool,
         d: Declaration,
+        lazy: Option<&std::path::Path>,
         ask: &mut dyn FnMut(&str) -> Result<RecordBatch>,
     ) -> Result<()> {
         if !begun && !d.hold {
@@ -366,6 +430,37 @@ impl Cursor {
         }
         // A cursor on one table keeps each row's key there, for WHERE CURRENT OF.
         let keyed = cursor_keys(catalog, &d.question);
+        // Where the round can stop early, a block of the table at a time along its order, the
+        // cursor reads only the blocks FETCH needs, on a snail of its own holding the generation
+        // the declaration read.
+        let asked = keyed.as_ref().map_or(d.question.clone(), |k| k.2.clone());
+        let read_lazily = lazy
+            .filter(|_| !locking)
+            .map(|path| -> Result<Option<(Snail, super::Scan)>> {
+                let snail = Snail::open(path)?;
+                Ok(match snail.scan(&asked, None) {
+                    Ok(scan) if !scan.whole => Some((snail, scan)),
+                    _ => None,
+                })
+            })
+            .transpose()?
+            .flatten();
+        if let Some((snail, scan)) = read_lazily {
+            let empty = RecordBatch::new_empty(std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+            *count += 1;
+            list.push(Cursor {
+                id: *count,
+                name: d.name,
+                hold: d.hold,
+                fresh: begun,
+                no_scroll: d.scroll == Some(false),
+                answer: empty.clone(),
+                keys: keyed.map(|(t, k, _)| (t, k, empty)),
+                lazy: Some(Box::new((snail, scan, asked))),
+                at: 0,
+            });
+            return Ok(());
+        }
         let (answer, keys) = match keyed {
             Some((table, key, asked)) => {
                 let batch = ask(&asked)?;
@@ -385,6 +480,7 @@ impl Cursor {
             no_scroll: d.scroll == Some(false),
             answer,
             keys,
+            lazy: None,
             at: 0,
         });
         Ok(())
@@ -454,6 +550,8 @@ impl Cursor {
             .iter_mut()
             .find(|c| c.name == name)
             .ok_or_else(|| Error::new(format!("cursor \"{name}\" does not exist")))?;
+        let need = c.needs(d);
+        let read = c.read_up_to(need)?;
         let rows = c.take(d)?;
         let n = rows.len() as u64;
         let answer = match fetch {
@@ -477,6 +575,7 @@ impl Cursor {
         };
         Ok(super::Done {
             statement: if fetch { "FETCH" } else { "MOVE" },
+            pages_read: read,
             rows: n,
             answer,
             ..Default::default()
@@ -589,7 +688,14 @@ impl Snail {
         let mut cursors = std::mem::take(&mut self.session.cursors);
         let mut count = self.session.cursor_count;
         let catalog = self.catalog.clone();
-        let declared = declare(&mut cursors, &mut count, &catalog, begun, d, &mut |q| {
+        // A transaction that staged nothing reads as the file stands: its cursor may read lazily.
+        // At REPEATABLE READ and SERIALIZABLE it reads as the transaction's snapshot does, whole.
+        let lazy = (self.rebased.is_empty()
+            && self.declared.is_none()
+            && !self.held
+            && !self.levels.repeatable(begun))
+            .then(|| self.reader.path().to_path_buf());
+        let declared = declare(&mut cursors, &mut count, &catalog, begun, d, lazy.as_deref(), &mut |q| {
             self.ask(q, None).map(|(b, _)| b)
         });
         self.session.cursors = cursors;

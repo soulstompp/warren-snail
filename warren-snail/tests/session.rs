@@ -478,7 +478,7 @@ fn copy_writes_rows_out_and_reads_them_back_in_text_and_csv() {
     for (st, rows, said) in [
         ("COPY s.t FROM STDIN", "6\tx\n", "missing data for column \"b\""),
         ("COPY s.t (k) FROM STDIN", "6\tx\n", "extra data after last expected column (line 1)"),
-        ("COPY s.t TO STDOUT (FORMAT binary)", "", "COPY … BINARY is refused"),
+        ("COPY s.t TO STDOUT (FORMAT binary, HEADER)", "", "cannot specify HEADER in BINARY mode"),
         ("COPY s.t TO STDOUT (QUOTE '\"')", "", "COPY QUOTE requires CSV mode"),
     ] {
         let e = w.execute_copy(st, rows.as_bytes()).unwrap_err().to_string();
@@ -624,4 +624,46 @@ fn copy_writes_and_reads_the_binary_format_as_postgresql_does() {
         .unwrap_err()
         .to_string()
         .contains("COPY file signature not recognized"));
+}
+
+#[test]
+fn a_cursor_the_round_can_stop_early_on_reads_only_the_blocks_its_fetches_take() {
+    let s = sample(20_000);
+    let path = snail("session-cursor-lazy", &s);
+    let q = "SELECT r.reading_id, r.feed FROM weather.readings r";
+    let (whole, round) = fresh(&path).ask(q, None).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("BEGIN").unwrap();
+    w.execute(&format!("DECLARE c CURSOR FOR {q}")).unwrap();
+    // A reading deleted after the declaration is still the cursor's.
+    let first = cell(whole.column(0).as_ref(), 0).unwrap();
+    Snail::open_writing(&path)
+        .unwrap()
+        .execute(&format!("DELETE FROM weather.readings WHERE reading_id = {first}"))
+        .unwrap();
+    let one = w.execute("FETCH 1 FROM c").unwrap();
+    assert!(one.pages_read > 0, "{one:?}");
+    assert!(
+        one.pages_read < round.column_pages_read,
+        "one row read {} pages where the whole read {}",
+        one.pages_read,
+        round.column_pages_read
+    );
+    let rest = w.execute("FETCH ALL FROM c").unwrap();
+    assert_eq!(rest.rows, whole.num_rows() as u64 - 1);
+    let mut got = column0(&one);
+    got.extend(column0(&rest));
+    let want: Vec<Option<String>> = (0..whole.num_rows()).map(|r| cell(whole.column(0).as_ref(), r)).collect();
+    assert_eq!(got, want);
+    let back = w.execute("FETCH BACKWARD 2 FROM c").unwrap();
+    assert_eq!(back.pages_read, 0);
+    w.execute("COMMIT").unwrap();
+    // In a transaction that wrote, the cursor reads its rows, whole.
+    w.execute("BEGIN").unwrap();
+    w.execute("INSERT INTO weather.stations (network_id, station_no, name) VALUES (9700, 1, 'Tavira')")
+        .unwrap();
+    w.execute("DECLARE d CURSOR FOR SELECT s.name FROM weather.stations s WHERE s.network_id = 9700")
+        .unwrap();
+    assert_eq!(column0(&w.execute("FETCH d").unwrap()), [Some("Tavira".to_string())]);
+    w.execute("ROLLBACK").unwrap();
 }
