@@ -5,6 +5,7 @@
 
 use crate::{Error, Result};
 use sqlparser::ast::{
+    ArrayElemTypeDef, DataType,
     Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, GroupByExpr,
     Ident, JoinConstraint, JoinOperator, LimitClause, NamedWindowExpr, ObjectName, OrderBy,
     OrderByExpr, OrderByKind, Query, Select, SelectFlavor, SelectItem, SetExpr, Statement,
@@ -613,9 +614,15 @@ impl Walk<'_> {
                 self.expr(expr)?;
                 self.expr(pattern)
             }
+            Expr::Cast {
+                expr, data_type, ..
+            } => {
+                typmod(data_type)?;
+                self.expr(expr)
+            }
+            Expr::TypedString(t) => typmod(&t.data_type),
             Expr::UnaryOp { expr, .. }
             | Expr::Nested(expr)
-            | Expr::Cast { expr, .. }
             | Expr::Collate { expr, .. }
             | Expr::IsNull(expr)
             | Expr::IsNotNull(expr)
@@ -712,6 +719,52 @@ impl Walk<'_> {
                 .try_for_each(|x| self.expr(x)),
             _ => Ok(()),
         }
+    }
+}
+
+/// A type a cast or a literal names, its modifier refused as PostgreSQL's grammar and its type's
+/// modifier input refuse it: after a keyword that takes none, on a type that takes none, or out of
+/// its bounds.
+fn typmod(dt: &DataType) -> Result<()> {
+    let not_allowed = |n: &str| Error::new(format!("type modifier is not allowed for type \"{n}\""));
+    match dt {
+        DataType::Int(Some(_))
+        | DataType::Integer(Some(_))
+        | DataType::SmallInt(Some(_))
+        | DataType::BigInt(Some(_)) => Err(near("(")),
+        DataType::Int2(Some(_)) => Err(not_allowed("int2")),
+        DataType::Int4(Some(_)) => Err(not_allowed("int4")),
+        DataType::Int8(Some(_)) => Err(not_allowed("int8")),
+        DataType::Array(ArrayElemTypeDef::SquareBracket(inner, _) | ArrayElemTypeDef::AngleBracket(inner)) => {
+            typmod(inner)
+        }
+        DataType::Custom(name, args) if !args.is_empty() => {
+            let n = crate::catalog::object_name(name).to_lowercase();
+            let n = n.strip_prefix("pg_catalog.").unwrap_or(&n);
+            let takes = [
+                "numeric", "varchar", "bpchar", "bit", "varbit", "time", "timetz", "timestamp",
+                "timestamptz", "interval",
+            ];
+            // The name with no modifier, as sqlparser reads a type of that name.
+            let bare = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+                .try_with_sql(n)
+                .and_then(|mut p| p.parse_data_type())
+                .unwrap_or_else(|_| DataType::Custom(name.clone(), Vec::new()));
+            match crate::catalog::held_type(&bare) {
+                Ok(_) if !takes.contains(&n) => Err(not_allowed(n)),
+                _ => Ok(()),
+            }
+        }
+        _ => match crate::catalog::held_type(dt) {
+            Err(e)
+                if ["length for type", "NUMERIC precision", "NUMERIC scale", "precision for type"]
+                    .iter()
+                    .any(|w| e.to_string().starts_with(w)) =>
+            {
+                Err(e)
+            }
+            _ => Ok(()),
+        },
     }
 }
 

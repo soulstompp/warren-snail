@@ -244,6 +244,30 @@ fn words_are_read_as_postgresql_s_scanner_reads_them() {
 }
 
 #[test]
+fn a_type_s_modifier_is_taken_or_refused_as_postgresql_takes_it() {
+    let mut s = Snail::open(&made("typmod")).unwrap();
+    for (sql, pg) in [
+        ("WITH q AS (SELECT numeric(5,2) '1.234' AS x, varchar(2) 'abc' AS y) SELECT x::text AS x, y FROM q", "1.23|ab"),
+        ("WITH q AS (SELECT time(1) '10:00:00.26' AS x) SELECT x::text AS x FROM q", "10:00:00.3"),
+    ] {
+        assert_eq!(column(&mut s, sql), pg, "{sql}");
+    }
+    for (sql, pg) in [
+        ("SELECT int4(3) '1'", "type modifier is not allowed for type \"int4\""),
+        ("SELECT '1'::int4(3)", "type modifier is not allowed for type \"int4\""),
+        ("SELECT '1'::text(3)", "type modifier is not allowed for type \"text\""),
+        ("SELECT '1'::inet(2)", "type modifier is not allowed for type \"inet\""),
+        ("SELECT id FROM s.a WHERE id = '1'::int8(3)", "type modifier is not allowed for type \"int8\""),
+        ("SELECT 1::integer(3)", "syntax error at or near \"(\""),
+        ("SELECT '1'::bigint(2)", "syntax error at or near \"(\""),
+        ("SELECT 'abc'::varchar(0)", "length for type varchar must be at least 1"),
+        ("SELECT 'a'::varchar(10485761)", "length for type varchar cannot exceed 10485760"),
+    ] {
+        assert_eq!(refused(&mut s, sql), pg, "{sql}");
+    }
+}
+
+#[test]
 fn what_sqlparser_takes_past_postgresql_s_grammar_is_refused_in_its_words() {
     let mut s = Snail::open(&made("grammar")).unwrap();
     let near = |w: &str| format!("syntax error at or near \"{w}\"");
