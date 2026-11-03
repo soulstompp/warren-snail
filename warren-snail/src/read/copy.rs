@@ -35,6 +35,11 @@ pub struct Copy {
     force_not_null: Vec<usize>,
     force_null: Vec<usize>,
     default: Option<String>,
+    /// ON_ERROR ignore, LOG_VERBOSITY (0 silent, 1 default, 2 verbose), REJECT_LIMIT, WHERE.
+    on_error_ignore: bool,
+    log_verbosity: u8,
+    reject_limit: Option<i64>,
+    where_: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +87,7 @@ pub(super) fn parse_copy(
     if kw(0) != "COPY" {
         return None;
     }
+    let release = catalog.release;
     Some((|| {
         let mut end_at = w.len();
         if matches!(w.last().map(|x| &x.0), Some(Token::SemiColon)) {
@@ -221,6 +227,10 @@ pub(super) fn parse_copy(
             force_not_null: Vec::new(),
             force_null: Vec::new(),
             default: None,
+            on_error_ignore: false,
+            log_verbosity: 1,
+            reject_limit: None,
+            where_: None,
         };
         let mut delimiter = None;
         let mut null = None;
@@ -293,6 +303,12 @@ pub(super) fn parse_copy(
                         }),
                     }
                 };
+                // An option the file's release does not know is none of its options.
+                if matches!(opt.as_str(), "on_error" | "log_verbosity") && release < 17
+                    || opt == "reject_limit" && release < 18
+                {
+                    return Err(Error::new(format!("option \"{opt}\" not recognized")));
+                }
                 match opt.as_str() {
                     "format" => match value.as_deref() {
                         Some("text") => {}
@@ -342,11 +358,7 @@ pub(super) fn parse_copy(
                     },
                     "on_error" => match value.as_deref() {
                         Some("stop") => {}
-                        Some("ignore") => {
-                            return Err(Error::new(
-                                "COPY … ON_ERROR ignore is refused: the snail stops at a row it cannot read",
-                            ))
-                        }
+                        Some("ignore") => c.on_error_ignore = true,
                         Some(v) => {
                             return Err(Error::new(format!(
                                 "COPY ON_ERROR \"{v}\" not recognized"
@@ -354,11 +366,32 @@ pub(super) fn parse_copy(
                         }
                         None => return Err(Error::new("on_error requires a parameter")),
                     },
-                    "log_verbosity" => {}
+                    "log_verbosity" => {
+                        c.log_verbosity = match value.as_deref() {
+                            Some("silent") if release >= 18 => 0,
+                            Some("default") => 1,
+                            Some("verbose") => 2,
+                            Some(v) => {
+                                return Err(Error::new(format!(
+                                    "COPY LOG_VERBOSITY \"{v}\" not recognized"
+                                )))
+                            }
+                            None => {
+                                return Err(Error::new("log_verbosity requires a parameter"))
+                            }
+                        }
+                    }
                     "reject_limit" => {
-                        return Err(Error::new(
-                            "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
-                        ))
+                        let n = value
+                            .as_deref()
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .ok_or_else(|| Error::new("reject_limit requires a numeric value"))?;
+                        if n <= 0 {
+                            return Err(Error::new(format!(
+                                "REJECT_LIMIT ({n}) must be greater than zero"
+                            )));
+                        }
+                        c.reject_limit = Some(n);
                     }
                     other => {
                         return Err(Error::new(format!("option \"{other}\" not recognized")))
@@ -438,10 +471,10 @@ pub(super) fn parse_copy(
             }
         }
         if kw(i) == "WHERE" && !c.to {
-            return Err(Error::new(
-                "COPY … FROM … WHERE is refused: write the rows into a table of their own, then \
-                 INSERT … SELECT … WHERE",
-            ));
+            let start = w[i].2;
+            let stop = w.get(end_at).map_or(sql.len(), |x| x.1);
+            c.where_ = Some(sql[start..stop].trim().to_string());
+            i = end_at;
         }
         if i != end_at {
             return Err(syntax_at(tok(i)));
@@ -524,6 +557,17 @@ pub(super) fn parse_copy(
         }
         if c.default.is_some() && c.to {
             return Err(Error::new("COPY DEFAULT cannot be used with COPY TO"));
+        }
+        if c.on_error_ignore && c.to {
+            return Err(Error::new("COPY ON_ERROR cannot be used with COPY TO"));
+        }
+        if c.on_error_ignore && c.binary {
+            return Err(Error::new("only ON_ERROR STOP is allowed in BINARY mode"));
+        }
+        if c.reject_limit.is_some() && !c.on_error_ignore {
+            return Err(Error::new(
+                "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+            ));
         }
         if c.binary {
             return Err(Error::new(
@@ -863,6 +907,17 @@ impl Snail {
         }
         let mut header = c.header != Header::No;
         let mut values = Vec::new();
+        let (mut skipped, mut notices) = (0u64, Vec::new());
+        let where_ = match &c.where_ {
+            None => None,
+            Some(w) => match super::image::parse_sql(&format!("SELECT 1 WHERE {w}"))?.as_slice() {
+                [sqlparser::ast::Statement::Query(q)] => match q.body.as_ref() {
+                    sqlparser::ast::SetExpr::Select(s) => s.selection.clone(),
+                    _ => None,
+                },
+                _ => None,
+            },
+        };
         for (n, r) in rows.into_iter().enumerate() {
             if header {
                 header = false;
@@ -892,6 +947,56 @@ impl Snail {
                     t.columns[cols[r.len()]].name
                 )));
             }
+            // Each value read by its column's input: under ON_ERROR ignore a row one fails is
+            // skipped, said where LOG_VERBOSITY is verbose.
+            let mut typed = Vec::with_capacity(r.len());
+            let mut failed = None;
+            let checked = c.on_error_ignore || where_.is_some();
+            for (f, &k) in r.iter().zip(&cols).filter(|_| checked) {
+                let Some(v) = f.as_deref().filter(|v| c.default.as_deref() != Some(*v)) else {
+                    typed.push(super::pipeline::Value::Null);
+                    continue;
+                };
+                let literal = sqlparser::ast::Expr::value(sqlparser::ast::Value::SingleQuotedString(
+                    v.to_string(),
+                ));
+                match super::statement::datum(&literal, t, k) {
+                    Ok(_) if where_.is_some() => typed.push(cast_value(v, t.columns[k].ty, t)?),
+                    Ok(_) => {}
+                    Err(e) => {
+                        failed = Some((k, v.to_string(), e));
+                        break;
+                    }
+                }
+            }
+            if let Some((k, v, e)) = failed {
+                if !c.on_error_ignore {
+                    return Err(e);
+                }
+                skipped += 1;
+                if c.log_verbosity == 2 {
+                    notices.push(format!(
+                        "NOTICE:  skipping row due to data type incompatibility at line {} for column \"{}\": \"{v}\"",
+                        n + 1,
+                        t.columns[k].name
+                    ));
+                }
+                if c.reject_limit.is_some_and(|l| skipped > l as u64) {
+                    return Err(Error::new(format!(
+                        "skipped more than REJECT_LIMIT ({}) rows due to data type incompatibility",
+                        c.reject_limit.unwrap()
+                    )));
+                }
+                continue;
+            }
+            if let Some(w) = &where_ {
+                let names: Vec<String> = cols.iter().map(|&k| t.columns[k].name.clone()).collect();
+                let casings = super::pipeline::Casings::under(t);
+                let kept = super::pipeline::eval_on(w, &names, &typed, t.release, &casings)?;
+                if !matches!(kept, super::pipeline::Value::Bool(true)) {
+                    continue;
+                }
+            }
             let row: Vec<String> = r
                 .iter()
                 .map(|f| match f {
@@ -901,6 +1006,12 @@ impl Snail {
                 })
                 .collect();
             values.push(format!("({})", row.join(", ")));
+        }
+        if skipped > 0 && c.log_verbosity >= 1 {
+            notices.push(match skipped {
+                1 => "NOTICE:  1 row was skipped due to data type incompatibility".to_string(),
+                k => format!("NOTICE:  {k} rows were skipped due to data type incompatibility"),
+            });
         }
         let n = values.len() as u64;
         if n > 0 {
@@ -918,11 +1029,13 @@ impl Snail {
             return Ok(super::Done {
                 statement: "COPY",
                 rows: d.rows,
+                notices,
                 ..d
             });
         }
         Ok(super::Done {
             statement: "COPY",
+            notices,
             ..Default::default()
         })
     }
@@ -936,4 +1049,29 @@ impl Snail {
         self.session.copy_input = None;
         done
     }
+}
+
+/// A value read in by its column's type, as a step's expression holds it.
+fn cast_value(
+    v: &str,
+    ty: crate::catalog::ColumnType,
+    t: &crate::catalog::Table,
+) -> Result<super::pipeline::Value> {
+    let e = match super::image::parse_sql(&format!(
+        "SELECT CAST('{}' AS {})",
+        v.replace('\'', "''"),
+        ty.pg_name()
+    ))?
+    .as_slice()
+    {
+        [sqlparser::ast::Statement::Query(q)] => match q.body.as_ref() {
+            sqlparser::ast::SetExpr::Select(s) => match s.projection.first() {
+                Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) => e.clone(),
+                _ => return Err(Error::new("a value COPY reads is no expression")),
+            },
+            _ => return Err(Error::new("a value COPY reads is no expression")),
+        },
+        _ => return Err(Error::new("a value COPY reads is no expression")),
+    };
+    super::pipeline::eval_on(&e, &[], &[], t.release, &super::pipeline::Casings::under(t))
 }

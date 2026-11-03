@@ -507,7 +507,7 @@ impl super::Snail {
     }
 
     fn said_run(&mut self, said: Said) -> Result<super::Done> {
-        let done = super::Done::default();
+        let mut done = super::Done::default();
         match said {
             Said::Savepoint { name } => self.savepoint(&name)?,
             Said::RollbackTo { name } => self.rollback_to(&name)?,
@@ -552,7 +552,13 @@ impl super::Snail {
                 name,
                 values,
                 local,
-            } => self.set_setting(&name, values, local)?,
+            } => {
+                if local && self.begun.is_none() {
+                    done.notices
+                        .push("WARNING:  SET LOCAL can only be used in transaction blocks".into());
+                }
+                self.set_setting(&name, values, local)?
+            }
             Said::Show { name } => {
                 let (column, value) = self.shown_setting(name.as_deref())?;
                 let batch = arrow::array::RecordBatch::try_new(
