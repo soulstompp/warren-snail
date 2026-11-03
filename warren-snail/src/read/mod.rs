@@ -9,6 +9,7 @@ mod aggregates;
 mod answer;
 mod arrays;
 mod beside;
+mod binary;
 mod calls;
 mod change;
 mod clock;

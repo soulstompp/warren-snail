@@ -575,3 +575,53 @@ fn default_text_search_config_is_the_files_and_set_config_in_a_write_stands_for_
     w.execute("COMMIT").unwrap();
     assert_eq!(show(&mut w, "work_mem"), "4MB");
 }
+
+#[test]
+fn copy_writes_and_reads_the_binary_format_as_postgresql_does() {
+    let path = tmp("session-copy-binary.snail");
+    let catalog = warren_snail::catalog::Catalog::parse(
+        "CREATE TABLE s.b (k integer NOT NULL, v text, n numeric(10,2), d date, at timestamptz, \
+         u uuid, f double precision, ok boolean, PRIMARY KEY (k));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.b (k, v, n, d, at, u, f, ok) VALUES \
+         (1, 'one', 1.5, '2000-01-02', '2000-01-01 00:00:01+00', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', -2.25, true), \
+         (2, NULL, -12345678.9, NULL, NULL, NULL, NULL, false)",
+    )
+    .unwrap();
+    let out = w
+        .execute("COPY s.b TO STDOUT (FORMAT binary)")
+        .unwrap()
+        .copied
+        .unwrap();
+    // The header, then row 1: eight fields, k = 1, v = "one", n = 1.50 as base-10000 digits, the
+    // date and the instant one day and one second past 2000.
+    let mut want = b"PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0".to_vec();
+    want.extend([0, 8, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 3, b'o', b'n', b'e']);
+    want.extend([0, 0, 0, 12, 0, 2, 0, 0, 0, 0, 0, 2, 0, 1, 0x13, 0x88]);
+    want.extend([0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0x0f, 0x42, 0x40]);
+    assert_eq!(&out[..want.len()], &want[..]);
+    assert_eq!(&out[out.len() - 2..], &[0xff, 0xff]);
+    w.execute("DELETE FROM s.b").unwrap();
+    assert_eq!(
+        w.execute_copy("COPY s.b FROM STDIN (FORMAT binary)", &out)
+            .unwrap()
+            .rows,
+        2
+    );
+    assert_eq!(
+        w.execute("COPY s.b TO STDOUT (FORMAT binary)")
+            .unwrap()
+            .copied
+            .unwrap(),
+        out
+    );
+    assert!(w
+        .execute_copy("COPY s.b FROM STDIN (FORMAT binary)", b"not a copy")
+        .unwrap_err()
+        .to_string()
+        .contains("COPY file signature not recognized"));
+}

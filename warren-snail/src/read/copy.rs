@@ -488,10 +488,17 @@ pub(super) fn parse_copy(
                 ))),
             }
         };
-        if c.binary && (delimiter.is_some() || null.is_some() || c.csv) {
-            return Err(Error::new(
-                "cannot specify DELIMITER in BINARY mode",
-            ));
+        if c.binary {
+            for (what, given) in [
+                ("DELIMITER", delimiter.is_some()),
+                ("NULL", null.is_some()),
+                ("DEFAULT", c.default.is_some()),
+                ("HEADER", c.header != Header::No),
+            ] {
+                if given {
+                    return Err(Error::new(format!("cannot specify {what} in BINARY mode")));
+                }
+            }
         }
         c.delimiter = one_char("delimiter", delimiter, if c.csv { ',' } else { '\t' })?;
         c.null = null.unwrap_or_else(|| if c.csv { String::new() } else { "\\N".into() });
@@ -567,12 +574,6 @@ pub(super) fn parse_copy(
         if c.reject_limit.is_some() && !c.on_error_ignore {
             return Err(Error::new(
                 "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
-            ));
-        }
-        if c.binary {
-            return Err(Error::new(
-                "COPY … BINARY is refused: the snail writes and reads COPY's text and CSV formats, \
-                 each value by its type's output and input functions",
             ));
         }
         Ok(c)
@@ -802,6 +803,24 @@ impl Snail {
             true => batch.schema().fields().iter().map(|f| f.name().clone()).collect(),
             false => names,
         };
+        if c.binary {
+            let mut out = super::binary::HEADER.to_vec();
+            for r in &rows {
+                out.extend((r.len() as i16).to_be_bytes());
+                for (k, d) in r.iter().enumerate() {
+                    match d {
+                        super::statement::Datum::Null => out.extend((-1i32).to_be_bytes()),
+                        d => {
+                            let b = super::binary::send(types[k], d)?;
+                            out.extend((b.len() as i32).to_be_bytes());
+                            out.extend(b);
+                        }
+                    }
+                }
+            }
+            out.extend((-1i16).to_be_bytes());
+            return self.copied(c, out, rows.len() as u64);
+        }
         let forced: Vec<bool> = match (&c.force_quote, &c.table) {
             _ if c.force_all => vec![true; names.len()],
             (Some(f), Some((_, cols))) => cols.iter().map(|k| f.contains(k)).collect(),
@@ -833,10 +852,14 @@ impl Snail {
             }
             out.push('\n');
         }
-        let n = rows.len() as u64;
+        self.copied(c, out.into_bytes(), rows.len() as u64)
+    }
+
+    /// What COPY TO wrote: into the file it names, or handed back.
+    fn copied(&self, c: &Copy, out: Vec<u8>, n: u64) -> Result<super::Done> {
         match &c.end {
             End::File(f) => {
-                std::fs::write(f, out.as_bytes()).map_err(|e| {
+                std::fs::write(f, &out).map_err(|e| {
                     Error::new(format!("could not open file \"{f}\" for writing: {e}"))
                 })?;
                 Ok(super::Done {
@@ -848,7 +871,7 @@ impl Snail {
             _ => Ok(super::Done {
                 statement: "COPY",
                 rows: n,
-                copied: Some(out.into_bytes()),
+                copied: Some(out),
                 ..Default::default()
             }),
         }
@@ -869,13 +892,20 @@ impl Snail {
                 ))
             }
         };
-        let data = String::from_utf8(bytes)
-            .map_err(|_| Error::new("invalid byte sequence for encoding \"UTF8\""))?;
         let (ti, cols) = c.table.clone().expect("COPY FROM names a table");
         let t = &self.catalog.tables[ti];
         // Each row's fields: the NULL string, or a value.
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-        if c.csv {
+        let data = match c.binary {
+            true => {
+                rows = binary_rows(&bytes, &cols.iter().map(|&k| t.columns[k].ty).collect::<Vec<_>>())?;
+                String::new()
+            }
+            false => String::from_utf8(bytes)
+                .map_err(|_| Error::new("invalid byte sequence for encoding \"UTF8\""))?,
+        };
+        if c.binary {
+        } else if c.csv {
             for r in csv_rows(&data, c)? {
                 rows.push(
                     r.into_iter()
@@ -1074,4 +1104,48 @@ fn cast_value(
         _ => return Err(Error::new("a value COPY reads is no expression")),
     };
     super::pipeline::eval_on(&e, &[], &[], t.release, &super::pipeline::Casings::under(t))
+}
+
+/// COPY's binary rows read into their fields: each NULL, or the text its column's input reads, as
+/// its type's receive function reads its bytes.
+fn binary_rows(b: &[u8], types: &[crate::catalog::ColumnType]) -> Result<Vec<Vec<Option<String>>>> {
+    let bad = || Error::new("COPY file signature not recognized");
+    let sig = &super::binary::HEADER[..11];
+    if b.len() < 19 || &b[..11] != sig {
+        return Err(bad());
+    }
+    let flags = u32::from_be_bytes(b[11..15].try_into().unwrap());
+    if flags & 0xffff_0000 != 0 {
+        return Err(Error::new("unrecognized critical flags in COPY file header"));
+    }
+    let ext = u32::from_be_bytes(b[15..19].try_into().unwrap()) as usize;
+    let mut at = 19 + ext;
+    let early = || Error::new("unexpected EOF in COPY data");
+    let mut rows = Vec::new();
+    loop {
+        let n = i16::from_be_bytes(b.get(at..at + 2).ok_or_else(early)?.try_into().unwrap());
+        at += 2;
+        if n == -1 {
+            return Ok(rows);
+        }
+        if n as usize != types.len() {
+            return Err(Error::new(format!(
+                "row field count is {n}, expected {}",
+                types.len()
+            )));
+        }
+        let mut row = Vec::with_capacity(types.len());
+        for &ty in types {
+            let len = i32::from_be_bytes(b.get(at..at + 4).ok_or_else(early)?.try_into().unwrap());
+            at += 4;
+            if len < 0 {
+                row.push(None);
+                continue;
+            }
+            let v = b.get(at..at + len as usize).ok_or_else(early)?;
+            at += len as usize;
+            row.push(Some(super::binary::recv(ty, v)?));
+        }
+        rows.push(row);
+    }
 }
