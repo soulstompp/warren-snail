@@ -29,6 +29,15 @@ at once, and a snail written inside a host that decides its commits.
 
 ### Added
 
+- **A session on `exec` as PostgreSQL's:** SAVEPOINT, ROLLBACK TO and RELEASE, a savepoint the
+  transaction's staged blocks as they stand, put back with the pages staged since dropped and the
+  locks taken since let go; COMMIT AND CHAIN and ROLLBACK AND CHAIN; LOCK TABLE in each of
+  PostgreSQL's modes but ACCESS EXCLUSIVE, refused by name since a snail's reader never waits;
+  SET, RESET and SHOW of the settings the snail takes, `set_config` and `current_setting`;
+  PREPARE, EXECUTE and DEALLOCATE; cursors, FETCH and MOVE in every direction, `WHERE CURRENT OF`;
+  COPY in the text and CSV formats; EXPLAIN printing the snail's round. `exec` takes `--param`,
+  `--answers` and `--go-on`. A statement the snail refuses fails its transaction, as PostgreSQL's
+  does.
 - The types: the integers and serials, the floats, `numeric` past 18 digits, `money`; `text`,
   `varchar`, `character`, `name`, `"char"`, `bytea`, the bit strings, `boolean`, `uuid`; the date
   and time types and `interval`; `oid`, `oid8`, `xid`, `xid8`, `cid`, `pg_lsn`, `tid` and the reg*
