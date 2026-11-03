@@ -2868,6 +2868,22 @@ impl Catalog {
     /// where the release has no such type.
     pub fn with_release(&mut self, release: u8) -> Result<()> {
         crate::regs::check_release(None, release)?;
+        // An index on GiST taking inet's operator class unnamed takes 19's default, which an
+        // earlier release lacks: the DDL read again under it refuses that one.
+        let gist_inet = self.tables.iter().flat_map(|t| &t.orders).any(|o| {
+            o.method == Method::Gist && o.opclasses.iter().any(|c| c == "inet_ops")
+        });
+        if gist_inet && release < 19 {
+            let again = crate::ddl::read_ddl_at(&self.ddl, true, usize::MAX, release)?;
+            if let Some(why) = again
+                .statements
+                .iter()
+                .filter_map(|s| s.refused.as_ref())
+                .find(|why| why.ends_with("no default operator class for access method \"gist\""))
+            {
+                return Err(Error::new(why.clone()));
+            }
+        }
         self.release = release;
         let mut types: Vec<&mut ColumnType> = Vec::new();
         for t in &mut self.tables {

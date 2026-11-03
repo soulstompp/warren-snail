@@ -112,6 +112,40 @@ fn order_by_using_sorts_as_its_operator_does_wherever_it_stands() {
     }
 }
 
+#[test]
+fn gist_takes_inet_s_class_unnamed_only_from_release_19() {
+    let gist = "no default operator class for access method \"gist\"";
+    for (ddl, refused) in [
+        ("CREATE INDEX n_ip ON s.n USING gist (ip);", Some("inet")),
+        ("CREATE INDEX n_c ON s.n USING gist (c);", Some("cidr")),
+        ("CREATE INDEX n_ip ON s.n USING gist (ip inet_ops);", None),
+        ("CREATE INDEX n_ip ON s.n USING spgist (ip);", None),
+        ("CREATE TABLE s.m (id integer PRIMARY KEY, ip inet, EXCLUDE USING gist (ip WITH &&));", Some("inet")),
+    ] {
+        let ddl = format!("CREATE TABLE s.n (id integer PRIMARY KEY, ip inet, c cidr);\n{ddl}");
+        let catalog = Catalog::parse(&ddl).unwrap();
+        for release in [18, 19] {
+            let path = tmp("wrongs-gist.snail");
+            let got = warren_snail::write::write_released(
+                &path,
+                &catalog,
+                &[],
+                &[],
+                weather::span(),
+                release,
+            );
+            match (refused, release) {
+                (Some(ty), 18) => assert_eq!(
+                    got.err().map(|e| e.to_string()),
+                    Some(format!("data type {ty} has {gist}")),
+                    "{ddl}"
+                ),
+                _ => assert!(got.is_ok(), "{ddl} on {release}: {:?}", got.err()),
+            }
+        }
+    }
+}
+
 #[cfg(feature = "standalone")]
 mod written {
     use super::*;

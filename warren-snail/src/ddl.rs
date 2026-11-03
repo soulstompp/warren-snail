@@ -1832,6 +1832,8 @@ struct Draft {
     /// strands lie among the tables where its statement stands, so that no later statement moves a
     /// table.
     strands_at: Vec<(usize, String, String)>,
+    /// The release whose operator classes are each type's defaults.
+    release: u8,
 }
 
 /// A key a CREATE TABLE writes, before its name is chosen.
@@ -3325,7 +3327,7 @@ impl Draft {
                 let mut operators = Vec::new();
                 for (i, l) in levels.iter().enumerate() {
                     let ty = columns[l.column()].ty;
-                    let op = crate::methods::opclass(Method::Gist, ty, None)?;
+                    let op = crate::methods::opclass(Method::Gist, ty, None, self.release)?;
                     let operator = if i + 1 == levels.len() { "&&" } else { "=" };
                     if crate::methods::exclusion_operator(Method::Gist, &op, ty, operator).is_err()
                     {
@@ -3937,7 +3939,7 @@ impl Draft {
             });
             let op = match &c.operator_class {
                 _ if method != Method::Btree => {
-                    crate::methods::opclass(method, key_type, named.as_deref())?
+                    crate::methods::opclass(method, key_type, named.as_deref(), self.release)?
                 }
                 None => default.to_string(),
                 Some(o) => {
@@ -5016,7 +5018,15 @@ pub(crate) fn read_ddl(ddl: &str, strict: bool) -> Result<Reading> {
 /// Reads a DDL as `read_ddl` does, its first `kept` statements as the file's own: a library
 /// collation they name taken by a build without the feature `collations`.
 pub(crate) fn read_ddl_kept(ddl: &str, strict: bool, kept: usize) -> Result<Reading> {
-    let mut draft = Draft::default();
+    read_ddl_at(ddl, strict, kept, crate::regs::LATEST)
+}
+
+/// Reads a DDL as `read_ddl_kept` does, each type's default operator classes `release`'s.
+pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> Result<Reading> {
+    let mut draft = Draft {
+        release,
+        ..Draft::default()
+    };
     let mut statements: Vec<StatementRead> = Vec::new();
     for (at, tokens) in statements_of(ddl)?.into_iter().enumerate() {
         draft.kept = at < kept;

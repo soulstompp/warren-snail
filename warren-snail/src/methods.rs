@@ -306,8 +306,9 @@ fn brin(ty: ColumnType, named: Option<&str>) -> (bool, bool, Option<String>) {
 }
 
 /// The operator class a key of type `ty` takes in an index of `method`, other than the B-tree, as
-/// PostgreSQL's `ResolveOpClass` resolves it: the one named, or the type's default.
-pub fn opclass(method: Method, ty: ColumnType, named: Option<&str>) -> Result<String> {
+/// PostgreSQL's `ResolveOpClass` resolves it under `release`: the one named, or the type's default.
+/// GiST's `inet_ops` is inet's default from 19 on.
+pub fn opclass(method: Method, ty: ColumnType, named: Option<&str>, release: u8) -> Result<String> {
     let am = method.name();
     let (exists, takes, default) = match method {
         Method::Hash => {
@@ -331,7 +332,9 @@ pub fn opclass(method: Method, ty: ColumnType, named: Option<&str>) -> Result<St
             let takes = named.is_none_or(|n| classes.iter().any(|c| c.0 == n && (c.2)(ty)));
             let default = classes
                 .iter()
-                .find(|c| c.1 && (c.2)(ty))
+                .find(|c| {
+                    c.1 && (c.2)(ty) && !(method == Method::Gist && c.0 == "inet_ops" && release < 19)
+                })
                 .map(|c| c.0.to_string());
             (exists, takes, default)
         }
