@@ -50,7 +50,9 @@ at once, and a snail written inside a host that decides its commits.
   `OR`; a GiST index with such a key beside a key of another kind, a strand of each.
 - A distance read: `ORDER BY v <-> point`, on a point, a box, a polygon or a circle with a GiST or
   SP-GiST index, reads the index's nearest blocks first where that is the fewer pages, each read's
-  pages known before it is read, as far as its `LIMIT` needs.
+  pages known before it is read, as far as its `LIMIT` needs. A geometric operator's hypotenuse, a
+  distance's among them, rounds as the release the file records: PostgreSQL 18's own, and 19's the
+  C library's, which part in the last digit.
 - BRIN, on all 72 of PostgreSQL 19's operator classes: no order of its own, each block's directory
   entry and each entry above the blocks keeping the operator class's summary (its least and greatest,
   a span, runs of values, or a bloom filter of a power of two of bits), a block ruled out of a

@@ -189,9 +189,10 @@ block keeping the span of the values it holds. One on a point, a box, a polygon 
 order on x's and y's bits taken in turn, a shape by the centre of its bounding box, each block
 keeping the bounding box of the shapes it holds, so that a box reads the blocks it meets and no
 others, and `ORDER BY v <-> point LIMIT n` reads the nearest blocks first, stopping once its rows lie
-nearer than the next block's box, a column the strand does not hold read after by the keys found. A
-distance rounds as the release the file records rounds it: 18 and 19 part in its last digit. A GIN index on an array, a `jsonb` or a `tsvector`, and a GiST index on a `tsvector` or a
-`tsquery`, is a strand of what each row holds, an element and the row's key, on the element's order:
+nearer than the next block's box, a column the strand does not hold read after by the keys found,
+where that reads fewer pages than the table's own read and its sort. A distance rounds as the
+release the file records rounds it: 18 and 19 part in its last digit. A GIN index on an array, a
+`jsonb` or a `tsvector`, and a GiST index on a `tsvector` or a `tsquery`, is a strand of what each row holds, an element and the row's key, on the element's order:
 an operator finds its rows' keys there and the rows by them on the table's order, where that reads
 the fewest pages, and one element's count comes from its counts. Every operator of those classes
 reads so: a jsonpath's `@?` and `@@` by what must hold of a row it passes, a tsquery's `|`, `&`, `!`
