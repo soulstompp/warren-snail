@@ -29,6 +29,7 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
                           [--written <written.parquet>] [--format <7|8>]
        warren-snail exec <file> <statements.sql> --out <done.parquet> [--with <file>]...
                          [--host <command> --host-server <name>] [--applier <source>]
+                         [--param <value>]... [--answers <dir>] [--go-on]
        warren-snail replica <file> [--of <source> | --clear]
        warren-snail read <file> <question.sql> --out <answer.parquet> [--order <name>]
                          [--param <value>]... [--rounds <n>] [--hold <MiB>] [--room <bytes>]
@@ -70,6 +71,13 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
           opens one more snail with <file>, as one writer of them all: a statement writes the
           snail that holds its table, and a transaction's COMMIT commits every snail it wrote,
           one root deciding.
+          Its session is PostgreSQL's: SAVEPOINT, ROLLBACK TO and RELEASE; COMMIT AND CHAIN and
+          ROLLBACK AND CHAIN; LOCK TABLE; SET, RESET and SHOW; PREPARE, EXECUTE and DEALLOCATE;
+          cursors; COPY, the rows of COPY … FROM STDIN after it up to a line \\., as psql reads
+          them from a file; and EXPLAIN. Each --param gives the next of $1, $2 and on, as text,
+          to every statement. --answers writes each statement's answer to <dir>/<n>.parquet and
+          the bytes of COPY … TO STDOUT to <dir>/<n>.copy. --go-on records a statement's refusal
+          in --out's error column and goes on to the next, as psql does without ON_ERROR_STOP.
           A snail PostgreSQL writes through its WAL is written only through PostgreSQL, its host:
           --host names the command that carries each commit to it, psql for one, read a
           statement at a time; the statements run as one transaction of the host's, under the
@@ -506,9 +514,26 @@ fn cmd_exec(args: &[String]) -> Result<()> {
     let sql = args.get(1).ok_or_else(|| Error::new(USAGE))?;
     let out = flag(args, "--out").ok_or_else(|| Error::new(USAGE))?;
     let text = std::fs::read_to_string(sql).map_err(|e| Error::new(format!("{sql}: {e}")))?;
-    // Each statement as written: the snail reads itself what sqlparser does not.
-    let statements = warren_snail::read::statement::split(&text)?;
+    // Each statement as written: the snail reads itself what sqlparser does not. The rows of a
+    // COPY … FROM STDIN follow it, up to a line `\.`, as psql reads them from a file.
+    let (statements, copied) = with_copy_rows(&text)?;
+    let params: Vec<String> = args
+        .windows(2)
+        .filter(|w| w[0] == "--param")
+        .map(|w| w[1].clone())
+        .collect();
+    let answers = flag(args, "--answers");
+    let go_on = args.iter().any(|a| a == "--go-on");
+    if let Some(dir) = answers {
+        std::fs::create_dir_all(dir).map_err(|e| Error::new(format!("{dir}: {e}")))?;
+    }
     let others = withs(args);
+    if (!params.is_empty() || copied.iter().any(Option::is_some)) && !others.is_empty() {
+        return Err(Error::new(
+            "--param and COPY's rows are a session's on one snail: --with is refused",
+        ));
+    }
+    let mut errors: Vec<String> = Vec::new();
     let applier = flag(args, "--applier");
     if applier.is_some() && !others.is_empty() {
         return Err(Error::new(
@@ -542,19 +567,39 @@ fn cmd_exec(args: &[String]) -> Result<()> {
             let mut done = Vec::with_capacity(statements.len());
             for (i, st) in statements.iter().enumerate() {
                 let before = wchar();
-                let d = match &mut opened {
-                    Opened::One(s) => s.execute(st),
-                    Opened::Several(s) => s.execute(st),
+                let ran = match (&mut opened, &copied[i]) {
+                    (Opened::One(s), Some(rows)) => s.execute_copy(st, rows),
+                    (Opened::One(s), None) => s.execute_with(st, &params),
+                    (Opened::Several(s), _) => s.execute(st),
+                };
+                let d = match ran {
+                    Ok(d) => {
+                        errors.push(String::new());
+                        d
+                    }
+                    Err(e) if go_on => {
+                        errors.push(e.to_string());
+                        warren_snail::read::Done::default()
+                    }
+                    Err(e) => return Err(Error::new(format!("statement {}: {e}", i + 1))),
+                };
+                let bytes = wchar() - before;
+                if let Some(dir) = answers {
+                    if let Some(b) = &d.answer {
+                        save(&format!("{dir}/{}.parquet", i + 1), b)?;
+                    }
+                    if let Some(c) = &d.copied {
+                        std::fs::write(format!("{dir}/{}.copy", i + 1), c)?;
+                    }
                 }
-                .map_err(|e| Error::new(format!("statement {}: {e}", i + 1)))?;
-                done.push((d, wchar() - before));
+                done.push((d, bytes));
             }
             done
         }
     };
     let system_agrees: Vec<bool> = done
         .iter()
-        .map(|(d, bytes)| d.pages_written * PAGE as u64 == *bytes)
+        .map(|(d, bytes)| d.statement == "COPY" || d.pages_written * PAGE as u64 == *bytes)
         .collect();
     let batch = table(vec![
         ("statement_no", counts((1..=done.len() as u64).collect())),
@@ -592,6 +637,22 @@ fn cmd_exec(args: &[String]) -> Result<()> {
             Arc::new(BooleanArray::from(system_agrees.clone())),
         ),
     ])?;
+    // Under --go-on, each statement's refusal, or none.
+    let batch = match go_on {
+        true => {
+            let schema = batch.schema();
+            let mut columns: Vec<(&str, ArrayRef)> = schema
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .map(|(f, a)| (f.name().as_str(), a.clone()))
+                .collect();
+            errors.resize(done.len(), String::new());
+            columns.push(("error", texts(errors.clone())));
+            table(columns)?
+        }
+        false => batch,
+    };
     save(out, &batch)?;
     let written: u64 = done.iter().map(|(d, _)| d.pages_written).sum();
     let generation = done.last().map_or(0, |(d, _)| d.generation);
@@ -1584,4 +1645,51 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The statements of a file, each as written, and the rows each COPY … FROM STDIN takes: the lines
+/// after it up to one that is `\.`, as psql reads them from a file.
+fn with_copy_rows(text: &str) -> Result<(Vec<String>, Vec<Option<Vec<u8>>>)> {
+    let from_stdin = |st: &str| {
+        let words: Vec<String> = st
+            .split_whitespace()
+            .map(|w| w.trim_end_matches(';').to_ascii_uppercase())
+            .collect();
+        words.first().is_some_and(|w| w == "COPY")
+            && words.windows(2).any(|w| w[0] == "FROM" && w[1] == "STDIN")
+    };
+    let mut statements = Vec::new();
+    let mut rows = Vec::new();
+    let mut buf = String::new();
+    let mut lines = text.split_inclusive('\n');
+    while let Some(line) = lines.next() {
+        buf.push_str(line);
+        if !line.trim_end().ends_with(';') {
+            continue;
+        }
+        let Ok(parts) = warren_snail::read::statement::split(&buf) else {
+            continue;
+        };
+        if !parts.last().is_some_and(|p| from_stdin(p)) {
+            continue;
+        }
+        let mut data = Vec::new();
+        for l in lines.by_ref() {
+            if l.trim_end_matches(['\n', '\r']) == "\\." {
+                break;
+            }
+            data.extend_from_slice(l.as_bytes());
+        }
+        let n = parts.len();
+        for (k, p) in parts.into_iter().enumerate() {
+            statements.push(p);
+            rows.push((k + 1 == n).then(|| std::mem::take(&mut data)));
+        }
+        buf.clear();
+    }
+    for p in warren_snail::read::statement::split(&buf)? {
+        statements.push(p);
+        rows.push(None);
+    }
+    Ok((statements, rows))
 }
