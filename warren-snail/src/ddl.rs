@@ -3295,7 +3295,8 @@ impl Draft {
                     .iter()
                     .map(|n| Level::Column(column_index(n).unwrap()))
                     .collect();
-                let include: Vec<usize> = k.include.iter().map(|n| column_index(n).unwrap()).collect();
+                let include: Vec<usize> =
+                    k.include.iter().map(|n| column_index(n).unwrap()).collect();
                 let method = if k.without_overlaps {
                     Method::Gist
                 } else {
@@ -3322,7 +3323,8 @@ impl Draft {
                     }
                     None => {
                         // PostgreSQL names a key for its columns and those it includes.
-                        let all: Vec<String> = k.columns.iter().chain(&k.include).cloned().collect();
+                        let all: Vec<String> =
+                            k.columns.iter().chain(&k.include).cloned().collect();
                         let addition = name_addition(&all);
                         choose(
                             bare(&name),
@@ -3346,7 +3348,8 @@ impl Draft {
                         let ty = columns[l.column()].ty;
                         let op = crate::methods::opclass(Method::Gist, ty, None, next.release)?;
                         let operator = if i + 1 == levels.len() { "&&" } else { "=" };
-                        if crate::methods::exclusion_operator(Method::Gist, &op, ty, operator).is_err()
+                        if crate::methods::exclusion_operator(Method::Gist, &op, ty, operator)
+                            .is_err()
                         {
                             return Err(Error::new(format!(
                                 "could not identify an equality operator for type {}",

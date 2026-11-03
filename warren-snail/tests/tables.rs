@@ -8,6 +8,7 @@ mod weather;
 
 use arrow::array::{Array, Int64Array};
 use std::path::{Path, PathBuf};
+use warren_snail::carry::{self, Commit, Host};
 use warren_snail::catalog::Catalog;
 use warren_snail::file::Reader;
 use warren_snail::read::Snail;
@@ -73,6 +74,10 @@ fn a_schema_the_root_holds_is_laid_out_as_before() {
     let mut snail = fresh(&path);
     assert_eq!(count(&mut snail, "SELECT count(*) FROM s.table_00003"), 100);
     whole(&path);
+    // The root holds 43 of these tables with its reused runs at their most and room for a commit's
+    // marks (`snail.nu tables`), and cuts at 44.
+    assert!(!is_cut(&written("fits", 43, &[])));
+    assert!(is_cut(&written("cut", 44, &[])));
 }
 
 #[test]
@@ -94,23 +99,115 @@ fn a_schema_past_the_root_is_read_through_the_pages_it_names() {
         .unwrap();
     assert_eq!(b.num_rows(), 1);
     let point = snail.pages_read() - before;
-    assert!(point <= 6, "{point} pages for a point read, {opened} to open");
+    assert!(
+        point <= 6,
+        "{point} pages for a point read, {opened} to open"
+    );
     whole(&path);
+}
+
+fn insert(i: usize, a: i64) -> String {
+    format!("INSERT INTO {} (a, b) VALUES ({a}, 'n{a}')", name(i))
+}
+
+/// A host that keeps the root, as PostgreSQL does: each commit, its pages and its root, replayed
+/// by it before it returns, its transaction's root tagged.
+struct Keeping(PathBuf, u64);
+
+impl Host for Keeping {
+    fn carry(&mut self, commit: &Commit) -> warren_snail::Result<()> {
+        assert_eq!(
+            carry::replay_held(&self.0, commit, &mut |_| Ok(()))?,
+            carry::Replayed::Landed
+        );
+        Ok(())
+    }
+
+    fn tag(&self) -> Option<u64> {
+        Some(self.1)
+    }
+
+    fn keeps_root(&self) -> bool {
+        true
+    }
+}
+
+/// A judge that takes the tags given as committed.
+struct Said(Vec<u64>);
+
+impl carry::Judge for Said {
+    fn taken(&self, tag: u64) -> warren_snail::Result<bool> {
+        Ok(self.0.contains(&tag))
+    }
+}
+
+/// A judge that hands the root its host takes.
+struct Handing(Vec<u8>);
+
+impl carry::Judge for Handing {
+    fn taken(&self, _: u64) -> warren_snail::Result<bool> {
+        Err(warren_snail::Error::new("asked no word on a copy"))
+    }
+
+    fn root(&self) -> warren_snail::Result<Option<Vec<u8>>> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+#[test]
+fn a_host_keeps_a_cut_root_and_a_writer_handed_it_begins_from_it() {
+    use std::rc::Rc;
+    let path = written("hosted", MANY, &[300]);
+    let g = fresh(&path).generation();
+    let mut w = Snail::open_carried(
+        &path,
+        Box::new(Keeping(path.clone(), 7)),
+        Rc::new(Said(vec![7])),
+    )
+    .unwrap();
+    w.execute(&insert(300, 1001)).unwrap();
+    drop(w);
+    let mut judged = Snail::open_judged(&path, Rc::new(Said(vec![7]))).unwrap();
+    assert_eq!(judged.generation(), g + 1);
+    assert_eq!(
+        count(&mut judged, "SELECT count(*) FROM s.table_00300"),
+        101
+    );
+    drop(judged);
+    // A writer outside the host, handed the root its host takes, writes its pages from it: a
+    // table made, the catalog's and the list's pages among them.
+    let root = carry::taken_root(&path, &Said(vec![7])).unwrap();
+    let mut w = Snail::open_carried(
+        &path,
+        Box::new(Keeping(path.clone(), 8)),
+        Rc::new(Handing(root)),
+    )
+    .unwrap();
+    w.execute("CREATE TABLE s.extra (a bigint PRIMARY KEY, b text)")
+        .unwrap();
+    drop(w);
+    let mut judged = Snail::open_judged(&path, Rc::new(Said(vec![7, 8]))).unwrap();
+    assert_eq!(judged.generation(), g + 2);
+    assert_eq!(count(&mut judged, "SELECT count(*) FROM s.extra"), 0);
+    assert_eq!(
+        count(&mut judged, "SELECT count(*) FROM s.table_00300"),
+        101
+    );
+    assert!(is_cut(&path));
+    judged.census().unwrap();
 }
 
 #[cfg(feature = "standalone")]
 mod written {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use warren_snail::carry::{self, Commit, Host};
     use warren_snail::read::{Snails, StopAcross};
 
-    fn insert(i: usize, a: i64) -> String {
-        format!("INSERT INTO {} (a, b) VALUES ({a}, 'n{a}')", name(i))
-    }
-
     fn rows_of(path: &Path, i: usize) -> i64 {
-        count(&mut fresh(path), &format!("SELECT count(*) FROM {}", name(i)))
+        count(
+            &mut fresh(path),
+            &format!("SELECT count(*) FROM {}", name(i)),
+        )
     }
 
     #[test]
@@ -123,20 +220,26 @@ mod written {
         let mut w = Snail::open_writing(&path).unwrap();
         let one = w.execute(&insert(300, 1001)).unwrap();
         assert!(one.pages_written <= 10, "{one:?}");
-        assert_eq!(
-            count(&mut before, "SELECT count(*) FROM s.table_00300"),
-            100
-        );
-        assert_eq!(
-            count(&mut before, "SELECT count(*) FROM s.table_00300"),
-            101
-        );
-        drop(before);
         // A table made: its own path and the catalog's last page, not the catalog whole.
         let made = w
             .execute("CREATE TABLE s.extra (a bigint PRIMARY KEY, b text)")
             .unwrap();
         assert!(made.pages_written <= 10, "{made:?}");
+        assert_eq!(
+            count(&mut before, "SELECT count(*) FROM s.table_00300"),
+            100
+        );
+        // Begun again, it reads the root and the pages written since: the catalog's two, the list's
+        // leaves the two commits wrote, and its table's.
+        let at = before.pages_read();
+        assert_eq!(
+            count(&mut before, "SELECT count(*) FROM s.table_00300"),
+            101
+        );
+        let renewed = before.pages_read() - at;
+        assert!(renewed <= 12, "{renewed} pages begun again");
+        assert_eq!(count(&mut before, "SELECT count(*) FROM s.extra"), 0);
+        drop(before);
         w.execute("INSERT INTO s.extra (a, b) VALUES (1, 'one')")
             .unwrap();
         // A transaction across two tables far apart in the list.
@@ -159,10 +262,7 @@ mod written {
         assert_eq!(rows_of(&path, 300), 101);
         assert_eq!(rows_of(&path, 1), 1);
         assert_eq!(rows_of(&path, MANY - 2), 1);
-        assert_eq!(
-            count(&mut fresh(&path), "SELECT count(*) FROM s.extra"),
-            1
-        );
+        assert_eq!(count(&mut fresh(&path), "SELECT count(*) FROM s.extra"), 1);
     }
 
     #[test]
@@ -198,7 +298,10 @@ mod written {
         drop(w);
         whole(&path);
         let mut r = fresh(&path);
-        assert_eq!(count(&mut r, "SELECT count(*) FROM s.counted WHERE id = 4"), 1);
+        assert_eq!(
+            count(&mut r, "SELECT count(*) FROM s.counted WHERE id = 4"),
+            1
+        );
         assert_eq!(
             count(&mut r, "SELECT count(*) FROM s.counted WHERE m > '2.10'"),
             1

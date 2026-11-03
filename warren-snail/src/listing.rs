@@ -447,7 +447,9 @@ mod tests {
 
     #[test]
     fn a_text_is_a_page_a_chunk_and_an_appended_one_writes_its_last() {
-        let text: Vec<u8> = (0..100_000u32).map(|i| b"abcdefg;\n"[i as usize % 9]).collect();
+        let text: Vec<u8> = (0..100_000u32)
+            .map(|i| b"abcdefg;\n"[i as usize % 9])
+            .collect();
         let mut pages = Vec::new();
         let (shape, _, written) = settled(&Shape::default(), chunks(&text), 1, PAGE, &mut pages);
         let leaves = text.len().div_ceil(PAGE - 17);

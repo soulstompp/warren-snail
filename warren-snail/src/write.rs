@@ -1201,7 +1201,14 @@ fn write_tables(
     let mut gone = Vec::new();
     let states = carried.map_or(&[][..], |c| &c.sequences);
     if w.format() >= crate::file::FORMAT && !root.fits_uncut(w.format())? {
-        crate::file::cut_afresh(&mut root, catalog.ddl.as_bytes(), states, 1, &mut w, &mut gone)?;
+        crate::file::cut_afresh(
+            &mut root,
+            catalog.ddl.as_bytes(),
+            states,
+            1,
+            &mut w,
+            &mut gone,
+        )?;
         crate::file::settle_tables(&mut root, w.format(), 1, &mut w, &mut gone)?;
     } else {
         root.catalog = w.place(catalog.ddl.as_bytes())?;
