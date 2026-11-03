@@ -835,8 +835,10 @@ impl Snail {
         if self.aborted {
             match st {
                 Statement::Commit | Statement::Rollback => {
+                    if let Some((began, _)) = self.begun.take() {
+                        self.root = began;
+                    }
                     self.abandon()?;
-                    self.begun = None;
                     self.aborted = false;
                     self.ended(false);
                     return Ok(Done {

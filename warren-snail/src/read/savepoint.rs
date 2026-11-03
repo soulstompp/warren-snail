@@ -116,6 +116,10 @@ impl Snail {
             self.aborted = true;
             return Ok(());
         }
+        // What it dropped named the root it staged; the transaction stands where it began.
+        if let Some((began, _)) = self.begun.as_ref() {
+            self.root = began.clone();
+        }
         self.abandon()?;
         self.aborted = self.begun.is_some();
         Ok(())
