@@ -810,7 +810,7 @@ impl Snail {
         // A statement refused fails its transaction, as one that fails as it runs does.
         // WHERE CURRENT OF a cursor finds the row it stands on by the table's key.
         let current;
-        let text = match text.to_ascii_uppercase().contains("CURRENT") {
+        let text = match super::cursor::mentions_current_of(text) {
             true => match self.current_of(text) {
                 Ok(t) => {
                     current = t;

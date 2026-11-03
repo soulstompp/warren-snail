@@ -920,7 +920,7 @@ impl Snails {
         self.resolve()?;
         // WHERE CURRENT OF a cursor finds the row it stands on by the table's key.
         let current;
-        let sql = match sql.to_ascii_uppercase().contains("CURRENT") {
+        let sql = match super::cursor::mentions_current_of(sql) {
             true => {
                 current = super::cursor::current_of(&self.catalog, &self.session.cursors, sql)?;
                 current.as_str()

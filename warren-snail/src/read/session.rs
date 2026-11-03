@@ -318,6 +318,16 @@ pub(super) fn said(
     sql: &str,
     tokens: &[sqlparser::tokenizer::Token],
 ) -> Result<Option<Said>> {
+    // Only a statement whose first word is one of theirs is read by their readers, each of which
+    // walks the statement's text.
+    let first = keyword(words(tokens).first());
+    if !matches!(
+        first.as_str(),
+        "LOCK" | "SET" | "SHOW" | "RESET" | "PREPARE" | "DECLARE" | "FETCH" | "MOVE" | "EXPLAIN"
+            | "COPY" | "EXECUTE" | "DEALLOCATE" | "CLOSE"
+    ) {
+        return Ok(None);
+    }
     if let Some(read) = super::tablelock::parse_lock(tokens) {
         let (names, mode, nowait) = read?;
         let tables = names

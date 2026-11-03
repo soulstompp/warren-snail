@@ -739,3 +739,14 @@ fn key_columns(table: &crate::catalog::Table) -> Option<Vec<usize>> {
         .or_else(|| table.orders.iter().find(plain))?;
     Some(o.levels.iter().map(|l| l.column()).collect())
 }
+
+/// Whether a statement's text holds the words CURRENT OF, in any case, white space between them: a
+/// cheap look before its words are read.
+pub(super) fn mentions_current_of(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.match_indices("CURRENT").any(|(at, w)| {
+        let rest = upper[at + w.len()..].trim_start();
+        rest.len() < upper.len() - at - w.len() && rest.starts_with("OF")
+            && !rest[2..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
