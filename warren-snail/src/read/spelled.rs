@@ -44,13 +44,24 @@ pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
 pub(crate) const SAMPLED: char = '\u{2}';
 
 /// The statement as PostgreSQL's scanner and grammar read its words, where sqlparser's tokenizer
-/// reads them otherwise, under `release`: a number in its bases and with its underscores from 16 on,
-/// a name written against it refused as trailing junk from 15 on; strings a newline apart as one string;
-/// `x ISNULL` and `x NOTNULL`; `interval(p) '…'`'s precision; a TABLESAMPLE clause carried in a call's name
-/// (`SAMPLED`); and what sqlparser takes and PostgreSQL's grammar does not, refused.
+/// reads them otherwise, under `release`: a number in its bases and with its underscores from 16
+/// on, a name written against it refused as trailing junk from 15 on; strings a newline apart as one
+/// string; `x ISNULL` and `x NOTNULL`; `interval(p) '…'`'s precision; a TABLESAMPLE clause carried
+/// in a call's name (`SAMPLED`), with a seed drawn for the statement where it names none; and what
+/// sqlparser takes and PostgreSQL's grammar does not, refused.
 pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
+    scanned_seeding(sql, release, true)
+}
+
+/// A DDL's text as `scanned` reads a statement's, a TABLESAMPLE that names no seed left to draw one
+/// each time a statement reads it: a view's.
+pub(crate) fn scanned_unseeded(sql: &str, release: u8) -> Result<Cow<'_, str>> {
+    scanned_seeding(sql, release, false)
+}
+
+fn scanned_seeding(sql: &str, release: u8, seeded: bool) -> Result<Cow<'_, str>> {
     let mut out = numbered(sql, release)?;
-    if let Some(next) = worded(&out)? {
+    if let Some(next) = worded(&out, seeded)? {
         out = Cow::Owned(next);
     }
     Ok(out)
@@ -419,7 +430,7 @@ fn finish(sql: &str, mut out: String, copied: usize) -> Cow<'_, str> {
 
 /// The statement with its words as PostgreSQL's grammar reads them; none where it needs none, or
 /// where sqlparser's tokenizer refuses it, which its parser says.
-fn worded(sql: &str) -> Result<Option<String>> {
+fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
     let lower = sql.to_ascii_lowercase();
     if !["isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>"]
         .iter()
@@ -556,7 +567,7 @@ fn worded(sql: &str) -> Result<Option<String>> {
                 return Err(near(i));
             }
             Some("TABLESAMPLE") if !prev_as => {
-                swaps.push(sampled_clause(sql, &solid, i, &near, &closed)?);
+                swaps.push(sampled_clause(sql, &solid, i, &near, &closed, seeded)?);
             }
             _ => {}
         }
@@ -613,13 +624,15 @@ fn ends_a_value(t: &Token) -> bool {
 }
 
 /// A TABLESAMPLE clause as PostgreSQL's grammar has it, written as a call of a name that carries its
-/// method: `TABLESAMPLE m (a, b) REPEATABLE (s)` as `TABLESAMPLE "\u{2}r\u{2}m"(a, b, (s))`.
+/// method: `TABLESAMPLE m (a, b) REPEATABLE (s)` as `TABLESAMPLE "\u{2}r\u{2}m"(a, b, (s))`; one naming
+/// no seed as `"\u{2}s\u{2}m"(a, b, n)`, `n` the seed drawn for the statement, or unseeded `\u{2}n`.
 fn sampled_clause(
     sql: &str,
     solid: &[&(Token, usize, usize)],
     i: usize,
     near: &dyn Fn(usize) -> Error,
     closed: &dyn Fn(usize, Token, Token) -> Option<usize>,
+    seeded: bool,
 ) -> Result<(usize, usize, String)> {
     let part = |j: usize| match solid.get(j).map(|t| &t.0) {
         Some(Token::Word(w)) => Some(match w.quote_style {
@@ -676,6 +689,12 @@ fn sampled_clause(
             'r',
             format!(", ({})", &sql[solid[after + 2].1..solid[last - 2].2]),
             solid[last - 1].2,
+        )
+    } else if seeded {
+        (
+            's',
+            format!(", {}", super::tablesample::drawn_seed()),
+            solid[after - 1].2,
         )
     } else {
         ('n', String::new(), solid[after - 1].2)

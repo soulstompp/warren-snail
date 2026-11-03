@@ -39,6 +39,7 @@ mod rest;
 pub(crate) mod serial;
 mod sets;
 mod spill;
+mod tablesample;
 mod spelled;
 mod strands;
 mod summed;
@@ -111,7 +112,7 @@ impl relations::Reads for Snail {
     }
 }
 pub use question::{instant, truth};
-pub(crate) use spelled::scanned;
+pub(crate) use spelled::scanned_unseeded;
 pub(crate) use typed::element_of as element_type;
 
 use crate::catalog::{Catalog, Table};
@@ -1585,7 +1586,7 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let _rows = handed::rows_of(&self.catalog);
         let q = &pipeline::windows::written(&spelled::between_written(q))?;
-        if relations::several(&self.catalog, q) || subqueries::held(q) {
+        if relations::several(&self.catalog, q) || subqueries::held(q) || pipeline::samples(q) {
             return relations::answer(self, q, params);
         }
         let name = pipeline::table_named(q)?;
@@ -1781,6 +1782,15 @@ impl Snail {
             keys: kept,
         };
         let (before, held_before) = (self.touched(), self.pages_held());
+        // A sample is drawn from the table read whole along its order, before anything is kept.
+        if let Some(sample) = &q.sample {
+            if kept.is_some() || !q.sides[0].is_whole() {
+                return Err(Error::new("a sample is drawn from a whole table"));
+            }
+            let mut part = self.part(&want, None)?;
+            self.keep_drawn(&mut part.plan, sample, &want)?;
+            return self.scan_part(&want, &columns, part, sink, before, held_before);
+        }
         let along = match kept {
             None => self.along_elements(q, &want, order)?,
             Some(_) => Along::Not,

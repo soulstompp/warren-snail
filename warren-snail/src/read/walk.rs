@@ -1193,6 +1193,17 @@ impl Snail {
         Ok(())
     }
 
+    /// The plan of a whole table kept to the rows a sample draws from its blocks' live rows.
+    pub(super) fn keep_drawn(
+        &self,
+        plan: &mut Plan,
+        sample: &super::tablesample::Sample,
+        want: &Want,
+    ) -> Result<()> {
+        let live: Vec<u64> = plan.reads.iter().map(|br| u64::from(br.rows)).collect();
+        self.keep_rows(plan, &sample.picks(&live), want)
+    }
+
     /// Of the pages a plan's read will read that are known now, those held the round keeps until the
     /// read ends: those of the blocks whose maps the plan holds, where any of the order's are held.
     pub(super) fn keep_held(&self, plan: &Plan, want: &Want) -> Result<()> {

@@ -623,11 +623,16 @@ fn lift_factor(
             version: None,
             partitions,
             json_path: None,
-            sample: None,
+            sample,
             index_hints,
             ..
         } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty() => {
             let n = crate::catalog::object_name(name);
+            if sample.is_some() && (visible.contains(&n) || catalog.view(&n).is_some()) {
+                return Err(Error::new(
+                    "TABLESAMPLE clause can only be applied to tables and materialized views",
+                ));
+            }
             if visible.contains(&n) {
                 return Ok(());
             }
@@ -788,8 +793,12 @@ struct Node {
 }
 
 enum What {
-    /// A table of the snail, by its place in the catalog.
-    Table { table: usize, qualifier: String },
+    /// A table of the snail, by its place in the catalog, and the TABLESAMPLE it is read under.
+    Table {
+        table: usize,
+        qualifier: String,
+        sample: Option<String>,
+    },
     /// A step made before.
     Made { name: String, qualifier: String },
     /// A function's rows, made for each row of the relations before it.
@@ -903,7 +912,13 @@ struct Laying<'a> {
 impl Laying<'_> {
     fn factor(&mut self, t: &TableFactor) -> Result<Node> {
         let at = self.columns.len();
-        let TableFactor::Table { name, alias, .. } = t else {
+        let TableFactor::Table {
+            name,
+            alias,
+            sample,
+            ..
+        } = t
+        else {
             let TableFactor::NestedJoin {
                 table_with_joins, ..
             } = t
@@ -970,6 +985,10 @@ impl Laying<'_> {
                 What::Table {
                     table: ti,
                     qualifier: q,
+                    sample: sample.as_ref().map(|k| match k {
+                        sqlparser::ast::TableSampleKind::AfterTableAlias(s)
+                        | sqlparser::ast::TableSampleKind::BeforeTableAlias(s) => s.to_string(),
+                    }),
                 },
                 cols,
             )
@@ -1684,7 +1703,7 @@ impl Reading<'_> {
             return r.each_chunk(&mut |c| each(c, None));
         }
         match &node.what {
-            What::Table { table, qualifier } => {
+            What::Table { table, qualifier, .. } => {
                 self.alone(node, *table, qualifier, preserved, each)
             }
             What::Made { name, .. } => {
@@ -1881,7 +1900,15 @@ impl Reading<'_> {
     ) -> Result<()> {
         let catalog = self.reads.catalog();
         let t = &catalog.tables[table];
-        let keep = self.keep_of(node).cloned();
+        // A sample is drawn from the whole table: no condition, key or strand narrows its read.
+        let sample = match &node.what {
+            What::Table { sample, .. } => sample.clone(),
+            _ => None,
+        };
+        let keep = match sample {
+            Some(_) => None,
+            None => self.keep_of(node).cloned(),
+        };
         let mut wanted: Vec<usize> = (node.at..node.at + node.width)
             .filter(|&p| self.needed(p) || keep.as_ref().is_some_and(|k| k.places.contains(&p)))
             .collect();
@@ -1901,8 +1928,11 @@ impl Reading<'_> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let from = format!("{} {}", quote_name(&t.name), quote(qualifier));
-        let conds: Vec<&Expr> = match preserved {
+        let from = match &sample {
+            Some(s) => format!("{} {} {s}", quote_name(&t.name), quote(qualifier)),
+            None => format!("{} {}", quote_name(&t.name), quote(qualifier)),
+        };
+        let conds: Vec<&Expr> = match preserved && sample.is_none() {
             true => self.own_wheres(node),
             false => Vec::new(),
         };
@@ -1915,7 +1945,7 @@ impl Reading<'_> {
         let strand = self
             .along
             .as_ref()
-            .filter(|a| std::ptr::eq(a.node, node))
+            .filter(|a| sample.is_none() && std::ptr::eq(a.node, node))
             .map(|a| (a.strand.clone(), a.at.clone()));
         let at = along(t)
             .and_then(|c| stored(t).position(|x| x == c))
@@ -1979,7 +2009,10 @@ impl Reading<'_> {
     ) -> Result<bool> {
         let mut leaves = Vec::new();
         node.leaves(&mut leaves);
-        if leaves.iter().any(|l| !matches!(l.what, What::Table { .. })) {
+        if leaves
+            .iter()
+            .any(|l| !matches!(l.what, What::Table { sample: None, .. }))
+        {
             return Ok(false);
         }
         // Stopped for its room, the round has asked this already.
@@ -1992,7 +2025,7 @@ impl Reading<'_> {
         let catalog = self.reads.catalog();
         let mut wanted: Vec<(usize, String, String)> = Vec::new();
         for l in &leaves {
-            let What::Table { table, qualifier } = &l.what else {
+            let What::Table { table, qualifier, .. } = &l.what else {
                 unreachable!()
             };
             let t = &catalog.tables[*table];
@@ -2005,7 +2038,7 @@ impl Reading<'_> {
         }
         if wanted.is_empty() {
             let l = leaves[0];
-            let What::Table { table, qualifier } = &l.what else {
+            let What::Table { table, qualifier, .. } = &l.what else {
                 unreachable!()
             };
             let t = &catalog.tables[*table];
@@ -2076,7 +2109,7 @@ impl Reading<'_> {
             }
             node = left;
         }
-        let What::Table { table, qualifier } = &node.what else {
+        let What::Table { table, qualifier, .. } = &node.what else {
             return Ok(None);
         };
         let catalog = self.reads.catalog();
@@ -2148,7 +2181,7 @@ impl Reading<'_> {
     fn written(&self, node: &Node, _first: bool) -> Result<Option<String>> {
         let catalog = self.reads.catalog();
         Ok(Some(match &node.what {
-            What::Table { table, qualifier } => format!(
+            What::Table { table, qualifier, .. } => format!(
                 "{} {}",
                 quote_name(&catalog.tables[*table].name),
                 quote(qualifier)
@@ -3550,7 +3583,7 @@ fn select_step(
         }
         for l in &leaves {
             match &l.what {
-                What::Table { table, qualifier } => {
+                What::Table { table, qualifier, .. } => {
                     let t = &catalog.tables[*table];
                     let primary: Vec<String> = t
                         .orders

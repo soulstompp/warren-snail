@@ -905,6 +905,7 @@ fn strand_question(strand: &Table, side: Side) -> Question {
         after: Vec::new(),
         select,
         order: Vec::new(),
+        sample: None,
     }
 }
 
@@ -1466,6 +1467,7 @@ impl Snail {
                 after: Vec::new(),
                 select,
                 order: Vec::new(),
+                sample: None,
             };
             let mut blocks = Blocks {
                 table,

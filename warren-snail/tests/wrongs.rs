@@ -113,6 +113,76 @@ fn order_by_using_sorts_as_its_operator_does_wherever_it_stands() {
 }
 
 #[test]
+fn tablesample_takes_none_at_0_every_row_at_100_and_refuses_in_postgresql_s_words() {
+    let mut s = Snail::open(&made("sample")).unwrap();
+    for (sql, pg) in [
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (0)", "0"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE BERNOULLI (0)", "0"),
+        ("SELECT count(*) FROM s.a x TABLESAMPLE SYSTEM (0)", "0"),
+        ("SELECT id FROM s.a TABLESAMPLE BERNOULLI (0)", ""),
+        ("SELECT a.id FROM s.a a TABLESAMPLE SYSTEM (0) JOIN s.t t TABLESAMPLE SYSTEM (0) ON t.id = a.id", ""),
+        ("WITH x AS (SELECT id FROM s.a TABLESAMPLE SYSTEM (0)) SELECT count(*) FROM x", "0"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (0) WHERE id = 1", "0"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (100)", "6"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE pg_catalog.bernoulli (100) REPEATABLE (1)", "6"),
+        ("SELECT id FROM s.a TABLESAMPLE BERNOULLI (100) WHERE g = 10 ORDER BY id", "1,2"),
+        ("SELECT g, count(*) FROM s.a TABLESAMPLE BERNOULLI (100) GROUP BY g ORDER BY g", "10|2,20|2,30|2"),
+        ("SELECT t.id FROM s.a a JOIN s.t t TABLESAMPLE SYSTEM (100) ON t.id = a.id ORDER BY 1", "1,2,3,4,5"),
+    ] {
+        assert_eq!(column(&mut s, sql), pg, "{sql}");
+    }
+    for (sql, pg) in [
+        ("SELECT count(*) FROM s.a TABLESAMPLE foo (1)", "tablesample method foo does not exist"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE system_rows (10)", "tablesample method system_rows does not exist"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (101)", "sample percentage must be between 0 and 100"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (-1)", "sample percentage must be between 0 and 100"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM ('NaN')", "sample percentage must be between 0 and 100"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (NULL)", "TABLESAMPLE parameter cannot be null"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (1, 2)", "tablesample method system requires 1 argument, not 2"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM ('a')", "invalid input syntax for type real: \"a\""),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (50) REPEATABLE (NULL)", "TABLESAMPLE REPEATABLE parameter cannot be null"),
+        ("SELECT count(*) FROM s.a TABLESAMPLE SYSTEM (50) REPEATABLE ('x')", "invalid input syntax for type double precision: \"x\""),
+        (
+            "WITH x AS (SELECT id FROM s.a) SELECT count(*) FROM x TABLESAMPLE SYSTEM (10)",
+            "TABLESAMPLE clause can only be applied to tables and materialized views",
+        ),
+        ("SELECT count(*) FROM (SELECT id FROM s.a) y TABLESAMPLE SYSTEM (10)", "syntax error at or near \"TABLESAMPLE\""),
+    ] {
+        assert_eq!(refused(&mut s, sql), pg, "{sql}");
+    }
+}
+
+#[test]
+fn a_sample_draws_by_the_counts_and_reads_only_the_pages_of_what_it_draws() {
+    let n = 16_384i64;
+    let path = tmp("wrongs-drawn.snail");
+    let ddl = "CREATE TABLE s.r (id bigint PRIMARY KEY, v integer NOT NULL);";
+    let ids: Vec<i64> = (0..n).collect();
+    let rows = Rows { columns: vec![ints(&ids), ints(&ids)] };
+    write(&path, &Catalog::parse(ddl).unwrap(), &[("s.r".into(), rows)]).unwrap();
+    let mut s = weather::fresh(&path);
+    let asked = |s: &mut Snail, clause: &str| {
+        let sql = format!("SELECT count(*) AS n, sum(v) AS v FROM s.r TABLESAMPLE {clause}");
+        let (b, round) = s.ask(&sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let at = |c: usize| arrow::util::display::array_value_to_string(b.column(c), 0).unwrap();
+        (at(0).parse::<i64>().unwrap(), at(1), round)
+    };
+    let (all, _, whole) = asked(&mut s, "SYSTEM (100)");
+    assert_eq!(all, n);
+    // Each row on its own: about a quarter, the same rows for the same seed, others for another.
+    let (b7, v7, _) = asked(&mut s, "BERNOULLI (25) REPEATABLE (7)");
+    assert!((3_800..4_400).contains(&b7), "{b7}");
+    assert_eq!(asked(&mut s, "BERNOULLI (25) REPEATABLE (7)").1, v7);
+    assert_ne!(asked(&mut s, "BERNOULLI (25) REPEATABLE (8)").1, v7);
+    assert_ne!(asked(&mut s, "BERNOULLI (50)").1, asked(&mut s, "BERNOULLI (50)").1);
+    // A block at a time: whole blocks, and only their pages read.
+    let (s7, _, round) = asked(&mut s, "SYSTEM (25) REPEATABLE (7)");
+    assert!(s7 > 0 && s7 < n && s7 % 1_024 == 0, "{s7}");
+    assert!(round.column_pages_read < whole.column_pages_read, "{round:?} against {whole:?}");
+    assert_eq!(round.column_pages_read, round.column_pages_predicted, "{round:?}");
+}
+
+#[test]
 fn words_are_read_as_postgresql_s_scanner_reads_them() {
     let mut s = Snail::open(&made("scanned")).unwrap();
     for (sql, pg) in [

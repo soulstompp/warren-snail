@@ -1428,7 +1428,7 @@ pub(crate) fn index_extras(tokens: &[Token]) -> Result<IndexExtras> {
 
 /// The statements of a DDL, split on their semicolons by sqlparser's PostgreSQL tokenizer.
 pub(crate) fn statements(ddl: &str) -> Result<Vec<Vec<Token>>> {
-    let ddl = crate::read::scanned(ddl, crate::regs::LATEST)?;
+    let ddl = crate::read::scanned_unseeded(ddl, crate::regs::LATEST)?;
     let tokens = crate::read::image::tokens(&ddl)?;
     let mut out = vec![Vec::new()];
     for t in tokens.into_iter().map(|t| t.token) {

@@ -410,6 +410,7 @@ impl Walk<'_> {
                 version,
                 partitions,
                 json_path,
+                sample,
                 index_hints,
                 ..
             } => {
@@ -429,6 +430,9 @@ impl Walk<'_> {
                     return Err(near("USE"));
                 }
                 if let Some(a) = args {
+                    if sample.is_some() {
+                        return Err(near("TABLESAMPLE"));
+                    }
                     if a.settings.is_some() {
                         return Err(near("SETTINGS"));
                     }

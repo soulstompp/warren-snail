@@ -7954,8 +7954,41 @@ pub fn reads_per_row(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
             .is_some_and(|w| !by_rows.is_empty() && operated(w, &by_rows, table))
 }
 
+/// Whether a FROM of the query, or of a query its FROM or WITH holds, draws a sample of a table:
+/// read as a step reads it, among the relations it meets.
+pub(crate) fn samples(q: &Query) -> bool {
+    fn body(b: &SetExpr) -> bool {
+        match b {
+            SetExpr::Select(s) => s.from.iter().any(|t| {
+                std::iter::once(&t.relation)
+                    .chain(t.joins.iter().map(|j| &j.relation))
+                    .any(factor)
+            }),
+            SetExpr::Query(q) => samples(q),
+            SetExpr::SetOperation { left, right, .. } => body(left) || body(right),
+            _ => false,
+        }
+    }
+    fn factor(f: &TableFactor) -> bool {
+        match f {
+            TableFactor::Table { sample, .. } => sample.is_some(),
+            TableFactor::Derived { subquery, .. } => samples(subquery),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => std::iter::once(&table_with_joins.relation)
+                .chain(table_with_joins.joins.iter().map(|j| &j.relation))
+                .any(factor),
+            _ => false,
+        }
+    }
+    q.with
+        .as_ref()
+        .is_some_and(|w| w.cte_tables.iter().any(|c| samples(&c.query)))
+        || body(&q.body)
+}
+
 pub fn is_pipeline(q: &Query) -> bool {
-    if q.with.is_some() {
+    if q.with.is_some() || samples(q) {
         return true;
     }
     let SetExpr::Select(s) = q.body.as_ref() else {

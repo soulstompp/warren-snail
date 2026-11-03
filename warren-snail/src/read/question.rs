@@ -510,6 +510,8 @@ pub struct Question {
     pub select: Select,
     /// How the answer is ordered: by which of its columns, outermost first.
     pub order: Vec<Sort>,
+    /// The rows of its one table a TABLESAMPLE draws, where it names one: read a step at a time.
+    pub(crate) sample: Option<super::tablesample::Sample>,
 }
 
 impl Question {
@@ -1822,6 +1824,23 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             || side.texts.iter().any(TextCond::is_empty)
             || side.nulls.iter().any(|&(c, null)| null && compared(c));
     }
+    // A sample is drawn from a table read alone, of its rows, as a step reads it.
+    let sampled: Vec<&sqlparser::ast::TableSampleKind> = s
+        .from
+        .iter()
+        .flat_map(|t| std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)))
+        .filter_map(|f| match f {
+            TableFactor::Table { sample: Some(k), .. } => Some(k),
+            _ => None,
+        })
+        .collect();
+    let sample = match sampled.as_slice() {
+        [] => None,
+        [k] if sides.len() == 1 && matches!(select, Select::Rows(_)) && order.is_empty() => {
+            Some(super::tablesample::read(k)?)
+        }
+        _ => return Err(Error::new("a TABLESAMPLE is read in a step")),
+    };
     Ok(Question {
         sides,
         meets,
@@ -1830,6 +1849,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         after,
         select,
         order,
+        sample,
     })
 }
 
