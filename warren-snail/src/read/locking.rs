@@ -565,8 +565,7 @@ impl Snail {
             false => self.locked_answer(&l, order, params),
         };
         if answered.is_err() && self.begun.is_some() {
-            self.abandon()?;
-            self.aborted = true;
+            self.failed()?;
         } else if self.begun.is_none() {
             self.let_go_blocks()?;
         }
@@ -587,6 +586,9 @@ impl Snail {
             .expect("a snail open to write")
             .file()
             .try_clone()?;
+        for t in &plan.locked {
+            self.lock_table(t.table, super::tablelock::Mode::RowShare, false)?;
+        }
         for t in &plan.locked {
             self.take_bytes(&[(lock::lockers_byte(t.table), true)], Waiting::Try)?;
         }

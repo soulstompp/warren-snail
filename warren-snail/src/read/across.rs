@@ -155,6 +155,9 @@ pub struct Snails {
     /// The snails the transaction under way has written, in the order its statements first wrote
     /// them: the first decides.
     written: Vec<usize>,
+    /// The savepoints of the transaction under way, oldest first, each with the snails it had
+    /// written then.
+    savepoints: Vec<(String, Vec<usize>)>,
     stop: Option<StopAcross>,
     /// Run once, after the first snail's root is read in the next round's first pass: for the tests
     /// of a commit landing between the passes.
@@ -261,6 +264,7 @@ impl Snails {
             begun: false,
             aborted: false,
             written: Vec::new(),
+            savepoints: Vec::new(),
             stop: None,
             between: None,
             writing,
@@ -911,8 +915,26 @@ impl Snails {
 
     fn execute_across(&mut self, sql: &str) -> Result<Done> {
         self.resolve()?;
-        let st = statement::parse(&self.catalog, sql)?;
-        if self.aborted && !matches!(st, Statement::Commit | Statement::Rollback) {
+        let st = match statement::parse(&self.catalog, sql) {
+            Ok(st) => st,
+            Err(e) => {
+                if self.begun && !self.aborted {
+                    self.failed()?;
+                }
+                return Err(e);
+            }
+        };
+        if self.aborted
+            && !matches!(
+                st,
+                Statement::Commit
+                    | Statement::Rollback
+                    | Statement::Session(
+                        super::session::Said::RollbackTo { .. }
+                            | super::session::Said::Chain { .. }
+                    )
+            )
+        {
             return Err(Error::new(super::change::ABORTED));
         }
         // A statement alone, at a session's SERIALIZABLE, is a transaction that ends with it.
@@ -976,6 +998,7 @@ impl Snails {
                 "a table is declared on its own snail: open it alone to write",
             )),
             Statement::Setting { .. } => self.snails[0].execute(sql),
+            Statement::Session(said) => self.said_across(said, sql),
             Statement::Question { .. } => {
                 Err(Error::new("a SELECT across snails is a question: ask it"))
             }
@@ -1061,15 +1084,126 @@ impl Snails {
         }
     }
 
+    /// A statement failed in the transaction across them: on every snail, as each fails one, what was
+    /// done since its newest savepoint let go, or, with none, the transaction takes only its end.
+    fn failed(&mut self) -> Result<()> {
+        for s in &mut self.snails {
+            if !s.aborted {
+                s.failed()?;
+            }
+            s.aborted = true;
+        }
+        self.aborted = true;
+        if let Some((_, w)) = self.savepoints.last() {
+            self.written = w.clone();
+        }
+        Ok(())
+    }
+
+    /// A statement of the session's own across them: a savepoint's on every snail, a chained end,
+    /// LOCK TABLE on the snail holding each table.
+    fn said_across(&mut self, said: super::session::Said, sql: &str) -> Result<Done> {
+        use super::session::Said;
+        let outside =
+            |what: &str| Error::new(format!("{what} can only be used in transaction blocks"));
+        let every = |me: &mut Snails| -> Result<Done> {
+            let mut done = Done::default();
+            for s in &mut me.snails {
+                done = s.execute(sql)?;
+            }
+            Ok(done)
+        };
+        let named = |me: &mut Snails, name: &str| -> Result<usize> {
+            me.savepoints
+                .iter()
+                .rposition(|(n, _)| n == name)
+                .ok_or_else(|| Error::new(format!("savepoint \"{name}\" does not exist")))
+        };
+        let ran = match said {
+            Said::Savepoint { name } => {
+                if !self.begun {
+                    return Err(outside("SAVEPOINT"));
+                }
+                let done = every(self);
+                if done.is_ok() {
+                    self.savepoints.push((name, self.written.clone()));
+                }
+                done
+            }
+            Said::RollbackTo { name } => {
+                if !self.begun {
+                    return Err(outside("ROLLBACK TO SAVEPOINT"));
+                }
+                named(self, &name).and_then(|at| {
+                    let done = every(self)?;
+                    self.savepoints.truncate(at + 1);
+                    self.written = self.savepoints[at].1.clone();
+                    self.aborted = false;
+                    Ok(done)
+                })
+            }
+            Said::Release { name } => {
+                if !self.begun {
+                    return Err(outside("RELEASE SAVEPOINT"));
+                }
+                named(self, &name).and_then(|at| {
+                    let done = every(self)?;
+                    self.savepoints.truncate(at);
+                    Ok(done)
+                })
+            }
+            Said::Chain { commit } => {
+                let what = if commit { "COMMIT" } else { "ROLLBACK" };
+                if !self.begun {
+                    return Err(Error::new(format!(
+                        "{what} AND CHAIN can only be used in transaction blocks"
+                    )));
+                }
+                let modes = self.snails[0].levels.chained();
+                let ended = self.execute_across(what)?;
+                let begin = super::statement::begin_text(modes);
+                self.execute_across(&begin)?;
+                return Ok(ended);
+            }
+            Said::Lock {
+                tables,
+                mode,
+                nowait,
+            } => {
+                if !self.begun {
+                    return Err(outside("LOCK TABLE"));
+                }
+                let mut by: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+                for t in tables {
+                    by.entry(self.at[t].0)
+                        .or_default()
+                        .push(self.catalog.tables[t].name.clone());
+                }
+                let mut done = Done::default();
+                for (i, names) in by {
+                    let text = format!(
+                        "LOCK TABLE {} IN {} MODE{}",
+                        names.join(", "),
+                        mode.words(),
+                        if nowait { " NOWAIT" } else { "" }
+                    );
+                    done = self.snails[i].execute(&text)?;
+                }
+                Ok(done)
+            }
+        };
+        if ran.is_err() && self.begun && !self.aborted {
+            self.failed()?;
+        }
+        ran
+    }
+
     /// One statement on one snail; in a transaction, one that fails fails the transaction on every
     /// snail.
     fn run(&mut self, i: usize, sql: &str) -> Result<Done> {
         let done = self.snails[i].execute(sql);
         if done.is_err() && self.begun {
-            self.aborted = true;
-            for s in &mut self.snails {
-                s.aborted = true;
-            }
+            self.failed()?;
         }
         done
     }
@@ -1079,12 +1213,13 @@ impl Snails {
         self.begun = false;
         self.aborted = false;
         self.written.clear();
+        self.savepoints.clear();
         let mut first = Ok(());
         for s in &mut self.snails {
             s.aborted = false;
             if let Some((root, _)) = s.begun.take() {
                 s.root = root;
-                s.levels.end(false);
+                s.ended(false);
             }
             let r = s.abandon();
             if first.is_ok() {

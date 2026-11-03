@@ -129,6 +129,9 @@ pub enum Statement {
     Question {
         question: String,
     },
+    /// A statement of the session's own: a savepoint's, an end that chains the next transaction,
+    /// LOCK TABLE, a setting's, a prepared statement's, a cursor's, COPY or EXPLAIN.
+    Session(super::session::Said),
 }
 
 /// The isolation levels the snail runs: READ COMMITTED, which PostgreSQL also runs READ UNCOMMITTED
@@ -205,11 +208,29 @@ impl Levels {
     /// Modes named outside BEGIN, `begun` whether a transaction is: SET TRANSACTION's, which outside
     /// a transaction does nothing, and inside one, after its first read, changes neither its level
     /// nor READ ONLY to READ WRITE, and takes no [NOT] DEFERRABLE; or SET SESSION CHARACTERISTICS's.
-    pub(crate) fn set(&mut self, modes: Modes, at: Isolated, begun: bool) -> Result<()> {
+    /// In a savepoint, `sub`, as in a subtransaction of PostgreSQL's, neither the level nor [NOT]
+    /// DEFERRABLE is set, nor READ WRITE in a transaction READ ONLY.
+    pub(crate) fn set(&mut self, modes: Modes, at: Isolated, begun: bool, sub: bool) -> Result<()> {
         match at {
             Isolated::Transaction if begun => {
+                let level = modes.level.is_some_and(|l| l != self.transaction.level);
+                if level && !self.read && sub {
+                    return Err(Error::new(
+                        "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+                    ));
+                }
+                if modes.deferrable.is_some() && sub {
+                    return Err(Error::new(
+                        "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+                    ));
+                }
+                if modes.read_only == Some(false) && self.transaction.read_only && sub {
+                    return Err(Error::new(
+                        "cannot set transaction read-write mode inside a read-only transaction",
+                    ));
+                }
                 if self.read {
-                    if modes.level.is_some_and(|l| l != self.transaction.level) {
+                    if level {
                         return Err(Error::new(
                             "SET TRANSACTION ISOLATION LEVEL must be called before any query",
                         ));
@@ -270,6 +291,45 @@ impl Levels {
             self.session = self.session_at_begin;
         }
     }
+
+    /// The modes as a savepoint kept them, put back: what SET TRANSACTION and SET SESSION
+    /// CHARACTERISTICS named since is undone, and the transaction's first read stays taken.
+    pub(crate) fn back_to(&mut self, kept: &Levels) {
+        self.session = kept.session;
+        self.transaction = kept.transaction;
+    }
+
+    /// The modes the transaction under way runs as, as BEGIN would name them: what COMMIT AND
+    /// CHAIN and ROLLBACK AND CHAIN begin the next with.
+    pub(crate) fn chained(&self) -> Modes {
+        Modes {
+            level: Some(self.transaction.level),
+            read_only: Some(self.transaction.read_only),
+            deferrable: Some(self.transaction.deferrable),
+        }
+    }
+
+    /// What `SHOW` gives for the transaction's modes and the session's defaults, by the names
+    /// PostgreSQL's settings take: none for any other name.
+    pub(crate) fn shown(&self, name: &str, begun: bool) -> Option<&'static str> {
+        let level = |l: Isolation| match l {
+            Isolation::ReadUncommitted => "read uncommitted",
+            Isolation::ReadCommitted => "read committed",
+            Isolation::RepeatableRead => "repeatable read",
+            Isolation::Serializable => "serializable",
+        };
+        let truth = |b: bool| if b { "on" } else { "off" };
+        let now = self.of(begun);
+        Some(match name {
+            "transaction_isolation" => level(now.level),
+            "transaction_read_only" => truth(now.read_only),
+            "transaction_deferrable" => truth(now.deferrable),
+            "default_transaction_isolation" => level(self.session.level),
+            "default_transaction_read_only" => truth(self.session.read_only),
+            "default_transaction_deferrable" => truth(self.session.deferrable),
+            _ => return None,
+        })
+    }
 }
 
 impl Statement {
@@ -291,8 +351,28 @@ impl Statement {
             Statement::Constraints { .. } => "SET CONSTRAINTS",
             Statement::Setting { .. } => "SET",
             Statement::Question { .. } => "SELECT",
+            Statement::Session(s) => s.kind(),
         }
     }
+}
+
+/// The BEGIN that begins a transaction of `modes`.
+pub(crate) fn begin_text(modes: Modes) -> String {
+    let level = match modes.level.unwrap_or_default() {
+        Isolation::ReadUncommitted => "READ UNCOMMITTED",
+        Isolation::ReadCommitted => "READ COMMITTED",
+        Isolation::RepeatableRead => "REPEATABLE READ",
+        Isolation::Serializable => "SERIALIZABLE",
+    };
+    let rw = match modes.read_only {
+        Some(true) => "READ ONLY",
+        _ => "READ WRITE",
+    };
+    let deferrable = match modes.deferrable {
+        Some(true) => "DEFERRABLE",
+        _ => "NOT DEFERRABLE",
+    };
+    format!("BEGIN ISOLATION LEVEL {level}, {rw}, {deferrable}")
 }
 
 fn refused(what: &str) -> Error {
@@ -1066,6 +1146,9 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         let (names, deferred) = read?;
         return Ok(Statement::Constraints { names, deferred });
     }
+    if let Some(said) = super::session::said(catalog, sql, &tokens)? {
+        return Ok(Statement::Session(said));
+    }
     if tokens.iter().any(|t| matches!(t, sqlparser::tokenizer::Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("overriding"))) {
         return Err(refused("OVERRIDING SYSTEM VALUE or USER VALUE"));
     }
@@ -1093,6 +1176,31 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             chain: false,
             savepoint: None,
         } => Ok(Statement::Rollback),
+        Sql::Commit { chain: true, .. } => Ok(Statement::Session(super::session::Said::Chain {
+            commit: true,
+        })),
+        Sql::Rollback {
+            chain: true,
+            savepoint: None,
+        } => Ok(Statement::Session(super::session::Said::Chain {
+            commit: false,
+        })),
+        Sql::Rollback {
+            chain: true,
+            savepoint: Some(_),
+        } => Err(Error::new("syntax error at or near \"TO\"")),
+        Sql::Rollback {
+            savepoint: Some(name),
+            ..
+        } => Ok(Statement::Session(super::session::Said::RollbackTo {
+            name: ident(name),
+        })),
+        Sql::Savepoint { name } => Ok(Statement::Session(super::session::Said::Savepoint {
+            name: ident(name),
+        })),
+        Sql::ReleaseSavepoint { name } => Ok(Statement::Session(super::session::Said::Release {
+            name: ident(name),
+        })),
         Sql::Insert(i) => insert(catalog, i),
         Sql::Update(u) => {
             if u.from.is_some() {

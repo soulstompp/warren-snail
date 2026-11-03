@@ -1196,11 +1196,18 @@ impl Reader {
         self.staged.borrow().next
     }
 
-    /// Drops the pages staged since `mark`.
+    /// Drops the pages staged since `mark`, numbering the pages staged after them afresh, as a
+    /// statement run again stages them.
     pub(crate) fn staged_back_to(&self, mark: u64) {
         let mut s = self.staged.borrow_mut();
         s.pages.split_off(&(STAGED + mark));
         s.next = mark;
+    }
+
+    /// Drops the pages staged since `mark`, as a savepoint rolled back drops them: the pages staged
+    /// after them never take their numbers.
+    pub(crate) fn staged_drop_since(&self, mark: u64) {
+        self.staged.borrow_mut().pages.split_off(&(STAGED + mark));
     }
 
     pub fn read(&self, start: u64, pages: u64) -> Result<Vec<u8>> {

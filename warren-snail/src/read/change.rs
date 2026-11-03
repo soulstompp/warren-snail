@@ -129,6 +129,7 @@ pub(super) struct Mark {
 
 /// The catalog a statement or a transaction declared: the catalog it began from, its DDL now, and
 /// the orders it made, each empty until rows come.
+#[derive(Clone)]
 pub(super) struct Declared {
     from: Extent,
     ddl: String,
@@ -794,26 +795,42 @@ impl Snail {
                 written_out.as_str()
             }
         };
-        let st = statement::parse(&self.catalog, text)?;
+        // A statement refused fails its transaction, as one that fails as it runs does.
+        let st = match statement::parse(&self.catalog, text) {
+            Ok(st) => st,
+            Err(e) => {
+                if self.begun.is_some() && !self.aborted {
+                    self.failed()?;
+                }
+                return Err(e);
+            }
+        };
         // A transaction one of whose statements failed takes no statement but its end, which rolls
-        // it back, as PostgreSQL does.
+        // it back, or a ROLLBACK TO one of its savepoints, as PostgreSQL does.
         if self.aborted {
-            return match st {
+            match st {
                 Statement::Commit | Statement::Rollback => {
+                    self.abandon()?;
                     self.begun = None;
                     self.aborted = false;
-                    self.levels.end(false);
-                    Ok(Done {
+                    self.ended(false);
+                    return Ok(Done {
                         statement: "ROLLBACK",
                         generation: self.root.generation,
                         ..Default::default()
-                    })
+                    });
                 }
-                _ => Err(Error::new(ABORTED)),
-            };
+                Statement::Session(
+                    super::session::Said::RollbackTo { .. } | super::session::Said::Chain { .. },
+                ) => {}
+                _ => return Err(Error::new(ABORTED)),
+            }
         }
         if let Statement::Question { .. } = st {
             return self.answered(sql, params);
+        }
+        if let Statement::Session(said) = st {
+            return self.said(said, params);
         }
         // A transaction READ ONLY takes no write, in PostgreSQL's words.
         let begun = self.begun.is_some();
@@ -827,8 +844,7 @@ impl Snail {
             };
             if let Some(what) = what {
                 if begun {
-                    self.abandon()?;
-                    self.aborted = true;
+                    self.failed()?;
                 }
                 return Err(Error::new(format!(
                     "cannot execute {what} in a read-only transaction"
@@ -852,8 +868,7 @@ impl Snail {
         // that reads takes the transaction's snapshot, its marks with it.
         if snapshot && self.levels.serializable(begun) {
             if let Err(e) = self.serial_snapshot(begun) {
-                self.abandon()?;
-                self.aborted = begun;
+                self.failed()?;
                 return Err(e);
             }
             self.held = begun;
@@ -904,7 +919,10 @@ impl Snail {
                 } else {
                     Ok(())
                 })
-                .and_then(|_| self.levels.set(modes, at, begun));
+                .and_then(|_| {
+                    self.levels
+                        .set(modes, at, begun, !self.savepoints.is_empty())
+                });
                 if let Err(e) = set {
                     self.aborted = begun;
                     return Err(e);
@@ -921,12 +939,12 @@ impl Snail {
                 if let Err(e) = self.commit_checked() {
                     let (began, _) = self.begun.take().expect("a transaction begun");
                     self.root = began;
-                    self.levels.end(false);
+                    self.ended(false);
                     self.abandon()?;
                     return Err(e);
                 }
                 let (_, changed) = self.begun.take().expect("a transaction begun");
-                self.levels.end(true);
+                self.ended(true);
                 changed
             }
             Statement::Rollback => {
@@ -935,7 +953,7 @@ impl Snail {
                     .take()
                     .ok_or_else(|| Error::new("no transaction is begun"))?;
                 self.root = root;
-                self.levels.end(false);
+                self.ended(false);
                 self.abandon()?;
                 false
             }
@@ -944,8 +962,7 @@ impl Snail {
                 // alone.
                 if !matches!(st, Statement::Constraints { .. }) {
                     if let Err(e) = self.writes_marked(&self.root) {
-                        self.abandon()?;
-                        self.aborted = self.begun.is_some();
+                        self.failed()?;
                         return Err(e);
                     }
                 }
@@ -984,8 +1001,7 @@ impl Snail {
                             // block, and is refused.
                             self.back_to(&mark);
                             if self.held {
-                                self.abandon()?;
-                                self.aborted = self.begun.is_some();
+                                self.failed()?;
                                 return Err(super::beside::concurrent_update());
                             }
                             if self.begun.is_some() {
@@ -996,8 +1012,7 @@ impl Snail {
                         }
                         Ok(changed) => break changed,
                         Err(e) => {
-                            self.abandon()?;
-                            self.aborted = self.begun.is_some();
+                            self.failed()?;
                             return Err(e);
                         }
                     }
@@ -1046,8 +1061,7 @@ impl Snail {
             Ok((batch, _)) => batch,
             Err(e) => {
                 if self.begun.is_some() && !self.aborted {
-                    self.abandon()?;
-                    self.aborted = true;
+                    self.failed()?;
                 }
                 return Err(e);
             }
@@ -1081,8 +1095,7 @@ impl Snail {
         // Refused in a transaction, it fails the transaction, as a statement refused does.
         let marked = self.marked(source);
         if marked.is_err() && self.begun.is_some() {
-            self.abandon()?;
-            self.aborted = true;
+            self.failed()?;
         }
         marked
     }
@@ -1240,7 +1253,8 @@ impl Snail {
             | Statement::Rollback
             | Statement::Setting { .. }
             | Statement::Isolation { .. }
-            | Statement::Question { .. } => {
+            | Statement::Question { .. }
+            | Statement::Session(_) => {
                 unreachable!(
                     "a transaction's own statements, a setting and a question write no rows"
                 )
@@ -1719,6 +1733,7 @@ impl Snail {
     /// lets go of the blocks it locked.
     pub(super) fn abandon(&mut self) -> Result<()> {
         self.rebased.clear();
+        self.savepoints.clear();
         self.own.clear();
         self.own_from = None;
         self.first_bytes.clear();
@@ -1744,6 +1759,7 @@ impl Snail {
         for b in std::mem::take(&mut self.row_locks).into_keys() {
             self.unlock_byte(b)?;
         }
+        self.let_go_tables()?;
         self.unnamed.clear();
         self.held = false;
         self.comparing.set(false);
@@ -2311,6 +2327,8 @@ impl Snail {
                 Change::Insert(_) => None,
             })
             .collect();
+        // A writer of the table holds its lock in ROW EXCLUSIVE, as PostgreSQL's does.
+        self.lock_table(ti, super::tablelock::Mode::RowExclusive, false)?;
         self.name_rows(ti, &named)?;
         // A transaction of one snapshot writes the version it reads; its commit writes the newest.
         if self.held {
@@ -2799,13 +2817,9 @@ impl Snail {
         let mut dead: std::collections::BTreeSet<u32> = map.dead.iter().copied().collect();
         let types: Vec<ColumnType> = order.columns.iter().map(|&c| table.columns[c].ty).collect();
         let holds = |p: usize, values: &[Datum]| -> bool {
-            columns
-                .iter()
-                .zip(values)
-                .zip(&types)
-                .all(|((v, d), &ty)| {
-                    super::image::held_alike(&[datum_typed(v, p, ty)], std::slice::from_ref(d))
-                })
+            columns.iter().zip(values).zip(&types).all(|((v, d), &ty)| {
+                super::image::held_alike(&[datum_typed(v, p, ty)], std::slice::from_ref(d))
+            })
         };
         let level_slots: Vec<usize> = order
             .levels

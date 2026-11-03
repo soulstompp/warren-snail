@@ -13,6 +13,7 @@ mod calls;
 mod change;
 mod clock;
 mod collate;
+mod cursor;
 pub(crate) mod elements;
 pub(crate) mod fill;
 pub(crate) mod foreign;
@@ -32,17 +33,21 @@ mod pipeline;
 mod point;
 mod populate;
 mod prefix;
+mod prepared;
 mod question;
 mod ranges;
 mod relations;
 mod rest;
+mod savepoint;
 pub(crate) mod serial;
+mod session;
 mod sets;
 mod spill;
 mod tablesample;
 mod spelled;
 mod strands;
 mod summed;
+pub mod tablelock;
 pub mod statement;
 mod subqueries;
 mod together;
@@ -448,6 +453,10 @@ pub struct Snail {
     own_from: Option<Root>,
     committing: bool,
     first_bytes: std::collections::BTreeMap<u64, u64>,
+    /// The savepoints of the transaction under way, oldest first.
+    savepoints: Vec<savepoint::Savepoint>,
+    /// What the session holds between its statements.
+    session: session::Session,
 }
 
 /// A block a round found a page or more of waste in: its table and order, its first key, and its
@@ -716,6 +725,8 @@ impl Snail {
             own_from: None,
             committing: false,
             first_bytes: Default::default(),
+            savepoints: Vec::new(),
+            session: Default::default(),
         })
     }
 
@@ -1436,8 +1447,7 @@ impl Snail {
         match &asked {
             Err(_) if self.levels.serializable(begun) && self.writer.is_some() => {
                 if !self.aborted {
-                    self.abandon()?;
-                    self.aborted = begun;
+                    self.failed()?;
                 }
             }
             Err(_) => {}

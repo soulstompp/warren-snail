@@ -452,6 +452,44 @@ pub fn unlock_block(file: &File, byte: u64) -> Result<()> {
     give(file, byte, 1)
 }
 
+/// The bytes of the tables' locks LOCK TABLE and the writers take: for each table, a run of a byte a
+/// slot for each pair of its modes that conflict, and one for each mode that conflicts with itself.
+const TABLES: u64 = (1 << 62) + (1 << 60);
+const TABLE_RUNS: u64 = 32;
+
+/// The first byte of a table's `run`th run.
+pub(crate) fn table_run(table: usize, run: u64) -> u64 {
+    TABLES + ((table as u64 * TABLE_RUNS + run) << 16)
+}
+
+/// Takes a lock on a table's run, shared, but for the byte of `slot`, which is the writer's own,
+/// waiting for it where `wait`. Returns false where it does not wait and another file holds a byte
+/// of it alone.
+pub(crate) fn lock_run_shared(file: &File, start: u64, slot: u64, wait: bool) -> Result<bool> {
+    if slot > 0 && !take(file, Kind::Shared, start, slot, wait)? {
+        return Ok(false);
+    }
+    if !take(
+        file,
+        Kind::Shared,
+        start + slot + 1,
+        WRITER_SLOTS - slot - 1,
+        wait,
+    )? {
+        give(file, start, slot)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Lets go of a table's run taken shared but for the byte of `slot`.
+pub(crate) fn unlock_run_shared(file: &File, start: u64, slot: u64) -> Result<()> {
+    if slot > 0 {
+        give(file, start, slot)?;
+    }
+    give(file, start + slot + 1, WRITER_SLOTS - slot - 1)
+}
+
 /// Waits for the root's turn, the one commit at a time.
 pub fn take_root_turn(file: &File) -> Result<()> {
     take(file, Kind::Alone, ROOT_TURN, 1, true).map(|_| ())
