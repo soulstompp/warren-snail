@@ -2343,7 +2343,9 @@ fn a_distance_rounds_as_the_release_the_file_records_rounds_it() {
             "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
              CREATE INDEX t_v ON s.t USING gist (v); \
              CREATE TABLE s.c (id bigint NOT NULL, v point, PRIMARY KEY (id), \
-             CHECK (v <-> point '(0,0)' = 1.4142135623730951e150));",
+             CHECK (v <-> point '(0,0)' = 1.4142135623730951e150)); \
+             CREATE TABLE s.e (id bigint NOT NULL, c circle, PRIMARY KEY (id), \
+             EXCLUDE USING gist (c WITH &&));",
         )
         .unwrap();
         let path = tmp(&format!("plane-near-release-check-{release}.snail"));
@@ -2365,6 +2367,10 @@ fn a_distance_rounds_as_the_release_the_file_records_rounds_it() {
             assert_eq!(n.value(0), held, "{release} {order:?}");
         }
         let taken = s.execute("INSERT INTO s.c VALUES (1, '(1e150,1e150)')");
+        assert_eq!(taken.is_ok(), held == 1, "{release}: {taken:?}");
+        // Two circles that meet where their centres lie 19's distance apart, and not 18's.
+        s.execute("INSERT INTO s.e VALUES (1, '<(0,0),0>')").unwrap();
+        let taken = s.execute("INSERT INTO s.e VALUES (2, '<(1e150,1e150),1.414213562373095e150>')");
         assert_eq!(taken.is_ok(), held == 1, "{release}: {taken:?}");
     }
 }
