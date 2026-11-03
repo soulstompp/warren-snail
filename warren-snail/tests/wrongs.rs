@@ -369,6 +369,36 @@ fn gist_takes_inet_s_class_unnamed_only_from_release_19() {
     }
 }
 
+#[cfg(all(feature = "standalone", feature = "collations"))]
+#[test]
+fn a_composite_s_text_field_is_compared_and_ordered_under_its_collation() {
+    let path = tmp("wrongs-collated.snail");
+    let ddl = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
+               CREATE TYPE s.cc AS (v text COLLATE s.ci);\n\
+               CREATE TYPE s.ce AS (v text COLLATE \"en-x-icu\");\n\
+               CREATE TABLE s.ct (id integer PRIMARY KEY, c s.cc, e s.ce);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.ct VALUES (1, ROW('a'), ROW('a')), (2, ROW('A'), ROW('B')), \
+         (3, ROW('b'), ROW('b')), (4, ROW('B'), ROW('A'))",
+    )
+    .unwrap();
+    for (sql, pg) in [
+        ("SELECT ROW('a')::s.cc = ROW('A')::s.cc AS x", "true"),
+        ("SELECT ROW('a')::s.cc <> ROW('A')::s.cc AS x", "false"),
+        ("SELECT id FROM s.ct WHERE c = ROW('A')::s.cc ORDER BY id", "1,2"),
+        ("WITH q AS (SELECT id, c FROM s.ct) SELECT id FROM q WHERE c = ROW('A')::s.cc ORDER BY id", "1,2"),
+        ("SELECT a.id, b.id AS bid FROM s.ct a JOIN s.ct b ON a.c = b.c WHERE a.id = 1 ORDER BY 2", "1|1,1|2"),
+        ("SELECT count(DISTINCT c) FROM s.ct", "2"),
+        // The record image stays each field's bytes.
+        ("SELECT id FROM s.ct WHERE c *= ROW('a')::s.cc ORDER BY id", "1"),
+        ("SELECT id FROM s.ct ORDER BY e, id", "1,4,3,2"),
+    ] {
+        assert_eq!(column(&mut w, sql), pg, "{sql}");
+    }
+}
+
 #[cfg(feature = "standalone")]
 mod written {
     use super::*;

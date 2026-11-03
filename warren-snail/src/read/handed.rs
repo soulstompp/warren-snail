@@ -384,6 +384,7 @@ pub(crate) fn rows_of(catalog: &crate::catalog::Catalog) -> Rows {
                     name: c.name.clone(),
                     ty: c.ty,
                     domain: c.domain.clone(),
+                    collation: None,
                 })
                 .collect();
             (t.name.clone(), fields)

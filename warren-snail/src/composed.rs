@@ -28,14 +28,15 @@ impl std::fmt::Debug for TypeRef {
     }
 }
 
-/// One field of a composite: its name, its type, and the domain it names, whose constraints its
-/// values meet.
+/// One field of a composite: its name, its type, the domain it names, whose constraints its values
+/// meet, and the library collation its text is ordered and compared under, where it names one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Field {
     pub name: String,
     pub ty: ColumnType,
     pub domain: Option<String>,
+    pub collation: Option<u16>,
 }
 
 impl Field {
@@ -45,6 +46,7 @@ impl Field {
             name: name.into(),
             ty,
             domain: None,
+            collation: None,
         }
     }
 }
@@ -443,7 +445,13 @@ fn key_into(out: &mut Vec<u8>, ty: ColumnType, item: &Item) {
                     out.push(2);
                 } else {
                     out.push(1);
-                    key_into(out, f.ty, v);
+                    // Text under a library collation by the collation's key, as its field orders it.
+                    match (f.collation, v) {
+                        (Some(id), Item::Scalar(Datum::Text(s))) => {
+                            ended(out, &crate::collations::get(id).key(s.as_bytes()))
+                        }
+                        _ => key_into(out, f.ty, v),
+                    }
                 }
             }
         }

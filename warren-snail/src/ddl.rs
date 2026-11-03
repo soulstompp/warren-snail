@@ -1963,6 +1963,7 @@ impl Draft {
                             name: c.name.clone(),
                             ty: c.ty,
                             domain: c.domain.clone(),
+                            collation: None,
                         })
                         .collect();
                     return Ok((type_of(Composed::Record { name: n, fields }), None));
@@ -1994,18 +1995,26 @@ impl Draft {
                 let fields = fields
                     .iter()
                     .map(|(name, ty, collation)| {
-                        if let Some(k) = collation {
-                            if crate::catalog::collation_held(k, &self.collations).is_none() {
-                                return Err(refused(format!(
-                                    "its field {name} names COLLATE {k}: text is compared by its bytes"
-                                )));
-                            }
-                        }
+                        let casing = match collation {
+                            Some(k) => match crate::catalog::collation_held(k, &self.collations) {
+                                Some(c) => Some(c),
+                                None => {
+                                    return Err(refused(format!(
+                                        "its field {name} names COLLATE {k}: text is compared by its bytes"
+                                    )))
+                                }
+                            },
+                            None => None,
+                        };
                         let (ty, domain) = self.held(&parse_type(ty)?, what)?;
                         Ok(Field {
                             name: name.clone(),
                             ty,
                             domain,
+                            collation: match casing {
+                                Some(crate::catalog::Casing::Library(id)) => Some(id),
+                                _ => None,
+                            },
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
