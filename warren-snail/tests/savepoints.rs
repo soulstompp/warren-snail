@@ -616,3 +616,38 @@ fn lock_timeout_and_statement_timeout_cancel_a_wait_in_postgresqls_words() {
     assert!(got[8].as_ref().unwrap_err().contains("current transaction is aborted"));
     w.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+fn prepared_statements_cursors_copy_and_explain_read_across_snails() {
+    let (a, b) = (tmp("session-across-a.snail"), tmp("session-across-b.snail"));
+    for (path, ddl) in [
+        (&a, "CREATE TABLE a.t (k integer NOT NULL, v text, PRIMARY KEY (k));"),
+        (&b, "CREATE TABLE b.u (k integer NOT NULL, w text, PRIMARY KEY (k));"),
+    ] {
+        let catalog = warren_snail::catalog::Catalog::parse(ddl).unwrap();
+        write(path, &catalog, &[]).unwrap();
+    }
+    let mut w = warren_snail::read::Snails::open_writing(&[a.as_path(), b.as_path()]).unwrap();
+    w.execute_copy("COPY a.t FROM STDIN (FORMAT csv)", b"1,one\n2,two\n3,three\n")
+        .unwrap();
+    w.execute("INSERT INTO b.u (k, w) VALUES (1, 'uno'), (2, 'dos')").unwrap();
+    w.execute("PREPARE j (integer) AS SELECT t.v, u.w FROM a.t t JOIN b.u u ON u.k = t.k WHERE t.k = $1")
+        .unwrap();
+    let d = w.execute("EXECUTE j(2)").unwrap();
+    assert_eq!(bag(d.answer.as_ref().unwrap()), [vec![Some("two".into()), Some("dos".into())]]);
+    w.execute("BEGIN").unwrap();
+    w.execute("DECLARE c SCROLL CURSOR FOR SELECT t.k, t.v FROM a.t t ORDER BY t.k")
+        .unwrap();
+    let d = w.execute("FETCH LAST FROM c").unwrap();
+    assert_eq!(bag(d.answer.as_ref().unwrap()), [vec![Some("3".into()), Some("three".into())]]);
+    w.execute("FETCH PRIOR FROM c").unwrap();
+    w.execute("UPDATE a.t SET v = 'TWO' WHERE CURRENT OF c").unwrap();
+    w.execute("COMMIT").unwrap();
+    assert!(w.execute("FETCH c").is_err(), "a rollback or a commit closes it");
+    let out = w.execute("COPY (SELECT t.k, t.v FROM a.t t ORDER BY t.k) TO STDOUT").unwrap();
+    assert_eq!(out.copied.unwrap(), b"1\tone\n2\tTWO\n3\tthree\n");
+    let d = w.execute("EXPLAIN (ANALYZE) SELECT t.v, u.w FROM a.t t JOIN b.u u ON u.k = t.k").unwrap();
+    assert!(d.rows > 0);
+    let d = w.execute("EXPLAIN SELECT u.w FROM b.u u WHERE u.k = 1").unwrap();
+    assert!(cell(d.answer.unwrap().column(0).as_ref(), 0).unwrap().starts_with("Snail round along"));
+}

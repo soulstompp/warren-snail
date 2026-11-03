@@ -374,7 +374,7 @@ pub(super) fn said(
 #[derive(Default)]
 pub(super) struct Session {
     pub(super) settings: Settings,
-    pub(super) prepared: BTreeMap<String, super::prepared::Prepared>,
+    pub(super) prepared: super::prepared::Kept,
     pub(super) cursors: Vec<super::cursor::Cursor>,
     pub(super) table_locks: BTreeSet<(usize, Mode)>,
     /// The cursors declared so far, which numbers each.
@@ -584,17 +584,25 @@ impl super::Snail {
                 name,
                 types,
                 statement,
-            } => self.prepare(&name, types, &statement)?,
+            } => super::prepared::prepare(
+                &mut self.session.prepared,
+                &self.catalog,
+                &name,
+                types,
+                &statement,
+            )?,
             Said::Execute { name, args } => return self.execute_prepared(&name, &args),
-            Said::Deallocate { name } => self.deallocate(name.as_deref())?,
+            Said::Deallocate { name } => {
+                super::prepared::deallocate(&mut self.session.prepared, name.as_deref())?
+            }
             Said::Declare(d) => self.declare_cursor(d)?,
             Said::Fetch {
                 fetch,
                 direction,
                 name,
-            } => return self.fetch(fetch, &direction, &name),
+            } => return self.fetch_cursor(fetch, &direction, &name),
             Said::Close { name } => self.close_cursor(name.as_deref())?,
-            Said::Explain(e) => return self.explain(&e),
+            Said::Explain(e) => return super::explain::explain(self, &e),
             Said::Copy(c) => {
                 return match c.from_stdin() || !c.to() {
                     true => {

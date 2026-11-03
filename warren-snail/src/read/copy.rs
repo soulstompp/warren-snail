@@ -777,12 +777,15 @@ fn csv_rows(data: &str, c: &Copy) -> Result<Vec<Vec<(String, bool)>>> {
     Ok(rows)
 }
 
-impl Snail {
     /// COPY TO: the rows, as COPY writes them, written where it names, or handed back.
-    pub(super) fn copy_to(&mut self, c: &Copy) -> Result<super::Done> {
+    pub(super) fn copy_out(
+        c: &Copy,
+        catalog: &crate::catalog::Catalog,
+        ask: &mut dyn FnMut(&str) -> Result<arrow::array::RecordBatch>,
+    ) -> Result<super::Done> {
         let (question, names) = match (&c.table, &c.question) {
             (Some((ti, cols)), _) => {
-                let t = &self.catalog.tables[*ti];
+                let t = &catalog.tables[*ti];
                 let by = t.name.rsplit('.').next().unwrap_or_default();
                 let list: Vec<String> = cols
                     .iter()
@@ -796,7 +799,7 @@ impl Snail {
             (None, Some(q)) => (q.clone(), Vec::new()),
             _ => unreachable!("COPY names a table or a question"),
         };
-        let batch = self.ask(&question, None)?.0;
+        let batch = ask(&question)?;
         let types = super::change::answer_types(&batch)?;
         let rows = super::change::rows_of(&batch)?;
         let names: Vec<String> = match names.is_empty() {
@@ -819,7 +822,7 @@ impl Snail {
                 }
             }
             out.extend((-1i16).to_be_bytes());
-            return self.copied(c, out, rows.len() as u64);
+            return copied(c, out, rows.len() as u64);
         }
         let forced: Vec<bool> = match (&c.force_quote, &c.table) {
             _ if c.force_all => vec![true; names.len()],
@@ -852,11 +855,11 @@ impl Snail {
             }
             out.push('\n');
         }
-        self.copied(c, out.into_bytes(), rows.len() as u64)
+        copied(c, out.into_bytes(), rows.len() as u64)
     }
 
     /// What COPY TO wrote: into the file it names, or handed back.
-    fn copied(&self, c: &Copy, out: Vec<u8>, n: u64) -> Result<super::Done> {
+    fn copied(c: &Copy, out: Vec<u8>, n: u64) -> Result<super::Done> {
         match &c.end {
             End::File(f) => {
                 std::fs::write(f, &out).map_err(|e| {
@@ -879,7 +882,12 @@ impl Snail {
 
     /// COPY FROM: the rows read from the caller's bytes or the file, each value by its column's
     /// input function, written as one INSERT of them all would write them.
-    pub(super) fn copy_from(&mut self, c: &Copy, given: Option<&[u8]>) -> Result<super::Done> {
+    pub(super) fn copy_in(
+        c: &Copy,
+        catalog: &crate::catalog::Catalog,
+        given: Option<&[u8]>,
+        exec: &mut dyn FnMut(&str) -> Result<super::Done>,
+    ) -> Result<super::Done> {
         let bytes = match (&c.end, given) {
             (End::File(f), _) => std::fs::read(f).map_err(|e| {
                 Error::new(format!("could not open file \"{f}\" for reading: {e}"))
@@ -893,7 +901,7 @@ impl Snail {
             }
         };
         let (ti, cols) = c.table.clone().expect("COPY FROM names a table");
-        let t = &self.catalog.tables[ti];
+        let t = &catalog.tables[ti];
         // Each row's fields: the NULL string, or a value.
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
         let data = match c.binary {
@@ -1055,7 +1063,7 @@ impl Snail {
                 names.join(", "),
                 values.join(", ")
             );
-            let d = self.execute(&insert)?;
+            let d = exec(&insert)?;
             return Ok(super::Done {
                 statement: "COPY",
                 rows: d.rows,
@@ -1069,9 +1077,18 @@ impl Snail {
             ..Default::default()
         })
     }
-}
 
 impl Snail {
+    pub(super) fn copy_to(&mut self, c: &Copy) -> Result<super::Done> {
+        let catalog = self.catalog.clone();
+        copy_out(c, &catalog, &mut |q| self.ask(q, None).map(|(b, _)| b))
+    }
+
+    pub(super) fn copy_from(&mut self, c: &Copy, given: Option<&[u8]>) -> Result<super::Done> {
+        let catalog = self.catalog.clone();
+        copy_in(c, &catalog, given, &mut |q| self.execute(q))
+    }
+
     /// Runs COPY … FROM STDIN with the rows `input` holds, as a client's COPY data hands them.
     pub fn execute_copy(&mut self, sql: &str, input: &[u8]) -> Result<super::Done> {
         self.session.copy_input = Some(input.to_vec());

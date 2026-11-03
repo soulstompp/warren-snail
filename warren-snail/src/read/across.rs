@@ -157,7 +157,9 @@ pub struct Snails {
     written: Vec<usize>,
     /// The savepoints of the transaction under way, oldest first, each with the snails it had
     /// written then.
-    savepoints: Vec<(String, Vec<usize>)>,
+    savepoints: Vec<(String, Vec<usize>, Vec<u64>)>,
+    /// Their session's prepared statements and cursors, which read across them.
+    session: super::session::Session,
     stop: Option<StopAcross>,
     /// Run once, after the first snail's root is read in the next round's first pass: for the tests
     /// of a commit landing between the passes.
@@ -265,6 +267,7 @@ impl Snails {
             aborted: false,
             written: Vec::new(),
             savepoints: Vec::new(),
+            session: Default::default(),
             stop: None,
             between: None,
             writing,
@@ -915,6 +918,15 @@ impl Snails {
 
     fn execute_across(&mut self, sql: &str) -> Result<Done> {
         self.resolve()?;
+        // WHERE CURRENT OF a cursor finds the row it stands on by the table's key.
+        let current;
+        let sql = match sql.to_ascii_uppercase().contains("CURRENT") {
+            true => {
+                current = super::cursor::current_of(&self.catalog, &self.session.cursors, sql)?;
+                current.as_str()
+            }
+            false => sql,
+        };
         let st = match statement::parse(&self.catalog, sql) {
             Ok(st) => st,
             Err(e) => {
@@ -1001,8 +1013,15 @@ impl Snails {
             )),
             Statement::Setting { .. } => self.snails[0].execute(sql),
             Statement::Session(said) => self.said_across(said, sql),
+            // A question among the statements is asked across them, its answer in what it did.
             Statement::Question { .. } => {
-                Err(Error::new("a SELECT across snails is a question: ask it"))
+                let (batch, _) = self.ask(sql)?;
+                Ok(Done {
+                    statement: "SELECT",
+                    rows: batch.num_rows() as u64,
+                    answer: Some(batch),
+                    ..Default::default()
+                })
             }
             // Each snail holds the transaction's level, and refuses a change after its first read.
             Statement::Isolation { .. } => {
@@ -1096,8 +1115,10 @@ impl Snails {
             s.aborted = true;
         }
         self.aborted = true;
-        if let Some((_, w)) = self.savepoints.last() {
+        if let Some((_, w, cursors)) = self.savepoints.last() {
             self.written = w.clone();
+            let cursors = cursors.clone();
+            self.session.cursors.retain(|c| cursors.contains(&c.id));
         }
         Ok(())
     }
@@ -1118,7 +1139,7 @@ impl Snails {
         let named = |me: &mut Snails, name: &str| -> Result<usize> {
             me.savepoints
                 .iter()
-                .rposition(|(n, _)| n == name)
+                .rposition(|(n, _, _)| n == name)
                 .ok_or_else(|| Error::new(format!("savepoint \"{name}\" does not exist")))
         };
         let ran = match said {
@@ -1128,7 +1149,8 @@ impl Snails {
                 }
                 let done = every(self);
                 if done.is_ok() {
-                    self.savepoints.push((name, self.written.clone()));
+                    let cursors = self.session.cursors.iter().map(|c| c.id).collect();
+                    self.savepoints.push((name, self.written.clone(), cursors));
                 }
                 done
             }
@@ -1140,6 +1162,8 @@ impl Snails {
                     let done = every(self)?;
                     self.savepoints.truncate(at + 1);
                     self.written = self.savepoints[at].1.clone();
+                    let cursors = self.savepoints[at].2.clone();
+                    self.session.cursors.retain(|c| cursors.contains(&c.id));
                     self.aborted = false;
                     Ok(done)
                 })
@@ -1170,17 +1194,65 @@ impl Snails {
             // The session's settings stand alike on every snail.
             Said::Set { .. } | Said::Reset { .. } => every(self),
             Said::Show { .. } => self.snails[0].execute(sql),
-            Said::Prepare { .. }
-            | Said::Execute { .. }
-            | Said::Deallocate { .. }
-            | Said::Declare(_)
-            | Said::Fetch { .. }
-            | Said::Close { .. }
-            | Said::Copy(_)
-            | Said::Explain(_) => Err(Error::new(
-                "prepared statements and cursors are a session's on one snail: open it alone to \
-                 write",
-            )),
+            Said::Prepare {
+                name,
+                types,
+                statement,
+            } => super::prepared::prepare(
+                &mut self.session.prepared,
+                &self.catalog,
+                &name,
+                types,
+                &statement,
+            )
+            .map(|_| Done::default()),
+            Said::Execute { name, args } => {
+                super::prepared::bound(&self.session.prepared, &self.catalog, &name, &args)
+                    .and_then(|text| self.execute_across(&text))
+            }
+            Said::Deallocate { name } => {
+                super::prepared::deallocate(&mut self.session.prepared, name.as_deref())
+                    .map(|_| Done::default())
+            }
+            Said::Declare(d) => {
+                let mut cursors = std::mem::take(&mut self.session.cursors);
+                let mut count = self.session.cursor_count;
+                let catalog = self.catalog.clone();
+                let begun = self.begun;
+                let declared = super::cursor::declare(
+                    &mut cursors,
+                    &mut count,
+                    &catalog,
+                    begun,
+                    d,
+                    &mut |q| self.ask(q).map(|(b, _)| b),
+                );
+                self.session.cursors = cursors;
+                self.session.cursor_count = count;
+                declared.map(|_| Done::default())
+            }
+            Said::Fetch {
+                fetch,
+                direction,
+                name,
+            } => super::cursor::fetch_from(&mut self.session.cursors, fetch, &direction, &name),
+            Said::Close { name } => super::cursor::close(&mut self.session.cursors, name.as_deref())
+                .map(|_| Done::default()),
+            Said::Copy(c) => {
+                let catalog = self.catalog.clone();
+                match c.from_stdin() || !c.to() {
+                    true => {
+                        let given = self.session.copy_input.take();
+                        super::copy::copy_in(&c, &catalog, given.as_deref(), &mut |q| {
+                            self.execute_across(q)
+                        })
+                    }
+                    false => super::copy::copy_out(&c, &catalog, &mut |q| {
+                        self.ask(q).map(|(b, _)| b)
+                    }),
+                }
+            }
+            Said::Explain(e) => super::explain::explain(self, &e),
             Said::Lock {
                 tables,
                 mode,
@@ -1227,6 +1299,7 @@ impl Snails {
     /// Ends the transaction on every snail, rolled back.
     fn end_all(&mut self) -> Result<()> {
         self.begun = false;
+        self.session.end(false);
         self.aborted = false;
         self.written.clear();
         self.savepoints.clear();
@@ -1279,6 +1352,7 @@ impl Snails {
                 }
             }
             self.begun = false;
+            self.session.end(true);
             for s in &mut self.snails {
                 if s.begun.is_some() {
                     s.execute("COMMIT")?;
@@ -1355,6 +1429,7 @@ impl Snails {
             self.snails[i].root = root;
         }
         self.begun = false;
+        self.session.end(true);
         for s in &mut self.snails {
             s.begun = None;
             s.abandon()?;
@@ -1553,5 +1628,33 @@ impl Snail {
         }
         self.root = root;
         Ok(())
+    }
+}
+
+impl super::explain::Runs for Snails {
+    fn ask_round(&mut self, sql: &str) -> Result<(RecordBatch, Round)> {
+        self.ask(sql)
+    }
+    fn run(&mut self, sql: &str) -> Result<Done> {
+        self.execute(sql)
+    }
+    /// A question priced from the directory of the one snail holding every table it names.
+    fn priced(&mut self, sql: &str) -> Result<super::Price> {
+        match self.snails_named(sql)?.as_slice() {
+            [i] => self.snails[*i].price(sql, None),
+            _ => Err(Error::new(
+                "a question over several snails' tables is priced only as it runs",
+            )),
+        }
+    }
+}
+
+impl Snails {
+    /// Runs COPY … FROM STDIN with the rows `input` holds, as a client's COPY data hands them.
+    pub fn execute_copy(&mut self, sql: &str, input: &[u8]) -> Result<Done> {
+        self.session.copy_input = Some(input.to_vec());
+        let done = self.execute(sql);
+        self.session.copy_input = None;
+        done
     }
 }

@@ -310,15 +310,19 @@ pub(super) fn parse_prepare(sql: &str) -> Option<Result<(String, Vec<Option<Stri
     Some(Ok((name, types, body)))
 }
 
-impl Snail {
-    /// PREPARE: the statement kept under `name`, each parameter's type named or inferred.
-    pub(super) fn prepare(
-        &mut self,
-        name: &str,
-        given: Vec<Option<String>>,
-        body: &str,
-    ) -> Result<()> {
-        if self.session.prepared.contains_key(name) {
+/// A session's prepared statements, by name.
+pub(super) type Kept = std::collections::BTreeMap<String, Prepared>;
+
+/// PREPARE: the statement kept under `name`, each parameter's type named or inferred.
+pub(super) fn prepare(
+    kept: &mut Kept,
+    catalog: &Catalog,
+    name: &str,
+    given: Vec<Option<String>>,
+    body: &str,
+) -> Result<()> {
+    {
+        if kept.contains_key(name) {
             return Err(Error::new(format!(
                 "prepared statement \"{name}\" already exists"
             )));
@@ -335,7 +339,7 @@ impl Snail {
             return Err(Error::new(format!("syntax error at or near \"{first}\"")));
         }
         let n = highest(body)?.max(given.len());
-        let inferred = inferred(&self.catalog, body, n);
+        let inferred = inferred(&catalog, body, n);
         let types = (0..n)
             .map(|k| {
                 given
@@ -345,7 +349,7 @@ impl Snail {
                     .or_else(|| inferred[k].clone())
             })
             .collect();
-        self.session.prepared.insert(
+        kept.insert(
             name.to_string(),
             Prepared {
                 types,
@@ -354,11 +358,13 @@ impl Snail {
         );
         Ok(())
     }
+}
 
-    /// EXECUTE: the statement kept under `name`, each parameter's value worked out from its
-    /// expression and cast to its type, then run as the statement it is.
-    pub(super) fn execute_prepared(&mut self, name: &str, args: &[String]) -> Result<super::Done> {
-        let p = self.session.prepared.get(name).cloned().ok_or_else(|| {
+/// EXECUTE: the statement kept under `name`, each parameter's value worked out from its expression
+/// and cast to its type, written where it stands: the statement to run.
+pub(super) fn bound(kept: &Kept, catalog: &Catalog, name: &str, args: &[String]) -> Result<String> {
+    {
+        let p = kept.get(name).cloned().ok_or_else(|| {
             Error::new(format!("prepared statement \"{name}\" does not exist"))
         })?;
         if args.len() != p.types.len() {
@@ -366,7 +372,7 @@ impl Snail {
                 "wrong number of parameters for prepared statement \"{name}\""
             )));
         }
-        let casings = super::pipeline::Casings::of_file(self.catalog.monetary, self.catalog.text_search);
+        let casings = super::pipeline::Casings::of_file(catalog.monetary, catalog.text_search);
         let mut values = Vec::with_capacity(args.len());
         for (a, ty) in args.iter().zip(&p.types) {
             let text = match ty {
@@ -384,7 +390,7 @@ impl Snail {
                 },
                 _ => return Err(Error::new(format!("syntax error at or near \"{a}\""))),
             };
-            let v = super::pipeline::eval_on(&e, &[], &[], self.catalog.release, &casings)?;
+            let v = super::pipeline::eval_on(&e, &[], &[], catalog.release, &casings)?;
             values.push(v.text());
         }
         // Each parameter where it stands: a NULL, a literal of its type where it is a column the
@@ -411,15 +417,17 @@ impl Snail {
             from = b;
         }
         out.push_str(&p.statement[from..]);
-        self.execute(&out)
+        Ok(out)
     }
+}
 
-    /// DEALLOCATE: the statement kept under `name` let go, or every one.
-    pub(super) fn deallocate(&mut self, name: Option<&str>) -> Result<()> {
+/// DEALLOCATE: the statement kept under `name` let go, or every one.
+pub(super) fn deallocate(kept: &mut Kept, name: Option<&str>) -> Result<()> {
+    {
         match name {
-            None => self.session.prepared.clear(),
+            None => kept.clear(),
             Some(n) => {
-                if self.session.prepared.remove(n).is_none() {
+                if kept.remove(n).is_none() {
                     return Err(Error::new(format!(
                         "prepared statement \"{n}\" does not exist"
                     )));
@@ -427,6 +435,13 @@ impl Snail {
             }
         }
         Ok(())
+    }
+}
+
+impl Snail {
+    pub(super) fn execute_prepared(&mut self, name: &str, args: &[String]) -> Result<super::Done> {
+        let text = bound(&self.session.prepared, &self.catalog, name, args)?;
+        self.execute(&text)
     }
 }
 

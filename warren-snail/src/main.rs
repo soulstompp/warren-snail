@@ -528,9 +528,9 @@ fn cmd_exec(args: &[String]) -> Result<()> {
         std::fs::create_dir_all(dir).map_err(|e| Error::new(format!("{dir}: {e}")))?;
     }
     let others = withs(args);
-    if (!params.is_empty() || copied.iter().any(Option::is_some)) && !others.is_empty() {
+    if !params.is_empty() && !others.is_empty() {
         return Err(Error::new(
-            "--param and COPY's rows are a session's on one snail: --with is refused",
+            "--param gives one snail's statements their parameters: --with is refused",
         ));
     }
     let mut errors: Vec<String> = Vec::new();
@@ -570,7 +570,8 @@ fn cmd_exec(args: &[String]) -> Result<()> {
                 let ran = match (&mut opened, &copied[i]) {
                     (Opened::One(s), Some(rows)) => s.execute_copy(st, rows),
                     (Opened::One(s), None) => s.execute_with(st, &params),
-                    (Opened::Several(s), _) => s.execute(st),
+                    (Opened::Several(s), Some(rows)) => s.execute_copy(st, rows),
+                    (Opened::Several(s), None) => s.execute(st),
                 };
                 let d = match ran {
                     Ok(d) => {

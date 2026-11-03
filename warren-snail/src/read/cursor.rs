@@ -326,16 +326,22 @@ impl Cursor {
     }
 }
 
-impl Snail {
     /// DECLARE: the question answered now, on the generation the statement reads, and kept as the
     /// cursor's rows.
-    pub(super) fn declare_cursor(&mut self, d: Declaration) -> Result<()> {
-        if self.begun.is_none() && !d.hold {
+    pub(super) fn declare(
+        list: &mut Vec<Cursor>,
+        count: &mut u64,
+        catalog: &crate::catalog::Catalog,
+        begun: bool,
+        d: Declaration,
+        ask: &mut dyn FnMut(&str) -> Result<RecordBatch>,
+    ) -> Result<()> {
+        if !begun && !d.hold {
             return Err(Error::new(
                 "DECLARE CURSOR can only be used in transaction blocks",
             ));
         }
-        if self.session.cursors.iter().any(|c| c.name == d.name) {
+        if list.iter().any(|c| c.name == d.name) {
             return Err(Error::new(format!("cursor \"{}\" already exists", d.name)));
         }
         let locking = super::locking::clauses(&d.question)?.is_some();
@@ -359,23 +365,23 @@ impl Snail {
             return Err(Error::new(format!("syntax error at or near \"{first}\"")));
         }
         // A cursor on one table keeps each row's key there, for WHERE CURRENT OF.
-        let keyed = self.cursor_keys(&d.question);
+        let keyed = cursor_keys(catalog, &d.question);
         let (answer, keys) = match keyed {
             Some((table, key, asked)) => {
-                let batch = self.ask(&asked, None)?.0;
+                let batch = ask(&asked)?;
                 let width = batch.num_columns() - key.len();
                 let answer = batch.project(&(0..width).collect::<Vec<_>>())?;
                 let keys = batch.project(&(width..batch.num_columns()).collect::<Vec<_>>())?;
                 (answer, Some((table, key, keys)))
             }
-            None => (self.ask(&d.question, None)?.0, None),
+            None => (ask(&d.question)?, None),
         };
-        self.session.cursor_count += 1;
-        self.session.cursors.push(Cursor {
-            id: self.session.cursor_count,
+        *count += 1;
+        list.push(Cursor {
+            id: *count,
             name: d.name,
             hold: d.hold,
-            fresh: self.begun.is_some(),
+            fresh: begun,
             no_scroll: d.scroll == Some(false),
             answer,
             keys,
@@ -386,7 +392,7 @@ impl Snail {
 
     /// The table a cursor's question reads alone, with no grouping, its key's columns, and the
     /// question with those columns after its own; none for any other question.
-    fn cursor_keys(&self, question: &str) -> Option<(usize, Vec<usize>, String)> {
+    fn cursor_keys(catalog: &crate::catalog::Catalog, question: &str) -> Option<(usize, Vec<usize>, String)> {
         use sqlparser::ast::{SelectItem, SetExpr, Statement as Sql, TableFactor};
         let parsed = super::image::parse_sql(question).ok()?;
         let [Sql::Query(q)] = parsed.as_slice() else {
@@ -408,8 +414,8 @@ impl Snail {
             return None;
         };
         let n = crate::catalog::object_name(name);
-        let ti = self.catalog.tables.iter().position(|t| t.name == n)?;
-        let table = &self.catalog.tables[ti];
+        let ti = catalog.tables.iter().position(|t| t.name == n)?;
+        let table = &catalog.tables[ti];
         let key = key_columns(table)?;
         let by = alias
             .as_ref()
@@ -443,10 +449,8 @@ impl Snail {
     }
 
     /// FETCH or MOVE: the rows taken, as the cursor's answer holds them, and the cursor moved.
-    pub(super) fn fetch(&mut self, fetch: bool, d: &Direction, name: &str) -> Result<super::Done> {
-        let c = self
-            .session
-            .cursors
+    pub(super) fn fetch_from(list: &mut [Cursor], fetch: bool, d: &Direction, name: &str) -> Result<super::Done> {
+        let c = list
             .iter_mut()
             .find(|c| c.name == name)
             .ok_or_else(|| Error::new(format!("cursor \"{name}\" does not exist")))?;
@@ -480,17 +484,15 @@ impl Snail {
     }
 
     /// CLOSE: the cursor let go, or every one.
-    pub(super) fn close_cursor(&mut self, name: Option<&str>) -> Result<()> {
+    pub(super) fn close(list: &mut Vec<Cursor>, name: Option<&str>) -> Result<()> {
         match name {
-            None => self.session.cursors.clear(),
+            None => list.clear(),
             Some(n) => {
-                let at = self
-                    .session
-                    .cursors
+                let at = list
                     .iter()
                     .position(|c| c.name == n)
                     .ok_or_else(|| Error::new(format!("cursor \"{n}\" does not exist")))?;
-                self.session.cursors.remove(at);
+                list.remove(at);
             }
         }
         Ok(())
@@ -498,7 +500,11 @@ impl Snail {
 
     /// `WHERE CURRENT OF name` in a statement written as the condition on the table's key that finds
     /// the row the cursor stands on; the statement as it is where it names no cursor.
-    pub(super) fn current_of(&self, sql: &str) -> Result<String> {
+    pub(super) fn current_of(
+        catalog: &crate::catalog::Catalog,
+        list: &[Cursor],
+        sql: &str,
+    ) -> Result<String> {
         use sqlparser::tokenizer::Token;
         let spans = super::statement::spans(sql)?;
         let words: Vec<&(Token, usize, usize)> = spans
@@ -519,9 +525,7 @@ impl Snail {
             },
             _ => return Err(Error::new("syntax error at end of input")),
         };
-        let c = self
-            .session
-            .cursors
+        let c = list
             .iter()
             .find(|c| c.name == name)
             .ok_or_else(|| Error::new(format!("cursor \"{name}\" does not exist")))?;
@@ -552,7 +556,7 @@ impl Snail {
                 target.rsplit('.').next().unwrap_or_default()
             )));
         };
-        let table = &self.catalog.tables[*ti];
+        let table = &catalog.tables[*ti];
         if table.name != target {
             return Err(Error::new(format!(
                 "cursor \"{name}\" does not have a FOR UPDATE/SHARE reference to table \"{}\"",
@@ -577,6 +581,37 @@ impl Snail {
         let start = words[at].1;
         let end = words.get(at + 2).map_or(sql.len(), |w| w.2);
         Ok(format!("{}{}{}", &sql[..start], conds.join(" AND "), &sql[end..]))
+    }
+
+impl Snail {
+    pub(super) fn declare_cursor(&mut self, d: Declaration) -> Result<()> {
+        let begun = self.begun.is_some();
+        let mut cursors = std::mem::take(&mut self.session.cursors);
+        let mut count = self.session.cursor_count;
+        let catalog = self.catalog.clone();
+        let declared = declare(&mut cursors, &mut count, &catalog, begun, d, &mut |q| {
+            self.ask(q, None).map(|(b, _)| b)
+        });
+        self.session.cursors = cursors;
+        self.session.cursor_count = count;
+        declared
+    }
+
+    pub(super) fn fetch_cursor(
+        &mut self,
+        fetch: bool,
+        d: &Direction,
+        name: &str,
+    ) -> Result<super::Done> {
+        fetch_from(&mut self.session.cursors, fetch, d, name)
+    }
+
+    pub(super) fn close_cursor(&mut self, name: Option<&str>) -> Result<()> {
+        close(&mut self.session.cursors, name)
+    }
+
+    pub(super) fn current_of(&self, sql: &str) -> Result<String> {
+        current_of(&self.catalog, &self.session.cursors, sql)
     }
 }
 

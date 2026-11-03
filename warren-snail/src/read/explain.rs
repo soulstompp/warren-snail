@@ -210,9 +210,28 @@ fn as_json(lines: &[String]) -> String {
     out
 }
 
-impl Snail {
-    /// EXPLAIN: the plan's lines, as rows of `QUERY PLAN`.
-    pub(super) fn explain(&mut self, e: &Explain) -> Result<super::Done> {
+/// What EXPLAIN runs a statement on: one snail, or several.
+pub(super) trait Runs {
+    fn ask_round(&mut self, sql: &str) -> Result<(arrow::array::RecordBatch, Round)>;
+    fn run(&mut self, sql: &str) -> Result<super::Done>;
+    fn priced(&mut self, sql: &str) -> Result<super::Price>;
+}
+
+impl Runs for Snail {
+    fn ask_round(&mut self, sql: &str) -> Result<(arrow::array::RecordBatch, Round)> {
+        self.ask(sql, None)
+    }
+    fn run(&mut self, sql: &str) -> Result<super::Done> {
+        self.execute(sql)
+    }
+    fn priced(&mut self, sql: &str) -> Result<super::Price> {
+        self.price(sql, None)
+    }
+}
+
+/// EXPLAIN: the plan's lines, as rows of `QUERY PLAN`.
+pub(super) fn explain(r: &mut dyn Runs, e: &Explain) -> Result<super::Done> {
+    {
         let first = e
             .statement
             .split(|c: char| !c.is_ascii_alphabetic())
@@ -232,7 +251,7 @@ impl Snail {
         let began = std::time::Instant::now();
         match (e.analyze, question) {
             (false, true) => {
-                let p = self.price(&e.statement, None).map_err(|why| {
+                let p = r.priced(&e.statement).map_err(|why| {
                     Error::new(format!(
                         "EXPLAIN without ANALYZE prices a question on one table from its directory \
                          alone: {why}; EXPLAIN ANALYZE runs it and prints its round"
@@ -271,13 +290,13 @@ impl Snail {
                 ))
             }
             (true, true) => {
-                let (batch, round) = self.ask(&e.statement, None)?;
+                let (batch, round) = r.ask_round(&e.statement)?;
                 let mut r = round;
                 r.rows = batch.num_rows() as u64;
                 round_lines(&r, e, &mut lines);
             }
             (true, false) => {
-                let d = self.execute(&e.statement)?;
+                let d = r.run(&e.statement)?;
                 lines.push(format!("Snail write: {} {} rows", d.statement, d.rows));
                 if e.costs {
                     lines.push(format!(
