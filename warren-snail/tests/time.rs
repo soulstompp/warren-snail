@@ -372,7 +372,7 @@ fn a_setting_set_to_the_value_the_snail_answers_under_does_nothing_and_any_other
         ("SET DateStyle = 'SQL'", "datestyle ISO, MDY"),
         ("SET IntervalStyle = iso_8601", "intervalstyle postgres"),
         ("SET extra_float_digits = 3", "extra_float_digits 1"),
-        ("SET application_name = 'x'", "is not read"),
+        ("SET search_path = public", "has no search path"),
     ] {
         let e = snail.execute(s).unwrap_err().to_string();
         assert!(e.contains(says), "{s}: {e}");

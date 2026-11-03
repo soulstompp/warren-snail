@@ -107,10 +107,10 @@ fn setting_name(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<(Str
     let mut parts = Vec::new();
     loop {
         match w.get(i) {
-            Some(Token::Word(x)) => parts.push(match x.quote_style {
-                Some(_) => x.value.clone(),
-                None => x.value.to_lowercase(),
-            }),
+            Some(Token::Word(x)) if x.quote_style.is_some() => parts.push(x.value.clone()),
+            // A reserved word, or one that names a type or a function alone, is no part of a name.
+            Some(Token::Word(x)) if !col_id(&x.value) => return Err(syntax_at(w.get(i))),
+            Some(Token::Word(x)) => parts.push(x.value.to_lowercase()),
             other => return Err(syntax_at(other)),
         }
         i += 1;
@@ -780,4 +780,14 @@ fn parse_execute(sql: &str) -> Option<Result<Said>> {
         }
         _ => None,
     }
+}
+
+/// Whether a word, unquoted, is a name PostgreSQL's grammar takes as a column's (`ColId`): any
+/// word but its reserved keywords and those that name a type or a function alone.
+fn col_id(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    !include_str!("../kwlist.txt").lines().any(|l| {
+        let mut f = l.split('\t');
+        f.next() == Some(lower.as_str()) && matches!(f.next(), Some("R" | "T"))
+    })
 }

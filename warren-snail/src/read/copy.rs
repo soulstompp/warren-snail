@@ -30,6 +30,8 @@ pub struct Copy {
     quote: char,
     escape: char,
     force_quote: Option<Vec<usize>>,
+    /// FORCE_QUOTE *: every column quoted, a question's too.
+    force_all: bool,
     force_not_null: Vec<usize>,
     force_null: Vec<usize>,
     default: Option<String>,
@@ -215,6 +217,7 @@ pub(super) fn parse_copy(
             quote: '"',
             escape: '"',
             force_quote: None,
+            force_all: false,
             force_not_null: Vec::new(),
             force_null: Vec::new(),
             default: None,
@@ -501,6 +504,7 @@ pub(super) fn parse_copy(
             if !c.to {
                 return Err(Error::new("COPY FORCE_QUOTE cannot be used with COPY FROM"));
             }
+            c.force_all = named.is_none();
             c.force_quote = Some(match named {
                 None => c.table.as_ref().map_or(Vec::new(), |(_, cols)| cols.clone()),
                 Some(l) => l.iter().map(column_of).collect::<Result<_>>()?,
@@ -755,6 +759,7 @@ impl Snail {
             false => names,
         };
         let forced: Vec<bool> = match (&c.force_quote, &c.table) {
+            _ if c.force_all => vec![true; names.len()],
             (Some(f), Some((_, cols))) => cols.iter().map(|k| f.contains(k)).collect(),
             _ => vec![false; names.len()],
         };
