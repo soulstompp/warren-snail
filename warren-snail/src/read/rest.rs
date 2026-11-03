@@ -1100,6 +1100,27 @@ fn text_of(v: &Value) -> Option<String> {
 
 /// current_setting and set_config of the fixed settings; none where it is neither.
 fn settings(name: &str, values: &[Value]) -> Result<Option<Value>> {
+    // A writer's session hands its own settings to the statement.
+    match name {
+        "current_setting" => {
+            let n = text_of(&values[0]).unwrap_or_default();
+            let missing_ok = matches!(values.get(1), Some(Value::Bool(true)));
+            if let Some(got) = super::settings::current_setting(&n, missing_ok) {
+                return Ok(Some(got?.map_or(Value::Null, Value::Text)));
+            }
+        }
+        "set_config" => {
+            let Some(n) = text_of(&values[0]) else {
+                return Err(Error::new("SET requires parameter name"));
+            };
+            let local = matches!(values.get(2), Some(Value::Bool(true)));
+            if let Some(got) = super::settings::set_config(&n, text_of(&values[1]).as_deref(), local)
+            {
+                return Ok(Some(Value::Text(got?)));
+            }
+        }
+        _ => {}
+    }
     Ok(Some(match name {
         "current_setting" => {
             let n = text_of(&values[0]).unwrap_or_default();

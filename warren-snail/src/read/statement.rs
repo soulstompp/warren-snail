@@ -299,6 +299,11 @@ impl Levels {
         self.transaction = kept.transaction;
     }
 
+    /// RESET ALL: the session's modes back at their defaults.
+    pub(crate) fn reset_session(&mut self) {
+        self.session = Mode::default();
+    }
+
     /// The modes the transaction under way runs as, as BEGIN would name them: what COMMIT AND
     /// CHAIN and ROLLBACK AND CHAIN begin the next with.
     pub(crate) fn chained(&self) -> Modes {
@@ -1305,12 +1310,6 @@ pub const SETTINGS: [(&str, &str); 10] = [
 /// where it sets another or a setting the snail does not read.
 fn setting(name: &str, values: &[Expr], catalog: &Catalog) -> Result<Statement> {
     let name = name.to_lowercase();
-    let file = catalog.monetary.name();
-    let Some(&(_, fixed)) = SETTINGS.iter().find(|(n, _)| *n == name) else {
-        return Err(Error::new(format!(
-            "SET {name} is not read: the snail answers under fixed settings"
-        )));
-    };
     // Each value as SET reads it: a word, a quoted text or a number.
     let words: Vec<String> = values
         .iter()
@@ -1324,6 +1323,26 @@ fn setting(name: &str, values: &[Expr], catalog: &Catalog) -> Result<Statement> 
             other => other.to_string(),
         })
         .collect();
+    fixed_setting(&name, &words, catalog.monetary, catalog.text_search)?;
+    Ok(Statement::Setting { name })
+}
+
+/// A SET of a fixed setting `name` to `words`: taken where it sets the value the snail answers
+/// under, `monetary` lc_monetary's and `text_search` default_text_search_config's, and refused by
+/// name where it sets another or a setting the snail does not fix.
+pub(super) fn fixed_setting(
+    name: &str,
+    words: &[String],
+    monetary: crate::monetary::Monetary,
+    text_search: crate::tsearch::TextSearch,
+) -> Result<()> {
+    let name = name.to_lowercase();
+    let file = monetary.name();
+    let Some(&(_, fixed)) = SETTINGS.iter().find(|(n, _)| *n == name) else {
+        return Err(Error::new(format!(
+            "SET {name} is not read: the snail answers under fixed settings"
+        )));
+    };
     let joined = words.join(", ");
     let same = match name.as_str() {
         "datestyle" => {
@@ -1357,14 +1376,14 @@ fn setting(name: &str, values: &[Expr], catalog: &Catalog) -> Result<Statement> 
             matches!(joined.as_str(), "C" | "POSIX") || joined.eq_ignore_ascii_case("default")
         }
         "default_text_search_config" => {
-            crate::tsearch::TextSearch::open(&joined).is_ok_and(|t| t == catalog.text_search)
+            crate::tsearch::TextSearch::open(&joined).is_ok_and(|t| t == text_search)
                 || joined.eq_ignore_ascii_case("default")
         }
         _ => joined.eq_ignore_ascii_case(fixed) || joined.eq_ignore_ascii_case("default"),
     };
     let fixed = match name.as_str() {
         "lc_monetary" => file.as_str(),
-        "default_text_search_config" => catalog.text_search.name(),
+        "default_text_search_config" => text_search.name(),
         _ => fixed,
     };
     if !same {
@@ -1372,7 +1391,7 @@ fn setting(name: &str, values: &[Expr], catalog: &Catalog) -> Result<Statement> 
             "SET {name} to {joined} is refused: the snail answers under {name} {fixed}"
         )));
     }
-    Ok(Statement::Setting { name })
+    Ok(())
 }
 
 #[cfg(test)]

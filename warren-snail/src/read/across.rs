@@ -1165,6 +1165,9 @@ impl Snails {
                 self.execute_across(&begin)?;
                 return Ok(ended);
             }
+            // The session's settings stand alike on every snail.
+            Said::Set { .. } | Said::Reset { .. } => every(self),
+            Said::Show { .. } => self.snails[0].execute(sql),
             Said::Lock {
                 tables,
                 mode,

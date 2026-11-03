@@ -41,6 +41,7 @@ mod rest;
 mod savepoint;
 pub(crate) mod serial;
 mod session;
+pub(crate) mod settings;
 mod sets;
 mod spill;
 mod tablesample;
@@ -1465,6 +1466,7 @@ impl Snail {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _handed = handed::holding(&self.functions);
+        let viewing = settings::viewing(self.settings_view());
         let room = self.reader.room();
         let _room = self.entered_round(&room);
         self.wasted.borrow_mut().clear();
@@ -1472,6 +1474,10 @@ impl Snail {
             Some(l) => self.ask_locking(l, order, params)?,
             None => self.answer_with(sql, order, params)?,
         };
+        // What set_config set stands for the session once the question is answered.
+        for (name, taken, local) in viewing.changed() {
+            self.take_setting(&name, taken, local)?;
+        }
         round.pages_at_start = pages_at_start;
         let wasted = self.wasted.take();
         if !wasted.is_empty() {

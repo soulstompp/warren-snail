@@ -30,6 +30,235 @@ pub enum Said {
         mode: Mode,
         nowait: bool,
     },
+    /// SET of a setting, LOCAL or of the session, to its values, or to its default where none.
+    Set {
+        name: String,
+        values: Option<Vec<String>>,
+        local: bool,
+    },
+    /// SHOW of a setting, or of them all.
+    Show {
+        name: Option<String>,
+    },
+    /// RESET of a setting, or of them all.
+    Reset {
+        name: Option<String>,
+    },
+}
+
+/// The words of a statement but its white space and its last semicolon.
+fn words(tokens: &[sqlparser::tokenizer::Token]) -> Vec<&sqlparser::tokenizer::Token> {
+    use sqlparser::tokenizer::Token;
+    let mut w: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    if matches!(w.last(), Some(Token::SemiColon)) {
+        w.pop();
+    }
+    w
+}
+
+/// A word as PostgreSQL's grammar reads a keyword: upper case, none where it is quoted or no word.
+fn keyword(t: Option<&&sqlparser::tokenizer::Token>) -> String {
+    match t {
+        Some(sqlparser::tokenizer::Token::Word(w)) if w.quote_style.is_none() => {
+            w.value.to_uppercase()
+        }
+        _ => String::new(),
+    }
+}
+
+fn syntax_at(t: Option<&&sqlparser::tokenizer::Token>) -> Error {
+    Error::new(match t {
+        Some(t) => format!("syntax error at or near \"{t}\""),
+        None => "syntax error at end of input".to_string(),
+    })
+}
+
+/// A setting's name as SET, SHOW and RESET read it: a word, or words with dots between, each lower
+/// case unless quoted; and the place after it.
+fn setting_name(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<(String, usize)> {
+    use sqlparser::tokenizer::Token;
+    let mut parts = Vec::new();
+    loop {
+        match w.get(i) {
+            Some(Token::Word(x)) => parts.push(match x.quote_style {
+                Some(_) => x.value.clone(),
+                None => x.value.to_lowercase(),
+            }),
+            other => return Err(syntax_at(other)),
+        }
+        i += 1;
+        if matches!(w.get(i), Some(Token::Period)) {
+            i += 1;
+            continue;
+        }
+        return Ok((parts.join("."), i));
+    }
+}
+
+/// SET's values, as PostgreSQL's `var_list` reads them: each a word lower case unless quoted, a
+/// string, or a number with its sign.
+fn set_values(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<Vec<String>> {
+    use sqlparser::tokenizer::Token;
+    let mut out = Vec::new();
+    loop {
+        let mut sign = "";
+        if matches!(w.get(i), Some(Token::Minus | Token::Plus)) {
+            sign = if matches!(w.get(i), Some(Token::Minus)) {
+                "-"
+            } else {
+                ""
+            };
+            i += 1;
+        }
+        out.push(match w.get(i) {
+            Some(Token::Word(x)) if sign.is_empty() => match x.quote_style {
+                Some(_) => x.value.clone(),
+                None => x.value.to_lowercase(),
+            },
+            Some(Token::SingleQuotedString(s)) | Some(Token::EscapedStringLiteral(s))
+                if sign.is_empty() =>
+            {
+                s.clone()
+            }
+            Some(Token::Number(n, _)) => format!("{sign}{n}"),
+            other => return Err(syntax_at(other)),
+        });
+        i += 1;
+        match w.get(i) {
+            None => return Ok(out),
+            Some(Token::Comma) => i += 1,
+            other => return Err(syntax_at(other)),
+        }
+    }
+}
+
+/// SET, SHOW and RESET read off their words; none where the words are no such statement, or one
+/// the snail reads elsewhere: SET TRANSACTION, SET SESSION CHARACTERISTICS and SET CONSTRAINTS.
+fn parse_setting(tokens: &[sqlparser::tokenizer::Token]) -> Option<Result<Said>> {
+    let w = words(tokens);
+    let first = keyword(w.first());
+    let refused =
+        |what: &str, why: &str| Some(Err(Error::new(format!("{what} is refused: {why}"))));
+    let roles = "roles and privileges are the server's own, and a snail has none";
+    match first.as_str() {
+        "SET" => {
+            let mut i = 1;
+            let mut local = false;
+            match keyword(w.get(i)).as_str() {
+                "LOCAL" => {
+                    local = true;
+                    i += 1;
+                }
+                "SESSION"
+                    if keyword(w.get(i + 1)) != "AUTHORIZATION"
+                        && keyword(w.get(i + 1)) != "CHARACTERISTICS" =>
+                {
+                    i += 1
+                }
+                _ => {}
+            }
+            let named = |name: &str, values: Option<Vec<String>>| {
+                Some(Ok(Said::Set {
+                    name: name.to_string(),
+                    values,
+                    local,
+                }))
+            };
+            match (keyword(w.get(i)).as_str(), keyword(w.get(i + 1)).as_str()) {
+                ("TRANSACTION", _) | ("CONSTRAINTS", _) | ("SESSION", "CHARACTERISTICS") => None,
+                ("ROLE", _) => refused("SET ROLE", roles),
+                ("SESSION", "AUTHORIZATION") => refused("SET SESSION AUTHORIZATION", roles),
+                ("TIME", "ZONE") => match keyword(w.get(i + 2)).as_str() {
+                    "DEFAULT" | "LOCAL" if w.len() == i + 3 => named("timezone", None),
+                    _ => match set_values(&w, i + 2) {
+                        Ok(v) => named("timezone", Some(v)),
+                        Err(e) => Some(Err(e)),
+                    },
+                },
+                ("NAMES", _) => match keyword(w.get(i + 1)).as_str() {
+                    "DEFAULT" if w.len() == i + 2 => named("client_encoding", None),
+                    _ => match set_values(&w, i + 1) {
+                        Ok(v) => named("client_encoding", Some(v)),
+                        Err(e) => Some(Err(e)),
+                    },
+                },
+                ("SCHEMA", _) => match set_values(&w, i + 1) {
+                    Ok(v) => named("search_path", Some(v)),
+                    Err(e) => Some(Err(e)),
+                },
+                ("XML", "OPTION") => match keyword(w.get(i + 2)).as_str() {
+                    v @ ("DOCUMENT" | "CONTENT") if w.len() == i + 3 => {
+                        named("xmloption", Some(vec![v.to_lowercase()]))
+                    }
+                    _ => Some(Err(syntax_at(w.get(i + 2)))),
+                },
+                ("SEED", _) => refused(
+                    "SET SEED",
+                    "the snail's random() draws from no seed a session sets",
+                ),
+                _ => {
+                    let (name, j) = match setting_name(&w, i) {
+                        Ok(x) => x,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    use sqlparser::tokenizer::Token;
+                    let j = match w.get(j) {
+                        Some(Token::Eq) => j + 1,
+                        Some(Token::Word(x))
+                            if x.quote_style.is_none() && x.value.eq_ignore_ascii_case("to") =>
+                        {
+                            j + 1
+                        }
+                        Some(Token::Word(x))
+                            if x.quote_style.is_none()
+                                && x.value.eq_ignore_ascii_case("from")
+                                && keyword(w.get(j + 1)) == "CURRENT"
+                                && w.len() == j + 2 =>
+                        {
+                            return refused(
+                                &format!("SET {name} FROM CURRENT"),
+                                "it names no value of its own; SET it to one",
+                            )
+                        }
+                        other => return Some(Err(syntax_at(other))),
+                    };
+                    if keyword(w.get(j)) == "DEFAULT" && w.len() == j + 1 {
+                        return named(&name, None);
+                    }
+                    match set_values(&w, j) {
+                        Ok(v) => named(&name, Some(v)),
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+            }
+        }
+        "SHOW" | "RESET" => {
+            let name = match (keyword(w.get(1)).as_str(), keyword(w.get(2)).as_str()) {
+                ("ALL", "") => None,
+                ("TIME", "ZONE") if w.len() == 3 => Some("timezone".to_string()),
+                ("TRANSACTION", "ISOLATION") if keyword(w.get(3)) == "LEVEL" && w.len() == 4 => {
+                    Some("transaction_isolation".to_string())
+                }
+                ("SESSION", "AUTHORIZATION") => {
+                    return refused(&format!("{first} SESSION AUTHORIZATION"), roles)
+                }
+                ("ROLE", "") => return refused(&format!("{first} ROLE"), roles),
+                _ => match setting_name(&w, 1) {
+                    Ok((n, j)) if j == w.len() => Some(n),
+                    Ok((_, j)) => return Some(Err(syntax_at(w.get(j)))),
+                    Err(e) => return Some(Err(e)),
+                },
+            };
+            Some(Ok(match first.as_str() {
+                "SHOW" => Said::Show { name },
+                _ => Said::Reset { name },
+            }))
+        }
+        _ => None,
+    }
 }
 
 impl Said {
@@ -42,6 +271,9 @@ impl Said {
             Said::RollbackTo { .. } => "ROLLBACK",
             Said::Release { .. } => "RELEASE",
             Said::Lock { .. } => "LOCK TABLE",
+            Said::Set { .. } => "SET",
+            Said::Show { .. } => "SHOW",
+            Said::Reset { .. } => "RESET",
         }
     }
 }
@@ -70,6 +302,9 @@ pub(super) fn said(
             mode,
             nowait,
         }));
+    }
+    if let Some(read) = parse_setting(tokens) {
+        return read.map(Some);
     }
     Ok(None)
 }
@@ -247,7 +482,122 @@ impl super::Snail {
                     self.lock_table(t, mode, nowait)?;
                 }
             }
+            Said::Set {
+                name,
+                values,
+                local,
+            } => self.set_setting(&name, values, local)?,
+            Said::Show { name } => {
+                let (column, value) = self.shown_setting(name.as_deref())?;
+                let batch = arrow::array::RecordBatch::try_new(
+                    std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                        arrow::datatypes::Field::new(
+                            column,
+                            arrow::datatypes::DataType::Utf8,
+                            false,
+                        ),
+                    ])),
+                    vec![std::sync::Arc::new(arrow::array::StringArray::from(vec![
+                        value,
+                    ]))],
+                )?;
+                return Ok(super::Done {
+                    rows: 1,
+                    answer: Some(batch),
+                    ..done
+                });
+            }
+            Said::Reset { name: Some(name) } => self.set_setting(&name, None, false)?,
+            Said::Reset { name: None } => {
+                let begun = self.begun.is_some();
+                self.session.settings.reset_all(begun);
+                self.levels.reset_session();
+            }
         }
         Ok(done)
+    }
+
+    /// What set_config and current_setting read the session's settings and modes by.
+    pub(super) fn settings_view(&self) -> super::settings::View {
+        super::settings::View {
+            release: self.catalog.release,
+            monetary: self.catalog.monetary.name(),
+            lc_monetary: self.catalog.monetary,
+            text_search: self.catalog.text_search,
+            values: self.session.settings.all().clone(),
+            modes: [
+                "transaction_isolation",
+                "transaction_read_only",
+                "transaction_deferrable",
+                "default_transaction_isolation",
+                "default_transaction_read_only",
+                "default_transaction_deferrable",
+            ]
+            .into_iter()
+            .map(|n| {
+                (
+                    n,
+                    self.levels
+                        .shown(n, self.begun.is_some())
+                        .expect("a mode's setting"),
+                )
+            })
+            .collect(),
+            changed: Vec::new(),
+        }
+    }
+
+    /// SET of a setting to `values`, or to its default where none, as its kind takes it.
+    fn set_setting(&mut self, name: &str, values: Option<Vec<String>>, local: bool) -> Result<()> {
+        let value = match values.as_deref() {
+            None => None,
+            Some([v]) => Some(v.clone()),
+            Some(_) if name == "timezone" || name == "datestyle" => {
+                Some(values.unwrap().join(", "))
+            }
+            Some(_) => return Err(Error::new(format!("SET {name} takes only one argument"))),
+        };
+        let taken = super::settings::taken(
+            self.catalog.release,
+            self.catalog.monetary,
+            self.catalog.text_search,
+            name,
+            value.as_deref(),
+        )?;
+        self.take_setting(name, taken, local)
+    }
+
+    /// A setting taken: stored for the session or the transaction, or a transaction's mode set.
+    pub(super) fn take_setting(
+        &mut self,
+        name: &str,
+        taken: super::settings::Taken,
+        local: bool,
+    ) -> Result<()> {
+        let begun = self.begun.is_some();
+        match taken {
+            super::settings::Taken::Nothing => {}
+            // SET LOCAL outside a transaction lasts no longer than the statement.
+            super::settings::Taken::Stored(shown) => {
+                if !local || begun {
+                    self.session.settings.set(name, shown, local, begun);
+                }
+            }
+            super::settings::Taken::Mode(text) => {
+                self.execute(&text)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// SHOW of a setting: its name as PostgreSQL's SHOW names its column, and its value.
+    fn shown_setting(&self, name: Option<&str>) -> Result<(String, String)> {
+        let Some(name) = name else {
+            return Err(Error::new(
+                "SHOW ALL is refused: it lists the server's settings, and a snail has no server; \
+                 SHOW names one setting",
+            ));
+        };
+        super::settings::shown(&self.settings_view(), name)
     }
 }
