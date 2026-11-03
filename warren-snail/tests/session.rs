@@ -667,3 +667,40 @@ fn a_cursor_the_round_can_stop_early_on_reads_only_the_blocks_its_fetches_take()
     assert_eq!(column0(&w.execute("FETCH d").unwrap()), [Some("Tavira".to_string())]);
     w.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+fn copy_from_keeps_the_rows_its_where_admits_and_skips_those_on_error_ignore_finds_unread() {
+    let path = tmp("session-copy-options.snail");
+    let catalog = warren_snail::catalog::Catalog::parse(
+        "CREATE TABLE s.o (k integer NOT NULL, g integer, PRIMARY KEY (k));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    let d = w
+        .execute_copy("COPY s.o FROM STDIN WHERE g > 10", b"1\t5\n2\t20\n3\t30\n")
+        .unwrap();
+    assert_eq!(d.rows, 2);
+    let d = w
+        .execute_copy(
+            "COPY s.o FROM STDIN (ON_ERROR ignore, LOG_VERBOSITY verbose)",
+            b"4\tx\n5\t50\n",
+        )
+        .unwrap();
+    assert_eq!(d.rows, 1);
+    assert_eq!(
+        d.notices,
+        [
+            "NOTICE:  skipping row due to data type incompatibility at line 1 for column \"g\": \"x\"",
+            "NOTICE:  1 row was skipped due to data type incompatibility",
+        ]
+    );
+    let e = w
+        .execute_copy("COPY s.o FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 1)", b"6\ty\n7\tz\n")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "skipped more than REJECT_LIMIT (1) rows due to data type incompatibility");
+    assert!(w.execute_copy("COPY s.o FROM STDIN", b"8\tq\n").is_err());
+    let out = w.execute("COPY s.o TO STDOUT").unwrap().copied.unwrap();
+    assert_eq!(out, b"2\t20\n3\t30\n5\t50\n");
+}
