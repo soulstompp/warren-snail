@@ -35,9 +35,12 @@ at once, and a snail written inside a host that decides its commits.
   PostgreSQL's modes but ACCESS EXCLUSIVE, refused by name since a snail's reader never waits;
   SET, RESET and SHOW of the settings the snail takes, `set_config` and `current_setting`;
   PREPARE, EXECUTE and DEALLOCATE; cursors, FETCH and MOVE in every direction, `WHERE CURRENT OF`;
-  COPY in the text and CSV formats; EXPLAIN printing the snail's round. `exec` takes `--param`,
-  `--answers` and `--go-on`. A statement the snail refuses fails its transaction, as PostgreSQL's
-  does.
+  COPY in the text, CSV and binary formats, COPY FROM's WHERE, ON_ERROR ignore and REJECT_LIMIT;
+  EXPLAIN printing the snail's round; each of them across several snails too. statement_timeout
+  and lock_timeout cancel as PostgreSQL's. BEGIN in a transaction, and COMMIT or ROLLBACK outside
+  one, warn and go on. A foreign key's check holds its parent's table in ROW SHARE. `exec` takes
+  `--param`, `--answers` and `--go-on`. A statement the snail refuses fails its transaction, as
+  PostgreSQL's does.
 - The types: the integers and serials, the floats, `numeric` past 18 digits, `money`; `text`,
   `varchar`, `character`, `name`, `"char"`, `bytea`, the bit strings, `boolean`, `uuid`; the date
   and time types and `interval`; `oid`, `oid8`, `xid`, `xid8`, `cid`, `pg_lsn`, `tid` and the reg*
