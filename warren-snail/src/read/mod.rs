@@ -1469,6 +1469,7 @@ impl Snail {
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _handed = handed::holding(&self.functions);
         let viewing = settings::viewing(self.settings_view());
+        let _timing = self.timing();
         let room = self.reader.room();
         let _room = self.entered_round(&room);
         self.wasted.borrow_mut().clear();

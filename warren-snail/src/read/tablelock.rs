@@ -183,7 +183,7 @@ impl Snail {
                  waits, in a ring, for a lock this writer holds",
             ));
         }
-        let got = take(true);
+        let got = super::settings::wait_for_lock(&take);
         lock::mark_waiting(file, self.slot, byte, false)?;
         got
     }

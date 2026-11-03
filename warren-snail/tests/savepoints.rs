@@ -515,3 +515,104 @@ fn two_writers_each_waiting_for_the_others_table_fail_one_with_a_deadlock() {
     a.execute("ROLLBACK").unwrap();
     rx.recv_timeout(Duration::from_secs(10)).unwrap();
 }
+
+/// A snail of three tables, a parent, a child referencing it, and one apart.
+fn keyed(name: &str) -> std::path::PathBuf {
+    let path = tmp(&format!("{name}.snail"));
+    let catalog = warren_snail::catalog::Catalog::parse(
+        "CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id));
+         CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p, PRIMARY KEY (id));
+         CREATE TABLE s.q (id integer NOT NULL, PRIMARY KEY (id));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.p (id) VALUES (1), (2), (3)").unwrap();
+    path
+}
+
+/// Statements run on a writer of their own, on a thread, their outcomes sent back at the end.
+fn on_thread(
+    path: &std::path::Path,
+    st: Vec<String>,
+) -> mpsc::Receiver<Vec<Result<u64, String>>> {
+    let (tx, rx) = mpsc::channel();
+    let p = path.to_path_buf();
+    std::thread::spawn(move || {
+        let mut o = Snail::open_writing(&p).unwrap();
+        let done = st
+            .iter()
+            .map(|s| o.execute(s).map(|d| d.rows).map_err(|e| e.to_string()))
+            .collect();
+        let _ = o.execute("ROLLBACK");
+        tx.send(done).unwrap();
+    });
+    rx
+}
+
+#[test]
+fn a_foreign_keys_check_holds_its_parents_table_in_row_share() {
+    let path = keyed("savepoint-fk-share");
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("BEGIN").unwrap();
+    w.execute("LOCK TABLE s.p IN EXCLUSIVE MODE").unwrap();
+    let child = on_thread(&path, vec!["INSERT INTO s.c (id, r) VALUES (1, 1)".into()]);
+    assert!(child.recv_timeout(Duration::from_millis(1500)).is_err(), "it waits for EXCLUSIVE");
+    w.execute("COMMIT").unwrap();
+    assert_eq!(child.recv_timeout(Duration::from_secs(10)).unwrap(), [Ok(1)]);
+    // SHARE conflicts with no ROW SHARE: the check goes on.
+    w.execute("BEGIN").unwrap();
+    w.execute("LOCK TABLE s.p IN SHARE MODE").unwrap();
+    let child = on_thread(&path, vec!["INSERT INTO s.c (id, r) VALUES (2, 2)".into()]);
+    assert_eq!(child.recv_timeout(Duration::from_secs(10)).unwrap(), [Ok(1)]);
+    w.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn writers_waiting_in_a_ring_through_three_tables_locks_fail_one_with_a_deadlock() {
+    let path = keyed("savepoint-lock-ring-three");
+    let lock = |t: &str| format!("LOCK TABLE s.{t} IN SHARE ROW EXCLUSIVE MODE");
+    let mut a = Snail::open_writing(&path).unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute(&lock("p")).unwrap();
+    let b = on_thread(&path, vec!["BEGIN".into(), lock("c"), lock("p")]);
+    std::thread::sleep(Duration::from_millis(300));
+    let c = on_thread(&path, vec!["BEGIN".into(), lock("q"), lock("c")]);
+    std::thread::sleep(Duration::from_millis(300));
+    // a waits for q, held by c, which waits for c's table, held by b, which waits for p, a's.
+    let e = a.execute(&lock("q")).unwrap_err().to_string();
+    assert!(e.starts_with("deadlock detected"), "{e}");
+    a.execute("ROLLBACK").unwrap();
+    let b = b.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(b[2], Ok(0), "b takes p once a lets go");
+    let c = c.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(c[2], Ok(0), "c takes c's table once b ends");
+}
+
+#[test]
+fn lock_timeout_and_statement_timeout_cancel_a_wait_in_postgresqls_words() {
+    let path = keyed("savepoint-timeouts");
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("BEGIN").unwrap();
+    w.execute("UPDATE s.p SET id = 10 WHERE id = 1").unwrap();
+    let other = on_thread(
+        &path,
+        vec![
+            "SET lock_timeout = '200ms'".into(),
+            "UPDATE s.p SET id = 20 WHERE id = 1".into(),
+            "RESET lock_timeout".into(),
+            "SET statement_timeout = 200".into(),
+            "UPDATE s.p SET id = 30 WHERE id = 1".into(),
+            "BEGIN".into(),
+            "SET LOCAL lock_timeout = '100ms'".into(),
+            "UPDATE s.p SET id = 40 WHERE id = 1".into(),
+            "SELECT 1".into(),
+        ],
+    );
+    let got = other.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(got[1], Err("canceling statement due to lock timeout".into()));
+    assert_eq!(got[4], Err("canceling statement due to statement timeout".into()));
+    assert_eq!(got[7], Err("canceling statement due to lock timeout".into()));
+    assert!(got[8].as_ref().unwrap_err().contains("current transaction is aborted"));
+    w.execute("ROLLBACK").unwrap();
+}

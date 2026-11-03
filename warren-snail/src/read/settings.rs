@@ -76,7 +76,9 @@ pub(crate) enum Kind {
 
 /// The settings that change no answer: the planner's, the memory and workers a statement may use,
 /// the messages sent and logged, and VACUUM's, which a snail never runs.
-const TAKEN: [&str; 14] = [
+const TAKEN: [&str; 16] = [
+    "statement_timeout",
+    "lock_timeout",
     "application_name",
     "client_min_messages",
     "check_function_bodies",
@@ -94,12 +96,7 @@ const TAKEN: [&str; 14] = [
 ];
 
 /// The settings the snail answers under one value of, and why.
-const OWN: [(&str, &str); 20] = [
-    ("statement_timeout", "the snail never cancels a statement"),
-    (
-        "lock_timeout",
-        "a writer waits for a lock as long as it takes",
-    ),
+const OWN: [(&str, &str); 18] = [
     (
         "idle_in_transaction_session_timeout",
         "the snail ends no session",
@@ -839,14 +836,82 @@ mod tests {
         assert_eq!(kind(18, "work_mem"), Some(Kind::Taken));
         assert_eq!(kind(18, "enable_hashjoin"), Some(Kind::Taken));
         assert!(matches!(
-            kind(18, "statement_timeout"),
+            kind(18, "idle_session_timeout"),
             Some(Kind::Own("0", _))
         ));
+        assert_eq!(kind(18, "statement_timeout"), Some(Kind::Taken));
         assert_eq!(kind(18, "search_path"), Some(Kind::Path));
         assert_eq!(kind(18, "shared_buffers"), Some(Kind::Server));
         assert_eq!(kind(18, "myapp.user"), Some(Kind::Custom));
         assert_eq!(kind(18, "no_such_setting"), None);
         assert_eq!(kind(18, "enable_eager_aggregate"), None);
         assert_eq!(kind(19, "enable_eager_aggregate"), Some(Kind::Taken));
+    }
+}
+
+thread_local! {
+    static TIMEOUTS: std::cell::Cell<(Option<std::time::Instant>, Option<std::time::Duration>)> =
+        const { std::cell::Cell::new((None, None)) };
+}
+
+/// A statement's statement_timeout and lock_timeout while it runs, as PostgreSQL's cancel it.
+pub(crate) struct Timing((Option<std::time::Instant>, Option<std::time::Duration>));
+
+/// The timeouts a statement runs under, each in milliseconds, none at 0, from now.
+pub(crate) fn timing(statement_ms: u64, lock_ms: u64) -> Timing {
+    let now = std::time::Instant::now();
+    let given = (
+        (statement_ms > 0).then(|| now + std::time::Duration::from_millis(statement_ms)),
+        (lock_ms > 0).then(|| std::time::Duration::from_millis(lock_ms)),
+    );
+    Timing(TIMEOUTS.with(|t| t.replace(given)))
+}
+
+impl Drop for Timing {
+    fn drop(&mut self) {
+        TIMEOUTS.with(|t| t.set(self.0));
+    }
+}
+
+/// A setting of milliseconds, as the session stands it, 0 where it is not set.
+pub(crate) fn millis(values: &std::collections::BTreeMap<String, String>, name: &str) -> u64 {
+    values
+        .get(name)
+        .and_then(|v| parse_number(v, "ms", true))
+        .map_or(0, |v| v.max(0.0) as u64)
+}
+
+fn statement_timeout() -> Error {
+    Error::new("canceling statement due to statement timeout")
+}
+
+/// Refused where the statement has run past its statement_timeout.
+pub(crate) fn in_time() -> Result<()> {
+    match TIMEOUTS.with(|t| t.get()).0 {
+        Some(at) if std::time::Instant::now() >= at => Err(statement_timeout()),
+        _ => Ok(()),
+    }
+}
+
+/// A lock taken as `take` takes it, waiting where its argument is true: at once where no timeout
+/// stands, else asked again until it is taken or a timeout passes, refused in PostgreSQL's words.
+pub(crate) fn wait_for_lock(mut take: impl FnMut(bool) -> Result<bool>) -> Result<bool> {
+    let (deadline, lock) = TIMEOUTS.with(|t| t.get());
+    if deadline.is_none() && lock.is_none() {
+        return take(true);
+    }
+    let began = std::time::Instant::now();
+    loop {
+        if take(false)? {
+            return Ok(true);
+        }
+        let now = std::time::Instant::now();
+        if lock.is_some_and(|l| now >= began + l) {
+            return Err(Error::new("canceling statement due to lock timeout"));
+        }
+        if deadline.is_some_and(|d| now >= d) {
+            return Err(statement_timeout());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }

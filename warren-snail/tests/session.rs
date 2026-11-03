@@ -72,8 +72,8 @@ fn show_gives_each_setting_the_snail_answers_under_in_postgresqls_words() {
             "unrecognized configuration parameter \"no_such\"",
         ),
         (
-            "SHOW myapp.user",
-            "unrecognized configuration parameter \"myapp.user\"",
+            "SHOW myapp.who",
+            "unrecognized configuration parameter \"myapp.who\"",
         ),
     ] {
         let e = refused(&mut w, st);
@@ -113,9 +113,9 @@ fn a_setting_set_is_kept_and_put_back_as_postgresql_nests_it() {
     w.execute("SET LOCAL work_mem = '2MB'").unwrap();
     assert_eq!(show(&mut w, "work_mem"), "8MB");
     w.execute("SET application_name = 'My App'").unwrap();
-    w.execute("SET myapp.user TO 'kenny'").unwrap();
+    w.execute("SET myapp.who TO 'kenny'").unwrap();
     assert_eq!(show(&mut w, "application_name"), "My App");
-    assert_eq!(show(&mut w, "myapp.user"), "kenny");
+    assert_eq!(show(&mut w, "myapp.who"), "kenny");
     w.execute("RESET ALL").unwrap();
     assert_eq!(show(&mut w, "work_mem"), "4MB");
     assert_eq!(show(&mut w, "application_name"), "");
@@ -170,8 +170,8 @@ fn a_setting_the_snail_answers_under_one_value_of_is_taken_there_and_refused_els
     }
     for (st, why) in [
         (
-            "SET statement_timeout = '5s'",
-            "the snail never cancels a statement",
+            "SET idle_session_timeout = '5s'",
+            "the snail ends no session",
         ),
         (
             "SET client_encoding = 'LATIN1'",
@@ -258,7 +258,7 @@ fn set_config_and_current_setting_read_and_write_the_sessions_settings() {
     );
     assert_eq!(show(&mut w, "work_mem"), "32MB");
     assert!(w
-        .execute("SELECT set_config('statement_timeout', '5s', false)")
+        .execute("SELECT set_config('idle_session_timeout', '5s', false)")
         .is_err());
 }
 
@@ -452,7 +452,7 @@ fn copy_writes_rows_out_and_reads_them_back_in_text_and_csv() {
     );
     assert_eq!(
         out(&mut w, "COPY (SELECT t.k, t.k * 2 AS twice FROM s.t t WHERE t.k < 3 ORDER BY t.k) TO STDOUT WITH CSV FORCE QUOTE *"),
-        "1,2\n2,4\n"
+        "\"1\",\"2\"\n\"2\",\"4\"\n"
     );
     assert_eq!(
         out(&mut w, "COPY s.t (k, v) TO STDOUT (DELIMITER '|', NULL 'NULL', FORMAT csv, FORCE_QUOTE (v))"),
@@ -524,4 +524,54 @@ fn explain_prints_the_snails_round() {
     let wrote = lines(&mut w, "EXPLAIN ANALYZE DELETE FROM weather.stations WHERE network_id = -1");
     assert_eq!(wrote[0], "Snail write: DELETE 0 rows");
     assert!(w.execute("EXPLAIN (FORMAT XML) SELECT 1").is_err());
+}
+
+#[test]
+fn begin_in_a_transaction_and_an_end_outside_one_warn_and_go_on() {
+    let s = sample(200);
+    let path = snail("session-warn", &s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    for st in ["COMMIT", "ROLLBACK"] {
+        let d = w.execute(st).unwrap();
+        assert_eq!(
+            (d.statement, d.notices),
+            (st, vec!["WARNING:  there is no transaction in progress".to_string()])
+        );
+    }
+    w.execute("BEGIN").unwrap();
+    let d = w.execute("BEGIN").unwrap();
+    assert_eq!(d.notices, ["WARNING:  there is already a transaction in progress"]);
+    w.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    assert_eq!(show(&mut w, "transaction_isolation"), "repeatable read");
+    w.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn default_text_search_config_is_the_files_and_set_config_in_a_write_stands_for_the_session() {
+    let s = sample(200);
+    let path = snail("session-tsearch", &s);
+    let mut w = Snail::open_writing(&path).unwrap();
+    assert_eq!(show(&mut w, "default_text_search_config"), "pg_catalog.simple");
+    w.execute("SET default_text_search_config = 'pg_catalog.simple'").unwrap();
+    assert!(w
+        .execute("SET default_text_search_config = 'pg_catalog.english'")
+        .unwrap_err()
+        .to_string()
+        .contains("refused"));
+    let (network, station) = stations_of(&s)[0];
+    w.execute(&format!(
+        "UPDATE weather.stations SET name = set_config('myapp.last', 'renamed', false) \
+         WHERE network_id = {network} AND station_no = {station}"
+    ))
+    .unwrap();
+    assert_eq!(show(&mut w, "myapp.last"), "renamed");
+    w.execute("BEGIN").unwrap();
+    w.execute(&format!(
+        "UPDATE weather.stations SET name = set_config('work_mem', '8MB', true) \
+         WHERE network_id = {network} AND station_no = {station}"
+    ))
+    .unwrap();
+    assert_eq!(show(&mut w, "work_mem"), "8MB");
+    w.execute("COMMIT").unwrap();
+    assert_eq!(show(&mut w, "work_mem"), "4MB");
 }

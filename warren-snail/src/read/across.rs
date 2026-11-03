@@ -962,12 +962,17 @@ impl Snails {
                 at: statement::Isolated::Begin,
                 ..
             } => {
-                if self.begun {
-                    return Err(Error::new("a transaction is begun already"));
-                }
+                // In a transaction each snail warns and goes on.
+                let begun = self.begun;
                 let mut done = Done::default();
-                for s in &mut self.snails {
-                    done = s.execute(sql)?;
+                for i in 0..self.snails.len() {
+                    done = match begun {
+                        true => self.run(i, sql)?,
+                        false => self.snails[i].execute(sql)?,
+                    };
+                }
+                if begun {
+                    return Ok(done);
                 }
                 // One clock for the whole transaction, as PostgreSQL's now() is.
                 let clock = self.snails[0].clock.0;
@@ -978,22 +983,19 @@ impl Snails {
                 self.written.clear();
                 Ok(done)
             }
+            Statement::Commit | Statement::Rollback if !self.begun => Ok(Done {
+                statement: st.kind(),
+                notices: vec!["WARNING:  there is no transaction in progress".into()],
+                ..Default::default()
+            }),
             Statement::Rollback => {
-                if !self.begun {
-                    return Err(Error::new("no transaction is begun"));
-                }
                 self.end_all()?;
                 Ok(Done {
                     statement: "ROLLBACK",
                     ..Default::default()
                 })
             }
-            Statement::Commit => {
-                if !self.begun {
-                    return Err(Error::new("no transaction is begun"));
-                }
-                self.commit()
-            }
+            Statement::Commit => self.commit(),
             Statement::Declare { .. } => Err(Error::new(
                 "a table is declared on its own snail: open it alone to write",
             )),

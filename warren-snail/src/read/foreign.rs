@@ -632,6 +632,8 @@ impl Snail {
             .iter()
             .position(|t| t.name == k.parent)
             .expect("a foreign key's parent is in the file");
+        // The check reads its parent as PostgreSQL's FOR KEY SHARE does, holding its table in ROW SHARE.
+        self.lock_table(pi, super::tablelock::Mode::RowShare, false)?;
         if self.held {
             return self.holds_key_beside(pi, k, key).map(Some);
         }
@@ -728,6 +730,7 @@ impl Snail {
                 return Ok(None);
             }
             let n = self.count_where(ci, &k.columns, key)?;
+            self.lock_table(ci, super::tablelock::Mode::RowShare, false)?;
             if n > 0 && !self.lock_blocks(ci, oi, blocks, Waiting::Wait)? {
                 self.stale = true;
                 return Ok(None);
@@ -777,6 +780,7 @@ impl Snail {
             Some(b) => b,
             None => self.blocks_holding(ci, oi, &rows)?,
         };
+        self.lock_table(ci, super::tablelock::Mode::RowShare, false)?;
         if !self.lock_blocks(ci, oi, blocks, Waiting::Wait)? {
             self.stale = true;
             return Ok(None);
@@ -878,6 +882,7 @@ impl Snail {
     /// rows of its other columns lie still the newest root's. None where the round must run again.
     fn holds_period(&mut self, k: &ForeignKey, key: &[Datum]) -> Result<Option<bool>> {
         let (pi, oi) = self.referenced_order(k);
+        self.lock_table(pi, super::tablelock::Mode::RowShare, false)?;
         let (rows, periods, fresh) = self.periods_meeting(k, key)?;
         let ty = self.catalog.tables[pi].columns[k.parent_columns[key.len() - 1]].ty;
         let Some(period) = period_of(&key[key.len() - 1]) else {
@@ -916,6 +921,7 @@ impl Snail {
             return Ok(Some(false));
         }
         let (pi, oi) = self.referenced_order(k);
+        self.lock_table(pi, super::tablelock::Mode::RowShare, false)?;
         let (parents, periods, fresh) = self.periods_meeting(k, key)?;
         let n = key.len() - 1;
         let ty = self.catalog.tables[ci].columns[k.columns[n]].ty;

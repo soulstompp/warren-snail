@@ -1211,6 +1211,7 @@ impl Reader {
     }
 
     pub fn read(&self, start: u64, pages: u64) -> Result<Vec<u8>> {
+        crate::read::settings::in_time()?;
         let mut buf = vec![0u8; pages as usize * PAGE];
         if start >= STAGED {
             // Pages staged in memory: read from no file, so counted as found held.

@@ -61,6 +61,9 @@ pub struct Done {
     pub answer: Option<RecordBatch>,
     /// The bytes COPY … TO STDOUT wrote.
     pub copied: Option<Vec<u8>>,
+    /// What it said beside its answer, each a line as PostgreSQL's client prints its WARNING or
+    /// NOTICE.
+    pub notices: Vec<String>,
 }
 
 /// How a writer takes a block's lock: waiting while another writer has it, as long as it takes,
@@ -795,6 +798,7 @@ impl Snail {
         }
         let _handed = super::handed::holding(&self.functions);
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
+        let _timing = self.timing();
         let written_out;
         let text = match params.is_empty() {
             true => sql,
@@ -914,6 +918,7 @@ impl Snail {
             statement: st.kind(),
             ..Default::default()
         };
+        let viewing = super::settings::viewing(self.settings_view());
         let changed = match st {
             Statement::Setting { .. } => false,
             Statement::Begin
@@ -921,13 +926,28 @@ impl Snail {
                 at: statement::Isolated::Begin,
                 ..
             } => {
-                if self.begun.is_some() {
-                    return Err(Error::new("a transaction is begun already"));
-                }
                 let modes = match st {
                     Statement::Isolation { modes, .. } => modes,
                     _ => Default::default(),
                 };
+                // BEGIN in a transaction warns and goes on, its modes set for the transaction, as
+                // PostgreSQL's does.
+                if self.begun.is_some() {
+                    done.notices
+                        .push("WARNING:  there is already a transaction in progress".into());
+                    if modes != Default::default() {
+                        let sub = !self.savepoints.is_empty();
+                        if let Err(e) =
+                            self.levels
+                                .set(modes, statement::Isolated::Transaction, true, sub)
+                        {
+                            self.failed()?;
+                            return Err(e);
+                        }
+                    }
+                    done.generation = self.root.generation;
+                    return Ok(done);
+                }
                 if modes.level == Some(statement::Isolation::Serializable) {
                     self.serial_allowed(true)?;
                 }
@@ -954,10 +974,17 @@ impl Snail {
                 }
                 false
             }
+            Statement::Commit if self.begun.is_none() => {
+                done.notices
+                    .push("WARNING:  there is no transaction in progress".into());
+                false
+            }
+            Statement::Rollback if self.begun.is_none() => {
+                done.notices
+                    .push("WARNING:  there is no transaction in progress".into());
+                false
+            }
             Statement::Commit => {
-                if self.begun.is_none() {
-                    return Err(Error::new("no transaction is begun"));
-                }
                 // The foreign keys deferred to the commit are checked on the newest root, and a
                 // transaction of one snapshot's rows written there; one that fails rolls the
                 // transaction back, as PostgreSQL's COMMIT does.
@@ -1044,6 +1071,10 @@ impl Snail {
                 }
             }
         };
+        // What set_config set as the statement ran stands for the session once it has.
+        for (name, taken, local) in viewing.changed() {
+            self.take_setting(&name, taken, local)?;
+        }
         if let Some((_, any)) = self.begun.as_mut() {
             *any |= changed;
         } else if changed || self.serial_records()? {
@@ -1826,7 +1857,7 @@ impl Snail {
                      in a ring, for a block this writer holds",
                 ));
             }
-            let taken = lock::lock_as(file, b, shared, true);
+            let taken = super::settings::wait_for_lock(|w| lock::lock_as(file, b, shared, w));
             lock::mark_waiting(file, self.slot, b, false)?;
             taken?;
         }

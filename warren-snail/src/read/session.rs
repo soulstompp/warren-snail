@@ -791,3 +791,14 @@ fn col_id(word: &str) -> bool {
         f.next() == Some(lower.as_str()) && matches!(f.next(), Some("R" | "T"))
     })
 }
+
+impl super::Snail {
+    /// The statement_timeout and lock_timeout the session's next statement runs under.
+    pub(super) fn timing(&self) -> super::settings::Timing {
+        let all = self.session.settings.all();
+        super::settings::timing(
+            super::settings::millis(all, "statement_timeout"),
+            super::settings::millis(all, "lock_timeout"),
+        )
+    }
+}
