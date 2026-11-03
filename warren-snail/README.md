@@ -947,7 +947,9 @@ name.
   partitioned or not, named in a `WINDOW` clause, their frames `ROWS`, `RANGE` and `GROUPS` offset
   from the current row, whole partitions and `EXCLUDE`, and in a file of release 19 `RESPECT` and
   `IGNORE NULLS`; `CASE`, `COALESCE`, `LEAST`, `GREATEST`, `NULLIF`, `IN`, casts, comparisons and
-  `IS [NOT] DISTINCT FROM`;
+  `IS [NOT] DISTINCT FROM`; `ORDER BY … USING` an operator a B-tree class orders by, or `~<~` and
+  `~>~`, wherever an `ORDER BY` stands; `TABLESAMPLE SYSTEM` and `BERNOULLI`, `REPEATABLE` or not,
+  a table's rows drawn by its counts and only the pages of what is drawn read;
   the functions `warren-snail functions` names held and the operators `warren-snail operators`
   names held, regular expressions among them, matching as PostgreSQL's own engine matches;
   parameters `$1` and on. Each step's expressions are typed before
@@ -959,7 +961,9 @@ Anything else is refused, with a sentence that says what is not read: among it a
 `SEARCH` and `CYCLE` clauses, a window over groups, a locking clause (`FOR UPDATE`, `FOR NO KEY
 UPDATE`, `FOR SHARE`, `FOR KEY SHARE`), the record image's order (`*<`, `*<=`, `*>`, `*>=` and `record_image_ops`), which is PostgreSQL's in-memory layout of each type, and in a write `RETURNING`, `ON CONFLICT`, `UPDATE …
 FROM`, `DELETE … USING`, `TRUNCATE`, `MERGE` and a savepoint. A statement sqlparser reads otherwise than it is written is refused too, so
-nothing it declares is dropped without a word.
+nothing it declares is dropped without a word: what PostgreSQL's grammar has no place for (`TOP`,
+`LATERAL VIEW`, `CONNECT BY`, `QUALIFY`, `FOR XML`, a string as a label, a table's hints) in its
+words, and `SELECT … INTO`, which makes a table with no key, a session's or an unlogged one, by why.
 
 ### What the commands record
 

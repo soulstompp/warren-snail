@@ -167,6 +167,24 @@ at once, and a snail written inside a host that decides its commits.
 - B-tree `cidr_ops`, the order `inet_ops` gives; text's operator classes on a `pg_node_tree` and
   bytea's on `pg_ndistinct`, `pg_dependencies` and `pg_mcv_list`, by each method, through the casts
   PostgreSQL's catalog holds as bytes.
+- `ORDER BY … USING` wherever it stands; `TABLESAMPLE SYSTEM` and `BERNOULLI`, drawn from the
+  counts, reading only the pages of what they draw; integers written in bases 16, 8 and 2 and
+  digits parted by underscores, from release 16 on; strings a newline apart, `x ISNULL` and
+  `x NOTNULL`; a type-prefixed literal's modifier; a cast to a domain of the file's.
+
+### Fixed
+
+- A statement's words read as PostgreSQL's scanner and grammar read them where sqlparser read
+  them otherwise: `0x10` was a bit string and `0o17` a 0 labelled `o17`; `n ISNULL` and a second
+  string on a new line were labels; `TOP`, `LATERAL VIEW`, `CONNECT BY`, `QUALIFY`, `FOR XML` and
+  a string as a label were dropped; `SELECT … INTO` answered as a question. Each is now read as
+  PostgreSQL reads it or refused in its words.
+- An `UPDATE` or a `DELETE` whose condition the pipeline reads, on a table holding a `numeric`,
+  was refused, *a row the statement found is not in* its order.
+- A function in `FROM` returning a record of one field gave the record, not its field.
+- A composite's text field under a library collation compared by its bytes.
+- A row made of a domain's column compared as the domain's base type.
+- GiST took `inet_ops` as inet's default on a file of release 18 or before.
 
 ## 0.1.1
 
