@@ -268,10 +268,6 @@ fn column0(d: &warren_snail::read::Done) -> Vec<Option<String>> {
     (0..b.num_rows()).map(|r| cell(b.column(0).as_ref(), r)).collect()
 }
 
-fn ids(v: &[i64]) -> Vec<Option<String>> {
-    v.iter().map(|x| Some(x.to_string())).collect()
-}
-
 #[test]
 fn a_prepared_statement_runs_with_its_parameters_typed_as_postgresql_types_them() {
     let s = sample(500);
@@ -429,4 +425,65 @@ fn where_current_of_writes_the_row_the_cursor_stands_on() {
             .0),
         0
     );
+}
+
+#[test]
+fn copy_writes_rows_out_and_reads_them_back_in_text_and_csv() {
+    let path = tmp("session-copy.snail");
+    let catalog = warren_snail::catalog::Catalog::parse(
+        "CREATE TABLE s.t (k integer NOT NULL, v text, b boolean, c character(3), PRIMARY KEY (k));",
+    )
+    .unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(
+        "INSERT INTO s.t (k, v, b, c) VALUES (1, 'plain', true, 'ab'), (2, 'tab\there\nline\\back', false, NULL), \
+         (3, 'a,b \"q\"', NULL, 'xyz'), (4, '', true, ''), (5, NULL, false, 'z')",
+    )
+    .unwrap();
+    let out = |w: &mut Snail, st: &str| String::from_utf8(w.execute(st).unwrap().copied.unwrap()).unwrap();
+    assert_eq!(
+        out(&mut w, "COPY s.t TO STDOUT"),
+        "1\tplain\tt\tab \n2\ttab\\there\\nline\\\\back\tf\t\\N\n3\ta,b \"q\"\t\\N\txyz\n4\t\tt\t   \n5\t\\N\tf\tz  \n"
+    );
+    assert_eq!(
+        out(&mut w, "COPY s.t (k, v) TO STDOUT WITH (FORMAT csv, HEADER)"),
+        "k,v\n1,plain\n2,\"tab\there\nline\\back\"\n3,\"a,b \"\"q\"\"\"\n4,\"\"\n5,\n"
+    );
+    assert_eq!(
+        out(&mut w, "COPY (SELECT t.k, t.k * 2 AS twice FROM s.t t WHERE t.k < 3 ORDER BY t.k) TO STDOUT WITH CSV FORCE QUOTE *"),
+        "1,2\n2,4\n"
+    );
+    assert_eq!(
+        out(&mut w, "COPY s.t (k, v) TO STDOUT (DELIMITER '|', NULL 'NULL', FORMAT csv, FORCE_QUOTE (v))"),
+        "1|\"plain\"\n2|\"tab\there\nline\\back\"\n3|\"a,b \"\"q\"\"\"\n4|\"\"\n5|NULL\n"
+    );
+    // Out and back in, each format: the same rows.
+    for options in ["", " WITH (FORMAT csv)", " (FORMAT csv, HEADER true, DELIMITER ';')", " (HEADER)"] {
+        let text = out(&mut w, &format!("COPY s.t TO STDOUT{options}"));
+        w.execute("DELETE FROM s.t").unwrap();
+        let d = w
+            .execute_copy(&format!("COPY s.t FROM STDIN{options}"), text.as_bytes())
+            .unwrap();
+        assert_eq!((d.statement, d.rows), ("COPY", 5), "{options}");
+        assert_eq!(out(&mut w, &format!("COPY s.t TO STDOUT{options}")), text, "{options}");
+    }
+    // To a file and back.
+    let file = tmp("session-copy.txt");
+    w.execute(&format!("COPY s.t TO '{}'", file.display())).unwrap();
+    w.execute("DELETE FROM s.t WHERE k > 1").unwrap();
+    w.execute("DELETE FROM s.t WHERE k = 1").unwrap();
+    assert_eq!(w.execute(&format!("COPY s.t FROM '{}'", file.display())).unwrap().rows, 5);
+    // A row of the wrong width, and COPY FROM STDIN with no rows handed, refused.
+    for (st, rows, said) in [
+        ("COPY s.t FROM STDIN", "6\tx\n", "missing data for column \"b\""),
+        ("COPY s.t (k) FROM STDIN", "6\tx\n", "extra data after last expected column (line 1)"),
+        ("COPY s.t TO STDOUT (FORMAT binary)", "", "COPY … BINARY is refused"),
+        ("COPY s.t TO STDOUT (QUOTE '\"')", "", "COPY QUOTE requires CSV mode"),
+    ] {
+        let e = w.execute_copy(st, rows.as_bytes()).unwrap_err().to_string();
+        assert!(e.starts_with(said), "{st}: {e}");
+    }
+    assert!(w.execute("COPY s.t FROM STDIN").is_err());
+    fresh(&path).census().unwrap();
 }

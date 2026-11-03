@@ -59,6 +59,8 @@ pub struct Done {
     pub pages_reused: u64,
     /// A question's answer.
     pub answer: Option<RecordBatch>,
+    /// The bytes COPY … TO STDOUT wrote.
+    pub copied: Option<Vec<u8>>,
 }
 
 /// How a writer takes a block's lock: waiting while another writer has it, as long as it takes,
@@ -476,25 +478,7 @@ fn assigned_types(
     ti: usize,
     fills: &[(usize, usize)],
 ) -> Result<Vec<ColumnType>> {
-    let types: Vec<ColumnType> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| {
-            match crate::composed::field_composed(f)
-                .or_else(|| crate::scalars::field_scalar(f))
-                .or_else(|| crate::strings::field_string(f))
-            {
-                Some(ty) => Ok(ty),
-                None if crate::numeric::is_numeric_field(f)
-                    && matches!(f.data_type(), arrow::datatypes::DataType::Utf8) =>
-                {
-                    Ok(ColumnType::NumericText(None))
-                }
-                None => answer_type(f.data_type()),
-            }
-        })
-        .collect::<Result<_>>()?;
+    let types = answer_types(batch)?;
     let stated = stated_types(catalog, question);
     let t = &catalog.tables[ti];
     for &(c, i) in fills {
@@ -514,6 +498,30 @@ fn assigned_types(
             )));
         }
     }
+    Ok(types)
+}
+
+/// The type of each column of an answer, as the snail answers a column of that type.
+pub(super) fn answer_types(batch: &RecordBatch) -> Result<Vec<ColumnType>> {
+    let types: Vec<ColumnType> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            match crate::composed::field_composed(f)
+                .or_else(|| crate::scalars::field_scalar(f))
+                .or_else(|| crate::strings::field_string(f))
+            {
+                Some(ty) => Ok(ty),
+                None if crate::numeric::is_numeric_field(f)
+                    && matches!(f.data_type(), arrow::datatypes::DataType::Utf8) =>
+                {
+                    Ok(ColumnType::NumericText(None))
+                }
+                None => answer_type(f.data_type()),
+            }
+        })
+        .collect::<Result<_>>()?;
     Ok(types)
 }
 

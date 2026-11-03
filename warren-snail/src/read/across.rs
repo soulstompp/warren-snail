@@ -1173,7 +1173,8 @@ impl Snails {
             | Said::Deallocate { .. }
             | Said::Declare(_)
             | Said::Fetch { .. }
-            | Said::Close { .. } => Err(Error::new(
+            | Said::Close { .. }
+            | Said::Copy(_) => Err(Error::new(
                 "prepared statements and cursors are a session's on one snail: open it alone to \
                  write",
             )),

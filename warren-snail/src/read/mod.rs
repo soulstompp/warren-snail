@@ -13,6 +13,7 @@ mod calls;
 mod change;
 mod clock;
 mod collate;
+mod copy;
 mod cursor;
 pub(crate) mod elements;
 pub(crate) mod fill;

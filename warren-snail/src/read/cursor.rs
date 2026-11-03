@@ -43,7 +43,7 @@ pub enum Direction {
 
 /// DECLARE's words: the cursor's name, BINARY, SCROLL or NO SCROLL, WITH HOLD, and its question.
 #[derive(Clone, Debug)]
-pub(super) struct Declaration {
+pub struct Declaration {
     pub(super) name: String,
     pub(super) scroll: Option<bool>,
     pub(super) hold: bool,

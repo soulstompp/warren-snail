@@ -64,6 +64,8 @@ pub enum Said {
     },
     /// CLOSE of a cursor, or of them all.
     Close { name: Option<String> },
+    /// COPY.
+    Copy(Box<super::copy::Copy>),
 }
 
 /// The words of a statement but its white space and its last semicolon.
@@ -301,6 +303,7 @@ impl Said {
             Said::Fetch { fetch: true, .. } => "FETCH",
             Said::Fetch { .. } => "MOVE",
             Said::Close { .. } => "CLOSE CURSOR",
+            Said::Copy(_) => "COPY",
         }
     }
 }
@@ -352,6 +355,9 @@ pub(super) fn said(
             name,
         }));
     }
+    if let Some(read) = super::copy::parse_copy(catalog, sql) {
+        return Ok(Some(Said::Copy(Box::new(read?))));
+    }
     if let Some(read) = parse_execute(sql) {
         return read.map(Some);
     }
@@ -367,6 +373,8 @@ pub(super) struct Session {
     pub(super) table_locks: BTreeSet<(usize, Mode)>,
     /// The cursors declared so far, which numbers each.
     pub(super) cursor_count: u64,
+    /// The rows a caller hands COPY … FROM STDIN.
+    pub(super) copy_input: Option<Vec<u8>>,
 }
 
 /// What a savepoint keeps of the session: the settings, which cursors were open, and the tables'
@@ -419,11 +427,6 @@ pub(super) struct Settings {
 }
 
 impl Settings {
-    /// The value a setting stands at, where the session set it.
-    pub(super) fn get(&self, name: &str) -> Option<&str> {
-        self.now.get(name).map(String::as_str)
-    }
-
     /// A SET: of the session, which outlives its transaction where it commits, or LOCAL, for the
     /// transaction alone; `None` sets the default back.
     pub(super) fn set(&mut self, name: &str, value: Option<String>, local: bool, begun: bool) {
@@ -579,6 +582,15 @@ impl super::Snail {
                 name,
             } => return self.fetch(fetch, &direction, &name),
             Said::Close { name } => self.close_cursor(name.as_deref())?,
+            Said::Copy(c) => {
+                return match c.from_stdin() || !c.to() {
+                    true => {
+                        let given = self.session.copy_input.take();
+                        self.copy_from(&c, given.as_deref())
+                    }
+                    false => self.copy_to(&c),
+                }
+            }
             Said::Reset { name: None } => {
                 let begun = self.begun.is_some();
                 self.session.settings.reset_all(begun);
