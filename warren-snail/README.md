@@ -631,6 +631,23 @@ that holds none of the question's pages is never opened.
 **How it shows.** `blocks --out` records, for each column of each block, the files its page map
 and its pages lie in.
 
+## Any number of tables
+
+**What it writes.** The root names each order's directory, each money column's `lc_monetary`, the
+catalog and where each sequence stands. While that fits the root's one page, the root holds it, as
+it always has. Once it would not, in a file of format 9, it goes into lists of pages the root names:
+the tables' orders and money columns, keyed by table, the top of their list in the root; the
+catalog's text, a page a chunk; the sequences, by name. A commit writes again only the pages of a
+list it changed, and those above them, each to a fresh page, then the root, which stays one small
+write. A file of format 7 or 8 refuses a schema its root does not hold, by name.
+
+**The read it cancels.** A round on one table of thousands reads the root, its table's directory
+and its pages, never a page of another table's. An open snail keeps the pages of the lists it read,
+and reads again only those a commit wrote since; opening a snail reads them all once.
+
+**How it shows.** `Root::is_cut` says whether the root's lists lie in pages of their own; `census`
+counts those pages among the pages the root names; `exec --out` records each statement's pages.
+
 **Where it stops.** A row group is never split between files. `out` writes a table larger than one
 of the snail's files as a directory of numbered Parquet files, each holding whole row groups, and
 one row group larger than a file in a file of its own; `write` reads such a directory back, its

@@ -153,6 +153,11 @@ at once, and a snail written inside a host that decides its commits.
   `room::Sizes` naming its bytes and, by `written_to`, a `room::RoundFile` of the host's for the rows
   past them, and hands its answer out a batch at a time (`read::Answering`). `Priced`'s tables say the
   bytes a round holds of each.
+- Any number of tables in a file of format 9. Where the root would not hold the tables' orders,
+  their money columns' `lc_monetary`, the catalog and the sequences, they lie in pages the root names,
+  and a commit writes again only the pages of the tables it wrote; `Root::is_cut` says which. 0.1.1
+  refused a file whose root could not hold its tables; a file of format 7 or 8 still refuses it, by
+  name.
 - Followers: `Snail::carried_by`, `carry::Commit`, `carry::apply` and `carry::copy` carry each
   commit to other copies of the file.
 - A host that decides its commits: `Snail::open_carried`, `Snail::open_judged`, `carry::Judge`,
