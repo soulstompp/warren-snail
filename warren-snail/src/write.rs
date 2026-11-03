@@ -1560,7 +1560,7 @@ pub fn cut_checked(table: &Table, order: &Order, head: &Head) -> Result<()> {
     for (li, l) in order.levels.iter().enumerate() {
         let column = &table.columns[l.column()];
         let had = head.cut_under.get(li).map_or("", String::as_str);
-        if had.is_empty() && !column.collated() {
+        if had.is_empty() && !column.keyed_under_a_library() {
             continue;
         }
         let now = column.cut_under();

@@ -1012,6 +1012,30 @@ pub struct Column {
     pub library: Option<crate::collations::Spec>,
 }
 
+/// The fields of a composite, inside its arrays and its composites, whose text its key orders under
+/// a library collation: each field's path and the collation's number.
+fn fields_collated(ty: ColumnType, path: &str, out: &mut Vec<(String, u16)>) {
+    let ColumnType::Composed(r) = ty else {
+        return;
+    };
+    match r.def() {
+        crate::composed::Composed::Record { fields, .. } => {
+            for f in fields {
+                let p = match path {
+                    "" => f.name.clone(),
+                    _ => format!("{path}.{}", f.name),
+                };
+                if let Some(id) = f.collation {
+                    out.push((p.clone(), id));
+                }
+                fields_collated(f.ty, &p, out);
+            }
+        }
+        crate::composed::Composed::Array { element, .. } => fields_collated(*element, path, out),
+        _ => {}
+    }
+}
+
 impl Column {
     /// Whether its text is ordered by a library collation, glibc's LC_COLLATE C and POSIX aside,
     /// which order by the bytes.
@@ -1029,12 +1053,31 @@ impl Column {
     }
 
     /// What an order with a level on it records the level was cut under: its collation and the
-    /// version its library gives, where `collated`; nothing otherwise.
+    /// version its library gives, where `collated`; for a composite, each of its fields' text keyed
+    /// under a library collation, by the field's path, as its key orders it; nothing otherwise.
     pub fn cut_under(&self) -> Result<String> {
         match (self.orderer()?, &self.library) {
             (Some(c), Some(spec)) => Ok(spec.cut_under(c.version())),
-            _ => Ok(String::new()),
+            _ => {
+                let mut fields = Vec::new();
+                fields_collated(self.ty, "", &mut fields);
+                Ok(fields
+                    .iter()
+                    .map(|(path, id)| {
+                        let c = crate::collations::get(*id);
+                        format!("field {path} {}", c.spec.cut_under(c.version()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "))
+            }
         }
+    }
+
+    /// Whether an order on it is keyed under a library collation: its text, or a composite's field.
+    pub fn keyed_under_a_library(&self) -> bool {
+        let mut fields = Vec::new();
+        fields_collated(self.ty, "", &mut fields);
+        self.collated() || !fields.is_empty()
     }
 
     /// The collator its text is ordered by and its case mapped by, where its collation calls a

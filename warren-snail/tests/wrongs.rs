@@ -399,6 +399,83 @@ fn a_composite_s_text_field_is_compared_and_ordered_under_its_collation() {
     }
 }
 
+#[cfg(all(feature = "standalone", feature = "collations"))]
+#[test]
+fn an_order_on_a_composite_s_collated_field_records_its_version_and_is_refused_under_another() {
+    use warren_snail::collations::{open, Spec};
+    let path = tmp("wrongs-collated-order.snail");
+    let ddl = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
+               CREATE TYPE s.cc AS (v text COLLATE s.ci);\n\
+               CREATE TABLE s.ct (id integer PRIMARY KEY, c s.cc);\n\
+               CREATE INDEX ct_c ON s.ct (c, id);";
+    let catalog = Catalog::parse(ddl).unwrap();
+    write(&path, &catalog, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO s.ct VALUES (1, ROW('a')), (2, ROW('A')), (3, ROW('b')), (4, ROW('B'))")
+        .unwrap();
+    drop(w);
+    let along = |s: &mut Snail| {
+        let (b, _) = s
+            .ask("SELECT id FROM s.ct WHERE c = ROW('A')::s.cc ORDER BY id", Some("ct_c"))
+            .map_err(|e| e.to_string())?;
+        Ok::<Vec<String>, String>(
+            (0..b.num_rows())
+                .map(|r| arrow::util::display::array_value_to_string(b.column(0), r).unwrap())
+                .collect(),
+        )
+    };
+    let one_two = Ok(vec!["1".to_string(), "2".to_string()]);
+    // The order records its field's collation and the version ICU gives it, as a text level does.
+    let (_, c) = open(&Spec::icu("und-u-ks-level2", None, false), "test").unwrap();
+    let recorded = format!(
+        "field v collation icu und-u-ks-level2 nondeterministic version {}",
+        c.version()
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    let found: Vec<usize> = bytes
+        .windows(recorded.len())
+        .enumerate()
+        .filter(|(_, w)| *w == recorded.as_bytes())
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!found.is_empty(), "the order records {recorded}");
+    assert_eq!(along(&mut Snail::open(&path).unwrap()), one_two);
+    // Under another version it is refused by name, until re-cut; the table's own order reads.
+    for i in &found {
+        let last = i + recorded.len() - 1;
+        bytes[last] = if bytes[last] == b'0' { b'1' } else { b'0' };
+    }
+    std::fs::write(&path, &bytes).unwrap();
+    let mut s = Snail::open(&path).unwrap();
+    let e = along(&mut s).unwrap_err();
+    assert!(e.contains("ct_c") && e.contains("re-cut"), "{e}");
+    let (b, _) = s.ask("SELECT id FROM s.ct WHERE id = 3", Some("ct_pkey")).unwrap();
+    assert_eq!(b.num_rows(), 1);
+    let to = tmp("wrongs-collated-order-recut.snail");
+    s.recut(&to).unwrap();
+    assert_eq!(along(&mut Snail::open(&to).unwrap()), one_two);
+    // Out, then in by `write`: cut afresh under this build's version.
+    let dir = tmp("wrongs-collated-order-parquet");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = Snail::open(&to).unwrap().out(&dir).unwrap()[0].file.clone();
+    let back = tmp("wrongs-collated-order-back.snail");
+    warren_snail::write::write_parquet(&back, &catalog, &[("s.ct".into(), file)], weather::span(), None, None)
+        .unwrap();
+    assert_eq!(along(&mut Snail::open(&back).unwrap()), one_two);
+    let again = std::fs::read(&back).unwrap();
+    assert!(again.windows(recorded.len()).any(|w| w == recorded.as_bytes()));
+}
+
+#[cfg(not(feature = "collations"))]
+#[test]
+fn a_composite_s_field_under_a_library_collation_is_refused_by_name_without_the_feature() {
+    let ddl = "CREATE TYPE s.ce AS (v text COLLATE \"en-x-icu\");\n\
+               CREATE TABLE s.ct (id integer PRIMARY KEY, c s.ce);";
+    let e = Catalog::parse(ddl).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("s.ct.c") && e.contains("COLLATE en-x-icu"), "{e}");
+}
+
 #[cfg(feature = "standalone")]
 mod written {
     use super::*;
