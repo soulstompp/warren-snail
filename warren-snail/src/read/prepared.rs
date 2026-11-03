@@ -366,7 +366,7 @@ impl Snail {
                 "wrong number of parameters for prepared statement \"{name}\""
             )));
         }
-        let casings = super::pipeline::Casings::under(self.catalog.monetary);
+        let casings = super::pipeline::Casings::of_file(self.catalog.monetary, self.catalog.text_search);
         let mut values = Vec::with_capacity(args.len());
         for (a, ty) in args.iter().zip(&p.types) {
             let text = match ty {

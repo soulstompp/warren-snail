@@ -570,6 +570,19 @@ impl Casings {
         }
     }
 
+    /// No column's casing, under a file's lc_monetary and default_text_search_config: what an
+    /// expression naming no table reads.
+    pub(crate) fn of_file(
+        monetary: crate::monetary::Monetary,
+        text_search: crate::tsearch::TextSearch,
+    ) -> Casings {
+        Casings {
+            monetary,
+            text_search,
+            ..Casings::default()
+        }
+    }
+
     /// The casings of several tables' columns, each table's collations carried under its name, and
     /// the collations the DDL makes.
     pub(super) fn of_tables(
