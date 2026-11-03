@@ -708,6 +708,10 @@ fn a_distance_beside_a_condition_finds_its_nearest_rows_along_its_strand() {
     let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     let got: Vec<i64> = (0..5).map(|i| a.value(i)).collect();
     assert_eq!(got, all[..5].iter().map(|x| x.1).collect::<Vec<_>>());
+    // A distance returned with no ORDER BY is a row's at a time.
+    let q = "SELECT id, v <-> point '(1030,1030)' FROM s.t WHERE id = 7";
+    let (b, _) = s.ask(q, None).unwrap();
+    assert_eq!(b.num_rows(), 1);
 }
 
 #[test]
@@ -1984,6 +1988,10 @@ fn a_tie_is_read_only_where_the_question_can_mean_it_and_with_ties_keeps_them_al
     let off = format!("SELECT id FROM s.t ORDER BY v <-> point '{centre}', id LIMIT 3 OFFSET 2");
     let (key, _) = along(&mut fresh(&path), &off, Some("t_pkey"));
     assert_eq!(along(&mut fresh(&path), &off, None).0, key);
+    let far = format!("SELECT id FROM s.t ORDER BY v <-> point '{centre}', id LIMIT 1 OFFSET 40");
+    let (key, _) = along(&mut fresh(&path), &far, Some("t_pkey"));
+    assert_eq!(key.len(), 1);
+    assert_eq!(along(&mut fresh(&path), &far, None).0, key);
     let none = format!("SELECT id FROM s.t ORDER BY v <-> point '{centre}' LIMIT 0");
     let (got, round) = along_any(&mut fresh(&path), &none);
     assert_eq!((got, round.column_pages_read), (0, 0));
@@ -2274,22 +2282,24 @@ fn a_strand_of_several_levels_and_a_partial_one_give_a_distance_where_they_hold_
 #[cfg(feature = "standalone")]
 #[test]
 fn at_serializable_a_distance_read_marks_the_strand_whole_so_a_nearer_row_written_is_met() {
-    let path = table_of("plane-near-serial", "point", GeoKind::Point, &["gist"], 16384, |i| {
-        Some(format!("({},{})", cell(i).0, cell(i).1))
-    });
+    let path = grid("plane-near-serial");
     let mut a = Snail::open_writing(&path).unwrap();
     let mut b = Snail::open_writing(&path).unwrap();
     let serial = "BEGIN ISOLATION LEVEL SERIALIZABLE";
     a.execute(serial).unwrap();
     b.execute(serial).unwrap();
-    let near_a = "SELECT id FROM s.t ORDER BY v <-> point '(1100.5,1100.5)', id LIMIT 3";
-    let near_b = "SELECT id FROM s.t ORDER BY v <-> point '(1900.5,1900.5)', id LIMIT 3";
-    let (_, round) = a.ask(near_a, Some("t_gist")).unwrap();
-    assert_eq!(round.order, "t_gist");
-    b.ask(near_b, Some("t_gist")).unwrap();
-    // Each writes a row nearer than the other read, in a block neither read.
-    a.execute("INSERT INTO s.t VALUES (100000, '(1900.5,1900.5)')").unwrap();
-    b.execute("INSERT INTO s.t VALUES (100001, '(1100.5,1100.5)')").unwrap();
+    // Each stands off the grid, past its top left corner and past its bottom right, and finds its
+    // nearest rows there.
+    let near_a = "SELECT id FROM s.t ORDER BY p <-> point '(1024,3000)', id LIMIT 3";
+    let near_b = "SELECT id FROM s.t ORDER BY p <-> point '(3000,1024)', id LIMIT 3";
+    for (s, q) in [(&mut a, near_a), (&mut b, near_b)] {
+        let (_, round) = s.ask(q, Some("t_p")).unwrap();
+        assert_eq!((round.order.as_str(), round.blocks_read), ("t_p", 1), "{round:?}");
+    }
+    // Each writes a row nearer than the other's three: its exponent past the grid's, so it lands in
+    // the strand's last block, the grid's top right, which neither read.
+    a.execute("INSERT INTO s.t VALUES (2000000, '(2500,1500)')").unwrap();
+    b.execute("INSERT INTO s.t VALUES (2000001, '(1500,2500)')").unwrap();
     a.execute("COMMIT").unwrap();
     let e = b.execute("COMMIT").unwrap_err().to_string();
     assert!(e.contains("could not serialize access"), "{e}");
@@ -2327,4 +2337,26 @@ fn a_distance_rounds_as_the_release_the_file_records_rounds_it() {
     assert_eq!(answer(Some(18)), 1.4142135623730951e150f64.to_bits());
     assert_eq!(answer(Some(19)), 1.414213562373095e150f64.to_bits());
     assert_eq!(answer(None), 1.414213562373095e150f64.to_bits());
+}
+
+#[test]
+fn a_row_returned_whole_beside_a_distance_holds_every_column() {
+    let path = table_of("plane-near-whole", "point", GeoKind::Point, &["gist"], 4096, |i| {
+        Some(format!("({},{})", 1024 + (i * 7919) % 64, 1024 + i % 64))
+    });
+    for q in [
+        "SELECT t.* FROM s.t t ORDER BY t.v <-> point '(1030,1030)', t.id LIMIT 3",
+        "SELECT * FROM s.t ORDER BY v <-> point '(1030,1030)', id LIMIT 3",
+    ] {
+        let (strand, round) = fresh(&path).ask(q, None).unwrap();
+        assert_eq!(round.order, "t_gist", "{q}");
+        let (key, _) = fresh(&path).ask(q, Some("t_pkey")).unwrap();
+        assert_eq!(strand.num_columns(), 2, "{q}");
+        assert_eq!(strand, key, "{q}");
+    }
+    // A whole row's reference is refused alike along either order.
+    let q = "SELECT t FROM s.t t ORDER BY t.v <-> point '(1030,1030)', t.id LIMIT 1";
+    let strand = fresh(&path).ask(q, None).unwrap_err().to_string();
+    let key = fresh(&path).ask(q, Some("t_pkey")).unwrap_err().to_string();
+    assert_eq!(strand, key);
 }

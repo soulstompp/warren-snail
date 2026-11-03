@@ -546,7 +546,7 @@ impl Snail {
         if keyed {
             strands = strands_of(&want)?;
         }
-        // Rows it may hold beyond its value's walk, kept to its keys, are read only by reached rows.
+        // No strand to read along, or with no LIMIT every row's key, which is the table's own read.
         if strands.is_empty() || (keyed && reached.is_none()) {
             return Ok(match order {
                 Some(_) => Nearest::Not,
