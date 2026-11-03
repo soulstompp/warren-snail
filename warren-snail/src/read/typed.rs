@@ -536,6 +536,19 @@ impl Typing<'_> {
                 }
                 Some(ColumnType::Boolean)
             }
+            // `@@@`, which sqlparser reads as `@@` and a prefix `@`: the match `@@` is, its prefix
+            // `@` none of its own.
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::AtAt,
+                right,
+            } if super::spelled::right_of_three_ats(right).is_some() => {
+                self.type_of(left)?;
+                if let Some(inner) = super::spelled::right_of_three_ats(right) {
+                    self.type_of(inner)?;
+                }
+                Some(ColumnType::Boolean)
+            }
             Expr::BinaryOp { left, op, right } => {
                 let (a, b) = (self.type_of(left)?, self.type_of(right)?);
                 if let Some(t) = statistics_operator(&op.to_string(), a, b)? {
