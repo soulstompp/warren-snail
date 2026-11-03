@@ -485,6 +485,442 @@ mod written {
         assert!(PathBuf::from(p).exists());
     }
 
+    /// A snail of `n` tables and two tables counted by one sequence, `s.ids`, the table `at`
+    /// holding `held` rows.
+    fn counted(file: &str, n: usize, at: usize, held: i64) -> PathBuf {
+        let path = tmp(&format!("tables-{file}.snail"));
+        let ddl = format!(
+            "{}CREATE SEQUENCE s.ids;\n\
+             CREATE TABLE s.counted (id bigint NOT NULL DEFAULT nextval('s.ids'), v integer, PRIMARY KEY (id));\n\
+             CREATE TABLE s.beside (id bigint NOT NULL DEFAULT nextval('s.ids'), v integer, PRIMARY KEY (id));\n",
+            ddl(n)
+        );
+        let tables = vec![(name(at), rows(1, held))];
+        write(&path, &Catalog::parse(&ddl).unwrap(), &tables).unwrap();
+        path
+    }
+
+    /// A snail of `n` tables, the table `at` holding `held` rows.
+    fn written_with(file: &str, n: usize, at: usize, held: i64) -> PathBuf {
+        let path = tmp(&format!("tables-{file}.snail"));
+        let tables = vec![(name(at), rows(1, held))];
+        write(&path, &Catalog::parse(&ddl(n)).unwrap(), &tables).unwrap();
+        path
+    }
+
+    /// Tables a transaction makes, each `s.<prefix>_<i>`.
+    fn make(w: &mut Snail, prefix: &str, n: usize) {
+        for i in 0..n {
+            w.execute(&format!(
+                "CREATE TABLE s.{prefix}_{i:03} (a bigint PRIMARY KEY, b text)"
+            ))
+            .unwrap();
+        }
+    }
+
+    /// Tables enough to take a root of 40 tables past what it holds.
+    const PAST: usize = 10;
+
+    #[test]
+    fn a_ddl_past_the_cut_rolled_back_to_a_savepoint_leaves_what_the_commit_writes_as_if_it_never_ran(
+    ) {
+        for (kind, n) in [("holds", 40), ("cut", MANY)] {
+            let cut = n == MANY;
+            let path = written(&format!("rolled-{kind}"), n, &[1]);
+            let twin = written(&format!("rolled-{kind}-twin"), n, &[1]);
+            assert_eq!(is_cut(&path), cut);
+            let named = whole(&path);
+            let mut w = Snail::open_writing(&path).unwrap();
+            w.execute("BEGIN").unwrap();
+            w.execute(&insert(1, 1001)).unwrap();
+            w.execute("SAVEPOINT a").unwrap();
+            make(&mut w, "gone", PAST);
+            w.execute("INSERT INTO s.gone_000 (a, b) VALUES (1, 'x')")
+                .unwrap();
+            assert_eq!(count(&mut w, "SELECT count(*) FROM s.gone_000"), 1);
+            w.execute("ROLLBACK TO a").unwrap();
+            assert!(w.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+            w.execute(&insert(2, 1)).unwrap();
+            let done = w.execute("COMMIT").unwrap();
+            drop(w);
+            let mut other = Snail::open_writing(&twin).unwrap();
+            for st in ["BEGIN", &insert(1, 1001), &insert(2, 1)] {
+                other.execute(st).unwrap();
+            }
+            let plain = other.execute("COMMIT").unwrap();
+            drop(other);
+            assert_eq!(
+                (done.generation, done.pages_written, done.pages_reused),
+                (plain.generation, plain.pages_written, plain.pages_reused)
+            );
+            assert_eq!(is_cut(&path), cut);
+            assert_eq!(whole(&path), whole(&twin));
+            assert!(whole(&path) < named + 32);
+            assert!(std::fs::read(&path).unwrap() == std::fs::read(&twin).unwrap());
+            let mut r = fresh(&path);
+            assert!(r.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+            assert_eq!(rows_of(&path, 1), 101);
+            assert_eq!(rows_of(&path, 2), 1);
+        }
+    }
+
+    #[test]
+    fn a_ddl_past_the_cut_released_in_a_savepoint_is_the_transactions_at_its_commit() {
+        for (kind, n) in [("holds", 40), ("cut", MANY)] {
+            let path = written(&format!("released-{kind}"), n, &[1]);
+            let mut before = fresh(&path);
+            assert_eq!(count(&mut before, "SELECT count(*) FROM s.table_00001"), 100);
+            let mut w = Snail::open_writing(&path).unwrap();
+            w.execute("BEGIN").unwrap();
+            w.execute(&insert(1, 1001)).unwrap();
+            w.execute("SAVEPOINT a").unwrap();
+            make(&mut w, "kept", PAST);
+            w.execute("INSERT INTO s.kept_001 (a, b) VALUES (1, 'x')")
+                .unwrap();
+            w.execute("SAVEPOINT b").unwrap();
+            make(&mut w, "gone", PAST);
+            w.execute("ROLLBACK TO b").unwrap();
+            w.execute("RELEASE a").unwrap();
+            assert_eq!(count(&mut w, "SELECT count(*) FROM s.kept_001"), 1);
+            // A reader sees none of it before the commit, and the root stands as it was.
+            assert_eq!(is_cut(&path), n == MANY);
+            assert_eq!(count(&mut before, "SELECT count(*) FROM s.table_00001"), 100);
+            w.execute("COMMIT").unwrap();
+            assert!(is_cut(&path));
+            assert_eq!(count(&mut before, "SELECT count(*) FROM s.kept_001"), 1);
+            assert_eq!(count(&mut before, "SELECT count(*) FROM s.table_00001"), 101);
+            assert!(before.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+            // The writer goes on on what it committed.
+            w.execute("INSERT INTO s.kept_009 (a, b) VALUES (1, 'x')")
+                .unwrap();
+            w.execute("CREATE TABLE s.after (a bigint PRIMARY KEY, b text)")
+                .unwrap();
+            drop(w);
+            whole(&path);
+            let mut r = fresh(&path);
+            assert_eq!(count(&mut r, "SELECT count(*) FROM s.kept_009"), 1);
+            assert_eq!(count(&mut r, "SELECT count(*) FROM s.after"), 0);
+            assert!(r.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+        }
+    }
+
+    #[test]
+    fn a_ddl_refused_or_rolled_back_on_either_root_leaves_the_catalog_as_it_stood() {
+        for (kind, n) in [("holds", 40), ("cut", MANY)] {
+            let cut = n == MANY;
+            let path = written(&format!("refused-{kind}"), n, &[1]);
+            let mut w = Snail::open_writing(&path).unwrap();
+            w.execute("BEGIN").unwrap();
+            make(&mut w, "gone", PAST);
+            w.execute("ROLLBACK").unwrap();
+            assert!(w.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+            // A statement that fails after a DDL ends the transaction's work.
+            w.execute("BEGIN").unwrap();
+            make(&mut w, "gone", PAST);
+            assert!(w.execute("INSERT INTO s.none (a) VALUES (1)").is_err());
+            assert!(w.execute("CREATE TABLE s.late (a bigint)").is_err());
+            w.execute("ROLLBACK").unwrap();
+            assert!(w.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+            // Failed in a savepoint, it goes on from ROLLBACK TO.
+            w.execute("BEGIN").unwrap();
+            make(&mut w, "kept", 1);
+            w.execute("SAVEPOINT a").unwrap();
+            make(&mut w, "gone", PAST);
+            assert!(w.execute("CREATE TABLE s.gone_000 (a bigint)").is_err());
+            w.execute("ROLLBACK TO a").unwrap();
+            make(&mut w, "also", 1);
+            w.execute("COMMIT").unwrap();
+            assert_eq!(is_cut(&path), cut);
+            drop(w);
+            whole(&path);
+            let mut r = fresh(&path);
+            assert_eq!(count(&mut r, "SELECT count(*) FROM s.kept_000"), 0);
+            assert_eq!(count(&mut r, "SELECT count(*) FROM s.also_000"), 0);
+            assert!(r.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+        }
+    }
+
+    #[test]
+    fn another_writers_ddl_past_the_cut_refuses_a_declaration_begun_before_it() {
+        let path = written("declared", 40, &[1]);
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("BEGIN").unwrap();
+        w.execute("CREATE TABLE s.mine (a bigint PRIMARY KEY, b text)")
+            .unwrap();
+        let mut other = Snail::open_writing(&path).unwrap();
+        make(&mut other, "theirs", PAST);
+        assert!(is_cut(&path));
+        let e = w.execute("COMMIT").unwrap_err().to_string();
+        assert!(e.contains("declared since by another writer"), "{e}");
+        w.execute("CREATE TABLE s.mine (a bigint PRIMARY KEY, b text)")
+            .unwrap();
+        drop((w, other));
+        whole(&path);
+        let mut r = fresh(&path);
+        assert_eq!(count(&mut r, "SELECT count(*) FROM s.mine"), 0);
+        assert_eq!(count(&mut r, "SELECT count(*) FROM s.theirs_009"), 0);
+    }
+
+    /// The first column of what a statement answered, as text.
+    fn first_column(d: &warren_snail::read::Done) -> Vec<i64> {
+        let answer = d.answer.as_ref().unwrap();
+        let a = answer
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    #[test]
+    fn a_lazy_cursor_fetches_what_it_declared_across_a_commit_that_cuts_the_root() {
+        const HELD: i64 = 20_000;
+        let question = format!("SELECT t.a, t.b FROM {} t", name(3));
+        for (kind, n) in [("holds", 40), ("cut", MANY)] {
+            let path = written_with(&format!("lazy-{kind}"), n, 3, HELD);
+            let (answer, round) = fresh(&path).ask(&question, None).unwrap();
+            assert_eq!(answer.num_rows() as i64, HELD);
+            let mut w = Snail::open_writing(&path).unwrap();
+            w.execute("BEGIN").unwrap();
+            w.execute(&format!("DECLARE c CURSOR FOR {question}"))
+                .unwrap();
+            let one = w.execute("FETCH 1 FROM c").unwrap();
+            assert!(
+                one.pages_read > 0 && one.pages_read < round.column_pages_read,
+                "one row read {} pages where the whole read {}",
+                one.pages_read,
+                round.column_pages_read
+            );
+            // Another writer's commits: the root cut, the row gone, the pages they free taken again.
+            let mut other = Snail::open_writing(&path).unwrap();
+            make(&mut other, "made", PAST);
+            assert!(is_cut(&path));
+            other
+                .execute(&format!("DELETE FROM {} WHERE a <= 5000", name(3)))
+                .unwrap();
+            for a in 0..8 {
+                other.execute(&insert(4, 100 + a)).unwrap();
+            }
+            drop(other);
+            let rest = w.execute("FETCH ALL FROM c").unwrap();
+            assert_eq!(rest.rows as i64, HELD - 1);
+            let mut got = first_column(&one);
+            got.extend(first_column(&rest));
+            got.sort_unstable();
+            assert_eq!(got, (1..=HELD).collect::<Vec<_>>());
+            // The transaction goes on on the file as it stands.
+            assert_eq!(count(&mut w, "SELECT count(*) FROM s.made_009"), 0);
+            w.execute("COMMIT").unwrap();
+            drop(w);
+            whole(&path);
+            assert_eq!(rows_of(&path, 3), HELD - 5000);
+        }
+    }
+
+    #[test]
+    fn a_cursor_with_hold_outlasts_the_commit_of_its_own_transaction_that_cuts_the_root() {
+        const HELD: i64 = 20_000;
+        let question = format!("SELECT t.a, t.b FROM {} t", name(3));
+        let path = written_with("lazy-own", 40, 3, HELD);
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("BEGIN").unwrap();
+        w.execute(&format!("DECLARE h CURSOR WITH HOLD FOR {question}"))
+            .unwrap();
+        w.execute(&format!("DECLARE c CURSOR FOR {question}"))
+            .unwrap();
+        let one = w.execute("FETCH 1 FROM h").unwrap();
+        assert_eq!(one.rows, 1);
+        make(&mut w, "made", PAST);
+        assert_eq!(w.execute("FETCH 1 FROM c").unwrap().rows, 1);
+        w.execute("COMMIT").unwrap();
+        assert!(is_cut(&path));
+        assert!(w.execute("FETCH 1 FROM c").is_err());
+        let rest = w.execute("FETCH ALL FROM h").unwrap();
+        assert_eq!(rest.rows as i64, HELD - 1);
+        w.execute("CLOSE h").unwrap();
+        drop(w);
+        whole(&path);
+    }
+
+    #[test]
+    fn a_sequence_advanced_in_a_savepoint_on_a_cut_root_is_never_given_back() {
+        let path = counted("sequence-cut", MANY, 1, 10);
+        assert!(is_cut(&path));
+        let ids = |w: &mut Snail| -> Vec<i64> {
+            let d = w
+                .execute("SELECT c.id FROM s.counted c ORDER BY c.id")
+                .unwrap();
+            first_column(&d)
+        };
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("BEGIN").unwrap();
+        w.execute("INSERT INTO s.counted (v) VALUES (1)").unwrap();
+        w.execute("SAVEPOINT a").unwrap();
+        w.execute("INSERT INTO s.counted (v) VALUES (2)").unwrap();
+        // Another writer between them draws the next, into a table whose blocks the first holds none of.
+        let mut other = Snail::open_writing(&path).unwrap();
+        other
+            .execute("INSERT INTO s.beside (v) VALUES (20)")
+            .unwrap();
+        w.execute("ROLLBACK TO a").unwrap();
+        w.execute("INSERT INTO s.counted (v) VALUES (3)").unwrap();
+        // A table made beside the draw: the draw lands at once, the catalog at the commit.
+        w.execute("CREATE TABLE s.extra (a bigint PRIMARY KEY, b text)")
+            .unwrap();
+        w.execute("COMMIT").unwrap();
+        assert_eq!(ids(&mut w), [1, 4]);
+        w.execute("BEGIN").unwrap();
+        w.execute("CREATE TABLE s.more (a bigint PRIMARY KEY, b text)")
+            .unwrap();
+        w.execute("SAVEPOINT b").unwrap();
+        w.execute("INSERT INTO s.counted (v) VALUES (4)").unwrap();
+        w.execute("ROLLBACK TO b").unwrap();
+        w.execute("COMMIT").unwrap();
+        w.execute("INSERT INTO s.counted (v) VALUES (5)").unwrap();
+        assert_eq!(ids(&mut w), [1, 4, 6]);
+        drop((w, other));
+        whole(&path);
+        assert!(is_cut(&path));
+        let mut r = fresh(&path);
+        assert_eq!(count(&mut r, "SELECT count(*) FROM s.beside b"), 1);
+        assert_eq!(
+            count(&mut r, "SELECT count(*) FROM s.beside b WHERE b.id = 3"),
+            1
+        );
+        let states = r.sequences().unwrap();
+        let state = states.iter().find(|s| s.0 == "s.ids").unwrap();
+        assert_eq!((state.1, state.2), (6, true));
+        assert_eq!(count(&mut r, "SELECT count(*) FROM s.extra"), 0);
+        assert_eq!(count(&mut r, "SELECT count(*) FROM s.more"), 0);
+    }
+
+    #[test]
+    fn a_sequence_advanced_in_a_savepoint_stands_where_it_stood_as_the_root_cuts_around_it() {
+        let path = counted("sequence-past", 40, 1, 10);
+        assert!(!is_cut(&path));
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("BEGIN").unwrap();
+        w.execute("SAVEPOINT a").unwrap();
+        w.execute("INSERT INTO s.counted (v) VALUES (1)").unwrap();
+        make(&mut w, "gone", PAST);
+        w.execute("ROLLBACK TO a").unwrap();
+        assert!(!is_cut(&path));
+        w.execute("SAVEPOINT b").unwrap();
+        make(&mut w, "kept", PAST);
+        w.execute("RELEASE b").unwrap();
+        w.execute("INSERT INTO s.counted (v) VALUES (2)").unwrap();
+        // The draw landed on a root that still holds it; the commit cuts it, the sequence with it.
+        assert!(!is_cut(&path));
+        w.execute("COMMIT").unwrap();
+        assert!(is_cut(&path));
+        w.execute("INSERT INTO s.counted (v) VALUES (3)").unwrap();
+        drop(w);
+        whole(&path);
+        let mut r = fresh(&path);
+        assert_eq!(count(&mut r, "SELECT count(*) FROM s.counted c"), 2);
+        assert_eq!(
+            count(&mut r, "SELECT count(*) FROM s.counted c WHERE c.id >= 2"),
+            2
+        );
+        let state = r.sequences().unwrap();
+        let state = state.iter().find(|s| s.0 == "s.ids").unwrap();
+        assert_eq!((state.1, state.2), (3, true));
+        assert_eq!(count(&mut r, "SELECT count(*) FROM s.kept_009"), 0);
+    }
+
+    #[test]
+    fn copy_from_into_one_table_of_hundreds_writes_that_tables_path() {
+        let path = written("copy", MANY, &[300]);
+        let text = |from: i64, to: i64| -> Vec<u8> {
+            (from..to)
+                .map(|a| format!("{a}\tb{a}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let mut w = Snail::open_writing(&path).unwrap();
+        let d = w
+            .execute_copy(
+                &format!("COPY {} (a, b) FROM STDIN", name(300)),
+                &text(1000, 1050),
+            )
+            .unwrap();
+        assert_eq!((d.statement, d.rows), ("COPY", 50));
+        assert!(d.pages_written <= 12, "{d:?}");
+        // Into a table that held none, and into one rolled back to a savepoint.
+        let d = w
+            .execute_copy(&format!("COPY {} FROM STDIN", name(1)), &text(1, 4))
+            .unwrap();
+        assert_eq!(d.rows, 3);
+        w.execute("BEGIN").unwrap();
+        w.execute_copy(&format!("COPY {} FROM STDIN", name(2)), &text(1, 4))
+            .unwrap();
+        w.execute("SAVEPOINT a").unwrap();
+        w.execute_copy(&format!("COPY {} FROM STDIN", name(2)), &text(4, 9))
+            .unwrap();
+        w.execute_copy(&format!("COPY {} FROM STDIN", name(599)), &text(4, 9))
+            .unwrap();
+        w.execute("ROLLBACK TO a").unwrap();
+        w.execute("COMMIT").unwrap();
+        // And written out as it went in.
+        let d = w
+            .execute(&format!(
+                "COPY (SELECT t.a, t.b FROM {} t ORDER BY t.a) TO STDOUT",
+                name(2)
+            ))
+            .unwrap();
+        assert_eq!(d.copied.unwrap(), text(1, 4));
+        // A table made, then copied into in the same transaction, on the cut root.
+        w.execute("BEGIN").unwrap();
+        w.execute("CREATE TABLE s.extra (a bigint PRIMARY KEY, b text)")
+            .unwrap();
+        w.execute_copy("COPY s.extra FROM STDIN", &text(1, 4))
+            .unwrap();
+        w.execute("COMMIT").unwrap();
+        drop(w);
+        assert!(is_cut(&path));
+        whole(&path);
+        assert_eq!(rows_of(&path, 300), 150);
+        assert_eq!(rows_of(&path, 1), 3);
+        assert_eq!(rows_of(&path, 2), 3);
+        assert_eq!(rows_of(&path, 599), 0);
+        assert_eq!(count(&mut fresh(&path), "SELECT count(*) FROM s.extra"), 3);
+    }
+
+    #[test]
+    fn a_table_lock_on_a_table_of_hundreds_holds_off_that_table_alone() {
+        let path = written("lock", MANY, &[1]);
+        let last = name(MANY - 1);
+        let mut w = Snail::open_writing(&path).unwrap();
+        w.execute("BEGIN").unwrap();
+        w.execute(&format!("LOCK TABLE {last} IN EXCLUSIVE MODE"))
+            .unwrap();
+        let mut other = Snail::open_writing(&path).unwrap();
+        other.execute("BEGIN").unwrap();
+        let e = other
+            .execute(&format!("LOCK TABLE {last} IN ROW SHARE MODE NOWAIT"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("could not obtain lock on relation"), "{e}");
+        other.execute("ROLLBACK").unwrap();
+        other.execute("BEGIN").unwrap();
+        other
+            .execute(&format!(
+                "LOCK TABLE {} IN EXCLUSIVE MODE NOWAIT",
+                name(MANY - 2)
+            ))
+            .unwrap();
+        other.execute("COMMIT").unwrap();
+        w.execute("COMMIT").unwrap();
+        other
+            .execute(&format!("LOCK TABLE {last} IN ROW SHARE MODE NOWAIT"))
+            .unwrap_err();
+        other.execute("BEGIN").unwrap();
+        other
+            .execute(&format!("LOCK TABLE {last} IN EXCLUSIVE MODE NOWAIT"))
+            .unwrap();
+        other.execute("COMMIT").unwrap();
+    }
+
     /// The pages a round reads and writes, and the file's size, at 1, 100, 1,000 and 10,000 tables:
     /// a table made, a one-row insert, a point read on a snail opened before it and on one opened
     /// after, and a commit across two tables. Printed, for the ledger.
