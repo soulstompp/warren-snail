@@ -2337,6 +2337,36 @@ fn a_distance_rounds_as_the_release_the_file_records_rounds_it() {
     assert_eq!(answer(Some(18)), 1.4142135623730951e150f64.to_bits());
     assert_eq!(answer(Some(19)), 1.414213562373095e150f64.to_bits());
     assert_eq!(answer(None), 1.414213562373095e150f64.to_bits());
+    // A condition along the strand and a CHECK round alike.
+    for (release, held) in [(18, 1), (19, 0)] {
+        let catalog = Catalog::parse(
+            "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+             CREATE INDEX t_v ON s.t USING gist (v); \
+             CREATE TABLE s.c (id bigint NOT NULL, v point, PRIMARY KEY (id), \
+             CHECK (v <-> point '(0,0)' = 1.4142135623730951e150));",
+        )
+        .unwrap();
+        let path = tmp(&format!("plane-near-release-check-{release}.snail"));
+        warren_snail::write::write_parquet(
+            &path,
+            &catalog,
+            &[],
+            warren_snail::file::FILE_PAGES,
+            Some(release),
+            None,
+        )
+        .unwrap();
+        let mut s = Snail::open_writing(&path).unwrap();
+        s.execute("INSERT INTO s.t VALUES (1, '(1e150,1e150)')").unwrap();
+        let near = "SELECT count(*) FROM s.t WHERE v <-> point '(0,0)' = 1.4142135623730951e150";
+        for order in [Some("t_v"), Some("t_pkey")] {
+            let (b, _) = s.ask(near, order).unwrap();
+            let n = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(n.value(0), held, "{release} {order:?}");
+        }
+        let taken = s.execute("INSERT INTO s.c VALUES (1, '(1e150,1e150)')");
+        assert_eq!(taken.is_ok(), held == 1, "{release}: {taken:?}");
+    }
 }
 
 #[test]
