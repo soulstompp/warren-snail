@@ -810,7 +810,7 @@ impl Snail {
     }
 
     fn catalog(reader: &Reader, root: &Root) -> Result<Catalog> {
-        let ddl = String::from_utf8(reader.read_extent(root.catalog)?)
+        let ddl = String::from_utf8(reader.catalog_text(root)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
         let mut catalog = Catalog::parse_kept(&ddl, usize::MAX)?;
         old_names(&mut catalog, reader.format());
@@ -825,11 +825,18 @@ impl Snail {
     fn renew(&mut self) -> Result<u64> {
         let before = self.reader.pages_read();
         let root = self.reader.begin_round()?;
-        if root.generation != self.root.generation {
+        if self.catalog_moved(&root) {
             self.catalog = Snail::catalog(&self.reader, &root)?;
         }
         self.root = root;
         Ok(self.reader.pages_read() - before)
+    }
+
+    /// Whether the catalog must be read again for `root`: at every generation where the root holds
+    /// its tables, and where it cut them, only once a commit wrote the catalog afresh.
+    pub(super) fn catalog_moved(&self, root: &Root) -> bool {
+        root.generation != self.root.generation
+            && (root.cut.is_none() || root.catalog_named() != self.root.catalog_named())
     }
 
     /// The generation of the root the snail reads.
@@ -880,11 +887,7 @@ impl Snail {
     /// Where each sequence stands, as the file holds it: its last value and whether it was handed
     /// out; where the file holds none, where its DDL leaves it.
     pub fn sequences(&self) -> Result<Vec<crate::file::SequenceState>> {
-        let held = if self.root.sequences.bytes > 0 {
-            crate::file::decode_sequences(&self.reader.read_extent(self.root.sequences)?)?
-        } else {
-            Vec::new()
-        };
+        let held = self.reader.sequence_states(&self.root)?;
         Ok(self
             .catalog
             .sequences
@@ -1935,10 +1938,17 @@ impl Snail {
             }
             Ok(())
         };
-        mark(self.root.catalog, 1)?;
-        // Where the sequences stand, once one has handed out a value.
-        if self.root.sequences.bytes > 0 {
-            mark(self.root.sequences, 1)?;
+        if self.root.cut.is_some() {
+            // The pages of the lists the root cut: the tables', the catalog's and the sequences'.
+            for e in self.reader.listed_pages(&self.root)? {
+                mark(e, 1)?;
+            }
+        } else {
+            mark(self.root.catalog, 1)?;
+            // Where the sequences stand, once one has handed out a value.
+            if self.root.sequences.bytes > 0 {
+                mark(self.root.sequences, 1)?;
+            }
         }
         // The serializable transactions' records, while a round older than their commits runs.
         if self.root.serial.bytes > 0 {

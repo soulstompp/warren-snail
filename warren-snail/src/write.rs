@@ -1197,9 +1197,17 @@ fn write_tables(
             out.push(written);
         }
     }
-    root.catalog = w.place(catalog.ddl.as_bytes())?;
-    if let Some(c) = carried.filter(|c| !c.sequences.is_empty()) {
-        root.sequences = w.place(&crate::file::encode_sequences(&c.sequences))?;
+    // What grows with the schema lies in pages of its own where the root would not hold it.
+    let mut gone = Vec::new();
+    let states = carried.map_or(&[][..], |c| &c.sequences);
+    if w.format() >= crate::file::FORMAT && !root.fits_uncut(w.format())? {
+        crate::file::cut_afresh(&mut root, catalog.ddl.as_bytes(), states, 1, &mut w, &mut gone)?;
+        crate::file::settle_tables(&mut root, w.format(), 1, &mut w, &mut gone)?;
+    } else {
+        root.catalog = w.place(catalog.ddl.as_bytes())?;
+        if !states.is_empty() {
+            root.sequences = w.place(&crate::file::encode_sequences(states))?;
+        }
     }
     // The pages passed over at a file's end, where a run would have crossed into the next, are free.
     let passed: Vec<Run> = w

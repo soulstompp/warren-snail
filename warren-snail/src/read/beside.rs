@@ -690,7 +690,7 @@ impl Snail {
     /// meanwhile.
     fn rows_into_newest(&mut self, own: &BTreeMap<String, OwnRows>) -> Result<()> {
         let mark = self.mark();
-        let seen_catalog = self.root.catalog;
+        let seen_catalog = self.root.catalog_named();
         loop {
             self.stale = false;
             self.touched = Default::default();
@@ -724,7 +724,7 @@ impl Snail {
     /// it declared it; refused where another's DDL since changed a table it wrote.
     fn root_for_commit(
         &mut self,
-        seen_catalog: Extent,
+        seen_catalog: (Extent, u64),
         own: &BTreeMap<String, OwnRows>,
     ) -> Result<Root> {
         let mut root = self.reader.peek_root()?;
@@ -746,7 +746,7 @@ impl Snail {
                     }
                 }
             }
-            None if root.catalog != seen_catalog => {
+            None if root.catalog_named() != seen_catalog => {
                 let catalog = Snail::catalog(&self.reader, &root)?;
                 for name in own.keys() {
                     let (Some(a), Some(b)) = (self.catalog.table(name), catalog.table(name)) else {

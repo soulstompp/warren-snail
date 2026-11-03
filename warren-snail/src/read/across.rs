@@ -1621,10 +1621,11 @@ impl Snail {
     pub(super) fn adopt(&mut self, mut root: Root) -> Result<()> {
         root.pending = None;
         self.reader.adopt(&root);
+        let root = self.reader.expanded(root)?;
         if self.begun.is_some() {
             return self.in_transaction_on(root);
         }
-        if root.generation != self.root.generation {
+        if self.catalog_moved(&root) {
             self.catalog = Snail::catalog(&self.reader, &root)?;
         }
         self.root = root;

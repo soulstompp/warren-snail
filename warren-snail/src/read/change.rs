@@ -17,13 +17,9 @@ use crate::directory::{
 };
 use crate::encode::{decode_leaf, tail_pages};
 use crate::file::{
-    decode_free, decode_sequences, encode_free, encode_sequences, Extent, Place, Root, Run, Writer,
-    FORMAT_SEVEN, STAGED,
+    decode_free, encode_free, Extent, Place, Root, Run, Writer, FORMAT_SEVEN, REUSED_KEPT, STAGED,
 };
 use crate::lock;
-
-/// The runs of reused pages the root names, at most.
-const REUSED_KEPT: usize = 64;
 
 /// What a transaction answers once one of its statements failed, until it ends, as PostgreSQL does.
 pub(super) const ABORTED: &str =
@@ -136,7 +132,7 @@ pub(super) struct Mark {
 /// the orders it made, each empty until rows come.
 #[derive(Clone)]
 pub(super) struct Declared {
-    from: Extent,
+    from: (Extent, u64),
     ddl: String,
     made: Vec<(String, String)>,
     /// The sequences it made or restarted, which stand where the DDL leaves them.
@@ -1585,11 +1581,7 @@ impl Snail {
         let turn = lock::take_root_turn(w.file());
         let drawn = turn.and_then(|_| {
             let root = self.reader.peek_root()?;
-            let mut states = if root.sequences.bytes > 0 {
-                decode_sequences(&self.reader.read_extent(root.sequences)?)?
-            } else {
-                Vec::new()
-            };
+            let mut states = self.reader.sequence_states(&root)?;
             let (mut last, mut called) = states
                 .iter()
                 .find(|x| x.0 == s.name)
@@ -1730,7 +1722,9 @@ impl Snail {
         if root.generation == self.root.generation {
             return Ok(());
         }
-        self.catalog = Snail::catalog(&self.reader, &root)?;
+        if self.catalog_moved(&root) {
+            self.catalog = Snail::catalog(&self.reader, &root)?;
+        }
         let mut stage = self.reader.stage();
         for ((ti, oi), blocks) in self.rebased.clone() {
             let table = &self.catalog.tables[ti];
@@ -2004,19 +1998,19 @@ impl Snail {
         // The catalog declared: written afresh, each table it touches given the orders it declares,
         // those it made empty.
         if let Some(d) = self.declared.take() {
-            if root.catalog != d.from {
+            if root.catalog_named() != d.from {
                 return Err(Error::new(
                     "the catalog was declared since by another writer",
                 ));
             }
-            gone.push(root.catalog);
-            root.catalog = w.place(d.ddl.as_bytes())?;
+            self.reader
+                .put_catalog(&mut root, d.ddl.as_bytes(), generation, w, &mut gone)?;
             root.monetary = crate::file::monetary_of(&self.catalog, &root.monetary);
             if !d.resets.is_empty() && root.sequences.bytes > 0 {
-                let mut states = decode_sequences(&self.reader.read_extent(root.sequences)?)?;
+                let mut states = self.reader.sequence_states(&root)?;
                 states.retain(|s| !d.resets.contains(&s.0));
-                gone.push(root.sequences);
-                root.sequences = w.place(&encode_sequences(&states))?;
+                self.reader
+                    .put_sequences(&mut root, &states, generation, w, &mut gone)?;
             }
             let touched: Vec<&String> = d.made.iter().map(|(t, _)| t).collect();
             let mut orders = Vec::new();
@@ -2045,10 +2039,8 @@ impl Snail {
         }
         // The sequences a statement advanced, at the root's turn, each where it stands now.
         if let Some(states) = self.advancing.take() {
-            if root.sequences.bytes > 0 {
-                gone.push(root.sequences);
-            }
-            root.sequences = w.place(&encode_sequences(&states))?;
+            self.reader
+                .put_sequences(&mut root, &states, generation, w, &mut gone)?;
         }
         // A transaction across snails this commit decides: the roots it writes into the others,
         // carried.
@@ -2150,6 +2142,8 @@ impl Snail {
             root.orders[at].2 = w.place(&bytes)?;
         }
         maps.finish(w)?;
+        self.reader
+            .settle(&mut root, w.format(), generation, w, &mut gone)?;
         spent.sort_unstable();
         // The free map as it stands now: the runs left free, those still waiting, and the pages
         // this generation stops naming, tagged with it.
@@ -3533,8 +3527,14 @@ impl Snail {
             let top = stage.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
             orders.push((tn.clone(), on.clone(), top));
         }
-        let from = self.declared.as_ref().map_or(self.root.catalog, |d| d.from);
+        let from = self
+            .declared
+            .as_ref()
+            .map_or(self.root.catalog_named(), |d| d.from);
         self.root.catalog = stage.place(text.as_bytes())?;
+        if let Some(cut) = self.root.cut.as_mut() {
+            cut.catalog_at = None;
+        }
         self.root.orders = orders;
         // A sequence made or restarted stands where its DDL leaves it, whatever the file kept.
         let resets: Vec<String> = catalog

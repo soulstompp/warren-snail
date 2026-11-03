@@ -298,11 +298,7 @@ impl Snail {
             ));
             sources.push((t.name.clone(), crate::write::sources(&files, t)?));
         }
-        let sequences = if self.root.sequences.bytes > 0 {
-            crate::file::decode_sequences(&self.reader.read_extent(self.root.sequences)?)?
-        } else {
-            Vec::new()
-        };
+        let sequences = self.reader.sequence_states(&self.root)?;
         let carried = crate::write::Carried {
             sequences,
             monetary: self.root.monetary.clone(),

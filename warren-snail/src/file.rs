@@ -427,6 +427,45 @@ pub struct Root {
     /// Where the last of them stands on the clock the records of snails opened together share, so that
     /// commits have one order: format 9 only, 0 where none has been.
     pub clock: u64,
+    /// Where what grows with the schema lies once the root would not hold it: format 9 only.
+    pub(crate) cut: Option<Cut>,
+}
+
+/// What a format 9 root cut into pages once it would not hold it: the tables' orders and money
+/// columns, a list whose top the root holds; the catalog's text, a list whose top page `catalog`
+/// names; and the sequences, a list whose top page `sequences` names. A root once cut stays cut.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Cut {
+    pub(crate) tables: crate::listing::Shape,
+    /// The generation that wrote the catalog's top page; none where `catalog` holds the text itself,
+    /// as a declaration stages it.
+    pub(crate) catalog_at: Option<u64>,
+    /// The generation that wrote the sequences' top page.
+    pub(crate) sequences_at: u64,
+}
+
+/// The count of orders a root names that says it is cut.
+const CUT: u32 = u32::MAX;
+
+/// The runs of reused pages the root names, at most.
+pub(crate) const REUSED_KEPT: usize = 64;
+
+/// What a commit adds to its root once its pages are written: its host's tag, and a pending mark
+/// naming the table that decides a transaction across snails, by PostgreSQL's two names of 63 bytes
+/// at most.
+const MARGIN: usize = 9 + 4 + 2 * 63 + 1 + 8;
+
+/// The tables' list: an order's top under its table, and a money column's lc_monetary.
+const ORDER: u8 = 1;
+const MONEY: u8 = 2;
+
+fn listed_key(table: &str, kind: u8, name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(table.len() + 2 + name.len());
+    k.extend_from_slice(table.as_bytes());
+    k.push(0);
+    k.push(kind);
+    k.extend_from_slice(name.as_bytes());
+    k
 }
 
 /// What a snail of a format older than this build's says of a serializable transaction: its root
@@ -450,6 +489,12 @@ impl Root {
         } else {
             &self.text_search
         }
+    }
+
+    /// Whether what grows with the schema lies in pages the root names, the root no longer holding
+    /// it.
+    pub fn is_cut(&self) -> bool {
+        self.cut.is_some()
     }
 
     /// The file's own default collation.
@@ -629,6 +674,100 @@ pub(crate) fn decode_free(buf: &[u8], format: u32) -> Result<(Vec<Run>, Spent)> 
 
 impl Root {
     pub(crate) fn encode(&self, format: u32) -> Result<Vec<u8>> {
+        if let Some(cut) = &self.cut {
+            if cut.tables.read() && cut.tables.entries() != self.listed()? {
+                return Err(Error::new(
+                    "the root's tables changed since their list was written: settle it first",
+                ));
+            }
+        }
+        let bytes = self.encoded(format, false, None)?;
+        if bytes.len() > PAGE {
+            return Err(Error::new(match format >= FORMAT {
+                true => "the root does not fit one page".to_string(),
+                false => format!(
+                    "the root does not fit one page, which a snail of format {format} cannot cut: \
+                     put the snail `out` and `write` it afresh, in format {FORMAT}"
+                ),
+            }));
+        }
+        Ok(bytes)
+    }
+
+    /// Whether a root of `format` not cut holds what grows with the schema, with its reused runs at
+    /// their most and room for what its commit adds after its pages.
+    pub(crate) fn fits_uncut(&self, format: u32) -> Result<bool> {
+        Ok(self.encoded(format, true, None)?.len() + MARGIN <= PAGE)
+    }
+
+    /// The bytes a cut root has for the top of its tables' list, its reused runs at their most and
+    /// room left for what its commit adds after its pages.
+    pub(crate) fn top_room(&self, format: u32) -> Result<usize> {
+        let empty = crate::listing::Node::default();
+        let rest = self.encoded(format, true, Some(&empty))?.len() - empty.bytes();
+        Ok(PAGE.saturating_sub(rest + MARGIN))
+    }
+
+    /// The entries of the tables' list: each order's top and each money column's lc_monetary, under
+    /// its table, in their keys' order.
+    pub(crate) fn listed(&self) -> Result<Vec<crate::listing::Item>> {
+        let mut out = Vec::with_capacity(self.orders.len() + self.monetary.len());
+        for (t, o, e) in &self.orders {
+            let mut v = Out::default();
+            v.extent(*e);
+            out.push((listed_key(t, ORDER, o), v.0));
+        }
+        for (t, c, l) in &self.monetary {
+            out.push((listed_key(t, MONEY, c), l.as_bytes().to_vec()));
+        }
+        out.sort();
+        if let Some(w) = out.windows(2).find(|w| w[0].0 == w[1].0) {
+            return Err(Error::new(format!(
+                "the root names {} twice",
+                String::from_utf8_lossy(&w[0].0).replace(['\0', '\u{1}', '\u{2}'], " ")
+            )));
+        }
+        Ok(out)
+    }
+
+    /// The orders and money columns the tables' list holds.
+    fn unlist(&mut self, entries: &[crate::listing::Item]) -> Result<()> {
+        let bad = || Error::new("the root's list of tables holds an entry of no table");
+        let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| bad());
+        self.orders.clear();
+        self.monetary.clear();
+        for (k, v) in entries {
+            let at = k.iter().position(|&b| b == 0).ok_or_else(bad)?;
+            let (table, name) = (text(&k[..at])?, text(k.get(at + 2..).ok_or_else(bad)?)?);
+            match k.get(at + 1) {
+                Some(&ORDER) => {
+                    let mut i = In::new(v);
+                    self.orders.push((table, name, i.extent()?));
+                }
+                Some(&MONEY) => self.monetary.push((table, name, text(v)?)),
+                _ => return Err(bad()),
+            }
+        }
+        Ok(())
+    }
+
+    /// The catalog as the root names it: its extent, and the generation that wrote it where it is
+    /// a list.
+    pub(crate) fn catalog_named(&self) -> (Extent, u64) {
+        (
+            self.catalog,
+            self.cut.as_ref().and_then(|c| c.catalog_at).unwrap_or(0),
+        )
+    }
+
+    /// The root's bytes: `full` with its reused runs at their most, and with `top` in place of its
+    /// tables' list's top where it is cut.
+    fn encoded(
+        &self,
+        format: u32,
+        full: bool,
+        top: Option<&crate::listing::Node>,
+    ) -> Result<Vec<u8>> {
         let mut o = Out::default();
         o.0.extend_from_slice(&MAGIC);
         o.u32(format);
@@ -636,16 +775,37 @@ impl Root {
         o.u64(self.pages);
         o.u64(self.span);
         o.extent(self.catalog);
-        o.u32(self.orders.len() as u32);
-        for (t, n, e) in &self.orders {
-            o.str(t);
-            o.str(n);
-            o.extent(*e);
+        match &self.cut {
+            None => {
+                o.u32(self.orders.len() as u32);
+                for (t, n, e) in &self.orders {
+                    o.str(t);
+                    o.str(n);
+                    o.extent(*e);
+                }
+            }
+            Some(_) if format < FORMAT => {
+                return Err(Error::new(format!(
+                    "a snail of format {format} holds its tables in its root: `out`, then `write`"
+                )))
+            }
+            Some(cut) => {
+                o.u32(CUT);
+                o.u64(cut.catalog_at.unwrap_or(0));
+                o.u64(cut.sequences_at);
+                top.unwrap_or(&cut.tables.top).encode(&mut o);
+            }
         }
         o.extent(self.free);
         o.u64(self.reused_from);
-        o.u32(self.reused.len() as u32);
-        for &(g, s, p) in &self.reused {
+        let reused = if full {
+            self.reused.len().max(REUSED_KEPT)
+        } else {
+            self.reused.len()
+        };
+        o.u32(reused as u32);
+        for i in 0..reused {
+            let (g, s, p) = self.reused.get(i).copied().unwrap_or_default();
             o.u64(g);
             o.u64(s);
             o.u64(p);
@@ -653,8 +813,12 @@ impl Root {
         if format >= FORMAT {
             o.extent(self.sequences);
             o.u8(self.release);
-            o.u32(self.monetary.len() as u32);
-            for (t, c, l) in &self.monetary {
+            let monetary: &[(String, String, String)] = match self.cut {
+                None => &self.monetary,
+                Some(_) => &[],
+            };
+            o.u32(monetary.len() as u32);
+            for (t, c, l) in monetary {
                 o.str(t);
                 o.str(c);
                 o.str(l);
@@ -736,9 +900,6 @@ impl Root {
         }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
-        if o.0.len() > PAGE {
-            return Err(Error::new("the root does not fit one page"));
-        }
         Ok(o.0)
     }
 
@@ -756,10 +917,23 @@ impl Root {
         let pages = i.u64().ok()?;
         let span = i.u64().ok()?;
         let catalog = i.extent().ok()?;
-        let n = i.u32().ok()? as usize;
-        let mut orders = Vec::with_capacity(n);
-        for _ in 0..n {
-            orders.push((i.str().ok()?, i.str().ok()?, i.extent().ok()?));
+        let n = i.u32().ok()?;
+        let mut orders = Vec::new();
+        let mut cut = None;
+        if n == CUT && format >= FORMAT {
+            let catalog_at = i.u64().ok()?;
+            let sequences_at = i.u64().ok()?;
+            let top = crate::listing::Node::decode(&mut i).ok()?;
+            cut = Some(Cut {
+                tables: crate::listing::Shape::of(top),
+                catalog_at: (catalog_at > 0).then_some(catalog_at),
+                sequences_at,
+            });
+        } else {
+            orders.reserve((n as usize).min(256));
+            for _ in 0..n {
+                orders.push((i.str().ok()?, i.str().ok()?, i.extent().ok()?));
+            }
         }
         let free = i.extent().ok()?;
         let reused_from = i.u64().ok()?;
@@ -850,30 +1024,41 @@ impl Root {
         };
         let end = i.at();
         let crc = i.u32().ok()?;
-        (crc32fast::hash(&page[..end]) == crc).then_some((
-            Root {
-                generation,
-                pages,
-                span,
-                catalog,
-                orders,
-                free,
-                reused,
-                reused_from,
-                sequences,
-                release,
-                monetary,
-                collation,
-                text_search,
-                decided,
-                pending,
-                host,
-                replica,
-                serial,
-                clock,
-            },
-            format,
-        ))
+        if crc32fast::hash(&page[..end]) != crc {
+            return None;
+        }
+        let mut root = Root {
+            generation,
+            pages,
+            span,
+            catalog,
+            orders,
+            free,
+            reused,
+            reused_from,
+            sequences,
+            release,
+            monetary,
+            collation,
+            text_search,
+            decided,
+            pending,
+            host,
+            replica,
+            serial,
+            clock,
+            cut,
+        };
+        // A list of tables its top holds whole is read with the root.
+        if let Some(entries) = root
+            .cut
+            .as_ref()
+            .filter(|c| c.tables.read())
+            .map(|c| c.tables.entries())
+        {
+            root.unlist(&entries).ok()?;
+        }
+        Some((root, format))
     }
 
     /// The checksum a root's encoding ends with, as the root it stands for once taken: its pending
@@ -1111,7 +1296,15 @@ pub struct Reader {
     /// and the reader's name there.
     room: RefCell<Rc<crate::room::Room>>,
     id: u64,
+    /// The pages of the lists a cut root names that the reader read last: the tables', the
+    /// catalog's and the sequences'.
+    listed: RefCell<[crate::listing::Read; 3]>,
 }
+
+/// The lists a cut root names, as a reader keeps the pages it read of each.
+const TABLES: usize = 0;
+const CATALOG: usize = 1;
+const SEQUENCES: usize = 2;
 
 static READERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1143,6 +1336,7 @@ impl Reader {
             tag: Cell::new(NO_TAG),
             room: RefCell::new(crate::room::Room::new(Default::default())),
             id: READERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            listed: Default::default(),
         })
     }
 
@@ -1367,7 +1561,8 @@ impl Reader {
         self.round.set(Some(root.generation));
         self.forget_reused(&root);
         self.generation.set(root.generation);
-        *self.spare.borrow_mut() = pending;
+        let root = self.expanded(root)?;
+        *self.spare.borrow_mut() = pending.map(|p| self.expanded(p)).transpose()?;
         self.copy.set(copy);
         self.waiting.set(waiting);
         Ok(root)
@@ -1388,12 +1583,300 @@ impl Reader {
         self.files.span.set(root.span);
         self.files.format.set(format);
         self.forget_reused(&root);
-        *self.spare.borrow_mut() = pending;
+        let root = self.expanded(root)?;
+        *self.spare.borrow_mut() = pending.map(|p| self.expanded(p)).transpose()?;
         self.copy.set(copy);
         self.waiting.set(waiting);
         Ok(root)
     }
 
+    /// The root with the tables' list it cut into pages read: a page the reader read before, by its
+    /// page and the generation that wrote it, taken as it read it.
+    pub(crate) fn expanded(&self, mut root: Root) -> Result<Root> {
+        let Some(top) = root
+            .cut
+            .as_ref()
+            .filter(|c| !c.tables.read())
+            .map(|c| c.tables.top.clone())
+        else {
+            return Ok(root);
+        };
+        self.listed.borrow_mut()[TABLES].begin();
+        let shape = crate::listing::walk(top, &mut |n, at| self.list_page(TABLES, n, at))?;
+        let entries = shape.entries();
+        root.cut.as_mut().unwrap().tables = shape;
+        root.unlist(&entries)?;
+        Ok(root)
+    }
+
+    /// A page of one of the lists a cut root names, read where the reader has not read it.
+    fn list_page(&self, list: usize, page: u64, at: u64) -> Result<Rc<crate::listing::Node>> {
+        if let Some(n) = self.listed.borrow_mut()[list].found(page, at) {
+            return Ok(n);
+        }
+        let buf = self.read(page, 1)?;
+        let node = Rc::new(crate::listing::Node::decode(&mut In::new(&buf))?);
+        self.listed.borrow_mut()[list].keep(page, at, node.clone());
+        Ok(node)
+    }
+
+    /// A list whose top page lies at `top`, written at generation `at`.
+    fn paged_list(&self, list: usize, top: Extent, at: u64) -> Result<crate::listing::Shape> {
+        self.listed.borrow_mut()[list].begin();
+        let node = self.list_page(list, top.start, at)?;
+        crate::listing::walk(node, &mut |n, a| self.list_page(list, n, a))
+    }
+
+    /// The catalog's text, as the root names it.
+    pub(crate) fn catalog_text(&self, root: &Root) -> Result<Vec<u8>> {
+        match root.cut.as_ref().and_then(|c| c.catalog_at) {
+            None => self.read_extent(root.catalog),
+            Some(at) => Ok(self
+                .paged_list(CATALOG, root.catalog, at)?
+                .entries()
+                .into_iter()
+                .flat_map(|(_, v)| v)
+                .collect()),
+        }
+    }
+
+    /// Where each sequence stands that has handed out a value, as the root names them.
+    pub(crate) fn sequence_states(&self, root: &Root) -> Result<Vec<SequenceState>> {
+        if root.sequences.bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(cut) = &root.cut else {
+            return decode_sequences(&self.read_extent(root.sequences)?);
+        };
+        let bad = || Error::new("a sequence's place in the file is not whole");
+        self.paged_list(SEQUENCES, root.sequences, cut.sequences_at)?
+            .entries()
+            .into_iter()
+            .map(|(k, v)| {
+                let mut i = In::new(&v);
+                let state = (
+                    String::from_utf8(k).map_err(|_| bad())?,
+                    i.i64()?,
+                    i.u8()? != 0,
+                );
+                Ok(state)
+            })
+            .collect()
+    }
+
+    /// The pages of the lists a cut root names: none where it is not cut.
+    pub(crate) fn listed_pages(&self, root: &Root) -> Result<Vec<Extent>> {
+        let Some(cut) = &root.cut else {
+            return Ok(Vec::new());
+        };
+        let mut out: Vec<Extent> = self
+            .expanded(root.clone())?
+            .cut
+            .unwrap()
+            .tables
+            .pages()
+            .map(crate::listing::Paged::extent)
+            .collect();
+        let paged = [
+            (CATALOG, root.catalog, cut.catalog_at.unwrap_or(0)),
+            (SEQUENCES, root.sequences, cut.sequences_at),
+        ];
+        for (list, top, at) in paged {
+            if top.bytes > 0 && at > 0 {
+                out.push(top);
+                let shape = self.paged_list(list, top, at)?;
+                out.extend(shape.pages().map(crate::listing::Paged::extent));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The catalog's text written over the one `root` names, at generation `at`: in its own pages
+    /// where the root is not cut, else as a list.
+    pub(crate) fn put_catalog(
+        &self,
+        root: &mut Root,
+        text: &[u8],
+        at: u64,
+        w: &mut dyn Place,
+        gone: &mut Vec<Extent>,
+    ) -> Result<()> {
+        let Some(cut) = &root.cut else {
+            gone.push(root.catalog);
+            root.catalog = w.place(text)?;
+            return Ok(());
+        };
+        let old = match cut.catalog_at {
+            Some(a) => Some((root.catalog, a, self.paged_list(CATALOG, root.catalog, a)?)),
+            None => {
+                if root.catalog.bytes > 0 && root.catalog.start < STAGED {
+                    gone.push(root.catalog);
+                }
+                None
+            }
+        };
+        let (top, a) = crate::listing::settle_paged(
+            old.as_ref().map(|(e, a, s)| (*e, *a, s)),
+            crate::listing::chunks(text),
+            at,
+            &mut |b| w.place(b),
+            gone,
+        )?;
+        root.catalog = top;
+        root.cut.as_mut().unwrap().catalog_at = Some(a);
+        Ok(())
+    }
+
+    /// Where each sequence stands, written over the states `root` names, at generation `at`: in
+    /// their own pages where the root is not cut, else as a list, none where no sequence has handed
+    /// out a value.
+    pub(crate) fn put_sequences(
+        &self,
+        root: &mut Root,
+        states: &[SequenceState],
+        at: u64,
+        w: &mut dyn Place,
+        gone: &mut Vec<Extent>,
+    ) -> Result<()> {
+        let Some(cut) = &root.cut else {
+            if root.sequences.bytes > 0 {
+                gone.push(root.sequences);
+            }
+            root.sequences = w.place(&encode_sequences(states))?;
+            return Ok(());
+        };
+        let old = match root.sequences.bytes > 0 && cut.sequences_at > 0 {
+            true => Some((
+                root.sequences,
+                cut.sequences_at,
+                self.paged_list(SEQUENCES, root.sequences, cut.sequences_at)?,
+            )),
+            false => None,
+        };
+        let (top, a) = crate::listing::settle_paged(
+            old.as_ref().map(|(e, a, s)| (*e, *a, s)),
+            sequence_entries(states),
+            at,
+            &mut |b| w.place(b),
+            gone,
+        )?;
+        root.sequences = top;
+        root.cut.as_mut().unwrap().sequences_at = a;
+        Ok(())
+    }
+
+    /// The commit's last step before its free map, at generation `at`: what grows with the schema
+    /// cut into pages where a root of `format` would hold it no longer, its catalog and sequences
+    /// moved out of their own pages; and each page of a cut root's tables' list whose entries
+    /// changed written afresh. The pages replaced are added to `gone`.
+    pub(crate) fn settle(
+        &self,
+        root: &mut Root,
+        format: u32,
+        at: u64,
+        w: &mut dyn Place,
+        gone: &mut Vec<Extent>,
+    ) -> Result<()> {
+        if format < FORMAT {
+            return Ok(());
+        }
+        if root.cut.is_none() {
+            if root.fits_uncut(format)? {
+                return Ok(());
+            }
+            let text = self.read_extent(root.catalog)?;
+            let states = self.sequence_states(root)?;
+            cut_afresh(root, &text, &states, at, w, gone)?;
+        }
+        settle_tables(root, format, at, w, gone)
+    }
+}
+
+/// A root not cut, cut at generation `at`: its catalog's text and its sequences' states written as
+/// lists, the pages that held them added to `gone`.
+pub(crate) fn cut_afresh(
+    root: &mut Root,
+    text: &[u8],
+    states: &[SequenceState],
+    at: u64,
+    w: &mut dyn Place,
+    gone: &mut Vec<Extent>,
+) -> Result<()> {
+    if root.catalog.start > 0 {
+        gone.push(root.catalog);
+    }
+    if root.sequences.bytes > 0 {
+        gone.push(root.sequences);
+    }
+    root.catalog = Extent::default();
+    root.sequences = Extent::default();
+    root.cut = Some(Cut::default());
+    let (top, a) = crate::listing::settle_paged(
+        None,
+        crate::listing::chunks(text),
+        at,
+        &mut |b| w.place(b),
+        gone,
+    )?;
+    root.catalog = top;
+    root.cut.as_mut().unwrap().catalog_at = Some(a);
+    if !states.is_empty() {
+        let (top, a) = crate::listing::settle_paged(
+            None,
+            sequence_entries(states),
+            at,
+            &mut |b| w.place(b),
+            gone,
+        )?;
+        root.sequences = top;
+        root.cut.as_mut().unwrap().sequences_at = a;
+    }
+    Ok(())
+}
+
+/// The sequences' states as the entries of their list, by name.
+fn sequence_entries(states: &[SequenceState]) -> Vec<crate::listing::Item> {
+    let mut entries: Vec<crate::listing::Item> = states
+        .iter()
+        .map(|(name, last, called)| {
+            let mut v = Out::default();
+            v.i64(*last);
+            v.u8(*called as u8);
+            (name.as_bytes().to_vec(), v.0)
+        })
+        .collect();
+    entries.sort();
+    entries.dedup_by(|a, b| a.0 == b.0);
+    entries
+}
+
+/// Each page of a cut root's tables' list whose entries changed written afresh at generation
+/// `at`, levels standing above them until the root holds the top.
+pub(crate) fn settle_tables(
+    root: &mut Root,
+    format: u32,
+    at: u64,
+    w: &mut dyn Place,
+    gone: &mut Vec<Extent>,
+) -> Result<()> {
+    if root.cut.is_none() {
+        return Ok(());
+    }
+    let entries = root.listed()?;
+    let room = root.top_room(format)?;
+    let cut = root.cut.as_mut().unwrap();
+    cut.tables = crate::listing::settle(
+        &cut.tables,
+        entries,
+        at,
+        &|b| b <= room,
+        &mut |b| w.place(b),
+        gone,
+    )?;
+    Ok(())
+}
+
+impl Reader {
     /// The root's two copies read, and the root taken from them as the reader's judge, where it has
     /// one, decides the roots a host tagged, or the root it hands.
     fn copies(&self) -> Result<Copies> {

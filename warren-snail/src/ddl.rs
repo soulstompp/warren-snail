@@ -3247,216 +3247,231 @@ impl Draft {
                 }
             }
         }
-        // The sequences, then the defaults that read them.
-        let mut next = self.clone();
-        next.tables.push(Declared {
-            name: name.clone(),
-            columns: columns.clone(),
-            primary: None,
-            uniques: Vec::new(),
-            checks: Vec::new(),
-            indexes: Vec::new(),
-            clustered: None,
-            foreign_keys: Vec::new(),
-        });
-        for (cname, s) in serials {
-            let seq = next.column_sequence(&name, &cname, s, &[], false)?;
-            let i = columns.iter().position(|c| c.name == cname).unwrap();
-            columns[i].default = Some(nextval_expr(&seq));
-        }
-        for (cname, s, always, options) in identities {
-            let seq = next.column_sequence(&name, &cname, s, &options, true)?;
-            let i = columns.iter().position(|c| c.name == cname).unwrap();
-            columns[i].identity = Some(Identity {
-                always,
-                sequence: seq,
+        // The table made whole or not at all: where it is refused, what it added is taken back. The
+        // sequences, then the defaults that read them.
+        let undo = (
+            self.tables.len(),
+            self.sequences.len(),
+            self.check_names.len(),
+            self.strands_at.len(),
+        );
+        let next = &mut *self;
+        let made = (move || -> Result<Vec<String>> {
+            next.tables.push(Declared {
+                name: name.clone(),
+                columns: columns.clone(),
+                primary: None,
+                uniques: Vec::new(),
+                checks: Vec::new(),
+                indexes: Vec::new(),
+                clustered: None,
+                foreign_keys: Vec::new(),
             });
-        }
-        for col in &columns {
-            if let Some(e) = &col.default {
-                next.check_default(e, col.ty, &format!("column \"{}\"", col.name))?;
+            for (cname, s) in serials {
+                let seq = next.column_sequence(&name, &cname, s, &[], false)?;
+                let i = columns.iter().position(|c| c.name == cname).unwrap();
+                columns[i].default = Some(nextval_expr(&seq));
             }
-        }
-        // The keys, named as PostgreSQL names them: the primary key first, then each UNIQUE in the
-        // order written, one written twice made once.
-        keys.sort_by_key(|k| !k.primary);
-        let mut made: Vec<Keyed> = Vec::new();
-        for k in keys {
-            let levels: Vec<Level> = k
-                .columns
-                .iter()
-                .map(|n| Level::Column(column_index(n).unwrap()))
-                .collect();
-            let include: Vec<usize> = k.include.iter().map(|n| column_index(n).unwrap()).collect();
-            let method = if k.without_overlaps {
-                Method::Gist
-            } else {
-                Method::Btree
-            };
-            if let Some(prior) = made.iter_mut().find(|m| {
-                m.levels == levels
-                    && m.include == include
-                    && m.nulls_distinct == k.nulls_distinct
-                    && m.constraint.as_ref().map(|c| c.deferrable) == Some(k.deferrable)
-                    && m.method == method
-            }) {
-                if let Some(c) = prior.constraint.as_mut() {
-                    c.primary |= k.primary;
-                }
-                continue;
+            for (cname, s, always, options) in identities {
+                let seq = next.column_sequence(&name, &cname, s, &options, true)?;
+                let i = columns.iter().position(|c| c.name == cname).unwrap();
+                columns[i].identity = Some(Identity {
+                    always,
+                    sequence: seq,
+                });
             }
-            let kname = match &k.name {
-                Some(n) => {
-                    if next.relation(&schema, n) || made.iter().any(|m| &m.name == n) {
-                        return Err(Error::new(format!("relation \"{n}\" already exists")));
-                    }
-                    n.clone()
+            for col in &columns {
+                if let Some(e) = &col.default {
+                    next.check_default(e, col.ty, &format!("column \"{}\"", col.name))?;
                 }
-                None => {
-                    // PostgreSQL names a key for its columns and those it includes.
-                    let all: Vec<String> = k.columns.iter().chain(&k.include).cloned().collect();
-                    let addition = name_addition(&all);
-                    choose(
-                        bare(&name),
-                        if k.primary { None } else { Some(&addition) },
-                        if k.primary { "pkey" } else { "key" },
-                        &|n| {
-                            next.relation(&schema, n)
-                                || next.constraint(&schema, n)
-                                || made.iter().any(|m| m.name == n)
-                        },
-                    )
-                }
-            };
-            // A key WITHOUT OVERLAPS is an EXCLUDE on GiST: `=` on each column but its last, `&&`
-            // on its last, as PostgreSQL's ComputeIndexAttrs finds them in each column's operator
-            // class.
-            let (opclasses, exclusion) = if k.without_overlaps {
-                let mut opclasses = Vec::new();
-                let mut operators = Vec::new();
-                for (i, l) in levels.iter().enumerate() {
-                    let ty = columns[l.column()].ty;
-                    let op = crate::methods::opclass(Method::Gist, ty, None, self.release)?;
-                    let operator = if i + 1 == levels.len() { "&&" } else { "=" };
-                    if crate::methods::exclusion_operator(Method::Gist, &op, ty, operator).is_err()
-                    {
-                        return Err(Error::new(format!(
-                            "could not identify an equality operator for type {}",
-                            crate::methods::bare_name(ty)
-                        )));
-                    }
-                    if !crate::methods::held(Method::Gist, &op) {
-                        return Err(Error::new(format!(
-                            "{name}: a key WITHOUT OVERLAPS on {}: USING gist with the operator \
-                             class {op} is not held yet",
-                            columns[l.column()].name
-                        )));
-                    }
-                    opclasses.push(op);
-                    operators.push(operator.to_string());
-                }
-                let exclusion = crate::catalog::Exclusion {
-                    operators,
-                    deferrable: k.deferrable,
-                };
-                (opclasses, Some(exclusion))
-            } else {
-                let opclasses = levels
+            }
+            // The keys, named as PostgreSQL names them: the primary key first, then each UNIQUE in the
+            // order written, one written twice made once.
+            keys.sort_by_key(|k| !k.primary);
+            let mut made: Vec<Keyed> = Vec::new();
+            for k in keys {
+                let levels: Vec<Level> = k
+                    .columns
                     .iter()
-                    .map(|l| columns[l.column()].ty.default_opclass().to_string())
+                    .map(|n| Level::Column(column_index(n).unwrap()))
                     .collect();
-                (opclasses, None)
-            };
-            made.push(Keyed {
-                name: kname,
-                method,
-                predicate: None,
-                predicate_columns: Vec::new(),
-                // A key WITHOUT OVERLAPS refuses what overlaps, the same key among it, by its
-                // EXCLUDE.
-                unique: exclusion.is_none(),
-                exclusion,
-                nulls_first: vec![false; levels.len()],
-                desc: vec![false; levels.len()],
-                keys: k.columns.clone(),
-                opclasses,
-                levels,
-                include,
-                nulls_distinct: k.nulls_distinct,
-                options: Vec::new(),
-                params: Vec::new(),
-                constraint: Some(KeyConstraint {
-                    primary: k.primary,
-                    deferrable: k.deferrable,
-                }),
-            });
-        }
-        let mut used: Vec<String> = Vec::new();
-        let mut table_checks = Vec::new();
-        for (given, expr, enforced) in checks {
-            let n = match given {
-                Some(n) => {
-                    if used.contains(&n) || table_checks.iter().any(|c: &Check| c.name == n) {
-                        return Err(Error::new(format!(
-                            "constraint \"{n}\" for relation \"{name}\" already exists"
-                        )));
+                let include: Vec<usize> = k.include.iter().map(|n| column_index(n).unwrap()).collect();
+                let method = if k.without_overlaps {
+                    Method::Gist
+                } else {
+                    Method::Btree
+                };
+                if let Some(prior) = made.iter_mut().find(|m| {
+                    m.levels == levels
+                        && m.include == include
+                        && m.nulls_distinct == k.nulls_distinct
+                        && m.constraint.as_ref().map(|c| c.deferrable) == Some(k.deferrable)
+                        && m.method == method
+                }) {
+                    if let Some(c) = prior.constraint.as_mut() {
+                        c.primary |= k.primary;
                     }
-                    n
+                    continue;
                 }
-                None => {
-                    let refs = references(&expr);
-                    let col = match refs.as_slice() {
-                        [one] => Some(one.as_str()),
-                        _ => None,
+                let kname = match &k.name {
+                    Some(n) => {
+                        if next.relation(&schema, n) || made.iter().any(|m| &m.name == n) {
+                            return Err(Error::new(format!("relation \"{n}\" already exists")));
+                        }
+                        n.clone()
+                    }
+                    None => {
+                        // PostgreSQL names a key for its columns and those it includes.
+                        let all: Vec<String> = k.columns.iter().chain(&k.include).cloned().collect();
+                        let addition = name_addition(&all);
+                        choose(
+                            bare(&name),
+                            if k.primary { None } else { Some(&addition) },
+                            if k.primary { "pkey" } else { "key" },
+                            &|n| {
+                                next.relation(&schema, n)
+                                    || next.constraint(&schema, n)
+                                    || made.iter().any(|m| m.name == n)
+                            },
+                        )
+                    }
+                };
+                // A key WITHOUT OVERLAPS is an EXCLUDE on GiST: `=` on each column but its last, `&&`
+                // on its last, as PostgreSQL's ComputeIndexAttrs finds them in each column's operator
+                // class.
+                let (opclasses, exclusion) = if k.without_overlaps {
+                    let mut opclasses = Vec::new();
+                    let mut operators = Vec::new();
+                    for (i, l) in levels.iter().enumerate() {
+                        let ty = columns[l.column()].ty;
+                        let op = crate::methods::opclass(Method::Gist, ty, None, next.release)?;
+                        let operator = if i + 1 == levels.len() { "&&" } else { "=" };
+                        if crate::methods::exclusion_operator(Method::Gist, &op, ty, operator).is_err()
+                        {
+                            return Err(Error::new(format!(
+                                "could not identify an equality operator for type {}",
+                                crate::methods::bare_name(ty)
+                            )));
+                        }
+                        if !crate::methods::held(Method::Gist, &op) {
+                            return Err(Error::new(format!(
+                                "{name}: a key WITHOUT OVERLAPS on {}: USING gist with the operator \
+                                 class {op} is not held yet",
+                                columns[l.column()].name
+                            )));
+                        }
+                        opclasses.push(op);
+                        operators.push(operator.to_string());
+                    }
+                    let exclusion = crate::catalog::Exclusion {
+                        operators,
+                        deferrable: k.deferrable,
                     };
-                    choose(bare(&name), col, "check", &|n| {
-                        next.constraint(&schema, n)
-                            || made.iter().any(|m| m.name == n)
-                            || used.iter().any(|u| u == n)
-                    })
+                    (opclasses, Some(exclusion))
+                } else {
+                    let opclasses = levels
+                        .iter()
+                        .map(|l| columns[l.column()].ty.default_opclass().to_string())
+                        .collect();
+                    (opclasses, None)
+                };
+                made.push(Keyed {
+                    name: kname,
+                    method,
+                    predicate: None,
+                    predicate_columns: Vec::new(),
+                    // A key WITHOUT OVERLAPS refuses what overlaps, the same key among it, by its
+                    // EXCLUDE.
+                    unique: exclusion.is_none(),
+                    exclusion,
+                    nulls_first: vec![false; levels.len()],
+                    desc: vec![false; levels.len()],
+                    keys: k.columns.clone(),
+                    opclasses,
+                    levels,
+                    include,
+                    nulls_distinct: k.nulls_distinct,
+                    options: Vec::new(),
+                    params: Vec::new(),
+                    constraint: Some(KeyConstraint {
+                        primary: k.primary,
+                        deferrable: k.deferrable,
+                    }),
+                });
+            }
+            let mut used: Vec<String> = Vec::new();
+            let mut table_checks = Vec::new();
+            for (given, expr, enforced) in checks {
+                let n = match given {
+                    Some(n) => {
+                        if used.contains(&n) || table_checks.iter().any(|c: &Check| c.name == n) {
+                            return Err(Error::new(format!(
+                                "constraint \"{n}\" for relation \"{name}\" already exists"
+                            )));
+                        }
+                        n
+                    }
+                    None => {
+                        let refs = references(&expr);
+                        let col = match refs.as_slice() {
+                            [one] => Some(one.as_str()),
+                            _ => None,
+                        };
+                        choose(bare(&name), col, "check", &|n| {
+                            next.constraint(&schema, n)
+                                || made.iter().any(|m| m.name == n)
+                                || used.iter().any(|u| u == n)
+                        })
+                    }
+                };
+                used.push(n.clone());
+                // PostgreSQL marks a CHECK NOT ENFORCED never validated.
+                table_checks.push(Check {
+                    name: n,
+                    expr,
+                    enforced,
+                    valid: enforced,
+                });
+            }
+            for n in &used {
+                next.check_names.push(qualified(&schema, n));
+            }
+            let d = next.tables.last_mut().unwrap();
+            d.columns = columns;
+            let mut made = made.into_iter();
+            let first = made.next();
+            match first {
+                Some(k) if k.constraint.as_ref().is_some_and(|c| c.primary) => {
+                    d.primary = Some(k);
+                    d.uniques = made.collect();
                 }
-            };
-            used.push(n.clone());
-            // PostgreSQL marks a CHECK NOT ENFORCED never validated.
-            table_checks.push(Check {
-                name: n,
-                expr,
-                enforced,
-                valid: enforced,
-            });
-        }
-        for n in &used {
-            next.check_names.push(qualified(&schema, n));
-        }
-        let d = next.tables.last_mut().unwrap();
-        d.columns = columns;
-        let mut made = made.into_iter();
-        let first = made.next();
-        match first {
-            Some(k) if k.constraint.as_ref().is_some_and(|c| c.primary) => {
-                d.primary = Some(k);
-                d.uniques = made.collect();
+                Some(k) => {
+                    d.uniques = std::iter::once(k).chain(made).collect();
+                }
+                None => {}
             }
-            Some(k) => {
-                d.uniques = std::iter::once(k).chain(made).collect();
+            d.checks = table_checks;
+            for x in excludes {
+                notices.extend(next.exclude(&name, &x)?);
             }
-            None => {}
+            // The foreign keys, named as PostgreSQL names them, in the order written: once the table's
+            // own keys and EXCLUDEs are made, so that it may reference itself. Each is valid, the table
+            // being empty.
+            for r in fks {
+                let k = next.reference(&name, r, true)?;
+                parting(&name, &next.table(&name).unwrap().foreign_keys, &k)?;
+                next.check_names.push(qualified(&schema, &k.name));
+                next.table_mut(&name).unwrap().foreign_keys.push(k);
+            }
+            Ok(notices)
+        })();
+        if made.is_err() {
+            self.tables.truncate(undo.0);
+            self.sequences.truncate(undo.1);
+            self.check_names.truncate(undo.2);
+            self.strands_at.truncate(undo.3);
         }
-        d.checks = table_checks;
-        for x in excludes {
-            notices.extend(next.exclude(&name, &x)?);
-        }
-        // The foreign keys, named as PostgreSQL names them, in the order written: once the table's
-        // own keys and EXCLUDEs are made, so that it may reference itself. Each is valid, the table
-        // being empty.
-        for r in fks {
-            let k = next.reference(&name, r, true)?;
-            parting(&name, &next.table(&name).unwrap().foreign_keys, &k)?;
-            next.check_names.push(qualified(&schema, &k.name));
-            next.table_mut(&name).unwrap().foreign_keys.push(k);
-        }
-        *self = next;
-        Ok(notices)
+        made
     }
 
     /// An EXCLUDE constraint of a table: the index of its method that stands for it, read as its
@@ -5040,18 +5055,22 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
     for (at, tokens) in statements_of(ddl)?.into_iter().enumerate() {
         draft.kept = at < kept;
         let (kind, object) = head(&tokens);
-        let mut next = draft.clone();
-        let read = match next.apply(&tokens) {
-            Ok(notices) => {
-                draft = next;
-                StatementRead {
-                    text: written(&tokens),
-                    kind,
-                    object,
-                    refused: None,
-                    notices,
-                }
+        // Read strictly, the DDL stops at its first refusal, so each statement is applied in place.
+        let applied = match strict {
+            true => draft.apply(&tokens),
+            false => {
+                let mut next = draft.clone();
+                next.apply(&tokens).inspect(|_| draft = next)
             }
+        };
+        let read = match applied {
+            Ok(notices) => StatementRead {
+                text: written(&tokens),
+                kind,
+                object,
+                refused: None,
+                notices,
+            },
             Err(e) => {
                 // A statement on a table refused before it is refused for that.
                 let on = if kind.contains("INDEX") {
