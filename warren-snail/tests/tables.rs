@@ -365,6 +365,47 @@ mod written {
         whole(&follower);
     }
 
+    /// A host that keeps each commit, a majority holding it once kept.
+    struct Kept(Arc<Mutex<Vec<Commit>>>);
+
+    impl Host for Kept {
+        fn carry(&mut self, commit: &Commit) -> warren_snail::Result<()> {
+            self.0.lock().unwrap().push(commit.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_follower_stopped_before_a_cut_roots_commit_or_halfway_stands_at_its_parent() {
+        use warren_snail::file::Stop;
+        let leader = written("stopped-leader", MANY, &[300]);
+        let follower = tmp("tables-stopped-follower.snail");
+        carry::copy(&leader, &follower).unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut w = Snail::open_writing(&leader).unwrap();
+        w.carried_by(Box::new(Kept(log.clone()))).unwrap();
+        w.execute("CREATE TABLE s.extra (a bigint PRIMARY KEY, b text)")
+            .unwrap();
+        w.execute(&insert(300, 1001)).unwrap();
+        drop(w);
+        let commits = log.lock().unwrap().clone();
+        assert_eq!(commits.len(), 2);
+        for stop in [Stop::BeforeRoot, Stop::HalfRoot] {
+            assert!(carry::apply_stopping(&follower, &commits[0], Some(stop)).is_err());
+            let mut r = fresh(&follower);
+            assert!(r.ask("SELECT count(*) FROM s.extra", None).is_err());
+        }
+        for c in &commits {
+            carry::apply(&follower, c).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&leader).unwrap(),
+            std::fs::read(&follower).unwrap()
+        );
+        assert_eq!(rows_of(&follower, 300), 101);
+        whole(&follower);
+    }
+
     #[test]
     fn a_transaction_across_snails_one_of_them_cut_is_all_or_nothing() {
         let a = written("across-a", MANY, &[300]);
