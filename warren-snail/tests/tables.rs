@@ -631,12 +631,24 @@ mod written {
             make(&mut w, "also", 1);
             w.execute("COMMIT").unwrap();
             assert_eq!(is_cut(&path), cut);
+            // Failed in a savepoint, then rolled back whole: nothing it declared stands, before the
+            // savepoint or after it.
+            w.execute("BEGIN").unwrap();
+            make(&mut w, "whole", 1);
+            w.execute("SAVEPOINT b").unwrap();
+            make(&mut w, "inner", 1);
+            assert!(w.execute("INSERT INTO s.none (a) VALUES (1)").is_err());
+            w.execute("ROLLBACK").unwrap();
+            assert!(w.ask("SELECT count(*) FROM s.whole_000", None).is_err());
+            make(&mut w, "whole", 1);
             drop(w);
             whole(&path);
             let mut r = fresh(&path);
             assert_eq!(count(&mut r, "SELECT count(*) FROM s.kept_000"), 0);
             assert_eq!(count(&mut r, "SELECT count(*) FROM s.also_000"), 0);
+            assert_eq!(count(&mut r, "SELECT count(*) FROM s.whole_000"), 0);
             assert!(r.ask("SELECT count(*) FROM s.gone_000", None).is_err());
+            assert!(r.ask("SELECT count(*) FROM s.inner_000", None).is_err());
         }
     }
 
