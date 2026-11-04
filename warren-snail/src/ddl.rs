@@ -12,6 +12,7 @@ use crate::catalog::{
 };
 use crate::{Error, Result};
 use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
+use std::collections::HashMap;
 use sqlparser::ast::{
     ColumnOption, ConstraintCharacteristics, CreateFunctionBody, DataType, DeferrableInitial, Expr,
     FunctionArg, FunctionArgExpr, FunctionArguments, NullsDistinctOption, ObjectNamePart,
@@ -1834,6 +1835,36 @@ struct Draft {
     strands_at: Vec<(usize, String, String)>,
     /// The release whose operator classes are each type's defaults.
     release: u8,
+    /// Each table's place in `tables`, by its name.
+    table_at: HashMap<String, usize>,
+    /// The relations of each name in each schema, counted: the tables, their keys, the sequences
+    /// and the views, as `relation` finds them.
+    relations: HashMap<(String, String), usize>,
+    /// The primary and unique keys of each name in each schema, counted, as `constraint` finds
+    /// them beside `check_names`.
+    key_constraints: HashMap<(String, String), usize>,
+    /// `check_names`, counted.
+    check_named: HashMap<String, usize>,
+}
+
+/// One more of a name.
+fn count_in<K: std::hash::Hash + Eq>(names: &mut HashMap<K, usize>, name: K) {
+    *names.entry(name).or_default() += 1;
+}
+
+/// One fewer of a name.
+fn count_out<K: std::hash::Hash + Eq>(names: &mut HashMap<K, usize>, name: &K) {
+    if let Some(n) = names.get_mut(name) {
+        *n -= 1;
+        if *n == 0 {
+            names.remove(name);
+        }
+    }
+}
+
+/// A name in its schema, as `relation` and `constraint` compare it.
+fn in_schema(schema: &str, name: &str) -> (String, String) {
+    (schema.to_string(), name.to_string())
 }
 
 /// A key a CREATE TABLE writes, before its name is chosen.
@@ -1850,15 +1881,84 @@ struct KeySpec {
 
 impl Draft {
     fn table(&self, name: &str) -> Option<&Declared> {
-        self.tables.iter().find(|t| t.name == name)
+        let found = self.table_at.get(name).map(|&i| &self.tables[i]);
+        debug_assert_eq!(
+            found.map(|t| &t.name),
+            self.tables.iter().find(|t| t.name == name).map(|t| &t.name)
+        );
+        found
     }
 
     fn table_mut(&mut self, name: &str) -> Option<&mut Declared> {
-        self.tables.iter_mut().find(|t| t.name == name)
+        let i = *self.table_at.get(name)?;
+        Some(&mut self.tables[i])
+    }
+
+    /// A table declared, its name and its keys' names counted.
+    fn push_table(&mut self, table: Declared) {
+        self.table_at
+            .entry(table.name.clone())
+            .or_insert(self.tables.len());
+        let schema = schema_of(&table.name);
+        count_in(&mut self.relations, in_schema(schema, bare(&table.name)));
+        for k in table.keys() {
+            count_in(&mut self.relations, in_schema(schema, &k.name));
+        }
+        for k in table.primary.iter().chain(table.uniques.iter()) {
+            count_in(&mut self.key_constraints, in_schema(schema, &k.name));
+        }
+        self.tables.push(table);
+    }
+
+    /// The tables, sequences and constraints' names past the counts given taken back, as a
+    /// statement refused leaves them.
+    fn take_back(&mut self, tables: usize, sequences: usize, check_names: usize) {
+        for t in self.tables.drain(tables..) {
+            let schema = schema_of(&t.name);
+            count_out(&mut self.relations, &in_schema(schema, bare(&t.name)));
+            for k in t.keys() {
+                count_out(&mut self.relations, &in_schema(schema, &k.name));
+            }
+            for k in t.primary.iter().chain(t.uniques.iter()) {
+                count_out(&mut self.key_constraints, &in_schema(schema, &k.name));
+            }
+        }
+        self.table_at.retain(|_, &mut i| i < tables);
+        for s in self.sequences.drain(sequences..) {
+            count_out(
+                &mut self.relations,
+                &in_schema(schema_of(&s.name), bare(&s.name)),
+            );
+        }
+        for q in self.check_names.drain(check_names..) {
+            count_out(&mut self.check_named, &q);
+        }
+    }
+
+    /// A sequence declared, its name counted.
+    fn push_sequence(&mut self, sequence: Sequence) {
+        count_in(
+            &mut self.relations,
+            in_schema(schema_of(&sequence.name), bare(&sequence.name)),
+        );
+        self.sequences.push(sequence);
+    }
+
+    /// A CHECK's or a foreign key's name, schema-qualified, taken and counted.
+    fn push_check_name(&mut self, q: String) {
+        count_in(&mut self.check_named, q.clone());
+        self.check_names.push(q);
     }
 
     /// Whether a relation of that name lies in the schema: a table, an index or a sequence.
     fn relation(&self, schema: &str, name: &str) -> bool {
+        let found = self.relations.contains_key(&in_schema(schema, name));
+        debug_assert_eq!(found, self.relation_walked(schema, name), "{schema}.{name}");
+        found
+    }
+
+    /// `relation`, every table, sequence and view walked.
+    fn relation_walked(&self, schema: &str, name: &str) -> bool {
         self.tables.iter().any(|t| {
             (schema_of(&t.name) == schema && bare(&t.name) == name)
                 || (schema_of(&t.name) == schema && t.keys().any(|k| k.name == name))
@@ -1874,6 +1974,14 @@ impl Draft {
 
     /// Whether a constraint of that name lies in the schema: a key's or a CHECK's.
     fn constraint(&self, schema: &str, name: &str) -> bool {
+        let found = self.check_named.contains_key(&qualified(schema, name))
+            || self.key_constraints.contains_key(&in_schema(schema, name));
+        debug_assert_eq!(found, self.constraint_walked(schema, name), "{schema}.{name}");
+        found
+    }
+
+    /// `constraint`, every name and table walked.
+    fn constraint_walked(&self, schema: &str, name: &str) -> bool {
         self.check_names.contains(&qualified(schema, name))
             || self.tables.iter().any(|t| {
                 schema_of(&t.name) == schema
@@ -1897,7 +2005,7 @@ impl Draft {
         if self.domains.iter().any(|d| d.name == name) {
             return Some("domain");
         }
-        if self.tables.iter().any(|t| t.name == name) {
+        if self.table(name).is_some() {
             return Some("table's row type");
         }
         None
@@ -2257,7 +2365,7 @@ impl Draft {
         let mut s = Sequence::made(&name, &given, &what)?;
         s.owned_by = Some((table.to_string(), column.to_string()));
         s.identity = identity;
-        self.sequences.push(s);
+        self.push_sequence(s);
         Ok(name)
     }
 
@@ -2402,6 +2510,7 @@ impl Draft {
                 "column \"{n}\" specified more than once"
             )));
         }
+        count_in(&mut self.relations, in_schema(schema_of(&name), bare(&name)));
         self.views.push(View {
             name,
             columns,
@@ -2553,7 +2662,7 @@ impl Draft {
                     used.push(k.name.clone());
                 }
                 for n in used {
-                    self.check_names.push(qualified(&schema, &n));
+                    self.push_check_name(qualified(&schema, &n));
                 }
                 self.domains.push(d);
             }
@@ -2605,7 +2714,7 @@ impl Draft {
                             }
                             None => chosen,
                         };
-                        self.check_names.push(qualified(&schema, &n));
+                        self.push_check_name(qualified(&schema, &n));
                         let d = self.domains.iter_mut().find(|d| d.name == name).unwrap();
                         d.checks.push(DomainCheck {
                             name: n,
@@ -2618,7 +2727,11 @@ impl Draft {
                             Some(i) => {
                                 d.checks.remove(i);
                                 let q = qualified(&schema, &n);
+                                let before = self.check_names.len();
                                 self.check_names.retain(|x| *x != q);
+                                for _ in self.check_names.len()..before {
+                                    count_out(&mut self.check_named, &q);
+                                }
                             }
                             None if d.not_null_name.as_deref() == Some(n.as_str()) => {
                                 d.not_null = false;
@@ -2653,7 +2766,9 @@ impl Draft {
                         let q = qualified(&schema, &from);
                         for x in &mut self.check_names {
                             if *x == q {
+                                count_out(&mut self.check_named, &q);
                                 *x = qualified(&schema, &to);
+                                count_in(&mut self.check_named, x.clone());
                             }
                         }
                     }
@@ -2686,7 +2801,7 @@ impl Draft {
                     )));
                 }
                 sequence.owned_by = self.owner(&sequence.name, &options, None)?;
-                self.sequences.push(sequence);
+                self.push_sequence(sequence);
             }
             Form::AlterSequence {
                 name,
@@ -2814,7 +2929,7 @@ impl Draft {
             end(&c, &format!("ALTER TABLE {name} ADD FOREIGN KEY"))?;
             let k = self.reference(&name, r, false)?;
             parting(&name, &self.table(&name).unwrap().foreign_keys, &k)?;
-            self.check_names.push(qualified(&schema, &k.name));
+            self.push_check_name(qualified(&schema, &k.name));
             self.table_mut(&name).unwrap().foreign_keys.push(k);
             return Ok(notices);
         }
@@ -2874,7 +2989,7 @@ impl Draft {
                 choose(bare(&name), col, "check", &|n| self.constraint(&schema, n))
             }
         };
-        self.check_names.push(qualified(&schema, &n));
+        self.push_check_name(qualified(&schema, &n));
         self.table_mut(&name).unwrap().checks.push(Check {
             name: n,
             expr,
@@ -3257,7 +3372,7 @@ impl Draft {
         );
         let next = &mut *self;
         let made = (move || -> Result<Vec<String>> {
-            next.tables.push(Declared {
+            next.push_table(Declared {
                 name: name.clone(),
                 columns: columns.clone(),
                 primary: None,
@@ -3289,6 +3404,8 @@ impl Draft {
             // order written, one written twice made once.
             keys.sort_by_key(|k| !k.primary);
             let mut made: Vec<Keyed> = Vec::new();
+            // Whether each key's name was chosen rather than written.
+            let mut chosen: Vec<bool> = Vec::new();
             for k in keys {
                 let levels: Vec<Level> = k
                     .columns
@@ -3302,15 +3419,24 @@ impl Draft {
                 } else {
                     Method::Btree
                 };
-                if let Some(prior) = made.iter_mut().find(|m| {
+                if let Some(at) = made.iter().position(|m| {
                     m.levels == levels
                         && m.include == include
                         && m.nulls_distinct == k.nulls_distinct
                         && m.constraint.as_ref().map(|c| c.deferrable) == Some(k.deferrable)
                         && m.method == method
                 }) {
-                    if let Some(c) = prior.constraint.as_mut() {
+                    if let Some(c) = made[at].constraint.as_mut() {
                         c.primary |= k.primary;
+                    }
+                    // A name written takes the place of one chosen, as PostgreSQL's
+                    // transformIndexConstraints gives it to the key it keeps.
+                    if let (true, Some(n)) = (chosen[at], &k.name) {
+                        if next.relation(&schema, n) || made.iter().any(|m| &m.name == n) {
+                            return Err(Error::new(format!("relation \"{n}\" already exists")));
+                        }
+                        made[at].name = n.clone();
+                        chosen[at] = false;
                     }
                     continue;
                 }
@@ -3378,6 +3504,7 @@ impl Draft {
                         .collect();
                     (opclasses, None)
                 };
+                chosen.push(k.name.is_none());
                 made.push(Keyed {
                     name: kname,
                     method,
@@ -3437,7 +3564,7 @@ impl Draft {
                 });
             }
             for n in &used {
-                next.check_names.push(qualified(&schema, n));
+                next.push_check_name(qualified(&schema, n));
             }
             let d = next.tables.last_mut().unwrap();
             d.columns = columns;
@@ -3453,6 +3580,11 @@ impl Draft {
                 }
                 None => {}
             }
+            for k in d.primary.iter().chain(d.uniques.iter()) {
+                let named = in_schema(schema_of(&d.name), &k.name);
+                count_in(&mut next.relations, named.clone());
+                count_in(&mut next.key_constraints, named);
+            }
             d.checks = table_checks;
             for x in excludes {
                 notices.extend(next.exclude(&name, &x)?);
@@ -3463,15 +3595,13 @@ impl Draft {
             for r in fks {
                 let k = next.reference(&name, r, true)?;
                 parting(&name, &next.table(&name).unwrap().foreign_keys, &k)?;
-                next.check_names.push(qualified(&schema, &k.name));
+                next.push_check_name(qualified(&schema, &k.name));
                 next.table_mut(&name).unwrap().foreign_keys.push(k);
             }
             Ok(notices)
         })();
         if made.is_err() {
-            self.tables.truncate(undo.0);
-            self.sequences.truncate(undo.1);
-            self.check_names.truncate(undo.2);
+            self.take_back(undo.0, undo.1, undo.2);
             self.strands_at.truncate(undo.3);
         }
         made
@@ -4150,6 +4280,10 @@ impl Draft {
             params: written,
             constraint: None,
         };
+        count_in(
+            &mut self.relations,
+            in_schema(schema_of(&table_name), &keyed.name),
+        );
         self.table_mut(&table_name).unwrap().indexes.push(keyed);
         Ok(notices)
     }
@@ -5055,17 +5189,36 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
         ..Draft::default()
     };
     let mut statements: Vec<StatementRead> = Vec::new();
-    for (at, tokens) in statements_of(ddl)?.into_iter().enumerate() {
+    let all = statements_of(ddl)?;
+    // The statements taken so far, by their place.
+    let mut taken: Vec<usize> = Vec::new();
+    for (at, tokens) in all.iter().enumerate() {
         draft.kept = at < kept;
-        let (kind, object) = head(&tokens);
-        // Read strictly, the DDL stops at its first refusal, so each statement is applied in place.
-        let applied = match strict {
-            true => draft.apply(&tokens),
-            false => {
-                let mut next = draft.clone();
-                next.apply(&tokens).inspect(|_| draft = next)
+        let (kind, object) = head(tokens);
+        // Each statement is applied in place. Read strictly, the DDL stops at its first refusal;
+        // otherwise a statement refused leaves the draft as the statements taken before it make it.
+        let applied = draft.apply(tokens);
+        match &applied {
+            Ok(_) => taken.push(at),
+            Err(_) if !strict => {
+                let mut again = Draft {
+                    release,
+                    ..Draft::default()
+                };
+                for &i in &taken {
+                    again.kept = i < kept;
+                    again.apply(&all[i]).map_err(|e| {
+                        Error::new(format!(
+                            "{}: taken once and refused read again: {}",
+                            written(&all[i]),
+                            e.0
+                        ))
+                    })?;
+                }
+                draft = again;
             }
-        };
+            Err(_) => {}
+        }
         let read = match applied {
             Ok(notices) => StatementRead {
                 text: written(&tokens),
@@ -5360,6 +5513,57 @@ mod tests {
 
     fn form(s: &str) -> Result<Form> {
         read(&tokens(s)).expect("a form the snail reads")
+    }
+
+    #[test]
+    fn a_name_taken_in_a_schema_is_refused_again_as_postgresql_refuses_it() {
+        // Each statement as PostgreSQL 18.6 took or refused it, the colliding names among them.
+        let read: [(&str, bool); 23] = [
+            ("CREATE TABLE s.a (x bigint PRIMARY KEY)", true),
+            ("CREATE TABLE s.a_pkey (x bigint PRIMARY KEY)", false),
+            ("CREATE SEQUENCE s.q", true),
+            ("CREATE SEQUENCE s.q", false),
+            ("CREATE TABLE s.b (id bigint PRIMARY KEY, CONSTRAINT a_pkey UNIQUE (id))", false),
+            ("CREATE TABLE s.b (id serial PRIMARY KEY, v bigint REFERENCES s.nowhere (x))", false),
+            ("CREATE TABLE s.b (id serial PRIMARY KEY)", true),
+            ("CREATE SEQUENCE s.b_id_seq", false),
+            ("CREATE TABLE s.c (id serial PRIMARY KEY, w serial)", true),
+            ("CREATE VIEW s.v AS SELECT x FROM s.a", true),
+            ("CREATE TABLE s.v (x bigint PRIMARY KEY)", false),
+            ("CREATE INDEX a_x ON s.a (x)", true),
+            ("CREATE TABLE s.a_x (y bigint PRIMARY KEY)", false),
+            ("CREATE TABLE s.k (x bigint, y bigint, PRIMARY KEY (x), UNIQUE (y), UNIQUE (x, y))", true),
+            ("CREATE TABLE s.k_y_key (x bigint PRIMARY KEY)", false),
+            ("CREATE DOMAIN s.d AS integer CONSTRAINT d_pos CHECK (VALUE > 0)", true),
+            ("ALTER DOMAIN s.d RENAME CONSTRAINT d_pos TO d_big", true),
+            ("ALTER DOMAIN s.d ADD CONSTRAINT d_pos CHECK (VALUE < 100)", true),
+            ("ALTER DOMAIN s.d DROP CONSTRAINT d_big", true),
+            ("ALTER DOMAIN s.d ADD CONSTRAINT d_big CHECK (VALUE <> 5)", true),
+            ("ALTER DOMAIN s.d ADD CONSTRAINT d_pos CHECK (VALUE <> 6)", false),
+            ("CREATE TABLE s.e (x bigint PRIMARY KEY, CHECK (x > 0), CHECK (x < 9))", true),
+            ("CREATE TABLE s.f (x bigint PRIMARY KEY REFERENCES s.e (x), y bigint REFERENCES s.e (x))", true),
+        ];
+        let ddl: String = read.iter().map(|(s, _)| format!("{s};\n")).collect();
+        let reading = read_ddl(&ddl, false).unwrap();
+        let taken: Vec<bool> = reading.statements.iter().map(|s| s.refused.is_none()).collect();
+        assert_eq!(taken, read.iter().map(|r| r.1).collect::<Vec<_>>(), "{:#?}", reading.statements);
+        // A key written twice is made once, under the name written where the other's was chosen.
+        let reading = read_ddl(
+            "CREATE TABLE s.t (id bigint PRIMARY KEY, CONSTRAINT t_named UNIQUE (id));\n\
+             CREATE TABLE s.t_pkey (x bigint PRIMARY KEY);\n\
+             CREATE TABLE s.u (id bigint, CONSTRAINT u_first PRIMARY KEY (id), CONSTRAINT u_second UNIQUE (id));\n\
+             CREATE TABLE s.u_second (x bigint PRIMARY KEY);\n",
+            false,
+        )
+        .unwrap();
+        let refused: Vec<bool> = reading.statements.iter().map(|s| s.refused.is_some()).collect();
+        assert_eq!(refused, [false, false, false, false]);
+        let names = |t: &str| -> Vec<String> {
+            let t = reading.catalog.tables.iter().find(|x| x.name == t).unwrap();
+            t.orders.iter().map(|o| o.name.clone()).collect()
+        };
+        assert_eq!(names("s.t"), ["t_named"]);
+        assert_eq!(names("s.u"), ["u_first"]);
     }
 
     #[test]
