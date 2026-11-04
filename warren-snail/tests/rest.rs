@@ -337,15 +337,12 @@ fn the_rest_and_the_forms_a_call_resolves_to() {
 
 #[test]
 fn a_setting_the_snail_does_not_hold_fixed_is_refused_by_name() {
-    // PostgreSQL answers each: work_mem's value, NULL for a missing one, the server's default.
+    // work_mem changes no answer, so it is read at PostgreSQL's boot value; a setting missing, where
+    // that is asked for, is NULL; TimeZone reset is the one the snail answers under.
     let mut snail = snail("rest-refused");
-    for expr in [
-        "current_setting('work_mem')",
-        "current_setting('no_such', true)",
-        "set_config('TimeZone', NULL, false)",
-        "set_config('TimeZone', 'Europe/Lisbon', false)",
-    ] {
-        let got = answer(&mut snail, expr, 1);
-        assert!(got.contains("the snail answers under"), "{expr}: {got}");
-    }
+    assert_eq!(answer(&mut snail, "current_setting('work_mem')", 1), "4MB");
+    assert_eq!(answer(&mut snail, "current_setting('no_such', true)", 1), "NULL");
+    assert_eq!(answer(&mut snail, "set_config('TimeZone', NULL, false)", 1), "UTC");
+    let got = answer(&mut snail, "set_config('TimeZone', 'Europe/Lisbon', false)", 1);
+    assert!(got.contains("the snail answers under"), "{got}");
 }
