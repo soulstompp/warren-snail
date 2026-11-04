@@ -1379,7 +1379,20 @@ pub(super) fn fixed_setting(
             crate::tsearch::TextSearch::open(&joined).is_ok_and(|t| t == text_search)
                 || joined.eq_ignore_ascii_case("default")
         }
-        _ => joined.eq_ignore_ascii_case(fixed) || joined.eq_ignore_ascii_case("default"),
+        _ => {
+            joined.eq_ignore_ascii_case(fixed)
+                || joined.eq_ignore_ascii_case("default")
+                // A number or a word of a list as PostgreSQL's SET reads it: ` +1 ` is 1.
+                || super::settings::find(crate::regs::LATEST, &name).is_some_and(|g| {
+                    matches!(
+                        (
+                            super::settings::normalized(g, &joined),
+                            super::settings::normalized(g, fixed)
+                        ),
+                        (Ok(a), Ok(b)) if a == b
+                    )
+                })
+        }
     };
     let fixed = match name.as_str() {
         "lc_monetary" => file.as_str(),
