@@ -340,6 +340,11 @@ impl Typing<'_> {
                 self.type_of(left)?;
                 Some(ColumnType::Boolean)
             }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                self.type_of(left)?;
+                self.type_of(right)?;
+                Some(ColumnType::Boolean)
+            }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => self.column(e),
             Expr::Nested(x) => self.type_of(x)?,
             Expr::Collate { expr, .. } => self.type_of(expr)?,

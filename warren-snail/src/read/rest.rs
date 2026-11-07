@@ -169,6 +169,7 @@ const FORMS: &[Form] = &[
     ),
     ("error_on_null", &[P::Element], R::First),
     ("format_type", &[OID, I4], R::T(ColumnType::Text(None))),
+    ("nameconcatoid", &[P::T(ColumnType::Name), OID], R::T(ColumnType::Name)),
     (
         "makeaclitem",
         &[OID, OID, TEXT, BOOL],
@@ -1406,6 +1407,19 @@ fn the_rest(name: &str, types: &[Option<ColumnType>], values: &[Value]) -> Resul
             return Err(Error::new("null value not allowed"))
         }
         "error_on_null" => values[0].clone(),
+        // The name, cut at a character so that it and `_` and the OID fit in a name's 63 bytes.
+        "nameconcatoid" => match (&values[0], oid_of(&values[1])) {
+            (Value::Null, _) | (_, None) => Value::Null,
+            (v, Some(oid)) => {
+                let name = v.text().unwrap_or_default();
+                let suffix = format!("_{oid}");
+                let mut cut = name.len().min(63 - suffix.len());
+                while !name.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                Value::Str(ColumnType::Name, format!("{}{suffix}", &name[..cut]))
+            }
+        },
         "format_type" => match oid_of(&values[0]) {
             None => Value::Null,
             Some(oid) => {

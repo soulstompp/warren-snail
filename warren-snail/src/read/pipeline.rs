@@ -342,6 +342,17 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
 /// How two values compare under `under`: two strings under a library collation as it compares
 /// them, any others as `compare` does.
 fn compare_under(under: Option<Casing>, a: &Value, b: &Value) -> Result<Option<Ordering>> {
+    // A "char" beside a string compares as the text it is cast to implicitly.
+    let char_beside = |v: &Value, w: &Value| {
+        matches!(v, Value::Scalar(ColumnType::Char, _)) && w.string_key().is_some()
+    };
+    if char_beside(a, b) || char_beside(b, a) {
+        let (a, b) = (
+            super::ops::char_as_text(a.clone()),
+            super::ops::char_as_text(b.clone()),
+        );
+        return compare_under(under, &a, &b);
+    }
     if let (Some(Casing::Library(id)), Some(x), Some(y)) = (under, a.string_key(), b.string_key()) {
         return Ok(Some(crate::collations::get(id).cmp(x, y)));
     }

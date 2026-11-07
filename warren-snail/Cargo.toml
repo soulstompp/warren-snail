@@ -34,7 +34,7 @@ zones = []
 collations = []
 
 [dependencies]
-sqlparser = { version = "0.63", default-features = false, features = ["std"] }
+sqlparser = { version = "0.63", default-features = false, features = ["std", "visitor"] }
 arrow = { version = "58", default-features = false }
 parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 bytes = "1"

@@ -183,25 +183,30 @@ fn catalog_steps(catalog: &Catalog, q: &Query) -> Result<Steps> {
     if !crate::pgcatalog::names_catalog(&text) {
         return Ok(steps);
     }
-    let tokens = super::image::tokens(&text)?;
-    for t in &tokens {
-        let sqlparser::tokenizer::Token::Word(w) = &t.token else {
-            continue;
-        };
-        let v = if w.quote_style.is_some() {
-            w.value.clone()
-        } else {
-            w.value.to_lowercase()
-        };
-        let Some(table) = crate::pgcatalog::table_named(&v) else {
-            continue;
-        };
-        if steps.contains_key(table) {
-            continue;
+    let words = super::sysviews::words_of(&text);
+    // The tables the statement names itself, then those the views it names read: inside one of
+    // PostgreSQL's views a table only a server holds is empty.
+    let mut add = |words: &[String], in_view: bool| -> Result<()> {
+        for w in words {
+            let Some(table) = crate::pgcatalog::table_named(w) else {
+                continue;
+            };
+            if steps.contains_key(table) {
+                continue;
+            }
+            let rel = match in_view {
+                true => crate::pgcatalog::relation_in_view(catalog, table)?,
+                false => crate::pgcatalog::relation(catalog, table)?,
+            };
+            let made = Rc::new(Made::of_catalog(rel)?);
+            steps.insert(format!("pg_catalog.{table}"), made.clone());
+            steps.insert(table.to_string(), made);
         }
-        let made = Rc::new(Made::of_catalog(crate::pgcatalog::relation(catalog, table)?)?);
-        steps.insert(format!("pg_catalog.{table}"), made.clone());
-        steps.insert(table.to_string(), made);
+        Ok(())
+    };
+    add(&words, false)?;
+    for d in super::sysviews::texts_read(&words, catalog.release) {
+        add(&super::sysviews::words_of(&d), true)?;
     }
     Ok(steps)
 }
@@ -712,6 +717,16 @@ fn lift_factor(
             if visible.contains(&n) {
                 return Ok(());
             }
+            // One of PostgreSQL's views, pg_catalog searched first.
+            if let Some((q, refused)) = super::sysviews::system_view(catalog.release, &n)? {
+                let step = fresh(out, "view");
+                lift(catalog, out, &[], step.clone(), q, Vec::new())?;
+                super::sysviews::note_refused(&step, refused);
+                let bare = n.rsplit('.').next().unwrap_or(&n).to_string();
+                let kept = alias.take().unwrap_or_else(|| alias_named(&bare));
+                *t = plain(&step, Some(kept));
+                return Ok(());
+            }
             if let Some(v) = catalog.view(&n) {
                 let bound = crate::grammar::bound(&v.query);
                 let parsed = super::image::parse_sql(bound.as_deref().unwrap_or(&v.query))?;
@@ -1032,7 +1047,12 @@ impl Laying<'_> {
         }
         let (what, cols): (What, Vec<Col>) = if let Some(m) = self.made.get(&n) {
             let q = qualifier(&n);
-            for (i, r) in m.refused.iter().enumerate() {
+            // A catalog table's refusals, or those of the view a step was lifted from.
+            let refusals = match m.refused.is_empty() {
+                true => super::sysviews::refused_of(&n),
+                false => m.refused.clone(),
+            };
+            for (i, r) in refusals.iter().enumerate() {
                 if let Some(r) = r {
                     self.refused.insert(at + i, r.clone());
                 }
@@ -3257,6 +3277,7 @@ fn answered(
     if let Some(r) = super::join::stopped_reads() {
         accrued.add(&r);
     }
+    let _views = super::sysviews::holding();
     let before = catalog_steps(catalog, q)?;
     let (last, held) = made_by(asked, q, &before, &casings, None, &accrued)?;
     Ok((last, held, accrued))

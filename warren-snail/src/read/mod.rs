@@ -11,6 +11,7 @@ mod arrays;
 mod beside;
 mod binary;
 pub(crate) mod calls;
+pub(crate) mod sysviews;
 mod change;
 mod clock;
 mod collate;
@@ -818,6 +819,7 @@ impl Snail {
         catalog.with_release(root.release)?;
         catalog.with_monetary(&root.monetary)?;
         catalog.with_text_search(root.text_search())?;
+        catalog.collation = root.collation().to_string();
         Ok(catalog)
     }
 

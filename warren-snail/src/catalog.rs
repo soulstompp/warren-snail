@@ -2060,6 +2060,8 @@ pub struct Catalog {
     pub monetary: crate::monetary::Monetary,
     /// The file's default_text_search_config, the configuration a call naming none reads.
     pub text_search: crate::tsearch::TextSearch,
+    /// The file's own default collation, as its root names it: empty for libc C.UTF-8.
+    pub collation: String,
     /// The OIDs its DDL handed its objects, from 16384 on, in the order of its statements.
     pub oids: std::sync::Arc<crate::oids::Oids>,
 }

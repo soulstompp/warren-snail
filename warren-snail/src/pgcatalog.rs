@@ -116,6 +116,11 @@ fn unescaped(f: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// A text COPY wrote, read back: NULL as none.
+pub(crate) fn unescaped_text(f: &str) -> Option<String> {
+    unescaped(f)
+}
+
 fn bit(release: u8) -> u8 {
     1 << (release - crate::regs::RELEASES.start())
 }
@@ -597,6 +602,14 @@ impl<'a> File<'a> {
             let indexes = self.indexes_of(tb);
             r.insert("relhasindex", Some(t(!indexes.is_empty())));
             r.insert("relchecks", Some(tb.checks.len().to_string()));
+            // An enforced foreign key gives both its tables PostgreSQL's triggers that check it.
+            let checked = tb.foreign_keys.iter().any(|f| f.enforced)
+                || self.tables().any(|o| {
+                    o.foreign_keys
+                        .iter()
+                        .any(|f| f.enforced && full(&f.parent) == name)
+                });
+            r.insert("relhastriggers", Some(t(checked)));
             out.push(r);
             let schema = parts(&name).0;
             for i in indexes {
@@ -1354,21 +1367,74 @@ fn type_text(t: ColumnType) -> String {
     }
 }
 
-/// Whether a statement names one of pg_catalog's tables as a relation.
+/// Whether a statement names one of pg_catalog's tables, or one of PostgreSQL's views, as a
+/// relation.
 pub(crate) fn names_catalog(sql: &str) -> bool {
-    let Ok(tokens) = crate::read::image::tokens(sql) else {
-        return false;
-    };
-    tokens.iter().any(|t| match &t.token {
-        sqlparser::tokenizer::Token::Word(w) => {
-            let v = if w.quote_style.is_some() {
-                w.value.clone()
-            } else {
-                w.value.to_lowercase()
-            };
-            table_named(&v).is_some()
+    crate::read::sysviews::words_of(sql)
+        .iter()
+        .any(|w| table_named(w).is_some() || crate::read::sysviews::view_named(w).is_some())
+}
+
+/// The name the file stands under as a database inside PostgreSQL's views, which their
+/// `current_database()` gives and pg_database's row holds; no answer shows it.
+pub(crate) const DATABASE: &str = "snail";
+
+/// A catalog table as one of PostgreSQL's views reads it: as `relation` gives it, each owner read
+/// as the role its row names; pg_authid those roles alone, pg_database the file alone,
+/// under the name `DATABASE`, its encoding UTF8 and its collation the file's; any other table only
+/// a server holds empty. What the view's columns show of them is refused where a statement asks it.
+pub(crate) fn relation_in_view(catalog: &Catalog, table: &str) -> Result<Relation> {
+    if answered(table).is_ok() {
+        let mut r = relation(catalog, table)?;
+        for (n, refused) in r.names.iter().zip(r.refused.iter_mut()) {
+            if n.ends_with("owner") {
+                *refused = None;
+            }
         }
-        _ => false,
+        return Ok(r);
+    }
+    let fields = crate::rowtypes::fields_at(table, catalog.release)?;
+    let collation = match catalog.collation.is_empty() {
+        true => crate::file::COLLATION,
+        false => &catalog.collation,
+    };
+    let value = |column: &str| -> Option<String> {
+        Some(
+            match (table, column) {
+                ("pg_database", "datname") => DATABASE,
+                ("pg_database", "encoding") => "6",
+                ("pg_database", "datlocprovider") => "c",
+                ("pg_database", "datistemplate" | "dathasloginevt") => "f",
+                ("pg_database", "datallowconn") => "t",
+                ("pg_database", "datconnlimit") => "-1",
+                ("pg_database", "dattablespace") => "1663",
+                ("pg_database", "datcollate" | "datctype") => collation,
+                _ => return None,
+            }
+            .to_string(),
+        )
+    };
+    // The roles the carried rows and the file's own name as owners: the bootstrap superuser, 10,
+    // and pg_database_owner, 6171, which owns public from 15 on.
+    let role = |oid: &str| -> Vec<Option<String>> {
+        fields
+            .iter()
+            .map(|f| (f.0 == "oid").then(|| oid.to_string()))
+            .collect()
+    };
+    let rows = match table {
+        "pg_authid" => vec![role("10"), role("6171")],
+        "pg_database" => vec![fields.iter().map(|f| value(&f.0)).collect()],
+        _ => Vec::new(),
+    };
+    Ok(Relation {
+        names: fields.iter().map(|f| f.0.clone()).collect(),
+        types: fields
+            .iter()
+            .map(|f| f.1.unwrap_or(ColumnType::Text(None)))
+            .collect(),
+        refused: vec![None; fields.len()],
+        rows,
     })
 }
 

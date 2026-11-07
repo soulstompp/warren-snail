@@ -1008,7 +1008,9 @@ fn rewrite_once(sql: &str) -> Result<Option<String>> {
 
 /// A pipeline's statement with each BETWEEN written as PostgreSQL's `transformAExprBetween` writes
 /// it: `x >= a AND x <= b`; NOT BETWEEN, `x < a OR x > b`; SYMMETRIC, both orders of the bounds
-/// or'd; NOT BETWEEN SYMMETRIC, both orders' NOT BETWEEN and'd. Each in parentheses.
+/// or'd; NOT BETWEEN SYMMETRIC, both orders' NOT BETWEEN and'd. Each in parentheses. And each
+/// `CASE x WHEN v` whose `x` calls no function and holds no subquery written `CASE WHEN (x = v)`,
+/// the comparison `transformCaseExpr` makes, an `x` written as a quoted literal read as text.
 pub(super) fn between_written(q: &Query) -> Query {
     let mut q = q.clone();
     query(&mut q);
@@ -1113,6 +1115,22 @@ fn function_arguments(a: &mut FunctionArguments) {
     }
 }
 
+/// Whether an expression reads the same written in several places as once: it calls no function
+/// and holds no subquery.
+fn written_once(e: &Expr) -> bool {
+    let mut once = true;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        if matches!(
+            x,
+            Expr::Function(_) | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
+        ) {
+            once = false;
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    once
+}
+
 /// Each BETWEEN inside `e`, and `e` where it is one, written as its comparisons.
 fn expr(e: &mut Expr) {
     let each = |es: &mut [Expr]| es.iter_mut().for_each(expr);
@@ -1185,11 +1203,34 @@ fn expr(e: &mut Expr) {
             ..
         } => {
             boxed(operand);
-            for c in conditions {
+            for c in conditions.iter_mut() {
                 expr(&mut c.condition);
                 expr(&mut c.result);
             }
             boxed(else_result);
+            if operand.as_deref().is_some_and(written_once) {
+                let x = *operand.take().unwrap();
+                let x = match super::typed::untyped(&x) {
+                    Some(Some(_)) => Expr::Cast {
+                        kind: sqlparser::ast::CastKind::DoubleColon,
+                        expr: Box::new(x),
+                        data_type: sqlparser::ast::DataType::Text,
+                        format: None,
+                    },
+                    _ => x,
+                };
+                for c in conditions {
+                    let v = std::mem::replace(
+                        &mut c.condition,
+                        Expr::Value(sqlparser::ast::Value::Null.into()),
+                    );
+                    c.condition = Expr::Nested(Box::new(Expr::BinaryOp {
+                        left: Box::new(x.clone()),
+                        op: BinaryOperator::Eq,
+                        right: Box::new(v),
+                    }));
+                }
+            }
         }
         Expr::Function(f) => {
             function_arguments(&mut f.args);
@@ -1248,6 +1289,23 @@ fn expr(e: &mut Expr) {
         Expr::Tuple(es) => each(es),
         Expr::Array(a) => each(&mut a.elem),
         Expr::CompoundFieldAccess { root, access_chain } => {
+            // A name and the names dotted after it, before a subscript, are one column's name, as
+            // PostgreSQL's grammar reads `c.conkey[1]`.
+            if let Expr::Identifier(first) = root.as_ref() {
+                let named = access_chain
+                    .iter()
+                    .take_while(|a| matches!(a, AccessExpr::Dot(Expr::Identifier(_))))
+                    .count();
+                if named > 0 && named < access_chain.len() {
+                    let mut parts = vec![first.clone()];
+                    for a in access_chain.drain(..named) {
+                        if let AccessExpr::Dot(Expr::Identifier(i)) = a {
+                            parts.push(i);
+                        }
+                    }
+                    **root = Expr::CompoundIdentifier(parts);
+                }
+            }
             expr(root);
             for a in access_chain {
                 match a {

@@ -2758,6 +2758,7 @@ impl Draft {
             release: crate::regs::LATEST,
             monetary: crate::monetary::Monetary::C,
             text_search: crate::tsearch::TextSearch::Simple,
+            collation: String::new(),
             oids: std::sync::Arc::new(self.oids.clone()),
         }
     }
@@ -4271,6 +4272,7 @@ impl Draft {
                     release: crate::regs::LATEST,
                     monetary: crate::monetary::Monetary::C,
                     text_search: crate::tsearch::TextSearch::Simple,
+                    collation: String::new(),
                     oids: Default::default(),
                 };
                 let text = p.to_string();
@@ -5593,6 +5595,7 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
             release: crate::regs::LATEST,
             monetary: crate::monetary::Monetary::C,
             text_search: crate::tsearch::TextSearch::Simple,
+            collation: String::new(),
             oids,
         },
         statements,
