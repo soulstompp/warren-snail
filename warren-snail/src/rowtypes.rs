@@ -131,6 +131,42 @@ pub fn row_type_at(name: &str, release: u8) -> Result<ColumnType> {
     Ok(ty)
 }
 
+/// A catalog relation's columns under a release, each its name and its type, none for a column of a
+/// pseudo-type, which PostgreSQL's own tables hold and no other relation may. Refused where the
+/// release defines no such relation.
+pub(crate) fn fields_at(name: &str, release: u8) -> Result<Vec<(String, Option<ColumnType>)>> {
+    let name = unqualified(name);
+    let Some(definitions) = all().get(name) else {
+        return Err(Error::new(format!("the type {name} is not held")));
+    };
+    let bit = release
+        .checked_sub(*crate::regs::RELEASES.start())
+        .filter(|b| *b < 8)
+        .map_or(0, |b| 1u8 << b);
+    let defined = definitions
+        .iter()
+        .find(|d| d.releases & bit != 0)
+        .ok_or_else(|| {
+            Error::new(format!(
+                "{name} is not in PostgreSQL {release}'s catalog, and this file's OIDs came from \
+                 {release}"
+            ))
+        })?;
+    defined
+        .fields
+        .iter()
+        .map(|(field, text)| {
+            let pseudo = crate::lists::all(crate::lists::Kind::Type)
+                .iter()
+                .any(|t| t.name == *text && t.family == "pseudo-types");
+            let ty = (!pseudo)
+                .then(|| field_type(field, text, release))
+                .transpose()?;
+            Ok((field.to_string(), ty))
+        })
+        .collect()
+}
+
 /// A row type as a type's name names it before the file's release is known: under the newest
 /// release that defines it. None where the name is no row type.
 pub fn row_type(name: &str) -> Result<Option<ColumnType>> {

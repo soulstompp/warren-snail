@@ -752,6 +752,12 @@ impl Snails {
             [one] => crate::oids::named(one.catalog.oids.clone()),
             _ => crate::oids::named_several(),
         };
+        if self.snails.len() > 1 && crate::pgcatalog::names_catalog(sql) {
+            return Err(Error::new(
+                "pg_catalog's tables are read on one snail at a time: each file numbers its own \
+                 objects from 16384, so across several their rows would name one OID twice",
+            ));
+        }
         // Its clock is the transaction's across the snails, begun at BEGIN or with the round alone.
         let at = super::change::wall_micros();
         let _clocked = crate::scalars::clocked(

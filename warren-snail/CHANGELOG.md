@@ -34,6 +34,14 @@ at once, and a snail written inside a host that decides its commits.
 
 ### Added
 
+- **pg_catalog's tables as relations:** `pg_class`, `pg_attribute`, `pg_type`, `pg_namespace`,
+  `pg_constraint`, `pg_index`, `pg_attrdef`, `pg_enum`, `pg_sequence`, `pg_collation`, `pg_proc`,
+  `pg_range`, `pg_rewrite` and every other table initdb fills, each the built-in rows of the file's
+  release, 14 to 19, beside the rows of the file's own objects, in that release's columns. `pg_class`
+  alone names the catalog's, pg_catalog searched first. A column only a running server fills (an
+  owner, privileges, a node tree, a planner's statistics) is refused by name where a statement asks
+  it, a table only a server holds (`pg_authid`, `pg_database`, `pg_statistic` and their kin) whole,
+  and across several snails the catalog is not read.
 - **A file's own objects have OIDs,** handed out from 16384 in the order its DDL makes them and kept as
   the file grows, so a `regclass`, `regtype`, `regnamespace`, `regcollation`, `regproc` or
   `regprocedure` value names one as PostgreSQL names it: `'t'::regclass`, `'s.u_pkey'::regclass`,

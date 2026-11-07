@@ -1574,6 +1574,7 @@ impl Snail {
             // What the question path does not read, a pipeline reads: a view, and parameters, among
             // them.
             if relations::names_a_view(&self.catalog, q)
+                || crate::pgcatalog::names_catalog(sql)
                 || !params.is_empty()
                 || pipeline::hands_over(q) && question::parse(&self.catalog, sql).is_err()
                 || elements::read_a_row_at_a_time(&self.catalog, q)
@@ -1615,7 +1616,7 @@ impl Snail {
         // A question naming a system column reads it where each table holds it past its own.
         let names_system = {
             let t = q.to_string().to_lowercase();
-            t.contains("ctid") || t.contains("tableoid")
+            t.contains("ctid") || t.contains("tableoid") || crate::pgcatalog::names_catalog(&t)
         };
         if relations::several(&self.catalog, q)
             || subqueries::held(q)

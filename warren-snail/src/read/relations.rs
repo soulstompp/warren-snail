@@ -100,11 +100,41 @@ pub(super) struct Made {
     /// Where the step is kept for the steps after it, its rows in the round's room, those past it
     /// written: `rel` then holds none.
     kept: Option<Rows>,
+    /// Each column's refusal where a statement asks it, a catalog table's column only a server
+    /// fills: empty where none is refused.
+    refused: Vec<Option<String>>,
 }
 
 impl Made {
+    /// One of pg_catalog's tables as the file's release and its own objects make it, each value
+    /// read by its column's type.
+    fn of_catalog(c: crate::pgcatalog::Relation) -> Result<Made> {
+        let rows = c
+            .rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .zip(&c.types)
+                    .map(|(v, &ty)| catalog_value(ty, v.as_deref()))
+                    .collect::<Result<Vec<Value>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut m = Made::of(
+            Relation {
+                names: c.names,
+                rows,
+                order: None,
+            },
+            c.types.iter().map(|&t| Some(t)).collect(),
+            vec![Carried::None; c.types.len()],
+        );
+        m.refused = c.refused;
+        Ok(m)
+    }
+
     fn of(rel: Relation, types: Vec<Option<ColumnType>>, carried: Vec<Carried>) -> Made {
         Made {
+            refused: Vec::new(),
             rel,
             types,
             carried,
@@ -128,6 +158,52 @@ impl Made {
         }
     }
 
+}
+
+/// A catalog table's value read from its text, as its column's type's input reads it.
+fn catalog_value(ty: ColumnType, s: Option<&str>) -> Result<Value> {
+    let Some(s) = s else {
+        return Ok(Value::Null);
+    };
+    if let ColumnType::Composed(_) = ty {
+        let item = crate::composed::text_in(ty, s)?;
+        return Ok(Value::Composed(
+            ty,
+            std::sync::Arc::new(crate::composed::Compound::new(ty, item)),
+        ));
+    }
+    Ok(super::fill::value_of(&crate::composed::scalar_in(ty, s)?, ty))
+}
+
+/// The catalog tables a statement names, each made as the file's release and its objects make it,
+/// by the names a FROM reads it by: `pg_catalog.x`, and `x` alone, pg_catalog searched first.
+fn catalog_steps(catalog: &Catalog, q: &Query) -> Result<Steps> {
+    let mut steps = Steps::new();
+    let text = q.to_string();
+    if !crate::pgcatalog::names_catalog(&text) {
+        return Ok(steps);
+    }
+    let tokens = super::image::tokens(&text)?;
+    for t in &tokens {
+        let sqlparser::tokenizer::Token::Word(w) = &t.token else {
+            continue;
+        };
+        let v = if w.quote_style.is_some() {
+            w.value.clone()
+        } else {
+            w.value.to_lowercase()
+        };
+        let Some(table) = crate::pgcatalog::table_named(&v) else {
+            continue;
+        };
+        if steps.contains_key(table) {
+            continue;
+        }
+        let made = Rc::new(Made::of_catalog(crate::pgcatalog::relation(catalog, table)?)?);
+        steps.insert(format!("pg_catalog.{table}"), made.clone());
+        steps.insert(table.to_string(), made);
+    }
+    Ok(steps)
 }
 
 /// The relations a statement made before a step, by the names its FROM reads them by.
@@ -878,6 +954,9 @@ struct From {
     items: Vec<Node>,
     /// Where the columns of the query around it begin, where it is a subquery's: after its own.
     outer_at: usize,
+    /// The refusal of each column a statement may not ask, by its place: a catalog table's that only
+    /// a server fills.
+    refused: HashMap<usize, String>,
 }
 
 impl From {
@@ -914,6 +993,8 @@ struct Laying<'a> {
     columns: Vec<Col>,
     /// Whether the step names a system column, which each table of it then holds past its own.
     systems: bool,
+    /// The refusal of each column of the FROM a statement may not ask, by its place.
+    refused: HashMap<usize, String>,
 }
 
 impl Laying<'_> {
@@ -951,6 +1032,11 @@ impl Laying<'_> {
         }
         let (what, cols): (What, Vec<Col>) = if let Some(m) = self.made.get(&n) {
             let q = qualifier(&n);
+            for (i, r) in m.refused.iter().enumerate() {
+                if let Some(r) = r {
+                    self.refused.insert(at + i, r.clone());
+                }
+            }
             let cols = m
                 .rel
                 .names
@@ -3171,7 +3257,8 @@ fn answered(
     if let Some(r) = super::join::stopped_reads() {
         accrued.add(&r);
     }
-    let (last, held) = made_by(asked, q, &Steps::new(), &casings, None, &accrued)?;
+    let before = catalog_steps(catalog, q)?;
+    let (last, held) = made_by(asked, q, &before, &casings, None, &accrued)?;
     Ok((last, held, accrued))
 }
 
@@ -3660,6 +3747,7 @@ fn select_step(
             release,
             columns: Vec::new(),
             systems,
+            refused: HashMap::new(),
         };
         let mut items = Vec::with_capacity(s.from.len());
         for item in &s.from {
@@ -3669,6 +3757,7 @@ fn select_step(
             columns: laying.columns,
             items,
             outer_at: 0,
+            refused: laying.refused,
         }
     };
     {
@@ -3821,6 +3910,13 @@ fn select_step(
     // refuses one it finds none or two of.
     for (q, n) in p.reads() {
         let found = place(&q, &n);
+        if let [one] = found.as_slice() {
+            if let Some(why) = from.refused.get(one) {
+                return Err(Error::new(format!(
+                    "{why}, only a running server's, and a snail has no server: it is not read"
+                )));
+            }
+        }
         match (found.len(), q) {
             (1, _) => {}
             (0, Some(q))
