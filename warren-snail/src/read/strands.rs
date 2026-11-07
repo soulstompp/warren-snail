@@ -209,7 +209,7 @@ pub(super) fn led_by(
                 .iter()
                 .zip(ordered)
                 .all(|(l, &c)| *l == Level::Column(c))
-            && needs.iter().all(|&c| o.slot(c).is_some())
+            && needs.iter().all(|&c| o.holds(c))
     };
     (0..table.orders.len()).find(|&i| fits(&table.orders[i]))
 }

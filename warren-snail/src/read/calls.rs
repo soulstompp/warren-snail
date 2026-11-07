@@ -1549,7 +1549,7 @@ fn reserved() -> &'static std::collections::HashSet<&'static str> {
 /// A name as PostgreSQL's quote_identifier writes it: bare where it is lower-case letters, digits
 /// and underscores, begun by a letter or underscore, and no keyword but an unreserved one; else in
 /// double quotes, each double quote doubled.
-pub(super) fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     let safe = s
         .bytes()
         .next()

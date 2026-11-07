@@ -1281,6 +1281,49 @@ impl Snail {
         read
     }
 
+    /// A system column's values over the rows `from` to `to` of a block: the OID the file gave the
+    /// table; or each row's ctid, the first page its block's page map names, a page the block alone
+    /// owns as PostgreSQL's tid names a page of the heap, and the row's place in the block from 1.
+    fn system_values(
+        &self,
+        table: &Table,
+        map: &crate::directory::PageMap,
+        c: usize,
+        from: usize,
+        to: usize,
+    ) -> Result<Values> {
+        if c == crate::catalog::TABLEOID {
+            let class = crate::oids::Object::Class(crate::oids::full(&table.name));
+            let oid = self.catalog.oids.of(&class).unwrap_or(0);
+            let key = crate::scalars::unsigned_key(u64::from(oid), 32);
+            return Ok(Values::Int(vec![Some(key); to - from]));
+        }
+        let first = map
+            .columns
+            .iter()
+            .flat_map(|cp| cp.dictionary.iter().chain(cp.pages.iter().map(|p| &p.at)))
+            .map(|e| e.start)
+            .min()
+            .ok_or_else(|| Error::new(format!("ctid of {}: a block of no pages", table.name)))?;
+        let block = u32::try_from(first).map_err(|_| {
+            Error::new(format!(
+                "ctid of {}: its block's first page {first} lies past a tid's 2^32 blocks",
+                table.name
+            ))
+        })?;
+        if to > usize::from(u16::MAX) {
+            return Err(Error::new(format!(
+                "ctid of {}: a block of {to} rows, where a tid's place counts to 65,535",
+                table.name
+            )));
+        }
+        Ok(Values::Int(
+            (from..to)
+                .map(|r| Some(crate::scalars::tid_key(block, (r + 1) as u16)))
+                .collect(),
+        ))
+    }
+
     fn scan_tagged(
         &self,
         plan: &Plan,
@@ -1306,6 +1349,9 @@ impl Snail {
             .chain(want.side.texts.iter().map(|t| t.column))
             .chain(order.levels.iter().map(|l| l.column()))
         {
+            if crate::catalog::is_system(c) {
+                continue;
+            }
             orderers[c] = table.columns[c].orderer()?;
         }
         let descs = crate::write::leaf_descriptors(table, order)?;
@@ -1427,8 +1473,17 @@ impl Snail {
                         (c, Values::from_leaves(table.columns[c].ty, parts))
                     })
                     .collect();
+                // The system columns asked over this range, made rather than read.
+                let systems: Vec<(usize, Values)> = columns
+                    .iter()
+                    .filter(|&&(c, _)| crate::catalog::is_system(c))
+                    .map(|&(c, _)| Ok((c, self.system_values(table, &map, c, from, to)?)))
+                    .collect::<Result<_>>()?;
                 // Each column read: the values that hold this range, and their first row.
                 let column = |c: usize| -> (usize, &Values) {
+                    if let Some((_, v)) = systems.iter().find(|s| s.0 == c) {
+                        return (from, v);
+                    }
                     match joined.iter().find(|j| j.0 == c) {
                         Some((_, v)) => (from, v),
                         None => run(order.leaf_slot(table, c).unwrap()),
@@ -1512,7 +1567,7 @@ impl Snail {
                     .iter()
                     .map(|&(c, month)| {
                         let (start, v) = column(c);
-                        let ty = table.columns[c].ty;
+                        let ty = table.column_at(c).ty;
                         (ty.is_byte_array() || ty.is_bits(), month, start, v)
                     })
                     .collect();
@@ -1523,7 +1578,7 @@ impl Snail {
                 let keyed: Vec<Option<ColumnType>> = columns
                     .iter()
                     .map(|&(c, _)| {
-                        let ty = table.columns[c].ty;
+                        let ty = table.column_at(c).ty;
                         matches!(ty, ColumnType::Bpchar(_) | ColumnType::Textual(_))
                             .then_some(ty)
                             .filter(|t| t.keyed_by_bytes() || matches!(t, ColumnType::Bpchar(_)))
@@ -1531,12 +1586,15 @@ impl Snail {
                     .collect();
                 let collated: Vec<(ColumnType, Coll)> = columns
                     .iter()
-                    .map(|&(c, _)| (table.columns[c].ty, orderers[c]))
+                    .map(|&(c, _)| match crate::catalog::is_system(c) {
+                        true => (table.column_at(c).ty, None),
+                        false => (table.columns[c].ty, orderers[c]),
+                    })
                     .collect();
                 // Which of them are numerics held as their text, each kept beside its class.
                 let classed: Vec<bool> = columns
                     .iter()
-                    .map(|&(c, _)| matches!(table.columns[c].ty, ColumnType::NumericText(_)))
+                    .map(|&(c, _)| matches!(table.column_at(c).ty, ColumnType::NumericText(_)))
                     .collect();
                 let dicts: Vec<Dict> = outs.iter().map(|o| o.3.dict().cloned()).collect();
                 if !same(&sent, &dicts) {
@@ -2184,7 +2242,7 @@ fn assess_entry(walk: &mut Walk, e: Entry, order: &Order, want: &Want) {
             }
         }
     };
-    for &c in &want.columns {
+    for &c in want.columns.iter().filter(|&&c| !crate::catalog::is_system(c)) {
         need(c);
     }
     if interval == Status::May {

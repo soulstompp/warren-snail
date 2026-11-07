@@ -29,6 +29,7 @@ pub mod lock;
 mod methods;
 pub mod monetary;
 pub mod numeric;
+pub mod oids;
 pub mod places;
 pub(crate) mod plane;
 pub mod read;

@@ -748,6 +748,10 @@ impl Snails {
     }
 
     fn asked(&mut self, sql: &str, params: &[String]) -> Result<(RecordBatch, Round)> {
+        let _named = match self.snails.as_slice() {
+            [one] => crate::oids::named(one.catalog.oids.clone()),
+            _ => crate::oids::named_several(),
+        };
         // Its clock is the transaction's across the snails, begun at BEGIN or with the round alone.
         let at = super::change::wall_micros();
         let _clocked = crate::scalars::clocked(

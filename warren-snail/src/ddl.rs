@@ -1845,6 +1845,22 @@ struct Draft {
     key_constraints: HashMap<(String, String), usize>,
     /// `check_names`, counted.
     check_named: HashMap<String, usize>,
+    /// The OIDs the statements read so far have handed out.
+    oids: crate::oids::Oids,
+    /// The objects the statement now read renamed, each keeping its OID.
+    renamed: Vec<(crate::oids::Object, crate::oids::Object)>,
+}
+
+/// How many of each kind of object a draft holds, before a statement is read.
+#[derive(Clone, Copy)]
+struct Lens {
+    tables: usize,
+    types: usize,
+    domains: usize,
+    sequences: usize,
+    collations: usize,
+    views: usize,
+    functions: usize,
 }
 
 /// One more of a name.
@@ -1990,6 +2006,214 @@ impl Draft {
                         .chain(t.uniques.iter())
                         .any(|k| k.name == name)
             })
+    }
+
+    fn lens(&self) -> Lens {
+        Lens {
+            tables: self.tables.len(),
+            types: self.types.len(),
+            domains: self.domains.len(),
+            sequences: self.sequences.len(),
+            collations: self.collations.len(),
+            views: self.views.len(),
+            functions: self.functions.len(),
+        }
+    }
+
+    /// The objects a table makes, in the order it makes them: the relation, its row type and the
+    /// type's array, each DEFAULT, each NOT NULL, each key and its index, each CHECK, each foreign
+    /// key, then each index and the EXCLUDE it stands for.
+    fn table_objects(t: &Declared, out: &mut Vec<crate::oids::Object>) {
+        use crate::oids::Object as O;
+        let name = crate::oids::full(&t.name);
+        let (schema, own) = crate::oids::parts(&name);
+        let (schema, own) = (schema.to_string(), own.to_string());
+        out.push(O::Class(name.clone()));
+        out.push(O::Type(name.clone()));
+        out.push(O::Array(name.clone()));
+        for c in t.columns.iter().filter(|c| c.default.is_some()) {
+            out.push(O::Default(name.clone(), c.name.clone()));
+        }
+        for c in t.columns.iter().filter(|c| c.not_null) {
+            out.push(O::Constraint(
+                name.clone(),
+                format!("{own}_{}_not_null", c.name),
+            ));
+        }
+        for k in t.primary.iter().chain(&t.uniques) {
+            out.push(O::Constraint(name.clone(), k.name.clone()));
+            out.push(O::Class(format!("{schema}.{}", k.name)));
+        }
+        for c in &t.checks {
+            out.push(O::Constraint(name.clone(), c.name.clone()));
+        }
+        for f in &t.foreign_keys {
+            out.push(O::Constraint(name.clone(), f.name.clone()));
+        }
+        for k in &t.indexes {
+            if k.exclusion.is_some() {
+                out.push(O::Constraint(name.clone(), k.name.clone()));
+            }
+            out.push(O::Class(format!("{schema}.{}", k.name)));
+        }
+    }
+
+    /// The objects a type makes: the type and its array, an enum's labels, a composite's relation,
+    /// a range's multirange and its array, and the functions that construct each.
+    fn type_objects(t: &Type, out: &mut Vec<crate::oids::Object>) {
+        use crate::oids::Object as O;
+        let name = crate::oids::full(&t.name);
+        out.push(O::Type(name.clone()));
+        out.push(O::Array(name.clone()));
+        match &t.kind {
+            TypeKind::Enum { labels } => {
+                for l in labels {
+                    out.push(O::Label(name.clone(), l.clone()));
+                }
+            }
+            TypeKind::Composite { .. } => out.push(O::Class(name.clone())),
+            TypeKind::Range(r) => {
+                let m = crate::oids::full(&r.multirange);
+                out.push(O::Type(m.clone()));
+                out.push(O::Array(m.clone()));
+                let sub = crate::regs::type_oid(&r.subtype, crate::regs::LATEST)
+                    .map(|o| crate::regs::reg_text(crate::regs::RegKind::Type, o, crate::regs::LATEST))
+                    .unwrap_or_else(|_| r.subtype.clone());
+                out.push(O::Proc(name.clone(), format!("{sub},{sub}")));
+                out.push(O::Proc(name.clone(), format!("{sub},{sub},text")));
+                let shown = match crate::oids::parts(&name) {
+                    ("public", n) => n.to_string(),
+                    _ => name.clone(),
+                };
+                out.push(O::Proc(m.clone(), String::new()));
+                out.push(O::Proc(m.clone(), shown.clone()));
+                out.push(O::Proc(m, format!("{shown}[]")));
+            }
+        }
+    }
+
+    fn domain_objects(d: &Domain, out: &mut Vec<crate::oids::Object>) {
+        use crate::oids::Object as O;
+        let name = crate::oids::full(&d.name);
+        out.push(O::Type(name.clone()));
+        out.push(O::Array(name.clone()));
+        if d.not_null {
+            let own = crate::oids::parts(&name).1;
+            let n = d
+                .not_null_name
+                .clone()
+                .unwrap_or_else(|| format!("{own}_not_null"));
+            out.push(O::Constraint(name.clone(), n));
+        }
+        for k in &d.checks {
+            out.push(O::Constraint(name.clone(), k.name.clone()));
+        }
+    }
+
+    fn view_objects(v: &View, out: &mut Vec<crate::oids::Object>) {
+        use crate::oids::Object as O;
+        let name = crate::oids::full(&v.name);
+        out.push(O::Class(name.clone()));
+        out.push(O::Type(name.clone()));
+        out.push(O::Array(name));
+    }
+
+    fn function_object(f: &Function) -> crate::oids::Object {
+        let args: Vec<String> = f.args.iter().map(|t| t.pg_name()).collect();
+        crate::oids::Object::Proc(crate::oids::full(&f.name), args.join(","))
+    }
+
+    /// Every object the draft holds that PostgreSQL gives an OID, each schema before its first.
+    fn objects(&self) -> Vec<crate::oids::Object> {
+        let all = Lens {
+            tables: 0,
+            types: 0,
+            domains: 0,
+            sequences: 0,
+            collations: 0,
+            views: 0,
+            functions: 0,
+        };
+        self.objects_since(all, &[])
+    }
+
+    /// The objects past `before` of each kind, and those of the tables, types and domains named, each
+    /// schema before its first.
+    fn objects_since(&self, before: Lens, touched: &[&str]) -> Vec<crate::oids::Object> {
+        use crate::oids::Object as O;
+        let mut out = Vec::new();
+        for c in &self.collations[before.collations.min(self.collations.len())..] {
+            out.push(O::Collation(crate::oids::full(&c.name)));
+        }
+        let types = self.types.iter().enumerate().filter(|(i, t)| {
+            *i >= before.types || touched.contains(&t.name.as_str())
+        });
+        for (_, t) in types {
+            Self::type_objects(t, &mut out);
+        }
+        let domains = self.domains.iter().enumerate().filter(|(i, d)| {
+            *i >= before.domains || touched.contains(&d.name.as_str())
+        });
+        for (_, d) in domains {
+            Self::domain_objects(d, &mut out);
+        }
+        for s in &self.sequences[before.sequences.min(self.sequences.len())..] {
+            out.push(O::Class(crate::oids::full(&s.name)));
+        }
+        for t in &self.tables[before.tables.min(self.tables.len())..] {
+            Self::table_objects(t, &mut out);
+        }
+        for name in touched {
+            if let Some(t) = self.table(name) {
+                Self::table_objects(t, &mut out);
+            }
+        }
+        for v in &self.views[before.views.min(self.views.len())..] {
+            Self::view_objects(v, &mut out);
+        }
+        for f in &self.functions[before.functions.min(self.functions.len())..] {
+            out.push(Self::function_object(f));
+        }
+        let mut seen: Vec<String> = Vec::new();
+        let mut with_schemas = Vec::with_capacity(out.len());
+        for o in out {
+            let schema = crate::oids::parts(o.name()).0;
+            if schema != "public" && schema != "pg_catalog" && !seen.iter().any(|s| s == schema) {
+                seen.push(schema.to_string());
+                with_schemas.push(O::Namespace(schema.to_string()));
+            }
+            with_schemas.push(o);
+        }
+        with_schemas
+    }
+
+    /// The OIDs a statement just read hands out: to each object it made or touched. A statement
+    /// that drops or renames settles every object, those no longer standing giving their OIDs up.
+    fn settle(&mut self, before: Lens, kind: &str, object: &str, tokens: &[Token]) {
+        let renamed = std::mem::take(&mut self.renamed);
+        let ws = words(tokens);
+        let wide = !renamed.is_empty()
+            || kind.starts_with("DROP")
+            || (kind.starts_with("ALTER") && ws.iter().any(|w| w == "drop" || w == "rename"));
+        if wide {
+            let all = self.objects();
+            self.oids.settle(&all, &renamed);
+            return;
+        }
+        let on = if kind.contains("INDEX") {
+            index_on(&written(tokens))
+        } else {
+            None
+        };
+        let mut touched: Vec<&str> = Vec::new();
+        if kind.starts_with("ALTER") {
+            touched.push(object);
+        }
+        if let Some(t) = on.as_deref() {
+            touched.push(t);
+        }
+        let made = self.objects_since(before, &touched);
+        self.oids.give(&made);
     }
 
     fn type_named(&self, name: &str) -> Option<&'static str> {
@@ -2534,6 +2758,7 @@ impl Draft {
             release: crate::regs::LATEST,
             monetary: crate::monetary::Monetary::C,
             text_search: crate::tsearch::TextSearch::Simple,
+            oids: std::sync::Arc::new(self.oids.clone()),
         }
     }
 
@@ -2624,6 +2849,11 @@ impl Draft {
                         let i = labels.iter().position(|l| *l == from).ok_or_else(|| {
                             Error::new(format!("\"{from}\" is not an existing enum label"))
                         })?;
+                        let enum_name = crate::oids::full(&name);
+                        self.renamed.push((
+                            crate::oids::Object::Label(enum_name.clone(), from.clone()),
+                            crate::oids::Object::Label(enum_name, to.clone()),
+                        ));
                         labels[i] = to;
                     }
                 }
@@ -2771,6 +3001,11 @@ impl Draft {
                                 count_in(&mut self.check_named, x.clone());
                             }
                         }
+                        let domain_name = crate::oids::full(&name);
+                        self.renamed.push((
+                            crate::oids::Object::Constraint(domain_name.clone(), from.clone()),
+                            crate::oids::Object::Constraint(domain_name, to.clone()),
+                        ));
                     }
                     AlterDomain::ValidateConstraint(n) => {
                         let k = d.checks.iter_mut().find(|k| k.name == n).ok_or_else(|| {
@@ -3070,6 +3305,11 @@ impl Draft {
             if columns.iter().any(|x| x.name == cname) {
                 return Err(Error::new(format!(
                     "column \"{cname}\" specified more than once"
+                )));
+            }
+            if crate::oids::SYSTEM_COLUMNS.contains(&cname.as_str()) {
+                return Err(Error::new(format!(
+                    "column name \"{cname}\" conflicts with a system column name"
                 )));
             }
             let x = match extras.iter().position(|(n, _)| *n == cname) {
@@ -4031,6 +4271,7 @@ impl Draft {
                     release: crate::regs::LATEST,
                     monetary: crate::monetary::Monetary::C,
                     text_search: crate::tsearch::TextSearch::Simple,
+                    oids: Default::default(),
                 };
                 let text = p.to_string();
                 let read = crate::read::partial::Predicate::read(&alone, &alone.tables[0], &text)
@@ -5197,9 +5438,13 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
         let (kind, object) = head(tokens);
         // Each statement is applied in place. Read strictly, the DDL stops at its first refusal;
         // otherwise a statement refused leaves the draft as the statements taken before it make it.
+        let before = draft.lens();
         let applied = draft.apply(tokens);
         match &applied {
-            Ok(_) => taken.push(at),
+            Ok(_) => {
+                draft.settle(before, &kind, &object, tokens);
+                taken.push(at)
+            }
             Err(_) if !strict => {
                 let mut again = Draft {
                     release,
@@ -5207,6 +5452,8 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
                 };
                 for &i in &taken {
                     again.kept = i < kept;
+                    let (k, o) = head(&all[i]);
+                    let before = again.lens();
                     again.apply(&all[i]).map_err(|e| {
                         Error::new(format!(
                             "{}: taken once and refused read again: {}",
@@ -5214,10 +5461,11 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
                             e.0
                         ))
                     })?;
+                    again.settle(before, &k, &o, &all[i]);
                 }
                 draft = again;
             }
-            Err(_) => {}
+            Err(_) => draft.renamed.clear(),
         }
         let read = match applied {
             Ok(notices) => StatementRead {
@@ -5291,6 +5539,9 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
         }
     }
     let mut tables = Vec::new();
+    // A table refused once every statement is read was given OIDs as it was read: the OIDs are
+    // then those the DDL kept hands out, read again whole.
+    let refused_late = finished.iter().any(|r| r.is_err());
     for r in finished {
         match r {
             Ok(t) => tables.push(t),
@@ -5319,13 +5570,19 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
         .filter(|s| s.refused.is_none())
         .map(|s| format!("{};", s.text))
         .collect();
+    let ddl = if taken.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", taken.join("\n"))
+    };
+    let oids = if refused_late && !strict {
+        read_ddl_at(&ddl, true, kept, release)?.catalog.oids
+    } else {
+        std::sync::Arc::new(draft.oids)
+    };
     Ok(Reading {
         catalog: Catalog {
-            ddl: if taken.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n", taken.join("\n"))
-            },
+            ddl,
             tables,
             functions: draft.functions,
             types: draft.types,
@@ -5336,6 +5593,7 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
             release: crate::regs::LATEST,
             monetary: crate::monetary::Monetary::C,
             text_search: crate::tsearch::TextSearch::Simple,
+            oids,
         },
         statements,
     })

@@ -183,7 +183,7 @@ fn is_classed(ty: Option<ColumnType>) -> bool {
 /// NULL. A numeric column itself, its min, max and sum; a bigint's sum, at scale 0; an integer's or
 /// a numeric's mean.
 fn numeric_output(item: &Item, tables: &[&Table]) -> Option<(ColumnType, bool)> {
-    let col = |c: &super::question::Col| &tables[c.side].columns[c.column];
+    let col = |c: &super::question::Col| tables[c.side].column_at(c.column);
     match item {
         Item::Key(Key::Column(c)) if col(c).ty.is_numeric() => Some((col(c).ty, !col(c).not_null)),
         Item::Least(c) | Item::Greatest(c) | Item::Sum(c) if col(c).ty.is_numeric() => {
@@ -527,7 +527,7 @@ impl Answer {
                 .iter()
                 .map(|i| match i {
                     Item::Sum(c) | Item::Least(c) | Item::Greatest(c) | Item::Avg(c) => {
-                        Some(tables[c.side].columns[c.column].ty)
+                        Some(tables[c.side].column_at(c.column).ty)
                     }
                     _ => None,
                 })
@@ -1068,7 +1068,7 @@ impl Answer {
                 for accs in groups.values() {
                     for (item, acc) in items.iter().zip(accs) {
                         if let (Item::Sum(c), Acc::Sum(Some(t))) = (item, acc) {
-                            if matches!(tables[c.side].columns[c.column].ty, ColumnType::Money(_))
+                            if matches!(tables[c.side].column_at(c.column).ty, ColumnType::Money(_))
                                 && i64::try_from(*t).is_err()
                             {
                                 return Err(crate::Error::new("money out of range"));
@@ -1113,7 +1113,7 @@ impl Answer {
                                 // A bigint's sum is a numeric; a smallint's and an integer's a
                                 // bigint, wrapping as PostgreSQL's int2_sum and int4_sum add.
                                 (Item::Sum(c), Acc::Sum(total))
-                                    if tables[c.side].columns[c.column].ty == ColumnType::Int8 =>
+                                    if tables[c.side].column_at(c.column).ty == ColumnType::Int8 =>
                                 {
                                     total.map_or(Cell::Null, |t| {
                                         if t.unsigned_abs() < 10u128.pow(38) {
@@ -1131,7 +1131,7 @@ impl Answer {
                                 (
                                     Item::Least(c) | Item::Greatest(c),
                                     Acc::Least(m) | Acc::Greatest(m),
-                                ) if tables[c.side].columns[c.column].ty == ColumnType::Char => m
+                                ) if tables[c.side].column_at(c.column).ty == ColumnType::Char => m
                                     .map_or(Cell::Null, |r| {
                                         let b = crate::scalars::char_of_text_rank(r as i64);
                                         let t = crate::scalars::scalar_text(
@@ -1143,7 +1143,7 @@ impl Answer {
                                 (
                                     Item::Least(c) | Item::Greatest(c),
                                     Acc::Least(m) | Acc::Greatest(m),
-                                ) if tables[c.side].columns[c.column].ty.is_float() => {
+                                ) if tables[c.side].column_at(c.column).ty.is_float() => {
                                     m.map_or(Cell::Null, |v| {
                                         Cell::Float(Float {
                                             key: (v >> 64) as i64,
@@ -1154,7 +1154,7 @@ impl Answer {
                                 (
                                     Item::Least(c) | Item::Greatest(c),
                                     Acc::Least(m) | Acc::Greatest(m),
-                                ) if tables[c.side].columns[c.column].ty.is_wide() => {
+                                ) if tables[c.side].column_at(c.column).ty.is_wide() => {
                                     m.map_or(Cell::Null, Cell::Wide)
                                 }
                                 (_, Acc::Extreme(m, _)) => m.map_or(Cell::Null, Cell::Composed),
@@ -1171,7 +1171,7 @@ impl Answer {
                                     None => Cell::Null,
                                     Some(t) => {
                                         let t = t.expect("a sum held");
-                                        let units = match tables[c.side].columns[c.column].ty {
+                                        let units = match tables[c.side].column_at(c.column).ty {
                                             ColumnType::Numeric { scale, .. } => t
                                                 .units_at(u32::from(scale))
                                                 .filter(|u| u.unsigned_abs() < 10u128.pow(38)),
@@ -1197,7 +1197,7 @@ impl Answer {
                                     total.map_or(Cell::Null, |t| {
                                         float_cell(
                                             t,
-                                            tables[c.side].columns[c.column].ty
+                                            tables[c.side].column_at(c.column).ty
                                                 == ColumnType::Float8,
                                         )
                                     })
@@ -1258,7 +1258,7 @@ impl Answer {
                 })
             };
             let char_text = matches!(*item, Item::Least(c) | Item::Greatest(c)
-                if tables[c.side].columns[c.column].ty == ColumnType::Char);
+                if tables[c.side].column_at(c.column).ty == ColumnType::Char);
             // A numeric: as its page form gives it, its sum at its scale up to 38 digits, a mean
             // and anything past them as its text; each named a numeric.
             if let Some((ty, nullable)) = numeric_output(item, tables) {
@@ -1331,7 +1331,7 @@ impl Answer {
                     ),
                 ),
                 Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) => {
-                    let col = &tables[c.side].columns[c.column];
+                    let col = tables[c.side].column_at(c.column);
                     let a: ArrayRef = match col.ty {
                         ColumnType::Boolean => {
                             Arc::new(ints().map(|v| v.map(|x| x != 0)).collect::<BooleanArray>())
@@ -1422,7 +1422,7 @@ impl Answer {
                 // An interval's sum and average, and a time's, are intervals.
                 Item::Avg(c) | Item::Sum(c)
                     if matches!(
-                        tables[c.side].columns[c.column].ty,
+                        tables[c.side].column_at(c.column).ty,
                         ColumnType::Interval { .. } | ColumnType::Time(_)
                     ) =>
                 {
@@ -1442,7 +1442,7 @@ impl Answer {
                             .collect::<Float64Array>(),
                     ),
                 ),
-                Item::Sum(c) => match tables[c.side].columns[c.column].ty {
+                Item::Sum(c) => match tables[c.side].column_at(c.column).ty {
                     ColumnType::Float4 => (
                         true,
                         Arc::new(
@@ -1466,13 +1466,13 @@ impl Answer {
                 _ if char_text => None,
                 // A reg* type's min and max are oid's, an oid.
                 Item::Least(c) | Item::Greatest(c)
-                    if tables[c.side].columns[c.column].ty.is_oid() =>
+                    if tables[c.side].column_at(c.column).ty.is_oid() =>
                 {
                     Some(ColumnType::Oid)
                 }
                 Item::Avg(c) | Item::Sum(c)
                     if matches!(
-                        tables[c.side].columns[c.column].ty,
+                        tables[c.side].column_at(c.column).ty,
                         ColumnType::Interval { .. } | ColumnType::Time(_)
                     ) =>
                 {
@@ -1482,7 +1482,7 @@ impl Answer {
                     })
                 }
                 Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) | Item::Sum(c) => {
-                    Some(tables[c.side].columns[c.column].ty).filter(|&t| {
+                    Some(tables[c.side].column_at(c.column).ty).filter(|&t| {
                         crate::scalars::is_scalar(t) || matches!(t, ColumnType::Interval { .. })
                     })
                 }
@@ -1493,7 +1493,7 @@ impl Answer {
             let named = match *item {
                 Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) => {
                     let extreme = matches!(*item, Item::Least(_) | Item::Greatest(_));
-                    match tables[c.side].columns[c.column].ty {
+                    match tables[c.side].column_at(c.column).ty {
                         ColumnType::Textual(crate::textual::Textual::Cidr) if extreme => {
                             Some(ColumnType::Textual(crate::textual::Textual::Inet))
                         }
@@ -1514,7 +1514,7 @@ impl Answer {
             };
             let composed = match *item {
                 Item::Key(Key::Column(c)) | Item::Least(c) | Item::Greatest(c) => {
-                    Some(tables[c.side].columns[c.column].ty)
+                    Some(tables[c.side].column_at(c.column).ty)
                         .filter(|t| matches!(t, ColumnType::Composed(_)))
                 }
                 _ => None,

@@ -984,6 +984,14 @@ fn cmd_read(args: &[String]) -> Result<()> {
         match &first {
             None => {
                 if args.iter().any(|a| a == "--text") {
+                    // A reg* value of the file's own objects is written as its name.
+                    let _named = match &snail {
+                        Opened::One(s) => warren_snail::oids::named(s.catalog.oids.clone()),
+                        Opened::Several(s) => match s.snails() {
+                            [one] => warren_snail::oids::named(one.catalog.oids.clone()),
+                            _ => warren_snail::oids::named_several(),
+                        },
+                    };
                     save(out, &as_text(&answer)?)?;
                 } else {
                     save(out, &answer)?;

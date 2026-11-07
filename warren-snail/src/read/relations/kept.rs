@@ -2,7 +2,7 @@
 //! columns the table meets them on, as the table's levels key them, so its read is priced once they
 //! are known and only the rows that meet them are held.
 
-use super::{conjuncts, stored, Merged, Node, Reading};
+use super::{conjuncts, Merged, Node, Reading};
 use crate::catalog::{Column, ColumnType, Level, Table};
 use crate::places::{column_byte_key, KeyValue};
 use crate::read::pipeline::{self, Key, Value};
@@ -170,10 +170,14 @@ pub(in crate::read) struct Kept {
 
 impl Kept {
     pub(in crate::read) fn of(keep: &Keep, node_at: usize, table: &Table) -> Kept {
-        let columns: Vec<usize> = stored(table).collect();
+        let columns: Vec<usize> = super::node_columns(table, usize::MAX);
         let cols: Vec<usize> = keep.places.iter().map(|p| columns[p - node_at]).collect();
+        // A system column keys no walk: no order holds it.
         let keyable: Vec<bool> = (0..cols.len())
             .map(|i| {
+                if crate::catalog::is_system(cols[i]) {
+                    return false;
+                }
                 keep.values.iter().all(|r| match r[i].is_null() {
                     true => !keep.nulls_meet,
                     false => kept_value(&r[i], &table.columns[cols[i]]).is_some(),

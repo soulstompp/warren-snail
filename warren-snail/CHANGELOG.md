@@ -29,6 +29,15 @@ at once, and a snail written inside a host that decides its commits.
 
 ### Added
 
+- **A file's own objects have OIDs,** handed out from 16384 in the order its DDL makes them and kept as
+  the file grows, so a `regclass`, `regtype`, `regnamespace`, `regcollation`, `regproc` or
+  `regprocedure` value names one as PostgreSQL names it: `'t'::regclass`, `'s.u_pkey'::regclass`,
+  `'mood[]'::regtype`, a name the search path does not find first qualified by its schema. Across
+  several snails, which each count from 16384, such an OID is refused by name.
+- **`tableoid` and `ctid`:** a table's OID, and a row's address in the generation its statement reads,
+  the first page its block owns and the row's place there from 1. A ctid compared with one from outside
+  the statement is refused by name, since a prune moves a live row; `xmin`, `xmax`, `cmin` and `cmax`
+  are refused by name, and a column of a system column's name is refused as PostgreSQL refuses it.
 - **A session on `exec` as PostgreSQL's:** SAVEPOINT, ROLLBACK TO and RELEASE, a savepoint the
   transaction's staged blocks as they stand, put back with the pages staged since dropped and the
   locks taken since let go; COMMIT AND CHAIN and ROLLBACK AND CHAIN; LOCK TABLE in each of

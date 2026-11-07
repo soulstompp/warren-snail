@@ -173,7 +173,7 @@ impl Snail {
         read.extend(want.columns.iter().copied());
         read.extend(given.iter().copied());
         let served: Vec<usize> = (0..table.orders.len())
-            .filter(|&o| read.iter().all(|&c| table.orders[o].slot(c).is_some()))
+            .filter(|&o| read.iter().all(|&c| table.orders[o].holds(c)))
             .collect();
         if served.is_empty() {
             return Err(Error::new(format!(

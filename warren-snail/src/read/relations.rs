@@ -912,6 +912,8 @@ struct Laying<'a> {
     outer: Option<&'a Outer<'a>>,
     release: u8,
     columns: Vec<Col>,
+    /// Whether the step names a system column, which each table of it then holds past its own.
+    systems: bool,
 }
 
 impl Laying<'_> {
@@ -1010,13 +1012,25 @@ impl Laying<'_> {
         for (c, r) in cols.iter_mut().zip(&renames) {
             c.name = r.clone();
         }
+        let starred = cols.len();
+        // A table's system columns, past its own, in no star.
+        if let (true, What::Table { qualifier, .. }) = (self.systems, &what) {
+            for (name, ty) in [("ctid", ColumnType::Tid), ("tableoid", ColumnType::Oid)] {
+                cols.push(Col {
+                    qualifier: Some(qualifier.clone()),
+                    name: name.to_string(),
+                    ty: Some(ty),
+                    carried: Carried::None,
+                });
+            }
+        }
         let width = cols.len();
         self.columns.extend(cols);
         Ok(Node {
             what,
             at,
             width,
-            star: (at..at + width).collect(),
+            star: (at..at + starred).collect(),
         })
     }
 
@@ -1412,6 +1426,59 @@ fn carried_of(ty: Option<ColumnType>) -> Carried {
         Some(t) if super::collate::collatable(t) => Carried::Named(super::collate::DEFAULT.into()),
         _ => Carried::None,
     }
+}
+
+/// Whether an expression is a ctid, alone or qualified.
+fn is_ctid(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(i) => crate::catalog::ident(i) == "ctid",
+        Expr::CompoundIdentifier(p) => p.last().is_some_and(|i| crate::catalog::ident(i) == "ctid"),
+        Expr::Nested(x) => is_ctid(x),
+        _ => false,
+    }
+}
+
+/// A comparison of a ctid with a value from outside the statement: a literal, a parameter, or
+/// anything that reads no ctid and is no subquery of the statement's own. A ctid is a row's address
+/// in the generation its statement reads, and a prune moves a live row to another block, where
+/// PostgreSQL's VACUUM never moves one: a ctid kept from an earlier statement names another row.
+fn ctid_from_outside(e: &Expr) -> Option<String> {
+    use sqlparser::ast::BinaryOperator as B;
+    let inside = |x: &Expr| {
+        let mut found = matches!(x, Expr::Subquery(_));
+        crate::ddl::each_expr(x, &mut |y| found |= is_ctid(y) || matches!(y, Expr::Subquery(_)));
+        found
+    };
+    let mut bad = None;
+    crate::ddl::each_expr(e, &mut |x| {
+        let sides: Vec<&Expr> = match x {
+            Expr::BinaryOp {
+                left,
+                op: B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq,
+                right,
+            } => vec![left, right],
+            Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
+            Expr::Between {
+                expr, low, high, ..
+            } => vec![expr, low, high],
+            _ => return,
+        };
+        let with = sides.iter().filter(|s| inside(s)).count();
+        if sides.iter().any(|s| is_ctid(s)) && with < sides.len() && bad.is_none() {
+            bad = Some(x.to_string());
+        }
+    });
+    bad
+}
+
+/// The columns a node of a table holds, by its places: those it stores, then the system columns a
+/// step names, where the node is wider than those it stores.
+pub(super) fn node_columns(t: &Table, width: usize) -> Vec<usize> {
+    let mut c: Vec<usize> = stored(t).collect();
+    if width > c.len() {
+        c.extend([crate::catalog::CTID, crate::catalog::TABLEOID]);
+    }
+    c
 }
 
 /// The columns a table stores: a step computes each virtual one from them.
@@ -1925,7 +1992,10 @@ impl Reading<'_> {
         if wanted.is_empty() {
             wanted.push(node.at);
         }
-        let names: Vec<String> = stored(t).map(|c| t.columns[c].name.clone()).collect();
+        let names: Vec<String> = node_columns(t, node.width)
+            .into_iter()
+            .map(|c| t.column_at(c).name.clone())
+            .collect();
         let select = wanted
             .iter()
             .map(|&p| {
@@ -2039,7 +2109,10 @@ impl Reading<'_> {
                 unreachable!()
             };
             let t = &catalog.tables[*table];
-            let names: Vec<String> = stored(t).map(|c| t.columns[c].name.clone()).collect();
+            let names: Vec<String> = node_columns(t, l.width)
+                .into_iter()
+                .map(|c| t.column_at(c).name.clone())
+                .collect();
             for p in l.at..l.at + l.width {
                 if self.needed(p) {
                     wanted.push((p, qualifier.clone(), names[p - l.at].clone()));
@@ -2124,7 +2197,7 @@ impl Reading<'_> {
         };
         let catalog = self.reads.catalog();
         let t = &catalog.tables[*table];
-        let columns: Vec<usize> = stored(t).collect();
+        let columns: Vec<usize> = node_columns(t, node.width);
         // Each expression a column of this table alone.
         let place = |e: &&Expr| -> Option<usize> {
             let (q, n) = pipeline::column_of(e)?;
@@ -2151,7 +2224,17 @@ impl Reading<'_> {
             .filter(|&p| self.needed(p))
             .map(|p| columns[p - node.at])
             .collect();
-        let Some(o) = super::strands::led_by(t, &at_columns(&by), &at_columns(&ordered), &needs)
+        // A strand holds no system column.
+        let (by_at, ordered_at) = (at_columns(&by), at_columns(&ordered));
+        if needs
+            .iter()
+            .chain(&by_at)
+            .chain(&ordered_at)
+            .any(|&c| crate::catalog::is_system(c))
+        {
+            return Ok(None);
+        }
+        let Some(o) = super::strands::led_by(t, &by_at, &ordered_at, &needs)
         else {
             return Ok(None);
         };
@@ -2478,7 +2561,7 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From) -> Result<()> {
                     .ok_or_else(|| {
                         Error::new(format!("missing FROM-clause entry for table \"{q}\""))
                     })?;
-                out.extend(by_place((found.at..found.at + found.width).collect()));
+                out.extend(by_place(found.star.clone()));
             }
             other => out.push(other),
         }
@@ -3539,6 +3622,33 @@ fn select_step(
         let SetExpr::Select(s) = step.query.body.as_ref() else {
             return Err(Error::new("a step is a SELECT"));
         };
+        let systems = {
+            let t = step.query.to_string().to_lowercase();
+            t.contains("ctid") || t.contains("tableoid")
+        };
+        if systems {
+            let ons = s.from.iter().flat_map(|f| &f.joins).filter_map(|j| {
+                use sqlparser::ast::{JoinConstraint, JoinOperator as J};
+                match &j.join_operator {
+                    J::Inner(JoinConstraint::On(e))
+                    | J::Join(JoinConstraint::On(e))
+                    | J::Left(JoinConstraint::On(e))
+                    | J::LeftOuter(JoinConstraint::On(e))
+                    | J::Right(JoinConstraint::On(e))
+                    | J::RightOuter(JoinConstraint::On(e))
+                    | J::FullOuter(JoinConstraint::On(e)) => Some(e),
+                    _ => None,
+                }
+            });
+            for e in s.selection.iter().chain(s.having.iter()).chain(ons) {
+                if let Some(x) = ctid_from_outside(e) {
+                    return Err(Error::new(format!(
+                        "{x}: a ctid from outside the statement is not read: a prune moves a live \
+                         row to another block, where PostgreSQL's VACUUM never moves one"
+                    )));
+                }
+            }
+        }
         let mut laying = Laying {
             catalog,
             made,
@@ -3549,6 +3659,7 @@ fn select_step(
             outer,
             release,
             columns: Vec::new(),
+            systems,
         };
         let mut items = Vec::with_capacity(s.from.len());
         for item in &s.from {

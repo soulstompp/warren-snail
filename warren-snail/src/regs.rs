@@ -1,8 +1,8 @@
 //! The reg* types: an oid that PostgreSQL prints and reads as the name of the object it names. The
 //! snail carries the built-in objects of each release from 14 to 19, the OIDs below 12000 each
 //! release fixes the same on every machine (`regs.txt`), and names them by the release the file's
-//! OIDs came from. Any other OID, every role's among them, prints bare, and a name the carried
-//! catalog does not hold is refused.
+//! OIDs came from; the file's own objects it names by the names its DDL gave them (`crate::oids`).
+//! Any other OID, every role's among them, prints bare, and a name neither holds is refused.
 
 use crate::{Error, Result};
 use std::collections::HashMap;
@@ -225,7 +225,8 @@ fn carried_rows(section: &str, release: u8) -> impl Iterator<Item = (u32, &'stat
 }
 
 /// An OID of `kind` as PostgreSQL's output function writes it under `release`: a built-in object's
-/// name from the carried catalog; 0 as `-`, or `0` for an operator; any other OID bare.
+/// name from the carried catalog, an object of the file held its own name; 0 as `-`, or `0` for an
+/// operator; any other OID bare.
 pub fn reg_text(kind: RegKind, oid: u32, release: u8) -> String {
     if oid == 0 {
         return if matches!(kind, RegKind::Oper | RegKind::Operator) {
@@ -234,9 +235,77 @@ pub fn reg_text(kind: RegKind, oid: u32, release: u8) -> String {
             "-".into()
         };
     }
+    if oid >= crate::oids::FIRST {
+        if let Ok(Some(o)) = crate::oids::held_object(oid) {
+            if let Some(t) = file_text(kind, &o, release) {
+                return t;
+            }
+        }
+    }
     kind.section()
         .and_then(|s| carried_text(s, oid, release))
         .map_or_else(|| oid.to_string(), str::to_string)
+}
+
+/// A file's object named as PostgreSQL's output functions name it: bare where the search path
+/// finds it by its name alone, `public` searched after `pg_catalog`; otherwise qualified by its
+/// schema. None where it is no object of `kind`.
+fn file_text(kind: RegKind, o: &crate::oids::Object, release: u8) -> Option<String> {
+    use crate::oids::Object as O;
+    let q = crate::read::calls::quote_ident;
+    let n = names(release);
+    let shown = |name: &str, shadowed: bool| -> String {
+        let (schema, own) = crate::oids::parts(name);
+        if schema == "public" && !shadowed {
+            q(own)
+        } else {
+            format!("{}.{}", q(schema), q(own))
+        }
+    };
+    let own = |name: &str| crate::oids::parts(name).1.to_string();
+    let in_catalog = |section: &'static str, name: &str| {
+        n.named
+            .contains_key(&(section, "pg_catalog".to_string(), own(name)))
+    };
+    Some(match (kind, o) {
+        (RegKind::Class, O::Class(name)) => shown(name, in_catalog("class", name)),
+        (RegKind::Type, O::Type(name)) => shown(name, n.typnames.contains_key(&own(name))),
+        (RegKind::Type, O::Array(name)) => {
+            format!("{}[]", shown(name, n.typnames.contains_key(&own(name))))
+        }
+        (RegKind::Namespace, O::Namespace(name)) => q(name),
+        (RegKind::Collation, O::Collation(name)) => shown(name, in_catalog("collation", name)),
+        (RegKind::Proc | RegKind::Procedure, O::Proc(name, args)) => {
+            // regproc qualifies a name the search path finds more than one function of.
+            let several = crate::oids::held_each(|oids| {
+                oids.each()
+                    .filter(|(_, x)| matches!(x, O::Proc(m, _) if m == name))
+                    .count()
+                    > 1
+            })
+            .unwrap_or(false);
+            let shadowed = n.shared.contains_key(&("proc", own(name)));
+            match kind {
+                RegKind::Proc => shown(name, shadowed || several),
+                _ => format!("{}({args})", shown(name, shadowed)),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// A name the carried catalog does not hold, looked for among the held file's objects: in its
+/// schema, or in `public` where it names none, as the search path finds it after `pg_catalog`.
+fn file_named(
+    parts: &[String],
+    make: impl Fn(String) -> crate::oids::Object,
+) -> Result<Option<u32>> {
+    let name = match parts {
+        [n] => format!("public.{n}"),
+        [s, n] if s != "pg_catalog" => format!("{s}.{n}"),
+        _ => return Ok(None),
+    };
+    crate::oids::held_oid(&make(name))
 }
 
 /// White space as PostgreSQL's scanner takes it.
@@ -402,11 +471,11 @@ fn names(release: u8) -> &'static Names {
     &all[(release - RELEASES.start()) as usize]
 }
 
-/// The refusal of a name the carried catalog does not hold.
+/// The refusal of a name neither the carried catalog nor the file holds.
 fn unknown(kind: RegKind, name: &str, release: u8) -> Error {
     Error::new(format!(
-        "{} \"{name}\" is none of PostgreSQL {release}'s built-in objects, the only ones the snail \
-         names",
+        "{} \"{name}\" does not exist, among PostgreSQL {release}'s built-in objects and the file's \
+         own",
         kind.object()
     ))
 }
@@ -430,6 +499,21 @@ pub fn reg_parse(kind: RegKind, s: &str, release: u8) -> Result<u32> {
         RegKind::Type => type_oid(s, release),
         RegKind::Procedure | RegKind::Operator => {
             let (parts, args) = name_and_args(s, operator, release)?;
+            if !operator {
+                // A function of the file's, by its name and its arguments' types.
+                let texts: Option<Vec<String>> = args
+                    .iter()
+                    .map(|a| a.map(|t| reg_text(RegKind::Type, t, release)))
+                    .collect();
+                if let Some(texts) = texts {
+                    let joined = texts.join(",");
+                    if let Some(oid) =
+                        file_named(&parts, |n| crate::oids::Object::Proc(n, joined.clone()))?
+                    {
+                        return Ok(oid);
+                    }
+                }
+            }
             let name = in_catalog(&parts).ok_or_else(|| unknown(kind, s, release))?;
             if operator {
                 if args.len() == 1 {
@@ -455,14 +539,19 @@ pub fn reg_parse(kind: RegKind, s: &str, release: u8) -> Result<u32> {
         }
         RegKind::Proc | RegKind::Oper => {
             let parts = split_name(s).ok_or_else(syntax)?;
-            let name = in_catalog(&parts).ok_or_else(|| unknown(kind, s, release))?;
             let section = if operator { "oper" } else { "proc" };
-            match n.shared.get(&(section, name)) {
+            let carried = in_catalog(&parts).and_then(|name| n.shared.get(&(section, name)));
+            match carried {
                 Some(Some(oid)) => Ok(*oid),
                 Some(None) if operator => {
                     Err(Error::new(format!("more than one operator named {s}")))
                 }
                 Some(None) => Err(Error::new(format!("more than one function named \"{s}\""))),
+                None if !operator => match file_procs(&parts)?.as_slice() {
+                    [oid] => Ok(*oid),
+                    [] => Err(unknown(kind, s, release)),
+                    _ => Err(Error::new(format!("more than one function named \"{s}\""))),
+                },
                 None => Err(unknown(kind, s, release)),
             }
         }
@@ -482,10 +571,20 @@ pub fn reg_parse(kind: RegKind, s: &str, release: u8) -> Result<u32> {
                 return Err(syntax());
             }
             let section = kind.section().unwrap();
-            n.named
+            if let Some(oid) = n
+                .named
                 .get(&(section, "pg_catalog".to_string(), parts[0].clone()))
-                .copied()
-                .ok_or_else(|| unknown(kind, &parts[0], release))
+            {
+                return Ok(*oid);
+            }
+            if kind == RegKind::Namespace {
+                if let Some(oid) =
+                    crate::oids::held_oid(&crate::oids::Object::Namespace(parts[0].clone()))?
+                {
+                    return Ok(oid);
+                }
+            }
+            Err(unknown(kind, &parts[0], release))
         }
         RegKind::Class | RegKind::Collation | RegKind::Config | RegKind::Dictionary => {
             qualified(kind, s, release)
@@ -501,13 +600,39 @@ fn qualified(kind: RegKind, s: &str, release: u8) -> Result<u32> {
     if parts.len() > 2 {
         return Err(unknown(kind, &shown, release));
     }
+    let given = parts.clone();
     let name = parts.pop().unwrap();
     let schema = parts.pop().unwrap_or_else(|| "pg_catalog".into());
-    names(release)
+    if let Some(oid) = names(release)
         .named
         .get(&(kind.section().unwrap(), schema, name))
-        .copied()
-        .ok_or_else(|| unknown(kind, &shown, release))
+    {
+        return Ok(*oid);
+    }
+    let made = match kind {
+        RegKind::Class => file_named(&given, crate::oids::Object::Class)?,
+        RegKind::Collation => file_named(&given, crate::oids::Object::Collation)?,
+        _ => None,
+    };
+    made.ok_or_else(|| unknown(kind, &shown, release))
+}
+
+/// The file's functions of a name, in its schema or in `public`.
+fn file_procs(parts: &[String]) -> Result<Vec<u32>> {
+    let name = match parts {
+        [n] => format!("public.{n}"),
+        [s, n] if s != "pg_catalog" => format!("{s}.{n}"),
+        _ => return Ok(Vec::new()),
+    };
+    // Several snails name no object of theirs.
+    crate::oids::held_oid(&crate::oids::Object::Namespace(String::new()))?;
+    Ok(crate::oids::held_each(|o| {
+        o.each()
+            .filter(|(_, x)| matches!(x, crate::oids::Object::Proc(m, _) if *m == name))
+            .map(|(oid, _)| oid)
+            .collect()
+    })
+    .unwrap_or_default())
 }
 
 /// A text cast to a regclass, as PostgreSQL's `text_regclass` reads it: a relation's name alone,
@@ -982,6 +1107,11 @@ impl TypeReader<'_> {
         if !array {
             return Ok(oid);
         }
+        if let Some(crate::oids::Object::Type(n)) = crate::oids::held_object(oid)? {
+            if let Some(a) = crate::oids::held_oid(&crate::oids::Object::Array(n))? {
+                return Ok(a);
+            }
+        }
         names(self.release)
             .arrays
             .get(&oid)
@@ -1169,15 +1299,18 @@ impl TypeReader<'_> {
             )));
         }
         let shown = parts.join(".");
-        let name = match parts.as_slice() {
-            [name] => name.clone(),
-            [schema, name] if schema == "pg_catalog" => name.clone(),
-            _ => return Err(unknown(RegKind::Type, &shown, self.release)),
+        let carried = match parts.as_slice() {
+            [name] => names(self.release).typnames.get(name).copied(),
+            [schema, name] if schema == "pg_catalog" => {
+                names(self.release).typnames.get(name).copied()
+            }
+            _ => None,
         };
-        let oid = *names(self.release)
-            .typnames
-            .get(&name)
-            .ok_or_else(|| unknown(RegKind::Type, &shown, self.release))?;
+        let oid = match carried {
+            Some(oid) => oid,
+            None => file_named(&parts, crate::oids::Object::Type)?
+                .ok_or_else(|| unknown(RegKind::Type, &shown, self.release))?,
+        };
         match self.modifier_list()? {
             None => Ok(oid),
             Some(list) => self.modified(oid, &list),

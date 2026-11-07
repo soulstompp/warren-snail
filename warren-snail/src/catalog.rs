@@ -1012,6 +1012,51 @@ pub struct Column {
     pub library: Option<crate::collations::Spec>,
 }
 
+/// The place a question reads a table's `ctid` at among its columns: past any of its own. A ctid is
+/// the row's address in the generation its statement reads: the block's ordinal along the table's
+/// order, and the row's place in it from 1.
+pub const CTID: usize = usize::MAX;
+
+/// The place a question reads a table's `tableoid` at: the OID the file gave the table.
+pub const TABLEOID: usize = usize::MAX - 1;
+
+/// A system column's place, by its name: those a snail reads; xmin, xmax, cmin and cmax name a
+/// heap tuple's version, which a snail has none of, and are refused by name.
+pub fn system_column(name: &str) -> Result<Option<usize>> {
+    match name {
+        "ctid" => Ok(Some(CTID)),
+        "tableoid" => Ok(Some(TABLEOID)),
+        "xmin" | "xmax" | "cmin" | "cmax" => Err(Error::new(format!(
+            "the system column {name} names a heap tuple's version, and a snail has no heap: it \
+             is not read"
+        ))),
+        _ => Ok(None),
+    }
+}
+
+/// Whether a place is a system column's.
+pub fn is_system(c: usize) -> bool {
+    c == CTID || c == TABLEOID
+}
+
+fn system_columns() -> &'static [Column; 2] {
+    static SYSTEM: std::sync::OnceLock<[Column; 2]> = std::sync::OnceLock::new();
+    SYSTEM.get_or_init(|| {
+        let column = |name: &str, ty| Column {
+            name: name.to_string(),
+            ty,
+            not_null: true,
+            default: None,
+            generated: None,
+            identity: None,
+            collation: None,
+            domain: None,
+            library: None,
+        };
+        [column("ctid", ColumnType::Tid), column("tableoid", ColumnType::Oid)]
+    })
+}
+
 /// The fields of a composite, inside its arrays and its composites, whose text its key orders under
 /// a library collation: each field's path and the collation's number.
 fn fields_collated(ty: ColumnType, path: &str, out: &mut Vec<(String, u16)>) {
@@ -1274,6 +1319,16 @@ impl Order {
         self.constraint.is_some() && self.exclusion.is_some()
     }
 
+    /// Whether a read along it gives a column: one it holds; the table's OID along any order; a
+    /// row's ctid only along the table's own order, whose blocks the address counts.
+    pub fn holds(&self, column: usize) -> bool {
+        match column {
+            TABLEOID => true,
+            CTID => self.table_order,
+            c => self.slot(c).is_some(),
+        }
+    }
+
     /// Where a table column sits among the columns this order holds.
     pub fn slot(&self, column: usize) -> Option<usize> {
         self.columns.iter().position(|&c| c == column)
@@ -1432,6 +1487,16 @@ impl Table {
     /// Whether it is a table a DDL names, rather than an index's element strand.
     pub fn declared(&self) -> bool {
         self.elements_of.is_none()
+    }
+
+    /// The column at a place: one of its own, or, past them, a system column a question reads
+    /// beside them (`CTID`, `TABLEOID`).
+    pub fn column_at(&self, c: usize) -> &Column {
+        match c {
+            CTID => &system_columns()[0],
+            TABLEOID => &system_columns()[1],
+            _ => &self.columns[c],
+        }
     }
 
     /// Whether another reading of the table holds the same columns and orders: a row written for one
@@ -1995,6 +2060,8 @@ pub struct Catalog {
     pub monetary: crate::monetary::Monetary,
     /// The file's default_text_search_config, the configuration a call naming none reads.
     pub text_search: crate::tsearch::TextSearch,
+    /// The OIDs its DDL handed its objects, from 16384 on, in the order of its statements.
+    pub oids: std::sync::Arc<crate::oids::Oids>,
 }
 
 /// A DDL read a statement at a time: the catalog of the statements taken, and each statement taken

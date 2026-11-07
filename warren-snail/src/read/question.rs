@@ -1040,6 +1040,12 @@ impl From<'_> {
         if let Some(call) = undeclared(e, &self.catalog.functions) {
             return Err(Error::new(format!("{call} is not read")));
         }
+        if self.system(e)?.is_some() {
+            return Err(Error::new(format!(
+                "{e} is a system column: a question reads it in its select list, a step anywhere \
+                 else"
+            )));
+        }
         let mut found = Vec::new();
         let mut first_error = None;
         for (side, (ti, alias)) in self.tables.iter().enumerate() {
@@ -1073,7 +1079,36 @@ impl From<'_> {
         }
     }
 
+    /// The system column an expression names, and the table it is of: `ctid` or `tableoid`, alone
+    /// or qualified by the table's name or alias. None where it names no system column.
+    fn system(&self, e: &Expr) -> Result<Option<(usize, usize)>> {
+        let (q, n) = match e {
+            Expr::Identifier(i) => (None, ident(i)),
+            Expr::CompoundIdentifier(p) if p.len() == 2 => (Some(ident(&p[0])), ident(&p[1])),
+            _ => return Ok(None),
+        };
+        let Some(c) = crate::catalog::system_column(&n)? else {
+            return Ok(None);
+        };
+        let sides: Vec<usize> = (0..self.tables.len())
+            .filter(|&s| {
+                q.as_ref().is_none_or(|q| {
+                    let named = self.named(s);
+                    *q == named || Some(q.as_str()) == named.rsplit('.').next()
+                })
+            })
+            .collect();
+        match sides.as_slice() {
+            [s] => Ok(Some((*s, c))),
+            [] => Ok(None),
+            _ => Err(Error::new(format!("column reference \"{n}\" is ambiguous"))),
+        }
+    }
+
     fn key_of(&self, e: &Expr) -> Result<Key> {
+        if let Some((side, column)) = self.system(e)? {
+            return Ok(Key::Column(Col { side, column }));
+        }
         match self.resolve(e)? {
             (side, Shape::Column(column)) => Ok(Key::Column(Col { side, column })),
             (side, Shape::MonthUtc(column)) => Ok(Key::Month(Col { side, column })),
@@ -1234,7 +1269,7 @@ impl From<'_> {
     /// The name PostgreSQL gives a column the question leaves unnamed.
     fn default_name(&self, item: Item) -> String {
         match item {
-            Item::Key(Key::Column(c)) => self.table(c.side).columns[c.column].name.clone(),
+            Item::Key(Key::Column(c)) => self.table(c.side).column_at(c.column).name.clone(),
             Item::Key(Key::Month(_)) => "extract".into(),
             Item::Count => "count".into(),
             Item::Sum(_) => "sum".into(),
@@ -1530,7 +1565,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             };
             // A type PostgreSQL has no equality for is grouped by none.
             if let Key::Column(c) = k {
-                let ty = from.table(c.side).columns[c.column].ty;
+                let ty = from.table(c.side).column_at(c.column).ty;
                 if !ty.grouped() {
                     return Err(Error::new(format!(
                         "could not identify an equality operator for type {}",
@@ -1613,7 +1648,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 (None | Some(OrderBySort::Asc), _) => false,
                 (Some(OrderBySort::Desc), _) => true,
                 (Some(_), (_, Item::Key(Key::Column(c)))) => {
-                    let ty = from.table(c.side).columns[c.column].ty;
+                    let ty = from.table(c.side).column_at(c.column).ty;
                     super::ordering::checked(&o.options, Some(ty))?;
                     super::ordering::along_a_key(&o.options).ok_or_else(|| {
                         Error::new(format!("ORDER BY {}: its operator is read in a step", o.expr))
@@ -1627,7 +1662,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                 }
             };
             if let (_, Item::Key(Key::Column(c))) = listed[at] {
-                let ty = from.table(c.side).columns[c.column].ty;
+                let ty = from.table(c.side).column_at(c.column).ty;
                 if !ty.ordered() {
                     return Err(Error::new(format!(
                         "could not identify an ordering operator for type {}",

@@ -10,7 +10,7 @@ mod answer;
 mod arrays;
 mod beside;
 mod binary;
-mod calls;
+pub(crate) mod calls;
 mod change;
 mod clock;
 mod collate;
@@ -624,6 +624,7 @@ fn row_bytes(plan: &Plan, table: &Table, columns: impl Iterator<Item = usize>) -
     }
     let order = &table.orders[plan.walk.order];
     columns
+        .filter(|&c| !crate::catalog::is_system(c))
         .map(|c| {
             let written = order
                 .slots(table, c)
@@ -927,7 +928,7 @@ impl Snail {
         }
         let mut served = Vec::new();
         for o in 0..table.orders.len() {
-            if needed.iter().all(|&c| table.orders[o].slot(c).is_some()) {
+            if needed.iter().all(|&c| table.orders[o].holds(c)) {
                 let predicate = partial::Predicate::of(&self.catalog, table, &table.orders[o])?;
                 if predicate.is_none_or(|p| p.implied_by(want.side)) {
                     served.push(o);
@@ -977,7 +978,7 @@ impl Snail {
         };
         let mut served = Vec::new();
         for o in 0..table.orders.len() {
-            if needed.iter().all(|&c| table.orders[o].slot(c).is_some()) && implied(o)? {
+            if needed.iter().all(|&c| table.orders[o].holds(c)) && implied(o)? {
                 served.push(o);
             }
         }
@@ -1342,6 +1343,7 @@ impl Snail {
     ) -> Result<Round> {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
+        let _named = crate::oids::named(self.catalog.oids.clone());
         let mut scan = self.scan(sql, order)?;
         while let Some(batch) = self.next_block(&mut scan)? {
             each(batch)?;
@@ -1471,6 +1473,7 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
+        let _named = crate::oids::named(self.catalog.oids.clone());
         let _handed = handed::holding(&self.functions);
         let viewing = settings::viewing(self.settings_view());
         let _timing = self.timing();
@@ -1609,7 +1612,16 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let _rows = handed::rows_of(&self.catalog);
         let q = &pipeline::windows::written(&spelled::between_written(q))?;
-        if relations::several(&self.catalog, q) || subqueries::held(q) || pipeline::samples(q) {
+        // A question naming a system column reads it where each table holds it past its own.
+        let names_system = {
+            let t = q.to_string().to_lowercase();
+            t.contains("ctid") || t.contains("tableoid")
+        };
+        if relations::several(&self.catalog, q)
+            || subqueries::held(q)
+            || pipeline::samples(q)
+            || names_system
+        {
             return relations::answer(self, q, params);
         }
         let name = pipeline::table_named(q)?;

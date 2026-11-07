@@ -209,7 +209,7 @@ impl Tables<'_> {
     }
 
     fn ty(&self, side: usize, column: usize) -> ColumnType {
-        self.tables[side].columns[column].ty
+        self.tables[side].column_at(column).ty
     }
 
     /// The cell of a column of a table in a row met, NULL where the table stands NULL.

@@ -905,6 +905,7 @@ pub fn write_spanned(
     sources: &[(String, Source)],
     span: u64,
 ) -> Result<Vec<Written>> {
+    let _named = crate::oids::named(catalog.oids.clone());
     write_made(
         path,
         catalog,
