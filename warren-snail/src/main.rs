@@ -3,6 +3,8 @@
 //! writes it afresh under its collations' versions, reads a DDL as the snail reads it, lists the
 //! functions PostgreSQL defines, and holds it open. Everything it records is typed Parquet.
 
+#![deny(unsafe_code)]
+
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{Field, Schema};
 use parquet::arrow::ArrowWriter;

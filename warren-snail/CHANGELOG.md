@@ -7,6 +7,11 @@ at once, and a snail written inside a host that decides its commits.
 
 ### What a user of 0.1.1 meets
 
+- **Unsafe code only where the crate calls C,** in one module, every other module built under
+  `#![deny(unsafe_code)]`: the machine's libm where PostgreSQL reads `errno` after a function or
+  std's method parts from it, glibc's C.UTF-8 classes and case, its monetary data and, under
+  `collations`, ICU's and glibc's collation, each called as PostgreSQL calls it. The file's byte
+  locks are taken through `nix`, `errno` read through `errno`.
 - **Format 9.** A snail written by 0.2.0 is of format 9, which 0.1.0 and 0.1.1 do not open. A snail
   of format 7 or 8 is opened and written in its own format, and what that format cannot hold is
   refused by name.

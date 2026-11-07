@@ -3,8 +3,7 @@
 //! glibc's C.UTF-8 under the libc provider. Characters are classified as PostgreSQL classifies
 //! them there, by glibc's `iswalpha_l` and friends under that locale.
 
-use std::ffi::{c_char, c_int, c_void};
-use std::sync::OnceLock;
+
 
 /// The rows of `ts_token_type('default')`: each token type's id, alias and description
 /// (`prsd_lextype`).
@@ -67,7 +66,8 @@ const XMLENTITY: i32 = 23;
 pub(crate) fn parse(text: &str) -> Vec<(i32, String)> {
     let s = text.as_bytes();
     let w = to_wide(s);
-    let mut p = Parser::new(s, &w, c_utf8());
+    c_utf8();
+    let mut p = Parser::new(s, &w);
     let mut out = Vec::new();
     while p.get() {
         let tok = &s[p.token..p.token + p.lenbytetoken];
@@ -76,40 +76,19 @@ pub(crate) fn parse(text: &str) -> Vec<(i32, String)> {
     out
 }
 
-type LocaleT = *mut c_void;
-
-/// glibc's `LC_CTYPE_MASK`.
-const LC_CTYPE_MASK: c_int = 1;
-
-extern "C" {
-    fn newlocale(category_mask: c_int, locale: *const c_char, base: LocaleT) -> LocaleT;
-    fn iswalnum_l(wc: u32, locale: LocaleT) -> c_int;
-    fn iswalpha_l(wc: u32, locale: LocaleT) -> c_int;
-    fn iswdigit_l(wc: u32, locale: LocaleT) -> c_int;
-    fn iswspace_l(wc: u32, locale: LocaleT) -> c_int;
-    fn iswxdigit_l(wc: u32, locale: LocaleT) -> c_int;
-}
-
-/// glibc's C.UTF-8 locale for LC_CTYPE, opened once.
-fn c_utf8() -> LocaleT {
-    static LOCALE: OnceLock<usize> = OnceLock::new();
-    let at = *LOCALE.get_or_init(|| {
-        // SAFETY: newlocale reads the NUL-terminated name and makes a locale of its own.
-        let loc = unsafe { newlocale(LC_CTYPE_MASK, c"C.UTF-8".as_ptr(), std::ptr::null_mut()) };
-        loc as usize
-    });
-    assert!(
-        at != 0,
-        "this machine's C library has no C.UTF-8, which the default text search parser classifies characters under"
-    );
-    at as LocaleT
+/// glibc's C.UTF-8 locale for LC_CTYPE, which the default text search parser classifies characters
+/// under.
+fn c_utf8() {
+    if let Err(e) = crate::sys::ctype::found("the default text search parser classifies characters under") {
+        panic!("{}", e.0);
+    }
 }
 
 /// Whether glibc's C.UTF-8 takes a character as a letter or a digit: `t_isalnum_cstr`
 /// (ts_locale.c), as `parse_or_operator` asks it.
 pub(crate) fn is_alnum(c: char) -> bool {
-    // SAFETY: the locale lives as long as the program; any code point is a wint_t.
-    unsafe { iswalnum_l(c as u32, c_utf8()) != 0 }
+    c_utf8();
+    crate::sys::ctype::is(crate::sys::ctype::Class::Alnum, c as u32)
 }
 
 /// The text's characters as code points, then a zero, one slot per byte and one more
@@ -1154,7 +1133,7 @@ struct Parser<'a> {
     stack: Vec<Pos>,
     ignore: bool,
     wanthost: bool,
-    loc: LocaleT,
+
     token: usize,
     lenbytetoken: usize,
     lenchartoken: usize,
@@ -1184,7 +1163,7 @@ enum Poll<'a> {
 
 impl<'a> Parser<'a> {
     /// A parser at the start of `s`, in state `Base` (`TParserInit`, `TParserCopyInit`).
-    fn new(s: &'a [u8], w: &'a [u32], loc: LocaleT) -> Self {
+    fn new(s: &'a [u8], w: &'a [u32]) -> Self {
         Parser {
             s,
             w,
@@ -1199,7 +1178,7 @@ impl<'a> Parser<'a> {
             }],
             ignore: false,
             wanthost: false,
-            loc,
+
             token: 0,
             lenbytetoken: 0,
             lenchartoken: 0,
@@ -1240,25 +1219,23 @@ impl<'a> Parser<'a> {
     /// Runs one row's character test (the `p_is*` functions but `p_ishost` and `p_isURLPath`,
     /// which `scan` starts as parsers of their own).
     fn test(&mut self, t: T) -> bool {
-        // SAFETY: the locale was opened by newlocale and is never freed; the classifiers only read it.
-        let class = |f: unsafe extern "C" fn(u32, LocaleT) -> c_int, wc: u32, loc: LocaleT| unsafe {
-            f(wc, loc) != 0
-        };
+        use crate::sys::ctype::Class;
+        let class = |c: Class, wc: u32| crate::sys::ctype::is(c, wc);
         match t {
             Eof => {
                 let p = self.top();
                 p.posbyte == self.s.len() || p.charlen == 0
             }
             Eq(c) => self.byte1() == Some(c),
-            Alnum => class(iswalnum_l, self.wc(), self.loc),
-            NotAlnum => !class(iswalnum_l, self.wc(), self.loc),
-            Alpha => class(iswalpha_l, self.wc(), self.loc),
-            Digit => class(iswdigit_l, self.wc(), self.loc),
-            Space => class(iswspace_l, self.wc(), self.loc),
-            XDigit => class(iswxdigit_l, self.wc(), self.loc),
+            Alnum => class(Class::Alnum, self.wc()),
+            NotAlnum => !class(Class::Alnum, self.wc()),
+            Alpha => class(Class::Alpha, self.wc()),
+            Digit => class(Class::Digit, self.wc()),
+            Space => class(Class::Space, self.wc()),
+            XDigit => class(Class::XDigit, self.wc()),
             AscLet => {
                 matches!(self.byte1(), Some(b) if b.is_ascii())
-                    && class(iswalpha_l, self.wc(), self.loc)
+                    && class(Class::Alpha, self.wc())
             }
             Special => self.is_special(),
             Ignore => self.ignore,
@@ -1301,7 +1278,7 @@ impl<'a> Parser<'a> {
     fn sub_parser(&self, t: T) -> Parser<'a> {
         let p = self.top();
         let (s, w) = (self.s, self.w);
-        let mut sub = Parser::new(&s[p.posbyte..], &w[p.poschar..], self.loc);
+        let mut sub = Parser::new(&s[p.posbyte..], &w[p.poschar..]);
         match t {
             Host => {
                 sub.wanthost = true;

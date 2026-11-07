@@ -696,31 +696,10 @@ fn final_sigma(chars: &[char], at: usize) -> bool {
         && !first_cased(Box::new(chars[at + 1..].iter()))
 }
 
-/// glibc's C.UTF-8, the locale libc's C.utf8 and the database's default map case under.
-pub(crate) fn c_utf8() -> Result<libc::locale_t> {
-    static LOCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let at = *LOCALE.get_or_init(|| {
-        // SAFETY: newlocale reads the NUL-terminated name and makes a locale of its own.
-        let loc = unsafe {
-            libc::newlocale(
-                libc::LC_CTYPE_MASK,
-                c"C.UTF-8".as_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        loc as usize
-    });
-    if at == 0 {
-        return Err(Error::new(
-            "this machine's C library has no C.UTF-8, which libc's C.utf8 maps case under",
-        ));
-    }
-    Ok(at as libc::locale_t)
-}
-
-extern "C" {
-    fn towlower_l(wc: u32, locale: libc::locale_t) -> u32;
-    fn towupper_l(wc: u32, locale: libc::locale_t) -> u32;
+/// Refused where the machine has no glibc C.UTF-8, the locale libc's C.utf8 and the database's
+/// default map case under.
+pub(crate) fn c_utf8() -> Result<()> {
+    crate::sys::ctype::found("libc's C.utf8 maps case under")
 }
 
 /// A text in upper case, or in lower case where `!upper`, as PostgreSQL's upper and lower map it
@@ -739,16 +718,13 @@ pub fn case(s: &str, upper: bool, casing: crate::catalog::Casing) -> Result<Stri
             }
         }
         Casing::Libc => {
-            let loc = c_utf8()?;
+            c_utf8()?;
             s.chars()
                 .map(|ch| {
-                    // SAFETY: the locale lives as long as the program; any code point is a wint_t.
-                    let m = unsafe {
-                        if upper {
-                            towupper_l(ch as u32, loc)
-                        } else {
-                            towlower_l(ch as u32, loc)
-                        }
+                    let m = if upper {
+                        crate::sys::ctype::upper(ch as u32)
+                    } else {
+                        crate::sys::ctype::lower(ch as u32)
                     };
                     char::from_u32(m).unwrap_or(ch)
                 })
@@ -1041,10 +1017,6 @@ pub fn bits_cat(a: &[u8], b: &[u8]) -> Vec<u8> {
     key_of_bits(&x)
 }
 
-extern "C" {
-    fn iswalnum_l(wc: u32, locale: libc::locale_t) -> libc::c_int;
-}
-
 /// A text with each word's first letter in upper case and the rest in lower, as PostgreSQL's
 /// initcap makes it under a collation that maps case as `casing`: a word a run of letters and
 /// digits, read after each character is mapped; ASCII's letters alone, glibc's C.UTF-8 a
@@ -1067,19 +1039,15 @@ pub fn title(s: &str, casing: crate::catalog::Casing) -> Result<String> {
             })
             .collect()),
         Casing::Libc => {
-            let loc = c_utf8()?;
+            c_utf8()?;
             Ok(s.chars()
                 .map(|ch| {
-                    // SAFETY: the locale lives as long as the program; any code point is a wint_t.
-                    let m = unsafe {
-                        if was_alnum {
-                            towlower_l(ch as u32, loc)
-                        } else {
-                            towupper_l(ch as u32, loc)
-                        }
+                    let m = if was_alnum {
+                        crate::sys::ctype::lower(ch as u32)
+                    } else {
+                        crate::sys::ctype::upper(ch as u32)
                     };
-                    // SAFETY: as above.
-                    was_alnum = unsafe { iswalnum_l(m, loc) } != 0;
+                    was_alnum = crate::sys::ctype::is(crate::sys::ctype::Class::Alnum, m);
                     char::from_u32(m).unwrap_or(ch)
                 })
                 .collect())

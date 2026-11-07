@@ -8,133 +8,18 @@ use crate::catalog::ColumnType;
 use crate::numeric::Numeric;
 use crate::{Error, Result};
 
-extern "C" {
-    fn sin(x: f64) -> f64;
-    fn cos(x: f64) -> f64;
-    fn tan(x: f64) -> f64;
-    fn asin(x: f64) -> f64;
-    fn acos(x: f64) -> f64;
-    fn atan(x: f64) -> f64;
-    fn atan2(y: f64, x: f64) -> f64;
-    fn sinh(x: f64) -> f64;
-    fn cosh(x: f64) -> f64;
-    fn tanh(x: f64) -> f64;
-    fn asinh(x: f64) -> f64;
-    fn acosh(x: f64) -> f64;
-    fn atanh(x: f64) -> f64;
-    fn exp(x: f64) -> f64;
-    fn log(x: f64) -> f64;
-    fn log10(x: f64) -> f64;
-    fn cbrt(x: f64) -> f64;
-    fn pow(x: f64, y: f64) -> f64;
-    fn erf(x: f64) -> f64;
-    fn erfc(x: f64) -> f64;
-    fn tgamma(x: f64) -> f64;
-    fn lgamma(x: f64) -> f64;
-}
-
-type F1 = unsafe extern "C" fn(f64) -> f64;
-type F2 = unsafe extern "C" fn(f64, f64) -> f64;
-
-/// The C library's functions of a double that PostgreSQL calls, as the machine's libm defines them:
-/// looked up in it by name, since the toolchain links copies of its own under some of those names;
-/// where the machine has no libm.so.6, the copies linked.
-struct Libm {
-    sin: F1,
-    cos: F1,
-    tan: F1,
-    asin: F1,
-    acos: F1,
-    atan: F1,
-    atan2: F2,
-    sinh: F1,
-    cosh: F1,
-    tanh: F1,
-    asinh: F1,
-    acosh: F1,
-    atanh: F1,
-    exp: F1,
-    log: F1,
-    log10: F1,
-    cbrt: F1,
-    pow: F2,
-    erf: F1,
-    erfc: F1,
-    tgamma: F1,
-    lgamma: F1,
-}
-
-fn libm() -> &'static Libm {
-    static LIBM: std::sync::OnceLock<Libm> = std::sync::OnceLock::new();
-    LIBM.get_or_init(|| {
-        // SAFETY: dlopen reads the NUL-terminated name; the library stays open for the program.
-        let h = unsafe { libc::dlopen(c"libm.so.6".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        let found = |name: &std::ffi::CStr| -> *mut libc::c_void {
-            if h.is_null() {
-                return std::ptr::null_mut();
-            }
-            // SAFETY: the handle is open and the name NUL-terminated.
-            unsafe { libc::dlsym(h, name.as_ptr()) }
-        };
-        let f1 = |name: &std::ffi::CStr, linked: F1| -> F1 {
-            let p = found(name);
-            // SAFETY: libm's function of that name takes a double and returns one.
-            if p.is_null() {
-                linked
-            } else {
-                unsafe { std::mem::transmute::<*mut libc::c_void, F1>(p) }
-            }
-        };
-        let f2 = |name: &std::ffi::CStr, linked: F2| -> F2 {
-            let p = found(name);
-            // SAFETY: libm's function of that name takes two doubles and returns one.
-            if p.is_null() {
-                linked
-            } else {
-                unsafe { std::mem::transmute::<*mut libc::c_void, F2>(p) }
-            }
-        };
-        Libm {
-            sin: f1(c"sin", sin),
-            cos: f1(c"cos", cos),
-            tan: f1(c"tan", tan),
-            asin: f1(c"asin", asin),
-            acos: f1(c"acos", acos),
-            atan: f1(c"atan", atan),
-            atan2: f2(c"atan2", atan2),
-            sinh: f1(c"sinh", sinh),
-            cosh: f1(c"cosh", cosh),
-            tanh: f1(c"tanh", tanh),
-            asinh: f1(c"asinh", asinh),
-            acosh: f1(c"acosh", acosh),
-            atanh: f1(c"atanh", atanh),
-            exp: f1(c"exp", exp),
-            log: f1(c"log", log),
-            log10: f1(c"log10", log10),
-            cbrt: f1(c"cbrt", cbrt),
-            pow: f2(c"pow", pow),
-            erf: f1(c"erf", erf),
-            erfc: f1(c"erfc", erfc),
-            tgamma: f1(c"tgamma", tgamma),
-            lgamma: f1(c"lgamma", lgamma),
-        }
-    })
-}
+use crate::sys::libm::{libm, Fn1};
 
 /// A function of the C library called with errno cleared: its result, and errno after it.
 fn errno_of(f: impl FnOnce() -> f64) -> (f64, i32) {
-    // SAFETY: errno is the calling thread's own; the functions read only their arguments.
-    unsafe {
-        *libc::__errno_location() = 0;
-        let r = f();
-        (r, *libc::__errno_location())
-    }
+    errno::set_errno(errno::Errno(0));
+    let r = f();
+    (r, errno::errno().0)
 }
 
 /// A function of the C library over one double, which reads only its argument.
-fn c1(f: unsafe extern "C" fn(f64) -> f64, x: f64) -> f64 {
-    // SAFETY: the function reads only its argument.
-    unsafe { f(x) }
+fn c1(f: Fn1, x: f64) -> f64 {
+    f.call(x)
 }
 
 fn overflow() -> Error {
@@ -499,9 +384,9 @@ fn degrees() -> &'static Degrees {
         let mut d = Degrees {
             sin_30: c1(libm().sin, std::hint::black_box(30.0) * RADIANS_PER_DEGREE),
             one_minus_cos_60: 1.0 - c1(libm().cos, std::hint::black_box(60.0) * RADIANS_PER_DEGREE),
-            asin_0_5: c1(libm().asin, std::hint::black_box(0.5)),
-            acos_0_5: c1(libm().acos, std::hint::black_box(0.5)),
-            atan_1_0: c1(libm().atan, std::hint::black_box(1.0)),
+            asin_0_5: std::hint::black_box(0.5f64).asin(),
+            acos_0_5: std::hint::black_box(0.5f64).acos(),
+            atan_1_0: std::hint::black_box(1.0f64).atan(),
             tan_45: 0.0,
             cot_45: 0.0,
         };
@@ -514,17 +399,17 @@ fn degrees() -> &'static Degrees {
 
 fn asind_q1(d: &Degrees, x: f64) -> f64 {
     if x <= 0.5 {
-        (c1(libm().asin, x) / d.asin_0_5) * 30.0
+        (x.asin() / d.asin_0_5) * 30.0
     } else {
-        90.0 - (c1(libm().acos, x) / d.acos_0_5) * 60.0
+        90.0 - (x.acos() / d.acos_0_5) * 60.0
     }
 }
 
 fn acosd_q1(d: &Degrees, x: f64) -> f64 {
     if x <= 0.5 {
-        90.0 - (c1(libm().asin, x) / d.asin_0_5) * 30.0
+        90.0 - (x.asin() / d.asin_0_5) * 30.0
     } else {
-        (c1(libm().acos, x) / d.acos_0_5) * 60.0
+        (x.acos() / d.acos_0_5) * 60.0
     }
 }
 
@@ -650,8 +535,7 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
                     0.0
                 }
             } else {
-                // SAFETY: exp reads only its argument.
-                let (r, errno) = errno_of(|| unsafe { (libm().exp)(x) });
+                let (r, errno) = errno_of(|| libm().exp.call(x));
                 if errno == libc::ERANGE {
                     return Err(if r != 0.0 { overflow() } else { underflow() });
                 }
@@ -672,9 +556,9 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
                 return Err(Error::new("cannot take logarithm of a negative number"));
             }
             let r = if matches!(name, "ln" | "dlog1") {
-                c1(libm().log, x)
+                x.ln()
             } else {
-                c1(libm().log10, x)
+                x.log10()
             };
             if r.is_infinite() && !x.is_infinite() {
                 return Err(overflow());
@@ -692,23 +576,22 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
                 return Err(out_of_range());
             }
             finite_result(if name == "acos" {
-                c1(libm().acos, x)
+                x.acos()
             } else {
-                c1(libm().asin, x)
+                x.asin()
             })?
         }
         ("atan", [_]) => {
             if x.is_nan() {
                 return Ok(nan);
             }
-            finite_result(c1(libm().atan, x))?
+            finite_result(x.atan())?
         }
         ("atan2", [y, x]) => {
             if x.is_nan() || y.is_nan() {
                 return Ok(nan);
             }
-            // SAFETY: atan2 reads only its arguments.
-            finite_result(unsafe { (libm().atan2)(*y, *x) })?
+            finite_result(y.atan2(*x))?
         }
         ("cos" | "sin" | "tan" | "cot", [_]) => {
             if x.is_nan() {
@@ -719,8 +602,7 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
                 "sin" => libm().sin,
                 _ => libm().tan,
             };
-            // SAFETY: the function reads only its argument.
-            let (r, errno) = errno_of(|| unsafe { f(x) });
+            let (r, errno) = errno_of(|| f.call(x));
             if errno != 0 || x.is_infinite() {
                 return Err(out_of_range());
             }
@@ -750,15 +632,14 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
                 return Ok(nan);
             }
             let d = degrees();
-            finite_result((c1(libm().atan, x) / d.atan_1_0) * 45.0)?
+            finite_result((x.atan() / d.atan_1_0) * 45.0)?
         }
         ("atan2d", [y, x]) => {
             if x.is_nan() || y.is_nan() {
                 return Ok(nan);
             }
             let d = degrees();
-            // SAFETY: atan2 reads only its arguments.
-            finite_result((unsafe { (libm().atan2)(*y, *x) } / d.atan_1_0) * 45.0)?
+            finite_result((y.atan2(*x) / d.atan_1_0) * 45.0)?
         }
         ("sind" | "cosd" | "tand" | "cotd", [_]) => {
             if x.is_nan() {
@@ -790,8 +671,7 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
         ("degrees", [_]) => checked_div(x, RADIANS_PER_DEGREE)?,
         ("radians", [_]) => checked_mul(x, RADIANS_PER_DEGREE)?,
         ("sinh", [_]) => {
-            // SAFETY: sinh reads only its argument.
-            let (r, errno) = errno_of(|| unsafe { (libm().sinh)(x) });
+            let (r, errno) = errno_of(|| libm().sinh.call(x));
             if errno == libc::ERANGE {
                 if x < 0.0 {
                     f64::NEG_INFINITY
@@ -803,8 +683,7 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
             }
         }
         ("cosh", [_]) => {
-            // SAFETY: cosh reads only its argument.
-            let (r, errno) = errno_of(|| unsafe { (libm().cosh)(x) });
+            let (r, errno) = errno_of(|| libm().cosh.call(x));
             let r = if errno == libc::ERANGE {
                 f64::INFINITY
             } else {
@@ -815,13 +694,13 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
             }
             r
         }
-        ("tanh", [_]) => finite_result(c1(libm().tanh, x))?,
-        ("asinh", [_]) => c1(libm().asinh, x),
+        ("tanh", [_]) => finite_result(x.tanh())?,
+        ("asinh", [_]) => x.asinh(),
         ("acosh", [_]) => {
             if x < 1.0 {
                 return Err(out_of_range());
             }
-            c1(libm().acosh, x)
+            x.acosh()
         }
         ("atanh", [_]) => {
             if x < -1.0 || x > 1.0 {
@@ -846,8 +725,7 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
                 }
                 x
             } else {
-                // SAFETY: tgamma reads only its argument.
-                let (r, errno) = errno_of(|| unsafe { (libm().tgamma)(x) });
+                let (r, errno) = errno_of(|| libm().tgamma.call(x));
                 if errno != 0 || r.is_infinite() || r.is_nan() {
                     return Err(if r != 0.0 { overflow() } else { underflow() });
                 }
@@ -858,8 +736,7 @@ fn doubles(name: &str, args: &[Value]) -> Result<f64> {
             }
         }
         ("lgamma", [_]) => {
-            // SAFETY: lgamma reads only its argument.
-            let (r, errno) = errno_of(|| unsafe { (libm().lgamma)(x) });
+            let (r, errno) = errno_of(|| libm().lgamma.call(x));
             if errno == libc::ERANGE || (r.is_infinite() && !x.is_infinite()) {
                 return Err(overflow());
             }
@@ -934,8 +811,7 @@ fn dpow(x: f64, y: f64) -> Result<f64> {
             }
         });
     }
-    // SAFETY: pow reads only its arguments.
-    let (r, errno) = errno_of(|| unsafe { (libm().pow)(x, y) });
+    let (r, errno) = errno_of(|| libm().pow.call(x, y));
     if errno == libc::EDOM || r.is_nan() {
         if x == 0.0 {
             return Ok(0.0);

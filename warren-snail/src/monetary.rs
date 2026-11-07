@@ -209,7 +209,7 @@ mod library {
 #[cfg(feature = "collations")]
 mod library {
     use super::*;
-    use std::ffi::{CStr, CString};
+    use std::ffi::CString;
 
     /// glibc's items of LC_MONETARY, `_NL_ITEM(LC_MONETARY, n)`, in `langinfo.h`'s order.
     const MONETARY: libc::nl_item = 4 << 16;
@@ -237,22 +237,32 @@ mod library {
             ))
         };
         let name = CString::new(locale).map_err(|_| invalid())?;
-        // SAFETY: the name is a C string; a locale made here is freed here.
-        let loc =
-            unsafe { libc::newlocale(libc::LC_ALL_MASK, name.as_ptr(), std::ptr::null_mut()) };
-        if loc.is_null() {
-            return Err(invalid());
-        }
-        // SAFETY: nl_langinfo_l returns a string glibc holds as long as the locale lives.
-        let item = |i: libc::nl_item| unsafe { CStr::from_ptr(libc::nl_langinfo_l(i, loc)) };
-        let text = |i| String::from_utf8_lossy(item(i).to_bytes()).into_owned();
-        let byte = |i| item(i).to_bytes().first().map_or(0, |&b| b as i8);
-        let codeset = item(libc::CODESET).to_bytes().to_vec();
+        let items = [
+            CURRENCY_SYMBOL,
+            MON_DECIMAL_POINT,
+            MON_THOUSANDS_SEP,
+            MON_GROUPING,
+            POSITIVE_SIGN,
+            NEGATIVE_SIGN,
+            FRAC_DIGITS,
+            P_CS_PRECEDES,
+            P_SEP_BY_SPACE,
+            N_CS_PRECEDES,
+            N_SEP_BY_SPACE,
+            P_SIGN_POSN,
+            N_SIGN_POSN,
+            libc::CODESET,
+        ];
+        let got = crate::sys::monetary::langinfo(&name, &items).ok_or_else(invalid)?;
+        let item = |i: libc::nl_item| got[items.iter().position(|&x| x == i).unwrap()].as_slice();
+        let text = |i| String::from_utf8_lossy(item(i)).into_owned();
+        let byte = |i| item(i).first().map_or(0, |&b| b as i8);
+        let codeset = item(libc::CODESET).to_vec();
         let conv = Conv {
             currency_symbol: text(CURRENCY_SYMBOL),
             mon_decimal_point: text(MON_DECIMAL_POINT),
             mon_thousands_sep: text(MON_THOUSANDS_SEP),
-            mon_grouping: item(MON_GROUPING).to_bytes().to_vec(),
+            mon_grouping: item(MON_GROUPING).to_vec(),
             positive_sign: text(POSITIVE_SIGN),
             negative_sign: text(NEGATIVE_SIGN),
             frac_digits: byte(FRAC_DIGITS),
@@ -264,8 +274,6 @@ mod library {
             n_sign_posn: byte(N_SIGN_POSN),
             ..c_conv()
         };
-        // SAFETY: the locale was made above and is used no more.
-        unsafe { libc::freelocale(loc) };
         if codeset != b"UTF-8" && codeset != b"ANSI_X3.4-1968" {
             return Err(Error::new(format!(
                 "lc_monetary {locale} writes money in {}: the snail reads a locale of UTF-8 or \

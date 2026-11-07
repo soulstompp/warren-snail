@@ -41,3 +41,5 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 crc32fast = "1"
 libc = "0.2"
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+errno = "0.3"

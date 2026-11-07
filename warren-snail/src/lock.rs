@@ -4,7 +4,6 @@
 
 use crate::{Error, Result};
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 
 /// The byte whose lock is a commit's turn at the root.
 const ROOT_TURN: u64 = 1 << 60;
@@ -40,23 +39,27 @@ enum Kind {
 }
 
 fn flock(kind: libc::c_short, start: u64, len: u64) -> libc::flock {
-    // SAFETY: flock is plain data; every field the call reads is set below.
-    let mut f: libc::flock = unsafe { std::mem::zeroed() };
-    f.l_type = kind;
-    f.l_whence = libc::SEEK_SET as libc::c_short;
-    f.l_start = start as libc::off_t;
-    f.l_len = len as libc::off_t;
-    f
+    libc::flock {
+        l_type: kind,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: start as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+    }
 }
 
+/// An open file description's lock taken, let go or tested, as `fcntl` does it.
 fn fcntl(file: &File, cmd: libc::c_int, f: &mut libc::flock) -> std::io::Result<()> {
-    // SAFETY: the descriptor is open for the life of `file`, and `f` is a valid flock.
-    let r = unsafe { libc::fcntl(file.as_raw_fd(), cmd, f as *mut libc::flock) };
-    if r == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    use nix::fcntl::FcntlArg;
+    let arg = match cmd {
+        libc::F_OFD_SETLK => FcntlArg::F_OFD_SETLK(f),
+        libc::F_OFD_SETLKW => FcntlArg::F_OFD_SETLKW(f),
+        libc::F_OFD_GETLK => FcntlArg::F_OFD_GETLK(f),
+        _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+    };
+    nix::fcntl::fcntl(file, arg)
+        .map(|_| ())
+        .map_err(std::io::Error::from)
 }
 
 /// Takes a lock on bytes `start..start + len`, waiting for it where `wait`. Returns false where it

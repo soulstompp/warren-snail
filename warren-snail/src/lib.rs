@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![deny(unsafe_code)]
 
 pub mod arrays;
 pub mod brin;
@@ -41,6 +42,9 @@ pub mod rowtypes;
 pub mod scalars;
 pub(crate) mod spans;
 pub mod strings;
+// Every call into a C library, and the only unsafe code the crate holds.
+#[allow(unsafe_code)]
+pub(crate) mod sys;
 pub mod textual;
 pub mod times;
 pub mod tsearch;
