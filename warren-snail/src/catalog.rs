@@ -1265,6 +1265,8 @@ pub struct Order {
     pub keys: Vec<String>,
     /// For each level, its B-tree operator class: the one its index names, or its type's default.
     pub opclasses: Vec<String>,
+    /// Each level's operator class's parameters, as written.
+    pub params: Vec<Option<String>>,
     /// The columns its INCLUDE names.
     pub include: Vec<usize>,
     /// The storage parameters its index sets, as written: read, and nothing in a snail.
@@ -1288,6 +1290,8 @@ pub struct ElementKey {
     pub method: Method,
     pub column: usize,
     pub opclass: String,
+    /// Its operator class's parameters, as written.
+    pub params: Option<String>,
     /// The columns its INCLUDE names: read, and carried by no strand.
     pub include: Vec<usize>,
     /// The storage parameters its index sets, as written: read, and nothing in a snail.

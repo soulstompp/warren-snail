@@ -31,6 +31,7 @@ mod methods;
 pub mod monetary;
 pub mod numeric;
 pub mod oids;
+pub(crate) mod deparse;
 pub(crate) mod pgcatalog;
 pub mod places;
 pub(crate) mod plane;

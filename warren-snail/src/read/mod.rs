@@ -33,7 +33,7 @@ mod ops;
 mod ordering;
 mod out;
 pub(crate) mod partial;
-mod pipeline;
+pub(crate) mod pipeline;
 mod point;
 mod populate;
 mod prefix;
@@ -49,7 +49,7 @@ pub(crate) mod settings;
 mod sets;
 mod spill;
 mod tablesample;
-mod spelled;
+pub(crate) mod spelled;
 mod strands;
 mod summed;
 pub mod tablelock;
@@ -1346,6 +1346,7 @@ impl Snail {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _named = crate::oids::named(self.catalog.oids.clone());
+        let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let mut scan = self.scan(sql, order)?;
         while let Some(batch) = self.next_block(&mut scan)? {
             each(batch)?;
@@ -1476,6 +1477,7 @@ impl Snail {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _named = crate::oids::named(self.catalog.oids.clone());
+        let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _handed = handed::holding(&self.functions);
         let viewing = settings::viewing(self.settings_view());
         let _timing = self.timing();

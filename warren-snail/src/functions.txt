@@ -1793,19 +1793,19 @@ pg_get_acl(oid,oid,integer)	18-19	server	roles and privileges
 pg_get_aios()	18-19	server	the server itself
 pg_get_backend_memory_contexts()		server	the server itself
 pg_get_catalog_foreign_keys()		server	the server's catalog
-pg_get_constraintdef(oid)		server	the server's catalog
-pg_get_constraintdef(oid,boolean)		server	the server's catalog
+pg_get_constraintdef(oid)		type	the file's catalog
+pg_get_constraintdef(oid,boolean)		type	the file's catalog
 pg_get_dsm_registry_allocations()	19	server	the server itself
-pg_get_expr(pg_node_tree,oid)		server	the server's catalog
-pg_get_expr(pg_node_tree,oid,boolean)		server	the server's catalog
+pg_get_expr(pg_node_tree,oid)		type	the file's catalog
+pg_get_expr(pg_node_tree,oid,boolean)		type	the file's catalog
 pg_get_function_arg_default(oid,integer)		server	the server's catalog
 pg_get_function_arguments(oid)		server	the server's catalog
 pg_get_function_identity_arguments(oid)		server	the server's catalog
 pg_get_function_result(oid)		server	the server's catalog
 pg_get_function_sqlbody(oid)		server	the server's catalog
 pg_get_functiondef(oid)		server	the server's catalog
-pg_get_indexdef(oid)		server	the server's catalog
-pg_get_indexdef(oid,integer,boolean)		server	the server's catalog
+pg_get_indexdef(oid)		type	the file's catalog
+pg_get_indexdef(oid,integer,boolean)		type	the file's catalog
 pg_get_keywords()		type	the rest
 pg_get_loaded_modules()	18-19	server	the server itself
 pg_get_multixact_members(xid)		server	locks

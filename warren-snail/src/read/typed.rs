@@ -767,6 +767,9 @@ impl Typing<'_> {
                 if let Some(t) = super::json::typed(&name, &types)? {
                     return Ok(t);
                 }
+                if let Some(t) = crate::deparse::typed(&name) {
+                    return Ok(Some(t));
+                }
                 crate::functions::refuse_server(&name, self.release)?;
                 None
             }

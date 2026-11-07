@@ -1367,6 +1367,34 @@ pub(super) fn parts_of(e: &Expr) -> Vec<&Expr> {
 }
 
 /// The columns an expression reads, by their qualifier and name, each as often as it is read.
+/// The columns an expression reads, a parse tree handed to pg_get_expr apart: the one place a
+/// catalog's tree is read.
+pub(super) fn columns_read_but_trees(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    if let Expr::Function(f) = e {
+        if function_name(f) == "pg_get_expr" {
+            let a = args(f).unwrap_or_default();
+            for (i, x) in a.iter().enumerate() {
+                if i == 0 && column_of(x).is_some() {
+                    continue;
+                }
+                columns_read_but_trees(x, out);
+            }
+            return;
+        }
+    }
+    if let Some(c) = column_of(e) {
+        out.push(c);
+        return;
+    }
+    let mut parts = parts_of(e);
+    if parts.is_empty() {
+        parts = super::collate::children(e);
+    }
+    for p in parts {
+        columns_read_but_trees(p, out);
+    }
+}
+
 pub(super) fn columns_read(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     if let Some(c) = column_of(e) {
         out.push(c);
@@ -4447,6 +4475,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     )? {
                         return Ok(v);
                     }
+                    if let Some(v) = crate::deparse::call(&name, &values)? {
+                        return Ok(v);
+                    }
                     crate::functions::refuse_server(&name, frame.release)?;
                     return Err(Error::new(format!("{e} is not read")));
                 }
@@ -5494,8 +5525,25 @@ impl<'q> Prepared<'q> {
     /// The columns its expressions read of its FROM's: its select list's, its WHERE's, its HAVING's,
     /// its ORDER BY's own, its windows' partitions and orders, and those its FROM reads its
     /// relations by.
+    /// The columns it reads, a parse tree handed to pg_get_expr apart.
+    pub(super) fn reads_but_trees(&self) -> Vec<(Option<String>, String)> {
+        let mut kept = Vec::new();
+        for e in self.read_expressions() {
+            columns_read_but_trees(e, &mut kept);
+        }
+        kept
+    }
+
     pub(super) fn reads(&self) -> Vec<(Option<String>, String)> {
         let mut out = Vec::new();
+        for e in self.read_expressions() {
+            columns_read(e, &mut out);
+        }
+        out
+    }
+
+    /// The expressions its columns are read in.
+    fn read_expressions(&self) -> Vec<&Expr> {
         let windowed = self.calls.windows.iter().flat_map(|w| match w {
             Expr::Function(f) => match &f.over {
                 Some(WindowType::WindowSpec(s)) => s
@@ -5508,8 +5556,7 @@ impl<'q> Prepared<'q> {
             },
             _ => Vec::new(),
         });
-        for e in self
-            .items
+        self.items
             .iter()
             .map(|(e, _)| *e)
             .chain(self.selection)
@@ -5517,10 +5564,7 @@ impl<'q> Prepared<'q> {
             .chain(self.hidden.iter().copied())
             .chain(self.joined.iter().copied())
             .chain(windowed)
-        {
-            columns_read(e, &mut out);
-        }
-        out
+            .collect()
     }
 
     /// The rows its select list makes of one row, each with its ORDER BY's expressions after them:

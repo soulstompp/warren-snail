@@ -126,7 +126,7 @@ fn bit(release: u8) -> u8 {
 }
 
 /// A carried table's built-in rows under a release, each field by its column's name.
-fn built_in(table: &str, release: u8) -> Vec<HashMap<&'static str, Option<String>>> {
+pub(crate) fn built_in(table: &str, release: u8) -> Vec<HashMap<&'static str, Option<String>>> {
     let Some(defs) = carried().get(table) else {
         return Vec::new();
     };
@@ -235,6 +235,15 @@ pub(crate) fn relation(catalog: &Catalog, table: &str) -> Result<Relation> {
     let mut rows: Vec<HashMap<&str, Option<String>>> = built_in(table, release);
     let file = File::of(catalog);
     rows.extend(file.rows(table)?);
+    if table == "pg_type" {
+        for r in rows.iter_mut() {
+            if let Some(Some(h)) = r.get("typdefaultbin").cloned() {
+                let text = crate::deparse::text_of_tree(catalog, &h, 0, false)
+                    .map_err(|e| Error::new(format!("typdefault {h}: {e}")))?;
+                r.insert("typdefault", text);
+            }
+        }
+    }
     let rows = rows
         .into_iter()
         .map(|r| names.iter().map(|n| r.get(n.as_str()).cloned().flatten()).collect())
@@ -245,6 +254,16 @@ pub(crate) fn relation(catalog: &Catalog, table: &str) -> Result<Relation> {
         refused,
         rows,
     })
+}
+
+/// The rows of a catalog table the file's own objects make, none for a table they make none of.
+pub(crate) fn file_rows(catalog: &Catalog, table: &str) -> Vec<Row> {
+    File::of(catalog).rows(table).unwrap_or_default()
+}
+
+/// The OID of a column's type, as pg_attribute's atttypid gives it.
+pub(crate) fn type_oid_of(catalog: &Catalog, ty: ColumnType, domain: Option<&str>) -> u32 {
+    File::of(catalog).facts(ty, domain).oid
 }
 
 /// A row of the file's own, each field by its column's name: a column it leaves out is NULL.
@@ -273,7 +292,28 @@ struct TypeFacts {
 struct File<'a> {
     catalog: &'a Catalog,
     release: u8,
-    types: HashMap<u32, HashMap<&'static str, Option<String>>>,
+    types: std::sync::Arc<HashMap<u32, HashMap<&'static str, Option<String>>>>,
+}
+
+/// A release's built-in rows of pg_type by OID, read once.
+fn built_in_types(release: u8) -> std::sync::Arc<HashMap<u32, HashMap<&'static str, Option<String>>>> {
+    type Types = std::sync::Arc<HashMap<u32, HashMap<&'static str, Option<String>>>>;
+    static TYPES: OnceLock<std::sync::Mutex<HashMap<u8, Types>>> = OnceLock::new();
+    let all = TYPES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut all = all.lock().unwrap_or_else(|e| e.into_inner());
+    all.entry(release)
+        .or_insert_with(|| {
+            std::sync::Arc::new(
+                built_in("pg_type", release)
+                    .into_iter()
+                    .filter_map(|r| {
+                        let oid = r.get("oid")?.as_deref()?.parse().ok()?;
+                        Some((oid, r))
+                    })
+                    .collect(),
+            )
+        })
+        .clone()
 }
 
 /// An access method's OID, as initdb fixes it.
@@ -289,7 +329,7 @@ fn am_oid(m: Method) -> u32 {
 }
 
 /// A type's typmod, as PostgreSQL's input of its modifiers writes it: -1 where it has none.
-fn typmod_of(ty: ColumnType) -> i32 {
+pub(crate) fn typmod_of(ty: ColumnType) -> i32 {
     use ColumnType as C;
     match ty {
         C::Text(Some(n)) | C::Bpchar(Some(n)) if n != C::VARCHAR => n as i32 + 4,
@@ -304,7 +344,7 @@ fn typmod_of(ty: ColumnType) -> i32 {
             if range == crate::times::INTERVAL_FULL_RANGE && precision.is_none() {
                 -1
             } else {
-                (i32::from(range) << 16) | i32::from(precision.unwrap_or(0xff)).min(0xffff)
+                (i32::from(range) << 16) | precision.map_or(0xffff, i32::from)
             }
         }
         _ => -1,
@@ -313,13 +353,7 @@ fn typmod_of(ty: ColumnType) -> i32 {
 
 impl<'a> File<'a> {
     fn of(catalog: &'a Catalog) -> File<'a> {
-        let types = built_in("pg_type", catalog.release)
-            .into_iter()
-            .filter_map(|r| {
-                let oid = r.get("oid")?.as_deref()?.parse().ok()?;
-                Some((oid, r))
-            })
-            .collect();
+        let types = built_in_types(catalog.release);
         File {
             catalog,
             release: catalog.release,
@@ -402,7 +436,10 @@ impl<'a> File<'a> {
                     }
                 }
                 K::Range { name, .. } | K::Multirange { name, .. } => {
-                    return varlena(self.oid(Object::Type(full(name))), "d")
+                    let oid = self.oid(Object::Type(full(name)));
+                    if oid != 0 {
+                        return varlena(oid, "d");
+                    }
                 }
                 K::Array { element, domain } => {
                     let of = self.facts(*element, domain.as_deref());
@@ -547,6 +584,9 @@ impl<'a> File<'a> {
                 exclusion: o.exclusion.is_some(),
                 clustered: o.clustered && o.table_order,
                 nulls_distinct: o.nulls_distinct,
+                keyed: o.constraint.is_some(),
+                deferrable: o.constraint.as_ref().is_some_and(|k| k.deferrable)
+                    || o.exclusion.as_ref().is_some_and(|x| x.deferrable),
             });
         }
         for b in &tb.brins {
@@ -567,6 +607,8 @@ impl<'a> File<'a> {
                 exclusion: false,
                 clustered: false,
                 nulls_distinct: true,
+                keyed: false,
+                deferrable: false,
             });
         }
         for e in &tb.element_keys {
@@ -582,6 +624,8 @@ impl<'a> File<'a> {
                     exclusion: false,
                     clustered: false,
                     nulls_distinct: true,
+                    keyed: false,
+                    deferrable: false,
                 }),
             }
         }
@@ -827,24 +871,43 @@ impl<'a> File<'a> {
             let n = full(&d.name);
             let oid = self.oid(Object::Type(n.clone()));
             let array = self.oid(Object::Array(n.clone()));
-            let base = d
-                .base_type
-                .map(|b| self.facts(b, None))
-                .unwrap_or_else(|| record.clone());
-            let out_fn = self
-                .types
-                .get(&base.oid)
-                .and_then(|r| r.get("typoutput").cloned().flatten())
-                .unwrap_or_default();
-            let send_fn = self
-                .types
-                .get(&base.oid)
-                .and_then(|r| r.get("typsend").cloned().flatten())
-                .unwrap_or_default();
-            let category = self
-                .types
-                .get(&base.oid)
-                .and_then(|r| r.get("typcategory").cloned().flatten())
+            // Its base type: as the snail holds it, else by the name the DDL gives it.
+            let base = match d.base_type {
+                Some(b) => self.facts(b, None),
+                None => {
+                    let named = crate::regs::type_oid(&d.base, self.release).unwrap_or(0);
+                    let mut f = record.clone();
+                    if let Some(r) = self.types.get(&named) {
+                        let g = |k: &str| r.get(k).cloned().flatten().unwrap_or_default();
+                        f = TypeFacts {
+                            oid: named,
+                            len: g("typlen"),
+                            byval: g("typbyval"),
+                            align: g("typalign"),
+                            storage: g("typstorage"),
+                            collatable: g("typcollation") != "0",
+                        };
+                    } else if named != 0 {
+                        f.oid = named;
+                    }
+                    f
+                }
+            };
+            // The base type's row: a built-in's as carried, one of the file's as made above.
+            let base_oid = base.oid.to_string();
+            let of_base = |k: &str| -> Option<String> {
+                self.types
+                    .get(&base.oid)
+                    .and_then(|r| r.get(k).cloned().flatten())
+                    .or_else(|| {
+                        out.iter()
+                            .find(|r| r.get("oid").cloned().flatten().as_deref() == Some(base_oid.as_str()))
+                            .and_then(|r| r.get(k).cloned().flatten())
+                    })
+            };
+            let out_fn = of_base("typoutput").unwrap_or_else(|| "0".into());
+            let send_fn = of_base("typsend").unwrap_or_else(|| "0".into());
+            let category = of_base("typcategory")
                 .and_then(|c| c.chars().next())
                 .unwrap_or('U');
             let mut r = self.pg_type(
@@ -866,6 +929,12 @@ impl<'a> File<'a> {
                 Some(d.base_type.map_or(-1, typmod_of).to_string()),
             );
             r.insert("typnotnull", Some(t(d.not_null)));
+            if d.default.is_some() {
+                r.insert(
+                    "typdefaultbin",
+                    Some(crate::deparse::tree_handle("domaindefault", oid, 0)),
+                );
+            }
             out.push(r);
             out.push(self.array_of(&n, oid, &base.align));
         }
@@ -975,7 +1044,7 @@ impl<'a> File<'a> {
             let n = full(&tb.name);
             let rel = self.oid(Object::Class(n.clone()));
             for (i, c) in tb.columns.iter().enumerate() {
-                if c.default.is_some() {
+                if c.default.is_some() || c.generated.is_some() {
                     out.push(row(&[
                         (
                             "oid",
@@ -983,6 +1052,7 @@ impl<'a> File<'a> {
                         ),
                         ("adrelid", rel.to_string()),
                         ("adnum", (i + 1).to_string()),
+                        ("adbin", crate::deparse::tree_handle("attrdef", rel, i as i64 + 1)),
                     ]));
                 }
             }
@@ -1049,9 +1119,10 @@ impl<'a> File<'a> {
             let rel = self.oid(Object::Class(n.clone()));
             let schema = parts(&n).0;
             for i in self.indexes_of(tb) {
-                let kind = match (i.primary, i.exclusion, i.unique) {
+                let kind = match (i.primary, i.keyed || !i.exclusion, i.unique) {
                     (true, _, _) => 'p',
-                    (_, true, _) => 'x',
+                    (_, true, _) if i.keyed => 'u',
+                    (_, false, _) => 'x',
                     (_, _, true)
                         if self
                             .catalog
@@ -1064,10 +1135,13 @@ impl<'a> File<'a> {
                     _ => continue,
                 };
                 let index = self.oid(Object::Class(format!("{schema}.{}", i.name)));
-                out.push(self.constraint(&n, &i.name, kind, rel, index, &i.keys, false));
+                let mut r = self.constraint(&n, &i.name, kind, rel, index, &i.keys, i.deferrable);
+                r.insert("conperiod", Some(t(i.keyed && i.exclusion)));
+                out.push(r);
             }
-            for c in &tb.checks {
+            for (ci, c) in tb.checks.iter().enumerate() {
                 let mut r = self.constraint(&n, &c.name, 'c', rel, 0, &[], false);
+                r.insert("conbin", Some(crate::deparse::tree_handle("check", rel, ci as i64)));
                 r.insert("conenforced", Some(t(c.enforced)));
                 r.insert("convalidated", Some(t(c.valid)));
                 out.push(r);
@@ -1096,9 +1170,31 @@ impl<'a> File<'a> {
                             .to_string(),
                     ),
                 );
-                r.insert("confupdtype", Some("a".into()));
-                r.insert("confdeltype", Some("a".into()));
-                r.insert("confmatchtype", Some("s".into()));
+                let code = |a: &crate::catalog::Action| -> String {
+                    use crate::catalog::Action as A;
+                    match a {
+                        A::NoAction => "a",
+                        A::Restrict => "r",
+                        A::Cascade => "c",
+                        A::SetNull(_) => "n",
+                        A::SetDefault(_) => "d",
+                    }
+                    .into()
+                };
+                r.insert("confupdtype", Some(code(&f.on_update)));
+                r.insert("confdeltype", Some(code(&f.on_delete)));
+                r.insert("confmatchtype", Some(if f.full { "f" } else { "s" }.into()));
+                r.insert("condeferrable", Some(t(f.deferrable)));
+                r.insert("condeferred", Some(t(f.deferred)));
+                r.insert("conenforced", Some(t(f.enforced)));
+                r.insert("convalidated", Some(t(f.valid)));
+                r.insert("conperiod", Some(t(f.period)));
+                if let crate::catalog::Action::SetNull(c) | crate::catalog::Action::SetDefault(c) = &f.on_delete {
+                    if !c.is_empty() {
+                        let k: Vec<String> = c.iter().map(|x| (x + 1).to_string()).collect();
+                        r.insert("confdelsetcols", Some(format!("{{{}}}", k.join(","))));
+                    }
+                }
                 out.push(r);
             }
             for c in tb.columns.iter().enumerate().filter(|(_, c)| c.not_null) {
@@ -1113,8 +1209,16 @@ impl<'a> File<'a> {
         for d in &self.catalog.domains {
             let n = full(&d.name);
             let ty = self.oid(Object::Type(n.clone()));
-            for k in &d.checks {
+            if d.not_null && self.release >= 17 {
+                let own = parts(&n).1;
+                let cname = d.not_null_name.clone().unwrap_or_else(|| format!("{own}_not_null"));
+                let mut r = self.constraint(&n, &cname, 'n', 0, 0, &[], false);
+                r.insert("contypid", Some(ty.to_string()));
+                out.push(r);
+            }
+            for (ki, k) in d.checks.iter().enumerate() {
                 let mut r = self.constraint(&n, &k.name, 'c', 0, 0, &[], false);
+                r.insert("conbin", Some(crate::deparse::tree_handle("domaincheck", ty, ki as i64)));
                 r.insert("contypid", Some(ty.to_string()));
                 r.insert("convalidated", Some(t(k.valid)));
                 out.push(r);
@@ -1142,7 +1246,7 @@ impl<'a> File<'a> {
                     ("indrelid", rel.to_string()),
                     ("indnatts", all.len().to_string()),
                     ("indnkeyatts", i.keys.len().to_string()),
-                    ("indisunique", t(i.unique)),
+                    ("indisunique", t(i.unique || i.keyed)),
                     ("indnullsnotdistinct", t(!i.nulls_distinct)),
                     ("indisprimary", t(i.primary)),
                     ("indisexclusion", t(i.exclusion)),
@@ -1158,6 +1262,16 @@ impl<'a> File<'a> {
                     ("indclass", zeros(i.keys.len())),
                     ("indoption", zeros(i.keys.len())),
                 ]));
+                let ioid = self.oid(Object::Class(format!("{schema}.{}", i.name)));
+                let (exprs, pred) = crate::deparse::defs::index_has_trees(self.catalog, ioid);
+                if let Some(r) = out.last_mut() {
+                    if exprs {
+                        r.insert("indexprs", Some(crate::deparse::tree_handle("indexprs", ioid, 0)));
+                    }
+                    if pred {
+                        r.insert("indpred", Some(crate::deparse::tree_handle("indpred", ioid, 0)));
+                    }
+                }
             }
         }
         out
@@ -1343,6 +1457,9 @@ struct IndexFacts {
     exclusion: bool,
     clustered: bool,
     nulls_distinct: bool,
+    /// Whether it stands for a PRIMARY KEY or UNIQUE, WITHOUT OVERLAPS among them.
+    keyed: bool,
+    deferrable: bool,
 }
 
 /// A type's name as PostgreSQL's type reader reads it, without its modifiers.

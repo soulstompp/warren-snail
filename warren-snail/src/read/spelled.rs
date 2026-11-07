@@ -17,7 +17,7 @@ use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 use std::borrow::Cow;
 
 /// The statement with each rewrite made, one at a time until none is left.
-pub(super) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
+pub(crate) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
     at_at_spaced(sql)?;
     let lower = sql.to_ascii_lowercase();
     let mut out = Cow::Borrowed(sql);

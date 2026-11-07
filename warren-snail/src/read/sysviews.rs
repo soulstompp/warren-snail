@@ -705,14 +705,17 @@ fn inline(name: &str, args: &[Expr], release: u8) -> Result<Expr> {
             .position(|p| p == n)
             .and_then(|i| args.get(i).cloned())
     };
+    // A field of a parameter first, `($2).typtype` its relation's column, before its parameter alone
+    // is replaced: the visit reaches a parameter before the field access around it.
+    for fields in [true, false] {
     let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
         let replaced = match x {
-            Expr::Identifier(i) if i.quote_style.is_none() => arg_of(&i.value),
-            Expr::Value(v) => match &v.value {
+            Expr::Identifier(i) if i.quote_style.is_none() && !fields => arg_of(&i.value),
+            Expr::Value(v) if !fields => match &v.value {
                 Value::Placeholder(p) => arg_of(p),
                 _ => None,
             },
-            Expr::CompoundFieldAccess { root, access_chain } => {
+            Expr::CompoundFieldAccess { root, access_chain } if fields => {
                 let mut r = root.as_ref();
                 while let Expr::Nested(inner) = r {
                     r = inner;
@@ -740,6 +743,7 @@ fn inline(name: &str, args: &[Expr], release: u8) -> Result<Expr> {
         }
         ControlFlow::<()>::Continue(())
     });
+    }
     Ok(e)
 }
 
@@ -777,6 +781,13 @@ fn expression(s: &str) -> Result<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_field_of_a_row_argument_is_its_relations_column() {
+        let args = [Expr::Identifier("a".into()), Expr::Identifier("t".into())];
+        let e = inline("_pg_truetypid", &args, 18).unwrap().to_string();
+        assert!(e.contains("t.typtype") && e.contains("t.typbasetype") && e.contains("a.atttypid"), "{e}");
+    }
 
     fn tied(sql: &str) -> String {
         let parsed = crate::read::image::parse_sql(sql).unwrap();

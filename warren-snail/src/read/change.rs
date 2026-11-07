@@ -795,6 +795,7 @@ impl Snail {
         let _handed = super::handed::holding(&self.functions);
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _named = crate::oids::named(self.catalog.oids.clone());
+        let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _timing = self.timing();
         let written_out;
         let text = match params.is_empty() {

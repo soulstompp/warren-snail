@@ -133,6 +133,7 @@ pub(crate) fn strand_table(table: &Table, key: &ElementKey) -> Table {
             .iter()
             .map(|c| c.ty.default_opclass().to_string())
             .collect(),
+        params: vec![None; n],
         include: Vec::new(),
         options: Vec::new(),
         constraint: None,

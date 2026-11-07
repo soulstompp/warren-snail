@@ -2031,7 +2031,7 @@ impl Draft {
         out.push(O::Class(name.clone()));
         out.push(O::Type(name.clone()));
         out.push(O::Array(name.clone()));
-        for c in t.columns.iter().filter(|c| c.default.is_some()) {
+        for c in t.columns.iter().filter(|c| c.default.is_some() || c.generated.is_some()) {
             out.push(O::Default(name.clone(), c.name.clone()));
         }
         for c in t.columns.iter().filter(|c| c.not_null) {
@@ -4628,6 +4628,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
                     method: s.method,
                     column: l.column(),
                     opclass: o.clone(),
+                    params: s.params.get(n).cloned().flatten(),
                     include: s.include.clone(),
                     options: s.options.clone(),
                     predicate: s.predicate.clone(),
@@ -4644,6 +4645,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         s.levels = kept(&s.levels, &others);
         s.keys = kept(&s.keys, &others);
         s.opclasses = kept(&s.opclasses, &others);
+        s.params = kept(&s.params, &others);
         s.nulls_first = kept(&s.nulls_first, &others);
         s.desc = kept(&s.desc, &others);
         !others.is_empty()
@@ -4661,6 +4663,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
         desc: ordered.desc,
         keys: ordered.keys,
         opclasses: ordered.opclasses,
+        params: ordered.params,
         include: ordered.include,
         options: ordered.options,
         constraint: ordered.constraint,
@@ -4689,6 +4692,7 @@ fn finish_table(d: &Declared) -> Result<Table> {
             desc: s.desc,
             keys: s.keys,
             opclasses: s.opclasses,
+            params: s.params,
             include: s.include.clone(),
             options: s.options,
             constraint: s.constraint,

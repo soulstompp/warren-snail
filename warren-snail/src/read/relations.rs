@@ -165,6 +165,10 @@ fn catalog_value(ty: ColumnType, s: Option<&str>) -> Result<Value> {
     let Some(s) = s else {
         return Ok(Value::Null);
     };
+    // A parse tree's cell holds the name of the object it comes from, which pg_get_expr reads.
+    if let ColumnType::Internal(crate::textual::Internal::NodeTree) = ty {
+        return Ok(Value::Typed(ty, s.to_string()));
+    }
     if let ColumnType::Composed(_) = ty {
         let item = crate::composed::text_in(ty, s)?;
         return Ok(Value::Composed(
@@ -3928,11 +3932,19 @@ fn select_step(
         }
     }
     // Each column it reads is one of its FROM's, refused before any row as PostgreSQL's parser
-    // refuses one it finds none or two of.
+    // refuses one it finds none or two of. A parse tree handed to pg_get_expr is read there alone.
+    let outside_trees: Vec<usize> = p
+        .reads_but_trees()
+        .iter()
+        .filter_map(|(q, n)| match place(q, n).as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        })
+        .collect();
     for (q, n) in p.reads() {
         let found = place(&q, &n);
         if let [one] = found.as_slice() {
-            if let Some(why) = from.refused.get(one) {
+            if let Some(why) = from.refused.get(one).filter(|_| outside_trees.contains(one)) {
                 return Err(Error::new(format!(
                     "{why}, only a running server's, and a snail has no server: it is not read"
                 )));
