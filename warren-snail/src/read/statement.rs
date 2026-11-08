@@ -102,6 +102,15 @@ pub enum Statement {
         alias: String,
         items: Vec<sqlparser::ast::SelectItem>,
     },
+    /// An INSERT … ON CONFLICT: the INSERT, the name its table is read by, the order a proposed row
+    /// is looked up on (any unique one where none is named), and DO UPDATE's columns set and its
+    /// WHERE, none for DO NOTHING.
+    OnConflict {
+        insert: Box<Statement>,
+        alias: String,
+        arbiter: Option<usize>,
+        update: Option<(Vec<(usize, Fill)>, Option<String>)>,
+    },
     /// A question whose WITH holds writes: each write by the name its WITH query takes, and the
     /// question. Every write finds its rows on the statement's one snapshot, none seeing another's,
     /// the question reading that snapshot and the rows each write returns.
@@ -374,13 +383,15 @@ impl Statement {
             Statement::Session(s) => s.kind(),
             Statement::Returning { write, .. } => write.kind(),
             Statement::Writes { .. } => "SELECT",
+            Statement::OnConflict { .. } => "INSERT",
         }
     }
 
-    /// The write itself, its RETURNING taken off; any other statement as it is.
+    /// The write itself, its RETURNING and its ON CONFLICT taken off; any other statement as it is.
     pub fn written(&self) -> &Statement {
         match self {
-            Statement::Returning { write, .. } => write,
+            Statement::Returning { write, .. } => write.written(),
+            Statement::OnConflict { insert, .. } => insert,
             st => st,
         }
     }
@@ -1048,11 +1059,6 @@ fn one_table(catalog: &Catalog, t: &TableWithJoins) -> Result<usize> {
 }
 
 fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
-    if i.on.is_some() {
-        return Err(Error::new(
-            "ON CONFLICT is not written: a row's place is its key",
-        ));
-    }
     let ti = match &i.table {
         TableObject::TableName(n) => table_index(catalog, n)?,
         _ => return Err(Error::new("an INSERT names a table")),
@@ -1142,7 +1148,105 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         }
         _ => return Err(Error::new("an INSERT's rows are VALUES or a SELECT")),
     };
-    Ok(Statement::Insert { table: ti, source })
+    let st = Statement::Insert { table: ti, source };
+    let Some(on) = &i.on else {
+        return Ok(st);
+    };
+    let sqlparser::ast::OnInsert::OnConflict(c) = on else {
+        return Err(refused("ON DUPLICATE KEY UPDATE"));
+    };
+    use sqlparser::ast::{ConflictTarget, OnConflictAction};
+    let update = match &c.action {
+        OnConflictAction::DoNothing => None,
+        OnConflictAction::DoUpdate(d) => Some((
+            sets_of(table, &d.assignments)?,
+            d.selection.as_ref().map(|e| e.to_string()),
+        )),
+    };
+    let bare = table.name.rsplit('.').next().unwrap_or(&table.name);
+    // The order a proposed row is looked up on, as PostgreSQL's parser infers it: the unique one,
+    // no partial one, whose columns are the target's, or the constraint named; any unique one
+    // where DO NOTHING names none.
+    let arbiter = match &c.conflict_target {
+        None if update.is_some() => {
+            return Err(Error::new(
+                "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+            ))
+        }
+        None => None,
+        Some(ConflictTarget::Columns(cols)) => {
+            let mut want = cols
+                .iter()
+                .map(|n| column_index(table, &ObjectName(vec![ObjectNamePart::Identifier(n.clone())])))
+                .collect::<Result<Vec<_>>>()?;
+            want.sort_unstable();
+            want.dedup();
+            let found = table.orders.iter().position(|o| {
+                let mut have: Vec<usize> = o.levels.iter().map(|l| l.column()).collect();
+                have.sort_unstable();
+                o.unique && o.predicate.is_none() && have == want
+            });
+            Some(found.ok_or_else(|| {
+                Error::new(
+                    "there is no unique or exclusion constraint matching the ON CONFLICT \
+                     specification",
+                )
+            })?)
+        }
+        Some(ConflictTarget::OnConstraint(n)) => {
+            let n = object_name(n);
+            Some(
+                table
+                    .orders
+                    .iter()
+                    .position(|o| o.unique && o.name == n)
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "constraint \"{n}\" for table \"{bare}\" does not exist"
+                        ))
+                    })?,
+            )
+        }
+    };
+    let alias = match &i.table_alias {
+        Some(a) => ident(&a.alias),
+        None => bare.to_string(),
+    };
+    Ok(Statement::OnConflict {
+        insert: Box::new(st),
+        alias,
+        arbiter,
+        update,
+    })
+}
+
+/// An UPDATE's SET, each column to its DEFAULT, a literal, or an expression read on the row.
+fn sets_of(
+    table: &Table,
+    assignments: &[sqlparser::ast::Assignment],
+) -> Result<Vec<(usize, Fill)>> {
+    let mut sets: Vec<(usize, Fill)> = Vec::new();
+    for a in assignments {
+        let c = match &a.target {
+            AssignmentTarget::ColumnName(n) => column_index(table, n)?,
+            AssignmentTarget::Tuple(_) => return Err(refused("an UPDATE of a tuple")),
+        };
+        if sets.iter().any(|(s, _)| *s == c) {
+            return Err(Error::new(format!(
+                "multiple assignments to same column \"{}\"",
+                table.columns[c].name
+            )));
+        }
+        if is_default(&a.value) {
+            sets.push((c, Fill::Default));
+        } else if is_literal(&a.value) || crate::composed::constructs(table.columns[c].ty, &a.value)
+        {
+            sets.push((c, Fill::Literal(datum(&a.value, table, c)?)));
+        } else {
+            sets.push((c, Fill::Expression(a.value.to_string())));
+        }
+    }
+    Ok(sets)
 }
 
 /// The tokens of a statement, each with where it begins and ends in the text, in bytes.
@@ -1298,28 +1402,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             }
             let ti = one_table(catalog, &u.table)?;
             let table = &catalog.tables[ti];
-            let mut sets: Vec<(usize, Fill)> = Vec::new();
-            for a in &u.assignments {
-                let c = match &a.target {
-                    AssignmentTarget::ColumnName(n) => column_index(table, n)?,
-                    AssignmentTarget::Tuple(_) => return Err(refused("an UPDATE of a tuple")),
-                };
-                if sets.iter().any(|(s, _)| *s == c) {
-                    return Err(Error::new(format!(
-                        "multiple assignments to same column \"{}\"",
-                        table.columns[c].name
-                    )));
-                }
-                if is_default(&a.value) {
-                    sets.push((c, Fill::Default));
-                } else if is_literal(&a.value)
-                    || crate::composed::constructs(table.columns[c].ty, &a.value)
-                {
-                    sets.push((c, Fill::Literal(datum(&a.value, table, c)?)));
-                } else {
-                    sets.push((c, Fill::Expression(a.value.to_string())));
-                }
-            }
+            let sets = sets_of(table, &u.assignments)?;
             let set = Statement::Set {
                 table: ti,
                 find: finder(table, &u.table, u.selection.as_ref()),
@@ -1605,10 +1688,6 @@ mod tests {
             (
                 "DELETE FROM s.t USING s.u WHERE s.u.a = s.t.a",
                 "DELETE … USING",
-            ),
-            (
-                "INSERT INTO s.t (a) VALUES (1) ON CONFLICT DO NOTHING",
-                "a row's place is its key",
             ),
             (
                 "INSERT INTO s.t (a) OVERRIDING SYSTEM VALUE VALUES (1)",

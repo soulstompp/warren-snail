@@ -551,6 +551,64 @@ pub fn set_to(
     )
 }
 
+/// An expression of ON CONFLICT DO UPDATE, read on the row the table holds, by the name `by` reads
+/// it, and on the row proposed, as `excluded`.
+pub fn on_conflict(
+    table: &Table,
+    held: &Row,
+    proposed: &Row,
+    e: &sqlparser::ast::Expr,
+    by: &str,
+) -> Result<Value> {
+    // The table named with its schema reads the row held, as its own name does.
+    let mut e = e.clone();
+    let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
+        if let sqlparser::ast::Expr::CompoundIdentifier(parts) = x {
+            if let [s, t, c] = parts.as_slice() {
+                let named = format!("{}.{}", crate::catalog::ident(s), crate::catalog::ident(t));
+                if named == table.name {
+                    *x = sqlparser::ast::Expr::CompoundIdentifier(vec![
+                        sqlparser::ast::Ident::new(by),
+                        c.clone(),
+                    ]);
+                }
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    let e = &e;
+    let mut columns = Vec::new();
+    let mut row = Vec::new();
+    for (q, r) in [(by, held), ("excluded", proposed)] {
+        let r = with_virtual(table, r)?;
+        for (c, d) in table.columns.iter().zip(&r) {
+            columns.push((Some(q.to_string()), c.name.clone()));
+            row.push(value_of(d, c.ty));
+        }
+    }
+    super::pipeline::eval_on_columns(
+        e,
+        columns,
+        &row,
+        table.release,
+        &Casings::of_table(table, &[]),
+    )
+}
+
+/// A column's value set by ON CONFLICT DO UPDATE: its expression read on the row held and the row
+/// proposed, assigned to the column's type.
+pub fn on_conflict_set(
+    table: &Table,
+    held: &Row,
+    proposed: &Row,
+    c: usize,
+    e: &sqlparser::ast::Expr,
+    by: &str,
+) -> Result<Datum> {
+    let col = &table.columns[c];
+    assign_value(on_conflict(table, held, proposed, e, by)?, col.ty, &col.name)
+}
+
 /// The row with its virtual columns computed, as a read gives it.
 pub fn with_virtual(table: &Table, row: &Row) -> Result<Row> {
     let mut out = row.clone();

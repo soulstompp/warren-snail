@@ -6398,6 +6398,27 @@ pub(crate) fn eval_on(
     eval_on_as(e, None, names, row, release, casings)
 }
 
+/// An expression on one row whose columns are named each with its own qualifier.
+pub(crate) fn eval_on_columns(
+    e: &Expr,
+    columns: Vec<(Option<String>, String)>,
+    row: &[Value],
+    release: u8,
+    casings: &Casings,
+) -> Result<Value> {
+    let types = super::typed::Types::new();
+    let frame = Frame {
+        columns,
+        params: &[],
+        release,
+        casings,
+        types: &types,
+        now: crate::scalars::transaction_clock(),
+        subqueries: None,
+    };
+    eval(e, row, &frame, &computed_none())
+}
+
 /// An expression on one row, its columns named as `by` names them, or by their names alone.
 pub(crate) fn eval_on_as(
     e: &Expr,

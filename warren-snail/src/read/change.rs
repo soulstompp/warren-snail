@@ -1338,51 +1338,25 @@ impl Snail {
     ) -> Result<bool> {
         Ok(match st {
             Statement::Insert { table, source } => {
-                let rows = match (source, found.as_ref()) {
-                    (_, Some(rows)) => rows.clone(),
-                    (Source::Values(rows), None) => {
-                        let given = rows
-                            .into_iter()
-                            .map(|r| r.into_iter().map(Fill::Literal).collect())
-                            .collect();
-                        self.filled(table, given)?
-                    }
-                    (Source::Filled(rows), None) => self.filled(table, rows)?,
-                    (Source::Select { question, fill }, None) => {
-                        let (batch, _) = self.answer(&question, None)?;
-                        let fills: Vec<(usize, usize)> = fill
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(c, f)| match f {
-                                Fill::Answer(i) => Some((c, *i)),
-                                _ => None,
-                            })
-                            .collect();
-                        let types =
-                            assigned_types(&self.catalog, &question, &batch, table, &fills)?;
-                        let t = &self.catalog.tables[table];
-                        let mut given = Vec::new();
-                        for a in rows_of(&batch)? {
-                            let mut row = Vec::with_capacity(fill.len());
-                            for (col, f) in t.columns.iter().zip(&fill) {
-                                row.push(match f {
-                                    Fill::Answer(i) => Fill::Literal(fill::assign(
-                                        a[*i].clone(),
-                                        types[*i],
-                                        col.ty,
-                                        &col.name,
-                                    )?),
-                                    other => other.clone(),
-                                });
-                            }
-                            given.push(row);
-                        }
-                        self.filled(table, given)?
-                    }
-                };
-                *found = Some(rows.clone());
+                let rows = self.proposed(table, source, found)?;
                 done.rows = rows.len() as u64;
                 let changes: Vec<Change> = rows.into_iter().map(Change::Insert).collect();
+                self.keep(&changes);
+                (done.rewritten, done.orders) = self.put(table, changes)?;
+                done.rows > 0
+            }
+            Statement::OnConflict {
+                insert,
+                alias,
+                arbiter,
+                update,
+            } => {
+                let Statement::Insert { table, source } = *insert else {
+                    unreachable!("ON CONFLICT is an INSERT's")
+                };
+                let rows = self.proposed(table, source, found)?;
+                let changes = self.conflicted(table, &alias, arbiter, update.as_ref(), rows)?;
+                done.rows = changes.len() as u64;
                 self.keep(&changes);
                 (done.rewritten, done.orders) = self.put(table, changes)?;
                 done.rows > 0
@@ -1528,6 +1502,167 @@ impl Snail {
         }
     }
 
+    /// The rows an INSERT proposes: its VALUES or its question's rows, each column filled, kept
+    /// where it runs again.
+    fn proposed(
+        &mut self,
+        table: usize,
+        source: Source,
+        found: &mut Option<Vec<Row>>,
+    ) -> Result<Vec<Row>> {
+        let rows = match (source, found.as_ref()) {
+            (_, Some(rows)) => rows.clone(),
+            (Source::Values(rows), None) => {
+                let given = rows
+                    .into_iter()
+                    .map(|r| r.into_iter().map(Fill::Literal).collect())
+                    .collect();
+                self.filled(table, given)?
+            }
+            (Source::Filled(rows), None) => self.filled(table, rows)?,
+            (Source::Select { question, fill }, None) => {
+                let (batch, _) = self.answer(&question, None)?;
+                let fills: Vec<(usize, usize)> = fill
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(c, f)| match f {
+                        Fill::Answer(i) => Some((c, *i)),
+                        _ => None,
+                    })
+                    .collect();
+                let types = assigned_types(&self.catalog, &question, &batch, table, &fills)?;
+                let t = &self.catalog.tables[table];
+                let mut given = Vec::new();
+                for a in rows_of(&batch)? {
+                    let mut row = Vec::with_capacity(fill.len());
+                    for (col, f) in t.columns.iter().zip(&fill) {
+                        row.push(match f {
+                            Fill::Answer(i) => Fill::Literal(fill::assign(
+                                a[*i].clone(),
+                                types[*i],
+                                col.ty,
+                                &col.name,
+                            )?),
+                            other => other.clone(),
+                        });
+                    }
+                    given.push(row);
+                }
+                self.filled(table, given)?
+            }
+        };
+        *found = Some(rows.clone());
+        Ok(rows)
+    }
+
+    /// An INSERT … ON CONFLICT's changes, as PostgreSQL makes them row by row: a proposed row
+    /// looked up on its arbiter among the rows the statement wrote and the rows held; inserted where
+    /// none holds its key; where one does, passed over by DO NOTHING, or set by DO UPDATE over the
+    /// row held and EXCLUDED, the proposed one, where its WHERE holds. A row the statement wrote
+    /// met again by DO UPDATE is refused.
+    fn conflicted(
+        &mut self,
+        table: usize,
+        alias: &str,
+        arbiter: Option<usize>,
+        update: Option<&(Vec<(usize, Fill)>, Option<String>)>,
+        rows: Vec<Row>,
+    ) -> Result<Vec<Change>> {
+        let t = self.catalog.tables[table].clone();
+        let orders: Vec<usize> = match arbiter {
+            Some(o) => vec![o],
+            None => (0..t.orders.len())
+                .filter(|&o| t.orders[o].unique && t.orders[o].predicate.is_none())
+                .collect(),
+        };
+        // A key of an order, none where it holds a NULL its order keeps distinct.
+        let key = |r: &Row, o: &Order| -> Option<Vec<Datum>> {
+            let k: Vec<Datum> = o.levels.iter().map(|l| r[l.column()].clone()).collect();
+            (!o.nulls_distinct || !k.iter().any(|d| matches!(d, Datum::Null))).then_some(k)
+        };
+        let mut sets: Vec<(usize, Fill, Option<sqlparser::ast::Expr>)> = Vec::new();
+        let mut selection = None;
+        if let Some((given, w)) = update {
+            for (c, f) in given {
+                let col = &t.columns[*c];
+                let always = col.identity.as_ref().is_some_and(|i| i.always);
+                if col.generated.is_some() || always {
+                    return Err(Error::new(format!(
+                        "column \"{}\" can only be updated to DEFAULT",
+                        col.name
+                    )));
+                }
+                let e = match f {
+                    Fill::Expression(text) => Some(super::image::parse_expr(text)?),
+                    Fill::Literal(_) => None,
+                    _ => return Err(Error::new("DEFAULT in ON CONFLICT DO UPDATE is not written")),
+                };
+                sets.push((*c, f.clone(), e));
+            }
+            selection = w.as_deref().map(super::image::parse_expr).transpose()?;
+        }
+        let mut changes = Vec::new();
+        let mut written: Vec<Row> = Vec::new();
+        let mut replaced: Vec<Row> = Vec::new();
+        for r in rows {
+            let mut hit: Option<Option<Row>> = None;
+            for &oi in &orders {
+                let o = &t.orders[oi];
+                let Some(k) = key(&r, o) else {
+                    continue;
+                };
+                if written.iter().any(|w| key(w, o).as_ref() == Some(&k)) {
+                    hit = Some(None);
+                    break;
+                }
+                let columns: Vec<usize> = o.levels.iter().map(|l| l.column()).collect();
+                let held = self.rows_where(table, &columns, &k, false)?;
+                if let Some(h) = held.into_iter().find(|h| !replaced.contains(h)) {
+                    hit = Some(Some(h));
+                    break;
+                }
+            }
+            match (hit, update) {
+                (None, _) => {
+                    written.push(r.clone());
+                    changes.push(Change::Insert(r));
+                }
+                (Some(_), None) => {}
+                (Some(None), Some(_)) => {
+                    return Err(Error::new(
+                        "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                    ))
+                }
+                (Some(Some(h)), Some(_)) => {
+                    if let Some(w) = &selection {
+                        if !matches!(
+                            fill::on_conflict(&t, &h, &r, w, alias)?,
+                            super::Value::Bool(true)
+                        ) {
+                            continue;
+                        }
+                    }
+                    let mut n = h.clone();
+                    for (c, f, e) in &sets {
+                        n[*c] = match (f, e) {
+                            (Fill::Literal(d), _) => d.clone(),
+                            (_, Some(e)) => fill::on_conflict_set(&t, &h, &r, *c, e, alias)?,
+                            _ => unreachable!("a value or an expression"),
+                        };
+                    }
+                    fill::generate(&t, &mut n)?;
+                    fill::check_domains(&self.catalog.domains, &t, &n)?;
+                    fill::check(&t, &n)?;
+                    fill::without_overlaps(&t, &n)?;
+                    replaced.push(h.clone());
+                    written.push(n.clone());
+                    changes.push(Change::Replace(h, n));
+                }
+            }
+        }
+        Ok(changes)
+    }
+
     /// A write's changes applied, or held unapplied for a write inside WITH until every write of
     /// its statement has found its rows.
     fn put(&mut self, table: usize, changes: Vec<Change>) -> Result<(u64, u64)> {
@@ -1664,12 +1799,12 @@ impl Snail {
         let (Statement::Insert { table, .. }
         | Statement::Set { table, .. }
         | Statement::Update { table, .. }
-        | Statement::Delete { table, .. }) = write
+        | Statement::Delete { table, .. }) = write.written()
         else {
             unreachable!("a write returns rows")
         };
         let t = &self.catalog.tables[*table];
-        let deleting = matches!(write, Statement::Delete { .. });
+        let deleting = matches!(write.written(), Statement::Delete { .. });
         let mut fields: Vec<(String, ColumnType)> = Vec::new();
         for side in [None, Some("old"), Some("new")] {
             for c in &t.columns {

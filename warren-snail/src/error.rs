@@ -117,6 +117,15 @@ const SAID: &[(Words, &str)] = &[
     (Words::Is("cannot truncate a table referenced in a foreign key constraint"), "0A000"),
     (Words::Starts("nondeterministic collations are not supported for "), "0A000"),
     (Words::Holds("WITH query \"", "\" does not have a RETURNING clause"), "0A000"),
+    (
+        Words::Is("there is no unique or exclusion constraint matching the ON CONFLICT specification"),
+        "42P10",
+    ),
+    (
+        Words::Is("ON CONFLICT DO UPDATE requires inference specification or constraint name"),
+        "42601",
+    ),
+    (Words::Holds("constraint \"", "\" for table \""), "42704"),
     (Words::Starts("sql parser error: "), "42601"),
 ];
 

@@ -489,3 +489,99 @@ fn a_write_returns_rows_of_what_it_changed_its_old_and_new_among_them() {
         ["t|f|f|t"]
     );
 }
+
+#[test]
+fn on_conflict_passes_over_or_sets_the_row_its_key_meets() {
+    let mut w = snail("conflict");
+    run(
+        &mut w,
+        "CREATE TABLE s.w (k integer NOT NULL, a integer, b text, CONSTRAINT \"w_pkey \" PRIMARY \
+         KEY (k))",
+    );
+    run(&mut w, "INSERT INTO s.w VALUES (1, 0, 'x'), (2, 40, 'y')");
+    // MySQL's REPLACE as the speller writes it: a row's two counts where it replaced one.
+    let replace = |k: i32| {
+        format!(
+            "WITH replaced AS (INSERT INTO s.w (k, a, b) VALUES ({k}, 5, 'r') ON CONFLICT (\"k\") \
+             DO UPDATE SET \"k\" = EXCLUDED.\"k\", a = EXCLUDED.a, b = EXCLUDED.b RETURNING \
+             (old.\"k\" IS NOT NULL) AS deleted) SELECT count(*) + count(*) FILTER (WHERE deleted) \
+             AS affected FROM replaced"
+        )
+    };
+    for (sql, want) in [
+        (
+            "INSERT INTO s.w (k, a) VALUES (1, 100) ON CONFLICT (k) DO UPDATE SET a = EXCLUDED.a + \
+             s.w.a RETURNING k, a, old.a"
+                .to_string(),
+            vec!["1|100|0"],
+        ),
+        (
+            "INSERT INTO s.w (k, a) VALUES (1, 100) ON CONFLICT (k) DO UPDATE SET a = 0 WHERE s.w.a \
+             > 1000 RETURNING k"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "INSERT INTO s.w (k, a) VALUES (1, 100), (8, 80) ON CONFLICT (k) DO NOTHING RETURNING k"
+                .to_string(),
+            vec!["8"],
+        ),
+        (
+            "INSERT INTO s.w (k, a) VALUES (9, 1), (9, 2) ON CONFLICT (k) DO NOTHING RETURNING k, a"
+                .to_string(),
+            vec!["9|1"],
+        ),
+        (
+            "INSERT INTO s.w (k, a) VALUES (11, 1) ON CONFLICT DO NOTHING RETURNING k".to_string(),
+            vec!["11"],
+        ),
+        (
+            "INSERT INTO s.w AS x (k, a) VALUES (11, 5), (12, 6) ON CONFLICT (k) DO UPDATE SET a = \
+             x.a + EXCLUDED.a WHERE x.a < 3 RETURNING k, a, old.a, new.a"
+                .to_string(),
+            vec!["11|6|1|6", "12|6|NULL|6"],
+        ),
+        (replace(2), vec!["2"]),
+        (replace(20), vec!["1"]),
+    ] {
+        assert_eq!(rows(&mut w, &sql), want, "{sql}");
+    }
+    run(&mut w, "INSERT INTO s.w (k, a) VALUES (1, 7) ON CONFLICT ON CONSTRAINT \"w_pkey \" DO NOTHING");
+    for (sql, code, words) in [
+        (
+            "INSERT INTO s.w (k, a) VALUES (10, 1), (10, 2) ON CONFLICT (k) DO UPDATE SET a = \
+             EXCLUDED.a",
+            "21000",
+            "ON CONFLICT DO UPDATE command cannot affect row a second time",
+        ),
+        (
+            "INSERT INTO s.w (k, a) VALUES (13, 1) ON CONFLICT (a) DO NOTHING",
+            "42P10",
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        ),
+        (
+            "INSERT INTO s.w (k, a) VALUES (13, 1) ON CONFLICT DO UPDATE SET a = 2",
+            "42601",
+            "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+        ),
+        (
+            "INSERT INTO s.w (k, a) VALUES (13, 1) ON CONFLICT ON CONSTRAINT nosuch DO NOTHING",
+            "42704",
+            "constraint \"nosuch\" for table \"w\" does not exist",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
+    assert_eq!(
+        rows(&mut w, "SELECT k, a, b FROM s.w ORDER BY k"),
+        [
+            "1|100|x",
+            "2|5|r",
+            "8|80|NULL",
+            "9|1|NULL",
+            "11|6|NULL",
+            "12|6|NULL",
+            "20|5|r"
+        ]
+    );
+}
