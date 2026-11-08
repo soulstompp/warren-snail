@@ -585,3 +585,36 @@ fn on_conflict_passes_over_or_sets_the_row_its_key_meets() {
         ]
     );
 }
+
+#[test]
+fn update_from_and_delete_using_change_each_row_a_join_meets_once() {
+    let mut w = snail("joined");
+    run(&mut w, "CREATE TABLE s.t (k integer NOT NULL, a integer, PRIMARY KEY (k))");
+    run(&mut w, "CREATE TABLE s.u (k integer NOT NULL, y integer, PRIMARY KEY (k))");
+    run(&mut w, "CREATE TABLE s.v (id integer NOT NULL, t_k integer, PRIMARY KEY (id))");
+    run(&mut w, "INSERT INTO s.t VALUES (1, NULL), (2, 5), (3, 1), (4, 2)");
+    run(&mut w, "INSERT INTO s.u VALUES (1, 100), (2, 200)");
+    run(&mut w, "INSERT INTO s.v VALUES (1, 1), (2, 1), (3, 3)");
+    run(&mut w, "UPDATE s.t AS a SET a = b.y FROM s.u AS b WHERE b.k = a.k");
+    assert_eq!(
+        rows(&mut w, "SELECT k, a FROM s.t ORDER BY k"),
+        ["1|100", "2|200", "3|1", "4|2"]
+    );
+    for (sql, want) in [
+        // Two rows of v meet k 1: it is set once.
+        (
+            "UPDATE s.t AS a SET a = 7 FROM s.v AS v WHERE v.t_k = a.k RETURNING a.k",
+            vec!["1", "3"],
+        ),
+        (
+            "WITH updated AS (UPDATE s.t AS a SET a = b.y FROM s.u AS b WHERE b.k = a.k RETURNING \
+             record_image_ne(ROW(old.a), ROW(new.a)) AS changed) SELECT count(*) FILTER (WHERE \
+             changed) AS changed, count(*) AS matched FROM updated",
+            vec!["1|2"],
+        ),
+        ("DELETE FROM s.t AS a USING s.v AS v WHERE v.t_k = a.k RETURNING a.k", vec!["1", "3"]),
+        ("SELECT k, a FROM s.t ORDER BY k", vec!["2|200", "4|2"]),
+    ] {
+        assert_eq!(rows(&mut w, sql), want, "{sql}");
+    }
+}

@@ -1047,6 +1047,34 @@ fn read_as(t: &TableWithJoins) -> String {
     }
 }
 
+/// The question that finds a write's rows joined with the relations its FROM or USING lists: every
+/// column the table stores, read by the name it reads the table by, then each value `asked`.
+fn joined_finder(
+    table: &Table,
+    relation: &TableWithJoins,
+    from: &[TableWithJoins],
+    asked: &[String],
+    selection: Option<&Expr>,
+) -> String {
+    let by = format!("\"{}\"", read_as(relation).replace('"', "\"\""));
+    let columns = table
+        .columns
+        .iter()
+        .filter(|c| !c.is_virtual())
+        .map(|c| format!("{by}.\"{}\"", c.name.replace('"', "\"\"")))
+        .chain(asked.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let relations = std::iter::once(relation.to_string())
+        .chain(from.iter().map(|f| f.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match selection {
+        Some(w) => format!("SELECT {columns} FROM {relations} WHERE {w}"),
+        None => format!("SELECT {columns} FROM {relations}"),
+    }
+}
+
 /// The one table a statement names, read alone.
 fn one_table(catalog: &Catalog, t: &TableWithJoins) -> Result<usize> {
     if !t.joins.is_empty() {
@@ -1394,26 +1422,37 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             Ok(returning(insert(catalog, i)?, alias, &i.returning))
         }
         Sql::Update(u) => {
-            if u.from.is_some() {
-                return Err(refused("UPDATE … FROM"));
-            }
             if !u.order_by.is_empty() || u.limit.is_some() {
                 return Err(refused("an UPDATE with ORDER BY or LIMIT"));
             }
             let ti = one_table(catalog, &u.table)?;
             let table = &catalog.tables[ti];
-            let sets = sets_of(table, &u.assignments)?;
+            let mut sets = sets_of(table, &u.assignments)?;
+            let find = match &u.from {
+                None => finder(table, &u.table, u.selection.as_ref()),
+                // Joined with its FROM: each expression set read on the joined row, an answer of
+                // the question that finds the rows.
+                Some(from) => {
+                    let (sqlparser::ast::UpdateTableFromKind::BeforeSet(from)
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(from)) = from;
+                    let mut asked = Vec::new();
+                    for (_, f) in sets.iter_mut() {
+                        if let Fill::Expression(e) = f {
+                            asked.push(format!("({e})"));
+                            *f = Fill::Answer(asked.len() - 1);
+                        }
+                    }
+                    joined_finder(table, &u.table, from, &asked, u.selection.as_ref())
+                }
+            };
             let set = Statement::Set {
                 table: ti,
-                find: finder(table, &u.table, u.selection.as_ref()),
+                find,
                 sets,
             };
             Ok(returning(set, read_as(&u.table), &u.returning))
         }
         Sql::Delete(d) => {
-            if d.using.is_some() {
-                return Err(refused("DELETE … USING"));
-            }
             if !d.tables.is_empty() || !d.order_by.is_empty() || d.limit.is_some() {
                 return Err(refused(
                     "a DELETE of several tables, or with ORDER BY or LIMIT",
@@ -1427,10 +1466,13 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                 _ => return Err(Error::new("a DELETE names one table")),
             };
             let ti = one_table(catalog, t)?;
-            let delete = Statement::Delete {
-                table: ti,
-                find: finder(&catalog.tables[ti], t, d.selection.as_ref()),
+            let find = match &d.using {
+                None => finder(&catalog.tables[ti], t, d.selection.as_ref()),
+                Some(using) => {
+                    joined_finder(&catalog.tables[ti], t, using, &[], d.selection.as_ref())
+                }
             };
+            let delete = Statement::Delete { table: ti, find };
             Ok(returning(delete, read_as(t), &d.returning))
         }
         // A WITH holding writes: each read as a statement of its own.
@@ -1681,14 +1723,6 @@ mod tests {
     fn what_is_not_written_is_refused_with_its_reason() {
         let c = catalog();
         for (sql, why) in [
-            (
-                "UPDATE s.t SET b = 'z' FROM s.u WHERE s.u.a = s.t.a",
-                "UPDATE … FROM",
-            ),
-            (
-                "DELETE FROM s.t USING s.u WHERE s.u.a = s.t.a",
-                "DELETE … USING",
-            ),
             (
                 "INSERT INTO s.t (a) OVERRIDING SYSTEM VALUE VALUES (1)",
                 "OVERRIDING",

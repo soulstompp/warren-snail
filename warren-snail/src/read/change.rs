@@ -1378,7 +1378,13 @@ impl Snail {
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
                 let t = &self.catalog.tables[table];
-                let old = self.kept_to(table, found_rows(t, &batch)?, found)?;
+                // A row that USING meets more than once is deleted once.
+                let mut seen = std::collections::HashSet::new();
+                let once: Vec<Row> = found_rows(t, &batch)?
+                    .into_iter()
+                    .filter(|r| seen.insert(r.clone()))
+                    .collect();
+                let old = self.kept_to(table, once, found)?;
                 done.rows = old.len() as u64;
                 let changes: Vec<Change> = old.into_iter().map(Change::Delete).collect();
                 self.keep(&changes);
@@ -1459,7 +1465,29 @@ impl Snail {
             }
         }
         let (batch, _) = self.answer(&find, None)?;
-        let old = self.kept_to(table, found_rows(&t, &batch)?, found)?;
+        // Under FROM the values set are the answer's last columns, each row's paired with it; a
+        // row the join meets more than once changed once, by the first values it meets.
+        let stored = t.columns.iter().filter(|c| !c.is_virtual()).count();
+        let (target, asked) = match batch.num_columns() > stored {
+            true => {
+                let n = batch.num_columns();
+                let types = answer_types(&batch)?[stored..].to_vec();
+                let values = rows_of(&batch.project(&(stored..n).collect::<Vec<_>>())?)?;
+                (batch.project(&(0..stored).collect::<Vec<_>>())?, Some((types, values)))
+            }
+            false => (batch, None),
+        };
+        let mut paired: std::collections::HashMap<Row, Vec<Datum>> = Default::default();
+        let mut once = Vec::new();
+        for (i, r) in found_rows(&t, &target)?.into_iter().enumerate() {
+            if paired.contains_key(&r) {
+                continue;
+            }
+            let values = asked.as_ref().map(|(_, v)| v[i].clone()).unwrap_or_default();
+            paired.insert(r.clone(), values);
+            once.push(r);
+        }
+        let old = self.kept_to(table, once, found)?;
         done.rows = old.len() as u64;
         let defaults: Vec<usize> = sets
             .iter()
@@ -1480,6 +1508,11 @@ impl Snail {
                             .expect("an expression")
                             .1;
                         fill::set_to(&t, &o, *c, e, &by)?
+                    }
+                    Fill::Answer(k) => {
+                        let (types, _) = asked.as_ref().expect("values asked");
+                        let col = &t.columns[*c];
+                        fill::assign(paired[&o][*k].clone(), types[*k], col.ty, &col.name)?
                     }
                     _ => self.default_of(&t, *c, &mut drawn)?,
                 };
