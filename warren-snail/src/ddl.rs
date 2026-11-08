@@ -5375,13 +5375,60 @@ fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
         if a.name.is_some() {
             return Err(Error::new(format!("{name}: named arguments are not read")));
         }
+        if a.mode.is_some() || a.default_expr.is_some() {
+            return Err(Error::new(format!(
+                "{name}: an argument's mode or DEFAULT is not read"
+            )));
+        }
         args.push(held_type(&a.data_type).map_err(|e| Error::new(format!("{name}: {e}")))?);
     }
+    if f.temporary
+        || f.or_alter
+        || f.security.is_some()
+        || !f.set_params.is_empty()
+        || f.using.is_some()
+        || f.determinism_specifier.is_some()
+        || f.options.is_some()
+        || f.remote_connection.is_some()
+    {
+        return Err(Error::new(format!(
+            "{name}: only its arguments, RETURNS, LANGUAGE, its volatility, STRICT, PARALLEL and its body are read"
+        )));
+    }
+    let returns = match &f.return_type {
+        Some(sqlparser::ast::FunctionReturnType::DataType(dt)) => {
+            held_type(dt).map_err(|e| Error::new(format!("{name}: RETURNS {e}")))?
+        }
+        Some(sqlparser::ast::FunctionReturnType::SetOf(_)) => {
+            return Err(Error::new(format!("{name}: RETURNS SETOF is not read")))
+        }
+        None => return Err(Error::new(format!("{name}: function result type must be specified"))),
+    };
+    let volatility = match f.behavior {
+        Some(sqlparser::ast::FunctionBehavior::Immutable) => 'i',
+        Some(sqlparser::ast::FunctionBehavior::Stable) => 's',
+        Some(sqlparser::ast::FunctionBehavior::Volatile) | None => 'v',
+    };
+    let strict = matches!(
+        f.called_on_null,
+        Some(
+            sqlparser::ast::FunctionCalledOnNull::ReturnsNullOnNullInput
+                | sqlparser::ast::FunctionCalledOnNull::Strict
+        )
+    );
+    let parallel = match f.parallel {
+        Some(sqlparser::ast::FunctionParallel::Safe) => 's',
+        Some(sqlparser::ast::FunctionParallel::Restricted) => 'r',
+        Some(sqlparser::ast::FunctionParallel::Unsafe) | None => 'u',
+    };
     let text = match &f.function_body {
-        Some(CreateFunctionBody::AsBeforeOptions {
-            body: Expr::Value(v),
-            ..
-        }) => match &v.value {
+        Some(
+            CreateFunctionBody::AsBeforeOptions {
+                body: Expr::Value(v),
+                ..
+            }
+            | CreateFunctionBody::AsAfterOptions(Expr::Value(v)),
+        ) => match &v.value {
             Value::DollarQuotedString(s) => s.value.clone(),
             Value::SingleQuotedString(s) => s.clone(),
             _ => String::new(),
@@ -5415,7 +5462,16 @@ fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
         },
         _ => return Err(Error::new(format!("{name}: its body is not one SELECT"))),
     };
-    Ok(Function { name, args, body })
+    Ok(Function {
+        name,
+        args,
+        body,
+        returns,
+        volatility,
+        strict,
+        parallel,
+        source: text,
+    })
 }
 
 /// Reads a DDL a statement at a time. `strict` stops at the first statement refused, as a file's

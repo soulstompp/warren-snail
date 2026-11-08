@@ -8,6 +8,7 @@
 pub(crate) mod analyze;
 pub(crate) mod cat;
 pub(crate) mod defs;
+pub(crate) mod funcs;
 pub(crate) mod print;
 pub(crate) mod query;
 pub(crate) mod viewdef;
@@ -60,7 +61,7 @@ pub(crate) fn is_deparser(name: &str) -> bool {
     matches!(
         name,
         "pg_get_expr" | "pg_get_constraintdef" | "pg_get_indexdef" | "pg_get_viewdef" | "pg_get_ruledef"
-    )
+    ) || funcs::is_function_printer(name)
 }
 
 /// What a deparser returns.
@@ -68,7 +69,12 @@ pub(crate) fn typed(name: &str) -> Option<crate::catalog::ColumnType> {
     is_deparser(name).then_some(crate::catalog::ColumnType::Text(None))
 }
 
+/// An OID as an argument gives it: an oid's or a reg* value's own, or a number written out.
 fn oid_of(v: &Value) -> Option<u32> {
+    use crate::catalog::ColumnType as T;
+    if let Value::Scalar(ty @ (T::Oid | T::Reg(..)), k) = v {
+        return u32::try_from(crate::scalars::raw_of_key(*ty, *k)).ok();
+    }
     let t = v.text()?;
     t.parse::<i64>().ok().and_then(|n| u32::try_from(n).ok())
 }
@@ -92,6 +98,11 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     let catalog = held()?;
     let cat = Cat::of(&catalog);
     let text = match name {
+        _ if funcs::is_function_printer(name) => {
+            let oid = args.first().and_then(oid_of).unwrap_or(0);
+            let nth = args.get(1).and_then(Value::text).and_then(|s| s.parse::<i64>().ok());
+            funcs::printed(&cat, name, oid, nth)?
+        }
         "pg_get_expr" => {
             let tree = match args.first() {
                 Some(Value::Typed(_, s)) => s.clone(),

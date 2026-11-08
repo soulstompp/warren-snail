@@ -1,7 +1,8 @@
 //! The deparsers over a snail's catalog, each printing as PostgreSQL 18.6 prints the same object:
 //! pg_get_expr over a DEFAULT, a generation, a CHECK and an index's trees, pg_get_constraintdef and
 //! pg_get_indexdef, plain and pretty; pg_get_viewdef by OID and by name, plain, pretty and unwrapped;
-//! pg_get_ruledef of a view's rule and of a built-in one; a parse tree's column read only through
+//! pg_get_ruledef of a view's rule and of a built-in one; the pg_get_function_* functions of the file's
+//! functions, a range's constructors and built-ins; a parse tree's column read only through
 //! pg_get_expr. Every expected string was printed by 18.6 after the same DDL.
 
 mod weather;
@@ -319,5 +320,56 @@ fn a_views_rule_prints_as_pg_get_ruledef_prints_it_and_a_built_in_rule_is_carrie
                 "CREATE RULE pg_settings_n AS\n    ON UPDATE TO pg_settings DO INSTEAD NOTHING;",
             ]),
         ]
+    );
+}
+
+const FUNCTIONS: &str = "CREATE FUNCTION s.half(numeric) RETURNS numeric LANGUAGE sql STABLE STRICT \
+     PARALLEL RESTRICTED AS $$SELECT $1 / 2$$; \
+     CREATE FUNCTION s.quoted(text) RETURNS text LANGUAGE sql IMMUTABLE RETURNS NULL ON NULL INPUT \
+     AS 'SELECT $1 || ''$function$'''; \
+     CREATE TYPE s.fr AS RANGE (subtype = float8);";
+
+#[test]
+fn a_function_and_a_ranges_constructors_print_as_pg_get_functiondef_prints_them() {
+    let path = tmp("dep-functions.snail");
+    let catalog = Catalog::parse(FUNCTIONS).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    let mut snail = Snail::open(&path).unwrap();
+    let got = rows(
+        &mut snail,
+        "SELECT p.proname::text, pg_get_function_identity_arguments(p.oid), pg_get_function_result(p.oid), \
+         pg_get_functiondef(p.oid), p.prosrc, p.provolatile::text, p.proisstrict::text, \
+         p.proparallel::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 's' ORDER BY p.oid",
+    );
+    let f = |name: &str, args: &str, ret: &str, def: &str, src: &str, v: &str, strict: &str, par: &str| {
+        s(&[name, args, ret, def, src, v, strict, par])
+    };
+    assert_eq!(
+        got,
+        vec![
+            f("half", "numeric", "numeric", "CREATE OR REPLACE FUNCTION s.half(numeric)\n RETURNS numeric\n LANGUAGE sql\n STABLE PARALLEL RESTRICTED STRICT\nAS $function$SELECT $1 / 2$function$\n", "SELECT $1 / 2", "s", "true", "r"),
+            f("quoted", "text", "text", "CREATE OR REPLACE FUNCTION s.quoted(text)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE STRICT\nAS $functionx$SELECT $1 || '$function$'$functionx$\n", "SELECT $1 || '$function$'", "i", "true", "u"),
+            f("fr", "double precision, double precision", "s.fr", "CREATE OR REPLACE FUNCTION s.fr(double precision, double precision)\n RETURNS s.fr\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE\nAS $function$range_constructor2$function$\n", "range_constructor2", "i", "false", "s"),
+            f("fr", "double precision, double precision, text", "s.fr", "CREATE OR REPLACE FUNCTION s.fr(double precision, double precision, text)\n RETURNS s.fr\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE\nAS $function$range_constructor3$function$\n", "range_constructor3", "i", "false", "s"),
+            f("fr_multirange", "", "s.fr_multirange", "CREATE OR REPLACE FUNCTION s.fr_multirange()\n RETURNS s.fr_multirange\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$multirange_constructor0$function$\n", "multirange_constructor0", "i", "true", "s"),
+            f("fr_multirange", "s.fr", "s.fr_multirange", "CREATE OR REPLACE FUNCTION s.fr_multirange(s.fr)\n RETURNS s.fr_multirange\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$multirange_constructor1$function$\n", "multirange_constructor1", "i", "true", "s"),
+            f("fr_multirange", "VARIADIC s.fr[]", "s.fr_multirange", "CREATE OR REPLACE FUNCTION s.fr_multirange(VARIADIC s.fr[])\n RETURNS s.fr_multirange\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$multirange_constructor2$function$\n", "multirange_constructor2", "i", "true", "s"),
+        ]
+    );
+    let got = rows(
+        &mut snail,
+        "SELECT pg_get_function_arguments('make_interval'::regproc), \
+         pg_get_function_arg_default('make_interval'::regproc, 6), pg_get_functiondef('int4abs'::regproc), \
+         (SELECT pg_get_function_sqlbody(p.oid) FROM pg_proc p WHERE p.proname = 'timedate_pl')",
+    );
+    assert_eq!(
+        got,
+        vec![s(&[
+            "years integer DEFAULT 0, months integer DEFAULT 0, weeks integer DEFAULT 0, days integer DEFAULT 0, hours integer DEFAULT 0, mins integer DEFAULT 0, secs double precision DEFAULT 0.0",
+            "0",
+            "CREATE OR REPLACE FUNCTION pg_catalog.int4abs(integer)\n RETURNS integer\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$int4abs$function$\n",
+            "RETURN ($2 + $1)",
+        ])]
     );
 }

@@ -2041,6 +2041,16 @@ pub struct Function {
     pub name: String,
     pub args: Vec<ColumnType>,
     pub body: Expr,
+    /// What it returns, as RETURNS declares it.
+    pub returns: ColumnType,
+    /// How its answer may change, as pg_proc's provolatile says it: i, s or v.
+    pub volatility: char,
+    /// Whether it answers NULL for a NULL argument without being called (STRICT).
+    pub strict: bool,
+    /// Whether it may run in a parallel worker, as pg_proc's proparallel says it: s, r or u.
+    pub parallel: char,
+    /// Its body's text as written, which pg_proc's prosrc holds.
+    pub source: String,
 }
 
 #[derive(Clone, Debug)]

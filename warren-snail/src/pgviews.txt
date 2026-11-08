@@ -1,3 +1,703 @@
+= fnargs 1177
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 1179
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 1180
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 1268
+14-19	str text, strict boolean DEFAULT true
+= fnargs 2023
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 2030
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 2096
+14-18	pid integer, timeout bigint DEFAULT 0
+19	pid integer, timeout bigint DEFAULT '0'::bigint
+= fnargs 2172
+14	label text, fast boolean DEFAULT false, exclusive boolean DEFAULT true
+15-19	label text, fast boolean DEFAULT false
+= fnargs 2307
+17-19	target text DEFAULT NULL::text
+= fnargs 2739
+14	exclusive boolean, wait_for_archive boolean DEFAULT true, OUT lsn pg_lsn, OUT labelfile text, OUT spcmapfile text
+15-19	wait_for_archive boolean DEFAULT true, OUT lsn pg_lsn, OUT labelfile text, OUT spcmapfile text
+= fnargs 3261
+18-19	target json, strip_in_arrays boolean DEFAULT false
+= fnargs 3262
+18-19	target jsonb, strip_in_arrays boolean DEFAULT false
+= fnargs 3305
+14-19	jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean DEFAULT true
+= fnargs 3436
+14-19	wait boolean DEFAULT true, wait_seconds integer DEFAULT 60
+= fnargs 3464
+14-18	years integer DEFAULT 0, months integer DEFAULT 0, weeks integer DEFAULT 0, days integer DEFAULT 0, hours integer DEFAULT 0, mins integer DEFAULT 0, secs double precision DEFAULT 0.0
+19	years integer DEFAULT 0, months integer DEFAULT 0, weeks integer DEFAULT 0, days integer DEFAULT 0, hours integer DEFAULT 0, mins integer DEFAULT 0, secs double precision DEFAULT '0'::double precision
+= fnargs 3577
+17-19	transactional boolean, prefix text, message text, flush boolean DEFAULT false
+= fnargs 3578
+17-19	transactional boolean, prefix text, message bytea, flush boolean DEFAULT false
+= fnargs 3579
+14-19	jsonb_in jsonb, path text[], replacement jsonb, insert_after boolean DEFAULT false
+= fnargs 3775
+17-19	target text DEFAULT NULL::text
+= fnargs 3779
+14-19	slot_name name, immediately_reserve boolean DEFAULT false, temporary boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn
+= fnargs 3782
+14-19	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data text
+= fnargs 3783
+14-19	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea
+= fnargs 3784
+14-19	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data text
+= fnargs 3785
+14-19	slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea
+= fnargs 3786
+14-16	slot_name name, plugin name, temporary boolean DEFAULT false, twophase boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn
+17-19	slot_name name, plugin name, temporary boolean DEFAULT false, twophase boolean DEFAULT false, failover boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn
+= fnargs 3960
+14-19	base anyelement, from_json json, use_json_as_text boolean DEFAULT false
+= fnargs 3961
+14-19	base anyelement, from_json json, use_json_as_text boolean DEFAULT false
+= fnargs 4005
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 4006
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 4007
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 4008
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 4009
+14-19	target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false
+= fnargs 4350
+14-19	text, text DEFAULT 'NFC'::text
+= fnargs 4351
+14-19	text, text DEFAULT 'NFC'::text
+= fnargs 5054
+14-19	jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean DEFAULT true, null_value_treatment text DEFAULT 'use_json_null'::text
+= fnargs 6006
+19	node_name text, pid integer DEFAULT 0
+= fnargs 6212
+16-18	mean double precision DEFAULT 0, stddev double precision DEFAULT 1
+19	mean double precision DEFAULT '0'::double precision, stddev double precision DEFAULT '1'::double precision
+= fnbody 1176
+14-19	RETURN (($1 + $2))::timestamp with time zone
+= fnbody 1215
+14-19	BEGIN ATOMIC\n SELECT pg_description.description\n    FROM pg_description\n   WHERE ((pg_description.objoid = $1) AND (pg_description.classoid = ( SELECT pg_class.oid\n            FROM pg_class\n           WHERE ((pg_class.relname = $2) AND (pg_class.relnamespace = ('pg_catalog'::regnamespace)::oid)))) AND (pg_description.objsubid = 0));\nEND
+= fnbody 1216
+14-19	BEGIN ATOMIC\n SELECT pg_description.description\n    FROM pg_description\n   WHERE ((pg_description.objoid = $1) AND (pg_description.classoid = ('pg_class'::regclass)::oid) AND (pg_description.objsubid = $2));\nEND
+= fnbody 12439
+15	BEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND
+= fnbody 12440
+15	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END
+= fnbody 12441
+15	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END
+= fnbody 12442
+15	RETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END
+= fnbody 12443
+15	RETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END
+= fnbody 12445
+15	RETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END
+= fnbody 12446
+15	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END
+= fnbody 12447
+15	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END
+= fnbody 12448
+15	RETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END
+= fnbody 12449
+15	RETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END
+= fnbody 12644
+14	BEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND
+= fnbody 12645
+14	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END
+= fnbody 12646
+14	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END
+= fnbody 12647
+14	RETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END
+= fnbody 12648
+14	RETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END
+= fnbody 12650
+14	RETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END
+= fnbody 12651
+14	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END
+= fnbody 12652
+14	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END
+= fnbody 12653
+14	RETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END
+= fnbody 12654
+14	RETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END
+= fnbody 1296
+14-19	RETURN ($2 + $1)
+= fnbody 1298
+14-19	RETURN ($2 + $1)
+= fnbody 1305
+14-19	RETURN (($1, ($1 + $2)) OVERLAPS ($3, ($3 + $4)))
+= fnbody 1306
+14-19	RETURN (($1, $2) OVERLAPS ($3, ($3 + $4)))
+= fnbody 1307
+14-19	RETURN (($1, ($1 + $2)) OVERLAPS ($3, $4))
+= fnbody 1309
+14-19	RETURN (($1, ($1 + $2)) OVERLAPS ($3, ($3 + $4)))
+= fnbody 1310
+14-19	RETURN (($1, $2) OVERLAPS ($3, ($3 + $4)))
+= fnbody 1311
+14-19	RETURN (($1, ($1 + $2)) OVERLAPS ($3, $4))
+= fnbody 13294
+16	BEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND
+= fnbody 13295
+16	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END
+= fnbody 13296
+16	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END
+= fnbody 13297
+16	RETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END
+= fnbody 13298
+16	RETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END
+= fnbody 13300
+16	RETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END
+= fnbody 13301
+16	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END
+17	BEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND
+= fnbody 13302
+16	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END
+17	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END
+= fnbody 13303
+16	RETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END
+17	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END
+= fnbody 13304
+16	RETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END
+17	RETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END
+= fnbody 13305
+17	RETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END
+= fnbody 13307
+17	RETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END
+= fnbody 13308
+17	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END
+= fnbody 13309
+17	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END
+= fnbody 13310
+17	RETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END
+= fnbody 13311
+17	RETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END
+18	BEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND
+= fnbody 13312
+18	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END
+= fnbody 13313
+18	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END
+= fnbody 13314
+18	RETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END
+= fnbody 13315
+18	RETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END
+= fnbody 13317
+18	RETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END
+= fnbody 13318
+18	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END
+= fnbody 13319
+18	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END
+= fnbody 13320
+18	RETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END
+= fnbody 13321
+18	RETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END
+= fnbody 13342
+19	BEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND
+= fnbody 13343
+19	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END
+= fnbody 13344
+19	RETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END
+= fnbody 13345
+19	RETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END
+= fnbody 13346
+19	RETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END
+= fnbody 13348
+19	RETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END
+= fnbody 13349
+19	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END
+= fnbody 13350
+19	RETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END
+= fnbody 13351
+19	RETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END
+= fnbody 13352
+19	RETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END
+= fnbody 1348
+14-19	BEGIN ATOMIC\n SELECT pg_description.description\n    FROM pg_description\n   WHERE ((pg_description.objoid = $1) AND (pg_description.objsubid = 0));\nEND
+= fnbody 1384
+14-19	RETURN date_part($1, ($2)::timestamp without time zone)
+= fnbody 1386
+14-19	RETURN age((CURRENT_DATE)::timestamp with time zone, $1)
+= fnbody 1426
+14-19	RETURN on_ppath($2, $1)
+= fnbody 1481
+14-19	RETURN log((10)::numeric, $1)
+= fnbody 1544
+14-18	RETURN polygon(12, $1)
+= fnbody 1708
+14-19	RETURN round($1, 0)
+= fnbody 1710
+14-19	RETURN trunc($1, 0)
+= fnbody 1741
+14-19	RETURN log((10)::numeric, $1)
+= fnbody 1810
+14-19	RETURN (octet_length($1) * 8)
+= fnbody 1811
+14-19	RETURN (octet_length($1) * 8)
+= fnbody 1812
+14-19	RETURN length($1)
+= fnbody 1848
+14-19	RETURN ($2 + $1)
+= fnbody 1993
+14-19	BEGIN ATOMIC\n SELECT pg_shdescription.description\n    FROM pg_shdescription\n   WHERE ((pg_shdescription.objoid = $1) AND (pg_shdescription.classoid = ( SELECT pg_class.oid\n            FROM pg_class\n           WHERE ((pg_class.relname = $2) AND (pg_class.relnamespace = ('pg_catalog'::regnamespace)::oid)))));\nEND
+= fnbody 2042
+14-19	RETURN (($1, ($1 + $2)) OVERLAPS ($3, ($3 + $4)))
+= fnbody 2043
+14-19	RETURN (($1, $2) OVERLAPS ($3, ($3 + $4)))
+= fnbody 2044
+14-19	RETURN (($1, ($1 + $2)) OVERLAPS ($3, $4))
+= fnbody 2059
+14-19	RETURN age((CURRENT_DATE)::timestamp without time zone, $1)
+= fnbody 2074
+14-19	RETURN "substring"($1, similar_to_escape($2, $3))
+= fnbody 2325
+14-19	RETURN pg_relation_size($1, 'main'::text)
+= fnbody 2546
+14-19	RETURN ($2 + $1)
+= fnbody 2547
+14-19	RETURN ($2 + $1)
+= fnbody 2548
+14-19	RETURN ($2 + $1)
+= fnbody 2549
+14-19	RETURN ($2 + $1)
+= fnbody 2550
+14-19	RETURN ($2 + $1)
+= fnbody 2631
+14-19	RETURN ($2 + $1)
+= fnbody 2932
+14-19	RETURN xpath($1, $2, '{}'::text[])
+= fnbody 3050
+14-19	RETURN xpath_exists($1, $2, '{}'::text[])
+= fnbody 3935
+14-19	RETURN pg_sleep(((EXTRACT(epoch FROM (clock_timestamp() + $1)) - EXTRACT(epoch FROM clock_timestamp())))::double precision)
+= fnbody 3936
+14-19	RETURN pg_sleep(((EXTRACT(epoch FROM $1) - EXTRACT(epoch FROM clock_timestamp())))::double precision)
+= fnbody 5023
+14-19	RETURN ($2 + $1)
+= fnbody 6183
+14-19	BEGIN ATOMIC\n SELECT tt.alias,\n     tt.description,\n     parse.token,\n     ARRAY( SELECT (m.mapdict)::regdictionary AS mapdict\n            FROM pg_ts_config_map m\n           WHERE ((m.mapcfg = (ts_debug.config)::oid) AND (m.maptokentype = parse.tokid))\n           ORDER BY m.mapseqno) AS dictionaries,\n     ( SELECT (m.mapdict)::regdictionary AS mapdict\n            FROM pg_ts_config_map m\n           WHERE ((m.mapcfg = (ts_debug.config)::oid) AND (m.maptokentype = parse.tokid))\n           ORDER BY (ts_lexize((m.mapdict)::regdictionary, parse.token) IS NULL), m.mapseqno\n          LIMIT 1) AS dictionary,\n     ( SELECT ts_lexize((m.mapdict)::regdictionary, parse.token) AS ts_lexize\n            FROM pg_ts_config_map m\n           WHERE ((m.mapcfg = (ts_debug.config)::oid) AND (m.maptokentype = parse.tokid))\n           ORDER BY (ts_lexize((m.mapdict)::regdictionary, parse.token) IS NULL), m.mapseqno\n          LIMIT 1) AS lexemes\n    FROM ts_parse(( SELECT pg_ts_config.cfgparser\n            FROM pg_ts_config\n           WHERE (pg_ts_config.oid = (ts_debug.config)::oid)), ts_debug.document) parse(tokid, token),\n     ts_token_type(( SELECT pg_ts_config.cfgparser\n            FROM pg_ts_config\n           WHERE (pg_ts_config.oid = (ts_debug.config)::oid))) tt(tokid, alias, description)\n   WHERE (tt.tokid = parse.tokid);\nEND
+= fnbody 6184
+14-19	BEGIN ATOMIC\n SELECT ts_debug.alias,\n     ts_debug.description,\n     ts_debug.token,\n     ts_debug.dictionaries,\n     ts_debug.dictionary,\n     ts_debug.lexemes\n    FROM ts_debug(get_current_ts_config(), ts_debug.document) ts_debug(alias, description, token, dictionaries, dictionary, lexemes);\nEND
+= fnbody 879
+14-19	RETURN lpad($1, $2, ' '::text)
+= fnbody 880
+14-19	RETURN rpad($1, $2, ' '::text)
+= fndef 1176
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.timestamptz(date, time without time zone)\n RETURNS timestamp with time zone\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT COST 1\nRETURN (($1 + $2))::timestamp with time zone\n
+= fndef 1177
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_exists_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS boolean\n LANGUAGE internal\n STABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_exists_tz$function$\n
+= fndef 1179
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_query_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS SETOF jsonb\n LANGUAGE internal\n STABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_query_tz$function$\n
+= fndef 1180
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_query_array_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS jsonb\n LANGUAGE internal\n STABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_query_array_tz$function$\n
+= fndef 1215
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.obj_description(oid, name)\n RETURNS text\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT\nBEGIN ATOMIC\n SELECT pg_description.description\n    FROM pg_description\n   WHERE ((pg_description.objoid = $1) AND (pg_description.classoid = ( SELECT pg_class.oid\n            FROM pg_class\n           WHERE ((pg_class.relname = $2) AND (pg_class.relnamespace = ('pg_catalog'::regnamespace)::oid)))) AND (pg_description.objsubid = 0));\nEND\n
+= fndef 1216
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.col_description(oid, integer)\n RETURNS text\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT\nBEGIN ATOMIC\n SELECT pg_description.description\n    FROM pg_description\n   WHERE ((pg_description.objoid = $1) AND (pg_description.classoid = ('pg_class'::regclass)::oid) AND (pg_description.objsubid = $2));\nEND\n
+= fndef 12439
+15	CREATE OR REPLACE FUNCTION information_schema._pg_index_position(oid, smallint)\n RETURNS integer\n LANGUAGE sql\n STABLE STRICT\nBEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND\n
+= fndef 12440
+15	CREATE OR REPLACE FUNCTION information_schema._pg_truetypid(pg_attribute, pg_type)\n RETURNS oid\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END\n
+= fndef 12441
+15	CREATE OR REPLACE FUNCTION information_schema._pg_truetypmod(pg_attribute, pg_type)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END\n
+= fndef 12442
+15	CREATE OR REPLACE FUNCTION information_schema._pg_char_max_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END\n
+= fndef 12443
+15	CREATE OR REPLACE FUNCTION information_schema._pg_char_octet_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END\n
+= fndef 12445
+15	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END\n
+= fndef 12446
+15	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision_radix(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END\n
+= fndef 12447
+15	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_scale(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END\n
+= fndef 12448
+15	CREATE OR REPLACE FUNCTION information_schema._pg_datetime_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END\n
+= fndef 12449
+15	CREATE OR REPLACE FUNCTION information_schema._pg_interval_type(typid oid, mod integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END\n
+= fndef 12644
+14	CREATE OR REPLACE FUNCTION information_schema._pg_index_position(oid, smallint)\n RETURNS integer\n LANGUAGE sql\n STABLE STRICT\nBEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND\n
+= fndef 12645
+14	CREATE OR REPLACE FUNCTION information_schema._pg_truetypid(pg_attribute, pg_type)\n RETURNS oid\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END\n
+= fndef 12646
+14	CREATE OR REPLACE FUNCTION information_schema._pg_truetypmod(pg_attribute, pg_type)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END\n
+= fndef 12647
+14	CREATE OR REPLACE FUNCTION information_schema._pg_char_max_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END\n
+= fndef 12648
+14	CREATE OR REPLACE FUNCTION information_schema._pg_char_octet_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END\n
+= fndef 12650
+14	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END\n
+= fndef 12651
+14	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision_radix(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END\n
+= fndef 12652
+14	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_scale(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END\n
+= fndef 12653
+14	CREATE OR REPLACE FUNCTION information_schema._pg_datetime_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END\n
+= fndef 12654
+14	CREATE OR REPLACE FUNCTION information_schema._pg_interval_type(typid oid, mod integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END\n
+= fndef 1268
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.parse_ident(str text, strict boolean DEFAULT true)\n RETURNS text[]\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$parse_ident$function$\n
+= fndef 1296
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.timedate_pl(time without time zone, date)\n RETURNS timestamp without time zone\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 1298
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.timetzdate_pl(time with time zone, date)\n RETURNS timestamp with time zone\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 1305
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(timestamp with time zone, interval, timestamp with time zone, interval)\n RETURNS boolean\n LANGUAGE sql\n STABLE PARALLEL SAFE COST 1\nRETURN (($1, ($1 + $2)) OVERLAPS ($3, ($3 + $4)))\n
+= fndef 1306
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(timestamp with time zone, timestamp with time zone, timestamp with time zone, interval)\n RETURNS boolean\n LANGUAGE sql\n STABLE PARALLEL SAFE COST 1\nRETURN (($1, $2) OVERLAPS ($3, ($3 + $4)))\n
+= fndef 1307
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(timestamp with time zone, interval, timestamp with time zone, timestamp with time zone)\n RETURNS boolean\n LANGUAGE sql\n STABLE PARALLEL SAFE COST 1\nRETURN (($1, ($1 + $2)) OVERLAPS ($3, $4))\n
+= fndef 1309
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(time without time zone, interval, time without time zone, interval)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE COST 1\nRETURN (($1, ($1 + $2)) OVERLAPS ($3, ($3 + $4)))\n
+= fndef 1310
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(time without time zone, time without time zone, time without time zone, interval)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE COST 1\nRETURN (($1, $2) OVERLAPS ($3, ($3 + $4)))\n
+= fndef 1311
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(time without time zone, interval, time without time zone, time without time zone)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE COST 1\nRETURN (($1, ($1 + $2)) OVERLAPS ($3, $4))\n
+= fndef 13294
+16	CREATE OR REPLACE FUNCTION information_schema._pg_index_position(oid, smallint)\n RETURNS integer\n LANGUAGE sql\n STABLE STRICT\nBEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND\n
+= fndef 13295
+16	CREATE OR REPLACE FUNCTION information_schema._pg_truetypid(pg_attribute, pg_type)\n RETURNS oid\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END\n
+= fndef 13296
+16	CREATE OR REPLACE FUNCTION information_schema._pg_truetypmod(pg_attribute, pg_type)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END\n
+= fndef 13297
+16	CREATE OR REPLACE FUNCTION information_schema._pg_char_max_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END\n
+= fndef 13298
+16	CREATE OR REPLACE FUNCTION information_schema._pg_char_octet_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END\n
+= fndef 13300
+16	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END\n
+= fndef 13301
+16	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision_radix(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END\n
+17	CREATE OR REPLACE FUNCTION information_schema._pg_index_position(oid, smallint)\n RETURNS integer\n LANGUAGE sql\n STABLE STRICT\nBEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND\n
+= fndef 13302
+16	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_scale(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END\n
+17	CREATE OR REPLACE FUNCTION information_schema._pg_truetypid(pg_attribute, pg_type)\n RETURNS oid\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END\n
+= fndef 13303
+16	CREATE OR REPLACE FUNCTION information_schema._pg_datetime_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END\n
+17	CREATE OR REPLACE FUNCTION information_schema._pg_truetypmod(pg_attribute, pg_type)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END\n
+= fndef 13304
+16	CREATE OR REPLACE FUNCTION information_schema._pg_interval_type(typid oid, mod integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END\n
+17	CREATE OR REPLACE FUNCTION information_schema._pg_char_max_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END\n
+= fndef 13305
+17	CREATE OR REPLACE FUNCTION information_schema._pg_char_octet_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END\n
+= fndef 13307
+17	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END\n
+= fndef 13308
+17	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision_radix(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END\n
+= fndef 13309
+17	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_scale(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END\n
+= fndef 13310
+17	CREATE OR REPLACE FUNCTION information_schema._pg_datetime_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END\n
+= fndef 13311
+17	CREATE OR REPLACE FUNCTION information_schema._pg_interval_type(typid oid, mod integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END\n
+18	CREATE OR REPLACE FUNCTION information_schema._pg_index_position(oid, smallint)\n RETURNS integer\n LANGUAGE sql\n STABLE STRICT\nBEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND\n
+= fndef 13312
+18	CREATE OR REPLACE FUNCTION information_schema._pg_truetypid(pg_attribute, pg_type)\n RETURNS oid\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END\n
+= fndef 13313
+18	CREATE OR REPLACE FUNCTION information_schema._pg_truetypmod(pg_attribute, pg_type)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END\n
+= fndef 13314
+18	CREATE OR REPLACE FUNCTION information_schema._pg_char_max_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END\n
+= fndef 13315
+18	CREATE OR REPLACE FUNCTION information_schema._pg_char_octet_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END\n
+= fndef 13317
+18	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END\n
+= fndef 13318
+18	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision_radix(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END\n
+= fndef 13319
+18	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_scale(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END\n
+= fndef 13320
+18	CREATE OR REPLACE FUNCTION information_schema._pg_datetime_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END\n
+= fndef 13321
+18	CREATE OR REPLACE FUNCTION information_schema._pg_interval_type(typid oid, mod integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END\n
+= fndef 13342
+19	CREATE OR REPLACE FUNCTION information_schema._pg_index_position(oid, smallint)\n RETURNS integer\n LANGUAGE sql\n STABLE STRICT\nBEGIN ATOMIC\n SELECT (ss.a).n AS n\n    FROM ( SELECT information_schema._pg_expandarray(pg_index.indkey) AS a\n            FROM pg_index\n           WHERE (pg_index.indexrelid = $1)) ss\n   WHERE ((ss.a).x = $2);\nEND\n
+= fndef 13343
+19	CREATE OR REPLACE FUNCTION information_schema._pg_truetypid(pg_attribute, pg_type)\n RETURNS oid\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typbasetype ELSE ($1).atttypid END\n
+= fndef 13344
+19	CREATE OR REPLACE FUNCTION information_schema._pg_truetypmod(pg_attribute, pg_type)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (($2).typtype = 'd'::"char") THEN ($2).typtypmod ELSE ($1).atttypmod END\n
+= fndef 13345
+19	CREATE OR REPLACE FUNCTION information_schema._pg_char_max_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END\n
+= fndef 13346
+19	CREATE OR REPLACE FUNCTION information_schema._pg_char_octet_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(25)::oid, (1042)::oid, (1043)::oid])) THEN CASE WHEN (typmod = '-1'::integer) THEN (((2)::double precision ^ (30)::double precision))::integer ELSE (information_schema._pg_char_max_length(typid, typmod) * pg_encoding_max_length((SELECT pg_database.encoding FROM pg_database WHERE (pg_database.datname = current_database())))) END ELSE NULL::integer END\n
+= fndef 13348
+19	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE typid WHEN 21 THEN 16 WHEN 23 THEN 32 WHEN 20 THEN 64 WHEN 1700 THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE (((typmod - 4) >> 16) & 65535) END WHEN 700 THEN 24 WHEN 701 THEN 53 ELSE NULL::integer END\n
+= fndef 13349
+19	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_precision_radix(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid, (700)::oid, (701)::oid])) THEN 2 WHEN (typid = (1700)::oid) THEN 10 ELSE NULL::integer END\n
+= fndef 13350
+19	CREATE OR REPLACE FUNCTION information_schema._pg_numeric_scale(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = ANY (ARRAY[(21)::oid, (23)::oid, (20)::oid])) THEN 0 WHEN (typid = (1700)::oid) THEN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer ELSE ((typmod - 4) & 65535) END ELSE NULL::integer END\n
+= fndef 13351
+19	CREATE OR REPLACE FUNCTION information_schema._pg_datetime_precision(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1082)::oid) THEN 0 WHEN (typid = ANY (ARRAY[(1083)::oid, (1114)::oid, (1184)::oid, (1266)::oid])) THEN CASE WHEN (typmod < 0) THEN 6 ELSE typmod END WHEN (typid = (1186)::oid) THEN CASE WHEN ((typmod < 0) OR ((typmod & 65535) = 65535)) THEN 6 ELSE (typmod & 65535) END ELSE NULL::integer END\n
+= fndef 13352
+19	CREATE OR REPLACE FUNCTION information_schema._pg_interval_type(typid oid, mod integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typid = (1186)::oid) THEN upper(SUBSTRING(format_type(typid, mod) SIMILAR 'interval[()0-9]* #"%#"'::text ESCAPE '#'::text)) ELSE NULL::text END\n
+= fndef 1348
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.obj_description(oid)\n RETURNS text\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT\nBEGIN ATOMIC\n SELECT pg_description.description\n    FROM pg_description\n   WHERE ((pg_description.objoid = $1) AND (pg_description.objsubid = 0));\nEND\n
+= fndef 1384
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.date_part(text, date)\n RETURNS double precision\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN date_part($1, ($2)::timestamp without time zone)\n
+= fndef 1386
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.age(timestamp with time zone)\n RETURNS interval\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT COST 1\nRETURN age((CURRENT_DATE)::timestamp with time zone, $1)\n
+= fndef 1426
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.path_contain_pt(path, point)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN on_ppath($2, $1)\n
+= fndef 1481
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.log10(numeric)\n RETURNS numeric\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN log((10)::numeric, $1)\n
+= fndef 1544
+14-18	CREATE OR REPLACE FUNCTION pg_catalog.polygon(circle)\n RETURNS polygon\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN polygon(12, $1)\n
+= fndef 1708
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.round(numeric)\n RETURNS numeric\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN round($1, 0)\n
+= fndef 1710
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.trunc(numeric)\n RETURNS numeric\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN trunc($1, 0)\n
+= fndef 1741
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.log(numeric)\n RETURNS numeric\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN log((10)::numeric, $1)\n
+= fndef 1810
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.bit_length(bytea)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN (octet_length($1) * 8)\n
+= fndef 1811
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.bit_length(text)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN (octet_length($1) * 8)\n
+= fndef 1812
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.bit_length(bit)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN length($1)\n
+= fndef 1848
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.interval_pl_time(interval, time without time zone)\n RETURNS time without time zone\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 1993
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.shobj_description(oid, name)\n RETURNS text\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT\nBEGIN ATOMIC\n SELECT pg_shdescription.description\n    FROM pg_shdescription\n   WHERE ((pg_shdescription.objoid = $1) AND (pg_shdescription.classoid = ( SELECT pg_class.oid\n            FROM pg_class\n           WHERE ((pg_class.relname = $2) AND (pg_class.relnamespace = ('pg_catalog'::regnamespace)::oid)))));\nEND\n
+= fndef 2023
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_query_first_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS jsonb\n LANGUAGE internal\n STABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_query_first_tz$function$\n
+= fndef 2030
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_match_tz(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS boolean\n LANGUAGE internal\n STABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_match_tz$function$\n
+= fndef 2042
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(timestamp without time zone, interval, timestamp without time zone, interval)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE COST 1\nRETURN (($1, ($1 + $2)) OVERLAPS ($3, ($3 + $4)))\n
+= fndef 2043
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(timestamp without time zone, timestamp without time zone, timestamp without time zone, interval)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE COST 1\nRETURN (($1, $2) OVERLAPS ($3, ($3 + $4)))\n
+= fndef 2044
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."overlaps"(timestamp without time zone, interval, timestamp without time zone, timestamp without time zone)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE COST 1\nRETURN (($1, ($1 + $2)) OVERLAPS ($3, $4))\n
+= fndef 2059
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.age(timestamp without time zone)\n RETURNS interval\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT COST 1\nRETURN age((CURRENT_DATE)::timestamp without time zone, $1)\n
+= fndef 2074
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."substring"(text, text, text)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN "substring"($1, similar_to_escape($2, $3))\n
+= fndef 2096
+14-18	CREATE OR REPLACE FUNCTION pg_catalog.pg_terminate_backend(pid integer, timeout bigint DEFAULT 0)\n RETURNS boolean\n LANGUAGE internal\n PARALLEL SAFE STRICT\nAS $function$pg_terminate_backend$function$\n
+19	CREATE OR REPLACE FUNCTION pg_catalog.pg_terminate_backend(pid integer, timeout bigint DEFAULT '0'::bigint)\n RETURNS boolean\n LANGUAGE internal\n PARALLEL SAFE STRICT\nAS $function$pg_terminate_backend$function$\n
+= fndef 2172
+14	CREATE OR REPLACE FUNCTION pg_catalog.pg_start_backup(label text, fast boolean DEFAULT false, exclusive boolean DEFAULT true)\n RETURNS pg_lsn\n LANGUAGE internal\n PARALLEL RESTRICTED STRICT\nAS $function$pg_start_backup$function$\n
+15-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_backup_start(label text, fast boolean DEFAULT false)\n RETURNS pg_lsn\n LANGUAGE internal\n PARALLEL RESTRICTED STRICT\nAS $function$pg_backup_start$function$\n
+= fndef 2307
+17-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_stat_reset_slru(target text DEFAULT NULL::text)\n RETURNS void\n LANGUAGE internal\n PARALLEL SAFE\nAS $function$pg_stat_reset_slru$function$\n
+= fndef 2325
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_relation_size(regclass)\n RETURNS bigint\n LANGUAGE sql\n PARALLEL SAFE STRICT COST 1\nRETURN pg_relation_size($1, 'main'::text)\n
+= fndef 2546
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.interval_pl_date(interval, date)\n RETURNS timestamp without time zone\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 2547
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.interval_pl_timetz(interval, time with time zone)\n RETURNS time with time zone\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 2548
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.interval_pl_timestamp(interval, timestamp without time zone)\n RETURNS timestamp without time zone\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 2549
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.interval_pl_timestamptz(interval, timestamp with time zone)\n RETURNS timestamp with time zone\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 2550
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.integer_pl_date(integer, date)\n RETURNS date\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 2631
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.int8pl_inet(bigint, inet)\n RETURNS inet\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 2739
+14	CREATE OR REPLACE FUNCTION pg_catalog.pg_stop_backup(exclusive boolean, wait_for_archive boolean DEFAULT true, OUT lsn pg_lsn, OUT labelfile text, OUT spcmapfile text)\n RETURNS SETOF record\n LANGUAGE internal\n PARALLEL RESTRICTED STRICT\nAS $function$pg_stop_backup_v2$function$\n
+15-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_backup_stop(wait_for_archive boolean DEFAULT true, OUT lsn pg_lsn, OUT labelfile text, OUT spcmapfile text)\n RETURNS record\n LANGUAGE internal\n PARALLEL RESTRICTED STRICT\nAS $function$pg_backup_stop$function$\n
+= fndef 2932
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.xpath(text, xml)\n RETURNS xml[]\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN xpath($1, $2, '{}'::text[])\n
+= fndef 3050
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.xpath_exists(text, xml)\n RETURNS boolean\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN xpath_exists($1, $2, '{}'::text[])\n
+= fndef 3261
+18-19	CREATE OR REPLACE FUNCTION pg_catalog.json_strip_nulls(target json, strip_in_arrays boolean DEFAULT false)\n RETURNS json\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$json_strip_nulls$function$\n
+= fndef 3262
+18-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_strip_nulls(target jsonb, strip_in_arrays boolean DEFAULT false)\n RETURNS jsonb\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_strip_nulls$function$\n
+= fndef 3305
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_set(jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean DEFAULT true)\n RETURNS jsonb\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_set$function$\n
+= fndef 3436
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)\n RETURNS boolean\n LANGUAGE internal\n PARALLEL SAFE STRICT\nAS $function$pg_promote$function$\n
+= fndef 3464
+14-18	CREATE OR REPLACE FUNCTION pg_catalog.make_interval(years integer DEFAULT 0, months integer DEFAULT 0, weeks integer DEFAULT 0, days integer DEFAULT 0, hours integer DEFAULT 0, mins integer DEFAULT 0, secs double precision DEFAULT 0.0)\n RETURNS interval\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$make_interval$function$\n
+19	CREATE OR REPLACE FUNCTION pg_catalog.make_interval(years integer DEFAULT 0, months integer DEFAULT 0, weeks integer DEFAULT 0, days integer DEFAULT 0, hours integer DEFAULT 0, mins integer DEFAULT 0, secs double precision DEFAULT '0'::double precision)\n RETURNS interval\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$make_interval$function$\n
+= fndef 3577
+17-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_logical_emit_message(transactional boolean, prefix text, message text, flush boolean DEFAULT false)\n RETURNS pg_lsn\n LANGUAGE internal\n STRICT\nAS $function$pg_logical_emit_message_text$function$\n
+= fndef 3578
+17-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_logical_emit_message(transactional boolean, prefix text, message bytea, flush boolean DEFAULT false)\n RETURNS pg_lsn\n LANGUAGE internal\n STRICT\nAS $function$pg_logical_emit_message_bytea$function$\n
+= fndef 3579
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_insert(jsonb_in jsonb, path text[], replacement jsonb, insert_after boolean DEFAULT false)\n RETURNS jsonb\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_insert$function$\n
+= fndef 3775
+17-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_stat_reset_shared(target text DEFAULT NULL::text)\n RETURNS void\n LANGUAGE internal\n PARALLEL SAFE\nAS $function$pg_stat_reset_shared$function$\n
+= fndef 3779
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_create_physical_replication_slot(slot_name name, immediately_reserve boolean DEFAULT false, temporary boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn)\n RETURNS record\n LANGUAGE internal\n STRICT\nAS $function$pg_create_physical_replication_slot$function$\n
+= fndef 3782
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_logical_slot_get_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data text)\n RETURNS SETOF record\n LANGUAGE internal\n COST 1000\nAS $function$pg_logical_slot_get_changes$function$\n
+= fndef 3783
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_logical_slot_get_binary_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea)\n RETURNS SETOF record\n LANGUAGE internal\n COST 1000\nAS $function$pg_logical_slot_get_binary_changes$function$\n
+= fndef 3784
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_logical_slot_peek_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data text)\n RETURNS SETOF record\n LANGUAGE internal\n COST 1000\nAS $function$pg_logical_slot_peek_changes$function$\n
+= fndef 3785
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_logical_slot_peek_binary_changes(slot_name name, upto_lsn pg_lsn, upto_nchanges integer, VARIADIC options text[] DEFAULT '{}'::text[], OUT lsn pg_lsn, OUT xid xid, OUT data bytea)\n RETURNS SETOF record\n LANGUAGE internal\n COST 1000\nAS $function$pg_logical_slot_peek_binary_changes$function$\n
+= fndef 3786
+14-16	CREATE OR REPLACE FUNCTION pg_catalog.pg_create_logical_replication_slot(slot_name name, plugin name, temporary boolean DEFAULT false, twophase boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn)\n RETURNS record\n LANGUAGE internal\n STRICT\nAS $function$pg_create_logical_replication_slot$function$\n
+17-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_create_logical_replication_slot(slot_name name, plugin name, temporary boolean DEFAULT false, twophase boolean DEFAULT false, failover boolean DEFAULT false, OUT slot_name name, OUT lsn pg_lsn)\n RETURNS record\n LANGUAGE internal\n STRICT\nAS $function$pg_create_logical_replication_slot$function$\n
+= fndef 3935
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_sleep_for(interval)\n RETURNS void\n LANGUAGE sql\n PARALLEL SAFE STRICT COST 1\nRETURN pg_sleep(((EXTRACT(epoch FROM (clock_timestamp() + $1)) - EXTRACT(epoch FROM clock_timestamp())))::double precision)\n
+= fndef 3936
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.pg_sleep_until(timestamp with time zone)\n RETURNS void\n LANGUAGE sql\n PARALLEL SAFE STRICT COST 1\nRETURN pg_sleep(((EXTRACT(epoch FROM $1) - EXTRACT(epoch FROM clock_timestamp())))::double precision)\n
+= fndef 3960
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.json_populate_record(base anyelement, from_json json, use_json_as_text boolean DEFAULT false)\n RETURNS anyelement\n LANGUAGE internal\n STABLE PARALLEL SAFE\nAS $function$json_populate_record$function$\n
+= fndef 3961
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.json_populate_recordset(base anyelement, from_json json, use_json_as_text boolean DEFAULT false)\n RETURNS SETOF anyelement\n LANGUAGE internal\n STABLE PARALLEL SAFE ROWS 100\nAS $function$json_populate_recordset$function$\n
+= fndef 4005
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_exists(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS boolean\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_exists$function$\n
+= fndef 4006
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_query(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS SETOF jsonb\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_query$function$\n
+= fndef 4007
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_query_array(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS jsonb\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_query_array$function$\n
+= fndef 4008
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_query_first(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS jsonb\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_query_first$function$\n
+= fndef 4009
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_path_match(target jsonb, path jsonpath, vars jsonb DEFAULT '{}'::jsonb, silent boolean DEFAULT false)\n RETURNS boolean\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$jsonb_path_match$function$\n
+= fndef 4350
+14-19	CREATE OR REPLACE FUNCTION pg_catalog."normalize"(text, text DEFAULT 'NFC'::text)\n RETURNS text\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$unicode_normalize_func$function$\n
+= fndef 4351
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.is_normalized(text, text DEFAULT 'NFC'::text)\n RETURNS boolean\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$unicode_is_normalized$function$\n
+= fndef 5023
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.numeric_pl_pg_lsn(numeric, pg_lsn)\n RETURNS pg_lsn\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN ($2 + $1)\n
+= fndef 5054
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.jsonb_set_lax(jsonb_in jsonb, path text[], replacement jsonb, create_if_missing boolean DEFAULT true, null_value_treatment text DEFAULT 'use_json_null'::text)\n RETURNS jsonb\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE\nAS $function$jsonb_set_lax$function$\n
+= fndef 6006
+19	CREATE OR REPLACE FUNCTION pg_catalog.pg_replication_origin_session_setup(node_name text, pid integer DEFAULT 0)\n RETURNS void\n LANGUAGE internal\n STRICT\nAS $function$pg_replication_origin_session_setup$function$\n
+= fndef 6183
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.ts_debug(config regconfig, document text, OUT alias text, OUT description text, OUT token text, OUT dictionaries regdictionary[], OUT dictionary regdictionary, OUT lexemes text[])\n RETURNS SETOF record\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT\nBEGIN ATOMIC\n SELECT tt.alias,\n     tt.description,\n     parse.token,\n     ARRAY( SELECT (m.mapdict)::regdictionary AS mapdict\n            FROM pg_ts_config_map m\n           WHERE ((m.mapcfg = (ts_debug.config)::oid) AND (m.maptokentype = parse.tokid))\n           ORDER BY m.mapseqno) AS dictionaries,\n     ( SELECT (m.mapdict)::regdictionary AS mapdict\n            FROM pg_ts_config_map m\n           WHERE ((m.mapcfg = (ts_debug.config)::oid) AND (m.maptokentype = parse.tokid))\n           ORDER BY (ts_lexize((m.mapdict)::regdictionary, parse.token) IS NULL), m.mapseqno\n          LIMIT 1) AS dictionary,\n     ( SELECT ts_lexize((m.mapdict)::regdictionary, parse.token) AS ts_lexize\n            FROM pg_ts_config_map m\n           WHERE ((m.mapcfg = (ts_debug.config)::oid) AND (m.maptokentype = parse.tokid))\n           ORDER BY (ts_lexize((m.mapdict)::regdictionary, parse.token) IS NULL), m.mapseqno\n          LIMIT 1) AS lexemes\n    FROM ts_parse(( SELECT pg_ts_config.cfgparser\n            FROM pg_ts_config\n           WHERE (pg_ts_config.oid = (ts_debug.config)::oid)), ts_debug.document) parse(tokid, token),\n     ts_token_type(( SELECT pg_ts_config.cfgparser\n            FROM pg_ts_config\n           WHERE (pg_ts_config.oid = (ts_debug.config)::oid))) tt(tokid, alias, description)\n   WHERE (tt.tokid = parse.tokid);\nEND\n
+= fndef 6184
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.ts_debug(document text, OUT alias text, OUT description text, OUT token text, OUT dictionaries regdictionary[], OUT dictionary regdictionary, OUT lexemes text[])\n RETURNS SETOF record\n LANGUAGE sql\n STABLE PARALLEL SAFE STRICT\nBEGIN ATOMIC\n SELECT ts_debug.alias,\n     ts_debug.description,\n     ts_debug.token,\n     ts_debug.dictionaries,\n     ts_debug.dictionary,\n     ts_debug.lexemes\n    FROM ts_debug(get_current_ts_config(), ts_debug.document) ts_debug(alias, description, token, dictionaries, dictionary, lexemes);\nEND\n
+= fndef 6212
+16-18	CREATE OR REPLACE FUNCTION pg_catalog.random_normal(mean double precision DEFAULT 0, stddev double precision DEFAULT 1)\n RETURNS double precision\n LANGUAGE internal\n PARALLEL RESTRICTED STRICT\nAS $function$drandom_normal$function$\n
+19	CREATE OR REPLACE FUNCTION pg_catalog.random_normal(mean double precision DEFAULT '0'::double precision, stddev double precision DEFAULT '1'::double precision)\n RETURNS double precision\n LANGUAGE internal\n PARALLEL RESTRICTED STRICT\nAS $function$drandom_normal$function$\n
+= fndef 879
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.lpad(text, integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN lpad($1, $2, ' '::text)\n
+= fndef 880
+14-19	CREATE OR REPLACE FUNCTION pg_catalog.rpad(text, integer)\n RETURNS text\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT COST 1\nRETURN rpad($1, $2, ' '::text)\n
+= fndefault 1177 3
+14-19	'{}'::jsonb
+= fndefault 1177 4
+14-19	false
+= fndefault 1179 3
+14-19	'{}'::jsonb
+= fndefault 1179 4
+14-19	false
+= fndefault 1180 3
+14-19	'{}'::jsonb
+= fndefault 1180 4
+14-19	false
+= fndefault 1268 2
+14-19	true
+= fndefault 2023 3
+14-19	'{}'::jsonb
+= fndefault 2023 4
+14-19	false
+= fndefault 2030 3
+14-19	'{}'::jsonb
+= fndefault 2030 4
+14-19	false
+= fndefault 2096 2
+14-18	0
+19	'0'::bigint
+= fndefault 2172 2
+14-19	false
+= fndefault 2172 3
+14	true
+= fndefault 2307 1
+17-19	NULL::text
+= fndefault 2739 1
+15-19	true
+= fndefault 2739 2
+14	true
+= fndefault 3261 2
+18-19	false
+= fndefault 3262 2
+18-19	false
+= fndefault 3305 4
+14-19	true
+= fndefault 3436 1
+14-19	true
+= fndefault 3436 2
+14-19	60
+= fndefault 3464 1
+14-19	0
+= fndefault 3464 2
+14-19	0
+= fndefault 3464 3
+14-19	0
+= fndefault 3464 4
+14-19	0
+= fndefault 3464 5
+14-19	0
+= fndefault 3464 6
+14-19	0
+= fndefault 3464 7
+14-18	0.0
+19	'0'::double precision
+= fndefault 3577 4
+17-19	false
+= fndefault 3578 4
+17-19	false
+= fndefault 3579 4
+14-19	false
+= fndefault 3775 1
+17-19	NULL::text
+= fndefault 3779 2
+14-19	false
+= fndefault 3779 3
+14-19	false
+= fndefault 3782 4
+14-19	'{}'::text[]
+= fndefault 3783 4
+14-19	'{}'::text[]
+= fndefault 3784 4
+14-19	'{}'::text[]
+= fndefault 3785 4
+14-19	'{}'::text[]
+= fndefault 3786 3
+14-19	false
+= fndefault 3786 4
+14-19	false
+= fndefault 3786 5
+17-19	false
+= fndefault 3960 3
+14-19	false
+= fndefault 3961 3
+14-19	false
+= fndefault 4005 3
+14-19	'{}'::jsonb
+= fndefault 4005 4
+14-19	false
+= fndefault 4006 3
+14-19	'{}'::jsonb
+= fndefault 4006 4
+14-19	false
+= fndefault 4007 3
+14-19	'{}'::jsonb
+= fndefault 4007 4
+14-19	false
+= fndefault 4008 3
+14-19	'{}'::jsonb
+= fndefault 4008 4
+14-19	false
+= fndefault 4009 3
+14-19	'{}'::jsonb
+= fndefault 4009 4
+14-19	false
+= fndefault 4350 2
+14-19	'NFC'::text
+= fndefault 4351 2
+14-19	'NFC'::text
+= fndefault 5054 4
+14-19	true
+= fndefault 5054 5
+14-19	'use_json_null'::text
+= fndefault 6006 2
+19	0
+= fndefault 6212 1
+16-18	0
+19	'0'::double precision
+= fndefault 6212 2
+16-18	1
+19	'1'::double precision
 = function information_schema._pg_char_max_length(typid oid, typmod integer)
 14-19	CREATE OR REPLACE FUNCTION information_schema._pg_char_max_length(typid oid, typmod integer)\n RETURNS integer\n LANGUAGE sql\n IMMUTABLE PARALLEL SAFE STRICT\nRETURN CASE WHEN (typmod = '-1'::integer) THEN NULL::integer WHEN (typid = ANY (ARRAY[(1042)::oid, (1043)::oid])) THEN (typmod - 4) WHEN (typid = ANY (ARRAY[(1560)::oid, (1562)::oid])) THEN typmod ELSE NULL::integer END\n
 = function information_schema._pg_char_octet_length(typid oid, typmod integer)

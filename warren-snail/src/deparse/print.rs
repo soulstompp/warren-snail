@@ -75,6 +75,16 @@ fn interval_typmod(t: i32) -> String {
     }
 }
 
+/// A type's name as format_type_be writes it: as format_type_with_typemod with no typmod, but `bit`
+/// and `character` bare where that form quotes them or writes bpchar.
+pub(crate) fn format_type_be(cat: &Cat, oid: u32) -> String {
+    match oid {
+        1560 => "bit".into(),
+        1042 => "character".into(),
+        _ => format_type(cat, oid, -1),
+    }
+}
+
 /// A type's name as format_type_with_typemod writes it: the SQL standard's names, a modifier as
 /// the type writes it, an array's element's name with `[]`, a name the search path does not find
 /// by itself qualified.
@@ -85,7 +95,8 @@ pub(crate) fn format_type(cat: &Cat, oid: u32, typmod: i32) -> String {
     let Some(ty) = cat.ty(oid) else {
         return "???".into();
     };
-    if cat.element(oid) != 0 && ty.typtype != 'd' {
+    // A true array not of plain storage: oidvector and int2vector keep their own names.
+    if cat.element(oid) != 0 && ty.typtype != 'd' && ty.storage != 'p' {
         return format!("{}[]", format_type(cat, ty.elem, typmod));
     }
     let with = (typmod >= 0).then_some(typmod);

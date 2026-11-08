@@ -1351,56 +1351,110 @@ impl<'a> File<'a> {
     }
 
     fn procs(&self) -> Vec<Row> {
-        self.catalog
-            .functions
-            .iter()
-            .map(|f| {
-                let n = full(&f.name);
-                let (schema, own) = parts(&n);
-                let args: Vec<String> = f
-                    .args
-                    .iter()
-                    .map(|&a| self.facts(a, None).oid.to_string())
-                    .collect();
-                let o = self.catalog.oids.each().find_map(|(oid, x)| match x {
-                    Object::Proc(m, a)
-                        if *m == n
-                            && *a
-                                == f.args
-                                    .iter()
-                                    .map(|t| t.pg_name())
-                                    .collect::<Vec<_>>()
-                                    .join(",") =>
-                    {
-                        Some(oid)
-                    }
+        let proc_oid = |n: &str, args: &str| {
+            self.catalog
+                .oids
+                .each()
+                .find_map(|(oid, x)| match x {
+                    Object::Proc(m, a) if m == n && a == args => Some(oid),
                     _ => None,
-                });
-                row(&[
-                    ("oid", o.unwrap_or(0).to_string()),
+                })
+                .unwrap_or(0)
+        };
+        let mut out = Vec::new();
+        for f in &self.catalog.functions {
+            let n = full(&f.name);
+            let (schema, own) = parts(&n);
+            let args: Vec<String> = f
+                .args
+                .iter()
+                .map(|&a| self.facts(a, None).oid.to_string())
+                .collect();
+            let key = f.args.iter().map(|t| t.pg_name()).collect::<Vec<_>>().join(",");
+            out.push(row(&[
+                ("oid", proc_oid(&n, &key).to_string()),
+                ("proname", own.to_string()),
+                ("pronamespace", self.namespace(schema).to_string()),
+                ("proowner", "10".into()),
+                ("prolang", "14".into()),
+                ("procost", "100".into()),
+                ("prorows", "0".into()),
+                ("provariadic", "0".into()),
+                ("prosupport", "0".into()),
+                ("prokind", "f".into()),
+                ("prosecdef", "f".into()),
+                ("proleakproof", "f".into()),
+                ("proisstrict", t(f.strict)),
+                ("proretset", "f".into()),
+                ("provolatile", f.volatility.to_string()),
+                ("proparallel", f.parallel.to_string()),
+                ("pronargs", f.args.len().to_string()),
+                ("pronargdefaults", "0".into()),
+                ("prorettype", self.facts(f.returns, None).oid.to_string()),
+                ("proargtypes", args.join(" ")),
+                ("prosrc", f.source.clone()),
+            ]));
+        }
+        // Each range's constructors, as DefineRange makes them: the range's of two bounds and of two
+        // and their inclusivity, the multirange's of none, of one range and of any number.
+        for ty in &self.catalog.types {
+            let crate::catalog::TypeKind::Range(r) = &ty.kind else {
+                continue;
+            };
+            let n = full(&ty.name);
+            let m = full(&r.multirange);
+            let sub = crate::regs::type_oid(&r.subtype, self.release).unwrap_or(0);
+            let sub_key = crate::regs::type_oid(&r.subtype, crate::regs::LATEST)
+                .map(|o| crate::regs::reg_text(crate::regs::RegKind::Type, o, crate::regs::LATEST))
+                .unwrap_or_else(|_| r.subtype.clone());
+            let shown = match parts(&n) {
+                ("public", x) => x.to_string(),
+                _ => n.clone(),
+            };
+            let range = self.oid(Object::Type(n.clone()));
+            let range_array = self.oid(Object::Array(n.clone()));
+            let multi = self.oid(Object::Type(m.clone()));
+            let made = [
+                (&n, format!("{sub_key},{sub_key}"), format!("{sub} {sub}"), range, false, "range_constructor2"),
+                (&n, format!("{sub_key},{sub_key},text"), format!("{sub} {sub} 25"), range, false, "range_constructor3"),
+                (&m, String::new(), String::new(), multi, true, "multirange_constructor0"),
+                (&m, shown.clone(), range.to_string(), multi, true, "multirange_constructor1"),
+                (&m, format!("{shown}[]"), range_array.to_string(), multi, true, "multirange_constructor2"),
+            ];
+            for (name, key, args, ret, strict, src) in made {
+                let (schema, own) = parts(name);
+                let variadic = src == "multirange_constructor2";
+                let mut fields = vec![
+                    ("oid", proc_oid(name, &key).to_string()),
                     ("proname", own.to_string()),
                     ("pronamespace", self.namespace(schema).to_string()),
                     ("proowner", "10".into()),
-                    ("prolang", "14".into()),
-                    ("procost", "100".into()),
+                    ("prolang", "12".into()),
+                    ("procost", "1".into()),
                     ("prorows", "0".into()),
-                    ("provariadic", "0".into()),
+                    ("provariadic", if variadic { range.to_string() } else { "0".into() }),
                     ("prosupport", "0".into()),
                     ("prokind", "f".into()),
                     ("prosecdef", "f".into()),
                     ("proleakproof", "f".into()),
-                    ("proisstrict", "f".into()),
+                    ("proisstrict", t(strict)),
                     ("proretset", "f".into()),
-                    ("provolatile", "v".into()),
-                    ("proparallel", "u".into()),
-                    ("pronargs", f.args.len().to_string()),
+                    ("provolatile", "i".into()),
+                    ("proparallel", "s".into()),
+                    ("pronargs", args.split(' ').filter(|a| !a.is_empty()).count().to_string()),
                     ("pronargdefaults", "0".into()),
-                    ("prorettype", "0".into()),
-                    ("proargtypes", args.join(" ")),
-                    ("prosrc", f.body.to_string()),
-                ])
-            })
-            .collect()
+                    ("prorettype", ret.to_string()),
+                    ("proargtypes", args.clone()),
+                    ("prosrc", src.into()),
+                ];
+                if variadic {
+                    fields.push(("proallargtypes", format!("{{{range_array}}}")));
+                    fields.push(("proargmodes", "{v}".into()));
+                }
+                out.push(row(&fields));
+            }
+        }
+        out
     }
 
     fn ranges(&self) -> Vec<Row> {

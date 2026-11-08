@@ -1798,12 +1798,12 @@ pg_get_constraintdef(oid,boolean)		type	the file's catalog
 pg_get_dsm_registry_allocations()	19	server	the server itself
 pg_get_expr(pg_node_tree,oid)		type	the file's catalog
 pg_get_expr(pg_node_tree,oid,boolean)		type	the file's catalog
-pg_get_function_arg_default(oid,integer)		server	the server's catalog
-pg_get_function_arguments(oid)		server	the server's catalog
-pg_get_function_identity_arguments(oid)		server	the server's catalog
-pg_get_function_result(oid)		server	the server's catalog
-pg_get_function_sqlbody(oid)		server	the server's catalog
-pg_get_functiondef(oid)		server	the server's catalog
+pg_get_function_arg_default(oid,integer)		type	the file's catalog
+pg_get_function_arguments(oid)		type	the file's catalog
+pg_get_function_identity_arguments(oid)		type	the file's catalog
+pg_get_function_result(oid)		type	the file's catalog
+pg_get_function_sqlbody(oid)		type	the file's catalog
+pg_get_functiondef(oid)		type	the file's catalog
 pg_get_indexdef(oid)		type	the file's catalog
 pg_get_indexdef(oid,integer,boolean)		type	the file's catalog
 pg_get_keywords()		type	the rest

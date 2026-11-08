@@ -55,6 +55,13 @@ pub(crate) fn carried_viewdef(full: &str, release: u8, pretty: bool) -> Option<S
     definition(&key, release)
 }
 
+/// A carried text by its key, under a release: a built-in function's arguments with their
+/// defaults (`fnargs oid`), one default (`fndefault oid n`), its SQL body (`fnbody oid`) or its
+/// definition (`fndef oid`).
+pub(crate) fn carried_definition(key: &str, release: u8) -> Option<String> {
+    definition(key, release)
+}
+
 /// A built-in rule's text other than a view's, `schema.relation.rule`, as pg_get_ruledef writes it.
 pub(crate) fn carried_ruledef(full: &str, release: u8, pretty: bool) -> Option<String> {
     let key = if pretty { format!("rule {full}") } else { format!("plain rule {full}") };

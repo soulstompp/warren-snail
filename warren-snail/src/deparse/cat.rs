@@ -67,6 +67,7 @@ pub(crate) struct Type {
     pub typmod: i32,
     pub collation: u32,
     pub len: i16,
+    pub storage: char,
 }
 
 /// A row of pg_operator.
@@ -149,6 +150,7 @@ fn type_row(r: &Raw) -> Type {
         typmod: field(r, "typtypmod").parse().unwrap_or(-1),
         collation: num(r, "typcollation"),
         len: num(r, "typlen"),
+        storage: letter(r, "typstorage"),
     }
 }
 
