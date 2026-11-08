@@ -2955,6 +2955,33 @@ impl Catalog {
         }
     }
 
+    /// `parse_kept`, with what PostgreSQL says of the DDL's last statement, the one a session
+    /// declares: what IF [NOT] EXISTS passed over, what a DROP took with it.
+    pub(crate) fn parse_declared(ddl: &str, kept: usize) -> Result<(Catalog, Vec<String>)> {
+        let reading = crate::ddl::read_ddl_kept(ddl, true, kept)?;
+        if let Some(why) = reading.statements.iter().find_map(|s| s.refused.as_ref()) {
+            return Err(Error::new(why.clone()));
+        }
+        let said = reading
+            .statements
+            .last()
+            .map(|s| {
+                s.notices
+                    .iter()
+                    .filter(|n| crate::ddl::said_by_postgresql(n))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((
+            Catalog {
+                ddl: ddl.to_string(),
+                ..reading.catalog
+            },
+            said,
+        ))
+    }
+
     /// The number of statements a DDL holds.
     pub fn statements_in(ddl: &str) -> Result<usize> {
         crate::ddl::statements_in(ddl)
@@ -3375,7 +3402,7 @@ mod tests {
              CREATE INDEX tg ON s.t USING gin (a);
              CREATE INDEX tp ON s.t (a) WHERE a > 0;
              CREATE INDEX tb ON s.t USING btree (a DESC) WITH (fillfactor = 90);
-             DROP TABLE s.t;",
+             ALTER INDEX s.tp RENAME TO tq;",
         )
         .unwrap();
         let read: Vec<(&str, Option<&str>)> = r

@@ -1043,3 +1043,268 @@ fn a_draw_comes_in_the_rows_order_after_the_sort_for_the_rows_the_cut_reaches() 
     );
     run(&mut w, "COMMIT");
 }
+
+/// What a statement said beside its answer, each line as PostgreSQL's client prints it.
+fn said(w: &mut Snail, sql: &str) -> Vec<String> {
+    w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).notices
+}
+
+#[test]
+fn a_schema_is_made_and_dropped_with_what_depends_on_it() {
+    let mut w = snail("schemas");
+    run(&mut w, "CREATE SCHEMA a");
+    run(&mut w, "CREATE TABLE a.t (id integer PRIMARY KEY)");
+    run(&mut w, "CREATE SEQUENCE a.q OWNED BY a.t.id");
+    run(&mut w, "INSERT INTO a.t (id) VALUES (1)");
+    run(&mut w, "CREATE SCHEMA b");
+    run(&mut w, "CREATE VIEW b.v AS SELECT id FROM a.t");
+    run(&mut w, "CREATE VIEW b.w AS SELECT id FROM b.v");
+    // Each answer as 18.6 gives it, its DETAIL after a colon.
+    assert_eq!(
+        refused(&mut w, "DROP SCHEMA a"),
+        (
+            Some("2BP01"),
+            "cannot drop schema a because other objects depend on it: table a.t depends on schema \
+             a\nview b.v depends on table a.t\nview b.w depends on view b.v"
+                .into()
+        )
+    );
+    assert_eq!(
+        refused(&mut w, "DROP SCHEMA a, b"),
+        (
+            Some("2BP01"),
+            "cannot drop desired object(s) because other objects depend on them: table a.t \
+             depends on schema a\nview b.v depends on table a.t\nview b.w depends on view b.v"
+                .into()
+        )
+    );
+    assert_eq!(
+        refused(&mut w, "CREATE SCHEMA a"),
+        (Some("42P06"), "schema \"a\" already exists".into())
+    );
+    assert_eq!(
+        said(&mut w, "CREATE SCHEMA IF NOT EXISTS a"),
+        ["NOTICE:  schema \"a\" already exists, skipping"]
+    );
+    assert_eq!(
+        refused(&mut w, "CREATE SCHEMA pg_a"),
+        (
+            Some("42939"),
+            "unacceptable schema name \"pg_a\": The prefix \"pg_\" is reserved for system schemas."
+                .into()
+        )
+    );
+    assert_eq!(
+        refused(&mut w, "DROP SCHEMA pg_catalog CASCADE"),
+        (
+            Some("2BP01"),
+            "cannot drop schema pg_catalog because it is required by the database system".into()
+        )
+    );
+    run(&mut w, "CREATE SEQUENCE a.c CACHE 5");
+    assert_eq!(rows(&mut w, "SELECT nextval('a.q'), nextval('a.c')"), ["1|1"]);
+    // A cascade's NOTICE counts what it reports: the sequence a.t's column owns goes with it,
+    // unreported.
+    assert_eq!(
+        said(&mut w, "DROP SCHEMA a CASCADE"),
+        ["NOTICE:  drop cascades to 4 other objects"]
+    );
+    assert_eq!(
+        refused(&mut w, "SELECT currval('a.q')"),
+        (Some("42P01"), "relation \"a.q\" does not exist".into())
+    );
+    // Made again, a sequence of the name has handed the session nothing, its cache none.
+    run(&mut w, "CREATE SCHEMA a");
+    run(&mut w, "CREATE SEQUENCE a.q");
+    run(&mut w, "CREATE SEQUENCE a.c CACHE 5");
+    assert_eq!(
+        refused(&mut w, "SELECT currval('a.q')"),
+        (Some("55000"), "currval of sequence \"q\" is not yet defined in this session".into())
+    );
+    assert_eq!(
+        refused(&mut w, "SELECT lastval()"),
+        (Some("55000"), "lastval is not yet defined in this session".into())
+    );
+    assert_eq!(rows(&mut w, "SELECT nextval('a.c')"), ["1"]);
+    run(&mut w, "DROP SCHEMA a CASCADE");
+    assert_eq!(
+        refused(&mut w, "SELECT * FROM b.v"),
+        (Some("42P01"), "relation \"b.v\" does not exist".into())
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT nspname FROM pg_namespace WHERE nspname IN ('a', 'b') ORDER BY 1"),
+        ["b"]
+    );
+    assert_eq!(
+        said(&mut w, "DROP SCHEMA IF EXISTS a, b"),
+        ["NOTICE:  schema \"a\" does not exist, skipping"]
+    );
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_namespace WHERE nspname = 'b'"), ["0"]);
+    // Made again, a table of the name is a table of its own, its sequence drawn from the start.
+    run(&mut w, "CREATE SCHEMA a");
+    run(&mut w, "CREATE TABLE a.t (id integer PRIMARY KEY, n text)");
+    run(&mut w, "INSERT INTO a.t (id, n) VALUES (7, 'x')");
+    assert_eq!(rows(&mut w, "SELECT id, n FROM a.t"), ["7|x"]);
+    // `public`, which a name with no schema is read in, and the release's own, refused by name.
+    assert!(refused(&mut w, "DROP SCHEMA public").1.contains("has no search path"));
+    assert!(refused(&mut w, "DROP SCHEMA information_schema CASCADE").1.contains("release's own"));
+    assert!(refused(&mut w, "CREATE SCHEMA c AUTHORIZATION u").1.contains("a snail has none"));
+}
+
+#[test]
+fn a_function_a_key_and_an_identity_are_dropped_as_postgresql_drops_them() {
+    let path = tmp("speller-dropped-kinds.snail");
+    let ddl = "CREATE SCHEMA f;
+        CREATE FUNCTION f.g(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+        CREATE TABLE k (id integer PRIMARY KEY, k integer CHECK (f.g(k) > 0));
+        CREATE TABLE f.r (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, n integer);";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    assert_eq!(
+        refused(&mut w, "DROP SCHEMA f"),
+        (
+            Some("2BP01"),
+            "cannot drop schema f because other objects depend on it: function f.g(integer) \
+             depends on schema f\nconstraint k_k_check on table k depends on function \
+             f.g(integer)\ntable f.r depends on schema f"
+                .into()
+        )
+    );
+    assert_eq!(
+        refused(&mut w, "DROP INDEX f.r_pkey"),
+        (
+            Some("2BP01"),
+            "cannot drop index f.r_pkey because constraint r_pkey on table f.r requires it".into()
+        )
+    );
+    assert_eq!(
+        refused(&mut w, "DROP SEQUENCE f.r_id_seq"),
+        (
+            Some("2BP01"),
+            "cannot drop sequence f.r_id_seq because column id of table f.r requires it".into()
+        )
+    );
+    assert_eq!(
+        refused(&mut w, "DROP TABLE pg_class"),
+        (Some("42501"), "permission denied: \"pg_class\" is a system catalog".into())
+    );
+    assert_eq!(
+        refused(&mut w, "DROP TABLE pg_tables"),
+        (Some("42809"), "\"pg_tables\" is not a table".into())
+    );
+    assert_eq!(
+        refused(&mut w, "DROP TABLE nosuch.t"),
+        (Some("3F000"), "schema \"nosuch\" does not exist".into())
+    );
+    assert_eq!(
+        refused(&mut w, "DROP TABLE f.r_pkey"),
+        (Some("42809"), "\"r_pkey\" is not a table".into())
+    );
+    assert_eq!(
+        said(&mut w, "DROP SCHEMA f CASCADE"),
+        ["NOTICE:  drop cascades to 3 other objects"]
+    );
+    // The CHECK went with the function, the table it was on kept.
+    assert_eq!(
+        rows(&mut w, "SELECT conname FROM pg_constraint WHERE conrelid = 'k'::regclass ORDER BY 1"),
+        ["k_id_not_null", "k_pkey"]
+    );
+    run(&mut w, "INSERT INTO k (id, k) VALUES (1, -5)");
+    // The DDL a table is read back from, where its DDL drops anything, is the whole of it, and
+    // reads to the table as it stands.
+    let ddl = w.catalog.ddl_of("k").unwrap();
+    let read = Catalog::parse(&ddl).unwrap();
+    assert!(read.table("k").is_some_and(|t| t.checks.is_empty()));
+}
+
+#[test]
+fn a_cascade_takes_the_parts_of_a_table_it_leaves_in_a_write_beside_it() {
+    let mut w = snail("cascade-parts");
+    run(&mut w, "CREATE SCHEMA d");
+    run(&mut w, "CREATE SEQUENCE d.s");
+    run(&mut w, "CREATE TABLE d.p (id integer PRIMARY KEY)");
+    run(
+        &mut w,
+        "CREATE TABLE c (id integer PRIMARY KEY DEFAULT nextval('d.s'), p integer REFERENCES d.p (id))",
+    );
+    run(&mut w, "INSERT INTO d.p (id) VALUES (1)");
+    run(&mut w, "INSERT INTO c (p) VALUES (1)");
+    // The write's own rows, before the drop and after it, every one kept.
+    run(&mut w, "BEGIN");
+    run(&mut w, "INSERT INTO c (id, p) VALUES (2, 1)");
+    assert_eq!(
+        said(&mut w, "DROP SCHEMA d CASCADE"),
+        ["NOTICE:  drop cascades to 4 other objects"]
+    );
+    run(&mut w, "INSERT INTO c (id, p) VALUES (5, 9)");
+    run(&mut w, "COMMIT");
+    assert_eq!(rows(&mut w, "SELECT id, p FROM c ORDER BY id"), ["1|1", "2|1", "5|9"]);
+    // The DEFAULT went with the sequence, the foreign key with the table it referenced.
+    assert_eq!(
+        refused(&mut w, "INSERT INTO c (p) VALUES (9)"),
+        (
+            Some("23502"),
+            "null value in column \"id\" of relation \"c\" violates not-null constraint: Failing \
+             row contains (null, 9)."
+                .into()
+        )
+    );
+}
+
+#[test]
+fn a_table_declared_inside_an_unfinished_write_takes_every_write() {
+    let mut w = snail("declared-inside");
+    for end in ["ROLLBACK", "COMMIT"] {
+        run(&mut w, "BEGIN");
+        run(
+            &mut w,
+            "CREATE TABLE copy (slobol__place bigint NOT NULL, amount numeric(9,2), PRIMARY KEY \
+             (slobol__place))",
+        );
+        run(&mut w, "INSERT INTO copy (slobol__place, amount) VALUES (1, 12.50)");
+        run(&mut w, "INSERT INTO copy (slobol__place, amount) VALUES (2, 1.00)");
+        run(&mut w, "INSERT INTO copy (slobol__place, amount) VALUES (3, 2.00), (4, 3.00)");
+        run(&mut w, "DELETE FROM copy WHERE slobol__place IN (1)");
+        run(&mut w, "UPDATE copy SET amount = amount + 1 WHERE slobol__place IN (2, 3)");
+        assert_eq!(
+            rows(&mut w, "SELECT slobol__place, amount FROM copy ORDER BY 1"),
+            ["2|2.00", "3|3.00", "4|3.00"]
+        );
+        run(&mut w, end);
+    }
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM copy"), ["3"]);
+    // A failed statement fails its transaction, which then reads no name until it ends.
+    run(&mut w, "BEGIN");
+    run(&mut w, "CREATE TABLE made (id integer PRIMARY KEY)");
+    assert!(w.execute("SELECT nosuch FROM made").is_err());
+    assert_eq!(
+        refused(&mut w, "INSERT INTO made (id) VALUES (1)"),
+        (
+            Some("25P02"),
+            "current transaction is aborted, commands ignored until end of transaction block".into()
+        )
+    );
+    run(&mut w, "ROLLBACK");
+    // Under REPEATABLE READ: a table dropped and made again under its name, written beside
+    // another, every write kept by the commit, the dropped table's rows gone with it.
+    run(&mut w, "CREATE TABLE other (id integer PRIMARY KEY)");
+    run(&mut w, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    run(&mut w, "INSERT INTO other VALUES (1)");
+    run(&mut w, "INSERT INTO copy (slobol__place, amount) VALUES (9, 1.00)");
+    run(&mut w, "DROP TABLE copy");
+    run(
+        &mut w,
+        "CREATE TABLE copy (slobol__place bigint NOT NULL, note text, PRIMARY KEY (slobol__place))",
+    );
+    run(&mut w, "INSERT INTO copy VALUES (1, 'a'), (2, 'b')");
+    run(&mut w, "INSERT INTO copy VALUES (3, 'c')");
+    run(&mut w, "DELETE FROM copy WHERE slobol__place IN (2)");
+    run(&mut w, "COMMIT");
+    assert_eq!(rows(&mut w, "SELECT * FROM copy ORDER BY 1"), ["1|a", "3|c"]);
+    assert_eq!(rows(&mut w, "SELECT * FROM other"), ["1"]);
+    run(&mut w, "DROP TABLE copy, other");
+    assert_eq!(
+        refused(&mut w, "SELECT * FROM copy"),
+        (Some("42P01"), "relation \"copy\" does not exist".into())
+    );
+}

@@ -39,6 +39,24 @@ impl Touched {
     pub(super) fn is_empty(&self) -> bool {
         self.written.values().all(Vec::is_empty) && self.taken.values().all(Vec::is_empty)
     }
+
+    /// Each key and each order moved to its place in a catalog declared since, as `key` and `order`
+    /// place them; what was recorded of one no longer declared let go.
+    pub(super) fn renumbered(
+        self,
+        key: &dyn Fn((usize, usize)) -> Option<(usize, usize)>,
+        order: &dyn Fn((usize, usize)) -> Option<(usize, usize)>,
+    ) -> Touched {
+        Touched {
+            written: self.written.into_iter().filter_map(|(k, v)| Some((key(k)?, v))).collect(),
+            taken: self.taken.into_iter().filter_map(|(k, v)| Some((key(k)?, v))).collect(),
+            excluded: self
+                .excluded
+                .into_iter()
+                .filter_map(|(o, v)| Some((order(o)?, v)))
+                .collect(),
+        }
+    }
 }
 
 /// A value as `=` sees it: a float's class, any other value itself.

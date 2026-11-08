@@ -337,6 +337,62 @@ pub(crate) enum Form {
         collation: Collation,
         if_not_exists: bool,
     },
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    DropRelations {
+        kind: Dropped,
+        /// Each relation named: its schema where the name gives one, and its own name.
+        names: Vec<(Option<String>, String)>,
+        if_exists: bool,
+        cascade: bool,
+    },
+}
+
+/// The kind of relation a DROP names: DROP TABLE, VIEW, SEQUENCE or INDEX.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Dropped {
+    Table,
+    View,
+    Sequence,
+    Index,
+}
+
+impl Dropped {
+    /// The kind as pg_class's relkind gives it.
+    fn relkind(self) -> char {
+        match self {
+            Dropped::Table => 'r',
+            Dropped::View => 'v',
+            Dropped::Sequence => 'S',
+            Dropped::Index => 'i',
+        }
+    }
+
+    /// The word PostgreSQL's DROP names the kind by.
+    fn word(self) -> &'static str {
+        match self {
+            Dropped::Table => "table",
+            Dropped::View => "view",
+            Dropped::Sequence => "sequence",
+            Dropped::Index => "index",
+        }
+    }
+
+    fn one(self) -> &'static str {
+        match self {
+            Dropped::Index => "an index",
+            Dropped::Table => "a table",
+            Dropped::View => "a view",
+            Dropped::Sequence => "a sequence",
+        }
+    }
 }
 
 pub(crate) enum AlterType {
@@ -428,7 +484,119 @@ pub(crate) fn read(tokens: &[Token]) -> Option<Result<Form>> {
     if c.kws(&["CREATE", "COLLATION"]) {
         return Some(create_collation(&mut c));
     }
+    if c.kws(&["CREATE", "SCHEMA"]) {
+        return Some(create_schema(&mut c));
+    }
+    if c.kws(&["DROP", "SCHEMA"]) {
+        return Some(drop_schema(&mut c));
+    }
+    for (word, kind) in [
+        ("TABLE", Dropped::Table),
+        ("VIEW", Dropped::View),
+        ("SEQUENCE", Dropped::Sequence),
+        ("INDEX", Dropped::Index),
+    ] {
+        if c.kws(&["DROP", word]) {
+            return Some(drop_relations(&mut c, kind));
+        }
+    }
     None
+}
+
+/// DROP { TABLE | VIEW | SEQUENCE | INDEX [CONCURRENTLY] } [IF EXISTS] name [, …] [CASCADE |
+/// RESTRICT]. CONCURRENTLY is read, and drops the index as DROP INDEX does: a snail lays an index
+/// out in one round, and takes it out in one.
+fn drop_relations(c: &mut Cursor, kind: Dropped) -> Result<Form> {
+    let concurrently = kind == Dropped::Index && c.kw("CONCURRENTLY");
+    let if_exists = c.kws(&["IF", "EXISTS"]);
+    let mut names = Vec::new();
+    loop {
+        let first = c.ident()?;
+        let name = match c.token(Token::Period) {
+            true => (Some(first), c.ident()?),
+            false => (None, first),
+        };
+        if c.peek() == Some(&Token::Period) {
+            return Err(Error::new(
+                "DROP TABLE names a table by its database: cross-database references are not \
+                 implemented",
+            ));
+        }
+        names.push(name);
+        if !c.token(Token::Comma) {
+            break;
+        }
+    }
+    let cascade = c.kw("CASCADE");
+    if !cascade {
+        c.kw("RESTRICT");
+    }
+    end(c, &format!("DROP {}", kind.word().to_uppercase()))?;
+    if concurrently && names.len() > 1 {
+        return Err(Error::new(
+            "DROP INDEX CONCURRENTLY does not support dropping multiple objects",
+        ));
+    }
+    if concurrently && cascade {
+        return Err(Error::new("DROP INDEX CONCURRENTLY does not support CASCADE"));
+    }
+    Ok(Form::DropRelations {
+        kind,
+        names,
+        if_exists,
+        cascade,
+    })
+}
+
+/// CREATE SCHEMA [IF NOT EXISTS] name. AUTHORIZATION names a role, and the statements a schema is
+/// made with read their names by a search path that begins with it: each refused by name.
+fn create_schema(c: &mut Cursor) -> Result<Form> {
+    let if_not_exists = c.kws(&["IF", "NOT", "EXISTS"]);
+    let authorization = || {
+        Error::new(
+            "CREATE SCHEMA … AUTHORIZATION is refused: roles and privileges are the server's own, \
+             and a snail has none",
+        )
+    };
+    if c.is("AUTHORIZATION") {
+        return Err(authorization());
+    }
+    let name = c.ident()?;
+    if c.is("AUTHORIZATION") {
+        return Err(authorization());
+    }
+    if c.is("CREATE") || c.is("GRANT") {
+        return Err(Error::new(format!(
+            "CREATE SCHEMA {name} {} is refused: the statements a schema is made with read their \
+             names by a search path that begins with it, and a snail names each table by its \
+             schema, and has no search path",
+            c.rest()
+        )));
+    }
+    end(c, "CREATE SCHEMA")?;
+    Ok(Form::CreateSchema {
+        name,
+        if_not_exists,
+    })
+}
+
+/// DROP SCHEMA [IF EXISTS] name [, …] [CASCADE | RESTRICT].
+fn drop_schema(c: &mut Cursor) -> Result<Form> {
+    let if_exists = c.kws(&["IF", "EXISTS"]);
+    let mut names = vec![c.ident()?];
+    while c.token(Token::Comma) {
+        names.push(c.ident()?);
+    }
+    let cascade = c.kw("CASCADE");
+    if !cascade {
+        c.kw("RESTRICT");
+    }
+    end(c, "DROP SCHEMA")?;
+    Ok(Form::DropSchema {
+        names,
+        if_exists,
+        cascade,
+    })
 }
 
 fn end(c: &Cursor, what: &str) -> Result<()> {
@@ -1865,8 +2033,11 @@ struct Draft {
     kept: bool,
     /// Each index held as element strands, with the number of tables declared before it: its
     /// strands lie among the tables where its statement stands, so that no later statement moves a
-    /// table.
+    /// table. A DROP that takes a table out moves those after it down.
     strands_at: Vec<(usize, String, String)>,
+    /// The schemas CREATE SCHEMA made, in the order made; a schema an object names that no
+    /// statement made stands while an object lies in it.
+    schemas: Vec<String>,
     /// The release whose operator classes are each type's defaults.
     release: u8,
     /// Each table's place in `tables`, by its name.
@@ -1895,6 +2066,7 @@ struct Lens {
     collations: usize,
     views: usize,
     functions: usize,
+    schemas: usize,
 }
 
 /// One more of a name.
@@ -2051,6 +2223,7 @@ impl Draft {
             collations: self.collations.len(),
             views: self.views.len(),
             functions: self.functions.len(),
+            schemas: self.schemas.len(),
         }
     }
 
@@ -2170,6 +2343,7 @@ impl Draft {
             collations: 0,
             views: 0,
             functions: 0,
+            schemas: 0,
         };
         self.objects_since(all, &[])
     }
@@ -2179,6 +2353,9 @@ impl Draft {
     fn objects_since(&self, before: Lens, touched: &[&str]) -> Vec<crate::oids::Object> {
         use crate::oids::Object as O;
         let mut out = Vec::new();
+        for s in &self.schemas[before.schemas.min(self.schemas.len())..] {
+            out.push(O::Namespace(s.clone()));
+        }
         for c in &self.collations[before.collations.min(self.collations.len())..] {
             out.push(O::Collation(crate::oids::full(&c.name)));
         }
@@ -2214,6 +2391,13 @@ impl Draft {
         let mut seen: Vec<String> = Vec::new();
         let mut with_schemas = Vec::with_capacity(out.len());
         for o in out {
+            if let O::Namespace(n) = &o {
+                if !seen.contains(n) {
+                    seen.push(n.clone());
+                    with_schemas.push(o);
+                }
+                continue;
+            }
             let schema = crate::oids::parts(o.name()).0;
             if schema != "public" && schema != "pg_catalog" && !seen.iter().any(|s| s == schema) {
                 seen.push(schema.to_string());
@@ -3164,8 +3348,454 @@ impl Draft {
                 }
                 self.collations.push(collation);
             }
+            Form::CreateSchema {
+                name,
+                if_not_exists,
+            } => {
+                if name.starts_with("pg_") {
+                    return Err(Error::new(format!(
+                        "unacceptable schema name \"{name}\": The prefix \"pg_\" is reserved for \
+                         system schemas."
+                    )));
+                }
+                if self.schema_stands(&name) {
+                    if if_not_exists {
+                        notices.push(format!("schema \"{name}\" already exists, skipping"));
+                        return Ok(notices);
+                    }
+                    return Err(Error::new(format!("schema \"{name}\" already exists")));
+                }
+                self.schemas.push(name);
+            }
+            Form::DropSchema {
+                names,
+                if_exists,
+                cascade,
+            } => return self.drop_schemas(&names, if_exists, cascade),
+            Form::DropRelations {
+                kind,
+                names,
+                if_exists,
+                cascade,
+            } => return self.drop_relations(kind, &names, if_exists, cascade),
         }
         Ok(notices)
+    }
+
+    /// One of pg_catalog's relations of that name, as the release's catalog holds it: its OID and
+    /// its kind.
+    fn built_in_relation(&self, name: &str) -> Option<(u32, char)> {
+        crate::pgcatalog::built_in("pg_class", self.release)
+            .iter()
+            .find(|r| {
+                r.get("relnamespace").cloned().flatten().as_deref() == Some("11")
+                    && r.get("relname").cloned().flatten().as_deref() == Some(name)
+            })
+            .and_then(|r| {
+                let oid = r.get("oid").cloned().flatten()?.parse().ok()?;
+                Some((oid, r.get("relkind").cloned().flatten()?.chars().next()?))
+            })
+    }
+
+    /// The kind of the file's relation of that name in that schema, as pg_class's relkind gives it.
+    fn relation_kind(&self, schema: &str, own: &str) -> Option<char> {
+        use crate::oids::full;
+        let name = format!("{schema}.{own}");
+        if self.tables.iter().any(|t| full(&t.name) == name) {
+            return Some('r');
+        }
+        if self.views.iter().any(|v| full(&v.name) == name) {
+            return Some('v');
+        }
+        if self.sequences.iter().any(|x| full(&x.name) == name) {
+            return Some('S');
+        }
+        if self
+            .tables
+            .iter()
+            .any(|t| schema_of(&t.name) == schema && t.keys().any(|k| k.name == own))
+        {
+            return Some('i');
+        }
+        self.types
+            .iter()
+            .any(|t| full(&t.name) == name && matches!(t.kind, TypeKind::Composite { .. }))
+            .then_some('c')
+    }
+
+    /// DROP TABLE, VIEW, SEQUENCE or INDEX: each relation named, found as PostgreSQL's search path
+    /// finds a name with no schema (pg_catalog's own first, then public), refused where it is of
+    /// another kind; and under CASCADE every object that depends on one, refused under RESTRICT
+    /// where an object depends on one.
+    fn drop_relations(
+        &mut self,
+        kind: Dropped,
+        names: &[(Option<String>, String)],
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<Vec<String>> {
+        use crate::oids::Object as O;
+        let (word, one) = (kind.word(), kind.one());
+        let mut notices = Vec::new();
+        let mut named = Vec::new();
+        for (schema, own) in names {
+            if schema.as_deref().is_none_or(|s| s == "pg_catalog") {
+                if let Some((oid, k)) = self.built_in_relation(own) {
+                    return Err(Error::new(match k == kind.relkind() {
+                        false => format!("\"{own}\" is not {one}"),
+                        true if oid < 12000 => {
+                            format!("permission denied: \"{own}\" is a system catalog")
+                        }
+                        true => format!(
+                            "DROP {} pg_catalog.{own} is refused: PostgreSQL's own relations are \
+                             the release's, which a snail carries beside its file, not objects its \
+                             DDL made",
+                            word.to_uppercase()
+                        ),
+                    }));
+                }
+            }
+            if schema.as_deref() == Some("information_schema") {
+                return Err(Error::new(format!(
+                    "DROP {} of information_schema's is refused: its relations are the release's \
+                     own, which a snail carries beside its file, not objects its DDL made",
+                    word.to_uppercase()
+                )));
+            }
+            let s = schema.clone().unwrap_or_else(|| "public".to_string());
+            if schema.is_some() && !self.schema_stands(&s) {
+                if !if_exists {
+                    return Err(Error::new(format!("schema \"{s}\" does not exist")));
+                }
+                notices.push(format!("schema \"{s}\" does not exist, skipping"));
+                continue;
+            }
+            match self.relation_kind(&s, own) {
+                Some(k) if k == kind.relkind() => {
+                    let oid = self.oids.of(&O::Class(format!("{s}.{own}"))).unwrap_or(0);
+                    named.push(crate::deparse::depend::Addr::of(
+                        crate::deparse::depend::CLASS,
+                        oid,
+                    ));
+                }
+                Some(_) => return Err(Error::new(format!("\"{own}\" is not {one}"))),
+                None if if_exists => {
+                    notices.push(format!("{word} \"{own}\" does not exist, skipping"))
+                }
+                None => return Err(Error::new(format!("{word} \"{own}\" does not exist"))),
+            }
+        }
+        self.dropping(&named, cascade, notices)
+    }
+
+    /// What a DROP of the objects named takes, as PostgreSQL's dependency walk finds it over
+    /// pg_depend's rows, taken out of the draft; with what it says beside `notices`.
+    fn dropping(
+        &mut self,
+        named: &[crate::deparse::depend::Addr],
+        cascade: bool,
+        mut notices: Vec<String>,
+    ) -> Result<Vec<String>> {
+        if named.is_empty() {
+            return Ok(notices);
+        }
+        let catalog = Catalog {
+            release: self.release,
+            ..self.so_far()
+        };
+        let dropped = crate::cascade::dropped(&catalog, named, cascade)?;
+        self.take_out(&catalog, &dropped.taken)?;
+        notices.extend(dropped.notice);
+        Ok(notices)
+    }
+
+    /// Whether a schema of that name stands: PostgreSQL's own, one CREATE SCHEMA made, or one an
+    /// object of the draft lies in.
+    fn schema_stands(&self, name: &str) -> bool {
+        self.schemas.iter().any(|s| s == name)
+            || self.built_in_schema(name).is_some()
+            || self
+                .objects()
+                .iter()
+                .any(|o| matches!(o, crate::oids::Object::Namespace(n) if n == name))
+    }
+
+    /// The OID of one of PostgreSQL's own schemas, as the release's catalog holds it.
+    fn built_in_schema(&self, name: &str) -> Option<u32> {
+        crate::pgcatalog::built_in("pg_namespace", self.release)
+            .iter()
+            .find(|r| r.get("nspname").cloned().flatten().as_deref() == Some(name))
+            .and_then(|r| r.get("oid").cloned().flatten()?.parse().ok())
+    }
+
+    /// DROP SCHEMA: each schema named, and under CASCADE every object that depends on one, as
+    /// PostgreSQL's dependency walk finds them over pg_depend's rows; refused under RESTRICT where an
+    /// object depends on one. `public`, which every name without a schema is read in, and
+    /// `information_schema`, the release's own, are refused by name.
+    fn drop_schemas(
+        &mut self,
+        names: &[String],
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<Vec<String>> {
+        let mut notices = Vec::new();
+        let mut found: Vec<&str> = Vec::new();
+        for n in names {
+            if self.schema_stands(n) {
+                found.push(n);
+                continue;
+            }
+            if !if_exists {
+                return Err(Error::new(format!("schema \"{n}\" does not exist")));
+            }
+            notices.push(format!("schema \"{n}\" does not exist, skipping"));
+        }
+        if found.is_empty() {
+            return Ok(notices);
+        }
+        let mut named = Vec::new();
+        for n in found {
+            let oid = match n {
+                "public" => {
+                    return Err(Error::new(
+                        "DROP SCHEMA public is refused: a snail reads every name written without a \
+                         schema as public's, and has no search path",
+                    ))
+                }
+                "information_schema" => {
+                    return Err(Error::new(
+                        "DROP SCHEMA information_schema is refused: its views are the release's \
+                         own, which a snail carries beside its file, not objects its DDL made",
+                    ))
+                }
+                _ => self
+                    .oids
+                    .of(&crate::oids::Object::Namespace(n.to_string()))
+                    .or_else(|| self.built_in_schema(n))
+                    .unwrap_or(0),
+            };
+            named.push(crate::deparse::depend::Addr::of(crate::deparse::depend::NAMESPACE, oid));
+        }
+        self.dropping(&named, cascade, notices)
+    }
+
+    /// What a DROP takes, taken out of the draft: each whole object, and each part of an object it
+    /// leaves that stands alone (a DEFAULT, a CHECK, a foreign key, an index, a domain's
+    /// constraint). A column of a relation it leaves, or a key of a table it leaves, is refused by
+    /// name: that is ALTER TABLE's DROP COLUMN and DROP CONSTRAINT, which the snail does not write.
+    fn take_out(&mut self, catalog: &Catalog, taken: &[crate::cascade::Taken]) -> Result<()> {
+        use crate::deparse::depend as d;
+        use crate::oids::{full, Object as O};
+        let whole = |class: u32, oid: u32| {
+            taken
+                .iter()
+                .any(|t| t.addr.class == class && t.addr.oid == oid && t.addr.sub == 0)
+        };
+        let of_table = |name: &str| catalog.oids.of(&O::Class(name.to_string())).unwrap_or(0);
+        let mut tables: Vec<String> = Vec::new();
+        let mut sequences: Vec<String> = Vec::new();
+        let mut views: Vec<String> = Vec::new();
+        let mut types: Vec<String> = Vec::new();
+        let mut functions: Vec<(String, String)> = Vec::new();
+        let mut collations: Vec<String> = Vec::new();
+        let mut schemas: Vec<String> = Vec::new();
+        // The parts of objects left standing: (table or domain, name).
+        let mut defaults: Vec<(String, String)> = Vec::new();
+        let mut constraints: Vec<(String, String)> = Vec::new();
+        let mut indexes: Vec<(String, String)> = Vec::new();
+        for t in taken {
+            let Some(o) = catalog.oids.object(t.addr.oid) else {
+                continue;
+            };
+            match (t.addr.class, o) {
+                (d::NAMESPACE, O::Namespace(n)) => schemas.push(n.clone()),
+                (d::CLASS, O::Class(n)) if t.addr.sub != 0 => {
+                    if t.part_of_whole() || whole(d::CLASS, t.addr.oid) {
+                        continue;
+                    }
+                    let what = match self.views.iter().any(|v| full(&v.name) == *n) {
+                        true => "view",
+                        false => "table",
+                    };
+                    let column = crate::pgcatalog::file_rows(catalog, "pg_attribute")
+                        .iter()
+                        .find(|r| {
+                            r.get("attrelid").cloned().flatten() == Some(t.addr.oid.to_string())
+                                && r.get("attnum").cloned().flatten()
+                                    == Some(t.addr.sub.to_string())
+                        })
+                        .and_then(|r| r.get("attname").cloned().flatten())
+                        .unwrap_or_default();
+                    return Err(Error::new(format!(
+                        "the drop reaches column {column} of {what} {n}, which it leaves: a column \
+                         is dropped by ALTER TABLE … DROP COLUMN, which the snail does not write"
+                    )));
+                }
+                (d::CLASS, O::Class(n)) => {
+                    if self.tables.iter().any(|x| full(&x.name) == *n) {
+                        tables.push(n.clone());
+                    } else if self.sequences.iter().any(|x| full(&x.name) == *n) {
+                        sequences.push(n.clone());
+                    } else if self.views.iter().any(|x| full(&x.name) == *n) {
+                        views.push(n.clone());
+                    } else if let Some(x) = self.tables.iter().find(|x| {
+                        let (s, own) = crate::oids::parts(n);
+                        schema_of(&x.name) == s && x.indexes.iter().any(|k| k.name == own)
+                    }) {
+                        // An index of a table: with it where the table goes; a key's or an
+                        // EXCLUDE's goes with its constraint.
+                        let own = crate::oids::parts(n).1.to_string();
+                        let k = x.indexes.iter().find(|k| k.name == own).unwrap();
+                        if k.exclusion.is_none() && !whole(d::CLASS, of_table(&full(&x.name))) {
+                            indexes.push((x.name.clone(), own));
+                        }
+                    }
+                }
+                (d::TYPE, O::Type(n)) => {
+                    let declared = self.types.iter().any(|x| full(&x.name) == *n)
+                        || self.domains.iter().any(|x| full(&x.name) == *n);
+                    if declared {
+                        types.push(n.clone());
+                    }
+                }
+                (d::PROC, O::Proc(n, args)) => {
+                    if self.functions.iter().any(|f| full(&f.name) == *n) {
+                        functions.push((n.clone(), args.clone()));
+                    }
+                }
+                (d::COLLATION, O::Collation(n)) => collations.push(n.clone()),
+                (d::CONSTRAINT, O::Constraint(on, n)) => {
+                    if let Some(x) = self.tables.iter().find(|x| full(&x.name) == *on) {
+                        if whole(d::CLASS, of_table(on)) {
+                            continue;
+                        }
+                        let keyed = x.primary.iter().chain(&x.uniques).any(|k| k.name == *n);
+                        if keyed {
+                            return Err(Error::new(format!(
+                                "the drop reaches constraint {n} on table {on}, which it leaves: a \
+                                 key is dropped by ALTER TABLE … DROP CONSTRAINT, which the snail \
+                                 does not write"
+                            )));
+                        }
+                        // An EXCLUDE goes with its index.
+                        if x.indexes.iter().any(|k| k.name == *n && k.exclusion.is_some()) {
+                            indexes.push((x.name.clone(), n.clone()));
+                            continue;
+                        }
+                        constraints.push((x.name.clone(), n.clone()));
+                    } else if let Some(x) = self.domains.iter().find(|x| full(&x.name) == *on) {
+                        let oid = catalog.oids.of(&O::Type(full(&x.name))).unwrap_or(0);
+                        if !whole(d::TYPE, oid) {
+                            constraints.push((x.name.clone(), n.clone()));
+                        }
+                    }
+                }
+                (d::ATTRDEF, O::Default(on, c)) if !whole(d::CLASS, of_table(on)) => {
+                    if let Some(x) = self.tables.iter().find(|x| full(&x.name) == *on) {
+                        defaults.push((x.name.clone(), c.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The names of constraints that go, each taken back once from those a schema holds.
+        let mut gone: Vec<String> = Vec::new();
+        let mut removed_at: Vec<usize> = Vec::new();
+        for (i, x) in self.tables.iter().enumerate() {
+            if tables.contains(&full(&x.name)) {
+                removed_at.push(i);
+                let s = schema_of(&x.name);
+                gone.extend(x.checks.iter().map(|k| qualified(s, &k.name)));
+                gone.extend(x.foreign_keys.iter().map(|k| qualified(s, &k.name)));
+            }
+        }
+        for x in &self.domains {
+            if types.contains(&full(&x.name)) {
+                let s = schema_of(&x.name);
+                gone.extend(x.checks.iter().map(|k| qualified(s, &k.name)));
+                gone.extend(x.not_null_name.iter().map(|k| qualified(s, k)));
+            }
+        }
+        for (on, n) in &constraints {
+            gone.push(qualified(schema_of(on), n));
+            if let Some(x) = self.table_mut(on) {
+                x.checks.retain(|k| k.name != *n);
+                x.foreign_keys.retain(|k| k.name != *n);
+            } else if let Some(x) = self.domains.iter_mut().find(|x| x.name == *on) {
+                x.checks.retain(|k| k.name != *n);
+                if x.not_null_name.as_deref() == Some(n.as_str()) {
+                    x.not_null = false;
+                    x.not_null_name = None;
+                }
+            }
+        }
+        for (on, c) in &defaults {
+            if let Some(col) = self
+                .table_mut(on)
+                .and_then(|x| x.columns.iter_mut().find(|y| y.name == *c))
+            {
+                col.default = None;
+            }
+        }
+        for (on, k) in &indexes {
+            if let Some(x) = self.table_mut(on) {
+                x.indexes.retain(|y| y.name != *k);
+                if x.clustered.as_ref() == Some(k) {
+                    x.clustered = None;
+                }
+            }
+        }
+        self.strands_at.retain(|(_, on, k)| {
+            !tables.contains(&full(on)) && !indexes.iter().any(|(t, i)| t == on && i == k)
+        });
+        for s in &mut self.strands_at {
+            s.0 -= removed_at.iter().filter(|&&r| r < s.0).count();
+        }
+        self.tables.retain(|x| !tables.contains(&full(&x.name)));
+        self.sequences.retain(|x| !sequences.contains(&full(&x.name)));
+        self.views.retain(|x| !views.contains(&full(&x.name)));
+        self.types.retain(|x| !types.contains(&full(&x.name)));
+        self.domains.retain(|x| !types.contains(&full(&x.name)));
+        self.functions.retain(|f| {
+            let args: Vec<String> = f.args.iter().map(|t| t.pg_name()).collect();
+            !functions.contains(&(full(&f.name), args.join(",")))
+        });
+        self.collations.retain(|x| !collations.contains(&full(&x.name)));
+        self.schemas.retain(|x| !schemas.contains(x));
+        for q in gone {
+            if let Some(i) = self.check_names.iter().position(|x| *x == q) {
+                self.check_names.remove(i);
+            }
+        }
+        self.recount();
+        Ok(())
+    }
+
+    /// The counts and places `relation`, `constraint` and `table` read, made again from what the
+    /// draft holds, once a DROP has taken objects out of it.
+    fn recount(&mut self) {
+        self.table_at.clear();
+        self.relations.clear();
+        self.key_constraints.clear();
+        for t in std::mem::take(&mut self.tables) {
+            self.push_table(t);
+        }
+        for s in &self.sequences {
+            count_in(
+                &mut self.relations,
+                in_schema(schema_of(&s.name), bare(&s.name)),
+            );
+        }
+        for v in &self.views {
+            count_in(
+                &mut self.relations,
+                in_schema(schema_of(&v.name), bare(&v.name)),
+            );
+        }
+        self.check_named.clear();
+        for q in &self.check_names {
+            count_in(&mut self.check_named, q.clone());
+        }
     }
 
     /// The table and column a sequence's OWNED BY names, checked; or what it was owned by before.
@@ -5914,8 +6544,23 @@ pub(crate) fn declares(sql: &str) -> Option<&'static str> {
         "ALTER TYPE" => "ALTER TYPE",
         "ALTER DOMAIN" => "ALTER DOMAIN",
         "CREATE VIEW" | "CREATE OR REPLACE VIEW" => "CREATE VIEW",
+        "CREATE SCHEMA" => "CREATE SCHEMA",
+        "DROP SCHEMA" => "DROP SCHEMA",
+        "DROP TABLE" => "DROP TABLE",
+        "DROP VIEW" => "DROP VIEW",
+        "DROP SEQUENCE" => "DROP SEQUENCE",
+        "DROP INDEX" => "DROP INDEX",
         _ => return None,
     })
+}
+
+/// Whether a statement's notice is PostgreSQL's own, which a session hears as PostgreSQL's NOTICE:
+/// what IF [NOT] EXISTS passed over, what a DROP took with it, an ICU locale's standard form. The
+/// others are the snail's word on what it reads and does nothing with.
+pub(crate) fn said_by_postgresql(notice: &str) -> bool {
+    notice.ends_with(", skipping")
+        || notice.starts_with("drop cascades to ")
+        || notice.starts_with("using standard form ")
 }
 
 /// A relation's name as text, as PostgreSQL's regclass reads it: its parts folded unless quoted.
@@ -5958,11 +6603,20 @@ pub(crate) fn function_statements(ddl: &str) -> Result<Vec<String>> {
 
 /// The statements that declare a table, as they are written: the table, its indexes and its order,
 /// with every function, type, domain and collation of the DDL, and the sequences its columns take
-/// values from.
+/// values from. Where the DDL drops anything, every statement of it: a statement after a DROP may
+/// stand on what the drop took, and only the whole reads to the catalog.
 pub(crate) fn ddl_of(catalog: &Catalog, table: &str) -> Result<String> {
     let t = catalog
         .table(table)
         .ok_or_else(|| Error::new(format!("{table} is not in the snail")))?;
+    let all = statements(&catalog.ddl)?;
+    if all.iter().any(|s| head(s).0.starts_with("DROP")) {
+        return Ok(all
+            .iter()
+            .map(|s| format!("{};", written(s)))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
     let mut sequences: Vec<String> = catalog
         .sequences
         .iter()

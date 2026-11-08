@@ -14,19 +14,34 @@ use std::collections::{HashMap, VecDeque};
 
 /// What a session holds of its sequences beside the values they handed it and it has not used:
 /// the value each last gave it, which `currval` reads, and the sequence it drew from last, whose
-/// value `lastval` reads. Neither is rolled back.
+/// value `lastval` reads. Neither is rolled back. Each is held by the sequence's OID beside its
+/// name, as PostgreSQL's session holds it by the relation: a sequence dropped and made again under
+/// the name has handed this session nothing, and one a rollback brings back has.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Drawn {
-    current: HashMap<String, i64>,
+    current: HashMap<String, (u32, i64)>,
     last: Option<String>,
 }
 
 impl Drawn {
     /// A value a sequence handed the session: its `currval`, and the sequence `lastval` reads.
-    pub(super) fn drew(&mut self, name: &str, v: i64) {
-        self.current.insert(name.to_string(), v);
+    pub(super) fn drew(&mut self, name: &str, oid: u32, v: i64) {
+        self.current.insert(name.to_string(), (oid, v));
         self.last = Some(name.to_string());
     }
+
+    /// The value the sequence of that name and OID last handed the session.
+    fn current(&self, name: &str, oid: Option<u32>) -> Option<i64> {
+        self.current
+            .get(name)
+            .filter(|(o, _)| Some(*o) == oid)
+            .map(|(_, v)| *v)
+    }
+}
+
+/// A sequence's OID, where the catalog holds it.
+pub(super) fn sequence_oid(catalog: &Catalog, name: &str) -> Option<u32> {
+    catalog.oids.of(&Object::Class(full(name)))
 }
 
 /// A call that moves a sequence, as the statement made it: a value drawn, or the sequence set to a
@@ -58,6 +73,8 @@ pub(super) struct Tab {
     /// hands out next where none was, and whether it has handed it out.
     stands: HashMap<String, (i64, bool)>,
     sequences: Vec<Sequence>,
+    /// Each sequence's OID, by its name.
+    oids: HashMap<String, u32>,
     /// The file's relations that are no sequence, by their full names, each with the words
     /// PostgreSQL names its kind by.
     others: HashMap<String, &'static str>,
@@ -94,11 +111,18 @@ impl Tab {
         for t in &l.catalog.types {
             others.entry(full(&t.name)).or_insert("composite types");
         }
+        let oids = l
+            .catalog
+            .sequences
+            .iter()
+            .filter_map(|s| Some((s.name.clone(), sequence_oid(l.catalog, &s.name)?)))
+            .collect();
         Tab {
             drawn: l.drawn,
             held: l.held.clone(),
             stands: l.stands.clone(),
             sequences: l.catalog.sequences.clone(),
+            oids,
             others,
             release: l.catalog.release,
             read_only: l.read_only,
@@ -170,10 +194,15 @@ impl Tab {
 
     /// What a call that came to `v` leaves the session.
     fn took(&mut self, op: &Op, v: i64) {
+        let oid = |s: &String| self.oids.get(s).copied().unwrap_or(0);
         match op {
-            Op::Draw(s) => self.drawn.drew(s, v),
+            Op::Draw(s) => {
+                let o = oid(s);
+                self.drawn.drew(s, o, v)
+            }
             Op::Set(s, _, true) => {
-                self.drawn.current.insert(s.clone(), v);
+                let o = oid(s);
+                self.drawn.current.insert(s.clone(), (o, v));
             }
             Op::Set(..) => {}
         }
@@ -453,7 +482,7 @@ pub(super) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
         let v = match name {
             "lastval" => {
                 let last = tab.drawn.last.clone();
-                match last.and_then(|s| tab.drawn.current.get(&s).copied()) {
+                match last.and_then(|s| tab.drawn.current(&s, tab.oids.get(&s).copied())) {
                     Some(v) => v,
                     None => return Err(Error::new("lastval is not yet defined in this session")),
                 }
@@ -461,8 +490,8 @@ pub(super) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
             _ => {
                 let s = tab.named(&args[0])?.expect("an argument not NULL");
                 match name {
-                    "currval" => match tab.drawn.current.get(&s) {
-                        Some(v) => *v,
+                    "currval" => match tab.drawn.current(&s, tab.oids.get(&s).copied()) {
+                        Some(v) => v,
                         None => {
                             return Err(Error::new(format!(
                                 "currval of sequence \"{}\" is not yet defined in this session",

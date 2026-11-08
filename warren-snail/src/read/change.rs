@@ -158,12 +158,20 @@ pub(super) struct Declared {
     made: Vec<(String, String)>,
     /// The sequences it made or restarted, which stand where the DDL leaves them.
     resets: Vec<String>,
+    /// The orders a DROP of it took out, by table and name, which its commit lets go: of a table
+    /// dropped, or an index a drop took with it.
+    taken_out: Vec<(String, String)>,
 }
 
 impl Declared {
     /// The orders it made, by table and name.
     pub(super) fn made(&self) -> &[(String, String)] {
         &self.made
+    }
+
+    /// The orders a DROP of it took out, by table and name.
+    pub(super) fn taken_out(&self) -> &[(String, String)] {
+        &self.taken_out
     }
 }
 
@@ -938,6 +946,11 @@ impl Snail {
         };
         let st = match statement::parse(&self.catalog, text) {
             Ok(st) => st,
+            // In a failed transaction only a statement's grammar is read before it is refused,
+            // as PostgreSQL reads no name of it.
+            Err(e) if self.aborted && e.sqlstate() != Some("42601") => {
+                return Err(Error::new(ABORTED))
+            }
             Err(e) => {
                 if self.begun.is_some() && !self.aborted {
                     self.failed()?;
@@ -1465,7 +1478,9 @@ impl Snail {
                 done.rows > 0
             }
             Statement::Declare { ddl, .. } => {
-                self.declare(&ddl)?;
+                let said = self.declare(&ddl)?;
+                done.notices
+                    .extend(said.into_iter().map(|n| format!("NOTICE:  {n}")));
                 true
             }
             Statement::Constraints { names, deferred } => {
@@ -2143,7 +2158,8 @@ impl Snail {
                 .extend(fetched[missing..].iter().copied());
         }
         if let Some(&v) = out.last() {
-            self.drawn.drew(name, v);
+            let oid = super::sequences::sequence_oid(&self.catalog, name).unwrap_or(0);
+            self.drawn.drew(name, oid, v);
         }
         Ok(out)
     }
@@ -2769,7 +2785,8 @@ impl Snail {
                     .catalog
                     .table(&t)
                     .is_some_and(|x| x.orders.iter().any(|y| y.name == o));
-                if touched.contains(&&t) && (made || !declared) {
+                let taken_out = d.taken_out.contains(&(t.clone(), o.clone()));
+                if (touched.contains(&&t) && (made || !declared)) || taken_out {
                     gone.push(e);
                 } else {
                     orders.push((t, o, e));
@@ -3377,19 +3394,20 @@ impl Snail {
     }
 
     /// Whether the newest root names each block the round reads, by its first key: a block the
-    /// transaction staged lies under the lock of the block it began from, and is its own.
+    /// transaction staged lies under the lock of the block it began from, and is its own. An order
+    /// the newest root does not name yet, one the transaction declared, holds only blocks of its own.
     pub(super) fn newest_names(&self, ti: usize, oi: usize, blocks: &[Entry]) -> Result<bool> {
         let blocks: Vec<&Entry> = blocks.iter().filter(|e| e.child.start < STAGED).collect();
         let root = self.reader.peek_root()?;
         let table = &self.catalog.tables[ti];
         let order = &table.orders[oi];
-        let at = root
+        let Some(at) = root
             .orders
             .iter()
             .position(|(t, o, _)| *t == table.name && *o == order.name)
-            .ok_or_else(|| {
-                Error::new(format!("{}: the root names no {}", table.name, order.name))
-            })?;
+        else {
+            return Ok(blocks.is_empty());
+        };
         let (head, entries) =
             crate::write::top_read(table, order, &self.reader.read_extent(root.orders[at].2)?)?;
         if entries.is_empty() && !blocks.is_empty() {
@@ -4145,10 +4163,12 @@ impl Snail {
         Ok(())
     }
 
-    fn declare(&mut self, ddl: &str) -> Result<()> {
+    /// A declaration: the catalog read again with the statement after its DDL, each order it makes
+    /// or changes laid out, each a DROP takes out let go. Returns what PostgreSQL says of it.
+    fn declare(&mut self, ddl: &str) -> Result<Vec<String>> {
         let text = format!("{}\n{ddl};\n", self.catalog.ddl.trim_end());
         let kept = Catalog::statements_in(&self.catalog.ddl)?;
-        let mut catalog = Catalog::parse_kept(&text, kept)?;
+        let (mut catalog, said) = Catalog::parse_declared(&text, kept)?;
         super::old_names(&mut catalog, self.reader.format());
         catalog.with_release(self.root.release)?;
         catalog.with_monetary(&crate::file::monetary_of(&catalog, &self.root.monetary))?;
@@ -4259,7 +4279,7 @@ impl Snail {
             }
             self.catalog = before;
             if !checked? {
-                return Ok(());
+                return Ok(Vec::new());
             }
         }
         let mut stage = self.reader.stage();
@@ -4295,13 +4315,36 @@ impl Snail {
                     .is_none_or(|o| (o.last_value, o.is_called) != (s.last_value, s.is_called))
             })
             .map(|s| s.name.clone())
+            // A sequence dropped keeps no state either.
+            .chain(
+                self.catalog
+                    .sequences
+                    .iter()
+                    .filter(|s| catalog.sequence(&s.name).is_none())
+                    .map(|s| s.name.clone()),
+            )
             .collect();
+        // The orders a DROP took out: of a table it dropped, or an index it took with it.
+        let mut taken_out: Vec<(String, String)> = Vec::new();
+        for t in &self.catalog.tables {
+            for o in &t.orders {
+                let stands = catalog
+                    .table(&t.name)
+                    .is_some_and(|x| x.orders.iter().any(|y| y.name == o.name));
+                if !stands {
+                    taken_out.push((t.name.clone(), o.name.clone()));
+                }
+            }
+        }
+        self.renumbered(&catalog);
+        self.sequences_redeclared(&catalog);
         self.catalog = catalog;
         let d = self.declared.get_or_insert(Declared {
             from,
             ddl: String::new(),
             made: Vec::new(),
             resets: Vec::new(),
+            taken_out: Vec::new(),
         });
         for r in resets {
             if !d.resets.contains(&r) {
@@ -4309,12 +4352,102 @@ impl Snail {
             }
         }
         d.ddl = text;
+        // An order made and then taken out is made no more; one taken out and made again is made.
+        d.made.retain(|m| !taken_out.contains(m));
+        for t in taken_out {
+            if !d.taken_out.contains(&t) {
+                d.taken_out.push(t);
+            }
+        }
         for m in made {
             if !d.made.contains(&m) {
                 d.made.push(m);
             }
         }
-        Ok(())
+        Ok(said)
+    }
+
+    /// What the statement or the transaction under way holds of each table by its place, and of
+    /// each order and foreign key by its place in its table, moved to their places in the catalog
+    /// `to` declares; what it held of one the declaration took out let go, its rows with it.
+    fn renumbered(&mut self, to: &Catalog) {
+        let from = &self.catalog;
+        let tables: Vec<Option<usize>> = from
+            .tables
+            .iter()
+            .map(|t| to.tables.iter().position(|x| x.name == t.name))
+            .collect();
+        let orders: Vec<Vec<Option<usize>>> = from
+            .tables
+            .iter()
+            .zip(&tables)
+            .map(|(t, at)| {
+                t.orders
+                    .iter()
+                    .map(|o| at.and_then(|i| to.tables[i].orders.iter().position(|y| y.name == o.name)))
+                    .collect()
+            })
+            .collect();
+        let keys: Vec<Vec<Option<usize>>> = from
+            .tables
+            .iter()
+            .zip(&tables)
+            .map(|(t, at)| {
+                t.foreign_keys
+                    .iter()
+                    .map(|k| {
+                        at.and_then(|i| to.tables[i].foreign_keys.iter().position(|y| y.name == k.name))
+                    })
+                    .collect()
+            })
+            .collect();
+        let unmoved = tables.iter().enumerate().all(|(i, t)| *t == Some(i))
+            && orders.iter().all(|os| os.iter().enumerate().all(|(i, o)| *o == Some(i)))
+            && keys.iter().all(|ks| ks.iter().enumerate().all(|(i, k)| *k == Some(i)));
+        if unmoved {
+            return;
+        }
+        let order = |(t, o): (usize, usize)| -> Option<(usize, usize)> {
+            Some((tables.get(t).copied().flatten()?, orders.get(t)?.get(o).copied().flatten()?))
+        };
+        let key = |(t, k): (usize, usize)| -> Option<(usize, usize)> {
+            Some((tables.get(t).copied().flatten()?, keys.get(t)?.get(k).copied().flatten()?))
+        };
+        let gone: Vec<String> = from
+            .tables
+            .iter()
+            .zip(&tables)
+            .filter(|(_, at)| at.is_none())
+            .map(|(t, _)| t.name.clone())
+            .collect();
+        self.rebased = std::mem::take(&mut self.rebased)
+            .into_iter()
+            .filter_map(|(at, v)| Some((order(at)?, v)))
+            .collect();
+        self.unnamed = std::mem::take(&mut self.unnamed)
+            .into_iter()
+            .filter_map(|t| tables.get(t).copied().flatten())
+            .collect();
+        self.modes = std::mem::take(&mut self.modes)
+            .into_iter()
+            .filter_map(|(at, v)| Some((key(at)?, v)))
+            .collect();
+        self.touched = std::mem::take(&mut self.touched).renumbered(&key, &order);
+        self.pending = std::mem::take(&mut self.pending).renumbered(&key, &order);
+        self.own.retain(|t, _| !gone.contains(t));
+    }
+
+    /// What the session holds of a sequence a declaration took out or made again: the values its
+    /// cache held, given up, as PostgreSQL's session gives up a dropped sequence's.
+    fn sequences_redeclared(&mut self, to: &Catalog) {
+        let oid = |c: &Catalog, name: &str| {
+            c.oids
+                .of(&crate::oids::Object::Class(crate::oids::full(name)))
+        };
+        let from = &self.catalog;
+        self.handed.retain(|name, _| {
+            from.sequence(name).is_none() || oid(from, name) == oid(to, name)
+        });
     }
 
     /// Whether any order of a table holds a live row, as the round reads the file.

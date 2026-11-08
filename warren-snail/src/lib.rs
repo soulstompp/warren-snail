@@ -5,6 +5,7 @@ pub mod arrays;
 pub mod brin;
 pub mod bytes;
 pub mod carry;
+mod cascade;
 pub mod catalog;
 mod categories;
 pub mod collations;

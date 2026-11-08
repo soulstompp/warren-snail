@@ -8087,8 +8087,8 @@ fn is_written_constant(e: &Expr) -> bool {
 }
 
 /// Whether an expression calls a function, or an operator on numbers or on a document, the question
-/// path does not read, or reads a CASE or a parameter: its aggregates and the functions a DDL names
-/// are its own.
+/// path does not read, or reads a CASE, an IN list or a parameter: its aggregates and the functions
+/// a DDL names are its own.
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => {
@@ -8144,9 +8144,8 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::AllOp {
             left: a, right: b, ..
         } => calls_beyond_the_question(a) || calls_beyond_the_question(b),
-        Expr::InList { expr, list, .. } => {
-            calls_beyond_the_question(expr) || list.iter().any(calls_beyond_the_question)
-        }
+        // An IN list: the question path reads no level by one.
+        Expr::InList { .. } => true,
         Expr::Array(a) => a.elem.iter().any(calls_beyond_the_question),
         Expr::CompoundFieldAccess { root, .. } => calls_beyond_the_question(root),
         _ => false,

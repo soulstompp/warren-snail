@@ -157,8 +157,18 @@ fn key_at(table: &Table, order: &Order, columns: &[Values], p: usize) -> Result<
 }
 
 impl Snail {
-    /// A round's order as a root names it: none where the root names none.
+    /// A round's order as a root names it: none where the root names none, or where the order is
+    /// one the transaction made, which no root before its commit holds, whatever an order of the
+    /// name dropped since holds there.
     fn top_on(&self, root: &Root, table: &Table, order: &Order) -> Result<Option<(Head, Node)>> {
+        let made = self.declared.as_ref().is_some_and(|d| {
+            d.made()
+                .iter()
+                .any(|(t, o)| *t == table.name && *o == order.name)
+        });
+        if made {
+            return Ok(None);
+        }
         let Some((_, _, top)) = root
             .orders
             .iter()
@@ -739,6 +749,9 @@ impl Snail {
         match &self.declared {
             Some(d) => {
                 let mut stage = self.reader.stage();
+                // What a DROP of it took out goes; what it made, made again, is laid down after.
+                root.orders
+                    .retain(|(t, o, _)| !d.taken_out().contains(&(t.clone(), o.clone())));
                 for (tn, on) in d.made() {
                     let t = self.catalog.table(tn).expect("a table it declared");
                     let o = t
