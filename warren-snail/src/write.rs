@@ -1244,21 +1244,33 @@ pub(crate) struct Laid {
     pub blocks: Vec<Block>,
 }
 
-/// The refusal of two rows sharing a unique order's key.
-pub(crate) fn key_shared(table: &Table, order: &Order, key: &[KeyValue]) -> Error {
+/// The refusal of a row whose key a unique order already holds, in PostgreSQL's words, its DETAIL
+/// the order's columns and the row's `values` of them.
+pub(crate) fn key_shared(
+    table: &Table,
+    order: &Order,
+    values: &[crate::read::statement::Datum],
+) -> Error {
+    let columns: Vec<usize> = order.levels.iter().map(|l| l.column()).collect();
     Error::new(format!(
-        "{}: two rows share the value {} of {}, which is unique",
-        table.name,
-        crate::places::shown_as(
-            key,
-            &order
-                .levels
-                .iter()
-                .map(|l| table.columns[l.column()].ty)
-                .collect::<Vec<_>>()
-        ),
-        order.name
+        "duplicate key value violates unique constraint \"{}\": Key {} already exists.",
+        order.name,
+        crate::read::foreign::shown(table, &columns, values)
     ))
+}
+
+/// The values of an order's columns in row `r` of rows laid out, for its refusal.
+fn order_values(
+    table: &Table,
+    order: &Order,
+    rows: &Rows,
+    r: usize,
+) -> Vec<crate::read::statement::Datum> {
+    order
+        .levels
+        .iter()
+        .map(|l| row_value(table.columns[l.column()].ty, &rows.columns[l.column()], r))
+        .collect()
 }
 
 /// Sorts rows on an order and cuts them into blocks. A text level is cut on the sublevels `given`, or,
@@ -1355,7 +1367,7 @@ pub(crate) fn laid_out(
             a == b && !(order.nulls_distinct && a.iter().any(KeyValue::is_null))
         };
         if let Some(p) = perm.windows(2).find(|p| shared(row(p[0]), row(p[1]))) {
-            return Err(key_shared(table, order, row(p[0])));
+            return Err(key_shared(table, order, &order_values(table, order, rows, p[1])));
         }
     }
     let keys = Keys {

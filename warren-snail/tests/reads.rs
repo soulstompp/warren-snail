@@ -195,7 +195,7 @@ fn a_unique_order_refuses_two_rows_with_one_key() {
     let path = tmp("unique.snail");
     let catalog = Catalog::parse(DDL).unwrap();
     let e = write(&path, &catalog, &tables(&s)).unwrap_err().to_string();
-    assert!(e.contains("readings_pkey, which is unique"), "{e}");
+    assert!(e.contains("violates unique constraint \"readings_pkey\""), "{e}");
 }
 
 #[test]

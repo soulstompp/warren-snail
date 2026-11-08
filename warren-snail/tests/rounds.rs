@@ -1425,5 +1425,8 @@ fn an_alias_hides_its_table_s_own_name() {
         )
         .unwrap_err()
         .to_string();
-    assert!(e.contains("names no table"), "{e}");
+    assert!(
+        e.contains("missing FROM-clause entry for table \"p\""),
+        "{e}"
+    );
 }

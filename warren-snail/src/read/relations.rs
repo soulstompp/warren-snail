@@ -1016,6 +1016,32 @@ struct From {
 }
 
 impl From {
+    /// The refusal of a qualifier `q` no relation of the FROM answers to, in PostgreSQL's words:
+    /// an invalid reference where it names a relation its alias hides (a table by its schema and
+    /// name, or by its name alone where the search path finds it; a WITH query by its name), else a
+    /// missing entry.
+    fn no_entry(&self, catalog: &Catalog, q: &str) -> Error {
+        let mut leaves = Vec::new();
+        for n in &self.items {
+            n.leaves(&mut leaves);
+        }
+        let hidden = leaves.iter().any(|l| match &l.what {
+            What::Table {
+                table, qualifier, ..
+            } => {
+                let name = &catalog.tables[*table].name;
+                qualifier != q && crate::catalog::found_by_qualifier(name, q)
+            }
+            What::Made { name, qualifier } => qualifier != q && apart::written(name) == q,
+            _ => false,
+        });
+        let relation = q.rsplit('.').next().unwrap_or(q);
+        Error::new(match hidden {
+            true => format!("invalid reference to FROM-clause entry for table \"{relation}\""),
+            false => format!("missing FROM-clause entry for table \"{relation}\""),
+        })
+    }
+
     fn typed(&self) -> Vec<TypedColumn> {
         self.columns
             .iter()
@@ -3994,9 +4020,7 @@ fn select_step(
                     c.qualifier.as_deref().map(pipeline::unmarked) == Some(q.as_str())
                 }) =>
             {
-                return Err(Error::new(format!(
-                    "missing FROM-clause entry for table \"{q}\""
-                )))
+                return Err(from.no_entry(catalog, &q))
             }
             (0, Some(q)) => return Err(Error::new(format!("column {q}.{n} does not exist"))),
             (0, None) => return Err(Error::new(format!("column \"{n}\" does not exist"))),

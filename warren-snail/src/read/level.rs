@@ -96,7 +96,7 @@ impl Snail {
             .columns
             .iter()
             .position(|x| x.name == column)
-            .ok_or_else(|| Error::new(format!("{table} has no column {column}")))?;
+            .ok_or_else(|| Error::new(format!("column \"{column}\" does not exist")))?;
         let leading: Vec<usize> = (0..t.orders.len())
             .filter(|&o| {
                 t.orders[o].levels.first() == Some(&Leading::Column(c))

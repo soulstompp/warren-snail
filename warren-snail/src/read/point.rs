@@ -159,7 +159,7 @@ impl Snail {
                     .columns
                     .iter()
                     .position(|c| c.name == *n)
-                    .ok_or_else(|| Error::new(format!("{} has no column {n}", table.name)))
+                    .ok_or_else(|| Error::new(format!("column \"{n}\" does not exist")))
             })
             .collect::<Result<_>>()?;
         self.point_of(&want, &given)

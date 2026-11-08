@@ -439,6 +439,15 @@ fn end(c: &Cursor, what: &str) -> Result<()> {
     }
 }
 
+/// Whether an expression is a constant written out: a literal, signed or cast, or a typed string.
+fn constant(e: &Expr) -> bool {
+    match e {
+        Expr::Value(_) | Expr::TypedString(_) => true,
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => constant(expr),
+        _ => false,
+    }
+}
+
 /// The multirange PostgreSQL names for a range where its DDL names none: "multi" put before the
 /// first "range" in its name, or "_multirange" after it.
 pub(crate) fn multirange_name(range: &str) -> String {
@@ -814,7 +823,7 @@ fn create_sequence(c: &mut Cursor) -> Result<Form> {
     let name = c.name()?;
     let what = format!("CREATE SEQUENCE {name}");
     let options = sequence_options(c, &what, false)?;
-    let sequence = Sequence::made(&name, &options, &what)?;
+    let sequence = Sequence::made(&name, &options)?;
     Ok(Form::CreateSequence {
         sequence,
         if_not_exists,
@@ -2579,7 +2588,7 @@ impl Draft {
             }
         };
         if self.relation(schema_of(&name), bare(&name)) {
-            return Err(Error::new(format!("relation \"{name}\" already exists")));
+            return Err(Error::new(format!("relation \"{}\" already exists", bare(&name))));
         }
         let mut given: Vec<SequenceOption> = vec![SequenceOption::As(ty)];
         given.extend(
@@ -2588,8 +2597,7 @@ impl Draft {
                 .filter(|o| !matches!(o, SequenceOption::SequenceName(_)))
                 .cloned(),
         );
-        let what = format!("{table}.{column}'s sequence");
-        let mut s = Sequence::made(&name, &given, &what)?;
+        let mut s = Sequence::made(&name, &given)?;
         s.owned_by = Some((table.to_string(), column.to_string()));
         s.identity = identity;
         self.push_sequence(s);
@@ -2710,7 +2718,7 @@ impl Draft {
             if v.or_replace && self.views.iter().any(|x| x.name == name) {
                 return refused("OR REPLACE of a view that exists");
             }
-            return Err(Error::new(format!("relation \"{name}\" already exists")));
+            return Err(Error::new(format!("relation \"{}\" already exists", bare(&name))));
         }
         let columns = v
             .columns
@@ -3054,13 +3062,13 @@ impl Draft {
                     if if_not_exists {
                         notices.push(format!(
                             "relation \"{}\" already exists, skipping",
-                            sequence.name
+                            bare(&sequence.name)
                         ));
                         return Ok(notices);
                     }
                     return Err(Error::new(format!(
                         "relation \"{}\" already exists",
-                        sequence.name
+                        bare(&sequence.name)
                     )));
                 }
                 sequence.owned_by = self.owner(&sequence.name, &options, None)?;
@@ -3085,7 +3093,7 @@ impl Draft {
                 };
                 let owned_by = self.owner(&name, &options, owned)?;
                 let s = self.sequence_mut(&name).unwrap();
-                s.alter(&options, &format!("ALTER SEQUENCE {name}"))?;
+                s.alter(&options)?;
                 s.owned_by = owned_by;
             }
             Form::CreateCollation {
@@ -3147,8 +3155,9 @@ impl Draft {
         Ok(Some((table, column)))
     }
 
-    /// ALTER TABLE … ADD [CONSTRAINT n] CHECK (…) [NOT VALID], ADD [CONSTRAINT n] FOREIGN KEY …, and
-    /// VALIDATE CONSTRAINT; CLUSTER ON is read before. Any other form is refused by name.
+    /// ALTER TABLE … ADD [CONSTRAINT n] CHECK (…) [NOT VALID], ADD [CONSTRAINT n] FOREIGN KEY …,
+    /// VALIDATE CONSTRAINT, and ALTER [COLUMN] … SET DEFAULT or DROP DEFAULT; CLUSTER ON is read
+    /// before. Any other form is refused by name.
     fn alter_table(&mut self, tokens: &[Token], object: &str) -> Result<Vec<String>> {
         let mut c = Cursor::new(tokens);
         c.kws(&["ALTER", "TABLE"]);
@@ -3181,10 +3190,56 @@ impl Draft {
             k.valid = true;
             return Ok(notices);
         }
+        // A column's default set or dropped: what fills it where a row gives it none, no row held
+        // moving.
+        if c.kw("ALTER") {
+            c.kw("COLUMN");
+            let column = c.ident()?;
+            let set = if c.kws(&["SET", "DEFAULT"]) {
+                Some(c.expr_until(&[])?)
+            } else if c.kws(&["DROP", "DEFAULT"]) {
+                None
+            } else {
+                return Err(Error::new(format!(
+                    "ALTER TABLE {object}: of ALTER COLUMN, only SET DEFAULT and DROP DEFAULT are \
+                     read"
+                )));
+            };
+            end(&c, &format!("ALTER TABLE {name}"))?;
+            let relation = bare(&name).to_string();
+            let t = self.table_mut(&name).unwrap();
+            let at = t.columns.iter().position(|x| x.name == column).ok_or_else(|| {
+                Error::new(format!(
+                    "column \"{column}\" of relation \"{relation}\" does not exist"
+                ))
+            })?;
+            // A constant is cast to the column's type as it is set, as PostgreSQL's parser casts
+            // it: refused where the column's input refuses it.
+            if let (Some(e), Ok(table)) = (set.as_ref().filter(|e| constant(e)), finish_table(t)) {
+                if let Err(why) = crate::read::statement::datum(e, &table, at) {
+                    if why.sqlstate().is_some_and(|code| code.starts_with("22")) {
+                        return Err(why);
+                    }
+                }
+            }
+            let col = &mut t.columns[at];
+            if col.identity.is_some() {
+                return Err(Error::new(format!(
+                    "column \"{column}\" of relation \"{relation}\" is an identity column"
+                )));
+            }
+            if col.generated.is_some() {
+                return Err(Error::new(format!(
+                    "column \"{column}\" of relation \"{relation}\" is a generated column"
+                )));
+            }
+            col.default = set;
+            return Ok(notices);
+        }
         if !c.kw("ADD") {
             return Err(Error::new(format!(
-                "ALTER TABLE {object}: only ADD CHECK, ADD FOREIGN KEY, VALIDATE CONSTRAINT and \
-                 CLUSTER ON are read"
+                "ALTER TABLE {object}: only ADD CHECK, ADD FOREIGN KEY, VALIDATE CONSTRAINT, \
+                 CLUSTER ON, and ALTER COLUMN's SET DEFAULT and DROP DEFAULT are read"
             )));
         }
         let at = c.i;
@@ -3238,7 +3293,7 @@ impl Draft {
             Some(n) => {
                 if t.checks.iter().any(|k| k.name == n) || self.constraint(&schema, &n) {
                     return Err(Error::new(format!(
-                        "constraint \"{n}\" for relation \"{name}\" already exists"
+                        "constraint \"{n}\" for relation \"{}\" already exists", bare(&name)
                     )));
                 }
                 n
@@ -3311,10 +3366,10 @@ impl Draft {
         let schema = schema_of(&name).to_string();
         if self.table(&name).is_some() || self.relation(&schema, bare(&name)) {
             if t.if_not_exists {
-                notices.push(format!("relation \"{name}\" already exists, skipping"));
+                notices.push(format!("relation \"{}\" already exists, skipping", bare(&name)));
                 return Ok(notices);
             }
-            return Err(Error::new(format!("relation \"{name}\" already exists")));
+            return Err(Error::new(format!("relation \"{}\" already exists", bare(&name))));
         }
         if let Some(k) = self.type_named(&name) {
             return Err(Error::new(format!("type \"{name}\" already exists, a {k}")));
@@ -3804,7 +3859,7 @@ impl Draft {
                     Some(n) => {
                         if used.contains(&n) || table_checks.iter().any(|c: &Check| c.name == n) {
                             return Err(Error::new(format!(
-                                "constraint \"{n}\" for relation \"{name}\" already exists"
+                                "constraint \"{n}\" for relation \"{}\" already exists", bare(&name)
                             )));
                         }
                         n
@@ -4438,7 +4493,7 @@ impl Draft {
             let c = ident(c);
             let k =
                 t.columns.iter().position(|x| x.name == c).ok_or_else(|| {
-                    Error::new(format!("{shown}: {table_name} has no column {c}"))
+                    Error::new(format!("column \"{c}\" does not exist"))
                 })?;
             if t.columns[k].is_virtual() {
                 return Err(Error::new(format!(
@@ -5296,6 +5351,61 @@ pub(crate) fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                         each_expr(x, f);
                     }
                 }
+            }
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            each_expr(left, f);
+            each_expr(right, f);
+        }
+        Expr::Array(a) => {
+            for x in &a.elem {
+                each_expr(x, f);
+            }
+        }
+        Expr::Tuple(xs) => {
+            for x in xs {
+                each_expr(x, f);
+            }
+        }
+        Expr::SimilarTo { expr, pattern, .. } => {
+            each_expr(expr, f);
+            each_expr(pattern, f);
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            each_expr(expr, f);
+            for x in [substring_from, substring_for].into_iter().flatten() {
+                each_expr(x, f);
+            }
+        }
+        Expr::Trim {
+            expr, trim_what, ..
+        } => {
+            each_expr(expr, f);
+            if let Some(x) = trim_what {
+                each_expr(x, f);
+            }
+        }
+        Expr::Position { expr, r#in } => {
+            each_expr(expr, f);
+            each_expr(r#in, f);
+        }
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => each_expr(expr, f),
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            each_expr(expr, f);
+            each_expr(overlay_what, f);
+            each_expr(overlay_from, f);
+            if let Some(x) = overlay_for {
+                each_expr(x, f);
             }
         }
         _ => {}

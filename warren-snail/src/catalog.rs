@@ -2135,7 +2135,6 @@ impl Sequence {
     pub(crate) fn made(
         name: &str,
         options: &[crate::ddl::SequenceOption],
-        what: &str,
     ) -> Result<Sequence> {
         let mut s = Sequence {
             name: name.to_string(),
@@ -2151,7 +2150,7 @@ impl Sequence {
             is_called: false,
             identity: false,
         };
-        s.set(options, true, what)?;
+        s.set(options, true)?;
         Ok(s)
     }
 
@@ -2159,10 +2158,9 @@ impl Sequence {
     pub(crate) fn alter(
         &mut self,
         options: &[crate::ddl::SequenceOption],
-        what: &str,
     ) -> Result<()> {
         let mut s = self.clone();
-        s.set(options, false, what)?;
+        s.set(options, false)?;
         *self = s;
         Ok(())
     }
@@ -2171,7 +2169,6 @@ impl Sequence {
         &mut self,
         options: &[crate::ddl::SequenceOption],
         init: bool,
-        what: &str,
     ) -> Result<()> {
         use crate::ddl::SequenceOption as O;
         let mut seen: Vec<std::mem::Discriminant<O>> = Vec::new();
@@ -2179,7 +2176,7 @@ impl Sequence {
             let d = std::mem::discriminant(o);
             if seen.contains(&d) {
                 return Err(Error::new(format!(
-                    "{what}: conflicting or redundant options"
+                    "conflicting or redundant options"
                 )));
             }
             seen.push(d);
@@ -2198,7 +2195,7 @@ impl Sequence {
         }
         if let Some(O::Increment(n)) = find(&|o| matches!(o, O::Increment(_))) {
             if *n == 0 {
-                return Err(Error::new(format!("{what}: INCREMENT must not be zero")));
+                return Err(Error::new(format!("INCREMENT must not be zero")));
             }
             self.increment = *n;
         } else if init {
@@ -2223,7 +2220,7 @@ impl Sequence {
         }
         if self.max < self.ty.min() || self.max > self.ty.max() {
             return Err(Error::new(format!(
-                "{what}: MAXVALUE ({}) is out of range for sequence data type {}",
+                "MAXVALUE ({}) is out of range for sequence data type {}",
                 self.max,
                 typename(self.ty)
             )));
@@ -2242,14 +2239,14 @@ impl Sequence {
         }
         if self.min < self.ty.min() || self.min > self.ty.max() {
             return Err(Error::new(format!(
-                "{what}: MINVALUE ({}) is out of range for sequence data type {}",
+                "MINVALUE ({}) is out of range for sequence data type {}",
                 self.min,
                 typename(self.ty)
             )));
         }
         if self.min >= self.max {
             return Err(Error::new(format!(
-                "{what}: MINVALUE ({}) must be less than MAXVALUE ({})",
+                "MINVALUE ({}) must be less than MAXVALUE ({})",
                 self.min, self.max
             )));
         }
@@ -2264,13 +2261,13 @@ impl Sequence {
         }
         if self.start < self.min {
             return Err(Error::new(format!(
-                "{what}: START value ({}) cannot be less than MINVALUE ({})",
+                "START value ({}) cannot be less than MINVALUE ({})",
                 self.start, self.min
             )));
         }
         if self.start > self.max {
             return Err(Error::new(format!(
-                "{what}: START value ({}) cannot be greater than MAXVALUE ({})",
+                "START value ({}) cannot be greater than MAXVALUE ({})",
                 self.start, self.max
             )));
         }
@@ -2283,20 +2280,20 @@ impl Sequence {
         }
         if self.last_value < self.min {
             return Err(Error::new(format!(
-                "{what}: RESTART value ({}) cannot be less than MINVALUE ({})",
+                "RESTART value ({}) cannot be less than MINVALUE ({})",
                 self.last_value, self.min
             )));
         }
         if self.last_value > self.max {
             return Err(Error::new(format!(
-                "{what}: RESTART value ({}) cannot be greater than MAXVALUE ({})",
+                "RESTART value ({}) cannot be greater than MAXVALUE ({})",
                 self.last_value, self.max
             )));
         }
         if let Some(O::Cache(n)) = find(&|o| matches!(o, O::Cache(_))) {
             if *n <= 0 {
                 return Err(Error::new(format!(
-                    "{what}: CACHE ({n}) must be greater than zero"
+                    "CACHE ({n}) must be greater than zero"
                 )));
             }
             self.cache = *n;
@@ -2304,6 +2301,16 @@ impl Sequence {
             self.cache = 1;
         }
         Ok(())
+    }
+}
+
+/// Whether a column's qualifier `q` finds the table `table` as PostgreSQL's parser looks a
+/// qualifier up: by its schema and name, or by its name alone where the search path, `public`,
+/// holds the table.
+pub(crate) fn found_by_qualifier(table: &str, q: &str) -> bool {
+    match table.rsplit_once('.') {
+        Some((schema, bare)) => q == table || (schema == "public" && q == bare),
+        None => q == table,
     }
 }
 pub fn object_name(name: &ObjectName) -> String {
@@ -2676,7 +2683,7 @@ pub fn shape(
             .iter()
             .position(|c| c.name == name)
             .map(Shape::Column)
-            .ok_or_else(|| Error::new(format!("{table} has no column {name}")))
+            .ok_or_else(|| Error::new(format!("column \"{name}\" does not exist")))
     };
     let bare = table.rsplit('.').next().unwrap_or(table);
     match expr {
@@ -2694,11 +2701,18 @@ pub fn shape(
                 Some(a) => qualifier == a,
                 None => qualifier == bare || qualifier == table,
             };
+            // Refused in PostgreSQL's words, the relation named by its own part: the table where an
+            // alias hides the name that finds it, or a name of no relation the statement reads.
+            let relation = ident(&parts[parts.len() - 2]);
             if named {
                 column(&name)
+            } else if alias.is_some() && found_by_qualifier(table, &qualifier) {
+                Err(Error::new(format!(
+                    "invalid reference to FROM-clause entry for table \"{relation}\""
+                )))
             } else {
                 Err(Error::new(format!(
-                    "{qualifier}.{name} names no table the statement reads"
+                    "missing FROM-clause entry for table \"{relation}\""
                 )))
             }
         }
@@ -3225,7 +3239,7 @@ mod tests {
         let e = refused(&format!(
             "{TABLE} CREATE INDEX o ON s.t (at) INCLUDE (b); ALTER TABLE s.t CLUSTER ON o;"
         ));
-        assert!(e.contains("has no column b"), "{e}");
+        assert!(e.contains("column \"b\" does not exist"), "{e}");
     }
 
     #[test]

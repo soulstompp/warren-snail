@@ -1075,7 +1075,7 @@ fn a_bit_string_shared_by_two_rows_of_a_unique_key_is_named_by_its_bits() {
     )
     .unwrap_err()
     .to_string();
-    assert!(e.contains("['10100']"), "{e}");
+    assert!(e.contains("Key (v)=(10100) already exists."), "{e}");
 }
 
 #[test]

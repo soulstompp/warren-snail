@@ -560,7 +560,10 @@ fn column_index(table: &Table, name: &ObjectName) -> Result<usize> {
         .columns
         .iter()
         .position(|c| c.name == last)
-        .ok_or_else(|| Error::new(format!("{} has no column {last}", table.name)))
+        .ok_or_else(|| Error::new(format!(
+            "column \"{last}\" of relation \"{}\" does not exist",
+            table.name.rsplit('.').next().unwrap_or(&table.name)
+        )))
 }
 
 /// A geometric literal cast to another geometric type inside its cast to `to`, cast as PostgreSQL
@@ -829,17 +832,22 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
                 .ok()
                 .map(|s| crate::composed::int_in(&s, col.ty.integer_bits()))
                 .transpose()?;
-            let v = quoted.or_else(|| number(e)).ok_or_else(wrong)?;
-            let fits = match col.ty {
-                ColumnType::Int2 => i16::try_from(v).is_ok(),
-                ColumnType::Int4 => i32::try_from(v).is_ok(),
-                _ => true,
+            let (lo, hi, name) = match col.ty {
+                ColumnType::Int2 => (i64::from(i16::MIN), i64::from(i16::MAX), "smallint"),
+                ColumnType::Int4 => (i64::from(i32::MIN), i64::from(i32::MAX), "integer"),
+                _ => (i64::MIN, i64::MAX, "bigint"),
             };
-            if !fits {
-                return Err(Error::new(format!(
-                    "{v} is out of range for {}.{}",
-                    table.name, col.name
-                )));
+            // A number is cast to the column as its assignment casts it: an integer past the
+            // column's range, or a numeric (a point, an exponent, past a bigint) rounded half away
+            // from zero, refused as `smallint out of range` and the like.
+            let v = match quoted.or_else(|| number(e)) {
+                Some(v) => v,
+                None => crate::numeric::Numeric::parse(&number_text(e).ok_or_else(wrong)?)
+                    .map_err(|_| wrong())?
+                    .to_integer(lo, hi, name)?,
+            };
+            if v < lo || v > hi {
+                return Err(Error::new(format!("{name} out of range")));
             }
             Datum::Int(v)
         }
@@ -861,7 +869,15 @@ pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
             let wide = col.ty == ColumnType::Float8;
             let text = match text_literal(e) {
                 Ok(s) => s,
-                Err(_) => number_text(e).ok_or_else(wrong)?,
+                // A number past a bigint, or with a point or an exponent, is a numeric, cast to a
+                // float through its text as numeric_float4 and numeric_float8 cast it.
+                Err(_) => {
+                    let t = number_text(e).ok_or_else(wrong)?;
+                    match number(e) {
+                        Some(_) => t,
+                        None => crate::numeric::Numeric::parse(&t).map_or(t, |n| n.to_string()),
+                    }
+                }
             };
             let bits = crate::scalars::float_parse(&text, wide)?;
             if wide {

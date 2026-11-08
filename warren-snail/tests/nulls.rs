@@ -378,7 +378,8 @@ fn a_unique_index_takes_any_number_of_nulls_unless_they_are_not_distinct() {
     .to_string();
     // Where b repeats and s is NULL, or both are NULL, the keys are one.
     assert!(
-        e.contains("two rows share the value [") && e.contains("NULL] of t_u, which is unique"),
+        e.contains("duplicate key value violates unique constraint \"t_u\": Key (b, s)=(")
+            && e.contains(", null) already exists."),
         "{e}"
     );
 }
@@ -422,7 +423,10 @@ fn a_statement_puts_a_null_beside_a_null_under_a_unique_index_unless_they_are_no
         .err()
         .unwrap()
         .to_string();
-    assert!(e.contains("two rows share the value [NULL] of t_u"), "{e}");
+    assert!(
+        e.contains("duplicate key value violates unique constraint \"t_u\": Key (b)=(null) already exists."),
+        "{e}"
+    );
     w.execute("INSERT INTO s.t (a, b, s) VALUES (2, 2, NULL)")
         .unwrap();
 }

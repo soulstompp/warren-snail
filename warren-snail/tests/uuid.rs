@@ -360,7 +360,7 @@ fn a_uuid_is_written_from_its_spellings_and_its_defaults_hand_out_a_v4_and_risin
         .execute("INSERT INTO s.t (id) VALUES ('00112233-4455-6677-8899-aabbccddeeff')")
         .unwrap_err()
         .to_string()
-        .contains("share the value"));
+        .contains("duplicate key value violates unique constraint"));
     assert!(w
         .execute("INSERT INTO s.t (id) VALUES ('{00112233-4455-6677-8899-aabbccddeeff')")
         .unwrap_err()

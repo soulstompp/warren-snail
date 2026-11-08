@@ -500,7 +500,14 @@ impl Snail {
         for (oi, order) in table.orders.iter().enumerate().filter(|(_, o)| o.unique) {
             let predicate = super::partial::Predicate::of(&self.catalog, table, order)?;
             let admits = |r: &Row| predicate.as_ref().is_none_or(|p| p.admits(table, r));
+            // The refusal names the order's columns of the row that brought the key.
+            let shared = |new: &Row| {
+                let values: Vec<Datum> =
+                    order.levels.iter().map(|l| new[l.column()].clone()).collect();
+                crate::write::key_shared(table, order, &values)
+            };
             let mut asked: Vec<Vec<KeyValue>> = Vec::new();
+            let mut brought: HashMap<Vec<KeyValue>, &Row> = HashMap::new();
             for c in changes {
                 let (old, new) = match c {
                     Change::Insert(n) => (None, n),
@@ -520,8 +527,9 @@ impl Snail {
                     }
                 }
                 if own.keys.get(&(oi, k.clone())).is_some_and(|n| *n > 1) {
-                    return Err(crate::write::key_shared(table, order, &k));
+                    return Err(shared(new));
                 }
+                brought.entry(k.clone()).or_insert(new);
                 asked.push(k);
             }
             if asked.is_empty() {
@@ -560,7 +568,7 @@ impl Snail {
                         took += i64::from(key_of(table, order, o)? == k);
                     }
                     if n > took {
-                        return Err(crate::write::key_shared(table, order, &k));
+                        return Err(shared(brought[&k]));
                     }
                 }
             }

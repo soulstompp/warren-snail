@@ -1675,7 +1675,17 @@ fn cast(
                     }
                 }
             }
-            other => return Err(Error::new(format!("{other:?} cast to an integer"))),
+            // As int4(boolean): true 1, false 0; to no other integer.
+            Value::Bool(b) if matches!(base.as_str(), "integer" | "int" | "int4") => {
+                Value::Int(i64::from(b))
+            }
+            other => {
+                return Err(Error::new(format!(
+                    "cannot cast type {} to {}",
+                    kind_name(&other),
+                    integer_range(&base).0
+                )))
+            }
         },
         "numeric" | "decimal" => {
             let n = match v {
@@ -1702,7 +1712,14 @@ fn cast(
         "boolean" | "bool" => match v {
             Value::Bool(b) => Value::Bool(b),
             Value::Text(t) => boolean_of(&t)?,
-            other => return Err(Error::new(format!("{other:?} cast to boolean"))),
+            // As bool(integer): zero false, any other true; from no other integer.
+            Value::Int(x) if i32::try_from(x).is_ok() => Value::Bool(x != 0),
+            other => {
+                return Err(Error::new(format!(
+                    "cannot cast type {} to boolean",
+                    kind_name(&other)
+                )))
+            }
         },
         "uuid" => match v {
             Value::Uuid(k) => Value::Uuid(k),
@@ -3386,6 +3403,147 @@ fn literal_interval() -> ColumnType {
 }
 
 /// Evaluates an expression on one row of a frame, its aggregates' and windows' values computed.
+/// A binary operator's value on one row, its sides read where they stand: arithmetic, the
+/// comparisons and the rest an operator reads past AND, OR, OVERLAPS and the regular expressions;
+/// `e` the node whose type and collation settle it.
+fn operated(
+    e: &Expr,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    row: &[Value],
+    frame: &Frame,
+    computed: &Computed,
+) -> Result<Value> {
+    let ev = |x: &Expr| eval(x, row, frame, computed);
+    let x = ev(left)?;
+    let y = ev(right)?;
+    let (x, y) = (
+        written_beside(frame, left, x, right),
+        written_beside(frame, right, y, left),
+    );
+    let typed = [frame.type_of(left), frame.type_of(right)];
+    if let Some(v) = super::ops::of_integers(op, &x, &y, left, right, typed)? {
+        return Ok(v);
+    }
+    if let Some(v) = super::ops::pattern_compared(op, &x, &y, left, right, typed)? {
+        return Ok(v);
+    }
+    if let Some(v) = super::ops::text_matched(op, &x, &y, left, right, &frame.casings)? {
+        return Ok(v);
+    }
+    if *op == BinaryOperator::PGExp {
+        return super::ops::power(x, y, typed, frame.type_of(e));
+    }
+    if *op == BinaryOperator::PGStartsWith {
+        if [&x, &y].into_iter().any(Value::is_null) {
+            return Ok(Value::Null);
+        }
+        let values = [super::ops::char_as_text(x), super::ops::char_as_text(y)];
+        let casing = string_casing(frame, e, "starts_with", &values)?;
+        return Ok(super::calls::strings("starts_with", &values, casing)?
+            .unwrap_or(Value::Null));
+    }
+    if *op == BinaryOperator::StringConcat && concat_is_text(&x, &y, left, right, typed) {
+        return Ok(match x.is_null() || y.is_null() {
+            true => Value::Null,
+            false => Value::Text(text_part(&x) + &text_part(&y)),
+        });
+    }
+    // An array's `||` is in the array of its sides' common type.
+    let (x, y) = match frame.type_of(e) {
+        Some(t) if *op == BinaryOperator::StringConcat => {
+            (array_as(x, t)?, array_as(y, t)?)
+        }
+        _ => (x, y),
+    };
+    let x = super::ops::document_literal(op, x, left, frame.type_of(e))?;
+    let y = super::ops::shift_count(op, &x, y, right)?;
+    if !super::ops::deletes_keys(op, &x, &y) {
+        if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
+            return Ok(v);
+        }
+    }
+    if let Some(v) = geo_op(op, &x, &y, left, right, frame.release)? {
+        return Ok(v);
+    }
+    // An operator on a type held as its text reads a literal beside it as the operator
+    // takes it.
+    if let Some(v) = typed_op(op, &x, &y, left, right)? {
+        return Ok(v);
+    }
+    let (x, y) = beside(x, y, left, right)?;
+    if let Some(v) = string_op(op, &x, &y)? {
+        return Ok(v);
+    }
+    if matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::BitwiseAnd
+            | BinaryOperator::BitwiseOr
+    ) {
+        // Each of these operators is strict: over a NULL it is NULL.
+        if x.is_null() || y.is_null() {
+            return Ok(Value::Null);
+        }
+        if let Some(v) = super::clock::arith(op, &x, &y)? {
+            return Ok(v);
+        }
+        if let Some(v) = float_arith(op, &x, &y)? {
+            return Ok(v);
+        }
+        if let Some(v) = scalar_arith(op, &x, &y)? {
+            return Ok(v);
+        }
+    } else {
+        compared(op, &x, &y)?;
+    }
+    Ok(match op {
+        BinaryOperator::Plus
+        | BinaryOperator::Minus
+        | BinaryOperator::Multiply
+        | BinaryOperator::Divide
+        | BinaryOperator::Modulo => frame.held(e, arith(op, &x, &y)?)?,
+        BinaryOperator::Eq
+        | BinaryOperator::NotEq
+        | BinaryOperator::Lt
+        | BinaryOperator::LtEq
+        | BinaryOperator::Gt
+        | BinaryOperator::GtEq => {
+            // A NULL is compared under no collation.
+            let under = match x.is_null() || y.is_null() {
+                true => None,
+                false => frame.casings.compared(e, "string comparison")?,
+            };
+            match compare_under(under, &x, &y)? {
+                None => Value::Null,
+                Some(o) => Value::Bool(match op {
+                    BinaryOperator::Eq => o == Ordering::Equal,
+                    BinaryOperator::NotEq => o != Ordering::Equal,
+                    BinaryOperator::Lt => o == Ordering::Less,
+                    BinaryOperator::LtEq => o != Ordering::Greater,
+                    BinaryOperator::Gt => o == Ordering::Greater,
+                    _ => o != Ordering::Less,
+                }),
+            }
+        }
+        other => return Err(Error::new(format!("the operator {other} is not read"))),
+    })
+}
+
+/// Two truths joined by AND (`and`) or by OR, in SQL's three values.
+fn joined(and: bool, x: Option<bool>, y: Option<bool>) -> Option<bool> {
+    match (x, y) {
+        (Some(a), Some(b)) => Some(if and { a && b } else { a || b }),
+        (Some(v), None) | (None, Some(v)) if v != and => Some(v),
+        _ => None,
+    }
+}
+
 pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Value> {
     if let Some(v) = computed.calls.get(&(e as *const Expr)) {
         return Ok(v.clone());
@@ -3483,6 +3641,17 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 .collect::<Result<Vec<_>>>()?;
             composed(ty, crate::composed::Item::Record(items))
         }
+        // A boolean casts to and from integer alone, refused from a smallint or a bigint whatever
+        // its value.
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type: DataType::Bool | DataType::Boolean,
+            ..
+        } if matches!(frame.type_of(expr), Some(ColumnType::Int2 | ColumnType::Int8)) => {
+            let from = frame.type_of(expr).map(|t| t.pg_name()).unwrap_or_default();
+            return Err(Error::new(format!("cannot cast type {from} to boolean")));
+        }
         Expr::Cast {
             kind: CastKind::Cast | CastKind::DoubleColon,
             expr,
@@ -3496,14 +3665,27 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             quoted(expr),
         )?,
         Expr::Array(a) => {
-            let ty = frame
-                .type_of(e)
-                .ok_or_else(|| Error::new("cannot determine type of empty array"))?;
             let values = a
                 .elem
                 .iter()
                 .map(|x| Ok((ev(x)?, quoted(x))))
                 .collect::<Result<Vec<_>>>()?;
+            let ty = match frame.type_of(e) {
+                Some(t) => t,
+                // Where nothing typed it, as a CHECK read alone: its elements' common type, as
+                // PostgreSQL's transformArrayExpr finds it, text where every one is untyped.
+                None if !a.elem.is_empty() && !a.elem.iter().any(|x| matches!(x, Expr::Array(_))) => {
+                    let types: Vec<Option<ColumnType>> = values
+                        .iter()
+                        .map(|(v, q)| if *q { None } else { type_of_value(v) })
+                        .collect();
+                    crate::composed::type_of(crate::composed::Composed::Array {
+                        element: super::typed::common_type(&types, "ARRAY")?,
+                        domain: None,
+                    })
+                }
+                None => return Err(Error::new("cannot determine type of empty array")),
+            };
             array_value(ty, values, holds_arrays(a, frame))?
         }
         // An interval written as `interval '…'` with no fields named, read by its input.
@@ -3916,6 +4098,34 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             };
             Value::Bool(same == matches!(e, Expr::IsNotDistinctFrom(..)))
         }
+        // As PostgreSQL's parser rewrites it: `x >= a AND x <= b`, NOT BETWEEN `x < a OR x > b`;
+        // SYMMETRIC both orders of the bounds or'd, NOT BETWEEN SYMMETRIC both and'd. Each
+        // comparison is read on the BETWEEN's own sides, a side settling it read alone.
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let (low, symmetric) = super::question::between_low(low);
+            let one = |a: &Expr, b: &Expr| -> Result<Option<bool>> {
+                let (first, second) = match negated {
+                    false => (BinaryOperator::GtEq, BinaryOperator::LtEq),
+                    true => (BinaryOperator::Lt, BinaryOperator::Gt),
+                };
+                let x = truth(&operated(e, expr, &first, a, row, frame, computed)?)?;
+                if x == Some(*negated) {
+                    return Ok(x);
+                }
+                let y = truth(&operated(e, expr, &second, b, row, frame, computed)?)?;
+                Ok(joined(!*negated, x, y))
+            };
+            let v = match one(low, high)? {
+                v if !symmetric || v == Some(!*negated) => v,
+                v => joined(*negated, v, one(high, low)?),
+            };
+            v.map_or(Value::Null, Value::Bool)
+        }
         Expr::BinaryOp { left, op, right } if super::image::operator(op).is_some() => {
             let name = super::image::operator(op).unwrap_or_default();
             super::image::answer(name, left, right, &ev)?
@@ -4000,123 +4210,7 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 }
                 _ => {}
             }
-            let x = ev(left)?;
-            let y = ev(right)?;
-            let (x, y) = (
-                written_beside(frame, left, x, right),
-                written_beside(frame, right, y, left),
-            );
-            let typed = [frame.type_of(left), frame.type_of(right)];
-            if let Some(v) = super::ops::of_integers(op, &x, &y, left, right, typed)? {
-                return Ok(v);
-            }
-            if let Some(v) = super::ops::pattern_compared(op, &x, &y, left, right, typed)? {
-                return Ok(v);
-            }
-            if let Some(v) = super::ops::text_matched(op, &x, &y, left, right, &frame.casings)? {
-                return Ok(v);
-            }
-            if *op == BinaryOperator::PGExp {
-                return super::ops::power(x, y, typed, frame.type_of(e));
-            }
-            if *op == BinaryOperator::PGStartsWith {
-                if [&x, &y].into_iter().any(Value::is_null) {
-                    return Ok(Value::Null);
-                }
-                let values = [super::ops::char_as_text(x), super::ops::char_as_text(y)];
-                let casing = string_casing(frame, e, "starts_with", &values)?;
-                return Ok(super::calls::strings("starts_with", &values, casing)?
-                    .unwrap_or(Value::Null));
-            }
-            if *op == BinaryOperator::StringConcat && concat_is_text(&x, &y, left, right, typed) {
-                return Ok(match x.is_null() || y.is_null() {
-                    true => Value::Null,
-                    false => Value::Text(text_part(&x) + &text_part(&y)),
-                });
-            }
-            // An array's `||` is in the array of its sides' common type.
-            let (x, y) = match frame.type_of(e) {
-                Some(t) if *op == BinaryOperator::StringConcat => {
-                    (array_as(x, t)?, array_as(y, t)?)
-                }
-                _ => (x, y),
-            };
-            let x = super::ops::document_literal(op, x, left, frame.type_of(e))?;
-            let y = super::ops::shift_count(op, &x, y, right)?;
-            if !super::ops::deletes_keys(op, &x, &y) {
-                if let Some(v) = composed_op(op, &x, &y, left, right, typed)? {
-                    return Ok(v);
-                }
-            }
-            if let Some(v) = geo_op(op, &x, &y, left, right, frame.release)? {
-                return Ok(v);
-            }
-            // An operator on a type held as its text reads a literal beside it as the operator
-            // takes it.
-            if let Some(v) = typed_op(op, &x, &y, left, right)? {
-                return Ok(v);
-            }
-            let (x, y) = beside(x, y, left, right)?;
-            if let Some(v) = string_op(op, &x, &y)? {
-                return Ok(v);
-            }
-            if matches!(
-                op,
-                BinaryOperator::Plus
-                    | BinaryOperator::Minus
-                    | BinaryOperator::Multiply
-                    | BinaryOperator::Divide
-                    | BinaryOperator::Modulo
-                    | BinaryOperator::BitwiseAnd
-                    | BinaryOperator::BitwiseOr
-            ) {
-                // Each of these operators is strict: over a NULL it is NULL.
-                if x.is_null() || y.is_null() {
-                    return Ok(Value::Null);
-                }
-                if let Some(v) = super::clock::arith(op, &x, &y)? {
-                    return Ok(v);
-                }
-                if let Some(v) = float_arith(op, &x, &y)? {
-                    return Ok(v);
-                }
-                if let Some(v) = scalar_arith(op, &x, &y)? {
-                    return Ok(v);
-                }
-            } else {
-                compared(op, &x, &y)?;
-            }
-            match op {
-                BinaryOperator::Plus
-                | BinaryOperator::Minus
-                | BinaryOperator::Multiply
-                | BinaryOperator::Divide
-                | BinaryOperator::Modulo => frame.held(e, arith(op, &x, &y)?)?,
-                BinaryOperator::Eq
-                | BinaryOperator::NotEq
-                | BinaryOperator::Lt
-                | BinaryOperator::LtEq
-                | BinaryOperator::Gt
-                | BinaryOperator::GtEq => {
-                    // A NULL is compared under no collation.
-                    let under = match x.is_null() || y.is_null() {
-                        true => None,
-                        false => frame.casings.compared(e, "string comparison")?,
-                    };
-                    match compare_under(under, &x, &y)? {
-                        None => Value::Null,
-                        Some(o) => Value::Bool(match op {
-                            BinaryOperator::Eq => o == Ordering::Equal,
-                            BinaryOperator::NotEq => o != Ordering::Equal,
-                            BinaryOperator::Lt => o == Ordering::Less,
-                            BinaryOperator::LtEq => o != Ordering::Greater,
-                            BinaryOperator::Gt => o == Ordering::Greater,
-                            _ => o != Ordering::Less,
-                        }),
-                    }
-                }
-                other => return Err(Error::new(format!("the operator {other} is not read"))),
-            }
+            operated(e, left, op, right, row, frame, computed)?
         }
         Expr::Case {
             operand: None,

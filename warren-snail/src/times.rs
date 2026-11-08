@@ -1339,10 +1339,16 @@ fn decode_timezone(s: &[u8]) -> D<i32> {
     Ok(-tz)
 }
 
-/// A zone named in a text, refused by name by a build without the feature `zones`.
+/// A zone named in a text. A name no zone has is a bad format, as PostgreSQL's pg_tzset finding
+/// none makes it. A build without the feature `zones` cannot tell, so it reads the zone only where
+/// its offset is taken, after the rest of the text: a text bad whatever the name is refused as bad,
+/// and one that needs the zone refused by name.
 fn named_zone(name: &[u8]) -> D<String> {
     let name = String::from_utf8_lossy(name).into_owned();
-    crate::zones::utc_offset(&name, 0).map_err(Dterr::Refused)?;
+    #[cfg(feature = "zones")]
+    if crate::zones::utc_offset(&name, 0).is_err() {
+        return Err(Dterr::BadFormat);
+    }
     Ok(name)
 }
 
@@ -1648,6 +1654,9 @@ fn decode_date_time(fields: &[Field], now: i64) -> D<Decoded> {
             }
             tz = 0;
         }
+    } else if let Some(name) = &named {
+        // `epoch` or an infinity beside a zone: taken only where the name is a zone.
+        crate::zones::utc_offset(name, 0).map_err(Dterr::Refused)?;
     }
     Ok(Decoded {
         tm,

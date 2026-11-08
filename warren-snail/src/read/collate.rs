@@ -349,6 +349,10 @@ impl Deriving<'_> {
                 }
                 (Derived::none(), input)
             }
+            // Its two comparisons' sides read together.
+            Expr::Between {
+                expr, low, high, ..
+            } => (Derived::none(), self.merged(&[expr, low, high])?),
             Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
                 (Derived::none(), self.merged(&[a, b])?)
             }

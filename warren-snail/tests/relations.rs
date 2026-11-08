@@ -452,7 +452,7 @@ fn a_view_is_kept_in_the_catalog_and_read_as_a_step() {
         ),
         (
             "CREATE VIEW a.tu AS SELECT t.id FROM a.t t",
-            "relation \"a.tu\" already exists",
+            "relation \"tu\" already exists",
         ),
         (
             "CREATE VIEW a.two (x, y) AS SELECT t.id FROM a.t t",
@@ -495,7 +495,7 @@ fn a_view_is_declared_through_a_writer_and_read_after() {
         .execute("CREATE VIEW a.light AS SELECT t.id FROM a.t t")
         .unwrap_err()
         .to_string();
-    assert_eq!(e, "relation \"a.light\" already exists");
+    assert_eq!(e, "relation \"light\" already exists");
     drop(w);
     same(&path, "SELECT l.id, l.w FROM a.light l", &["1,5"]);
     assert_eq!(fresh(&path).catalog.views.len(), 3);

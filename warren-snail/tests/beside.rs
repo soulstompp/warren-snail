@@ -393,7 +393,11 @@ fn a_key_another_committed_since_is_refused_and_one_it_deleted_since_is_free() {
         &mut a,
         &format!("INSERT INTO s.t (id, v) VALUES ({key}, 2)"),
     );
-    assert!(e.contains("which is unique"), "{e}");
+    assert!(
+        e.contains("duplicate key value violates unique constraint")
+            && e.ends_with(&format!(": Key (id)=({key}) already exists.")),
+        "{e}"
+    );
     run(&mut a, "ROLLBACK");
     // Deleted since: its key is free, the row it reads standing beside the row it wrote.
     run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
@@ -423,7 +427,7 @@ fn a_key_another_committed_since_is_refused_and_one_it_deleted_since_is_free() {
         &mut a,
         &format!("INSERT INTO s.t (id, v) VALUES ({}, 4)", key + 1),
     );
-    assert!(e.contains("which is unique"), "{e}");
+    assert!(e.contains("duplicate key value violates unique constraint"), "{e}");
     run(&mut a, "ROLLBACK");
     // A row of its snapshot it took, its key written again.
     run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");

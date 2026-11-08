@@ -598,9 +598,11 @@ pub fn check(table: &Table, row: &Row) -> Result<()> {
         )? {
             Value::Bool(false) => {
                 return Err(Error::new(format!(
-                    "new row for relation \"{}\" violates check constraint \"{}\"",
+                    "new row for relation \"{}\" violates check constraint \"{}\": Failing row \
+                     contains {}.",
                     table.name.rsplit('.').next().unwrap_or(&table.name),
-                    k.name
+                    k.name,
+                    failing_row(table, row)
                 )))
             }
             Value::Bool(true) | Value::Null => {}

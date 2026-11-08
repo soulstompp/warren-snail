@@ -118,7 +118,8 @@ fn literal(d: &Datum, ty: ColumnType) -> String {
     }
 }
 
-/// A key's columns and values as PostgreSQL's DETAIL writes them: `(a, b)=(1, 2)`.
+/// A key's columns and values as PostgreSQL's DETAIL writes them, each value by its type's output
+/// function: `(a, b)=(1, t)`, a NULL as `null`.
 pub(crate) fn shown(t: &Table, columns: &[usize], key: &[Datum]) -> String {
     let names: Vec<&str> = columns
         .iter()
@@ -127,7 +128,10 @@ pub(crate) fn shown(t: &Table, columns: &[usize], key: &[Datum]) -> String {
     let values: Vec<String> = columns
         .iter()
         .zip(key)
-        .map(|(&c, d)| fill::text_of(d, t.columns[c].ty).unwrap_or_else(|| "null".into()))
+        .map(|(&c, d)| match d {
+            Datum::Null => "null".into(),
+            d => crate::composed::scalar_out(t.columns[c].ty, d),
+        })
         .collect();
     format!("({})=({})", names.join(", "), values.join(", "))
 }

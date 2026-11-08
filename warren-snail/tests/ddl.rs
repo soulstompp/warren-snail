@@ -627,7 +627,9 @@ fn a_null_in_a_not_null_column_is_refused_in_postgresql_s_words_with_the_row_it_
         ),
         (
             "INSERT INTO s.nn (id, a, b, e) VALUES (3, -1, 'y', 1), (4, NULL, 'z', 1)".to_string(),
-            "new row for relation \"nn\" violates check constraint \"nn_c\"".to_string(),
+            "new row for relation \"nn\" violates check constraint \"nn_c\": Failing row contains \
+             (3, -1, y, null, null, 1.00, -2, virtual, virtual, null, 1)."
+                .to_string(),
         ),
         (
             format!("INSERT INTO s.nn (id, a, e, long) VALUES (5, NULL, 1, '{e}')"),
