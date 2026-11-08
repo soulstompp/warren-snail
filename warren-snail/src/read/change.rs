@@ -957,6 +957,7 @@ impl Snail {
         let begun = self.begun.is_some();
         if self.levels.read_only(begun) {
             let what = match st.written() {
+                Statement::Writes { writes, .. } => writes.first().map(|(_, w)| w.kind()),
                 Statement::Insert { .. } => Some("INSERT"),
                 Statement::Update { .. } | Statement::Set { .. } => Some("UPDATE"),
                 Statement::Delete { .. } => Some("DELETE"),
@@ -1383,7 +1384,7 @@ impl Snail {
                 done.rows = rows.len() as u64;
                 let changes: Vec<Change> = rows.into_iter().map(Change::Insert).collect();
                 self.keep(&changes);
-                (done.rewritten, done.orders) = self.apply(table, changes)?;
+                (done.rewritten, done.orders) = self.put(table, changes)?;
                 done.rows > 0
             }
             Statement::Update { table, find, sets } => {
@@ -1399,6 +1400,7 @@ impl Snail {
                 self.kept = Some(Vec::new());
                 self.write_rows(*write, done, found)?
             }
+            Statement::Writes { writes, question } => self.written_with(writes, &question, done)?,
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
                 let t = &self.catalog.tables[table];
@@ -1406,7 +1408,7 @@ impl Snail {
                 done.rows = old.len() as u64;
                 let changes: Vec<Change> = old.into_iter().map(Change::Delete).collect();
                 self.keep(&changes);
-                (done.rewritten, done.orders) = self.apply(table, changes)?;
+                (done.rewritten, done.orders) = self.put(table, changes)?;
                 done.rows > 0
             }
             Statement::Declare { ddl, .. } => {
@@ -1515,7 +1517,7 @@ impl Snail {
             changes.push(Change::Replace(o, n));
         }
         self.keep(&changes);
-        (done.rewritten, done.orders) = self.apply(table, changes)?;
+        (done.rewritten, done.orders) = self.put(table, changes)?;
         Ok(done.rows > 0)
     }
 
@@ -1524,6 +1526,128 @@ impl Snail {
         if let Some(k) = self.kept.as_mut() {
             k.extend_from_slice(changes);
         }
+    }
+
+    /// A write's changes applied, or held unapplied for a write inside WITH until every write of
+    /// its statement has found its rows.
+    fn put(&mut self, table: usize, changes: Vec<Change>) -> Result<(u64, u64)> {
+        match self.dry.as_mut() {
+            Some(held) => {
+                held.push((table, changes));
+                Ok((0, 0))
+            }
+            None => self.apply(table, changes),
+        }
+    }
+
+    /// A question whose WITH holds writes: each write finds its rows and makes its changes on the
+    /// statement's one snapshot, held unapplied, its RETURNING read over them; the question is
+    /// asked on that snapshot, each write's query read as the rows it returns; then every write's
+    /// changes apply, in the WITH's order.
+    fn written_with(
+        &mut self,
+        writes: Vec<(String, Statement)>,
+        question: &str,
+        done: &mut Done,
+    ) -> Result<bool> {
+        let mut held = Vec::new();
+        let mut returned: Vec<(String, Option<RecordBatch>)> = Vec::new();
+        for (name, st) in writes {
+            let mut own = Done::default();
+            self.dry = Some(Vec::new());
+            let ran = match &st {
+                Statement::Returning { write, alias, items } => {
+                    self.kept = Some(Vec::new());
+                    let ran = self.write_rows((**write).clone(), &mut own, &mut None);
+                    let kept = self.kept.take().unwrap_or_default();
+                    ran.and_then(|_| self.returned(write, alias, items, kept).map(Some))
+                }
+                st => self.write_rows(st.clone(), &mut own, &mut None).map(|_| None),
+            };
+            held.extend(self.dry.take().unwrap_or_default());
+            returned.push((name, ran?));
+        }
+        // Each write's query read as a function handed for the question alone, of the rows it
+        // returns; one returning none, refused where the question reads it, as PostgreSQL's
+        // parser refuses it.
+        let mut q = match super::image::parse_sql(question)?.pop() {
+            Some(sqlparser::ast::Statement::Query(q)) => q,
+            _ => unreachable!("a question"),
+        };
+        let mut handed = self.functions.clone();
+        let mut read: Vec<String> = Vec::new();
+        let _ = sqlparser::ast::visit_relations(&q, |n| {
+            read.push(crate::catalog::object_name(n));
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        let with = q.with.as_mut().expect("a WITH");
+        let mut kept_ctes = Vec::new();
+        for (k, mut cte) in std::mem::take(&mut with.cte_tables).into_iter().enumerate() {
+            let Some((name, batch)) = returned
+                .iter()
+                .find(|(n, _)| *n == crate::catalog::ident(&cte.alias.name))
+                .filter(|_| statement::writes_query(&cte.query))
+            else {
+                kept_ctes.push(cte);
+                continue;
+            };
+            let Some(batch) = batch else {
+                if read.iter().any(|r| r == name) {
+                    return Err(Error::new(format!(
+                        "WITH query \"{name}\" does not have a RETURNING clause"
+                    )));
+                }
+                continue;
+            };
+            let types = answer_types(batch)?;
+            let schema = batch.schema();
+            let named: Vec<(&str, ColumnType)> = schema
+                .fields()
+                .iter()
+                .zip(&types)
+                .map(|(f, ty)| (f.name().as_str(), *ty))
+                .collect();
+            let row = super::handed::row_type(&format!("{KEPT}with{k}"), &named);
+            let rows = rows_of(batch)?
+                .iter()
+                .map(|r| {
+                    super::Value::row(
+                        row,
+                        r.iter().zip(&types).map(|(d, ty)| fill::value_of(d, *ty)).collect(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let f = format!("{KEPT}with{k}");
+            super::handed::hand(
+                &mut handed,
+                &self.catalog,
+                super::handed::Function::set_returning(&f, &[], row, move |_| Ok(rows.clone())),
+            )?;
+            let body = format!("SELECT * FROM {}()", quoted(&f));
+            match super::image::parse_sql(&body)?.pop() {
+                Some(sqlparser::ast::Statement::Query(b)) => cte.query = b,
+                _ => unreachable!("a question"),
+            }
+            kept_ctes.push(cte);
+        }
+        with.cte_tables = kept_ctes;
+        if with.cte_tables.is_empty() {
+            q.with = None;
+        }
+        {
+            let _held = super::handed::holding(&handed);
+            let (batch, _) = self.answer(&q.to_string(), None)?;
+            done.rows = batch.num_rows() as u64;
+            done.answer = Some(batch);
+        }
+        let mut changed = false;
+        for (table, changes) in held {
+            changed |= !changes.is_empty();
+            let (rewritten, orders) = self.apply(table, changes)?;
+            done.rewritten += rewritten;
+            done.orders += orders;
+        }
+        Ok(changed)
     }
 
     /// A write's RETURNING: its list read as a question over the rows it changed, by the name

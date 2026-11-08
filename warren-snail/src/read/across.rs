@@ -1076,6 +1076,9 @@ impl Snails {
                 }
                 Ok(done)
             }
+            Statement::Writes { .. } => Err(Error::new(
+                "a WITH holding writes is written on one snail, not across several",
+            )),
             st @ (Statement::Insert { .. }
             | Statement::Update { .. }
             | Statement::Delete { .. }

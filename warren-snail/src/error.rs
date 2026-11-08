@@ -116,6 +116,7 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("cannot drop ", " because other objects depend on it"), "2BP01"),
     (Words::Is("cannot truncate a table referenced in a foreign key constraint"), "0A000"),
     (Words::Starts("nondeterministic collations are not supported for "), "0A000"),
+    (Words::Holds("WITH query \"", "\" does not have a RETURNING clause"), "0A000"),
     (Words::Starts("sql parser error: "), "42601"),
 ];
 

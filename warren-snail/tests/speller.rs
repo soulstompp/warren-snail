@@ -446,6 +446,38 @@ fn a_write_returns_rows_of_what_it_changed_its_old_and_new_among_them() {
     let schema = done.answer.expect("an answer").schema();
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, ["k", "?column?", "a", "record_image_ne"]);
+    // Writes inside one WITH find their rows on one snapshot, the question reading it too; a write
+    // nothing reads runs all the same.
+    run(&mut w, "INSERT INTO s.w (k, a) VALUES (5, 50), (6, 60)");
+    for (sql, want) in [
+        (
+            "WITH u AS (UPDATE s.w SET a = 0 WHERE k = 1 RETURNING k), d AS (DELETE FROM s.w WHERE \
+             k = 5 RETURNING k) SELECT (SELECT count(*) FROM u) AS updated, (SELECT count(*) FROM \
+             d) AS deleted, (SELECT count(*) FROM s.w) AS seen",
+            vec!["1|1|6"],
+        ),
+        ("SELECT count(*) FROM s.w", vec!["5"]),
+        (
+            "WITH i AS (INSERT INTO s.w (k, a) VALUES (7, 70) RETURNING k) SELECT k FROM s.w \
+             WHERE k = 7",
+            vec![],
+        ),
+        ("WITH d AS (DELETE FROM s.w WHERE k = 7 RETURNING k) SELECT 1", vec!["1"]),
+        ("SELECT count(*) FROM s.w WHERE k = 7", vec!["0"]),
+        (
+            "WITH updated AS (UPDATE s.w SET a = 10 WHERE k <= 3 RETURNING \
+             record_image_ne(ROW(old.a), ROW(new.a)) AS changed) SELECT count(*) FILTER (WHERE \
+             changed) AS changed, count(*) AS matched FROM updated",
+            vec!["3|3"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), want, "{sql}");
+    }
+    assert_eq!(
+        refused(&mut w, "WITH d AS (DELETE FROM s.w WHERE k = 6) SELECT count(*) FROM d"),
+        (Some("0A000"), "WITH query \"d\" does not have a RETURNING clause".to_string())
+    );
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM s.w WHERE k = 6"), ["1"]);
     // Two records compared by their images, a NULL field the same as a NULL field.
     assert_eq!(
         rows(

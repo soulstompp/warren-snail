@@ -102,6 +102,13 @@ pub enum Statement {
         alias: String,
         items: Vec<sqlparser::ast::SelectItem>,
     },
+    /// A question whose WITH holds writes: each write by the name its WITH query takes, and the
+    /// question. Every write finds its rows on the statement's one snapshot, none seeing another's,
+    /// the question reading that snapshot and the rows each write returns.
+    Writes {
+        writes: Vec<(String, Statement)>,
+        question: String,
+    },
     /// A table, an index or a table's order declared: its DDL, and what it declares.
     Declare {
         ddl: String,
@@ -366,6 +373,7 @@ impl Statement {
             Statement::Question { .. } => "SELECT",
             Statement::Session(s) => s.kind(),
             Statement::Returning { write, .. } => write.kind(),
+            Statement::Writes { .. } => "SELECT",
         }
     }
 
@@ -994,6 +1002,14 @@ fn finder(table: &Table, relation: &TableWithJoins, selection: Option<&Expr>) ->
     }
 }
 
+/// Whether a WITH query writes.
+pub(crate) fn writes_query(q: &Query) -> bool {
+    matches!(
+        q.body.as_ref(),
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)
+    )
+}
+
 /// A write that returns rows where it has a RETURNING list, its table read by `alias`.
 fn returning(write: Statement, alias: String, items: &Option<Vec<SelectItem>>) -> Statement {
     match items {
@@ -1333,6 +1349,34 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                 find: finder(&catalog.tables[ti], t, d.selection.as_ref()),
             };
             Ok(returning(delete, read_as(t), &d.returning))
+        }
+        // A WITH holding writes: each read as a statement of its own.
+        Sql::Query(q)
+            if q
+                .with
+                .as_ref()
+                .is_some_and(|w| w.cte_tables.iter().any(|c| writes_query(&c.query))) =>
+        {
+            let mut writes = Vec::new();
+            for c in &q.with.as_ref().unwrap().cte_tables {
+                if !writes_query(&c.query) {
+                    continue;
+                }
+                let written = match c.query.body.as_ref() {
+                    SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s)
+                        if c.query.with.is_none() =>
+                    {
+                        s.to_string()
+                    }
+                    SetExpr::Merge(_) => return Err(refused("MERGE in a WITH")),
+                    _ => return Err(refused("a WITH of its own on a write inside WITH")),
+                };
+                writes.push((ident(&c.alias.name), parse(catalog, &written)?));
+            }
+            Ok(Statement::Writes {
+                writes,
+                question: sql.trim().trim_end_matches(';').trim_end().to_string(),
+            })
         }
         Sql::Query(_) => Ok(Statement::Question {
             question: sql.trim().trim_end_matches(';').trim_end().to_string(),
