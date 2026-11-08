@@ -77,6 +77,24 @@ pub fn pipeline_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>> {
     Ok(pipeline::relation_of(batch)?.rows)
 }
 
+/// An answer's rows as PostgreSQL's output functions write each value, a NULL as `None`: what a
+/// client reading the rows as text is handed, each value as COPY … TO writes it.
+pub fn answer_text(batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>> {
+    let types = change::answer_types(batch)?;
+    Ok(change::rows_of(batch)?
+        .iter()
+        .map(|r| {
+            r.iter()
+                .zip(&types)
+                .map(|(d, ty)| match d {
+                    statement::Datum::Null => None,
+                    d => Some(crate::composed::scalar_out(*ty, d)),
+                })
+                .collect()
+        })
+        .collect())
+}
+
 /// The names of the columns a view's question returns, read over the catalog as PostgreSQL's
 /// parser reads it as the view is made: no row read.
 pub(crate) fn view_columns(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Vec<String>> {
