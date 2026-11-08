@@ -4508,6 +4508,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 ("timezone", [zone, x]) => super::clock::at_zone(ev(x)?, ev(zone)?)?,
                 _ => {
                     let values = a.iter().map(|x| ev(x)).collect::<Result<Vec<_>>>()?;
+                    if let Some(v) = super::sequences::call(&name, &values)? {
+                        return Ok(v);
+                    }
                     let types: Vec<Option<ColumnType>> =
                         a.iter().map(|x| frame.type_of(x)).collect();
                     let given: Vec<(Value, bool)> = values
@@ -5592,6 +5595,10 @@ pub(super) struct Prepared<'q> {
     sorted: Vec<usize>,
     hidden: Vec<&'q Expr>,
     items: Vec<(&'q Expr, String)>,
+    /// The items that draw from a sequence in a step that sorts or cuts its rows: each made once
+    /// the rows are sorted, for each row the cut reaches, from the row it came from, carried after
+    /// the ORDER BY's values until then.
+    drawn: Vec<usize>,
     calls: Calls<'q>,
     grouping: Vec<&'q Expr>,
     grouped: bool,
@@ -5677,9 +5684,19 @@ impl<'q> Prepared<'q> {
                 .iter()
                 .map(|(e, _)| *e)
                 .chain(self.hidden.iter().copied())
-                .map(|e| eval(e, row, frame, c))
+                .enumerate()
+                .map(|(i, e)| match self.drawn.contains(&i) {
+                    true => Ok(Value::Null),
+                    false => eval(e, row, frame, c),
+                })
                 .collect::<Result<Vec<_>>>()
         };
+        // A row whose drawing items wait for the cut carries the row it came from.
+        if !self.drawn.is_empty() {
+            let mut made = one(&computed)?;
+            made.extend_from_slice(row);
+            return Ok(vec![made]);
+        }
         if self.calls.sets.is_empty() {
             return Ok(vec![one(&computed)?]);
         }
@@ -5702,6 +5719,31 @@ impl<'q> Prepared<'q> {
         }
         Ok(out)
     }
+
+    /// A row the cut reaches, its drawing items made from the row it came from, which it carries
+    /// no further.
+    fn drawn_after(&self, row: &mut Vec<Value>, frame: &Frame) -> Result<()> {
+        if self.drawn.is_empty() {
+            return Ok(());
+        }
+        let from = row.split_off(self.items.len() + self.hidden.len());
+        for &i in &self.drawn {
+            row[i] = eval(self.items[i].0, &from, frame, &computed_none())?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether an expression calls a function that moves a sequence.
+fn draws(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        if let Expr::Function(f) = x {
+            found |= matches!(function_name(f).as_str(), "nextval" | "setval");
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    found
 }
 
 /// COALESCE, LEAST, GREATEST and NULLIF, each in the type the step resolved it to: COALESCE its
@@ -6367,7 +6409,22 @@ pub(super) fn prepare<'q>(
     }
     let listed: Vec<&Expr> = items.iter().map(|(e, _)| *e).collect();
     windows::checked(&calls.windows, &listed, &mut typing, release)?;
+    // An item that draws from a sequence and is no sort key is made above the sort and below the
+    // cut, as PostgreSQL's planner places a volatile item: in the rows' sorted order, for each row
+    // the LIMIT and OFFSET read.
+    let cuts = q.order_by.is_some() || limit.is_some();
+    let plain = s.distinct.is_none() && !grouped && calls.windows.is_empty() && calls.sets.is_empty();
+    let drawn = match cuts && plain {
+        true => items
+            .iter()
+            .enumerate()
+            .filter(|(i, (e, _))| !sorted.contains(i) && draws(e))
+            .map(|(i, _)| i)
+            .collect(),
+        false => Vec::new(),
+    };
     Ok(Prepared {
+        drawn,
         from: &s.from,
         selection: s.selection.as_ref(),
         having,
@@ -6738,6 +6795,11 @@ impl Going {
         };
         if !self.sorts {
             let Some(l) = &p.limit else {
+                // Rows that come in their order make their drawing items as they come.
+                let mut rows = rows;
+                for r in &mut rows {
+                    p.drawn_after(r, frame)?;
+                }
                 return Ok(rows);
             };
             let keys = match l.ties {
@@ -6752,7 +6814,11 @@ impl Going {
             if self.cut.is_none() {
                 self.cut = Some(sorted::Cut::of(l, frame)?);
             }
-            return Ok(self.cut.as_mut().expect("just made").take(rows, &keys));
+            return self
+                .cut
+                .as_mut()
+                .expect("just made")
+                .take(rows, &keys, &mut |r| p.drawn_after(r, frame));
         }
         if self.sorter.is_none() {
             let mut s = sorted::Sorter::new(p, casings)?;
@@ -6990,23 +7056,28 @@ impl<'q> StepRun<'q> {
         let Some(sorter) = self.going.sorter.take() else {
             return Ok(());
         };
+        let frame = Frame {
+            columns: self.columns.clone(),
+            params,
+            release,
+            casings,
+            types: &self.p.types,
+            now: self.p.now,
+            subqueries: self.subqueries,
+        };
         if let (None, Some(l)) = (&self.going.cut, &self.p.limit) {
-            let frame = Frame {
-                columns: self.columns.clone(),
-                params,
-                release,
-                casings,
-                types: &self.p.types,
-                now: self.p.now,
-                subqueries: self.subqueries,
-            };
             self.going.cut = Some(sorted::Cut::of(l, &frame)?);
         }
-        let (cut, out) = (&mut self.going.cut, &mut self.partitions_out);
-        sorter.finish(&mut |rows, keys| {
+        let (cut, out, p) = (&mut self.going.cut, &mut self.partitions_out, &self.p);
+        sorter.finish(&mut |mut rows, keys| {
             out.extend(match cut {
-                Some(c) => c.take(rows, &keys),
-                None => rows,
+                Some(c) => c.take(rows, &keys, &mut |r| p.drawn_after(r, &frame))?,
+                None => {
+                    for r in &mut rows {
+                        p.drawn_after(r, &frame)?;
+                    }
+                    rows
+                }
             });
             Ok(())
         })
@@ -7134,10 +7205,15 @@ impl<'q> StepRun<'q> {
                 Some(l) => Some(sorted::Cut::of(l, &frame)?),
                 None => None,
             };
-            sorter.finish(&mut |rows, keys| {
+            sorter.finish(&mut |mut rows, keys| {
                 let rows = match &mut cut {
-                    Some(c) => c.take(rows, &keys),
-                    None => rows,
+                    Some(c) => c.take(rows, &keys, &mut |r| p.drawn_after(r, frame_ref))?,
+                    None => {
+                        for r in &mut rows {
+                            p.drawn_after(r, frame_ref)?;
+                        }
+                        rows
+                    }
                 };
                 if !rows.is_empty() {
                     each(truncated(rows, width))?;
@@ -7955,7 +8031,7 @@ pub fn hands_over(q: &Query) -> bool {
         .collect();
     let returned = exprs.clone();
     let one_table = matches!(s.from.as_slice(), [only] if only.joins.is_empty());
-    if returned.iter().any(|e| compares_no_constant(e))
+    if returned.iter().any(|e| compares_no_constant(e) || is_written_constant(e))
         || one_table && s.selection.as_ref().is_some_and(compares_no_constant)
     {
         return true;
@@ -7995,6 +8071,19 @@ pub fn hands_over(q: &Query) -> bool {
         exprs.extend(o.iter().map(|x| &x.expr));
     }
     exprs.into_iter().any(calls_beyond_the_question)
+}
+
+/// Whether a select list's item is a constant written out, which the question path holds no level
+/// for: a literal, NULL, a typed literal, or a cast or a sign of one.
+fn is_written_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Value(v) => !matches!(v.value, SqlValue::Placeholder(_)),
+        Expr::TypedString { .. } => true,
+        Expr::Cast { expr, .. } | Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            is_written_constant(expr)
+        }
+        _ => false,
+    }
 }
 
 /// Whether an expression calls a function, or an operator on numbers or on a document, the question

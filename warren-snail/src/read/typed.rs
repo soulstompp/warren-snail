@@ -770,6 +770,9 @@ impl Typing<'_> {
                 if let Some(t) = super::updatable::typed(&name) {
                     return Ok(Some(t));
                 }
+                if let Some(t) = super::sequences::typed(&name) {
+                    return Ok(Some(t));
+                }
                 if let Some(t) = crate::deparse::typed(&name) {
                     return Ok(Some(t));
                 }

@@ -1460,7 +1460,19 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             let ti = one_table(catalog, &u.table)?;
             let table = &catalog.tables[ti];
             let mut sets = sets_of(table, &u.assignments)?;
-            let find = match &u.from {
+            // A value set by a subquery is read on the row it changes, as a FROM's are, over a FROM
+            // listing nothing more.
+            let reads_a_set = u.assignments.iter().any(|a| {
+                let mut found = Vec::new();
+                super::pipeline::subqueries_in(&a.value, &mut found);
+                !found.is_empty()
+            });
+            let none = sqlparser::ast::UpdateTableFromKind::AfterSet(Vec::new());
+            let from = match (&u.from, reads_a_set) {
+                (None, true) => Some(&none),
+                (from, _) => from.as_ref(),
+            };
+            let find = match from {
                 None => finder(table, &u.table, u.selection.as_ref()),
                 // Joined with its FROM: each expression set read on the joined row, an answer of
                 // the question that finds the rows.

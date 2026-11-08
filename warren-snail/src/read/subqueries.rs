@@ -408,6 +408,8 @@ impl<'q> Plan<'q> {
             _ => unreachable!("a subquery"),
         };
         super::question::unlocked(query)?;
+        // Read for its columns alone: a sequence it draws from is drawn only as rows ask it.
+        let _probing = super::sequences::probing();
         let empty = relations::Empty(asked.reads.catalog());
         let probe = Asked {
             reads: &empty,

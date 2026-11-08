@@ -43,6 +43,7 @@ mod ranges;
 mod relations;
 mod rest;
 mod savepoint;
+mod sequences;
 pub(crate) mod serial;
 mod session;
 pub(crate) mod settings;
@@ -442,6 +443,8 @@ pub struct Snail {
     /// The values each sequence has handed this writer and it has not used, as PostgreSQL's
     /// sequences cache them a session.
     handed: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
+    /// The value each sequence last handed this session, and the sequence it drew from last.
+    drawn: sequences::Drawn,
     /// The changes a write makes to its own table, kept where its statement returns rows of them.
     kept: Option<Vec<change::Change>>,
     /// A write inside WITH's changes, held unapplied while every write of the statement finds its
@@ -741,6 +744,7 @@ impl Snail {
             declared: None,
             clock: (0, 0),
             handed: Default::default(),
+            drawn: Default::default(),
             kept: None,
             dry: None,
             checking: None,
@@ -1514,9 +1518,28 @@ impl Snail {
         let room = self.reader.room();
         let _room = self.entered_round(&room);
         self.wasted.borrow_mut().clear();
-        let (batch, mut round) = match locking::clauses(sql)? {
-            Some(l) => self.ask_locking(l, order, params)?,
-            None => self.answer_with(sql, order, params)?,
+        // A question that calls the sequence functions is asked on a tab, and again over what its
+        // calls came to wherever a run owed the file.
+        let (batch, mut round) = match self.sequence_runs(sql)? {
+            None => match locking::clauses(sql)? {
+                Some(l) => self.ask_locking(l, order, params)?,
+                None => self.answer_with(sql, order, params)?,
+            },
+            Some(mut runs) => loop {
+                let tabbing = self.tab_for(&runs);
+                let asked = match locking::clauses(sql) {
+                    Ok(Some(l)) => self.ask_locking(l, order, params),
+                    Ok(None) => self.answer_with(sql, order, params),
+                    Err(e) => Err(e),
+                };
+                let tab = tabbing.ended();
+                if tab.owes() {
+                    self.replay_run(&mut runs, &tab)?;
+                    continue;
+                }
+                self.took_tab(tab);
+                break asked?;
+            },
         };
         // What set_config set stands for the session once the question is answered.
         for (name, taken, local) in viewing.changed() {

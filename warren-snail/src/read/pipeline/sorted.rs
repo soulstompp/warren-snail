@@ -487,11 +487,18 @@ impl Cut {
         self.left.map(|n| n.saturating_add(self.skip))
     }
 
-    /// Of `rows` as they come, with the values each sorts by where it keeps ties, those it keeps.
-    pub(super) fn take(&mut self, rows: Vec<Vec<Value>>, keys: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    /// Of `rows` as they come, with the values each sorts by where it keeps ties, those it keeps;
+    /// `each` made of every row it reaches in their order, those its OFFSET passes over among them.
+    pub(super) fn take(
+        &mut self,
+        rows: Vec<Vec<Value>>,
+        keys: &[Vec<Value>],
+        each: &mut dyn FnMut(&mut Vec<Value>) -> Result<()>,
+    ) -> Result<Vec<Vec<Value>>> {
         let mut out = Vec::new();
-        for (i, row) in rows.into_iter().enumerate() {
+        for (i, mut row) in rows.into_iter().enumerate() {
             if self.skip > 0 {
+                each(&mut row)?;
                 self.skip -= 1;
                 continue;
             }
@@ -512,8 +519,9 @@ impl Cut {
             if self.ties {
                 self.last = keys.get(i).cloned();
             }
+            each(&mut row)?;
             out.push(row);
         }
-        out
+        Ok(out)
     }
 }

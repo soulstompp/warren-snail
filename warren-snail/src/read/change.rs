@@ -119,13 +119,34 @@ impl Rebased {
     }
 }
 
-/// What a statement under way had staged when it began, and what its foreign keys had recorded.
+/// What a statement under way had staged when it began, the root it read with its writes in place,
+/// what a transaction of one snapshot had changed (which its commit writes) and the tables changed
+/// without being named, and what its foreign keys had recorded.
 pub(super) struct Mark {
+    root: Root,
+    own: BTreeMap<String, super::beside::OwnRows>,
+    first_bytes: BTreeMap<u64, u64>,
+    unnamed: std::collections::BTreeSet<usize>,
     rebased: BTreeMap<(usize, usize), Vec<Rebased>>,
     staged: u64,
     touched: Touched,
     pending: Touched,
     modes: BTreeMap<(usize, usize), bool>,
+}
+
+/// The most times a statement's calls of the sequence functions are replayed before it is refused:
+/// a run answered from its script makes the same calls unless another writer moved a sequence its
+/// course turns on.
+const REPLAYS: usize = 16;
+
+/// What a statement that calls the sequence functions carries from one run to the next: what the
+/// session held of them as it began, where each sequence stands, and the calls its replays made,
+/// each with what it came to.
+pub(super) struct Runs {
+    start: super::sequences::Drawn,
+    stands: std::collections::HashMap<String, (i64, bool)>,
+    script: Vec<(super::sequences::Op, super::sequences::Outcome)>,
+    replays: usize,
 }
 
 /// The catalog a statement or a transaction declared: the catalog it began from, its DDL now, and
@@ -1120,8 +1141,19 @@ impl Snail {
                 let mark = self.mark();
                 // The rows the statement found when it began, which it keeps to if it runs again.
                 let mut found = None;
+                // A statement that calls the sequence functions runs on a tab; a run that owes the
+                // file is undone, its calls replayed on the file, and the statement runs again
+                // over what they came to.
+                let mut runs = match self.sequence_runs(text) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.failed()?;
+                        return Err(e);
+                    }
+                };
                 loop {
                     self.stale = false;
+                    let tabbing = runs.as_ref().map(|r| self.tab_for(r));
                     // Its foreign keys are checked as it ends, their actions written first.
                     let written =
                         self.write_rows(st.clone(), &mut done, &mut found)
@@ -1135,6 +1167,32 @@ impl Snail {
                                     })
                                     .map(|_| changed),
                             });
+                    // A write's RETURNING, read over the rows it changed as it ran last.
+                    let returned = match (&written, &st) {
+                        (Ok(_), Statement::Returning { write, alias, items }) if !self.stale => {
+                            let kept = self.kept.take().unwrap_or_default();
+                            Some(self.returned(write, alias, items, kept))
+                        }
+                        _ => None,
+                    };
+                    let tab = tabbing.map(super::sequences::Tabbing::ended);
+                    if let (Some(r), Some(tab)) = (runs.as_mut(), tab) {
+                        if !(self.stale && written.is_ok()) {
+                            if tab.owes() {
+                                // Run again on the same root, it finds the same rows and makes
+                                // them again over what its calls came to.
+                                self.back_to(&mark);
+                                self.kept = None;
+                                found = None;
+                                if let Err(e) = self.replay_run(r, &tab) {
+                                    self.failed()?;
+                                    return Err(e);
+                                }
+                                continue;
+                            }
+                            self.took_tab(tab);
+                        }
+                    }
                     match written {
                         Ok(_) if self.stale => {
                             // A block the statement locked was written since the root it read: it
@@ -1156,16 +1214,13 @@ impl Snail {
                             }
                         }
                         Ok(changed) => {
-                            // A write's RETURNING, read over the rows it changed as it ran last.
-                            if let Statement::Returning { write, alias, items } = &st {
-                                let kept = self.kept.take().unwrap_or_default();
-                                match self.returned(write, alias, items, kept) {
-                                    Ok(b) => done.answer = Some(b),
-                                    Err(e) => {
-                                        self.failed()?;
-                                        return Err(e);
-                                    }
+                            match returned {
+                                Some(Ok(b)) => done.answer = Some(b),
+                                Some(Err(e)) => {
+                                    self.failed()?;
+                                    return Err(e);
                                 }
+                                None => {}
                             }
                             break changed;
                         }
@@ -1977,7 +2032,11 @@ impl Snail {
         }
         let mut out = std::collections::HashMap::new();
         for (s, n) in need {
-            let values = self.draw(&s, n)?;
+            // A statement that calls the sequence functions draws on its tab, in its calls' order.
+            let values = match super::sequences::defaults(&s, n) {
+                Some(drawn) => drawn?,
+                None => self.draw(&s, n)?,
+            };
             out.insert(s, values.into());
         }
         Ok(out)
@@ -2066,14 +2125,185 @@ impl Snail {
             let missing = n - out.len();
             let cache = s.cache.max(1) as usize;
             let chunk = missing.div_ceil(cache) * cache;
-            let fetched = self.advance(&s, chunk, missing)?;
+            let fetched = match self.advance(&s, chunk, missing) {
+                Ok(f) => f,
+                Err(e) => {
+                    // The values held stay held where the sequence runs out.
+                    let held = self.handed.entry(name.to_string()).or_default();
+                    for v in out.into_iter().rev() {
+                        held.push_front(v);
+                    }
+                    return Err(e);
+                }
+            };
             out.extend_from_slice(&fetched[..missing]);
             self.handed
                 .entry(name.to_string())
                 .or_default()
                 .extend(fetched[missing..].iter().copied());
         }
+        if let Some(&v) = out.last() {
+            self.drawn.drew(name, v);
+        }
         Ok(out)
+    }
+
+    /// setval at the root's turn, a commit of its own never rolled back: the sequence stands on
+    /// `v`, handed out where `called`, and the values it handed this writer are thrown away.
+    fn set_sequence(&mut self, name: &str, v: i64, called: bool) -> Result<()> {
+        if self
+            .declared
+            .as_ref()
+            .is_some_and(|d| d.resets.iter().any(|r| r == name))
+        {
+            return Err(Error::new(format!(
+                "{name} is declared in this transaction, and is set once it is committed"
+            )));
+        }
+        self.at_sequences_turn(|states| {
+            states.retain(|x| x.0 != name);
+            states.push((name.to_string(), v, called));
+            Ok(())
+        })?;
+        self.handed.remove(name);
+        Ok(())
+    }
+
+    /// The calls a statement's run made that only the file could answer, made on the file in their
+    /// order, each draw from what the session holds and then at the root's turn, each set committed:
+    /// what each came to, up to and with the first refused or the first that came to other than the
+    /// run was answered, after which the statement's course may be another. A draw's values past
+    /// that one stay the session's, as its CACHE's do. `stands` keeps where each stands after.
+    fn replayed(
+        &mut self,
+        fresh: &[super::sequences::Fresh],
+        stands: &mut std::collections::HashMap<String, (i64, bool)>,
+    ) -> Result<Vec<(super::sequences::Op, super::sequences::Outcome)>> {
+        use super::sequences::Op;
+        let mut out = Vec::with_capacity(fresh.len());
+        let mut i = 0;
+        while i < fresh.len() {
+            let f = &fresh[i];
+            match &f.op {
+                Op::Draw(s) => {
+                    // Draws of one sequence in a row, drawn at once.
+                    let n = fresh[i..].iter().take_while(|g| g.op == f.op).count();
+                    let (values, refused) = self.drawn_on_file(s, n)?;
+                    let parted = values
+                        .iter()
+                        .zip(&fresh[i..])
+                        .position(|(v, g)| g.outcome != Ok(*v));
+                    let used = parted.map_or(values.len(), |k| k + 1);
+                    out.extend(values[..used].iter().map(|&v| (f.op.clone(), Ok(v))));
+                    let held = self.handed.entry(s.clone()).or_default();
+                    for &v in values[used..].iter().rev() {
+                        held.push_front(v);
+                    }
+                    // The file stands on the last value it handed the session.
+                    if let Some(&v) = held.back().or(values.last()) {
+                        stands.insert(s.clone(), (v, true));
+                    }
+                    if parted.is_some() {
+                        return Ok(out);
+                    }
+                    if let Some(e) = refused {
+                        out.push((f.op.clone(), Err(e)));
+                        return Ok(out);
+                    }
+                    i += n;
+                    continue;
+                }
+                Op::Set(s, v, called) => {
+                    self.set_sequence(s, *v, *called)?;
+                    stands.insert(s.clone(), (*v, *called));
+                    out.push((f.op.clone(), Ok(*v)));
+                }
+            }
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    /// `n` values of a sequence drawn for a replay, at once; where it runs out first, one at a time,
+    /// so that those drawn before its end stand, with the words it was refused in.
+    fn drawn_on_file(&mut self, s: &str, n: usize) -> Result<(Vec<i64>, Option<String>)> {
+        match self.draw(s, n) {
+            Ok(values) => Ok((values, None)),
+            Err(e) if e.0.starts_with("nextval: reached ") => {
+                let mut values = Vec::with_capacity(n);
+                for _ in 0..n {
+                    match self.draw(s, 1) {
+                        Ok(v) => values.push(v[0]),
+                        Err(e) => return Ok((values, Some(e.0))),
+                    }
+                }
+                Ok((values, None))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The runs of a statement whose text names the sequence functions; none for any other.
+    pub(super) fn sequence_runs(&self, sql: &str) -> Result<Option<Runs>> {
+        if !super::sequences::names(sql) {
+            return Ok(None);
+        }
+        Ok(Some(Runs {
+            start: self.drawn.clone(),
+            stands: self.sequences_standing()?,
+            script: Vec::new(),
+            replays: 0,
+        }))
+    }
+
+    /// The tab a run of the statement is lent: what the session holds, and what the replays so
+    /// far came to.
+    pub(super) fn tab_for(&self, r: &Runs) -> super::sequences::Tabbing {
+        let read_only = self.writer.is_none() || self.levels.read_only(self.begun.is_some());
+        super::sequences::tabbing(super::sequences::Tab::lent(super::sequences::Lent {
+            drawn: r.start.clone(),
+            held: &self.handed,
+            stands: &r.stands,
+            catalog: &self.catalog,
+            read_only,
+            script: r.script.clone(),
+        }))
+    }
+
+    /// A run's calls that only the file can answer, replayed on it: the next run answers them from
+    /// what they came to.
+    pub(super) fn replay_run(&mut self, r: &mut Runs, tab: &super::sequences::Tab) -> Result<()> {
+        r.replays += 1;
+        if r.replays > REPLAYS {
+            return Err(Error::new(format!(
+                "the sequences this statement draws from moved under it on each of {REPLAYS} \
+                 runs; run it again"
+            )));
+        }
+        let replayed = self.replayed(tab.fresh(), &mut r.stands)?;
+        r.script.truncate(tab.matched());
+        r.script.extend(replayed);
+        Ok(())
+    }
+
+    /// What the run that stands left the session: its `currval`s, the sequence it drew from last,
+    /// and the values it drew of those the session held.
+    pub(super) fn took_tab(&mut self, tab: super::sequences::Tab) {
+        self.drawn = tab.drawn().clone();
+        self.handed = tab.held();
+    }
+
+    /// Where each sequence stands on the root this statement reads, those no draw has moved
+    /// standing where the DDL leaves them.
+    pub(super) fn sequences_standing(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (i64, bool)>> {
+        Ok(self
+            .reader
+            .sequence_states(&self.root)?
+            .into_iter()
+            .map(|(n, v, c)| (n, (v, c)))
+            .collect())
     }
 
     /// Advances a sequence by up to `chunk` values at the root's turn, a commit of its own, as
@@ -2085,14 +2315,7 @@ impl Snail {
         chunk: usize,
         need: usize,
     ) -> Result<Vec<i64>> {
-        let mut w = self
-            .writer
-            .take()
-            .ok_or_else(|| Error::new("this snail was opened to read; open it to write"))?;
-        let turn = lock::take_root_turn(w.file());
-        let drawn = turn.and_then(|_| {
-            let root = self.reader.peek_root()?;
-            let mut states = self.reader.sequence_states(&root)?;
+        self.at_sequences_turn(|states| {
             let (mut last, mut called) = states
                 .iter()
                 .find(|x| x.0 == s.name)
@@ -2100,33 +2323,40 @@ impl Snail {
                 .unwrap_or((s.last_value, s.is_called));
             let mut out = Vec::with_capacity(chunk);
             while out.len() < chunk {
-                let next = if called {
-                    last.checked_add(s.increment)
-                        .filter(|v| *v >= s.min && *v <= s.max)
-                } else {
-                    Some(last)
-                };
-                match next {
-                    Some(v) => last = v,
-                    None if out.len() >= need => break,
-                    None if s.cycle => last = if s.increment > 0 { s.min } else { s.max },
-                    None => {
-                        let (end, bound) = if s.increment > 0 {
-                            ("maximum", s.max)
-                        } else {
-                            ("minimum", s.min)
-                        };
-                        return Err(Error::new(format!(
-                            "nextval: reached {end} value of sequence \"{}\" ({bound})",
-                            s.name.rsplit('.').next().unwrap_or(&s.name)
-                        )));
-                    }
+                // A run of values ends at the sequence's end once it holds what was asked; the
+                // next draw cycles, or is refused.
+                let ends = called
+                    && last
+                        .checked_add(s.increment)
+                        .is_none_or(|v| v < s.min || v > s.max);
+                if ends && out.len() >= need {
+                    break;
                 }
+                last = super::sequences::next(s, (last, called)).map_err(Error::new)?;
                 called = true;
                 out.push(last);
             }
             states.retain(|x| x.0 != s.name);
             states.push((s.name.clone(), last, true));
+            Ok(out)
+        })
+    }
+
+    /// Moves where the sequences stand at the root's turn, a commit of its own: `f` is given their
+    /// states on the newest root to move.
+    fn at_sequences_turn<T>(
+        &mut self,
+        f: impl FnOnce(&mut Vec<crate::file::SequenceState>) -> Result<T>,
+    ) -> Result<T> {
+        let mut w = self
+            .writer
+            .take()
+            .ok_or_else(|| Error::new("this snail was opened to read; open it to write"))?;
+        let turn = lock::take_root_turn(w.file());
+        let moved = turn.and_then(|_| {
+            let root = self.reader.peek_root()?;
+            let mut states = self.reader.sequence_states(&root)?;
+            let out = f(&mut states)?;
             self.advancing = Some(states);
             let rebased = std::mem::take(&mut self.rebased);
             let declared = self.declared.take();
@@ -2138,7 +2368,7 @@ impl Snail {
         });
         let given = lock::give_root_turn(w.file());
         self.writer = Some(w);
-        let out = drawn?;
+        let out = moved?;
         given?;
         Ok(out)
     }
@@ -2197,6 +2427,10 @@ impl Snail {
     /// can run again from there.
     pub(super) fn mark(&self) -> Mark {
         Mark {
+            root: self.root.clone(),
+            own: self.own.clone(),
+            first_bytes: self.first_bytes.clone(),
+            unnamed: self.unnamed.clone(),
             rebased: self.rebased.clone(),
             staged: self.reader.staged_mark(),
             touched: self.touched.clone(),
@@ -2206,6 +2440,10 @@ impl Snail {
     }
 
     pub(super) fn back_to(&mut self, mark: &Mark) {
+        self.root = mark.root.clone();
+        self.own = mark.own.clone();
+        self.first_bytes = mark.first_bytes.clone();
+        self.unnamed = mark.unnamed.clone();
         self.rebased = mark.rebased.clone();
         self.reader.staged_back_to(mark.staged);
         self.touched = mark.touched.clone();
