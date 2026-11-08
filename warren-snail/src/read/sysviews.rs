@@ -341,7 +341,11 @@ fn servers_read(e: &Expr) -> Option<String> {
 
 /// A view as a step reads it, under a release: its definition rewritten, and each of its columns'
 /// refusal. None for a name that is none of PostgreSQL's views.
-pub(crate) fn system_view(release: u8, name: &str) -> Result<Option<(Query, Vec<Option<String>>)>> {
+pub(crate) fn system_view(
+    catalog: &crate::catalog::Catalog,
+    name: &str,
+) -> Result<Option<(Query, Vec<Option<String>>)>> {
+    let release = catalog.release;
     let Some(full) = view_named(name) else {
         return Ok(None);
     };
@@ -367,14 +371,14 @@ pub(crate) fn system_view(release: u8, name: &str) -> Result<Option<(Query, Vec<
         return Err(Error::new(format!("{full}'s definition is no question")));
     };
     let mut q = (**q).clone();
-    let refused = rewrite(&mut q, release)?;
+    let refused = rewrite(&mut q, catalog)?;
     Ok(Some((super::spelled::between_written(&q), refused)))
 }
 
 /// Each output column's refusal: a select item reading what only a server fills is NULL. Then,
 /// throughout, the privilege tests and the temporary schemas answered, the domains read as their
 /// base types, information_schema's functions inlined.
-fn rewrite(q: &mut Query, release: u8) -> Result<Vec<Option<String>>> {
+fn rewrite(q: &mut Query, catalog: &crate::catalog::Catalog) -> Result<Vec<Option<String>>> {
     let mut refused: Vec<Option<String>> = Vec::new();
     // A privilege test holds for whoever opens a file, so what it reads decides no column.
     let _ = sqlparser::ast::visit_expressions_mut(q, |e| {
@@ -419,7 +423,7 @@ fn rewrite(q: &mut Query, release: u8) -> Result<Vec<Option<String>>> {
     }
     let mut failed: Option<Error> = None;
     let _ = sqlparser::ast::visit_expressions_mut(q, |e| {
-        if let Err(err) = answer(e, release) {
+        if let Err(err) = answer(e, catalog) {
             failed.get_or_insert(err);
         }
         ControlFlow::<()>::Continue(())
@@ -614,7 +618,8 @@ fn qualifiers_read(e: &Expr) -> Option<Vec<String>> {
 
 /// One expression answered: a privilege test true, another session's temporary schema none, one of
 /// information_schema's functions as the expression it returns.
-fn answer(e: &mut Expr, release: u8) -> Result<()> {
+fn answer(e: &mut Expr, catalog: &crate::catalog::Catalog) -> Result<()> {
+    let release = catalog.release;
     let Expr::Function(f) = e else {
         return Ok(());
     };
@@ -641,17 +646,40 @@ fn answer(e: &mut Expr, release: u8) -> Result<()> {
             *e = expression("CAST('UTF8' AS name)")?;
             return Ok(());
         }
-        // What a snail's own writes take: a table's rows, never a view's or another relation's.
+        // What a write takes: a table's rows, and a view's where it is written through, each
+        // view's as `updatable::writable` finds it.
         "pg_relation_is_updatable" | "pg_column_is_updatable" => {
             let args = arguments(f);
             let Some(rel) = args.first() else {
                 return Ok(());
             };
+            let views = super::updatable::writable_views(catalog)?;
             let what = match (name.as_str(), args.get(1)) {
                 ("pg_relation_is_updatable", _) => {
-                    "CASE WHEN snail_rel.relkind IN ('r', 'p') THEN 28 ELSE 0 END".to_string()
+                    let events: String = views
+                        .iter()
+                        .filter(|(_, can, _)| *can > 0)
+                        .map(|(oid, can, _)| format!(" WHEN {oid} THEN {can}"))
+                        .collect();
+                    format!(
+                        "CASE WHEN snail_rel.relkind IN ('r', 'p') THEN 28 ELSE CASE \
+                         CAST(snail_rel.oid AS bigint){events} ELSE 0 END END"
+                    )
                 }
-                (_, Some(attnum)) => format!("snail_rel.relkind IN ('r', 'p') AND ({attnum}) > 0"),
+                (_, Some(attnum)) => {
+                    let set: String = views
+                        .iter()
+                        .filter(|(_, _, set)| !set.is_empty())
+                        .map(|(oid, _, set)| {
+                            let numbers: Vec<String> = set.iter().map(|n| n.to_string()).collect();
+                            format!(
+                                " OR (snail_rel.oid = {oid} AND ({attnum}) IN ({}))",
+                                numbers.join(", ")
+                            )
+                        })
+                        .collect();
+                    format!("(snail_rel.relkind IN ('r', 'p') AND ({attnum}) > 0){set}")
+                }
                 _ => return Ok(()),
             };
             *e = expression(&format!(
@@ -670,7 +698,7 @@ fn answer(e: &mut Expr, release: u8) -> Result<()> {
         let mut inlined = inline(own, &args, release)?;
         let mut failed: Option<Error> = None;
         let _ = sqlparser::ast::visit_expressions_mut(&mut inlined, |x| {
-            if let Err(err) = answer(x, release) {
+            if let Err(err) = answer(x, catalog) {
                 failed.get_or_insert(err);
             }
             ControlFlow::<()>::Continue(())

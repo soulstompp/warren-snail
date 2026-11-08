@@ -36,7 +36,7 @@ pub(crate) struct Holding(Option<Option<Arc<Catalog>>>);
 /// one of them.
 pub(crate) fn holding(catalog: &Catalog, sql: &str) -> Holding {
     let lower = sql.to_ascii_lowercase();
-    if !lower.contains("pg_get_") && !crate::pgcatalog::names_catalog(sql) {
+    if !lower.contains("pg_get_") && !lower.contains("_is_updatable") && !crate::pgcatalog::names_catalog(sql) {
         return Holding(None);
     }
     let before = HELD.with(|h| h.replace(Some(Arc::new(catalog.clone()))));
@@ -51,7 +51,7 @@ impl Drop for Holding {
     }
 }
 
-fn held() -> Result<Arc<Catalog>> {
+pub(crate) fn held() -> Result<Arc<Catalog>> {
     HELD.with(|h| h.borrow().clone()).ok_or_else(|| {
         Error::new("a deparser reads one snail's catalog, and this round holds none")
     })
@@ -71,7 +71,7 @@ pub(crate) fn typed(name: &str) -> Option<crate::catalog::ColumnType> {
 }
 
 /// An OID as an argument gives it: an oid's or a reg* value's own, or a number written out.
-fn oid_of(v: &Value) -> Option<u32> {
+pub(crate) fn oid_of(v: &Value) -> Option<u32> {
     use crate::catalog::ColumnType as T;
     if let Value::Scalar(ty @ (T::Oid | T::Reg(..)), k) = v {
         return u32::try_from(crate::scalars::raw_of_key(*ty, *k)).ok();

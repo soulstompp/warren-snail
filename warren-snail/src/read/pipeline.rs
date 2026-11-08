@@ -4572,6 +4572,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     )? {
                         return Ok(v);
                     }
+                    if let Some(v) = super::updatable::call(&name, &values)? {
+                        return Ok(v);
+                    }
                     if let Some(v) = crate::deparse::call(&name, &values)? {
                         return Ok(v);
                     }

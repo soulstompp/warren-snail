@@ -2,7 +2,8 @@
 //! it: each refusal with its SQLSTATE and in its words, a qualifier an alias hides looked up as
 //! PostgreSQL's parser looks it up, a CHECK holding BETWEEN or an ARRAY of literals read on every
 //! row, a boolean's casts to and from an integer, a column's default set and dropped, a write
-//! returning rows of what it changed, its `old` and `new` among them. Every word,
+//! returning rows of what it changed, its `old` and `new` among them, a write through a view reaching
+//! its table, each CHECK OPTION met, an INSERT of fewer values than columns. Every word,
 //! code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -617,4 +618,193 @@ fn update_from_and_delete_using_change_each_row_a_join_meets_once() {
     ] {
         assert_eq!(rows(&mut w, sql), want, "{sql}");
     }
+}
+
+#[test]
+fn a_write_through_a_view_reaches_its_table_each_check_option_met() {
+    let mut w = snail("through");
+    run(&mut w, "CREATE TABLE s.u (id integer NOT NULL, a integer, b text DEFAULT 'd', PRIMARY KEY (id))");
+    run(&mut w, "CREATE TABLE s.w (id integer NOT NULL, z integer, PRIMARY KEY (id))");
+    run(&mut w, "INSERT INTO s.u VALUES (1, 5), (2, 50), (3, 7)");
+    run(&mut w, "INSERT INTO s.w VALUES (1, 100), (3, 4), (2, 8)");
+    run(&mut w, "CREATE VIEW s.v AS SELECT id AS k, a AS n, a + 1 AS m FROM s.u t WHERE t.a < 10");
+    run(&mut w, "CREATE VIEW s.cv AS SELECT id, a FROM s.u WHERE a < 10 WITH CHECK OPTION");
+    run(&mut w, "CREATE VIEW s.pu AS SELECT id, a FROM s.u WHERE a < 10");
+    run(&mut w, "CREATE VIEW s.uc AS SELECT id, a FROM s.pu WHERE a > 0 WITH CASCADED CHECK OPTION");
+    run(&mut w, "CREATE VIEW s.ul AS SELECT id, a FROM s.pu WHERE a > 0 WITH LOCAL CHECK OPTION");
+    run(&mut w, "CREATE VIEW s.e AS SELECT a + 1 AS m, 2 AS c FROM s.u");
+    run(&mut w, "CREATE VIEW s.g AS SELECT a, count(*) AS c FROM s.u GROUP BY a");
+    run(&mut w, "CREATE VIEW s.og AS SELECT a FROM s.g");
+    for (sql, want) in [
+        // An ON CONFLICT's update meets a row the view does not show.
+        (
+            "INSERT INTO s.v (k, n) VALUES (2, 1) ON CONFLICT (k) DO UPDATE SET n = 3 RETURNING *",
+            vec!["2|3|4"],
+        ),
+        (
+            "INSERT INTO s.v AS q (k, n) VALUES (1, 9) ON CONFLICT (k) DO UPDATE SET n = q.n + \
+             excluded.m RETURNING k, n, m",
+            vec!["1|15|16"],
+        ),
+        ("INSERT INTO s.cv VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET a = 4 RETURNING *", vec!["2|4"]),
+        ("INSERT INTO s.v (k, n) VALUES (4, 1) RETURNING k, n, m", vec!["4|1|2"]),
+        ("SELECT id, a, b FROM s.u ORDER BY id", vec!["1|15|d", "2|4|d", "3|7|d", "4|1|d"]),
+        // UPDATE … FROM finds only the rows the view shows.
+        (
+            "WITH d AS (UPDATE s.v SET n = w.z FROM s.w WHERE v.k = w.id RETURNING v.k, old.m, new.m) \
+             SELECT * FROM d ORDER BY k",
+            vec!["2|5|9", "3|8|5"],
+        ),
+        (
+            "WITH d AS (UPDATE s.v x SET n = n + 1 FROM s.w WHERE x.k = w.id AND w.z < 10 \
+             RETURNING x.k, x.n) SELECT * FROM d ORDER BY k",
+            vec!["2|9", "3|5"],
+        ),
+        ("DELETE FROM s.v USING s.w WHERE v.k = w.id AND w.z = 100 RETURNING old.*", vec![]),
+        ("UPDATE s.v SET n = 2 WHERE k = 4 RETURNING k, old.n, new.n, old.m, new.m", vec!["4|1|2|2|3"]),
+        ("DELETE FROM s.e WHERE m = 3 RETURNING *", vec!["3|2"]),
+        ("SELECT id, a FROM s.u ORDER BY id", vec!["1|15", "2|9", "3|5"]),
+        ("INSERT INTO s.ul VALUES (21, 50) RETURNING *", vec!["21|50"]),
+        (
+            "SELECT table_name, check_option, is_updatable, is_insertable_into FROM \
+             information_schema.views WHERE table_schema = 's' ORDER BY 1",
+            vec![
+                "cv|CASCADED|YES|YES",
+                "e|NONE|NO|NO",
+                "g|NONE|NO|NO",
+                "og|NONE|NO|NO",
+                "pu|NONE|YES|YES",
+                "uc|CASCADED|YES|YES",
+                "ul|LOCAL|YES|YES",
+                "v|NONE|YES|YES",
+            ],
+        ),
+        (
+            "SELECT table_name, column_name, is_updatable FROM information_schema.columns WHERE \
+             table_schema = 's' AND table_name IN ('v', 'e', 'u') ORDER BY 1, ordinal_position",
+            vec![
+                "e|m|NO", "e|c|NO", "u|id|YES", "u|a|YES", "u|b|YES", "v|k|YES", "v|n|YES",
+                "v|m|NO",
+            ],
+        ),
+        // DELETE alone through a view none of whose columns is its relation's.
+        (
+            "SELECT pg_relation_is_updatable('s.e'::regclass, false), \
+             pg_relation_is_updatable('s.og'::regclass, false), \
+             pg_relation_is_updatable('s.v'::regclass, false), \
+             pg_relation_is_updatable('s.u'::regclass, false), \
+             pg_column_is_updatable('s.v'::regclass, 3::smallint, false), \
+             pg_column_is_updatable('s.v'::regclass, 1::smallint, false), \
+             pg_relation_is_updatable(0, false), pg_relation_is_updatable('s.u_pkey'::regclass, false)",
+            vec!["16|0|28|28|f|t|0|0"],
+        ),
+        (
+            "SELECT relname, reloptions FROM pg_class WHERE relname IN ('cv', 'ul', 'v') ORDER BY 1",
+            vec!["cv|{check_option=cascaded}", "ul|{check_option=local}", "v|NULL"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), want, "{sql}");
+    }
+    for (sql, code, words) in [
+        (
+            "INSERT INTO s.cv VALUES (5, 70)",
+            "44000",
+            "new row violates check option for view \"cv\": Failing row contains (5, 70, d).",
+        ),
+        (
+            "UPDATE s.cv SET a = w.z * 2 FROM s.w WHERE cv.id = w.id",
+            "44000",
+            "new row violates check option for view \"cv\": Failing row contains (2, 16, d).",
+        ),
+        (
+            "INSERT INTO s.cv VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET a = 99",
+            "44000",
+            "new row violates check option for view \"cv\": Failing row contains (2, 99, d).",
+        ),
+        // CASCADED checks the views beneath; LOCAL its own alone.
+        (
+            "INSERT INTO s.uc VALUES (20, 50)",
+            "44000",
+            "new row violates check option for view \"pu\": Failing row contains (20, 50, d).",
+        ),
+        (
+            "INSERT INTO s.ul VALUES (22, -1)",
+            "44000",
+            "new row violates check option for view \"ul\": Failing row contains (22, -1, d).",
+        ),
+        (
+            "INSERT INTO s.v (k, m) VALUES (11, 1)",
+            "0A000",
+            "cannot insert into column \"m\" of view \"v\": View columns that are not columns of \
+             their base relation are not updatable.",
+        ),
+        (
+            "INSERT INTO s.v (k, n) VALUES (1, 2) ON CONFLICT (k) DO UPDATE SET m = 1",
+            "0A000",
+            "cannot insert into column \"m\" of view \"v\": View columns that are not columns of \
+             their base relation are not updatable.",
+        ),
+        (
+            "UPDATE s.v SET m = 1",
+            "0A000",
+            "cannot update column \"m\" of view \"v\": View columns that are not columns of their \
+             base relation are not updatable.",
+        ),
+        (
+            "INSERT INTO s.e VALUES (1, 2)",
+            "55000",
+            "cannot insert into view \"e\": Views that have no updatable columns are not \
+             automatically updatable.",
+        ),
+        (
+            "UPDATE s.g SET a = 1",
+            "55000",
+            "cannot update view \"g\": Views containing GROUP BY are not automatically updatable.",
+        ),
+        (
+            "DELETE FROM s.og",
+            "55000",
+            "cannot delete from view \"g\": Views containing GROUP BY are not automatically updatable.",
+        ),
+        (
+            "INSERT INTO s.v (k, n) VALUES (1, 2) ON CONFLICT (m) DO NOTHING",
+            "42P10",
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        ),
+        (
+            "INSERT INTO s.v (k, n) VALUES (1, 2) ON CONFLICT ON CONSTRAINT u_pkey DO NOTHING",
+            "42704",
+            "constraint \"u_pkey\" for table \"v\" does not exist",
+        ),
+        (
+            "CREATE VIEW s.gc AS SELECT a, count(*) AS c FROM s.u GROUP BY a WITH CHECK OPTION",
+            "0A000",
+            "WITH CHECK OPTION is supported only on automatically updatable views",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
+}
+
+#[test]
+fn an_insert_of_fewer_values_fills_the_first_columns_and_the_rest_by_default() {
+    let mut w = snail("lengths");
+    run(&mut w, "CREATE TABLE s.u (id integer NOT NULL, a integer, b text DEFAULT 'd', PRIMARY KEY (id))");
+    run(&mut w, "INSERT INTO s.u VALUES (1, 5), (2, 50)");
+    run(&mut w, "INSERT INTO s.u VALUES (3)");
+    run(&mut w, "INSERT INTO s.u SELECT id + 8, 2 FROM s.u WHERE id = 1");
+    for (sql, words) in [
+        ("INSERT INTO s.u VALUES (4, 1), (5)", "VALUES lists must all be the same length"),
+        ("INSERT INTO s.u VALUES (6, 1, 'x', 9)", "INSERT has more expressions than target columns"),
+        ("INSERT INTO s.u (id, a) VALUES (7)", "INSERT has more target columns than expressions"),
+        ("INSERT INTO s.u (id) VALUES (8, 1)", "INSERT has more expressions than target columns"),
+        ("INSERT INTO s.u SELECT 10, 2, 'y', 1", "INSERT has more expressions than target columns"),
+        ("INSERT INTO s.u (id, a) SELECT 11", "INSERT has more target columns than expressions"),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some("42601"), words.to_string()), "{sql}");
+    }
+    assert_eq!(
+        rows(&mut w, "SELECT * FROM s.u ORDER BY id"),
+        ["1|5|d", "2|50|d", "3|NULL|d", "9|2|d"]
+    );
 }

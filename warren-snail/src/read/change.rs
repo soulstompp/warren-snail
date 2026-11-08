@@ -1375,6 +1375,24 @@ impl Snail {
                 self.write_rows(*write, done, found)?
             }
             Statement::Writes { writes, question } => self.written_with(writes, &question, done)?,
+            // A write through a view: each new row of its table held to the views' CHECK OPTIONs.
+            Statement::Checked { write, checks } => {
+                let (Statement::Insert { table, .. }
+                | Statement::Set { table, .. }
+                | Statement::Update { table, .. }
+                | Statement::Delete { table, .. }) = write.written()
+                else {
+                    unreachable!("a write through a view")
+                };
+                let conditions = checks
+                    .iter()
+                    .map(|(v, c)| Ok((v.clone(), super::image::parse_expr(c)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                self.checking = Some((*table, conditions));
+                let wrote = self.write_rows(*write, done, found);
+                self.checking = None;
+                wrote?
+            }
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
                 let t = &self.catalog.tables[table];
@@ -1699,6 +1717,19 @@ impl Snail {
     /// A write's changes applied, or held unapplied for a write inside WITH until every write of
     /// its statement has found its rows.
     fn put(&mut self, table: usize, changes: Vec<Change>) -> Result<(u64, u64)> {
+        // Each new row written through a view meets the conditions of its CHECK OPTIONs.
+        if let Some((through, conditions)) = &self.checking {
+            if *through == table {
+                let t = &self.catalog.tables[table];
+                for c in &changes {
+                    if let Change::Insert(n) | Change::Replace(_, n) = c {
+                        for (view, condition) in conditions {
+                            fill::check_option(t, n, view, condition)?;
+                        }
+                    }
+                }
+            }
+        }
         match self.dry.as_mut() {
             Some(held) => {
                 held.push((table, changes));

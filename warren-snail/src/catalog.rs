@@ -2032,6 +2032,8 @@ pub struct View {
     pub name: String,
     pub columns: Vec<String>,
     pub query: String,
+    /// Its WITH CHECK OPTION, as PostgreSQL's reloptions write it: `cascaded` or `local`.
+    pub check_option: Option<&'static str>,
 }
 
 /// A function written in SQL whose body is one expression over its arguments.

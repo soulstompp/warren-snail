@@ -86,7 +86,7 @@ fn information_schema_reads_the_files_tables_constraints_and_schemas() {
         ),
         [
             s(&["t", "BASE TABLE", "YES"]),
-            s(&["tv", "VIEW", "NO"]),
+            s(&["tv", "VIEW", "YES"]),
             s(&["u", "BASE TABLE", "YES"]),
             s(&["w", "BASE TABLE", "YES"]),
         ]

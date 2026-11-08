@@ -759,7 +759,7 @@ fn lift_factor(
                 return Ok(());
             }
             // One of PostgreSQL's views, pg_catalog searched first.
-            if let Some((q, refused)) = super::sysviews::system_view(catalog.release, &n)? {
+            if let Some((q, refused)) = super::sysviews::system_view(catalog, &n)? {
                 let step = fresh(out, "view");
                 lift(catalog, out, &[], step.clone(), q, Vec::new())?;
                 super::sysviews::note_refused(&step, refused);

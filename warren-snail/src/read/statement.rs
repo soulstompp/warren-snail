@@ -111,6 +111,12 @@ pub enum Statement {
         arbiter: Option<usize>,
         update: Option<(Vec<(usize, Fill)>, Option<String>)>,
     },
+    /// A write through a view, as the write to the table under it, and the conditions its new rows
+    /// must meet, each with the view whose CHECK OPTION it is.
+    Checked {
+        write: Box<Statement>,
+        checks: Vec<(String, String)>,
+    },
     /// A question whose WITH holds writes: each write by the name its WITH query takes, and the
     /// question. Every write finds its rows on the statement's one snapshot, none seeing another's,
     /// the question reading that snapshot and the rows each write returns.
@@ -384,13 +390,14 @@ impl Statement {
             Statement::Returning { write, .. } => write.kind(),
             Statement::Writes { .. } => "SELECT",
             Statement::OnConflict { .. } => "INSERT",
+            Statement::Checked { write, .. } => write.kind(),
         }
     }
 
     /// The write itself, its RETURNING and its ON CONFLICT taken off; any other statement as it is.
     pub fn written(&self) -> &Statement {
         match self {
-            Statement::Returning { write, .. } => write.written(),
+            Statement::Returning { write, .. } | Statement::Checked { write, .. } => write.written(),
             Statement::OnConflict { insert, .. } => insert,
             st => st,
         }
@@ -1086,6 +1093,18 @@ fn one_table(catalog: &Catalog, t: &TableWithJoins) -> Result<usize> {
     }
 }
 
+/// The columns an INSERT's rows of `width` values fill, as PostgreSQL's parser matches them: the
+/// columns listed, each given one; with none listed, the table's first.
+fn filled(columns: &[usize], width: usize, listed: bool) -> Result<Vec<usize>> {
+    if width > columns.len() {
+        return Err(Error::new("INSERT has more expressions than target columns"));
+    }
+    if width < columns.len() && listed {
+        return Err(Error::new("INSERT has more target columns than expressions"));
+    }
+    Ok(columns[..width].to_vec())
+}
+
 fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     let ti = match &i.table {
         TableObject::TableName(n) => table_index(catalog, n)?,
@@ -1117,15 +1136,13 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     }
     let source = match q.body.as_ref() {
         SetExpr::Values(v) => {
+            let width = v.rows.first().map_or(0, |r| r.content.len());
+            if v.rows.iter().any(|r| r.content.len() != width) {
+                return Err(Error::new("VALUES lists must all be the same length"));
+            }
+            let columns = filled(&columns, width, !i.columns.is_empty())?;
             let mut rows = Vec::with_capacity(v.rows.len());
             for r in &v.rows {
-                if r.content.len() != columns.len() {
-                    return Err(Error::new(format!(
-                        "a row of the INSERT gives {} values for {} columns",
-                        r.content.len(),
-                        columns.len()
-                    )));
-                }
                 let mut row = vec![Fill::Default; table.columns.len()];
                 for (&c, e) in columns.iter().zip(&r.content) {
                     row[c] = if is_default(e) {
@@ -1139,13 +1156,7 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             Source::Filled(rows)
         }
         SetExpr::Select(s) => {
-            if s.projection.len() != columns.len() {
-                return Err(Error::new(format!(
-                    "the INSERT's question returns {} columns for {}",
-                    s.projection.len(),
-                    columns.len()
-                )));
-            }
+            let columns = filled(&columns, s.projection.len(), !i.columns.is_empty())?;
             let mut fill = vec![Fill::Default; table.columns.len()];
             let mut kept = Vec::new();
             for (&c, item) in columns.iter().zip(&s.projection) {
@@ -1379,6 +1390,27 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         [s] => s,
         _ => return Err(Error::new("one statement at a time")),
     };
+    // A write to a view is the write to the table under it, its views' CHECK OPTIONs held to.
+    if super::updatable::writes_a_view(catalog, s) {
+        let (st, checks) = super::updatable::rewritten(catalog, s)?;
+        let checks: Vec<(String, String)> =
+            checks.into_iter().map(|(v, e)| (v, e.to_string())).collect();
+        let checked = |write: Statement| match checks.is_empty() {
+            true => write,
+            false => Statement::Checked {
+                write: Box::new(write),
+                checks: checks.clone(),
+            },
+        };
+        return Ok(match parse(catalog, &st.to_string())? {
+            Statement::Returning { write, alias, items } => Statement::Returning {
+                write: Box::new(checked(*write)),
+                alias,
+                items,
+            },
+            write => checked(write),
+        });
+    }
     match s {
         Sql::Commit { chain: false, .. } => Ok(Statement::Commit),
         Sql::Rollback {

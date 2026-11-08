@@ -57,6 +57,7 @@ pub mod statement;
 mod subqueries;
 mod together;
 mod unread;
+pub(crate) mod updatable;
 mod tsearch;
 mod typed;
 mod walk;
@@ -446,6 +447,9 @@ pub struct Snail {
     /// A write inside WITH's changes, held unapplied while every write of the statement finds its
     /// rows on one snapshot.
     dry: Option<Vec<(usize, Vec<change::Change>)>>,
+    /// A write through a view's table, and the CHECK OPTION conditions each new row of it must
+    /// meet, each with its view.
+    checking: Option<(usize, Vec<(String, sqlparser::ast::Expr)>)>,
     /// The sequences' states a commit at the root's turn writes.
     advancing: Option<Vec<crate::file::SequenceState>>,
     /// Where the snail is open to write, what its writer shares among the snails it writes, and
@@ -739,6 +743,7 @@ impl Snail {
             handed: Default::default(),
             kept: None,
             dry: None,
+            checking: None,
             advancing: None,
             group: None,
             deciding: None,

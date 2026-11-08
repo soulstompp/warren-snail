@@ -551,6 +551,30 @@ pub fn set_to(
     )
 }
 
+/// A new row written through a view held to its CHECK OPTION: refused unless the view's condition
+/// is true of it, a NULL failing it, as PostgreSQL's WITH CHECK OPTION refuses it.
+pub fn check_option(
+    table: &Table,
+    row: &Row,
+    view: &str,
+    condition: &sqlparser::ast::Expr,
+) -> Result<()> {
+    let full = with_virtual(table, row)?;
+    match eval_on(
+        condition,
+        &names(table),
+        &values(table, &full),
+        table.release,
+        &Casings::of_table(table, &[]),
+    )? {
+        Value::Bool(true) => Ok(()),
+        _ => Err(Error::new(format!(
+            "new row violates check option for view \"{view}\": Failing row contains {}.",
+            failing_row(table, row)
+        ))),
+    }
+}
+
 /// An expression of ON CONFLICT DO UPDATE, read on the row the table holds, by the name `by` reads
 /// it, and on the row proposed, as `excluded`.
 pub fn on_conflict(

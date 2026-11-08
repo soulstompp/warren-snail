@@ -844,7 +844,11 @@ impl<'a> File<'a> {
         for v in &self.catalog.views {
             let name = full(&v.name);
             let reltype = self.oid(Object::Type(name.clone()));
-            out.push(self.class(&name, 'v', reltype, 0, v.columns.len()));
+            let mut r = self.class(&name, 'v', reltype, 0, v.columns.len());
+            if let Some(option) = v.check_option {
+                r.insert("reloptions", Some(format!("{{check_option={option}}}")));
+            }
+            out.push(r);
         }
         for ty in &self.catalog.types {
             if let crate::catalog::TypeKind::Composite { fields } = &ty.kind {

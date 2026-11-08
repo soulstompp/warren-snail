@@ -1084,7 +1084,8 @@ impl Snails {
             | Statement::Delete { .. }
             | Statement::Set { .. }
             | Statement::Returning { .. }
-            | Statement::OnConflict { .. }) => {
+            | Statement::OnConflict { .. }
+            | Statement::Checked { .. }) => {
                 // A write and its RETURNING run on the snail holding its table, which reads both.
                 let (table, source) = match st.written() {
                     Statement::Insert { table, source } => (*table, Some(source)),

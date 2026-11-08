@@ -1739,7 +1739,7 @@ pg_collation_actual_version(oid)		server	the server's catalog
 pg_collation_for("any")		type	collations
 pg_collation_is_visible(oid)		server	the server's catalog
 pg_column_compression("any")		server	statistics and sizes
-pg_column_is_updatable(regclass,smallint,boolean)		server	the server's catalog
+pg_column_is_updatable(regclass,smallint,boolean)		type	the file's catalog
 pg_column_size("any")		server	statistics and sizes
 pg_column_toast_chunk_id("any")	17-19	server	statistics and sizes
 pg_conf_load_time()		server	the server itself
@@ -1947,7 +1947,7 @@ pg_read_file_old(text,bigint,bigint)	14-16	server	files and logs
 pg_relation_filenode(regclass)		server	files and logs
 pg_relation_filepath(regclass)		server	files and logs
 pg_relation_is_publishable(regclass)		server	WAL and replication
-pg_relation_is_updatable(regclass,boolean)		server	the server's catalog
+pg_relation_is_updatable(regclass,boolean)		type	the file's catalog
 pg_relation_size(regclass)		server	statistics and sizes
 pg_relation_size(regclass,text)		server	statistics and sizes
 pg_reload_conf()		server	files and logs

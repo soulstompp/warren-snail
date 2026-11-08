@@ -439,6 +439,31 @@ fn end(c: &Cursor, what: &str) -> Result<()> {
     }
 }
 
+/// A CREATE VIEW's tokens without the WITH [CASCADED | LOCAL] CHECK OPTION that ends it, and that
+/// option as PostgreSQL's reloptions write it, CASCADED where it names neither.
+fn check_option(tokens: &[Token]) -> (Vec<Token>, Option<&'static str>) {
+    let words: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i], Token::Whitespace(_) | Token::SemiColon))
+        .collect();
+    let word = |i: usize, w: &str| {
+        matches!(&tokens[i], Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w))
+    };
+    let n = words.len();
+    if n < 4 || !word(words[n - 1], "OPTION") || !word(words[n - 2], "CHECK") {
+        return (tokens.to_vec(), None);
+    }
+    let (start, option) = if word(words[n - 3], "WITH") {
+        (words[n - 3], "cascaded")
+    } else if word(words[n - 4], "WITH") && word(words[n - 3], "CASCADED") {
+        (words[n - 4], "cascaded")
+    } else if word(words[n - 4], "WITH") && word(words[n - 3], "LOCAL") {
+        (words[n - 4], "local")
+    } else {
+        return (tokens.to_vec(), None);
+    };
+    (tokens[..start].to_vec(), Some(option))
+}
+
 /// Whether an expression is a constant written out: a literal, signed or cast, or a typed string.
 fn constant(e: &Expr) -> bool {
     match e {
@@ -2661,6 +2686,12 @@ impl Draft {
         if kind == "ALTER TABLE" {
             return self.alter_table(tokens, &object);
         }
+        // A view's WITH CHECK OPTION, which sqlparser drops, read here.
+        let (tokens, check) = match kind == "CREATE VIEW" || kind == "CREATE OR REPLACE VIEW" {
+            true => check_option(tokens),
+            false => (tokens.to_vec(), None),
+        };
+        let tokens = tokens.as_slice();
         let st = Parser::new(&PostgreSqlDialect {})
             .with_tokens(tokens.to_vec())
             .parse_statement()
@@ -2681,7 +2712,7 @@ impl Draft {
             }
             Statement::CreateView(v) => {
                 read_as_written(tokens, &st, &format!("{kind} {object}"))?;
-                self.create_view(v)
+                self.create_view(v, check)
             }
             _ => Err(Error::new(format!(
                 "the statement {kind} {object} is not read"
@@ -2691,7 +2722,11 @@ impl Draft {
 
     /// A view: its question read over the tables and the views declared before it, as
     /// PostgreSQL's parser reads it when the view is made, and kept as written.
-    fn create_view(&mut self, v: &sqlparser::ast::CreateView) -> Result<Vec<String>> {
+    fn create_view(
+        &mut self,
+        v: &sqlparser::ast::CreateView,
+        check_option: Option<&'static str>,
+    ) -> Result<Vec<String>> {
         let name = object_name(&v.name);
         let what = format!("CREATE VIEW {name}");
         let refused = |clause: &str| Err(Error::new(format!("{what}: {clause} is not read")));
@@ -2745,12 +2780,22 @@ impl Draft {
                 "column \"{n}\" specified more than once"
             )));
         }
-        count_in(&mut self.relations, in_schema(schema_of(&name), bare(&name)));
-        self.views.push(View {
+        let view = View {
             name,
             columns,
             query: v.query.to_string(),
-        });
+            check_option,
+        };
+        // A CHECK OPTION stands only on a view a write can go through.
+        if check_option.is_some()
+            && crate::read::updatable::through(&self.so_far(), &view)?.is_err()
+        {
+            return Err(Error::new(
+                "WITH CHECK OPTION is supported only on automatically updatable views",
+            ));
+        }
+        count_in(&mut self.relations, in_schema(schema_of(&view.name), bare(&view.name)));
+        self.views.push(view);
         Ok(Vec::new())
     }
 
