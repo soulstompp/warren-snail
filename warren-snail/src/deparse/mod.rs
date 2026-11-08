@@ -8,6 +8,7 @@
 pub(crate) mod analyze;
 pub(crate) mod cat;
 pub(crate) mod defs;
+pub(crate) mod depend;
 pub(crate) mod funcs;
 pub(crate) mod print;
 pub(crate) mod query;
@@ -234,7 +235,12 @@ pub(crate) fn row_fields(cat: &Cat, relid: u32) -> Vec<(String, u32, i32)> {
             }
         }
     }
-    let mut fields: Vec<(i16, String, u32, i32)> = crate::pgcatalog::file_rows(cat.catalog, "pg_attribute")
+    // A built-in relation's columns are the carried ones; only the file's own read its rows.
+    let own = match relid >= crate::oids::FIRST {
+        true => crate::pgcatalog::file_rows(cat.catalog, "pg_attribute"),
+        false => Vec::new(),
+    };
+    let mut fields: Vec<(i16, String, u32, i32)> = own
         .into_iter()
         .chain(crate::pgcatalog::built_in("pg_attribute", cat.release))
         .filter(|r| r.get("attrelid").cloned().flatten().and_then(|s| s.parse::<u32>().ok()) == Some(relid))
@@ -255,19 +261,23 @@ pub(crate) fn row_fields(cat: &Cat, relid: u32) -> Vec<(String, u32, i32)> {
 
 /// A range type's subtype.
 pub(crate) fn range_subtype(cat: &Cat, t: u32) -> Option<u32> {
+    // A built-in range's row is carried; only the file's own read its rows.
+    let rows = || {
+        let own = match t >= crate::oids::FIRST {
+            true => crate::pgcatalog::file_rows(cat.catalog, "pg_range"),
+            false => Vec::new(),
+        };
+        crate::pgcatalog::built_in("pg_range", cat.release).into_iter().chain(own)
+    };
     let mut t = t;
     if let Some(r) = cat.ty(t) {
         if r.typtype == 'm' {
-            t = crate::pgcatalog::built_in("pg_range", cat.release)
-                .into_iter()
-                .chain(crate::pgcatalog::file_rows(cat.catalog, "pg_range"))
+            t = rows()
                 .find(|r| r.get("rngmultitypid").cloned().flatten().and_then(|s| s.parse().ok()) == Some(t))
                 .and_then(|r| r.get("rngtypid").cloned().flatten()?.parse().ok())?;
         }
     }
-    crate::pgcatalog::built_in("pg_range", cat.release)
-        .into_iter()
-        .chain(crate::pgcatalog::file_rows(cat.catalog, "pg_range"))
+    rows()
         .find(|r| r.get("rngtypid").cloned().flatten().and_then(|s| s.parse().ok()) == Some(t))
         .and_then(|r| r.get("rngsubtype").cloned().flatten()?.parse().ok())
 }
@@ -395,6 +405,17 @@ fn tree_of(cat: &Cat, handle: &str) -> Result<(Node, u32)> {
         }
         _ => Err(bad()),
     }
+}
+
+/// The tree a stored expression of an object holds, as the parser left it: `attrdef`, `check`,
+/// `domaincheck`, `indexprs` or `indpred` by its handle's parts; a domain's DEFAULT coerced to the
+/// domain's base type, as DefineDomain cooks it.
+pub(crate) fn stored_tree(cat: &Cat, kind: &str, oid: u32, part: i64) -> Result<Node> {
+    let (node, _) = tree_of(cat, &tree_handle(kind, oid, part))?;
+    Ok(match node {
+        Node::Domain { arg, ty, .. } if kind == "domaindefault" && ty == oid => *arg,
+        n => n,
+    })
 }
 
 /// pg_get_expr: the tree a handle names, printed with its columns named by `relid`'s.

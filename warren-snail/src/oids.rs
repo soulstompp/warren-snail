@@ -36,6 +36,8 @@ pub enum Object {
     Label(String, String),
     /// A view's rule, `_RETURN`, by the view's name.
     Rule(String),
+    /// A range's cast to its multirange, by the range's name.
+    Cast(String),
 }
 
 impl Object {
@@ -52,7 +54,8 @@ impl Object {
             | Object::Constraint(n, _)
             | Object::Default(n, _)
             | Object::Label(n, _)
-            | Object::Rule(n) => n,
+            | Object::Rule(n)
+            | Object::Cast(n) => n,
         }
     }
 

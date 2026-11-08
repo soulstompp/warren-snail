@@ -146,6 +146,30 @@ pub(crate) fn built_in(table: &str, release: u8) -> Vec<HashMap<&'static str, Op
         .collect()
 }
 
+/// A carried table's built-in row under a release whose column holds an OID, found through an
+/// index made once for that table, column and release.
+pub(crate) fn built_in_by(table: &'static str, column: &'static str, oid: u32, release: u8) -> Option<Row> {
+    type Index = std::sync::Arc<HashMap<u32, Row>>;
+    type Indexes = std::sync::Mutex<HashMap<(&'static str, &'static str, u8), Index>>;
+    static INDEXES: OnceLock<Indexes> = OnceLock::new();
+    let all = INDEXES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let index = {
+        let mut all = all.lock().unwrap_or_else(|e| e.into_inner());
+        all.entry((table, column, release))
+            .or_insert_with(|| {
+                let mut by: HashMap<u32, Row> = HashMap::new();
+                for r in built_in(table, release) {
+                    if let Some(k) = r.get(column).cloned().flatten().and_then(|s| s.parse().ok()) {
+                        by.entry(k).or_insert(r);
+                    }
+                }
+                std::sync::Arc::new(by)
+            })
+            .clone()
+    };
+    index.get(&oid).cloned()
+}
+
 /// Whether a table is one of pg_catalog's the snail answers.
 fn is_answered(table: &str) -> bool {
     carried().contains_key(table)
@@ -309,6 +333,38 @@ fn built_in_types(release: u8) -> std::sync::Arc<HashMap<u32, HashMap<&'static s
                     .filter_map(|r| {
                         let oid = r.get("oid")?.as_deref()?.parse().ok()?;
                         Some((oid, r))
+                    })
+                    .collect(),
+            )
+        })
+        .clone()
+}
+
+/// The default collation's OID.
+const DEFAULT_COLLATION: u32 = 100;
+
+/// Whether pg_catalog holds a collation of that name under a release, for UTF8 or any encoding.
+pub(crate) fn is_built_in_collation(name: &str, release: u8) -> bool {
+    let bare = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    built_in_collations(release).contains_key(bare)
+}
+
+/// A release's built-in collations by name: those of any encoding or of UTF8, a snail's, read once.
+fn built_in_collations(release: u8) -> std::sync::Arc<HashMap<String, u32>> {
+    type Named = std::sync::Arc<HashMap<String, u32>>;
+    static COLLATIONS: OnceLock<std::sync::Mutex<HashMap<u8, Named>>> = OnceLock::new();
+    let all = COLLATIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut all = all.lock().unwrap_or_else(|e| e.into_inner());
+    all.entry(release)
+        .or_insert_with(|| {
+            std::sync::Arc::new(
+                built_in("pg_collation", release)
+                    .into_iter()
+                    .filter(|r| r.get("collnamespace").cloned().flatten().as_deref() == Some("11"))
+                    .filter(|r| matches!(r.get("collencoding").cloned().flatten().as_deref(), Some("-1" | "6")))
+                    .filter_map(|r| {
+                        let oid = r.get("oid")?.as_deref()?.parse().ok()?;
+                        Some((r.get("collname")?.clone()?, oid))
                     })
                     .collect(),
             )
@@ -500,8 +556,102 @@ impl<'a> File<'a> {
             "pg_proc" => self.procs(),
             "pg_range" => self.ranges(),
             "pg_rewrite" => self.rules(),
+            "pg_cast" => self.casts(),
+            "pg_depend" => self.depends(),
             _ => Vec::new(),
         })
+    }
+
+    /// A collation's OID by the name a COLLATE gives it, found as PostgreSQL's search path finds
+    /// it: pg_catalog's for the file's encoding first, then the file's own; 0 where none is.
+    fn collation_oid(&self, name: &str) -> u32 {
+        let built = built_in_collations(self.release);
+        if let Some(o) = built.get(name) {
+            return *o;
+        }
+        if let Some(("pg_catalog", n)) = name.rsplit_once('.') {
+            return built.get(n).copied().unwrap_or(0);
+        }
+        self.catalog.oids.of(&Object::Collation(full(name))).unwrap_or(0)
+    }
+
+    /// The collation a type takes where nothing names one: a domain's own or its base's, the
+    /// default one for any other collatable type, none for the rest.
+    fn type_collation(&self, ty: ColumnType, domain: Option<&str>) -> u32 {
+        if let Some(d) = domain {
+            return self.domain_collation(d, 0);
+        }
+        if let ColumnType::Composed(r) = ty {
+            if let crate::composed::Composed::Array { domain: Some(d), .. } = r.def() {
+                return self.domain_collation(d, 0);
+            }
+        }
+        // A built-in type's own, as its row of pg_type carries it (`name`'s is C).
+        let oid = self.facts(ty, None).oid;
+        self.types
+            .get(&oid)
+            .and_then(|r| r.get("typcollation").cloned().flatten()?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// A domain's typcollation: its COLLATE's, else its base type's.
+    fn domain_collation(&self, d: &str, depth: u8) -> u32 {
+        let Some(x) = self.catalog.domains.iter().find(|x| full(&x.name) == full(d)) else {
+            return 0;
+        };
+        if let Some(c) = &x.collation {
+            return self.collation_oid(c);
+        }
+        let over = self.catalog.domains.iter().any(|y| full(&y.name) == full(&x.base));
+        if over && depth < 32 {
+            return self.domain_collation(&x.base, depth + 1);
+        }
+        match x.base_type {
+            Some(b) => self.type_collation(b, None),
+            None => crate::regs::type_oid(&x.base, self.release)
+                .ok()
+                .and_then(|o| self.types.get(&o))
+                .and_then(|r| r.get("typcollation").cloned().flatten()?.parse().ok())
+                .unwrap_or(0),
+        }
+    }
+
+    /// A table column's collation, as pg_attribute's attcollation gives it.
+    fn column_collation(&self, c: &crate::catalog::Column) -> u32 {
+        match &c.collation {
+            Some(n) => self.collation_oid(n),
+            None => self.type_collation(c.ty, c.domain.as_deref()),
+        }
+    }
+
+    /// A composite's field's type and collation, by the type's name as its DDL gives it.
+    fn field_facts(&self, ty: &str, collation: Option<&str>) -> (u32, u32) {
+        let oid = crate::regs::type_oid(ty, self.release)
+            .ok()
+            .or_else(|| self.catalog.oids.of(&Object::Type(full(ty))))
+            .unwrap_or(0);
+        let coll = match collation {
+            Some(n) => self.collation_oid(n),
+            None if self.catalog.domains.iter().any(|d| full(&d.name) == full(ty)) => self.domain_collation(ty, 0),
+            None => self
+                .types
+                .get(&oid)
+                .and_then(|r| r.get("typcollation").cloned().flatten()?.parse().ok())
+                .unwrap_or(0),
+        };
+        (oid, coll)
+    }
+
+    /// A function's OID by its name and its arguments' types as PostgreSQL names them, by commas.
+    fn proc_oid(&self, name: &str, args: &str) -> u32 {
+        self.catalog
+            .oids
+            .each()
+            .find_map(|(oid, x)| match x {
+                Object::Proc(m, a) if m == name && a == args => Some(oid),
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 
     fn namespaces(&self) -> Vec<Row> {
@@ -566,10 +716,26 @@ impl<'a> File<'a> {
     /// whether it stands for the primary key.
     fn indexes_of(&self, tb: &Table) -> Vec<IndexFacts> {
         let mut out: Vec<IndexFacts> = Vec::new();
+        // A key's collation: its COLLATE's, else its column's; an expression here keys no text.
+        let collation = |written: Option<&String>, l: &crate::catalog::Level| -> u32 {
+            if let Some(n) = written.and_then(|k| crate::deparse::defs::key_collation(k)) {
+                return self.collation_oid(&n);
+            }
+            match l {
+                crate::catalog::Level::Column(c) => self.column_collation(&tb.columns[*c]),
+                _ => 0,
+            }
+        };
         for o in &tb.orders {
             out.push(IndexFacts {
                 name: o.name.clone(),
                 method: o.method,
+                collations: o
+                    .levels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| collation(o.keys.get(i), l))
+                    .collect(),
                 keys: o
                     .levels
                     .iter()
@@ -593,6 +759,12 @@ impl<'a> File<'a> {
             out.push(IndexFacts {
                 name: b.name.clone(),
                 method: Method::Brin,
+                collations: b
+                    .levels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| collation(b.keys.get(i), l))
+                    .collect(),
                 keys: b
                     .levels
                     .iter()
@@ -612,11 +784,16 @@ impl<'a> File<'a> {
             });
         }
         for e in &tb.element_keys {
+            let coll = self.column_collation(&tb.columns[e.column]);
             match out.iter_mut().find(|x| x.name == e.index) {
-                Some(x) => x.keys.push(e.column as i16 + 1),
+                Some(x) => {
+                    x.keys.push(e.column as i16 + 1);
+                    x.collations.push(coll);
+                }
                 None => out.push(IndexFacts {
                     name: e.index.clone(),
                     method: e.method,
+                    collations: vec![coll],
                     keys: vec![e.column as i16 + 1],
                     include: e.include.iter().map(|&c| c as i16 + 1).collect(),
                     unique: false,
@@ -935,8 +1112,13 @@ impl<'a> File<'a> {
                     Some(crate::deparse::tree_handle("domaindefault", oid, 0)),
                 );
             }
+            // A domain's collation, its COLLATE's or its base's; its array's the same.
+            let coll = self.domain_collation(&d.name, 0).to_string();
+            r.insert("typcollation", Some(coll.clone()));
             out.push(r);
-            out.push(self.array_of(&n, oid, &base.align));
+            let mut array = self.array_of(&n, oid, &base.align);
+            array.insert("typcollation", Some(coll));
+            out.push(array);
         }
         out
     }
@@ -972,6 +1154,47 @@ impl<'a> File<'a> {
         ])
     }
 
+    /// A column's row of pg_attribute by its type's OID: a view's or a composite's, whose type the
+    /// snail reads by OID; its length, passing, alignment and storage its type's.
+    #[allow(clippy::too_many_arguments)]
+    fn attribute_of(&self, rel: u32, num: i16, name: &str, typid: u32, typmod: i32, coll: u32, dims: i16) -> Row {
+        let own;
+        let r = match self.types.get(&typid) {
+            Some(r) => r,
+            None => {
+                own = self
+                    .pg_types()
+                    .into_iter()
+                    .find(|r| r.get("oid").cloned().flatten() == Some(typid.to_string()))
+                    .unwrap_or_default();
+                &own
+            }
+        };
+        let f = |k: &str| r.get(k).cloned().flatten().unwrap_or_default();
+        row(&[
+            ("attrelid", rel.to_string()),
+            ("attname", name.to_string()),
+            ("atttypid", typid.to_string()),
+            ("attlen", f("typlen")),
+            ("attnum", num.to_string()),
+            ("atttypmod", typmod.to_string()),
+            ("attndims", dims.to_string()),
+            ("attbyval", f("typbyval")),
+            ("attalign", f("typalign")),
+            ("attstorage", f("typstorage")),
+            ("attcompression", String::new()),
+            ("attnotnull", "f".into()),
+            ("atthasdef", "f".into()),
+            ("atthasmissing", "f".into()),
+            ("attidentity", String::new()),
+            ("attgenerated", String::new()),
+            ("attisdropped", "f".into()),
+            ("attislocal", "t".into()),
+            ("attinhcount", "0".into()),
+            ("attcollation", coll.to_string()),
+        ])
+    }
+
     fn attributes(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for tb in self.tables() {
@@ -979,6 +1202,7 @@ impl<'a> File<'a> {
             let rel = self.oid(Object::Class(n.clone()));
             for (i, c) in tb.columns.iter().enumerate() {
                 let mut r = self.attribute(rel, i as i16 + 1, &c.name, c.ty, c.domain.as_deref());
+                r.insert("attcollation", Some(self.column_collation(c).to_string()));
                 r.insert("attnotnull", Some(t(c.not_null)));
                 r.insert("atthasdef", Some(t(c.default.is_some())));
                 r.insert(
@@ -1016,9 +1240,47 @@ impl<'a> File<'a> {
                         }
                         _ => ("expr".to_string(), ColumnType::Text(None), None),
                     };
-                    out.push(self.attribute(rel, k as i16 + 1, &name, ty, domain));
+                    let mut r = self.attribute(rel, k as i16 + 1, &name, ty, domain);
+                    // A key's collation is the index's; an INCLUDE column has none.
+                    let coll = i.collations.get(k).copied().unwrap_or(0);
+                    r.insert("attcollation", Some(coll.to_string()));
+                    out.push(r);
                 }
             }
+        }
+        // A composite type's fields, as its relation's columns.
+        for ty in &self.catalog.types {
+            let crate::catalog::TypeKind::Composite { fields } = &ty.kind else {
+                continue;
+            };
+            let rel = self.oid(Object::Class(full(&ty.name)));
+            for (i, (name, fty, fcoll)) in fields.iter().enumerate() {
+                let (typid, coll) = self.field_facts(fty, fcoll.as_deref());
+                let parsed = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+                    .try_with_sql(fty)
+                    .and_then(|mut p| p.parse_data_type())
+                    .ok();
+                let typmod = parsed
+                    .as_ref()
+                    .and_then(|dt| crate::catalog::held_type(dt).ok())
+                    .map_or(-1, typmod_of);
+                let dims = parsed.as_ref().map_or(0, array_dims);
+                out.push(self.attribute_of(rel, i as i16 + 1, name, typid, typmod, coll, dims));
+            }
+        }
+        // A view's columns, as its question gives them; not while one is being read for them.
+        if !READING_VIEWS.with(|r| r.replace(true)) {
+            let cat = crate::deparse::cat::Cat::of(self.catalog);
+            for v in &self.catalog.views {
+                let rel = self.oid(Object::Class(full(&v.name)));
+                if let Ok((q, cols)) = crate::deparse::query::view_query(&cat, v) {
+                    for (i, ((name, typid, typmod), t)) in cols.iter().zip(q.output()).enumerate() {
+                        let coll = crate::deparse::depend::output_collation(&cat, &q, &t.expr);
+                        out.push(self.attribute_of(rel, i as i16 + 1, name, *typid, *typmod, coll, 0));
+                    }
+                }
+            }
+            READING_VIEWS.with(|r| r.set(false));
         }
         for s in &self.catalog.sequences {
             let rel = self.oid(Object::Class(full(&s.name)));
@@ -1119,28 +1381,23 @@ impl<'a> File<'a> {
             let rel = self.oid(Object::Class(n.clone()));
             let schema = parts(&n).0;
             for i in self.indexes_of(tb) {
-                let kind = match (i.primary, i.keyed || !i.exclusion, i.unique) {
-                    (true, _, _) => 'p',
-                    (_, true, _) if i.keyed => 'u',
-                    (_, false, _) => 'x',
-                    (_, _, true)
-                        if self
-                            .catalog
-                            .oids
-                            .of(&Object::Constraint(n.clone(), i.name.clone()))
-                            .is_some() =>
-                    {
-                        'u'
-                    }
-                    _ => continue,
+                let Some(kind) = self.index_constraint(&n, &i) else {
+                    continue;
                 };
                 let index = self.oid(Object::Class(format!("{schema}.{}", i.name)));
                 let mut r = self.constraint(&n, &i.name, kind, rel, index, &i.keys, i.deferrable);
                 r.insert("conperiod", Some(t(i.keyed && i.exclusion)));
                 out.push(r);
             }
+            let cat = (!tb.checks.is_empty()).then(|| crate::deparse::cat::Cat::of(self.catalog));
             for (ci, c) in tb.checks.iter().enumerate() {
-                let mut r = self.constraint(&n, &c.name, 'c', rel, 0, &[], false);
+                // Its keys: the columns its expression reads, each once, in the order met.
+                let keys = cat
+                    .as_ref()
+                    .and_then(|cat| crate::deparse::stored_tree(cat, "check", rel, ci as i64).ok())
+                    .map(|node| crate::deparse::depend::columns_read(&node))
+                    .unwrap_or_default();
+                let mut r = self.constraint(&n, &c.name, 'c', rel, 0, &keys, false);
                 r.insert("conbin", Some(crate::deparse::tree_handle("check", rel, ci as i64)));
                 r.insert("conenforced", Some(t(c.enforced)));
                 r.insert("convalidated", Some(t(c.valid)));
@@ -1227,6 +1484,300 @@ impl<'a> File<'a> {
         out
     }
 
+    /// The kind of the constraint an index of a table stands for, where it stands for one.
+    fn index_constraint(&self, table: &str, i: &IndexFacts) -> Option<char> {
+        match (i.primary, i.keyed || !i.exclusion, i.unique) {
+            (true, _, _) => Some('p'),
+            (_, true, _) if i.keyed => Some('u'),
+            (_, false, _) => Some('x'),
+            (_, _, true)
+                if self
+                    .catalog
+                    .oids
+                    .of(&Object::Constraint(table.to_string(), i.name.clone()))
+                    .is_some() =>
+            {
+                Some('u')
+            }
+            _ => None,
+        }
+    }
+
+    /// The rows of pg_depend the file's objects make, as PostgreSQL's DDL records them: each
+    /// object's on its schema, its parts, its types and collations, the objects its stored trees
+    /// name, and what it is made beside; never one on an object PostgreSQL holds pinned.
+    fn depends(&self) -> Vec<Row> {
+        use crate::deparse::depend::{self as d, Addr};
+        let _named = crate::oids::named(self.catalog.oids.clone());
+        let cat = crate::deparse::cat::Cat::of(self.catalog);
+        let mut out = Deps::default();
+        let class = |name: &str| Addr::of(d::CLASS, self.oid(Object::Class(name.to_string())));
+        let ty = |name: &str| Addr::of(d::TYPE, self.oid(Object::Type(name.to_string())));
+        let array = |name: &str| Addr::of(d::TYPE, self.oid(Object::Array(name.to_string())));
+        let schema_of = |name: &str| Addr::of(d::NAMESPACE, self.namespace(parts(name).0));
+        let collation = |oid: u32| (oid != DEFAULT_COLLATION).then(|| Addr::of(d::COLLATION, oid));
+        let constraint = |table: &str, name: &str| {
+            Addr::of(
+                d::CONSTRAINT,
+                self.oid(Object::Constraint(table.to_string(), name.to_string())),
+            )
+        };
+        let tree = |kind: &str, oid: u32, part: i64| crate::deparse::stored_tree(&cat, kind, oid, part).ok();
+        for tb in self.tables() {
+            let n = full(&tb.name);
+            let rel = class(&n);
+            out.many(rel, vec![schema_of(&n)], 'n');
+            for (i, c) in tb.columns.iter().enumerate() {
+                let col = Addr::column(rel.oid, i as i32 + 1);
+                out.one(col, Addr::of(d::TYPE, self.facts(c.ty, c.domain.as_deref()).oid), 'n');
+                if let Some(k) = collation(self.column_collation(c)) {
+                    out.one(col, k, 'n');
+                }
+            }
+            out.one(ty(&n), rel, 'i');
+            out.one(array(&n), ty(&n), 'i');
+            for (i, c) in tb.columns.iter().enumerate() {
+                if c.default.is_none() && c.generated.is_none() {
+                    continue;
+                }
+                let def = Addr::of(d::ATTRDEF, self.oid(Object::Default(n.clone(), c.name.clone())));
+                let generated = if c.generated.is_some() { 'i' } else { 'a' };
+                out.one(def, Addr::column(rel.oid, i as i32 + 1), generated);
+                if let Some(node) = tree("attrdef", rel.oid, i as i64 + 1) {
+                    let (own, other) = d::single_rel(&cat, &node, rel.oid);
+                    out.all(def, &own, 'n');
+                    out.all(def, &other, 'n');
+                }
+            }
+            if self.release >= 18 {
+                let own = parts(&n).1;
+                for (i, c) in tb.columns.iter().enumerate().filter(|(_, c)| c.not_null) {
+                    let con = constraint(&n, &format!("{own}_{}_not_null", c.name));
+                    out.one(con, Addr::column(rel.oid, i as i32 + 1), 'a');
+                }
+            }
+            for (ci, k) in tb.checks.iter().enumerate() {
+                let con = constraint(&n, &k.name);
+                let Some(node) = tree("check", rel.oid, ci as i64) else {
+                    continue;
+                };
+                let cols = d::columns_read(&node);
+                let keys = match cols.is_empty() {
+                    true => vec![rel],
+                    false => cols.iter().map(|&c| Addr::column(rel.oid, c.into())).collect(),
+                };
+                out.many(con, keys, 'a');
+                let (own, other) = d::single_rel(&cat, &node, rel.oid);
+                out.all(con, &own, 'n');
+                out.all(con, &other, 'n');
+            }
+            let schema = parts(&n).0;
+            for i in self.indexes_of(tb) {
+                let index = class(&format!("{schema}.{}", i.name));
+                let cols: Vec<Addr> = i
+                    .keys
+                    .iter()
+                    .chain(&i.include)
+                    .map(|&k| if k > 0 { Addr::column(rel.oid, k.into()) } else { rel })
+                    .collect();
+                match self.index_constraint(&n, &i) {
+                    Some(_) => {
+                        let con = constraint(&n, &i.name);
+                        out.many(con, cols, 'a');
+                        out.one(index, con, 'i');
+                    }
+                    None => {
+                        let simple: Vec<Addr> = cols.into_iter().filter(|a| a.sub != 0).collect();
+                        out.many(index, if simple.is_empty() { vec![rel] } else { simple }, 'a');
+                    }
+                }
+                out.many(index, i.collations.iter().filter_map(|&c| collation(c)).collect(), 'n');
+                let (exprs, pred) = crate::deparse::defs::index_has_trees(self.catalog, index.oid);
+                for (has, kind) in [(exprs, "indexprs"), (pred, "indpred")] {
+                    if let Some(node) = tree(kind, index.oid, 0).filter(|_| has) {
+                        let (own, other) = d::single_rel(&cat, &node, rel.oid);
+                        out.all(index, &own, 'a');
+                        out.all(index, &other, 'n');
+                    }
+                }
+            }
+            for f in &tb.foreign_keys {
+                let con = constraint(&n, &f.name);
+                let keys = f.columns.iter().map(|&c| Addr::column(rel.oid, c as i32 + 1)).collect();
+                out.many(con, keys, 'a');
+                let parent = full(&f.parent);
+                let prel = class(&parent);
+                let mut refs: Vec<Addr> = f
+                    .parent_columns
+                    .iter()
+                    .map(|&c| Addr::column(prel.oid, c as i32 + 1))
+                    .collect();
+                refs.push(class(&format!("{}.{}", parts(&parent).0, f.key)));
+                out.many(con, refs, 'n');
+            }
+        }
+        for s in &self.catalog.sequences {
+            let n = full(&s.name);
+            let seq = class(&n);
+            out.many(seq, vec![schema_of(&n)], 'n');
+            let Some((t, c)) = &s.owned_by else {
+                continue;
+            };
+            let owner = full(t);
+            let column = self
+                .catalog
+                .tables
+                .iter()
+                .find(|x| full(&x.name) == owner)
+                .and_then(|x| x.columns.iter().position(|y| y.name == *c));
+            if let Some(i) = column {
+                let kind = if s.identity { 'i' } else { 'a' };
+                out.one(seq, Addr::column(class(&owner).oid, i as i32 + 1), kind);
+            }
+        }
+        for v in &self.catalog.views {
+            let n = full(&v.name);
+            let view = class(&n);
+            out.many(view, vec![schema_of(&n)], 'n');
+            let analyzed = crate::deparse::query::view_query(&cat, v).ok();
+            if let Some((q, cols)) = &analyzed {
+                for (i, ((_, t, _), target)) in cols.iter().zip(q.output()).enumerate() {
+                    let col = Addr::column(view.oid, i as i32 + 1);
+                    out.one(col, Addr::of(d::TYPE, *t), 'n');
+                    if let Some(k) = collation(d::output_collation(&cat, q, &target.expr)) {
+                        out.one(col, k, 'n');
+                    }
+                }
+            }
+            out.one(ty(&n), view, 'i');
+            out.one(array(&n), ty(&n), 'i');
+            let rule = Addr::of(d::REWRITE, self.oid(Object::Rule(n.clone())));
+            out.one(rule, view, 'i');
+            if let Some((q, _)) = &analyzed {
+                // Before 16 a view's question kept OLD and NEW, the view itself, in its range table.
+                let mut refs = d::of_query(&cat, q);
+                if self.release < 16 {
+                    refs.push(view);
+                    refs = d::eliminated(refs);
+                }
+                out.all(rule, &refs, 'n');
+            }
+        }
+        let own_types = self.pg_types();
+        for t in &self.catalog.types {
+            let n = full(&t.name);
+            let typ = ty(&n);
+            out.many(typ, vec![schema_of(&n)], 'n');
+            out.one(array(&n), typ, 'i');
+            match &t.kind {
+                crate::catalog::TypeKind::Enum { .. } => {}
+                crate::catalog::TypeKind::Composite { fields } => {
+                    let rel = class(&n);
+                    out.one(rel, typ, 'i');
+                    for (i, (_, fty, fcoll)) in fields.iter().enumerate() {
+                        let col = Addr::column(rel.oid, i as i32 + 1);
+                        let (toid, coll) = self.field_facts(fty, fcoll.as_deref());
+                        out.one(col, Addr::of(d::TYPE, toid), 'n');
+                        if let Some(k) = collation(coll) {
+                            out.one(col, k, 'n');
+                        }
+                    }
+                }
+                crate::catalog::TypeKind::Range(r) => {
+                    let f = self.range_facts(&cat, r);
+                    let mut refs = vec![
+                        Addr::of(d::TYPE, f.sub),
+                        Addr::of(d::OPCLASS, f.opclass),
+                        Addr::of(d::PROC, f.subdiff),
+                    ];
+                    if f.collation != 0 {
+                        refs.push(Addr::of(d::COLLATION, f.collation));
+                    }
+                    out.many(typ, refs, 'n');
+                    let m = full(&r.multirange);
+                    let multi = ty(&m);
+                    out.many(multi, vec![schema_of(&m)], 'n');
+                    out.one(array(&m), multi, 'i');
+                    out.one(multi, typ, 'i');
+                    // The five constructors DefineRange makes, each on its schema, its result and
+                    // its arguments, and made a part of its range or multirange.
+                    let sub_key = crate::regs::type_oid(&r.subtype, crate::regs::LATEST)
+                        .map(|o| crate::regs::reg_text(RegKind::Type, o, crate::regs::LATEST))
+                        .unwrap_or_else(|_| r.subtype.clone());
+                    let shown = match parts(&n) {
+                        ("public", x) => x.to_string(),
+                        _ => n.clone(),
+                    };
+                    let made = [
+                        (&n, format!("{sub_key},{sub_key}"), vec![f.sub, f.sub], typ),
+                        (&n, format!("{sub_key},{sub_key},text"), vec![f.sub, f.sub, 25], typ),
+                        (&m, String::new(), vec![], multi),
+                        (&m, shown.clone(), vec![typ.oid], multi),
+                        (&m, format!("{shown}[]"), vec![array(&n).oid], multi),
+                    ];
+                    for (name, key, args, owner) in made {
+                        let p = Addr::of(d::PROC, self.proc_oid(name, &key));
+                        let mut refs = vec![schema_of(name), Addr::of(LANGUAGE, 12), owner];
+                        refs.extend(args.iter().map(|&a| Addr::of(d::TYPE, a)));
+                        out.many(p, refs, 'n');
+                        out.one(p, owner, 'i');
+                    }
+                    let cast = Addr::of(d::CAST, self.oid(Object::Cast(n.clone())));
+                    let by = Addr::of(d::PROC, self.proc_oid(&m, &shown));
+                    out.many(cast, vec![typ, multi, by], 'i');
+                }
+            }
+        }
+        for dm in &self.catalog.domains {
+            let n = full(&dm.name);
+            let typ = ty(&n);
+            let base = own_types
+                .iter()
+                .find(|r| r.get("oid").cloned().flatten() == Some(typ.oid.to_string()))
+                .and_then(|r| r.get("typbasetype").cloned().flatten()?.parse().ok())
+                .unwrap_or(0);
+            let coll = collation(self.domain_collation(&dm.name, 0));
+            let mut refs = vec![schema_of(&n), Addr::of(d::TYPE, base)];
+            refs.extend(coll);
+            out.many(typ, refs, 'n');
+            if let Some(node) = tree("domaindefault", typ.oid, 0).filter(|_| dm.default.is_some()) {
+                out.all(typ, &d::of_expr(&cat, &node), 'n');
+            }
+            out.many(array(&n), coll.into_iter().collect(), 'n');
+            out.one(array(&n), typ, 'i');
+            if dm.not_null && self.release >= 17 {
+                let own = parts(&n).1;
+                let name = dm.not_null_name.clone().unwrap_or_else(|| format!("{own}_not_null"));
+                out.one(constraint(&n, &name), typ, 'a');
+            }
+            for (ki, k) in dm.checks.iter().enumerate() {
+                let con = constraint(&n, &k.name);
+                out.one(con, typ, 'a');
+                if let Some(node) = tree("domaincheck", typ.oid, ki as i64) {
+                    out.all(con, &d::of_expr(&cat, &node), 'n');
+                }
+            }
+        }
+        for f in &self.catalog.functions {
+            let n = full(&f.name);
+            let key = f.args.iter().map(|t| t.pg_name()).collect::<Vec<_>>().join(",");
+            let p = Addr::of(d::PROC, self.proc_oid(&n, &key));
+            let mut refs = vec![
+                schema_of(&n),
+                Addr::of(LANGUAGE, 14),
+                Addr::of(d::TYPE, self.facts(f.returns, None).oid),
+            ];
+            refs.extend(f.args.iter().map(|&a| Addr::of(d::TYPE, self.facts(a, None).oid)));
+            out.many(p, refs, 'n');
+        }
+        for c in &self.catalog.collations {
+            let n = full(&c.name);
+            let coll = Addr::of(d::COLLATION, self.oid(Object::Collation(n.clone())));
+            out.many(coll, vec![schema_of(&n)], 'n');
+        }
+        out.rows
+    }
+
     fn indexes(&self) -> Vec<Row> {
         let mut out = Vec::new();
         for tb in self.tables() {
@@ -1258,7 +1809,10 @@ impl<'a> File<'a> {
                     ("indislive", "t".into()),
                     ("indisreplident", "f".into()),
                     ("indkey", vector(&all)),
-                    ("indcollation", zeros(i.keys.len())),
+                    (
+                        "indcollation",
+                        i.collations.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" "),
+                    ),
                     ("indclass", zeros(i.keys.len())),
                     ("indoption", zeros(i.keys.len())),
                 ]));
@@ -1457,24 +2011,90 @@ impl<'a> File<'a> {
         out
     }
 
+    /// What a range's row of pg_range says, as DefineRange finds it: its subtype, its collation (its
+    /// COLLATION's, else the subtype's), its subtype's operator class (the one named, else the
+    /// default B-tree one), and its subtype_diff function.
+    fn range_facts(&self, cat: &crate::deparse::cat::Cat, r: &crate::catalog::RangeType) -> RangeFacts {
+        let sub = crate::regs::type_oid(&r.subtype, self.release)
+            .ok()
+            .or_else(|| self.catalog.oids.of(&Object::Type(full(&r.subtype))))
+            .unwrap_or(0);
+        let collation = if cat.collatable(sub) {
+            match &r.collation {
+                Some(c) => self.collation_oid(c),
+                None => cat.ty(sub).map_or(0, |t| t.collation),
+            }
+        } else {
+            0
+        };
+        let opclass = match &r.opclass {
+            Some(n) => crate::deparse::defs::opclass_oid(self.release, n, 403),
+            None => crate::deparse::defs::default_btree_opclass(cat, sub),
+        };
+        let function = |name: &Option<String>, args: &[u32], returns: Option<u32>| -> u32 {
+            let Some(name) = name else { return 0 };
+            let (schema, own) = match name.rsplit_once('.') {
+                Some((s, n)) => (Some(crate::deparse::query::namespace_oid(cat, s)), n),
+                None => (None, name.as_str()),
+            };
+            cat.procs_named(own, schema)
+                .into_iter()
+                .find(|p| p.args == args && returns.is_none_or(|t| p.result == t))
+                .map_or(0, |p| p.oid)
+        };
+        RangeFacts {
+            sub,
+            collation,
+            opclass,
+            subdiff: function(&r.subtype_diff, &[sub, sub], Some(701)),
+        }
+    }
+
     fn ranges(&self) -> Vec<Row> {
         let mut out = Vec::new();
+        let mut cat = None;
         for ty in &self.catalog.types {
             if let crate::catalog::TypeKind::Range(r) = &ty.kind {
                 let n = full(&ty.name);
-                let sub = crate::regs::type_oid(&r.subtype, self.release).unwrap_or(0);
-                let opc = self.types.get(&sub).map(|_| "0").unwrap_or("0");
+                let cat = cat.get_or_insert_with(|| crate::deparse::cat::Cat::of(self.catalog));
+                let f = self.range_facts(cat, r);
                 out.push(row(&[
                     ("rngtypid", self.oid(Object::Type(n.clone())).to_string()),
-                    ("rngsubtype", sub.to_string()),
+                    ("rngsubtype", f.sub.to_string()),
                     (
                         "rngmultitypid",
                         self.oid(Object::Type(full(&r.multirange))).to_string(),
                     ),
-                    ("rngcollation", "0".into()),
-                    ("rngsubopc", opc.into()),
+                    ("rngcollation", f.collation.to_string()),
+                    ("rngsubopc", f.opclass.to_string()),
+                    // A range naming a CANONICAL is refused by name.
                     ("rngcanonical", "0".into()),
-                    ("rngsubdiff", "0".into()),
+                    ("rngsubdiff", f.subdiff.to_string()),
+                ]));
+            }
+        }
+        out
+    }
+
+    /// Each range's cast to its multirange, as DefineRange makes it: explicit, by the multirange's
+    /// constructor of one range.
+    fn casts(&self) -> Vec<Row> {
+        let mut out = Vec::new();
+        for ty in &self.catalog.types {
+            if let crate::catalog::TypeKind::Range(r) = &ty.kind {
+                let n = full(&ty.name);
+                let m = full(&r.multirange);
+                let shown = match parts(&n) {
+                    ("public", x) => x.to_string(),
+                    _ => n.clone(),
+                };
+                out.push(row(&[
+                    ("oid", self.oid(Object::Cast(n.clone())).to_string()),
+                    ("castsource", self.oid(Object::Type(n.clone())).to_string()),
+                    ("casttarget", self.oid(Object::Type(m.clone())).to_string()),
+                    ("castfunc", self.proc_oid(&m, &shown).to_string()),
+                    ("castcontext", "e".into()),
+                    ("castmethod", "f".into()),
                 ]));
             }
         }
@@ -1500,11 +2120,114 @@ impl<'a> File<'a> {
     }
 }
 
+/// pg_language's OID, a catalog a row of pg_depend names.
+const LANGUAGE: u32 = 2612;
+
+thread_local! {
+    /// Whether the file's views are being read for their columns, which reading one may ask again.
+    static READING_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The dimensions a type's name writes: `int[]` one, `int[][]` two.
+fn array_dims(dt: &sqlparser::ast::DataType) -> i16 {
+    use sqlparser::ast::{ArrayElemTypeDef as E, DataType as D};
+    match dt {
+        D::Array(E::SquareBracket(inner, _) | E::AngleBracket(inner) | E::Parenthesis(inner)) => {
+            1 + array_dims(inner)
+        }
+        _ => 0,
+    }
+}
+
+/// pg_depend's rows as they are recorded: each from an object to those it depends on, by how.
+#[derive(Default)]
+struct Deps {
+    rows: Vec<Row>,
+}
+
+impl Deps {
+    /// As `recordDependencyOn`: one dependency, unless the object depended on is pinned.
+    fn one(&mut self, on: crate::deparse::depend::Addr, to: crate::deparse::depend::Addr, kind: char) {
+        self.all(on, &[to], kind);
+    }
+
+    /// As `recordMultipleDependencies`: each dependency in turn, none on a pinned object; none from
+    /// an object the file gave no OID.
+    fn all(&mut self, on: crate::deparse::depend::Addr, to: &[crate::deparse::depend::Addr], kind: char) {
+        if on.oid == 0 {
+            return;
+        }
+        for a in to.iter().filter(|a| !a.pinned()) {
+            self.rows.push(row(&[
+                ("classid", on.class.to_string()),
+                ("objid", on.oid.to_string()),
+                ("objsubid", on.sub.to_string()),
+                ("refclassid", a.class.to_string()),
+                ("refobjid", a.oid.to_string()),
+                ("refobjsubid", a.sub.to_string()),
+                ("deptype", kind.to_string()),
+            ]));
+        }
+    }
+
+    /// As `record_object_address_dependencies`: the objects each kept once first.
+    fn many(&mut self, on: crate::deparse::depend::Addr, to: Vec<crate::deparse::depend::Addr>, kind: char) {
+        let to = crate::deparse::depend::eliminated(to);
+        self.all(on, &to, kind);
+    }
+}
+
+/// A column's collation, as pg_attribute's attcollation gives it: of a file's table or composite,
+/// or a built-in relation's as carried.
+pub(crate) fn attcollation_of(catalog: &Catalog, relid: u32, attno: i32) -> u32 {
+    let f = File::of(catalog);
+    let at = (attno - 1) as usize;
+    if let Some(Object::Class(n)) = catalog.oids.object(relid) {
+        if let Some(t) = catalog.tables.iter().find(|t| full(&t.name) == *n) {
+            return t.columns.get(at).map_or(0, |c| f.column_collation(c));
+        }
+        for ty in &catalog.types {
+            if let crate::catalog::TypeKind::Composite { fields } = &ty.kind {
+                if full(&ty.name) == *n {
+                    return fields.get(at).map_or(0, |(_, t, c)| f.field_facts(t, c.as_deref()).1);
+                }
+            }
+        }
+        if let Some(v) = catalog.views.iter().find(|v| full(&v.name) == *n) {
+            let cat = crate::deparse::cat::Cat::of(catalog);
+            if let Ok((q, _)) = crate::deparse::query::view_query(&cat, v) {
+                if let Some(t) = q.output().nth(at) {
+                    return crate::deparse::depend::output_collation(&cat, &q, &t.expr);
+                }
+            }
+        }
+        return 0;
+    }
+    built_in("pg_attribute", catalog.release)
+        .iter()
+        .find(|r| {
+            r.get("attrelid").cloned().flatten() == Some(relid.to_string())
+                && r.get("attnum").cloned().flatten() == Some(attno.to_string())
+        })
+        .and_then(|r| r.get("attcollation").cloned().flatten()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// What a range's row of pg_range says of it.
+struct RangeFacts {
+    sub: u32,
+    collation: u32,
+    opclass: u32,
+    subdiff: u32,
+}
+
 /// An index of a table's, as pg_class, pg_index and pg_constraint say it.
 struct IndexFacts {
     name: String,
     method: Method,
     keys: Vec<i16>,
+    /// Each key's collation, 0 for a key of a type that has none.
+    collations: Vec<u32>,
     include: Vec<i16>,
     unique: bool,
     primary: bool,

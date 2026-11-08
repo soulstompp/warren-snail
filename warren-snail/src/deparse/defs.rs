@@ -57,6 +57,28 @@ fn method_oid(m: Method) -> u32 {
     }
 }
 
+/// The collation a key's COLLATE names, where it names one.
+pub(crate) fn key_collation(key: &str) -> Option<String> {
+    split_collate(key).1
+}
+
+/// An operator class's OID by its name under an access method, pg_catalog's.
+pub(crate) fn opclass_oid(release: u8, name: &str, am: u32) -> u32 {
+    crate::pgcatalog::built_in("pg_opclass", release)
+        .iter()
+        .find(|r| {
+            r.get("opcname").cloned().flatten().as_deref() == Some(name)
+                && r.get("opcmethod").cloned().flatten().and_then(|s| s.parse::<u32>().ok()) == Some(am)
+        })
+        .and_then(|r| r.get("oid").cloned().flatten()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The default B-tree operator class of a type, by its OID; 0 where it has none.
+pub(crate) fn default_btree_opclass(cat: &Cat, ty: u32) -> u32 {
+    default_opclass(cat, ty, 403).map_or(0, |n| opclass_oid(cat.release, &n, 403))
+}
+
 /// A key written with a COLLATE: the key, and the collation.
 fn split_collate(key: &str) -> (String, Option<String>) {
     match super::parse_expr(key) {

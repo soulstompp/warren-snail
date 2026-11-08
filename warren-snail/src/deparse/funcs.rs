@@ -63,12 +63,14 @@ fn elements(s: &str) -> Vec<String> {
 }
 
 fn proc_of(cat: &Cat, oid: u32) -> Option<Proc> {
-    let own = crate::pgcatalog::file_rows(cat.catalog, "pg_proc");
-    let carried = crate::pgcatalog::built_in("pg_proc", cat.release);
     let is = |r: &&Raw| r.get("oid").cloned().flatten().and_then(|s| s.parse::<u32>().ok()) == Some(oid);
-    let (r, built_in) = match own.iter().find(is) {
-        Some(r) => (r.clone(), false),
-        None => (carried.iter().find(is)?.clone(), true),
+    let own = match oid >= crate::oids::FIRST {
+        true => crate::pgcatalog::file_rows(cat.catalog, "pg_proc").iter().find(is).cloned(),
+        false => None,
+    };
+    let (r, built_in) = match own {
+        Some(r) => (r, false),
+        None => (crate::pgcatalog::built_in_by("pg_proc", "oid", oid, cat.release)?, true),
     };
     let f = |k: &str| r.get(k).cloned().flatten();
     let num = |k: &str| f(k).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
@@ -113,10 +115,7 @@ fn direct_arguments(cat: &Cat, p: &Proc) -> Option<usize> {
     if p.kind != 'a' {
         return None;
     }
-    let rows = crate::pgcatalog::built_in("pg_aggregate", cat.release);
-    let r = rows
-        .iter()
-        .find(|r| r.get("aggfnoid").cloned().flatten().and_then(|s| s.parse::<u32>().ok()) == Some(p.oid))?;
+    let r = crate::pgcatalog::built_in_by("pg_aggregate", "aggfnoid", p.oid, cat.release)?;
     let kind = r.get("aggkind").cloned().flatten()?;
     if kind != "o" && kind != "h" {
         return None;

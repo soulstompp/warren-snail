@@ -2059,7 +2059,8 @@ impl Draft {
     }
 
     /// The objects a type makes: the type and its array, an enum's labels, a composite's relation,
-    /// a range's multirange and its array, and the functions that construct each.
+    /// a range's multirange and its array, the functions that construct each, and the range's cast
+    /// to its multirange.
     fn type_objects(t: &Type, out: &mut Vec<crate::oids::Object>) {
         use crate::oids::Object as O;
         let name = crate::oids::full(&t.name);
@@ -2088,6 +2089,7 @@ impl Draft {
                 out.push(O::Proc(m.clone(), String::new()));
                 out.push(O::Proc(m.clone(), shown.clone()));
                 out.push(O::Proc(m, format!("{shown}[]")));
+                out.push(O::Cast(name.clone()));
             }
         }
     }
@@ -2764,6 +2766,19 @@ impl Draft {
         }
     }
 
+    /// Refused where a collation a statement names is not in the file, neither PostgreSQL's own
+    /// under the file's release nor one its DDL made, as PostgreSQL refuses a name it does not find.
+    fn collation_exists(&self, name: &str) -> Result<()> {
+        let declared = self.collations.iter().any(|c| c.name == name)
+            || crate::catalog::bytes_casing(name, &self.collations).is_some();
+        if declared || crate::pgcatalog::is_built_in_collation(name, self.release) {
+            return Ok(());
+        }
+        Err(Error::new(format!(
+            "collation \"{name}\" for encoding \"UTF8\" does not exist"
+        )))
+    }
+
     fn form(&mut self, form: Form) -> Result<Vec<String>> {
         let mut notices = Vec::new();
         match form {
@@ -2789,6 +2804,14 @@ impl Draft {
                             "type \"{}\" already exists",
                             r.multirange
                         )));
+                    }
+                    if let Some(k) = &r.collation {
+                        self.collation_exists(k)?;
+                    }
+                }
+                if let TypeKind::Composite { fields } = &t.kind {
+                    for k in fields.iter().filter_map(|f| f.2.as_ref()) {
+                        self.collation_exists(k)?;
                     }
                 }
                 self.types.push(t);
@@ -2876,6 +2899,9 @@ impl Draft {
                         "type \"{}\" already exists, a {k}",
                         d.name
                     )));
+                }
+                if let Some(k) = &d.collation {
+                    self.collation_exists(k)?;
                 }
                 let schema = schema_of(&d.name).to_string();
                 let domain = bare(&d.name).to_string();
@@ -4820,11 +4846,25 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 fact("column", &o, "identity", s.into());
             }
             if let Some(own) = collation_of(col.ty) {
+                // A column of a domain naming no COLLATE takes its domain's, or its base domain's.
+                let mut by_domain = None;
+                let mut at = col.domain.clone();
+                for _ in 0..32 {
+                    let Some(n) = at.take() else { break };
+                    let Some(d) = c.domains.iter().find(|x| crate::oids::full(&x.name) == crate::oids::full(&n)) else {
+                        break;
+                    };
+                    if d.collation.is_some() {
+                        by_domain = d.collation.clone();
+                        break;
+                    }
+                    at = Some(d.base.clone());
+                }
                 fact(
                     "column",
                     &o,
                     "collation",
-                    col.collation.clone().unwrap_or_else(|| own.into()),
+                    col.collation.clone().or(by_domain).unwrap_or_else(|| own.into()),
                 );
             }
         }
