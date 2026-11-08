@@ -4447,6 +4447,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 );
             }
             let a = args(f)?;
+            if let ("record_image_eq" | "record_image_ne", [x, y]) = (name.as_str(), a.as_slice()) {
+                return super::image::records_compared(name == "record_image_eq", ev(x)?, ev(y)?);
+            }
             if super::handed::is_handed(f) {
                 let given = a
                     .iter()

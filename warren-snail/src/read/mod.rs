@@ -441,6 +441,8 @@ pub struct Snail {
     /// The values each sequence has handed this writer and it has not used, as PostgreSQL's
     /// sequences cache them a session.
     handed: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
+    /// The changes a write makes to its own table, kept where its statement returns rows of them.
+    kept: Option<Vec<change::Change>>,
     /// The sequences' states a commit at the root's turn writes.
     advancing: Option<Vec<crate::file::SequenceState>>,
     /// Where the snail is open to write, what its writer shares among the snails it writes, and
@@ -732,6 +734,7 @@ impl Snail {
             declared: None,
             clock: (0, 0),
             handed: Default::default(),
+            kept: None,
             advancing: None,
             group: None,
             deciding: None,

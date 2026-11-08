@@ -963,7 +963,7 @@ impl Snails {
         if !self.begun
             && self.snails[0].levels.serializable(false)
             && matches!(
-                st,
+                st.written(),
                 Statement::Insert { .. }
                     | Statement::Update { .. }
                     | Statement::Delete { .. }
@@ -1079,8 +1079,10 @@ impl Snails {
             st @ (Statement::Insert { .. }
             | Statement::Update { .. }
             | Statement::Delete { .. }
-            | Statement::Set { .. }) => {
-                let (table, source) = match &st {
+            | Statement::Set { .. }
+            | Statement::Returning { .. }) => {
+                // A write and its RETURNING run on the snail holding its table, which reads both.
+                let (table, source) = match st.written() {
                     Statement::Insert { table, source } => (*table, Some(source)),
                     Statement::Update { table, .. }
                     | Statement::Delete { table, .. }

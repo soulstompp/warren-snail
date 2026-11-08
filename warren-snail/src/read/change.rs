@@ -576,6 +576,98 @@ pub(super) fn found_rows(table: &Table, batch: &RecordBatch) -> Result<Vec<Row>>
     Ok(rows)
 }
 
+/// What marks the fields a write's rows hold `old`'s and `new`'s columns in: names no statement can
+/// write.
+const KEPT: char = '\u{5}';
+
+/// The field a write's row holds column `c` in: its own name for the row as the write left it,
+/// marked for `old` and `new`.
+fn kept_name(side: Option<&str>, c: &str) -> String {
+    match side {
+        None => c.to_string(),
+        Some(s) => format!("{KEPT}{s}{KEPT}{c}"),
+    }
+}
+
+/// A name quoted as SQL writes one.
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// A RETURNING list as a select list over a write's rows read by `alias`: `old.c` and `new.c` read
+/// from their fields, `*` and `alias.*` the table's columns, `old.*` and `new.*` theirs, each item
+/// named as PostgreSQL names it.
+fn returning_list(
+    t: &Table,
+    alias: &str,
+    items: &[sqlparser::ast::SelectItem],
+) -> Result<String> {
+    use sqlparser::ast::{Expr, Ident, SelectItem, SelectItemQualifiedWildcardKind as Kind};
+    let ident = crate::catalog::ident;
+    // `old` and `new` name the rows before and after, where the table is not read by either name.
+    let side_of = |name: &Ident| -> Option<&'static str> {
+        match ident(name).as_str() {
+            n if n == alias => None,
+            "old" => Some("old"),
+            "new" => Some("new"),
+            _ => None,
+        }
+    };
+    let spread = |side: Option<&str>| -> Vec<String> {
+        t.columns
+            .iter()
+            .map(|c| format!("{} AS {}", quoted(&kept_name(side, &c.name)), quoted(&c.name)))
+            .collect()
+    };
+    let rewritten = |e: &Expr| -> String {
+        let mut e = e.clone();
+        let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
+            if let Expr::CompoundIdentifier(parts) = x {
+                if let [q, c] = parts.as_slice() {
+                    if let Some(side) = side_of(q) {
+                        *x = Expr::Identifier(Ident::with_quote('"', kept_name(Some(side), &ident(c))));
+                    }
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        e.to_string()
+    };
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) => out.extend(spread(None)),
+            SelectItem::QualifiedWildcard(Kind::ObjectName(n), _) => {
+                let q = crate::catalog::object_name(n);
+                match n.0.as_slice() {
+                    [p] if p.as_ident().and_then(side_of).is_some() => {
+                        out.extend(spread(p.as_ident().and_then(side_of)))
+                    }
+                    _ if q == alias || q.rsplit('.').next() == Some(alias) => {
+                        out.extend(spread(None))
+                    }
+                    _ => {
+                        return Err(Error::new(format!(
+                            "missing FROM-clause entry for table \"{}\"",
+                            q.rsplit('.').next().unwrap_or(&q)
+                        )))
+                    }
+                }
+            }
+            SelectItem::UnnamedExpr(e) => out.push(format!(
+                "{} AS {}",
+                rewritten(e),
+                quoted(&super::pipeline::default_name(e))
+            )),
+            SelectItem::ExprWithAlias { expr, alias: a } => {
+                out.push(format!("{} AS {}", rewritten(expr), quoted(&ident(a))))
+            }
+            other => return Err(Error::new(format!("RETURNING {other} is not read"))),
+        }
+    }
+    Ok(out.join(", "))
+}
+
 /// The sequence a column's DEFAULT draws from: its identity's, or its DEFAULT's nextval.
 fn sequence_of(catalog: &Catalog, col: &crate::catalog::Column) -> Option<String> {
     if let Some(i) = &col.identity {
@@ -864,7 +956,7 @@ impl Snail {
         // A transaction READ ONLY takes no write, in PostgreSQL's words.
         let begun = self.begun.is_some();
         if self.levels.read_only(begun) {
-            let what = match &st {
+            let what = match st.written() {
                 Statement::Insert { .. } => Some("INSERT"),
                 Statement::Update { .. } | Statement::Set { .. } => Some("UPDATE"),
                 Statement::Delete { .. } => Some("DELETE"),
@@ -1062,8 +1154,22 @@ impl Snail {
                                 self.renew()?;
                             }
                         }
-                        Ok(changed) => break changed,
+                        Ok(changed) => {
+                            // A write's RETURNING, read over the rows it changed as it ran last.
+                            if let Statement::Returning { write, alias, items } = &st {
+                                let kept = self.kept.take().unwrap_or_default();
+                                match self.returned(write, alias, items, kept) {
+                                    Ok(b) => done.answer = Some(b),
+                                    Err(e) => {
+                                        self.failed()?;
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            break changed;
+                        }
                         Err(e) => {
+                            self.kept = None;
                             self.failed()?;
                             return Err(e);
                         }
@@ -1275,8 +1381,9 @@ impl Snail {
                 };
                 *found = Some(rows.clone());
                 done.rows = rows.len() as u64;
-                (done.rewritten, done.orders) =
-                    self.apply(table, rows.into_iter().map(Change::Insert).collect())?;
+                let changes: Vec<Change> = rows.into_iter().map(Change::Insert).collect();
+                self.keep(&changes);
+                (done.rewritten, done.orders) = self.apply(table, changes)?;
                 done.rows > 0
             }
             Statement::Update { table, find, sets } => {
@@ -1287,13 +1394,19 @@ impl Snail {
                 self.set(table, find, sets, done, found)?
             }
             Statement::Set { table, find, sets } => self.set(table, find, sets, done, found)?,
+            // The write's changes to its own table kept for its RETURNING, afresh each time it runs.
+            Statement::Returning { write, .. } => {
+                self.kept = Some(Vec::new());
+                self.write_rows(*write, done, found)?
+            }
             Statement::Delete { table, find } => {
                 let (batch, _) = self.answer(&find, None)?;
                 let t = &self.catalog.tables[table];
                 let old = self.kept_to(table, found_rows(t, &batch)?, found)?;
                 done.rows = old.len() as u64;
-                (done.rewritten, done.orders) =
-                    self.apply(table, old.into_iter().map(Change::Delete).collect())?;
+                let changes: Vec<Change> = old.into_iter().map(Change::Delete).collect();
+                self.keep(&changes);
+                (done.rewritten, done.orders) = self.apply(table, changes)?;
                 done.rows > 0
             }
             Statement::Declare { ddl, .. } => {
@@ -1401,8 +1514,79 @@ impl Snail {
             fill::without_overlaps(&t, &n)?;
             changes.push(Change::Replace(o, n));
         }
+        self.keep(&changes);
         (done.rewritten, done.orders) = self.apply(table, changes)?;
         Ok(done.rows > 0)
+    }
+
+    /// Keeps a write's changes to its own table where its statement returns rows of them.
+    fn keep(&mut self, changes: &[Change]) {
+        if let Some(k) = self.kept.as_mut() {
+            k.extend_from_slice(changes);
+        }
+    }
+
+    /// A write's RETURNING: its list read as a question over the rows it changed, by the name
+    /// `alias` reads its table, each row its table's columns as the write left them (as it found
+    /// them, for a DELETE) and, under `old` and `new`, as it found them and as it left them, NULL
+    /// where it found none or left none, as PostgreSQL 18 reads them.
+    pub(super) fn returned(
+        &self,
+        write: &Statement,
+        alias: &str,
+        items: &[sqlparser::ast::SelectItem],
+        kept: Vec<Change>,
+    ) -> Result<RecordBatch> {
+        let (Statement::Insert { table, .. }
+        | Statement::Set { table, .. }
+        | Statement::Update { table, .. }
+        | Statement::Delete { table, .. }) = write
+        else {
+            unreachable!("a write returns rows")
+        };
+        let t = &self.catalog.tables[*table];
+        let deleting = matches!(write, Statement::Delete { .. });
+        let mut fields: Vec<(String, ColumnType)> = Vec::new();
+        for side in [None, Some("old"), Some("new")] {
+            for c in &t.columns {
+                fields.push((kept_name(side, &c.name), c.ty));
+            }
+        }
+        let named: Vec<(&str, ColumnType)> = fields.iter().map(|(n, ty)| (n.as_str(), *ty)).collect();
+        let row = super::handed::row_type(&format!("{KEPT}returned"), &named);
+        let values = |r: Option<&Row>| -> Result<Vec<super::Value>> {
+            Ok(match r {
+                None => vec![super::Value::Null; t.columns.len()],
+                Some(r) => fill::with_virtual(t, r)?
+                    .iter()
+                    .zip(&t.columns)
+                    .map(|(d, c)| fill::value_of(d, c.ty))
+                    .collect(),
+            })
+        };
+        let mut rows = Vec::with_capacity(kept.len());
+        for c in &kept {
+            let (old, new) = match c {
+                Change::Insert(n) => (None, Some(n)),
+                Change::Delete(o) => (Some(o), None),
+                Change::Replace(o, n) => (Some(o), Some(n)),
+            };
+            let mut v = values(if deleting { old } else { new })?;
+            v.extend(values(old)?);
+            v.extend(values(new)?);
+            rows.push(super::Value::row(row, v)?);
+        }
+        let list = returning_list(t, alias, items)?;
+        let name = format!("{KEPT}returned");
+        let f = super::handed::Function::set_returning(&name, &[], row, move |_| Ok(rows.clone()));
+        let mut handed = self.functions.clone();
+        super::handed::hand(&mut handed, &self.catalog, f)?;
+        let _held = super::handed::holding(&handed);
+        let (batch, _) = self.answer(
+            &format!("SELECT {list} FROM {}() AS {}", quoted(&name), quoted(alias)),
+            None,
+        )?;
+        Ok(batch)
     }
 
     /// The rows an INSERT gives, each cell a value or its column's DEFAULT: the DEFAULTs filled,

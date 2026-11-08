@@ -1,7 +1,8 @@
 //! The PostgreSQL warren-speller writes for MySQL's statements, answered as PostgreSQL 18.6 answers
 //! it: each refusal with its SQLSTATE and in its words, a qualifier an alias hides looked up as
 //! PostgreSQL's parser looks it up, a CHECK holding BETWEEN or an ARRAY of literals read on every
-//! row, a boolean's casts to and from an integer, a column's default set and dropped. Every word,
+//! row, a boolean's casts to and from an integer, a column's default set and dropped, a write
+//! returning rows of what it changed, its `old` and `new` among them. Every word,
 //! code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -399,4 +400,60 @@ fn a_columns_default_is_set_and_dropped_on_a_table_holding_rows() {
     ] {
         assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
     }
+}
+
+#[test]
+fn a_write_returns_rows_of_what_it_changed_its_old_and_new_among_them() {
+    let mut w = snail("returning");
+    run(
+        &mut w,
+        "CREATE TABLE s.w (k integer NOT NULL, a integer, b text, CONSTRAINT \"w_pkey \" PRIMARY \
+         KEY (k))",
+    );
+    run(&mut w, "INSERT INTO s.w VALUES (1, 10, 'x'), (2, 20, 'y'), (3, NULL, 'z')");
+    for (sql, want) in [
+        ("INSERT INTO s.w (k, a) VALUES (4, 40) RETURNING *", vec!["4|40|NULL"]),
+        (
+            "INSERT INTO s.w (k, a) VALUES (5, 50), (6, 60) RETURNING k, a + 1, old.k, new.a AS n",
+            vec!["5|51|NULL|50", "6|61|NULL|60"],
+        ),
+        (
+            "UPDATE s.w SET a = a * 2 WHERE k <= 2 RETURNING k, old.a, new.a, a",
+            vec!["1|10|20|20", "2|20|40|40"],
+        ),
+        ("UPDATE s.w SET b = 'q' WHERE k = 9 RETURNING k", vec![]),
+        ("DELETE FROM s.w WHERE k = 6 RETURNING old.*, new.k", vec!["6|60|NULL|NULL"]),
+        ("DELETE FROM s.w WHERE k = 5 RETURNING k, a", vec!["5|50"]),
+        ("UPDATE s.w SET a = 1 WHERE k = 1 RETURNING old.*, new.*", vec!["1|20|x|1|1|x"]),
+        ("UPDATE s.w AS x SET a = 2 WHERE x.k = 1 RETURNING x.k, old.a", vec!["1|1"]),
+        (
+            "UPDATE s.w SET a = 3 WHERE k = 1 RETURNING (old.a IS DISTINCT FROM new.a) AS moved, \
+             record_image_ne(ROW(old.a), ROW(new.a))",
+            vec!["t|t"],
+        ),
+        (
+            "UPDATE s.w SET a = 3 WHERE k = 1 RETURNING record_image_ne(ROW(old.a, old.b), \
+             ROW(new.a, new.b))",
+            vec!["f"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), want, "{sql}");
+    }
+    // Each column named as PostgreSQL names it.
+    let done = w
+        .execute("UPDATE s.w SET a = 4 WHERE k = 1 RETURNING k, a + 1, old.a, record_image_ne(ROW(old.a), ROW(new.a))")
+        .unwrap();
+    let schema = done.answer.expect("an answer").schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, ["k", "?column?", "a", "record_image_ne"]);
+    // Two records compared by their images, a NULL field the same as a NULL field.
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT record_image_ne(ROW(1.0::numeric), ROW(1.00::numeric)), \
+             record_image_ne(ROW(1, 'a'), ROW(1, 'a')), record_image_ne(ROW(NULL::integer), \
+             ROW(NULL::integer)), record_image_ne(ROW(NULL::integer), ROW(1))"
+        ),
+        ["t|f|f|t"]
+    );
 }

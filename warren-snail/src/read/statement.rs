@@ -94,6 +94,14 @@ pub enum Statement {
         table: usize,
         find: String,
     },
+    /// An INSERT, UPDATE or DELETE that returns rows of what it changed: the write, the name its
+    /// table is read by, and its RETURNING list, read over the rows changed, each with its values
+    /// before (`old`) and after (`new`) as PostgreSQL 18 reads them.
+    Returning {
+        write: Box<Statement>,
+        alias: String,
+        items: Vec<sqlparser::ast::SelectItem>,
+    },
     /// A table, an index or a table's order declared: its DDL, and what it declares.
     Declare {
         ddl: String,
@@ -357,6 +365,15 @@ impl Statement {
             Statement::Setting { .. } => "SET",
             Statement::Question { .. } => "SELECT",
             Statement::Session(s) => s.kind(),
+            Statement::Returning { write, .. } => write.kind(),
+        }
+    }
+
+    /// The write itself, its RETURNING taken off; any other statement as it is.
+    pub fn written(&self) -> &Statement {
+        match self {
+            Statement::Returning { write, .. } => write,
+            st => st,
         }
     }
 }
@@ -977,6 +994,32 @@ fn finder(table: &Table, relation: &TableWithJoins, selection: Option<&Expr>) ->
     }
 }
 
+/// A write that returns rows where it has a RETURNING list, its table read by `alias`.
+fn returning(write: Statement, alias: String, items: &Option<Vec<SelectItem>>) -> Statement {
+    match items {
+        Some(items) => Statement::Returning {
+            write: Box::new(write),
+            alias,
+            items: items.clone(),
+        },
+        None => write,
+    }
+}
+
+/// The name a write's table is read by: its alias, or its own name without its schema.
+fn read_as(t: &TableWithJoins) -> String {
+    match &t.relation {
+        TableFactor::Table {
+            alias: Some(a), ..
+        } => ident(&a.name),
+        TableFactor::Table { name, .. } => {
+            let n = object_name(name);
+            n.rsplit('.').next().unwrap_or(&n).to_string()
+        }
+        _ => String::new(),
+    }
+}
+
 /// The one table a statement names, read alone.
 fn one_table(catalog: &Catalog, t: &TableWithJoins) -> Result<usize> {
     if !t.joins.is_empty() {
@@ -993,9 +1036,6 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         return Err(Error::new(
             "ON CONFLICT is not written: a row's place is its key",
         ));
-    }
-    if i.returning.is_some() {
-        return Err(refused("RETURNING"));
     }
     let ti = match &i.table {
         TableObject::TableName(n) => table_index(catalog, n)?,
@@ -1222,13 +1262,20 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         Sql::ReleaseSavepoint { name } => Ok(Statement::Session(super::session::Said::Release {
             name: ident(name),
         })),
-        Sql::Insert(i) => insert(catalog, i),
+        Sql::Insert(i) => {
+            let alias = match (&i.table_alias, &i.table) {
+                (Some(a), _) => ident(&a.alias),
+                (None, TableObject::TableName(n)) => {
+                    let n = object_name(n);
+                    n.rsplit('.').next().unwrap_or(&n).to_string()
+                }
+                _ => String::new(),
+            };
+            Ok(returning(insert(catalog, i)?, alias, &i.returning))
+        }
         Sql::Update(u) => {
             if u.from.is_some() {
                 return Err(refused("UPDATE … FROM"));
-            }
-            if u.returning.is_some() {
-                return Err(refused("RETURNING"));
             }
             if !u.order_by.is_empty() || u.limit.is_some() {
                 return Err(refused("an UPDATE with ORDER BY or LIMIT"));
@@ -1257,18 +1304,16 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                     sets.push((c, Fill::Expression(a.value.to_string())));
                 }
             }
-            Ok(Statement::Set {
+            let set = Statement::Set {
                 table: ti,
                 find: finder(table, &u.table, u.selection.as_ref()),
                 sets,
-            })
+            };
+            Ok(returning(set, read_as(&u.table), &u.returning))
         }
         Sql::Delete(d) => {
             if d.using.is_some() {
                 return Err(refused("DELETE … USING"));
-            }
-            if d.returning.is_some() {
-                return Err(refused("RETURNING"));
             }
             if !d.tables.is_empty() || !d.order_by.is_empty() || d.limit.is_some() {
                 return Err(refused(
@@ -1283,10 +1328,11 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                 _ => return Err(Error::new("a DELETE names one table")),
             };
             let ti = one_table(catalog, t)?;
-            Ok(Statement::Delete {
+            let delete = Statement::Delete {
                 table: ti,
                 find: finder(&catalog.tables[ti], t, d.selection.as_ref()),
-            })
+            };
+            Ok(returning(delete, read_as(t), &d.returning))
         }
         Sql::Query(_) => Ok(Statement::Question {
             question: sql.trim().trim_end_matches(';').trim_end().to_string(),
@@ -1516,7 +1562,6 @@ mod tests {
                 "DELETE FROM s.t USING s.u WHERE s.u.a = s.t.a",
                 "DELETE … USING",
             ),
-            ("INSERT INTO s.t (a) VALUES (1) RETURNING a", "RETURNING"),
             (
                 "INSERT INTO s.t (a) VALUES (1) ON CONFLICT DO NOTHING",
                 "a row's place is its key",

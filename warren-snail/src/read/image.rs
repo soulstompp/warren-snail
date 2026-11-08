@@ -318,6 +318,25 @@ fn pair(
     Ok(Value::Bool(same == (name == "*=")))
 }
 
+/// record_image_eq and record_image_ne: two records compared by their images, a NULL field the same
+/// as a NULL field; NULL over a NULL record, as both functions are strict.
+pub(super) fn records_compared(eq: bool, x: Value, y: Value) -> Result<Value> {
+    if x.is_null() || y.is_null() {
+        return Ok(Value::Null);
+    }
+    match (&x, &y) {
+        (Value::Composed(a, p), Value::Composed(b, q)) if is_record(*a) && is_record(*b) => {
+            Ok(Value::Bool(records_same(*a, &p.item, *b, &q.item)? == eq))
+        }
+        _ => Err(Error::new(format!(
+            "function record_image_{}({}, {}) does not exist",
+            if eq { "eq" } else { "ne" },
+            kind_name(&x),
+            kind_name(&y)
+        ))),
+    }
+}
+
 /// What PostgreSQL's parser asks of an operator before ANY, SOME or ALL: an array on its right, whose
 /// element it asks as a right operand.
 pub(super) fn over_array_operands(
