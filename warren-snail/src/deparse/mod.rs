@@ -9,6 +9,8 @@ pub(crate) mod analyze;
 pub(crate) mod cat;
 pub(crate) mod defs;
 pub(crate) mod print;
+pub(crate) mod query;
+pub(crate) mod viewdef;
 
 use crate::catalog::{Catalog, Table};
 use crate::oids::{full, Object};
@@ -55,7 +57,10 @@ fn held() -> Result<Arc<Catalog>> {
 
 /// The deparsers a pipeline answers, by name.
 pub(crate) fn is_deparser(name: &str) -> bool {
-    matches!(name, "pg_get_expr" | "pg_get_constraintdef" | "pg_get_indexdef")
+    matches!(
+        name,
+        "pg_get_expr" | "pg_get_constraintdef" | "pg_get_indexdef" | "pg_get_viewdef" | "pg_get_ruledef"
+    )
 }
 
 /// What a deparser returns.
@@ -107,6 +112,25 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
             let colno = args.get(1).and_then(Value::text).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
             let pretty = args.get(2).and_then(truth_of).unwrap_or(false);
             defs::indexdef(&cat, oid, colno.max(0) as usize, pretty)?
+        }
+        "pg_get_ruledef" => {
+            let oid = args.first().and_then(oid_of).unwrap_or(0);
+            let pretty = args.get(1).and_then(truth_of).unwrap_or(false);
+            viewdef::ruledef(&cat, oid, pretty)?
+        }
+        "pg_get_viewdef" => {
+            let pretty_or_wrap = args.get(1);
+            let (pretty, wrap) = match pretty_or_wrap.and_then(truth_of) {
+                Some(p) => (p, 0),
+                None => match pretty_or_wrap.and_then(Value::text).and_then(|s| s.parse::<i32>().ok()) {
+                    Some(w) => (true, w),
+                    None => (false, 0),
+                },
+            };
+            match view_oid(&catalog, &args[0])? {
+                Some(oid) => viewdef::viewdef(&cat, oid, pretty, wrap)?,
+                None => None,
+            }
         }
         _ => None,
     };
@@ -292,6 +316,7 @@ fn tree_of(cat: &Cat, handle: &str) -> Result<(Node, u32)> {
                 cat,
                 columns: columns_of(cat, t),
                 value: None,
+                scope: None,
             };
             let (ty, typmod) = column_type(cat, c);
             let n = a.expr(raw)?;
@@ -305,6 +330,7 @@ fn tree_of(cat: &Cat, handle: &str) -> Result<(Node, u32)> {
                 cat,
                 columns: columns_of(cat, t),
                 value: None,
+                scope: None,
             };
             Ok((a.boolean(a.expr(&k.expr)?)?, oid))
         }
@@ -325,6 +351,7 @@ fn tree_of(cat: &Cat, handle: &str) -> Result<(Node, u32)> {
                 cat,
                 columns: Vec::new(),
                 value: Some((base, typmod)),
+                scope: None,
             };
             Ok((a.boolean(a.expr(&k.check)?)?, 0))
         }
@@ -344,6 +371,7 @@ fn tree_of(cat: &Cat, handle: &str) -> Result<(Node, u32)> {
                 cat,
                 columns: Vec::new(),
                 value: None,
+                scope: None,
             };
             let n = a.expr(raw)?;
             Ok((a.coerce_to_target(n, oid, -1, Context::Assignment, Form::Implicit)?, 0))
@@ -379,6 +407,7 @@ fn expr_of(cat: &Cat, handle: &str, relid: u32, pretty: bool) -> Result<Option<S
         level: 0,
         buf: String::new(),
         relations,
+        q: Default::default(),
     };
     p.expr(&node, false)?;
     Ok(Some(p.buf))
@@ -389,4 +418,46 @@ fn expr_of(cat: &Cat, handle: &str, relid: u32, pretty: bool) -> Result<Option<S
 pub(crate) fn text_of_tree(catalog: &Catalog, handle: &str, relid: u32, pretty: bool) -> Result<Option<String>> {
     let cat = Cat::of(catalog);
     expr_of(&cat, handle, relid, pretty)
+}
+
+/// The relation a deparser's first argument names: an OID, or a name as text, qualified or found
+/// on the search path (pg_catalog, then public).
+fn view_oid(catalog: &Catalog, v: &Value) -> Result<Option<u32>> {
+    if let Some(oid) = oid_of(v) {
+        return Ok(Some(oid));
+    }
+    let Some(text) = v.text() else {
+        return Ok(None);
+    };
+    let parts: Vec<String> = text
+        .split('.')
+        .map(|p| match p.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+            Some(q) => q.replace("\"\"", "\""),
+            None => p.to_lowercase(),
+        })
+        .collect();
+    let rows = crate::pgcatalog::built_in("pg_class", catalog.release);
+    let built_in = |schema: u32, name: &str| {
+        rows.iter()
+            .find(|r| {
+                r.get("relname").cloned().flatten().as_deref() == Some(name)
+                    && r.get("relnamespace").cloned().flatten().and_then(|s| s.parse::<u32>().ok()) == Some(schema)
+            })
+            .and_then(|r| r.get("oid").cloned().flatten()?.parse::<u32>().ok())
+    };
+    let found = match parts.as_slice() {
+        [n] => built_in(11, n).or_else(|| catalog.oids.of(&Object::Class(full(n)))),
+        [s, n] => match s.as_str() {
+            "pg_catalog" => built_in(11, n),
+            "information_schema" => {
+                let ns = crate::regs::reg_parse(crate::regs::RegKind::Namespace, s, catalog.release).unwrap_or(0);
+                built_in(ns, n)
+            }
+            _ => catalog.oids.of(&Object::Class(format!("{s}.{n}"))),
+        },
+        _ => None,
+    };
+    found
+        .map(Some)
+        .ok_or_else(|| Error::new(format!("relation \"{text}\" does not exist")))
 }

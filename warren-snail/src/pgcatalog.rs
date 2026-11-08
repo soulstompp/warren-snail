@@ -1434,7 +1434,7 @@ impl<'a> File<'a> {
             .map(|v| {
                 let n = full(&v.name);
                 row(&[
-                    ("oid", "0".into()),
+                    ("oid", self.oid(Object::Rule(n.clone())).to_string()),
                     ("rulename", "_RETURN".into()),
                     ("ev_class", self.oid(Object::Class(n)).to_string()),
                     ("ev_type", "1".into()),

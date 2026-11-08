@@ -34,6 +34,8 @@ pub enum Object {
     Proc(String, String),
     /// An enum's label: the enum, and the label.
     Label(String, String),
+    /// A view's rule, `_RETURN`, by the view's name.
+    Rule(String),
 }
 
 impl Object {
@@ -49,7 +51,8 @@ impl Object {
             | Object::Proc(n, _)
             | Object::Constraint(n, _)
             | Object::Default(n, _)
-            | Object::Label(n, _) => n,
+            | Object::Label(n, _)
+            | Object::Rule(n) => n,
         }
     }
 

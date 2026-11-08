@@ -22,6 +22,8 @@ pub(crate) struct Printer<'c, 'a> {
     /// Each relation's columns by number, and the name a column is qualified with where several
     /// relations are read (None where it is not qualified).
     pub relations: Vec<(Vec<String>, Option<String>)>,
+    /// The query levels around an expression of a query; empty for one over a single relation.
+    pub q: super::viewdef::Ctx,
 }
 
 /// A name as quote_identifier writes it.
@@ -139,7 +141,7 @@ pub(crate) fn format_type(cat: &Cat, oid: u32, typmod: i32) -> String {
 }
 
 impl Printer<'_, '_> {
-    fn push(&mut self, s: &str) {
+    pub(crate) fn push(&mut self, s: &str) {
         self.buf.push_str(s);
     }
 
@@ -219,6 +221,8 @@ impl Printer<'_, '_> {
                     | N::MinMax { .. }
                     | N::NullIf { .. }
                     | N::Case { .. }
+                    | N::Agg { .. }
+                    | N::Window { .. }
             )
         };
         match n {
@@ -231,12 +235,14 @@ impl Printer<'_, '_> {
             | N::SqlValue { .. }
             | N::NullIf { .. }
             | N::Func { .. }
-            | N::Case { .. } => true,
+            | N::Case { .. }
+            | N::Agg { .. }
+            | N::Window { .. } => true,
             N::Field { .. } => !matches!(parent, N::Field { .. }),
             N::Domain { arg, .. } | N::Relabel { arg, .. } | N::Io { arg, .. } | N::ArrayCoerce { arg, .. } => {
                 self.simple(arg, n)
             }
-            N::Op { .. } | N::NullTest { .. } | N::BoolTest { .. } | N::Distinct { .. } => {
+            N::Op { .. } | N::NullTest { .. } | N::BoolTest { .. } | N::Distinct { .. } | N::SubLink { .. } => {
                 if let (N::Op { .. }, true, N::Op { args: pargs, .. }) = (n, self.paren, parent) {
                     let Some(op) = self.binary_op_name(n) else {
                         return false;
@@ -296,6 +302,7 @@ impl Printer<'_, '_> {
             cat: self.cat,
             columns: Vec::new(),
             value: None,
+            scope: None,
         };
         let found = match o.kind {
             'l' => a.op_lookup(&o.name, 'l', 0, r),
@@ -309,7 +316,7 @@ impl Printer<'_, '_> {
     }
 
     /// generate_function_name: bare where the search path finds it by its name and arguments.
-    fn function_name(&self, oid: u32, args: &[u32]) -> String {
+    pub(crate) fn function_name(&self, oid: u32, args: &[u32]) -> String {
         let Some(p) = self.cat.proc(oid) else {
             return oid.to_string();
         };
@@ -335,7 +342,16 @@ impl Printer<'_, '_> {
     pub(crate) fn expr(&mut self, n: &Node, implicit: bool) -> Result<()> {
         use Node as N;
         match n {
-            N::Var { attno, .. } => self.var(*attno, 0),
+            N::Var { attno, .. } => {
+                if self.q.ns.is_empty() {
+                    self.var(*attno, 0)
+                } else {
+                    self.variable(n, 0, false);
+                }
+            }
+            N::Agg { .. } => self.agg(n)?,
+            N::Window { .. } => self.window_call(n)?,
+            N::SubLink { .. } => self.sublink_expr(n)?,
             N::DomainValue { .. } => self.push("VALUE"),
             N::Const { .. } => self.constant(n, 0),
             N::Subscript { container, subs, .. } => {
@@ -569,6 +585,10 @@ impl Printer<'_, '_> {
 
     /// get_rule_expr_toplevel: a column alone as itself, whole-row included.
     pub(crate) fn toplevel(&mut self, n: &Node, implicit: bool) -> Result<()> {
+        if matches!(n, Node::Var { .. }) && !self.q.ns.is_empty() {
+            self.variable(n, 0, true);
+            return Ok(());
+        }
         self.expr(n, implicit)
     }
 

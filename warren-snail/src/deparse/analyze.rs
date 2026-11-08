@@ -38,10 +38,15 @@ pub(crate) enum Context {
 /// An expression as PostgreSQL's parser leaves it.
 #[derive(Clone, Debug)]
 pub(crate) enum Node {
+    /// A column: its relation in the range table (from 1) and its query level (0 its own), and
+    /// the relation and column it was named through, where that differs (a named join).
     Var {
         attno: i16,
         ty: u32,
         typmod: i32,
+        rel: u32,
+        up: u32,
+        syn: (u32, i16),
     },
     /// A domain CHECK's VALUE.
     DomainValue {
@@ -163,6 +168,35 @@ pub(crate) enum Node {
         ty: u32,
         typmod: i32,
     },
+    /// An aggregate call: its arguments, its ORDER BY, DISTINCT, `*`, FILTER.
+    Agg {
+        oid: u32,
+        args: Vec<Node>,
+        order: Vec<super::query::Sort>,
+        distinct: bool,
+        star: bool,
+        filter: Option<Box<Node>>,
+        variadic: bool,
+        ty: u32,
+    },
+    /// A window function call: its window by its place in the query's windows.
+    Window {
+        oid: u32,
+        args: Vec<Node>,
+        star: bool,
+        filter: Option<Box<Node>>,
+        win: usize,
+        ty: u32,
+    },
+    /// A subquery as an expression: its kind, the left side, operator and right type it is
+    /// compared by (ANY, ALL), and the query.
+    SubLink {
+        kind: super::query::SubKind,
+        test: Option<(Box<Node>, u32, u32)>,
+        query: Box<super::query::Query>,
+        ty: u32,
+        typmod: i32,
+    },
     List(Vec<Node>),
 }
 
@@ -189,7 +223,10 @@ impl Node {
             | N::MinMax { ty, .. }
             | N::SqlValue { ty, .. }
             | N::Subscript { ty, .. }
-            | N::Field { ty, .. } => *ty,
+            | N::Field { ty, .. }
+            | N::Agg { ty, .. }
+            | N::Window { ty, .. }
+            | N::SubLink { ty, .. } => *ty,
             N::Bool { .. }
             | N::NullTest { .. }
             | N::BoolTest { .. }
@@ -211,7 +248,8 @@ impl Node {
             | N::ArrayCoerce { typmod, .. }
             | N::CaseTest { typmod, .. }
             | N::Subscript { typmod, .. }
-            | N::Field { typmod, .. } => *typmod,
+            | N::Field { typmod, .. }
+            | N::SubLink { typmod, .. } => *typmod,
             N::Func { .. } => self.length_coercion().unwrap_or(-1),
             N::SqlValue { typmod, .. } => typmod.unwrap_or(-1),
             N::Collate { arg, .. } => arg.typmod(),
@@ -288,6 +326,20 @@ impl Node {
             | N::MinMax { args, .. }
             | N::List(args)
             | N::Array { elements: args, .. } => args.iter().for_each(|a| a.walk(f)),
+            N::Agg { args, filter, order, .. } => {
+                args.iter().for_each(|a| a.walk(f));
+                order.iter().for_each(|s| s.expr.walk(f));
+                if let Some(x) = filter {
+                    x.walk(f);
+                }
+            }
+            N::Window { args, filter, .. } => {
+                args.iter().for_each(|a| a.walk(f));
+                if let Some(x) = filter {
+                    x.walk(f);
+                }
+            }
+            N::SubLink { test: Some((l, _, _)), .. } => l.walk(f),
             N::Relabel { arg, .. }
             | N::Io { arg, .. }
             | N::ArrayCoerce { arg, .. }
@@ -343,14 +395,16 @@ pub(crate) struct Analyzer<'c, 'a> {
     pub cat: &'c Cat<'a>,
     pub columns: Vec<Column>,
     pub value: Option<(u32, i32)>,
+    /// The query level an expression of a query is read at; none for one over a single relation.
+    pub scope: Option<&'c super::query::Scope<'c>>,
 }
 
-fn not_read(e: &impl std::fmt::Display) -> Error {
+pub(crate) fn not_read(e: &impl std::fmt::Display) -> Error {
     Error::new(format!("{e} is not printed as PostgreSQL prints it"))
 }
 
 /// An identifier as PostgreSQL's scanner folds it.
-fn folded(i: &sqlparser::ast::Ident) -> String {
+pub(crate) fn folded(i: &sqlparser::ast::Ident) -> String {
     match i.quote_style {
         Some(_) => i.value.clone(),
         None => i.value.to_lowercase(),
@@ -489,6 +543,7 @@ impl Analyzer<'_, '_> {
                 let op = if *negated { "!~" } else { "~" };
                 self.op(op, None, Some(self.expr(expr)?), pat)?
             }
+            E::AnyOp { right, .. } | E::AllOp { right, .. } if matches!(right.as_ref(), E::Subquery(_)) => self.sublink(e)?,
             E::AnyOp {
                 left,
                 compare_op,
@@ -608,11 +663,30 @@ impl Analyzer<'_, '_> {
                 let args = vec![self.expr(time_zone)?, self.expr(timestamp)?];
                 self.sql_call("timezone", args, e)?
             }
+            E::Interval(iv)
+                if iv.leading_field.is_none()
+                    && iv.last_field.is_none()
+                    && iv.leading_precision.is_none()
+                    && iv.fractional_seconds_precision.is_none() =>
+            {
+                let lit = match iv.value.as_ref() {
+                    E::Value(v) => match &v.value {
+                        SqlValue::SingleQuotedString(s) => s.clone(),
+                        _ => return Err(not_read(e)),
+                    },
+                    _ => return Err(not_read(e)),
+                };
+                self.coerce_to_target(unknown(Some(lit)), cat::INTERVAL, -1, Context::Explicit, Form::Explicit)?
+            }
             E::Ceil { expr, .. } | E::Floor { expr, .. } => {
                 let name = if matches!(e, E::Ceil { .. }) { "ceil" } else { "floor" };
                 self.func_call(name, None, vec![self.expr(expr)?], e)?
             }
-            E::Function(f) => self.function(f, e)?,
+            E::Function(f) => match self.query_function(f, e)? {
+                Some(n) => n,
+                None => self.function(f, e)?,
+            },
+            E::Subquery(_) | E::Exists { .. } | E::InSubquery { .. } => self.sublink(e)?,
             E::CompoundFieldAccess { root, access_chain } => {
                 let mut node = self.expr(root)?;
                 let mut subs: Vec<(Option<Node>, Option<Node>, bool)> = Vec::new();
@@ -704,6 +778,11 @@ impl Analyzer<'_, '_> {
     }
 
     fn column(&self, names: &[String], e: &Expr) -> Result<Node> {
+        if let Some(s) = self.scope {
+            return s
+                .column(names)
+                .ok_or_else(|| Error::new(format!("column \"{}\" does not exist: {e}", names.join("."))));
+        }
         let name = names.last().map(String::as_str).unwrap_or("");
         if names.len() == 1 && name == "value" {
             if let Some((ty, typmod)) = self.value {
@@ -715,6 +794,9 @@ impl Analyzer<'_, '_> {
                 attno: c.attno,
                 ty: c.ty,
                 typmod: c.typmod,
+                rel: 1,
+                up: 0,
+                syn: (1, c.attno),
             }),
             None => Err(Error::new(format!("column \"{name}\" does not exist: {e}"))),
         }
@@ -1805,7 +1887,7 @@ impl Analyzer<'_, '_> {
             if actual.len() == n {
                 forms.push((i, p.args.clone(), false));
             }
-            if p.variadic != 0 && actual.len() + 1 >= n && n > 0 {
+            if p.variadic != 0 && actual.len() >= n && n > 0 {
                 let mut a = p.args[..n - 1].to_vec();
                 let elem = if p.variadic == cat::ANY { cat::ANY } else { p.variadic };
                 while a.len() < actual.len() {
@@ -1996,7 +2078,7 @@ fn numeric_text(lit: &str, negative: bool) -> String {
 }
 
 /// The operator's name a binary operator of sqlparser's is written with.
-fn binary_name(op: &BinaryOperator) -> Option<String> {
+pub(crate) fn binary_name(op: &BinaryOperator) -> Option<String> {
     use BinaryOperator as B;
     Some(
         match op {

@@ -1,7 +1,8 @@
 //! The deparsers over a snail's catalog, each printing as PostgreSQL 18.6 prints the same object:
 //! pg_get_expr over a DEFAULT, a generation, a CHECK and an index's trees, pg_get_constraintdef and
-//! pg_get_indexdef, plain and pretty; a parse tree's column read only through pg_get_expr. Every
-//! expected string was printed by 18.6 after the same DDL.
+//! pg_get_indexdef, plain and pretty; pg_get_viewdef by OID and by name, plain, pretty and unwrapped;
+//! pg_get_ruledef of a view's rule and of a built-in one; a parse tree's column read only through
+//! pg_get_expr. Every expected string was printed by 18.6 after the same DDL.
 
 mod weather;
 
@@ -192,5 +193,131 @@ fn a_columns_type_and_typmod_and_a_domains_base_are_postgresqls() {
             "SELECT typbasetype::regtype::text, typcategory::text FROM pg_type WHERE typname = 'ints'"
         ),
         [s(&["integer[]", "A"])]
+    );
+}
+
+const VIEWS: &str = "CREATE TABLE t (id bigint PRIMARY KEY, n text NOT NULL DEFAULT 'x', q integer, \
+     c numeric(8,2)); \
+     CREATE TABLE s.u (id bigint PRIMARY KEY, t_id bigint REFERENCES t (id), k integer UNIQUE); \
+     CREATE VIEW tv AS SELECT t.id, t.n FROM t WHERE t.c > 1; \
+     CREATE VIEW s.uv (key, total) AS SELECT u.t_id, count(*) FROM s.u u JOIN t ON t.id = u.t_id \
+     GROUP BY u.t_id; \
+     CREATE VIEW s.unioned AS SELECT id FROM t UNION ALL SELECT k FROM s.u ORDER BY 1 LIMIT 3; \
+     CREATE VIEW s.sub AS SELECT x.id FROM (SELECT t.id FROM t WHERE EXISTS \
+     (SELECT 1 FROM t t2 WHERE t2.q = t.q)) x; \
+     CREATE VIEW s.again AS SELECT t.id FROM t WHERE t.q IN (SELECT t.q FROM t); \
+     CREATE VIEW s.ranked AS SELECT u.id, rank() OVER (ORDER BY u.k DESC) AS r FROM s.u u; \
+     CREATE VIEW s.mixed AS (SELECT id FROM t UNION SELECT k FROM s.u) EXCEPT SELECT t_id FROM s.u; \
+     CREATE VIEW s.dated AS SELECT t.id, now() - interval '1 day' AS since FROM t;";
+
+fn opened_views(name: &str) -> Snail {
+    let path = tmp(&format!("{name}.snail"));
+    let catalog = Catalog::parse(VIEWS).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    Snail::open(&path).unwrap()
+}
+
+#[test]
+fn a_view_prints_as_pg_get_viewdef_prints_it_plain_and_pretty() {
+    let mut snail = opened_views("dep-views");
+    let got = rows(
+        &mut snail,
+        "SELECT c.relname::text, pg_get_viewdef(c.oid), pg_get_viewdef(c.oid, true) FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'v' \
+         AND n.nspname IN ('public', 's') ORDER BY c.relname",
+    );
+    assert_eq!(
+        got,
+        vec![
+            s(&[
+                "again",
+                " SELECT id\n   FROM t\n  WHERE (q IN ( SELECT t_1.q\n           FROM t t_1));",
+                " SELECT id\n   FROM t\n  WHERE (q IN ( SELECT t_1.q\n           FROM t t_1));",
+            ]),
+            s(&[
+                "dated",
+                " SELECT id,\n    (now() - '1 day'::interval) AS since\n   FROM t;",
+                " SELECT id,\n    now() - '1 day'::interval AS since\n   FROM t;",
+            ]),
+            s(&[
+                "mixed",
+                "(\n         SELECT t.id\n           FROM t\n        UNION\n         SELECT u.k AS id\n           FROM s.u\n) EXCEPT\n SELECT u.t_id AS id\n   FROM s.u;",
+                "(\n         SELECT t.id\n           FROM t\n        UNION\n         SELECT u.k AS id\n           FROM s.u\n) EXCEPT\n SELECT u.t_id AS id\n   FROM s.u;",
+            ]),
+            s(&[
+                "ranked",
+                " SELECT id,\n    rank() OVER (ORDER BY k DESC) AS r\n   FROM s.u u;",
+                " SELECT id,\n    rank() OVER (ORDER BY k DESC) AS r\n   FROM s.u u;",
+            ]),
+            s(&[
+                "sub",
+                " SELECT id\n   FROM ( SELECT t.id\n           FROM t\n          WHERE (EXISTS ( SELECT 1\n                   FROM t t2\n                  WHERE (t2.q = t.q)))) x;",
+                " SELECT id\n   FROM ( SELECT t.id\n           FROM t\n          WHERE (EXISTS ( SELECT 1\n                   FROM t t2\n                  WHERE t2.q = t.q))) x;",
+            ]),
+            s(&[
+                "tv",
+                " SELECT id,\n    n\n   FROM t\n  WHERE (c > (1)::numeric);",
+                " SELECT id,\n    n\n   FROM t\n  WHERE c > 1::numeric;",
+            ]),
+            s(&[
+                "unioned",
+                " SELECT t.id\n   FROM t\nUNION ALL\n SELECT u.k AS id\n   FROM s.u\n  ORDER BY 1\n LIMIT 3;",
+                " SELECT t.id\n   FROM t\nUNION ALL\n SELECT u.k AS id\n   FROM s.u\n  ORDER BY 1\n LIMIT 3;",
+            ]),
+            s(&[
+                "uv",
+                " SELECT u.t_id AS key,\n    count(*) AS total\n   FROM (s.u u\n     JOIN t ON ((t.id = u.t_id)))\n  GROUP BY u.t_id;",
+                " SELECT u.t_id AS key,\n    count(*) AS total\n   FROM s.u u\n     JOIN t ON t.id = u.t_id\n  GROUP BY u.t_id;",
+            ]),
+        ]
+    );
+}
+
+#[test]
+fn a_view_is_found_by_name_unwrapped_by_minus_one_and_a_table_has_no_definition_and_a_built_in_is_carried() {
+    let mut snail = opened_views("dep-views-named");
+    let got = rows(
+        &mut snail,
+        "SELECT pg_get_viewdef('s.uv'), pg_get_viewdef('tv', true), \
+         pg_get_viewdef('s.uv'::regclass, -1), pg_get_viewdef('t'::regclass), \
+         (SELECT definition FROM pg_views WHERE viewname = 'tv'), \
+         (SELECT view_definition FROM information_schema.views WHERE table_name = 'tv'), \
+         pg_get_viewdef('pg_available_extensions'), pg_get_viewdef('pg_catalog.pg_available_extensions', true)",
+    );
+    assert_eq!(
+        got,
+        vec![vec![
+            Some(" SELECT u.t_id AS key,\n    count(*) AS total\n   FROM (s.u u\n     JOIN t ON ((t.id = u.t_id)))\n  GROUP BY u.t_id;".into()),
+            Some(" SELECT id,\n    n\n   FROM t\n  WHERE c > 1::numeric;".into()),
+            Some(" SELECT u.t_id AS key, count(*) AS total\n   FROM s.u u\n     JOIN t ON t.id = u.t_id\n  GROUP BY u.t_id;".into()),
+            None,
+            Some(" SELECT id,\n    n\n   FROM t\n  WHERE (c > (1)::numeric);".into()),
+            Some(" SELECT id,\n    n\n   FROM t\n  WHERE (c > (1)::numeric);".into()),
+            Some(" SELECT e.name,\n    e.default_version,\n    x.extversion AS installed_version,\n    e.comment\n   FROM (pg_available_extensions() e(name, default_version, comment)\n     LEFT JOIN pg_extension x ON ((e.name = x.extname)));".into()),
+            Some(" SELECT e.name,\n    e.default_version,\n    x.extversion AS installed_version,\n    e.comment\n   FROM pg_available_extensions() e(name, default_version, comment)\n     LEFT JOIN pg_extension x ON e.name = x.extname;".into()),
+        ]]
+    );
+}
+
+#[test]
+fn a_views_rule_prints_as_pg_get_ruledef_prints_it_and_a_built_in_rule_is_carried() {
+    let mut snail = opened_views("dep-rules");
+    let got = rows(
+        &mut snail,
+        "SELECT pg_get_ruledef(r.oid), pg_get_ruledef(r.oid, true) FROM pg_rewrite r \
+         WHERE r.ev_class = 'tv'::regclass OR r.rulename = 'pg_settings_n' ORDER BY r.rulename",
+    );
+    assert_eq!(
+        got,
+        vec![
+            s(&[
+                "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO public.tv DO INSTEAD  SELECT id,\n    n\n   FROM t\n  WHERE (c > (1)::numeric);",
+                "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO tv DO INSTEAD  SELECT id,\n    n\n   FROM t\n  WHERE c > 1::numeric;",
+            ]),
+            s(&[
+                "CREATE RULE pg_settings_n AS\n    ON UPDATE TO pg_catalog.pg_settings DO INSTEAD NOTHING;",
+                "CREATE RULE pg_settings_n AS\n    ON UPDATE TO pg_settings DO INSTEAD NOTHING;",
+            ]),
+        ]
     );
 }

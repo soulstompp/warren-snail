@@ -2115,7 +2115,8 @@ impl Draft {
         let name = crate::oids::full(&v.name);
         out.push(O::Class(name.clone()));
         out.push(O::Type(name.clone()));
-        out.push(O::Array(name));
+        out.push(O::Array(name.clone()));
+        out.push(O::Rule(name));
     }
 
     fn function_object(f: &Function) -> crate::oids::Object {

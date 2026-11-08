@@ -49,6 +49,18 @@ fn definition(key: &str, release: u8) -> Option<String> {
         .and_then(|(_, t)| crate::pgcatalog::unescaped_text(t))
 }
 
+/// A built-in view's text as pg_get_viewdef writes it, pretty or plain, under a release.
+pub(crate) fn carried_viewdef(full: &str, release: u8, pretty: bool) -> Option<String> {
+    let key = if pretty { format!("view {full}") } else { format!("plain {full}") };
+    definition(&key, release)
+}
+
+/// A built-in rule's text other than a view's, `schema.relation.rule`, as pg_get_ruledef writes it.
+pub(crate) fn carried_ruledef(full: &str, release: u8, pretty: bool) -> Option<String> {
+    let key = if pretty { format!("rule {full}") } else { format!("plain rule {full}") };
+    definition(&key, release)
+}
+
 /// The view a relation's name names, `schema.name`: pg_catalog's searched first for a name alone;
 /// none for any other name.
 pub(crate) fn view_named(name: &str) -> Option<String> {
@@ -357,6 +369,15 @@ pub(crate) fn system_view(release: u8, name: &str) -> Result<Option<(Query, Vec<
 /// base types, information_schema's functions inlined.
 fn rewrite(q: &mut Query, release: u8) -> Result<Vec<Option<String>>> {
     let mut refused: Vec<Option<String>> = Vec::new();
+    // A privilege test holds for whoever opens a file, so what it reads decides no column.
+    let _ = sqlparser::ast::visit_expressions_mut(q, |e| {
+        if let Expr::Function(f) = e {
+            if privilege_test(&function_name(f)) {
+                *e = Expr::Value(Value::Boolean(true).into());
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
     fn selects<'a>(body: &'a mut SetExpr, out: &mut Vec<&'a mut sqlparser::ast::Select>) {
         match body {
             SetExpr::Select(s) => out.push(s),

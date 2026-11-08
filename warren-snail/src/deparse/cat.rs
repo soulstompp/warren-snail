@@ -91,6 +91,8 @@ pub(crate) struct Proc {
     pub result: u32,
     pub variadic: u32,
     pub nargdefaults: usize,
+    /// prokind: f a function, a an aggregate, w a window function, p a procedure.
+    pub kind: char,
 }
 
 /// A row of pg_cast.
@@ -166,6 +168,7 @@ fn proc_row(r: &Raw) -> Proc {
         result: num(r, "prorettype"),
         variadic: num(r, "provariadic"),
         nargdefaults: num(r, "pronargdefaults"),
+        kind: letter(r, "prokind"),
     }
 }
 

@@ -1819,8 +1819,8 @@ pg_get_publication_tables(text[])	16-19	server	WAL and replication
 pg_get_publication_tables(text[],oid)	19	server	WAL and replication
 pg_get_replica_identity_index(regclass)		server	the server's catalog
 pg_get_replication_slots()		server	WAL and replication
-pg_get_ruledef(oid)		server	the server's catalog
-pg_get_ruledef(oid,boolean)		server	the server's catalog
+pg_get_ruledef(oid)		type	the file's catalog
+pg_get_ruledef(oid,boolean)		type	the file's catalog
 pg_get_sequence_data(regclass)	18-19	server	the server's catalog
 pg_get_serial_sequence(text,text)		type	sequences
 pg_get_shmem_allocations()		server	the server itself
@@ -1831,11 +1831,11 @@ pg_get_statisticsobjdef_expressions(oid)		server	the server's catalog
 pg_get_triggerdef(oid)		server	the server's catalog
 pg_get_triggerdef(oid,boolean)		server	the server's catalog
 pg_get_userbyid(oid)		server	roles and privileges
-pg_get_viewdef(oid)		server	the server's catalog
-pg_get_viewdef(oid,boolean)		server	the server's catalog
-pg_get_viewdef(oid,integer)		server	the server's catalog
-pg_get_viewdef(text)		server	the server's catalog
-pg_get_viewdef(text,boolean)		server	the server's catalog
+pg_get_viewdef(oid)		type	the file's catalog
+pg_get_viewdef(oid,boolean)		type	the file's catalog
+pg_get_viewdef(oid,integer)		type	the file's catalog
+pg_get_viewdef(text)		type	the file's catalog
+pg_get_viewdef(text,boolean)		type	the file's catalog
 pg_get_wait_events()	17-19	server	the server itself
 pg_get_wal_replay_pause_state()		server	WAL and replication
 pg_get_wal_resource_managers()	15-19	server	WAL and replication

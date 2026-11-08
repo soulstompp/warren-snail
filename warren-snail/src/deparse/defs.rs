@@ -250,6 +250,7 @@ fn printed(cat: &Cat, t: &Table, rel: u32, node: &Node, pretty: bool) -> Result<
         level: 0,
         buf: String::new(),
         relations: vec![(t.columns.iter().map(|c| c.name.clone()).collect(), None)],
+        q: Default::default(),
     };
     p.expr(node, false)?;
     Ok(p.buf)
@@ -260,6 +261,7 @@ fn analyzer<'c, 'a>(cat: &'c Cat<'a>, t: &Table) -> Analyzer<'c, 'a> {
         cat,
         columns: super::columns_of(cat, t),
         value: None,
+        scope: None,
     }
 }
 
@@ -389,6 +391,7 @@ fn index_text(cat: &Cat, ix: &Index, colno: usize, pretty: bool) -> Result<Strin
                     level: 0,
                     buf: String::new(),
                     relations: Vec::new(),
+                    q: Default::default(),
                 };
                 let found = a.op_lookup(op, 'b', keytype, keytype);
                 let shown = found.map_or_else(|| op.clone(), |o| p.operator_name(o, keytype, keytype));
@@ -572,6 +575,7 @@ pub(crate) fn constraintdef(cat: &Cat, oid: u32, pretty: bool) -> Result<Option<
                 cat,
                 columns: Vec::new(),
                 value: Some((base, typmod)),
+                scope: None,
             };
             let node = a.boolean(a.expr(&k.check)?)?;
             if !k.valid {
@@ -584,6 +588,7 @@ pub(crate) fn constraintdef(cat: &Cat, oid: u32, pretty: bool) -> Result<Option<
                 level: 0,
                 buf: String::new(),
                 relations: Vec::new(),
+                q: Default::default(),
             };
             p.expr(&node, false)?;
             format!("CHECK ({})", p.buf)
