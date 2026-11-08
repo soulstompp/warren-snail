@@ -194,3 +194,45 @@ fn a_read_prunes_a_block_on_the_first_page_its_dead_rows_waste_and_never_before(
     let (_, round) = w.ask(q, None).unwrap();
     assert_eq!(round.blocks_pruned, 0, "{round:?}");
 }
+
+/// The INSERT of `n` records of 80 bytes into a data set, from place `from`.
+#[cfg(feature = "standalone")]
+fn records(data_set: &str, from: i64, n: i64) -> String {
+    let bytes = "ab".repeat(80);
+    let rows: Vec<String> = (from..from + n)
+        .map(|seq| format!("('{data_set}', {seq}, '\\x{bytes}')"))
+        .collect();
+    format!("INSERT INTO s.data_record VALUES {}", rows.join(", "))
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_block_split_after_its_neighbour_keeps_the_bound_its_neighbour_ends_below() {
+    // WARREN.BIG's 5,000 records lie in blocks of 512 (the first of 1,023), the last holding its
+    // tail and WARREN.ONE's one. WARREN.VARB's 2,000 split that last block; its new lower bound is
+    // also the upper bound of the block before it, which holds WARREN.BIG's 3,584 to 4,095, so a
+    // read of WARREN.BIG by its name must still reach that block.
+    let path = tmp("split-neighbour.snail");
+    let catalog = Catalog::parse(
+        "CREATE TABLE s.data_record (data_set text NOT NULL, seq bigint NOT NULL, \
+         bytes bytea NOT NULL, PRIMARY KEY (data_set, seq));",
+    )
+    .unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute(&format!("{}, ('WARREN.ONE', 1, '\\xab')", records("WARREN.BIG", 1, 5000)))
+        .unwrap();
+    let big = "SELECT count(*) FROM s.data_record r WHERE r.data_set = 'WARREN.BIG'";
+    let count = |w: &mut Snail| -> Vec<Option<i64>> {
+        let (b, _) = w.ask(big, None).unwrap();
+        ints64(b.column(0).as_ref())
+    };
+    assert_eq!(count(&mut w), vec![Some(5000)]);
+    let before = w.blocks().unwrap().iter().filter(|b| b.column == "data_set").count();
+    let d = w.execute(&records("WARREN.VARB", 1, 2000)).unwrap();
+    let after = w.blocks().unwrap().iter().filter(|b| b.column == "data_set").count();
+    assert!(after > before, "the last block is split: {before} blocks, then {after}: {d:?}");
+    assert_eq!(count(&mut w), vec![Some(5000)]);
+    drop(w);
+    assert_eq!(count(&mut Snail::open(&path).unwrap()), vec![Some(5000)]);
+}

@@ -486,10 +486,11 @@ fn cut_above(key: &[KeyValue], other: &[KeyValue]) -> (Vec<KeyValue>, bool) {
 
 /// Neighbouring blocks written afresh, their first and last keys whole, given the bounds between
 /// them: each block's first the separator below it, its last the greatest key the separator above
-/// it leaves it. The first block's lower bound is `lower`, or its first key as `cut_below` cuts it
-/// beside the last block's last; the last block's upper `upper`, with whether every key sorts before
-/// it, or its last key as `cut_above` widens it beside the first block's first; each of the two its
-/// key's where that lies beyond it.
+/// it leaves it. The first block's lower bound is `lower` where its first key reaches it, `lower`
+/// being also the upper bound of the block before, which a bound cut lower would leave keys of;
+/// else its first key as `cut_below` cuts it beside the last block's last, the lower of the two.
+/// The last block's upper bound is `upper`, with whether every key sorts before it, or its last key
+/// as `cut_above` widens it beside the first block's first, where that lies beyond it.
 pub fn separate(
     entries: &mut [Entry],
     level_text: &[u32],
@@ -503,8 +504,12 @@ pub fn separate(
     let seps: Vec<Vec<KeyValue>> = (1..n)
         .map(|i| separator(&entries[i - 1].last, &entries[i].first))
         .collect();
-    let first = cut_below(&entries[0].first, &entries[n - 1].last);
-    let first = lower.map_or(first.clone(), |l| first.min(l.to_vec()));
+    let cut = cut_below(&entries[0].first, &entries[n - 1].last);
+    let first = match lower {
+        Some(l) if entries[0].first.as_slice() >= l => l.to_vec(),
+        Some(l) => cut.min(l.to_vec()),
+        None => cut,
+    };
     let (last, open) = cut_above(&entries[n - 1].last, &entries[0].first);
     let (last, open) = match upper {
         Some((u, under)) => match u.cmp(last.as_slice()) {
