@@ -5,6 +5,7 @@
 //! derived table, VALUES or a view lifted to a step of its own, a function's rows) are met by their
 //! ON, USING or NATURAL, a function's rows made for each row of the relations before it.
 
+mod apart;
 mod kept;
 mod met;
 mod recursive;
@@ -536,40 +537,61 @@ impl Parted {
 }
 
 /// The steps a question makes, in the order they are read: each WITH query, each relation lifted
-/// out of a FROM before the step that reads it, and the question last.
+/// out of a FROM before the step that reads it, and the question last. A WITH inside a step is
+/// read as steps of the question's own, under names kept apart (`apart`).
 fn steps(catalog: &Catalog, q: &Query, before: &[String]) -> Result<Vec<Step>> {
+    let mut q = q.clone();
+    apart::below(&mut q)?;
     let mut out = Vec::new();
     let mut visible: Vec<String> = before.to_vec();
-    if let Some(with) = &q.with {
-        // Under RECURSIVE each query reads any other, so they are made in the order they read
-        // each other, a query reading itself as its recursion.
-        let ordered = match with.recursive {
-            true => recursive::ordered(&with.cte_tables)?,
-            false => with.cte_tables.iter().map(|c| (c, false)).collect(),
-        };
-        for (cte, recursion) in ordered {
-            let name = crate::catalog::ident(&cte.alias.name);
-            let renames = cte
-                .alias
-                .columns
-                .iter()
-                .map(|c| crate::catalog::ident(&c.name))
-                .collect();
-            let query = (*cte.query).clone();
-            match recursion {
-                true => recursive::lift(catalog, &mut out, &visible, name.clone(), query, renames)?,
-                false => lift(catalog, &mut out, &visible, name.clone(), query, renames)?,
-            }
-            visible.push(name);
-        }
+    if let Some(with) = q.with.take() {
+        with_steps(catalog, &mut out, &mut visible, &with)?;
     }
-    let mut last = q.clone();
-    last.with = None;
-    lift(catalog, &mut out, &visible, String::new(), last, Vec::new())?;
+    lift(catalog, &mut out, &visible, String::new(), q, Vec::new())?;
     Ok(out)
 }
 
-/// One step, after the relations its FROM lifts out of itself.
+/// A WITH's queries as steps, each visible to the steps lifted after it.
+fn with_steps(
+    catalog: &Catalog,
+    out: &mut Vec<Step>,
+    visible: &mut Vec<String>,
+    with: &sqlparser::ast::With,
+) -> Result<()> {
+    // Under RECURSIVE each query reads any other, so they are made in the order they read each
+    // other, a query reading itself as its recursion.
+    let ordered = match with.recursive {
+        true => recursive::ordered(&with.cte_tables)?,
+        false => with.cte_tables.iter().map(|c| (c, false)).collect(),
+    };
+    for (cte, recursion) in ordered {
+        let name = crate::catalog::ident(&cte.alias.name);
+        let renames = cte
+            .alias
+            .columns
+            .iter()
+            .map(|c| crate::catalog::ident(&c.name))
+            .collect();
+        let query = (*cte.query).clone();
+        match recursion {
+            true => recursive::lift(catalog, out, &visible[..], name.clone(), query, renames)?,
+            false => lift(catalog, out, &visible[..], name.clone(), query, renames)?,
+        }
+        visible.push(name);
+    }
+    Ok(())
+}
+
+/// Whether a WITH query writes: INSERT, UPDATE, DELETE or MERGE.
+fn writes(q: &Query) -> bool {
+    matches!(
+        q.body.as_ref(),
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_)
+    )
+}
+
+/// One step, after the relations its FROM lifts out of itself, and the steps its own WITH makes
+/// before it.
 fn lift(
     catalog: &Catalog,
     out: &mut Vec<Step>,
@@ -578,9 +600,24 @@ fn lift(
     mut query: Query,
     renames: Vec<String>,
 ) -> Result<()> {
-    if query.with.is_some() {
-        return Err(Error::new("a WITH inside a step is not read"));
-    }
+    let seen;
+    let visible = match query.with.is_some() {
+        false => visible,
+        true => {
+            // A view's question comes here as written, so its names are kept apart here.
+            apart::all(&mut query)?;
+            let with = query.with.take().expect("a WITH");
+            if with.cte_tables.iter().any(|c| writes(&c.query)) {
+                return Err(Error::new(
+                    "WITH clause containing a data-modifying statement must be at the top level",
+                ));
+            }
+            let mut v = visible.to_vec();
+            with_steps(catalog, out, &mut v, &with)?;
+            seen = v;
+            &seen[..]
+        }
+    };
     let mut lifted = Lifted::default();
     match query.body.as_mut() {
         SetExpr::Select(s) => {
@@ -3478,7 +3515,7 @@ impl Making<'_, '_> {
         if step.renames.len() > m.rel.names.len() {
             return Err(Error::new(format!(
                 "WITH query \"{}\" has {} columns available but {} columns specified",
-                step.name.trim_start_matches(MERGED),
+                apart::written(&step.name),
                 m.rel.names.len(),
                 step.renames.len()
             )));
@@ -4410,6 +4447,10 @@ pub(super) fn several(catalog: &Catalog, q: &Query) -> bool {
             return true;
         }
         for cte in &with.cte_tables {
+            // A step's own WITH makes steps of its own.
+            if cte.query.with.is_some() {
+                return true;
+            }
             note(cte.query.body.as_ref(), &steps, &mut tables);
             steps.push(crate::catalog::ident(&cte.alias.name));
         }

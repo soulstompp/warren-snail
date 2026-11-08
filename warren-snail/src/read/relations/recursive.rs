@@ -84,7 +84,11 @@ pub(super) fn lift(
     query: Query,
     renames: Vec<String>,
 ) -> Result<()> {
+    let shown = super::apart::written(&name).to_string();
     let mut query = query;
+    // The query's own WITH, written before its terms or before the parentheses around them: both
+    // terms read it. A WITH on each side of the parentheses is refused before this (`apart`).
+    let mut own = query.with.take();
     while let SetExpr::Query(inner) = query.body.as_ref() {
         if query.order_by.is_some()
             || query.limit_clause.is_some()
@@ -94,6 +98,9 @@ pub(super) fn lift(
             break;
         }
         query = (**inner).clone();
+        if let Some(w) = query.with.take() {
+            own = Some(w);
+        }
     }
     let SetExpr::SetOperation {
         left,
@@ -103,12 +110,18 @@ pub(super) fn lift(
     } = query.body.as_ref()
     else {
         return Err(Error::new(format!(
-            "recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] \
+            "recursive query \"{shown}\" does not have the form non-recursive-term UNION [ALL] \
              recursive-term"
         )));
     };
-    if query.with.is_some() {
-        return Err(Error::new("a WITH inside a step is not read"));
+    if let Some(w) = &own {
+        for c in &w.cte_tables {
+            if named(&c.query.to_string())?.iter().any(|(n, _)| *n == name) {
+                return Err(Error::new(format!(
+                    "recursive reference to query \"{shown}\" must not appear within a subquery"
+                )));
+            }
+        }
     }
     if query.order_by.is_some() {
         return Err(Error::new(
@@ -138,7 +151,7 @@ pub(super) fn lift(
     };
     if named(&left.to_string())?.iter().any(|(n, _)| *n == name) {
         return Err(Error::new(format!(
-            "recursive reference to query \"{name}\" must not appear within its non-recursive term"
+            "recursive reference to query \"{shown}\" must not appear within its non-recursive term"
         )));
     }
     let mut walk = Walk {
@@ -152,7 +165,7 @@ pub(super) fn lift(
         .any(|(n, sub)| *sub && *n == name)
     {
         return Err(Error::new(format!(
-            "recursive reference to query \"{name}\" must not appear within a subquery"
+            "recursive reference to query \"{shown}\" must not appear within a subquery"
         )));
     }
     if walk.aggregated {
@@ -160,8 +173,18 @@ pub(super) fn lift(
             "aggregate functions are not allowed in a recursive query's recursive term",
         ));
     }
-    let left = arm_of(catalog, out, visible, left)?;
-    let mut seen = visible.to_vec();
+    // The query's own WITH, made once before both terms.
+    let mut theirs = visible.to_vec();
+    if let Some(w) = &own {
+        if w.cte_tables.iter().any(|c| super::writes(&c.query)) {
+            return Err(Error::new(
+                "WITH clause containing a data-modifying statement must be at the top level",
+            ));
+        }
+        super::with_steps(catalog, out, &mut theirs, w)?;
+    }
+    let left = arm_of(catalog, out, &theirs, left)?;
+    let mut seen = theirs;
     seen.push(name.clone());
     let start = out.len();
     let right = arm_of(catalog, out, &seen, right)?;
@@ -274,14 +297,14 @@ impl Walk<'_> {
                 if let Some(place) = place {
                     return Err(Error::new(format!(
                         "recursive reference to query \"{}\" must not appear within {place}",
-                        self.name
+                        super::apart::written(self.name)
                     )));
                 }
                 self.found += 1;
                 if self.found > 1 {
                     return Err(Error::new(format!(
                         "recursive reference to query \"{}\" must not appear more than once",
-                        self.name
+                        super::apart::written(self.name)
                     )));
                 }
                 Ok(true)
@@ -483,6 +506,7 @@ pub(in crate::read) fn make(
         .as_ref()
         .ok_or_else(|| Error::new("a recursion's terms were not lifted"))?;
     let name = &step.name;
+    let shown = super::apart::written(name);
     let seed = met(&rec.left, &making.made, &making.casings)?;
     let n = seed.types.len();
     // Each column typed as the non-recursive term types it, an untyped literal or NULL as text.
@@ -515,7 +539,7 @@ pub(in crate::read) fn make(
     let mut names = seed.names.clone();
     if step.renames.len() > names.len() {
         return Err(Error::new(format!(
-            "WITH query \"{name}\" has {} columns available but {} columns specified",
+            "WITH query \"{shown}\" has {} columns available but {} columns specified",
             names.len(),
             step.renames.len()
         )));
@@ -593,7 +617,7 @@ pub(in crate::read) fn make(
             }
             if overall != types[c] {
                 return Err(Error::new(format!(
-                    "recursive query \"{name}\" column {} has type {} in non-recursive term but \
+                    "recursive query \"{shown}\" column {} has type {} in non-recursive term but \
                      type {} overall",
                     c + 1,
                     types[c].pg_name(),
@@ -611,7 +635,7 @@ pub(in crate::read) fn make(
                         _ => crate::read::collate::DEFAULT.to_string(),
                     };
                     return Err(Error::new(format!(
-                        "recursive query \"{name}\" column {} has collation \"{declared}\" in \
+                        "recursive query \"{shown}\" column {} has collation \"{declared}\" in \
                          non-recursive term but collation \"{k}\" overall",
                         c + 1
                     )));
@@ -625,7 +649,7 @@ pub(in crate::read) fn make(
         total += added.len();
         if total > MOST_ROWS {
             return Err(Error::new(format!(
-                "recursive query \"{name}\" made more than {MOST_ROWS} rows: a recursion is read \
+                "recursive query \"{shown}\" made more than {MOST_ROWS} rows: a recursion is read \
                  only where it ends within a row group's rows"
             )));
         }
