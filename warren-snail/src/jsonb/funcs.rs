@@ -86,20 +86,30 @@ fn encode_date(d: i32) -> String {
     times::date_out(d)
 }
 
-/// An instant as `JsonEncodeDateTime` writes it under TimeZone UTC: as ISO 8601 writes it, a `T`
-/// between its date and its time, a timestamptz's zone as `+00:00`, the infinities as words.
+/// An instant as `JsonEncodeDateTime` writes it: as ISO 8601 writes it, a `T` between its date and
+/// its time, a timestamptz on the statement zone's clock with the zone's offset as `+05:30`, its
+/// seconds where it has some, the infinities as words.
 fn encode_instant(t: i64, zoned: bool) -> String {
-    let s = times::timestamp_out(t);
     if t == i64::MIN || t == i64::MAX {
-        return s;
+        return times::timestamp_out(t);
     }
+    let (local, east) = match zoned {
+        true => times::local_of(t).unwrap_or((t, 0)),
+        false => (t, 0),
+    };
+    let s = times::timestamp_out(local);
     let (body, era) = match s.strip_suffix(" BC") {
         Some(b) => (b, " BC"),
         None => (s.as_str(), ""),
     };
     let mut out = body.replacen(' ', "T", 1);
     if zoned {
-        out.push_str("+00:00");
+        let abs = east.unsigned_abs();
+        out.push(if east >= 0 { '+' } else { '-' });
+        out.push_str(&format!("{:02}:{:02}", abs / 3600, abs % 3600 / 60));
+        if abs % 60 != 0 {
+            out.push_str(&format!(":{:02}", abs % 60));
+        }
     }
     out.push_str(era);
     out

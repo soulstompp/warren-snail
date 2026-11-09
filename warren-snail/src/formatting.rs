@@ -1318,19 +1318,22 @@ fn instant_to_char(t: i64, fmt: &str, zoned: bool) -> Result<Option<String>> {
     if fmt.is_empty() || t == i64::MIN || t == i64::MAX {
         return Ok(None);
     }
-    let pg = t
+    // A timestamptz is taken apart on the statement zone's clock, its offset and abbreviation that
+    // zone's.
+    let (local, east, abbrev) = match zoned {
+        true => {
+            let (local, east) = crate::times::local_of(t)?;
+            (local, east, Some(crate::zones::session_abbrev(t.div_euclid(USECS_PER_SEC))?))
+        }
+        false => (t, 0, None),
+    };
+    let pg = local
         .checked_sub(EPOCH_SHIFT)
         .ok_or_else(|| err("timestamp out of range"))?;
-    let (tm, fsec) = instant_tm(pg)?;
+    let (mut tm, fsec) = instant_tm(pg)?;
+    tm.gmtoff = east;
     let nodes = parse_format(fmt.as_bytes(), true, None)?;
-    dch_to_char(
-        &nodes,
-        false,
-        &tm,
-        fsec,
-        if zoned { Some("UTC") } else { None },
-    )
-    .map(Some)
+    dch_to_char(&nodes, false, &tm, fsec, abbrev.as_deref()).map(Some)
 }
 
 /// `to_char(timestamp, text)`; none where the template is empty or the instant infinite.
@@ -1338,8 +1341,8 @@ pub fn to_char_timestamp(t: i64, fmt: &str) -> Result<Option<String>> {
     instant_to_char(t, fmt, false)
 }
 
-/// `to_char(timestamptz, text)` under TimeZone UTC; none where the template is empty or the
-/// instant infinite.
+/// `to_char(timestamptz, text)` on the statement zone's clock; none where the template is empty or
+/// the instant infinite.
 pub fn to_char_timestamptz(t: i64, fmt: &str) -> Result<Option<String>> {
     instant_to_char(t, fmt, true)
 }
@@ -2376,14 +2379,24 @@ fn pg_instant_text(pg: i64) -> String {
 }
 
 /// `to_timestamp(text, text)`: the instant the text is under the template, in microseconds since
-/// 1970-01-01 UTC; the zone the text names, else UTC.
+/// 1970-01-01 UTC; the zone the text names, else the statement's.
 pub fn to_timestamp_text(s: &str, fmt: &str) -> Result<i64> {
     let (tm, fsec, zone, fprec) = do_to_timestamp(s, fmt, false)?;
-    let tz = zone.unwrap_or(0);
     let out = || err("timestamp out of range");
     if !valid_julian(tm.year, tm.mon) {
         return Err(out());
     }
+    let tz = match zone {
+        Some(z) => z,
+        None => crate::times::zone_offset_at(
+            tm.year,
+            tm.mon,
+            tm.mday,
+            tm.hour,
+            tm.min,
+            tm.sec,
+        )?,
+    };
     let date = i64::from(date2j(tm.year, tm.mon, tm.mday)) - POSTGRES_EPOCH_JDATE;
     let time = ((i64::from(tm.hour) * 60 + i64::from(tm.min)) * 60 + i64::from(tm.sec))
         * USECS_PER_SEC

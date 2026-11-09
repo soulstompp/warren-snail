@@ -915,6 +915,7 @@ impl Snail {
         }
         let _handed = super::handed::holding(&self.functions);
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
+        let _zoned = self.in_zone();
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _timing = self.timing();
@@ -4176,6 +4177,14 @@ impl Snail {
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         crate::file::holds_catalog(self.reader.format(), &catalog)?;
+        // Under a zone other than UTC a declaration makes no literal its zone would read
+        // otherwise; the file held none before it.
+        if !crate::zones::session_is_utc() {
+            if let Some(what) = super::folded::unfolded(&catalog) {
+                let zone = self.session_zone_name();
+                return Err(super::folded::refusal(&what, &zone));
+            }
+        }
         for t in &catalog.tables {
             crate::file::holds(self.reader.format(), t)?;
             let old = self.catalog.tables.iter().find(|x| x.name == t.name);

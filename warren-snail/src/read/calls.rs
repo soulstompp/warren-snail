@@ -979,19 +979,22 @@ fn timestamptz(t: i64) -> Value {
     Value::Scalar(ColumnType::Timestamptz, t)
 }
 
-/// The machine's clock as PostgreSQL's timeofday writes it, under UTC.
-fn timeofday(micros: i64) -> String {
+/// The machine's clock as PostgreSQL's timeofday writes it, on the statement zone's clock with the
+/// zone's abbreviation.
+fn timeofday(micros: i64) -> Result<String> {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    let abbrev = crate::zones::session_abbrev(micros.div_euclid(1_000_000))?;
+    let micros = crate::times::local_of(micros)?.0;
     let (year, month, day, hour, min, sec, usec) = crate::times::civil(micros);
     let days = micros.div_euclid(crate::times::MICROS_PER_DAY);
-    format!(
-        "{} {} {day:02} {hour:02}:{min:02}:{sec:02}.{usec:06} {year} UTC",
+    Ok(format!(
+        "{} {} {day:02} {hour:02}:{min:02}:{sec:02}.{usec:06} {year} {abbrev}",
         DAYS[days.rem_euclid(7) as usize],
         MONTHS[(month - 1) as usize]
-    )
+    ))
 }
 
 /// The value of a function of time over its arguments' values, `now` the statement's clock: `ret`
@@ -1016,22 +1019,27 @@ pub(super) fn time(
             return Ok(Some(timestamptz(crate::scalars::statement_clock())))
         }
         ("clock_timestamp", []) => return Ok(Some(timestamptz(crate::scalars::wall_clock()))),
-        ("timeofday", []) => return Ok(Some(Value::Text(timeofday(crate::scalars::wall_clock())))),
-        ("current_date", []) => {
-            return Ok(Some(Value::Scalar(ColumnType::Date, now.div_euclid(day))))
+        ("timeofday", []) => {
+            return Ok(Some(Value::Text(timeofday(crate::scalars::wall_clock())?)))
         }
-        ("localtimestamp", []) => return Ok(Some(timestamp(now))),
+        // The transaction's clock on the statement zone's.
+        ("current_date", []) => {
+            let local = t::local_of(now)?.0;
+            return Ok(Some(Value::Scalar(ColumnType::Date, local.div_euclid(day))));
+        }
+        ("localtimestamp", []) => return Ok(Some(timestamp(t::local_of(now)?.0))),
         ("localtime", []) => {
             return Ok(Some(Value::Scalar(
                 ColumnType::Time(None),
-                now.rem_euclid(day),
+                t::local_of(now)?.0.rem_euclid(day),
             )))
         }
         ("current_time", []) => {
+            let (local, east) = t::local_of(now)?;
             return Ok(Some(Value::Scalar(
                 ColumnType::Timetz(None),
-                crate::scalars::timetz_key(now.rem_euclid(day), 0),
-            )))
+                crate::scalars::timetz_key(local.rem_euclid(day), -(east as i32)),
+            )));
         }
         _ => {}
     }
@@ -1079,14 +1087,19 @@ pub(super) fn time(
         )?),
         ("age", [a, b]) => {
             let wide = tz(a) || tz(b) || ret.is_none();
-            Value::Interval(t::timestamp_age(
-                instant(a, wide, now)?,
-                instant(b, wide, now)?,
-            )?)
+            let (a, b) = (instant(a, wide, now)?, instant(b, wide, now)?);
+            Value::Interval(match wide {
+                true => t::timestamptz_age(a, b)?,
+                false => t::timestamp_age(a, b)?,
+            })
         }
+        // age(x) is age(current_date, x), the date cast to x's type.
         ("age", [x]) => {
-            let midnight = now.div_euclid(day) * day;
-            Value::Interval(t::timestamp_age(midnight, instant(x, tz(x), now)?)?)
+            let today = t::local_of(now)?.0.div_euclid(day) as i32;
+            Value::Interval(match tz(x) {
+                true => t::timestamptz_age(t::date_timestamptz(today)?, instant(x, true, now)?)?,
+                false => t::timestamp_age(t::date_timestamp(today)?, instant(x, false, now)?)?,
+            })
         }
         ("make_date", [y, m, d]) => {
             let d = t::make_date(int32(y)?, int32(m)?, int32(d)?)?;
@@ -1176,7 +1189,10 @@ pub(super) fn time(
         }
         ("timestamptz", [Value::Scalar(ColumnType::Date, d), Value::Scalar(ty, k)]) => {
             match super::clock::base(*ty) {
-                ColumnType::Time(_) => timestamptz(t::datetime_pl(*d as i32, *k)?),
+                // date + time, a timestamp, cast to a timestamptz on the statement zone's clock.
+                ColumnType::Time(_) => {
+                    timestamptz(t::timestamp_timestamptz(t::datetime_pl(*d as i32, *k)?)?)
+                }
                 ColumnType::Timetz(_) => {
                     let (time, zone) = crate::scalars::timetz_parts(*k);
                     timestamptz(t::datetimetz_pl(*d as i32, time, zone)?)

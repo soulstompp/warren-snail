@@ -170,6 +170,13 @@ pub struct Snails {
 }
 
 impl Snails {
+    /// An answer's rows as `answer_text` writes them, under the session's TimeZone as it stands,
+    /// which stands alike on every snail.
+    pub fn text_of(&self, batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>> {
+        let _zoned = self.snails[0].in_zone();
+        super::answer_text(batch)
+    }
+
     /// Opens several snails together to read. Built `standalone`, each holds `HELD_BYTES` of the
     /// pages its rounds read.
     pub fn open(paths: &[&Path]) -> Result<Snails> {
@@ -768,6 +775,8 @@ impl Snails {
             },
             at,
         );
+        // The session's settings stand alike on every snail; its zone is the first's.
+        let _zoned = self.snails[0].in_zone();
         let _handed = super::handed::holding(&self.functions);
         let room = self.snails[0].reader.room();
         let entered = crate::room::entered(&room);

@@ -143,8 +143,7 @@ const OWN: [(&str, &str); 17] = [
 
 /// How the snail takes the setting of that name, lower case.
 pub(crate) fn kind(release: u8, name: &str) -> Option<Kind> {
-    const FIXED: [&str; 10] = [
-        "timezone",
+    const FIXED: [&str; 9] = [
         "datestyle",
         "intervalstyle",
         "extra_float_digits",
@@ -170,7 +169,7 @@ pub(crate) fn kind(release: u8, name: &str) -> Option<Kind> {
         | "default_transaction_read_only"
         | "default_transaction_deferrable" => Kind::Mode,
         "search_path" => Kind::Path,
-        "session_replication_role" => Kind::Read,
+        "session_replication_role" | "timezone" => Kind::Read,
         "client_encoding" => Kind::Own("UTF8", "the snail answers in UTF8"),
         "server_encoding" => Kind::Preset("UTF8"),
         "integer_datetimes" => Kind::Preset("on"),
@@ -254,6 +253,10 @@ pub(crate) fn taken(
             super::statement::fixed_setting(name, &words, monetary, text_search)?;
             Taken::Nothing
         }
+        Kind::Read if name == "timezone" => Taken::Stored(match value {
+            Some(v) => Some(timezone(g.expect("a setting of the release"), v)?),
+            None => None,
+        }),
         Kind::Taken | Kind::Read => Taken::Stored(match value {
             Some(v) => Some(normalized(g.expect("a setting of the release"), v)?),
             None => None,
@@ -364,6 +367,8 @@ pub(crate) fn shown(view: &View, name: &str) -> Result<(String, String)> {
                         "SHOW {name} is refused: the snail reads no {name}"
                     )))
                 }
+                // A session begins in UTC, as PostgreSQL's side of a certificate does.
+                _ if name == "timezone" => "UTC".to_string(),
                 _ => default_shown(find(release, name).expect("a setting of the release")),
             },
         },
@@ -533,6 +538,106 @@ pub(crate) fn normalized(g: &Guc, value: &str) -> Result<String> {
         }
         _ => value.to_string(),
     })
+}
+
+/// A TimeZone as PostgreSQL's check_timezone reads it, and the name SHOW then writes: `INTERVAL
+/// '…'` an offset east of UTC in hours, minutes and seconds alone; a number, hours east of UTC;
+/// any other text a zone's name. An offset is named as pg_tzset_offset names it, `<+05:30>-05:30`.
+fn timezone(g: &Guc, value: &str) -> Result<String> {
+    let invalid = |detail: Option<&str>| {
+        Error::new(match detail {
+            Some(d) => format!("invalid value for parameter \"{}\": \"{value}\": {d}", g.name),
+            None => format!("invalid value for parameter \"{}\": \"{value}\"", g.name),
+        })
+    };
+    let named = |west: i64| {
+        crate::zones::offset_name(west)
+            .ok_or_else(|| invalid(Some("UTC timezone offset is out of range.")))
+    };
+    if value.len() >= 8 && value.is_char_boundary(8) && value[..8].eq_ignore_ascii_case("interval")
+    {
+        let quoted = value[8..].trim_start_matches(c_space);
+        let inner = quoted.strip_prefix('\'').ok_or_else(|| invalid(None))?;
+        let text = match inner.find('\'') {
+            Some(end) if end + 1 == inner.len() => &inner[..end],
+            _ => return Err(invalid(None)),
+        };
+        let v = crate::times::interval_in(text, crate::times::INTERVAL_FULL_RANGE, None)?;
+        if v.months != 0 {
+            return Err(invalid(Some("Cannot specify months in time zone interval.")));
+        }
+        if v.days != 0 {
+            return Err(invalid(Some("Cannot specify days in time zone interval.")));
+        }
+        return named(-(v.micros / 1_000_000));
+    }
+    if let Some(hours) = strtod_whole(value) {
+        // C's conversion of the double to a long, toward zero; one past a long's range, or not a
+        // number, names no zone.
+        let west = -hours * 3600.0;
+        if west.is_nan() || west.abs() >= 9.2e18 {
+            return Err(invalid(Some("UTC timezone offset is out of range.")));
+        }
+        return named(west as i64);
+    }
+    crate::zones::set_name(value)?.ok_or_else(|| invalid(None))
+}
+
+/// C's isspace in the C locale.
+fn c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
+/// The number C's strtod reads where it reads the whole of `s` but its leading blanks: a decimal or
+/// hexadecimal number, an infinity or NaN; none where something is left after it.
+fn strtod_whole(s: &str) -> Option<f64> {
+    let t = s.trim_start_matches(c_space);
+    let (neg, body) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let lower = body.to_ascii_lowercase();
+    let v = if let Some(hex) = lower.strip_prefix("0x").filter(|h| {
+        h.as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_hexdigit() || (*c == b'.' && h.len() > 1))
+    }) {
+        // A hexadecimal number: digits, a point, digits, and a binary exponent.
+        let (mant, exp) = match hex.split_once('p') {
+            Some((m, e)) => (m, Some(e)),
+            None => (hex, None),
+        };
+        let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
+        if !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_hexdigit())
+            || int.len() + frac.len() == 0
+        {
+            return None;
+        }
+        let mut v = 0f64;
+        for c in int.chars() {
+            v = v * 16.0 + c.to_digit(16)? as f64;
+        }
+        let mut scale = 1.0 / 16.0;
+        for c in frac.chars() {
+            v += c.to_digit(16)? as f64 * scale;
+            scale /= 16.0;
+        }
+        match exp {
+            Some(e) => v * 2f64.powi(e.parse::<i32>().ok()?),
+            None => v,
+        }
+    } else if ["infinity", "inf"].contains(&lower.as_str()) {
+        f64::INFINITY
+    } else if lower == "nan" {
+        f64::NAN
+    } else {
+        match c_number(body, false) {
+            Some((v, "")) if !body.starts_with(['+', '-']) => v,
+            _ => return None,
+        }
+    };
+    Some(if neg { -v } else { v })
 }
 
 /// A setting's default, as SHOW writes it.
@@ -833,7 +938,8 @@ mod tests {
 
     #[test]
     fn each_setting_is_taken_or_refused_by_its_kind() {
-        assert_eq!(kind(18, "timezone"), Some(Kind::Fixed));
+        assert_eq!(kind(18, "timezone"), Some(Kind::Read));
+        assert_eq!(kind(18, "datestyle"), Some(Kind::Fixed));
         assert_eq!(kind(18, "work_mem"), Some(Kind::Taken));
         assert_eq!(kind(18, "enable_hashjoin"), Some(Kind::Taken));
         assert!(matches!(

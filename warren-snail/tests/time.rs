@@ -367,7 +367,9 @@ fn a_setting_set_to_the_value_the_snail_answers_under_does_nothing_and_any_other
         snail.execute(s).unwrap();
     }
     for (s, says) in [
-        ("SET TimeZone = 'Europe/Lisbon'", "timezone UTC"),
+        // TimeZone is the session's: a named zone is read only under the feature zones.
+        #[cfg(not(feature = "zones"))]
+        ("SET TimeZone = 'Europe/Lisbon'", "read only under the feature zones"),
         ("SET datestyle = 'ISO, DMY'", "datestyle ISO, MDY"),
         ("SET DateStyle = 'SQL'", "datestyle ISO, MDY"),
         ("SET IntervalStyle = iso_8601", "intervalstyle postgres"),

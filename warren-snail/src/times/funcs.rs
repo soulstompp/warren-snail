@@ -221,7 +221,7 @@ fn year_part(val: i32, tm: &Tm, decade_from_zero: bool) -> Option<i64> {
 }
 
 /// timestamp_part_common and timestamptz_part_common, on PostgreSQL's count from 2000-01-01: a
-/// timestamptz's zone is UTC's.
+/// timestamptz read on the statement zone's clock, its `timezone` fields that zone's offset.
 fn instant_part(unit: &str, t: i64, zoned: bool, numeric: bool) -> Result<Option<Part>> {
     let ty = if zoned {
         TIMESTAMPTZ_TYPE
@@ -244,7 +244,11 @@ fn instant_part(unit: &str, t: i64, zoned: bool, numeric: bool) -> Result<Option
         };
     }
     if kind == UNITS {
-        let (tm, fsec) = pg_tm(t).ok_or_else(|| out_of_range("timestamp"))?;
+        let east = match zoned {
+            true => super::east_of(t.saturating_add(EPOCH_SHIFT))?,
+            false => 0,
+        };
+        let (tm, fsec) = super::pg_tm_in(t, zoned)?;
         let usec = i64::from(tm.sec) * USECS_PER_SEC + i64::from(fsec);
         let v = match val {
             DTK_MICROSEC => usec,
@@ -258,7 +262,9 @@ fn instant_part(unit: &str, t: i64, zoned: bool, numeric: bool) -> Result<Option
             }
             DTK_MINUTE => i64::from(tm.min),
             DTK_HOUR => i64::from(tm.hour),
-            DTK_TZ | DTK_TZ_MINUTE | DTK_TZ_HOUR if zoned => 0,
+            DTK_TZ if zoned => east,
+            DTK_TZ_MINUTE if zoned => east / 60 % 60,
+            DTK_TZ_HOUR if zoned => east / 3600,
             DTK_JULIAN => {
                 let jd = date2j_c(tm.year, tm.mon, tm.mday);
                 let secs = (tm.hour * MINS_PER_HOUR + tm.min) * SECS_PER_MINUTE + tm.sec;
@@ -316,7 +322,8 @@ pub fn extract_timestamp(unit: &str, t: i64) -> Result<Option<Numeric>> {
     )?))
 }
 
-/// `extract(unit FROM timestamptz)` under TimeZone UTC; none where PostgreSQL gives NULL.
+/// `extract(unit FROM timestamptz)` on the statement zone's clock; none where PostgreSQL gives
+/// NULL.
 pub fn extract_timestamptz(unit: &str, t: i64) -> Result<Option<Numeric>> {
     Ok(numeric_of(instant_part(
         unit,
@@ -336,7 +343,7 @@ pub fn date_part_timestamp(unit: &str, t: i64) -> Result<Option<f64>> {
     )?))
 }
 
-/// `date_part(unit, timestamptz)` under TimeZone UTC; none where PostgreSQL gives NULL.
+/// `date_part(unit, timestamptz)` on the statement zone's clock; none where PostgreSQL gives NULL.
 pub fn date_part_timestamptz(unit: &str, t: i64) -> Result<Option<f64>> {
     Ok(double_of(instant_part(
         unit,
@@ -753,9 +760,14 @@ fn zoned_trunc(
     instant_from_pg(r)
 }
 
-/// `date_trunc(unit, timestamptz)` under TimeZone UTC.
+/// `date_trunc(unit, timestamptz)` on the statement zone's clock.
 pub fn timestamptz_trunc(unit: &str, t: i64) -> Result<i64> {
-    zoned_trunc(unit, t, &|_| Ok(0), &|_| Ok(0))
+    zoned_trunc(
+        unit,
+        t,
+        &crate::zones::session_utc_offset,
+        &super::session_offset,
+    )
 }
 
 /// A zone's name cut to the 255 bytes PostgreSQL reads of one, at a character's end.
@@ -833,9 +845,18 @@ pub fn interval_trunc(unit: &str, v: Interval) -> Result<Interval> {
     itm2interval(&tm).ok_or_else(|| out_of_range("interval"))
 }
 
-/// `age(timestamp, timestamp)`, and `age(timestamptz, timestamptz)` under TimeZone UTC, which is
-/// the same: the difference field by field, years and months kept.
+/// `age(timestamp, timestamp)`: the difference field by field, years and months kept.
 pub fn timestamp_age(a: i64, b: i64) -> Result<Interval> {
+    instants_age(a, b, false)
+}
+
+/// `age(timestamptz, timestamptz)`: the difference field by field on the statement zone's clock,
+/// years and months kept.
+pub fn timestamptz_age(a: i64, b: i64) -> Result<Interval> {
+    instants_age(a, b, true)
+}
+
+fn instants_age(a: i64, b: i64, zoned: bool) -> Result<Interval> {
     let infinite = |t: i64| t == i64::MIN || t == i64::MAX;
     if infinite(a) || infinite(b) {
         return match (a, b) {
@@ -845,8 +866,8 @@ pub fn timestamp_age(a: i64, b: i64) -> Result<Interval> {
         };
     }
     let (dt1, dt2) = (instant_to_pg(a), instant_to_pg(b));
-    let (tm1, fsec1) = pg_tm(dt1).ok_or_else(|| out_of_range("timestamp"))?;
-    let (tm2, fsec2) = pg_tm(dt2).ok_or_else(|| out_of_range("timestamp"))?;
+    let (tm1, fsec1) = super::pg_tm_in(dt1, zoned)?;
+    let (tm2, fsec2) = super::pg_tm_in(dt2, zoned)?;
     let mut tm = Itm2 {
         usec: fsec1 - fsec2,
         sec: tm1.sec - tm2.sec,
@@ -1115,8 +1136,8 @@ fn sane_zone(tm: &Tm, zone: &str) -> Result<i32> {
     }
 }
 
-/// `make_timestamptz(year, month, mday, hour, min, sec)` under TimeZone UTC, and with a seventh
-/// argument, the zone its date and time are on.
+/// `make_timestamptz(year, month, mday, hour, min, sec)`, its date and time on the statement zone's
+/// clock, and with a seventh argument, the zone its date and time are on.
 pub fn make_timestamptz(
     year: i32,
     month: i32,
@@ -1128,7 +1149,7 @@ pub fn make_timestamptz(
 ) -> Result<i64> {
     let t = make_timestamp_pg(year, month, mday, hour, min, sec)?;
     let Some(zone) = zone else {
-        return instant_from_pg(t);
+        return super::timestamp_timestamptz(instant_from_pg(t)?);
     };
     let (tm, _) = pg_tm(t).ok_or_else(|| out_of_range("timestamp"))?;
     let tz = sane_zone(&tm, zone)?;

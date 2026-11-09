@@ -1365,12 +1365,15 @@ fn zone_offset(name: &str, tm: &Tm) -> D<i32> {
 }
 
 /// What DecodeDateTime and DecodeTimeOnly read: the date and time, the microseconds, the zone in
-/// seconds west of UTC, and what the text named (a date, `epoch` or an infinity).
+/// seconds west of UTC, what the text named (a date, `epoch` or an infinity), whether it named its
+/// zone (where not, the session's zone is the caller's to read), and whether it named a date.
 struct Decoded {
     tm: Tm,
     fsec: i32,
     tz: i32,
     dtype: i32,
+    zoned: bool,
+    dated: bool,
 }
 
 /// PostgreSQL's DecodeDateTime, its zone always asked for, under TimeZone UTC and DateStyle MDY.
@@ -1535,15 +1538,15 @@ fn decode_date_time(fields: &[Field], now: i64) -> D<Decoded> {
                         DTK_NOW => {
                             tmask = DATE_M | TIME_M | m(TZ);
                             dtype = DTK_DATE;
-                            let (t, f) = now_tm(now);
+                            let (t, f, west) = now_local(now)?;
                             tm = t;
                             fsec = f;
-                            tz = 0;
+                            tz = west;
                         }
                         DTK_YESTERDAY | DTK_TODAY | DTK_TOMORROW => {
                             tmask = DATE_M;
                             dtype = DTK_DATE;
-                            let (t, _) = now_tm(now);
+                            let (t, _, _) = now_local(now)?;
                             let shift = match val {
                                 DTK_YESTERDAY => -1,
                                 DTK_TOMORROW => 1,
@@ -1663,6 +1666,8 @@ fn decode_date_time(fields: &[Field], now: i64) -> D<Decoded> {
         fsec,
         tz,
         dtype,
+        zoned: fmask & m(TZ) != 0,
+        dated: fmask & DATE_M == DATE_M,
     })
 }
 
@@ -1825,7 +1830,7 @@ fn decode_time_only(fields: &mut [Field], now: i64) -> D<Decoded> {
                     RESERV => match val {
                         DTK_NOW => {
                             tmask = TIME_M;
-                            let (t, f) = now_tm(now);
+                            let (t, f, _) = now_local(now)?;
                             tm = t;
                             fsec = f;
                         }
@@ -1916,6 +1921,8 @@ fn decode_time_only(fields: &mut [Field], now: i64) -> D<Decoded> {
         fsec,
         tz,
         dtype,
+        zoned: fmask & m(TZ) != 0,
+        dated: fmask & DATE_M == DATE_M,
     })
 }
 
@@ -2125,7 +2132,18 @@ pub fn time_out(t: i64) -> String {
 /// A time with its zone as PostgreSQL's `timetz_in` reads it: microseconds since midnight, and
 /// the zone in seconds west of UTC.
 pub fn timetz_in(s: &str, precision: Option<u32>, now: i64) -> Result<(i64, i32)> {
-    let d = decoded(s, MAXDATELEN + 1, "time with time zone", now, true)?;
+    let mut d = decoded(s, MAXDATELEN + 1, "time with time zone", now, true)?;
+    if !d.zoned {
+        // The session's zone on the text's date, or on the transaction's own date there.
+        let mut on = match d.dated {
+            true => d.tm,
+            false => now_tm(local_of(now)?.0).0,
+        };
+        on.hour = d.tm.hour;
+        on.min = d.tm.min;
+        on.sec = d.tm.sec;
+        d.tz = session_offset(&on)?;
+    }
     let t = time2t(&d.tm, d.fsec);
     let t = match precision {
         Some(p) => round_time(t, p),
@@ -2141,6 +2159,85 @@ pub fn timetz_out(t: i64, zone: i32) -> String {
     out
 }
 
+/// The offset east of UTC, in seconds, the statement's zone gives the instant `t`, microseconds
+/// after 1970-01-01 UTC. The zone gives every instant the snail holds one.
+fn east_of(t: i64) -> Result<i64> {
+    if crate::zones::session_is_utc() {
+        return Ok(0);
+    }
+    Ok(i64::from(crate::zones::session_utc_offset(
+        t.div_euclid(USECS_PER_SEC),
+    )?))
+}
+
+/// An instant on the statement zone's clock, as PostgreSQL's timestamp2tm takes it apart there:
+/// microseconds after 1970-01-01 on that clock, and the zone's offset east of UTC in seconds.
+pub(crate) fn local_of(t: i64) -> Result<(i64, i64)> {
+    let east = east_of(t)?;
+    let local = t
+        .checked_add(east * USECS_PER_SEC)
+        .ok_or_else(|| out_of_range("timestamp"))?;
+    Ok((local, east))
+}
+
+/// PostgreSQL's DetermineTimeZoneOffset under the statement's zone: the offset west of UTC, in
+/// seconds, the zone gives the date and time `tm` on its own clock; UTC outside the Julian days.
+fn session_offset(tm: &Tm) -> Result<i32> {
+    if crate::zones::session_is_utc() || !valid_julian(tm.year, tm.mon) {
+        return Ok(0);
+    }
+    let day = i64::from(date2j_c(tm.year, tm.mon, tm.mday)) - UNIX_EPOCH_JDATE;
+    let local = day * SECS_PER_DAY + i64::from(tm.sec + (tm.min + tm.hour * 60) * 60);
+    Ok(-crate::zones::session_local_offset(local)?)
+}
+
+/// Whether a literal's text reads as an instant or a time of day naming no zone of its own, so
+/// that a timestamptz's or a timetz's input reads it on the zone it is read under: each bound or
+/// element where it is a range's or an array's.
+pub(crate) fn reads_on_the_zone(s: &str) -> bool {
+    let one = |p: &str| {
+        let p = p.trim().trim_matches('"').trim();
+        if p.is_empty() {
+            return false;
+        }
+        match decoded(p, MAXDATELEN + MAXDATEFIELDS, "timestamp with time zone", 0, false) {
+            Ok(d) => d.dtype == DTK_DATE && !d.zoned,
+            Err(_) => decoded(p, MAXDATELEN + 1, "time with time zone", 0, true)
+                .is_ok_and(|d| !d.zoned),
+        }
+    };
+    let t = s.trim();
+    match t.as_bytes().first() {
+        Some(b'[' | b'(' | b'{') => t[1..]
+            .trim_end_matches([']', ')', '}'])
+            .split(',')
+            .any(one),
+        _ => one(t),
+    }
+}
+
+/// The offset west of UTC, in seconds, the statement's zone gives a date and time on its clock, as
+/// PostgreSQL's DetermineTimeZoneOffset finds it.
+pub(crate) fn zone_offset_at(year: i32, mon: i32, mday: i32, hour: i32, min: i32, sec: i32) -> Result<i32> {
+    session_offset(&Tm {
+        year,
+        mon,
+        mday,
+        hour,
+        min,
+        sec,
+        yday: 0,
+    })
+}
+
+/// The statement's clock on its zone's clock, taken apart, its microseconds in the second, and the
+/// zone's offset west of UTC, as PostgreSQL's GetCurrentTimeUsec gives them.
+fn now_local(now: i64) -> D<(Tm, i32, i32)> {
+    let (local, east) = local_of(now).map_err(Dterr::Refused)?;
+    let (tm, fsec) = now_tm(local);
+    Ok((tm, fsec, -(east as i32)))
+}
+
 fn instant_in(s: &str, precision: Option<u32>, now: i64, zoned: bool) -> Result<i64> {
     let datatype = if zoned {
         "timestamp with time zone"
@@ -2148,7 +2245,10 @@ fn instant_in(s: &str, precision: Option<u32>, now: i64, zoned: bool) -> Result<
         "timestamp"
     };
     let zone = if zoned { "+00" } else { "" };
-    let d = decoded(s, MAXDATELEN + MAXDATEFIELDS, datatype, now, false)?;
+    let mut d = decoded(s, MAXDATELEN + MAXDATEFIELDS, datatype, now, false)?;
+    if zoned && !d.zoned && d.dtype == DTK_DATE {
+        d.tz = session_offset(&d.tm)?;
+    }
     let t2000 = match d.dtype {
         DTK_DATE => tm2timestamp(&d.tm, d.fsec, zoned.then_some(d.tz))
             .ok_or_else(|| Error::new(format!("timestamp out of range: \"{s}\"")))?,
@@ -2173,8 +2273,8 @@ pub fn timestamp_in(s: &str, precision: Option<u32>, now: i64) -> Result<i64> {
     instant_in(s, precision, now, false)
 }
 
-/// A timestamp with time zone as PostgreSQL's `timestamptz_in` reads it under TimeZone UTC:
-/// microseconds since 1970-01-01 UTC.
+/// A timestamp with time zone as PostgreSQL's `timestamptz_in` reads it, a text naming no zone on
+/// the statement zone's clock: microseconds since 1970-01-01 UTC.
 pub fn timestamptz_in(s: &str, precision: Option<u32>, now: i64) -> Result<i64> {
     instant_in(s, precision, now, true)
 }
@@ -2185,6 +2285,11 @@ fn instant_out(t: i64, zoned: bool) -> String {
         i64::MAX => return "infinity".into(),
         _ => {}
     }
+    // A timestamptz is written on the statement zone's clock, its offset after it.
+    let (t, east) = match zoned {
+        true => local_of(t).unwrap_or((t, 0)),
+        false => (t, 0),
+    };
     let (y, mo, d, h, mi, s, us) = civil(t);
     let mut out = format!(
         "{}-{}-{} {}:{}:",
@@ -2196,7 +2301,7 @@ fn instant_out(t: i64, zoned: bool) -> String {
     );
     append_seconds(&mut out, s as i32, us as i32, true);
     if zoned {
-        encode_timezone(&mut out, 0);
+        encode_timezone(&mut out, -(east as i32));
     }
     if y <= 0 {
         out.push_str(" BC");
@@ -2209,8 +2314,8 @@ pub fn timestamp_out(t: i64) -> String {
     instant_out(t, false)
 }
 
-/// A timestamp with time zone as PostgreSQL's `timestamptz_out` writes it under DateStyle ISO and
-/// TimeZone UTC.
+/// A timestamp with time zone as PostgreSQL's `timestamptz_out` writes it under DateStyle ISO, on
+/// the statement zone's clock.
 pub fn timestamptz_out(t: i64) -> String {
     instant_out(t, true)
 }
@@ -3147,9 +3252,22 @@ pub fn datetimetz_pl(d: i32, t: i64, zone: i32) -> Result<i64> {
     instant_from_pg(at)
 }
 
+/// PostgreSQL's timestamp2tm on its own count from 2000-01-01, a timestamptz on the statement
+/// zone's clock where `zoned`.
+fn pg_tm_in(t: i64, zoned: bool) -> Result<(Tm, i32)> {
+    let t = match zoned {
+        true => t
+            .checked_add(east_of(t.saturating_add(EPOCH_SHIFT))? * USECS_PER_SEC)
+            .ok_or_else(|| out_of_range("timestamp"))?,
+        false => t,
+    };
+    pg_tm(t).ok_or_else(|| out_of_range("timestamp"))
+}
+
 /// PostgreSQL's timestamp_pl_interval and timestamptz_pl_interval on its own count: the months
 /// on the calendar, a day past a month's end held to its last, then the days, then the
-/// microseconds. `zoned` takes timestamptz's bound on the Julian day.
+/// microseconds. `zoned` reads the calendar on the statement zone's clock, each step's offset
+/// there, and takes timestamptz's bound on the Julian day.
 fn pl_interval(t: i64, v: Interval, zoned: bool) -> Result<i64> {
     let oor = || out_of_range("timestamp");
     if v == Interval::NEG_INFINITY {
@@ -3170,8 +3288,14 @@ fn pl_interval(t: i64, v: Interval, zoned: bool) -> Result<i64> {
         return Ok(t);
     }
     let mut t = t;
+    let offset = |tm: &Tm| -> Result<Option<i32>> {
+        Ok(match zoned {
+            true => Some(session_offset(tm)?),
+            false => None,
+        })
+    };
     if v.months != 0 {
-        let (mut tm, fsec) = pg_tm(t).ok_or_else(oor)?;
+        let (mut tm, fsec) = pg_tm_in(t, zoned)?;
         tm.mon = tm.mon.checked_add(v.months).ok_or_else(oor)?;
         if tm.mon > MONTHS_PER_YEAR {
             tm.year = tm.year.wrapping_add((tm.mon - 1) / MONTHS_PER_YEAR);
@@ -3184,10 +3308,10 @@ fn pl_interval(t: i64, v: Interval, zoned: bool) -> Result<i64> {
         if tm.mday > last {
             tm.mday = last;
         }
-        t = tm2timestamp(&tm, fsec, None).ok_or_else(oor)?;
+        t = tm2timestamp(&tm, fsec, offset(&tm)?).ok_or_else(oor)?;
     }
     if v.days != 0 {
-        let (mut tm, fsec) = pg_tm(t).ok_or_else(oor)?;
+        let (mut tm, fsec) = pg_tm_in(t, zoned)?;
         let julian = date2j_c(tm.year, tm.mon, tm.mday)
             .checked_add(v.days)
             .filter(|&j| j >= if zoned { -1 } else { 0 })
@@ -3196,7 +3320,7 @@ fn pl_interval(t: i64, v: Interval, zoned: bool) -> Result<i64> {
         tm.year = y;
         tm.mon = mo;
         tm.mday = d;
-        t = tm2timestamp(&tm, fsec, if zoned { Some(0) } else { None }).ok_or_else(oor)?;
+        t = tm2timestamp(&tm, fsec, offset(&tm)?).ok_or_else(oor)?;
     }
     t = t.checked_add(v.micros).ok_or_else(oor)?;
     if !valid_timestamp(t) {
@@ -3216,12 +3340,13 @@ pub fn timestamp_mi_interval(t: i64, v: Interval) -> Result<i64> {
     instant_from_pg(pl_interval(instant_to_pg(t), v, false)?)
 }
 
-/// `timestamptz + interval`, and `interval + timestamptz`, under TimeZone UTC.
+/// `timestamptz + interval`, and `interval + timestamptz`, its months and days on the statement
+/// zone's clock.
 pub fn timestamptz_pl_interval(t: i64, v: Interval) -> Result<i64> {
     instant_from_pg(pl_interval(instant_to_pg(t), v, true)?)
 }
 
-/// `timestamptz - interval`, under TimeZone UTC.
+/// `timestamptz - interval`, its months and days on the statement zone's clock.
 pub fn timestamptz_mi_interval(t: i64, v: Interval) -> Result<i64> {
     let v = interval_um(v)?;
     instant_from_pg(pl_interval(instant_to_pg(t), v, true)?)
@@ -3562,9 +3687,87 @@ pub fn date_timestamp(d: i32) -> Result<i64> {
     instant_from_pg(date2timestamp(date_to_pg(d))?)
 }
 
-/// The cast `date::timestamptz` (implicit), under TimeZone UTC: its midnight.
+/// The cast `date::timestamptz` (implicit): its midnight on the statement zone's clock.
 pub fn date_timestamptz(d: i32) -> Result<i64> {
-    date_timestamp(d)
+    match date_tz_rank(d)? {
+        (0, _) => Ok(i64::MIN),
+        (3, _) => Ok(i64::MAX),
+        (1, at) if at != i128::MIN => instant_from_pg((at - i128::from(EPOCH_SHIFT)) as i64),
+        _ => Err(Error::new("date out of range for timestamp")),
+    }
+}
+
+/// The offset west of UTC, in seconds, the statement's zone gives a date's midnight on its clock,
+/// as PostgreSQL's DetermineTimeZoneOffset finds it; UTC for an infinity.
+pub fn date_zone_offset(d: i32) -> Result<i32> {
+    match d {
+        i32::MIN | i32::MAX => Ok(0),
+        _ => session_offset(&midnight(date_to_pg(d))),
+    }
+}
+
+/// The offset west of UTC, in seconds, the statement's zone gives a timestamp's time on its clock;
+/// UTC for an infinity.
+pub fn timestamp_zone_offset(t: i64) -> Result<i32> {
+    match t {
+        i64::MIN | i64::MAX => Ok(0),
+        _ => Ok(-crate::zones::session_local_offset(
+            t.div_euclid(USECS_PER_SEC),
+        )?),
+    }
+}
+
+/// The midnight of a date counted from 2000-01-01, taken apart.
+fn midnight(d: i32) -> Tm {
+    let (year, mon, mday) = j2date_c(d.wrapping_add(POSTGRES_EPOCH_JDATE as i32));
+    Tm {
+        year,
+        mon,
+        mday,
+        ..Tm::default()
+    }
+}
+
+/// Where a date's midnight on the statement zone's clock lies among instants, as PostgreSQL's
+/// date2timestamptz_opt_overflow places it, ranked as `instant_rank` ranks: one past an instant's
+/// range just inside the infinity on its side.
+fn date_tz_rank(d: i32) -> Result<(u8, i128)> {
+    let pg = date_to_pg(d);
+    Ok(match pg {
+        i32::MIN => (0, 0),
+        i32::MAX => (3, 0),
+        _ if i64::from(pg) >= TIMESTAMP_END_JULIAN - POSTGRES_EPOCH_JDATE => (2, 0),
+        _ => {
+            let west = session_offset(&midnight(pg))?;
+            let at = i64::from(pg) * MICROS_PER_DAY + i64::from(west) * USECS_PER_SEC;
+            past_instants(at)
+        }
+    })
+}
+
+/// A finite instant counted from 2000-01-01 ranked as `instant_rank` ranks one, past PostgreSQL's
+/// range just inside the infinity on its side.
+fn past_instants(at: i64) -> (u8, i128) {
+    if at < MIN_TIMESTAMP {
+        (1, i128::MIN)
+    } else if at >= END_TIMESTAMP {
+        (2, 0)
+    } else {
+        (1, i128::from(at) + i128::from(EPOCH_SHIFT))
+    }
+}
+
+/// Where a timestamp, a time on the statement zone's clock, lies among instants, as PostgreSQL's
+/// timestamp2timestamptz_opt_overflow places it, ranked as `date_tz_rank` ranks.
+fn timestamp_tz_rank(t: i64) -> Result<(u8, i128)> {
+    Ok(match t {
+        i64::MIN => (0, 0),
+        i64::MAX => (3, 0),
+        _ => {
+            let east = crate::zones::session_local_offset(t.div_euclid(USECS_PER_SEC))?;
+            past_instants(t - EPOCH_SHIFT - i64::from(east) * USECS_PER_SEC)
+        }
+    })
 }
 
 /// The cast `timestamp::date` (by assignment): its day; an infinity the date's.
@@ -3576,9 +3779,12 @@ pub fn timestamp_date(t: i64) -> Result<i32> {
     }
 }
 
-/// The cast `timestamptz::date` (by assignment), under TimeZone UTC.
+/// The cast `timestamptz::date` (by assignment): its day on the statement zone's clock.
 pub fn timestamptz_date(t: i64) -> Result<i32> {
-    timestamp_date(t)
+    match t {
+        i64::MIN | i64::MAX => timestamp_date(t),
+        _ => timestamp_date(local_of(t)?.0),
+    }
 }
 
 /// The cast `timestamp::time` (by assignment): its time of day; NULL for an infinity, as
@@ -3590,30 +3796,63 @@ pub fn timestamp_time(t: i64) -> Result<Option<i64>> {
     }
 }
 
-/// The cast `timestamptz::time` (by assignment), under TimeZone UTC; NULL for an infinity.
+/// The cast `timestamptz::time` (by assignment): its time of day on the statement zone's clock;
+/// NULL for an infinity.
 pub fn timestamptz_time(t: i64) -> Result<Option<i64>> {
-    timestamp_time(t)
+    match t {
+        i64::MIN | i64::MAX => Ok(None),
+        _ => timestamp_time(local_of(t)?.0),
+    }
 }
 
-/// The cast `timestamptz::timetz` (by assignment), under TimeZone UTC: its time of day at zone
-/// 0; NULL for an infinity, as PostgreSQL gives.
+/// The cast `timestamptz::timetz` (by assignment): its time of day on the statement zone's clock,
+/// at the zone's offset there; NULL for an infinity, as PostgreSQL gives.
 pub fn timestamptz_timetz(t: i64) -> Result<Option<(i64, i32)>> {
-    Ok(timestamp_time(t)?.map(|time| (time, 0)))
+    match t {
+        i64::MIN | i64::MAX => Ok(None),
+        _ => {
+            let (local, east) = local_of(t)?;
+            Ok(timestamp_time(local)?.map(|time| (time, -(east as i32))))
+        }
+    }
 }
 
-/// The cast `timestamp::timestamptz` (implicit), under TimeZone UTC: the same instant.
-pub fn timestamp_timestamptz(t: i64) -> i64 {
-    t
+/// The cast `timestamp::timestamptz` (implicit): the instant its time names on the statement
+/// zone's clock.
+pub fn timestamp_timestamptz(t: i64) -> Result<i64> {
+    match timestamp_tz_rank(t)? {
+        (0, _) => Ok(i64::MIN),
+        (3, _) => Ok(i64::MAX),
+        (1, at) if at != i128::MIN => instant_from_pg((at - i128::from(EPOCH_SHIFT)) as i64),
+        _ => Err(out_of_range("timestamp")),
+    }
 }
 
-/// The cast `timestamptz::timestamp` (by assignment), under TimeZone UTC: the same instant.
-pub fn timestamptz_timestamp(t: i64) -> i64 {
-    t
+/// The cast `timestamptz::timestamp` (by assignment): the instant's time on the statement zone's
+/// clock.
+pub fn timestamptz_timestamp(t: i64) -> Result<i64> {
+    match t {
+        i64::MIN | i64::MAX => Ok(t),
+        _ => {
+            let local = local_of(t)?.0;
+            if !valid_timestamp(local - EPOCH_SHIFT) {
+                return Err(out_of_range("timestamp"));
+            }
+            instant_from_pg(local - EPOCH_SHIFT)
+        }
+    }
 }
 
-/// The cast `time::timetz` (implicit), under TimeZone UTC: zone 0.
-pub fn time_timetz(t: i64) -> (i64, i32) {
-    (t, 0)
+/// The cast `time::timetz` (implicit): the time at the statement zone's offset on the
+/// transaction's own date there.
+pub fn time_timetz(t: i64) -> Result<(i64, i32)> {
+    if crate::zones::session_is_utc() {
+        return Ok((t, 0));
+    }
+    let (mut tm, _) = now_tm(local_of(crate::scalars::transaction_clock())?.0);
+    let mut fsec = 0;
+    dt2time(t, &mut tm, &mut fsec);
+    Ok((t, session_offset(&tm)?))
 }
 
 /// The cast `timetz::time` (by assignment): its time, its zone passed over.
@@ -3665,14 +3904,14 @@ pub fn date_cmp_timestamp(d: i32, t: i64) -> Ordering {
     date_rank(d).cmp(&instant_rank(t))
 }
 
-/// A date against a timestamptz, under TimeZone UTC.
-pub fn date_cmp_timestamptz(d: i32, t: i64) -> Ordering {
-    date_cmp_timestamp(d, t)
+/// A date against a timestamptz, the date's midnight on the statement zone's clock.
+pub fn date_cmp_timestamptz(d: i32, t: i64) -> Result<Ordering> {
+    Ok(date_tz_rank(d)?.cmp(&instant_rank(t)))
 }
 
-/// A timestamp against a timestamptz, under TimeZone UTC: the same count.
-pub fn timestamp_cmp_timestamptz(a: i64, b: i64) -> Ordering {
-    a.cmp(&b)
+/// A timestamp against a timestamptz, the timestamp's time on the statement zone's clock.
+pub fn timestamp_cmp_timestamptz(a: i64, b: i64) -> Result<Ordering> {
+    Ok(timestamp_tz_rank(a)?.cmp(&instant_rank(b)))
 }
 
 /// A timestamp against a date: the reverse of `date_cmp_timestamp`.
@@ -3680,14 +3919,14 @@ pub fn timestamp_cmp_date(t: i64, d: i32) -> Ordering {
     date_cmp_timestamp(d, t).reverse()
 }
 
-/// A timestamptz against a date, under TimeZone UTC.
-pub fn timestamptz_cmp_date(t: i64, d: i32) -> Ordering {
-    date_cmp_timestamp(d, t).reverse()
+/// A timestamptz against a date: the reverse of `date_cmp_timestamptz`.
+pub fn timestamptz_cmp_date(t: i64, d: i32) -> Result<Ordering> {
+    Ok(date_cmp_timestamptz(d, t)?.reverse())
 }
 
-/// A timestamptz against a timestamp, under TimeZone UTC.
-pub fn timestamptz_cmp_timestamp(a: i64, b: i64) -> Ordering {
-    a.cmp(&b)
+/// A timestamptz against a timestamp: the reverse of `timestamp_cmp_timestamptz`.
+pub fn timestamptz_cmp_timestamp(a: i64, b: i64) -> Result<Ordering> {
+    Ok(timestamp_cmp_timestamptz(b, a)?.reverse())
 }
 
 /// The cast `timetz::timetz(p)`: its time rounded to `precision` digits, its zone kept.

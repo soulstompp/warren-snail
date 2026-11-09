@@ -338,11 +338,15 @@ fn the_rest_and_the_forms_a_call_resolves_to() {
 #[test]
 fn a_setting_the_snail_does_not_hold_fixed_is_refused_by_name() {
     // work_mem changes no answer, so it is read at PostgreSQL's boot value; a setting missing, where
-    // that is asked for, is NULL; TimeZone reset is the one the snail answers under.
+    // that is asked for, is NULL; TimeZone reset is UTC, where a session begins, and a named zone is
+    // read only under the feature zones.
     let mut snail = snail("rest-refused");
     assert_eq!(answer(&mut snail, "current_setting('work_mem')", 1), "4MB");
     assert_eq!(answer(&mut snail, "current_setting('no_such', true)", 1), "NULL");
     assert_eq!(answer(&mut snail, "set_config('TimeZone', NULL, false)", 1), "UTC");
-    let got = answer(&mut snail, "set_config('TimeZone', 'Europe/Lisbon', false)", 1);
-    assert!(got.contains("the snail answers under"), "{got}");
+    #[cfg(not(feature = "zones"))]
+    {
+        let got = answer(&mut snail, "set_config('TimeZone', 'Europe/Lisbon', false)", 1);
+        assert!(got.contains("read only under the feature zones"), "{got}");
+    }
 }

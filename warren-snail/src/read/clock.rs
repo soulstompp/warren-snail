@@ -44,7 +44,7 @@ pub(super) fn time_of(v: &Value) -> Option<ColumnType> {
 }
 
 /// An instant of either kind, a date taken as one where the other side is one, as PostgreSQL's
-/// implicit casts take it: a date at midnight, and a timestamp as a timestamptz under UTC.
+/// implicit casts take it: a date at midnight, and a timestamp as a timestamptz, each on the statement zone's clock.
 fn instants(x: &Value, y: &Value) -> Result<Option<(ColumnType, i64, i64)>> {
     let (Some(a), Some(b)) = (time_of(x), time_of(y)) else {
         return Ok(None);
@@ -66,7 +66,7 @@ fn instants(x: &Value, y: &Value) -> Result<Option<(ColumnType, i64, i64)>> {
         Ok(match (t, to) {
             (ColumnType::Date, 1) => times::date_timestamp(k as i32)?,
             (ColumnType::Date, _) => times::date_timestamptz(k as i32)?,
-            (ColumnType::Timestamp(_), 2) => times::timestamp_timestamptz(k),
+            (ColumnType::Timestamp(_), 2) => times::timestamp_timestamptz(k)?,
             _ => k,
         })
     };
@@ -102,25 +102,25 @@ pub(super) fn compare(x: &Value, y: &Value) -> Result<Option<Ordering>> {
                 Some(ColumnType::Timestamptz),
                 Value::Scalar(_, d),
                 Value::Scalar(_, t),
-            ) => Ok(Some(times::date_cmp_timestamptz(*d as i32, *t))),
+            ) => Ok(Some(times::date_cmp_timestamptz(*d as i32, *t)?)),
             (
                 Some(ColumnType::Timestamptz),
                 Some(ColumnType::Date),
                 Value::Scalar(_, t),
                 Value::Scalar(_, d),
-            ) => Ok(Some(times::timestamptz_cmp_date(*t, *d as i32))),
+            ) => Ok(Some(times::timestamptz_cmp_date(*t, *d as i32)?)),
             (
                 Some(ColumnType::Timestamp(_)),
                 Some(ColumnType::Timestamptz),
                 Value::Scalar(_, a),
                 Value::Scalar(_, b),
-            ) => Ok(Some(times::timestamp_cmp_timestamptz(*a, *b))),
+            ) => Ok(Some(times::timestamp_cmp_timestamptz(*a, *b)?)),
             (
                 Some(ColumnType::Timestamptz),
                 Some(ColumnType::Timestamp(_)),
                 Value::Scalar(_, a),
                 Value::Scalar(_, b),
-            ) => Ok(Some(times::timestamptz_cmp_timestamp(*a, *b))),
+            ) => Ok(Some(times::timestamptz_cmp_timestamp(*a, *b)?)),
             _ => Ok(None),
         },
     }
@@ -417,14 +417,14 @@ pub(super) fn cast(v: Value, to: ColumnType) -> Result<Value> {
                 (T::Timestamp(_), T::Date) => scalar(to, i64::from(times::timestamp_date(k)?)),
                 (T::Timestamptz, T::Date) => scalar(to, i64::from(times::timestamptz_date(k)?)),
                 (T::Timestamp(_), T::Timestamp(q)) => scalar(to, rounded(k, q)?),
-                (T::Timestamp(_), T::Timestamptz) => scalar(to, times::timestamp_timestamptz(k)),
+                (T::Timestamp(_), T::Timestamptz) => scalar(to, times::timestamp_timestamptz(k)?),
                 (T::Timestamp(_), T::TimestamptzRounded(q)) => {
-                    scalar(to, rounded(times::timestamp_timestamptz(k), Some(q))?)
+                    scalar(to, rounded(times::timestamp_timestamptz(k)?, Some(q))?)
                 }
                 (T::Timestamptz, T::Timestamptz) => v,
                 (T::Timestamptz, T::TimestamptzRounded(q)) => scalar(to, rounded(k, Some(q))?),
                 (T::Timestamptz, T::Timestamp(q)) => {
-                    scalar(to, rounded(times::timestamptz_timestamp(k), q)?)
+                    scalar(to, rounded(times::timestamptz_timestamp(k)?, q)?)
                 }
                 (T::Timestamp(_), T::Time(q)) => null(
                     times::timestamp_time(k)?
@@ -441,7 +441,7 @@ pub(super) fn cast(v: Value, to: ColumnType) -> Result<Value> {
                 }
                 (T::Time(_), T::Time(q)) => scalar(to, p(q).map_or(k, |q| times::round_time(k, q))),
                 (T::Time(_), T::Timetz(q)) => {
-                    let (t, z) = times::time_timetz(k);
+                    let (t, z) = times::time_timetz(k)?;
                     timetz(p(q).map_or((t, z), |q| times::round_timetz(t, z, q)))
                 }
                 (T::Time(_), T::Interval { range, precision }) => Value::Interval(

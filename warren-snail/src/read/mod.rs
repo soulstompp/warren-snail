@@ -21,6 +21,7 @@ pub(crate) mod elements;
 mod explain;
 pub(crate) mod fill;
 pub(crate) mod foreign;
+mod folded;
 pub mod handed;
 mod hash;
 pub(crate) mod image;
@@ -1379,6 +1380,7 @@ impl Snail {
     ) -> Result<Round> {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
+        let _zoned = self.in_zone();
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let mut scan = self.scan(sql, order)?;
@@ -1461,6 +1463,14 @@ impl Snail {
         self.ask_with(sql, order, &[])
     }
 
+    /// An answer's rows as `answer_text` writes them, under the session's TimeZone as it stands:
+    /// what PostgreSQL hands a client reading rows as text, a timestamptz on the session zone's
+    /// clock.
+    pub fn text_of(&self, batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>> {
+        let _zoned = self.in_zone();
+        answer_text(batch)
+    }
+
     /// Gives each round from now on the room `sizes` names: the bytes it holds its rows and the pages
     /// it keeps for its later reads in, 128 MB unless told otherwise; the directory it writes the rows
     /// past them to, a file of its own removed as soon as it is opened; and the most it writes there.
@@ -1510,6 +1520,7 @@ impl Snail {
     ) -> Result<(RecordBatch, Round)> {
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
+        let _zoned = self.in_zone();
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _handed = handed::holding(&self.functions);

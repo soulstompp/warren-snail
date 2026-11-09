@@ -177,9 +177,11 @@ fn a_setting_the_snail_answers_under_one_value_of_is_taken_there_and_refused_els
             "SET client_encoding = 'LATIN1'",
             "the snail answers in UTF8",
         ),
+        // TimeZone is the session's: a named zone is read only under the feature zones.
+        #[cfg(not(feature = "zones"))]
         (
             "SET TIME ZONE 'Europe/Lisbon'",
-            "the snail answers under timezone UTC",
+            "read only under the feature zones",
         ),
         ("SET xmloption = document", "it changes how xml is read"),
         ("SET search_path = public", "has no search path"),

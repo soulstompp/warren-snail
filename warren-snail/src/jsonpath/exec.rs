@@ -617,18 +617,18 @@ fn compare_datetime(a: &Datetime, b: &Datetime, use_tz: bool) -> Result<Option<O
         (Date(x), Timestamp(y)) => date_cmp_timestamp(x, y),
         (Date(x), TimestampTz(y, _)) => {
             need_tz(use_tz, "date", "timestamptz")?;
-            date_cmp_timestamptz(x, y)
+            date_cmp_timestamptz(x, y)?
         }
         (Date(_), Time(_) | TimeTz(..)) => return Ok(None),
         (Time(x), Time(y)) => x.cmp(&y),
         (Time(x), TimeTz(t, z)) => {
             need_tz(use_tz, "time", "timetz")?;
-            timetz_cmp(crate::times::time_timetz(x), (t, z))
+            timetz_cmp(crate::times::time_timetz(x)?, (t, z))
         }
         (Time(_), Date(_) | Timestamp(_) | TimestampTz(..)) => return Ok(None),
         (TimeTz(t, z), Time(y)) => {
             need_tz(use_tz, "time", "timetz")?;
-            timetz_cmp((t, z), crate::times::time_timetz(y))
+            timetz_cmp((t, z), crate::times::time_timetz(y)?)
         }
         (TimeTz(t, z), TimeTz(u, w)) => timetz_cmp((t, z), (u, w)),
         (TimeTz(..), Date(_) | Timestamp(_) | TimestampTz(..)) => return Ok(None),
@@ -636,16 +636,16 @@ fn compare_datetime(a: &Datetime, b: &Datetime, use_tz: bool) -> Result<Option<O
         (Timestamp(x), Timestamp(y)) => x.cmp(&y),
         (Timestamp(x), TimestampTz(y, _)) => {
             need_tz(use_tz, "timestamp", "timestamptz")?;
-            timestamp_cmp_timestamptz(x, y)
+            timestamp_cmp_timestamptz(x, y)?
         }
         (Timestamp(_), Time(_) | TimeTz(..)) => return Ok(None),
         (TimestampTz(x, _), Date(y)) => {
             need_tz(use_tz, "date", "timestamptz")?;
-            date_cmp_timestamptz(y, x).reverse()
+            date_cmp_timestamptz(y, x)?.reverse()
         }
         (TimestampTz(x, _), Timestamp(y)) => {
             need_tz(use_tz, "timestamp", "timestamptz")?;
-            timestamp_cmp_timestamptz(y, x).reverse()
+            timestamp_cmp_timestamptz(y, x)?.reverse()
         }
         (TimestampTz(x, _), TimestampTz(y, _)) => x.cmp(&y),
         (TimestampTz(..), Time(_) | TimeTz(..)) => return Ok(None),
@@ -756,6 +756,17 @@ fn run<T: Send>(
     if levels <= INLINE_LEVELS {
         return go();
     }
+    // The run on a thread of its own reads the statement's zone and clocks there.
+    let zone = crate::zones::session();
+    let clocks = (
+        crate::scalars::transaction_clock(),
+        crate::scalars::statement_clock(),
+    );
+    let go = move || {
+        let _zoned = crate::zones::handed(zone);
+        let _clocked = crate::scalars::clocked(clocks.0, clocks.1);
+        go()
+    };
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(levels * LEVEL_BYTES + (1 << 20))
@@ -2297,7 +2308,7 @@ fn execute_datetime_method(
                 }
                 Datetime::Time(t) => {
                     need_tz(cx.use_tz, "time", "timetz")?;
-                    times::time_timetz(t)
+                    times::time_timetz(t)?
                 }
                 Datetime::TimeTz(t, zone) => (t, zone),
                 Datetime::TimestampTz(t, _) => times::timestamptz_timetz(t)?.unwrap_or((0, 0)),
@@ -2316,7 +2327,7 @@ fn execute_datetime_method(
                 Datetime::Timestamp(t) => t,
                 Datetime::TimestampTz(t, _) => {
                     need_tz(cx.use_tz, "timestamptz", "timestamp")?;
-                    times::timestamptz_timestamp(t)
+                    times::timestamptz_timestamp(t)?
                 }
             };
             if time_precision != -1 {
@@ -2334,14 +2345,19 @@ fn execute_datetime_method(
             let (mut t, tz) = match value {
                 Datetime::Date(d) => {
                     need_tz(cx.use_tz, "date", "timestamptz")?;
-                    (times::date_timestamptz(d)?, 0)
+                    // The zone kept beside it is the session's for its midnight, as PostgreSQL
+                    // keeps it.
+                    (times::date_timestamptz(d)?, times::date_zone_offset(d)?)
                 }
                 Datetime::Time(_) | Datetime::TimeTz(..) => {
                     return_error!(cx, "{}", not_recognized("timestamp_tz"))
                 }
                 Datetime::Timestamp(t) => {
                     need_tz(cx.use_tz, "timestamp", "timestamptz")?;
-                    (times::timestamp_timestamptz(t), 0)
+                    (
+                        times::timestamp_timestamptz(t)?,
+                        times::timestamp_zone_offset(t)?,
+                    )
                 }
                 Datetime::TimestampTz(t, tz) => (t, tz),
             };

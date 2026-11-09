@@ -59,45 +59,226 @@ pub(crate) fn utc_offset(name: &str, utc: i64) -> Result<i32> {
 }
 
 /// The names of the zone files whose zone is UTC itself, with no change ever: read so without a
-/// file.
-const UTC_NAMES: [&str; 17] = [
-    "UTC",
-    "ETC/UTC",
-    "UCT",
-    "ETC/UCT",
-    "UNIVERSAL",
-    "ETC/UNIVERSAL",
-    "ZULU",
-    "ETC/ZULU",
-    "ETC/GMT",
-    "GMT0",
-    "GMT+0",
-    "GMT-0",
-    "ETC/GMT0",
-    "ETC/GMT+0",
-    "ETC/GMT-0",
-    "GREENWICH",
-    "ETC/GREENWICH",
+/// file. Each is spelled as PostgreSQL's directory spells it, beside the abbreviation its file
+/// gives.
+const UTC_NAMES: [(&str, &str); 17] = [
+    ("UTC", "UTC"),
+    ("Etc/UTC", "UTC"),
+    ("UCT", "UTC"),
+    ("Etc/UCT", "UTC"),
+    ("Universal", "UTC"),
+    ("Etc/Universal", "UTC"),
+    ("Zulu", "UTC"),
+    ("Etc/Zulu", "UTC"),
+    ("Etc/GMT", "GMT"),
+    ("GMT0", "GMT"),
+    ("GMT+0", "GMT"),
+    ("GMT-0", "GMT"),
+    ("Etc/GMT0", "GMT"),
+    ("Etc/GMT+0", "GMT"),
+    ("Etc/GMT-0", "GMT"),
+    ("Greenwich", "GMT"),
+    ("Etc/Greenwich", "GMT"),
 ];
+
+/// A name of UTC itself, as the directory spells it, and its abbreviation.
+fn utc_named(name: &str) -> Option<(&'static str, &'static str)> {
+    if name.eq_ignore_ascii_case("GMT") {
+        return Some(("GMT", "GMT"));
+    }
+    UTC_NAMES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .copied()
+}
 
 /// The offset east of UTC, in seconds, of a name that needs no zone file: `GMT`, which PostgreSQL
 /// reads without one, a name of UTC itself, and a POSIX TZ string whose zone never changes (`UTC+3`,
 /// `<+03>-03`, `+02`, `EST5`); none for any other.
 pub fn fixed_offset(name: &str) -> Option<i32> {
+    fixed(name).map(|(east, _)| east)
+}
+
+/// A name that needs no zone file, as `fixed_offset` reads it, with the abbreviation its zone
+/// gives.
+fn fixed(name: &str) -> Option<(i32, String)> {
     if name.len() > TZ_STRLEN_MAX {
         return None;
     }
-    let upper = name.to_ascii_uppercase();
-    if upper == "GMT" || UTC_NAMES.contains(&upper.as_str()) {
-        return Some(0);
+    if let Some((_, abbrev)) = utc_named(name) {
+        return Some((0, abbrev.to_string()));
     }
+    let upper = name.to_ascii_uppercase();
     if upper.starts_with(':') {
         return None;
     }
     let st = State::parse(upper.as_bytes(), false)?;
     match (st.ttis.as_slice(), st.ats.len()) {
-        ([one], 0) => Some(one.utoff as i32),
+        ([one], 0) => Some((
+            one.utoff as i32,
+            String::from_utf8_lossy(cstr(&st.chars, one.desigidx)).into_owned(),
+        )),
         _ => None,
+    }
+}
+
+/// The zone a session's TimeZone is set to, as PostgreSQL's pg_tzset finds it: its name as SHOW
+/// writes it back, the directory's spelling where a file has the name, a POSIX TZ string's upper
+/// case where none does; none where no zone has the name. A zone keeping leap seconds is refused in
+/// PostgreSQL's words, and a build without the feature `zones` refuses by name any name it cannot
+/// read without a file.
+pub(crate) fn set_name(name: &str) -> Result<Option<String>> {
+    if name.is_empty() || name.len() > TZ_STRLEN_MAX {
+        return Ok(None);
+    }
+    #[cfg(feature = "zones")]
+    {
+        let Ok(zone) = read::zone(name) else {
+            return Ok(None);
+        };
+        // PostgreSQL's pg_tz_acceptable: midnight UTC of 2000-01-01 must fall on a whole minute.
+        let t2000 = 946_684_800;
+        if zone
+            .state
+            .utc_offset(t2000)
+            .is_none_or(|east| (t2000 + east).rem_euclid(60) != 0)
+        {
+            return Err(Error::new(format!(
+                "time zone \"{name}\" appears to use leap seconds: PostgreSQL does not support \
+                 leap seconds."
+            )));
+        }
+        Ok(Some(zone.canonical.clone()))
+    }
+    #[cfg(not(feature = "zones"))]
+    {
+        if let Some((spelled, _)) = utc_named(name.strip_prefix(':').unwrap_or(name)) {
+            return Ok(Some(spelled.to_string()));
+        }
+        match fixed(name) {
+            Some(_) => Ok(Some(name.to_ascii_uppercase())),
+            None => Err(refused(name)),
+        }
+    }
+}
+
+/// The zone PostgreSQL's pg_tzset_offset names for an offset of `west` seconds west of UTC: a
+/// POSIX TZ string of that offset alone, `<+05:30>-05:30`; none where PostgreSQL reads no such
+/// string.
+pub(crate) fn offset_name(west: i64) -> Option<String> {
+    let abs = west.unsigned_abs();
+    let mut text = format!("{:02}", abs / 3600);
+    let rest = abs % 3600;
+    if rest != 0 {
+        text.push_str(&format!(":{:02}", rest / 60));
+        if !rest.is_multiple_of(60) {
+            text.push_str(&format!(":{:02}", rest % 60));
+        }
+    }
+    let name = match west > 0 {
+        true => format!("<-{text}>+{text}"),
+        false => format!("<+{text}>-{text}"),
+    };
+    fixed(&name).map(|_| name)
+}
+
+/// The zone a statement reads under, its session's TimeZone: none for UTC.
+#[derive(Clone, Debug)]
+pub(crate) enum Session {
+    /// A zone that never changes: its offset east of UTC and its abbreviation.
+    Fixed(i32, String),
+    /// A zone read from its file, or a POSIX TZ string with its rules, by its name.
+    Named(String),
+}
+
+std::thread_local! {
+    static SESSION: std::cell::RefCell<Option<Session>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The zone a statement reads under, held while it runs; the one before it put back after.
+pub(crate) struct InZone(Option<Session>);
+
+/// Holds the zone a session's TimeZone names, as SHOW writes it, for a statement: UTC where none.
+pub(crate) fn in_zone(name: Option<&str>) -> InZone {
+    let session = name.filter(|n| *n != "UTC").and_then(|n| match fixed(n) {
+        Some((0, abbrev)) if abbrev == "UTC" => None,
+        Some((east, abbrev)) => Some(Session::Fixed(east, abbrev)),
+        None => Some(Session::Named(n.to_string())),
+    });
+    handed(session)
+}
+
+/// Holds a zone a statement reads under on a thread it runs a part of on.
+pub(crate) fn handed(session: Option<Session>) -> InZone {
+    InZone(SESSION.with(|s| s.replace(session)))
+}
+
+impl Drop for InZone {
+    fn drop(&mut self) {
+        SESSION.with(|s| *s.borrow_mut() = self.0.take());
+    }
+}
+
+/// The zone the statement reads under, to hand to a thread it runs a part of on.
+pub(crate) fn session() -> Option<Session> {
+    SESSION.with(|s| s.borrow().clone())
+}
+
+/// Whether the statement reads under UTC itself.
+pub(crate) fn session_is_utc() -> bool {
+    SESSION.with(|s| s.borrow().is_none())
+}
+
+/// The offset east of UTC, in seconds, that the statement's zone gives the instant `utc` seconds
+/// after 1970-01-01 00:00 UTC.
+pub(crate) fn session_utc_offset(utc: i64) -> Result<i32> {
+    SESSION.with(|s| match &*s.borrow() {
+        None => Ok(0),
+        Some(Session::Fixed(east, _)) => Ok(*east),
+        Some(Session::Named(n)) => utc_offset(n, utc),
+    })
+}
+
+/// The offset east of UTC, in seconds, that the statement's zone gives a time `local` seconds after
+/// 1970-01-01 00:00 on its own clock, as PostgreSQL's DetermineTimeZoneOffset resolves a local
+/// time: UTC for a day outside the Julian days PostgreSQL counts.
+pub(crate) fn session_local_offset(local: i64) -> Result<i32> {
+    SESSION.with(|s| match &*s.borrow() {
+        None => Ok(0),
+        Some(Session::Fixed(east, _)) => {
+            let day = local.div_euclid(SECSPERDAY);
+            Ok(match (FIRST_JULIAN_DAY..END_JULIAN_DAY).contains(&day) {
+                true => *east,
+                false => 0,
+            })
+        }
+        Some(Session::Named(n)) => local_offset(n, local),
+    })
+}
+
+/// The abbreviation the statement's zone gives the instant `utc` seconds after 1970-01-01 00:00
+/// UTC, as to_char's TZ writes it.
+pub(crate) fn session_abbrev(utc: i64) -> Result<String> {
+    SESSION.with(|s| match &*s.borrow() {
+        None => Ok("UTC".to_string()),
+        Some(Session::Fixed(_, abbrev)) => Ok(abbrev.clone()),
+        Some(Session::Named(n)) => abbrev_at(n, utc),
+    })
+}
+
+/// The abbreviation zone `name` gives the instant `utc` seconds after 1970-01-01 00:00 UTC.
+fn abbrev_at(name: &str, utc: i64) -> Result<String> {
+    #[cfg(feature = "zones")]
+    {
+        let zone = read::zone(name)?;
+        zone.state
+            .abbrev(utc)
+            .ok_or_else(|| Error::new("timestamp out of range"))
+    }
+    #[cfg(not(feature = "zones"))]
+    {
+        let _ = utc;
+        fixed(name).map(|(_, a)| a).ok_or_else(|| refused(name))
     }
 }
 
@@ -568,6 +749,20 @@ impl State {
     /// The offset east of UTC that the zone gives the instant `t`, leap seconds taken off; none
     /// where a time far outside its transitions cannot be brought inside them.
     fn utc_offset(&self, t: i64) -> Option<i64> {
+        let (i, at) = self.type_at(t)?;
+        Some(self.ttis[i].utoff - self.leapcorr(at))
+    }
+
+    /// The abbreviation the zone gives the instant `t`.
+    #[cfg_attr(not(feature = "zones"), allow(dead_code))]
+    fn abbrev(&self, t: i64) -> Option<String> {
+        let (i, _) = self.type_at(t)?;
+        Some(String::from_utf8_lossy(cstr(&self.chars, self.ttis[i].desigidx)).into_owned())
+    }
+
+    /// The local time type in force at the instant `t`, and the instant it was read at: `t`, or a
+    /// time 400 years apart inside the transitions where `t` lies far outside them.
+    fn type_at(&self, t: i64) -> Option<(usize, i64)> {
         let n = self.ats.len();
         if (self.goback && t < self.ats[0]) || (self.goahead && t > self.ats[n - 1]) {
             let seconds = if t < self.ats[0] {
@@ -585,7 +780,7 @@ impl State {
             if newt < self.ats[0] || newt > self.ats[n - 1] {
                 return None;
             }
-            return self.utc_offset(newt);
+            return self.type_at(newt);
         }
         let i = if n == 0 || t < self.ats[0] {
             self.defaulttype
@@ -601,7 +796,7 @@ impl State {
             }
             self.types[lo - 1] as usize
         };
-        Some(self.ttis[i].utoff - self.leapcorr(t))
+        Some((i, t))
     }
 
     /// The type in force at `t`, and where the zone next changes after it with the type it

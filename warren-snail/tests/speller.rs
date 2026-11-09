@@ -38,11 +38,12 @@ fn refused(w: &mut Snail, sql: &str) -> (Option<&'static str>, String) {
     (e.sqlstate(), e.to_string())
 }
 
-/// An answer's rows, each value as PostgreSQL's output function writes it, `|` between them.
+/// An answer's rows, each value as PostgreSQL's output function writes it under the session's
+/// TimeZone, `|` between them.
 fn rows(w: &mut Snail, sql: &str) -> Vec<String> {
     let done = w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     let b = done.answer.expect("an answer");
-    warren_snail::read::answer_text(&b)
+    w.text_of(&b)
         .unwrap()
         .into_iter()
         .map(|r| {
@@ -1492,4 +1493,171 @@ fn the_replica_role_neither_checks_nor_acts_on_a_foreign_key() {
     run(&mut w, "SET session_replication_role = replica");
     run(&mut w, "ROLLBACK");
     assert_eq!(refused(&mut w, "INSERT INTO s.t VALUES (4, 98)").0, Some("23503"));
+}
+
+#[test]
+fn the_session_time_zone_reads_and_writes_instants_as_postgresql_does() {
+    let mut w = snail("zone");
+    // Each SET's value as PostgreSQL's check_timezone reads it and SHOW writes it back.
+    for (set, want) in [
+        ("SET TIME ZONE 5.5", "<+05:30>-05:30"),
+        ("SET TIME ZONE 5.123", "<+05:07:22>-05:07:22"),
+        ("SET TIME ZONE -7", "<-07>+07"),
+        ("SET TimeZone = '0x10'", "<+16>-16"),
+        ("SET TIME ZONE INTERVAL '+05:30:20' HOUR TO MINUTE", "<+05:30>-05:30"),
+        ("SET TimeZone = 'interval ''-02:00'''", "<-02>+02"),
+        ("SET TimeZone = 'utc+3'", "UTC+3"),
+        ("SET TIME ZONE UTC", "UTC"),
+    ] {
+        run(&mut w, set);
+        assert_eq!(rows(&mut w, "SHOW TimeZone"), [want], "{set}");
+    }
+    // UTC's own names, spelled as PostgreSQL's directory spells them; under the feature zones they
+    // are the directory's own.
+    #[cfg(not(feature = "zones"))]
+    for (set, want) in [("SET TimeZone = 'zulu'", "Zulu"), ("SET TimeZone = ':UTC'", "UTC")] {
+        run(&mut w, set);
+        assert_eq!(rows(&mut w, "SHOW TimeZone"), [want], "{set}");
+    }
+    for (set, code, words) in [
+        (
+            "SET TIME ZONE 168",
+            "22023",
+            "invalid value for parameter \"TimeZone\": \"168\": UTC timezone offset is out of range.",
+        ),
+        (
+            "SET TIME ZONE INTERVAL '1 day'",
+            "22023",
+            "invalid value for parameter \"TimeZone\": \"INTERVAL '1 day'\": Cannot specify days in \
+             time zone interval.",
+        ),
+        (
+            "SET TIME ZONE INTERVAL '05:30' HOUR TO SECOND",
+            "42601",
+            "time zone interval must be HOUR or HOUR TO MINUTE",
+        ),
+        ("SET TIME ZONE TRUE", "42601", "syntax error at or near \"TRUE\""),
+        ("SET TimeZone = ''", "22023", "invalid value for parameter \"TimeZone\": \"\""),
+        ("SET TimeZone = 'UTC', 'GMT'", "22023", "SET timezone takes only one argument"),
+    ] {
+        assert_eq!(refused(&mut w, set), (Some(code), words.to_string()), "{set}");
+    }
+    // Without the feature zones a named zone is refused by name.
+    #[cfg(not(feature = "zones"))]
+    assert!(refused(&mut w, "SET TimeZone = 'Europe/Lisbon'").1.contains("feature zones"));
+    run(&mut w, "CREATE TABLE s.z (id integer PRIMARY KEY, d timestamptz, l timestamp)");
+    run(&mut w, "INSERT INTO s.z VALUES (1, '2026-11-08 12:00:00+00', '2026-11-08 12:00:00')");
+    run(&mut w, "SET TimeZone = '<+05:30>-05:30'");
+    run(&mut w, "INSERT INTO s.z VALUES (2, '2026-07-01 12:00:00', '2026-07-01 12:00:00')");
+    // Every answer as 18.6 gave it under the same statements.
+    assert_eq!(
+        rows(&mut w, "SELECT id, d FROM s.z ORDER BY id"),
+        ["1|2026-11-08 17:30:00+05:30", "2|2026-07-01 12:00:00+05:30"]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "WITH x AS (SELECT id, CAST(d AS timestamp) AS s, CAST(d AS date) AS a, CAST(d AS timetz) \
+             AS z FROM s.z) SELECT id, s, a, z FROM x ORDER BY id"
+        ),
+        [
+            "1|2026-11-08 17:30:00|2026-11-08|17:30:00+05:30",
+            "2|2026-07-01 12:00:00|2026-07-01|12:00:00+05:30"
+        ]
+    );
+    // A day on the zone's clock that is not UTC's.
+    assert_eq!(
+        rows(
+            &mut w,
+            "WITH x AS (SELECT CAST(timestamptz '2026-07-01 20:00+00' AS date) AS a) SELECT a FROM x"
+        ),
+        ["2026-07-02"]
+    );
+    assert_eq!(rows(&mut w, "SELECT id FROM s.z WHERE l < d ORDER BY id"), ["1"]);
+    assert_eq!(
+        rows(&mut w, "SELECT id FROM s.z WHERE d < '2026-07-01 12:00:01' ORDER BY id"),
+        ["2"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT d - interval '1 month 1 day 1 hour' FROM s.z WHERE id = 1"),
+        ["2026-10-07 16:30:00+05:30"]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT extract(hour FROM d), extract(timezone FROM d), extract(timezone_minute FROM d) \
+             FROM s.z WHERE id = 1"
+        ),
+        ["17|19800|30"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT date_trunc('day', d), date_trunc('week', d) FROM s.z WHERE id = 1"),
+        ["2026-11-08 00:00:00+05:30|2026-11-02 00:00:00+05:30"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT to_char(d, 'YYYY-MM-DD HH24:MI:SS TZ OF') FROM s.z WHERE id = 1"),
+        ["2026-11-08 17:30:00 +05:30 +05:30"]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT to_timestamp('2026-07-01 12:00', 'YYYY-MM-DD HH24:MI'), timestamp '2026-07-01 \
+             12:00' AT TIME ZONE 'UTC'"
+        ),
+        ["2026-07-01 12:00:00+05:30|2026-07-01 17:30:00+05:30"]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT current_date = CAST(now() AS date), localtimestamp = CAST(now() AS timestamp)"
+        ),
+        ["t|t"]
+    );
+    // A row's text is written under the zone the session stands in when it is written.
+    let b = w.execute("SELECT d FROM s.z WHERE id = 1").unwrap().answer.unwrap();
+    run(&mut w, "RESET TimeZone");
+    assert_eq!(w.text_of(&b).unwrap(), [[Some("2026-11-08 12:00:00+00".to_string())]]);
+    assert_eq!(warren_snail::read::answer_text(&b).unwrap(), w.text_of(&b).unwrap());
+}
+
+#[test]
+fn a_ddl_literal_read_on_the_zone_keeps_the_session_to_utc() {
+    let mut w = snail("folded");
+    run(&mut w, "SET TimeZone = '<+05>-05'");
+    // A literal naming its offset reads alike under every zone, and one on a date column needs none.
+    run(
+        &mut w,
+        "CREATE TABLE s.w (id integer PRIMARY KEY, d timestamptz CHECK (d >= '2026-01-01 00:00+00'), \
+         a date CHECK (a >= '2026-01-01'))",
+    );
+    assert_eq!(
+        refused(&mut w, "INSERT INTO s.w VALUES (1, '2026-01-01 04:00', NULL)").0,
+        Some("23514")
+    );
+    let unfolded = "holds a literal PostgreSQL reads once, under the zone its DDL ran in";
+    for ddl in [
+        "CREATE TABLE s.t (id integer PRIMARY KEY, d timestamptz CHECK (d >= '2026-01-01 00:00'))",
+        "CREATE TABLE s.t (id integer PRIMARY KEY, d timestamptz DEFAULT '2026-06-01 00:00')",
+        "CREATE TABLE s.t (id integer PRIMARY KEY, d timetz CHECK (d > '12:00'))",
+        "CREATE TABLE s.t (id integer PRIMARY KEY, n text CHECK (n::timestamptz > '2026-01-01'))",
+        "CREATE TABLE s.t (id integer PRIMARY KEY, r tstzrange CHECK (r <> '[2026-01-01, 2026-02-01)'))",
+        "CREATE VIEW s.v AS SELECT id FROM s.w WHERE d < '2026-03-01'",
+        "CREATE INDEX w_part ON s.w (id) WHERE d < '2026-07-01'",
+    ] {
+        assert!(refused(&mut w, ddl).1.contains(unfolded), "{ddl}");
+    }
+    run(&mut w, "SET TimeZone = 'UTC'");
+    run(
+        &mut w,
+        "CREATE TABLE s.t (id integer PRIMARY KEY, d timestamptz CHECK (d >= '2026-01-01 00:00'))",
+    );
+    assert!(refused(&mut w, "SET TimeZone = '<+05>-05'").1.contains(unfolded));
+    assert!(refused(&mut w, "SELECT set_config('TimeZone', '+05', false)")
+        .1
+        .contains(unfolded));
+    // UTC by another name is UTC.
+    run(&mut w, "SET TimeZone = 'Etc/UTC'");
+    run(&mut w, "DROP TABLE s.t");
+    run(&mut w, "SET TimeZone = '<+05>-05'");
+    assert_eq!(rows(&mut w, "SHOW TimeZone"), ["<+05>-05"]);
 }

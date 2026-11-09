@@ -159,6 +159,56 @@ fn set_values(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<Vec<St
     }
 }
 
+/// SET TIME ZONE INTERVAL's value from the place after INTERVAL, as PostgreSQL's grammar reads it
+/// and flatten_set_variable_args writes it: `'…'` with HOUR, MINUTE or HOUR TO MINUTE or none, or
+/// `(p) '…'`, read as an interval of those fields and written back as `INTERVAL '…'`.
+fn zone_interval(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<String> {
+    use sqlparser::tokenizer::Token;
+    let mut precision = None;
+    if matches!(w.get(i), Some(Token::LParen)) {
+        let Some(Token::Number(n, _)) = w.get(i + 1) else {
+            return Err(syntax_at(w.get(i + 1)));
+        };
+        if !matches!(w.get(i + 2), Some(Token::RParen)) {
+            return Err(syntax_at(w.get(i + 2)));
+        }
+        precision = Some(
+            n.parse::<u32>()
+                .map_err(|_| syntax_at(w.get(i + 1)))?,
+        );
+        i += 3;
+    }
+    let text = match w.get(i) {
+        Some(Token::SingleQuotedString(s)) | Some(Token::EscapedStringLiteral(s)) => s.clone(),
+        other => return Err(syntax_at(other)),
+    };
+    i += 1;
+    let fields: Vec<String> = w[i.min(w.len())..]
+        .iter()
+        .map(|t| match t {
+            Token::Word(x) if x.quote_style.is_none() => x.value.to_lowercase(),
+            other => other.to_string(),
+        })
+        .collect();
+    let range = match (precision, fields.is_empty()) {
+        (_, true) => crate::times::INTERVAL_FULL_RANGE,
+        (Some(_), false) => return Err(syntax_at(w.get(i))),
+        (None, false) => {
+            let range = crate::times::interval_range(&fields.join(" "))
+                .ok_or_else(|| syntax_at(w.get(i)))?;
+            let hour_minute = crate::times::interval_range("hour to minute").unwrap_or(0);
+            if range & !hour_minute != 0 {
+                return Err(Error::new(
+                    "time zone interval must be HOUR or HOUR TO MINUTE",
+                ));
+            }
+            range
+        }
+    };
+    let v = crate::times::interval_in(&text, range, precision)?;
+    Ok(format!("INTERVAL '{}'", crate::times::interval_out(v)))
+}
+
 /// SET, SHOW and RESET read off their words; none where the words are no such statement, or one
 /// the snail reads elsewhere: SET TRANSACTION, SET SESSION CHARACTERISTICS and SET CONSTRAINTS.
 fn parse_setting(tokens: &[sqlparser::tokenizer::Token]) -> Option<Result<Said>> {
@@ -197,8 +247,24 @@ fn parse_setting(tokens: &[sqlparser::tokenizer::Token]) -> Option<Result<Said>>
                 ("SESSION", "AUTHORIZATION") => refused("SET SESSION AUTHORIZATION", roles),
                 ("TIME", "ZONE") => match keyword(w.get(i + 2)).as_str() {
                     "DEFAULT" | "LOCAL" if w.len() == i + 3 => named("timezone", None),
+                    "INTERVAL" => match zone_interval(&w, i + 3) {
+                        Ok(v) => named("timezone", Some(vec![v])),
+                        Err(e) => Some(Err(e)),
+                    },
+                    // A keyword is no zone_value: only a string, a number or an IDENT is.
+                    _ if matches!(w.get(i + 2), Some(sqlparser::tokenizer::Token::Word(x))
+                        if x.quote_style.is_none() && any_keyword(&x.value)) =>
+                    {
+                        Some(Err(syntax_at(w.get(i + 2))))
+                    }
+                    // One value, as the grammar's zone_value is.
                     _ => match set_values(&w, i + 2) {
-                        Ok(v) => named("timezone", Some(v)),
+                        Ok(v) if v.len() == 1 => named("timezone", Some(v)),
+                        Ok(_) => Some(Err(syntax_at(
+                            w.iter().skip(i + 2).find(|t| {
+                                matches!(t, sqlparser::tokenizer::Token::Comma)
+                            }),
+                        ))),
                         Err(e) => Some(Err(e)),
                     },
                 },
@@ -631,6 +697,28 @@ impl super::Snail {
         Ok(done)
     }
 
+    /// The zone the session's TimeZone names, held for a statement: what reads and writes its
+    /// instants' text, casts and calendar.
+    pub(super) fn in_zone(&self) -> crate::zones::InZone {
+        crate::zones::in_zone(
+            self.session
+                .settings
+                .all()
+                .get("timezone")
+                .map(String::as_str),
+        )
+    }
+
+    /// The session's TimeZone, as SHOW writes it.
+    pub(super) fn session_zone_name(&self) -> String {
+        self.session
+            .settings
+            .all()
+            .get("timezone")
+            .cloned()
+            .unwrap_or_else(|| "UTC".to_string())
+    }
+
     /// What set_config and current_setting read the session's settings and modes by.
     pub(super) fn settings_view(&self) -> super::settings::View {
         super::settings::View {
@@ -666,9 +754,7 @@ impl super::Snail {
         let value = match values.as_deref() {
             None => None,
             Some([v]) => Some(v.clone()),
-            Some(_) if name == "timezone" || name == "datestyle" => {
-                Some(values.unwrap().join(", "))
-            }
+            Some(_) if name == "datestyle" => Some(values.unwrap().join(", ")),
             Some(_) => return Err(Error::new(format!("SET {name} takes only one argument"))),
         };
         let taken = super::settings::taken(
@@ -689,6 +775,15 @@ impl super::Snail {
         local: bool,
     ) -> Result<()> {
         let begun = self.begun.is_some();
+        // A zone other than UTC only where no DDL literal would be read otherwise under it.
+        if let (true, super::settings::Taken::Stored(Some(zone))) = (name == "timezone", &taken) {
+            let _zoned = crate::zones::in_zone(Some(zone));
+            if !crate::zones::session_is_utc() {
+                if let Some(what) = super::folded::unfolded(&self.catalog) {
+                    return Err(super::folded::refusal(&what, zone));
+                }
+            }
+        }
         match taken {
             super::settings::Taken::Nothing => {}
             // SET LOCAL outside a transaction lasts no longer than the statement.
@@ -804,6 +899,14 @@ fn parse_execute(sql: &str) -> Option<Result<Said>> {
         }
         _ => None,
     }
+}
+
+/// Whether a word, unquoted, is one of PostgreSQL's keywords, of any kind: none is an IDENT.
+fn any_keyword(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    include_str!("../kwlist.txt")
+        .lines()
+        .any(|l| l.split('\t').next() == Some(lower.as_str()))
 }
 
 /// Whether a word, unquoted, is a name PostgreSQL's grammar takes as a column's (`ColId`): any
