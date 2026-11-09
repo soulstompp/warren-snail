@@ -170,6 +170,9 @@ pub(crate) struct Query {
     pub limit: Option<Node>,
     pub with_ties: bool,
     pub setop: Option<SetOp>,
+    /// A write's values, each coerced to the column it is written to, and its ON CONFLICT's
+    /// expressions; its RETURNING list is its targets.
+    pub assigned: Vec<Node>,
 }
 
 impl Query {
@@ -565,6 +568,21 @@ pub(crate) fn analyze(cat: &Cat, q: &A::Query, parent: Option<&Scope>, resolve: 
     Builder { cat, scope: &scope }.query(q, resolve, None)
 }
 
+mod writes;
+
+/// A statement analyzed as PostgreSQL's parse analysis reads it: a question as `analyze` reads
+/// one, an INSERT, UPDATE or DELETE as transformInsertStmt, transformUpdateStmt and
+/// transformDeleteStmt read them, its RETURNING list its targets.
+pub(crate) fn statement(cat: &Cat, st: &A::Statement) -> Result<Query> {
+    let scope = Scope::new(None);
+    let b = Builder { cat, scope: &scope };
+    match st {
+        A::Statement::Query(q) => b.query(q, true, None),
+        A::Statement::Insert(_) | A::Statement::Update(_) | A::Statement::Delete(_) => b.write(st),
+        other => Err(not_read(other)),
+    }
+}
+
 /// A recursive WITH query being read: the level it is defined at, its name and its column names.
 struct Recursing<'r, 'p> {
     at: &'r Scope<'p>,
@@ -628,6 +646,11 @@ impl<'b> Builder<'b, '_, '_> {
                     return Err(not_read(q));
                 }
                 self.values(v)?
+            }
+            A::SetExpr::Insert(s) | A::SetExpr::Update(s) | A::SetExpr::Delete(s)
+                if q.order_by.is_none() && q.limit_clause.is_none() && q.fetch.is_none() =>
+            {
+                self.write(s)?
             }
             other => return Err(not_read(other)),
         };
@@ -712,14 +735,6 @@ impl<'b> Builder<'b, '_, '_> {
         *self.scope.names.borrow_mut() = names;
         let a = self.analyzer();
         let mut targets = self.targets(&s.projection)?;
-        if resolve {
-            for t in targets.iter_mut() {
-                if t.expr.ty() == cat::UNKNOWN {
-                    let n = std::mem::replace(&mut t.expr, Node::List(Vec::new()));
-                    t.expr = a.coerce(n, cat::UNKNOWN, cat::TEXT, -1, Context::Implicit, Form::Implicit)?;
-                }
-            }
-        }
         let quals = s.selection.as_ref().map(|w| a.boolean(a.expr(w)?)).transpose()?;
         let having = s.having.as_ref().map(|h| a.boolean(a.expr(h)?)).transpose()?;
         let mut sort = Vec::new();
@@ -729,7 +744,7 @@ impl<'b> Builder<'b, '_, '_> {
             };
             for item in items {
                 let at = self.find_target(&item.expr, &mut targets, false, false)?;
-                sort.push(self.sort(&targets, at, item)?);
+                sort.push(self.sort(&mut targets, at, item)?);
             }
         }
         let mut group = Vec::new();
@@ -737,6 +752,7 @@ impl<'b> Builder<'b, '_, '_> {
             A::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => {
                 for e in exprs {
                     let at = self.find_target(e, &mut targets, true, false)?;
+                    self.as_text(&mut targets[at])?;
                     if !group.iter().any(|g: &Sort| g.resno == at + 1) {
                         group.push(Sort {
                             expr: targets[at].expr.clone(),
@@ -754,8 +770,19 @@ impl<'b> Builder<'b, '_, '_> {
             Some(A::Distinct::Distinct) => true,
             Some(A::Distinct::On(_)) => return Err(Error::new("DISTINCT ON is not printed as PostgreSQL prints it")),
         };
+        if distinct {
+            for t in targets.iter_mut().filter(|t| !t.junk) {
+                self.as_text(t)?;
+            }
+        }
         let (offset, limit, with_ties) = self.limits(q)?;
         let windows = self.windows(&mut targets)?;
+        // resolveTargetListUnknowns, once the rest is read: each output still unknown is text.
+        if resolve {
+            for t in targets.iter_mut() {
+                self.as_text(t)?;
+            }
+        }
         Ok(Query {
             rtable: self.scope.rtable.borrow().clone(),
             from,
@@ -773,10 +800,21 @@ impl<'b> Builder<'b, '_, '_> {
         })
     }
 
-    fn sort(&self, targets: &[Target], at: usize, item: &A::OrderByExpr) -> Result<Sort> {
+    /// A target whose type is still unknown read as text, as addTargetToSortList and
+    /// addTargetToGroupList read one, and resolveTargetListUnknowns.
+    fn as_text(&self, t: &mut Target) -> Result<()> {
+        if t.expr.ty() == cat::UNKNOWN {
+            let n = std::mem::replace(&mut t.expr, Node::List(Vec::new()));
+            t.expr = self.analyzer().coerce(n, cat::UNKNOWN, cat::TEXT, -1, Context::Implicit, Form::Implicit)?;
+        }
+        Ok(())
+    }
+
+    fn sort(&self, targets: &mut [Target], at: usize, item: &A::OrderByExpr) -> Result<Sort> {
         if item.with_fill.is_some() {
             return Err(not_read(item));
         }
+        self.as_text(&mut targets[at])?;
         let desc = match &item.options.sort {
             None | Some(A::OrderBySort::Asc) => false,
             Some(A::OrderBySort::Desc) => true,
@@ -873,6 +911,7 @@ impl<'b> Builder<'b, '_, '_> {
             let mut partition = Vec::new();
             for e in &d.spec.partition_by {
                 let at = self.find_target(e, targets, false, true)?;
+                self.as_text(&mut targets[at])?;
                 partition.push(Sort {
                     expr: targets[at].expr.clone(),
                     resno: at + 1,
@@ -1002,46 +1041,8 @@ impl<'b> Builder<'b, '_, '_> {
                 sample: None,
                 index_hints,
             } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty() => {
-                let parts: Vec<String> = name.0.iter().filter_map(|p| p.as_ident().map(super::analyze::folded)).collect();
                 let alias = alias.as_ref().map(table_alias).transpose()?;
-                if let [n] = parts.as_slice() {
-                    if let Some(def) = self.scope.cte(n) {
-                        return Ok(self.cte_item(def, alias));
-                    }
-                }
-                let (schema, rel) = match parts.as_slice() {
-                    [n] => ("public".to_string(), n.clone()),
-                    [s, n] => (s.clone(), n.clone()),
-                    _ => return Err(not_read(name)),
-                };
-                if schema == "public" && parts.len() == 1 && catalog_relation(self.cat, &rel) {
-                    return Err(not_read(name));
-                }
-                let key = format!("{schema}.{rel}");
-                let cols = relation(self.cat, &key)?
-                    .ok_or_else(|| Error::new(format!("relation \"{name}\" does not exist")))?;
-                let names = renamed(cols.iter().map(|c| c.0.clone()).collect(), alias.as_ref());
-                let ename = alias.as_ref().map_or_else(|| rel.clone(), |a| a.name.clone());
-                let rtindex = self.scope.add(Rte {
-                    kind: RteKind::Relation {
-                        name: rel,
-                        namespace: namespace_oid(self.cat, &schema),
-                        columns: cols.iter().map(|c| c.0.clone()).collect(),
-                    },
-                    alias: alias.clone(),
-                    ename: ename.clone(),
-                    ecols: names.clone(),
-                    in_from: true,
-                });
-                let ns = Ns {
-                    refname: ename,
-                    schema: alias.is_none().then_some(schema),
-                    rel_visible: true,
-                    cols_visible: true,
-                    names,
-                    cols: plain_cols(rtindex, &cols),
-                };
-                Ok((Jt::Ref(rtindex), ns.clone(), vec![ns]))
+                self.relation_item(name, alias, true)
             }
             A::TableFactor::Derived {
                 lateral: false,
@@ -1113,6 +1114,50 @@ impl<'b> Builder<'b, '_, '_> {
             }
             other => Err(not_read(other)),
         }
+    }
+
+    /// A relation a FROM item names, a WITH query's where `ctes` lets one be: its range table
+    /// entry, and its namespace item.
+    fn relation_item(&self, name: &A::ObjectName, alias: Option<Alias>, ctes: bool) -> Result<(Jt, Ns, Vec<Ns>)> {
+        let parts: Vec<String> = name.0.iter().filter_map(|p| p.as_ident().map(super::analyze::folded)).collect();
+        if let [n] = parts.as_slice() {
+            if let Some(def) = self.scope.cte(n).filter(|_| ctes) {
+                return Ok(self.cte_item(def, alias));
+            }
+        }
+        let (schema, rel) = match parts.as_slice() {
+            [n] => ("public".to_string(), n.clone()),
+            [s, n] => (s.clone(), n.clone()),
+            _ => return Err(not_read(name)),
+        };
+        if schema == "public" && parts.len() == 1 && catalog_relation(self.cat, &rel) {
+            return Err(not_read(name));
+        }
+        let key = format!("{schema}.{rel}");
+        let cols = relation(self.cat, &key)?
+            .ok_or_else(|| Error::new(format!("relation \"{name}\" does not exist")))?;
+        let names = renamed(cols.iter().map(|c| c.0.clone()).collect(), alias.as_ref());
+        let ename = alias.as_ref().map_or_else(|| rel.clone(), |a| a.name.clone());
+        let rtindex = self.scope.add(Rte {
+            kind: RteKind::Relation {
+                name: rel,
+                namespace: namespace_oid(self.cat, &schema),
+                columns: cols.iter().map(|c| c.0.clone()).collect(),
+            },
+            alias: alias.clone(),
+            ename: ename.clone(),
+            ecols: names.clone(),
+            in_from: true,
+        });
+        let ns = Ns {
+            refname: ename,
+            schema: alias.is_none().then_some(schema),
+            rel_visible: true,
+            cols_visible: true,
+            names,
+            cols: plain_cols(rtindex, &cols),
+        };
+        Ok((Jt::Ref(rtindex), ns.clone(), vec![ns]))
     }
 
     fn cte_item(&self, def: CteDef, alias: Option<Alias>) -> (Jt, Ns, Vec<Ns>) {
@@ -1279,7 +1324,7 @@ impl<'b> Builder<'b, '_, '_> {
                 _ => Vec::new(),
             }
         };
-        let targets: Vec<Target> = cols
+        let mut targets: Vec<Target> = cols
             .iter()
             .enumerate()
             .map(|(i, (ty, typmod))| Target {
@@ -1314,7 +1359,7 @@ impl<'b> Builder<'b, '_, '_> {
                 }
                 .filter(|&p| p < targets.len())
                 .ok_or_else(|| not_read(&item.expr))?;
-                sort.push(self.sort(&targets, at, item)?);
+                sort.push(self.sort(&mut targets, at, item)?);
             }
         }
         let (offset, limit, with_ties) = self.limits(q)?;
@@ -1455,7 +1500,7 @@ impl<'b> Builder<'b, '_, '_> {
         let Some(t) = sub.targets.iter_mut().filter(|t| !t.junk).nth(i) else {
             return Ok(());
         };
-        if t.expr.ty() == cat::UNKNOWN && matches!(t.expr, Node::Const { .. }) {
+        if t.expr.ty() == cat::UNKNOWN && matches!(t.expr, Node::Const { .. } | Node::Param { .. }) {
             let a = self.analyzer();
             let n = std::mem::replace(&mut t.expr, Node::List(Vec::new()));
             t.expr = a.to_common(n, ty)?;

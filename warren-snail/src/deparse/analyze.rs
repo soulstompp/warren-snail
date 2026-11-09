@@ -200,6 +200,12 @@ pub(crate) enum Node {
         typmod: i32,
     },
     List(Vec<Node>),
+    /// A statement's parameter, `$n`: its type as the statement's reading has settled it where it
+    /// stands, unknown until a coercion settles it.
+    Param {
+        n: usize,
+        ty: u32,
+    },
 }
 
 impl Node {
@@ -228,7 +234,8 @@ impl Node {
             | N::Field { ty, .. }
             | N::Agg { ty, .. }
             | N::Window { ty, .. }
-            | N::SubLink { ty, .. } => *ty,
+            | N::SubLink { ty, .. }
+            | N::Param { ty, .. } => *ty,
             N::Bool { .. }
             | N::NullTest { .. }
             | N::BoolTest { .. }
@@ -943,6 +950,7 @@ impl Analyzer<'_, '_> {
                 text: Some(if *b { "t" } else { "f" }.into()),
             },
             SqlValue::Null => unknown(None),
+            SqlValue::Placeholder(p) => super::params::reference(p).ok_or_else(|| not_read(e))??,
             SqlValue::HexStringLiteral(_) | SqlValue::SingleQuotedByteStringLiteral(_) => {
                 return Err(not_read(e))
             }
@@ -1033,7 +1041,50 @@ impl Analyzer<'_, '_> {
                     },
                     other => (binary_name(other).ok_or_else(|| not_read(e))?, None),
                 };
+                if let (Some(l), Some(r)) = (row_written(left), row_written(right)) {
+                    return self.row_comparison(&name, schema, l, r);
+                }
                 self.op(&name, schema, Some(self.expr(left)?), self.expr(right)?)
+            }
+        }
+    }
+
+    /// make_row_comparison_op: a row compared with a row column by column, each pair by the
+    /// operator its types find; `=` all of them, `<>` any, and an ordering the rows over the
+    /// columns so coerced.
+    fn row_comparison(&self, name: &str, schema: Option<u32>, l: &[Expr], r: &[Expr]) -> Result<Node> {
+        let largs = l.iter().map(|x| self.expr(x)).collect::<Result<Vec<_>>>()?;
+        let rargs = r.iter().map(|x| self.expr(x)).collect::<Result<Vec<_>>>()?;
+        if largs.len() != rargs.len() {
+            return Err(Error::new("unequal number of entries in row expressions"));
+        }
+        let mut ops = Vec::with_capacity(largs.len());
+        for (a, b) in largs.into_iter().zip(rargs) {
+            let o = self.op(name, schema, Some(a), b)?;
+            if o.ty() != cat::BOOL {
+                return Err(Error::new(format!(
+                    "row comparison operator must yield type boolean, not type {}",
+                    self.type_name(o.ty())
+                )));
+            }
+            ops.push(o);
+        }
+        if ops.len() == 1 {
+            return Ok(ops.remove(0));
+        }
+        match name {
+            "=" => Ok(Node::Bool { op: BoolOp::And, args: ops }),
+            "<>" => Ok(Node::Bool { op: BoolOp::Or, args: ops }),
+            _ => {
+                let (mut ls, mut rs) = (Vec::new(), Vec::new());
+                for o in ops {
+                    if let Node::Op { mut args, .. } = o {
+                        rs.extend(args.pop());
+                        ls.extend(args.pop());
+                    }
+                }
+                let row = |args| Node::Row { args, ty: cat::RECORD, explicit: false };
+                self.op(name, schema, Some(row(ls)), row(rs))
             }
         }
     }
@@ -1094,13 +1145,11 @@ impl Analyzer<'_, '_> {
             }
         }
         let list: Vec<Vec<u32>> = candidates.iter().map(|o| vec![o.left, o.right]).collect();
-        match self.select(&[l, r], &list) {
-            Some(i) => Ok(candidates[i].clone()),
-            None => Err(Error::new(format!(
-                "operator does not exist: {} {name} {}",
-                self.type_name(l),
-                self.type_name(r)
-            ))),
+        let found = |not: &str| format!("operator {not}: {} {name} {}", self.type_name(l), self.type_name(r));
+        match self.choose(&[l, r], &list) {
+            Chosen::One(i) => Ok(candidates[i].clone()),
+            Chosen::NotFound => Err(Error::new(found("does not exist"))),
+            Chosen::NotUnique => Err(Error::new(found("is not unique"))),
         }
     }
 
@@ -1110,12 +1159,11 @@ impl Analyzer<'_, '_> {
             return Ok((*o).clone());
         }
         let list: Vec<Vec<u32>> = candidates.iter().map(|o| vec![o.right]).collect();
-        match self.select(&[r], &list) {
-            Some(i) => Ok(candidates[i].clone()),
-            None => Err(Error::new(format!(
-                "operator does not exist: {name} {}",
-                self.type_name(r)
-            ))),
+        let found = |not: &str| format!("operator {not}: {name} {}", self.type_name(r));
+        match self.choose(&[r], &list) {
+            Chosen::One(i) => Ok(candidates[i].clone()),
+            Chosen::NotFound => Err(Error::new(found("does not exist"))),
+            Chosen::NotUnique => Err(Error::new(found("is not unique"))),
         }
     }
 
@@ -1131,15 +1179,18 @@ impl Analyzer<'_, '_> {
         super::print::format_type(self.cat, t, -1)
     }
 
-    /// The candidate oper_select_candidate and func_select_candidate choose, where one is chosen.
-    fn select(&self, input: &[u32], candidates: &[Vec<u32>]) -> Option<usize> {
+    /// What oper_select_candidate and func_select_candidate come to: the candidate chosen, none
+    /// that takes the arguments, or several and none of them best.
+    fn choose(&self, input: &[u32], candidates: &[Vec<u32>]) -> Chosen {
         let matching: Vec<usize> = (0..candidates.len())
             .filter(|&i| self.can_coerce_all(input, &candidates[i], Context::Implicit))
             .collect();
         match matching.len() {
-            0 => None,
-            1 => Some(matching[0]),
-            _ => self.select_candidate(input, candidates, matching),
+            0 => Chosen::NotFound,
+            1 => Chosen::One(matching[0]),
+            _ => self
+                .select_candidate(input, candidates, matching)
+                .map_or(Chosen::NotUnique, Chosen::One),
         }
     }
 
@@ -1418,6 +1469,11 @@ impl Analyzer<'_, '_> {
                     text,
                 };
                 return self.to_domain(c, base, base_typmod, target, ctx, form, false);
+            }
+            // A parameter not yet settled takes the type it is coerced to, as PostgreSQL's
+            // variable_coerce_param_hook gives it.
+            if let Node::Param { n, .. } = node {
+                return super::params::settled(self.cat, n, target);
             }
         }
         if let Node::Collate { arg, coll } = node {
@@ -2082,7 +2138,16 @@ impl Analyzer<'_, '_> {
                     }
                 }
                 let lists: Vec<Vec<u32>> = forms.iter().map(|f| f.1.clone()).collect();
-                self.select(&actual, &lists)
+                match self.choose(&actual, &lists) {
+                    Chosen::One(c) => Some(c),
+                    Chosen::NotFound => None,
+                    Chosen::NotUnique => {
+                        return Err(Error::new(format!(
+                            "function {name}({}) is not unique",
+                            actual.iter().map(|&t| self.type_name(t)).collect::<Vec<_>>().join(", ")
+                        )))
+                    }
+                }
             }
         };
         let Some(c) = chosen else {
@@ -2118,6 +2183,25 @@ impl Analyzer<'_, '_> {
             variadic,
         })
     }
+}
+
+/// The values of a row written out, `(a, b)`, with its parentheses taken off.
+fn row_written(e: &Expr) -> Option<&[Expr]> {
+    let mut x = e;
+    while let Expr::Nested(i) = x {
+        x = i;
+    }
+    match x {
+        Expr::Tuple(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// What a candidate's selection comes to.
+enum Chosen {
+    One(usize),
+    NotFound,
+    NotUnique,
 }
 
 /// How a coercion converts: by its type alone, a function, element by element, or through text.

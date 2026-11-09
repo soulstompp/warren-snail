@@ -928,6 +928,14 @@ impl Snail {
             }
         };
         // A statement refused fails its transaction, as one that fails as it runs does.
+        if !self.aborted {
+            if let Err(e) = self.parameters_read(sql, params) {
+                if self.begun.is_some() {
+                    self.failed()?;
+                }
+                return Err(e);
+            }
+        }
         // WHERE CURRENT OF a cursor finds the row it stands on by the table's key.
         let current;
         let text = match super::cursor::mentions_current_of(text) {

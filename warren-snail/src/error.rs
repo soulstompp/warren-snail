@@ -1,20 +1,30 @@
 use std::fmt;
 
-/// Everything the snail refuses or fails on, as one sentence saying why.
+/// Everything the snail refuses or fails on, as one sentence saying why, and PostgreSQL's SQLSTATE
+/// where its words alone do not tell it.
 #[derive(Debug)]
-pub struct Error(pub String);
+pub struct Error(pub String, Option<&'static str>);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn new(msg: impl Into<String>) -> Self {
-        Error(msg.into())
+        Error(msg.into(), None)
+    }
+
+    /// A failure PostgreSQL raises with `code`, where the same words are raised with another code
+    /// elsewhere.
+    pub fn coded(code: &'static str, msg: impl Into<String>) -> Self {
+        Error(msg.into(), Some(code))
     }
 
     /// PostgreSQL's SQLSTATE, where the sentence is PostgreSQL's own failure: of a transaction or of
     /// what it may do (that a retry may succeed, that it waited in a ring, that it holds what it may
     /// not take), of a constraint, of a value, or of a name, each in PostgreSQL's words.
     pub fn sqlstate(&self) -> Option<&'static str> {
+        if self.1.is_some() {
+            return self.1;
+        }
         let first = self.0.lines().next().unwrap_or_default();
         if let Some(code) = said(first) {
             return Some(code);
@@ -153,7 +163,15 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("operator does not exist: "), "42883"),
     (Words::Holds("function ", " does not exist"), "42883"),
     (Words::Starts("operator is not unique: "), "42725"),
+    (Words::Holds("function ", " is not unique"), "42725"),
     (Words::Starts("could not determine data type of parameter "), "42P18"),
+    (Words::Starts("inconsistent types deduced for parameter "), "42P08"),
+    (Words::Starts("there is no parameter $"), "42P02"),
+    (Words::Holds("prepared statement \"", "\" already exists"), "42P05"),
+    (Words::Holds("prepared statement \"", "\" does not exist"), "26000"),
+    (Words::Starts("wrong number of parameters for prepared statement \""), "42601"),
+    (Words::Holds("parameter $", " cannot be coerced to the expected type "), "42804"),
+    (Words::Is("cannot use subquery in EXECUTE parameter"), "0A000"),
     (Words::Holds("cannot drop ", " because other objects depend on it"), "2BP01"),
     (Words::Is("cannot truncate a table referenced in a foreign key constraint"), "0A000"),
     (Words::Starts("nondeterministic collations are not supported for "), "0A000"),
@@ -203,7 +221,7 @@ macro_rules! from {
     ($($t:ty),*) => {$(
         impl From<$t> for Error {
             fn from(e: $t) -> Self {
-                Error(e.to_string())
+                Error(e.to_string(), None)
             }
         }
     )*};

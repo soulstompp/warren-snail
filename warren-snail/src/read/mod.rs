@@ -1511,12 +1511,26 @@ impl Snail {
         asked
     }
 
+    /// A protocol's Parse of a statement given its parameters: each typed as PostgreSQL's parse
+    /// analysis types them before anything runs, and refused where that reading refuses it.
+    pub(super) fn parameters_read(&self, sql: &str, params: &[String]) -> Result<()> {
+        if params.is_empty() {
+            return Ok(());
+        }
+        let _named = crate::oids::named(self.catalog.oids.clone());
+        match crate::deparse::params::types(&self.catalog, sql, &[], true) {
+            Err(e) if crate::deparse::params::refuses(&e) => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     fn round_asked(
         &mut self,
         sql: &str,
         order: Option<&str>,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
+        self.parameters_read(sql, params)?;
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _zoned = self.in_zone();

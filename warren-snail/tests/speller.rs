@@ -4,7 +4,8 @@
 //! row, a boolean's casts to and from an integer, a column's default set and dropped, a write
 //! returning rows of what it changed, its `old` and `new` among them, a write through a view reaching
 //! its table, each CHECK OPTION met, an INSERT of fewer values than columns, the replica role
-//! switching the foreign keys off. Every word,
+//! switching the foreign keys off, each parameter typed where PostgreSQL's parse analysis settles it
+//! and refused where it cannot. Every word,
 //! code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -1758,4 +1759,95 @@ fn a_ddl_literal_its_zone_or_its_clock_reads_is_kept_as_its_value_where_it_is_de
         rows(&mut w, "SELECT id, e FROM s.t ORDER BY id"),
         ["1|2026-07-01 00:00:00+05", "4|2026-07-01 00:00:00+05", "5|2026-07-01 00:00:00+05"]
     );
+}
+
+#[test]
+fn a_parameter_is_typed_where_postgresql_settles_it_and_refused_where_it_cannot_be() {
+    let mut w = snail("params");
+    run(
+        &mut w,
+        "CREATE TABLE s.p (k integer NOT NULL, a varchar(5), n numeric(6,2), b boolean, PRIMARY KEY (k))",
+    );
+    run(&mut w, "INSERT INTO s.p VALUES (1, 'ab', 1.50, true), (2, 'cd', 2.25, false)");
+    // PREPARE refused where 18.6's parse analysis cannot settle a parameter, in its words.
+    for (sql, code, words) in [
+        ("PREPARE a AS SELECT $1 + $2", "42725", "operator is not unique: unknown + unknown"),
+        ("PREPARE a AS SELECT -$1", "42725", "operator is not unique: - unknown"),
+        ("PREPARE a AS SELECT $1 IS NULL", "42P18", "could not determine data type of parameter $1"),
+        ("PREPARE a AS SELECT $2", "42P18", "could not determine data type of parameter $1"),
+        ("PREPARE a AS SELECT $1 IS NULL, $1 = 1", "42P08", "could not determine data type of parameter $1"),
+        (
+            "PREPARE a AS SELECT $1 WHERE $1 = 1",
+            "42P08",
+            "inconsistent types deduced for parameter $1: integer versus text",
+        ),
+        (
+            "PREPARE a AS SELECT k FROM s.p WHERE a = $1 AND k = $1",
+            "42883",
+            "operator does not exist: integer = text",
+        ),
+        (
+            "PREPARE a AS INSERT INTO s.p (k, a) VALUES ($1, $1)",
+            "42P08",
+            "inconsistent types deduced for parameter $1: integer versus character varying",
+        ),
+        (
+            "PREPARE a AS UPDATE s.p SET k = $1 WHERE $1 IS NULL",
+            "42P08",
+            "could not determine data type of parameter $1",
+        ),
+        (
+            "PREPARE a (int) AS SELECT k FROM s.p WHERE a = $1",
+            "42883",
+            "operator does not exist: character varying = integer",
+        ),
+        ("PREPARE a (nosuchtype) AS SELECT $1", "42704", "type \"nosuchtype\" does not exist"),
+        ("PREPARE a AS SELECT $0", "42P02", "there is no parameter $0"),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
+    // Each answered as its parameters' types answer it.
+    run(&mut w, "PREPARE r AS SELECT abs($1)");
+    assert_eq!(rows(&mut w, "EXECUTE r ('-2.5')"), ["2.5"]);
+    run(&mut w, "PREPARE g (numeric) AS SELECT $1 + $2");
+    assert_eq!(rows(&mut w, "EXECUTE g (1.5, 2)"), ["3.5"]);
+    run(&mut w, "PREPARE i (bigint) AS SELECT k FROM s.p WHERE k = $1");
+    assert_eq!(rows(&mut w, "EXECUTE i (2)"), ["2"]);
+    run(&mut w, "PREPARE v (varchar(3)) AS SELECT $1");
+    assert_eq!(rows(&mut w, "EXECUTE v ('abcdef')"), ["abcdef"]);
+    run(&mut w, "PREPARE u AS UPDATE s.p SET n = n + $1 WHERE k = $2 RETURNING n * $3");
+    assert_eq!(rows(&mut w, "EXECUTE u ('1.25', 1, 2)"), ["5.50"]);
+    // EXECUTE's arguments read as EvaluateParams reads them.
+    run(&mut w, "PREPARE t AS SELECT $1");
+    run(&mut w, "PREPARE f AS UPDATE s.p SET b = $1 WHERE k = 1");
+    for (sql, code, words) in [
+        ("EXECUTE t ($1)", "42P02", "there is no parameter $1"),
+        ("EXECUTE t ((SELECT 3))", "0A000", "cannot use subquery in EXECUTE parameter"),
+        ("EXECUTE t (k)", "42703", "column \"k\" does not exist"),
+        (
+            "EXECUTE t",
+            "42601",
+            "wrong number of parameters for prepared statement \"t\": Expected 1 parameters but got 0.",
+        ),
+        (
+            "EXECUTE f (1)",
+            "42804",
+            "parameter $1 of type integer cannot be coerced to the expected type boolean",
+        ),
+        ("PREPARE t AS SELECT 2", "42P05", "prepared statement \"t\" already exists"),
+        ("EXECUTE nosuch (1)", "26000", "prepared statement \"nosuch\" does not exist"),
+        ("DEALLOCATE nosuch", "26000", "prepared statement \"nosuch\" does not exist"),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
+    // A host's statement given its parameters is read as a protocol's Parse reads it.
+    let one = |v: &str| vec![v.to_string()];
+    let e = w.execute_with("SELECT $1 + $2", &[one("1"), one("2")].concat()).unwrap_err();
+    assert_eq!((e.sqlstate(), e.0.as_str()), (Some("42725"), "operator is not unique: unknown + unknown"));
+    let e = w.execute_with("SELECT $1 IS NULL", &one("1")).unwrap_err();
+    assert_eq!(e.sqlstate(), Some("42P18"));
+    let e = w.ask_with("SELECT $1 WHERE $1 = 1", None, &one("1")).unwrap_err();
+    assert_eq!(e.sqlstate(), Some("42P08"));
+    let (b, _) = w.ask_with("SELECT k FROM s.p WHERE k = $1", None, &one("2")).unwrap();
+    assert_eq!(b.num_rows(), 1);
 }

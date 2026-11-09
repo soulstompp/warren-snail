@@ -580,6 +580,7 @@ impl Printer<'_, '_> {
                 }
             }
             N::List(items) => self.list(items, implicit)?,
+            N::Param { n, .. } => self.push(&format!("${n}")),
         }
         Ok(())
     }

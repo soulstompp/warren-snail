@@ -11,6 +11,7 @@ pub(crate) mod defs;
 pub(crate) mod depend;
 pub(crate) mod fold;
 pub(crate) mod funcs;
+pub(crate) mod params;
 pub(crate) mod print;
 pub(crate) mod query;
 pub(crate) mod viewdef;

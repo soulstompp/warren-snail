@@ -1,6 +1,8 @@
 //! Prepared statements, as PostgreSQL's PREPARE keeps them for its session: each its name, the types
 //! of its parameters and its statement, run by EXECUTE with its parameters' values. A parameter's
-//! type is the one PREPARE names, or the one the column it meets gives it, or text.
+//! type is the one PREPARE names, else the one PostgreSQL's parse analysis settles where it stands
+//! (`deparse::params`), and PREPARE is refused where that reading refuses it; where the reading
+//! reads no such statement, the type the column it meets gives it, or text.
 
 use super::Snail;
 use crate::catalog::Catalog;
@@ -10,11 +12,50 @@ use sqlparser::ast::{Expr, SetExpr, Statement as Sql};
 /// A statement PREPARE keeps.
 #[derive(Clone, Debug)]
 pub(super) struct Prepared {
-    /// Each parameter's type, as PREPARE names it or as where it stands gives it; none where
-    /// neither does, and it is read as a literal is, by its context.
+    /// Each parameter's type by its name, as PREPARE names it or as where it stands settles it;
+    /// none where neither does, and it is read as a literal is, by its context.
     pub(super) types: Vec<Option<String>>,
+    /// Each parameter's type by its OID, where PostgreSQL's reading of the statement settled
+    /// them all.
+    pub(super) oids: Option<Vec<u32>>,
+    /// Each reference to a parameter, in the order they stand: how its value is written there.
+    pub(super) written: Vec<Written>,
     /// The statement, as written.
     pub(super) statement: String,
+}
+
+/// How a parameter's value is written where a reference to it stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Written {
+    /// As a literal, which its context reads as the parameter's type.
+    Bare,
+    /// Cast to the parameter's type, which a literal standing there would be read as no longer.
+    Cast,
+    /// As a literal where its value reads the same as this integer type, which a literal standing
+    /// there is read as, the parameter's being another integer type; else cast.
+    BareAs(String),
+}
+
+/// smallint, integer and bigint.
+fn integer(oid: u32) -> bool {
+    matches!(oid, 20 | 21 | 23)
+}
+
+/// The type a value of `ty` is worked out as: a file's domain's base type, whose checks the
+/// statement makes where the value stands.
+fn worked_out_as<'a>(catalog: &'a Catalog, ty: &'a str) -> &'a str {
+    let mut t = ty;
+    for _ in 0..catalog.domains.len() {
+        let found = catalog.domains.iter().find(|d| {
+            let full = crate::oids::full(&d.name);
+            d.name == t || full == t || full == format!("public.{t}")
+        });
+        match found {
+            Some(d) => t = &d.base,
+            None => break,
+        }
+    }
+    t
 }
 
 /// The highest parameter, `$n`, a statement names.
@@ -313,7 +354,8 @@ pub(super) fn parse_prepare(sql: &str) -> Option<Result<(String, Vec<Option<Stri
 /// A session's prepared statements, by name.
 pub(super) type Kept = std::collections::BTreeMap<String, Prepared>;
 
-/// PREPARE: the statement kept under `name`, each parameter's type named or inferred.
+/// PREPARE: the statement kept under `name`, each parameter's type named or settled where it
+/// stands.
 pub(super) fn prepare(
     kept: &mut Kept,
     catalog: &Catalog,
@@ -321,43 +363,88 @@ pub(super) fn prepare(
     given: Vec<Option<String>>,
     body: &str,
 ) -> Result<()> {
-    {
-        if kept.contains_key(name) {
-            return Err(Error::new(format!(
-                "prepared statement \"{name}\" already exists"
-            )));
+    if kept.contains_key(name) {
+        return Err(Error::new(format!(
+            "prepared statement \"{name}\" already exists"
+        )));
+    }
+    let first = body
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if !matches!(
+        first.as_str(),
+        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "VALUES" | "WITH" | "TABLE" | "MERGE"
+    ) {
+        return Err(Error::new(format!("syntax error at or near \"{first}\"")));
+    }
+    use crate::deparse::params;
+    // typenameTypeId: each type named, read before the statement, its typmod dropped.
+    let named: Vec<u32> = given
+        .iter()
+        .map(|g| g.as_deref().map_or(Ok(0), |t| params::named_type(catalog, t)))
+        .collect::<Result<_>>()?;
+    let (text, refs) = params::each_reference(body)?;
+    let prepared = match params::types(catalog, body, &named, true) {
+        Ok(oids) => {
+            let names = params::type_names(catalog, &oids);
+            // Each reference's own type, as a literal standing there would be read.
+            let own = params::types(catalog, &text, &[], false).ok();
+            let own_names = own.as_deref().map(|o| params::type_names(catalog, o));
+            let written = refs
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| {
+                    let slot = oids[k - 1];
+                    match (&own, &own_names) {
+                        (Some(own), Some(n)) => match own.get(i).copied() {
+                            Some(t) if t == slot => Written::Bare,
+                            Some(t) if integer(t) && integer(slot) => Written::BareAs(n[i].clone()),
+                            _ => Written::Cast,
+                        },
+                        _ if named.get(k - 1).is_some_and(|&t| t != 0) => Written::Cast,
+                        _ => Written::Bare,
+                    }
+                })
+                .collect();
+            Prepared {
+                types: names.into_iter().map(Some).collect(),
+                oids: Some(oids),
+                written,
+                statement: body.to_string(),
+            }
         }
-        let first = body
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .find(|w| !w.is_empty())
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        if !matches!(
-            first.as_str(),
-            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "VALUES" | "WITH" | "TABLE" | "MERGE"
-        ) {
-            return Err(Error::new(format!("syntax error at or near \"{first}\"")));
-        }
-        let n = highest(body)?.max(given.len());
-        let inferred = inferred(&catalog, body, n);
-        let types = (0..n)
-            .map(|k| {
-                given
-                    .get(k)
-                    .cloned()
-                    .flatten()
-                    .or_else(|| inferred[k].clone())
-            })
-            .collect();
-        kept.insert(
-            name.to_string(),
+        Err(e) if params::refuses(&e) => return Err(e),
+        // A statement the reading does not read: each parameter typed by the column it meets.
+        Err(_) => {
+            let n = highest(body)?.max(given.len());
+            let inferred = inferred(catalog, body, n);
+            let named_names = params::type_names(catalog, &named);
+            let types: Vec<Option<String>> = (0..n)
+                .map(|k| match named.get(k) {
+                    Some(&t) if t != 0 => Some(named_names[k].clone()),
+                    _ => inferred[k].clone(),
+                })
+                .collect();
+            let returned = returned_params(body);
+            let written = refs
+                .iter()
+                .map(|k| match types[k - 1].is_some() && returned.contains(k) {
+                    true => Written::Cast,
+                    false => Written::Bare,
+                })
+                .collect();
             Prepared {
                 types,
+                oids: None,
+                written,
                 statement: body.to_string(),
-            },
-        );
-        Ok(())
-    }
+            }
+        }
+    };
+    kept.insert(name.to_string(), prepared);
+    Ok(())
 }
 
 /// EXECUTE: the statement kept under `name`, each parameter's value worked out from its expression
@@ -369,16 +456,15 @@ pub(super) fn bound(kept: &Kept, catalog: &Catalog, name: &str, args: &[String])
         })?;
         if args.len() != p.types.len() {
             return Err(Error::new(format!(
-                "wrong number of parameters for prepared statement \"{name}\""
+                "wrong number of parameters for prepared statement \"{name}\": Expected {} \
+                 parameters but got {}.",
+                p.types.len(),
+                args.len()
             )));
         }
         let casings = super::pipeline::Casings::of_file(catalog.monetary, catalog.text_search);
-        let mut values = Vec::with_capacity(args.len());
-        for (a, ty) in args.iter().zip(&p.types) {
-            let text = match ty {
-                Some(ty) => format!("CAST(CAST(({a}) AS {ty}) AS text)"),
-                None => format!("CAST(({a}) AS text)"),
-            };
+        // A value worked out as text.
+        let evaluated = |a: &str, text: &str| -> Result<Option<String>> {
             let parsed = super::image::parse_sql(&format!("SELECT {text}"))?;
             let e = match parsed.as_slice() {
                 [Sql::Query(q)] => match q.body.as_ref() {
@@ -390,14 +476,23 @@ pub(super) fn bound(kept: &Kept, catalog: &Catalog, name: &str, args: &[String])
                 },
                 _ => return Err(Error::new(format!("syntax error at or near \"{a}\""))),
             };
-            let v = super::pipeline::eval_on(&e, &[], &[], catalog.release, &casings)?;
-            values.push(v.text());
+            Ok(super::pipeline::eval_on(&e, &[], &[], catalog.release, &casings)?.text())
+        };
+        let mut values = Vec::with_capacity(args.len());
+        for (k, (a, ty)) in args.iter().zip(&p.types).enumerate() {
+            let expected = p.oids.as_ref().map_or(0, |o| o[k]);
+            crate::deparse::params::argument(catalog, k + 1, a, expected)?;
+            let text = match ty {
+                Some(ty) => format!("CAST(CAST(({a}) AS {}) AS text)", worked_out_as(catalog, ty)),
+                None => format!("CAST(({a}) AS text)"),
+            };
+            values.push(evaluated(a, &text)?);
         }
-        // Each parameter where it stands: a NULL, a literal of its type where it is a column the
-        // statement returns, else a literal its context reads.
-        let returned = returned_params(&p.statement);
+        // Each parameter where it stands: a literal its context reads as the parameter's type, or
+        // its value cast to that type where a literal there would be read as another.
         let mut out = String::with_capacity(p.statement.len());
         let mut from = 0;
+        let mut at = 0;
         for (t, a, b) in super::statement::spans(&p.statement)? {
             let sqlparser::tokenizer::Token::Placeholder(ph) = t else {
                 continue;
@@ -405,11 +500,20 @@ pub(super) fn bound(kept: &Kept, catalog: &Catalog, name: &str, args: &[String])
             let Some(k) = ph.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) else {
                 continue;
             };
+            let cast = match (p.written.get(at), &values[k - 1]) {
+                (Some(Written::Cast), _) => true,
+                (Some(Written::BareAs(t)), Some(v)) => {
+                    let quoted = v.replace('\'', "''");
+                    evaluated(v, &format!("CAST(CAST('{quoted}' AS {t}) AS text)")).ok().flatten().as_ref() != Some(v)
+                }
+                _ => false,
+            };
+            at += 1;
             out.push_str(&p.statement[from..a]);
             match (&values[k - 1], &p.types[k - 1]) {
-                (None, Some(ty)) => out.push_str(&format!("CAST(NULL AS {ty})")),
-                (None, None) => out.push_str("NULL"),
-                (Some(v), Some(ty)) if returned.contains(&k) => {
+                (None, Some(ty)) if cast => out.push_str(&format!("CAST(NULL AS {ty})")),
+                (None, _) => out.push_str("NULL"),
+                (Some(v), Some(ty)) if cast => {
                     out.push_str(&format!("CAST('{}' AS {ty})", v.replace('\'', "''")))
                 }
                 (Some(v), _) => out.push_str(&format!("'{}'", v.replace('\'', "''"))),

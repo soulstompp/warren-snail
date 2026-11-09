@@ -306,7 +306,10 @@ fn a_prepared_statement_runs_with_its_parameters_typed_as_postgresql_types_them(
     for (st, said) in [
         ("PREPARE st AS SELECT 1", "prepared statement \"st\" already exists"),
         ("EXECUTE nope", "prepared statement \"nope\" does not exist"),
-        ("EXECUTE st(1)", "wrong number of parameters for prepared statement \"st\""),
+        (
+            "EXECUTE st(1)",
+            "wrong number of parameters for prepared statement \"st\": Expected 2 parameters but got 1.",
+        ),
         ("EXECUTE st('a', 1)", "invalid input syntax for type integer: \"a\""),
         ("DEALLOCATE nope", "prepared statement \"nope\" does not exist"),
     ] {
