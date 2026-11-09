@@ -533,3 +533,78 @@ fn a_join_on_text_under_a_library_collation_meets_and_compares_as_the_collation_
         assert!(e.contains(why), "{q}: {e}");
     }
 }
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_column_compared_under_another_collation_and_an_index_under_its_own_are_read() {
+    let path = tmp("icu-collate-in-where.snail");
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.base (id integer NOT NULL, PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    let rows = |w: &mut Snail, sql: &str| -> Vec<String> {
+        let b = w
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .answer
+            .expect("an answer");
+        w.text_of(&b)
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| v.unwrap_or_else(|| "NULL".into()))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    };
+    for sql in [
+        "CREATE SCHEMA a",
+        "CREATE COLLATION a.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+        "CREATE TABLE a.t (id integer NOT NULL, a text, e text COLLATE a.ci, PRIMARY KEY (id))",
+        "CREATE INDEX t_e ON a.t (e COLLATE a.ci)",
+        "CREATE INDEX t_a ON a.t (a COLLATE \"default\")",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Under another collation than its column's, an index is refused by name, until a strand is
+    // ordered under one.
+    let e = w
+        .execute("CREATE INDEX t_ae ON a.t (a COLLATE a.ci)")
+        .err()
+        .expect("refused");
+    assert!(
+        e.to_string()
+            .contains("a column read under a collation that orders otherwise than its own"),
+        "{e}"
+    );
+    w.execute("INSERT INTO a.t VALUES (1, 'abc', 'abc'), (2, 'ABC', 'ABC'), (3, 'b', 'b')")
+        .unwrap();
+    // An index under its column's own collation keys the column itself; a column compared under
+    // another collation is compared as that collation compares, in WHERE, an IN list and ON.
+    for (sql, answer) in [
+        (
+            "SELECT pg_get_indexdef('a.t_e'::regclass), pg_get_indexdef('a.t_a'::regclass)",
+            vec!["CREATE INDEX t_e ON a.t USING btree (e)|CREATE INDEX t_a ON a.t USING btree (a)"],
+        ),
+        ("SELECT id FROM a.t WHERE e COLLATE \"C\" = 'abc' ORDER BY id", vec!["1"]),
+        ("SELECT id FROM a.t WHERE e = 'abc' ORDER BY id", vec!["1", "2"]),
+        ("SELECT id FROM a.t WHERE e COLLATE \"C\" IN ('ABC', 'x') ORDER BY id", vec!["2"]),
+        ("SELECT id FROM a.t WHERE a COLLATE a.ci = 'ABC' ORDER BY id", vec!["1", "2"]),
+        (
+            "SELECT x.id, y.id FROM a.t x JOIN a.t y ON x.e COLLATE \"C\" = y.a ORDER BY 1, 2",
+            vec!["1|1", "2|2", "3|3"],
+        ),
+        (
+            "SELECT pg_collation_for(e), pg_collation_for(e COLLATE \"C\"), pg_collation_for(e || a) \
+             FROM a.t WHERE id = 1",
+            vec!["a.ci|\"C\"|a.ci"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), answer, "{sql}");
+    }
+    assert_eq!(
+        w.execute("UPDATE a.t SET a = 'x' WHERE e COLLATE \"C\" = 'ABC'").unwrap().rows,
+        1
+    );
+}

@@ -9,7 +9,8 @@
 //! locking clause, a name written twice and a relation not held each refused with its code, a
 //! literal read as the type its place gives it (a truth, a CASE's or a COALESCE's type, the other
 //! side's integer, two rows' columns compared in turn), an element of an array by a subscript an
-//! aggregate gives, a function in a subquery's FROM reading the row around it. Every
+//! aggregate gives, a function in a subquery's FROM reading the row around it, the collation a call
+//! is made under, an index keyed under its column's own collation. Every
 //! word, code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -2315,4 +2316,82 @@ fn a_subscript_an_aggregate_gives_and_a_function_reading_the_row_around_its_subq
     ] {
         assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
     }
+}
+
+#[test]
+fn pg_collation_for_names_a_calls_collation_and_an_index_keys_a_column_under_its_own() {
+    let mut w = snail("collation-for");
+    run(&mut w, "CREATE COLLATION s.bytes (provider = libc, locale = 'C')");
+    run(&mut w, "CREATE COLLATION s.\"Mixed Case\" (provider = libc, locale = 'C')");
+    run(&mut w, "CREATE COLLATION public.speller_bytes (provider = libc, locale = 'C')");
+    run(
+        &mut w,
+        "CREATE TABLE s.t (id integer NOT NULL, a text, b varchar(8) COLLATE \"C\", \
+         c text COLLATE s.bytes, f text COLLATE public.speller_bytes, n integer, nm name, \
+         PRIMARY KEY (id))",
+    );
+    // An index under its column's own collation keys the column; under another of byte order it
+    // keeps the COLLATE PostgreSQL writes.
+    run(&mut w, "CREATE INDEX t_b ON s.t (b COLLATE \"C\")");
+    run(&mut w, "CREATE INDEX t_c ON s.t (c COLLATE s.bytes)");
+    run(&mut w, "CREATE INDEX t_nm ON s.t (nm COLLATE \"C\")");
+    run(&mut w, "CREATE INDEX t_ac ON s.t (a COLLATE \"C\")");
+    run(&mut w, "CREATE INDEX t_ab ON s.t (a COLLATE s.bytes)");
+    run(
+        &mut w,
+        "INSERT INTO s.t VALUES (1, 'abc', 'abc', 'abc', 'abc', 1, 'abc'), \
+         (2, 'ABC', 'ABC ', 'b', 'b', 2, 'b')",
+    );
+    for (sql, answer) in [
+        (
+            "SELECT pg_get_indexdef('s.t_b'::regclass), pg_get_indexdef('s.t_c'::regclass), \
+             pg_get_indexdef('s.t_nm'::regclass)",
+            vec![
+                "CREATE INDEX t_b ON s.t USING btree (b)|CREATE INDEX t_c ON s.t USING btree (c)|\
+                 CREATE INDEX t_nm ON s.t USING btree (nm)",
+            ],
+        ),
+        (
+            "SELECT pg_get_indexdef('s.t_ac'::regclass), pg_get_indexdef('s.t_ab'::regclass)",
+            vec![
+                "CREATE INDEX t_ac ON s.t USING btree (a COLLATE \"C\")|\
+                 CREATE INDEX t_ab ON s.t USING btree (a COLLATE s.bytes)",
+            ],
+        ),
+        // The collation a call over its argument is made under, by its name as PostgreSQL writes
+        // it: quoted where it must be, its schema before it unless that is public.
+        (
+            "SELECT pg_collation_for(a), pg_collation_for(b), pg_collation_for(c), \
+             pg_collation_for(f), pg_collation_for(nm) FROM s.t WHERE id = 1",
+            vec!["\"default\"|\"C\"|s.bytes|speller_bytes|\"C\""],
+        ),
+        (
+            "SELECT pg_collation_for('x'), pg_collation_for('x'::text), \
+             pg_collation_for(a COLLATE s.\"Mixed Case\"), pg_collation_for(a COLLATE \"C.utf8\") \
+             FROM s.t WHERE id = 1",
+            vec!["NULL|\"default\"|s.\"Mixed Case\"|\"C.utf8\""],
+        ),
+        (
+            "SELECT pg_collation_for(b || a), pg_collation_for(b || c), pg_collation_for(upper(c)), \
+             pg_typeof(pg_collation_for(b)) FROM s.t WHERE id = 1",
+            vec!["\"C\"|NULL|s.bytes|text"],
+        ),
+        ("SELECT id FROM s.t WHERE pg_collation_for(b) = '\"C\"' ORDER BY id", vec!["1", "2"]),
+    ] {
+        assert_eq!(rows(&mut w, sql), answer, "{sql}");
+    }
+    // A column under a collation of the DDL's ordering as its own is a level the question path
+    // reads along an index.
+    let (b, _) = w
+        .ask("SELECT id FROM s.t WHERE a COLLATE s.bytes = 'abc'", Some("t_ab"))
+        .unwrap_or_else(|e| panic!("along t_ab: {e}"));
+    assert_eq!(w.text_of(&b).unwrap(), [[Some("1".to_string())]]);
+    assert_eq!(
+        refused(&mut w, "SELECT pg_collation_for(n) FROM s.t"),
+        (Some("42804"), "collations are not supported by type integer".to_string())
+    );
+    // Listed among the functions of a type the snail answers.
+    assert!(warren_snail::functions::all()
+        .iter()
+        .any(|f| f.signature == "pg_collation_for(\"any\")" && f.held()));
 }

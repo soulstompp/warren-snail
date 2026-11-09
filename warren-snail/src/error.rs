@@ -124,6 +124,7 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("column \"", " but expression is of type "), "42804"),
     (Words::Holds("argument of ", " must be type boolean, not type "), "42804"),
     (Words::Is("array subscript must have type integer"), "42804"),
+    (Words::Starts("collations are not supported by type "), "42804"),
     (Words::Starts("aggregate functions are not allowed in "), "42803"),
     (
         Words::Holds("column \"", "\" must appear in the GROUP BY clause or be used in an aggregate function"),

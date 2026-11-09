@@ -690,6 +690,7 @@ const HELD: &[&str] = &[
     "octet_length(bit)",
     "pclose(path)",
     "pg_basetype(regtype)",
+    "pg_collation_for(\"any\")",
     "pg_get_keywords()",
     "pg_prepared_statement()",
     "pg_snapshot_xip(pg_snapshot)",

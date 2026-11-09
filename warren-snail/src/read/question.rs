@@ -1056,6 +1056,7 @@ impl From<'_> {
                 alias.as_deref(),
                 &t.columns,
                 &self.catalog.functions,
+                &self.catalog.collations,
                 &[],
             ) {
                 Ok(s) => found.push((side, s)),

@@ -1974,6 +1974,17 @@ pub fn collation_casing(name: &str, declared: &[Collation]) -> Result<Casing> {
     }
 }
 
+/// Whether a collation's name names a column's own: the one its DDL names, else its type's, C for a
+/// name and the database's default for any other string.
+pub fn own_collation(column: &Column, name: &str) -> bool {
+    let bare = |n: &str| n.strip_prefix("pg_catalog.").unwrap_or(n).to_string();
+    match (&column.collation, column.ty) {
+        (Some(own), _) => bare(own) == bare(name),
+        (None, ColumnType::Name) => bare(name) == "C",
+        (None, _) => bare(name) == "default",
+    }
+}
+
 /// How the collation named maps case, where it orders text by its bytes: one of PostgreSQL's
 /// built-in collations ordering text by its bytes, the database's default (libc C.UTF-8, as every
 /// database on the certificates' server), or one `declared` like them.
@@ -2678,6 +2689,7 @@ pub fn shape(
     alias: Option<&str>,
     columns: &[Column],
     functions: &[Function],
+    collations: &[Collation],
     env: &[Shape],
 ) -> Result<Shape> {
     let column = |name: &str| -> Result<Shape> {
@@ -2689,7 +2701,7 @@ pub fn shape(
     };
     let bare = table.rsplit('.').next().unwrap_or(table);
     match expr {
-        Expr::Nested(e) => shape(e, table, alias, columns, functions, env),
+        Expr::Nested(e) => shape(e, table, alias, columns, functions, collations, env),
         Expr::Identifier(i) => column(&ident(i)),
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
             let qualifier = parts[..parts.len() - 1]
@@ -2720,20 +2732,20 @@ pub fn shape(
         }
         Expr::Collate { expr, collation } => {
             let named = object_name(collation);
-            match shape(expr, table, alias, columns, functions, env)? {
+            match shape(expr, table, alias, columns, functions, collations, env)? {
                 // A COLLATE that orders as its column does: one of byte order on a column of byte
                 // order, or its column's own library collation.
                 Shape::Column(c)
                     if columns[c].ty.is_string()
                         && match &columns[c].library {
-                            None => bytes_casing(&named, &[]).is_some(),
-                            Some(own) => library_spec(&named, &[]).as_ref() == Some(own),
+                            None => bytes_casing(&named, collations).is_some(),
+                            Some(own) => library_spec(&named, collations).as_ref() == Some(own),
                         } =>
                 {
                     Ok(Shape::Column(c))
                 }
                 Shape::Column(c)
-                    if columns[c].ty.is_string() && collation_held(&named, &[]).is_some() =>
+                    if columns[c].ty.is_string() && collation_held(&named, collations).is_some() =>
                 {
                     Err(Error::new(format!(
                         "{expr} COLLATE {named}: a column read under a collation that orders \
@@ -2759,7 +2771,7 @@ pub fn shape(
         Expr::Floor {
             expr: inner,
             field: CeilFloorKind::DateTimeField(DateTimeField::NoDateTime),
-        } => scaled(expr, inner, table, alias, columns, functions, env),
+        } => scaled(expr, inner, table, alias, columns, functions, collations, env),
         Expr::Function(f) => {
             let name = object_name(&f.name);
             let function = functions
@@ -2781,12 +2793,12 @@ pub fn shape(
             for a in args {
                 match a {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        inner.push(shape(e, table, alias, columns, functions, env)?)
+                        inner.push(shape(e, table, alias, columns, functions, collations, env)?)
                     }
                     other => return Err(Error::new(format!("the argument {other} is not read"))),
                 }
             }
-            shape(&function.body, table, alias, columns, functions, &inner)
+            shape(&function.body, table, alias, columns, functions, collations, &inner)
         }
         Expr::AtTimeZone {
             timestamp,
@@ -2804,7 +2816,7 @@ pub fn shape(
                     "only the UTC clock is read, not {time_zone}"
                 )));
             }
-            match shape(timestamp, table, alias, columns, functions, env)? {
+            match shape(timestamp, table, alias, columns, functions, collations, env)? {
                 Shape::Column(c) if columns[c].ty.is_timestamptz() => Ok(Shape::Clock(c)),
                 _ => Err(Error::new(format!(
                     "{timestamp} AT TIME ZONE 'UTC' needs a timestamptz column"
@@ -2846,7 +2858,7 @@ pub fn shape(
                     "a month is read as smallint, not {data_type}"
                 )));
             }
-            match shape(month, table, alias, columns, functions, env)? {
+            match shape(month, table, alias, columns, functions, collations, env)? {
                 Shape::Clock(c) => Ok(Shape::MonthUtc(c)),
                 Shape::Column(c) if columns[c].ty.is_timestamptz() => Err(Error::new(format!(
                     "the month of {} needs a clock: extract on a timestamptz is stable, and \
@@ -2872,6 +2884,7 @@ pub fn shape(
 
 /// The shape of `floor(column * 10^k)` on a double precision column, k from 1 to 9: a count of its
 /// k places' units.
+#[allow(clippy::too_many_arguments)]
 fn scaled(
     f: &Expr,
     arg: &Expr,
@@ -2879,6 +2892,7 @@ fn scaled(
     alias: Option<&str>,
     columns: &[Column],
     functions: &[Function],
+    collations: &[Collation],
     env: &[Shape],
 ) -> Result<Shape> {
     let refused = || {
@@ -2913,7 +2927,7 @@ fn scaled(
         (Some(k), None) => (right, k),
         _ => return Err(refused()),
     };
-    match shape(column, table, alias, columns, functions, env)? {
+    match shape(column, table, alias, columns, functions, collations, env)? {
         Shape::Column(c) if columns[c].ty == ColumnType::Float8 => Ok(Shape::Scaled(c, k)),
         _ => Err(refused()),
     }

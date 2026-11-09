@@ -340,13 +340,13 @@ fn index_text(cat: &Cat, ix: &Index, colno: usize, pretty: bool) -> Result<Strin
         }
         sep = ", ";
         let shown = colno == 0 || colno == keyno + 1;
-        let (keytype, keycoll) = match key {
+        let (keytype, keycol) = match key {
             None => {
                 let c = &t.columns[ix.include[keyno - nkeys]];
                 if shown {
                     buf.push_str(&quote(&c.name));
                 }
-                (super::column_type(cat, c).0, c.collation.clone())
+                (super::column_type(cat, c).0, Some(c))
             }
             Some(k) => match (k.column, &k.expr) {
                 (Some(c), _) => {
@@ -354,7 +354,7 @@ fn index_text(cat: &Cat, ix: &Index, colno: usize, pretty: bool) -> Result<Strin
                     if shown {
                         buf.push_str(&quote(&col.name));
                     }
-                    (super::column_type(cat, col).0, col.collation.clone())
+                    (super::column_type(cat, col).0, Some(col))
                 }
                 (None, Some(e)) => {
                     let node = a.expr(&super::parse_expr(e)?)?;
@@ -377,8 +377,10 @@ fn index_text(cat: &Cat, ix: &Index, colno: usize, pretty: bool) -> Result<Strin
         if attrs_only || !shown {
             continue;
         }
+        // Its COLLATE, where it is another than its column's own: the one the column's DDL names,
+        // else its type's.
         if let Some(c) = &k.collation {
-            if keycoll.as_deref() != Some(c.as_str()) {
+            if !keycol.is_some_and(|col| crate::catalog::own_collation(col, c)) {
                 buf.push_str(&format!(" COLLATE {}", collation_shown(c)));
             }
         }

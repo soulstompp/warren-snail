@@ -176,6 +176,7 @@ const FORMS: &[Form] = &[
         R::T(ColumnType::Textual(Textual::Aclitem)),
     ),
     ("pg_basetype", &[REGTYPE], R::T(ty(REGTYPE))),
+    ("pg_collation_for", &[P::Any], R::T(ColumnType::Text(None))),
     ("pg_get_keywords", &[], R::Rows),
     ("pg_snapshot_xip", &[SNAPSHOT], R::T(ColumnType::Xid8)),
     ("pg_snapshot_xmax", &[SNAPSHOT], R::T(ColumnType::Xid8)),

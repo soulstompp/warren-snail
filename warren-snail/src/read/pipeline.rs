@@ -752,6 +752,26 @@ impl Casings {
         }
     }
 
+    /// The collation a call is made under, by its name, where its inputs settle one.
+    fn called_under(&self, e: &Expr) -> Option<&str> {
+        self.nodes
+            .get(&(e as *const Expr))
+            .and_then(|(_, input)| input.under())
+    }
+
+    /// A collation's name as PostgreSQL writes it: one the DDL makes in a schema other than public,
+    /// by its schema and its name, each quoted where it must be; any other by its name alone.
+    fn written_collation(&self, name: &str) -> String {
+        let quote = super::calls::quote_ident;
+        match name.split_once('.') {
+            Some((schema, bare)) if self.declared.iter().any(|c| c.name == name) => match schema {
+                "public" => quote(bare),
+                _ => format!("{}.{}", quote(schema), quote(bare)),
+            },
+            _ => quote(name),
+        }
+    }
+
     /// Whether the inputs of a call or an operator settle no collation.
     fn unsettled(&self, e: &Expr) -> bool {
         self.nodes
@@ -4598,6 +4618,24 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 }
             }
             match (name.as_str(), a.as_slice()) {
+                // The collation its argument's call is made under, by its name; NULL for an
+                // argument of no type, or one two implicit collations leave unsettled.
+                ("pg_collation_for", [x]) => {
+                    ev(x)?;
+                    match frame.type_of(x) {
+                        None => Value::Null,
+                        Some(t) if !super::collate::collatable(t) => {
+                            return Err(Error::new(format!(
+                                "collations are not supported by type {}",
+                                t.pg_name()
+                            )))
+                        }
+                        Some(_) => match frame.casings.called_under(e) {
+                            Some(n) => Value::Text(frame.casings.written_collation(n)),
+                            None => Value::Null,
+                        },
+                    }
+                }
                 // Under the collation its argument carries, the database's default where none.
                 ("upper" | "lower", [x]) => {
                     match ev(x)? {
@@ -8145,8 +8183,9 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
 /// NATURAL, or a RIGHT or FULL JOIN after the first join; it groups by a name its select list gives
 /// or orders by what it does not return; or it calls a function, an aggregate of a column's values
 /// counted, or over each value once, filtered or ordered, or an operator on numbers or on a document,
-/// the question path does not read, or reads a CASE, a subscript or a parameter; or calls an
-/// aggregate or a window function in WHERE, which the pipeline refuses as PostgreSQL's parser does.
+/// the question path does not read, or reads a CASE, a subscript, a COLLATE or a parameter; or
+/// calls an aggregate or a window function in WHERE, which the pipeline refuses as PostgreSQL's
+/// parser does.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
@@ -8298,8 +8337,8 @@ fn is_written_constant(e: &Expr) -> bool {
 }
 
 /// Whether an expression calls a function, or an operator on numbers or on a document, the question
-/// path does not read, or reads a CASE, an IN list, a subscript or a parameter: its aggregates and
-/// the functions a DDL names are its own.
+/// path does not read, or reads a CASE, an IN list, a subscript, a COLLATE or a parameter: its
+/// aggregates and the functions a DDL names are its own.
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => {
@@ -8338,7 +8377,6 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         }
         Expr::Nested(x)
         | Expr::Cast { expr: x, .. }
-        | Expr::Collate { expr: x, .. }
         | Expr::IsNull(x)
         | Expr::IsNotNull(x)
         | Expr::IsTrue(x)
@@ -8347,6 +8385,8 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::IsNotFalse(x)
         | Expr::IsUnknown(x)
         | Expr::IsNotUnknown(x) => calls_beyond_the_question(x),
+        // A COLLATE: the question path holds a level only for one that orders as its column does.
+        Expr::Collate { .. } => true,
         Expr::IsDistinctFrom(a, b)
         | Expr::IsNotDistinctFrom(a, b)
         | Expr::AnyOp {

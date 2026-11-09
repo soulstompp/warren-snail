@@ -5165,6 +5165,7 @@ impl Draft {
                 None,
                 &t.columns,
                 &functions,
+                &self.collations,
                 &[],
             )
             .map_err(|e| Error::new(format!("{shown}: {e}")))?;

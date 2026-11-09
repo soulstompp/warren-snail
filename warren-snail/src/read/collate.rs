@@ -120,6 +120,15 @@ impl Derived {
         }
     }
 
+    /// The collation a call over it is made under: its own, implicit or explicit; none where two
+    /// implicit ones conflict or it carries none.
+    pub(super) fn under(&self) -> Option<&str> {
+        match self.strength {
+            Strength::Implicit | Strength::Explicit => self.collation.as_deref(),
+            Strength::None | Strength::Conflict => None,
+        }
+    }
+
     /// The collations it names: its own, and the second of two in conflict.
     pub(super) fn names(&self) -> impl Iterator<Item = &str> {
         self.collation
