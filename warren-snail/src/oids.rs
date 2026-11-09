@@ -39,11 +39,27 @@ pub enum Object {
     Rule(String),
     /// A range's cast to its multirange, by the range's name.
     Cast(String),
+    /// A trigger a constraint makes, by the constraint's table, its name and the trigger's place
+    /// among its own (`trigger`'s): a foreign key's four, a deferrable key's or EXCLUDE's one.
+    Trigger(String, String, u8),
+}
+
+/// The triggers a constraint makes, as PostgreSQL makes them: a foreign key that is enforced its
+/// action on DELETE and on UPDATE on the table it references, then its check on INSERT and on
+/// UPDATE on its own; a deferrable key or EXCLUDE its recheck on INSERT or UPDATE. The places are
+/// `Trigger`'s third part.
+pub mod trigger {
+    pub const ACTION_DELETE: u8 = 0;
+    pub const ACTION_UPDATE: u8 = 1;
+    pub const CHECK_INSERT: u8 = 2;
+    pub const CHECK_UPDATE: u8 = 3;
+    /// A deferrable key's or EXCLUDE's recheck.
+    pub const RECHECK: u8 = 0;
 }
 
 impl Object {
-    /// The schema-qualified name it is known by: a constraint's, a DEFAULT's and a label's, its
-    /// table's, domain's or enum's.
+    /// The schema-qualified name it is known by: a constraint's, a DEFAULT's, a label's and a
+    /// trigger's, its table's, domain's, enum's or constraint's table's.
     pub fn name(&self) -> &str {
         match self {
             Object::Namespace(n)
@@ -56,7 +72,8 @@ impl Object {
             | Object::Default(n, _)
             | Object::Label(n, _)
             | Object::Rule(n)
-            | Object::Cast(n) => n,
+            | Object::Cast(n)
+            | Object::Trigger(n, _, _) => n,
         }
     }
 

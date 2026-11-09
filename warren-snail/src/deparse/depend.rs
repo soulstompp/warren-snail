@@ -13,6 +13,7 @@ pub(crate) const TYPE: u32 = 1247;
 pub(crate) const PROC: u32 = 1255;
 pub(crate) const ATTRDEF: u32 = 2604;
 pub(crate) const CONSTRAINT: u32 = 2606;
+pub(crate) const TRIGGER: u32 = 2620;
 pub(crate) const OPERATOR: u32 = 2617;
 pub(crate) const REWRITE: u32 = 2618;
 pub(crate) const CAST: u32 = 2605;

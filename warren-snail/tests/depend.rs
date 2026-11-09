@@ -3,7 +3,9 @@
 //! what 18.6 names; a view's rule depends on its own view before 16 and not from 16; a domain, a
 //! range or a composite naming a collation the file does not hold is refused as PostgreSQL refuses
 //! it. Every expected row was given by PostgreSQL after the same DDL (15.19 and 16.15 for the
-//! rules), each row of pg_depend by the names of its two objects, since the OIDs differ.
+//! rules), each row of pg_depend by the names of its two objects, since the OIDs differ: a trigger
+//! by its table, its constraint and the function it calls. A constraint's triggers are in
+//! pg_trigger as 18.6 makes them, each named by its own OID.
 
 mod weather;
 
@@ -40,6 +42,7 @@ const NAMED: &str = "SELECT x.k AS k, count(*) AS n FROM (SELECT CASE d.classid 
      WHEN 'pg_rewrite'::regclass THEN 'rule ' || (SELECT s.nspname || '.' || c.relname || '.' || r.rulename FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class JOIN pg_namespace s ON s.oid = c.relnamespace WHERE r.oid = d.objid) \
      WHEN 'pg_cast'::regclass THEN 'cast ' || (SELECT k.castsource::regtype::text || ' AS ' || k.casttarget::regtype::text FROM pg_cast k WHERE k.oid = d.objid) \
      WHEN 'pg_collation'::regclass THEN 'collation ' || (SELECT s.nspname || '.' || l.collname FROM pg_collation l JOIN pg_namespace s ON s.oid = l.collnamespace WHERE l.oid = d.objid) \
+     WHEN 'pg_trigger'::regclass THEN 'trigger ' || (SELECT s.nspname || '.' || c.relname || '.' || k.conname || ' ' || g.tgfoid::regproc::text FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_namespace s ON s.oid = c.relnamespace JOIN pg_constraint k ON k.oid = g.tgconstraint WHERE g.oid = d.objid) \
      ELSE d.classid::regclass::text || ' ' || d.objid::text END || ' > ' || CASE d.refclassid \
      WHEN 'pg_class'::regclass THEN 'class ' || (SELECT s.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace s ON s.oid = c.relnamespace WHERE c.oid = d.refobjid) || CASE WHEN d.refobjsubid <> 0 THEN '.' || (SELECT a.attname FROM pg_attribute a WHERE a.attrelid = d.refobjid AND a.attnum = d.refobjsubid) ELSE '' END \
      WHEN 'pg_type'::regclass THEN 'type ' || (SELECT s.nspname || '.' || t.typname FROM pg_type t JOIN pg_namespace s ON s.oid = t.typnamespace WHERE t.oid = d.refobjid) \
@@ -146,6 +149,10 @@ fn each_object_depends_on_what_postgresql_records_it_depends_on() {
         "rule s.v._RETURN > class s.v i",
         "rule s.w._RETURN > class s.v.k n",
         "rule s.w._RETURN > class s.w i",
+        "trigger s.t.u_t_id_fkey \"RI_FKey_noaction_del\" > constraint s.u.u_t_id_fkey i",
+        "trigger s.t.u_t_id_fkey \"RI_FKey_noaction_upd\" > constraint s.u.u_t_id_fkey i",
+        "trigger s.u.u_t_id_fkey \"RI_FKey_check_ins\" > constraint s.u.u_t_id_fkey i",
+        "trigger s.u.u_t_id_fkey \"RI_FKey_check_upd\" > constraint s.u.u_t_id_fkey i",
         "type s._code > type s.code i",
         "type s._mood > type s.mood i",
         "type s._pair > type s.pair i",
@@ -258,4 +265,59 @@ fn a_type_naming_a_collation_the_file_does_not_hold_is_refused_as_postgresql_ref
         assert!(e.contains("collation \"nowhere\" for encoding \"UTF8\" does not exist"), "{ddl}: {e}");
     }
     Catalog::parse("CREATE DOMAIN d AS text COLLATE \"C\"").unwrap();
+}
+
+#[test]
+fn a_constraints_triggers_are_in_pg_trigger_as_postgresql_makes_them() {
+    let ddl = "CREATE SCHEMA tr; \
+         CREATE TABLE tr.p (id integer PRIMARY KEY, d integer, CONSTRAINT p_d UNIQUE (d) DEFERRABLE); \
+         CREATE TABLE tr.pu (id integer PRIMARY KEY, u integer, CONSTRAINT pu_u UNIQUE (u)); \
+         CREATE TABLE tr.pr (id integer PRIMARY KEY); \
+         CREATE TABLE tr.c (id integer PRIMARY KEY, p integer REFERENCES tr.p (id) ON DELETE CASCADE \
+         ON UPDATE SET NULL, q integer, CONSTRAINT c_q FOREIGN KEY (q) REFERENCES tr.pu (u) DEFERRABLE \
+         INITIALLY DEFERRED, r integer, CONSTRAINT c_ne FOREIGN KEY (r) REFERENCES tr.p NOT ENFORCED, \
+         CONSTRAINT c_restrict FOREIGN KEY (r) REFERENCES tr.pr ON DELETE RESTRICT DEFERRABLE); \
+         CREATE TABLE tr.e (k integer PRIMARY KEY, id integer, EXCLUDE USING btree (id WITH =) DEFERRABLE); \
+         CREATE TABLE tr.s2 (a integer PRIMARY KEY DEFERRABLE);";
+    let mut snail = opened("triggers", ddl, 18);
+    // Each trigger by its table, constraint and function: its name's prefix, whether the name ends
+    // in its own OID, its type, the other table, the key's index, its deferral, and whether its OID
+    // follows its constraint's. A NOT ENFORCED key makes none; an action other than NO ACTION is
+    // never deferrable.
+    let got = rows(
+        &mut snail,
+        "SELECT c.relname||'.'||k.conname||' '||g.tgfoid::regproc::text||'|'||regexp_replace(g.tgname, '[0-9]+$', '')\
+         ||'|'||(g.tgname = regexp_replace(g.tgname, '[0-9]+$', '')||g.oid::text)::text||'|'||g.tgtype::text\
+         ||'|'||g.tgconstrrelid::regclass::text||'|'||g.tgconstrindid::regclass::text||'|'||g.tgdeferrable::text\
+         ||'|'||g.tginitdeferred::text||'|'||(g.oid::bigint > g.tgconstraint::bigint)::text \
+         FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid JOIN pg_constraint k ON k.oid = g.tgconstraint \
+         WHERE c.relnamespace = 'tr'::regnamespace ORDER BY 1",
+    );
+    assert_eq!(
+        texts(&got),
+        [
+            "c.c_p_fkey \"RI_FKey_check_ins\"|RI_ConstraintTrigger_c_|true|5|tr.p|tr.p_pkey|false|false|true",
+            "c.c_p_fkey \"RI_FKey_check_upd\"|RI_ConstraintTrigger_c_|true|17|tr.p|tr.p_pkey|false|false|true",
+            "c.c_q \"RI_FKey_check_ins\"|RI_ConstraintTrigger_c_|true|5|tr.pu|tr.pu_u|true|true|true",
+            "c.c_q \"RI_FKey_check_upd\"|RI_ConstraintTrigger_c_|true|17|tr.pu|tr.pu_u|true|true|true",
+            "c.c_restrict \"RI_FKey_check_ins\"|RI_ConstraintTrigger_c_|true|5|tr.pr|tr.pr_pkey|true|false|true",
+            "c.c_restrict \"RI_FKey_check_upd\"|RI_ConstraintTrigger_c_|true|17|tr.pr|tr.pr_pkey|true|false|true",
+            "e.e_id_excl unique_key_recheck|Unique_ConstraintTrigger_|true|21|-|tr.e_id_excl|true|false|true",
+            "p.c_p_fkey \"RI_FKey_cascade_del\"|RI_ConstraintTrigger_a_|true|9|tr.c|tr.p_pkey|false|false|true",
+            "p.c_p_fkey \"RI_FKey_setnull_upd\"|RI_ConstraintTrigger_a_|true|17|tr.c|tr.p_pkey|false|false|true",
+            "p.p_d unique_key_recheck|Unique_ConstraintTrigger_|true|21|-|tr.p_d|true|false|true",
+            "pr.c_restrict \"RI_FKey_noaction_upd\"|RI_ConstraintTrigger_a_|true|17|tr.c|tr.pr_pkey|true|false|true",
+            "pr.c_restrict \"RI_FKey_restrict_del\"|RI_ConstraintTrigger_a_|true|9|tr.c|tr.pr_pkey|false|false|true",
+            "pu.c_q \"RI_FKey_noaction_del\"|RI_ConstraintTrigger_a_|true|9|tr.c|tr.pu_u|true|true|true",
+            "pu.c_q \"RI_FKey_noaction_upd\"|RI_ConstraintTrigger_a_|true|17|tr.c|tr.pu_u|true|true|true",
+            "s2.s2_pkey unique_key_recheck|PK_ConstraintTrigger_|true|21|-|tr.s2_pkey|true|false|true",
+        ]
+    );
+    // Each one depends on its constraint, internally.
+    let got = rows(
+        &mut snail,
+        "SELECT count(*)::text FROM pg_depend d JOIN pg_trigger g ON g.oid = d.objid \
+         WHERE d.classid = 'pg_trigger'::regclass AND d.refobjid = g.tgconstraint AND d.deptype = 'i'",
+    );
+    assert_eq!(texts(&got), ["15"]);
 }

@@ -2233,12 +2233,16 @@ impl Draft {
 
     /// The objects a table makes, in the order it makes them: the relation, its row type and the
     /// type's array, each DEFAULT, each NOT NULL, each key and its index, each CHECK, each foreign
-    /// key, then each index and the EXCLUDE it stands for.
+    /// key, then each index and the EXCLUDE it stands for; each after a constraint its triggers.
     fn table_objects(t: &Declared, out: &mut Vec<crate::oids::Object>) {
-        use crate::oids::Object as O;
+        use crate::oids::{trigger, Object as O};
         let name = crate::oids::full(&t.name);
         let (schema, own) = crate::oids::parts(&name);
         let (schema, own) = (schema.to_string(), own.to_string());
+        let deferrable = |k: &Keyed| {
+            k.constraint.as_ref().is_some_and(|c| c.deferrable)
+                || k.exclusion.as_ref().is_some_and(|x| x.deferrable)
+        };
         out.push(O::Class(name.clone()));
         out.push(O::Type(name.clone()));
         out.push(O::Array(name.clone()));
@@ -2254,18 +2258,34 @@ impl Draft {
         for k in t.primary.iter().chain(&t.uniques) {
             out.push(O::Constraint(name.clone(), k.name.clone()));
             out.push(O::Class(format!("{schema}.{}", k.name)));
+            if deferrable(k) {
+                out.push(O::Trigger(name.clone(), k.name.clone(), trigger::RECHECK));
+            }
         }
         for c in &t.checks {
             out.push(O::Constraint(name.clone(), c.name.clone()));
         }
         for f in &t.foreign_keys {
             out.push(O::Constraint(name.clone(), f.name.clone()));
+            if f.enforced {
+                for place in [
+                    trigger::ACTION_DELETE,
+                    trigger::ACTION_UPDATE,
+                    trigger::CHECK_INSERT,
+                    trigger::CHECK_UPDATE,
+                ] {
+                    out.push(O::Trigger(name.clone(), f.name.clone(), place));
+                }
+            }
         }
         for k in &t.indexes {
             if k.exclusion.is_some() {
                 out.push(O::Constraint(name.clone(), k.name.clone()));
             }
             out.push(O::Class(format!("{schema}.{}", k.name)));
+            if k.exclusion.is_some() && deferrable(k) {
+                out.push(O::Trigger(name.clone(), k.name.clone(), trigger::RECHECK));
+            }
         }
     }
 

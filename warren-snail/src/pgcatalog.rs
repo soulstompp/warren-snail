@@ -317,6 +317,36 @@ fn t(b: bool) -> String {
     if b { "t" } else { "f" }.to_string()
 }
 
+/// The functions a constraint's internal triggers call, by their OIDs, the same in every release.
+const UNIQUE_KEY_RECHECK: u32 = 1250;
+const RI_FKEY_CHECK_INS: u32 = 1644;
+const RI_FKEY_CHECK_UPD: u32 = 1645;
+
+/// A trigger's type as pg_trigger's tgtype holds it: for each row (1), after the statement's change,
+/// on INSERT (4), DELETE (8) or UPDATE (16).
+const ROW_INSERT: u8 = 1 | 4;
+const ROW_DELETE: u8 = 1 | 8;
+const ROW_UPDATE: u8 = 1 | 16;
+const ROW_INSERT_UPDATE: u8 = 1 | 4 | 16;
+
+/// The function a foreign key's action on DELETE, or on UPDATE, calls: `RI_FKey_cascade_del` and
+/// its kin, each action's DELETE function followed by its UPDATE one.
+fn ri_action(a: &crate::catalog::Action, delete: bool) -> u32 {
+    use crate::catalog::Action as A;
+    let on_delete = match a {
+        A::Cascade => 1646,
+        A::Restrict => 1648,
+        A::SetNull(_) => 1650,
+        A::SetDefault(_) => 1652,
+        A::NoAction => 1654,
+    };
+    if delete {
+        on_delete
+    } else {
+        on_delete + 1
+    }
+}
+
 /// What PostgreSQL's pg_type says of a type a column of the file is of.
 #[derive(Clone)]
 struct TypeFacts {
@@ -575,6 +605,7 @@ impl<'a> File<'a> {
             "pg_rewrite" => self.rules(),
             "pg_cast" => self.casts(),
             "pg_depend" => self.depends(),
+            "pg_trigger" => self.triggers(),
             _ => Vec::new(),
         })
     }
@@ -1505,6 +1536,87 @@ impl<'a> File<'a> {
         out
     }
 
+    /// The rows of pg_trigger the file's constraints make, as PostgreSQL's DDL makes them: each
+    /// enforced foreign key's action on DELETE and on UPDATE on the table it references and its
+    /// check on INSERT and on UPDATE on its own; each deferrable key's or EXCLUDE's recheck. Each is
+    /// internal, named by its own OID, and deferrable as its constraint is.
+    fn triggers(&self) -> Vec<Row> {
+        use crate::oids::trigger as at;
+        let mut out = Vec::new();
+        let mut push = |table: &str,
+                        constraint: &str,
+                        place: u8,
+                        prefix: &str,
+                        on: u32,
+                        function: u32,
+                        tgtype: u8,
+                        other: u32,
+                        index: u32,
+                        (deferrable, deferred): (bool, bool)| {
+            let oid = self.oid(Object::Trigger(table.to_string(), constraint.to_string(), place));
+            let mut r = row(&[
+                ("oid", oid.to_string()),
+                ("tgrelid", on.to_string()),
+                ("tgparentid", "0".into()),
+                ("tgname", format!("{prefix}{oid}")),
+                ("tgfoid", function.to_string()),
+                ("tgtype", tgtype.to_string()),
+                ("tgenabled", "O".into()),
+                ("tgisinternal", "t".into()),
+                ("tgconstrrelid", other.to_string()),
+                ("tgconstrindid", index.to_string()),
+                (
+                    "tgconstraint",
+                    self.oid(Object::Constraint(table.to_string(), constraint.to_string()))
+                        .to_string(),
+                ),
+                ("tgdeferrable", t(deferrable)),
+                ("tginitdeferred", t(deferred)),
+                ("tgnargs", "0".into()),
+                ("tgattr", String::new()),
+                ("tgargs", "\\x".into()),
+            ]);
+            for absent in ["tgqual", "tgoldtable", "tgnewtable"] {
+                r.insert(absent, None);
+            }
+            out.push(r);
+        };
+        for tb in self.tables() {
+            let n = full(&tb.name);
+            let rel = self.oid(Object::Class(n.clone()));
+            let schema = parts(&n).0;
+            for i in self.indexes_of(tb) {
+                if !i.deferrable || self.index_constraint(&n, &i).is_none() {
+                    continue;
+                }
+                let index = self.oid(Object::Class(format!("{schema}.{}", i.name)));
+                let prefix = if i.primary { "PK_ConstraintTrigger_" } else { "Unique_ConstraintTrigger_" };
+                let kind = (true, false);
+                push(&n, &i.name, at::RECHECK, prefix, rel, UNIQUE_KEY_RECHECK, ROW_INSERT_UPDATE, 0, index, kind);
+            }
+            for f in tb.foreign_keys.iter().filter(|f| f.enforced) {
+                let parent = full(&f.parent);
+                let prel = self.oid(Object::Class(parent.clone()));
+                let index = self.oid(Object::Class(format!("{}.{}", parts(&parent).0, f.key)));
+                let kind = (f.deferrable, f.deferred);
+                // An action other than NO ACTION is never deferred, whatever its key says.
+                let acting = |a: &crate::catalog::Action| match a {
+                    crate::catalog::Action::NoAction => kind,
+                    _ => (false, false),
+                };
+                let (del, upd) = (ri_action(&f.on_delete, true), ri_action(&f.on_update, false));
+                let a = "RI_ConstraintTrigger_a_";
+                let c = "RI_ConstraintTrigger_c_";
+                let (on_del, on_upd) = (acting(&f.on_delete), acting(&f.on_update));
+                push(&n, &f.name, at::ACTION_DELETE, a, prel, del, ROW_DELETE, rel, index, on_del);
+                push(&n, &f.name, at::ACTION_UPDATE, a, prel, upd, ROW_UPDATE, rel, index, on_upd);
+                push(&n, &f.name, at::CHECK_INSERT, c, rel, RI_FKEY_CHECK_INS, ROW_INSERT, prel, index, kind);
+                push(&n, &f.name, at::CHECK_UPDATE, c, rel, RI_FKEY_CHECK_UPD, ROW_UPDATE, prel, index, kind);
+            }
+        }
+        out
+    }
+
     /// The kind of the constraint an index of a table stands for, where it stands for one.
     fn index_constraint(&self, table: &str, i: &IndexFacts) -> Option<char> {
         match (i.primary, i.keyed || !i.exclusion, i.unique) {
@@ -1541,6 +1653,12 @@ impl<'a> File<'a> {
             Addr::of(
                 d::CONSTRAINT,
                 self.oid(Object::Constraint(table.to_string(), name.to_string())),
+            )
+        };
+        let trigger = |table: &str, name: &str, place: u8| {
+            Addr::of(
+                d::TRIGGER,
+                self.oid(Object::Trigger(table.to_string(), name.to_string(), place)),
             )
         };
         let tree = |kind: &str, oid: u32, part: i64| crate::deparse::stored_tree(&cat, kind, oid, part).ok();
@@ -1606,6 +1724,9 @@ impl<'a> File<'a> {
                         let con = constraint(&n, &i.name);
                         out.many(con, cols, 'a');
                         out.one(index, con, 'i');
+                        if i.deferrable {
+                            out.one(trigger(&n, &i.name, crate::oids::trigger::RECHECK), con, 'i');
+                        }
                     }
                     None => {
                         let simple: Vec<Addr> = cols.into_iter().filter(|a| a.sub != 0).collect();
@@ -1635,6 +1756,12 @@ impl<'a> File<'a> {
                     .collect();
                 refs.push(class(&format!("{}.{}", parts(&parent).0, f.key)));
                 out.many(con, refs, 'n');
+                if f.enforced {
+                    use crate::oids::trigger as at;
+                    for place in [at::ACTION_DELETE, at::ACTION_UPDATE, at::CHECK_INSERT, at::CHECK_UPDATE] {
+                        out.one(trigger(&n, &f.name, place), con, 'i');
+                    }
+                }
             }
         }
         for s in &self.catalog.sequences {
