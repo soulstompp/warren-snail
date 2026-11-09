@@ -12,7 +12,7 @@ use warren_snail::values::{push_datum, Values};
 use warren_snail::write::{Rows, Written};
 use weather::{exact, fresh, tmp, write};
 
-const DDL: &str = "CREATE TABLE s.a (id bigint NOT NULL, PRIMARY KEY (id));\n\
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.a (id bigint NOT NULL, PRIMARY KEY (id));\n\
      CREATE TABLE s.b (id bigint NOT NULL, a_id bigint NOT NULL, v bigint NOT NULL, \
      PRIMARY KEY (id)); CREATE INDEX b_a ON s.b (a_id, id) INCLUDE (v);";
 

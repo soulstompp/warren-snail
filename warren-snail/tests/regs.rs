@@ -14,7 +14,7 @@ use weather::tmp;
 use weather::{exact, ints64, texts};
 
 #[cfg(feature = "standalone")]
-const DDL: &str = "CREATE TABLE s.r (n integer NOT NULL, c regclass, t regtype, p regproc, \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.r (n integer NOT NULL, c regclass, t regtype, p regproc, \
                    pr regprocedure, o regoper, ro regrole, k regconfig, m money, PRIMARY KEY (n)); \
                    CREATE INDEX r_c ON s.r (c, n);";
 
@@ -247,7 +247,7 @@ fn a_reg_value_standing_alone_prints_a_built_in_object_s_name_and_any_other_oid_
     // A text assigned to a regclass is read by regclass(text): a name alone.
     let path = tmp("regs-assign.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.x (n integer NOT NULL, t text, PRIMARY KEY (n)); \
+        "CREATE SCHEMA s; CREATE TABLE s.x (n integer NOT NULL, t text, PRIMARY KEY (n)); \
          CREATE TABLE s.y (n integer NOT NULL, c regclass, PRIMARY KEY (n));",
     )
     .unwrap();
@@ -274,7 +274,7 @@ fn a_reg_value_standing_alone_prints_a_built_in_object_s_name_and_any_other_oid_
 #[test]
 #[cfg(feature = "standalone")]
 fn the_file_records_the_release_its_oids_came_from_and_names_them_by_its_catalog() {
-    let ddl = "CREATE TABLE s.p (n integer NOT NULL, pr regprocedure, PRIMARY KEY (n));";
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.p (n integer NOT NULL, pr regprocedure, PRIMARY KEY (n));";
     for (release, text) in [
         (14, "pg_is_in_backup()"),
         (16, "3813"),
@@ -310,7 +310,7 @@ fn the_file_records_the_release_its_oids_came_from_and_names_them_by_its_catalog
     }
     // regdatabase is 19's; a release the snail carries no catalog for is refused.
     let catalog =
-        Catalog::parse("CREATE TABLE s.d (n integer NOT NULL, d regdatabase, PRIMARY KEY (n));")
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.d (n integer NOT NULL, d regdatabase, PRIMARY KEY (n));")
             .unwrap();
     let path = tmp("regs-database-18.snail");
     let e = warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18)
@@ -322,7 +322,7 @@ fn the_file_records_the_release_its_oids_came_from_and_names_them_by_its_catalog
     let path = tmp("regs-release-13.snail");
     assert!(warren_snail::write::write_released(
         &path,
-        &Catalog::parse("CREATE TABLE s.e (n integer NOT NULL, PRIMARY KEY (n));").unwrap(),
+        &Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.e (n integer NOT NULL, PRIMARY KEY (n));").unwrap(),
         &[],
         &[],
         weather::span(),
@@ -358,7 +358,7 @@ fn the_file_records_each_money_column_s_lc_monetary() {
 fn a_snail_of_format_7_or_8_refuses_a_reg_type_and_oid8_by_name() {
     for (ty, name) in [("regclass", "regclass"), ("oid8", "oid8")] {
         let catalog = Catalog::parse(&format!(
-            "CREATE TABLE s.f (n integer NOT NULL, v {ty}, PRIMARY KEY (n));"
+            "CREATE SCHEMA s; CREATE TABLE s.f (n integer NOT NULL, v {ty}, PRIMARY KEY (n));"
         ))
         .unwrap();
         let path = tmp(&format!("regs-format-8-{ty}.snail"));
@@ -370,7 +370,7 @@ fn a_snail_of_format_7_or_8_refuses_a_reg_type_and_oid8_by_name() {
 }
 
 #[cfg(feature = "standalone")]
-const OID8: &str = "CREATE TABLE s.e (n integer NOT NULL, e oid8, o oid, PRIMARY KEY (n)); \
+const OID8: &str = "CREATE SCHEMA s; CREATE TABLE s.e (n integer NOT NULL, e oid8, o oid, PRIMARY KEY (n)); \
                     CREATE INDEX e_e ON s.e (e DESC, n); \
                     CREATE TABLE s.f (n integer NOT NULL, e oid8, o oid, PRIMARY KEY (n));";
 
@@ -476,7 +476,7 @@ fn a_reg_type_is_cut_by_its_bits_as_an_oid_is_and_goes_out_naming_its_release() 
     use warren_snail::write::Rows;
     // 4,096 regclass values spread evenly over their 32 bits cut as 4,096 oids spread so.
     let catalog = Catalog::parse(
-        "CREATE TABLE s.c (id regclass NOT NULL, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.c (id regclass NOT NULL, PRIMARY KEY (id)); \
          CREATE TABLE s.o (id oid NOT NULL, PRIMARY KEY (id));",
     )
     .unwrap();

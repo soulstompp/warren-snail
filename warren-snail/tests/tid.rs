@@ -57,7 +57,7 @@ fn table() -> Vec<Option<i64>> {
     ]
 }
 
-const DDL: &str = "CREATE TABLE s.t (id integer NOT NULL, v tid, PRIMARY KEY (id)); \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v tid, PRIMARY KEY (id)); \
                    CREATE INDEX t_v ON s.t (v, id); \
                    CREATE INDEX t_vd ON s.t (v DESC, id);";
 
@@ -94,7 +94,7 @@ fn a_tid_is_held_as_two_leaves_its_block_then_its_offset() {
 
 /// A table clustered on its tid, NULL on some rows, a column after it.
 const OUT_DDL: &str =
-    "CREATE TABLE s.t (id integer NOT NULL, v tid, w integer NOT NULL, PRIMARY KEY (id)); \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v tid, w integer NOT NULL, PRIMARY KEY (id)); \
                        CREATE INDEX t_v ON s.t (v, id); \
                        ALTER TABLE s.t CLUSTER ON t_v;";
 
@@ -219,7 +219,7 @@ fn a_tid_goes_out_as_a_group_of_its_leaves_sorted_on_both_and_comes_back_by_thei
 
 #[test]
 fn a_tid_is_cut_on_its_block_s_32_bits_then_its_offset_s_16() {
-    let catalog = "CREATE TABLE s.t (v tid NOT NULL, PRIMARY KEY (v));";
+    let catalog = "CREATE SCHEMA s; CREATE TABLE s.t (v tid NOT NULL, PRIMARY KEY (v));";
     let cut = |name: &str, keys: Vec<i64>| -> Vec<u64> {
         let path = snail_of(
             name,
@@ -251,7 +251,7 @@ fn each_leaf_takes_its_own_encoding_and_reads_back_beside_the_other() {
     let n = 2047;
     let path = snail_of(
         "tid-encodings",
-        "CREATE TABLE s.t (id integer NOT NULL, v tid, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v tid, PRIMARY KEY (id));",
         vec![
             Values::Int((0..n).map(Some).collect()),
             Values::Int(
@@ -291,7 +291,7 @@ fn a_condition_on_a_tid_rules_blocks_out_by_its_leaves_summaries() {
     let n = 8192;
     let path = snail_of(
         "tid-ruled",
-        "CREATE TABLE s.t (id integer NOT NULL, v tid NOT NULL, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v tid NOT NULL, PRIMARY KEY (id));",
         vec![
             Values::Int((0..n).map(Some).collect()),
             Values::Int(
@@ -499,7 +499,7 @@ fn a_tid_written_into_a_block_goes_into_each_leaf_s_tail_and_is_pruned_back_in_o
 #[cfg(feature = "standalone")]
 fn a_snail_of_format_eight_refuses_a_tid_by_its_leaves() {
     let catalog =
-        Catalog::parse("CREATE TABLE s.t (id integer NOT NULL, v tid, PRIMARY KEY (id));").unwrap();
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v tid, PRIMARY KEY (id));").unwrap();
     let path = tmp("tid-eight.snail");
     let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
         .err()

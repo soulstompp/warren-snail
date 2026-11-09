@@ -27,7 +27,7 @@ fn s_of(id: i64) -> String {
 fn snail(name: &str) -> std::path::PathBuf {
     let path = tmp(&format!("{name}.snail"));
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, n integer, s text, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, n integer, s text, PRIMARY KEY (id));
          CREATE INDEX t_n ON s.t (n);
          CREATE INDEX t_s ON s.t (s);",
     )
@@ -342,7 +342,7 @@ fn snail_of(name: &str, ddl: &str, statements: &[&str]) -> Snail {
 fn strings_snail() -> Snail {
     snail_of(
         "qpath_substring",
-        "CREATE TABLE s.u (id integer NOT NULL, s text, c char(6), nm name, b bytea, \
+        "CREATE SCHEMA s; CREATE TABLE s.u (id integer NOT NULL, s text, c char(6), nm name, b bytea, \
          bt bit varying(10), i integer, PRIMARY KEY (id));",
         &["INSERT INTO s.u VALUES (1, 'hello', 'ab', 'hello', '\\x616263', B'10110', 2)"],
     )
@@ -475,7 +475,7 @@ fn u_of(id: i64) -> Option<String> {
 fn prefixed(name: &str) -> std::path::PathBuf {
     let path = tmp(&format!("{name}.snail"));
     let catalog = Catalog::parse(
-        "CREATE TABLE s.p (id integer NOT NULL, k text NOT NULL, u text COLLATE \"C\", \
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, k text NOT NULL, u text COLLATE \"C\", \
          PRIMARY KEY (id));
          CREATE INDEX p_k ON s.p (k);
          CREATE INDEX p_u ON s.p (u DESC);",
@@ -569,7 +569,7 @@ fn a_range_on_a_text_level_narrows_the_walk_each_end_kept_or_left_out_as_written
 fn an_equality_on_a_text_level_fixes_it_and_the_next_level_narrows_after_it() {
     let path = tmp("qpath_text_equality.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.g (id integer NOT NULL, g text NOT NULL, k text NOT NULL, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.g (id integer NOT NULL, g text NOT NULL, k text NOT NULL, PRIMARY KEY (id));
          CREATE INDEX g_gk ON s.g (g, k);",
     )
     .unwrap();
@@ -774,7 +774,7 @@ fn a_bpchar_s_name_s_and_a_bytea_s_prefix_narrow_as_their_keys_are_held() {
     let insert = format!("INSERT INTO s.v VALUES {}", rows.join(", "));
     let mut s = snail_of(
         "qpath_prefix_kinds",
-        "CREATE TABLE s.v (id integer NOT NULL, c char(6), nm name, b bytea, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.v (id integer NOT NULL, c char(6), nm name, b bytea, PRIMARY KEY (id));
          CREATE INDEX v_c ON s.v (c);
          CREATE INDEX v_nm ON s.v (nm);
          CREATE INDEX v_b ON s.v (b);",
@@ -826,7 +826,7 @@ fn a_bpchar_s_name_s_and_a_bytea_s_prefix_narrow_as_their_keys_are_held() {
 fn under_a_library_s_collation_only_an_exact_pattern_narrows_the_read() {
     let path = tmp("qpath_prefix_collated.snail");
     let catalog = Catalog::parse(
-        "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+        "CREATE SCHEMA s; CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
          CREATE TABLE s.c (id integer NOT NULL, k text COLLATE \"en-US-x-icu\", ci text COLLATE s.ci,
          PRIMARY KEY (id));
          CREATE INDEX c_k ON s.c (k);

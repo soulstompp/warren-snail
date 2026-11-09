@@ -461,7 +461,7 @@ mod tests {
             .collect();
         assert_eq!(back, text);
         let mut longer = text.clone();
-        longer.extend_from_slice(b"CREATE TABLE s.t (a int);\n");
+        longer.extend_from_slice(b"CREATE SCHEMA s; CREATE TABLE s.t (a int);\n");
         let (_, gone, written) = settled(&shape, chunks(&longer), 2, PAGE, &mut pages);
         assert_eq!((written, gone.len()), (1, 1));
     }

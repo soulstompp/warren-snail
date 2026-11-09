@@ -14,7 +14,7 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{fresh, tmp, write};
 
-const DDL: &str = "CREATE TABLE r.t (id integer NOT NULL, g integer, v text, PRIMARY KEY (id));
+const DDL: &str = "CREATE SCHEMA r; CREATE TABLE r.t (id integer NOT NULL, g integer, v text, PRIMARY KEY (id));
      CREATE TABLE r.u (id integer NOT NULL, t_id integer, amount integer, PRIMARY KEY (id));
      CREATE TABLE r.p (id integer NOT NULL, parent integer, PRIMARY KEY (id));
      CREATE TABLE items (id integer NOT NULL, name text, PRIMARY KEY (id));

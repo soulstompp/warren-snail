@@ -31,7 +31,7 @@ fn an_oid_is_cut_by_its_bits_as_an_integer_is() {
     // 4,096 oids spread evenly over their 32 bits, across the top bit: held in the signed range,
     // they cut as 4,096 integers spread so do, 1,024 rows of 4 bytes a page.
     let catalog = Catalog::parse(
-        "CREATE TABLE s.o (id oid NOT NULL, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.o (id oid NOT NULL, PRIMARY KEY (id)); \
          CREATE TABLE s.i (id integer NOT NULL, PRIMARY KEY (id));",
     )
     .unwrap();
@@ -75,7 +75,7 @@ fn an_oid_is_cut_by_its_bits_as_an_integer_is() {
 }
 
 #[cfg(feature = "standalone")]
-const DDL: &str = "CREATE TABLE s.k (n integer NOT NULL, o oid, x xid, c cid, x8 xid8, l pg_lsn, \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.k (n integer NOT NULL, o oid, x xid, c cid, x8 xid8, l pg_lsn, \
                    ch \"char\", m money, PRIMARY KEY (n)); \
                    CREATE INDEX k_o ON s.k (o DESC, n); \
                    CREATE INDEX k_l ON s.k (l, n); \
@@ -310,7 +310,7 @@ fn a_pipeline_reads_the_scalars_and_their_operators_as_postgresql_does() {
 fn a_value_is_assigned_to_a_scalar_as_postgresql_s_casts_take_it() {
     let path = tmp("scalars-assign.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.a (n integer NOT NULL, o oid, m money, ch \"char\", x xid, PRIMARY KEY (n));",
+        "CREATE SCHEMA s; CREATE TABLE s.a (n integer NOT NULL, o oid, m money, ch \"char\", x xid, PRIMARY KEY (n));",
     )
     .unwrap();
     write(&path, &catalog, &[]).unwrap();
@@ -338,8 +338,8 @@ fn a_value_is_assigned_to_a_scalar_as_postgresql_s_casts_take_it() {
     assert_eq!(col(1), [Some("$5.00".into()), Some("$1.01".into())]);
     assert_eq!(col(2), [Some("\\303".into()), Some("a".into())]);
     // An index on an xid is refused, as PostgreSQL has no B-tree on one.
-    assert!(Catalog::parse("CREATE TABLE s.b (x xid NOT NULL, PRIMARY KEY (x));").is_err());
-    assert!(Catalog::parse("CREATE TABLE s.b (x xid); CREATE INDEX b_x ON s.b (x);").is_err());
+    assert!(Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.b (x xid NOT NULL, PRIMARY KEY (x));").is_err());
+    assert!(Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.b (x xid); CREATE INDEX b_x ON s.b (x);").is_err());
 }
 
 #[test]
@@ -415,7 +415,7 @@ fn a_mac_address_is_held_in_its_bytes_compared_as_them_and_goes_out_as_them() {
     use arrow::array::FixedSizeBinaryArray;
     let path = tmp("mac.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.m (n integer NOT NULL, a macaddr, b macaddr8, PRIMARY KEY (n)); \
+        "CREATE SCHEMA s; CREATE TABLE s.m (n integer NOT NULL, a macaddr, b macaddr8, PRIMARY KEY (n)); \
          CREATE INDEX m_a ON s.m (a, n); \
          CREATE TABLE s.e (n integer NOT NULL, b macaddr8, PRIMARY KEY (n));",
     )

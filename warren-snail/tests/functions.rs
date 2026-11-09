@@ -38,7 +38,7 @@ fn snail_of(name: &str, ddl: &str, statements: &[&str]) -> Snail {
 }
 
 #[cfg(feature = "standalone")]
-const DDL: &str = "CREATE TABLE s.t (id integer NOT NULL, a integer, b smallint, c bigint, \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, a integer, b smallint, c bigint, \
                    d double precision, n numeric, ok boolean, PRIMARY KEY (id));";
 
 #[cfg(feature = "standalone")]
@@ -282,7 +282,7 @@ fn a_question_the_question_path_does_not_read_is_handed_to_the_pipeline() {
 }
 
 #[cfg(feature = "standalone")]
-const TIMES: &str = "CREATE TABLE s.t (id integer NOT NULL, d date, tm time, ts timestamp, \
+const TIMES: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, d date, tm time, ts timestamp, \
                      tstz timestamptz, iv interval, PRIMARY KEY (id));";
 
 #[cfg(feature = "standalone")]
@@ -409,7 +409,7 @@ fn the_least_bigint_is_one_constant_with_its_minus() {
 
 #[cfg(feature = "standalone")]
 const FOLDS: &str =
-    "CREATE TABLE s.t (id integer NOT NULL, g integer, a integer, d double precision, \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, g integer, a integer, d double precision, \
                      n numeric, b boolean, PRIMARY KEY (id));";
 
 #[cfg(feature = "standalone")]
@@ -671,7 +671,7 @@ fn cased_under(name: &str, want: &[(&str, &str, [&str; 7])]) {
     let insert = format!("INSERT INTO s.t VALUES {}", values.join(", "));
     let mut snail = snail_of(
         name,
-        "CREATE TABLE s.t (id integer NOT NULL, v text, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v text, PRIMARY KEY (id));",
         &[&insert],
     );
     for (collation, f, rows) in want {
@@ -947,7 +947,7 @@ fn initcap_and_casefold_map_case_under_each_library_collation() {
 fn a_substring_search_under_a_nondeterministic_collation_is_refused() {
     let mut snail = snail_of(
         "nondeterministic",
-        "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
+        "CREATE SCHEMA s; CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
          deterministic = false); \
          CREATE TABLE s.t (id integer NOT NULL, v text COLLATE s.ci, PRIMARY KEY (id));",
         &["INSERT INTO s.t VALUES (1, 'xABC')"],
@@ -992,7 +992,7 @@ fn a_substring_search_under_a_nondeterministic_collation_is_refused() {
 fn the_aggregates_and_windows_compare_strings_under_their_collation() {
     let mut snail = snail_of(
         "collated-folds",
-        "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
+        "CREATE SCHEMA s; CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
          deterministic = false); \
          CREATE TABLE s.t (id integer NOT NULL, v text COLLATE s.ci, w text COLLATE \"en-x-icu\", \
          PRIMARY KEY (id));",

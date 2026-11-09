@@ -51,6 +51,8 @@ either made, of format 7 or 8, is opened and written in its own format.
 A shop's orders, declared as PostgreSQL declares them, in `shop.sql`:
 
 ```sql
+CREATE SCHEMA shop;
+
 CREATE FUNCTION shop.clock(timestamptz) RETURNS timestamp
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
 
@@ -73,7 +75,8 @@ The table is clustered on `orders_customer`, so each customer's orders lie toget
 they were placed. `orders_month` holds the orders by the month they were placed in. PostgreSQL
 refuses `extract(month …)` on a `timestamptz` in an index, since the month depends on the
 session's time zone; `shop.clock` reads the instant on UTC's clock, and the month through it is
-indexable. The same file runs on PostgreSQL, in a database with a schema `shop`.
+indexable. The same file runs on PostgreSQL as it is: it makes the schema `shop` before anything
+in it, which both need.
 
 Write the snail from the DDL alone. Each order is written empty:
 
@@ -757,6 +760,7 @@ order.
 most rows the pipeline held at once. A payments log, `payments.sql`:
 
 ```sql
+CREATE SCHEMA shop;
 CREATE TABLE shop.payments (
     seq bigint NOT NULL,
     customer_id integer NOT NULL,
@@ -813,8 +817,8 @@ lists each.
 ## Checking an answer against PostgreSQL
 
 The DDL is PostgreSQL's, and so is every question, so the same files run on
-[PostgreSQL](https://www.postgresql.org/): load the DDL into a database with the schema it names,
-put the same rows in, and ask the same question. PostgreSQL's rows are the answer the snail's are
+[PostgreSQL](https://www.postgresql.org/): load the DDL into a database, put the same rows in, and
+ask the same question. PostgreSQL's rows are the answer the snail's are
 checked against. Text that names no collation is compared by its bytes, as PostgreSQL compares it
 under the `C` collation, so check against a database whose collation is `C`, or `C.UTF-8`. A
 column's own collation orders it as PostgreSQL orders it: one that orders by bytes in any build,

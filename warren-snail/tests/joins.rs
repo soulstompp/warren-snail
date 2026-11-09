@@ -12,7 +12,7 @@ use warren_snail::read::{Round, Snail};
 use warren_snail::values::Values;
 use warren_snail::write::Rows;
 
-const DDL: &str = "
+const DDL: &str = "CREATE SCHEMA j; 
 CREATE TABLE j.themes (
     theme_id integer NOT NULL,
     parent_id integer,
@@ -792,7 +792,7 @@ fn what_a_join_does_not_read_is_refused_with_its_reason() {
 
 /// Two tables of the structured types, written empty.
 fn structured(name: &str) -> PathBuf {
-    let ddl = "CREATE TABLE s.a (id integer NOT NULL, n inet, j jsonb, t tsvector, x json, p point, \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.a (id integer NOT NULL, n inet, j jsonb, t tsvector, x json, p point, \
                b box, PRIMARY KEY (id)); \
                CREATE TABLE s.c (id integer NOT NULL, n cidr, j jsonb, t tsvector, x json, p point, \
                b box, PRIMARY KEY (id));";

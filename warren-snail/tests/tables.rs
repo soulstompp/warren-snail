@@ -21,9 +21,10 @@ const MANY: usize = 600;
 
 /// `n` tables of two columns, `s.table_<i>`.
 fn ddl(n: usize) -> String {
-    (0..n)
+    let tables: String = (0..n)
         .map(|i| format!("CREATE TABLE s.table_{i:05} (a bigint PRIMARY KEY, b text);\n"))
-        .collect()
+        .collect();
+    format!("CREATE SCHEMA s;\n{tables}")
 }
 
 fn name(i: usize) -> String {
@@ -412,7 +413,7 @@ mod written {
         let b = tmp("tables-across-b.snail");
         write(
             &b,
-            &Catalog::parse("CREATE TABLE t.other (a bigint PRIMARY KEY, b text);").unwrap(),
+            &Catalog::parse("CREATE SCHEMA t; CREATE TABLE t.other (a bigint PRIMARY KEY, b text);").unwrap(),
             &[("t.other".into(), rows(1, 10))],
         )
         .unwrap();

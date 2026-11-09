@@ -14,7 +14,7 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{fresh, tmp, write};
 
-const DDL: &str = "CREATE TABLE a.t (id integer NOT NULL, g integer, v integer, sm smallint, \
+const DDL: &str = "CREATE SCHEMA a; CREATE TABLE a.t (id integer NOT NULL, g integer, v integer, sm smallint, \
                    s text, PRIMARY KEY (id));
      CREATE TABLE a.u (id integer NOT NULL, t_id integer, w integer, PRIMARY KEY (id));
      CREATE TABLE a.big (id integer NOT NULL, n bigint, PRIMARY KEY (id));";
@@ -472,7 +472,7 @@ fn a_case_and_a_parameter_on_one_table_are_read_as_a_step_reads_them() {
 fn a_document_s_arrows_on_one_table_are_read_as_a_step_reads_them() {
     let path = tmp("answers-arrows.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE a.j (id integer NOT NULL, doc jsonb, PRIMARY KEY (id));")
+        Catalog::parse("CREATE SCHEMA a; CREATE TABLE a.j (id integer NOT NULL, doc jsonb, PRIMARY KEY (id));")
             .unwrap();
     let empty = Rows {
         columns: catalog.tables[0]

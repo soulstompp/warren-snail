@@ -431,7 +431,7 @@ fn where_current_of_writes_the_row_the_cursor_stands_on() {
 fn copy_writes_rows_out_and_reads_them_back_in_text_and_csv() {
     let path = tmp("session-copy.snail");
     let catalog = warren_snail::catalog::Catalog::parse(
-        "CREATE TABLE s.t (k integer NOT NULL, v text, b boolean, c character(3), PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (k integer NOT NULL, v text, b boolean, c character(3), PRIMARY KEY (k));",
     )
     .unwrap();
     write(&path, &catalog, &[]).unwrap();
@@ -580,7 +580,7 @@ fn default_text_search_config_is_the_files_and_set_config_in_a_write_stands_for_
 fn copy_writes_and_reads_the_binary_format_as_postgresql_does() {
     let path = tmp("session-copy-binary.snail");
     let catalog = warren_snail::catalog::Catalog::parse(
-        "CREATE TABLE s.b (k integer NOT NULL, v text, n numeric(10,2), d date, at timestamptz, \
+        "CREATE SCHEMA s; CREATE TABLE s.b (k integer NOT NULL, v text, n numeric(10,2), d date, at timestamptz, \
          u uuid, f double precision, ok boolean, PRIMARY KEY (k));",
     )
     .unwrap();
@@ -672,7 +672,7 @@ fn a_cursor_the_round_can_stop_early_on_reads_only_the_blocks_its_fetches_take()
 fn copy_from_keeps_the_rows_its_where_admits_and_skips_those_on_error_ignore_finds_unread() {
     let path = tmp("session-copy-options.snail");
     let catalog = warren_snail::catalog::Catalog::parse(
-        "CREATE TABLE s.o (k integer NOT NULL, g integer, PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.o (k integer NOT NULL, g integer, PRIMARY KEY (k));",
     )
     .unwrap();
     write(&path, &catalog, &[]).unwrap();

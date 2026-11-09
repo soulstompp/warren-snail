@@ -145,7 +145,7 @@ fn a_root_whose_transaction_did_not_commit_is_written_over_by_the_next_commit_of
     assert_eq!(read_as(&path, Some(&said), "Sagres 1"), (g + 1, 0));
 }
 
-const SEQUENCED: &str = "CREATE SEQUENCE shop.ids;\n\
+const SEQUENCED: &str = "CREATE SCHEMA shop; CREATE SEQUENCE shop.ids;\n\
      CREATE TABLE shop.orders (id bigint NOT NULL DEFAULT nextval('shop.ids'), v integer NOT NULL, \
      PRIMARY KEY (id));";
 
@@ -597,7 +597,7 @@ impl carry::Monitor for Told {
 }
 
 const COUNTED: &str =
-    "CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
+    "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
 
 /// A host's monitor is the one monitor: told of each block a round reads and each a write changes,
 /// and of a cut as its commit lands; the file's records hold none of it.

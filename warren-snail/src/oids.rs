@@ -17,7 +17,8 @@ pub const SYSTEM_COLUMNS: [&str; 6] = ["tableoid", "cmax", "xmax", "cmin", "xmin
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Object {
-    /// A schema other than `public` and `pg_catalog`, which an object of the file lies in.
+    /// A schema the DDL made, or one a file's kept statement names that no statement made;
+    /// `public` only where the DDL made it again after dropping it.
     Namespace(String),
     /// A table, an index, a sequence, a view, or the relation behind a composite type.
     Class(String),
@@ -93,7 +94,13 @@ pub struct Oids {
     by_object: HashMap<Object, u32>,
     by_oid: BTreeMap<u32, Object>,
     next: u32,
+    /// Whether the DDL dropped the release's schema `public`, whose OID is 2200: a `public` made
+    /// again is the file's own, with an OID the DDL hands it.
+    public_dropped: bool,
 }
+
+/// The OID of the schema `public` as initdb makes it.
+pub const PUBLIC: u32 = 2200;
 
 impl Default for Oids {
     fn default() -> Self {
@@ -101,6 +108,7 @@ impl Default for Oids {
             by_object: HashMap::new(),
             by_oid: BTreeMap::new(),
             next: FIRST,
+            public_dropped: false,
         }
     }
 }
@@ -168,6 +176,25 @@ impl Oids {
     /// The next OID it would hand out.
     pub fn next(&self) -> u32 {
         self.next
+    }
+
+    /// The release's `public` given up: the DDL dropped it.
+    pub(crate) fn drop_public(&mut self) {
+        self.public_dropped = true;
+    }
+
+    /// Whether the DDL dropped the release's `public`, OID 2200.
+    pub fn public_dropped(&self) -> bool {
+        self.public_dropped
+    }
+
+    /// The OID of the schema `public` as the file has it: the release's until the DDL drops it,
+    /// then the one CREATE SCHEMA public handed out, none while it stands nowhere.
+    pub fn public(&self) -> Option<u32> {
+        match self.public_dropped {
+            false => Some(PUBLIC),
+            true => self.of(&Object::Namespace("public".into())),
+        }
     }
 }
 

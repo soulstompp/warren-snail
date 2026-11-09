@@ -16,7 +16,7 @@ use warren_snail::write::Rows;
 use warren_snail::{Error, Result};
 use weather::{fresh, tmp, write};
 
-const DDL: &str = "CREATE TYPE a.dim AS (w integer, h integer);
+const DDL: &str = "CREATE SCHEMA a; CREATE TYPE a.dim AS (w integer, h integer);
      CREATE TABLE a.p (id integer NOT NULL, g integer, r bigint, c bigint, k text, PRIMARY KEY (id));
      CREATE TABLE a.q (id integer NOT NULL, p_id integer, w bigint, PRIMARY KEY (id));
      CREATE TABLE a.inv (id integer NOT NULL, name text, qty integer, price numeric(10,2), \
@@ -576,11 +576,11 @@ fn split(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let one = tmp(&format!("handed-{name}-p.snail"));
     let two = tmp(&format!("handed-{name}-q.snail"));
     let p_ddl = Catalog::parse(
-        "CREATE TABLE a.p (id integer NOT NULL, g integer, r bigint, c bigint, k text, PRIMARY KEY (id));",
+        "CREATE SCHEMA a; CREATE TABLE a.p (id integer NOT NULL, g integer, r bigint, c bigint, k text, PRIMARY KEY (id));",
     )
     .unwrap();
     let q_ddl = Catalog::parse(
-        "CREATE TABLE a.q (id integer NOT NULL, p_id integer, w bigint, PRIMARY KEY (id));",
+        "CREATE SCHEMA a; CREATE TABLE a.q (id integer NOT NULL, p_id integer, w bigint, PRIMARY KEY (id));",
     )
     .unwrap();
     write(&one, &p_ddl, &all[0..1]).unwrap();
@@ -762,7 +762,7 @@ fn a_built_in_type_s_name_casts_to_the_built_in_type_beside_a_table_of_that_name
     // answers its count of cents.
     let path = tmp("handed-built-in-names.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.oid (id integer NOT NULL, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.oid (id integer NOT NULL, PRIMARY KEY (id));
          CREATE TABLE s.money (id integer NOT NULL, PRIMARY KEY (id));
          CREATE TABLE s.inet (id integer NOT NULL, PRIMARY KEY (id));",
     )

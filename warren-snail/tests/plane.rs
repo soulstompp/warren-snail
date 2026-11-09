@@ -45,7 +45,7 @@ fn ids(s: &mut Snail, sql: &str, order: &str) -> Vec<i64> {
 /// as an integer's over the grid's 10.
 fn grid(name: &str) -> std::path::PathBuf {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, p point, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, p point, PRIMARY KEY (id)); \
          CREATE INDEX t_p ON s.t USING gist (p);",
     )
     .unwrap();
@@ -108,12 +108,14 @@ fn a_grid_of_points_is_cut_one_bit_a_rung_and_a_box_reads_the_blocks_the_arithme
     assert_eq!(whole.blocks_read, 2048, "{whole:?}");
 }
 
-/// Each statement's refusal, or None where it is taken.
+/// Each statement's refusal, or None where it is taken; the schema's CREATE SCHEMA left out, which
+/// no test here is about.
 fn outcomes(ddl: &str) -> Vec<Option<String>> {
     Catalog::read(ddl)
         .unwrap()
         .statements
         .into_iter()
+        .filter(|s| s.kind != "CREATE SCHEMA")
         .map(|s| s.refused)
         .collect()
 }
@@ -129,7 +131,7 @@ fn spelled(table: &str, statement: &str) -> String {
 #[test]
 fn an_index_on_the_plane_is_read_or_refused_as_postgresql_reads_it() {
     let table =
-        "CREATE TABLE s.t (id int PRIMARY KEY, p point, b box, c circle, g polygon, l lseg, \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, p point, b box, c circle, g polygon, l lseg, \
                  pa path, li line);";
     // Each refusal as PostgreSQL 18.6 and 19 RC1 gave it (28818, 28819, 2026-11-02).
     for (statement, why) in [
@@ -323,7 +325,7 @@ fn table_of(
         .map(|m| format!("CREATE INDEX t_{m} ON s.t USING {m} (v); "))
         .collect();
     let catalog = Catalog::parse(&format!(
-        "CREATE TABLE s.t (id bigint NOT NULL, v {ty}, PRIMARY KEY (id)); {indexes}"
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v {ty}, PRIMARY KEY (id)); {indexes}"
     ))
     .unwrap();
     let id = Values::Int((0..n).map(Some).collect());
@@ -718,7 +720,7 @@ fn a_distance_beside_a_condition_finds_its_nearest_rows_along_its_strand() {
 fn write_and_the_old_formats_treat_a_shape_as_postgresql_and_their_refusals_name_the_way_across() {
     // A circle whose bounding box overflows, refused where it enters the strand.
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v circle, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v circle, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v);",
     )
     .unwrap();
@@ -746,7 +748,7 @@ fn write_and_the_old_formats_treat_a_shape_as_postgresql_and_their_refusals_name
         let e = warren_snail::write::write_format_eight(
             &tmp("plane-eight.snail"),
             &Catalog::parse(&format!(
-                "CREATE TABLE s.t (a integer NOT NULL, v {ty}, PRIMARY KEY (a)); \
+                "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, v {ty}, PRIMARY KEY (a)); \
                  CREATE INDEX t_v ON s.t USING {method} (v);",
             ))
             .unwrap(),
@@ -768,7 +770,7 @@ fn write_and_the_old_formats_treat_a_shape_as_postgresql_and_their_refusals_name
 #[test]
 fn a_table_clustered_on_a_gist_index_on_the_plane_is_cut_on_it_and_read_as_any_order() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v); \
          ALTER TABLE s.t CLUSTER ON t_v;",
     )
@@ -840,7 +842,7 @@ fn refused(w: &mut Snail, sql: &str, why: &str) {
 #[cfg(feature = "standalone")]
 fn shapes_snail(name: &str) -> std::path::PathBuf {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, p point, b box, g polygon, c circle, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, p point, b box, g polygon, c circle, PRIMARY KEY (id)); \
          CREATE INDEX t_p ON s.t USING gist (p); \
          CREATE INDEX t_ps ON s.t USING spgist (p kd_point_ops); \
          CREATE INDEX t_b ON s.t USING gist (b); \
@@ -1016,7 +1018,7 @@ fn a_shape_written_moved_and_deleted_widens_its_block_s_box_on_every_strand() {
 #[test]
 fn a_table_clustered_on_the_plane_takes_statements_as_any_order_does() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v); \
          ALTER TABLE s.t CLUSTER ON t_v;",
     )
@@ -1088,7 +1090,7 @@ fn a_table_clustered_on_the_plane_takes_statements_as_any_order_does() {
 fn exclusions(name: &str) -> std::path::PathBuf {
     let path = tmp(&format!("{name}.snail"));
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, p point, b box, g polygon, c circle, PRIMARY KEY (id), \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, p point, b box, g polygon, c circle, PRIMARY KEY (id), \
          EXCLUDE USING gist (p WITH ~=), \
          EXCLUDE USING gist (b WITH &&), \
          EXCLUDE USING gist (g WITH &&), \
@@ -1156,7 +1158,7 @@ fn an_exclude_on_the_plane_refuses_a_shape_that_conflicts_as_postgresql_refuses_
     run(&mut w, "UPDATE s.t SET b = '((1,1),(5,5))' WHERE id = 5");
     // On SP-GiST, PostgreSQL takes the constraint and refuses every box or polygon it meets (geo_spgist.c).
     let catalog = Catalog::parse(
-        "CREATE TABLE s.u (id integer NOT NULL, b box, g polygon, p point, PRIMARY KEY (id), \
+        "CREATE SCHEMA s; CREATE TABLE s.u (id integer NOT NULL, b box, g polygon, p point, PRIMARY KEY (id), \
          EXCLUDE USING spgist (b WITH &&), EXCLUDE USING spgist (g WITH ~=), \
          EXCLUDE USING spgist (p kd_point_ops WITH ~=));",
     )
@@ -1394,7 +1396,7 @@ fn at_serializable_a_read_along_the_plane_meets_a_row_written_into_a_block_it_ru
 #[test]
 fn a_join_reads_its_side_along_the_plane_and_a_comparison_of_two_columns_is_a_row_s() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v box, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v box, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v); \
          CREATE TABLE s.u (id bigint NOT NULL, t_id bigint NOT NULL, w box, PRIMARY KEY (id));",
     )
@@ -1531,7 +1533,7 @@ fn what_a_mount_asks_holds_on_the_plane_its_price_its_scan_its_sample_and_its_sh
     exact(q, &round);
     // A sample of a table whose own order is the plane's reads its rows' pages, whichever.
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v); \
          ALTER TABLE s.t CLUSTER ON t_v;",
     )
@@ -1585,7 +1587,7 @@ fn what_a_mount_asks_holds_on_the_plane_its_price_its_scan_its_sample_and_its_sh
 #[test]
 fn a_commit_rebuilds_the_boxes_above_its_blocks_a_coordinate_at_a_time() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v);",
     )
     .unwrap();
@@ -1628,7 +1630,7 @@ fn a_commit_rebuilds_the_boxes_above_its_blocks_a_coordinate_at_a_time() {
 #[test]
 fn a_strand_of_several_levels_keeps_the_box_of_each_and_reads_a_condition_on_any() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, p point, b box, r int4range, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, p point, b box, r int4range, PRIMARY KEY (id)); \
          CREATE INDEX t_pb ON s.t USING gist (p, b) INCLUDE (r); \
          CREATE INDEX t_rp ON s.t USING gist (r, p);",
     )
@@ -1700,7 +1702,7 @@ fn a_strand_of_several_levels_keeps_the_box_of_each_and_reads_a_condition_on_any
 #[test]
 fn a_partial_strand_on_the_plane_holds_the_rows_it_admits_and_serves_what_implies_it() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v) WHERE id >= 1000;",
     )
     .unwrap();
@@ -2076,7 +2078,7 @@ fn a_descending_distance_or_its_nulls_first_is_left_to_the_table_s_read() {
 #[test]
 fn a_column_off_the_strand_is_read_after_the_table_kept_to_the_keys_the_walk_found() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v point, w bigint, z bigint, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, w bigint, z bigint, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t USING gist (v); \
          CREATE INDEX t_vw ON s.t USING gist (v) INCLUDE (w);",
     )
@@ -2224,7 +2226,7 @@ fn a_row_written_comes_where_its_distance_puts_it_and_a_page_held_is_read_from_n
 #[test]
 fn a_strand_of_several_levels_and_a_partial_one_give_a_distance_where_they_hold_what_it_reads() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, v point, b box, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, b box, PRIMARY KEY (id)); \
          CREATE INDEX t_vb ON s.t USING gist (v, b); \
          CREATE INDEX t_part ON s.t USING gist (v) WHERE id >= 1000;",
     )
@@ -2310,7 +2312,7 @@ fn at_serializable_a_distance_read_marks_the_strand_whole_so_a_nearer_row_writte
 fn a_distance_rounds_as_the_release_the_file_records_rounds_it() {
     let answer = |release: Option<u8>| -> u64 {
         let catalog = Catalog::parse(
-            "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
              CREATE INDEX t_v ON s.t USING gist (v);",
         )
         .unwrap();
@@ -2340,7 +2342,7 @@ fn a_distance_rounds_as_the_release_the_file_records_rounds_it() {
     // A condition along the strand and a CHECK round alike.
     for (release, held) in [(18, 1), (19, 0)] {
         let catalog = Catalog::parse(
-            "CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v point, PRIMARY KEY (id)); \
              CREATE INDEX t_v ON s.t USING gist (v); \
              CREATE TABLE s.c (id bigint NOT NULL, v point, PRIMARY KEY (id), \
              CHECK (v <-> point '(0,0)' = 1.4142135623730951e150)); \

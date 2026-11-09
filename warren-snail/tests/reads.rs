@@ -783,7 +783,7 @@ fn an_infinite_instant_is_carried_on_a_level_and_counted_at_its_end_beside_the_m
     assert_eq!(total, 3000);
     // Keyed on an instant, the infinities are places at the ends of the level.
     let keyed =
-        Catalog::parse("CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));").unwrap();
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));").unwrap();
     let _ = std::fs::remove_file(&path);
     let rows = Rows {
         columns: vec![Values::Int(vec![

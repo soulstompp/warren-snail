@@ -1,6 +1,8 @@
 -- Weather stations and their readings, as a snail holds them. The same file is PostgreSQL's DDL for
 -- these tables.
 
+CREATE SCHEMA weather;
+
 CREATE FUNCTION weather.clock(timestamptz) RETURNS timestamp
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
 

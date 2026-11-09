@@ -58,7 +58,7 @@ fn a_jsonb_level_holds_its_values_in_jsonb_cmp_s_order_equal_classes_on_one_plac
     ];
     let path = snail_of(
         "jsonb-level",
-        "CREATE TABLE s.t (id integer NOT NULL, v jsonb, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v jsonb, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t (v, id);",
         rows(&values, jsonb),
     );
@@ -96,7 +96,7 @@ fn an_inet_level_orders_as_network_cmp_and_a_cidr_reads_a_literal_as_inet() {
     ];
     let path = snail_of(
         "inet-level",
-        "CREATE TABLE s.t (id integer NOT NULL, v inet, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v inet, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t (v, id);",
         rows(&values, inet),
     );
@@ -109,7 +109,7 @@ fn an_inet_level_orders_as_network_cmp_and_a_cidr_reads_a_literal_as_inet() {
     let cidrs = ["10.0.0.0/8", "10.0.0.1/32"];
     let path = snail_of(
         "cidr-literal",
-        "CREATE TABLE s.t (id integer NOT NULL, v cidr, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v cidr, PRIMARY KEY (id));",
         rows(&cidrs, |s| warren_snail::inet::inet_in(s, true).unwrap()),
     );
     let (b, _) = Snail::open(&path)
@@ -130,7 +130,7 @@ fn a_tsquery_holds_a_text_that_reads_back_into_the_same_value_and_prints_as_tsqu
     let values = ["a & (b & c)", "a & b & c"];
     let path = snail_of(
         "tsquery-held",
-        "CREATE TABLE s.t (id integer NOT NULL, v tsquery, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v tsquery, PRIMARY KEY (id));",
         rows(&values, |s| warren_snail::tsearch::tsquery_in(s).unwrap()),
     );
     let mut snail = Snail::open(&path).unwrap();
@@ -164,7 +164,7 @@ fn a_geometric_value_is_its_float8_leaves_each_bit_kept_out_and_back() {
     use arrow::array::{Array, Float64Array, StructArray};
     let path = tmp("point-bits.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.t (id integer NOT NULL, v point, PRIMARY KEY (id));")
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v point, PRIMARY KEY (id));")
             .unwrap();
     let empty = Rows {
         columns: vec![Values::Int(vec![]), Values::Utf8(vec![])],
@@ -213,7 +213,7 @@ fn a_geometric_value_is_its_float8_leaves_each_bit_kept_out_and_back() {
 #[test]
 fn a_type_only_a_server_makes_is_refused_from_a_literal_and_held_null_only_where_none_is_copied() {
     let ddl =
-        "CREATE TABLE s.t (id integer NOT NULL, n pg_node_tree, g gtsvector, PRIMARY KEY (id));";
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, n pg_node_tree, g gtsvector, PRIMARY KEY (id));";
     let catalog = Catalog::parse(ddl).unwrap();
     // A node tree copied in is held; a gtsvector copied in is refused, as no table holds one.
     let path = tmp("server-made.snail");
@@ -287,7 +287,7 @@ fn unhex(s: &str) -> Vec<u8> {
 fn the_planner_s_statistics_are_answered_as_their_bytes_their_output_refused_by_name() {
     use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array};
     use std::sync::Arc;
-    let ddl = "CREATE TABLE s.t (id integer NOT NULL, nd pg_ndistinct, dp pg_dependencies, \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, nd pg_ndistinct, dp pg_dependencies, \
                mc pg_mcv_list, PRIMARY KEY (id));";
     let catalog = Catalog::parse(ddl).unwrap();
     // The statistics PostgreSQL 19 RC1 kept on two columns (28819, 2026-10-31), and some bytes for
@@ -434,7 +434,7 @@ fn the_planner_s_statistics_are_answered_as_their_bytes_their_output_refused_by_
 fn an_aclitem_is_three_leaves_its_roles_their_oids_and_names_no_role() {
     let path = tmp("aclitem.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.t (id integer NOT NULL, v aclitem, PRIMARY KEY (id));")
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v aclitem, PRIMARY KEY (id));")
             .unwrap();
     let empty = Rows {
         columns: vec![Values::Int(vec![]), Values::Text(vec![])],
@@ -476,7 +476,7 @@ fn an_aclitem_is_three_leaves_its_roles_their_oids_and_names_no_role() {
 fn a_type_postgresql_neither_orders_nor_groups_is_refused_both_ways() {
     let path = snail_of(
         "json-refused",
-        "CREATE TABLE s.t (id integer NOT NULL, v json, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v json, PRIMARY KEY (id));",
         rows(&[r#"{"a":1}"#, "[1, 2]"], str::to_string),
     );
     let mut snail = Snail::open(&path).unwrap();
@@ -536,7 +536,7 @@ fn out_and_back(path: &std::path::Path, catalog: &Catalog, name: &str) -> std::p
 fn a_path_and_a_polygon_are_trees_of_their_own_the_polygon_s_bounding_box_kept_out_and_back() {
     let path = tmp("path-polygon.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, p path, g polygon, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, p path, g polygon, PRIMARY KEY (id)); \
          CREATE TABLE s.u (id integer NOT NULL, p path, g polygon, PRIMARY KEY (id));",
     )
     .unwrap();
@@ -628,7 +628,7 @@ fn a_path_and_a_polygon_are_trees_of_their_own_the_polygon_s_bounding_box_kept_o
 
 #[test]
 fn a_snapshot_is_its_xmin_its_xmax_and_its_transactions_compared_by_nothing() {
-    let ddl = "CREATE TABLE s.t (id integer NOT NULL, v pg_snapshot, w txid_snapshot, \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v pg_snapshot, w txid_snapshot, \
                PRIMARY KEY (id));";
     let held = |v: &[Option<&str>]| Values::Text(v.iter().map(|s| s.map(str::to_string)).collect());
     let path = snail_of(
@@ -695,7 +695,7 @@ fn a_snapshot_is_its_xmin_its_xmax_and_its_transactions_compared_by_nothing() {
 fn an_array_of_a_type_with_no_equality_refuses_one_only_of_two_arrays_of_one_shape() {
     let path = tmp("carried-arrays.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, p point[], b box[], a aclitem[], q path[], \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, p point[], b box[], a aclitem[], q path[], \
          PRIMARY KEY (id));",
     )
     .unwrap();

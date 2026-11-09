@@ -16,7 +16,7 @@ use warren_snail::write::Rows;
 use weather::{fresh, tmp, write};
 
 const DDL: &str =
-    "CREATE TABLE a.t (id integer NOT NULL, g integer, v integer, s text, PRIMARY KEY (id));
+    "CREATE SCHEMA a; CREATE TABLE a.t (id integer NOT NULL, g integer, v integer, s text, PRIMARY KEY (id));
      CREATE TABLE a.u (id integer NOT NULL, t_id integer, w integer, PRIMARY KEY (id));
      CREATE TABLE a.k (lo integer NOT NULL, hi integer NOT NULL, label text, PRIMARY KEY (lo));
      CREATE VIEW a.tu AS SELECT t.id, t.g, u.w FROM a.t t JOIN a.u u ON u.t_id = t.id;
@@ -518,7 +518,7 @@ fn several_snails_relations_meet_as_one_snail_s_do() {
     .unwrap();
     let spans = tmp("relations-several-spans.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE b.k (lo integer NOT NULL, hi integer NOT NULL, label text, PRIMARY KEY (lo));",
+        "CREATE SCHEMA b; CREATE TABLE b.k (lo integer NOT NULL, hi integer NOT NULL, label text, PRIMARY KEY (lo));",
     )
     .unwrap();
     write(&spans, &catalog, &[("b.k".into(), k)]).unwrap();

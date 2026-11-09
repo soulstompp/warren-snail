@@ -63,7 +63,7 @@ fn rows_of(catalog: &Catalog, table: &str, rows: &[Vec<String>]) -> Rows {
 /// Both tables as one snail.
 fn one(name: &str) -> PathBuf {
     let path = tmp(&format!("handing-{name}.snail"));
-    let ddl = format!("{A_DDL}\n{B_DDL}");
+    let ddl = format!("CREATE SCHEMA s;\n{A_DDL}\n{B_DDL}");
     let catalog = Catalog::parse(&ddl).unwrap();
     write(
         &path,
@@ -81,14 +81,14 @@ fn one(name: &str) -> PathBuf {
 fn two(name: &str) -> (PathBuf, PathBuf) {
     let a = tmp(&format!("handing-{name}-a.snail"));
     let b = tmp(&format!("handing-{name}-b.snail"));
-    let catalog = Catalog::parse(A_DDL).unwrap();
+    let catalog = Catalog::parse(&format!("CREATE SCHEMA s; {A_DDL}")).unwrap();
     write(
         &a,
         &catalog,
         &[("s.a".into(), rows_of(&catalog, "s.a", &a_rows()))],
     )
     .unwrap();
-    let catalog = Catalog::parse(B_DDL).unwrap();
+    let catalog = Catalog::parse(&format!("CREATE SCHEMA s; {B_DDL}")).unwrap();
     write(
         &b,
         &catalog,

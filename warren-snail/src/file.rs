@@ -165,12 +165,15 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
 }
 
 /// Refuses a catalog's types, domains, sequences and collations in a snail of `format`: 0.1.x reads
-/// none, and a sequence's state lies in format 9's root.
+/// none, and a sequence's state lies in format 9's root. So too a statement 0.1.x does not read in
+/// the DDL the file keeps, which it reads again as it opens: CREATE SCHEMA and the DROPs.
 pub(crate) fn holds_catalog(format: u32, catalog: &crate::catalog::Catalog) -> crate::Result<()> {
     if format >= FORMAT {
         return Ok(());
     }
-    let what = if let Some(t) = catalog.types.first() {
+    let what = if let Some(s) = crate::ddl::past_first_formats(&catalog.ddl) {
+        format!("the statement {s}")
+    } else if let Some(t) = catalog.types.first() {
         format!("the type {}", t.name)
     } else if let Some(d) = catalog.domains.first() {
         format!("the domain {}", d.name)

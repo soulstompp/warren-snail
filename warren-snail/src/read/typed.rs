@@ -699,6 +699,14 @@ impl Typing<'_> {
                 if let Some(e) = type_keyword(f) {
                     return Err(e);
                 }
+                // A function named in a schema that stands nowhere, refused as PostgreSQL's lookup
+                // refuses it, before its arguments.
+                if let [sqlparser::ast::ObjectNamePart::Identifier(s), _] = f.name.0.as_slice() {
+                    let s = crate::catalog::ident(s);
+                    if s != "pg_catalog" {
+                        crate::regs::schema_found(&s)?;
+                    }
+                }
                 let Some(args) = call_args(f) else {
                     return Ok(None);
                 };

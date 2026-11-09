@@ -112,7 +112,7 @@ fn an_integer_is_cut_by_its_bits() {
     // 4 bytes a row: a page fills at 1,024 rows, so 16,384 spread evenly make 16 blocks.
     let path = written(
         "int",
-        "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| i.to_string())],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -125,7 +125,7 @@ fn a_float_is_cut_by_the_bits_of_its_class() {
     // 16,384 doubles one apart in their last bits, 8 bytes a row: a page fills at 512 rows.
     let path = written(
         "float",
-        "CREATE TABLE s.t (a double precision NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a double precision NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| {
             f64::from_bits(1f64.to_bits() + i as u64).to_string()
         })],
@@ -139,7 +139,7 @@ fn a_numeric_is_cut_by_the_bits_of_its_smallest_unit() {
     // numeric(10, 2) as the count of its hundredths, 8 bytes a row; its NaN leaf never decides.
     let path = written(
         "numeric",
-        "CREATE TABLE s.t (a numeric(10, 2) NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a numeric(10, 2) NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| format!("{}.{:02}", i / 100, i % 100))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -152,7 +152,7 @@ fn an_instant_is_cut_on_the_calendar_and_its_thin_month_joins_the_one_before() {
     // none, so every month is a block; 2019's November, 328 hours, joins October.
     let path = written(
         "instant",
-        "CREATE TABLE s.t (a timestamptz NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a timestamptz NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| at(3600 * i))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -177,7 +177,7 @@ fn an_interval_is_one_leaf_of_16_bytes_cut_on_30_day_months() {
     // and no month would have split.
     let path = written(
         "interval",
-        "CREATE TABLE s.t (a interval NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a interval NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| format!("{i} hours"))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -197,7 +197,7 @@ fn a_text_is_cut_a_bit_a_rung_where_a_byte_a_rung_kept_one_block() {
     // 1,024 split and those of 512 do not. A byte a rung, each first character's 256 rows fill none.
     let path = written(
         "text",
-        "CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));",
         vec![each(chars)],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -216,7 +216,7 @@ fn a_bytea_is_cut_a_bit_a_rung() {
     // Two bytes and their length, 6 bytes a row: a page fills at 683 rows.
     let path = written(
         "bytea",
-        "CREATE TABLE s.t (a bytea NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a bytea NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| format!("\\x{:04x}", i))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -228,7 +228,7 @@ fn a_uuid_is_cut_by_its_128_bits() {
     // 16 bytes a row: a page fills at 256 rows.
     let path = written(
         "uuid",
-        "CREATE TABLE s.t (a uuid NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a uuid NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| {
             format!("{:04x}0000-0000-0000-0000-000000000000", i << 2)
         })],
@@ -243,7 +243,7 @@ fn an_address_is_cut_by_the_bits_of_its_key() {
     // fills at 216 rows, so blocks of 256.
     let path = written(
         "inet",
-        "CREATE TABLE s.t (a inet NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a inet NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| {
             format!("200.200.{}.{}", 128 + (i >> 7), 128 + (i & 127))
         })],
@@ -256,7 +256,7 @@ fn an_address_is_cut_by_the_bits_of_its_key() {
 fn a_point_carried_decides_as_its_two_8_byte_leaves() {
     let path = written(
         "point",
-        "CREATE TABLE s.t (k bigint NOT NULL, p point NOT NULL, PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (k bigint NOT NULL, p point NOT NULL, PRIMARY KEY (k));",
         vec![each(|i| i.to_string()), each(|i| format!("({i}, {})", -i))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -268,7 +268,7 @@ fn a_range_is_cut_on_its_structure_its_bounds_on_their_own_rungs() {
     // An int4range's three 4-byte leaves: a page fills at 1,024 rows, cut on the lower bound's bits.
     let ints = written(
         "int4range",
-        "CREATE TABLE s.t (r int4range NOT NULL, PRIMARY KEY (r));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (r int4range NOT NULL, PRIMARY KEY (r));",
         vec![each(|i| format!("[{i},{})", i + 1))],
     );
     let blocks = Snail::open(&ints).unwrap().blocks().unwrap();
@@ -282,7 +282,7 @@ fn a_range_is_cut_on_its_structure_its_bounds_on_their_own_rungs() {
     // December's 352 join November.
     let instants = written(
         "tstzrange",
-        "CREATE TABLE s.t (r tstzrange NOT NULL, PRIMARY KEY (r));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (r tstzrange NOT NULL, PRIMARY KEY (r));",
         vec![(0..ROWS)
             .map(|i| Some(format!("[{},{})", at(1800 * i), at(1800 * (i + 1)))))
             .collect()],
@@ -298,7 +298,7 @@ fn a_range_is_cut_on_its_structure_its_bounds_on_their_own_rungs() {
 fn a_multirange_is_cut_on_its_ranges_in_turn() {
     let path = written(
         "multirange",
-        "CREATE TABLE s.t (m int4multirange NOT NULL, PRIMARY KEY (m));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (m int4multirange NOT NULL, PRIMARY KEY (m));",
         vec![each(|i| format!("{{[{i},{})}}", i + 1))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -312,7 +312,7 @@ fn an_array_is_cut_on_its_elements_and_a_long_one_takes_a_unit_only_in_its_own_b
     // disk pages; every other block keeps a unit of one.
     let path = written(
         "array",
-        "CREATE TABLE s.t (a integer[] NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer[] NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| {
             let rest = if i == 8000 { 9999 } else { 2 };
             format!("{{{i}{}}}", ",0".repeat(rest))
@@ -330,7 +330,7 @@ fn an_array_is_cut_on_its_elements_and_a_long_one_takes_a_unit_only_in_its_own_b
     // Text elements by the bits of their bytes: four characters and their length, a page of 512.
     let texts = written(
         "text-array",
-        "CREATE TABLE s.t (a text[] NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a text[] NOT NULL, PRIMARY KEY (a));",
         vec![each(|i| format!("{{{}}}", nibbles(i)))],
     );
     let blocks = Snail::open(&texts).unwrap().blocks().unwrap();
@@ -342,7 +342,7 @@ fn a_jsonb_is_cut_on_the_bits_of_its_key() {
     // A string of four characters, its text six and its length: 10 bytes a row, a page of 410 rows.
     let path = written(
         "jsonb",
-        "CREATE TABLE s.t (j jsonb NOT NULL, PRIMARY KEY (j));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (j jsonb NOT NULL, PRIMARY KEY (j));",
         vec![each(|i| format!("\"{}\"", nibbles(i)))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -355,7 +355,7 @@ fn a_tsvector_is_cut_on_the_bits_of_its_lexemes() {
     // length: 10 bytes a row, a page of 410 rows.
     let path = written(
         "tsvector",
-        "CREATE TABLE s.t (v tsvector NOT NULL, PRIMARY KEY (v));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (v tsvector NOT NULL, PRIMARY KEY (v));",
         vec![each(nibbles)],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -366,7 +366,7 @@ fn a_tsvector_is_cut_on_the_bits_of_its_lexemes() {
 fn an_enum_is_cut_by_its_rank_and_its_label_never_decides() {
     let path = written(
         "enum",
-        "CREATE TYPE s.e AS ENUM ('north', 'east', 'south', 'west');
+        "CREATE SCHEMA s; CREATE TYPE s.e AS ENUM ('north', 'east', 'south', 'west');
          CREATE TABLE s.t (e s.e NOT NULL, k integer NOT NULL, PRIMARY KEY (e, k));",
         vec![
             each(|i| ["north", "east", "south", "west"][(i % 4) as usize].into()),
@@ -381,7 +381,7 @@ fn an_enum_is_cut_by_its_rank_and_its_label_never_decides() {
 fn a_record_is_cut_on_its_fields_in_turn() {
     let path = written(
         "record",
-        "CREATE TYPE s.c AS (a integer, b text);
+        "CREATE SCHEMA s; CREATE TYPE s.c AS (a integer, b text);
          CREATE TABLE s.t (c s.c NOT NULL, PRIMARY KEY (c));",
         vec![each(|i| format!("({i},x)"))],
     );
@@ -393,7 +393,7 @@ fn a_record_is_cut_on_its_fields_in_turn() {
 fn money_is_cut_by_the_bits_of_its_count() {
     let path = written(
         "money",
-        "CREATE TABLE s.t (m money NOT NULL, PRIMARY KEY (m));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (m money NOT NULL, PRIMARY KEY (m));",
         vec![each(|i| format!("{}.{:02}", i / 100, i % 100))],
     );
     let blocks = Snail::open(&path).unwrap().blocks().unwrap();
@@ -406,14 +406,14 @@ fn a_bit_string_is_cut_by_its_bits() {
     let bits = |i: i64| format!("{:032b}", i);
     let fixed = written(
         "bit",
-        "CREATE TABLE s.t (b bit(32) NOT NULL, PRIMARY KEY (b));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (b bit(32) NOT NULL, PRIMARY KEY (b));",
         vec![each(bits)],
     );
     let blocks = Snail::open(&fixed).unwrap().blocks().unwrap();
     assert_eq!(blocks_of(&blocks, "t_pkey"), [1024; 16]);
     let varying = written(
         "varbit",
-        "CREATE TABLE s.t (b bit varying(32) NOT NULL, PRIMARY KEY (b));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (b bit varying(32) NOT NULL, PRIMARY KEY (b));",
         vec![each(bits)],
     );
     let blocks = Snail::open(&varying).unwrap().blocks().unwrap();
@@ -426,7 +426,7 @@ fn a_text_carried_rules_blocks_out_by_its_bounds() {
     // equality reads the one block whose bounds hold it, and a value past every bound reads none.
     let path = written(
         "bounds",
-        "CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
         vec![
             each(|i| i.to_string()),
             each(|i| format!("{}{}", chars(i), "z".repeat(12))),
@@ -446,7 +446,7 @@ fn a_key_as_long_as_postgresql_takes_is_held_between_separators() {
     // first key that sorts after the key before it.
     let long = |i: i64| format!("{}{}", "x".repeat(2690), nibbles(i));
     let path = tmp("cycle-long.snail");
-    let catalog = Catalog::parse("CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
     let mut v = Values::new(catalog.tables[0].columns[0].ty);
     for i in 0..1024 {
         push_datum(
@@ -482,7 +482,7 @@ fn a_dba_s_thousandths_of_a_degree_are_cut_on_their_decimal_places_inside_the_de
     // 4-byte id holds: each tenth is a block.
     let path = written(
         "geo",
-        "CREATE TABLE s.t (id integer NOT NULL, latitude double precision NOT NULL, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, latitude double precision NOT NULL, PRIMARY KEY (id));
          CREATE INDEX t_cell ON s.t ((floor(latitude * 1000)), id);
          ALTER TABLE s.t CLUSTER ON t_cell;",
         vec![
@@ -514,7 +514,7 @@ fn a_row_written_into_a_block_widens_its_bounds() {
     // widen to hold it, and an equality on it finds it.
     let path = written(
         "bounds-written",
-        "CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
         vec![each(|i| i.to_string()), each(chars)],
     );
     let mut w = Snail::open_writing(&path).unwrap();
@@ -537,7 +537,7 @@ fn a_literal_on_codes_sharing_their_first_9_bytes_reads_one_block() {
     let code = |i: i64| format!("sharedxxx{i:08x}");
     let path = tmp("cycle-codes.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (k bigint NOT NULL, code text NOT NULL, PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (k bigint NOT NULL, code text NOT NULL, PRIMARY KEY (k));",
     )
     .unwrap();
     let t = catalog.table("s.t").unwrap();
@@ -595,7 +595,7 @@ fn an_order_keyed_by_its_bytes_rules_out_a_literal_past_either_end() {
     let code = |i: i64| format!("sharedxxxxxx{i:014}");
     let path = written(
         "ends",
-        "CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));",
         vec![each(code)],
     );
     let q = |v: &str| format!("SELECT count(*) FROM s.t t WHERE t.t = '{v}'");
@@ -636,7 +636,7 @@ fn a_key_past_64_bytes_shared_is_kept_to_64_and_answers_whole() {
     let long = |i: i64| format!("{}{i:06}", "x".repeat(80));
     let path = written(
         "long-bounds",
-        "CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
         vec![each(|i| i.to_string()), each(long)],
     );
     let q = |v: &str| format!("SELECT count(*) FROM s.t t WHERE t.t = '{v}'");
@@ -666,7 +666,7 @@ fn a_row_written_past_a_block_s_bounds_is_found_and_they_keep_less() {
     let code = |i: i64| format!("sharedxxx{i:08x}");
     let path = written(
         "bounds-past",
-        "CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (k integer NOT NULL, t text NOT NULL, PRIMARY KEY (k));",
         vec![each(|i| i.to_string()), each(code)],
     );
     let q = |v: &str| format!("SELECT count(*) FROM s.t t WHERE t.t = '{v}'");
@@ -693,7 +693,7 @@ fn a_key_written_at_the_order_s_greatest_end_is_found() {
     // Two keys sharing their first 9 bytes, past 10: the order's greatest end is the bound past what
     // the last keeps, under which every key sorts. A key written at that bound passes it.
     let path = tmp("cycle-end.snail");
-    let catalog = Catalog::parse("CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));").unwrap();
     let ty = catalog.tables[0].columns[0].ty;
     let mut v = Values::new(ty);
     for t in ["aaaaaaaaaaX-long", "aaaaaaaaabY-long"] {
@@ -728,7 +728,7 @@ fn a_literal_between_a_separator_and_its_block_s_least_reads_no_block() {
     };
     let path = written(
         "between",
-        "CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (t text NOT NULL, PRIMARY KEY (t));",
         vec![each(code)],
     );
     let q = "SELECT count(*) FROM s.t t WHERE t.t = 'mm'";

@@ -131,11 +131,13 @@ fn ddl_refused(ddl: &str, release: u8) -> Option<String> {
 /// A table holding a column of each type, keyed by an integer of its own, with what it declares
 /// first.
 fn table_ddl(columns: &[(String, &str)]) -> String {
-    let mut out: Vec<String> = DECLARED
-        .iter()
-        .filter(|(t, _)| columns.iter().any(|(_, c)| c == t))
-        .map(|(_, d)| format!("{d};"))
-        .collect();
+    let mut out: Vec<String> = vec![format!("CREATE SCHEMA {SCHEMA};")];
+    out.extend(
+        DECLARED
+            .iter()
+            .filter(|(t, _)| columns.iter().any(|(_, c)| c == t))
+            .map(|(_, d)| format!("{d};")),
+    );
     let cols: String = columns.iter().map(|(n, t)| format!(", {n} {t}")).collect();
     out.push(format!(
         "CREATE TABLE {SCHEMA}.t (k integer PRIMARY KEY{cols});"

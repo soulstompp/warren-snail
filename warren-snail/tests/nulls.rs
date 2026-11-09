@@ -27,7 +27,7 @@ fn s_of(a: i64) -> Option<String> {
     })
 }
 
-const DDL: &str = "CREATE TABLE s.t (a bigint NOT NULL, b integer, s text, PRIMARY KEY (a));
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, b integer, s text, PRIMARY KEY (a));
 CREATE INDEX t_b ON s.t (b, a);
 CREATE INDEX t_bf ON s.t (b NULLS FIRST, a);
 CREATE INDEX t_s ON s.t (s, a);
@@ -354,7 +354,7 @@ fn an_answer_is_ordered_with_its_nulls_where_order_by_puts_them() {
     }
 }
 
-const TABLE: &str = "CREATE TABLE s.t (a bigint NOT NULL, b integer, s text, PRIMARY KEY (a));";
+const TABLE: &str = "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, b integer, s text, PRIMARY KEY (a));";
 
 #[test]
 fn a_unique_index_takes_any_number_of_nulls_unless_they_are_not_distinct() {
@@ -491,7 +491,7 @@ fn a_null_on_a_level_is_inserted_updated_and_deleted_as_any_value_is() {
 fn a_join_kept_to_keys_finds_every_row_beside_a_level_s_nulls() {
     // c's pid is NULL on every eightieth row: on c_p its NULLs are too few to fill a page, so they
     // join the last block of values, and the keys at the end are found among them.
-    let ddl = "CREATE TABLE s.p (id bigint NOT NULL, PRIMARY KEY (id));
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.p (id bigint NOT NULL, PRIMARY KEY (id));
 CREATE TABLE s.c (id bigint NOT NULL, pid bigint, PRIMARY KEY (id));
 CREATE INDEX c_p ON s.c (pid, id);";
     let pid = |id: i64| (id % 80 != 0).then_some(id / 4);
@@ -609,7 +609,7 @@ fn window_snail(name: &str, index: &str) -> std::path::PathBuf {
     write(
         &path,
         &Catalog::parse(&format!(
-            "CREATE TABLE s.w (k bigint, v bigint NOT NULL);
+            "CREATE SCHEMA s; CREATE TABLE s.w (k bigint, v bigint NOT NULL);
              CREATE UNIQUE INDEX w_k ON s.w {index};
              ALTER TABLE s.w CLUSTER ON w_k;"
         ))
@@ -715,7 +715,7 @@ fn a_statement_that_waited_finds_its_rows_again_by_a_key_that_holds_no_null() {
     write(
         &path,
         &Catalog::parse(
-            "CREATE TABLE s.k (k bigint, v bigint NOT NULL, id bigint NOT NULL);
+            "CREATE SCHEMA s; CREATE TABLE s.k (k bigint, v bigint NOT NULL, id bigint NOT NULL);
              CREATE UNIQUE INDEX k_k ON s.k (k);
              ALTER TABLE s.k CLUSTER ON k_k;",
         )
@@ -763,7 +763,7 @@ fn a_level_s_null_run_is_no_place_of_it_for_the_counting_unit() {
     write(
         &path,
         &Catalog::parse(
-            "CREATE TABLE s.t (a bigint NOT NULL, b integer, PRIMARY KEY (a));
+            "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, b integer, PRIMARY KEY (a));
              CREATE INDEX t_b1 ON s.t (b);",
         )
         .unwrap(),
@@ -798,7 +798,7 @@ fn a_text_level_whose_first_rows_are_null_takes_text_after_them() {
     write(
         &path,
         &Catalog::parse(
-            "CREATE TABLE s.b (id integer NOT NULL, k text, PRIMARY KEY (id)); CREATE INDEX b_k ON s.b (k);",
+            "CREATE SCHEMA s; CREATE TABLE s.b (id integer NOT NULL, k text, PRIMARY KEY (id)); CREATE INDEX b_k ON s.b (k);",
         )
         .unwrap(),
         &[],

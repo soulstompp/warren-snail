@@ -13,7 +13,7 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{fresh, tmp, write};
 
-const DDL: &str = "CREATE TABLE a.t (id integer NOT NULL, g integer, s text, PRIMARY KEY (id));
+const DDL: &str = "CREATE SCHEMA a; CREATE TABLE a.t (id integer NOT NULL, g integer, s text, PRIMARY KEY (id));
      CREATE TABLE a.u (id integer NOT NULL, g bigint, s text, PRIMARY KEY (id));";
 
 /// The tables' snail: `a.t` seven rows and `a.u` five, rows repeating and NULLs in both columns.
@@ -287,7 +287,7 @@ fn arms_read_tables_of_several_snails() {
     let one = snail("several-one");
     let two = tmp("sets-several-two.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE b.v (id integer NOT NULL, g integer, s text, PRIMARY KEY (id));",
+        "CREATE SCHEMA b; CREATE TABLE b.v (id integer NOT NULL, g integer, s text, PRIMARY KEY (id));",
     )
     .unwrap();
     let v = Rows {

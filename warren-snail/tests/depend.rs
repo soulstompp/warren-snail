@@ -13,7 +13,7 @@ use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
 use weather::tmp;
 
-const DDL: &str = "CREATE COLLATION s.bytes (provider = libc, locale = 'C'); \
+const DDL: &str = "CREATE SCHEMA s; CREATE COLLATION s.bytes (provider = libc, locale = 'C'); \
      CREATE TYPE s.mood AS ENUM ('sad', 'ok'); \
      CREATE TYPE s.pair AS (a integer, b text COLLATE \"C\"); \
      CREATE TYPE s.span AS RANGE (subtype = float8, subtype_diff = float8mi); \

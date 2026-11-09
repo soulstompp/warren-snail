@@ -13,7 +13,7 @@ fn text_narrower_than_the_key_decides_the_cut_on_write() {
     // 4,096 rows of an 8-byte key, 512 to a page, beside one byte of text a row, 5 written plain.
     let path = tmp("narrow.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.t (a bigint NOT NULL, b text NOT NULL, PRIMARY KEY (a));")
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, b text NOT NULL, PRIMARY KEY (a));")
             .unwrap();
     let rows = Rows {
         columns: vec![
@@ -41,7 +41,7 @@ fn an_order_is_out_once_the_directory_pages_it_reads_next_pass_another_order_s_e
     // levels. A point read on the primary key may find its row in any of the index's blocks.
     let path = tmp("deep.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (a integer NOT NULL, b integer NOT NULL, k text NOT NULL, PRIMARY KEY (a));
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer NOT NULL, k text NOT NULL, PRIMARY KEY (a));
          CREATE INDEX s_k ON s.t (k, a) INCLUDE (b);",
     )
     .unwrap();
@@ -89,7 +89,7 @@ fn an_order_is_out_once_the_directory_pages_it_reads_next_pass_another_order_s_e
 fn counted(name: &str) -> std::path::PathBuf {
     let path = tmp(name);
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (a integer NOT NULL, b bigint NOT NULL);
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b bigint NOT NULL);
          CREATE INDEX o ON s.t (a, b);
          ALTER TABLE s.t CLUSTER ON o;",
     )
@@ -214,7 +214,7 @@ fn a_block_split_after_its_neighbour_keeps_the_bound_its_neighbour_ends_below() 
     // read of WARREN.BIG by its name must still reach that block.
     let path = tmp("split-neighbour.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.data_record (data_set text NOT NULL, seq bigint NOT NULL, \
+        "CREATE SCHEMA s; CREATE TABLE s.data_record (data_set text NOT NULL, seq bigint NOT NULL, \
          bytes bytea NOT NULL, PRIMARY KEY (data_set, seq));",
     )
     .unwrap();

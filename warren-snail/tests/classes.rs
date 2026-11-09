@@ -23,7 +23,7 @@ fn fact(c: &Catalog, kind: &str, object: &str, name: &str) -> Option<String> {
 
 fn index_fact(column: &str, ty: &str, using: &str) -> Result<String, String> {
     let ddl = format!(
-        "CREATE TABLE s.t (id integer PRIMARY KEY, {column} {ty});\nCREATE INDEX i ON s.t {using};"
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, {column} {ty});\nCREATE INDEX i ON s.t {using};"
     );
     Catalog::parse(&ddl)
         .map(|c| fact(&c, "index", "s.t.i", "opclasses").unwrap())
@@ -44,12 +44,12 @@ fn cidr_ops_is_read_on_an_inet_and_a_cidr() {
 #[test]
 fn an_exclusion_on_cidr_ops_is_of_the_family_of_inet_ops() {
     let e = Catalog::parse(
-        "CREATE TABLE s.t (id integer PRIMARY KEY, c cidr, EXCLUDE USING gist (c inet_ops WITH <>));\n\
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, c cidr, EXCLUDE USING gist (c inet_ops WITH <>));\n\
          CREATE TABLE s.u (id integer PRIMARY KEY, c cidr, EXCLUDE USING btree (c cidr_ops WITH =));",
     );
     assert!(e.is_ok(), "{:?}", e.err());
     let e = Catalog::parse(
-        "CREATE TABLE s.u (id integer PRIMARY KEY, c cidr, EXCLUDE USING btree (c cidr_ops WITH <>));",
+        "CREATE SCHEMA s; CREATE TABLE s.u (id integer PRIMARY KEY, c cidr, EXCLUDE USING btree (c cidr_ops WITH <>));",
     )
     .err()
     .unwrap()
@@ -59,7 +59,7 @@ fn an_exclusion_on_cidr_ops_is_of_the_family_of_inet_ops() {
 
 #[test]
 fn a_strand_on_cidr_ops_holds_the_order_inet_ops_gives() {
-    let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, c cidr, a inet);\n\
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, c cidr, a inet);\n\
         CREATE INDEX by_c ON s.t USING btree (c cidr_ops);\n\
         CREATE INDEX by_a ON s.t USING btree (a cidr_ops);";
     let catalog = Catalog::parse(ddl).unwrap();
@@ -152,7 +152,7 @@ fn a_brin_on_a_node_tree_rules_out_no_row_it_holds() {
     let n = 4096i64;
     for class in ["text_minmax_ops", "text_bloom_ops"] {
         let ddl = format!(
-            "CREATE TABLE s.t (id integer PRIMARY KEY, n pg_node_tree);\n\
+            "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, n pg_node_tree);\n\
              CREATE INDEX b ON s.t USING brin (n {class});"
         );
         let catalog = Catalog::parse(&ddl).unwrap();
@@ -187,7 +187,7 @@ fn a_brin_on_the_planner_s_statistics_rules_out_no_row_it_holds() {
     let bytes = |i: i64| i.to_be_bytes().to_vec();
     for class in ["bytea_minmax_ops", "bytea_bloom_ops"] {
         let ddl = format!(
-            "CREATE TABLE s.t (id integer PRIMARY KEY, n pg_ndistinct);\n\
+            "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, n pg_ndistinct);\n\
              CREATE INDEX b ON s.t USING brin (n {class});"
         );
         let catalog = Catalog::parse(&ddl).unwrap();
@@ -214,7 +214,7 @@ fn a_brin_on_the_planner_s_statistics_rules_out_no_row_it_holds() {
 #[test]
 fn the_server_s_own_types_take_the_collation_postgresql_gives_them() {
     let c = Catalog::parse(
-        "CREATE TABLE s.t (id integer PRIMARY KEY, a pg_node_tree, b pg_ndistinct, c pg_dependencies, \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, a pg_node_tree, b pg_ndistinct, c pg_dependencies, \
          d pg_mcv_list, e pg_brin_bloom_summary, f pg_brin_minmax_multi_summary, g gtsvector, \
          h pg_node_tree COLLATE \"C\");",
     )

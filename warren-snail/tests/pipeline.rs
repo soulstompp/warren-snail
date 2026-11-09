@@ -102,7 +102,9 @@ fn a_table_declared_in_a_file_that_holds_others_takes_rows_and_reads_its_runs() 
         .unwrap();
     w.execute("ROLLBACK").unwrap();
     assert!(w.catalog.table("weather.scratch").is_none());
-    let d = w.execute(WIND_DDL.trim_end_matches(';')).unwrap();
+    // The wind table alone: the snail holds its schema already.
+    let table = WIND_DDL.trim_start_matches("CREATE SCHEMA weather; ");
+    let d = w.execute(table.trim_end_matches(';')).unwrap();
     assert_eq!((d.statement, d.generation), ("CREATE TABLE", 2));
     let rows = winds(3000);
     // The lines arrive in reverse, 250 at a time: the table's order is not their arrival.

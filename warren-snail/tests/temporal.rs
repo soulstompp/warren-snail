@@ -9,12 +9,14 @@ mod weather;
 use warren_snail::catalog::Catalog;
 use weather::tmp;
 
-/// Each statement's refusal, or None where it is taken.
+/// Each statement's refusal, or None where it is taken; the schema's CREATE SCHEMA left out, which
+/// no test here is about.
 fn outcomes(ddl: &str) -> Vec<Option<String>> {
     Catalog::read(ddl)
         .unwrap()
         .statements
         .into_iter()
+        .filter(|s| s.kind != "CREATE SCHEMA")
         .map(|s| s.refused)
         .collect()
 }
@@ -22,7 +24,7 @@ fn outcomes(ddl: &str) -> Vec<Option<String>> {
 #[test]
 fn a_key_without_overlaps_is_read_as_an_exclude_on_gist() {
     let c = Catalog::parse(
-        "CREATE TABLE s.p (id int4range, valid daterange, x int, PRIMARY KEY (id, valid WITHOUT OVERLAPS),
+        "CREATE SCHEMA s; CREATE TABLE s.p (id int4range, valid daterange, x int, PRIMARY KEY (id, valid WITHOUT OVERLAPS),
              UNIQUE (id, valid WITHOUT OVERLAPS), UNIQUE (id, valid),
              CONSTRAINT p_n UNIQUE NULLS NOT DISTINCT (id, valid WITHOUT OVERLAPS));
          CREATE TABLE s.m (k int PRIMARY KEY, id int4multirange, valid tstzmultirange,
@@ -95,7 +97,7 @@ fn a_key_without_overlaps_is_refused_as_postgresql_refuses_it() {
         ),
     ] {
         let got = outcomes(&format!(
-            "CREATE TABLE s.k (a int, p point, r int4range, {key});"
+            "CREATE SCHEMA s; CREATE TABLE s.k (a int, p point, r int4range, {key});"
         ));
         let e = got[0]
             .as_deref()
@@ -104,7 +106,7 @@ fn a_key_without_overlaps_is_refused_as_postgresql_refuses_it() {
     }
 }
 
-const PARENTS: &str = "CREATE TABLE s.p (id int4range, valid daterange, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+const PARENTS: &str = "CREATE SCHEMA s; CREATE TABLE s.p (id int4range, valid daterange, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
     CREATE TABLE s.u (n int PRIMARY KEY, id int4range, valid daterange, UNIQUE (id, valid WITHOUT OVERLAPS));
     CREATE TABLE s.d (id int4range, valid daterange, PRIMARY KEY (id, valid WITHOUT OVERLAPS) DEFERRABLE);
     CREATE TABLE s.b (id int4range, valid daterange, PRIMARY KEY (id, valid));
@@ -222,7 +224,7 @@ fn a_foreign_key_with_period_is_read_as_postgresql_reads_it() {
 #[test]
 fn a_snail_of_format_eight_refuses_a_key_without_overlaps_by_name() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.p (id int4range NOT NULL, valid daterange NOT NULL, PRIMARY KEY (id, valid WITHOUT OVERLAPS));",
+        "CREATE SCHEMA s; CREATE TABLE s.p (id int4range NOT NULL, valid daterange NOT NULL, PRIMARY KEY (id, valid WITHOUT OVERLAPS));",
     )
     .unwrap();
     let path = tmp("temporal-format-8.snail");
@@ -291,7 +293,7 @@ mod writes {
     fn a_key_without_overlaps_refuses_an_overlap_and_an_empty_period() {
         let path = made(
             "temporal-key",
-            "CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+            "CREATE SCHEMA s; CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
              CREATE TABLE s.n (k int PRIMARY KEY, id int4range, valid int4range,
                  UNIQUE NULLS NOT DISTINCT (id, valid WITHOUT OVERLAPS));
              CREATE TABLE s.u (k int PRIMARY KEY, id int4range, valid int4range,
@@ -373,7 +375,7 @@ mod writes {
         assert_eq!(rows(&mut s, "SELECT count(*) FROM s.p"), ["3"]);
     }
 
-    const TEMPORAL: &str = "CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+    const TEMPORAL: &str = "CREATE SCHEMA s; CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
         CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range,
             FOREIGN KEY (pid, PERIOD valid) REFERENCES s.p MATCH FULL);
         CREATE TABLE s.pm (id int4range, valid int4multirange, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
@@ -519,7 +521,7 @@ mod writes {
     fn a_deferred_period_is_held_at_the_commit() {
         let path = made(
             "temporal-deferred",
-            "CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+            "CREATE SCHEMA s; CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
              CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range,
                  CONSTRAINT c_p FOREIGN KEY (pid, PERIOD valid) REFERENCES s.p DEFERRABLE INITIALLY DEFERRED);",
         );
@@ -572,7 +574,7 @@ mod writes {
     fn a_child_s_period_that_shrinks_is_not_checked_again() {
         let path = made(
             "temporal-shrinks",
-            "CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+            "CREATE SCHEMA s; CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
              CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range);",
         );
         let mut w = Snail::open_writing(&path).unwrap();
@@ -630,7 +632,7 @@ mod writes {
         // parent's, and one holding a NULL references nothing.
         let source = made(
             "temporal-write-source",
-            "CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range);
+            "CREATE SCHEMA s; CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range);
              CREATE TABLE s.p (n int PRIMARY KEY, id int4range, valid int4range);",
         );
         let mut w = Snail::open_writing(&source).unwrap();
@@ -647,7 +649,7 @@ mod writes {
         let (b, _) = s.ask("SELECT n, pid, valid FROM s.c", None).unwrap();
         let (p, _) = s.ask("SELECT id, valid FROM s.p", None).unwrap();
         let held = Catalog::parse(
-            "CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
+            "CREATE SCHEMA s; CREATE TABLE s.p (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS));
              CREATE TABLE s.c (n int PRIMARY KEY, pid int4range, valid int4range,
                  FOREIGN KEY (pid, PERIOD valid) REFERENCES s.p);",
         )
@@ -685,7 +687,7 @@ mod writes {
     fn an_exclude_tells_its_rows_apart_by_every_column_where_the_table_s_order_is_no_unique_key() {
         let path = made(
             "temporal-clustered",
-            "CREATE TABLE s.e (n int PRIMARY KEY, g int, r int4range, EXCLUDE USING gist (r WITH -|-));
+            "CREATE SCHEMA s; CREATE TABLE s.e (n int PRIMARY KEY, g int, r int4range, EXCLUDE USING gist (r WITH -|-));
              CREATE INDEX e_g ON s.e (g);
              ALTER TABLE s.e CLUSTER ON e_g;",
         );

@@ -9,7 +9,7 @@ use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
 use weather::tmp;
 
-const DDL: &str = "CREATE TABLE t (id bigint PRIMARY KEY, n text NOT NULL DEFAULT 'x', \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE t (id bigint PRIMARY KEY, n text NOT NULL DEFAULT 'x', \
      v varchar(10), c numeric(8,2) CHECK (c > 0)); \
      CREATE TABLE s.u (id bigint PRIMARY KEY, t_id bigint REFERENCES t (id), k integer UNIQUE); \
      CREATE TABLE w (id serial PRIMARY KEY, n text); \

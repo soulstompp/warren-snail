@@ -13,7 +13,7 @@ use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
 use weather::tmp;
 
-const DDL: &str = "CREATE SEQUENCE w_id_seq; \
+const DDL: &str = "CREATE SCHEMA s; CREATE SEQUENCE w_id_seq; \
      CREATE TABLE t (id bigint PRIMARY KEY, n text NOT NULL DEFAULT 'x', v varchar(10) DEFAULT 'y', \
      c numeric(8,2) CHECK (c > 0), q integer DEFAULT -1, w bigint DEFAULT nextval('w_id_seq'), \
      g numeric GENERATED ALWAYS AS (q * c) STORED); \
@@ -197,7 +197,7 @@ fn a_columns_type_and_typmod_and_a_domains_base_are_postgresqls() {
     );
 }
 
-const VIEWS: &str = "CREATE TABLE t (id bigint PRIMARY KEY, n text NOT NULL DEFAULT 'x', q integer, \
+const VIEWS: &str = "CREATE SCHEMA s; CREATE TABLE t (id bigint PRIMARY KEY, n text NOT NULL DEFAULT 'x', q integer, \
      c numeric(8,2)); \
      CREATE TABLE s.u (id bigint PRIMARY KEY, t_id bigint REFERENCES t (id), k integer UNIQUE); \
      CREATE VIEW tv AS SELECT t.id, t.n FROM t WHERE t.c > 1; \
@@ -323,7 +323,7 @@ fn a_views_rule_prints_as_pg_get_ruledef_prints_it_and_a_built_in_rule_is_carrie
     );
 }
 
-const FUNCTIONS: &str = "CREATE FUNCTION s.half(numeric) RETURNS numeric LANGUAGE sql STABLE STRICT \
+const FUNCTIONS: &str = "CREATE SCHEMA s; CREATE FUNCTION s.half(numeric) RETURNS numeric LANGUAGE sql STABLE STRICT \
      PARALLEL RESTRICTED AS $$SELECT $1 / 2$$; \
      CREATE FUNCTION s.quoted(text) RETURNS text LANGUAGE sql IMMUTABLE RETURNS NULL ON NULL INPUT \
      AS 'SELECT $1 || ''$function$'''; \

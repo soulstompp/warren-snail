@@ -22,7 +22,7 @@ const N: i64 = (1 << 14) - 1;
 const ROOT_PARENT: i64 = 1 << 14;
 
 const DDL: &str =
-    "CREATE TABLE s.t (parent bigint NOT NULL, id bigint NOT NULL, PRIMARY KEY (parent, id));";
+    "CREATE SCHEMA s; CREATE TABLE s.t (parent bigint NOT NULL, id bigint NOT NULL, PRIMARY KEY (parent, id));";
 
 /// The tree, as a snail of its own.
 fn tree(name: &str) -> PathBuf {
@@ -406,7 +406,7 @@ fn a_window_past_the_round_s_room_holds_every_partition_whole_and_writes_the_row
 
 /// Purchases: 16,384, each of one of 512 owners spread over them, at its own moment.
 const P_DDL: &str =
-    "CREATE TABLE s.p (id bigint NOT NULL, owner bigint NOT NULL, at bigint NOT NULL, \
+    "CREATE SCHEMA s; CREATE TABLE s.p (id bigint NOT NULL, owner bigint NOT NULL, at bigint NOT NULL, \
                      PRIMARY KEY (id)); CREATE INDEX p_owner ON s.p (owner, at) INCLUDE (id);";
 const PURCHASES: i64 = 1 << 14;
 

@@ -15,7 +15,7 @@ use warren_snail::write::Rows;
 use weather::{fresh, tmp, write};
 
 const DDL: &str =
-    "CREATE TABLE a.p (id integer NOT NULL, parent integer, name text, PRIMARY KEY (id));
+    "CREATE SCHEMA a; CREATE TABLE a.p (id integer NOT NULL, parent integer, name text, PRIMARY KEY (id));
      CREATE TABLE a.e (src integer NOT NULL, dst integer NOT NULL, PRIMARY KEY (src, dst));
      CREATE TABLE a.two (id integer NOT NULL, PRIMARY KEY (id));
      CREATE TABLE a.s (id integer NOT NULL, kind text NOT NULL, setting text, PRIMARY KEY (id));";

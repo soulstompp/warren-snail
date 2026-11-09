@@ -1038,6 +1038,12 @@ fn write_made(
     let mut w = Writer::create_spanned(path, span)?;
     if let Some(f) = format {
         w.set_format(f);
+        // The DDL kept as the format's version kept it, read again as it reads it as it opens.
+        let ddl = crate::ddl::as_first_formats(&named.ddl, f)?;
+        if ddl != named.ddl {
+            named.oids = Catalog::parse_kept(&ddl, usize::MAX)?.oids;
+            named.ddl = ddl;
+        }
         crate::read::old_names(&mut named, f);
     }
     let written = write_tables(w, &named, tables, sources, carried);

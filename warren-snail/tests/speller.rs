@@ -14,7 +14,7 @@ use warren_snail::catalog::Catalog;
 use warren_snail::read::Snail;
 use weather::{tmp, write};
 
-const DDL: &str = "CREATE TABLE s.base (id integer NOT NULL, PRIMARY KEY (id));
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.base (id integer NOT NULL, PRIMARY KEY (id));
      CREATE TABLE items (id integer NOT NULL, PRIMARY KEY (id));";
 
 /// A snail holding no rows, its tables declared by statements as a host declares them.
@@ -1050,6 +1050,72 @@ fn said(w: &mut Snail, sql: &str) -> Vec<String> {
 }
 
 #[test]
+fn a_name_in_a_schema_no_statement_made_is_refused_but_in_a_files_kept_statements() {
+    let mut w = snail("unmade");
+    run(&mut w, "CREATE TYPE s.mood AS ENUM ('a')");
+    let unmade = (Some("3F000"), "schema \"nx\" does not exist".to_string());
+    // Each as PostgreSQL 18.6 refuses it: the schema before anything else of the statement.
+    for sql in [
+        "CREATE TABLE nx.t (id integer PRIMARY KEY)",
+        "CREATE TABLE nx.t (id integer PRIMARY KEY, m nosuchtype)",
+        "CREATE TABLE IF NOT EXISTS nx.t (id integer PRIMARY KEY)",
+        "CREATE TYPE nx.e AS ENUM ('a')",
+        "CREATE DOMAIN nx.d AS integer",
+        "CREATE SEQUENCE nx.q",
+        "CREATE VIEW nx.v AS SELECT 1 AS a",
+        "CREATE TYPE s.r AS RANGE (subtype = integer, multirange_type_name = nx.rm)",
+        "CREATE TABLE s.u (id integer PRIMARY KEY, m nx.mood)",
+        "CREATE TABLE s.u (id integer PRIMARY KEY, m nx.mood[])",
+        "CREATE TABLE s.u (id integer PRIMARY KEY REFERENCES nx.p (id))",
+        "CREATE INDEX i ON nx.t (id)",
+        "ALTER TABLE nx.t ALTER COLUMN id SET DEFAULT 1",
+        "DROP TABLE nx.t",
+        "SELECT 'nx.mood'::regtype",
+        "SELECT 'nx'::regnamespace",
+        "SELECT 1::nx.mood",
+        "SELECT nx.f(1)",
+    ] {
+        assert_eq!(refused(&mut w, sql), unmade, "{sql}");
+    }
+    // A name the schema does not hold, as 18.6 refuses it there.
+    for (sql, code, words) in [
+        ("CREATE TABLE s.u (id integer PRIMARY KEY, m s.nope)", "42704", "type \"s.nope\" does not exist"),
+        ("CREATE TABLE s.u (id integer PRIMARY KEY DEFAULT nextval('nx.q'))", "42P01", "relation \"nx.q\" does not exist"),
+        ("CREATE INDEX i ON s.missing (id)", "42P01", "relation \"s.missing\" does not exist"),
+        ("INSERT INTO nx.t VALUES (1)", "42P01", "relation \"nx.t\" does not exist"),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
+    run(&mut w, "CREATE TABLE public.base (id integer PRIMARY KEY)");
+    assert_eq!(
+        refused(&mut w, "CREATE TABLE base (id integer PRIMARY KEY)"),
+        (Some("42P07"), "relation \"base\" already exists".into())
+    );
+    assert_eq!(
+        said(&mut w, "ALTER TABLE IF EXISTS nx.t ALTER COLUMN id SET DEFAULT 1"),
+        ["NOTICE:  relation \"t\" does not exist, skipping"]
+    );
+    assert_eq!(
+        said(&mut w, "DROP TABLE IF EXISTS nx.t"),
+        ["NOTICE:  schema \"nx\" does not exist, skipping"]
+    );
+    // A DDL handed to a snail says its CREATE SCHEMA, as PostgreSQL needs.
+    let e = Catalog::parse("CREATE TABLE k.t (id integer PRIMARY KEY);").unwrap_err();
+    assert_eq!((e.sqlstate(), e.to_string().as_str()), (Some("3F000"), "schema \"k\" does not exist"));
+    // A file's kept statements read as they were written: a schema they name stands as one made,
+    // through its tables' drop, and goes out with its CREATE SCHEMA.
+    let path = tmp("speller-kept-schema.snail");
+    let kept = Catalog::parse_kept("CREATE TABLE k.t (id integer PRIMARY KEY);", usize::MAX).unwrap();
+    write(&path, &kept, &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(&mut w, "CREATE TABLE k.u (id integer PRIMARY KEY)");
+    run(&mut w, "DROP TABLE k.t, k.u");
+    run(&mut w, "CREATE TABLE k.v (id integer PRIMARY KEY)");
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_namespace WHERE nspname = 'k'"), ["1"]);
+    assert!(w.catalog.ddl_of("k.v").unwrap().starts_with("CREATE SCHEMA k;\n"));
+}
+
+#[test]
 fn a_schema_is_made_and_dropped_with_what_depends_on_it() {
     let mut w = snail("schemas");
     run(&mut w, "CREATE SCHEMA a");
@@ -1145,8 +1211,39 @@ fn a_schema_is_made_and_dropped_with_what_depends_on_it() {
     run(&mut w, "CREATE TABLE a.t (id integer PRIMARY KEY, n text)");
     run(&mut w, "INSERT INTO a.t (id, n) VALUES (7, 'x')");
     assert_eq!(rows(&mut w, "SELECT id, n FROM a.t"), ["7|x"]);
-    // `public`, which a name with no schema is read in, and the release's own, refused by name.
-    assert!(refused(&mut w, "DROP SCHEMA public").1.contains("has no search path"));
+    // `public` dropped as PostgreSQL drops it: refused while a table lies in it, then taken with
+    // everything in it; a name with no schema then made nowhere, until public is made again.
+    let (code, e) = refused(&mut w, "DROP SCHEMA public");
+    assert_eq!(code, Some("2BP01"), "{e}");
+    assert!(e.contains("table items depends on schema public"), "{e}");
+    assert_eq!(
+        said(&mut w, "DROP SCHEMA public CASCADE"),
+        ["NOTICE:  drop cascades to table items"]
+    );
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_namespace WHERE nspname = 'public'"), ["0"]);
+    assert_eq!(
+        refused(&mut w, "CREATE TABLE gone (id integer PRIMARY KEY)"),
+        (Some("3F000"), "no schema has been selected to create in".into())
+    );
+    assert_eq!(
+        refused(&mut w, "CREATE TABLE public.gone (id integer PRIMARY KEY)"),
+        (Some("3F000"), "schema \"public\" does not exist".into())
+    );
+    assert_eq!(
+        refused(&mut w, "SELECT 'public'::regnamespace"),
+        (Some("3F000"), "schema \"public\" does not exist".into())
+    );
+    run(&mut w, "CREATE SCHEMA public");
+    run(&mut w, "CREATE TABLE back (id integer PRIMARY KEY)");
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT n.nspname, n.oid <> 2200 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'back'"
+        ),
+        ["public|t"]
+    );
+    // The release's own, refused by name.
     assert!(refused(&mut w, "DROP SCHEMA information_schema CASCADE").1.contains("release's own"));
     assert!(refused(&mut w, "CREATE SCHEMA c AUTHORIZATION u").1.contains("a snail has none"));
 }

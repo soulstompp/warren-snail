@@ -287,9 +287,10 @@ impl<'a> Cat<'a> {
             .unwrap_or_default()
     }
 
-    /// The schemas a name not qualified is looked for in, in order: pg_catalog, then public.
+    /// The schemas a name not qualified is looked for in, in order: pg_catalog, then public, while
+    /// one stands.
     pub(crate) fn path(&self) -> [u32; 2] {
-        [11, 2200]
+        [11, self.catalog.oids.public().unwrap_or(0)]
     }
 
     /// The operators of a name and kind in the schemas searched, an earlier schema's hiding a later

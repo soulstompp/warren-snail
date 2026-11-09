@@ -58,7 +58,7 @@ fn refused_ddl(ddl: &str) -> String {
     Catalog::parse(ddl).unwrap_err().to_string()
 }
 
-const PARENT: &str = "CREATE TABLE s.p (id integer PRIMARY KEY, a integer, b integer, UNIQUE (a, b), d integer UNIQUE DEFERRABLE);";
+const PARENT: &str = "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY, a integer, b integer, UNIQUE (a, b), d integer UNIQUE DEFERRABLE);";
 
 #[test]
 fn a_foreign_key_is_read_as_postgresql_reads_it() {
@@ -143,22 +143,23 @@ fn a_foreign_key_is_read_as_postgresql_reads_it() {
     }
     // A table whose key references a table refused is refused for it.
     let r = Catalog::read(
-        "CREATE TABLE s.u (id integer UNIQUE); CREATE TABLE s.c (id integer PRIMARY KEY, x integer REFERENCES s.u (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.u (id integer UNIQUE); CREATE TABLE s.c (id integer PRIMARY KEY, x integer REFERENCES s.u (id));",
     )
     .unwrap();
-    assert!(r.statements[0]
+    // The schema's statement first.
+    assert!(r.statements[1]
         .refused
         .as_deref()
         .unwrap()
         .contains("has no order"));
-    assert!(r.statements[1]
+    assert!(r.statements[2]
         .refused
         .as_deref()
         .unwrap()
         .contains("references s.u, which is refused"));
 }
 
-const KEYS: &str = "CREATE TABLE s.p (id integer PRIMARY KEY, a integer, b integer, t text, u uuid, f real, UNIQUE (a, b), UNIQUE (t), UNIQUE (u), UNIQUE (f));
+const KEYS: &str = "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY, a integer, b integer, t text, u uuid, f real, UNIQUE (a, b), UNIQUE (t), UNIQUE (u), UNIQUE (f));
      CREATE TABLE s.c (id integer PRIMARY KEY, x bigint REFERENCES s.p, ya integer, yb integer, t text REFERENCES s.p (t),
          u uuid REFERENCES s.p (u), f real REFERENCES s.p (f), FOREIGN KEY (ya, yb) REFERENCES s.p (a, b));
      CREATE TABLE s.m (id integer PRIMARY KEY, ya integer, yb integer, FOREIGN KEY (ya, yb) REFERENCES s.p (a, b) MATCH FULL);";
@@ -242,7 +243,7 @@ fn a_row_written_references_its_parent_s_key_unless_its_reference_holds_a_null()
     );
 }
 
-const ACTIONS: &str = "CREATE TABLE s.p (id integer PRIMARY KEY, v integer);
+const ACTIONS: &str = "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY, v integer);
      CREATE TABLE s.na (id integer PRIMARY KEY, r integer REFERENCES s.p);
      CREATE TABLE s.re (id integer PRIMARY KEY, r integer REFERENCES s.p ON DELETE RESTRICT ON UPDATE RESTRICT);
      CREATE TABLE s.ca (id integer PRIMARY KEY, r integer REFERENCES s.p ON DELETE CASCADE ON UPDATE CASCADE);
@@ -336,7 +337,7 @@ fn a_key_taken_from_its_parent_is_refused_or_acted_on_in_the_same_round() {
 fn a_deferred_key_is_checked_at_the_commit_and_one_that_fails_rolls_it_back() {
     let path = made(
         "keys-deferred",
-        "CREATE TABLE s.p (id integer PRIMARY KEY);
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY);
          CREATE TABLE s.c (id integer PRIMARY KEY, r integer CONSTRAINT late REFERENCES s.p DEFERRABLE INITIALLY DEFERRED,
              q integer CONSTRAINT soon REFERENCES s.p DEFERRABLE, z integer CONSTRAINT now REFERENCES s.p,
              x integer CONSTRAINT strict REFERENCES s.p ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);",
@@ -416,7 +417,7 @@ fn set_constraints_finds_a_name_in_its_schema_or_the_first_on_the_search_path_ho
     // 28818 and 28819 (2026-10-31). A table naming no schema lies in public.
     let path = made(
         "keys-set-constraints",
-        "CREATE TABLE parent (id integer PRIMARY KEY);
+        "CREATE SCHEMA s; CREATE TABLE parent (id integer PRIMARY KEY);
          CREATE TABLE child (id integer PRIMARY KEY, p integer,
              CONSTRAINT k_fk FOREIGN KEY (p) REFERENCES parent (id) DEFERRABLE, CONSTRAINT k_check CHECK (id > 0));
          CREATE TABLE s.parent (id integer PRIMARY KEY);
@@ -521,7 +522,7 @@ fn set_constraints_finds_a_name_in_its_schema_or_the_first_on_the_search_path_ho
 fn a_key_that_references_its_own_table_cascades_down_its_tree() {
     let path = made(
         "keys-tree",
-        "CREATE TABLE s.e (id integer PRIMARY KEY, boss integer REFERENCES s.e ON DELETE CASCADE ON UPDATE CASCADE);",
+        "CREATE SCHEMA s; CREATE TABLE s.e (id integer PRIMARY KEY, boss integer REFERENCES s.e ON DELETE CASCADE ON UPDATE CASCADE);",
     );
     let mut w = Snail::open_writing(&path).unwrap();
     run(
@@ -548,7 +549,7 @@ fn a_key_that_references_its_own_table_cascades_down_its_tree() {
 fn a_foreign_key_not_enforced_checks_and_acts_on_nothing() {
     let path = made(
         "keys-not-enforced",
-        "CREATE TABLE s.p (id integer PRIMARY KEY);
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY);
          CREATE TABLE s.c (id integer PRIMARY KEY, r integer REFERENCES s.p ON DELETE CASCADE NOT ENFORCED);",
     );
     let mut w = Snail::open_writing(&path).unwrap();
@@ -565,7 +566,7 @@ fn a_foreign_key_not_enforced_checks_and_acts_on_nothing() {
 /// where they write nothing of each other's, or are one key written twice.
 #[test]
 fn two_keys_on_one_parent_acting_on_what_each_other_reads_are_refused_by_name() {
-    let parents = "CREATE TABLE s.p (id integer PRIMARY KEY, v integer);
+    let parents = "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY, v integer);
                    CREATE TABLE s.q (a integer PRIMARY KEY, b integer NOT NULL, UNIQUE (a, b));";
     let child =
         |body: &str| format!("{parents} CREATE TABLE s.c (id integer PRIMARY KEY, {body});");
@@ -641,7 +642,7 @@ fn two_keys_on_one_parent_acting_on_what_each_other_reads_are_refused_by_name() 
 fn a_foreign_key_made_valid_on_rows_held_checks_every_one() {
     let path = made(
         "keys-added",
-        "CREATE TABLE s.p (id integer PRIMARY KEY); CREATE TABLE s.c (id integer PRIMARY KEY, r integer);",
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY); CREATE TABLE s.c (id integer PRIMARY KEY, r integer);",
     );
     let mut w = Snail::open_writing(&path).unwrap();
     run(&mut w, "INSERT INTO s.p (id) VALUES (1)");
@@ -683,7 +684,7 @@ fn write_refuses_an_orphan_among_the_rows_it_is_given() {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
     let catalog = Catalog::parse(
-        "CREATE TABLE s.p (id integer PRIMARY KEY); CREATE TABLE s.c (id integer PRIMARY KEY, r integer REFERENCES s.p);",
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY); CREATE TABLE s.c (id integer PRIMARY KEY, r integer REFERENCES s.p);",
     )
     .unwrap();
     let batch = |values: Vec<Vec<Option<i32>>>, names: &[&str]| {
@@ -735,7 +736,7 @@ fn write_refuses_an_orphan_among_the_rows_it_is_given() {
 #[test]
 fn a_snail_of_format_seven_or_eight_refuses_a_foreign_key_by_name() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id)); CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id)); CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p, PRIMARY KEY (id));",
     )
     .unwrap();
     for n in [7, 8] {
@@ -774,7 +775,7 @@ fn later(
 fn a_child_written_and_its_parent_taken_by_two_writers_at_once_meet_at_the_parent_s_block() {
     let path = made(
         "keys-two-writers",
-        "CREATE TABLE s.p (id integer PRIMARY KEY); CREATE TABLE s.c (id integer PRIMARY KEY, r integer REFERENCES s.p);",
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY); CREATE TABLE s.c (id integer PRIMARY KEY, r integer REFERENCES s.p);",
     );
     let mut w = Snail::open_writing(&path).unwrap();
     run(&mut w, "INSERT INTO s.p (id) VALUES (1), (2)");

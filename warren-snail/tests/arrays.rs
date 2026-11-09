@@ -32,7 +32,7 @@ fn snail_of(name: &str, ddl: &str, statements: &[&str]) -> Snail {
 fn arrays(name: &str) -> Snail {
     snail_of(
         name,
-        "CREATE TABLE s.t (id integer PRIMARY KEY, a integer[], t text[], n numeric);",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, a integer[], t text[], n numeric);",
         &[
             "INSERT INTO s.t VALUES (1, '{1,2,3}', '{a,b}', 1.5), (2, '{}', '{x,NULL}', NULL), \
            (3, NULL, '{y}', 2), (4, '[2:3]={7,8}', NULL, 3)",

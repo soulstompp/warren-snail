@@ -289,7 +289,7 @@ fn a_savepoint_takes_no_new_level_and_rollback_to_puts_back_the_modes_named_sinc
 fn a_sequences_advance_in_a_savepoint_rolled_back_is_never_given_back() {
     let path = tmp("savepoint-sequence.snail");
     let catalog = warren_snail::catalog::Catalog::parse(
-        "CREATE TABLE s.t (id bigint GENERATED ALWAYS AS IDENTITY, v integer NOT NULL, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint GENERATED ALWAYS AS IDENTITY, v integer NOT NULL, PRIMARY KEY (id));",
     )
     .unwrap();
     write(&path, &catalog, &[]).unwrap();
@@ -444,11 +444,11 @@ fn a_savepoint_across_two_snails_puts_both_back() {
     for (path, ddl) in [
         (
             &a,
-            "CREATE TABLE a.t (k integer NOT NULL, PRIMARY KEY (k));",
+            "CREATE SCHEMA a; CREATE TABLE a.t (k integer NOT NULL, PRIMARY KEY (k));",
         ),
         (
             &b,
-            "CREATE TABLE b.u (k integer NOT NULL, PRIMARY KEY (k));",
+            "CREATE SCHEMA b; CREATE TABLE b.u (k integer NOT NULL, PRIMARY KEY (k));",
         ),
     ] {
         let catalog = warren_snail::catalog::Catalog::parse(ddl).unwrap();
@@ -520,7 +520,7 @@ fn two_writers_each_waiting_for_the_others_table_fail_one_with_a_deadlock() {
 fn keyed(name: &str) -> std::path::PathBuf {
     let path = tmp(&format!("{name}.snail"));
     let catalog = warren_snail::catalog::Catalog::parse(
-        "CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id));
          CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p, PRIMARY KEY (id));
          CREATE TABLE s.q (id integer NOT NULL, PRIMARY KEY (id));",
     )
@@ -621,8 +621,8 @@ fn lock_timeout_and_statement_timeout_cancel_a_wait_in_postgresqls_words() {
 fn prepared_statements_cursors_copy_and_explain_read_across_snails() {
     let (a, b) = (tmp("session-across-a.snail"), tmp("session-across-b.snail"));
     for (path, ddl) in [
-        (&a, "CREATE TABLE a.t (k integer NOT NULL, v text, PRIMARY KEY (k));"),
-        (&b, "CREATE TABLE b.u (k integer NOT NULL, w text, PRIMARY KEY (k));"),
+        (&a, "CREATE SCHEMA a; CREATE TABLE a.t (k integer NOT NULL, v text, PRIMARY KEY (k));"),
+        (&b, "CREATE SCHEMA b; CREATE TABLE b.u (k integer NOT NULL, w text, PRIMARY KEY (k));"),
     ] {
         let catalog = warren_snail::catalog::Catalog::parse(ddl).unwrap();
         write(path, &catalog, &[]).unwrap();

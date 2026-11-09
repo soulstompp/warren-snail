@@ -2084,8 +2084,10 @@ fn count_out<K: std::hash::Hash + Eq>(names: &mut HashMap<K, usize>, name: &K) {
     }
 }
 
-/// A name in its schema, as `relation` and `constraint` compare it.
+/// A name in its schema, as `relation` and `constraint` compare it: one written with no schema is
+/// public's, as `public.x` is.
 fn in_schema(schema: &str, name: &str) -> (String, String) {
+    let schema = if schema.is_empty() { "public" } else { schema };
     (schema.to_string(), name.to_string())
 }
 
@@ -2181,17 +2183,19 @@ impl Draft {
 
     /// `relation`, every table, sequence and view walked.
     fn relation_walked(&self, schema: &str, name: &str) -> bool {
+        let schema = in_schema(schema, "").0;
+        let of = |n: &str| in_schema(schema_of(n), "").0;
         self.tables.iter().any(|t| {
-            (schema_of(&t.name) == schema && bare(&t.name) == name)
-                || (schema_of(&t.name) == schema && t.keys().any(|k| k.name == name))
+            (of(&t.name) == schema && bare(&t.name) == name)
+                || (of(&t.name) == schema && t.keys().any(|k| k.name == name))
         }) || self
             .sequences
             .iter()
-            .any(|s| schema_of(&s.name) == schema && bare(&s.name) == name)
+            .any(|s| of(&s.name) == schema && bare(&s.name) == name)
             || self
                 .views
                 .iter()
-                .any(|v| schema_of(&v.name) == schema && bare(&v.name) == name)
+                .any(|v| of(&v.name) == schema && bare(&v.name) == name)
     }
 
     /// Whether a constraint of that name lies in the schema: a key's or a CHECK's.
@@ -2206,7 +2210,7 @@ impl Draft {
     fn constraint_walked(&self, schema: &str, name: &str) -> bool {
         self.check_names.contains(&qualified(schema, name))
             || self.tables.iter().any(|t| {
-                schema_of(&t.name) == schema
+                in_schema(schema_of(&t.name), "") == in_schema(schema, "")
                     && t.primary
                         .iter()
                         .chain(t.uniques.iter())
@@ -2528,6 +2532,14 @@ impl Draft {
                         }
                     }
                 }
+                // A type named in a schema of the file's that declares none of that name, as
+                // PostgreSQL's lookup refuses it: the schema first.
+                if let Some((schema, _)) = n.rsplit_once('.') {
+                    if !self.kept && !self.schema_stands(schema) {
+                        return Err(Error::new(format!("schema \"{schema}\" does not exist")));
+                    }
+                    return Err(Error::new(format!("type \"{n}\" does not exist")));
+                }
             }
         }
         held_type(dt)
@@ -2634,10 +2646,11 @@ impl Draft {
         let name = c
             .name()
             .map_err(|_| Error::new(format!("nextval('{text}') names no sequence")))?;
-        if !c.done() || !self.sequences.iter().any(|s| s.name == name) {
-            return Err(Error::new(format!(
-                "nextval('{text}'): the DDL declares no sequence {name}"
-            )));
+        if !c.done() {
+            return Err(Error::new(format!("nextval('{text}') names no sequence")));
+        }
+        if !self.sequences.iter().any(|s| s.name == name) {
+            return Err(Error::new(format!("relation \"{name}\" does not exist")));
         }
         Ok(name)
     }
@@ -2712,8 +2725,11 @@ impl Draft {
                 };
                 match (name, args.as_slice()) {
                     ("nextval", [s]) => {
-                        self.nextval_of(s)
-                            .map_err(|e| Error::new(format!("{what}: {e}")))?;
+                        // A sequence that does not exist in PostgreSQL's words, as it says them.
+                        self.nextval_of(s).map_err(|e| match e.sqlstate() {
+                            Some(_) => e,
+                            None => Error::new(format!("{what}: {e}")),
+                        })?;
                         Some(ColumnType::Int8)
                     }
                     (
@@ -2816,6 +2832,10 @@ impl Draft {
     /// Reads one statement into the draft, or refuses it by name. Returns what it says of what it
     /// read and did nothing with.
     fn apply(&mut self, tokens: &[Token]) -> Result<Vec<String>> {
+        {
+            let (kind, object) = head(tokens);
+            self.schema_named(&kind, &object, tokens)?;
+        }
         if let Some((table, index)) = cluster_on(tokens) {
             let t = self.table_mut(&table).ok_or_else(|| {
                 Error::new(format!(
@@ -3509,15 +3529,87 @@ impl Draft {
         Ok(notices)
     }
 
-    /// Whether a schema of that name stands: PostgreSQL's own, one CREATE SCHEMA made, or one an
-    /// object of the draft lies in.
+    /// Whether a schema of that name stands: one CREATE SCHEMA made, or a file's kept statement
+    /// named; or PostgreSQL's own, `public` among them until the DDL drops it.
     fn schema_stands(&self, name: &str) -> bool {
         self.schemas.iter().any(|s| s == name)
-            || self.built_in_schema(name).is_some()
-            || self
-                .objects()
-                .iter()
-                .any(|o| matches!(o, crate::oids::Object::Namespace(n) if n == name))
+            || ((name != "public" || !self.oids.public_dropped())
+                && self.built_in_schema(name).is_some())
+    }
+
+    /// The schema a statement makes its object in, or finds the table it indexes or alters in,
+    /// refused where none of that name stands, as PostgreSQL refuses it before it reads the rest:
+    /// one no statement made, or `public` dropped where a name has no schema. A file's own kept
+    /// statements are read as they were written.
+    fn schema_named(&self, kind: &str, object: &str, tokens: &[Token]) -> Result<()> {
+        if self.kept {
+            return Ok(());
+        }
+        let w: Vec<&str> = kind.split(' ').collect();
+        let temporary = w.iter().any(|k| matches!(*k, "TEMP" | "TEMPORARY"));
+        let made = w.first() == Some(&"CREATE")
+            && !temporary
+            && matches!(
+                w.last().copied(),
+                Some(
+                    "TABLE" | "TYPE" | "DOMAIN" | "SEQUENCE" | "VIEW" | "FUNCTION" | "PROCEDURE"
+                        | "COLLATION" | "AGGREGATE"
+                )
+            );
+        let named = if made {
+            Some(object.to_string())
+        } else if w.first() == Some(&"CREATE") && w.last() == Some(&"INDEX") {
+            index_on(&written(tokens))
+        } else if kind == "ALTER TABLE" && !alters_if_exists(tokens) {
+            Some(object.to_string())
+        } else {
+            None
+        };
+        match named.as_deref().map(|n| n.rsplit_once('.')) {
+            Some(Some((s, _))) if !self.schema_stands(s) => {
+                Err(Error::new(format!("schema \"{s}\" does not exist")))
+            }
+            Some(None) if made && !self.schema_stands("public") => {
+                Err(Error::new("no schema has been selected to create in"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses a statement whose objects lie in a schema that stands nowhere, as PostgreSQL refuses
+    /// it: a name another clause gives an object, a multirange's among them. A file's own kept
+    /// statements are read as they were written.
+    fn no_schema_implied(&self, before: Lens) -> Result<()> {
+        if self.kept {
+            return Ok(());
+        }
+        for o in self.objects_since(before, &[]) {
+            let s = match &o {
+                crate::oids::Object::Namespace(n) => n.as_str(),
+                other => crate::oids::parts(other.name()).0,
+            };
+            if s != "pg_catalog" && !self.schema_stands(s) {
+                return Err(Error::new(format!("schema \"{s}\" does not exist")));
+            }
+        }
+        Ok(())
+    }
+
+    /// The schemas a file's own kept statement named that no statement made: each stands from it
+    /// on, as one made, whether or not an object still lies in it.
+    fn keep_named_schemas(&mut self) {
+        if !self.kept {
+            return;
+        }
+        let named: Vec<String> = self
+            .oids
+            .each()
+            .filter_map(|(_, o)| match o {
+                crate::oids::Object::Namespace(n) if !self.schemas.contains(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        self.schemas.extend(named);
     }
 
     /// The OID of one of PostgreSQL's own schemas, as the release's catalog holds it.
@@ -3530,8 +3622,8 @@ impl Draft {
 
     /// DROP SCHEMA: each schema named, and under CASCADE every object that depends on one, as
     /// PostgreSQL's dependency walk finds them over pg_depend's rows; refused under RESTRICT where an
-    /// object depends on one. `public`, which every name without a schema is read in, and
-    /// `information_schema`, the release's own, are refused by name.
+    /// object depends on one. `public` goes as PostgreSQL drops it, a name with no schema then
+    /// found only in pg_catalog; `information_schema`, the release's own, is refused by name.
     fn drop_schemas(
         &mut self,
         names: &[String],
@@ -3554,14 +3646,10 @@ impl Draft {
             return Ok(notices);
         }
         let mut named = Vec::new();
+        let public = found.contains(&"public");
         for n in found {
             let oid = match n {
-                "public" => {
-                    return Err(Error::new(
-                        "DROP SCHEMA public is refused: a snail reads every name written without a \
-                         schema as public's, and has no search path",
-                    ))
-                }
+                "public" => self.oids.public().unwrap_or(crate::oids::PUBLIC),
                 "information_schema" => {
                     return Err(Error::new(
                         "DROP SCHEMA information_schema is refused: its views are the release's \
@@ -3576,7 +3664,14 @@ impl Draft {
             };
             named.push(crate::deparse::depend::Addr::of(crate::deparse::depend::NAMESPACE, oid));
         }
-        self.dropping(&named, cascade, notices)
+        let notices = self.dropping(&named, cascade, notices)?;
+        if public {
+            // The release's public goes for good; one CREATE SCHEMA public makes again is the
+            // file's own, and went with the drop.
+            self.oids.drop_public();
+            self.schemas.retain(|s| s != "public");
+        }
+        Ok(notices)
     }
 
     /// What a DROP takes, taken out of the draft: each whole object, and each part of an object it
@@ -3836,13 +3931,18 @@ impl Draft {
     fn alter_table(&mut self, tokens: &[Token], object: &str) -> Result<Vec<String>> {
         let mut c = Cursor::new(tokens);
         c.kws(&["ALTER", "TABLE"]);
+        let if_exists = c.kws(&["IF", "EXISTS"]);
         c.kw("ONLY");
         let name = c.name()?;
         let schema = schema_of(&name).to_string();
+        let mut notices = Vec::new();
         if self.table(&name).is_none() {
+            if if_exists {
+                notices.push(format!("relation \"{}\" does not exist, skipping", bare(&name)));
+                return Ok(notices);
+            }
             return Err(Error::new(format!("relation \"{name}\" does not exist")));
         }
-        let mut notices = Vec::new();
         if c.kws(&["VALIDATE", "CONSTRAINT"]) {
             let n = c.ident()?;
             end(&c, &format!("ALTER TABLE {name}"))?;
@@ -4695,9 +4795,13 @@ impl Draft {
             .iter()
             .map(|n| column_of(t, n))
             .collect::<Result<_>>()?;
-        let parent = self
-            .table(&r.parent)
-            .ok_or_else(|| Error::new(format!("relation \"{}\" does not exist", r.parent)))?;
+        let parent = self.table(&r.parent).ok_or_else(|| match r.parent.rsplit_once('.') {
+            // As PostgreSQL's lookup of the referenced table refuses a schema first.
+            Some((s, _)) if !self.kept && !self.schema_stands(s) => {
+                Error::new(format!("schema \"{s}\" does not exist"))
+            }
+            _ => Error::new(format!("relation \"{}\" does not exist", r.parent)),
+        })?;
         let pname = bare(&parent.name);
         let with_period = r.period || r.parent_period;
         let referenced_only = || {
@@ -4968,11 +5072,9 @@ impl Draft {
         read_as_written(&kept, &st, &format!("CREATE INDEX {shown}"))?;
         let schema = schema_of(&table_name).to_string();
         let functions = self.functions.clone();
-        let t = self.table(&table_name).ok_or_else(|| {
-            Error::new(format!(
-                "{shown} is on {table_name}, which the DDL does not create"
-            ))
-        })?;
+        let t = self
+            .table(&table_name)
+            .ok_or_else(|| Error::new(format!("relation \"{table_name}\" does not exist")))?;
         if i.r#async || !i.index_options.is_empty() || !i.alter_options.is_empty() {
             return Err(Error::new(format!("{shown}: {st} is not read")));
         }
@@ -6327,10 +6429,13 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
         // Each statement is applied in place. Read strictly, the DDL stops at its first refusal;
         // otherwise a statement refused leaves the draft as the statements taken before it make it.
         let before = draft.lens();
-        let applied = draft.apply(tokens);
+        let applied = draft
+            .apply(tokens)
+            .and_then(|n| draft.no_schema_implied(before).map(|()| n));
         match &applied {
             Ok(_) => {
                 draft.settle(before, &kind, &object, tokens);
+                draft.keep_named_schemas();
                 taken.push(at)
             }
             Err(_) if !strict => {
@@ -6350,6 +6455,7 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
                         ))
                     })?;
                     again.settle(before, &k, &o, &all[i]);
+                    again.keep_named_schemas();
                 }
                 draft = again;
             }
@@ -6587,6 +6693,76 @@ fn index_on(text: &str) -> Option<String> {
     c.name().ok()
 }
 
+/// The first statement of a DDL that 0.1.x does not read, as its head names it: CREATE SCHEMA, and
+/// DROP of a schema or a relation. None where it holds none.
+pub(crate) fn past_first_formats(ddl: &str) -> Option<String> {
+    statements(ddl)
+        .ok()?
+        .iter()
+        .map(|t| head(t))
+        .find(|(kind, _)| kind == "CREATE SCHEMA" || kind.starts_with("DROP "))
+        .map(|(kind, object)| format!("{kind} {object}"))
+}
+
+/// The DDL a snail of format 7 or 8 keeps, as 0.1.x kept it: no CREATE SCHEMA, which 0.1.x does not
+/// read, each schema then named by what lies in it, as 0.1.x named one. Refused for a schema nothing
+/// lies in, which such a file cannot hold. Each CREATE SCHEMA written on a line of its own goes with
+/// its line, the rest of the DDL as written; one written beside another statement, the statements
+/// written again.
+pub(crate) fn as_first_formats(ddl: &str, format: u32) -> Result<String> {
+    let all = statements(ddl)?;
+    let made: Vec<String> = all
+        .iter()
+        .map(|t| head(t))
+        .filter(|(kind, _)| kind == "CREATE SCHEMA")
+        .map(|(_, object)| object)
+        .collect();
+    if made.is_empty() {
+        return Ok(ddl.to_string());
+    }
+    for s in &made {
+        let holds = all.iter().any(|t| {
+            let (kind, object) = head(t);
+            let name = match kind.ends_with("INDEX") {
+                true => index_on(&written(t)).unwrap_or_default(),
+                false => object,
+            };
+            kind != "CREATE SCHEMA" && name.rsplit_once('.').is_some_and(|(x, _)| x == s)
+        });
+        if !holds {
+            return Err(Error::new(format!(
+                "the schema {s} holds nothing, and a snail of format {format} holds a schema only by \
+                 what lies in it: write it in format {}",
+                crate::file::FORMAT
+            )));
+        }
+    }
+    let alone = |l: &str| {
+        let t = l.trim();
+        t.len() > 14
+            && t.is_char_boundary(14)
+            && t[..14].eq_ignore_ascii_case("CREATE SCHEMA ")
+            && t.ends_with(';')
+            && t.matches(';').count() == 1
+    };
+    let text: String = ddl.split_inclusive('\n').filter(|l| !alone(l)).collect();
+    if statements(&text)?.iter().all(|t| head(t).0 != "CREATE SCHEMA") {
+        return Ok(text);
+    }
+    Ok(all
+        .iter()
+        .filter(|t| head(t).0 != "CREATE SCHEMA")
+        .map(|t| format!("{};", written(t)))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Whether an ALTER TABLE says IF EXISTS.
+fn alters_if_exists(tokens: &[Token]) -> bool {
+    let mut c = Cursor::new(tokens);
+    c.kws(&["ALTER", "TABLE"]) && c.kws(&["IF", "EXISTS"])
+}
+
 /// The statements of a DDL that declare its functions, as they are written.
 pub(crate) fn function_statements(ddl: &str) -> Result<Vec<String>> {
     Ok(statements(ddl)?
@@ -6611,11 +6787,7 @@ pub(crate) fn ddl_of(catalog: &Catalog, table: &str) -> Result<String> {
         .ok_or_else(|| Error::new(format!("{table} is not in the snail")))?;
     let all = statements(&catalog.ddl)?;
     if all.iter().any(|s| head(s).0.starts_with("DROP")) {
-        return Ok(all
-            .iter()
-            .map(|s| format!("{};", written(s)))
-            .collect::<Vec<_>>()
-            .join("\n"));
+        return Ok(with_schemas(&all, &all));
     }
     let mut sequences: Vec<String> = catalog
         .sequences
@@ -6668,10 +6840,50 @@ pub(crate) fn ddl_of(catalog: &Catalog, table: &str) -> Result<String> {
             _ => false,
         };
         if keep {
-            out.push(format!("{};", written(&tokens)));
+            out.push(tokens);
         }
     }
-    Ok(out.join("\n"))
+    Ok(with_schemas(&out, &all))
+}
+
+/// Statements of a DDL handed out of a snail, each schema their objects lie in made first, as
+/// PostgreSQL needs: by the DDL's own CREATE SCHEMA as written where it has one, and otherwise by
+/// one of its own, where a file's kept statements name a schema no statement made.
+fn with_schemas(kept: &[Vec<Token>], all: &[Vec<Token>]) -> String {
+    let made = |s: &str| {
+        all.iter().find(|t| {
+            let (kind, object) = head(t);
+            kind == "CREATE SCHEMA" && object == s
+        })
+    };
+    let mut schemas: Vec<String> = Vec::new();
+    for t in kept {
+        let (kind, object) = head(t);
+        let name = match kind.ends_with("INDEX") {
+            true => index_on(&written(t)).unwrap_or_default(),
+            false => object,
+        };
+        if kind != "CREATE SCHEMA" && kind != "DROP SCHEMA" {
+            if let Some((s, _)) = name.rsplit_once('.') {
+                if !matches!(s, "public" | "pg_catalog") && !schemas.iter().any(|x| x == s) {
+                    schemas.push(s.to_string());
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for s in &schemas {
+        // A schema the kept statements make where they stand needs none ahead of them.
+        if kept.iter().any(|t| head(t) == ("CREATE SCHEMA".to_string(), s.clone())) {
+            continue;
+        }
+        out.push(match made(s) {
+            Some(t) => format!("{};", written(t)),
+            None => format!("CREATE SCHEMA {};", crate::read::calls::quote_ident(s)),
+        });
+    }
+    out.extend(kept.iter().map(|t| format!("{};", written(t))));
+    out.join("\n")
 }
 #[cfg(test)]
 mod tests {
@@ -6715,12 +6927,14 @@ mod tests {
             ("CREATE TABLE s.f (x bigint PRIMARY KEY REFERENCES s.e (x), y bigint REFERENCES s.e (x))", true),
         ];
         let ddl: String = read.iter().map(|(s, _)| format!("{s};\n")).collect();
-        let reading = read_ddl(&ddl, false).unwrap();
-        let taken: Vec<bool> = reading.statements.iter().map(|s| s.refused.is_none()).collect();
+        let reading = read_ddl(&format!("CREATE SCHEMA s;\n{ddl}"), false).unwrap();
+        // The schema's statement first, then the ones the test is about.
+        let taken: Vec<bool> =
+            reading.statements.iter().skip(1).map(|s| s.refused.is_none()).collect();
         assert_eq!(taken, read.iter().map(|r| r.1).collect::<Vec<_>>(), "{:#?}", reading.statements);
         // A key written twice is made once, under the name written where the other's was chosen.
         let reading = read_ddl(
-            "CREATE TABLE s.t (id bigint PRIMARY KEY, CONSTRAINT t_named UNIQUE (id));\n\
+            "CREATE SCHEMA s; CREATE TABLE s.t (id bigint PRIMARY KEY, CONSTRAINT t_named UNIQUE (id));\n\
              CREATE TABLE s.t_pkey (x bigint PRIMARY KEY);\n\
              CREATE TABLE s.u (id bigint, CONSTRAINT u_first PRIMARY KEY (id), CONSTRAINT u_second UNIQUE (id));\n\
              CREATE TABLE s.u_second (x bigint PRIMARY KEY);\n",
@@ -6728,7 +6942,7 @@ mod tests {
         )
         .unwrap();
         let refused: Vec<bool> = reading.statements.iter().map(|s| s.refused.is_some()).collect();
-        assert_eq!(refused, [false, false, false, false]);
+        assert_eq!(refused, [false, false, false, false, false]);
         let names = |t: &str| -> Vec<String> {
             let t = reading.catalog.tables.iter().find(|x| x.name == t).unwrap();
             t.orders.iter().map(|o| o.name.clone()).collect()

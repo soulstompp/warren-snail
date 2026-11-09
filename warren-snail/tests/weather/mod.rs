@@ -489,7 +489,7 @@ pub fn parquet_of(path: &Path) -> (Vec<RecordBatch>, usize) {
 
 /// The wind log: a line's place in the log, its station's code as bytes, and the turn in tenths of
 /// a degree.
-pub const WIND_DDL: &str = "CREATE TABLE weather.wind (seq bigint NOT NULL, station bytea NOT NULL, turn numeric(5,1) NOT NULL, PRIMARY KEY (seq));";
+pub const WIND_DDL: &str = "CREATE SCHEMA weather; CREATE TABLE weather.wind (seq bigint NOT NULL, station bytea NOT NULL, turn numeric(5,1) NOT NULL, PRIMARY KEY (seq));";
 /// The wind, run by run.
 pub const WIND: &str = include_str!("../wind.sql");
 

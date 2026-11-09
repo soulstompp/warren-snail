@@ -14,7 +14,7 @@ use warren_snail::values::Values;
 use warren_snail::write::{write_carried, Carried, Rows};
 use weather::{span, tmp};
 
-const DDL: &str = "CREATE TABLE s.t (id integer NOT NULL, v money, PRIMARY KEY (id)); \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v money, PRIMARY KEY (id)); \
                    CREATE INDEX t_v ON s.t (v, id);";
 
 /// Each row's money, as its count of the smallest unit.
@@ -194,7 +194,7 @@ fn a_table_made_on_a_snail_holding_no_money_records_its_money_under_c() {
     let path = tmp("money-none.snail");
     weather::write(
         &path,
-        &Catalog::parse("CREATE TABLE s.n (id integer NOT NULL, PRIMARY KEY (id));").unwrap(),
+        &Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.n (id integer NOT NULL, PRIMARY KEY (id));").unwrap(),
         &[],
     )
     .unwrap();
@@ -387,7 +387,7 @@ mod under_a_locale {
 
     #[test]
     fn money_of_two_locales_or_of_one_glibc_lacks_is_refused_by_name() {
-        let ddl = "CREATE TABLE s.t (id integer NOT NULL, v money, w money, PRIMARY KEY (id));";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v money, w money, PRIMARY KEY (id));";
         let e = write_carried(
             &tmp("money-two.snail"),
             &Catalog::parse(ddl).unwrap(),
@@ -455,7 +455,7 @@ mod under_a_locale {
         use warren_snail::read::{MONETARY_KEY, RELEASE_KEY};
         use warren_snail::write::write_parquet;
         let catalog = Catalog::parse(
-            "CREATE TABLE s.r (id integer NOT NULL, c regclass, v money, PRIMARY KEY (id)); \
+            "CREATE SCHEMA s; CREATE TABLE s.r (id integer NOT NULL, c regclass, v money, PRIMARY KEY (id)); \
              CREATE INDEX r_v ON s.r (v, id) INCLUDE (c);",
         )
         .unwrap();
@@ -555,7 +555,7 @@ mod under_a_locale {
     #[cfg(feature = "standalone")]
     fn money_held_in_an_array_reads_and_prints_under_the_file_s_locale() {
         // A file whose money lies in an array alone records it for that column.
-        let ddl = "CREATE TABLE s.a (id integer NOT NULL, a money[], PRIMARY KEY (id));";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.a (id integer NOT NULL, a money[], PRIMARY KEY (id));";
         let path = tmp("money-dk-array.snail");
         write_carried(
             &path,
@@ -593,7 +593,7 @@ mod under_a_locale {
         // Each as PostgreSQL 18.6 and 19 RC1 took, refused and printed it on 28818 and 28819 under
         // lc_monetary en_DK.utf8 (2026-10-31): a money literal standing alone, read where the
         // domain's CHECK and the DEFAULT are.
-        let ddl = "CREATE DOMAIN s.floor AS money CHECK (VALUE >= 'kr. 1,50'::money);
+        let ddl = "CREATE SCHEMA s; CREATE DOMAIN s.floor AS money CHECK (VALUE >= 'kr. 1,50'::money);
                    CREATE TABLE s.d (id integer NOT NULL, v s.floor,
                        w money DEFAULT 'kr. 1,50'::money + CAST(1 AS money), PRIMARY KEY (id));";
         let path = tmp("money-dk-domain.snail");

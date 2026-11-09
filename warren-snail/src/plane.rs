@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn a_circle_whose_bounding_box_overflows_is_refused_by_gist_as_postgresql_refuses_it() {
         let catalog = crate::catalog::Catalog::parse(
-            "CREATE TABLE s.t (id int PRIMARY KEY, c circle, p point); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, c circle, p point); \
              CREATE INDEX t_c ON s.t USING gist (c); \
              CREATE INDEX t_p ON s.t USING gist (p);",
         )

@@ -591,7 +591,7 @@ fn table_index(catalog: &Catalog, name: &ObjectName) -> Result<usize> {
         .tables
         .iter()
         .position(|t| t.name == name)
-        .ok_or_else(|| Error::new(format!("{name} is not in the snail")))
+        .ok_or_else(|| Error::new(format!("relation \"{name}\" does not exist")))
 }
 
 fn column_index(table: &Table, name: &ObjectName) -> Result<usize> {
@@ -1688,7 +1688,7 @@ mod tests {
 
     fn catalog() -> Catalog {
         Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b text, at timestamptz, PRIMARY KEY (a));
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b text, at timestamptz, PRIMARY KEY (a));
              CREATE TABLE s.u (a integer NOT NULL, n smallint, PRIMARY KEY (a));",
         )
         .unwrap()

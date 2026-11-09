@@ -32,7 +32,7 @@ fn snail_of(name: &str, ddl: &str, statements: &[&str]) -> Snail {
 fn ranges(name: &str) -> Snail {
     snail_of(
         name,
-        "CREATE TABLE s.t (id integer PRIMARY KEY, r int4range, m int4multirange, n numrange, \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, r int4range, m int4multirange, n numrange, \
          d daterange, ts tsrange, a integer, b integer);",
         &["INSERT INTO s.t VALUES \
            (1, '[1,5)', '{[1,3),[5,8)}', '[1.5,2.5]', '[2024-01-01,2024-02-01)', \

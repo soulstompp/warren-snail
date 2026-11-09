@@ -12,7 +12,7 @@ use warren_snail::read::{Round, Snails};
 use weather::*;
 
 /// The stations alone, and the readings alone, each as the weather's DDL declares it.
-const STATIONS: &str = "
+const STATIONS: &str = "CREATE SCHEMA weather; 
 CREATE TABLE weather.stations (
     network_id integer NOT NULL,
     station_no integer NOT NULL,
@@ -22,7 +22,7 @@ CREATE TABLE weather.stations (
 CREATE INDEX s_name ON weather.stations (name, network_id, station_no);
 ";
 
-const READINGS: &str = "
+const READINGS: &str = "CREATE SCHEMA weather; 
 CREATE FUNCTION weather.clock(timestamptz) RETURNS timestamp
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
 CREATE TABLE weather.readings (
@@ -281,8 +281,8 @@ fn a_table_named_anywhere_in_a_question_is_read_from_the_snail_holding_it() {
     let int = |v: &[Option<i64>]| warren_snail::values::Values::Int(v.to_vec());
     let ints = |v: [i64; 5]| int(&v.map(Some));
     let (t_ddl, u_ddl) = (
-        "CREATE TABLE a.t (id integer NOT NULL, g integer, v integer, PRIMARY KEY (id));",
-        "CREATE TABLE b.u (id integer NOT NULL, t_id integer, w integer, PRIMARY KEY (id));",
+        "CREATE SCHEMA a; CREATE TABLE a.t (id integer NOT NULL, g integer, v integer, PRIMARY KEY (id));",
+        "CREATE SCHEMA b; CREATE TABLE b.u (id integer NOT NULL, t_id integer, w integer, PRIMARY KEY (id));",
     );
     let t = || Rows {
         columns: vec![
@@ -428,7 +428,7 @@ fn two_snails_holding_one_name_are_refused_when_opened_together() {
     );
     // An index's name is a relation's in its table's schema, as PostgreSQL holds it.
     let other = tmp("across-names-other.snail");
-    let ddl = "CREATE TABLE weather.other (a integer NOT NULL, PRIMARY KEY (a)); \
+    let ddl = "CREATE SCHEMA weather; CREATE TABLE weather.other (a integer NOT NULL, PRIMARY KEY (a)); \
                CREATE INDEX s_name ON weather.other (a);";
     write(
         &other,
@@ -468,7 +468,7 @@ fn two_snails_holding_one_name_are_refused_when_opened_together() {
     .unwrap();
     assert!(Snails::open(&[&split.readings, &clock]).is_ok());
     let odd = tmp("across-names-odd.snail");
-    let ddl = "CREATE FUNCTION weather.clock(timestamptz) RETURNS timestamp \
+    let ddl = "CREATE SCHEMA weather; CREATE FUNCTION weather.clock(timestamptz) RETURNS timestamp \
                LANGUAGE sql IMMUTABLE AS $$ SELECT $1 AT TIME ZONE 'Europe/Lisbon' $$; \
                CREATE TABLE weather.odd (a integer NOT NULL, PRIMARY KEY (a));";
     if let Ok(catalog) = Catalog::parse(ddl) {
@@ -1002,7 +1002,7 @@ mod written {
         );
         made(
             &two,
-            "CREATE TABLE s.parent (id integer PRIMARY KEY);
+            "CREATE SCHEMA s; CREATE TABLE s.parent (id integer PRIMARY KEY);
              CREATE TABLE s.child (id integer PRIMARY KEY, q integer, CONSTRAINT k_check CHECK (id > 0),
                  CONSTRAINT s_fk FOREIGN KEY (q) REFERENCES s.parent (id) DEFERRABLE);",
         );
@@ -1049,7 +1049,7 @@ mod written {
     fn ring_table(name: &str, i: usize) -> (PathBuf, i64, i64) {
         let path = tmp(&format!("{name}-{i}.snail"));
         let ddl = format!(
-            "CREATE TABLE ring.t{i} (k integer NOT NULL, v integer NOT NULL, PRIMARY KEY (k));"
+            "CREATE SCHEMA ring; CREATE TABLE ring.t{i} (k integer NOT NULL, v integer NOT NULL, PRIMARY KEY (k));"
         );
         let keys: Vec<i64> = (0..4096).collect();
         write(

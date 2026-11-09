@@ -13,7 +13,7 @@ use warren_snail::catalog::Catalog;
 use warren_snail::read::{Done, Snail};
 use weather::{tmp, write};
 
-const DDL: &str = "
+const DDL: &str = "CREATE SCHEMA a; 
 CREATE TABLE a.inv (id integer NOT NULL, qty integer, price numeric(10,2), note text,
     total numeric(12,2) GENERATED ALWAYS AS (qty * price) STORED, PRIMARY KEY (id));
 CREATE TABLE a.t (id integer NOT NULL, g integer, name text, PRIMARY KEY (id));

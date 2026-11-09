@@ -1838,7 +1838,13 @@ fn cast(
             Ok(ty @ (ColumnType::Float4 | ColumnType::Float8)) => {
                 float_cast(v, ty == ColumnType::Float8)?
             }
-            _ => return Err(Error::new(format!("a cast to {to} is not read"))),
+            _ => {
+                // A type that does not exist, refused as PostgreSQL refuses it: its schema first.
+                if let DataType::Custom(..) = to {
+                    crate::regs::type_oid(&to.to_string(), release)?;
+                }
+                return Err(Error::new(format!("a cast to {to} is not read")));
+            }
         },
     })
 }

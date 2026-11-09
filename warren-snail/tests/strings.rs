@@ -76,7 +76,7 @@ fn byteas() -> Vec<Option<Vec<u8>>> {
 fn bytea_snail(name: &str) -> std::path::PathBuf {
     snail_of(
         name,
-        "CREATE TABLE s.t (id integer NOT NULL, v bytea, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v bytea, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t (v, id);",
         vec![
             Values::Int((1..=13).map(Some).collect()),
@@ -163,7 +163,7 @@ fn a_bytea_level_is_cut_by_its_bytes_and_fixed_by_an_equality() {
         .collect();
     let path = snail_of(
         "bytea-cut",
-        "CREATE TABLE s.t (v bytea NOT NULL, PRIMARY KEY (v));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (v bytea NOT NULL, PRIMARY KEY (v));",
         vec![Values::Utf8(v)],
     );
     let mut snail = Snail::open(&path).unwrap();
@@ -191,7 +191,7 @@ fn a_bytea_level_goes_out_and_comes_back_by_its_pages() {
     let outs = Snail::open(&path).unwrap().out(&dir).unwrap();
     let (batches, _) = parquet_of(&outs[0].file);
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, v bytea, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v bytea, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t (v, id);",
     )
     .unwrap();
@@ -208,7 +208,7 @@ fn a_bytea_level_goes_out_and_comes_back_by_its_pages() {
 
 #[test]
 fn a_bytea_level_is_refused_by_name_in_formats_seven_and_eight() {
-    let catalog = Catalog::parse("CREATE TABLE s.t (v bytea NOT NULL, PRIMARY KEY (v));").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (v bytea NOT NULL, PRIMARY KEY (v));").unwrap();
     let rows = || Rows {
         columns: vec![Values::Utf8(vec![Some(ByteArray::from(vec![1u8]))])],
     };
@@ -228,7 +228,7 @@ fn a_bytea_level_is_refused_by_name_in_formats_seven_and_eight() {
 /// bpchar, unlimited and of three characters, each holding values equal but for their trailing
 /// blanks.
 const BPCHAR_DDL: &str =
-    "CREATE TABLE s.t (id integer NOT NULL, v bpchar, c char(3), PRIMARY KEY (id)); \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v bpchar, c char(3), PRIMARY KEY (id)); \
      CREATE INDEX t_v ON s.t (v, id); \
      CREATE INDEX t_c ON s.t (c, id);";
 
@@ -457,7 +457,7 @@ fn a_bpchar_becomes_text_without_its_trailing_blanks_in_a_pipeline() {
 fn a_name_is_cut_to_63_bytes_and_compared_by_its_bytes() {
     let path = tmp("name.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, v name, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v name, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t (v, id);",
     )
     .unwrap();
@@ -488,7 +488,7 @@ fn a_name_is_cut_to_63_bytes_and_compared_by_its_bytes() {
 
 /// The bit strings of a table of bit(5) and bit varying.
 const BITS_DDL: &str =
-    "CREATE TABLE s.t (id integer NOT NULL, b bit(5), v varbit, PRIMARY KEY (id)); \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, b bit(5), v varbit, PRIMARY KEY (id)); \
      CREATE INDEX t_b ON s.t (b, id); \
      CREATE INDEX t_v ON s.t (v, id);";
 
@@ -732,7 +732,7 @@ fn a_bit_string_is_cut_by_its_bits_and_a_short_one_never_decides() {
     assert_eq!(
         cut(
             "bits-cut-64",
-            "CREATE TABLE s.t (v bit(64) NOT NULL, PRIMARY KEY (v));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (v bit(64) NOT NULL, PRIMARY KEY (v));",
             spread(64)
         ),
         [512; 8]
@@ -742,7 +742,7 @@ fn a_bit_string_is_cut_by_its_bits_and_a_short_one_never_decides() {
     let beside = |n: u32| -> Vec<u64> {
         let path = snail_of(
             &format!("bits-cut-beside-{n}"),
-            &format!("CREATE TABLE s.t (v bit({n}) NOT NULL, w bigint NOT NULL, PRIMARY KEY (v));"),
+            &format!("CREATE SCHEMA s; CREATE TABLE s.t (v bit({n}) NOT NULL, w bigint NOT NULL, PRIMARY KEY (v));"),
             vec![
                 Values::Utf8(
                     spread(n)
@@ -775,7 +775,7 @@ fn a_bit_string_is_cut_by_its_bits_and_a_short_one_never_decides() {
         .collect();
     let path = snail_of(
         "bits-cut-varbit",
-        "CREATE TABLE s.t (v varbit NOT NULL, PRIMARY KEY (v));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (v varbit NOT NULL, PRIMARY KEY (v));",
         vec![Values::Utf8(
             varying
                 .into_iter()
@@ -807,14 +807,14 @@ fn the_collations_of_byte_order_are_held_and_any_other_refused_by_name() {
         "\"default\"",
     ] {
         let ddl = format!(
-            "CREATE TABLE s.t (id integer NOT NULL, v text COLLATE {c}, n name COLLATE {c}, \
+            "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v text COLLATE {c}, n name COLLATE {c}, \
              b char(2) COLLATE {c}, PRIMARY KEY (id));"
         );
         Catalog::parse(&ddl).unwrap_or_else(|e| panic!("{c}: {e}"));
     }
     for c in ["\"en_US.utf8\"", "\"und-x-icu\"", "unicode", "c"] {
         let ddl = format!(
-            "CREATE TABLE s.t (id integer NOT NULL, v text COLLATE {c}, PRIMARY KEY (id));"
+            "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v text COLLATE {c}, PRIMARY KEY (id));"
         );
         // With the feature collations, a collation a library orders is taken.
         if cfg!(feature = "collations") && c != "c" {
@@ -831,14 +831,14 @@ fn the_collations_of_byte_order_are_held_and_any_other_refused_by_name() {
         assert!(e.contains(named), "{c}: {e}");
     }
     let c = Catalog::parse(
-        "CREATE COLLATION s.fast (provider = builtin, locale = 'PG_UNICODE_FAST'); \
+        "CREATE SCHEMA s; CREATE COLLATION s.fast (provider = builtin, locale = 'PG_UNICODE_FAST'); \
          CREATE COLLATION s.lib (provider = libc, locale = 'C.utf8'); \
          CREATE TABLE s.t (id integer NOT NULL, v text COLLATE s.fast, w text COLLATE s.lib, \
          PRIMARY KEY (id));",
     )
     .unwrap();
     assert_eq!(c.collations.len(), 2);
-    let us = Catalog::parse("CREATE COLLATION s.us (provider = libc, locale = 'en_US.utf8');");
+    let us = Catalog::parse("CREATE SCHEMA s; CREATE COLLATION s.us (provider = libc, locale = 'en_US.utf8');");
     if cfg!(feature = "collations") {
         assert_eq!(us.unwrap().collations.len(), 1);
     } else {
@@ -851,7 +851,7 @@ fn the_collations_of_byte_order_are_held_and_any_other_refused_by_name() {
 fn case_follows_the_collation_a_column_or_a_collate_names() {
     let path = snail_of(
         "case-collations",
-        "CREATE TABLE s.t (id integer NOT NULL, d text, c text COLLATE \"C\", f text COLLATE \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, d text, c text COLLATE \"C\", f text COLLATE \
          pg_unicode_fast, n name, PRIMARY KEY (id));",
         vec![
             Values::Int(vec![Some(1)]),
@@ -910,7 +910,7 @@ fn case_follows_the_collation_a_column_or_a_collate_names() {
 fn strings_are_joined_and_matched_by_like_as_postgresql_does() {
     let path = snail_of(
         "like",
-        "CREATE TABLE s.t (id integer NOT NULL, v text, b bpchar, y bytea, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v text, b bpchar, y bytea, PRIMARY KEY (id));",
         vec![
             Values::Int((1..=5).map(Some).collect()),
             Values::Text(
@@ -1019,7 +1019,7 @@ fn bit_strings_are_operated_on_as_postgresql_does() {
 fn the_string_types_are_read_from_their_spellings() {
     use warren_snail::catalog::ColumnType::*;
     let c = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, a char, b character(5), c bpchar, d bpchar(3), \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, a char, b character(5), c bpchar, d bpchar(3), \
          e name, f bit, g bit(9), h bit varying, i varbit(3), j bytea, PRIMARY KEY (id)); \
          CREATE INDEX t_b ON s.t (b bpchar_pattern_ops);",
     )
@@ -1050,14 +1050,14 @@ fn the_string_types_are_read_from_their_spellings() {
         ),
         ("CREATE TABLE s.t (a integer COLLATE \"C\");", "not text"),
     ] {
-        let e = Catalog::parse(ddl).unwrap_err().to_string();
+        let e = Catalog::parse(&format!("CREATE SCHEMA s; {ddl}")).unwrap_err().to_string();
         assert!(e.contains(why), "{ddl}: {e}");
     }
 }
 
 #[test]
 fn a_bit_string_shared_by_two_rows_of_a_unique_key_is_named_by_its_bits() {
-    let catalog = Catalog::parse("CREATE TABLE s.t (v bit(5) NOT NULL, PRIMARY KEY (v));").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (v bit(5) NOT NULL, PRIMARY KEY (v));").unwrap();
     let k = || {
         Some(ByteArray::from(
             bits_parse("10100", Some(5), false).unwrap(),
@@ -1082,7 +1082,7 @@ fn a_bit_string_shared_by_two_rows_of_a_unique_key_is_named_by_its_bits() {
 #[cfg(feature = "standalone")]
 fn a_bpchar_written_is_keyed_on_its_class_so_a_unique_key_refuses_its_twin_of_other_blanks() {
     let path = tmp("bpchar-unique.snail");
-    let ddl = "CREATE TABLE s.u (id integer NOT NULL, c character(3) NOT NULL, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.u (id integer NOT NULL, c character(3) NOT NULL, PRIMARY KEY (id)); \
                CREATE UNIQUE INDEX u_c ON s.u (c);";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let mut w = Snail::open_writing(&path).unwrap();
@@ -1106,7 +1106,7 @@ fn a_bpchar_written_is_routed_to_the_block_its_class_lies_in() {
     let n = 2048;
     let path = snail_of(
         "bpchar-route",
-        "CREATE TABLE s.t (c character(3) NOT NULL, id integer NOT NULL, PRIMARY KEY (c, id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (c character(3) NOT NULL, id integer NOT NULL, PRIMARY KEY (c, id));",
         vec![
             Values::Text(
                 (0..2 * n)
@@ -1162,7 +1162,7 @@ fn a_bpchar_written_is_routed_to_the_block_its_class_lies_in() {
 #[test]
 fn a_collation_is_derived_as_postgresql_derives_it_and_carried_by_each_column() {
     let ddl =
-        "CREATE TABLE s.t (id integer NOT NULL, a text COLLATE \"C\", b text COLLATE \"POSIX\", \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, a text COLLATE \"C\", b text COLLATE \"POSIX\", \
                c text, n name, PRIMARY KEY (id));";
     let text = |v: &[Option<&str>]| Values::Text(v.iter().map(|s| s.map(str::to_string)).collect());
     let path = snail_of(

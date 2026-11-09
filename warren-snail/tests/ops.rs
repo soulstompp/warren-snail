@@ -15,7 +15,7 @@ use warren_snail::write::Rows;
 use weather::{exact, fresh, tmp, write};
 
 const DDL: &str =
-    "CREATE TABLE s.t (id integer PRIMARY KEY, i2 smallint, i2b smallint, i4 integer, \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, i2 smallint, i2b smallint, i4 integer, \
      i4b integer, i8 bigint, f4 real, f8 double precision, n numeric, t text, tb text, c char(4), \
      nm name, b bytea, bb bytea, j json, jb jsonb, k text[]);";
 
@@ -932,7 +932,7 @@ fn an_operator_reads_in_every_clause_of_a_question_and_a_join() {
 fn keyed(name: &str) -> PathBuf {
     let path = tmp(&format!("ops-{name}.snail"));
     let catalog = Catalog::parse(
-        "CREATE TABLE s.k (id bigint PRIMARY KEY, s text, c char(8), m name, d bytea, pad bigint);
+        "CREATE SCHEMA s; CREATE TABLE s.k (id bigint PRIMARY KEY, s text, c char(8), m name, d bytea, pad bigint);
          CREATE INDEX k_s ON s.k (s text_pattern_ops);
          CREATE INDEX k_c ON s.k (c bpchar_pattern_ops);
          CREATE INDEX k_m ON s.k (m);
@@ -1175,7 +1175,7 @@ fn an_operator_reads_in_a_write_s_conditions_and_values_a_check_and_a_generated_
     use warren_snail::read::Snail;
     let path = tmp("ops-writes.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.w (id integer PRIMARY KEY, n integer, t text, d integer DEFAULT 1 << 3, \
+        "CREATE SCHEMA s; CREATE TABLE s.w (id integer PRIMARY KEY, n integer, t text, d integer DEFAULT 1 << 3, \
          g integer GENERATED ALWAYS AS (n & 1) STORED, CHECK (@ n - 1 >= 0));",
     )
     .unwrap();
@@ -1237,7 +1237,7 @@ fn a_domain_s_check_and_a_generated_column_bind_a_prefix_operator_beside_a_sign(
     use warren_snail::read::Snail;
     let path = tmp("ops-signed.snail");
     let catalog = Catalog::parse(
-        "CREATE DOMAIN s.dd AS integer CHECK (- @ VALUE - 1 >= - 1);
+        "CREATE SCHEMA s; CREATE DOMAIN s.dd AS integer CHECK (- @ VALUE - 1 >= - 1);
          CREATE TABLE s.w (id integer PRIMARY KEY, n integer, e s.dd, \
          g integer GENERATED ALWAYS AS (- @ n - 1) STORED);",
     )
@@ -1273,7 +1273,7 @@ fn a_domain_s_check_and_a_generated_column_bind_a_prefix_operator_beside_a_sign(
 fn searched(name: &str, config: Option<&str>) -> PathBuf {
     let path = tmp(&format!("ops-{name}.snail"));
     let catalog = Catalog::parse(
-        "CREATE TABLE s.d (id integer PRIMARY KEY, t text, tb text, c char(12), v varchar(12), \
+        "CREATE SCHEMA s; CREATE TABLE s.d (id integer PRIMARY KEY, t text, tb text, c char(12), v varchar(12), \
          nm name, q tsquery);",
     )
     .unwrap();
@@ -1578,7 +1578,7 @@ fn a_configuration_goes_out_and_comes_in_with_the_tables_as_lc_monetary_does() {
     assert_eq!(of.text_search.as_deref(), Some("pg_catalog.english"));
     // Written back it reads under what its files name, a flag naming the same taken, another not.
     let catalog = Catalog::parse(
-        "CREATE TABLE s.d (id integer PRIMARY KEY, t text, tb text, c char(12), v varchar(12), \
+        "CREATE SCHEMA s; CREATE TABLE s.d (id integer PRIMARY KEY, t text, tb text, c char(12), v varchar(12), \
          nm name, q tsquery);",
     )
     .unwrap();
@@ -1706,7 +1706,7 @@ fn a_call_naming_none_across_snails_of_two_configurations_is_refused_by_name() {
     use warren_snail::read::Snails;
     let a = searched("across_a", None);
     let dir = tmp("ops-across-b.snail");
-    let catalog = Catalog::parse("CREATE TABLE r.b (id integer PRIMARY KEY, t text);").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA r; CREATE TABLE r.b (id integer PRIMARY KEY, t text);").unwrap();
     let mut carried = warren_snail::write::Carried::default();
     carried.text_search = "english".to_string();
     warren_snail::write::write_carried(
@@ -1756,7 +1756,7 @@ fn a_recut_keeps_its_file_s_configuration() {
 fn a_view_binds_its_operators_as_a_statement_does() {
     let path = tmp("ops-view.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer PRIMARY KEY, n integer, t text);
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, n integer, t text);
          CREATE VIEW s.v AS SELECT id, @ n + 1 AS a, t ~~ 'a%' AS b, t ~<~ 'b' AS c FROM s.t;",
     )
     .unwrap();
@@ -1782,7 +1782,7 @@ fn a_view_binds_its_operators_as_a_statement_does() {
     assert_eq!(rows(&b), strs(&["1", "2"]));
     // Made, it is read as PostgreSQL's parser reads it: `(t ~~ 'a') & 1`.
     let e = Catalog::parse(
-        "CREATE TABLE s.t (id integer PRIMARY KEY, n integer, t text);
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, n integer, t text);
          CREATE VIEW s.v AS SELECT id, t ~~ 'a' & 1 AS a FROM s.t;",
     )
     .unwrap_err()

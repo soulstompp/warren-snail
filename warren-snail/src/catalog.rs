@@ -3162,7 +3162,7 @@ mod tests {
     }
 
     const TABLE: &str =
-        "CREATE TABLE s.t (a integer NOT NULL, at timestamptz NOT NULL, PRIMARY KEY (a));";
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, at timestamptz NOT NULL, PRIMARY KEY (a));";
 
     #[test]
     fn the_month_without_a_clock_is_refused_as_postgresql_refuses_it() {
@@ -3179,7 +3179,7 @@ mod tests {
                      AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;";
         let month = "(extract(month FROM s.clock(at))::smallint)";
         let c = Catalog::parse(&format!(
-            "{clock} {TABLE} CREATE INDEX i ON s.t ((s.clock(at))); \
+            "{TABLE} {clock} CREATE INDEX i ON s.t ((s.clock(at))); \
              CREATE INDEX mi ON s.t ({month}, (s.clock(at))) INCLUDE (at, a); \
              CREATE INDEX mc ON s.t ({month}, at) INCLUDE (a);"
         ))
@@ -3198,7 +3198,7 @@ mod tests {
         let day = "CREATE FUNCTION r.day(timestamptz) RETURNS date LANGUAGE sql IMMUTABLE \
                    AS $$ SELECT ($1 AT TIME ZONE 'UTC')::date $$;";
         let c = Catalog::parse(&format!(
-            "{clock}\n{TABLE}\nCREATE INDEX i ON s.t (at);\n{day}\nALTER TABLE s.t CLUSTER ON i;"
+            "{TABLE}\n{clock}\nCREATE INDEX i ON s.t (at);\nCREATE SCHEMA r;\n{day}\nALTER TABLE s.t CLUSTER ON i;"
         ))
         .unwrap();
         let names: Vec<&str> = c.functions.iter().map(|f| f.name.as_str()).collect();
@@ -3208,14 +3208,14 @@ mod tests {
 
     #[test]
     fn a_table_with_no_order_is_refused() {
-        let e = refused("CREATE TABLE s.t (a integer NOT NULL);");
+        let e = refused("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL);");
         assert!(e.contains("has no order"), "{e}");
     }
 
     #[test]
     fn an_index_s_nulls_lie_where_its_b_tree_read_ascending_holds_them() {
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
              CREATE INDEX asc_last ON s.t (b, a);
              CREATE INDEX asc_first ON s.t (b ASC NULLS FIRST, a);
              CREATE INDEX desc_first ON s.t (b DESC, a DESC NULLS LAST);
@@ -3238,7 +3238,7 @@ mod tests {
         assert_eq!(read("not_distinct_b"), (vec![false], false));
         // Clustered on an index, the table's order takes its NULLs as the index lies.
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
              CREATE UNIQUE INDEX u ON s.t (b NULLS FIRST) NULLS NOT DISTINCT;
              ALTER TABLE s.t CLUSTER ON u;",
         )
@@ -3273,14 +3273,14 @@ mod tests {
 
     #[test]
     fn a_type_not_held_is_refused() {
-        let e = refused("CREATE TABLE s.t (a trigger NOT NULL, PRIMARY KEY (a));");
+        let e = refused("CREATE SCHEMA s; CREATE TABLE s.t (a trigger NOT NULL, PRIMARY KEY (a));");
         assert!(e.contains("is not held"), "{e}");
     }
 
     #[test]
     fn a_numeric_is_held_in_the_form_its_typmod_allows_and_bytea_as_a_level() {
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a bigint NOT NULL, k bytea, m numeric(9,2) NOT NULL, \
+            "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, k bytea, m numeric(9,2) NOT NULL, \
              w numeric(38,2), u numeric, x decimal(3,-1), y numeric(3,5), z numeric(40), \
              PRIMARY KEY (a));",
         )
@@ -3320,10 +3320,10 @@ mod tests {
                 "NUMERIC scale 1001 must be between -1000 and 1000",
             ),
         ] {
-            let e = refused(ddl);
+            let e = refused(&format!("CREATE SCHEMA s; {ddl}"));
             assert!(e.contains(why), "{ddl}: {e}");
         }
-        let c = Catalog::parse("CREATE TABLE s.t (k bytea NOT NULL, PRIMARY KEY (k));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (k bytea NOT NULL, PRIMARY KEY (k));").unwrap();
         assert_eq!(c.tables[0].orders[0].levels, [Level::Column(0)]);
         assert_eq!(numeric_units("12.345", 9, 2).unwrap(), 1235);
         assert_eq!(numeric_units("-12.344", 9, 2).unwrap(), -1234);
@@ -3334,7 +3334,7 @@ mod tests {
     #[test]
     fn text_is_read_with_its_length_cap() {
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b varchar(64), c character varying(255) NOT NULL, \
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b varchar(64), c character varying(255) NOT NULL, \
              d text, e varchar COLLATE \"C\", PRIMARY KEY (a));",
         )
         .unwrap();
@@ -3356,39 +3356,39 @@ mod tests {
     #[test]
     fn a_collation_not_ordered_by_bytes_is_refused_without_the_feature() {
         let ddl =
-            "CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"en_US\", PRIMARY KEY (a));";
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"en_US\", PRIMARY KEY (a));";
         if cfg!(feature = "collations") {
             assert!(Catalog::parse(ddl).unwrap().tables[0].columns[1].collated());
             let e = refused(
-                "CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"xx_YY\", PRIMARY KEY (a));",
+                "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b text COLLATE \"xx_YY\", PRIMARY KEY (a));",
             );
             assert!(e.contains("does not exist"), "{e}");
         } else {
             let e = refused(ddl);
             assert!(e.contains("only a collation of byte order"), "{e}");
-            let e = refused("CREATE COLLATION s.pt (provider = icu, locale = 'pt-PT')");
+            let e = refused("CREATE SCHEMA s; CREATE COLLATION s.pt (provider = icu, locale = 'pt-PT')");
             assert!(e.contains("only a collation of byte order"), "{e}");
         }
-        let e = refused("CREATE TABLE s.t (a integer NOT NULL COLLATE \"C\", PRIMARY KEY (a));");
+        let e = refused("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL COLLATE \"C\", PRIMARY KEY (a));");
         assert!(e.contains("not text"), "{e}");
     }
 
     #[test]
     fn text_keys_an_order_and_an_index() {
-        let c = Catalog::parse("CREATE TABLE s.u (a integer NOT NULL, b text, PRIMARY KEY (a)); CREATE INDEX ub ON s.u (b, a);").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.u (a integer NOT NULL, b text, PRIMARY KEY (a)); CREATE INDEX ub ON s.u (b, a);").unwrap();
         let t = &c.tables[0];
         assert_eq!(t.orders[1].name, "ub");
         assert_eq!(t.orders[1].levels, [Level::Column(1), Level::Column(0)]);
         assert_eq!(t.orders[1].columns, [1, 0]);
-        let c = Catalog::parse("CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
         assert_eq!(c.tables[0].orders[0].levels, [Level::Column(0)]);
     }
 
     #[test]
     fn a_clock_in_another_zone_is_refused() {
         let e = refused(&format!(
-            "CREATE FUNCTION s.c(timestamptz) RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT $1 AT TIME ZONE 'Europe/Lisbon' $$; \
-             {TABLE} CREATE INDEX m ON s.t ((extract(month FROM s.c(at))::smallint));"
+            "{TABLE} CREATE FUNCTION s.c(timestamptz) RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$ SELECT $1 AT TIME ZONE 'Europe/Lisbon' $$; \
+             CREATE INDEX m ON s.t ((extract(month FROM s.c(at))::smallint));"
         ));
         assert!(e.contains("only the UTC clock"), "{e}");
     }
@@ -3396,7 +3396,7 @@ mod tests {
     #[test]
     fn a_ddl_is_read_a_statement_at_a_time_each_taken_or_refused_by_name() {
         let r = Catalog::read(
-            "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));
              CREATE TABLE s.u (a s.unknown NOT NULL, PRIMARY KEY (a));
              CREATE INDEX ua ON s.u (a);
              CREATE INDEX tg ON s.t USING gin (a);
@@ -3405,9 +3405,11 @@ mod tests {
              ALTER INDEX s.tp RENAME TO tq;",
         )
         .unwrap();
+        // The schema's statement first, then the ones the test is about.
         let read: Vec<(&str, Option<&str>)> = r
             .statements
             .iter()
+            .skip(1)
             .map(|s| (s.object.as_str(), s.refused.as_deref()))
             .collect();
         assert_eq!(read[0], ("s.t", None));
@@ -3415,7 +3417,7 @@ mod tests {
             read[1]
                 .1
                 .unwrap()
-                .contains("the type s.unknown is not held"),
+                .contains("type \"s.unknown\" does not exist"),
             "{:?}",
             read[1]
         );
@@ -3436,10 +3438,10 @@ mod tests {
         assert_eq!(read[5].1, None);
         assert_eq!(r.catalog.tables[0].order("tb").unwrap().desc, [true]);
         assert_eq!(
-            r.statements[5].notices.len(),
+            r.statements[6].notices.len(),
             2,
             "{:?}",
-            r.statements[5].notices
+            r.statements[6].notices
         );
         assert!(read[6].1.unwrap().contains("is not read"));
         // The statements taken are a DDL of their own, which reads as the catalog they made.
@@ -3447,7 +3449,7 @@ mod tests {
         assert_eq!(again.facts(), r.catalog.facts());
         assert_eq!(again.tables[0].orders.len(), 3);
         let e = refused(
-            "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t USING foo (a);",
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t USING foo (a);",
         );
         assert!(e.contains("access method \"foo\" does not exist"), "{e}");
     }
@@ -3470,7 +3472,7 @@ mod tests {
     #[test]
     fn keys_checks_and_sequences_are_named_as_postgresql_names_them() {
         let c = Catalog::parse(
-            "CREATE TABLE s.t (id serial, a integer UNIQUE, b integer CHECK (b > 0),
+            "CREATE SCHEMA s; CREATE TABLE s.t (id serial, a integer UNIQUE, b integer CHECK (b > 0),
                  c integer, d integer GENERATED BY DEFAULT AS IDENTITY,
                  PRIMARY KEY (id), UNIQUE (a, c) INCLUDE (b), UNIQUE (a),
                  CHECK (b < c), CHECK (c > 0), CONSTRAINT named CHECK (c < 9));",
@@ -3498,7 +3500,7 @@ mod tests {
         );
         // A name taken is numbered, the label first.
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, CONSTRAINT t_a_check CHECK (a < 9), CHECK (a > 0), PRIMARY KEY (a));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, CONSTRAINT t_a_check CHECK (a < 9), CHECK (a > 0), PRIMARY KEY (a));",
         )
         .unwrap();
         let checks: Vec<&str> = c.tables[0].checks.iter().map(|k| k.name.as_str()).collect();
@@ -3508,7 +3510,7 @@ mod tests {
     #[test]
     fn a_sequence_s_options_are_read_as_postgresql_reads_them() {
         let c = Catalog::parse(
-            "CREATE SEQUENCE s.up;
+            "CREATE SCHEMA s; CREATE SEQUENCE s.up;
              CREATE SEQUENCE s.down INCREMENT BY -1;
              CREATE SEQUENCE s.small AS smallint;
              ALTER SEQUENCE s.small AS integer;
@@ -3567,7 +3569,7 @@ mod tests {
             ),
             ("CREATE TEMP SEQUENCE s.x", "kept in its file"),
         ] {
-            let e = refused(ddl);
+            let e = refused(&format!("CREATE SCHEMA s; {ddl}"));
             assert!(e.contains(why), "{ddl}: {e}");
         }
     }
@@ -3575,7 +3577,7 @@ mod tests {
     #[test]
     fn types_domains_and_collations_are_kept_as_declared() {
         let c = Catalog::parse(
-            "CREATE TYPE s.mood AS ENUM ('sad', 'ok');
+            "CREATE SCHEMA s; CREATE TYPE s.mood AS ENUM ('sad', 'ok');
              ALTER TYPE s.mood ADD VALUE 'happy';
              ALTER TYPE s.mood ADD VALUE 'meh' BEFORE 'ok';
              ALTER TYPE s.mood ADD VALUE IF NOT EXISTS 'ok';
@@ -3621,7 +3623,7 @@ mod tests {
             ),
             ("CREATE TYPE s.b (INPUT = x, OUTPUT = y)", "written in C"),
         ] {
-            let e = refused(ddl);
+            let e = refused(&format!("CREATE SCHEMA s; {ddl}"));
             assert!(e.contains(why), "{ddl}: {e}");
         }
     }
@@ -3629,7 +3631,7 @@ mod tests {
     #[test]
     fn a_column_s_default_generation_and_checks_are_read_and_refused_by_name() {
         let c = Catalog::parse(
-            "CREATE SEQUENCE s.n;
+            "CREATE SCHEMA s; CREATE SEQUENCE s.n;
              CREATE TABLE s.t (a integer NOT NULL DEFAULT nextval('s.n'), at timestamptz DEFAULT now(),
                  q integer DEFAULT 1 + 1, g integer GENERATED ALWAYS AS (q * 2) STORED,
                  v integer GENERATED ALWAYS AS (q + 1), PRIMARY KEY (a));",
@@ -3648,7 +3650,7 @@ mod tests {
         // A uuid's key: a v7 rises as rows arrive, a v4 scatters them; a CLUSTER ON names another
         // order.
         let u = Catalog::parse(
-            "CREATE TABLE s.u (id uuid DEFAULT uuidv7() NOT NULL, PRIMARY KEY (id));
+            "CREATE SCHEMA s; CREATE TABLE s.u (id uuid DEFAULT uuidv7() NOT NULL, PRIMARY KEY (id));
              CREATE TABLE s.r (id uuid DEFAULT gen_random_uuid() NOT NULL, n integer NOT NULL,
                  PRIMARY KEY (id));
              CREATE TABLE s.c (id uuid DEFAULT gen_random_uuid() NOT NULL, n integer NOT NULL,
@@ -3668,7 +3670,7 @@ mod tests {
             .contains("a key handed out at random"));
         assert_eq!(words[2], None);
         for (ddl, why) in [
-            ("CREATE TABLE s.t (a integer NOT NULL DEFAULT nextval('s.none'), PRIMARY KEY (a))", "no sequence s.none"),
+            ("CREATE TABLE s.t (a integer NOT NULL DEFAULT nextval('s.none'), PRIMARY KEY (a))", "relation \"s.none\" does not exist"),
             ("CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT a, PRIMARY KEY (a))", "cannot use column reference"),
             ("CREATE TABLE s.t (a integer NOT NULL, b boolean DEFAULT now(), PRIMARY KEY (a))", "is of type boolean but default expression is of type timestamp with time zone"),
             ("CREATE TABLE s.t (a integer NOT NULL, b integer DEFAULT random(), PRIMARY KEY (a))", "which the snail does not read"),
@@ -3682,7 +3684,7 @@ mod tests {
             ("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)) PARTITION BY RANGE (a)", "is not read: only a table's columns"),
             ("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a)); CREATE INDEX x ON s.t (a int8_ops)", "the operator class int8_ops is not read"),
         ] {
-            let e = refused(ddl);
+            let e = refused(&format!("CREATE SCHEMA s; {ddl}"));
             assert!(e.contains(why), "{ddl}: {e}");
         }
     }

@@ -673,7 +673,7 @@ fn r8_a_repeated_leaf_decides_the_cut_by_its_values_bytes_and_the_shape_never() 
         element: ColumnType::Int4,
         domain: None,
     });
-    let ddl = "CREATE TABLE s.t (id bigint NOT NULL, v integer[] NOT NULL, PRIMARY KEY (id));";
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v integer[] NOT NULL, PRIMARY KEY (id));";
     let column = |spelled: &dyn Fn(i64) -> String| {
         Values::Composed(
             (0..8192)
@@ -726,7 +726,7 @@ fn composed_level(name: &str) -> std::path::PathBuf {
         element: ColumnType::Int4,
         domain: None,
     });
-    let ddl = "CREATE TABLE s.t (id integer NOT NULL, v integer[] NOT NULL, PRIMARY KEY (v, id));";
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer[] NOT NULL, PRIMARY KEY (v, id));";
     snail_of(
         name,
         ddl,
@@ -782,7 +782,7 @@ fn texts_of(b: &arrow::array::RecordBatch, c: usize) -> Vec<Option<String>> {
         .collect()
 }
 
-const MIXED: &str = "CREATE TYPE s.pair AS (a integer, b text); \
+const MIXED: &str = "CREATE SCHEMA s; CREATE TYPE s.pair AS (a integer, b text); \
     CREATE TABLE s.t (id integer NOT NULL, a integer[], p s.pair, r int4range, m int4multirange, PRIMARY KEY (id)); \
     CREATE INDEX t_a ON s.t (a, id);";
 
@@ -964,7 +964,7 @@ fn a_composed_level_takes_rows_into_its_tail_and_by_update_and_delete() {
 #[cfg(feature = "standalone")]
 #[test]
 fn a_domain_s_constraints_are_met_at_the_write_its_arrays_and_fields_too() {
-    let ddl = "CREATE DOMAIN s.posint AS integer CHECK (VALUE > 0); \
+    let ddl = "CREATE SCHEMA s; CREATE DOMAIN s.posint AS integer CHECK (VALUE > 0); \
         CREATE DOMAIN s.nn AS s.posint NOT NULL DEFAULT 5; \
         CREATE TYPE s.dp AS (a s.posint, b text); \
         CREATE TABLE s.t (id integer NOT NULL, x s.posint, y s.nn, z s.posint[], w s.dp, PRIMARY KEY (id));";
@@ -1169,7 +1169,7 @@ fn a_snail_of_format_eight_refuses_a_composed_column_by_name() {
             "which a snail of format 8",
         ),
     ] {
-        let catalog = warren_snail::catalog::Catalog::parse(ddl).unwrap();
+        let catalog = warren_snail::catalog::Catalog::parse(&format!("CREATE SCHEMA s; {ddl}")).unwrap();
         let path = weather::tmp("composed-eight.snail");
         let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
             .err()

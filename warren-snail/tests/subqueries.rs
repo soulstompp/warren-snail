@@ -44,7 +44,7 @@ fn tables() -> (Rows, Rows) {
 
 fn snail(name: &str) -> std::path::PathBuf {
     let path = tmp(&format!("subqueries-{name}.snail"));
-    let catalog = Catalog::parse(&format!("{T}\n{U}")).unwrap();
+    let catalog = Catalog::parse(&format!("CREATE SCHEMA a;\n{T}\n{U}")).unwrap();
     let (t, u) = tables();
     write(&path, &catalog, &[("a.t".into(), t), ("a.u".into(), u)]).unwrap();
     path
@@ -441,8 +441,8 @@ fn several_snails_subqueries_read_each_table_from_its_own() {
     let main = tmp("subqueries-several-t.snail");
     let other = tmp("subqueries-several-u.snail");
     let (t, u) = tables();
-    write(&main, &Catalog::parse(T).unwrap(), &[("a.t".into(), t)]).unwrap();
-    write(&other, &Catalog::parse(U).unwrap(), &[("a.u".into(), u)]).unwrap();
+    write(&main, &Catalog::parse(&format!("CREATE SCHEMA a; {T}")).unwrap(), &[("a.t".into(), t)]).unwrap();
+    write(&other, &Catalog::parse(&format!("CREATE SCHEMA a; {U}")).unwrap(), &[("a.u".into(), u)]).unwrap();
     let mut s = warren_snail::read::Snails::open(&[&main, &other]).unwrap();
     for (q, expected) in [
         (

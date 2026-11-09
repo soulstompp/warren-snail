@@ -296,7 +296,7 @@ fn every_row_type_of_every_release_is_held_as_its_catalog_s_or_refused_for_its_p
                     assert!(!fields.is_empty(), "{name}");
                     assert_eq!(ty.pg_name(), name);
                     // Its array too, and a DDL naming each under the release.
-                    let ddl = format!("CREATE TABLE s.t (k integer PRIMARY KEY, c {name}, d {name}[]);");
+                    let ddl = format!("CREATE SCHEMA s; CREATE TABLE s.t (k integer PRIMARY KEY, c {name}, d {name}[]);");
                     let mut catalog = Catalog::parse(&ddl).unwrap();
                     catalog.with_release(release).unwrap();
                     assert_eq!(catalog.tables[0].columns[1].ty, ty, "{name} of {release}");
@@ -323,7 +323,7 @@ fn every_row_type_of_every_release_is_held_as_its_catalog_s_or_refused_for_its_p
 
 #[test]
 fn a_row_type_a_release_does_not_define_is_refused_under_it() {
-    let mut catalog = Catalog::parse("CREATE TABLE s.t (k integer PRIMARY KEY, c pg_aios);").unwrap();
+    let mut catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (k integer PRIMARY KEY, c pg_aios);").unwrap();
     let e = catalog.with_release(17).unwrap_err().to_string();
     assert!(
         e.contains("pg_aios is not in PostgreSQL 17's catalog"),
@@ -337,7 +337,7 @@ fn a_row_type_a_release_does_not_define_is_refused_under_it() {
         .map(|t| t.name);
     if let Some(name) = name {
         let mut catalog =
-            Catalog::parse(&format!("CREATE TABLE s.t (k integer PRIMARY KEY, c {name});")).unwrap();
+            Catalog::parse(&format!("CREATE SCHEMA s; CREATE TABLE s.t (k integer PRIMARY KEY, c {name});")).unwrap();
         assert!(catalog.with_release(19).is_err(), "{name}");
     }
 }
@@ -345,7 +345,7 @@ fn a_row_type_a_release_does_not_define_is_refused_under_it() {
 #[test]
 fn a_type_of_the_file_s_release_reaches_every_part_that_names_a_catalog() {
     // The name of OID 3813 is another function's by release, through an array and a row type.
-    let ddl = "CREATE TYPE s.p AS (r regproc);
+    let ddl = "CREATE SCHEMA s; CREATE TYPE s.p AS (r regproc);
          CREATE TABLE s.t (k integer PRIMARY KEY, a regproc[], c pg_am, d pg_am[], e s.p);";
     for (release, shown) in [
         (14u8, "pg_is_in_backup"),
@@ -400,7 +400,7 @@ mod written {
     fn a_vector_column_is_subscripted_from_0_and_cast_as_postgresql_casts_it() {
         let path = snail_at(
             "vector-subscripts.snail",
-            "CREATE TABLE s.t (id integer PRIMARY KEY, a int2vector, o oidvector);",
+            "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, a int2vector, o oidvector);",
             19,
             &[],
         );
@@ -470,7 +470,7 @@ mod written {
     fn min_and_max_of_a_vector_are_an_array_s_and_its_order_its_own() {
         let path = snail_at(
             "vector-extremes.snail",
-            "CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);",
+            "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);",
             19,
             &[],
         );
@@ -503,7 +503,7 @@ mod written {
 
     #[test]
     fn an_index_takes_array_ops_on_either_vector_and_oidvector_ops_on_oidvector_alone() {
-        let table = "CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);";
+        let table = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);";
         for (index, words) in [
             ("CREATE INDEX i ON s.t (o array_ops)", None),
             ("CREATE INDEX i ON s.t (a array_ops)", None),
@@ -525,7 +525,7 @@ mod written {
 
     #[test]
     fn a_table_named_as_a_row_type_leaves_the_type_the_catalog_s() {
-        let ddl = "CREATE TABLE pg_am (x integer PRIMARY KEY);
+        let ddl = "CREATE SCHEMA s; CREATE TABLE pg_am (x integer PRIMARY KEY);
              CREATE TABLE s.t (id integer PRIMARY KEY, c pg_am);";
         let catalog = Catalog::parse(ddl).unwrap();
         let t = catalog.table("s.t").unwrap();
@@ -534,7 +534,7 @@ mod written {
 
     #[test]
     fn an_interval_inside_a_composed_value_comes_back_from_its_file() {
-        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, v interval[], c pg_timezone_names);";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, v interval[], c pg_timezone_names);";
         let path = snail_at("interval-out.snail", ddl, 19, &[]);
         let mut w = Snail::open_writing(&path).unwrap();
         w.execute("INSERT INTO s.t VALUES (1, '{1 day,NULL}', '(a,b,1 mon 2 days,t)'), (2, NULL, NULL)")
@@ -579,7 +579,7 @@ mod written {
 
     #[test]
     fn a_value_wider_than_its_block_s_unit_is_written_into_its_tail() {
-        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, v text, c pg_attrdef);";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, v text, c pg_attrdef);";
         let path = snail_at("wide-tail.snail", ddl, 19, &[]);
         let wide = "x".repeat(9_000);
         let mut w = Snail::open_writing(&path).unwrap();
@@ -597,7 +597,7 @@ mod written {
 
     #[test]
     fn a_row_made_of_columns_is_read_a_row_at_a_time() {
-        let ddl = "CREATE TABLE s.src (id integer PRIMARY KEY, n pg_node_tree, r oid);
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.src (id integer PRIMARY KEY, n pg_node_tree, r oid);
              CREATE TABLE s.t (id integer PRIMARY KEY, c pg_attrdef);";
         let tree = "({QUERY :commandType 1})";
         let path = snail_at(
@@ -625,7 +625,7 @@ mod written {
 
     #[test]
     fn an_order_and_a_strand_on_a_vector_cut_and_read_in_its_order() {
-        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, o oidvector, a int2vector);
              CREATE INDEX t_o ON s.t USING btree (o oidvector_ops, id);
              CREATE INDEX t_h ON s.t USING hash (o oidvector_ops);
              CREATE INDEX t_a ON s.t (a, id);";
@@ -712,7 +712,7 @@ mod written {
 
     #[test]
     fn a_vector_is_assigned_to_an_array_and_a_string_and_nothing_to_a_vector_but_itself() {
-        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, a int2vector, o oidvector);
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, a int2vector, o oidvector);
              CREATE TABLE s.u (id integer PRIMARY KEY, a int2vector, o oidvector, s smallint[], i oid[], x text, b integer[], y text[]);";
         let path = snail_at("vector-assign.snail", ddl, 19, &[]);
         let mut w = Snail::open_writing(&path).unwrap();
@@ -798,7 +798,7 @@ mod written {
     #[test]
     fn a_row_type_whose_fields_differ_is_read_as_each_file_s_release_says() {
         // pg_database holds datlastsysoid on 14 alone, and datlocprovider from 15.
-        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, c pg_database);";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, c pg_database);";
         let old = snail_at("row-14.snail", ddl, 14, &[]);
         let new = snail_at("row-19.snail", ddl, 19, &[]);
         let fields = |n: usize| {
@@ -861,7 +861,7 @@ mod written {
 
     #[test]
     fn a_row_type_holds_what_a_literal_cannot_write_and_a_node_tree_only_by_a_copy() {
-        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, c pg_attrdef, d pg_rewrite);";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, c pg_attrdef, d pg_rewrite);";
         let ty = row_type_at("pg_attrdef", 19).unwrap();
         let tree = "({QUERY :commandType 1})";
         let item = Item::Record(vec![
@@ -928,7 +928,7 @@ mod written {
 
     #[test]
     fn a_row_type_is_compared_as_far_as_its_fields_are_ordered() {
-        let ddl = "CREATE TABLE s.t (id integer PRIMARY KEY, n pg_namespace);";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, n pg_namespace);";
         let path = snail_at("row-reach.snail", ddl, 19, &[]);
         let mut w = Snail::open_writing(&path).unwrap();
         w.execute("INSERT INTO s.t VALUES (1, '(11,a,10,)'), (2, '(99,b,10,)'), (3, '(11,a,10,)')")
@@ -988,7 +988,7 @@ mod written {
     fn a_snail_of_an_old_format_refuses_a_vector_and_a_row_type_by_name_with_the_way_across() {
         for format in [7u32, 8] {
             let path = tmp(&format!("old-{format}.snail"));
-            let plain = Catalog::parse("CREATE TABLE s.p (id integer PRIMARY KEY);").unwrap();
+            let plain = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.p (id integer PRIMARY KEY);").unwrap();
             if format == 7 {
                 warren_snail::write::write_format_seven(&path, &plain, &[], weather::span()).unwrap();
             } else {

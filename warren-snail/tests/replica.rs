@@ -291,7 +291,7 @@ fn a_sequences_advance_lands_ahead_of_the_transaction_that_marks_the_replica() {
     use warren_snail::catalog::Catalog;
     let path = tmp("replica-sequence.snail");
     let catalog = Catalog::parse(
-        "CREATE SEQUENCE s.ids START 100;
+        "CREATE SCHEMA s; CREATE SEQUENCE s.ids START 100;
          CREATE TABLE s.q (id bigint NOT NULL DEFAULT nextval('s.ids'), v integer, PRIMARY KEY (id));",
     )
     .unwrap();
@@ -326,7 +326,7 @@ fn counted(name: &str) -> std::path::PathBuf {
     use warren_snail::write::Rows;
     let path = tmp(name);
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (a integer NOT NULL, b bigint NOT NULL);
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b bigint NOT NULL);
          CREATE INDEX o ON s.t (a, b);
          ALTER TABLE s.t CLUSTER ON o;",
     )
@@ -437,7 +437,7 @@ fn a_follower_carries_its_leaders_mark_and_refuses_a_stray_writer_while_the_lead
 fn a_snail_of_format_seven_or_eight_is_marked_no_replica() {
     use warren_snail::catalog::Catalog;
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (a integer NOT NULL, b bigint NOT NULL, PRIMARY KEY (a, b));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b bigint NOT NULL, PRIMARY KEY (a, b));",
     )
     .unwrap();
     for (n, path) in [

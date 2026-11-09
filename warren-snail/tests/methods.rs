@@ -14,19 +14,21 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{exact, fresh, tmp, write};
 
-/// Each statement's refusal, or None where it is taken.
+/// Each statement's refusal, or None where it is taken; the schema's CREATE SCHEMA left out, which
+/// no test here is about.
 fn outcomes(ddl: &str) -> Vec<Option<String>> {
     Catalog::read(ddl)
         .unwrap()
         .statements
         .into_iter()
+        .filter(|s| s.kind != "CREATE SCHEMA")
         .map(|s| s.refused)
         .collect()
 }
 
 #[test]
 fn an_index_of_each_method_is_refused_as_postgresql_19_refuses_it() {
-    let table = "CREATE TABLE s.t (id int PRIMARY KEY, r int4range, a int[], v tsvector, x xid, \
+    let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, r int4range, a int[], v tsvector, x xid, \
                  m money, b bit(3), c cid, g aclitem, p point, tx text, j jsonb, n inet);";
     // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31).
     let refused = [
@@ -155,7 +157,7 @@ fn an_index_of_each_method_is_refused_as_postgresql_19_refuses_it() {
 #[test]
 fn a_hash_index_is_read_with_its_operator_class_and_storage_as_postgresql_holds_them() {
     let reading = Catalog::read(
-        "CREATE TABLE s.t (id int PRIMARY KEY, tx text, x xid, g aclitem, n cidr);\n\
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, tx text, x xid, g aclitem, n cidr);\n\
          CREATE INDEX t_tx ON s.t USING hash (tx text_pattern_ops) WITH (fillfactor = '50');\n\
          CREATE INDEX t_x ON s.t USING hash (x);\n\
          CREATE INDEX t_g ON s.t USING hash (g);\n\
@@ -197,7 +199,7 @@ fn a_hash_strand_is_the_b_tree_strand_on_its_key() {
     // 4,096 rows, k and x spread over their 32 bits: the hash strand on k is cut as the B-tree
     // strand on k, and `=` along either reads the one block holding the value.
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id int NOT NULL, k int NOT NULL, x xid NOT NULL, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, k int NOT NULL, x xid NOT NULL, PRIMARY KEY (id)); \
          CREATE INDEX t_hk ON s.t USING hash (k); \
          CREATE INDEX t_bk ON s.t (k); \
          CREATE INDEX t_hx ON s.t USING hash (x);",
@@ -256,7 +258,7 @@ fn a_hash_strand_is_the_b_tree_strand_on_its_key() {
 #[test]
 fn aclitem_cid_and_xid_are_keyed_on_their_bytes_in_a_hash_strand() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id int PRIMARY KEY, c cid, g aclitem, x xid); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, c cid, g aclitem, x xid); \
          CREATE INDEX t_c ON s.t USING hash (c); \
          CREATE INDEX t_g ON s.t USING hash (g); \
          CREATE INDEX t_x ON s.t USING hash (x);",
@@ -293,7 +295,7 @@ fn a_snail_of_format_eight_refuses_an_index_of_another_method_by_name() {
     let e = warren_snail::write::write_format_eight(
         &path,
         &Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
              CREATE INDEX t_b ON s.t USING hash (b);",
         )
         .unwrap(),
@@ -310,7 +312,7 @@ fn a_snail_of_format_eight_refuses_an_index_of_another_method_by_name() {
     let e = warren_snail::write::write_format_eight(
         &path,
         &Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
              CREATE INDEX t_b ON s.t (b) WHERE b > 0;",
         )
         .unwrap(),
@@ -328,7 +330,7 @@ fn a_snail_of_format_eight_refuses_an_index_of_another_method_by_name() {
 
 #[test]
 fn a_partial_index_s_predicate_is_read_as_a_question_s_where_or_refused_by_name() {
-    let table = "CREATE TABLE s.t (id int PRIMARY KEY, a int, tags int[], gone timestamptz);";
+    let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, a int, tags int[], gone timestamptz);";
     let got = outcomes(&format!(
         "{table}\nCREATE INDEX t_live ON s.t (a) WHERE gone IS NULL;\n\
          CREATE INDEX t_big ON s.t USING hash (a) WHERE a > 100 AND a <= 200;\n\
@@ -354,7 +356,7 @@ fn a_partial_index_s_predicate_is_read_as_a_question_s_where_or_refused_by_name(
 /// strand on `a` holding the rows whose `b` is not NULL and whose `a` is under 256.
 fn partial_snail(name: &str) -> std::path::PathBuf {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id int NOT NULL, a int NOT NULL, b int, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int NOT NULL, b int, PRIMARY KEY (id)); \
          CREATE INDEX t_part ON s.t (a) WHERE b IS NOT NULL AND a < 256;",
     )
     .unwrap();
@@ -474,7 +476,7 @@ fn a_statement_routes_a_row_into_a_partial_strand_and_out_as_its_predicate_says(
 
 #[test]
 fn a_gist_or_sp_gist_index_is_held_on_a_range_a_multirange_an_inet_text_and_the_plane() {
-    let table = "CREATE TABLE s.t (id int PRIMARY KEY, r int4range, m int4multirange, n inet, \
+    let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, r int4range, m int4multirange, n inet, \
                  tx text, p point, v tsvector);";
     let got = outcomes(&format!(
         "{table}\nCREATE INDEX t_r ON s.t USING gist (r) INCLUDE (tx);\n\
@@ -503,7 +505,7 @@ fn ranges(name: &str, n: i64) -> std::path::PathBuf {
 /// As `ranges`, of type `ty`: a multirange holds its range and one past it.
 fn spans_of(name: &str, n: i64, ty: &str) -> std::path::PathBuf {
     let catalog = Catalog::parse(&format!(
-        "CREATE TABLE s.t (id int NOT NULL, r {ty}, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, r {ty}, PRIMARY KEY (id)); \
          CREATE INDEX t_r ON s.t USING gist (r);"
     ))
     .unwrap();
@@ -651,7 +653,7 @@ fn a_gist_strand_s_condition_it_cannot_hold_is_refused_never_taken_as_false() {
 #[test]
 fn an_sp_gist_strand_on_an_inet_rules_out_a_block_whose_addresses_its_network_misses() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id int NOT NULL, n inet, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, n inet, PRIMARY KEY (id)); \
          CREATE INDEX t_n ON s.t USING spgist (n);",
     )
     .unwrap();
@@ -779,7 +781,7 @@ fn a_gist_strand_on_a_multirange_keeps_the_span_of_its_ranges() {
 #[test]
 fn a_condition_by_a_gist_operator_is_refused_in_a_partial_index_s_predicate() {
     let got = outcomes(
-        "CREATE TABLE s.t (id int PRIMARY KEY, r int4range);\n\
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, r int4range);\n\
          CREATE INDEX t_r ON s.t (id) WHERE r && '[1,2)';",
     );
     assert!(
@@ -792,7 +794,7 @@ fn a_condition_by_a_gist_operator_is_refused_in_a_partial_index_s_predicate() {
 
 #[test]
 fn an_exclude_constraint_is_read_as_postgresql_19_reads_it() {
-    let table = "CREATE TABLE s.b (id int PRIMARY KEY, room int, during int4range, \
+    let table = "CREATE SCHEMA s; CREATE TABLE s.b (id int PRIMARY KEY, room int, during int4range, \
                  EXCLUDE USING gist (during WITH &&), \
                  CONSTRAINT b_code EXCLUDE USING btree (room WITH =) WHERE (id > 100));";
     let reading = Catalog::read(table).unwrap();
@@ -831,7 +833,7 @@ fn an_exclude_constraint_is_read_as_postgresql_19_reads_it() {
         ),
     ] {
         let got = outcomes(&format!(
-            "CREATE TABLE s.c (id int PRIMARY KEY, a int, r int4range, {constraint});"
+            "CREATE SCHEMA s; CREATE TABLE s.c (id int PRIMARY KEY, a int, r int4range, {constraint});"
         ));
         let e = got[0]
             .as_deref()
@@ -853,7 +855,7 @@ fn refused(w: &mut Snail, sql: &str, why: &str) {
 #[cfg(feature = "standalone")]
 fn bookings(name: &str) -> std::path::PathBuf {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.b (id int PRIMARY KEY, room int, during int4range, \
+        "CREATE SCHEMA s; CREATE TABLE s.b (id int PRIMARY KEY, room int, during int4range, \
          EXCLUDE USING gist (during WITH &&), \
          CONSTRAINT b_code EXCLUDE USING btree (room WITH =) WHERE (id > 100));",
     )
@@ -964,7 +966,7 @@ fn a_writer_whose_value_conflicts_with_another_s_uncommitted_waits_and_is_refuse
 #[test]
 fn write_and_a_snail_of_format_eight_refuse_an_exclude_by_name() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a), \
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a), \
          CONSTRAINT t_b EXCLUDE (b WITH =));",
     )
     .unwrap();
@@ -1003,7 +1005,7 @@ fn write_and_a_snail_of_format_eight_refuse_an_exclude_by_name() {
 fn writers_of_one_exclude_s_strand_take_turns_whatever_blocks_they_write() {
     use std::time::Duration;
     let catalog =
-        Catalog::parse("CREATE TABLE s.w (id int PRIMARY KEY, room int, EXCLUDE (room WITH =));")
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.w (id int PRIMARY KEY, room int, EXCLUDE (room WITH =));")
             .unwrap();
     let path = tmp("exclude-turns.snail");
     write(&path, &catalog, &[]).unwrap();

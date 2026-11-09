@@ -14,7 +14,7 @@ use warren_snail::write::Rows;
 use weather::{ints, tmp, write};
 
 /// Two tables: `s.a`, six rows keyed by id, two to each `g`; `s.t`, five, NULLs in its fourth.
-const DDL: &str = "CREATE TABLE s.a (id bigint PRIMARY KEY, g integer NOT NULL, name text NOT NULL);\n\
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.a (id bigint PRIMARY KEY, g integer NOT NULL, name text NOT NULL);\n\
     CREATE TABLE s.t (id integer PRIMARY KEY, n integer, e text);";
 
 fn made(name: &str) -> std::path::PathBuf {
@@ -156,7 +156,7 @@ fn tablesample_takes_none_at_0_every_row_at_100_and_refuses_in_postgresql_s_word
 fn a_sample_draws_by_the_counts_and_reads_only_the_pages_of_what_it_draws() {
     let n = 16_384i64;
     let path = tmp("wrongs-drawn.snail");
-    let ddl = "CREATE TABLE s.r (id bigint PRIMARY KEY, v integer NOT NULL);";
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.r (id bigint PRIMARY KEY, v integer NOT NULL);";
     let ids: Vec<i64> = (0..n).collect();
     let rows = Rows { columns: vec![ints(&ids), ints(&ids)] };
     write(&path, &Catalog::parse(ddl).unwrap(), &[("s.r".into(), rows)]).unwrap();
@@ -311,7 +311,7 @@ fn what_sqlparser_takes_past_postgresql_s_grammar_is_refused_in_its_words() {
 #[test]
 fn a_record_of_one_field_made_in_from_is_its_field_and_a_declared_type_is_named_alone() {
     let path = tmp("wrongs-populate.snail");
-    let ddl = "CREATE TYPE s.tc AS (a integer);\nCREATE TYPE s.c2 AS (a integer, b text);\n\
+    let ddl = "CREATE SCHEMA s; CREATE TYPE s.tc AS (a integer);\nCREATE TYPE s.c2 AS (a integer, b text);\n\
                CREATE TABLE s.one (a integer PRIMARY KEY);";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let mut s = Snail::open(&path).unwrap();
@@ -345,7 +345,7 @@ fn gist_takes_inet_s_class_unnamed_only_from_release_19() {
         ("CREATE INDEX n_ip ON s.n USING spgist (ip);", None),
         ("CREATE TABLE s.m (id integer PRIMARY KEY, ip inet, EXCLUDE USING gist (ip WITH &&));", Some("inet")),
     ] {
-        let ddl = format!("CREATE TABLE s.n (id integer PRIMARY KEY, ip inet, c cidr);\n{ddl}");
+        let ddl = format!("CREATE SCHEMA s; CREATE TABLE s.n (id integer PRIMARY KEY, ip inet, c cidr);\n{ddl}");
         let catalog = Catalog::parse(&ddl).unwrap();
         for release in [18, 19] {
             let path = tmp("wrongs-gist.snail");
@@ -373,7 +373,7 @@ fn gist_takes_inet_s_class_unnamed_only_from_release_19() {
 #[test]
 fn a_composite_s_text_field_is_compared_and_ordered_under_its_collation() {
     let path = tmp("wrongs-collated.snail");
-    let ddl = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
+    let ddl = "CREATE SCHEMA s; CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
                CREATE TYPE s.cc AS (v text COLLATE s.ci);\n\
                CREATE TYPE s.ce AS (v text COLLATE \"en-x-icu\");\n\
                CREATE TABLE s.ct (id integer PRIMARY KEY, c s.cc, e s.ce);";
@@ -404,7 +404,7 @@ fn a_composite_s_text_field_is_compared_and_ordered_under_its_collation() {
 fn an_order_on_a_composite_s_collated_field_records_its_version_and_is_refused_under_another() {
     use warren_snail::collations::{open, Spec};
     let path = tmp("wrongs-collated-order.snail");
-    let ddl = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
+    let ddl = "CREATE SCHEMA s; CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
                CREATE TYPE s.cc AS (v text COLLATE s.ci);\n\
                CREATE TABLE s.ct (id integer PRIMARY KEY, c s.cc);\n\
                CREATE INDEX ct_c ON s.ct (c, id);";
@@ -470,7 +470,7 @@ fn an_order_on_a_composite_s_collated_field_records_its_version_and_is_refused_u
 #[cfg(not(feature = "collations"))]
 #[test]
 fn a_composite_s_field_under_a_library_collation_is_refused_by_name_without_the_feature() {
-    let ddl = "CREATE TYPE s.ce AS (v text COLLATE \"en-x-icu\");\n\
+    let ddl = "CREATE SCHEMA s; CREATE TYPE s.ce AS (v text COLLATE \"en-x-icu\");\n\
                CREATE TABLE s.ct (id integer PRIMARY KEY, c s.ce);";
     let e = Catalog::parse(ddl).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(e.contains("s.ct.c") && e.contains("COLLATE en-x-icu"), "{e}");
@@ -483,7 +483,7 @@ mod written {
     #[test]
     fn a_domain_is_cast_to_and_a_row_of_a_domain_s_column_keeps_its_domain() {
         let path = tmp("wrongs-domain.snail");
-        let ddl = "CREATE DOMAIN s.posint AS integer CHECK (VALUE > 0);\n\
+        let ddl = "CREATE SCHEMA s; CREATE DOMAIN s.posint AS integer CHECK (VALUE > 0);\n\
                    CREATE DOMAIN s.nn AS integer NOT NULL;\n\
                    CREATE TYPE s.rp AS (d s.posint);\n\
                    CREATE TABLE s.dt (id integer PRIMARY KEY, d s.posint, r s.rp);";
@@ -535,7 +535,7 @@ mod written {
     #[test]
     fn a_row_a_pipeline_finds_is_its_block_s_whatever_numeric_it_holds() {
         let path = tmp("wrongs-numeric.snail");
-        let ddl = "CREATE TABLE s.b (id bigint PRIMARY KEY, v integer, w numeric(10,2), x numeric, \
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.b (id bigint PRIMARY KEY, v integer, w numeric(10,2), x numeric, \
                    y numeric(30,4));";
         write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
         let mut w = Snail::open_writing(&path).unwrap();

@@ -11,7 +11,7 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{fresh, ints64, span, tmp, write};
 
-const DDL: &str = "CREATE TABLE s.t (id bigint NOT NULL, k integer, w integer NOT NULL, \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, k integer, w integer NOT NULL, \
                    m integer NOT NULL, PRIMARY KEY (id));
                    CREATE INDEX t_k ON s.t (k, id);
                    ALTER TABLE s.t CLUSTER ON t_k;
@@ -157,7 +157,7 @@ fn a_level_whose_places_lie_several_to_a_page_is_bounded_by_its_pages() {
     assert!(none.directory_pages < l.directory_pages);
 }
 
-const GAPS: &str = "CREATE TABLE s.g (id bigint NOT NULL, g integer NOT NULL, d bigint NOT NULL, \
+const GAPS: &str = "CREATE SCHEMA s; CREATE TABLE s.g (id bigint NOT NULL, g integer NOT NULL, d bigint NOT NULL, \
                     PRIMARY KEY (id));
                     CREATE INDEX g_g ON s.g (g, id);
                     ALTER TABLE s.g CLUSTER ON g_g;
@@ -233,7 +233,7 @@ fn a_key_held_once_is_not_walked() {
     );
     // No order leads with a column no index names first.
     let catalog = Catalog::parse(
-        "CREATE TABLE s.u (a integer NOT NULL, b integer NOT NULL, PRIMARY KEY (a, b));",
+        "CREATE SCHEMA s; CREATE TABLE s.u (a integer NOT NULL, b integer NOT NULL, PRIMARY KEY (a, b));",
     )
     .unwrap();
     let path = tmp("level-none.snail");
@@ -346,7 +346,7 @@ fn pages_count_their_live_rows_and_a_block_s_new_rows_may_lie_on_any_of_its_plac
 fn paired(name: &str) -> std::path::PathBuf {
     let path = tmp(name);
     let catalog = Catalog::parse(
-        "CREATE TABLE s.p (id bigint NOT NULL, g integer NOT NULL, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.p (id bigint NOT NULL, g integer NOT NULL, PRIMARY KEY (id));
          CREATE INDEX p_g ON s.p (g, id);",
     )
     .unwrap();
@@ -399,7 +399,7 @@ fn dead_rows_are_no_place_s_and_new_rows_may_be_any_of_their_block_s() {
     }
 }
 
-const KINDS: &str = "CREATE TABLE s.k (id bigint NOT NULL, t text NOT NULL, b bytea NOT NULL, \
+const KINDS: &str = "CREATE SCHEMA s; CREATE TABLE s.k (id bigint NOT NULL, t text NOT NULL, b bytea NOT NULL, \
                      u uuid NOT NULL, n numeric(10, 2) NOT NULL, x numeric NOT NULL, \
                      z timestamptz NOT NULL, d date NOT NULL, v interval NOT NULL, \
                      f real NOT NULL, g double precision NOT NULL, j jsonb NOT NULL, \
@@ -596,7 +596,7 @@ fn a_long_text_at_a_block_s_end_is_exact_only_where_its_last_page_is_read() {
 #[test]
 #[cfg(not(feature = "collations"))]
 fn a_column_under_a_library_this_build_holds_none_for_is_carried_without_bounds() {
-    let ddl = "CREATE TABLE s.c (id bigint NOT NULL, u text COLLATE \"und-x-icu\", \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.c (id bigint NOT NULL, u text COLLATE \"und-x-icu\", \
                PRIMARY KEY (id));";
     let catalog = Catalog::parse_kept(ddl, usize::MAX).unwrap();
     let rows = Rows {

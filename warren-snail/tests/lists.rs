@@ -166,7 +166,7 @@ fn an_operator_class_is_held_where_an_index_of_it_is_taken() {
         .contains(" c integer[]);"));
     assert!(named(&of, "enum_ops USING btree")
         .probe
-        .starts_with("CREATE TYPE census.e AS ENUM ('a', 'b');"));
+        .starts_with("CREATE SCHEMA census;\nCREATE TYPE census.e AS ENUM ('a', 'b');"));
     assert_eq!(
         named(&of, "oidvector_ops USING btree").refused.as_deref(),
         None

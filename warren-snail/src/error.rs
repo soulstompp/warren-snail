@@ -129,6 +129,8 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("DROP INDEX CONCURRENTLY does not support "), "0A000"),
     (Words::Holds("permission denied: \"", "\" is a system catalog"), "42501"),
     (Words::Holds("schema \"", "\" does not exist"), "3F000"),
+    (Words::Is("no schema has been selected to create in"), "3F000"),
+    (Words::Holds("type \"", "\" does not exist"), "42704"),
     (Words::Starts("unacceptable schema name \""), "42939"),
     (Words::Holds("cannot drop ", " because it is required by the database system"), "2BP01"),
     (

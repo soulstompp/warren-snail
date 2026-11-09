@@ -15,7 +15,7 @@ use warren_snail::write::Rows;
 use weather::{span, tmp, write};
 
 const DDL: &str = "CREATE TABLE t (id bigint PRIMARY KEY, n text); \
-     CREATE TABLE s.u (id bigint PRIMARY KEY, t_id bigint REFERENCES t (id)); \
+     CREATE SCHEMA s; CREATE TABLE s.u (id bigint PRIMARY KEY, t_id bigint REFERENCES t (id)); \
      CREATE TYPE mood AS ENUM ('sad', 'ok'); \
      CREATE TABLE \"Mixed\" (id integer PRIMARY KEY); \
      CREATE TABLE pg_class (id integer PRIMARY KEY); \

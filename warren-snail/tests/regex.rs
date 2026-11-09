@@ -34,7 +34,7 @@ fn snail(name: &str) -> Snail {
 fn snail_after(name: &str, before: &str) -> Snail {
     let path = tmp(&format!("{name}.snail"));
     let catalog = Catalog::parse(&format!(
-        "{before} CREATE TABLE s.t (id integer NOT NULL, t text, p text, PRIMARY KEY (id));"
+        "CREATE SCHEMA s; {before} CREATE TABLE s.t (id integer NOT NULL, t text, p text, PRIMARY KEY (id));"
     ))
     .unwrap();
     let columns = vec![

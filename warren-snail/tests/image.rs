@@ -18,7 +18,7 @@ fn made(name: &str, ddl: &str) -> std::path::PathBuf {
 }
 
 fn empty(name: &str) -> Snail {
-    Snail::open(&made(name, "CREATE TABLE s.e (id integer PRIMARY KEY);")).unwrap()
+    Snail::open(&made(name, "CREATE SCHEMA s; CREATE TABLE s.e (id integer PRIMARY KEY);")).unwrap()
 }
 
 /// An answer's rows, each cell as arrow writes it, NULL as "NULL".
@@ -287,7 +287,7 @@ fn the_operator_is_one_word_as_postgresql_s_lexer_reads_it() {
 fn the_order_of_the_image_is_refused_by_name() {
     let mut s = Snail::open(&made(
         "order",
-        "CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.t (id integer PRIMARY KEY, a s.c, b s.c);",
+        "CREATE SCHEMA s; CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.t (id integer PRIMARY KEY, a s.c, b s.c);",
     ))
     .unwrap();
     for op in ["*<", "*<=", "*>", "*>="] {
@@ -308,7 +308,7 @@ fn the_order_of_the_image_is_refused_by_name() {
         }
     }
     let e = Catalog::parse(
-        "CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.t (id integer PRIMARY KEY, a s.c);\n\
+        "CREATE SCHEMA s; CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.t (id integer PRIMARY KEY, a s.c);\n\
          CREATE INDEX i ON s.t (a record_image_ops);",
     )
     .err()
@@ -374,7 +374,7 @@ fn a_row_constructor_compared_otherwise_stays_unread() {
 
 #[test]
 fn a_string_holding_the_operator_asks_nothing_of_it() {
-    let catalog = Catalog::parse("CREATE TABLE s.t (id bigint PRIMARY KEY, n text);").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (id bigint PRIMARY KEY, n text);").unwrap();
     let path = tmp("image-string.snail");
     let n = 8192i64;
     write(
@@ -409,7 +409,7 @@ fn a_string_holding_the_operator_asks_nothing_of_it() {
 mod written {
     use super::*;
 
-    const DDL: &str = "CREATE TYPE s.c AS (n numeric);\n\
+    const DDL: &str = "CREATE SCHEMA s; CREATE TYPE s.c AS (n numeric);\n\
         CREATE TYPE s.g AS (f double precision, r real, i interval, h char(3), j jsonb);\n\
         CREATE TABLE s.t (id integer PRIMARY KEY, a s.c, b s.c, g s.g, h s.g);";
 
@@ -568,8 +568,8 @@ mod written {
     #[test]
     fn two_snails_read_the_operator_across() {
         let (a, b) = (
-            made("across-a", "CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.a (id integer PRIMARY KEY, v s.c);"),
-            made("across-b", "CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.b (id integer PRIMARY KEY, v s.c);"),
+            made("across-a", "CREATE SCHEMA s; CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.a (id integer PRIMARY KEY, v s.c);"),
+            made("across-b", "CREATE SCHEMA s; CREATE TYPE s.c AS (n numeric);\nCREATE TABLE s.b (id integer PRIMARY KEY, v s.c);"),
         );
         Snail::open_writing(&a)
             .unwrap()
@@ -594,7 +594,7 @@ mod written {
 
     #[test]
     fn a_check_and_a_view_read_the_operator() {
-        let ddl = "CREATE TYPE s.c AS (n numeric);\n\
+        let ddl = "CREATE SCHEMA s; CREATE TYPE s.c AS (n numeric);\n\
             CREATE TABLE s.t (id integer PRIMARY KEY, a s.c, b s.c, CONSTRAINT alike CHECK (a *= b));\n\
             CREATE VIEW s.v AS SELECT id, a *= b AS i FROM s.t;";
         let mut w = Snail::open_writing(&made("check", ddl)).unwrap();
@@ -612,7 +612,7 @@ mod written {
 #[cfg(all(feature = "standalone", feature = "collations"))]
 #[test]
 fn text_under_a_collation_is_its_bytes() {
-    let ddl = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
+    let ddl = "CREATE SCHEMA s; CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
         CREATE TYPE s.c AS (v text COLLATE s.ci);\n\
         CREATE TABLE s.t (id integer PRIMARY KEY, a s.c, b s.c);";
     let mut w = Snail::open_writing(&made("collated", ddl)).unwrap();

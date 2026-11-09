@@ -40,7 +40,7 @@ fn a_numeric_of_19_to_38_digits_is_cut_by_its_decimal_digits() {
     // where the numbers' bits would cut at powers of two.
     let path = tmp("numeric-cut.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.k (v numeric(38,0) NOT NULL, PRIMARY KEY (v));").unwrap();
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.k (v numeric(38,0) NOT NULL, PRIMARY KEY (v));").unwrap();
     let step = 10i128.pow(20);
     let rows = Rows {
         columns: vec![Values::Wide(
@@ -73,7 +73,7 @@ fn a_condition_on_a_numeric_of_19_to_38_digits_off_the_levels_rules_blocks_out_b
     // numeric are made from its decimal's and its kind's.
     let path = tmp("numeric-wide-rest.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.w (id integer NOT NULL, w numeric(38,0), PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.w (id integer NOT NULL, w numeric(38,0), PRIMARY KEY (id));",
     )
     .unwrap();
     let step = 10i128.pow(20);
@@ -122,7 +122,7 @@ fn a_numeric_held_as_its_text_is_cut_by_its_class_and_answers_its_own_text() {
     // answers its own text.
     let path = tmp("numeric-text.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id integer NOT NULL, v numeric NOT NULL, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v numeric NOT NULL, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t (v, id);",
     )
     .unwrap();
@@ -196,7 +196,7 @@ fn nan_lies_on_a_kind_leaf_beside_a_numeric_s_decimal() {
     use arrow::array::Decimal128Array;
     let path = tmp("numeric-nan.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.n (id integer NOT NULL, a numeric(5,2), w numeric(30,2), \
+        "CREATE SCHEMA s; CREATE TABLE s.n (id integer NOT NULL, a numeric(5,2), w numeric(30,2), \
          PRIMARY KEY (id)); \
          CREATE TABLE s.k (v numeric(5,2) NOT NULL, PRIMARY KEY (v));",
     )
@@ -403,7 +403,7 @@ fn nan_lies_on_a_kind_leaf_beside_a_numeric_s_decimal() {
 fn nan_in_an_array_or_a_composite_lies_on_its_element_s_kind_leaf() {
     let path = tmp("numeric-nan-composed.snail");
     let catalog = Catalog::parse(
-        "CREATE TYPE s.priced AS (a integer, n numeric(5,2)); \
+        "CREATE SCHEMA s; CREATE TYPE s.priced AS (a integer, n numeric(5,2)); \
          CREATE TABLE s.r (id integer NOT NULL, p s.priced, a numeric(5,2)[], w numeric(30,2)[], \
          PRIMARY KEY (id));",
     )
@@ -503,7 +503,7 @@ fn b_of(s: &mut Snail) -> arrow::array::RecordBatch {
 fn a_sum_past_128_bits_is_held_whole() {
     let path = tmp("numeric-sum.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.m (id integer NOT NULL, v numeric(38,0), PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.m (id integer NOT NULL, v numeric(38,0), PRIMARY KEY (id)); \
          CREATE TABLE s.h (id integer NOT NULL, v numeric(38,0), PRIMARY KEY (id));",
     )
     .unwrap();
@@ -552,7 +552,7 @@ fn a_snail_of_format_eight_refuses_a_numeric_past_18_digits_and_a_nan_by_name() 
             "s.k.v is numeric",
         ),
     ] {
-        let catalog = Catalog::parse(ddl).unwrap();
+        let catalog = Catalog::parse(&format!("CREATE SCHEMA s; {ddl}")).unwrap();
         let e = warren_snail::write::write_format_eight(
             &tmp("numeric-eight.snail"),
             &catalog,
@@ -568,7 +568,7 @@ fn a_snail_of_format_eight_refuses_a_numeric_past_18_digits_and_a_nan_by_name() 
         );
     }
     let catalog =
-        Catalog::parse("CREATE TABLE s.k (id integer NOT NULL, v numeric(5,2), PRIMARY KEY (id));")
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.k (id integer NOT NULL, v numeric(5,2), PRIMARY KEY (id));")
             .unwrap();
     let rows = Rows {
         columns: vec![
@@ -650,7 +650,7 @@ fn a_pipeline_computes_a_numeric_at_numeric_c_s_scales() {
     // Each answer read from PostgreSQL 18.6, 2026-10-30.
     let path = tmp("numeric-pipeline.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.p (id integer NOT NULL, v numeric(5,2), PRIMARY KEY (id));")
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, v numeric(5,2), PRIMARY KEY (id));")
             .unwrap();
     let rows = Rows {
         columns: vec![
@@ -710,7 +710,7 @@ fn a_pipeline_computes_a_numeric_at_numeric_c_s_scales() {
 fn a_numeric_is_written_held_to_its_typmod_and_assigned_as_postgresql_assigns_it() {
     let path = tmp("numeric-assign.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.a (id integer NOT NULL, t numeric(3,-1), m money, n numeric, \
+        "CREATE SCHEMA s; CREATE TABLE s.a (id integer NOT NULL, t numeric(3,-1), m money, n numeric, \
          PRIMARY KEY (id)); \
          CREATE TABLE s.f (id integer NOT NULL, d double precision, PRIMARY KEY (id)); \
          CREATE TABLE s.b (id integer NOT NULL, m money, PRIMARY KEY (id));",
@@ -762,7 +762,7 @@ fn a_numeric_s_sum_by_a_text_s_codes_leaves_its_nan_to_the_rows() {
     // 2,000 rows of two stores, read by their codes: the sum of one of them holds a NaN.
     let path = tmp("numeric-run.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.r (id integer NOT NULL, g text NOT NULL, v numeric(5,2), \
+        "CREATE SCHEMA s; CREATE TABLE s.r (id integer NOT NULL, g text NOT NULL, v numeric(5,2), \
          PRIMARY KEY (id));",
     )
     .unwrap();
@@ -796,7 +796,7 @@ fn a_numeric_s_sum_by_a_text_s_codes_leaves_its_nan_to_the_rows() {
 fn a_pipeline_divides_integers_as_postgresql_does() {
     let path = tmp("numeric-int.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.i (id integer NOT NULL, PRIMARY KEY (id));").unwrap();
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.i (id integer NOT NULL, PRIMARY KEY (id));").unwrap();
     let rows = Rows {
         columns: vec![Values::Int(vec![Some(7), Some(-7)])],
     };
@@ -829,7 +829,7 @@ fn a_pipeline_divides_integers_as_postgresql_does() {
 fn a_numeric_past_18_digits_is_assigned_from_an_answer() {
     let path = tmp("numeric-select.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.x (id integer NOT NULL, v numeric(30,2), PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.x (id integer NOT NULL, v numeric(30,2), PRIMARY KEY (id)); \
          CREATE TABLE s.y (id integer NOT NULL, v numeric(30,4), PRIMARY KEY (id));",
     )
     .unwrap();
@@ -860,7 +860,7 @@ fn a_numeric_held_as_its_text_goes_out_naming_no_sorting_column() {
     // Its rows lie in their classes' order, 2 before 10, which is not its text's.
     let path = tmp("numeric-text-out.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.u (v numeric NOT NULL, PRIMARY KEY (v));").unwrap();
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.u (v numeric NOT NULL, PRIMARY KEY (v));").unwrap();
     let rows = Rows {
         columns: vec![Values::Text(vec![Some("2".into()), Some("10".into())])],
     };

@@ -13,7 +13,7 @@ use warren_snail::values::{push_datum, Values};
 use warren_snail::write::Rows;
 use weather::{one, tmp, write};
 
-const DDL: &str = "CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
 const ROWS: i32 = 2048;
 /// Two rows of the second block, which holds every sixteenth id from 16,384.
 const C: i32 = 17600;
@@ -102,7 +102,7 @@ fn the_rows_written_lie_in_one_block() {
 /// A table whose rows lie in one block on its order and in two on a strand, so that each transaction
 /// reads its own rows along the strand without looking at the other's.
 const STRANDED: &str =
-    "CREATE TABLE s.i (id integer NOT NULL, g integer NOT NULL, v integer NOT NULL, \
+    "CREATE SCHEMA s; CREATE TABLE s.i (id integer NOT NULL, g integer NOT NULL, v integer NOT NULL, \
                         PRIMARY KEY (id)); CREATE INDEX i_g ON s.i (g);";
 
 fn stranded(name: &str) -> PathBuf {
@@ -704,7 +704,7 @@ fn a_transaction_s_rows_count_in_the_round_s_room() {
 #[test]
 fn a_foreign_key_at_one_snapshot_meets_rows_by_their_keys() {
     let path = tmp("beside-foreign.snail");
-    let ddl = "CREATE TABLE s.p (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
                CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p (id), PRIMARY KEY (id));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let (mut a, mut b) = (open(&path), open(&path));
@@ -770,7 +770,7 @@ fn a_foreign_key_at_one_snapshot_meets_rows_by_their_keys() {
 #[test]
 fn an_exclude_at_one_snapshot_meets_what_is_committed_and_its_own_rows() {
     let path = tmp("beside-exclude.snail");
-    let ddl = "CREATE TABLE s.x (id integer NOT NULL, during int4range, PRIMARY KEY (id), \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.x (id integer NOT NULL, during int4range, PRIMARY KEY (id), \
                EXCLUDE USING gist (during WITH &&));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let (mut a, mut b) = (open(&path), open(&path));
@@ -878,7 +878,7 @@ fn an_older_format_refuses_a_write_of_a_block_written_since_by_name() {
 #[test]
 fn a_child_written_beside_a_key_taken_is_refused_at_the_commit() {
     let path = tmp("beside-keys-commit.snail");
-    let ddl = "CREATE TABLE s.p (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
                CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p (id), PRIMARY KEY (id));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let (mut a, mut b) = (open(&path), open(&path));
@@ -914,7 +914,7 @@ fn a_row_past_the_bytes_a_transaction_names_is_met_at_its_commit() {
 #[test]
 fn a_table_another_declared_an_order_of_since_refuses_its_rows() {
     let path = tmp("beside-declared.snail");
-    let ddl = "CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
                CREATE TABLE s.e (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let (mut a, mut b) = (open(&path), open(&path));
@@ -961,7 +961,7 @@ fn a_table_declared_in_the_transaction_takes_its_rows_at_its_commit() {
 #[test]
 fn rows_of_every_kind_of_value_are_found_on_the_newest_version_by_their_values() {
     let path = tmp("beside-kinds.snail");
-    let ddl = "CREATE TABLE s.k (id integer NOT NULL, t text, n numeric(30, 2), u uuid, a integer[], \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.k (id integer NOT NULL, t text, n numeric(30, 2), u uuid, a integer[], \
                i interval, f double precision, d timestamptz, r int4range, j jsonb, PRIMARY KEY (id));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let (mut a, mut b) = (open(&path), open(&path));
@@ -1017,7 +1017,7 @@ fn rows_of_every_kind_of_value_are_found_on_the_newest_version_by_their_values()
 #[test]
 fn a_period_key_on_a_block_written_since_is_refused_by_the_block() {
     let path = tmp("beside-period.snail");
-    let ddl = "CREATE TABLE s.tp (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.tp (id int4range, valid int4range, PRIMARY KEY (id, valid WITHOUT OVERLAPS)); \
                CREATE TABLE s.tc (id integer NOT NULL, pid int4range, valid int4range, PRIMARY KEY (id), \
                FOREIGN KEY (pid, PERIOD valid) REFERENCES s.tp);";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
@@ -1054,7 +1054,7 @@ fn a_period_key_on_a_block_written_since_is_refused_by_the_block() {
 #[test]
 fn a_cascade_at_one_snapshot_takes_the_children_it_reads_and_its_commit_meets_another_s() {
     let path = tmp("beside-cascade.snail");
-    let ddl = "CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.p (id integer NOT NULL, PRIMARY KEY (id)); \
                CREATE TABLE s.c (id integer NOT NULL, r integer REFERENCES s.p (id) ON DELETE CASCADE, \
                PRIMARY KEY (id));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();

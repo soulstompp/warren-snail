@@ -16,7 +16,7 @@ use warren_snail::values::{push_datum, Values};
 use warren_snail::write::Rows;
 use weather::{fresh, tmp, write};
 
-const DDL: &str = "CREATE TABLE s.a (id bigint NOT NULL, g bigint NOT NULL, name text NOT NULL, \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.a (id bigint NOT NULL, g bigint NOT NULL, name text NOT NULL, \
                    PRIMARY KEY (id));
      CREATE TABLE s.b (id bigint NOT NULL, a_id bigint NOT NULL, v bigint NOT NULL, \
                    PRIMARY KEY (id));

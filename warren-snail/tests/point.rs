@@ -144,7 +144,7 @@ fn a_value_that_fixes_no_further_level_prices_no_point() {
         .is_err());
 }
 
-const BUYS: &str = "CREATE FUNCTION s.clock(timestamptz) RETURNS timestamp IMMUTABLE LANGUAGE sql \
+const BUYS: &str = "CREATE SCHEMA s; CREATE FUNCTION s.clock(timestamptz) RETURNS timestamp IMMUTABLE LANGUAGE sql \
                     AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
                     CREATE TABLE s.b (buy_id bigint NOT NULL, set_id integer NOT NULL, paid integer, \
                     at timestamptz NOT NULL, PRIMARY KEY (buy_id));

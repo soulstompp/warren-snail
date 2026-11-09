@@ -13,7 +13,7 @@ use warren_snail::read::Snail;
 use warren_snail::write::Rows;
 use weather::{tmp, write};
 
-const DDL: &str = "CREATE TYPE s.mood AS ENUM ('sad', 'ok', 'happy'); \
+const DDL: &str = "CREATE SCHEMA s; CREATE TYPE s.mood AS ENUM ('sad', 'ok', 'happy'); \
     CREATE TABLE s.t (id integer NOT NULL, p point, q point, b box, c circle, pa path, sg lseg, \
     i inet, ci cidr, m macaddr, m8 macaddr8, a bit varying, bb bit varying, e s.mood, u uuid, \
     sn pg_snapshot, t tid, o oid, n integer, PRIMARY KEY (id));";

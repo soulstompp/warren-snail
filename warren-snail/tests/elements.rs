@@ -209,7 +209,7 @@ fn texts_of(b: &arrow::array::RecordBatch, c: usize) -> Vec<Option<String>> {
 fn a_composite_of_one_leaf_counts_for_the_cut_by_its_leaf_s_values() {
     // 8,192 rows, each a composite whose one field is NULL: its leaf holds no value, so the bigint
     // key decides the cut, 512 rows a page, where the field's integer would decide at 1,024.
-    let ddl = "CREATE TYPE s.one AS (a integer); \
+    let ddl = "CREATE SCHEMA s; CREATE TYPE s.one AS (a integer); \
         CREATE TABLE s.t (id bigint NOT NULL, o s.one NOT NULL, PRIMARY KEY (id));";
     let path = weather::tmp("elements-one-leaf-cut.snail");
     let c = warren_snail::catalog::Catalog::parse(ddl).unwrap();
@@ -241,7 +241,7 @@ fn a_composite_of_one_leaf_counts_for_the_cut_by_its_leaf_s_values() {
     assert_eq!(rows, [512; 16]);
 }
 
-const ONE_LEAF: &str = "CREATE TYPE s.none AS (); CREATE TYPE s.one AS (a bigint); \
+const ONE_LEAF: &str = "CREATE SCHEMA s; CREATE TYPE s.none AS (); CREATE TYPE s.one AS (a bigint); \
     CREATE TABLE s.t (id integer NOT NULL, n s.none, o s.one, PRIMARY KEY (id));";
 
 #[test]
@@ -546,7 +546,7 @@ fn answer_text(b: &arrow::array::RecordBatch) -> String {
         .join("|")
 }
 
-const QUESTIONS: &str = "CREATE TABLE s.q (id integer NOT NULL, m int4multirange, r int4range, \
+const QUESTIONS: &str = "CREATE SCHEMA s; CREATE TABLE s.q (id integer NOT NULL, m int4multirange, r int4range, \
     a integer[], PRIMARY KEY (id));";
 
 const ROWS: [&[Option<&str>]; 3] = [
@@ -768,7 +768,7 @@ fn p8_an_array_of_a_geometric_type_or_an_aclitem_comes_back_from_its_pages() {
     }
 }
 
-const UNEQUAL: &str = "CREATE TABLE s.u (id integer NOT NULL, j json[], p point[], x xid[], \
+const UNEQUAL: &str = "CREATE SCHEMA s; CREATE TABLE s.u (id integer NOT NULL, j json[], p point[], x xid[], \
     PRIMARY KEY (id));";
 
 #[test]

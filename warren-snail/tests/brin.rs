@@ -38,7 +38,7 @@ fn snail_of(
 ) -> PathBuf {
     let path = tmp(&format!("brin-{name}.snail"));
     let catalog = Catalog::parse(&format!(
-        "CREATE TABLE s.t (id bigint NOT NULL, v {ty}, PRIMARY KEY (id)); {index}"
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v {ty}, PRIMARY KEY (id)); {index}"
     ))
     .unwrap_or_else(|e| panic!("{name}: {e}"));
     let table = catalog.table("s.t").unwrap();
@@ -377,7 +377,7 @@ fn every_brin_operator_class_of_nineteen_is_held() {
 
 #[test]
 fn a_brin_index_is_read_with_its_parameters_and_several_keys_as_postgresql_19_reads_it() {
-    let table = "CREATE TABLE s.t (id int PRIMARY KEY, a int, b int, c text, r int4range);";
+    let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, a int, b int, c text, r int4range);";
     let read = Catalog::read(&format!(
         "{table} CREATE INDEX i ON s.t USING brin (a, b int4_bloom_ops (false_positive_rate = 0.05, \
          n_distinct_per_range = 100), c text_bloom_ops, r range_inclusion_ops) \
@@ -517,7 +517,7 @@ fn a_brin_index_is_read_with_its_parameters_and_several_keys_as_postgresql_19_re
 #[test]
 fn several_keys_and_several_indexes_on_one_column_are_each_summed_and_read() {
     let catalog = Catalog::parse(
-        "CREATE TABLE s.t (id bigint NOT NULL, a integer, b integer, c integer, PRIMARY KEY (id));
+        "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, a integer, b integer, c integer, PRIMARY KEY (id));
          CREATE INDEX t_ab ON s.t USING brin (a int4_bloom_ops, b int4_minmax_multi_ops \
          (values_per_range = 8), c);
          CREATE INDEX t_a2 ON s.t USING brin (a int4_minmax_multi_ops (values_per_range = 8));
@@ -1132,7 +1132,7 @@ fn an_entry_past_a_page_lies_in_the_disk_pages_it_takes_and_reads_its_predicted_
 
 #[test]
 fn a_summary_of_a_month_or_a_scaled_key_reads_the_conditions_on_it() {
-    let clock = "CREATE FUNCTION s.clock(timestamptz) RETURNS timestamp \
+    let clock = "CREATE SCHEMA s; CREATE FUNCTION s.clock(timestamptz) RETURNS timestamp \
                  LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;";
     let path = tmp("brin-month.snail");
     let catalog = Catalog::parse(&format!(
@@ -1222,7 +1222,7 @@ fn a_partial_brin_sums_every_row_and_answers_any_question() {
     assert!(with.blocks_read <= 2, "{with:?}");
     assert_eq!(
         Catalog::parse(
-            "CREATE TABLE s.t (id bigint NOT NULL, v integer, PRIMARY KEY (id)); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v integer, PRIMARY KEY (id)); \
              CREATE INDEX t_v ON s.t USING brin (v) WHERE v > 100;"
         )
         .unwrap()
@@ -1252,11 +1252,13 @@ fn a_table_declaring_no_brin_keeps_its_pages_byte_for_byte() {
     let rows = |n: i64| Rows {
         columns: vec![ints(n, &|i| i), ints(n, &|i| (i * 7919) % 1000)],
     };
+    // Each DDL read as a file's own kept statements, as the build the sum below was taken from read
+    // it: its DDL, kept in the file's pages, names a schema no statement made, as DDL did then.
     let written = |name: &str, ddl: &str, tables: &[(String, Rows)]| {
         let path = tmp(&format!("brin-bytes-{name}.snail"));
         warren_snail::write::write_spanned(
             &path,
-            &Catalog::parse(ddl).unwrap(),
+            &Catalog::parse_kept(ddl, usize::MAX).unwrap(),
             tables,
             &[],
             warren_snail::file::FILE_PAGES,
@@ -1313,7 +1315,7 @@ fn a_snail_of_format_eight_refuses_a_brin_by_name_with_the_way_across() {
     let e = warren_snail::write::write_format_eight(
         &tmp("brin-eight.snail"),
         &Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a)); \
              CREATE INDEX t_b ON s.t USING brin (b);",
         )
         .unwrap(),
@@ -1407,7 +1409,7 @@ fn a_summary_under_a_library_s_collation_sums_each_value_s_key() {
             "ABC",
         ),
     ] {
-        let declared = "CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
+        let declared = "CREATE SCHEMA s; CREATE COLLATION s.ci (provider = icu, locale = 'und-u-ks-level2', \
                         deterministic = false);";
         let path = tmp(&format!("brin-collated-{name}.snail"));
         let catalog = Catalog::parse(&format!(
@@ -1488,7 +1490,7 @@ mod written {
         let path = tmp(&format!("brin-written-{name}.snail"));
         write(
             &path,
-            &Catalog::parse(&format!("CREATE TABLE s.t ({COLUMNS}); {index}")).unwrap(),
+            &Catalog::parse(&format!("CREATE SCHEMA s; CREATE TABLE s.t ({COLUMNS}); {index}")).unwrap(),
             &[],
         )
         .unwrap();
@@ -1736,7 +1738,7 @@ mod written {
         let path = tmp("brin-declared.snail");
         write(
             &path,
-            &Catalog::parse("CREATE TABLE s.t (id bigint NOT NULL, v integer, PRIMARY KEY (id));")
+            &Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v integer, PRIMARY KEY (id));")
                 .unwrap(),
             &[],
         )
@@ -1867,7 +1869,7 @@ mod written {
         write(
             &path,
             &Catalog::parse(
-                "CREATE TABLE s.t (id bigint NOT NULL, v integer, PRIMARY KEY (id)); \
+                "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, v integer, PRIMARY KEY (id)); \
                  CREATE TABLE s.e (id bigint NOT NULL, v integer, PRIMARY KEY (id));",
             )
             .unwrap(),
@@ -1899,7 +1901,7 @@ mod written {
         std::fs::create_dir_all(&dir).unwrap();
         let mut w = Snail::open_writing(&path).unwrap();
         let outs = w.out(&dir).unwrap();
-        let catalog = Catalog::parse(&format!("CREATE TABLE s.t ({COLUMNS}); {INDEXES}")).unwrap();
+        let catalog = Catalog::parse(&format!("CREATE SCHEMA s; CREATE TABLE s.t ({COLUMNS}); {INDEXES}")).unwrap();
         let back = tmp("brin-back.snail");
         warren_snail::write::write_parquet(
             &back,

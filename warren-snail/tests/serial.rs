@@ -19,7 +19,7 @@ use warren_snail::values::{push_datum, Values};
 use warren_snail::write::Rows;
 use weather::{one, tmp, write};
 
-const DDL: &str = "CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
 /// The table's rows, every sixteenth id: two blocks of 1,024, so `A` lies in the first and `B` in
 /// the second, and a row inserted beside either lies in its block.
 const ROWS: i32 = 2048;
@@ -1126,7 +1126,7 @@ fn two_snails(name: &str) -> (PathBuf, PathBuf) {
     let one = made(&format!("{name}-one"));
     let path = tmp(&format!("serial-{name}-two.snail"));
     let catalog = Catalog::parse(
-        "CREATE TABLE o.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));",
+        "CREATE SCHEMA o; CREATE TABLE o.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));",
     )
     .unwrap();
     let table = catalog.table("o.t").unwrap();

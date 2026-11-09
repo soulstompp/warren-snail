@@ -61,7 +61,7 @@ fn snail_of(name: &str, ddl: &str, statements: &[&str]) -> Snail {
 #[cfg(feature = "standalone")]
 fn table(ty: &str) -> String {
     format!(
-        "CREATE TABLE s.t (id integer NOT NULL, v {ty}, PRIMARY KEY (id)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v {ty}, PRIMARY KEY (id)); \
          CREATE INDEX t_v ON s.t (v, id);"
     )
 }
@@ -329,7 +329,7 @@ fn the_pipeline_adds_takes_and_casts_time_as_postgresql_does() {
 fn a_value_is_rounded_to_its_column_s_precision_at_the_write() {
     let mut snail = snail_of(
         "time-rounded",
-        "CREATE TABLE s.t (id integer NOT NULL, v timestamp(1), w timestamp, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v timestamp(1), w timestamp, PRIMARY KEY (id));",
         &[
             "INSERT INTO s.t (id, v, w) VALUES (1, '1999-12-31 23:59:59.95', '2024-01-01 00:00:00.05')",
             "INSERT INTO s.t (id, v) SELECT 2, w FROM s.t WHERE id = 1",
@@ -382,7 +382,7 @@ fn a_setting_set_to_the_value_the_snail_answers_under_does_nothing_and_any_other
 #[test]
 fn a_snail_of_format_8_refuses_an_infinite_instant_on_a_level_by_name() {
     let catalog =
-        Catalog::parse("CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));").unwrap();
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));").unwrap();
     let path = tmp("time-format8.snail");
     let _ = std::fs::remove_file(&path);
     let rows = Rows {
@@ -410,7 +410,7 @@ fn a_snail_of_format_8_refuses_an_infinite_instant_on_a_level_by_name() {
 fn out_names_the_columns_holding_an_infinity_or_24_00() {
     let mut snail = snail_of(
         "time-out",
-        "CREATE TABLE s.t (id integer NOT NULL, d date, t time, s timestamp, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, d date, t time, s timestamp, PRIMARY KEY (id));",
         &["INSERT INTO s.t (id, d, t, s) VALUES (1, '-infinity', '24:00', '2024-01-01'), (2, '2024-01-01', '12:00', '2024-01-02')"],
     );
     let dir = tmp("time-out-dir");
@@ -478,7 +478,7 @@ fn at_time_zone_reads_an_abbreviation_first_as_postgresql_does() {
 fn a_transaction_reads_one_clock_its_start_wherever_postgresql_reads_it() {
     let mut s = snail_of(
         "one-clock",
-        "CREATE TABLE s.t (id integer NOT NULL, at timestamptz, d date, \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, at timestamptz, d date, \
          by timestamptz DEFAULT now(), PRIMARY KEY (id));",
         &[],
     );

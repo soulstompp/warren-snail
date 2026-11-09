@@ -25,7 +25,7 @@ fn blocks_of(rows: &[BlockRow], order: &str, column: &str) -> Vec<u64> {
 fn a_real_is_cut_by_its_key_s_bits_on_the_four_bytes_the_file_writes() {
     // 4,096 reals spread evenly over the keys of the finite reals below 2: 1,024 rows of 4 bytes
     // fill a page, so the cut stops at four parts, as for an integer.
-    let catalog = Catalog::parse("CREATE TABLE s.f (v real NOT NULL, PRIMARY KEY (v));").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.f (v real NOT NULL, PRIMARY KEY (v));").unwrap();
     let reals: Vec<Option<u32>> = (0..4096u32).map(|i| Some(i << 18)).collect();
     let path = tmp("real-cut.snail");
     write(
@@ -44,7 +44,7 @@ fn a_real_is_cut_by_its_key_s_bits_on_the_four_bytes_the_file_writes() {
 }
 
 #[cfg(feature = "standalone")]
-const DDL: &str = "CREATE TABLE s.f (n integer NOT NULL, r real, d double precision, \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.f (n integer NOT NULL, r real, d double precision, \
                    PRIMARY KEY (n)); \
                    CREATE INDEX f_r ON s.f (r DESC, n); \
                    CREATE INDEX f_d ON s.f (d, n);";
@@ -266,7 +266,7 @@ fn a_float_goes_out_as_its_own_bits_and_comes_back() {
 fn a_float_sum_finite_numbers_make_infinite_is_refused() {
     let path = tmp("floats-over.snail");
     let catalog =
-        Catalog::parse("CREATE TABLE s.g (n integer NOT NULL, r real, PRIMARY KEY (n));").unwrap();
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.g (n integer NOT NULL, r real, PRIMARY KEY (n));").unwrap();
     write(&path, &catalog, &[]).unwrap();
     let mut w = Snail::open_writing(&path).unwrap();
     w.execute("INSERT INTO s.g (n, r) VALUES (1, '3e38'), (2, '3e38'), (3, '-1')")
@@ -349,7 +349,7 @@ fn a_float_s_statistics_out_are_those_the_parquet_library_writes() {
     ];
     for (i, values) in cases.iter().enumerate() {
         let ddl =
-            "CREATE TABLE s.f (id integer NOT NULL, r real, d double precision, PRIMARY KEY (id));";
+            "CREATE SCHEMA s; CREATE TABLE s.f (id integer NOT NULL, r real, d double precision, PRIMARY KEY (id));";
         let catalog = Catalog::parse(ddl).unwrap();
         let ids: Vec<i32> = (0..values.len() as i32).collect();
         let path = tmp(&format!("float-statistics-{i}.snail"));

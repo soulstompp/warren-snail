@@ -13,7 +13,7 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{fresh, tmp, write};
 
-const DDL: &str = "CREATE TABLE c.t (id integer NOT NULL, b bigint, i integer, s text, \
+const DDL: &str = "CREATE SCHEMA c; CREATE TABLE c.t (id integer NOT NULL, b bigint, i integer, s text, \
                    v varchar(3), p char(3), m name, PRIMARY KEY (id));";
 
 /// The table's snail: a row of values, and a row of NULLs.
@@ -428,7 +428,7 @@ fn where_no_form_takes_them_or_two_do_the_refusal_is_postgresql_s_before_any_row
 /// A varchar and a bpchar of 70 bytes beside a name.
 fn long_strings(name: &str) -> std::path::PathBuf {
     let path = tmp(&format!("concat-{name}.snail"));
-    let ddl = "CREATE TABLE c.u (id integer NOT NULL, v varchar, p char(70), m name, s text, \
+    let ddl = "CREATE SCHEMA c; CREATE TABLE c.u (id integer NOT NULL, v varchar, p char(70), m name, s text, \
                PRIMARY KEY (id));";
     let text = |v: String| Values::Text(vec![Some(v)]);
     write(

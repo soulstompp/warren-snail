@@ -22,7 +22,7 @@ const FOUND: &str = "t.x BETWEEN 7000 AND 7001";
 fn table(name: &str, types: &str, ty: &str, key: impl Fn(i64) -> String) -> std::path::PathBuf {
     let path = tmp(&format!("keyed-{name}.snail"));
     let ddl =
-        format!("{types} CREATE TABLE s.t (v {ty} NOT NULL, x bigint NOT NULL, PRIMARY KEY (v));");
+        format!("CREATE SCHEMA s; {types} CREATE TABLE s.t (v {ty} NOT NULL, x bigint NOT NULL, PRIMARY KEY (v));");
     let catalog = Catalog::parse(&ddl).unwrap();
     let t = catalog.table("s.t").unwrap();
     let mut v = Values::new(t.columns[0].ty);

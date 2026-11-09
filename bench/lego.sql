@@ -3,6 +3,8 @@
 -- builds on them, each as sqlc-brickgen writes it. One line is the DBA's own: the purchases are
 -- clustered on their index by collection row, which makes it the order the snail lays them out in.
 
+CREATE SCHEMA lego;
+
 CREATE FUNCTION lego.clock(timestamptz) RETURNS timestamp
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
 

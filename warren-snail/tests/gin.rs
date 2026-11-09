@@ -12,12 +12,14 @@ use warren_snail::values::{push_datum, Values};
 use warren_snail::write::Rows;
 use weather::{exact, fresh, tmp, write};
 
-/// Each statement's refusal, or None where it is taken.
+/// Each statement's refusal, or None where it is taken; the schema's CREATE SCHEMA left out, which
+/// no test here is about.
 fn outcomes(ddl: &str) -> Vec<Option<String>> {
     Catalog::read(ddl)
         .unwrap()
         .statements
         .into_iter()
+        .filter(|s| s.kind != "CREATE SCHEMA")
         .map(|s| s.refused)
         .collect()
 }
@@ -67,7 +69,7 @@ fn array_text(v: &[Option<i64>]) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
-const ARRAYS: &str = "CREATE TABLE s.t (id int NOT NULL, a int[], pad bigint, PRIMARY KEY (id)); \
+const ARRAYS: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], pad bigint, PRIMARY KEY (id)); \
                       CREATE INDEX t_a ON s.t USING gin (a);";
 
 fn arrays(name: &str, n: i64) -> std::path::PathBuf {
@@ -304,7 +306,7 @@ fn a_count_of_one_element_is_answered_from_its_counts() {
 
 #[test]
 fn a_gin_index_is_read_or_refused_as_postgresql_reads_it() {
-    let table = "CREATE TABLE s.t (id int PRIMARY KEY, a int[], tx text[], j jsonb, v tsvector, \
+    let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, a int[], tx text[], j jsonb, v tsvector, \
                  q tsquery, js json[], pt point[], n int, c text, r int4range, x xid[], u uuid[]);";
     // Each as PostgreSQL 18.6 and 19 RC1 gave it (2026-11-02).
     let refused = [
@@ -379,7 +381,7 @@ fn a_gin_index_is_read_or_refused_as_postgresql_reads_it() {
     }
     // A table refused takes its strands with it.
     let r = Catalog::read(
-        "CREATE TABLE s.p (id int PRIMARY KEY, g geometry); \
+        "CREATE SCHEMA s; CREATE TABLE s.p (id int PRIMARY KEY, g geometry); \
          CREATE TABLE s.c (id int PRIMARY KEY, a int[], p int REFERENCES s.p); \
          CREATE INDEX e ON s.c USING gin (a);",
     )
@@ -442,7 +444,7 @@ fn a_snail_of_an_old_format_refuses_an_element_strand_by_name() {
         let e = warren_snail::write::write_format_eight(
             &path,
             &Catalog::parse(&format!(
-                "CREATE TABLE s.t (id integer NOT NULL, a int[], v tsvector, PRIMARY KEY (id)); \
+                "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, a int[], v tsvector, PRIMARY KEY (id)); \
                  CREATE INDEX t_x ON s.t {ddl};"
             ))
             .unwrap(),
@@ -461,7 +463,7 @@ fn a_snail_of_an_old_format_refuses_an_element_strand_by_name() {
 
 #[test]
 fn a_table_is_not_clustered_on_an_element_strand() {
-    let table = "CREATE TABLE s.t (id int PRIMARY KEY, a int[], v tsvector);";
+    let table = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, a int[], v tsvector);";
     let got = outcomes(&format!(
         "{table}\nCREATE INDEX e ON s.t USING gin (a);\nALTER TABLE s.t CLUSTER ON e;"
     ));
@@ -531,7 +533,7 @@ fn alike(s: &mut Snail, orders: &[&str], wheres: &[&str]) {
     }
 }
 
-const JSONB: &str = "CREATE TABLE s.t (id int NOT NULL, j jsonb, PRIMARY KEY (id)); \
+const JSONB: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, j jsonb, PRIMARY KEY (id)); \
                      CREATE INDEX t_o ON s.t USING gin (j); \
                      CREATE INDEX t_p ON s.t USING gin (j jsonb_path_ops);";
 
@@ -611,7 +613,7 @@ fn a_jsonb_s_operators_answer_alike_along_its_strands() {
     assert!(round.order.contains("t_o+"), "{round:?}");
 }
 
-const TEXTS: &str = "CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, PRIMARY KEY (id)); \
+const TEXTS: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, PRIMARY KEY (id)); \
                      CREATE INDEX t_g ON s.t USING gin (v); \
                      CREATE INDEX t_s ON s.t USING gist (v tsvector_ops (siglen = 8)); \
                      CREATE INDEX t_q ON s.t USING gist (q);";
@@ -703,7 +705,7 @@ fn a_tsvector_s_match_and_a_tsquery_s_containment_answer_alike_along_their_stran
 
 #[test]
 fn several_keys_of_a_gin_index_are_a_strand_each_read_where_a_condition_asks_it() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], b text[], PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], b text[], PRIMARY KEY (id)); \
                CREATE INDEX t_ab ON s.t USING gin (a, b);";
     let mut s = snail_of("gin-several", ddl, 8192, |i| {
         vec![
@@ -740,7 +742,7 @@ fn several_keys_of_a_gin_index_are_a_strand_each_read_where_a_condition_asks_it(
 
 #[test]
 fn a_partial_gin_index_holds_the_elements_of_the_rows_its_predicate_admits() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], n int, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], n int, PRIMARY KEY (id)); \
                CREATE INDEX t_a ON s.t USING gin (a) WHERE n > 5;";
     let mut s = snail_of("gin-partial", ddl, 4096, |i| {
         vec![
@@ -769,7 +771,7 @@ mod written {
     use super::*;
     use warren_snail::read::Done;
 
-    const DDL: &str = "CREATE TABLE s.t (id int NOT NULL, a int[], pad text, PRIMARY KEY (id)); \
+    const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], pad text, PRIMARY KEY (id)); \
                        CREATE INDEX t_a ON s.t USING gin (a);";
 
     /// A snail of `s.t`, made from `ddl`, holding the rows of ids 0 to n, each array `{i % 7, i % 97 + 100}`.
@@ -1129,7 +1131,7 @@ mod written {
 
     #[test]
     fn a_gin_index_made_on_a_table_holding_rows_is_refused_and_on_an_empty_one_taken() {
-        let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], pad text, PRIMARY KEY (id));";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], pad text, PRIMARY KEY (id));";
         let path = made("gin-declared", ddl, 16);
         let mut s = Snail::open_writing(&path).unwrap();
         let e = s
@@ -1255,7 +1257,7 @@ fn a_scan_begun_along_a_strand_hands_its_blocks_as_a_round_does() {
 
 #[test]
 fn a_join_finds_a_table_s_rows_along_its_strand() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
                CREATE INDEX t_a ON s.t USING gin (a); \
                CREATE TABLE s.u (id int NOT NULL, x bigint, PRIMARY KEY (id));";
     let catalog = Catalog::parse(ddl).unwrap();
@@ -1358,7 +1360,7 @@ mod beside {
 
     #[test]
     fn writers_of_one_block_of_a_strand_take_turns_at_read_committed() {
-        let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
                    CREATE INDEX t_a ON s.t USING gin (a);";
         let path = empty("gin-turns", ddl);
         let mut a = Snail::open_writing(&path).unwrap();
@@ -1391,7 +1393,7 @@ mod beside {
 
     #[test]
     fn a_stored_generated_column_is_routed_as_any_column_is() {
-        let ddl = "CREATE TABLE s.t (id int NOT NULL, c text, v tsvector GENERATED ALWAYS AS \
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, c text, v tsvector GENERATED ALWAYS AS \
                    (to_tsvector('simple', c)) STORED, PRIMARY KEY (id)); \
                    CREATE INDEX t_v ON s.t USING gin (v);";
         let path = empty("gin-generated", ddl);
@@ -1410,12 +1412,12 @@ mod beside {
     fn a_transaction_across_snails_writes_each_strand_and_a_round_reads_them_together() {
         let one = empty(
             "gin-across-a",
-            "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+            "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
              CREATE INDEX t_a ON s.t USING gin (a);",
         );
         let two = empty(
             "gin-across-b",
-            "CREATE TABLE s.u (id int NOT NULL, j jsonb, PRIMARY KEY (id)); \
+            "CREATE SCHEMA s; CREATE TABLE s.u (id int NOT NULL, j jsonb, PRIMARY KEY (id)); \
              CREATE INDEX u_j ON s.u USING gin (j);",
         );
         let mut w = Snails::open_writing(&[&one, &two]).unwrap();
@@ -1444,7 +1446,7 @@ mod beside {
 
 #[test]
 fn a_jsonb_s_operators_are_read_on_its_column_with_no_strand_to_ask() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, j jsonb, v tsvector, PRIMARY KEY (id));";
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, j jsonb, v tsvector, PRIMARY KEY (id));";
     let mut s = snail_of("gin-bare", ddl, 1024, |i| {
         let mut r = jsonb_row(i);
         r.push(Some(format!("'w{}'", i % 7)));
@@ -1472,7 +1474,7 @@ fn a_jsonb_s_operators_are_read_on_its_column_with_no_strand_to_ask() {
 
 #[test]
 fn a_join_handed_over_is_priced_with_the_strand_it_reads() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
                CREATE INDEX t_a ON s.t USING gin (a); \
                CREATE TABLE s.u (id int NOT NULL, x bigint, PRIMARY KEY (id));";
     let catalog = Catalog::parse(ddl).unwrap();
@@ -1529,7 +1531,7 @@ fn a_join_handed_over_is_priced_with_the_strand_it_reads() {
 
 #[test]
 fn an_empty_array_lies_on_the_strand_where_no_array_holds_a_null() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], PRIMARY KEY (id)); \
                CREATE INDEX t_a ON s.t USING gin (a);";
     let n = 20480;
     let mut s = snail_of("gin-empty", ddl, n, |i| {
@@ -1568,7 +1570,7 @@ fn reads_of(round: &Round) -> Vec<(String, u64)> {
         .collect()
 }
 
-const PATHS: &str = "CREATE TABLE s.t (id int NOT NULL, j jsonb, pad bigint, PRIMARY KEY (id)); \
+const PATHS: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, j jsonb, pad bigint, PRIMARY KEY (id)); \
                      CREATE INDEX t_o ON s.t USING gin (j); \
                      CREATE INDEX t_p ON s.t USING gin (j jsonb_path_ops);";
 
@@ -2042,7 +2044,7 @@ fn what_a_path_asks_is_what_each_operator_class_holds() {
 }
 
 const OVER: &str =
-    "CREATE TABLE s.t (id int NOT NULL, a int[], v tsvector, n int, PRIMARY KEY (id)); \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], v tsvector, n int, PRIMARY KEY (id)); \
                     CREATE INDEX t_a ON s.t USING gin (a); \
                     CREATE INDEX t_v ON s.t USING gin (v);";
 const OVER_ROWS: i64 = 20480;
@@ -2509,7 +2511,7 @@ fn a_join_reads_a_side_s_or_along_its_strands() {
 }
 
 const THREE_ATS: &str =
-    "CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, t text, j jsonb, n int, \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, t text, j jsonb, n int, \
                          PRIMARY KEY (id)); \
                          CREATE INDEX t_v ON s.t USING gin (v); \
                          CREATE INDEX t_q ON s.t USING gist (q);";
@@ -2624,7 +2626,7 @@ fn three_ats_read_as_the_match_they_are_where_they_can_be_told_apart() {
 }
 
 const BESIDE: &str =
-    "CREATE TABLE s.t (id int NOT NULL, v tsvector, r int4range, n int, PRIMARY KEY (id)); \
+    "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, v tsvector, r int4range, n int, PRIMARY KEY (id)); \
                       CREATE INDEX t_vr ON s.t USING gist (v, r);";
 
 fn beside_row(i: i64) -> Vec<Option<String>> {
@@ -2639,7 +2641,7 @@ fn beside_row(i: i64) -> Vec<Option<String>> {
 #[test]
 fn a_gist_index_beside_a_key_of_another_kind_holds_a_strand_of_each() {
     let table =
-        "CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, r int4range, m int4multirange, \
+        "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, v tsvector, q tsquery, r int4range, m int4multirange, \
                  i inet, n int, PRIMARY KEY (id));";
     let c = Catalog::parse(&format!(
         "{table}\nCREATE INDEX e ON s.t USING gist (v, r);"
@@ -2707,7 +2709,7 @@ fn a_gist_index_beside_a_key_of_another_kind_holds_a_strand_of_each() {
         "{got:?}"
     );
     let got = outcomes(
-        "CREATE TABLE s.x (id int PRIMARY KEY, v tsvector, r int4range, \
+        "CREATE SCHEMA s; CREATE TABLE s.x (id int PRIMARY KEY, v tsvector, r int4range, \
          EXCLUDE USING gist (v WITH @@, r WITH &&));",
     );
     assert!(
@@ -2937,7 +2939,7 @@ mod beside_writers {
     }
 }
 
-const ARMS: &str = "CREATE TABLE s.t (id int NOT NULL, a int[], v tsvector, r int4range, m int, pad bigint, PRIMARY KEY (id)); \
+const ARMS: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], v tsvector, r int4range, m int, pad bigint, PRIMARY KEY (id)); \
                     CREATE INDEX t_a ON s.t USING gin (a); \
                     CREATE INDEX t_vr ON s.t USING gist (v, r); \
                     CREATE INDEX t_m ON s.t (m);";
@@ -3133,7 +3135,7 @@ fn an_or_on_a_table_an_outer_join_leaves_null_keeps_the_rows_it_leaves() {
 
 #[test]
 fn a_condition_on_the_table_s_own_order_is_read_with_it_not_before_it() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], r int4range, p1 bigint, p2 bigint, p3 bigint, \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], r int4range, p1 bigint, p2 bigint, p3 bigint, \
                p4 bigint, p5 bigint, p6 bigint); \
                CREATE INDEX t_r ON s.t USING gist (r); \
                ALTER TABLE s.t CLUSTER ON t_r; \
@@ -3169,7 +3171,7 @@ fn a_condition_on_the_table_s_own_order_is_read_with_it_not_before_it() {
 
 #[test]
 fn an_or_reads_a_partial_strand_where_what_stands_beside_its_arm_implies_its_predicate() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, a int[], p int[], n int, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, a int[], p int[], n int, PRIMARY KEY (id)); \
                CREATE INDEX t_a ON s.t USING gin (a); \
                CREATE INDEX t_p ON s.t USING gin (p) WHERE n > 5;";
     let n = 20480;
@@ -3215,7 +3217,7 @@ fn an_or_reads_a_partial_strand_where_what_stands_beside_its_arm_implies_its_pre
 
 #[test]
 fn an_or_and_a_not_over_a_strand_s_spans_are_read_with_no_element_key_on_the_table() {
-    let ddl = "CREATE TABLE s.t (id int NOT NULL, r int4range, n int, PRIMARY KEY (id)); \
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int NOT NULL, r int4range, n int, PRIMARY KEY (id)); \
                CREATE INDEX t_r ON s.t USING gist (r);";
     let n = 8192;
     let mut s = snail_of("gin-spans", ddl, n, |i| {

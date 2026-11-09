@@ -13,7 +13,7 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{fresh, tmp};
 
-const DDL: &str = "CREATE TABLE a.w (id integer NOT NULL, g integer, v integer, d double precision, s text, PRIMARY KEY (id));
+const DDL: &str = "CREATE SCHEMA a; CREATE TABLE a.w (id integer NOT NULL, g integer, v integer, d double precision, s text, PRIMARY KEY (id));
      CREATE TABLE a.k (g integer NOT NULL, label text, PRIMARY KEY (g));";
 
 /// The tables' snail, its catalog of `release`.

@@ -257,6 +257,9 @@ pub(crate) fn relation(catalog: &Catalog, table: &str) -> Result<Relation> {
         })
         .collect();
     let mut rows: Vec<HashMap<&str, Option<String>>> = built_in(table, release);
+    if catalog.oids.public_dropped() {
+        rows.retain(|r| !of_public(table, r));
+    }
     let file = File::of(catalog);
     rows.extend(file.rows(table)?);
     if table == "pg_type" {
@@ -278,6 +281,19 @@ pub(crate) fn relation(catalog: &Catalog, table: &str) -> Result<Relation> {
         refused,
         rows,
     })
+}
+
+/// Whether a carried row is the release's `public`'s, which a DROP SCHEMA public takes: its row of
+/// pg_namespace, its comment and its initial privileges.
+fn of_public(table: &str, r: &HashMap<&str, Option<String>>) -> bool {
+    let is = |c: &str, v: u32| r.get(c).cloned().flatten() == Some(v.to_string());
+    match table {
+        "pg_namespace" => is("oid", crate::oids::PUBLIC),
+        "pg_description" | "pg_init_privs" => {
+            is("objoid", crate::oids::PUBLIC) && is("classoid", crate::deparse::depend::NAMESPACE)
+        }
+        _ => false,
+    }
 }
 
 /// The rows of a catalog table the file's own objects make, none for a table they make none of.
@@ -421,11 +437,12 @@ impl<'a> File<'a> {
         self.catalog.oids.of(&o).unwrap_or(0)
     }
 
-    /// A schema's OID: pg_catalog's and public's as initdb fixes them, the file's own by its DDL.
+    /// A schema's OID: pg_catalog's and public's as initdb fixes them, the file's own by its DDL, a
+    /// public made again among them.
     fn namespace(&self, schema: &str) -> u32 {
         match schema {
             "pg_catalog" => 11,
-            "public" => 2200,
+            "public" => self.catalog.oids.public().unwrap_or(0),
             "pg_toast" => 99,
             s => self.oid(Object::Namespace(s.to_string())),
         }

@@ -369,7 +369,7 @@ mod tests {
     use crate::places::{ints, KeyValue};
 
     fn int_order() -> Catalog {
-        Catalog::parse("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));").unwrap()
+        Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));").unwrap()
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn thin_parts_in_a_row_that_fill_a_page_are_a_block_of_their_own() {
-        let c = Catalog::parse("CREATE TABLE s.t (s text NOT NULL, PRIMARY KEY (s));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (s text NOT NULL, PRIMARY KEY (s));").unwrap();
         let t = &c.tables[0];
         let sublevels = Sublevels::new(&t.orders[0], t, &[6]);
         // Each value takes 9 bytes written plain. Under `a` 2,000 values fill four pages; under each
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn text_narrower_than_the_integers_decides_the_cut() {
-        let c = Catalog::parse("CREATE TABLE s.t (a bigint NOT NULL, b text, PRIMARY KEY (a));")
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, b text, PRIMARY KEY (a));")
             .unwrap();
         let t = &c.tables[0];
         let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn the_largest_place_is_measured_in_bytes_column_by_column() {
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b text); CREATE INDEX o ON s.t (a); ALTER TABLE s.t CLUSTER ON o;",
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b text); CREATE INDEX o ON s.t (a); ALTER TABLE s.t CLUSTER ON o;",
         )
         .unwrap();
         let t = &c.tables[0];

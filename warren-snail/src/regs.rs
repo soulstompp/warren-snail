@@ -295,7 +295,9 @@ fn file_text(kind: RegKind, o: &crate::oids::Object, release: u8) -> Option<Stri
 }
 
 /// A name the carried catalog does not hold, looked for among the held file's objects: in its
-/// schema, or in `public` where it names none, as the search path finds it after `pg_catalog`.
+/// schema, or in `public` where it names none, as the search path finds it after `pg_catalog`. A
+/// schema that stands nowhere is refused first, as PostgreSQL's lookup of every kind of name but a
+/// relation's refuses it.
 fn file_named(
     parts: &[String],
     make: impl Fn(String) -> crate::oids::Object,
@@ -305,7 +307,34 @@ fn file_named(
         [s, n] if s != "pg_catalog" => format!("{s}.{n}"),
         _ => return Ok(None),
     };
-    crate::oids::held_oid(&make(name))
+    let made = make(name);
+    if let ([s, _], false) = (parts, matches!(made, crate::oids::Object::Class(_))) {
+        schema_found(s)?;
+    }
+    crate::oids::held_oid(&made)
+}
+
+/// Refuses a name in a schema that stands nowhere, as PostgreSQL's lookup of a type's, a function's
+/// or a collation's name does, where a file is held to say which of its schemas stand.
+pub(crate) fn schema_found(schema: &str) -> Result<()> {
+    if crate::oids::held_each(|_| ()).is_none() || schema_stands(schema)? {
+        return Ok(());
+    }
+    Err(no_schema(schema))
+}
+
+/// Whether a schema stands for a name to be found in: one of the release's, `public` until the
+/// held file drops it; or one the held file made.
+fn schema_stands(schema: &str) -> Result<bool> {
+    let dropped = crate::oids::held_each(|o| o.public_dropped()).unwrap_or(false);
+    let release = matches!(schema, "pg_catalog" | "pg_toast" | "information_schema")
+        || (schema == "public" && !dropped);
+    Ok(release || crate::oids::held_oid(&crate::oids::Object::Namespace(schema.into()))?.is_some())
+}
+
+/// The refusal of a schema that stands nowhere, in PostgreSQL's words.
+fn no_schema(schema: &str) -> Error {
+    Error::new(format!("schema \"{schema}\" does not exist"))
 }
 
 /// White space as PostgreSQL's scanner takes it.
@@ -571,6 +600,12 @@ pub fn reg_parse(kind: RegKind, s: &str, release: u8) -> Result<u32> {
                 return Err(syntax());
             }
             let section = kind.section().unwrap();
+            if kind == RegKind::Namespace && parts[0] == "public" {
+                // public as the held file has it: the release's, or the one made again.
+                if let Some(public) = crate::oids::held_each(|o| o.public()) {
+                    return public.ok_or_else(|| no_schema("public"));
+                }
+            }
             if let Some(oid) = n
                 .named
                 .get(&(section, "pg_catalog".to_string(), parts[0].clone()))
@@ -583,6 +618,7 @@ pub fn reg_parse(kind: RegKind, s: &str, release: u8) -> Result<u32> {
                 {
                     return Ok(oid);
                 }
+                return Err(no_schema(&parts[0]));
             }
             Err(unknown(kind, &parts[0], release))
         }
@@ -626,6 +662,9 @@ fn file_procs(parts: &[String]) -> Result<Vec<u32>> {
     };
     // Several snails name no object of theirs.
     crate::oids::held_oid(&crate::oids::Object::Namespace(String::new()))?;
+    if let [s, _] = parts {
+        schema_found(s)?;
+    }
     Ok(crate::oids::held_each(|o| {
         o.each()
             .filter(|(_, x)| matches!(x, crate::oids::Object::Proc(m, _) if *m == name))

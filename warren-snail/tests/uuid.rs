@@ -33,7 +33,7 @@ fn a_uuid_is_cut_by_its_bits_on_the_sixteen_bytes_the_file_writes() {
     // 4,096 uuids spread evenly on their first 12 bits: a page holds 256 of 16 bytes, so the cut
     // stops at sixteen parts, where a bigint's 512 a page stops at eight.
     let path = tmp("uuid-cut.snail");
-    let catalog = Catalog::parse("CREATE TABLE s.k (id uuid NOT NULL, PRIMARY KEY (id));").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.k (id uuid NOT NULL, PRIMARY KEY (id));").unwrap();
     let rows = Rows {
         columns: vec![Values::Wide((0..4096).map(|i| Some(id(i))).collect())],
     };
@@ -43,7 +43,7 @@ fn a_uuid_is_cut_by_its_bits_on_the_sixteen_bytes_the_file_writes() {
 }
 
 const DDL: &str =
-    "CREATE TABLE s.u (id uuid NOT NULL, n integer NOT NULL, b uuid, PRIMARY KEY (id)); \
+    "CREATE SCHEMA s; CREATE TABLE s.u (id uuid NOT NULL, n integer NOT NULL, b uuid, PRIMARY KEY (id)); \
      CREATE INDEX u_b ON s.u (b, id); \
      CREATE INDEX u_d ON s.u (id DESC) INCLUDE (n); \
      CREATE TABLE s.v (k integer NOT NULL, u uuid NOT NULL, PRIMARY KEY (k));";
@@ -322,7 +322,7 @@ fn a_uuid_goes_out_as_parquet_s_uuid_and_comes_back() {
 fn a_uuid_is_written_from_its_spellings_and_its_defaults_hand_out_a_v4_and_rising_v7s() {
     let path = tmp("uuid-writes.snail");
     let catalog = Catalog::parse(
-        "CREATE TABLE s.r (id uuid DEFAULT gen_random_uuid() NOT NULL, n integer NOT NULL, \
+        "CREATE SCHEMA s; CREATE TABLE s.r (id uuid DEFAULT gen_random_uuid() NOT NULL, n integer NOT NULL, \
          PRIMARY KEY (id)); \
          CREATE TABLE s.s (id uuid DEFAULT uuidv7() NOT NULL, n integer NOT NULL, PRIMARY KEY (id)); \
          CREATE TABLE s.t (id uuid NOT NULL, label text, PRIMARY KEY (id));",
@@ -402,7 +402,7 @@ fn a_uuid_is_written_from_its_spellings_and_its_defaults_hand_out_a_v4_and_risin
 #[test]
 #[cfg(feature = "standalone")]
 fn a_snail_of_format_eight_refuses_a_uuid_by_name() {
-    let catalog = Catalog::parse("CREATE TABLE s.k (id uuid NOT NULL, PRIMARY KEY (id));").unwrap();
+    let catalog = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.k (id uuid NOT NULL, PRIMARY KEY (id));").unwrap();
     let path = tmp("uuid-eight.snail");
     let e = warren_snail::write::write_format_eight(&path, &catalog, &[], weather::span())
         .err()

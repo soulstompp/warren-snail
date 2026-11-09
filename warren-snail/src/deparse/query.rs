@@ -511,7 +511,7 @@ fn catalog_relation(cat: &Cat, name: &str) -> bool {
 /// A schema's OID by its name.
 pub(crate) fn namespace_oid(cat: &Cat, schema: &str) -> u32 {
     match schema {
-        "public" => 2200,
+        "public" => cat.catalog.oids.public().unwrap_or(0),
         "pg_catalog" => 11,
         "information_schema" => crate::regs::reg_parse(crate::regs::RegKind::Namespace, schema, cat.release)
             .unwrap_or(0),

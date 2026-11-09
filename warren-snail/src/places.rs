@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn an_integer_is_cut_by_its_bits_top_first_and_keeps_its_order() {
-        let c = Catalog::parse("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));").unwrap();
         let t = &c.tables[0];
         let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
         assert_eq!(sublevels.len(), 32);
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_uuid_is_cut_by_its_128_bits_top_first_and_keeps_the_order_of_its_bytes() {
-        let c = Catalog::parse("CREATE TABLE s.t (a uuid NOT NULL, PRIMARY KEY (a));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a uuid NOT NULL, PRIMARY KEY (a));").unwrap();
         let t = &c.tables[0];
         let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
         assert_eq!(sublevels.len(), 128);
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn an_instant_is_cut_by_its_calendar_on_the_utc_clock() {
         let c = Catalog::parse(
-            "CREATE FUNCTION s.c(timestamptz) RETURNS timestamp LANGUAGE sql AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
+            "CREATE SCHEMA s; CREATE FUNCTION s.c(timestamptz) RETURNS timestamp LANGUAGE sql AS $$ SELECT $1 AT TIME ZONE 'UTC' $$;
              CREATE TABLE s.t (at timestamptz NOT NULL);
              CREATE INDEX m ON s.t ((extract(month FROM s.c(at))::smallint), at);
              ALTER TABLE s.t CLUSTER ON m;",
@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn every_date_s_calendar_rises_with_it_and_its_infinities_lie_at_the_ends() {
-        let ddl = "CREATE TABLE s.t (d date NOT NULL, PRIMARY KEY (d));";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (d date NOT NULL, PRIMARY KEY (d));";
         let c = Catalog::parse(ddl).unwrap();
         let t = &c.tables[0];
         let sublevels = Sublevels::new(&t.orders[0], t, &[0]);
@@ -819,8 +819,8 @@ mod tests {
     #[test]
     fn an_instant_s_infinities_lie_before_every_year_and_after_the_last() {
         for ddl in [
-            "CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));",
-            "CREATE TABLE s.t (at timestamp NOT NULL, PRIMARY KEY (at));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (at timestamptz NOT NULL, PRIMARY KEY (at));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (at timestamp NOT NULL, PRIMARY KEY (at));",
         ] {
             let first = crate::times::date2j(-4713, 11, 24) - crate::times::UNIX_EPOCH_JDATE;
             let low = rungs(ddl, KeyValue::Int(first * 86_400_000_000));
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn a_time_is_cut_by_the_clock_its_hour_running_0_to_24() {
-        let ddl = "CREATE TABLE s.t (v time NOT NULL, PRIMARY KEY (v));";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (v time NOT NULL, PRIMARY KEY (v));";
         assert_eq!(rungs(ddl, KeyValue::Int(0)), [0, 0, 0, 0]);
         assert_eq!(
             rungs(ddl, KeyValue::Int(86_399_999_999)),
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn a_timetz_sorts_and_is_cut_by_its_utc_clock_then_its_zone() {
-        let ddl = "CREATE TABLE s.t (v timetz NOT NULL, PRIMARY KEY (v));";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (v timetz NOT NULL, PRIMARY KEY (v));";
         let h = 3_600_000_000i64;
         // PostgreSQL's order of these (types/time-ranges-composed.md, timetz), each zone west of UTC.
         let sorted = [
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn an_interval_sorts_and_is_cut_by_its_total_of_30_day_months() {
         use crate::times::Interval;
-        let ddl = "CREATE TABLE s.t (v interval NOT NULL, PRIMARY KEY (v));";
+        let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (v interval NOT NULL, PRIMARY KEY (v));";
         let (d, u) = (86_400_000_000i64, 3_600_000_000i64);
         let v = |months, days, micros| Interval {
             months,
@@ -983,7 +983,7 @@ mod tests {
             ]
         );
         let c = Catalog::parse(
-            "CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, b integer, PRIMARY KEY (a));
              CREATE INDEX f ON s.t (b NULLS FIRST, a);
              CREATE INDEX l ON s.t (b, a);",
         )
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn text_is_cut_by_its_bytes_and_an_ended_value_comes_first() {
-        let c = Catalog::parse("CREATE TABLE s.t (s text NOT NULL, PRIMARY KEY (s));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (s text NOT NULL, PRIMARY KEY (s));").unwrap();
         let t = &c.tables[0];
         let sublevels = Sublevels::new(&t.orders[0], t, &[4]);
         assert_eq!(sublevels.len(), 4);
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn a_text_of_format_nine_is_cut_a_bit_a_rung_an_ended_value_first() {
-        let c = Catalog::parse("CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a text NOT NULL, PRIMARY KEY (a));").unwrap();
         let t = &c.tables[0];
         let values = ["", "a", "a\u{1}", "ab", "b", "\u{7f}", "\u{80}"];
         let text = values
@@ -1149,7 +1149,7 @@ mod tests {
     fn a_range_is_cut_on_its_structure_its_bounds_each_on_its_own_rungs() {
         // An int4range: its mark, its lower bound's mark, 32 bits and its mark, the upper's the same.
         let ints = rungs_of(
-            "CREATE TABLE s.t (r int4range NOT NULL, PRIMARY KEY (r));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (r int4range NOT NULL, PRIMARY KEY (r));",
             &["empty", "(,3)", "[-2,3)", "[0,1)", "[0,7)", "[5,)"],
         );
         assert_eq!(ints[0][..2], [0, -1]);
@@ -1161,7 +1161,7 @@ mod tests {
         assert!(ints.windows(2).all(|w| w[0] < w[1]));
         // A tstzrange's bounds on the calendar, year first.
         let instants = rungs_of(
-            "CREATE TABLE s.t (r tstzrange NOT NULL, PRIMARY KEY (r));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (r tstzrange NOT NULL, PRIMARY KEY (r));",
             &[
                 "[-infinity,2019-06-01 00:00:00+00)",
                 "[2017-12-31 23:59:59.5+00,2018-01-01 00:00:00+00)",
@@ -1176,14 +1176,14 @@ mod tests {
     #[test]
     fn an_array_of_text_is_cut_by_the_bits_of_its_elements_bytes_in_postgresql_s_order() {
         let arrays = rungs_of(
-            "CREATE TABLE s.t (a text[] NOT NULL, PRIMARY KEY (a));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (a text[] NOT NULL, PRIMARY KEY (a));",
             &["{}", "{a,b}", "{a,NULL}", "{ab}", "{b}", "{b,a}"],
         );
         // A mark, then the element's byte as eight bits, then the bits of its end.
         assert_eq!(arrays[1][..9], [1, 0, 1, 1, 0, 0, 0, 0, 1]);
         assert!(arrays.windows(2).all(|w| w[0] < w[1]));
         let dates = rungs_of(
-            "CREATE TABLE s.t (a date[] NOT NULL, PRIMARY KEY (a));",
+            "CREATE SCHEMA s; CREATE TABLE s.t (a date[] NOT NULL, PRIMARY KEY (a));",
             &[
                 "{2017-12-31}",
                 "{2018-01-01,1999-01-01}",

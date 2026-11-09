@@ -10,7 +10,7 @@ use warren_snail::values::Values;
 use warren_snail::write::Rows;
 use weather::{fresh, ints64, tmp, write};
 
-const DDL: &str = "CREATE TABLE s.t (id bigint NOT NULL, w integer NOT NULL, t text NOT NULL, \
+const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id bigint NOT NULL, w integer NOT NULL, t text NOT NULL, \
                    PRIMARY KEY (id));";
 
 const ROWS: i64 = 20_000;

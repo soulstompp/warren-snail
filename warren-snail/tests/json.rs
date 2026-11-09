@@ -44,7 +44,7 @@ fn ask(snail: &mut Snail, select: &str) -> warren_snail::Result<Vec<Option<Strin
 fn one_row(name: &str) -> Snail {
     snail_of(
         name,
-        "CREATE TABLE s.t (id integer PRIMARY KEY, x integer, k text);",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, x integer, k text);",
         &["INSERT INTO s.t VALUES (1, 1, 'a'), (2, NULL, 'b'), (3, 3, 'a')"],
     )
 }

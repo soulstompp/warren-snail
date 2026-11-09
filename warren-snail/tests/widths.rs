@@ -42,13 +42,13 @@ fn a_smallint_is_cut_on_the_four_bytes_the_file_writes() {
     let values = || Values::Int((0..4096).map(Some).collect());
     let small = written(
         "smallint",
-        "CREATE TABLE s.t (a smallint NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a smallint NOT NULL, PRIMARY KEY (a));",
         "s.t",
         vec![values()],
     );
     let int = written(
         "smallint-integer",
-        "CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));",
         "s.t",
         vec![values()],
     );
@@ -62,7 +62,7 @@ fn a_smallint_is_cut_on_the_four_bytes_the_file_writes() {
 fn keyed_with_nulls(name: &str, null: impl Fn(i64) -> bool) -> Snail {
     written(
         name,
-        "CREATE TABLE s.t (a bigint NOT NULL, b integer, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, b integer, PRIMARY KEY (a));",
         "s.t",
         vec![
             Values::Int((0..8192).map(Some).collect()),
@@ -103,7 +103,7 @@ fn a_boolean_never_decides_and_takes_a_page_of_its_own_in_each_block() {
     let n = 8192;
     let with = written(
         "boolean-beside",
-        "CREATE TABLE s.t (a bigint NOT NULL, f boolean NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, f boolean NOT NULL, PRIMARY KEY (a));",
         "s.t",
         vec![
             Values::Int((0..n).map(Some).collect()),
@@ -114,7 +114,7 @@ fn a_boolean_never_decides_and_takes_a_page_of_its_own_in_each_block() {
     .unwrap();
     let alone = written(
         "boolean-without",
-        "CREATE TABLE s.t (a bigint NOT NULL, PRIMARY KEY (a));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, PRIMARY KEY (a));",
         "s.t",
         vec![Values::Int((0..n).map(Some).collect())],
     )
@@ -129,7 +129,7 @@ fn a_boolean_never_decides_and_takes_a_page_of_its_own_in_each_block() {
     assert!(with.iter().filter(|r| r.column == "f").all(|r| r.k == 1));
 }
 
-const FLAGS: &str = "CREATE TABLE s.flags (id integer NOT NULL, v boolean, w boolean NOT NULL, \
+const FLAGS: &str = "CREATE SCHEMA s; CREATE TABLE s.flags (id integer NOT NULL, v boolean, w boolean NOT NULL, \
      PRIMARY KEY (id)); CREATE INDEX f_w ON s.flags (w, id);";
 
 /// Ten rows: v true, NULL and false in turn, w true on the even ids.
@@ -373,7 +373,7 @@ fn a_snail_of_format_seven_or_eight_refuses_a_boolean_by_name() {
     for name in ["seven", "eight"] {
         let path = tmp(&format!("ints-{name}.snail"));
         let ints =
-            Catalog::parse("CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));").unwrap();
+            Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, PRIMARY KEY (a));").unwrap();
         if name == "seven" {
             warren_snail::write::write_format_seven(&path, &ints, &[], weather::span()).unwrap();
         } else {
@@ -405,7 +405,7 @@ fn a_null_takes_no_width_in_a_column_s_unit_or_in_its_pages() {
     let day = 86_400_000_000;
     let snail = written(
         "nulls-unit",
-        "CREATE TABLE s.t (a bigint NOT NULL, g integer NOT NULL, at timestamptz NOT NULL, b bigint, \
+        "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, g integer NOT NULL, at timestamptz NOT NULL, b bigint, \
          PRIMARY KEY (a)); CREATE INDEX t_g ON s.t (g, at) INCLUDE (b);",
         "s.t",
         vec![
@@ -436,7 +436,7 @@ fn a_boolean_level_cuts_its_false_rows_before_its_true_rows() {
     let n = 8192;
     let mut snail = written(
         "boolean-level",
-        "CREATE TABLE s.t (a bigint NOT NULL, f boolean NOT NULL, PRIMARY KEY (a)); \
+        "CREATE SCHEMA s; CREATE TABLE s.t (a bigint NOT NULL, f boolean NOT NULL, PRIMARY KEY (a)); \
          CREATE INDEX t_f ON s.t (f, a);",
         "s.t",
         vec![
