@@ -429,6 +429,15 @@ impl Typing<'_> {
                     .all(|a| matches!(a, sqlparser::ast::AccessExpr::Subscript(_))) =>
             {
                 let t = self.type_of(root)?;
+                // Each subscript is coerced to integer by assignment: refused before any row where
+                // its type has no such cast, as PostgreSQL's parser refuses it.
+                for x in super::pipeline::subscripts(access_chain) {
+                    if self.type_of(x)?.is_some_and(|s| {
+                        !(s.is_integer() || s.is_numeric() || s.is_float() || s.is_oid())
+                    }) {
+                        return Err(Error::new("array subscript must have type integer"));
+                    }
+                }
                 let sliced = access_chain.iter().any(|a| {
                     matches!(
                         a,

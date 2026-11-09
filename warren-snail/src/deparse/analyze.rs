@@ -863,9 +863,8 @@ impl Analyzer<'_, '_> {
 
     fn int(&self, e: &Expr) -> Result<Node> {
         let n = self.expr(e)?;
-        let t = n.ty();
         self.coerce_to_target(n, cat::INT4, -1, Context::Assignment, Form::Implicit)
-            .map_err(|_| Error::new(format!("array subscript must have type integer, not {t}")))
+            .map_err(|_| Error::new("array subscript must have type integer"))
     }
 
     fn subscripted(&self, container: Node, subs: Vec<(Option<Node>, Option<Node>, bool)>, e: &Expr) -> Result<Node> {

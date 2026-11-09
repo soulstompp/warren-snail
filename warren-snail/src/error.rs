@@ -123,6 +123,13 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("column \"", "\" is an identity column"), "42601"),
     (Words::Holds("column \"", " but expression is of type "), "42804"),
     (Words::Holds("argument of ", " must be type boolean, not type "), "42804"),
+    (Words::Is("array subscript must have type integer"), "42804"),
+    (Words::Starts("aggregate functions are not allowed in "), "42803"),
+    (
+        Words::Holds("column \"", "\" must appear in the GROUP BY clause or be used in an aggregate function"),
+        "42803",
+    ),
+    (Words::Starts("window functions are not allowed in "), "42P20"),
     (Words::Is("unequal number of entries in row expressions"), "42601"),
     (Words::Starts("cannot cast type "), "42846"),
     (Words::Is("ON CONFLICT DO UPDATE command cannot affect row a second time"), "21000"),

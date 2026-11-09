@@ -8,7 +8,8 @@
 //! and refused where it cannot, the session's prepared statements in pg_prepared_statements, a
 //! locking clause, a name written twice and a relation not held each refused with its code, a
 //! literal read as the type its place gives it (a truth, a CASE's or a COALESCE's type, the other
-//! side's integer, two rows' columns compared in turn). Every
+//! side's integer, two rows' columns compared in turn), an element of an array by a subscript an
+//! aggregate gives, a function in a subquery's FROM reading the row around it. Every
 //! word, code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -2172,6 +2173,145 @@ fn a_literal_is_read_as_the_type_its_place_gives_it() {
         ("SELECT id FROM s.t WHERE ROW(a, b) IS DISTINCT FROM ROW('x', 1)", "22P02", "invalid input syntax for type integer: \"x\""),
         ("SELECT id FROM s.t WHERE ROW(a, b) IS DISTINCT FROM ROW(2, 3)", "42883", "operator does not exist: text = integer"),
         ("WITH w AS (SELECT id, b FROM s.t) SELECT id FROM w WHERE b = 3", "42883", "operator does not exist: text = integer"),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
+}
+
+#[test]
+fn a_subscript_an_aggregate_gives_and_a_function_reading_the_row_around_its_subquery_are_read() {
+    let mut w = snail("positions");
+    run(
+        &mut w,
+        "CREATE TABLE s.t (id integer NOT NULL, sz varchar(6), g integer, n numeric(4,1), \
+         st varchar(20), PRIMARY KEY (id))",
+    );
+    run(
+        &mut w,
+        "INSERT INTO s.t VALUES (1, 'medium', 1, 1.4, 'a,c'), (2, 'small', 1, 2.6, 'b'), \
+         (3, 'large', 2, NULL, ''), (4, NULL, 2, 0.5, NULL), (5, 'small', 3, 3.0, 'a,b,c')",
+    );
+    // An element of an array by a subscript an aggregate gives: in a select list, over groups, in
+    // HAVING and ORDER BY, a slice's bounds, under a function; NULL over no rows.
+    for (sql, answer) in [
+        (
+            "SELECT (ARRAY['small', 'medium', 'large'])[min(array_position(ARRAY['small', 'medium', 'large'], sz))] FROM s.t",
+            vec!["small"],
+        ),
+        ("SELECT (ARRAY[10, 20, 30, 40, 50])[min(id)], (ARRAY[10, 20, 30, 40, 50])[max(id)] FROM s.t", vec!["10|50"]),
+        ("SELECT (ARRAY['x'])[min(id)] FROM s.t WHERE id > 9", vec!["NULL"]),
+        (
+            "SELECT g, (ARRAY['small', 'medium', 'large'])[max(array_position(ARRAY['small', 'medium', 'large'], sz))] \
+             FROM s.t GROUP BY g ORDER BY g",
+            vec!["1|medium", "2|large", "3|small"],
+        ),
+        ("SELECT g FROM s.t GROUP BY g HAVING (ARRAY[false, true, false])[count(*)] ORDER BY g", vec!["1", "2"]),
+        ("SELECT g FROM s.t GROUP BY g ORDER BY (ARRAY[3, 1, 2])[min(id)] NULLS FIRST, g", vec!["3", "2", "1"]),
+        ("SELECT (ARRAY[1, 2, 3, 4, 5])[min(id):max(id) - 2] FROM s.t", vec!["{1,2,3}"]),
+        (
+            "SELECT upper((ARRAY['small', 'medium', 'large'])[min(array_position(ARRAY['small', 'medium', 'large'], sz))]) FROM s.t",
+            vec!["SMALL"],
+        ),
+        // Each subscript coerced to integer as by assignment: a numeric rounded, a double to even,
+        // an oid's bits, a quoted literal by integer's input.
+        ("SELECT (ARRAY['a', 'b', 'c'])[avg(g)], (ARRAY['a', 'b', 'c'])[max(n)] FROM s.t", vec!["b|c"]),
+        (
+            "SELECT (ARRAY['a', 'b', 'c'])[2.5], (ARRAY['a', 'b', 'c'])[CAST(2.5 AS double precision)], \
+             (ARRAY['a', 'b', 'c'])[CAST(2 AS oid)], (ARRAY['a', 'b', 'c'])['2']",
+            vec!["c|b|b|b"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), answer, "{sql}");
+    }
+    // A set-returning function in a subquery's FROM reading the row of the query around it: in a
+    // select list, WHERE and ORDER BY, by EXISTS and IN, with its ordinality.
+    for (sql, answer) in [
+        (
+            "SELECT id, (SELECT count(*) FROM unnest(string_to_array(st, ',')) AS m) FROM s.t ORDER BY id",
+            vec!["1|2", "2|1", "3|0", "4|0", "5|3"],
+        ),
+        (
+            "SELECT id, (SELECT bit_or(1 << (array_position(ARRAY['a', 'b', 'c'], m) - 1)) \
+             FROM unnest(string_to_array(st, ',')) AS m) FROM s.t ORDER BY id",
+            vec!["1|5", "2|2", "3|NULL", "4|NULL", "5|7"],
+        ),
+        (
+            "SELECT x.id FROM s.t AS x WHERE (SELECT sum(1 << (array_position(ARRAY['a', 'b', 'c'], m) - 1)) \
+             FROM unnest(string_to_array(x.st, ',')) AS m) & 4 = 4 ORDER BY x.id",
+            vec!["1", "5"],
+        ),
+        (
+            "SELECT id FROM s.t ORDER BY (SELECT count(*) FROM unnest(string_to_array(st, ',')) AS m) DESC, id",
+            vec!["5", "1", "2", "3", "4"],
+        ),
+        (
+            "SELECT id FROM s.t WHERE EXISTS (SELECT 1 FROM unnest(string_to_array(st, ',')) AS m WHERE m = 'b') ORDER BY id",
+            vec!["2", "5"],
+        ),
+        (
+            "SELECT id FROM s.t WHERE 'c' IN (SELECT m FROM unnest(string_to_array(st, ',')) AS m) ORDER BY id",
+            vec!["1", "5"],
+        ),
+        (
+            "SELECT id, (SELECT max(n) FROM unnest(string_to_array(st, ',')) WITH ORDINALITY AS u(m, n) \
+             WHERE m = 'c') FROM s.t ORDER BY id",
+            vec!["1|2", "2|NULL", "3|NULL", "4|NULL", "5|3"],
+        ),
+        (
+            "SELECT id, (SELECT count(*) FROM regexp_split_to_table(st, ',') AS m) FROM s.t ORDER BY id",
+            vec!["1|2", "2|1", "3|1", "4|0", "5|3"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), answer, "{sql}");
+    }
+    // The same in an UPDATE's SET and a DELETE's WHERE.
+    run(
+        &mut w,
+        "UPDATE s.t SET st = (SELECT string_agg(m, ',' ORDER BY m DESC) \
+         FROM unnest(string_to_array(st, ',')) AS m) WHERE id IN (1, 5)",
+    );
+    let deleted = w
+        .execute("DELETE FROM s.t WHERE (SELECT count(*) FROM unnest(string_to_array(st, ',')) AS m) = 0")
+        .unwrap();
+    assert_eq!(deleted.rows, 2);
+    assert_eq!(rows(&mut w, "SELECT id, st FROM s.t ORDER BY id"), ["1|c,a", "2|b", "5|c,b,a"]);
+    // A parameter as a subscript is typed integer, its argument assigned to it.
+    run(&mut w, "PREPARE p11 AS SELECT (ARRAY['a', 'b', 'c'])[$1]");
+    assert_eq!(rows(&mut w, "EXECUTE p11('2')"), ["b"]);
+    assert_eq!(rows(&mut w, "EXECUTE p11(2.5)"), ["c"]);
+    // An aggregate reading only the query around a subquery is that query's, never refused as the
+    // subquery's own.
+    let around = "SELECT g FROM s.t GROUP BY g HAVING EXISTS (SELECT 1 FROM s.t AS u \
+                  WHERE u.id = (ARRAY[1, 3, 5])[count(t.id)])";
+    assert_ne!(w.execute(around).err().and_then(|e| e.sqlstate()), Some("42803"), "{around}");
+    // Each refused as PostgreSQL refuses it.
+    for (sql, code, words) in [
+        ("SELECT (ARRAY['a', 'b'])[sz] FROM s.t WHERE false", "42804", "array subscript must have type integer"),
+        ("PREPARE p12 AS SELECT (ARRAY['a', 'b'])[sz] FROM s.t WHERE false", "42804", "array subscript must have type integer"),
+        (
+            "SELECT g FROM s.t GROUP BY g HAVING EXISTS (SELECT 1 FROM s.t AS u WHERE u.id = (ARRAY[1, 3, 5])[count(*)])",
+            "42803",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        ("SELECT (ARRAY['a', 'b', 'c'])['x']", "22P02", "invalid input syntax for type integer: \"x\""),
+        ("SELECT (ARRAY['a', 'b', 'c'])[1e10]", "22003", "integer out of range"),
+        ("SELECT id FROM s.t WHERE (ARRAY[1, 2])[min(id)] = 1", "42803", "aggregate functions are not allowed in WHERE"),
+        ("SELECT id FROM s.t WHERE min(id) = 1", "42803", "aggregate functions are not allowed in WHERE"),
+        (
+            "SELECT id FROM s.t WHERE (ARRAY[1, 2])[row_number() OVER ()] = 1",
+            "42P20",
+            "window functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT (ARRAY[10, 20, 30])[g] FROM s.t GROUP BY sz",
+            "42803",
+            "column \"t.g\" must appear in the GROUP BY clause or be used in an aggregate function",
+        ),
+        (
+            "SELECT id, (SELECT m FROM unnest(string_to_array(st, ',')) AS m) FROM s.t ORDER BY id",
+            "21000",
+            "more than one row returned by a subquery used as an expression",
+        ),
     ] {
         assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
     }

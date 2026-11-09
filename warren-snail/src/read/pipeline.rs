@@ -1249,8 +1249,14 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
             find_calls(a, out);
             find_calls(b, out);
         }
-        // A field of a composite an aggregate or a function gives.
-        Expr::CompoundFieldAccess { root, .. } => find_calls(root, out),
+        // A field of a composite an aggregate or a function gives, or an element of an array by
+        // subscripts an aggregate gives.
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            find_calls(root, out);
+            for x in subscripts(access_chain) {
+                find_calls(x, out);
+            }
+        }
         // What a subquery is compared with is the step's; the subquery's own calls are its own.
         Expr::InSubquery { expr, .. } => find_calls(expr, out),
         Expr::AnyOp { left, .. } | Expr::AllOp { left, .. } if is_subquery(e) => {
@@ -1363,8 +1369,32 @@ pub(super) fn parts_of(e: &Expr) -> Vec<&Expr> {
         }
         Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => vec![left, right],
         Expr::InSubquery { expr, .. } => vec![expr],
+        Expr::CompoundFieldAccess { root, access_chain } => std::iter::once(root.as_ref())
+            .chain(subscripts(access_chain))
+            .collect(),
         _ => Vec::new(),
     }
+}
+
+/// The expressions an access chain's subscripts read: each index, and each slice's bounds.
+pub(super) fn subscripts(chain: &[sqlparser::ast::AccessExpr]) -> Vec<&Expr> {
+    use sqlparser::ast::{AccessExpr, Subscript};
+    chain
+        .iter()
+        .flat_map(|a| match a {
+            AccessExpr::Subscript(Subscript::Index { index }) => vec![index],
+            AccessExpr::Subscript(Subscript::Slice {
+                lower_bound,
+                upper_bound,
+                stride,
+            }) => lower_bound
+                .iter()
+                .chain(upper_bound.iter())
+                .chain(stride.iter())
+                .collect(),
+            AccessExpr::Dot(_) => Vec::new(),
+        })
+        .collect()
 }
 
 /// The columns an expression reads, by their qualifier and name, each as often as it is read.
@@ -4008,16 +4038,39 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             // its lower 1.
             let mut slices: Vec<(Option<i64>, Option<i64>)> = Vec::new();
             let mut sliced = false;
-            // A subscript as an integer of 32 bits; none where it is NULL.
+            // A subscript as an integer of 32 bits, as PostgreSQL's parser coerces it by
+            // assignment: a numeric or a float rounded, an oid or a reg* value taken as its bits,
+            // a quoted literal or a parameter read by integer's input; none where it is NULL.
             let int = |e: &Expr| -> Result<Option<i64>> {
+                let mut x = e;
+                while let Expr::Nested(inner) = x {
+                    x = inner;
+                }
+                let quoted = matches!(x, Expr::Value(v) if matches!(v.value,
+                    SqlValue::SingleQuotedString(_)
+                        | SqlValue::EscapedStringLiteral(_)
+                        | SqlValue::Placeholder(_)));
                 match ev(e)? {
                     Value::Int(i) if i32::try_from(i).is_ok() => Ok(Some(i)),
                     Value::Int(_) => Err(Error::new("integer out of range")),
                     Value::Null => Ok(None),
-                    other => Err(Error::new(format!(
-                        "array subscript must have type integer, not {}",
-                        kind_name(&other)
-                    ))),
+                    Value::Scalar(ty, k) if ty.is_oid() => match scalar_integer(ty, k, "integer")? {
+                        Value::Int(i) => Ok(Some(i)),
+                        _ => Ok(None),
+                    },
+                    v @ (Value::Num(..) | Value::Numeric(_) | Value::Real(_) | Value::Double(_)) => {
+                        match part_value(ColumnType::Int4, &part_of(ColumnType::Int4, v, false)?) {
+                            Value::Int(i) => Ok(Some(i)),
+                            _ => Ok(None),
+                        }
+                    }
+                    v @ Value::Text(_) if quoted => {
+                        match part_value(ColumnType::Int4, &part_of(ColumnType::Int4, v, true)?) {
+                            Value::Int(i) => Ok(Some(i)),
+                            _ => Ok(None),
+                        }
+                    }
+                    _ => Err(Error::new("array subscript must have type integer")),
                 }
             };
             for a in access_chain {
@@ -6360,6 +6413,38 @@ pub(super) fn prepare<'q>(
             "set-returning functions are not allowed in WHERE",
         ));
     }
+    // An aggregate of the step's own in WHERE, or a window, refused as PostgreSQL's parser refuses
+    // it: one reading none of the query around it, or a column of the step's own FROM. One reading
+    // only the query around it is that query's.
+    if let Some(w) = s.selection.as_ref() {
+        let mut found = Calls::default();
+        find_calls(w, &mut found);
+        if !found.windows.is_empty() {
+            return Err(Error::new("window functions are not allowed in WHERE"));
+        }
+        let own = |a: &&Expr| {
+            let mut read = Vec::new();
+            columns_read(a, &mut read);
+            let levels: Option<Vec<usize>> = read
+                .iter()
+                .map(|(q, n)| {
+                    let at = naming(
+                        columns.iter().map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+                        q.as_deref(),
+                        n,
+                    );
+                    match at.as_slice() {
+                        [i] => Some(outer_level(columns[*i].0.as_deref())),
+                        _ => None,
+                    }
+                })
+                .collect();
+            levels.is_some_and(|l| l.is_empty() || l.contains(&0))
+        };
+        if found.aggregates.iter().any(own) {
+            return Err(Error::new("aggregate functions are not allowed in WHERE"));
+        }
+    }
     // HAVING keeps the groups its condition holds of, its aggregates folded with the others'.
     let having = s.having.as_ref();
     if let Some(h) = having {
@@ -8060,7 +8145,8 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
 /// NATURAL, or a RIGHT or FULL JOIN after the first join; it groups by a name its select list gives
 /// or orders by what it does not return; or it calls a function, an aggregate of a column's values
 /// counted, or over each value once, filtered or ordered, or an operator on numbers or on a document,
-/// the question path does not read, or reads a CASE or a parameter.
+/// the question path does not read, or reads a CASE, a subscript or a parameter; or calls an
+/// aggregate or a window function in WHERE, which the pipeline refuses as PostgreSQL's parser does.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
@@ -8130,6 +8216,10 @@ pub fn hands_over(q: &Query) -> bool {
     if returned.iter().any(|e| compares_no_constant(e) || is_written_constant(e))
         || one_table && s.selection.as_ref().is_some_and(compares_no_constant)
         || s.selection.iter().chain(on.iter().copied()).any(stands_constant)
+        || s.selection.as_ref().is_some_and(|w| {
+            let (aggregate, window, _) = calls_in(w);
+            aggregate || window
+        })
     {
         return true;
     }
@@ -8208,8 +8298,8 @@ fn is_written_constant(e: &Expr) -> bool {
 }
 
 /// Whether an expression calls a function, or an operator on numbers or on a document, the question
-/// path does not read, or reads a CASE, an IN list or a parameter: its aggregates and the functions
-/// a DDL names are its own.
+/// path does not read, or reads a CASE, an IN list, a subscript or a parameter: its aggregates and
+/// the functions a DDL names are its own.
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => {
@@ -8268,7 +8358,8 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         // An IN list: the question path reads no level by one.
         Expr::InList { .. } => true,
         Expr::Array(a) => a.elem.iter().any(calls_beyond_the_question),
-        Expr::CompoundFieldAccess { root, .. } => calls_beyond_the_question(root),
+        // A subscript or a field: the question path holds no level for either.
+        Expr::CompoundFieldAccess { .. } => true,
         _ => false,
     }
 }

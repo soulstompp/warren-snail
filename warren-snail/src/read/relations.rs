@@ -2644,7 +2644,8 @@ impl Reading<'_> {
         m.into_rows()
     }
 
-    /// A function's rows for the row before it, or for none where nothing comes before it.
+    /// A function's rows for the row before it, or for none where nothing comes before it; in a
+    /// subquery, for the row of the query around it too, whose columns its arguments may read.
     fn called(
         &mut self,
         node: &Node,
@@ -2653,8 +2654,15 @@ impl Reading<'_> {
         before: Option<(usize, &[Value])>,
     ) -> Result<Vec<Vec<Value>>> {
         let (start, row) = before.unwrap_or((node.at, &[]));
+        let mut columns = self.from.frame_columns(start, row.len());
+        let mut row = row.to_vec();
+        if let Some(o) = self.outer {
+            let at = self.from.outer_at;
+            columns.extend(self.from.frame_columns(at, self.from.columns.len() - at));
+            row.extend(o.values.iter().cloned());
+        }
         let frame = pipeline::Frame {
-            columns: self.from.frame_columns(start, row.len()),
+            columns,
             params: self.params,
             release: self.release,
             casings: self.casings,
@@ -2662,7 +2670,7 @@ impl Reading<'_> {
             now: self.now,
             subqueries: None,
         };
-        let values = pipeline::call_rows(&call.expr, row, &frame)?;
+        let values = pipeline::call_rows(&call.expr, &row, &frame)?;
         let fields = node.width - call.ordinality as usize;
         values
             .into_iter()
