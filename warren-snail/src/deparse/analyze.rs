@@ -5,6 +5,8 @@
 
 use super::cat::{self, Cat};
 use crate::{Error, Result};
+use std::borrow::Cow;
+use std::cell::RefCell;
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
     UnaryOperator, Value as SqlValue,
@@ -401,6 +403,132 @@ pub(crate) struct Analyzer<'c, 'a> {
 
 pub(crate) fn not_read(e: &impl std::fmt::Display) -> Error {
     Error::new(format!("{e} is not printed as PostgreSQL prints it"))
+}
+
+/// What brackets a literal's number where a fold writes it as a mark (`fold`).
+const MARK: char = '\u{F8FF}';
+
+thread_local! {
+    /// The literals a fold is typing, by the number each mark carries: its text, and each type and
+    /// text a coercion of it gave.
+    static MARKED: RefCell<Option<Vec<Marked>>> = const { RefCell::new(None) };
+}
+
+/// A literal a fold is typing: its text, and each type and text a coercion of it gave.
+#[derive(Default)]
+pub(crate) struct Marked {
+    pub text: String,
+    pub typed: Vec<(u32, String)>,
+}
+
+/// The mark a fold writes in place of its `k`th literal.
+pub(crate) fn mark(k: usize) -> String {
+    format!("{MARK}{k}{MARK}")
+}
+
+/// The literal a fold's mark stands for, where a fold is typing it.
+fn original(text: &str) -> Option<String> {
+    let k: usize = text.strip_prefix(MARK)?.strip_suffix(MARK)?.parse().ok()?;
+    MARKED.with(|m| m.borrow().as_ref().and_then(|m| m.get(k)).map(|x| x.text.clone()))
+}
+
+/// A text with each quoted mark of a fold in it written as the literal it stands for, quoted: what
+/// the DDL's reader reads a statement's copy by, wherever it reads a literal's value.
+pub(crate) fn unmarked(text: &str) -> Cow<'_, str> {
+    if !text.contains(MARK) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(&format!("'{MARK}")) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let end = after[MARK.len_utf8()..].find(MARK).map(|e| e + 2 * MARK.len_utf8());
+        match end.and_then(|e| original(&after[..e]).map(|o| (e, o))) {
+            Some((e, o)) if after[e..].starts_with('\'') => {
+                out.push_str(&super::print::literal(&o));
+                rest = &after[e + 1..];
+            }
+            _ => {
+                out.push('\'');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// An expression with each mark of a fold in it read as the literal it stands for; none where it
+/// holds none.
+pub(crate) fn unmarked_expr(e: &Expr) -> Option<Expr> {
+    if !e.to_string().contains(MARK) {
+        return None;
+    }
+    let mut e = e.clone();
+    let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
+        if let Expr::Value(v) = x {
+            if let SqlValue::SingleQuotedString(s) = &mut v.value {
+                if let Some(o) = original(s) {
+                    *s = o;
+                }
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    Some(e)
+}
+
+/// The literals a fold types, held until `typed`.
+pub(crate) struct Marking(());
+
+impl Marking {
+    pub(crate) fn of(texts: Vec<String>) -> Marking {
+        let marked = texts
+            .into_iter()
+            .map(|text| Marked {
+                text,
+                typed: Vec::new(),
+            })
+            .collect();
+        MARKED.with(|m| *m.borrow_mut() = Some(marked));
+        Marking(())
+    }
+
+    /// The number of literals marked.
+    pub(crate) fn len(&self) -> usize {
+        MARKED.with(|m| m.borrow().as_ref().map_or(0, Vec::len))
+    }
+
+    /// Each literal and what its coercions gave it.
+    pub(crate) fn typed(self) -> Vec<Marked> {
+        MARKED.with(|m| m.borrow_mut().take()).unwrap_or_default()
+    }
+}
+
+impl Drop for Marking {
+    fn drop(&mut self) {
+        MARKED.with(|m| *m.borrow_mut() = None);
+    }
+}
+
+/// An unknown literal's text read as its type's input reads it, its output's text, and where it is
+/// a fold's mark, the literal it stands for typed so.
+fn typed_text(cat: &Cat, text: &str, ty: u32, typmod: i32) -> Result<String> {
+    let k = text
+        .strip_prefix(MARK)
+        .and_then(|t| t.strip_suffix(MARK))
+        .and_then(|n| n.parse::<usize>().ok());
+    let (Some(k), Some(original)) = (k, original(text)) else {
+        return super::constant_text(cat, text, ty, typmod);
+    };
+    let out = super::constant_text(cat, &original, ty, typmod)?;
+    MARKED.with(|m| {
+        if let Some(x) = m.borrow_mut().as_mut().and_then(|m| m.get_mut(k)) {
+            x.typed.push((ty, out.clone()));
+        }
+    });
+    Ok(out)
 }
 
 /// An identifier as PostgreSQL's scanner folds it.
@@ -1281,7 +1409,7 @@ impl Analyzer<'_, '_> {
                 let (base, base_typmod) = self.cat.base_and_typmod(target, typmod);
                 let input_typmod = if base == cat::INTERVAL { base_typmod } else { -1 };
                 let text = match text {
-                    Some(t) => Some(super::constant_text(self.cat, t, base, input_typmod)?),
+                    Some(t) => Some(typed_text(self.cat, t, base, input_typmod)?),
                     None => None,
                 };
                 let c = Node::Const {
@@ -1453,28 +1581,50 @@ impl Analyzer<'_, '_> {
             }
         };
         let mut compat: Vec<u32> = Vec::new();
+        // An argument declared a range, a multirange or an array is one, as
+        // check_generic_type_consistency holds it.
+        let kind = |t: u32| self.cat.ty(t).map_or(' ', |x| x.typtype);
+        let of_kind = |b: u32, k: char, what: &str| -> Result<()> {
+            match kind(b) == k {
+                true => Ok(()),
+                false => Err(Error::new(format!("argument declared {what} is not one"))),
+            }
+        };
         for (i, &d) in declared.iter().enumerate() {
             let a = actual[i];
             if a == cat::UNKNOWN {
                 continue;
             }
+            let b = self.cat.base(a);
             match d {
                 cat::ANYELEMENT | cat::ANYNONARRAY | cat::ANYENUM => agree(&mut elem, a)?,
-                cat::ANYARRAY => {
-                    let b = self.cat.base(a);
-                    agree(&mut array, b)?;
+                cat::ANYARRAY => agree(&mut array, b)?,
+                cat::ANYRANGE => {
+                    of_kind(b, 'r', "anyrange")?;
+                    agree(&mut range, b)?
                 }
-                cat::ANYRANGE => agree(&mut range, self.cat.base(a))?,
-                cat::ANYMULTIRANGE => agree(&mut multirange, self.cat.base(a))?,
-                cat::ANYCOMPATIBLE | cat::ANYCOMPATIBLENONARRAY => compat.push(a),
-                cat::ANYCOMPATIBLEARRAY => {
-                    let e = self.cat.element(self.cat.base(a));
-                    if e != 0 {
-                        compat.push(e);
+                cat::ANYMULTIRANGE => {
+                    of_kind(b, 'm', "anymultirange")?;
+                    agree(&mut multirange, b)?
+                }
+                cat::ANYCOMPATIBLE => compat.push(a),
+                cat::ANYCOMPATIBLENONARRAY => {
+                    if self.cat.element(b) != 0 {
+                        return Err(Error::new("argument declared anycompatiblenonarray is an array"));
                     }
+                    compat.push(a)
                 }
+                cat::ANYCOMPATIBLEARRAY => match self.cat.element(b) {
+                    0 => return Err(Error::new("argument declared anycompatiblearray is not an array")),
+                    e => compat.push(e),
+                },
                 cat::ANYCOMPATIBLERANGE | cat::ANYCOMPATIBLEMULTIRANGE => {
-                    if let Some(s) = super::range_subtype(self.cat, self.cat.base(a)) {
+                    let (k, what) = match d {
+                        cat::ANYCOMPATIBLERANGE => ('r', "anycompatiblerange"),
+                        _ => ('m', "anycompatiblemultirange"),
+                    };
+                    of_kind(b, k, what)?;
+                    if let Some(s) = super::range_subtype(self.cat, b) {
                         compat.push(s);
                     }
                 }
@@ -1491,6 +1641,16 @@ impl Analyzer<'_, '_> {
         if let Some(r) = range {
             if let Some(s) = super::range_subtype(self.cat, r) {
                 agree(&mut elem, s)?;
+            }
+        }
+        // The element anynonarray and anyenum stand for is no array, and an enum.
+        if let Some(e) = elem {
+            let e = self.cat.base(e);
+            if declared.contains(&cat::ANYNONARRAY) && self.cat.element(e) != 0 {
+                return Err(Error::new("argument declared anynonarray is an array"));
+            }
+            if declared.contains(&cat::ANYENUM) && kind(e) != 'e' {
+                return Err(Error::new("argument declared anyenum is not an enum"));
             }
         }
         let elem_t = match elem {

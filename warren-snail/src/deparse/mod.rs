@@ -9,6 +9,7 @@ pub(crate) mod analyze;
 pub(crate) mod cat;
 pub(crate) mod defs;
 pub(crate) mod depend;
+pub(crate) mod fold;
 pub(crate) mod funcs;
 pub(crate) mod print;
 pub(crate) mod query;
@@ -287,6 +288,14 @@ pub(crate) fn constant_text(cat: &Cat, lit: &str, ty: u32, typmod: i32) -> Resul
     if ty == cat::UNKNOWN || ty == cat::TEXT {
         return Ok(lit.to_string());
     }
+    // An array of a domain is written as an array of its base, as a domain writes its base's
+    // output.
+    let (ty, typmod) = match cat.element(ty) {
+        e if e != 0 && cat.base(e) != e && cat.array_of(cat.base(e)) != 0 => {
+            (cat.array_of(cat.base(e)), -1)
+        }
+        _ => (ty, typmod),
+    };
     let name = print::format_type(cat, ty, typmod);
     let sql = format!(
         "CAST(CAST({} AS {name}) AS text)",

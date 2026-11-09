@@ -3989,8 +3989,11 @@ impl Draft {
                 ))
             })?;
             // A constant is cast to the column's type as it is set, as PostgreSQL's parser casts
-            // it: refused where the column's input refuses it.
+            // it: refused where the column's input refuses it. A fold's copy of the statement is
+            // read by the literal each mark stands for.
             if let (Some(e), Ok(table)) = (set.as_ref().filter(|e| constant(e)), finish_table(t)) {
+                let e = crate::deparse::analyze::unmarked_expr(e);
+                let e = e.as_ref().or(set.as_ref()).unwrap();
                 if let Err(why) = crate::read::statement::datum(e, &table, at) {
                     if why.sqlstate().is_some_and(|code| code.starts_with("22")) {
                         return Err(why);
@@ -5135,7 +5138,9 @@ impl Draft {
                     oids: Default::default(),
                 };
                 let text = p.to_string();
-                let read = crate::read::partial::Predicate::read(&alone, &alone.tables[0], &text)
+                // A fold's copy of the statement is read by the literal each mark stands for.
+                let read_as = crate::deparse::analyze::unmarked(&text);
+                let read = crate::read::partial::Predicate::read(&alone, &alone.tables[0], &read_as)
                     .map_err(
                     |e| {
                         Error::new(format!(

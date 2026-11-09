@@ -1621,43 +1621,141 @@ fn the_session_time_zone_reads_and_writes_instants_as_postgresql_does() {
 }
 
 #[test]
-fn a_ddl_literal_read_on_the_zone_keeps_the_session_to_utc() {
+fn a_ddl_literal_its_zone_or_its_clock_reads_is_kept_as_its_value_where_it_is_declared() {
     let mut w = snail("folded");
     run(&mut w, "SET TimeZone = '<+05>-05'");
-    // A literal naming its offset reads alike under every zone, and one on a date column needs none.
     run(
         &mut w,
-        "CREATE TABLE s.w (id integer PRIMARY KEY, d timestamptz CHECK (d >= '2026-01-01 00:00+00'), \
-         a date CHECK (a >= '2026-01-01'))",
+        "CREATE TABLE s.t (id integer PRIMARY KEY, \
+         d timestamptz CONSTRAINT t_d CHECK (d >= '2026-01-01 00:00'), \
+         e timestamptz DEFAULT '2026-06-01 00:00', \
+         z timetz CONSTRAINT t_z CHECK (z <> '12:00'), \
+         r tstzrange CONSTRAINT t_r CHECK (r <> '[2026-01-01, 2026-02-01)'), \
+         a timestamptz[] DEFAULT '{2026-01-01 10:00}', \
+         g boolean GENERATED ALWAYS AS (d > '2026-01-02') STORED, \
+         n date DEFAULT 'today', l timestamp DEFAULT 'now', \
+         k date CONSTRAINT t_k CHECK (k >= '2026-01-01'), x text DEFAULT '2026-01-01')",
+    );
+    run(
+        &mut w,
+        "CREATE DOMAIN s.dd AS timestamptz DEFAULT '2026-03-01 00:00' CONSTRAINT dd_c CHECK \
+         (VALUE > '2000-01-01')",
+    );
+    run(&mut w, "CREATE INDEX t_part ON s.t (id) WHERE d < '2026-07-01'");
+    run(
+        &mut w,
+        "CREATE VIEW s.v AS SELECT id, d, '2026-01-01'::timestamptz AS x, timestamptz \
+         '2026-01-01 01:00' AS y FROM s.t WHERE d < '2026-03-01'",
+    );
+    run(&mut w, "ALTER TABLE s.t ALTER COLUMN e SET DEFAULT '2026-07-01 00:00'");
+    run(&mut w, "ALTER TABLE s.t ADD CONSTRAINT t_e CHECK (e > '2020-01-01')");
+    run(&mut w, "CREATE DOMAIN s.de AS timestamptz");
+    run(
+        &mut w,
+        "CREATE TABLE s.q (id integer PRIMARY KEY, q s.de[] DEFAULT '{2026-01-01 10:00}', \
+         m tstzmultirange DEFAULT '{[2026-01-01, 2026-02-01)}' CONSTRAINT q_m CHECK (m <> \
+         '{[2026-03-01, 2026-04-01)}'))",
+    );
+    // Read under another zone, each is the value it was where it was declared, as 18.6 prints it.
+    run(&mut w, "SET TimeZone = 'UTC'");
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = \
+             's.q'::regclass ORDER BY adnum"
+        ),
+        [
+            "2|'{\"2026-01-01 05:00:00+00\"}'::s.de[]",
+            "3|'{[\"2025-12-31 19:00:00+00\",\"2026-01-31 19:00:00+00\")}'::tstzmultirange",
+        ]
     );
     assert_eq!(
-        refused(&mut w, "INSERT INTO s.w VALUES (1, '2026-01-01 04:00', NULL)").0,
+        rows(&mut w, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'q_m'"),
+        ["CHECK ((m <> '{[\"2026-02-28 19:00:00+00\",\"2026-03-31 19:00:00+00\")}'::tstzmultirange))"]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE conname IN \
+             ('dd_c', 't_d', 't_e', 't_k', 't_r', 't_z') ORDER BY conname"
+        ),
+        [
+            "dd_c|CHECK ((VALUE > '1999-12-31 19:00:00+00'::timestamp with time zone))",
+            "t_d|CHECK ((d >= '2025-12-31 19:00:00+00'::timestamp with time zone))",
+            "t_e|CHECK ((e > '2019-12-31 19:00:00+00'::timestamp with time zone))",
+            "t_k|CHECK ((k >= '2026-01-01'::date))",
+            "t_r|CHECK ((r <> '[\"2025-12-31 19:00:00+00\",\"2026-01-31 19:00:00+00\")'::tstzrange))",
+            "t_z|CHECK ((z <> '12:00:00+05'::time with time zone))",
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = \
+             's.t'::regclass AND adnum NOT IN (8, 9) ORDER BY adnum"
+        ),
+        [
+            "3|'2026-06-30 19:00:00+00'::timestamp with time zone",
+            "6|'{\"2026-01-01 05:00:00+00\"}'::timestamp with time zone[]",
+            "7|(d > '2026-01-01 19:00:00+00'::timestamp with time zone)",
+            "11|'2026-01-01'::text",
+        ]
+    );
+    // The clock's literals, kept as the date and the instant they read where declared.
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT adnum, pg_get_expr(adbin, adrelid) ~ '^''20[0-9-]+ ?[0-9:.]*''::' FROM \
+             pg_attrdef WHERE adrelid = 's.t'::regclass AND adnum IN (8, 9) ORDER BY adnum"
+        ),
+        ["8|t", "9|t"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT pg_get_indexdef('s.t_part'::regclass)"),
+        ["CREATE INDEX t_part ON s.t USING btree (id) WHERE (d < '2026-06-30 19:00:00+00'::timestamp \
+          with time zone)"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT pg_get_expr(typdefaultbin, 0) FROM pg_type WHERE typname = 'dd'"),
+        ["'2026-02-28 19:00:00+00'::timestamp with time zone"]
+    );
+    // And each row is taken or refused as 18.6 takes or refuses it.
+    run(&mut w, "INSERT INTO s.t (id, d) VALUES (1, '2025-12-31 20:00:00+00')");
+    assert_eq!(
+        refused(&mut w, "INSERT INTO s.t (id, d) VALUES (2, '2025-12-31 18:00:00+00')").0,
         Some("23514")
     );
-    let unfolded = "holds a literal PostgreSQL reads once, under the zone its DDL ran in";
-    for ddl in [
-        "CREATE TABLE s.t (id integer PRIMARY KEY, d timestamptz CHECK (d >= '2026-01-01 00:00'))",
-        "CREATE TABLE s.t (id integer PRIMARY KEY, d timestamptz DEFAULT '2026-06-01 00:00')",
-        "CREATE TABLE s.t (id integer PRIMARY KEY, d timetz CHECK (d > '12:00'))",
-        "CREATE TABLE s.t (id integer PRIMARY KEY, n text CHECK (n::timestamptz > '2026-01-01'))",
-        "CREATE TABLE s.t (id integer PRIMARY KEY, r tstzrange CHECK (r <> '[2026-01-01, 2026-02-01)'))",
-        "CREATE VIEW s.v AS SELECT id FROM s.w WHERE d < '2026-03-01'",
-        "CREATE INDEX w_part ON s.w (id) WHERE d < '2026-07-01'",
-    ] {
-        assert!(refused(&mut w, ddl).1.contains(unfolded), "{ddl}");
-    }
-    run(&mut w, "SET TimeZone = 'UTC'");
-    run(
-        &mut w,
-        "CREATE TABLE s.t (id integer PRIMARY KEY, d timestamptz CHECK (d >= '2026-01-01 00:00'))",
+    assert_eq!(
+        refused(&mut w, "INSERT INTO s.t (id, d, z) VALUES (3, '2026-01-01 00:00:00+00', '12:00+05')").0,
+        Some("23514")
     );
-    assert!(refused(&mut w, "SET TimeZone = '<+05>-05'").1.contains(unfolded));
-    assert!(refused(&mut w, "SELECT set_config('TimeZone', '+05', false)")
-        .1
-        .contains(unfolded));
-    // UTC by another name is UTC.
-    run(&mut w, "SET TimeZone = 'Etc/UTC'");
-    run(&mut w, "DROP TABLE s.t");
+    run(&mut w, "INSERT INTO s.t (id, d, z) VALUES (4, '2026-01-01 00:00:00+00', '12:00+00')");
+    run(&mut w, "INSERT INTO s.t (id, d) VALUES (5, '2026-02-28 21:00:00+00')");
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT id, d, e, a, g, l = (SELECT l FROM s.t WHERE id = 1) FROM s.t ORDER BY id"
+        ),
+        [
+            "1|2025-12-31 20:00:00+00|2026-06-30 19:00:00+00|{\"2026-01-01 05:00:00+00\"}|f|t",
+            "4|2026-01-01 00:00:00+00|2026-06-30 19:00:00+00|{\"2026-01-01 05:00:00+00\"}|f|t",
+            "5|2026-02-28 21:00:00+00|2026-06-30 19:00:00+00|{\"2026-01-01 05:00:00+00\"}|t|t",
+        ]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT id, x, y FROM s.v ORDER BY id"),
+        [
+            "1|2025-12-31 19:00:00+00|2025-12-31 20:00:00+00",
+            "4|2025-12-31 19:00:00+00|2025-12-31 20:00:00+00",
+        ]
+    );
     run(&mut w, "SET TimeZone = '<+05>-05'");
-    assert_eq!(rows(&mut w, "SHOW TimeZone"), ["<+05>-05"]);
+    assert_eq!(
+        rows(&mut w, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 't_d'"),
+        ["CHECK ((d >= '2026-01-01 00:00:00+05'::timestamp with time zone))"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT id, e FROM s.t ORDER BY id"),
+        ["1|2026-07-01 00:00:00+05", "4|2026-07-01 00:00:00+05", "5|2026-07-01 00:00:00+05"]
+    );
 }

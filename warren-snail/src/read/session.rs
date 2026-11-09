@@ -709,16 +709,6 @@ impl super::Snail {
         )
     }
 
-    /// The session's TimeZone, as SHOW writes it.
-    pub(super) fn session_zone_name(&self) -> String {
-        self.session
-            .settings
-            .all()
-            .get("timezone")
-            .cloned()
-            .unwrap_or_else(|| "UTC".to_string())
-    }
-
     /// What set_config and current_setting read the session's settings and modes by.
     pub(super) fn settings_view(&self) -> super::settings::View {
         super::settings::View {
@@ -775,15 +765,6 @@ impl super::Snail {
         local: bool,
     ) -> Result<()> {
         let begun = self.begun.is_some();
-        // A zone other than UTC only where no DDL literal would be read otherwise under it.
-        if let (true, super::settings::Taken::Stored(Some(zone))) = (name == "timezone", &taken) {
-            let _zoned = crate::zones::in_zone(Some(zone));
-            if !crate::zones::session_is_utc() {
-                if let Some(what) = super::folded::unfolded(&self.catalog) {
-                    return Err(super::folded::refusal(&what, zone));
-                }
-            }
-        }
         match taken {
             super::settings::Taken::Nothing => {}
             // SET LOCAL outside a transaction lasts no longer than the statement.

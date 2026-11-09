@@ -21,7 +21,6 @@ pub(crate) mod elements;
 mod explain;
 pub(crate) mod fill;
 pub(crate) mod foreign;
-mod folded;
 pub mod handed;
 mod hash;
 pub(crate) mod image;

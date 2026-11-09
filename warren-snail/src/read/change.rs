@@ -4169,22 +4169,21 @@ impl Snail {
     fn declare(&mut self, ddl: &str) -> Result<Vec<String>> {
         let text = format!("{}\n{ddl};\n", self.catalog.ddl.trim_end());
         let kept = Catalog::statements_in(&self.catalog.ddl)?;
+        let (format, root) = (self.reader.format(), &self.root);
+        let prepared = |catalog: &mut Catalog| -> Result<()> {
+            super::old_names(catalog, format);
+            catalog.with_release(root.release)?;
+            catalog.with_monetary(&crate::file::monetary_of(catalog, &root.monetary))?;
+            catalog.with_text_search(root.text_search())
+        };
+        // Each literal PostgreSQL keeps as its value where the statement is declared, kept so,
+        // under the statement's zone and on its clock.
+        let text = crate::deparse::fold::folded(&text, kept, kept, &prepared)?.into_owned();
         let (mut catalog, said) = Catalog::parse_declared(&text, kept)?;
-        super::old_names(&mut catalog, self.reader.format());
-        catalog.with_release(self.root.release)?;
-        catalog.with_monetary(&crate::file::monetary_of(&catalog, &self.root.monetary))?;
-        catalog.with_text_search(self.root.text_search())?;
+        prepared(&mut catalog)?;
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         crate::file::holds_catalog(self.reader.format(), &catalog)?;
-        // Under a zone other than UTC a declaration makes no literal its zone would read
-        // otherwise; the file held none before it.
-        if !crate::zones::session_is_utc() {
-            if let Some(what) = super::folded::unfolded(&catalog) {
-                let zone = self.session_zone_name();
-                return Err(super::folded::refusal(&what, &zone));
-            }
-        }
         for t in &catalog.tables {
             crate::file::holds(self.reader.format(), t)?;
             let old = self.catalog.tables.iter().find(|x| x.name == t.name);

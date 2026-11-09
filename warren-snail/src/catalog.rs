@@ -2929,8 +2929,14 @@ pub(crate) fn level(s: Shape) -> Level {
 }
 
 impl Catalog {
-    /// The DDL read whole: refused at the first statement the snail does not read, by name.
+    /// The DDL read whole: refused at the first statement the snail does not read, by name. Each
+    /// literal PostgreSQL reads once, where its statement is declared, is kept as the value it
+    /// reads as now, under the zone in force: an instant or a time its zone reads, and a date or a
+    /// time the clock gives (`now`, `today`), in a CHECK, a DEFAULT, a generated column, a domain,
+    /// an index or a view.
     pub fn parse(ddl: &str) -> Result<Catalog> {
+        let ddl = crate::deparse::fold::folded(ddl, 0, 0, &|_| Ok(()))?;
+        let ddl = ddl.as_ref();
         let reading = crate::ddl::read_ddl(ddl, true)?;
         match reading.statements.iter().find_map(|s| s.refused.as_ref()) {
             Some(why) => Err(Error::new(why.clone())),
