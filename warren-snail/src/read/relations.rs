@@ -1287,6 +1287,16 @@ impl Laying<'_> {
                 renames.len()
             )));
         }
+        // A plan cache's counts, which a snail has none of, refused by name where a statement
+        // reads them.
+        if name == "pg_prepared_statement" {
+            for (i, c) in cols.iter().enumerate() {
+                if super::prepared::PLAN_CACHE.contains(&c.name.as_str()) {
+                    self.refused
+                        .insert(at + i, super::prepared::plan_cache_refusal(&c.name));
+                }
+            }
+        }
         for (c, r) in cols.iter_mut().zip(&renames) {
             c.name = r.clone();
         }

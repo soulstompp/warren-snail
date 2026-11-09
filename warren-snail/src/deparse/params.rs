@@ -155,6 +155,19 @@ fn each_in(n: &Node, f: &mut dyn FnMut(usize, u32)) {
 /// where its reading cannot settle one. Where `checked` is false, a parameter left unknown is
 /// unknown, and none is refused for it.
 pub(crate) fn types(catalog: &Catalog, sql: &str, given: &[u32], checked: bool) -> Result<Vec<u32>> {
+    reading(catalog, sql, given, checked).map(|r| r.params)
+}
+
+/// What PostgreSQL's parse analysis of a statement gives a prepared statement: each parameter's
+/// type, and each column's of the rows it returns, none where it returns no rows (a write without
+/// RETURNING), as its result descriptor has them.
+pub(crate) struct Reading {
+    pub(crate) params: Vec<u32>,
+    pub(crate) results: Option<Vec<u32>>,
+}
+
+/// A statement read as `types` reads it, with the types of the columns it returns.
+pub(crate) fn reading(catalog: &Catalog, sql: &str, given: &[u32], checked: bool) -> Result<Reading> {
     let bound = crate::grammar::bound(sql);
     let parsed = crate::read::image::parse_sql(bound.as_deref().unwrap_or(sql))?;
     let [st] = parsed.as_slice() else {
@@ -169,8 +182,22 @@ pub(crate) fn types(catalog: &Catalog, sql: &str, given: &[u32], checked: bool) 
     let read = super::query::statement(&cat, st)?;
     let slots = typing.types();
     drop(typing);
+    use sqlparser::ast::{SetExpr, Statement};
+    let writes = match st {
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => true,
+        Statement::Query(q) => matches!(
+            q.body.as_ref(),
+            SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_)
+        ),
+        _ => false,
+    };
+    let outputs: Vec<u32> = read.output().map(|t| t.expr.ty()).collect();
+    let results = match writes && outputs.is_empty() {
+        true => None,
+        false => Some(outputs),
+    };
     if !checked {
-        return Ok(slots);
+        return Ok(Reading { params: slots, results });
     }
     // check_variable_parameters: a reference left unknown where another settled its parameter.
     let mut left = None;
@@ -192,7 +219,7 @@ pub(crate) fn types(catalog: &Catalog, sql: &str, given: &[u32], checked: bool) 
             k + 1
         )));
     }
-    Ok(slots)
+    Ok(Reading { params: slots, results })
 }
 
 /// Whether a refusal of a statement's reading is PostgreSQL's own for its parameters, in its

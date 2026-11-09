@@ -5,6 +5,7 @@
 //! server fills (an owner's name, the database's name, a size) is NULL and refused by name where a
 //! statement asks it; information_schema's domains are read as their base types and its own
 //! functions as the expressions they return. The server's statistics views are refused whole.
+//! pg_prepared_statements reads the session's prepared statements, but for a plan cache's counts.
 
 use crate::{Error, Result};
 use sqlparser::ast::{
@@ -218,10 +219,7 @@ const SERVERS_VIEWS: &[(&[&str], &str)] = &[
         ],
         "user mappings, a role's",
     ),
-    (
-        &["pg_cursors", "pg_prepared_statements"],
-        "a session's cursors and prepared statements",
-    ),
+    (&["pg_cursors"], "a session's cursors"),
     (&["pg_locks", "pg_prepared_xacts"], "transactions' locks"),
     (
         &[
@@ -326,6 +324,15 @@ fn servers_read(e: &Expr) -> Option<String> {
             Expr::Identifier(i) if servers_column(&i.value) => {
                 Some(format!("{} is a server's own", i.value))
             }
+            Expr::Identifier(i) if super::prepared::PLAN_CACHE.contains(&i.value.as_str()) => {
+                Some(super::prepared::plan_cache_refusal(&i.value))
+            }
+            Expr::CompoundIdentifier(p)
+                if p.last()
+                    .is_some_and(|i| super::prepared::PLAN_CACHE.contains(&i.value.as_str())) =>
+            {
+                Some(super::prepared::plan_cache_refusal(&p.last().unwrap().value))
+            }
             Expr::CompoundIdentifier(p) if p.last().is_some_and(|i| servers_column(&i.value)) => {
                 Some(format!("{} is a server's own", p.last().unwrap().value))
             }
@@ -413,10 +420,20 @@ fn rewrite(q: &mut Query, catalog: &crate::catalog::Catalog) -> Result<Vec<Optio
                     refused.resize(i + 1, None);
                 }
                 refused[i].get_or_insert(why);
+                // A column keeps its name once it is NULL, as the view names it. An unnamed
+                // function keeps none: PostgreSQL names it by its function, which the view writes
+                // with an alias wherever one is read.
+                let column = match e {
+                    Expr::Identifier(c) => Some(c.clone()),
+                    Expr::CompoundIdentifier(p) => p.last().cloned(),
+                    _ => None,
+                };
                 *e = Expr::Value(Value::Null.into());
-                if let SelectItem::UnnamedExpr(_) = item {
-                    // An unnamed item keeps no name once it is NULL: PostgreSQL names it by its
-                    // function, which the view writes with an alias wherever one is read.
+                if let (SelectItem::UnnamedExpr(_), Some(alias)) = (&*item, column) {
+                    *item = SelectItem::ExprWithAlias {
+                        expr: Expr::Value(Value::Null.into()),
+                        alias,
+                    };
                 }
             }
         }

@@ -781,6 +781,12 @@ impl Typing<'_> {
                 if let Some(t) = super::sequences::typed(&name) {
                     return Ok(Some(t));
                 }
+                if let Some(t) = super::prepared::typed(&name, self.release) {
+                    if !types.is_empty() {
+                        return Err(no_form(&name, &types));
+                    }
+                    return Ok(Some(t));
+                }
                 if let Some(t) = crate::deparse::typed(&name) {
                     return Ok(Some(t));
                 }

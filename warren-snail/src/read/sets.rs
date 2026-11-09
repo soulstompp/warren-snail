@@ -27,6 +27,9 @@ pub(super) fn values(
     if let Some(v) = super::rest::set(name, &resolved)? {
         return Ok(v);
     }
+    if let Some(rows) = super::prepared::rows(name, given.len(), ty)? {
+        return Ok(rows);
+    }
     if let Some(rows) = super::rest::rows(name, &resolved)? {
         let ty = crate::composed::type_of(crate::composed::Composed::Record {
             name: "record".into(),

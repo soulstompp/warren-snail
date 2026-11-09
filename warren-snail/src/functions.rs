@@ -691,6 +691,7 @@ const HELD: &[&str] = &[
     "pclose(path)",
     "pg_basetype(regtype)",
     "pg_get_keywords()",
+    "pg_prepared_statement()",
     "pg_snapshot_xip(pg_snapshot)",
     "pg_snapshot_xmax(pg_snapshot)",
     "pg_snapshot_xmin(pg_snapshot)",

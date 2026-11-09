@@ -2,12 +2,16 @@
 //! of its parameters and its statement, run by EXECUTE with its parameters' values. A parameter's
 //! type is the one PREPARE names, else the one PostgreSQL's parse analysis settles where it stands
 //! (`deparse::params`), and PREPARE is refused where that reading refuses it; where the reading
-//! reads no such statement, the type the column it meets gives it, or text.
+//! reads no such statement, the type the column it meets gives it, or text. pg_prepared_statement()
+//! gives the session's prepared statements as PostgreSQL's does, but for a plan cache's counts.
 
-use super::Snail;
-use crate::catalog::Catalog;
+use super::{Snail, Value};
+use crate::catalog::{Catalog, ColumnType};
+use crate::regs::RegKind;
 use crate::{Error, Result};
 use sqlparser::ast::{Expr, SetExpr, Statement as Sql};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// A statement PREPARE keeps.
 #[derive(Clone, Debug)]
@@ -18,10 +22,17 @@ pub(super) struct Prepared {
     /// Each parameter's type by its OID, where PostgreSQL's reading of the statement settled
     /// them all.
     pub(super) oids: Option<Vec<u32>>,
+    /// Where that reading settled them, each column's type by its OID of the rows the statement
+    /// returns; none where it returns none, a write without RETURNING.
+    pub(super) results: Option<Vec<u32>>,
     /// Each reference to a parameter, in the order they stand: how its value is written there.
     pub(super) written: Vec<Written>,
     /// The statement, as written.
     pub(super) statement: String,
+    /// The text the PREPARE came in, whole, as the session was handed it.
+    pub(super) source: String,
+    /// When the PREPARE ran: its statement's clock.
+    pub(super) at: i64,
 }
 
 /// How a parameter's value is written where a reference to it stands.
@@ -354,14 +365,156 @@ pub(super) fn parse_prepare(sql: &str) -> Option<Result<(String, Vec<Option<Stri
 /// A session's prepared statements, by name.
 pub(super) type Kept = std::collections::BTreeMap<String, Prepared>;
 
+thread_local! {
+    /// The session's prepared statements while one of its statements runs, as
+    /// pg_prepared_statement() reads them.
+    static VIEWED: RefCell<Option<Rc<Kept>>> = const { RefCell::new(None) };
+}
+
+/// The session's prepared statements, held while a statement runs; those held before come back
+/// where it is dropped.
+pub(super) struct Viewing(Option<Rc<Kept>>);
+
+pub(super) fn viewing(kept: &Rc<Kept>) -> Viewing {
+    Viewing(VIEWED.with(|v| v.replace(Some(kept.clone()))))
+}
+
+impl Drop for Viewing {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        VIEWED.with(|v| *v.borrow_mut() = before);
+    }
+}
+
+/// The columns of pg_prepared_statement()'s rows under a release, each its name and type:
+/// result_types from 16.
+fn columns(release: u8) -> Vec<(&'static str, ColumnType)> {
+    let regtypes = super::typed::array_of(ColumnType::Reg(RegKind::Type, release));
+    let mut out = vec![
+        ("name", ColumnType::Text(None)),
+        ("statement", ColumnType::Text(None)),
+        ("prepare_time", ColumnType::Timestamptz),
+        ("parameter_types", regtypes),
+    ];
+    if release >= 16 {
+        out.push(("result_types", regtypes));
+    }
+    out.extend([
+        ("from_sql", ColumnType::Boolean),
+        ("generic_plans", ColumnType::Int8),
+        ("custom_plans", ColumnType::Int8),
+    ]);
+    out
+}
+
+/// The columns of pg_prepared_statement()'s rows only a plan cache fills: how many times each
+/// statement was run on its generic plan and on a custom one.
+pub(super) const PLAN_CACHE: [&str; 2] = ["generic_plans", "custom_plans"];
+
+/// Why a column of a plan cache's is not read.
+pub(super) fn plan_cache_refusal(column: &str) -> String {
+    format!("{column} is a plan cache's count")
+}
+
+/// The type of pg_prepared_statement()'s rows under a release; none for any other name.
+pub(super) fn typed(name: &str, release: u8) -> Option<ColumnType> {
+    (name == "pg_prepared_statement").then(|| {
+        crate::composed::type_of(crate::composed::Composed::Record {
+            name: "record".into(),
+            fields: columns(release)
+                .into_iter()
+                .map(|(n, t)| crate::composed::Field::new(n, t))
+                .collect(),
+        })
+    })
+}
+
+/// pg_prepared_statement()'s rows: the session's prepared statements, each a record of `ty`, its
+/// columns as PostgreSQL's fills them but a plan cache's, which are NULL and refused by name where
+/// a statement reads them. Refused where a statement's types were not settled as PostgreSQL's
+/// reading settles them. None for any other name.
+pub(super) fn rows(name: &str, given: usize, ty: Option<ColumnType>) -> Result<Option<Vec<Value>>> {
+    if name != "pg_prepared_statement" {
+        return Ok(None);
+    }
+    if given > 0 {
+        return Err(Error::new(format!(
+            "function pg_prepared_statement({}) does not exist",
+            vec!["unknown"; given].join(", ")
+        )));
+    }
+    let Some(ColumnType::Composed(r)) = ty else {
+        return Err(Error::new("pg_prepared_statement() is read in FROM"));
+    };
+    let crate::composed::Composed::Record { fields, .. } = r.def() else {
+        return Err(Error::new("pg_prepared_statement() is read in FROM"));
+    };
+    let kept = VIEWED.with(|v| v.borrow().clone()).unwrap_or_default();
+    let mut out = Vec::with_capacity(kept.len());
+    for (n, p) in kept.iter() {
+        let Some(oids) = &p.oids else {
+            return Err(Error::new(format!(
+                "the types of prepared statement \"{n}\" were not settled as PostgreSQL's parse \
+                 analysis settles them: pg_prepared_statement() is not read"
+            )));
+        };
+        let mut items = Vec::with_capacity(fields.len());
+        for f in fields {
+            let v = match f.name.as_str() {
+                "name" => Value::Text(n.clone()),
+                "statement" => Value::Text(p.source.clone()),
+                "prepare_time" => Value::Scalar(ColumnType::Timestamptz, p.at),
+                "parameter_types" => regtypes(f.ty, oids)?,
+                "result_types" => match &p.results {
+                    Some(r) => regtypes(f.ty, r)?,
+                    None => Value::Null,
+                },
+                "from_sql" => Value::Bool(true),
+                _ => Value::Null,
+            };
+            items.push(super::pipeline::part_of(f.ty, v, false)?);
+        }
+        out.push(super::pipeline::composed(ty.unwrap(), crate::composed::Item::Record(items)));
+    }
+    Ok(Some(out))
+}
+
+/// A regtype[] of types by their OIDs.
+fn regtypes(ty: ColumnType, oids: &[u32]) -> Result<Value> {
+    let element = super::typed::element_of(ty).expect("an array of regtype");
+    let elements = oids
+        .iter()
+        .map(|&o| {
+            super::pipeline::part_of(
+                element,
+                Value::Scalar(element, crate::scalars::unsigned_key(u64::from(o), 32)),
+                false,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (dims, lower) = match elements.len() {
+        0 => (Vec::new(), Vec::new()),
+        n => (vec![n as i32], vec![1]),
+    };
+    Ok(super::pipeline::composed(
+        ty,
+        crate::composed::Item::Array {
+            elements,
+            dims,
+            lower,
+        },
+    ))
+}
+
 /// PREPARE: the statement kept under `name`, each parameter's type named or settled where it
-/// stands.
+/// stands; `source` the text it came in, `at` its statement's clock.
 pub(super) fn prepare(
     kept: &mut Kept,
     catalog: &Catalog,
     name: &str,
     given: Vec<Option<String>>,
     body: &str,
+    (source, at): (&str, i64),
 ) -> Result<()> {
     if kept.contains_key(name) {
         return Err(Error::new(format!(
@@ -386,8 +539,11 @@ pub(super) fn prepare(
         .map(|g| g.as_deref().map_or(Ok(0), |t| params::named_type(catalog, t)))
         .collect::<Result<_>>()?;
     let (text, refs) = params::each_reference(body)?;
-    let prepared = match params::types(catalog, body, &named, true) {
-        Ok(oids) => {
+    let prepared = match params::reading(catalog, body, &named, true) {
+        Ok(params::Reading {
+            params: oids,
+            results,
+        }) => {
             let names = params::type_names(catalog, &oids);
             // Each reference's own type, as a literal standing there would be read.
             let own = params::types(catalog, &text, &[], false).ok();
@@ -411,8 +567,11 @@ pub(super) fn prepare(
             Prepared {
                 types: names.into_iter().map(Some).collect(),
                 oids: Some(oids),
+                results,
                 written,
                 statement: body.to_string(),
+                source: source.to_string(),
+                at,
             }
         }
         Err(e) if params::refuses(&e) => return Err(e),
@@ -438,8 +597,11 @@ pub(super) fn prepare(
             Prepared {
                 types,
                 oids: None,
+                results: None,
                 written,
                 statement: body.to_string(),
+                source: source.to_string(),
+                at,
             }
         }
     };
@@ -568,4 +730,37 @@ fn returned_params(sql: &str) -> Vec<usize> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pg_prepared_statements_rows_carry_result_types_from_16() {
+        let names = |release: u8| -> Vec<String> {
+            let Some(ColumnType::Composed(r)) = typed("pg_prepared_statement", release) else {
+                panic!("a record")
+            };
+            let crate::composed::Composed::Record { fields, .. } = r.def() else {
+                panic!("a record")
+            };
+            fields.iter().map(|f| f.name.clone()).collect()
+        };
+        assert_eq!(
+            names(15),
+            [
+                "name",
+                "statement",
+                "prepare_time",
+                "parameter_types",
+                "from_sql",
+                "generic_plans",
+                "custom_plans"
+            ]
+        );
+        assert_eq!(names(16)[4], "result_types");
+        assert_eq!(names(18).len(), 8);
+        assert!(typed("pg_prepared_statements", 18).is_none());
+    }
 }

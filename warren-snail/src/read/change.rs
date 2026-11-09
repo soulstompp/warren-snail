@@ -994,7 +994,7 @@ impl Snail {
             return self.answered(sql, params);
         }
         if let Statement::Session(said) = st {
-            return self.said(said, params);
+            return self.said(said, sql);
         }
         // A transaction READ ONLY takes no write, in PostgreSQL's words.
         let begun = self.begun.is_some();
@@ -1054,6 +1054,7 @@ impl Snail {
             statement: st.kind(),
             ..Default::default()
         };
+        let _prepared = super::prepared::viewing(&self.session.prepared);
         let viewing = super::settings::viewing(self.settings_view());
         let changed = match st {
             Statement::Setting { .. } => false,

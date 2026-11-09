@@ -5,7 +5,8 @@
 //! returning rows of what it changed, its `old` and `new` among them, a write through a view reaching
 //! its table, each CHECK OPTION met, an INSERT of fewer values than columns, the replica role
 //! switching the foreign keys off, each parameter typed where PostgreSQL's parse analysis settles it
-//! and refused where it cannot. Every word,
+//! and refused where it cannot, the session's prepared statements in pg_prepared_statements. Every
+//! word,
 //! code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -1850,4 +1851,134 @@ fn a_parameter_is_typed_where_postgresql_settles_it_and_refused_where_it_cannot_
     assert_eq!(e.sqlstate(), Some("42P08"));
     let (b, _) = w.ask_with("SELECT k FROM s.p WHERE k = $1", None, &one("2")).unwrap();
     assert_eq!(b.num_rows(), 1);
+}
+
+#[test]
+fn pg_prepared_statements_holds_the_sessions_statements_as_postgresql_shows_them() {
+    let mut w = snail("prepared-view");
+    run(&mut w, "CREATE DOMAIN s.dom AS varchar(4) CHECK (VALUE <> 'x')");
+    run(&mut w, "CREATE TABLE s.t (k integer NOT NULL, a varchar(5), m s.dom, PRIMARY KEY (k))");
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_prepared_statements"), ["0"]);
+    // Each statement as the session was handed it, its parameters' types and its rows' as 18.6's
+    // parse analysis settles them: none for a write without RETURNING.
+    for sql in [
+        "PREPARE q1 AS SELECT k FROM s.t WHERE k = $1 AND a = $2;",
+        "PREPARE q2 AS INSERT INTO s.t (k, a) VALUES ($1, $2);",
+        "PREPARE q3 (bigint, s.dom) AS SELECT $1, $2, 'x', NULL, m FROM s.t;",
+        "PREPARE q4 AS DELETE FROM s.t WHERE k = $1 RETURNING k, m;",
+        "PREPARE q5 AS SELECT FROM s.t;",
+        "PREPARE   q6   AS   SELECT 1  ;",
+    ] {
+        run(&mut w, sql);
+    }
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT name, statement, parameter_types, result_types, from_sql FROM \
+             pg_prepared_statements ORDER BY name"
+        ),
+        [
+            "q1|PREPARE q1 AS SELECT k FROM s.t WHERE k = $1 AND a = $2;|{integer,text}|{integer}|t",
+            "q2|PREPARE q2 AS INSERT INTO s.t (k, a) VALUES ($1, $2);|{integer,\"character varying\"}|NULL|t",
+            "q3|PREPARE q3 (bigint, s.dom) AS SELECT $1, $2, 'x', NULL, m FROM s.t;|{bigint,s.dom}|{bigint,s.dom,text,text,s.dom}|t",
+            "q4|PREPARE q4 AS DELETE FROM s.t WHERE k = $1 RETURNING k, m;|{integer}|{integer,s.dom}|t",
+            "q5|PREPARE q5 AS SELECT FROM s.t;|{}|{}|t",
+            "q6|PREPARE   q6   AS   SELECT 1  ;|{}|{integer}|t",
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT name, parameter_types[2], cardinality(result_types) FROM \
+             pg_prepared_statement() ORDER BY name"
+        ),
+        [
+            "q1|text|1",
+            "q2|character varying|NULL",
+            "q3|s.dom|5",
+            "q4|NULL|2",
+            "q5|NULL|0",
+            "q6|NULL|1",
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT pg_typeof(prepare_time), pg_typeof(parameter_types) FROM \
+             pg_prepared_statements WHERE name = 'q1'"
+        ),
+        ["timestamp with time zone|regtype[]"]
+    );
+    // Its time the PREPARE statement's own; a PREPARE outlives the transaction it was made in.
+    run(&mut w, "BEGIN");
+    run(&mut w, "PREPARE r1 AS SELECT 2");
+    assert_eq!(
+        rows(
+            &mut w,
+            "SELECT prepare_time >= now(), prepare_time < statement_timestamp() FROM \
+             pg_prepared_statements WHERE name = 'r1'"
+        ),
+        ["t|t"]
+    );
+    run(&mut w, "ROLLBACK");
+    run(&mut w, "DEALLOCATE q1");
+    assert_eq!(
+        rows(&mut w, "SELECT string_agg(name, ',' ORDER BY name) FROM pg_prepared_statements"),
+        ["q2,q3,q4,q5,q6,r1"]
+    );
+    // A write reads them as a question does.
+    run(&mut w, "CREATE TABLE s.names (n text NOT NULL, PRIMARY KEY (n))");
+    run(
+        &mut w,
+        "INSERT INTO s.names (n) SELECT name FROM pg_prepared_statements WHERE name LIKE 'q_'",
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT string_agg(n, ',' ORDER BY n) FROM s.names"),
+        ["q2,q3,q4,q5,q6"]
+    );
+    // A plan cache's counts, which a snail has none of, refused by name wherever they are read.
+    for (sql, words) in [
+        (
+            "SELECT * FROM pg_prepared_statements",
+            "generic_plans is a plan cache's count, only a running server's, and a snail has no \
+             server: it is not read",
+        ),
+        (
+            "SELECT custom_plans FROM pg_prepared_statements",
+            "custom_plans is a plan cache's count, only a running server's, and a snail has no \
+             server: it is not read",
+        ),
+        (
+            "SELECT p.generic_plans FROM pg_prepared_statement() p",
+            "generic_plans is a plan cache's count, only a running server's, and a snail has no \
+             server: it is not read",
+        ),
+        (
+            "SELECT pg_prepared_statement()",
+            "pg_prepared_statement() in a select list gives its rows whole, generic_plans and \
+             custom_plans among them, a plan cache's counts, and a snail has no plan cache: it is \
+             read in FROM, by its columns",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (None, words.to_string()), "{sql}");
+    }
+    assert_eq!(
+        refused(&mut w, "SELECT pg_prepared_statement(1)"),
+        (Some("42883"), "function pg_prepared_statement(integer) does not exist".to_string())
+    );
+    // A statement whose types were not settled as PostgreSQL's parse analysis settles them refuses
+    // the view while the session holds it, never answered with a guess.
+    run(&mut w, "PREPARE z AS TABLE s.t");
+    assert_eq!(
+        refused(&mut w, "SELECT name FROM pg_prepared_statements"),
+        (
+            None,
+            "the types of prepared statement \"z\" were not settled as PostgreSQL's parse \
+             analysis settles them: pg_prepared_statement() is not read"
+                .to_string()
+        )
+    );
+    run(&mut w, "DEALLOCATE z");
+    run(&mut w, "DEALLOCATE ALL");
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_prepared_statements"), ["0"]);
 }

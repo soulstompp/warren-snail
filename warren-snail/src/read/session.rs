@@ -450,7 +450,7 @@ pub(super) fn said(
 #[derive(Default)]
 pub(super) struct Session {
     pub(super) settings: Settings,
-    pub(super) prepared: super::prepared::Kept,
+    pub(super) prepared: std::rc::Rc<super::prepared::Kept>,
     pub(super) cursors: Vec<super::cursor::Cursor>,
     pub(super) table_locks: BTreeSet<(usize, Mode)>,
     /// The cursors declared so far, which numbers each.
@@ -561,10 +561,9 @@ impl super::Snail {
     }
 
     /// A statement of the session's own, run; in a transaction, one that fails fails it.
-    pub(super) fn said(&mut self, said: Said, params: &[String]) -> Result<super::Done> {
-        let _ = params;
+    pub(super) fn said(&mut self, said: Said, source: &str) -> Result<super::Done> {
         let kind = said.kind();
-        let ran = self.said_run(said);
+        let ran = self.said_run(said, source);
         match ran {
             Ok(mut done) => {
                 if done.statement.is_empty() {
@@ -582,7 +581,8 @@ impl super::Snail {
         }
     }
 
-    fn said_run(&mut self, said: Said) -> Result<super::Done> {
+    /// `source` the text the statement came in.
+    fn said_run(&mut self, said: Said, source: &str) -> Result<super::Done> {
         let mut done = super::Done::default();
         match said {
             Said::Savepoint { name } => self.savepoint(&name)?,
@@ -661,15 +661,19 @@ impl super::Snail {
                 types,
                 statement,
             } => super::prepared::prepare(
-                &mut self.session.prepared,
+                std::rc::Rc::make_mut(&mut self.session.prepared),
                 &self.catalog,
                 &name,
                 types,
                 &statement,
+                (source, self.clock.1),
             )?,
             Said::Execute { name, args } => return self.execute_prepared(&name, &args),
             Said::Deallocate { name } => {
-                super::prepared::deallocate(&mut self.session.prepared, name.as_deref())?
+                super::prepared::deallocate(
+                    std::rc::Rc::make_mut(&mut self.session.prepared),
+                    name.as_deref(),
+                )?
             }
             Said::Declare(d) => self.declare_cursor(d)?,
             Said::Fetch {

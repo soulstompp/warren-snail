@@ -1464,9 +1464,10 @@ impl Snail {
 
     /// An answer's rows as `answer_text` writes them, under the session's TimeZone as it stands:
     /// what PostgreSQL hands a client reading rows as text, a timestamptz on the session zone's
-    /// clock.
+    /// clock, and an OID of the file's own objects in a reg* type by its name.
     pub fn text_of(&self, batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>> {
         let _zoned = self.in_zone();
+        let _named = crate::oids::named(self.catalog.oids.clone());
         answer_text(batch)
     }
 
@@ -1537,6 +1538,7 @@ impl Snail {
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _handed = handed::holding(&self.functions);
+        let _prepared = prepared::viewing(&self.session.prepared);
         let viewing = settings::viewing(self.settings_view());
         let _timing = self.timing();
         let room = self.reader.room();

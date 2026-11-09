@@ -1278,8 +1278,9 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
 }
 
 /// The set-returning functions a step's select list reads.
-const SET_RETURNING: [&str; 11] = [
+const SET_RETURNING: [&str; 12] = [
     "unnest",
+    "pg_prepared_statement",
     "range_minus_multi",
     "multirange_minus_multi",
     "generate_subscripts",
@@ -1439,6 +1440,15 @@ fn sets_placed(e: &Expr) -> Result<()> {
             }
             if inner && is_set_returning(&name) {
                 return refused("a set-returning function among another's arguments is not read");
+            }
+            // Its rows whole hold a plan cache's counts, which a snail has none of.
+            if name == "pg_prepared_statement" && parts_of(e).is_empty() {
+                return refused(&format!(
+                    "pg_prepared_statement() in a select list gives its rows whole, {} among them, \
+                     a plan cache's counts, and a snail has no plan cache: it is read in FROM, by \
+                     its columns",
+                    super::prepared::PLAN_CACHE.join(" and ")
+                ));
             }
         }
         Expr::Case { .. } if parts_of(e).into_iter().any(holds_set) => {

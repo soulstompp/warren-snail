@@ -1932,7 +1932,7 @@ pg_partition_ancestors(regclass)		server	the server's catalog
 pg_partition_root(regclass)		server	the server's catalog
 pg_partition_tree(regclass)		server	the server's catalog
 pg_postmaster_start_time()		server	the server itself
-pg_prepared_statement()		server	sessions
+pg_prepared_statement()		type	prepared statements
 pg_prepared_xact()		server	sessions
 pg_promote(boolean,integer)		server	WAL and replication
 pg_read_binary_file(text)		server	files and logs

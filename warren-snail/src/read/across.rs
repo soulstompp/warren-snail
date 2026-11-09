@@ -171,9 +171,14 @@ pub struct Snails {
 
 impl Snails {
     /// An answer's rows as `answer_text` writes them, under the session's TimeZone as it stands,
-    /// which stands alike on every snail.
+    /// which stands alike on every snail, and an OID of a file's own objects in a reg* type by its
+    /// name where one snail is open.
     pub fn text_of(&self, batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>> {
         let _zoned = self.snails[0].in_zone();
+        let _named = match self.snails.as_slice() {
+            [one] => crate::oids::named(one.catalog.oids.clone()),
+            _ => crate::oids::named_several(),
+        };
         super::answer_text(batch)
     }
 
@@ -765,6 +770,16 @@ impl Snails {
                  objects from 16384, so across several their rows would name one OID twice",
             ));
         }
+        if self.snails.len() > 1
+            && super::sysviews::words_of(sql)
+                .iter()
+                .any(|w| matches!(w.as_str(), "pg_prepared_statement" | "pg_catalog.pg_prepared_statement"))
+        {
+            return Err(Error::new(
+                "pg_prepared_statement() is read on one snail at a time: each file numbers its own \
+                 types from 16384, so across several a parameter's type would name one OID twice",
+            ));
+        }
         // Its clock is the transaction's across the snails, begun at BEGIN or with the round alone.
         let at = super::change::wall_micros();
         let _clocked = crate::scalars::clocked(
@@ -778,6 +793,7 @@ impl Snails {
         // The session's settings stand alike on every snail; its zone is the first's.
         let _zoned = self.snails[0].in_zone();
         let _handed = super::handed::holding(&self.functions);
+        let _prepared = super::prepared::viewing(&self.session.prepared);
         let room = self.snails[0].reader.room();
         let entered = crate::room::entered(&room);
         if entered.outermost() {
@@ -1225,11 +1241,12 @@ impl Snails {
                 types,
                 statement,
             } => super::prepared::prepare(
-                &mut self.session.prepared,
+                std::rc::Rc::make_mut(&mut self.session.prepared),
                 &self.catalog,
                 &name,
                 types,
                 &statement,
+                (sql, super::change::wall_micros()),
             )
             .map(|_| Done::default()),
             Said::Execute { name, args } => {
@@ -1237,8 +1254,11 @@ impl Snails {
                     .and_then(|text| self.execute_across(&text))
             }
             Said::Deallocate { name } => {
-                super::prepared::deallocate(&mut self.session.prepared, name.as_deref())
-                    .map(|_| Done::default())
+                super::prepared::deallocate(
+                    std::rc::Rc::make_mut(&mut self.session.prepared),
+                    name.as_deref(),
+                )
+                .map(|_| Done::default())
             }
             Said::Declare(d) => {
                 let mut cursors = std::mem::take(&mut self.session.cursors);

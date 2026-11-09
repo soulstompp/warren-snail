@@ -635,6 +635,15 @@ fn prepared_statements_cursors_copy_and_explain_read_across_snails() {
         .unwrap();
     let d = w.execute("EXECUTE j(2)").unwrap();
     assert_eq!(bag(d.answer.as_ref().unwrap()), [vec![Some("two".into()), Some("dos".into())]]);
+    // The session's prepared statements are read on one snail at a time: across several, a file's
+    // own types would name one OID twice.
+    for sql in [
+        "SELECT name FROM pg_prepared_statements",
+        "SELECT name FROM pg_prepared_statement()",
+    ] {
+        let e = w.execute(sql).unwrap_err().to_string();
+        assert!(e.contains("read on one snail at a time"), "{sql}: {e}");
+    }
     w.execute("BEGIN").unwrap();
     w.execute("DECLARE c SCROLL CURSOR FOR SELECT t.k, t.v FROM a.t t ORDER BY t.k")
         .unwrap();
@@ -650,4 +659,23 @@ fn prepared_statements_cursors_copy_and_explain_read_across_snails() {
     assert!(d.rows > 0);
     let d = w.execute("EXPLAIN SELECT u.w FROM b.u u WHERE u.k = 1").unwrap();
     assert!(cell(d.answer.unwrap().column(0).as_ref(), 0).unwrap().starts_with("Snail round along"));
+    drop(w);
+    // Opened alone, the session's statements as it was handed them.
+    let mut one = warren_snail::read::Snails::open_writing(&[a.as_path()]).unwrap();
+    one.execute("PREPARE p (bigint) AS SELECT t.v FROM a.t t WHERE t.k = $1;").unwrap();
+    let d = one
+        .execute("SELECT name, statement, parameter_types, result_types FROM pg_prepared_statements")
+        .unwrap();
+    assert_eq!(
+        one.text_of(d.answer.as_ref().unwrap()).unwrap(),
+        [[
+            Some("p".to_string()),
+            Some("PREPARE p (bigint) AS SELECT t.v FROM a.t t WHERE t.k = $1;".to_string()),
+            Some("{bigint}".to_string()),
+            Some("{text}".to_string()),
+        ]]
+    );
+    one.execute("DEALLOCATE p").unwrap();
+    let d = one.execute("SELECT count(*) FROM pg_prepared_statement()").unwrap();
+    assert_eq!(one.text_of(d.answer.as_ref().unwrap()).unwrap(), [[Some("0".to_string())]]);
 }
