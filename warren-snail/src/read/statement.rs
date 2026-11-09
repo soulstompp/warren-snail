@@ -724,8 +724,8 @@ fn cast_through(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
         return Err(Error::new(format!(
             "column \"{}\" is of type {} but expression is of type {}",
             col.name,
-            col.ty.pg_name(),
-            from.pg_name()
+            super::typed::type_name(col.ty),
+            super::typed::type_name(from)
         )));
     }
     let d = super::fill::assign_value(v, from, &col.name)?;

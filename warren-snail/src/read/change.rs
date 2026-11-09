@@ -521,8 +521,8 @@ fn assigned_types(
             return Err(Error::new(format!(
                 "column \"{}\" is of type {} but expression is of type {}",
                 col.name,
-                col.ty.pg_name(),
-                from.pg_name().split('(').next().unwrap_or_default()
+                super::typed::type_name(col.ty),
+                super::typed::type_name(from)
             )));
         }
     }
@@ -1535,12 +1535,16 @@ impl Snail {
         // Each expression a column is set to, typed before any row is read, as PostgreSQL types it
         // against the column: read on the finder's relation, by the name it reads the table by.
         let (relation, by) = finder_relation(&find)?;
+        // Each written as the pipeline writes a statement's, and typed once, each item in turn,
+        // before its type is held to its column's.
         let mut computed: Vec<(usize, sqlparser::ast::Expr)> = Vec::new();
         for (c, f) in &sets {
             if let Fill::Expression(text) = f {
-                computed.push((*c, super::image::parse_expr(text)?));
+                let e = super::image::parse_expr(text)?;
+                computed.push((*c, super::spelled::expr_written(&e)));
             }
         }
+        let mut typed = Vec::with_capacity(computed.len());
         if !computed.is_empty() {
             let typing = format!(
                 "SELECT {} FROM {relation}",
@@ -1550,14 +1554,17 @@ impl Snail {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            for ((c, _), from) in computed.iter().zip(stated_types(&self.catalog, &typing)) {
+            let stated = stated_types(&self.catalog, &typing);
+            for (k, (c, e)) in computed.iter().enumerate() {
+                typed.push(fill::set_typed(&t, e, &by)?);
                 let col = &t.columns[*c];
+                let from = stated.get(k).copied().flatten();
                 if let Some(from) = from.filter(|&from| !assignable(from, col.ty)) {
                     return Err(Error::new(format!(
                         "column \"{}\" is of type {} but expression is of type {}",
                         col.name,
-                        col.ty.pg_name(),
-                        from.pg_name().split('(').next().unwrap_or_default()
+                        super::typed::type_name(col.ty),
+                        super::typed::type_name(from)
                     )));
                 }
             }
@@ -1600,12 +1607,11 @@ impl Snail {
                 n[*c] = match f {
                     Fill::Literal(d) => d.clone(),
                     Fill::Expression(_) => {
-                        let e = &computed
+                        let at = computed
                             .iter()
-                            .find(|(k, _)| k == c)
-                            .expect("an expression")
-                            .1;
-                        fill::set_to(&t, &o, *c, e, &by)?
+                            .position(|(k, _)| k == c)
+                            .expect("an expression");
+                        fill::set_to(&t, &o, *c, &computed[at].1, &by, &typed[at])?
                     }
                     Fill::Answer(k) => {
                         let (types, _) = asked.as_ref().expect("values asked");

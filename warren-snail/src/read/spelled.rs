@@ -1010,11 +1010,21 @@ fn rewrite_once(sql: &str) -> Result<Option<String>> {
 /// it: `x >= a AND x <= b`; NOT BETWEEN, `x < a OR x > b`; SYMMETRIC, both orders of the bounds
 /// or'd; NOT BETWEEN SYMMETRIC, both orders' NOT BETWEEN and'd. Each in parentheses. And each
 /// `CASE x WHEN v` whose `x` calls no function and holds no subquery written `CASE WHEN (x = v)`,
-/// the comparison `transformCaseExpr` makes, an `x` written as a quoted literal read as text.
+/// the comparison `transformCaseExpr` makes, an `x` written as a quoted literal read as text. And
+/// two rows of one length compared by IS DISTINCT FROM written as `make_row_distinct_op` writes
+/// them, each pair's IS DISTINCT FROM or'd in turn, FALSE for two rows of none; IS NOT DISTINCT FROM
+/// the NOT of that.
 pub(super) fn between_written(q: &Query) -> Query {
     let mut q = q.clone();
     query(&mut q);
     q
+}
+
+/// An expression written as `between_written` writes a statement's: an UPDATE's SET item's.
+pub(super) fn expr_written(e: &Expr) -> Expr {
+    let mut e = e.clone();
+    expr(&mut e);
+    e
 }
 
 fn query(q: &mut Query) {
@@ -1362,4 +1372,42 @@ fn expr(e: &mut Expr) {
         };
         *e = Expr::Nested(Box::new(written));
     }
+    if let Some(written) = rows_distinct(e) {
+        *e = written;
+    }
+}
+
+/// Two rows of one length compared by IS DISTINCT FROM or IS NOT DISTINCT FROM, written as
+/// `make_row_distinct_op` writes them; none for anything else.
+fn rows_distinct(e: &Expr) -> Option<Expr> {
+    let (Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b)) = e else {
+        return None;
+    };
+    let (Some(Ok(x)), Some(Ok(y))) = (
+        super::pipeline::row_parts(a),
+        super::pipeline::row_parts(b),
+    ) else {
+        return None;
+    };
+    if x.len() != y.len() {
+        return None;
+    }
+    let any = x
+        .iter()
+        .zip(&y)
+        .map(|(l, r)| Expr::IsDistinctFrom(Box::new((*l).clone()), Box::new((*r).clone())))
+        .reduce(|acc, d| Expr::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOperator::Or,
+            right: Box::new(d),
+        })
+        .unwrap_or(Expr::Value(sqlparser::ast::Value::Boolean(false).into()));
+    let written = match e {
+        Expr::IsNotDistinctFrom(..) => Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(Expr::Nested(Box::new(any))),
+        },
+        _ => any,
+    };
+    Some(Expr::Nested(Box::new(written)))
 }

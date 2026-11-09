@@ -4087,8 +4087,8 @@ fn select_step(
         };
         let row = vec![Value::Null; from.columns.len()];
         for g in gates {
-            let v = pipeline::eval(g, &row, &frame, &pipeline::computed_none())?;
-            if pipeline::truth(&v)? != Some(true) {
+            let v = pipeline::holds(g, &row, &frame, &pipeline::computed_none())?;
+            if v != Some(true) {
                 shut = true;
                 break;
             }

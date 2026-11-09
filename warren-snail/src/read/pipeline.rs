@@ -3230,6 +3230,62 @@ pub(super) fn truth(v: &Value) -> Result<Option<bool>> {
     }
 }
 
+/// A quoted literal or a parameter beside an expression the step resolved to an integer, read by
+/// that integer's input at its width, as PostgreSQL gives an unknown the other side's type; any
+/// other value as it is.
+fn integer_read(frame: &Frame, e: &Expr, v: Value, other: &Expr) -> Result<Value> {
+    let bits = match frame.type_of(other) {
+        Some(ColumnType::Int2) => 16,
+        Some(ColumnType::Int4) => 32,
+        Some(ColumnType::Int8) => 64,
+        _ => return Ok(v),
+    };
+    match &v {
+        Value::Text(t) if quoted(e) => Ok(Value::Int(crate::composed::int_in(t, bits)?)),
+        _ => Ok(v),
+    }
+}
+
+/// A CASE's arm taken, in the type the step resolved the CASE to, as PostgreSQL's parser coerces
+/// each arm to the type select_common_type finds: a quoted literal or a parameter read by that type's
+/// input, a value of a type promoted to it (an integer to a numeric, a date to a timestamp) cast to
+/// it. A string, a composite or an array, an arm of a type the CASE's is not found from, or a CASE
+/// whose type is not resolved, as it is.
+fn case_arm(frame: &Frame, case: &Expr, arm: &Expr, v: Value) -> Result<Value> {
+    let Some(t) = frame.type_of(case) else {
+        return Ok(v);
+    };
+    if v.is_null() || t.is_string() || matches!(t, ColumnType::Composed(_)) {
+        return Ok(v);
+    }
+    let literal = quoted(arm) && matches!(v, Value::Text(_));
+    let promoted = || {
+        frame.type_of(arm).is_some_and(|a| {
+            a != t && super::typed::common_type(&[Some(a), Some(t)], "CASE").is_ok_and(|c| c == t)
+        })
+    };
+    if !literal && !promoted() {
+        return Ok(v);
+    }
+    Ok(part_value(t, &part_of(t, v, literal)?))
+}
+
+/// A condition's truth on a row: a quoted literal or a parameter standing as the condition read by
+/// boolean's input, as PostgreSQL's parser coerces an unknown to boolean where a truth stands
+/// (WHERE, HAVING, ON, NOT, AND, OR, a CASE's WHEN, IS TRUE and its kin, an aggregate's FILTER);
+/// else its value's.
+pub(super) fn holds(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Option<bool>> {
+    truth_of(e, eval(e, row, frame, computed)?)
+}
+
+/// The truth of a condition's value, `holds`' reading of it.
+pub(super) fn truth_of(e: &Expr, v: Value) -> Result<Option<bool>> {
+    match (&v, quoted(e)) {
+        (Value::Text(t), true) => truth(&boolean_of(t)?),
+        _ => truth(&v),
+    }
+}
+
 /// The type a quoted literal beside a scalar of type `ty` is read as: an oid beside a reg* type,
 /// whose comparisons are oid's; else `ty`.
 fn literal_type(ty: ColumnType) -> ColumnType {
@@ -3488,6 +3544,10 @@ fn operated(
     if let Some(v) = typed_op(op, &x, &y, left, right)? {
         return Ok(v);
     }
+    let (x, y) = (
+        integer_read(frame, left, x, right)?,
+        integer_read(frame, right, y, left)?,
+    );
     let (x, y) = beside(x, y, left, right)?;
     if let Some(v) = string_op(op, &x, &y)? {
         return Ok(v);
@@ -3846,7 +3906,7 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => match truth(&ev(expr)?)? {
+        } => match holds(expr, row, frame, computed)? {
             None => Value::Null,
             Some(b) => Value::Bool(!b),
         },
@@ -4092,17 +4152,18 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
         Expr::IsNull(x) => Value::Bool(null_test(&ev(x)?, false)),
         Expr::IsNotNull(x) => Value::Bool(null_test(&ev(x)?, true)),
         // A truth tested is never NULL: an unknown truth is neither true nor false.
-        Expr::IsTrue(x) => Value::Bool(truth(&ev(x)?)? == Some(true)),
-        Expr::IsNotTrue(x) => Value::Bool(truth(&ev(x)?)? != Some(true)),
-        Expr::IsFalse(x) => Value::Bool(truth(&ev(x)?)? == Some(false)),
-        Expr::IsNotFalse(x) => Value::Bool(truth(&ev(x)?)? != Some(false)),
-        Expr::IsUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_none()),
-        Expr::IsNotUnknown(x) => Value::Bool(truth(&ev(x)?)?.is_some()),
+        Expr::IsTrue(x) => Value::Bool(holds(x, row, frame, computed)? == Some(true)),
+        Expr::IsNotTrue(x) => Value::Bool(holds(x, row, frame, computed)? != Some(true)),
+        Expr::IsFalse(x) => Value::Bool(holds(x, row, frame, computed)? == Some(false)),
+        Expr::IsNotFalse(x) => Value::Bool(holds(x, row, frame, computed)? != Some(false)),
+        Expr::IsUnknown(x) => Value::Bool(holds(x, row, frame, computed)?.is_none()),
+        Expr::IsNotUnknown(x) => Value::Bool(holds(x, row, frame, computed)?.is_some()),
         Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
             let (x, y) = (
                 written_beside(frame, a, ev(a)?, b),
                 written_beside(frame, b, ev(b)?, a),
             );
+            let (x, y) = (integer_read(frame, a, x, b)?, integer_read(frame, b, y, a)?);
             let (x, y) = beside(x, y, a, b)?;
             let same = match (x.is_null(), y.is_null()) {
                 (true, true) => true,
@@ -4186,11 +4247,11 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     // Its right side read only where its left does not settle it, as the executor
                     // reads a list of conditions; a pattern written out PostgreSQL's planner reads
                     // before any row.
-                    let x = truth(&ev(left)?)?;
+                    let x = holds(left, row, frame, computed)?;
                     if x == Some(!and) && !super::ops::pattern_written(right) {
                         return Ok(Value::Bool(!and));
                     }
-                    let y = truth(&ev(right)?)?;
+                    let y = holds(right, row, frame, computed)?;
                     return Ok(match (x, y) {
                         (Some(a), Some(b)) => Value::Bool(if and { a && b } else { a || b }),
                         (Some(false), None) | (None, Some(false)) if and => Value::Bool(false),
@@ -4234,13 +4295,15 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             else_result,
             ..
         } => {
+            let mut taken = else_result.as_deref();
             for c in conditions {
-                if truth(&ev(&c.condition)?)? == Some(true) {
-                    return ev(&c.result);
+                if holds(&c.condition, row, frame, computed)? == Some(true) {
+                    taken = Some(&c.result);
+                    break;
                 }
             }
-            match else_result {
-                Some(x) => ev(x)?,
+            match taken {
+                Some(x) => case_arm(frame, e, x, ev(x)?)?,
                 None => Value::Null,
             }
         }
@@ -6379,7 +6442,7 @@ pub(super) fn prepare<'q>(
         .map(|(e, _)| typing.type_of(e))
         .collect::<Result<Vec<_>>>()?;
     if let Some(w) = s.selection.as_ref() {
-        typing.type_of(w)?;
+        typing.condition(w, "WHERE")?;
     }
     for g in &grouping {
         typing.type_of(g)?;
@@ -6388,7 +6451,7 @@ pub(super) fn prepare<'q>(
         typing.type_of(e)?;
     }
     if let Some(h) = having {
-        typing.type_of(h)?;
+        typing.condition(h, "HAVING")?;
     }
     for e in joined {
         typing.type_of(e)?;
@@ -6474,25 +6537,42 @@ pub(crate) fn eval_on(
     eval_on_as(e, None, names, row, release, casings)
 }
 
-/// An expression on one row whose columns are named each with its own qualifier.
-pub(crate) fn eval_on_columns(
+/// An expression on one row whose columns are named each with its own qualifier, in the types its
+/// typing gave it and each expression in it.
+pub(crate) fn eval_typed(
     e: &Expr,
     columns: Vec<(Option<String>, String)>,
     row: &[Value],
     release: u8,
     casings: &Casings,
+    types: &super::typed::Types,
 ) -> Result<Value> {
-    let types = super::typed::Types::new();
     let frame = Frame {
         columns,
         params: &[],
         release,
         casings,
-        types: &types,
+        types,
         now: crate::scalars::transaction_clock(),
         subqueries: None,
     };
     eval(e, row, &frame, &computed_none())
+}
+
+/// The types of an expression on one row whose columns are those given, and of each expression in
+/// it, as a step types them; refused before any row where PostgreSQL's parser refuses it.
+pub(crate) fn typed_on(
+    e: &Expr,
+    columns: &[(Option<String>, String, Option<ColumnType>)],
+    release: u8,
+) -> Result<super::typed::Types> {
+    let mut typing = super::typed::Typing {
+        columns,
+        release,
+        types: Default::default(),
+    };
+    typing.type_of(e)?;
+    Ok(typing.types)
 }
 
 /// An expression on one row, its columns named as `by` names them, or by their names alone.
@@ -6679,7 +6759,7 @@ impl Groups {
                 self.list[i].1.iter_mut().zip(&folded).zip(&folded_under)
             {
                 if let Some(w) = f.filter {
-                    if truth(&eval(w, &row, frame, &none)?)? != Some(true) {
+                    if holds(w, &row, frame, &none)? != Some(true) {
                         continue;
                     }
                 }
@@ -6741,7 +6821,7 @@ impl Groups {
                 _q: std::marker::PhantomData,
             };
             if let Some(h) = p.having {
-                if truth(&eval(h, &first, frame, &computed)?)? != Some(true) {
+                if holds(h, &first, frame, &computed)? != Some(true) {
                     continue;
                 }
             }
@@ -6959,7 +7039,7 @@ impl<'q> StepRun<'q> {
         if let Some(w) = self.p.selection {
             let mut kept = Vec::with_capacity(rel.rows.len());
             for row in std::mem::take(&mut rel.rows) {
-                if truth(&eval(w, &row, &frame, &none)?)? == Some(true) {
+                if holds(w, &row, &frame, &none)? == Some(true) {
                     kept.push(row);
                 }
             }
@@ -7770,7 +7850,7 @@ impl<'q> Stream<'q> {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             if let Some(w) = selection {
-                if truth(&eval(w, &row, &frame, &none)?)? != Some(true) {
+                if holds(w, &row, &frame, &none)? != Some(true) {
                     continue;
                 }
             }
@@ -8049,6 +8129,7 @@ pub fn hands_over(q: &Query) -> bool {
     let one_table = matches!(s.from.as_slice(), [only] if only.joins.is_empty());
     if returned.iter().any(|e| compares_no_constant(e) || is_written_constant(e))
         || one_table && s.selection.as_ref().is_some_and(compares_no_constant)
+        || s.selection.iter().chain(on.iter().copied()).any(stands_constant)
     {
         return true;
     }
@@ -8087,6 +8168,30 @@ pub fn hands_over(q: &Query) -> bool {
         exprs.extend(o.iter().map(|x| &x.expr));
     }
     exprs.into_iter().any(calls_beyond_the_question)
+}
+
+/// Whether a condition holds a constant written out where a truth stands, which the question path
+/// holds no level for: alone, or under NOT, AND, OR or a truth test.
+fn stands_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x)
+        | Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: x,
+        }
+        | Expr::IsTrue(x)
+        | Expr::IsNotTrue(x)
+        | Expr::IsFalse(x)
+        | Expr::IsNotFalse(x)
+        | Expr::IsUnknown(x)
+        | Expr::IsNotUnknown(x) => stands_constant(x),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And | BinaryOperator::Or,
+            right,
+        } => stands_constant(left) || stands_constant(right),
+        e => is_written_constant(e),
+    }
 }
 
 /// Whether a select list's item is a constant written out, which the question path holds no level

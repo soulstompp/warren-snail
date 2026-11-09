@@ -1,7 +1,7 @@
 //! A row as a write fills it: a value assigned to a column of another type as PostgreSQL's
 //! assignment casts take it, a stored generated column computed, and a table's CHECKs checked.
 
-use super::pipeline::{eval_on, eval_on_as, Casings, Value};
+use super::pipeline::{eval_on, Casings, Value};
 use super::statement::{Datum, Row};
 use crate::catalog::{ColumnType, Table};
 use crate::numeric::Numeric;
@@ -126,9 +126,9 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
     let refused = || {
         Error::new(format!(
             "column \"{what}\" is of type {} but expression is of type {}",
-            to.pg_name(),
-            // PostgreSQL names the expression's type without its modifier.
-            from.pg_name().split('(').next().unwrap_or_default()
+            // PostgreSQL names both types without their modifiers.
+            super::typed::type_name(to),
+            super::typed::type_name(from)
         ))
     };
     let out_of_range = || Error::new(format!("{} out of range", to.pg_name()));
@@ -527,28 +527,50 @@ pub fn generate(table: &Table, row: &mut Row) -> Result<()> {
     Ok(())
 }
 
-/// The value an UPDATE sets column `c` of a row to: its expression read on the row's old values,
-/// the table's columns named as `by` names them or by their names alone, assigned to the column.
+/// The value an UPDATE sets column `c` of a row to: its expression read on the row's old values in
+/// the types `set_typed` gave it, the table's columns named as `by` names them or by their names
+/// alone, assigned to the column.
 pub fn set_to(
     table: &Table,
     row: &Row,
     c: usize,
     e: &sqlparser::ast::Expr,
     by: &str,
+    types: &super::typed::Types,
 ) -> Result<Datum> {
     let col = &table.columns[c];
+    let columns = table
+        .columns
+        .iter()
+        .map(|c| (Some(by.to_string()), c.name.clone()))
+        .collect();
     assign_value(
-        eval_on_as(
+        super::pipeline::eval_typed(
             e,
-            Some(by),
-            &names(table),
+            columns,
             &values(table, row),
             table.release,
             &Casings::of_table(table, &[]),
+            types,
         )?,
         col.ty,
         &col.name,
     )
+}
+
+/// The types of an UPDATE's SET expression and each expression in it, before any row is read, as
+/// PostgreSQL's parser types it over the table's columns named as `by` names them.
+pub fn set_typed(
+    table: &Table,
+    e: &sqlparser::ast::Expr,
+    by: &str,
+) -> Result<super::typed::Types> {
+    let columns: Vec<super::typed::TypedColumn> = table
+        .columns
+        .iter()
+        .map(|c| (Some(by.to_string()), c.name.clone(), Some(c.ty)))
+        .collect();
+    super::pipeline::typed_on(e, &columns, table.release)
 }
 
 /// A new row written through a view held to its CHECK OPTION: refused unless the view's condition
@@ -585,7 +607,7 @@ pub fn on_conflict(
     by: &str,
 ) -> Result<Value> {
     // The table named with its schema reads the row held, as its own name does.
-    let mut e = e.clone();
+    let mut e = super::spelled::expr_written(e);
     let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
         if let sqlparser::ast::Expr::CompoundIdentifier(parts) = x {
             if let [s, t, c] = parts.as_slice() {
@@ -606,16 +628,18 @@ pub fn on_conflict(
     for (q, r) in [(by, held), ("excluded", proposed)] {
         let r = with_virtual(table, r)?;
         for (c, d) in table.columns.iter().zip(&r) {
-            columns.push((Some(q.to_string()), c.name.clone()));
+            columns.push((Some(q.to_string()), c.name.clone(), Some(c.ty)));
             row.push(value_of(d, c.ty));
         }
     }
-    super::pipeline::eval_on_columns(
+    let types = super::pipeline::typed_on(e, &columns, table.release)?;
+    super::pipeline::eval_typed(
         e,
-        columns,
+        columns.into_iter().map(|(q, n, _)| (q, n)).collect(),
         &row,
         table.release,
         &Casings::of_table(table, &[]),
+        &types,
     )
 }
 

@@ -6,7 +6,9 @@
 //! its table, each CHECK OPTION met, an INSERT of fewer values than columns, the replica role
 //! switching the foreign keys off, each parameter typed where PostgreSQL's parse analysis settles it
 //! and refused where it cannot, the session's prepared statements in pg_prepared_statements, a
-//! locking clause, a name written twice and a relation not held each refused with its code. Every
+//! locking clause, a name written twice and a relation not held each refused with its code, a
+//! literal read as the type its place gives it (a truth, a CASE's or a COALESCE's type, the other
+//! side's integer, two rows' columns compared in turn). Every
 //! word, code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -2066,4 +2068,111 @@ fn a_locking_clause_a_name_written_twice_and_a_relation_not_held_carry_their_cod
     );
     run(&mut w, "ROLLBACK");
     assert_eq!(rows(&mut w, "SELECT count(*) FROM s.t"), ["2"]);
+}
+
+#[test]
+fn a_literal_is_read_as_the_type_its_place_gives_it() {
+    let mut w = snail("literal");
+    run(
+        &mut w,
+        "CREATE TABLE s.t (id integer NOT NULL, a integer, b text, ts timestamp(0), \
+         n numeric(6,2), f boolean, PRIMARY KEY (id))",
+    );
+    run(&mut w, "CREATE TABLE s.e (id integer NOT NULL, PRIMARY KEY (id))");
+    run(
+        &mut w,
+        "INSERT INTO s.t VALUES (1, 1, 'x', '2026-01-01 00:00', NULL, true), \
+         (2, 2, 'y', '2026-01-01 00:00', 1.5, false), (3, NULL, NULL, NULL, NULL, NULL)",
+    );
+    // A literal standing as a condition, in a question and a write, alone and under NOT, AND, OR,
+    // a CASE's WHEN, HAVING, ON and IS TRUE.
+    for (sql, answer) in [
+        ("SELECT id FROM s.t WHERE 't' ORDER BY id", vec!["1", "2", "3"]),
+        ("SELECT id FROM s.t WHERE 'yes' AND a > 1 ORDER BY id", vec!["2"]),
+        ("SELECT id FROM s.t WHERE a > 1 OR 'on' ORDER BY id", vec!["1", "2", "3"]),
+        ("SELECT id FROM s.t WHERE NOT 'off' ORDER BY id", vec!["1", "2", "3"]),
+        ("SELECT id FROM s.t WHERE NOT 't' ORDER BY id", vec![]),
+        ("SELECT id FROM s.t WHERE 't' IS TRUE ORDER BY id", vec!["1", "2", "3"]),
+        ("WITH w AS (SELECT id FROM s.t) SELECT id FROM w WHERE 'f' ORDER BY id", vec![]),
+        ("SELECT count(*) FROM s.t HAVING 't'", vec!["3"]),
+        ("SELECT x.id FROM s.t x JOIN s.t y ON 't' WHERE x.id = y.id ORDER BY x.id", vec!["1", "2", "3"]),
+        ("SELECT CASE WHEN 't' THEN 1 ELSE 0 END, NOT 't', 't' AND 'f', 'f' OR 't'", vec!["1|f|f|t"]),
+        (
+            "SELECT count(*) FILTER (WHERE 'f'), count(*) FILTER (WHERE 't') FROM s.t",
+            vec!["0|3"],
+        ),
+        (
+            "SELECT id, count(*) FILTER (WHERE 'off') OVER () FROM s.t ORDER BY id",
+            vec!["1|0", "2|0", "3|0"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), answer, "{sql}");
+    }
+    assert_eq!(w.execute("UPDATE s.t SET a = 10 WHERE 'f'").unwrap().rows, 0);
+    // A CASE's arms in its type: a literal read by its input without the column's modifier, an
+    // integer promoted to a numeric; a COALESCE's too, its NULL argument's place taken by its type.
+    for (sql, answer) in [
+        (
+            "SELECT id, CASE WHEN a > 1 THEN '2026-06-01 00:00:00.6' ELSE ts END FROM s.t ORDER BY id",
+            vec!["1|2026-01-01 00:00:00", "2|2026-06-01 00:00:00.6", "3|NULL"],
+        ),
+        (
+            "SELECT id, CASE WHEN a > 1 THEN 1 ELSE 1.5 END / 3 FROM s.t ORDER BY id",
+            vec!["1|0.50000000000000000000", "2|0.33333333333333333333", "3|0.50000000000000000000"],
+        ),
+        (
+            "SELECT id, coalesce(ts, '2026-06-01 00:00:00.6') FROM s.t ORDER BY id",
+            vec!["1|2026-01-01 00:00:00", "2|2026-01-01 00:00:00", "3|2026-06-01 00:00:00.6"],
+        ),
+        (
+            "SELECT id, coalesce(n, 0) + '1.25' FROM s.t ORDER BY id",
+            vec!["1|1.25", "2|2.75", "3|1.25"],
+        ),
+        (
+            "SELECT id FROM s.t WHERE ROW(a, b) IS DISTINCT FROM ROW(2, 'y') ORDER BY id",
+            vec!["1", "3"],
+        ),
+        (
+            "SELECT id FROM s.t WHERE (a, b) IS NOT DISTINCT FROM (NULL, NULL) ORDER BY id",
+            vec!["3"],
+        ),
+    ] {
+        assert_eq!(rows(&mut w, sql), answer, "{sql}");
+    }
+    // The same in an UPDATE's SET and in ON CONFLICT's, each typed before any row.
+    run(&mut w, "UPDATE s.t SET ts = CASE WHEN a > 1 THEN '2026-06-01 00:00:00.6' ELSE ts END");
+    run(&mut w, "UPDATE s.t SET n = coalesce(n, 0) + '1.25' WHERE id = 1");
+    run(&mut w, "UPDATE s.t SET f = ROW(a, b) IS DISTINCT FROM ROW(1, 'x')");
+    run(
+        &mut w,
+        "INSERT INTO s.t (id) VALUES (3) ON CONFLICT (id) DO UPDATE SET n = coalesce(excluded.n, 0) + '0.5'",
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT id, ts, n, f FROM s.t ORDER BY id"),
+        ["1|2026-01-01 00:00:00|1.25|f", "2|2026-06-01 00:00:01|1.50|t", "3|NULL|0.50|t"]
+    );
+    // Each refused as PostgreSQL's parser refuses it, before any row.
+    for (sql, code, words) in [
+        ("SELECT id FROM s.e WHERE 'x'", "22P02", "invalid input syntax for type boolean: \"x\""),
+        ("SELECT id FROM s.e WHERE 1", "42804", "argument of WHERE must be type boolean, not type integer"),
+        ("SELECT NOT 1", "42804", "argument of NOT must be type boolean, not type integer"),
+        ("SELECT CASE WHEN 1 THEN 1 END", "42804", "argument of CASE/WHEN must be type boolean, not type integer"),
+        ("SELECT id FROM s.e WHERE 1 AND true", "42804", "argument of AND must be type boolean, not type integer"),
+        ("SELECT count(*) FROM s.e HAVING 1", "42804", "argument of HAVING must be type boolean, not type integer"),
+        ("SELECT count(*) FILTER (WHERE 1) FROM s.e", "42804", "argument of FILTER must be type boolean, not type integer"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 'a' END", "22P02", "invalid input syntax for type integer: \"a\""),
+        (
+            "UPDATE s.t SET ts = CASE WHEN a > 1 THEN '2026-06-01' ELSE '2026-01-01' END",
+            "42804",
+            "column \"ts\" is of type timestamp without time zone but expression is of type text",
+        ),
+        ("SELECT id, a + '3000000000' FROM s.t", "22003", "value \"3000000000\" is out of range for type integer"),
+        ("SELECT coalesce(a, 0) + '1.25' FROM s.t", "22P02", "invalid input syntax for type integer: \"1.25\""),
+        ("SELECT id FROM s.t WHERE ROW(a, b) IS DISTINCT FROM ROW(2)", "42601", "unequal number of entries in row expressions"),
+        ("SELECT id FROM s.t WHERE ROW(a, b) IS DISTINCT FROM ROW('x', 1)", "22P02", "invalid input syntax for type integer: \"x\""),
+        ("SELECT id FROM s.t WHERE ROW(a, b) IS DISTINCT FROM ROW(2, 3)", "42883", "operator does not exist: text = integer"),
+        ("WITH w AS (SELECT id, b FROM s.t) SELECT id FROM w WHERE b = 3", "42883", "operator does not exist: text = integer"),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
 }

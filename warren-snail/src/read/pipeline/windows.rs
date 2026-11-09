@@ -6,7 +6,7 @@
 
 use super::{
     args, column_of, columns_read, compare, computed_none, eval, function_name, grouped_key, ident,
-    is_aggregate, is_count_star, key_under, kind_name, naming, truth, Acc, Frame, Key, Relation,
+    is_aggregate, is_count_star, key_under, kind_name, naming, Acc, Frame, Key, Relation,
     Value,
 };
 use crate::catalog::{Casing, ColumnType};
@@ -949,7 +949,7 @@ pub(super) fn values(
                     let fold = |acc: &mut Acc, pos: usize| -> Result<()> {
                         let row = s.rows[pos];
                         if let Some(w) = folds.filter {
-                            if truth(&at(w, row)?)? != Some(true) {
+                            if super::truth_of(w, at(w, row)?)? != Some(true) {
                                 return Ok(());
                             }
                         }

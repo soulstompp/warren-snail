@@ -377,7 +377,7 @@ impl Reading<'_> {
             }
             match on {
                 Some(e) => {
-                    Ok(pipeline::truth(&pipeline::eval(e, pair, &frame, &none)?)? == Some(true))
+                    Ok(pipeline::holds(e, pair, &frame, &none)? == Some(true))
                 }
                 None => Ok(true),
             }
@@ -477,7 +477,7 @@ impl Reading<'_> {
             }
             match on {
                 Some(e) => {
-                    Ok(pipeline::truth(&pipeline::eval(e, pair, &frame, &none)?)? == Some(true))
+                    Ok(pipeline::holds(e, pair, &frame, &none)? == Some(true))
                 }
                 None => Ok(true),
             }

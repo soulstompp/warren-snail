@@ -122,6 +122,8 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("column \"", "\" is a generated column"), "42601"),
     (Words::Holds("column \"", "\" is an identity column"), "42601"),
     (Words::Holds("column \"", " but expression is of type "), "42804"),
+    (Words::Holds("argument of ", " must be type boolean, not type "), "42804"),
+    (Words::Is("unequal number of entries in row expressions"), "42601"),
     (Words::Starts("cannot cast type "), "42846"),
     (Words::Is("ON CONFLICT DO UPDATE command cannot affect row a second time"), "21000"),
     (Words::Is("more than one row returned by a subquery used as an expression"), "21000"),

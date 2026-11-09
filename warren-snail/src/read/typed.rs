@@ -315,6 +315,27 @@ impl Typing<'_> {
         Ok(t)
     }
 
+    /// An expression standing where a truth stands, typed as PostgreSQL's coerce_to_boolean types
+    /// it, `clause` naming where: a quoted literal read by boolean's input before any row, refused
+    /// where it reads as none; an expression of another type refused in PostgreSQL's words.
+    pub fn condition(&mut self, e: &Expr, clause: &str) -> Result<()> {
+        if let Some(Some(s)) = untyped(e) {
+            return match super::question::truth(s) {
+                Some(_) => Ok(()),
+                None => Err(Error::new(format!(
+                    "invalid input syntax for type boolean: \"{s}\""
+                ))),
+            };
+        }
+        match self.type_of(e)? {
+            Some(t) if t != ColumnType::Boolean => Err(Error::new(format!(
+                "argument of {clause} must be type boolean, not type {}",
+                type_name(t)
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn resolve(&mut self, e: &Expr) -> Result<Option<ColumnType>> {
         Ok(match e {
             // A scalar subquery's type is its column's, given before the step is typed; EXISTS, and
@@ -478,18 +499,28 @@ impl Typing<'_> {
                 op: UnaryOperator::Not,
                 expr,
             } => {
-                self.type_of(expr)?;
+                self.condition(expr, "NOT")?;
                 Some(ColumnType::Boolean)
             }
-            Expr::IsNull(x)
-            | Expr::IsNotNull(x)
-            | Expr::IsTrue(x)
+            Expr::IsNull(x) | Expr::IsNotNull(x) => {
+                self.type_of(x)?;
+                Some(ColumnType::Boolean)
+            }
+            Expr::IsTrue(x)
             | Expr::IsNotTrue(x)
             | Expr::IsFalse(x)
             | Expr::IsNotFalse(x)
             | Expr::IsUnknown(x)
             | Expr::IsNotUnknown(x) => {
-                self.type_of(x)?;
+                let clause = match e {
+                    Expr::IsTrue(_) => "IS TRUE",
+                    Expr::IsNotTrue(_) => "IS NOT TRUE",
+                    Expr::IsFalse(_) => "IS FALSE",
+                    Expr::IsNotFalse(_) => "IS NOT FALSE",
+                    Expr::IsUnknown(_) => "IS UNKNOWN",
+                    _ => "IS NOT UNKNOWN",
+                };
+                self.condition(x, clause)?;
                 Some(ColumnType::Boolean)
             }
             Expr::InList { expr, list, .. } => {
@@ -544,7 +575,18 @@ impl Typing<'_> {
             }
             Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
                 let (t, u) = (self.type_of(a)?, self.type_of(b)?);
+                // Two rows of one length are compared column by column, as the statement is
+                // written before it is typed (`spelled::between_written`); of two lengths, refused
+                // as make_row_distinct_op refuses them.
+                if let (Some(Ok(x)), Some(Ok(y))) =
+                    (super::pipeline::row_parts(a), super::pipeline::row_parts(b))
+                {
+                    if x.len() != y.len() {
+                        return Err(Error::new("unequal number of entries in row expressions"));
+                    }
+                }
                 statistics_operator("=", t, u)?;
+                compared("=", (t, a), (u, b))?;
                 Some(ColumnType::Boolean)
             }
             // Untyped NULL beside ends of more than one type leaves PostgreSQL more than one form.
@@ -609,6 +651,19 @@ impl Typing<'_> {
                 }
                 Some(ColumnType::Boolean)
             }
+            Expr::BinaryOp {
+                left,
+                op: op @ (BinaryOperator::And | BinaryOperator::Or),
+                right,
+            } => {
+                let clause = match op {
+                    BinaryOperator::And => "AND",
+                    _ => "OR",
+                };
+                self.condition(left, clause)?;
+                self.condition(right, clause)?;
+                Some(ColumnType::Boolean)
+            }
             Expr::BinaryOp { left, op, right } => {
                 let (a, b) = (self.type_of(left)?, self.type_of(right)?);
                 if let Some(t) = statistics_operator(&op.to_string(), a, b)? {
@@ -629,14 +684,17 @@ impl Typing<'_> {
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo => arithmetic(a, b),
-                    BinaryOperator::And
-                    | BinaryOperator::Or
-                    | BinaryOperator::Eq
+                    BinaryOperator::Eq
                     | BinaryOperator::NotEq
                     | BinaryOperator::Lt
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
-                    | BinaryOperator::GtEq
+                    | BinaryOperator::GtEq => {
+                        compared(&op.to_string(), (a, left), (b, right))?;
+                        Some(ColumnType::Boolean)
+                    }
+                    BinaryOperator::And
+                    | BinaryOperator::Or
                     | BinaryOperator::Overlaps
                     | BinaryOperator::PGRegexMatch
                     | BinaryOperator::PGRegexIMatch
@@ -654,15 +712,20 @@ impl Typing<'_> {
                 if let Some(o) = operand {
                     self.type_of(o)?;
                 }
-                let mut t = None;
+                let mut arms = Vec::with_capacity(conditions.len() + 1);
                 for c in conditions {
-                    self.type_of(&c.condition)?;
-                    t = t.or(self.type_of(&c.result)?);
+                    match operand {
+                        None => self.condition(&c.condition, "CASE/WHEN")?,
+                        Some(_) => {
+                            self.type_of(&c.condition)?;
+                        }
+                    }
+                    arms.push((&c.result, self.type_of(&c.result)?));
                 }
                 if let Some(x) = else_result {
-                    t = t.or(self.type_of(x)?);
+                    arms.push((x.as_ref(), self.type_of(x)?));
                 }
-                t
+                case_type(&arms, else_result.is_some())?
             }
             Expr::Extract { expr, .. } => {
                 self.type_of(expr)?;
@@ -706,6 +769,10 @@ impl Typing<'_> {
                     if s != "pg_catalog" {
                         crate::regs::schema_found(&s)?;
                     }
+                }
+                // An aggregate's FILTER stands where a truth stands.
+                if let Some(w) = &f.filter {
+                    self.condition(w, "FILTER")?;
                 }
                 let Some(args) = call_args(f) else {
                     return Ok(None);
@@ -1653,14 +1720,88 @@ fn type_keyword(f: &sqlparser::ast::Function) -> Option<Error> {
     })
 }
 
+/// A type's name as PostgreSQL's format_type_be writes it in an error: without its modifier.
+pub(crate) fn type_name(t: ColumnType) -> String {
+    unmodified(t).pg_name()
+}
+
+/// A comparison typed as PostgreSQL's parser chooses its operator: a quoted literal beside a number
+/// or a truth read by that type's input, and a string compared with a number, which PostgreSQL has
+/// no operator for and casts neither to the other of unasked, refused in its words; each before any
+/// row. Any other two types are left to the comparison.
+fn compared(
+    op: &str,
+    (a, left): (Option<ColumnType>, &Expr),
+    (b, right): (Option<ColumnType>, &Expr),
+) -> Result<()> {
+    let number = |t: ColumnType| t.is_integer() || t.is_numeric() || t.is_float();
+    // A quoted literal beside a number or a truth is read by that type's input as the operator is
+    // chosen, each side in turn.
+    for (t, other) in [(a, right), (b, left)] {
+        if let (Some(t), Some(Some(s))) = (t, untyped(other)) {
+            if number(t) || t == ColumnType::Boolean {
+                super::pipeline::part_of(
+                    unmodified(t),
+                    super::pipeline::Value::Text(s.to_string()),
+                    true,
+                )?;
+            }
+        }
+    }
+    match (a, b) {
+        (Some(x), Some(y)) if x.is_string() && number(y) || number(x) && y.is_string() => {
+            Err(Error::new(format!(
+                "operator does not exist: {} {op} {}",
+                type_name(x),
+                type_name(y)
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A CASE's type, as transformCaseExpr gives it: its arms' as select_common_type finds it, each
+/// quoted literal among them read in it before any row and refused here where it reads as none; its
+/// modifier kept only where it has an ELSE and every arm is of that type and modifier, as exprTypmod
+/// reads a CASE. None where no arm is typed; the first typed arm's where the arms' types are not
+/// matched here.
+fn case_type(arms: &[(&Expr, Option<ColumnType>)], has_else: bool) -> Result<Option<ColumnType>> {
+    let types: Vec<Option<ColumnType>> = arms.iter().map(|(_, t)| *t).collect();
+    let Some(first) = types.iter().flatten().next().copied() else {
+        return Ok(None);
+    };
+    let Ok(t) = common_type(&types, "CASE") else {
+        return Ok(Some(first));
+    };
+    let t = match has_else && types.iter().all(|a| *a == Some(t)) {
+        true => t,
+        false => unmodified(t),
+    };
+    if !t.is_string() && !matches!(t, ColumnType::Composed(_)) {
+        for (x, ty) in arms {
+            if let (None, Some(Some(s))) = (ty, untyped(x)) {
+                super::pipeline::part_of(t, super::pipeline::Value::Text(s.to_string()), true)?;
+            }
+        }
+    }
+    Ok(Some(t))
+}
+
 /// The type COALESCE, LEAST, GREATEST and NULLIF take, as PostgreSQL's parser types them: the
-/// first three their arguments' as select_common_type finds it; NULLIF the type of the left side of
-/// the = it compares by, its first argument's, a number promoted to the other's where it is wider in
-/// kind. A quoted literal among them is read in that type, refused here where it reads as none. None
-/// for any other call.
+/// first three their arguments' as select_common_type finds it, its modifier kept only where every
+/// argument is of that type and modifier, as exprTypmod reads them; NULLIF the type of the left side
+/// of the = it compares by, its first argument's, a number promoted to the other's where it is wider
+/// in kind. A quoted literal among them is read in that type, refused here where it reads as none.
+/// None for any other call.
 fn chosen(name: &str, args: &[&Expr], types: &[Option<ColumnType>]) -> Result<Option<ColumnType>> {
     let ty = match (name, types) {
-        ("coalesce" | "least" | "greatest", _) => common_type(types, &name.to_uppercase())?,
+        ("coalesce" | "least" | "greatest", _) => {
+            let t = common_type(types, &name.to_uppercase())?;
+            match types.iter().all(|a| *a == Some(t)) {
+                true => t,
+                false => unmodified(t),
+            }
+        }
         ("nullif", [a, b]) => match (*a, *b) {
             (Some(x), Some(y))
                 if x == y
