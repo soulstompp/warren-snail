@@ -1,6 +1,7 @@
 //! PostgreSQL's settings as a writer's session takes them: those the snail answers under, fixed;
-//! those that change no answer, taken at any value PostgreSQL takes; those it answers under one value
-//! of, taken at that value alone; the transaction's modes; and the server's own, refused by name.
+//! those that change no answer, taken at any value PostgreSQL takes; those the session reads where
+//! they act, taken so too; those it answers under one value of, taken at that value alone; the
+//! transaction's modes; and the server's own, refused by name.
 //! Each value is read and shown as PostgreSQL's `guc.c` reads and shows it.
 
 use crate::{Error, Result};
@@ -60,6 +61,9 @@ pub(crate) enum Kind {
     Fixed,
     /// One that changes no answer: taken at any value PostgreSQL takes.
     Taken,
+    /// One the session reads where it acts, as PostgreSQL's session does: taken at any value
+    /// PostgreSQL takes.
+    Read,
     /// One the snail answers under one value of: taken at it, refused at any other for the reason.
     Own(&'static str, &'static str),
     /// The transaction's modes, and the session's for the transactions after.
@@ -96,7 +100,7 @@ const TAKEN: [&str; 16] = [
 ];
 
 /// The settings the snail answers under one value of, and why.
-const OWN: [(&str, &str); 18] = [
+const OWN: [(&str, &str); 17] = [
     (
         "idle_in_transaction_session_timeout",
         "the snail ends no session",
@@ -121,10 +125,6 @@ const OWN: [(&str, &str); 18] = [
     ),
     ("backslash_quote", "it changes how a literal is read"),
     ("exit_on_error", "the snail ends no session"),
-    (
-        "session_replication_role",
-        "it changes which triggers and keys act",
-    ),
     ("default_tablespace", "a snail has no tablespace"),
     ("temp_tablespaces", "a snail has no tablespace"),
     (
@@ -170,6 +170,7 @@ pub(crate) fn kind(release: u8, name: &str) -> Option<Kind> {
         | "default_transaction_read_only"
         | "default_transaction_deferrable" => Kind::Mode,
         "search_path" => Kind::Path,
+        "session_replication_role" => Kind::Read,
         "client_encoding" => Kind::Own("UTF8", "the snail answers in UTF8"),
         "server_encoding" => Kind::Preset("UTF8"),
         "integer_datetimes" => Kind::Preset("on"),
@@ -253,7 +254,7 @@ pub(crate) fn taken(
             super::statement::fixed_setting(name, &words, monetary, text_search)?;
             Taken::Nothing
         }
-        Kind::Taken => Taken::Stored(match value {
+        Kind::Taken | Kind::Read => Taken::Stored(match value {
             Some(v) => Some(normalized(g.expect("a setting of the release"), v)?),
             None => None,
         }),
@@ -354,7 +355,7 @@ pub(crate) fn shown(view: &View, name: &str) -> Result<(String, String)> {
                 .expect("a fixed setting"),
         },
         Kind::Custom => view.values.get(name).cloned().ok_or_else(unknown)?,
-        Kind::Taken | Kind::Own(..) => match view.values.get(name) {
+        Kind::Taken | Kind::Read | Kind::Own(..) => match view.values.get(name) {
             Some(v) => v.clone(),
             None => match k {
                 Kind::Own(own, why) if !why.is_empty() => own.to_string(),
@@ -840,6 +841,7 @@ mod tests {
             Some(Kind::Own("0", _))
         ));
         assert_eq!(kind(18, "statement_timeout"), Some(Kind::Taken));
+        assert_eq!(kind(18, "session_replication_role"), Some(Kind::Read));
         assert_eq!(kind(18, "search_path"), Some(Kind::Path));
         assert_eq!(kind(18, "shared_buffers"), Some(Kind::Server));
         assert_eq!(kind(18, "myapp.user"), Some(Kind::Custom));

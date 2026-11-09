@@ -3,7 +3,8 @@
 //! PostgreSQL's parser looks it up, a CHECK holding BETWEEN or an ARRAY of literals read on every
 //! row, a boolean's casts to and from an integer, a column's default set and dropped, a write
 //! returning rows of what it changed, its `old` and `new` among them, a write through a view reaching
-//! its table, each CHECK OPTION met, an INSERT of fewer values than columns. Every word,
+//! its table, each CHECK OPTION met, an INSERT of fewer values than columns, the replica role
+//! switching the foreign keys off. Every word,
 //! code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
@@ -1404,4 +1405,91 @@ fn a_table_declared_inside_an_unfinished_write_takes_every_write() {
         refused(&mut w, "SELECT * FROM copy"),
         (Some("42P01"), "relation \"copy\" does not exist".into())
     );
+}
+
+#[test]
+fn the_replica_role_neither_checks_nor_acts_on_a_foreign_key() {
+    let mut w = snail("replica");
+    run(&mut w, "CREATE TABLE s.u (id integer PRIMARY KEY)");
+    run(
+        &mut w,
+        "CREATE TABLE s.t (id integer PRIMARY KEY, u integer REFERENCES s.u (id) ON DELETE RESTRICT)",
+    );
+    run(
+        &mut w,
+        "CREATE TABLE s.c (id integer PRIMARY KEY, u integer REFERENCES s.u (id) ON DELETE CASCADE \
+         ON UPDATE CASCADE)",
+    );
+    run(
+        &mut w,
+        "CREATE TABLE s.df (id integer PRIMARY KEY, u integer REFERENCES s.u (id) DEFERRABLE \
+         INITIALLY DEFERRED)",
+    );
+    run(
+        &mut w,
+        "CREATE TABLE s.ck (id integer PRIMARY KEY, v integer CHECK (v > 0))",
+    );
+    run(&mut w, "INSERT INTO s.u VALUES (1), (2), (3)");
+    run(&mut w, "INSERT INTO s.t VALUES (1, 1)");
+    run(&mut w, "INSERT INTO s.c VALUES (1, 2)");
+    assert_eq!(rows(&mut w, "SHOW session_replication_role"), ["origin"]);
+    assert_eq!(
+        refused(&mut w, "SET session_replication_role = on"),
+        (
+            Some("22023"),
+            "invalid value for parameter \"session_replication_role\": \"on\"".into()
+        )
+    );
+    run(&mut w, "SET session_replication_role = 'REPLICA'");
+    assert_eq!(rows(&mut w, "SHOW session_replication_role"), ["replica"]);
+    // No key is checked, and none acts: an orphan taken, a RESTRICT and a CASCADE passed over.
+    run(&mut w, "INSERT INTO s.t VALUES (2, 77)");
+    run(&mut w, "DELETE FROM s.u WHERE id = 1");
+    run(&mut w, "UPDATE s.u SET id = 20 WHERE id = 2");
+    assert_eq!(rows(&mut w, "SELECT id, u FROM s.t ORDER BY id"), ["1|1", "2|77"]);
+    assert_eq!(rows(&mut w, "SELECT id, u FROM s.c ORDER BY id"), ["1|2"]);
+    // Every other constraint holds, and a key added is still checked on the rows it finds.
+    assert_eq!(refused(&mut w, "INSERT INTO s.ck VALUES (1, -1)").0, Some("23514"));
+    assert_eq!(refused(&mut w, "INSERT INTO s.t VALUES (1, 3)").0, Some("23505"));
+    assert_eq!(
+        refused(
+            &mut w,
+            "ALTER TABLE s.t ADD CONSTRAINT t_again FOREIGN KEY (u) REFERENCES s.u (id)"
+        ),
+        (
+            Some("23503"),
+            "insert or update on table \"t\" violates foreign key constraint \"t_again\": Key \
+             (u)=(1) is not present in table \"u\"."
+                .into()
+        )
+    );
+    // local fires the keys as origin does.
+    run(&mut w, "SET session_replication_role = local");
+    assert_eq!(refused(&mut w, "INSERT INTO s.t VALUES (3, 99)").0, Some("23503"));
+    run(&mut w, "RESET session_replication_role");
+    assert_eq!(rows(&mut w, "SHOW session_replication_role"), ["origin"]);
+    // A deferred check is the role's where its row was written, not where the commit is.
+    run(&mut w, "BEGIN");
+    run(&mut w, "INSERT INTO s.df VALUES (1, 66)");
+    run(&mut w, "SET LOCAL session_replication_role = replica");
+    run(&mut w, "INSERT INTO s.df VALUES (3, 68)");
+    assert_eq!(refused(&mut w, "COMMIT").0, Some("23503"));
+    run(&mut w, "BEGIN");
+    run(&mut w, "SET LOCAL session_replication_role = replica");
+    run(&mut w, "INSERT INTO s.df VALUES (2, 67)");
+    run(&mut w, "SET LOCAL session_replication_role = origin");
+    run(&mut w, "COMMIT");
+    // A row written under origin and replaced under replica is checked as neither.
+    run(&mut w, "BEGIN");
+    run(&mut w, "INSERT INTO s.df VALUES (5, 70)");
+    run(&mut w, "SET LOCAL session_replication_role = replica");
+    run(&mut w, "UPDATE s.df SET u = 71 WHERE id = 5");
+    run(&mut w, "COMMIT");
+    assert_eq!(rows(&mut w, "SELECT id, u FROM s.df ORDER BY id"), ["2|67", "5|71"]);
+    assert_eq!(rows(&mut w, "SHOW session_replication_role"), ["origin"]);
+    // A role set in a transaction rolled back goes with it.
+    run(&mut w, "BEGIN");
+    run(&mut w, "SET session_replication_role = replica");
+    run(&mut w, "ROLLBACK");
+    assert_eq!(refused(&mut w, "INSERT INTO s.t VALUES (4, 98)").0, Some("23503"));
 }

@@ -237,7 +237,11 @@ pub(super) fn named<'c, 'n>(catalog: &'c Catalog, n: &'n str) -> Result<(&'n str
 impl Snail {
     /// The foreign keys a table's changes touch, each change recorded where the key reads it: a row
     /// written into a child, and a key taken from a parent, the parent's row holding no NULL in it.
+    /// Under `session_replication_role` replica a change is recorded nowhere, as PostgreSQL fires
+    /// none of a key's triggers then; a row it deletes or replaces is still let go from what the
+    /// round had recorded, since a check finding its row gone checks nothing.
     pub(super) fn touch(&mut self, ti: usize, changes: &[Change]) {
+        let replica = self.replica_role();
         let name = &self.catalog.tables[ti].name;
         for (ci, child) in self.catalog.tables.iter().enumerate() {
             for (fi, k) in child.foreign_keys.iter().enumerate() {
@@ -248,6 +252,7 @@ impl Snail {
                 if ci == ti {
                     for c in changes {
                         match c {
+                            Change::Insert(_) if replica => {}
                             Change::Insert(r) => {
                                 self.touched.written.entry(at).or_default().push(r.clone())
                             }
@@ -261,14 +266,14 @@ impl Snail {
                                 // whose reference did not change is not checked again.
                                 let ours = forget(&mut self.touched, at, o)
                                     || forget(&mut self.pending, at, o);
-                                if ours || !same_reference(child, k, o, n) {
+                                if !replica && (ours || !same_reference(child, k, o, n)) {
                                     self.touched.written.entry(at).or_default().push(n.clone());
                                 }
                             }
                         }
                     }
                 }
-                if k.parent == *name {
+                if k.parent == *name && !replica {
                     let keyed = |r: &Row| k.parent_columns.iter().all(|&p| r[p] != Datum::Null);
                     for c in changes {
                         match c {
@@ -293,6 +298,16 @@ impl Snail {
                 }
             }
         }
+    }
+
+    /// Whether the session's `session_replication_role` is replica, under which no foreign key
+    /// checks or acts; origin and local fire them alike.
+    fn replica_role(&self) -> bool {
+        self.session
+            .settings
+            .all()
+            .get("session_replication_role")
+            .is_some_and(|v| v == "replica")
     }
 
     /// Whether a key is checked at the commit: deferrable and deferred, by its DDL or by SET
