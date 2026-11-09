@@ -558,6 +558,7 @@ fn with_steps(
     visible: &mut Vec<String>,
     with: &sqlparser::ast::With,
 ) -> Result<()> {
+    pipeline::named_once(&with.cte_tables)?;
     // Under RECURSIVE each query reads any other, so they are made in the order they read each
     // other, a query reading itself as its recursion.
     let ordered = match with.recursive {

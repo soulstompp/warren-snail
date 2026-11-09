@@ -8793,8 +8793,24 @@ pub fn in_order(rel: &mut Relation, column: usize) -> Result<()> {
     failed.map_or(Ok(()), Err)
 }
 
+/// A WITH's queries refused where one's name is another's, before any of them is read, as
+/// PostgreSQL refuses them.
+pub(in crate::read) fn named_once(ctes: &[sqlparser::ast::Cte]) -> Result<()> {
+    let names: Vec<String> = ctes.iter().map(|c| ident(&c.alias.name)).collect();
+    match (0..names.len()).find(|&i| names[..i].contains(&names[i])) {
+        Some(i) => Err(Error::new(format!(
+            "WITH query name \"{}\" specified more than once",
+            names[i]
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The one table a pipeline reads, by name: every table its steps name that no step of the WITH is.
 pub fn table_named(q: &Query) -> Result<String> {
+    if let Some(with) = &q.with {
+        named_once(&with.cte_tables)?;
+    }
     if q.with.as_ref().is_some_and(|w| w.recursive) {
         return Err(Error::new("WITH RECURSIVE is not read"));
     }

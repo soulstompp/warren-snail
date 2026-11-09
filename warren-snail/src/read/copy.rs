@@ -149,7 +149,7 @@ pub(super) fn parse_copy(
                 .tables
                 .iter()
                 .position(|t| t.name == n)
-                .ok_or_else(|| Error::new(format!("{n} is not in the snail")))?;
+                .ok_or_else(|| Error::new(format!("relation \"{n}\" does not exist")))?;
             if matches!(tok(i), Some(Token::LParen)) {
                 i += 1;
                 loop {

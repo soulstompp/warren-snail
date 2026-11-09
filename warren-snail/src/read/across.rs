@@ -1308,6 +1308,7 @@ impl Snails {
                 if !self.begun {
                     return Err(outside("LOCK TABLE"));
                 }
+                let tables = super::session::locked_tables(&self.catalog, &tables)?;
                 let mut by: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
                 for t in tables {
                     by.entry(self.at[t].0)

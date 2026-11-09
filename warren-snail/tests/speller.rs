@@ -5,9 +5,9 @@
 //! returning rows of what it changed, its `old` and `new` among them, a write through a view reaching
 //! its table, each CHECK OPTION met, an INSERT of fewer values than columns, the replica role
 //! switching the foreign keys off, each parameter typed where PostgreSQL's parse analysis settles it
-//! and refused where it cannot, the session's prepared statements in pg_prepared_statements. Every
-//! word,
-//! code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
+//! and refused where it cannot, the session's prepared statements in pg_prepared_statements, a
+//! locking clause, a name written twice and a relation not held each refused with its code. Every
+//! word, code and answer is 18.6's over the same statements (`session.nu --suite speller --codes`). A
 //! snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
 
@@ -1981,4 +1981,89 @@ fn pg_prepared_statements_holds_the_sessions_statements_as_postgresql_shows_them
     run(&mut w, "DEALLOCATE z");
     run(&mut w, "DEALLOCATE ALL");
     assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_prepared_statements"), ["0"]);
+}
+
+#[test]
+fn a_locking_clause_a_name_written_twice_and_a_relation_not_held_carry_their_codes() {
+    let mut w = snail("named");
+    run(&mut w, "CREATE TABLE s.t (id integer NOT NULL, a integer, PRIMARY KEY (id))");
+    run(&mut w, "CREATE TABLE s.b (id integer NOT NULL, t_id integer, PRIMARY KEY (id))");
+    run(&mut w, "INSERT INTO s.t VALUES (1, NULL), (2, 2)");
+    run(&mut w, "INSERT INTO s.b VALUES (1, 1)");
+    for (sql, code, words) in [
+        ("SELECT id FROM s.nosuch", "42P01", "relation \"s.nosuch\" does not exist"),
+        ("SELECT id FROM \"NoSuch\"", "42P01", "relation \"NoSuch\" does not exist"),
+        ("SELECT id FROM nosuch WHERE id = 1 ORDER BY id", "42P01", "relation \"nosuch\" does not exist"),
+        ("SELECT count(*) FROM s.nosuch", "42P01", "relation \"s.nosuch\" does not exist"),
+        (
+            "WITH w AS (SELECT id FROM s.nosuch) SELECT id FROM w",
+            "42P01",
+            "relation \"s.nosuch\" does not exist",
+        ),
+        ("SELECT row_number() OVER () FROM s.nosuch", "42P01", "relation \"s.nosuch\" does not exist"),
+        (
+            "SELECT t.id FROM s.t t JOIN s.nosuch n ON n.id = t.id",
+            "42P01",
+            "relation \"s.nosuch\" does not exist",
+        ),
+        ("SELECT count(*) FROM s.nosuch FOR UPDATE", "42P01", "relation \"s.nosuch\" does not exist"),
+        ("COPY s.nosuch TO STDOUT", "42P01", "relation \"s.nosuch\" does not exist"),
+        ("LOCK TABLE s.nosuch", "25P01", "LOCK TABLE can only be used in transaction blocks"),
+        ("SAVEPOINT x", "25P01", "SAVEPOINT can only be used in transaction blocks"),
+        ("SELECT count(*) FROM s.t FOR UPDATE", "0A000", "FOR UPDATE is not allowed with aggregate functions"),
+        ("SELECT a FROM s.t GROUP BY a FOR SHARE", "0A000", "FOR SHARE is not allowed with GROUP BY clause"),
+        (
+            "SELECT t.id FROM s.t t LEFT JOIN s.b b ON b.t_id = t.id FOR UPDATE",
+            "0A000",
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT t.id FROM s.t t FOR UPDATE OF b",
+            "42P01",
+            "relation \"b\" in FOR UPDATE clause not found in FROM clause",
+        ),
+        ("SELECT id FROM s.t LIMIT -1 FOR UPDATE", "2201W", "LIMIT must not be negative"),
+        ("SELECT id FROM s.t OFFSET -1 FOR UPDATE", "2201X", "OFFSET must not be negative"),
+        ("CREATE TABLE s.u (id integer, \"ID\" integer, Id integer)", "42701", "column \"id\" specified more than once"),
+        ("CREATE VIEW s.v (x, x) AS SELECT id, a FROM s.t", "42701", "column \"x\" specified more than once"),
+        ("INSERT INTO s.t (id, a, ID) VALUES (3, 4, 5)", "42701", "column \"id\" specified more than once"),
+        ("INSERT INTO s.t (id, id, nosuch) VALUES (3, 4, 5)", "42701", "column \"id\" specified more than once"),
+        ("UPDATE s.t SET a = 1, a = 2", "42601", "multiple assignments to same column \"a\""),
+        ("SELECT x.id FROM s.t x JOIN s.b x ON true", "42712", "table name \"x\" specified more than once"),
+        (
+            "WITH w AS (SELECT 1), w AS (SELECT 2) SELECT * FROM w",
+            "42712",
+            "WITH query name \"w\" specified more than once",
+        ),
+        (
+            "WITH w AS (SELECT id FROM s.t), w AS (SELECT a FROM s.t) SELECT * FROM w",
+            "42712",
+            "WITH query name \"w\" specified more than once",
+        ),
+        (
+            "WITH w AS (SELECT id FROM s.t), w AS (SELECT a FROM s.t) SELECT id FROM w",
+            "42712",
+            "WITH query name \"w\" specified more than once",
+        ),
+        (
+            "SELECT * FROM s.t JOIN s.b USING (id, id)",
+            "42701",
+            "column name \"id\" appears more than once in USING clause",
+        ),
+        (
+            "SELECT * FROM (SELECT 1 AS a, 2 AS a) l NATURAL JOIN (SELECT 1 AS a) r",
+            "42702",
+            "common column name \"a\" appears more than once in left table",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+    }
+    // In a transaction block LOCK TABLE looks its tables up before its mode is read.
+    run(&mut w, "BEGIN");
+    assert_eq!(
+        refused(&mut w, "LOCK TABLE s.nosuch IN ACCESS EXCLUSIVE MODE"),
+        (Some("42P01"), "relation \"s.nosuch\" does not exist".to_string())
+    );
+    run(&mut w, "ROLLBACK");
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM s.t"), ["2"]);
 }

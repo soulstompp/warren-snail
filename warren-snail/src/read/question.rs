@@ -1323,7 +1323,7 @@ fn relation(catalog: &Catalog, t: &TableFactor) -> Result<(usize, Option<String>
                 .tables
                 .iter()
                 .position(|t| t.name == name)
-                .ok_or_else(|| Error::new(format!("{name} is not in the snail")))?;
+                .ok_or_else(|| Error::new(format!("relation \"{name}\" does not exist")))?;
             Ok((ti, alias.as_ref().map(|a| ident(&a.name))))
         }
         other => Err(Error::new(format!(

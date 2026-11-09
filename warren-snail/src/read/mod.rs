@@ -1714,7 +1714,7 @@ impl Snail {
             .tables
             .iter()
             .find(|t| t.name == name || t.name.rsplit('.').next() == Some(name.as_str()))
-            .ok_or_else(|| Error::new(format!("{name} is not in the snail")))?;
+            .ok_or_else(|| Error::new(format!("relation \"{name}\" does not exist")))?;
         let order = table
             .orders
             .iter()

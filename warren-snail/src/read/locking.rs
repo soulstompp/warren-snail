@@ -13,7 +13,7 @@ use crate::{Error, Result};
 use arrow::array::RecordBatch;
 use sqlparser::ast::{
     Expr, JoinOperator, LimitClause, ObjectNamePart, SelectItem, SetExpr, Statement as Sql,
-    TableFactor, Value,
+    TableFactor, UnaryOperator, Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::tokenizer::Token;
@@ -317,6 +317,12 @@ fn count(e: &Expr, params: &[String], what: &str) -> Result<Option<u64>> {
             }
         },
         Expr::Identifier(i) if i.value.eq_ignore_ascii_case("all") => return Ok(None),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Value(v) if matches!(v.value, Value::Number(..))) => {
+            format!("-{expr}")
+        }
         _ => {
             return Err(Error::new(format!(
                 "{what} {e} is not read beside a locking clause"
@@ -360,6 +366,18 @@ impl Snail {
             }
             _ => return Err(Error::new(format!("{first} is read only on a SELECT"))),
         };
+        // FROM's tables are looked up before the locking clause is read, as PostgreSQL reads them.
+        for item in &s.from {
+            let sides = std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation));
+            for f in sides {
+                if let TableFactor::Table { name, .. } = f {
+                    let n = crate::catalog::object_name(name);
+                    if !self.catalog.tables.iter().any(|t| t.name == n) {
+                        return Err(Error::new(format!("relation \"{n}\" does not exist")));
+                    }
+                }
+            }
+        }
         if s.distinct.is_some() {
             return Err(Error::new(format!(
                 "{first} is not allowed with DISTINCT clause"
@@ -433,7 +451,7 @@ impl Snail {
                     .tables
                     .iter()
                     .position(|t| t.name == n)
-                    .ok_or_else(|| Error::new(format!("{n} is not in the snail")))?;
+                    .ok_or_else(|| Error::new(format!("relation \"{n}\" does not exist")))?;
                 let by = match alias {
                     Some(a) => crate::catalog::ident(&a.name),
                     None => match name.0.last() {

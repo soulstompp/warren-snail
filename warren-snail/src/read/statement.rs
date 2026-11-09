@@ -1111,21 +1111,20 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         _ => return Err(Error::new("an INSERT names a table")),
     };
     let table = &catalog.tables[ti];
-    let columns: Vec<usize> = if i.columns.is_empty() {
-        (0..table.columns.len()).collect()
-    } else {
-        i.columns
-            .iter()
-            .map(|n| column_index(table, n))
-            .collect::<Result<_>>()?
-    };
-    for (k, c) in columns.iter().enumerate() {
-        if columns[..k].contains(c) {
+    // The columns named, each in its turn: refused where it is not the table's, or named again.
+    let mut columns: Vec<usize> = Vec::with_capacity(i.columns.len());
+    for n in &i.columns {
+        let c = column_index(table, n)?;
+        if columns.contains(&c) {
             return Err(Error::new(format!(
-                "{} is named twice",
-                table.columns[*c].name
+                "column \"{}\" specified more than once",
+                table.columns[c].name
             )));
         }
+        columns.push(c);
+    }
+    if columns.is_empty() {
+        columns = (0..table.columns.len()).collect();
     }
     let q: &Query = i
         .source

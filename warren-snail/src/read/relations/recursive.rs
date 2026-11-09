@@ -33,19 +33,13 @@ pub(in crate::read) struct Recursion {
 }
 
 /// A WITH RECURSIVE's queries in the order they are made, each after those it reads, each with
-/// whether it reads itself; refused as PostgreSQL refuses two queries that read each other.
+/// whether it reads itself; refused as PostgreSQL refuses two queries that read each other. Each
+/// query's name is its own (`pipeline::named_once`).
 pub(super) fn ordered(ctes: &[Cte]) -> Result<Vec<(&Cte, bool)>> {
     let names: Vec<String> = ctes
         .iter()
         .map(|c| crate::catalog::ident(&c.alias.name))
         .collect();
-    for (i, n) in names.iter().enumerate() {
-        if names[..i].contains(n) {
-            return Err(Error::new(format!(
-                "WITH query name \"{n}\" specified more than once"
-            )));
-        }
-    }
     let mut items: Vec<(usize, HashSet<usize>, bool)> = Vec::with_capacity(ctes.len());
     for (i, c) in ctes.iter().enumerate() {
         let read: HashSet<String> = named(&c.query.to_string())?

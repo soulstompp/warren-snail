@@ -24,9 +24,9 @@ pub enum Said {
     Release {
         name: String,
     },
-    /// LOCK TABLE: the tables by their places in the catalog, the mode, and NOWAIT.
+    /// LOCK TABLE: the tables by their names as written, the mode, and NOWAIT.
     Lock {
-        tables: Vec<usize>,
+        tables: Vec<String>,
         mode: Mode,
         nowait: bool,
     },
@@ -377,6 +377,21 @@ impl Said {
     }
 }
 
+/// LOCK TABLE's tables by their places in the catalog, looked up once the statement stands in a
+/// transaction block, as PostgreSQL looks them up.
+pub(super) fn locked_tables(catalog: &Catalog, names: &[String]) -> Result<Vec<usize>> {
+    names
+        .iter()
+        .map(|n| {
+            catalog
+                .tables
+                .iter()
+                .position(|t| t.name == *n)
+                .ok_or_else(|| Error::new(format!("relation \"{n}\" does not exist")))
+        })
+        .collect()
+}
+
 /// A statement of the session's own read off its words, where sqlparser does not read it as
 /// PostgreSQL does: none where it is no such statement.
 pub(super) fn said(
@@ -395,17 +410,7 @@ pub(super) fn said(
         return Ok(None);
     }
     if let Some(read) = super::tablelock::parse_lock(tokens) {
-        let (names, mode, nowait) = read?;
-        let tables = names
-            .iter()
-            .map(|n| {
-                catalog
-                    .tables
-                    .iter()
-                    .position(|t| t.name == *n)
-                    .ok_or_else(|| Error::new(format!("{n} is not in the snail")))
-            })
-            .collect::<Result<_>>()?;
+        let (tables, mode, nowait) = read?;
         return Ok(Some(Said::Lock {
             tables,
             mode,
@@ -613,6 +618,7 @@ impl super::Snail {
                         "LOCK TABLE can only be used in transaction blocks",
                     ));
                 }
+                let tables = locked_tables(&self.catalog, &tables)?;
                 if mode == Mode::AccessExclusive {
                     return Err(Error::new(
                         "LOCK TABLE … IN ACCESS EXCLUSIVE MODE is refused: it would make the \

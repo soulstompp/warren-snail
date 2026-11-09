@@ -659,6 +659,20 @@ fn prepared_statements_cursors_copy_and_explain_read_across_snails() {
     assert!(d.rows > 0);
     let d = w.execute("EXPLAIN SELECT u.w FROM b.u u WHERE u.k = 1").unwrap();
     assert!(cell(d.answer.unwrap().column(0).as_ref(), 0).unwrap().starts_with("Snail round along"));
+    // LOCK TABLE across them: outside a transaction block refused before its tables are looked up,
+    // and in one a table no snail holds refused by its name.
+    let e = w.execute("LOCK TABLE b.nosuch").unwrap_err();
+    assert_eq!(
+        (e.sqlstate(), e.to_string().as_str()),
+        (Some("25P01"), "LOCK TABLE can only be used in transaction blocks")
+    );
+    w.execute("BEGIN").unwrap();
+    let e = w.execute("LOCK TABLE a.t, b.nosuch IN SHARE MODE").unwrap_err();
+    assert_eq!(
+        (e.sqlstate(), e.to_string().as_str()),
+        (Some("42P01"), "relation \"b.nosuch\" does not exist")
+    );
+    w.execute("ROLLBACK").unwrap();
     drop(w);
     // Opened alone, the session's statements as it was handed them.
     let mut one = warren_snail::read::Snails::open_writing(&[a.as_path()]).unwrap();
