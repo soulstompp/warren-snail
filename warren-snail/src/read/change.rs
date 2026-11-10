@@ -144,6 +144,8 @@ const REPLAYS: usize = 16;
 /// each with what it came to.
 pub(super) struct Runs {
     start: super::sequences::Drawn,
+    /// The values the session held when the statement began.
+    held: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
     stands: std::collections::HashMap<String, (i64, bool)>,
     script: Vec<(super::sequences::Op, super::sequences::Outcome)>,
     replays: usize,
@@ -918,6 +920,8 @@ impl Snail {
         let _zoned = self.in_zone();
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
+        let _standing =
+            super::sequences::standing(&self.catalog, sql, || self.sequences_newest())?;
         let _timing = self.timing();
         let written_out;
         let text = match params.is_empty() {
@@ -2130,6 +2134,16 @@ impl Snail {
     /// The values a sequence hands this writer: those its cache holds first, then a run of CACHE
     /// values at a time drawn at the root's turn, never given back.
     fn draw(&mut self, name: &str, n: usize) -> Result<Vec<i64>> {
+        match self.draw_upto(name, n)? {
+            (values, None) => Ok(values),
+            (_, Some(refused)) => Err(Error::new(refused)),
+        }
+    }
+
+    /// `n` values drawn as `draw` draws them; where the sequence runs out first, those it handed
+    /// before its end, with the words the next was refused in. Every value handed is used up, and
+    /// the sequence stands at its end, as PostgreSQL's statement leaves it.
+    fn draw_upto(&mut self, name: &str, n: usize) -> Result<(Vec<i64>, Option<String>)> {
         if self
             .declared
             .as_ref()
@@ -2152,32 +2166,35 @@ impl Snail {
                 None => break,
             }
         }
+        let mut refused = None;
         if out.len() < n {
             let missing = n - out.len();
-            let cache = s.cache.max(1) as usize;
-            let chunk = missing.div_ceil(cache) * cache;
-            let fetched = match self.advance(&s, chunk, missing) {
-                Ok(f) => f,
+            match self.advance(&s, missing) {
+                Ok((fetched, ended)) => {
+                    let used = missing.min(fetched.len());
+                    out.extend_from_slice(&fetched[..used]);
+                    self.handed
+                        .entry(name.to_string())
+                        .or_default()
+                        .extend(fetched[used..].iter().copied());
+                    refused = ended;
+                }
+                Err(e) if e.0.starts_with("nextval: reached ") => refused = Some(e.0),
                 Err(e) => {
-                    // The values held stay held where the sequence runs out.
+                    // The values held stay held where the file could not be written.
                     let held = self.handed.entry(name.to_string()).or_default();
                     for v in out.into_iter().rev() {
                         held.push_front(v);
                     }
                     return Err(e);
                 }
-            };
-            out.extend_from_slice(&fetched[..missing]);
-            self.handed
-                .entry(name.to_string())
-                .or_default()
-                .extend(fetched[missing..].iter().copied());
+            }
         }
         if let Some(&v) = out.last() {
             let oid = super::sequences::sequence_oid(&self.catalog, name).unwrap_or(0);
             self.drawn.drew(name, oid, v);
         }
-        Ok(out)
+        Ok((out, refused))
     }
 
     /// setval at the root's turn, a commit of its own never rolled back: the sequence stands on
@@ -2256,23 +2273,10 @@ impl Snail {
         Ok(out)
     }
 
-    /// `n` values of a sequence drawn for a replay, at once; where it runs out first, one at a time,
-    /// so that those drawn before its end stand, with the words it was refused in.
+    /// `n` values of a sequence drawn for a replay, at once; where it runs out first, those drawn
+    /// before its end stand, with the words it was refused in.
     fn drawn_on_file(&mut self, s: &str, n: usize) -> Result<(Vec<i64>, Option<String>)> {
-        match self.draw(s, n) {
-            Ok(values) => Ok((values, None)),
-            Err(e) if e.0.starts_with("nextval: reached ") => {
-                let mut values = Vec::with_capacity(n);
-                for _ in 0..n {
-                    match self.draw(s, 1) {
-                        Ok(v) => values.push(v[0]),
-                        Err(e) => return Ok((values, Some(e.0))),
-                    }
-                }
-                Ok((values, None))
-            }
-            Err(e) => Err(e),
-        }
+        self.draw_upto(s, n)
     }
 
     /// The runs of a statement whose text names the sequence functions; none for any other.
@@ -2282,6 +2286,7 @@ impl Snail {
         }
         Ok(Some(Runs {
             start: self.drawn.clone(),
+            held: self.handed.clone(),
             stands: self.sequences_standing()?,
             script: Vec::new(),
             replays: 0,
@@ -2295,6 +2300,7 @@ impl Snail {
         super::sequences::tabbing(super::sequences::Tab::lent(super::sequences::Lent {
             drawn: r.start.clone(),
             held: &self.handed,
+            held_at_start: &r.held,
             stands: &r.stands,
             catalog: &self.catalog,
             read_only,
@@ -2318,6 +2324,20 @@ impl Snail {
         Ok(())
     }
 
+    /// Where each sequence stands as pg_sequence_last_value reads it: on the newest root, as
+    /// PostgreSQL reads a sequence's own row whatever the transaction's snapshot.
+    pub(super) fn sequences_newest(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (i64, bool)>> {
+        let newest = self.reader.peek_root()?;
+        Ok(self
+            .reader
+            .sequence_states(&newest)?
+            .into_iter()
+            .map(|(n, v, c)| (n, (v, c)))
+            .collect())
+    }
+
     /// What the run that stands left the session: its `currval`s, the sequence it drew from last,
     /// and the values it drew of those the session held.
     pub(super) fn took_tab(&mut self, tab: super::sequences::Tab) {
@@ -2338,39 +2358,42 @@ impl Snail {
             .collect())
     }
 
-    /// Advances a sequence by up to `chunk` values at the root's turn, a commit of its own, as
-    /// PostgreSQL's nextval is never rolled back: at least `need` of them, or refused where a
-    /// sequence that does not cycle runs out first.
+    /// Advances a sequence at the root's turn, a commit of its own, as PostgreSQL's nextval is never
+    /// rolled back: a run at a time, as nextval fetches one (`sequences::run_from`), until the runs
+    /// hold `need` values; the sequence stands on the last value fetched. Where it runs out first,
+    /// the runs before its end, with the words the next was refused in; refused where it runs out
+    /// before any.
     fn advance(
         &mut self,
         s: &crate::catalog::Sequence,
-        chunk: usize,
         need: usize,
-    ) -> Result<Vec<i64>> {
+    ) -> Result<(Vec<i64>, Option<String>)> {
         self.at_sequences_turn(|states| {
             let (mut last, mut called) = states
                 .iter()
                 .find(|x| x.0 == s.name)
                 .map(|x| (x.1, x.2))
                 .unwrap_or((s.last_value, s.is_called));
-            let mut out = Vec::with_capacity(chunk);
-            while out.len() < chunk {
-                // A run of values ends at the sequence's end once it holds what was asked; the
-                // next draw cycles, or is refused.
-                let ends = called
-                    && last
-                        .checked_add(s.increment)
-                        .is_none_or(|v| v < s.min || v > s.max);
-                if ends && out.len() >= need {
-                    break;
+            let mut out = Vec::with_capacity(need);
+            let mut ended = None;
+            while out.len() < need {
+                match super::sequences::next(s, (last, called)) {
+                    Ok(first) => {
+                        let run = super::sequences::run_from(s, first);
+                        last = *run.last().expect("a run holds the value it begins with");
+                        called = true;
+                        out.extend(run);
+                    }
+                    Err(e) if out.is_empty() => return Err(Error::new(e)),
+                    Err(e) => {
+                        ended = Some(e);
+                        break;
+                    }
                 }
-                last = super::sequences::next(s, (last, called)).map_err(Error::new)?;
-                called = true;
-                out.push(last);
             }
             states.retain(|x| x.0 != s.name);
             states.push((s.name.clone(), last, true));
-            Ok(out)
+            Ok((out, ended))
         })
     }
 

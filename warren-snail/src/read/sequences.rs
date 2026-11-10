@@ -64,6 +64,44 @@ pub(super) struct Fresh {
     pub(super) owed: bool,
 }
 
+/// The file's sequences, as a call's argument names one.
+#[derive(Clone)]
+struct Names {
+    sequences: Vec<Sequence>,
+    /// Each sequence's OID, by its name.
+    oids: HashMap<String, u32>,
+    /// The file's relations that are no sequence, by their full names, each with the words
+    /// PostgreSQL names its kind by.
+    others: HashMap<String, &'static str>,
+    release: u8,
+}
+
+impl Names {
+    fn of(catalog: &Catalog) -> Names {
+        let mut others: HashMap<String, &'static str> = HashMap::new();
+        for t in &catalog.tables {
+            others.insert(full(&t.name), "tables");
+        }
+        for v in &catalog.views {
+            others.insert(full(&v.name), "views");
+        }
+        for t in &catalog.types {
+            others.entry(full(&t.name)).or_insert("composite types");
+        }
+        let oids = catalog
+            .sequences
+            .iter()
+            .filter_map(|s| Some((s.name.clone(), sequence_oid(catalog, &s.name)?)))
+            .collect();
+        Names {
+            sequences: catalog.sequences.clone(),
+            oids,
+            others,
+            release: catalog.release,
+        }
+    }
+}
+
 /// What a statement's calls read and record while it runs.
 pub(super) struct Tab {
     drawn: Drawn,
@@ -72,13 +110,13 @@ pub(super) struct Tab {
     /// Where each sequence stands in the file as the run goes on: the value it handed out last, or
     /// hands out next where none was, and whether it has handed it out.
     stands: HashMap<String, (i64, bool)>,
-    sequences: Vec<Sequence>,
-    /// Each sequence's OID, by its name.
-    oids: HashMap<String, u32>,
-    /// The file's relations that are no sequence, by their full names, each with the words
-    /// PostgreSQL names its kind by.
-    others: HashMap<String, &'static str>,
-    release: u8,
+    names: Names,
+    /// Where each sequence this run moved stands after its last call, as PostgreSQL's session
+    /// moves it, with the values its session then holds of it: a value the session held moves
+    /// nothing, any other begins a run the sequence stands at the end of (`run_from`), and a set
+    /// stands where it set it.
+    moved: HashMap<String, (i64, bool)>,
+    cached: HashMap<String, VecDeque<i64>>,
     /// Whether nothing may be written: a READ ONLY transaction, or a snail opened to read.
     read_only: bool,
     /// The calls a replay made, each with what it came to, which a run answers in order while it
@@ -93,6 +131,8 @@ pub(super) struct Tab {
 pub(super) struct Lent<'a> {
     pub(super) drawn: Drawn,
     pub(super) held: &'a HashMap<String, VecDeque<i64>>,
+    /// What the session held when the statement began, from which `moved` is told.
+    pub(super) held_at_start: &'a HashMap<String, VecDeque<i64>>,
     pub(super) stands: &'a HashMap<String, (i64, bool)>,
     pub(super) catalog: &'a Catalog,
     pub(super) read_only: bool,
@@ -101,30 +141,13 @@ pub(super) struct Lent<'a> {
 
 impl Tab {
     pub(super) fn lent(l: Lent<'_>) -> Tab {
-        let mut others: HashMap<String, &'static str> = HashMap::new();
-        for t in &l.catalog.tables {
-            others.insert(full(&t.name), "tables");
-        }
-        for v in &l.catalog.views {
-            others.insert(full(&v.name), "views");
-        }
-        for t in &l.catalog.types {
-            others.entry(full(&t.name)).or_insert("composite types");
-        }
-        let oids = l
-            .catalog
-            .sequences
-            .iter()
-            .filter_map(|s| Some((s.name.clone(), sequence_oid(l.catalog, &s.name)?)))
-            .collect();
         Tab {
             drawn: l.drawn,
             held: l.held.clone(),
             stands: l.stands.clone(),
-            sequences: l.catalog.sequences.clone(),
-            oids,
-            others,
-            release: l.catalog.release,
+            names: Names::of(l.catalog),
+            moved: HashMap::new(),
+            cached: l.held_at_start.clone(),
             read_only: l.read_only,
             script: l.script,
             at: 0,
@@ -159,10 +182,7 @@ impl Tab {
     }
 
     fn sequence(&self, name: &str) -> &Sequence {
-        self.sequences
-            .iter()
-            .find(|s| s.name == name)
-            .expect("a sequence the tab named")
+        self.names.sequence(name)
     }
 
     /// The call's outcome, from the script where it is the script's next, else as the tab answers it.
@@ -192,19 +212,31 @@ impl Tab {
         outcome
     }
 
-    /// What a call that came to `v` leaves the session.
+    /// What a call that came to `v` leaves the session, and where it leaves the sequence standing.
     fn took(&mut self, op: &Op, v: i64) {
-        let oid = |s: &String| self.oids.get(s).copied().unwrap_or(0);
+        let oid = |s: &String| self.names.oids.get(s).copied().unwrap_or(0);
         match op {
             Op::Draw(s) => {
                 let o = oid(s);
-                self.drawn.drew(s, o, v)
+                self.drawn.drew(s, o, v);
+                let cached = self.cached.entry(s.clone()).or_default();
+                if cached.front() == Some(&v) {
+                    cached.pop_front();
+                } else {
+                    let run = run_from(self.names.sequence(s), v);
+                    let last = *run.last().expect("a run holds the value it begins with");
+                    *cached = run.into_iter().skip(1).collect();
+                    self.moved.insert(s.clone(), (last, true));
+                }
             }
-            Op::Set(s, _, true) => {
-                let o = oid(s);
-                self.drawn.current.insert(s.clone(), (o, v));
+            Op::Set(s, _, called) => {
+                if *called {
+                    let o = oid(s);
+                    self.drawn.current.insert(s.clone(), (o, v));
+                }
+                self.cached.remove(s);
+                self.moved.insert(s.clone(), (v, *called));
             }
-            Op::Set(..) => {}
         }
     }
 
@@ -238,6 +270,15 @@ impl Tab {
             tab.stands.insert(name.to_string(), (v, called));
             (Ok(v), true)
         })
+    }
+}
+
+impl Names {
+    fn sequence(&self, name: &str) -> &Sequence {
+        self.sequences
+            .iter()
+            .find(|s| s.name == name)
+            .expect("a sequence the file holds")
     }
 
     /// The sequence a regclass argument names, or none for a NULL; refused in PostgreSQL's words
@@ -306,7 +347,8 @@ impl Tab {
             return Err(refused(&n, self.others.get(&n).copied().unwrap_or("indexes")));
         }
         let text = crate::regs::reg_text(crate::regs::RegKind::Class, oid, self.release);
-        if text.bytes().all(|b| b.is_ascii_digit()) {
+        // OID 0 names no relation, though regclass writes it `-`.
+        if oid == 0 || text.bytes().all(|b| b.is_ascii_digit()) {
             return Err(Error::new(format!("could not open relation with OID {oid}")));
         }
         let kind = match super::sysviews::view_named(&text) {
@@ -341,6 +383,24 @@ pub(super) fn next(s: &Sequence, (last, called): (i64, bool)) -> Outcome {
     ))
 }
 
+/// The values one fetch of nextval takes, the first `v`, the value it hands out: up to CACHE of
+/// them, as PostgreSQL's sequence.c fetches them, the run ending at the sequence's end even where
+/// it cycles, the fetch after it cycling. The sequence stands on the run's last value.
+pub(super) fn run_from(s: &Sequence, v: i64) -> Vec<i64> {
+    let mut run = vec![v];
+    let mut last = v;
+    while run.len() < s.cache.max(1) as usize {
+        match last.checked_add(s.increment).filter(|n| *n >= s.min && *n <= s.max) {
+            Some(n) => {
+                run.push(n);
+                last = n;
+            }
+            None => break,
+        }
+    }
+    run
+}
+
 /// setval's refusal of a value past a sequence's bounds, in PostgreSQL's words.
 pub(super) fn out_of_bounds(s: &Sequence, v: i64) -> Option<String> {
     (v < s.min || v > s.max).then(|| {
@@ -356,6 +416,9 @@ pub(super) fn out_of_bounds(s: &Sequence, v: i64) -> Option<String> {
 thread_local! {
     /// The tab of the statement under way on this thread, where it calls the sequence functions.
     static TAB: RefCell<Option<Tab>> = const { RefCell::new(None) };
+    /// Where the file's sequences stood when the statement under way began, where it may call
+    /// pg_sequence_last_value.
+    static STANDING: RefCell<Option<Standing>> = const { RefCell::new(None) };
     /// Whether a question is read only for what it returns, its rows thrown away: a subquery's
     /// columns learnt before any row asks it.
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -373,6 +436,91 @@ impl Drop for Probing {
     fn drop(&mut self) {
         PROBING.with(|p| p.set(self.0));
     }
+}
+
+/// Where the file's sequences stand, each by its name: its last value and whether it was handed
+/// out.
+struct Standing {
+    names: Names,
+    stands: HashMap<String, (i64, bool)>,
+}
+
+/// Where the file's sequences stand held for pg_sequence_last_value until dropped.
+pub(super) struct Standings(Option<Option<Standing>>);
+
+/// Whether a statement may call pg_sequence_last_value: its text names it or pg_sequences, or a
+/// view or function of the file whose text does.
+pub(super) fn reads_standing(catalog: &Catalog, sql: &str) -> bool {
+    let names = |t: &str| {
+        let lower = t.to_ascii_lowercase();
+        lower.contains("pg_sequence_last_value") || lower.contains("pg_sequences")
+    };
+    names(sql)
+        || catalog.views.iter().any(|v| names(&v.query))
+        || catalog.functions.iter().any(|f| names(&f.source))
+}
+
+/// Holds where the file's sequences stand, as `stands` gives those the file holds a place of, the
+/// rest where the DDL leaves them; none held where the statement may not call
+/// pg_sequence_last_value.
+pub(super) fn standing(
+    catalog: &Catalog,
+    sql: &str,
+    stands: impl FnOnce() -> Result<HashMap<String, (i64, bool)>>,
+) -> Result<Standings> {
+    if !reads_standing(catalog, sql) {
+        return Ok(Standings(None));
+    }
+    let held = Standing {
+        names: Names::of(catalog),
+        stands: stands()?,
+    };
+    Ok(Standings(Some(STANDING.with(|s| s.replace(Some(held))))))
+}
+
+impl Drop for Standings {
+    fn drop(&mut self) {
+        if let Some(before) = self.0.take() {
+            STANDING.with(|s| *s.borrow_mut() = before);
+        }
+    }
+}
+
+/// pg_sequence_last_value: the last value the sequence handed out, as the file stands where the
+/// statement began, moved by the statement's own calls before this one; NULL where it has handed
+/// out none since it was made or set without being called.
+fn last_value(arg: &Value) -> Result<Value> {
+    let moved = TAB.with(|t| -> Result<Option<(i64, bool)>> {
+        let t = t.borrow();
+        let Some(tab) = t.as_ref() else {
+            return Ok(None);
+        };
+        let s = tab.names.named(arg)?.expect("an argument not NULL");
+        Ok(tab.moved.get(&s).copied())
+    })?;
+    let (v, called) = match moved {
+        Some(m) => m,
+        None => STANDING.with(|st| -> Result<(i64, bool)> {
+            let st = st.borrow();
+            let st = st.as_ref().ok_or_else(|| {
+                Error::new(
+                    "pg_sequence_last_value reads where the file's sequences stand, which only a \
+                     statement run on one snail holds",
+                )
+            })?;
+            let s = st.names.named(arg)?.expect("an argument not NULL");
+            let seq = st.names.sequence(&s);
+            Ok(st
+                .stands
+                .get(&s)
+                .copied()
+                .unwrap_or((seq.last_value, seq.is_called)))
+        })?,
+    };
+    Ok(match called {
+        true => Value::Int(v),
+        false => Value::Null,
+    })
 }
 
 /// A statement's tab lent until it ends or is dropped.
@@ -423,7 +571,9 @@ pub(super) fn defaults(name: &str, n: usize) -> Option<Result<Vec<i64>>> {
 /// What `call` answers in: a bigint, or text for `pg_get_serial_sequence`.
 pub(super) fn typed(name: &str) -> Option<ColumnType> {
     match name {
-        "nextval" | "currval" | "setval" | "lastval" => Some(ColumnType::Int8),
+        "nextval" | "currval" | "setval" | "lastval" | "pg_sequence_last_value" => {
+            Some(ColumnType::Int8)
+        }
         "pg_get_serial_sequence" => Some(ColumnType::Text(None)),
         _ => None,
     }
@@ -432,7 +582,9 @@ pub(super) fn typed(name: &str) -> Option<ColumnType> {
 /// A call of one of the sequence functions, as PostgreSQL answers it; none for any other.
 pub(super) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     match (name, args.len()) {
-        ("nextval" | "currval", 1) | ("lastval", 0) | ("setval", 2 | 3) => {}
+        ("nextval" | "currval" | "pg_sequence_last_value", 1)
+        | ("lastval", 0)
+        | ("setval", 2 | 3) => {}
         ("pg_get_serial_sequence", 2) => return serial(args).map(Some),
         _ => return Ok(None),
     }
@@ -442,6 +594,9 @@ pub(super) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     }
     if PROBING.with(std::cell::Cell::get) {
         return Ok(Some(Value::Int(0)));
+    }
+    if name == "pg_sequence_last_value" {
+        return last_value(&args[0]).map(Some);
     }
     let set_to = match args.get(1).filter(|_| name == "setval") {
         Some(Value::Int(v)) => Some(*v),
@@ -482,15 +637,15 @@ pub(super) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
         let v = match name {
             "lastval" => {
                 let last = tab.drawn.last.clone();
-                match last.and_then(|s| tab.drawn.current(&s, tab.oids.get(&s).copied())) {
+                match last.and_then(|s| tab.drawn.current(&s, tab.names.oids.get(&s).copied())) {
                     Some(v) => v,
                     None => return Err(Error::new("lastval is not yet defined in this session")),
                 }
             }
             _ => {
-                let s = tab.named(&args[0])?.expect("an argument not NULL");
+                let s = tab.names.named(&args[0])?.expect("an argument not NULL");
                 match name {
-                    "currval" => match tab.drawn.current(&s, tab.oids.get(&s).copied()) {
+                    "currval" => match tab.drawn.current(&s, tab.names.oids.get(&s).copied()) {
                         Some(v) => v,
                         None => {
                             return Err(Error::new(format!(

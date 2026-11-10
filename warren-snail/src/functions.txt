@@ -1970,7 +1970,7 @@ pg_restore_relation_stats("any")	18-19	server	statistics and sizes
 pg_rotate_logfile()		server	files and logs
 pg_rotate_logfile_old()	14-16	server	files and logs
 pg_safe_snapshot_blocking_pids(integer)		server	locks
-pg_sequence_last_value(regclass)		server	the server's catalog
+pg_sequence_last_value(regclass)		type	sequences
 pg_sequence_parameters(oid)		server	the server's catalog
 pg_settings_get_flags(text)	15-19	server	the server itself
 pg_show_all_file_settings()		server	files and logs

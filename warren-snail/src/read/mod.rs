@@ -1382,6 +1382,7 @@ impl Snail {
         let _zoned = self.in_zone();
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
+        let _standing = sequences::standing(&self.catalog, sql, || self.sequences_newest())?;
         let mut scan = self.scan(sql, order)?;
         while let Some(batch) = self.next_block(&mut scan)? {
             each(batch)?;
@@ -1537,6 +1538,7 @@ impl Snail {
         let _zoned = self.in_zone();
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
+        let _standing = sequences::standing(&self.catalog, sql, || self.sequences_newest())?;
         let _handed = handed::holding(&self.functions);
         let _prepared = prepared::viewing(&self.session.prepared);
         let viewing = settings::viewing(self.settings_view());
