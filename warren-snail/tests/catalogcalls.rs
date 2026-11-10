@@ -5,7 +5,8 @@
 //! pg_table_is_visible, pg_type_is_visible and pg_function_is_visible, whether the search path,
 //! pg_catalog then public, finds an object by its name alone, as the reg* types' output names it;
 //! information_schema's views of what a write takes, in a file none of whose views is written
-//! through. Every expected row and code was given by 18.6.
+//! through; the reg* names of the objects initdb makes from 12000 on; information_schema's
+//! functions called in a statement of its own. Every expected row and code was given by 18.6.
 
 mod weather;
 
@@ -715,5 +716,104 @@ fn pg_attribute_holds_each_columns_type_as_postgresql_keeps_it() {
             "t_tags.1|tags|text|-1|1|-1|f|i|x|f",
             "t_v.1|v|integer|-1|0|4|t|i|p|f",
         ]
+    );
+}
+
+#[test]
+fn the_reg_types_name_the_objects_initdb_makes_as_postgresql_does() {
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY);";
+    let mut s = Snail::open(&written("initdb-names", ddl)).unwrap();
+    let mut asked = |q: &str, want: &[&str]| {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), want, "{q}");
+    };
+    // 18.6: information_schema's qualified, pg_catalog's bare, by name and by OID.
+    asked(
+        "SELECT 'information_schema.tables'::regclass::oid, 13526::regclass, \
+         'pg_roles'::regclass::oid, 12000::regclass",
+        &["13526|information_schema.tables|12000|pg_roles"],
+    );
+    asked(
+        "SELECT 'information_schema.cardinal_number'::regtype::oid, \
+         'information_schema.cardinal_number[]'::regtype, 13323::regtype",
+        &["13323|information_schema.cardinal_number[]|information_schema.cardinal_number"],
+    );
+    asked(
+        "SELECT 'information_schema._pg_expandarray(anyarray)'::regprocedure::oid, \
+         13310::regprocedure, 13310::regproc, \
+         'information_schema._pg_char_max_length(oid, integer)'::regprocedure, \
+         'plpgsql_validator'::regproc::oid > 12000",
+        &["13310|information_schema._pg_expandarray(anyarray)|information_schema._pg_expandarray|information_schema._pg_char_max_length(oid,integer)|t"],
+    );
+    asked(
+        "SELECT 'information_schema'::regnamespace::oid, 13309::regnamespace, \
+         'information_schema._pg_expandarray'::regproc::oid",
+        &["13309|information_schema|13310"],
+    );
+    // Not on the search path, so not found by its name alone.
+    for q in ["SELECT '_pg_expandarray'::regproc", "SELECT 'tables'::regclass"] {
+        let e = s.ask(q, None).err().unwrap_or_else(|| panic!("{q} was taken")).0;
+        assert!(e.contains("does not exist"), "{q}: {e}");
+    }
+}
+
+#[test]
+fn information_schema_s_functions_answer_a_statement_s_own_calls_as_postgresql_does() {
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.p (a integer, b integer, v varchar(14), \
+         n numeric(10,2), t timestamptz(3), i interval day to second(2), PRIMARY KEY (b, a));";
+    let mut s = Snail::open(&written("schema-functions", ddl)).unwrap();
+    let mut asked = |q: &str, want: &[&str]| {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), want, "{q}");
+    };
+    // 18.6: each inlined as the views inline it, the encoding its body reads the file's.
+    asked(
+        "SELECT information_schema._pg_char_max_length(1043, 14), \
+         information_schema._pg_numeric_precision(23, -1), \
+         information_schema._pg_char_octet_length(1043, 14), \
+         information_schema._pg_numeric_precision_radix(23, -1), \
+         information_schema._pg_numeric_scale(1700, 655366), \
+         information_schema._pg_datetime_precision(1184, 3)",
+        &["10|32|40|2|2|3"],
+    );
+    asked(
+        "SELECT information_schema._pg_index_position('s.p_pkey'::regclass, 2::smallint), \
+         information_schema._pg_index_position('s.p_pkey'::regclass, 1::smallint)",
+        &["1|2"],
+    );
+    // In FROM, each element and its place, under the function's name or the alias given.
+    asked(
+        "SELECT x, n FROM information_schema._pg_expandarray(ARRAY[10, 20, 30])",
+        &["10|1", "20|2", "30|3"],
+    );
+    asked(
+        "SELECT e.n, e.x FROM information_schema._pg_expandarray(ARRAY['a', 'b']) AS e",
+        &["1|a", "2|b"],
+    );
+    // Reading the relations before it, as a function in FROM does.
+    asked(
+        "SELECT c.conname || '.' || e.n, e.x FROM pg_constraint c, \
+         information_schema._pg_expandarray(c.conkey) e \
+         WHERE c.conrelid = 's.p'::regclass ORDER BY 1",
+        &["p_a_not_null.1|1", "p_b_not_null.1|2", "p_pkey.1|2", "p_pkey.2|1"],
+    );
+    // Over a table's columns, each row argument a whole row.
+    asked(
+        "SELECT a.attname, information_schema._pg_truetypid(a.*, t.*)::regtype::text, \
+         information_schema._pg_truetypmod(a.*, t.*), \
+         information_schema._pg_char_max_length(information_schema._pg_truetypid(a.*, t.*), \
+         information_schema._pg_truetypmod(a.*, t.*)), \
+         information_schema._pg_interval_type(information_schema._pg_truetypid(a.*, t.*), \
+         information_schema._pg_truetypmod(a.*, t.*)) \
+         FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+         WHERE a.attrelid = 's.p'::regclass AND a.attnum > 0 ORDER BY a.attnum",
+        &[
+            "a|integer|-1|NULL|NULL",
+            "b|integer|-1|NULL|NULL",
+            "v|character varying|18|14|NULL",
+            "n|numeric|655366|NULL|NULL",
+            "t|timestamp with time zone|3|NULL|NULL",
+            "i|interval|470286338|NULL|DAY TO SECOND(2)",
+        ],
     );
 }

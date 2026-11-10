@@ -3376,6 +3376,11 @@ fn answered(
         LIFTED.with(|c| c.set(0));
     }
     let before = catalog_steps(catalog, q)?;
+    // Its own calls of information_schema's functions, read as the views read them, the tables
+    // their bodies read already taken as a view's.
+    let inlined = super::sysviews::inlined_calls(catalog, q)?
+        .map(|q| super::spelled::between_written(&q));
+    let q = inlined.as_ref().unwrap_or(q);
     let (last, held) = made_by(asked, q, &before, &casings, None, &accrued)?;
     Ok((last, held, accrued))
 }

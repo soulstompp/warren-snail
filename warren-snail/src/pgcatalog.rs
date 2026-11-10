@@ -2535,11 +2535,13 @@ fn type_text(t: ColumnType) -> String {
 }
 
 /// Whether a statement names one of pg_catalog's tables, or one of PostgreSQL's views, as a
-/// relation.
+/// relation, or one of information_schema's functions that read them.
 pub(crate) fn names_catalog(sql: &str) -> bool {
-    crate::read::sysviews::words_of(sql)
-        .iter()
-        .any(|w| table_named(w).is_some() || crate::read::sysviews::view_named(w).is_some())
+    crate::read::sysviews::words_of(sql).iter().any(|w| {
+        table_named(w).is_some()
+            || crate::read::sysviews::view_named(w).is_some()
+            || crate::read::sysviews::names_schema_function(w)
+    })
 }
 
 /// The name the file stands under as a database inside PostgreSQL's views, which their

@@ -197,8 +197,111 @@ fn carried() -> &'static HashMap<&'static str, Vec<Row>> {
                 text,
             });
         }
+        for (section, row) in initdb_rows(&sections) {
+            sections.entry(section).or_default().push(row);
+        }
+        for rows in sections.values_mut() {
+            rows.sort_by_key(|r| r.oid);
+        }
         sections
     })
+}
+
+/// The first OID initdb gives, from which the census reads nothing, and the first a database's own
+/// objects take.
+const INITDB_FIRST: u32 = 12000;
+const INITDB_LAST: u32 = 16384;
+
+/// The objects initdb makes from 12000 on, under each release, as the reg* types write them, drawn
+/// from the carried catalog's rows: pg_catalog's views, its row types and its language and
+/// dictionary functions bare, as the search path finds them; information_schema's and pg_toast's
+/// qualified by their schema, which it does not search.
+fn initdb_rows(census: &HashMap<&'static str, Vec<Row>>) -> Vec<(&'static str, Row)> {
+    use crate::deparse::print::quote;
+    type Fields = HashMap<&'static str, Option<String>>;
+    let get = |r: &Fields, k: &str| r.get(k).cloned().flatten().unwrap_or_default();
+    let num = |r: &Fields, k: &str| -> u32 { get(r, k).parse().unwrap_or(0) };
+    let made = |oid: u32| (INITDB_FIRST..INITDB_LAST).contains(&oid);
+    let mut out: Vec<(&'static str, Row)> = Vec::new();
+    for release in RELEASES {
+        let bit = 1u8 << (release - RELEASES.start());
+        let mut add = |section: &'static str, oid: u32, text: String| {
+            let text: &'static str = Box::leak(text.into_boxed_str());
+            out.push((section, Row { oid, releases: bit, text }));
+        };
+        let schemas: HashMap<u32, String> = crate::pgcatalog::built_in("pg_namespace", release)
+            .iter()
+            .map(|r| (num(r, "oid"), get(r, "nspname")))
+            .collect();
+        let in_catalog = |schema: u32| schemas.get(&schema).is_none_or(|s| s == "pg_catalog");
+        let named = |schema: u32, name: &str| match in_catalog(schema) {
+            true => quote(name),
+            false => format!("{}.{}", quote(&schemas[&schema]), quote(name)),
+        };
+        let mut spaces: Vec<(&u32, &String)> = schemas.iter().filter(|(o, _)| made(**o)).collect();
+        spaces.sort();
+        for (oid, name) in spaces {
+            add("namespace", *oid, quote(name));
+        }
+        for r in crate::pgcatalog::built_in("pg_class", release) {
+            if made(num(&r, "oid")) {
+                add("class", num(&r, "oid"), named(num(&r, "relnamespace"), &get(&r, "relname")));
+            }
+        }
+        let types = crate::pgcatalog::built_in("pg_type", release);
+        let own: HashMap<u32, String> = types
+            .iter()
+            .filter(|r| made(num(r, "oid")))
+            .map(|r| (num(r, "oid"), named(num(r, "typnamespace"), &get(r, "typname"))))
+            .collect();
+        for r in &types {
+            let oid = num(r, "oid");
+            if !made(oid) {
+                continue;
+            }
+            // An array is written as its element's name and `[]`.
+            let text = match (get(r, "typcategory").as_str(), own.get(&num(r, "typelem"))) {
+                ("A", Some(element)) => format!("{element}[]"),
+                _ => own[&oid].clone(),
+            };
+            add("type", oid, text);
+            if in_catalog(num(r, "typnamespace")) {
+                add("typname", oid, get(r, "typname"));
+            }
+            if num(r, "typarray") != 0 {
+                add("array", oid, num(r, "typarray").to_string());
+            }
+        }
+        // A function's arguments as the type section writes them.
+        let census_type = |oid: u32| -> Option<String> {
+            let rows = census.get("type")?;
+            let from = rows.partition_point(|r| r.oid < oid);
+            rows[from..]
+                .iter()
+                .take_while(|r| r.oid == oid)
+                .find(|r| r.releases & bit != 0)
+                .map(|r| r.text.to_string())
+        };
+        for r in crate::pgcatalog::built_in("pg_proc", release) {
+            let oid = num(&r, "oid");
+            if !made(oid) {
+                continue;
+            }
+            let name = named(num(&r, "pronamespace"), &get(&r, "proname"));
+            let args: Option<Vec<String>> = get(&r, "proargtypes")
+                .split_whitespace()
+                .map(|a| {
+                    let t = a.parse().unwrap_or(0);
+                    census_type(t).or_else(|| own.get(&t).cloned())
+                })
+                .collect();
+            if let Some(args) = args {
+                add("procedure", oid, format!("{name}({})", args.join(",")));
+            }
+            add("proc", oid, name);
+        }
+    }
+    out
 }
 
 /// A section's text for an OID under a release, where the carried catalog holds one.
@@ -545,6 +648,13 @@ fn names(release: u8) -> &'static Names {
                         } else {
                             split_name(text).expect("a carried name splits")
                         };
+                        // A function of a schema the search path does not find, by that schema.
+                        if let [schema, own] = parts.as_slice() {
+                            if section == "proc" && schema != "pg_catalog" {
+                                n.named.insert((section, schema.clone(), own.clone()), oid);
+                                continue;
+                            }
+                        }
                         let name = parts.last().unwrap().clone();
                         let e = n.shared.entry((section, name)).or_insert(Some(oid));
                         if parts.len() > 1 {
@@ -556,11 +666,28 @@ fn names(release: u8) -> &'static Names {
                     for (oid, text) in carried_rows(section, r) {
                         let (name, args) = signature(text).expect("a carried signature");
                         let name = if section == "procedure" {
-                            split_name(&name).unwrap().pop().unwrap()
+                            let mut parts = split_name(&name).unwrap();
+                            if let [schema, own] = parts.as_slice() {
+                                if schema != "pg_catalog" {
+                                    let signed = format!("{own}({args})");
+                                    n.named.insert((section, schema.clone(), signed), oid);
+                                    continue;
+                                }
+                            }
+                            parts.pop().unwrap()
                         } else {
                             name
                         };
                         n.signed.insert((section, name, args), oid);
+                    }
+                }
+                // A type of a schema the search path does not find, by that schema.
+                for (oid, text) in carried_rows("type", r) {
+                    if oid < INITDB_FIRST || text.ends_with("[]") {
+                        continue;
+                    }
+                    if let Some([schema, own]) = split_name(text).as_deref() {
+                        n.named.insert(("type", schema.clone(), own.clone()), oid);
                     }
                 }
                 for (oid, text) in carried_rows("typname", r) {
@@ -604,6 +731,17 @@ pub fn reg_parse(kind: RegKind, s: &str, release: u8) -> Result<u32> {
         RegKind::Type => type_oid(s, release),
         RegKind::Procedure | RegKind::Operator => {
             let (parts, args) = name_and_args(s, operator, release)?;
+            // A built-in function of a schema the search path does not find, by that schema.
+            if let ([schema, own], false) = (parts.as_slice(), operator) {
+                let texts: Option<Vec<&str>> = args
+                    .iter()
+                    .map(|a| a.and_then(|t| carried_text("type", t, release)))
+                    .collect();
+                let signed = texts.map(|t| format!("{own}({})", t.join(",")));
+                if let Some(oid) = signed.and_then(|g| n.named.get(&("procedure", schema.clone(), g))) {
+                    return Ok(*oid);
+                }
+            }
             if !operator {
                 // A function of the file's, by its name and its arguments' types.
                 let texts: Option<Vec<String>> = args
@@ -645,6 +783,11 @@ pub fn reg_parse(kind: RegKind, s: &str, release: u8) -> Result<u32> {
         RegKind::Proc | RegKind::Oper => {
             let parts = split_name(s).ok_or_else(syntax)?;
             let section = if operator { "oper" } else { "proc" };
+            if let [schema, own] = parts.as_slice() {
+                if let Some(oid) = n.named.get(&(section, schema.clone(), own.clone())) {
+                    return Ok(*oid);
+                }
+            }
             let carried = in_catalog(&parts).and_then(|name| n.shared.get(&(section, name)));
             match carried {
                 Some(Some(oid)) => Ok(*oid),
@@ -1419,6 +1562,11 @@ impl TypeReader<'_> {
             [schema, name] if schema == "pg_catalog" => {
                 names(self.release).typnames.get(name).copied()
             }
+            // A built-in type of a schema the search path does not find, by that schema.
+            [schema, name] => names(self.release)
+                .named
+                .get(&("type", schema.clone(), name.clone()))
+                .copied(),
             _ => None,
         };
         let oid = match carried {

@@ -933,6 +933,109 @@ fn answer(e: &mut Expr, catalog: &crate::catalog::Catalog) -> Result<()> {
     Ok(())
 }
 
+/// Whether a word names one of information_schema's functions, whose bodies read the catalog.
+pub(crate) fn names_schema_function(word: &str) -> bool {
+    word.strip_prefix("information_schema.")
+        .is_some_and(|f| f.starts_with("_pg_"))
+}
+
+/// A question's own calls of information_schema's functions, read as its views read them: each
+/// inlined as its body, `_pg_expandarray` in FROM as `unnest … WITH ORDINALITY` with its place an
+/// integer, and in a select list as a view writes it. None where it calls none.
+pub(crate) fn inlined_calls(catalog: &crate::catalog::Catalog, q: &Query) -> Result<Option<Query>> {
+    let lower = q.to_string().to_lowercase();
+    if !lower.contains("information_schema._pg_") {
+        return Ok(None);
+    }
+    let mut q = Box::new(q.clone());
+    struct Froms {
+        called: bool,
+        failed: Option<Error>,
+    }
+    impl sqlparser::ast::VisitorMut for Froms {
+        type Break = ();
+        fn pre_visit_table_factor(
+            &mut self,
+            t: &mut sqlparser::ast::TableFactor,
+        ) -> ControlFlow<()> {
+            use sqlparser::ast::TableFactor;
+            let TableFactor::Table {
+                name,
+                args: Some(args),
+                alias,
+                ..
+            } = t
+            else {
+                return ControlFlow::Continue(());
+            };
+            let n = crate::catalog::object_name(name).to_lowercase();
+            if n != "information_schema._pg_expandarray" {
+                return ControlFlow::Continue(());
+            }
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(array))] = args.args.as_slice() else {
+                return ControlFlow::Continue(());
+            };
+            let made = crate::read::image::parse_sql(&format!(
+                "SELECT snail_u.x, CAST(snail_u.n AS integer) AS n \
+                 FROM unnest({array}) WITH ORDINALITY AS snail_u(x, n)"
+            ));
+            match made.as_deref() {
+                Ok([sqlparser::ast::Statement::Query(sub)]) => {
+                    let alias = alias.take().unwrap_or_else(|| sqlparser::ast::TableAlias {
+                        explicit: true,
+                        name: sqlparser::ast::Ident::new("_pg_expandarray"),
+                        columns: Vec::new(),
+                        at: None,
+                    });
+                    // A function in FROM reads the relations before it, as LATERAL does.
+                    *t = TableFactor::Derived {
+                        lateral: true,
+                        subquery: sub.clone(),
+                        alias: Some(alias),
+                        sample: None,
+                    };
+                    self.called = true;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.failed.get_or_insert(Error::new(e.to_string()));
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut froms = Froms {
+        called: false,
+        failed: None,
+    };
+    let _ = sqlparser::ast::VisitMut::visit(q.as_mut(), &mut froms);
+    if let Some(e) = froms.failed {
+        return Err(e);
+    }
+    let mut called = froms.called;
+    let mut failed: Option<Error> = None;
+    let _ = sqlparser::ast::visit_expressions_mut(q.as_mut(), |e| {
+        if let Expr::Function(f) = e {
+            let name = function_name(f);
+            let own = name.strip_prefix("information_schema.");
+            if own.is_some_and(|o| o != "_pg_expandarray") {
+                called = true;
+                if let Err(err) = answer(e, catalog) {
+                    failed.get_or_insert(err);
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    // The bodies' own `_pg_expandarray`, and the question's in a select list.
+    expand_arrays(q.as_mut())?;
+    called |= lower.contains("_pg_expandarray");
+    Ok(called.then_some(*q))
+}
+
 /// A function call's arguments, each as an expression: a row argument `a.*` as its relation's name.
 fn arguments(f: &sqlparser::ast::Function) -> Vec<Expr> {
     let FunctionArguments::List(l) = &f.args else {
