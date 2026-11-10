@@ -4755,6 +4755,16 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                             .and_then(|oid| crate::regs::is_visible(kind, oid, frame.release));
                         return Ok(visible.map_or(Value::Null, Value::Bool));
                     }
+                    if name == "obj_description" && matches!(values.len(), 1 | 2) {
+                        if values.iter().any(Value::is_null) {
+                            return Ok(Value::Null);
+                        }
+                        let class = values.get(1).map(|v| v.text().unwrap_or_default());
+                        let found = crate::deparse::oid_of(&values[0]).and_then(|oid| {
+                            crate::pgcatalog::description(oid, class.as_deref(), frame.release)
+                        });
+                        return Ok(found.map_or(Value::Null, Value::Text));
+                    }
                     if let Some(v) = crate::deparse::call(&name, &values)? {
                         return Ok(v);
                     }

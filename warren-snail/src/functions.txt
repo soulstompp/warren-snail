@@ -1631,8 +1631,8 @@ numnode(tsquery)		type	text search
 numrange(numeric,numeric)		type	ranges and multiranges
 numrange(numeric,numeric,text)		type	ranges and multiranges
 numrange_subdiff(numeric,numeric)		type	ranges and multiranges
-obj_description(oid)		server	the server's catalog
-obj_description(oid,name)		server	the server's catalog
+obj_description(oid)		type	the file's catalog
+obj_description(oid,name)		type	the file's catalog
 octet_length(bit)		type	bit strings
 octet_length(bytea)		type	strings and formatting
 octet_length(character)		type	strings and formatting

@@ -307,6 +307,14 @@ fn in_catalog_signed(name: &str, args: &str, release: u8) -> bool {
         .is_some_and(|(f, _)| !f.contains('.'))
 }
 
+/// The OID of pg_catalog's relation of exactly that name, under a release.
+pub(crate) fn catalog_class(name: &str, release: u8) -> Option<u32> {
+    names(release)
+        .named
+        .get(&("class", "pg_catalog".to_string(), name.to_string()))
+        .copied()
+}
+
 /// The kind of object `pg_table_is_visible`, `pg_type_is_visible` and `pg_function_is_visible`
 /// each ask of.
 pub(crate) fn visibility_kind(name: &str) -> Option<RegKind> {

@@ -146,6 +146,49 @@ pub(crate) fn built_in(table: &str, release: u8) -> Vec<HashMap<&'static str, Op
         .collect()
 }
 
+/// obj_description: the description pg_description holds for an object, of sub-object 0, of the
+/// catalog `class` names, pg_catalog's relation of exactly that name, or of any where none is
+/// given, the first held. The built-in objects' are carried, public's gone where the file dropped
+/// public; the file's own objects hold none, COMMENT ON being refused.
+pub(crate) fn description(objoid: u32, class: Option<&str>, release: u8) -> Option<String> {
+    type Index = std::sync::Arc<HashMap<u32, Vec<(u32, i32, String)>>>;
+    static INDEXES: OnceLock<std::sync::Mutex<HashMap<u8, Index>>> = OnceLock::new();
+    let classoid = match class {
+        Some(name) => Some(crate::regs::catalog_class(name, release)?),
+        None => None,
+    };
+    let index = {
+        let all = INDEXES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut all = all.lock().unwrap_or_else(|e| e.into_inner());
+        all.entry(release)
+            .or_insert_with(|| {
+                let mut by: HashMap<u32, Vec<(u32, i32, String)>> = HashMap::new();
+                for r in built_in("pg_description", release) {
+                    let n = |c: &str| r.get(c).cloned().flatten();
+                    let (Some(o), Some(c), Some(s), Some(d)) =
+                        (n("objoid"), n("classoid"), n("objsubid"), n("description"))
+                    else {
+                        continue;
+                    };
+                    if let (Ok(o), Ok(c), Ok(s)) = (o.parse(), c.parse(), s.parse()) {
+                        by.entry(o).or_default().push((c, s, d));
+                    }
+                }
+                std::sync::Arc::new(by)
+            })
+            .clone()
+    };
+    let dropped = crate::oids::held_each(|o| o.public_dropped()).unwrap_or(false);
+    index
+        .get(&objoid)?
+        .iter()
+        .filter(|(c, _, _)| {
+            !(dropped && objoid == crate::oids::PUBLIC && *c == crate::deparse::depend::NAMESPACE)
+        })
+        .find(|(c, s, _)| *s == 0 && classoid.is_none_or(|k| k == *c))
+        .map(|(_, _, d)| d.clone())
+}
+
 /// A carried table's built-in row under a release whose column holds an OID, found through an
 /// index made once for that table, column and release.
 pub(crate) fn built_in_by(table: &'static str, column: &'static str, oid: u32, release: u8) -> Option<Row> {

@@ -465,3 +465,81 @@ fn pg_get_triggerdef_writes_each_constraint_trigger_as_postgresql_does() {
         &["17|17"],
     );
 }
+
+#[test]
+fn obj_description_reads_each_built_in_objects_description_as_postgresql_does() {
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, v text);";
+    let mut s = Snail::open(&written("descriptions", ddl)).unwrap();
+    let mut asked = |q: &str, want: &[&str]| {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), want, "{q}");
+    };
+    asked(
+        "SELECT obj_description('lower(text)'::regprocedure, 'pg_proc'), \
+         obj_description('pg_class'::regclass, 'pg_class'), \
+         obj_description('int4'::regtype, 'pg_type'), \
+         obj_description('public'::regnamespace, 'pg_namespace'), \
+         obj_description('pg_catalog'::regnamespace, 'pg_namespace')",
+        &["lowercase|NULL|-2 billion to 2 billion integer, 4-byte storage|standard public schema|system catalog schema"],
+    );
+    // Of sub-object 0 of any catalog alone; of pg_catalog's relation of exactly the name given.
+    asked(
+        "SELECT obj_description(1259), obj_description(870), obj_description(99999, 'pg_class'), \
+         obj_description(1259, 'nope'), obj_description(NULL, 'pg_class'), \
+         obj_description(1259, NULL), obj_description('s.t'::regclass, 'pg_class'), \
+         obj_description('s'::regnamespace, 'pg_namespace')",
+        &["NULL|lowercase|NULL|NULL|NULL|NULL|NULL|NULL"],
+    );
+    asked(
+        "SELECT obj_description(870, 'pg_class'), obj_description(1259, 'pg_catalog.pg_class'), \
+         obj_description(870, 'PG_PROC'), pg_typeof(obj_description(1259, 'pg_class'))::text",
+        &["NULL|NULL|NULL|text"],
+    );
+    for (q, want) in [
+        (
+            "SELECT count(*) FILTER (WHERE obj_description(oid, 'pg_proc') IS NOT NULL), \
+             count(*) FILTER (WHERE obj_description(oid) IS NOT NULL), count(*) \
+             FROM pg_proc WHERE oid < 16384",
+            "3397|3397|3413",
+        ),
+        (
+            "SELECT count(*) FILTER (WHERE obj_description(oid, 'pg_type') IS NOT NULL), \
+             count(*) FROM pg_type WHERE oid < 16384",
+            "107|621",
+        ),
+        (
+            "SELECT count(*) FILTER (WHERE obj_description(oid, 'pg_class') IS NOT NULL), \
+             count(*) FROM pg_class WHERE oid < 16384",
+            "0|415",
+        ),
+        (
+            "SELECT count(*) FILTER (WHERE obj_description(oid, 'pg_operator') IS NOT NULL), \
+             count(*) FROM pg_operator WHERE oid < 16384",
+            "799|799",
+        ),
+        (
+            "SELECT count(*) FILTER (WHERE obj_description(oid, 'pg_namespace') IS NOT NULL), \
+             count(*) FROM pg_namespace WHERE oid < 16384",
+            "3|4",
+        ),
+    ] {
+        asked(q, &[want]);
+    }
+    // A file that drops public drops its description with it.
+    let ddl = "DROP SCHEMA public; CREATE SCHEMA s; CREATE TABLE s.t (id int PRIMARY KEY, v text);";
+    let mut s = Snail::open(&written("descriptions-no-public", ddl)).unwrap();
+    for (q, want) in [
+        (
+            "SELECT obj_description(2200, 'pg_namespace'), obj_description(2200)",
+            "NULL|NULL",
+        ),
+        (
+            "SELECT count(*) FILTER (WHERE obj_description(oid, 'pg_namespace') IS NOT NULL), \
+             count(*) FROM pg_namespace WHERE oid < 16384",
+            "2|3",
+        ),
+    ] {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), [want], "{q}");
+    }
+}
