@@ -1788,7 +1788,7 @@ pg_export_snapshot()		server	sessions
 pg_extension_config_dump(regclass,text)		server	the server's catalog
 pg_extension_update_paths(name)		server	the server's catalog
 pg_filenode_relation(oid,oid)		server	files and logs
-pg_function_is_visible(oid)		server	the server's catalog
+pg_function_is_visible(oid)		type	the file's catalog
 pg_get_acl(oid,oid,integer)	18-19	server	roles and privileges
 pg_get_aios()	18-19	server	the server itself
 pg_get_backend_memory_contexts()		server	the server itself
@@ -2142,7 +2142,7 @@ pg_stop_backup(boolean,boolean)	14	server	WAL and replication
 pg_stop_making_pinned_objects()	15-19	server	the server's catalog
 pg_switch_wal()		server	WAL and replication
 pg_sync_replication_slots()	17-19	server	WAL and replication
-pg_table_is_visible(oid)		server	the server's catalog
+pg_table_is_visible(oid)		type	the file's catalog
 pg_table_size(regclass)		server	statistics and sizes
 pg_tablespace_databases(oid)		server	other databases
 pg_tablespace_location(oid)		server	files and logs
@@ -2167,7 +2167,7 @@ pg_ts_config_is_visible(oid)		server	the server's catalog
 pg_ts_dict_is_visible(oid)		server	the server's catalog
 pg_ts_parser_is_visible(oid)		server	the server's catalog
 pg_ts_template_is_visible(oid)		server	the server's catalog
-pg_type_is_visible(oid)		server	the server's catalog
+pg_type_is_visible(oid)		type	the file's catalog
 pg_typeof("any")		type	the rest
 pg_visible_in_snapshot(xid8,pg_snapshot)		type	the rest
 pg_wal_lsn_diff(pg_lsn,pg_lsn)		type	numbers

@@ -287,12 +287,80 @@ fn file_text(kind: RegKind, o: &crate::oids::Object, release: u8) -> Option<Stri
             let shadowed = n.shared.contains_key(&("proc", own(name)));
             match kind {
                 RegKind::Proc => shown(name, shadowed || several),
-                _ => format!("{}({args})", shown(name, shadowed)),
+                // regprocedure qualifies a function pg_catalog holds one of its name and
+                // arguments before.
+                _ => format!("{}({args})", shown(name, in_catalog_signed(&own(name), args, release))),
             }
         }
         _ => return None,
     })
 }
+
+/// Whether pg_catalog holds a function of the name and the arguments' types, written as
+/// regprocedure writes them: one the search path finds before any of `public`'s.
+fn in_catalog_signed(name: &str, args: &str, release: u8) -> bool {
+    names(release)
+        .signed
+        .get(&("procedure", name.to_string(), args.to_string()))
+        .and_then(|&oid| carried_text("procedure", oid, release))
+        .and_then(signature)
+        .is_some_and(|(f, _)| !f.contains('.'))
+}
+
+/// The kind of object `pg_table_is_visible`, `pg_type_is_visible` and `pg_function_is_visible`
+/// each ask of.
+pub(crate) fn visibility_kind(name: &str) -> Option<RegKind> {
+    match name {
+        "pg_table_is_visible" => Some(RegKind::Class),
+        "pg_type_is_visible" => Some(RegKind::Type),
+        "pg_function_is_visible" => Some(RegKind::Procedure),
+        _ => None,
+    }
+}
+
+/// Whether the search path finds the relation, the type or the function an OID names by its name
+/// alone, as PostgreSQL's visibility tests answer; none where the OID names no object of `kind`.
+/// A snail's search path is pg_catalog, then public. A built-in object is visible where it is
+/// pg_catalog's, by its carried row; a file's where it is public's and pg_catalog holds none of
+/// its name: a type's array by the array's own name, `_` before its type's, and a function by its
+/// name and its arguments.
+pub(crate) fn is_visible(kind: RegKind, oid: u32, release: u8) -> Option<bool> {
+    use crate::oids::Object as O;
+    if oid >= crate::oids::FIRST {
+        let o = crate::oids::held_object(oid).ok().flatten()?;
+        let n = names(release);
+        let public = |name: &str| crate::oids::parts(name).0 == "public";
+        let own = |name: &str| crate::oids::parts(name).1.to_string();
+        return match (kind, &o) {
+            (RegKind::Class, O::Class(name)) => Some(
+                public(name)
+                    && !n
+                        .named
+                        .contains_key(&("class", "pg_catalog".to_string(), own(name))),
+            ),
+            (RegKind::Type, O::Type(name)) => {
+                Some(public(name) && !n.typnames.contains_key(&own(name)))
+            }
+            (RegKind::Type, O::Array(name)) => {
+                Some(public(name) && !n.typnames.contains_key(&format!("_{}", own(name))))
+            }
+            (RegKind::Procedure, O::Proc(name, args)) => {
+                Some(public(name) && !in_catalog_signed(&own(name), args, release))
+            }
+            _ => None,
+        };
+    }
+    let (table, namespace) = match kind {
+        RegKind::Class => ("pg_class", "relnamespace"),
+        RegKind::Type => ("pg_type", "typnamespace"),
+        _ => ("pg_proc", "pronamespace"),
+    };
+    let row = crate::pgcatalog::built_in_by(table, "oid", oid, release)?;
+    Some(row.get(namespace).cloned().flatten().as_deref() == Some(PG_CATALOG))
+}
+
+/// pg_catalog's OID, as a carried row writes it.
+const PG_CATALOG: &str = "11";
 
 /// A name the carried catalog does not hold, looked for among the held file's objects: in its
 /// schema, or in `public` where it names none, as the search path finds it after `pg_catalog`. A

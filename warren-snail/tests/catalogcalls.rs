@@ -1,7 +1,9 @@
 //! The catalog's functions PostgreSQL's views and its clients call, over a snail's catalog, each
 //! answered as PostgreSQL 18.6 answers it after the same DDL and statements: pg_sequence_last_value,
 //! where each sequence stands as its session's draws, a CACHE run at a time, and its sets leave it,
-//! call by call within one statement and on the newest root whatever a transaction's snapshot.
+//! call by call within one statement and on the newest root whatever a transaction's snapshot;
+//! pg_table_is_visible, pg_type_is_visible and pg_function_is_visible, whether the search path,
+//! pg_catalog then public, finds an object by its name alone, as the reg* types' output names it.
 //! Every expected row and code was given by 18.6.
 
 mod weather;
@@ -219,5 +221,130 @@ fn pg_sequence_last_value_reads_where_each_sequence_stands_as_postgresql_does() 
             "t_id_seq|2",
             "t_n_seq|2",
         ],
+    );
+}
+
+const VISIBLE: &str = "CREATE SCHEMA a; \
+     CREATE TABLE public.t (id int PRIMARY KEY); CREATE TABLE a.t (id int PRIMARY KEY); \
+     CREATE TABLE public.pg_class (x int PRIMARY KEY); CREATE TABLE public.tables (x int PRIMARY KEY); \
+     CREATE VIEW public.v AS SELECT 1 AS one; CREATE SEQUENCE public.sq; \
+     CREATE INDEX t_i ON public.t (id); \
+     CREATE TYPE public.mood AS ENUM ('a'); CREATE TYPE public.int4 AS ENUM ('x'); \
+     CREATE TYPE a.mood AS ENUM ('b'); CREATE TYPE public.cardinal_number AS ENUM ('c'); \
+     CREATE TYPE public.pair AS (a int, b text); CREATE DOMAIN public.dm AS int; \
+     CREATE FUNCTION public.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+     CREATE FUNCTION a.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+     CREATE FUNCTION public.lower(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+     CREATE FUNCTION public.abs(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+     CREATE FUNCTION public.g(text, integer) RETURNS integer LANGUAGE sql AS 'SELECT $2';";
+
+#[test]
+fn the_visibility_tests_answer_whether_the_search_path_finds_an_object_by_its_name() {
+    let mut s = Snail::open(&written("visible", VISIBLE)).unwrap();
+    let mut asked = |q: &str, want: &[&str]| {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), want, "{q}");
+    };
+    // A file's object is visible where it is public's and pg_catalog holds none of its name: a
+    // type's array by its own, a function by its name and its arguments.
+    asked(
+        "SELECT n.nspname||'.'||c.relname, pg_table_is_visible(c.oid), c.oid::regclass::text \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname IN ('public', 'a') ORDER BY 1",
+        &[
+            "a.t|f|a.t",
+            "a.t_pkey|f|a.t_pkey",
+            "public.pair|t|pair",
+            "public.pg_class|f|public.pg_class",
+            "public.pg_class_pkey|t|pg_class_pkey",
+            "public.sq|t|sq",
+            "public.t|t|t",
+            "public.t_i|t|t_i",
+            "public.t_pkey|t|t_pkey",
+            "public.tables|t|tables",
+            "public.tables_pkey|t|tables_pkey",
+            "public.v|t|v",
+        ],
+    );
+    asked(
+        "SELECT n.nspname||'.'||t.typname, pg_type_is_visible(t.oid), t.oid::regtype::text \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE n.nspname IN ('public', 'a') ORDER BY 1",
+        &[
+            "a._mood|f|a.mood[]",
+            "a._t|f|a.t[]",
+            "a.mood|f|a.mood",
+            "a.t|f|a.t",
+            "public._cardinal_number|t|cardinal_number[]",
+            "public._dm|t|dm[]",
+            "public._int4|f|public.int4[]",
+            "public._mood|t|mood[]",
+            "public._pair|t|pair[]",
+            "public._pg_class|f|public.pg_class[]",
+            "public._t|t|t[]",
+            "public._tables|t|tables[]",
+            "public._v|t|v[]",
+            "public.cardinal_number|t|cardinal_number",
+            "public.dm|t|dm",
+            "public.int4|f|public.int4",
+            "public.mood|t|mood",
+            "public.pair|t|pair",
+            "public.pg_class|f|public.pg_class",
+            "public.t|t|t",
+            "public.tables|t|tables",
+            "public.v|t|v",
+        ],
+    );
+    asked(
+        "SELECT n.nspname||'.'||p.proname||'('||pg_get_function_identity_arguments(p.oid)||')', \
+         pg_function_is_visible(p.oid), p.oid::regprocedure::text, p.oid::regproc::text \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname IN ('public', 'a') ORDER BY 1",
+        &[
+            "a.f(integer)|f|a.f(integer)|a.f",
+            "public.abs(integer)|f|public.abs(integer)|public.abs",
+            "public.f(integer)|t|f(integer)|f",
+            "public.g(text, integer)|t|g(text,integer)|g",
+            "public.lower(integer)|t|lower(integer)|public.lower",
+        ],
+    );
+    // A built-in object is visible where it is pg_catalog's.
+    asked(
+        "SELECT n.nspname, count(*), count(*) FILTER (WHERE pg_table_is_visible(c.oid)) \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid < 16384 GROUP BY 1 ORDER BY 1",
+        &[
+            "information_schema|69|0",
+            "pg_catalog|268|268",
+            "pg_toast|78|0",
+        ],
+    );
+    asked(
+        "SELECT n.nspname, count(*), count(*) FILTER (WHERE pg_type_is_visible(t.oid)) \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE t.oid < 16384 GROUP BY 1 ORDER BY 1",
+        &["information_schema|148|0", "pg_catalog|473|473"],
+    );
+    asked(
+        "SELECT n.nspname, count(*), count(*) FILTER (WHERE pg_function_is_visible(p.oid)) \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.oid < 16384 GROUP BY 1 ORDER BY 1",
+        &["information_schema|11|0", "pg_catalog|3402|3402"],
+    );
+    // NULL where the OID names no object of the kind.
+    asked(
+        "SELECT pg_table_is_visible(1259), pg_table_is_visible(99999), pg_table_is_visible(0), \
+         pg_table_is_visible(NULL), pg_table_is_visible(23)",
+        &["t|NULL|NULL|NULL|NULL"],
+    );
+    asked(
+        "SELECT pg_type_is_visible('int4'::regtype), pg_type_is_visible('integer[]'::regtype), \
+         pg_type_is_visible(83), pg_type_is_visible(99999), pg_type_is_visible(1259)",
+        &["t|t|t|NULL|NULL"],
+    );
+    asked(
+        "SELECT pg_function_is_visible('lower(text)'::regprocedure), pg_function_is_visible(870), \
+         pg_function_is_visible(99999), pg_function_is_visible(23), pg_function_is_visible(NULL)",
+        &["t|t|NULL|NULL|NULL"],
     );
 }

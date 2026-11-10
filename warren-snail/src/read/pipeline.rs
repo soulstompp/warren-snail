@@ -4748,6 +4748,13 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     if let Some(v) = super::updatable::call(&name, &values)? {
                         return Ok(v);
                     }
+                    if let (Some(kind), [v]) =
+                        (crate::regs::visibility_kind(&name), values.as_slice())
+                    {
+                        let visible = crate::deparse::oid_of(v)
+                            .and_then(|oid| crate::regs::is_visible(kind, oid, frame.release));
+                        return Ok(visible.map_or(Value::Null, Value::Bool));
+                    }
                     if let Some(v) = crate::deparse::call(&name, &values)? {
                         return Ok(v);
                     }

@@ -866,6 +866,9 @@ impl Typing<'_> {
                 if let Some(t) = crate::deparse::typed(&name) {
                     return Ok(Some(t));
                 }
+                if crate::regs::visibility_kind(&name).is_some() {
+                    return Ok(Some(ColumnType::Boolean));
+                }
                 crate::functions::refuse_server(&name, self.release)?;
                 None
             }
