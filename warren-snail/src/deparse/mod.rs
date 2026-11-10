@@ -63,7 +63,12 @@ pub(crate) fn held() -> Result<Arc<Catalog>> {
 pub(crate) fn is_deparser(name: &str) -> bool {
     matches!(
         name,
-        "pg_get_expr" | "pg_get_constraintdef" | "pg_get_indexdef" | "pg_get_viewdef" | "pg_get_ruledef"
+        "pg_get_expr"
+            | "pg_get_constraintdef"
+            | "pg_get_indexdef"
+            | "pg_get_viewdef"
+            | "pg_get_ruledef"
+            | "pg_get_triggerdef"
     ) || funcs::is_function_printer(name)
 }
 
@@ -131,6 +136,11 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
             let oid = args.first().and_then(oid_of).unwrap_or(0);
             let pretty = args.get(1).and_then(truth_of).unwrap_or(false);
             viewdef::ruledef(&cat, oid, pretty)?
+        }
+        "pg_get_triggerdef" => {
+            let oid = args.first().and_then(oid_of).unwrap_or(0);
+            let pretty = args.get(1).and_then(truth_of).unwrap_or(false);
+            defs::triggerdef(&cat, oid, pretty)?
         }
         "pg_get_viewdef" => {
             let pretty_or_wrap = args.get(1);

@@ -405,3 +405,63 @@ fn information_schema_reads_each_array_element_and_its_place_as_postgresql_does(
         &["0"],
     );
 }
+
+const TRIGGERS: &str = "CREATE SCHEMA s; \
+     CREATE TABLE s.p (a int, b text, c int, PRIMARY KEY (b, a), UNIQUE (c)); \
+     CREATE TABLE s.f (id int PRIMARY KEY, pc int REFERENCES s.p (c) ON DELETE CASCADE \
+     ON UPDATE SET NULL); \
+     CREATE TABLE s.g (id int PRIMARY KEY, pb text, pa int, FOREIGN KEY (pb, pa) \
+     REFERENCES s.p (b, a) DEFERRABLE INITIALLY DEFERRED); \
+     CREATE TABLE public.q (id int PRIMARY KEY, k int UNIQUE DEFERRABLE, r int \
+     REFERENCES public.q (id) ON DELETE RESTRICT ON UPDATE SET DEFAULT DEFERRABLE); \
+     CREATE TABLE s.\"Odd Name\" (id int PRIMARY KEY, q_id int REFERENCES public.q (id) \
+     ON DELETE SET NULL);";
+
+#[test]
+fn pg_get_triggerdef_writes_each_constraint_trigger_as_postgresql_does() {
+    let mut s = Snail::open(&written("triggers", TRIGGERS)).unwrap();
+    let mut asked = |q: &str, want: &[&str]| {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), want, "{q}");
+    };
+    // Each trigger named by its own OID, written N here as the OIDs differ: its table qualified,
+    // or named as the search path finds it where pretty; the other table so in either.
+    asked(
+        "SELECT c.relname||' '||k.conname||' '||g.tgfoid::regproc::text AS k, \
+         regexp_replace(pg_get_triggerdef(g.oid), '_[0-9]+\"', '_N\"') AS plain, \
+         regexp_replace(pg_get_triggerdef(g.oid, true), '_[0-9]+\"', '_N\"') AS pretty \
+         FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid \
+         JOIN pg_constraint k ON k.oid = g.tgconstraint ORDER BY 1",
+        &[
+            "Odd Name Odd Name_q_id_fkey \"RI_FKey_check_ins\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON s.\"Odd Name\" FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON s.\"Odd Name\" FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()",
+            "Odd Name Odd Name_q_id_fkey \"RI_FKey_check_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON s.\"Odd Name\" FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON s.\"Odd Name\" FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()",
+            "f f_pc_fkey \"RI_FKey_check_ins\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON s.f FROM s.p NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON s.f FROM s.p NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()",
+            "f f_pc_fkey \"RI_FKey_check_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON s.f FROM s.p NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON s.f FROM s.p NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()",
+            "g g_pb_pa_fkey \"RI_FKey_check_ins\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON s.g FROM s.p DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON s.g FROM s.p DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()",
+            "g g_pb_pa_fkey \"RI_FKey_check_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON s.g FROM s.p DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON s.g FROM s.p DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()",
+            "p f_pc_fkey \"RI_FKey_cascade_del\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON s.p FROM s.f NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON s.p FROM s.f NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_cascade_del\"()",
+            "p f_pc_fkey \"RI_FKey_setnull_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON s.p FROM s.f NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_setnull_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON s.p FROM s.f NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_setnull_upd\"()",
+            "p g_pb_pa_fkey \"RI_FKey_noaction_del\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON s.p FROM s.g DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON s.p FROM s.g DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_del\"()",
+            "p g_pb_pa_fkey \"RI_FKey_noaction_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON s.p FROM s.g DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON s.p FROM s.g DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()",
+            "q Odd Name_q_id_fkey \"RI_FKey_noaction_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON public.q FROM s.\"Odd Name\" NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON q FROM s.\"Odd Name\" NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_noaction_upd\"()",
+            "q Odd Name_q_id_fkey \"RI_FKey_setnull_del\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON public.q FROM s.\"Odd Name\" NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_setnull_del\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON q FROM s.\"Odd Name\" NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_setnull_del\"()",
+            "q q_k_key unique_key_recheck|CREATE CONSTRAINT TRIGGER \"Unique_ConstraintTrigger_N\" AFTER INSERT OR UPDATE ON public.q DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION unique_key_recheck()|CREATE CONSTRAINT TRIGGER \"Unique_ConstraintTrigger_N\" AFTER INSERT OR UPDATE ON q DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION unique_key_recheck()",
+            "q q_r_fkey \"RI_FKey_check_ins\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON public.q FROM q DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER INSERT ON q FROM q DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_ins\"()",
+            "q q_r_fkey \"RI_FKey_check_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON public.q FROM q DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_c_N\" AFTER UPDATE ON q FROM q DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_check_upd\"()",
+            "q q_r_fkey \"RI_FKey_restrict_del\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON public.q FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_restrict_del\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER DELETE ON q FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_restrict_del\"()",
+            "q q_r_fkey \"RI_FKey_setdefault_upd\"|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON public.q FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_setdefault_upd\"()|CREATE CONSTRAINT TRIGGER \"RI_ConstraintTrigger_a_N\" AFTER UPDATE ON q FROM q NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION \"RI_FKey_setdefault_upd\"()",
+        ],
+    );
+    asked(
+        "SELECT pg_get_triggerdef(99999), pg_get_triggerdef(0), pg_get_triggerdef(NULL), \
+         pg_typeof(pg_get_triggerdef(0))::text",
+        &["NULL|NULL|NULL|text"],
+    );
+    asked("SELECT count(*) FROM information_schema.triggers", &["0"]);
+    // Each named by its own OID.
+    asked(
+        "SELECT count(*) FILTER (WHERE position(g.oid::text IN pg_get_triggerdef(g.oid)) > 0), \
+         count(*) FROM pg_trigger g",
+        &["17|17"],
+    );
+}

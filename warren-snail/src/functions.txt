@@ -1828,8 +1828,8 @@ pg_get_shmem_allocations_numa()	18-19	server	the server itself
 pg_get_statisticsobjdef(oid)		server	the server's catalog
 pg_get_statisticsobjdef_columns(oid)		server	the server's catalog
 pg_get_statisticsobjdef_expressions(oid)		server	the server's catalog
-pg_get_triggerdef(oid)		server	the server's catalog
-pg_get_triggerdef(oid,boolean)		server	the server's catalog
+pg_get_triggerdef(oid)		type	the file's catalog
+pg_get_triggerdef(oid,boolean)		type	the file's catalog
 pg_get_userbyid(oid)		server	roles and privileges
 pg_get_viewdef(oid)		type	the file's catalog
 pg_get_viewdef(oid,boolean)		type	the file's catalog

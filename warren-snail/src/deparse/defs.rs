@@ -653,6 +653,84 @@ pub(crate) fn index_trees(cat: &Cat, oid: u32) -> Result<Option<Trees>> {
     Ok(Some(((!exprs.is_empty()).then_some(Node::List(exprs)), pred, rel)))
 }
 
+/// pg_get_triggerdef: a trigger of the file's as pg_get_triggerdef_worker writes it, as the
+/// statement that would make it: its table schema-qualified, or where pretty named as the search
+/// path finds it, the table its constraint names after FROM so in either, its function by its
+/// name; none for an OID that names no trigger.
+pub(crate) fn triggerdef(cat: &Cat, oid: u32, pretty: bool) -> Result<Option<String>> {
+    use crate::regs::{reg_text, RegKind};
+    let catalog = cat.catalog;
+    if !matches!(catalog.oids.object(oid), Some(Object::Trigger(..))) {
+        return Ok(None);
+    }
+    let own = oid.to_string();
+    let Some(row) = crate::pgcatalog::file_rows(catalog, "pg_trigger")
+        .into_iter()
+        .find(|r| r.get("oid").cloned().flatten().as_deref() == Some(own.as_str()))
+    else {
+        return Ok(None);
+    };
+    let text = |c: &str| row.get(c).cloned().flatten().unwrap_or_default();
+    let number = |c: &str| text(c).parse::<u32>().unwrap_or(0);
+    let tgtype = number("tgtype");
+    let constraint = number("tgconstraint") != 0;
+    let mut s = format!(
+        "CREATE {}TRIGGER {} ",
+        if constraint { "CONSTRAINT " } else { "" },
+        quote(&text("tgname"))
+    );
+    s.push_str(match (tgtype & TRIGGER_BEFORE != 0, tgtype & TRIGGER_INSTEAD != 0) {
+        (true, _) => "BEFORE",
+        (_, true) => "INSTEAD OF",
+        _ => "AFTER",
+    });
+    let events: Vec<&str> = [
+        (TRIGGER_INSERT, "INSERT"),
+        (TRIGGER_DELETE, "DELETE"),
+        (TRIGGER_UPDATE, "UPDATE"),
+        (TRIGGER_TRUNCATE, "TRUNCATE"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| tgtype & bit != 0)
+    .map(|(_, e)| e)
+    .collect();
+    let rel = number("tgrelid");
+    let on = match (pretty, catalog.oids.object(rel)) {
+        (false, Some(Object::Class(name))) => {
+            let (schema, table) = parts(name);
+            format!("{}.{}", quote(schema), quote(table))
+        }
+        _ => reg_text(RegKind::Class, rel, cat.release),
+    };
+    s.push_str(&format!(" {} ON {on} ", events.join(" OR ")));
+    if constraint {
+        let other = number("tgconstrrelid");
+        if other != 0 {
+            s.push_str(&format!("FROM {} ", reg_text(RegKind::Class, other, cat.release)));
+        }
+        if text("tgdeferrable") != "t" {
+            s.push_str("NOT ");
+        }
+        s.push_str("DEFERRABLE INITIALLY ");
+        s.push_str(if text("tginitdeferred") == "t" { "DEFERRED " } else { "IMMEDIATE " });
+    }
+    s.push_str(if tgtype & TRIGGER_ROW != 0 { "FOR EACH ROW " } else { "FOR EACH STATEMENT " });
+    s.push_str(&format!(
+        "EXECUTE FUNCTION {}()",
+        reg_text(RegKind::Proc, number("tgfoid"), cat.release)
+    ));
+    Ok(Some(s))
+}
+
+/// pg_trigger.tgtype's bits, as trigger.h numbers them.
+const TRIGGER_ROW: u32 = 1;
+const TRIGGER_BEFORE: u32 = 2;
+const TRIGGER_INSERT: u32 = 4;
+const TRIGGER_DELETE: u32 = 8;
+const TRIGGER_UPDATE: u32 = 16;
+const TRIGGER_TRUNCATE: u32 = 32;
+const TRIGGER_INSTEAD: u32 = 64;
+
 /// Whether an index of the file has expression keys, and whether it has a predicate.
 pub(crate) fn index_has_trees(catalog: &crate::catalog::Catalog, oid: u32) -> (bool, bool) {
     match index_of(catalog, oid) {
