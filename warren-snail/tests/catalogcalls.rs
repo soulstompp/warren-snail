@@ -3,8 +3,9 @@
 //! where each sequence stands as its session's draws, a CACHE run at a time, and its sets leave it,
 //! call by call within one statement and on the newest root whatever a transaction's snapshot;
 //! pg_table_is_visible, pg_type_is_visible and pg_function_is_visible, whether the search path,
-//! pg_catalog then public, finds an object by its name alone, as the reg* types' output names it.
-//! Every expected row and code was given by 18.6.
+//! pg_catalog then public, finds an object by its name alone, as the reg* types' output names it;
+//! information_schema's views of what a write takes, in a file none of whose views is written
+//! through. Every expected row and code was given by 18.6.
 
 mod weather;
 
@@ -404,6 +405,24 @@ fn information_schema_reads_each_array_element_and_its_place_as_postgresql_does(
         "SELECT count(*) FROM information_schema.triggered_update_columns",
         &["0"],
     );
+    // In a file holding a view, whose step is named beside the system views': element_types'
+    // columns past those the views its subquery reads refuse at their places, each view's
+    // refusals its own and its subquery's kept beside its statement's.
+    let viewed = format!("{KEYS} CREATE VIEW s.v AS SELECT id, xs FROM s.arr;");
+    let mut s = Snail::open(&written("keys-view", &viewed)).unwrap();
+    let q = "SELECT object_name || '.' || collection_type_identifier, data_type, udt_schema, \
+         udt_name, dtd_identifier FROM information_schema.element_types \
+         WHERE object_schema = 's' ORDER BY 1";
+    let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+    assert_eq!(
+        joined(&s, &b),
+        [
+            "arr.2|integer|pg_catalog|int4|a2",
+            "arr.3|text|pg_catalog|text|a3",
+            "v.2|integer|pg_catalog|int4|a2",
+        ],
+        "{q}"
+    );
 }
 
 const TRIGGERS: &str = "CREATE SCHEMA s; \
@@ -542,4 +561,159 @@ fn obj_description_reads_each_built_in_objects_description_as_postgresql_does() 
         let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
         assert_eq!(joined(&s, &b), [want], "{q}");
     }
+}
+
+#[test]
+fn information_schema_reads_what_a_write_takes_where_no_view_is_written_through() {
+    let tables = "SELECT table_name, table_type, is_insertable_into FROM information_schema.tables \
+         WHERE table_schema = 'public' ORDER BY 1";
+    let columns = "SELECT table_name, column_name, is_updatable FROM information_schema.columns \
+         WHERE table_schema = 'public' ORDER BY 1, 2";
+    let views = "SELECT table_name, is_updatable, is_insertable_into, is_trigger_updatable \
+         FROM information_schema.views WHERE table_schema = 'public'";
+    let table = "CREATE TABLE t (id integer PRIMARY KEY, g integer);";
+    let counted = format!("{table} CREATE VIEW w AS SELECT count(*) AS n FROM t;");
+    for (name, ddl, want) in [
+        (
+            "no-view",
+            table.to_string(),
+            [vec!["t|BASE TABLE|YES"], vec!["t|g|YES", "t|id|YES"], vec![]],
+        ),
+        (
+            "unwritable-view",
+            counted,
+            [
+                vec!["t|BASE TABLE|YES", "w|VIEW|NO"],
+                vec!["t|g|YES", "t|id|YES", "w|n|NO"],
+                vec!["w|NO|NO|NO"],
+            ],
+        ),
+    ] {
+        let mut s = Snail::open(&written(name, &ddl)).unwrap();
+        for (q, want) in [tables, columns, views].into_iter().zip(want) {
+            let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{name}: {q}: {}", e.0));
+            assert_eq!(joined(&s, &b), want, "{name}: {q}");
+        }
+    }
+}
+
+#[test]
+fn information_schema_reads_the_options_of_foreign_objects_a_snail_holds_none_of() {
+    let ddl = "CREATE TABLE t (id integer PRIMARY KEY, g integer); \
+         CREATE VIEW w AS SELECT id, g FROM t;";
+    let mut s = Snail::open(&written("options", ddl)).unwrap();
+    for q in [
+        "SELECT table_name, column_name, option_name, option_value \
+         FROM information_schema.column_options",
+        "SELECT option_name FROM information_schema.foreign_server_options",
+        "SELECT option_name FROM information_schema.foreign_table_options",
+        "SELECT option_name FROM information_schema.foreign_data_wrapper_options",
+    ] {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), Vec::<String>::new(), "{q}");
+    }
+    // A column the view passes through from one beneath it that only a server fills is refused
+    // where a statement asks it.
+    for q in [
+        "SELECT foreign_server_catalog FROM information_schema.foreign_server_options",
+        "SELECT table_catalog FROM information_schema.column_options",
+    ] {
+        let e = s.ask(q, None).err().unwrap_or_else(|| panic!("{q} was taken")).0;
+        assert!(e.contains("current_database() is a server's own"), "{q}: {e}");
+    }
+}
+
+#[test]
+fn pg_index_holds_each_keys_operator_class_and_order_as_postgresql_does() {
+    let ddl = "CREATE SCHEMA s; \
+         CREATE TABLE s.t (id integer PRIMARY KEY, v text, w varchar(20), p point, j jsonb, \
+         d date, n numeric); \
+         CREATE INDEX t_v_pattern ON s.t (v text_pattern_ops); \
+         CREATE INDEX t_desc ON s.t (d DESC, id); \
+         CREATE INDEX t_desc_last ON s.t (d DESC NULLS LAST); \
+         CREATE INDEX t_first ON s.t (n NULLS FIRST, v DESC NULLS FIRST); \
+         CREATE INDEX t_w ON s.t (w); \
+         CREATE INDEX t_hash ON s.t USING hash (v); \
+         CREATE INDEX t_gist ON s.t USING gist (p); \
+         CREATE INDEX t_gin ON s.t USING gin (j jsonb_path_ops); \
+         CREATE INDEX t_gin_default ON s.t USING gin (j); \
+         CREATE INDEX t_brin ON s.t USING brin (d); \
+         CREATE INDEX t_include ON s.t (v) INCLUDE (n);";
+    let mut s = Snail::open(&written("index-classes", ddl)).unwrap();
+    let q = "SELECT c.relname, i.indclass::text, i.indoption::text, \
+         (SELECT o.opcname FROM pg_opclass o WHERE o.oid = i.indclass[0]), \
+         (SELECT o.opcname FROM pg_opclass o WHERE o.oid = i.indclass[1]) \
+         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+         JOIN pg_namespace ns ON ns.oid = c.relnamespace WHERE ns.nspname = 's' ORDER BY 1";
+    let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+    assert_eq!(
+        joined(&s, &b),
+        [
+            "t_brin|10136|0|date_minmax_ops|NULL",
+            "t_desc|3122 1978|3 0|date_ops|int4_ops",
+            "t_desc_last|3122|1|date_ops|NULL",
+            "t_first|3125 3126|2 3|numeric_ops|text_ops",
+            "t_gin|10091|0|jsonb_path_ops|NULL",
+            "t_gin_default|10090|0|jsonb_ops|NULL",
+            "t_gist|10061|0|point_ops|NULL",
+            "t_hash|10037|0|text_ops|NULL",
+            "t_include|3126|0|text_ops|NULL",
+            "t_pkey|1978|0|int4_ops|NULL",
+            "t_v_pattern|4217|0|text_pattern_ops|NULL",
+            "t_w|3126|0|text_ops|NULL",
+        ]
+    );
+}
+
+#[test]
+fn pg_attribute_holds_each_columns_type_as_postgresql_keeps_it() {
+    let ddl = "CREATE SCHEMA s; CREATE TYPE s.pair AS (x integer, y integer); \
+         CREATE DOMAIN s.price AS numeric(10,2); CREATE DOMAIN s.code AS char(2); \
+         CREATE DOMAIN s.scores AS integer[]; CREATE DOMAIN s.known AS s.pair; \
+         CREATE TABLE s.t (id integer PRIMARY KEY, a int[][], b varchar(2)[], c int ARRAY[3], \
+         d _int4, e numeric(6,1)[], p s.price, q s.code, r s.scores, k s.known, \
+         n integer GENERATED ALWAYS AS (id * 2) STORED, pt point, v text, j jsonb, tags text[], \
+         body tsvector); \
+         CREATE INDEX t_pt ON s.t USING gist (pt); CREATE INDEX t_v ON s.t USING hash (v); \
+         CREATE INDEX t_j ON s.t USING gin (j jsonb_path_ops); \
+         CREATE INDEX t_tags ON s.t USING gin (tags); CREATE INDEX t_body ON s.t USING gist (body); \
+         CREATE INDEX t_a ON s.t (a);";
+    let mut s = Snail::open(&written("attributes", ddl)).unwrap();
+    let q = "SELECT c.relname || '.' || a.attnum AS k, a.attname, a.atttypid::regtype::text, \
+         a.atttypmod, a.attndims, a.attlen, a.attbyval, a.attalign::text, a.attstorage::text, \
+         a.atthasdef FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 's' AND c.relkind IN ('r', 'i') AND a.attnum > 0 \
+         ORDER BY c.relname, a.attnum";
+    let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+    // A declared array's dimensions and its element's typmod, none of a domain's; a generation
+    // held as a DEFAULT; each index key the type its class or method stores.
+    assert_eq!(
+        joined(&s, &b),
+        [
+            "t.1|id|integer|-1|0|4|t|i|p|f",
+            "t.2|a|integer[]|-1|2|-1|f|i|x|f",
+            "t.3|b|character varying[]|6|1|-1|f|i|x|f",
+            "t.4|c|integer[]|-1|1|-1|f|i|x|f",
+            "t.5|d|integer[]|-1|0|-1|f|i|x|f",
+            "t.6|e|numeric[]|393221|1|-1|f|i|x|f",
+            "t.7|p|s.price|-1|0|-1|f|i|m|f",
+            "t.8|q|s.code|-1|0|-1|f|i|x|f",
+            "t.9|r|s.scores|-1|0|-1|f|i|x|f",
+            "t.10|k|s.known|-1|0|-1|f|d|x|f",
+            "t.11|n|integer|-1|0|4|t|i|p|t",
+            "t.12|pt|point|-1|0|16|f|d|p|f",
+            "t.13|v|text|-1|0|-1|f|i|x|f",
+            "t.14|j|jsonb|-1|0|-1|f|i|x|f",
+            "t.15|tags|text[]|-1|1|-1|f|i|x|f",
+            "t.16|body|tsvector|-1|0|-1|f|i|x|f",
+            "t_a.1|a|integer[]|-1|2|-1|f|i|x|f",
+            "t_body.1|body|gtsvector|-1|0|-1|f|i|p|f",
+            "t_j.1|j|integer|-1|0|4|t|i|p|f",
+            "t_pkey.1|id|integer|-1|0|4|t|i|p|f",
+            "t_pt.1|pt|box|-1|0|32|f|d|p|f",
+            "t_tags.1|tags|text|-1|1|-1|f|i|x|f",
+            "t_v.1|v|integer|-1|0|4|t|i|p|f",
+        ]
+    );
 }

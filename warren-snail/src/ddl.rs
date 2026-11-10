@@ -4220,6 +4220,7 @@ impl Draft {
                 collation: None,
                 domain,
                 library: None,
+                dims: crate::pgcatalog::array_dims(&c.data_type),
             };
             let mut nullness: Option<bool> = None;
             for o in &c.options {

@@ -783,6 +783,10 @@ impl Typing<'_> {
                 if let Some(w) = &f.filter {
                     self.condition(w, "FILTER")?;
                 }
+                // count(*) counts rows, a bigint, as an aggregate and as a window.
+                if name == "count" && f.args_star() {
+                    return Ok(Some(ColumnType::Int8));
+                }
                 let Some(args) = call_args(f) else {
                     return Ok(None);
                 };

@@ -85,19 +85,36 @@ pub(crate) fn view_named(name: &str) -> Option<String> {
 thread_local! {
     /// The columns of each view lifted to a step that a statement may not ask, by the step's name.
     static REFUSED: RefCell<HashMap<String, Vec<Option<String>>>> = RefCell::new(HashMap::new());
+    /// How many questions are under way on this thread, a subquery's inside its statement's.
+    static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// What a statement's views refuse, held while it runs.
-pub(crate) struct Holding;
+/// What a statement's views refuse, held while it runs, a subquery's beside its statement's.
+pub(crate) struct Holding {
+    outermost: bool,
+}
 
 pub(crate) fn holding() -> Holding {
-    REFUSED.with(|r| r.borrow_mut().clear());
-    Holding
+    let outermost = HELD.with(|h| h.replace(h.get() + 1)) == 0;
+    if outermost {
+        REFUSED.with(|r| r.borrow_mut().clear());
+    }
+    Holding { outermost }
+}
+
+impl Holding {
+    /// Whether it holds the statement's own question, no subquery's.
+    pub(crate) fn outermost(&self) -> bool {
+        self.outermost
+    }
 }
 
 impl Drop for Holding {
     fn drop(&mut self) {
-        REFUSED.with(|r| r.borrow_mut().clear());
+        HELD.with(|h| h.set(h.get().saturating_sub(1)));
+        if self.outermost {
+            REFUSED.with(|r| r.borrow_mut().clear());
+        }
     }
 }
 
@@ -346,6 +363,76 @@ fn servers_read(e: &Expr) -> Option<String> {
     found
 }
 
+/// The columns refused of the views of PostgreSQL's that a SELECT's FROM reads, each by the name
+/// the FROM gives the view and the column's own, with its refusal.
+fn refused_beneath(
+    catalog: &crate::catalog::Catalog,
+    s: &sqlparser::ast::Select,
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let factors = s
+        .from
+        .iter()
+        .flat_map(|t| std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)));
+    for f in factors {
+        let sqlparser::ast::TableFactor::Table { name, alias, .. } = f else {
+            continue;
+        };
+        let n = crate::catalog::object_name(name);
+        // A view refused whole is refused where it is lifted.
+        let Ok(Some((q, refused))) = system_view(catalog, &n) else {
+            continue;
+        };
+        let SetExpr::Select(inner) = q.body.as_ref() else {
+            continue;
+        };
+        let called = match alias {
+            Some(a) => a.name.value.clone(),
+            None => n.rsplit('.').next().unwrap_or(&n).to_string(),
+        };
+        for (item, why) in inner.projection.iter().zip(&refused) {
+            let (Some(why), Some(column)) = (why, output_name(item)) else {
+                continue;
+            };
+            out.push((called.clone(), column, why.clone()));
+        }
+    }
+    out
+}
+
+/// The name a select item gives its column, where it gives one.
+fn output_name(item: &SelectItem) -> Option<String> {
+    match item {
+        SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+        SelectItem::UnnamedExpr(Expr::Identifier(i)) => Some(i.value.clone()),
+        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(p)) => p.last().map(|i| i.value.clone()),
+        _ => None,
+    }
+}
+
+/// A refused column of a view beneath that an expression reads, where it reads one: the select
+/// item passing it through is refused with it.
+fn read_beneath(e: &Expr, beneath: &[(String, String, String)]) -> Option<String> {
+    let mut found = None;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        let read = match x {
+            Expr::Identifier(c) => Some((None, &c.value)),
+            Expr::CompoundIdentifier(p) if p.len() == 2 => Some((Some(&p[0].value), &p[1].value)),
+            _ => None,
+        };
+        if let Some((q, c)) = read {
+            let hit = beneath
+                .iter()
+                .find(|(v, col, _)| col == c && q.is_none_or(|q| q == v));
+            if let (None, Some((_, _, why))) = (&found, hit) {
+                found = Some(why.clone());
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
 /// A view as a step reads it, under a release: its definition rewritten, and each of its columns'
 /// refusal. None for a name that is none of PostgreSQL's views.
 pub(crate) fn system_view(
@@ -410,12 +497,13 @@ fn rewrite(q: &mut Query, catalog: &crate::catalog::Catalog) -> Result<Vec<Optio
     let mut arms = Vec::new();
     selects(&mut q.body, &mut arms);
     for s in arms {
+        let through = refused_beneath(catalog, s);
         for (i, item) in s.projection.iter_mut().enumerate() {
             let e = match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                 _ => continue,
             };
-            if let Some(why) = servers_read(e) {
+            if let Some(why) = servers_read(e).or_else(|| read_beneath(e, &through)) {
                 if refused.len() <= i {
                     refused.resize(i + 1, None);
                 }
@@ -793,10 +881,12 @@ fn answer(e: &mut Expr, catalog: &crate::catalog::Catalog) -> Result<()> {
                         .filter(|(_, can, _)| *can > 0)
                         .map(|(oid, can, _)| format!(" WHEN {oid} THEN {can}"))
                         .collect();
-                    format!(
-                        "CASE WHEN snail_rel.relkind IN ('r', 'p') THEN 28 ELSE CASE \
-                         CAST(snail_rel.oid AS bigint){events} ELSE 0 END END"
-                    )
+                    // A CASE takes at least one WHEN: where no view is written through, none.
+                    let viewed = match events.is_empty() {
+                        true => "0".to_string(),
+                        false => format!("CASE CAST(snail_rel.oid AS bigint){events} ELSE 0 END"),
+                    };
+                    format!("CASE WHEN snail_rel.relkind IN ('r', 'p') THEN 28 ELSE {viewed} END")
                 }
                 (_, Some(attnum)) => {
                     let set: String = views

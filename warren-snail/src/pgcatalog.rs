@@ -552,13 +552,16 @@ impl<'a> File<'a> {
         };
         if let Some(d) = domain {
             let oid = self.oid(Object::Type(full(d)));
-            let base = self
-                .catalog
-                .domains
-                .iter()
-                .find(|x| x.name == d)
-                .and_then(|x| x.base_type);
-            let mut f = base.map_or_else(|| varlena(oid, "i"), |b| self.facts(b, None));
+            let held = self.catalog.domains.iter().find(|x| x.name == d);
+            let base = held.and_then(|x| x.base_type);
+            // A row type, a composite's or a table's, is aligned on a double.
+            let row = held.is_some_and(|x| {
+                self.catalog.types.iter().any(|t| {
+                    t.name == x.base && matches!(t.kind, crate::catalog::TypeKind::Composite { .. })
+                }) || self.catalog.tables.iter().any(|t| t.name == x.base)
+            });
+            let align = if row { "d" } else { "i" };
+            let mut f = base.map_or_else(|| varlena(oid, align), |b| self.facts(b, None));
             f.oid = oid;
             return f;
         }
@@ -1220,10 +1223,21 @@ impl<'a> File<'a> {
 
     /// A relation's rows of pg_attribute, its columns numbered from 1.
     fn attribute(&self, rel: u32, num: i16, name: &str, ty: ColumnType, domain: Option<&str>) -> Row {
+        use crate::composed::Composed;
         let f = self.facts(ty, domain);
-        let dims = match ty {
-            ColumnType::Composed(r) if matches!(r.def(), crate::composed::Composed::Array { .. }) => 1,
-            _ => 0,
+        let array = match ty {
+            ColumnType::Composed(r) => match r.def() {
+                Composed::Array { element, domain } => Some((*element, domain.is_some())),
+                _ => None,
+            },
+            _ => None,
+        };
+        // A domain's typmod is its own; an array's is its element's, an array of a domain none.
+        let (typmod, dims) = match (domain, array) {
+            (Some(_), _) => (-1, 0),
+            (None, Some((_, true))) => (-1, 1),
+            (None, Some((element, false))) => (typmod_of(element), 1),
+            (None, None) => (typmod_of(ty), 0),
         };
         row(&[
             ("attrelid", rel.to_string()),
@@ -1231,7 +1245,7 @@ impl<'a> File<'a> {
             ("atttypid", f.oid.to_string()),
             ("attlen", f.len.clone()),
             ("attnum", num.to_string()),
-            ("atttypmod", typmod_of(ty).to_string()),
+            ("atttypmod", typmod.to_string()),
             ("attndims", dims.to_string()),
             ("attbyval", f.byval.clone()),
             ("attalign", f.align.clone()),
@@ -1290,16 +1304,64 @@ impl<'a> File<'a> {
         ])
     }
 
+    /// The type an index key holds where it is another than its column's, as ConstructTupleDescriptor
+    /// finds it: its operator class's `opckeytype`, an array class's `anyelement` read as the
+    /// column's element type, else the method's own (a hash index's int4).
+    fn stored_type(&self, method: Method, class: Option<u32>, ty: ColumnType) -> Option<u32> {
+        const INT4: u32 = 23;
+        const ANYARRAY: u32 = 2277;
+        const ANYELEMENT: u32 = 2283;
+        let row = class.and_then(|c| built_in_by("pg_opclass", "oid", c, self.release));
+        let field = |k: &str| -> u32 {
+            row.as_ref()
+                .and_then(|r| r.get(k).cloned().flatten())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+        match field("opckeytype") {
+            ANYELEMENT if field("opcintype") == ANYARRAY => match ty {
+                ColumnType::Composed(r) => match r.def() {
+                    crate::composed::Composed::Array { element, domain } => {
+                        Some(self.facts(*element, domain.as_deref()).oid)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            0 if method == Method::Hash => Some(INT4),
+            0 => None,
+            key => Some(key),
+        }
+    }
+
+    /// A row of pg_attribute given another type, a built-in one: its length, passing, alignment
+    /// and storage that type's, its typmod none.
+    fn retyped(&self, r: &mut Row, ty: u32) {
+        let Some(t) = self.types.get(&ty) else {
+            return;
+        };
+        let f = |k: &str| t.get(k).cloned().flatten();
+        r.insert("atttypid", Some(ty.to_string()));
+        r.insert("atttypmod", Some("-1".into()));
+        r.insert("attlen", f("typlen"));
+        r.insert("attbyval", f("typbyval"));
+        r.insert("attalign", f("typalign"));
+        r.insert("attstorage", f("typstorage"));
+    }
+
     fn attributes(&self) -> Vec<Row> {
         let mut out = Vec::new();
+        let mut cat = None;
         for tb in self.tables() {
             let n = full(&tb.name);
             let rel = self.oid(Object::Class(n.clone()));
             for (i, c) in tb.columns.iter().enumerate() {
                 let mut r = self.attribute(rel, i as i16 + 1, &c.name, c.ty, c.domain.as_deref());
+                r.insert("attndims", Some(c.dims.to_string()));
                 r.insert("attcollation", Some(self.column_collation(c).to_string()));
                 r.insert("attnotnull", Some(t(c.not_null)));
-                r.insert("atthasdef", Some(t(c.default.is_some())));
+                // A generation is held in pg_attrdef as a DEFAULT is.
+                r.insert("atthasdef", Some(t(c.default.is_some() || c.generated.is_some())));
                 r.insert(
                     "attidentity",
                     Some(match &c.identity {
@@ -1327,18 +1389,34 @@ impl<'a> File<'a> {
             let schema = parts(&n).0;
             for i in self.indexes_of(tb) {
                 let rel = self.oid(Object::Class(format!("{schema}.{}", i.name)));
+                let cat = cat.get_or_insert_with(|| crate::deparse::cat::Cat::of(self.catalog));
+                let classes = crate::deparse::defs::index_classes(cat, rel)
+                    .ok()
+                    .flatten()
+                    .map(|(c, _)| c)
+                    .unwrap_or_default();
                 for (k, &col) in i.keys.iter().chain(&i.include).enumerate() {
-                    let (name, ty, domain) = match col {
+                    let (name, ty, domain, dims) = match col {
                         c if c > 0 => {
                             let c = &tb.columns[c as usize - 1];
-                            (c.name.clone(), c.ty, c.domain.as_deref())
+                            (c.name.clone(), c.ty, c.domain.as_deref(), Some(c.dims))
                         }
-                        _ => ("expr".to_string(), ColumnType::Text(None), None),
+                        _ => ("expr".to_string(), ColumnType::Text(None), None, None),
                     };
                     let mut r = self.attribute(rel, k as i16 + 1, &name, ty, domain);
+                    if let Some(d) = dims {
+                        r.insert("attndims", Some(d.to_string()));
+                    }
                     // A key's collation is the index's; an INCLUDE column has none.
                     let coll = i.collations.get(k).copied().unwrap_or(0);
                     r.insert("attcollation", Some(coll.to_string()));
+                    // A key holds the type its operator class stores, else its method's.
+                    if k < i.keys.len() {
+                        let stored = self.stored_type(i.method, classes.get(k).copied(), ty);
+                        if let Some(stored) = stored.filter(|&s| Some(s.to_string()) != r["atttypid"]) {
+                            self.retyped(&mut r, stored);
+                        }
+                    }
                     out.push(r);
                 }
             }
@@ -1971,6 +2049,7 @@ impl<'a> File<'a> {
 
     fn indexes(&self) -> Vec<Row> {
         let mut out = Vec::new();
+        let cat = crate::deparse::cat::Cat::of(self.catalog);
         for tb in self.tables() {
             let n = full(&tb.name);
             let rel = self.oid(Object::Class(n.clone()));
@@ -1978,13 +2057,14 @@ impl<'a> File<'a> {
             for i in self.indexes_of(tb) {
                 let vector = |k: &[i16]| k.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
                 let all: Vec<i16> = i.keys.iter().chain(&i.include).copied().collect();
-                let zeros = |n: usize| vec!["0"; n].join(" ");
+                let ioid = self.oid(Object::Class(format!("{schema}.{}", i.name)));
+                let (classes, options) = crate::deparse::defs::index_classes(&cat, ioid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| (vec![0; i.keys.len()], vec![0; i.keys.len()]));
+                let words = |v: Vec<String>| v.join(" ");
                 out.push(row(&[
-                    (
-                        "indexrelid",
-                        self.oid(Object::Class(format!("{schema}.{}", i.name)))
-                            .to_string(),
-                    ),
+                    ("indexrelid", ioid.to_string()),
                     ("indrelid", rel.to_string()),
                     ("indnatts", all.len().to_string()),
                     ("indnkeyatts", i.keys.len().to_string()),
@@ -2004,10 +2084,9 @@ impl<'a> File<'a> {
                         "indcollation",
                         i.collations.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" "),
                     ),
-                    ("indclass", zeros(i.keys.len())),
-                    ("indoption", zeros(i.keys.len())),
+                    ("indclass", words(classes.iter().map(u32::to_string).collect())),
+                    ("indoption", words(options.iter().map(i16::to_string).collect())),
                 ]));
-                let ioid = self.oid(Object::Class(format!("{schema}.{}", i.name)));
                 let (exprs, pred) = crate::deparse::defs::index_has_trees(self.catalog, ioid);
                 if let Some(r) = out.last_mut() {
                     if exprs {
@@ -2319,13 +2398,16 @@ thread_local! {
     static READING_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The dimensions a type's name writes: `int[]` one, `int[][]` two.
-fn array_dims(dt: &sqlparser::ast::DataType) -> i16 {
+/// The dimensions a type's name writes: `int[]` and `int ARRAY[3]` one, `int[][]` two.
+pub(crate) fn array_dims(dt: &sqlparser::ast::DataType) -> i16 {
     use sqlparser::ast::{ArrayElemTypeDef as E, DataType as D};
     match dt {
-        D::Array(E::SquareBracket(inner, _) | E::AngleBracket(inner) | E::Parenthesis(inner)) => {
-            1 + array_dims(inner)
-        }
+        D::Array(
+            E::SquareBracket(inner, _)
+            | E::AngleBracket(inner)
+            | E::Parenthesis(inner)
+            | E::Qualified(inner, _),
+        ) => 1 + array_dims(inner),
         _ => 0,
     }
 }

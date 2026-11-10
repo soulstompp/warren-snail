@@ -1010,6 +1010,9 @@ pub struct Column {
     /// The collation its COLLATE names, where that one calls a library, ICU or glibc, to order
     /// text.
     pub library: Option<crate::collations::Spec>,
+    /// The array dimensions its DDL writes, `[]` by `[]`, as PostgreSQL keeps them: none for an
+    /// array named by its array type's own name, `_int4`, or by a domain.
+    pub dims: i16,
 }
 
 /// The place a question reads a table's `ctid` at among its columns: past any of its own. A ctid is
@@ -1052,6 +1055,7 @@ fn system_columns() -> &'static [Column; 2] {
             collation: None,
             domain: None,
             library: None,
+            dims: 0,
         };
         [column("ctid", ColumnType::Tid), column("tableoid", ColumnType::Oid)]
     })

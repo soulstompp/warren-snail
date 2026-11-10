@@ -678,9 +678,17 @@ fn lift_join(
     Ok(())
 }
 
-/// A name of its own for a relation lifted out of a FROM.
-fn fresh(out: &[Step], what: &str) -> String {
-    format!("{MERGED}{what}{}", out.len())
+thread_local! {
+    /// How many relations the statement under way has lifted out of a FROM, at every level.
+    static LIFTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A name of its own for a relation lifted out of a FROM, given once in the statement: a view
+/// named before the views it reads are lifted, and a subquery's steps lifted apart from the
+/// question's, take none another has, so that what is kept by a step's name is its own.
+fn fresh(what: &str) -> String {
+    let n = LIFTED.with(|c| c.replace(c.get() + 1));
+    format!("{MERGED}{what}{n}")
 }
 
 fn named(n: &str) -> ObjectName {
@@ -761,7 +769,7 @@ fn lift_factor(
             }
             // One of PostgreSQL's views, pg_catalog searched first.
             if let Some((q, refused)) = super::sysviews::system_view(catalog, &n)? {
-                let step = fresh(out, "view");
+                let step = fresh("view");
                 lift(catalog, out, &[], step.clone(), q, Vec::new())?;
                 super::sysviews::note_refused(&step, refused);
                 let bare = n.rsplit('.').next().unwrap_or(&n).to_string();
@@ -775,7 +783,7 @@ fn lift_factor(
                 let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
                     return Err(Error::new(format!("the view {} is no question", v.name)));
                 };
-                let step = fresh(out, "view");
+                let step = fresh("view");
                 lift(
                     catalog,
                     out,
@@ -831,7 +839,7 @@ fn lift_factor(
             alias,
             sample: None,
         } => {
-            let step = fresh(out, "derived");
+            let step = fresh("derived");
             let renames = renames_of(alias)?;
             lift(
                 catalog,
@@ -2903,7 +2911,7 @@ fn lift_set(
         });
         return Ok(());
     }
-    let set = fresh(out, "set");
+    let set = fresh("set");
     out.push(Step {
         name: set.clone(),
         query: query.clone(),
@@ -2983,7 +2991,7 @@ fn arm_of(
                 b => query_of(b.clone()),
             };
             let untyped = untyped_of(&query);
-            let name = fresh(out, "arm");
+            let name = fresh("arm");
             lift(catalog, out, visible, name.clone(), query, Vec::new())?;
             Ok(Arm::Leaf { name, untyped })
         }
@@ -3363,7 +3371,10 @@ fn answered(
     if let Some(r) = super::join::stopped_reads() {
         accrued.add(&r);
     }
-    let _views = super::sysviews::holding();
+    let views = super::sysviews::holding();
+    if views.outermost() {
+        LIFTED.with(|c| c.set(0));
+    }
     let before = catalog_steps(catalog, q)?;
     let (last, held) = made_by(asked, q, &before, &casings, None, &accrued)?;
     Ok((last, held, accrued))

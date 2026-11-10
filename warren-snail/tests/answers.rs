@@ -1,5 +1,6 @@
 //! Answers that were neither PostgreSQL's nor a refusal by name, each now one or the other: a sum
-//! typed as PostgreSQL types it, on the question path, over a join and in a pipeline; a locking
+//! typed as PostgreSQL types it, on the question path, over a join and in a pipeline; a count of
+//! rows a bigint, as an aggregate and as a window, through a subquery and a union; a locking
 //! clause refused by name on every read path; each refusal naming the clause or the call it
 //! refuses; a step's expressions read on one table; a parameter typed by its context; and the
 //! isolation level the snail runs taken in each of its spellings. Every answer is PostgreSQL 19's
@@ -170,6 +171,53 @@ fn a_sum_is_a_bigint_of_smaller_integers_and_a_numeric_of_bigints() {
         numerics(&b, 1),
         [Some(i128::from(MAX)), Some(twice), Some(twice + 5)]
     );
+}
+
+#[test]
+fn a_count_of_rows_is_a_bigint_as_an_aggregate_and_as_a_window() {
+    use arrow::array::AsArray;
+    let path = snail("counts");
+    let texts = |b: &RecordBatch, c: usize| -> Vec<Option<String>> {
+        b.column(c).as_string::<i32>().iter().map(|s| s.map(str::to_string)).collect()
+    };
+    let bigint = || Some("bigint".to_string());
+    // 18.6: count(*) a bigint like count(v), where its type came out integer.
+    let b = ask(
+        &path,
+        "SELECT pg_typeof(count(*))::text, pg_typeof(count(t.v))::text, count(*), count(t.v) \
+         FROM a.t t",
+    );
+    assert_eq!((texts(&b, 0), texts(&b, 1)), (vec![bigint()], vec![bigint()]));
+    assert_eq!((bigints(&b, 2), bigints(&b, 3)), (vec![Some(5)], vec![Some(4)]));
+    // Its arithmetic a bigint's, where it was refused as integer out of range.
+    let b = ask(
+        &path,
+        "SELECT pg_typeof(x.n)::text, x.n + 2147483647 FROM (SELECT count(*) + 1 AS n FROM a.t t) x",
+    );
+    assert_eq!(texts(&b, 0), [bigint()]);
+    assert_eq!(bigints(&b, 1), [Some(2147483653)]);
+    // Two arms' counts a bigint, where the union typed them text.
+    let b = ask(
+        &path,
+        "SELECT x.k, pg_typeof(x.n)::text, x.n FROM (SELECT 'a' AS k, count(*) AS n FROM a.t t \
+         UNION ALL SELECT 'b', count(*) FROM a.u u) x ORDER BY 1",
+    );
+    assert_eq!(texts(&b, 1), [bigint(), bigint()]);
+    assert_eq!(bigints(&b, 2), [Some(5), Some(5)]);
+    // Grouped, and as a window.
+    let b = ask(
+        &path,
+        "SELECT t.g, pg_typeof(count(*))::text, count(*) FROM a.t t GROUP BY t.g ORDER BY t.g",
+    );
+    assert_eq!(texts(&b, 1), [bigint(), bigint(), bigint()]);
+    assert_eq!(bigints(&b, 2), [Some(2), Some(2), Some(1)]);
+    let b = ask(
+        &path,
+        "SELECT t.id, pg_typeof(count(*) OVER ())::text, count(*) OVER () FROM a.t t \
+         ORDER BY t.id LIMIT 2",
+    );
+    assert_eq!(texts(&b, 1), [bigint(), bigint()]);
+    assert_eq!(bigints(&b, 2), [Some(5), Some(5)]);
 }
 
 /// The words a question is refused in.

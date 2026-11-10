@@ -741,3 +741,44 @@ pub(crate) fn index_has_trees(catalog: &crate::catalog::Catalog, oid: u32) -> (b
         None => (false, false),
     }
 }
+
+const INDOPTION_DESC: i16 = 1;
+const INDOPTION_NULLS_FIRST: i16 = 2;
+
+/// Each key of a file's index as pg_index's `indclass` and `indoption` hold it: the OID of the
+/// operator class it names, else of its type's default under the method; DESC and NULLS FIRST as
+/// their bits where the method orders, as a B-tree alone does. None for an OID no index of the
+/// file's has.
+pub(crate) fn index_classes(cat: &Cat, oid: u32) -> Result<Option<(Vec<u32>, Vec<i16>)>> {
+    let Some(ix) = index_of(cat.catalog, oid) else {
+        return Ok(None);
+    };
+    let t = ix.table;
+    let a = analyzer(cat, t);
+    let am = method_oid(ix.method);
+    let mut classes = Vec::new();
+    let mut options = Vec::new();
+    for k in &ix.keys {
+        let named = k.opclass.strip_prefix("pg_catalog.").unwrap_or(&k.opclass);
+        let class = match named.is_empty() {
+            false => Some(named.to_string()),
+            true => {
+                let keytype = match (k.column, &k.expr) {
+                    (Some(c), _) => super::column_type(cat, &t.columns[c]).0,
+                    (None, Some(e)) => a.expr(&super::parse_expr(e)?)?.ty(),
+                    _ => 0,
+                };
+                default_opclass(cat, keytype, am)
+            }
+        };
+        classes.push(class.map_or(0, |n| opclass_oid(cat.release, &n, am)));
+        options.push(match ix.method {
+            Method::Btree => {
+                (if k.desc { INDOPTION_DESC } else { 0 })
+                    | (if k.nulls_first { INDOPTION_NULLS_FIRST } else { 0 })
+            }
+            _ => 0,
+        });
+    }
+    Ok(Some((classes, options)))
+}
