@@ -1167,16 +1167,16 @@ pub(crate) fn viewdef(cat: &Cat, oid: u32, pretty: bool, wrap: i32) -> Result<Op
         p.buf.push(';');
         return Ok(Some(p.buf));
     }
-    // A built-in view: the text PostgreSQL wrote, carried.
+    // A built-in view: the text PostgreSQL wrote, carried, pretty at wrap column 0; at another,
+    // its lists rejoined as that column has them.
     let Some(name) = built_in_view(cat, oid) else {
         return Ok(None);
     };
-    if wrap != 0 {
-        return Err(crate::Error::new(format!(
-            "pg_get_viewdef of {name} at a wrap column other than 0: a built-in view's text is carried as PostgreSQL wrote it, not its query"
-        )));
-    }
-    Ok(crate::read::sysviews::carried_viewdef(&name, cat.release, pretty))
+    let text = crate::read::sysviews::carried_viewdef(&name, cat.release, pretty);
+    Ok(match wrap {
+        0 => text,
+        _ => text.map(|t| super::rewrap::rewrapped(&t, wrap)),
+    })
 }
 
 /// A built-in view's `schema.name` by its OID.

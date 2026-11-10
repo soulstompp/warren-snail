@@ -1,6 +1,6 @@
 //! Rows written into a snail by SQL statements: each answer afterwards as a snail written afresh
-//! from the same rows gives it, writers beside writers and readers, and a commit that never
-//! finished.
+//! from the same rows gives it, writers beside writers and readers, a commit that never
+//! finished, and the pages of a statement refused under exec --go-on after its draws wrote.
 
 mod weather;
 
@@ -829,4 +829,31 @@ fn a_snail_of_format_eight_is_read_and_written_as_0_1_1_lays_it_and_stays_of_for
     assert!(block_entries(&eight)
         .iter()
         .any(|e| e.child.bytes >> 32 > 0));
+}
+
+#[test]
+#[cfg(feature = "standalone")]
+fn exec_going_on_counts_the_pages_a_refused_statement_s_draws_wrote() {
+    // A SELECT whose draws run past the sequence's end is refused after three, which stay drawn,
+    // their pages written: its row counts them, so the system's bytes agree and exec goes on.
+    let path = tmp("exec-go-on.snail");
+    let ddl = "CREATE TABLE t (id integer PRIMARY KEY); CREATE SEQUENCE q MAXVALUE 3;";
+    let catalog = warren_snail::catalog::Catalog::parse(ddl).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], span(), 18).unwrap();
+    Snail::open_writing(&path)
+        .unwrap()
+        .execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
+    let statements = tmp("exec-go-on.sql");
+    std::fs::write(&statements, "SELECT nextval('q') FROM t;\nSELECT 1;\n").unwrap();
+    let done = tmp("exec-go-on.parquet");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_warren-snail"))
+        .args(["exec", path.to_str().unwrap(), statements.to_str().unwrap(), "--out"])
+        .arg(&done)
+        .arg("--go-on")
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said} {}", String::from_utf8_lossy(&out.stderr));
+    assert!(said.contains("2 statements, 3 pages written"), "{said}");
 }

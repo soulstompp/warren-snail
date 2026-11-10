@@ -209,7 +209,14 @@ fn catalog_steps(catalog: &Catalog, q: &Query) -> Result<Steps> {
         }
         Ok(())
     };
-    add(&words, false)?;
+    // A table the statement reads in a FROM: one it names only as a type, a row type of a cast or
+    // a column, is not read.
+    let mut read: Vec<String> = Vec::new();
+    let _ = sqlparser::ast::visit_relations(q, |name| {
+        read.push(crate::catalog::object_name(name));
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    add(&read, false)?;
     for d in super::sysviews::texts_read(&words, catalog.release) {
         add(&super::sysviews::words_of(&d), true)?;
     }

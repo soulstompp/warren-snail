@@ -14,6 +14,7 @@ pub(crate) mod funcs;
 pub(crate) mod params;
 pub(crate) mod print;
 pub(crate) mod query;
+pub(crate) mod rewrap;
 pub(crate) mod viewdef;
 
 use crate::catalog::{Catalog, Table};

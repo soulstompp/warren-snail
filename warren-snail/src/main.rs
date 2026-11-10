@@ -569,6 +569,10 @@ fn cmd_exec(args: &[String]) -> Result<()> {
             let mut done = Vec::with_capacity(statements.len());
             for (i, st) in statements.iter().enumerate() {
                 let before = wchar();
+                let pages_before = match &opened {
+                    Opened::One(s) => s.pages_written(),
+                    Opened::Several(s) => s.pages_written(),
+                };
                 let ran = match (&mut opened, &copied[i]) {
                     (Opened::One(s), Some(rows)) => s.execute_copy(st, rows),
                     (Opened::One(s), None) => s.execute_with(st, &params),
@@ -580,9 +584,16 @@ fn cmd_exec(args: &[String]) -> Result<()> {
                         errors.push(String::new());
                         d
                     }
+                    // A refused statement's pages: those its draws wrote before the refusal, kept.
                     Err(e) if go_on => {
                         errors.push(e.to_string());
-                        warren_snail::read::Done::default()
+                        let after = match &opened {
+                            Opened::One(s) => s.pages_written(),
+                            Opened::Several(s) => s.pages_written(),
+                        };
+                        let mut refused = warren_snail::read::Done::default();
+                        refused.pages_written = after - pages_before;
+                        refused
                     }
                     Err(e) => return Err(Error::new(format!("statement {}: {e}", i + 1))),
                 };

@@ -1463,6 +1463,12 @@ impl Snail {
         self.ask_with(sql, order, &[])
     }
 
+    /// The pages it has written since it was opened to write, its roots among them: those a
+    /// statement wrote before it was refused, the draws it made committed, by the difference.
+    pub fn pages_written(&self) -> u64 {
+        self.written()
+    }
+
     /// An answer's rows as `answer_text` writes them, under the session's TimeZone as it stands:
     /// what PostgreSQL hands a client reading rows as text, a timestamptz on the session zone's
     /// clock, and an OID of the file's own objects in a reg* type by its name.

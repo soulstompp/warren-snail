@@ -927,6 +927,12 @@ impl Snails {
         Ok(read)
     }
 
+    /// The pages every snail has written since they were opened to write, as `Snail::pages_written`
+    /// counts each.
+    pub fn pages_written(&self) -> u64 {
+        self.snails.iter().map(|s| s.written()).sum()
+    }
+
     /// Runs one statement that writes, or begins or ends a transaction across the snails. A
     /// statement writes the snail that holds its table; outside a transaction it commits there. A
     /// transaction's COMMIT commits every snail it wrote, one root deciding.

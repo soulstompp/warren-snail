@@ -1,6 +1,7 @@
 //! The deparsers over a snail's catalog, each printing as PostgreSQL 18.6 prints the same object:
 //! pg_get_expr over a DEFAULT, a generation, a CHECK and an index's trees, pg_get_constraintdef and
-//! pg_get_indexdef, plain and pretty; pg_get_viewdef by OID and by name, plain, pretty and unwrapped;
+//! pg_get_indexdef, plain and pretty; pg_get_viewdef by OID and by name, plain, pretty and unwrapped,
+//! a built-in one at any wrap column;
 //! pg_get_ruledef of a view's rule and of a built-in one; the pg_get_function_* functions of the file's
 //! functions, a range's constructors and built-ins; a parse tree's column read only through
 //! pg_get_expr. Every expected string was printed by 18.6 after the same DDL.
@@ -371,5 +372,74 @@ fn a_function_and_a_ranges_constructors_print_as_pg_get_functiondef_prints_them(
             "CREATE OR REPLACE FUNCTION pg_catalog.int4abs(integer)\n RETURNS integer\n LANGUAGE internal\n IMMUTABLE PARALLEL SAFE STRICT\nAS $function$int4abs$function$\n",
             "RETURN ($2 + $1)",
         ])]
+    );
+}
+
+#[test]
+fn a_built_in_view_prints_at_any_wrap_column_as_postgresql_wraps_it() {
+    let mut snail = opened_views("dep-views-wrapped");
+    let got = rows(
+        &mut snail,
+        "SELECT pg_get_viewdef('pg_user_mappings'::regclass, 60), \
+         pg_get_viewdef('information_schema.collations'::regclass, 70), \
+         pg_get_viewdef('information_schema.collations'::regclass, -1), \
+         (pg_get_viewdef('pg_tables'::regclass, 80) = pg_get_viewdef('pg_tables'::regclass, 0))::text",
+    );
+    let lines = |l: &[&str]| Some(l.join("\n"));
+    // 18.6: a list's items on its line where they fit, a CASE on its own; none wrapped at -1.
+    assert_eq!(
+        got,
+        vec![vec![
+            lines(&[
+                " SELECT u.oid AS umid, s.oid AS srvid, s.srvname, u.umuser,",
+                "        CASE",
+                "            WHEN u.umuser = 0::oid THEN 'public'::name",
+                "            ELSE a.rolname",
+                "        END AS usename,",
+                "        CASE",
+                "            WHEN u.umuser <> 0::oid AND a.rolname = CURRENT_USER AND (pg_has_role(s.srvowner, 'USAGE'::text) OR has_server_privilege(s.oid, 'USAGE'::text)) OR u.umuser = 0::oid AND pg_has_role(s.srvowner, 'USAGE'::text) OR ( SELECT pg_authid.rolsuper",
+                "               FROM pg_authid",
+                "              WHERE pg_authid.rolname = CURRENT_USER) THEN u.umoptions",
+                "            ELSE NULL::text[]",
+                "        END AS umoptions",
+                "   FROM pg_user_mapping u",
+                "     JOIN pg_foreign_server s ON u.umserver = s.oid",
+                "     LEFT JOIN pg_authid a ON a.oid = u.umuser;",
+            ]),
+            lines(&[
+                " SELECT current_database()::information_schema.sql_identifier AS collation_catalog,",
+                "    nc.nspname::information_schema.sql_identifier AS collation_schema,",
+                "    c.collname::information_schema.sql_identifier AS collation_name,",
+                "    'NO PAD'::character varying::information_schema.character_data AS pad_attribute",
+                "   FROM pg_collation c, pg_namespace nc",
+                "  WHERE c.collnamespace = nc.oid AND (c.collencoding = ANY (ARRAY['-1'::integer, ( SELECT pg_database.encoding",
+                "           FROM pg_database",
+                "          WHERE pg_database.datname = current_database())]));",
+            ]),
+            lines(&[
+                " SELECT current_database()::information_schema.sql_identifier AS collation_catalog, nc.nspname::information_schema.sql_identifier AS collation_schema, c.collname::information_schema.sql_identifier AS collation_name, 'NO PAD'::character varying::information_schema.character_data AS pad_attribute",
+                "   FROM pg_collation c, pg_namespace nc",
+                "  WHERE c.collnamespace = nc.oid AND (c.collencoding = ANY (ARRAY['-1'::integer, ( SELECT pg_database.encoding",
+                "           FROM pg_database",
+                "          WHERE pg_database.datname = current_database())]));",
+            ]),
+            Some("false".into()),
+        ]]
+    );
+    // Every built-in view at a wrap column, each column's texts in turn under one digest: 18.6's.
+    let got = rows(
+        &mut snail,
+        "SELECT v.w::text, md5(string_agg(pg_get_viewdef(c.oid, v.w), '|' ORDER BY c.oid)) \
+         FROM pg_class c, (VALUES (-1), (1), (77), (1000)) v(w) \
+         WHERE c.relkind = 'v' AND c.oid < 16384 GROUP BY v.w ORDER BY v.w",
+    );
+    assert_eq!(
+        got,
+        vec![
+            s(&["-1", "0f0fb73ff1e152a01cc4674f6b62ec3c"]),
+            s(&["1", "c0f6ef396785af150191d64625d62efa"]),
+            s(&["77", "a7e1a6377acb0a0cf73acdab7aa1481d"]),
+            s(&["1000", "22e809922734ad6f10369a1eb08cbac3"]),
+        ]
     );
 }
