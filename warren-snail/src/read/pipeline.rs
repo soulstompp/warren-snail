@@ -1299,7 +1299,17 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
                 find_calls(x, out);
             }
         }
-        _ => {}
+        // Any other expression's calls are those of the parts it reads: an IN list's, a BETWEEN's,
+        // a LIKE's, an array's, a row's, a COLLATE's and the rest.
+        e => {
+            let mut parts = parts_of(e);
+            if parts.is_empty() {
+                parts = super::collate::children(e);
+            }
+            for p in parts {
+                find_calls(p, out);
+            }
+        }
     }
 }
 

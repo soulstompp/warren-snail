@@ -1628,7 +1628,12 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                         }
                         _ => None,
                     };
-                    match named {
+                    // An aggregate the select list writes as it is sorts by that column.
+                    let folded = match from.aggregate(&o.expr)? {
+                        Some(a) => listed.iter().position(|(_, i)| *i == a),
+                        None => None,
+                    };
+                    match named.or(folded) {
                         Some(at) => at,
                         None => {
                             let k = from.key_of(&o.expr)?;

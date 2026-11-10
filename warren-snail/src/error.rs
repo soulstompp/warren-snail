@@ -131,6 +131,10 @@ const SAID: &[(Words, &str)] = &[
         "42803",
     ),
     (Words::Starts("window functions are not allowed in "), "42P20"),
+    (
+        Words::Is("for SELECT DISTINCT, ORDER BY expressions must appear in select list"),
+        "42P10",
+    ),
     (Words::Is("unequal number of entries in row expressions"), "42601"),
     (Words::Starts("cannot cast type "), "42846"),
     (Words::Is("ON CONFLICT DO UPDATE command cannot affect row a second time"), "21000"),

@@ -47,40 +47,42 @@ struct Asked<'q> {
     more: bool,
 }
 
-/// What an item of an ORDER BY sorts by: an item of the select list, by its alias or its place.
+/// What an item of an ORDER BY sorts by: an item of the select list, by its alias or its place,
+/// once; the item's expression reads the FROM's columns, and a name in it is never the select
+/// list's again.
 fn sorted_by<'q>(e: &'q Expr, s: &'q Select) -> &'q Expr {
-    let item = |i: &'q SelectItem| match i {
-        SelectItem::UnnamedExpr(x) | SelectItem::ExprWithAlias { expr: x, .. } => Some(x),
-        _ => None,
+    let bare = |mut x: &'q Expr| {
+        while let Expr::Nested(inner) = x {
+            x = inner;
+        }
+        x
     };
-    match e {
-        Expr::Nested(x) => sorted_by(x, s),
-        Expr::Identifier(i) => s
-            .projection
-            .iter()
-            .find_map(|p| match p {
-                SelectItem::ExprWithAlias { expr, alias }
-                    if crate::catalog::ident(alias) == crate::catalog::ident(i) =>
-                {
-                    Some(expr)
-                }
-                _ => None,
-            })
-            .map_or(e, |x| sorted_by(x, s)),
+    let e = bare(e);
+    let item = match e {
+        Expr::Identifier(i) => s.projection.iter().find_map(|p| match p {
+            SelectItem::ExprWithAlias { expr, alias }
+                if crate::catalog::ident(alias) == crate::catalog::ident(i) =>
+            {
+                Some(expr)
+            }
+            _ => None,
+        }),
         Expr::Value(v) => match &v.value {
             SqlValue::Number(n, _) => n
                 .parse::<usize>()
                 .ok()
                 .and_then(|k| s.projection.get(k.checked_sub(1)?))
-                .and_then(item)
-                .map_or(e, |x| match x {
-                    Expr::Value(_) => x,
-                    x => sorted_by(x, s),
+                .and_then(|i| match i {
+                    SelectItem::UnnamedExpr(x) | SelectItem::ExprWithAlias { expr: x, .. } => {
+                        Some(x)
+                    }
+                    _ => None,
                 }),
-            _ => e,
+            _ => None,
         },
-        _ => e,
-    }
+        _ => None,
+    };
+    item.map_or(e, bare)
 }
 
 /// Whether an expression comes to one value whatever the row: no column, and nothing a statement
