@@ -348,3 +348,60 @@ fn the_visibility_tests_answer_whether_the_search_path_finds_an_object_by_its_na
         &["t|t|NULL|NULL|NULL"],
     );
 }
+
+const KEYS: &str = "CREATE SCHEMA s; \
+     CREATE TABLE s.p (a int, b text, c int, PRIMARY KEY (b, a), UNIQUE (c)); \
+     CREATE TABLE s.f (id int PRIMARY KEY, pb text, pa int, pc int REFERENCES s.p (c), \
+     FOREIGN KEY (pb, pa) REFERENCES s.p (b, a)); \
+     CREATE TABLE s.arr (id int PRIMARY KEY, xs int[], ts text[]); \
+     CREATE FUNCTION s.fn(integer, text) RETURNS integer LANGUAGE sql AS 'SELECT $1';";
+
+#[test]
+fn information_schema_reads_each_array_element_and_its_place_as_postgresql_does() {
+    let mut s = Snail::open(&written("keys", KEYS)).unwrap();
+    let mut asked = |q: &str, want: &[&str]| {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), want, "{q}");
+    };
+    // Each key's columns by their place in it, and a foreign key's by the place each column it
+    // references has in that key's index.
+    asked(
+        "SELECT constraint_name, table_name, column_name, ordinal_position, \
+         position_in_unique_constraint FROM information_schema.key_column_usage \
+         WHERE table_schema = 's' ORDER BY 1, 4",
+        &[
+            "arr_pkey|arr|id|1|NULL",
+            "f_pb_pa_fkey|f|pb|1|1",
+            "f_pb_pa_fkey|f|pa|2|2",
+            "f_pc_fkey|f|pc|1|1",
+            "f_pkey|f|id|1|NULL",
+            "p_c_key|p|c|1|NULL",
+            "p_pkey|p|b|1|NULL",
+            "p_pkey|p|a|2|NULL",
+        ],
+    );
+    asked(
+        "SELECT object_name, object_type, collection_type_identifier, data_type \
+         FROM information_schema.element_types WHERE object_schema = 's' ORDER BY 1, 3",
+        &["arr|TABLE|2|integer", "arr|TABLE|3|text"],
+    );
+    asked(
+        "SELECT specific_schema, regexp_replace(specific_name, '_[0-9]+$', ''), \
+         ordinal_position, parameter_mode, parameter_name, data_type, parameter_default, \
+         dtd_identifier FROM information_schema.parameters \
+         WHERE specific_schema = 's' OR specific_name LIKE 'pg_get_keywords\\_%' ORDER BY 1, 2, 3",
+        &[
+            "pg_catalog|pg_get_keywords|1|OUT|word|text|NULL|1",
+            "pg_catalog|pg_get_keywords|2|OUT|catcode|\"char\"|NULL|2",
+            "pg_catalog|pg_get_keywords|3|OUT|barelabel|boolean|NULL|3",
+            "pg_catalog|pg_get_keywords|4|OUT|catdesc|text|NULL|4",
+            "pg_catalog|pg_get_keywords|5|OUT|baredesc|text|NULL|5",
+            "s|fn|1|IN|NULL|integer|NULL|1",
+            "s|fn|2|IN|NULL|text|NULL|2",
+        ],
+    );
+    asked(
+        "SELECT count(*) FROM information_schema.triggered_update_columns",
+        &["0"],
+    );
+}

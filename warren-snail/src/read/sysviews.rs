@@ -448,6 +448,7 @@ fn rewrite(q: &mut Query, catalog: &crate::catalog::Catalog) -> Result<Vec<Optio
     if let Some(e) = failed {
         return Err(e);
     }
+    expand_arrays(q)?;
     let _ = sqlparser::ast::visit_expressions_mut(q, |e| {
         if let Expr::Cast { data_type, .. } = e {
             if let Some(base) = domain_base(data_type) {
@@ -458,6 +459,120 @@ fn rewrite(q: &mut Query, catalog: &crate::catalog::Catalog) -> Result<Vec<Optio
     });
     let _ = sqlparser::ast::VisitMut::visit(q, &mut Commas);
     Ok(refused)
+}
+
+/// `information_schema._pg_expandarray(a) AS x` in a select list, each element of `a` with its
+/// place counted from 1, as the function returns them a row each: read as `unnest(a) WITH
+/// ORDINALITY`, LATERAL, after the FROM of its query, the element and its place the query's columns
+/// `snail_x_x` and `snail_x_n`, the place an integer as the function declares it. Each `(q.x).x`
+/// and `(q.x).n` reads them.
+fn expand_arrays(q: &mut Query) -> Result<()> {
+    struct Expand {
+        names: Vec<String>,
+        failed: Option<Error>,
+    }
+    impl sqlparser::ast::VisitorMut for Expand {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+            if let Err(e) = expand_in(&mut q.body, &mut self.names) {
+                self.failed.get_or_insert(e);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut expand = Expand {
+        names: Vec::new(),
+        failed: None,
+    };
+    let _ = sqlparser::ast::VisitMut::visit(q, &mut expand);
+    if let Some(e) = expand.failed {
+        return Err(e);
+    }
+    let names = expand.names;
+    if names.is_empty() {
+        return Ok(());
+    }
+    let _ = sqlparser::ast::visit_expressions_mut(q, |x| {
+        let Expr::CompoundFieldAccess { root, access_chain } = x else {
+            return ControlFlow::<()>::Continue(());
+        };
+        let mut r = root.as_ref();
+        while let Expr::Nested(inner) = r {
+            r = inner;
+        }
+        let (qualifier, column) = match r {
+            Expr::CompoundIdentifier(p) if p.len() == 2 => (Some(p[0].clone()), &p[1]),
+            Expr::Identifier(i) => (None, i),
+            _ => return ControlFlow::Continue(()),
+        };
+        let [sqlparser::ast::AccessExpr::Dot(Expr::Identifier(field))] = access_chain.as_slice()
+        else {
+            return ControlFlow::Continue(());
+        };
+        if !names.contains(&column.value) || !matches!(field.value.as_str(), "x" | "n") {
+            return ControlFlow::Continue(());
+        }
+        let read = sqlparser::ast::Ident::new(format!("snail_{}_{}", column.value, field.value));
+        *x = match qualifier {
+            Some(q) => Expr::CompoundIdentifier(vec![q, read]),
+            None => Expr::Identifier(read),
+        };
+        ControlFlow::Continue(())
+    });
+    Ok(())
+}
+
+fn expand_in(body: &mut SetExpr, names: &mut Vec<String>) -> Result<()> {
+    match body {
+        SetExpr::Select(s) => expand_select(s, names),
+        SetExpr::SetOperation { left, right, .. } => {
+            expand_in(left, names)?;
+            expand_in(right, names)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn expand_select(s: &mut sqlparser::ast::Select, names: &mut Vec<String>) -> Result<()> {
+    let mut items = Vec::with_capacity(s.projection.len());
+    for item in std::mem::take(&mut s.projection) {
+        let expanded = match &item {
+            SelectItem::ExprWithAlias {
+                expr: Expr::Function(f),
+                alias,
+            } if function_name(f) == "information_schema._pg_expandarray" => {
+                match arguments(f).as_slice() {
+                    [a] => Some((a.clone(), alias.value.clone())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((array, name)) = expanded else {
+            items.push(item);
+            continue;
+        };
+        let lateral = format!("snail_{name}");
+        let parsed = crate::read::image::parse_sql(&format!(
+            "SELECT {lateral}.x AS snail_{name}_x, CAST({lateral}.n AS integer) AS snail_{name}_n \
+             FROM snail_t CROSS JOIN LATERAL unnest({array}) WITH ORDINALITY AS {lateral}(x, n)"
+        ))?;
+        let [sqlparser::ast::Statement::Query(made)] = parsed.as_slice() else {
+            return Err(Error::new("_pg_expandarray's elements are no question"));
+        };
+        let SetExpr::Select(made) = made.body.as_ref() else {
+            return Err(Error::new("_pg_expandarray's elements are no question"));
+        };
+        items.extend(made.projection.iter().cloned());
+        s.from.push(sqlparser::ast::TableWithJoins {
+            relation: made.from[0].joins[0].relation.clone(),
+            joins: Vec::new(),
+        });
+        names.push(name);
+    }
+    s.projection = items;
+    Ok(())
 }
 
 /// Each comma of a view's FROM met by the conjuncts of its WHERE that tie the item after it to
@@ -745,8 +860,42 @@ fn arguments(f: &sqlparser::ast::Function) -> Vec<Expr> {
         .collect()
 }
 
+/// Each relation a function's body names under an alias, named afresh, `snail_body_<alias>`, with
+/// every column the body qualifies by it.
+fn own_names(q: &mut Query) {
+    struct Aliases(Vec<String>);
+    impl sqlparser::ast::VisitorMut for Aliases {
+        type Break = ();
+
+        fn pre_visit_table_factor(
+            &mut self,
+            t: &mut sqlparser::ast::TableFactor,
+        ) -> ControlFlow<()> {
+            use sqlparser::ast::TableFactor as T;
+            if let T::Table { alias: Some(a), .. } | T::Derived { alias: Some(a), .. } = t {
+                let own = ident_folded(&a.name);
+                a.name = sqlparser::ast::Ident::new(format!("snail_body_{own}"));
+                self.0.push(own);
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut aliases = Aliases(Vec::new());
+    let _ = sqlparser::ast::VisitMut::visit(q, &mut aliases);
+    let _ = sqlparser::ast::visit_expressions_mut(q, |x| {
+        if let Expr::CompoundIdentifier(p) = x {
+            if p.len() >= 2 && aliases.0.contains(&ident_folded(&p[0])) {
+                p[0] = sqlparser::ast::Ident::new(format!("snail_body_{}", ident_folded(&p[0])));
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
 /// One of information_schema's functions as the expression it returns, its arguments in place of
-/// its parameters: `($2).typtype` the second argument's relation's column.
+/// its parameters: `($2).typtype` the second argument's relation's column. A body of BEGIN ATOMIC
+/// holding one SELECT is that question, a scalar subquery, the relations it names under names of
+/// their own so that none hides one an argument names.
 fn inline(name: &str, args: &[Expr], release: u8) -> Result<Expr> {
     let key = carried()
         .keys()
@@ -757,10 +906,6 @@ fn inline(name: &str, args: &[Expr], release: u8) -> Result<Expr> {
         .ok_or_else(|| Error::new(format!("information_schema.{name} is not read")))?;
     let text = definition(key, release)
         .ok_or_else(|| Error::new(format!("information_schema.{name} is not in this release")))?;
-    let body = text
-        .split_once("\nRETURN ")
-        .map(|(_, b)| b.trim())
-        .ok_or_else(|| Error::new(format!("information_schema.{name}'s body is no expression")))?;
     let params: Vec<String> = key
         .split_once('(')
         .map(|(_, p)| p.trim_end_matches(')'))
@@ -768,7 +913,24 @@ fn inline(name: &str, args: &[Expr], release: u8) -> Result<Expr> {
         .split(", ")
         .map(|p| p.split(' ').next().unwrap_or("").to_string())
         .collect();
-    let mut e = expression(&super::spelled::spelled(body)?)?;
+    let no_body = || Error::new(format!("information_schema.{name}'s body is no expression"));
+    let mut e = match text.split_once("\nRETURN ") {
+        Some((_, body)) => expression(&super::spelled::spelled(body.trim())?)?,
+        None => {
+            let body = text
+                .split_once("\nBEGIN ATOMIC\n")
+                .and_then(|(_, b)| b.trim_end().strip_suffix("END"))
+                .and_then(|b| b.trim_end().strip_suffix(';'))
+                .ok_or_else(no_body)?;
+            let parsed = crate::read::image::parse_sql(&super::spelled::spelled(body)?)?;
+            let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
+                return Err(no_body());
+            };
+            let mut q = (**q).clone();
+            own_names(&mut q);
+            Expr::Subquery(Box::new(q))
+        }
+    };
     let arg_of = |n: &str| -> Option<Expr> {
         if let Some(i) = n.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
             return args.get(i - 1).cloned();
