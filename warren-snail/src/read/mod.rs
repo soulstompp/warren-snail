@@ -30,6 +30,7 @@ mod level;
 mod locking;
 mod nearest;
 mod ops;
+pub(crate) mod own;
 mod ordering;
 mod out;
 pub(crate) mod partial;
@@ -1546,6 +1547,7 @@ impl Snail {
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _standing = sequences::standing(&self.catalog, sql, || self.sequences_newest())?;
         let _handed = handed::holding(&self.functions);
+        let _own = own::holding(&self.catalog.functions, self.catalog.release);
         let _prepared = prepared::viewing(&self.session.prepared);
         let viewing = settings::viewing(self.settings_view());
         let _timing = self.timing();
@@ -1670,6 +1672,7 @@ impl Snail {
                 || pipeline::hands_over(q) && question::parse(&self.catalog, sql).is_err()
                 || elements::read_a_row_at_a_time(&self.catalog, q)
                     && question::parse(&self.catalog, sql).is_err()
+                || own::calls(&self.catalog, q) && question::parse(&self.catalog, sql).is_err()
             {
                 if order.is_some() {
                     return Err(Error::new("a pipeline reads its table along its own order"));

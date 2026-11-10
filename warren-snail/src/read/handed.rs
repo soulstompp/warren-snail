@@ -479,7 +479,7 @@ fn named(f: &Function, called: &str) -> bool {
 /// Where an argument of type `from` is taken as one of type `to` with no cast written, as
 /// PostgreSQL's implicit casts take it: whether exactly, else whether at all. A literal of no type
 /// yet, or NULL, is taken as any type.
-fn implicit(from: Option<ColumnType>, to: ColumnType) -> Option<bool> {
+pub(super) fn implicit(from: Option<ColumnType>, to: ColumnType) -> Option<bool> {
     use ColumnType as C;
     let Some(from) = from else {
         return Some(false);
@@ -608,7 +608,7 @@ fn taken(g: &Function, given: Vec<(Value, bool)>) -> Result<Vec<Value>> {
 }
 
 /// A value in a type: a literal of no type yet read by the type's input, any other assigned to it.
-fn fitted(v: Value, ty: ColumnType, quoted: bool) -> Result<Value> {
+pub(super) fn fitted(v: Value, ty: ColumnType, quoted: bool) -> Result<Value> {
     Ok(super::pipeline::part_value(
         ty,
         &super::pipeline::part_of(ty, v, quoted)?,

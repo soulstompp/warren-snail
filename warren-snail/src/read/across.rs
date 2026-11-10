@@ -793,6 +793,12 @@ impl Snails {
         // The session's settings stand alike on every snail; its zone is the first's.
         let _zoned = self.snails[0].in_zone();
         let _handed = super::handed::holding(&self.functions);
+        let functions: Vec<crate::catalog::Function> = self
+            .snails
+            .iter()
+            .flat_map(|s| s.catalog.functions.iter().cloned())
+            .collect();
+        let _own = super::own::holding(&functions, self.snails[0].catalog.release);
         let _prepared = super::prepared::viewing(&self.session.prepared);
         let room = self.snails[0].reader.room();
         let entered = crate::room::entered(&room);

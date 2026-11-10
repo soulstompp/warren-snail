@@ -3299,6 +3299,24 @@ impl Draft {
                         }
                         None
                     }
+                    // A function the DDL declares, called as a statement calls it.
+                    _ if self.functions.iter().any(|g| {
+                        g.name == name
+                            || !name.contains('.')
+                                && g.name.strip_prefix("public.").unwrap_or(&g.name) == name
+                    }) =>
+                    {
+                        for a in &args {
+                            self.default_type(a, what)?;
+                        }
+                        self.functions
+                            .iter()
+                            .find(|g| {
+                                g.name == name
+                                    || g.name.strip_prefix("public.").unwrap_or(&g.name) == name
+                            })
+                            .map(|g| g.returns)
+                    }
                     _ => {
                         return Err(Error::new(format!(
                             "{what}: the DEFAULT calls {}, which the snail does not read",
@@ -3455,14 +3473,37 @@ impl Draft {
             Statement::CreateFunction(f) => {
                 read_as_written(tokens, &st, &format!("{kind} {object}"))?;
                 let f = function(f)?;
-                if self.functions.iter().any(|g| g.name == f.name) {
-                    return Err(Error::new(format!("function {} already exists", f.name)));
+                if let Some(g) = self.functions.iter().find(|g| g.name == f.name) {
+                    let last = f.name.rsplit('.').next().unwrap_or(&f.name);
+                    return Err(Error::new(match g.args == f.args {
+                        true => format!(
+                            "function \"{last}\" already exists with same argument types"
+                        ),
+                        false => format!(
+                            "function {}: a second function of its name is not read",
+                            f.name
+                        ),
+                    }));
+                }
+                // Its body read as PostgreSQL reads it once the function is made: typed with the
+                // functions made before it and itself, and its type one RETURNS takes.
+                let body = crate::read::own::body_type(&self.functions, &f, self.release)?;
+                if let Some(t) = body {
+                    if t != f.returns && !crate::catalog::assignable(t, f.returns) {
+                        return Err(Error::new(format!(
+                            "return type mismatch in function declared to return {}: Actual \
+                             return type is {}.",
+                            f.returns.pg_name(),
+                            t.pg_name()
+                        )));
+                    }
                 }
                 self.functions.push(f);
                 Ok(Vec::new())
             }
             Statement::CreateView(v) => {
                 read_as_written(tokens, &st, &format!("{kind} {object}"))?;
+                let _own = crate::read::own::holding(&self.functions, self.release);
                 self.create_view(v, check)
             }
             _ => Err(Error::new(format!(
@@ -7219,6 +7260,7 @@ pub(crate) fn declares(sql: &str) -> Option<&'static str> {
         "ALTER TYPE" => "ALTER TYPE",
         "ALTER DOMAIN" => "ALTER DOMAIN",
         "CREATE VIEW" | "CREATE OR REPLACE VIEW" => "CREATE VIEW",
+        "CREATE FUNCTION" => "CREATE FUNCTION",
         "CREATE SCHEMA" => "CREATE SCHEMA",
         "DROP SCHEMA" => "DROP SCHEMA",
         "DROP TABLE" => "DROP TABLE",

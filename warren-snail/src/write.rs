@@ -1133,6 +1133,7 @@ fn write_tables(
             || table.checks.iter().any(|k| k.enforced)
             || table.columns.iter().any(|c| c.domain.is_some())
         {
+            let _own = crate::read::own::holding(&catalog.functions, catalog.release);
             for i in 0..rows.len() {
                 let row: crate::read::statement::Row = table
                     .columns

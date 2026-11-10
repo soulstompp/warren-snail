@@ -799,6 +799,9 @@ impl Typing<'_> {
                         written(*t)?;
                     }
                 }
+                if let Some(t) = super::own::typed(f, &types)? {
+                    return Ok(Some(t));
+                }
                 if super::handed::is_handed(f) {
                     if let Some(t) = super::handed::typed(f, &types)? {
                         return Ok(Some(t));

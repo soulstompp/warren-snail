@@ -1006,7 +1006,7 @@ fn names_collate(e: &Expr) -> bool {
 
 impl Frame<'_> {
     /// The type the step resolved an expression to, where it resolved one.
-    fn type_of(&self, e: &Expr) -> Option<ColumnType> {
+    pub(super) fn type_of(&self, e: &Expr) -> Option<ColumnType> {
         self.types.get(&(e as *const Expr)).copied()
     }
 
@@ -1517,7 +1517,21 @@ fn sets_placed(e: &Expr) -> Result<()> {
 /// The values a row's expressions see beyond its columns: each aggregate's and window's, by place.
 pub(super) struct Computed<'q> {
     calls: HashMap<*const Expr, Value>,
+    /// Where a function of the file's body is read: each of its parameters' values, read from
+    /// the call's argument.
+    bound: Option<&'q dyn Fn(&Expr) -> Option<Result<Value>>>,
     _q: std::marker::PhantomData<&'q ()>,
+}
+
+impl<'q> Computed<'q> {
+    /// What a function's body sees: its parameters' values, as `bound` reads them.
+    pub(super) fn bound_by(bound: &'q dyn Fn(&Expr) -> Option<Result<Value>>) -> Computed<'q> {
+        Computed {
+            calls: HashMap::new(),
+            bound: Some(bound),
+            _q: std::marker::PhantomData,
+        }
+    }
 }
 
 fn args(f: &sqlparser::ast::Function) -> Result<Vec<&Expr>> {
@@ -3674,6 +3688,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
     if let Some(v) = computed.calls.get(&(e as *const Expr)) {
         return Ok(v.clone());
     }
+    if let Some(v) = computed.bound.and_then(|b| b(e)) {
+        return v;
+    }
     let ev = |x: &Expr| eval(x, row, frame, computed);
     if is_subquery(e) {
         return match frame.subqueries {
@@ -4602,6 +4619,9 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             if let ("record_image_eq" | "record_image_ne", [x, y]) = (name.as_str(), a.as_slice()) {
                 return super::image::records_compared(name == "record_image_eq", ev(x)?, ev(y)?);
             }
+            if let Some(v) = super::own::call(f, &a, row, frame, computed)? {
+                return Ok(v);
+            }
             if super::handed::is_handed(f) {
                 let given = a
                     .iter()
@@ -5027,6 +5047,7 @@ fn windows(
         };
         let none = Computed {
             calls: HashMap::new(),
+            bound: None,
             _q: std::marker::PhantomData,
         };
         let running = state.entry(call as *const Expr).or_default();
@@ -6756,6 +6777,7 @@ pub(crate) fn eval_on_as(
 pub(super) fn computed_none<'q>() -> Computed<'q> {
     Computed {
         calls: HashMap::new(),
+        bound: None,
         _q: std::marker::PhantomData,
     }
 }
@@ -6791,6 +6813,7 @@ fn fold_partition(
     for (row, w) in rel.rows.iter().zip(per_row) {
         let computed = Computed {
             calls: w,
+            bound: None,
             _q: std::marker::PhantomData,
         };
         out.extend(p.project(row, frame, computed)?);
@@ -6970,6 +6993,7 @@ impl Groups {
                         Ok((c as *const Expr, a.value()?))
                     })
                     .collect::<Result<_>>()?,
+                bound: None,
                 _q: std::marker::PhantomData,
             };
             if let Some(h) = p.having {
@@ -7269,6 +7293,7 @@ impl<'q> StepRun<'q> {
         for (row, w) in rel.rows.iter().zip(per_row) {
             let computed = Computed {
                 calls: w,
+                bound: None,
                 _q: std::marker::PhantomData,
             };
             rows.extend(self.p.project(row, &frame, computed)?);
@@ -7410,6 +7435,7 @@ impl<'q> StepRun<'q> {
                 for (row, w) in rel.rows.iter().zip(per_row) {
                     let computed = Computed {
                         calls: w,
+                        bound: None,
                         _q: std::marker::PhantomData,
                     };
                     rows.extend(p.project(row, &frame, computed)?);

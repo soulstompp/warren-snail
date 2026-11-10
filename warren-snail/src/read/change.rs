@@ -916,6 +916,7 @@ impl Snail {
             self.clock.0 = at;
         }
         let _handed = super::handed::holding(&self.functions);
+        let _own = super::own::holding(&self.catalog.functions, self.catalog.release);
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
         let _zoned = self.in_zone();
         let _named = crate::oids::named(self.catalog.oids.clone());
