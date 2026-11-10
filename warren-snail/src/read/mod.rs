@@ -99,8 +99,9 @@ pub fn answer_text(batch: &RecordBatch) -> Result<Vec<Vec<Option<String>>>> {
 }
 
 /// The names of the columns a view's question returns, read over the catalog as PostgreSQL's
-/// parser reads it as the view is made: no row read.
+/// parser reads it as the view is made, the file's functions held: no row read.
 pub(crate) fn view_columns(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Vec<String>> {
+    let _own = own::holding(&catalog.functions, catalog.release);
     relations::checked(catalog, q)
 }
 

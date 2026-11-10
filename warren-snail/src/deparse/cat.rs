@@ -94,6 +94,32 @@ pub(crate) struct Proc {
     pub nargdefaults: usize,
     /// prokind: f a function, a an aggregate, w a window function, p a procedure.
     pub kind: char,
+    /// Its parameters' names as proargnames holds them, empty where it holds none.
+    pub argnames: Vec<String>,
+}
+
+/// The elements of a one-dimensional text array as its output writes it, `{a,"b c",""}`.
+pub(crate) fn text_elements(s: &str) -> Vec<String> {
+    let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut escaped) = (false, false);
+    for c in inner.chars() {
+        match c {
+            _ if escaped => {
+                cur.push(c);
+                escaped = false;
+            }
+            '\\' => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !inner.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// A row of pg_cast.
@@ -171,6 +197,12 @@ fn proc_row(r: &Raw) -> Proc {
         variadic: num(r, "provariadic"),
         nargdefaults: num(r, "pronargdefaults"),
         kind: letter(r, "prokind"),
+        argnames: r
+            .get("proargnames")
+            .cloned()
+            .flatten()
+            .map(|s| text_elements(&s))
+            .unwrap_or_default(),
     }
 }
 

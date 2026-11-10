@@ -5,7 +5,7 @@
 //! rest. Each form refuses by name what it does not know.
 
 use crate::catalog::{
-    assignable, format_type, held_type, ident, level, object_name, shape, Action, Brin, Catalog,
+    assignable, format_type, held_type, BodyForm, ident, level, object_name, shape, Action, Brin, Catalog,
     Check, Collation, Column, ColumnType, Domain, DomainCheck, Fact, ForeignKey, Function,
     Generated, Identity, KeyConstraint, Level, Method, Order, Reading, Sequence, SequenceType,
     Shape, StatementRead, Table, Type, TypeKind, View, TEXT_OPCLASSES,
@@ -1799,17 +1799,52 @@ pub(crate) fn index_extras(tokens: &[Token]) -> Result<IndexExtras> {
     Ok((kept, params))
 }
 
+/// Whether a statement's first words, lower case, are CREATE [OR REPLACE] FUNCTION or PROCEDURE.
+fn routine(words: &[String]) -> bool {
+    let made = |x: Option<&String>| matches!(x.map(String::as_str), Some("function" | "procedure"));
+    words.first().map(String::as_str) == Some("create")
+        && (made(words.get(1))
+            || words.get(1).map(String::as_str) == Some("or")
+                && words.get(2).map(String::as_str) == Some("replace")
+                && made(words.get(3)))
+}
+
 /// The statements of a DDL, split on their semicolons by sqlparser's PostgreSQL tokenizer.
 pub(crate) fn statements(ddl: &str) -> Result<Vec<Vec<Token>>> {
     let ddl = crate::read::scanned_unseeded(ddl, crate::regs::LATEST)?;
     let tokens = crate::read::image::tokens(&ddl)?;
     let mut out = vec![Vec::new()];
+    // A routine's BEGIN … END keeps the semicolons inside it, as psql keeps them: in a statement
+    // that begins CREATE [OR REPLACE] FUNCTION or PROCEDURE, each BEGIN outside parentheses opens
+    // a block, a CASE inside one opens another, and END closes the last.
+    let (mut words, mut depth, mut parens) = (Vec::<String>::new(), 0usize, 0i64);
     for t in tokens.into_iter().map(|t| t.token) {
-        if t == Token::SemiColon {
+        if t == Token::SemiColon && depth == 0 {
             out.push(Vec::new());
-        } else {
-            out.last_mut().unwrap().push(t);
+            words.clear();
+            parens = 0;
+            continue;
         }
+        match &t {
+            Token::LParen => parens += 1,
+            Token::RParen => parens -= 1,
+            Token::Word(w) if w.quote_style.is_none() => {
+                let word = w.value.to_ascii_lowercase();
+                if words.len() < 4 {
+                    words.push(word.clone());
+                }
+                if parens == 0 && routine(&words) {
+                    match word.as_str() {
+                        "begin" => depth += 1,
+                        "case" if depth >= 1 => depth += 1,
+                        "end" if depth > 0 => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.last_mut().unwrap().push(t);
     }
     Ok(out
         .into_iter()
@@ -3460,6 +3495,12 @@ impl Draft {
             true => check_option(tokens),
             false => (tokens.to_vec(), None),
         };
+        // A function's body in SQL's own words, which sqlparser reads otherwise or not at all,
+        // taken out of the words here.
+        let (tokens, sql) = match kind.starts_with("CREATE") && kind.ends_with("FUNCTION") {
+            true => sql_body(&tokens)?,
+            false => (tokens, None),
+        };
         let tokens = tokens.as_slice();
         let st = Parser::new(&PostgreSqlDialect {})
             .with_tokens(tokens.to_vec())
@@ -3471,8 +3512,27 @@ impl Draft {
             })?;
         match &st {
             Statement::CreateFunction(f) => {
-                read_as_written(tokens, &st, &format!("{kind} {object}"))?;
-                let f = function(f)?;
+                // sqlparser writes a parameter's DEFAULT as `=`.
+                let compared: Vec<Token> = tokens
+                    .iter()
+                    .map(|t| match t {
+                        Token::Word(w)
+                            if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("default") =>
+                        {
+                            Token::Eq
+                        }
+                        t => t.clone(),
+                    })
+                    .collect();
+                read_as_written(&compared, &st, &format!("{kind} {object}"))?;
+                let name = object_name(&f.name);
+                let held = |dt: &DataType| match self.held(dt, &name)? {
+                    (t, None) => Ok(t),
+                    (_, Some(d)) => Err(Error::new(format!(
+                        "{name}: a parameter or result of the domain {d} is not read"
+                    ))),
+                };
+                let f = function(f, sql, &held)?;
                 if let Some(g) = self.functions.iter().find(|g| g.name == f.name) {
                     let last = f.name.rsplit('.').next().unwrap_or(&f.name);
                     return Err(Error::new(match g.args == f.args {
@@ -3485,6 +3545,7 @@ impl Draft {
                         ),
                     }));
                 }
+                self.parameter_defaults(&f)?;
                 // Its body read as PostgreSQL reads it once the function is made: typed with the
                 // functions made before it and itself, and its type one RETURNS takes.
                 let body = crate::read::own::body_type(&self.functions, &f, self.release)?;
@@ -3510,6 +3571,74 @@ impl Draft {
                 "the statement {kind} {object} is not read"
             ))),
         }
+    }
+
+    /// Each DEFAULT of a function's parameters read as PostgreSQL's parse analysis reads it when
+    /// the function is made, over the objects made before it: no subquery, aggregate, window or
+    /// set-returning function, no column, and a value its parameter takes by assignment.
+    fn parameter_defaults(&self, f: &Function) -> Result<()> {
+        use crate::deparse::analyze::{Analyzer, Context, Form};
+        if f.defaults.is_empty() {
+            return Ok(());
+        }
+        let catalog = Catalog {
+            release: self.release,
+            ..self.so_far()
+        };
+        let _named = crate::oids::named(catalog.oids.clone());
+        let cat = crate::deparse::cat::Cat::of(&catalog);
+        let a = Analyzer {
+            cat: &cat,
+            columns: Vec::new(),
+            value: None,
+            scope: None,
+        };
+        for (e, &ty) in f.defaults.iter().zip(&f.args[f.required()..]) {
+            let mut why = None;
+            let _ = sqlparser::ast::visit_expressions(e, |x| {
+                let found = match x {
+                    Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                        Some("cannot use subquery in DEFAULT expression")
+                    }
+                    Expr::Function(g) if g.over.is_some() => {
+                        Some("window functions are not allowed in DEFAULT expressions")
+                    }
+                    Expr::Function(g) => {
+                        let n = object_name(&g.name);
+                        let n = n.strip_prefix("pg_catalog.").unwrap_or(&n);
+                        if crate::read::pipeline::is_aggregate(n) {
+                            Some("aggregate functions are not allowed in DEFAULT expressions")
+                        } else if crate::read::pipeline::is_set_returning(n) || crate::read::own::returns_set(n, self.release) {
+                            Some("set-returning functions are not allowed in DEFAULT expressions")
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                match found {
+                    Some(w) => {
+                        why = Some(w);
+                        std::ops::ControlFlow::Break(())
+                    }
+                    None => std::ops::ControlFlow::Continue(()),
+                }
+            });
+            if let Some(w) = why {
+                return Err(Error::new(w));
+            }
+            let node = a.expr(e)?;
+            let target = crate::pgcatalog::type_oid_of(&catalog, ty, None);
+            if !a.can_coerce_all(&[node.ty()], &[target], Context::Assignment) {
+                return Err(Error::new(format!(
+                    "argument of DEFAULT must be type {}, not type {}",
+                    a.type_name(target),
+                    a.type_name(node.ty())
+                )));
+            }
+            a.coerce_to_target(node, target, -1, Context::Assignment, Form::Implicit)?;
+        }
+        Ok(())
     }
 
     /// A view: its question read over the tables and the views declared before it, as
@@ -6900,24 +7029,187 @@ fn nextval_expr(sequence: &str) -> Expr {
     .unwrap()
 }
 
-/// A function written in SQL: its name, its arguments' types and its body's one expression.
-fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
-    let name = object_name(&f.name);
-    let language = f.language.as_ref().map(ident).unwrap_or_default();
-    if language != "sql" {
-        return Err(Error::new(format!("{name}: only LANGUAGE sql is read")));
+/// A routine's body written in SQL's own words, taken out of its statement's words before
+/// sqlparser reads the rest: the expression after RETURN, or the statements of BEGIN ATOMIC.
+pub(crate) enum SqlBody {
+    Return(String),
+    Atomic(Vec<String>),
+}
+
+/// A CREATE FUNCTION's words without its body in SQL's own words, and that body: RETURN to the
+/// statement's end, or BEGIN ATOMIC to its END, each found outside parentheses.
+pub(crate) fn sql_body(tokens: &[Token]) -> Result<(Vec<Token>, Option<SqlBody>)> {
+    let word = |t: Option<&Token>| match t {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_uppercase(),
+        _ => String::new(),
+    };
+    let solid = |from: usize| {
+        tokens
+            .get(from..)
+            .unwrap_or(&[])
+            .iter()
+            .position(|t| !matches!(t, Token::Whitespace(_)))
+            .map(|i| from + i)
+    };
+    let mut parens = 0i64;
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::LParen => parens += 1,
+            Token::RParen => parens -= 1,
+            Token::Word(_) if parens == 0 => match word(Some(t)).as_str() {
+                "RETURN" => {
+                    let text = written(&tokens[i + 1..]);
+                    return Ok((tokens[..i].to_vec(), Some(SqlBody::Return(text))));
+                }
+                "BEGIN" if solid(i + 1).is_some_and(|j| word(tokens.get(j)) == "ATOMIC") => {
+                    let start = solid(i + 1).unwrap_or(i) + 1;
+                    let (mut depth, mut inner) = (1usize, 0i64);
+                    let mut statements: Vec<Vec<Token>> = vec![Vec::new()];
+                    let mut end = None;
+                    for (j, u) in tokens.iter().enumerate().skip(start) {
+                        match u {
+                            Token::LParen => inner += 1,
+                            Token::RParen => inner -= 1,
+                            Token::SemiColon if depth == 1 => {
+                                statements.push(Vec::new());
+                                continue;
+                            }
+                            Token::Word(_) if inner == 0 => match word(Some(u)).as_str() {
+                                "BEGIN" | "CASE" => depth += 1,
+                                "END" => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        end = Some(j);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                        statements.last_mut().expect("a statement").push(u.clone());
+                    }
+                    let Some(end) = end else {
+                        return Err(Error::new("syntax error at end of input"));
+                    };
+                    if let Some(k) = solid(end + 1) {
+                        return Err(Error::new(format!(
+                            "syntax error at or near \"{}\"",
+                            tokens[k]
+                        )));
+                    }
+                    let statements = statements
+                        .iter()
+                        .map(|s| written(s))
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    return Ok((tokens[..i].to_vec(), Some(SqlBody::Atomic(statements))));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
     }
-    let mut args = Vec::new();
+    Ok((tokens.to_vec(), None))
+}
+
+/// An expression written to the end of its text, refused as PostgreSQL's grammar refuses a word
+/// after it.
+fn whole_expression(text: &str) -> Result<()> {
+    let tokens = crate::read::image::tokens(text)?;
+    let mut p = Parser::new(&PostgreSqlDialect {}).with_tokens_with_locations(tokens);
+    p.parse_expr()?;
+    match p.next_token().token {
+        Token::EOF => Ok(()),
+        t => Err(Error::new(format!("syntax error at or near \"{t}\""))),
+    }
+}
+
+/// A body's one statement read: a SELECT of one expression and nothing else, its expression.
+fn body_expression(name: &str, text: &str) -> Result<Expr> {
+    let bound = crate::grammar::bound(text);
+    let parsed = crate::read::image::parse_sql(bound.as_deref().unwrap_or(text))
+        .map_err(|e| Error::new(format!("{name}: its body: {e}")))?;
+    match parsed.as_slice() {
+        [Statement::Query(q)] => match q.body.as_ref() {
+            SetExpr::Select(s)
+                if s.from.is_empty() && s.selection.is_none() && s.projection.len() == 1 =>
+            {
+                match &s.projection[0] {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        Ok(e.clone())
+                    }
+                    _ => Err(Error::new(format!("{name}: its body is not one expression"))),
+                }
+            }
+            _ => Err(Error::new(format!("{name}: its body is not one expression"))),
+        },
+        _ => Err(Error::new(format!("{name}: its body is not one SELECT"))),
+    }
+}
+
+/// A function written in SQL: its name, its parameters' types, names and DEFAULTs, and its body's
+/// one expression, written after AS, after RETURN or inside BEGIN ATOMIC (`sql`, taken out of its
+/// words). Refused in PostgreSQL's words where its CREATE FUNCTION refuses it.
+fn function(
+    f: &sqlparser::ast::CreateFunction,
+    sql: Option<SqlBody>,
+    held: &dyn Fn(&DataType) -> Result<ColumnType>,
+) -> Result<Function> {
+    let name = object_name(&f.name);
+    let language = f.language.as_ref().map(ident);
+    let quoted = match &f.function_body {
+        None => None,
+        Some(
+            CreateFunctionBody::AsBeforeOptions {
+                body: Expr::Value(v),
+                link_symbol: None,
+            }
+            | CreateFunctionBody::AsAfterOptions(Expr::Value(v)),
+        ) => match &v.value {
+            Value::DollarQuotedString(s) => Some(s.value.clone()),
+            Value::SingleQuotedString(s) => Some(s.clone()),
+            _ => return Err(Error::new(format!("{name}: its body is not read"))),
+        },
+        Some(_) => return Err(Error::new(format!("{name}: its body is not read"))),
+    };
+    match (&language, &sql) {
+        (None, None) => return Err(Error::new("no language specified")),
+        (Some(l), None) if l != "sql" => {
+            return Err(Error::new(format!("{name}: only LANGUAGE sql is read")))
+        }
+        _ => {}
+    }
+    let (mut args, mut arg_names, mut defaults) = (Vec::new(), Vec::new(), Vec::new());
     for a in f.args.as_deref().unwrap_or(&[]) {
-        if a.name.is_some() {
-            return Err(Error::new(format!("{name}: named arguments are not read")));
+        let ty = crate::read::own::parameter_type(held(&a.data_type)?);
+        match &a.mode {
+            None | Some(sqlparser::ast::ArgMode::In) => {}
+            Some(m) => {
+                return Err(Error::new(format!(
+                    "{name}: a parameter of mode {m} is not read"
+                )))
+            }
         }
-        if a.mode.is_some() || a.default_expr.is_some() {
-            return Err(Error::new(format!(
-                "{name}: an argument's mode or DEFAULT is not read"
-            )));
+        let named = a.name.as_ref().map(ident);
+        if let Some(n) = &named {
+            if arg_names.iter().flatten().any(|x: &String| x == n) {
+                return Err(Error::new(format!(
+                    "parameter name \"{n}\" used more than once"
+                )));
+            }
         }
-        args.push(held_type(&a.data_type).map_err(|e| Error::new(format!("{name}: {e}")))?);
+        match &a.default_expr {
+            Some(e) => defaults.push(e.clone()),
+            None if !defaults.is_empty() => {
+                return Err(Error::new(
+                    "input parameters after one with a default value must also have defaults",
+                ))
+            }
+            None => {}
+        }
+        args.push(ty);
+        arg_names.push(named);
     }
     if f.temporary
         || f.or_alter
@@ -6958,57 +7250,74 @@ fn function(f: &sqlparser::ast::CreateFunction) -> Result<Function> {
         Some(sqlparser::ast::FunctionParallel::Restricted) => 'r',
         Some(sqlparser::ast::FunctionParallel::Unsafe) | None => 'u',
     };
-    let text = match &f.function_body {
-        Some(
-            CreateFunctionBody::AsBeforeOptions {
-                body: Expr::Value(v),
-                ..
+    if sql.is_some() && quoted.is_some() {
+        return Err(Error::new("duplicate function body specified"));
+    }
+    if sql.is_some() && language.as_deref().is_some_and(|l| l != "sql") {
+        return Err(Error::new(
+            "inline SQL function body only valid for language SQL",
+        ));
+    }
+    // The statement as written, and as read: the string after AS; RETURN's expression, read as a
+    // SELECT of it; or BEGIN ATOMIC's one statement, a RETURN or a SELECT.
+    let (form, statement, selected) = match (sql, quoted) {
+        (None, Some(text)) => (BodyForm::Quoted, text.clone(), text),
+        (Some(SqlBody::Return(text)), None) => {
+            whole_expression(&text)?;
+            let selected = format!("SELECT {text}");
+            (BodyForm::Return, text, selected)
+        }
+        (Some(SqlBody::Atomic(statements)), None) => match statements.as_slice() {
+            [] => {
+                return Err(Error::new(format!(
+                    "return type mismatch in function declared to return {}: Function's final \
+                     statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+                    returns.pg_name()
+                )))
             }
-            | CreateFunctionBody::AsAfterOptions(Expr::Value(v)),
-        ) => match &v.value {
-            Value::DollarQuotedString(s) => s.value.clone(),
-            Value::SingleQuotedString(s) => s.clone(),
-            _ => String::new(),
-        },
-        _ => String::new(),
-    };
-    let bound = crate::grammar::bound(&text);
-    let parsed = crate::read::image::parse_sql(bound.as_deref().unwrap_or(&text))
-        .map_err(|e| Error::new(format!("{name}: its body: {e}")))?;
-    let body = match parsed.as_slice() {
-        [Statement::Query(q)] => match q.body.as_ref() {
-            SetExpr::Select(s)
-                if s.from.is_empty() && s.selection.is_none() && s.projection.len() == 1 =>
-            {
-                match &s.projection[0] {
-                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                        e.clone()
-                    }
-                    _ => {
-                        return Err(Error::new(format!(
-                            "{name}: its body is not one expression"
-                        )))
-                    }
+            [one] => match returned(one) {
+                Some(text) => {
+                    whole_expression(text)?;
+                    (BodyForm::Atomic, one.clone(), format!("SELECT {text}"))
                 }
-            }
+                None => (BodyForm::Atomic, one.clone(), one.clone()),
+            },
             _ => {
                 return Err(Error::new(format!(
-                    "{name}: its body is not one expression"
+                    "{name}: a body of more than one statement is not read"
                 )))
             }
         },
-        _ => return Err(Error::new(format!("{name}: its body is not one SELECT"))),
+        _ => return Err(Error::new("no function body specified")),
+    };
+    let body = body_expression(&name, &selected)?;
+    let source = match form {
+        BodyForm::Quoted => statement.clone(),
+        _ => String::new(),
     };
     Ok(Function {
         name,
         args,
+        arg_names,
+        defaults,
         body,
+        form,
+        statement,
         returns,
         volatility,
         strict,
         parallel,
-        source: text,
+        source,
     })
+}
+
+/// The expression of a RETURN statement, as written after its first word; none for another.
+pub(crate) fn returned(statement: &str) -> Option<&str> {
+    let t = statement.trim_start();
+    let head = t.get(..6)?;
+    let rest = &t[6..];
+    (head.eq_ignore_ascii_case("return") && rest.starts_with(|c: char| c.is_whitespace() || c == '('))
+        .then(|| rest.trim())
 }
 
 /// Reads a DDL a statement at a time. `strict` stops at the first statement refused, as a file's

@@ -418,6 +418,11 @@ fn tree_of(cat: &Cat, handle: &str) -> Result<(Node, u32)> {
             let n = a.expr(raw)?;
             Ok((a.coerce_to_target(n, oid, -1, Context::Assignment, Form::Implicit)?, 0))
         }
+        // A function's DEFAULTs, as one list.
+        "procdefaults" => {
+            let f = function_of(catalog, oid).ok_or_else(bad)?;
+            Ok((Node::List(defaults_of(cat, f)?), 0))
+        }
         // An index's key expressions, as one list, and its predicate.
         "indexprs" | "indpred" => {
             let (exprs, pred, rel) = defs::index_trees(cat, oid)?.ok_or_else(bad)?;
@@ -426,6 +431,49 @@ fn tree_of(cat: &Cat, handle: &str) -> Result<(Node, u32)> {
         }
         _ => Err(bad()),
     }
+}
+
+/// A function of the file by its OID.
+pub(crate) fn function_of(catalog: &Catalog, oid: u32) -> Option<&crate::catalog::Function> {
+    match catalog.oids.object(oid)? {
+        Object::Proc(n, _) => catalog.functions.iter().find(|f| full(&f.name) == *n),
+        _ => None,
+    }
+}
+
+/// A function's DEFAULTs, each read as its CREATE FUNCTION reads it: over no relation, coerced to
+/// its parameter's type by assignment.
+pub(crate) fn defaults_of(cat: &Cat, f: &crate::catalog::Function) -> Result<Vec<Node>> {
+    let a = Analyzer {
+        cat,
+        columns: Vec::new(),
+        value: None,
+        scope: None,
+    };
+    f.defaults
+        .iter()
+        .zip(&f.args[f.required()..])
+        .map(|(e, &ty)| {
+            let target = crate::pgcatalog::type_oid_of(cat.catalog, ty, None);
+            let n = a.expr(e)?;
+            a.coerce_to_target(n, target, -1, Context::Assignment, Form::Implicit)
+        })
+        .collect()
+}
+
+/// An expression printed as deparse_expression prints it over no relation, plain.
+pub(crate) fn plain_text(cat: &Cat, node: &Node) -> Result<String> {
+    let mut p = Printer {
+        cat,
+        paren: false,
+        indent: false,
+        level: 0,
+        buf: String::new(),
+        relations: Vec::new(),
+        q: Default::default(),
+    };
+    p.expr(node, false)?;
+    Ok(p.buf)
 }
 
 /// The tree a stored expression of an object holds, as the parser left it: `attrdef`, `check`,

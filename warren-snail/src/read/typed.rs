@@ -99,7 +99,7 @@ fn arg_of(t: Option<ColumnType>) -> Arg {
 }
 
 /// The name an argument's type is written under in PostgreSQL's errors.
-fn arg_name(t: Option<ColumnType>) -> String {
+pub(super) fn arg_name(t: Option<ColumnType>) -> String {
     match t {
         None => "unknown".into(),
         Some(ColumnType::NumericText(_) | ColumnType::Numeric { .. }) => "numeric".into(),
@@ -787,6 +787,10 @@ impl Typing<'_> {
                 if name == "count" && f.args_star() {
                     return Ok(Some(ColumnType::Int8));
                 }
+                // A function of the file's, its arguments by place or by name.
+                if let Some(t) = super::own::typed(f, &mut |x| self.type_of(x))? {
+                    return Ok(Some(t));
+                }
                 let Some(args) = call_args(f) else {
                     return Ok(None);
                 };
@@ -798,9 +802,6 @@ impl Typing<'_> {
                     for t in &types {
                         written(*t)?;
                     }
-                }
-                if let Some(t) = super::own::typed(f, &types)? {
-                    return Ok(Some(t));
                 }
                 if super::handed::is_handed(f) {
                     if let Some(t) = super::handed::typed(f, &types)? {
@@ -1631,7 +1632,7 @@ fn written(t: Option<ColumnType>) -> Result<()> {
 }
 
 /// A type without its modifier, as PostgreSQL's polymorphic forms match it.
-fn unmodified(ty: ColumnType) -> ColumnType {
+pub(super) fn unmodified(ty: ColumnType) -> ColumnType {
     match super::clock::base(ty) {
         t if t.is_numeric() => NUMERIC,
         ColumnType::Text(Some(_)) => ColumnType::Text(Some(ColumnType::VARCHAR)),

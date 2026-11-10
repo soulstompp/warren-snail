@@ -457,7 +457,7 @@ pub(super) fn reads_standing(catalog: &Catalog, sql: &str) -> bool {
     };
     names(sql)
         || catalog.views.iter().any(|v| names(&v.query))
-        || catalog.functions.iter().any(|f| names(&f.source))
+        || catalog.functions.iter().any(|f| names(&super::own::written_text(f)))
 }
 
 /// Holds where the file's sequences stand, as `stands` gives those the file holds a place of, the

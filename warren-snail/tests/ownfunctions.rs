@@ -415,3 +415,154 @@ fn a_body_more_volatile_than_its_function_says_is_called_every_argument_computed
         &["1|2024-01-02 00:00:00+00", "2|2024-01-03 00:00:00+00"],
     );
 }
+
+/// The four forms of a function's DDL (ledgers/pgcatalog.md, *Part 7*): a body after RETURN and in
+/// BEGIN ATOMIC, a parameter's DEFAULT, named parameters, arrays.
+const FORMS: &str = "CREATE SCHEMA n; \
+     CREATE FUNCTION n.ret(a integer) RETURNS integer LANGUAGE sql RETURN a + 1; \
+     CREATE FUNCTION n.atom(a integer, b integer) RETURNS integer LANGUAGE sql BEGIN ATOMIC SELECT a * b; END; \
+     CREATE FUNCTION n.atom3(a integer) RETURNS integer BEGIN ATOMIC RETURN a + 1; END; \
+     CREATE FUNCTION n.alone(a integer) RETURNS integer STRICT BEGIN ATOMIC SELECT a; END; \
+     CREATE FUNCTION n.cased(a integer) RETURNS text BEGIN ATOMIC SELECT CASE WHEN a > 0 THEN 'up' ELSE 'down' END; END; \
+     CREATE FUNCTION n.dflt(integer, integer DEFAULT 10) RETURNS integer LANGUAGE sql AS 'SELECT $1 + $2'; \
+     CREATE FUNCTION n.named(a integer, b text DEFAULT 'x') RETURNS text LANGUAGE sql AS 'SELECT b || a::text'; \
+     CREATE FUNCTION n.mix(a integer, integer) RETURNS integer RETURN a + $2; \
+     CREATE FUNCTION n.eq(a integer = 5, b integer = 6) RETURNS integer RETURN a * 10 + b; \
+     CREATE FUNCTION n.sd(a integer, b integer DEFAULT NULL) RETURNS integer LANGUAGE sql STRICT AS 'SELECT $1 + coalesce($2, 0)'; \
+     CREATE FUNCTION n.calls(a integer) RETURNS text RETURN n.named(b => 'k', a => a); \
+     CREATE FUNCTION n.arr(integer[]) RETURNS integer LANGUAGE sql AS 'SELECT $1[1]'; \
+     CREATE FUNCTION n.arrn(xs text[], i integer) RETURNS text LANGUAGE sql RETURN xs[i]; \
+     CREATE FUNCTION n.d2a(a int[] DEFAULT '{1,2}', b numeric(5,2) DEFAULT 1.5) RETURNS text RETURN a::text || b::text;";
+
+#[test]
+fn a_body_after_return_or_in_begin_atomic_is_called_and_its_file_opens_again() {
+    let mut s = Snail::open(&written("forms-bodies", FORMS)).unwrap();
+    assert_eq!(
+        question(&mut s, "SELECT n.ret(1), n.atom(2, 3), n.atom3(2), n.alone(NULL), n.cased(1), n.cased(-1)").unwrap(),
+        ["2|6|3|NULL|up|down"]
+    );
+    assert_eq!(
+        question(&mut s, "SELECT n.arr(ARRAY[7, 8]), n.arr('{9,10}'), n.arrn(ARRAY['p', 'q'], 2), n.d2a()").unwrap(),
+        ["7|9|q|{1,2}1.5"]
+    );
+}
+
+#[test]
+fn a_call_gives_its_arguments_by_place_then_by_name_and_the_defaults_fill_the_rest() {
+    let mut s = Snail::open(&written("forms-calls", FORMS)).unwrap();
+    assert_eq!(
+        question(
+            &mut s,
+            "SELECT n.dflt(1), n.dflt(1, 2), n.named(5), n.named(b => 'z', a => 1), n.named(a => 2), \
+             n.named(3, b => 'w'), n.named(a := 4), n.named(A => 1), n.eq(), n.eq(b => 1), n.eq(7), \
+             n.sd(1), n.calls(9), n.mix(1, 2)"
+        )
+        .unwrap(),
+        ["11|3|x5|z1|x2|w3|x4|x1|56|51|76|NULL|k9|3"]
+    );
+    for (sql, why) in [
+        ("SELECT n.named(c => 1)", "function n.named(c => integer) does not exist"),
+        ("SELECT n.dflt()", "function n.dflt() does not exist"),
+        ("SELECT n.named(b => 'q')", "function n.named(b => unknown) does not exist"),
+        ("SELECT n.named(1, a => 2)", "function n.named(integer, a => integer) does not exist"),
+        ("SELECT n.dflt(a => 1)", "function n.dflt(a => integer) does not exist"),
+        ("SELECT n.named(a => 1, a => 2)", "argument name \"a\" used more than once"),
+        ("SELECT n.named(a => 1, 2)", "positional argument cannot follow named argument"),
+    ] {
+        assert_eq!(question(&mut s, sql).unwrap_err(), why, "{sql}");
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_default_is_drawn_as_an_argument_and_named_arguments_in_their_parameters_order() {
+    let ddl = "CREATE SCHEMA d; CREATE SEQUENCE d.q; \
+         CREATE FUNCTION d.vd(a integer DEFAULT nextval('d.q')::integer) RETURNS integer RETURN a + a; \
+         CREATE FUNCTION d.twos(a integer, b integer) RETURNS integer LANGUAGE sql STRICT AS 'SELECT coalesce($1, 0) * 10 + coalesce($2, 0)';";
+    let mut w = Snail::open_writing(&written("forms-drawn", ddl)).unwrap();
+    asked(&mut w, "SELECT d.vd()", &["2"]);
+    asked(&mut w, "SELECT d.vd()", &["4"]);
+    asked(
+        &mut w,
+        "SELECT d.twos(b => nextval('d.q')::integer, a => nextval('d.q')::integer)",
+        &["34"],
+    );
+}
+
+#[test]
+fn the_four_forms_stand_in_pg_proc_and_print_as_postgresql_prints_them() {
+    let mut s = Snail::open(&written("forms-catalog", FORMS)).unwrap();
+    let of = |s: &mut Snail, what: &str, name: &str| {
+        question(s, &format!("SELECT {what} FROM pg_proc p WHERE p.proname = '{name}'"))
+            .unwrap()
+            .join(";")
+    };
+    assert_eq!(of(&mut s, "p.proargnames, p.pronargdefaults, p.prosrc", "named"), "{a,b}|1|SELECT b || a::text");
+    assert_eq!(of(&mut s, "p.proargnames, p.pronargdefaults, p.prosrc", "mix"), "{a,\"\"}|0|");
+    assert_eq!(of(&mut s, "p.proargnames, pg_get_expr(p.proargdefaults, 0)", "dflt"), "NULL|10");
+    assert_eq!(of(&mut s, "pg_get_expr(p.proargdefaults, 0)", "eq"), "5, 6");
+    assert_eq!(of(&mut s, "pg_get_expr(p.proargdefaults, 0)", "sd"), "NULL::integer");
+    assert_eq!(of(&mut s, "pg_get_expr(p.proargdefaults, 0)", "d2a"), "'{1,2}'::integer[], 1.5");
+    assert_eq!(
+        of(&mut s, "pg_get_function_arguments(p.oid), pg_get_function_identity_arguments(p.oid), pg_get_function_arg_default(p.oid, 2)", "named"),
+        "a integer, b text DEFAULT 'x'::text|a integer, b text|'x'::text"
+    );
+    assert_eq!(of(&mut s, "pg_get_function_arguments(p.oid)", "d2a"), "a integer[] DEFAULT '{1,2}'::integer[], b numeric DEFAULT 1.5");
+    for (name, body) in [
+        ("ret", "RETURN (a + 1)"),
+        ("atom", "BEGIN ATOMIC\n SELECT (a * b);\nEND"),
+        ("atom3", "BEGIN ATOMIC\n RETURN (a + 1);\nEND"),
+        ("alone", "BEGIN ATOMIC\n SELECT a AS a;\nEND"),
+        ("mix", "RETURN (a + \"\")"),
+        ("calls", "RETURN n.named(b => 'k'::text, a => a)"),
+        ("arrn", "RETURN (xs)[i]"),
+        ("named", "NULL"),
+    ] {
+        assert_eq!(of(&mut s, "pg_get_function_sqlbody(p.oid)", name), body, "{name}");
+    }
+    assert_eq!(
+        of(&mut s, "pg_get_functiondef(p.oid)", "ret"),
+        "CREATE OR REPLACE FUNCTION n.ret(a integer)\n RETURNS integer\n LANGUAGE sql\nRETURN (a + 1)\n"
+    );
+    assert_eq!(
+        question(&mut s, "SELECT count(*) FROM pg_depend d JOIN pg_proc p ON p.oid = d.objid WHERE p.proname = 'calls' AND d.refobjid = 'n.named'::regproc").unwrap(),
+        ["1"]
+    );
+}
+
+#[test]
+fn a_view_calling_by_name_keeps_its_columns_in_the_catalog_s_facts() {
+    let ddl = format!("{FORMS} CREATE VIEW n.v AS SELECT n.named(b => 'z', a => 1) AS x, n.dflt(1) AS y;");
+    let facts = Catalog::parse(&ddl).unwrap().facts();
+    let columns = facts
+        .iter()
+        .find(|f| f.kind == "view" && f.object == "n.v" && f.fact == "columns")
+        .map(|f| f.value.clone());
+    assert_eq!(columns.as_deref(), Some("x,y"));
+}
+
+#[test]
+fn create_function_refuses_the_four_forms_in_postgresql_s_words() {
+    for (f, why) in [
+        ("e1(a integer DEFAULT 1, b integer) RETURNS integer RETURN a", "input parameters after one with a default value must also have defaults"),
+        ("e2(a integer, a integer) RETURNS integer RETURN a", "parameter name \"a\" used more than once"),
+        ("e3(a integer DEFAULT 'x') RETURNS integer RETURN a", "invalid input syntax for type integer: \"x\""),
+        ("e4(a integer DEFAULT true) RETURNS integer RETURN a", "argument of DEFAULT must be type integer, not type boolean"),
+        ("e5(a integer, b integer DEFAULT a) RETURNS integer RETURN a", "column \"a\" does not exist"),
+        ("e6(a integer DEFAULT (SELECT 1)) RETURNS integer RETURN a", "cannot use subquery in DEFAULT expression"),
+        ("e7(a integer DEFAULT count(*)) RETURNS integer RETURN a", "aggregate functions are not allowed in DEFAULT expressions"),
+        ("e8(a integer) RETURNS integer LANGUAGE plpgsql RETURN a", "inline SQL function body only valid for language SQL"),
+        ("e9(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 1' RETURN a", "duplicate function body specified"),
+        ("e10(a integer) RETURNS integer RETURN 'x'::text", "Actual return type is text."),
+        ("e37(a integer DEFAULT generate_series(1, 2)) RETURNS integer RETURN a", "set-returning functions are not allowed in DEFAULT expressions"),
+        ("e11(a integer) RETURNS integer RETURN c", "column \"c\" does not exist"),
+        ("e12(a integer) RETURNS integer BEGIN ATOMIC END", "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING."),
+        ("e14(a integer) RETURNS integer RETURN 'x'", "Actual return type is text."),
+        ("e20(a integer) RETURNS integer RETURN a IMMUTABLE", "syntax error at or near \"IMMUTABLE\""),
+        ("e23(a integer) RETURNS integer AS 'SELECT a + 1'", "no language specified"),
+    ] {
+        let ddl = format!("CREATE SCHEMA r; CREATE FUNCTION r.{f};");
+        let e = Catalog::parse(&ddl).unwrap_err().to_string();
+        assert!(e.contains(why), "{f}: {e}");
+    }
+}

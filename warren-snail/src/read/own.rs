@@ -21,6 +21,10 @@ pub(crate) struct Own {
     /// Its name as the catalog holds it: `s.plus`, or `plus` for one of public.
     name: String,
     args: Vec<ColumnType>,
+    /// Each parameter's name; none where it has none.
+    names: Vec<Option<String>>,
+    /// The DEFAULTs of its last parameters, each typed on its own.
+    defaults: Vec<Defaulted>,
     returns: ColumnType,
     strict: bool,
     volatility: char,
@@ -34,6 +38,20 @@ pub(crate) struct Own {
     held: Props,
     /// Why it is not called, where its body is not read.
     refused: Option<String>,
+}
+
+/// A parameter's DEFAULT: its expression and the types its parts read, read over no row.
+struct Defaulted {
+    expr: Box<Expr>,
+    types: super::typed::Types,
+}
+
+/// Where a parameter's value comes from in one call: the call's argument at its place, or the
+/// parameter's DEFAULT at its place among them.
+#[derive(Clone, Copy, Debug)]
+enum Given {
+    Arg(usize),
+    Default(usize),
 }
 
 /// What an expression holds, as 18.6's planner reads it before it inlines a function.
@@ -92,8 +110,16 @@ pub(crate) fn holding(functions: &[Function], release: u8) -> Holding {
         .iter()
         .map(|f| {
             format!(
-                "{}\u{1}{:?}\u{1}{:?}\u{1}{}{}\u{1}{}",
-                f.name, f.args, f.returns, f.strict, f.volatility, f.source
+                "{}\u{1}{:?}\u{1}{:?}\u{1}{}{}\u{1}{}\u{1}{:?}\u{1}{}\u{1}{:?}",
+                f.name,
+                f.args,
+                f.returns,
+                f.strict,
+                f.volatility,
+                f.statement,
+                f.arg_names,
+                f.defaults.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("\u{3}"),
+                f.form
             )
         })
         .collect::<Vec<_>>()
@@ -135,6 +161,15 @@ fn stub(f: &Function) -> Own {
     Own {
         name: f.name.clone(),
         args: f.args.clone(),
+        names: f.arg_names.clone(),
+        defaults: f
+            .defaults
+            .iter()
+            .map(|e| Defaulted {
+                expr: Box::new(e.clone()),
+                types: Default::default(),
+            })
+            .collect(),
         returns: f.returns,
         strict: f.strict,
         volatility: f.volatility,
@@ -152,7 +187,12 @@ fn stub(f: &Function) -> Own {
 fn unknown_name(body: &Expr, types: &super::typed::Types, release: u8) -> Option<String> {
     let mut why = None;
     let c = carried(release);
+    let mut names_of_calls = std::collections::HashSet::new();
     let _ = sqlparser::ast::visit_expressions(body, |e| {
+        if names_of_calls.contains(&(e as *const Expr)) {
+            return ControlFlow::Continue(());
+        }
+        names_of_calls.extend(argument_names(e));
         let found = match e {
             Expr::Identifier(i) if !(i.quote_style == Some('"') && i.value.starts_with('$')) => {
                 Some(format!("column \"{}\" does not exist", crate::catalog::ident(i)))
@@ -216,26 +256,114 @@ const SYNTAX: &[&str] = &[
     "current_schema",
 ];
 
+/// The parameters a body names, as PostgreSQL's parser finds them in a SQL function's body.
+struct Naming<'a> {
+    function: &'a str,
+    names: &'a [Option<String>],
+    to: &'a dyn Fn(usize) -> Expr,
+    uses: Vec<usize>,
+    beyond: Option<String>,
+    /// For each query the walk is inside, whether it reads a relation.
+    reading: Vec<bool>,
+    /// The names of named arguments met so far, which name a call's parameter, never a value.
+    names_of_calls: std::collections::HashSet<*const Expr>,
+}
+
+/// The names a call gives its named arguments, which an expression's walk meets as expressions.
+fn argument_names(e: &Expr) -> Vec<*const Expr> {
+    match e {
+        Expr::Function(f) => match &f.args {
+            sqlparser::ast::FunctionArguments::List(l) => l
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    sqlparser::ast::FunctionArg::ExprNamed { name, .. } => Some(name as *const Expr),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+impl sqlparser::ast::VisitorMut for Naming<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut sqlparser::ast::Query) -> ControlFlow<()> {
+        let reads = matches!(q.body.as_ref(), sqlparser::ast::SetExpr::Select(s) if !s.from.is_empty());
+        self.reading.push(reads);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &mut sqlparser::ast::Query) -> ControlFlow<()> {
+        self.reading.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if self.names_of_calls.contains(&(e as *const Expr)) {
+            return ControlFlow::Continue(());
+        }
+        self.names_of_calls.extend(argument_names(e));
+        let named = |n: &str| self.names.iter().position(|x| x.as_deref() == Some(n));
+        let at = match e {
+            Expr::Value(v) => match &v.value {
+                sqlparser::ast::Value::Placeholder(p) => {
+                    match p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+                        Some(n) if n >= 1 && n <= self.uses.len() => Some(n - 1),
+                        _ => {
+                            self.beyond.get_or_insert(format!("there is no parameter {p}"));
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            },
+            _ if self.reading.iter().any(|r| *r) => None,
+            Expr::Identifier(i) => named(&crate::catalog::ident(i)),
+            Expr::CompoundIdentifier(parts)
+                if parts.len() == 2 && crate::catalog::ident(&parts[0]) == self.function =>
+            {
+                named(&crate::catalog::ident(&parts[1]))
+            }
+            _ => None,
+        };
+        if let Some(i) = at {
+            self.uses[i] += 1;
+            *e = (self.to)(i + 1);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Each parameter a function's body names, by `$n`, by its name, or by the function's name and its
+/// name, written as `to` writes the n-th; a name inside a subquery that reads a relation is left to
+/// its columns. How often each is named, and the first `$n` past the last parameter.
+pub(crate) fn parameters_named<V: sqlparser::ast::VisitMut>(
+    body: &mut V,
+    function: &str,
+    names: &[Option<String>],
+    to: &dyn Fn(usize) -> Expr,
+) -> (Vec<usize>, Option<String>) {
+    let mut n = Naming {
+        function: function.rsplit('.').next().unwrap_or(function),
+        names,
+        to,
+        uses: vec![0; names.len()],
+        beyond: None,
+        reading: Vec::new(),
+        names_of_calls: Default::default(),
+    };
+    let _ = body.visit(&mut n);
+    (n.uses, n.beyond)
+}
+
 /// A function made ready: its parameters named as columns, its body typed with them.
 fn made(f: &Function, release: u8) -> Own {
     let mut body = Box::new(f.body.clone());
-    let mut uses = vec![0; f.args.len()];
-    let mut beyond = None;
-    let _ = sqlparser::ast::visit_expressions_mut(body.as_mut(), |e| {
-        if let Expr::Value(v) = e {
-            if let sqlparser::ast::Value::Placeholder(p) = &v.value {
-                match p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
-                    Some(n) if n >= 1 && n <= uses.len() => {
-                        uses[n - 1] += 1;
-                        *e = Expr::Identifier(sqlparser::ast::Ident::with_quote('"', p.clone()));
-                    }
-                    _ => {
-                        beyond.get_or_insert(format!("there is no parameter {p}"));
-                    }
-                }
-            }
-        }
-        ControlFlow::<()>::Continue(())
+    let (uses, beyond) = parameters_named(body.as_mut(), &f.name, &f.arg_names, &|n| {
+        Expr::Identifier(sqlparser::ast::Ident::with_quote('"', format!("${n}")))
     });
     let columns: Vec<(Option<String>, String, Option<ColumnType>)> = f
         .args
@@ -254,9 +382,28 @@ fn made(f: &Function, release: u8) -> Own {
         },
     };
     let held = props(&body, &|x| types.get(&(x as *const Expr)).copied(), release);
+    // Each DEFAULT typed over no row, as a call reads it in its argument's place.
+    let mut refused = refused;
+    let defaults = f
+        .defaults
+        .iter()
+        .map(|e| {
+            let expr = Box::new(e.clone());
+            let types = match super::pipeline::typed_on(&expr, &[], release) {
+                Ok(t) => t,
+                Err(err) => {
+                    refused.get_or_insert(err.to_string());
+                    Default::default()
+                }
+            };
+            Defaulted { expr, types }
+        })
+        .collect();
     Own {
         name: f.name.clone(),
         args: f.args.clone(),
+        names: f.arg_names.clone(),
+        defaults,
         returns: f.returns,
         strict: f.strict,
         volatility: f.volatility,
@@ -291,6 +438,43 @@ pub(crate) fn body_type(
         .get(&(own.body.as_ref() as *const Expr))
         .copied()
         .or_else(|| super::pipeline::quoted(body).then_some(ColumnType::Text(None))))
+}
+
+/// The text a function's body and DEFAULTs are written in.
+pub(crate) fn written_text(f: &Function) -> String {
+    let defaults: Vec<String> = f.defaults.iter().map(|d| d.to_string()).collect();
+    format!("{} {}", f.statement, defaults.join(" "))
+}
+
+/// Whether a statement's text names a function of the file whose body or DEFAULTs name text the
+/// test `names` finds, itself or through another function of the file it names.
+pub(crate) fn names_through(catalog: &crate::catalog::Catalog, sql: &str, names: fn(&str) -> bool) -> bool {
+    let bare = |f: &Function| f.name.rsplit('.').next().unwrap_or(&f.name).to_ascii_lowercase();
+    let texts: Vec<(String, String)> = catalog
+        .functions
+        .iter()
+        .map(|f| (bare(f), written_text(f).to_ascii_lowercase()))
+        .collect();
+    let mut found: Vec<bool> = texts.iter().map(|(_, t)| names(t)).collect();
+    loop {
+        let more: Vec<usize> = (0..texts.len())
+            .filter(|&i| !found[i])
+            .filter(|&i| (0..texts.len()).any(|j| found[j] && texts[i].1.contains(&texts[j].0)))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        for i in more {
+            found[i] = true;
+        }
+    }
+    let lower = sql.to_ascii_lowercase();
+    texts.iter().zip(&found).any(|((n, _), f)| *f && lower.contains(n.as_str()))
+}
+
+/// A parameter's type as PostgreSQL holds it: without its modifier.
+pub(crate) fn parameter_type(t: ColumnType) -> ColumnType {
+    super::typed::unmodified(t)
 }
 
 /// Whether the statement under way holds any function of the file's.
@@ -334,45 +518,127 @@ fn built_in_name(name: &str) -> bool {
         .contains(name)
 }
 
-/// Whether a function of the file's takes a call's arguments, as PostgreSQL's implicit casts take
-/// them; refused in its words where it does not.
-fn taken(g: &Own, called: &str, types: &[Option<ColumnType>]) -> Result<()> {
-    if g.args.len() == types.len()
-        && types
-            .iter()
-            .zip(&g.args)
-            .all(|(from, to)| super::handed::implicit(*from, *to).is_some())
-    {
-        return Ok(());
+/// A call's arguments as written: each its name where it is given by one, and its expression.
+type Arguments<'a> = Vec<(Option<String>, &'a Expr)>;
+
+/// A call's arguments as written, each with its name where it is given by name; refused as
+/// PostgreSQL's parser refuses a name given twice or a place given after a name. None where an
+/// argument is written in a form a call of the file's does not read.
+fn written(f: &sqlparser::ast::Function) -> Result<Option<Arguments<'_>>> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let list = match &f.args {
+        FunctionArguments::None => return Ok(Some(Vec::new())),
+        FunctionArguments::List(l) => &l.args,
+        FunctionArguments::Subquery(_) => return Ok(None),
+    };
+    let mut out: Vec<(Option<String>, &Expr)> = Vec::with_capacity(list.len());
+    for a in list {
+        let (name, x) = match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => (None, x),
+            FunctionArg::ExprNamed {
+                name: Expr::Identifier(i),
+                arg: FunctionArgExpr::Expr(x),
+                operator: sqlparser::ast::FunctionArgOperator::RightArrow,
+            }
+            | FunctionArg::Named {
+                name: i,
+                arg: FunctionArgExpr::Expr(x),
+                operator: sqlparser::ast::FunctionArgOperator::RightArrow,
+            } => (Some(crate::catalog::ident(i)), x),
+            _ => return Ok(None),
+        };
+        match &name {
+            Some(n) if out.iter().any(|(m, _)| m.as_deref() == Some(n)) => {
+                return Err(Error::new(format!("argument name \"{n}\" used more than once")))
+            }
+            None if out.iter().any(|(m, _)| m.is_some()) => {
+                return Err(Error::new("positional argument cannot follow named argument"))
+            }
+            _ => {}
+        }
+        out.push((name, x));
     }
-    Err(super::typed::no_form(called, types))
+    Ok(Some(out))
+}
+
+/// Where each of a function's parameters takes its value in a call, as PostgreSQL matches a call
+/// to a function: the arguments by place, then each by its name at a place none took, every
+/// parameter left a DEFAULT, each argument's type one its parameter takes implicitly. None where
+/// the call does not match.
+fn matched(g: &Own, written: &[(Option<String>, Option<ColumnType>)]) -> Option<Vec<Given>> {
+    if written.len() > g.args.len() {
+        return None;
+    }
+    let mut slots: Vec<Option<Given>> = vec![None; g.args.len()];
+    for (i, (name, _)) in written.iter().enumerate() {
+        let at = match name {
+            None => i,
+            Some(n) => g.names.iter().position(|x| x.as_deref() == Some(n.as_str()))?,
+        };
+        if slots[at].is_some() {
+            return None;
+        }
+        slots[at] = Some(Given::Arg(i));
+    }
+    let required = g.args.len() - g.defaults.len();
+    let slots = slots
+        .into_iter()
+        .enumerate()
+        .map(|(at, s)| s.or_else(|| (at >= required).then(|| Given::Default(at - required))))
+        .collect::<Option<Vec<Given>>>()?;
+    let fits = slots.iter().zip(&g.args).all(|(s, to)| match s {
+        Given::Arg(i) => super::handed::implicit(written[*i].1, *to).is_some(),
+        Given::Default(_) => true,
+    });
+    fits.then_some(slots)
+}
+
+/// `function f(a, b => c) does not exist`, each argument by its type, a named one after its name
+/// as written.
+fn no_form(called: &str, written: &[(Option<String>, Option<ColumnType>)]) -> Error {
+    let shown: Vec<String> = written
+        .iter()
+        .map(|(n, t)| match n {
+            Some(n) => format!("{n} => {}", super::typed::arg_name(*t)),
+            None => super::typed::arg_name(*t),
+        })
+        .collect();
+    Error::new(format!("function {called}({}) does not exist", shown.join(", ")))
 }
 
 /// The type a call of a function of the file's returns, read before any row; none where the call
 /// names none.
 pub(super) fn typed(
     f: &sqlparser::ast::Function,
-    types: &[Option<ColumnType>],
+    type_of: &mut dyn FnMut(&Expr) -> Result<Option<ColumnType>>,
 ) -> Result<Option<ColumnType>> {
     if !holds_any() {
         return Ok(None);
     }
     let called = crate::catalog::object_name(&f.name);
-    let Some(g) = found(&called) else {
-        // A bare name only a function of the file's outside public has: off the search path.
-        let elsewhere = !called.contains('.')
-            && !built_in_name(&called)
-            && OWN.with(|o| {
-                o.borrow()
-                    .iter()
-                    .any(|g| g.name.rsplit('.').next() == Some(called.as_str()))
-            });
-        if elsewhere {
-            return Err(super::typed::no_form(&called, types));
-        }
+    let g = found(&called);
+    // A bare name only a function of the file's outside public has: off the search path.
+    let elsewhere = g.is_none()
+        && !called.contains('.')
+        && !built_in_name(&called)
+        && OWN.with(|o| {
+            o.borrow()
+                .iter()
+                .any(|g| g.name.rsplit('.').next() == Some(called.as_str()))
+        });
+    if g.is_none() && !elsewhere {
         return Ok(None);
+    }
+    let Some(args) = written(f)? else {
+        return Err(Error::new(format!("{f}: its arguments are not read")));
     };
-    taken(&g, &called, types)?;
+    let mut typed = Vec::with_capacity(args.len());
+    for (name, x) in &args {
+        typed.push((name.clone(), type_of(x)?));
+    }
+    let Some(g) = g.filter(|g| matched(g, &typed).is_some()) else {
+        return Err(no_form(&called, &typed));
+    };
     if f.over.is_some() {
         return Err(Error::new(format!(
             "OVER specified, but {called} is not a window function nor an aggregate function"
@@ -431,7 +697,6 @@ pub(crate) fn calls(catalog: &crate::catalog::Catalog, q: &sqlparser::ast::Query
 /// A call's value on a row; none where the call names no function of the file's.
 pub(super) fn call(
     f: &sqlparser::ast::Function,
-    args: &[&Expr],
     row: &[Value],
     frame: &Frame,
     computed: &Computed,
@@ -447,22 +712,62 @@ pub(super) fn call(
         return Err(Error::new(format!("{called}: {why}")));
     }
     let _deeper = deeper()?;
-    let types: Vec<Option<ColumnType>> = args.iter().map(|x| frame.type_of(x)).collect();
-    taken(&g, &called, &types)?;
-    let ev = |x: &Expr| super::pipeline::eval(x, row, frame, computed);
-    let fit = |i: usize, v: Value| super::handed::fitted(v, g.args[i], super::pipeline::quoted(args[i]));
+    let Some(args) = written(f)? else {
+        return Err(Error::new(format!("{f}: its arguments are not read")));
+    };
+    let typed: Vec<(Option<String>, Option<ColumnType>)> =
+        args.iter().map(|(n, x)| (n.clone(), frame.type_of(x))).collect();
+    let Some(slots) = matched(&g, &typed) else {
+        return Err(no_form(&called, &typed));
+    };
+    // Each parameter's expression, read on the call's row where the call gives it, or its DEFAULT
+    // read over no row.
+    let casings = Casings::default();
+    let frames: Vec<Frame> = g
+        .defaults
+        .iter()
+        .map(|d| Frame {
+            columns: Vec::new(),
+            params: &[],
+            release: frame.release,
+            casings: &casings,
+            types: &d.types,
+            now: frame.now,
+            subqueries: None,
+        })
+        .collect();
+    let expr_at = |at: usize| -> &Expr {
+        match slots[at] {
+            Given::Arg(i) => args[i].1,
+            Given::Default(k) => &g.defaults[k].expr,
+        }
+    };
+    let ev = |at: usize| match slots[at] {
+        Given::Arg(i) => super::pipeline::eval(args[i].1, row, frame, computed),
+        Given::Default(k) => super::pipeline::eval(&g.defaults[k].expr, &[], &frames[k], computed),
+    };
+    let fit = |at: usize, v: Value| {
+        super::handed::fitted(v, g.args[at], super::pipeline::quoted(expr_at(at)))
+    };
+    let props_at = |at: usize| match slots[at] {
+        Given::Arg(i) => props(args[i].1, &|x| frame.type_of(x), frame.release),
+        Given::Default(k) => {
+            let d = &g.defaults[k];
+            props(&d.expr, &|x| d.types.get(&(x as *const Expr)).copied(), frame.release)
+        }
+    };
     let inlined = inlined(&g)
-        && args.iter().zip(&g.uses).all(|(a, &u)| {
-            u <= 1 || {
-                let p = props(a, &|x| frame.type_of(x), frame.release);
+        && (0..slots.len()).all(|at| {
+            g.uses[at] <= 1 || {
+                let p = props_at(at);
                 !p.sublink && p.volatility < 2 && p.cost <= 10.0
             }
         });
-    let given: RefCell<Vec<Option<Value>>> = RefCell::new(vec![None; args.len()]);
+    let given: RefCell<Vec<Option<Value>>> = RefCell::new(vec![None; slots.len()]);
     if !inlined {
-        for (i, a) in args.iter().enumerate() {
-            let v = fit(i, ev(a)?)?;
-            given.borrow_mut()[i] = Some(v);
+        for at in 0..slots.len() {
+            let v = fit(at, ev(at)?)?;
+            given.borrow_mut()[at] = Some(v);
         }
         if g.strict && given.borrow().iter().any(|v| matches!(v, Some(Value::Null))) {
             return Ok(Some(Value::Null));
@@ -476,13 +781,13 @@ pub(super) fn call(
             return None;
         }
         let at = i.value.strip_prefix('$')?.parse::<usize>().ok()?.checked_sub(1)?;
-        if at >= args.len() {
+        if at >= slots.len() {
             return None;
         }
         if let Some(v) = given.borrow()[at].clone() {
             return Some(Ok(v));
         }
-        let v = ev(args[at]).and_then(|v| fit(at, v));
+        let v = ev(at).and_then(|v| fit(at, v));
         if let Ok(v) = &v {
             given.borrow_mut()[at] = Some(v.clone());
         }
@@ -637,6 +942,14 @@ fn carried(release: u8) -> Arc<Carried> {
             })
         })
         .clone()
+}
+
+/// Whether every function of a name the release's catalog holds returns a set.
+pub(crate) fn returns_set(name: &str, release: u8) -> bool {
+    carried(release)
+        .by_name
+        .get(name)
+        .is_some_and(|all| !all.is_empty() && all.iter().all(|p| p.retset))
 }
 
 /// A type's OID under a release, where it is a built-in one.
@@ -904,6 +1217,10 @@ fn walk(e: &Expr, type_of: &dyn Fn(&Expr) -> Option<ColumnType>, release: u8, c:
                         | sqlparser::ast::FunctionArg::Named {
                             arg: sqlparser::ast::FunctionArgExpr::Expr(x),
                             ..
+                        }
+                        | sqlparser::ast::FunctionArg::ExprNamed {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(x),
+                            ..
                         } => Some(x),
                         _ => None,
                     })
@@ -917,6 +1234,10 @@ fn walk(e: &Expr, type_of: &dyn Fn(&Expr) -> Option<ColumnType>, release: u8, c:
                     ..Props::default()
                 });
             } else if let Some(g) = found(&called) {
+                // The DEFAULTs a call leaves to the function are its arguments too.
+                for d in g.defaults.iter().skip(args.len().saturating_sub(g.args.len() - g.defaults.len())) {
+                    out.with(props(&d.expr, &|x| d.types.get(&(x as *const Expr)).copied(), release));
+                }
                 // Another of the file's: as its planner reads it once it is inlined, or its call.
                 if inlined(&g) {
                     out.with(g.held);

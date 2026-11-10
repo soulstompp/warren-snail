@@ -40,26 +40,7 @@ struct Proc {
 
 /// The elements of an array as COPY's text writes it, `{a,"b c"}`.
 fn elements(s: &str) -> Vec<String> {
-    let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let (mut quoted, mut escaped) = (false, false);
-    for c in inner.chars() {
-        match c {
-            _ if escaped => {
-                cur.push(c);
-                escaped = false;
-            }
-            '\\' => escaped = true,
-            '"' => quoted = !quoted,
-            ',' if !quoted => out.push(std::mem::take(&mut cur)),
-            _ => cur.push(c),
-        }
-    }
-    if !inner.is_empty() {
-        out.push(cur);
-    }
-    out
+    cat::text_elements(s)
 }
 
 fn proc_of(cat: &Cat, oid: u32) -> Option<Proc> {
@@ -126,6 +107,9 @@ fn direct_arguments(cat: &Cat, p: &Proc) -> Option<usize> {
 /// print_function_arguments: the arguments, those of `TABLE` alone where `table`, each default
 /// where `defaults`; and how many were printed.
 fn arguments(cat: &Cat, p: &Proc, table: bool, defaults: bool) -> Result<(String, usize)> {
+    if defaults && p.nargdefaults > 0 && !p.built_in {
+        return own_arguments(cat, p);
+    }
     if defaults && p.nargdefaults > 0 {
         let text = carried(cat, &format!("fnargs {}", p.oid)).ok_or_else(|| {
             Error::new(format!(
@@ -176,6 +160,133 @@ fn arguments(cat: &Cat, p: &Proc, table: bool, defaults: bool) -> Result<(String
         i += 1;
     }
     Ok((out, printed))
+}
+
+/// print_function_arguments of a function of the file's: each parameter, its name where it has
+/// one, and the DEFAULTs of the last ones, printed from their trees.
+fn own_arguments(cat: &Cat, p: &Proc) -> Result<(String, usize)> {
+    let texts = own_defaults(cat, p)?;
+    let lack = p.argtypes.len().saturating_sub(texts.len());
+    let mut out = Vec::with_capacity(p.argtypes.len());
+    for (i, &t) in p.argtypes.iter().enumerate() {
+        let mut s = String::new();
+        if let Some(n) = p.argnames.as_ref().and_then(|n| n.get(i)).filter(|n| !n.is_empty()) {
+            s.push_str(&format!("{} ", quote(n)));
+        }
+        s.push_str(&format_type_be(cat, t));
+        if i >= lack {
+            s.push_str(&format!(" DEFAULT {}", texts[i - lack]));
+        }
+        out.push(s);
+    }
+    let n = out.len();
+    Ok((out.join(", "), n))
+}
+
+/// A function of the file's DEFAULTs, each as deparse_expression prints it.
+fn own_defaults(cat: &Cat, p: &Proc) -> Result<Vec<String>> {
+    let Some(f) = super::function_of(cat.catalog, p.oid) else {
+        return Ok(Vec::new());
+    };
+    super::defaults_of(cat, f)?
+        .iter()
+        .map(|n| super::plain_text(cat, n))
+        .collect()
+}
+
+/// A function of the file's body in SQL's own words read as its CREATE FUNCTION reads it: its one
+/// statement over the parameters of the types it declares, a parameter named by its name read as
+/// `$n`, and a select list's column keeping the name its words give it; a RETURN's one target
+/// unnamed.
+fn body_query(cat: &Cat, f: &crate::catalog::Function) -> Result<super::query::Query> {
+    use sqlparser::ast as A;
+    let (text, is_return) = match f.form {
+        crate::catalog::BodyForm::Return => (format!("SELECT {}", f.statement), true),
+        _ => match crate::ddl::returned(&f.statement) {
+            Some(e) => (format!("SELECT {e}"), true),
+            None => (f.statement.clone(), false),
+        },
+    };
+    let spelled = crate::read::spelled::spelled(&text)?;
+    let parsed = crate::read::image::parse_sql(&spelled)?;
+    let [A::Statement::Query(q)] = parsed.as_slice() else {
+        return Err(Error::new(format!("{}'s body is not one question", f.name)));
+    };
+    let mut q = (**q).clone();
+    if !is_return {
+        if let A::SetExpr::Select(s) = q.body.as_mut() {
+            for item in &mut s.projection {
+                if let A::SelectItem::UnnamedExpr(e) = item {
+                    let (name, _) = super::query::figure(cat, e, None);
+                    if name != "?column?" {
+                        *item = A::SelectItem::ExprWithAlias {
+                            expr: e.clone(),
+                            alias: A::Ident::with_quote('"', name),
+                        };
+                    }
+                }
+            }
+        }
+    }
+    crate::read::own::parameters_named(&mut q, &f.name, &f.arg_names, &|n| {
+        A::Expr::Value(A::Value::Placeholder(format!("${n}")).with_empty_span())
+    });
+    let types = f
+        .args
+        .iter()
+        .map(|&t| crate::pgcatalog::type_oid_of(cat.catalog, t, None))
+        .collect();
+    let _declared = super::params::declared(types);
+    let mut query = super::query::analyze(cat, &q, None, true)?;
+    if is_return {
+        query.is_return = true;
+        for t in &mut query.targets {
+            t.name = None;
+        }
+    }
+    Ok(query)
+}
+
+/// print_function_sqlbody of a function of the file's: RETURN and its expression, or BEGIN ATOMIC,
+/// its statement and END; none for a body written as a string.
+fn own_sqlbody(cat: &Cat, p: &Proc) -> Result<Option<String>> {
+    let Some(f) = super::function_of(cat.catalog, p.oid) else {
+        return Ok(None);
+    };
+    if f.form == crate::catalog::BodyForm::Quoted {
+        return Ok(None);
+    }
+    let atomic = f.form == crate::catalog::BodyForm::Atomic;
+    let q = std::rc::Rc::new(body_query(cat, f)?);
+    let mut printer = Printer {
+        cat,
+        paren: false,
+        indent: atomic,
+        level: 0,
+        buf: String::new(),
+        relations: Vec::new(),
+        q: super::viewdef::Ctx {
+            function: Some(std::rc::Rc::new((p.name.clone(), p.argnames.clone()))),
+            ..Default::default()
+        },
+    };
+    if atomic {
+        printer.buf.push_str("BEGIN ATOMIC\n");
+    }
+    printer.query_def(q, None, false, if atomic { 1 } else { 0 })?;
+    if atomic {
+        printer.buf.push_str(";\nEND");
+    }
+    Ok(Some(printer.buf))
+}
+
+/// The tree of a function of the file's body, read as `body_query` reads it: what pg_depend
+/// records the function depends on.
+pub(crate) fn own_body(cat: &Cat, f: &crate::catalog::Function) -> Result<Option<super::query::Query>> {
+    match f.form {
+        crate::catalog::BodyForm::Quoted => Ok(None),
+        _ => body_query(cat, f).map(Some),
+    }
 }
 
 /// print_function_rettype.
@@ -289,6 +400,13 @@ fn functiondef(cat: &Cat, p: &Proc) -> Result<String> {
     if buf.len() != before {
         buf.push('\n');
     }
+    if !p.built_in && p.lang == 14 {
+        if let Some(body) = own_sqlbody(cat, p)? {
+            buf.push_str(&body);
+            buf.push('\n');
+            return Ok(buf);
+        }
+    }
     if p.lang == 14 && p.src.is_empty() {
         return Err(Error::new(format!("{}'s SQL body is a parse tree the snail does not carry", p.name)));
     }
@@ -333,7 +451,7 @@ pub(crate) fn printed(cat: &Cat, name: &str, oid: u32, nth: Option<i64>) -> Resu
             if p.built_in {
                 carried(cat, &format!("fnbody {}", p.oid))
             } else {
-                None
+                own_sqlbody(cat, &p)?
             }
         }
         "pg_get_function_arg_default" => {
@@ -345,7 +463,9 @@ pub(crate) fn printed(cat: &Cat, name: &str, oid: u32, nth: Option<i64>) -> Resu
             } else if p.built_in {
                 carried(cat, &format!("fndefault {} {n}", p.oid))
             } else {
-                None
+                let texts = own_defaults(cat, &p)?;
+                let lack = types.len().saturating_sub(texts.len());
+                (n as usize > lack).then(|| texts[n as usize - lack - 1].clone())
             }
         }
         _ => None,

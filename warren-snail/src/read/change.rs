@@ -2280,9 +2280,12 @@ impl Snail {
         self.draw_upto(s, n)
     }
 
-    /// The runs of a statement whose text names the sequence functions; none for any other.
+    /// The runs of a statement whose text names the sequence functions, itself or through a
+    /// function of the file it calls; none for any other.
     pub(super) fn sequence_runs(&self, sql: &str) -> Result<Option<Runs>> {
-        if !super::sequences::names(sql) {
+        if !super::sequences::names(sql)
+            && !super::own::names_through(&self.catalog, sql, super::sequences::names)
+        {
             return Ok(None);
         }
         Ok(Some(Runs {

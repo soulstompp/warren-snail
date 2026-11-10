@@ -40,8 +40,17 @@ fn written_bang(sql: &str, t: &TokenWithSpan) -> bool {
 
 /// A statement's tokens, `*` and the comparison written against it one operator, as PostgreSQL's
 /// lexer reads them. sqlparser reads `!=` as `<>`, and `*!=` is no operator: it stays two tokens.
+/// `:=`, which PostgreSQL's grammar reads only between an argument's name and its value, is read
+/// as `=>`, the spelling sqlparser reads there.
 pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, TokenizerError> {
-    let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location()?;
+    let mut tokens = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location()?;
+    if sql.contains(":=") {
+        for t in &mut tokens {
+            if t.token == Token::Assignment {
+                t.token = Token::RArrow;
+            }
+        }
+    }
     if !names_an_operator(sql) {
         return Ok(tokens);
     }

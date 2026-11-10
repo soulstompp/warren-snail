@@ -580,9 +580,31 @@ impl Printer<'_, '_> {
                 }
             }
             N::List(items) => self.list(items, implicit)?,
-            N::Param { n, .. } => self.push(&format!("${n}")),
+            N::Param { n, .. } => self.parameter(*n),
+            N::Named { name, arg, .. } => {
+                self.push(&format!("{} => ", quote(name)));
+                self.expr(arg, implicit)?;
+            }
         }
         Ok(())
+    }
+
+    /// get_parameter: `$n`, or in a SQL function's body the parameter's name where proargnames
+    /// gives one, qualified by the function's name where a query around it reads a relation.
+    fn parameter(&mut self, n: usize) {
+        let named = self.q.function.as_ref().and_then(|f| {
+            let name = f.1.as_ref()?.get(n.checked_sub(1)?)?;
+            Some((f.0.clone(), name.clone()))
+        });
+        match named {
+            Some((function, name)) => {
+                if self.q.ns.iter().any(|d| !d.names.is_empty()) {
+                    self.push(&format!("{}.", quote(&function)));
+                }
+                self.push(&quote(&name));
+            }
+            None => self.push(&format!("${n}")),
+        }
     }
 
     fn list(&mut self, items: &[Node], implicit: bool) -> Result<()> {

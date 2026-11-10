@@ -47,6 +47,9 @@ pub(crate) struct Ctx {
     pub in_group_by: bool,
     pub var_in_order_by: bool,
     pub wrap: i32,
+    /// The SQL function whose body is printed, the outermost namespace: its name and its
+    /// parameters' names as proargnames holds them, none where it holds none.
+    pub function: Option<Rc<(String, Option<Vec<String>>)>>,
 }
 
 fn expand_to(c: &mut Colinfo, n: usize) {
@@ -364,7 +367,8 @@ impl Printer<'_, '_> {
     /// get_query_def: a query level printed under the levels around it.
     pub(crate) fn query_def(&mut self, q: Rc<Query>, result: Option<Rc<Vec<String>>>, visible: bool, start: i32) -> Result<()> {
         let parents = self.q.ns.clone();
-        let varprefix = !parents.is_empty() || q.rtable.len() != 1;
+        // A function's body stands under the function's namespace, as under a parent's.
+        let varprefix = !parents.is_empty() || self.q.function.is_some() || q.rtable.len() != 1;
         let dpns = Rc::new(Dpns::of(q.clone(), &parents));
         let mut ns = vec![dpns];
         ns.extend(parents);
@@ -377,6 +381,7 @@ impl Printer<'_, '_> {
             in_group_by: false,
             var_in_order_by: false,
             wrap: self.q.wrap,
+            function: self.q.function.clone(),
         };
         let saved = std::mem::replace(&mut self.q, ctx);
         let level = std::mem::replace(&mut self.level, start);
@@ -528,7 +533,7 @@ impl Printer<'_, '_> {
         if let Some(rows) = self.simple_values(q) {
             return self.values(&rows);
         }
-        self.push("SELECT");
+        self.push(if q.is_return { "RETURN" } else { "SELECT" });
         if q.distinct {
             self.push(" DISTINCT");
         }

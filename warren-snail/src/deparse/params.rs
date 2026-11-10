@@ -18,11 +18,39 @@ thread_local! {
     /// not met yet, unknown for one met and not yet settled; none while no statement's parameters
     /// are being typed.
     static PARAMS: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
+    /// The types a SQL function's body reads its parameters as, while the body is being read.
+    static DECLARED: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
+}
+
+/// A SQL function's parameters, of the types it declares, while its body is read; those before
+/// come back where it is dropped.
+pub(crate) struct Declared(Option<Vec<u32>>);
+
+pub(crate) fn declared(types: Vec<u32>) -> Declared {
+    Declared(DECLARED.with(|d| d.replace(Some(types))))
+}
+
+impl Drop for Declared {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        DECLARED.with(|d| *d.borrow_mut() = before);
+    }
 }
 
 /// A reference to `$n`, as variable_paramref_hook makes it: a parameter of the type settled for
-/// it so far. None where no statement's parameters are being typed.
+/// it so far, or as sql_fn_param_ref makes it in a SQL function's body, of its declared type. None
+/// where no statement's parameters are being typed.
 pub(crate) fn reference(p: &str) -> Option<Result<Node>> {
+    if let Some(found) = DECLARED.with(|d| {
+        let d = d.borrow();
+        let types = d.as_ref()?;
+        Some(match p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+            Some(n) if (1..=types.len()).contains(&n) => Ok(Node::Param { n, ty: types[n - 1] }),
+            _ => Err(Error::new(format!("there is no parameter {p}"))),
+        })
+    }) {
+        return Some(found);
+    }
     PARAMS.with(|ps| {
         let mut ps = ps.borrow_mut();
         let slots = ps.as_mut()?;

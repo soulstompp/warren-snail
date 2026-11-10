@@ -2051,13 +2051,33 @@ pub struct View {
     pub check_option: Option<&'static str>,
 }
 
+/// How a function's body is written: a string after AS, which pg_proc's prosrc holds, or in SQL's
+/// own words, RETURN or BEGIN ATOMIC, which its prosqlbody holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BodyForm {
+    Quoted,
+    Return,
+    Atomic,
+}
+
 /// A function written in SQL whose body is one expression over its arguments.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Function {
     pub name: String,
     pub args: Vec<ColumnType>,
+    /// Each parameter's name as its DDL gives it, folded as an identifier is; none where it has
+    /// none.
+    pub arg_names: Vec<Option<String>>,
+    /// The DEFAULTs of its last parameters, as written, in their order.
+    pub defaults: Vec<Expr>,
     pub body: Expr,
+    /// How its body is written.
+    pub form: BodyForm,
+    /// Its body's one statement as written: the string after AS, `SELECT` and the expression after
+    /// RETURN, or the statement inside BEGIN ATOMIC.
+    pub statement: String,
     /// What it returns, as RETURNS declares it.
     pub returns: ColumnType,
     /// How its answer may change, as pg_proc's provolatile says it: i, s or v.
@@ -2066,8 +2086,15 @@ pub struct Function {
     pub strict: bool,
     /// Whether it may run in a parallel worker, as pg_proc's proparallel says it: s, r or u.
     pub parallel: char,
-    /// Its body's text as written, which pg_proc's prosrc holds.
+    /// The string after AS, which pg_proc's prosrc holds; empty for a body in SQL's own words.
     pub source: String,
+}
+
+impl Function {
+    /// The number of its parameters that have no DEFAULT.
+    pub fn required(&self) -> usize {
+        self.args.len() - self.defaults.len()
+    }
 }
 
 #[derive(Clone, Debug)]

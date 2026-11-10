@@ -285,7 +285,8 @@ impl<'c, 'a> Refs<'c, 'a> {
             | N::NullTest { arg, .. }
             | N::BoolTest { arg, .. }
             | N::Collate { arg, .. }
-            | N::Field { arg, .. } => self.node(arg),
+            | N::Field { arg, .. }
+            | N::Named { arg, .. } => self.node(arg),
             N::Case { arg, whens, default, .. } => {
                 if let Some(a) = arg {
                     self.node(a);

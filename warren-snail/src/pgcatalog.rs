@@ -395,6 +395,24 @@ fn t(b: bool) -> String {
     if b { "t" } else { "f" }.to_string()
 }
 
+/// A one-dimensional text array as its output writes it: an element quoted where it is empty,
+/// spelled NULL, or holds a brace, a comma, a quote, a backslash or white space.
+fn text_array(items: &[String]) -> String {
+    let each: Vec<String> = items
+        .iter()
+        .map(|s| {
+            let quoted = s.is_empty()
+                || s.eq_ignore_ascii_case("null")
+                || s.chars().any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_ascii_whitespace());
+            match quoted {
+                true => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+                false => s.clone(),
+            }
+        })
+        .collect();
+    format!("{{{}}}", each.join(","))
+}
+
 /// The functions a constraint's internal triggers call, by their OIDs, the same in every release.
 const UNIQUE_KEY_RECHECK: u32 = 1250;
 const RI_FKEY_CHECK_INS: u32 = 1644;
@@ -2090,7 +2108,27 @@ impl<'a> File<'a> {
                 Addr::of(d::TYPE, self.facts(f.returns, None).oid),
             ];
             refs.extend(f.args.iter().map(|&a| Addr::of(d::TYPE, self.facts(a, None).oid)));
-            out.many(p, refs, 'n');
+            // What a body in SQL's own words and its DEFAULTs name: through 18 each recorded on its
+            // own after the rest, from 19 gathered with the rest and recorded once.
+            let body = match crate::deparse::funcs::own_body(&cat, f) {
+                Ok(Some(q)) => d::of_query(&cat, &q),
+                _ => Vec::new(),
+            };
+            let defaults = match f.defaults.is_empty() {
+                true => Vec::new(),
+                false => crate::deparse::defaults_of(&cat, f)
+                    .map(|nodes| d::of_expr(&cat, &crate::deparse::analyze::Node::List(nodes)))
+                    .unwrap_or_default(),
+            };
+            if self.release >= 19 {
+                refs.extend(body);
+                refs.extend(defaults);
+                out.many(p, refs, 'n');
+            } else {
+                out.many(p, refs, 'n');
+                out.many(p, body, 'n');
+                out.many(p, defaults, 'n');
+            }
         }
         for c in &self.catalog.collations {
             let n = full(&c.name);
@@ -2248,8 +2286,9 @@ impl<'a> File<'a> {
                 .map(|&a| self.facts(a, None).oid.to_string())
                 .collect();
             let key = f.args.iter().map(|t| t.pg_name()).collect::<Vec<_>>().join(",");
-            out.push(row(&[
-                ("oid", proc_oid(&n, &key).to_string()),
+            let oid = proc_oid(&n, &key);
+            let mut fields = vec![
+                ("oid", oid.to_string()),
                 ("proname", own.to_string()),
                 ("pronamespace", self.namespace(schema).to_string()),
                 ("proowner", "10".into()),
@@ -2266,11 +2305,24 @@ impl<'a> File<'a> {
                 ("provolatile", f.volatility.to_string()),
                 ("proparallel", f.parallel.to_string()),
                 ("pronargs", f.args.len().to_string()),
-                ("pronargdefaults", "0".into()),
+                ("pronargdefaults", f.defaults.len().to_string()),
                 ("prorettype", self.facts(f.returns, None).oid.to_string()),
                 ("proargtypes", args.join(" ")),
                 ("prosrc", f.source.clone()),
-            ]));
+            ];
+            // Every parameter's name where any has one, an empty one for each that has none.
+            if f.arg_names.iter().any(Option::is_some) {
+                let names: Vec<String> = f.arg_names.iter().map(|n| n.clone().unwrap_or_default()).collect();
+                fields.push(("proargnames", text_array(&names)));
+            }
+            // The DEFAULTs and a body in SQL's own words are parse trees, each named by its object.
+            if !f.defaults.is_empty() {
+                fields.push(("proargdefaults", crate::deparse::tree_handle("procdefaults", oid, 0)));
+            }
+            if f.form != crate::catalog::BodyForm::Quoted {
+                fields.push(("prosqlbody", crate::deparse::tree_handle("procbody", oid, 0)));
+            }
+            out.push(row(&fields));
         }
         // Each range's constructors, as DefineRange makes them: the range's of two bounds and of two
         // and their inclusivity, the multirange's of none, of one range and of any number.

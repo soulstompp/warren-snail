@@ -1186,7 +1186,7 @@ const AGGREGATES: [&str; 37] = [
 ];
 
 /// Whether a name is an aggregate a step folds.
-pub(super) fn is_aggregate(name: &str) -> bool {
+pub(crate) fn is_aggregate(name: &str) -> bool {
     AGGREGATES.contains(&name) || super::json::AGGREGATES.contains(&name)
         || super::handed::is_aggregate(name)
 }
@@ -1320,7 +1320,7 @@ const SET_RETURNING: [&str; 12] = [
 ];
 
 /// Whether a name is a set-returning function a step's select list reads.
-pub(super) fn is_set_returning(name: &str) -> bool {
+pub(crate) fn is_set_returning(name: &str) -> bool {
     SET_RETURNING.contains(&name)
         || super::json::SETS.contains(&name)
         || super::tsearch::SETS.contains(&name)
@@ -4615,12 +4615,13 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                         .unwrap_or(Value::Null),
                 );
             }
+            // A function of the file's, its arguments by place or by name.
+            if let Some(v) = super::own::call(f, row, frame, computed)? {
+                return Ok(v);
+            }
             let a = args(f)?;
             if let ("record_image_eq" | "record_image_ne", [x, y]) = (name.as_str(), a.as_slice()) {
                 return super::image::records_compared(name == "record_image_eq", ev(x)?, ev(y)?);
-            }
-            if let Some(v) = super::own::call(f, &a, row, frame, computed)? {
-                return Ok(v);
             }
             if super::handed::is_handed(f) {
                 let given = a

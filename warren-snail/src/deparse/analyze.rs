@@ -206,6 +206,11 @@ pub(crate) enum Node {
         n: usize,
         ty: u32,
     },
+    /// An argument a call gives by name, `name => arg`.
+    Named {
+        name: String,
+        arg: Box<Node>,
+    },
 }
 
 impl Node {
@@ -213,6 +218,7 @@ impl Node {
     pub(crate) fn ty(&self) -> u32 {
         use Node as N;
         match self {
+            N::Named { arg, .. } => arg.ty(),
             N::Var { ty, .. }
             | N::DomainValue { ty, .. }
             | N::Const { ty, .. }
@@ -356,7 +362,8 @@ impl Node {
             | N::NullTest { arg, .. }
             | N::BoolTest { arg, .. }
             | N::Collate { arg, .. }
-            | N::Field { arg, .. } => arg.walk(f),
+            | N::Field { arg, .. }
+            | N::Named { arg, .. } => arg.walk(f),
             N::Case { arg, whens, default, .. } => {
                 if let Some(a) = arg {
                     a.walk(f);
@@ -1979,6 +1986,8 @@ impl Analyzer<'_, '_> {
             [s, n] => (Some(s.clone()), n.clone()),
             _ => return Err(not_read(e)),
         };
+        // Each argument, and its name where it is given by one.
+        let mut names: Vec<Option<String>> = Vec::new();
         let args: Vec<&Expr> = match &f.args {
             FunctionArguments::None => {
                 if schema.is_none() {
@@ -1992,16 +2001,41 @@ impl Analyzer<'_, '_> {
                 if l.duplicate_treatment.is_some() || !l.clauses.is_empty() {
                     return Err(not_read(e));
                 }
-                l.args
-                    .iter()
-                    .map(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Ok(x),
-                        _ => Err(not_read(e)),
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                let mut out = Vec::with_capacity(l.args.len());
+                for a in &l.args {
+                    let (named, x) = match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => (None, x),
+                        FunctionArg::ExprNamed {
+                            name: Expr::Identifier(i),
+                            arg: FunctionArgExpr::Expr(x),
+                            operator: sqlparser::ast::FunctionArgOperator::RightArrow,
+                        } => (Some(folded(i)), x),
+                        _ => return Err(not_read(e)),
+                    };
+                    match &named {
+                        Some(n) if names.iter().flatten().any(|m| m == n) => {
+                            return Err(Error::new(format!("argument name \"{n}\" used more than once")))
+                        }
+                        None if names.iter().any(Option::is_some) => {
+                            return Err(Error::new("positional argument cannot follow named argument"))
+                        }
+                        _ => {}
+                    }
+                    names.push(named);
+                    out.push(x);
+                }
+                out
             }
             FunctionArguments::Subquery(_) => return Err(not_read(e)),
         };
+        if names.iter().any(Option::is_some) {
+            if f.over.is_some() || f.filter.is_some() || !f.within_group.is_empty() {
+                return Err(not_read(e));
+            }
+            let nodes = args.iter().map(|x| self.expr(x)).collect::<Result<Vec<_>>>()?;
+            let schema = schema.map(|s| self.schema_oid(&s)).transpose()?;
+            return self.func_call_named(&name, schema, nodes, names);
+        }
         if f.over.is_some() || f.filter.is_some() || !f.within_group.is_empty() {
             return Err(not_read(e));
         }
@@ -2089,6 +2123,93 @@ impl Analyzer<'_, '_> {
             *form = Form::Sql;
         }
         Ok(n)
+    }
+
+    /// A function called with arguments given by name, as ParseFuncOrColumn resolves it: each
+    /// candidate whose parameters take the arguments by place, then by name at a place none took,
+    /// every parameter left one with a DEFAULT; the arguments coerced in the call's order, each
+    /// given by name kept with its name.
+    fn func_call_named(&self, name: &str, schema: Option<u32>, args: Vec<Node>, names: Vec<Option<String>>) -> Result<Node> {
+        let actual: Vec<u32> = args.iter().map(Node::ty).collect();
+        let candidates = self.cat.procs_named(name, schema);
+        // Each candidate that matches: its declared types in the call's order, and the parameter
+        // each argument takes.
+        let mut forms: Vec<(usize, Vec<u32>, Vec<usize>)> = Vec::new();
+        for (i, p) in candidates.iter().enumerate() {
+            if p.argnames.is_empty() || actual.len() > p.args.len() {
+                continue;
+            }
+            let mut taken = vec![false; p.args.len()];
+            let mut at = Vec::with_capacity(names.len());
+            for (k, n) in names.iter().enumerate() {
+                let j = match n {
+                    None => Some(k),
+                    Some(n) => p.argnames.iter().position(|x| x == n),
+                };
+                match j {
+                    Some(j) if j < p.args.len() && !taken[j] => {
+                        taken[j] = true;
+                        at.push(j);
+                    }
+                    _ => break,
+                }
+            }
+            let required = p.args.len() - p.nargdefaults.min(p.args.len());
+            if at.len() != names.len() || (0..required).any(|j| !taken[j]) {
+                continue;
+            }
+            forms.push((i, at.iter().map(|&j| p.args[j]).collect(), at));
+        }
+        let shown = || {
+            names
+                .iter()
+                .zip(&actual)
+                .map(|(n, &t)| match n {
+                    Some(n) => format!("{n} => {}", self.type_name(t)),
+                    None => self.type_name(t),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let chosen = match forms.iter().position(|f| f.1 == actual) {
+            Some(c) => Some(c),
+            None => {
+                let lists: Vec<Vec<u32>> = forms.iter().map(|f| f.1.clone()).collect();
+                match self.choose(&actual, &lists) {
+                    Chosen::One(c) => Some(c),
+                    Chosen::NotFound => None,
+                    Chosen::NotUnique => {
+                        return Err(Error::new(format!("function {name}({}) is not unique", shown())))
+                    }
+                }
+            }
+        };
+        let Some(c) = chosen else {
+            return Err(Error::new(format!("function {name}({}) does not exist", shown())));
+        };
+        let (pi, mut declared, _) = forms[c].clone();
+        let p = candidates[pi];
+        let ty = self.generic(&actual, &mut declared, p.result)?;
+        let mut args = args;
+        self.fn_arguments(&mut args, &actual, &declared)?;
+        let args = args
+            .into_iter()
+            .zip(names)
+            .map(|(a, n)| match n {
+                Some(name) => Node::Named {
+                    name,
+                    arg: Box::new(a),
+                },
+                None => a,
+            })
+            .collect();
+        Ok(Node::Func {
+            oid: p.oid,
+            args,
+            ty,
+            form: Form::Call,
+            variadic: false,
+        })
     }
 
     /// A function called, as ParseFuncOrColumn resolves and coerces it.

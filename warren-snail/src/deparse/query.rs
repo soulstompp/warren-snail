@@ -173,6 +173,8 @@ pub(crate) struct Query {
     /// A write's values, each coerced to the column it is written to, and its ON CONFLICT's
     /// expressions; its RETURNING list is its targets.
     pub assigned: Vec<Node>,
+    /// Whether it is a SQL function's RETURN, which prints as RETURN where a question prints SELECT.
+    pub is_return: bool,
 }
 
 impl Query {
@@ -1728,6 +1730,14 @@ impl Analyzer<'_, '_> {
                 name.as_str(),
                 "coalesce" | "greatest" | "least" | "nullif" | "current_time" | "current_timestamp" | "localtime" | "localtimestamp"
             )
+        {
+            return Ok(None);
+        }
+        // A call giving an argument by name is a function's, read as one.
+        if l
+            .args
+            .iter()
+            .any(|a| matches!(a, A::FunctionArg::ExprNamed { .. } | A::FunctionArg::Named { .. }))
         {
             return Ok(None);
         }
