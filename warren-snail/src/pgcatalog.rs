@@ -148,15 +148,38 @@ pub(crate) fn built_in(table: &str, release: u8) -> Vec<HashMap<&'static str, Op
 
 /// obj_description: the description pg_description holds for an object, of sub-object 0, of the
 /// catalog `class` names, pg_catalog's relation of exactly that name, or of any where none is
-/// given, the first held. The built-in objects' are carried, public's gone where the file dropped
-/// public; the file's own objects hold none, COMMENT ON being refused.
+/// given, the first held. The file's own objects' are those COMMENT ON gave them; the built-in
+/// objects' are carried, public's gone where the file dropped public or given another.
 pub(crate) fn description(objoid: u32, class: Option<&str>, release: u8) -> Option<String> {
-    type Index = std::sync::Arc<HashMap<u32, Vec<(u32, i32, String)>>>;
-    static INDEXES: OnceLock<std::sync::Mutex<HashMap<u8, Index>>> = OnceLock::new();
     let classoid = match class {
         Some(name) => Some(crate::regs::catalog_class(name, release)?),
         None => None,
     };
+    described(objoid, classoid, 0, release)
+}
+
+/// col_description: the description pg_description holds for a relation's column, by its number.
+pub(crate) fn column_description(relation: u32, column: i32, release: u8) -> Option<String> {
+    described(relation, Some(crate::deparse::depend::CLASS), column, release)
+}
+
+/// The description pg_description holds for an object's sub-object, of the catalog given or of
+/// any: the file's first, then the release's.
+fn described(objoid: u32, classoid: Option<u32>, sub: i32, release: u8) -> Option<String> {
+    type Index = std::sync::Arc<HashMap<u32, Vec<(u32, i32, String)>>>;
+    static INDEXES: OnceLock<std::sync::Mutex<HashMap<u8, Index>>> = OnceLock::new();
+    let own = crate::oids::held_each(|o| {
+        o.described()
+            .iter()
+            .find(|d| {
+                d.objoid == objoid && d.objsubid == sub && classoid.is_none_or(|k| k == d.classoid)
+            })
+            .map(|d| d.text.clone())
+    })
+    .flatten();
+    if own.is_some() {
+        return own;
+    }
     let index = {
         let all = INDEXES.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
         let mut all = all.lock().unwrap_or_else(|e| e.into_inner());
@@ -185,7 +208,7 @@ pub(crate) fn description(objoid: u32, class: Option<&str>, release: u8) -> Opti
         .filter(|(c, _, _)| {
             !(dropped && objoid == crate::oids::PUBLIC && *c == crate::deparse::depend::NAMESPACE)
         })
-        .find(|(c, s, _)| *s == 0 && classoid.is_none_or(|k| k == *c))
+        .find(|(c, s, _)| *s == sub && classoid.is_none_or(|k| k == *c))
         .map(|(_, _, d)| d.clone())
 }
 
@@ -302,6 +325,18 @@ pub(crate) fn relation(catalog: &Catalog, table: &str) -> Result<Relation> {
     let mut rows: Vec<HashMap<&str, Option<String>>> = built_in(table, release);
     if catalog.oids.public_dropped() {
         rows.retain(|r| !of_public(table, r));
+    }
+    // A description the file gave a built-in object, `public`'s, stands in place of the release's.
+    if table == "pg_description" {
+        let own = catalog.oids.described();
+        rows.retain(|r| {
+            let is = |c: &str, v: String| r.get(c).cloned().flatten() == Some(v);
+            !own.iter().any(|d| {
+                is("objoid", d.objoid.to_string())
+                    && is("classoid", d.classoid.to_string())
+                    && is("objsubid", d.objsubid.to_string())
+            })
+        });
     }
     let file = File::of(catalog);
     rows.extend(file.rows(table)?);
@@ -652,8 +687,26 @@ impl<'a> File<'a> {
             "pg_cast" => self.casts(),
             "pg_depend" => self.depends(),
             "pg_trigger" => self.triggers(),
+            "pg_description" => self.descriptions(),
             _ => Vec::new(),
         })
+    }
+
+    /// The descriptions COMMENT ON gave the file's objects.
+    fn descriptions(&self) -> Vec<Row> {
+        self.catalog
+            .oids
+            .described()
+            .iter()
+            .map(|d| {
+                row(&[
+                    ("objoid", d.objoid.to_string()),
+                    ("classoid", d.classoid.to_string()),
+                    ("objsubid", d.objsubid.to_string()),
+                    ("description", d.text.clone()),
+                ])
+            })
+            .collect()
     }
 
     /// A collation's OID by the name a COLLATE gives it, found as PostgreSQL's search path finds

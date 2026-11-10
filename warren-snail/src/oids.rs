@@ -114,6 +114,18 @@ pub struct Oids {
     /// Whether the DDL dropped the release's schema `public`, whose OID is 2200: a `public` made
     /// again is the file's own, with an OID the DDL hands it.
     public_dropped: bool,
+    /// The descriptions COMMENT ON gave the file's objects, as pg_description holds them.
+    described: Vec<Described>,
+}
+
+/// A description of one of the file's objects, as pg_description holds it: the object's OID, the
+/// catalog that holds it, its column's number or 0, and the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Described {
+    pub objoid: u32,
+    pub classoid: u32,
+    pub objsubid: i32,
+    pub text: String,
 }
 
 /// The OID of the schema `public` as initdb makes it.
@@ -126,6 +138,7 @@ impl Default for Oids {
             by_oid: BTreeMap::new(),
             next: FIRST,
             public_dropped: false,
+            described: Vec::new(),
         }
     }
 }
@@ -193,6 +206,16 @@ impl Oids {
     /// The next OID it would hand out.
     pub fn next(&self) -> u32 {
         self.next
+    }
+
+    /// The descriptions of the file's objects, by OID, catalog and column.
+    pub fn described(&self) -> &[Described] {
+        &self.described
+    }
+
+    /// The descriptions the statements read so far leave the file's objects.
+    pub(crate) fn describe(&mut self, rows: Vec<Described>) {
+        self.described = rows;
     }
 
     /// The release's `public` given up: the DDL dropped it.

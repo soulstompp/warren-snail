@@ -817,3 +817,129 @@ fn information_schema_s_functions_answer_a_statement_s_own_calls_as_postgresql_d
         ],
     );
 }
+
+const COMMENTED: &str = "CREATE SCHEMA s; \
+     CREATE TABLE s.t (id integer PRIMARY KEY, v text CHECK (v <> ''), w integer); \
+     CREATE INDEX t_v ON s.t (v); CREATE SEQUENCE s.q; \
+     CREATE VIEW s.v AS SELECT id, v FROM s.t; \
+     CREATE TYPE s.mood AS ENUM ('sad', 'ok'); CREATE TYPE s.pair AS (x integer, y integer); \
+     CREATE TYPE s.r AS RANGE (subtype = integer); \
+     CREATE DOMAIN s.pos AS integer CONSTRAINT pos_check CHECK (VALUE > 0); \
+     CREATE FUNCTION s.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1'; \
+     COMMENT ON SCHEMA s IS 'the schema'; COMMENT ON TABLE s.t IS 'the table'; \
+     COMMENT ON COLUMN s.t.v IS 'a column'; COMMENT ON INDEX s.t_v IS 'an index'; \
+     COMMENT ON SEQUENCE s.q IS 'a sequence'; COMMENT ON VIEW s.v IS 'a view'; \
+     COMMENT ON COLUMN s.v.id IS 'a view column'; COMMENT ON TYPE s.mood IS 'an enum'; \
+     COMMENT ON TYPE s.pair IS 'a composite'; COMMENT ON COLUMN s.pair.x IS 'a field'; \
+     COMMENT ON TYPE s.r IS 'a range'; COMMENT ON DOMAIN s.pos IS 'a domain'; \
+     COMMENT ON CONSTRAINT pos_check ON DOMAIN s.pos IS 'a domain check'; \
+     COMMENT ON CONSTRAINT t_pkey ON s.t IS 'a key'; \
+     COMMENT ON CONSTRAINT t_v_check ON s.t IS 'a check'; \
+     COMMENT ON FUNCTION s.f(integer) IS 'a function'; \
+     COMMENT ON RULE \"_RETURN\" ON s.v IS 'a rule'; \
+     COMMENT ON FUNCTION s.f IS 'by name alone'; COMMENT ON TYPE s.t IS 'a table''s row type'; \
+     COMMENT ON COLUMN s.t.w IS ''; COMMENT ON COLUMN s.t.w IS 'then'; \
+     COMMENT ON COLUMN s.t.w IS NULL; COMMENT ON TABLE s.t IS 'again'; \
+     COMMENT ON SCHEMA public IS 'the public one'; COMMENT ON COLUMN s.v.v IS 'x'; \
+     COMMENT ON COLUMN s.v.v IS '';";
+
+#[test]
+fn comment_on_describes_each_kind_of_object_the_file_makes_as_postgresql_does() {
+    let mut s = Snail::open(&written("commented", COMMENTED)).unwrap();
+    let mut asked = |q: &str, want: &[&str]| {
+        let (b, _) = s.ask(q, None).unwrap_or_else(|e| panic!("{q}: {}", e.0));
+        assert_eq!(joined(&s, &b), want, "{q}");
+    };
+    // 18.6: each object's row, an empty text or NULL removing it, the last given standing,
+    // public's in place of the release's.
+    asked(
+        "SELECT CASE classoid WHEN 'pg_class'::regclass THEN 'class' \
+         WHEN 'pg_type'::regclass THEN 'type' WHEN 'pg_proc'::regclass THEN 'proc' \
+         WHEN 'pg_namespace'::regclass THEN 'namespace' \
+         WHEN 'pg_constraint'::regclass THEN 'constraint' \
+         WHEN 'pg_rewrite'::regclass THEN 'rule' ELSE 'other' END || ' ' || \
+         CASE classoid WHEN 'pg_class'::regclass THEN objoid::regclass::text \
+         WHEN 'pg_type'::regclass THEN objoid::regtype::text \
+         WHEN 'pg_proc'::regclass THEN objoid::regprocedure::text \
+         WHEN 'pg_namespace'::regclass THEN objoid::regnamespace::text \
+         WHEN 'pg_constraint'::regclass THEN (SELECT conname FROM pg_constraint WHERE oid = objoid) \
+         ELSE '' END || ' ' || objsubid AS k, description FROM pg_description \
+         WHERE objoid >= 16384 OR objoid = 2200 ORDER BY 1",
+        &[
+            "class s.pair 1|a field",
+            "class s.q 0|a sequence",
+            "class s.t 0|again",
+            "class s.t 2|a column",
+            "class s.t_v 0|an index",
+            "class s.v 0|a view",
+            "class s.v 1|a view column",
+            "constraint pos_check 0|a domain check",
+            "constraint t_pkey 0|a key",
+            "constraint t_v_check 0|a check",
+            "namespace public 0|the public one",
+            "namespace s 0|the schema",
+            "proc s.f(integer) 0|by name alone",
+            "rule  0|a rule",
+            "type s.mood 0|an enum",
+            "type s.pair 0|a composite",
+            "type s.pos 0|a domain",
+            "type s.r 0|a range",
+            "type s.t 0|a table's row type",
+        ],
+    );
+    asked(
+        "SELECT obj_description('s.t'::regclass, 'pg_class'), obj_description('s.t'::regclass), \
+         col_description('s.t'::regclass, 2), col_description('s.t'::regclass, 3), \
+         col_description('s.v'::regclass, 1), \
+         obj_description('s.f(integer)'::regprocedure, 'pg_proc'), \
+         obj_description(2200, 'pg_namespace')",
+        &["again|again|a column|NULL|a view column|by name alone|the public one"],
+    );
+    // A dropped object takes its own, and one made again under its name has none.
+    let again = "CREATE SCHEMA s; CREATE TABLE s.b (id int PRIMARY KEY); \
+         COMMENT ON TABLE s.b IS 'bee'; DROP TABLE s.b; CREATE TABLE s.b (id int PRIMARY KEY);";
+    let mut s = Snail::open(&written("commented-again", again)).unwrap();
+    let (b, _) = s
+        .ask("SELECT count(*) FROM pg_description WHERE objoid >= 16384", None)
+        .unwrap_or_else(|e| panic!("{}", e.0));
+    assert_eq!(joined(&s, &b), ["0"]);
+    // Refused in 18.6's words, PostgreSQL's own objects and the server's by name.
+    for (statement, words) in [
+        ("COMMENT ON TABLE public.nothing IS 'x'", "relation \"public.nothing\" does not exist"),
+        ("COMMENT ON TABLE s.v IS 'x'", "\"v\" is not a table"),
+        ("COMMENT ON INDEX s.t IS 'x'", "\"t\" is not an index"),
+        ("COMMENT ON COLUMN s.t.nope IS 'x'", "column \"nope\" of relation \"s.t\" does not exist"),
+        ("COMMENT ON COLUMN t IS 'x'", "column name must be qualified"),
+        ("COMMENT ON TYPE s.nope IS 'x'", "type \"s.nope\" does not exist"),
+        ("COMMENT ON DOMAIN s.mood IS 'x'", "\"s.mood\" is not a domain"),
+        ("COMMENT ON FUNCTION s.f(text) IS 'x'", "function s.f(text) does not exist"),
+        ("COMMENT ON CONSTRAINT nope ON s.t IS 'x'", "constraint \"nope\" for table \"t\" does not exist"),
+        ("COMMENT ON SCHEMA nope IS 'x'", "schema \"nope\" does not exist"),
+        ("COMMENT ON TABLE pg_catalog.pg_class IS 'x'", "PostgreSQL's own objects are the release's"),
+        ("COMMENT ON DATABASE postgres IS 'x'", "a database is a running server's own"),
+    ] {
+        let ddl = format!("{COMMENTED} {statement};");
+        let e = Catalog::parse(&ddl).err().unwrap_or_else(|| panic!("{statement} was taken"));
+        assert!(e.0.contains(words), "{statement}: {}", e.0);
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_session_declares_a_comment_as_its_ddl_does() {
+    let path = written("commented-session", "CREATE SCHEMA s; CREATE TABLE s.c (id int PRIMARY KEY);");
+    let mut w = Snail::open_writing(&path).unwrap();
+    rows(&mut w, "COMMENT ON TABLE s.c IS 'later'");
+    rows(&mut w, "COMMENT ON COLUMN s.c.id IS 'the id'");
+    asked(
+        &mut w,
+        "SELECT obj_description('s.c'::regclass, 'pg_class'), col_description('s.c'::regclass, 1)",
+        &["later|the id"],
+    );
+    drop(w);
+    let mut s = Snail::open(&path).unwrap();
+    let (b, _) = s
+        .ask("SELECT obj_description('s.c'::regclass, 'pg_class')", None)
+        .unwrap_or_else(|e| panic!("{}", e.0));
+    assert_eq!(joined(&s, &b), ["later"]);
+}

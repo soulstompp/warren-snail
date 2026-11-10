@@ -4765,6 +4765,18 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                         });
                         return Ok(found.map_or(Value::Null, Value::Text));
                     }
+                    if name == "col_description" && values.len() == 2 {
+                        let column = match &values[1] {
+                            Value::Int(n) => i32::try_from(*n).ok(),
+                            _ => None,
+                        };
+                        let found = crate::deparse::oid_of(&values[0])
+                            .zip(column)
+                            .and_then(|(oid, c)| {
+                                crate::pgcatalog::column_description(oid, c, frame.release)
+                            });
+                        return Ok(found.map_or(Value::Null, Value::Text));
+                    }
                     if let Some(v) = crate::deparse::call(&name, &values)? {
                         return Ok(v);
                     }

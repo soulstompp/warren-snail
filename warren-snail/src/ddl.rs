@@ -319,6 +319,11 @@ pub(crate) fn expression(tokens: &[Token]) -> Result<Expr> {
 
 /// A statement the snail reads itself.
 pub(crate) enum Form {
+    /// COMMENT ON: the object described, and its text, none for IS NULL.
+    Comment {
+        target: Commented,
+        text: Option<String>,
+    },
     CreateType(Type),
     AlterType(String, AlterType),
     CreateDomain(Domain),
@@ -490,6 +495,9 @@ pub(crate) fn read(tokens: &[Token]) -> Option<Result<Form>> {
     if c.kws(&["DROP", "SCHEMA"]) {
         return Some(drop_schema(&mut c));
     }
+    if c.kws(&["COMMENT", "ON"]) {
+        return Some(comment_on(&mut c));
+    }
     for (word, kind) in [
         ("TABLE", Dropped::Table),
         ("VIEW", Dropped::View),
@@ -605,6 +613,168 @@ fn end(c: &Cursor, what: &str) -> Result<()> {
     } else {
         Err(Error::new(format!("{what}: {} is not read", c.rest())))
     }
+}
+
+/// The object a COMMENT ON names, as its grammar names each kind the file makes.
+#[derive(Clone, Debug)]
+pub(crate) enum Commented {
+    /// A TABLE, VIEW, INDEX or SEQUENCE, by its word, with its schema where the name gives one.
+    Relation {
+        word: &'static str,
+        schema: Option<String>,
+        own: String,
+    },
+    /// A COLUMN: its relation's name's parts, then its own.
+    Column(Vec<String>),
+    /// A TYPE, or a DOMAIN where it says so.
+    Type { name: String, domain: bool },
+    /// A FUNCTION, PROCEDURE or ROUTINE, by name, with its arguments' types where it lists them.
+    Function {
+        name: String,
+        args: Option<Vec<sqlparser::ast::DataType>>,
+    },
+    /// A CONSTRAINT of a table, or of a DOMAIN where it says so.
+    Constraint {
+        name: String,
+        on: String,
+        domain: bool,
+    },
+    /// A RULE or a TRIGGER of a relation.
+    OnRelation {
+        word: &'static str,
+        name: String,
+        on: String,
+    },
+    Schema(String),
+    Collation(String),
+    /// A kind of object the file makes none of, by its words and why.
+    Refused(String),
+}
+
+/// COMMENT ON: the object, by its kind's words, IS a text or NULL.
+fn comment_on(c: &mut Cursor) -> Result<Form> {
+    let what = "COMMENT ON";
+    let server = |kind: &str| {
+        Commented::Refused(format!(
+            "{what} {kind} is not read: a {} is a running server's own, and a snail has no server",
+            kind.to_lowercase()
+        ))
+    };
+    let target = if c.kws(&["MATERIALIZED", "VIEW"]) || c.kws(&["FOREIGN", "TABLE"]) {
+        let own = c.name()?;
+        Commented::Refused(format!(
+            "{what}: relation \"{own}\" does not exist, a snail holding no materialized view or \
+             foreign table"
+        ))
+    } else if let Some(word) = ["TABLE", "VIEW", "INDEX", "SEQUENCE"]
+        .into_iter()
+        .find(|w| c.kw(w))
+    {
+        let first = c.ident()?;
+        let (schema, own) = match c.token(Token::Period) {
+            true => (Some(first), c.ident()?),
+            false => (None, first),
+        };
+        Commented::Relation { word, schema, own }
+    } else if c.kw("COLUMN") {
+        let mut parts = vec![c.ident()?];
+        while c.token(Token::Period) {
+            parts.push(c.ident()?);
+        }
+        Commented::Column(parts)
+    } else if c.kw("TYPE") || c.is("DOMAIN") {
+        let domain = c.kw("DOMAIN");
+        Commented::Type {
+            name: c.name()?,
+            domain,
+        }
+    } else if c.kw("FUNCTION") || c.kw("PROCEDURE") || c.kw("ROUTINE") {
+        let name = c.name()?;
+        let args = match c.peek() == Some(&Token::LParen) {
+            true => Some(argument_types(&c.group()?)?),
+            false => None,
+        };
+        Commented::Function { name, args }
+    } else if c.kw("CONSTRAINT") {
+        let name = c.ident()?;
+        c.expect("ON")?;
+        let domain = c.kw("DOMAIN");
+        Commented::Constraint {
+            name,
+            on: c.name()?,
+            domain,
+        }
+    } else if let Some(word) = ["RULE", "TRIGGER"].into_iter().find(|w| c.kw(w)) {
+        let name = c.ident()?;
+        c.expect("ON")?;
+        Commented::OnRelation {
+            word,
+            name,
+            on: c.name()?,
+        }
+    } else if c.kw("SCHEMA") {
+        Commented::Schema(c.ident()?)
+    } else if c.kw("COLLATION") {
+        Commented::Collation(c.name()?)
+    } else if let Some(kind) = ["DATABASE", "ROLE", "TABLESPACE", "SUBSCRIPTION", "PUBLICATION"]
+        .into_iter()
+        .find(|w| c.is(w))
+    {
+        c.kw(kind);
+        c.name()?;
+        server(kind)
+    } else {
+        let kind = c.rest();
+        let kind = kind.split(" IS ").next().unwrap_or(&kind).to_string();
+        return Err(Error::new(format!(
+            "{what} {kind} is not read: the snail describes the objects its file makes, its \
+             tables, columns, views, indexes, sequences, types, domains, functions, constraints, \
+             rules, triggers, schemas and collations"
+        )));
+    };
+    c.expect("IS")?;
+    let text = match c.peek() {
+        Some(Token::SingleQuotedString(s)) | Some(Token::EscapedStringLiteral(s)) => Some(s.clone()),
+        Some(Token::DollarQuotedString(d)) => Some(d.value.clone()),
+        Some(Token::Word(w)) if w.value.eq_ignore_ascii_case("NULL") && w.quote_style.is_none() => {
+            None
+        }
+        _ => return Err(c.wanted("a quoted string or NULL")),
+    };
+    c.i += 1;
+    end(c, what)?;
+    Ok(Form::Comment { target, text })
+}
+
+/// The types of a function's arguments as a COMMENT ON lists them, each read as a data type.
+fn argument_types(tokens: &[Token]) -> Result<Vec<sqlparser::ast::DataType>> {
+    let mut out = Vec::new();
+    let mut piece: Vec<Token> = Vec::new();
+    let mut depth = 0;
+    let mut pieces = Vec::new();
+    for t in tokens {
+        match t {
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth -= 1,
+            Token::Comma if depth == 0 => {
+                pieces.push(std::mem::take(&mut piece));
+                continue;
+            }
+            _ => {}
+        }
+        piece.push(t.clone());
+    }
+    if piece.iter().any(|t| !matches!(t, Token::Whitespace(_))) {
+        pieces.push(piece);
+    }
+    for p in pieces {
+        let dt = Parser::new(&PostgreSqlDialect {})
+            .with_tokens(p)
+            .parse_data_type()
+            .map_err(|e| Error::new(format!("COMMENT ON FUNCTION: an argument is no type ({e})")))?;
+        out.push(dt);
+    }
+    Ok(out)
 }
 
 /// A CREATE VIEW's tokens without the WITH [CASCADED | LOCAL] CHECK OPTION that ends it, and that
@@ -2054,6 +2224,23 @@ struct Draft {
     oids: crate::oids::Oids,
     /// The objects the statement now read renamed, each keeping its OID.
     renamed: Vec<(crate::oids::Object, crate::oids::Object)>,
+    /// The descriptions COMMENT ON gave, each object by its OID, so that one dropped takes its own
+    /// and one made again under its name has none.
+    described: Vec<Description>,
+}
+
+/// What a COMMENT ON names: its object's OID, the catalog that holds it, and its column by name and
+/// number.
+type Target = (u32, u32, Option<(String, i32)>);
+
+/// A description COMMENT ON gave: the object by its OID and the catalog that holds it, a column by
+/// its name, its number read where the description is.
+#[derive(Clone, Debug)]
+struct Description {
+    objoid: u32,
+    classoid: u32,
+    column: Option<(String, i32)>,
+    text: String,
 }
 
 /// How many of each kind of object a draft holds, before a statement is read.
@@ -2443,22 +2630,362 @@ impl Draft {
         if wide {
             let all = self.objects();
             self.oids.settle(&all, &renamed);
-            return;
-        }
-        let on = if kind.contains("INDEX") {
-            index_on(&written(tokens))
         } else {
-            None
+            let on = if kind.contains("INDEX") {
+                index_on(&written(tokens))
+            } else {
+                None
+            };
+            let mut touched: Vec<&str> = Vec::new();
+            if kind.starts_with("ALTER") {
+                touched.push(object);
+            }
+            if let Some(t) = on.as_deref() {
+                touched.push(t);
+            }
+            let made = self.objects_since(before, &touched);
+            self.oids.give(&made);
+        }
+        self.publish_descriptions();
+    }
+
+    /// The object a COMMENT ON names: its OID, the catalog that holds it and its column, found as
+    /// PostgreSQL's search path finds a name with no schema, refused in PostgreSQL's words where
+    /// it names none or one of another kind; PostgreSQL's own objects refused by name.
+    fn commented(&self, target: &Commented) -> Result<Target> {
+        use crate::deparse::depend as d;
+        use crate::oids::{full, parts, Object as O};
+        fn own_refused<T>(what: &str) -> Result<T> {
+            Err(Error::new(format!(
+                "COMMENT ON {what} is refused: PostgreSQL's own objects are the release's, which \
+                 a snail carries beside its file, not objects its DDL made"
+            )))
+        }
+        let catalog_schema =
+            |s: &str| matches!(s, "pg_catalog" | "information_schema" | "pg_toast");
+        // A relation by its schema and its own name: its OID and kind.
+        let relation = |word: &str, schema: Option<&str>, own: &str, shown: &str| -> Result<(u32, char)> {
+            if let Some(s) = schema.filter(|s| catalog_schema(s)) {
+                return own_refused(&format!("{word} {s}.{own}"));
+            }
+            if schema.is_none() && self.built_in_relation(own).is_some() {
+                return own_refused(&format!("{word} {own}"));
+            }
+            let s = schema.unwrap_or("public");
+            if schema.is_some() && !self.schema_stands(s) {
+                return Err(Error::new(format!("schema \"{s}\" does not exist")));
+            }
+            let kind = self.relation_kind(s, own).ok_or_else(|| {
+                Error::new(format!("relation \"{shown}\" does not exist"))
+            })?;
+            let oid = self.oids.of(&O::Class(format!("{s}.{own}"))).unwrap_or(0);
+            Ok((oid, kind))
         };
-        let mut touched: Vec<&str> = Vec::new();
-        if kind.starts_with("ALTER") {
-            touched.push(object);
+        // A type of the file's by its name: PostgreSQL's own refused, one of no name refused.
+        let type_oid = |name: &str| -> Result<u32> {
+            let f = full(name);
+            let (s, _) = parts(&f);
+            if catalog_schema(s) || (!name.contains('.') && self.built_in_type(name)) {
+                return own_refused(&format!("TYPE {name}"));
+            }
+            self.oids
+                .of(&O::Type(full(name)))
+                .ok_or_else(|| Error::new(format!("type \"{name}\" does not exist")))
+        };
+        let shown_type = |name: &str| match parts(&full(name)) {
+            ("public", own) => own.to_string(),
+            _ => full(name),
+        };
+        Ok(match target {
+            Commented::Refused(why) => return Err(Error::new(why.clone())),
+            Commented::Relation { word, schema, own } => {
+                let shown = match schema {
+                    Some(s) => format!("{s}.{own}"),
+                    None => own.clone(),
+                };
+                let (oid, kind) = relation(word, schema.as_deref(), own, &shown)?;
+                let (wanted, one) = match *word {
+                    "TABLE" => ('r', "a table"),
+                    "VIEW" => ('v', "a view"),
+                    "INDEX" => ('i', "an index"),
+                    _ => ('S', "a sequence"),
+                };
+                if kind != wanted {
+                    return Err(Error::new(format!("\"{own}\" is not {one}")));
+                }
+                (oid, d::CLASS, None)
+            }
+            Commented::Column(names) => {
+                let (schema, own, column) = match names.as_slice() {
+                    [_] => return Err(Error::new("column name must be qualified")),
+                    [r, c] => (None, r, c),
+                    [s, r, c] => (Some(s.as_str()), r, c),
+                    _ => {
+                        return Err(Error::new(format!(
+                            "cross-database references are not implemented: {}",
+                            names.join(".")
+                        )))
+                    }
+                };
+                let shown = match schema {
+                    Some(s) => format!("{s}.{own}"),
+                    None => own.clone(),
+                };
+                let (oid, kind) = relation("COLUMN", schema, own, &shown)?;
+                let rel = format!("{}.{own}", schema.unwrap_or("public"));
+                let number = match kind {
+                    'v' => self.view_column_number(&rel, column)?,
+                    _ => self.column_number(&rel, column),
+                };
+                let number = number.ok_or_else(|| {
+                    Error::new(format!(
+                        "column \"{column}\" of relation \"{shown}\" does not exist"
+                    ))
+                })?;
+                (oid, d::CLASS, Some((column.clone(), number)))
+            }
+            Commented::Type { name, domain } => {
+                let oid = type_oid(name)?;
+                let is_domain = self.domains.iter().any(|x| full(&x.name) == full(name));
+                if *domain && !is_domain {
+                    return Err(Error::new(format!("\"{}\" is not a domain", shown_type(name))));
+                }
+                (oid, d::TYPE, None)
+            }
+            Commented::Function { name, args } => {
+                let f = full(name);
+                let (s, own) = parts(&f);
+                let bare = !name.contains('.');
+                if catalog_schema(s) {
+                    return own_refused(&format!("FUNCTION {name}"));
+                }
+                let oid = match args {
+                    Some(args) => {
+                        let mut texts = Vec::new();
+                        for a in args {
+                            let ty = crate::catalog::held_type(a).map_err(|e| {
+                                Error::new(format!("COMMENT ON FUNCTION {name}: {e}"))
+                            })?;
+                            texts.push(ty.pg_name());
+                        }
+                        let joined = texts.join(",");
+                        // pg_catalog's of that signature, which the search path finds first.
+                        let built_in = crate::regs::reg_parse(
+                            crate::regs::RegKind::Procedure,
+                            &format!("pg_catalog.{own}({joined})"),
+                            self.release,
+                        );
+                        if bare && built_in.is_ok() {
+                            return own_refused(&format!("FUNCTION {name}({joined})"));
+                        }
+                        self.oids.of(&O::Proc(full(name), joined)).ok_or_else(|| {
+                            Error::new(format!(
+                                "function {name}({}) does not exist",
+                                texts.join(", ")
+                            ))
+                        })?
+                    }
+                    None => {
+                        let named: Vec<u32> = self
+                            .oids
+                            .each()
+                            .filter(|(_, o)| matches!(o, O::Proc(n, _) if *n == full(name)))
+                            .map(|(oid, _)| oid)
+                            .collect();
+                        let built_in = if bare { self.built_in_functions(own) } else { 0 };
+                        match (named.as_slice(), built_in) {
+                            ([oid], 0) => *oid,
+                            ([], 0) => {
+                                return Err(Error::new(format!(
+                                    "could not find a function named \"{name}\""
+                                )))
+                            }
+                            ([], 1) => return own_refused(&format!("FUNCTION {name}")),
+                            _ => {
+                                return Err(Error::new(format!(
+                                    "function name \"{name}\" is not unique"
+                                )))
+                            }
+                        }
+                    }
+                };
+                (oid, d::PROC, None)
+            }
+            Commented::Constraint { name, on, domain: true } => {
+                type_oid(on)?;
+                if !self.domains.iter().any(|x| full(&x.name) == full(on)) {
+                    return Err(Error::new(format!("\"{}\" is not a domain", shown_type(on))));
+                }
+                let k = self.oids.of(&O::Constraint(full(on), name.clone())).ok_or_else(|| {
+                    Error::new(format!(
+                        "constraint \"{name}\" for domain {} does not exist",
+                        shown_type(on)
+                    ))
+                })?;
+                (k, d::CONSTRAINT, None)
+            }
+            Commented::Constraint { name, on, domain: false } => {
+                let f = full(on);
+                let (s, own) = parts(&f);
+                let schema = on.contains('.').then_some(s);
+                relation("CONSTRAINT ON", schema, own, on)?;
+                let k = self
+                    .oids
+                    .of(&O::Constraint(full(on), name.clone()))
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "constraint \"{name}\" for table \"{own}\" does not exist"
+                        ))
+                    })?;
+                (k, d::CONSTRAINT, None)
+            }
+            Commented::OnRelation { word, name, on } => {
+                let f = full(on);
+                let (s, own) = parts(&f);
+                let schema = on.contains('.').then_some(s);
+                relation(word, schema, own, on)?;
+                match *word {
+                    "RULE" => {
+                        let rule = (name == "_RETURN")
+                            .then(|| self.oids.of(&O::Rule(full(on))))
+                            .flatten()
+                            .ok_or_else(|| {
+                                Error::new(format!(
+                                    "rule \"{name}\" for relation \"{own}\" does not exist"
+                                ))
+                            })?;
+                        (rule, d::REWRITE, None)
+                    }
+                    _ => {
+                        // A trigger is named by its own OID, after its kind's prefix.
+                        let digits = name.trim_start_matches(|c: char| !c.is_ascii_digit());
+                        let found = digits.parse::<u32>().ok().filter(|oid| {
+                            matches!(self.oids.object(*oid),
+                                Some(O::Trigger(t, _, _)) if *t == full(on))
+                        });
+                        let oid = found.ok_or_else(|| {
+                            Error::new(format!(
+                                "trigger \"{name}\" for table \"{own}\" does not exist"
+                            ))
+                        })?;
+                        (oid, d::TRIGGER, None)
+                    }
+                }
+            }
+            Commented::Schema(name) => {
+                if catalog_schema(name) {
+                    return own_refused(&format!("SCHEMA {name}"));
+                }
+                let oid = match self.oids.of(&O::Namespace(name.clone())) {
+                    Some(oid) => oid,
+                    None if name == "public" && !self.oids.public_dropped() => crate::oids::PUBLIC,
+                    None => return Err(Error::new(format!("schema \"{name}\" does not exist"))),
+                };
+                (oid, d::NAMESPACE, None)
+            }
+            Commented::Collation(name) => {
+                let f = full(name);
+                let (s, _) = parts(&f);
+                if catalog_schema(s)
+                    || (!name.contains('.')
+                        && crate::pgcatalog::is_built_in_collation(name, self.release))
+                {
+                    return own_refused(&format!("COLLATION {name}"));
+                }
+                let oid = self.oids.of(&O::Collation(full(name))).ok_or_else(|| {
+                    Error::new(format!(
+                        "collation \"{name}\" for encoding \"UTF8\" does not exist"
+                    ))
+                })?;
+                (oid, d::COLLATION, None)
+            }
+        })
+    }
+
+    /// Whether a type's name with no schema names one of PostgreSQL's, which the search path finds
+    /// first.
+    fn built_in_type(&self, name: &str) -> bool {
+        crate::regs::type_oid(name, self.release).is_ok_and(|oid| oid < crate::oids::FIRST)
+    }
+
+    /// How many of PostgreSQL's functions bear a name, which the search path finds first.
+    fn built_in_functions(&self, name: &str) -> usize {
+        crate::pgcatalog::built_in("pg_proc", self.release)
+            .iter()
+            .filter(|r| {
+                r.get("proname").cloned().flatten().as_deref() == Some(name)
+                    && r.get("pronamespace").cloned().flatten().as_deref() == Some("11")
+            })
+            .count()
+    }
+
+    /// The descriptions as pg_description holds them once a statement is read: those of objects
+    /// no longer standing, or of columns gone, given up; each column's by its number now.
+    fn publish_descriptions(&mut self) {
+        use crate::oids::Object as O;
+        let mut rows = Vec::new();
+        let mut kept = Vec::new();
+        for d in std::mem::take(&mut self.described) {
+            let standing = match self.oids.object(d.objoid) {
+                Some(_) => true,
+                None => d.objoid == crate::oids::PUBLIC && !self.oids.public_dropped(),
+            };
+            let objsubid = match (&d.column, self.oids.object(d.objoid)) {
+                (None, _) => Some(0),
+                (Some((c, n)), Some(O::Class(rel))) => match self.tables.iter().any(|t| crate::oids::full(&t.name) == *rel) {
+                    true => self.column_number(rel, c),
+                    false => Some(*n),
+                },
+                _ => None,
+            };
+            let (true, Some(objsubid)) = (standing, objsubid) else {
+                continue;
+            };
+            rows.push(crate::oids::Described {
+                objoid: d.objoid,
+                classoid: d.classoid,
+                objsubid,
+                text: d.text.clone(),
+            });
+            kept.push(d);
         }
-        if let Some(t) = on.as_deref() {
-            touched.push(t);
+        rows.sort_by_key(|r| (r.objoid, r.classoid, r.objsubid));
+        self.described = kept;
+        self.oids.describe(rows);
+    }
+
+    /// A view's column's number, from 1, its names those its question gives under its column list.
+    fn view_column_number(&self, relation: &str, column: &str) -> Result<Option<i32>> {
+        let Some(v) = self.views.iter().find(|v| crate::oids::full(&v.name) == relation) else {
+            return Ok(None);
+        };
+        let bound = crate::grammar::bound(&v.query);
+        let parsed = crate::read::image::parse_sql(bound.as_deref().unwrap_or(&v.query))?;
+        let [Statement::Query(q)] = parsed.as_slice() else {
+            return Ok(None);
+        };
+        let mut names = crate::read::view_columns(&self.so_far(), q)?;
+        for (n, c) in names.iter_mut().zip(&v.columns) {
+            *n = c.clone();
         }
-        let made = self.objects_since(before, &touched);
-        self.oids.give(&made);
+        Ok(names.iter().position(|n| n == column).map(|i| i as i32 + 1))
+    }
+
+    /// A column's number in its relation, from 1, where the relation holds it: a table's, a
+    /// composite's field or a sequence's.
+    fn column_number(&self, relation: &str, column: &str) -> Option<i32> {
+        use crate::oids::full;
+        let at = |names: Vec<&str>| names.iter().position(|n| *n == column).map(|i| i as i32 + 1);
+        if let Some(t) = self.tables.iter().find(|t| full(&t.name) == relation) {
+            return at(t.columns.iter().map(|c| c.name.as_str()).collect());
+        }
+        if self.sequences.iter().any(|s| full(&s.name) == relation) {
+            return at(vec!["last_value", "log_cnt", "is_called"]);
+        }
+        self.types.iter().find(|t| full(&t.name) == relation).and_then(|t| match &t.kind {
+            TypeKind::Composite { fields } => at(fields.iter().map(|f| f.0.as_str()).collect()),
+            _ => None,
+        })
     }
 
     fn type_named(&self, name: &str) -> Option<&'static str> {
@@ -3059,6 +3586,21 @@ impl Draft {
     fn form(&mut self, form: Form) -> Result<Vec<String>> {
         let mut notices = Vec::new();
         match form {
+            Form::Comment { target, text } => {
+                let (objoid, classoid, column) = self.commented(&target)?;
+                self.described.retain(|d| {
+                    !(d.objoid == objoid && d.classoid == classoid && d.column == column)
+                });
+                // An empty text removes the description, as NULL does.
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    self.described.push(Description {
+                        objoid,
+                        classoid,
+                        column,
+                        text,
+                    });
+                }
+            }
             Form::CreateType(t) => {
                 if let Some(k) = self.type_named(&t.name) {
                     return Err(Error::new(format!(
@@ -6683,6 +7225,7 @@ pub(crate) fn declares(sql: &str) -> Option<&'static str> {
         "DROP VIEW" => "DROP VIEW",
         "DROP SEQUENCE" => "DROP SEQUENCE",
         "DROP INDEX" => "DROP INDEX",
+        "COMMENT ON" => "COMMENT",
         _ => return None,
     })
 }

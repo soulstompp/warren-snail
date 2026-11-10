@@ -483,7 +483,7 @@ close_pl(point,line)		type	an operator's, a cast's or an index's
 close_ps(point,lseg)		type	an operator's, a cast's or an index's
 close_sb(lseg,box)		type	an operator's, a cast's or an index's
 close_sl(lseg,line)	14	type	an operator's, a cast's or an index's
-col_description(oid,integer)		server	the server's catalog
+col_description(oid,integer)		type	the file's catalog
 concat("any")		type	strings and formatting
 concat_ws(text,"any")		type	strings and formatting
 convert(bytea,name,name)		type	strings and formatting

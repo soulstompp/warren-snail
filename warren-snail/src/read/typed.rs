@@ -873,7 +873,7 @@ impl Typing<'_> {
                 if crate::regs::visibility_kind(&name).is_some() {
                     return Ok(Some(ColumnType::Boolean));
                 }
-                if name == "obj_description" {
+                if name == "obj_description" || name == "col_description" {
                     return Ok(Some(ColumnType::Text(None)));
                 }
                 crate::functions::refuse_server(&name, self.release)?;
