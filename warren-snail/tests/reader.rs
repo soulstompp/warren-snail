@@ -577,7 +577,8 @@ fn distinct_on_keeps_the_first_row_to_come_where_the_order_by_leaves_a_tie() {
     let path = tmp("reader-ties-past.snail");
     let n = 20_000;
     let catalog = Catalog::parse(
-        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, g integer, PRIMARY KEY (id));",
+        "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, g integer, PRIMARY KEY (id));
+         CREATE TABLE s.o (k integer NOT NULL, PRIMARY KEY (k));",
     )
     .unwrap();
     let t = Rows {
@@ -586,18 +587,25 @@ fn distinct_on_keeps_the_first_row_to_come_where_the_order_by_leaves_a_tie() {
             Values::Int((1..=n).map(|i| Some(i % 7)).collect()),
         ],
     };
-    write(&path, &catalog, &[("s.t".into(), t)]).unwrap();
+    let o = Rows {
+        columns: vec![Values::Int((0..7).map(Some).collect())],
+    };
+    write(&path, &catalog, &[("s.t".into(), t), ("s.o".into(), o)]).unwrap();
     let mut s = Snail::open_writing(&path).unwrap();
-    let mut first: Vec<(i64, String)> = Vec::new();
-    for r in rows(&mut s, "SELECT g, id FROM s.t") {
-        let (g, _) = r.split_once('|').unwrap();
-        let g: i64 = g.parse().unwrap();
-        if !first.iter().any(|(k, _)| *k == g) {
-            first.push((g, r));
+    // The first row of each key as the rows come.
+    let firsts = |rows: Vec<String>| -> Vec<String> {
+        let mut first: Vec<(i64, String)> = Vec::new();
+        for r in rows {
+            let (g, _) = r.split_once('|').unwrap();
+            let g: i64 = g.parse().unwrap();
+            if !first.iter().any(|(k, _)| *k == g) {
+                first.push((g, r));
+            }
         }
-    }
-    first.sort();
-    let want: Vec<String> = first.into_iter().map(|(_, r)| r).collect();
+        first.sort();
+        first.into_iter().map(|(_, r)| r).collect()
+    };
+    let want = firsts(rows(&mut s, "SELECT g, id FROM s.t"));
     for room in [256 << 10, 64 << 10] {
         s.size_rounds(Sizes::of(room));
         assert_eq!(
@@ -606,6 +614,18 @@ fn distinct_on_keeps_the_first_row_to_come_where_the_order_by_leaves_a_tie() {
             "{room}"
         );
     }
+    // Over a join, how many rows come not known: those written within two rooms stand as one part
+    // once the runs begin, its ties after the first run's and before the next's.
+    let join = "FROM s.o o JOIN s.t t ON t.g = o.k";
+    let want = firsts(rows(&mut s, &format!("SELECT t.g, t.id {join}")));
+    assert_eq!(
+        rows(
+            &mut s,
+            &format!("SELECT DISTINCT ON (t.g) t.g, t.id {join}")
+        ),
+        want,
+        "{join}"
+    );
 }
 
 // FROM's three, case 12a: a subquery written without an alias, a join with an alias, and the
