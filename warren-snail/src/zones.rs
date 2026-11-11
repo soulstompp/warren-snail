@@ -1325,7 +1325,7 @@ mod read {
     /// A compiled zone file, as PostgreSQL's `tzloadbody` reads one: its 32-bit part, then where the
     /// file has one its 64-bit part, then its footer's rule extending its transitions; none for a
     /// file it refuses.
-    fn load_file(file: &[u8]) -> Option<State> {
+    pub(super) fn load_file(file: &[u8]) -> Option<State> {
         let mut buf: &[u8] = file;
         if buf.len() < TZHEAD {
             return None;
@@ -1482,8 +1482,9 @@ mod read {
         Some(sp)
     }
 
-    /// The footer's rule, `\n<POSIX TZ string>\n`, extending a zone's transitions past its last,
-    /// where its abbreviations fit beside the file's.
+    /// The footer's rule, `\n<POSIX TZ string>\n`, extending a zone's transitions from the last the
+    /// file writes, where its abbreviations fit beside the file's. A slim file's last transition
+    /// may change nothing: it marks where the rule begins.
     fn extend(sp: &mut State, footer: &[u8]) {
         let n = footer.len();
         if !(n > 2
@@ -1529,15 +1530,18 @@ mod read {
         }
         sp.chars.truncate(charcnt);
         sp.chars.push(0);
+        // Where the file's transitions end, the rule begins.
+        let written = sp.ats.last().copied();
         // Trailing transitions that change nothing are passed over.
         while sp.ats.len() > 1 && sp.types[sp.types.len() - 1] == sp.types[sp.types.len() - 2] {
             sp.ats.pop();
             sp.types.pop();
         }
+        // The rule's transitions past the last the file keeps, none before the file's end.
         let mut i = 0;
         while i < ts.ats.len() {
             let at = ts.ats[i] + sp.leapcorr(ts.ats[i]);
-            if sp.ats.last().is_none_or(|&last| last < at) {
+            if sp.ats.last().is_none_or(|&last| last < at) && written.is_none_or(|end| end <= at) {
                 break;
             }
             i += 1;
@@ -1707,5 +1711,100 @@ mod tests {
         }
         set_directory(pg_directory());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The fixtures' compiled files: IANA's 2026c (public domain), the bytes jiff-tzdb 0.1.8 holds,
+    /// as warren-sling writes its zones' directory from them. A newer zic than 18.6's wrote them
+    /// slim: past where a zone last changes its rules, the rule written once in the footer, and
+    /// that instant marked, where the clock does not change at it, by a transition that changes
+    /// nothing.
+    #[cfg(feature = "zones")]
+    fn slim_directory() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/zones-slim")
+    }
+
+    /// PostgreSQL 18.6's own compiled files of the same release, by its own zic: slim too, the
+    /// rule's first change written out where a newer zic writes one that changes nothing.
+    #[cfg(feature = "zones")]
+    fn pg18_directory() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".pgrx/18.6/pgrx-install/share/postgresql/timezone")
+    }
+
+    /// The instants where two reads of a zone part, and how many were asked: from the zone's first
+    /// transition, or 1970 where it has none, to the end of 2100, each transition either read lays,
+    /// the microsecond before it (read at its second), and mid-January and mid-July of every year;
+    /// at each, its offset, daylight time and abbreviation, and the offset its local time takes on
+    /// the clock before it and on the clock after.
+    #[cfg(feature = "zones")]
+    fn parted(a: &State, b: &State) -> (usize, Vec<i64>) {
+        use crate::times::{date2j, j2date, UNIX_EPOCH_JDATE};
+        let day = |y, m, d| (date2j(y, m, d) - UNIX_EPOCH_JDATE) * SECSPERDAY;
+        let end = day(2101, 1, 1) - 1;
+        let first = a.ats.first().or(b.ats.first()).copied().unwrap_or(0);
+        let mut asked = std::collections::BTreeSet::new();
+        for &t in a.ats.iter().chain(&b.ats) {
+            if (first..=end).contains(&t) {
+                asked.insert(t);
+                asked.insert(t - 1);
+            }
+        }
+        let year = j2date(first.div_euclid(SECSPERDAY) + UNIX_EPOCH_JDATE).0;
+        for y in year..=2100 {
+            for m in [1, 7] {
+                let t = day(y, m, 15) + 12 * SECSPERHOUR;
+                if t >= first {
+                    asked.insert(t);
+                }
+            }
+        }
+        let read = |s: &State, t: i64| {
+            let (i, _) = s.type_at(t)?;
+            let (east, before) = (s.utc_offset(t)?, s.utc_offset(t - 1)?);
+            Some((
+                east,
+                s.ttis[i].isdst,
+                s.abbrev(t)?,
+                s.local_offset(t + before),
+                s.local_offset(t + east),
+            ))
+        };
+        let parted = asked
+            .iter()
+            .copied()
+            .filter(|&t| read(a, t) != read(b, t))
+            .collect();
+        (asked.len(), parted)
+    }
+
+    #[cfg(feature = "zones")]
+    #[test]
+    fn a_slim_zone_file_reads_at_every_instant_as_postgresql_18_6_reads_its_own() {
+        let read = |dir: std::path::PathBuf, zone: &str| {
+            read::load_file(&std::fs::read(dir.join(zone)).unwrap()).unwrap()
+        };
+        // The three Baltic zones, each keeping EET with no summer time for a while before taking
+        // the EU's rules again, and Norfolk, a southern summer from 2019 on after none since 1975:
+        // each slim file's last transition changes nothing. Troll, its file one transition and its
+        // footer every change after; Santiago, a southern summer; Phoenix, no summer time.
+        for (zone, asked) in [
+            ("Europe/Vilnius", 934),
+            ("Europe/Riga", 946),
+            ("Europe/Tallinn", 940),
+            ("Pacific/Norfolk", 736),
+            ("Antarctica/Troll", 577),
+            ("America/Santiago", 992),
+            ("America/Phoenix", 456),
+        ] {
+            let (slim, own) = (read(slim_directory(), zone), read(pg18_directory(), zone));
+            assert_eq!(parted(&slim, &own), (asked, vec![]), "{zone}");
+        }
+        // Lithuania kept EET from 1999-10-31 to 2003-03-30: mid-July of 2000 two hours east.
+        let vilnius = read(slim_directory(), "Europe/Vilnius");
+        assert_eq!(vilnius.utc_offset(963_662_400), Some(7200));
+        // 18.6's own Nuuk ends on a transition that changes nothing, at 2023-10-29 01:00 UTC, the
+        // instant of one of the rule's changes: that change kept, as 18.6 keeps it.
+        let nuuk = read(pg18_directory(), "America/Nuuk");
+        assert!(nuuk.ats.contains(&1_698_541_200));
     }
 }

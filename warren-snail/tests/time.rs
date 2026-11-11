@@ -71,6 +71,16 @@ fn some(v: &[&str]) -> Vec<Option<String>> {
     v.iter().map(|s| Some(s.to_string())).collect()
 }
 
+/// The tests that read a zone's file, one at a time: the directory zones are read from is the
+/// process's, and one of them sets another.
+#[cfg(feature = "standalone")]
+static ZONE_FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "standalone")]
+fn zone_files() -> std::sync::MutexGuard<'static, ()> {
+    ZONE_FILES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(feature = "standalone")]
 #[test]
 fn each_time_type_sorts_and_writes_as_postgresql_does_its_ends_and_infinities_among_them() {
@@ -355,6 +365,7 @@ fn a_value_is_rounded_to_its_column_s_precision_at_the_write() {
 #[cfg(feature = "standalone")]
 #[test]
 fn a_setting_set_to_the_value_the_snail_answers_under_does_nothing_and_any_other_is_refused() {
+    let _zones = zone_files();
     let mut snail = snail_of("time-set", &table("date"), &[]);
     for s in [
         "SET TimeZone = 'UTC'",
@@ -440,6 +451,7 @@ fn zones_are_among_the_default_features() {
 #[cfg(all(feature = "zones", feature = "standalone"))]
 #[test]
 fn under_zones_an_instant_at_a_named_zone_reads_its_rules() {
+    let _zones = zone_files();
     let mut snail = snail_of(
         "time-zones",
         &table("timestamptz"),
@@ -463,9 +475,68 @@ fn under_zones_an_instant_at_a_named_zone_reads_its_rules() {
     );
 }
 
+#[cfg(all(feature = "zones", feature = "standalone"))]
+#[test]
+fn a_slim_zone_file_answers_sling_s_statement_as_postgresql_18_6_does() {
+    let _zones = zone_files();
+    /// The directory zones were read from, set again however the test ends.
+    struct Back(std::path::PathBuf);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            warren_snail::zones::set_directory(self.0.clone());
+        }
+    }
+    let _back = Back(warren_snail::zones::directory());
+    // tests/zones-slim: compiled files of IANA's 2026c (public domain), the bytes jiff-tzdb 0.1.8
+    // holds, as warren-sling writes its zones' directory from them; slim, each Baltic zone's last
+    // transition changing nothing where the EU's rules begin again.
+    warren_snail::zones::set_directory(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/zones-slim"),
+    );
+    let mut snail = snail_of("time-slim", &table("timestamptz"), &[]);
+    // Each instant the snail once read by the footer's rule before the file's end, and the first
+    // change the rule makes after it: the zone, the instant, and 18.6's answer on its own files.
+    let asked = "\
+        Europe/Vilnius | 2000-03-26 01:00:00+00        | 2000-03-26 03:00:00
+        Europe/Vilnius | 2000-07-15 12:00:00+00        | 2000-07-15 14:00:00
+        Europe/Vilnius | 2000-10-29 00:59:59.999999+00 | 2000-10-29 02:59:59.999999
+        Europe/Vilnius | 2001-03-25 01:00:00+00        | 2001-03-25 03:00:00
+        Europe/Vilnius | 2001-07-15 12:00:00+00        | 2001-07-15 14:00:00
+        Europe/Vilnius | 2001-10-28 00:59:59.999999+00 | 2001-10-28 02:59:59.999999
+        Europe/Vilnius | 2002-03-31 01:00:00+00        | 2002-03-31 03:00:00
+        Europe/Vilnius | 2002-07-15 12:00:00+00        | 2002-07-15 14:00:00
+        Europe/Vilnius | 2002-10-27 00:59:59.999999+00 | 2002-10-27 02:59:59.999999
+        Europe/Vilnius | 2003-03-30 01:00:00+00        | 2003-03-30 04:00:00
+        Europe/Riga    | 2000-03-26 01:00:00+00        | 2000-03-26 03:00:00
+        Europe/Riga    | 2000-07-15 12:00:00+00        | 2000-07-15 14:00:00
+        Europe/Riga    | 2000-10-29 00:59:59.999999+00 | 2000-10-29 02:59:59.999999
+        Europe/Riga    | 2001-03-25 01:00:00+00        | 2001-03-25 04:00:00
+        Europe/Tallinn | 2000-03-26 01:00:00+00        | 2000-03-26 03:00:00
+        Europe/Tallinn | 2000-07-15 12:00:00+00        | 2000-07-15 14:00:00
+        Europe/Tallinn | 2000-10-29 00:59:59.999999+00 | 2000-10-29 02:59:59.999999
+        Europe/Tallinn | 2001-03-25 01:00:00+00        | 2001-03-25 03:00:00
+        Europe/Tallinn | 2001-07-15 12:00:00+00        | 2001-07-15 14:00:00
+        Europe/Tallinn | 2001-10-28 00:59:59.999999+00 | 2001-10-28 02:59:59.999999
+        Europe/Tallinn | 2002-03-31 01:00:00+00        | 2002-03-31 04:00:00";
+    for row in asked.lines() {
+        let [zone, instant, local] = row.split('|').map(str::trim).collect::<Vec<_>>()[..] else {
+            panic!("{row}");
+        };
+        snail.execute("BEGIN").unwrap();
+        snail
+            .execute(&format!("SET LOCAL TimeZone = '{zone}'"))
+            .unwrap();
+        let q = format!("SELECT CAST(TIMESTAMPTZ '{instant}' AS timestamp)");
+        let (b, _) = snail.ask(&q, None).unwrap();
+        snail.execute("COMMIT").unwrap();
+        assert_eq!(texts(&b, 0), some(&[local]), "{zone} {instant}");
+    }
+}
+
 #[cfg(feature = "standalone")]
 #[test]
 fn at_time_zone_reads_an_abbreviation_first_as_postgresql_does() {
+    let _zones = zone_files();
     let mut snail = snail_of(
         "time-abbreviations",
         &table("timestamptz"),
