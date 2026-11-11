@@ -522,15 +522,71 @@ fn assigned_types(
             stated.get(i).copied().flatten()
         };
         if let Some(from) = from.filter(|&from| !assignable(from, col.ty)) {
-            return Err(Error::new(format!(
-                "column \"{}\" is of type {} but expression is of type {}",
-                col.name,
-                super::typed::type_name(col.ty),
-                super::typed::type_name(from)
-            )));
+            return Err(not_assigned(col, from));
         }
     }
     Ok(types)
+}
+
+/// PostgreSQL's refusal of an expression of type `from` given to a column no assignment cast
+/// reaches.
+fn not_assigned(col: &crate::catalog::Column, from: ColumnType) -> Error {
+    Error::new(format!(
+        "column \"{}\" is of type {} but expression is of type {}",
+        col.name,
+        super::typed::type_name(col.ty),
+        super::typed::type_name(from)
+    ))
+}
+
+/// Each column a row's question answers, with its place in the answer.
+fn answered(fill: &[Fill]) -> Vec<(usize, usize)> {
+    fill.iter()
+        .enumerate()
+        .filter_map(|(c, f)| match f {
+            Fill::Answer(i) => Some((c, *i)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A value given to a generated column, or to an identity GENERATED ALWAYS, refused as PostgreSQL
+/// refuses it; its DEFAULT, drawn by the row's question or not, taken.
+fn given_refused<'a>(t: &Table, rows: impl Iterator<Item = &'a Vec<Fill>>) -> Result<()> {
+    for r in rows {
+        for (col, f) in t.columns.iter().zip(r) {
+            let always = col.identity.as_ref().is_some_and(|i| i.always);
+            if (col.generated.is_some() || always) && !matches!(f, Fill::Default | Fill::Drawn(_))
+            {
+                let why = match col.generated.is_some() {
+                    true => "a generated column",
+                    false => "an identity column defined as GENERATED ALWAYS",
+                };
+                return Err(Error::new(format!(
+                    "cannot insert a non-DEFAULT value into column \"{0}\": Column \"{0}\" is \
+                     {why}.",
+                    col.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many rows take each column's DEFAULT drawn for the statement, none drawn by a question.
+fn defaults_taken<'a>(
+    t: &Table,
+    rows: impl Iterator<Item = &'a Vec<Fill>>,
+) -> std::vec::IntoIter<(usize, usize)> {
+    let mut counts = vec![0usize; t.columns.len()];
+    for r in rows {
+        for (c, f) in r.iter().enumerate() {
+            if matches!(f, Fill::Default) {
+                counts[c] += 1;
+            }
+        }
+    }
+    counts.into_iter().enumerate().collect::<Vec<_>>().into_iter()
 }
 
 /// The type of each column of an answer, as the snail answers a column of that type.
@@ -702,7 +758,7 @@ fn returning_list(
 }
 
 /// The sequence a column's DEFAULT draws from: its identity's, or its DEFAULT's nextval.
-fn sequence_of(catalog: &Catalog, col: &crate::catalog::Column) -> Option<String> {
+pub(super) fn sequence_of(catalog: &Catalog, col: &crate::catalog::Column) -> Option<String> {
     if let Some(i) = &col.identity {
         return Some(i.sequence.clone());
     }
@@ -1664,35 +1720,21 @@ impl Snail {
                 self.filled(table, given)?
             }
             (Source::Filled(rows), None) => self.filled(table, rows)?,
+            (Source::Computed(rows), None) => self.computed(table, rows)?,
             (Source::Select { question, fill }, None) => {
                 let (batch, _) = self.answer(&question, None)?;
-                let fills: Vec<(usize, usize)> = fill
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(c, f)| match f {
-                        Fill::Answer(i) => Some((c, *i)),
-                        _ => None,
-                    })
+                let types = assigned_types(
+                    &self.catalog,
+                    &question,
+                    &batch,
+                    table,
+                    &answered(&fill),
+                )?;
+                let given = rows_of(&batch)?
+                    .into_iter()
+                    .map(|a| (fill.clone(), a))
                     .collect();
-                let types = assigned_types(&self.catalog, &question, &batch, table, &fills)?;
-                let t = &self.catalog.tables[table];
-                let mut given = Vec::new();
-                for a in rows_of(&batch)? {
-                    let mut row = Vec::with_capacity(fill.len());
-                    for (col, f) in t.columns.iter().zip(&fill) {
-                        row.push(match f {
-                            Fill::Answer(i) => Fill::Literal(fill::assign(
-                                a[*i].clone(),
-                                types[*i],
-                                col.ty,
-                                &col.name,
-                            )?),
-                            other => other.clone(),
-                        });
-                    }
-                    given.push(row);
-                }
-                self.filled(table, given)?
+                self.filled_from(table, given, &types)?
             }
         };
         *found = Some(rows.clone());
@@ -2010,43 +2052,105 @@ impl Snail {
     /// the CHECKs checked. A value given to a generated column, or to an identity GENERATED ALWAYS,
     /// is refused, as PostgreSQL refuses it.
     fn filled(&mut self, table: usize, rows: Vec<Vec<Fill>>) -> Result<Vec<Row>> {
+        let given = rows.into_iter().map(|r| (r, Row::new())).collect();
+        self.filled_from(table, given, &[])
+    }
+
+    /// The rows an INSERT gives, as `filled` fills them, each beside the row its question
+    /// answered, of the answer's `types`: a cell the question answers, or a DEFAULT it drew, read
+    /// from it.
+    fn filled_from(
+        &mut self,
+        table: usize,
+        rows: Vec<(Vec<Fill>, Row)>,
+        types: &[ColumnType],
+    ) -> Result<Vec<Row>> {
         let t = self.catalog.tables[table].clone();
-        for r in &rows {
-            for (col, f) in t.columns.iter().zip(r) {
-                let always = col.identity.as_ref().is_some_and(|i| i.always);
-                if (col.generated.is_some() || always) && !matches!(f, Fill::Default) {
-                    return Err(Error::new(format!(
-                        "cannot insert a non-DEFAULT value into column \"{}\"",
-                        col.name
-                    )));
+        given_refused(&t, rows.iter().map(|(r, _)| r))?;
+        let mut drawn = self.draws(&t, defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (r, a) in rows {
+            out.push(self.row_filled(&t, r, &a, types, &mut drawn)?);
+        }
+        Ok(out)
+    }
+
+    /// The rows a VALUES list gives where a cell is an expression, as 18.6 makes them row by row:
+    /// every row's expressions typed against their columns first; then each row's question answered
+    /// as the reader answers one, its expressions computed and its DEFAULTs drawn in their order
+    /// among its calls, and the row filled and checked before the next is computed.
+    fn computed(
+        &mut self,
+        table: usize,
+        rows: Vec<(Vec<Fill>, Option<String>)>,
+    ) -> Result<Vec<Row>> {
+        let t = self.catalog.tables[table].clone();
+        given_refused(&t, rows.iter().map(|(r, _)| r))?;
+        for (r, q) in &rows {
+            let Some(q) = q else {
+                continue;
+            };
+            let stated = stated_types(&self.catalog, q);
+            for (c, k) in answered(r) {
+                let col = &t.columns[c];
+                if let Some(from) = stated
+                    .get(k)
+                    .copied()
+                    .flatten()
+                    .filter(|&from| !assignable(from, col.ty))
+                {
+                    return Err(not_assigned(col, from));
                 }
             }
         }
-        let counts = (0..t.columns.len()).map(|c| {
-            (
-                c,
-                rows.iter()
-                    .filter(|r| matches!(r[c], Fill::Default))
-                    .count(),
-            )
-        });
-        let mut drawn = self.draws(&t, counts)?;
+        let mut drawn = self.draws(&t, defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let mut row = Vec::with_capacity(r.len());
-            for (c, f) in r.into_iter().enumerate() {
-                row.push(match f {
-                    Fill::Literal(d) => d,
-                    _ => self.default_of(&t, c, &mut drawn)?,
-                });
-            }
-            fill::generate(&t, &mut row)?;
-            fill::check_domains(&self.catalog.domains, &t, &row)?;
-            fill::check(&t, &row)?;
-            fill::without_overlaps(&t, &row)?;
-            out.push(row);
+        for (r, q) in rows {
+            let (a, types) = match q {
+                None => (Row::new(), Vec::new()),
+                Some(q) => {
+                    let (batch, _) = self.answer(&q, None)?;
+                    let types = assigned_types(&self.catalog, &q, &batch, table, &answered(&r))?;
+                    let a = rows_of(&batch)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| Error::new("a VALUES row's question answers its row"))?;
+                    (a, types)
+                }
+            };
+            out.push(self.row_filled(&t, r, &a, &types, &mut drawn)?);
         }
         Ok(out)
+    }
+
+    /// One row an INSERT gives, each cell filled: a value; the column of `answer`, of `types`, its
+    /// question gave it, or the DEFAULT the question drew; else its DEFAULT, with the values drawn
+    /// for the statement (`drawn`). Its stored generated columns are computed, and its domains,
+    /// CHECKs and temporal keys checked.
+    fn row_filled(
+        &self,
+        t: &Table,
+        r: Vec<Fill>,
+        answer: &[Datum],
+        types: &[ColumnType],
+        drawn: &mut std::collections::HashMap<String, std::collections::VecDeque<i64>>,
+    ) -> Result<Row> {
+        let mut row = Vec::with_capacity(r.len());
+        for (c, f) in r.into_iter().enumerate() {
+            let col = &t.columns[c];
+            row.push(match f {
+                Fill::Literal(d) => d,
+                Fill::Answer(k) | Fill::Drawn(k) => {
+                    fill::assign(answer[k].clone(), types[k], col.ty, &col.name)?
+                }
+                _ => self.default_of(t, c, drawn)?,
+            });
+        }
+        fill::generate(t, &mut row)?;
+        fill::check_domains(&self.catalog.domains, t, &row)?;
+        fill::check(t, &row)?;
+        fill::without_overlaps(t, &row)?;
+        Ok(row)
     }
 
     /// The values each column's sequence hands out for the statement, drawn at once: `counts` the

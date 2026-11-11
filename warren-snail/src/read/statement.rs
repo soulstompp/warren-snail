@@ -59,6 +59,9 @@ pub enum Fill {
     Answer(usize),
     Default,
     Expression(String),
+    /// The column's DEFAULT, drawn from its sequence by the question's column at that place, in
+    /// the order 18.6 draws it among the row's calls.
+    Drawn(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +75,12 @@ pub enum Source {
     },
     /// Rows given as VALUES, each cell a literal or the column's DEFAULT.
     Filled(Vec<Vec<Fill>>),
+    /// Rows given as VALUES, a cell of one at least an expression: each row's cells, and the
+    /// question that computes the row, asked once for it. Its columns are the row's expressions,
+    /// and where the statement calls the sequence functions its DEFAULTs drawing a sequence, in the
+    /// order 18.6 computes them: a row of several in the list's order, then the columns it leaves
+    /// out; one row alone in the table's.
+    Computed(Vec<(Vec<Fill>, Option<String>)>),
 }
 
 #[derive(Clone, Debug)]
@@ -849,6 +858,18 @@ pub(crate) fn numeric_literal_text(e: &Expr) -> Option<String> {
     }
 }
 
+/// A literal cell of an INSERT as a value of column `c`; none where the column's type does not
+/// read it as written (a number given to a text column, a value of another type cast, an array or
+/// a row built of expressions), which 18.6 types alone and assigns to the column, as the snail
+/// computes an expression.
+fn literal_cell(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
+    match datum(e, table, c) {
+        Ok(d) => Ok(Some(d)),
+        Err(err) if err.0.contains(" is not a value of ") => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// A literal as a value of column `c`.
 pub fn datum(e: &Expr, table: &Table, c: usize) -> Result<Datum> {
     if let ColumnType::Geometric(k) = table.columns[c].ty {
@@ -1105,6 +1126,76 @@ fn filled(columns: &[usize], width: usize, listed: bool) -> Result<Vec<usize>> {
     Ok(columns[..width].to_vec())
 }
 
+/// A cell of an INSERT read as a literal of its column where it is one the column reads; none
+/// where it is computed.
+fn literal_or_computed(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
+    match is_literal(e) || crate::composed::constructs(table.columns[c].ty, e) {
+        true => literal_cell(e, table, c),
+        false => Ok(None),
+    }
+}
+
+/// Whether a statement calls the sequence functions, itself or through a function of the file.
+fn calls_sequences(catalog: &Catalog, sql: &str) -> bool {
+    super::sequences::names(sql)
+        || super::own::names_through(catalog, sql, super::sequences::names)
+}
+
+/// The item a question draws a column's DEFAULT by, where a sequence hands it out: nextval of the
+/// sequence's OID, or of its name where the file holds no OID.
+fn draw_item(catalog: &Catalog, col: &crate::catalog::Column) -> Option<String> {
+    let s = super::change::sequence_of(catalog, col)?;
+    Some(match super::sequences::sequence_oid(catalog, &s) {
+        Some(oid) => format!("nextval({oid})"),
+        None => format!("nextval('{}')", s.replace('\'', "''")),
+    })
+}
+
+/// Each VALUES row's question: its expressions and, where the statement calls the sequence
+/// functions, its DEFAULTs a sequence hands out, in the order 18.6 computes a row's. A VALUES list
+/// of several rows is read row by row, each row's list in its order, a DEFAULT in its place,
+/// then the columns the list leaves out in the table's; one row alone is computed in the table's
+/// order.
+fn computed_rows(
+    catalog: &Catalog,
+    table: &Table,
+    rows: Vec<Vec<Fill>>,
+    listed: &[usize],
+    draws: bool,
+) -> Vec<(Vec<Fill>, Option<String>)> {
+    let n = table.columns.len();
+    let order: Vec<usize> = match rows.len() {
+        1 => (0..n).collect(),
+        _ => listed
+            .iter()
+            .copied()
+            .chain((0..n).filter(|c| !listed.contains(c)))
+            .collect(),
+    };
+    rows.into_iter()
+        .map(|mut row| {
+            let mut items: Vec<String> = Vec::new();
+            for &c in &order {
+                match &row[c] {
+                    Fill::Expression(text) => {
+                        items.push(format!("({text})"));
+                        row[c] = Fill::Answer(items.len() - 1);
+                    }
+                    Fill::Default if draws => {
+                        if let Some(item) = draw_item(catalog, &table.columns[c]) {
+                            items.push(item);
+                            row[c] = Fill::Drawn(items.len() - 1);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let question = (!items.is_empty()).then(|| format!("SELECT {}", items.join(", ")));
+            (row, question)
+        })
+        .collect()
+}
+
 fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     let ti = match &i.table {
         TableObject::TableName(n) => table_index(catalog, n)?,
@@ -1141,18 +1232,31 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             }
             let columns = filled(&columns, width, !i.columns.is_empty())?;
             let mut rows = Vec::with_capacity(v.rows.len());
+            let mut computed = false;
             for r in &v.rows {
                 let mut row = vec![Fill::Default; table.columns.len()];
                 for (&c, e) in columns.iter().zip(&r.content) {
                     row[c] = if is_default(e) {
                         Fill::Default
                     } else {
-                        Fill::Literal(datum(e, table, c)?)
+                        match literal_or_computed(e, table, c)? {
+                            Some(d) => Fill::Literal(d),
+                            None => {
+                                computed = true;
+                                Fill::Expression(e.to_string())
+                            }
+                        }
                     };
                 }
                 rows.push(row);
             }
-            Source::Filled(rows)
+            match computed {
+                false => Source::Filled(rows),
+                true => {
+                    let draws = calls_sequences(catalog, &i.to_string());
+                    Source::Computed(computed_rows(catalog, table, rows, &columns, draws))
+                }
+            }
         }
         SetExpr::Select(s) => {
             let columns = filled(&columns, s.projection.len(), !i.columns.is_empty())?;
@@ -1163,17 +1267,34 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                     SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                     _ => return Err(Error::new("name each column the INSERT's question returns")),
                 };
-                if is_literal(e) || crate::composed::constructs(table.columns[c].ty, e) {
-                    fill[c] = Fill::Literal(datum(e, table, c)?);
-                } else {
-                    fill[c] = Fill::Answer(kept.len());
-                    kept.push(item.clone());
+                match literal_or_computed(e, table, c)? {
+                    Some(d) => fill[c] = Fill::Literal(d),
+                    None => {
+                        fill[c] = Fill::Answer(kept.len());
+                        kept.push(item.clone());
+                    }
                 }
             }
             if kept.is_empty() {
                 return Err(Error::new(
                     "an INSERT's question returns a column of the table it reads",
                 ));
+            }
+            // Where the statement calls the sequence functions, each DEFAULT a sequence hands out
+            // is drawn by the question too, after the row's own items, as 18.6 draws a row's
+            // DEFAULTs after its question's calls for that row. A DISTINCT question makes its
+            // rows whole before any is written, and its DEFAULTs are drawn after it, as 18.6
+            // draws them.
+            if s.distinct.is_none() && calls_sequences(catalog, &i.to_string()) {
+                for (c, col) in table.columns.iter().enumerate() {
+                    if !matches!(fill[c], Fill::Default) {
+                        continue;
+                    }
+                    if let Some(item) = draw_item(catalog, col) {
+                        fill[c] = Fill::Drawn(kept.len());
+                        kept.push(SelectItem::UnnamedExpr(super::image::parse_expr(&item)?));
+                    }
+                }
             }
             let mut reduced = q.clone();
             if let SetExpr::Select(s) = reduced.body.as_mut() {

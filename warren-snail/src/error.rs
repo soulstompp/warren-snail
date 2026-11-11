@@ -67,6 +67,7 @@ enum Words {
 /// read in order, a RESTRICT before the foreign key's other refusal.
 const SAID: &[(Words, &str)] = &[
     (Words::Starts("duplicate key value violates unique constraint "), "23505"),
+    (Words::Starts("cannot insert a non-DEFAULT value into column \""), "428C9"),
     (Words::Holds("new row for relation ", " violates check constraint "), "23514"),
     (Words::Holds("check constraint ", " is violated by some row"), "23514"),
     (Words::Holds("value for domain ", " violates check constraint "), "23514"),

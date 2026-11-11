@@ -1132,8 +1132,16 @@ impl Snails {
                     _ => unreachable!(),
                 };
                 let (i, _) = self.at[table];
-                // The rows an INSERT … SELECT takes are read on the snail it writes.
-                if let Some(statement::Source::Select { question, .. }) = source {
+                // The rows an INSERT … SELECT takes, and a VALUES row's subqueries, are read on the
+                // snail it writes.
+                let questions: Vec<&String> = match source {
+                    Some(statement::Source::Select { question, .. }) => vec![question],
+                    Some(statement::Source::Computed(rows)) => {
+                        rows.iter().filter_map(|(_, q)| q.as_ref()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                for question in questions {
                     if self.snails_named(question)?.iter().any(|&j| j != i) {
                         return Err(Error::new(format!(
                             "a statement across snails reads only the snail it writes: {} lies in \

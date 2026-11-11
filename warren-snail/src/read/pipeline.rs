@@ -5965,12 +5965,16 @@ impl<'q> Prepared<'q> {
     }
 }
 
-/// Whether an expression calls a function that moves a sequence.
+/// Whether an expression calls a function that moves a sequence or reads what the session drew,
+/// each volatile in PostgreSQL's catalog.
 fn draws(e: &Expr) -> bool {
     let mut found = false;
     let _ = sqlparser::ast::visit_expressions(e, |x| {
         if let Expr::Function(f) = x {
-            found |= matches!(function_name(f).as_str(), "nextval" | "setval");
+            found |= matches!(
+                function_name(f).as_str(),
+                "nextval" | "setval" | "currval" | "lastval"
+            );
         }
         std::ops::ControlFlow::<()>::Continue(())
     });
