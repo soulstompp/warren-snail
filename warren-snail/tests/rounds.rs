@@ -826,12 +826,24 @@ fn a_sort_past_the_room_writes_the_rows_that_sort_last_and_hands_on_each_pass_in
         ints_of("SELECT t.parent FROM s.t t ORDER BY t.parent FETCH FIRST 3 ROWS WITH TIES");
     assert_eq!(got, [[1], [1], [2], [2]]);
     // Sorted in a step, read back in that order by the one after it.
-    let (got, _) = ints_of(
+    let q =
         "SELECT x.id FROM (SELECT t.parent, t.id FROM s.t t ORDER BY t.parent DESC, t.id DESC) x \
-         LIMIT 2",
-    );
+         LIMIT 2";
+    let (got, round) = ints_of(q);
     // The root's parent sorts first, then node 8,191's two children.
     assert_eq!(got, [[1], [16_383]]);
+    // Its 9 runs past the 8 a merge takes: the first merge takes 2 of them, the last the 8 left.
+    assert_eq!(round.spill_pages_written, 155, "{q}: {round:?}");
+    // Rows that tie across 9 runs, in the order they came: the root, then the children of nodes
+    // 4,096 to 8,191, then the rest.
+    let (got, _) =
+        ints_of("SELECT x.id FROM (SELECT t.id FROM s.t t ORDER BY t.parent / 4096 DESC) x");
+    let want: Vec<Vec<i64>> = std::iter::once(1)
+        .chain(8_192..=N)
+        .chain(2..8_192)
+        .map(|i| vec![i])
+        .collect();
+    assert_eq!(got, want);
 }
 
 #[test]

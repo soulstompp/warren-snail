@@ -394,9 +394,10 @@ impl Sorter {
         };
         let held = self.sorted_held()?;
         bytes += std::mem::take(&mut self.bytes);
-        // As many runs as the room has a page each for. Past it, that many side by side merged, those
-        // of the fewest bytes first, written again in their place, so the runs stand in the order they
-        // were written; never the first with those after the part.
+        // As many runs as the room has a page each for. Past it, runs side by side merged, those of
+        // the fewest bytes first, written again in their place, so the runs stand in the order they
+        // were written; never the first with those after the part. The first merge takes only as many
+        // as leave merges of that many to bring them to that many, each after it that many.
         let most = self
             .room
             .as_ref()
@@ -405,17 +406,19 @@ impl Sorter {
             })
             .max(8);
         let after = usize::from(parted);
+        let mut take = self.runs.len().saturating_sub(2) % (most - 1) + 2;
         while self.runs.len() > most {
-            let from = (after..=self.runs.len() - most)
-                .min_by_key(|&i| self.runs[i..i + most].iter().map(Run::total).sum::<u64>())
+            let from = (after..=self.runs.len() - take)
+                .min_by_key(|&i| self.runs[i..i + take].iter().map(Run::total).sum::<u64>())
                 .expect("runs past the most");
-            let group: Vec<Run> = self.runs.drain(from..from + most).collect();
+            let group: Vec<Run> = self.runs.drain(from..from + take).collect();
             let run = Run::past();
-            self.merged(Vec::new(), most, &group, &mut |rows, _| {
+            self.merged(Vec::new(), take, &group, &mut |rows, _| {
                 rows.into_iter().try_for_each(|r| run.push(r))
             })?;
             run.seal()?;
             self.runs.insert(from, run);
+            take = most;
         }
         let runs = std::mem::take(&mut self.runs);
         // The rows held came last; a part, after the first run, the rows held as the runs began.
