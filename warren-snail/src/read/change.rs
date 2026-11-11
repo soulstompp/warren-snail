@@ -1066,6 +1066,14 @@ impl Snail {
                 self.failed()?;
                 return Err(e);
             }
+            // At READ COMMITTED it names as committed when its round renews, which is before it is
+            // read where another's commit moved the catalog.
+            if let Err(e) = self.renewed_where_declared_since() {
+                if self.begun.is_some() {
+                    self.failed()?;
+                }
+                return Err(e);
+            }
         }
         let _handed = super::handed::holding(&self.functions);
         let _own = super::own::holding(&self.catalog.functions, self.catalog.release);
@@ -1188,6 +1196,7 @@ impl Snail {
         // Each statement reads what was committed when it began; in a transaction, with the
         // transaction's own changes in place (PostgreSQL's READ COMMITTED). At SERIALIZABLE the first
         // that reads takes the transaction's snapshot, its marks with it.
+        let read_on = self.root.catalog_named();
         if snapshot && self.levels.serializable(begun) {
             if let Err(e) = self.serial_snapshot(begun) {
                 self.failed()?;
@@ -1205,6 +1214,18 @@ impl Snail {
                     Statement::Setting { .. } | Statement::Constraints { .. }
                 );
         }
+        // Where another's DDL committed after it was read and before its round renewed, it is read
+        // again on the catalog as committed.
+        let st = match self.root.catalog_named() == read_on {
+            true => st,
+            false => match statement::parse(&self.catalog, text) {
+                Ok(again) => again,
+                Err(e) => {
+                    self.failed()?;
+                    return Err(e);
+                }
+            },
+        };
         self.rounds += 1;
         let (read0, written0, reused0) = (self.reader.pages_read(), self.written(), self.reused);
         let mut done = Done {
@@ -2752,8 +2773,11 @@ impl Snail {
         if root.generation == self.root.generation {
             return Ok(());
         }
+        // What it holds of each table by its place follows the table where another's DDL moved it.
         if self.catalog_moved(&root) {
-            self.catalog = Snail::catalog(&self.reader, &root)?;
+            let catalog = Snail::catalog(&self.reader, &root)?;
+            self.renumbered(&catalog);
+            self.catalog = catalog;
         }
         let mut stage = self.reader.stage();
         for ((ti, oi), blocks) in self.rebased.clone() {
@@ -4642,6 +4666,11 @@ impl Snail {
             .to_string();
         let (mut catalog, said) = Catalog::parse_declared(&text, kept)?;
         prepared(&mut catalog)?;
+        // The relations it reads are locked as PostgreSQL's parse analysis locks them; where it
+        // waited for another writer's, it begins again on the catalog that writer's end leaves.
+        if self.reads_locked(&catalog)? {
+            return self.declare(ddl);
+        }
         // A name another writer is making and has not committed is waited for; where its end
         // leaves the name standing, refused there, and else the declaration begins again on the
         // catalog its end leaves.
@@ -4928,6 +4957,24 @@ impl Snail {
             }
         }
         self.seen = self.catalog_seen(&newest)?;
+        Ok(())
+    }
+
+    /// A statement whose round renews, alone or in a transaction at READ COMMITTED, names as
+    /// committed: where another writer's commit moved the catalog past the one the snail read last,
+    /// its round renews before the statement is read. A transaction that declared reads as it
+    /// began.
+    fn renewed_where_declared_since(&mut self) -> Result<()> {
+        if self.held || self.declared.is_some() || (self.begun.is_none() && self.rounds == 0) {
+            return Ok(());
+        }
+        if self.reader.peek_root()?.catalog_named() == self.root.catalog_named() {
+            return Ok(());
+        }
+        match self.begun.is_some() {
+            true => self.renew_in_transaction()?,
+            false => self.renew()?,
+        };
         Ok(())
     }
 

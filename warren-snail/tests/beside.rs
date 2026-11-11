@@ -955,6 +955,48 @@ fn a_table_another_declared_an_order_of_since_takes_its_rows_as_committed() {
 }
 
 #[test]
+fn at_read_committed_a_write_names_its_tables_as_committed_when_its_round_renews() {
+    let path = tmp("beside-renewed.snail");
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.d (id integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.d2 (id integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.e (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    // Alone, a write takes a table another made since, as 18.6's does, and a table laid after one
+    // another dropped since.
+    run(&mut a, "INSERT INTO s.t (id, v) VALUES (1, 1)");
+    run(&mut b, "CREATE TABLE s.n (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id))");
+    run(&mut b, "INSERT INTO s.n (id, v) VALUES (1, 1)");
+    assert_eq!(run(&mut a, "INSERT INTO s.n (id, v) VALUES (2, 2)").rows, 1);
+    assert_eq!(run(&mut a, "UPDATE s.n SET v = v + 10").rows, 2);
+    assert_eq!(run(&mut a, "DELETE FROM s.n WHERE id = 1").rows, 1);
+    assert_eq!(count(&mut a, "SELECT sum(n.v) FROM s.n n"), 12);
+    run(&mut b, "DROP TABLE s.d");
+    assert_eq!(run(&mut a, "INSERT INTO s.e (id, v) VALUES (1, 1)").rows, 1);
+    assert_eq!(run(&mut a, "UPDATE s.e SET v = v + 10 WHERE id = 1").rows, 1);
+    // In a transaction too: a table another made since, and its own rows of a table that another's
+    // DROP of one laid before it moved, kept with that table to its commit.
+    run(&mut b, "CREATE TABLE s.m (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id))");
+    run(&mut b, "INSERT INTO s.m (id, v) VALUES (1, 1), (2, 2)");
+    run(&mut a, "BEGIN");
+    run(&mut a, "INSERT INTO s.e (id, v) VALUES (2, 2)");
+    run(&mut a, "UPDATE s.e SET v = v + 100 WHERE id = 1");
+    run(&mut b, "DROP TABLE s.d2");
+    assert_eq!(run(&mut a, "INSERT INTO s.e (id, v) VALUES (3, 3)").rows, 1);
+    assert_eq!(run(&mut a, "DELETE FROM s.e WHERE id = 2").rows, 1);
+    assert_eq!(run(&mut a, "INSERT INTO s.m (id, v) VALUES (3, 3)").rows, 1);
+    assert_eq!(run(&mut a, "UPDATE s.m SET v = v + 10 WHERE id = 1").rows, 1);
+    assert_eq!(run(&mut a, "DELETE FROM s.m WHERE id = 2").rows, 1);
+    assert_eq!(count(&mut a, "SELECT sum(e.v) FROM s.e e"), 114);
+    assert_eq!(count(&mut a, "SELECT sum(m.v) FROM s.m m"), 14);
+    run(&mut a, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(count(&mut r, "SELECT sum(e.id * 1000 + e.v) FROM s.e e"), 1111 + 3003);
+    assert_eq!(count(&mut r, "SELECT sum(m.id * 1000 + m.v) FROM s.m m"), 1011 + 3003);
+}
+
+#[test]
 fn a_table_declared_in_the_transaction_takes_its_rows_at_its_commit() {
     let path = made("declared-here");
     let (mut a, mut b) = (open(&path), open(&path));

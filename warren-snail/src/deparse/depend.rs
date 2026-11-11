@@ -85,11 +85,13 @@ pub(crate) fn eliminated(mut v: Vec<Addr>) -> Vec<Addr> {
 }
 
 /// What a tree names, gathered as the walker visits it: each query level's range table as the
-/// relations its entries read, the innermost last.
+/// relations its entries read, the innermost last; and every relation a range table entry of any
+/// level reads, in the order the walk meets them.
 pub(crate) struct Refs<'c, 'a> {
     cat: &'c Cat<'a>,
     pub addrs: Vec<Addr>,
     rtables: Vec<Vec<Option<u32>>>,
+    read: Vec<u32>,
 }
 
 impl<'c, 'a> Refs<'c, 'a> {
@@ -99,6 +101,7 @@ impl<'c, 'a> Refs<'c, 'a> {
             cat,
             addrs: Vec::new(),
             rtables: vec![relid.map_or_else(Vec::new, |r| vec![Some(r)])],
+            read: Vec::new(),
         }
     }
 
@@ -119,6 +122,9 @@ impl<'c, 'a> Refs<'c, 'a> {
             .collect();
         for rel in level.iter().flatten() {
             self.add(CLASS, *rel, 0);
+            if !self.read.contains(rel) {
+                self.read.push(*rel);
+            }
         }
         self.rtables.push(level);
         for r in &q.rtable {
@@ -402,9 +408,19 @@ pub(crate) fn of_query(cat: &Cat, q: &Query) -> Vec<Addr> {
         cat,
         addrs: Vec::new(),
         rtables: Vec::new(),
+        read: Vec::new(),
     };
     r.query(q);
     eliminated(r.addrs)
+}
+
+/// The relations a query's range tables read, at every level, its subqueries' and its CTEs' among
+/// them, each once: those PostgreSQL's parse analysis opens and locks.
+pub(crate) fn relations_read(cat: &Cat, q: &Query) -> Vec<u32> {
+    let mut r = Refs::over(cat, None);
+    r.rtables.clear();
+    r.query(q);
+    r.read
 }
 
 /// The distinct columns an expression reads, in the order the walk meets them, as `StoreRelCheck`

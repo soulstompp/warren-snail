@@ -476,8 +476,9 @@ pub fn unlock_block(file: &File, byte: u64) -> Result<()> {
 
 /// The bytes of the relations' locks LOCK TABLE, the writers and DDL take: for each relation, by its
 /// OID, a run of a byte a slot for each pair of its modes that conflict, and one for each mode that
-/// conflicts with itself.
-const TABLES: u64 = (1 << 62) + (1 << 60);
+/// conflicts with itself. They lie past the serializable marks' runs, so that no block's read mark
+/// falls on a relation's run.
+const TABLES: u64 = (1 << 62) + (1 << 60) + (12 << 56);
 const TABLE_RUNS: u64 = 32;
 
 /// The first byte of the `run`th run of the relation `key` names: its OID, or, for a table the file
@@ -753,6 +754,28 @@ mod tests {
         keep_generation(&b, 7, 9).unwrap();
         assert!(!older_held(&a, 9).unwrap());
         assert!(older_held(&a, 10).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_relation_s_lock_and_a_serializable_read_mark_never_meet() {
+        let (path, a, b) = file("tables-marks");
+        // A block whose lock byte falls on the number of a relation's run, read by one writer at
+        // SERIALIZABLE while another takes the relation's lock in that run.
+        let key = 16_384;
+        for run in 0..TABLE_RUNS {
+            let block = BLOCKS + key * TABLE_RUNS + run;
+            let at = table_run(key, run);
+            assert!(lock_run_shared(&b, at, 2, false).unwrap(), "run {run}");
+            assert!(lock_as(&b, at + 2, false, false).unwrap(), "run {run}");
+            assert_eq!(readers(&a, block).unwrap(), Vec::<u64>::new(), "run {run}: no reader");
+            unlock_run_shared(&b, at, 2).unwrap();
+            unlock_block(&b, at + 2).unwrap();
+            mark_read(&a, 1, block, true).unwrap();
+            assert!(lock_run_shared(&b, at, 2, false).unwrap(), "run {run}: no wait");
+            unlock_run_shared(&b, at, 2).unwrap();
+            mark_read(&a, 1, block, false).unwrap();
+        }
         std::fs::remove_file(path).unwrap();
     }
 

@@ -1928,6 +1928,99 @@ fn ddl_of_a_table_being_changed_waits_then_answers() {
 }
 
 #[test]
+fn ddl_reading_a_relation_another_is_changing_waits_then_answers() {
+    let (mut a, _b, path) = named("being-read");
+    let held_off = |a: &mut Snail, ours: &[&str], theirs: &str, end: &str| {
+        a.execute("BEGIN").unwrap();
+        for st in ours {
+            a.execute(st).unwrap_or_else(|e| panic!("{st}: {e}"));
+        }
+        let rx = later(&path, &[theirs]);
+        assert!(waits(&rx), "{theirs} waits on {ours:?}");
+        a.execute(end).unwrap();
+        next(&rx)
+    };
+    // A view of a table another is dropping waits on its lock, then is refused as committed; of one
+    // another is altering, at any level of its question, it is made once the other ends.
+    assert_eq!(
+        held_off(&mut a, &["DROP TABLE d7"], "CREATE VIEW v10 AS SELECT k FROM d7", "COMMIT"),
+        Err(said("42P01", "relation \"d7\" does not exist"))
+    );
+    let locked = ["ALTER TABLE t ADD CONSTRAINT c30 CHECK (y > 0)"];
+    assert_eq!(
+        held_off(
+            &mut a,
+            &locked,
+            "CREATE VIEW v13 AS WITH c AS (SELECT k FROM t) SELECT k FROM c",
+            "ROLLBACK"
+        ),
+        Ok(0)
+    );
+    // The view's lock stands to its transaction's end, on a table its subquery reads too; and a
+    // view of a view another is dropping waits as on a table.
+    assert_eq!(
+        held_off(
+            &mut a,
+            &["CREATE VIEW v12 AS SELECT k FROM t WHERE y IN (SELECT y FROM t8)"],
+            "DROP TABLE t8",
+            "ROLLBACK"
+        ),
+        Ok(0)
+    );
+    assert_eq!(
+        held_off(&mut a, &["DROP VIEW v13"], "CREATE VIEW v16 AS SELECT k FROM v13", "COMMIT"),
+        Err(said("42P01", "relation \"v13\" does not exist"))
+    );
+    // A sequence OWNED BY a table, and a function whose body reads one, wait alike.
+    for theirs in [
+        "CREATE SEQUENCE s20 OWNED BY t.y",
+        "CREATE FUNCTION f20() RETURNS bigint LANGUAGE sql RETURN (SELECT count(*) FROM t)",
+    ] {
+        assert_eq!(held_off(&mut a, &locked, theirs, "ROLLBACK"), Ok(0), "{theirs}");
+    }
+    a.execute("CREATE SEQUENCE s21").unwrap();
+    assert_eq!(
+        held_off(&mut a, &locked, "ALTER SEQUENCE s21 OWNED BY t.y", "ROLLBACK"),
+        Ok(0)
+    );
+    for (made, theirs, gone) in [
+        ("d22", "CREATE SEQUENCE s22 OWNED BY d22.k", "d22"),
+        (
+            "d23",
+            "CREATE FUNCTION f23() RETURNS bigint LANGUAGE sql RETURN (SELECT count(*) FROM d23)",
+            "d23",
+        ),
+    ] {
+        a.execute(&format!("CREATE TABLE {made} (k integer NOT NULL, PRIMARY KEY (k))"))
+            .unwrap();
+        let drop = format!("DROP TABLE {made}");
+        assert_eq!(
+            held_off(&mut a, &[drop.as_str()], theirs, "COMMIT"),
+            Err(said("42P01", &format!("relation \"{gone}\" does not exist"))),
+            "{theirs}"
+        );
+    }
+    // Two views of one table, and a writer of it, do not wait on another's view.
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE VIEW v14 AS SELECT k FROM t").unwrap();
+    let rx = later(
+        &path,
+        &["CREATE VIEW v15 AS SELECT k FROM t", "INSERT INTO t VALUES ('z', 1, 1)"],
+    );
+    assert_eq!((next(&rx), next(&rx)), (Ok(0), Ok(1)));
+    a.execute("COMMIT").unwrap();
+    drop(rx);
+    assert_eq!(
+        rows(
+            &mut a,
+            "SELECT count(*) FROM pg_class WHERE relname IN ('v10', 'v12', 'v13', 'v14', 'v15', \
+             'v16', 't8', 's20', 's21')"
+        ),
+        ["4"]
+    );
+}
+
+#[test]
 fn a_question_names_as_committed_and_reads_its_snapshot() {
     let (mut a, mut b, path) = named("question-committed");
     b.execute("CREATE TABLE d17 (k integer NOT NULL, PRIMARY KEY (k))")

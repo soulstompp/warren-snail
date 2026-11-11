@@ -237,10 +237,66 @@ impl Snail {
     /// holds not at all, the declaration refusing it in PostgreSQL's words. Returns whether it waited
     /// for another writer's.
     pub(super) fn ddl_locked(&mut self, ddl: &str) -> Result<bool> {
+        self.relations_locked(crate::ddl::locked(ddl))
+    }
+
+    /// Locks ACCESS SHARE, held to the transaction's end, each relation a declaration reads as
+    /// `catalog` declares it, as PostgreSQL's parse analysis opens them: those a view or a SQL
+    /// function's body it made reads, at every level, and the table a sequence's OWNED BY names.
+    /// Returns whether it waited for another writer's.
+    pub(super) fn reads_locked(&mut self, catalog: &crate::catalog::Catalog) -> Result<bool> {
+        use crate::ddl::Locked;
+        use crate::deparse::depend::relations_read;
+        let _named = crate::oids::named(catalog.oids.clone());
+        let cat = crate::deparse::cat::Cat::of(catalog);
+        let mut read: Vec<u32> = Vec::new();
+        for v in &catalog.views {
+            if self.catalog.views.iter().any(|x| x.name == v.name && x.query == v.query) {
+                continue;
+            }
+            if let Ok((q, _)) = crate::deparse::query::view_query(&cat, v) {
+                read.extend(relations_read(&cat, &q));
+            }
+        }
+        for f in &catalog.functions {
+            let kept = self.catalog.functions.iter().any(|x| {
+                x.name == f.name && x.args == f.args && x.statement == f.statement && x.form == f.form
+            });
+            if kept {
+                continue;
+            }
+            // A body naming a relation that does not stand is refused, as its parse analysis is.
+            match crate::deparse::funcs::own_body(&cat, f) {
+                Ok(Some(q)) => read.extend(relations_read(&cat, &q)),
+                Err(e) if e.sqlstate() == Some("42P01") => return Err(e),
+                _ => {}
+            }
+        }
+        let mut wanted: Vec<(Locked, Mode)> = Vec::new();
+        for oid in read {
+            if let Some(crate::oids::Object::Class(n)) = catalog.oids.object(oid) {
+                let l = Locked::Relation(n.clone());
+                if !wanted.iter().any(|(w, _)| *w == l) {
+                    wanted.push((l, AccessShare));
+                }
+            }
+        }
+        for s in &catalog.sequences {
+            let was = self.catalog.sequence(&s.name).map(|x| &x.owned_by);
+            if let Some((t, _)) = s.owned_by.as_ref().filter(|_| was != Some(&s.owned_by)) {
+                wanted.push((Locked::Relation(t.clone()), AccessShare));
+            }
+        }
+        self.relations_locked(wanted)
+    }
+
+    /// Locks each relation named in its mode, as `ddl_locked` describes, held to the transaction's
+    /// end. Returns whether it waited for another writer's.
+    fn relations_locked(&mut self, locked: Vec<(crate::ddl::Locked, Mode)>) -> Result<bool> {
         use crate::ddl::Locked;
         use crate::oids::{full, parts, Object};
         let mut keys: Vec<(u64, String, Mode)> = Vec::new();
-        for (l, mode) in crate::ddl::locked(ddl) {
+        for (l, mode) in locked {
             let (schema, name) = match &l {
                 Locked::Relation(n) => (None, full(n)),
                 Locked::Schema(s) => (Some(s.clone()), String::new()),
