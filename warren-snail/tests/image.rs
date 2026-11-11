@@ -359,13 +359,18 @@ fn before_any_some_and_all_over_an_array_it_is_asked_of_each_element() {
 fn a_row_constructor_compared_otherwise_stays_unread() {
     let mut s = empty("otherwise");
     for sql in [
-        "SELECT ROW(1, NULL) = ROW(1, NULL) AS x",
         "SELECT ROW(1) < ROW(2) AS x",
-        "SELECT (1, 2) <> (1, 3) AS x",
-        "SELECT (1, 2) IN ((1, 2)) AS x",
         "SELECT ROW(1) BETWEEN ROW(0) AND ROW(2) AS x",
     ] {
         assert!(refused(&mut s, sql).ends_with("is not read"), "{sql}");
+    }
+    // By `=` and `<>`, and in a list of rows, their pairs' comparisons, as 18.6 answers them.
+    for (sql, want) in [
+        ("SELECT ROW(1, NULL) = ROW(1, NULL) AS x", "NULL"),
+        ("SELECT (1, 2) <> (1, 3) AS x", "true"),
+        ("SELECT (1, 2) IN ((1, 2)) AS x", "true"),
+    ] {
+        assert_eq!(rows(&mut s, sql), [[want]], "{sql}");
     }
     assert_eq!(rows(&mut s, "SELECT ROW(1, 2.50)::text AS x"), [["(1,2.50)"]]);
     assert_eq!(rows(&mut s, "SELECT (ROW(1, 2)).f2 AS x"), [["2"]]);

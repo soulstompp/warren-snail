@@ -4223,7 +4223,29 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             list,
             negated,
         } => {
+            // A row IN a list of rows is the OR of its rows' comparisons, as PostgreSQL's parser
+            // writes it; where it is not, refused in its words.
             if row_parts(expr).is_some() {
+                if let Some(written) = super::spelled::rows_in(e) {
+                    return eval(&written, row, frame, computed);
+                }
+                super::spelled::rows_in_refused(e, &mut |x, with| match with {
+                    Some((op, field)) => {
+                        let compared = Expr::BinaryOp {
+                            left: Box::new(field.clone()),
+                            op: op.clone(),
+                            right: Box::new(x.clone()),
+                        };
+                        eval(&compared, row, frame, computed).map(|_| ())
+                    }
+                    None if super::image::unknown(x) => Err(Error::new(
+                        "input of anonymous composite types is not implemented",
+                    )),
+                    None => Err(Error::new(format!(
+                        "operator does not exist: record = {}",
+                        kind_name(&ev(x)?)
+                    ))),
+                })?;
                 return Err(Error::new(format!("{expr} is not read")));
             }
             let v = ev(expr)?;
@@ -4340,6 +4362,14 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                 return eval(&matched, row, frame, computed);
             }
             if row_parts(left).is_some() && row_parts(right).is_some() && !matches!(op, BinaryOperator::Overlaps) {
+                // Two rows compared by `=` or `<>` are their pairs' comparisons, as PostgreSQL's
+                // parser writes them; of two widths, or of none, refused in its words.
+                if let Some(written) = super::spelled::rows_compared(e) {
+                    return eval(&written, row, frame, computed);
+                }
+                if let (Some(l), Some(r)) = (row_parts(left), row_parts(right)) {
+                    super::image::rows_agree(l?.len(), r?.len())?;
+                }
                 return Err(Error::new(format!("{left} is not read")));
             }
             match op {
@@ -8658,8 +8688,8 @@ fn is_written_constant(e: &Expr) -> bool {
 }
 
 /// Whether an expression calls a function, or an operator on numbers or on a document, the question
-/// path does not read, or reads a CASE, an IN list, a subscript, a COLLATE or a parameter: its
-/// aggregates and the functions a DDL names are its own.
+/// path does not read, or reads a CASE, an OR, an IN list, a subscript, a COLLATE or a parameter:
+/// its aggregates and the functions a DDL names are its own.
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         Expr::Function(f) => {
@@ -8688,8 +8718,9 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::Tuple(_)
         | Expr::Case { .. } => true,
         Expr::Value(v) => matches!(v.value, SqlValue::Placeholder(_)),
+        // An OR: the question path reads one only where its arms are keys or elements.
         Expr::BinaryOp { left, op, right } => {
-            !(matches!(op, BinaryOperator::And | BinaryOperator::Or) || is_comparison(op))
+            !(matches!(op, BinaryOperator::And) || is_comparison(op))
                 || calls_beyond_the_question(left)
                 || calls_beyond_the_question(right)
         }

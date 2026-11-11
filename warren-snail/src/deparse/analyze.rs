@@ -1061,6 +1061,17 @@ impl Analyzer<'_, '_> {
     fn row_comparison(&self, name: &str, schema: Option<u32>, l: &[Expr], r: &[Expr]) -> Result<Node> {
         let largs = l.iter().map(|x| self.expr(x)).collect::<Result<Vec<_>>>()?;
         let rargs = r.iter().map(|x| self.expr(x)).collect::<Result<Vec<_>>>()?;
+        self.rows_compared(name, schema, largs, rargs)
+    }
+
+    /// The same, over the rows' fields as they are analysed.
+    fn rows_compared(
+        &self,
+        name: &str,
+        schema: Option<u32>,
+        largs: Vec<Node>,
+        rargs: Vec<Node>,
+    ) -> Result<Node> {
         if largs.len() != rargs.len() {
             return Err(Error::new("unequal number of entries in row expressions"));
         }
@@ -1871,7 +1882,14 @@ impl Analyzer<'_, '_> {
             }
         }
         for r in rest {
-            let cmp = self.boolean(self.op(name, None, Some(lexpr.clone()), r)?)?;
+            // A row against a row, field by field (`row_comparison`).
+            let cmp = match (&lexpr, r) {
+                (Node::Row { args: l, .. }, Node::Row { args: r, .. }) => {
+                    self.rows_compared(name, None, l.clone(), r)?
+                }
+                (_, r) => self.op(name, None, Some(lexpr.clone()), r)?,
+            };
+            let cmp = self.boolean(cmp)?;
             result = Some(match result {
                 None => cmp,
                 Some(prev) => Node::Bool {

@@ -2,7 +2,8 @@
 //! overlapping transactions found from both sides, and two in a row refused where PostgreSQL's
 //! monitor refuses them, in its words; READ ONLY and DEFERRABLE; the records a commit leaves; the
 //! older formats and a replica refused by name; and every interleaving of two transactions over two
-//! blocks, within one and across two snails held to some serial order.
+//! blocks, within one, within one read by an OR of keys, and across two snails held to some serial
+//! order.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -363,11 +364,13 @@ fn a_replica_refuses_the_level_as_a_hot_standby_does() {
     );
 }
 
-/// One of a transaction's statements in the walk: a read of a block, its rows' sum and count; a write
-/// of one of its rows; a row inserted into it.
+/// One of a transaction's statements in the walk: a read of a block, its rows' sum and count; a read
+/// by an OR of two keys, its row and where the second transaction's first row inserted beside it
+/// lands, their sum and count; a write of one of its rows; a row inserted into it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Step {
     Read(i32),
+    Keys(i32),
     Write(i32),
     Insert(i32),
 }
@@ -382,6 +385,7 @@ impl Step {
         };
         match self {
             Step::Read(x) => Step::Read(other(x)),
+            Step::Keys(x) => Step::Keys(other(x)),
             Step::Write(x) => Step::Write(other(x)),
             Step::Insert(x) => Step::Insert(other(x)),
         }
@@ -395,6 +399,11 @@ fn value_of(t: usize, k: usize) -> i32 {
 
 fn inserted_at(x: i32, t: usize, k: usize) -> i32 {
     x + 1 + 3 * t as i32 + k as i32
+}
+
+/// The two keys `Step::Keys(x)` reads.
+fn keys_of(x: i32) -> [i32; 2] {
+    [x, inserted_at(x, 1, 0)]
 }
 
 fn range_of(x: i32) -> (i32, i32) {
@@ -421,6 +430,11 @@ fn statement(step: Step, t: usize, k: usize, several: bool) -> String {
             let table = table_of(x, several);
             format!("SELECT sum(t.v), count(*) FROM {table} t WHERE t.id >= {a} AND t.id <= {z}")
         }
+        Step::Keys(x) => {
+            let [k, l] = keys_of(x);
+            let table = table_of(x, several);
+            format!("SELECT sum(t.v), count(*) FROM {table} t WHERE t.id = {k} OR t.id = {l}")
+        }
         Step::Write(x) => format!(
             "UPDATE {} SET v = {} WHERE id = {x}",
             table_of(x, several),
@@ -444,7 +458,7 @@ struct Rows2 {
 impl Rows2 {
     fn apply(&mut self, step: Step, t: usize, k: usize) {
         match step {
-            Step::Read(_) => {}
+            Step::Read(_) | Step::Keys(_) => {}
             Step::Write(x) => {
                 self.touched.insert(x, value_of(t, k));
             }
@@ -472,6 +486,28 @@ impl Rows2 {
             }
         }
         (sum, count)
+    }
+
+    /// What a read by keys answers: the rows at those keys, their sum and count.
+    fn keys(&self, ids: &[i32]) -> (i64, i64) {
+        let (mut sum, mut count) = (0, 0);
+        for &id in ids {
+            let written = (id % 16 == 0 && (0..16 * ROWS).contains(&id)).then_some(id);
+            if let Some(v) = self.touched.get(&id).copied().or(written) {
+                sum += i64::from(v);
+                count += 1;
+            }
+        }
+        (sum, count)
+    }
+
+    /// What a step that reads answers; none for one that writes.
+    fn answer(&self, step: Step) -> Answered {
+        match step {
+            Step::Read(x) => Some(self.read(x)),
+            Step::Keys(x) => Some(self.keys(&keys_of(x))),
+            Step::Write(_) | Step::Insert(_) => None,
+        }
     }
 }
 
@@ -706,9 +742,9 @@ fn some_serial_order(transactions: &[Vec<Step>], ran: &[Ran], rows: [(i64, i64);
         for &t in order {
             let mut answer = ran[t].1.iter();
             for (k, step) in transactions[t].iter().enumerate() {
-                if let Step::Read(x) = step {
+                if let Some(read) = state.answer(*step) {
                     match answer.next() {
-                        Some(Some(a)) if *a == state.read(*x) => {}
+                        Some(Some(a)) if *a == read => {}
                         _ => return false,
                     }
                 } else {
@@ -806,6 +842,13 @@ struct Walked {
     broken_count: u64,
 }
 
+/// Which walk `statements` are, for the names of its files: over two blocks, within one, or within
+/// one by keys.
+fn kind_of(statements: &[Step]) -> i32 {
+    let has = |s: Step| i32::from(statements.contains(&s));
+    has(Step::Read(C)) + 2 * has(Step::Keys(C))
+}
+
 /// Walks every interleaving of every set of `n` transactions of `statements`, at `level`, those of
 /// `shard` among `of`.
 fn walk(
@@ -815,11 +858,7 @@ fn walk(
     shard_of: (usize, usize),
     jobs: usize,
 ) -> Walked {
-    let tag = format!(
-        "{n}-{}-{}",
-        level.replace(' ', "-"),
-        i32::from(statements.contains(&Step::Read(C)))
-    );
+    let tag = format!("{n}-{}-{}", level.replace(' ', "-"), kind_of(statements));
     walk_on(
         vec![made(&format!("walk-base-{tag}"))],
         n,
@@ -842,7 +881,7 @@ fn walk_on(
     let tag = format!(
         "{n}-{}-{}-{}",
         level.replace(' ', "-"),
-        i32::from(statements.contains(&Step::Read(C))),
+        kind_of(statements),
         base.len()
     );
     let mut work: Vec<(Vec<Vec<Step>>, Vec<u8>)> = Vec::new();
@@ -922,6 +961,16 @@ const IN_ONE_BLOCK_AND_INSERTS: [Step; 6] = [
     Step::Insert(C),
     Step::Insert(D),
 ];
+/// The same, each read by an OR of two keys beside the writes by key: its row, and where a row is
+/// inserted beside it.
+const IN_ONE_BLOCK_BY_KEYS: [Step; 6] = [
+    Step::Keys(C),
+    Step::Keys(D),
+    Step::Write(C),
+    Step::Write(D),
+    Step::Insert(C),
+    Step::Insert(D),
+];
 
 /// How much of a walk a run takes: `SNAIL_SERIAL_SHARD` as `k/n`, one in `n` of its schedules.
 fn shard() -> (usize, usize) {
@@ -960,6 +1009,15 @@ fn at_repeatable_read_the_same_walk_finds_histories_no_serial_order_gives() {
 #[test]
 fn every_interleaving_of_two_transactions_in_one_block_is_some_serial_order() {
     let w = walk(2, &IN_ONE_BLOCK_AND_INSERTS, "SERIALIZABLE", (0, 1), jobs());
+    println!("{w:?}");
+    assert_eq!(w.broken_count, 0, "{:#?}", w.broken);
+    assert_eq!(w.schedules, 5772);
+    assert!(w.committed > 0 && w.refused > 0, "{w:?}");
+}
+
+#[test]
+fn every_interleaving_of_two_transactions_in_one_block_reading_by_keys_is_some_serial_order() {
+    let w = walk(2, &IN_ONE_BLOCK_BY_KEYS, "SERIALIZABLE", (0, 1), jobs());
     println!("{w:?}");
     assert_eq!(w.broken_count, 0, "{:#?}", w.broken);
     assert_eq!(w.schedules, 5772);

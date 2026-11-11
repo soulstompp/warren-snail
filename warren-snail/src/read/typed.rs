@@ -534,6 +534,27 @@ impl Typing<'_> {
             }
             Expr::InList { expr, list, .. } => {
                 let t = self.type_of(expr)?;
+                // A row IN a list as PostgreSQL's parser refuses it, where it is not written as the
+                // OR of its rows' comparisons (`spelled::rows_in`).
+                if super::pipeline::row_parts(expr).is_some() {
+                    super::spelled::rows_in_refused(e, &mut |x, with| {
+                        let u = self.type_of(x)?;
+                        match (with, u) {
+                            (Some((op, field)), u) => {
+                                let f = self.type_of(field)?;
+                                compared(&op.to_string(), (f, field), (u, x))
+                            }
+                            (None, _) if super::image::unknown(x) => Err(Error::new(
+                                "input of anonymous composite types is not implemented",
+                            )),
+                            (None, Some(u)) => Err(Error::new(format!(
+                                "operator does not exist: record = {}",
+                                type_name(u)
+                            ))),
+                            (None, None) => Ok(()),
+                        }
+                    })?;
+                }
                 for x in list {
                     let u = self.type_of(x)?;
                     statistics_operator("=", t, u)?;
@@ -699,6 +720,14 @@ impl Typing<'_> {
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
+                        // Two rows compared, of two widths or of none, as make_row_comparison_op
+                        // refuses them.
+                        if let (Some(l), Some(r)) = (
+                            super::pipeline::row_parts(left),
+                            super::pipeline::row_parts(right),
+                        ) {
+                            super::image::rows_agree(l?.len(), r?.len())?;
+                        }
                         compared(&op.to_string(), (a, left), (b, right))?;
                         Some(ColumnType::Boolean)
                     }

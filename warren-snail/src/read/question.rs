@@ -2133,6 +2133,15 @@ fn own_names(e: &mut Expr, table: &Table, columns: &mut Vec<usize>) -> bool {
     }
 }
 
+/// Whether a condition is NULL or FALSE written out, inside any parentheses.
+fn keeps_none(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x) => keeps_none(x),
+        Expr::Value(v) => matches!(v.value, Value::Null | Value::Boolean(false)),
+        _ => false,
+    }
+}
+
 /// An OR, a NOT or what stands under one, read on one table.
 fn arms_of(from: &From, e: &Expr) -> Result<Arms> {
     let not_one = || Error::new(format!("{e} reads more than one table"));
@@ -2147,7 +2156,34 @@ fn arms_of(from: &From, e: &Expr) -> Result<Arms> {
             op: op @ (BinaryOperator::And | BinaryOperator::Or),
             right,
         } => {
-            let (l, r) = (arms_of(from, left)?, arms_of(from, right)?);
+            // NULL or FALSE written out keeps no row, on the other side's table.
+            let none = |side: usize, e: &Expr| Arms {
+                side,
+                arm: Arm::Read(Box::new(Side {
+                    table: from.tables[side].0,
+                    goes_by: String::new(),
+                    conds: Vec::new(),
+                    texts: Vec::new(),
+                    nulls: Vec::new(),
+                    empty: true,
+                    ops: Vec::new(),
+                })),
+                expr: e.clone(),
+                columns: Vec::new(),
+                element: false,
+            };
+            let (l, r) = match (keeps_none(left), keeps_none(right)) {
+                (true, false) => {
+                    let r = arms_of(from, right)?;
+                    (none(r.side, left), r)
+                }
+                (false, true) => {
+                    let l = arms_of(from, left)?;
+                    let r = none(l.side, right);
+                    (l, r)
+                }
+                _ => (arms_of(from, left)?, arms_of(from, right)?),
+            };
             if l.side != r.side {
                 return Err(not_one());
             }
@@ -2237,8 +2273,9 @@ fn arms_of(from: &From, e: &Expr) -> Result<Arms> {
     }
 }
 
-/// An OR or a NOT over conditions of one table with an operator a strand may answer among them; none
-/// where it is any other, or reads what is not held a row at a time here.
+/// An OR or a NOT over conditions of one table with an operator a strand may answer among them, or
+/// an OR whose every arm is one key of the table's own order (`points`); none where it is any other,
+/// or reads what is not held a row at a time here.
 fn over_operators(from: &From, p: &Expr) -> Option<Conj> {
     let mut e = p;
     while let Expr::Nested(x) = e {
@@ -2256,7 +2293,9 @@ fn over_operators(from: &From, p: &Expr) -> Option<Conj> {
     ) {
         return None;
     }
-    let a = arms_of(from, e).ok().filter(|a| a.element)?;
+    let a = arms_of(from, e)
+        .ok()
+        .filter(|a| a.element || points(from.table(a.side), &a.arm).is_some())?;
     let table = from.table(a.side);
     let name = |c: usize| table.columns[c].name.clone();
     Some(Conj::One(
@@ -2274,9 +2313,95 @@ fn over_operators(from: &From, p: &Expr) -> Option<Conj> {
     ))
 }
 
+/// The keys an OR reads of its table's own order, a unique one, where each of its arms, at any depth,
+/// fixes every level of that order by `=` to a value, none NULL, as a walk of it reads one key
+/// (`walk::point_of`), other conditions beside them; an arm that keeps no row is left out. Each key
+/// once, in the order's order, with the conditions that fix it. None where an arm is any other, or
+/// none is left.
+fn points(table: &Table, arm: &Arm) -> Option<Vec<(Vec<crate::places::KeyValue>, Side)>> {
+    let order = table.orders.iter().find(|o| o.table_order && o.unique)?;
+    let mut arms = Vec::new();
+    any_arms(arm, &mut arms);
+    let mut keys = Vec::new();
+    for a in arms {
+        let side = all_of(table, a)?;
+        if !side.empty {
+            keys.push(super::walk::point_of(table, order, &side)?);
+        }
+    }
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    keys.dedup_by(|a, b| a.0 == b.0);
+    (!keys.is_empty()).then_some(keys)
+}
+
+/// A side holding an OR of keys (`points`), read a key at a time: for each key, in the order's
+/// order, the side with the conditions that fix it beside its own. None where it holds none.
+pub(super) fn by_points(table: &Table, side: &Side) -> Option<Vec<Side>> {
+    let keys = side
+        .ops
+        .iter()
+        .find_map(|o| o.arms.as_ref().and_then(|a| points(table, a)))?;
+    let each = keys.into_iter().map(|(_, fixing)| {
+        let mut s = side.clone();
+        for c in fixing.conds {
+            s.take(Piece::Cond(c), table);
+        }
+        for t in fixing.texts {
+            s.take(Piece::Text(t), table);
+        }
+        s
+    });
+    Some(each.collect())
+}
+
+/// The arms of an OR, each OR among them opened.
+fn any_arms<'a>(arm: &'a Arm, out: &mut Vec<&'a Arm>) {
+    match arm {
+        Arm::Any(v) => v.iter().for_each(|a| any_arms(a, out)),
+        a => out.push(a),
+    }
+}
+
+/// The conditions an arm holds a row to on the table's levels: its own, or those of each part of
+/// an AND that an order may answer, the others standing beside them. None where it is no such arm.
+fn all_of(table: &Table, arm: &Arm) -> Option<Side> {
+    match arm {
+        Arm::Read(own) => Some(own.as_ref().clone()),
+        Arm::All(parts) => {
+            let mut sides = parts.iter().filter_map(|p| all_of(table, p));
+            let mut side = sides.next()?;
+            for s in sides {
+                for c in s.conds {
+                    side.take(Piece::Cond(c), table);
+                }
+                for t in s.texts {
+                    side.take(Piece::Text(t), table);
+                }
+                for (c, null) in s.nulls {
+                    side.take(Piece::Null(c, null), table);
+                }
+                side.empty |= s.empty;
+            }
+            Some(side)
+        }
+        Arm::Op(_) | Arm::Held | Arm::Any(_) => None,
+    }
+}
+
 /// What one conjunct says, as the conditions and comparisons PostgreSQL's analyser reads it as: a
-/// BETWEEN as its comparisons; a pattern as itself, and the keys its fixed prefix narrows to.
+/// BETWEEN as its comparisons; a pattern as itself, and the keys its fixed prefix narrows to; a row
+/// IN a list of rows, or two rows compared, as the conjuncts of their comparisons.
 fn read_conjunct(from: &From, p: &Expr) -> Result<Vec<Conj>> {
+    let written = super::spelled::rows_in(p).or_else(|| super::spelled::rows_compared(p));
+    if let Some(w) = written {
+        let mut parts = Vec::new();
+        conjuncts(&w, &mut parts);
+        let mut read = Vec::new();
+        for c in parts {
+            read.extend(read_conjunct(from, c)?);
+        }
+        return Ok(read);
+    }
     if let Some(read) = over_operators(from, p) {
         return Ok(vec![read]);
     }

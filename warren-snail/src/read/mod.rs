@@ -400,8 +400,8 @@ fn order_tag(table: usize, order: usize) -> u32 {
 
 /// What a question a pipeline reads off one table hands to the table's read: its FROM, the alias it
 /// gives the table kept, and each conjunct of its WHERE fixing a column of the table's order by `=`
-/// with a constant written out, so that the read goes by the key and a serializable round marks what
-/// that key reaches. The pipeline reads the WHERE whole after. None where the question has a WITH,
+/// with a constant written out, or an OR of such, so that the read goes by the keys and a
+/// serializable round marks what those keys reach. The pipeline reads the WHERE whole after. None where the question has a WITH,
 /// whose steps may give a column of the table's name another value, or a FROM of more than the table.
 fn keyed_conjuncts<'q>(
     q: &'q sqlparser::ast::Query,
@@ -462,18 +462,41 @@ fn keyed_conjuncts<'q>(
         }
         _ => false,
     };
+    let by_key = |c: &Expr| {
+        matches!(c, Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
+                if key(left) && constant(right) || key(right) && constant(left))
+    };
     let mut all = Vec::new();
     if let Some(w) = &s.selection {
         relations::conjuncts(w, &mut all);
     }
     let keyed = all
         .into_iter()
-        .filter(|c| {
-            matches!(c, Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
-                if key(left) && constant(right) || key(right) && constant(left))
-        })
+        .filter(|c| by_key(c) || of_keys(c, &by_key, false))
         .collect();
     (from, keyed)
+}
+
+/// Whether a condition is an OR, inside any parentheses, of ANDs and ORs whose every condition
+/// `by_key` holds of; `under_or` where one stands above it.
+fn of_keys(
+    e: &sqlparser::ast::Expr,
+    by_key: &dyn Fn(&sqlparser::ast::Expr) -> bool,
+    under_or: bool,
+) -> bool {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match e {
+        Expr::Nested(x) => of_keys(x, by_key, under_or),
+        Expr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            right,
+        } => {
+            let or = under_or || *op == BinaryOperator::Or;
+            or && of_keys(left, by_key, true) && of_keys(right, by_key, true)
+        }
+        e => under_or && by_key(e),
+    }
 }
 
 /// A snail opened for reading: its root and its catalog read, nothing else.
@@ -2005,6 +2028,13 @@ impl Snail {
             self.keep_drawn(&mut part.plan, sample, &want)?;
             return self.scan_part(&want, &columns, part, sink, before, held_before);
         }
+        // An OR of keys of the table's own order: each key read by a walk of its own.
+        let own = table.orders.iter().find(|o| o.table_order);
+        if let (None, Some(own)) = (kept, own.filter(|o| order.is_none_or(|n| n == o.name))) {
+            if let Some(each) = question::by_points(table, want.side) {
+                return self.scan_points(&want, &columns, &own.name, each, sink);
+            }
+        }
         let along = match kept {
             None => self.along_elements(q, &want, order)?,
             Some(_) => Along::Not,
@@ -2035,6 +2065,47 @@ impl Snail {
             }
         };
         self.scan_part(&want, &columns, part, sink, before, held_before)
+    }
+
+    /// A table read a key at a time along its own order, each key's side read by a walk of its own,
+    /// in the order's order, into one sink: the rounds summed, and what the directories counted.
+    fn scan_points(
+        &self,
+        want: &Want,
+        columns: &[(usize, bool)],
+        order: &str,
+        each: Vec<question::Side>,
+        sink: &mut dyn Sink,
+    ) -> Result<(Round, u64, [u64; 12])> {
+        // Each key holds one row at most.
+        sink.rows_most(each.len() as u64);
+        let mut sink = Told(sink);
+        let mut total: Option<Round> = None;
+        let (mut counted, mut months) = (0, [0u64; 12]);
+        for side in &each {
+            let want = Want {
+                table: want.table,
+                side,
+                columns: want.columns.clone(),
+                countable: want.countable,
+                keys: want.keys,
+            };
+            let (before, held_before) = (self.touched(), self.pages_held());
+            let part = self.part(&want, Some(order))?;
+            let (r, c, m) = self.scan_part(&want, columns, part, &mut sink, before, held_before)?;
+            counted += c;
+            months.iter_mut().zip(m).for_each(|(x, y)| *x += y);
+            match &mut total {
+                None => total = Some(r),
+                Some(t) => {
+                    t.add_table(&r, "");
+                    t.order = r.order;
+                    t.rows_walked += r.rows_walked;
+                    t.rows_taken += r.rows_taken;
+                }
+            }
+        }
+        Ok((total.unwrap_or_default(), counted, months))
     }
 
     /// A table's read along the order priced: the round, and what the directory counted, in all and
@@ -2356,6 +2427,40 @@ impl<F: FnMut(RecordBatch) -> Result<()>> Sink for Blocks<'_, F> {
         );
         let batch = done.finish(&[self.table], &self.q.select, &self.q.order)?;
         (self.feed)(batch)
+    }
+}
+
+/// A sink read by several walks, already told the rows they may give in all.
+struct Told<'a>(&'a mut dyn Sink);
+
+impl Sink for Told<'_> {
+    fn dictionaries(&mut self, dicts: &[Dict]) {
+        self.0.dictionaries(dicts);
+    }
+
+    fn lead(&self) -> usize {
+        self.0.lead()
+    }
+
+    fn admits(&mut self, lead: &[Cell]) -> bool {
+        self.0.admits(lead)
+    }
+
+    fn row(&mut self, cells: &[Cell]) {
+        self.0.row(cells);
+    }
+
+    fn run(
+        &mut self,
+        outs: &[(bool, bool, usize, &crate::values::Values)],
+        from: usize,
+        to: usize,
+    ) -> bool {
+        self.0.run(outs, from, to)
+    }
+
+    fn block_end(&mut self) -> Result<()> {
+        self.0.block_end()
     }
 }
 

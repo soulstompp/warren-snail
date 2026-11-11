@@ -1375,6 +1375,144 @@ fn expr(e: &mut Expr) {
     if let Some(written) = rows_distinct(e) {
         *e = written;
     }
+    if let Some(written) = rows_in(e) {
+        *e = written;
+    }
+    if let Some(written) = rows_compared(e) {
+        *e = written;
+    }
+}
+
+/// A row IN a list, written as `transformAExprIn` writes it where every element is a row of the
+/// left's width or NULL: each element's pairs compared by `=` and and'd, NOT IN's by `<>` and or'd,
+/// a row of one field its one comparison, an element NULL a NULL; the elements or'd, NOT IN's and'd.
+/// None for anything else, which stays as written (`rows_in_refused`).
+pub(super) fn rows_in(e: &Expr) -> Option<Expr> {
+    let Expr::InList {
+        expr: left,
+        list,
+        negated,
+    } = e
+    else {
+        return None;
+    };
+    let Some(Ok(l)) = super::pipeline::row_parts(left) else {
+        return None;
+    };
+    let (op, among) = match negated {
+        false => (BinaryOperator::Eq, BinaryOperator::Or),
+        true => (BinaryOperator::NotEq, BinaryOperator::And),
+    };
+    let mut arms = Vec::with_capacity(list.len());
+    for x in list {
+        match super::pipeline::row_parts(x) {
+            Some(Ok(r)) if r.len() == l.len() => arms.push(paired(&l, &r, &op)?),
+            None if is_null(x) => arms.push(Expr::Value(sqlparser::ast::Value::Null.into())),
+            _ => return None,
+        }
+    }
+    let written = arms.into_iter().reduce(|a, b| Expr::BinaryOp {
+        left: Box::new(a),
+        op: among.clone(),
+        right: Box::new(b),
+    })?;
+    Some(Expr::Nested(Box::new(written)))
+}
+
+/// Two rows of one width compared by `=` or `<>`, written as `make_row_comparison_op` writes them:
+/// the pairs' `=`s and'd, their `<>`s or'd; none for anything else.
+pub(super) fn rows_compared(e: &Expr) -> Option<Expr> {
+    let Expr::BinaryOp {
+        left,
+        op: op @ (BinaryOperator::Eq | BinaryOperator::NotEq),
+        right,
+    } = e
+    else {
+        return None;
+    };
+    let (Some(Ok(l)), Some(Ok(r))) = (
+        super::pipeline::row_parts(left),
+        super::pipeline::row_parts(right),
+    ) else {
+        return None;
+    };
+    (l.len() == r.len()).then(|| paired(&l, &r, op))?
+}
+
+/// Each pair of two rows' fields compared by `op`, in parentheses: and'd for `=`, or'd for `<>`.
+/// None for rows of no fields.
+fn paired(l: &[&Expr], r: &[&Expr], op: &BinaryOperator) -> Option<Expr> {
+    let joined = match op {
+        BinaryOperator::NotEq => BinaryOperator::Or,
+        _ => BinaryOperator::And,
+    };
+    let grouped = |x: &Expr| match x {
+        Expr::BinaryOp { .. } | Expr::UnaryOp { .. } => Expr::Nested(Box::new(x.clone())),
+        x => x.clone(),
+    };
+    let written = l
+        .iter()
+        .zip(r)
+        .map(|(x, y)| Expr::BinaryOp {
+            left: Box::new(grouped(x)),
+            op: op.clone(),
+            right: Box::new(grouped(y)),
+        })
+        .reduce(|a, b| Expr::BinaryOp {
+            left: Box::new(a),
+            op: joined.clone(),
+            right: Box::new(b),
+        })?;
+    Some(Expr::Nested(Box::new(written)))
+}
+
+/// Whether an expression is NULL written out, inside any parentheses.
+fn is_null(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(x) => is_null(x),
+        Expr::Value(v) => v.value == sqlparser::ast::Value::Null,
+        _ => false,
+    }
+}
+
+/// What PostgreSQL's parser says of a row IN a list that stays as written, each element in turn: a
+/// row of another width, or a row of none; `said` says it of each field of a row of the left's
+/// width, given with the operator and the left's field it is compared with, and of an element that
+/// is no row, given alone.
+pub(super) fn rows_in_refused(
+    e: &Expr,
+    said: &mut dyn FnMut(&Expr, Option<(&BinaryOperator, &Expr)>) -> Result<()>,
+) -> Result<()> {
+    let Expr::InList {
+        expr: left,
+        list,
+        negated,
+    } = e
+    else {
+        return Ok(());
+    };
+    let Some(l) = super::pipeline::row_parts(left) else {
+        return Ok(());
+    };
+    let l = l?;
+    let op = match negated {
+        false => BinaryOperator::Eq,
+        true => BinaryOperator::NotEq,
+    };
+    for x in list {
+        match super::pipeline::row_parts(x) {
+            Some(r) => {
+                let r = r?;
+                super::image::rows_agree(l.len(), r.len())?;
+                for (a, b) in l.iter().zip(&r) {
+                    said(b, Some((&op, a)))?;
+                }
+            }
+            None if is_null(x) => {}
+            None => said(x, None)?,
+        }
+    }
+    Ok(())
 }
 
 /// Two rows of one length compared by IS DISTINCT FROM or IS NOT DISTINCT FROM, written as

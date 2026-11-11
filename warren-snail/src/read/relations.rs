@@ -872,12 +872,13 @@ fn lift_factor(
                     return Err(Error::new(format!("the view {} is no question", v.name)));
                 };
                 let step = fresh("view");
+                // Its body written as a statement's is.
                 lift(
                     catalog,
                     out,
                     &[],
                     step.clone(),
-                    (**q).clone(),
+                    super::spelled::between_written(q),
                     v.columns.clone(),
                 )?;
                 let bare = v.name.rsplit('.').next().unwrap_or(&v.name).to_string();

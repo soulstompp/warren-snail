@@ -158,6 +158,8 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("could not identify an equality operator for type "), "42883"),
     (Words::Starts("could not identify an ordering operator for type "), "42883"),
     (Words::Is("unequal number of entries in row expressions"), "42601"),
+    (Words::Is("cannot compare rows of zero length"), "0A000"),
+    (Words::Is("input of anonymous composite types is not implemented"), "0A000"),
     (Words::Starts("cannot cast type "), "42846"),
     (Words::Is("ON CONFLICT DO UPDATE command cannot affect row a second time"), "21000"),
     (Words::Is("more than one row returned by a subquery used as an expression"), "21000"),

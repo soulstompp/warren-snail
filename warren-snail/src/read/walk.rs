@@ -292,14 +292,26 @@ impl Walk {
     /// The one key of the table's own order, a unique one, the walk fixes whole, each of its levels a
     /// column by `=`: at most one row, which a serializable round marks by itself.
     pub(super) fn point(&self, order: &Order) -> Option<&[KeyValue]> {
+        Walk::one_key(order, self.m, &self.lo, &self.hi, self.ends_open)
+            .then_some(self.lo.as_slice())
+    }
+
+    /// Whether a run of keys of the leading levels is one key of the table's own order, a unique
+    /// one, fixed whole, each of its levels a column by `=`, none NULL: at most one row.
+    fn one_key(
+        order: &Order,
+        m: usize,
+        lo: &[KeyValue],
+        hi: &[KeyValue],
+        ends_open: (bool, bool),
+    ) -> bool {
         let whole = order.unique
             && order.table_order
-            && self.m == order.levels.len()
+            && m == order.levels.len()
             && order.levels.iter().all(|l| matches!(l, Level::Column(_)))
-            && self.lo == self.hi
-            && self.ends_open == (false, false)
-            && !self.lo.iter().any(KeyValue::is_null);
-        whole.then_some(self.lo.as_slice())
+            && lo == hi
+            && ends_open == (false, false);
+        whole && !lo.iter().any(KeyValue::is_null)
     }
 
     /// Counts what the entries left open hold now in the round's room.
@@ -330,6 +342,148 @@ impl Walk {
             })
             .collect();
         pages.into_iter()
+    }
+}
+
+/// The run of keys a side's conditions fix the leading levels of an order to, each by IS NULL on its
+/// column, by an equality on it, or by a range, the last level fixed by a range ending the run; and
+/// which conditions fixed them, each read by the walk no further.
+struct Fixed {
+    lo: Vec<KeyValue>,
+    hi: Vec<KeyValue>,
+    ends_open: (bool, bool),
+    used: Vec<bool>,
+    used_texts: Vec<bool>,
+    used_nulls: Vec<bool>,
+}
+
+/// The one key of the table's own order a side's conditions fix whole, as a walk of it reads it by
+/// itself (`Walk::point`), and the side's conditions that fix it.
+pub(super) fn point_of(table: &Table, order: &Order, side: &Side) -> Option<(Vec<KeyValue>, Side)> {
+    let f = fixed(table, order, side);
+    if !Walk::one_key(order, f.lo.len(), &f.lo, &f.hi, f.ends_open) {
+        return None;
+    }
+    let fixing = Side {
+        conds: (side.conds.iter().zip(&f.used))
+            .filter(|(_, u)| **u)
+            .map(|(c, _)| c.clone())
+            .collect(),
+        texts: (side.texts.iter().zip(&f.used_texts))
+            .filter(|(_, u)| **u)
+            .map(|(t, _)| t.clone())
+            .collect(),
+        nulls: Vec::new(),
+        empty: false,
+        ops: Vec::new(),
+        ..side.clone()
+    };
+    Some((f.lo, fixing))
+}
+
+/// What a side's conditions fix of an order's leading levels.
+fn fixed(table: &Table, order: &Order, side: &Side) -> Fixed {
+    let (conds, texts, nulls) = (&side.conds, &side.texts, &side.nulls);
+    let mut used = vec![false; conds.len()];
+    let mut used_texts = vec![false; texts.len()];
+    let mut used_nulls = vec![false; nulls.len()];
+    let (mut lo, mut hi) = (Vec::new(), Vec::new());
+    let mut ends_open = (false, false);
+    // For each level fixed, the test for NULL that fixed it, if one did.
+    let mut by_null: Vec<Option<usize>> = Vec::new();
+    for (li, l) in order.levels.iter().enumerate() {
+        // A level is fixed on its NULL rows' own run by IS NULL on its column.
+        if let Some(i) = nulls.iter().position(|&n| n == (l.column(), true)) {
+            used_nulls[i] = true;
+            lo.push(null_key(order, li));
+            hi.push(null_key(order, li));
+            by_null.push(Some(i));
+            continue;
+        }
+        by_null.push(None);
+        // A level of a string type, bytea or a bit string is fixed by an equality on it, or by a
+        // range, each end its bound's key; an end left open by the NULLs on its side, which no
+        // value is.
+        if let Level::Column(c) = *l {
+            let ty = table.columns[c].ty;
+            if ty.keyed_by_text() || ty.keyed_by_bytes() {
+                let column = &table.columns[c];
+                let fixed = texts.iter().position(|t| {
+                    t.column == c && t.gaps.is_empty() && matches!((&t.lo, &t.hi), (Bound::Included(a), Bound::Included(b)) if a == b)
+                });
+                if let Some(i) = fixed {
+                    used_texts[i] = true;
+                    let Bound::Included(v) = &texts[i].lo else {
+                        unreachable!()
+                    };
+                    lo.push(crate::places::column_byte_key(column, v));
+                    hi.push(crate::places::column_byte_key(column, v));
+                    continue;
+                }
+                let ranged = texts.iter().position(|t| {
+                    t.column == c
+                        && t.is_range()
+                        && !matches!((&t.lo, &t.hi), (Bound::Unbounded, Bound::Unbounded))
+                });
+                if let Some(i) = ranged {
+                    used_texts[i] = true;
+                    let end = |b: &Bound<Vec<u8>>, first: bool| match b {
+                        Bound::Included(v) => (crate::places::column_byte_key(column, v), false),
+                        Bound::Excluded(v) => (crate::places::column_byte_key(column, v), true),
+                        Bound::Unbounded => (KeyValue::Null { first }, true),
+                    };
+                    let (l, lo_open) = end(&texts[i].lo, true);
+                    let (h, hi_open) = end(&texts[i].hi, false);
+                    lo.push(l);
+                    hi.push(h);
+                    ends_open = (lo_open, hi_open);
+                }
+                break;
+            }
+        }
+        let wanted = match *l {
+            Level::Column(c) => Shape::Column(c),
+            Level::MonthUtc(c) => Shape::MonthUtc(c),
+            Level::Scaled(c, k) => Shape::Scaled(c, k),
+        };
+        // A level is fixed by a range on it; `<>`, and a test that keeps NULLs, stay
+        // conditions to read.
+        match conds.iter().position(|c| c.shape == wanted && c.is_range()) {
+            Some(i) => {
+                used[i] = true;
+                let iv = conds[i].kept;
+                let bound = |v: i128| {
+                    if table.columns[l.column()].ty.is_wide() {
+                        KeyValue::Wide(v)
+                    } else {
+                        KeyValue::Int(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+                    }
+                };
+                lo.push(bound(iv.lo));
+                hi.push(bound(iv.hi));
+                if iv.lo != iv.hi {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    // A NULL run fixed last narrows nothing the NULLs counted do not, and the counts close a
+    // block holding values beside it, so IS NULL fixes a level only ahead of another fixed.
+    by_null.truncate(lo.len());
+    while let Some(Some(i)) = by_null.last().copied() {
+        used_nulls[i] = false;
+        by_null.pop();
+        lo.pop();
+        hi.pop();
+    }
+    Fixed {
+        lo,
+        hi,
+        ends_open,
+        used,
+        used_texts,
+        used_nulls,
     }
 }
 
@@ -720,104 +874,15 @@ impl Snail {
         let order = &want.table.orders[oi];
         let (head, entries, pages) = self.top(want.table, oi)?;
         crate::write::cut_checked(want.table, order, &head)?;
-        let conds = &want.side.conds;
-        let texts = &want.side.texts;
-        let nulls = &want.side.nulls;
-        let mut used = vec![false; conds.len()];
-        let mut used_texts = vec![false; texts.len()];
-        let mut used_nulls = vec![false; nulls.len()];
-        let (mut lo, mut hi) = (Vec::new(), Vec::new());
-        let mut ends_open = (false, false);
-        // For each level fixed, the test for NULL that fixed it, if one did.
-        let mut by_null: Vec<Option<usize>> = Vec::new();
-        for (li, l) in order.levels.iter().enumerate() {
-            // A level is fixed on its NULL rows' own run by IS NULL on its column.
-            if let Some(i) = nulls.iter().position(|&n| n == (l.column(), true)) {
-                used_nulls[i] = true;
-                lo.push(null_key(order, li));
-                hi.push(null_key(order, li));
-                by_null.push(Some(i));
-                continue;
-            }
-            by_null.push(None);
-            // A level of a string type, bytea or a bit string is fixed by an equality on it, or by a
-            // range, each end its bound's key; an end left open by the NULLs on its side, which no
-            // value is.
-            if let Level::Column(c) = *l {
-                let ty = want.table.columns[c].ty;
-                if ty.keyed_by_text() || ty.keyed_by_bytes() {
-                    let column = &want.table.columns[c];
-                    let fixed = texts.iter().position(|t| {
-                        t.column == c && t.gaps.is_empty() && matches!((&t.lo, &t.hi), (Bound::Included(a), Bound::Included(b)) if a == b)
-                    });
-                    if let Some(i) = fixed {
-                        used_texts[i] = true;
-                        let Bound::Included(v) = &texts[i].lo else {
-                            unreachable!()
-                        };
-                        lo.push(crate::places::column_byte_key(column, v));
-                        hi.push(crate::places::column_byte_key(column, v));
-                        continue;
-                    }
-                    let ranged = texts.iter().position(|t| {
-                        t.column == c
-                            && t.is_range()
-                            && !matches!((&t.lo, &t.hi), (Bound::Unbounded, Bound::Unbounded))
-                    });
-                    if let Some(i) = ranged {
-                        used_texts[i] = true;
-                        let end = |b: &Bound<Vec<u8>>, first: bool| match b {
-                            Bound::Included(v) => {
-                                (crate::places::column_byte_key(column, v), false)
-                            }
-                            Bound::Excluded(v) => (crate::places::column_byte_key(column, v), true),
-                            Bound::Unbounded => (KeyValue::Null { first }, true),
-                        };
-                        let (l, lo_open) = end(&texts[i].lo, true);
-                        let (h, hi_open) = end(&texts[i].hi, false);
-                        lo.push(l);
-                        hi.push(h);
-                        ends_open = (lo_open, hi_open);
-                    }
-                    break;
-                }
-            }
-            let wanted = match *l {
-                Level::Column(c) => Shape::Column(c),
-                Level::MonthUtc(c) => Shape::MonthUtc(c),
-                Level::Scaled(c, k) => Shape::Scaled(c, k),
-            };
-            // A level is fixed by a range on it; `<>`, and a test that keeps NULLs, stay
-            // conditions to read.
-            match conds.iter().position(|c| c.shape == wanted && c.is_range()) {
-                Some(i) => {
-                    used[i] = true;
-                    let iv = conds[i].kept;
-                    let bound = |v: i128| {
-                        if want.table.columns[l.column()].ty.is_wide() {
-                            KeyValue::Wide(v)
-                        } else {
-                            KeyValue::Int(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
-                        }
-                    };
-                    lo.push(bound(iv.lo));
-                    hi.push(bound(iv.hi));
-                    if iv.lo != iv.hi {
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-        // A NULL run fixed last narrows nothing the NULLs counted do not, and the counts close a
-        // block holding values beside it, so IS NULL fixes a level only ahead of another fixed.
-        by_null.truncate(lo.len());
-        while let Some(Some(i)) = by_null.last().copied() {
-            used_nulls[i] = false;
-            by_null.pop();
-            lo.pop();
-            hi.pop();
-        }
+        let (conds, texts, nulls) = (&want.side.conds, &want.side.texts, &want.side.nulls);
+        let Fixed {
+            lo,
+            hi,
+            ends_open,
+            used,
+            used_texts,
+            used_nulls,
+        } = fixed(want.table, order, want.side);
         let m = lo.len();
         let rest: Vec<Cond> = conds
             .iter()
