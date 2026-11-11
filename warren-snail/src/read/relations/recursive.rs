@@ -198,6 +198,7 @@ pub(super) fn lift(
             all,
             body,
         }),
+        laid: Vec::new(),
     });
     Ok(())
 }

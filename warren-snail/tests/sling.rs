@@ -10,8 +10,11 @@
 //! reading by its index; and a row value IN a list of rows, read as the OR of its rows' comparisons;
 //! and a subquery in a join's ON, correlated to either side or to the query around, a FULL JOIN on
 //! one side's subquery answered and any other refused, and an ON inside a subquery reading the query
-//! around it, a FULL JOIN's equality holding it among them; a type, a domain, a relation or a
-//! function of a name taken refused in 18.6's words; and DDL in a transaction naming and making
+//! around it, a FULL JOIN's equality holding it among them; an outer query's column read anywhere in
+//! a join's ON inside a subquery, and a subquery in FROM reading a relation laid before it, a LATERAL
+//! reference to a RIGHT or FULL JOIN's left side and an aggregate or a window in an ON refused in
+//! 18.6's words; a type, a domain, a relation or a function of a name taken refused in 18.6's words;
+//! and DDL in a transaction naming and making
 //! against the catalog as committed, at each level, a name another committed since refused in its
 //! kind's words, one dropped since made again, DDL over a table made since reading none of its rows,
 //! and writers of different names both committing. Every answer and refusal is 18.6's over the same
@@ -1292,6 +1295,431 @@ fn a_full_join_s_on_inside_a_subquery_meets_by_an_equality_holding_the_query_aro
          ON length(o.owner) - 3 = t.lower) AS n FROM k6.owners o",
     ] {
         assert_eq!(refused(&mut w, sql), unmet, "{sql}");
+    }
+}
+
+const K8: &str = "CREATE SCHEMA k8;
+     CREATE TABLE k8.accounts (account varchar(10) NOT NULL, bank varchar(8) NOT NULL,
+         PRIMARY KEY (account));
+     CREATE TABLE k8.tr (request varchar(8) NOT NULL, from_account varchar(10) NOT NULL,
+         to_account varchar(10) NOT NULL, PRIMARY KEY (request));
+     CREATE TABLE k8.closed (account varchar(10) NOT NULL, PRIMARY KEY (account));
+     CREATE VIEW k8.apart AS SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1
+         FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account
+         WHERE s.account = t.from_account AND s.bank <> r.bank);";
+
+const K8_ROWS: [&str; 2] = [
+    "INSERT INTO k8.accounts VALUES ('A1', 'BA'), ('A2', 'BA'), ('C1', 'BC')",
+    "INSERT INTO k8.tr VALUES ('T1', 'A1', 'A2'), ('T2', 'A1', 'C1'), ('T3', 'A1', 'X9')",
+];
+
+/// warren-sling's ask 10: whether a transfer's two accounts are at different banks, the transfer's
+/// own column read in a join's ON in an EXISTS.
+const APART: &str = "SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.accounts s \
+     JOIN k8.accounts r ON r.account = t.to_account WHERE s.account = t.from_account \
+     AND s.bank <> r.bank) ORDER BY 1";
+
+#[test]
+fn an_outer_column_in_a_join_s_on_inside_a_subquery_is_answered_as_postgresql_answers_it() {
+    let three = |n: &'static str| -> Vec<String> {
+        ["T1", "T2", "T3"].iter().map(|r| format!("{r}|{n}")).collect()
+    };
+    let (n3, n0) = (three("3"), three("0"));
+    let n3: Vec<&str> = n3.iter().map(String::as_str).collect();
+    let n0: Vec<&str> = n0.iter().map(String::as_str).collect();
+    let banks = ["T1|BA", "T2|BC", "T3|NULL"];
+    let viewdef = concat!(
+        " SELECT request\n",
+        "   FROM k8.tr t\n",
+        "  WHERE (EXISTS ( SELECT 1\n",
+        "           FROM (k8.accounts s\n",
+        "             JOIN k8.accounts r ON (((r.account)::text = (t.to_account)::text)))\n",
+        "          WHERE (((s.account)::text = (t.from_account)::text) AND ",
+        "((s.bank)::text <> (r.bank)::text))));"
+    );
+    let asked: &[(&str, &[&str])] = &[
+        (APART, &["T2"]),
+        (
+            "SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.accounts s \
+             JOIN k8.accounts r ON r.bank <> s.bank AND r.account = t.to_account \
+             WHERE s.account = t.from_account) ORDER BY 1",
+            &["T2"],
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = to_account WHERE s.account = from_account \
+             AND s.bank <> r.bank) ORDER BY 1",
+            &["T2"],
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE t.request IN (SELECT t.request \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account \
+             WHERE s.account = t.from_account AND s.bank = r.bank) ORDER BY 1",
+            &["T1"],
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE t.to_account = ANY (SELECT r.account \
+             FROM k8.accounts s JOIN k8.accounts r ON r.bank = s.bank \
+             AND s.account = t.from_account) ORDER BY 1",
+            &["T1"],
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE t.to_account NOT IN (SELECT r.account \
+             FROM k8.accounts s JOIN k8.accounts r ON r.bank = s.bank \
+             AND s.account = t.from_account) ORDER BY 1",
+            &["T2", "T3"],
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE NOT EXISTS (SELECT 1 FROM k8.accounts s \
+             LEFT JOIN k8.accounts r ON r.account = t.to_account WHERE s.account = t.from_account \
+             AND r.account IS NULL) ORDER BY 1",
+            &["T1", "T2"],
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE NOT EXISTS (SELECT 1 FROM k8.accounts s \
+             JOIN k8.accounts r ON t.to_account = 'X9' WHERE s.account = t.from_account) ORDER BY 1",
+            &["T1", "T2"],
+        ),
+        (
+            "SELECT t.request, (SELECT r.bank FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = t.to_account WHERE s.account = t.from_account) AS bank \
+             FROM k8.tr t ORDER BY 1",
+            &banks,
+        ),
+        (
+            "SELECT t.request, x.bank FROM k8.tr t, LATERAL (SELECT r.bank FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account WHERE s.account = t.from_account) x \
+             ORDER BY 1",
+            &banks[..2],
+        ),
+        (
+            "SELECT t.request, x.bank FROM k8.tr t LEFT JOIN LATERAL (SELECT r.bank \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account \
+             WHERE s.account = t.from_account) x ON true ORDER BY 1",
+            &banks,
+        ),
+        (
+            "SELECT t.request, (SELECT count(*) FROM k8.accounts s LEFT JOIN k8.accounts r \
+             ON r.account = t.to_account) AS n FROM k8.tr t ORDER BY 1",
+            n3.as_slice(),
+        ),
+        (
+            "SELECT t.request, (SELECT count(r.account) FROM k8.accounts s RIGHT JOIN \
+             k8.accounts r ON s.account = t.to_account) AS n FROM k8.tr t ORDER BY 1",
+            n3.as_slice(),
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.accounts s \
+             RIGHT JOIN k8.accounts r ON r.account = t.to_account AND s.account = t.from_account \
+             WHERE s.bank <> r.bank) ORDER BY 1",
+            &["T2"],
+        ),
+        (
+            "SELECT t.request, (SELECT count(*) FROM k8.accounts s FULL JOIN k8.accounts r \
+             ON s.account = r.account AND r.account = t.to_account) AS n FROM k8.tr t ORDER BY 1",
+            &["T1|5", "T2|5", "T3|6"],
+        ),
+        (
+            "SELECT t.request, (SELECT count(*) FROM k8.accounts s FULL JOIN k8.accounts r \
+             ON s.bank = r.bank || t.request) AS n FROM k8.tr t ORDER BY 1",
+            &["T1|6", "T2|6", "T3|6"],
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.accounts a \
+             WHERE a.account = t.from_account AND EXISTS (SELECT 1 FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account AND s.account = a.account \
+             WHERE s.bank = r.bank)) ORDER BY 1",
+            &["T1"],
+        ),
+        (
+            "SELECT t.request, (SELECT (SELECT count(*) FROM k8.accounts s LEFT JOIN k8.accounts r \
+             ON r.account = t.to_account AND r.bank = a.bank) FROM k8.accounts a \
+             WHERE a.account = t.from_account) AS n FROM k8.tr t ORDER BY 1",
+            n3.as_slice(),
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.accounts s \
+             JOIN k8.accounts r ON s.bank <> r.bank AND (r.account = t.to_account \
+             OR r.account = t.from_account) WHERE s.account = 'C1') ORDER BY 1",
+            &["T1", "T2", "T3"],
+        ),
+        (
+            "SELECT t.request, (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r \
+             ON r.bank = s.bank JOIN k8.tr u ON u.to_account = r.account \
+             AND u.request <> t.request) AS n FROM k8.tr t ORDER BY 1",
+            &["T1|1", "T2|2", "T3|3"],
+        ),
+        (
+            "SELECT t.request, a.bank FROM k8.tr t JOIN k8.accounts a ON EXISTS (SELECT 1 \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account \
+             AND s.account = a.account WHERE s.bank = r.bank) ORDER BY 1, 2",
+            &["T1|BA", "T1|BA", "T2|BC"],
+        ),
+        (
+            "SELECT t.request, (SELECT count(*) FROM k8.closed c RIGHT JOIN k8.accounts s \
+             ON c.account = t.to_account) AS n FROM k8.tr t ORDER BY 1",
+            n3.as_slice(),
+        ),
+        (
+            "SELECT t.request, (SELECT count(*) FROM k8.closed c JOIN k8.accounts s \
+             ON c.account = t.to_account) AS n FROM k8.tr t ORDER BY 1",
+            n0.as_slice(),
+        ),
+        (
+            "SELECT a.account, (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = t.to_account) AS n FROM k8.accounts a LEFT JOIN k8.tr t \
+             ON t.to_account = a.account ORDER BY 1",
+            &["A1|0", "A2|3", "C1|3"],
+        ),
+        ("SELECT request FROM k8.apart ORDER BY 1", &["T2"]),
+        ("SELECT pg_get_viewdef('k8.apart'::regclass)", &[viewdef]),
+        (
+            "UPDATE k8.tr t SET to_account = 'A2' WHERE EXISTS (SELECT 1 FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account WHERE s.account = t.from_account \
+             AND s.bank <> r.bank) RETURNING request, to_account",
+            &["T2|A2"],
+        ),
+        (
+            "DELETE FROM k8.tr t WHERE NOT EXISTS (SELECT 1 FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account WHERE s.account = t.from_account) \
+             RETURNING request",
+            &["T3"],
+        ),
+    ];
+    let path = declared("on-outer-ended", K8, &K8_ROWS);
+    ended(&path, "on-outer", asked);
+    let path = declared("on-outer", K8, &K8_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(&mut w, asked);
+}
+
+/// PostgreSQL's words for a subquery in FROM reading a relation laid before it, `relation` by the
+/// name it was asked by, `entry` the one found, with its HINT where LATERAL would have let it.
+fn not_lateral(relation: &str, entry: &str, hint: bool) -> (Option<&'static str>, String) {
+    let words = format!(
+        "invalid reference to FROM-clause entry for table \"{relation}\": There is an entry for \
+         table \"{entry}\", but it cannot be referenced from this part of the query."
+    );
+    match hint {
+        true => said(
+            "42P01",
+            &format!(
+                "{words}\nHINT:  To reference that table, you must mark this subquery with LATERAL."
+            ),
+        ),
+        false => said("42P01", &words),
+    }
+}
+
+#[test]
+fn a_subquery_in_from_reading_a_relation_laid_before_it_is_refused_in_postgresql_s_words() {
+    let path = declared("from-before", K8, &K8_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let column = "column \"to_account\" does not exist: There is a column named \"to_account\" \
+         in table \"t\", but it cannot be referenced from this part of the query.";
+    for (sql, want) in [
+        (
+            "SELECT t.request, x.bank FROM k8.tr t, (SELECT r.bank FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account WHERE s.account = t.from_account) x",
+            not_lateral("t", "t", true),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t JOIN (SELECT count(*) AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account) x ON true",
+            not_lateral("t", "t", true),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t RIGHT JOIN (SELECT count(*) AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account) x ON true",
+            not_lateral("t", "t", false),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t FULL JOIN (k8.accounts a JOIN (SELECT count(*) AS n \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account) x ON true) ON true",
+            not_lateral("t", "t", false),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t FULL JOIN (k8.accounts a JOIN (SELECT count(*) AS n \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = a.account) x ON true) ON true",
+            not_lateral("a", "a", true),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t RIGHT JOIN k8.accounts a ON true, (SELECT count(*) \
+             AS n FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account) x",
+            not_lateral("t", "t", true),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t, (SELECT d.n FROM (SELECT count(*) AS n \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account) d) x",
+            not_lateral("t", "t", true),
+        ),
+        (
+            "SELECT t.request, j.n FROM k8.tr t, (k8.accounts a JOIN (SELECT t.request AS n) y \
+             ON true) j",
+            not_lateral("t", "t", true),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t, (SELECT r.account AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.to_account UNION SELECT 'z') x",
+            not_lateral("t", "t", true),
+        ),
+        (
+            "SELECT t.request FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.tr u, (SELECT 1 \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = u.to_account) x)",
+            not_lateral("u", "u", true),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t, (SELECT count(*) AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = t.nothere) x",
+            not_lateral("t", "t", true),
+        ),
+        (
+            "SELECT x.n FROM (SELECT count(*) AS n FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = t.to_account) x, k8.tr t",
+            said("42P01", "missing FROM-clause entry for table \"t\""),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t, (SELECT count(*) AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = to_account) x",
+            said(
+                "42703",
+                &format!(
+                    "{column}\nHINT:  To reference that column, you must mark this subquery with \
+                     LATERAL."
+                ),
+            ),
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t FULL JOIN (SELECT count(*) AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = to_account) x ON true",
+            said("42703", column),
+        ),
+        (
+            "SELECT x.n FROM k8.tr t, k8.tr u, (SELECT count(*) AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = to_account) x",
+            said(
+                "42703",
+                "column \"to_account\" does not exist: There are columns named \"to_account\", \
+                 but they are in tables that cannot be referenced from this part of the query.\n\
+                 HINT:  Try using a table-qualified name.",
+            ),
+        ),
+        (
+            "SELECT x.n FROM k8.tr t(a, b, c), (SELECT count(*) AS n FROM k8.accounts s \
+             JOIN k8.accounts r ON r.account = c) x",
+            said(
+                "42703",
+                "column \"c\" does not exist: There is a column named \"c\" in table \"t\", but it \
+                 cannot be referenced from this part of the query.\nHINT:  To reference that \
+                 column, you must mark this subquery with LATERAL.",
+            ),
+        ),
+        (
+            "SELECT 1 FROM k8.tr t WHERE EXISTS (SELECT 1 FROM k8.accounts t, k8.accounts u, \
+             (SELECT count(*) AS n FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = t.bank) x)",
+            said(
+                "42703",
+                "column t.bank does not exist: There is a column named \"bank\" in table \"t\", \
+                 but it cannot be referenced from this part of the query.\nHINT:  To reference \
+                 that column, you must mark this subquery with LATERAL.",
+            ),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+}
+
+#[test]
+fn a_lateral_reference_to_a_right_or_full_join_s_left_side_is_refused_in_postgresql_s_words() {
+    let path = declared("lateral-outer-join", K8, &K8_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let combining = |name: &str| {
+        said(
+            "42P10",
+            &format!(
+                "invalid reference to FROM-clause entry for table \"{name}\": The combining JOIN \
+                 type must be INNER or LEFT for a LATERAL reference."
+            ),
+        )
+    };
+    for (sql, name) in [
+        (
+            "SELECT t.request, x.n FROM k8.tr t RIGHT JOIN LATERAL (SELECT count(*) AS n \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account) x ON true",
+            "t",
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t FULL JOIN LATERAL (SELECT count(*) AS n \
+             FROM k8.accounts s JOIN k8.accounts r ON r.account = t.to_account) x ON true",
+            "t",
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t, LATERAL (SELECT count(*) AS n FROM k8.accounts s \
+             RIGHT JOIN LATERAL (SELECT s.bank AS b) y ON true) x",
+            "s",
+        ),
+        (
+            "SELECT t.request, g FROM k8.tr t RIGHT JOIN generate_series(1, length(t.request)) g \
+             ON true",
+            "t",
+        ),
+        (
+            "SELECT t.request, x.n FROM k8.tr t LEFT JOIN k8.accounts a ON true RIGHT JOIN LATERAL \
+             (SELECT count(*) AS n FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = a.account) x ON true",
+            "a",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), combining(name), "{sql}");
+    }
+}
+
+#[test]
+fn an_aggregate_or_a_window_in_a_join_s_on_is_refused_in_postgresql_s_words() {
+    let path = declared("on-aggregate", K8, &K8_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let aggregate = said("42803", "aggregate functions are not allowed in JOIN conditions");
+    for (sql, want) in [
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = max(t.to_account || r.account)) AS n FROM k8.tr t",
+            aggregate.clone(),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r ON count(*) > 0) AS n \
+             FROM k8.tr t",
+            aggregate.clone(),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = t.to_account AND row_number() OVER () > 0) AS n FROM k8.tr t",
+            said("42P20", "window functions are not allowed in JOIN conditions"),
+        ),
+        (
+            "SELECT 1 FROM k8.accounts s JOIN k8.accounts r ON r.account = max(s.account)",
+            aggregate.clone(),
+        ),
+        (
+            "SELECT 1 FROM k8.accounts s FULL JOIN k8.accounts r ON count(*) > 0",
+            aggregate.clone(),
+        ),
+        (
+            "SELECT 1 FROM k8.accounts s JOIN k8.accounts r ON s.account = r.account \
+             AND (SELECT count(*) FROM k8.tr t WHERE t.to_account = s.account) > 0 \
+             AND count(*) > 0",
+            aggregate,
+        ),
+        (
+            "SELECT t.from_account, (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = t.to_account) AS n FROM k8.tr t GROUP BY t.from_account",
+            said(
+                "42803",
+                "subquery uses ungrouped column \"t.to_account\" from outer query",
+            ),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
     }
 }
 

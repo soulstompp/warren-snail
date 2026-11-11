@@ -137,6 +137,7 @@ const SAID: &[(Words, &str)] = &[
         Words::Holds("column \"", "\" must appear in the GROUP BY clause or be used in an aggregate function"),
         "42803",
     ),
+    (Words::Holds("subquery uses ungrouped column \"", "\" from outer query"), "42803"),
     (Words::Starts("window functions are not allowed in "), "42P20"),
     (
         Words::Is("for SELECT DISTINCT, ORDER BY expressions must appear in select list"),
@@ -178,6 +179,13 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("date/time field value out of range"), "22008"),
     (Words::Holds("relation \"", "\" does not exist"), "42P01"),
     (Words::Starts("missing FROM-clause entry for table "), "42P01"),
+    (
+        Words::Holds(
+            "invalid reference to FROM-clause entry for table ",
+            "The combining JOIN type must be INNER or LEFT for a LATERAL reference.",
+        ),
+        "42P10",
+    ),
     (Words::Starts("invalid reference to FROM-clause entry for table "), "42P01"),
     (Words::Holds("relation \"", " clause not found in FROM clause"), "42P01"),
     (Words::Holds("FOR ", " is not allowed with "), "0A000"),

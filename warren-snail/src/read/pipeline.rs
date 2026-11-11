@@ -1228,6 +1228,48 @@ pub(super) fn calls_in(e: &Expr) -> (bool, bool, bool) {
     )
 }
 
+/// An aggregate of the step's own in a clause no aggregate stands in, or a window, refused as
+/// PostgreSQL's parser refuses it, naming the clause: one reading none of the query around it, or a
+/// column of the step's own FROM. One reading only the query around it is that query's.
+pub(super) fn no_own_calls(
+    e: &Expr,
+    columns: &[super::typed::TypedColumn],
+    clause: &str,
+) -> Result<()> {
+    let mut found = Calls::default();
+    find_calls(e, &mut found);
+    if !found.windows.is_empty() {
+        return Err(Error::new(format!(
+            "window functions are not allowed in {clause}"
+        )));
+    }
+    let own = |a: &&Expr| {
+        let mut read = Vec::new();
+        columns_read(a, &mut read);
+        let levels: Option<Vec<usize>> = read
+            .iter()
+            .map(|(q, n)| {
+                let at = naming(
+                    columns.iter().map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
+                    q.as_deref(),
+                    n,
+                );
+                match at.as_slice() {
+                    [i] => Some(outer_level(columns[*i].0.as_deref())),
+                    _ => None,
+                }
+            })
+            .collect();
+        levels.is_some_and(|l| l.is_empty() || l.contains(&0))
+    };
+    if found.aggregates.iter().any(own) {
+        return Err(Error::new(format!(
+            "aggregate functions are not allowed in {clause}"
+        )));
+    }
+    Ok(())
+}
+
 fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
     match e {
         Expr::Function(f) => {
@@ -6712,37 +6754,8 @@ pub(super) fn prepare<'q>(
             "set-returning functions are not allowed in WHERE",
         ));
     }
-    // An aggregate of the step's own in WHERE, or a window, refused as PostgreSQL's parser refuses
-    // it: one reading none of the query around it, or a column of the step's own FROM. One reading
-    // only the query around it is that query's.
     if let Some(w) = s.selection.as_ref() {
-        let mut found = Calls::default();
-        find_calls(w, &mut found);
-        if !found.windows.is_empty() {
-            return Err(Error::new("window functions are not allowed in WHERE"));
-        }
-        let own = |a: &&Expr| {
-            let mut read = Vec::new();
-            columns_read(a, &mut read);
-            let levels: Option<Vec<usize>> = read
-                .iter()
-                .map(|(q, n)| {
-                    let at = naming(
-                        columns.iter().map(|(cq, cn, _)| (cq.as_deref(), cn.as_str())),
-                        q.as_deref(),
-                        n,
-                    );
-                    match at.as_slice() {
-                        [i] => Some(outer_level(columns[*i].0.as_deref())),
-                        _ => None,
-                    }
-                })
-                .collect();
-            levels.is_some_and(|l| l.is_empty() || l.contains(&0))
-        };
-        if found.aggregates.iter().any(own) {
-            return Err(Error::new("aggregate functions are not allowed in WHERE"));
-        }
+        no_own_calls(w, columns, "WHERE")?;
     }
     // HAVING keeps the groups its condition holds of, its aggregates folded with the others'.
     let having = s.having.as_ref();

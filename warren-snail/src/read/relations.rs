@@ -99,6 +99,9 @@ struct Step {
     laterals: Vec<(Query, super::subqueries::Kept)>,
     /// A recursive WITH query's terms, where the step is one.
     recursion: Option<recursive::Recursion>,
+    /// The relations of each FROM it was lifted out of laid before it, nearest first, which it
+    /// cannot read.
+    laid: Vec<Laid>,
 }
 
 /// What a step was lifted from, as a refusal of its alias's column names names it.
@@ -737,17 +740,31 @@ fn lift(
             .map(|q| (q, Default::default()))
             .collect(),
         recursion: None,
+        laid: Vec::new(),
     });
     Ok(())
 }
 
 /// What a FROM keeps beside its step once lifted out of it: the functions it calls, the LATERAL
-/// subqueries it reads and what its joins named by an alias hold.
+/// subqueries it reads and what its joins named by an alias hold; and the relations it has laid so
+/// far, which a subquery lifted out of it after them cannot read.
 #[derive(Default)]
 struct Lifted {
     calls: Vec<Call>,
     laterals: Vec<Query>,
     inside: Inside,
+    laid: Vec<Laid>,
+}
+
+/// A relation of a FROM laid before a subquery lifted out of it: the name it goes by there, the
+/// table it reads, if one, under the names its alias gives the columns, and whether the subquery
+/// could read it, written LATERAL.
+#[derive(Clone)]
+struct Laid {
+    name: String,
+    table: Option<String>,
+    renames: Vec<String>,
+    lateral: bool,
 }
 
 fn lift_join(
@@ -757,11 +774,82 @@ fn lift_join(
     item: &mut TableWithJoins,
     lifted: &mut Lifted,
 ) -> Result<()> {
-    lift_factor(catalog, out, visible, &mut item.relation, lifted)?;
+    let start = lifted.laid.len();
+    lay(catalog, out, visible, &mut item.relation, lifted)?;
     for j in &mut item.joins {
-        lift_factor(catalog, out, visible, &mut j.relation, lifted)?;
+        // The right side of a RIGHT or FULL JOIN reads nothing of its left side, LATERAL or not.
+        let apart = matches!(
+            j.join_operator,
+            JoinOperator::Right(_) | JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_)
+        );
+        let was: Vec<bool> = lifted.laid[start..].iter().map(|l| l.lateral).collect();
+        if apart {
+            for l in &mut lifted.laid[start..] {
+                l.lateral = false;
+            }
+        }
+        lay(catalog, out, visible, &mut j.relation, lifted)?;
+        for (l, w) in lifted.laid[start..].iter_mut().zip(was) {
+            l.lateral = w;
+        }
     }
     Ok(())
+}
+
+/// One relation of a FROM lifted as `lift_factor` lifts it, then laid before the ones after it.
+fn lay(
+    catalog: &Catalog,
+    out: &mut Vec<Step>,
+    visible: &[String],
+    t: &mut TableFactor,
+    lifted: &mut Lifted,
+) -> Result<()> {
+    let laid = laid_by(t);
+    lift_factor(catalog, out, visible, t, lifted)?;
+    lifted.laid.extend(laid);
+    Ok(())
+}
+
+/// The relations a FROM item lays, as a subquery after it finds them: a join's with no alias are
+/// laid one by one; those inside a join with one, which its alias hides, then the join.
+fn laid_by(t: &TableFactor) -> Vec<Laid> {
+    if let TableFactor::NestedJoin {
+        table_with_joins,
+        alias: Some(a),
+    } = t
+    {
+        let mut inside = Vec::new();
+        hidden_in(table_with_joins, &mut inside);
+        let join = (crate::catalog::ident(&a.name), None);
+        return inside
+            .into_iter()
+            .map(|n| (n, false))
+            .chain(std::iter::once((join, true)))
+            .map(|((name, table), lateral)| Laid {
+                name,
+                table,
+                renames: Vec::new(),
+                lateral,
+            })
+            .collect();
+    }
+    let renames = match t {
+        TableFactor::Table { alias: Some(a), .. } => a
+            .columns
+            .iter()
+            .map(|c| crate::catalog::ident(&c.name))
+            .collect(),
+        _ => Vec::new(),
+    };
+    goes_by(t)
+        .map(|(name, table)| Laid {
+            name,
+            table,
+            renames,
+            lateral: true,
+        })
+        .into_iter()
+        .collect()
 }
 
 thread_local! {
@@ -1082,6 +1170,7 @@ fn lift_factor(
             let renames = renames_of(alias)?;
             let written = alias.as_ref().map(|a| crate::catalog::ident(&a.name));
             let origin = Origin::Table(written.unwrap_or_default());
+            let first = out.len();
             lift_as(
                 catalog,
                 out,
@@ -1091,6 +1180,10 @@ fn lift_factor(
                 renames,
                 origin,
             )?;
+            // Its steps cannot read the relations laid before it.
+            for s in &mut out[first..] {
+                s.laid.extend(lifted.laid.iter().cloned());
+            }
             let kept = alias.take().map_or_else(unnamed, |mut a| {
                 a.columns.clear();
                 a
@@ -1133,7 +1226,13 @@ fn lift_factor(
             let step = fresh("joined");
             let renames = renames_of(&Some(a.clone()))?;
             let origin = Origin::Join(crate::catalog::ident(&a.name));
+            let first = out.len();
             lift_as(catalog, out, visible, step.clone(), query, renames, origin)?;
+            // The steps of the subqueries inside it cannot read the relations laid before it.
+            let last = out.len() - 1;
+            for s in &mut out[first..last] {
+                s.laid.extend(lifted.laid.iter().cloned());
+            }
             let mut kept = a.clone();
             kept.columns.clear();
             *t = plain(&step, Some(kept));
@@ -1176,40 +1275,43 @@ fn star_over(join: TableWithJoins) -> Query {
 
 /// Each relation a join holds, at every depth, by the name it goes by there and the table it reads.
 fn hidden_in(join: &TableWithJoins, out: &mut Vec<(String, Option<String>)>) {
+    for f in std::iter::once(&join.relation).chain(join.joins.iter().map(|j| &j.relation)) {
+        out.extend(goes_by(f));
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = f
+        {
+            hidden_in(table_with_joins, out);
+        }
+    }
+}
+
+/// The name a relation of a FROM goes by there, and the table it reads, if one.
+fn goes_by(f: &TableFactor) -> Option<(String, Option<String>)> {
     let alias = |a: &Option<TableAlias>| a.as_ref().map(|a| crate::catalog::ident(&a.name));
     let bare = |n: &ObjectName| {
         let n = crate::catalog::object_name(n);
         n.rsplit('.').next().unwrap_or(&n).to_string()
     };
-    for f in std::iter::once(&join.relation).chain(join.joins.iter().map(|j| &j.relation)) {
-        match f {
-            TableFactor::Table {
-                name,
-                alias: a,
-                args,
-                ..
-            } => {
-                let table = args.is_none().then(|| crate::catalog::object_name(name));
-                out.push((alias(a).unwrap_or_else(|| bare(name)), table));
-            }
-            TableFactor::Function { name, alias: a, .. } => {
-                out.push((alias(a).unwrap_or_else(|| bare(name)), None));
-            }
-            TableFactor::UNNEST { alias: a, .. } => {
-                out.push((alias(a).unwrap_or_else(|| "unnest".into()), None));
-            }
-            TableFactor::Derived { alias: Some(a), .. } => {
-                out.push((crate::catalog::ident(&a.name), None));
-            }
-            TableFactor::NestedJoin {
-                table_with_joins,
-                alias: a,
-            } => {
-                out.extend(alias(a).map(|a| (a, None)));
-                hidden_in(table_with_joins, out);
-            }
-            _ => {}
+    match f {
+        TableFactor::Table {
+            name,
+            alias: a,
+            args,
+            ..
+        } => {
+            let table = args.is_none().then(|| crate::catalog::object_name(name));
+            Some((alias(a).unwrap_or_else(|| bare(name)), table))
         }
+        TableFactor::Function { name, alias: a, .. } => {
+            Some((alias(a).unwrap_or_else(|| bare(name)), None))
+        }
+        TableFactor::UNNEST { alias: a, .. } => {
+            Some((alias(a).unwrap_or_else(|| "unnest".into()), None))
+        }
+        TableFactor::Derived { alias: Some(a), .. } => Some((crate::catalog::ident(&a.name), None)),
+        TableFactor::NestedJoin { alias: a, .. } => alias(a).map(|a| (a, None)),
+        _ => None,
     }
 }
 
@@ -1372,6 +1474,8 @@ struct From {
     hidden: Vec<(String, Option<String>)>,
     /// The relations of the query around it it cannot reference, where it stands in a join's ON.
     unseen: Vec<String>,
+    /// The relations laid before it in each FROM it was lifted out of, which it cannot read.
+    laid: Vec<Laid>,
 }
 
 impl From {
@@ -1379,8 +1483,9 @@ impl From {
     /// an invalid reference where it names a relation its alias hides (a table by its schema and
     /// name, or by its name alone where the search path finds it; a WITH query by its name), or a
     /// subquery written without an alias, here or in a query around it, or a relation inside a join
-    /// its alias hides, or one of the query around it laid before the join whose ON holds it, each
-    /// of these three with the entry it found; else a missing entry.
+    /// its alias hides, or one laid before it in a FROM it was lifted out of, or one of the query
+    /// around it laid before the join whose ON holds it, each of these four with the entry it
+    /// found; else a missing entry.
     fn no_entry(&self, catalog: &Catalog, q: &str) -> Error {
         let relation = q.rsplit('.').next().unwrap_or(q);
         let entry = |name: &str| {
@@ -1424,11 +1529,69 @@ impl From {
                     .as_deref()
                     .is_some_and(|t| crate::catalog::found_by_qualifier(t, q))
         });
-        match inside {
-            Some((name, _)) => entry(name),
-            None if self.unseen.iter().any(|u| u == relation) => entry(relation),
-            None => Error::new(format!(
+        let laid = self.laid.iter().find(|l| {
+            l.name == q
+                || l.table
+                    .as_deref()
+                    .is_some_and(|t| crate::catalog::found_by_qualifier(t, q))
+        });
+        match (inside, laid) {
+            (Some((name, _)), _) => entry(name),
+            (None, Some(l)) if l.lateral => Error::new(format!(
+                "{}\nHINT:  To reference that table, you must mark this subquery with LATERAL.",
+                entry(&l.name)
+            )),
+            (None, Some(l)) => entry(&l.name),
+            (None, None) if self.unseen.iter().any(|u| u == relation) => entry(relation),
+            (None, None) => Error::new(format!(
                 "missing FROM-clause entry for table \"{relation}\""
+            )),
+        }
+    }
+
+    /// The refusal of a column name no column of the FROM answers to, under its qualifier `q` where
+    /// it has one, in PostgreSQL's words: where tables laid before it in a FROM it was lifted out of
+    /// (of that name, where qualified) hold a column of that name, that it cannot be read from here.
+    fn no_column(&self, catalog: &Catalog, q: Option<&str>, n: &str) -> Error {
+        let missing = match q {
+            Some(q) => format!("column {q}.{n} does not exist"),
+            None => format!("column \"{n}\" does not exist"),
+        };
+        let holding: Vec<&Laid> = self
+            .laid
+            .iter()
+            .filter(|l| q.is_none_or(|q| l.name == q))
+            .filter(|l| {
+                let Some(t) = l.table.as_deref().and_then(|t| table_of(catalog, t).ok()) else {
+                    return false;
+                };
+                let t = &catalog.tables[t];
+                stored(t)
+                    .enumerate()
+                    .any(|(k, c)| l.renames.get(k).unwrap_or(&t.columns[c].name) == n)
+            })
+            .collect();
+        match holding.as_slice() {
+            [] => Error::new(missing),
+            [l] => Error::new(format!(
+                "{missing}: There is a column named \"{n}\" in table \"{}\", but it cannot be \
+                 referenced from this part of the query.{}",
+                l.name,
+                match l.lateral {
+                    true => {
+                        "\nHINT:  To reference that column, you must mark this subquery with \
+                         LATERAL."
+                    }
+                    false => "",
+                }
+            )),
+            _ => Error::new(format!(
+                "{missing}: There are columns named \"{n}\", but they are in tables that cannot be \
+                 referenced from this part of the query.{}",
+                match q {
+                    Some(_) => "",
+                    None => "\nHINT:  Try using a table-qualified name.",
+                }
             )),
         }
     }
@@ -1878,6 +2041,81 @@ impl Laying<'_> {
         })
     }
 
+    /// The relation of a join's left side that a function's rows or a LATERAL subquery on its right
+    /// side reads, by the name it goes by: the first whose columns a function's arguments name, or
+    /// that a subquery cannot be made without.
+    fn lateral_reads(&self, left: &Node, right: &Node) -> Option<String> {
+        let mut lefts = Vec::new();
+        left.leaves(&mut lefts);
+        let mut rights = Vec::new();
+        right.leaves(&mut rights);
+        let holding = |p: usize| lefts.iter().find(|l| l.at <= p && p < l.at + l.width);
+        for r in rights {
+            match &r.what {
+                What::Call { call, .. } => {
+                    let before = &self.columns[..r.at];
+                    for c in &call.functions {
+                        let mut read = Vec::new();
+                        pipeline::columns_read(&c.expr, &mut read);
+                        for (q, n) in &read {
+                            let found = pipeline::naming(
+                                before
+                                    .iter()
+                                    .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+                                q.as_deref(),
+                                n,
+                            );
+                            if let Some(l) = found.first().and_then(|&p| holding(p)) {
+                                return l.leaf_named().map(str::to_string);
+                            }
+                        }
+                    }
+                }
+                What::Lateral { at, .. } => {
+                    if self.made_without(*at, r.at, left.at..left.at + left.width) {
+                        continue;
+                    }
+                    for l in &lefts {
+                        if !self.made_without(*at, r.at, l.at..l.at + l.width) {
+                            return l.leaf_named().map(str::to_string);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether the LATERAL subquery at `at`, laid at `place`, is made with the columns laid before
+    /// it at `hidden` left out.
+    fn made_without(&self, at: usize, place: usize, hidden: std::ops::Range<usize>) -> bool {
+        let kept = super::subqueries::Kept::default();
+        let mut columns: Vec<Col> = self.columns[..place]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !hidden.contains(i))
+            .map(|(_, c)| marked(c))
+            .collect();
+        if let Some(o) = self.outer {
+            columns.extend(o.columns.iter().map(marked));
+        }
+        let outer = Outer {
+            values: vec![Value::Null; columns.len()],
+            columns,
+            kept: &kept,
+            clause: None,
+            unseen: Vec::new(),
+        };
+        let empty = Empty(self.catalog);
+        let asked = Asked {
+            reads: &empty,
+            ..self.asked
+        };
+        let query = &self.laterals[at].0;
+        made_by(asked, query, self.made, self.casings, Some(&outer), &Accrued::default()).is_ok()
+    }
+
     /// A FROM item: its first relation, then each joined to it in turn.
     fn item(&mut self, item: &TableWithJoins) -> Result<Node> {
         let mut node = self.factor(&item.relation)?;
@@ -1974,6 +2212,26 @@ impl Laying<'_> {
         using: &[String],
     ) -> Result<Node> {
         let at = left.at;
+        // A LATERAL right side of a RIGHT or FULL JOIN reads nothing of its left side, and an ON
+        // holds no aggregate of the step's own nor a window: each refused as PostgreSQL's parser
+        // refuses it.
+        if matches!(kind, Kind::Right | Kind::Full) {
+            if let Some(name) = self.lateral_reads(&left, &right) {
+                return Err(Error::new(format!(
+                    "invalid reference to FROM-clause entry for table \"{name}\": The combining \
+                     JOIN type must be INNER or LEFT for a LATERAL reference."
+                )));
+            }
+        }
+        if let Some(e) = &on {
+            let typed: Vec<TypedColumn> = self
+                .columns
+                .iter()
+                .chain(self.outer.iter().flat_map(|o| &o.columns))
+                .map(|c| (c.qualifier.clone(), c.name.clone(), c.ty))
+                .collect();
+            pipeline::no_own_calls(e, &typed, "JOIN conditions")?;
+        }
         // An ON holding a subquery is checked once its subqueries are read.
         if let (Kind::Full, Some(e)) = (kind, &on) {
             let mut found = Vec::new();
@@ -3519,6 +3777,7 @@ fn lift_set(
             set: Some(arm),
             laterals: Vec::new(),
             recursion: None,
+            laid: Vec::new(),
         });
         return Ok(());
     }
@@ -3533,6 +3792,7 @@ fn lift_set(
         set: Some(arm),
         laterals: Vec::new(),
         recursion: None,
+        laid: Vec::new(),
     });
     let parsed = sqlparser::parser::Parser::parse_sql(
         &sqlparser::dialect::PostgreSqlDialect {},
@@ -3556,6 +3816,7 @@ fn lift_set(
         set: None,
         laterals: Vec::new(),
         recursion: None,
+        laid: Vec::new(),
     });
     Ok(())
 }
@@ -4504,6 +4765,7 @@ fn select_step(
             refused: laying.refused,
             hidden: step.inside.hidden.clone(),
             unseen: outer.map(|o| o.unseen.clone()).unwrap_or_default(),
+            laid: step.laid.clone(),
         }
     };
     {
@@ -4732,8 +4994,8 @@ fn select_step(
             {
                 return Err(from.no_entry(catalog, &q))
             }
-            (0, Some(q)) => return Err(Error::new(format!("column {q}.{n} does not exist"))),
-            (0, None) => return Err(Error::new(format!("column \"{n}\" does not exist"))),
+            (0, Some(q)) => return Err(from.no_column(catalog, Some(&q), &n)),
+            (0, None) => return Err(from.no_column(catalog, None, &n)),
             _ => return Err(Error::new(format!("column reference \"{n}\" is ambiguous"))),
         }
     }
