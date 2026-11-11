@@ -364,10 +364,16 @@ fn a_replica_is_pruned_by_its_appliers_reads_alone_and_goes_out_dead_rows_and_al
         e.contains("blocks hold dead rows") && refused(warren_snail::Error::new(e.clone())),
         "{e}"
     );
+    // The applier's read finds the block wasted, and its next commit that writes prunes it.
     let mut applier = Snail::open_writing(&path).unwrap();
     applier.applying(SOURCE).unwrap();
     let (got, round) = applier.ask(q, None).unwrap();
-    assert_eq!((got.num_rows(), round.blocks_pruned), (1976 - 396, 1));
+    assert_eq!((got.num_rows(), round.blocks_pruned), (1976 - 396, 0));
+    assert_eq!(Snail::open(&path).unwrap().generation(), g);
+    let d = applier
+        .execute("UPDATE s.t SET b = b WHERE a = 1 AND b = 2999")
+        .unwrap();
+    assert_eq!((d.rows, d.blocks_pruned), (1, 1), "{d:?}");
     let now = Snail::open(&path).unwrap();
     assert_eq!((now.generation(), now.replica()), (g + 1, Some(SOURCE)));
     // Pruned, its blocks go out by any writer, and a recut carries the mark.

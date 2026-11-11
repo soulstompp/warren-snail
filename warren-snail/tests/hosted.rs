@@ -658,7 +658,8 @@ fn a_host_s_monitor_is_told_of_each_block_and_the_file_keeps_no_marks() {
             .unwrap(),
         0
     );
-    // A block that holds no row once its dead rows go is let go.
+    // A block that holds no row once its dead rows go is let go, at the writer's next commit that
+    // writes: a read alone commits nothing.
     let (mut w, _) = hosted(&path, 9, &said);
     w.execute("DELETE FROM s.t WHERE id < 1024").unwrap();
     drop(w);
@@ -667,6 +668,12 @@ fn a_host_s_monitor_is_told_of_each_block_and_the_file_keeps_no_marks() {
     w.monitored_by(Rc::new(Told(told.clone())));
     told.borrow_mut().clear();
     w.ask("SELECT sum(t.v) FROM s.t t", None).unwrap();
+    assert!(
+        !told.borrow().iter().any(|t| t == "let go s.t t_pkey"),
+        "{told:?}"
+    );
+    w.execute("INSERT INTO s.t (id, v) VALUES (200000, 0)")
+        .unwrap();
     assert!(
         told.borrow().iter().any(|t| t == "let go s.t t_pkey"),
         "{told:?}"

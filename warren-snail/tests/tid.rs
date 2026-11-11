@@ -463,7 +463,10 @@ fn a_tid_written_into_a_block_goes_into_each_leaf_s_tail_and_is_pruned_back_in_o
         assert_eq!((r[0].dead_marked, r[0].data_pages), (2, 2), "{leaf}");
     }
     check(&mut w);
-    // Read again, the block is pruned: each leaf laid back in the order, one page.
+    // Read again, the block is pruned by the writer's next commit that writes: each leaf laid back
+    // in the order, one page.
+    let d = w.execute("UPDATE s.t SET v = v WHERE id = 1").unwrap();
+    assert!(d.blocks_pruned > 0, "{d:?}");
     let blocks = w.blocks().unwrap();
     for leaf in ["v.block", "v.offset"] {
         let r = of(&blocks, "t_pkey", leaf);

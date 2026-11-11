@@ -875,13 +875,14 @@ impl Snails {
                 part.pages_at_start = *p;
             }
         }
-        // A prune is its snail's own commit, and changes no answer.
+        // A prune is its snail's own, and changes no answer: in a transaction, as the round ends;
+        // outside one, in the snail's next commit that writes.
         for i in 0..self.snails.len() {
             let wasted = self.snails[i].wasted.take();
             if wasted.is_empty() || self.snails[i].reader.pending_copy().is_some() {
                 continue;
             }
-            let (pruned, written) = self.snails[i].prune(wasted)?;
+            let (pruned, written) = self.snails[i].round_wasted(wasted)?;
             round.blocks_pruned += pruned;
             round.pages_written += written;
             if let Some(part) = round.snails.get_mut(i) {

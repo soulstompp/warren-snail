@@ -1622,7 +1622,8 @@ mod written {
             run(&mut w, "INSERT INTO s.t VALUES (16384, 666666)");
             run(&mut w, "DELETE FROM s.t WHERE id = 16384");
             let q = "SELECT id FROM s.t WHERE v = 666666";
-            // Read whole, the block is read a page for that row alone, and pruned.
+            // Read whole, the block is read a page for that row alone; the writer's next commit, of
+            // a row of the first block, prunes it.
             let (b, round) = w.ask(q, None).unwrap();
             exact(q, &round);
             assert_eq!(
@@ -1630,7 +1631,9 @@ mod written {
                 (0, 1),
                 "{class}: {round:?}"
             );
-            assert_eq!(round.blocks_pruned, 1, "{class}: {round:?}");
+            assert_eq!(round.blocks_pruned, 0, "{class}: {round:?}");
+            let d = run(&mut w, "DELETE FROM s.t WHERE id = 0");
+            assert_eq!(d.blocks_pruned, 1, "{class}: {d:?}");
             // Its summary is written afresh from the rows it keeps: the block is ruled out.
             let (b, round) = w.ask(q, None).unwrap();
             exact(q, &round);

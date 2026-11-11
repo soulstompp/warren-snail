@@ -129,29 +129,31 @@ fn a_row_written_into_a_last_page_is_read_wherever_its_key_lies() {
     w.execute("DELETE FROM s.t WHERE a = 1 AND b = 1101")
         .unwrap();
     // The read narrowed to (1, 1100) reads the last pages only for the row written there: a page
-    // of waste, so it prunes the block, and the read after reads it in order.
-    for (q, want, pruned) in [
-        (
-            "SELECT t.b FROM s.t t WHERE t.a = 1 AND t.b = 1100",
-            vec![1100, 1100],
-            1,
-        ),
-        (
-            "SELECT t.b FROM s.t t WHERE t.a = 1 AND t.b >= 1100 AND t.b <= 1102",
-            vec![1100, 1100, 1102],
-            0,
-        ),
-    ] {
+    // of waste. A read alone commits nothing; the writer's next commit, of a row of the first block,
+    // prunes the second, and the read after reads it in order.
+    let asked = |w: &mut Snail, q: &str, want: Vec<i64>| {
         let (b, round) = w.ask(q, None).unwrap();
         let mut got: Vec<i64> = ints64(b.column(0).as_ref()).into_iter().flatten().collect();
         got.sort();
-        assert_eq!((got, round.blocks_pruned), (want, pruned), "{q}: {round:?}");
+        assert_eq!((got, round.blocks_pruned), (want, 0), "{q}: {round:?}");
         assert_eq!(
             round.column_pages_read,
             round.column_pages_predicted - round.column_pages_held,
             "{q}: {round:?}"
         );
-    }
+    };
+    asked(
+        &mut w,
+        "SELECT t.b FROM s.t t WHERE t.a = 1 AND t.b = 1100",
+        vec![1100, 1100],
+    );
+    let d = w.execute("DELETE FROM s.t WHERE a = 1 AND b = 0").unwrap();
+    assert_eq!(d.blocks_pruned, 1, "{d:?}");
+    asked(
+        &mut w,
+        "SELECT t.b FROM s.t t WHERE t.a = 1 AND t.b >= 1100 AND t.b <= 1102",
+        vec![1100, 1100, 1102],
+    );
 }
 
 #[test]
@@ -170,6 +172,8 @@ fn a_read_prunes_a_block_on_the_first_page_its_dead_rows_waste_and_never_before(
 
     let mut w = Snail::open_writing(&path).unwrap();
     let q = "SELECT t.b FROM s.t t WHERE t.a = 1 AND t.b >= 1024";
+    // A read alone commits nothing: the writer's next commit, here of a row of the first block,
+    // prunes what it found.
     w.execute(&format!(
         "DELETE FROM s.t WHERE a = 1 AND b >= 1024 AND b < {}",
         1024 + threshold - 1
@@ -177,7 +181,9 @@ fn a_read_prunes_a_block_on_the_first_page_its_dead_rows_waste_and_never_before(
     .unwrap();
     let (got, round) = w.ask(q, None).unwrap();
     assert_eq!(got.num_rows() as u64, n - (threshold - 1));
-    assert_eq!(round.blocks_pruned, 0, "a row short of a page: {round:?}");
+    assert_eq!(round.blocks_pruned, 0, "{round:?}");
+    let d = w.execute("DELETE FROM s.t WHERE a = 1 AND b = 0").unwrap();
+    assert_eq!(d.blocks_pruned, 0, "a row short of a page: {d:?}");
     w.execute(&format!(
         "DELETE FROM s.t WHERE a = 1 AND b = {}",
         1024 + threshold - 1
@@ -185,14 +191,20 @@ fn a_read_prunes_a_block_on_the_first_page_its_dead_rows_waste_and_never_before(
     .unwrap();
     let (got, round) = w.ask(q, None).unwrap();
     assert_eq!(got.num_rows() as u64, n - threshold);
-    assert_eq!(round.blocks_pruned, 1, "{round:?}");
-    let (again, round) = w.ask(q, None).unwrap();
-    assert_eq!((again.num_rows(), round.blocks_pruned), (got.num_rows(), 0));
+    assert_eq!(round.blocks_pruned, 0, "{round:?}");
+    let d = w.execute("DELETE FROM s.t WHERE a = 1 AND b = 1").unwrap();
+    assert_eq!(d.blocks_pruned, 1, "{d:?}");
+    let (again, _) = w.ask(q, None).unwrap();
+    let d = w.execute("DELETE FROM s.t WHERE a = 1 AND b = 2").unwrap();
+    assert_eq!((again.num_rows(), d.blocks_pruned), (got.num_rows(), 0));
     // A block nobody reads keeps its dead rows.
     w.execute("DELETE FROM s.t WHERE a = 1 AND b < 600")
         .unwrap();
-    let (_, round) = w.ask(q, None).unwrap();
-    assert_eq!(round.blocks_pruned, 0, "{round:?}");
+    w.ask(q, None).unwrap();
+    let d = w
+        .execute("DELETE FROM s.t WHERE a = 1 AND b = 2999")
+        .unwrap();
+    assert_eq!(d.blocks_pruned, 0, "{d:?}");
 }
 
 /// The INSERT of `n` records of 80 bytes into a data set, from place `from`.

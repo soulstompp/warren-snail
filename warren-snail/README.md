@@ -425,9 +425,11 @@ Writers that wait in a ring, each for a block the next holds, fail one of their 
 `deadlock detected`; a transaction one of whose statements failed takes nothing but its end, which
 rolls it back. A writer of 0.1.0 and one of a later version never write one snail at once: their
 block locks lie on different bytes. A read that pays a page or more of a block only for its dead
-rows, or for rows written after its last, prunes it as the round ends, on a snail open to write:
-the block is written again, in order and without its dead rows. A page the newest root no longer
-names is freed once no older round still reads it, and reused:
+rows, or for rows written after its last, on a snail open to write, leaves it to the writer's next
+commit, which prunes it: the block is written again, in order and without its dead rows. A read
+alone commits nothing, as PostgreSQL's commits nothing; the blocks it found wait for the writer's
+next statement or transaction that writes. A page the newest root no longer names is freed once no
+older round still reads it, and reused:
 
 ```sh
 warren-snail census shop.snail

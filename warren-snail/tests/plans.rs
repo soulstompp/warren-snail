@@ -245,11 +245,15 @@ fn a_writer_s_whole_read_reads_each_map_for_what_its_dead_rows_waste() {
     let mut w = Snail::open_writing(&path).unwrap();
     w.execute("DELETE FROM s.b WHERE id < 2048").unwrap();
     drop(w);
-    // Nothing held: the writer's first read, read whole, prunes what the deletes wasted.
+    // Nothing held: the writer's first read, read whole, finds what the deletes wasted, and its next
+    // commit prunes it.
     let mut w = Snail::open_writing(&path).unwrap();
     let q = "SELECT b.id FROM s.b b";
     let (b, r) = w.ask(q, Some("b_pkey")).unwrap();
     exact(q, &r);
     assert_eq!(b.num_rows() as i64, N - 2048);
-    assert!(r.blocks_pruned >= 1, "{r:?}");
+    let d = w
+        .execute(&format!("DELETE FROM s.b WHERE id = {}", N - 1))
+        .unwrap();
+    assert!(d.blocks_pruned >= 1, "{d:?}");
 }

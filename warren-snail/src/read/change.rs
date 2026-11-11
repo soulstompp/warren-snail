@@ -49,6 +49,9 @@ pub struct Done {
     pub pages_written: u64,
     /// The blocks rewritten in order.
     pub rewritten: u64,
+    /// The blocks its commit pruned: those reads outside a transaction found wasted since the
+    /// writer's last commit that wrote.
+    pub blocks_pruned: u64,
     /// The orders it wrote: those holding a column it changed.
     pub orders: u64,
     /// Of the pages written, those written into pages freed before.
@@ -1326,6 +1329,16 @@ impl Snail {
         if let Some((_, any)) = self.begun.as_mut() {
             *any |= changed;
         } else if changed || self.serial_records()? {
+            // A commit that writes prunes what reads outside a transaction found wasted since.
+            if changed {
+                match self.prune_unpruned() {
+                    Ok(pruned) => done.blocks_pruned = pruned,
+                    Err(e) => {
+                        self.abandon()?;
+                        return Err(e);
+                    }
+                }
+            }
             self.commit()?;
         } else {
             // A statement alone, or a transaction's end, that wrote nothing lets go of what it
@@ -3697,6 +3710,68 @@ impl Snail {
             self.locate(node.kids.get_mut(&i).unwrap(), head, key, path)?;
         }
         Ok(())
+    }
+
+    /// What a round found wasted, as it ends: in a transaction, pruned within it; outside one, kept
+    /// for the writer's next commit that writes, the round committing nothing. Returns the blocks
+    /// pruned and the pages written.
+    pub(super) fn round_wasted(&mut self, wasted: Vec<Wasted>) -> Result<(u64, u64)> {
+        if self.begun.is_some() {
+            return self.prune(wasted);
+        }
+        // A snail marked a replica is pruned by its applier's reads alone.
+        if self.writes_marked(&self.root).is_err() {
+            return Ok((0, 0));
+        }
+        let named = self.root.catalog_named();
+        let mut kept = match self.unpruned.take() {
+            Some((at, kept)) if at == named => kept,
+            _ => Vec::new(),
+        };
+        for b in wasted {
+            let known = kept
+                .iter()
+                .any(|k| k.table == b.table && k.order == b.order && k.child == b.child);
+            if !known {
+                kept.push(b);
+            }
+        }
+        self.unpruned = Some((named, kept));
+        Ok((0, 0))
+    }
+
+    /// Stages into the commit of a statement or a transaction that wrote the blocks rounds outside a
+    /// transaction found wasted since, pruned as a transaction's prune stages them: one it wrote
+    /// itself as it stands staged, one cut as it was written left so; one another writer has
+    /// written since, or holds, left as it is. The list is let go either way; it is kept only for
+    /// the catalog it was read under. Returns the blocks pruned.
+    pub(super) fn prune_unpruned(&mut self) -> Result<u64> {
+        let Some((named, wasted)) = self.unpruned.take() else {
+            return Ok(0);
+        };
+        if named != self.root.catalog_named()
+            || self.declared.is_some()
+            || self.held
+            || self.writes_marked(&self.root).is_err()
+        {
+            return Ok(0);
+        }
+        let wasted = wasted
+            .into_iter()
+            .map(|mut b| {
+                let staged = self
+                    .rebased
+                    .get(&(b.table, b.order))
+                    .and_then(|log| log.iter().find(|r| r.child == b.child));
+                if let Some([e]) = staged.map(|r| r.entries.as_slice()) {
+                    b.first = e.first.clone();
+                    b.child = e.child;
+                }
+                b
+            })
+            .collect();
+        let mut stage = self.reader.stage();
+        self.prune_with(&mut stage, wasted)
     }
 
     /// Prunes the blocks a round found a page or more of waste in: each rewritten in order, its dead

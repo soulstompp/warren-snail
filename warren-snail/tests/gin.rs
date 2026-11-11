@@ -960,12 +960,12 @@ mod written {
         let (_, first) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{150}'", Some("t_a"));
         assert_eq!(first.blocks_pruned, 0, "{first:?}");
         run(&mut s, "UPDATE s.t SET a = '{9000}' WHERE a @> '{1}'");
-        let (_, after) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{2}'", Some("t_a"));
-        let (_, again) = ids(&mut s, "SELECT id FROM s.t WHERE a @> '{1}'", Some("t_a"));
-        assert!(
-            after.blocks_pruned + again.blocks_pruned > 0,
-            "{after:?} {again:?}"
-        );
+        ids(&mut s, "SELECT id FROM s.t WHERE a @> '{2}'", Some("t_a"));
+        ids(&mut s, "SELECT id FROM s.t WHERE a @> '{1}'", Some("t_a"));
+        // A read alone commits nothing: the writer's next commit, of a row the reads never met,
+        // prunes the strand's blocks they found wasted.
+        let d = run(&mut s, "INSERT INTO s.t (id, a, pad) VALUES (100000, '{9001}', 'p')");
+        assert!(d.blocks_pruned > 0, "{d:?}");
         whole(&mut s);
     }
 

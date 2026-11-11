@@ -2142,14 +2142,17 @@ fn a_block_a_prune_lets_go_leaves_its_mark_on_the_order() {
     run(&mut w, "INSERT INTO s.o (id, v) VALUES (1, 1)");
     run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     assert_eq!(read(&mut a, row), i64::from(row));
-    // Outside the level, every row of the first block goes, and the block with them.
+    // Outside the level, every row of the first block goes, and the block with them, at the
+    // writer's next commit that writes after its read.
     let mut x = open(&path);
     run(&mut x, "DELETE FROM s.t WHERE id < 16384");
     x.ask("SELECT sum(t.v) FROM s.t t", None).unwrap();
+    let d = run(&mut x, &format!("UPDATE s.t SET v = v WHERE id = {B}"));
+    assert_eq!(d.blocks_pruned, 1, "{d:?}");
     assert_eq!(
-        blocks_of(&path),
-        [1024],
-        "the read pruned the first block away"
+        blocks_of(&path).len(),
+        1,
+        "the commit after the read pruned the first block away"
     );
     // A row written where the first block's rows lay lies in the block that remains.
     run(&mut w, "BEGIN ISOLATION LEVEL SERIALIZABLE");

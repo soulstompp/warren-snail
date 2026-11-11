@@ -598,10 +598,12 @@ fn a_block_pruned_or_let_go_since_the_snapshot_is_met_too() {
     assert_eq!(count(&mut a, SECOND_BLOCK), 1024);
     run(&mut x, "DELETE FROM s.t WHERE id < 16384");
     x.ask("SELECT sum(t.v) FROM s.t t", None).unwrap();
+    let neutral = format!("UPDATE s.t SET v = v WHERE id = {D}");
+    assert_eq!(run(&mut x, &neutral).blocks_pruned, 1);
     assert_eq!(
-        blocks_of(&path, "t_pkey"),
-        [1024],
-        "the read pruned it away"
+        blocks_of(&path, "t_pkey").len(),
+        1,
+        "the commit after the read pruned it away"
     );
     run(&mut a, "INSERT INTO s.t (id, v) VALUES (5, 5)");
     assert_eq!(value(&mut a, 5), 5);

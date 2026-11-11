@@ -31,6 +31,9 @@ at once, and a snail written inside a host that decides its commits.
   `integer`'s are `bigint`s, in a pipeline too.
 - **A locking clause is refused by name,** `FOR UPDATE` and the others, where 0.1.1 answered the
   question and took no lock.
+- **A read alone commits nothing,** as PostgreSQL's commits nothing: the blocks it finds wasted on
+  a snail open to write are pruned in the writer's next commit that writes, counted in its
+  `Done::blocks_pruned`, where 0.1.1's read pruned them and committed as it ended.
 
 ### Added
 

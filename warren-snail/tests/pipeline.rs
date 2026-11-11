@@ -147,8 +147,9 @@ fn a_table_declared_in_a_file_that_holds_others_takes_rows_and_reads_its_runs() 
     assert_eq!(wind_blocks(&r), wind_blocks(&fresh));
     let (b, _) = r.ask_with(WIND, None, &wind_params()).unwrap();
     assert_eq!(as_written(&b), want);
-    // Read on its key, the pages read only for rows past a block's sorted ones prune it, and it is
-    // cut again by the counts.
+    // Read on its key, the pages read only for rows past a block's sorted ones prune it at the
+    // writer's next commit that writes, and it is cut again by the counts: a read alone commits
+    // nothing.
     let first = rows[0].0;
     let (n, round) = w
         .ask(
@@ -163,23 +164,31 @@ fn a_table_declared_in_a_file_that_holds_others_takes_rows_and_reads_its_runs() 
         one(&n),
         rows.iter().filter(|x| x.0 <= first + 10).count() as i64
     );
-    assert_eq!(round.blocks_pruned, 1);
-    assert!(wind_blocks(&w) > 1, "{} blocks", wind_blocks(&w));
+    assert_eq!(round.blocks_pruned, 0);
     // A row written after a block's last lies in its tail; deleted, it is still there. Read whole,
-    // the block is read a page for that row alone, and pruned; read whole again, it is not.
+    // the block is read a page for that row alone, and pruned at the next commit, of a reading;
+    // read whole again, it is not.
     let next = rows.iter().map(|x| x.0).max().unwrap() + 1;
-    w.execute(&format!(
-        "INSERT INTO weather.wind (seq, station, turn) VALUES ({next}, '\\x00', 0.0)"
-    ))
-    .unwrap();
+    let d = w
+        .execute(&format!(
+            "INSERT INTO weather.wind (seq, station, turn) VALUES ({next}, '\\x00', 0.0)"
+        ))
+        .unwrap();
+    assert_eq!(d.blocks_pruned, 1, "{d:?}");
+    assert!(wind_blocks(&w) > 1, "{} blocks", wind_blocks(&w));
     w.execute(&format!("DELETE FROM weather.wind WHERE seq = {next}"))
         .unwrap();
-    let (b, round) = w.ask_with(WIND, None, &wind_params()).unwrap();
-    assert_eq!(as_written(&b), want);
-    assert_eq!(round.blocks_pruned, 1, "{round:?}");
-    let (b, round) = w.ask_with(WIND, None, &wind_params()).unwrap();
-    assert_eq!(as_written(&b), want);
-    assert_eq!(round.blocks_pruned, 0);
+    let reading = format!(
+        "UPDATE weather.readings SET feed = feed WHERE reading_id = {}",
+        s.reading_id[0]
+    );
+    for pruned in [1, 0] {
+        let (b, round) = w.ask_with(WIND, None, &wind_params()).unwrap();
+        assert_eq!(as_written(&b), want);
+        assert_eq!(round.blocks_pruned, 0, "{round:?}");
+        let d = w.execute(&reading).unwrap();
+        assert_eq!((d.rows, d.blocks_pruned), (1, pruned), "{d:?}");
+    }
     drop(w);
     r.census().unwrap();
     let (b, _) = r.ask_with(WIND, None, &wind_params()).unwrap();

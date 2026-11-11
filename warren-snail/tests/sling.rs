@@ -3,10 +3,11 @@
 //! expression holds; an aggregate inside an IN list, a BETWEEN, a LIKE, a COLLATE or a SUBSTRING,
 //! grouped or not; an aggregate in ORDER BY, a column of the select list or none; and two serializable
 //! writers of one block, each of its own row by the table's key, both committing, as 18.6 commits them
-//! where the row's page has room, a write skew refused and a key moved into a read gap met. Every
-//! answer and refusal is 18.6's over the same statements (`session.nu --suite sling`, and
-//! `sessions.nu --only serializable` for the writers). A snail writes on its own only with
-//! `standalone`, as `tests/ddl.rs`.
+//! where the row's page has room, a write skew refused and a key moved into a read gap met; and a
+//! read alone between a writer's texts committing nothing, as 18.6's commits nothing, the block it
+//! found wasted pruned by the writer's next commit that writes. Every answer and refusal is 18.6's
+//! over the same statements (`session.nu --suite sling`, and `sessions.nu --only serializable` for
+//! the writers). A snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -404,5 +405,112 @@ fn an_update_moving_a_key_lands_in_the_gap_a_read_of_that_key_marked() {
     assert_eq!(
         rows(&mut c, "SELECT acct, balance FROM s.accounts ORDER BY acct"),
         ["A00001|10.00", "A00005|20.00", "A00009|90.00"]
+    );
+}
+
+/// A host counting the commits handed it.
+struct Counted(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl warren_snail::carry::Host for Counted {
+    fn carry(&mut self, _: &warren_snail::carry::Commit) -> warren_snail::Result<()> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The disk pages of each block of `s.designs`' `written` column.
+fn written_pages(w: &Snail) -> Vec<u64> {
+    w.blocks()
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.table == "s.designs" && b.column == "written")
+        .map(|b| b.disk_pages)
+        .collect()
+}
+
+/// The answers, the row counts and the refusal are 18.6's over the same statements; the commits
+/// handed to the host, the generations and the pages are the snail's own: a read alone writes no
+/// commit, as 18.6's writes no commit record.
+#[test]
+fn a_read_alone_commits_nothing_and_its_prune_rides_the_writer_s_next_commit() {
+    let path = tmp("sling-ride.snail");
+    let ddl = "CREATE SCHEMA s;
+         CREATE TABLE s.designs (name varchar(32) NOT NULL, ordinal integer NOT NULL, written text,
+             PRIMARY KEY (name));
+         CREATE TABLE s.filled (set_name varchar(32) NOT NULL, way varchar(8),
+             PRIMARY KEY (set_name));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    let handed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    w.carried_by(Box::new(Counted(handed.clone()))).unwrap();
+    let commits = || handed.load(std::sync::atomic::Ordering::SeqCst);
+    // Two texts as warren-sling sends them, each a row of its own: the second lands in the block's
+    // tail.
+    for row in ["('trans', 1, 'set trans')", "('totals', 2, 'set totals')"] {
+        w.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        w.ask("SELECT 1", None).unwrap();
+        w.execute(&format!("INSERT INTO s.designs VALUES {row}"))
+            .unwrap();
+        w.execute("COMMIT").unwrap();
+    }
+    assert_eq!((commits(), written_pages(&w)), (2, vec![2]));
+    let at = w.generation();
+    // Read alone, twice: each pays the tail's page and commits nothing.
+    for _ in 0..2 {
+        let (b, round) = w
+            .ask("SELECT written FROM s.designs ORDER BY ordinal, name", None)
+            .unwrap();
+        let got: Vec<Option<String>> = w.text_of(&b).unwrap().into_iter().flatten().collect();
+        assert_eq!(
+            got,
+            [Some("set trans".to_string()), Some("set totals".to_string())]
+        );
+        assert_eq!(round.pages_written, 0, "{round:?}");
+        assert_eq!(
+            (w.generation(), Snail::open(&path).unwrap().generation(), commits()),
+            (at, at, 2)
+        );
+    }
+    // A statement alone that writes nothing, and one refused, commit nothing either.
+    let done = w
+        .execute("UPDATE s.designs SET ordinal = 3 WHERE name = 'none'")
+        .unwrap();
+    assert_eq!(done.rows, 0);
+    let (state, _) = refused(&mut w, "INSERT INTO s.designs VALUES ('trans', 9, 'again')");
+    assert_eq!(state, Some("23505"));
+    assert_eq!((w.generation(), commits()), (at, 2));
+    // The next text that writes commits once, the block the reads found pruned in it.
+    let d = w
+        .execute("INSERT INTO s.filled VALUES ('trans', 'sling')")
+        .unwrap();
+    assert_eq!(
+        (d.blocks_pruned, w.generation(), commits(), written_pages(&w)),
+        (1, at + 1, 3, vec![1])
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT name, ordinal, written FROM s.designs ORDER BY name"),
+        ["totals|2|set totals", "trans|1|set trans"]
+    );
+    // A commit that writes the very block a read found wasted prunes it as it writes it.
+    w.execute("INSERT INTO s.designs VALUES ('patch', 3, 'set patch')")
+        .unwrap();
+    assert_eq!(written_pages(&w), [2]);
+    w.ask("SELECT written FROM s.designs ORDER BY ordinal, name", None)
+        .unwrap();
+    let d = w
+        .execute("INSERT INTO s.designs VALUES ('push', 4, 'set push')")
+        .unwrap();
+    assert_eq!(
+        (d.blocks_pruned, commits(), written_pages(&w)),
+        (1, 5, vec![1])
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT name, ordinal, written FROM s.designs ORDER BY name"),
+        [
+            "patch|3|set patch",
+            "push|4|set push",
+            "totals|2|set totals",
+            "trans|1|set trans"
+        ]
     );
 }

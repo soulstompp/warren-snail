@@ -494,8 +494,12 @@ pub struct Snail {
     pub(crate) levels: statement::Levels,
     /// Where the snail is open to write, its writer's slot among the file's writers.
     slot: u64,
-    /// The blocks a round read a page or more of waste in, which it prunes as it ends.
+    /// The blocks a round read a page or more of waste in: in a transaction, it prunes them as it
+    /// ends.
     wasted: std::cell::RefCell<Vec<Wasted>>,
+    /// The blocks rounds outside a transaction found wasted, each once, and the catalog they read
+    /// them under: the writer's next commit that writes prunes them.
+    unpruned: Option<((Extent, u64), Vec<Wasted>)>,
     /// The blocks the statement or the transaction under way has written, by table and order, each
     /// against the block it began from.
     rebased: std::collections::BTreeMap<(usize, usize), Vec<change::Rebased>>,
@@ -637,7 +641,8 @@ pub struct Round {
     /// Blocks whose pages were read; the rest were answered from their counts or skipped.
     pub blocks_read: u64,
     pub rows: u64,
-    /// On a snail open to write, the blocks the round pruned as it ended, and the pages it wrote.
+    /// On a snail open to write, in a transaction, the blocks the round pruned as it ended, and the
+    /// pages it wrote; outside one, the writer's next commit that writes prunes them.
     pub blocks_pruned: u64,
     pub pages_written: u64,
     /// For a question read as a pipeline, the most rows it held at once as the table's rows came:
@@ -813,6 +818,7 @@ impl Snail {
             levels: Default::default(),
             slot: 0,
             wasted: Default::default(),
+            unpruned: None,
             walked: Default::default(),
             taken: Default::default(),
             rebased: Default::default(),
@@ -1664,7 +1670,7 @@ impl Snail {
         round.pages_at_start = pages_at_start;
         let wasted = self.wasted.take();
         if !wasted.is_empty() {
-            (round.blocks_pruned, round.pages_written) = self.prune(wasted)?;
+            (round.blocks_pruned, round.pages_written) = self.round_wasted(wasted)?;
         }
         Ok((batch, round))
     }

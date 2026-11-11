@@ -108,7 +108,7 @@ fn rows_written_into_a_snail_answer_as_a_snail_written_afresh_from_the_same_rows
 
     // More rows than one last page has room for, all from one station: a part of the block now
     // fills a page, so the commit cuts the block as a block written afresh is cut, and a read
-    // narrowed to them prunes nothing.
+    // narrowed to them finds nothing the writer's next commit prunes.
     let observed = |i: i64| format!("2023-0{}-1{} 08:00:00+00", 1 + i % 9, i % 10);
     let values: Vec<String> = (0..1500)
         .map(|i| {
@@ -181,7 +181,8 @@ fn rows_written_into_a_snail_answer_as_a_snail_written_afresh_from_the_same_rows
         .iter_mut()
         .filter(|x| (x.0, x.1) == (9001, 2))
         .for_each(|x| x.2 = "Faro 0".into());
-    assert_eq!(w.execute("COMMIT").unwrap().generation, before + 1);
+    let d = w.execute("COMMIT").unwrap();
+    assert_eq!((d.generation, d.blocks_pruned), (before + 1, 0), "{d:?}");
 
     // A unique key is kept unique, a block's first key among them: the key finds it in the block
     // it begins.
@@ -702,12 +703,18 @@ fn a_block_statements_change_may_lie_in_two_files_and_a_block_written_whole_lies
             bag(&b)
         })
         .collect();
-    // Read whole along each order, the blocks the statements changed are pruned: each written whole,
-    // in one run, in one file.
+    // Read whole along each order, the blocks the statements changed are pruned by the writer's next
+    // commit that writes, here of a station: each written whole, in one run, in one file.
     for ((q, o), want) in questions.iter().zip(&asked) {
         let (b, _) = w.ask(q, Some(o)).unwrap();
         assert_eq!(&bag(&b), want, "{q}");
     }
+    let d = w
+        .execute(
+            "INSERT INTO weather.stations (network_id, station_no, name) VALUES (9001, 7, 'added')",
+        )
+        .unwrap();
+    assert!(d.blocks_pruned > 0, "{d:?}");
     let readings: Vec<u64> = w
         .blocks()
         .unwrap()

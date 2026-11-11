@@ -995,7 +995,8 @@ fn a_shape_written_moved_and_deleted_widens_its_block_s_box_on_every_strand() {
         );
     };
     check(&mut w);
-    // A read that finds its block's tail wasted prunes it, and the box stays what the block holds.
+    // A read that finds its block's tail wasted has the writer's next commit prune it, and the box
+    // stays what the block holds.
     drop(w);
     let mut s = fresh(&path);
     check(&mut s);
@@ -1301,26 +1302,24 @@ fn at_repeatable_read_two_writers_of_one_block_update_and_delete_their_own_rows_
         "could not serialize access due to concurrent update",
     );
     run(&mut a, "ROLLBACK");
-    // Many rows moved within the block's places waste its pages: a read along the strand prunes it, and
-    // the box it keeps still holds what it holds.
+    // Many rows moved within the block's places waste its pages: a read along the strand finds it,
+    // the writer's next commit prunes it, and the box it keeps still holds what it holds.
     let mut pruned = 0;
     for round in 0..12 {
         for id in 0..64 {
-            run(
-                &mut a,
-                &format!(
-                    "UPDATE s.t SET p = '({},{})' WHERE id = {id}",
-                    1024 + round,
-                    1024 + id
-                ),
+            let sql = format!(
+                "UPDATE s.t SET p = '({},{})' WHERE id = {id}",
+                1024 + round,
+                1024 + id
             );
+            pruned += a.execute(&sql).unwrap().blocks_pruned;
         }
         let q = format!("SELECT id FROM s.t WHERE p ~= '({},1024)'", 1024 + round);
         let (_, r) = a.ask(&q, Some("t_p")).unwrap();
-        pruned += r.blocks_pruned;
+        assert_eq!(r.blocks_pruned, 0, "{r:?}");
         assert_eq!(ids(&mut a, &q, "t_p"), ids(&mut a, &q, "t_pkey"), "{q}");
     }
-    assert!(pruned > 0, "no read along the strand pruned");
+    assert!(pruned > 0, "no commit after a read along the strand pruned");
     let q = "SELECT id FROM s.t WHERE p <@ box '((1024,1024),(1035,1087))'";
     assert_eq!(ids(&mut a, q, "t_p"), ids(&mut a, q, "t_pkey"));
     // A block pruned since a snapshot takes the row its transaction wrote, in the box it keeps.
@@ -1338,13 +1337,15 @@ fn at_repeatable_read_two_writers_of_one_block_update_and_delete_their_own_rows_
             ),
         );
     }
-    let (_, r) = a
-        .ask(
-            "SELECT id FROM s.t WHERE p <@ box '((1024,1024),(1035,1087))'",
-            Some("t_p"),
-        )
+    a.ask(
+        "SELECT id FROM s.t WHERE p <@ box '((1024,1024),(1035,1087))'",
+        Some("t_p"),
+    )
+    .unwrap();
+    let d = a
+        .execute("UPDATE s.t SET p = '(1024.5,1087)' WHERE id = 63")
         .unwrap();
-    assert!(r.blocks_pruned > 0, "{r:?}");
+    assert!(d.blocks_pruned > 0, "{d:?}");
     run(&mut b, "COMMIT");
     let q = "SELECT id FROM s.t WHERE p ~= '(1023.75,1023.75)'";
     assert_eq!(ids(&mut a, q, "t_p"), [9100]);
