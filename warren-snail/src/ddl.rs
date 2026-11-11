@@ -7566,20 +7566,21 @@ pub(crate) fn set_constraints(tokens: &[Token]) -> Option<Result<(Option<Vec<Str
     Some(read)
 }
 
-/// A relation a declaration locks, as it names it: by its name, or every relation of a schema it
-/// drops.
+/// What a declaration locks, as it names it: a relation by its name, every relation of a schema it
+/// drops, or a schema itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Locked {
     Relation(String),
     Schema(String),
+    Namespace(String),
 }
 
 /// The relations a declaration locks while it runs, in the modes PostgreSQL 18.6 takes: a DROP's,
-/// ACCESS EXCLUSIVE; ALTER TABLE's, the strongest its actions take (`AlterTableGetLockLevel`), and
-/// SHARE ROW EXCLUSIVE on a table a foreign key references; CREATE INDEX's table, SHARE, or SHARE
-/// UPDATE EXCLUSIVE CONCURRENTLY; ALTER SEQUENCE's, SHARE ROW EXCLUSIVE; COMMENT ON a relation or its
-/// column or constraint, SHARE UPDATE EXCLUSIVE; and a view CREATE OR REPLACE VIEW replaces, ACCESS
-/// EXCLUSIVE. Any other declaration locks no relation.
+/// ACCESS EXCLUSIVE, a DROP SCHEMA's on the schema too; ALTER TABLE's, the strongest its actions
+/// take (`AlterTableGetLockLevel`), and SHARE ROW EXCLUSIVE on a table a foreign key references;
+/// CREATE INDEX's table, SHARE, or SHARE UPDATE EXCLUSIVE CONCURRENTLY; ALTER SEQUENCE's, SHARE ROW
+/// EXCLUSIVE; COMMENT ON a relation or its column or constraint, SHARE UPDATE EXCLUSIVE; and a view
+/// CREATE OR REPLACE VIEW replaces, ACCESS EXCLUSIVE. Any other declaration locks no relation.
 pub(crate) fn locked(sql: &str) -> Vec<(Locked, crate::read::tablelock::Mode)> {
     use crate::read::tablelock::Mode;
     let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
@@ -7619,6 +7620,9 @@ pub(crate) fn locked(sql: &str) -> Vec<(Locked, crate::read::tablelock::Mode)> {
         c.kw("CONCURRENTLY");
         c.kws(&["IF", "EXISTS"]);
         for n in names(&mut c) {
+            if schema {
+                out.push((Locked::Namespace(n.clone()), Mode::AccessExclusive));
+            }
             let l = if schema {
                 Locked::Schema(n)
             } else {

@@ -174,12 +174,19 @@ pub(super) struct Declared {
     /// The relations it made, by name, which no other writer names until it commits: their locks
     /// are no other's to meet.
     relations: Vec<String>,
+    /// The schemas it made, by name, as no other writer names them until it commits.
+    schemas: Vec<String>,
 }
 
 impl Declared {
     /// Whether it made the relation of that name.
     pub(super) fn made_relation(&self, name: &str) -> bool {
         self.relations.iter().any(|r| r == name)
+    }
+
+    /// Whether it made the schema of that name.
+    pub(super) fn made_schema(&self, name: &str) -> bool {
+        self.schemas.iter().any(|s| s == name)
     }
 
     /// The catalog as committed it declared on.
@@ -249,7 +256,7 @@ fn names_relations(sql: &str) -> bool {
 /// The objects `after` holds that `before` does not whose rows take a key of the catalog's unique
 /// indexes (a schema, a relation, a type or an array, a function), in the order PostgreSQL writes
 /// their rows: as the DDL made them, a relation's row type and its array before its pg_class row.
-fn names_made(before: &Catalog, after: &Catalog) -> Vec<crate::oids::Object> {
+pub(super) fn names_made(before: &Catalog, after: &Catalog) -> Vec<crate::oids::Object> {
     use crate::oids::Object as O;
     let made: Vec<&O> = after
         .oids
@@ -2755,12 +2762,8 @@ impl Snail {
 
     /// What a statement of a transaction reads: the newest root, with the transaction's own changes
     /// in place of the blocks it changed, each still the block it began from, since the
-    /// transaction holds its lock. A transaction that declared a table reads as it began. Returns
-    /// the pages it read.
+    /// transaction holds its lock. Returns the pages it read.
     pub(super) fn renew_in_transaction(&mut self) -> Result<u64> {
-        if self.declared.is_some() {
-            return Ok(0);
-        }
         let before = self.reader.pages_read();
         let root = self.reader.begin_round()?;
         self.in_transaction_on(root)?;
@@ -2768,13 +2771,17 @@ impl Snail {
     }
 
     /// What a statement of a transaction reads on `root`: the transaction's own changes in place of
-    /// the blocks it changed.
+    /// the blocks it changed. A transaction that declared reads the catalog as committed with its
+    /// own statements declared on it (`declared_on`).
     pub(super) fn in_transaction_on(&mut self, mut root: Root) -> Result<()> {
         if root.generation == self.root.generation {
             return Ok(());
         }
-        // What it holds of each table by its place follows the table where another's DDL moved it.
-        if self.catalog_moved(&root) {
+        if self.declared.is_some() {
+            self.declared_on(&mut root)?;
+        } else if self.catalog_moved(&root) {
+            // What it holds of each table by its place follows the table where another's DDL
+            // moved it.
             let catalog = Snail::catalog(&self.reader, &root)?;
             self.renumbered(&catalog);
             self.catalog = catalog;
@@ -3596,7 +3603,8 @@ impl Snail {
         blocks: &[(Entry, bool)],
         effects: &[&Effect],
     ) -> super::serial::Written {
-        let byte = |e: &Entry| lock::block_byte_of(ti, oi, &e.first);
+        let key = self.lock_key(ti);
+        let byte = |e: &Entry| lock::block_byte_of(key, oi, &e.first);
         let begun = |e: &Entry| {
             self.rebased
                 .get(&(ti, oi))
@@ -3604,7 +3612,7 @@ impl Snail {
                     rs.iter()
                         .find(|r| r.entries.iter().any(|x| x.child.start == e.child.start))
                 })
-                .map_or_else(|| byte(e), |r| lock::block_byte_of(ti, oi, &r.first))
+                .map_or_else(|| byte(e), |r| lock::block_byte_of(key, oi, &r.first))
         };
         super::serial::Written {
             blocks: blocks
@@ -3615,7 +3623,7 @@ impl Snail {
             rows: match order.table_order {
                 true => effects
                     .iter()
-                    .map(|e| lock::row_byte(ti, oi, &e.key))
+                    .map(|e| lock::row_byte(key, oi, &e.key))
                     .collect(),
                 false => Vec::new(),
             },
@@ -3678,7 +3686,7 @@ impl Snail {
                 return Err(Error::new(format!("{} holds no row to delete", order.name)));
             }
             // The order's first rows: its lock taken, as a block's is, and the order still empty.
-            let b = lock::block_byte_of(ti, oi, &[]);
+            let b = lock::block_byte_of(self.lock_key(ti), oi, &[]);
             if !self.locks.contains(&b) {
                 self.lock_byte(b, Waiting::Wait)?;
                 self.locks.insert(b);
@@ -3690,9 +3698,10 @@ impl Snail {
             let mut written = super::serial::Written::blocks(vec![b]);
             written.landed.push(b);
             if order.table_order {
+                let key = self.lock_key(ti);
                 written.rows = effects
                     .iter()
-                    .map(|e| lock::row_byte(ti, oi, &e.key))
+                    .map(|e| lock::row_byte(key, oi, &e.key))
                     .collect();
             }
             self.mark_wrote(ti, oi, &written)?;
@@ -3765,10 +3774,11 @@ impl Snail {
         blocks: Vec<Entry>,
         waiting: Waiting,
     ) -> Result<bool> {
+        let key = self.lock_key(ti);
         let mut want: Vec<(u64, Entry)> = blocks
             .into_iter()
             .filter(|e| e.child.start < STAGED)
-            .map(|e| (lock::block_byte_of(ti, oi, &e.first), e))
+            .map(|e| (lock::block_byte_of(key, oi, &e.first), e))
             .collect();
         want.sort_by_key(|x| x.0);
         want.dedup_by_key(|x| x.0);
@@ -3995,7 +4005,7 @@ impl Snail {
                 // to its end.
                 let held = self
                     .locks
-                    .contains(&lock::block_byte_of(ti, oi, &entry.first));
+                    .contains(&lock::block_byte_of(self.lock_key(ti), oi, &entry.first));
                 if self.begun.is_some() && !held {
                     continue;
                 }
@@ -4847,6 +4857,17 @@ impl Snail {
                 .collect()
         };
         let (before, after) = (relations(&self.catalog), relations(&catalog));
+        // The schemas it made, and those it dropped.
+        let schemas = |c: &Catalog| -> Vec<String> {
+            c.oids
+                .each()
+                .filter_map(|(_, o)| match o {
+                    crate::oids::Object::Namespace(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (had, has) = (schemas(&self.catalog), schemas(&catalog));
         self.renumbered(&catalog);
         self.sequences_redeclared(&catalog);
         self.catalog = catalog;
@@ -4858,6 +4879,7 @@ impl Snail {
             resets: Vec::new(),
             taken_out: Vec::new(),
             relations: Vec::new(),
+            schemas: Vec::new(),
         });
         for r in resets {
             if !d.resets.contains(&r) {
@@ -4867,6 +4889,8 @@ impl Snail {
         d.relations.retain(|r| after.contains(r));
         d.relations
             .extend(after.into_iter().filter(|r| !before.contains(r)));
+        d.schemas.retain(|s| has.contains(s));
+        d.schemas.extend(has.into_iter().filter(|s| !had.contains(s)));
         d.from = from;
         d.ddl = text;
         d.own.push_str(&stated);
@@ -4962,13 +4986,17 @@ impl Snail {
 
     /// A statement whose round renews, alone or in a transaction at READ COMMITTED, names as
     /// committed: where another writer's commit moved the catalog past the one the snail read last,
-    /// its round renews before the statement is read. A transaction that declared reads as it
-    /// began.
+    /// or the one a transaction that declared declared on, its round renews before the statement
+    /// is read.
     fn renewed_where_declared_since(&mut self) -> Result<()> {
-        if self.held || self.declared.is_some() || (self.begun.is_none() && self.rounds == 0) {
+        if self.held || (self.begun.is_none() && self.rounds == 0) {
             return Ok(());
         }
-        if self.reader.peek_root()?.catalog_named() == self.root.catalog_named() {
+        let read = self
+            .declared
+            .as_ref()
+            .map_or(self.root.catalog_named(), |d| d.from);
+        if self.reader.peek_root()?.catalog_named() == read {
             return Ok(());
         }
         match self.begun.is_some() {
@@ -5078,6 +5106,51 @@ impl Snail {
         d.from = root.catalog_named();
         d.ddl = catalog.ddl.clone();
         self.catalog = catalog;
+        Ok(())
+    }
+
+    /// What a statement of a transaction that declared reads on `root`, as its commit writes it
+    /// there: its own statements declared again where another writer's commit moved the catalog
+    /// since (`replayed_on`), the root's orders but those of a table its DDL made or changed and
+    /// those a DROP of it took out, and each order it made empty, its own rows to come.
+    fn declared_on(&mut self, root: &mut Root) -> Result<()> {
+        let moved = self
+            .declared
+            .as_ref()
+            .is_some_and(|d| root.catalog_named() != d.from);
+        self.replayed_on(root)?;
+        let d = self.declared.as_ref().expect("a transaction that declared");
+        let mut stage = self.reader.stage();
+        let touched: Vec<&String> = d.made.iter().map(|(t, _)| t).collect();
+        let mut orders = Vec::new();
+        for (t, o, e) in std::mem::take(&mut root.orders) {
+            let made = d.made.contains(&(t.clone(), o.clone()));
+            let declared = self
+                .catalog
+                .table(&t)
+                .is_some_and(|x| x.orders.iter().any(|y| y.name == o));
+            let taken_out = d.taken_out.contains(&(t.clone(), o.clone()));
+            if !((touched.contains(&&t) && (made || !declared)) || taken_out) {
+                orders.push((t, o, e));
+            }
+        }
+        for (tn, on) in &d.made {
+            if let Some(t) = self.catalog.table(tn) {
+                if let Some(o) = t.orders.iter().find(|x| x.name == *on) {
+                    let head = empty_head(t, o, self.reader.format());
+                    orders.push((tn.clone(), on.clone(), stage.place(&encode_top(&head, &[]))?));
+                }
+            }
+        }
+        root.orders = orders;
+        // Its root names the catalog it declared, as a declaration stages it.
+        root.catalog = match moved {
+            true => stage.place(d.ddl.as_bytes())?,
+            false => self.root.catalog,
+        };
+        if let Some(c) = root.cut.as_mut() {
+            c.catalog_at = None;
+        }
         Ok(())
     }
 

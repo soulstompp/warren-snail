@@ -128,6 +128,14 @@ impl Snail {
         )
     }
 
+    /// The key a table's blocks, rows and keys are locked and marked by: its lock's key
+    /// (`table_key`), which another's DROP of a table laid before it moves no more than its OID; for
+    /// a table the transaction made, a key of this writer's own by its name (`made_table_key`).
+    pub(super) fn lock_key(&self, table: usize) -> u64 {
+        self.table_key(table)
+            .unwrap_or_else(|| lock::made_table_key(self.slot, &self.catalog.tables[table].name))
+    }
+
     /// Whether the transaction's DDL made the relation of that name.
     fn made_relation(&self, name: &str) -> bool {
         self.declared.as_ref().is_some_and(|d| d.made_relation(name))
@@ -233,17 +241,18 @@ impl Snail {
 
     /// Locks the relations a declaration changes, each in the mode PostgreSQL takes for it
     /// (`ddl::locked`), held to the transaction's end: each named on the catalog the transaction
-    /// declares on, an index by its table, a schema by every relation in it, and a name no relation
-    /// holds not at all, the declaration refusing it in PostgreSQL's words. Returns whether it waited
-    /// for another writer's.
+    /// declares on, an index by its table, a schema by itself and every relation in it, and a name
+    /// no relation holds not at all, the declaration refusing it in PostgreSQL's words. Returns
+    /// whether it waited for another writer's.
     pub(super) fn ddl_locked(&mut self, ddl: &str) -> Result<bool> {
         self.relations_locked(crate::ddl::locked(ddl))
     }
 
     /// Locks ACCESS SHARE, held to the transaction's end, each relation a declaration reads as
     /// `catalog` declares it, as PostgreSQL's parse analysis opens them: those a view or a SQL
-    /// function's body it made reads, at every level, and the table a sequence's OWNED BY names.
-    /// Returns whether it waited for another writer's.
+    /// function's body it made reads, at every level, and the table a sequence's OWNED BY names;
+    /// and the schema each object it makes is made in. Returns whether it waited for another
+    /// writer's.
     pub(super) fn reads_locked(&mut self, catalog: &crate::catalog::Catalog) -> Result<bool> {
         use crate::ddl::Locked;
         use crate::deparse::depend::relations_read;
@@ -287,6 +296,25 @@ impl Snail {
                 wanted.push((Locked::Relation(t.clone()), AccessShare));
             }
         }
+        // The schema of each object it makes, as PostgreSQL locks what a new object depends on: a
+        // table, a view, a sequence, a type or a function; an index stands under its table's lock.
+        for o in super::change::names_made(&self.catalog, catalog) {
+            use crate::oids::{full, parts, Object};
+            let relation = |n: &str| {
+                catalog.tables.iter().any(|t| full(&t.name) == n)
+                    || catalog.views.iter().any(|v| full(&v.name) == n)
+                    || catalog.sequences.iter().any(|s| full(&s.name) == n)
+            };
+            let made_in = match &o {
+                Object::Class(n) if relation(n) => n,
+                Object::Type(n) | Object::Proc(n, _) => n,
+                _ => continue,
+            };
+            let l = Locked::Namespace(parts(made_in).0.to_string());
+            if !wanted.iter().any(|(w, _)| *w == l) {
+                wanted.push((l, AccessShare));
+            }
+        }
         self.relations_locked(wanted)
     }
 
@@ -300,6 +328,19 @@ impl Snail {
             let (schema, name) = match &l {
                 Locked::Relation(n) => (None, full(n)),
                 Locked::Schema(s) => (Some(s.clone()), String::new()),
+                // A schema itself, by its OID: but one the transaction made, which no other
+                // writer names until it commits, or one the catalog does not hold.
+                Locked::Namespace(s) => {
+                    let made = self.declared.as_ref().is_some_and(|d| d.made_schema(s));
+                    let oid = match s.as_str() {
+                        "public" => self.catalog.oids.public(),
+                        _ => self.catalog.oids.of(&Object::Namespace(s.clone())),
+                    };
+                    if let Some(oid) = oid.filter(|_| !made) {
+                        keys.push((u64::from(oid), s.clone(), mode));
+                    }
+                    continue;
+                }
             };
             let named = |n: &str| match &schema {
                 Some(s) => parts(&full(n)).0 == s,

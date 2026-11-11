@@ -997,6 +997,74 @@ fn at_read_committed_a_write_names_its_tables_as_committed_when_its_round_renews
 }
 
 #[test]
+fn at_read_committed_a_transaction_after_its_own_ddl_reads_each_statement_on_the_newest_commit() {
+    let path = tmp("beside-declared-renewed.snail");
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.d (id integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.u (id integer NOT NULL, PRIMARY KEY (id)); \
+               CREATE TABLE s.u2 (id integer NOT NULL, PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN");
+    run(&mut a, "CREATE TABLE s.own (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id))");
+    run(&mut a, "INSERT INTO s.own (id, v) VALUES (1, 1)");
+    // Rows another committed since are read, as 18.6 reads them.
+    run(&mut b, "INSERT INTO s.t (id, v) VALUES (1, 1), (2, 2)");
+    assert_eq!(count(&mut a, "SELECT sum(t.v) FROM s.t t"), 3);
+    // A table another made since: read, and written.
+    run(&mut b, "CREATE TABLE s.n (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id))");
+    run(&mut b, "INSERT INTO s.n (id, v) VALUES (1, 1), (2, 2)");
+    assert_eq!(count(&mut a, "SELECT sum(n.v) FROM s.n n"), 3);
+    assert_eq!(run(&mut a, "INSERT INTO s.n (id, v) VALUES (3, 3)").rows, 1);
+    assert_eq!(run(&mut a, "UPDATE s.n SET v = v + 10 WHERE id = 1").rows, 1);
+    assert_eq!(run(&mut a, "DELETE FROM s.n WHERE id = 2").rows, 1);
+    assert_eq!(count(&mut a, "SELECT sum(n.v) FROM s.n n"), 14);
+    // Its own DDL again, on the catalog another's moved.
+    run(&mut a, "CREATE TABLE s.own2 (id integer NOT NULL, PRIMARY KEY (id))");
+    run(&mut a, "INSERT INTO s.own2 (id) VALUES (7)");
+    // Another's DROP of a table laid before its own: its rows stay with their tables.
+    run(&mut b, "DROP TABLE s.d");
+    assert_eq!(run(&mut a, "INSERT INTO s.own (id, v) VALUES (2, 2)").rows, 1);
+    assert_eq!(run(&mut a, "UPDATE s.t SET v = v + 100").rows, 2);
+    assert_eq!(count(&mut a, "SELECT sum(o.v) FROM s.own o"), 3);
+    assert_eq!(count(&mut a, "SELECT sum(t.v) FROM s.t t"), 203);
+    // A write names a table another made since as its round renews, read or not before.
+    run(&mut b, "CREATE TABLE s.n2 (id integer NOT NULL, PRIMARY KEY (id))");
+    assert_eq!(run(&mut a, "INSERT INTO s.n2 (id) VALUES (1)").rows, 1);
+    // A table it never touched, altered by another, then dropped by another.
+    run(&mut b, "ALTER TABLE s.u2 ADD CONSTRAINT u2_c CHECK (id > 0)");
+    run(&mut a, "SAVEPOINT q");
+    let checked = a.execute("INSERT INTO s.u2 (id) VALUES (0)").unwrap_err();
+    assert_eq!(
+        (checked.sqlstate(), checked.to_string().as_str()),
+        (
+            Some("23514"),
+            "new row for relation \"u2\" violates check constraint \"u2_c\": Failing row contains (0)."
+        )
+    );
+    run(&mut a, "ROLLBACK TO q");
+    assert_eq!(run(&mut a, "INSERT INTO s.u2 (id) VALUES (5)").rows, 1);
+    assert_eq!(count(&mut a, "SELECT sum(u.id) FROM s.u2 u"), 5);
+    run(&mut b, "DROP TABLE s.u");
+    run(&mut a, "SAVEPOINT p");
+    let gone = a.ask("SELECT count(*) FROM s.u u", None).unwrap_err();
+    assert_eq!(
+        (gone.sqlstate(), gone.to_string().as_str()),
+        (Some("42P01"), "relation \"s.u\" does not exist")
+    );
+    run(&mut a, "ROLLBACK TO p");
+    assert_eq!(count(&mut a, "SELECT sum(n.v) FROM s.n n"), 14);
+    run(&mut a, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(count(&mut r, "SELECT sum(o.id * 1000 + o.v) FROM s.own o"), 3003);
+    assert_eq!(count(&mut r, "SELECT sum(t.id * 1000 + t.v) FROM s.t t"), 3203);
+    assert_eq!(count(&mut r, "SELECT sum(n.id * 1000 + n.v) FROM s.n n"), 4014);
+    assert_eq!(count(&mut r, "SELECT sum(u.id) FROM s.u2 u"), 5);
+    assert_eq!(count(&mut r, "SELECT sum(o.id) FROM s.own2 o"), 7);
+    assert_eq!(count(&mut r, "SELECT count(*) FROM s.n2 n"), 1);
+}
+
+#[test]
 fn a_table_declared_in_the_transaction_takes_its_rows_at_its_commit() {
     let path = made("declared-here");
     let (mut a, mut b) = (open(&path), open(&path));

@@ -608,7 +608,8 @@ impl Snail {
             self.lock_table(t.table, super::tablelock::Mode::RowShare, false)?;
         }
         for t in &plan.locked {
-            self.take_bytes(&[(lock::lockers_byte(t.table), true)], Waiting::Try)?;
+            let lockers = lock::lockers_byte(self.lock_key(t.table));
+            self.take_bytes(&[(lockers, true)], Waiting::Try)?;
         }
         let mut found: Option<HashSet<Vec<Datum>>> = None;
         'round: loop {
@@ -628,7 +629,7 @@ impl Snail {
             // A table a writer changed rows of without naming them: its rows wait for that writer.
             let mut skipped = vec![false; plan.locked.len()];
             for (k, t) in plan.locked.iter().enumerate() {
-                let unnamed = lock::unnamed_byte(t.table);
+                let unnamed = lock::unnamed_byte(self.lock_key(t.table));
                 if !lock::held_by_other(&file, unnamed)? {
                     continue;
                 }
@@ -666,7 +667,8 @@ impl Snail {
                         continue 'rows;
                     }
                     let key: Vec<Datum> = t.key.iter().map(|&i| read[i].clone()).collect();
-                    let bytes = t.strength.bytes(lock::row_bytes(t.table, &key_bytes(&key)));
+                    let row = lock::row_bytes(self.lock_key(t.table), &key_bytes(&key));
+                    let bytes = t.strength.bytes(row);
                     let waiting = match t.waits {
                         Waits::Wait => Waiting::Wait,
                         _ => Waiting::Try,
@@ -739,13 +741,14 @@ impl Snail {
     pub(super) fn key_shared(&mut self, ti: usize, rows: &[Row]) -> Result<()> {
         let table = self.catalog.tables[ti].clone();
         let key = key_columns(&table);
+        let locked = self.lock_key(ti);
         for r in rows {
             if self.row_locks.len() >= NAMED {
                 return Ok(());
             }
             let k: Vec<Datum> = key.iter().map(|&c| r[c].clone()).collect();
             self.take_bytes(
-                &Strength::KeyShare.bytes(lock::row_bytes(ti, &key_bytes(&k))),
+                &Strength::KeyShare.bytes(lock::row_bytes(locked, &key_bytes(&k))),
                 Waiting::Wait,
             )?;
         }
@@ -796,8 +799,9 @@ impl Snail {
         if rows.is_empty() {
             return Ok(());
         }
-        let lockers = lock::lockers_byte(ti);
-        let unnamed = lock::unnamed_byte(ti);
+        let locked = self.lock_key(ti);
+        let lockers = lock::lockers_byte(locked);
+        let unnamed = lock::unnamed_byte(locked);
         let fits = self.row_locks.len() + 2 * rows.len() <= NAMED;
         if !fits {
             // Marked first, so that a question that locks rows of the table from here on finds
@@ -819,7 +823,7 @@ impl Snail {
                 Strength::NoKeyUpdate
             };
             self.take_bytes(
-                &strength.bytes(lock::row_bytes(ti, &key_bytes(&k))),
+                &strength.bytes(lock::row_bytes(locked, &key_bytes(&k))),
                 Waiting::Wait,
             )?;
         }

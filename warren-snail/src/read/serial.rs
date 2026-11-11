@@ -42,7 +42,7 @@ pub(super) enum Mark {
 /// The marks a round takes on the block of byte `block`: one key of the table's unique order fixed
 /// whole, the gap and that key's row; any other read, the block.
 fn read_marks(
-    table: usize,
+    table: u64,
     order: usize,
     block: u64,
     point: Option<&[crate::places::KeyValue]>,
@@ -228,9 +228,10 @@ pub(super) struct Serial {
     /// Its place among the transaction's files; and the generation of this file its snapshot reads.
     place: usize,
     snapshot: u64,
-    /// What it marked, by table and order, each entry by its lock's byte; and the orders marked whole.
-    marks: BTreeMap<(usize, usize), BTreeSet<u64>>,
-    whole: BTreeSet<(usize, usize)>,
+    /// What it marked, by its table's lock key (`Snail::lock_key`) and order, each entry by its lock's
+    /// byte; and the orders marked whole.
+    marks: BTreeMap<(u64, usize), BTreeSet<u64>>,
+    whole: BTreeSet<(u64, usize)>,
     /// The blocks and orders it wrote, by their bytes.
     wrote: BTreeSet<u64>,
     /// Where it passed its commit's test, the generation of this file its commit makes.
@@ -624,8 +625,8 @@ impl Snail {
                     lock::mark_read(file, self.slot, b, false)?;
                 }
             }
-            for &(ti, oi) in &s.whole {
-                lock::mark_read(file, self.slot, lock::order_byte(ti, oi), false)?;
+            for &(key, oi) in &s.whole {
+                lock::mark_read(file, self.slot, lock::order_byte(key, oi), false)?;
             }
             for &b in &s.wrote {
                 lock::mark_wrote(file, self.slot, b, false)?;
@@ -973,12 +974,13 @@ impl Snail {
         if let Some(m) = &self.monitor {
             let t = &self.catalog.tables[table];
             let order = &t.orders[walk.order];
+            let key = self.lock_key(table);
             if !walk.empty && (walk.upper || walk.marks.is_empty()) {
                 m.read(&t.name, &order.name, None)?;
             }
             for first in &walk.marks {
                 let b = self.block_read_byte(table, walk.order, first);
-                for (byte, _) in read_marks(table, walk.order, b, walk.point(order)) {
+                for (byte, _) in read_marks(key, walk.order, b, walk.point(order)) {
                     m.read(&t.name, &order.name, Some(byte))?;
                 }
             }
@@ -1017,17 +1019,17 @@ impl Snail {
             }
             (txn.id, txn.read_only, txn.order)
         };
-        let key = (table, walk.order);
+        let key = (self.lock_key(table), walk.order);
         let point = walk.point(&self.catalog.tables[table].orders[walk.order]);
         let mut fresh: Vec<(u64, Mark)> = Vec::new();
-        let order_byte = lock::order_byte(table, walk.order);
+        let order_byte = lock::order_byte(key.0, walk.order);
         if !s.whole.contains(&key) {
             let mut whole = !walk.empty && (walk.upper || walk.marks.is_empty());
             if !whole {
                 let held = s.marks.entry(key).or_default();
                 for first in &walk.marks {
                     let b = self.block_read_byte(table, walk.order, first);
-                    for (byte, mark) in read_marks(table, walk.order, b, point) {
+                    for (byte, mark) in read_marks(key.0, walk.order, b, point) {
                         if held.insert(byte) {
                             lock::mark_read(file, self.slot, byte, true)?;
                             fresh.push((byte, mark));
@@ -1135,7 +1137,7 @@ impl Snail {
             txn.did_write = true;
             txn.id
         };
-        let order_byte = lock::order_byte(table, order);
+        let order_byte = lock::order_byte(self.lock_key(table), order);
         if s.wrote.insert(order_byte) {
             lock::mark_wrote(file, self.slot, order_byte, true)?;
         }
@@ -1406,15 +1408,16 @@ impl Snail {
         self.rebased
             .iter()
             .flat_map(|((ti, oi), blocks)| {
+                let key = self.lock_key(*ti);
                 blocks.iter().flat_map(move |b| {
-                    let from = lock::block_byte_of(*ti, *oi, b.first_key());
+                    let from = lock::block_byte_of(key, *oi, b.first_key());
                     let pairs: Vec<(u64, u64)> = match b.staged_entries().is_empty() {
                         // A block no longer named: what lands in its gap lands in any of its order.
-                        true => vec![(lock::order_byte(*ti, *oi), from)],
+                        true => vec![(lock::order_byte(key, *oi), from)],
                         false => b
                             .staged_entries()
                             .iter()
-                            .map(|e| lock::block_byte_of(*ti, *oi, &e.first))
+                            .map(|e| lock::block_byte_of(key, *oi, &e.first))
                             .filter(|to| *to != from)
                             .map(|to| (to, from))
                             .collect(),
@@ -1433,14 +1436,15 @@ impl Snail {
         for ((ti, oi), blocks) in &self.rebased {
             let t = &self.catalog.tables[*ti];
             let o = &t.orders[*oi];
+            let key = self.lock_key(*ti);
             for b in blocks {
-                let from = lock::block_byte_of(*ti, *oi, b.first_key());
+                let from = lock::block_byte_of(key, *oi, b.first_key());
                 if b.staged_entries().is_empty() {
                     m.let_go(&t.name, &o.name, from)?;
                     m.let_go(&t.name, &o.name, lock::gap_byte(from))?;
                 }
                 for e in b.staged_entries() {
-                    let to = lock::block_byte_of(*ti, *oi, &e.first);
+                    let to = lock::block_byte_of(key, *oi, &e.first);
                     if to != from {
                         m.cut(&t.name, &o.name, from, to)?;
                         m.cut(&t.name, &o.name, lock::gap_byte(from), lock::gap_byte(to))?;

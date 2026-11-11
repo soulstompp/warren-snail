@@ -175,12 +175,21 @@ pub fn block_byte(key: &impl std::hash::Hash) -> u64 {
     BLOCKS + BuildHasherDefault::<Fnv>::default().hash_one(key) % BLOCK_BYTES
 }
 
-/// The byte of a block's lock from its table's and order's places in the catalog and its first
-/// key's bytes, the same in every build of this version.
-pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::KeyValue]) -> u64 {
+/// The key a table a writer made, which no other writer names until it commits, is locked by in
+/// that writer's slot: by its name, past every key a table the file holds is locked by.
+pub(crate) fn made_table_key(slot: u64, name: &str) -> u64 {
     use std::hash::Hasher;
     let mut h = Fnv::default();
-    h.write(&(table as u64).to_le_bytes());
+    h.write(name.as_bytes());
+    (1 << 40) + (slot << 24) + (h.finish() & 0xff_ffff)
+}
+
+/// The byte of a block's lock from its table's key (`Snail::lock_key`), its order's place in the
+/// table and its first key's bytes, the same in every build of this version.
+pub(crate) fn block_byte_of(table: u64, order: usize, key: &[crate::places::KeyValue]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = Fnv::default();
+    h.write(&table.to_le_bytes());
     h.write(&(order as u64).to_le_bytes());
     for v in key {
         match v {
@@ -210,8 +219,8 @@ pub(crate) fn block_byte_of(table: usize, order: usize, key: &[crate::places::Ke
 
 /// The byte a transaction of one snapshot holds for a key of a unique order it writes or takes: it
 /// falls among the block bytes, apart from any block's.
-pub(crate) fn key_byte(table: usize, order: usize, key: &[crate::places::KeyValue]) -> u64 {
-    block_byte(&(table as u64, order as u64, "key", key))
+pub(crate) fn key_byte(table: u64, order: usize, key: &[crate::places::KeyValue]) -> u64 {
+    block_byte(&(table, order as u64, "key", key))
 }
 
 /// The byte a writer holds alone, to its transaction's end, for a key of one of the catalog's unique
@@ -229,17 +238,17 @@ pub(crate) fn gap_byte(block: u64) -> u64 {
 
 /// The byte a serializable round marks for one row, by its key on the table's order: apart from any
 /// block's and any gap's, and moved by no cut.
-pub(crate) fn row_byte(table: usize, order: usize, key: &[crate::places::KeyValue]) -> u64 {
-    block_byte(&(table as u64, order as u64, "row", key))
+pub(crate) fn row_byte(table: u64, order: usize, key: &[crate::places::KeyValue]) -> u64 {
+    block_byte(&(table, order as u64, "row", key))
 }
 
-/// The two bytes of a row's lock, its key's and the rest's, from its table's place in the catalog
+/// The two bytes of a row's lock, its key's and the rest's, from its table's key (`Snail::lock_key`)
 /// and its key's bytes, the same in every build of this version; they fall among the block bytes.
-pub(crate) fn row_bytes(table: usize, key: &[u8]) -> (u64, u64) {
+pub(crate) fn row_bytes(table: u64, key: &[u8]) -> (u64, u64) {
     use std::hash::Hasher;
     let mut h = Fnv::default();
     h.write(b"row");
-    h.write(&(table as u64).to_le_bytes());
+    h.write(&table.to_le_bytes());
     h.write(&(key.len() as u64).to_le_bytes());
     h.write(key);
     let k = BLOCKS + (h.finish() % (BLOCK_BYTES / 2)) * 2;
@@ -248,14 +257,14 @@ pub(crate) fn row_bytes(table: usize, key: &[u8]) -> (u64, u64) {
 
 /// The byte a table's lockers hold, shared: rows of it are locked by a question, so its writers
 /// name the rows they change.
-pub(crate) fn lockers_byte(table: usize) -> u64 {
-    block_byte(&(table as u64, "lockers"))
+pub(crate) fn lockers_byte(table: u64) -> u64 {
+    block_byte(&(table, "lockers"))
 }
 
 /// The byte a table's writers hold, shared, while rows they changed are not named by their own
 /// bytes.
-pub(crate) fn unnamed_byte(table: usize) -> u64 {
-    block_byte(&(table as u64, "unnamed"))
+pub(crate) fn unnamed_byte(table: u64) -> u64 {
+    block_byte(&(table, "unnamed"))
 }
 
 /// Takes a lock on one byte, shared or alone, waiting for it where `wait`. Returns false where it
@@ -557,8 +566,8 @@ const ORDER_LOW: u64 = 1 << 24;
 const SERIAL_NAMES: u64 = 1 << 40;
 
 /// The byte of an order's own mark, which a read holds for all of it and a writer of any of it.
-pub(crate) fn order_byte(table: usize, order: usize) -> u64 {
-    block_byte(&(table as u64, order as u64, "order"))
+pub(crate) fn order_byte(table: u64, order: usize) -> u64 {
+    block_byte(&(table, order as u64, "order"))
 }
 
 /// A serializable transaction's mark among those of every process now running: its process and its

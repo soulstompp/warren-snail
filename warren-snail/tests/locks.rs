@@ -550,3 +550,53 @@ fn repeatable_read_waits_for_a_writer_of_its_row_and_is_refused_once_that_writer
         "could not serialize access due to concurrent update"
     );
 }
+
+#[test]
+fn a_block_s_lock_is_its_table_s_wherever_each_writer_s_catalog_lays_it() {
+    let path = made("block-key");
+    let mut a = Snail::open_writing(&path).unwrap();
+    let mut c = Snail::open_writing(&path).unwrap();
+    // Another's DROP of a table laid before moves a table a transaction holds a block of: a writer
+    // of that block, reading the catalog as committed, waits for it, as 18.6's waits for its row,
+    // and both go on.
+    run(&mut a, "BEGIN");
+    run(&mut a, "UPDATE a.t SET g = g + 1 WHERE id = 1");
+    run(&mut c, "DROP TABLE a.inv");
+    let rx = later(&path, vec!["UPDATE a.t SET g = g + 10 WHERE id = 1".into()]);
+    assert!(waits(&rx), "a writer of a block another holds");
+    assert_eq!(run(&mut a, "UPDATE a.t SET g = g + 100 WHERE id = 2").rows, 1);
+    run(&mut a, "COMMIT");
+    assert_eq!(next(&rx).map(|d| d.rows), Ok(1));
+    assert_eq!(
+        rows(&mut a, "SELECT t.id, t.g FROM a.t t ORDER BY t.id"),
+        ["1,12", "2,102", "3,5"]
+    );
+    // A row's lock likewise: a question locking a row another holds waits for it.
+    run(&mut a, "BEGIN");
+    assert_eq!(rows(&mut a, "SELECT q.id FROM a.q q WHERE q.id = 2 FOR UPDATE"), ["2"]);
+    run(&mut c, "DROP TABLE a.u");
+    let rx = later(&path, vec!["SELECT q.id FROM a.q q WHERE q.id = 2 FOR UPDATE".into()]);
+    assert!(waits(&rx), "a lock of a row another holds");
+    run(&mut a, "COMMIT");
+    assert_eq!(next(&rx).map(|d| d.rows), Ok(1));
+    // Two transactions each writing a table it made, laid at one place in each one's catalog:
+    // neither waits for the other.
+    run(&mut a, "BEGIN");
+    run(&mut a, "CREATE TABLE a.m1 (id integer NOT NULL, PRIMARY KEY (id))");
+    run(&mut a, "INSERT INTO a.m1 VALUES (1)");
+    let theirs = [
+        "BEGIN",
+        "CREATE TABLE a.m2 (id integer NOT NULL, PRIMARY KEY (id))",
+        "INSERT INTO a.m2 VALUES (2)",
+        "COMMIT",
+    ];
+    let rx = later(&path, theirs.iter().map(|s| s.to_string()).collect());
+    for st in theirs {
+        assert!(next(&rx).is_ok(), "{st}");
+    }
+    run(&mut a, "COMMIT");
+    assert_eq!(
+        rows(&mut a, "SELECT (SELECT count(*) FROM a.m1) || ',' || (SELECT count(*) FROM a.m2)"),
+        ["1,1"]
+    );
+}

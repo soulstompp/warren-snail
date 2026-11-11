@@ -393,8 +393,8 @@ impl Snail {
             self.renew_in_transaction()?;
             if self.root.generation == generation {
                 return Err(Error::new(
-                    "a block a foreign key reads was written by another writer, and the \
-                     transaction, which declared, reads the file as it began",
+                    "a block a foreign key reads was written by another writer, and the newest \
+                     root does not hold it",
                 ));
             }
         }
@@ -1143,7 +1143,7 @@ impl Snail {
             if rows.is_empty() {
                 continue;
             }
-            let b = crate::lock::block_byte_of(ti, oi, &[]);
+            let b = crate::lock::block_byte_of(self.lock_key(ti), oi, &[]);
             if !self.locks.contains(&b) {
                 self.lock_byte(b, Waiting::Wait)?;
                 self.locks.insert(b);

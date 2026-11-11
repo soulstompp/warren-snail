@@ -410,6 +410,7 @@ impl Snail {
             return Ok(());
         }
         let newest = self.reader.peek_root()?;
+        let key = self.lock_key(ti);
         for (oi, order) in table.orders.iter().enumerate() {
             let effects = self.effects_on(table, order, changes)?;
             if effects.is_empty() {
@@ -421,7 +422,7 @@ impl Snail {
                     for e in &effects {
                         let mut path = Vec::new();
                         self.locate(&mut top, &head, &e.key, &mut path)?;
-                        let b = lock::block_byte_of(ti, oi, &entry_at(&top, &path).first);
+                        let b = lock::block_byte_of(key, oi, &entry_at(&top, &path).first);
                         w.blocks.push(b);
                         if e.lands {
                             w.landed.push(b);
@@ -429,7 +430,7 @@ impl Snail {
                     }
                 }
                 _ => {
-                    let b = lock::block_byte_of(ti, oi, &[]);
+                    let b = lock::block_byte_of(key, oi, &[]);
                     w.blocks.push(b);
                     w.landed.push(b);
                 }
@@ -437,7 +438,7 @@ impl Snail {
             if order.table_order {
                 w.rows = effects
                     .iter()
-                    .map(|e| lock::row_byte(ti, oi, &e.key))
+                    .map(|e| lock::row_byte(key, oi, &e.key))
                     .collect();
             }
             for v in [&mut w.blocks, &mut w.rows, &mut w.landed] {
@@ -479,7 +480,7 @@ impl Snail {
                     if self.row_locks.len() >= super::locking::NAMED {
                         return Ok(());
                     }
-                    let byte = lock::key_byte(ti, oi, &k);
+                    let byte = lock::key_byte(self.lock_key(ti), oi, &k);
                     self.take_bytes(&[(byte, false)], super::change::Waiting::Wait)?;
                 }
             }
@@ -675,7 +676,7 @@ impl Snail {
                 if let Some(n) = new.first().filter(|n| n.first != entry.first) {
                     let was = self.block_read_byte(ti, oi, &entry.first);
                     self.first_bytes
-                        .insert(lock::block_byte_of(ti, oi, &n.first), was);
+                        .insert(lock::block_byte_of(self.lock_key(ti), oi, &n.first), was);
                 }
                 replaced.insert(path, new);
             }
@@ -696,7 +697,7 @@ impl Snail {
     /// The lock byte a read of a block marks: the first key the transaction's snapshot gives it,
     /// where its rows lowered it.
     pub(super) fn block_read_byte(&self, ti: usize, oi: usize, first: &[KeyValue]) -> u64 {
-        let b = lock::block_byte_of(ti, oi, first);
+        let b = lock::block_byte_of(self.lock_key(ti), oi, first);
         self.first_bytes.get(&b).copied().unwrap_or(b)
     }
 

@@ -2356,6 +2356,80 @@ fn ddl_of_a_table_being_changed_waits_then_answers() {
 }
 
 #[test]
+fn a_schema_an_object_is_being_made_in_holds_off_its_drop() {
+    let (mut a, _b, path) = named("being-made-in");
+    // Each kind made in a schema holds off another's DROP SCHEMA of it, as 18.6's lock on the
+    // schema does; on its rollback the schema is dropped.
+    let kinds = [
+        "CREATE TABLE {s}.x (k integer NOT NULL, PRIMARY KEY (k))",
+        "CREATE VIEW {s}.v AS SELECT 1 AS one",
+        "CREATE SEQUENCE {s}.q",
+        "CREATE TYPE {s}.e AS ENUM ('a')",
+        "CREATE FUNCTION {s}.f() RETURNS integer LANGUAGE sql RETURN 1",
+        "CREATE DOMAIN {s}.d AS integer",
+    ];
+    for (i, made) in kinds.iter().enumerate() {
+        let (s, made) = (format!("sc{i}"), made.replace("{s}", &format!("sc{i}")));
+        a.execute(&format!("CREATE SCHEMA {s}")).unwrap();
+        a.execute("BEGIN").unwrap();
+        a.execute(&made).unwrap_or_else(|e| panic!("{made}: {e}"));
+        let rx = later(&path, &[&format!("DROP SCHEMA {s}")]);
+        assert!(waits(&rx), "{made}");
+        a.execute("ROLLBACK").unwrap();
+        assert_eq!(next(&rx), Ok(0), "{made}");
+    }
+    // On its commit the DROP is refused, or takes what it made with CASCADE.
+    a.execute("CREATE SCHEMA s9").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE s9.x (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    let rx = later(&path, &["DROP SCHEMA s9"]);
+    assert!(waits(&rx), "a DROP SCHEMA of a schema a table is made in");
+    assert_eq!(a.execute("INSERT INTO s9.x VALUES (1)").unwrap().rows, 1);
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        next(&rx),
+        Err(said(
+            "2BP01",
+            "cannot drop schema s9 because other objects depend on it: table s9.x depends on \
+             schema s9"
+        ))
+    );
+    drop(rx);
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE s9.y (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    let rx = later(&path, &["DROP SCHEMA s9 CASCADE"]);
+    assert!(waits(&rx), "a DROP SCHEMA CASCADE");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(next(&rx), Ok(0));
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname IN ('x', 'y')"),
+        ["0"]
+    );
+    // A schema another is dropping holds off what is made in it: refused once the DROP commits,
+    // made on its rollback. Two tables made in one schema never wait for each other.
+    for (end, ended) in [
+        ("COMMIT", Err(said("3F000", "schema \"s11\" does not exist"))),
+        ("ROLLBACK", Ok(0)),
+    ] {
+        a.execute("CREATE SCHEMA IF NOT EXISTS s11").unwrap();
+        a.execute("BEGIN").unwrap();
+        a.execute("DROP SCHEMA s11").unwrap();
+        let rx = later(&path, &["CREATE TABLE s11.a (k integer NOT NULL, PRIMARY KEY (k))"]);
+        assert!(waits(&rx), "a table made in a schema being dropped");
+        a.execute(end).unwrap();
+        assert_eq!(next(&rx), ended, "{end}");
+    }
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE s11.b (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    let rx = later(&path, &["CREATE TABLE s11.c (k integer NOT NULL, PRIMARY KEY (k))"]);
+    assert_eq!(next(&rx), Ok(0));
+    a.execute("COMMIT").unwrap();
+}
+
+#[test]
 fn ddl_reading_a_relation_another_is_changing_waits_then_answers() {
     let (mut a, _b, path) = named("being-read");
     let held_off = |a: &mut Snail, ours: &[&str], theirs: &str, end: &str| {
