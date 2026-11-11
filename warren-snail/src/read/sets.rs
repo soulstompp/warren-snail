@@ -33,13 +33,7 @@ pub(super) fn values(
         return Ok(rows);
     }
     if let Some(rows) = super::rest::rows(name, &resolved)? {
-        let ty = crate::composed::type_of(crate::composed::Composed::Record {
-            name: "record".into(),
-            fields: super::rest::KEYWORD_COLUMNS
-                .iter()
-                .map(|(n, t)| crate::composed::Field::new(n, *t))
-                .collect(),
-        });
+        let ty = super::rest::keyword_record();
         return rows
             .into_iter()
             .map(|r| {

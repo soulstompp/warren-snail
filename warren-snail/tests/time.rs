@@ -467,11 +467,33 @@ fn at_time_zone_reads_an_abbreviation_first_as_postgresql_does() {
         let (b, _) = snail.ask(&q, None).unwrap();
         assert_eq!(texts(&b, 1), some(&["2024-07-05 13:04:05+00"]), "{zone}");
     }
-    // Any other abbreviation is refused by name, never read as the zone file of its name.
-    for zone in ["EST", "cet"] {
+    // Every other abbreviation of PostgreSQL's set at its own offset, never read as the zone file
+    // of its name: EST five hours west, CET one east.
+    for (zone, local, instant) in [
+        ("EST", "2024-07-05 08:04:05", "2024-07-05 13:04:05+00"),
+        ("cet", "2024-07-05 14:04:05", "2024-07-05 13:04:05+00"),
+        ("PDT", "2024-07-05 06:04:05", "2024-07-05 13:04:05+00"),
+    ] {
         let q = format!("{step} SELECT id, v AT TIME ZONE '{zone}' AS x FROM t");
+        let (b, _) = snail.ask(&q, None).unwrap();
+        assert_eq!(texts(&b, 1), some(&[local]), "{zone}");
+        let q =
+            format!("{step} SELECT id, timezone('{zone}', v AT TIME ZONE '{zone}') AS x FROM t");
+        let (b, _) = snail.ask(&q, None).unwrap();
+        assert_eq!(texts(&b, 1), some(&[instant]), "{zone}");
+    }
+    // One naming a zone is read by that zone's rules, only under the feature zones: MSK, Moscow's,
+    // three hours east.
+    let q = format!("{step} SELECT id, v AT TIME ZONE 'MSK' AS x FROM t");
+    #[cfg(feature = "zones")]
+    {
+        let (b, _) = snail.ask(&q, None).unwrap();
+        assert_eq!(texts(&b, 1), some(&["2024-07-05 16:04:05"]));
+    }
+    #[cfg(not(feature = "zones"))]
+    {
         let e = snail.ask(&q, None).unwrap_err().to_string();
-        assert!(e.contains("abbreviation"), "{zone}: {e}");
+        assert!(e.contains("Europe/Moscow") && e.contains("zones"), "{e}");
     }
 }
 

@@ -511,28 +511,55 @@ const DELTATKTBL: &[(&str, i32, i32)] = &[
     ("yrs", UNITS, DTK_YEAR),
 ];
 
-/// The abbreviations PostgreSQL's `Default` set reads at UTC, which the snail reads.
-const UTC_ABBREVIATIONS: &[&str] = &["gmt", "uct", "ut", "utc", "z", "zulu"];
+/// What a zone abbreviation names: an offset east of UTC, in seconds, and whether it is daylight
+/// time; or a zone, whose rules give the offset it means at the time it is read at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Abbreviated {
+    Fixed(i32, bool),
+    Zone(String),
+}
 
-/// Every other abbreviation of PostgreSQL's `Default` set, which the snail refuses by name.
-const OTHER_ABBREVIATIONS: &[&str] = &[
-    "acdt", "acsst", "acst", "act", "acwst", "adt", "aedt", "aesst", "aest", "aft", "akdt", "akst",
-    "almst", "almt", "amst", "amt", "anast", "anat", "arst", "art", "ast", "awsst", "awst",
-    "azost", "azot", "azst", "azt", "bdst", "bdt", "bnt", "bort", "bot", "bra", "brst", "brt",
-    "bst", "btt", "cadt", "cast", "cct", "cdt", "cest", "cet", "cetdst", "chadt", "chast", "chut",
-    "ckt", "clst", "clt", "cot", "cst", "cxt", "davt", "ddut", "easst", "east", "eat", "edt",
-    "eest", "eet", "eetdst", "egst", "egt", "est", "fet", "fjst", "fjt", "fkst", "fkt", "fnst",
-    "fnt", "galt", "gamt", "gest", "get", "gft", "gilt", "gyt", "hkt", "hst", "ict", "idt", "iot",
-    "irkst", "irkt", "irt", "ist", "jayt", "jst", "kdt", "kgst", "kgt", "kost", "krast", "krat",
-    "kst", "lhdt", "lhst", "ligt", "lint", "lkt", "magst", "magt", "mart", "mawt", "mdt", "mest",
-    "mesz", "met", "metdst", "mez", "mht", "mmt", "mpt", "msd", "msk", "mst", "must", "mut", "mvt",
-    "myt", "nddt", "ndt", "nft", "novst", "novt", "npt", "nst", "nut", "nzdt", "nzst", "nzt",
-    "omsst", "omst", "pdt", "pet", "petst", "pett", "pgt", "pht", "pkst", "pkt", "pmdt", "pmst",
-    "pont", "pst", "pwt", "pyst", "pyt", "ret", "sadt", "sast", "sct", "sgt", "taht", "tft", "tjt",
-    "tkt", "tmt", "tot", "trut", "tvt", "ulast", "ulat", "uyst", "uyt", "uzst", "uzt", "vet",
-    "vlast", "vlat", "volt", "vut", "wadt", "wakt", "wast", "wat", "wdt", "wet", "wetdst", "wft",
-    "wgst", "wgt", "xjt", "yakst", "yakt", "yapt", "yekst", "yekt",
-];
+/// PostgreSQL's `Default` set of zone abbreviations (`src/timezone/tznames/Default`, 18.6's and
+/// 19's alike), in its table's order, by each one's lowered name: each lowered, as written, and
+/// what it names.
+fn abbreviation_table() -> &'static [(String, &'static str, Abbreviated)] {
+    static ALL: std::sync::OnceLock<Vec<(String, &'static str, Abbreviated)>> =
+        std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        include_str!("abbrevs.txt")
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                let (name, value, kind) = (f.next()?, f.next()?, f.next().unwrap_or(""));
+                Some((
+                    name.to_ascii_lowercase(),
+                    name,
+                    match value.parse::<i32>() {
+                        Ok(east) => Abbreviated::Fixed(east, kind == "D"),
+                        Err(_) => Abbreviated::Zone(value.to_string()),
+                    },
+                ))
+            })
+            .collect()
+    })
+}
+
+/// The abbreviations of PostgreSQL's `Default` set in its table's order: each as written, and what
+/// it names.
+pub fn abbreviations() -> impl Iterator<Item = (&'static str, &'static Abbreviated)> {
+    abbreviation_table().iter().map(|(_, w, a)| (*w, a))
+}
+
+/// A dynamic abbreviation's kind of field, beside TZ and DTZ.
+const DYNTZ: i32 = 7;
+
+/// The abbreviation a lowered word names in the set, compared on the first `TOKMAXLEN` bytes.
+fn abbreviation(key: &[u8]) -> Option<&'static Abbreviated> {
+    abbreviation_table()
+        .iter()
+        .find(|(t, _, _)| token_eq(key, t))
+        .map(|(_, _, a)| a)
+}
 
 /// Whether a field names a token, compared as PostgreSQL compares them: on their first
 /// `TOKMAXLEN` bytes.
@@ -560,30 +587,141 @@ fn decode_units(key: &[u8]) -> (i32, i32) {
     lookup(key, DELTATKTBL).unwrap_or((UNKNOWN_FIELD, 0))
 }
 
-/// A zone abbreviation: UTC's read at offset 0, any other of PostgreSQL's refused by name, and
-/// none for a word that is no abbreviation.
-fn decode_timezone_abbrev(key: &[u8]) -> D<Option<(i32, i32)>> {
-    if UTC_ABBREVIATIONS.iter().any(|t| token_eq(key, t)) {
-        return Ok(Some((TZ, 0)));
+/// A zone abbreviation, as PostgreSQL's DecodeTimezoneAbbrev reads a lowered word: from 18 on the
+/// statement zone's own first, then the set's. Its kind (TZ, DTZ or DYNTZ), its offset east of UTC
+/// where it has one, and the zone a dynamic one names, read where it is met; none for a word that is
+/// no abbreviation.
+fn decode_timezone_abbrev(key: &[u8]) -> D<Option<(i32, i32, Option<String>)>> {
+    let kind = |dst: bool| if dst { DTZ } else { TZ };
+    if crate::zones::zone_abbreviations_first() {
+        let upper = String::from_utf8_lossy(key).to_ascii_uppercase();
+        match crate::zones::session_abbrev_known(&upper).map_err(Dterr::Refused)? {
+            Some(Some((east, dst))) => return Ok(Some((kind(dst), east, None))),
+            Some(None) => return Ok(Some((DYNTZ, 0, crate::zones::session_named()))),
+            None => {}
+        }
     }
-    if OTHER_ABBREVIATIONS.iter().any(|t| token_eq(key, t)) {
-        return Err(Dterr::Refused(Error::new(format!(
-            "time zone abbreviation \"{}\" is not read: the snail reads only the abbreviations of UTC",
-            String::from_utf8_lossy(key)
-        ))));
+    Ok(match abbreviation(key) {
+        Some(Abbreviated::Fixed(east, dst)) => Some((kind(*dst), *east, None)),
+        Some(Abbreviated::Zone(zone)) => {
+            if let Err(e) = crate::zones::utc_offset(zone, 0) {
+                #[cfg(feature = "zones")]
+                let e = {
+                    let _ = e;
+                    Error::coded(
+                        "22023",
+                        format!(
+                            "time zone \"{zone}\" not recognized\nDETAIL:  This time zone name \
+                             appears in the configuration file for time zone abbreviation \"{}\".",
+                            String::from_utf8_lossy(key)
+                        ),
+                    )
+                };
+                return Err(Dterr::Refused(e));
+            }
+            Some((DYNTZ, 0, Some(zone.clone())))
+        }
+        None => None,
+    })
+}
+
+/// PostgreSQL's DetermineTimeZoneAbbrevOffset: the offset west of UTC that `abbrev`, an
+/// abbreviation of zone `zone`, means at the date and time `tm` on that zone's clock; the zone's
+/// own offset there where the zone gives it no meaning, and UTC's outside the Julian days.
+fn abbrev_offset(zone: &str, abbrev: &str, tm: &Tm) -> D<i32> {
+    let local = match valid_julian(tm.year, tm.mon) {
+        true => {
+            let day = i64::from(date2j_c(tm.year, tm.mon, tm.mday)) - UNIX_EPOCH_JDATE;
+            Some(day * SECS_PER_DAY + i64::from(tm.sec + (tm.min + tm.hour * 60) * 60))
+        }
+        false => None,
+    };
+    let east = match local {
+        Some(l) => crate::zones::local_offset(zone, l).map_err(Dterr::Refused)?,
+        None => 0,
+    };
+    let probe = local.map_or(0, |l| l - i64::from(east));
+    let meant = crate::zones::abbrev_meaning(zone, &abbrev.to_ascii_uppercase(), probe)
+        .map_err(Dterr::Refused)?;
+    Ok(-meant.map_or(east, |(e, _)| e))
+}
+
+/// The offset east of UTC that an abbreviation of zone `zone` means at a time `local` seconds after
+/// 1970-01-01 00:00 on that zone's clock, as AT TIME ZONE reads a timestamp by it.
+pub fn abbrev_local_offset(zone: &str, abbrev: &str, local: i64) -> Result<i32> {
+    let east = crate::zones::local_offset(zone, local)?;
+    let meant =
+        crate::zones::abbrev_meaning(zone, &abbrev.to_ascii_uppercase(), local - i64::from(east))?;
+    Ok(meant.map_or(east, |(e, _)| e))
+}
+
+/// The offset east of UTC, and whether it is daylight time, that an abbreviation of zone `zone`
+/// means at the instant `utc` seconds after 1970-01-01 00:00 UTC (PostgreSQL's
+/// DetermineTimeZoneAbbrevOffsetTS): the zone's own at that instant where it gives the abbreviation
+/// no meaning.
+pub fn abbrev_utc_offset(zone: &str, abbrev: &str, utc: i64) -> Result<(i32, bool)> {
+    match crate::zones::abbrev_meaning(zone, &abbrev.to_ascii_uppercase(), utc)? {
+        Some(m) => Ok(m),
+        None => {
+            let local = utc + i64::from(crate::zones::utc_offset(zone, utc)?);
+            let east = crate::zones::local_offset(zone, local)?;
+            Ok((east, crate::zones::dst_at(zone, local - i64::from(east))?))
+        }
     }
-    Ok(None)
+}
+
+/// What a lowered word names as an abbreviation where to_timestamp's TZ reads one, as PostgreSQL's
+/// DecodeTimezoneAbbrevPrefix tries each length: from 18 on the statement zone's own first, then
+/// the set's, a dynamic one whose zone cannot be read none.
+pub fn abbreviation_prefix(key: &[u8]) -> Result<Option<Abbreviated>> {
+    if crate::zones::zone_abbreviations_first() {
+        let upper = String::from_utf8_lossy(key).to_ascii_uppercase();
+        match crate::zones::session_abbrev_known(&upper)? {
+            Some(Some((east, dst))) => return Ok(Some(Abbreviated::Fixed(east, dst))),
+            Some(None) => return Ok(crate::zones::session_named().map(Abbreviated::Zone)),
+            None => {}
+        }
+    }
+    Ok(match abbreviation(key) {
+        Some(Abbreviated::Zone(zone)) => match crate::zones::utc_offset(zone, 0) {
+            Ok(_) => Some(Abbreviated::Zone(zone.clone())),
+            // A zone the directory lacks is passed over; one a build cannot read refused by name.
+            Err(e) if cfg!(not(feature = "zones")) => return Err(e),
+            Err(_) => None,
+        },
+        other => other.cloned(),
+    })
+}
+
+/// The offset west of UTC that `abbrev`, an abbreviation of zone `zone`, means at a date and a time
+/// of day on that zone's clock, as to_timestamp reads it.
+pub fn abbrev_west(
+    zone: &str,
+    abbrev: &str,
+    (year, mon, mday): (i32, i32, i32),
+    (hour, min, sec): (i32, i32, i32),
+) -> Result<i32> {
+    let tm = Tm {
+        year,
+        mon,
+        mday,
+        hour,
+        min,
+        sec,
+        ..Tm::default()
+    };
+    abbrev_offset(zone, abbrev, &tm).map_err(|e| parse_error(e, abbrev, "timestamp"))
 }
 
 /// A zone named in AT TIME ZONE or timezone() as an abbreviation, as PostgreSQL's
-/// DecodeTimezoneName reads it first, its name lowered and cut to 63 bytes: UTC's at offset 0, any
-/// other of PostgreSQL's refused by name; none for a name that is no abbreviation, which is then a
-/// zone's.
-pub fn zone_abbreviation(name: &str) -> Result<Option<i32>> {
+/// DecodeTimezoneName reads it first, its name lowered and cut to 63 bytes: what it names; none for
+/// a name that is no abbreviation, which is then a zone's.
+pub fn zone_abbreviation(name: &str) -> Result<Option<Abbreviated>> {
     let mut key: Vec<u8> = name.bytes().map(|b| b.to_ascii_lowercase()).collect();
     key.truncate(63);
     match decode_timezone_abbrev(&key) {
-        Ok(Some((_, offset))) => Ok(Some(offset)),
+        Ok(Some((DYNTZ, _, Some(zone)))) => Ok(Some(Abbreviated::Zone(zone))),
+        Ok(Some((kind, east, _))) => Ok(Some(Abbreviated::Fixed(east, kind == DTZ))),
         Ok(None) => Ok(None),
         Err(Dterr::Refused(e)) => Err(e),
         Err(_) => Ok(None),
@@ -1386,6 +1524,7 @@ fn decode_date_time(fields: &[Field], now: i64) -> D<Decoded> {
     let mut is2digits = false;
     let mut bc = false;
     let mut named: Option<String> = None;
+    let mut dynamic: Option<(String, String)> = None;
     let mut dtype = DTK_DATE;
     let mut tm = Tm::default();
     let mut fsec = 0;
@@ -1525,8 +1664,12 @@ fn decode_date_time(fields: &[Field], now: i64) -> D<Decoded> {
                 }
             }
             DTK_STRING | DTK_SPECIAL => {
+                let mut zone_of = None;
                 let (ty, val) = match decode_timezone_abbrev(&field)? {
-                    Some(found) => found,
+                    Some((ty, val, zone)) => {
+                        zone_of = zone;
+                        (ty, val)
+                    }
                     None => decode_special(&field),
                 };
                 if ty == IGNORE_DTF {
@@ -1594,6 +1737,11 @@ fn decode_date_time(fields: &[Field], now: i64) -> D<Decoded> {
                     TZ => {
                         tz = -val;
                     }
+                    // A dynamic abbreviation's offset waits for the date it is read at.
+                    DYNTZ => {
+                        tmask |= m(TZ);
+                        dynamic = zone_of.map(|z| (z, String::from_utf8_lossy(&field).into_owned()));
+                    }
                     AMPM => mer = val,
                     ADBC => bc = val == BC,
                     DOW => {}
@@ -1651,6 +1799,12 @@ fn decode_date_time(fields: &[Field], now: i64) -> D<Decoded> {
             }
             tz = zone_offset(name, &tm)?;
         }
+        if let Some((zone, abbrev)) = &dynamic {
+            if fmask & m(DTZMOD) != 0 {
+                return Err(Dterr::BadFormat);
+            }
+            tz = abbrev_offset(zone, abbrev, &tm)?;
+        }
         if fmask & m(TZ) == 0 {
             if fmask & m(DTZMOD) != 0 {
                 return Err(Dterr::BadFormat);
@@ -1681,6 +1835,7 @@ fn decode_time_only(fields: &mut [Field], now: i64) -> D<Decoded> {
     let mut bc = false;
     let mut mer = HR24;
     let mut named: Option<String> = None;
+    let mut dynamic: Option<(String, String)> = None;
     let dtype = DTK_TIME;
     let mut tm = Tm::default();
     let mut fsec = 0;
@@ -1818,8 +1973,12 @@ fn decode_time_only(fields: &mut [Field], now: i64) -> D<Decoded> {
                 }
             }
             DTK_STRING | DTK_SPECIAL => {
+                let mut zone_of = None;
                 let (ty, val) = match decode_timezone_abbrev(&field)? {
-                    Some(found) => found,
+                    Some((ty, val, zone)) => {
+                        zone_of = zone;
+                        (ty, val)
+                    }
                     None => decode_special(&field),
                 };
                 if ty == IGNORE_DTF {
@@ -1853,6 +2012,12 @@ fn decode_time_only(fields: &mut [Field], now: i64) -> D<Decoded> {
                     }
                     TZ => {
                         tz = -val;
+                        fields[i].ftype = DTK_TZ;
+                    }
+                    // A dynamic abbreviation's offset waits for the date it is read at.
+                    DYNTZ => {
+                        tmask |= m(TZ);
+                        dynamic = zone_of.map(|z| (z, String::from_utf8_lossy(&field).into_owned()));
                         fields[i].ftype = DTK_TZ;
                     }
                     AMPM => mer = val,
@@ -1906,6 +2071,21 @@ fn decode_time_only(fields: &mut [Field], now: i64) -> D<Decoded> {
             return Err(Dterr::BadFormat);
         }
         tz = zone_offset(name, &tm)?;
+    }
+    // A dynamic abbreviation read at the date given, else at the statement's.
+    if let Some((zone, abbrev)) = &dynamic {
+        if fmask & m(DTZMOD) != 0 {
+            return Err(Dterr::BadFormat);
+        }
+        let mut at = match fmask & DATE_M {
+            0 => now_local(now)?.0,
+            d if d != DATE_M => return Err(Dterr::BadFormat),
+            _ => tm,
+        };
+        at.hour = tm.hour;
+        at.min = tm.min;
+        at.sec = tm.sec;
+        tz = abbrev_offset(zone, abbrev, &at)?;
     }
     if fmask & m(TZ) == 0 {
         if fmask & m(DTZMOD) != 0 {
@@ -4162,7 +4342,16 @@ mod tests {
             tstz("294277-01-01 00:00:00+00"),
             "ERROR: timestamp out of range: \"294277-01-01 00:00:00+00\""
         );
-        assert!(tstz("2024-03-05 13:04 EST").contains("abbreviation \"est\" is not read"));
+        // Every abbreviation of PostgreSQL's set: a fixed one at its offset, a daylight one too, and
+        // one of a zone by its rules, which only the feature zones reads.
+        assert_eq!(tstz("2024-03-05 13:04 EST"), "2024-03-05 18:04:00+00");
+        assert_eq!(tstz("2024-07-05 13:04 PDT"), "2024-07-05 20:04:00+00");
+        assert_eq!(tstz("2024-07-05 13:04:05 MET DST"), "2024-07-05 11:04:05+00");
+        let msk = tstz("2010-07-05 13:04 MSK");
+        #[cfg(not(feature = "zones"))]
+        assert!(msk.contains("Europe/Moscow") && msk.contains("zones"), "{msk}");
+        #[cfg(feature = "zones")]
+        assert_eq!(msk, "2010-07-05 10:04:00+00");
         let named = tstz("2024-03-05 13:04 America/New_York");
         #[cfg(not(feature = "zones"))]
         assert!(named.contains("zones"), "{named}");

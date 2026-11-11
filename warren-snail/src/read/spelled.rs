@@ -43,18 +43,28 @@ pub(crate) fn spelled(sql: &str) -> Result<Cow<'_, str>> {
 /// call's last argument.
 pub(crate) const SAMPLED: char = '\u{2}';
 
+/// What marks ROWS FROM's call (`ROWS_FROM`), and an alias that names nothing, standing where a
+/// function in FROM takes a column definition list with no alias before it (`AS (…)`).
+pub(crate) const ROWS_MARK: char = '\u{6}';
+
+/// The name ROWS FROM (…) is called by: its functions are its arguments, a function's column
+/// definition list named arguments after it, each a column's name and a NULL of its type.
+pub(crate) const ROWS_FROM: &str = "\u{6}rows";
+
 /// The statement as PostgreSQL's scanner and grammar read its words, where sqlparser's tokenizer
 /// reads them otherwise, under `release`: a number in its bases and with its underscores from 16
 /// on, a name written against it refused as trailing junk from 15 on; strings a newline apart as one
 /// string; `x ISNULL` and `x NOTNULL`; `interval(p) '…'`'s precision; a TABLESAMPLE clause carried
-/// in a call's name (`SAMPLED`), with a seed drawn for the statement where it names none; and what
-/// sqlparser takes and PostgreSQL's grammar does not, refused.
+/// in a call's name (`SAMPLED`), with a seed drawn for the statement where it names none; ROWS FROM
+/// (…) as a call (`ROWS_FROM`), and the alias a function's column definition list stands behind
+/// where none is written; and what sqlparser takes and PostgreSQL's grammar does not, refused.
 pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
     scanned_seeding(sql, release, true)
 }
 
 /// A DDL's text as `scanned` reads a statement's, a TABLESAMPLE that names no seed left to draw one
-/// each time a statement reads it: a view's.
+/// each time a statement reads it: a view's. ROWS FROM and a column definition list with no alias
+/// are left as written, so that statements split from a text read again as PostgreSQL's.
 pub(crate) fn scanned_unseeded(sql: &str, release: u8) -> Result<Cow<'_, str>> {
     scanned_seeding(sql, release, false)
 }
@@ -432,9 +442,14 @@ fn finish(sql: &str, mut out: String, copied: usize) -> Cow<'_, str> {
 /// where sqlparser's tokenizer refuses it, which its parser says.
 fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
     let lower = sql.to_ascii_lowercase();
-    if !["isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>"]
-        .iter()
-        .any(|w| lower.contains(w))
+    // `AS (`, whatever stands between the two.
+    let as_paren = lower.match_indices("as").any(|(at, _)| {
+        lower[at + 2..].trim_start().starts_with('(')
+    });
+    if !as_paren
+        && !["isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>", "rows"]
+            .iter()
+            .any(|w| lower.contains(w))
     {
         return Ok(None);
     }
@@ -483,8 +498,84 @@ fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
     let mut swaps: Vec<(usize, usize, String)> = Vec::new();
     let mut brackets = 0i32;
     let mut array_closes: Vec<i32> = Vec::new();
+    // Whether each depth of parentheses stands in a FROM list, as the clauses met at it say; the
+    // places of the parentheses open, and of the last one closed and where it opened.
+    let mut in_from: Vec<bool> = vec![false];
+    let mut opens: Vec<usize> = Vec::new();
+    let mut last_closed: Option<(usize, usize)> = None;
     for i in 0..solid.len() {
         let prev_as = i > 0 && (word(i - 1).as_deref() == Some("AS") || solid[i - 1].0 == Token::Period);
+        match &solid[i].0 {
+            Token::LParen => {
+                in_from.push(false);
+                opens.push(i);
+            }
+            Token::RParen => {
+                if in_from.len() > 1 {
+                    in_from.pop();
+                }
+                if let Some(o) = opens.pop() {
+                    last_closed = Some((i, o));
+                }
+            }
+            _ => {}
+        }
+        let from_here = *in_from.last().unwrap_or(&false);
+        match word(i).as_deref() {
+            Some("FROM") if !prev_as && !matches!(word(i.wrapping_sub(1)).as_deref(), Some("ROWS" | "DISTINCT")) => {
+                if let Some(f) = in_from.last_mut() {
+                    *f = true;
+                }
+            }
+            Some(
+                "SELECT" | "WHERE" | "GROUP" | "HAVING" | "WINDOW" | "ORDER" | "LIMIT" | "OFFSET"
+                | "FETCH" | "UNION" | "INTERSECT" | "EXCEPT" | "RETURNING" | "VALUES" | "SET",
+            ) if !prev_as => {
+                if let Some(f) = in_from.last_mut() {
+                    *f = false;
+                }
+            }
+            // ROWS FROM, where a FROM item stands.
+            Some("ROWS")
+                if seeded
+                    && word(i + 1).as_deref() == Some("FROM")
+                    && matches!(solid.get(i + 2).map(|t| &t.0), Some(Token::LParen))
+                    && i > 0
+                    && (matches!(word(i - 1).as_deref(), Some("FROM" | "JOIN" | "LATERAL"))
+                        || (solid[i - 1].0 == Token::Comma && from_here)
+                        || (solid[i - 1].0 == Token::LParen
+                            && in_from.len() > 1
+                            && in_from[in_from.len() - 2])) =>
+            {
+                swaps.extend(rows_from(sql, &solid, i, &word, &near, &closed)?);
+            }
+            // A function's column definition list with no alias before it.
+            Some("AS")
+                if seeded
+                    && from_here
+                    && matches!(solid.get(i + 1).map(|t| &t.0), Some(Token::LParen))
+                    && last_closed.is_some_and(|(c, o)| {
+                        let after_call = c + 1 == i
+                            || (c + 3 == i
+                                && word(c + 1).as_deref() == Some("WITH")
+                                && word(c + 2).as_deref() == Some("ORDINALITY"));
+                        let called = o > 0
+                            && match &solid[o - 1].0 {
+                                Token::Word(w) if w.quote_style.is_some() => true,
+                                Token::Word(w) => {
+                                    !matches!(keyword(&w.value), Some(('R', _)))
+                                        || (w.value.eq_ignore_ascii_case("from")
+                                            && word(o.wrapping_sub(2)).as_deref() == Some("ROWS"))
+                                }
+                                _ => false,
+                            };
+                        after_call && called
+                    }) =>
+            {
+                swaps.push((solid[i].1, solid[i].2, format!("AS \"{ROWS_MARK}\"")));
+            }
+            _ => {}
+        }
         match &solid[i].0 {
             // Touching an operator's characters before it, it ends a longer operator, the parser's.
             Token::DoubleEq
@@ -705,6 +796,109 @@ fn sampled_clause(
         end,
         format!("TABLESAMPLE \"{name}\"({args}{seed})"),
     ))
+}
+
+/// ROWS FROM (…) at `i` as a call of `ROWS_FROM`, its functions its arguments, each function's
+/// column definition list the named arguments after it: `ROWS FROM (f(a) AS (x t), g(b))` as
+/// `"\u{6}rows"(f(a) , "x" => CAST(NULL AS t), g(b))`. Each swap made, the functions' own text left
+/// to the rest; refused as PostgreSQL's grammar refuses a list it does not read.
+fn rows_from(
+    sql: &str,
+    solid: &[&(Token, usize, usize)],
+    i: usize,
+    word: &dyn Fn(usize) -> Option<String>,
+    near: &dyn Fn(usize) -> Error,
+    closed: &dyn Fn(usize, Token, Token) -> Option<usize>,
+) -> Result<Vec<(usize, usize, String)>> {
+    let open = i + 2;
+    let Some(after) = closed(open, Token::LParen, Token::RParen) else {
+        return Err(near(solid.len()));
+    };
+    if after == open + 2 {
+        return Err(near(open + 1));
+    }
+    // The places of a list's items between `from` and `to`, split at its commas.
+    let items = |from: usize, to: usize| {
+        let mut out = Vec::new();
+        let (mut depth, mut start) = (0i32, from);
+        for k in from..to {
+            match solid[k].0 {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                Token::Comma if depth == 0 => {
+                    out.push((start, k));
+                    start = k + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push((start, to));
+        out
+    };
+    let mut swaps = vec![(solid[i].1, solid[open].2, format!("\"{ROWS_FROM}\"("))];
+    for (a, b) in items(open + 1, after - 1) {
+        if a == b {
+            return Err(near(a));
+        }
+        if !matches!(solid[a].0, Token::Word(_)) {
+            return Err(near(a));
+        }
+        let mut depth = 0i32;
+        let mut listed = None;
+        for k in a..b {
+            match solid[k].0 {
+                Token::LParen | Token::LBracket => depth += 1,
+                Token::RParen | Token::RBracket => depth -= 1,
+                _ if depth == 0 && k > a && word(k).as_deref() == Some("AS") => {
+                    listed = Some(k);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(k) = listed else {
+            continue;
+        };
+        if k + 1 >= b || solid[k + 1].0 != Token::LParen {
+            return Err(near(k + 1));
+        }
+        let Some(end) = closed(k + 1, Token::LParen, Token::RParen) else {
+            return Err(near(solid.len()));
+        };
+        if end != b {
+            return Err(near(end));
+        }
+        if end == k + 3 {
+            return Err(near(k + 2));
+        }
+        let mut named = Vec::new();
+        for (ea, eb) in items(k + 2, end - 1) {
+            let name = match &solid[ea].0 {
+                Token::Word(w) if w.quote_style.is_some() => w.value.clone(),
+                Token::Word(w) => w.value.to_lowercase(),
+                _ => return Err(near(ea)),
+            };
+            if eb <= ea + 1 {
+                return Err(near(eb));
+            }
+            let collate = (ea + 1..eb).find(|&c| word(c).as_deref() == Some("COLLATE"));
+            let typed_to = collate.unwrap_or(eb);
+            if typed_to == ea + 1 {
+                return Err(near(typed_to));
+            }
+            let ty = &sql[solid[ea + 1].1..solid[typed_to - 1].2];
+            let collation = match collate {
+                Some(c) => format!(" {}", &sql[solid[c].1..solid[eb - 1].2]),
+                None => String::new(),
+            };
+            named.push(format!(
+                ", \"{}\" => CAST(NULL AS {ty}){collation}",
+                name.replace('"', "\"\"")
+            ));
+        }
+        swaps.push((solid[k].1, solid[end - 1].2, named.concat()));
+    }
+    Ok(swaps)
 }
 
 /// What stands on the right of `@@@`, which sqlparser reads as `@@` and a prefix `@`.

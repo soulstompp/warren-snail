@@ -84,28 +84,6 @@ const DAY_TAB: [[i32; 12]; 2] = [
     [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
 ];
 
-/// The zone abbreviations of UTC, read at offset 0, and every other of PostgreSQL's `Default`
-/// set, which the snail refuses by name.
-const UTC_ABBREVIATIONS: &[&str] = &["gmt", "uct", "ut", "utc", "z", "zulu"];
-const OTHER_ABBREVIATIONS: &[&str] = &[
-    "acdt", "acsst", "acst", "act", "acwst", "adt", "aedt", "aesst", "aest", "aft", "akdt", "akst",
-    "almst", "almt", "amst", "amt", "anast", "anat", "arst", "art", "ast", "awsst", "awst",
-    "azost", "azot", "azst", "azt", "bdst", "bdt", "bnt", "bort", "bot", "bra", "brst", "brt",
-    "bst", "btt", "cadt", "cast", "cct", "cdt", "cest", "cet", "cetdst", "chadt", "chast", "chut",
-    "ckt", "clst", "clt", "cot", "cst", "cxt", "davt", "ddut", "easst", "east", "eat", "edt",
-    "eest", "eet", "eetdst", "egst", "egt", "est", "fet", "fjst", "fjt", "fkst", "fkt", "fnst",
-    "fnt", "galt", "gamt", "gest", "get", "gft", "gilt", "gyt", "hkt", "hst", "ict", "idt", "iot",
-    "irkst", "irkt", "irt", "ist", "jayt", "jst", "kdt", "kgst", "kgt", "kost", "krast", "krat",
-    "kst", "lhdt", "lhst", "ligt", "lint", "lkt", "magst", "magt", "mart", "mawt", "mdt", "mest",
-    "mesz", "met", "metdst", "mez", "mht", "mmt", "mpt", "msd", "msk", "mst", "must", "mut", "mvt",
-    "myt", "nddt", "ndt", "nft", "novst", "novt", "npt", "nst", "nut", "nzdt", "nzst", "nzt",
-    "omsst", "omst", "pdt", "pet", "petst", "pett", "pgt", "pht", "pkst", "pkt", "pmdt", "pmst",
-    "pont", "pst", "pwt", "pyst", "pyt", "ret", "sadt", "sast", "sct", "sgt", "taht", "tft", "tjt",
-    "tkt", "tmt", "tot", "trut", "tvt", "ulast", "ulat", "uyst", "uyt", "uzst", "uzt", "vet",
-    "vlast", "vlat", "volt", "vut", "wadt", "wakt", "wast", "wat", "wdt", "wet", "wetdst", "wft",
-    "wgst", "wgt", "xjt", "yakst", "yakt", "yapt", "yekst", "yekt",
-];
-
 fn err(msg: impl Into<String>) -> Error {
     Error::new(msg.into())
 }
@@ -1412,6 +1390,8 @@ struct TmFromChar {
     ff: i32,
     has_tz: bool,
     gmtoffset: i32,
+    /// A dynamic abbreviation's zone and the abbreviation as written, resolved at the date read.
+    abbrev_zone: Option<(String, String)>,
 }
 
 fn set_mode(tmfc: &mut TmFromChar, mode: Mode) -> Result<()> {
@@ -1684,9 +1664,10 @@ fn adjust_partial_year_to_2020(year: i32) -> i32 {
     }
 }
 
-/// DecodeTimezoneAbbrevPrefix under TimeZone UTC: the longest abbreviation the text begins with,
-/// UTC's read at offset 0, any other of PostgreSQL's refused by name; its length, 0 for none.
-fn timezone_abbrev_prefix(s: &[u8]) -> Result<usize> {
+/// DecodeTimezoneAbbrevPrefix: the longest abbreviation the text begins with, its length and what
+/// it names; 0 for none. Of each length, from 18 on the statement zone's own first, then
+/// PostgreSQL's set, a dynamic one whose zone cannot be read passed over.
+fn timezone_abbrev_prefix(s: &[u8]) -> Result<(usize, Option<crate::times::Abbreviated>)> {
     let low: Vec<u8> = s
         .iter()
         .take(TOKMAXLEN)
@@ -1694,19 +1675,11 @@ fn timezone_abbrev_prefix(s: &[u8]) -> Result<usize> {
         .map(|b| b.to_ascii_lowercase())
         .collect();
     for len in (1..=low.len()).rev() {
-        let key = &low[..len];
-        if UTC_ABBREVIATIONS.iter().any(|t| t.as_bytes() == key) {
-            return Ok(len);
-        }
-        if OTHER_ABBREVIATIONS.iter().any(|t| t.as_bytes() == key) {
-            return Err(err(format!(
-                "time zone abbreviation \"{}\" is not read: the snail reads only the \
-                 abbreviations of UTC",
-                text(key)
-            )));
+        if let Some(names) = crate::times::abbreviation_prefix(&low[..len])? {
+            return Ok((len, Some(names)));
         }
     }
-    Ok(0)
+    Ok((0, None))
 }
 
 /// sscanf's `%d,%03d%n`: the two numbers and the characters taken, where both are read.
@@ -1892,10 +1865,19 @@ fn dch_from_char(nodes: &[Node], s: &[u8], std: bool) -> Result<TmFromChar> {
             K::tz | K::TZ | K::OF => {
                 let mut as_of = k.id == K::OF;
                 if !as_of {
-                    let len = timezone_abbrev_prefix(cstr(s, pos))?;
+                    let (len, names) = timezone_abbrev_prefix(cstr(s, pos))?;
                     if len > 0 {
                         out.has_tz = true;
-                        out.gmtoffset = 0;
+                        match names {
+                            Some(crate::times::Abbreviated::Fixed(east, _)) => {
+                                out.gmtoffset = east;
+                                out.abbrev_zone = None;
+                            }
+                            Some(crate::times::Abbreviated::Zone(zone)) => {
+                                out.abbrev_zone = Some((zone, text(&cstr(s, pos)[..len])));
+                            }
+                            None => {}
+                        }
                         out.tzsign = 0;
                         pos += len;
                     } else if at(s, pos).is_ascii_alphabetic() {
@@ -2332,7 +2314,10 @@ fn do_to_timestamp(input: &str, fmt: &str, std: bool) -> Result<(PgTm, i32, Opti
         let off = (tmfc.tzh * 60 + tmfc.tzm) * 60;
         zone = Some(if tmfc.tzsign > 0 { -off } else { off });
     } else if tmfc.has_tz {
-        zone = Some(-tmfc.gmtoffset);
+        zone = Some(match &tmfc.abbrev_zone {
+            Some((z, a)) => crate::times::abbrev_west(z, a, (tm.year, tm.mon, tm.mday), (tm.hour, tm.min, tm.sec))?,
+            None => -tmfc.gmtoffset,
+        });
     }
     Ok((tm, fsec, zone, tmfc.ff))
 }

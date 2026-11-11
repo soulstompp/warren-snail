@@ -1450,3 +1450,524 @@ fn functions_side_by_side_run_as_long_as_the_longest() {
         ],
     );
 }
+
+#[test]
+fn rows_from_reads_its_functions_side_by_side() {
+    let mut w = fr("rows-from");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT * FROM ROWS FROM (generate_series(1, 3), generate_series(10, 11)) AS t(a, b)",
+                &["1|10", "2|11", "3|NULL"],
+            ),
+            (
+                "SELECT * FROM ROWS FROM (generate_series(1, 2), unnest(ARRAY['x', 'y', 'z'])) \
+                 WITH ORDINALITY AS t(a, b, n)",
+                &["1|x|1", "2|y|2", "NULL|z|3"],
+            ),
+            ("SELECT t FROM ROWS FROM (generate_series(1, 2)) AS t", &["1", "2"]),
+            (
+                "SELECT * FROM ROWS FROM (unnest(ARRAY[1, 2], ARRAY['a', 'b', 'c'])) AS t(x, y)",
+                &["1|a", "2|b", "NULL|c"],
+            ),
+            (
+                "SELECT a.id, t.* FROM fr.a a, ROWS FROM (generate_series(1, a.id), \
+                 generate_series(10, 10 + a.id)) AS t(s, u) WHERE a.id <= 2 ORDER BY 1, 2, 3",
+                &["1|1|10", "1|NULL|11", "2|1|10", "2|2|11", "2|NULL|12"],
+            ),
+            (
+                "SELECT a.id, t.* FROM fr.a a CROSS JOIN LATERAL ROWS FROM \
+                 (generate_series(1, a.id)) AS t(s) WHERE a.id <= 2 ORDER BY 1, 2",
+                &["1|1", "2|1", "2|2"],
+            ),
+            (
+                "SELECT * FROM fr.a a JOIN ROWS FROM (generate_series(1, 2)) AS t(s) \
+                 ON a.id = t.s ORDER BY 1",
+                &["1|10|one|1", "2|10|two|2"],
+            ),
+            // `rows` before FROM in a select list is a name.
+            ("SELECT x, rows FROM (SELECT 1 AS x, 2 AS rows) s", &["1|2"]),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[
+            (
+                "SELECT generate_series FROM ROWS FROM (generate_series(1, 2), \
+                 generate_series(3, 4))",
+                "42702",
+                "column reference \"generate_series\" is ambiguous",
+            ),
+            ("SELECT * FROM ROWS FROM ()", "42601", "syntax error at or near \")\""),
+        ],
+    );
+    // Split from a text, each statement reads again as PostgreSQL's: ROWS FROM as written.
+    assert_eq!(
+        warren_snail::read::statement::split(
+            "SELECT * FROM ROWS FROM (generate_series(1, 2)) AS t(a); \
+             SELECT * FROM jsonb_to_record('{}') AS (x integer)"
+        )
+        .unwrap(),
+        [
+            "SELECT * FROM ROWS FROM (generate_series(1, 2)) AS t(a)",
+            "SELECT * FROM jsonb_to_record('{}') AS (x integer)",
+        ]
+    );
+}
+
+#[test]
+fn a_column_definition_list_types_a_record() {
+    let mut w = fr("defined");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT * FROM jsonb_to_recordset('[{\"x\": 1, \"y\": \"a\"}, {\"x\": 2}]') \
+                 AS t(x integer, y text)",
+                &["1|a", "2|NULL"],
+            ),
+            (
+                "SELECT * FROM json_to_recordset('[{\"x\": 1, \"y\": \"a\"}, {\"x\": 2}]') \
+                 AS t(x integer, y text)",
+                &["1|a", "2|NULL"],
+            ),
+            (
+                "SELECT x FROM jsonb_to_record('{\"x\": 1, \"y\": \"a\"}') AS (x integer, y text)",
+                &["1"],
+            ),
+            (
+                "SELECT jsonb_to_record.x FROM jsonb_to_record('{\"x\": 1, \"y\": \"a\"}') \
+                 AS (x integer, y text)",
+                &["1"],
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": \"1.5\", \"y\": [1, 2], \"z\": {\"q\": 1}, \
+                 \"w\": \"2026-01-02\"}') AS t(x numeric, y integer[], z jsonb, w date)",
+                &["1.5|{1,2}|{\"q\": 1}|2026-01-02"],
+            ),
+            (
+                "SELECT pg_typeof(x), pg_typeof(y) FROM jsonb_to_record('{\"x\": 1}') \
+                 AS t(x int8, y timestamptz)",
+                &["bigint|timestamp with time zone"],
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": {\"id\": 1, \"v\": 2}}') AS t(x fr.b)",
+                &["(1,,2)"],
+            ),
+            ("SELECT * FROM jsonb_to_record(NULL) AS t(x integer)", &["NULL"]),
+            ("SELECT * FROM jsonb_to_recordset(NULL) AS t(x integer)", &[]),
+            (
+                "SELECT * FROM jsonb_to_record('{\"X\": 1, \"x\": 2}') AS t(\"X\" integer, x integer)",
+                &["1|2"],
+            ),
+            (
+                "SELECT a.id, r.* FROM fr.a a, jsonb_to_record(jsonb_build_object('k', a.name)) \
+                 AS r(k text) ORDER BY 1",
+                &["1|one", "2|two", "3|three", "4|four"],
+            ),
+            (
+                "SELECT * FROM ROWS FROM (jsonb_to_record('{\"a\": 1, \"b\": \"x\"}') \
+                 AS (a integer, b text), generate_series(1, 2)) AS t",
+                &["1|x|1", "NULL|NULL|2"],
+            ),
+            (
+                "SELECT * FROM ROWS FROM (jsonb_to_recordset('[{\"a\": 1}, {\"a\": 2}]') \
+                 AS (a integer), json_to_record('{\"c\": true}') AS (c boolean))",
+                &["1|t", "2|NULL"],
+            ),
+            (
+                "SELECT * FROM ROWS FROM (jsonb_to_record('{\"a\": 1}')) AS t(a integer)",
+                &["1"],
+            ),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[
+            (
+                "SELECT * FROM json_to_record('{\"x\": \"abc\"}') AS t(x integer)",
+                "22P02",
+                "invalid input syntax for type integer: \"abc\"",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": \"abc\"}') AS t(x varchar(1))",
+                "22001",
+                "value too long for type character varying(1)",
+            ),
+            (
+                "SELECT * FROM jsonb_to_recordset('{\"x\": 1}') AS t(x integer)",
+                "22023",
+                "cannot call jsonb_to_recordset on a non-array",
+            ),
+            (
+                "SELECT * FROM json_to_recordset('{\"x\": 1}') AS t(x integer)",
+                "22023",
+                "cannot call json_to_recordset on an object",
+            ),
+            (
+                "SELECT * FROM jsonb_to_recordset('[1]') AS t(x integer)",
+                "22023",
+                "argument of jsonb_to_recordset must be an array of objects",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('[1]') AS t(x integer)",
+                "22023",
+                "cannot call populate_composite on an array",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_column_definition_list_refused_as_postgresql_refuses() {
+    let mut w = fr("undefined");
+    let required = "a column definition list is required for functions returning \"record\"";
+    let only = "a column definition list is only allowed for functions returning \"record\"";
+    refusals(
+        &mut w,
+        &[
+            ("SELECT * FROM jsonb_to_recordset('[{\"x\": 1}]')", "42601", required),
+            ("SELECT * FROM ROWS FROM (jsonb_to_record('{\"a\": 1}'))", "42601", required),
+            ("SELECT * FROM generate_series(1, 2) AS t(x integer)", "42601", only),
+            ("SELECT * FROM ROWS FROM (generate_series(1, 2) AS (x integer))", "42601", only),
+            (
+                "SELECT * FROM json_each('{\"a\": 1}') AS t(k text, v json)",
+                "42601",
+                "a column definition list is redundant for a function with OUT parameters",
+            ),
+            (
+                "SELECT * FROM jsonb_populate_recordset(NULL::fr.b, '[{\"id\": 7}]') \
+                 AS t(x integer)",
+                "42601",
+                "a column definition list is redundant for a function returning a named \
+                 composite type",
+            ),
+            (
+                "SELECT * FROM generate_series(1, 2) WITH ORDINALITY AS t(x integer)",
+                "42601",
+                "WITH ORDINALITY cannot be used with a column definition list\nHINT:  Put the \
+                 column definition list inside ROWS FROM().",
+            ),
+            (
+                "SELECT * FROM unnest(ARRAY[1, 2], ARRAY['a', 'b']) AS t(x integer, y text)",
+                "42601",
+                "UNNEST() with multiple arguments cannot have a column definition list\nHINT:  \
+                 Use separate UNNEST() calls inside ROWS FROM(), and attach a column definition \
+                 list to each one.",
+            ),
+            (
+                "SELECT * FROM ROWS FROM (jsonb_to_record('{\"a\": 1}'), generate_series(1, 2)) \
+                 AS t(a integer)",
+                "42601",
+                "ROWS FROM() with multiple functions cannot have a column definition list\nHINT:  \
+                 Put a separate column definition list for each function inside ROWS FROM().",
+            ),
+            (
+                "SELECT * FROM ROWS FROM (jsonb_to_record('{\"a\": 1}') AS (a integer)) \
+                 AS t(x integer)",
+                "42601",
+                "multiple column definition lists are not allowed for the same function",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": 1}') AS t(x integer, x text)",
+                "42701",
+                "column name \"x\" specified more than once",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": 1}') AS t(x, y integer)",
+                "42601",
+                "syntax error at or near \"integer\"",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": 1}') AS t(x integer, y)",
+                "42601",
+                "syntax error at or near \")\"",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": 1}') AS t(x nosuchtype)",
+                "42704",
+                "type \"nosuchtype\" does not exist",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\": 1}') AS t(x record)",
+                "42809",
+                "record type has not been registered",
+            ),
+            (
+                "SELECT jsonb_to_record('{\"a\": 1}')",
+                "0A000",
+                "could not determine row type for result of jsonb_to_record\nHINT:  Provide a \
+                 non-null record argument, or call the function in the FROM clause using a \
+                 column definition list.",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn the_other_sets_in_from() {
+    let mut w = fr("others");
+    answered(
+        &mut w,
+        &[
+            ("SELECT * FROM string_to_table('a|b||c', '|')", &["a", "b", "", "c"]),
+            ("SELECT * FROM string_to_table('a|b||c', '|', '')", &["a", "b", "NULL", "c"]),
+            ("SELECT * FROM string_to_table(NULL, '|')", &[]),
+            ("SELECT * FROM string_to_table('abc', NULL)", &["a", "b", "c"]),
+            (
+                "SELECT * FROM string_to_table('a,b', ',') WITH ORDINALITY AS t(x, n)",
+                &["a|1", "b|2"],
+            ),
+            ("SELECT string_to_table('a|b', '|')", &["a", "b"]),
+            ("SELECT * FROM ts_parse(3722, 'cat')", &["1|cat"]),
+            ("SELECT * FROM ts_parse(3722::oid, 'cat 12')", &["1|cat", "12| ", "22|12"]),
+            (
+                "SELECT * FROM ts_token_type(3722) WHERE tokid <= 3",
+                &[
+                    "1|asciiword|Word, all ASCII",
+                    "2|word|Word, all letters",
+                    "3|numword|Word, letters and digits",
+                ],
+            ),
+            ("SELECT * FROM ts_token_type(NULL::oid)", &[]),
+            (
+                "SELECT word, catcode, barelabel FROM pg_get_keywords() \
+                 WHERE word IN ('all', 'select', 'zone') ORDER BY word",
+                &["all|R|t", "select|R|t", "zone|U|t"],
+            ),
+            (
+                "SELECT word, catdesc, baredesc FROM pg_get_keywords() WHERE word = 'zone'",
+                &["zone|unreserved|can be bare label"],
+            ),
+            ("SELECT k.word FROM pg_get_keywords() AS k WHERE k.word = 'all'", &["all"]),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[
+            (
+                "SELECT * FROM ts_parse(9999, 'cat')",
+                "XX000",
+                "cache lookup failed for text search parser 9999",
+            ),
+            (
+                "SELECT * FROM ts_parse('3722', 'cat')",
+                "42704",
+                "text search parser \"3722\" does not exist",
+            ),
+            (
+                "SELECT * FROM ts_parse('nosuch', 'cat')",
+                "42704",
+                "text search parser \"nosuch\" does not exist",
+            ),
+            (
+                "SELECT * FROM ts_token_type(9999)",
+                "XX000",
+                "cache lookup failed for text search parser 9999",
+            ),
+        ],
+    );
+    // 18.6 answers both: ts_stat's rows (b|1|1, a|1|1) and no channels. The snail refuses each in
+    // its class's words: a query run by its text, and what only a server has.
+    for (sql, words) in [
+        (
+            "SELECT * FROM ts_stat('SELECT ''a b a''::tsvector')",
+            "ts_stat runs a query by its text: it is not read",
+        ),
+        (
+            "SELECT * FROM pg_listening_channels()",
+            "pg_listening_channels is the server's own (sessions): a snail answers only what its \
+             file holds",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql).1, words, "{sql}");
+    }
+}
+
+#[test]
+fn every_abbreviation_of_the_set_is_read() {
+    let mut w = fr("abbreviations");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT '2024-03-05 13:04 EST'::timestamptz, '2024-07-05 13:04 PDT'::timestamptz, \
+                 '2024-07-05 13:04:05 MET DST'::timestamptz",
+                &["2024-03-05 18:04:00+00|2024-07-05 20:04:00+00|2024-07-05 11:04:05+00"],
+            ),
+            (
+                "SELECT '2024-07-05 13:04:05+00'::timestamptz AT TIME ZONE 'EST', \
+                 timezone('PDT', '2024-07-05 13:04:05+00'::timestamptz)",
+                &["2024-07-05 08:04:05|2024-07-05 06:04:05"],
+            ),
+            ("SELECT '13:04 EST'::timetz", &["13:04:00-05"]),
+            (
+                "SELECT to_timestamp('2024-07-05 13:04 pdt', 'YYYY-MM-DD HH24:MI TZ')",
+                &["2024-07-05 20:04:00+00"],
+            ),
+            (
+                "SELECT date_trunc('day', '2024-07-05 02:04+00'::timestamptz, 'PST'), \
+                 make_timestamptz(2024, 7, 5, 13, 4, 5, 'PDT')",
+                &["2024-07-04 08:00:00+00|2024-07-05 20:04:05+00"],
+            ),
+        ],
+    );
+    // One naming a zone is read by its rules under the feature zones: MSK, Moscow's, the meaning
+    // it had at the time read (three hours east in the summer of 2010, when Moscow kept four); and
+    // ART, which Buenos Aires's rules no longer name, as the zone's offset.
+    let dynamic: &[(&str, &[&str])] = &[
+        (
+            "SELECT '2010-07-05 13:04 MSK'::timestamptz, '2012-01-05 13:04 MSK'::timestamptz, \
+             '2024-07-05 13:04 ART'::timestamptz",
+            &["2010-07-05 10:04:00+00|2012-01-05 09:04:00+00|2024-07-05 16:04:00+00"],
+        ),
+        (
+            "SELECT '2024-07-05 13:04:05+00'::timestamptz AT TIME ZONE 'MSK', \
+             '2024-07-05 13:04:05'::timestamp AT TIME ZONE 'msk'",
+            &["2024-07-05 16:04:05|2024-07-05 10:04:05+00"],
+        ),
+        ("SELECT '2024-07-05 13:04 MSK'::timetz", &["13:04:00+03"]),
+        (
+            "SELECT to_timestamp('2010-07-05 13:04 MSK', 'YYYY-MM-DD HH24:MI TZ'), \
+             make_timestamptz(2010, 7, 5, 13, 4, 5, 'MSK')",
+            &["2010-07-05 10:04:00+00|2010-07-05 10:04:05+00"],
+        ),
+        (
+            "SELECT abbrev, utc_offset, is_dst FROM pg_timezone_abbrevs_abbrevs() \
+             WHERE abbrev IN ('EST', 'PDT', 'MSK', 'ART', 'CETDST', 'ZULU') ORDER BY abbrev",
+            &[
+                "ART|-03:00:00|f",
+                "CETDST|02:00:00|t",
+                "EST|-05:00:00|f",
+                "MSK|03:00:00|f",
+                "PDT|-07:00:00|t",
+                "ZULU|00:00:00|f",
+            ],
+        ),
+        ("SELECT count(*) FROM pg_timezone_abbrevs_abbrevs()", &["195"]),
+    ];
+    #[cfg(feature = "zones")]
+    {
+        answered(&mut w, dynamic);
+        refusals(
+            &mut w,
+            &[(
+                "SELECT '2024-07-05 13:04 MSK DST'::timestamptz",
+                "22007",
+                "invalid input syntax for type timestamp with time zone: \"2024-07-05 13:04 MSK \
+                 DST\"",
+            )],
+        );
+    }
+    // Without it, refused by name.
+    #[cfg(not(feature = "zones"))]
+    for (sql, _) in dynamic {
+        let words = refused(&mut w, sql).1;
+        assert!(words.contains("read only under the feature zones"), "{sql}: {words}");
+    }
+}
+
+#[cfg(feature = "zones")]
+#[test]
+fn the_session_zone_s_abbreviations_are_read_first() {
+    let mut w = fr("zone-first");
+    w.execute("SET TimeZone = 'Asia/Shanghai'").unwrap();
+    answered(
+        &mut w,
+        &[(
+            "SELECT '2024-07-05 13:04 CST'::timestamptz, \
+             '2024-07-05 13:04:05+00'::timestamptz AT TIME ZONE 'CST'",
+            &["2024-07-05 13:04:00+08|2024-07-05 21:04:05"],
+        )],
+    );
+    w.execute("SET TimeZone = 'Europe/Dublin'").unwrap();
+    answered(
+        &mut w,
+        &[(
+            "SELECT '2024-01-05 13:04 IST'::timestamptz, '2024-07-05 13:04 IST'::timestamptz",
+            &["2024-01-05 12:04:00+00|2024-07-05 13:04:00+01"],
+        )],
+    );
+    w.execute("SET TimeZone = 'Europe/Lisbon'").unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT '1900-01-05 13:04 LMT'::timestamptz, '2024-07-05 13:04 WEST'::timestamptz",
+                &["1900-01-05 13:04:00-00:36:45|2024-07-05 13:04:00+01"],
+            ),
+            (
+                "SELECT * FROM pg_timezone_abbrevs_zone() ORDER BY abbrev",
+                &[
+                    "CEST|02:00:00|t",
+                    "CET|01:00:00|f",
+                    "LMT|-00:36:45|f",
+                    "WEMT|02:00:00|t",
+                    "WEST|01:00:00|t",
+                    "WET|00:00:00|f",
+                ],
+            ),
+        ],
+    );
+    w.execute("SET TimeZone = 'UTC'").unwrap();
+    answered(
+        &mut w,
+        &[
+            ("SELECT * FROM pg_timezone_abbrevs_zone()", &["UTC|00:00:00|f"]),
+            (
+                "SELECT name, utc_offset, is_dst FROM pg_timezone_names() \
+                 WHERE name = 'Asia/Kolkata'",
+                &["Asia/Kolkata|05:30:00|f"],
+            ),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[(
+            "SELECT * FROM pg_timezone_abbrevs()",
+            "42883",
+            "function pg_timezone_abbrevs() does not exist",
+        )],
+    );
+}
+
+/// A snail of case 12a's tables, holding none of its rows, written as release `release`'s.
+#[cfg(feature = "zones")]
+fn fr_of(name: &str, release: u8) -> Snail {
+    let path = tmp(&format!("reader-fr-{name}.snail"));
+    let mut catalog = Catalog::parse(FR_DDL).unwrap();
+    catalog.with_release(release).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), release)
+        .unwrap();
+    Snail::open_writing(&path).unwrap()
+}
+
+// Before 18 PostgreSQL reads its set alone: CST is the set's, six hours west, under any zone, and
+// the set is pg_timezone_abbrevs()'s. No server of 14 to 17 is asked here: these are the snail's
+// own, read from 18.6's source, which reads the session zone's own first from 18 on.
+#[cfg(feature = "zones")]
+#[test]
+fn before_18_the_set_alone_is_read() {
+    let mut w = fr_of("release-17", 17);
+    answered(
+        &mut w,
+        &[(
+            "SELECT abbrev, utc_offset FROM pg_timezone_abbrevs() WHERE abbrev = 'CST'",
+            &["CST|-06:00:00"],
+        )],
+    );
+    w.execute("SET TimeZone = 'Asia/Shanghai'").unwrap();
+    answered(
+        &mut w,
+        &[("SELECT '2024-07-05 13:04 CST'::timestamptz", &["2024-07-06 03:04:00+08"])],
+    );
+    refusals(
+        &mut w,
+        &[(
+            "SELECT * FROM pg_timezone_abbrevs_abbrevs()",
+            "42883",
+            "function pg_timezone_abbrevs_abbrevs() does not exist",
+        )],
+    );
+}

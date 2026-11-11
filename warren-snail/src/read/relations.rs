@@ -24,9 +24,9 @@ use crate::catalog::{Catalog, ColumnType, Table};
 use crate::{Error, Result};
 use arrow::array::RecordBatch;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, JoinConstraint,
-    JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, TableAlias, TableFactor, TableWithJoins, Value as SqlValue,
+    BinaryOperator, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, TableAlias, TableFactor, TableWithJoins, Value as SqlValue,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -124,12 +124,16 @@ struct Inside {
     laterals: Vec<usize>,
 }
 
-/// A function a FROM reads the rows of: one call, or several read side by side (an unnest of
-/// several arrays), and its ordinality after them, where asked.
+/// A function a FROM reads the rows of: one call, or several read side by side (ROWS FROM, an unnest
+/// of several arrays), and its ordinality after them, where asked.
 #[derive(Clone)]
 struct Call {
     functions: Vec<Called>,
     ordinality: bool,
+    /// Whether it is written ROWS FROM (…), as a column definition list beside it is refused.
+    rows_from: bool,
+    /// The column definition list its alias writes, where it writes one.
+    listed: Option<Vec<(String, DataType)>>,
 }
 
 /// One function of a call in FROM, and the columns it lays out there.
@@ -140,6 +144,10 @@ struct Called {
     spread: bool,
     /// How many columns it lays out.
     width: usize,
+    /// The column definition list written for it inside ROWS FROM, each column's name and type.
+    defined: Option<Vec<(String, DataType)>>,
+    /// The record its column definition list makes, once laid.
+    record: Option<ColumnType>,
 }
 
 impl Called {
@@ -148,6 +156,8 @@ impl Called {
             expr,
             spread: false,
             width: 1,
+            defined: None,
+            record: None,
         }
     }
 }
@@ -803,7 +813,8 @@ fn alias_named(n: &str) -> TableAlias {
     }
 }
 
-/// The names an alias gives a relation's columns.
+/// The names an alias gives a relation's columns; one typing them refused, as PostgreSQL's grammar
+/// refuses a column definition list beside anything but a function.
 fn renames_of(alias: &Option<TableAlias>) -> Result<Vec<String>> {
     let Some(a) = alias else {
         return Ok(Vec::new());
@@ -812,11 +823,143 @@ fn renames_of(alias: &Option<TableAlias>) -> Result<Vec<String>> {
         .iter()
         .map(|c| match &c.data_type {
             None => Ok(crate::catalog::ident(&c.name)),
-            Some(_) => Err(Error::new(format!(
-                "{a}: a column definition list is not read"
-            ))),
+            Some(dt) => Err(near_type(dt)),
         })
         .collect()
+}
+
+/// A column list's syntax error at the type a column is written with: at its first word.
+fn near_type(dt: &DataType) -> Error {
+    let written = dt.to_string();
+    let first: String = written
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '"')
+        .collect();
+    Error::new(format!(
+        "syntax error at or near \"{}\"",
+        first.trim_matches('"').to_lowercase()
+    ))
+}
+
+/// The column definition list a function's alias writes, taken from it: each column's name and
+/// type, where every column is typed; none where none is. A list typing some of its columns is
+/// refused as PostgreSQL's grammar refuses it, at the first word it cannot read.
+fn listed_of(alias: &mut Option<TableAlias>) -> Result<Option<Vec<(String, DataType)>>> {
+    let Some(a) = alias else {
+        return Ok(None);
+    };
+    let typed = a.columns.iter().filter(|c| c.data_type.is_some()).count();
+    if typed == 0 {
+        return Ok(None);
+    }
+    if typed < a.columns.len() {
+        return Err(match a.columns[0].data_type {
+            // Names first: a type is where a name or the list's end stands.
+            None => near_type(
+                a.columns
+                    .iter()
+                    .find_map(|c| c.data_type.as_ref())
+                    .expect("a typed column"),
+            ),
+            // Types first: a name alone ends where its type stands.
+            Some(_) => {
+                let at = a.columns.iter().position(|c| c.data_type.is_none()).unwrap();
+                let next = if at + 1 == a.columns.len() { ")" } else { "," };
+                Error::new(format!("syntax error at or near \"{next}\""))
+            }
+        });
+    }
+    let listed = a
+        .columns
+        .drain(..)
+        .map(|c| (crate::catalog::ident(&c.name), c.data_type.expect("typed")))
+        .collect();
+    Ok(Some(listed))
+}
+
+/// ROWS FROM's functions as `spelled::rows_from` writes them, each with the column definition list
+/// written for it; an unnest of several arrays written with none an unnest of each, as PostgreSQL's
+/// parser makes it.
+fn rows_from_functions(args: &[FunctionArg]) -> Result<Vec<Called>> {
+    let mut out: Vec<Called> = Vec::new();
+    for a in args {
+        let (name, arg) = match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e @ Expr::Function(_))) => {
+                out.push(Called::of(e.clone()));
+                continue;
+            }
+            FunctionArg::ExprNamed {
+                name: Expr::Identifier(n),
+                arg: FunctionArgExpr::Expr(arg),
+                ..
+            } => (n, arg),
+            FunctionArg::Named {
+                name: n,
+                arg: FunctionArgExpr::Expr(arg),
+                ..
+            } => (n, arg),
+            other => return Err(Error::new(format!("{other} is not read in ROWS FROM"))),
+        };
+        let data_type = match arg {
+            Expr::Cast { data_type, .. } => data_type.clone(),
+            other => {
+                return Err(Error::new(format!(
+                    "{other}: a column definition list's collation is not read"
+                )))
+            }
+        };
+        let Some(last) = out.last_mut() else {
+            return Err(Error::new("syntax error at or near \"AS\""));
+        };
+        last.defined
+            .get_or_insert_with(Vec::new)
+            .push((crate::catalog::ident(name), data_type));
+    }
+    let mut each = Vec::with_capacity(out.len());
+    for c in out {
+        let several = match (&c.expr, &c.defined) {
+            (Expr::Function(f), None)
+                if f.name.0.len() == 1 && pipeline::function_name(f) == "unnest" =>
+            {
+                match &f.args {
+                    FunctionArguments::List(l) if l.args.len() > 1 => Some(l.args.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match several {
+            Some(arrays) => {
+                let name = ObjectName(vec![
+                    ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+                    ObjectNamePart::Identifier(Ident::new("unnest")),
+                ]);
+                for a in arrays {
+                    each.push(Called::of(called_with(&name, vec![a])));
+                }
+            }
+            None => each.push(c),
+        }
+    }
+    Ok(each)
+}
+
+/// A call of a function by its name, of these arguments.
+fn called_with(name: &ObjectName, args: Vec<FunctionArg>) -> Expr {
+    Expr::Function(sqlparser::ast::Function {
+        name: name.clone(),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args,
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
+    })
 }
 
 /// A FROM item as the steps read it: a table or a step by name; a derived table, a VALUES list and
@@ -828,23 +971,13 @@ fn lift_factor(
     t: &mut TableFactor,
     lifted: &mut Lifted,
 ) -> Result<()> {
-    let call = |name: &ObjectName, args: Vec<FunctionArg>| {
-        Expr::Function(sqlparser::ast::Function {
-            name: name.clone(),
-            uses_odbc_syntax: false,
-            parameters: FunctionArguments::None,
-            args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
-                duplicate_treatment: None,
-                args,
-                clauses: Vec::new(),
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: Vec::new(),
-        })
+    let call = |name: &ObjectName, args: Vec<FunctionArg>| -> Result<(Vec<Called>, bool)> {
+        if crate::catalog::object_name(name) == super::spelled::ROWS_FROM {
+            return Ok((rows_from_functions(&args)?, true));
+        }
+        Ok((vec![Called::of(called_with(name, args))], false))
     };
-    let (exprs, ordinality, alias) = match t {
+    let ((functions, rows_from), ordinality, mut alias) = match t {
         TableFactor::Table {
             name,
             alias,
@@ -904,18 +1037,14 @@ fn lift_factor(
             args: Some(a),
             with_ordinality,
             ..
-        } if a.settings.is_none() => (
-            vec![call(name, a.args.clone())],
-            *with_ordinality,
-            alias.take(),
-        ),
+        } if a.settings.is_none() => (call(name, a.args.clone())?, *with_ordinality, alias.take()),
         TableFactor::Function {
             name,
             args,
             with_ordinality,
             alias,
             ..
-        } => (vec![call(name, args.clone())], *with_ordinality, alias.take()),
+        } => (call(name, args.clone())?, *with_ordinality, alias.take()),
         // An unnest of several arrays is an unnest of each, read side by side, as PostgreSQL's
         // parser makes it.
         TableFactor::UNNEST {
@@ -934,9 +1063,14 @@ fn lift_factor(
             };
             let each = array_exprs
                 .iter()
-                .map(|a| call(&name, vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(a.clone()))]))
+                .map(|a| {
+                    Called::of(called_with(
+                        &name,
+                        vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(a.clone()))],
+                    ))
+                })
                 .collect();
-            (each, *with_ordinality, alias.take())
+            ((each, false), *with_ordinality, alias.take())
         }
         TableFactor::Derived {
             lateral: false,
@@ -1007,9 +1141,19 @@ fn lift_factor(
         }
         other => return Err(Error::new(format!("{other} is not read in FROM"))),
     };
+    let listed = listed_of(&mut alias)?;
+    // `AS (…)` with no name before it: the call goes by its first function's.
+    if alias
+        .as_ref()
+        .is_some_and(|a| a.name.value == super::spelled::ROWS_MARK.to_string())
+    {
+        alias = None;
+    }
     lifted.calls.push(Call {
-        functions: exprs.into_iter().map(Called::of).collect(),
+        functions,
         ordinality,
+        rows_from,
+        listed,
     });
     *t = plain(&format!("{CALLED}{}", lifted.calls.len() - 1), alias);
     Ok(())
@@ -1488,19 +1632,14 @@ impl Laying<'_> {
             .unwrap_or_else(|| first.clone());
         let lone = call.functions.len() == 1;
         let whole = lone && !call.ordinality;
-        let mut cols: Vec<Col> = Vec::new();
-        let mut names = Vec::new();
-        for c in &mut call.functions {
+        // Each function typed, its refusal first, then a list beside the call where it writes one
+        // of its own, as PostgreSQL's transformRangeFunction meets them.
+        let mut types = Vec::with_capacity(call.functions.len());
+        for c in &call.functions {
             let Expr::Function(f) = &c.expr else {
                 unreachable!("a call")
             };
             let name = pipeline::function_name(f);
-            if !pipeline::is_set_returning(&name) && !pipeline::gives_a_row(f) {
-                return Err(Error::new(format!(
-                    "{}: a function in FROM is read where it returns a set the snail makes",
-                    c.expr
-                )));
-            }
             // A function named in its schema is named so in its refusals.
             let ty = typing.type_of(&c.expr).map_err(|e| {
                 let written = crate::catalog::object_name(&f.name);
@@ -1515,6 +1654,79 @@ impl Laying<'_> {
                     _ => e,
                 }
             })?;
+            if c.defined.is_some() && call.listed.is_some() {
+                return Err(Error::coded(
+                    "42601",
+                    "multiple column definition lists are not allowed for the same function",
+                ));
+            }
+            types.push(ty);
+        }
+        if let Some(listed) = call.listed.take() {
+            if !lone {
+                return Err(Error::coded("42601", match call.rows_from {
+                    true => "ROWS FROM() with multiple functions cannot have a column definition \
+                             list\nHINT:  Put a separate column definition list for each function \
+                             inside ROWS FROM().",
+                    false => "UNNEST() with multiple arguments cannot have a column definition \
+                              list\nHINT:  Use separate UNNEST() calls inside ROWS FROM(), and \
+                              attach a column definition list to each one.",
+                }));
+            }
+            if call.ordinality {
+                return Err(Error::coded(
+                    "42601",
+                    "WITH ORDINALITY cannot be used with a column definition list\nHINT:  Put the \
+                     column definition list inside ROWS FROM().",
+                ));
+            }
+            call.functions[0].defined = Some(listed);
+        }
+        let mut cols: Vec<Col> = Vec::new();
+        let mut names = Vec::new();
+        for (c, ty) in call.functions.iter_mut().zip(types) {
+            let Expr::Function(f) = &c.expr else {
+                unreachable!("a call")
+            };
+            let name = pipeline::function_name(f);
+            // A record of no type of its own takes its columns from a list, and only it takes one.
+            let record_of_none = super::populate::RECORDS.contains(&name.as_str());
+            let ty = match (&c.defined, record_of_none) {
+                (Some(listed), true) => {
+                    let record = defined_record(listed)?;
+                    c.record = Some(record);
+                    Some(record)
+                }
+                (None, true) => {
+                    return Err(Error::coded(
+                        "42601",
+                        "a column definition list is required for functions returning \"record\"",
+                    ))
+                }
+                (Some(_), false) => {
+                    return Err(Error::coded("42601", match ty.map(record_name) {
+                        Some(Some(n)) if n == "record" => {
+                            "a column definition list is redundant for a function with OUT \
+                             parameters"
+                        }
+                        Some(Some(_)) => {
+                            "a column definition list is redundant for a function returning a \
+                             named composite type"
+                        }
+                        _ => {
+                            "a column definition list is only allowed for functions returning \
+                             \"record\""
+                        }
+                    }))
+                }
+                (None, false) => ty,
+            };
+            if !record_of_none && !pipeline::is_set_returning(&name) && !pipeline::gives_a_row(f) {
+                return Err(Error::new(format!(
+                    "{}: a function in FROM is read where it returns a set the snail makes",
+                    c.expr
+                )));
+            }
             let fields = ty.and_then(record_fields);
             c.spread = fields.is_some();
             let before = cols.len();
@@ -1910,6 +2122,52 @@ fn record_fields(ty: ColumnType) -> Option<Vec<(String, ColumnType)>> {
         }
         _ => None,
     }
+}
+
+/// The name of a record type: `record` for one of no name, a function's OUT parameters among them.
+fn record_name(ty: ColumnType) -> Option<String> {
+    let ColumnType::Composed(r) = ty else {
+        return None;
+    };
+    match r.def() {
+        crate::composed::Composed::Record { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The anonymous record a column definition list makes: each column of the type it names, as a cast
+/// names it, refused where none has the name; no name twice.
+fn defined_record(listed: &[(String, DataType)]) -> Result<ColumnType> {
+    let mut fields: Vec<crate::composed::Field> = Vec::with_capacity(listed.len());
+    for (name, dt) in listed {
+        if matches!(dt, DataType::Custom(n, a) if a.is_empty() && crate::catalog::object_name(n) == "record")
+        {
+            return Err(Error::coded("42809", "record type has not been registered"));
+        }
+        let ty = crate::catalog::held_type(dt)
+            .ok()
+            .or_else(|| crate::composed::resolve(dt))
+            .ok_or_else(|| {
+                let written = match dt {
+                    DataType::Custom(n, _) => crate::catalog::object_name(n),
+                    other => other.to_string(),
+                };
+                Error::new(format!("type \"{written}\" does not exist"))
+            })?;
+        fields.push(crate::composed::Field::new(name, ty));
+    }
+    for (i, f) in fields.iter().enumerate() {
+        if fields[..i].iter().any(|g| g.name == f.name) {
+            return Err(Error::coded(
+                "42701",
+                format!("column name \"{}\" specified more than once", f.name),
+            ));
+        }
+    }
+    Ok(crate::composed::type_of(crate::composed::Composed::Record {
+        name: "record".into(),
+        fields,
+    }))
 }
 
 /// The collation a value of a type carries where nothing names one: the database's, for a string.
@@ -3024,6 +3282,10 @@ impl Reading<'_> {
         for c in &call.functions {
             let ty = self.from.columns[at].ty;
             at += c.width;
+            if let Some(record) = c.record {
+                values.push(pipeline::defined_rows(&c.expr, &row, &frame, record)?);
+                continue;
+            }
             values.push(match pipeline::call_series(&c.expr, &row, &frame, ty)? {
                 Some(series) => series.collect::<Result<Vec<_>>>()?,
                 None => pipeline::call_rows(&c.expr, &row, &frame)?,

@@ -440,8 +440,19 @@ fn returns(form: &Form, types: &[Option<ColumnType>]) -> Option<ColumnType> {
         R::Bit => Some(ColumnType::Bit(0)),
         R::First => first(),
         R::ArrayOfFirst => first().map(super::typed::array_of),
-        R::Rows => None,
+        R::Rows => Some(keyword_record()),
     }
+}
+
+/// The record of a row of `pg_get_keywords()`, its OUT parameters' names and types.
+pub(super) fn keyword_record() -> ColumnType {
+    crate::composed::type_of(crate::composed::Composed::Record {
+        name: "record".into(),
+        fields: KEYWORD_COLUMNS
+            .iter()
+            .map(|(n, t)| crate::composed::Field::new(n, *t))
+            .collect(),
+    })
 }
 
 /// The type a function of this module's returns over its arguments' types, or PostgreSQL's

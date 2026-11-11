@@ -708,7 +708,7 @@ impl super::Snail {
     }
 
     /// The zone the session's TimeZone names, held for a statement: what reads and writes its
-    /// instants' text, casts and calendar.
+    /// instants' text, casts and calendar, and the abbreviations it reads first.
     pub(super) fn in_zone(&self) -> crate::zones::InZone {
         crate::zones::in_zone(
             self.session
@@ -717,6 +717,7 @@ impl super::Snail {
                 .get("timezone")
                 .map(String::as_str),
         )
+        .of_release(self.catalog.release)
     }
 
     /// What set_config and current_setting read the session's settings and modes by.

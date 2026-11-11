@@ -479,6 +479,87 @@ fn held_instant(t: i128) -> Result<i64> {
     Ok(t as i64)
 }
 
+/// The record of a row of pg_timezone_names, the zone's name first, or of the abbreviations'
+/// functions: an abbreviation, its offset east of UTC and whether it is daylight time.
+pub(super) fn zones_record(named: bool) -> ColumnType {
+    use crate::composed::{Composed, Field};
+    let text = ColumnType::Text(None);
+    let mut fields = Vec::with_capacity(4);
+    if named {
+        fields.push(Field::new("name", text));
+    }
+    fields.extend([
+        Field::new("abbrev", text),
+        Field::new("utc_offset", full_interval()),
+        Field::new("is_dst", ColumnType::Boolean),
+    ]);
+    crate::composed::type_of(Composed::Record {
+        name: "record".into(),
+        fields,
+    })
+}
+
+/// The rows of pg_timezone_names, of pg_timezone_abbrevs (pg_timezone_abbrevs_abbrevs from 18) and
+/// of pg_timezone_abbrevs_zone, at the statement's clock `now`, microseconds after 1970-01-01 00:00
+/// UTC: every zone compiled beside the server with its abbreviation, offset and daylight time then;
+/// PostgreSQL's set of abbreviations in its order, a dynamic one as its zone means it then; the
+/// statement zone's own. None where the name is none of them.
+pub(super) fn zone_sets(name: &str, now: i64) -> Result<Option<Vec<Value>>> {
+    let utc = now.div_euclid(1_000_000);
+    let interval = |east: i32| {
+        Value::Interval(times::Interval {
+            months: 0,
+            days: 0,
+            micros: i64::from(east) * 1_000_000,
+        })
+    };
+    let row = |abbrev: &str, east: i32, dst: bool| {
+        vec![Value::Text(abbrev.to_string()), interval(east), Value::Bool(dst)]
+    };
+    let rows: Vec<Vec<Value>> = match name {
+        "pg_timezone_names" => crate::zones::every_zone_at(utc)?
+            .into_iter()
+            .map(|(zone, abbrev, east, dst)| {
+                let mut r = vec![Value::Text(zone)];
+                r.extend(row(&abbrev, east, dst));
+                r
+            })
+            .collect(),
+        "pg_timezone_abbrevs" | "pg_timezone_abbrevs_abbrevs" => times::abbreviations()
+            .map(|(abbrev, names)| {
+                let (east, dst) = match names {
+                    times::Abbreviated::Fixed(east, dst) => (*east, *dst),
+                    times::Abbreviated::Zone(zone) => times::abbrev_utc_offset(zone, abbrev, utc)?,
+                };
+                Ok(row(&abbrev.to_ascii_uppercase(), east, dst))
+            })
+            .collect::<Result<_>>()?,
+        "pg_timezone_abbrevs_zone" => crate::zones::session_abbrevs_at(utc)?
+            .into_iter()
+            .map(|(abbrev, east, dst)| row(&abbrev, east, dst))
+            .collect(),
+        _ => return Ok(None),
+    };
+    let ty = zones_record(name == "pg_timezone_names");
+    let crate::catalog::ColumnType::Composed(r) = ty else {
+        unreachable!("a record")
+    };
+    let crate::composed::Composed::Record { fields, .. } = r.def() else {
+        unreachable!("a record")
+    };
+    rows.into_iter()
+        .map(|r| {
+            let items = r
+                .into_iter()
+                .zip(fields.iter())
+                .map(|(v, f)| super::pipeline::part_of(f.ty, v, false))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(super::pipeline::composed(ty, crate::composed::Item::Record(items)))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 /// A value AT TIME ZONE `zone`, as PostgreSQL's timestamptz_zone and timestamp_zone take it: an
 /// instant as the zone's clock shows it, and a time on the zone's clock as the instant it is. A zone
 /// other than UTC is read only under the feature zones.
@@ -494,17 +575,22 @@ pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
         }
     };
     let second = 1_000_000i128;
-    // An abbreviation first, as PostgreSQL reads the name: UTC's at offset 0.
-    let fixed = times::zone_abbreviation(&name)?;
+    // An abbreviation first, as PostgreSQL reads the name: of a fixed offset, or of a zone whose
+    // rules give the offset it means at the time.
+    let abbreviated = times::zone_abbreviation(&name)?;
     Ok(match (time_of(&v), &v) {
         (_, Value::Null) => Value::Null,
         (Some(ColumnType::Timestamptz), Value::Scalar(_, t)) => {
             let local = if *t == i64::MIN || *t == i64::MAX {
                 *t
             } else {
-                let east = match fixed {
-                    Some(east) => east,
-                    None => crate::zones::utc_offset(&name, t.div_euclid(1_000_000))?,
+                let utc = t.div_euclid(1_000_000);
+                let east = match &abbreviated {
+                    Some(times::Abbreviated::Fixed(east, _)) => *east,
+                    Some(times::Abbreviated::Zone(zone)) => {
+                        times::abbrev_utc_offset(zone, &name, utc)?.0
+                    }
+                    None => crate::zones::utc_offset(&name, utc)?,
                 };
                 held_instant(i128::from(*t) + i128::from(east) * second)?
             };
@@ -514,9 +600,13 @@ pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
             let at = if *t == i64::MIN || *t == i64::MAX {
                 *t
             } else {
-                let east = match fixed {
-                    Some(east) => east,
-                    None => crate::zones::local_offset(&name, t.div_euclid(1_000_000))?,
+                let local = t.div_euclid(1_000_000);
+                let east = match &abbreviated {
+                    Some(times::Abbreviated::Fixed(east, _)) => *east,
+                    Some(times::Abbreviated::Zone(zone)) => {
+                        times::abbrev_local_offset(zone, &name, local)?
+                    }
+                    None => crate::zones::local_offset(&name, local)?,
                 };
                 held_instant(i128::from(*t) - i128::from(east) * second)?
             };

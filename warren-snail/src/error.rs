@@ -207,6 +207,12 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("schema \"", "\" does not exist"), "3F000"),
     (Words::Is("no schema has been selected to create in"), "3F000"),
     (Words::Holds("type \"", "\" does not exist"), "42704"),
+    (Words::Holds("text search parser \"", "\" does not exist"), "42704"),
+    (Words::Holds("cannot call ", " on a non-array"), "22023"),
+    (Words::Holds("cannot call ", " on an object"), "22023"),
+    (Words::Holds("cannot call ", " on a scalar"), "22023"),
+    (Words::Holds("cannot call ", " on an array"), "22023"),
+    (Words::Holds("argument of ", " must be an array of objects"), "22023"),
     (Words::Starts("unacceptable schema name \""), "42939"),
     (Words::Holds("cannot drop ", " because it is required by the database system"), "2BP01"),
     (

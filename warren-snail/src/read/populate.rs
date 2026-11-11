@@ -3,7 +3,8 @@
 //! name: a JSON null NULL; a string read by the field's type's input, as is any scalar's text; an
 //! object into a composite field and an array into an array field made in turn; a json or jsonb
 //! field the value as a document. A key the object lacks keeps the base row's field, NULL where no
-//! base row is given.
+//! base row is given. json[b]_to_record and json[b]_to_recordset make rows the same way, of the
+//! record a column definition list beside them in FROM makes.
 
 use super::pipeline::Value;
 use crate::catalog::ColumnType;
@@ -20,6 +21,15 @@ pub(super) const ROWS: [&str; 2] = ["jsonb_populate_record", "json_populate_reco
 /// The functions giving a set of rows of a row type.
 pub(super) const SETS: [&str; 2] = ["jsonb_populate_recordset", "json_populate_recordset"];
 
+/// The functions giving rows of a record of no type of their own, read in FROM by the column
+/// definition list written beside them.
+pub(super) const RECORDS: [&str; 4] = [
+    "jsonb_to_record",
+    "json_to_record",
+    "jsonb_to_recordset",
+    "json_to_recordset",
+];
+
 /// Whether a name's document is json rather than jsonb.
 fn of_json(name: &str) -> bool {
     name.starts_with("json_")
@@ -32,6 +42,14 @@ pub(super) fn typed(
     args: &[Option<ColumnType>],
     release: u8,
 ) -> Result<Option<Option<ColumnType>>> {
+    // A record of no type of its own, its type left to its column definition list.
+    if RECORDS.contains(&name) {
+        let document = if of_json(name) { JSON } else { JSONB };
+        if args.len() != 1 || args[0].is_some_and(|t| t != document) {
+            return Err(super::typed::no_form(name, args));
+        }
+        return Ok(Some(None));
+    }
     let valid = name == "jsonb_populate_record_valid";
     if !(ROWS.contains(&name) || SETS.contains(&name) || valid) {
         return Ok(None);
@@ -82,6 +100,16 @@ pub(super) fn call(
     types: &[Option<ColumnType>],
 ) -> Result<Option<Value>> {
     let valid = name == "jsonb_populate_record_valid";
+    if RECORDS.contains(&name) {
+        return Err(Error::coded(
+            "0A000",
+            format!(
+                "could not determine row type for result of {name}\nHINT:  Provide a non-null \
+                 record argument, or call the function in the FROM clause using a column \
+                 definition list."
+            ),
+        ));
+    }
     if !(ROWS.contains(&name) || valid) {
         return Ok(None);
     }
@@ -160,8 +188,37 @@ pub(super) fn sets(
     if args[1].0.is_null() {
         return Ok(Some(Vec::new()));
     }
+    rows_of(name, &args[1], base_of(&args[0].0).as_deref(), ty).map(Some)
+}
+
+/// The rows of a record of no type of its own, `ty` the record its column definition list makes:
+/// json[b]_to_record's one, NULL for a NULL document, and json[b]_to_recordset's, none for one.
+pub(super) fn defined(name: &str, args: &[(Value, bool)], ty: ColumnType) -> Result<Vec<Value>> {
+    let doc = &args[0];
+    if name.ends_with("recordset") {
+        if doc.0.is_null() {
+            return Ok(Vec::new());
+        }
+        return rows_of(name, doc, None, ty);
+    }
+    if doc.0.is_null() {
+        return Ok(vec![Value::Null]);
+    }
     let json = of_json(name);
-    let doc = Jv::of(document(&args[1], json)?, json);
+    let v = Jv::of(document(doc, json)?, json);
+    Ok(vec![super::pipeline::composed(ty, composite(ty, &v, None)?)])
+}
+
+/// A document's array of objects as rows of the row type `ty`, a base row's fields kept where an
+/// object lacks a key.
+fn rows_of(
+    name: &str,
+    doc: &(Value, bool),
+    base: Option<&[Item]>,
+    ty: ColumnType,
+) -> Result<Vec<Value>> {
+    let json = of_json(name);
+    let doc = Jv::of(document(doc, json)?, json);
     match doc.kind() {
         Kind::Array => {}
         Kind::Object if json => {
@@ -170,7 +227,6 @@ pub(super) fn sets(
         _ if json => return Err(Error::new(format!("cannot call {name} on a scalar"))),
         _ => return Err(Error::new(format!("cannot call {name} on a non-array"))),
     }
-    let base = base_of(&args[0].0);
     doc.elements()?
         .iter()
         .map(|e| {
@@ -179,10 +235,9 @@ pub(super) fn sets(
                     "argument of {name} must be an array of objects"
                 )));
             }
-            Ok(super::pipeline::composed(ty, composite(ty, e, base.as_deref())?))
+            Ok(super::pipeline::composed(ty, composite(ty, e, base)?))
         })
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
+        .collect()
 }
 
 /// What a JSON value is at its top.

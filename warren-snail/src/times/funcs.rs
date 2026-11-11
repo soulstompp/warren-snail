@@ -780,15 +780,20 @@ fn zone_text(zone: &str) -> &str {
 }
 
 /// `date_trunc(unit, timestamptz, zone)`: cut on the zone's clock. The zone is looked up as
-/// PostgreSQL looks one up: an abbreviation first, UTC's read and any other refused by name, then
-/// a zone as AT TIME ZONE reads one.
+/// PostgreSQL looks one up: an abbreviation first, of a fixed offset or of the zone whose rules it
+/// names, then a zone as AT TIME ZONE reads one.
 pub fn timestamptz_trunc_zone(unit: &str, t: i64, zone: &str) -> Result<i64> {
     let zone = zone_text(zone);
-    match decode_timezone_abbrev(lowered(zone).as_bytes()) {
-        Ok(Some(_)) => return timestamptz_trunc(unit, t),
+    let named = match decode_timezone_abbrev(lowered(zone).as_bytes()) {
+        Ok(Some((_, _, Some(named)))) => named,
+        Ok(Some((_, 0, None))) => return timestamptz_trunc(unit, t),
+        Ok(Some((_, east, None))) => {
+            return zoned_trunc(unit, t, &|_| Ok(east), &|_| Ok(-east));
+        }
         Err(Dterr::Refused(e)) => return Err(e),
-        _ => {}
-    }
+        _ => zone.to_string(),
+    };
+    let zone = named.as_str();
     crate::zones::utc_offset(zone, 0)?;
     zoned_trunc(
         unit,
@@ -1124,7 +1129,12 @@ fn sane_zone(tm: &Tm, zone: &str) -> Result<i32> {
         Err(Dterr::BadFormat) => {
             let low = lowered(name);
             match decode_timezone_abbrev(low.as_bytes()) {
-                Ok(Some((_, offset))) => Ok(-offset),
+                // A dynamic abbreviation read at the date and time given.
+                Ok(Some((_, _, Some(zone)))) => abbrev_offset(&zone, name, tm).map_err(|e| match e {
+                    Dterr::Refused(e) => e,
+                    _ => Error::new(format!("time zone \"{name}\" not recognized")),
+                }),
+                Ok(Some((_, offset, None))) => Ok(-offset),
                 Err(Dterr::Refused(e)) => Err(e),
                 _ => zone_offset(name, tm).map_err(|e| match e {
                     Dterr::Refused(e) => e,
@@ -1481,7 +1491,11 @@ mod tests {
             timestamptz_trunc_zone("hour", 1_800_000_000, "+05").unwrap(),
             0
         );
-        assert!(refusal(timestamptz_trunc_zone("day", 0, "PST")).contains("abbreviations of UTC"));
+        // An abbreviation's clock: Pacific Standard Time, eight hours west.
+        assert_eq!(
+            timestamptz_trunc_zone("day", 0, "PST").unwrap(),
+            -16 * 3_600_000_000
+        );
     }
 
     #[test]

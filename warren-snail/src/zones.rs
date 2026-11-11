@@ -193,10 +193,28 @@ pub(crate) enum Session {
 
 std::thread_local! {
     static SESSION: std::cell::RefCell<Option<Session>> = const { std::cell::RefCell::new(None) };
+    /// Whether a statement reads its zone's own abbreviations before PostgreSQL's set, as
+    /// PostgreSQL does from 18 on.
+    static ZONE_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-/// The zone a statement reads under, held while it runs; the one before it put back after.
-pub(crate) struct InZone(Option<Session>);
+/// The zone a statement reads under, held while it runs; the one before it put back after, and
+/// how it read abbreviations, where it says.
+pub(crate) struct InZone(Option<Session>, Option<bool>);
+
+impl InZone {
+    /// The zone held for a statement of release `release`, whose own abbreviations are read before
+    /// PostgreSQL's set from 18 on.
+    pub(crate) fn of_release(mut self, release: u8) -> InZone {
+        self.1 = Some(ZONE_FIRST.with(|f| f.replace(release >= 18)));
+        self
+    }
+}
+
+/// Whether the statement reads its zone's own abbreviations before PostgreSQL's set.
+pub(crate) fn zone_abbreviations_first() -> bool {
+    ZONE_FIRST.with(|f| f.get())
+}
 
 /// Holds the zone a session's TimeZone names, as SHOW writes it, for a statement: UTC where none.
 pub(crate) fn in_zone(name: Option<&str>) -> InZone {
@@ -210,12 +228,15 @@ pub(crate) fn in_zone(name: Option<&str>) -> InZone {
 
 /// Holds a zone a statement reads under on a thread it runs a part of on.
 pub(crate) fn handed(session: Option<Session>) -> InZone {
-    InZone(SESSION.with(|s| s.replace(session)))
+    InZone(SESSION.with(|s| s.replace(session)), None)
 }
 
 impl Drop for InZone {
     fn drop(&mut self) {
         SESSION.with(|s| *s.borrow_mut() = self.0.take());
+        if let Some(first) = self.1 {
+            ZONE_FIRST.with(|f| f.set(first));
+        }
     }
 }
 
@@ -279,6 +300,110 @@ fn abbrev_at(name: &str, utc: i64) -> Result<String> {
     {
         let _ = utc;
         fixed(name).map(|(_, a)| a).ok_or_else(|| refused(name))
+    }
+}
+
+/// A zone that never changes, as its one local time type and abbreviation.
+fn fixed_state(east: i32, abbrev: &str) -> State {
+    let mut chars = abbrev.as_bytes().to_vec();
+    chars.extend([0, 0]);
+    State {
+        ttis: vec![Ttinfo::new(i64::from(east), false, 0)],
+        chars,
+        ..State::default()
+    }
+}
+
+/// Zone `name`'s rules, as `f` reads them: its file's under the feature `zones`; without it, those
+/// of a name that needs no file alone.
+fn with_state<T>(name: &str, f: impl FnOnce(&State) -> T) -> Result<T> {
+    #[cfg(feature = "zones")]
+    {
+        let zone = read::zone(name)?;
+        Ok(f(&zone.state))
+    }
+    #[cfg(not(feature = "zones"))]
+    {
+        match fixed(name) {
+            Some((east, abbrev)) => Ok(f(&fixed_state(east, &abbrev))),
+            None => Err(refused(name)),
+        }
+    }
+}
+
+/// The statement zone's rules, as `f` reads them: UTC's where it reads under UTC.
+fn with_session_state<T>(f: impl FnOnce(&State) -> T) -> Result<T> {
+    match session() {
+        None => Ok(f(&fixed_state(0, "UTC"))),
+        Some(Session::Fixed(east, abbrev)) => Ok(f(&fixed_state(east, &abbrev))),
+        Some(Session::Named(n)) => with_state(&n, f),
+    }
+}
+
+/// Whether the statement's zone gives the abbreviation `abbrev`, in upper case, to any of its local
+/// time types, and where all give it one meaning, that meaning: its offset east of UTC and whether
+/// it is daylight time (PostgreSQL's pg_timezone_abbrev_is_known); none where it gives it none.
+pub(crate) fn session_abbrev_known(abbrev: &str) -> Result<Option<Option<(i32, bool)>>> {
+    with_session_state(|st| {
+        st.abbrev_known(abbrev.as_bytes())
+            .map(|m| m.map(|(east, dst)| (east as i32, dst)))
+    })
+}
+
+/// Whether zone `name` keeps daylight time at the instant `utc` seconds after 1970-01-01 00:00 UTC.
+pub(crate) fn dst_at(name: &str, utc: i64) -> Result<bool> {
+    with_state(name, |st| st.type_at(utc).is_some_and(|(i, _)| st.ttis[i].isdst))
+}
+
+/// The statement zone's name, where it is a zone read by its rules.
+pub(crate) fn session_named() -> Option<String> {
+    match session() {
+        Some(Session::Named(n)) => Some(n),
+        _ => None,
+    }
+}
+
+/// The meaning zone `name` gives the abbreviation `abbrev`, in upper case, at the instant `utc`
+/// seconds after 1970-01-01 00:00 UTC (PostgreSQL's pg_interpret_timezone_abbrev); none where it
+/// gives it none.
+pub(crate) fn abbrev_meaning(name: &str, abbrev: &str, utc: i64) -> Result<Option<(i32, bool)>> {
+    with_state(name, |st| {
+        st.abbrev_meaning(abbrev.as_bytes(), utc)
+            .map(|(east, dst)| (east as i32, dst))
+    })
+}
+
+/// Each abbreviation of letters alone the statement's zone gives, with its meaning at the instant
+/// `utc`, in the order its list holds them (PostgreSQL's pg_timezone_abbrevs_zone).
+pub(crate) fn session_abbrevs_at(utc: i64) -> Result<Vec<(String, i32, bool)>> {
+    with_session_state(|st| {
+        st.abbrevs()
+            .into_iter()
+            .filter(|a| a.bytes().all(|b| b.is_ascii_uppercase()))
+            .filter_map(|a| {
+                let (east, dst) = st.abbrev_meaning(a.as_bytes(), utc)?;
+                Some((a, east as i32, dst))
+            })
+            .collect()
+    })
+}
+
+/// Every zone the directory holds as PostgreSQL's pg_tzenumerate walks it, each with its
+/// abbreviation, offset east of UTC and daylight time at the instant `utc`: a file read as a zone,
+/// by its path below the directory, one keeping leap seconds or of an abbreviation past 31 bytes
+/// left out. Read only under the feature `zones`.
+pub(crate) fn every_zone_at(utc: i64) -> Result<Vec<(String, String, i32, bool)>> {
+    #[cfg(feature = "zones")]
+    {
+        read::every_zone_at(utc)
+    }
+    #[cfg(not(feature = "zones"))]
+    {
+        let _ = utc;
+        Err(Error::new(
+            "pg_timezone_names lists the zones compiled beside a server, read only under the \
+             feature zones",
+        ))
     }
 }
 
@@ -760,6 +885,68 @@ impl State {
         Some(String::from_utf8_lossy(cstr(&self.chars, self.ttis[i].desigidx)).into_owned())
     }
 
+    /// The abbreviations the zone lists, in its list's order.
+    fn abbrevs(&self) -> Vec<String> {
+        let count = self.chars.len().saturating_sub(1);
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < count {
+            let a = cstr(&self.chars, at);
+            out.push(String::from_utf8_lossy(a).into_owned());
+            at += a.len() + 1;
+        }
+        out
+    }
+
+    /// Where the zone's list holds the abbreviation `abbrev`.
+    fn abbrev_index(&self, abbrev: &[u8]) -> Option<usize> {
+        let count = self.chars.len().saturating_sub(1);
+        let mut at = 0;
+        while at < count {
+            let a = cstr(&self.chars, at);
+            if a == abbrev {
+                return Some(at);
+            }
+            at += a.len() + 1;
+        }
+        None
+    }
+
+    /// Whether a local time type gives the abbreviation `abbrev`, and where every one giving it
+    /// gives it the same offset and daylight time, those.
+    fn abbrev_known(&self, abbrev: &[u8]) -> Option<Option<(i64, bool)>> {
+        let at = self.abbrev_index(abbrev)?;
+        let mut found = None;
+        for t in self.ttis.iter().filter(|t| t.desigidx == at) {
+            match found {
+                None => found = Some((t.utoff, t.isdst)),
+                Some(m) if m != (t.utoff, t.isdst) => return Some(None),
+                Some(_) => {}
+            }
+        }
+        found.map(Some)
+    }
+
+    /// The offset and daylight time the abbreviation `abbrev` means at the instant `t`: the last
+    /// type giving it before `t`, else the type of a time before the first transition, else the
+    /// first giving it after `t`.
+    fn abbrev_meaning(&self, abbrev: &[u8], t: i64) -> Option<(i64, bool)> {
+        let at = self.abbrev_index(abbrev)?;
+        let of = |i: usize| {
+            self.ttis
+                .get(i)
+                .filter(|x| x.desigidx == at)
+                .map(|x| (x.utoff, x.isdst))
+        };
+        let cutoff = self.ats.partition_point(|&a| a <= t);
+        let types = |r: std::ops::Range<usize>| r.map(|i| self.types[i] as usize);
+        types(0..cutoff)
+            .rev()
+            .find_map(of)
+            .or_else(|| of(self.defaulttype))
+            .or_else(|| types(cutoff..self.ats.len()).find_map(of))
+    }
+
     /// The local time type in force at the instant `t`, and the instant it was read at: `t`, or a
     /// time 400 years apart inside the transitions where `t` lies far outside them.
     fn type_at(&self, t: i64) -> Option<(usize, i64)> {
@@ -973,6 +1160,70 @@ mod read {
     /// The zone's name as PostgreSQL's lookup finds it, case and all.
     pub fn canonical(name: &str) -> Result<String> {
         Ok(zone(name)?.canonical.clone())
+    }
+
+    /// Every zone the directory holds, walked as PostgreSQL's pg_tzenumerate walks it: each entry
+    /// in the order the directory gives it, a hidden one passed over, a directory entered where it
+    /// stands, a file read as a zone file or passed over; with each zone's abbreviation, offset and
+    /// daylight time at the instant `utc`.
+    pub(super) fn every_zone_at(utc: i64) -> Result<Vec<(String, String, i32, bool)>> {
+        let base = directory();
+        let mut out = Vec::new();
+        let mut stack = vec![std::fs::read_dir(&base).map_err(|e| {
+            Error::new(format!("could not open directory \"{}\": {e}", base.display()))
+        })?];
+        while let Some(dir) = stack.last_mut() {
+            let Some(entry) = dir.next() else {
+                stack.pop();
+                continue;
+            };
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                if stack.len() >= 10 {
+                    return Err(Error::new("timezone directory stack overflow"));
+                }
+                stack.push(std::fs::read_dir(&path).map_err(|e| {
+                    Error::new(format!("could not open directory \"{}\": {e}", path.display()))
+                })?);
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(state) = load_file(&bytes[..bytes.len().min(FILE_BYTES)]) else {
+                continue;
+            };
+            // PostgreSQL's pg_tz_acceptable: midnight UTC of 2000-01-01 on a whole minute.
+            let t2000 = 946_684_800;
+            if state
+                .utc_offset(t2000)
+                .is_none_or(|east| (t2000 + east).rem_euclid(60) != 0)
+            {
+                continue;
+            }
+            let Some((i, at)) = state.type_at(utc) else {
+                continue;
+            };
+            let tt = state.ttis[i];
+            let abbrev = String::from_utf8_lossy(cstr(&state.chars, tt.desigidx)).into_owned();
+            if abbrev.len() > 31 {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&base)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let east = tt.utoff - state.leapcorr(at);
+            out.push((rel, abbrev, east as i32, tt.isdst));
+        }
+        Ok(out)
     }
 
     /// The zone `name` names, read once for each directory and kept.

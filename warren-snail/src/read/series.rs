@@ -254,13 +254,19 @@ fn resolved(given: &[(Value, bool)]) -> Result<ColumnType> {
     form.ok_or_else(|| super::typed::no_form("generate_series", &types))
 }
 
-/// The zone a call names, as PostgreSQL's lookup_timezone reads it: an abbreviation first, then a
-/// zone's name; refused where it names none. None for UTC.
+/// The zone a call names, as PostgreSQL's lookup_timezone reads it: an abbreviation first, of a
+/// fixed offset or of the zone whose rules it names, then a zone's name; refused where it names
+/// none. None for UTC.
 fn zone_named(name: &str) -> Result<Option<crate::zones::Session>> {
-    if let Some(east) = crate::times::zone_abbreviation(name)? {
-        let fixed = crate::zones::Session::Fixed(east, name.to_uppercase());
-        return Ok((east != 0).then_some(fixed));
-    }
+    let name = match crate::times::zone_abbreviation(name)? {
+        Some(crate::times::Abbreviated::Fixed(east, _)) => {
+            let fixed = crate::zones::Session::Fixed(east, name.to_uppercase());
+            return Ok((east != 0).then_some(fixed));
+        }
+        Some(crate::times::Abbreviated::Zone(zone)) => zone,
+        None => name.to_string(),
+    };
+    let name = name.as_str();
     let Some(zone) = crate::zones::set_name(name)? else {
         return Err(Error::new(format!("time zone \"{name}\" not recognized")));
     };

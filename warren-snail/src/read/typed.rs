@@ -864,8 +864,19 @@ impl Typing<'_> {
                 if let Some(t) = numbers(&name, &types)? {
                     return Ok(t);
                 }
-                // generate_series names its zone from 16 on.
+                // generate_series names its zone from 16 on; the abbreviations' function is
+                // pg_timezone_abbrevs before 18, and from 18 on the set's and the zone's apart.
                 if name == "generate_series" && types.len() == 4 && self.release < 16 {
+                    return Err(no_form(&name, &types));
+                }
+                let abbreviations = match name.as_str() {
+                    "pg_timezone_abbrevs" => Some(self.release < 18),
+                    "pg_timezone_abbrevs_abbrevs" | "pg_timezone_abbrevs_zone" => {
+                        Some(self.release >= 18)
+                    }
+                    _ => None,
+                };
+                if abbreviations == Some(false) {
                     return Err(no_form(&name, &types));
                 }
                 if let Some(t) = time(&name, &types)? {
@@ -1325,6 +1336,10 @@ pub(super) fn time(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Opt
             [],
         ) => C::Timestamptz,
         ("timeofday", []) => C::Text(None),
+        ("pg_timezone_names", []) => super::clock::zones_record(true),
+        ("pg_timezone_abbrevs" | "pg_timezone_abbrevs_abbrevs" | "pg_timezone_abbrevs_zone", []) => {
+            super::clock::zones_record(false)
+        }
         ("current_date", []) => C::Date,
         ("localtimestamp", []) => C::Timestamp(None),
         ("current_time", []) => C::Timetz(None),

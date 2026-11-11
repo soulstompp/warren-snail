@@ -1314,7 +1314,7 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
 }
 
 /// The set-returning functions a step's select list reads.
-const SET_RETURNING: [&str; 13] = [
+const SET_RETURNING: [&str; 18] = [
     "unnest",
     "generate_series",
     "pg_prepared_statement",
@@ -1328,6 +1328,11 @@ const SET_RETURNING: [&str; 13] = [
     "pg_get_keywords",
     "regexp_matches",
     "regexp_split_to_table",
+    "string_to_table",
+    "pg_timezone_names",
+    "pg_timezone_abbrevs_abbrevs",
+    "pg_timezone_abbrevs_zone",
+    "pg_timezone_abbrevs",
 ];
 
 /// Whether a name is a set-returning function a step's select list reads.
@@ -6115,6 +6120,9 @@ fn set_values(c: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
     if let Some(v) = super::populate::sets(&name, &values, frame.type_of(c))? {
         return Ok(v);
     }
+    if let Some(v) = super::clock::zone_sets(&name, frame.now)? {
+        return Ok(v);
+    }
     let casing = match super::calls::is_regexp_function(&name) {
         true => regex_casing(frame, c, &values.iter().map(|(v, _)| v).collect::<Vec<_>>())?,
         false => string_casing(frame, c, &name, &[])?,
@@ -6137,6 +6145,25 @@ pub(super) fn call_rows(c: &Expr, row: &[Value], frame: &Frame) -> Result<Vec<Va
         Expr::Function(f) if gives_a_row(f) => Ok(vec![eval(c, row, frame, &computed_none())?]),
         _ => set_values(c, row, frame, &computed_none()),
     }
+}
+
+/// The values a function of a record of no type of its own gives in FROM for one row of the
+/// relations before it, each a record of the type its column definition list makes.
+pub(super) fn defined_rows(
+    c: &Expr,
+    row: &[Value],
+    frame: &Frame,
+    record: ColumnType,
+) -> Result<Vec<Value>> {
+    let Expr::Function(f) = c else {
+        return Err(Error::new(format!("{c} is not read")));
+    };
+    let none = computed_none();
+    let given = args(f)?
+        .iter()
+        .map(|x| Ok((eval(x, row, frame, &none)?, quoted(x))))
+        .collect::<Result<Vec<_>>>()?;
+    super::populate::defined(&function_name(f), &given, record)
 }
 
 /// The values a generate_series in FROM gives for one row of the relations before it, made one at

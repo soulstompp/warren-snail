@@ -79,7 +79,10 @@ Under PostgreSQL's notice (src/ of this crate, from the sources named under Post
   read/serial.rs                    storage/lmgr/predicate.c: the test of two in a row, and its words
   zones.rs                          timezone/localtime.c, whose own header says it is in the public
                                     domain; how PostgreSQL's pgtz.c finds a zone's file by its name
-  ddl.rs, catalog.rs                what PostgreSQL's parser/parse_utilcmd.c, commands/tablecmds.c,
+                                    and walks their directory
+  abbrevs.txt                       the zone abbreviations PostgreSQL sets by default,
+                                    timezone/tznames/Default, held as a list
+  ddl.rs, catalog.rs               what PostgreSQL's parser/parse_utilcmd.c, commands/tablecmds.c,
                                     and the commands beside them accept and refuse, in their words
   regs.txt, regs.rs, functions.txt, the built-in objects of PostgreSQL 14 to 19, drawn from each
   functions.rs, operators.txt,      release's catalog (include/catalog/*.dat), and its keywords

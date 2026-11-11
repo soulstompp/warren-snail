@@ -389,6 +389,22 @@ pub(super) fn sets(name: &str, args: &[(Value, bool)]) -> Result<Option<Vec<Valu
     let int = |x: i32| Item::Scalar(Datum::Int(i64::from(x)));
     let row = |items: Vec<Item>| composed(record(name), Item::Record(items));
     let named = |i: usize| args[i].0.text().unwrap_or_default();
+    // A parser by its OID, an integer or an oid: the one parser, `default`, is 3722.
+    let parser = || -> Result<String> {
+        let oid = match &args[0].0 {
+            Value::Int(n) => Some(*n as u32),
+            Value::Scalar(ColumnType::Oid, k) => Some(crate::scalars::unsigned_of(*k, 32) as u32),
+            _ => None,
+        };
+        match oid {
+            Some(3722) => Ok("default".into()),
+            Some(o) => Err(Error::coded(
+                "XX000",
+                format!("cache lookup failed for text search parser {o}"),
+            )),
+            None => Ok(named(0)),
+        }
+    };
     Ok(Some(match (name, args.len()) {
         ("unnest", 1) => {
             let v = held(&args[0].0, args[0].1, Textual::Tsvector)?;
@@ -410,11 +426,11 @@ pub(super) fn sets(name: &str, args: &[(Value, bool)]) -> Result<Option<Vec<Valu
                 })
                 .collect()
         }
-        ("ts_parse", 2) => ts::ts_parse(&named(0), &named(1))?
+        ("ts_parse", 2) => ts::ts_parse(&parser()?, &named(1))?
             .into_iter()
             .map(|(id, token)| row(vec![int(id), text(token)]))
             .collect(),
-        ("ts_token_type", 1) => ts::ts_token_type(&named(0))?
+        ("ts_token_type", 1) => ts::ts_token_type(&parser()?)?
             .into_iter()
             .map(|(id, alias, description)| row(vec![int(id), text(alias), text(description)]))
             .collect(),

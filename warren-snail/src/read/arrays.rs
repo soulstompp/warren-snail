@@ -71,6 +71,7 @@ pub(super) fn typed(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Op
     let no_form = || Err(super::typed::no_form(name, args));
     Ok(Some(match name {
         "string_to_array" | "parse_ident" => text_array,
+        "string_to_table" if (2..=3).contains(&args.len()) => Some(ColumnType::Text(None)),
         "oidvectortypes" if args.len() == 1 => Some(ColumnType::Text(None)),
         "acldefault" => Some(aclitem_array()),
         "aclexplode" | "pg_options_to_table" => record(name),
@@ -427,6 +428,20 @@ pub(super) fn sets(name: &str, args: &[Value]) -> Result<Option<Vec<Value>>> {
             .collect()
     };
     Ok(Some(match (name, args) {
+        // string_to_array's elements, one a row; none of a NULL string.
+        ("string_to_table", [s, d]) | ("string_to_table", [s, d, _]) => {
+            let Some(s) = text(s) else {
+                return Ok(Some(Vec::new()));
+            };
+            let null = args.get(2).and_then(text);
+            match crate::arrays::string_to_array(&s, text(d).as_deref(), null.as_deref()) {
+                Item::Array { elements, .. } => elements
+                    .iter()
+                    .map(|e| super::pipeline::part_value(ColumnType::Text(None), e))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
         ("generate_subscripts", [a, d]) | ("generate_subscripts", [a, d, _]) => {
             let Some((_, _, item)) = array_arg(name, a)? else {
                 return Ok(Some(Vec::new()));

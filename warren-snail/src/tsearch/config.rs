@@ -140,11 +140,13 @@ pub(crate) fn dict_of(name: &str) -> Result<Dict> {
     }
 }
 
-/// The parser by its name: `default`, in `pg_catalog`.
+/// The parser by its name: `default`, in `pg_catalog`, the only one a database has.
 fn parser_of(name: &str) -> Result<()> {
     match object_name(name).as_deref() {
         Some("default") => Ok(()),
-        _ => Err(not_read("parser", name)),
+        _ => Err(Error::new(format!(
+            "text search parser \"{name}\" does not exist"
+        ))),
     }
 }
 
