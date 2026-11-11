@@ -1,9 +1,10 @@
 //! A step's subqueries: a scalar subquery, EXISTS, and IN, ANY or ALL over a subquery, in its select
-//! list, WHERE, HAVING, GROUP BY or ORDER BY. One that reads nothing of the query around it is a step
-//! run once, the first time a row asks for it. One that reads that query is answered for each set of
-//! values a row gives what it names, its tables read from the file once, its FROM's rows kept where
-//! they read nothing of the query around it, and met with each row by the =s of its WHERE that tie
-//! a column of its own to that query; where none ties them, every kept row is read for each.
+//! list, WHERE, HAVING, GROUP BY, ORDER BY or a join's ON. One that reads nothing of the query
+//! around it is a step run once, the first time a row asks for it. One that reads that query is
+//! answered for each set of values a row gives what it names, its tables read from the file once,
+//! its FROM's rows kept where they read nothing of the query around it, and met with each row by the
+//! =s of its WHERE that tie a column of its own to that query; where none ties them, every kept row
+//! is read for each. An ON's are answered for each pair of rows its join meets.
 
 use super::pipeline::{self, Casings, Computed, Frame, Key, Value};
 use super::question::Question;
@@ -263,7 +264,8 @@ struct Plan<'q> {
     first: Option<ColumnType>,
     /// Where it reads the query around it: the places of that query's columns its words name.
     around: Option<Vec<usize>>,
-    /// Of those, the ones it cannot be read without, where it is read on each group.
+    /// Of those, the ones it cannot be read without, where it is read on each group or stands in a
+    /// FULL JOIN's ON.
     reads_around: Vec<usize>,
     /// What it returned: once, where it reads nothing of the query around it; else for each set of
     /// values of what it names.
@@ -332,7 +334,7 @@ impl<'q> Plans<'q> {
             .map(|e| (e, true))
             .chain(before.into_iter().map(|e| (e, false)));
         for (e, grouped) in found {
-            let plan = Plan::of(asked, e, columns, made, casings, grouped)?;
+            let plan = Plan::of(asked, e, columns, made, casings, grouped, None)?;
             if let (Asks::Scalar, Some(t)) = (&plan.asks, plan.first) {
                 seeded.insert(e as *const Expr, t);
             }
@@ -342,13 +344,48 @@ impl<'q> Plans<'q> {
         Ok((plans, seeded))
     }
 
+    /// Each subquery a join's ON holds outside any other, read as a WHERE's are, over `columns`: the
+    /// join's two sides', then the query's around the step. Its refusals name the ON, and the
+    /// relations `unseen` of the FROM it cannot reference. Where `sided`, each is read again with one
+    /// column hidden at a time, so the columns it cannot be read without are known.
+    pub(super) fn of_on(
+        asked: Asked,
+        on: &'q Expr,
+        columns: &[Col],
+        made: &Steps,
+        casings: &Casings,
+        sided: bool,
+        unseen: &[String],
+    ) -> Result<(Plans<'q>, Types)> {
+        let mut found = Vec::new();
+        pipeline::subqueries_in(on, &mut found);
+        let mut plans = Plans::default();
+        let mut seeded = Types::new();
+        for e in found {
+            let plan = Plan::of(asked, e, columns, made, casings, sided, Some(unseen))?;
+            if let (Asks::Scalar, Some(t)) = (&plan.asks, plan.first) {
+                seeded.insert(e as *const Expr, t);
+            }
+            plans.plans.insert(e as *const Expr, plan);
+        }
+        Ok((plans, seeded))
+    }
+
     /// The columns of the step its subqueries read on each group, where it groups.
     pub(super) fn around(&self) -> &[usize] {
         &self.around
     }
+
+    /// The places of the columns a subquery cannot be read without, where it was read so.
+    pub(super) fn read_by(&self, e: &Expr) -> &[usize] {
+        self.plans
+            .get(&(e as *const Expr))
+            .map_or(&[], |p| p.reads_around.as_slice())
+    }
 }
 
 impl<'q> Plan<'q> {
+    /// Where `on` holds the relations it cannot reference, it stands in a join's ON.
     fn of(
         asked: Asked,
         e: &'q Expr,
@@ -356,6 +393,7 @@ impl<'q> Plan<'q> {
         made: &Steps,
         casings: &Casings,
         grouped: bool,
+        on: Option<&[String]>,
     ) -> Result<Plan<'q>> {
         let arity = |x: &Expr| match x {
             Expr::Tuple(xs) => xs.len(),
@@ -426,6 +464,8 @@ impl<'q> Plan<'q> {
                 values: vec![Value::Null; columns.len()],
                 columns,
                 kept: &kept,
+                clause: on.map(|_| "JOIN conditions"),
+                unseen: on.map(<[String]>::to_vec).unwrap_or_default(),
             };
             relations::made_by(
                 probe,
@@ -445,7 +485,8 @@ impl<'q> Plan<'q> {
                 let named: Vec<usize> = (0..columns.len())
                     .filter(|&i| ws.contains(&columns[i].name))
                     .collect();
-                // Where it is read on each group, the columns it cannot be read without.
+                // Where it is read on each group, or stands in a FULL JOIN's ON, the columns it
+                // cannot be read without.
                 let reads: Vec<usize> = match grouped {
                     true => named
                         .iter()
@@ -632,6 +673,8 @@ impl<'a, 'q> Subs<'a, 'q> {
                 .collect(),
             values,
             kept: &plan.kept,
+            clause: None,
+            unseen: Vec::new(),
         };
         let cached = Cached {
             reads: self.asked.reads,

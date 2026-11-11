@@ -300,6 +300,12 @@ pub(super) struct Outer<'o> {
     pub(super) columns: Vec<Col>,
     pub(super) values: Vec<Value>,
     pub(super) kept: &'o super::subqueries::Kept,
+    /// The clause of the query around it that it stands in, where a refusal of an aggregate of that
+    /// query names it: a join's ON.
+    pub(super) clause: Option<&'static str>,
+    /// The relations of that query's FROM it cannot reference: those laid before the join whose ON
+    /// it stands in, and outside it.
+    pub(super) unseen: Vec<String>,
 }
 
 /// A column of a query, marked as one of the query around a subquery.
@@ -1215,6 +1221,8 @@ struct From {
     refused: HashMap<usize, String>,
     /// The relations inside its joins named by an alias, which the alias hides.
     hidden: Vec<(String, Option<String>)>,
+    /// The relations of the query around it it cannot reference, where it stands in a join's ON.
+    unseen: Vec<String>,
 }
 
 impl From {
@@ -1222,7 +1230,8 @@ impl From {
     /// an invalid reference where it names a relation its alias hides (a table by its schema and
     /// name, or by its name alone where the search path finds it; a WITH query by its name), or a
     /// subquery written without an alias, here or in a query around it, or a relation inside a join
-    /// its alias hides, each of these two with the entry it found; else a missing entry.
+    /// its alias hides, or one of the query around it laid before the join whose ON holds it, each
+    /// of these three with the entry it found; else a missing entry.
     fn no_entry(&self, catalog: &Catalog, q: &str) -> Error {
         let relation = q.rsplit('.').next().unwrap_or(q);
         let entry = |name: &str| {
@@ -1268,6 +1277,7 @@ impl From {
         });
         match inside {
             Some((name, _)) => entry(name),
+            None if self.unseen.iter().any(|u| u == relation) => entry(relation),
             None => Error::new(format!(
                 "missing FROM-clause entry for table \"{relation}\""
             )),
@@ -1594,6 +1604,8 @@ impl Laying<'_> {
             values: vec![Value::Null; columns.len()],
             columns,
             kept: &kept,
+            clause: None,
+            unseen: Vec::new(),
         };
         let empty = Empty(self.catalog);
         let asked = Asked {
@@ -1699,44 +1711,6 @@ impl Laying<'_> {
         Ok(node)
     }
 
-    /// Whether a FULL JOIN's ON is one PostgreSQL meets the rows by: true, or holding an = between
-    /// an expression of the left side's columns alone and one of the right side's.
-    fn hashable(&self, left: &Node, right: &Node, on: &Expr) -> bool {
-        if matches!(on, Expr::Value(v) if v.value == sqlparser::ast::Value::Boolean(true)) {
-            return true;
-        }
-        let side = |e: &Expr| -> Option<bool> {
-            let mut read = Vec::new();
-            pipeline::columns_read(e, &mut read);
-            let mut sides = read.iter().map(|(q, n)| {
-                match pipeline::naming(
-                    self.columns[left.at..right.at + right.width]
-                        .iter()
-                        .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
-                    q.as_deref(),
-                    n,
-                )
-                .as_slice()
-                {
-                    [i] => Some(*i < left.width),
-                    _ => None,
-                }
-            });
-            let first = sides.next()??;
-            sides.all(|s| s == Some(first)).then_some(first)
-        };
-        let mut cs = Vec::new();
-        conjuncts(on, &mut cs);
-        cs.into_iter().any(|c| match c {
-            Expr::BinaryOp {
-                left: a,
-                op: BinaryOperator::Eq,
-                right: b,
-            } => matches!((side(a), side(b)), (Some(x), Some(y)) if x != y),
-            _ => false,
-        })
-    }
-
     /// The names a bare reference finds in a node's columns, each once, in order.
     fn visible(&self, n: &Node) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -1783,12 +1757,12 @@ impl Laying<'_> {
         using: &[String],
     ) -> Result<Node> {
         let at = left.at;
+        // An ON holding a subquery is checked once its subqueries are read.
         if let (Kind::Full, Some(e)) = (kind, &on) {
-            if !self.hashable(&left, &right, e) {
-                return Err(Error::new(
-                    "FULL JOIN is only supported with merge-joinable or hash-joinable join \
-                     conditions",
-                ));
+            let mut found = Vec::new();
+            pipeline::subqueries_in(e, &mut found);
+            if found.is_empty() && !hashable(&self.columns, &left, &right, e, &|_| &[]) {
+                return Err(Error::new(FULL_UNMET));
             }
         }
         let mut merged = Vec::new();
@@ -1852,6 +1826,70 @@ impl Laying<'_> {
             star,
         })
     }
+}
+
+/// PostgreSQL's refusal of a FULL JOIN whose ON it cannot meet the rows by.
+const FULL_UNMET: &str =
+    "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions";
+
+/// Whether a FULL JOIN's ON is one PostgreSQL meets the rows by: true, or holding an = between
+/// an expression of the left side's columns alone and one of the right side's. A subquery stands on
+/// the side of each column `read_by` gives it, the places among the two sides' of those it cannot
+/// be read without; one reading neither side stands on none.
+fn hashable<'p>(
+    columns: &[Col],
+    left: &Node,
+    right: &Node,
+    on: &Expr,
+    read_by: &dyn Fn(&Expr) -> &'p [usize],
+) -> bool {
+    if matches!(on, Expr::Value(v) if v.value == sqlparser::ast::Value::Boolean(true)) {
+        return true;
+    }
+    let both = left.width + right.width;
+    let side = |e: &Expr| -> Option<bool> {
+        let mut read = Vec::new();
+        pipeline::columns_read(e, &mut read);
+        let mut sides: Vec<Option<bool>> = read
+            .iter()
+            .map(|(q, n)| {
+                match pipeline::naming(
+                    columns[left.at..right.at + right.width]
+                        .iter()
+                        .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+                    q.as_deref(),
+                    n,
+                )
+                .as_slice()
+                {
+                    [i] => Some(*i < left.width),
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut subqueries = Vec::new();
+        pipeline::subqueries_in(e, &mut subqueries);
+        for s in subqueries {
+            sides.extend(
+                read_by(s)
+                    .iter()
+                    .filter(|&&i| i < both)
+                    .map(|&i| Some(i < left.width)),
+            );
+        }
+        let first = (*sides.first()?)?;
+        sides.iter().all(|s| *s == Some(first)).then_some(first)
+    };
+    let mut cs = Vec::new();
+    conjuncts(on, &mut cs);
+    cs.into_iter().any(|c| match c {
+        Expr::BinaryOp {
+            left: a,
+            op: BinaryOperator::Eq,
+            right: b,
+        } => matches!((side(a), side(b)), (Some(x), Some(y)) if x != y),
+        _ => false,
+    })
 }
 
 /// The fields of a record type, each with its type.
@@ -2099,6 +2137,9 @@ pub(super) fn parsed(
 /// where they keep it.
 type Each<'e> = &'e mut dyn FnMut(Vec<Vec<Value>>, Option<usize>) -> Result<()>;
 
+/// What answers the subqueries of a join's ON, by the join's node.
+type Ons<'a> = HashMap<*const Node, &'a dyn pipeline::Subqueries>;
+
 /// A step's FROM read into its rows, as the round reads the tables in it.
 struct Reading<'a> {
     reads: &'a dyn Reads,
@@ -2108,6 +2149,8 @@ struct Reading<'a> {
     /// The conjuncts of its WHERE, which a table read alone or a join read as C1's takes where it
     /// reads them.
     wheres: Vec<&'a Expr>,
+    /// What answers the subqueries of each join's ON holding any.
+    ons: &'a Ons<'a>,
     params: &'a [String],
     release: u8,
     casings: &'a Casings,
@@ -2886,6 +2929,8 @@ impl Reading<'_> {
             columns,
             values,
             kept,
+            clause: None,
+            unseen: Vec::new(),
         };
         let cached = super::subqueries::Cached {
             reads: self.asked.reads,
@@ -3994,6 +4039,7 @@ fn read_from(
     accrued: &Accrued,
     laterals: &[(Query, super::subqueries::Kept)],
     outer: Option<&Outer>,
+    ons: &Ons,
     kept: Vec<Keep>,
     rows_known: &std::cell::Cell<Option<u64>>,
     along: Option<(
@@ -4007,6 +4053,7 @@ fn read_from(
         from,
         named,
         wheres,
+        ons,
         params: asked.params,
         release: asked.release,
         casings,
@@ -4187,6 +4234,7 @@ fn select_step(
             outer_at: 0,
             refused: laying.refused,
             hidden: step.inside.hidden.clone(),
+            unseen: outer.map(|o| o.unseen.clone()).unwrap_or_default(),
         }
     };
     {
@@ -4211,11 +4259,12 @@ fn select_step(
         from.columns.extend(o.columns.iter().cloned());
     }
     let step = &*step;
-    let (plans, seeded) =
+    let (plans, mut seeded) =
         super::subqueries::Plans::of(asked, &step.query, &from.columns, made, casings)?;
     let typed = from.typed();
     let mut keyed: Vec<(String, Vec<String>)> = Vec::new();
     let mut joined: Vec<&Expr> = Vec::new();
+    let mut joins: Vec<&Node> = Vec::new();
     {
         let mut leaves = Vec::new();
         for n in &from.items {
@@ -4242,20 +4291,69 @@ fn select_step(
                 _ => {}
             }
         }
-        fn ons<'n>(n: &'n Node, out: &mut Vec<&'n Expr>) {
+        fn ons<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
             if let What::Join {
                 left, right, on, ..
             } = &n.what
             {
                 ons(left, out);
                 ons(right, out);
-                if let Some(e) = on {
-                    out.push(e);
+                if on.is_some() {
+                    out.push(n);
                 }
             }
         }
         for n in &from.items {
-            ons(n, &mut joined);
+            ons(n, &mut joins);
+        }
+        joined.extend(joins.iter().filter_map(|n| match &n.what {
+            What::Join { on, .. } => on.as_ref(),
+            _ => None,
+        }));
+    }
+    // Each join's ON holding a subquery: its subqueries read as the pairs it meets are, over the
+    // join's two sides and the query's around the step; a FULL JOIN's checked once they are.
+    let mut on_plans: Vec<(*const Node, Vec<Col>, super::subqueries::Plans)> = Vec::new();
+    {
+        let mut leaves = Vec::new();
+        for n in &from.items {
+            n.leaves(&mut leaves);
+        }
+        for n in &joins {
+            let What::Join {
+                left,
+                right,
+                kind,
+                on: Some(on),
+                ..
+            } = &n.what
+            else {
+                continue;
+            };
+            let mut found = Vec::new();
+            pipeline::subqueries_in(on, &mut found);
+            if found.is_empty() {
+                continue;
+            }
+            let columns: Vec<Col> = from.columns[n.at..n.at + left.width + right.width]
+                .iter()
+                .chain(&from.columns[from.outer_at..])
+                .cloned()
+                .collect();
+            let unseen: Vec<String> = leaves
+                .iter()
+                .filter(|l| l.at < n.at)
+                .filter_map(|l| l.leaf_named().map(str::to_string))
+                .collect();
+            let full = *kind == Kind::Full;
+            let (p, types) = super::subqueries::Plans::of_on(
+                asked, on, &columns, made, casings, full, &unseen,
+            )?;
+            if full && !hashable(&from.columns, left, right, on, &|e| p.read_by(e)) {
+                return Err(Error::new(FULL_UNMET));
+            }
+            seeded.extend(types);
+            on_plans.push((*n as *const Node, columns, p));
         }
     }
     // Each column of a table of the FROM of the domain its DDL gives it, for a row made of it.
@@ -4320,8 +4418,9 @@ fn select_step(
             n,
         )
     };
-    // An aggregate of the query's around a subquery alone is that query's.
-    if outer.is_some() {
+    // An aggregate of the query's around a subquery alone is that query's: refused in PostgreSQL's
+    // words where the subquery stands in a clause of that query no aggregate may stand in.
+    if let Some(o) = outer {
         for a in p.aggregates() {
             let mut read = Vec::new();
             pipeline::columns_read(a, &mut read);
@@ -4329,9 +4428,10 @@ fn select_step(
                 place(q, n).first().is_some_and(|&i| i >= from.outer_at)
             };
             if !read.is_empty() && read.iter().all(around) {
-                return Err(Error::new(format!(
-                    "{a} is not read: an aggregate of the query around a subquery"
-                )));
+                return Err(Error::new(match o.clause {
+                    Some(c) => format!("aggregate functions are not allowed in {c}"),
+                    None => format!("{a} is not read: an aggregate of the query around a subquery"),
+                }));
             }
         }
     }
@@ -4447,7 +4547,16 @@ fn select_step(
     }
     let run_types = p.types.clone();
     let windowed = !p.windows().is_empty();
-    let kept = outer.filter(|_| leaves.iter().all(|l| matches!(l.what, What::Table { .. })));
+    // A join's ON naming the query around it meets other pairs for each row that asks.
+    let on_around = joins.iter().any(|n| match &n.what {
+        What::Join { on: Some(e), .. } => words(&e.to_string())
+            .iter()
+            .any(|x| around.contains(&x.as_str())),
+        _ => false,
+    });
+    let kept = outer.filter(|_| {
+        !on_around && leaves.iter().all(|l| matches!(l.what, What::Table { .. }))
+    });
     let names: Vec<String> = from.columns.iter().map(|c| c.name.clone()).collect();
     let columns: Columns = from
         .columns
@@ -4470,6 +4579,19 @@ fn select_step(
         }
     };
     let subs = super::subqueries::Subs::new(&plans, asked, made, casings, &from.columns, accrued);
+    let on_subs: Vec<(*const Node, super::subqueries::Subs)> = on_plans
+        .iter()
+        .map(|(n, columns, p)| {
+            (
+                *n,
+                super::subqueries::Subs::new(p, asked, made, casings, columns, accrued),
+            )
+        })
+        .collect();
+    let ons: Ons = on_subs
+        .iter()
+        .map(|(n, s)| (*n, s as &dyn pipeline::Subqueries))
+        .collect();
     let mut run = pipeline::StepRun::new(p);
     run.hands_on = true;
     if !plans.is_empty() {
@@ -4551,6 +4673,7 @@ fn select_step(
                             accrued,
                             &step.laterals,
                             outer,
+                            &ons,
                             keeps.clone(),
                             &rows_known,
                             None,
@@ -4608,6 +4731,7 @@ fn select_step(
                     accrued,
                     &step.laterals,
                     outer,
+                    &ons,
                     keeps,
                     &rows_known,
                     along_wanted,
@@ -4627,6 +4751,7 @@ fn select_step(
                         accrued,
                         &step.laterals,
                         outer,
+                        &ons,
                         keeps,
                         &rows_known,
                         along_wanted,

@@ -163,6 +163,11 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("cannot cast type "), "42846"),
     (Words::Is("ON CONFLICT DO UPDATE command cannot affect row a second time"), "21000"),
     (Words::Is("more than one row returned by a subquery used as an expression"), "21000"),
+    (Words::Is("subquery must return only one column"), "42601"),
+    (
+        Words::Is("FULL JOIN is only supported with merge-joinable or hash-joinable join conditions"),
+        "0A000",
+    ),
     (Words::Starts("invalid input syntax for type date:"), "22007"),
     (Words::Starts("invalid input syntax for type time:"), "22007"),
     (Words::Starts("invalid input syntax for type time with time zone:"), "22007"),

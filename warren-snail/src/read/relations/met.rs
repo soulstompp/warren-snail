@@ -1,8 +1,9 @@
 //! Two relations met: each pair of their rows the ON holds of, or every pair; a row of the side an
-//! outer join keeps that meets none, beside NULLs; then the columns the USING merges. Where the ON
-//! compares a column of each side by =, a hash on one side's keys, the other's rows reading it a chunk
-//! at a time. Where neither side's rows are held whole, each side's are written into batches by a hash
-//! of their keys, and each batch met in turn.
+//! outer join keeps that meets none, beside NULLs; then the columns the USING merges. The ON reads a
+//! pair with the query's around the step after it, its subqueries answered for each pair. Where the
+//! ON compares a column of each side by =, a hash on one side's keys, the other's rows reading it a
+//! chunk at a time. Where neither side's rows are held whole, each side's are written into batches by
+//! a hash of their keys, and each batch met in turn.
 
 use super::{conjuncts, Kind, Merged, Node, Reading};
 use crate::read::pipeline::{self, parted, Key, Value};
@@ -18,11 +19,13 @@ enum Keyed<'e> {
     Expr(&'e Expr),
 }
 
-/// The keys a hash meets two sides' rows by: each pair the left side's and the right side's.
+/// The keys a hash meets two sides' rows by: each pair the left side's and the right side's. A
+/// side's row is read as a pair is, the values of the query around the step after it.
 struct JoinKeys<'f> {
     pairs: Vec<(Keyed<'f>, Keyed<'f>)>,
     lw: usize,
     rw: usize,
+    around: &'f [Value],
     frame: &'f pipeline::Frame<'f>,
 }
 
@@ -50,6 +53,7 @@ impl JoinKeys<'_> {
     fn left(&self, l: &[Value]) -> Result<Option<Vec<Key>>> {
         let mut pair = l.to_vec();
         pair.resize(self.lw + self.rw, Value::Null);
+        pair.extend_from_slice(self.around);
         self.key(&pair, false)
     }
 
@@ -57,6 +61,7 @@ impl JoinKeys<'_> {
     fn right(&self, r: &[Value]) -> Result<Option<Vec<Key>>> {
         let mut pair = vec![Value::Null; self.lw];
         pair.extend(r.iter().cloned());
+        pair.extend_from_slice(self.around);
         self.key(&pair, true)
     }
 
@@ -335,6 +340,33 @@ fn nested_loop(
     Ok(())
 }
 
+impl<'a> Reading<'a> {
+    /// What a join's ON reads a pair of rows by: the pair's columns, then the query's around the
+    /// step, where it is a subquery's; and what answers the subqueries it holds.
+    fn on_frame(&self, node: &Node, width: usize) -> pipeline::Frame<'a> {
+        let mut columns = self.from.frame_columns(node.at, width);
+        if self.outer.is_some() {
+            let at = self.from.outer_at;
+            columns.extend(self.from.frame_columns(at, self.from.columns.len() - at));
+        }
+        let ons: &'a super::Ons<'a> = self.ons;
+        pipeline::Frame {
+            columns,
+            params: self.params,
+            release: self.release,
+            casings: self.casings,
+            types: self.types,
+            now: self.now,
+            subqueries: ons.get(&(node as *const Node)).copied(),
+        }
+    }
+
+    /// The values of the query around the step a pair is read with, where it is a subquery's.
+    fn around(&self) -> &'a [Value] {
+        self.outer.map_or(&[], |o| o.values.as_slice())
+    }
+}
+
 impl Reading<'_> {
     /// Two relations met, the rows they make handed to `each` a chunk at a time. The right side's
     /// rows are made for each row of the left where it is lateral.
@@ -352,16 +384,8 @@ impl Reading<'_> {
         before: Option<(usize, &[Value])>,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<()> {
-        let frame_columns = self.from.frame_columns(node.at, left.width + right.width);
-        let frame = pipeline::Frame {
-            columns: frame_columns,
-            params: self.params,
-            release: self.release,
-            casings: self.casings,
-            types: self.types,
-            now: self.now,
-            subqueries: None,
-        };
+        let frame = self.on_frame(node, left.width + right.width);
+        let around = self.around();
         let none = pipeline::computed_none();
         // The pairs of places a USING meets, compared by =.
         let usings: Vec<(usize, usize)> = merged
@@ -376,8 +400,13 @@ impl Reading<'_> {
                 }
             }
             match on {
-                Some(e) => {
+                Some(e) if around.is_empty() => {
                     Ok(pipeline::holds(e, pair, &frame, &none)? == Some(true))
+                }
+                Some(e) => {
+                    let mut row = pair.to_vec();
+                    row.extend_from_slice(around);
+                    Ok(pipeline::holds(e, &row, &frame, &none)? == Some(true))
                 }
                 None => Ok(true),
             }
@@ -395,7 +424,7 @@ impl Reading<'_> {
         };
         let mut out = Chunk::new(each);
         match rrows {
-            Some(rrows) => match self.join_keys(left, on, &usings, &frame) {
+            Some(rrows) => match self.join_keys(left, right, on, &usings, &frame, around) {
                 Some(keys) => hash_join(&keys, &pairs, kind, &lrows, &rrows, &mut out)?,
                 None => nested_loop(&pairs, kind, &lrows, &rrows, &mut out)?,
             },
@@ -453,16 +482,8 @@ impl Reading<'_> {
         preserved: bool,
         each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<()> {
-        let frame_columns = self.from.frame_columns(node.at, left.width + right.width);
-        let frame = pipeline::Frame {
-            columns: frame_columns,
-            params: self.params,
-            release: self.release,
-            casings: self.casings,
-            types: self.types,
-            now: self.now,
-            subqueries: None,
-        };
+        let frame = self.on_frame(node, left.width + right.width);
+        let around = self.around();
         let none = pipeline::computed_none();
         let usings: Vec<(usize, usize)> = merged
             .iter()
@@ -476,8 +497,13 @@ impl Reading<'_> {
                 }
             }
             match on {
-                Some(e) => {
+                Some(e) if around.is_empty() => {
                     Ok(pipeline::holds(e, pair, &frame, &none)? == Some(true))
+                }
+                Some(e) => {
+                    let mut row = pair.to_vec();
+                    row.extend_from_slice(around);
+                    Ok(pipeline::holds(e, &row, &frame, &none)? == Some(true))
                 }
                 None => Ok(true),
             }
@@ -493,7 +519,7 @@ impl Reading<'_> {
             lw: left.width,
             width,
         };
-        let keys = self.join_keys(left, on, &usings, &frame);
+        let keys = self.join_keys(left, right, on, &usings, &frame, around);
         let keeps_left = kind == Kind::Left;
         let keep_left = matches!(kind, Kind::Inner | Kind::Cross | Kind::Left) && preserved;
         let mut out = Chunk::new(each);
@@ -547,11 +573,14 @@ impl Reading<'_> {
     fn join_keys<'f>(
         &self,
         left: &Node,
+        right: &Node,
         on: Option<&'f Expr>,
         usings: &[(usize, usize)],
         frame: &'f pipeline::Frame<'f>,
+        around: &'f [Value],
     ) -> Option<JoinKeys<'f>> {
-        let lw = left.width;
+        let (lw, rw) = (left.width, right.width);
+        // A column of the query around the step is neither side's.
         let side = |e: &Expr| -> Option<bool> {
             let (q, n) = pipeline::column_of(e)?;
             let found = pipeline::naming(
@@ -563,7 +592,7 @@ impl Reading<'_> {
                 &n,
             );
             match found.as_slice() {
-                [i] => Some(*i < lw),
+                [i] if *i < lw + rw => Some(*i < lw),
                 _ => None,
             }
         };
@@ -608,7 +637,8 @@ impl Reading<'_> {
         Some(JoinKeys {
             pairs,
             lw,
-            rw: frame.columns.len() - lw,
+            rw,
+            around,
             frame,
         })
     }

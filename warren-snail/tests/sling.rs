@@ -7,10 +7,13 @@
 //! read alone between a writer's texts committing nothing, as 18.6's commits nothing, the block it
 //! found wasted pruned by the writer's next commit that writes; an OR anywhere in a WHERE or an ON,
 //! two writers each reading its own rows by an OR of their keys both committing, as 18.6 commits them
-//! reading by its index; and a row value IN a list of rows, read as the OR of its rows' comparisons.
-//! Every answer and refusal is 18.6's over the same statements (`session.nu --suite sling`, and
-//! `sessions.nu --only serializable` for the writers; 18.6 with its index, through `dblink`, for
-//! the writers by an OR). A snail writes on its own only with `standalone`, as `tests/ddl.rs`.
+//! reading by its index; and a row value IN a list of rows, read as the OR of its rows' comparisons;
+//! and a subquery in a join's ON, correlated to either side or to the query around, a FULL JOIN on
+//! one side's subquery answered and any other refused, and an ON inside a subquery reading the query
+//! around it. Every answer and refusal is 18.6's over the same statements (`session.nu --suite
+//! sling`, and `sessions.nu --only serializable` for the writers; 18.6 with its index, through
+//! `dblink`, for the writers by an OR). A snail writes on its own only with `standalone`, as
+//! `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -931,4 +934,309 @@ fn a_row_in_a_list_of_keys_marks_each_key_as_its_or_does() {
         rows(&mut c, "SELECT a, b, v FROM s.r ORDER BY a, b"),
         ["1|x|2.00", "1|y|4.00", "2|x|3.00", "2|y|4.00"]
     );
+}
+
+const K6: &str = "CREATE SCHEMA k6;
+     CREATE TABLE k6.stated (acct varchar(9) NOT NULL, balance numeric(12,2), PRIMARY KEY (acct));
+     CREATE TABLE k6.tiers (lower numeric(12,2) NOT NULL, rate numeric(6,4) NOT NULL,
+         PRIMARY KEY (lower));
+     CREATE TABLE k6.owners (acct varchar(9) NOT NULL, owner varchar(8) NOT NULL, PRIMARY KEY (acct));
+     CREATE TABLE k6.caps (owner varchar(8) NOT NULL, cap numeric(12,2), PRIMARY KEY (owner));
+     CREATE VIEW k6.v AS SELECT s.acct, t.rate FROM k6.stated s JOIN k6.tiers t
+         ON t.lower = (SELECT max(u.lower) FROM k6.tiers u WHERE u.lower <= s.balance);";
+
+const K6_ROWS: [&str; 4] = [
+    "INSERT INTO k6.stated VALUES ('ACT-A-001', 60.00), ('ACT-A-002', 9999.00), \
+     ('ACT-B-001', 1.00), ('ACT-B-002', 50000.00), ('ACT-C-001', NULL), ('ACT-C-002', -5.00)",
+    "INSERT INTO k6.tiers VALUES (0.00, 0.0050), (10000.00, 0.0150), (100000.00, 0.0200)",
+    "INSERT INTO k6.owners VALUES ('ACT-A-001', 'ann'), ('ACT-A-002', 'ann'), ('ACT-B-001', 'bob'), \
+     ('ACT-B-002', 'bob'), ('ACT-C-001', 'cy')",
+    "INSERT INTO k6.caps VALUES ('ann', 5000.00), ('bob', NULL)",
+];
+
+/// The tier each account's balance reaches, by the greatest lower bound at or below it.
+const TIER: &str = "(SELECT max(u.lower) FROM k6.tiers u WHERE u.lower <= s.balance)";
+
+#[test]
+fn a_subquery_in_a_join_s_on_is_answered_as_postgresql_answers_it() {
+    let rated = ["ACT-A-001|0.0050", "ACT-A-002|0.0050", "ACT-B-001|0.0050", "ACT-B-002|0.0150"];
+    let lowest = ["ACT-A-001|0.00", "ACT-A-002|0.00", "ACT-B-001|0.00", "ACT-B-002|10000.00"];
+    let sql: Vec<String> = vec![
+        format!(
+            "SELECT s.acct, t.rate FROM k6.stated s JOIN k6.tiers t ON t.lower = {TIER} \
+             ORDER BY s.acct"
+        ),
+        format!(
+            "SELECT s.acct, t.rate FROM k6.stated s JOIN k6.tiers t ON {TIER} = t.lower \
+             ORDER BY s.acct"
+        ),
+        format!(
+            "SELECT s.acct, t.rate FROM k6.stated s LEFT JOIN k6.tiers t ON t.lower = {TIER} \
+             ORDER BY s.acct"
+        ),
+        format!(
+            "SELECT s.acct, t.lower FROM k6.stated s RIGHT JOIN k6.tiers t ON t.lower = {TIER} \
+             ORDER BY t.lower, s.acct"
+        ),
+        format!(
+            "SELECT s.acct, t.lower FROM k6.stated s FULL JOIN k6.tiers t ON s.balance > 100 \
+             AND t.lower = {TIER} ORDER BY t.lower, s.acct"
+        ),
+        format!(
+            "SELECT t.lower, s.acct FROM k6.tiers t LEFT JOIN k6.stated s ON t.lower = {TIER} \
+             ORDER BY t.lower, s.acct"
+        ),
+        "SELECT s.acct, t.lower FROM k6.stated s JOIN k6.tiers t ON t.rate = (SELECT min(u.rate) \
+         FROM k6.tiers u WHERE u.lower <= s.balance AND u.lower >= t.lower) ORDER BY s.acct, t.lower"
+            .into(),
+        "SELECT s.acct, t.lower FROM k6.stated s JOIN k6.tiers t ON t.lower <= s.balance \
+         AND NOT EXISTS (SELECT 1 FROM k6.tiers u WHERE u.lower > t.lower AND u.lower <= s.balance) \
+         ORDER BY s.acct"
+            .into(),
+        "SELECT s.acct, t.lower FROM k6.stated s LEFT JOIN k6.tiers t ON EXISTS (SELECT 1 \
+         FROM k6.owners o WHERE o.acct = s.acct AND o.owner = 'ann') AND t.lower = 0 ORDER BY s.acct"
+            .into(),
+        "SELECT s.acct, t.lower FROM k6.stated s JOIN k6.tiers t ON t.lower IN (SELECT u.lower \
+         FROM k6.tiers u WHERE u.lower <= s.balance ORDER BY u.lower DESC LIMIT 1) ORDER BY s.acct"
+            .into(),
+        "SELECT s.acct, t.lower FROM k6.stated s JOIN k6.tiers t ON t.lower = (SELECT min(lower) \
+         FROM k6.tiers) WHERE s.balance IS NULL"
+            .into(),
+        "SELECT o.acct, c.cap FROM k6.owners o JOIN k6.caps c ON c.owner = o.owner \
+         AND (SELECT s.balance FROM k6.stated s WHERE s.acct = o.acct) <= c.cap ORDER BY o.acct"
+            .into(),
+        "SELECT o.acct, c.owner FROM k6.owners o LEFT JOIN k6.caps c ON c.owner = o.owner \
+         AND c.cap IS NOT DISTINCT FROM (SELECT max(c2.cap) FROM k6.caps c2 \
+         WHERE c2.owner = o.owner) ORDER BY o.acct"
+            .into(),
+        format!(
+            "SELECT o.owner, s.acct, t.rate FROM k6.owners o JOIN k6.stated s ON s.acct = o.acct \
+             JOIN k6.tiers t ON t.lower = {TIER} ORDER BY s.acct"
+        ),
+        "SELECT o.owner, s.acct, c.cap FROM k6.owners o JOIN k6.stated s ON s.acct = o.acct \
+         LEFT JOIN k6.caps c ON c.owner = o.owner AND c.cap >= (SELECT s2.balance \
+         FROM k6.stated s2 WHERE s2.acct = s.acct) ORDER BY s.acct"
+            .into(),
+        "SELECT o.acct, (SELECT t.lower FROM k6.stated s JOIN k6.tiers t ON s.acct = o.acct \
+         AND t.lower = (SELECT max(u.lower) FROM k6.tiers u WHERE u.lower <= s.balance \
+         AND o.owner <> 'bob')) AS lower FROM k6.owners o ORDER BY o.acct"
+            .into(),
+        format!(
+            "SELECT s.acct, t.lower FROM k6.stated s JOIN k6.tiers t ON t.lower = {TIER} \
+             OR (s.balance IS NULL AND t.lower = 0) ORDER BY s.acct"
+        ),
+        "SELECT acct, rate FROM k6.v ORDER BY acct".into(),
+        "SELECT pg_get_viewdef('k6.v'::regclass)".into(),
+        format!(
+            "DELETE FROM k6.owners o USING k6.stated s JOIN k6.tiers t ON t.lower = {TIER} \
+             WHERE o.acct = s.acct AND t.rate > 0.01 RETURNING o.acct"
+        ),
+    ];
+    let want: [&[&str]; 20] = [
+        &rated,
+        &rated,
+        &[
+            rated[0], rated[1], rated[2], rated[3], "ACT-C-001|NULL", "ACT-C-002|NULL",
+        ],
+        &[lowest[0], lowest[1], lowest[2], lowest[3], "NULL|100000.00"],
+        &[
+            "ACT-A-002|0.00",
+            "ACT-B-002|10000.00",
+            "NULL|100000.00",
+            "ACT-A-001|NULL",
+            "ACT-B-001|NULL",
+            "ACT-C-001|NULL",
+            "ACT-C-002|NULL",
+        ],
+        &[
+            "0.00|ACT-A-001",
+            "0.00|ACT-A-002",
+            "0.00|ACT-B-001",
+            "10000.00|ACT-B-002",
+            "100000.00|NULL",
+        ],
+        &[lowest[0], lowest[1], lowest[2], "ACT-B-002|0.00", lowest[3]],
+        &lowest,
+        &[
+            "ACT-A-001|0.00",
+            "ACT-A-002|0.00",
+            "ACT-B-001|NULL",
+            "ACT-B-002|NULL",
+            "ACT-C-001|NULL",
+            "ACT-C-002|NULL",
+        ],
+        &lowest,
+        &["ACT-C-001|0.00"],
+        &["ACT-A-001|5000.00"],
+        &[
+            "ACT-A-001|ann",
+            "ACT-A-002|ann",
+            "ACT-B-001|bob",
+            "ACT-B-002|bob",
+            "ACT-C-001|NULL",
+        ],
+        &[
+            "ann|ACT-A-001|0.0050",
+            "ann|ACT-A-002|0.0050",
+            "bob|ACT-B-001|0.0050",
+            "bob|ACT-B-002|0.0150",
+        ],
+        &[
+            "ann|ACT-A-001|5000.00",
+            "ann|ACT-A-002|NULL",
+            "bob|ACT-B-001|NULL",
+            "bob|ACT-B-002|NULL",
+            "cy|ACT-C-001|NULL",
+        ],
+        &[
+            "ACT-A-001|0.00",
+            "ACT-A-002|0.00",
+            "ACT-B-001|NULL",
+            "ACT-B-002|NULL",
+            "ACT-C-001|NULL",
+        ],
+        &[lowest[0], lowest[1], lowest[2], lowest[3], "ACT-C-001|0.00"],
+        &rated,
+        &[" SELECT s.acct,\n    t.rate\n   FROM (k6.stated s\n     JOIN k6.tiers t ON ((t.lower = \
+            ( SELECT max(u.lower) AS max\n           FROM k6.tiers u\n          WHERE \
+            (u.lower <= s.balance)))));"],
+        &["ACT-B-002"],
+    ];
+    let asked: Vec<(&str, &[&str])> = sql.iter().map(String::as_str).zip(want).collect();
+    let path = declared("on-subquery-ended", K6, &K6_ROWS);
+    ended(&path, "on-subquery", &asked);
+    let path = declared("on-subquery", K6, &K6_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(&mut w, &asked);
+}
+
+#[test]
+fn a_full_join_on_a_subquery_of_one_side_is_answered_and_any_other_refused() {
+    let met = [
+        "ACT-A-001|0.00",
+        "ACT-A-002|0.00",
+        "ACT-B-001|0.00",
+        "ACT-B-002|10000.00",
+        "NULL|100000.00",
+        "ACT-C-001|NULL",
+        "ACT-C-002|NULL",
+    ];
+    let sql = [
+        format!(
+            "SELECT s.acct, t.lower FROM k6.stated s FULL JOIN k6.tiers t ON s.balance > 100 \
+             AND t.lower = {TIER} ORDER BY t.lower, s.acct"
+        ),
+        format!(
+            "SELECT s.acct, t.lower FROM k6.stated s FULL JOIN k6.tiers t ON t.lower = {TIER} \
+             ORDER BY t.lower, s.acct"
+        ),
+        format!(
+            "SELECT s.acct, t.lower FROM k6.stated s FULL JOIN k6.tiers t ON {TIER} = t.lower \
+             ORDER BY t.lower, s.acct"
+        ),
+    ];
+    let want: [&[&str]; 3] = [
+        &[
+            "ACT-A-002|0.00",
+            "ACT-B-002|10000.00",
+            "NULL|100000.00",
+            "ACT-A-001|NULL",
+            "ACT-B-001|NULL",
+            "ACT-C-001|NULL",
+            "ACT-C-002|NULL",
+        ],
+        &met,
+        &met,
+    ];
+    let asked: Vec<(&str, &[&str])> = sql.iter().map(String::as_str).zip(want).collect();
+    let path = declared("full-on-subquery", K6, &K6_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(&mut w, &asked);
+    let unmet = (
+        Some("0A000"),
+        "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions".into(),
+    );
+    for sql in [
+        "SELECT s.acct FROM k6.stated s FULL JOIN k6.tiers t ON t.lower <= s.balance \
+         AND NOT EXISTS (SELECT 1 FROM k6.tiers u WHERE u.lower > t.lower)",
+        "SELECT s.acct FROM k6.stated s FULL JOIN k6.tiers t ON t.lower = (SELECT max(u.lower) \
+         FROM k6.tiers u WHERE u.lower <= s.balance AND u.rate <= t.rate)",
+        "SELECT s.acct FROM k6.stated s FULL JOIN k6.tiers t ON t.lower = (SELECT min(lower) \
+         FROM k6.tiers)",
+    ] {
+        assert_eq!(refused(&mut w, sql), unmet, "{sql}");
+    }
+}
+
+#[test]
+fn a_subquery_in_an_on_is_refused_in_postgresql_s_words() {
+    let path = declared("on-subquery-refused", K6, &K6_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    for (sql, want) in [
+        (
+            "SELECT s.acct FROM k6.stated s JOIN k6.tiers t ON t.lower = (SELECT u.lower \
+             FROM k6.tiers u WHERE u.lower <= s.balance)",
+            (
+                Some("21000"),
+                "more than one row returned by a subquery used as an expression",
+            ),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s JOIN k6.tiers t ON t.lower = (SELECT max(s.balance))",
+            (Some("42803"), "aggregate functions are not allowed in JOIN conditions"),
+        ),
+        (
+            "SELECT s.acct FROM k6.owners o, k6.stated s JOIN k6.tiers t ON t.lower = \
+             (SELECT max(u.lower) FROM k6.tiers u WHERE o.acct = s.acct)",
+            (
+                Some("42P01"),
+                "invalid reference to FROM-clause entry for table \"o\": There is an entry for \
+                 table \"o\", but it cannot be referenced from this part of the query.",
+            ),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s JOIN k6.tiers t ON t.lower = (SELECT max(u.lower) \
+             FROM k6.tiers u WHERE o.acct = s.acct) JOIN k6.owners o ON o.acct = s.acct",
+            (Some("42P01"), "missing FROM-clause entry for table \"o\""),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s JOIN k6.tiers t ON t.lower = (SELECT u.lower, u.rate \
+             FROM k6.tiers u LIMIT 1)",
+            (Some("42601"), "subquery must return only one column"),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (want.0, want.1.to_string()), "{sql}");
+    }
+}
+
+#[test]
+fn a_join_s_on_inside_a_subquery_reads_the_query_around_it() {
+    let asked: &[(&str, &[&str])] = &[
+        (
+            "SELECT o.acct, (SELECT t.lower FROM k6.stated s JOIN k6.tiers t ON s.acct = o.acct \
+             AND t.lower = (SELECT max(u.lower) FROM k6.tiers u WHERE u.lower <= s.balance \
+             AND o.owner <> 'bob')) AS lower FROM k6.owners o ORDER BY o.acct",
+            &[
+                "ACT-A-001|0.00",
+                "ACT-A-002|0.00",
+                "ACT-B-001|NULL",
+                "ACT-B-002|NULL",
+                "ACT-C-001|NULL",
+            ],
+        ),
+        (
+            "SELECT o.acct, (SELECT t.lower FROM k6.stated s JOIN k6.tiers t ON s.acct = o.acct \
+             AND t.lower = 0) AS lower FROM k6.owners o ORDER BY o.acct",
+            &[
+                "ACT-A-001|0.00",
+                "ACT-A-002|0.00",
+                "ACT-B-001|0.00",
+                "ACT-B-002|0.00",
+                "ACT-C-001|0.00",
+            ],
+        ),
+    ];
+    let path = declared("on-around", K6, &K6_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(&mut w, asked);
 }
