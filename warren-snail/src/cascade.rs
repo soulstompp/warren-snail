@@ -57,8 +57,8 @@ fn same(a: Addr, b: Addr) -> bool {
 }
 
 /// pg_depend's rows of the file, each read back from its text.
-fn deps(catalog: &Catalog) -> Vec<Dep> {
-    let rows = crate::pgcatalog::file_rows(catalog, "pg_depend");
+fn deps(catalog: &Catalog) -> Result<Vec<Dep>> {
+    let rows = crate::pgcatalog::file_rows_read(catalog, "pg_depend")?;
     let num = |r: &HashMap<&'static str, Option<String>>, k: &str| -> i64 {
         r.get(k)
             .cloned()
@@ -66,7 +66,8 @@ fn deps(catalog: &Catalog) -> Vec<Dep> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     };
-    rows.iter()
+    Ok(rows
+        .iter()
         .map(|r| Dep {
             obj: Addr {
                 class: num(r, "classid") as u32,
@@ -85,7 +86,7 @@ fn deps(catalog: &Catalog) -> Vec<Dep> {
                 .and_then(|v| v.chars().next())
                 .unwrap_or('n'),
         })
-        .collect()
+        .collect())
 }
 
 /// As `object_address_comparator`: OID falling, then the catalog, then the column.
@@ -253,7 +254,7 @@ pub(crate) fn dropped(catalog: &Catalog, named: &[Addr], cascade: bool) -> Resul
         named,
         words: &words,
     };
-    for x in deps(catalog) {
+    for x in deps(catalog)? {
         walk.on.entry((x.obj.class, x.obj.oid)).or_default().push(x);
         walk.of.entry((x.on.class, x.on.oid)).or_default().push(x);
     }

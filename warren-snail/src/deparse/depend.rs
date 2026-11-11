@@ -6,6 +6,7 @@ use super::analyze::Node;
 use super::cat::Cat;
 use super::query::{Jt, Query, RteKind};
 use crate::oids::Object;
+use crate::Result;
 
 /// The catalogs a row of pg_depend names, by their OIDs, as initdb fixes them.
 pub(crate) const CLASS: u32 = 1259;
@@ -232,7 +233,8 @@ impl<'c, 'a> Refs<'c, 'a> {
                     .map_or(0, |i| i as i32 + 1);
                 if reltype != 0 && num != 0 {
                     self.add(CLASS, reltype, num);
-                    let coll = crate::pgcatalog::attcollation_of(self.cat.catalog, reltype, num);
+                    // A view's fields are found only where its question was read.
+                    let coll = crate::pgcatalog::attcollation_of(self.cat.catalog, reltype, num).unwrap_or(0);
                     if coll != 0 && coll != DEFAULT_COLLATION {
                         self.add(COLLATION, coll, 0);
                     }
@@ -269,6 +271,7 @@ impl<'c, 'a> Refs<'c, 'a> {
             | N::Row { args, .. }
             | N::Coalesce { args, .. }
             | N::MinMax { args, .. }
+            | N::Grouping { args }
             | N::List(args)
             | N::Array { elements: args, .. } => args.iter().for_each(|a| self.node(a)),
             N::Agg { args, filter, order, .. } => {
@@ -375,8 +378,8 @@ pub(crate) fn of_expr(cat: &Cat, node: &Node) -> Vec<Addr> {
 /// The collation a query's output column carries, as `assign_collations` gives a column read or
 /// a COLLATE written: the column's own, the COLLATE's, the default for any other value of a
 /// collatable type; none for a type without one.
-pub(crate) fn output_collation(cat: &Cat, q: &Query, n: &Node) -> u32 {
-    match n {
+pub(crate) fn output_collation(cat: &Cat, q: &Query, n: &Node) -> Result<u32> {
+    Ok(match n {
         Node::Collate { coll, .. } => *coll,
         Node::Var { attno, rel, up: 0, ty, .. } if *attno > 0 => {
             match q.rtable.get((*rel as usize).wrapping_sub(1)).map(|r| &r.kind) {
@@ -384,22 +387,22 @@ pub(crate) fn output_collation(cat: &Cat, q: &Query, n: &Node) -> u32 {
                     cat.catalog,
                     relation_oid(cat, name, *namespace),
                     i32::from(*attno),
-                ),
-                Some(RteKind::Subquery(sub)) => sub
-                    .output()
-                    .nth(*attno as usize - 1)
-                    .map_or(0, |t| output_collation(cat, sub, &t.expr)),
+                )?,
+                Some(RteKind::Subquery(sub)) => match sub.output().nth(*attno as usize - 1) {
+                    Some(t) => output_collation(cat, sub, &t.expr)?,
+                    None => 0,
+                },
                 _ if cat.collatable(*ty) => DEFAULT_COLLATION,
                 _ => 0,
             }
         }
-        Node::Relabel { arg, ty, .. } if cat.collatable(*ty) => match output_collation(cat, q, arg) {
+        Node::Relabel { arg, ty, .. } if cat.collatable(*ty) => match output_collation(cat, q, arg)? {
             0 => DEFAULT_COLLATION,
             c => c,
         },
         _ if cat.collatable(n.ty()) => DEFAULT_COLLATION,
         _ => 0,
-    }
+    })
 }
 
 /// What a view's question names, as `recordDependencyOnExpr` gathers it for its rule.

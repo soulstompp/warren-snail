@@ -2454,3 +2454,79 @@ fn a_set_where_18_6_refuses_one_is_refused_in_its_words() {
     }
     answered(&mut w, &[("SELECT count(*) FROM sr.t", &["4"])]);
 }
+
+/// A snail of one table and no rows, written as release `release`'s.
+fn keyed_of(name: &str, release: u8) -> Snail {
+    let path = tmp(&format!("reader-keywords-{name}.snail"));
+    let mut catalog = Catalog::parse("CREATE TABLE k (id integer PRIMARY KEY);").unwrap();
+    catalog.with_release(release).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), release)
+        .unwrap();
+    Snail::open_writing(&path).unwrap()
+}
+
+// 18.6 over a file of 18, 19 RC1 over one of 19, the same statements in the same order: 19's list
+// holds five keywords more, `ignore` and `respect` labels only after AS; a keyword either list says
+// wants AS is refused as a bare label under both.
+#[test]
+fn the_keywords_are_the_file_s_release_s() {
+    let five = "SELECT word, catcode, barelabel FROM pg_get_keywords() \
+         WHERE word IN ('ignore', 'lsn', 'repack', 'respect', 'wait') ORDER BY word";
+    let syntax = |w: &mut Snail, sql: &str, word: &str| {
+        let near = format!("syntax error at or near \"{word}\"");
+        assert_eq!(refused(w, sql), (Some("42601"), near), "{sql}");
+    };
+    let bare = ["year", "filter", "day", "within"];
+    let mut w = keyed_of("18", 18);
+    answered(
+        &mut w,
+        &[
+            ("SELECT count(*) FROM pg_get_keywords()", &["494"]),
+            (five, &[]),
+            ("SELECT 1 ignore", &["1"]),
+            ("SELECT 1 respect", &["1"]),
+            ("SELECT 1 wait", &["1"]),
+            ("SELECT quote_ident('wait') AS a, quote_ident('ignore') AS b", &["wait|ignore"]),
+            ("SELECT 1 AS ignore", &["1"]),
+            ("SELECT 1 lsn", &["1"]),
+        ],
+    );
+    for word in bare {
+        syntax(&mut w, &format!("SELECT 1 {word}"), word);
+    }
+    answered(&mut w, &[("SELECT x ignore FROM (SELECT 1 AS x) q", &["1"])]);
+    // A name, so a zone's: without `zones` the snail reads UTC alone.
+    #[cfg(feature = "zones")]
+    refusals(
+        &mut w,
+        &[
+            ("SET TIME ZONE wait", "22023", "invalid value for parameter \"TimeZone\": \"wait\""),
+            ("SET TIME ZONE ignore", "22023", "invalid value for parameter \"TimeZone\": \"ignore\""),
+        ],
+    );
+    let mut w = keyed_of("19", 19);
+    answered(
+        &mut w,
+        &[
+            ("SELECT count(*) FROM pg_get_keywords()", &["499"]),
+            (five, &["ignore|U|f", "lsn|U|t", "repack|U|t", "respect|U|f", "wait|U|t"]),
+        ],
+    );
+    syntax(&mut w, "SELECT 1 ignore", "ignore");
+    syntax(&mut w, "SELECT 1 respect", "respect");
+    answered(
+        &mut w,
+        &[
+            ("SELECT 1 wait", &["1"]),
+            ("SELECT quote_ident('wait') AS a, quote_ident('ignore') AS b", &["wait|ignore"]),
+            ("SELECT 1 AS ignore", &["1"]),
+            ("SELECT 1 lsn", &["1"]),
+        ],
+    );
+    for word in bare {
+        syntax(&mut w, &format!("SELECT 1 {word}"), word);
+    }
+    syntax(&mut w, "SELECT x ignore FROM (SELECT 1 AS x) q", "ignore");
+    syntax(&mut w, "SET TIME ZONE wait", "wait");
+    syntax(&mut w, "SET TIME ZONE ignore", "ignore");
+}

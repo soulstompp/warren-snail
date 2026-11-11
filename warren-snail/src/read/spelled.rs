@@ -59,21 +59,24 @@ pub(crate) const ROWS_FROM: &str = "\u{6}rows";
 /// TABLESAMPLE clause carried in a call's name (`SAMPLED`), with a seed drawn for the statement where
 /// it names none; ROWS FROM (…) as a call (`ROWS_FROM`), and the alias a function's column definition
 /// list stands behind where none is written; and what sqlparser takes and PostgreSQL's grammar does
-/// not, refused.
+/// not, refused, a label written without the AS the release's keywords want among them.
 pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
-    scanned_seeding(sql, release, true)
+    let out = scanned_seeding(sql, release, true)?;
+    bare_labels(&out, release)?;
+    Ok(out)
 }
 
 /// A DDL's text as `scanned` reads a statement's, a TABLESAMPLE that names no seed left to draw one
 /// each time a statement reads it: a view's. ROWS FROM and a column definition list with no alias
-/// are left as written, so that statements split from a text read again as PostgreSQL's.
+/// are left as written, so that statements split from a text read again as PostgreSQL's; its labels
+/// are a statement's to read.
 pub(crate) fn scanned_unseeded(sql: &str, release: u8) -> Result<Cow<'_, str>> {
     scanned_seeding(sql, release, false)
 }
 
 fn scanned_seeding(sql: &str, release: u8, seeded: bool) -> Result<Cow<'_, str>> {
     let mut out = numbered(sql, release)?;
-    if let Some(next) = worded(&out, seeded)? {
+    if let Some(next) = worded(&out, seeded, release)? {
         out = Cow::Owned(next);
     }
     Ok(out)
@@ -442,7 +445,7 @@ fn finish(sql: &str, mut out: String, copied: usize) -> Cow<'_, str> {
 
 /// The statement with its words as PostgreSQL's grammar reads them; none where it needs none, or
 /// where sqlparser's tokenizer refuses it, which its parser says.
-fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
+fn worded(sql: &str, seeded: bool, release: u8) -> Result<Option<String>> {
     let lower = sql.to_ascii_lowercase();
     // `AS (`, whatever stands between the two.
     let as_paren = lower.match_indices("as").any(|(at, _)| {
@@ -650,7 +653,7 @@ fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
                             && match &solid[o - 1].0 {
                                 Token::Word(w) if w.quote_style.is_some() => true,
                                 Token::Word(w) => {
-                                    !matches!(keyword(&w.value), Some(('R', _)))
+                                    !matches!(keyword(&w.value, release), Some(('R', _)))
                                         || (w.value.eq_ignore_ascii_case("from")
                                             && word(o.wrapping_sub(2)).as_deref() == Some("ROWS"))
                                 }
@@ -681,7 +684,7 @@ fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
                 return Err(Error::new("operator does not exist: =="));
             }
             Token::LBracket => {
-                if brackets == 0 && i > 0 && !ends_a_value(&solid[i - 1].0) {
+                if brackets == 0 && i > 0 && !ends_a_value(&solid[i - 1].0, release) {
                     return Err(near(i));
                 }
                 brackets += 1;
@@ -781,13 +784,23 @@ fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
     Ok(Some(out))
 }
 
-/// A word of PostgreSQL's grammar: its category, and whether it may stand as a label without AS.
-pub(super) fn keyword(word: &str) -> Option<(char, bool)> {
-    static WORDS: std::sync::OnceLock<std::collections::HashMap<&'static str, (char, bool)>> =
-        std::sync::OnceLock::new();
-    WORDS
+/// PostgreSQL's keywords under a release, a line each: the word, its category, and `t` where it may
+/// stand as a label without AS. 19's list from 19 on; 18's for 18 and every release before it.
+pub(super) fn keyword_list(release: u8) -> &'static str {
+    match release {
+        19.. => include_str!("../kwlist.txt"),
+        _ => include_str!("../kwlist18.txt"),
+    }
+}
+
+/// A word of PostgreSQL's grammar under a release: its category, and whether it may stand as a
+/// label without AS.
+pub(super) fn keyword(word: &str, release: u8) -> Option<(char, bool)> {
+    type Words = std::collections::HashMap<&'static str, (char, bool)>;
+    static WORDS: [std::sync::OnceLock<Words>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    WORDS[usize::from(release >= 19)]
         .get_or_init(|| {
-            include_str!("../kwlist.txt")
+            keyword_list(release)
                 .lines()
                 .filter_map(|l| {
                     let mut f = l.split('\t');
@@ -801,7 +814,7 @@ pub(super) fn keyword(word: &str) -> Option<(char, bool)> {
 }
 
 /// Whether a value can end at a token, so that a bracket after it is a subscript or a type's.
-fn ends_a_value(t: &Token) -> bool {
+fn ends_a_value(t: &Token, release: u8) -> bool {
     match t {
         Token::RParen
         | Token::RBracket
@@ -811,9 +824,91 @@ fn ends_a_value(t: &Token) -> bool {
         Token::Word(w) => {
             w.quote_style.is_some()
                 || w.value.eq_ignore_ascii_case("array")
-                || !matches!(keyword(&w.value), Some(('R', _)))
+                || !matches!(keyword(&w.value, release), Some(('R', _)))
         }
         _ => false,
+    }
+}
+
+/// A select list's or RETURNING list's label written without AS where PostgreSQL's grammar takes it
+/// only after AS: a keyword the release's list says requires it (`SELECT 1 year`), refused at the
+/// label as the grammar refuses it. sqlparser takes such a word for the label.
+fn bare_labels(sql: &str, release: u8) -> Result<()> {
+    let Ok(tokens) = super::image::tokens(sql) else {
+        return Ok(());
+    };
+    let mut before: Option<&Token> = None;
+    let mut bare = Vec::new();
+    for t in &tokens {
+        if matches!(t.token, Token::Whitespace(_)) {
+            continue;
+        }
+        if let Token::Word(w) = &t.token {
+            let after_as = matches!(before, Some(Token::Word(b)) if b.quote_style.is_none() && b.keyword == Keyword::AS);
+            let needs_as = matches!(keyword(&w.value, release), Some((c, false)) if c != 'R');
+            if w.quote_style.is_none() && needs_as && !after_as {
+                bare.push(t.span.start);
+            }
+        }
+        before = Some(&t.token);
+    }
+    if bare.is_empty() {
+        return Ok(());
+    }
+    let Ok(statements) = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+    else {
+        return Ok(());
+    };
+    struct Labels<'b> {
+        bare: &'b [Location],
+        found: Vec<(Location, String)>,
+    }
+    impl Labels<'_> {
+        fn items(&mut self, items: &[SelectItem]) {
+            for item in items {
+                if let SelectItem::ExprWithAlias { alias, .. } = item {
+                    if alias.quote_style.is_none() && self.bare.contains(&alias.span.start) {
+                        self.found.push((alias.span.start, alias.value.clone()));
+                    }
+                }
+            }
+        }
+        fn body(&mut self, body: &SetExpr) {
+            match body {
+                SetExpr::Select(s) => self.items(&s.projection),
+                SetExpr::SetOperation { left, right, .. } => {
+                    self.body(left);
+                    self.body(right);
+                }
+                _ => {}
+            }
+        }
+    }
+    impl sqlparser::ast::Visitor for Labels<'_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> std::ops::ControlFlow<()> {
+            self.body(&q.body);
+            std::ops::ControlFlow::Continue(())
+        }
+        fn pre_visit_statement(&mut self, s: &sqlparser::ast::Statement) -> std::ops::ControlFlow<()> {
+            use sqlparser::ast::Statement as S;
+            let returning = match s {
+                S::Insert(i) => i.returning.as_deref(),
+                S::Update(u) => u.returning.as_deref(),
+                S::Delete(d) => d.returning.as_deref(),
+                _ => None,
+            };
+            self.items(returning.unwrap_or_default());
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let mut labels = Labels { bare: &bare, found: Vec::new() };
+    let _ = sqlparser::ast::Visit::visit(&statements, &mut labels);
+    match labels.found.into_iter().min_by_key(|(at, _)| (at.line, at.column)) {
+        Some((_, word)) => Err(Error::new(format!("syntax error at or near \"{word}\""))),
+        None => Ok(()),
     }
 }
 

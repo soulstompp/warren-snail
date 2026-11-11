@@ -181,6 +181,10 @@ pub(crate) enum Node {
         variadic: bool,
         ty: u32,
     },
+    /// GROUPING(…): its arguments as written.
+    Grouping {
+        args: Vec<Node>,
+    },
     /// A window function call: its window by its place in the query's windows.
     Window {
         oid: u32,
@@ -247,6 +251,7 @@ impl Node {
             | N::BoolTest { .. }
             | N::Distinct { .. }
             | N::AnyAll { .. } => cat::BOOL,
+            N::Grouping { .. } => cat::INT4,
             N::Collate { arg, .. } => arg.ty(),
             N::List(_) => 0,
         }
@@ -339,6 +344,7 @@ impl Node {
             | N::Row { args, .. }
             | N::Coalesce { args, .. }
             | N::MinMax { args, .. }
+            | N::Grouping { args }
             | N::List(args)
             | N::Array { elements: args, .. } => args.iter().for_each(|a| a.walk(f)),
             N::Agg { args, filter, order, .. } => {

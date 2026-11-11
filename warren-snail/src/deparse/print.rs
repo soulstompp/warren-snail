@@ -233,6 +233,7 @@ impl Printer<'_, '_> {
                     | N::NullIf { .. }
                     | N::Case { .. }
                     | N::Agg { .. }
+                    | N::Grouping { .. }
                     | N::Window { .. }
             )
         };
@@ -248,6 +249,7 @@ impl Printer<'_, '_> {
             | N::Func { .. }
             | N::Case { .. }
             | N::Agg { .. }
+            | N::Grouping { .. }
             | N::Window { .. } => true,
             N::Field { .. } => !matches!(parent, N::Field { .. }),
             N::Domain { arg, .. } | N::Relabel { arg, .. } | N::Io { arg, .. } | N::ArrayCoerce { arg, .. } => {
@@ -361,6 +363,11 @@ impl Printer<'_, '_> {
                 }
             }
             N::Agg { .. } => self.agg(n)?,
+            N::Grouping { args } => {
+                self.push("GROUPING(");
+                self.list(args, true)?;
+                self.push(")");
+            }
             N::Window { .. } => self.window_call(n)?,
             N::SubLink { .. } => self.sublink_expr(n)?,
             N::DomainValue { .. } => self.push("VALUE"),

@@ -124,6 +124,17 @@ pub(crate) struct Window {
     pub frame: Option<Frame>,
 }
 
+/// A grouping set as transformGroupClause keeps it: unexpanded, each expression by its place in the
+/// target list (from 1).
+#[derive(Clone, Debug)]
+pub(crate) enum GroupingSet {
+    Empty,
+    Simple(Vec<usize>),
+    Rollup(Vec<GroupingSet>),
+    Cube(Vec<GroupingSet>),
+    Sets(Vec<GroupingSet>),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum SetOp {
     Leaf(usize),
@@ -162,7 +173,12 @@ pub(crate) struct Query {
     pub quals: Option<Node>,
     pub targets: Vec<Target>,
     pub distinct: bool,
+    /// DISTINCT ON's keys, in the order its clause keeps them: those ORDER BY begins with first.
+    pub distinct_on: Vec<Sort>,
+    /// Each grouping expression once.
     pub group: Vec<Sort>,
+    /// The grouping sets as written, where GROUP BY holds any.
+    pub grouping_sets: Vec<GroupingSet>,
     pub having: Option<Node>,
     pub windows: Vec<Window>,
     pub sort: Vec<Sort>,
@@ -749,34 +765,22 @@ impl<'b> Builder<'b, '_, '_> {
                 sort.push(self.sort(&mut targets, at, item)?);
             }
         }
-        let mut group = Vec::new();
-        match &s.group_by {
+        let (group, grouping_sets) = match &s.group_by {
             A::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => {
-                for e in exprs {
-                    let at = self.find_target(e, &mut targets, true, false)?;
-                    self.as_text(&mut targets[at])?;
-                    if !group.iter().any(|g: &Sort| g.resno == at + 1) {
-                        group.push(Sort {
-                            expr: targets[at].expr.clone(),
-                            resno: at + 1,
-                            desc: false,
-                            nulls_first: false,
-                        });
-                    }
-                }
+                self.group_clause(exprs, &mut targets)?
             }
             other => return Err(not_read(other)),
-        }
-        let distinct = match &s.distinct {
-            None | Some(A::Distinct::All) => false,
-            Some(A::Distinct::Distinct) => true,
-            Some(A::Distinct::On(_)) => return Err(Error::new("DISTINCT ON is not printed as PostgreSQL prints it")),
         };
-        if distinct {
-            for t in targets.iter_mut().filter(|t| !t.junk) {
-                self.as_text(t)?;
+        let (distinct, distinct_on) = match &s.distinct {
+            None | Some(A::Distinct::All) => (false, Vec::new()),
+            Some(A::Distinct::Distinct) => {
+                for t in targets.iter_mut().filter(|t| !t.junk) {
+                    self.as_text(t)?;
+                }
+                (true, Vec::new())
             }
-        }
+            Some(A::Distinct::On(keys)) => (true, self.distinct_on(keys, &mut targets, &sort)?),
+        };
         let (offset, limit, with_ties) = self.limits(q)?;
         let windows = self.windows(&mut targets)?;
         // resolveTargetListUnknowns, once the rest is read: each output still unknown is text.
@@ -791,7 +795,9 @@ impl<'b> Builder<'b, '_, '_> {
             quals,
             targets,
             distinct,
+            distinct_on,
             group,
+            grouping_sets,
             having,
             windows,
             sort,
@@ -810,6 +816,133 @@ impl<'b> Builder<'b, '_, '_> {
             t.expr = self.analyzer().coerce(n, cat::UNKNOWN, cat::TEXT, -1, Context::Implicit, Form::Implicit)?;
         }
         Ok(())
+    }
+
+    /// transformGroupClause: each grouping expression once, by its target (one added unprojected
+    /// where none is equal); and where GROUP BY writes a ROLLUP, a CUBE, GROUPING SETS or `()`, its
+    /// sets as written, a row in parentheses one set of its members, `()` beside others dropped, an
+    /// expression written twice at the top or in one row kept once there.
+    fn group_clause(&self, exprs: &[A::Expr], targets: &mut Vec<Target>) -> Result<(Vec<Sort>, Vec<GroupingSet>)> {
+        let sets_written = exprs.iter().any(|e| match e {
+            A::Expr::Rollup(_) | A::Expr::Cube(_) | A::Expr::GroupingSets(_) => true,
+            A::Expr::Tuple(items) => items.is_empty(),
+            _ => false,
+        });
+        let mut items = Vec::new();
+        for e in exprs {
+            row_members(e, &mut items);
+        }
+        let mut flat = Vec::new();
+        let mut sets = Vec::new();
+        let mut seen = Vec::new();
+        for e in items {
+            match e {
+                A::Expr::Rollup(m) => sets.push(GroupingSet::Rollup(self.set_members(m, false, targets, &mut flat)?)),
+                A::Expr::Cube(m) => sets.push(GroupingSet::Cube(self.set_members(m, false, targets, &mut flat)?)),
+                A::Expr::GroupingSets(m) => sets.push(GroupingSet::Sets(self.set_members(m, true, targets, &mut flat)?)),
+                e => {
+                    let at = self.group_item(e, targets, &mut flat)?;
+                    if !seen.contains(&at) {
+                        seen.push(at);
+                        if sets_written {
+                            sets.push(GroupingSet::Simple(vec![at]));
+                        }
+                    }
+                }
+            }
+        }
+        if sets_written && sets.is_empty() {
+            sets.push(GroupingSet::Empty);
+        }
+        Ok((flat, sets))
+    }
+
+    /// transformGroupingSet: the members of a ROLLUP, a CUBE or GROUPING SETS, each a set of its
+    /// own; `()` only among GROUPING SETS'.
+    fn set_members(
+        &self,
+        members: &[Vec<A::Expr>],
+        sets: bool,
+        targets: &mut Vec<Target>,
+        flat: &mut Vec<Sort>,
+    ) -> Result<Vec<GroupingSet>> {
+        let mut out = Vec::new();
+        for member in members {
+            if member.is_empty() {
+                if !sets {
+                    return Err(not_read(&"() inside ROLLUP or CUBE"));
+                }
+                out.push(GroupingSet::Empty);
+                continue;
+            }
+            let mut exprs = Vec::new();
+            for e in member {
+                row_members(e, &mut exprs);
+            }
+            let mut places = Vec::new();
+            for e in exprs {
+                let at = self.group_item(e, targets, flat)?;
+                if !places.contains(&at) {
+                    places.push(at);
+                }
+            }
+            out.push(GroupingSet::Simple(places));
+        }
+        Ok(out)
+    }
+
+    /// transformGroupClauseExpr: a grouping expression's place in the target list (from 1), the
+    /// expression kept once among the grouping expressions.
+    fn group_item(&self, e: &A::Expr, targets: &mut Vec<Target>, flat: &mut Vec<Sort>) -> Result<usize> {
+        let at = self.find_target(e, targets, true, false)?;
+        self.as_text(&mut targets[at])?;
+        if !flat.iter().any(|g| g.resno == at + 1) {
+            flat.push(Sort {
+                expr: targets[at].expr.clone(),
+                resno: at + 1,
+                desc: false,
+                nulls_first: false,
+            });
+        }
+        Ok(at + 1)
+    }
+
+    /// transformDistinctOnClause: each key's target (one added unprojected where none is equal),
+    /// kept in ORDER BY's order and sort where ORDER BY begins with it, then the rest as written;
+    /// refused where a key would follow an ORDER BY item that is none of them.
+    fn distinct_on(&self, keys: &[A::Expr], targets: &mut Vec<Target>, sort: &[Sort]) -> Result<Vec<Sort>> {
+        let mut places = Vec::new();
+        for k in keys {
+            places.push(self.find_target(k, targets, false, false)? + 1);
+        }
+        let unmatched = || Error::new("SELECT DISTINCT ON expressions must match initial ORDER BY expressions");
+        let mut out: Vec<Sort> = Vec::new();
+        let mut skipped = false;
+        for s in sort {
+            if !places.contains(&s.resno) {
+                skipped = true;
+            } else if skipped {
+                return Err(unmatched());
+            } else {
+                out.push(s.clone());
+            }
+        }
+        for &resno in &places {
+            if out.iter().any(|s| s.resno == resno) {
+                continue;
+            }
+            if skipped {
+                return Err(unmatched());
+            }
+            self.as_text(&mut targets[resno - 1])?;
+            out.push(Sort {
+                expr: targets[resno - 1].expr.clone(),
+                resno,
+                desc: false,
+                nulls_first: false,
+            });
+        }
+        Ok(out)
     }
 
     fn sort(&self, targets: &mut [Target], at: usize, item: &A::OrderByExpr) -> Result<Sort> {
@@ -1572,6 +1705,16 @@ impl<'b> Builder<'b, '_, '_> {
     }
 }
 
+/// What a GROUP BY item stands for, as flatten_grouping_sets reads it: a row written in
+/// parentheses its members, each a grouping expression of its own; anything else itself.
+fn row_members<'e>(e: &'e A::Expr, out: &mut Vec<&'e A::Expr>) {
+    match e {
+        A::Expr::Tuple(items) => items.iter().for_each(|x| row_members(x, out)),
+        A::Expr::Nested(inner) if matches!(inner.as_ref(), A::Expr::Tuple(_)) => row_members(inner, out),
+        _ => out.push(e),
+    }
+}
+
 fn cte_def(name: &str, cols: &[String], q: &Query) -> CteDef {
     let out = q.columns();
     let names = out
@@ -1708,6 +1851,30 @@ impl Analyzer<'_, '_> {
             [s, n] => (Some(s.clone()), n.clone()),
             _ => return Ok(None),
         };
+        // GROUPING is the grammar's, not a function's: its arguments as written, an integer.
+        let bare = f.name.0.iter().all(|p| p.as_ident().is_some_and(|i| i.quote_style.is_none()));
+        if schema.is_none() && name == "grouping" && bare {
+            let A::FunctionArguments::List(l) = &f.args else {
+                return Err(not_read(e));
+            };
+            if l.duplicate_treatment.is_some()
+                || !l.clauses.is_empty()
+                || f.filter.is_some()
+                || f.over.is_some()
+                || !f.within_group.is_empty()
+                || f.null_treatment.is_some()
+            {
+                return Err(not_read(e));
+            }
+            let mut args = Vec::new();
+            for arg in &l.args {
+                let A::FunctionArg::Unnamed(A::FunctionArgExpr::Expr(x)) = arg else {
+                    return Err(not_read(e));
+                };
+                args.push(self.expr(x)?);
+            }
+            return Ok(Some(Node::Grouping { args }));
+        }
         if let A::FunctionArguments::Subquery(q) = &f.args {
             if schema.is_none() && name == "array" {
                 let sub = analyze(self.cat, q, Some(scope), true)?;

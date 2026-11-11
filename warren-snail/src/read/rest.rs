@@ -605,11 +605,12 @@ pub(super) const KEYWORD_COLUMNS: [(&str, ColumnType); 5] = [
     ("baredesc", ColumnType::Text(None)),
 ];
 
-/// The rows of `pg_get_keywords()`, a keyword a row in the order of PostgreSQL 19's list, each its
+/// The rows of `pg_get_keywords()`, a keyword a row in the order of the release's list, each its
 /// values in `KEYWORD_COLUMNS`' order; none where `name` is no function of rows of this module's.
 pub(super) fn rows(
     name: &str,
     args: &[(Value, bool, Option<ColumnType>)],
+    release: u8,
 ) -> Result<Option<Vec<Vec<Value>>>> {
     if name != "pg_get_keywords" {
         return Ok(None);
@@ -620,7 +621,7 @@ pub(super) fn rows(
         return Ok(None);
     }
     let mut out = Vec::with_capacity(500);
-    for line in include_str!("../kwlist.txt").lines() {
+    for line in super::spelled::keyword_list(release).lines() {
         let mut f = line.split('\t');
         let (word, cat, bare) = (
             f.next().unwrap_or_default(),
@@ -1553,9 +1554,16 @@ mod tests {
 
     #[test]
     fn the_keywords_are_postgresql_19_s_in_its_order() {
-        // PostgreSQL 19: 499 rows; abort U t, array R f, authorization T t, between C t.
-        let all = rows("pg_get_keywords", &[]).unwrap().unwrap();
+        // PostgreSQL 19: 499 rows; abort U t, array R f, authorization T t, between C t. 18.6: 494,
+        // ignore, lsn, repack, respect and wait none of them.
+        let all = rows("pg_get_keywords", &[], 19).unwrap().unwrap();
         assert_eq!(all.len(), 499);
+        let eighteen = rows("pg_get_keywords", &[], 18).unwrap().unwrap();
+        assert_eq!(eighteen.len(), 494);
+        let named = |r: &[Value], w: &str| matches!(&r[0], Value::Text(t) if t == w);
+        for w in ["ignore", "lsn", "repack", "respect", "wait"] {
+            assert!(all.iter().any(|r| named(r, w)) && !eighteen.iter().any(|r| named(r, w)), "{w}");
+        }
         let text = |r: &[Value]| {
             r.iter()
                 .map(|v| v.text().unwrap())
@@ -1578,6 +1586,6 @@ mod tests {
             find("between"),
             "between|C|true|unreserved (cannot be function or type name)|can be bare label"
         );
-        assert!(rows("pg_get_keywords", &[(Value::Int(1), false, None)]).is_err());
+        assert!(rows("pg_get_keywords", &[(Value::Int(1), false, None)], 19).is_err());
     }
 }

@@ -1,6 +1,7 @@
 //! pg_catalog's tables as relations: the built-in rows of the file's release and the rows of the
 //! file's own objects, in the columns that release defines; a column only a server fills refused
-//! where a statement asks it, and a table only a server holds refused whole.
+//! where a statement asks it, and a table only a server holds refused whole; a view's rows refused
+//! by its name where the snail does not print its question, never left out.
 
 mod weather;
 
@@ -203,4 +204,101 @@ fn several_snails_read_no_catalog_table() {
     let mut both = warren_snail::read::Snails::open(&[a.as_path(), b.as_path()]).unwrap();
     let e = both.ask("SELECT relname FROM pg_class").unwrap_err();
     assert!(e.0.contains("one snail at a time"), "{}", e.0);
+}
+
+const GROUPED: &str = "CREATE SCHEMA dn; CREATE TABLE dn.a (id integer PRIMARY KEY, g integer, k integer); \
+     CREATE VIEW dn.vd AS SELECT DISTINCT ON (g) g, id FROM dn.a ORDER BY g, id; \
+     CREATE VIEW dn.vr AS SELECT count(*) FROM dn.a GROUP BY ROLLUP (g); \
+     CREATE VIEW dn.vgr AS SELECT g, GROUPING(g) AS gr FROM dn.a GROUP BY id, ROLLUP (g); \
+     CREATE VIEW dn.ve AS SELECT count(*) FROM dn.a GROUP BY ();";
+
+#[test]
+fn a_distinct_on_or_rollup_view_keeps_its_catalog_rows() {
+    let path = tmp("pgc-grouped.snail");
+    let catalog = Catalog::parse(GROUPED).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO dn.a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, NULL, 50)")
+        .unwrap();
+    drop(w);
+    let mut snail = Snail::open(&path).unwrap();
+    // Every answer 18.6's after the same DDL.
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT attname::text, atttypid::regtype::text, attnum::text, attcollation::text \
+             FROM pg_attribute WHERE attrelid = 'dn.vd'::regclass AND attnum > 0 ORDER BY attnum"
+        ),
+        [s(&["g", "integer", "1", "0"]), s(&["id", "integer", "2", "0"])]
+    );
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT c.relname::text, a.attname::text, a.atttypid::regtype::text, a.attnum::text \
+             FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.relname IN ('vr', 'vgr', 've') AND a.attnum > 0 ORDER BY 1, a.attnum"
+        ),
+        [
+            s(&["ve", "count", "bigint", "1"]),
+            s(&["vgr", "g", "integer", "1"]),
+            s(&["vgr", "gr", "integer", "2"]),
+            s(&["vr", "count", "bigint", "1"]),
+        ]
+    );
+    let rule = |view: &str| {
+        format!(
+            "SELECT refobjid::regclass::text, refobjsubid::text, deptype::text FROM pg_depend \
+             WHERE classid = 'pg_rewrite'::regclass AND objid = \
+             (SELECT oid FROM pg_rewrite WHERE ev_class = '{view}'::regclass) ORDER BY 1, 2"
+        )
+    };
+    let on = |rel: &str, sub: &str, kind: &str| s(&[rel, sub, kind]);
+    assert_eq!(
+        rows(&mut snail, &rule("dn.vd")),
+        [on("dn.a", "1", "n"), on("dn.a", "2", "n"), on("dn.vd", "0", "i")]
+    );
+    assert_eq!(
+        rows(&mut snail, &rule("dn.vgr")),
+        [on("dn.a", "1", "n"), on("dn.a", "2", "n"), on("dn.vgr", "0", "i")]
+    );
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT column_name::text, data_type::text FROM information_schema.columns \
+             WHERE table_name = 'vd' ORDER BY ordinal_position"
+        ),
+        [s(&["g", "integer"]), s(&["id", "integer"])]
+    );
+    assert_eq!(
+        rows(&mut snail, "SELECT g::text, id::text FROM dn.vd"),
+        [s(&["1", "1"]), s(&["2", "3"]), vec![None, Some("5".into())]]
+    );
+}
+
+#[test]
+fn a_view_the_snail_does_not_print_is_refused_by_name_never_left_out() {
+    let path = tmp("pgc-unprinted.snail");
+    let catalog = Catalog::parse(
+        "CREATE SCHEMA dn; CREATE TABLE dn.a (id integer PRIMARY KEY, g integer, k integer); \
+         CREATE VIEW dn.vw AS SELECT id, sum(k) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND \
+         CURRENT ROW) AS s FROM dn.a;",
+    )
+    .unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    // 18.6 answers `id`, `g`, `k` and 5, and refuses the DROP 2BP01 for the view; the snail, which
+    // does not yet print a RANGE frame with an offset, refuses each by the view's name.
+    let why = "the view dn.vw is not read: a RANGE frame with an offset is not printed as PostgreSQL prints it";
+    let mut snail = Snail::open(&path).unwrap();
+    for q in [
+        "SELECT attname::text FROM pg_attribute WHERE attrelid = 'dn.a'::regclass AND attnum > 0 ORDER BY attnum",
+        "SELECT count(*)::text FROM pg_depend WHERE refobjid = 'dn.a'::regclass",
+    ] {
+        assert_eq!(snail.ask(q, None).unwrap_err().0, why, "{q}");
+    }
+    drop(snail);
+    let mut w = Snail::open_writing(&path).unwrap();
+    assert_eq!(w.execute("DROP TABLE dn.a").unwrap_err().0, why);
+    drop(w);
+    let mut snail = Snail::open(&path).unwrap();
+    assert_eq!(snail.ask("SELECT id FROM dn.a", None).unwrap().0.num_rows(), 0);
 }

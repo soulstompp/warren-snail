@@ -102,14 +102,14 @@ fn syntax_at(t: Option<&&sqlparser::tokenizer::Token>) -> Error {
 
 /// A setting's name as SET, SHOW and RESET read it: a word, or words with dots between, each lower
 /// case unless quoted; and the place after it.
-fn setting_name(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<(String, usize)> {
+fn setting_name(w: &[&sqlparser::tokenizer::Token], mut i: usize, release: u8) -> Result<(String, usize)> {
     use sqlparser::tokenizer::Token;
     let mut parts = Vec::new();
     loop {
         match w.get(i) {
             Some(Token::Word(x)) if x.quote_style.is_some() => parts.push(x.value.clone()),
             // A reserved word, or one that names a type or a function alone, is no part of a name.
-            Some(Token::Word(x)) if !col_id(&x.value) => return Err(syntax_at(w.get(i))),
+            Some(Token::Word(x)) if !col_id(&x.value, release) => return Err(syntax_at(w.get(i))),
             Some(Token::Word(x)) => parts.push(x.value.to_lowercase()),
             other => return Err(syntax_at(other)),
         }
@@ -211,7 +211,7 @@ fn zone_interval(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<Str
 
 /// SET, SHOW and RESET read off their words; none where the words are no such statement, or one
 /// the snail reads elsewhere: SET TRANSACTION, SET SESSION CHARACTERISTICS and SET CONSTRAINTS.
-fn parse_setting(tokens: &[sqlparser::tokenizer::Token]) -> Option<Result<Said>> {
+fn parse_setting(tokens: &[sqlparser::tokenizer::Token], release: u8) -> Option<Result<Said>> {
     let w = words(tokens);
     let first = keyword(w.first());
     let refused =
@@ -253,7 +253,7 @@ fn parse_setting(tokens: &[sqlparser::tokenizer::Token]) -> Option<Result<Said>>
                     },
                     // A keyword is no zone_value: only a string, a number or an IDENT is.
                     _ if matches!(w.get(i + 2), Some(sqlparser::tokenizer::Token::Word(x))
-                        if x.quote_style.is_none() && any_keyword(&x.value)) =>
+                        if x.quote_style.is_none() && any_keyword(&x.value, release)) =>
                     {
                         Some(Err(syntax_at(w.get(i + 2))))
                     }
@@ -290,7 +290,7 @@ fn parse_setting(tokens: &[sqlparser::tokenizer::Token]) -> Option<Result<Said>>
                     "the snail's random() draws from no seed a session sets",
                 ),
                 _ => {
-                    let (name, j) = match setting_name(&w, i) {
+                    let (name, j) = match setting_name(&w, i, release) {
                         Ok(x) => x,
                         Err(e) => return Some(Err(e)),
                     };
@@ -336,7 +336,7 @@ fn parse_setting(tokens: &[sqlparser::tokenizer::Token]) -> Option<Result<Said>>
                     return refused(&format!("{first} SESSION AUTHORIZATION"), roles)
                 }
                 ("ROLE", "") => return refused(&format!("{first} ROLE"), roles),
-                _ => match setting_name(&w, 1) {
+                _ => match setting_name(&w, 1, release) {
                     Ok((n, j)) if j == w.len() => Some(n),
                     Ok((_, j)) => return Some(Err(syntax_at(w.get(j)))),
                     Err(e) => return Some(Err(e)),
@@ -417,7 +417,7 @@ pub(super) fn said(
             nowait,
         }));
     }
-    if let Some(read) = parse_setting(tokens) {
+    if let Some(read) = parse_setting(tokens, catalog.release) {
         return read.map(Some);
     }
     if let Some(read) = super::prepared::parse_prepare(sql) {
@@ -893,22 +893,16 @@ fn parse_execute(sql: &str) -> Option<Result<Said>> {
     }
 }
 
-/// Whether a word, unquoted, is one of PostgreSQL's keywords, of any kind: none is an IDENT.
-fn any_keyword(word: &str) -> bool {
-    let lower = word.to_lowercase();
-    include_str!("../kwlist.txt")
-        .lines()
-        .any(|l| l.split('\t').next() == Some(lower.as_str()))
+/// Whether a word, unquoted, is one of PostgreSQL's keywords under the release, of any kind: none
+/// is an IDENT.
+fn any_keyword(word: &str, release: u8) -> bool {
+    super::spelled::keyword(word, release).is_some()
 }
 
-/// Whether a word, unquoted, is a name PostgreSQL's grammar takes as a column's (`ColId`): any
-/// word but its reserved keywords and those that name a type or a function alone.
-fn col_id(word: &str) -> bool {
-    let lower = word.to_lowercase();
-    !include_str!("../kwlist.txt").lines().any(|l| {
-        let mut f = l.split('\t');
-        f.next() == Some(lower.as_str()) && matches!(f.next(), Some("R" | "T"))
-    })
+/// Whether a word, unquoted, is a name PostgreSQL's grammar takes as a column's (`ColId`) under the
+/// release: any word but its reserved keywords and those that name a type or a function alone.
+fn col_id(word: &str, release: u8) -> bool {
+    !matches!(super::spelled::keyword(word, release), Some(('R' | 'T', _)))
 }
 
 impl super::Snail {

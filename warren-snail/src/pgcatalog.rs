@@ -592,9 +592,16 @@ fn of_public(table: &str, r: &HashMap<&str, Option<String>>) -> bool {
     }
 }
 
-/// The rows of a catalog table the file's own objects make, none for a table they make none of.
+/// The rows of a catalog table the file's own objects make, none for a table they make none of or
+/// where a view among them is not read.
 pub(crate) fn file_rows(catalog: &Catalog, table: &str) -> Vec<Row> {
     File::of(catalog).rows(table).unwrap_or_default()
+}
+
+/// The rows of a catalog table the file's own objects make, refused where a view among them is not
+/// read.
+pub(crate) fn file_rows_read(catalog: &Catalog, table: &str) -> Result<Vec<Row>> {
+    File::of(catalog).rows(table)
 }
 
 /// The OID of a column's type, as pg_attribute's atttypid gives it.
@@ -910,7 +917,7 @@ impl<'a> File<'a> {
             "pg_namespace" => self.namespaces(),
             "pg_class" => self.classes(),
             "pg_type" => self.pg_types(),
-            "pg_attribute" => self.attributes(),
+            "pg_attribute" => self.attributes()?,
             "pg_attrdef" => self.defaults(),
             "pg_constraint" => self.constraints(),
             "pg_index" => self.indexes(),
@@ -921,7 +928,7 @@ impl<'a> File<'a> {
             "pg_range" => self.ranges(),
             "pg_rewrite" => self.rules(),
             "pg_cast" => self.casts(),
-            "pg_depend" => self.depends(),
+            "pg_depend" => self.depends()?,
             "pg_trigger" => self.triggers(),
             "pg_description" => self.descriptions(),
             _ => Vec::new(),
@@ -1638,7 +1645,7 @@ impl<'a> File<'a> {
         r.insert("attstorage", f("typstorage"));
     }
 
-    fn attributes(&self) -> Vec<Row> {
+    fn attributes(&self) -> Result<Vec<Row>> {
         let mut out = Vec::new();
         let mut cat = None;
         for tb in self.tables() {
@@ -1733,16 +1740,20 @@ impl<'a> File<'a> {
         // A view's columns, as its question gives them; not while one is being read for them.
         if !READING_VIEWS.with(|r| r.replace(true)) {
             let cat = crate::deparse::cat::Cat::of(self.catalog);
-            for v in &self.catalog.views {
-                let rel = self.oid(Object::Class(full(&v.name)));
-                if let Ok((q, cols)) = crate::deparse::query::view_query(&cat, v) {
+            let mut views = || -> Result<()> {
+                for v in &self.catalog.views {
+                    let rel = self.oid(Object::Class(full(&v.name)));
+                    let (q, cols) = crate::deparse::query::view_query(&cat, v).map_err(|e| unread_view(v, e))?;
                     for (i, ((name, typid, typmod), t)) in cols.iter().zip(q.output()).enumerate() {
-                        let coll = crate::deparse::depend::output_collation(&cat, &q, &t.expr);
+                        let coll = crate::deparse::depend::output_collation(&cat, &q, &t.expr)?;
                         out.push(self.attribute_of(rel, i as i16 + 1, name, *typid, *typmod, coll, 0));
                     }
                 }
-            }
+                Ok(())
+            };
+            let read = views();
             READING_VIEWS.with(|r| r.set(false));
+            read?;
         }
         for s in &self.catalog.sequences {
             let rel = self.oid(Object::Class(full(&s.name)));
@@ -1759,7 +1770,7 @@ impl<'a> File<'a> {
                 out.push(r);
             }
         }
-        out
+        Ok(out)
     }
 
     fn defaults(&self) -> Vec<Row> {
@@ -2049,7 +2060,7 @@ impl<'a> File<'a> {
     /// The rows of pg_depend the file's objects make, as PostgreSQL's DDL records them: each
     /// object's on its schema, its parts, its types and collations, the objects its stored trees
     /// name, and what it is made beside; never one on an object PostgreSQL holds pinned.
-    fn depends(&self) -> Vec<Row> {
+    fn depends(&self) -> Result<Vec<Row>> {
         use crate::deparse::depend::{self as d, Addr};
         let _named = crate::oids::named(self.catalog.oids.clone());
         let cat = crate::deparse::cat::Cat::of(self.catalog);
@@ -2197,29 +2208,25 @@ impl<'a> File<'a> {
             let n = full(&v.name);
             let view = class(&n);
             out.many(view, vec![schema_of(&n)], 'n');
-            let analyzed = crate::deparse::query::view_query(&cat, v).ok();
-            if let Some((q, cols)) = &analyzed {
-                for (i, ((_, t, _), target)) in cols.iter().zip(q.output()).enumerate() {
-                    let col = Addr::column(view.oid, i as i32 + 1);
-                    out.one(col, Addr::of(d::TYPE, *t), 'n');
-                    if let Some(k) = collation(d::output_collation(&cat, q, &target.expr)) {
-                        out.one(col, k, 'n');
-                    }
+            let (q, cols) = crate::deparse::query::view_query(&cat, v).map_err(|e| unread_view(v, e))?;
+            for (i, ((_, t, _), target)) in cols.iter().zip(q.output()).enumerate() {
+                let col = Addr::column(view.oid, i as i32 + 1);
+                out.one(col, Addr::of(d::TYPE, *t), 'n');
+                if let Some(k) = collation(d::output_collation(&cat, &q, &target.expr)?) {
+                    out.one(col, k, 'n');
                 }
             }
             out.one(ty(&n), view, 'i');
             out.one(array(&n), ty(&n), 'i');
             let rule = Addr::of(d::REWRITE, self.oid(Object::Rule(n.clone())));
             out.one(rule, view, 'i');
-            if let Some((q, _)) = &analyzed {
-                // Before 16 a view's question kept OLD and NEW, the view itself, in its range table.
-                let mut refs = d::of_query(&cat, q);
-                if self.release < 16 {
-                    refs.push(view);
-                    refs = d::eliminated(refs);
-                }
-                out.all(rule, &refs, 'n');
+            // Before 16 a view's question kept OLD and NEW, the view itself, in its range table.
+            let mut refs = d::of_query(&cat, &q);
+            if self.release < 16 {
+                refs.push(view);
+                refs = d::eliminated(refs);
             }
+            out.all(rule, &refs, 'n');
         }
         let own_types = self.pg_types();
         for t in &self.catalog.types {
@@ -2353,7 +2360,7 @@ impl<'a> File<'a> {
             let coll = Addr::of(d::COLLATION, self.oid(Object::Collation(n.clone())));
             out.many(coll, vec![schema_of(&n)], 'n');
         }
-        out.rows
+        Ok(out.rows)
     }
 
     fn indexes(&self) -> Vec<Row> {
@@ -2773,40 +2780,46 @@ impl Deps {
     }
 }
 
-/// A column's collation, as pg_attribute's attcollation gives it: of a file's table or composite,
-/// or a built-in relation's as carried.
-pub(crate) fn attcollation_of(catalog: &Catalog, relid: u32, attno: i32) -> u32 {
+/// A column's collation, as pg_attribute's attcollation gives it: of a file's table, composite or
+/// view, or a built-in relation's as carried; refused for a view whose question is not read.
+pub(crate) fn attcollation_of(catalog: &Catalog, relid: u32, attno: i32) -> Result<u32> {
     let f = File::of(catalog);
     let at = (attno - 1) as usize;
     if let Some(Object::Class(n)) = catalog.oids.object(relid) {
         if let Some(t) = catalog.tables.iter().find(|t| full(&t.name) == *n) {
-            return t.columns.get(at).map_or(0, |c| f.column_collation(c));
+            return Ok(t.columns.get(at).map_or(0, |c| f.column_collation(c)));
         }
         for ty in &catalog.types {
             if let crate::catalog::TypeKind::Composite { fields } = &ty.kind {
                 if full(&ty.name) == *n {
-                    return fields.get(at).map_or(0, |(_, t, c)| f.field_facts(t, c.as_deref()).1);
+                    return Ok(fields.get(at).map_or(0, |(_, t, c)| f.field_facts(t, c.as_deref()).1));
                 }
             }
         }
         if let Some(v) = catalog.views.iter().find(|v| full(&v.name) == *n) {
             let cat = crate::deparse::cat::Cat::of(catalog);
-            if let Ok((q, _)) = crate::deparse::query::view_query(&cat, v) {
-                if let Some(t) = q.output().nth(at) {
-                    return crate::deparse::depend::output_collation(&cat, &q, &t.expr);
-                }
+            let (q, _) = crate::deparse::query::view_query(&cat, v).map_err(|e| unread_view(v, e))?;
+            let column = q.output().nth(at);
+            if let Some(t) = column {
+                return crate::deparse::depend::output_collation(&cat, &q, &t.expr);
             }
         }
-        return 0;
+        return Ok(0);
     }
-    built_in("pg_attribute", catalog.release)
+    Ok(built_in("pg_attribute", catalog.release)
         .iter()
         .find(|r| {
             r.get("attrelid").cloned().flatten() == Some(relid.to_string())
                 && r.get("attnum").cloned().flatten() == Some(attno.to_string())
         })
         .and_then(|r| r.get("attcollation").cloned().flatten()?.parse().ok())
-        .unwrap_or(0)
+        .unwrap_or(0))
+}
+
+/// A view of the file's whose question deparse analysis does not read, refused by its name where
+/// its catalog rows are asked for.
+fn unread_view(v: &crate::catalog::View, e: Error) -> Error {
+    Error::new(format!("the view {} is not read: {}", v.name, e.0))
 }
 
 /// What a range's row of pg_range says of it.

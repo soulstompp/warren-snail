@@ -5,7 +5,9 @@
 use super::analyze::Node;
 use super::cat::Cat;
 use super::print::{quote, Printer, INDENT_STD, INDENT_VAR};
-use super::query::{self, Bound, Frame, JoinKind, Jt, Query, RteKind, SetOp, Sort, SubKind, Target, Window};
+use super::query::{
+    self, Bound, Frame, GroupingSet, JoinKind, Jt, Query, RteKind, SetOp, Sort, SubKind, Target, Window,
+};
 use crate::oids::{full, Object};
 use crate::Result;
 use std::collections::HashMap;
@@ -534,7 +536,16 @@ impl Printer<'_, '_> {
             return self.values(&rows);
         }
         self.push(if q.is_return { "RETURN" } else { "SELECT" });
-        if q.distinct {
+        if !q.distinct_on.is_empty() {
+            self.push(" DISTINCT ON (");
+            for (i, s) in q.distinct_on.iter().enumerate() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                self.sortgroup(s, false)?;
+            }
+            self.push(")");
+        } else if q.distinct {
             self.push(" DISTINCT");
         }
         self.target_list(&q.targets)?;
@@ -543,14 +554,23 @@ impl Printer<'_, '_> {
             self.keyword(" WHERE ", -INDENT_STD, INDENT_STD, 1);
             self.expr(w, false)?;
         }
-        if !q.group.is_empty() {
+        if !q.group.is_empty() || !q.grouping_sets.is_empty() {
             self.keyword(" GROUP BY ", -INDENT_STD, INDENT_STD, 1);
             let save = std::mem::replace(&mut self.q.in_group_by, true);
-            for (i, g) in q.group.iter().enumerate() {
-                if i > 0 {
-                    self.push(", ");
+            if q.grouping_sets.is_empty() {
+                for (i, g) in q.group.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.sortgroup(g, false)?;
                 }
-                self.sortgroup(g, false)?;
+            } else {
+                for (i, set) in q.grouping_sets.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    self.grouping_set(set, &q.targets, true)?;
+                }
             }
             self.q.in_group_by = save;
         }
@@ -935,6 +955,50 @@ impl Printer<'_, '_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// get_rule_groupingset: a set unexpanded, a one-member set bare where its parent allows.
+    fn grouping_set(&mut self, set: &GroupingSet, targets: &[Target], omit_parens: bool) -> Result<()> {
+        let (word, members, omit) = match set {
+            GroupingSet::Empty => {
+                self.push("()");
+                return Ok(());
+            }
+            GroupingSet::Simple(places) => {
+                let parens = !omit_parens || places.len() != 1;
+                if parens {
+                    self.push("(");
+                }
+                for (i, &at) in places.iter().enumerate() {
+                    if i > 0 {
+                        self.push(", ");
+                    }
+                    let s = Sort {
+                        expr: targets[at - 1].expr.clone(),
+                        resno: at,
+                        desc: false,
+                        nulls_first: false,
+                    };
+                    self.sortgroup(&s, false)?;
+                }
+                if parens {
+                    self.push(")");
+                }
+                return Ok(());
+            }
+            GroupingSet::Rollup(m) => ("ROLLUP(", m, true),
+            GroupingSet::Cube(m) => ("CUBE(", m, true),
+            GroupingSet::Sets(m) => ("GROUPING SETS (", m, false),
+        };
+        self.push(word);
+        for (i, m) in members.iter().enumerate() {
+            if i > 0 {
+                self.push(", ");
+            }
+            self.grouping_set(m, targets, omit)?;
+        }
+        self.push(")");
         Ok(())
     }
 

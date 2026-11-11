@@ -32,7 +32,7 @@ pub(super) fn values(
     if let Some(rows) = super::prepared::rows(name, given.len(), ty)? {
         return Ok(rows);
     }
-    if let Some(rows) = super::rest::rows(name, &resolved)? {
+    if let Some(rows) = super::rest::rows(name, &resolved, super::handed::release_held())? {
         let ty = super::rest::keyword_record();
         return rows
             .into_iter()

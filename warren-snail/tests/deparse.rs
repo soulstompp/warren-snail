@@ -1,7 +1,7 @@
 //! The deparsers over a snail's catalog, each printing as PostgreSQL 18.6 prints the same object:
 //! pg_get_expr over a DEFAULT, a generation, a CHECK and an index's trees, pg_get_constraintdef and
 //! pg_get_indexdef, plain and pretty; pg_get_viewdef by OID and by name, plain, pretty and unwrapped,
-//! a built-in one at any wrap column;
+//! a built-in one at any wrap column, a DISTINCT ON or grouping-sets view's;
 //! pg_get_ruledef of a view's rule and of a built-in one; the pg_get_function_* functions of the file's
 //! functions, a range's constructors and built-ins; a parse tree's column read only through
 //! pg_get_expr. Every expected string was printed by 18.6 after the same DDL.
@@ -440,6 +440,59 @@ fn a_built_in_view_prints_at_any_wrap_column_as_postgresql_wraps_it() {
             s(&["1", "c0f6ef396785af150191d64625d62efa"]),
             s(&["77", "a7e1a6377acb0a0cf73acdab7aa1481d"]),
             s(&["1000", "22e809922734ad6f10369a1eb08cbac3"]),
+        ]
+    );
+}
+
+const GROUPED: &str ="CREATE SCHEMA dn; CREATE TABLE dn.a (id integer PRIMARY KEY, g integer, k integer); \
+     CREATE VIEW dn.vd AS SELECT DISTINCT ON (g) g, id FROM dn.a ORDER BY g, id; \
+     CREATE VIEW dn.vd2 AS SELECT DISTINCT ON (g, k / 10) g, id FROM dn.a ORDER BY g, k / 10, id DESC; \
+     CREATE VIEW dn.vd3 AS SELECT DISTINCT ON (k, g) g, k FROM dn.a ORDER BY g, k, id; \
+     CREATE VIEW dn.vd4 AS SELECT DISTINCT ON (id) id, k FROM dn.a; \
+     CREATE VIEW dn.vr AS SELECT count(*) FROM dn.a GROUP BY ROLLUP (g); \
+     CREATE VIEW dn.vc AS SELECT count(*) FROM dn.a GROUP BY CUBE (g, k); \
+     CREATE VIEW dn.vs AS SELECT count(*) FROM dn.a GROUP BY GROUPING SETS ((g), (k), ()); \
+     CREATE VIEW dn.vgr AS SELECT g, GROUPING(g) AS gr FROM dn.a GROUP BY id, ROLLUP (g); \
+     CREATE VIEW dn.vmix AS SELECT g, k, count(*) FROM dn.a GROUP BY id, g, ROLLUP (k), CUBE ((g, k)); \
+     CREATE VIEW dn.ve AS SELECT count(*) FROM dn.a GROUP BY (); \
+     CREATE VIEW dn.vrow AS SELECT count(*) FROM dn.a \
+     GROUP BY GROUPING SETS ((g, g, k), (g)), ROLLUP ((k, id), g), g, g;";
+
+#[test]
+fn distinct_on_and_grouping_sets_views_print_as_postgresql_prints_them() {
+    let path = tmp("dep-grouped.snail");
+    let catalog = Catalog::parse(GROUPED).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    let mut snail = Snail::open(&path).unwrap();
+    let got = rows(
+        &mut snail,
+        "SELECT c.relname::text, pg_get_viewdef(c.oid), pg_get_viewdef(c.oid, true) FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'v' AND n.nspname = 'dn' \
+         ORDER BY c.relname",
+    );
+    // 18.6, plain and pretty alike: DISTINCT ON's keys in ORDER BY's order, the sets unexpanded, an
+    // expression written twice at the top or in one row printed once.
+    let def = |name: &str, text: &str| s(&[name, text, text]);
+    assert_eq!(
+        got,
+        vec![
+            def("vc", " SELECT count(*) AS count\n   FROM dn.a\n  GROUP BY CUBE(g, k);"),
+            def("vd", " SELECT DISTINCT ON (g) g,\n    id\n   FROM dn.a\n  ORDER BY g, id;"),
+            def("vd2", " SELECT DISTINCT ON (g, (k / 10)) g,\n    id\n   FROM dn.a\n  ORDER BY g, (k / 10), id DESC;"),
+            def("vd3", " SELECT DISTINCT ON (g, k) g,\n    k\n   FROM dn.a\n  ORDER BY g, k, id;"),
+            def("vd4", " SELECT DISTINCT ON (id) id,\n    k\n   FROM dn.a;"),
+            def("ve", " SELECT count(*) AS count\n   FROM dn.a\n  GROUP BY ();"),
+            def("vgr", " SELECT g,\n    GROUPING(g) AS gr\n   FROM dn.a\n  GROUP BY id, ROLLUP(g);"),
+            def(
+                "vmix",
+                " SELECT g,\n    k,\n    count(*) AS count\n   FROM dn.a\n  GROUP BY id, g, ROLLUP(k), CUBE((g, k));"
+            ),
+            def("vr", " SELECT count(*) AS count\n   FROM dn.a\n  GROUP BY ROLLUP(g);"),
+            def(
+                "vrow",
+                " SELECT count(*) AS count\n   FROM dn.a\n  GROUP BY GROUPING SETS ((g, k), (g)), ROLLUP((k, id), g), g;"
+            ),
+            def("vs", " SELECT count(*) AS count\n   FROM dn.a\n  GROUP BY GROUPING SETS ((g), (k), ());"),
         ]
     );
 }
