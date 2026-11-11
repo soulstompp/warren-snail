@@ -170,7 +170,7 @@ pub(super) struct Sorter {
 
 impl Sorter {
     pub(super) fn new(p: &Prepared, casings: &Casings) -> Result<Sorter> {
-        let dirs = match p.order_by.map(|ob| &ob.kind) {
+        let mut dirs: Vec<(bool, bool)> = match p.order_by.map(|ob| &ob.kind) {
             Some(OrderByKind::Expressions(e)) => e
                 .iter()
                 .map(|o| {
@@ -181,6 +181,8 @@ impl Sorter {
             Some(_) => return Err(Error::new("ORDER BY ALL is not read")),
             None => Vec::new(),
         };
+        // The DISTINCT ON keys sorted after the ORDER BY's, ascending, NULLs last.
+        dirs.resize(p.sorted.len(), (false, false));
         Ok(Sorter {
             room: current(),
             spec: Rc::new(Spec {
@@ -223,7 +225,7 @@ impl Sorter {
         let rows = self.sorted_held()?;
         let run = Run::past();
         for h in rows {
-            run.push(h.row)?;
+            run.push(with_place(h.row, h.seq))?;
         }
         run.seal()?;
         self.runs.push(run);
@@ -233,14 +235,20 @@ impl Sorter {
         Ok(())
     }
 
-    /// A row more: held where the room has room for it, or while it holds less than a chunk. Else
-    /// cut into runs, the rows held written as one; or within two rooms written, or the row of the
-    /// greatest key held written to make room for it where its own is less.
+    /// A row more, after those pushed before it.
     pub(super) fn push(&mut self, row: Vec<Value>) -> Result<()> {
-        let key = sort_key(&row, &self.sorted, &self.under)?;
-        let bytes = row_width(&row);
         let seq = self.seq;
         self.seq += 1;
+        self.place(row, seq)
+    }
+
+    /// A row that came `seq`th: held where the room has room for it, or while it holds less than a
+    /// chunk. Else cut into runs, the rows held written as one; or within two rooms written, or the
+    /// row of the greatest key held written to make room for it where its own is less. A row written
+    /// carries the place it came, so that rows that tie come in the order they came.
+    fn place(&mut self, row: Vec<Value>, seq: u64) -> Result<()> {
+        let key = sort_key(&row, &self.sorted, &self.under)?;
+        let bytes = row_width(&row);
         let item = Held {
             key,
             seq,
@@ -277,9 +285,16 @@ impl Sorter {
                         let out = heap.pop().expect("a row is held");
                         self.bytes -= out.bytes;
                         room.let_go(out.bytes);
-                        self.past.get_or_insert_with(Run::past).push(out.row)?;
+                        self.past
+                            .get_or_insert_with(Run::past)
+                            .push(with_place(out.row, out.seq))?;
                     }
-                    _ => return self.past.get_or_insert_with(Run::past).push(item.row),
+                    _ => {
+                        return self
+                            .past
+                            .get_or_insert_with(Run::past)
+                            .push(with_place(item.row, item.seq))
+                    }
                 }
             }
         }
@@ -317,7 +332,12 @@ impl Sorter {
             };
             past.seal()?;
             self.rows_to_come = None;
-            past.each_chunk(&mut |c| c.into_iter().try_for_each(|r| self.push(r)))?;
+            past.each_chunk(&mut |c| {
+                c.into_iter().try_for_each(|r| {
+                    let (row, seq) = placed(r);
+                    self.place(row, seq)
+                })
+            })?;
         }
     }
 
@@ -336,10 +356,11 @@ impl Sorter {
                 r.hold_anyway(bytes);
             }
             part.each_chunk(&mut |c| {
-                for row in c {
+                for r in c {
+                    let (row, seq) = placed(r);
                     self.held.push(Held {
                         key: sort_key(&row, &self.sorted, &self.under)?,
-                        seq: 0,
+                        seq,
                         bytes: row_width(&row),
                         row,
                         spec: self.spec.clone(),
@@ -362,25 +383,27 @@ impl Sorter {
             let rest = self.runs.split_off(most);
             let first = std::mem::replace(&mut self.runs, rest);
             let run = Run::past();
-            self.merged(Vec::new(), &first, &mut |rows, _| {
+            self.merged(Vec::new(), &first, true, &mut |rows, _| {
                 rows.into_iter().try_for_each(|r| run.push(r))
             })?;
             run.seal()?;
             self.runs.push(run);
         }
         let runs = std::mem::take(&mut self.runs);
-        self.merged(held, &runs, each)?;
+        self.merged(held, &runs, false, each)?;
         if let Some(r) = &self.room {
             r.let_go(bytes);
         }
         Ok(())
     }
 
-    /// `held` and each of `runs` merged, handed on a chunk at a time.
+    /// `held` and each of `runs` merged, handed on a chunk at a time; each row with the place it
+    /// came, where `places`, to be written again.
     fn merged(
         &self,
         held: Vec<Held>,
         runs: &[Run],
+        places: bool,
         each: &mut dyn FnMut(Vec<Vec<Value>>, Vec<Vec<Value>>) -> Result<()>,
     ) -> Result<()> {
         let _pages = crate::room::flying(runs.len() as u64 * PAGE as u64);
@@ -391,40 +414,43 @@ impl Sorter {
                        first: &mut std::vec::IntoIter<Held>|
          -> Result<Option<Held>> {
             if i == backs.len() {
-                return Ok(first.next().map(|mut h| {
-                    h.seq = i as u64;
-                    h
-                }));
+                return Ok(first.next());
             }
             Ok(match backs[i].next_row()? {
-                Some(row) => Some(Held {
-                    key: sort_key(&row, &self.sorted, &self.under)?,
-                    seq: i as u64,
-                    bytes: 0,
-                    row,
-                    spec: self.spec.clone(),
-                }),
+                Some(r) => {
+                    let (row, seq) = placed(r);
+                    Some(Held {
+                        key: sort_key(&row, &self.sorted, &self.under)?,
+                        seq,
+                        bytes: 0,
+                        row,
+                        spec: self.spec.clone(),
+                    })
+                }
                 None => None,
             })
         };
+        // Each row beside the run it came from.
         let mut heap = BinaryHeap::with_capacity(backs.len() + 1);
         for i in 0..=backs.len() {
             if let Some(h) = next_of(i, &mut backs, &mut first)? {
-                heap.push(std::cmp::Reverse(h));
+                heap.push(std::cmp::Reverse((h, i)));
             }
         }
         let (mut rows, mut keys, mut bytes) = (Vec::new(), Vec::new(), 0u64);
-        while let Some(std::cmp::Reverse(h)) = heap.pop() {
-            let i = h.seq as usize;
+        while let Some(std::cmp::Reverse((h, i))) = heap.pop() {
             bytes += row_width(&h.row);
             keys.push(h.key);
-            rows.push(h.row);
+            rows.push(match places {
+                true => with_place(h.row, h.seq),
+                false => h.row,
+            });
             if bytes >= CHUNK {
                 let _flying = crate::room::flying(std::mem::take(&mut bytes));
                 each(std::mem::take(&mut rows), std::mem::take(&mut keys))?;
             }
             if let Some(n) = next_of(i, &mut backs, &mut first)? {
-                heap.push(std::cmp::Reverse(n));
+                heap.push(std::cmp::Reverse((n, i)));
             }
         }
         if let Some(e) = self.spec.failed.borrow_mut().take() {
@@ -435,6 +461,53 @@ impl Sorter {
             each(rows, keys)?;
         }
         Ok(())
+    }
+}
+
+/// A row as it is written past the room: with the place it came after its values.
+fn with_place(mut row: Vec<Value>, seq: u64) -> Vec<Value> {
+    row.push(Value::Int(seq as i64));
+    row
+}
+
+/// A row read back, and the place it came.
+fn placed(mut row: Vec<Value>) -> (Vec<Value>, u64) {
+    let seq = match row.pop() {
+        Some(Value::Int(n)) => n as u64,
+        _ => 0,
+    };
+    (row, seq)
+}
+
+/// What DISTINCT ON keeps of rows as they come in their order: each row whose first `lead` values
+/// it is sorted by tie with none it kept before, the first of each run, held from chunk to chunk.
+pub(super) struct First {
+    lead: usize,
+    last: Option<Vec<Value>>,
+}
+
+impl First {
+    pub(super) fn of(lead: usize) -> First {
+        First { lead, last: None }
+    }
+
+    /// Of `rows` as they come, with the values each is sorted by, those it keeps and their values.
+    pub(super) fn take(
+        &mut self,
+        rows: Vec<Vec<Value>>,
+        keys: Vec<Vec<Value>>,
+    ) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+        let mut kept = (Vec::new(), Vec::new());
+        for (row, key) in rows.into_iter().zip(keys) {
+            let lead = &key[..self.lead.min(key.len())];
+            if self.last.as_deref().is_some_and(|l| tie(l, lead)) {
+                continue;
+            }
+            self.last = Some(lead.to_vec());
+            kept.0.push(row);
+            kept.1.push(key);
+        }
+        kept
     }
 }
 

@@ -5835,6 +5835,9 @@ pub(super) struct Prepared<'q> {
     grouped: bool,
     /// Whether it returns each row once (SELECT DISTINCT).
     distinct: bool,
+    /// Where it returns the first row of each run its DISTINCT ON keys tie in: how many of the
+    /// places `sorted` begins with hold the keys.
+    distinct_on: Option<usize>,
     /// The rows it returns of those it makes, where it says.
     limit: Option<Limit<'q>>,
     /// Whether a window reads its partition whole: the step then holds its rows until they have
@@ -6210,11 +6213,17 @@ fn grouped_by<'q>(
     Ok(e)
 }
 
-/// The place in the select list an ORDER BY item names, as PostgreSQL's parser reads one: an
-/// ordinal's place; a bare name's item of that name, two different ones refused; an expression the
-/// select list writes as it is. None where it is an expression over the FROM's columns.
-fn sorted_by(e: &Expr, items: &[(&Expr, String)]) -> Result<Option<usize>> {
-    if let Some(at) = ordinal(e, "ORDER BY", items.len())? {
+/// The place in the select list an ORDER BY or DISTINCT ON item names, as PostgreSQL's parser
+/// reads one, `clause` naming which: an ordinal's place; a bare name's item of that name, two
+/// different ones refused; an expression the select list writes alike. None where it is an
+/// expression over the FROM's columns.
+fn sorted_by(
+    e: &Expr,
+    items: &[(&Expr, String)],
+    columns: &[super::typed::TypedColumn],
+    clause: &str,
+) -> Result<Option<usize>> {
+    if let Some(at) = ordinal(e, clause, items.len())? {
         return Ok(Some(at));
     }
     let mut bare = e;
@@ -6225,20 +6234,119 @@ fn sorted_by(e: &Expr, items: &[(&Expr, String)]) -> Result<Option<usize>> {
         let name = ident(i);
         let mut found = items.iter().enumerate().filter(|(_, (_, n))| *n == name);
         if let Some((at, (first, _))) = found.next() {
-            if found.any(|(_, (other, _))| other != first) {
-                return Err(Error::new(format!("ORDER BY \"{name}\" is ambiguous")));
+            if found.any(|(_, (other, _))| !alike(other, first, columns, None)) {
+                return Err(Error::new(format!("{clause} \"{name}\" is ambiguous")));
             }
             return Ok(Some(at));
         }
     }
-    Ok(items.iter().position(|(x, _)| *x == e))
+    Ok(items.iter().position(|(x, _)| alike(x, e, columns, None)))
 }
 
-/// The column of the FROM a reference names, where it names one.
-fn resolved<'c>(
+/// The place of an ORDER BY or DISTINCT ON expression among those a step makes beside its select
+/// list until they are sorted: one written alike, or a new one.
+fn hidden_place<'q>(
+    e: &'q Expr,
+    hidden: &mut Vec<&'q Expr>,
+    items: usize,
+    columns: &[super::typed::TypedColumn],
+) -> usize {
+    match hidden.iter().position(|h| alike(h, e, columns, None)) {
+        Some(at) => items + at,
+        None => {
+            hidden.push(e);
+            items + hidden.len() - 1
+        }
+    }
+}
+
+/// Whether two expressions are one as PostgreSQL's parser compares them once it has read them.
+fn alike(
+    a: &Expr,
+    b: &Expr,
+    columns: &[super::typed::TypedColumn],
+    types: Option<&super::typed::Types>,
+) -> bool {
+    a == b || as_read(a, columns, types) == as_read(b, columns, types)
+}
+
+/// An expression as PostgreSQL's parser leaves it: each column reference by the place of the
+/// FROM's column it names, unquoted names folded, parentheses passed over; and where its types are
+/// given, each cast to its operand's own type passed over.
+fn as_read(
     e: &Expr,
-    columns: &'c [super::typed::TypedColumn],
-) -> Option<&'c super::typed::TypedColumn> {
+    columns: &[super::typed::TypedColumn],
+    types: Option<&super::typed::Types>,
+) -> Expr {
+    use sqlparser::ast::{Ident, Visit, Visitor};
+    use std::ops::ControlFlow;
+    // Whether each expression in it, in the order a visit leaves them, is a cast to its operand's
+    // own type; its copy is visited in the same order.
+    struct Casts<'t>(Option<&'t super::typed::Types>, Vec<bool>);
+    impl Visitor for Casts<'_> {
+        type Break = ();
+        fn post_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            let passed = match (e, self.0) {
+                (
+                    Expr::Cast {
+                        expr, data_type, ..
+                    },
+                    Some(t),
+                ) => {
+                    let to = t.get(&(e as *const Expr));
+                    to.is_some()
+                        && to == t.get(&(&**expr as *const Expr))
+                        && super::handed::domain_named(data_type).is_none()
+                }
+                _ => false,
+            };
+            self.1.push(passed);
+            ControlFlow::Continue(())
+        }
+    }
+    let mut casts = Casts(types, Vec::new());
+    let _ = e.visit(&mut casts);
+    let folded = |i: &mut Ident| {
+        if i.quote_style.is_none() {
+            i.value = i.value.to_lowercase();
+        }
+    };
+    let mut out = e.clone();
+    let mut at = 0;
+    let _ = sqlparser::ast::visit_expressions_mut(&mut out, |x| {
+        let passed = casts.1.get(at).copied().unwrap_or(false);
+        at += 1;
+        if let Some(i) = resolved_place(x, columns) {
+            *x = Expr::Identifier(Ident::with_quote('"', format!("{MERGED}{i}")));
+            return ControlFlow::<()>::Continue(());
+        }
+        match x {
+            Expr::Nested(inner) => {
+                let inner = (**inner).clone();
+                *x = inner;
+            }
+            Expr::Cast { expr, .. } if passed => {
+                let inner = (**expr).clone();
+                *x = inner;
+            }
+            Expr::Identifier(i) => folded(i),
+            Expr::CompoundIdentifier(parts) => parts.iter_mut().for_each(folded),
+            Expr::Function(f) => {
+                for p in &mut f.name.0 {
+                    if let ObjectNamePart::Identifier(i) = p {
+                        folded(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    });
+    out
+}
+
+/// The place of the column of the FROM a reference names, where it names one.
+fn resolved_place(e: &Expr, columns: &[super::typed::TypedColumn]) -> Option<usize> {
     let (q, n) = column_of(e)?;
     match naming(
         columns
@@ -6249,9 +6357,17 @@ fn resolved<'c>(
     )
     .as_slice()
     {
-        [i] => columns.get(*i),
+        [i] => Some(*i),
         _ => None,
     }
+}
+
+/// The column of the FROM a reference names, where it names one.
+fn resolved<'c>(
+    e: &Expr,
+    columns: &'c [super::typed::TypedColumn],
+) -> Option<&'c super::typed::TypedColumn> {
+    columns.get(resolved_place(e, columns)?)
 }
 
 /// The first column an expression of a grouped step reads that is neither grouped by, nor read
@@ -6472,9 +6588,12 @@ pub(super) fn prepare<'q>(
         SetExpr::Select(s) => s,
         _ => return Err(Error::new("a step is a SELECT")),
     };
-    if matches!(s.distinct, Some(sqlparser::ast::Distinct::On(_))) {
-        return Err(Error::new("DISTINCT ON is not read in a step"));
-    }
+    // SELECT ALL returns every row, as a SELECT that says neither.
+    let distinct = matches!(s.distinct, Some(sqlparser::ast::Distinct::Distinct));
+    let on = match &s.distinct {
+        Some(sqlparser::ast::Distinct::On(keys)) => keys.as_slice(),
+        _ => &[],
+    };
     let limit = Limit::of(q)?;
     let items: Vec<(&Expr, String)> = s
         .projection
@@ -6486,23 +6605,20 @@ pub(super) fn prepare<'q>(
         })
         .collect::<Result<_>>()?;
     // ORDER BY sorts by the select list's column an item names by its place or its bare name, or
-    // that it writes as it is; any other is an expression over the FROM's columns, whose values the
+    // that it writes alike; any other is an expression over the FROM's columns, whose values the
     // step makes beside its own until they are sorted.
     let mut sorted = Vec::new();
     let mut hidden: Vec<&Expr> = Vec::new();
     if let Some(OrderByKind::Expressions(os)) = q.order_by.as_ref().map(|o| &o.kind) {
         for o in os {
-            sorted.push(match sorted_by(&o.expr, &items)? {
+            sorted.push(match sorted_by(&o.expr, &items, columns, "ORDER BY")? {
                 Some(at) => at,
-                None if s.distinct.is_some() => {
+                None if distinct => {
                     return Err(Error::new(
                         "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
                     ))
                 }
-                None => {
-                    hidden.push(&o.expr);
-                    items.len() + hidden.len() - 1
-                }
+                None => hidden_place(&o.expr, &mut hidden, items.len(), columns),
             });
         }
     }
@@ -6574,6 +6690,24 @@ pub(super) fn prepare<'q>(
         return Err(Error::new(
             "a set-returning function in GROUP BY is not read",
         ));
+    }
+    // Each DISTINCT ON key is read as an ORDER BY item is, after the ORDER BY and the GROUP BY, as
+    // PostgreSQL's parser reads it: the select list's column it names, or an expression the ORDER
+    // BY makes beside it, or one more of its own.
+    let mut keys = Vec::with_capacity(on.len());
+    for k in on {
+        keys.push(match sorted_by(k, &items, columns, "DISTINCT ON")? {
+            Some(at) => at,
+            None => {
+                let before = hidden.len();
+                let at = hidden_place(k, &mut hidden, items.len(), columns);
+                if hidden.len() > before {
+                    sets_placed(k)?;
+                    find_calls(k, &mut calls);
+                }
+                at
+            }
+        });
     }
     let grouped = !grouping.is_empty() || !calls.aggregates.is_empty() || having.is_some();
     let calls_windows_whole = calls.windows.iter().any(|w| !streams(w));
@@ -6676,11 +6810,94 @@ pub(super) fn prepare<'q>(
     }
     let listed: Vec<&Expr> = items.iter().map(|(e, _)| *e).collect();
     windows::checked(&calls.windows, &listed, &mut typing, release)?;
+    // DISTINCT ON returns the first row of each run of rows its keys tie in, sorted by the ORDER BY,
+    // whose items before its first other than a key hold every key; a key after them is read only
+    // where an item before it sorts by it. Under an ORDER BY of keys alone, the keys it leaves out
+    // sort after them, ascending, NULLs last, as PostgreSQL's parser adds them.
+    let distinct_on = match on.is_empty() {
+        true => None,
+        false => {
+            // An expression beside the select list, a key or the ORDER BY's, is read as an item or
+            // an expression before it alike once each cast to its operand's own type is passed over.
+            let typed = Some(&typing.types);
+            let read_as = |at: usize| -> usize {
+                let Some(own) = at.checked_sub(items.len()) else {
+                    return at;
+                };
+                let e = hidden[own];
+                if let Some(i) = items.iter().position(|(x, _)| alike(x, e, columns, typed)) {
+                    return i;
+                }
+                hidden[..own]
+                    .iter()
+                    .position(|h| alike(h, e, columns, typed))
+                    .map_or(at, |h| items.len() + h)
+            };
+            for at in sorted.iter_mut() {
+                *at = read_as(*at);
+            }
+            for at in keys.iter_mut() {
+                *at = read_as(*at);
+            }
+            let unmatched = || {
+                Error::new("SELECT DISTINCT ON expressions must match initial ORDER BY expressions")
+            };
+            let mut lead = 0;
+            let mut passed = false;
+            for (i, &at) in sorted.iter().enumerate() {
+                match (keys.contains(&at), passed) {
+                    (false, _) => passed = true,
+                    (true, false) => lead = i + 1,
+                    (true, true) if sorted[..i].contains(&at) => {}
+                    (true, true) => return Err(unmatched()),
+                }
+            }
+            for &k in &keys {
+                if sorted[..lead].contains(&k) {
+                    continue;
+                }
+                if passed {
+                    return Err(unmatched());
+                }
+                let ty = match returns.get(k) {
+                    Some(t) => *t,
+                    None => typing.type_of(hidden[k - items.len()])?,
+                };
+                if let Some(part) = ty.and_then(ColumnType::unequal_part) {
+                    return Err(unequal(part));
+                }
+                sorted.push(k);
+                lead = sorted.len();
+            }
+            // A set the select list makes where no sort key makes one, PostgreSQL makes after the
+            // rows DISTINCT ON keeps, under an ORDER BY.
+            let at = |i: usize| {
+                items
+                    .get(i)
+                    .map_or_else(|| hidden[i - items.len()], |(e, _)| *e)
+            };
+            let after = items
+                .iter()
+                .enumerate()
+                .any(|(i, (e, _))| !sorted.contains(&i) && holds_set(e));
+            if q.order_by.is_some() && after && !sorted.iter().any(|&i| holds_set(at(i))) {
+                return Err(Error::new(
+                    "a set-returning function in the select list beside DISTINCT ON and ORDER BY \
+                     is not read",
+                ));
+            }
+            Some(lead)
+        }
+    };
     // An item that draws from a sequence and is no sort key is made above the sort and below the
     // cut, as PostgreSQL's planner places a volatile item: in the rows' sorted order, for each row
-    // the LIMIT and OFFSET read.
+    // the LIMIT and OFFSET read. Under DISTINCT ON, only where it sorts by an ORDER BY.
     let cuts = q.order_by.is_some() || limit.is_some();
-    let plain = s.distinct.is_none() && !grouped && calls.windows.is_empty() && calls.sets.is_empty();
+    let plain = !distinct
+        && (on.is_empty() || q.order_by.is_some())
+        && !grouped
+        && calls.windows.is_empty()
+        && calls.sets.is_empty();
     let drawn = match cuts && plain {
         true => items
             .iter()
@@ -6704,7 +6921,8 @@ pub(super) fn prepare<'q>(
         grouping,
         grouped,
         whole_windows: calls_windows_whole,
-        distinct: s.distinct.is_some(),
+        distinct,
+        distinct_on,
         limit,
         types: typing.types,
         returns,
@@ -7163,7 +7381,7 @@ impl<'q> StepRun<'q> {
             rows_to_come: None,
             closed: false,
             sorter: None,
-            sorts: p.order_by.is_some(),
+            sorts: p.order_by.is_some() || p.distinct_on.is_some(),
             cut: None,
         };
         StepRun {
@@ -7459,7 +7677,9 @@ impl<'q> StepRun<'q> {
                 emit(rows, going)
             })?;
             order_out = order
-                .filter(|_| p.calls.sets.is_empty() && p.order_by.is_none())
+                .filter(|_| {
+                    p.calls.sets.is_empty() && p.order_by.is_none() && p.distinct_on.is_none()
+                })
                 .and_then(|o| {
                     p.items.iter().position(|(e, _)| {
                         column_of(e)
@@ -7494,7 +7714,13 @@ impl<'q> StepRun<'q> {
                 Some(l) => Some(sorted::Cut::of(l, &frame)?),
                 None => None,
             };
-            sorter.finish(&mut |mut rows, keys| {
+            // DISTINCT ON keeps its rows before the cut reads them.
+            let mut first = p.distinct_on.map(sorted::First::of);
+            sorter.finish(&mut |rows, keys| {
+                let (mut rows, keys) = match &mut first {
+                    Some(f) => f.take(rows, keys),
+                    None => (rows, keys),
+                };
                 let rows = match &mut cut {
                     Some(c) => c.take(rows, &keys, &mut |r| p.drawn_after(r, frame_ref))?,
                     None => {
@@ -7915,6 +8141,7 @@ impl<'q> Stream<'q> {
                     || p.whole_windows
                     || p.limit.is_some()
                     || p.distinct
+                    || p.distinct_on.is_some()
                 {
                     Kind::Folded
                 } else {
@@ -7985,6 +8212,7 @@ impl<'q> Stream<'q> {
                 p.order_by.is_some()
                     && !p.grouped
                     && !p.distinct
+                    && p.distinct_on.is_none()
                     && !p.whole_windows
                     && p.calls.sets.is_empty()
                     && p.calls.windows.is_empty()
