@@ -1324,6 +1324,55 @@ fn rows_past_several_rooms_are_written_once_and_read_back_once_at_each_place() {
     );
 }
 
+/// Rows of very different widths: 20 of 3,000 bytes of text, then 280 of one byte that sort before
+/// them, then 200 of one byte that sort after them.
+fn widths(name: &str) -> PathBuf {
+    let path = tmp(&format!("rounds-{name}.snail"));
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.w (id bigint NOT NULL, k bigint NOT NULL, \
+               pad text NOT NULL, PRIMARY KEY (id));";
+    let catalog = Catalog::parse(ddl).unwrap();
+    let k = |i: i64| match i {
+        0..=19 => 100_000 + i,
+        20..=299 => i,
+        _ => 200_000 + i,
+    };
+    let pad = |i: i64| if i < 20 { "x".repeat(3000) } else { "x".into() };
+    let w = Rows {
+        columns: vec![
+            weather::ints(&(0..=499).collect::<Vec<_>>()),
+            weather::ints(&(0..=499).map(k).collect::<Vec<_>>()),
+            Values::Text((0..=499).map(|i| Some(pad(i))).collect()),
+        ],
+    };
+    write(&path, &catalog, &[("s.w".into(), w)]).unwrap();
+    path
+}
+
+#[test]
+fn a_row_past_the_room_that_sorts_after_one_written_is_never_handed_on_before_it() {
+    let path = widths("widths");
+    let dir = spill_dir("widths");
+    // Each wide row is 3,023 bytes as held, each narrow one 24: 71,980 bytes, past a room of 64 KiB
+    // and within two. A narrow row that sorts before the wide ones lets the last of them go, freeing
+    // room for many; the narrow rows that sort after it are set aside with it, held in the room it
+    // freed until one finds none, then written. 18.6's order: the narrow rows that sort first, the
+    // wide, the narrow that sort last. The wide row let go is the one page written; the narrow rows
+    // written lie in the part page kept in memory.
+    let q = "SELECT w.id FROM s.w w ORDER BY w.k, w.pad";
+    let want: Vec<Vec<i64>> = (20..=299)
+        .chain(0..=19)
+        .chain(300..=499)
+        .map(|i| vec![i])
+        .collect();
+    let (got, round) = past_room(&path, &dir, 64 << 10, q);
+    assert_eq!(got, want, "{q}");
+    assert_eq!(round.spill_pages_written, 1, "{q}: {round:?}");
+    // Given room for every row, the same rows in the same order, nothing written.
+    let (got, round) = past_room(&path, &dir, 1 << 20, q);
+    assert_eq!(got, want, "{q}");
+    assert_eq!(round.spill_pages_written, 0, "{q}: {round:?}");
+}
+
 #[test]
 fn a_step_read_after_a_fold_over_one_table_holds_its_rows_in_the_room() {
     let path = owned("after");

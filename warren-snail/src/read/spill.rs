@@ -392,6 +392,26 @@ impl Run {
         self.stored.borrow().spilled
     }
 
+    /// The bytes of the rows it holds in the room.
+    pub(super) fn held_bytes(&self) -> u64 {
+        self.stored.borrow().bytes
+    }
+
+    /// Hands `each` the rows it holds in the room, in order, each letting its room go as it is
+    /// handed on; those written stay, to be read back.
+    pub(super) fn hand_held(&self, each: &mut dyn FnMut(Vec<Value>) -> Result<()>) -> Result<()> {
+        let rows = std::mem::take(&mut self.stored.borrow_mut().rows);
+        for row in rows {
+            let w = row_width(&row);
+            self.stored.borrow_mut().bytes -= w;
+            if let Some(r) = &self.room {
+                r.let_go(w);
+            }
+            each(row)?;
+        }
+        Ok(())
+    }
+
     /// The rows held in the room.
     #[cfg(test)]
     pub(super) fn held(&self) -> std::cell::Ref<'_, Vec<Vec<Value>>> {

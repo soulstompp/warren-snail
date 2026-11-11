@@ -1,7 +1,8 @@
 //! A step's rows sorted as its ORDER BY says, in the round's room. Past it, within two rooms, the rows
-//! that sort last are written, a row at a time, so that every row written sorts after every row held:
-//! those held are handed on sorted, then those written read back. Past two rooms, runs of a room
-//! each, merged. And what a LIMIT keeps of rows as they come in their order.
+//! that sort last are set aside, a row at a time, written where the room has no room for them, so
+//! that every row set aside sorts after every row held: those held are handed on sorted, then those
+//! set aside. Past two rooms, runs of a room each, merged. And what a LIMIT keeps of rows as they
+//! come in their order.
 
 use super::{compare, computed_none, tie, Casing, Casings, Frame, Limit, Prepared, Value};
 use crate::cut::PAGE;
@@ -245,12 +246,12 @@ impl Sorter {
 
     /// A row at place `seq`: held where the room has room for it, or while it holds less than a
     /// chunk. Else, where `cut`, cut into runs, the rows held written as one; or within two rooms
-    /// written as it came, or the row of the greatest key held let go to make room for it where its
-    /// own is less.
+    /// set aside as it came, or the row of the greatest key held let go to make room for it where its
+    /// own is less. Within two rooms, a row that sorts after one set aside is set aside too.
     fn place(&mut self, row: Vec<Value>, seq: u64, cut: bool) -> Result<()> {
         let key = sort_key(&row, &self.sorted, &self.under)?;
         let bytes = row_width(&row);
-        let item = Held {
+        let mut item = Held {
             key,
             seq,
             row,
@@ -260,10 +261,24 @@ impl Sorter {
         let room = self.room.clone();
         if let Some(room) = room {
             loop {
+                // Where a row let go freed more room than the row that took it needs, or another
+                // place let room go, a row that sorts after one set aside is set aside with those
+                // that came, to be handed on after it.
+                let after = !self.in_runs
+                    && self
+                        .past
+                        .as_ref()
+                        .and_then(|p| p.least.as_ref())
+                        .is_some_and(|l| item > *l);
                 if room.hold(bytes) {
-                    break;
+                    if !after {
+                        break;
+                    }
+                    room.let_go(bytes);
+                    let past = self.past.as_mut().expect("rows were set aside");
+                    return past.came.push(item.row);
                 }
-                if self.bytes + bytes <= CHUNK {
+                if !after && self.bytes + bytes <= CHUNK {
                     room.hold_anyway(bytes);
                     break;
                 }
@@ -286,15 +301,21 @@ impl Sorter {
                     .get_or_insert_with(|| std::mem::take(&mut self.held).into());
                 match heap.peek() {
                     Some(top) if item < *top => {
-                        let out = heap.pop().expect("a row is held");
+                        let mut out = heap.pop().expect("a row is held");
                         self.bytes -= out.bytes;
                         room.let_go(out.bytes);
-                        self.past
-                            .get_or_insert_with(Past::new)
-                            .let_go
-                            .push(out.row)?;
+                        let past = self.past.get_or_insert_with(Past::new);
+                        past.let_go.push(std::mem::take(&mut out.row))?;
+                        past.least = Some(out);
                     }
-                    _ => return self.past.get_or_insert_with(Past::new).came.push(item.row),
+                    _ => {
+                        let past = self.past.get_or_insert_with(Past::new);
+                        past.came.push(std::mem::take(&mut item.row))?;
+                        if !after {
+                            past.least = Some(item);
+                        }
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -348,8 +369,11 @@ impl Sorter {
             Some(part) => {
                 self.write_run()?;
                 bytes = part.total();
+                // The rows that came it holds let their room go as they are handed on, and are held
+                // again here.
+                let came = part.came.held_bytes();
                 if let Some(r) = &self.room {
-                    r.hold_anyway(bytes);
+                    r.hold_anyway(bytes - came);
                 }
                 part.each(&mut |row, seq, _| {
                     self.held.push(Held {
@@ -361,6 +385,9 @@ impl Sorter {
                     });
                     Ok(())
                 })?;
+                if let Some(r) = self.room.as_ref().filter(|_| came > 0) {
+                    r.hold_anyway(came);
+                }
                 true
             }
             None => false,
@@ -472,19 +499,23 @@ impl Sorter {
     }
 }
 
-/// The rows written within two rooms: those the room let go to make room for a row that sorts before
-/// them, each sorting before the one let go before it; and those written as they came, each sorting
-/// after every row held then. Of rows that tie, those let go came before those written as they came.
+/// The rows set aside within two rooms: those the room let go to make room for a row that sorts
+/// before them, each sorting before the one let go before it, written; and those set aside as they
+/// came, each sorting after every row held then, held while the room has room for them and none of
+/// them is written. Of rows that tie, those let go came before those set aside as they came.
 struct Past {
     let_go: Run,
     came: Run,
+    /// The least of its rows, its values and place.
+    least: Option<Held>,
 }
 
 impl Past {
     fn new() -> Past {
         Past {
             let_go: Run::past(),
-            came: Run::past(),
+            came: Run::new(),
+            least: None,
         }
     }
 
@@ -495,8 +526,8 @@ impl Past {
 
     /// Its rows read back once, each with a place that keeps rows that tie in the order they came,
     /// and whether it was let go: those let go first, the last let go at the first place, then those
-    /// written as they came. These keep their last page in memory, so the two write no more pages
-    /// than one.
+    /// set aside as they came, those held each letting its room go as it is handed on. These keep
+    /// their last page in memory, so the two write no more pages than one.
     fn each(&self, each: &mut dyn FnMut(Vec<Value>, u64, bool) -> Result<()>) -> Result<()> {
         self.let_go.seal()?;
         let n = self.let_go.len() as u64;
@@ -508,6 +539,10 @@ impl Past {
             })
         })?;
         let mut at = n;
+        self.came.hand_held(&mut |row| {
+            at += 1;
+            each(row, at - 1, false)
+        })?;
         self.came.each_chunk(&mut |c| {
             c.into_iter().try_for_each(|row| {
                 at += 1;
