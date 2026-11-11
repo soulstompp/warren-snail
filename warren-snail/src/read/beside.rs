@@ -410,20 +410,36 @@ impl Snail {
             if effects.is_empty() {
                 continue;
             }
-            let mut bytes = Vec::new();
+            let mut w = super::serial::Written::default();
             match self.top_on(&newest, table, order)? {
                 Some((head, mut top)) if !top.entries.is_empty() => {
                     for e in &effects {
                         let mut path = Vec::new();
                         self.locate(&mut top, &head, &e.key, &mut path)?;
-                        bytes.push(lock::block_byte_of(ti, oi, &entry_at(&top, &path).first));
+                        let b = lock::block_byte_of(ti, oi, &entry_at(&top, &path).first);
+                        w.blocks.push(b);
+                        if e.lands {
+                            w.landed.push(b);
+                        }
                     }
-                    bytes.sort_unstable();
-                    bytes.dedup();
                 }
-                _ => bytes.push(lock::block_byte_of(ti, oi, &[])),
+                _ => {
+                    let b = lock::block_byte_of(ti, oi, &[]);
+                    w.blocks.push(b);
+                    w.landed.push(b);
+                }
             }
-            self.mark_wrote(ti, oi, &bytes)?;
+            if order.table_order {
+                w.rows = effects
+                    .iter()
+                    .map(|e| lock::row_byte(ti, oi, &e.key))
+                    .collect();
+            }
+            for v in [&mut w.blocks, &mut w.rows, &mut w.landed] {
+                v.sort_unstable();
+                v.dedup();
+            }
+            self.mark_wrote(ti, oi, &w)?;
         }
         Ok(())
     }

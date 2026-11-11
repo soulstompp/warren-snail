@@ -621,8 +621,20 @@ fn a_host_s_monitor_is_told_of_each_block_and_the_file_keeps_no_marks() {
     assert!(told.borrow().iter().any(|t| t == "read s.t t_pkey whole"));
     assert!(told.borrow().iter().any(|t| t == "wrote s.t t_pkey"));
     told.borrow_mut().clear();
+    // A read by the whole key tells two places, the block's gaps and the row; one of a range, its
+    // block.
     w.ask("SELECT sum(t.v) FROM s.t t WHERE t.id = 5", None)
         .unwrap();
+    assert_eq!(
+        told.borrow().as_slice(),
+        ["read s.t t_pkey block", "read s.t t_pkey block"]
+    );
+    told.borrow_mut().clear();
+    w.ask(
+        "SELECT sum(t.v) FROM s.t t WHERE t.id >= 5 AND t.id <= 9",
+        None,
+    )
+    .unwrap();
     assert_eq!(told.borrow().as_slice(), ["read s.t t_pkey block"]);
     w.execute("COMMIT").unwrap();
     said.committed(7);

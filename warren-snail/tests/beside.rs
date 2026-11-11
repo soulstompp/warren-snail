@@ -267,13 +267,31 @@ fn an_update_a_delete_and_an_insert_each_of_its_own_row_of_one_block_all_commit(
 }
 
 #[test]
-fn at_serializable_two_updates_of_one_block_meet_as_their_scans_mark_the_block() {
+fn at_serializable_two_updates_of_one_block_by_key_both_commit_and_by_ranges_meet() {
+    // By key each marks its row and the block's gaps, and writes its row in place.
     let path = made("marked");
     let (mut a, mut b) = (open(&path), open(&path));
     run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     run(&mut a, &format!("UPDATE s.t SET v = 1 WHERE id = {C}"));
     run(&mut b, &format!("UPDATE s.t SET v = 2 WHERE id = {D}"));
+    run(&mut a, "COMMIT");
+    run(&mut b, "COMMIT");
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!((value(&mut r, C), value(&mut r, D)), (1, 2));
+    // By a range each scan marks the block whole, so each write meets the other's scan.
+    let path = made("ranged");
+    let (mut a, mut b) = (open(&path), open(&path));
+    run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(
+        &mut a,
+        &format!("UPDATE s.t SET v = 1 WHERE id BETWEEN {C} AND {}", C + 8),
+    );
+    run(
+        &mut b,
+        &format!("UPDATE s.t SET v = 2 WHERE id BETWEEN {D} AND {}", D + 8),
+    );
     run(&mut a, "COMMIT");
     let e = refused(&mut b, "COMMIT");
     assert!(

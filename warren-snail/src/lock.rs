@@ -214,6 +214,18 @@ pub(crate) fn key_byte(table: usize, order: usize, key: &[crate::places::KeyValu
     block_byte(&(table as u64, order as u64, "key", key))
 }
 
+/// The byte a serializable round marks for what lands between the keys of the block of lock byte
+/// `block`: apart from the block's own, which stands for its rows and its gaps at once.
+pub(crate) fn gap_byte(block: u64) -> u64 {
+    block_byte(&(block, "gap"))
+}
+
+/// The byte a serializable round marks for one row, by its key on the table's order: apart from any
+/// block's and any gap's, and moved by no cut.
+pub(crate) fn row_byte(table: usize, order: usize, key: &[crate::places::KeyValue]) -> u64 {
+    block_byte(&(table as u64, order as u64, "row", key))
+}
+
 /// The two bytes of a row's lock, its key's and the rest's, from its table's place in the catalog
 /// and its key's bytes, the same in every build of this version; they fall among the block bytes.
 pub(crate) fn row_bytes(table: usize, key: &[u8]) -> (u64, u64) {

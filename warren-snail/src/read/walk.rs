@@ -289,6 +289,19 @@ impl Walk {
         self.over(k.cmp(self.hi.as_slice()))
     }
 
+    /// The one key of the table's own order, a unique one, the walk fixes whole, each of its levels a
+    /// column by `=`: at most one row, which a serializable round marks by itself.
+    pub(super) fn point(&self, order: &Order) -> Option<&[KeyValue]> {
+        let whole = order.unique
+            && order.table_order
+            && self.m == order.levels.len()
+            && order.levels.iter().all(|l| matches!(l, Level::Column(_)))
+            && self.lo == self.hi
+            && self.ends_open == (false, false)
+            && !self.lo.iter().any(KeyValue::is_null);
+        whole.then_some(self.lo.as_slice())
+    }
+
     /// Counts what the entries left open hold now in the round's room.
     fn count_open(&mut self) {
         let now = (self.open.capacity() * std::mem::size_of::<Open>()) as u64

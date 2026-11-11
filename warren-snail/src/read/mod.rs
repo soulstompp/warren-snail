@@ -397,6 +397,84 @@ fn order_tag(table: usize, order: usize) -> u32 {
     (table as u32) << 16 | order as u32
 }
 
+/// What a question a pipeline reads off one table hands to the table's read: its FROM, the alias it
+/// gives the table kept, and each conjunct of its WHERE fixing a column of the table's order by `=`
+/// with a constant written out, so that the read goes by the key and a serializable round marks what
+/// that key reaches. The pipeline reads the WHERE whole after. None where the question has a WITH,
+/// whose steps may give a column of the table's name another value, or a FROM of more than the table.
+fn keyed_conjuncts<'q>(
+    q: &'q sqlparser::ast::Query,
+    table: &Table,
+    order: &crate::catalog::Order,
+) -> (String, Vec<&'q sqlparser::ast::Expr>) {
+    use sqlparser::ast::{BinaryOperator, Expr, SetExpr, TableFactor, Value};
+    fn constant(e: &Expr) -> bool {
+        match e {
+            Expr::Value(v) => !matches!(v.value, Value::Placeholder(_) | Value::Null),
+            Expr::TypedString { .. } => true,
+            Expr::Cast { expr, .. } | Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+                constant(expr)
+            }
+            _ => false,
+        }
+    }
+    let bare = || (table.name.clone(), Vec::new());
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return bare();
+    };
+    let [only] = s.from.as_slice() else {
+        return bare();
+    };
+    if q.with.is_some() || !only.joins.is_empty() {
+        return bare();
+    }
+    let TableFactor::Table { alias, .. } = &only.relation else {
+        return bare();
+    };
+    let (from, named) = match alias {
+        Some(a) if a.columns.is_empty() => (
+            format!("{} {}", table.name, a.name),
+            crate::catalog::ident(&a.name),
+        ),
+        Some(_) => return bare(),
+        None => (
+            table.name.clone(),
+            table
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    };
+    let keys: Vec<&str> = order
+        .levels
+        .iter()
+        .map(|l| table.columns[l.column()].name.as_str())
+        .collect();
+    // A column of the order's key, bare or under the name the FROM gives the table.
+    let key = |e: &Expr| match e {
+        Expr::Identifier(i) => keys.contains(&crate::catalog::ident(i).as_str()),
+        Expr::CompoundIdentifier(p) if p.len() == 2 => {
+            crate::catalog::ident(&p[0]) == named
+                && keys.contains(&crate::catalog::ident(&p[1]).as_str())
+        }
+        _ => false,
+    };
+    let mut all = Vec::new();
+    if let Some(w) = &s.selection {
+        relations::conjuncts(w, &mut all);
+    }
+    let keyed = all
+        .into_iter()
+        .filter(|c| {
+            matches!(c, Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
+                if key(left) && constant(right) || key(right) && constant(left))
+        })
+        .collect();
+    (from, keyed)
+}
+
 /// A snail opened for reading: its root and its catalog read, nothing else.
 pub struct Snail {
     reader: Reader,
@@ -1741,10 +1819,8 @@ impl Snail {
             .map(|&c| format!("\"{}\"", table.columns[c].name.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ");
-        let base = question::parse(
-            &self.catalog,
-            &format!("SELECT {columns} FROM {}", table.name),
-        )?;
+        let (from, keyed) = keyed_conjuncts(q, table, order);
+        let base = relations::parsed(&self.catalog, &columns, &from, &keyed)?;
         // The table's order carries its windows where it is one level, unique, every row its own
         // peer: its key's column, NOT NULL, or holding at most one NULL, last.
         let along = match (order.unique, order.levels.as_slice()) {

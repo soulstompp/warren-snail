@@ -85,21 +85,24 @@ pub trait Judge {
     }
 }
 
-/// What is told, inside a host with a monitor of its own, of each place a round reads and each block a
-/// write changes, so that the host's monitor is the one monitor: the file keeps no marks. A block
-/// comes by its lock's byte, an order by its table's and its own names; its top is every place of it.
-/// An error refuses the round.
+/// What is told, inside a host with a monitor of its own, of each place a round reads and each place a
+/// write changes, so that the host's monitor is the one monitor: the file keeps no marks. A place
+/// comes by its lock's byte: a block's, its rows and its gaps at once; a block's gaps alone; or one
+/// row's. An order comes by its table's and its own names; its top is every place of it. An error
+/// refuses the round.
 pub trait Monitor {
-    /// A round read the block, gaps and all; or, with none, every place of the order.
+    /// A round read the place; or, with none, every place of the order.
     fn read(&self, table: &str, order: &str, block: Option<u64>) -> Result<()>;
 
-    /// A write changes the block.
+    /// A write changes the place.
     fn wrote(&self, table: &str, order: &str, block: u64) -> Result<()>;
 
-    /// A commit cut the block `from`, or laid it out afresh: what `to` holds lay in it.
+    /// A commit cut the block `from`, or laid it out afresh: what `to` holds lay in it; told of the
+    /// blocks and of their gaps.
     fn cut(&self, table: &str, order: &str, from: u64, to: u64) -> Result<()>;
 
-    /// A commit let the block go, holding no row: what lands in its gaps lands in another of the order.
+    /// A commit let the block go, holding no row, told of it and of its gaps: what lands in its gaps
+    /// lands in another of the order.
     fn let_go(&self, table: &str, order: &str, block: u64) -> Result<()>;
 }
 

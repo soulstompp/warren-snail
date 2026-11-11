@@ -1,6 +1,8 @@
-//! A serializable transaction's round. Each entry a round looks at is marked, each block a write
-//! changes tests the marks on it, each read tests the writers of what it marked, and each edge found
-//! is tested for two in a row, as PostgreSQL's monitor tests them; the failure in its words. A running
+//! A serializable transaction's round. Each block a round looks at is marked, or, read by one whole
+//! key of the table's order, that key's row and the block's gaps; each write tests the marks of the
+//! blocks it changes, of the rows it changes, and of the gaps it lands keys in; each read tests the
+//! writers of what it marked; and each edge found is tested for two in a row, as PostgreSQL's monitor
+//! tests them; the failure in its words. A running
 //! transaction's marks are locks on bytes past the file's pages, and a committed one's are written
 //! into the records the root names, kept while a round older than its commit runs.
 //!
@@ -26,6 +28,65 @@ const FAILED: &str = "could not serialize access due to read/write dependencies 
 /// The entries a transaction marks on one order before it marks the order whole, as PostgreSQL's
 /// default `max_pred_locks_per_relation` promotes a relation's.
 const MARKS_AN_ORDER: usize = 32;
+
+/// What a mark stands for, by its block's byte or its row's: a block's rows and the gaps between its
+/// keys at once; those gaps alone; or one row. PostgreSQL's monitor marks an index's leaf page for its
+/// gaps and a heap tuple for its row, and a block is both at once.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Mark {
+    Block(u64),
+    Gap(u64),
+    Row(u64),
+}
+
+/// The marks a round takes on the block of byte `block`: one key of the table's unique order fixed
+/// whole, the gap and that key's row; any other read, the block.
+fn read_marks(
+    table: usize,
+    order: usize,
+    block: u64,
+    point: Option<&[crate::places::KeyValue]>,
+) -> Vec<(u64, Mark)> {
+    match point {
+        Some(key) => {
+            let row = lock::row_byte(table, order, key);
+            vec![
+                (lock::gap_byte(block), Mark::Gap(block)),
+                (row, Mark::Row(row)),
+            ]
+        }
+        None => vec![(block, Mark::Block(block))],
+    }
+}
+
+/// What a write of one order tests: every block it changes, by its rows and its gaps; each row of the
+/// table's order it changes; and the gaps of the blocks it lands a key in, an INSERT's and an UPDATE's
+/// that changes a key or a column a strand holds.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Written {
+    pub(super) blocks: Vec<u64>,
+    pub(super) rows: Vec<u64>,
+    pub(super) landed: Vec<u64>,
+}
+
+impl Written {
+    /// The blocks alone, a write whose rows the order cannot name.
+    pub(super) fn blocks(blocks: Vec<u64>) -> Written {
+        Written {
+            blocks,
+            ..Written::default()
+        }
+    }
+
+    /// Every byte the write marks as its own: each block's, each row's, and each gap's it lands in.
+    fn bytes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.blocks
+            .iter()
+            .chain(&self.rows)
+            .copied()
+            .chain(self.landed.iter().map(|&b| lock::gap_byte(b)))
+    }
+}
 
 fn failed(reason: &str) -> Error {
     Error::new(format!(
@@ -224,6 +285,16 @@ impl View {
 }
 
 impl FileView {
+    /// The bytes a mark meets: a block's, those of every block it was cut from or that was cut from
+    /// it; a gap's, those blocks' gaps; a row's, its own, which no cut moves.
+    fn met_by(&self, m: Mark) -> Vec<u64> {
+        match m {
+            Mark::Block(b) => self.related(b),
+            Mark::Gap(b) => self.related(b).into_iter().map(lock::gap_byte).collect(),
+            Mark::Row(r) => vec![r],
+        }
+    }
+
     /// A block's byte, and every byte of a block it was cut from or that was cut from it: what a mark on
     /// one means on the others, whichever generation each was named under.
     fn related(&self, byte: u64) -> Vec<u64> {
@@ -906,11 +977,10 @@ impl Snail {
                 m.read(&t.name, &order.name, None)?;
             }
             for first in &walk.marks {
-                m.read(
-                    &t.name,
-                    &order.name,
-                    Some(self.block_read_byte(table, walk.order, first)),
-                )?;
+                let b = self.block_read_byte(table, walk.order, first);
+                for (byte, _) in read_marks(table, walk.order, b, walk.point(order)) {
+                    m.read(&t.name, &order.name, Some(byte))?;
+                }
             }
         }
         let mut guard = self.serial.borrow_mut();
@@ -948,7 +1018,8 @@ impl Snail {
             (txn.id, txn.read_only, txn.order)
         };
         let key = (table, walk.order);
-        let mut fresh = Vec::new();
+        let point = walk.point(&self.catalog.tables[table].orders[walk.order]);
+        let mut fresh: Vec<(u64, Mark)> = Vec::new();
         let order_byte = lock::order_byte(table, walk.order);
         if !s.whole.contains(&key) {
             let mut whole = !walk.empty && (walk.upper || walk.marks.is_empty());
@@ -956,26 +1027,28 @@ impl Snail {
                 let held = s.marks.entry(key).or_default();
                 for first in &walk.marks {
                     let b = self.block_read_byte(table, walk.order, first);
-                    if held.insert(b) {
-                        lock::mark_read(file, self.slot, b, true)?;
-                        fresh.push(b);
+                    for (byte, mark) in read_marks(table, walk.order, b, point) {
+                        if held.insert(byte) {
+                            lock::mark_read(file, self.slot, byte, true)?;
+                            fresh.push((byte, mark));
+                        }
                     }
                 }
                 whole = held.len() > MARKS_AN_ORDER;
             }
             if whole {
                 lock::mark_read(file, self.slot, order_byte, true)?;
-                fresh.push(order_byte);
+                fresh.push((order_byte, Mark::Block(order_byte)));
                 for b in s.marks.remove(&key).unwrap_or_default() {
                     lock::mark_read(file, self.slot, b, false)?;
                 }
                 s.whole.insert(key);
             }
         }
-        // Each writer of what it newly marked: one running holds the block, and a commit since its
-        // snapshot named it, or a block cut from it.
+        // Each writer of what it newly marked: one running holds the block, its gap or its row, and a
+        // commit since its snapshot named it, or a block cut from it.
         let mut met: BTreeSet<u64> = BTreeSet::new();
-        let meets: BTreeSet<u64> = fresh.iter().flat_map(|&b| here.related(b)).collect();
+        let meets: BTreeSet<u64> = fresh.iter().flat_map(|&(_, m)| here.met_by(m)).collect();
         for &b in &meets {
             for slot in lock::writers(file, b)? {
                 if let Some((_, id)) = here.running.iter().find(|(x, _)| *x == slot) {
@@ -1020,15 +1093,16 @@ impl Snail {
         Ok(())
     }
 
-    /// A write of the transaction changes these blocks of an order: each block's marks tested, and the
-    /// marks on what it was cut from and on the order whole. A transaction someone doomed fails here.
-    pub(super) fn mark_wrote(&self, table: usize, order: usize, blocks: &[u64]) -> Result<()> {
+    /// A write of the transaction changes these blocks of an order, these rows, and lands keys in these
+    /// blocks: each block's marks tested, each row's, the gaps' of those it lands in, and the marks on
+    /// what they were cut from and on the order whole. A transaction someone doomed fails here.
+    pub(super) fn mark_wrote(&self, table: usize, order: usize, w: &Written) -> Result<()> {
         if self.committing {
-            return self.wrote_at_commit(blocks);
+            return self.wrote_at_commit(w);
         }
         if let Some(m) = &self.monitor {
             let t = &self.catalog.tables[table];
-            for &b in blocks {
+            for b in w.bytes() {
                 m.wrote(&t.name, &t.orders[order].name, b)?;
             }
         }
@@ -1037,7 +1111,7 @@ impl Snail {
             return Ok(());
         };
         let t = s.t.clone();
-        self.at_turn(&t, |v| self.tested_write(v, &t, s, table, order, blocks))
+        self.at_turn(&t, |v| self.tested_write(v, &t, s, table, order, w))
     }
 
     fn tested_write(
@@ -1047,7 +1121,7 @@ impl Snail {
         s: &mut Serial,
         table: usize,
         order: usize,
-        blocks: &[u64],
+        w: &Written,
     ) -> Result<()> {
         let here = &v.files[s.place];
         let file = &here.file;
@@ -1067,11 +1141,19 @@ impl Snail {
         }
         // What lands anywhere in the order lands in the gaps of a block a commit let go.
         let mut tests: BTreeSet<u64> = here.with_parents(order_byte).into_iter().collect();
-        for &b in blocks {
+        for b in w.bytes() {
             if s.wrote.insert(b) {
                 lock::mark_wrote(file, self.slot, b, true)?;
             }
-            tests.extend(here.related(b));
+        }
+        for &b in &w.blocks {
+            tests.extend(here.met_by(Mark::Block(b)));
+        }
+        for &r in &w.rows {
+            tests.extend(here.met_by(Mark::Row(r)));
+        }
+        for &b in &w.landed {
+            tests.extend(here.met_by(Mark::Gap(b)));
         }
         let mut readers: BTreeSet<u64> = BTreeSet::new();
         for &b in &tests {
@@ -1103,9 +1185,9 @@ impl Snail {
         Ok(())
     }
 
-    /// The blocks a transaction's commit writes its rows into, which its statements tested: named among
-    /// those it wrote, for a read after its commit.
-    fn wrote_at_commit(&self, blocks: &[u64]) -> Result<()> {
+    /// The blocks a transaction's commit writes its rows into, the rows and the gaps, which its
+    /// statements tested: named among those it wrote, for a read after its commit.
+    fn wrote_at_commit(&self, w: &Written) -> Result<()> {
         let mut guard = self.serial.borrow_mut();
         let Some(s) = guard.as_mut().filter(|s| s.t.borrow().active) else {
             return Ok(());
@@ -1115,7 +1197,7 @@ impl Snail {
         let file = &txn.files[s.place].lock;
         lock::take_serial_turn(file)?;
         let mut marked = Ok(());
-        for &b in blocks {
+        for b in w.bytes() {
             if marked.is_ok() && s.wrote.insert(b) {
                 marked = lock::mark_wrote(file, self.slot, b, true);
             }
@@ -1355,11 +1437,13 @@ impl Snail {
                 let from = lock::block_byte_of(*ti, *oi, b.first_key());
                 if b.staged_entries().is_empty() {
                     m.let_go(&t.name, &o.name, from)?;
+                    m.let_go(&t.name, &o.name, lock::gap_byte(from))?;
                 }
                 for e in b.staged_entries() {
                     let to = lock::block_byte_of(*ti, *oi, &e.first);
                     if to != from {
                         m.cut(&t.name, &o.name, from, to)?;
+                        m.cut(&t.name, &o.name, lock::gap_byte(from), lock::gap_byte(to))?;
                     }
                 }
             }

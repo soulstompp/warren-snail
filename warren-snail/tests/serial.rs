@@ -1016,10 +1016,11 @@ fn writers_of_rows_of_their_own_in_one_block_all_commit_in_every_order() {
         ],
         "REPEATABLE READ",
     );
-    // INSERTs read nothing, so at SERIALIZABLE the block's marks meet nothing.
+    // At SERIALIZABLE an UPDATE by key marks its row and its block's gap, and writes its row in
+    // place; an INSERT reads nothing and lands in the gap: so at most one edge between the two.
     own_rows_all_commit(
-        &[vec![Step::Insert(C)]],
-        &[vec![Step::Insert(D)]],
+        &[vec![Step::Write(C)], vec![Step::Insert(C)]],
+        &[vec![Step::Write(D)], vec![Step::Insert(D)]],
         "SERIALIZABLE",
     );
 }
@@ -2059,7 +2060,9 @@ fn a_read_of_a_block_whose_first_key_its_own_rows_lowered_marks_the_block_its_sn
     run(&mut a, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
     run(&mut a, "INSERT INTO s.t (id, v) VALUES (-5, 1)");
-    assert_eq!(read(&mut a, 0), 0);
+    // The block's rows read by a range, so that the block is marked.
+    let sql = "SELECT sum(t.v) FROM s.t t WHERE t.id >= 0 AND t.id <= 16";
+    assert_eq!(one(&a.ask(sql, None).unwrap().0), 16);
     assert_eq!(read(&mut b, B), i64::from(B));
     set(&mut b, 16, -1).unwrap();
     set(&mut a, B, -2).unwrap();
@@ -2081,8 +2084,10 @@ fn a_statement_alone_at_the_level_meets_the_reader_of_its_block() {
         "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
     );
     set(&mut b, A, -1).unwrap();
-    // a read what b wrote, and b, committed first, read what a writes.
-    let e = set(&mut a, 3200, -2).unwrap_err();
+    // a read what b wrote, and b, committed first, read the gap a's row lands in.
+    let e = a
+        .execute("INSERT INTO s.t (id, v) VALUES (3201, -2)")
+        .unwrap_err();
     assert_eq!(
         reason(&e),
         "Canceled on identification as a pivot, during write."

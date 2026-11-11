@@ -87,13 +87,15 @@ pub(super) enum Change {
     Replace(Row, Row),
 }
 
-/// One row's change on one order: its key there, the values the order holds, and for a row
-/// replaced, the key of the row that replaced it.
+/// One row's change on one order: its key there, the values the order holds, for a row replaced, the
+/// key of the row that replaced it, and whether it lands a key in its block: a row inserted, or one
+/// written by an UPDATE not in place.
 pub(super) struct Effect {
     pub(super) key: Vec<KeyValue>,
     pub(super) values: Vec<Datum>,
     pub(super) delete: bool,
     pub(super) chain: Option<Vec<KeyValue>>,
+    pub(super) lands: bool,
 }
 
 /// A block a transaction began from, by its first key and its page map then, and the entries that
@@ -3244,6 +3246,24 @@ impl Snail {
         } else {
             changes
         };
+        // A row replaced in place, as 18.6's UPDATE is HOT where its page has room: its key on the
+        // table's order the same, and every strand holding the same values of it.
+        let in_place = |o: &Row, n: &Row| -> Result<bool> {
+            for x in &table.orders {
+                let alike = if x.table_order {
+                    key_of(table, x, o)? == key_of(table, x, n)?
+                } else {
+                    let held_x = |r: &Row| -> Vec<Datum> {
+                        x.columns.iter().map(|&c| r[c].clone()).collect()
+                    };
+                    super::image::held_alike(&held_x(o), &held_x(n))
+                };
+                if !alike {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
         let mut effects = Vec::new();
         for c in changes {
             match c {
@@ -3252,12 +3272,14 @@ impl Snail {
                     values: held(r),
                     delete: false,
                     chain: None,
+                    lands: true,
                 }),
                 Change::Delete(r) => effects.push(Effect {
                     key: key_of(table, order, r)?,
                     values: held(r),
                     delete: true,
                     chain: None,
+                    lands: false,
                 }),
                 Change::Replace(o, n) => {
                     if super::image::held_alike(&held(o), &held(n)) {
@@ -3269,17 +3291,64 @@ impl Snail {
                         values: held(o),
                         delete: true,
                         chain: Some(to.clone()),
+                        lands: false,
                     });
                     effects.push(Effect {
                         key: to,
                         values: held(n),
                         delete: false,
                         chain: None,
+                        lands: !order.table_order || !in_place(o, n)?,
                     });
                 }
             }
         }
         Ok(effects)
+    }
+
+    /// What a write of one order marks for a serializable round: each block it changes, by its byte;
+    /// on the table's own order, each row's key it changes; and each block a key lands in, a block the
+    /// transaction already staged by the block it began from.
+    fn written_of(
+        &self,
+        ti: usize,
+        oi: usize,
+        order: &Order,
+        blocks: &[(Entry, bool)],
+        effects: &[&Effect],
+    ) -> super::serial::Written {
+        let byte = |e: &Entry| lock::block_byte_of(ti, oi, &e.first);
+        let begun = |e: &Entry| {
+            self.rebased
+                .get(&(ti, oi))
+                .and_then(|rs| {
+                    rs.iter()
+                        .find(|r| r.entries.iter().any(|x| x.child.start == e.child.start))
+                })
+                .map_or_else(|| byte(e), |r| lock::block_byte_of(ti, oi, &r.first))
+        };
+        super::serial::Written {
+            blocks: blocks
+                .iter()
+                .filter(|(e, _)| e.child.start < STAGED)
+                .map(|(e, _)| byte(e))
+                .collect(),
+            rows: match order.table_order {
+                true => effects
+                    .iter()
+                    .map(|e| lock::row_byte(ti, oi, &e.key))
+                    .collect(),
+                false => Vec::new(),
+            },
+            landed: blocks
+                .iter()
+                .filter(|(_, lands)| *lands)
+                .map(|(e, _)| match e.child.start < STAGED {
+                    true => byte(e),
+                    false => begun(e),
+                })
+                .collect(),
+        }
     }
 
     /// One order's part of a statement: its effects routed to their blocks, each block written
@@ -3339,7 +3408,15 @@ impl Snail {
                     return Ok(None);
                 }
             }
-            self.mark_wrote(ti, oi, &[b])?;
+            let mut written = super::serial::Written::blocks(vec![b]);
+            written.landed.push(b);
+            if order.table_order {
+                written.rows = effects
+                    .iter()
+                    .map(|e| lock::row_byte(ti, oi, &e.key))
+                    .collect();
+            }
+            self.mark_wrote(ti, oi, &written)?;
             let rows: Vec<Vec<Datum>> = effects.into_iter().map(|e| e.values).collect();
             let (entries, first) = self.written_in_order(w, table, order, rows)?;
             top.entries = entries;
@@ -3363,16 +3440,17 @@ impl Snail {
                 by_block.entry(path).or_default().push(e);
             }
             let blocks: Vec<Entry> = by_block.keys().map(|p| entry_at(&top, p).clone()).collect();
-            let bytes: Vec<u64> = blocks
+            let landing: Vec<(Entry, bool)> = by_block
                 .iter()
-                .filter(|e| e.child.start < STAGED)
-                .map(|e| lock::block_byte_of(ti, oi, &e.first))
+                .map(|(p, es)| (entry_at(&top, p).clone(), es.iter().any(|e| e.lands)))
                 .collect();
+            let all: Vec<&Effect> = by_block.values().flatten().collect();
+            let written = self.written_of(ti, oi, order, &landing, &all);
             if !self.lock_blocks(ti, oi, blocks, Waiting::Wait)? {
                 self.stale = true;
                 return Ok(None);
             }
-            self.mark_wrote(ti, oi, &bytes)?;
+            self.mark_wrote(ti, oi, &written)?;
             for (path, effects) in by_block {
                 let entry = entry_at(&top, &path).clone();
                 let (new, rewrote) = self.write_block_afresh(
