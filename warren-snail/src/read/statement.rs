@@ -1461,8 +1461,14 @@ pub(crate) fn with_params(sql: &str, params: &[String]) -> Result<String> {
 }
 
 /// The statements of a text, each as written, split on their semicolons by sqlparser's tokenizer.
+/// Where PostgreSQL's grammar refuses one of them, each is split as written, that one refused when
+/// it is read, as psql sends each alone.
 pub fn split(text: &str) -> Result<Vec<String>> {
-    Ok(crate::ddl::statements(text)?
+    let pieces = match crate::ddl::statements(text) {
+        Ok(pieces) => pieces,
+        Err(_) => crate::ddl::semicolons(text)?,
+    };
+    Ok(pieces
         .iter()
         .map(|t| crate::ddl::written(t))
         .collect())

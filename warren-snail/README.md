@@ -32,13 +32,15 @@ It needs Rust 1.88 or later. It installs one command, `warren-snail`, in `~/.car
 nothing else; `cargo uninstall warren-snail` takes it out again. The library is the same crate:
 `cargo add warren-snail`.
 
-Two features, off unless named, call a library of the machine's as PostgreSQL calls it:
-`collations`, for text under ICU's collations and the C library's locales, linking the machine's
-ICU, which pkg-config finds; and `zones`, for named time zones other than UTC, read from compiled
-zone files. Built without them, such a column or such a zone is refused by name.
+Named time zones other than UTC are read from compiled zone files, the machine's, under the
+feature `zones`, on by default, so that a session names its zone as in PostgreSQL. One feature, off
+unless named, calls a library of the machine's as PostgreSQL calls it: `collations`, for text under
+ICU's collations and the C library's locales, linking the machine's ICU, which pkg-config finds.
+Built without them, such a column or such a zone is refused by name.
 
 ```sh
-cargo install --locked warren-snail --features collations,zones
+cargo install --locked warren-snail --features collations
+cargo install --locked warren-snail --no-default-features --features standalone   # no zones
 ```
 
 A snail is the file you name; past 1 GiB, Parquet's size for one file of huge data, it goes on
@@ -1074,9 +1076,11 @@ fn main() -> warren_snail::Result<()> {
   order cut under another version is refused until `recut` writes the snail afresh. Without the
   feature, a DDL naming such a collation is refused, a snail written with one is read but where its
   order is needed, and money under a locale other than `C` or `POSIX` is refused.
-- `zones`, off by default: named time zones other than UTC, read from compiled zone files, the
-  machine's `/usr/share/zoneinfo` unless `SNAIL_ZONES` names another directory. Without it, a value
-  in such a zone is refused by name.
+- `zones`, on by default: named time zones other than UTC, read from compiled zone files, the
+  machine's `/usr/share/zoneinfo` unless `SNAIL_ZONES` names another directory, so that a session
+  names its zone (`SET TimeZone = 'Europe/Lisbon'`) as in PostgreSQL. Built without it
+  (`default-features = false`, `standalone` named again where it is wanted), a value in such a zone
+  is refused by name.
 
 ## The bench
 

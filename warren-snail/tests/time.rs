@@ -314,6 +314,7 @@ fn the_pipeline_adds_takes_and_casts_time_as_postgresql_does() {
     );
     let (b, _) = snail.ask(&q, None).unwrap();
     assert_eq!(texts(&b, 1), some(&["2024-01-30 22:00:00"]));
+    // A named zone, refused by name by a build without the feature zones, on by default.
     #[cfg(not(feature = "zones"))]
     {
         let q = format!(
@@ -367,7 +368,8 @@ fn a_setting_set_to_the_value_the_snail_answers_under_does_nothing_and_any_other
         snail.execute(s).unwrap();
     }
     for (s, says) in [
-        // TimeZone is the session's: a named zone is read only under the feature zones.
+        // TimeZone is the session's: a named zone is read only under the feature zones, on by
+        // default, and refused by name by a build without it.
         #[cfg(not(feature = "zones"))]
         ("SET TimeZone = 'Europe/Lisbon'", "read only under the feature zones"),
         ("SET datestyle = 'ISO, DMY'", "datestyle ISO, MDY"),
@@ -420,6 +422,19 @@ fn out_names_the_columns_holding_an_infinity_or_24_00() {
     std::fs::create_dir_all(&dir).unwrap();
     let out = snail.out(&dir).unwrap();
     assert_eq!(out[0].extremes, ["d", "t"]);
+}
+
+/// The feature zones is among the crate's default features, so that a default build reads a named
+/// zone; a build without the default features refuses one by name.
+#[test]
+fn zones_are_among_the_default_features() {
+    let manifest =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let default = manifest
+        .lines()
+        .find(|l| l.starts_with("default = ["))
+        .expect("the default features");
+    assert!(default.contains("\"standalone\"") && default.contains("\"zones\""), "{default}");
 }
 
 #[cfg(all(feature = "zones", feature = "standalone"))]
@@ -540,4 +555,236 @@ fn a_transaction_reads_one_clock_its_start_wherever_postgresql_reads_it() {
         &mut s,
         &format!("{step} SELECT (count(*) = 2) AS x FROM q WHERE now() > at AND now() = statement_timestamp()")
     ));
+}
+
+#[cfg(feature = "standalone")]
+/// A statement's answer, each row's values as PostgreSQL's output functions write them, `|` between.
+fn answer_rows(s: &mut Snail, sql: &str) -> Vec<String> {
+    let done = s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let b = done.answer.expect("an answer");
+    s.text_of(&b)
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|v| v.unwrap_or_else(|| "NULL".into()))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+#[cfg(feature = "standalone")]
+/// A statement's refusal: its SQLSTATE and its words.
+fn refusal(s: &mut Snail, sql: &str) -> (Option<&'static str>, String) {
+    let e = s.execute(sql).err().unwrap_or_else(|| panic!("{sql} was taken"));
+    (e.sqlstate(), e.to_string())
+}
+
+#[cfg(feature = "standalone")]
+/// A snail of one table of instants, `s.t`, holding one row.
+fn instants(name: &str) -> Snail {
+    snail_of(
+        name,
+        "CREATE SCHEMA s; CREATE TABLE s.t (id varchar(4) NOT NULL, at timestamp NOT NULL, PRIMARY KEY (id));",
+        &["INSERT INTO s.t VALUES ('I1', '2026-01-31 12:00:00')"],
+    )
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn an_interval_literal_with_a_qualifier_is_read_as_postgresql_reads_it() {
+    let mut s = instants("interval-qualified");
+    // warren-sling's statements, each answered as 18.6 answers it.
+    for (sql, want) in [
+        ("SELECT at + interval '1 day 2:03:04' hour to minute FROM s.t", "2026-02-01 14:03:00"),
+        ("SELECT at + interval '2' hour FROM s.t", "2026-01-31 14:00:00"),
+        ("SELECT at + interval '1:2' minute to second FROM s.t", "2026-01-31 12:01:02"),
+        ("SELECT at + interval '1.2345' second(2) FROM s.t", "2026-01-31 12:00:01.23"),
+        ("SELECT at + interval '1 year 2 months 3 days' month FROM s.t", "2027-03-31 12:00:00"),
+        ("SELECT at + interval '1 2' day to hour FROM s.t", "2026-02-01 14:00:00"),
+        ("SELECT at + interval '2.5' day FROM s.t", "2026-02-02 12:00:00"),
+        ("SELECT at + interval '-1.9 hours' hour FROM s.t", "2026-01-31 11:00:00"),
+    ] {
+        assert_eq!(answer_rows(&mut s, sql), [want], "{sql}");
+    }
+    // Each qualifier: the fields below its last zeroed, a bare number in its last field's unit,
+    // `a:b` as minutes and seconds under MINUTE TO SECOND, the seconds rounded half away from zero.
+    let all = "'1 year 2 months 3 days 4:05:06.789'";
+    for (fields, want) in [
+        ("year", "1 year"),
+        ("month", "1 year 2 mons"),
+        ("day", "1 year 2 mons 3 days"),
+        ("hour", "1 year 2 mons 3 days 04:00:00"),
+        ("minute", "1 year 2 mons 3 days 04:05:00"),
+        ("second", "1 year 2 mons 3 days 04:05:06.789"),
+        ("second(1)", "1 year 2 mons 3 days 04:05:06.8"),
+        ("year to month", "1 year 2 mons"),
+        ("day to hour", "1 year 2 mons 3 days 04:00:00"),
+        ("day to minute", "1 year 2 mons 3 days 04:05:00"),
+        ("day to second(2)", "1 year 2 mons 3 days 04:05:06.79"),
+        ("hour to minute", "1 year 2 mons 3 days 04:05:00"),
+        ("hour to second(0)", "1 year 2 mons 3 days 04:05:07"),
+        ("minute to second(1)", "1 year 2 mons 3 days 04:05:06.8"),
+    ] {
+        let sql = format!("SELECT interval {all} {fields}");
+        assert_eq!(answer_rows(&mut s, &sql), [want], "{sql}");
+    }
+    for (sql, want) in [
+        (
+            "SELECT interval '7' year to month, interval '7' day to hour, interval '7' day to minute, \
+             interval '7' day to second, interval '7' hour to minute, interval '7' minute to second",
+            "7 mons|07:00:00|00:07:00|00:00:07|00:07:00|00:00:07",
+        ),
+        (
+            "SELECT interval '1:2' hour, interval '1:2' minute, interval '1:2' second, \
+             interval '3:4.5' minute to second, interval '1:2:3' minute to second, interval '1-2' year to month",
+            "01:00:00|01:02:00|01:02:00|00:03:04.5|01:02:03|1 year 2 mons",
+        ),
+        (
+            "SELECT interval '1.25' second(1), interval '-1.25' second(1), interval '2.5' second(0), \
+             interval '-2.5' second(0), interval '-1.9995' second(3), interval '-0.5' hour",
+            "00:00:01.3|-00:00:01.3|00:00:03|-00:00:03|-00:00:02|00:00:00",
+        ),
+        (
+            "SELECT interval 'infinity' hour, interval '-13 months' year, interval '2147483648' hour, \
+             interval E'2' minute, INTERVAL '1' HOUR TO MINUTE, interval '1 2:3:4' DAY to Second ( 1 )",
+            "infinity|-1 years|2147483648:00:00|00:02:00|00:01:00|1 day 02:03:04",
+        ),
+        // A word sqlparser reads as a unit and PostgreSQL's grammar does not is the item's label.
+        (
+            "SELECT pg_typeof(interval '2' hour), interval '2' \"hour\", interval '1' week",
+            "interval|00:00:02|00:00:01",
+        ),
+    ] {
+        assert_eq!(answer_rows(&mut s, sql), [want], "{sql}");
+    }
+    let done = s.execute("SELECT interval '1' week").unwrap();
+    assert_eq!(done.answer.unwrap().schema().field(0).name(), "week");
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn an_interval_s_qualifier_is_read_beside_a_cast_a_column_and_a_function_s_body() {
+    let mut s = instants("interval-qualified-beside");
+    // A string constant cast to an interval of named fields is read under them; a value of text,
+    // or a parameter, is read whole, then cut.
+    for (sql, want) in [
+        (
+            "SELECT '2'::interval hour, ('2')::interval hour, CAST('1:2' AS interval minute to second), \
+             CAST('1 day 2:03:04.5678' AS interval day to second(2))",
+            "02:00:00|02:00:00|00:01:02|1 day 02:03:04.57",
+        ),
+        (
+            "SELECT ('2'::text)::interval hour, CAST('1:2'::text AS interval minute to second), \
+             CAST(interval '1 day 2:03:04' AS interval hour), (interval '90' minute)::interval hour",
+            "00:00:00|01:02:00|1 day 02:00:00|01:00:00",
+        ),
+        (
+            "SELECT '{\"1 day 2:03\"}'::interval hour[], - interval '1 day 2:03' hour",
+            "{\"1 day 02:00:00\"}|-1 days -02:00:00",
+        ),
+    ] {
+        assert_eq!(answer_rows(&mut s, sql), [want], "{sql}");
+    }
+    s.execute("PREPARE p AS SELECT $1::interval hour").unwrap();
+    assert_eq!(answer_rows(&mut s, "EXECUTE p('2')"), ["00:00:00"]);
+    // A column declared with fields reads a literal under them, its DEFAULT's among them, and
+    // keeps them in its type.
+    for sql in [
+        "CREATE TABLE s.q (k integer NOT NULL, h interval hour DEFAULT '7', dm interval day to minute, \
+         ms interval minute to second(1), PRIMARY KEY (k))",
+        "INSERT INTO s.q VALUES (1, '1 day 2:03:04', '7', '1:2.345'), (2, interval '5' hour, '1:30', '1:30')",
+        "INSERT INTO s.q (k) VALUES (3)",
+        "INSERT INTO s.q SELECT length(id) + 2, '4' FROM s.t",
+        "UPDATE s.q SET h = '9', dm = interval '1 day 2:03:04' hour WHERE k = 2",
+    ] {
+        s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        answer_rows(&mut s, "SELECT * FROM s.q ORDER BY k"),
+        [
+            "1|1 day 02:00:00|00:07:00|00:01:02.3",
+            "2|09:00:00|1 day 02:00:00|00:01:30",
+            "3|07:00:00|NULL|NULL",
+            "4|04:00:00|NULL|NULL",
+        ]
+    );
+    assert_eq!(
+        answer_rows(
+            &mut s,
+            "SELECT attname, format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = 's.q'::regclass AND attnum > 1 ORDER BY attnum"
+        ),
+        ["h|interval hour", "dm|interval day to minute", "ms|interval minute to second(1)"]
+    );
+    // A literal beside the column is read under the fields its cast names.
+    assert_eq!(
+        answer_rows(&mut s, "SELECT k FROM s.q WHERE h > interval '1' hour ORDER BY k"),
+        ["1", "2", "3", "4"]
+    );
+    assert_eq!(
+        answer_rows(&mut s, "SELECT k FROM s.q WHERE h > interval '7' hour ORDER BY k"),
+        ["1", "2"]
+    );
+    // A view keeps the literal as the cast PostgreSQL's grammar makes of it.
+    s.execute(
+        "CREATE VIEW s.v AS SELECT k, interval '2' hour AS two, h + interval '1.2345' second(2) AS s FROM s.q",
+    )
+    .unwrap();
+    assert_eq!(
+        answer_rows(&mut s, "SELECT pg_get_viewdef('s.v'::regclass)"),
+        [" SELECT k,\n    '02:00:00'::interval hour AS two,\n    (h + '00:00:01.23'::interval second(2)) AS s\n   FROM s.q;"]
+    );
+    // A function's body, after AS or after RETURN.
+    s.execute("CREATE FUNCTION s.fq() RETURNS interval LANGUAGE sql AS $$ SELECT interval '2' hour $$")
+        .unwrap();
+    s.execute("CREATE FUNCTION s.fr() RETURNS interval LANGUAGE sql RETURN interval '2' minute")
+        .unwrap();
+    assert_eq!(answer_rows(&mut s, "SELECT s.fq(), s.fr()"), ["02:00:00|00:02:00"]);
+    // SET TIME ZONE's interval is the setting's, its precision among it.
+    s.execute("SET TIME ZONE INTERVAL(2) '+05:30'").unwrap();
+    assert_eq!(answer_rows(&mut s, "SHOW TimeZone"), ["<+05:30>-05:30"]);
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn an_interval_s_qualifier_is_refused_where_postgresql_refuses_it_in_its_words() {
+    let mut s = instants("interval-qualified-refused");
+    for (sql, code, words) in [
+        ("SELECT interval 'abc' hour", "22007", "invalid input syntax for type interval: \"abc\""),
+        ("SELECT interval '1 2 3' day to hour", "22007", "invalid input syntax for type interval: \"1 2 3\""),
+        ("SELECT interval '1 2' year", "22007", "invalid input syntax for type interval: \"1 2\""),
+        ("SELECT interval '2147483648' day", "22015", "interval field value out of range: \"2147483648\""),
+        ("SELECT interval '2147483647' year", "22008", "interval out of range"),
+        ("SELECT interval '1' year to second", "42601", "syntax error at or near \"second\""),
+        ("SELECT interval '1' month to day", "42601", "syntax error at or near \"to\""),
+        ("SELECT interval '1' hour(2)", "42601", "syntax error at or near \"(\""),
+        ("SELECT interval '1' second(2, 2)", "42601", "syntax error at or near \",\""),
+        ("SELECT interval '1' second(1.5)", "42601", "syntax error at or near \"1.5\""),
+        ("SELECT interval '1' day to second(2) to minute", "42601", "syntax error at or near \"to\""),
+        ("SELECT interval '1' minute to hour", "42601", "syntax error at or near \"hour\""),
+        ("SELECT interval '1' second to second", "42601", "syntax error at or near \"to\""),
+        ("SELECT interval '1' year to", "42601", "syntax error at end of input"),
+        ("SELECT interval '2' hour hour", "42601", "syntax error at or near \"hour\""),
+        ("SELECT interval 1 hour", "42601", "syntax error at or near \"1\""),
+        ("SELECT interval(2) '1.2345' hour", "42601", "syntax error at or near \"hour\""),
+        ("SELECT '1'::interval hour(2)", "42601", "syntax error at or near \"(\""),
+        ("SELECT '1'::interval(2) hour", "42601", "syntax error at or near \"hour\""),
+        ("SELECT '1'::interval year to second", "42601", "syntax error at or near \"second\""),
+        (
+            "CREATE TABLE s.bad (k integer NOT NULL, h interval month to day, PRIMARY KEY (k))",
+            "42601",
+            "syntax error at or near \"to\"",
+        ),
+    ] {
+        assert_eq!(refusal(&mut s, sql), (Some(code), words.to_string()), "{sql}");
+    }
+    // A text holding one is split as psql sends each statement, that one refused when it is read.
+    let parts =
+        warren_snail::read::statement::split("SELECT interval '1' hour(2); SELECT interval '2' hour")
+            .unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(refusal(&mut s, &parts[0]).1, "syntax error at or near \"(\"");
+    assert_eq!(answer_rows(&mut s, &parts[1]), ["02:00:00"]);
 }

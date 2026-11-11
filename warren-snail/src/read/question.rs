@@ -594,18 +594,39 @@ fn literal(e: &Expr, s: Shape, table: &Table) -> Result<i128> {
                 crate::scalars::uuid_parse(&text_literal(e)?)
             }
             Shape::Column(c) => match table.columns[c].ty {
-                // An interval is compared by its total, a literal read as the column's type reads it.
-                // Read as an interval of every field, whatever fields the column keeps.
-                ColumnType::Interval { .. } => Ok(crate::times::interval_in(
-                    &text_literal(uncast_to(e, "interval")).map_err(|_| err)?,
-                    crate::times::INTERVAL_FULL_RANGE,
-                    None,
-                )?
-                .total()),
+                // An interval is compared by its total, a literal read as the column's type reads it:
+                // as an interval of every field, whatever fields the column keeps, or of the fields
+                // its cast names.
+                ColumnType::Interval { .. } => {
+                    let (range, precision) = match interval_cast(e) {
+                        Some(ColumnType::Interval { range, precision }) => {
+                            (range, precision.map(u32::from))
+                        }
+                        _ => (crate::times::INTERVAL_FULL_RANGE, None),
+                    };
+                    Ok(crate::times::interval_in(
+                        &text_literal(uncast_to(e, "interval")).map_err(|_| err)?,
+                        range,
+                        precision,
+                    )?
+                    .total())
+                }
                 _ => Err(err),
             },
             _ => Err(err),
         })
+}
+
+/// The interval a literal's cast names, with its fields and precision; none where it names none.
+fn interval_cast(e: &Expr) -> Option<ColumnType> {
+    match e {
+        Expr::Cast {
+            data_type: t @ sqlparser::ast::DataType::Interval { .. },
+            ..
+        } => crate::catalog::held_type(t).ok(),
+        Expr::Nested(x) => interval_cast(x),
+        _ => None,
+    }
 }
 
 /// A literal as written, its cast to the type named taken off.

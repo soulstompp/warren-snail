@@ -54,10 +54,12 @@ pub(crate) const ROWS_FROM: &str = "\u{6}rows";
 /// The statement as PostgreSQL's scanner and grammar read its words, where sqlparser's tokenizer
 /// reads them otherwise, under `release`: a number in its bases and with its underscores from 16
 /// on, a name written against it refused as trailing junk from 15 on; strings a newline apart as one
-/// string; `x ISNULL` and `x NOTNULL`; `interval(p) '…'`'s precision; a TABLESAMPLE clause carried
-/// in a call's name (`SAMPLED`), with a seed drawn for the statement where it names none; ROWS FROM
-/// (…) as a call (`ROWS_FROM`), and the alias a function's column definition list stands behind
-/// where none is written; and what sqlparser takes and PostgreSQL's grammar does not, refused.
+/// string; `x ISNULL` and `x NOTNULL`; an interval's literal as the cast its grammar makes of it, its
+/// precision or its fields, and the fields of its type, refused where its grammar refuses them; a
+/// TABLESAMPLE clause carried in a call's name (`SAMPLED`), with a seed drawn for the statement where
+/// it names none; ROWS FROM (…) as a call (`ROWS_FROM`), and the alias a function's column definition
+/// list stands behind where none is written; and what sqlparser takes and PostgreSQL's grammar does
+/// not, refused.
 pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
     scanned_seeding(sql, release, true)
 }
@@ -495,6 +497,91 @@ fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
         }
         None
     };
+    let token = |i: usize| solid.get(i).map(|t| &t.0);
+    // One of the fields an interval's type or literal names after it.
+    let field = |i: usize| {
+        matches!(
+            word(i).as_deref(),
+            Some("YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND")
+        )
+    };
+    // Past an interval's fields from `i`, as PostgreSQL's grammar reads them: one field, YEAR TO
+    // MONTH, DAY, HOUR or MINUTE TO a later field, and SECOND with its precision or without;
+    // refused at the word its grammar stops at.
+    let fields_end = |i: usize| -> Result<usize> {
+        let first = word(i).unwrap_or_default();
+        let mut j = i + 1;
+        let mut last = first.clone();
+        if word(j).as_deref() == Some("TO") {
+            let later: &[&str] = match first.as_str() {
+                "YEAR" => &["MONTH"],
+                "DAY" => &["HOUR", "MINUTE", "SECOND"],
+                "HOUR" => &["MINUTE", "SECOND"],
+                "MINUTE" => &["SECOND"],
+                _ => return Err(near(j)),
+            };
+            last = word(j + 1)
+                .filter(|w| later.contains(&w.as_str()))
+                .ok_or_else(|| near(j + 1))?;
+            j += 2;
+        }
+        if last == "SECOND" && token(j) == Some(&Token::LParen) {
+            let integer =
+                |n: &str| n.bytes().all(|b| b.is_ascii_digit()) && n.parse::<i32>().is_ok();
+            if !matches!(token(j + 1), Some(Token::Number(n, _)) if integer(n)) {
+                return Err(near(j + 1));
+            }
+            if token(j + 2) != Some(&Token::RParen) {
+                return Err(near(j + 2));
+            }
+            j += 3;
+        }
+        if token(j) == Some(&Token::LParen) || word(j).as_deref() == Some("TO") || field(j) {
+            return Err(near(j));
+        }
+        Ok(j)
+    };
+    // A word sqlparser reads as a unit after an interval's literal, where PostgreSQL's grammar
+    // reads the literal without it and the word as what follows: a label in a select list.
+    let unit_otherwise = |i: usize| {
+        matches!(token(i), Some(Token::Word(w)) if w.quote_style.is_none() && matches!(
+            w.keyword,
+            Keyword::YEARS
+                | Keyword::MONTHS
+                | Keyword::WEEK
+                | Keyword::WEEKS
+                | Keyword::DAYS
+                | Keyword::HOURS
+                | Keyword::MINUTES
+                | Keyword::SECONDS
+                | Keyword::CENTURY
+                | Keyword::DECADE
+                | Keyword::DOW
+                | Keyword::DOY
+                | Keyword::EPOCH
+                | Keyword::ISODOW
+                | Keyword::ISOYEAR
+                | Keyword::JULIAN
+                | Keyword::MICROSECOND
+                | Keyword::MICROSECONDS
+                | Keyword::MILLENIUM
+                | Keyword::MILLENNIUM
+                | Keyword::MILLISECOND
+                | Keyword::MILLISECONDS
+                | Keyword::NANOSECOND
+                | Keyword::NANOSECONDS
+                | Keyword::QUARTER
+                | Keyword::TIMEZONE
+                | Keyword::TIMEZONE_HOUR
+                | Keyword::TIMEZONE_MINUTE
+        ))
+    };
+    // INTERVAL as SET TIME ZONE's value, which the setting reads off its own words.
+    let zone_set = |i: usize| {
+        word(i.wrapping_sub(1)).as_deref() == Some("ZONE")
+            && word(i.wrapping_sub(2)).as_deref() == Some("TIME")
+            && word(i.wrapping_sub(3)).as_deref() != Some("AT")
+    };
     let mut swaps: Vec<(usize, usize, String)> = Vec::new();
     let mut brackets = 0i32;
     let mut array_closes: Vec<i32> = Vec::new();
@@ -633,22 +720,38 @@ fn worded(sql: &str, seeded: bool) -> Result<Option<String>> {
                 let with = if w == "ISNULL" { "IS NULL" } else { "IS NOT NULL" };
                 swaps.push((solid[i].1, solid[i].2, with.to_string()));
             }
-            Some("INTERVAL")
-                if matches!(solid.get(i + 1).map(|t| &t.0), Some(Token::LParen))
-                    && matches!(solid.get(i + 2).map(|t| &t.0), Some(Token::Number(..)))
-                    && matches!(solid.get(i + 3).map(|t| &t.0), Some(Token::RParen))
-                    && string(i + 4) =>
-            {
-                if matches!(
-                    word(i + 5).as_deref(),
-                    Some("YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND")
-                ) {
-                    return Err(near(i + 5));
+            // An interval's type or literal, its fields read as PostgreSQL's grammar reads them. A
+            // literal is written as the cast its grammar makes of it, `'…'::interval` before its
+            // fields or `'…'::interval(p)`, whose type sqlparser reads with its fields; a
+            // precision takes no fields after it.
+            Some("INTERVAL") if !zone_set(i) => {
+                let precision = token(i + 1) == Some(&Token::LParen)
+                    && matches!(token(i + 2), Some(Token::Number(..)))
+                    && token(i + 3) == Some(&Token::RParen);
+                let at = if precision { i + 4 } else { i + 1 };
+                let cast = match (string(at), precision) {
+                    (false, _) if matches!(token(at), Some(Token::Number(..))) => {
+                        return Err(near(at))
+                    }
+                    (false, true) if field(at) => return Err(near(at)),
+                    (false, false) if field(at) => {
+                        fields_end(at)?;
+                        None
+                    }
+                    (false, _) => None,
+                    (true, true) if field(at + 1) => return Err(near(at + 1)),
+                    (true, true) => Some(format!("::interval({})", &sql[solid[i + 2].1..solid[i + 2].2])),
+                    (true, false) if field(at + 1) => {
+                        fields_end(at + 1)?;
+                        Some("::interval".to_string())
+                    }
+                    (true, false) if unit_otherwise(at + 1) => Some("::interval".to_string()),
+                    (true, false) => None,
+                };
+                if let Some(cast) = cast {
+                    let literal = &sql[solid[at].1..solid[at].2];
+                    swaps.push((solid[i].1, solid[at].2, format!("{literal}{cast}")));
                 }
-                let (at, end) = (solid[i].1, solid[i + 4].2);
-                let literal = &sql[solid[i + 4].1..end];
-                let p = &sql[solid[i + 2].1..solid[i + 2].2];
-                swaps.push((at, end, format!("{literal}::interval({p})")));
             }
             Some("FORMAT")
                 if string(i + 1)

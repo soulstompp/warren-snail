@@ -139,8 +139,8 @@ usage: warren-snail write <file> --ddl <ddl.sql> [<table>=<rows.parquet>]... [--
 
   A command given --help, or -h, prints its own usage and what it does.
 
-  Built with the feature zones, SNAIL_ZONES names the directory compiled zones are read from: the
-  machine's /usr/share/zoneinfo unless given.";
+  Under the feature zones, on by default, SNAIL_ZONES names the directory compiled zones are read
+  from: the machine's /usr/share/zoneinfo unless given.";
 
 fn save(path: &str, batch: &RecordBatch) -> Result<()> {
     let mut w = ArrowWriter::try_new(

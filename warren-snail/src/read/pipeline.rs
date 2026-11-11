@@ -1645,6 +1645,21 @@ pub(super) fn quoted(e: &Expr) -> bool {
     }
 }
 
+/// Whether an expression is a string constant, written in any of PostgreSQL's quotings.
+fn string_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Value(v) => matches!(
+            v.value,
+            SqlValue::SingleQuotedString(_)
+                | SqlValue::EscapedStringLiteral(_)
+                | SqlValue::UnicodeStringLiteral(_)
+                | SqlValue::DollarQuotedString(_)
+        ),
+        Expr::Nested(e) => string_constant(e),
+        _ => false,
+    }
+}
+
 fn cast(
     v: Value,
     to: &DataType,
@@ -3853,6 +3868,20 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             let from = frame.type_of(expr).map(|t| t.pg_name()).unwrap_or_default();
             return Err(Error::new(format!("cannot cast type {from} to boolean")));
         }
+        // A string constant cast to an interval of named fields is read by interval's input under
+        // them, as PostgreSQL reads a constant of no type by its type's input and modifier: a bare
+        // number in the last field's unit. A value of text, or a parameter, is read whole and cut.
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type: data_type @ DataType::Interval { fields: Some(_), .. },
+            ..
+        } if string_constant(expr) => match (ev(expr)?, crate::catalog::held_type(data_type)?) {
+            (Value::Text(s), ColumnType::Interval { range, precision }) => Value::Interval(
+                crate::times::interval_in(&s, range, precision.map(u32::from))?,
+            ),
+            (v, _) => cast(v, data_type, frame.release, frame.casings.monetary(), true)?,
+        },
         Expr::Cast {
             kind: CastKind::Cast | CastKind::DoubleColon,
             expr,

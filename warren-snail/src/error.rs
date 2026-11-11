@@ -115,6 +115,8 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("start value cannot be "), "22023"),
     (Words::Starts("stop value cannot be "), "22023"),
     (Words::Is("timestamp out of range"), "22008"),
+    (Words::Is("interval out of range"), "22008"),
+    (Words::Starts("interval field value out of range: \""), "22015"),
     (Words::Is("canceling statement due to statement timeout"), "57014"),
     (Words::Holds("cannot convert value from ", " without time zone usage"), "0A000"),
     (Words::Is("time zone interval must be HOUR or HOUR TO MINUTE"), "42601"),

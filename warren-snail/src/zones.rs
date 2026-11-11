@@ -1,5 +1,5 @@
-//! Zones other than UTC, read only under the feature `zones`: without it, a zone other than UTC
-//! is refused by name.
+//! Zones other than UTC, read only under the feature `zones`, on by default: a build without it
+//! refuses a zone other than UTC by name.
 //!
 //! A zone is read as PostgreSQL reads one: its compiled file found in a directory by a name matched
 //! without regard to case, its transitions and their local time types, and past the last of them

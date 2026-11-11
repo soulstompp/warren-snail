@@ -177,7 +177,8 @@ fn a_setting_the_snail_answers_under_one_value_of_is_taken_there_and_refused_els
             "SET client_encoding = 'LATIN1'",
             "the snail answers in UTF8",
         ),
-        // TimeZone is the session's: a named zone is read only under the feature zones.
+        // TimeZone is the session's: a named zone is read only under the feature zones, on by
+        // default, and refused by name by a build without it.
         #[cfg(not(feature = "zones"))]
         (
             "SET TIME ZONE 'Europe/Lisbon'",

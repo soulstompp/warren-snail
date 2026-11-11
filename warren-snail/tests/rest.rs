@@ -339,7 +339,7 @@ fn the_rest_and_the_forms_a_call_resolves_to() {
 fn a_setting_the_snail_does_not_hold_fixed_is_refused_by_name() {
     // work_mem changes no answer, so it is read at PostgreSQL's boot value; a setting missing, where
     // that is asked for, is NULL; TimeZone reset is UTC, where a session begins, and a named zone is
-    // read only under the feature zones.
+    // read only under the feature zones, on by default: a build without it refuses one by name.
     let mut snail = snail("rest-refused");
     assert_eq!(answer(&mut snail, "current_setting('work_mem')", 1), "4MB");
     assert_eq!(answer(&mut snail, "current_setting('no_such', true)", 1), "NULL");

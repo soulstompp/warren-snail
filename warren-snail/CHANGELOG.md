@@ -191,7 +191,9 @@ at once, and a snail written inside a host that decides its commits.
   `Commit::replica`; the command `replica` and `exec --applier`. While the mark stands, every writer
   is refused by name but the source's applier.
 - The features `collations`, ICU's collations and the C library's locales, and `zones`, named time
-  zones read from compiled zone files; the command `recut`, an order cut under its collation's
+  zones read from compiled zone files, on by default, so that a session names its zone as in
+  PostgreSQL (a build without the default features refuses such a zone by name); the command
+  `recut`, an order cut under its collation's
   version written afresh. Each expression's collation derived as PostgreSQL derives it, two that
   conflict refused.
 - The commands `catalog`, what the snail reads of a DDL, a statement at a time; `read --text`;

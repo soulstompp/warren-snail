@@ -21,9 +21,11 @@ name = "warren-snail"
 path = "src/main.rs"
 
 [features]
+# Both on by default: a session names its zone as in PostgreSQL. A DBA builds without either by
+# turning the default features off (`default-features = false`) and naming those wanted.
+default = ["standalone", "zones"]
 # An open snail holds the pages its rounds read, between rounds. Built without it, a snail holds
 # none of its own, as inside PostgreSQL.
-default = ["standalone"]
 standalone = []
 # Zones other than UTC, read from compiled zone files in a directory: the machine's, or one named.
 # Built without it, a zone other than UTC is refused by name.

@@ -1548,7 +1548,7 @@ fn the_session_time_zone_reads_and_writes_instants_as_postgresql_does() {
     ] {
         assert_eq!(refused(&mut w, set), (Some(code), words.to_string()), "{set}");
     }
-    // Without the feature zones a named zone is refused by name.
+    // A build without the feature zones, on by default, refuses a named zone by name.
     #[cfg(not(feature = "zones"))]
     assert!(refused(&mut w, "SET TimeZone = 'Europe/Lisbon'").1.contains("feature zones"));
     run(&mut w, "CREATE TABLE s.z (id integer PRIMARY KEY, d timestamptz, l timestamp)");

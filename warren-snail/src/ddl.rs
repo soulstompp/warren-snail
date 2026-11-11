@@ -1811,8 +1811,12 @@ fn routine(words: &[String]) -> bool {
 
 /// The statements of a DDL, split on their semicolons by sqlparser's PostgreSQL tokenizer.
 pub(crate) fn statements(ddl: &str) -> Result<Vec<Vec<Token>>> {
-    let ddl = crate::read::scanned_unseeded(ddl, crate::regs::LATEST)?;
-    let tokens = crate::read::image::tokens(&ddl)?;
+    semicolons(&crate::read::scanned_unseeded(ddl, crate::regs::LATEST)?)
+}
+
+/// The statements of a text as written, split on their semicolons as `statements` splits a DDL's.
+pub(crate) fn semicolons(ddl: &str) -> Result<Vec<Vec<Token>>> {
+    let tokens = crate::read::image::tokens(ddl)?;
     let mut out = vec![Vec::new()];
     // A routine's BEGIN … END keeps the semicolons inside it, as psql keeps them: in a statement
     // that begins CREATE [OR REPLACE] FUNCTION or PROCEDURE, each BEGIN outside parentheses opens
@@ -7141,9 +7145,12 @@ fn whole_expression(text: &str) -> Result<()> {
 
 /// A body's one statement read: a SELECT of one expression and nothing else, its expression.
 fn body_expression(name: &str, text: &str) -> Result<Expr> {
-    let bound = crate::grammar::bound(text);
-    let parsed = crate::read::image::parse_sql(bound.as_deref().unwrap_or(text))
-        .map_err(|e| Error::new(format!("{name}: its body: {e}")))?;
+    let refused = |e: Error| Error::new(format!("{name}: its body: {e}"));
+    // Its words as a statement's are read, then its operators as PostgreSQL's grammar binds them.
+    let text = crate::read::scanned_unseeded(text, crate::regs::LATEST).map_err(refused)?;
+    let bound = crate::grammar::bound(&text);
+    let parsed =
+        crate::read::image::parse_sql(bound.as_deref().unwrap_or(&text)).map_err(refused)?;
     match parsed.as_slice() {
         [Statement::Query(q)] => match q.body.as_ref() {
             SetExpr::Select(s)
