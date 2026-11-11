@@ -1672,6 +1672,11 @@ fn expr(e: &mut Expr) {
     if let Some(written) = rows_distinct(e) {
         *e = written;
     }
+    // Rows compared holding a set-returning function stay as written, refused where they are
+    // read.
+    if super::pipeline::holds_set(e) {
+        return;
+    }
     if let Some(written) = rows_in(e) {
         *e = written;
     }
@@ -1826,6 +1831,38 @@ fn rows_distinct(e: &Expr) -> Option<Expr> {
     };
     if x.len() != y.len() {
         return None;
+    }
+    // Where a row holds a set-returning function, which an OR or a NOT refuses, the pairs' truths
+    // are the greatest of them, or for IS NOT DISTINCT FROM the least: none is ever NULL.
+    if super::pipeline::holds_set(e) && x.len() > 1 {
+        let (name, pair): (&str, fn(Box<Expr>, Box<Expr>) -> Expr) = match e {
+            Expr::IsNotDistinctFrom(..) => ("least", Expr::IsNotDistinctFrom),
+            _ => ("greatest", Expr::IsDistinctFrom),
+        };
+        let args = x
+            .iter()
+            .zip(&y)
+            .map(|(l, r)| {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(pair(
+                    Box::new((*l).clone()),
+                    Box::new((*r).clone()),
+                )))
+            })
+            .collect();
+        return Some(Expr::Function(sqlparser::ast::Function {
+            name: sqlparser::ast::ObjectName::from(vec![sqlparser::ast::Ident::new(name)]),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args,
+                clauses: Vec::new(),
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: Vec::new(),
+        }));
     }
     let any = x
         .iter()

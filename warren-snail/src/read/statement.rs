@@ -1049,6 +1049,20 @@ pub(crate) fn writes_query(q: &Query) -> bool {
     )
 }
 
+/// A write's WHERE and RETURNING refused where they call a set-returning function, as PostgreSQL's
+/// parser refuses one, in its order.
+fn sets_refused_in(selection: Option<&Expr>, items: &Option<Vec<SelectItem>>) -> Result<()> {
+    if let Some(w) = selection {
+        super::pipeline::sets_refused(w, "WHERE")?;
+    }
+    for i in items.iter().flatten() {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = i {
+            super::pipeline::sets_refused(e, "RETURNING")?;
+        }
+    }
+    Ok(())
+}
+
 /// A write that returns rows where it has a RETURNING list, its table read by `alias`.
 fn returning(write: Statement, alias: String, items: &Option<Vec<SelectItem>>) -> Statement {
     match items {
@@ -1227,8 +1241,17 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     let source = match q.body.as_ref() {
         SetExpr::Values(v) => {
             let width = v.rows.first().map_or(0, |r| r.content.len());
-            if v.rows.iter().any(|r| r.content.len() != width) {
-                return Err(Error::new("VALUES lists must all be the same length"));
+            // A list of several rows takes no set-returning function, each row read before its
+            // length is.
+            for r in &v.rows {
+                if v.rows.len() > 1 {
+                    for e in &r.content {
+                        super::pipeline::sets_refused(e, "VALUES")?;
+                    }
+                }
+                if r.content.len() != width {
+                    return Err(Error::new("VALUES lists must all be the same length"));
+                }
             }
             let columns = filled(&columns, width, !i.columns.is_empty())?;
             let mut rows = Vec::with_capacity(v.rows.len());
@@ -1577,13 +1600,20 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                 }
                 _ => String::new(),
             };
-            Ok(returning(insert(catalog, i)?, alias, &i.returning))
+            let write = insert(catalog, i)?;
+            sets_refused_in(None, &i.returning)?;
+            Ok(returning(write, alias, &i.returning))
         }
         Sql::Update(u) => {
             if !u.order_by.is_empty() || u.limit.is_some() {
                 return Err(refused("an UPDATE with ORDER BY or LIMIT"));
             }
             let ti = one_table(catalog, &u.table)?;
+            // Its WHERE, its RETURNING, then the values it sets, as PostgreSQL's parser reads them.
+            sets_refused_in(u.selection.as_ref(), &u.returning)?;
+            for a in &u.assignments {
+                super::pipeline::sets_refused(&a.value, "UPDATE")?;
+            }
             let table = &catalog.tables[ti];
             let mut sets = sets_of(table, &u.assignments)?;
             // A value set by a subquery is read on the row it changes, as a FROM's are, over a FROM
@@ -1636,6 +1666,7 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
                 _ => return Err(Error::new("a DELETE names one table")),
             };
             let ti = one_table(catalog, t)?;
+            sets_refused_in(d.selection.as_ref(), &d.returning)?;
             let find = match &d.using {
                 None => finder(&catalog.tables[ti], t, d.selection.as_ref()),
                 Some(using) => {

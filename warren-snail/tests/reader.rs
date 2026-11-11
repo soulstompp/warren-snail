@@ -1971,3 +1971,486 @@ fn before_18_the_set_alone_is_read() {
         )],
     );
 }
+
+// The select list's set-returning functions, case 12b: each set's values a row, in levels and in
+// lockstep, the items beside the deepest made once more as its sets end, and every place 18.6
+// refuses a set refused in its words.
+
+const SR_DDL: &str = "CREATE SCHEMA sr;
+     CREATE TABLE sr.t (id integer NOT NULL, n integer, tags text[], note text, PRIMARY KEY (id));
+     CREATE SEQUENCE sr.q;";
+
+const SR_ROWS: [&str; 1] = [
+    "INSERT INTO sr.t VALUES (1, 2, '{a,b}', 'x1y22'), (2, 0, '{}', 'none'), (3, 3, NULL, 'z333'), \
+     (4, NULL, '{c}', NULL)",
+];
+
+/// A snail holding case 12b's rows, at a path of the test's name.
+fn sr(name: &str) -> Snail {
+    let path = tmp(&format!("reader-sr-{name}.snail"));
+    write(&path, &Catalog::parse(SR_DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in SR_ROWS {
+        w.execute(sql).unwrap();
+    }
+    w
+}
+
+/// 18.6's refusal, with its HINT naming a LATERAL FROM item on a line of its own.
+fn lateral(words: &str) -> String {
+    format!(
+        "{words}\nHINT:  You might be able to move the set-returning function into a LATERAL FROM \
+         item."
+    )
+}
+
+#[test]
+fn a_set_in_the_select_list_gives_a_row_for_each_value() {
+    let mut w = sr("each-value");
+    answered(
+        &mut w,
+        &[
+            ("SELECT generate_series(1, 3)", &["1", "2", "3"]),
+            ("SELECT generate_series(1, 3) AS g, 'x' AS c", &["1|x", "2|x", "3|x"]),
+            (
+                "SELECT id, generate_series(1, n) AS k FROM sr.t ORDER BY id, k",
+                &["1|1", "1|2", "3|1", "3|2", "3|3"],
+            ),
+            (
+                "SELECT id, n * 10 + generate_series(1, n) AS k FROM sr.t ORDER BY id, k",
+                &["1|21", "1|22", "3|31", "3|32", "3|33"],
+            ),
+            (
+                "SELECT generate_series(1, 3) AS g, id FROM sr.t WHERE id < 3 ORDER BY id, g",
+                &["1|1", "2|1", "3|1", "1|2", "2|2", "3|2"],
+            ),
+            ("SELECT generate_series(1, 4) AS g ORDER BY g DESC", &["4", "3", "2", "1"]),
+            ("SELECT string_to_table('a,b', ',')", &["a", "b"]),
+        ],
+    );
+}
+
+#[test]
+fn a_set_beside_an_aggregate_or_a_window_is_made_after_them() {
+    let mut w = sr("after-folds");
+    answered(
+        &mut w,
+        &[
+            ("SELECT count(*), generate_series(1, 2) AS g FROM sr.t", &["4|1", "4|2"]),
+            (
+                "SELECT n, count(*), generate_series(1, 2) AS g FROM sr.t GROUP BY n ORDER BY n, g",
+                &[
+                    "0|1|1", "0|1|2", "2|1|1", "2|1|2", "3|1|1", "3|1|2", "NULL|1|1", "NULL|1|2",
+                ],
+            ),
+            (
+                "SELECT generate_series(1, count(*)::integer) AS g FROM sr.t",
+                &["1", "2", "3", "4"],
+            ),
+            (
+                "SELECT row_number() OVER (ORDER BY id) AS r, generate_series(1, 2) AS g FROM sr.t \
+                 ORDER BY r, g",
+                &["1|1", "1|2", "2|1", "2|2", "3|1", "3|2", "4|1", "4|2"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_set_under_distinct_a_limit_or_in_a_subquery() {
+    let mut w = sr("under");
+    answered(
+        &mut w,
+        &[
+            ("SELECT count(*) FROM (SELECT generate_series(1, n) FROM sr.t) d", &["5"]),
+            (
+                "SELECT x FROM (SELECT generate_series(1, 3) AS x) d ORDER BY x DESC",
+                &["3", "2", "1"],
+            ),
+            ("SELECT generate_series(1, 10) AS g LIMIT 3", &["1", "2", "3"]),
+            ("SELECT generate_series(1, 10) AS g OFFSET 7", &["8", "9", "10"]),
+            (
+                "SELECT id, generate_series(1, 3) AS k FROM sr.t ORDER BY id, k LIMIT 4",
+                &["1|1", "1|2", "1|3", "2|1"],
+            ),
+            ("SELECT DISTINCT unnest(ARRAY[3, 1, 3, 2]) AS v ORDER BY v", &["1", "2", "3"]),
+            ("SELECT DISTINCT generate_series(1, n) AS k FROM sr.t ORDER BY k", &["1", "2", "3"]),
+            ("SELECT count(DISTINCT x) FROM (SELECT unnest(ARRAY[1, 1, 2]) AS x) d", &["2"]),
+            (
+                "SELECT id FROM sr.t WHERE id IN (SELECT generate_series(1, 2)) ORDER BY id",
+                &["1", "2"],
+            ),
+            ("SELECT (SELECT generate_series(1, 1)) AS one", &["1"]),
+        ],
+    );
+}
+
+#[test]
+fn a_set_in_order_by_repeats_each_row() {
+    let mut w = sr("order-by");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT id FROM sr.t ORDER BY generate_series(1, 2), id",
+                &["1", "2", "3", "4", "1", "2", "3", "4"],
+            ),
+            (
+                "SELECT n FROM sr.t GROUP BY n ORDER BY generate_series(1, 2), n",
+                &["0", "2", "3", "NULL", "0", "2", "3", "NULL"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn sets_of_one_level_run_in_lockstep_the_shorter_padded_with_null() {
+    let mut w = sr("lockstep");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT generate_series(1, 3) AS a, generate_series(1, 2) AS b",
+                &["1|1", "2|2", "3|NULL"],
+            ),
+            (
+                "SELECT generate_series(1, 2) AS a, unnest(ARRAY['x', 'y', 'z']) AS b",
+                &["1|x", "2|y", "NULL|z"],
+            ),
+            (
+                "SELECT generate_series(1, 0) AS a, generate_series(1, 2) AS b",
+                &["NULL|1", "NULL|2"],
+            ),
+            ("SELECT generate_series(1, 0) AS a, unnest('{}'::integer[]) AS b", &[]),
+            ("SELECT generate_series(1, 3) + generate_series(1, 2) AS s", &["2", "4", "NULL"]),
+            (
+                "SELECT id, unnest(tags) AS tag, generate_series(1, 2) AS k FROM sr.t ORDER BY id, k",
+                &[
+                    "1|a|1", "1|b|2", "2|NULL|1", "2|NULL|2", "3|NULL|1", "3|NULL|2", "4|c|1",
+                    "4|NULL|2",
+                ],
+            ),
+            (
+                "SELECT id, pg_catalog.generate_series(1, 2) FROM sr.t WHERE id = 1",
+                &["1|1", "1|2"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_nested_set_runs_once_for_each_value_beneath_it() {
+    let mut w = sr("nested");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT generate_series(1, generate_series(1, 3)) AS g",
+                &["1", "1", "2", "1", "2", "3"],
+            ),
+            (
+                "SELECT generate_series(generate_series(1, 2), 3) AS g",
+                &["1", "2", "3", "2", "3"],
+            ),
+            (
+                "SELECT unnest(ARRAY[generate_series(1, 2), 10]) AS u",
+                &["1", "10", "2", "10"],
+            ),
+            (
+                "SELECT generate_series(1, generate_series(1, generate_series(1, 2))) AS g",
+                &["1", "1", "1", "2"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_row_goes_where_a_deeper_set_gives_none() {
+    let mut w = sr("row-goes");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT generate_series(1, generate_series(1, 2)) AS a, generate_series(1, 3) AS b",
+                &["1|1", "1|2", "2|2"],
+            ),
+            (
+                "SELECT generate_series(1, generate_series(1, 2)) + generate_series(10, 12) AS s",
+                &["11", "12", "13"],
+            ),
+            (
+                "SELECT id, generate_series(1, generate_series(0, n)) AS g FROM sr.t ORDER BY id, g",
+                &["1|1", "1|1", "1|2", "3|1", "3|1", "3|1", "3|2", "3|2", "3|3"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_set_among_another_calls_arguments_is_read() {
+    let mut w = sr("among");
+    answered(
+        &mut w,
+        &[
+            ("SELECT abs(generate_series(-2, 0)) AS a", &["2", "1", "0"]),
+            ("SELECT (generate_series(1, 2) || 'x') AS t", &["1x", "2x"]),
+            ("SELECT ARRAY[generate_series(1, 2), 10] AS a", &["{1,10}", "{2,10}"]),
+            ("SELECT greatest(generate_series(1, 3), 2) AS g", &["2", "2", "3"]),
+            ("SELECT nullif(generate_series(1, 3), 2) AS n", &["1", "NULL", "3"]),
+            ("SELECT unnest(ARRAY['ab', 'cd']) LIKE 'a%' AS l", &["t", "f"]),
+            ("SELECT unnest(ARRAY[1, NULL]) IS NULL AS n", &["f", "t"]),
+            ("SELECT generate_series(1, 2)::text AS t", &["1", "2"]),
+            ("SELECT ROW(generate_series(1, 2), 'x') AS r", &["(1,x)", "(2,x)"]),
+            ("SELECT generate_series(1, 3) = ANY (ARRAY[2, 3]) AS a", &["f", "t", "t"]),
+            ("SELECT 2 = ANY (ARRAY[generate_series(1, 3), 5]) AS a", &["f", "t", "f"]),
+            ("SELECT 2 IN (generate_series(1, 3), 5) AS i", &["f", "t", "f"]),
+            ("SELECT generate_series(1, 3) IN (1, 2) AS i", &["t", "t", "f"]),
+            ("SELECT 2 NOT IN (generate_series(1, 3), 5) AS i", &["t", "f", "t"]),
+            ("SELECT generate_series(1, 2) IS DISTINCT FROM 1 AS d", &["f", "t"]),
+            ("SELECT (generate_series(1, 2), 1) IS DISTINCT FROM (1, 1) AS d", &["f", "t"]),
+            ("SELECT (generate_series(1, 2), 1) IS NOT DISTINCT FROM (1, 1) AS d", &["t", "f"]),
+        ],
+    );
+}
+
+#[test]
+fn the_items_beside_a_set_are_made_once_more_as_its_sets_end() {
+    let mut w = sr("ending-pass");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT nextval('sr.q') AS v, generate_series(1, n) AS g FROM sr.t",
+                &["1|1", "2|2", "5|1", "6|2", "7|3"],
+            ),
+            ("SELECT currval('sr.q')", &["9"]),
+            (
+                "SELECT nextval('sr.q') AS v, generate_series(1, 2) + 0 AS g FROM sr.t WHERE id = 1",
+                &["10|1", "11|2"],
+            ),
+            ("SELECT currval('sr.q')", &["11"]),
+            (
+                "SELECT nextval('sr.q') AS v, generate_series(1, generate_series(1, 2)) AS g",
+                &["12|1", "14|1", "15|2"],
+            ),
+            ("SELECT currval('sr.q')", &["16"]),
+            (
+                "SELECT nextval('sr.q') AS v, (generate_series(1, 2)) AS g FROM sr.t WHERE id = 1",
+                &["17|1", "18|2"],
+            ),
+            ("SELECT currval('sr.q')", &["19"]),
+            ("SELECT nextval('sr.q') AS v, generate_series(1, 0) FROM sr.t", &[]),
+            ("SELECT currval('sr.q')", &["23"]),
+            (
+                "SELECT nextval('sr.q') AS v, generate_series(1, 2) AS g, \
+                 generate_series(1, generate_series(1, 2)) + 0 AS h",
+                &["24|1|1", "25|2|1", "26|2|2"],
+            ),
+            ("SELECT currval('sr.q')", &["26"]),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[
+            (
+                "SELECT 1 / (id - id) AS x, generate_series(1, 0) FROM sr.t",
+                "22012",
+                "division by zero",
+            ),
+            (
+                "SELECT generate_series(1, 0) AS g, 1 / (id - id) AS x FROM sr.t",
+                "22012",
+                "division by zero",
+            ),
+        ],
+    );
+    answered(
+        &mut w,
+        &[("SELECT 1 / (id - id) + 0 * generate_series(1, 0) AS x FROM sr.t", &[])],
+    );
+}
+
+#[test]
+fn a_set_where_18_6_refuses_one_is_refused_in_its_words() {
+    let mut w = sr("refused");
+    let not_in = |clause: &str| format!("set-returning functions are not allowed in {clause}");
+    let argument = |of: &str| format!("argument of {of} must not return a set");
+    let row = "row comparison operator must not return a set".to_string();
+    let aggregate = lateral("aggregate function calls cannot contain set-returning function calls");
+    let asked: Vec<(&str, &str, String)> = vec![
+        ("SELECT n FROM sr.t GROUP BY n HAVING generate_series(1, 2) > 1", "0A000", not_in("HAVING")),
+        ("SELECT sum(generate_series(1, 3))", "0A000", aggregate.clone()),
+        (
+            "SELECT count(*) FILTER (WHERE generate_series(1, 2) > 1) FROM sr.t",
+            "0A000",
+            not_in("FILTER"),
+        ),
+        (
+            "SELECT lag(generate_series(1, 2)) OVER ()",
+            "0A000",
+            lateral("window function calls cannot contain set-returning function calls"),
+        ),
+        (
+            "SELECT CASE WHEN id > 1 THEN generate_series(1, 2) END FROM sr.t",
+            "0A000",
+            lateral(&not_in("CASE")),
+        ),
+        ("SELECT COALESCE(generate_series(1, 2), 0)", "0A000", lateral(&not_in("COALESCE"))),
+        ("SELECT id FROM sr.t WHERE id = generate_series(1, 2)", "0A000", not_in("WHERE")),
+        (
+            "SELECT (SELECT generate_series(1, 2)) AS two",
+            "21000",
+            "more than one row returned by a subquery used as an expression".into(),
+        ),
+        (
+            "SELECT sum(generate_series(1, 3)) FILTER (WHERE generate_series(1, 2) > 1)",
+            "0A000",
+            not_in("FILTER"),
+        ),
+        (
+            "SELECT array_agg(id ORDER BY generate_series(1, 2)) FROM sr.t",
+            "0A000",
+            aggregate.clone(),
+        ),
+        (
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY generate_series(1, 3))",
+            "0A000",
+            aggregate.clone(),
+        ),
+        (
+            "SELECT a.id FROM sr.t a JOIN sr.t b ON a.id = generate_series(1, 2)",
+            "0A000",
+            not_in("JOIN conditions"),
+        ),
+        ("SELECT id FROM sr.t LIMIT generate_series(1, 2)", "0A000", not_in("LIMIT")),
+        ("SELECT id FROM sr.t OFFSET generate_series(1, 2)", "0A000", not_in("OFFSET")),
+        (
+            "SELECT count(*) OVER (ORDER BY id ROWS generate_series(1, 2) PRECEDING) FROM sr.t",
+            "0A000",
+            not_in("window definitions"),
+        ),
+        (
+            "SELECT * FROM (VALUES (generate_series(1, 2)), (3)) v",
+            "0A000",
+            not_in("VALUES"),
+        ),
+        ("SELECT generate_series(1, 2) > 1 AND true AS b", "42804", argument("AND")),
+        ("SELECT generate_series(1, 2) > 1 OR true AS b", "42804", argument("OR")),
+        ("SELECT NOT generate_series(1, 2) > 1 AS b", "42804", argument("NOT")),
+        ("SELECT (generate_series(1, 2) > 1) IS TRUE AS b", "42804", argument("IS TRUE")),
+        ("SELECT (generate_series(1, 2) > 1) IS NOT TRUE AS b", "42804", argument("IS NOT TRUE")),
+        ("SELECT (generate_series(1, 2) > 1) IS FALSE AS b", "42804", argument("IS FALSE")),
+        (
+            "SELECT (generate_series(1, 2) > 1) IS NOT FALSE AS b",
+            "42804",
+            argument("IS NOT FALSE"),
+        ),
+        ("SELECT (generate_series(1, 2) > 1) IS UNKNOWN AS b", "42804", argument("IS UNKNOWN")),
+        (
+            "SELECT (generate_series(1, 2) > 1) IS NOT UNKNOWN AS b",
+            "42804",
+            argument("IS NOT UNKNOWN"),
+        ),
+        ("SELECT generate_series(1, 3) BETWEEN 1 AND 2 AS b", "42804", argument("AND")),
+        ("SELECT generate_series(1, 3) NOT BETWEEN 1 AND 2 AS b", "42804", argument("OR")),
+        (
+            "SELECT CASE WHEN generate_series(1, 2) > 1 THEN 1 END AS c",
+            "42804",
+            argument("CASE/WHEN"),
+        ),
+        (
+            "SELECT CASE generate_series(1, 2) WHEN 1 THEN 'a' END AS c",
+            "0A000",
+            lateral(&not_in("CASE")),
+        ),
+        ("SELECT (generate_series(1, 2), 1) = (1, 1) AS b", "42804", row.clone()),
+        ("SELECT (generate_series(1, 2), 1) <> (1, 1) AS b", "42804", row.clone()),
+        ("SELECT ROW(generate_series(1, 2), 1) < ROW(2, 2) AS b", "42804", row.clone()),
+        ("SELECT (generate_series(1, 2), 1) IN ((1, 1), (2, 2)) AS i", "42804", row.clone()),
+        ("SELECT generate_series(1, 3) IN (SELECT 2) AS i", "42804", row.clone()),
+        ("SELECT generate_series(1, 3) IN (1) AS b", "42804", argument("IN")),
+        ("SELECT 2 IN (generate_series(1, 3), id) AS b FROM sr.t", "42804", argument("IN")),
+        ("SELECT generate_series(1, 3) IN (id, 5) AS b FROM sr.t", "42804", argument("IN")),
+        ("SELECT 1 IN (generate_series(1, 2), 1) AND true AS b", "42804", argument("AND")),
+        (
+            "SELECT id, generate_series(1, 2) FROM sr.t FOR UPDATE",
+            "0A000",
+            "FOR UPDATE is not allowed with set-returning functions in the target list".into(),
+        ),
+        ("UPDATE sr.t SET n = generate_series(1, 2) WHERE id = 1", "0A000", not_in("UPDATE")),
+        (
+            "UPDATE sr.t SET n = 1 WHERE id = 1 RETURNING generate_series(1, 2)",
+            "0A000",
+            not_in("RETURNING"),
+        ),
+        ("UPDATE sr.t SET n = 1 WHERE id = generate_series(1, 2)", "0A000", not_in("WHERE")),
+        (
+            "DELETE FROM sr.t WHERE id = 99 RETURNING generate_series(1, 2)",
+            "0A000",
+            not_in("RETURNING"),
+        ),
+        ("DELETE FROM sr.t WHERE id = generate_series(1, 2)", "0A000", not_in("WHERE")),
+        (
+            "INSERT INTO sr.t VALUES (99, 1) RETURNING generate_series(1, 2)",
+            "0A000",
+            not_in("RETURNING"),
+        ),
+        (
+            "INSERT INTO sr.t VALUES (10, generate_series(1, 2)), (11, 1)",
+            "0A000",
+            not_in("VALUES"),
+        ),
+        // A set-returning function the snail does not read, where 18.6 refuses any.
+        ("SELECT id FROM sr.t WHERE pg_listening_channels() IS NULL", "0A000", not_in("WHERE")),
+        (
+            "SELECT n FROM sr.t GROUP BY n HAVING count(*) > 0 AND ts_stat('SELECT 1') IS NULL",
+            "0A000",
+            not_in("HAVING"),
+        ),
+        (
+            "SELECT id FROM sr.t LIMIT pg_listening_channels()::text::integer",
+            "0A000",
+            not_in("LIMIT"),
+        ),
+        (
+            "UPDATE sr.t SET note = pg_listening_channels()::text WHERE id = 1",
+            "0A000",
+            not_in("UPDATE"),
+        ),
+        // The first refused in 18.6's parser's order: the FROM, the select list, WHERE, HAVING,
+        // ORDER BY; a write's WHERE, RETURNING, then the values it sets.
+        (
+            "SELECT CASE WHEN true THEN generate_series(1, 2) END FROM sr.t \
+             WHERE id = generate_series(1, 2)",
+            "0A000",
+            lateral(&not_in("CASE")),
+        ),
+        (
+            "SELECT id FROM sr.t WHERE id = generate_series(1, 2) \
+             ORDER BY sum(generate_series(1, 3))",
+            "0A000",
+            not_in("WHERE"),
+        ),
+        (
+            "SELECT n FROM sr.t GROUP BY n HAVING generate_series(1, 2) > 1 \
+             ORDER BY sum(generate_series(1, 2))",
+            "0A000",
+            not_in("HAVING"),
+        ),
+        (
+            "SELECT CASE WHEN true THEN generate_series(1, 2) END FROM sr.t a \
+             JOIN sr.t b ON a.id = generate_series(1, 2)",
+            "0A000",
+            not_in("JOIN conditions"),
+        ),
+        (
+            "UPDATE sr.t SET n = generate_series(1, 2) WHERE id = 1 RETURNING generate_series(1, 2)",
+            "0A000",
+            not_in("RETURNING"),
+        ),
+    ];
+    for (sql, code, words) in &asked {
+        assert_eq!(refused(&mut w, sql), (Some(*code), words.clone()), "{sql}");
+    }
+    answered(&mut w, &[("SELECT count(*) FROM sr.t", &["4"])]);
+}

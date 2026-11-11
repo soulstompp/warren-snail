@@ -386,6 +386,7 @@ pub(super) fn checked(
             return Err(Error::new("GROUPS mode requires an ORDER BY clause"));
         }
         for x in &offsets {
+            super::sets_refused(x, "window definitions")?;
             let mut read = Vec::new();
             columns_read(x, &mut read);
             if !read.is_empty() {

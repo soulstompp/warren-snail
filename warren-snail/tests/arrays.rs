@@ -147,7 +147,7 @@ fn a_set_returning_call_makes_as_many_rows_as_its_longest_set() {
         ("CASE WHEN id > 1 THEN unnest(a) END", "not allowed in CASE"),
         ("coalesce(unnest(a), 0)", "not allowed in COALESCE"),
         ("sum(unnest(a))", "aggregate function calls cannot contain"),
-        ("unnest(unnest(ARRAY[a]))", "among another's arguments"),
+        ("unnest(unnest(ARRAY[a]))", "function unnest(integer) does not exist"),
     ] {
         let e = ask(&mut s, select).unwrap_err().to_string();
         assert!(e.contains(why), "{select}: {e}");

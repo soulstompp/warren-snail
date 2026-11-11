@@ -141,6 +141,11 @@ const SAID: &[(Words, &str)] = &[
     ),
     (Words::Holds("subquery uses ungrouped column \"", "\" from outer query"), "42803"),
     (Words::Starts("window functions are not allowed in "), "42P20"),
+    (Words::Starts("set-returning functions are not allowed in "), "0A000"),
+    (Words::Is("aggregate function calls cannot contain set-returning function calls"), "0A000"),
+    (Words::Is("window function calls cannot contain set-returning function calls"), "0A000"),
+    (Words::Holds("argument of ", " must not return a set"), "42804"),
+    (Words::Is("row comparison operator must not return a set"), "42804"),
     (
         Words::Is("for SELECT DISTINCT, ORDER BY expressions must appear in select list"),
         "42P10",

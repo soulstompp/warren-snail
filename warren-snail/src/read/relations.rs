@@ -3644,8 +3644,14 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
     };
     let rows: Vec<&Vec<Expr>> = v.rows.iter().map(|r| &r.content).collect();
     let n = rows.first().map_or(0, |r| r.len());
-    if rows.iter().any(|r| r.len() != n) {
-        return Err(Error::new("VALUES lists must all be the same length"));
+    // Each row's values are read before its length is, none a set-returning function's.
+    for r in &rows {
+        for e in r.iter() {
+            pipeline::sets_refused(e, "VALUES")?;
+        }
+        if r.len() != n {
+            return Err(Error::new("VALUES lists must all be the same length"));
+        }
     }
     let columns: Vec<TypedColumn> = Vec::new();
     let mut typing = typed::Typing {
@@ -4841,6 +4847,12 @@ fn select_step(
             What::Join { on, .. } => on.as_ref(),
             _ => None,
         }));
+    }
+    // A join's ON takes no set-returning function, refused with the FROM it is read in.
+    for n in &joins {
+        if let What::Join { on: Some(on), .. } = &n.what {
+            pipeline::sets_refused(on, "JOIN conditions")?;
+        }
     }
     // Each join's ON holding a subquery: its subqueries read as the pairs it meets are, over the
     // join's two sides and the query's around the step; a FULL JOIN's checked once they are.
