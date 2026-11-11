@@ -1652,3 +1652,378 @@ fn writers_of_different_names_both_commit() {
         ["1,1"]
     );
 }
+
+/// What a statement on another thread came to: the rows it wrote, or its refusal.
+type Ended = Result<u64, (Option<&'static str>, String)>;
+
+/// A writer's statements run on a thread of its own, each one's outcome sent back as it ends; the
+/// snail held open until the test lets it go, so that its locks stand until then.
+fn later(path: &std::path::Path, statements: &[&str]) -> std::sync::mpsc::Receiver<Ended> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.to_path_buf();
+    let statements: Vec<String> = statements.iter().map(|s| s.to_string()).collect();
+    std::thread::spawn(move || {
+        let mut w = Snail::open_writing(&p).unwrap();
+        for st in &statements {
+            let ended = w
+                .execute(st)
+                .map(|d| d.rows)
+                .map_err(|e| (e.sqlstate(), e.to_string()));
+            if tx.send(ended).is_err() {
+                return;
+            }
+        }
+        while tx.send(Err((None, "held".into()))).is_ok() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    rx
+}
+
+/// Whether the thread's next statement is still waiting.
+fn waits(rx: &std::sync::mpsc::Receiver<Ended>) -> bool {
+    std::thread::sleep(Duration::from_millis(300));
+    rx.try_recv().is_err()
+}
+
+/// The thread's next statement's outcome, once it ends.
+fn next(rx: &std::sync::mpsc::Receiver<Ended>) -> Ended {
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("a statement ended")
+}
+
+/// PostgreSQL's refusal of a second row of a catalog's unique key, as the snail writes it.
+fn duplicate(index: &str, key: &str) -> (Option<&'static str>, String) {
+    let columns = match index {
+        "pg_type_typname_nsp_index" => "typname, typnamespace",
+        "pg_class_relname_nsp_index" => "relname, relnamespace",
+        "pg_namespace_nspname_index" => "nspname",
+        _ => "proname, proargtypes, pronamespace",
+    };
+    said(
+        "23505",
+        &format!(
+            "duplicate key value violates unique constraint \"{index}\": Key ({columns})=({key}) \
+             already exists."
+        ),
+    )
+}
+
+#[test]
+fn a_name_being_made_waits_then_23505() {
+    let (mut a, _b, path) = named("being-made");
+    // At SERIALIZABLE the name is not yet committed as its CREATE TABLE looks: it waits on the
+    // other's row type, and meets it.
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE notes9 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    let rx = later(
+        &path,
+        &[
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "SELECT 1",
+            "CREATE TABLE notes9 (k varchar(4) NOT NULL, v integer, PRIMARY KEY (k))",
+        ],
+    );
+    assert_eq!((next(&rx), next(&rx)), (Ok(0), Ok(1)));
+    assert!(waits(&rx), "a name another writer is making");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        next(&rx),
+        Err(duplicate("pg_type_typname_nsp_index", "notes9, 2200"))
+    );
+    drop(rx);
+    // Each kind by the first of the catalog's rows it meets.
+    for (theirs, ours, index, key) in [
+        ("CREATE SEQUENCE s21", "CREATE SEQUENCE s21", "pg_class_relname_nsp_index", "s21, 2200"),
+        (
+            "CREATE INDEX i21 ON t (w)",
+            "CREATE INDEX i21 ON t8 (y)",
+            "pg_class_relname_nsp_index",
+            "i21, 2200",
+        ),
+        ("CREATE SCHEMA sc21", "CREATE SCHEMA sc21", "pg_namespace_nspname_index", "sc21"),
+        (
+            "CREATE TYPE mood21 AS ENUM ('a')",
+            "CREATE TYPE mood21 AS ENUM ('b')",
+            "pg_type_typname_nsp_index",
+            "mood21, 2200",
+        ),
+        (
+            "CREATE DOMAIN dom21 AS integer",
+            "CREATE TABLE dom21 (k integer NOT NULL, PRIMARY KEY (k))",
+            "pg_type_typname_nsp_index",
+            "dom21, 2200",
+        ),
+        (
+            "CREATE FUNCTION f21(integer) RETURNS integer LANGUAGE sql RETURN 1",
+            "CREATE FUNCTION f21(integer) RETURNS integer LANGUAGE sql RETURN 2",
+            "pg_proc_proname_args_nsp_index",
+            "f21, 23, 2200",
+        ),
+        (
+            "CREATE VIEW v21 AS SELECT 1 AS one",
+            "CREATE TABLE v21 (k integer NOT NULL, PRIMARY KEY (k))",
+            "pg_type_typname_nsp_index",
+            "v21, 2200",
+        ),
+    ] {
+        a.execute("BEGIN").unwrap();
+        a.execute(theirs).unwrap();
+        let rx = later(&path, &[ours]);
+        assert!(waits(&rx), "{ours}");
+        a.execute("COMMIT").unwrap();
+        assert_eq!(next(&rx), Err(duplicate(index, key)), "{ours}");
+    }
+}
+
+#[test]
+fn a_name_being_made_waits_then_is_made_on_rollback() {
+    let (mut a, _b, path) = named("being-made-back");
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE notes10 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    let rx = later(
+        &path,
+        &[
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "SELECT 1",
+            "CREATE TABLE notes10 (k varchar(4) NOT NULL, v integer, PRIMARY KEY (k))",
+            "INSERT INTO notes10 VALUES ('a', 1)",
+            "COMMIT",
+        ],
+    );
+    assert_eq!((next(&rx), next(&rx)), (Ok(0), Ok(1)));
+    assert!(waits(&rx));
+    a.execute("ROLLBACK").unwrap();
+    assert_eq!((next(&rx), next(&rx), next(&rx)), (Ok(0), Ok(1), Ok(0)));
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM notes10 WHERE v = 1"), ["1"]);
+    // Two writers each making a name the other then makes wait in a ring: the second to wait fails,
+    // and the first makes its name.
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE r2 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    let rx = later(
+        &path,
+        &[
+            "BEGIN",
+            "CREATE TABLE r1 (k integer NOT NULL, PRIMARY KEY (k))",
+            "CREATE TABLE r2 (k integer NOT NULL, PRIMARY KEY (k))",
+            "COMMIT",
+        ],
+    );
+    assert_eq!((next(&rx), next(&rx)), (Ok(0), Ok(0)));
+    assert!(waits(&rx));
+    let (code, words) = refused(&mut a, "CREATE TABLE r1 (k integer NOT NULL, PRIMARY KEY (k))");
+    assert_eq!(code, Some("40P01"), "{words}");
+    a.execute("ROLLBACK").unwrap();
+    assert_eq!((next(&rx), next(&rx)), (Ok(0), Ok(0)));
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname IN ('r1', 'r2')"),
+        ["2"]
+    );
+}
+
+#[test]
+fn ddl_of_a_table_being_changed_waits_then_answers() {
+    let (mut a, _b, path) = named("being-changed");
+    let held_off = |a: &mut Snail, ours: &str, theirs: &str, end: &str| {
+        a.execute("BEGIN").unwrap();
+        a.execute(ours).unwrap_or_else(|e| panic!("{ours}: {e}"));
+        let rx = later(&path, &[theirs]);
+        assert!(waits(&rx), "{theirs} waits on {ours}");
+        a.execute(end).unwrap();
+        next(&rx)
+    };
+    // An ALTER and a DROP of a table another is changing wait on its lock, then answer as
+    // committed, at SERIALIZABLE too.
+    a.execute("BEGIN").unwrap();
+    a.execute("ALTER TABLE t8 ADD CONSTRAINT c9 CHECK (y > 0)")
+        .unwrap();
+    let rx = later(
+        &path,
+        &[
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "SELECT 1",
+            "ALTER TABLE t8 ADD CONSTRAINT c9 CHECK (y > 1)",
+        ],
+    );
+    assert_eq!((next(&rx), next(&rx)), (Ok(0), Ok(1)));
+    assert!(waits(&rx), "an ALTER of a table another alters");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        next(&rx),
+        Err(said("42710", "constraint \"c9\" for relation \"t8\" already exists"))
+    );
+    drop(rx);
+    a.execute("CREATE TABLE d15 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(
+        held_off(&mut a, "DROP TABLE d15", "DROP TABLE d15", "COMMIT"),
+        Err(said("42P01", "table \"d15\" does not exist"))
+    );
+    // A DROP waits on a writer of its rows; CREATE INDEX on a writer, and a writer on it; a foreign
+    // key holds off writers of the table it references, and COMMENT ON an index made on its table.
+    assert_eq!(
+        held_off(&mut a, "INSERT INTO d7 VALUES (1)", "DROP TABLE d7", "COMMIT"),
+        Ok(0)
+    );
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname = 'd7'"),
+        ["0"]
+    );
+    assert_eq!(
+        held_off(
+            &mut a,
+            "INSERT INTO t8 VALUES ('a', 1)",
+            "CREATE INDEX t8_y ON t8 (y)",
+            "ROLLBACK"
+        ),
+        Ok(0)
+    );
+    assert_eq!(
+        held_off(
+            &mut a,
+            "CREATE INDEX t_y ON t (y)",
+            "INSERT INTO t VALUES ('b', 1, 1)",
+            "ROLLBACK"
+        ),
+        Ok(1)
+    );
+    assert_eq!(
+        held_off(
+            &mut a,
+            "CREATE TABLE child (c integer NOT NULL, k varchar(4) REFERENCES t (k), \
+             PRIMARY KEY (c))",
+            "INSERT INTO t VALUES ('c', 1, 1)",
+            "ROLLBACK"
+        ),
+        Ok(1)
+    );
+    assert_eq!(
+        held_off(
+            &mut a,
+            "COMMENT ON TABLE t8 IS 'eight'",
+            "CREATE INDEX t8_y2 ON t8 (y)",
+            "ROLLBACK"
+        ),
+        Ok(0)
+    );
+    // A writer that waited on a DROP finds the table gone, in PostgreSQL's words.
+    a.execute("CREATE TABLE d16 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(
+        held_off(&mut a, "DROP TABLE d16", "INSERT INTO d16 VALUES (1)", "COMMIT"),
+        Err(said("42P01", "relation \"d16\" does not exist"))
+    );
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM t"), ["2"]);
+    // A table's lock is its own wherever the catalog lays it: a DROP before it moves it.
+    a.execute("BEGIN").unwrap();
+    a.execute("DROP TABLE t").unwrap();
+    a.execute("INSERT INTO t8 VALUES ('z', 5)").unwrap();
+    let rx = later(&path, &["ALTER TABLE t8 ADD CONSTRAINT c11 CHECK (y > 0)"]);
+    assert!(waits(&rx), "an ALTER of a table another writes");
+    a.execute("ROLLBACK").unwrap();
+    assert_eq!(next(&rx), Ok(0));
+}
+
+#[test]
+fn a_question_names_as_committed_and_reads_its_snapshot() {
+    let (mut a, mut b, path) = named("question-committed");
+    b.execute("CREATE TABLE d17 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO d17 VALUES (1)").unwrap();
+    a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("CREATE TABLE notes11 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO notes11 VALUES ('n1')").unwrap();
+    b.execute("DROP TABLE d17").unwrap();
+    // A table another made since is named, reading its snapshot's rows of it; one another dropped
+    // since is not found.
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM notes11"), ["0"]);
+    a.execute("SAVEPOINT a").unwrap();
+    assert_eq!(
+        refused(&mut a, "SELECT count(*) FROM d17"),
+        said("42P01", "relation \"d17\" does not exist")
+    );
+    a.execute("ROLLBACK TO a").unwrap();
+    // The catalog tables hold the snapshot's objects and its own, before its own DDL and after.
+    let classes = "SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class \
+                   WHERE relname IN ('notes11', 'd17', 'own11')";
+    assert_eq!(rows(&mut a, classes), ["d17"]);
+    a.execute("CREATE TABLE own11 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(rows(&mut a, classes), ["d17,own11"]);
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM notes11"), ["0"]);
+    a.execute("INSERT INTO notes11 VALUES ('n2')").unwrap();
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM notes11"), ["1"]);
+    a.execute("COMMIT").unwrap();
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM notes11"), ["2"]);
+    assert_eq!(rows(&mut a, classes), ["notes11,own11"]);
+    // At REPEATABLE READ alike; at READ COMMITTED each statement reads as committed.
+    a.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("CREATE TABLE notes12 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO notes12 VALUES ('n1')").unwrap();
+    // A write names as committed too, before any question.
+    a.execute("INSERT INTO notes12 VALUES ('n2')").unwrap();
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM notes12"), ["1"]);
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname = 'notes12'"),
+        ["0"]
+    );
+    a.execute("ROLLBACK").unwrap();
+    a.execute("BEGIN").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("CREATE TABLE notes13 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO notes13 VALUES ('n1')").unwrap();
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM notes13"), ["1"]);
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname = 'notes13'"),
+        ["1"]
+    );
+    a.execute("ROLLBACK").unwrap();
+    drop((a, b));
+    let mut c = Snail::open_writing(&path).unwrap();
+    assert_eq!(
+        rows(&mut c, "SELECT string_agg(k, ',' ORDER BY k) FROM notes11"),
+        ["n1,n2"]
+    );
+}
+
+#[test]
+fn writers_of_the_tables_each_made_write_them_beside_each_other() {
+    let (mut a, _b, path) = named("each-made");
+    // A table a transaction made is named by no other writer until it commits, whatever OID each
+    // writer's catalog gives what it made.
+    a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    a.execute("CREATE TABLE b15 (k integer NOT NULL, v integer, PRIMARY KEY (k))")
+        .unwrap();
+    a.execute("CREATE INDEX b15_v ON b15 (v)").unwrap();
+    a.execute("INSERT INTO b15 VALUES (1, 1)").unwrap();
+    let rx = later(
+        &path,
+        &[
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "CREATE TABLE a15 (k integer NOT NULL, PRIMARY KEY (k))",
+            "INSERT INTO a15 VALUES (7)",
+            "COMMIT",
+        ],
+    );
+    assert_eq!(
+        (next(&rx), next(&rx), next(&rx), next(&rx)),
+        (Ok(0), Ok(0), Ok(1), Ok(0))
+    );
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(
+            &mut a,
+            "SELECT (SELECT count(*) FROM a15) || ',' || (SELECT count(*) FROM b15 WHERE v = 1)"
+        ),
+        ["1,1"]
+    );
+}

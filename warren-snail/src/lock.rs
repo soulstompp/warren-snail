@@ -214,6 +214,13 @@ pub(crate) fn key_byte(table: usize, order: usize, key: &[crate::places::KeyValu
     block_byte(&(table as u64, order as u64, "key", key))
 }
 
+/// The byte a writer holds alone, to its transaction's end, for a key of one of the catalog's unique
+/// indexes that an object it makes takes, by the index and the key's names: it falls among the block
+/// bytes, apart from any block's.
+pub(crate) fn name_byte(index: &str, names: &str) -> u64 {
+    block_byte(&("name", index, names))
+}
+
 /// The byte a serializable round marks for what lands between the keys of the block of lock byte
 /// `block`: apart from the block's own, which stands for its rows and its gaps at once.
 pub(crate) fn gap_byte(block: u64) -> u64 {
@@ -467,14 +474,16 @@ pub fn unlock_block(file: &File, byte: u64) -> Result<()> {
     give(file, byte, 1)
 }
 
-/// The bytes of the tables' locks LOCK TABLE and the writers take: for each table, a run of a byte a
-/// slot for each pair of its modes that conflict, and one for each mode that conflicts with itself.
+/// The bytes of the relations' locks LOCK TABLE, the writers and DDL take: for each relation, by its
+/// OID, a run of a byte a slot for each pair of its modes that conflict, and one for each mode that
+/// conflicts with itself.
 const TABLES: u64 = (1 << 62) + (1 << 60);
 const TABLE_RUNS: u64 = 32;
 
-/// The first byte of a table's `run`th run.
-pub(crate) fn table_run(table: usize, run: u64) -> u64 {
-    TABLES + ((table as u64 * TABLE_RUNS + run) << 16)
+/// The first byte of the `run`th run of the relation `key` names: its OID, or, for a table the file
+/// gave none, a number past every OID.
+pub(crate) fn table_run(key: u64, run: u64) -> u64 {
+    TABLES + ((key * TABLE_RUNS + run) << 16)
 }
 
 /// Takes a lock on a table's run, shared, but for the byte of `slot`, which is the writer's own,

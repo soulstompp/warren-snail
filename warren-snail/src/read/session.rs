@@ -457,7 +457,7 @@ pub(super) struct Session {
     pub(super) settings: Settings,
     pub(super) prepared: std::rc::Rc<super::prepared::Kept>,
     pub(super) cursors: Vec<super::cursor::Cursor>,
-    pub(super) table_locks: BTreeSet<(usize, Mode)>,
+    pub(super) table_locks: BTreeSet<(u64, Mode)>,
     /// The cursors declared so far, which numbers each.
     pub(super) cursor_count: u64,
     /// The rows a caller hands COPY … FROM STDIN.
@@ -470,7 +470,7 @@ pub(super) struct Session {
 pub(super) struct Kept {
     settings: Settings,
     cursors: Vec<u64>,
-    pub(super) table_locks: BTreeSet<(usize, Mode)>,
+    pub(super) table_locks: BTreeSet<(u64, Mode)>,
 }
 
 impl Session {

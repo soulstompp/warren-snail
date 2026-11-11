@@ -236,6 +236,19 @@ impl Oids {
             true => self.of(&Object::Namespace("public".into())),
         }
     }
+
+    /// Its objects less those `gone` takes, with `added`'s at their OIDs: the objects a transaction's
+    /// snapshot holds beside its own.
+    pub(crate) fn kept(&self, gone: impl Fn(&Object) -> bool, added: &[(u32, Object)]) -> Oids {
+        let mut kept = self.clone();
+        kept.by_object.retain(|o, _| !gone(o));
+        kept.by_oid.retain(|_, o| !gone(o));
+        for (oid, o) in added {
+            kept.by_object.insert(o.clone(), *oid);
+            kept.by_oid.insert(*oid, o.clone());
+        }
+        kept
+    }
 }
 
 thread_local! {

@@ -78,10 +78,10 @@ impl Mode {
     }
 }
 
-/// The byte a table's holders of a mode mark held, among the block bytes, which the walk for a ring
-/// of writers follows.
-fn holders_byte(table: usize, mode: Mode) -> u64 {
-    lock::block_byte(&(table as u64, "table lock", mode as u8))
+/// The byte a relation's holders of a mode mark held, among the block bytes, which the walk for a
+/// ring of writers follows.
+fn holders_byte(key: u64, mode: Mode) -> u64 {
+    lock::block_byte(&(key, "table lock", mode as u8))
 }
 
 /// One part of a mode's lock on a table: a byte alone, or a run shared but the writer's own byte;
@@ -91,10 +91,10 @@ enum Part {
     Run(u64, Mode),
 }
 
-fn parts(table: usize, mode: Mode, slot: u64) -> Vec<Part> {
+fn parts(key: u64, mode: Mode, slot: u64) -> Vec<Part> {
     let mut out = Vec::new();
     for (i, &(a, b)) in APART.iter().enumerate() {
-        let run = lock::table_run(table, i as u64);
+        let run = lock::table_run(key, i as u64);
         if a == mode {
             out.push(Part::Alone(run + slot, b));
         }
@@ -104,7 +104,7 @@ fn parts(table: usize, mode: Mode, slot: u64) -> Vec<Part> {
     }
     if let Some(k) = ALONE.iter().position(|&m| m == mode) {
         out.push(Part::Alone(
-            lock::table_run(table, (APART.len() + k) as u64),
+            lock::table_run(key, (APART.len() + k) as u64),
             mode,
         ));
     }
@@ -112,22 +112,60 @@ fn parts(table: usize, mode: Mode, slot: u64) -> Vec<Part> {
 }
 
 impl Snail {
+    /// The key a table's locks are taken by: the OID the file gave it, which no DROP or DDL of
+    /// another moves; for a table the file gave none, a number past every OID by its place. None
+    /// for a table the transaction made, which no other writer names until it commits.
+    pub(super) fn table_key(&self, table: usize) -> Option<u64> {
+        let name = &self.catalog.tables[table].name;
+        if self.made_relation(name) {
+            return None;
+        }
+        Some(
+            match self.catalog.oids.of(&crate::oids::Object::Class(crate::oids::full(name))) {
+                Some(oid) => u64::from(oid),
+                None => (1 << 32) + table as u64,
+            },
+        )
+    }
+
+    /// Whether the transaction's DDL made the relation of that name.
+    fn made_relation(&self, name: &str) -> bool {
+        self.declared.as_ref().is_some_and(|d| d.made_relation(name))
+    }
+
     /// Takes a table's lock in `mode`, held to the transaction's end, waiting while another writer
     /// holds one that conflicts, as long as it takes, unless the writers waiting make a ring; with
-    /// `nowait`, refused at once in PostgreSQL's words.
-    pub(super) fn lock_table(&mut self, table: usize, mode: Mode, nowait: bool) -> Result<()> {
-        if self.session.table_locks.contains(&(table, mode)) || self.writer.is_none() {
-            return Ok(());
+    /// `nowait`, refused at once in PostgreSQL's words. Returns whether it waited.
+    pub(super) fn lock_table(&mut self, table: usize, mode: Mode, nowait: bool) -> Result<bool> {
+        let Some(key) = self.table_key(table) else {
+            return Ok(false);
+        };
+        let name = self.catalog.tables[table].name.clone();
+        self.lock_relation(key, &name, mode, nowait)
+    }
+
+    /// Takes the lock of the relation `key` names, `name`, in `mode`, as `lock_table` takes a
+    /// table's. Returns whether it waited.
+    pub(super) fn lock_relation(
+        &mut self,
+        key: u64,
+        name: &str,
+        mode: Mode,
+        nowait: bool,
+    ) -> Result<bool> {
+        if self.session.table_locks.contains(&(key, mode)) || self.writer.is_none() {
+            return Ok(false);
         }
         let file = self.writer.as_ref().expect("a snail open to write").file();
         let mut taken = Vec::new();
+        let mut waited = false;
         let waiting = if nowait { Waiting::Try } else { Waiting::Wait };
-        for p in parts(table, mode, self.slot) {
+        for p in parts(key, mode, self.slot) {
             let got = match &p {
-                Part::Alone(b, meets) => self.wait_for(*b, *meets, table, waiting, |wait| {
+                Part::Alone(b, meets) => self.wait_for(*meets, key, waiting, &mut waited, |wait| {
                     lock::lock_as(file, *b, false, wait)
                 }),
-                Part::Run(r, meets) => self.wait_for(*r, *meets, table, waiting, |wait| {
+                Part::Run(r, meets) => self.wait_for(*meets, key, waiting, &mut waited, |wait| {
                     lock::lock_run_shared(file, *r, self.slot, wait)
                 }),
             };
@@ -140,28 +178,24 @@ impl Snail {
                     got?;
                     return Err(Error::new(format!(
                         "could not obtain lock on relation \"{}\"",
-                        self.catalog.tables[table]
-                            .name
-                            .rsplit('.')
-                            .next()
-                            .unwrap_or_default()
+                        name.rsplit('.').next().unwrap_or_default()
                     )));
                 }
             }
         }
-        lock::mark_held(file, self.slot, holders_byte(table, mode), true)?;
-        self.session.table_locks.insert((table, mode));
-        Ok(())
+        lock::mark_held(file, self.slot, holders_byte(key, mode), true)?;
+        self.session.table_locks.insert((key, mode));
+        Ok(waited)
     }
 
-    /// Takes one part of a table's lock: at once where it can, else, with `Wait`, marked waiting for
-    /// the holders of the mode it meets, failed where they wait in a ring for this writer.
+    /// Takes one part of a relation's lock: at once where it can, else, with `Wait`, marked waiting
+    /// for the holders of the mode it meets, failed where they wait in a ring for this writer.
     fn wait_for(
         &self,
-        _at: u64,
         meets: Mode,
-        table: usize,
+        key: u64,
         waiting: Waiting,
+        waited: &mut bool,
         take: impl Fn(bool) -> Result<bool>,
     ) -> Result<bool> {
         if take(false)? {
@@ -170,8 +204,9 @@ impl Snail {
         if waiting == Waiting::Try {
             return Ok(false);
         }
+        *waited = true;
         let file = self.writer.as_ref().expect("a snail open to write").file();
-        let byte = holders_byte(table, meets);
+        let byte = holders_byte(key, meets);
         lock::mark_waiting(file, self.slot, byte, true)?;
         let (group, me) = self.group.as_ref().expect("a snail open to write");
         let ring = group.ring(*me, byte);
@@ -196,16 +231,72 @@ impl Snail {
         }
     }
 
-    /// Lets go of a table's lock in one mode.
-    fn let_go_table(&mut self, table: usize, mode: Mode) -> Result<()> {
-        if !self.session.table_locks.remove(&(table, mode)) {
+    /// Locks the relations a declaration changes, each in the mode PostgreSQL takes for it
+    /// (`ddl::locked`), held to the transaction's end: each named on the catalog the transaction
+    /// declares on, an index by its table, a schema by every relation in it, and a name no relation
+    /// holds not at all, the declaration refusing it in PostgreSQL's words. Returns whether it waited
+    /// for another writer's.
+    pub(super) fn ddl_locked(&mut self, ddl: &str) -> Result<bool> {
+        use crate::ddl::Locked;
+        use crate::oids::{full, parts, Object};
+        let mut keys: Vec<(u64, String, Mode)> = Vec::new();
+        for (l, mode) in crate::ddl::locked(ddl) {
+            let (schema, name) = match &l {
+                Locked::Relation(n) => (None, full(n)),
+                Locked::Schema(s) => (Some(s.clone()), String::new()),
+            };
+            let named = |n: &str| match &schema {
+                Some(s) => parts(&full(n)).0 == s,
+                None => full(n) == name,
+            };
+            for (ti, t) in self.catalog.tables.iter().enumerate() {
+                let whole = full(&t.name);
+                let (schema_of, _) = parts(&whole);
+                let index = t
+                    .orders
+                    .iter()
+                    .map(|o| &o.name)
+                    .chain(t.brins.iter().map(|b| &b.name))
+                    .any(|o| schema.is_none() && full(&format!("{schema_of}.{o}")) == name);
+                if let Some(k) = self.table_key(ti).filter(|_| t.declared() && (named(&t.name) || index)) {
+                    keys.push((k, t.name.clone(), mode));
+                }
+                // An index held as an element strand locks the table it is of.
+                let of = t.elements_of.as_ref().filter(|_| schema.is_none() && named(&t.name));
+                let oi = of.and_then(|o| self.catalog.tables.iter().position(|x| x.name == *o));
+                if let Some((oi, k)) = oi.and_then(|oi| self.table_key(oi).map(|k| (oi, k))) {
+                    keys.push((k, self.catalog.tables[oi].name.clone(), mode));
+                }
+            }
+            let others = self
+                .catalog
+                .views
+                .iter()
+                .map(|v| &v.name)
+                .chain(self.catalog.sequences.iter().map(|s| &s.name));
+            for n in others.filter(|n| named(n) && !self.made_relation(n)) {
+                if let Some(oid) = self.catalog.oids.of(&Object::Class(full(n))) {
+                    keys.push((u64::from(oid), n.clone(), mode));
+                }
+            }
+        }
+        let mut waited = false;
+        for (key, name, mode) in keys {
+            waited |= self.lock_relation(key, &name, mode, false)?;
+        }
+        Ok(waited)
+    }
+
+    /// Lets go of a relation's lock in one mode.
+    fn let_go_table(&mut self, key: u64, mode: Mode) -> Result<()> {
+        if !self.session.table_locks.remove(&(key, mode)) {
             return Ok(());
         }
         let Some(w) = self.writer.as_ref() else {
             return Ok(());
         };
-        lock::mark_held(w.file(), self.slot, holders_byte(table, mode), false)?;
-        for p in parts(table, mode, self.slot) {
+        lock::mark_held(w.file(), self.slot, holders_byte(key, mode), false)?;
+        for p in parts(key, mode, self.slot) {
             self.let_go_part(&p)?;
         }
         Ok(())
@@ -223,9 +314,9 @@ impl Snail {
     /// Lets go of the tables' locks taken since a savepoint that held `kept`.
     pub(super) fn table_locks_back_to(
         &mut self,
-        kept: &std::collections::BTreeSet<(usize, Mode)>,
+        kept: &std::collections::BTreeSet<(u64, Mode)>,
     ) -> Result<()> {
-        let since: Vec<(usize, Mode)> = self
+        let since: Vec<(u64, Mode)> = self
             .session
             .table_locks
             .iter()

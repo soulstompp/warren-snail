@@ -52,6 +52,10 @@ impl Reads for Cached<'_> {
         self.reads.catalog()
     }
 
+    fn catalog_rows(&self) -> &Catalog {
+        self.reads.catalog_rows()
+    }
+
     fn read_join(
         &self,
         q: &Question,

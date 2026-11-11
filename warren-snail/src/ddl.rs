@@ -7566,6 +7566,159 @@ pub(crate) fn set_constraints(tokens: &[Token]) -> Option<Result<(Option<Vec<Str
     Some(read)
 }
 
+/// A relation a declaration locks, as it names it: by its name, or every relation of a schema it
+/// drops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Locked {
+    Relation(String),
+    Schema(String),
+}
+
+/// The relations a declaration locks while it runs, in the modes PostgreSQL 18.6 takes: a DROP's,
+/// ACCESS EXCLUSIVE; ALTER TABLE's, the strongest its actions take (`AlterTableGetLockLevel`), and
+/// SHARE ROW EXCLUSIVE on a table a foreign key references; CREATE INDEX's table, SHARE, or SHARE
+/// UPDATE EXCLUSIVE CONCURRENTLY; ALTER SEQUENCE's, SHARE ROW EXCLUSIVE; COMMENT ON a relation or its
+/// column or constraint, SHARE UPDATE EXCLUSIVE; and a view CREATE OR REPLACE VIEW replaces, ACCESS
+/// EXCLUSIVE. Any other declaration locks no relation.
+pub(crate) fn locked(sql: &str) -> Vec<(Locked, crate::read::tablelock::Mode)> {
+    use crate::read::tablelock::Mode;
+    let Ok(tokens) = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize() else {
+        return Vec::new();
+    };
+    let mut c = Cursor::new(&tokens);
+    let mut out = Vec::new();
+    // Every table a REFERENCES names from here on.
+    let referenced = |c: &Cursor, out: &mut Vec<(Locked, Mode)>| {
+        for k in c.i..c.t.len() {
+            if Cursor::word_is(c.t.get(k), "REFERENCES") {
+                let mut r = Cursor {
+                    t: c.t[k + 1..].to_vec(),
+                    i: 0,
+                };
+                if let Ok(name) = r.name() {
+                    out.push((Locked::Relation(name), Mode::ShareRowExclusive));
+                }
+            }
+        }
+    };
+    let names = |c: &mut Cursor| -> Vec<String> {
+        let mut names = Vec::new();
+        while let Ok(n) = c.name() {
+            names.push(n);
+            if !c.token(Token::Comma) {
+                break;
+            }
+        }
+        names
+    };
+    if c.kw("DROP") {
+        let schema = c.kw("SCHEMA");
+        if !schema && !(c.kw("TABLE") || c.kw("VIEW") || c.kw("SEQUENCE") || c.kw("INDEX")) {
+            return out;
+        }
+        c.kw("CONCURRENTLY");
+        c.kws(&["IF", "EXISTS"]);
+        for n in names(&mut c) {
+            let l = if schema {
+                Locked::Schema(n)
+            } else {
+                Locked::Relation(n)
+            };
+            out.push((l, Mode::AccessExclusive));
+        }
+    } else if c.kws(&["ALTER", "TABLE"]) {
+        c.kws(&["IF", "EXISTS"]);
+        c.kw("ONLY");
+        let Ok(table) = c.name() else {
+            return out;
+        };
+        c.token(Token::Mul);
+        let mut mode = Mode::ShareUpdateExclusive;
+        while !c.done() {
+            let action = Cursor {
+                t: c.item(),
+                i: 0,
+            };
+            let first = |w: &[&str]| w.iter().any(|k| action.is(k));
+            let words = |w: &[&str]| {
+                (0..action.t.len()).any(|k| {
+                    w.iter()
+                        .enumerate()
+                        .all(|(n, x)| Cursor::word_is(action.t.get(k + n), x))
+                })
+            };
+            // SET ( … ) or RESET ( … ): a table's or a column's options.
+            let options = (0..action.t.len()).any(|k| {
+                (Cursor::word_is(action.t.get(k), "SET") || Cursor::word_is(action.t.get(k), "RESET"))
+                    && action.t.get(k + 1) == Some(&Token::LParen)
+            });
+            let foreign = first(&["ADD"]) && words(&["FOREIGN", "KEY"]);
+            let taken = if foreign {
+                Mode::ShareRowExclusive
+            } else if first(&["VALIDATE", "CLUSTER", "ATTACH"])
+                || words(&["SET", "WITHOUT", "CLUSTER"])
+                || words(&["SET", "STATISTICS"])
+                || options
+            {
+                Mode::ShareUpdateExclusive
+            } else if first(&["ENABLE", "DISABLE"]) && words(&["TRIGGER"]) {
+                Mode::ShareRowExclusive
+            } else {
+                Mode::AccessExclusive
+            };
+            mode = mode.max(taken);
+            referenced(&action, &mut out);
+        }
+        out.insert(0, (Locked::Relation(table), mode));
+    } else if c.kws(&["ALTER", "SEQUENCE"]) {
+        c.kws(&["IF", "EXISTS"]);
+        if let Ok(s) = c.name() {
+            out.push((Locked::Relation(s), Mode::ShareRowExclusive));
+        }
+    } else if c.kw("CREATE") {
+        let replace = c.kws(&["OR", "REPLACE"]);
+        c.kw("UNIQUE");
+        if c.kw("INDEX") {
+            let mode = match c.kw("CONCURRENTLY") {
+                true => Mode::ShareUpdateExclusive,
+                false => Mode::Share,
+            };
+            if let Some(t) = index_on(sql) {
+                out.push((Locked::Relation(t), mode));
+            }
+        } else if replace && c.kw("VIEW") {
+            if let Ok(v) = c.name() {
+                out.push((Locked::Relation(v), Mode::AccessExclusive));
+            }
+        } else {
+            while c.kw("UNLOGGED") || c.kw("TEMP") || c.kw("TEMPORARY") {}
+            if c.kw("TABLE") {
+                c.kws(&["IF", "NOT", "EXISTS"]);
+                let made = c.name().unwrap_or_default();
+                referenced(&c, &mut out);
+                out.retain(|(l, _)| *l != Locked::Relation(made.clone()));
+            }
+        }
+    } else if c.kws(&["COMMENT", "ON"]) {
+        let relation = if c.kw("TABLE") || c.kw("VIEW") || c.kw("SEQUENCE") || c.kw("INDEX") {
+            c.name().ok()
+        } else if c.kw("COLUMN") {
+            c.name()
+                .ok()
+                .and_then(|n| n.rsplit_once('.').map(|(r, _)| r.to_string()))
+        } else if c.kw("CONSTRAINT") {
+            let _ = c.ident();
+            c.kw("ON").then(|| c.name().ok()).flatten()
+        } else {
+            None
+        };
+        if let Some(r) = relation {
+            out.push((Locked::Relation(r), Mode::ShareUpdateExclusive));
+        }
+    }
+    out
+}
+
 /// What a statement declares, where it declares something the catalog holds: CREATE TABLE, INDEX,
 /// SEQUENCE, TYPE, DOMAIN, COLLATION or VIEW, or ALTER TABLE, SEQUENCE, TYPE or DOMAIN.
 pub(crate) fn declares(sql: &str) -> Option<&'static str> {

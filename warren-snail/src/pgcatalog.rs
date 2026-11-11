@@ -298,6 +298,224 @@ pub(crate) struct Relation {
     pub(crate) rows: Vec<Vec<Option<String>>>,
 }
 
+/// The key of one of PostgreSQL's unique catalog indexes that an object's row takes: the index, the
+/// key by its names, which two writers making the object write alike, and its columns and values as
+/// a duplicate's DETAIL writes them.
+pub(crate) struct NameKey {
+    pub(crate) index: &'static str,
+    pub(crate) names: String,
+    pub(crate) columns: &'static str,
+    pub(crate) values: String,
+}
+
+impl NameKey {
+    /// PostgreSQL's refusal of a second row of the key, its DETAIL after a colon.
+    pub(crate) fn duplicate(&self) -> Error {
+        Error::new(format!(
+            "duplicate key value violates unique constraint \"{}\": Key ({})=({}) already exists.",
+            self.index, self.columns, self.values
+        ))
+    }
+}
+
+/// The key a schema's row of pg_namespace, a relation's of pg_class, a type's or an array's of
+/// pg_type, or a function's of pg_proc takes, as the catalog names the object; none for any other.
+pub(crate) fn name_key(catalog: &Catalog, o: &Object) -> Option<NameKey> {
+    let f = File::of(catalog);
+    let in_schema = |n: &str, own: String, index, columns| {
+        let (schema, _) = parts(n);
+        NameKey {
+            index,
+            names: format!("{schema}.{own}"),
+            columns,
+            values: format!("{own}, {}", f.namespace(schema)),
+        }
+    };
+    Some(match o {
+        Object::Namespace(n) => NameKey {
+            index: "pg_namespace_nspname_index",
+            names: n.clone(),
+            columns: "nspname",
+            values: n.clone(),
+        },
+        Object::Class(n) => in_schema(
+            n,
+            parts(n).1.to_string(),
+            "pg_class_relname_nsp_index",
+            "relname, relnamespace",
+        ),
+        Object::Type(n) => in_schema(
+            n,
+            parts(n).1.to_string(),
+            "pg_type_typname_nsp_index",
+            "typname, typnamespace",
+        ),
+        Object::Array(n) => in_schema(
+            n,
+            format!("_{}", parts(n).1),
+            "pg_type_typname_nsp_index",
+            "typname, typnamespace",
+        ),
+        Object::Proc(n, args) => {
+            let (schema, own) = parts(n);
+            // Its arguments' types by their OIDs, as proargtypes holds them.
+            let held = catalog.functions.iter().find(|x| {
+                full(&x.name) == *n
+                    && x.args.iter().map(|t| t.pg_name()).collect::<Vec<_>>().join(",") == *args
+            });
+            let oids: Vec<String> = match held {
+                Some(x) => x.args.iter().map(|&a| f.facts(a, None).oid.to_string()).collect(),
+                None => args
+                    .split(',')
+                    .filter(|a| !a.is_empty())
+                    .map(|a| {
+                        crate::regs::reg_parse(RegKind::Type, a, catalog.release)
+                            .unwrap_or(0)
+                            .to_string()
+                    })
+                    .collect(),
+            };
+            NameKey {
+                index: "pg_proc_proname_args_nsp_index",
+                names: format!("{schema}.{own}({args})"),
+                columns: "proname, proargtypes, pronamespace",
+                values: format!("{own}, {}, {}", oids.join(" "), f.namespace(schema)),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// A catalog's objects that stand alone, each by its OID and the names of what it holds: a table
+/// its own, its indexes' and its element strands'; a type its own and a range's multirange's; a
+/// function none, being one of several of its name; any other its own.
+fn alone(c: &Catalog) -> Vec<(u32, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut add = |o: Object, names: Vec<String>| {
+        if let Some(oid) = c.oids.of(&o) {
+            out.push((oid, names));
+        }
+    };
+    for t in c.tables.iter().filter(|t| t.declared()) {
+        let n = full(&t.name);
+        let (schema, _) = parts(&n);
+        let mut names = vec![n.clone()];
+        names.extend(t.orders.iter().map(|o| format!("{schema}.{}", o.name)));
+        names.extend(t.brins.iter().map(|b| format!("{schema}.{}", b.name)));
+        names.extend(
+            c.tables
+                .iter()
+                .filter(|x| x.elements_of.as_deref() == Some(t.name.as_str()))
+                .map(|x| full(&x.name)),
+        );
+        add(Object::Class(n), names);
+    }
+    for n in c.views.iter().map(|v| &v.name).chain(c.sequences.iter().map(|s| &s.name)) {
+        add(Object::Class(full(n)), vec![full(n)]);
+    }
+    for t in &c.types {
+        let mut names = vec![full(&t.name)];
+        if let crate::catalog::TypeKind::Range(r) = &t.kind {
+            names.push(full(&r.multirange));
+        }
+        add(Object::Type(full(&t.name)), names);
+    }
+    for d in &c.domains {
+        add(Object::Type(full(&d.name)), vec![full(&d.name)]);
+    }
+    for f in &c.functions {
+        add(function_object(f), Vec::new());
+    }
+    for k in &c.collations {
+        add(Object::Collation(full(&k.name)), vec![full(&k.name)]);
+    }
+    for (oid, o) in c.oids.each() {
+        if let Object::Namespace(n) = o {
+            out.push((oid, vec![n.clone()]));
+        }
+    }
+    out
+}
+
+/// The catalog a transaction of one snapshot reads the catalog tables' rows from where another
+/// writer's DDL moved the catalog since its snapshot: `own`, the catalog as committed with its own
+/// statements on it, less each object another made since `snapshot`, with each another dropped since
+/// as its snapshot held it, by OID; `committed` is the catalog as committed.
+pub(crate) fn seen(own: &Catalog, committed: &Catalog, snapshot: &Catalog) -> Catalog {
+    use std::collections::BTreeSet;
+    let then: BTreeSet<u32> = alone(snapshot).into_iter().map(|(o, _)| o).collect();
+    let now: Vec<(u32, Vec<String>)> = alone(committed);
+    let made: BTreeSet<u32> = now
+        .iter()
+        .map(|(o, _)| *o)
+        .filter(|o| !then.contains(o))
+        .collect();
+    let standing: BTreeSet<u32> = alone(own).into_iter().map(|(o, _)| o).collect();
+    let now: BTreeSet<u32> = now.into_iter().map(|(o, _)| o).collect();
+    let dropped: Vec<(u32, Vec<String>)> = alone(snapshot)
+        .into_iter()
+        .filter(|(o, _)| !now.contains(o) && !standing.contains(o))
+        .collect();
+    let gone: Vec<String> = alone(own)
+        .into_iter()
+        .filter(|(o, _)| made.contains(o))
+        .flat_map(|(_, names)| names)
+        .collect();
+    let back_oids: BTreeSet<u32> = dropped.iter().map(|(o, _)| *o).collect();
+    let back: Vec<String> = dropped.into_iter().flat_map(|(_, names)| names).collect();
+    let gone_name = |n: &str| gone.iter().any(|g| g == n);
+    let back_name = |n: &str| back.iter().any(|g| g == n);
+    // A function goes or comes back by its OID, the others of its name standing as they do.
+    let gone_object = |o: &Object| match o {
+        Object::Proc(..) => own.oids.of(o).is_some_and(|x| made.contains(&x)) || gone_name(o.name()),
+        _ => gone_name(o.name()),
+    };
+    let back_object = |oid: u32, o: &Object| match o {
+        Object::Proc(..) => back_oids.contains(&oid) || back_name(o.name()),
+        _ => back_name(o.name()),
+    };
+    let mut seen = own.clone();
+    seen.tables.retain(|t| !gone_name(&full(&t.name)));
+    seen.views.retain(|v| !gone_name(&full(&v.name)));
+    seen.sequences.retain(|s| !gone_name(&full(&s.name)));
+    seen.types.retain(|t| !gone_name(&full(&t.name)));
+    seen.domains.retain(|d| !gone_name(&full(&d.name)));
+    seen.functions.retain(|f| !gone_object(&function_object(f)));
+    seen.collations.retain(|k| !gone_name(&full(&k.name)));
+    let named = |n: &String| back_name(&full(n));
+    seen.tables.extend(snapshot.tables.iter().filter(|t| named(&t.name)).cloned());
+    seen.views.extend(snapshot.views.iter().filter(|v| named(&v.name)).cloned());
+    seen.sequences.extend(snapshot.sequences.iter().filter(|s| named(&s.name)).cloned());
+    seen.types.extend(snapshot.types.iter().filter(|t| named(&t.name)).cloned());
+    seen.domains.extend(snapshot.domains.iter().filter(|d| named(&d.name)).cloned());
+    seen.collations.extend(snapshot.collations.iter().filter(|k| named(&k.name)).cloned());
+    seen.functions.extend(
+        snapshot
+            .functions
+            .iter()
+            .filter(|f| {
+                let o = function_object(f);
+                snapshot.oids.of(&o).is_some_and(|x| back_object(x, &o))
+            })
+            .cloned(),
+    );
+    let added: Vec<(u32, Object)> = snapshot
+        .oids
+        .each()
+        .filter(|(oid, o)| back_object(*oid, o))
+        .map(|(oid, o)| (oid, o.clone()))
+        .collect();
+    seen.oids = std::sync::Arc::new(own.oids.kept(gone_object, &added));
+    seen
+}
+
+/// The object a function is to the OIDs: its name and its arguments' types as PostgreSQL names
+/// them.
+fn function_object(f: &crate::catalog::Function) -> Object {
+    let args: Vec<String> = f.args.iter().map(|t| t.pg_name()).collect();
+    Object::Proc(full(&f.name), args.join(","))
+}
+
 /// A catalog table under the file's release: its built-in rows, then the file's own.
 pub(crate) fn relation(catalog: &Catalog, table: &str) -> Result<Relation> {
     answered(table)?;

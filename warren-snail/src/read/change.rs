@@ -171,9 +171,17 @@ pub(super) struct Declared {
     /// The orders a DROP of it took out, by table and name, which its commit lets go: of a table
     /// dropped, or an index a drop took with it.
     taken_out: Vec<(String, String)>,
+    /// The relations it made, by name, which no other writer names until it commits: their locks
+    /// are no other's to meet.
+    relations: Vec<String>,
 }
 
 impl Declared {
+    /// Whether it made the relation of that name.
+    pub(super) fn made_relation(&self, name: &str) -> bool {
+        self.relations.iter().any(|r| r == name)
+    }
+
     /// The catalog as committed it declared on.
     pub(super) fn from(&self) -> (Extent, u64) {
         self.from
@@ -202,6 +210,68 @@ pub(super) struct Node {
     pub(super) kids: BTreeMap<usize, Node>,
     /// The page it was read from; none at the top.
     pub(super) at: Extent,
+}
+
+/// A statement's first word, in capitals.
+fn first_word(sql: &str) -> String {
+    sql.trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+}
+
+/// Whether a statement is a question by its first word, which its round answers.
+fn asks(sql: &str) -> bool {
+    matches!(first_word(sql).as_str(), "SELECT" | "VALUES" | "TABLE")
+}
+
+/// Whether a statement may name a relation, as a transaction's end, its savepoints and the
+/// session's settings do not.
+fn names_relations(sql: &str) -> bool {
+    let first = first_word(sql);
+    !matches!(
+        first.as_str(),
+        "BEGIN"
+            | "START"
+            | "COMMIT"
+            | "END"
+            | "ROLLBACK"
+            | "ABORT"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "SET"
+            | "RESET"
+            | "SHOW"
+    )
+}
+
+/// The objects `after` holds that `before` does not whose rows take a key of the catalog's unique
+/// indexes (a schema, a relation, a type or an array, a function), in the order PostgreSQL writes
+/// their rows: as the DDL made them, a relation's row type and its array before its pg_class row.
+fn names_made(before: &Catalog, after: &Catalog) -> Vec<crate::oids::Object> {
+    use crate::oids::Object as O;
+    let made: Vec<&O> = after
+        .oids
+        .each()
+        .map(|(_, o)| o)
+        .filter(|o| matches!(o, O::Namespace(_) | O::Class(_) | O::Type(_) | O::Array(_) | O::Proc(..)))
+        .filter(|o| before.oids.of(o).is_none())
+        .collect();
+    let mut out: Vec<O> = Vec::new();
+    for o in &made {
+        if let O::Class(n) = o {
+            for t in [O::Type(n.clone()), O::Array(n.clone())] {
+                if made.contains(&&t) && !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        if !out.contains(o) {
+            out.push((*o).clone());
+        }
+    }
+    out
 }
 
 /// The entry, among an ordered page's, whose rows a key belongs with: the last whose first key is at
@@ -989,6 +1059,14 @@ impl Snail {
         if self.begun.is_none() {
             self.clock.0 = at;
         }
+        // In a transaction of one snapshot a statement names as committed, before anything reads
+        // its names; a question does as its round begins.
+        if !self.aborted && names_relations(sql) && !asks(sql) {
+            if let Err(e) = self.named_as_committed() {
+                self.failed()?;
+                return Err(e);
+            }
+        }
         let _handed = super::handed::holding(&self.functions);
         let _own = super::own::holding(&self.catalog.functions, self.catalog.release);
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
@@ -1225,7 +1303,7 @@ impl Snail {
                 self.abandon()?;
                 false
             }
-            st => {
+            mut st => {
                 // A snail marked a replica takes writes from the applier presenting its source
                 // alone.
                 if !matches!(st, Statement::Constraints { .. }) {
@@ -1309,10 +1387,22 @@ impl Snail {
                                 self.failed()?;
                                 return Err(super::beside::concurrent_update());
                             }
+                            let named = self.root.catalog_named();
                             if self.begun.is_some() {
                                 self.renew_in_transaction()?;
                             } else {
                                 self.renew()?;
+                            }
+                            // Where another writer's DDL moved the catalog, it is read again on
+                            // the catalog as committed, finding its rows afresh.
+                            if self.root.catalog_named() != named {
+                                match statement::parse(&self.catalog, text) {
+                                    Ok(again) => (st, found) = (again, None),
+                                    Err(e) => {
+                                        self.failed()?;
+                                        return Err(e);
+                                    }
+                                }
                             }
                         }
                         Ok(changed) => {
@@ -2733,7 +2823,9 @@ impl Snail {
         self.touched = Touched::default();
         self.pending = Touched::default();
         self.modes.clear();
-        if self.declared.take().is_some() {
+        self.seen = None;
+        let laid = self.snapshot_catalog.take().is_some();
+        if self.declared.take().is_some() || laid {
             self.catalog = Snail::catalog(&self.reader, &self.root)?;
         }
         self.let_go_blocks()?;
@@ -2775,28 +2867,40 @@ impl Snail {
 
     /// Takes one byte's lock, shared or alone, and marks it held, as `lock_byte` takes a block's.
     pub(super) fn lock_byte_as(&self, b: u64, shared: bool, waiting: Waiting) -> Result<bool> {
+        if waiting == Waiting::Wait {
+            self.lock_byte_for(b, shared, "a block")?;
+            return Ok(true);
+        }
         let file = self.writer.as_ref().expect("a snail open to write").file();
         if !lock::lock_as(file, b, shared, false)? {
-            if waiting == Waiting::Try {
-                return Ok(false);
-            }
+            return Ok(false);
+        }
+        lock::mark_held(file, self.slot, b, true)?;
+        Ok(true)
+    }
+
+    /// Takes one byte's lock, shared or alone, waiting while another writer holds it, as long as it
+    /// takes, unless the writers waiting make a ring, refused in words naming `what` it waits for;
+    /// marked held once taken.
+    pub(super) fn lock_byte_for(&self, b: u64, shared: bool, what: &str) -> Result<()> {
+        let file = self.writer.as_ref().expect("a snail open to write").file();
+        if !lock::lock_as(file, b, shared, false)? {
             lock::mark_waiting(file, self.slot, b, true)?;
             let (group, me) = self.group.as_ref().expect("a snail open to write");
             let ring = group.ring(*me, b);
             if !matches!(ring, Ok(false)) {
                 lock::mark_waiting(file, self.slot, b, false)?;
                 ring?;
-                return Err(Error::new(
-                    "deadlock detected: this writer waits for a block held by a writer that waits, \
-                     in a ring, for a block this writer holds",
-                ));
+                return Err(Error::new(format!(
+                    "deadlock detected: this writer waits for {what} held by a writer that waits, \
+                     in a ring, for a lock this writer holds"
+                )));
             }
             let taken = super::settings::wait_for_lock(|w| lock::lock_as(file, b, shared, w));
             lock::mark_waiting(file, self.slot, b, false)?;
             taken?;
         }
-        lock::mark_held(file, self.slot, b, true)?;
-        Ok(true)
+        lock::mark_held(file, self.slot, b, true)
     }
 
     pub(super) fn written(&self) -> u64 {
@@ -3332,8 +3436,15 @@ impl Snail {
                 Change::Insert(_) => None,
             })
             .collect();
-        // A writer of the table holds its lock in ROW EXCLUSIVE, as PostgreSQL's does.
-        self.lock_table(ti, super::tablelock::Mode::RowExclusive, false)?;
+        // A writer of the table holds its lock in ROW EXCLUSIVE, as PostgreSQL's does; where it
+        // waited for another writer's DDL, whose commit moved the catalog, the statement is read
+        // again on the catalog as committed.
+        if self.lock_table(ti, super::tablelock::Mode::RowExclusive, false)?
+            && self.catalog_moved(&self.reader.peek_root()?)
+        {
+            self.stale = true;
+            return Ok((0, 0));
+        }
         self.name_rows(ti, &named)?;
         // A transaction of one snapshot writes the version it reads; its commit writes the newest.
         if self.held {
@@ -4496,6 +4607,7 @@ impl Snail {
         // Its names are looked up, and its relations made, on the catalog as committed now: where
         // another writer's commit moved it past the catalog the transaction declares on, the
         // transaction's own statements are declared again on it first.
+        self.snapshot_kept();
         let newest = self.reader.peek_root()?;
         let from = self
             .declared
@@ -4504,6 +4616,11 @@ impl Snail {
         let own = self.declared.as_ref().map_or("", |d| d.own.as_str());
         if let Some(committed) = self.committed_ddl(&newest, from, own)? {
             self.lay_over(committed)?;
+        }
+        // The relations it changes are locked in PostgreSQL's modes; where it waited for another
+        // writer's, it begins again on the catalog that writer's end leaves.
+        if self.ddl_locked(ddl)? {
+            return self.declare(ddl);
         }
         let from = newest.catalog_named();
         let base = format!("{}\n", self.catalog.ddl.trim_end());
@@ -4525,6 +4642,12 @@ impl Snail {
             .to_string();
         let (mut catalog, said) = Catalog::parse_declared(&text, kept)?;
         prepared(&mut catalog)?;
+        // A name another writer is making and has not committed is waited for; where its end
+        // leaves the name standing, refused there, and else the declaration begins again on the
+        // catalog its end leaves.
+        if self.names_taken(&catalog, from)? {
+            return self.declare(ddl);
+        }
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
         crate::file::holds_catalog(self.reader.format(), &catalog)?;
@@ -4684,6 +4807,17 @@ impl Snail {
                 }
             }
         }
+        // The relations it made, and those it dropped.
+        let relations = |c: &Catalog| -> Vec<String> {
+            c.tables
+                .iter()
+                .filter(|t| t.declared())
+                .map(|t| t.name.clone())
+                .chain(c.views.iter().map(|v| v.name.clone()))
+                .chain(c.sequences.iter().map(|s| s.name.clone()))
+                .collect()
+        };
+        let (before, after) = (relations(&self.catalog), relations(&catalog));
         self.renumbered(&catalog);
         self.sequences_redeclared(&catalog);
         self.catalog = catalog;
@@ -4694,12 +4828,16 @@ impl Snail {
             made: Vec::new(),
             resets: Vec::new(),
             taken_out: Vec::new(),
+            relations: Vec::new(),
         });
         for r in resets {
             if !d.resets.contains(&r) {
                 d.resets.push(r);
             }
         }
+        d.relations.retain(|r| after.contains(r));
+        d.relations
+            .extend(after.into_iter().filter(|r| !before.contains(r)));
         d.from = from;
         d.ddl = text;
         d.own.push_str(&stated);
@@ -4716,6 +4854,109 @@ impl Snail {
             }
         }
         Ok(said)
+    }
+
+    /// Takes, alone and to the transaction's end, the byte of each key of the catalog's unique
+    /// indexes that an object `catalog` makes takes, in the order PostgreSQL writes their rows,
+    /// waiting where another writer making the same key holds it. Returns whether it waited:
+    /// refused, in PostgreSQL's words for the index, where that writer's commit leaves the key
+    /// standing on the catalog as committed, which moved past `from`.
+    fn names_taken(&mut self, catalog: &Catalog, from: (Extent, u64)) -> Result<bool> {
+        if self.writer.is_none() {
+            return Ok(false);
+        }
+        for o in names_made(&self.catalog, catalog) {
+            let Some(key) = crate::pgcatalog::name_key(catalog, &o) else {
+                continue;
+            };
+            let b = lock::name_byte(key.index, &key.names);
+            if self.locks.contains(&b) {
+                continue;
+            }
+            if self.lock_byte(b, Waiting::Try)? {
+                self.locks.insert(b);
+                continue;
+            }
+            self.lock_byte_for(b, false, "a name another writer is making")?;
+            self.locks.insert(b);
+            let newest = self.reader.peek_root()?;
+            if let Some(committed) = self.committed_ddl(&newest, from, "")? {
+                let standing = committed.oids.each().find_map(|(_, x)| {
+                    crate::pgcatalog::name_key(&committed, x)
+                        .filter(|k| k.index == key.index && k.names == key.names)
+                });
+                if let Some(k) = standing {
+                    return Err(k.duplicate());
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// A statement of a transaction of one snapshot names as committed: where another writer's
+    /// commit moved the catalog past the one it reads, the transaction is laid over the catalog as
+    /// committed, its own statements declared on it, reading its snapshot's rows (`lay_over`); and
+    /// its catalog tables' rows are made of its snapshot's objects and its own.
+    pub(super) fn named_as_committed(&mut self) -> Result<()> {
+        if self.begun.is_none() || !self.held {
+            return Ok(());
+        }
+        let newest = self.reader.peek_root()?;
+        let from = self
+            .declared
+            .as_ref()
+            .map_or(self.root.catalog_named(), |d| d.from);
+        let own = self.declared.as_ref().map_or(String::new(), |d| d.own.clone());
+        let Some(committed) = self.committed_ddl(&newest, from, &own)? else {
+            self.seen = self.catalog_seen(&newest)?;
+            return Ok(());
+        };
+        self.snapshot_kept();
+        self.lay_over(committed)?;
+        match self.declared.as_mut() {
+            Some(d) => {
+                d.from = newest.catalog_named();
+                d.ddl = self.catalog.ddl.clone();
+            }
+            // Its root names the catalog it now reads, as committed.
+            None => {
+                self.root.catalog = newest.catalog;
+                if let (Some(c), Some(n)) = (self.root.cut.as_mut(), newest.cut.as_ref()) {
+                    c.catalog_at = n.catalog_at;
+                }
+            }
+        }
+        self.seen = self.catalog_seen(&newest)?;
+        Ok(())
+    }
+
+    /// Keeps, once, the catalog of a transaction of one snapshot as its snapshot names it, before
+    /// its own DDL or another's moves it.
+    fn snapshot_kept(&mut self) {
+        if self.held && self.snapshot_catalog.is_none() {
+            self.snapshot_catalog = Some((self.catalog.clone(), self.root.catalog_named()));
+        }
+    }
+
+    /// The catalog a transaction of one snapshot makes its catalog tables' rows from, where another
+    /// writer's DDL moved the catalog since its snapshot: its snapshot's, where it declared nothing;
+    /// else its own less what another made since, with what another dropped since. None where
+    /// nothing moved it.
+    fn catalog_seen(&self, newest: &Root) -> Result<Option<Catalog>> {
+        let Some((snapshot, at)) = self.snapshot_catalog.as_ref() else {
+            return Ok(None);
+        };
+        if newest.catalog_named() == *at {
+            return Ok(None);
+        }
+        if self.declared.as_ref().is_none_or(|d| d.own.is_empty()) {
+            return Ok(Some(snapshot.clone()));
+        }
+        let Some(committed) = self.committed_ddl(newest, *at, "")? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::pgcatalog::seen(&self.catalog, &committed, snapshot)))
     }
 
     /// The transaction on `to`, the catalog as committed with its own statements declared on it:

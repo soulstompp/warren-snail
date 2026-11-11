@@ -35,6 +35,11 @@ use std::rc::Rc;
 pub(super) trait Reads {
     /// The catalog naming the tables.
     fn catalog(&self) -> &Catalog;
+    /// The catalog the catalog tables' rows are made from: the one naming the tables, but in a
+    /// transaction of one snapshot whose catalog another writer's DDL moved since.
+    fn catalog_rows(&self) -> &Catalog {
+        self.catalog()
+    }
     /// A join the question path reads, over the catalog's tables: one round, each snail's part of it
     /// in its `snails` where there are several, the rows it makes handed to `each` as they are made.
     fn read_join(
@@ -3723,7 +3728,7 @@ fn answered(
     if views.outermost() {
         LIFTED.with(|c| c.set(0));
     }
-    let before = catalog_steps(catalog, q)?;
+    let before = catalog_steps(reads.catalog_rows(), q)?;
     // Its own calls of information_schema's functions, read as the views read them, the tables
     // their bodies read already taken as a view's.
     let inlined = super::sysviews::inlined_calls(catalog, q)?

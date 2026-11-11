@@ -932,24 +932,23 @@ fn a_row_past_the_bytes_a_transaction_names_is_met_at_its_commit() {
 }
 
 #[test]
-fn a_table_another_declared_an_order_of_since_refuses_its_rows() {
+fn a_table_another_declared_an_order_of_since_takes_its_rows_as_committed() {
     let path = tmp("beside-declared.snail");
     let ddl = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id)); \
                CREATE TABLE s.e (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
     write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
     let (mut a, mut b) = (open(&path), open(&path));
+    // Its write names the table as committed, the other's order among it, as 18.6's does.
     run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
     assert_eq!(count(&mut a, "SELECT count(*) FROM s.t t"), 0);
     run(&mut b, "CREATE INDEX e_v ON s.e (v)");
     run(&mut a, "INSERT INTO s.e (id, v) VALUES (1, 1)");
-    assert_eq!(
-        refused(&mut a, "COMMIT"),
-        "could not serialize access due to concurrent update"
-    );
+    run(&mut a, "COMMIT");
+    assert_eq!(count(&mut a, "SELECT count(*) FROM s.e e WHERE v = 1"), 1);
     // On a table it left as it was, another's DDL does not stand in the way.
     run(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
     assert_eq!(count(&mut a, "SELECT count(*) FROM s.t t"), 0);
-    run(&mut b, "CREATE INDEX e_id ON s.e (id, v)");
+    run(&mut b, "CREATE TABLE s.f (id integer NOT NULL, PRIMARY KEY (id))");
     run(&mut a, "INSERT INTO s.t (id, v) VALUES (1, 1)");
     run(&mut a, "COMMIT");
     assert_eq!(count(&mut a, "SELECT count(*) FROM s.t t"), 1);

@@ -111,6 +111,10 @@ impl relations::Reads for Snail {
         &self.catalog
     }
 
+    fn catalog_rows(&self) -> &Catalog {
+        self.seen.as_ref().unwrap_or(&self.catalog)
+    }
+
     fn read_join(
         &self,
         q: &Question,
@@ -596,6 +600,13 @@ pub struct Snail {
     own_from: Option<Root>,
     committing: bool,
     first_bytes: std::collections::BTreeMap<u64, u64>,
+    /// In a transaction of one snapshot that declared, or named as committed once another writer's
+    /// DDL moved the catalog: the catalog of its snapshot, and the catalog its root named then.
+    snapshot_catalog: Option<(Catalog, (Extent, u64))>,
+    /// The catalog a round's catalog tables are made from where it is not the one it names by: in a
+    /// transaction of one snapshot whose catalog another writer's DDL moved since, its snapshot's
+    /// objects and its own (`pgcatalog::seen`).
+    seen: Option<Catalog>,
     /// The savepoints of the transaction under way, oldest first.
     savepoints: Vec<savepoint::Savepoint>,
     /// What the session holds between its statements.
@@ -875,6 +886,8 @@ impl Snail {
             own_from: None,
             committing: false,
             first_bytes: Default::default(),
+            snapshot_catalog: None,
+            seen: None,
             savepoints: Vec::new(),
             session: Default::default(),
         })
@@ -1671,6 +1684,10 @@ impl Snail {
         order: Option<&str>,
         params: &[String],
     ) -> Result<(RecordBatch, Round)> {
+        // In a transaction of one snapshot a question names as committed.
+        if !self.aborted {
+            self.named_as_committed()?;
+        }
         self.parameters_read(sql, params)?;
         let pages_at_start = self.begin_round()?;
         let _clocked = crate::scalars::clocked(self.clock.0, self.clock.1);
