@@ -1314,8 +1314,9 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
 }
 
 /// The set-returning functions a step's select list reads.
-const SET_RETURNING: [&str; 12] = [
+const SET_RETURNING: [&str; 13] = [
     "unnest",
+    "generate_series",
     "pg_prepared_statement",
     "range_minus_multi",
     "multirange_minus_multi",
@@ -6106,6 +6107,28 @@ pub(super) fn call_rows(c: &Expr, row: &[Value], frame: &Frame) -> Result<Vec<Va
         Expr::Function(f) if gives_a_row(f) => Ok(vec![eval(c, row, frame, &computed_none())?]),
         _ => set_values(c, row, frame, &computed_none()),
     }
+}
+
+/// The values a generate_series in FROM gives for one row of the relations before it, made one at
+/// a time, `ty` the type its column takes; none where the call is another function's.
+pub(super) fn call_series(
+    c: &Expr,
+    row: &[Value],
+    frame: &Frame,
+    ty: Option<ColumnType>,
+) -> Result<Option<super::series::Series>> {
+    let Expr::Function(f) = c else {
+        return Ok(None);
+    };
+    if function_name(f) != "generate_series" {
+        return Ok(None);
+    }
+    let none = computed_none();
+    let given = args(f)?
+        .iter()
+        .map(|x| Ok((eval(x, row, frame, &none)?, quoted(x))))
+        .collect::<Result<Vec<_>>>()?;
+    super::series::series(given, ty).map(Some)
 }
 
 /// A record's fields, each a value of its own type; NULLs where the record is one.

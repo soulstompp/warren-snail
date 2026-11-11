@@ -13,7 +13,9 @@ pub(super) fn values(
     ty: Option<ColumnType>,
     casing: crate::catalog::Casing,
 ) -> Result<Vec<Value>> {
-    let _ = ty;
+    if name == "generate_series" {
+        return super::series::values(given, ty);
+    }
     if let Some(v) = regexps(name, &given, casing)? {
         return Ok(v);
     }

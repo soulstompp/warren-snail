@@ -46,6 +46,7 @@ mod rest;
 mod savepoint;
 mod sequences;
 pub(crate) mod serial;
+mod series;
 mod session;
 pub(crate) mod settings;
 mod sets;

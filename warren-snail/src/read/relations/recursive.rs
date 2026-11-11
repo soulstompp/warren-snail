@@ -187,6 +187,8 @@ pub(super) fn lift(
         name,
         query,
         renames,
+        origin: super::Origin::With,
+        inside: super::Inside::default(),
         calls: Vec::new(),
         set: None,
         laterals: Vec::new(),

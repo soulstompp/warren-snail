@@ -835,6 +835,10 @@ impl Typing<'_> {
                 if let Some(t) = numbers(&name, &types)? {
                     return Ok(t);
                 }
+                // generate_series names its zone from 16 on.
+                if name == "generate_series" && types.len() == 4 && self.release < 16 {
+                    return Err(no_form(&name, &types));
+                }
                 if let Some(t) = time(&name, &types)? {
                     return Ok(t);
                 }
@@ -849,6 +853,18 @@ impl Typing<'_> {
                 }
                 if let Some(t) = regexps(&name, &types)? {
                     return Ok(t);
+                }
+                // unnest of a quoted literal or a NULL: an array's, a multirange's and a tsvector's
+                // forms all take it.
+                let literal = |e: &Expr| {
+                    matches!(untyped(e), Some(Some(_)))
+                        || matches!(e, Expr::Value(v) if v.value == SqlValue::Null)
+                };
+                if name == "unnest" && types == [None] && literal(args[0]) {
+                    return Err(Error::new(format!(
+                        "function {name}({}) is not unique",
+                        arg_name(None)
+                    )));
                 }
                 if let Some(t) = arrays(&name, &types)? {
                     return Ok(t);
@@ -1193,8 +1209,43 @@ pub(super) fn numbers(
             _ => return refused(),
         },
         "num_nulls" | "num_nonnulls" => Some(Some(C::Int4)),
+        // generate_series of numbers: numeric where an argument is one, else the widest integer;
+        // its forms of time are time's.
+        "generate_series" if matches!(args.len(), 2 | 3) && !args.iter().any(|t| of_time(*t)) => {
+            if !a.iter().all(|x| matches!(x, Arg::Int(_) | Arg::Numeric | Arg::Unknown)) {
+                return refused();
+            }
+            if a.contains(&Arg::Numeric) {
+                return Ok(Some(Some(NUMERIC)));
+            }
+            let widest = a
+                .iter()
+                .filter_map(|x| match x {
+                    Arg::Int(t) => Some(*t),
+                    _ => None,
+                })
+                .reduce(wider);
+            match widest {
+                Some(t) if t != C::Int2 => Some(Some(t)),
+                _ => {
+                    return Err(Error::new(format!(
+                        "function {name}({}) is not unique",
+                        args.iter().map(|t| arg_name(*t)).collect::<Vec<_>>().join(", ")
+                    )))
+                }
+            }
+        }
         _ => None,
     })
+}
+
+/// Whether a type is a date, a timestamp, a timestamptz or an interval.
+fn of_time(t: Option<ColumnType>) -> bool {
+    use ColumnType as C;
+    matches!(
+        t.map(super::clock::base),
+        Some(C::Date | C::Timestamp(_) | C::Timestamptz | C::Interval { .. })
+    )
 }
 
 trait AtLeastInt4 {
@@ -1304,6 +1355,36 @@ pub(super) fn time(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Opt
         ("date_add" | "date_subtract", [_, _]) => C::Timestamptz,
         ("timestamp", [_, _]) => C::Timestamp(None),
         ("timestamptz", [_, _]) => C::Timestamptz,
+        // generate_series of instants: a timestamp where its bounds are more timestamps than
+        // timestamptzs and it names no zone, else a timestamptz, a date read as one.
+        ("generate_series", [s, e, step, zone @ ..]) if zone.len() <= 1 => {
+            let named = zone.iter().all(|z| {
+                matches!(
+                    z.map(super::clock::base),
+                    None | Some(C::Text(_) | C::Bpchar(_) | C::Name)
+                )
+            });
+            if !instant(*s)
+                || !instant(*e)
+                || !matches!(base(*step), Some(C::Interval { .. }) | None)
+                || !named
+            {
+                return refused();
+            }
+            let count = |want: fn(&ColumnType) -> bool| {
+                [*s, *e]
+                    .iter()
+                    .filter(|t| base(**t).as_ref().is_some_and(want))
+                    .count()
+            };
+            let plain = count(|t| matches!(t, C::Timestamp(_)));
+            let zoned = count(|t| matches!(t, C::Timestamptz));
+            match zone.is_empty() && plain > zoned {
+                true => C::Timestamp(None),
+                false => C::Timestamptz,
+            }
+        }
+        ("generate_series", _) => return refused(),
         _ => return Ok(None),
     })))
 }

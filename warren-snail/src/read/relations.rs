@@ -66,6 +66,13 @@ const CALLED: &str = "\0call";
 /// The mark a LATERAL subquery's place in a FROM is named by, once lifted out of it.
 const LATERAL: &str = "\0lateral";
 
+/// The name a subquery written in a FROM without an alias goes by, with a number of its own: a bare
+/// name finds its columns as any relation's, and no qualified reference reaches it.
+const UNNAMED: &str = "\u{3}unnamed_subquery";
+
+/// The name PostgreSQL gives a subquery written without an alias.
+const UNNAMED_WRITTEN: &str = "unnamed_subquery";
+
 /// A relation the statement makes before its last SELECT, under the name its FROM reads it by: a
 /// WITH query, or a derived table, a VALUES list or a view lifted out of a FROM; last, the
 /// question itself, under no name.
@@ -74,6 +81,10 @@ struct Step {
     query: Query,
     /// The names an alias gives its columns, in place of their own.
     renames: Vec<String>,
+    /// What it was lifted from, as a refusal of those names names it.
+    origin: Origin,
+    /// What the joins its FROM names by an alias hold.
+    inside: Inside,
     /// The functions its FROM calls, each standing in its FROM under CALLED and its place here.
     calls: Vec<Call>,
     /// A set operation's arms, where the step is one.
@@ -85,11 +96,55 @@ struct Step {
     recursion: Option<recursive::Recursion>,
 }
 
-/// A function a FROM reads the rows of.
+/// What a step was lifted from, as a refusal of its alias's column names names it.
+#[derive(Clone, Default)]
+enum Origin {
+    /// A WITH query, a view or the question itself.
+    #[default]
+    With,
+    /// A subquery or a VALUES list in a FROM, by its alias.
+    Table(String),
+    /// A join in a FROM, by its alias.
+    Join(String),
+}
+
+/// What the joins a FROM names by an alias hold: the relations inside them, which the alias hides,
+/// and which of the step's LATERAL subqueries is such a join.
+#[derive(Clone, Default)]
+struct Inside {
+    /// Each relation inside such a join: the name it goes by there, and the table it reads, if one.
+    hidden: Vec<(String, Option<String>)>,
+    /// The places among the step's LATERAL subqueries of each such join read for each row before
+    /// it, where it holds a function or a LATERAL item.
+    laterals: Vec<usize>,
+}
+
+/// A function a FROM reads the rows of: one call, or several read side by side (an unnest of
+/// several arrays), and its ordinality after them, where asked.
 #[derive(Clone)]
 struct Call {
-    expr: Expr,
+    functions: Vec<Called>,
     ordinality: bool,
+}
+
+/// One function of a call in FROM, and the columns it lays out there.
+#[derive(Clone)]
+struct Called {
+    expr: Expr,
+    /// Whether its record is spread into its fields, one field among them.
+    spread: bool,
+    /// How many columns it lays out.
+    width: usize,
+}
+
+impl Called {
+    fn of(expr: Expr) -> Called {
+        Called {
+            expr,
+            spread: false,
+            width: 1,
+        }
+    }
 }
 
 /// What a step made: its rows, and the type and the collation of each of its columns.
@@ -651,6 +706,8 @@ fn lift(
         name,
         query,
         renames,
+        origin: Origin::With,
+        inside: lifted.inside,
         calls: lifted.calls,
         set: None,
         laterals: lifted
@@ -663,12 +720,13 @@ fn lift(
     Ok(())
 }
 
-/// What a FROM keeps beside its step once lifted out of it: the functions it calls and the LATERAL
-/// subqueries it reads.
+/// What a FROM keeps beside its step once lifted out of it: the functions it calls, the LATERAL
+/// subqueries it reads and what its joins named by an alias hold.
 #[derive(Default)]
 struct Lifted {
     calls: Vec<Call>,
     laterals: Vec<Query>,
+    inside: Inside,
 }
 
 fn lift_join(
@@ -696,6 +754,29 @@ thread_local! {
 fn fresh(what: &str) -> String {
     let n = LIFTED.with(|c| c.replace(c.get() + 1));
     format!("{MERGED}{what}{n}")
+}
+
+/// The alias a subquery written without one goes by: a name no other relation of the statement has.
+fn unnamed() -> TableAlias {
+    let n = LIFTED.with(|c| c.replace(c.get() + 1));
+    alias_named(&format!("{UNNAMED}{n}"))
+}
+
+/// One step lifted as `lift` lifts it, its column list's refusal naming what it was lifted from.
+fn lift_as(
+    catalog: &Catalog,
+    out: &mut Vec<Step>,
+    visible: &[String],
+    name: String,
+    query: Query,
+    renames: Vec<String>,
+    origin: Origin,
+) -> Result<()> {
+    lift(catalog, out, visible, name, query, renames)?;
+    if let Some(s) = out.last_mut() {
+        s.origin = origin;
+    }
+    Ok(())
 }
 
 fn named(n: &str) -> ObjectName {
@@ -752,7 +833,7 @@ fn lift_factor(
             within_group: Vec::new(),
         })
     };
-    let (expr, ordinality, alias) = match t {
+    let (exprs, ordinality, alias) = match t {
         TableFactor::Table {
             name,
             alias,
@@ -811,14 +892,20 @@ fn lift_factor(
             args: Some(a),
             with_ordinality,
             ..
-        } if a.settings.is_none() => (call(name, a.args.clone()), *with_ordinality, alias.take()),
+        } if a.settings.is_none() => (
+            vec![call(name, a.args.clone())],
+            *with_ordinality,
+            alias.take(),
+        ),
         TableFactor::Function {
             name,
             args,
             with_ordinality,
             alias,
             ..
-        } => (call(name, args.clone()), *with_ordinality, alias.take()),
+        } => (vec![call(name, args.clone())], *with_ordinality, alias.take()),
+        // An unnest of several arrays is an unnest of each, read side by side, as PostgreSQL's
+        // parser makes it.
         TableFactor::UNNEST {
             alias,
             array_exprs,
@@ -826,19 +913,18 @@ fn lift_factor(
             with_offset_alias: None,
             with_ordinality,
         } => {
-            if array_exprs.len() != 1 {
-                return Err(Error::new("unnest of several arrays in FROM is not read"));
-            }
-            (
-                call(
-                    &named("unnest"),
-                    vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(
-                        array_exprs[0].clone(),
-                    ))],
-                ),
-                *with_ordinality,
-                alias.take(),
-            )
+            let name = match array_exprs.len() {
+                1 => named("unnest"),
+                _ => ObjectName(vec![
+                    ObjectNamePart::Identifier(Ident::new("pg_catalog")),
+                    ObjectNamePart::Identifier(Ident::new("unnest")),
+                ]),
+            };
+            let each = array_exprs
+                .iter()
+                .map(|a| call(&name, vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(a.clone()))]))
+                .collect();
+            (each, *with_ordinality, alias.take())
         }
         TableFactor::Derived {
             lateral: false,
@@ -848,19 +934,22 @@ fn lift_factor(
         } => {
             let step = fresh("derived");
             let renames = renames_of(alias)?;
-            lift(
+            let written = alias.as_ref().map(|a| crate::catalog::ident(&a.name));
+            let origin = Origin::Table(written.unwrap_or_default());
+            lift_as(
                 catalog,
                 out,
                 visible,
                 step.clone(),
                 (**subquery).clone(),
                 renames,
+                origin,
             )?;
-            let kept = alias.take().map(|mut a| {
+            let kept = alias.take().map_or_else(unnamed, |mut a| {
                 a.columns.clear();
                 a
             });
-            *t = plain(&step, kept);
+            *t = plain(&step, Some(kept));
             return Ok(());
         }
         TableFactor::Derived {
@@ -871,18 +960,117 @@ fn lift_factor(
         } => {
             lifted.laterals.push((**subquery).clone());
             let at = lifted.laterals.len() - 1;
-            *t = plain(&format!("{LATERAL}{at}"), alias.take());
+            let kept = alias.take().unwrap_or_else(unnamed);
+            *t = plain(&format!("{LATERAL}{at}"), Some(kept));
             return Ok(());
         }
         TableFactor::NestedJoin {
             table_with_joins,
             alias: None,
         } => return lift_join(catalog, out, visible, table_with_joins, lifted),
+        // A join with an alias: its star's columns as a relation of their own, the names inside it
+        // hidden from the step; read for each row before it where it holds a function or a LATERAL
+        // item, which may read a relation before it.
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias: Some(a),
+        } => {
+            hidden_in(table_with_joins, &mut lifted.inside.hidden);
+            let query = star_over((**table_with_joins).clone());
+            if reads_before(table_with_joins) {
+                lifted.laterals.push(query);
+                let at = lifted.laterals.len() - 1;
+                lifted.inside.laterals.push(at);
+                *t = plain(&format!("{LATERAL}{at}"), Some(a.clone()));
+                return Ok(());
+            }
+            let step = fresh("joined");
+            let renames = renames_of(&Some(a.clone()))?;
+            let origin = Origin::Join(crate::catalog::ident(&a.name));
+            lift_as(catalog, out, visible, step.clone(), query, renames, origin)?;
+            let mut kept = a.clone();
+            kept.columns.clear();
+            *t = plain(&step, Some(kept));
+            return Ok(());
+        }
         other => return Err(Error::new(format!("{other} is not read in FROM"))),
     };
-    lifted.calls.push(Call { expr, ordinality });
+    lifted.calls.push(Call {
+        functions: exprs.into_iter().map(Called::of).collect(),
+        ordinality,
+    });
     *t = plain(&format!("{CALLED}{}", lifted.calls.len() - 1), alias);
     Ok(())
+}
+
+/// `SELECT *` over a join.
+fn star_over(join: TableWithJoins) -> Query {
+    let parsed =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, "SELECT *")
+            .expect("a SELECT");
+    let [sqlparser::ast::Statement::Query(q)] = parsed.as_slice() else {
+        unreachable!("one SELECT")
+    };
+    let mut q = (**q).clone();
+    if let SetExpr::Select(s) = q.body.as_mut() {
+        s.from = vec![join];
+    }
+    q
+}
+
+/// Each relation a join holds, at every depth, by the name it goes by there and the table it reads.
+fn hidden_in(join: &TableWithJoins, out: &mut Vec<(String, Option<String>)>) {
+    let alias = |a: &Option<TableAlias>| a.as_ref().map(|a| crate::catalog::ident(&a.name));
+    let bare = |n: &ObjectName| {
+        let n = crate::catalog::object_name(n);
+        n.rsplit('.').next().unwrap_or(&n).to_string()
+    };
+    for f in std::iter::once(&join.relation).chain(join.joins.iter().map(|j| &j.relation)) {
+        match f {
+            TableFactor::Table {
+                name,
+                alias: a,
+                args,
+                ..
+            } => {
+                let table = args.is_none().then(|| crate::catalog::object_name(name));
+                out.push((alias(a).unwrap_or_else(|| bare(name)), table));
+            }
+            TableFactor::Function { name, alias: a, .. } => {
+                out.push((alias(a).unwrap_or_else(|| bare(name)), None));
+            }
+            TableFactor::UNNEST { alias: a, .. } => {
+                out.push((alias(a).unwrap_or_else(|| "unnest".into()), None));
+            }
+            TableFactor::Derived { alias: Some(a), .. } => {
+                out.push((crate::catalog::ident(&a.name), None));
+            }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias: a,
+            } => {
+                out.extend(alias(a).map(|a| (a, None)));
+                hidden_in(table_with_joins, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether a join holds a relation that may read one before it: a function's rows or a LATERAL
+/// subquery, at any depth.
+fn reads_before(join: &TableWithJoins) -> bool {
+    std::iter::once(&join.relation)
+        .chain(join.joins.iter().map(|j| &j.relation))
+        .any(|f| match f {
+            TableFactor::Table { args, .. } => args.is_some(),
+            TableFactor::Function { .. } | TableFactor::UNNEST { .. } => true,
+            TableFactor::Derived { lateral, .. } => *lateral,
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => reads_before(table_with_joins),
+            _ => false,
+        })
 }
 
 /// A FROM item naming a relation by name.
@@ -950,12 +1138,7 @@ enum What {
     /// A step made before.
     Made { name: String, qualifier: String },
     /// A function's rows, made for each row of the relations before it.
-    Call {
-        call: Call,
-        qualifier: String,
-        /// Whether its record is spread into its fields, one field among them.
-        spread: bool,
-    },
+    Call { call: Call, qualifier: String },
     /// A LATERAL subquery's rows, by its place among the step's, made for each row of the relations
     /// before it.
     Lateral { at: usize, qualifier: String },
@@ -1029,14 +1212,34 @@ struct From {
     /// The refusal of each column a statement may not ask, by its place: a catalog table's that only
     /// a server fills.
     refused: HashMap<usize, String>,
+    /// The relations inside its joins named by an alias, which the alias hides.
+    hidden: Vec<(String, Option<String>)>,
 }
 
 impl From {
     /// The refusal of a qualifier `q` no relation of the FROM answers to, in PostgreSQL's words:
     /// an invalid reference where it names a relation its alias hides (a table by its schema and
-    /// name, or by its name alone where the search path finds it; a WITH query by its name), else a
-    /// missing entry.
+    /// name, or by its name alone where the search path finds it; a WITH query by its name), or a
+    /// subquery written without an alias, here or in a query around it, or a relation inside a join
+    /// its alias hides, each of these two with the entry it found; else a missing entry.
     fn no_entry(&self, catalog: &Catalog, q: &str) -> Error {
+        let relation = q.rsplit('.').next().unwrap_or(q);
+        let entry = |name: &str| {
+            Error::new(format!(
+                "invalid reference to FROM-clause entry for table \"{relation}\": There is an \
+                 entry for table \"{name}\", but it cannot be referenced from this part of the \
+                 query."
+            ))
+        };
+        let unnamed = q == UNNAMED_WRITTEN
+            && self.columns.iter().any(|c| {
+                c.qualifier
+                    .as_deref()
+                    .is_some_and(|x| pipeline::unmarked(x).starts_with(UNNAMED))
+            });
+        if unnamed {
+            return entry(q);
+        }
         let mut leaves = Vec::new();
         for n in &self.items {
             n.leaves(&mut leaves);
@@ -1051,11 +1254,23 @@ impl From {
             What::Made { name, qualifier } => qualifier != q && apart::written(name) == q,
             _ => false,
         });
-        let relation = q.rsplit('.').next().unwrap_or(q);
-        Error::new(match hidden {
-            true => format!("invalid reference to FROM-clause entry for table \"{relation}\""),
-            false => format!("missing FROM-clause entry for table \"{relation}\""),
-        })
+        if hidden {
+            return Error::new(format!(
+                "invalid reference to FROM-clause entry for table \"{relation}\""
+            ));
+        }
+        let inside = self.hidden.iter().find(|(name, table)| {
+            name == q
+                || table
+                    .as_deref()
+                    .is_some_and(|t| crate::catalog::found_by_qualifier(t, q))
+        });
+        match inside {
+            Some((name, _)) => entry(name),
+            None => Error::new(format!(
+                "missing FROM-clause entry for table \"{relation}\""
+            )),
+        }
     }
 
     fn typed(&self) -> Vec<TypedColumn> {
@@ -1084,6 +1299,8 @@ struct Laying<'a> {
     made: &'a Steps,
     calls: &'a [Call],
     laterals: &'a [(Query, super::subqueries::Kept)],
+    /// The places among `laterals` of the joins named by an alias.
+    joined: &'a [usize],
     asked: Asked<'a>,
     casings: &'a Casings,
     outer: Option<&'a Outer<'a>>,
@@ -1223,25 +1440,18 @@ impl Laying<'_> {
         })
     }
 
-    /// A function's rows: one column of its type, named by its one OUT parameter, else by the alias
-    /// or the function; a record's fields each a column; and its ordinality after, where asked.
+    /// A function's rows: of each function of the call, one column of its type, named by its one
+    /// OUT parameter, else by the alias where it is the call's only function, else by the function,
+    /// or its record's fields each a column; and its ordinality after, where asked. The call is
+    /// named by the alias, else by its first function. A bare reference to that name reads the
+    /// column of a lone function of a scalar with no ordinality, as PostgreSQL reads its whole row.
     fn call(
         &mut self,
-        call: Call,
+        mut call: Call,
         alias: &Option<TableAlias>,
         renames: Vec<String>,
     ) -> Result<Node> {
         let at = self.columns.len();
-        let Expr::Function(f) = &call.expr else {
-            unreachable!("a call")
-        };
-        let name = pipeline::function_name(f);
-        if !pipeline::is_set_returning(&name) && !pipeline::gives_a_row(f) {
-            return Err(Error::new(format!(
-                "{}: a function in FROM is read where it returns a set the snail makes",
-                call.expr
-            )));
-        }
         let typed: Vec<TypedColumn> = self
             .columns
             .iter()
@@ -1252,42 +1462,80 @@ impl Laying<'_> {
             release: self.release,
             types: typed::Types::new(),
         };
-        let ty = typing.type_of(&call.expr)?;
+        let first = match call.functions.first().map(|c| &c.expr) {
+            Some(Expr::Function(f)) => pipeline::function_name(f),
+            _ => unreachable!("a call"),
+        };
         let q = alias
             .as_ref()
             .map(|a| crate::catalog::ident(&a.name))
-            .unwrap_or_else(|| name.clone());
-        let fields = ty.and_then(record_fields);
-        let spread = fields.is_some();
-        let mut cols: Vec<Col> = match fields {
-            Some(fields) => fields
-                .into_iter()
-                .map(|(n, t)| Col {
+            .unwrap_or_else(|| first.clone());
+        let lone = call.functions.len() == 1;
+        let whole = lone && !call.ordinality;
+        let mut cols: Vec<Col> = Vec::new();
+        let mut names = Vec::new();
+        for c in &mut call.functions {
+            let Expr::Function(f) = &c.expr else {
+                unreachable!("a call")
+            };
+            let name = pipeline::function_name(f);
+            if !pipeline::is_set_returning(&name) && !pipeline::gives_a_row(f) {
+                return Err(Error::new(format!(
+                    "{}: a function in FROM is read where it returns a set the snail makes",
+                    c.expr
+                )));
+            }
+            // A function named in its schema is named so in its refusals.
+            let ty = typing.type_of(&c.expr).map_err(|e| {
+                let written = crate::catalog::object_name(&f.name);
+                match e.0.strip_prefix(&format!("function {name}(")) {
+                    Some(rest) if f.name.0.len() > 1 => {
+                        let words = format!("function {written}({rest}");
+                        match e.sqlstate() {
+                            Some(code) => Error::coded(code, words),
+                            None => Error::new(words),
+                        }
+                    }
+                    _ => e,
+                }
+            })?;
+            let fields = ty.and_then(record_fields);
+            c.spread = fields.is_some();
+            let before = cols.len();
+            match fields {
+                Some(fields) => cols.extend(fields.into_iter().map(|(n, t)| Col {
                     qualifier: Some(q.clone()),
                     name: n,
                     ty: Some(t),
                     carried: carried_of(Some(t)),
-                })
-                .collect(),
-            None => {
-                let named = match name.as_str() {
-                    "json_array_elements"
-                    | "json_array_elements_text"
-                    | "jsonb_array_elements"
-                    | "jsonb_array_elements_text" => "value".to_string(),
-                    _ => alias
-                        .as_ref()
-                        .map(|a| crate::catalog::ident(&a.name))
-                        .unwrap_or_else(|| name.clone()),
-                };
-                vec![Col {
-                    qualifier: Some(format!("{}{q}", pipeline::SCALAR)),
-                    name: named,
-                    ty,
-                    carried: carried_of(ty),
-                }]
+                })),
+                None => {
+                    let named = match name.as_str() {
+                        "json_array_elements"
+                        | "json_array_elements_text"
+                        | "jsonb_array_elements"
+                        | "jsonb_array_elements_text" => "value".to_string(),
+                        _ if lone => alias
+                            .as_ref()
+                            .map(|a| crate::catalog::ident(&a.name))
+                            .unwrap_or_else(|| name.clone()),
+                        _ => name.clone(),
+                    };
+                    let qualifier = match whole {
+                        true => format!("{}{q}", pipeline::SCALAR),
+                        false => q.clone(),
+                    };
+                    cols.push(Col {
+                        qualifier: Some(qualifier),
+                        name: named,
+                        ty,
+                        carried: carried_of(ty),
+                    });
+                }
             }
-        };
+            c.width = cols.len() - before;
+            names.push(name);
+        }
         if call.ordinality {
             cols.push(Col {
                 qualifier: Some(q.clone()),
@@ -1305,7 +1553,7 @@ impl Laying<'_> {
         }
         // A plan cache's counts, which a snail has none of, refused by name where a statement
         // reads them.
-        if name == "pg_prepared_statement" {
+        if names.iter().any(|n| n == "pg_prepared_statement") {
             for (i, c) in cols.iter().enumerate() {
                 if super::prepared::PLAN_CACHE.contains(&c.name.as_str()) {
                     self.refused
@@ -1319,11 +1567,7 @@ impl Laying<'_> {
         let width = cols.len();
         self.columns.extend(cols);
         Ok(Node {
-            what: What::Call {
-                call,
-                qualifier: q,
-                spread,
-            },
+            what: What::Call { call, qualifier: q },
             at,
             width,
             star: (at..at + width).collect(),
@@ -1366,7 +1610,7 @@ impl Laying<'_> {
         let qualifier = alias
             .as_ref()
             .map(|a| crate::catalog::ident(&a.name))
-            .unwrap_or_else(|| format!("\u{3}lateral{at}"));
+            .unwrap_or_else(|| format!("{UNNAMED}{at}"));
         let mut cols: Vec<Col> = m
             .rel
             .names
@@ -1381,8 +1625,12 @@ impl Laying<'_> {
             })
             .collect();
         if renames.len() > cols.len() {
+            let what = match self.joined.contains(&at) {
+                true => "join expression",
+                false => "table",
+            };
             return Err(Error::new(format!(
-                "table \"{qualifier}\" has {} columns available but {} columns specified",
+                "{what} \"{qualifier}\" has {} columns available but {} columns specified",
                 cols.len(),
                 renames.len()
             )));
@@ -1989,9 +2237,8 @@ impl Reading<'_> {
                 }
                 rows.each_chunk(&mut |c| each(c, None))
             }
-            What::Call { call, spread, .. } => {
-                let rows = self.called(node, call, *spread, before)?;
-                each(rows, None)
+            What::Call { call, .. } => {
+                self.called(node, call, before, &mut |rows| each(rows, None))
             }
             What::Lateral { at, .. } => self
                 .laterally(node, *at, before)?
@@ -2661,13 +2908,16 @@ impl Reading<'_> {
 
     /// A function's rows for the row before it, or for none where nothing comes before it; in a
     /// subquery, for the row of the query around it too, whose columns its arguments may read.
+    /// Several functions are read side by side, as many rows as the longest gives, a shorter one's
+    /// columns NULL past its last. They are handed to `each` whole, but a lone series's a chunk at
+    /// a time as it makes them, the statement's timeout read at each.
     fn called(
         &mut self,
         node: &Node,
         call: &Call,
-        spread: bool,
         before: Option<(usize, &[Value])>,
-    ) -> Result<Vec<Vec<Value>>> {
+        each: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+    ) -> Result<()> {
         let (start, row) = before.unwrap_or((node.at, &[]));
         let mut columns = self.from.frame_columns(start, row.len());
         let mut row = row.to_vec();
@@ -2685,23 +2935,62 @@ impl Reading<'_> {
             now: self.now,
             subqueries: None,
         };
-        let values = pipeline::call_rows(&call.expr, &row, &frame)?;
-        let fields = node.width - call.ordinality as usize;
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let mut out = match (fields, &v) {
-                    (1, _) if !spread => vec![v],
-                    (_, Value::Null) => vec![Value::Null; fields],
-                    (_, v) => pipeline::record_values(v, fields)?,
+        // A function's columns of one value it gives.
+        let laid = |c: &Called, v: Value, out: &mut Vec<Value>| -> Result<()> {
+            match (c.width, &v) {
+                (1, _) if !c.spread => out.push(v),
+                (_, Value::Null) => out.extend(vec![Value::Null; c.width]),
+                (_, v) => out.extend(pipeline::record_values(v, c.width)?),
+            }
+            Ok(())
+        };
+        let counted = |i: usize, out: &mut Vec<Value>| {
+            if call.ordinality {
+                out.push(Value::Int(i as i64 + 1));
+            }
+        };
+        if let [c] = call.functions.as_slice() {
+            let ty = self.from.columns[node.at].ty;
+            if let Some(series) = pipeline::call_series(&c.expr, &row, &frame, ty)? {
+                let mut hand = |rows: Vec<Vec<Value>>| {
+                    super::settings::in_time()?;
+                    each(rows)
                 };
-                if call.ordinality {
-                    out.push(Value::Int(i as i64 + 1));
+                let mut chunk = Chunk::new(&mut hand);
+                for (i, v) in series.enumerate() {
+                    let mut out = Vec::with_capacity(node.width);
+                    laid(c, v?, &mut out)?;
+                    counted(i, &mut out);
+                    chunk.push(out)?;
                 }
-                Ok(out)
-            })
-            .collect()
+                return chunk.finish();
+            }
+        }
+        let mut values = Vec::with_capacity(call.functions.len());
+        let mut at = node.at;
+        for c in &call.functions {
+            let ty = self.from.columns[at].ty;
+            at += c.width;
+            values.push(match pipeline::call_series(&c.expr, &row, &frame, ty)? {
+                Some(series) => series.collect::<Result<Vec<_>>>()?,
+                None => pipeline::call_rows(&c.expr, &row, &frame)?,
+            });
+        }
+        let longest = values.iter().map(Vec::len).max().unwrap_or(0);
+        let mut values: Vec<_> = values.into_iter().map(Vec::into_iter).collect();
+        let mut rows = Vec::with_capacity(longest);
+        for i in 0..longest {
+            let mut out = Vec::with_capacity(node.width);
+            for (c, vs) in call.functions.iter().zip(&mut values) {
+                match vs.next() {
+                    Some(v) => laid(c, v, &mut out)?,
+                    None => out.extend(vec![Value::Null; c.width]),
+                }
+            }
+            counted(i, &mut out);
+            rows.push(out);
+        }
+        each(rows)
     }
 
 }
@@ -2726,7 +3015,7 @@ fn along(table: &Table) -> Option<usize> {
 }
 
 /// A star in a select list read as the columns it names, each by its place in the FROM's row.
-fn starred(projection: &mut Vec<SelectItem>, from: &From) -> Result<()> {
+fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> Result<()> {
     let mut out = Vec::with_capacity(projection.len());
     let by_place = |places: Vec<usize>| -> Vec<SelectItem> {
         places
@@ -2765,9 +3054,7 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From) -> Result<()> {
                 let found = leaves
                     .iter()
                     .find(|l| l.leaf_named() == Some(q.as_str()))
-                    .ok_or_else(|| {
-                        Error::new(format!("missing FROM-clause entry for table \"{q}\""))
-                    })?;
+                    .ok_or_else(|| from.no_entry(catalog, &q))?;
                 out.extend(by_place(found.star.clone()));
             }
             other => out.push(other),
@@ -2911,6 +3198,8 @@ fn lift_set(
             name,
             query,
             renames,
+            origin: Origin::With,
+            inside: Inside::default(),
             calls: Vec::new(),
             set: Some(arm),
             laterals: Vec::new(),
@@ -2923,6 +3212,8 @@ fn lift_set(
         name: set.clone(),
         query: query.clone(),
         renames: Vec::new(),
+        origin: Origin::With,
+        inside: Inside::default(),
         calls: Vec::new(),
         set: Some(arm),
         laterals: Vec::new(),
@@ -2944,6 +3235,8 @@ fn lift_set(
         name,
         query,
         renames,
+        origin: Origin::With,
+        inside: Inside::default(),
         calls: Vec::new(),
         set: None,
         laterals: Vec::new(),
@@ -3505,7 +3798,7 @@ struct Making<'a, 'o> {
 /// its arms' steps.
 fn step_words(step: &Step) -> Vec<String> {
     let mut text = step.query.to_string();
-    for c in &step.calls {
+    for c in step.calls.iter().flat_map(|c| &c.functions) {
         text.push(' ');
         text.push_str(&c.expr.to_string());
     }
@@ -3578,12 +3871,15 @@ impl Making<'_, '_> {
     }
 
     /// A step's relation kept under its name, its columns under the names its alias gives them.
-    /// A step's relation kept under its name, its columns under the names its alias gives them.
     fn keep(&mut self, step: &Step, mut m: Made) -> Result<()> {
         if step.renames.len() > m.rel.names.len() {
+            let (what, name) = match &step.origin {
+                Origin::With => ("WITH query", apart::written(&step.name).to_string()),
+                Origin::Table(a) => ("table", a.clone()),
+                Origin::Join(a) => ("join expression", a.clone()),
+            };
             return Err(Error::new(format!(
-                "WITH query \"{}\" has {} columns available but {} columns specified",
-                apart::written(&step.name),
+                "{what} \"{name}\" has {} columns available but {} columns specified",
                 m.rel.names.len(),
                 step.renames.len()
             )));
@@ -3871,6 +4167,7 @@ fn select_step(
             made,
             calls: &step.calls,
             laterals: &step.laterals,
+            joined: &step.inside.laterals,
             asked,
             casings,
             outer,
@@ -3888,6 +4185,7 @@ fn select_step(
             items,
             outer_at: 0,
             refused: laying.refused,
+            hidden: step.inside.hidden.clone(),
         }
     };
     {
@@ -3905,7 +4203,7 @@ fn select_step(
         }
     }
     if let SetExpr::Select(s) = step.query.body.as_mut() {
-        starred(&mut s.projection, &from)?;
+        starred(&mut s.projection, &from, catalog)?;
     }
     from.outer_at = from.columns.len();
     if let Some(o) = outer {
@@ -3939,7 +4237,7 @@ fn select_step(
                         .unwrap_or_default();
                     keyed.push((qualifier.clone(), primary));
                 }
-                What::Call { call, .. } => joined.push(&call.expr),
+                What::Call { call, .. } => joined.extend(call.functions.iter().map(|c| &c.expr)),
                 _ => {}
             }
         }
@@ -4079,7 +4377,12 @@ fn select_step(
     // The FROM's rows.
     // The words it writes, its functions' calls and LATERAL subqueries among them.
     let text = std::iter::once(step.query.to_string())
-        .chain(step.calls.iter().map(|c| c.expr.to_string()))
+        .chain(
+            step.calls
+                .iter()
+                .flat_map(|c| &c.functions)
+                .map(|c| c.expr.to_string()),
+        )
         .chain(step.laterals.iter().map(|(q, _)| q.to_string()))
         .collect::<Vec<_>>()
         .join(" ");
