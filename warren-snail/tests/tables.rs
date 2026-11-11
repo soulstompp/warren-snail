@@ -654,7 +654,7 @@ mod written {
     }
 
     #[test]
-    fn another_writers_ddl_past_the_cut_refuses_a_declaration_begun_before_it() {
+    fn another_writers_ddl_past_the_cut_and_a_declaration_begun_before_it_both_commit() {
         let path = written("declared", 40, &[1]);
         let mut w = Snail::open_writing(&path).unwrap();
         w.execute("BEGIN").unwrap();
@@ -663,10 +663,16 @@ mod written {
         let mut other = Snail::open_writing(&path).unwrap();
         make(&mut other, "theirs", PAST);
         assert!(is_cut(&path));
-        let e = w.execute("COMMIT").unwrap_err().to_string();
-        assert!(e.contains("declared since by another writer"), "{e}");
-        w.execute("CREATE TABLE s.mine (a bigint PRIMARY KEY, b text)")
-            .unwrap();
+        // Its statement declared again on the catalog the other's commits left, as PostgreSQL
+        // commits both.
+        w.execute("COMMIT").unwrap();
+        let e = w
+            .execute("CREATE TABLE s.mine (a bigint PRIMARY KEY, b text)")
+            .unwrap_err();
+        assert_eq!(
+            (e.sqlstate(), e.to_string()),
+            (Some("42P07"), "relation \"mine\" already exists".to_string())
+        );
         drop((w, other));
         whole(&path);
         let mut r = fresh(&path);

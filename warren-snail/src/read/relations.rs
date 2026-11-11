@@ -1835,7 +1835,8 @@ const FULL_UNMET: &str =
 /// Whether a FULL JOIN's ON is one PostgreSQL meets the rows by: true, or holding an = between
 /// an expression of the left side's columns alone and one of the right side's. A subquery stands on
 /// the side of each column `read_by` gives it, the places among the two sides' of those it cannot
-/// be read without; one reading neither side stands on none.
+/// be read without; one reading neither side stands on none. A column of the query around the join,
+/// one value for the row that asks, stands on no side.
 fn hashable<'p>(
     columns: &[Col],
     left: &Node,
@@ -1852,7 +1853,7 @@ fn hashable<'p>(
         pipeline::columns_read(e, &mut read);
         let mut sides: Vec<Option<bool>> = read
             .iter()
-            .map(|(q, n)| {
+            .filter_map(|(q, n)| {
                 match pipeline::naming(
                     columns[left.at..right.at + right.width]
                         .iter()
@@ -1862,8 +1863,9 @@ fn hashable<'p>(
                 )
                 .as_slice()
                 {
-                    [i] => Some(*i < left.width),
-                    _ => None,
+                    [] => None,
+                    [i] => Some(Some(*i < left.width)),
+                    _ => Some(None),
                 }
             })
             .collect();

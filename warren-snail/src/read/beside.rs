@@ -61,6 +61,11 @@ impl OwnRows {
         self.written.get(r).is_some_and(|at| !at.is_empty())
     }
 
+    /// Whether it holds a change still standing.
+    pub(super) fn changed(&self) -> bool {
+        self.changes.iter().any(Option::is_some)
+    }
+
     fn add(&mut self, c: Change) {
         let weigh = |r: &Row| r.iter().map(datum_bytes).sum::<u64>();
         self.bytes += match &c {
@@ -764,6 +769,19 @@ impl Snail {
         let mut root = self.reader.peek_root()?;
         match &self.declared {
             Some(d) => {
+                // Where another writer's commit moved the catalog since, its statements are
+                // declared again there, and a table it wrote rows of stands as it wrote them.
+                if let Some(catalog) = self.committed_ddl(&root, d.from(), d.own())? {
+                    for name in own.keys() {
+                        let (Some(a), Some(b)) = (self.catalog.table(name), catalog.table(name))
+                        else {
+                            return Err(concurrent_update());
+                        };
+                        if !a.same_shape(b) {
+                            return Err(concurrent_update());
+                        }
+                    }
+                }
                 let mut stage = self.reader.stage();
                 // What a DROP of it took out goes; what it made, made again, is laid down after.
                 root.orders

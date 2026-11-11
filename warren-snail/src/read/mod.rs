@@ -967,6 +967,29 @@ impl Snail {
         Ok(catalog)
     }
 
+    /// The catalog `newest` names, where a commit moved it past `from`, with `own` declared on it:
+    /// what a transaction's statements, `own` among them, name as committed. Refused in the words
+    /// of the first of `own` refused there.
+    fn committed_ddl(&self, newest: &Root, from: (Extent, u64), own: &str) -> Result<Option<Catalog>> {
+        if newest.catalog_named() == from {
+            return Ok(None);
+        }
+        let committed = String::from_utf8(self.reader.catalog_text(newest)?)
+            .map_err(|_| Error::new("the catalog is not UTF-8"))?;
+        let text = format!("{}\n{own}", committed.trim_end());
+        let mut catalog = Catalog::parse_kept(&text, usize::MAX)?;
+        old_names(&mut catalog, self.reader.format());
+        catalog.with_release(newest.release)?;
+        catalog.with_monetary(&crate::file::monetary_of(&catalog, &newest.monetary))?;
+        catalog.with_text_search(newest.text_search())?;
+        catalog.collation = newest.collation().to_string();
+        crate::file::holds_catalog(self.reader.format(), &catalog)?;
+        for t in &catalog.tables {
+            crate::file::holds(self.reader.format(), t)?;
+        }
+        Ok(Some(catalog))
+    }
+
     /// Begins a round after the first: the root read afresh, and the catalog read again if the file
     /// has moved to a new generation. The pages it read from the file.
     fn renew(&mut self) -> Result<u64> {

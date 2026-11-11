@@ -10,10 +10,14 @@
 //! reading by its index; and a row value IN a list of rows, read as the OR of its rows' comparisons;
 //! and a subquery in a join's ON, correlated to either side or to the query around, a FULL JOIN on
 //! one side's subquery answered and any other refused, and an ON inside a subquery reading the query
-//! around it. Every answer and refusal is 18.6's over the same statements (`session.nu --suite
-//! sling`, and `sessions.nu --only serializable` for the writers; 18.6 with its index, through
-//! `dblink`, for the writers by an OR). A snail writes on its own only with `standalone`, as
-//! `tests/ddl.rs`.
+//! around it, a FULL JOIN's equality holding it among them; a type, a domain, a relation or a
+//! function of a name taken refused in 18.6's words; and DDL in a transaction naming and making
+//! against the catalog as committed, at each level, a name another committed since refused in its
+//! kind's words, one dropped since made again, DDL over a table made since reading none of its rows,
+//! and writers of different names both committing. Every answer and refusal is 18.6's over the same
+//! statements (`session.nu --suite sling`, and `sessions.nu --only serializable` for the writers,
+//! `sessions.nu --only "as committed"` for the DDL; 18.6 with its index, through `dblink`, for the
+//! writers by an OR). A snail writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -1239,4 +1243,412 @@ fn a_join_s_on_inside_a_subquery_reads_the_query_around_it() {
     let path = declared("on-around", K6, &K6_ROWS);
     let mut w = Snail::open_writing(&path).unwrap();
     answered(&mut w, asked);
+}
+
+#[test]
+fn a_full_join_s_on_inside_a_subquery_meets_by_an_equality_holding_the_query_around_it() {
+    let counted: &[&str] = &[
+        "ACT-A-001|9",
+        "ACT-A-002|9",
+        "ACT-B-001|9",
+        "ACT-B-002|9",
+        "ACT-C-001|8",
+    ];
+    let asked: &[(&str, &[&str])] = &[
+        (
+            "SELECT o.acct, (SELECT count(*) FROM k6.stated s FULL JOIN k6.tiers t \
+             ON s.balance = t.lower + length(o.owner) - 3) AS n FROM k6.owners o ORDER BY o.acct",
+            counted,
+        ),
+        (
+            "SELECT o.acct, (SELECT count(*) FROM k6.stated s FULL JOIN k6.tiers t \
+             ON s.balance + length(o.owner) = t.lower + 3) AS n FROM k6.owners o ORDER BY o.acct",
+            counted,
+        ),
+        (
+            "SELECT o.acct, (SELECT count(*) FROM k6.stated s FULL JOIN k6.tiers t \
+             ON s.balance = t.lower AND t.rate > length(o.owner) / 1000.0) AS n FROM k6.owners o \
+             ORDER BY o.acct",
+            &[
+                "ACT-A-001|9",
+                "ACT-A-002|9",
+                "ACT-B-001|9",
+                "ACT-B-002|9",
+                "ACT-C-001|9",
+            ],
+        ),
+    ];
+    let path = declared("full-on-around", K6, &K6_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(&mut w, asked);
+    let unmet = (
+        Some("0A000"),
+        "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions".into(),
+    );
+    for sql in [
+        "SELECT o.acct, (SELECT count(*) FROM k6.stated s FULL JOIN k6.tiers t \
+         ON s.balance = length(o.owner) - 3) AS n FROM k6.owners o",
+        "SELECT o.acct, (SELECT count(*) FROM k6.stated s FULL JOIN k6.tiers t \
+         ON length(o.owner) - 3 = t.lower) AS n FROM k6.owners o",
+    ] {
+        assert_eq!(refused(&mut w, sql), unmet, "{sql}");
+    }
+}
+
+/// A statement's refusal's SQLSTATE and words, as `refused` gives them.
+fn said(code: &'static str, words: &str) -> (Option<&'static str>, String) {
+    (Some(code), words.to_string())
+}
+
+/// PostgreSQL's words for a relation whose row type would take a type's name.
+fn row_type(name: &str) -> String {
+    format!(
+        "type \"{name}\" already exists\nHINT:  A relation has an associated type of the same \
+         name, so you must use a name that doesn't conflict with any existing type."
+    )
+}
+
+#[test]
+fn type_and_function_refusals_are_18_6_s_words() {
+    let path = declared(
+        "type-words",
+        "CREATE SCHEMA k7;
+         CREATE TYPE k7.mood AS ENUM ('a', 'b');
+         CREATE DOMAIN k7.dom AS integer;
+         CREATE TYPE k7.pair AS (a integer, b integer);
+         CREATE TABLE k7.t (k integer NOT NULL, PRIMARY KEY (k));
+         CREATE VIEW k7.v AS SELECT k FROM k7.t;
+         CREATE SEQUENCE k7.q;
+         CREATE FUNCTION k7.f(integer) RETURNS integer LANGUAGE sql RETURN $1;
+         CREATE TYPE k7.range7 AS RANGE (subtype = integer);",
+        &[],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    let taken = |n: &str| said("42710", &format!("type \"{n}\" already exists"));
+    for (sql, want) in [
+        ("CREATE TYPE k7.mood AS ENUM ('c')", taken("mood")),
+        ("CREATE TYPE k7.dom AS ENUM ('c')", taken("dom")),
+        ("CREATE TYPE k7.t AS ENUM ('c')", taken("t")),
+        ("CREATE TYPE k7.v AS ENUM ('c')", taken("v")),
+        ("CREATE TYPE k7.pair AS ENUM ('c')", taken("pair")),
+        ("CREATE DOMAIN k7.mood AS text", taken("mood")),
+        ("CREATE DOMAIN k7.t AS text", taken("t")),
+        ("CREATE DOMAIN k7.v AS text", taken("v")),
+        ("CREATE TYPE k7.t AS (x integer)", taken("t")),
+        (
+            "CREATE TABLE k7.mood (k integer NOT NULL, PRIMARY KEY (k))",
+            said("42710", &row_type("mood")),
+        ),
+        (
+            "CREATE TABLE k7.dom (k integer NOT NULL, PRIMARY KEY (k))",
+            said("42710", &row_type("dom")),
+        ),
+        (
+            "CREATE TABLE k7.pair (k integer NOT NULL, PRIMARY KEY (k))",
+            said("42P07", "relation \"pair\" already exists"),
+        ),
+        (
+            "CREATE TABLE k7.range7 (k integer NOT NULL, PRIMARY KEY (k))",
+            said("42710", &row_type("range7")),
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS k7.mood (k integer NOT NULL, PRIMARY KEY (k))",
+            said("42710", &row_type("mood")),
+        ),
+        ("CREATE VIEW k7.mood AS SELECT 1 AS one", said("42710", &row_type("mood"))),
+        ("CREATE SEQUENCE k7.dom", said("42710", &row_type("dom"))),
+        (
+            "CREATE FUNCTION k7.f(integer) RETURNS integer LANGUAGE sql RETURN 2",
+            said("42723", "function \"f\" already exists with same argument types"),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+    // A sequence has no row type, and an index none either: each takes a type's name.
+    w.execute("CREATE TYPE k7.q AS ENUM ('c')").unwrap();
+    w.execute("CREATE INDEX mood ON k7.t (k)").unwrap();
+}
+
+/// Two writers of one snail of the tables the transactions name as committed, at a path of the
+/// test's name.
+fn named(name: &str) -> (Snail, Snail, std::path::PathBuf) {
+    let path = declared(
+        name,
+        "CREATE TABLE t (k varchar(4) NOT NULL, w numeric(9,2), y integer, PRIMARY KEY (k));
+         CREATE TABLE d7 (k integer NOT NULL, PRIMARY KEY (k));
+         CREATE TABLE t8 (k varchar(4) NOT NULL, y integer, PRIMARY KEY (k));",
+        &[],
+    );
+    (
+        Snail::open_writing(&path).unwrap(),
+        Snail::open_writing(&path).unwrap(),
+        path,
+    )
+}
+
+#[test]
+fn a_name_committed_since_is_refused() {
+    let (mut a, mut b, path) = named("committed-since");
+    let exists = |n: &str| said("42P07", &format!("relation \"{n}\" already exists"));
+    // warren-sling's ask: at SERIALIZABLE the catalog read is the snapshot's, the name made as
+    // committed.
+    a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    b.execute("CREATE TABLE notes (k varchar(4) NOT NULL, w numeric(9,2), PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO notes VALUES ('n1', 1)").unwrap();
+    b.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname = 'notes'"),
+        ["0"]
+    );
+    assert_eq!(
+        refused(
+            &mut a,
+            "CREATE TABLE notes (k varchar(4) NOT NULL, v numeric(5), PRIMARY KEY (k))"
+        ),
+        exists("notes")
+    );
+    a.execute("ROLLBACK").unwrap();
+    assert_eq!(rows(&mut a, "SELECT k || ':' || w FROM notes"), ["n1:1.00"]);
+    // At REPEATABLE READ alike.
+    a.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("CREATE TABLE notes2 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname = 'notes2'"),
+        ["0"]
+    );
+    assert_eq!(
+        refused(&mut a, "CREATE TABLE notes2 (k varchar(4) NOT NULL, PRIMARY KEY (k))"),
+        exists("notes2")
+    );
+    a.execute("ROLLBACK").unwrap();
+    // At READ COMMITTED each statement reads the catalog as committed.
+    a.execute("BEGIN").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("CREATE TABLE notes3 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname = 'notes3'"),
+        ["1"]
+    );
+    assert_eq!(
+        refused(&mut a, "CREATE TABLE notes3 (k varchar(4) NOT NULL, PRIMARY KEY (k))"),
+        exists("notes3")
+    );
+    a.execute("ROLLBACK").unwrap();
+    // And after its own DDL.
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE own3 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("CREATE TABLE notes4 (k varchar(4) NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(
+        refused(&mut a, "CREATE TABLE notes4 (k varchar(4) NOT NULL, PRIMARY KEY (k))"),
+        exists("notes4")
+    );
+    a.execute("ROLLBACK").unwrap();
+    drop((a, b));
+    let mut c = Snail::open_writing(&path).unwrap();
+    assert_eq!(
+        rows(
+            &mut c,
+            "SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class \
+             WHERE relname IN ('notes', 'notes2', 'notes3', 'notes4', 'own3')"
+        ),
+        ["notes,notes2,notes3,notes4"]
+    );
+}
+
+#[test]
+fn each_kind_committed_since_is_refused_in_its_words() {
+    let (mut a, mut b, path) = named("each-kind");
+    a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("BEGIN").unwrap();
+    for sql in [
+        "CREATE SEQUENCE s6",
+        "CREATE VIEW v6 AS SELECT 1 AS one",
+        "CREATE INDEX t_w6 ON t (w)",
+        "CREATE SCHEMA sc6",
+        "CREATE TYPE mood6 AS ENUM ('a')",
+        "CREATE DOMAIN dom6 AS integer",
+        "CREATE FUNCTION f6(integer) RETURNS integer LANGUAGE sql RETURN $1",
+        "ALTER TABLE t8 ADD CONSTRAINT c8 CHECK (y > 0)",
+        "DROP TABLE d7",
+        "COMMIT",
+    ] {
+        b.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    a.execute("SAVEPOINT a").unwrap();
+    for (sql, want) in [
+        ("CREATE SEQUENCE s6", said("42P07", "relation \"s6\" already exists")),
+        (
+            "CREATE VIEW v6 AS SELECT 2 AS two",
+            said("42P07", "relation \"v6\" already exists"),
+        ),
+        (
+            "CREATE INDEX t_w6 ON t (y)",
+            said("42P07", "relation \"t_w6\" already exists"),
+        ),
+        ("CREATE SCHEMA sc6", said("42P06", "schema \"sc6\" already exists")),
+        (
+            "CREATE TYPE mood6 AS ENUM ('b')",
+            said("42710", "type \"mood6\" already exists"),
+        ),
+        ("CREATE DOMAIN dom6 AS text", said("42710", "type \"dom6\" already exists")),
+        (
+            "CREATE FUNCTION f6(integer) RETURNS integer LANGUAGE sql RETURN 2",
+            said("42723", "function \"f6\" already exists with same argument types"),
+        ),
+        (
+            "CREATE TABLE mood6 (k integer NOT NULL, PRIMARY KEY (k))",
+            said("42710", &row_type("mood6")),
+        ),
+        (
+            "ALTER TABLE t8 ADD CONSTRAINT c8 CHECK (y > 1)",
+            said("42710", "constraint \"c8\" for relation \"t8\" already exists"),
+        ),
+        ("DROP TABLE d7", said("42P01", "table \"d7\" does not exist")),
+    ] {
+        assert_eq!(refused(&mut a, sql), want, "{sql}");
+        a.execute("ROLLBACK TO a").unwrap();
+    }
+    let done = a
+        .execute("CREATE TABLE IF NOT EXISTS v6 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(
+        done.notices,
+        ["NOTICE:  relation \"v6\" already exists, skipping"]
+    );
+    let done = a.execute("DROP TABLE IF EXISTS d7").unwrap();
+    assert_eq!(done.notices, ["NOTICE:  table \"d7\" does not exist, skipping"]);
+    // What another made since is named as committed.
+    a.execute("CREATE TABLE sc6.inside (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    a.execute("CREATE TABLE typed6 (k integer NOT NULL, m mood6, d dom6, PRIMARY KEY (k))")
+        .unwrap();
+    assert_eq!(rows(&mut a, "SELECT nextval('s6')"), ["1"]);
+    assert_eq!(rows(&mut a, "SELECT f6(7)"), ["7"]);
+    a.execute("COMMIT").unwrap();
+    drop((a, b));
+    let mut c = Snail::open_writing(&path).unwrap();
+    assert_eq!(
+        rows(
+            &mut c,
+            "SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class \
+             WHERE relname IN ('inside', 'typed6', 'd7')"
+        ),
+        ["inside,typed6"]
+    );
+}
+
+#[test]
+fn ddl_over_a_table_made_since_reads_none() {
+    let (mut a, mut b, path) = named("made-since");
+    a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("CREATE TABLE notes5 (k varchar(4) NOT NULL, w numeric(9,2), PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("CREATE TABLE notes8 (k varchar(4) NOT NULL, w numeric(9,2), PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO notes8 VALUES ('n1', 1)").unwrap();
+    for sql in [
+        "CREATE INDEX notes5_w ON notes5 (w)",
+        "CREATE TABLE child5 (c integer NOT NULL, k varchar(4) REFERENCES notes5 (k), \
+         PRIMARY KEY (c))",
+        "CREATE VIEW v5 AS SELECT k FROM notes5",
+        "INSERT INTO notes5 VALUES ('n2', 2)",
+    ] {
+        a.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM v5"), ["1"]);
+    a.execute("CREATE VIEW v8 AS SELECT k FROM notes8").unwrap();
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM v8"), ["0"]);
+    a.execute("INSERT INTO notes8 VALUES ('n2', 2)").unwrap();
+    assert_eq!(
+        rows(&mut a, "SELECT string_agg(k, ',' ORDER BY k) FROM v8"),
+        ["n2"]
+    );
+    a.execute("COMMIT").unwrap();
+    drop((a, b));
+    let mut c = Snail::open_writing(&path).unwrap();
+    assert_eq!(
+        rows(&mut c, "SELECT string_agg(k, ',' ORDER BY k) FROM notes8"),
+        ["n1,n2"]
+    );
+    assert_eq!(
+        rows(&mut c, "SELECT string_agg(k, ',' ORDER BY k) FROM notes5"),
+        ["n2"]
+    );
+}
+
+#[test]
+fn a_name_dropped_since_is_made_again() {
+    let (mut a, mut b, path) = named("dropped-since");
+    b.execute("CREATE TABLE d9 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO d9 VALUES (1)").unwrap();
+    a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    b.execute("DROP TABLE d9").unwrap();
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_class WHERE relname = 'd9'"),
+        ["1"]
+    );
+    a.execute("CREATE TABLE d9 (k integer NOT NULL, v integer, PRIMARY KEY (k))")
+        .unwrap();
+    a.execute("INSERT INTO d9 VALUES (2, 2)").unwrap();
+    assert_eq!(
+        rows(&mut a, "SELECT string_agg(k || ':' || v, ',') FROM d9"),
+        ["2:2"]
+    );
+    a.execute("COMMIT").unwrap();
+    drop((a, b));
+    let mut c = Snail::open_writing(&path).unwrap();
+    assert_eq!(
+        rows(&mut c, "SELECT string_agg(k || ':' || v, ',') FROM d9"),
+        ["2:2"]
+    );
+}
+
+#[test]
+fn writers_of_different_names_both_commit() {
+    let (mut a, mut b, path) = named("both-commit");
+    a.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 1"), ["1"]);
+    a.execute("CREATE TABLE b13 (k integer NOT NULL, v integer, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+    b.execute("CREATE TABLE a13 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    b.execute("INSERT INTO a13 VALUES (7)").unwrap();
+    b.execute("COMMIT").unwrap();
+    // Its own statements declared on the other's catalog first.
+    a.execute("CREATE INDEX b13_v ON b13 (v)").unwrap();
+    a.execute("INSERT INTO b13 VALUES (1, 1)").unwrap();
+    // And again at its commit, on the catalog another's commit moved since.
+    b.execute("CREATE TABLE c13 (k integer NOT NULL, PRIMARY KEY (k))")
+        .unwrap();
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(
+            &mut b,
+            "SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class \
+             WHERE relname IN ('a13', 'b13', 'b13_v', 'c13')"
+        ),
+        ["a13,b13,b13_v,c13"]
+    );
+    drop((a, b));
+    let mut c = Snail::open_writing(&path).unwrap();
+    assert_eq!(
+        rows(
+            &mut c,
+            "SELECT (SELECT count(*) FROM a13) || ',' || (SELECT count(*) FROM b13)"
+        ),
+        ["1,1"]
+    );
 }

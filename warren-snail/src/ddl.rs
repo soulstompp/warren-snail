@@ -2167,6 +2167,20 @@ fn bare(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
+/// PostgreSQL's refusal of a type of a name a type stands under.
+fn type_taken(name: &str) -> Error {
+    Error::new(format!("type \"{}\" already exists", bare(name)))
+}
+
+/// PostgreSQL's refusal of a relation whose row type would take the name a type stands under.
+fn row_type_taken(name: &str) -> Error {
+    Error::new(format!(
+        "type \"{}\" already exists\nHINT:  A relation has an associated type of the same name, so \
+         you must use a name that doesn't conflict with any existing type.",
+        bare(name)
+    ))
+}
+
 fn qualified(schema: &str, name: &str) -> String {
     if schema.is_empty() {
         name.to_string()
@@ -3023,23 +3037,21 @@ impl Draft {
         })
     }
 
-    fn type_named(&self, name: &str) -> Option<&'static str> {
-        if self.types.iter().any(|t| t.name == name) {
-            return Some("type");
-        }
-        if self.types.iter().any(|t| match &t.kind {
-            TypeKind::Range(r) => r.multirange == name,
-            _ => false,
-        }) {
-            return Some("multirange");
-        }
-        if self.domains.iter().any(|d| d.name == name) {
-            return Some("domain");
-        }
-        if self.table(name).is_some() {
-            return Some("table's row type");
-        }
-        None
+    /// Whether a type of the name stands: a type the DDL declares, a range's multirange, a domain,
+    /// or the row type of a table or a view.
+    fn type_named(&self, name: &str) -> bool {
+        self.types.iter().any(|t| {
+            t.name == name || matches!(&t.kind, TypeKind::Range(r) if r.multirange == name)
+        }) || self.domains.iter().any(|d| d.name == name)
+            || self.table(name).is_some()
+            || self.views.iter().any(|v| v.name == name)
+    }
+
+    /// Whether a composite type of the name stands, which PostgreSQL keeps as a relation too.
+    fn composite_named(&self, name: &str) -> bool {
+        self.types
+            .iter()
+            .any(|t| t.name == name && matches!(t.kind, TypeKind::Composite { .. }))
     }
 
     /// A type as the DDL names it, and the domain it names where it names one, whose base type it
@@ -3670,11 +3682,14 @@ impl Draft {
         {
             return refused("a clause beside its name, its columns and its question");
         }
-        if self.relation(schema_of(&name), bare(&name)) {
+        if self.relation(schema_of(&name), bare(&name)) || self.composite_named(&name) {
             if v.or_replace && self.views.iter().any(|x| x.name == name) {
                 return refused("OR REPLACE of a view that exists");
             }
             return Err(Error::new(format!("relation \"{}\" already exists", bare(&name))));
+        }
+        if self.type_named(&name) {
+            return Err(row_type_taken(&name));
         }
         let columns = v
             .columns
@@ -3772,11 +3787,8 @@ impl Draft {
                 }
             }
             Form::CreateType(t) => {
-                if let Some(k) = self.type_named(&t.name) {
-                    return Err(Error::new(format!(
-                        "type \"{}\" already exists, a {k}",
-                        t.name
-                    )));
+                if self.type_named(&t.name) {
+                    return Err(type_taken(&t.name));
                 }
                 if let TypeKind::Enum { labels } = &t.kind {
                     if let Some(l) = labels.iter().find(|l| l.len() > NAMEDATALEN - 1) {
@@ -3788,11 +3800,8 @@ impl Draft {
                     }
                 }
                 if let TypeKind::Range(r) = &t.kind {
-                    if self.type_named(&r.multirange).is_some() {
-                        return Err(Error::new(format!(
-                            "type \"{}\" already exists",
-                            r.multirange
-                        )));
+                    if self.type_named(&r.multirange) {
+                        return Err(type_taken(&r.multirange));
                     }
                     if let Some(k) = &r.collation {
                         self.collation_exists(k)?;
@@ -3883,11 +3892,8 @@ impl Draft {
                 }
             }
             Form::CreateDomain(mut d) => {
-                if let Some(k) = self.type_named(&d.name) {
-                    return Err(Error::new(format!(
-                        "type \"{}\" already exists, a {k}",
-                        d.name
-                    )));
+                if self.type_named(&d.name) {
+                    return Err(type_taken(&d.name));
                 }
                 if let Some(k) = &d.collation {
                     self.collation_exists(k)?;
@@ -4039,7 +4045,9 @@ impl Draft {
                 if_not_exists,
                 options,
             } => {
-                if self.relation(schema_of(&sequence.name), bare(&sequence.name)) {
+                if self.relation(schema_of(&sequence.name), bare(&sequence.name))
+                    || self.composite_named(&sequence.name)
+                {
                     if if_not_exists {
                         notices.push(format!(
                             "relation \"{}\" already exists, skipping",
@@ -4051,6 +4059,9 @@ impl Draft {
                         "relation \"{}\" already exists",
                         bare(&sequence.name)
                     )));
+                }
+                if self.type_named(&sequence.name) {
+                    return Err(row_type_taken(&sequence.name));
                 }
                 sequence.owned_by = self.owner(&sequence.name, &options, None)?;
                 self.push_sequence(sequence);
@@ -4874,15 +4885,18 @@ impl Draft {
             )));
         }
         let schema = schema_of(&name).to_string();
-        if self.table(&name).is_some() || self.relation(&schema, bare(&name)) {
+        if self.table(&name).is_some()
+            || self.relation(&schema, bare(&name))
+            || self.composite_named(&name)
+        {
             if t.if_not_exists {
                 notices.push(format!("relation \"{}\" already exists, skipping", bare(&name)));
                 return Ok(notices);
             }
             return Err(Error::new(format!("relation \"{}\" already exists", bare(&name))));
         }
-        if let Some(k) = self.type_named(&name) {
-            return Err(Error::new(format!("type \"{name}\" already exists, a {k}")));
+        if self.type_named(&name) {
+            return Err(row_type_taken(&name));
         }
         let mut columns: Vec<Column> = Vec::new();
         let mut keys: Vec<KeySpec> = Vec::new();

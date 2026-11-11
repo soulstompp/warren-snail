@@ -214,6 +214,8 @@ const SAID: &[(Words, &str)] = &[
         "2BP01",
     ),
     (Words::Holds("constraint \"", "\" already exists"), "42710"),
+    (Words::Holds("type \"", "\" already exists"), "42710"),
+    (Words::Holds("function \"", "\" already exists with same argument types"), "42723"),
     (Words::Holds("column \"", "\" does not exist"), "42703"),
     (Words::Holds("column ", " does not exist"), "42703"),
     (Words::Starts("operator does not exist: "), "42883"),

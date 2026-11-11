@@ -156,12 +156,15 @@ pub(super) struct Runs {
     replays: usize,
 }
 
-/// The catalog a statement or a transaction declared: the catalog it began from, its DDL now, and
-/// the orders it made, each empty until rows come.
+/// The catalog a statement or a transaction declared: the catalog as committed it declared on, its
+/// DDL now, its own statements, and the orders it made, each empty until rows come.
 #[derive(Clone)]
 pub(super) struct Declared {
     from: (Extent, u64),
     ddl: String,
+    /// Its own statements, each as `fold::folded` left it, in their order: what it declares again
+    /// on the catalog as committed, where another writer's commit moves it.
+    own: String,
     made: Vec<(String, String)>,
     /// The sequences it made or restarted, which stand where the DDL leaves them.
     resets: Vec<String>,
@@ -171,6 +174,16 @@ pub(super) struct Declared {
 }
 
 impl Declared {
+    /// The catalog as committed it declared on.
+    pub(super) fn from(&self) -> (Extent, u64) {
+        self.from
+    }
+
+    /// Its own statements, in their order.
+    pub(super) fn own(&self) -> &str {
+        &self.own
+    }
+
     /// The orders it made, by table and name.
     pub(super) fn made(&self) -> &[(String, String)] {
         &self.made
@@ -2922,14 +2935,28 @@ impl Snail {
         }
         w.use_free(free);
         let waiting: Vec<Run> = runs.into_iter().filter(|r| r.tag > 0).collect();
-        // The catalog declared: written afresh, each table it touches given the orders it declares,
-        // those it made empty.
-        if let Some(d) = self.declared.take() {
-            if root.catalog_named() != d.from {
-                return Err(Error::new(
-                    "the catalog was declared since by another writer",
-                ));
+        // The catalog declared: its statements declared again where another writer's commit moved
+        // the catalog since, then written afresh, each table it touches given the orders it
+        // declares, those it made empty.
+        self.replayed_on(&root)?;
+        // An order made on a table that rows another writer committed since now fill is refused,
+        // as one made on a table that holds rows is.
+        if let Some(d) = self.declared.as_ref() {
+            for (t, _) in &d.made {
+                for (a, b, top) in &root.orders {
+                    if a != t || d.taken_out.contains(&(a.clone(), b.clone())) {
+                        continue;
+                    }
+                    let (_, entries) = decode_top(&self.reader.read_extent(*top)?)?;
+                    if entries.iter().any(|e| e.rows > 0) {
+                        return Err(Error::new(format!(
+                            "{t}: it holds rows, so its columns and orders stay as written"
+                        )));
+                    }
+                }
             }
+        }
+        if let Some(d) = self.declared.take() {
             self.reader
                 .put_catalog(&mut root, d.ddl.as_bytes(), generation, w, &mut gone)?;
             root.monetary = crate::file::monetary_of(&self.catalog, &root.monetary);
@@ -4466,7 +4493,21 @@ impl Snail {
     /// A declaration: the catalog read again with the statement after its DDL, each order it makes
     /// or changes laid out, each a DROP takes out let go. Returns what PostgreSQL says of it.
     fn declare(&mut self, ddl: &str) -> Result<Vec<String>> {
-        let text = format!("{}\n{ddl};\n", self.catalog.ddl.trim_end());
+        // Its names are looked up, and its relations made, on the catalog as committed now: where
+        // another writer's commit moved it past the catalog the transaction declares on, the
+        // transaction's own statements are declared again on it first.
+        let newest = self.reader.peek_root()?;
+        let from = self
+            .declared
+            .as_ref()
+            .map_or(self.root.catalog_named(), |d| d.from);
+        let own = self.declared.as_ref().map_or("", |d| d.own.as_str());
+        if let Some(committed) = self.committed_ddl(&newest, from, own)? {
+            self.lay_over(committed)?;
+        }
+        let from = newest.catalog_named();
+        let base = format!("{}\n", self.catalog.ddl.trim_end());
+        let text = format!("{base}{ddl};\n");
         let kept = Catalog::statements_in(&self.catalog.ddl)?;
         let (format, root) = (self.reader.format(), &self.root);
         let prepared = |catalog: &mut Catalog| -> Result<()> {
@@ -4478,6 +4519,10 @@ impl Snail {
         // Each literal PostgreSQL keeps as its value where the statement is declared, kept so,
         // under the statement's zone and on its clock.
         let text = crate::deparse::fold::folded(&text, kept, kept, &prepared)?.into_owned();
+        let stated = text
+            .strip_prefix(base.as_str())
+            .ok_or_else(|| Error::new("the catalog's text moved as its last statement was read"))?
+            .to_string();
         let (mut catalog, said) = Catalog::parse_declared(&text, kept)?;
         prepared(&mut catalog)?;
         let mut made: Vec<(String, String)> = Vec::new();
@@ -4489,7 +4534,7 @@ impl Snail {
             // A strand made new is a change to the table it is of.
             if let (None, Some(of)) = (old, &t.elements_of) {
                 let source = self.catalog.table(of);
-                if source.map(|o| self.holds_rows(o)).transpose()? == Some(true) {
+                if source.map(|o| self.holds_rows_now(o, &newest)).transpose()? == Some(true) {
                     return Err(Error::new(format!(
                         "{of}: it holds rows, so its columns and orders stay as written"
                     )));
@@ -4521,7 +4566,7 @@ impl Snail {
                 }
             }
             if let (true, Some(o)) = (changed, old) {
-                if self.holds_rows(o)? {
+                if self.holds_rows_now(o, &newest)? {
                     return Err(Error::new(format!(
                         "{}: it holds rows, so its columns and orders stay as written",
                         t.name
@@ -4603,10 +4648,6 @@ impl Snail {
             let top = stage.place(&encode_top(&empty_head(t, o, self.reader.format()), &[]))?;
             orders.push((tn.clone(), on.clone(), top));
         }
-        let from = self
-            .declared
-            .as_ref()
-            .map_or(self.root.catalog_named(), |d| d.from);
         self.root.catalog = stage.place(text.as_bytes())?;
         if let Some(cut) = self.root.cut.as_mut() {
             cut.catalog_at = None;
@@ -4649,6 +4690,7 @@ impl Snail {
         let d = self.declared.get_or_insert(Declared {
             from,
             ddl: String::new(),
+            own: String::new(),
             made: Vec::new(),
             resets: Vec::new(),
             taken_out: Vec::new(),
@@ -4658,7 +4700,9 @@ impl Snail {
                 d.resets.push(r);
             }
         }
+        d.from = from;
         d.ddl = text;
+        d.own.push_str(&stated);
         // An order made and then taken out is made no more; one taken out and made again is made.
         d.made.retain(|m| !taken_out.contains(m));
         for t in taken_out {
@@ -4672,6 +4716,81 @@ impl Snail {
             }
         }
         Ok(said)
+    }
+
+    /// The transaction on `to`, the catalog as committed with its own statements declared on it:
+    /// its root given an order for each `to` declares, its own staged and its snapshot's where the
+    /// table stands as it read it, and empty, staged, where another writer made the table since or
+    /// changed its columns or orders, so that it reads none of their rows; a table another dropped
+    /// since given none. Refused where another's DDL since dropped or changed a table it wrote rows
+    /// of, as its commit is.
+    fn lay_over(&mut self, to: Catalog) -> Result<()> {
+        self.wrote_stand(&to)?;
+        let mut stage = self.reader.stage();
+        let mut orders: Vec<(String, String, Extent)> = Vec::new();
+        for t in &to.tables {
+            let same = self.catalog.table(&t.name).is_some_and(|x| x.same_shape(t));
+            for o in &t.orders {
+                let held = self
+                    .root
+                    .orders
+                    .iter()
+                    .find(|(a, b, _)| *a == t.name && *b == o.name)
+                    .filter(|_| same);
+                match held {
+                    Some(h) => orders.push(h.clone()),
+                    None => {
+                        let head = empty_head(t, o, self.reader.format());
+                        let top = stage.place(&encode_top(&head, &[]))?;
+                        orders.push((t.name.clone(), o.name.clone(), top));
+                    }
+                }
+            }
+        }
+        self.root.orders = orders;
+        self.renumbered(&to);
+        self.sequences_redeclared(&to);
+        self.catalog = to;
+        Ok(())
+    }
+
+    /// Refuses a catalog in which a table the transaction wrote rows of no longer stands as it
+    /// wrote them: dropped since, or its columns or orders changed.
+    fn wrote_stand(&self, to: &Catalog) -> Result<()> {
+        let rebased: Vec<&str> = self
+            .rebased
+            .keys()
+            .map(|&(ti, _)| self.catalog.tables[ti].name.as_str())
+            .collect();
+        for t in &self.catalog.tables {
+            let wrote = self.own.get(&t.name).is_some_and(|o| o.changed())
+                || rebased.contains(&t.name.as_str());
+            if wrote && !to.table(&t.name).is_some_and(|x| x.same_shape(t)) {
+                return Err(super::beside::concurrent_update());
+            }
+        }
+        Ok(())
+    }
+
+    /// The transaction's own statements declared again on the catalog the newest root names, which
+    /// another writer's commit moved past the one it declared on, as its commit writes them there:
+    /// refused in the words of the first refused, and where a table it wrote rows of no longer
+    /// stands as it wrote them.
+    fn replayed_on(&mut self, root: &Root) -> Result<()> {
+        let Some(d) = self.declared.as_ref() else {
+            return Ok(());
+        };
+        let Some(catalog) = self.committed_ddl(root, d.from, &d.own)? else {
+            return Ok(());
+        };
+        self.wrote_stand(&catalog)?;
+        self.renumbered(&catalog);
+        self.sequences_redeclared(&catalog);
+        let d = self.declared.as_mut().expect("a transaction that declared");
+        d.from = root.catalog_named();
+        d.ddl = catalog.ddl.clone();
+        self.catalog = catalog;
+        Ok(())
     }
 
     /// What the statement or the transaction under way holds of each table by its place, and of
@@ -4759,8 +4878,19 @@ impl Snail {
 
     /// Whether any order of a table holds a live row, as the round reads the file.
     fn holds_rows(&self, table: &Table) -> Result<bool> {
-        for (t, _, top) in &self.root.orders {
-            if *t == table.name {
+        self.orders_hold_rows(&self.root, &table.name)
+    }
+
+    /// Whether any order of a table holds a live row, as the round reads the file or as `newest`
+    /// names it: rows committed since the transaction's snapshot among them.
+    fn holds_rows_now(&self, table: &Table, newest: &Root) -> Result<bool> {
+        Ok(self.holds_rows(table)? || self.orders_hold_rows(newest, &table.name)?)
+    }
+
+    /// Whether any order of the table of that name holds a live row on `root`.
+    fn orders_hold_rows(&self, root: &Root, table: &str) -> Result<bool> {
+        for (t, _, top) in &root.orders {
+            if t == table {
                 let (_, entries) = decode_top(&self.reader.read_extent(*top)?)?;
                 if entries.iter().any(|e| e.rows > 0) {
                     return Ok(true);
