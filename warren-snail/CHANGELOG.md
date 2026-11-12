@@ -48,8 +48,11 @@ at once, and a snail written inside a host that decides its commits.
 - **A file's own objects have OIDs,** handed out from 16384 in the order its DDL makes them and kept as
   the file grows, so a `regclass`, `regtype`, `regnamespace`, `regcollation`, `regproc` or
   `regprocedure` value names one as PostgreSQL names it: `'t'::regclass`, `'s.u_pkey'::regclass`,
-  `'mood[]'::regtype`, a name the search path does not find first qualified by its schema. Across
-  several snails, which each count from 16384, such an OID is refused by name.
+  `'mood[]'::regtype`, a name the search path does not find first qualified by its schema. Its
+  writers take them from one counter as each statement is declared, so an object keeps the OID it
+  was given whichever transaction commits first, and a rolled-back transaction's are never given
+  again; the DDL stays as written, the root recording each statement whose OIDs depart from its
+  order. Across several snails, which each count from 16384, such an OID is refused by name.
 - **`tableoid` and `ctid`:** a table's OID, and a row's address in the generation its statement reads,
   the first page its block owns and the row's place there from 1. A ctid compared with one from outside
   the statement is refused by name, since a prune moves a live row; `xmin`, `xmax`, `cmin` and `cmax`

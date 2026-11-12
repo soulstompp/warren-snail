@@ -3116,7 +3116,17 @@ impl Catalog {
     /// library collation they name taken by a build without the feature `collations`, and refused
     /// only where it is used.
     pub fn parse_kept(ddl: &str, kept: usize) -> Result<Catalog> {
-        let reading = crate::ddl::read_ddl_kept(ddl, true, kept)?;
+        Self::parse_recorded(ddl, kept, &[])
+    }
+
+    /// The file's DDL read whole, as `parse_kept` reads it, each statement its root's record names
+    /// given its OIDs from the first the record gives it.
+    pub(crate) fn parse_recorded(
+        ddl: &str,
+        kept: usize,
+        record: &crate::oids::Record,
+    ) -> Result<Catalog> {
+        let reading = crate::ddl::read_ddl_recorded(ddl, kept, record)?;
         match reading.statements.iter().find_map(|s| s.refused.as_ref()) {
             Some(why) => Err(Error::new(why.clone())),
             None => Ok(Catalog {
@@ -3126,10 +3136,14 @@ impl Catalog {
         }
     }
 
-    /// `parse_kept`, with what PostgreSQL says of the DDL's last statement, the one a session
+    /// `parse_recorded`, with what PostgreSQL says of the DDL's last statement, the one a session
     /// declares: what IF [NOT] EXISTS passed over, what a DROP took with it.
-    pub(crate) fn parse_declared(ddl: &str, kept: usize) -> Result<(Catalog, Vec<String>)> {
-        let reading = crate::ddl::read_ddl_kept(ddl, true, kept)?;
+    pub(crate) fn parse_declared(
+        ddl: &str,
+        kept: usize,
+        record: &crate::oids::Record,
+    ) -> Result<(Catalog, Vec<String>)> {
+        let reading = crate::ddl::read_ddl_recorded(ddl, kept, record)?;
         if let Some(why) = reading.statements.iter().find_map(|s| s.refused.as_ref()) {
             return Err(Error::new(why.clone()));
         }

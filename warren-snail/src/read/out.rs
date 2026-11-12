@@ -257,9 +257,9 @@ fn statistics(physical: PhysicalType, range: Option<(Extreme, Extreme)>, nulls: 
 impl Snail {
     /// The snail written afresh at `to`, where no file may be yet, every order cut under the rules
     /// this build reads it under: each table out as `out` writes it, into a directory beside `to`,
-    /// then written back as `write` writes it, carrying where its sequences stand and the
-    /// `lc_monetary` of its money. The way across for an order cut under a collation's other
-    /// version, which is refused until re-cut.
+    /// then written back as `write` writes it, carrying where its sequences stand, the
+    /// `lc_monetary` of its money, and the OIDs its objects were given. The way across for an order
+    /// cut under a collation's other version, which is refused until re-cut.
     pub fn recut(&mut self, to: &Path) -> Result<Vec<crate::write::Written>> {
         if to.exists() {
             return Err(Error::new(format!("{} exists already", to.display())));
@@ -276,7 +276,10 @@ impl Snail {
 
     fn recut_through(&mut self, to: &Path, parts: &Path) -> Result<Vec<crate::write::Written>> {
         self.out(parts)?;
-        let catalog = crate::catalog::Catalog::parse_kept(&self.catalog.ddl, usize::MAX)?;
+        // Each object keeps its OID, so that every reg* value written back names what it named.
+        let record = self.reader.oid_record(&self.root)?;
+        let catalog =
+            crate::catalog::Catalog::parse_recorded(&self.catalog.ddl, usize::MAX, &record)?;
         let mut tables = Vec::new();
         let mut sources = Vec::new();
         for t in catalog.tables.iter().filter(|t| t.declared()) {
@@ -304,6 +307,8 @@ impl Snail {
             monetary: self.root.monetary.clone(),
             text_search: self.root.text_search().to_string(),
             replica: self.root.replica.clone(),
+            next_oid: self.root.next_oid,
+            oids: record,
         };
         crate::write::write_carried(
             to,

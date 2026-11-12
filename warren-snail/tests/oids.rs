@@ -329,3 +329,90 @@ fn several_snails_name_none_of_their_objects_by_oid() {
     let (r, _) = both.ask("SELECT 'pg_class'::regclass::oid::text").unwrap();
     assert_eq!(one_row(&r), ["1259"]);
 }
+
+/// A file whose table keeps a regclass, for the OIDs its writers' objects take.
+#[cfg(feature = "standalone")]
+fn keeping(name: &str) -> std::path::PathBuf {
+    let path = tmp(&format!("{name}.snail"));
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.keep (k integer NOT NULL, r regclass, PRIMARY KEY (k));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    path
+}
+
+#[cfg(feature = "standalone")]
+fn run(w: &mut Snail, sql: &str) {
+    w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_file_one_writer_made_records_no_statement() {
+    // One writer, its DDL in a transaction block and out of one: each object's OIDs follow the
+    // text, so the root keeps no counter and records no statement, as before them.
+    let path = keeping("oids-one-writer");
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in [
+        "CREATE TABLE s.a (id integer PRIMARY KEY)",
+        "BEGIN",
+        "CREATE TABLE s.b (id integer PRIMARY KEY)",
+        "CREATE SEQUENCE s.q",
+        "COMMIT",
+        "CREATE TABLE s.c (id integer PRIMARY KEY)",
+    ] {
+        run(&mut w, sql);
+    }
+    drop(w);
+    let root = warren_snail::file::Reader::open(&path).unwrap().root().unwrap();
+    assert_eq!((root.next_oid, root.oids.bytes), (0, 0));
+    let s = Snail::open(&path).unwrap();
+    assert!(s.catalog.oids.departures().is_empty());
+    let all: Vec<u32> = s.catalog.oids.each().map(|(oid, _)| oid).collect();
+    assert_eq!(all, (16384..s.catalog.oids.next()).collect::<Vec<_>>());
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn recut_keeps_each_object_s_oid() {
+    // A transaction's table committed after another's, so that the root records both: recut, each
+    // keeps its OID, and the regclass the first stored still names it.
+    let path = keeping("oids-recut");
+    let (mut a, mut b) = (Snail::open_writing(&path).unwrap(), Snail::open_writing(&path).unwrap());
+    run(&mut a, "BEGIN");
+    run(&mut a, "CREATE TABLE s.o1 (id integer PRIMARY KEY)");
+    run(&mut a, "INSERT INTO s.keep (k, r) VALUES (1, 's.o1')");
+    run(&mut b, "CREATE TABLE s.o2 (id integer PRIMARY KEY)");
+    run(&mut a, "COMMIT");
+    drop(b);
+    let to = tmp("oids-recut-to.snail");
+    a.recut(&to).unwrap();
+    let sql = "SELECT r::text, ('s.o1'::regclass::oid < 's.o2'::regclass::oid)::text FROM s.keep";
+    let mut r = Snail::open(&to).unwrap();
+    let (x, _) = r.ask(sql, None).unwrap();
+    assert_eq!(one_row(&x), ["s.o1", "true"]);
+    let from = Snail::open(&path).unwrap();
+    assert_eq!(r.catalog.oids.departures(), from.catalog.oids.departures());
+    assert_eq!(r.catalog.oids.departures().len(), 2);
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_snail_of_format_8_gives_oids_in_its_text_s_order() {
+    // Its root holds no counter (ledgers/w10-plan.md, reading 1): a transaction's own table takes
+    // its OIDs after another's committed since, as the text gives them, and nothing is recorded.
+    let path = tmp("oids-format-8-writers.snail");
+    let catalog = Catalog::parse("CREATE TABLE t (id bigint PRIMARY KEY, n text);").unwrap();
+    warren_snail::write::write_format_eight(&path, &catalog, &[], span()).unwrap();
+    let (mut a, mut b) = (Snail::open_writing(&path).unwrap(), Snail::open_writing(&path).unwrap());
+    run(&mut a, "BEGIN");
+    run(&mut a, "CREATE TABLE o1 (id bigint PRIMARY KEY)");
+    run(&mut b, "CREATE TABLE o2 (id bigint PRIMARY KEY)");
+    run(&mut a, "COMMIT");
+    drop((a, b));
+    let mut r = Snail::open(&path).unwrap();
+    let (x, _) = r
+        .ask("SELECT ('o2'::regclass::oid < 'o1'::regclass::oid)::text", None)
+        .unwrap();
+    assert_eq!(one_row(&x), ["true"]);
+    let root = warren_snail::file::Reader::open(&path).unwrap().root().unwrap();
+    assert_eq!((root.next_oid, root.oids.bytes), (0, 0));
+}

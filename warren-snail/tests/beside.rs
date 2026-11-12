@@ -11,7 +11,7 @@ use warren_snail::catalog::Catalog;
 use warren_snail::read::{Done, Snail};
 use warren_snail::values::{push_datum, Values};
 use warren_snail::write::Rows;
-use weather::{one, tmp, write};
+use weather::{cell, one, tmp, write};
 
 const DDL: &str = "CREATE SCHEMA s; CREATE TABLE s.t (id integer NOT NULL, v integer NOT NULL, PRIMARY KEY (id));";
 const ROWS: i32 = 2048;
@@ -1062,6 +1062,129 @@ fn at_read_committed_a_transaction_after_its_own_ddl_reads_each_statement_on_the
     assert_eq!(count(&mut r, "SELECT sum(u.id) FROM s.u2 u"), 5);
     assert_eq!(count(&mut r, "SELECT sum(o.id) FROM s.own2 o"), 7);
     assert_eq!(count(&mut r, "SELECT count(*) FROM s.n2 n"), 1);
+}
+
+/// A file whose table keeps a regclass, for the OIDs two writers' objects take.
+fn keeping(name: &str) -> PathBuf {
+    let path = tmp(&format!("beside-{name}.snail"));
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.keep (k integer NOT NULL, r regclass, PRIMARY KEY (k));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    path
+}
+
+/// The first column of an answer, each cell as text.
+fn texts_of(w: &mut Snail, sql: &str) -> Vec<String> {
+    let (b, _) = w.ask(sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    (0..b.num_rows())
+        .map(|r| cell(b.column(0).as_ref(), r).unwrap_or_default())
+        .collect()
+}
+
+/// The OID of one of the file's relations.
+fn oid_of(w: &mut Snail, name: &str) -> u32 {
+    texts_of(w, &format!("SELECT '{name}'::regclass::oid::text"))[0]
+        .parse()
+        .unwrap()
+}
+
+const MADE: &str = "(id integer NOT NULL, PRIMARY KEY (id))";
+
+#[test]
+fn a_transaction_s_own_objects_keep_the_oids_they_were_given() {
+    // As 18.6 answers (ledgers/w10-plan.md, A and B): its own table before one another made since
+    // by OID, and the regclass it stored naming its own, before its COMMIT, after it and in the
+    // file opened again.
+    for (level, a, b) in [("READ COMMITTED", "o1", "o2"), ("REPEATABLE READ", "p1", "p2")] {
+        let path = keeping(&format!("own-oids-{a}"));
+        let (mut w0, mut w1) = (open(&path), open(&path));
+        run(&mut w0, &format!("BEGIN ISOLATION LEVEL {level}"));
+        run(&mut w0, &format!("CREATE TABLE s.{a} {MADE}"));
+        run(&mut w0, &format!("INSERT INTO s.keep (k, r) VALUES (1, 's.{a}')"));
+        run(&mut w1, &format!("CREATE TABLE s.{b} {MADE}"));
+        let before = format!("SELECT ('s.{a}'::regclass::oid < 's.{b}'::regclass::oid)::text");
+        let kept = "SELECT r::text FROM s.keep";
+        let listed = format!(
+            "SELECT relname::text FROM pg_class WHERE relname IN ('{a}', '{b}') ORDER BY oid"
+        );
+        assert_eq!(texts_of(&mut w0, &before), ["true"], "{level}");
+        assert_eq!(texts_of(&mut w0, kept), [format!("s.{a}")], "{level}");
+        // At REPEATABLE READ its snapshot's rows hold its own alone, as 18.6's.
+        let seen: Vec<&str> = match level {
+            "READ COMMITTED" => vec![a, b],
+            _ => vec![a],
+        };
+        assert_eq!(texts_of(&mut w0, &listed), seen, "{level}");
+        run(&mut w0, "COMMIT");
+        for w in [&mut w1, &mut w0] {
+            assert_eq!(texts_of(w, &before), ["true"], "{level}");
+            assert_eq!(texts_of(w, kept), [format!("s.{a}")], "{level}");
+            assert_eq!(texts_of(w, &listed), [a, b], "{level}");
+        }
+        drop((w0, w1));
+        let mut r = Snail::open(&path).unwrap();
+        assert_eq!(texts_of(&mut r, &before), ["true"], "{level}");
+        assert_eq!(texts_of(&mut r, kept), [format!("s.{a}")], "{level}");
+    }
+}
+
+#[test]
+fn a_rolled_back_transaction_s_oids_are_not_given_again() {
+    // As 18.6 answers (ledgers/w10-plan.md, C): another's object and its own made after a ROLLBACK,
+    // and after a ROLLBACK TO, each past the OIDs the one rolled back took; and so the next writer
+    // to open once every writer closed.
+    let path = keeping("rolled-back-oids");
+    let (mut w0, mut w1) = (open(&path), open(&path));
+    run(&mut w0, "BEGIN");
+    run(&mut w0, &format!("CREATE TABLE s.r1 {MADE}"));
+    let r1 = oid_of(&mut w0, "s.r1");
+    run(&mut w0, "ROLLBACK");
+    run(&mut w1, &format!("CREATE TABLE s.r2 {MADE}"));
+    run(&mut w0, &format!("CREATE TABLE s.r3 {MADE}"));
+    assert!(oid_of(&mut w0, "s.r2") > r1 && oid_of(&mut w1, "s.r3") > r1);
+    run(&mut w0, "BEGIN");
+    run(&mut w0, "SAVEPOINT a");
+    run(&mut w0, &format!("CREATE TABLE s.q1 {MADE}"));
+    let q1 = oid_of(&mut w0, "s.q1");
+    run(&mut w0, "ROLLBACK TO a");
+    run(&mut w0, &format!("CREATE TABLE s.q2 {MADE}"));
+    assert!(oid_of(&mut w0, "s.q2") > q1);
+    run(&mut w0, "COMMIT");
+    assert!(oid_of(&mut w1, "s.q2") > q1);
+    run(&mut w0, "BEGIN");
+    run(&mut w0, &format!("CREATE TABLE s.x1 {MADE}"));
+    let x1 = oid_of(&mut w0, "s.x1");
+    run(&mut w0, "ROLLBACK");
+    drop((w0, w1));
+    let mut w2 = open(&path);
+    run(&mut w2, &format!("CREATE TABLE s.x2 {MADE}"));
+    assert!(oid_of(&mut w2, "s.x2") > x1);
+}
+
+#[test]
+fn transactions_taking_turns_keep_their_oids() {
+    // As 18.6 answers (ledgers/w10-plan.md, D): two transaction blocks, the second committing
+    // first, their tables by OID as each was made; the root records the two whose OIDs depart from
+    // the text's order, and the third goes on from it.
+    let path = keeping("turns-oids");
+    let (mut w0, mut w1) = (open(&path), open(&path));
+    run(&mut w0, "BEGIN");
+    run(&mut w0, &format!("CREATE TABLE s.u1 {MADE}"));
+    run(&mut w1, "BEGIN");
+    run(&mut w1, &format!("CREATE TABLE s.u2 {MADE}"));
+    run(&mut w1, "COMMIT");
+    run(&mut w0, &format!("CREATE TABLE s.u3 {MADE}"));
+    run(&mut w0, "COMMIT");
+    let listed = "SELECT relname::text FROM pg_class WHERE relname IN ('u1', 'u2', 'u3') ORDER BY oid";
+    assert_eq!(texts_of(&mut w1, listed), ["u1", "u2", "u3"]);
+    drop((w0, w1));
+    let mut r = Snail::open(&path).unwrap();
+    assert_eq!(texts_of(&mut r, listed), ["u1", "u2", "u3"]);
+    // The text: the schema, s.keep, then u2, u1 and u3 as they committed.
+    let places: Vec<u32> = r.catalog.oids.departures().iter().map(|d| d.0).collect();
+    assert_eq!(places, [2, 3]);
+    let root = warren_snail::file::Reader::open(&path).unwrap().root().unwrap();
+    assert_eq!((root.next_oid, root.oids.bytes), (0, 4 + 2 * 8));
+    r.census().unwrap();
 }
 
 #[test]

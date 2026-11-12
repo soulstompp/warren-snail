@@ -581,6 +581,8 @@ pub struct Snail {
     checking: Option<(usize, Vec<(String, sqlparser::ast::Expr)>)>,
     /// The sequences' states a commit at the root's turn writes.
     advancing: Option<Vec<crate::file::SequenceState>>,
+    /// The OID counter a commit at the root's turn writes, past the OIDs a statement took from it.
+    taking: Option<u32>,
     /// Where the snail is open to write, what its writer shares among the snails it writes, and
     /// the snail's place among them.
     group: Option<(std::rc::Rc<across::Group>, usize)>,
@@ -886,6 +888,7 @@ impl Snail {
             dry: None,
             checking: None,
             advancing: None,
+            taking: None,
             group: None,
             deciding: None,
             touched: Default::default(),
@@ -987,7 +990,8 @@ impl Snail {
     fn catalog(reader: &Reader, root: &Root) -> Result<Catalog> {
         let ddl = String::from_utf8(reader.catalog_text(root)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
-        let mut catalog = Catalog::parse_kept(&ddl, usize::MAX)?;
+        let record = reader.oid_record(root)?;
+        let mut catalog = Catalog::parse_recorded(&ddl, usize::MAX, &record)?;
         old_names(&mut catalog, reader.format());
         catalog.with_release(root.release)?;
         catalog.with_monetary(&root.monetary)?;
@@ -997,16 +1001,36 @@ impl Snail {
     }
 
     /// The catalog `newest` names, where a commit moved it past `from`, with `own` declared on it:
-    /// what a transaction's statements, `own` among them, name as committed. Refused in the words
-    /// of the first of `own` refused there.
-    fn committed_ddl(&self, newest: &Root, from: (Extent, u64), own: &str) -> Result<Option<Catalog>> {
+    /// what a transaction's statements, `own` among them, name as committed, each of them `given`
+    /// names keeping the OIDs it took (`own_on`). Refused in the words of the first of `own`
+    /// refused there.
+    fn committed_ddl(
+        &self,
+        newest: &Root,
+        from: (Extent, u64),
+        own: &str,
+        given: &[change::Took],
+    ) -> Result<Option<Catalog>> {
         if newest.catalog_named() == from {
             return Ok(None);
         }
+        self.own_on(newest, own, given).map(Some)
+    }
+
+    /// The catalog `newest` names with `own` declared on it, each of its statements `given` names,
+    /// by its place among them, taking its OIDs from the first it took; the root's record read with
+    /// the text.
+    fn own_on(&self, newest: &Root, own: &str, given: &[change::Took]) -> Result<Catalog> {
         let committed = String::from_utf8(self.reader.catalog_text(newest)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
         let text = format!("{}\n{own}", crate::ddl::ended(&committed)?.trim_end());
-        let mut catalog = Catalog::parse_kept(&text, usize::MAX)?;
+        let mut record = self.reader.oid_record(newest)?;
+        if !given.is_empty() {
+            let at = Catalog::statements_in(&committed)?;
+            record.extend(given.iter().map(|t| ((at + t.place) as u32, t.first)));
+            record.sort_unstable();
+        }
+        let mut catalog = Catalog::parse_recorded(&text, usize::MAX, &record)?;
         old_names(&mut catalog, self.reader.format());
         catalog.with_release(newest.release)?;
         catalog.with_monetary(&crate::file::monetary_of(&catalog, &newest.monetary))?;
@@ -1016,7 +1040,7 @@ impl Snail {
         for t in &catalog.tables {
             crate::file::holds(self.reader.format(), t)?;
         }
-        Ok(Some(catalog))
+        Ok(catalog)
     }
 
     /// Begins a round after the first: the root read afresh, and the catalog read again if the file
@@ -2308,6 +2332,10 @@ impl Snail {
         // The serializable transactions' records, while a round older than their commits runs.
         if self.root.serial.bytes > 0 {
             mark(self.root.serial, 1)?;
+        }
+        // The record of the statements whose OIDs depart from the catalog's text's order.
+        if self.root.oids.bytes > 0 {
+            mark(self.root.oids, 1)?;
         }
         // The roots each decision across snails carries.
         for d in &self.root.decided {

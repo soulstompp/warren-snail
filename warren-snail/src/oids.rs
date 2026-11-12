@@ -2,7 +2,10 @@
 //! it makes each; a snail does the same, as its DDL makes each object, in the order of its
 //! statements, so that a reg* value of one names it (`'t'::regclass`). The DDL is kept in the file,
 //! and read again statement by statement as the file opens, so each object comes back to the OID it
-//! was given. An OID is never handed out again: an object dropped takes its number with it.
+//! was given. Two writers of one file take their OIDs from one counter as each statement is
+//! declared, and commit in either order: the root records each statement whose OIDs depart from
+//! the text's order, and reading the text gives it those. An OID is never handed out again: an
+//! object dropped, or a transaction rolled back, takes its numbers with it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -110,13 +113,32 @@ pub fn parts(name: &str) -> (&str, &str) {
 pub struct Oids {
     by_object: HashMap<Object, u32>,
     by_oid: BTreeMap<u32, Object>,
+    /// Where the text goes on: past every OID a statement read so far was given.
     next: u32,
     /// Whether the DDL dropped the release's schema `public`, whose OID is 2200: a `public` made
     /// again is the file's own, with an OID the DDL hands it.
     public_dropped: bool,
     /// The descriptions COMMENT ON gave the file's objects, as pg_description holds them.
     described: Vec<Described>,
+    /// Each statement that handed out OIDs, in the text's order.
+    runs: Vec<Run>,
+    /// Why the record the text was read with does not fit it, where it does not.
+    misfit: Option<String>,
 }
+
+/// The OIDs one statement handed out: its place among the text's statements, the first, and how
+/// many, one after another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub place: u32,
+    pub first: u32,
+    pub n: u32,
+}
+
+/// The statements of a file's text whose OIDs depart from its order, as its root records them:
+/// each by its place, with its first OID, in the text's order. Every other statement takes the
+/// OIDs after the most the statements before it were given.
+pub type Record = [(u32, u32)];
 
 /// A description of one of the file's objects, as pg_description holds it: the object's OID, the
 /// catalog that holds it, its column's number or 0, and the text.
@@ -139,6 +161,8 @@ impl Default for Oids {
             next: FIRST,
             public_dropped: false,
             described: Vec::new(),
+            runs: Vec::new(),
+            misfit: None,
         }
     }
 }
@@ -203,9 +227,79 @@ impl Oids {
         self.by_oid.iter().map(|(o, x)| (*o, x))
     }
 
-    /// The next OID it would hand out.
+    /// The next OID it would hand out: past every OID the statements read were given.
     pub fn next(&self) -> u32 {
         self.next
+    }
+
+    /// Begins the statement at `place`, which takes its OIDs from `recorded` where the record
+    /// gives it one. Returns where the text went on before it, and its first OID.
+    pub(crate) fn begin(&mut self, recorded: Option<u32>) -> (u32, u32) {
+        let on = self.next;
+        if let Some(first) = recorded {
+            self.next = first;
+        }
+        (on, self.next)
+    }
+
+    /// Ends the statement at `place` begun so: its OIDs kept as its run, and the text going on past
+    /// the most given. A statement the record gives its first OID does not fit it where it hands
+    /// out none, or one a statement before it was given.
+    pub(crate) fn end(&mut self, place: usize, (on, first): (u32, u32), recorded: bool) {
+        let n = self.next - first;
+        let met = self
+            .runs
+            .iter()
+            .find(|r| recorded && r.first < first + n && first < r.first + r.n);
+        if let Some(r) = met {
+            self.misfit = Some(format!(
+                "the statement at {place} is given OIDs from {first}, among those of the statement at {}",
+                r.place
+            ));
+        } else if recorded && n == 0 {
+            self.misfit = Some(format!("the statement at {place} hands out no OID"));
+        }
+        if n > 0 {
+            self.runs.push(Run {
+                place: place as u32,
+                first,
+                n,
+            });
+        }
+        self.next = self.next.max(on);
+    }
+
+    /// Why the record it was read with does not fit the text, where it does not.
+    pub(crate) fn misfit(&self) -> Option<&str> {
+        self.misfit.as_deref()
+    }
+
+    /// The OIDs the statement at `place` handed out, where it handed out any.
+    pub fn run_at(&self, place: usize) -> Option<Run> {
+        self.runs.iter().rev().find(|r| r.place as usize == place).copied()
+    }
+
+    /// Where the text goes on before the statement at `place`: past every OID the statements before
+    /// it were given.
+    pub fn going_on_at(&self, place: usize) -> u32 {
+        self.runs
+            .iter()
+            .take_while(|r| (r.place as usize) < place)
+            .fold(FIRST, |on, r| on.max(r.first + r.n))
+    }
+
+    /// The statements whose first OID is not where the text goes on before them: what the root
+    /// records.
+    pub fn departures(&self) -> Vec<(u32, u32)> {
+        let mut on = FIRST;
+        let mut out = Vec::new();
+        for r in &self.runs {
+            if r.first != on {
+                out.push((r.place, r.first));
+            }
+            on = on.max(r.first + r.n);
+        }
+        out
     }
 
     /// The descriptions of the file's objects, by OID, catalog and column.
@@ -347,6 +441,34 @@ mod tests {
         let v = Object::Class("public.v".into());
         o.settle(&[v.clone(), t.clone()], &[(u.clone(), v.clone())]);
         assert_eq!((o.of(&v), o.of(&u), o.next()), (Some(16385), None, 16387));
+    }
+
+    #[test]
+    fn a_recorded_statement_takes_its_oids_and_the_text_goes_on_past_the_most_given() {
+        use crate::catalog::Catalog;
+        // Three tables, each six OIDs (its relation, its row type, the type's array, its NOT NULL,
+        // its key and the key's index): u2 committed first, given 16390 to 16395 while u1 held
+        // 16384 to 16389; u3 took the next.
+        let ddl = "CREATE TABLE u2 (x integer PRIMARY KEY); CREATE TABLE u1 (x integer PRIMARY KEY); \
+                   CREATE TABLE u3 (x integer PRIMARY KEY);";
+        let read = Catalog::parse_recorded(ddl, usize::MAX, &[(0, 16390), (1, 16384)]).unwrap();
+        let of = |n: &str| read.oids.of(&Object::Class(format!("public.{n}"))).unwrap();
+        assert_eq!((of("u1"), of("u2"), of("u3")), (16384, 16390, 16396));
+        assert_eq!(read.oids.departures(), [(0, 16390), (1, 16384)]);
+        assert_eq!((read.oids.next(), read.oids.going_on_at(2)), (16402, 16396));
+        // Read with no record, the text's own order, which records nothing.
+        let plain = Catalog::parse_kept(ddl, usize::MAX).unwrap();
+        assert_eq!(plain.oids.of(&Object::Class("public.u2".into())), Some(16384));
+        assert!(plain.oids.departures().is_empty());
+        // A record that does not fit the text is refused: one OID given twice, a statement given
+        // OIDs that hands out none, a statement past the text.
+        let misfit = |ddl: &str, record: &[(u32, u32)]| {
+            Catalog::parse_recorded(ddl, usize::MAX, record).unwrap_err().to_string()
+        };
+        let twice = misfit(ddl, &[(1, 16385)]);
+        assert!(twice.starts_with("the file's record of its OIDs does not fit its catalog"), "{twice}");
+        misfit("CREATE TABLE a (x integer PRIMARY KEY); COMMENT ON TABLE a IS 'a';", &[(1, 16400)]);
+        misfit(ddl, &[(3, 16400)]);
     }
 
     #[test]

@@ -942,6 +942,11 @@ pub struct Carried {
     /// The file's `default_text_search_config`; `pg_catalog.simple` where it names none.
     pub text_search: String,
     pub replica: Option<String>,
+    /// The OID its writers take next, where it is past where its catalog's text goes on; 0 where
+    /// it is not.
+    pub next_oid: u32,
+    /// The statements of its catalog's text whose OIDs depart from its order (`oids::Record`).
+    pub oids: Vec<(u32, u32)>,
 }
 
 /// A new snail as `write_released` writes it, carrying over what `carried` holds of the snail its
@@ -1225,6 +1230,14 @@ fn write_tables(
             root.orders
                 .push((table.name.clone(), order.name.clone(), extent));
             out.push(written);
+        }
+    }
+    // The OIDs its writers take next, and the statements whose OIDs depart from its text's order,
+    // as the snail its rows came from had them.
+    if let Some(c) = carried.filter(|_| w.format() >= crate::file::FORMAT) {
+        root.next_oid = c.next_oid;
+        if !c.oids.is_empty() {
+            root.oids = w.place(&crate::file::encode_record(&c.oids))?;
         }
     }
     // What grows with the schema lies in pages of its own where the root would not hold it.

@@ -2553,6 +2553,10 @@ struct Draft {
     /// The descriptions COMMENT ON gave, each object by its OID, so that one dropped takes its own
     /// and one made again under its name has none.
     described: Vec<Description>,
+    /// The place of the statement now read among those taken.
+    at: usize,
+    /// The statements whose OIDs depart from the text's order, as the file's root records them.
+    record: Vec<(u32, u32)>,
 }
 
 /// What a COMMENT ON names: its object's OID, the catalog that holds it, and its column by name and
@@ -2959,9 +2963,21 @@ impl Draft {
         with_schemas
     }
 
-    /// The OIDs a statement just read hands out: to each object it made or touched. A statement
-    /// that drops or renames settles every object, those no longer standing giving their OIDs up.
+    /// The OIDs a statement just read hands out: to each object it made or touched, from where the
+    /// text goes on, or from the first the file's record gives the statement. A statement that drops
+    /// or renames settles every object, those no longer standing giving their OIDs up.
     fn settle(&mut self, before: Lens, kind: &str, object: &str, tokens: &[Token]) {
+        let recorded = self
+            .record
+            .binary_search_by_key(&(self.at as u32), |r| r.0)
+            .ok()
+            .map(|i| self.record[i].1);
+        let begun = self.oids.begin(recorded);
+        self.settled(before, kind, object, tokens);
+        self.oids.end(self.at, begun, recorded.is_some());
+    }
+
+    fn settled(&mut self, before: Lens, kind: &str, object: &str, tokens: &[Token]) {
         let renamed = std::mem::take(&mut self.renamed);
         let ws = words(tokens);
         let wide = !renamed.is_empty()
@@ -8020,8 +8036,29 @@ pub(crate) fn read_ddl_kept(ddl: &str, strict: bool, kept: usize) -> Result<Read
 
 /// Reads a DDL as `read_ddl_kept` does, each type's default operator classes `release`'s.
 pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> Result<Reading> {
+    read_ddl_given(ddl, strict, kept, release, &[])
+}
+
+/// Reads a file's DDL as `read_ddl_at` does, strictly, each statement `record` names taking its
+/// OIDs from the first it gives: refused where the record does not fit the text.
+pub(crate) fn read_ddl_recorded(
+    ddl: &str,
+    kept: usize,
+    record: &crate::oids::Record,
+) -> Result<Reading> {
+    read_ddl_given(ddl, true, kept, crate::regs::LATEST, record)
+}
+
+fn read_ddl_given(
+    ddl: &str,
+    strict: bool,
+    kept: usize,
+    release: u8,
+    record: &crate::oids::Record,
+) -> Result<Reading> {
     let mut draft = Draft {
         release,
+        record: record.to_vec(),
         ..Draft::default()
     };
     let mut statements: Vec<StatementRead> = Vec::new();
@@ -8039,6 +8076,7 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
             .and_then(|n| draft.no_schema_implied(before).map(|()| n));
         match &applied {
             Ok(_) => {
+                draft.at = taken.len();
                 draft.settle(before, &kind, &object, tokens);
                 draft.keep_named_schemas();
                 taken.push(at)
@@ -8048,7 +8086,8 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
                     release,
                     ..Draft::default()
                 };
-                for &i in &taken {
+                for (place, &i) in taken.iter().enumerate() {
+                    again.at = place;
                     again.kept = i < kept;
                     let (k, o) = head(&all[i]);
                     let before = again.lens();
@@ -8108,6 +8147,18 @@ pub(crate) fn read_ddl_at(ddl: &str, strict: bool, kept: usize, release: u8) -> 
         if stop {
             break;
         }
+    }
+    // A record that does not fit the text: the file's root and its catalog disagree.
+    let whole = statements.iter().all(|s| s.refused.is_none());
+    let past = draft
+        .record
+        .last()
+        .filter(|r| whole && r.0 as usize >= taken.len())
+        .map(|r| format!("it names a statement at {}, past the text's {}", r.0, taken.len()));
+    if let Some(why) = draft.oids.misfit().map(str::to_string).or(past) {
+        return Err(Error::new(format!(
+            "the file's record of its OIDs does not fit its catalog: {why}"
+        )));
     }
     // Each type the DDL declares is held whether a column names it or not, so a cast can name it.
     for t in &draft.types {

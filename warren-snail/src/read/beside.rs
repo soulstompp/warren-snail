@@ -834,7 +834,7 @@ impl Snail {
             Some(d) => {
                 // Where another writer's commit moved the catalog since, its statements are
                 // declared again there, and a table it wrote rows of stands as it wrote them.
-                if let Some(catalog) = self.committed_ddl(&root, d.from(), d.own())? {
+                if let Some(catalog) = self.committed_ddl(&root, d.from(), d.own(), d.given())? {
                     for name in own.keys() {
                         let (Some(a), Some(b)) = (self.catalog.table(name), catalog.table(name))
                         else {

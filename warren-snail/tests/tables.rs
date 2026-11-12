@@ -529,6 +529,7 @@ mod written {
             let cut = n == MANY;
             let path = written(&format!("rolled-{kind}"), n, &[1]);
             let twin = written(&format!("rolled-{kind}-twin"), n, &[1]);
+            let bare = written(&format!("rolled-{kind}-bare"), n, &[1]);
             assert_eq!(is_cut(&path), cut);
             let named = whole(&path);
             let mut w = Snail::open_writing(&path).unwrap();
@@ -544,7 +545,22 @@ mod written {
             w.execute(&insert(2, 1)).unwrap();
             let done = w.execute("COMMIT").unwrap();
             drop(w);
+            // Its twin makes the same tables in its savepoint and rolls them back, writing them no
+            // row: each declaration took its OIDs at the root's turn, a commit of its own, as
+            // PostgreSQL's are never given back, so the two files are alike to the byte.
             let mut other = Snail::open_writing(&twin).unwrap();
+            for st in ["BEGIN", &insert(1, 1001), "SAVEPOINT a"] {
+                other.execute(st).unwrap();
+            }
+            make(&mut other, "gone", PAST);
+            for st in ["ROLLBACK TO a", &insert(2, 1)] {
+                other.execute(st).unwrap();
+            }
+            let twinned = other.execute("COMMIT").unwrap();
+            drop(other);
+            // And the commit writes what one that never declared them writes, but for those
+            // generations and the counter its root keeps past the OIDs they took.
+            let mut other = Snail::open_writing(&bare).unwrap();
             for st in ["BEGIN", &insert(1, 1001), &insert(2, 1)] {
                 other.execute(st).unwrap();
             }
@@ -552,8 +568,14 @@ mod written {
             drop(other);
             assert_eq!(
                 (done.generation, done.pages_written, done.pages_reused),
-                (plain.generation, plain.pages_written, plain.pages_reused)
+                (twinned.generation, twinned.pages_written, twinned.pages_reused)
             );
+            assert_eq!(
+                (done.generation, done.pages_written, done.pages_reused),
+                (plain.generation + PAST as u64, plain.pages_written, plain.pages_reused)
+            );
+            let counter = |p: &Path| Reader::open(p).unwrap().root().unwrap().next_oid;
+            assert!(counter(&path) > 0 && counter(&bare) == 0);
             assert_eq!(is_cut(&path), cut);
             assert_eq!(whole(&path), whole(&twin));
             assert!(whole(&path) < named + 32);

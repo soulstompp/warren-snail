@@ -437,6 +437,13 @@ pub struct Root {
     /// Where the last of them stands on the clock the records of snails opened together share, so that
     /// commits have one order: format 9 only, 0 where none has been.
     pub clock: u64,
+    /// The next OID a writer of the file takes, where it is past where the catalog's text goes on:
+    /// a transaction's taken and not yet committed, or one's rolled back. Format 9 only, 0 where
+    /// the text's own is next.
+    pub next_oid: u32,
+    /// The statements of the catalog's text whose OIDs depart from its order, each by its place and
+    /// its first OID (`oids::Record`): format 9 only, none where every statement's follow the text.
+    pub oids: Extent,
     /// Where what grows with the schema lies once the root would not hold it: format 9 only.
     pub(crate) cut: Option<Cut>,
 }
@@ -650,6 +657,23 @@ pub fn decode_sequences(buf: &[u8]) -> Result<Vec<SequenceState>> {
         .collect()
 }
 
+/// The root's record of the statements whose OIDs depart from the text's order: each one's place
+/// and first OID.
+pub(crate) fn encode_record(record: &crate::oids::Record) -> Vec<u8> {
+    let mut o = Out::default();
+    o.u32(record.len() as u32);
+    for (place, first) in record {
+        o.u32(*place);
+        o.u32(*first);
+    }
+    o.0
+}
+
+pub(crate) fn decode_record(buf: &[u8]) -> Result<Vec<(u32, u32)>> {
+    let mut i = In::new(buf);
+    (0..i.u32()?).map(|_| Ok((i.u32()?, i.u32()?))).collect()
+}
+
 /// The free map as a snail of the current format holds it: its runs, then each page of packed page
 /// maps some of whose maps a commit has stopped naming, with how many. A snail of format 7 holds the
 /// runs alone.
@@ -850,7 +874,9 @@ impl Root {
             let searched = self.text_search() != TEXT_SEARCH;
             let records = u8::from(self.serial.bytes > 0) * 2
                 + u8::from(self.clock > 0) * 4
-                + u8::from(searched) * 8;
+                + u8::from(searched) * 8
+                + u8::from(self.next_oid > 0) * 16
+                + u8::from(self.oids.bytes > 0) * 32;
             match &self.pending {
                 None => o.u8(records),
                 Some(p) => {
@@ -867,6 +893,12 @@ impl Root {
             }
             if searched {
                 o.str(self.text_search());
+            }
+            if self.next_oid > 0 {
+                o.u32(self.next_oid);
+            }
+            if self.oids.bytes > 0 {
+                o.extent(self.oids);
             }
             // A root marked a replica carries its source, then whether its host tagged it.
             match &self.replica {
@@ -907,6 +939,11 @@ impl Root {
             )));
         } else if self.serial.bytes > 0 {
             return Err(serial_refused(format));
+        } else if self.next_oid > 0 || self.oids.bytes > 0 {
+            return Err(Error::new(format!(
+                "a snail of format {format} gives its objects their OIDs in its text's order alone: \
+                 `out`, then `write`"
+            )));
         }
         let crc = crc32fast::hash(&o.0);
         o.u32(crc);
@@ -977,7 +1014,9 @@ impl Root {
         } else {
             String::new()
         };
-        let (decided, pending, serial, clock, text_search) = if format >= FORMAT && !ended(&i) {
+        let ((decided, pending, serial, clock, text_search), (next_oid, oids)) = if format >= FORMAT
+            && !ended(&i)
+        {
             let n = i.u32().ok()? as usize;
             let mut decided = Vec::with_capacity(n.min(256));
             for _ in 0..n {
@@ -1014,9 +1053,20 @@ impl Root {
                 0 => String::new(),
                 _ => i.str().ok()?,
             };
-            (decided, pending, serial, clock, text_search)
+            let next_oid = match marks & 16 {
+                0 => 0,
+                _ => i.u32().ok()?,
+            };
+            let oids = match marks & 32 {
+                0 => Extent::default(),
+                _ => i.extent().ok()?,
+            };
+            ((decided, pending, serial, clock, text_search), (next_oid, oids))
         } else {
-            (Vec::new(), None, Extent::default(), 0, String::new())
+            (
+                (Vec::new(), None, Extent::default(), 0, String::new()),
+                (0, Extent::default()),
+            )
         };
         // A root its host tagged carries the tag last; one marked a replica carries its source,
         // then whether its host tagged it.
@@ -1057,6 +1107,8 @@ impl Root {
             replica,
             serial,
             clock,
+            next_oid,
+            oids,
             cut,
         };
         // A list of tables its top holds whole is read with the root.
@@ -1648,6 +1700,34 @@ impl Reader {
                 .flat_map(|(_, v)| v)
                 .collect()),
         }
+    }
+
+    /// The statements of the catalog's text whose OIDs depart from its order, as the root records
+    /// them.
+    pub(crate) fn oid_record(&self, root: &Root) -> Result<Vec<(u32, u32)>> {
+        if root.oids.bytes == 0 {
+            return Ok(Vec::new());
+        }
+        decode_record(&self.read_extent(root.oids)?)
+    }
+
+    /// The record of the statements whose OIDs depart from the text's order, written over the one
+    /// `root` names: in pages of its own, none where it is empty.
+    pub(crate) fn put_oid_record(
+        &self,
+        root: &mut Root,
+        record: &crate::oids::Record,
+        w: &mut dyn Place,
+        gone: &mut Vec<Extent>,
+    ) -> Result<()> {
+        if root.oids.bytes > 0 {
+            gone.push(root.oids);
+        }
+        root.oids = match record.is_empty() {
+            true => Extent::default(),
+            false => w.place(&encode_record(record))?,
+        };
+        Ok(())
     }
 
     /// Where each sequence stands that has handed out a value, as the root names them.
@@ -2840,6 +2920,50 @@ mod tests {
             .to_string();
             assert!(e.contains("is marked a replica of no source"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_root_reads_back_its_oid_counter_and_record_and_formats_seven_and_eight_take_neither() {
+        let record = Extent {
+            start: 40,
+            bytes: 24,
+        };
+        for (next_oid, oids) in [(0, Extent::default()), (16400, Extent::default()), (0, record), (16400, record)] {
+            for (replica, host) in [(None, None), (Some("mysql-1"), Some(9)), (None, Some(7))] {
+                let mut p = Root {
+                    generation: 5,
+                    text_search: "pg_catalog.english".into(),
+                    next_oid,
+                    oids,
+                    host,
+                    replica: replica.map(str::to_string),
+                    ..Default::default()
+                }
+                .encode(FORMAT)
+                .unwrap();
+                p.resize(PAGE, 0);
+                let (r, _) = Root::decode(&p).unwrap();
+                assert_eq!(
+                    (r.next_oid, r.oids, r.text_search.as_str(), r.replica.as_deref(), r.host),
+                    (next_oid, oids, "pg_catalog.english", replica, host)
+                );
+            }
+        }
+        // A root whose counter and record are the text's own is written as before them.
+        let plain = Root::default().encode(FORMAT).unwrap();
+        let counted = Root {
+            next_oid: 16400,
+            ..Default::default()
+        };
+        assert_eq!(counted.encode(FORMAT).unwrap().len(), plain.len() + 4);
+        for format in [FORMAT_SEVEN, FORMAT_EIGHT] {
+            for root in [counted.clone(), Root { oids: record, ..Default::default() }] {
+                let e = root.encode(format).unwrap_err().to_string();
+                assert!(e.contains("in its text's order alone"), "{e}");
+            }
+        }
+        let back = decode_record(&encode_record(&[(3, 16391), (7, 16384)])).unwrap();
+        assert_eq!(back, [(3, 16391), (7, 16384)]);
     }
 
     #[test]

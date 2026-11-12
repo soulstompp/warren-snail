@@ -17,7 +17,8 @@ use crate::directory::{
 };
 use crate::encode::{decode_leaf, tail_pages};
 use crate::file::{
-    decode_free, encode_free, Extent, Place, Root, Run, Writer, FORMAT_SEVEN, REUSED_KEPT, STAGED,
+    decode_free, encode_free, Extent, Place, Root, Run, Writer, FORMAT, FORMAT_SEVEN, REUSED_KEPT,
+    STAGED,
 };
 use crate::lock;
 
@@ -179,6 +180,18 @@ pub(super) struct Declared {
     schemas: Vec<String>,
     /// The types, domains and functions it made, as no other writer names them until it commits.
     objects: Vec<crate::oids::Object>,
+    /// The OIDs each of its own statements took from the counter every writer of the file shares,
+    /// which it keeps wherever it is declared again: in a transaction block, as each was declared.
+    given: Vec<Took>,
+}
+
+/// The OIDs one of a transaction's own statements took from the file's counter: its place among
+/// them, the first, and how many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Took {
+    pub(super) place: usize,
+    pub(super) first: u32,
+    pub(super) n: u32,
 }
 
 impl Declared {
@@ -205,6 +218,11 @@ impl Declared {
     /// Its own statements, in their order.
     pub(super) fn own(&self) -> &str {
         &self.own
+    }
+
+    /// The OIDs its own statements took from the file's counter.
+    pub(super) fn given(&self) -> &[Took] {
+        &self.given
     }
 
     /// The orders it made, by table and name.
@@ -2910,6 +2928,39 @@ impl Snail {
         Ok(out)
     }
 
+    /// Takes `n` OIDs from the counter every writer of the file shares, at the root's turn, a commit
+    /// of its own, as PostgreSQL's are never given back: from the newest root's counter, or where it
+    /// names none from where its catalog's text goes on, `on` where that is the catalog `from` the
+    /// statement was declared on. Returns the first.
+    fn at_oids_turn(&mut self, n: u32, from: (Extent, u64), on: u32) -> Result<u32> {
+        let mut w = self
+            .writer
+            .take()
+            .ok_or_else(|| Error::new("this snail was opened to read; open it to write"))?;
+        let turn = lock::take_root_turn(w.file());
+        let taken = turn.and_then(|_| {
+            let root = self.reader.peek_root()?;
+            let first = match root.next_oid {
+                0 if root.catalog_named() == from => on,
+                0 => Snail::catalog(&self.reader, &root)?.oids.next(),
+                next => next,
+            };
+            self.taking = Some(first + n);
+            let rebased = std::mem::take(&mut self.rebased);
+            let declared = self.declared.take();
+            let committed = self.commit_with(&mut w);
+            self.rebased = rebased;
+            self.declared = declared;
+            self.taking = None;
+            committed.map(|_| first)
+        });
+        let given = lock::give_root_turn(w.file());
+        self.writer = Some(w);
+        let first = taken?;
+        given?;
+        Ok(first)
+    }
+
     /// The rows an UPDATE or a DELETE finds, by their places in `now`: the first time, every one,
     /// kept as `found`; run again, only those whose key, on the table's first unique order of plain
     /// NOT NULL columns or else every column, is a key it found the first time, and of the rows
@@ -3237,8 +3288,9 @@ impl Snail {
 
     /// The commit, at the root's turn: it begins from the newest root.
     pub(super) fn commit_with(&mut self, w: &mut Writer) -> Result<Root> {
-        // A transaction's root carries its host's tag; a sequence's advance lands at once.
-        let advance = self.advancing.is_some();
+        // A transaction's root carries its host's tag; a sequence's advance, and OIDs taken, land
+        // at once.
+        let advance = self.advancing.is_some() || self.taking.is_some();
         let mut root = self.commit_pages(w, &[])?;
         root.host = match w.host_tag() {
             Some(_) if advance => Some(crate::carry::AT_ONCE),
@@ -3263,16 +3315,17 @@ impl Snail {
             )));
         }
         // A snail written through a host is written only through it; and a host's transaction
-        // commits it once, besides the advances of its sequences.
+        // commits it once, besides the advances of its sequences and the OIDs it takes.
         if !self.reader.judged() && (root.host.is_some() || self.reader.waiting_on().is_some()) {
             return Err(Error::new(
                 "this snail is written through its host, which decides which of its roots is \
                  taken: write it through its host",
             ));
         }
+        let at_once = self.advancing.is_some() || self.taking.is_some();
         if let Some(t) = w.host_tag().filter(|&t| t != crate::carry::AT_ONCE) {
             let lies = root.host == Some(t) || self.reader.waiting_on() == Some(t);
-            if lies && self.advancing.is_none() {
+            if lies && !at_once {
                 return Err(Error::new(format!(
                     "the host's transaction {t} commits this snail once, and its commit lies on \
                      the root already"
@@ -3285,7 +3338,7 @@ impl Snail {
         if self.marking.is_none() {
             self.writes_marked(&root)?;
         }
-        if self.advancing.is_none() {
+        if !at_once {
             if let Some(m) = self.marking.take() {
                 if let (Some(stands), Some(new)) = (&root.replica, &m) {
                     if stands != new {
@@ -3364,6 +3417,11 @@ impl Snail {
                     }
                 }
             }
+        }
+        self.oids_at_commit(&mut root, w, &mut gone)?;
+        // OIDs a statement took from the counter, at the root's turn.
+        if let Some(next) = self.taking.take() {
+            root.next_oid = next;
         }
         if let Some(d) = self.declared.take() {
             self.reader
@@ -4944,7 +5002,8 @@ impl Snail {
             .as_ref()
             .map_or(self.root.catalog_named(), |d| d.from);
         let own = self.declared.as_ref().map_or("", |d| d.own.as_str());
-        if let Some(committed) = self.committed_ddl(&newest, from, own)? {
+        let given = self.declared.as_ref().map_or(&[][..], |d| d.given.as_slice());
+        if let Some(committed) = self.committed_ddl(&newest, from, own, given)? {
             self.lay_over(committed)?;
         }
         let stands = |o: &crate::oids::Object| self.catalog.oids.of(o).is_some();
@@ -4965,12 +5024,15 @@ impl Snail {
         let base = format!("{}\n", crate::ddl::ended(&self.catalog.ddl)?.trim_end());
         let text = format!("{base}{ddl};\n");
         let kept = Catalog::statements_in(&self.catalog.ddl)?;
-        let (format, root) = (self.reader.format(), &self.root);
+        let its_place = kept;
+        let format = self.reader.format();
+        let (release, monetary) = (self.root.release, self.root.monetary.clone());
+        let searched = self.root.text_search().to_string();
         let prepared = |catalog: &mut Catalog| -> Result<()> {
             super::old_names(catalog, format);
-            catalog.with_release(root.release)?;
-            catalog.with_monetary(&crate::file::monetary_of(catalog, &root.monetary))?;
-            catalog.with_text_search(root.text_search())
+            catalog.with_release(release)?;
+            catalog.with_monetary(&crate::file::monetary_of(catalog, &monetary))?;
+            catalog.with_text_search(&searched)
         };
         // Each literal PostgreSQL keeps as its value where the statement is declared, kept so,
         // under the statement's zone and on its clock.
@@ -4979,7 +5041,9 @@ impl Snail {
             .strip_prefix(base.as_str())
             .ok_or_else(|| Error::new("the catalog's text moved as its last statement was read"))?
             .to_string();
-        let (mut catalog, said) = match Catalog::parse_declared(&text, kept) {
+        // The statements before it keep the OIDs they were given; it goes on from them for now.
+        let record = self.catalog.oids.departures();
+        let (mut catalog, said) = match Catalog::parse_declared(&text, kept, &record) {
             Ok(read) => read,
             Err(e) => return Err(self.reached_holding_rows(e, &newest)?),
         };
@@ -5110,6 +5174,32 @@ impl Snail {
                 return Ok(Vec::new());
             }
         }
+        // Its objects take their OIDs from the counter every writer of the file shares: in a
+        // transaction block at once, at the root's turn, as PostgreSQL's are never given back;
+        // else at its commit. Where it takes others than the text went on to, it is read again
+        // with them.
+        let mut took = None;
+        if self.begun.is_some() && format >= FORMAT {
+            if let Some(run) = catalog.oids.run_at(its_place) {
+                let place = match self.declared.as_ref() {
+                    Some(d) => Catalog::statements_in(&d.own)?,
+                    None => 0,
+                };
+                let on = catalog.oids.going_on_at(its_place - place);
+                let first = self.at_oids_turn(run.n, from, on)?;
+                if first != run.first {
+                    let mut record = record;
+                    record.push((its_place as u32, first));
+                    (catalog, _) = Catalog::parse_declared(&text, its_place, &record)?;
+                    prepared(&mut catalog)?;
+                }
+                took = Some(Took {
+                    place,
+                    first,
+                    n: run.n,
+                });
+            }
+        }
         let mut stage = self.reader.stage();
         let mut orders: Vec<(String, String, Extent)> = self
             .root
@@ -5206,7 +5296,9 @@ impl Snail {
             relations: Vec::new(),
             schemas: Vec::new(),
             objects: Vec::new(),
+            given: Vec::new(),
         });
+        d.given.extend(took);
         for r in resets {
             if !d.resets.contains(&r) {
                 d.resets.push(r);
@@ -5261,7 +5353,7 @@ impl Snail {
             self.lock_byte_for(b, false, "a name another writer is making")?;
             self.locks.insert(b);
             let newest = self.reader.peek_root()?;
-            if let Some(committed) = self.committed_ddl(&newest, from, "")? {
+            if let Some(committed) = self.committed_ddl(&newest, from, "", &[])? {
                 let standing = committed.oids.each().find_map(|(_, x)| {
                     crate::pgcatalog::name_key(&committed, x)
                         .filter(|k| k.index == key.index && k.names == key.names)
@@ -5289,7 +5381,8 @@ impl Snail {
             .as_ref()
             .map_or(self.root.catalog_named(), |d| d.from);
         let own = self.declared.as_ref().map_or(String::new(), |d| d.own.clone());
-        let Some(committed) = self.committed_ddl(&newest, from, &own)? else {
+        let given = self.declared.as_ref().map_or(Vec::new(), |d| d.given.clone());
+        let Some(committed) = self.committed_ddl(&newest, from, &own, &given)? else {
             self.seen = self.catalog_seen(&newest)?;
             return Ok(());
         };
@@ -5356,7 +5449,7 @@ impl Snail {
         if self.declared.as_ref().is_none_or(|d| d.own.is_empty()) {
             return Ok(Some(snapshot.clone()));
         }
-        let Some(committed) = self.committed_ddl(newest, *at, "")? else {
+        let Some(committed) = self.committed_ddl(newest, *at, "", &[])? else {
             return Ok(None);
         };
         Ok(Some(crate::pgcatalog::seen(&self.catalog, &committed, snapshot)))
@@ -5424,7 +5517,7 @@ impl Snail {
         let Some(d) = self.declared.as_ref() else {
             return Ok(());
         };
-        let Some(catalog) = self.committed_ddl(root, d.from, &d.own)? else {
+        let Some(catalog) = self.committed_ddl(root, d.from, &d.own, &d.given)? else {
             return Ok(());
         };
         self.wrote_stand(&catalog)?;
@@ -5434,6 +5527,60 @@ impl Snail {
         d.from = root.catalog_named();
         d.ddl = catalog.ddl.clone();
         self.catalog = catalog;
+        Ok(())
+    }
+
+    /// The OIDs a commit that declared leaves its root, at the root's turn: each of its own
+    /// statements that took none from the counter every writer of the file shares takes its own
+    /// now, its statements read again where one takes others than the text went on to; the record
+    /// of the statements whose OIDs depart from the text's order written where it changed; and the
+    /// counter kept only where it is past where the text goes on. A snail of format 7 or 8 keeps
+    /// its text's order alone.
+    fn oids_at_commit(&mut self, root: &mut Root, w: &mut Writer, gone: &mut Vec<Extent>) -> Result<()> {
+        let Some(d) = self.declared.as_ref() else {
+            return Ok(());
+        };
+        if w.format() < FORMAT {
+            return Ok(());
+        }
+        let mine = Catalog::statements_in(&d.own)?;
+        let committed = Catalog::statements_in(&self.catalog.ddl)? - mine;
+        let mut given = d.given.clone();
+        let mut next = match root.next_oid {
+            0 => self.catalog.oids.going_on_at(committed),
+            next => next,
+        };
+        let mut moved = false;
+        for place in 0..mine {
+            if given.iter().any(|t| t.place == place) {
+                continue;
+            }
+            let Some(run) = self.catalog.oids.run_at(committed + place) else {
+                continue;
+            };
+            moved |= run.first != next;
+            given.push(Took {
+                place,
+                first: next,
+                n: run.n,
+            });
+            next += run.n;
+        }
+        if moved {
+            given.sort_by_key(|t| t.place);
+            let catalog = self.own_on(root, &d.own, &given)?;
+            self.sequences_redeclared(&catalog);
+            self.catalog = catalog;
+        }
+        if let Some(d) = self.declared.as_mut() {
+            d.given = given;
+        }
+        let record = self.catalog.oids.departures();
+        if record != self.reader.oid_record(root)? {
+            self.reader.put_oid_record(root, &record, w, gone)?;
+        }
+        let next = next.max(root.next_oid);
+        root.next_oid = if next > self.catalog.oids.next() { next } else { 0 };
         Ok(())
     }
 
