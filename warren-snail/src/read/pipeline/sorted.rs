@@ -42,7 +42,7 @@ impl Spec {
                         Ordering::Less
                     }
                 }
-                (false, false) => match compare(&a[i], &b[i]) {
+                (false, false) => match sort_compare(&a[i], &b[i]) {
                     Ok(Some(o)) => {
                         if desc {
                             o.reverse()
@@ -93,7 +93,23 @@ impl Ord for Held {
     }
 }
 
-/// The values a row is sorted by, refused where its type has no ordering.
+/// Two values as a sort compares them: two row constructors' records field by field as far as
+/// their fields are alike, refused where that reaches a field of a type PostgreSQL compares by no
+/// function.
+fn sort_compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
+    if let (Value::Composed(ty, x), Value::Composed(_, y)) = (a, b) {
+        if super::anonymous_record(*ty) {
+            return match crate::composed::compare_reaches(*ty, &x.item, &y.item) {
+                Some(part) => Err(super::no_comparison(part)),
+                None => Ok(Some(x.key.cmp(&y.key))),
+            };
+        }
+    }
+    compare(a, b)
+}
+
+/// The values a row is sorted by, refused where its type has no ordering; a row constructor's
+/// record is compared as two rows meet.
 pub(super) fn sort_key(
     row: &[Value],
     sorted: &[usize],
@@ -106,7 +122,7 @@ pub(super) fn sort_key(
             let v = row[at].clone();
             match v {
                 Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
-                    if !ty.ordered() =>
+                    if !ty.ordered() && !super::anonymous_record(ty) =>
                 {
                     Err(super::unordered(&ty.pg_name()))
                 }

@@ -444,9 +444,60 @@ pub(super) fn unordered(name: &str) -> Error {
 /// Whether a type is the record a row constructor makes, of no declared type: PostgreSQL's parser
 /// finds an ordering and an equality for every such record, and compares its fields only as two
 /// rows meet.
-fn anonymous_record(ty: ColumnType) -> bool {
+pub(super) fn anonymous_record(ty: ColumnType) -> bool {
     matches!(ty, ColumnType::Composed(r)
         if matches!(r.def(), crate::composed::Composed::Record { name, .. } if name == "record"))
+}
+
+/// PostgreSQL's refusal of a comparison of two records that reaches a field of a type it compares
+/// by no function.
+pub(super) fn no_comparison(part: ColumnType) -> Error {
+    Error::new(format!(
+        "could not identify a comparison function for type {}",
+        part.pg_name()
+    ))
+}
+
+/// How far a comparison of two rows of these values reaches before a row constructor's field of
+/// no comparison: the keys of the values and fields before it, and the field's type. Two rows
+/// alike that far are compared there, as they meet.
+fn reached_part(values: &[Value]) -> Option<(Vec<Key>, ColumnType)> {
+    let mut reach = Vec::new();
+    for v in values {
+        if let Value::Composed(ty @ ColumnType::Composed(r), c) = v {
+            if let (true, crate::composed::Composed::Record { fields, .. }, crate::composed::Item::Record(items)) =
+                (anonymous_record(*ty), r.def(), &c.item)
+            {
+                for (f, x) in fields.iter().zip(items) {
+                    if !f.ty.ordered() {
+                        return Some((reach, f.ty));
+                    }
+                    let mut k = vec![u8::from(x.is_null())];
+                    k.extend(crate::composed::key(f.ty, x));
+                    reach.push(Key::Bytes(k));
+                }
+            }
+        }
+        reach.push(key(v));
+    }
+    None
+}
+
+/// The rows a DISTINCT or a GROUP BY has met, as far as comparing them reaches into a row
+/// constructor's record: refused at the first two alike up to a field of no comparison.
+#[derive(Default)]
+pub(super) struct Met(std::collections::HashSet<Vec<Key>>);
+
+impl Met {
+    pub(super) fn meet(&mut self, values: &[Value]) -> Result<()> {
+        match reached_part(values) {
+            Some((reach, part)) => match self.0.insert(reach) {
+                true => Ok(()),
+                false => Err(no_comparison(part)),
+            },
+            None => Ok(()),
+        }
+    }
 }
 
 /// A sort key's type as PostgreSQL's parser reads it, before any row: refused where it finds no
@@ -7069,7 +7120,15 @@ impl<'q> Prepared<'q> {
             let mut given = false;
             for (i, &e) in listed.iter().enumerate() {
                 let Some(at) = sets.iter().position(|&s| std::ptr::eq(s, unnested(e))) else {
-                    made.push(item(i, e)?);
+                    // An INSERT's RETURNING call, after the sets, is made for a row written alone.
+                    let returned = self
+                        .items
+                        .get(i)
+                        .is_some_and(|(_, n)| n == super::change::RETURNED_CALL);
+                    made.push(match returned && !given {
+                        true => Value::Null,
+                        false => item(i, e)?,
+                    });
                     continue;
                 };
                 if values[at].is_none() {
@@ -8652,6 +8711,7 @@ struct Groups {
     closed: bool,
     /// What its aggregates keep of the rows they are given, in the round's room.
     kept: crate::room::Holding,
+    met: Met,
 }
 
 /// How a step's rows are read for its groups, once a chunk: each aggregate's parts, the casing each
@@ -8702,7 +8762,10 @@ impl<'e> Reading<'e> {
         let mut values = Vec::with_capacity(p.grouping.len());
         for (g, &u) in p.grouping.iter().zip(&self.grouped_under) {
             let v = eval(g, row, frame, &none)?;
-            grouped_key(&v)?;
+            // A row constructor's record is compared as rows meet (`met`).
+            if !matches!(&v, Value::Composed(ty, _) if anonymous_record(*ty)) {
+                grouped_key(&v)?;
+            }
             keys.push(key_under(&v, u));
             values.push(v);
         }
@@ -8777,6 +8840,7 @@ impl Groups {
             rows_to_come: None,
             closed: false,
             kept: crate::room::holding(0),
+            met: Met::default(),
         }
     }
 
@@ -8802,6 +8866,9 @@ impl Groups {
         along: &mut Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>>,
     ) -> Result<Option<usize>> {
         let k: Vec<Key> = self.set.iter().map(|&i| keys[i].clone()).collect();
+        // A row constructor's record is compared as rows meet (`met`), over this set's values.
+        let met: Vec<Value> = self.set.iter().map(|&i| values[i].clone()).collect();
+        self.met.meet(&met)?;
         if let Some(end) = along {
             if !self.list.is_empty() && !self.at.contains_key(&k) {
                 self.project(p, frame, &mut |row, calls| end(p.group_rows(&row, calls, frame)?))?;
@@ -8963,6 +9030,7 @@ struct Going {
     /// Whether it sorts them; where they come in their order, what its LIMIT keeps of them.
     sorts: bool,
     cut: Option<sorted::Cut>,
+    met: Met,
 }
 
 impl Going {
@@ -8985,6 +9053,7 @@ impl Going {
         let rows = if self.distinct {
             let mut new = Vec::with_capacity(rows.len());
             for r in rows {
+                self.met.meet(&r)?;
                 let k: Vec<Key> = r.iter().map(key).collect();
                 if self.seen.contains(&k) {
                     continue;
@@ -9087,6 +9156,7 @@ impl<'q> StepRun<'q> {
             sorter: None,
             sorts: p.order_by.is_some() || p.distinct_on.is_some(),
             cut: None,
+            met: Met::default(),
         };
         let groups = match &p.sets {
             Some(sets) => sets.iter().map(|s| Groups::new(s.clone())).collect(),

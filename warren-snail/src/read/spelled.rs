@@ -1445,6 +1445,20 @@ fn defined_item<'s>(
     Ok((name, ty))
 }
 
+/// Whether the statement writes `@@@` together, which sqlparser reads as `@@` and a prefix `@`, as
+/// it reads the two written apart.
+pub(super) fn three_ats(sql: &str) -> bool {
+    if !sql.contains("@@@") {
+        return false;
+    }
+    Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+        .tokenize()
+        .is_ok_and(|t| {
+            t.windows(2)
+                .any(|w| w[0] == Token::AtAt && w[1] == Token::AtSign)
+        })
+}
+
 /// What stands on the right of `@@@`, which sqlparser reads as `@@` and a prefix `@`.
 pub(super) fn right_of_three_ats(right: &Expr) -> Option<&Expr> {
     match right {

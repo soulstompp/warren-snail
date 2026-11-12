@@ -25,6 +25,10 @@
 //! A constant is evaluated as the pipeline evaluates its printed text over no row; where the snail
 //! refuses to evaluate it for a reason of its own the constant is left to the rows, as before. Where
 //! that reading refuses the statement nothing is folded.
+//!
+//! Once it is folded, as its plan starts, a WHERE's condition that reads no column and calls
+//! nothing volatile is evaluated once before any row (a gating Result's one-time filter), the
+//! statement's own and then those of what its one FROM item starts; none under a LIMIT of none.
 
 use super::pipeline::{self, Casings};
 use crate::catalog::Catalog;
@@ -40,8 +44,18 @@ use std::ops::ControlFlow;
 use std::rc::Rc;
 
 /// A statement's constants folded: the first failure among them, in the planner's order, where
-/// one fails.
+/// one fails; then its one-time conditions.
 pub(super) fn folded(catalog: &Catalog, sql: &str) -> Result<()> {
+    read(catalog, sql, true)
+}
+
+/// A query's one-time conditions alone, its constants folded with the statement it stands in: a
+/// subquery reading nothing of the query around it, as a row first asks for it.
+pub(super) fn gated(catalog: &Catalog, sql: &str) -> Result<()> {
+    read(catalog, sql, false)
+}
+
+fn read(catalog: &Catalog, sql: &str, fold: bool) -> Result<()> {
     let bound = crate::grammar::bound(sql);
     let Ok(parsed) = super::image::parse_sql(bound.as_deref().unwrap_or(sql)) else {
         return Ok(());
@@ -49,12 +63,17 @@ pub(super) fn folded(catalog: &Catalog, sql: &str) -> Result<()> {
     let [st] = parsed.as_slice() else {
         return Ok(());
     };
-    if !computes_a_constant(st) && !super::own::calls_in(catalog, st) {
+    if !computes_a_constant(st) && !super::own::calls_in(catalog, st) && !types_a_literal(st) {
         return Ok(());
     }
     let cat = Cat::of(catalog);
-    let Ok(q) = crate::deparse::query::statement(&cat, st) else {
-        return Ok(());
+    // A literal is read by its type's input, and a cast found, as the statement is analyzed: a
+    // failure there is the statement's, as 18.6's parser gives it, before anything is folded. But
+    // for a statement writing `@@@`, which sqlparser reads as `@@` and a prefix `@`.
+    let q = match crate::deparse::query::statement(&cat, st) {
+        Ok(q) => q,
+        Err(e) if analyzed_refusal(&e) && !super::spelled::three_ats(sql) => return Err(e),
+        Err(_) => return Ok(()),
     };
     // The file's functions held, so that a call of one is evaluated as a row's call is.
     let _own = super::own::holding(&catalog.functions, catalog.release);
@@ -66,7 +85,44 @@ pub(super) fn folded(catalog: &Catalog, sql: &str) -> Result<()> {
         read: RefCell::new(HashSet::new()),
         places: Cell::new(0),
     };
-    folding.level(&q, &Rc::new(Withs::default()), &[], &Reading::default())
+    if fold {
+        folding.level(&q, &Rc::new(Withs::default()), &[], &Reading::default())?;
+    }
+    // Then, as the plan starts and before any row, its one-time conditions.
+    match folding.gate(&q, &[])? {
+        Some(g) => folding.passes(&g),
+        None => Ok(()),
+    }
+}
+
+/// What 18.6 evaluates once as a level's plan starts, before it reads a row (a gating Result's
+/// one-time filter): each condition of the level's WHERE, and of the ON of a join over its whole
+/// FROM, that reads no column and calls nothing volatile, in order; where each is TRUE, what the
+/// level below starts.
+enum Gate {
+    Level {
+        conds: Vec<Node>,
+        then: Option<Box<Gate>>,
+    },
+}
+
+/// Whether a statement holds a quoted literal or a cast, which its analysis types.
+fn types_a_literal(st: &Statement) -> bool {
+    sqlparser::ast::visit_expressions(st, |e| match e {
+        Expr::Cast { .. } => ControlFlow::Break(()),
+        Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::SingleQuotedString(_)) => {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// A refusal of the statement's analysis that is 18.6's parser's: a literal its type's input
+/// refuses (a data exception), or a cast of no path.
+fn analyzed_refusal(e: &crate::Error) -> bool {
+    e.sqlstate()
+        .is_some_and(|s| s.starts_with("22") || s == "42846")
 }
 
 /// Whether a statement holds an expression computed of constants alone: none, and nothing is
@@ -1197,6 +1253,149 @@ impl<'c, 'a> Folding<'c, 'a> {
             || q.ctes.iter().any(|c| self.volatile_query(&c.query))
     }
 
+    /// A level's one-time conditions, where the plan is sure to start it before any row: none
+    /// where its WHERE folded FALSE or NULL, and none from the first that holds a subquery on,
+    /// whose value the snail gives as a row asks for it. Below it, its one FROM item where that is
+    /// a subquery or a WITH query, an INSERT's SELECT, or a set operation's first arm.
+    fn gate(&self, q: &Query, ctes: &[&Cte]) -> Result<Option<Gate>> {
+        let laid = Laid {
+            q,
+            withs: Rc::new(Withs::default()),
+            place: 0,
+            pulled: HashMap::new(),
+            tree: Tree::Leaf,
+        };
+        let at = At {
+            case: None,
+            grouped: &[],
+            scope: &laid,
+            around: &[],
+            args: None,
+        };
+        if !self.starts(q, &at)? {
+            return Ok(None);
+        }
+        let mut visible = ctes.to_vec();
+        if !q.recursive {
+            visible.extend(&q.ctes);
+        }
+        if let Some(t) = &q.setop {
+            let mut leaves = Vec::new();
+            setop_leaves(t, &mut leaves);
+            return match leaves.first().map(|&i| &q.rtable[i - 1].kind) {
+                Some(RteKind::Subquery(s)) => self.gate(s, &visible),
+                _ => Ok(None),
+            };
+        }
+        // A join's ON over the whole FROM is read with the WHERE, before it.
+        let on = match q.from.as_slice() {
+            [Jt::Join(j)] if j.kind == JoinKind::Inner => j.quals.as_ref(),
+            _ => None,
+        };
+        for w in on.into_iter().chain(&q.quals) {
+            if matches!(self.node(w, &at)?.truth(), Some(Some(false) | None)) {
+                return Ok(None);
+            }
+        }
+        let mut conds = Vec::new();
+        for c in conjuncts(on).into_iter().chain(conjuncts(q.quals.as_ref())) {
+            let mut read = HashSet::new();
+            node_columns_at(c, 0, &mut read);
+            if !read.is_empty() || self.volatile(c) {
+                continue;
+            }
+            if any_node(c, &mut |x| matches!(x, Node::SubLink { .. })) {
+                return Ok(Some(Gate::Level { conds, then: None }));
+            }
+            if self.node(c, &at)?.constant().is_none() {
+                conds.push(c.clone());
+            }
+        }
+        let one = match q.from.as_slice() {
+            [Jt::Ref(i)] => q.rtable.get(*i - 1),
+            [] => q
+                .rtable
+                .iter()
+                .find(|r| matches!(r.kind, RteKind::Subquery(_)) && !r.in_from),
+            _ => None,
+        };
+        let then = match one.map(|r| &r.kind) {
+            Some(RteKind::Subquery(s)) => self.gate(s, &visible)?,
+            Some(RteKind::Cte { name }) => match visible.iter().rev().find(|c| c.name == *name) {
+                Some(c) => self.gate(&c.query, &visible)?,
+                None => None,
+            },
+            _ => None,
+        };
+        Ok(Some(Gate::Level {
+            conds,
+            then: then.map(Box::new),
+        }))
+    }
+
+    /// Whether the plan starts reading a level: not under a LIMIT of none, nor under an OFFSET or
+    /// a LIMIT it evaluates only as it starts (one that is no constant, or one it refuses).
+    fn starts(&self, q: &Query, at: &At<'_, '_>) -> Result<bool> {
+        let fits = |n: Option<&Node>, least: i64| -> Result<bool> {
+            let Some(n) = n else {
+                return Ok(true);
+            };
+            Ok(match self.node(n, at)? {
+                Shape::Const(Node::Const { text: None, .. }) => true,
+                Shape::Const(Node::Const { text: Some(t), .. }) => {
+                    t.parse::<i64>().is_ok_and(|v| v >= least)
+                }
+                _ => false,
+            })
+        };
+        Ok(fits(q.offset.as_ref(), 0)? && fits(q.limit.as_ref(), 1)?)
+    }
+
+    /// The one-time conditions evaluated in order as the plan starts: a failure of class 22 the
+    /// statement's. Past one FALSE or NULL, or one the snail does not evaluate here, what it
+    /// gates is left to the rows.
+    fn passes(&self, g: &Gate) -> Result<()> {
+        let Gate::Level { conds, then } = g;
+        for c in conds {
+            if self.once(c)? != Some(true) {
+                return Ok(());
+            }
+        }
+        match then {
+            Some(t) => self.passes(t),
+            None => Ok(()),
+        }
+    }
+
+    /// A condition reading no column evaluated once over no row, as the pipeline evaluates its
+    /// printed text.
+    fn once(&self, n: &Node) -> Result<Option<bool>> {
+        let mut p = Printer {
+            cat: self.cat,
+            paren: false,
+            indent: false,
+            level: 0,
+            buf: String::new(),
+            relations: Vec::new(),
+            q: Default::default(),
+        };
+        if p.expr(n, true).is_err() {
+            return Ok(None);
+        }
+        let Ok(e) = super::image::parse_expr(&p.buf) else {
+            return Ok(None);
+        };
+        let Ok(types) = pipeline::typed_on(&e, &[], self.release) else {
+            return Ok(None);
+        };
+        match pipeline::eval_typed(&e, Vec::new(), &[], self.release, &self.casings, &types) {
+            Ok(pipeline::Value::Bool(b)) => Ok(Some(b)),
+            Ok(_) => Ok(None),
+            Err(e) if e.sqlstate().is_some_and(|s| s.starts_with("22")) => Err(e),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Each argument folded, in order.
     fn each<'r>(&self, args: &[Node], at: &At<'_, 'r>) -> Result<Vec<Shape<'r>>> {
         args.iter().map(|a| self.node(a, at)).collect()
@@ -2045,7 +2244,12 @@ fn query_columns_at(q: &Query, depth: u32, out: &mut HashSet<(u32, i16)>) {
 fn with_arguments(n: &Node, next: &mut dyn FnMut() -> Option<Node>) -> Node {
     use Node as N;
     let mut out = n.clone();
+    // An argument given by name keeps its name.
     let mut put = |x: &mut Node| {
+        let x = match x {
+            N::Named { arg, .. } => &mut **arg,
+            x => x,
+        };
         if let Some(c) = next() {
             *x = c;
         }

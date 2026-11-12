@@ -425,3 +425,63 @@ fn a_set_in_a_one_row_values_inserts_a_row_for_each_value() {
         "1|0|1;2|0|2;21|0|7;22|0|8"
     );
 }
+
+#[test]
+fn returning_s_sequence_calls_are_made_as_each_row_is_written() {
+    let mut w = snail("returning-calls");
+    run(
+        &mut w,
+        &[
+            "CREATE SCHEMA w20",
+            "CREATE TABLE w20.q (n integer PRIMARY KEY, m serial)",
+            "CREATE TABLE w20.src (k integer PRIMARY KEY)",
+            "CREATE TABLE w20.r (k integer PRIMARY KEY, v integer)",
+            "INSERT INTO w20.src VALUES (1), (2), (3), (4)",
+        ],
+    );
+    for (sql, want) in [
+        (
+            "INSERT INTO w20.q (n) VALUES (71), (72) RETURNING n, m, currval('w20.q_m_seq')",
+            "71|1|1;72|2|2",
+        ),
+        (
+            "INSERT INTO w20.q (n) VALUES (generate_series(31, 32)) \
+             RETURNING n, m, currval('w20.q_m_seq')",
+            "31|3|3;32|4|4",
+        ),
+        ("SELECT nextval('w20.q_m_seq')", "6"),
+        (
+            "INSERT INTO w20.q (n) SELECT k + 80 FROM w20.src \
+             RETURNING n, m, currval('w20.q_m_seq')",
+            "81|7|7;82|8|8;83|9|9;84|10|10",
+        ),
+        (
+            "INSERT INTO w20.q (n) VALUES (91), (92) RETURNING n, nextval('w20.q_m_seq')",
+            "91|12;92|14",
+        ),
+        (
+            "INSERT INTO w20.q (n) VALUES (generate_series(41, 42)) \
+             RETURNING n, m, nextval('w20.q_m_seq')",
+            "41|15|16;42|17|18",
+        ),
+        ("SELECT nextval('w20.q_m_seq')", "20"),
+        (
+            "INSERT INTO w20.q (n) VALUES (51), (52) \
+             RETURNING n, m + currval('w20.q_m_seq'), lastval()",
+            "51|42|21;52|44|22",
+        ),
+        (
+            "INSERT INTO w20.r VALUES (nextval('w20.q_m_seq'), 1), (5, 2) \
+             RETURNING k, currval('w20.q_m_seq')",
+            "23|23;5|23",
+        ),
+        (
+            "INSERT INTO w20.q (n) VALUES (101), (102) \
+             RETURNING n, m, CASE WHEN n > 101 THEN currval('w20.q_m_seq') END",
+            "101|24|NULL;102|25|25",
+        ),
+        ("SELECT nextval('w20.q_m_seq')", "26"),
+    ] {
+        assert_eq!(rows(&mut w, sql), want, "{sql}");
+    }
+}

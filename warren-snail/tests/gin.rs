@@ -2607,14 +2607,19 @@ fn three_ats_read_as_the_match_they_are_where_they_can_be_told_apart() {
         assert!(s.ask(&q, None).is_err(), "{q}");
     }
     // `@@` and a prefix `@` written apart are two operators, each refused as PostgreSQL refuses it.
-    for w in ["v @@ @ 'word60'", "v @@  @ 1", "v @@\n@ 'word60'"] {
+    let input = "invalid input syntax for type double precision: \"word60\"";
+    for (w, refused) in [
+        ("v @@ @ 'word60'", input),
+        ("v @@  @ 1", "operator does not exist"),
+        ("v @@\n@ 'word60'", input),
+    ] {
         let q = format!("SELECT id FROM s.t WHERE {w}");
         let e = s
             .ask(&q, None)
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        assert!(e.contains("operator"), "{q}: {e}");
+        assert!(e.contains(refused), "{q}: {e}");
     }
     // A string or a comment holding them is no operator.
     let (got, _) = ids(
@@ -2623,6 +2628,9 @@ fn three_ats_read_as_the_match_they_are_where_they_can_be_told_apart() {
         None,
     );
     assert!(got.is_empty());
+    let q = "SELECT id FROM s.t WHERE t = '@@@' AND id = 'x'";
+    let e = s.ask(q, None).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("invalid input syntax for type integer: \"x\""), "{q}: {e}");
 }
 
 const BESIDE: &str =

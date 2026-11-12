@@ -238,6 +238,7 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("", " columns available but "), "42P10"),
     (Words::Starts("could not identify an equality operator for type "), "42883"),
     (Words::Starts("could not identify an ordering operator for type "), "42883"),
+    (Words::Starts("could not identify a comparison function for type "), "42883"),
     (Words::Is("unequal number of entries in row expressions"), "42601"),
     (Words::Is("cannot compare rows of zero length"), "0A000"),
     (Words::Is("input of anonymous composite types is not implemented"), "0A000"),

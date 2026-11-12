@@ -620,3 +620,145 @@ fn a_file_s_function_is_folded_as_postgresql_inlines_or_calls_it() {
         ],
     );
 }
+
+fn stamp() -> Result<Vec<String>, (Option<&'static str>, String)> {
+    Err((
+        Some("22007"),
+        "invalid input syntax for type timestamp with time zone: \"x\"".into(),
+    ))
+}
+
+#[test]
+fn a_condition_reading_no_column_is_evaluated_once_as_the_plan_starts() {
+    let mut w = snail("gate");
+    let all = || rows(&["1", "2", "3", "4"]);
+    each(
+        &mut w,
+        &[
+            (
+                "SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE k > 0 AND now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE (now() < 'x'::text::timestamptz) IS NULL",
+                stamp(),
+            ),
+            (
+                "UPDATE fo.none SET v = 1 WHERE now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "DELETE FROM fo.none WHERE now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT a.k FROM fo.none a, fo.src b WHERE now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT a.k FROM fo.none a JOIN fo.src b ON a.k = b.k \
+                 AND now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT a.k FROM fo.src a LEFT JOIN fo.none b ON a.k = b.k \
+                 AND now() < 'x'::text::timestamptz",
+                all(),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE (SELECT now() < 'x'::text::timestamptz)",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz AND (SELECT false)",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE (SELECT false) AND now() < 'x'::text::timestamptz",
+                rows(&[]),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE k > 0 OR now() < 'x'::text::timestamptz",
+                rows(&[]),
+            ),
+            (
+                "SELECT now() < 'x'::text::timestamptz FROM fo.none",
+                rows(&[]),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE random() < now()::text::float8",
+                rows(&[]),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz LIMIT 0",
+                rows(&[]),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz LIMIT 1",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz OFFSET -1",
+                Err((Some("2201X"), "OFFSET must not be negative".into())),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz AND k > 0 AND false",
+                rows(&[]),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE now() < '2000-01-01'::text::timestamptz \
+                 AND now() < 'x'::text::timestamptz",
+                rows(&[]),
+            ),
+            (
+                "SELECT count(*) FROM fo.none WHERE now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM fo.src WHERE k / 0 = 1 AND now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM (SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz) q",
+                stamp(),
+            ),
+            (
+                "SELECT * FROM (SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz \
+                 LIMIT 0) q",
+                rows(&[]),
+            ),
+            (
+                "WITH c AS MATERIALIZED (SELECT k FROM fo.none \
+                 WHERE now() < 'x'::text::timestamptz) SELECT * FROM c",
+                stamp(),
+            ),
+            (
+                "INSERT INTO fo.none SELECT k, v FROM fo.none \
+                 WHERE now() < 'x'::text::timestamptz",
+                stamp(),
+            ),
+            (
+                "SELECT k FROM fo.none WHERE now() < 'x'::text::timestamptz UNION ALL SELECT 1",
+                stamp(),
+            ),
+            (
+                "SELECT (SELECT 1 FROM fo.none WHERE now() < 'x'::text::timestamptz) \
+                 FROM fo.src",
+                stamp(),
+            ),
+            (
+                "SELECT (SELECT 1 FROM fo.none WHERE now() < 'x'::text::timestamptz) \
+                 FROM fo.none",
+                rows(&[]),
+            ),
+            (
+                "SELECT k FROM fo.src WHERE now() > '2000-01-01'::text::timestamptz",
+                all(),
+            ),
+        ],
+    );
+}

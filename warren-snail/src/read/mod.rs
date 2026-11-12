@@ -568,6 +568,8 @@ pub struct Snail {
     drawing: prng::Drawing,
     /// The changes a write makes to its own table, kept where its statement returns rows of them.
     kept: Option<Vec<change::Change>>,
+    /// The values of RETURNING's sequence calls each row an INSERT proposes was made with.
+    returned_calls: Vec<statement::Row>,
     /// A write inside WITH's changes, held unapplied while every write of the statement finds its
     /// rows on one snapshot.
     dry: Option<Vec<(usize, Vec<change::Change>)>>,
@@ -877,6 +879,7 @@ impl Snail {
             drawn: Default::default(),
             drawing: Default::default(),
             kept: None,
+            returned_calls: Vec::new(),
             dry: None,
             checking: None,
             advancing: None,

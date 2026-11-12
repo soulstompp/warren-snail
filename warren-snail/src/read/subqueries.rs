@@ -695,6 +695,8 @@ impl<'a, 'q> Subs<'a, 'q> {
             if let Some(r) = plan.once.borrow().as_ref() {
                 return Ok(r.clone());
             }
+            // Its one-time conditions first, as its plan starts.
+            super::folded::gated(self.asked.reads.catalog(), &plan.query.to_string())?;
             let (m, _) = relations::made_by(
                 asked,
                 &plan.query,

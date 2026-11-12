@@ -4969,3 +4969,137 @@ fn a_relation_s_name_reads_its_whole_row() {
         (Some("42P01"), "missing FROM-clause entry for table \"wr\"".to_string())
     );
 }
+
+#[test]
+fn a_row_constructor_s_record_is_compared_field_by_field_as_rows_meet() {
+    let mut w = snail("records-meet");
+    w.execute("CREATE TABLE dn.jj (id integer PRIMARY KEY, v json, p point)")
+        .unwrap();
+    let none: &[&str] = &[];
+    answered(
+        &mut w,
+        &[
+            ("SELECT DISTINCT ROW(v) FROM dn.jj", none),
+            ("SELECT id FROM dn.jj ORDER BY ROW(v)", none),
+            ("SELECT ROW(v) FROM dn.jj GROUP BY 1", none),
+        ],
+    );
+    w.execute("INSERT INTO dn.jj VALUES (1, '{}', '(1,2)'), (2, '[]', '(3,4)')")
+        .unwrap();
+    let no_comparison = |ty: &str| {
+        (
+            Some("42883"),
+            format!("could not identify a comparison function for type {ty}"),
+        )
+    };
+    for (sql, ty) in [
+        ("SELECT DISTINCT ROW(v) FROM dn.jj", "json"),
+        ("SELECT id FROM dn.jj ORDER BY ROW(v)", "json"),
+        ("SELECT ROW(v) FROM dn.jj GROUP BY 1", "json"),
+        ("SELECT count(*) FROM dn.jj GROUP BY ROW(v)", "json"),
+        ("SELECT DISTINCT ROW(p) FROM dn.jj", "point"),
+        ("SELECT id FROM dn.jj ORDER BY ROW(p) DESC", "point"),
+        ("SELECT DISTINCT ROW(1, v) FROM dn.jj", "json"),
+        ("SELECT id FROM dn.jj ORDER BY ROW(1, v)", "json"),
+        (
+            "SELECT ROW(('\"' || k || '\"')::json) FROM dn.a WHERE id < 3 GROUP BY 1",
+            "json",
+        ),
+        (
+            "SELECT DISTINCT ROW(g, ('\"' || k || '\"')::json) FROM dn.a ORDER BY 1",
+            "json",
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), no_comparison(ty), "{sql}");
+    }
+    // Rows that differ before the field are never compared there.
+    answered(
+        &mut w,
+        &[
+            ("SELECT DISTINCT ROW(v) FROM dn.jj WHERE id = 1", &["({})"]),
+            ("SELECT id FROM dn.jj WHERE id = 1 ORDER BY ROW(v)", &["1"]),
+            (
+                "SELECT DISTINCT ROW(id, v) FROM dn.jj ORDER BY 1",
+                &["(1,{})", "(2,[])"],
+            ),
+            ("SELECT id FROM dn.jj ORDER BY ROW(id, v) DESC", &["2", "1"]),
+            (
+                "SELECT ROW(id, v) FROM dn.jj GROUP BY 1 ORDER BY 1",
+                &["(1,{})", "(2,[])"],
+            ),
+            (
+                "SELECT DISTINCT ROW(id, ('\"' || k || '\"')::json) FROM dn.a ORDER BY 1",
+                &[
+                    "(1,\"\"\"x\"\"\")",
+                    "(2,\"\"\"y\"\"\")",
+                    "(3,\"\"\"x\"\"\")",
+                    "(4,\"\"\"x\"\"\")",
+                    "(5,\"\"\"y\"\"\")",
+                    "(6,)",
+                    "(7,)",
+                ],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_literal_and_a_cast_are_read_as_the_statement_is_typed() {
+    let mut w = snail("typed-literals");
+    let syntax = |ty: &str, s: &str| {
+        (
+            Some("22P02"),
+            format!("invalid input syntax for type {ty}: \"{s}\""),
+        )
+    };
+    let xid = || (Some("42846"), "cannot cast type integer to xid".to_string());
+    for (sql, want) in [
+        ("SELECT id + 'x' FROM dn.a WHERE false", syntax("integer", "x")),
+        ("SELECT id::xid FROM dn.a WHERE false", xid()),
+        ("SELECT id + 'x' FROM dn.a ORDER BY k::json", syntax("integer", "x")),
+        (
+            "SELECT id FROM dn.a ORDER BY k::json, id + 'x'",
+            (
+                Some("42883"),
+                "could not identify an ordering operator for type json\nHINT:  Use an explicit \
+                 ordering operator or modify the query."
+                    .to_string(),
+            ),
+        ),
+        ("SELECT 'x'::integer FROM dn.a WHERE false", syntax("integer", "x")),
+        ("SELECT 1 FROM dn.a WHERE false AND id = 'y'", syntax("integer", "y")),
+        ("SELECT CASE WHEN false THEN id + 'x' END FROM dn.a", syntax("integer", "x")),
+        ("SELECT id FROM dn.a WHERE id IN (1, 'z')", syntax("integer", "z")),
+        (
+            "SELECT nosuch, id + 'x' FROM dn.a",
+            (Some("42703"), "column \"nosuch\" does not exist".to_string()),
+        ),
+        ("SELECT id + 'x', nosuch FROM dn.a", syntax("integer", "x")),
+        ("SELECT id FROM dn.a WHERE false ORDER BY id::xid", xid()),
+        ("SELECT id FROM dn.a GROUP BY id HAVING id > 'q'", syntax("integer", "q")),
+        ("SELECT 1/0, id + 'x' FROM dn.a", syntax("integer", "x")),
+        ("SELECT ARRAY[id, 'x'] FROM dn.a WHERE false", syntax("integer", "x")),
+        (
+            "SELECT row_number() OVER (ORDER BY id + 'x') FROM dn.a WHERE false",
+            syntax("integer", "x"),
+        ),
+        ("INSERT INTO dn.b VALUES (9, 1, 'x')", syntax("integer", "x")),
+        ("UPDATE dn.b SET v = 'x' WHERE false", syntax("integer", "x")),
+        (
+            "SELECT a_id::xid FROM dn.b WHERE false",
+            (Some("42846"), "cannot cast type integer to xid".to_string()),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+    let none: &[&str] = &[];
+    answered(
+        &mut w,
+        &[
+            ("SELECT id::text::xid FROM dn.a WHERE false", none),
+            ("SELECT id FROM dn.a WHERE id = '1'", &["1"]),
+            ("SELECT g + '5' FROM dn.a WHERE id = 1", &["15"]),
+            ("SELECT id || 'x' FROM dn.a WHERE id = 1", &["1x"]),
+        ],
+    );
+}

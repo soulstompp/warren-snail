@@ -970,6 +970,15 @@ impl<'b> Builder<'b, '_, '_> {
             return Err(not_read(item));
         }
         self.as_text(&mut targets[at])?;
+        // Its ordering found as the item is read, before the next item is (addTargetToSortList).
+        let ty = self.cat.base(targets[at].expr.ty());
+        if super::defs::default_btree_opclass(self.cat, ty) == 0 {
+            return Err(Error::new(format!(
+                "could not identify an ordering operator for type {}\nHINT:  Use an explicit \
+                 ordering operator or modify the query.",
+                self.cat.ty(ty).map_or("?", |t| t.name.as_str())
+            )));
+        }
         let desc = match &item.options.sort {
             None | Some(A::OrderBySort::Asc) => false,
             Some(A::OrderBySort::Desc) => true,
@@ -1027,13 +1036,22 @@ impl<'b> Builder<'b, '_, '_> {
         Ok(targets.len() - 1)
     }
 
-    /// transformLimitClause: each bound coerced to bigint.
+    /// transformLimitClause: each bound coerced to bigint, as coerce_to_specific_type refuses a
+    /// type of no path.
     fn limits(&self, q: &A::Query) -> Result<(Option<Node>, Option<Node>, bool)> {
         let a = self.analyzer();
-        let bigint = |e: &A::Expr| -> Result<Node> {
+        let bigint_of = |e: &A::Expr, what: &str| -> Result<Node> {
             let n = a.expr(e)?;
+            let from = n.ty();
+            if !a.can_coerce_all(&[from], &[cat::INT8], Context::Assignment) {
+                return Err(Error::new(format!(
+                    "argument of {what} must be type bigint, not type {}",
+                    a.type_name(from)
+                )));
+            }
             a.coerce_to_target(n, cat::INT8, -1, Context::Assignment, Form::Implicit)
         };
+        let bigint = |e: &A::Expr| bigint_of(e, "LIMIT");
         let (mut offset, mut limit, mut ties) = (None, None, false);
         match &q.limit_clause {
             None => {}
@@ -1043,7 +1061,10 @@ impl<'b> Builder<'b, '_, '_> {
                 limit_by,
             }) if limit_by.is_empty() => {
                 limit = l.as_ref().map(&bigint).transpose()?;
-                offset = o.as_ref().map(|o| bigint(&o.value)).transpose()?;
+                offset = o
+                    .as_ref()
+                    .map(|o| bigint_of(&o.value, "OFFSET"))
+                    .transpose()?;
             }
             Some(other) => return Err(not_read(other)),
         }
@@ -1786,12 +1807,20 @@ impl<'b> Builder<'b, '_, '_> {
                     } else {
                         r.cols.clone()
                     };
+                    // analyzeCTETargetList: an unknown column of a recursive query is text.
+                    let types = lcols
+                        .iter()
+                        .map(|&(t, m)| match t {
+                            cat::UNKNOWN => (cat::TEXT, -1),
+                            _ => (t, m),
+                        })
+                        .collect();
                     let mut ctes = r.at.ctes.borrow_mut();
                     ctes.retain(|d| d.name != r.name);
                     ctes.push(CteDef {
                         name: r.name.clone(),
                         cols: names,
-                        types: lcols.clone(),
+                        types,
                     });
                 }
                 let (rr, rcols) = self.setop_tree(right, None, false)?;

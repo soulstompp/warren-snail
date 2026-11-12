@@ -7,8 +7,9 @@ use crate::catalog::{ident, object_name, Catalog, ColumnType, Table};
 use crate::error::NOT_ASSIGNED;
 use crate::{Error, Result};
 use sqlparser::ast::{
-    AssignmentTarget, Expr, FromTable, Insert, ObjectName, ObjectNamePart, Query, SelectItem,
-    SetExpr, Statement as Sql, TableFactor, TableObject, TableWithJoins, UnaryOperator, Value,
+    AssignmentTarget, Expr, FromTable, Ident, Insert, ObjectName, ObjectNamePart, Query,
+    SelectItem, SetExpr, Statement as Sql, TableFactor, TableObject, TableWithJoins, UnaryOperator,
+    Value,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 
@@ -1064,6 +1065,73 @@ fn sets_refused_in(selection: Option<&Expr>, items: &Option<Vec<SelectItem>>) ->
     Ok(())
 }
 
+/// The sequence calls a RETURNING list makes for each row, in the order it makes them: each a call
+/// of constant arguments. None where one stands under a condition or a subquery, or reads a column,
+/// as the list then makes its calls over the rows written.
+pub(super) fn returned_calls(items: &[SelectItem]) -> Vec<Expr> {
+    use sqlparser::ast::{visit_expressions, BinaryOperator};
+    use std::ops::ControlFlow;
+    let named = |e: &Expr, names: &[&str]| match e {
+        Expr::Function(f) => f
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .is_some_and(|n| names.contains(&ident(n).as_str())),
+        _ => false,
+    };
+    let sequence_call = |e: &Expr| named(e, &["nextval", "currval", "setval", "lastval"]);
+    // A call's arguments reading a column or a subquery, or calling a sequence function again.
+    let reads = |e: &Expr| {
+        let mut calls = 0;
+        visit_expressions(e, |x| match x {
+            Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::Subquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. } => ControlFlow::Break(()),
+            _ if sequence_call(x) && calls > 0 => ControlFlow::Break(()),
+            _ => {
+                calls += usize::from(sequence_call(x));
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    };
+    let mut calls = Vec::new();
+    for i in items {
+        let (SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }) = i else {
+            continue;
+        };
+        let mut found = Vec::new();
+        let mut plain = true;
+        let _ = visit_expressions(e, |x| {
+            match x {
+                _ if sequence_call(x) => {
+                    plain &= !reads(x);
+                    found.push(x.clone());
+                }
+                Expr::Case { .. }
+                | Expr::Subquery(_)
+                | Expr::Exists { .. }
+                | Expr::InSubquery { .. }
+                | Expr::BinaryOp {
+                    op: BinaryOperator::And | BinaryOperator::Or,
+                    ..
+                } => plain = false,
+                _ if named(x, &["coalesce", "nullif", "greatest", "least"]) => plain = false,
+                _ => {}
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        if !found.is_empty() && !plain {
+            return Vec::new();
+        }
+        calls.extend(found);
+    }
+    calls
+}
+
 /// A write that returns rows where it has a RETURNING list, its table read by `alias`.
 fn returning(write: Statement, alias: String, items: &Option<Vec<SelectItem>>) -> Statement {
     match items {
@@ -1291,6 +1359,23 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     if q.with.is_some() {
         return Err(refused("a write inside WITH"));
     }
+    // The sequence calls its RETURNING makes, made for each row by the row's question after the
+    // row's own, as 18.6 makes them once the row is written and before the next is made.
+    let calls: Vec<SelectItem> = match &i.on {
+        None => returned_calls(i.returning.as_deref().unwrap_or_default())
+            .into_iter()
+            .map(|expr| SelectItem::ExprWithAlias {
+                expr,
+                alias: Ident::with_quote('"', super::change::RETURNED_CALL),
+            })
+            .collect(),
+        Some(_) => Vec::new(),
+    };
+    let listed = calls
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let source = match q.body.as_ref() {
         SetExpr::Values(v) => {
             let width = v.rows.first().map_or(0, |r| r.content.len());
@@ -1326,7 +1411,7 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                 }
                 rows.push(row);
             }
-            match computed {
+            match computed || !calls.is_empty() {
                 false => Source::Filled(rows),
                 true => {
                     // One row holding a set is a select list, as 18.6 reads it: its DEFAULTs a
@@ -1334,7 +1419,17 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                     let set = v.rows.len() == 1
                         && v.rows[0].content.iter().any(super::pipeline::holds_set);
                     let draws = set || calls_sequences(catalog, &i.to_string());
-                    Source::Computed(computed_rows(catalog, table, rows, &columns, draws))
+                    let rows = computed_rows(catalog, table, rows, &columns, draws);
+                    Source::Computed(match calls.is_empty() {
+                        true => rows,
+                        false => rows
+                            .into_iter()
+                            .map(|(row, q)| match q {
+                                Some(q) => (row, Some(format!("{q}, {listed}"))),
+                                None => (row, Some(format!("SELECT {listed}"))),
+                            })
+                            .collect(),
+                    })
                 }
             }
         }
@@ -1387,6 +1482,11 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             // where it reads none: an item no column takes stands for them.
             if kept.is_empty() {
                 kept.push(SelectItem::UnnamedExpr(super::image::parse_expr("NULL")?));
+            }
+            // RETURNING's sequence calls after them, but for a DISTINCT question's rows, made whole
+            // before any is written.
+            if !super::pipeline::says_distinct(s) {
+                kept.extend(calls);
             }
             let mut reduced = q.clone();
             if let SetExpr::Select(s) = reduced.body.as_mut() {

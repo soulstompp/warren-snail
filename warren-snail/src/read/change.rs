@@ -814,6 +814,22 @@ fn met_once(table: &Table, batch: &RecordBatch) -> Result<Vec<usize>> {
 /// write.
 const KEPT: char = '\u{5}';
 
+/// What names each of RETURNING's sequence calls an INSERT's question makes for a row, after the
+/// row's own items.
+pub(super) const RETURNED_CALL: &str = "\u{5}call";
+
+/// How many of RETURNING's sequence calls a question made for each row: the fields at its end
+/// named for them.
+fn calls_made(batch: &RecordBatch) -> usize {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .rev()
+        .take_while(|f| f.name() == RETURNED_CALL)
+        .count()
+}
+
 /// The field a write's row holds column `c` in: its own name for the row as the write left it,
 /// marked for `old` and `new`.
 fn kept_name(side: Option<&str>, c: &str) -> String {
@@ -900,6 +916,42 @@ fn returning_list(
         }
     }
     Ok(out.join(", "))
+}
+
+/// A RETURNING list whose sequence calls each read the value its row's question made, each item
+/// named as it is written.
+fn called_as_made(items: &[sqlparser::ast::SelectItem]) -> Vec<sqlparser::ast::SelectItem> {
+    use sqlparser::ast::{Expr, Ident, SelectItem};
+    let calls: Vec<String> = super::statement::returned_calls(items)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut j = 0;
+    let mut read = |e: &Expr| {
+        let mut e = e.clone();
+        let _ = sqlparser::ast::visit_expressions_mut(&mut e, |x| {
+            if calls.get(j).is_some_and(|c| *c == x.to_string()) {
+                *x = Expr::Identifier(Ident::with_quote('"', format!("{RETURNED_CALL}{j}")));
+                j += 1;
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        e
+    };
+    items
+        .iter()
+        .map(|i| match i {
+            SelectItem::UnnamedExpr(e) => SelectItem::ExprWithAlias {
+                expr: read(e),
+                alias: Ident::with_quote('"', super::pipeline::default_name(e)),
+            },
+            SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
+                expr: read(expr),
+                alias: alias.clone(),
+            },
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// The sequence a column's DEFAULT draws from: its identity's, or its DEFAULT's nextval.
@@ -1940,6 +1992,9 @@ impl Snail {
         source: Source,
         found: &mut Option<Vec<Row>>,
     ) -> Result<Vec<Row>> {
+        if found.is_none() {
+            self.returned_calls.clear();
+        }
         let rows = match (source, found.as_ref()) {
             (_, Some(rows)) => rows.clone(),
             (Source::Values(rows), None) => {
@@ -1960,10 +2015,15 @@ impl Snail {
                     table,
                     &answered(&fill),
                 )?;
-                let given = rows_of(&batch)?
+                let calls = calls_made(&batch);
+                let given: Vec<(Vec<Fill>, Row)> = rows_of(&batch)?
                     .into_iter()
                     .map(|a| (fill.clone(), a))
                     .collect();
+                if calls > 0 {
+                    self.returned_calls
+                        .extend(given.iter().map(|(_, a)| a[a.len() - calls..].to_vec()));
+                }
                 self.filled_from(table, given, &types)?
             }
         };
@@ -2234,11 +2294,22 @@ impl Snail {
         };
         let t = &self.catalog.tables[*table];
         let deleting = matches!(write.written(), Statement::Delete { .. });
+        // The sequence calls each row's question made for the list, read as the row's.
+        let calls = super::statement::returned_calls(items);
+        let made = (!calls.is_empty()
+            && self.returned_calls.len() == kept.len()
+            && self.returned_calls.iter().all(|v| v.len() == calls.len()))
+        .then_some(&self.returned_calls);
         let mut fields: Vec<(String, ColumnType)> = Vec::new();
         for side in [None, Some("old"), Some("new")] {
             for c in &t.columns {
                 fields.push((kept_name(side, &c.name), c.ty));
             }
+        }
+        if made.is_some() {
+            fields.extend(
+                (0..calls.len()).map(|j| (format!("{RETURNED_CALL}{j}"), ColumnType::Int8)),
+            );
         }
         let named: Vec<(&str, ColumnType)> = fields.iter().map(|(n, ty)| (n.as_str(), *ty)).collect();
         let row = super::handed::row_type(&format!("{KEPT}returned"), &named);
@@ -2253,7 +2324,7 @@ impl Snail {
             })
         };
         let mut rows = Vec::with_capacity(kept.len());
-        for c in &kept {
+        for (i, c) in kept.iter().enumerate() {
             let (old, new) = match c {
                 Change::Insert(n) => (None, Some(n)),
                 Change::Delete(o) => (Some(o), None),
@@ -2262,9 +2333,16 @@ impl Snail {
             let mut v = values(if deleting { old } else { new })?;
             v.extend(values(old)?);
             v.extend(values(new)?);
+            if let Some(made) = made {
+                v.extend(made[i].iter().map(|d| fill::value_of(d, ColumnType::Int8)));
+            }
             rows.push(super::Value::row(row, v)?);
         }
-        let list = returning_list(t, alias, items)?;
+        let items = match made {
+            Some(_) => called_as_made(items),
+            None => items.to_vec(),
+        };
+        let list = returning_list(t, alias, &items)?;
         let name = format!("{KEPT}returned");
         let f = super::handed::Function::set_returning(&name, &[], row, move |_| Ok(rows.clone()));
         let mut handed = self.functions.clone();
@@ -2338,8 +2416,8 @@ impl Snail {
         let mut drawn = self.draws(&t, defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut out = Vec::with_capacity(rows.len());
         for (r, q) in rows {
-            let (answers, types) = match q {
-                None => (vec![Row::new()], Vec::new()),
+            let (answers, types, calls) = match q {
+                None => (vec![Row::new()], Vec::new(), 0),
                 Some(q) => {
                     let (batch, _) = self.answer(&q, None)?;
                     let types = assigned_types(&self.catalog, &q, &batch, table, &answered(&r))?;
@@ -2350,10 +2428,13 @@ impl Snail {
                             return Err(Error::new("a VALUES row's question answers its row"));
                         }
                     }
-                    (answers, types)
+                    (answers, types, calls_made(&batch))
                 }
             };
             for a in answers {
+                if calls > 0 {
+                    self.returned_calls.push(a[a.len() - calls..].to_vec());
+                }
                 out.push(self.row_filled(&t, r.clone(), &a, &types, &mut drawn)?);
             }
         }
