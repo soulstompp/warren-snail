@@ -2044,6 +2044,12 @@ fn words(tokens: &[Token]) -> Vec<String> {
 /// other words than it, so nothing it declares is dropped without a word. The words are compared
 /// as a whole, in any order, since sqlparser prints a statement's clauses in an order of its own.
 pub(crate) fn read_as_written(tokens: &[Token], st: &Statement, what: &str) -> Result<()> {
+    read_as_labelled(tokens, st, what, 0)
+}
+
+/// `read_as_written` of a statement writing `bare` labels without AS, which sqlparser prints after
+/// one.
+fn read_as_labelled(tokens: &[Token], st: &Statement, what: &str, bare: usize) -> Result<()> {
     let back: Vec<Token> = crate::read::image::tokens(&st.to_string())?
         .into_iter()
         .map(|t| t.token)
@@ -2068,6 +2074,9 @@ pub(crate) fn read_as_written(tokens: &[Token], st: &Statement, what: &str) -> R
     };
     let lost = less(&a, &b);
     let more = less(&b, &a);
+    if lost.is_empty() && more.len() == bare && more.iter().all(|w| w == "as") {
+        return Ok(());
+    }
     Err(Error::new(format!(
         "{what}: sqlparser 0.63 reads it otherwise than it is written ({}{})",
         if lost.is_empty() {
@@ -3625,7 +3634,10 @@ impl Draft {
                 Ok(Vec::new())
             }
             Statement::CreateView(v) => {
-                read_as_written(tokens, &st, &format!("{kind} {object}"))?;
+                // Its labels as PostgreSQL's grammar reads them, a label without AS sqlparser
+                // prints after one.
+                let bare = crate::read::ddl_labels(&written(tokens))?;
+                read_as_labelled(tokens, &st, &format!("{kind} {object}"), bare)?;
                 let _own = crate::read::own::holding(&self.functions, self.release);
                 self.create_view(v, check)
             }
@@ -7328,7 +7340,11 @@ fn function(
     // The statement as written, and as read: the string after AS; RETURN's expression, read as a
     // SELECT of it; or BEGIN ATOMIC's one statement, a RETURN or a SELECT.
     let (form, statement, selected) = match (sql, quoted) {
-        (None, Some(text)) => (BodyForm::Quoted, text.clone(), text),
+        // The string read as a statement, as CREATE FUNCTION checks it, its labels among it.
+        (None, Some(text)) => {
+            crate::read::ddl_labels(&text)?;
+            (BodyForm::Quoted, text.clone(), text)
+        }
         (Some(SqlBody::Return(text)), None) => {
             whole_expression(&text)?;
             let selected = format!("SELECT {text}");

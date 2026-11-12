@@ -3297,3 +3297,74 @@ fn a_column_named_by_its_schema_and_table() {
         ],
     );
 }
+
+// 18.6 over a file of 18, 19 RC1 over one of 19, the same statements in the same order: a view's
+// labels and a body's after AS are read as a statement's, under the file's release, a label written
+// without AS printed after one.
+#[test]
+fn a_view_s_and_a_body_s_labels_are_the_file_s_release_s() {
+    let syntax = |w: &mut Snail, sql: &str, word: &str| {
+        let near = format!("syntax error at or near \"{word}\"");
+        assert_eq!(refused(w, sql), (Some("42601"), near), "{sql}");
+    };
+    let taken = |w: &mut Snail, sql: &str| {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    };
+    let v4 = "CREATE VIEW v4 AS SELECT 1 \"Quoted\", 2 x, id FROM k WHERE id IN (SELECT 3 y)";
+    let printed = " SELECT 1 AS \"Quoted\",\n    2 AS x,\n    id\n   FROM k\n  WHERE (id IN ( SELECT 3 AS y));";
+    let mut w = keyed_of("labels-18", 18);
+    taken(&mut w, "CREATE VIEW v1 AS SELECT 1 x");
+    answered(
+        &mut w,
+        &[
+            ("SELECT * FROM v1", &["1"]),
+            ("SELECT pg_get_viewdef('v1'::regclass)", &[" SELECT 1 AS x;"]),
+        ],
+    );
+    taken(&mut w, "CREATE VIEW v2 AS SELECT 1 respect");
+    syntax(&mut w, "CREATE VIEW v3 AS SELECT 1 year", "year");
+    taken(&mut w, v4);
+    answered(&mut w, &[("SELECT pg_get_viewdef('v4'::regclass)", &[printed])]);
+    syntax(
+        &mut w,
+        "CREATE FUNCTION f1() RETURNS integer LANGUAGE sql AS $$ SELECT 1 year $$",
+        "year",
+    );
+    taken(&mut w, "CREATE FUNCTION f2() RETURNS integer LANGUAGE sql AS $$ SELECT 1 respect $$");
+    answered(&mut w, &[("SELECT f2()", &["1"])]);
+    taken(&mut w, "CREATE FUNCTION f3() RETURNS integer LANGUAGE sql AS $$ SELECT 1 x $$");
+    answered(&mut w, &[("SELECT f3()", &["1"])]);
+    let mut w = keyed_of("labels-19", 19);
+    taken(&mut w, "CREATE VIEW v1 AS SELECT 1 x");
+    answered(
+        &mut w,
+        &[
+            ("SELECT * FROM v1", &["1"]),
+            ("SELECT pg_get_viewdef('v1'::regclass)", &[" SELECT 1 AS x;"]),
+        ],
+    );
+    syntax(&mut w, "CREATE VIEW v2 AS SELECT 1 respect", "respect");
+    syntax(&mut w, "CREATE VIEW v3 AS SELECT 1 year", "year");
+    taken(&mut w, v4);
+    answered(&mut w, &[("SELECT pg_get_viewdef('v4'::regclass)", &[printed])]);
+    syntax(
+        &mut w,
+        "CREATE FUNCTION f1() RETURNS integer LANGUAGE sql AS $$ SELECT 1 year $$",
+        "year",
+    );
+    syntax(
+        &mut w,
+        "CREATE FUNCTION f2() RETURNS integer LANGUAGE sql AS $$ SELECT 1 respect $$",
+        "respect",
+    );
+    taken(&mut w, "CREATE FUNCTION f3() RETURNS integer LANGUAGE sql AS $$ SELECT 1 x $$");
+    answered(&mut w, &[("SELECT f3()", &["1"])]);
+    // A DDL's file: read whole, then under its release.
+    let ddl = |view: &str| format!("CREATE TABLE k (id integer PRIMARY KEY); {view};");
+    let e = Catalog::parse(&ddl("CREATE VIEW v AS SELECT 1 year")).unwrap_err();
+    assert_eq!((e.sqlstate(), e.to_string()), (Some("42601"), "syntax error at or near \"year\"".into()));
+    let mut c = Catalog::parse(&ddl("CREATE VIEW v AS SELECT 1 respect, 2 x")).unwrap();
+    c.clone().with_release(18).unwrap();
+    let e = c.with_release(19).unwrap_err();
+    assert_eq!(e.to_string(), "syntax error at or near \"respect\"");
+}

@@ -1162,6 +1162,166 @@ fn an_insert_of_constants_alone_inserts_a_row_for_each_its_question_returns() {
 
 #[cfg(feature = "standalone")]
 #[test]
+fn a_constant_its_question_makes_text_is_assigned_as_text_as_postgresql_assigns_it() {
+    let mut s = instants("insert-made-text");
+    s.execute(
+        "CREATE TABLE s.q (k integer NOT NULL, h interval hour DEFAULT '7', n text, v varchar(3), \
+         PRIMARY KEY (k))",
+    )
+    .unwrap();
+    // A string or NULL of no type a DISTINCT, or a DISTINCT ON, ORDER BY or GROUP BY naming its
+    // place or label, makes text: refused where its column takes no text.
+    let not_text = |column: &str, ty: &str| {
+        format!(
+            "column \"{column}\" is of type {ty} but expression is of type text\nHINT:  You will \
+             need to rewrite or cast the expression."
+        )
+    };
+    for (sql, column, ty) in [
+        ("INSERT INTO s.q SELECT DISTINCT 6, '6' FROM s.t", "h", "interval"),
+        ("INSERT INTO s.q SELECT DISTINCT 6, NULL FROM s.t", "h", "interval"),
+        ("INSERT INTO s.q SELECT DISTINCT '8' FROM s.t", "k", "integer"),
+        ("INSERT INTO s.q SELECT DISTINCT 9, E'6' FROM s.t", "h", "interval"),
+        ("INSERT INTO s.q SELECT 10, '6' FROM s.t ORDER BY 2", "h", "interval"),
+        ("INSERT INTO s.q SELECT 11, '6' FROM s.t GROUP BY 2", "h", "interval"),
+        ("INSERT INTO s.q SELECT DISTINCT ON (2) 13, '6' FROM s.t", "h", "interval"),
+        ("INSERT INTO s.q SELECT DISTINCT length(id), '6' FROM s.t", "h", "interval"),
+        ("INSERT INTO s.q SELECT DISTINCT 18, '6' WHERE false", "h", "interval"),
+        ("INSERT INTO s.q SELECT 19, '6' AS x FROM s.t ORDER BY x", "h", "interval"),
+    ] {
+        assert_eq!(refusal(&mut s, sql), (Some("42804"), not_text(column, ty)), "{sql}");
+    }
+    for sql in [
+        "INSERT INTO s.q SELECT DISTINCT 6, NULL::interval FROM s.t",
+        "INSERT INTO s.q (k, n, v) SELECT DISTINCT 7, 'x', 'y' FROM s.t",
+        "INSERT INTO s.q SELECT DISTINCT ON (1) 12, '6' FROM s.t",
+    ] {
+        s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        answer_rows(&mut s, "SELECT * FROM s.q ORDER BY k"),
+        ["6|NULL|NULL|NULL", "7|07:00:00|x|y", "12|06:00:00|NULL|NULL"]
+    );
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn on_conflict_after_a_select_with_no_from_is_read_as_postgresql_reads_it() {
+    let mut s = instants("on-conflict-no-from");
+    for sql in [
+        "CREATE TABLE s.c (k integer NOT NULL, h interval hour DEFAULT '7', n text, PRIMARY KEY (k))",
+        "INSERT INTO s.c SELECT 1, '1'",
+        "INSERT INTO s.c SELECT 8, '9' ON CONFLICT (k) DO NOTHING",
+        "INSERT INTO s.c SELECT 8, '10' ON CONFLICT (k) DO NOTHING",
+        "INSERT INTO s.c SELECT 1, '2', NULL ON CONFLICT (k) DO UPDATE SET n = 'u'",
+        "INSERT INTO s.c SELECT 9 k ON CONFLICT (k) DO NOTHING",
+        "INSERT INTO s.c SELECT 10 AS k ON CONFLICT (k) DO NOTHING",
+    ] {
+        s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        answer_rows(
+            &mut s,
+            "INSERT INTO s.c SELECT 8, '3' ON CONFLICT (k) DO UPDATE SET h = excluded.h RETURNING k, h"
+        ),
+        ["8|03:00:00"]
+    );
+    for sql in [
+        "INSERT INTO s.c SELECT 11, '4', 'x' ON CONFLICT DO NOTHING",
+        "INSERT INTO s.c SELECT 12, now() - now() ON CONFLICT (k) DO NOTHING",
+    ] {
+        s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        answer_rows(&mut s, "SELECT * FROM s.c ORDER BY k"),
+        [
+            "1|01:00:00|u",
+            "8|03:00:00|NULL",
+            "9|07:00:00|NULL",
+            "10|07:00:00|NULL",
+            "11|04:00:00|x",
+            "12|00:00:00|NULL",
+        ]
+    );
+    // Split from a text, as written.
+    assert_eq!(
+        warren_snail::read::statement::split("INSERT INTO s.c SELECT 13, '1' ON CONFLICT (k) DO NOTHING; SELECT 1")
+            .unwrap(),
+        ["INSERT INTO s.c SELECT 13, '1' ON CONFLICT (k) DO NOTHING", "SELECT 1"]
+    );
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn at_time_zone_a_time_with_time_zone_moves_its_zone_as_postgresql_does() {
+    let _zones = zone_files();
+    let mut s = instants("timetz-at-zone");
+    // timetz_izone and timetz_zone: the same moment of the day on the other zone's clock, a zone's
+    // name read at the transaction's start; a time a timetz on the session's zone.
+    for (sql, want) in [
+        (
+            "SELECT timetz '12:00+00' AT TIME ZONE interval '1 hour', timetz '12:00+00' AT TIME ZONE 'UTC'",
+            "13:00:00+01|12:00:00+00",
+        ),
+        (
+            "SELECT timetz '23:30+05' AT TIME ZONE interval '-03:00', timetz '01:00-02' AT TIME ZONE \
+             interval '+05:30', timetz '12:00+00' AT TIME ZONE interval '1.9 seconds'",
+            "15:30:00-03|08:30:00+05:30|12:00:01+00:00:01",
+        ),
+        (
+            "SELECT timetz '12:00+00' AT TIME ZONE 'EST', timetz '12:00+00' AT TIME ZONE '+02'",
+            "07:00:00-05|10:00:00-02",
+        ),
+        (
+            "SELECT timezone('UTC', timetz '12:00+03'), timezone(interval '2 hours', timetz '12:00+03'), \
+             pg_typeof(timetz '12:00+03' AT TIME ZONE 'UTC')",
+            "09:00:00+00|11:00:00+02|time with time zone",
+        ),
+        (
+            "SELECT timetz '12:00+00' AT TIME ZONE NULL::text, NULL::timetz AT TIME ZONE interval '1 hour'",
+            "NULL|NULL",
+        ),
+        (
+            "SELECT time '12:00' AT TIME ZONE 'UTC', time '12:00' AT TIME ZONE interval '2 hours'",
+            "12:00:00+00|14:00:00+02",
+        ),
+        (
+            "SELECT timetz '24:00+00' AT TIME ZONE interval '1 hour', timetz '00:00+00' AT TIME ZONE \
+             interval '-1 hour'",
+            "01:00:00+01|23:00:00-01",
+        ),
+    ] {
+        assert_eq!(answer_rows(&mut s, sql), [want], "{sql}");
+    }
+    #[cfg(feature = "zones")]
+    assert_eq!(
+        answer_rows(
+            &mut s,
+            "SELECT timetz '12:00+00' AT TIME ZONE 'Asia/Kolkata', timetz '12:00+00' AT TIME ZONE 'MSK'"
+        ),
+        ["17:30:00+05:30|15:00:00+03"]
+    );
+    for (sql, words) in [
+        (
+            "SELECT timetz '12:00+00' AT TIME ZONE interval '1 day'",
+            "interval time zone \"1 day\" must not include months or days",
+        ),
+        (
+            "SELECT timetz '12:00+00' AT TIME ZONE interval 'infinity'",
+            "interval time zone \"infinity\" must be finite",
+        ),
+    ] {
+        assert_eq!(refusal(&mut s, sql), (Some("22023"), words.to_string()), "{sql}");
+    }
+    #[cfg(feature = "zones")]
+    assert_eq!(
+        refusal(&mut s, "SELECT timetz '12:00+00' AT TIME ZONE 'Mars/Olympus'"),
+        (Some("22023"), "time zone \"Mars/Olympus\" not recognized".to_string())
+    );
+}
+
+#[cfg(feature = "standalone")]
+#[test]
 fn an_interval_s_qualifier_is_refused_where_postgresql_refuses_it_in_its_words() {
     let mut s = instants("interval-qualified-refused");
     for (sql, code, words) in [

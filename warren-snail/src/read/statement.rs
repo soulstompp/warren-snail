@@ -1210,6 +1210,56 @@ fn computed_rows(
         .collect()
 }
 
+/// Whether an item is a constant of no type: a string written out, or NULL.
+fn of_no_type(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Value(v) if matches!(
+            v.value,
+            Value::SingleQuotedString(_)
+                | Value::EscapedStringLiteral(_)
+                | Value::DollarQuotedString(_)
+                | Value::Null
+        )
+    )
+}
+
+/// The places of a question's items PostgreSQL's analyser makes text where they are of no type:
+/// each of a DISTINCT question's, and each a DISTINCT ON, an ORDER BY or a GROUP BY names by its
+/// place, or but for GROUP BY by its label.
+fn made_text(q: &Query, s: &sqlparser::ast::Select) -> Vec<usize> {
+    use sqlparser::ast::{Distinct, GroupByExpr, OrderByKind};
+    let n = s.projection.len();
+    if matches!(s.distinct, Some(Distinct::Distinct)) {
+        return (0..n).collect();
+    }
+    let place = |e: &Expr, labels: bool| match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(x, _) => x
+                .parse::<usize>()
+                .ok()
+                .filter(|k| (1..=n).contains(k))
+                .map(|k| k - 1),
+            _ => None,
+        },
+        Expr::Identifier(name) if labels => s.projection.iter().position(|p| {
+            matches!(p, SelectItem::ExprWithAlias { alias, .. } if ident(alias) == ident(name))
+        }),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    if let Some(Distinct::On(keys)) = &s.distinct {
+        out.extend(keys.iter().filter_map(|e| place(e, true)));
+    }
+    if let Some(OrderByKind::Expressions(o)) = q.order_by.as_ref().map(|o| &o.kind) {
+        out.extend(o.iter().filter_map(|x| place(&x.expr, true)));
+    }
+    if let GroupByExpr::Expressions(g, _) = &s.group_by {
+        out.extend(g.iter().filter_map(|e| place(e, false)));
+    }
+    out
+}
+
 fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
     let ti = match &i.table {
         TableObject::TableName(n) => table_index(catalog, n)?,
@@ -1285,11 +1335,24 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             let columns = filled(&columns, s.projection.len(), !i.columns.is_empty())?;
             let mut fill = vec![Fill::Default; table.columns.len()];
             let mut kept = Vec::new();
-            for (&c, item) in columns.iter().zip(&s.projection) {
+            let texts = made_text(q, s);
+            for (k, (&c, item)) in columns.iter().zip(&s.projection).enumerate() {
                 let e = match item {
                     SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                     _ => return Err(Error::new("name each column the INSERT's question returns")),
                 };
+                let col = &table.columns[c];
+                if texts.contains(&k)
+                    && of_no_type(e)
+                    && !crate::catalog::assignable(ColumnType::Text(None), col.ty)
+                {
+                    return Err(Error::new(format!(
+                        "column \"{}\" is of type {} but expression is of type text\nHINT:  You \
+                         will need to rewrite or cast the expression.",
+                        col.name,
+                        super::typed::type_name(col.ty)
+                    )));
+                }
                 match literal_or_computed(e, table, c)? {
                     Some(d) => fill[c] = Fill::Literal(d),
                     None => {
@@ -1507,6 +1570,8 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
         if crate::ddl::statements(&ddl)?.len() != 1 {
             return Err(Error::new("one statement at a time"));
         }
+        // A body of LANGUAGE sql after AS, its labels as the file's release reads them.
+        super::spelled::labels_at_release(&ddl, catalog.release)?;
         return Ok(Statement::Declare { ddl, kind });
     }
     let tokens = sqlparser::tokenizer::Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize()?;

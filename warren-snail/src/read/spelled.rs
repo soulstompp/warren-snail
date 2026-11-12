@@ -481,8 +481,9 @@ fn finish(sql: &str, mut out: String, copied: usize) -> Cow<'_, str> {
 }
 
 /// The statement with its words as PostgreSQL's grammar reads them; none where it needs none, or
-/// where sqlparser's tokenizer refuses it, which its parser says. Without `casts`, an interval's
-/// literal is left as written, its fields refused where its grammar refuses them all the same;
+/// where sqlparser's tokenizer refuses it, which its parser says. Without `casts` (a text split),
+/// what is written for sqlparser alone is left as written: an interval's literal, its fields
+/// refused where its grammar refuses them all the same, and the label before ON CONFLICT;
 /// without `rows`, ROWS FROM and a column definition list are left as written.
 fn worded(
     sql: &str,
@@ -499,7 +500,7 @@ fn worded(
     if !as_paren
         && ![
             "isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>", "rows",
-            "setof", "collate",
+            "setof", "collate", "conflict",
         ]
         .iter()
         .any(|w| lower.contains(w))
@@ -832,6 +833,20 @@ fn worded(
                 let with = if w == "ISNULL" { "IS NULL" } else { "IS NOT NULL" };
                 swaps.push((solid[i].1, solid[i].2, with.to_string()));
             }
+            // ON CONFLICT after a select list with no FROM, which sqlparser reads as the last
+            // item's label: an alias that names nothing given that item first, where it has none.
+            Some("ON")
+                if casts
+                    && word(i + 1).as_deref() == Some("CONFLICT")
+                    && in_list.last().copied().unwrap_or(false)
+                    && i >= 2
+                    && word(i - 2).as_deref() != Some("AS")
+                    && !(matches!(solid[i - 1].0, Token::Word(_))
+                        && (ends_a_value(&solid[i - 2].0, release)
+                            || matches!(word(i - 2).as_deref(), Some("NULL" | "TRUE" | "FALSE")))) =>
+            {
+                swaps.push((solid[i].1, solid[i].1, format!("AS \"{ROWS_MARK}\" ")));
+            }
             // An interval's type or literal, its fields read as PostgreSQL's grammar reads them. A
             // literal is written as the cast its grammar makes of it, `'…'::interval` before its
             // fields or `'…'::interval(p)`, whose type sqlparser reads with its fields; a
@@ -967,8 +982,76 @@ fn ends_a_value(t: &Token, release: u8) -> bool {
 /// only after AS: a keyword the release's list says requires it (`SELECT 1 year`), refused at the
 /// label as the grammar refuses it. sqlparser takes such a word for the label.
 fn bare_labels(sql: &str, release: u8) -> Result<()> {
+    labels_written_bare(sql, &|w| wants_as(w, release), false).map(|_| ())
+}
+
+/// Whether a word the release's list holds stands as a label only after AS.
+fn wants_as(word: &str, release: u8) -> bool {
+    matches!(keyword(word, release), Some((c, false)) if c != 'R')
+}
+
+/// The labels a DDL's statement writes without AS, which sqlparser prints after one: refused at the
+/// first that stands only after AS under every release the snail reads, as `bare_labels` refuses
+/// it; else how many there are. Each release's own word is the statement's, read where its file's
+/// release is known (`labels_at_release`).
+pub(crate) fn ddl_labels(sql: &str) -> Result<usize> {
+    labels_written_bare(sql, &|w| wants_as(w, 18) && wants_as(w, crate::regs::LATEST), true)
+}
+
+/// A DDL statement's labels and those of its bodies of LANGUAGE sql after AS, as `bare_labels`
+/// reads them under `release`, where CREATE FUNCTION checks a body as a statement.
+pub(crate) fn labels_at_release(sql: &str, release: u8) -> Result<()> {
+    bare_labels(sql, release)?;
+    for body in sql_bodies(sql) {
+        bare_labels(&body, release)?;
+    }
+    Ok(())
+}
+
+/// The bodies after AS of a CREATE FUNCTION or PROCEDURE of LANGUAGE sql, as their strings hold
+/// them; none for any other statement.
+pub(crate) fn sql_bodies(sql: &str) -> Vec<String> {
+    let Ok(tokens) = super::statement::spans(sql) else {
+        return Vec::new();
+    };
+    let solid: Vec<&Token> = tokens
+        .iter()
+        .map(|t| &t.0)
+        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    let word = |i: usize| match solid.get(i) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+        _ => None,
+    };
+    let routine = word(0).as_deref() == Some("CREATE")
+        && (matches!(word(1).as_deref(), Some("FUNCTION" | "PROCEDURE"))
+            || word(1).as_deref() == Some("OR")
+                && word(2).as_deref() == Some("REPLACE")
+                && matches!(word(3).as_deref(), Some("FUNCTION" | "PROCEDURE")));
+    let in_sql = (0..solid.len()).any(|i| {
+        word(i).as_deref() == Some("LANGUAGE")
+            && match solid.get(i + 1) {
+                Some(Token::Word(w)) => w.value.eq_ignore_ascii_case("sql"),
+                Some(Token::SingleQuotedString(s)) => s.eq_ignore_ascii_case("sql"),
+                _ => false,
+            }
+    });
+    if !(routine && in_sql) {
+        return Vec::new();
+    }
+    (0..solid.len())
+        .filter(|&i| word(i).as_deref() == Some("AS"))
+        .filter_map(|i| string_of(solid.get(i + 1).copied()))
+        .collect()
+}
+
+/// The labels of a statement's select lists and RETURNING lists that sqlparser took where no AS is
+/// written before them: refused at the first in the order written that `wants` says stands only
+/// after AS; else how many of them there are, each counted where `all`, else only those `wants`
+/// names (none: they are refused).
+fn labels_written_bare(sql: &str, wants: &dyn Fn(&str) -> bool, all: bool) -> Result<usize> {
     let Ok(tokens) = super::image::tokens(sql) else {
-        return Ok(());
+        return Ok(0);
     };
     let mut before: Option<&Token> = None;
     let mut bare = Vec::new();
@@ -978,32 +1061,36 @@ fn bare_labels(sql: &str, release: u8) -> Result<()> {
         }
         if let Token::Word(w) = &t.token {
             let after_as = matches!(before, Some(Token::Word(b)) if b.quote_style.is_none() && b.keyword == Keyword::AS);
-            let needs_as = matches!(keyword(&w.value, release), Some((c, false)) if c != 'R');
-            if w.quote_style.is_none() && needs_as && !after_as {
+            let wanted = w.quote_style.is_none() && wants(&w.value);
+            if (all || wanted) && !after_as {
                 bare.push(t.span.start);
             }
         }
         before = Some(&t.token);
     }
     if bare.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let Ok(statements) = sqlparser::parser::Parser::new(&sqlparser::dialect::PostgreSqlDialect {})
         .with_tokens_with_locations(tokens)
         .parse_statements()
     else {
-        return Ok(());
+        return Ok(0);
     };
     struct Labels<'b> {
         bare: &'b [Location],
-        found: Vec<(Location, String)>,
+        found: Vec<(Location, String, bool)>,
     }
     impl Labels<'_> {
         fn items(&mut self, items: &[SelectItem]) {
             for item in items {
                 if let SelectItem::ExprWithAlias { alias, .. } = item {
-                    if alias.quote_style.is_none() && self.bare.contains(&alias.span.start) {
-                        self.found.push((alias.span.start, alias.value.clone()));
+                    if self.bare.contains(&alias.span.start) {
+                        self.found.push((
+                            alias.span.start,
+                            alias.value.clone(),
+                            alias.quote_style.is_none(),
+                        ));
                     }
                 }
             }
@@ -1039,9 +1126,16 @@ fn bare_labels(sql: &str, release: u8) -> Result<()> {
     }
     let mut labels = Labels { bare: &bare, found: Vec::new() };
     let _ = sqlparser::ast::Visit::visit(&statements, &mut labels);
-    match labels.found.into_iter().min_by_key(|(at, _)| (at.line, at.column)) {
-        Some((_, word)) => Err(Error::new(format!("syntax error at or near \"{word}\""))),
-        None => Ok(()),
+    labels.found.sort_by_key(|(at, _, _)| (at.line, at.column));
+    labels.found.dedup_by_key(|(at, _, _)| (at.line, at.column));
+    let refused = labels
+        .found
+        .iter()
+        .filter(|(_, word, unquoted)| *unquoted && wants(word))
+        .min_by_key(|(at, _, _)| (at.line, at.column));
+    match refused {
+        Some((_, word, _)) => Err(Error::new(format!("syntax error at or near \"{word}\""))),
+        None => Ok(labels.found.len()),
     }
 }
 
@@ -2280,27 +2374,8 @@ fn precisions_named(sql: &str) -> Vec<String> {
         .map(|(_, w)| w.clone())
         .collect();
     // CREATE FUNCTION checks a body of LANGUAGE sql after AS as a statement.
-    let routine = word(0).as_deref() == Some("CREATE")
-        && (matches!(word(1).as_deref(), Some("FUNCTION" | "PROCEDURE"))
-            || word(1).as_deref() == Some("OR")
-                && word(2).as_deref() == Some("REPLACE")
-                && matches!(word(3).as_deref(), Some("FUNCTION" | "PROCEDURE")));
-    let in_sql = (0..solid.len()).any(|i| {
-        word(i).as_deref() == Some("LANGUAGE")
-            && match solid.get(i + 1) {
-                Some(Token::Word(w)) => w.value.eq_ignore_ascii_case("sql"),
-                Some(Token::SingleQuotedString(s)) => s.eq_ignore_ascii_case("sql"),
-                _ => false,
-            }
-    });
-    if routine && in_sql {
-        for i in 0..solid.len() {
-            if word(i).as_deref() == Some("AS") {
-                if let Some(body) = string_of(solid.get(i + 1).copied()) {
-                    out.extend(precisions_named(&body));
-                }
-            }
-        }
+    for body in sql_bodies(&sql) {
+        out.extend(precisions_named(&body));
     }
     out
 }

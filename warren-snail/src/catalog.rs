@@ -3123,9 +3123,13 @@ impl Catalog {
     }
 
     /// Each type its columns, its functions' arguments and its domains name, under `release`: refused
-    /// where the release has no such type.
+    /// where the release has no such type, and where a view or a function's body writes a label
+    /// without the AS the release's keywords want.
     pub fn with_release(&mut self, release: u8) -> Result<()> {
         crate::regs::check_release(None, release)?;
+        for tokens in crate::ddl::statements(&self.ddl)? {
+            crate::read::labels_at_release(&crate::ddl::written(&tokens), release)?;
+        }
         // An index on GiST taking inet's operator class unnamed takes 19's default, which an
         // earlier release lacks: the DDL read again under it refuses that one.
         let gist_inet = self.tables.iter().flat_map(|t| &t.orders).any(|o| {

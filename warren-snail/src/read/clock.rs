@@ -563,10 +563,13 @@ pub(super) fn zone_sets(name: &str, now: i64) -> Result<Option<Vec<Value>>> {
 /// A value AT TIME ZONE `zone`, as PostgreSQL's timestamptz_zone and timestamp_zone take it: an
 /// instant as the zone's clock shows it, and a time on the zone's clock as the instant it is. A zone
 /// other than UTC is read only under the feature zones; an interval as `at_interval` reads it. A
-/// date is the instant of its midnight, as PostgreSQL resolves it to timezone(…, timestamptz).
+/// date is the instant of its midnight, as PostgreSQL resolves it to timezone(…, timestamptz); a
+/// time a timetz on the session's zone, as it resolves it to timezone(…, timetz), whose zone a
+/// name gives as the zone's offset where the transaction began (timetz_zone).
 pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
     let v = match time_of(&v) {
         Some(ColumnType::Date) => cast(v, ColumnType::Timestamptz)?,
+        Some(ColumnType::Time(_)) => cast(v, ColumnType::Timetz(None))?,
         _ => v,
     };
     let name = match zone {
@@ -618,6 +621,15 @@ pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
             };
             Value::Scalar(ColumnType::Timestamptz, at)
         }
+        (Some(ColumnType::Timetz(_)), Value::Scalar(_, k)) => {
+            let utc = crate::scalars::transaction_clock().div_euclid(1_000_000);
+            let east = match &abbreviated {
+                Some(times::Abbreviated::Fixed(east, _)) => *east,
+                Some(times::Abbreviated::Zone(zone)) => times::abbrev_utc_offset(zone, &name, utc)?.0,
+                None => crate::zones::utc_offset(&name, utc)?,
+            };
+            timetz_at(*k, i64::from(east))?
+        }
         _ => {
             return Err(Error::new(format!(
                 "{} AT TIME ZONE is not read",
@@ -627,16 +639,34 @@ pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
     })
 }
 
-/// A value AT TIME ZONE an interval, as PostgreSQL's timestamptz_izone and timestamp_izone take it:
-/// the zone the interval's whole seconds east of UTC, its fraction cut toward zero; an infinite
-/// value as it is, before the interval is read; an infinite interval, or one with months or days,
-/// refused in PostgreSQL's words.
+/// A timetz on the clock of a zone `east` seconds east of UTC, as timetz_zone and timetz_izone
+/// move it: the same moment of the day, its time within the day.
+fn timetz_at(k: i64, east: i64) -> Result<Value> {
+    let (time, west) = crate::scalars::timetz_parts(k);
+    // The zones a timetz's key holds.
+    if !(-65_536..65_536).contains(&-east) {
+        return Err(Error::new(
+            "a time with time zone more than 18:12:16 from UTC is not held",
+        ));
+    }
+    let moved = (time + (i64::from(west) + east) * 1_000_000).rem_euclid(times::MICROS_PER_DAY);
+    Ok(Value::Scalar(
+        ColumnType::Timetz(None),
+        crate::scalars::timetz_key(moved, -east as i32),
+    ))
+}
+
+/// A value AT TIME ZONE an interval, as PostgreSQL's timestamptz_izone, timestamp_izone and
+/// timetz_izone take it: the zone the interval's whole seconds east of UTC, its fraction cut toward
+/// zero; an infinite value as it is, before the interval is read; an infinite interval, or one with
+/// months or days, refused in PostgreSQL's words.
 fn at_interval(v: Value, zone: times::Interval) -> Result<Value> {
     let (ty, t) = match (time_of(&v), &v) {
         (_, Value::Null) => return Ok(Value::Null),
-        (Some(ty @ (ColumnType::Timestamptz | ColumnType::Timestamp(_))), Value::Scalar(_, t)) => {
-            (ty, *t)
-        }
+        (
+            Some(ty @ (ColumnType::Timestamptz | ColumnType::Timestamp(_) | ColumnType::Timetz(_))),
+            Value::Scalar(_, t),
+        ) => (ty, *t),
         _ => {
             return Err(Error::new(format!(
                 "{} AT TIME ZONE is not read",
@@ -648,7 +678,8 @@ fn at_interval(v: Value, zone: times::Interval) -> Result<Value> {
         ColumnType::Timestamptz => ColumnType::Timestamp(None),
         _ => ColumnType::Timestamptz,
     };
-    if t == i64::MIN || t == i64::MAX {
+    let timetz = matches!(ty, ColumnType::Timetz(_));
+    if !timetz && (t == i64::MIN || t == i64::MAX) {
         return Ok(Value::Scalar(other, t));
     }
     let shown = times::interval_out(zone);
@@ -661,6 +692,9 @@ fn at_interval(v: Value, zone: times::Interval) -> Result<Value> {
         return Err(Error::new(format!(
             "interval time zone \"{shown}\" must not include months or days"
         )));
+    }
+    if timetz {
+        return timetz_at(t, zone.micros / 1_000_000);
     }
     let east = i128::from(zone.micros / 1_000_000) * 1_000_000;
     let moved = match ty {
