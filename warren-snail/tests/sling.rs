@@ -3163,3 +3163,99 @@ fn a_relation_joined_after_an_on_is_missing_there() {
         );
     }
 }
+
+/// A LATERAL right side of a RIGHT or FULL JOIN that reads nothing of its left side, a subquery or
+/// a function, made once over the rows before the join (a relation before it read by each of its
+/// rows), and met as any right side: as 18.6 answers, over k8's rows and with no transfer.
+#[test]
+fn a_lateral_right_side_of_a_right_or_full_join_reading_nothing_of_its_left_is_answered() {
+    let path = declared("lateral-right", K8, &K8_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT t.request, x.one FROM k8.tr t RIGHT JOIN LATERAL (SELECT 1 AS one) x ON true \
+                 ORDER BY 1",
+                &["T1|1", "T2|1", "T3|1"],
+            ),
+            (
+                "SELECT t.request, g FROM k8.tr t FULL JOIN LATERAL generate_series(1, 2) g ON true \
+                 ORDER BY 1, 2",
+                &["T1|1", "T1|2", "T2|1", "T2|2", "T3|1", "T3|2"],
+            ),
+            (
+                "SELECT t.request, a.account, x.b FROM k8.tr t, k8.accounts a RIGHT JOIN LATERAL \
+                 (SELECT t.to_account AS b) x ON true ORDER BY 1, 2, 3",
+                &[
+                    "T1|A1|A2", "T1|A2|A2", "T1|C1|A2", "T2|A1|C1", "T2|A2|C1", "T2|C1|C1",
+                    "T3|A1|X9", "T3|A2|X9", "T3|C1|X9",
+                ],
+            ),
+            (
+                "SELECT t.request, x.n FROM k8.tr t, LATERAL (SELECT count(*) AS n FROM k8.accounts s \
+                 RIGHT JOIN LATERAL (SELECT t.to_account AS b) y ON y.b = s.account) x ORDER BY 1",
+                &["T1|1", "T2|1", "T3|1"],
+            ),
+            (
+                "SELECT t.request, x.one FROM k8.tr t RIGHT JOIN LATERAL (SELECT 1 AS one) x \
+                 ON t.request = 'T2' ORDER BY 1",
+                &["T2|1"],
+            ),
+            (
+                "SELECT t.request, g FROM k8.tr t FULL JOIN LATERAL generate_series(1, 4) g \
+                 ON g = length(t.request) + 1 ORDER BY 1, 2",
+                &["T1|3", "T2|3", "T3|3", "NULL|1", "NULL|2", "NULL|4"],
+            ),
+            (
+                "SELECT t.request, x.c FROM k8.tr t RIGHT JOIN LATERAL (SELECT count(*) AS c \
+                 FROM k8.closed) x ON true ORDER BY 1",
+                &["T1|0", "T2|0", "T3|0"],
+            ),
+            (
+                "SELECT a.account, x.k FROM k8.accounts a FULL JOIN LATERAL (SELECT c.account AS k \
+                 FROM k8.closed c) x ON x.k = a.account ORDER BY 1",
+                &["A1|NULL", "A2|NULL", "C1|NULL"],
+            ),
+            (
+                "SELECT t.request, a.account FROM k8.tr t RIGHT JOIN LATERAL (SELECT s.account \
+                 FROM k8.accounts s WHERE s.bank = 'BC') a ON a.account = t.to_account ORDER BY 1, 2",
+                &["T2|C1"],
+            ),
+            // After a comma, each join holding a LATERAL side made for each row before it.
+            (
+                "SELECT t.request, a.account, x.b FROM k8.tr t, k8.accounts a LEFT JOIN LATERAL \
+                 (SELECT t.to_account AS b) x ON x.b = a.account ORDER BY 1, 2, 3",
+                &[
+                    "T1|A1|NULL", "T1|A2|A2", "T1|C1|NULL", "T2|A1|NULL", "T2|A2|NULL",
+                    "T2|C1|C1", "T3|A1|NULL", "T3|A2|NULL", "T3|C1|NULL",
+                ],
+            ),
+            (
+                "SELECT count(*) FROM k8.tr t, k8.accounts a JOIN generate_series(1, 2) g ON true",
+                &["18"],
+            ),
+            (
+                "SELECT t.request, count(*) FROM k8.tr t, k8.accounts a FULL JOIN LATERAL \
+                 (SELECT t.to_account AS b) x ON x.b = a.account GROUP BY 1 ORDER BY 1",
+                &["T1|3", "T2|3", "T3|4"],
+            ),
+        ],
+    );
+    w.execute("DELETE FROM k8.tr").unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT t.request, x.one FROM k8.tr t RIGHT JOIN LATERAL (SELECT 1 AS one) x ON true \
+                 ORDER BY 1",
+                &["NULL|1"],
+            ),
+            (
+                "SELECT t.request, g FROM k8.tr t FULL JOIN LATERAL generate_series(1, 2) g ON true \
+                 ORDER BY 1, 2",
+                &["NULL|1", "NULL|2"],
+            ),
+        ],
+    );
+}

@@ -1491,6 +1491,15 @@ impl Node {
             _ => false,
         }
     }
+
+    /// Whether a FROM item holds a function or a LATERAL subquery anywhere in it, which may read
+    /// the relations laid before the item.
+    fn holds_lateral(&self) -> bool {
+        match &self.what {
+            What::Join { left, right, .. } => left.holds_lateral() || right.holds_lateral(),
+            _ => self.lateral(),
+        }
+    }
 }
 
 /// A step's FROM, laid out: its columns in the row it makes, and its relations, each item after
@@ -2975,7 +2984,7 @@ impl Reading<'_> {
         run.seal()?;
         self.order = order;
         let rows = Rows::one(run);
-        if self.asked_again && !node.lateral() {
+        if self.asked_again && !node.holds_lateral() {
             self.cached.insert(node, rows.clone());
         } else {
             rows.last_reader();
@@ -4886,7 +4895,7 @@ fn read_from(
     let mut order = reading.order;
     for (k, item) in rest.iter().enumerate() {
         reading.order = None;
-        if item.lateral() {
+        if item.holds_lateral() {
             reading.foresee_lateral(item, &rows, &[])?;
             let run = Run::new();
             rows.clone().each_chunk(&mut |c| {

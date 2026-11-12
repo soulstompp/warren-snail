@@ -8,7 +8,7 @@
 use super::{conjuncts, Kind, Merged, Node, Reading};
 use crate::read::pipeline::{self, parted, Key, Value};
 use crate::read::spill::{Chunk, Rows, Run, CHUNK};
-use crate::{Error, Result};
+use crate::Result;
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::HashMap;
 
@@ -424,18 +424,23 @@ impl Reading<'_> {
             width,
         };
         let mut out = Chunk::new(each);
+        // A LATERAL right side of a RIGHT or FULL JOIN reads nothing of its left side: made once,
+        // over the rows before the join, its left side's columns NULL, and met as a side made whole.
+        let rrows = match (rrows, kind) {
+            (None, Kind::Right | Kind::Full) => {
+                let start = before.map_or(left.at, |(s, _)| s);
+                let mut ctx: Vec<Value> = before.map(|(_, r)| r.to_vec()).unwrap_or_default();
+                ctx.resize(ctx.len() + left.width, Value::Null);
+                Some(self.place(right, Some((start, &ctx)), false)?)
+            }
+            (r, _) => r,
+        };
         match rrows {
             Some(rrows) => match self.join_keys(left, right, on, &usings, &frame, around) {
                 Some(keys) => hash_join(&keys, &pairs, kind, &lrows, &rrows, &mut out)?,
                 None => nested_loop(&pairs, kind, &lrows, &rrows, &mut out)?,
             },
             None => {
-                if matches!(kind, Kind::Right | Kind::Full) {
-                    return Err(Error::new(
-                        "invalid reference to FROM-clause entry: a RIGHT or FULL JOIN to a LATERAL \
-                         function",
-                    ));
-                }
                 self.foresee_lateral(right, &lrows, before.map_or(&[], |(_, r)| r))?;
                 lrows.each_chunk(&mut |c| {
                     for l in c {
