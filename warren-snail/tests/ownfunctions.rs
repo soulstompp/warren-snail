@@ -244,8 +244,8 @@ fn returns_takes_the_body_s_value_as_postgresql_assigns_it() {
 #[test]
 fn create_function_refuses_a_body_as_postgresql_refuses_it_when_it_is_made() {
     for (body, returns, why) in [
-        ("SELECT ''a''::text", "integer", "return type mismatch in function declared to return integer: Actual return type is text."),
-        ("SELECT ''5''", "integer", "return type mismatch in function declared to return integer: Actual return type is text."),
+        ("SELECT ''a''::text", "integer", "return type mismatch in function declared to return integer\nDETAIL:  Actual return type is text."),
+        ("SELECT ''5''", "integer", "return type mismatch in function declared to return integer\nDETAIL:  Actual return type is text."),
         ("SELECT x", "integer", "column \"x\" does not exist"),
         ("SELECT t.x", "integer", "missing FROM-clause entry for table \"t\""),
         ("SELECT c4.nope($1)", "integer", "function c4.nope(integer) does not exist"),
@@ -265,6 +265,42 @@ fn create_function_refuses_a_body_as_postgresql_refuses_it_when_it_is_made() {
         e.to_string().contains("function \"f\" already exists with same argument types"),
         "{e}"
     );
+}
+
+#[test]
+fn create_function_s_and_a_named_call_s_refusals_carry_postgresql_s_codes() {
+    // As 18.6 refused each on 28818 (2026-11-12), its VERBOSITY verbose.
+    for (ddl, code) in [
+        ("c4.bad(integer) RETURNS integer LANGUAGE sql AS 'SELECT ''a''::text'", "42P13"),
+        ("c4.unk(integer) RETURNS integer LANGUAGE sql AS 'SELECT ''5'''", "42P13"),
+        ("c10.e1(a integer DEFAULT 1, b integer) RETURNS integer RETURN a", "42P13"),
+        ("c10.e2(a integer, a integer) RETURNS integer RETURN a", "42P13"),
+        ("c10.e4(a integer DEFAULT true) RETURNS integer RETURN a", "42804"),
+        ("c10.e6(a integer DEFAULT (SELECT 1)) RETURNS integer RETURN a", "0A000"),
+        ("c10.e8(a integer) RETURNS integer LANGUAGE plpgsql RETURN a", "42P13"),
+        ("c10.e9(a integer) RETURNS integer LANGUAGE sql AS 'SELECT 1' RETURN a", "42P13"),
+        ("c10.e10(a integer) RETURNS integer RETURN 'x'::text", "42P13"),
+        ("c10.e12(a integer) RETURNS integer BEGIN ATOMIC END", "42P13"),
+        ("c10.e14(a integer) RETURNS integer RETURN 'x'", "42P13"),
+        ("c10.e23(a integer) RETURNS integer AS 'SELECT a + 1'", "42P13"),
+    ] {
+        let ddl = format!("CREATE SCHEMA c4; CREATE SCHEMA c10; CREATE FUNCTION {ddl};");
+        let e = Catalog::parse(&ddl).err().unwrap_or_else(|| panic!("{ddl} was taken"));
+        assert_eq!(e.sqlstate(), Some(code), "{ddl}: {e}");
+    }
+    let path = written(
+        "named-codes",
+        "CREATE SCHEMA c9; \
+         CREATE FUNCTION c9.named(a integer, b integer DEFAULT 2) RETURNS integer RETURN a + b;",
+    );
+    let mut s = Snail::open(&path).unwrap();
+    for sql in [
+        "SELECT c9.named(a => 1, a => 2)",
+        "SELECT c9.named(a => 1, 2)",
+    ] {
+        let e = s.ask(sql, None).unwrap_err();
+        assert_eq!(e.sqlstate(), Some("42601"), "{sql}: {e}");
+    }
 }
 
 #[test]

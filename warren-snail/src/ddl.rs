@@ -3623,8 +3623,8 @@ impl Draft {
                 if let Some(t) = body {
                     if t != f.returns && !crate::catalog::assignable(t, f.returns) {
                         return Err(Error::new(format!(
-                            "return type mismatch in function declared to return {}: Actual \
-                             return type is {}.",
+                            "return type mismatch in function declared to return {}\nDETAIL:  \
+                             Actual return type is {}.",
                             f.returns.pg_name(),
                             t.pg_name()
                         )));
@@ -7353,8 +7353,8 @@ fn function(
         (Some(SqlBody::Atomic(statements)), None) => match statements.as_slice() {
             [] => {
                 return Err(Error::new(format!(
-                    "return type mismatch in function declared to return {}: Function's final \
-                     statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+                    "return type mismatch in function declared to return {}\nDETAIL:  Function's \
+                     final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
                     returns.pg_name()
                 )))
             }

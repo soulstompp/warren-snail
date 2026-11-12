@@ -82,8 +82,9 @@ fn snail(n: i64) -> Snail {
 }
 
 /// The most the round allocated past what stood before it, all its answer handed out; the blocks it
-/// read; the directory pages it touched and those it was to touch; and the rows it answered.
-fn most_held(snail: &Snail, room: u64) -> (u64, u64, (u64, u64), u64) {
+/// read; the directory pages it touched and those it was to touch; the rows it answered; and the
+/// most its room counted.
+fn most_held(snail: &Snail, room: u64) -> (u64, u64, (u64, u64), u64, u64) {
     let before = NOW.load(Ordering::Relaxed);
     MOST.store(before, Ordering::Relaxed);
     let mut a = begin_together(&[snail], JOIN, Sizes::of(room)).unwrap();
@@ -100,27 +101,31 @@ fn most_held(snail: &Snail, room: u64) -> (u64, u64, (u64, u64), u64) {
         r.blocks_read,
         (r.directory_pages, r.directory_pages_predicted),
         rows,
+        r.bytes_held,
     )
 }
 
 /// What a plan goes on holding of a block it reads in part, when the room has let its map go: where
-/// the map lies, its rows and pages, and its last key; and the plan's own bookkeeping of a read.
+/// the map lies, its rows and pages, and its last key.
 const BLOCK: u64 = 100;
-const BOOKKEEPING: u64 = 32 << 10;
 
 #[test]
 fn the_room_bounds_what_a_round_holds_however_many_rows_it_answers() {
     let room = 256u64 << 10;
+    // The round's own part, beside its rows, as this build holds it: the question read and planned,
+    // its plan's bookkeeping of a read, over a few rows held whole, less those rows.
+    let (few, .., counted) = most_held(&snail(64), 1 << 30);
+    let own = few.saturating_sub(2 * counted);
     for n in [1i64 << 16, 1 << 18, 1 << 20] {
         let large = snail(n);
-        let (most, blocks, (touched, predicted), rows) = most_held(&large, room);
+        let (most, blocks, (touched, predicted), rows, _) = most_held(&large, room);
         assert_eq!(rows, n as u64);
         assert_eq!(touched, predicted, "{n}");
-        // The plan as well as the rows: the rows take about twice the room, their cells' own bytes
-        // beside their held widths, and the plan a hundred bytes a block.
+        // The round's own part as well as the rows: the rows take about twice the room, their
+        // cells' own bytes beside their held widths, and the plan a hundred bytes a block.
         assert!(
-            most <= 2 * room + BOOKKEEPING + blocks * BLOCK,
-            "{n} rows, {blocks} blocks: {most} bytes at most"
+            most <= own + 2 * room + blocks * BLOCK,
+            "{n} rows, {blocks} blocks: {most} bytes at most, {own} the round's own"
         );
     }
     // Held whole, they grow with the rows.

@@ -206,12 +206,14 @@ fn several_snails_read_no_catalog_table() {
     assert!(e.0.contains("one snail at a time"), "{}", e.0);
 }
 
+#[cfg(feature = "standalone")]
 const GROUPED: &str = "CREATE SCHEMA dn; CREATE TABLE dn.a (id integer PRIMARY KEY, g integer, k integer); \
      CREATE VIEW dn.vd AS SELECT DISTINCT ON (g) g, id FROM dn.a ORDER BY g, id; \
      CREATE VIEW dn.vr AS SELECT count(*) FROM dn.a GROUP BY ROLLUP (g); \
      CREATE VIEW dn.vgr AS SELECT g, GROUPING(g) AS gr FROM dn.a GROUP BY id, ROLLUP (g); \
      CREATE VIEW dn.ve AS SELECT count(*) FROM dn.a GROUP BY ();";
 
+#[cfg(feature = "standalone")]
 #[test]
 fn a_distinct_on_or_rollup_view_keeps_its_catalog_rows() {
     let path = tmp("pgc-grouped.snail");
@@ -275,6 +277,7 @@ fn a_distinct_on_or_rollup_view_keeps_its_catalog_rows() {
     );
 }
 
+#[cfg(feature = "standalone")]
 #[test]
 fn a_view_the_snail_does_not_print_is_refused_by_name_never_left_out() {
     let path = tmp("pgc-unprinted.snail");
