@@ -63,6 +63,11 @@ pub(super) trait Reads {
     fn strand_wins(&self, q: &Question, strand: &str) -> Result<bool>;
     /// How many snails the tables lie in.
     fn snails(&self) -> usize;
+    /// Whether its tables are read with their rows: not where a question's shape is found over a
+    /// catalog whose tables hold none.
+    fn holds_rows(&self) -> bool {
+        true
+    }
 }
 
 /// The mark a function's place in a FROM is named by, once lifted out of it.
@@ -408,6 +413,7 @@ impl Tie<'_, '_> {
             types: self.types,
             now: self.asked.now,
             subqueries: None,
+            reads: Some(self.asked.reads),
             below: None,
         }
     }
@@ -3727,6 +3733,7 @@ impl Reading<'_> {
             types: self.types,
             now: self.now,
             subqueries: None,
+            reads: Some(self.reads),
             below: None,
         };
         // A function's columns of one value it gives.
@@ -4026,7 +4033,7 @@ fn values_step(
     accrued: &Accrued,
     casings: &Casings,
 ) -> Result<Made> {
-    let (params, release) = (asked.params, asked.release);
+    let (params, release, reads) = (asked.params, asked.release, asked.reads);
     let SetExpr::Values(v) = step.query.body.as_ref() else {
         unreachable!("a VALUES step")
     };
@@ -4065,6 +4072,7 @@ fn values_step(
         types: &typing.types,
         now: crate::scalars::transaction_clock(),
         subqueries: (!plans.is_empty()).then_some(&subs as &dyn pipeline::Subqueries),
+        reads: Some(reads),
         below: None,
     };
     let none = pipeline::computed_none();
@@ -4733,6 +4741,20 @@ pub(super) fn answer_rows(
         round.snails = accrued.parts.into_inner();
     }
     Ok((rows, names, round))
+}
+
+/// The first row a question makes, none where it makes none: a call of the file's function whose
+/// body reads relations takes it.
+pub(super) fn first_row(reads: &dyn Reads, q: &Query) -> Result<Option<Vec<Value>>> {
+    let (last, _, _) = answered(reads, q, &[], false)?;
+    let mut first = None;
+    last.into_rows()?.each_chunk(&mut |rows| {
+        if first.is_none() {
+            first = rows.into_iter().next();
+        }
+        Ok(())
+    })?;
+    Ok(first)
 }
 
 fn answered(
@@ -5718,6 +5740,7 @@ fn select_step(
             types: &p.types,
             now,
             subqueries: Some(&subs),
+            reads: Some(asked.reads),
             below: None,
         };
         let row = vec![Value::Null; from.columns.len()];
@@ -5794,6 +5817,7 @@ fn select_step(
         .collect();
     let mut run = pipeline::StepRun::new(p);
     run.hands_on = true;
+    run.reads = Some(asked.reads);
     if !plans.is_empty() {
         run.subqueries = Some(&subs);
     }
@@ -6029,6 +6053,7 @@ fn tied_keeps(
         types,
         now: asked.now,
         subqueries: None,
+        reads: Some(asked.reads),
         below: None,
     };
     let none = pipeline::computed_none();
@@ -6207,6 +6232,10 @@ impl Reads for Empty<'_> {
 
     fn snails(&self) -> usize {
         1
+    }
+
+    fn holds_rows(&self) -> bool {
+        false
     }
 }
 

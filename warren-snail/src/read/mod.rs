@@ -1721,10 +1721,10 @@ impl Snail {
         // Its constants folded before any row is read, as PostgreSQL's planner folds them; its
         // parameters' values among them, as a statement bound to them is planned.
         match params.is_empty() {
-            true => folded::folded(&self.catalog, sql)?,
+            true => folded::folded(&self.catalog, sql, Some(&*self))?,
             false => {
                 if let Ok(bound) = statement::with_params(sql, params) {
-                    folded::folded(&self.catalog, &bound)?;
+                    folded::folded(&self.catalog, &bound, Some(&*self))?;
                 }
             }
         }
@@ -1812,6 +1812,16 @@ impl Snail {
                 if order.is_some() {
                     return Err(Error::new(
                         "a question holding a subquery chooses its orders itself",
+                    ));
+                }
+                return self.ask_pipeline(q, params);
+            }
+            // So is a call of the file's function whose body reads relations, which asks the snail.
+            if own::reads_relations(&self.catalog, q) {
+                if order.is_some() {
+                    return Err(Error::new(
+                        "a question calling a function whose body reads relations chooses its \
+                         orders itself",
                     ));
                 }
                 return self.ask_pipeline(q, params);
@@ -1904,6 +1914,7 @@ impl Snail {
             || pipeline::samples(q)
             || names_system
             || pipeline::reads_whole_rows(&self.catalog, q)
+            || own::reads_relations(&self.catalog, q)
         {
             return relations::answer(self, q, params);
         }

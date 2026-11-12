@@ -1791,12 +1791,12 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Statement> {
             }
             let table = &catalog.tables[ti];
             let mut sets = sets_of(table, &u.assignments)?;
-            // A value set by a subquery is read on the row it changes, as a FROM's are, over a FROM
-            // listing nothing more.
+            // A value set by a subquery, or by a function of the file whose body reads relations,
+            // is read on the row it changes, as a FROM's are, over a FROM listing nothing more.
             let reads_a_set = u.assignments.iter().any(|a| {
                 let mut found = Vec::new();
                 super::pipeline::subqueries_in(&a.value, &mut found);
-                !found.is_empty()
+                !found.is_empty() || super::own::reads_relations(catalog, &a.value)
             });
             let none = sqlparser::ast::UpdateTableFromKind::AfterSet(Vec::new());
             let from = match (&u.from, reads_a_set) {

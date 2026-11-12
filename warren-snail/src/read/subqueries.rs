@@ -118,6 +118,10 @@ impl Reads for Cached<'_> {
     fn snails(&self) -> usize {
         self.reads.snails()
     }
+
+    fn holds_rows(&self) -> bool {
+        self.reads.holds_rows()
+    }
 }
 
 /// What a subquery's place asks of its rows.
@@ -719,7 +723,7 @@ impl<'a, 'q> Subs<'a, 'q> {
                 return Ok(r.clone());
             }
             // Its one-time conditions first, as its plan starts.
-            super::folded::gated(self.asked.reads.catalog(), &plan.query.to_string())?;
+            super::folded::gated(self.asked.reads.catalog(), &plan.query.to_string(), Some(self.asked.reads))?;
             let (m, _) = relations::made_by(
                 asked,
                 &plan.query,

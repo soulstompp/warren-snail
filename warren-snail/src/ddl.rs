@@ -3844,7 +3844,7 @@ impl Draft {
                         "{name}: a parameter or result of the domain {d} is not read"
                     ))),
                 };
-                let f = function(f, sql, &held)?;
+                let f = function(f, sql, &held, &self.relations_read())?;
                 if let Some(g) = self.functions.iter().find(|g| g.name == f.name) {
                     let last = f.name.rsplit('.').next().unwrap_or(&f.name);
                     return Err(Error::new(match g.args == f.args {
@@ -7727,30 +7727,63 @@ fn whole_expression(text: &str) -> Result<()> {
     }
 }
 
-/// A body's one statement read: a SELECT of one expression and nothing else, its expression.
-fn body_expression(name: &str, text: &str) -> Result<Expr> {
+/// A body's one statement read: a SELECT of one expression and nothing else, its expression; any
+/// other question, as a subquery of it, which a call runs as its statement. A question of other
+/// than one column is refused as PostgreSQL refuses it when the function is made.
+fn body_expression(
+    name: &str,
+    text: &str,
+    returns: ColumnType,
+    relations: &crate::read::own::Relations,
+) -> Result<Expr> {
     let refused = |e: Error| Error::new(format!("{name}: its body: {e}"));
     // Its words as a statement's are read, then its operators as PostgreSQL's grammar binds them.
     let text = crate::read::scanned_unseeded(text, crate::regs::LATEST).map_err(refused)?;
     let bound = crate::grammar::bound(&text);
     let parsed =
         crate::read::image::parse_sql(bound.as_deref().unwrap_or(&text)).map_err(refused)?;
-    match parsed.as_slice() {
-        [Statement::Query(q)] => match q.body.as_ref() {
-            SetExpr::Select(s)
-                if s.from.is_empty() && s.selection.is_none() && s.projection.len() == 1 =>
-            {
-                match &s.projection[0] {
-                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                        Ok(e.clone())
-                    }
-                    _ => Err(Error::new(format!("{name}: its body is not one expression"))),
+    let [Statement::Query(q)] = parsed.as_slice() else {
+        return Err(Error::new(format!("{name}: its body is not one SELECT")));
+    };
+    let alone = q.with.is_none()
+        && q.order_by.is_none()
+        && q.limit_clause.is_none()
+        && q.fetch.is_none()
+        && q.locks.is_empty();
+    if let SetExpr::Select(s) = q.body.as_ref() {
+        let grouped = !matches!(
+            &s.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
+        );
+        if alone
+            && s.from.is_empty()
+            && s.selection.is_none()
+            && s.having.is_none()
+            && s.distinct.is_none()
+            && !grouped
+            && s.projection.len() == 1
+        {
+            return match &s.projection[0] {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    Ok(e.clone())
                 }
-            }
-            _ => Err(Error::new(format!("{name}: its body is not one expression"))),
-        },
-        _ => Err(Error::new(format!("{name}: its body is not one SELECT"))),
+                _ => Err(Error::new(format!("{name}: its body is not one expression"))),
+            };
+        }
     }
+    if crate::read::own::columns_written(q, relations).is_some_and(|n| n != 1) {
+        return Err(one_column(returns));
+    }
+    Ok(Expr::Subquery(q.clone()))
+}
+
+/// PostgreSQL's refusal of a function whose last statement returns other than one column.
+pub(crate) fn one_column(returns: ColumnType) -> Error {
+    Error::new(format!(
+        "return type mismatch in function declared to return {}\nDETAIL:  Final statement must \
+         return exactly one column.",
+        returns.pg_name()
+    ))
 }
 
 /// A function written in SQL: its name, its parameters' types, names and DEFAULTs, and its body's
@@ -7760,6 +7793,7 @@ fn function(
     f: &sqlparser::ast::CreateFunction,
     sql: Option<SqlBody>,
     held: &dyn Fn(&DataType) -> Result<ColumnType>,
+    relations: &crate::read::own::Relations,
 ) -> Result<Function> {
     let name = object_name(&f.name);
     let language = f.language.as_ref().map(ident);
@@ -7899,7 +7933,7 @@ fn function(
         },
         _ => return Err(Error::new("no function body specified")),
     };
-    let body = body_expression(&name, &selected)?;
+    let body = body_expression(&name, &selected, returns, relations)?;
     let source = match form {
         BodyForm::Quoted => statement.clone(),
         _ => String::new(),

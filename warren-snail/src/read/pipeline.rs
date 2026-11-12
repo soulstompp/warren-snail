@@ -631,6 +631,9 @@ pub(super) struct Frame<'a> {
     pub(super) now: i64,
     /// What answers the step's subqueries, where it has any.
     pub(super) subqueries: Option<&'a dyn Subqueries>,
+    /// The snail the statement reads, where its step is read over relations: a call of the file's
+    /// function whose body reads relations asks it its body's statement.
+    pub(super) reads: Option<&'a dyn super::relations::Reads>,
     /// The values a step makes below its fold and its windows, where it makes any (`Below`).
     pub(super) below: Option<&'a Below>,
 }
@@ -8599,9 +8602,33 @@ pub(crate) fn eval_typed(
         types,
         now: crate::scalars::transaction_clock(),
         subqueries: None,
+        reads: None,
         below: None,
     };
     eval(e, row, &frame, &computed_none())
+}
+
+/// An expression over no row, in the types its typing gave it, a call of the file's function whose
+/// body reads relations asking `reads` where it is given.
+pub(super) fn eval_reading(
+    e: &Expr,
+    reads: Option<&dyn super::relations::Reads>,
+    release: u8,
+    casings: &Casings,
+    types: &super::typed::Types,
+) -> Result<Value> {
+    let frame = Frame {
+        columns: Vec::new(),
+        params: &[],
+        release,
+        casings,
+        types,
+        now: crate::scalars::transaction_clock(),
+        subqueries: None,
+        reads,
+        below: None,
+    };
+    eval(e, &[], &frame, &computed_none())
 }
 
 /// The types of an expression on one row whose columns are those given, and of each expression in
@@ -8641,6 +8668,7 @@ pub(crate) fn eval_on_as(
         types: &types,
         now: crate::scalars::transaction_clock(),
         subqueries: None,
+        reads: None,
         below: None,
     };
     eval(e, row, &frame, &computed_none())
@@ -9136,6 +9164,8 @@ pub(super) struct StepRun<'q> {
     columns: Columns,
     /// What answers its subqueries, where it has any.
     pub(super) subqueries: Option<&'q dyn Subqueries>,
+    /// The snail the statement reads, where the step is read over relations.
+    pub(super) reads: Option<&'q dyn super::relations::Reads>,
     /// The row a step that groups with no GROUP BY folds no row into reads its columns from: NULL,
     /// where none is given.
     pub(super) empty_row: Option<Vec<Value>>,
@@ -9177,6 +9207,7 @@ impl<'q> StepRun<'q> {
             hands_on: false,
             columns: Vec::new(),
             subqueries: None,
+            reads: None,
             empty_row: None,
         }
     }
@@ -9223,6 +9254,7 @@ impl<'q> StepRun<'q> {
             types: &self.p.types,
             now: self.p.now,
             subqueries: self.subqueries,
+            reads: self.reads,
             below: Some(&self.p.below),
         };
         let none = computed_none();
@@ -9383,6 +9415,7 @@ impl<'q> StepRun<'q> {
             types: &self.p.types,
             now: self.p.now,
             subqueries: self.subqueries,
+            reads: self.reads,
             below: Some(&self.p.below),
         };
         if let (None, Some(l)) = (&self.going.cut, &self.p.limit) {
@@ -9415,6 +9448,7 @@ impl<'q> StepRun<'q> {
             types: &self.p.types,
             now: self.p.now,
             subqueries: self.subqueries,
+            reads: self.reads,
             below: Some(&self.p.below),
         };
         if !self.partitions_out.is_empty() {
@@ -10069,6 +10103,7 @@ impl<'q> Stream<'q> {
             types: &run.p.types,
             now: run.p.now,
             subqueries: run.subqueries,
+            reads: run.reads,
             below: None,
         })
     }

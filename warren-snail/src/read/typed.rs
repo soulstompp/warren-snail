@@ -786,15 +786,18 @@ impl Typing<'_> {
                 else_result,
                 ..
             } => {
-                if let Some(o) = operand {
-                    self.type_of(o)?;
-                }
+                let compared_to = match operand {
+                    Some(o) => self.type_of(o)?,
+                    None => None,
+                };
                 let mut arms = Vec::with_capacity(conditions.len() + 1);
                 for c in conditions {
                     match operand {
                         None => self.condition(&c.condition, "CASE/WHEN")?,
+                        // Each WHEN is the operand's `=`, which void has none of.
                         Some(_) => {
-                            self.type_of(&c.condition)?;
+                            let t = self.type_of(&c.condition)?;
+                            void_compared(compared_to, t)?;
                         }
                     }
                     arms.push((&c.result, self.type_of(&c.result)?));
@@ -1788,20 +1791,30 @@ pub(super) fn multirange_range(ty: ColumnType) -> Option<ColumnType> {
     }
 }
 
+/// An `=` of two values, refused as PostgreSQL's parser refuses it where either is void.
+fn void_compared(a: Option<ColumnType>, b: Option<ColumnType>) -> Result<()> {
+    if [a, b].contains(&Some(super::prng::VOID)) {
+        statistics_operator("=", a, b)?;
+    }
+    Ok(())
+}
+
 /// The type a comparison, a pattern or `||` returns beside a value of the planner's statistics
 /// types, as PostgreSQL resolves it: they have no operator of their own, and each casts implicitly
 /// to text, through its output, and to bytea, as its bytes. Beside bytea, bytea's form; beside a
 /// string or an untyped literal, text's for a comparison or a pattern, `||` no unique one; beside
 /// another of them, no unique form; beside any other type, none. Their kin that hold only NULL
-/// cast to neither, and have no comparison. None where neither side is one, or the operator is
-/// none of these.
+/// cast to neither, and have no comparison, nor has void, what a function of no value answers.
+/// None where neither side is one, or the operator is none of these.
 pub(super) fn statistics_operator(
     op: &str,
     a: Option<ColumnType>,
     b: Option<ColumnType>,
 ) -> Result<Option<ColumnType>> {
     let statistics = |t: Option<ColumnType>| match t {
-        Some(ColumnType::Internal(i)) if i.is_bytes() => Some(i),
+        Some(ColumnType::Internal(i)) if i.is_bytes() || i == crate::textual::Internal::Void => {
+            Some(i)
+        }
         _ => None,
     };
     let (x, y) = (statistics(a), statistics(b));
@@ -2077,6 +2090,10 @@ fn case_type(arms: &[(&Expr, Option<ColumnType>)], has_else: bool) -> Result<Opt
 /// in kind. A quoted literal among them is read in that type, refused here where it reads as none.
 /// None for any other call.
 fn chosen(name: &str, args: &[&Expr], types: &[Option<ColumnType>]) -> Result<Option<ColumnType>> {
+    // NULLIF compares by `=`, which void has none of.
+    if let ("nullif", [a, b]) = (name, types) {
+        void_compared(*a, *b)?;
+    }
     let ty = match (name, types) {
         ("coalesce" | "least" | "greatest", _) => {
             let t = common_type(types, &name.to_uppercase())?;

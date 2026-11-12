@@ -45,17 +45,30 @@ use std::rc::Rc;
 
 /// A statement's constants folded: the first failure among them, in the planner's order, where
 /// one fails; then its one-time conditions.
-pub(super) fn folded(catalog: &Catalog, sql: &str) -> Result<()> {
-    read(catalog, sql, true)
+pub(super) fn folded(
+    catalog: &Catalog,
+    sql: &str,
+    reads: Option<&dyn super::relations::Reads>,
+) -> Result<()> {
+    read(catalog, sql, reads, true)
 }
 
 /// A query's one-time conditions alone, its constants folded with the statement it stands in: a
 /// subquery reading nothing of the query around it, as a row first asks for it.
-pub(super) fn gated(catalog: &Catalog, sql: &str) -> Result<()> {
-    read(catalog, sql, false)
+pub(super) fn gated(
+    catalog: &Catalog,
+    sql: &str,
+    reads: Option<&dyn super::relations::Reads>,
+) -> Result<()> {
+    read(catalog, sql, reads, false)
 }
 
-fn read(catalog: &Catalog, sql: &str, fold: bool) -> Result<()> {
+fn read(
+    catalog: &Catalog,
+    sql: &str,
+    reads: Option<&dyn super::relations::Reads>,
+    fold: bool,
+) -> Result<()> {
     let bound = crate::grammar::bound(sql);
     let Ok(parsed) = super::image::parse_sql(bound.as_deref().unwrap_or(sql)) else {
         return Ok(());
@@ -84,6 +97,7 @@ fn read(catalog: &Catalog, sql: &str, fold: bool) -> Result<()> {
         inlining: RefCell::new(Vec::new()),
         read: RefCell::new(HashSet::new()),
         places: Cell::new(0),
+        reads,
     };
     if fold {
         folding.level(&q, &Rc::new(Withs::default()), &[], &Reading::default())?;
@@ -380,6 +394,9 @@ struct Folding<'c, 'a> {
     /// (0 the whole row).
     read: RefCell<HashSet<(usize, u32, i16)>>,
     places: Cell<usize>,
+    /// The snail the statement reads, which a call of the file's function whose body reads
+    /// relations asks its body's statement.
+    reads: Option<&'c dyn super::relations::Reads>,
 }
 
 impl<'c, 'a> Folding<'c, 'a> {
@@ -1934,7 +1951,7 @@ impl<'c, 'a> Folding<'c, 'a> {
         let Ok(types) = pipeline::typed_on(&e, &[], self.release) else {
             return Ok(Shape::Varies(Vec::new()));
         };
-        match pipeline::eval_typed(&e, Vec::new(), &[], self.release, &self.casings, &types) {
+        match pipeline::eval_reading(&e, self.reads, self.release, &self.casings, &types) {
             Ok(v) => {
                 let text = match (n.ty(), &v) {
                     (cat::BOOL, pipeline::Value::Bool(b)) => {

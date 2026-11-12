@@ -3459,6 +3459,88 @@ fn random_draws_as_postgresql_draws_after_setseed() {
     }
 }
 
+// void, what setseed answers, has no operator, no equality and no ordering: each comparison, each
+// DISTINCT, grouping and UNION refused as 18.6's parser refuses it, before any row, over a table of
+// no rows and of one alike. IS NULL and UNION ALL ask neither.
+#[test]
+fn void_is_compared_and_kept_distinct_by_nothing() {
+    let path = tmp("reader-void.snail");
+    write(&path, &Catalog::parse(DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    let unequal = "could not identify an equality operator for type void";
+    let compared = [
+        ("SELECT 1 FROM dn.a WHERE setseed(0) = setseed(0)", "42883", "operator does not exist: void = void"),
+        ("SELECT 1 FROM dn.a WHERE setseed(0) <> setseed(0)", "42883", "operator does not exist: void <> void"),
+        ("SELECT 1 FROM dn.a WHERE setseed(0) < setseed(0)", "42883", "operator does not exist: void < void"),
+        (
+            "SELECT 1 FROM dn.a WHERE setseed(0) IS DISTINCT FROM setseed(0)",
+            "42883",
+            "operator does not exist: void = void",
+        ),
+        ("SELECT 1 FROM dn.a WHERE setseed(0) = 1", "42883", "operator does not exist: void = integer"),
+        ("SELECT 1 FROM dn.a WHERE 1 = setseed(0)", "42883", "operator does not exist: integer = void"),
+        ("SELECT 1 FROM dn.a WHERE setseed(0) = 'x'", "42883", "operator does not exist: void = unknown"),
+        ("SELECT 1 FROM dn.a WHERE setseed(0) IN (setseed(0))", "42883", "operator does not exist: void = void"),
+        (
+            "SELECT 1 FROM dn.a WHERE setseed(0) BETWEEN setseed(0) AND setseed(0)",
+            "42883",
+            "operator does not exist: void >= void",
+        ),
+        (
+            "SELECT 1 FROM dn.a WHERE NULLIF(setseed(0), setseed(0)) IS NULL",
+            "42883",
+            "operator does not exist: void = void",
+        ),
+        (
+            "SELECT CASE setseed(0) WHEN setseed(0) THEN 1 END FROM dn.a",
+            "42883",
+            "operator does not exist: void = void",
+        ),
+        (
+            "SELECT 1 FROM dn.a WHERE false AND setseed(0) = setseed(0)",
+            "42883",
+            "operator does not exist: void = void",
+        ),
+        ("SELECT DISTINCT setseed(0) FROM dn.a", "42883", unequal),
+        ("SELECT setseed(0) FROM dn.a GROUP BY 1", "42883", unequal),
+        ("SELECT count(DISTINCT setseed(0)) FROM dn.a", "42883", unequal),
+        (
+            "SELECT setseed(0) FROM dn.a ORDER BY 1",
+            "42883",
+            "could not identify an ordering operator for type void\nHINT:  Use an explicit \
+             ordering operator or modify the query.",
+        ),
+        ("SELECT DISTINCT ON (setseed(0)) 1 FROM dn.a", "42883", unequal),
+        ("SELECT setseed(0) FROM dn.a UNION SELECT setseed(0) FROM dn.a", "42883", unequal),
+    ];
+    refusals(&mut w, &compared);
+    answered(
+        &mut w,
+        &[
+            ("SELECT 1 FROM dn.a WHERE setseed(0) IS NULL", &[]),
+            ("SELECT setseed(0) FROM dn.a UNION ALL SELECT setseed(0) FROM dn.a", &[]),
+        ],
+    );
+    w.execute("INSERT INTO dn.a VALUES (1, 10, 'x', 'one')").unwrap();
+    refusals(
+        &mut w,
+        &[
+            ("SELECT 1 FROM dn.a WHERE setseed(0) = setseed(0)", "42883", "operator does not exist: void = void"),
+            ("SELECT DISTINCT setseed(0) FROM dn.a", "42883", unequal),
+            ("SELECT count(DISTINCT setseed(0)) FROM dn.a", "42883", unequal),
+            ("SELECT setseed(0) FROM dn.a GROUP BY 1", "42883", unequal),
+            ("SELECT setseed(0) FROM dn.a UNION SELECT setseed(0) FROM dn.a", "42883", unequal),
+        ],
+    );
+    answered(
+        &mut w,
+        &[
+            ("SELECT 1 FROM dn.a WHERE setseed(0) IS NULL", &[]),
+            ("SELECT setseed(0) FROM dn.a UNION ALL SELECT setseed(0) FROM dn.a", &["", ""]),
+        ],
+    );
+}
+
 // The array functions as `||` reads them, each in the array type of its arguments' common type.
 #[test]
 fn array_append_prepend_and_cat_answer_as_postgresql() {

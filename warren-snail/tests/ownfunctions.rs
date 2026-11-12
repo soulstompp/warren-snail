@@ -336,6 +336,169 @@ fn a_body_s_subquery_reads_its_relations_columns_before_the_parameters() {
     assert_eq!(Catalog::parse(&ddl).unwrap_err().to_string(), "column \"y\" does not exist");
 }
 
+const READING: &str = "CREATE SCHEMA fo; \
+     CREATE TABLE fo.src (k integer NOT NULL, v integer, PRIMARY KEY (k)); \
+     CREATE TABLE fo.none (k integer NOT NULL, v integer, PRIMARY KEY (k)); \
+     CREATE TABLE fo.one (x integer PRIMARY KEY); \
+     CREATE FUNCTION fo.fsi(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT (SELECT 1/$1 FROM fo.src LIMIT 1)'; \
+     CREATE FUNCTION fo.fsv(integer) RETURNS integer LANGUAGE sql VOLATILE AS 'SELECT (SELECT 1/$1 FROM fo.src LIMIT 1)'; \
+     CREATE FUNCTION fo.fsn(integer) RETURNS integer LANGUAGE sql VOLATILE AS 'SELECT (SELECT 1/$1 FROM fo.none LIMIT 1)'; \
+     CREATE FUNCTION fo.ff(integer) RETURNS integer LANGUAGE sql AS 'SELECT 1/$1 FROM fo.src LIMIT 1'; \
+     CREATE FUNCTION fo.fv(x integer) RETURNS integer LANGUAGE sql RETURN (SELECT v FROM fo.src WHERE k = x); \
+     CREATE FUNCTION fo.fmany() RETURNS integer LANGUAGE sql AS 'SELECT v FROM fo.src ORDER BY k DESC'; \
+     CREATE FUNCTION fo.fnone() RETURNS integer LANGUAGE sql AS 'SELECT v FROM fo.none'; \
+     CREATE FUNCTION fo.fsum(x integer) RETURNS bigint LANGUAGE sql STABLE RETURN (SELECT sum(v) FROM fo.src WHERE k <= x); \
+     CREATE FUNCTION fo.fex(x integer) RETURNS boolean LANGUAGE sql RETURN EXISTS (SELECT 1 FROM fo.src WHERE k = x); \
+     CREATE FUNCTION fo.fin(x integer) RETURNS boolean LANGUAGE sql RETURN x IN (SELECT k FROM fo.src); \
+     CREATE FUNCTION fo.fstrict(x integer) RETURNS integer LANGUAGE sql STRICT AS 'SELECT v FROM fo.src WHERE k = $1'; \
+     CREATE FUNCTION fo.fnamed(x integer, y integer DEFAULT 10) RETURNS bigint LANGUAGE sql RETURN (SELECT count(*) FROM fo.src WHERE v > y) + x; \
+     CREATE FUNCTION fo.fbig() RETURNS bigint LANGUAGE sql AS 'SELECT v FROM fo.src'; \
+     CREATE FUNCTION fo.fwhere(integer) RETURNS integer LANGUAGE sql AS 'SELECT 1 WHERE $1 > 0'; \
+     CREATE FUNCTION fo.fcall(integer) RETURNS integer LANGUAGE sql AS 'SELECT fo.fv($1) + k FROM fo.src WHERE k = $1'; \
+     CREATE FUNCTION fo.frec(integer) RETURNS integer LANGUAGE sql AS 'SELECT coalesce((SELECT 1 + fo.frec($1 - 1) WHERE $1 > 0), 0)'; \
+     CREATE FUNCTION fo.fgrp() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM fo.src GROUP BY v > 15 ORDER BY 1 DESC'; \
+     CREATE FUNCTION fo.fonestar() RETURNS integer LANGUAGE sql AS 'SELECT * FROM fo.one'; \
+     CREATE FUNCTION fo.fthree() RETURNS integer LANGUAGE sql AS 'SELECT v FROM fo.src ORDER BY k DESC LIMIT 3'; \
+     CREATE FUNCTION fo.fquote(t text) RETURNS bigint LANGUAGE sql RETURN (SELECT count(*) FROM fo.src WHERE t = 'it''s'); \
+     CREATE FUNCTION fo.fwrap(x integer) RETURNS integer LANGUAGE sql RETURN fo.fv(x) + 1; \
+     CREATE FUNCTION fo.fempty() RETURNS integer LANGUAGE sql AS 'SELECT 1 / count(*)::integer FROM fo.src';";
+
+#[test]
+#[cfg(feature = "standalone")]
+fn a_body_reading_relations_is_called_as_its_statement_through_the_caller_s_snail() {
+    // As 18.6 answered and refused each, in this order, over the same DDL and rows (2026-11-12).
+    let path = written("reading-bodies", READING);
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO fo.src VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+        .unwrap();
+    let zero = |w: &mut Snail, sql: &str| {
+        let e = w.execute(sql).err().unwrap_or_else(|| panic!("{sql} was taken"));
+        assert_eq!((e.sqlstate(), e.to_string().as_str()), (Some("22012"), "division by zero"), "{sql}");
+    };
+    asked(&mut w, "SELECT fo.fsi(1)", &["1"]);
+    // An immutable call of constants is called as the statement is planned, over no row too.
+    zero(&mut w, "SELECT fo.fsi(0)");
+    zero(&mut w, "SELECT fo.fsi(0) FROM fo.none");
+    asked(&mut w, "SELECT fo.fsi(k) FROM fo.src ORDER BY k", &["1", "0", "0", "0"]);
+    asked(&mut w, "SELECT fo.fsv(0) FROM fo.none", &[]);
+    zero(&mut w, "SELECT fo.fsv(0)");
+    // Its statement is planned with the argument as a constant: folded over a table of no rows.
+    zero(&mut w, "SELECT fo.fsn(0)");
+    // A statement with a FROM gives its first row.
+    asked(&mut w, "SELECT fo.ff(1), fo.ff(2)", &["1|0"]);
+    asked(&mut w, "SELECT fo.ff(0) FROM fo.none", &[]);
+    zero(&mut w, "SELECT fo.ff(k - 1) FROM fo.src ORDER BY k");
+    asked(
+        &mut w,
+        "SELECT k, fo.fv(k) FROM fo.src ORDER BY k",
+        &["1|10", "2|20", "3|30", "4|40"],
+    );
+    asked(&mut w, "SELECT fo.fv(9)", &["NULL"]);
+    asked(&mut w, "SELECT fo.fmany(), fo.fnone()", &["40|NULL"]);
+    asked(&mut w, "SELECT k FROM fo.src WHERE fo.fsum(k) > 30 ORDER BY k", &["3", "4"]);
+    asked(
+        &mut w,
+        "SELECT fo.fex(2), fo.fex(9), fo.fin(3), fo.fin(NULL)",
+        &["t|f|t|NULL"],
+    );
+    asked(&mut w, "SELECT fo.fstrict(NULL), fo.fstrict(2)", &["NULL|20"]);
+    asked(&mut w, "SELECT fo.fnamed(1), fo.fnamed(y => 25, x => 0)", &["4|2"]);
+    asked(
+        &mut w,
+        "SELECT fo.fbig(), fo.fwhere(1), fo.fwhere(0), fo.fonestar()",
+        &["10|1|NULL|NULL"],
+    );
+    asked(&mut w, "SELECT fo.fcall(2), fo.fgrp()", &["22|3"]);
+    // Its first row; a constant of a quoted argument.
+    asked(
+        &mut w,
+        "SELECT fo.fthree(), fo.fquote('it''s'), fo.fquote('its')",
+        &["40|4|0"],
+    );
+    // Through a function of the file whose body is inlined.
+    asked(
+        &mut w,
+        "SELECT k, fo.fwrap(k) FROM fo.src ORDER BY k",
+        &["1|11", "2|21", "3|31", "4|41"],
+    );
+    // A subquery's shape found over tables holding no rows calls no body.
+    asked(&mut w, "SELECT (SELECT fo.fempty()), (SELECT fo.frec(8))", &["0|8"]);
+    asked(
+        &mut w,
+        "SELECT k, fo.fsum(k) FROM fo.src ORDER BY fo.fsum(k) DESC",
+        &["4|100", "3|60", "2|30", "1|10"],
+    );
+    asked(&mut w, "SELECT sum(fo.fv(k)) FROM fo.src", &["100"]);
+    asked(
+        &mut w,
+        "SELECT k FROM fo.src GROUP BY k HAVING fo.fex(k + 1) ORDER BY k",
+        &["1", "2", "3"],
+    );
+    asked(
+        &mut w,
+        "SELECT (SELECT fo.fv(2)), EXISTS (SELECT 1 FROM fo.src WHERE v = fo.fv(k))",
+        &["20|t"],
+    );
+    asked(
+        &mut w,
+        "SELECT a.k FROM fo.src a JOIN fo.src b ON b.k = a.k + 1 AND fo.fex(b.k) ORDER BY 1",
+        &["1", "2", "3"],
+    );
+    asked(&mut w, "VALUES (fo.fv(1)), (fo.fv(3))", &["10", "30"]);
+    asked(
+        &mut w,
+        "UPDATE fo.src SET v = fo.fsum(1) + v WHERE k = 4 RETURNING v",
+        &["50"],
+    );
+    asked(&mut w, "SELECT fo.fsum(4)", &["110"]);
+    w.execute("INSERT INTO fo.none SELECT k, fo.fv(k) FROM fo.src WHERE k < 3")
+        .unwrap();
+    asked(&mut w, "SELECT * FROM fo.none ORDER BY k", &["1|10", "2|20"]);
+    w.execute("DELETE FROM fo.none WHERE fo.fex(k + 1)").unwrap();
+    asked(&mut w, "SELECT count(*) FROM fo.none", &["0"]);
+    asked(
+        &mut w,
+        "UPDATE fo.src SET v = fo.fsum(1) WHERE k = 3 RETURNING v",
+        &["10"],
+    );
+    w.execute("INSERT INTO fo.none VALUES (7, fo.fv(3))").unwrap();
+    asked(&mut w, "SELECT * FROM fo.none", &["7|10"]);
+    // A body calling itself through a subquery, each level a statement of its own: deep on a thread
+    // its host gave a stack of its own and said so, shallow on one whose host said nothing; past
+    // PostgreSQL's depth refused alike.
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            warren_snail::read::stack_given(1 << 30);
+            let mut s = Snail::open(&path).unwrap();
+            assert_eq!(question(&mut s, "SELECT fo.frec(1000)").unwrap(), ["1000"]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    asked(&mut w, "SELECT fo.frec(3)", &["3"]);
+    let e = w.execute("SELECT fo.frec(10000)").unwrap_err();
+    assert_eq!(e.sqlstate(), Some("54001"), "{e}");
+    // A body of other than one column is refused as the function is made, a star by the columns
+    // of the relations it names.
+    for body in ["SELECT k, v FROM fo.src", "SELECT * FROM fo.src", "SELECT s.* FROM fo.src s"] {
+        let ddl = format!(
+            "CREATE SCHEMA fo; CREATE TABLE fo.src (k integer NOT NULL, v integer, PRIMARY KEY (k)); \
+             CREATE FUNCTION fo.e() RETURNS integer LANGUAGE sql AS '{body}';"
+        );
+        let e = Catalog::parse(&ddl).err().unwrap_or_else(|| panic!("{body} was taken"));
+        assert_eq!(
+            (e.sqlstate(), e.to_string().as_str()),
+            (
+                Some("42P13"),
+                "return type mismatch in function declared to return integer\nDETAIL:  Final \
+                 statement must return exactly one column."
+            ),
+            "{body}"
+        );
+    }
+}
+
 #[test]
 fn create_function_s_and_a_named_call_s_refusals_carry_postgresql_s_codes() {
     // As 18.6 refused each on 28818 (2026-11-12), its VERBOSITY verbose.

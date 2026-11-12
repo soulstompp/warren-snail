@@ -4,7 +4,9 @@
 //! calls it: each argument computed once, left to right, and a STRICT function answering NULL for a
 //! NULL argument without its body. Which of the two, it decides from the body and the arguments, by
 //! the strictness, volatility and cost its catalog gives each function, operator and cast they
-//! hold; those are read here from the catalog the snail carries for the file's release.
+//! hold; those are read here from the catalog the snail carries for the file's release. A body
+//! that reads relations is never inlined: its statement is run through the snail the caller reads,
+//! each argument a constant in it, and its first row is the call's value.
 
 use super::pipeline::{Casings, Computed, Frame, Value};
 use crate::catalog::{ColumnType, Function};
@@ -36,6 +38,9 @@ pub(crate) struct Own {
     uses: Vec<usize>,
     /// What its body holds, by the catalog's word on each function, operator and cast in it.
     held: Props,
+    /// Where its body reads relations (a subquery, or a statement more than one expression), the
+    /// statement a call asks the snail, as written.
+    question: Option<String>,
     /// Why it is not called, where its body is not read.
     refused: Option<String>,
 }
@@ -177,6 +182,7 @@ fn stub(f: &Function) -> Own {
         types: Default::default(),
         uses: vec![1; f.args.len()],
         held: Props::default(),
+        question: None,
         refused: Some("its body is not made yet".into()),
     }
 }
@@ -203,6 +209,58 @@ pub(crate) fn relations_of(catalog: &crate::catalog::Catalog) -> Relations {
         (crate::oids::full(&v.name), Readable { columns, table: false })
     });
     tables.chain(views).collect()
+}
+
+/// How many columns a question returns, as its words and `relations` tell: a SELECT's items, a
+/// star's the relations it names; a set operation's first arm's; a VALUES list's first row's. None
+/// where a star names what is not known here.
+pub(crate) fn columns_written(q: &sqlparser::ast::Query, relations: &Relations) -> Option<usize> {
+    use sqlparser::ast::{SelectItem, SelectItemQualifiedWildcardKind, SetExpr};
+    fn of(body: &SetExpr, with: &[String], relations: &Relations) -> Option<usize> {
+        match body {
+            SetExpr::Select(s) => {
+                let scopes = Scopes {
+                    levels: Vec::new(),
+                    with: vec![with.to_vec()],
+                };
+                let items = || match scopes.items(s, relations) {
+                    Level::Items(i) => Some(i),
+                    Level::Nothing => Some(Vec::new()),
+                    Level::Unknown => None,
+                };
+                let mut n: usize = 0;
+                for item in &s.projection {
+                    n += match item {
+                        SelectItem::Wildcard(_) => {
+                            items()?.iter().map(|(_, c, _)| c.len()).sum::<usize>()
+                        }
+                        SelectItem::QualifiedWildcard(
+                            SelectItemQualifiedWildcardKind::ObjectName(name),
+                            _,
+                        ) => {
+                            let last = name.0.last()?.as_ident().map(crate::catalog::ident)?;
+                            let found = items()?.into_iter().find(|(n, _, _)| *n == last)?;
+                            found.1.len()
+                        }
+                        SelectItem::QualifiedWildcard(..) => return None,
+                        _ => 1,
+                    };
+                }
+                Some(n)
+            }
+            SetExpr::SetOperation { left, .. } => of(left, with, relations),
+            SetExpr::Values(v) => v.rows.first().map(|r| r.content.len()),
+            SetExpr::Query(q) => columns_written(q, relations),
+            _ => None,
+        }
+    }
+    let with: Vec<String> = q
+        .with
+        .iter()
+        .flat_map(|w| &w.cte_tables)
+        .map(|c| crate::catalog::ident(&c.alias.name))
+        .collect();
+    of(&q.body, &with, relations)
 }
 
 /// What a query's FROM gives the names inside it.
@@ -618,6 +676,9 @@ fn made(f: &Function, release: u8, relations: Option<&Relations>) -> Own {
         },
     };
     let held = props(&body, &|x| types.get(&(x as *const Expr)).copied(), release);
+    // A body that reads relations is called as its statement, which the snail asking it reads over
+    // its own relations.
+    let question = held.sublink.then(|| question_text(f));
     // Each DEFAULT typed over no row, as a call reads it in its argument's place.
     let mut refused = refused;
     let defaults = f
@@ -647,7 +708,20 @@ fn made(f: &Function, release: u8, relations: Option<&Relations>) -> Own {
         types,
         uses,
         held,
+        question,
         refused,
+    }
+}
+
+/// A function's body as the statement a call runs: RETURN's expression, or a RETURN inside BEGIN
+/// ATOMIC, selected; any other statement as written.
+fn question_text(f: &Function) -> String {
+    match f.form {
+        crate::catalog::BodyForm::Return => format!("SELECT {}", f.statement),
+        _ => match crate::ddl::returned(&f.statement) {
+            Some(e) => format!("SELECT {e}"),
+            None => f.statement.clone(),
+        },
     }
 }
 
@@ -941,6 +1015,67 @@ pub(crate) fn calls_in<V: sqlparser::ast::Visit>(catalog: &crate::catalog::Catal
     .is_break()
 }
 
+/// Whether anything a statement holds calls a function of the file's whose body reads relations,
+/// itself or through a function of the file its body or its DEFAULTs call: such a call asks the
+/// snail its body's statement.
+pub(crate) fn reads_relations<V: sqlparser::ast::Visit>(
+    catalog: &crate::catalog::Catalog,
+    q: &V,
+) -> bool {
+    !catalog.functions.is_empty() && calls_reading(catalog, q, &mut Vec::new())
+}
+
+fn calls_reading<V: sqlparser::ast::Visit>(
+    catalog: &crate::catalog::Catalog,
+    q: &V,
+    seen: &mut Vec<String>,
+) -> bool {
+    sqlparser::ast::visit_expressions(q, |e| match e {
+        Expr::Function(f) => match named_in(catalog, &crate::catalog::object_name(&f.name)) {
+            Some(g) if reading(catalog, g, seen) => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        },
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+fn reading(catalog: &crate::catalog::Catalog, g: &Function, seen: &mut Vec<String>) -> bool {
+    if seen.contains(&g.name) {
+        return false;
+    }
+    seen.push(g.name.clone());
+    let sublink = sqlparser::ast::visit_expressions(&g.body, |e| match e {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    });
+    sublink.is_break()
+        || calls_reading(catalog, &g.body, seen)
+        || g.defaults.iter().any(|d| calls_reading(catalog, d, seen))
+}
+
+/// The function of a catalog's a call names, as `found` finds one of those held.
+fn named_in<'c>(
+    catalog: &'c crate::catalog::Catalog,
+    called: &str,
+) -> Option<&'c Function> {
+    let (schema, last) = match called.rsplit_once('.') {
+        Some((s, l)) => (Some(s), l),
+        None => (None, called),
+    };
+    catalog.functions.iter().find(|g| {
+        let (gs, gl) = match g.name.rsplit_once('.') {
+            Some((s, l)) => (s, l),
+            None => ("public", g.name.as_str()),
+        };
+        gl == last
+            && match schema {
+                Some(s) => s == gs,
+                None => gs == "public" && !built_in_name(last),
+            }
+    })
+}
+
 /// A call's value on a row; none where the call names no function of the file's.
 pub(super) fn call(
     f: &sqlparser::ast::Function,
@@ -981,6 +1116,7 @@ pub(super) fn call(
             types: &d.types,
             now: frame.now,
             subqueries: None,
+            reads: frame.reads,
             below: None,
         })
         .collect();
@@ -1021,6 +1157,12 @@ pub(super) fn call(
             return Ok(Some(Value::Null));
         }
     }
+    if let Some(text) = &g.question {
+        let values: Vec<Value> =
+            given.into_inner().into_iter().map(|v| v.unwrap_or(Value::Null)).collect();
+        let v = asked(&g, text, &values, frame)?;
+        return super::handed::fitted(v, g.returns, false).map(Some);
+    }
     let bound = |e: &Expr| -> Option<Result<Value>> {
         let Expr::Identifier(i) = e else {
             return None;
@@ -1050,11 +1192,70 @@ pub(super) fn call(
         types: &g.types,
         now: frame.now,
         subqueries: None,
+        reads: frame.reads,
         below: None,
     };
     let none = vec![Value::Null; g.args.len()];
     let v = super::pipeline::eval(&g.body, &none, &body_frame, &Computed::bound_by(&bound))?;
     super::handed::fitted(v, g.returns, false).map(Some)
+}
+
+/// A body that reads relations, called as 18.6 calls a SQL function it does not inline: its
+/// statement planned with each argument's value as a constant, as a custom plan takes it, its
+/// constants folded; then run through the snail the caller reads, which answers with its first row,
+/// NULL where it makes none.
+fn asked(g: &Own, text: &str, values: &[Value], frame: &Frame) -> Result<Value> {
+    use sqlparser::ast::Statement;
+    let Some(reads) = frame.reads else {
+        return Err(Error::new(format!(
+            "{}: a body that reads relations is not called here",
+            g.name
+        )));
+    };
+    // Where a question's shape is found over tables holding no rows, nothing is asked of them.
+    if !reads.holds_rows() {
+        return Ok(Value::Null);
+    }
+    let catalog = reads.catalog();
+    let scanned = super::spelled::scanned(text, catalog.release)?;
+    let spelled = super::spelled::spelled(&scanned)?;
+    let parsed = super::image::parse_sql(&spelled)?;
+    let [Statement::Query(q)] = parsed.as_slice() else {
+        return Err(Error::new(format!("{}: its body is not one SELECT", g.name)));
+    };
+    let mut q = (**q).clone();
+    let given = values
+        .iter()
+        .zip(&g.args)
+        .map(|(v, &t)| constant(v, t))
+        .collect::<Result<Vec<Expr>>>()?;
+    let relations = relations_of(catalog);
+    parameters_named(&mut q, &g.name, &g.names, Some(&relations), &|n| given[n - 1].clone());
+    // One row is fetched of it: where it says no more, it is told so.
+    if q.limit_clause.is_none() && q.fetch.is_none() {
+        q.limit_clause = Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit: Some(super::image::parse_expr("1")?),
+            offset: None,
+            limit_by: Vec::new(),
+        });
+    }
+    super::folded::folded(catalog, &q.to_string(), Some(reads))?;
+    let q = super::pipeline::windows::written(&super::spelled::between_written(&q))?;
+    let q = super::computed(catalog, &q)?.unwrap_or(q);
+    let row = super::relations::first_row(reads, &q)?;
+    Ok(row.and_then(|r| r.into_iter().next()).unwrap_or(Value::Null))
+}
+
+/// An argument's value written as a constant of its parameter's type.
+fn constant(v: &Value, t: ColumnType) -> Result<Expr> {
+    let written = match v.text() {
+        Some(s) => format!("'{}'", s.replace('\'', "''")),
+        None => "NULL".into(),
+    };
+    Ok(super::image::parse_expr(&format!(
+        "CAST({written} AS {})",
+        t.pg_name()
+    ))?)
 }
 
 /// The calls of the file's functions inside one another taken before the next is refused, as 18.6

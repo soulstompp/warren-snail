@@ -1471,7 +1471,7 @@ impl Snail {
                         | Statement::Checked { .. }
                         | Statement::Writes { .. }
                 ) {
-                    if let Err(e) = super::folded::folded(&self.catalog, text) {
+                    if let Err(e) = super::folded::folded(&self.catalog, text, Some(&*self)) {
                         self.failed()?;
                         return Err(e);
                     }

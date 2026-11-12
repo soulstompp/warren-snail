@@ -358,6 +358,7 @@ impl<'a> Reading<'a> {
             types: self.types,
             now: self.now,
             subqueries: ons.get(&(node as *const Node)).copied(),
+            reads: Some(self.reads),
             below: None,
         }
     }
