@@ -1091,7 +1091,8 @@ fn read_as(t: &TableWithJoins) -> String {
 }
 
 /// The question that finds a write's rows joined with the relations its FROM or USING lists: every
-/// column the table stores, read by the name it reads the table by, then each value `asked`.
+/// column the table stores, read by the name it reads the table by, then each value `asked`, then
+/// the row's ctid, which tells a row the join meets more than once from another holding its values.
 fn joined_finder(
     table: &Table,
     relation: &TableWithJoins,
@@ -1106,6 +1107,7 @@ fn joined_finder(
         .filter(|c| !c.is_virtual())
         .map(|c| format!("{by}.\"{}\"", c.name.replace('"', "\"\"")))
         .chain(asked.iter().cloned())
+        .chain(std::iter::once(format!("{by}.ctid")))
         .collect::<Vec<_>>()
         .join(", ");
     let relations = std::iter::once(relation.to_string())

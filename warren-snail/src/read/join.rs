@@ -512,7 +512,7 @@ pub(super) fn ask_join_within(
         snail.mark_read(want.side.table, &part.plan.walk)?;
         let width: u64 = columns
             .iter()
-            .map(|c| super::strands::held_width(table.columns[c.0].ty))
+            .map(|c| super::strands::held_width(table.column_at(c.0).ty))
             .sum();
         if may_stop && !streamed {
             let free = crate::room::current().map_or(u64::MAX, |r| r.free_bytes());

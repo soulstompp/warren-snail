@@ -1,6 +1,7 @@
 //! Cursors, as PostgreSQL's DECLARE opens them: a question's answer as its declaration read it, the
 //! generation it read then, FETCH and MOVE taking rows from where the cursor stands, and an UPDATE
-//! or DELETE … WHERE CURRENT OF reaching the row it stands on by the table's key.
+//! or DELETE … WHERE CURRENT OF reaching the row it stands on by the table's key, or, where it has
+//! none, one row holding the values that row holds.
 
 use super::Snail;
 use crate::{Error, Result};
@@ -18,7 +19,7 @@ pub(super) struct Cursor {
     /// Declared NO SCROLL: it reads forward alone.
     no_scroll: bool,
     /// Its answer, its rows as the declaration read them; and, for a cursor on one table, each row's
-    /// key there, by the table's key columns.
+    /// key there, by the table's key columns, or every column it stores where it has no key.
     answer: RecordBatch,
     keys: Option<(usize, Vec<usize>, RecordBatch)>,
     /// Where its question is read a block at a time: a snail holding the generation the declaration
@@ -497,11 +498,23 @@ impl Cursor {
         let SetExpr::Select(s) = q.body.as_ref() else {
             return None;
         };
+        // An aggregate of its own makes one group of its rows, as GROUP BY does.
+        let aggregates = s.projection.iter().any(|p| match p {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                calls_aggregate(e)
+            }
+            _ => false,
+        }) || matches!(
+            q.order_by.as_ref().map(|o| &o.kind),
+            Some(sqlparser::ast::OrderByKind::Expressions(os))
+                if os.iter().any(|o| calls_aggregate(&o.expr))
+        );
         if s.from.len() != 1
             || !s.from[0].joins.is_empty()
             || super::pipeline::says_distinct(s)
             || s.having.is_some()
             || !matches!(&s.group_by, sqlparser::ast::GroupByExpr::Expressions(g, _) if g.is_empty())
+            || aggregates
             || q.with.is_some()
         {
             return None;
@@ -512,7 +525,7 @@ impl Cursor {
         let n = crate::catalog::object_name(name);
         let ti = catalog.tables.iter().position(|t| t.name == n)?;
         let table = &catalog.tables[ti];
-        let key = key_columns(table)?;
+        let (key, _) = key_columns(table);
         let by = alias
             .as_ref()
             .map(|a| crate::catalog::ident(&a.name))
@@ -669,17 +682,43 @@ impl Cursor {
         }
         let r = c.at - 1;
         let mut conds = Vec::new();
-        for (k, &col) in key.iter().enumerate() {
-            let v = arrow::util::display::array_value_to_string(keys.column(k).as_ref(), r)?;
-            conds.push(format!(
-                "\"{}\" = '{}'",
-                table.columns[col].name.replace('"', "\"\""),
-                v.replace('\'', "''")
-            ));
-        }
+        let condition = match key_columns(table).1 {
+            true => {
+                for (k, &col) in key.iter().enumerate() {
+                    let v =
+                        arrow::util::display::array_value_to_string(keys.column(k).as_ref(), r)?;
+                    conds.push(format!(
+                        "\"{}\" = '{}'",
+                        table.columns[col].name.replace('"', "\"\""),
+                        v.replace('\'', "''")
+                    ));
+                }
+                conds.join(" AND ")
+            }
+            // With no unique key the row is one of those holding its values, each written as
+            // PostgreSQL writes it and read back, one of no B-tree class compared as text: the
+            // statement changes one of them, as it would the row the cursor stands on.
+            false => {
+                let texts = super::answer_text(&keys.slice(r, 1))?;
+                for (&col, v) in key.iter().zip(&texts[0]) {
+                    let column = &table.columns[col];
+                    let name = super::relations::quote(&column.name);
+                    conds.push(match (v, column.ty.ordered()) {
+                        (None, _) => format!("{name} IS NULL"),
+                        (Some(v), true) => format!("{name} = '{}'", v.replace('\'', "''")),
+                        (Some(v), false) => format!("{name}::text = '{}'", v.replace('\'', "''")),
+                    });
+                }
+                format!(
+                    "ctid = (SELECT ctid FROM {} WHERE {} LIMIT 1)",
+                    super::relations::quote_name(&table.name),
+                    conds.join(" AND ")
+                )
+            }
+        };
         let start = words[at].1;
         let end = words.get(at + 2).map_or(sql.len(), |w| w.2);
-        Ok(format!("{}{}{}", &sql[..start], conds.join(" AND "), &sql[end..]))
+        Ok(format!("{}{condition}{}", &sql[..start], &sql[end..]))
     }
 
 impl Snail {
@@ -721,9 +760,44 @@ impl Snail {
     }
 }
 
+/// Whether an expression calls an aggregate of its own query, a subquery's apart.
+fn calls_aggregate(e: &sqlparser::ast::Expr) -> bool {
+    use super::pipeline;
+    match e {
+        sqlparser::ast::Expr::Function(f)
+            if f.over.is_none()
+                && (pipeline::is_aggregate(&pipeline::function_name(f))
+                    || !f.within_group.is_empty()) =>
+        {
+            true
+        }
+        e => {
+            let mut parts = pipeline::parts_of(e);
+            if parts.is_empty() {
+                parts = super::collate::children(e);
+            }
+            parts.into_iter().any(calls_aggregate)
+        }
+    }
+}
+
+/// The columns a cursor keeps of each row it reads of a table, for WHERE CURRENT OF: its unique
+/// key's, and whether there is one; with none, every column the table stores.
+fn key_columns(table: &crate::catalog::Table) -> (Vec<usize>, bool) {
+    match unique_key(table) {
+        Some(key) => (key, true),
+        None => (
+            (0..table.columns.len())
+                .filter(|&c| !table.columns[c].is_virtual())
+                .collect(),
+            false,
+        ),
+    }
+}
+
 /// The columns of a table's unique key, its primary key first, each level a column of its own and
 /// no row left out of it.
-fn key_columns(table: &crate::catalog::Table) -> Option<Vec<usize>> {
+fn unique_key(table: &crate::catalog::Table) -> Option<Vec<usize>> {
     let plain = |o: &&crate::catalog::Order| {
         o.unique
             && o.predicate.is_none()

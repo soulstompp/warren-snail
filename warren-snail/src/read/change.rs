@@ -781,6 +781,35 @@ pub(super) fn found_rows(table: &Table, batch: &RecordBatch) -> Result<Vec<Row>>
     Ok(rows)
 }
 
+/// The columns of a write's finder's answer its table stores, the values a join asks and the row's
+/// ctid after them left out.
+fn stored_of(table: &Table, batch: &RecordBatch) -> Result<RecordBatch> {
+    let stored = table.columns.iter().filter(|c| !c.is_virtual()).count();
+    Ok(batch.project(&(0..stored).collect::<Vec<_>>())?)
+}
+
+/// The rows of a write's finder's answer the write changes, by their places in it: where its finder
+/// joins, the answer's last column is each row's ctid, and a row the join meets more than once is
+/// changed once, at the first place it is met; where it does not, every row, rows alike each their
+/// own.
+fn met_once(table: &Table, batch: &RecordBatch) -> Result<Vec<usize>> {
+    let stored = table.columns.iter().filter(|c| !c.is_virtual()).count();
+    let n = batch.num_columns();
+    if n <= stored {
+        return Ok((0..batch.num_rows()).collect());
+    }
+    let ctids = batch.column(n - 1);
+    let mut seen = std::collections::HashSet::new();
+    let mut met = Vec::new();
+    for i in 0..batch.num_rows() {
+        let ctid = arrow::util::display::array_value_to_string(ctids.as_ref(), i)?;
+        if seen.insert(ctid) {
+            met.push(i);
+        }
+    }
+    Ok(met)
+}
+
 /// What marks the fields a write's rows hold `old`'s and `new`'s columns in: names no statement can
 /// write.
 const KEPT: char = '\u{5}';
@@ -1741,12 +1770,13 @@ impl Snail {
                 let (batch, _) = self.answer(&find, None)?;
                 let t = &self.catalog.tables[table];
                 // A row that USING meets more than once is deleted once.
-                let mut seen = std::collections::HashSet::new();
-                let once: Vec<Row> = found_rows(t, &batch)?
+                let rows = found_rows(t, &stored_of(t, &batch)?)?;
+                let once: Vec<Row> = met_once(t, &batch)?
                     .into_iter()
-                    .filter(|r| seen.insert(r.clone()))
+                    .map(|i| rows[i].clone())
                     .collect();
-                let old = self.kept_to(table, once, found)?;
+                let kept = self.kept_to(table, &once, found)?;
+                let old: Vec<Row> = kept.into_iter().map(|k| once[k].clone()).collect();
                 done.rows = old.len() as u64;
                 let changes: Vec<Change> = old.into_iter().map(Change::Delete).collect();
                 self.keep(&changes);
@@ -1836,29 +1866,26 @@ impl Snail {
             }
         }
         let (batch, _) = self.answer(&find, None)?;
-        // Under FROM the values set are the answer's last columns, each row's paired with it; a
-        // row the join meets more than once changed once, by the first values it meets.
+        // Under FROM the values set are the answer's columns after the table's, before the row's
+        // ctid, each row's paired with it; a row the join meets more than once changed once, by
+        // the first values it meets.
         let stored = t.columns.iter().filter(|c| !c.is_virtual()).count();
-        let (target, asked) = match batch.num_columns() > stored {
+        let n = batch.num_columns();
+        let asked = match n > stored + 1 {
             true => {
-                let n = batch.num_columns();
-                let types = answer_types(&batch)?[stored..].to_vec();
-                let values = rows_of(&batch.project(&(stored..n).collect::<Vec<_>>())?)?;
-                (batch.project(&(0..stored).collect::<Vec<_>>())?, Some((types, values)))
+                let values = batch.project(&(stored..n - 1).collect::<Vec<_>>())?;
+                Some((answer_types(&values)?, rows_of(&values)?))
             }
-            false => (batch, None),
+            false => None,
         };
-        let mut paired: std::collections::HashMap<Row, Vec<Datum>> = Default::default();
-        let mut once = Vec::new();
-        for (i, r) in found_rows(&t, &target)?.into_iter().enumerate() {
-            if paired.contains_key(&r) {
-                continue;
-            }
-            let values = asked.as_ref().map(|(_, v)| v[i].clone()).unwrap_or_default();
-            paired.insert(r.clone(), values);
-            once.push(r);
-        }
-        let old = self.kept_to(table, once, found)?;
+        let rows = found_rows(&t, &stored_of(&t, &batch)?)?;
+        let met = met_once(&t, &batch)?;
+        let once: Vec<Row> = met.iter().map(|&i| rows[i].clone()).collect();
+        let kept = self.kept_to(table, &once, found)?;
+        let old: Vec<(Row, usize)> = kept
+            .into_iter()
+            .map(|k| (once[k].clone(), met[k]))
+            .collect();
         done.rows = old.len() as u64;
         let defaults: Vec<usize> = sets
             .iter()
@@ -1867,7 +1894,7 @@ impl Snail {
             .collect();
         let mut drawn = self.draws(&t, defaults.iter().map(|&c| (c, old.len())))?;
         let mut changes = Vec::with_capacity(old.len());
-        for o in old {
+        for (o, i) in old {
             let mut n = o.clone();
             for (c, f) in &sets {
                 n[*c] = match f {
@@ -1880,9 +1907,9 @@ impl Snail {
                         fill::set_to(&t, &o, *c, &computed[at].1, &by, &typed[at])?
                     }
                     Fill::Answer(k) => {
-                        let (types, _) = asked.as_ref().expect("values asked");
+                        let (types, values) = asked.as_ref().expect("values asked");
                         let col = &t.columns[*c];
-                        fill::assign(paired[&o][*k].clone(), types[*k], col.ty, &col.name)?
+                        fill::assign(values[i][*k].clone(), types[*k], col.ty, &col.name)?
                     }
                     _ => self.default_of(&t, *c, &mut drawn)?,
                 };
@@ -2753,13 +2780,14 @@ impl Snail {
         Ok(out)
     }
 
-    /// The rows an UPDATE or a DELETE finds: the first time, every one, kept as `found`; run again,
-    /// only those whose key, on the table's first unique order of plain NOT NULL columns or else
-    /// every column, is a key it found the first time.
-    fn kept_to(&self, ti: usize, now: Vec<Row>, found: &mut Option<Vec<Row>>) -> Result<Vec<Row>> {
+    /// The rows an UPDATE or a DELETE finds, by their places in `now`: the first time, every one,
+    /// kept as `found`; run again, only those whose key, on the table's first unique order of plain
+    /// NOT NULL columns or else every column, is a key it found the first time, and of the rows
+    /// sharing a key no more than it found then: a row alike written since is not one it found.
+    fn kept_to(&self, ti: usize, now: &[Row], found: &mut Option<Vec<Row>>) -> Result<Vec<usize>> {
         let Some(first) = found.as_ref() else {
-            *found = Some(now.clone());
-            return Ok(now);
+            *found = Some(now.to_vec());
+            return Ok((0..now.len()).collect());
         };
         let table = &self.catalog.tables[ti];
         let columns: Vec<usize> = table
@@ -2777,30 +2805,45 @@ impl Snail {
             })
             .unwrap_or_else(|| (0..table.columns.len()).collect());
         let key = |r: &Row| -> Vec<Datum> { columns.iter().map(|&c| r[c].clone()).collect() };
+        // How many rows it found the first time holding each key.
+        let mut owed: std::collections::HashMap<Vec<Datum>, usize> = Default::default();
+        for f in first {
+            *owed.entry(key(f)).or_default() += 1;
+        }
         // At REPEATABLE READ a row found that another transaction changed or deleted since the
-        // transaction's generation is refused, in PostgreSQL's words, SQLSTATE 40001.
+        // transaction's generation is refused, in PostgreSQL's words, SQLSTATE 40001: one of rows
+        // alike is gone where fewer of them stand now than it found.
         if self.levels.repeatable(self.begun.is_some()) {
             let width = table.columns.len();
-            let newest: std::collections::HashMap<Vec<Datum>, &Row> =
-                now.iter().map(|r| (key(r), r)).collect();
+            let mut newest: std::collections::HashMap<Vec<Datum>, Vec<&Row>> = Default::default();
+            for r in now {
+                newest.entry(key(r)).or_default().push(r);
+            }
             for f in first {
-                match newest.get(&key(f)) {
-                    None => {
-                        return Err(Error::new(
-                            "could not serialize access due to concurrent delete",
-                        ))
-                    }
-                    Some(r) if r[..width] != f[..width] => {
+                let k = key(f);
+                match newest.get(&k) {
+                    Some(rs) if rs.len() >= owed[&k] && rs[0][..width] != f[..width] => {
                         return Err(Error::new(
                             "could not serialize access due to concurrent update",
                         ))
                     }
-                    Some(_) => {}
+                    Some(rs) if rs.len() >= owed[&k] => {}
+                    _ => {
+                        return Err(Error::new(
+                            "could not serialize access due to concurrent delete",
+                        ))
+                    }
                 }
             }
         }
-        let keys: std::collections::HashSet<Vec<Datum>> = first.iter().map(key).collect();
-        Ok(now.into_iter().filter(|r| keys.contains(&key(r))).collect())
+        let mut kept = Vec::new();
+        for (i, r) in now.iter().enumerate() {
+            if let Some(n) = owed.get_mut(&key(r)).filter(|n| **n > 0) {
+                *n -= 1;
+                kept.push(i);
+            }
+        }
+        Ok(kept)
     }
 
     /// Where the statement under way began: what it had staged and the root it read, so that it

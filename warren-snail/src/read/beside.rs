@@ -375,15 +375,20 @@ impl Snail {
             };
             let gone: HashSet<u32> = map.dead.iter().copied().collect();
             let dead = |p: usize| gone.contains(&(p as u32));
-            let live: HashSet<Vec<Datum>> = (0..positions).filter(|&p| !dead(p)).map(at).collect();
+            // How many live rows hold each row's values: of rows alike, each found is one of them.
+            let mut live: HashMap<Vec<Datum>, usize> = HashMap::new();
+            for p in (0..positions).filter(|&p| !dead(p)) {
+                *live.entry(at(p)).or_default() += 1;
+            }
             for r in rows {
                 let values = held(r);
-                if live.contains(&values) {
+                if let Some(n) = live.get_mut(&values).filter(|n| **n > 0) {
+                    *n -= 1;
                     continue;
                 }
                 let same_key = |p: usize| {
                     let a = at(p);
-                    identity.iter().all(|&s| a[s] == values[s])
+                    identity.iter().all(|&s| a[s] == values[s]) && a != values
                 };
                 let chained = |p: usize| map.chains.iter().any(|(c, _)| *c as usize == p);
                 let updated = (0..positions).any(|p| !dead(p) && same_key(p))
