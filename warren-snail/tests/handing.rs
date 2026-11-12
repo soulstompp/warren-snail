@@ -320,6 +320,25 @@ fn a_grouping_whose_groups_pass_the_room_goes_on_past_it() {
     assert!(r.spill_pages_written > 0);
 }
 
+/// A rollup whose groups pass the room goes on past it, each set's groups past it written and read
+/// back once: the same answer as in the default room.
+#[test]
+fn a_rollup_whose_groups_pass_the_room_goes_on_past_it() {
+    let path = one("rollup");
+    let snails = opened(&[&path]);
+    let refs: Vec<&Snail> = snails.iter().collect();
+    let rolled = "SELECT a_id AS c1, id AS c2, count(*) AS c3 FROM s.b GROUP BY ROLLUP (a_id, id)";
+    let want = whole(&snails, rolled);
+    assert_eq!(want.len(), B as usize + A as usize + 1);
+    let mut a = begin_together(&refs, rolled, Sizes::of(32 << 10)).unwrap();
+    let (rows, batches, _) = drained(&mut a);
+    assert_eq!(alike(rows), alike(want));
+    assert!(batches > 1, "{batches}");
+    let r = a.round();
+    assert!(r.spill_pages_written > 0);
+    assert_eq!(r.spill_pages_written, r.spill_pages_read);
+}
+
 /// Given a host's file, every page past the room goes to it and comes back from it; it is made at the
 /// first page, and closed as the answer is let go.
 #[test]

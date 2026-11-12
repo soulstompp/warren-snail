@@ -830,12 +830,23 @@ impl Typing<'_> {
                 for x in &parts {
                     types.push(self.type_of(x)?);
                 }
+                // A relation's whole row, its type given before the step is typed.
+                if let (Expr::Tuple(_), Some(&t)) = (e, self.types.get(&(e as *const Expr))) {
+                    return Ok(Some(t));
+                }
                 let domains: Vec<Option<String>> = parts.iter().map(|x| self.domain(x)).collect();
                 super::image::field_types(&parts, &types)
                     .map(|f| super::image::anonymous_of(&f, &domains))
             }
             Expr::Function(f) => {
                 let name = super::pipeline::function_name(f);
+                // GROUPING (…): an integer, a bit for each argument.
+                if super::pipeline::is_grouping_call(f) {
+                    for a in super::pipeline::parts_of(e) {
+                        self.type_of(a)?;
+                    }
+                    return Ok(Some(ColumnType::Int4));
+                }
                 if let Some(e) = type_keyword(f) {
                     return Err(e);
                 }

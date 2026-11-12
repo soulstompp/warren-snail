@@ -403,3 +403,88 @@ fn a_window_postgresql_refuses_is_refused_in_its_words() {
         assert_eq!(refused(&path, q), why, "{q}");
     }
 }
+
+/// A table of groups: `dn.a` (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, NULL, 50).
+fn groups(name: &str) -> std::path::PathBuf {
+    let path = tmp(&format!("windows-{name}.snail"));
+    let catalog = Catalog::parse(
+        "CREATE SCHEMA dn; CREATE TABLE dn.a (id integer NOT NULL, g integer, k integer, \
+         PRIMARY KEY (id));",
+    )
+    .unwrap();
+    let int = |v: &[Option<i64>]| Values::Int(v.to_vec());
+    let a = Rows {
+        columns: vec![
+            int(&[Some(1), Some(2), Some(3), Some(4), Some(5)]),
+            int(&[Some(1), Some(1), Some(2), Some(2), None]),
+            int(&[Some(10), Some(20), Some(30), Some(40), Some(50)]),
+        ],
+    };
+    warren_snail::write::write_released(&path, &catalog, &[("dn.a".into(), a)], &[], weather::span(), 18)
+        .unwrap();
+    path
+}
+
+/// A window over groups reads each group's row after HAVING, its aggregates and GROUPING read from
+/// the group, before ORDER BY, DISTINCT and LIMIT; a column no group holds, refused in a window's
+/// arguments, FILTER or keys as in the select list.
+#[test]
+fn a_window_over_groups_reads_each_group_s_row() {
+    let path = groups("over-groups");
+    for (q, rows) in [
+        (
+            "SELECT g, sum(k), rank() OVER (ORDER BY sum(k) DESC) FROM dn.a GROUP BY g ORDER BY g",
+            &["1,30,3", "2,70,1", "-,50,2"][..],
+        ),
+        (
+            "SELECT g, count(*), sum(count(*)) OVER () FROM dn.a GROUP BY g ORDER BY g",
+            &["1,2,5", "2,2,5", "-,1,5"],
+        ),
+        (
+            "SELECT g, row_number() OVER (PARTITION BY g > 1 ORDER BY g) FROM dn.a GROUP BY g \
+             ORDER BY g",
+            &["1,1", "2,1", "-,1"],
+        ),
+        ("SELECT count(*), rank() OVER (ORDER BY count(*)) FROM dn.a", &["5,1"]),
+        (
+            "SELECT g, sum(sum(k)) OVER (ORDER BY g) FROM dn.a GROUP BY g HAVING count(*) > 1 \
+             ORDER BY g",
+            &["1,30", "2,100"],
+        ),
+        (
+            "SELECT g, avg(sum(k)) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+             lag(max(k)) OVER (ORDER BY g NULLS FIRST) FROM dn.a GROUP BY g ORDER BY g NULLS FIRST",
+            &["-,60.0000000000000000,-", "1,30.0000000000000000,50", "2,50.0000000000000000,20"],
+        ),
+        (
+            "SELECT g, sum(k) AS s, rank() OVER (ORDER BY sum(k)) AS r FROM dn.a GROUP BY g ORDER \
+             BY r DESC LIMIT 2",
+            &["2,70,3", "-,50,2"],
+        ),
+        ("SELECT DISTINCT count(*) OVER () FROM dn.a GROUP BY g", &["3"]),
+        (
+            "SELECT g, k, count(*) OVER (PARTITION BY g) FROM dn.a GROUP BY g, k ORDER BY g, k",
+            &["1,10,2", "1,20,2", "2,30,2", "2,40,2", "-,50,1"],
+        ),
+        (
+            "SELECT g, GROUPING(g), rank() OVER (PARTITION BY GROUPING(g) ORDER BY g) FROM dn.a \
+             GROUP BY ROLLUP (g) ORDER BY 2, 1",
+            &["1,0,1", "2,0,2", "-,0,3", "-,1,1"],
+        ),
+        ("SELECT sum(count(*)) OVER (), g FROM dn.a WHERE false GROUP BY g", &[]),
+        ("SELECT rank() OVER (ORDER BY sum(k)) FROM dn.a WHERE false", &["1"]),
+    ] {
+        same(&path, q, rows);
+    }
+    for q in [
+        "SELECT g, rank() OVER (ORDER BY k) FROM dn.a GROUP BY g",
+        "SELECT g, sum(k) FILTER (WHERE k > 10) OVER () FROM dn.a GROUP BY g",
+        "SELECT g, sum(k) OVER (PARTITION BY id) FROM dn.a GROUP BY g",
+    ] {
+        assert_eq!(
+            refused(&path, q),
+            "column \"a.k\" must appear in the GROUP BY clause or be used in an aggregate function",
+            "{q}"
+        );
+    }
+}

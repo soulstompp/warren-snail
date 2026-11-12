@@ -385,6 +385,10 @@ impl Snail {
         let Some(a) = asked(&self.catalog, q) else {
             return Ok(Nearest::Not);
         };
+        // A table's whole row is the relations' reader's to make.
+        if pipeline::reads_whole_rows(&self.catalog, q) {
+            return Ok(Nearest::Not);
+        }
         let table = &self.catalog.tables[a.table];
         let Some(q) = stars_written(q, table, &a.qualifier) else {
             return Ok(Nearest::Not);

@@ -2397,9 +2397,15 @@ fn a_row_returned_whole_beside_a_distance_holds_every_column() {
         assert_eq!(strand.num_columns(), 2, "{q}");
         assert_eq!(strand, key, "{q}");
     }
-    // A whole row's reference is refused alike along either order.
-    let q = "SELECT t FROM s.t t ORDER BY t.v <-> point '(1030,1030)', t.id LIMIT 1";
-    let strand = fresh(&path).ask(q, None).unwrap_err().to_string();
-    let key = fresh(&path).ask(q, Some("t_pkey")).unwrap_err().to_string();
+    // A whole row's reference is answered alike along either order: 18.6's (7,"(1033,1031)").
+    let q = "SELECT t::text FROM s.t t ORDER BY t.v <-> point '(1030,1030)', t.id LIMIT 1";
+    let (strand, _) = fresh(&path).ask(q, None).unwrap();
+    let (key, _) = fresh(&path).ask(q, Some("t_pkey")).unwrap();
     assert_eq!(strand, key);
+    let text = strand
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .map(|a| a.value(0).to_string());
+    assert_eq!(text.as_deref(), Some("(7,\"(1033,1031)\")"));
 }

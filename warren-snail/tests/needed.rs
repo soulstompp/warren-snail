@@ -398,32 +398,69 @@ fn a_column_only_a_subquery_names_is_read_by_the_query_around_it() {
     );
 }
 
+/// A relation's name alone reads its whole row, every column of it: answered as 18.6 answers, its
+/// pages exact. A star among a call's arguments, and the whole row of the query around a subquery,
+/// stay refused.
 #[test]
-fn a_whole_row_is_refused_so_no_column_of_it_goes_unread() {
+fn a_whole_row_reads_every_column_of_it() {
     let path = snail("row");
+    let threes: Vec<String> = (0..31).map(|k| (3 + 97 * k).to_string()).collect();
+    let threes: Vec<&str> = threes.iter().map(String::as_str).collect();
+    for (q, want) in [
+        (
+            "SELECT a::text FROM s.a a WHERE a.id < 3",
+            &["(0,0,\"name 0\")", "(1,1,\"name 1\")", "(2,2,\"name 2\")"][..],
+        ),
+        ("SELECT count(a) FROM s.a a", &["3000"]),
+        ("SELECT count(a) FROM s.a a JOIN s.b b ON b.a_id = a.id", &["16384"]),
+        ("SELECT count(a) FROM s.a a JOIN s.b b ON b.a_id = a.id WHERE a.g = 1000", &["0"]),
+        (
+            "SELECT row_to_json(a) FROM s.a a WHERE a.id < 3",
+            &[
+                "{\"id\":0,\"g\":0,\"name\":\"name 0\"}",
+                "{\"id\":1,\"g\":1,\"name\":\"name 1\"}",
+                "{\"id\":2,\"g\":2,\"name\":\"name 2\"}",
+            ],
+        ),
+        (
+            "SELECT to_jsonb(a) FROM s.a a JOIN s.b b ON b.a_id = a.id WHERE b.v < 5",
+            &[
+                "{\"g\": 4, \"id\": 780, \"name\": \"name 780\"}",
+                "{\"g\": 35, \"id\": 811, \"name\": \"name 811\"}",
+                "{\"g\": 66, \"id\": 842, \"name\": \"name 842\"}",
+                "{\"g\": 0, \"id\": 873, \"name\": \"name 873\"}",
+            ],
+        ),
+        ("SELECT (a).id FROM s.a a WHERE a.g = 3", &threes),
+        (
+            "SELECT (a).name FROM s.a a JOIN s.b b ON b.a_id = a.id WHERE b.v < 5",
+            &["name 780", "name 811", "name 842", "name 873"],
+        ),
+        ("SELECT a IS NULL FROM s.a a WHERE a.id < 3", &["false", "false", "false"]),
+        ("SELECT a.id FROM s.a a WHERE a IS NOT NULL AND a.id < 3", &["0", "1", "2"]),
+        (
+            "SELECT count(a.name), min(a.name), max(a.name) FROM s.a a JOIN s.b b ON b.a_id = \
+             a.id WHERE a IS NOT NULL AND a.g = 3",
+            &["169,name 100,name 973"],
+        ),
+        ("SELECT a.id FROM s.a a WHERE a.id < 3 ORDER BY a", &["0", "1", "2"]),
+        ("SELECT count(*) FROM s.a a GROUP BY a HAVING count(*) > 1", &[]),
+        ("SELECT count(*) FROM (SELECT DISTINCT a FROM s.a a WHERE a.id < 3) q", &["3"]),
+        ("SELECT a = a FROM s.a a WHERE a.id < 3", &["true", "true", "true"]),
+        (
+            "SELECT a.name, row_number() OVER (ORDER BY a) FROM s.a a WHERE a.id < 3",
+            &["name 0,1", "name 1,2", "name 2,3"],
+        ),
+    ] {
+        same(&path, q, want);
+    }
     for q in [
-        "SELECT a FROM s.a a WHERE a.id < 3",
-        "SELECT count(a) FROM s.a a",
-        "SELECT count(a) FROM s.a a JOIN s.b b ON b.a_id = a.id",
-        "SELECT count(a) FROM s.a a JOIN s.b b ON b.a_id = a.id WHERE a.g = 1000",
-        "SELECT row_to_json(a) FROM s.a a WHERE a.id < 3",
-        "SELECT to_jsonb(a) FROM s.a a JOIN s.b b ON b.a_id = a.id WHERE b.v < 5",
-        "SELECT (a).id FROM s.a a WHERE a.g = 3",
-        "SELECT (a).name FROM s.a a JOIN s.b b ON b.a_id = a.id WHERE b.v < 5",
         "SELECT ROW(a.*) FROM s.a a WHERE a.id < 3",
         "SELECT count(a.*) FROM s.a a",
         "SELECT row_to_json(a.*) FROM s.a a WHERE a.id < 3",
-        "SELECT a IS NULL FROM s.a a WHERE a.id < 3",
-        "SELECT a.id FROM s.a a WHERE a IS NOT NULL AND a.id < 3",
-        "SELECT a.name FROM s.a a JOIN s.b b ON b.a_id = a.id WHERE a IS NOT NULL AND a.g = 3",
         "SELECT a.id FROM s.a a WHERE a.id < 3 AND EXISTS (SELECT a.*)",
         "SELECT (SELECT count(a) FROM s.b b WHERE b.id < 2) FROM s.a a WHERE a.id < 2",
         "SELECT a.id FROM s.a a WHERE a.id < 3 ORDER BY a.*",
-        "SELECT a.id FROM s.a a WHERE a.id < 3 ORDER BY a",
-        "SELECT count(*) FROM s.a a GROUP BY a",
-        "SELECT DISTINCT a FROM s.a a WHERE a.id < 3",
-        "SELECT a = a FROM s.a a WHERE a.id < 3",
-        "SELECT a.name, row_number() OVER (ORDER BY a) FROM s.a a WHERE a.id < 3",
     ] {
         refused(&path, q);
     }

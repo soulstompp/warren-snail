@@ -713,6 +713,10 @@ impl Walk<'_> {
                 }
             }
             Expr::CompoundFieldAccess { root, .. } => self.expr(root),
+            // `()` is a set GROUPING SETS lists, no element of a ROLLUP's or a CUBE's.
+            Expr::Cube(sets) | Expr::Rollup(sets) if sets.iter().any(Vec::is_empty) => {
+                Err(near(")"))
+            }
             Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => sets
                 .iter_mut()
                 .flatten()

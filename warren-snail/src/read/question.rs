@@ -1724,6 +1724,10 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
     } else {
         let mut keys = Vec::new();
         for g in grouping {
+            // Grouping sets are a step's.
+            if super::grouping::written(std::slice::from_ref(g)) {
+                return Err(Error::new(format!("GROUP BY {g} is read in a step")));
+            }
             let k = match number(g) {
                 Some(n) => match listed.get((n as usize).wrapping_sub(1)) {
                     Some((_, Item::Key(k))) => *k,

@@ -51,6 +51,9 @@ pub(crate) const ROWS_MARK: char = '\u{6}';
 /// definition list named arguments after it, each a column's name and a NULL of its type.
 pub(crate) const ROWS_FROM: &str = "\u{6}rows";
 
+/// What GROUP BY DISTINCT is written as, a name before its first item, which the reader takes off.
+pub(crate) const SETS_DISTINCT: char = '\u{e}';
+
 /// A column definition list's column written SETOF or with a COLLATE, as its name carries them:
 /// the name, `ROWS_MARK`, `s` where SETOF, `ROWS_MARK` again, and the collation as named.
 fn marked_column(name: &str, setof: bool, collation: Option<&str>) -> String {
@@ -497,7 +500,11 @@ fn worded(
     let as_paren = lower.match_indices("as").any(|(at, _)| {
         lower[at + 2..].trim_start().starts_with('(')
     });
+    // A GROUP BY that may say DISTINCT or ALL, or hold GROUPING SETS.
+    let grouped = lower.contains("group")
+        && ["distinct", "all", "sets"].iter().any(|w| lower.contains(w));
     if !as_paren
+        && !grouped
         && ![
             "isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>", "rows",
             "setof", "collate", "conflict",
@@ -658,6 +665,19 @@ fn worded(
             after_call && called(o)
         })
     };
+    // Whether an item of a list stands at `i`: neither the list's end nor a clause after it.
+    let item_follows = |i: usize| {
+        !matches!(token(i), None | Some(Token::EOF | Token::SemiColon | Token::RParen))
+            && !matches!(
+                word(i).as_deref(),
+                Some(
+                    "HAVING" | "WINDOW" | "ORDER" | "LIMIT" | "OFFSET" | "FETCH" | "FOR" | "UNION"
+                        | "INTERSECT" | "EXCEPT"
+                )
+            )
+    };
+    // The places of the parentheses each GROUPING SETS lists its elements in.
+    let mut sets_lists: Vec<usize> = Vec::new();
     let mut swaps: Vec<(usize, usize, String)> = Vec::new();
     let mut brackets = 0i32;
     let mut array_closes: Vec<i32> = Vec::new();
@@ -913,6 +933,40 @@ fn worded(
             }
             Some("TABLESAMPLE") if !prev_as => {
                 swaps.push(sampled_clause(sql, &solid, i, &near, &closed, seeded)?);
+            }
+            // GROUP BY DISTINCT, which sqlparser does not read, written as its mark before the
+            // first item (`SETS_DISTINCT`); GROUP BY ALL, the default, as GROUP BY where an item
+            // follows, a bare one left as written.
+            Some("BY") if casts && word(i.wrapping_sub(1)).as_deref() == Some("GROUP") => {
+                match word(i + 1).as_deref() {
+                    Some("DISTINCT") => swaps.push((
+                        solid[i + 1].1,
+                        solid[i + 1].2,
+                        format!("\"{SETS_DISTINCT}\","),
+                    )),
+                    Some("ALL") if item_follows(i + 2) => {
+                        swaps.push((solid[i + 1].1, solid[i + 1].2, String::new()))
+                    }
+                    _ => {}
+                }
+            }
+            // GROUPING SETS among the elements of another, which sqlparser does not read, written
+            // as its elements there, as PostgreSQL's parser flattens it.
+            Some("GROUPING")
+                if casts
+                    && word(i + 1).as_deref() == Some("SETS")
+                    && token(i + 2) == Some(&Token::LParen) =>
+            {
+                let within = opens.last().is_some_and(|o| sets_lists.contains(o));
+                let element = matches!(
+                    solid.get(i.wrapping_sub(1)).map(|t| &t.0),
+                    Some(Token::LParen | Token::Comma)
+                );
+                if let Some(after) = closed(i + 2, Token::LParen, Token::RParen).filter(|_| within && element) {
+                    swaps.push((solid[i].1, solid[i + 2].2, String::new()));
+                    swaps.push((solid[after - 1].1, solid[after - 1].2, String::new()));
+                }
+                sets_lists.push(i + 2);
             }
             _ => {}
         }

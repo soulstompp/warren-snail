@@ -1300,6 +1300,8 @@ pub(super) fn qualified(names: &[String]) -> String {
 struct Calls<'q> {
     aggregates: Vec<&'q Expr>,
     windows: Vec<&'q Expr>,
+    /// Its GROUPING calls, each read from the set a group is made for.
+    groupings: Vec<&'q Expr>,
     /// The set-returning calls of its select list.
     sets: Vec<&'q Expr>,
     /// The expressions it does not look inside, by their place in the text: those a step makes
@@ -1360,7 +1362,7 @@ pub(super) fn function_name(f: &sqlparser::ast::Function) -> String {
     }
 }
 
-/// Whether a SELECT's list or HAVING calls an aggregate.
+/// Whether a SELECT's list or HAVING calls an aggregate, or GROUPING.
 pub(super) fn aggregates(s: &sqlparser::ast::Select) -> bool {
     let mut calls = Calls::default();
     for i in &s.projection {
@@ -1371,7 +1373,39 @@ pub(super) fn aggregates(s: &sqlparser::ast::Select) -> bool {
     if let Some(h) = &s.having {
         find_calls(h, &mut calls);
     }
-    !calls.aggregates.is_empty()
+    !calls.aggregates.is_empty() || !calls.groupings.is_empty()
+}
+
+/// Whether a call is GROUPING (…), a word of PostgreSQL's grammar: unquoted, in no schema.
+pub(super) fn is_grouping_call(f: &sqlparser::ast::Function) -> bool {
+    matches!(f.name.0.as_slice(), [ObjectNamePart::Identifier(i)]
+        if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("grouping"))
+        && f.over.is_none()
+}
+
+/// What a window call reads: its arguments, its FILTER, its PARTITION BY and its ORDER BY.
+fn window_parts(e: &Expr) -> Vec<&Expr> {
+    let Expr::Function(f) = e else {
+        return Vec::new();
+    };
+    let mut out = parts_of(e);
+    out.extend(f.filter.as_deref());
+    if let Some(WindowType::WindowSpec(spec)) = &f.over {
+        out.extend(&spec.partition_by);
+        out.extend(spec.order_by.iter().map(|o| &o.expr));
+    }
+    out
+}
+
+/// A GROUPING call's arguments.
+fn grouping_args_of(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Function(f) => parts_of(e)
+            .into_iter()
+            .filter(|_| is_grouping_call(f))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Whether an expression calls an aggregate, a window function or a set-returning function, as a
@@ -1425,6 +1459,59 @@ pub(super) fn no_own_calls(
             "aggregate functions are not allowed in {clause}"
         )));
     }
+    if found.groupings.iter().any(own) {
+        return Err(Error::new(format!(
+            "grouping operations are not allowed in {clause}"
+        )));
+    }
+    Ok(())
+}
+
+/// A step's aggregates and GROUPING calls refused as PostgreSQL's parser refuses them: GROUPING of
+/// more than 31 arguments; an aggregate or GROUPING in an aggregate's FILTER, or among an
+/// aggregate's arguments, its ORDER BY or GROUPING's.
+fn nested_calls(calls: &Calls) -> Result<()> {
+    let holds = |xs: Vec<&Expr>| {
+        let mut c = Calls::default();
+        for x in xs {
+            find_calls(x, &mut c);
+        }
+        (!c.aggregates.is_empty(), !c.groupings.is_empty())
+    };
+    let nested = || Error::new("aggregate function calls cannot be nested");
+    for &g in &calls.groupings {
+        let args = grouping_args_of(g);
+        if args.len() > 31 {
+            return Err(Error::new("GROUPING must have fewer than 32 arguments"));
+        }
+        if holds(args) != (false, false) {
+            return Err(nested());
+        }
+    }
+    for &c in &calls.aggregates {
+        let Expr::Function(f) = c else {
+            continue;
+        };
+        if let Some(w) = f.filter.as_deref() {
+            match holds(vec![w]) {
+                (true, _) => return Err(Error::new("aggregate functions are not allowed in FILTER")),
+                (_, true) => return Err(Error::new("grouping operations are not allowed in FILTER")),
+                _ => {}
+            }
+        }
+        let mut parts = parts_of(c);
+        if let FunctionArguments::List(l) = &f.args {
+            for clause in &l.clauses {
+                if let sqlparser::ast::FunctionArgumentClause::OrderBy(os) = clause {
+                    parts.extend(os.iter().map(|o| &o.expr));
+                }
+            }
+        }
+        parts.extend(f.within_group.iter().map(|o| &o.expr));
+        if holds(parts) != (false, false) {
+            return Err(nested());
+        }
+    }
     Ok(())
 }
 
@@ -1436,6 +1523,21 @@ fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
         Expr::Function(f) => {
             if f.over.is_some() {
                 out.windows.push(e);
+                // The aggregates and GROUPING calls a window reads are its step's, read from the
+                // group each row of the window is.
+                let mut read = Calls {
+                    stops: out.stops.clone(),
+                    ..Calls::default()
+                };
+                for x in window_parts(e) {
+                    find_calls(x, &mut read);
+                }
+                out.aggregates.extend(read.aggregates);
+                out.groupings.extend(read.groupings);
+                return;
+            }
+            if is_grouping_call(f) {
+                out.groupings.push(e);
                 return;
             }
             if is_aggregate(&function_name(f)) || !f.within_group.is_empty() {
@@ -5335,10 +5437,14 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                 .zip(&parts)
                 .map(|((v, f), x)| part_of(f.0, v, quoted(x)))
                 .collect::<Result<Vec<_>>>()?;
-            // Its type as the step's typing made it, its fields' domains among it.
+            // Its type as the step's typing made it, its fields' domains among it; a relation's
+            // whole row's its row type.
             let ty = frame
                 .type_of(e)
-                .filter(|t| super::image::is_anonymous(*t, &fields))
+                .filter(|t| match e {
+                    Expr::Tuple(_) => super::image::is_record_of(*t, &fields),
+                    _ => super::image::is_anonymous(*t, &fields),
+                })
                 .unwrap_or_else(|| super::image::anonymous(&fields));
             composed(ty, crate::composed::Item::Record(items))
         }
@@ -6692,7 +6798,15 @@ pub(super) struct Prepared<'q> {
     below_exprs: Vec<&'q Expr>,
     below_levels: Vec<Vec<&'q Expr>>,
     pub(super) below: Below,
+    /// The expressions it groups by, each once.
     grouping: Vec<&'q Expr>,
+    /// Where it groups by more than one grouping set: each set by its members' places in
+    /// `grouping`, and each place one of them stands whole in its select list, its ORDER BY, its
+    /// HAVING or an aggregate's direct arguments, read from the set a group is made for.
+    sets: Option<Vec<Vec<usize>>>,
+    whole: Vec<(*const Expr, usize)>,
+    /// Each GROUPING call's arguments, by their places in `grouping`.
+    grouping_args: Vec<Vec<usize>>,
     grouped: bool,
     /// Whether it returns each row once (SELECT DISTINCT).
     distinct: bool,
@@ -6854,19 +6968,80 @@ impl<'q> Prepared<'q> {
             .collect()
     }
 
-    /// Each aggregate's and window's value a row is made with, in their order.
-    fn folds_of(&self, computed: &Computed) -> Vec<Value> {
+    /// What a row is made with beside its row, in their order: each aggregate's, window's and
+    /// GROUPING's value, and where it groups by sets, each grouped value in its place (`whole`).
+    fn folded(&self) -> Vec<*const Expr> {
         self.calls
             .aggregates
             .iter()
             .chain(&self.calls.windows)
-            .map(|&c| {
-                computed
-                    .calls
-                    .get(&(c as *const Expr))
-                    .cloned()
-                    .unwrap_or(Value::Null)
+            .chain(&self.calls.groupings)
+            .map(|&c| c as *const Expr)
+            .chain(self.whole.iter().map(|&(p, _)| p))
+            .collect()
+    }
+
+    /// Where a grouping expression is a column of its FROM or a value it makes below its fold, its
+    /// place in a row: NULL in the groups of a set that lacks it.
+    fn cleared(&self, i: usize, frame: &Frame) -> Option<usize> {
+        let g = self.grouping[i];
+        if let Some(&(_, k)) = self.below.at.iter().find(|(e, _)| std::ptr::eq(*e, g)) {
+            return Some(frame.columns.len() + k);
+        }
+        let (q, n) = column_of(g)?;
+        frame.find(q.as_deref(), &n).ok()
+    }
+
+    /// The rows a group returns, made of its row and the values its expressions read beyond it.
+    fn group_rows(
+        &self,
+        row: &[Value],
+        calls: HashMap<*const Expr, Value>,
+        frame: &Frame,
+    ) -> Result<Vec<Vec<Value>>> {
+        let computed = Computed {
+            calls,
+            bound: None,
+            _q: std::marker::PhantomData,
+        };
+        self.project(row, frame, computed)
+    }
+
+    /// The rows the groups return where windows read them, once every group is made: each window
+    /// over the groups' rows, reading each group's values, then each group made into its rows.
+    fn windowed_groups(
+        &self,
+        groups: Vec<(Vec<Value>, HashMap<*const Expr, Value>)>,
+        frame: &Frame,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (rows, calls): (Vec<_>, Vec<_>) = groups.into_iter().unzip();
+        let given: Vec<Computed> = calls
+            .into_iter()
+            .map(|calls| Computed {
+                calls,
+                bound: None,
+                _q: std::marker::PhantomData,
             })
+            .collect();
+        let rel = Relation {
+            names: Vec::new(),
+            rows,
+            order: None,
+        };
+        let per_row = windows::values(&self.calls.windows, &rel, frame, Some(&given))?;
+        let mut out = Vec::with_capacity(rel.rows.len());
+        for ((row, mut g), w) in rel.rows.iter().zip(given).zip(per_row) {
+            g.calls.extend(w);
+            out.extend(self.project(row, frame, g)?);
+        }
+        Ok(out)
+    }
+
+    /// The values `folded` names a row is made with, in their order.
+    fn folds_of(&self, computed: &Computed) -> Vec<Value> {
+        self.folded()
+            .into_iter()
+            .map(|c| computed.calls.get(&c).cloned().unwrap_or(Value::Null))
             .collect()
     }
 
@@ -6924,16 +7099,10 @@ impl<'q> Prepared<'q> {
             return Ok(());
         }
         let mut from = row.split_off(self.items.len() + self.hidden.len());
-        let folds = from.split_off(from.len() - self.calls.aggregates.len() - self.calls.windows.len());
+        let folded = self.folded();
+        let folds = from.split_off(from.len() - folded.len());
         let computed = Computed {
-            calls: self
-                .calls
-                .aggregates
-                .iter()
-                .chain(&self.calls.windows)
-                .zip(folds)
-                .map(|(&c, v)| (c as *const Expr, v))
-                .collect(),
+            calls: folded.into_iter().zip(folds).collect(),
             bound: None,
             _q: std::marker::PhantomData,
         };
@@ -7376,11 +7545,17 @@ fn grouped_by<'q>(
         },
     };
     let Some(e) = named else {
+        // GROUPING written in GROUP BY is refused as it is read.
+        let mut calls = Calls::default();
+        find_calls(g, &mut calls);
+        if !calls.groupings.is_empty() {
+            return Err(Error::new("grouping operations are not allowed in GROUP BY"));
+        }
         return Ok(g);
     };
     let mut calls = Calls::default();
     find_calls(e, &mut calls);
-    if !calls.aggregates.is_empty() {
+    if !calls.aggregates.is_empty() || !calls.groupings.is_empty() {
         return Err(Error::new(
             "aggregate functions are not allowed in GROUP BY",
         ));
@@ -7407,8 +7582,8 @@ fn below_fold<'q>(
         find_calls(e, &mut found);
     }
     let grouped: Vec<&'q Expr> = match &s.group_by {
-        GroupByExpr::Expressions(g, m) if m.is_empty() => g
-            .iter()
+        GroupByExpr::Expressions(g, m) if m.is_empty() => super::grouping::each_expr(g)
+            .into_iter()
             .filter_map(|g| grouped_by(g, items, columns).ok())
             .collect(),
         _ => Vec::new(),
@@ -7629,7 +7804,9 @@ fn ungrouped(
     match e {
         Expr::Function(f)
             if f.over.is_none()
-                && (is_aggregate(&function_name(f)) || !f.within_group.is_empty()) =>
+                && (is_aggregate(&function_name(f))
+                    || !f.within_group.is_empty()
+                    || is_grouping_call(f)) =>
         {
             None
         }
@@ -7642,6 +7819,10 @@ fn ungrouped(
             let q = q.as_deref().map_or("", unmarked).to_string();
             (!decided.contains(&q.as_str())).then(|| (q, n.clone()))
         }
+        // A window reads its arguments, FILTER, PARTITION BY and ORDER BY on each group.
+        Expr::Function(f) if f.over.is_some() => window_parts(e)
+            .into_iter()
+            .find_map(|x| ungrouped(x, grouping, columns, decided)),
         _ => {
             let mut parts = parts_of(e);
             if parts.is_empty() {
@@ -7650,6 +7831,47 @@ fn ungrouped(
             parts
                 .into_iter()
                 .find_map(|x| ungrouped(x, grouping, columns, decided))
+        }
+    }
+}
+
+/// Each place in `e` one of the expressions a step groups by stands whole, by its place among them:
+/// the whole before its parts, none inside an aggregate, GROUPING or a subquery, as PostgreSQL's
+/// parser puts a group's value in its place; a window's in what it reads.
+fn grouped_places(
+    e: &Expr,
+    grouping: &[&Expr],
+    same: &dyn Fn(&Expr, &Expr) -> bool,
+    out: &mut Vec<(*const Expr, usize)>,
+) {
+    if let Some(i) = grouping.iter().position(|g| same(g, e)) {
+        out.push((e as *const Expr, i));
+        return;
+    }
+    match e {
+        Expr::Function(f) if f.over.is_some() => {
+            for x in window_parts(e) {
+                grouped_places(x, grouping, same, out);
+            }
+        }
+        Expr::Function(f)
+            if is_grouping_call(f)
+                || is_aggregate(&function_name(f))
+                || !f.within_group.is_empty() => {}
+        // What a subquery is compared with is the step's; the subquery its own.
+        Expr::InSubquery { expr, .. } => grouped_places(expr, grouping, same, out),
+        Expr::AnyOp { left, .. } | Expr::AllOp { left, .. } if is_subquery(e) => {
+            grouped_places(left, grouping, same, out)
+        }
+        e if is_subquery(e) => {}
+        e => {
+            let mut parts = parts_of(e);
+            if parts.is_empty() {
+                parts = super::collate::children(e);
+            }
+            for p in parts {
+                grouped_places(p, grouping, same, out);
+            }
         }
     }
 }
@@ -7746,6 +7968,11 @@ impl<'q> Limit<'q> {
             if !calls.aggregates.is_empty() {
                 return Err(Error::new(format!(
                     "aggregate functions are not allowed in {what}"
+                )));
+            }
+            if !calls.groupings.is_empty() {
+                return Err(Error::new(format!(
+                    "grouping operations are not allowed in {what}"
                 )));
             }
             if !calls.windows.is_empty() {
@@ -7873,6 +8100,7 @@ pub(super) fn prepare<'q>(
     }
     // HAVING keeps the groups its condition holds of, its aggregates folded with the others'.
     let having = s.having.as_ref();
+    let having_groupings = calls.groupings.len();
     if let Some(h) = having {
         sets_refused(h, "HAVING")?;
         let windows = calls.windows.len();
@@ -7903,17 +8131,24 @@ pub(super) fn prepare<'q>(
         }
     }
     calls.aggregates.extend(lifted.iter().copied());
+    let having_groupings = having_groupings..calls.groupings.len();
+    nested_calls(&calls)?;
     for e in &hidden {
         sets_placed(e)?;
     }
-    let grouping = match &s.group_by {
+    let group_by = match &s.group_by {
         GroupByExpr::Expressions(g, m) if m.is_empty() => g.as_slice(),
         _ => return Err(Error::new("GROUP BY ALL is not read")),
     };
-    let grouping = grouping
-        .iter()
-        .map(|g| grouped_by(g, &items, columns))
-        .collect::<Result<Vec<&Expr>>>()?;
+    // Its grouping expressions, each once, alike as a column read outside an aggregate is to one
+    // of them (`ungrouped`), and its sets.
+    let same = |g: &Expr, e: &Expr| {
+        g == e
+            || matches!((resolved(g, columns), resolved(e, columns)),
+                (Some(a), Some(b)) if std::ptr::eq(a, b))
+    };
+    let read = super::grouping::expand(group_by, &mut |g| grouped_by(g, &items, columns), &same)?;
+    let grouping = read.exprs.clone();
     // Each DISTINCT ON key is read as an ORDER BY item is, after the ORDER BY and the GROUP BY, as
     // PostgreSQL's parser reads it: the select list's column it names, or an expression the ORDER
     // BY makes beside it, or one more of its own.
@@ -7932,10 +8167,20 @@ pub(super) fn prepare<'q>(
             }
         });
     }
-    let grouped = !grouping.is_empty() || !calls.aggregates.is_empty() || having.is_some();
+    let grouped = !grouping.is_empty()
+        || !calls.aggregates.is_empty()
+        || !calls.groupings.is_empty()
+        || having.is_some()
+        || read.written;
     let calls_windows_whole = calls.windows.iter().any(|w| !streams(w));
-    if grouped && !calls.windows.is_empty() {
-        return Err(Error::new("a window over groups is not read"));
+    // Each GROUPING call's arguments, each a grouping expression of the step's.
+    let mut grouping_args = Vec::with_capacity(calls.groupings.len());
+    for &g in &calls.groupings {
+        let places: Option<Vec<usize>> = grouping_args_of(g)
+            .iter()
+            .map(|a| grouping.iter().position(|x| same(x, a)))
+            .collect();
+        grouping_args.push(places);
     }
     let mut typing = super::typed::Typing {
         columns,
@@ -8099,15 +8344,30 @@ pub(super) fn prepare<'q>(
             Some(lead)
         }
     };
+    let arguments_grouped = |range: &mut dyn Iterator<Item = usize>| -> Result<()> {
+        for i in range {
+            if grouping_args[i].is_none() {
+                return Err(Error::new(
+                    "arguments to GROUPING must be grouping expressions of the associated query \
+                     level",
+                ));
+            }
+        }
+        Ok(())
+    };
     // Where it groups, a column read outside an aggregate is one it groups by, or one its group by
-    // the table's primary key decides, as PostgreSQL's parser holds it once the rest is read.
+    // the table's primary key decides where the key's columns are in every set, as PostgreSQL's
+    // parser holds it: GROUPING's arguments and then the columns of its select list and ORDER BY,
+    // then HAVING's, once the rest is read.
     if grouped {
+        read.refused()?;
+        let common: Vec<&Expr> = read.common().into_iter().map(|i| grouping[i]).collect();
         let decided: Vec<&str> = keyed
             .iter()
             .filter(|(q, key)| {
                 !key.is_empty()
                     && key.iter().all(|k| {
-                        grouping.iter().any(|g| {
+                        common.iter().any(|g| {
                             resolved(g, columns).is_some_and(|(cq, cn, _)| {
                                 cq.as_deref().map(unmarked) == Some(q.as_str()) && cn == k
                             })
@@ -8116,18 +8376,24 @@ pub(super) fn prepare<'q>(
             })
             .map(|(q, _)| q.as_str())
             .collect();
-        for e in items
-            .iter()
-            .map(|(e, _)| *e)
-            .chain(hidden.iter().copied())
-            .chain(having)
-        {
-            if let Some((q, n)) = ungrouped(e, &grouping, columns, &decided) {
-                return Err(Error::new(format!(
+        let ungrouped_in = |e: &Expr| -> Result<()> {
+            match ungrouped(e, &grouping, columns, &decided) {
+                Some((q, n)) => Err(Error::new(format!(
                     "column \"{q}.{n}\" must appear in the GROUP BY clause or be used in an \
                      aggregate function"
-                )));
+                ))),
+                None => Ok(()),
             }
+        };
+        arguments_grouped(
+            &mut (0..calls.groupings.len()).filter(|i| !having_groupings.contains(i)),
+        )?;
+        for e in items.iter().map(|(e, _)| *e).chain(hidden.iter().copied()) {
+            ungrouped_in(e)?;
+        }
+        arguments_grouped(&mut having_groupings.clone())?;
+        if let Some(h) = having {
+            ungrouped_in(h)?;
         }
         // A subquery read on each group reads only what is one value for it.
         for &at in around {
@@ -8139,6 +8405,33 @@ pub(super) fn prepare<'q>(
             }
         }
     }
+    // Where it groups by more than one set, each place an expression it groups by stands whole in
+    // its select list, ORDER BY, HAVING and aggregates' direct arguments.
+    let (sets, whole) = match read.plain() {
+        true => (None, Vec::new()),
+        false => {
+            let mut whole = Vec::new();
+            let direct = calls
+                .aggregates
+                .iter()
+                .filter(|c| matches!(c, Expr::Function(f) if !f.within_group.is_empty()))
+                .flat_map(|&c| parts_of(c));
+            for e in items
+                .iter()
+                .map(|(e, _)| *e)
+                .chain(hidden.iter().copied())
+                .chain(having)
+                .chain(direct)
+            {
+                grouped_places(e, &grouping, &same, &mut whole);
+            }
+            (Some(read.sets), whole)
+        }
+    };
+    let grouping_args = grouping_args
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect();
     // An item that draws, from a sequence or at random, and is no sort key is made above the sort
     // and below the cut, as PostgreSQL's planner places a volatile item: in the rows' sorted order,
     // for each row the LIMIT and OFFSET read, beside grouping, windows and sets too. Under DISTINCT
@@ -8202,6 +8495,9 @@ pub(super) fn prepare<'q>(
         items,
         calls,
         grouping,
+        sets,
+        whole,
+        grouping_args,
         grouped,
         whole_windows: calls_windows_whole,
         distinct,
@@ -8327,7 +8623,7 @@ fn fold_partition(
         rows,
         order: None,
     };
-    let per_row = windows::values(&p.calls.windows, &rel, frame)?;
+    let per_row = windows::values(&p.calls.windows, &rel, frame, None)?;
     for (row, w) in rel.rows.iter().zip(per_row) {
         let computed = Computed {
             calls: w,
@@ -8339,9 +8635,12 @@ fn fold_partition(
     Ok(())
 }
 
-/// A step's groups: each one's first row and its aggregates' folds, its key's place among them, and
-/// past the room, the rows of the groups none has come for yet, written for a pass of their own.
+/// A step's groups of one set: each one's first row and its aggregates' folds, its key's place
+/// among them, and past the room, the rows of the groups none has come for yet, written for a pass
+/// of their own. `set` is the places of its members among the step's grouping expressions; where
+/// the step groups by sets, a group's first row carries each grouping expression's value after it.
 struct Groups {
+    set: Vec<usize>,
     at: HashMap<Vec<Key>, usize>,
     list: Vec<(Vec<Value>, Vec<Acc>)>,
     held: crate::room::Holding,
@@ -8355,9 +8654,119 @@ struct Groups {
     kept: crate::room::Holding,
 }
 
+/// How a step's rows are read for its groups, once a chunk: each aggregate's parts, the casing each
+/// grouping expression keys under and each aggregate compares under.
+struct Reading<'e> {
+    folded: Vec<Folds<'e>>,
+    grouped_under: Vec<Option<Casing>>,
+    folded_under: Vec<(Vec<Option<Casing>>, Option<String>)>,
+    group_bytes: u64,
+}
+
+/// What a row gives each aggregate it is folded into: its direct arguments' values and its
+/// arguments', none where its FILTER passes the row over.
+type Given = Vec<Option<(Vec<Value>, Vec<Value>)>>;
+
+impl<'e> Reading<'e> {
+    fn of(p: &'e Prepared, frame: &Frame) -> Result<Reading<'e>> {
+        let folded: Vec<Folds> = p
+            .calls
+            .aggregates
+            .iter()
+            .map(|&c| Acc::of(c, &p.types).map(|(_, f)| f))
+            .collect::<Result<_>>()?;
+        let grouped_under = p
+            .grouping
+            .iter()
+            .map(|g| frame.casings.keyed(g))
+            .collect::<Result<Vec<_>>>()?;
+        let folded_under = p
+            .calls
+            .aggregates
+            .iter()
+            .zip(&folded)
+            .map(|(&c, f)| frame.casings.folded(c, &f.args))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Reading {
+            folded,
+            grouped_under,
+            folded_under,
+            group_bytes: 32 * p.calls.aggregates.len() as u64,
+        })
+    }
+
+    /// A row's grouping expressions' keys and values.
+    fn keyed(&self, p: &Prepared, row: &[Value], frame: &Frame) -> Result<(Vec<Key>, Vec<Value>)> {
+        let none = computed_none();
+        let mut keys = Vec::with_capacity(p.grouping.len());
+        let mut values = Vec::with_capacity(p.grouping.len());
+        for (g, &u) in p.grouping.iter().zip(&self.grouped_under) {
+            let v = eval(g, row, frame, &none)?;
+            grouped_key(&v)?;
+            keys.push(key_under(&v, u));
+            values.push(v);
+        }
+        Ok((keys, values))
+    }
+
+    /// What a row gives each aggregate (`Given`).
+    fn given(&self, row: &[Value], frame: &Frame) -> Result<Given> {
+        let none = computed_none();
+        let mut out = Vec::with_capacity(self.folded.len());
+        for f in &self.folded {
+            if let Some(w) = f.filter {
+                if holds(w, row, frame, &none)? != Some(true) {
+                    out.push(None);
+                    continue;
+                }
+            }
+            let direct = f
+                .direct
+                .iter()
+                .map(|x| eval(x, row, frame, &none))
+                .collect::<Result<_>>()?;
+            let values = f
+                .args
+                .iter()
+                .map(|x| eval(x, row, frame, &none))
+                .collect::<Result<_>>()?;
+            out.push(Some((direct, values)));
+        }
+        Ok(out)
+    }
+}
+
+/// Rows folded into the groups of each of a step's sets, each row's keys read once for all of them,
+/// and what it gives the aggregates once for those it is folded in (`Groups::place`). Where `along`
+/// is given, rows come in the order of their groups, each ended as its key changes.
+fn fold_rows(
+    groups: &mut [Groups],
+    p: &Prepared,
+    rows: Vec<Vec<Value>>,
+    frame: &Frame,
+    mut along: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>>,
+) -> Result<()> {
+    let reading = Reading::of(p, frame)?;
+    for row in rows {
+        let (keys, values) = reading.keyed(p, &row, frame)?;
+        let mut given: Option<Given> = None;
+        for g in groups.iter_mut() {
+            let Some(i) = g.place(p, &reading, &row, &keys, &values, frame, &mut along)? else {
+                continue;
+            };
+            if given.is_none() {
+                given = Some(reading.given(&row, frame)?);
+            }
+            g.add(i, &reading, given.clone().expect("just read"))?;
+        }
+    }
+    Ok(())
+}
+
 impl Groups {
-    fn new() -> Groups {
+    fn new(set: Vec<usize>) -> Groups {
         Groups {
+            set,
             at: HashMap::new(),
             list: Vec::new(),
             held: crate::room::holding(0),
@@ -8379,147 +8788,156 @@ impl Groups {
             .collect()
     }
 
-    /// Rows folded into their groups: a group none has come for, past the room, its rows written.
-    /// Where `along` is given, rows come in the order of their groups, each ended as its key changes.
-    fn fold(
+    /// The group a row is folded into, by its set's keys: a new one for a key none has come for, or
+    /// none past the room, the row written.
+    #[allow(clippy::too_many_arguments)]
+    fn place(
         &mut self,
         p: &Prepared,
-        rows: Vec<Vec<Value>>,
+        reading: &Reading,
+        row: &[Value],
+        keys: &[Key],
+        values: &[Value],
         frame: &Frame,
-        mut along: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>>,
-    ) -> Result<()> {
-        let none = computed_none();
-        let folded: Vec<Folds> = p
-            .calls
-            .aggregates
-            .iter()
-            .map(|&c| Acc::of(c, &p.types).map(|(_, f)| f))
-            .collect::<Result<_>>()?;
-        let grouped_under = p
-            .grouping
-            .iter()
-            .map(|g| frame.casings.keyed(g))
-            .collect::<Result<Vec<_>>>()?;
-        let folded_under = p
-            .calls
-            .aggregates
-            .iter()
-            .zip(&folded)
-            .map(|(&c, f)| frame.casings.folded(c, &f.args))
-            .collect::<Result<Vec<_>>>()?;
-        let group_bytes = 32 * p.calls.aggregates.len() as u64;
-        for row in rows {
-            let k: Vec<Key> = p
-                .grouping
-                .iter()
-                .zip(&grouped_under)
-                .map(|(g, &u)| {
-                    eval(g, &row, frame, &none).and_then(|v| {
-                        grouped_key(&v)?;
-                        Ok(key_under(&v, u))
-                    })
-                })
-                .collect::<Result<_>>()?;
-            if let Some(end) = &mut along {
-                if !self.list.is_empty() && !self.at.contains_key(&k) {
-                    self.project(p, frame, end)?;
-                }
+        along: &mut Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>>,
+    ) -> Result<Option<usize>> {
+        let k: Vec<Key> = self.set.iter().map(|&i| keys[i].clone()).collect();
+        if let Some(end) = along {
+            if !self.list.is_empty() && !self.at.contains_key(&k) {
+                self.project(p, frame, &mut |row, calls| end(p.group_rows(&row, calls, frame)?))?;
             }
-            let i = match self.at.get(&k) {
-                Some(&i) => i,
-                None => {
-                    let w = super::spill::row_width(&row) + group_bytes;
-                    if !self.list.is_empty() && (self.closed || !self.held.fits(w)) {
-                        self.closed = true;
-                        if self.expected.is_none() {
-                            self.expected = self.rows_to_come.map(|n| n * w);
-                        }
-                        let (lo, hi, expected) = (self.range.0, self.range.1, self.expected);
-                        self.past
-                            .get_or_insert_with(|| super::spill::Parts::new(lo, hi, expected))
-                            .push(parted::key_hash(&k, 0), row)?;
-                        continue;
-                    }
-                    if self.list.is_empty() {
-                        self.held.more(w);
-                    }
-                    self.list.push((row.clone(), Self::fresh(p)?));
-                    self.at.insert(k, self.list.len() - 1);
-                    self.list.len() - 1
-                }
+        }
+        if let Some(&i) = self.at.get(&k) {
+            return Ok(Some(i));
+        }
+        let w = super::spill::row_width(row) + reading.group_bytes;
+        if !self.list.is_empty() && (self.closed || !self.held.fits(w)) {
+            self.closed = true;
+            if self.expected.is_none() {
+                self.expected = self.rows_to_come.map(|n| n * w);
+            }
+            let (lo, hi, expected) = (self.range.0, self.range.1, self.expected);
+            self.past
+                .get_or_insert_with(|| super::spill::Parts::new(lo, hi, expected))
+                .push(parted::key_hash(&k, 0), row.to_vec())?;
+            return Ok(None);
+        }
+        if self.list.is_empty() {
+            self.held.more(w);
+        }
+        let mut first = row.to_vec();
+        if p.sets.is_some() {
+            first.extend_from_slice(values);
+        }
+        self.list.push((first, Self::fresh(p)?));
+        self.at.insert(k, self.list.len() - 1);
+        Ok(Some(self.list.len() - 1))
+    }
+
+    /// What a row gives the aggregates (`Given`) folded into its group.
+    fn add(&mut self, i: usize, reading: &Reading, given: Given) -> Result<()> {
+        for (((acc, f), (u, refused)), given) in self.list[i]
+            .1
+            .iter_mut()
+            .zip(&reading.folded)
+            .zip(&reading.folded_under)
+            .zip(given)
+        {
+            let Some((direct, values)) = given else {
+                continue;
             };
-            for ((acc, f), (u, refused)) in
-                self.list[i].1.iter_mut().zip(&folded).zip(&folded_under)
-            {
-                if let Some(w) = f.filter {
-                    if holds(w, &row, frame, &none)? != Some(true) {
-                        continue;
-                    }
-                }
-                if !f.direct.is_empty() {
-                    acc.direct(
-                        f.direct
-                            .iter()
-                            .map(|x| eval(x, &row, frame, &none))
-                            .collect::<Result<_>>()?,
-                    );
-                }
-                let values: Vec<Value> = f
-                    .args
-                    .iter()
-                    .map(|x| eval(x, &row, frame, &none))
-                    .collect::<Result<_>>()?;
-                if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
-                    return Err(Error::new(e.clone()));
-                }
-                if acc.keeps_rows() {
-                    self.kept.more(super::spill::row_width(&values));
-                }
-                acc.add_row(values, u)?;
+            if !f.direct.is_empty() {
+                acc.direct(direct);
             }
+            if let Some(e) = refused.as_ref().filter(|_| acc.compares(&values)) {
+                return Err(Error::new(e.clone()));
+            }
+            if acc.keeps_rows() {
+                self.kept.more(super::spill::row_width(&values));
+            }
+            acc.add_row(values, u)?;
         }
         Ok(())
     }
 
-    /// The rows the groups held return, then their room let go.
+    /// Each group HAVING keeps handed to `out`, its row and the values its expressions read beyond
+    /// it (`Computed`), then their room let go. Where the step groups by sets, each group's row has
+    /// the columns and the values made below the fold its set lacks NULL, and each grouping
+    /// expression standing whole reads its group's value, NULL where its set lacks it; each
+    /// GROUPING call reads a bit for each argument its set lacks.
     fn project(
         &mut self,
         p: &Prepared,
         frame: &Frame,
-        out: &mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>,
+        out: &mut dyn FnMut(Vec<Value>, HashMap<*const Expr, Value>) -> Result<()>,
     ) -> Result<()> {
+        let lacking: Vec<usize> = match &p.sets {
+            Some(_) => (0..p.grouping.len())
+                .filter(|i| !self.set.contains(i))
+                .flat_map(|i| p.cleared(i, frame))
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut lacks: HashMap<*const Expr, Value> = HashMap::new();
+        for (&g, args) in p.calls.groupings.iter().zip(&p.grouping_args) {
+            let bits = args
+                .iter()
+                .fold(0i64, |b, a| (b << 1) | i64::from(!self.set.contains(a)));
+            lacks.insert(g as *const Expr, Value::Int(bits));
+        }
         for (first, accs) in std::mem::take(&mut self.list) {
-            let computed = Computed {
-                calls: p
-                    .calls
-                    .aggregates
-                    .iter()
-                    .zip(&accs)
-                    .map(|(&c, a)| {
-                        // A direct argument is read once a group, from no row where none came.
-                        let (_, f) = Acc::of(c, &p.types)?;
-                        if f.direct.is_empty() {
-                            return Ok((c as *const Expr, a.value()?));
-                        }
-                        let mut a = a.clone();
-                        a.direct(
-                            f.direct
-                                .iter()
-                                .map(|x| eval(x, &first, frame, &computed_none()))
-                                .collect::<Result<_>>()?,
-                        );
-                        Ok((c as *const Expr, a.value()?))
-                    })
-                    .collect::<Result<_>>()?,
+            let (mut row, values) = match &p.sets {
+                Some(_) => {
+                    let mut row = first;
+                    let values = row.split_off(row.len() - p.grouping.len());
+                    (row, values)
+                }
+                None => (first, Vec::new()),
+            };
+            for &c in &lacking {
+                row[c] = Value::Null;
+            }
+            let mut calls = lacks.clone();
+            for &(at, i) in &p.whole {
+                let v = match self.set.contains(&i) {
+                    true => values[i].clone(),
+                    false => Value::Null,
+                };
+                calls.insert(at, v);
+            }
+            let grouped = Computed {
+                calls,
                 bound: None,
                 _q: std::marker::PhantomData,
             };
+            let folds = p
+                .calls
+                .aggregates
+                .iter()
+                .zip(&accs)
+                .map(|(&c, a)| {
+                    // A direct argument is read once a group, from no row where none came.
+                    let (_, f) = Acc::of(c, &p.types)?;
+                    if f.direct.is_empty() {
+                        return Ok((c, a.value()?));
+                    }
+                    let mut a = a.clone();
+                    a.direct(
+                        f.direct
+                            .iter()
+                            .map(|x| eval(x, &row, frame, &grouped))
+                            .collect::<Result<_>>()?,
+                    );
+                    Ok((c, a.value()?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let computed = grouped.and(folds);
             if let Some(h) = p.having {
-                if holds(h, &first, frame, &computed)? != Some(true) {
+                if holds(h, &row, frame, &computed)? != Some(true) {
                     continue;
                 }
             }
-            out(p.project(&first, frame, computed)?)?;
+            out(row, computed.calls)?;
         }
         self.at.clear();
         self.closed = false;
@@ -8628,7 +9046,8 @@ impl Going {
 pub(super) struct StepRun<'q> {
     p: Prepared<'q>,
     running: Running,
-    groups: Groups,
+    /// Its groups, of each grouping set.
+    groups: Vec<Groups>,
     going: Going,
     /// The rows its FROM gives, held for a window that reads its partition whole, and the column
     /// holding the table's order among them.
@@ -8669,10 +9088,14 @@ impl<'q> StepRun<'q> {
             sorts: p.order_by.is_some() || p.distinct_on.is_some(),
             cut: None,
         };
+        let groups = match &p.sets {
+            Some(sets) => sets.iter().map(|s| Groups::new(s.clone())).collect(),
+            None => vec![Groups::new((0..p.grouping.len()).collect())],
+        };
         StepRun {
             p,
             running: HashMap::new(),
-            groups: Groups::new(),
+            groups,
             going,
             held: parted::Parted::new(),
             along_partitions: false,
@@ -8691,7 +9114,9 @@ impl<'q> StepRun<'q> {
     /// Told how many rows its FROM gives, at most, before the first comes.
     pub(super) fn expect_rows(&mut self, n: u64) {
         self.held.rows_to_come = Some(n);
-        self.groups.rows_to_come = Some(n);
+        for g in &mut self.groups {
+            g.rows_to_come = Some(n);
+        }
         self.going.rows_to_come = Some(n);
     }
 
@@ -8761,9 +9186,10 @@ impl<'q> StepRun<'q> {
                 ended.extend(rows);
                 Ok(())
             };
+            // Windows read every group, so none is ended before all have come.
             let along: Option<&mut dyn FnMut(Vec<Vec<Value>>) -> Result<()>> =
-                self.along_groups.then_some(&mut end);
-            self.groups.fold(&self.p, rel.rows, &frame, along)?;
+                (self.along_groups && self.p.calls.windows.is_empty()).then_some(&mut end);
+            fold_rows(&mut self.groups, &self.p, rel.rows, &frame, along)?;
             let names = self.names();
             let handed = self.going.take(&self.p, &frame, ended)?;
             self.columns = frame.columns;
@@ -8940,27 +9366,50 @@ impl<'q> StepRun<'q> {
             Ok(())
         };
         if p.grouped {
-            if self.groups.list.is_empty() && p.grouping.is_empty() {
-                let row = self
-                    .empty_row
-                    .take()
-                    .unwrap_or_else(|| vec![Value::Null; frame.columns.len()]);
-                self.groups.list.push((row, Groups::fresh(p)?));
+            // Each set's groups, set after set: a set of none gives its row over no rows, each such
+            // set its own, its grouping expressions' values NULL after it where the step groups by
+            // sets.
+            let empty = self
+                .empty_row
+                .take()
+                .unwrap_or_else(|| vec![Value::Null; frame.columns.len()]);
+            // Where windows read the groups, every group's row is held for them.
+            let mut windowed = Vec::new();
+            for groups in &mut self.groups {
+                if groups.list.is_empty() && groups.set.is_empty() {
+                    let mut row = empty.clone();
+                    if p.sets.is_some() {
+                        row.extend((0..p.grouping.len()).map(|_| Value::Null));
+                    }
+                    groups.list.push((row, Groups::fresh(p)?));
+                }
+                loop {
+                    groups.project(p, &frame, &mut |row, calls| {
+                        match p.calls.windows.is_empty() {
+                            true => emit(p.group_rows(&row, calls, &frame)?, going),
+                            false => {
+                                windowed.push((row, calls));
+                                Ok(())
+                            }
+                        }
+                    })?;
+                    if let Some(past) = groups.past.take() {
+                        past.into_queue(groups.range.1, &mut groups.queue)?;
+                    }
+                    let Some((lo, hi, total, runs)) = groups.queue.next(0) else {
+                        break;
+                    };
+                    groups.range = (lo, hi);
+                    groups.expected = Some(total);
+                    for run in runs {
+                        run.each_chunk(&mut |c| {
+                            fold_rows(std::slice::from_mut(groups), p, c, &frame, None)
+                        })?;
+                    }
+                }
             }
-            loop {
-                self.groups.project(p, &frame, &mut |rows| emit(rows, going))?;
-                let groups = &mut self.groups;
-                if let Some(past) = groups.past.take() {
-                    past.into_queue(groups.range.1, &mut groups.queue)?;
-                }
-                let Some((lo, hi, total, runs)) = groups.queue.next(0) else {
-                    break;
-                };
-                groups.range = (lo, hi);
-                groups.expected = Some(total);
-                for run in runs {
-                    run.each_chunk(&mut |c| groups.fold(p, c, &frame, None))?;
-                }
+            if !windowed.is_empty() {
+                emit(p.windowed_groups(windowed, &frame)?, going)?;
             }
         }
         if self.along_partitions {
@@ -8974,7 +9423,7 @@ impl<'q> StepRun<'q> {
             let by = windows::shared_partition(&p.calls.windows);
             let mut order = None;
             held.finish(&|r| parted::partition_hash(by, r, &frame), &mut |rel| {
-                let per_row = windows::values(&p.calls.windows, &rel, &frame)?;
+                let per_row = windows::values(&p.calls.windows, &rel, &frame, None)?;
                 let mut rows = Vec::with_capacity(rel.rows.len());
                 for (row, w) in rel.rows.iter().zip(per_row) {
                     let computed = Computed {
@@ -9645,7 +10094,7 @@ impl<'q> Stream<'q> {
                 .iter()
                 .flatten()
                 .map(|r| {
-                    r.groups.list.len()
+                    r.groups.iter().map(|g| g.list.len()).sum::<usize>()
                         + r.going.sorter.as_ref().map_or(0, |s| s.held())
                         + r.partitions_out.len()
                         + r.running.values().map(HashMap::len).sum::<usize>()
@@ -10009,6 +10458,9 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         | Expr::Substring { .. }
         | Expr::Tuple(_)
         | Expr::Case { .. } => true,
+        // Grouping sets, and GROUP BY DISTINCT's mark: the question path holds no level for either.
+        Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => true,
+        e if super::grouping::is_distinct_mark(e) => true,
         Expr::Value(v) => matches!(v.value, SqlValue::Placeholder(_)),
         // An OR: the question path reads one only where its arms are keys or elements.
         Expr::BinaryOp { left, op, right } => {
@@ -10092,6 +10544,42 @@ fn compares_no_constant(e: &Expr) -> bool {
         | Expr::IsNotUnknown(x) => compares_no_constant(x),
         _ => false,
     }
+}
+
+/// Whether a question over the snail's tables reads one's whole row, which only the pipeline reads:
+/// a bare name none of their columns bears that names one of them, by its alias or its name.
+pub fn reads_whole_rows(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut columns: Vec<&str> = Vec::new();
+    for t in &s.from {
+        for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+            let TableFactor::Table { name, alias, args: None, .. } = f else {
+                return false;
+            };
+            let full = crate::catalog::object_name(name);
+            let last = full.rsplit('.').next().unwrap_or(&full).to_string();
+            if let Some(t) = catalog
+                .tables
+                .iter()
+                .find(|t| t.name == full || t.name.rsplit('.').next() == Some(&last))
+            {
+                columns.extend(t.columns.iter().map(|c| c.name.as_str()));
+            }
+            names.push(alias.as_ref().map_or(last, |a| ident(&a.name)));
+        }
+    }
+    sqlparser::ast::visit_expressions(q, |e| match e {
+        Expr::Identifier(i)
+            if names.contains(&ident(i)) && !columns.contains(&ident(i).as_str()) =>
+        {
+            std::ops::ControlFlow::Break(())
+        }
+        _ => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// Whether a question is read as a pipeline: a WITH, or a window in what it returns.

@@ -1413,21 +1413,17 @@ fn a_function_in_from_is_named_and_counted() {
             ),
         ],
     );
-    // 18.6 reads these as the whole row, a record: (5,1) and (6,2); (1,a) and (2,b). The snail
-    // refuses a whole-row reference past a lone function with no ordinality as it refuses a
-    // table's, in words of its own.
-    refusals(
+    // Past a lone function with no ordinality, the name reads the whole row, a record.
+    answered(
         &mut w,
         &[
             (
                 "SELECT u FROM unnest(ARRAY[5, 6]) WITH ORDINALITY AS u(v, n)",
-                "42703",
-                "column \"u\" does not exist",
+                &["(5,1)", "(6,2)"],
             ),
             (
                 "SELECT t FROM unnest(ARRAY[1, 2], ARRAY['a', 'b']) AS t(n, s)",
-                "42703",
-                "column \"t\" does not exist",
+                &["(1,a)", "(2,b)"],
             ),
         ],
     );
@@ -4250,5 +4246,671 @@ fn select_all_is_no_distinct_anywhere() {
     answered(
         &mut w,
         &[("SELECT id, b, k FROM dn.t ORDER BY id", &["2|1|1", "4|3|2", "6|5|3"])],
+    );
+}
+
+// The grouping sets, case 12d: GROUP BY ROLLUP, CUBE and GROUPING SETS, a group for each set, an
+// expression a set lacks NULL wherever it is named, GROUPING()'s bit for each argument its set
+// lacks; GROUP BY DISTINCT and ALL; refused where 18.6 refuses. Every statement orders by
+// GROUPING() first or returns rows alike, as the order with no ORDER BY is 18.6's plan's.
+
+const GS_DDL: &str = "CREATE SCHEMA gs;
+     CREATE TABLE gs.sale (id integer NOT NULL, region text, product text, qty integer, PRIMARY KEY (id));
+     CREATE TABLE gs.region (code text NOT NULL, name text, PRIMARY KEY (code));";
+
+const GS_ROWS: [&str; 2] = [
+    "INSERT INTO gs.sale VALUES (1, 'N', 'a', 10), (2, 'N', 'b', 20), (3, 'S', 'a', 5), \
+     (4, 'S', 'a', NULL), (5, NULL, 'b', 7), (6, 'S', NULL, 3), (7, 'N', 'a', 10)",
+    "INSERT INTO gs.region VALUES ('N', 'North'), ('S', 'South')",
+];
+
+/// A snail holding case 12d's rows, at a path of the test's name.
+fn gs(name: &str) -> Snail {
+    let path = tmp(&format!("reader-gs-{name}.snail"));
+    write(&path, &Catalog::parse(GS_DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in GS_ROWS {
+        w.execute(sql).unwrap();
+    }
+    w
+}
+
+#[test]
+fn a_rollup_gives_each_prefix_then_the_total() {
+    let mut w = gs("rollup");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, sum(qty) FROM gs.sale GROUP BY ROLLUP (region) ORDER BY \
+                 GROUPING(region), region",
+                &["N|40", "S|8", "NULL|7", "NULL|55"],
+            ),
+            (
+                "SELECT region, product, sum(qty), GROUPING(region, product) AS g FROM gs.sale \
+                 GROUP BY ROLLUP (region, product) ORDER BY g, region, product",
+                &[
+                    "N|a|20|0", "N|b|20|0", "S|a|5|0", "S|NULL|3|0", "NULL|b|7|0", "N|NULL|40|1",
+                    "S|NULL|8|1", "NULL|NULL|7|1", "NULL|NULL|55|3",
+                ],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY ROLLUP ((region, product)) \
+                 ORDER BY GROUPING(region, product), region, product",
+                &["N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1", "NULL|NULL|7"],
+            ),
+            (
+                "SELECT region, product, qty, count(*) FROM gs.sale GROUP BY ROLLUP (region, \
+                 product, qty) ORDER BY GROUPING(region, product, qty), region, product, qty",
+                &[
+                    "N|a|10|2", "N|b|20|1", "S|a|5|1", "S|a|NULL|1", "S|NULL|3|1", "NULL|b|7|1",
+                    "N|a|NULL|2", "N|b|NULL|1", "S|a|NULL|2", "S|NULL|NULL|1", "NULL|b|NULL|1",
+                    "N|NULL|NULL|3", "S|NULL|NULL|3", "NULL|NULL|NULL|1", "NULL|NULL|NULL|7",
+                ],
+            ),
+            // Places and output names are read inside a set.
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY ROLLUP (1, 2) ORDER BY \
+                 GROUPING(region, product), 1, 2",
+                &[
+                    "N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1", "N|NULL|3", "S|NULL|3",
+                    "NULL|NULL|1", "NULL|NULL|7",
+                ],
+            ),
+            (
+                "SELECT s % 2 AS p, count(*), sum(s) FROM generate_series(1, 5) s GROUP BY ROLLUP \
+                 (s % 2) ORDER BY GROUPING(s % 2), p",
+                &["0|2|6", "1|3|9", "NULL|5|15"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_cube_gives_every_subset() {
+    let mut w = gs("cube");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, product, count(*), GROUPING(region) AS gr, GROUPING(product) AS gp \
+                 FROM gs.sale GROUP BY CUBE (region, product) ORDER BY gr, gp, region, product",
+                &[
+                    "N|a|2|0|0", "N|b|1|0|0", "S|a|2|0|0", "S|NULL|1|0|0", "NULL|b|1|0|0",
+                    "N|NULL|3|0|1", "S|NULL|3|0|1", "NULL|NULL|1|0|1", "NULL|a|4|1|0",
+                    "NULL|b|2|1|0", "NULL|NULL|1|1|0", "NULL|NULL|7|1|1",
+                ],
+            ),
+            (
+                "SELECT region, product, sum(qty) FROM gs.sale GROUP BY CUBE ((region, product)) \
+                 ORDER BY GROUPING(region, product), region, product",
+                &["N|a|20", "N|b|20", "S|a|5", "S|NULL|3", "NULL|b|7", "NULL|NULL|55"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn every_fold_folds_each_set_from_the_rows() {
+    let mut w = gs("folds");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, count(*), count(qty), sum(qty), min(qty), max(qty), count(DISTINCT \
+                 qty), count(DISTINCT product) FROM gs.sale GROUP BY ROLLUP (region) ORDER BY \
+                 GROUPING(region), region",
+                &["N|3|3|40|10|20|2|2", "S|3|2|8|3|5|2|1", "NULL|1|1|7|7|7|1|1", "NULL|7|6|55|3|20|5|2"],
+            ),
+            (
+                "SELECT region, product, count(*), count(qty), sum(qty), min(qty), max(qty), \
+                 count(DISTINCT qty) FROM gs.sale GROUP BY CUBE (region, product) ORDER BY \
+                 GROUPING(region, product), region, product",
+                &[
+                    "N|a|2|2|20|10|10|1", "N|b|1|1|20|20|20|1", "S|a|2|1|5|5|5|1",
+                    "S|NULL|1|1|3|3|3|1", "NULL|b|1|1|7|7|7|1", "N|NULL|3|3|40|10|20|2",
+                    "S|NULL|3|2|8|3|5|2", "NULL|NULL|1|1|7|7|7|1", "NULL|a|4|3|25|5|10|2",
+                    "NULL|b|2|2|27|7|20|2", "NULL|NULL|1|1|3|3|3|1", "NULL|NULL|7|6|55|3|20|5",
+                ],
+            ),
+            (
+                "SELECT product, avg(qty), string_agg(region, ',' ORDER BY region), array_agg(id \
+                 ORDER BY id) FROM gs.sale GROUP BY GROUPING SETS ((product), ()) ORDER BY \
+                 GROUPING(product), product",
+                &[
+                    "a|8.3333333333333333|N,N,S,S|{1,3,4,7}",
+                    "b|13.5000000000000000|N|{2,5}",
+                    "NULL|3.0000000000000000|S|{6}",
+                    "NULL|9.1666666666666667|N,N,N,S,S,S|{1,2,3,4,5,6,7}",
+                ],
+            ),
+            (
+                "SELECT region, count(*) FILTER (WHERE qty > 5) AS big, bool_and(qty > 4) AS all4 \
+                 FROM gs.sale GROUP BY ROLLUP (region) ORDER BY GROUPING(region), region",
+                &["N|3|t", "S|0|f", "NULL|1|t", "NULL|4|f"],
+            ),
+            // A direct argument is read once a group, as an ordered set reads it.
+            (
+                "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY qty), region FROM gs.sale \
+                 GROUP BY ROLLUP (region) ORDER BY GROUPING(region), region",
+                &["10|N", "3|S", "7|NULL", "7|NULL"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn grouping_sets_give_each_set_listed_repeats_kept() {
+    let mut w = gs("sets");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, product, count(qty) FROM gs.sale GROUP BY GROUPING SETS ((region), \
+                 (product), ()) ORDER BY GROUPING(region, product), region, product",
+                &["N|NULL|3", "S|NULL|2", "NULL|NULL|1", "NULL|a|3", "NULL|b|2", "NULL|NULL|1", "NULL|NULL|6"],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY GROUPING SETS (region, \
+                 product) ORDER BY GROUPING(region, product), region, product",
+                &["N|NULL|3", "S|NULL|3", "NULL|NULL|1", "NULL|a|4", "NULL|b|2", "NULL|NULL|1"],
+            ),
+            ("SELECT count(*) FROM gs.sale GROUP BY GROUPING SETS (())", &["7"]),
+            ("SELECT count(*) FROM gs.sale GROUP BY ()", &["7"]),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY GROUPING SETS ((region), (region)) \
+                 ORDER BY region",
+                &["N|3", "N|3", "S|3", "S|3", "NULL|1", "NULL|1"],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY GROUPING SETS ((region, \
+                 product), ROLLUP (region), CUBE (product)) ORDER BY GROUPING(region, product), \
+                 region, product",
+                &[
+                    "N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1", "N|NULL|3", "S|NULL|3",
+                    "NULL|NULL|1", "NULL|a|4", "NULL|b|2", "NULL|NULL|1", "NULL|NULL|7",
+                    "NULL|NULL|7",
+                ],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY GROUPING SETS ((region), ROLLUP \
+                 (region)) ORDER BY GROUPING(region), region",
+                &["N|3", "N|3", "S|3", "S|3", "NULL|1", "NULL|1", "NULL|7"],
+            ),
+            // GROUPING SETS among another's elements are its elements there.
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY GROUPING SETS ((region), \
+                 GROUPING SETS ((product), ())) ORDER BY GROUPING(region, product), region, product",
+                &["N|NULL|3", "S|NULL|3", "NULL|NULL|1", "NULL|a|4", "NULL|b|2", "NULL|NULL|1", "NULL|NULL|7"],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY GROUPING SETS (GROUPING \
+                 SETS ((region, product)), ()) ORDER BY GROUPING(region, product), region, product",
+                &["N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1", "NULL|NULL|7"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn columns_and_sets_multiply() {
+    let mut w = gs("multiply");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY region, ROLLUP (product) \
+                 ORDER BY GROUPING(region, product), region, product",
+                &["N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1", "N|NULL|3", "S|NULL|3", "NULL|NULL|1"],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY ROLLUP (region), CUBE \
+                 (product) ORDER BY GROUPING(region, product), region, product",
+                &[
+                    "N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1", "N|NULL|3", "S|NULL|3",
+                    "NULL|NULL|1", "NULL|a|4", "NULL|b|2", "NULL|NULL|1", "NULL|NULL|7",
+                ],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY region, GROUPING SETS \
+                 ((product), ()) ORDER BY GROUPING(region, product), region, product",
+                &["N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1", "N|NULL|3", "S|NULL|3", "NULL|NULL|1"],
+            ),
+            (
+                "SELECT region, product, qty, count(*) FROM gs.sale GROUP BY region, CUBE \
+                 (product, qty) ORDER BY GROUPING(product, qty), region, product, qty",
+                &[
+                    "N|a|10|2", "N|b|20|1", "S|a|5|1", "S|a|NULL|1", "S|NULL|3|1", "NULL|b|7|1",
+                    "N|a|NULL|2", "N|b|NULL|1", "S|a|NULL|2", "S|NULL|NULL|1", "NULL|b|NULL|1",
+                    "N|NULL|10|2", "N|NULL|20|1", "S|NULL|3|1", "S|NULL|5|1", "S|NULL|NULL|1",
+                    "NULL|NULL|7|1", "N|NULL|NULL|3", "S|NULL|NULL|3", "NULL|NULL|NULL|1",
+                ],
+            ),
+            (
+                "SELECT r.name, s.product, sum(s.qty) FROM gs.sale s JOIN gs.region r ON r.code = \
+                 s.region GROUP BY ROLLUP (r.name, s.product) ORDER BY GROUPING(r.name, \
+                 s.product), r.name, s.product",
+                &[
+                    "North|a|20", "North|b|20", "South|a|5", "South|NULL|3", "North|NULL|40",
+                    "South|NULL|8", "NULL|NULL|48",
+                ],
+            ),
+            (
+                "SELECT x, count(*) FROM (SELECT region AS x FROM gs.sale) d GROUP BY ROLLUP (x) \
+                 ORDER BY GROUPING(x), x",
+                &["N|3", "S|3", "NULL|1", "NULL|7"],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY ROLLUP (region), region ORDER BY \
+                 region",
+                &["N|3", "N|3", "S|3", "S|3", "NULL|1", "NULL|1"],
+            ),
+            // At the top a list is its expressions, and `()` beside other items adds nothing.
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY (region, product) ORDER BY \
+                 region, product",
+                &["N|a|2", "N|b|1", "S|a|2", "S|NULL|1", "NULL|b|1"],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY (), region ORDER BY region",
+                &["N|3", "S|3", "NULL|1"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn an_empty_set_answers_over_no_rows() {
+    let mut w = gs("empty");
+    answered(
+        &mut w,
+        &[
+            ("SELECT region, count(*) FROM gs.sale WHERE false GROUP BY ROLLUP (region)", &["NULL|0"]),
+            (
+                "SELECT region, count(*) FROM gs.sale WHERE false GROUP BY GROUPING SETS ((region), \
+                 (), ())",
+                &["NULL|0", "NULL|0"],
+            ),
+            ("SELECT count(*) FROM gs.sale WHERE false GROUP BY ()", &["0"]),
+            (
+                "SELECT region, product, count(*) FROM gs.sale WHERE false GROUP BY ROLLUP \
+                 (region), ROLLUP (product)",
+                &["NULL|NULL|0"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_key_decides_only_through_the_columns_every_set_holds() {
+    let mut w = gs("key");
+    assert_eq!(
+        refused(&mut w, "SELECT region, count(*) FROM gs.sale GROUP BY ROLLUP (id)"),
+        (
+            Some("42803"),
+            "column \"sale.region\" must appear in the GROUP BY clause or be used in an aggregate \
+             function"
+                .to_string()
+        )
+    );
+    let each = ["1|N|1", "2|N|1", "3|S|1", "4|S|1", "5|NULL|1", "6|S|1", "7|N|1"];
+    answered(
+        &mut w,
+        &[(
+            "SELECT id, region, count(*) FROM gs.sale GROUP BY id, ROLLUP (product) ORDER BY \
+             GROUPING(product), id",
+            &[each, each].concat(),
+        )],
+    );
+}
+
+#[test]
+fn group_by_distinct_drops_repeated_sets_and_all_keeps_them() {
+    let mut w = gs("distinct");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY DISTINCT ROLLUP (region), ROLLUP \
+                 (region) ORDER BY GROUPING(region), region",
+                &["N|3", "S|3", "NULL|1", "NULL|7"],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY ALL ROLLUP (region), ROLLUP \
+                 (region) ORDER BY GROUPING(region), region, 2",
+                &["N|3", "N|3", "N|3", "S|3", "S|3", "S|3", "NULL|1", "NULL|1", "NULL|1", "NULL|7"],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY DISTINCT GROUPING SETS ((region), \
+                 (region)) ORDER BY region",
+                &["N|3", "S|3", "NULL|1"],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY ALL GROUPING SETS ((region), \
+                 (region)) ORDER BY region",
+                &["N|3", "N|3", "S|3", "S|3", "NULL|1", "NULL|1"],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY DISTINCT ROLLUP (region), CUBE \
+                 (region) ORDER BY GROUPING(region), region, 2",
+                &["N|3", "S|3", "NULL|1", "NULL|7"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn grouping_sets_a_bit_for_each_argument_the_set_lacks() {
+    let mut w = gs("bits");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, product, GROUPING(region), GROUPING(product), GROUPING(region, \
+                 product), GROUPING(product, region) FROM gs.sale GROUP BY CUBE (region, product) \
+                 ORDER BY 5, 1, 2",
+                &[
+                    "N|a|0|0|0|0", "N|b|0|0|0|0", "S|a|0|0|0|0", "S|NULL|0|0|0|0",
+                    "NULL|b|0|0|0|0", "N|NULL|0|1|1|2", "S|NULL|0|1|1|2", "NULL|NULL|0|1|1|2",
+                    "NULL|a|1|0|2|1", "NULL|b|1|0|2|1", "NULL|NULL|1|0|2|1", "NULL|NULL|1|1|3|3",
+                ],
+            ),
+            (
+                "SELECT region, GROUPING(region) FROM gs.sale GROUP BY region ORDER BY region",
+                &["N|0", "S|0", "NULL|0"],
+            ),
+            (
+                "SELECT region, count(*), GROUPING(region) FROM gs.sale GROUP BY region HAVING \
+                 GROUPING(region) = 0 ORDER BY region",
+                &["N|3|0", "S|3|0", "NULL|1|0"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_set_s_null_stands_where_its_expression_is_named() {
+    let mut w = gs("nulls");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT CASE WHEN GROUPING(region) = 1 THEN 'all' ELSE coalesce(region, '(none)') \
+                 END AS r, sum(qty) FROM gs.sale GROUP BY ROLLUP (region) ORDER BY \
+                 GROUPING(region), r",
+                &["(none)|7", "N|40", "S|8", "all|55"],
+            ),
+            (
+                "SELECT coalesce(region, 'all') AS r, sum(qty) FROM gs.sale GROUP BY ROLLUP \
+                 (region) ORDER BY GROUPING(region), r",
+                &["N|40", "S|8", "all|7", "all|55"],
+            ),
+            (
+                "SELECT upper(region) AS r, count(*) FROM gs.sale GROUP BY ROLLUP (upper(region)) \
+                 ORDER BY GROUPING(upper(region)), r",
+                &["N|3", "S|3", "NULL|1", "NULL|7"],
+            ),
+            // An expression a set holds is its group's value though a column inside it is lacking.
+            (
+                "SELECT upper(region), region, count(*) FROM gs.sale GROUP BY GROUPING SETS \
+                 ((upper(region)), (region)) ORDER BY 1, 2",
+                &["N|NULL|3", "S|NULL|3", "NULL|N|3", "NULL|S|3", "NULL|NULL|1", "NULL|NULL|1"],
+            ),
+            // A subquery reads a lacking column NULL.
+            (
+                "SELECT region, (SELECT region) AS r, count(*) FROM gs.sale GROUP BY ROLLUP \
+                 (region) ORDER BY GROUPING(region), region",
+                &["N|N|3", "S|S|3", "NULL|NULL|1", "NULL|NULL|7"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn having_order_by_distinct_and_limit_read_every_set_s_rows() {
+    let mut w = gs("having");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT region, product, sum(qty) FROM gs.sale GROUP BY CUBE (region, product) \
+                 HAVING GROUPING(region, product) = 1 ORDER BY region",
+                &["N|NULL|40", "S|NULL|8", "NULL|NULL|7"],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY ROLLUP (region, product) \
+                 HAVING count(*) > 1 ORDER BY GROUPING(region, product), region, product",
+                &["N|a|2", "S|a|2", "N|NULL|3", "S|NULL|3", "NULL|NULL|7"],
+            ),
+            (
+                "SELECT region, sum(qty) FROM gs.sale GROUP BY ROLLUP (region) HAVING region IS \
+                 NULL ORDER BY GROUPING(region)",
+                &["NULL|7", "NULL|55"],
+            ),
+            (
+                "SELECT region, product, sum(qty) AS s FROM gs.sale GROUP BY ROLLUP (region, \
+                 product) ORDER BY s DESC NULLS LAST, GROUPING(region, product), region, product",
+                &[
+                    "NULL|NULL|55", "N|NULL|40", "N|a|20", "N|b|20", "S|NULL|8", "NULL|b|7",
+                    "NULL|NULL|7", "S|a|5", "S|NULL|3",
+                ],
+            ),
+            (
+                "SELECT region, product, count(*) FROM gs.sale GROUP BY CUBE (region, product) \
+                 ORDER BY GROUPING(region, product), region, product LIMIT 3",
+                &["N|a|2", "N|b|1", "S|a|2"],
+            ),
+            (
+                "SELECT DISTINCT count(*) AS n FROM gs.sale GROUP BY CUBE (region, product) ORDER \
+                 BY n",
+                &["1", "2", "3", "4", "7"],
+            ),
+            (
+                "SELECT region, product FROM gs.sale GROUP BY CUBE (region, product) HAVING \
+                 GROUPING(region, product) = 3",
+                &["NULL|NULL"],
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY ROLLUP (region) ORDER BY region \
+                 NULLS FIRST, 2",
+                &["NULL|1", "NULL|7", "N|3", "S|3"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn grouping_is_refused_where_postgresql_refuses_it() {
+    let mut w = gs("refused");
+    let grouping_error = "arguments to GROUPING must be grouping expressions of the associated \
+                          query level";
+    refusals(
+        &mut w,
+        &[
+            ("SELECT GROUPING(qty) FROM gs.sale GROUP BY ROLLUP (region)", "42803", grouping_error),
+            (
+                "SELECT region FROM gs.sale WHERE GROUPING(region) = 0 GROUP BY ROLLUP (region)",
+                "42803",
+                "grouping operations are not allowed in WHERE",
+            ),
+            ("SELECT GROUPING(region) FROM gs.sale", "42803", grouping_error),
+            (
+                "SELECT region, sum(GROUPING(region)) FROM gs.sale GROUP BY ROLLUP (region)",
+                "42803",
+                "aggregate function calls cannot be nested",
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY GROUPING(region)",
+                "42803",
+                "grouping operations are not allowed in GROUP BY",
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY ROLLUP (region, GROUPING(region))",
+                "42803",
+                "grouping operations are not allowed in GROUP BY",
+            ),
+            (
+                "SELECT GROUPING(region) AS g, count(*) FROM gs.sale GROUP BY 1",
+                "42803",
+                "aggregate functions are not allowed in GROUP BY",
+            ),
+            (
+                "SELECT region, count(*) FILTER (WHERE GROUPING(region) = 0) FROM gs.sale GROUP \
+                 BY ROLLUP (region)",
+                "42803",
+                "grouping operations are not allowed in FILTER",
+            ),
+            (
+                "SELECT region FROM gs.sale GROUP BY ROLLUP (region) LIMIT GROUPING(region)",
+                "42803",
+                "grouping operations are not allowed in LIMIT",
+            ),
+            (
+                "SELECT s.region FROM gs.sale s JOIN gs.region r ON GROUPING(s.region) = 0 GROUP \
+                 BY ROLLUP (s.region)",
+                "42803",
+                "grouping operations are not allowed in JOIN conditions",
+            ),
+            (
+                "SELECT region, sum(count(*)) FROM gs.sale GROUP BY ROLLUP (region)",
+                "42803",
+                "aggregate function calls cannot be nested",
+            ),
+            (
+                "SELECT region, GROUPING(count(*)) FROM gs.sale GROUP BY ROLLUP (region)",
+                "42803",
+                "aggregate function calls cannot be nested",
+            ),
+            (
+                "SELECT region, count(*) FROM gs.sale GROUP BY ROLLUP ((), region)",
+                "42601",
+                "syntax error at or near \")\"",
+            ),
+        ],
+    );
+    let many = vec!["region"; 32].join(", ");
+    assert_eq!(
+        refused(
+            &mut w,
+            &format!("SELECT region, GROUPING({many}) FROM gs.sale GROUP BY ROLLUP (region)")
+        ),
+        (Some("54023"), "GROUPING must have fewer than 32 arguments".to_string())
+    );
+}
+
+#[test]
+fn the_sets_are_limited_as_postgresql_limits_them() {
+    let mut w = gs("limits");
+    refusals(
+        &mut w,
+        &[
+            (
+                "SELECT count(*) FROM gs.sale GROUP BY CUBE (id, region, product, qty, id + 1, id \
+                 + 2, id + 3, id + 4, id + 5, id + 6, id + 7, id + 8, id + 9)",
+                "54011",
+                "CUBE is limited to 12 elements",
+            ),
+            (
+                "SELECT count(*) FROM gs.sale GROUP BY CUBE (id, region, product, qty, id + 1, id \
+                 + 2), CUBE (id + 3, id + 4, id + 5, id + 6, id + 7, id + 8, id + 9)",
+                "54001",
+                "too many grouping sets present (maximum 4096)",
+            ),
+            // Each before a column no set holds.
+            (
+                "SELECT qty, count(*) FROM gs.sale GROUP BY CUBE (id, region, product, id + 1, id \
+                 + 2, id + 3, id + 4, id + 5, id + 6, id + 7, id + 8, id + 9, id + 10)",
+                "54011",
+                "CUBE is limited to 12 elements",
+            ),
+            (
+                "SELECT qty, count(*) FROM gs.sale GROUP BY CUBE (id, region, product, id + 1, id \
+                 + 2, id + 3, id + 4), CUBE (id + 5, id + 6, id + 7, id + 8, id + 9, id + 10)",
+                "54001",
+                "too many grouping sets present (maximum 4096)",
+            ),
+        ],
+    );
+    // Twelve elements are taken, a pair counting once; so are thirteen in a ROLLUP.
+    answered(
+        &mut w,
+        &[(
+            "SELECT count(*) FROM gs.sale GROUP BY ROLLUP (id, region, product, qty, id + 1, id + \
+             2, id + 3, id + 4, id + 5, id + 6, id + 7, id + 8, id + 9) HAVING count(*) > 6",
+            &["7"],
+        )],
+    );
+    let rows = rows(
+        &mut w,
+        "SELECT count(*) FROM gs.sale GROUP BY CUBE ((id, region), product, qty, id + 1, id + 2, id \
+         + 3, id + 4, id + 5, id + 6, id + 7, id + 8, id + 9) HAVING count(*) = 7",
+    );
+    assert_eq!(rows, ["7"]);
+}
+
+// A relation's name alone reads its whole row, as 18.6 reads a lone name no column bears: a
+// table's of its row type, a subquery's or a function's a record; a column of the name wins.
+
+const WR_DDL: &str = "CREATE SCHEMA wr;
+     CREATE TABLE wr.a (id integer NOT NULL, g integer, k integer, PRIMARY KEY (id));";
+
+#[test]
+fn a_relation_s_name_reads_its_whole_row() {
+    let path = tmp("reader-whole-rows.snail");
+    write(&path, &Catalog::parse(WR_DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO wr.a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, NULL, 50)")
+        .unwrap();
+    answered(
+        &mut w,
+        &[
+            ("SELECT a FROM wr.a a WHERE a.id < 3 ORDER BY a.id", &["(1,1,10)", "(2,1,20)"]),
+            ("SELECT row_to_json(a) FROM wr.a a WHERE a.id = 1", &["{\"id\":1,\"g\":1,\"k\":10}"]),
+            ("SELECT (a).k FROM wr.a a WHERE a.id = 1", &["10"]),
+            (
+                "SELECT a IS NULL, a = a, a IS NOT DISTINCT FROM a FROM wr.a a WHERE a.id = 5",
+                &["f|t|t"],
+            ),
+            ("SELECT count(a) FROM wr.a a", &["5"]),
+            ("SELECT a FROM wr.a WHERE id = 1", &["(1,1,10)"]),
+            (
+                "SELECT q FROM (SELECT id, k FROM wr.a WHERE id < 3) q ORDER BY q",
+                &["(1,10)", "(2,20)"],
+            ),
+            ("SELECT t FROM unnest(ARRAY[5, 6]) WITH ORDINALITY AS t(v, n)", &["(5,1)", "(6,2)"]),
+            ("SELECT f FROM generate_series(1, 2) f", &["1", "2"]),
+            ("SELECT a FROM wr.a a ORDER BY a DESC LIMIT 2", &["(5,,50)", "(4,2,40)"]),
+            (
+                "SELECT a.g, array_agg(a ORDER BY a.id) FROM wr.a a GROUP BY a.g ORDER BY a.g",
+                &[
+                    "1|{\"(1,1,10)\",\"(2,1,20)\"}",
+                    "2|{\"(3,2,30)\",\"(4,2,40)\"}",
+                    "NULL|{\"(5,,50)\"}",
+                ],
+            ),
+            ("SELECT g FROM wr.a g WHERE id = 1", &["1"]),
+            (
+                "SELECT t FROM jsonb_to_record('{\"x\":1,\"y\":\"a\"}') AS t(x integer, y text)",
+                &["(1,a)"],
+            ),
+            ("SELECT a, a.k FROM wr.a a WHERE a.id = 2", &["(2,1,20)|20"]),
+            ("SELECT a.id FROM wr.a a WHERE a IS NOT NULL AND a.id = 4", &["4"]),
+            // A row is NOT NULL where each of its columns is.
+            (
+                "SELECT a.id, a IS NOT NULL FROM wr.a a ORDER BY a.id",
+                &["1|t", "2|t", "3|t", "4|t", "5|f"],
+            ),
+            (
+                "SELECT row_to_json(q) FROM (SELECT id, k FROM wr.a WHERE id = 1) q",
+                &["{\"id\":1,\"k\":10}"],
+            ),
+            ("SELECT q FROM (SELECT id FROM wr.a WHERE id = 1) q", &["(1)"]),
+            ("SELECT a FROM wr.a a, wr.a b WHERE a.id = b.id AND b.id = 1", &["(1,1,10)"]),
+            ("SELECT a::text FROM wr.a a WHERE id = 1", &["(1,1,10)"]),
+        ],
+    );
+    assert_eq!(
+        refused(&mut w, "SELECT wr.a FROM wr.a"),
+        (Some("42P01"), "missing FROM-clause entry for table \"wr\"".to_string())
     );
 }

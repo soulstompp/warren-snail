@@ -6,7 +6,7 @@
 
 use super::{
     args, column_of, columns_read, compare, computed_none, eval, function_name, grouped_key, ident,
-    is_aggregate, is_count_star, key_under, kind_name, naming, Acc, Frame, Key, Relation,
+    is_aggregate, is_count_star, key_under, kind_name, naming, Acc, Computed, Frame, Key, Relation,
     Value,
 };
 use crate::catalog::{Casing, ColumnType};
@@ -853,14 +853,16 @@ fn sort_key(v: Value, under: Option<Casing>) -> Result<Value> {
 
 /// Each window call's value on each row of a relation read whole, on any order: each partition
 /// sorted on the window's ORDER BY, ties in the order the rows came, and its frame carried along.
+/// Where the rows are groups, `given` holds each one's values (its aggregates' among them).
 pub(super) fn values(
     calls: &[&Expr],
     rel: &Relation,
     frame: &Frame,
+    given: Option<&[Computed]>,
 ) -> Result<Vec<HashMap<*const Expr, Value>>> {
     let mut out: Vec<HashMap<*const Expr, Value>> = vec![HashMap::new(); rel.rows.len()];
     let none = computed_none();
-    let at = |e: &Expr, r: usize| eval(e, &rel.rows[r], frame, &none);
+    let at = |e: &Expr, r: usize| eval(e, &rel.rows[r], frame, given.map_or(&none, |g| &g[r]));
     for &call in calls {
         let Expr::Function(f) = call else {
             unreachable!()

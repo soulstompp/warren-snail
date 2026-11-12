@@ -21,6 +21,7 @@ pub(crate) mod elements;
 mod explain;
 pub(crate) mod fill;
 mod folded;
+mod grouping;
 pub(crate) mod foreign;
 pub mod handed;
 mod hash;
@@ -1830,6 +1831,7 @@ impl Snail {
                 || relations
                 || pipeline::tests_composite_null(&self.catalog, q)
                 || pipeline::reads_per_row(&self.catalog, q)
+                || pipeline::reads_whole_rows(&self.catalog, q)
                 || image::asks_an_operator(sql)
             {
                 if order.is_some() && (pipeline::is_pipeline(q) || relations) {
@@ -1898,6 +1900,7 @@ impl Snail {
             || subqueries::held(q)
             || pipeline::samples(q)
             || names_system
+            || pipeline::reads_whole_rows(&self.catalog, q)
         {
             return relations::answer(self, q, params);
         }

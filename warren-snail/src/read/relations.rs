@@ -3812,6 +3812,138 @@ fn along(table: &Table) -> Option<usize> {
     }
 }
 
+/// Each bare name a step's own expressions read that no column of its FROM bears and that names one
+/// of its FROM's relations, by its alias or a table's name, read as that relation's whole row, as
+/// PostgreSQL's parser reads a lone name: a row of the relation's columns, of a table's row type, or
+/// of a record of the columns' names and types; an item so written keeps the name as its own. A
+/// name in ORDER BY or GROUP BY the select list gives an item is that item's. Each row made, by its
+/// place, with its type.
+fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr, ColumnType)> {
+    use sqlparser::ast::{VisitMut, VisitorMut};
+    use std::ops::ControlFlow;
+    let SetExpr::Select(s) = q.body.as_mut() else {
+        return Vec::new();
+    };
+    let typed = from.typed();
+    let mut leaves = Vec::new();
+    for n in &from.items {
+        n.leaves(&mut leaves);
+    }
+    // A name's relation's row and its type, where no column bears the name.
+    let row_of = |name: &str| -> Option<(Expr, ColumnType)> {
+        let columns = typed.iter().map(|(q, n, _)| (q.as_deref(), n.as_str()));
+        if !pipeline::naming(columns, None, name).is_empty() {
+            return None;
+        }
+        let leaf = leaves.iter().find(|l| l.leaf_named() == Some(name))?;
+        let fields: Vec<crate::composed::Field> = leaf
+            .star
+            .iter()
+            .map(|&p| Some(crate::composed::Field::new(&typed[p].1, typed[p].2?)))
+            .collect::<Option<_>>()?;
+        let ty = match &leaf.what {
+            What::Table { table, .. } => {
+                let name = &catalog.tables[*table].name;
+                super::handed::table_row(name).unwrap_or_else(|| {
+                    crate::composed::type_of(crate::composed::Composed::Record {
+                        name: name.clone(),
+                        fields,
+                    })
+                })
+            }
+            _ => crate::composed::type_of(crate::composed::Composed::Record {
+                name: "record".into(),
+                fields,
+            }),
+        };
+        let parts = leaf
+            .star
+            .iter()
+            .map(|p| Expr::Identifier(Ident::with_quote('"', format!("{MERGED}{p}"))))
+            .collect();
+        Some((Expr::Tuple(parts), ty))
+    };
+    struct Rows<'r> {
+        row_of: &'r dyn Fn(&str) -> Option<(Expr, ColumnType)>,
+        depth: usize,
+        made: Vec<(*const Expr, ColumnType)>,
+    }
+    impl VisitorMut for Rows<'_> {
+        type Break = ();
+        fn pre_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
+            self.depth += 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+        fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+            if let (0, Expr::Identifier(i)) = (self.depth, &*e) {
+                if let Some((row, ty)) = (self.row_of)(&crate::catalog::ident(i)) {
+                    // In parentheses, a value compared as a composite is, not a row constructor's
+                    // fields one by one.
+                    *e = Expr::Nested(Box::new(row));
+                    if let Expr::Nested(row) = e {
+                        self.made.push((row.as_ref() as *const Expr, ty));
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    // An item that is such a name alone keeps the name.
+    for item in &mut s.projection {
+        if let SelectItem::UnnamedExpr(Expr::Identifier(i)) = item {
+            if row_of(&crate::catalog::ident(i)).is_some() {
+                let alias = i.clone();
+                *item = SelectItem::ExprWithAlias {
+                    expr: Expr::Identifier(alias.clone()),
+                    alias,
+                };
+            }
+        }
+    }
+    let named: Vec<String> = s
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::UnnamedExpr(e) => Some(pipeline::default_name(e)),
+            SelectItem::ExprWithAlias { alias, .. } => Some(crate::catalog::ident(alias)),
+            _ => None,
+        })
+        .collect();
+    let output =
+        |e: &Expr| matches!(e, Expr::Identifier(i) if named.contains(&crate::catalog::ident(i)));
+    let mut rows = Rows {
+        row_of: &row_of,
+        depth: 0,
+        made: Vec::new(),
+    };
+    for item in &mut s.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            let _ = e.visit(&mut rows);
+        }
+    }
+    for e in s.selection.iter_mut().chain(s.having.iter_mut()) {
+        let _ = e.visit(&mut rows);
+    }
+    // A bare name the select list gives an item, in GROUP BY or ORDER BY, is that item.
+    if let sqlparser::ast::GroupByExpr::Expressions(g, _) = &mut s.group_by {
+        for e in g.iter_mut().filter(|e| !output(e)) {
+            let _ = e.visit(&mut rows);
+        }
+    }
+    if let Some(sqlparser::ast::OrderByKind::Expressions(os)) =
+        q.order_by.as_mut().map(|o| &mut o.kind)
+    {
+        for o in os.iter_mut().filter(|o| !output(&o.expr)) {
+            let _ = o.expr.visit(&mut rows);
+        }
+    }
+    rows.made
+}
+
 /// A star in a select list read as the columns it names, each by its place in the FROM's row.
 fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> Result<()> {
     let mut out = Vec::with_capacity(projection.len());
@@ -5236,6 +5368,7 @@ fn select_step(
     if let SetExpr::Select(s) = step.query.body.as_mut() {
         starred(&mut s.projection, &from, catalog)?;
     }
+    let rows_read = whole_rows(&mut step.query, &from, catalog);
     from.outer_at = from.columns.len();
     if let Some(o) = outer {
         from.columns.extend(o.columns.iter().cloned());
@@ -5253,6 +5386,8 @@ fn select_step(
     }
     let (plans, mut seeded) =
         super::subqueries::Plans::of(asked, &step.query, &from.columns, made, casings)?;
+    // A relation's whole row is of its row type.
+    seeded.extend(rows_read);
     let typed = from.typed();
     let mut keyed: Vec<(String, Vec<String>)> = Vec::new();
     let mut joined: Vec<&Expr> = Vec::new();

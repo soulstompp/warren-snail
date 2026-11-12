@@ -583,9 +583,16 @@ pub(super) fn anonymous(types: &[(ColumnType, bool)]) -> ColumnType {
 /// Whether a type is a row constructor's record whose fields are of `fields`' types.
 pub(super) fn is_anonymous(ty: ColumnType, fields: &[(ColumnType, bool)]) -> bool {
     matches!(ty, ColumnType::Composed(r)
-        if matches!(r.def(), Composed::Record { name, fields: f }
-            if name == "record"
-                && f.len() == fields.len()
+        if matches!(r.def(), Composed::Record { name, .. } if name == "record"))
+        && is_record_of(ty, fields)
+}
+
+/// Whether a type is a record or a row type whose fields are of `fields`' types: a relation's whole
+/// row's.
+pub(super) fn is_record_of(ty: ColumnType, fields: &[(ColumnType, bool)]) -> bool {
+    matches!(ty, ColumnType::Composed(r)
+        if matches!(r.def(), Composed::Record { fields: f, .. }
+            if f.len() == fields.len()
                 && f.iter().zip(fields).all(|(a, b)| a.ty == b.0)))
 }
 

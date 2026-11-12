@@ -145,7 +145,8 @@ pub(super) fn wants(q: &Query) -> Option<Wants<'_>> {
         return None;
     }
     let grouping: &[Expr] = match &s.group_by {
-        GroupByExpr::Expressions(v, _) => v,
+        // Grouping sets come in the order of none of their sets.
+        GroupByExpr::Expressions(v, _) if !super::grouping::written(v) => v,
         _ => return None,
     };
     if !grouping.is_empty() {

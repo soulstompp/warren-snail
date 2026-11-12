@@ -1256,7 +1256,7 @@ fn made_text(q: &Query, s: &sqlparser::ast::Select) -> Vec<usize> {
         out.extend(o.iter().filter_map(|x| place(&x.expr, true)));
     }
     if let GroupByExpr::Expressions(g, _) = &s.group_by {
-        out.extend(g.iter().filter_map(|e| place(e, false)));
+        out.extend(super::grouping::each_expr(g).into_iter().filter_map(|e| place(e, false)));
     }
     out
 }
