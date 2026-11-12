@@ -228,7 +228,8 @@ pub(crate) fn body_query(cat: &Cat, f: &crate::catalog::Function) -> Result<supe
             }
         }
     }
-    crate::read::own::parameters_named(&mut q, &f.name, &f.arg_names, &|n| {
+    let relations = crate::read::own::relations_of(cat.catalog);
+    crate::read::own::parameters_named(&mut q, &f.name, &f.arg_names, Some(&relations), &|n| {
         A::Expr::Value(A::Value::Placeholder(format!("${n}")).with_empty_span())
     });
     let types = f

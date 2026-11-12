@@ -306,7 +306,7 @@ pub(crate) fn expression(tokens: &[Token]) -> Result<Expr> {
     if tokens.is_empty() {
         return Err(Error::new("an expression is wanted"));
     }
-    let mut p = Parser::new(&PostgreSqlDialect {}).with_tokens(tokens.to_vec());
+    let mut p = Parser::new(&crate::grammar::POSTGRES).with_tokens(tokens.to_vec());
     let e = p.parse_expr()?;
     if p.index() < tokens.len() {
         return Err(Error::new(format!(
@@ -2170,7 +2170,23 @@ fn read_as_labelled(tokens: &[Token], st: &Statement, what: &str, bare: usize) -
         out
     };
     let lost = less(&a, &b);
-    let more = less(&b, &a);
+    let mut more = less(&b, &a);
+    // A COLLATE after an operand that binds tighter is read with that operand in parentheses
+    // (`grammar::POSTGRES`): a pair of them for each such COLLATE is no change.
+    let mut wrapped = 0;
+    let _ = sqlparser::ast::visit_expressions(st, |e| {
+        if matches!(e, Expr::Collate { expr, .. } if matches!(**expr, Expr::Nested(_))) {
+            wrapped += 1;
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    for paren in ["(", ")"] {
+        for _ in 0..wrapped {
+            if let Some(i) = more.iter().position(|w| w == paren) {
+                more.remove(i);
+            }
+        }
+    }
     if lost.is_empty() && more.len() == bare && more.iter().all(|w| w == "as") {
         return Ok(());
     }
@@ -2494,6 +2510,20 @@ struct KeySpec {
 }
 
 impl Draft {
+    /// The tables and views made so far, as a function body's subqueries read them.
+    fn relations_read(&self) -> crate::read::own::Relations {
+        use crate::read::own::Readable;
+        let tables = self.tables.iter().map(|t| {
+            let columns = t.columns.iter().map(|c| c.name.clone()).collect();
+            (crate::oids::full(&t.name), Readable { columns, table: true })
+        });
+        let views = self.views.iter().map(|v| {
+            let columns = v.columns.clone();
+            (crate::oids::full(&v.name), Readable { columns, table: false })
+        });
+        tables.chain(views).collect()
+    }
+
     fn table(&self, name: &str) -> Option<&Declared> {
         let found = self.table_at.get(name).map(|&i| &self.tables[i]);
         debug_assert_eq!(
@@ -3671,7 +3701,7 @@ impl Draft {
             false => (tokens, None),
         };
         let tokens = tokens.as_slice();
-        let st = Parser::new(&PostgreSqlDialect {})
+        let st = Parser::new(&crate::grammar::POSTGRES)
             .with_tokens(tokens.to_vec())
             .parse_statement()
             .map_err(|e| {
@@ -3716,8 +3746,11 @@ impl Draft {
                 }
                 self.parameter_defaults(&f)?;
                 // Its body read as PostgreSQL reads it once the function is made: typed with the
-                // functions made before it and itself, and its type one RETURNS takes.
-                let body = crate::read::own::body_type(&self.functions, &f, self.release)?;
+                // functions made before it and itself, its subqueries' names over the relations
+                // made before it, and its type one RETURNS takes.
+                let relations = self.relations_read();
+                let body =
+                    crate::read::own::body_type(&self.functions, &f, self.release, &relations)?;
                 if let Some(t) = body {
                     if t != f.returns && !crate::catalog::assignable(t, f.returns) {
                         return Err(Error::new(format!(
@@ -5173,7 +5206,7 @@ impl Draft {
         without_overlaps: &[usize],
     ) -> Result<Vec<String>> {
         let mut notices = Vec::new();
-        let st = Parser::new(&PostgreSqlDialect {})
+        let st = Parser::new(&crate::grammar::POSTGRES)
             .with_tokens(kept.to_vec())
             .parse_statement()?;
         let Statement::CreateTable(t) = &st else {
@@ -6132,7 +6165,7 @@ impl Draft {
     fn create_index(&mut self, tokens: &[Token]) -> Result<Vec<String>> {
         let mut notices = Vec::new();
         let (kept, params) = index_extras(tokens)?;
-        let st = Parser::new(&PostgreSqlDialect {})
+        let st = Parser::new(&crate::grammar::POSTGRES)
             .with_tokens(kept.clone())
             .parse_statement()?;
         let Statement::CreateIndex(i) = &st else {
@@ -7459,7 +7492,7 @@ pub(crate) fn sql_body(tokens: &[Token]) -> Result<(Vec<Token>, Option<SqlBody>)
 /// after it.
 fn whole_expression(text: &str) -> Result<()> {
     let tokens = crate::read::image::tokens(text)?;
-    let mut p = Parser::new(&PostgreSqlDialect {}).with_tokens_with_locations(tokens);
+    let mut p = Parser::new(&crate::grammar::POSTGRES).with_tokens_with_locations(tokens);
     p.parse_expr()?;
     match p.next_token().token {
         Token::EOF => Ok(()),
@@ -8668,7 +8701,7 @@ pub(crate) fn parse_type(text: &str) -> Result<DataType> {
         .into_iter()
         .filter(|t| !matches!(t, Token::Whitespace(_)))
         .collect();
-    let mut p = Parser::new(&PostgreSqlDialect {}).with_tokens(tokens.clone());
+    let mut p = Parser::new(&crate::grammar::POSTGRES).with_tokens(tokens.clone());
     let dt = p.parse_data_type()?;
     if p.index() < tokens.len() && !matches!(tokens[p.index()], Token::EOF) {
         return Err(Error::new(format!("{text} is not one type")));

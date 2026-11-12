@@ -381,6 +381,61 @@ fn a_collation_on_an_integer_is_refused_before_distinct_on_s_words() {
     }
 }
 
+// A COLLATE after an operand that binds tighter, a cast or a subscript, is read as 18.6 reads it:
+// answered, or refused 42804 by the cast's type; in a view too, printed as 18.6 prints it.
+#[test]
+fn a_collate_after_a_cast_is_read_as_postgresql_reads_it() {
+    let mut w = snail("collate-cast");
+    answered(
+        &mut w,
+        &[
+            ("SELECT id::text COLLATE \"C\" AS x FROM dn.a WHERE id < 4 ORDER BY 1", &["1", "2", "3"]),
+            (
+                "SELECT lower(name::text COLLATE \"C\") AS x FROM dn.a WHERE id < 3 ORDER BY 1",
+                &["one", "two"],
+            ),
+            (
+                "SELECT name FROM dn.a ORDER BY name::varchar COLLATE \"C\" DESC LIMIT 3",
+                &["two", "three", "six"],
+            ),
+            (
+                "SELECT name FROM dn.a WHERE name::text COLLATE \"C\" < 'o' ORDER BY 1",
+                &["five", "four"],
+            ),
+            ("SELECT 'a' || name::text COLLATE \"C\" AS x FROM dn.a WHERE id = 1", &["aone"]),
+            ("SELECT (ARRAY[k, name])[2] COLLATE \"C\" AS x FROM dn.a WHERE id = 1", &["one"]),
+            (
+                "SELECT pg_collation_for(name::text COLLATE \"POSIX\") AS x FROM dn.a WHERE id = 1",
+                &["\"POSIX\""],
+            ),
+        ],
+    );
+    for (sql, ty) in [
+        ("SELECT NULL::integer COLLATE \"C\"", "integer"),
+        ("SELECT g::integer COLLATE \"C\" FROM dn.a", "integer"),
+        ("SELECT g::numeric COLLATE \"C\" FROM dn.a", "numeric"),
+    ] {
+        assert_eq!(
+            refused(&mut w, sql),
+            (Some("42804"), format!("collations are not supported by type {ty}")),
+            "{sql}"
+        );
+    }
+    for (name, view, collation) in [
+        ("v1", "SELECT k COLLATE \"C\" AS x FROM dn.a", "\"C\""),
+        ("v2", "SELECT k::text COLLATE \"C\" AS x FROM dn.a", "\"C\""),
+        ("v3", "SELECT k::text COLLATE \"POSIX\" AS x FROM dn.a", "\"POSIX\""),
+    ] {
+        w.execute(&format!("CREATE VIEW dn.{name} AS {view}"))
+            .unwrap_or_else(|e| panic!("{view}: {e}"));
+        assert_eq!(
+            rows(&mut w, &format!("SELECT pg_get_viewdef('dn.{name}'::regclass)")),
+            [format!(" SELECT (k COLLATE {collation}) AS x\n   FROM dn.a;")],
+            "{view}"
+        );
+    }
+}
+
 #[test]
 fn distinct_on_groups_nulls_and_equal_values_as_one() {
     // numeric 1.00 and 1.0 are one key, each row printing its own; float8 0 and -0 one, NaN one.

@@ -267,6 +267,75 @@ fn create_function_refuses_a_body_as_postgresql_refuses_it_when_it_is_made() {
     );
 }
 
+// A body whose subquery reads a relation is made as 18.6 makes it: a name is the column of a
+// relation in reach before it is a parameter, a parameter the subquery's relations do not hold is
+// read as one, and a column no relation in reach holds is refused in 18.6's words. Each printed as
+// 18.6 prints it.
+#[test]
+fn a_body_s_subquery_reads_its_relations_columns_before_the_parameters() {
+    let tables = "CREATE SCHEMA dn; CREATE TABLE dn.a (id integer PRIMARY KEY, g integer, k integer); \
+         CREATE TABLE dn.b (id integer PRIMARY KEY, v integer);";
+    let made = [
+        "dn.f1() RETURNS integer LANGUAGE sql RETURN (SELECT max(g) FROM dn.a)",
+        "dn.f2(x integer) RETURNS integer LANGUAGE sql RETURN (SELECT max(g) FROM dn.a WHERE id = x)",
+        "dn.f3() RETURNS integer LANGUAGE sql AS 'SELECT (SELECT max(g) FROM dn.a)'",
+        "dn.f4() RETURNS bigint LANGUAGE sql RETURN (SELECT sum(k) OVER (ORDER BY id ROWS BETWEEN \
+         1 PRECEDING AND CURRENT ROW) FROM dn.a LIMIT 1)",
+        "dn.f5(g integer) RETURNS integer LANGUAGE sql RETURN (SELECT max(g) FROM dn.a)",
+        "dn.f6(x integer) RETURNS integer LANGUAGE sql RETURN (SELECT max(a.g) FROM dn.a a WHERE \
+         a.id = x)",
+        "dn.f7(x integer) RETURNS bigint LANGUAGE sql RETURN (SELECT count(*) FROM dn.a WHERE g = x \
+         AND EXISTS (SELECT 1 FROM dn.b WHERE b.v = a.g))",
+        "dn.f8(x integer) RETURNS integer LANGUAGE sql RETURN x + (SELECT max(v) FROM dn.b WHERE \
+         b.id = x)",
+        "dn.f9(x integer) RETURNS integer LANGUAGE sql RETURN (SELECT max(g) FROM dn.a WHERE id = \
+         f9.x)",
+        "dn.f10(x integer) RETURNS integer LANGUAGE sql AS 'SELECT (SELECT max(g) FROM dn.a WHERE \
+         id = $1)'",
+        "dn.f11(k integer) RETURNS integer LANGUAGE sql RETURN (SELECT max(v) FROM dn.b WHERE v > k)",
+    ];
+    let ddl = format!(
+        "{tables} {}",
+        made.iter().map(|f| format!("CREATE FUNCTION {f};")).collect::<String>()
+    );
+    let path = written("subquery-bodies", &ddl);
+    let mut s = Snail::open(&path).unwrap();
+    for (f, body) in [
+        ("f2", "RETURN (SELECT max(a.g) AS max FROM dn.a WHERE (a.id = f2.x))"),
+        ("f5", "RETURN (SELECT max(a.g) AS max FROM dn.a)"),
+        (
+            "f7",
+            "RETURN (SELECT count(*) AS count FROM dn.a WHERE ((a.g = f7.x) AND (EXISTS (SELECT 1 \
+             FROM dn.b WHERE (b.v = a.g)))))",
+        ),
+        ("f8", "RETURN (x + (SELECT max(b.v) AS max FROM dn.b WHERE (b.id = f8.x)))"),
+        ("f11", "RETURN (SELECT max(b.v) AS max FROM dn.b WHERE (b.v > f11.k))"),
+    ] {
+        let q = format!("SELECT pg_get_functiondef('dn.{f}'::regproc)");
+        let got = question(&mut s, &q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let last = got[0].lines().last().unwrap_or_default().to_string();
+        assert_eq!(last, body, "{f}");
+    }
+    for (body, why) in [
+        ("RETURN (SELECT max(zz) FROM dn.a)", "column \"zz\" does not exist"),
+        ("RETURN (SELECT max(q.g) FROM dn.a)", "missing FROM-clause entry for table \"q\""),
+        ("RETURN (SELECT max(a.zz) FROM dn.a a)", "column a.zz does not exist"),
+        (
+            "RETURN (SELECT max(gg) FROM dn.a)",
+            "column \"gg\" does not exist\nHINT:  Perhaps you meant to reference the column \"a.g\".",
+        ),
+    ] {
+        let ddl = format!("{tables} CREATE FUNCTION dn.e() RETURNS integer LANGUAGE sql {body};");
+        let e = Catalog::parse(&ddl).err().unwrap_or_else(|| panic!("{body} was taken"));
+        assert_eq!(e.to_string(), why, "{body}");
+    }
+    let ddl = format!(
+        "{tables} CREATE FUNCTION dn.e(x integer) RETURNS integer LANGUAGE sql \
+         RETURN (SELECT max(g) FROM dn.a WHERE id = y);"
+    );
+    assert_eq!(Catalog::parse(&ddl).unwrap_err().to_string(), "column \"y\" does not exist");
+}
+
 #[test]
 fn create_function_s_and_a_named_call_s_refusals_carry_postgresql_s_codes() {
     // As 18.6 refused each on 28818 (2026-11-12), its VERBOSITY verbose.

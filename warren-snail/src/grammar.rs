@@ -30,6 +30,123 @@ macro_rules! as_postgresql {
     };
 }
 
+/// Every method PostgreSQL's dialect answers of its own but its precedences and its prefix and infix
+/// readings, as it answers them.
+macro_rules! postgresql_otherwise {
+    () => {
+        fn dialect(&self) -> std::any::TypeId {
+            std::any::TypeId::of::<PostgreSqlDialect>()
+        }
+
+        fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
+            PostgreSqlDialect {}.identifier_quote_style(identifier)
+        }
+
+        fn is_delimited_identifier_start(&self, ch: char) -> bool {
+            PostgreSqlDialect {}.is_delimited_identifier_start(ch)
+        }
+
+        fn is_identifier_start(&self, ch: char) -> bool {
+            PostgreSqlDialect {}.is_identifier_start(ch)
+        }
+
+        fn is_identifier_part(&self, ch: char) -> bool {
+            PostgreSqlDialect {}.is_identifier_part(ch)
+        }
+
+        fn is_reserved_for_identifier(&self, kw: Keyword) -> bool {
+            PostgreSqlDialect {}.is_reserved_for_identifier(kw)
+        }
+
+        fn is_table_alias(&self, kw: &Keyword, parser: &mut Parser) -> bool {
+            PostgreSqlDialect {}.is_table_alias(kw, parser)
+        }
+
+        fn is_custom_operator_part(&self, ch: char) -> bool {
+            PostgreSqlDialect {}.is_custom_operator_part(ch)
+        }
+
+        fn prec_value(&self, prec: Precedence) -> u8 {
+            PostgreSqlDialect {}.prec_value(prec)
+        }
+
+        as_postgresql!(
+            supports_unicode_string_literal,
+            supports_filter_during_aggregation,
+            supports_group_by_expr,
+            supports_alter_user_as_alter_role,
+            allow_extract_custom,
+            allow_extract_single_quotes,
+            supports_create_index_with_clause,
+            supports_explain_with_utility_options,
+            supports_listen_notify,
+            supports_exclude_constraint,
+            supports_factorial_operator,
+            supports_bitwise_shift_operators,
+            supports_comment_on,
+            supports_load_extension,
+            supports_named_fn_args_with_colon_operator,
+            supports_named_fn_args_with_expr_name,
+            supports_empty_projections,
+            supports_nested_comments,
+            supports_string_escape_constant,
+            supports_numeric_literal_underscores,
+            supports_array_typedef_with_brackets,
+            supports_geometric_types,
+            supports_order_by_using_operator,
+            supports_set_names,
+            supports_alter_column_type_using,
+            supports_left_associative_joins_without_parens,
+            supports_notnull_operator,
+            supports_interval_options,
+            supports_insert_table_alias,
+            supports_create_table_like_parenthesized,
+            supports_select_wildcard_with_alias,
+            supports_comma_separated_trim,
+            supports_xml_expressions,
+            supports_aliased_function_args,
+            supports_comment_optimizer_hint,
+        );
+    };
+}
+
+/// PostgreSQL's dialect, with the one reading it lacks: a COLLATE after an operator that binds
+/// tighter (`x::text COLLATE "C"`, `a[1] COLLATE "C"`), which PostgreSQL's grammar reads and its
+/// dialect in sqlparser refuses. Every statement PostgreSQL's dialect reads it reads the same.
+#[derive(Debug)]
+pub(crate) struct Postgres;
+
+/// The statements and expressions written by a person are read in it.
+pub(crate) const POSTGRES: Postgres = Postgres;
+
+impl Dialect for Postgres {
+    postgresql_otherwise!();
+
+    fn get_next_precedence(&self, parser: &Parser) -> Option<std::result::Result<u8, ParserError>> {
+        PostgreSqlDialect {}.get_next_precedence(parser)
+    }
+
+    fn parse_infix(&self, parser: &mut Parser, expr: &Expr, _precedence: u8) -> Option<Parsed> {
+        collated(parser, expr)
+    }
+}
+
+/// A COLLATE met where an operand is read on: its operand in parentheses, so that its printing reads
+/// as the same tree under PostgreSQL's dialect, which takes a COLLATE only after a whole operand.
+/// PostgreSQL's dialect gives COLLATE no precedence in a column's definition, so it is never met
+/// here there.
+fn collated(parser: &mut Parser, expr: &Expr) -> Option<Parsed> {
+    match &parser.peek_token_ref().token {
+        Token::Word(w) if w.keyword == Keyword::COLLATE => {}
+        _ => return None,
+    }
+    parser.next_token();
+    Some(parser.parse_object_name(false).map(|collation| Expr::Collate {
+        expr: Box::new(Expr::Nested(Box::new(expr.clone()))),
+        collation,
+    }))
+}
+
 /// Whether an expression's printing begins with a prefix operator's.
 fn begins_with_prefix(e: &Expr) -> bool {
     match e {
@@ -94,79 +211,7 @@ impl Grammar {
 }
 
 impl Dialect for Grammar {
-    fn dialect(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<PostgreSqlDialect>()
-    }
-
-    fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
-        PostgreSqlDialect {}.identifier_quote_style(identifier)
-    }
-
-    fn is_delimited_identifier_start(&self, ch: char) -> bool {
-        PostgreSqlDialect {}.is_delimited_identifier_start(ch)
-    }
-
-    fn is_identifier_start(&self, ch: char) -> bool {
-        PostgreSqlDialect {}.is_identifier_start(ch)
-    }
-
-    fn is_identifier_part(&self, ch: char) -> bool {
-        PostgreSqlDialect {}.is_identifier_part(ch)
-    }
-
-    fn is_reserved_for_identifier(&self, kw: Keyword) -> bool {
-        PostgreSqlDialect {}.is_reserved_for_identifier(kw)
-    }
-
-    fn is_table_alias(&self, kw: &Keyword, parser: &mut Parser) -> bool {
-        PostgreSqlDialect {}.is_table_alias(kw, parser)
-    }
-
-    fn is_custom_operator_part(&self, ch: char) -> bool {
-        PostgreSqlDialect {}.is_custom_operator_part(ch)
-    }
-
-    fn prec_value(&self, prec: Precedence) -> u8 {
-        PostgreSqlDialect {}.prec_value(prec)
-    }
-
-    as_postgresql!(
-        supports_unicode_string_literal,
-        supports_filter_during_aggregation,
-        supports_group_by_expr,
-        supports_alter_user_as_alter_role,
-        allow_extract_custom,
-        allow_extract_single_quotes,
-        supports_create_index_with_clause,
-        supports_explain_with_utility_options,
-        supports_listen_notify,
-        supports_exclude_constraint,
-        supports_factorial_operator,
-        supports_bitwise_shift_operators,
-        supports_comment_on,
-        supports_load_extension,
-        supports_named_fn_args_with_colon_operator,
-        supports_named_fn_args_with_expr_name,
-        supports_empty_projections,
-        supports_nested_comments,
-        supports_string_escape_constant,
-        supports_numeric_literal_underscores,
-        supports_array_typedef_with_brackets,
-        supports_geometric_types,
-        supports_order_by_using_operator,
-        supports_set_names,
-        supports_alter_column_type_using,
-        supports_left_associative_joins_without_parens,
-        supports_notnull_operator,
-        supports_interval_options,
-        supports_insert_table_alias,
-        supports_create_table_like_parenthesized,
-        supports_select_wildcard_with_alias,
-        supports_comma_separated_trim,
-        supports_xml_expressions,
-        supports_aliased_function_args,
-        supports_comment_optimizer_hint,
-    );
+    postgresql_otherwise!();
 
     fn get_next_precedence(&self, parser: &Parser) -> Option<std::result::Result<u8, ParserError>> {
         match parser.peek_token_ref().token {
@@ -214,7 +259,7 @@ impl Dialect for Grammar {
             Token::ExclamationMarkDoubleTilde => (None, Some((true, false))),
             Token::DoubleTildeAsterisk => (None, Some((false, true))),
             Token::ExclamationMarkDoubleTildeAsterisk => (None, Some((true, true))),
-            _ => return None,
+            _ => return collated(parser, expr),
         };
         // Of ANY, ALL and SOME, as PostgreSQL's dialect reads them.
         if let Token::Word(w) = &parser.peek_nth_token_ref(1).token {

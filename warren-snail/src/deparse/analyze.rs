@@ -983,8 +983,16 @@ impl Analyzer<'_, '_> {
         Ok((oid, typmod))
     }
 
+    /// A collation's OID by its name as a COLLATE writes it, each part read as written: `"C"`
+    /// quoted keeps its case.
     fn collation_named(&self, name: &sqlparser::ast::ObjectName) -> Result<u32> {
-        let n = crate::catalog::object_name(name);
+        let n = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(folded))
+            .map(|p| crate::read::calls::quote_ident(&p))
+            .collect::<Vec<_>>()
+            .join(".");
         crate::regs::reg_parse(crate::regs::RegKind::Collation, &n, self.cat.release)
     }
 

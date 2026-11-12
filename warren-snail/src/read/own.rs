@@ -134,7 +134,7 @@ pub(crate) fn holding(functions: &[Function], release: u8) -> Holding {
         OWN.with(|o| *o.borrow_mut() = all);
         return held;
     }
-    let all = made_all(functions, release);
+    let all = made_all(functions, release, None);
     OWN.with(|o| *o.borrow_mut() = all.clone());
     MADE.with(|m| *m.borrow_mut() = Some((key, all)));
     held
@@ -142,11 +142,11 @@ pub(crate) fn holding(functions: &[Function], release: u8) -> Holding {
 
 /// Every function made ready, in the DDL's order. Each is held by its signature first, so a body
 /// may call any of them, itself among them; each body is then typed with those before it made.
-fn made_all(functions: &[Function], release: u8) -> Rc<Vec<Rc<Own>>> {
+fn made_all(functions: &[Function], release: u8, relations: Option<&Relations>) -> Rc<Vec<Rc<Own>>> {
     let stubs: Vec<Rc<Own>> = functions.iter().map(|f| Rc::new(stub(f))).collect();
     OWN.with(|o| *o.borrow_mut() = Rc::new(stubs));
     for (i, f) in functions.iter().enumerate() {
-        let own = Rc::new(made(f, release));
+        let own = Rc::new(made(f, release, relations));
         OWN.with(|o| {
             let mut all = (**o.borrow()).clone();
             all[i] = own;
@@ -181,60 +181,284 @@ fn stub(f: &Function) -> Own {
     }
 }
 
-/// Whether a body names a column or a function the function cannot read, refused in PostgreSQL's
-/// words: a name no parameter has, a relation the body holds none of, a function neither the DDL
-/// nor pg_catalog holds.
-fn unknown_name(body: &Expr, types: &super::typed::Types, release: u8) -> Option<String> {
-    let mut why = None;
-    let c = carried(release);
-    let mut names_of_calls = std::collections::HashSet::new();
-    let _ = sqlparser::ast::visit_expressions(body, |e| {
-        if names_of_calls.contains(&(e as *const Expr)) {
+/// A relation a body's subquery may read: its columns' names, and whether it is a table, whose
+/// system columns it reads too.
+pub(crate) struct Readable {
+    pub columns: Vec<String>,
+    pub table: bool,
+}
+
+/// The relations a body's subqueries may read, each by its full name, as the catalog the function
+/// is made over holds them.
+pub(crate) type Relations = HashMap<String, Readable>;
+
+/// A catalog's relations as a body's subqueries read them: each table and each view.
+pub(crate) fn relations_of(catalog: &crate::catalog::Catalog) -> Relations {
+    let tables = catalog.tables.iter().map(|t| {
+        let columns = t.columns.iter().map(|c| c.name.clone()).collect();
+        (crate::oids::full(&t.name), Readable { columns, table: true })
+    });
+    let views = catalog.views.iter().map(|v| {
+        let columns = v.columns.clone();
+        (crate::oids::full(&v.name), Readable { columns, table: false })
+    });
+    tables.chain(views).collect()
+}
+
+/// What a query's FROM gives the names inside it.
+enum Level {
+    /// It reads no relation.
+    Nothing,
+    /// Each FROM item's name, its columns' names, and whether it is a table.
+    Items(Vec<(String, Vec<String>, bool)>),
+    /// A FROM item whose columns are not known here: a subquery, a function, a WITH query, or a
+    /// relation the catalog given holds none of, or no catalog given.
+    Unknown,
+}
+
+/// The query levels a walk of a body is inside, and the WITH queries each names.
+#[derive(Default)]
+struct Scopes {
+    levels: Vec<Level>,
+    with: Vec<Vec<String>>,
+}
+
+impl Scopes {
+    fn enter(&mut self, q: &sqlparser::ast::Query, relations: Option<&Relations>) {
+        use crate::catalog::ident;
+        let named = q.with.iter().flat_map(|w| &w.cte_tables);
+        self.with.push(named.map(|c| ident(&c.alias.name)).collect());
+        let level = match (q.body.as_ref(), relations) {
+            (sqlparser::ast::SetExpr::Select(s), Some(r)) if !s.from.is_empty() => self.items(s, r),
+            (sqlparser::ast::SetExpr::Select(s), None) if !s.from.is_empty() => Level::Unknown,
+            _ => Level::Nothing,
+        };
+        self.levels.push(level);
+    }
+
+    fn leave(&mut self) {
+        self.levels.pop();
+        self.with.pop();
+    }
+
+    /// The FROM items of a SELECT, each named as its alias or its relation's name names it.
+    fn items(&self, s: &sqlparser::ast::Select, relations: &Relations) -> Level {
+        use crate::catalog::ident;
+        use sqlparser::ast::TableFactor;
+        let mut out = Vec::new();
+        for t in &s.from {
+            for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+                let TableFactor::Table {
+                    name,
+                    alias,
+                    args: None,
+                    ..
+                } = f
+                else {
+                    return Level::Unknown;
+                };
+                if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                    return Level::Unknown;
+                }
+                let parts: Vec<String> =
+                    name.0.iter().filter_map(|p| p.as_ident().map(ident)).collect();
+                let key = match parts.as_slice() {
+                    [n] if self.with.iter().flatten().any(|w| w == n) => return Level::Unknown,
+                    [n] => format!("public.{n}"),
+                    [s, n] => format!("{s}.{n}"),
+                    _ => return Level::Unknown,
+                };
+                let Some(r) = relations.get(&key) else {
+                    return Level::Unknown;
+                };
+                let refname = match alias {
+                    Some(a) => ident(&a.name),
+                    None => parts.last().cloned().unwrap_or_default(),
+                };
+                out.push((refname, r.columns.clone(), r.table));
+            }
+        }
+        Level::Items(out)
+    }
+
+    /// Whether the walk is inside a query that reads a relation.
+    fn reading(&self) -> bool {
+        self.levels.iter().any(|l| !matches!(l, Level::Nothing))
+    }
+
+    /// Whether every FROM item in reach is known.
+    fn known(&self) -> bool {
+        !self.levels.iter().any(|l| matches!(l, Level::Unknown))
+    }
+
+    /// The FROM items in reach, the innermost query's first.
+    fn in_reach(&self) -> impl Iterator<Item = &(String, Vec<String>, bool)> {
+        self.levels.iter().rev().flat_map(|l| match l {
+            Level::Items(i) => i.as_slice(),
+            _ => &[],
+        })
+    }
+
+    /// Whether a FROM item in reach holds a column of that name.
+    fn holds(&self, column: &str) -> bool {
+        self.in_reach().any(|(_, columns, table)| {
+            columns.iter().any(|c| c == column)
+                || *table && crate::oids::SYSTEM_COLUMNS.contains(&column)
+        })
+    }
+
+    /// The FROM item in reach of that name, the innermost first.
+    fn item(&self, name: &str) -> Option<&(String, Vec<String>, bool)> {
+        self.in_reach().find(|(n, _, _)| n == name)
+    }
+}
+
+/// The names a body's walk refuses, in PostgreSQL's words: a name no parameter has, or no column of
+/// a relation its subqueries read, a relation the body holds none of, a function neither the DDL nor
+/// pg_catalog holds.
+struct Unknowns<'a> {
+    types: &'a super::typed::Types,
+    relations: Option<&'a Relations>,
+    carried: &'a Carried,
+    scopes: Scopes,
+    names_of_calls: std::collections::HashSet<*const Expr>,
+    why: Option<String>,
+}
+
+impl Unknowns<'_> {
+    /// A column a subquery names that no relation in reach holds, as PostgreSQL's
+    /// `errorMissingColumn` refuses it; none where it is held, or where a relation in reach is not
+    /// known here.
+    fn missing(&self, e: &Expr) -> Option<String> {
+        use crate::catalog::ident;
+        if !self.scopes.known() {
+            return None;
+        }
+        let reach: Vec<(String, Vec<String>)> = self
+            .scopes
+            .in_reach()
+            .map(|(n, c, _)| (n.clone(), c.clone()))
+            .collect();
+        match e {
+            Expr::Identifier(i) => {
+                let n = ident(i);
+                (!self.scopes.holds(&n)).then(|| {
+                    let hint = super::hint::column_hint(&reach, None, &n).unwrap_or_default();
+                    format!("column \"{n}\" does not exist{hint}")
+                })
+            }
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                let (q, n) = (ident(&parts[0]), ident(&parts[1]));
+                match self.scopes.item(&q) {
+                    None => Some(format!("missing FROM-clause entry for table \"{q}\"")),
+                    Some((_, columns, table)) => {
+                        let held = columns.iter().any(|c| *c == n)
+                            || *table && crate::oids::SYSTEM_COLUMNS.contains(&n.as_str());
+                        (!held).then(|| {
+                            let hint =
+                                super::hint::column_hint(&reach, Some(&q), &n).unwrap_or_default();
+                            format!("column {q}.{n} does not exist{hint}")
+                        })
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl sqlparser::ast::Visitor for Unknowns<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &sqlparser::ast::Query) -> ControlFlow<()> {
+        self.scopes.enter(q, self.relations);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &sqlparser::ast::Query) -> ControlFlow<()> {
+        self.scopes.leave();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if self.names_of_calls.contains(&(e as *const Expr)) {
             return ControlFlow::Continue(());
         }
-        names_of_calls.extend(argument_names(e));
+        self.names_of_calls.extend(argument_names(e));
+        let parameter = |i: &sqlparser::ast::Ident| i.quote_style == Some('"') && i.value.starts_with('$');
         let found = match e {
-            Expr::Identifier(i) if !(i.quote_style == Some('"') && i.value.starts_with('$')) => {
+            Expr::Identifier(i) if parameter(i) => None,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) if self.scopes.reading() => {
+                self.missing(e)
+            }
+            Expr::Identifier(i) => {
                 Some(format!("column \"{}\" does not exist", crate::catalog::ident(i)))
             }
             Expr::CompoundIdentifier(parts) if parts.len() >= 2 => Some(format!(
                 "missing FROM-clause entry for table \"{}\"",
                 crate::catalog::ident(&parts[parts.len() - 2])
             )),
-            Expr::Function(f) => {
-                let called = crate::catalog::object_name(&f.name);
-                let bare = called.strip_prefix("pg_catalog.").unwrap_or(&called);
-                let known = found(&called).is_some()
-                    || !bare.contains('.')
-                        && (c.by_name.contains_key(bare) || SYNTAX.contains(&bare));
-                (!known).then(|| {
-                    let args: Vec<Option<ColumnType>> = match &f.args {
-                        sqlparser::ast::FunctionArguments::List(l) => l
-                            .args
-                            .iter()
-                            .map(|a| match a {
-                                sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Expr(x),
-                                ) => types.get(&(x as *const Expr)).copied(),
-                                _ => None,
-                            })
-                            .collect(),
-                        _ => Vec::new(),
-                    };
-                    super::typed::no_form(&called, &args).to_string()
-                })
-            }
+            Expr::Function(f) => unknown_function(f, self.types, self.carried),
             _ => None,
         };
         match found {
             Some(w) => {
-                why = Some(w);
+                self.why = Some(w);
                 ControlFlow::Break(())
             }
             None => ControlFlow::Continue(()),
         }
-    });
-    why
+    }
+}
+
+/// Whether a body names a column or a function the function cannot read, refused in PostgreSQL's
+/// words, as `Unknowns` finds them; the names of its subqueries checked against `relations` where
+/// given, as the function is made, and left to the call where not.
+fn unknown_name(
+    body: &Expr,
+    types: &super::typed::Types,
+    release: u8,
+    relations: Option<&Relations>,
+) -> Option<String> {
+    let c = carried(release);
+    let mut walk = Unknowns {
+        types,
+        relations,
+        carried: &c,
+        scopes: Scopes::default(),
+        names_of_calls: Default::default(),
+        why: None,
+    };
+    let _ = sqlparser::ast::Visit::visit(body, &mut walk);
+    walk.why
+}
+
+/// A call of a function neither the DDL nor pg_catalog holds, refused as PostgreSQL refuses it.
+fn unknown_function(
+    f: &sqlparser::ast::Function,
+    types: &super::typed::Types,
+    c: &Carried,
+) -> Option<String> {
+    let called = crate::catalog::object_name(&f.name);
+    let bare = called.strip_prefix("pg_catalog.").unwrap_or(&called);
+    let known = found(&called).is_some()
+        || !bare.contains('.') && (c.by_name.contains_key(bare) || SYNTAX.contains(&bare));
+    (!known).then(|| {
+        let args: Vec<Option<ColumnType>> = match &f.args {
+            sqlparser::ast::FunctionArguments::List(l) => l
+                .args
+                .iter()
+                .map(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                        x,
+                    )) => types.get(&(x as *const Expr)).copied(),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        super::typed::no_form(&called, &args).to_string()
+    })
 }
 
 /// The calls PostgreSQL's grammar reads as syntax of its own, which pg_proc holds under no name.
@@ -263,8 +487,10 @@ struct Naming<'a> {
     to: &'a dyn Fn(usize) -> Expr,
     uses: Vec<usize>,
     beyond: Option<String>,
-    /// For each query the walk is inside, whether it reads a relation.
-    reading: Vec<bool>,
+    /// The relations the body's subqueries may read, where the catalog is given.
+    relations: Option<&'a Relations>,
+    /// The queries the walk is inside, and what each one's FROM gives.
+    scopes: Scopes,
     /// The names of named arguments met so far, which name a call's parameter, never a value.
     names_of_calls: std::collections::HashSet<*const Expr>,
 }
@@ -291,13 +517,12 @@ impl sqlparser::ast::VisitorMut for Naming<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, q: &mut sqlparser::ast::Query) -> ControlFlow<()> {
-        let reads = matches!(q.body.as_ref(), sqlparser::ast::SetExpr::Select(s) if !s.from.is_empty());
-        self.reading.push(reads);
+        self.scopes.enter(q, self.relations);
         ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, _: &mut sqlparser::ast::Query) -> ControlFlow<()> {
-        self.reading.pop();
+        self.scopes.leave();
         ControlFlow::Continue(())
     }
 
@@ -320,10 +545,15 @@ impl sqlparser::ast::VisitorMut for Naming<'_> {
                 }
                 _ => None,
             },
-            _ if self.reading.iter().any(|r| *r) => None,
+            // Inside a subquery reading a relation, a column of a relation in reach comes before
+            // a parameter of its name; where one in reach is not known here, the name is left.
+            _ if self.scopes.reading() && !self.scopes.known() => None,
+            Expr::Identifier(i) if self.scopes.holds(&crate::catalog::ident(i)) => None,
             Expr::Identifier(i) => named(&crate::catalog::ident(i)),
             Expr::CompoundIdentifier(parts)
-                if parts.len() == 2 && crate::catalog::ident(&parts[0]) == self.function =>
+                if parts.len() == 2
+                    && crate::catalog::ident(&parts[0]) == self.function
+                    && self.scopes.item(self.function).is_none() =>
             {
                 named(&crate::catalog::ident(&parts[1]))
             }
@@ -338,12 +568,15 @@ impl sqlparser::ast::VisitorMut for Naming<'_> {
 }
 
 /// Each parameter a function's body names, by `$n`, by its name, or by the function's name and its
-/// name, written as `to` writes the n-th; a name inside a subquery that reads a relation is left to
-/// its columns. How often each is named, and the first `$n` past the last parameter.
+/// name, written as `to` writes the n-th; a name inside a subquery that reads a relation left to
+/// the column of that name of a relation in reach, `relations` saying which hold it, and left
+/// whole where no catalog is given. How often each is named, and the first `$n` past the last
+/// parameter.
 pub(crate) fn parameters_named<V: sqlparser::ast::VisitMut>(
     body: &mut V,
     function: &str,
     names: &[Option<String>],
+    relations: Option<&Relations>,
     to: &dyn Fn(usize) -> Expr,
 ) -> (Vec<usize>, Option<String>) {
     let mut n = Naming {
@@ -352,19 +585,22 @@ pub(crate) fn parameters_named<V: sqlparser::ast::VisitMut>(
         to,
         uses: vec![0; names.len()],
         beyond: None,
-        reading: Vec::new(),
+        relations,
+        scopes: Scopes::default(),
         names_of_calls: Default::default(),
     };
     let _ = body.visit(&mut n);
     (n.uses, n.beyond)
 }
 
-/// A function made ready: its parameters named as columns, its body typed with them.
-fn made(f: &Function, release: u8) -> Own {
+/// A function made ready: its parameters named as columns, its body typed with them, the names of
+/// its subqueries read over `relations` where given.
+fn made(f: &Function, release: u8, relations: Option<&Relations>) -> Own {
     let mut body = Box::new(f.body.clone());
-    let (uses, beyond) = parameters_named(body.as_mut(), &f.name, &f.arg_names, &|n| {
-        Expr::Identifier(sqlparser::ast::Ident::with_quote('"', format!("${n}")))
-    });
+    let (uses, beyond) =
+        parameters_named(body.as_mut(), &f.name, &f.arg_names, relations, &|n| {
+            Expr::Identifier(sqlparser::ast::Ident::with_quote('"', format!("${n}")))
+        });
     let columns: Vec<(Option<String>, String, Option<ColumnType>)> = f
         .args
         .iter()
@@ -375,7 +611,7 @@ fn made(f: &Function, release: u8) -> Own {
         Some(why) => (Default::default(), Some(why)),
         None => match super::pipeline::typed_on(&body, &columns, release) {
             Ok(t) => {
-                let why = unknown_name(&body, &t, release);
+                let why = unknown_name(&body, &t, release, relations);
                 (t, why)
             }
             Err(e) => (Default::default(), Some(e.to_string())),
@@ -416,15 +652,17 @@ fn made(f: &Function, release: u8) -> Own {
 }
 
 /// The type a function's body gives, typed as 18.6 types it when the function is made, after
-/// `before` and itself: refused where its parser refuses the body. A quoted literal alone is text.
+/// `before` and itself, its subqueries' names read over `relations`: refused where its parser
+/// refuses the body. A quoted literal alone is text.
 pub(crate) fn body_type(
     before: &[Function],
     f: &Function,
     release: u8,
+    relations: &Relations,
 ) -> Result<Option<ColumnType>> {
     let all: Vec<Function> = before.iter().cloned().chain([f.clone()]).collect();
     let _held = holding(&[], release);
-    let made = made_all(&all, release);
+    let made = made_all(&all, release, Some(relations));
     let own = made.last().expect("the function made");
     if let Some(why) = &own.refused {
         return Err(Error::new(why.clone()));
