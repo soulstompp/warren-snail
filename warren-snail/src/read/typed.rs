@@ -114,9 +114,7 @@ pub(super) fn arg_name(t: Option<ColumnType>) -> String {
     }
 }
 
-/// The HINT under PostgreSQL's refusal of a call no function takes.
-pub(super) const NO_FUNCTION: &str = "\nHINT:  No function matches the given name and argument \
-     types. You might need to add explicit type casts.";
+pub(super) use crate::error::NO_FUNCTION;
 
 /// PostgreSQL's refusal of a call no form of the function takes, the function named as the call
 /// names it.

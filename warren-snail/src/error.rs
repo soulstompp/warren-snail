@@ -19,6 +19,10 @@ pub(crate) const NO_PREFIX_OPERATOR: &str = "\nHINT:  No operator matches the gi
 pub(crate) const OPERATOR_NOT_UNIQUE: &str = "\nHINT:  Could not choose a best candidate operator. \
      You might need to add explicit type casts.";
 
+/// The HINT PostgreSQL gives under *function … does not exist* of a call no function takes.
+pub(crate) const NO_FUNCTION: &str = "\nHINT:  No function matches the given name and argument \
+     types. You might need to add explicit type casts.";
+
 /// The HINT PostgreSQL gives under *function … is not unique*.
 pub(crate) const FUNCTION_NOT_UNIQUE: &str = "\nHINT:  Could not choose a best candidate \
      function. You might need to add explicit type casts.";
