@@ -140,8 +140,6 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("could not open relation with OID "), "XX000"),
     (Words::Starts("improper relation name (too many dotted names): "), "42601"),
     (Words::Starts("improper qualified name (too many dotted names): "), "42601"),
-    (Words::Is("positional argument cannot follow named argument"), "42601"),
-    (Words::Holds("argument name \"", "\" used more than once"), "42601"),
     (Words::Holds("parameter \"", "\" cannot be reset"), "0A000"),
     (Words::Starts("cross-database references are not implemented: "), "0A000"),
     (Words::Is("invalid name syntax"), "42602"),
