@@ -170,6 +170,7 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("GROUP BY position ", " is not in select list"), "42P10"),
     (Words::Holds("DISTINCT ON position ", " is not in select list"), "42P10"),
     (Words::Starts("non-integer constant in "), "42601"),
+    (Words::Starts("stack depth limit exceeded"), "54001"),
     (Words::Holds("ORDER BY \"", "\" is ambiguous"), "42702"),
     (Words::Holds("GROUP BY \"", "\" is ambiguous"), "42702"),
     (Words::Holds("DISTINCT ON \"", "\" is ambiguous"), "42702"),

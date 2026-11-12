@@ -817,37 +817,70 @@ pub(super) fn call(
     super::handed::fitted(v, g.returns, false).map(Some)
 }
 
-/// The stack calls of the file's functions inside one another may take, from the outermost, before
-/// the next is refused, as PostgreSQL refuses a call past its `max_stack_depth`.
+/// The calls of the file's functions inside one another taken before the next is refused, as 18.6
+/// takes `c4.down(8422)` and refuses `c4.down(8423)` under its default `max_stack_depth` (2048kB).
+const CALLS: usize = 8423;
+
+/// The stack the calls may take from the outermost, on a thread whose host gave none.
 const STACK: usize = 1 << 20;
 
+/// What a thread's stack keeps past the calls' own: the deepest call's reading, and what its host
+/// stands on below the stack it gave.
+const MARGIN: usize = 1 << 20;
+
+/// PostgreSQL's refusal of a call past its stack.
+const TOO_DEEP: &str = "stack depth limit exceeded\nHINT:  Increase the configuration parameter \
+     \"max_stack_depth\" (currently 2048kB), after ensuring the platform's stack depth limit is \
+     adequate.";
+
 thread_local! {
-    /// Where the outermost call under way on this thread stands on the stack.
-    static BASE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Where the outermost call under way on this thread stands on the stack, and how many calls
+    /// are under way.
+    static BASE: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+    /// Where this thread's stack begins and how large its host gave it, where it said.
+    static GIVEN: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Says that the thread this is called on was given a stack of `bytes`, from about where it is
+/// called: calls of a snail's functions inside one another then take up to it, less a mebibyte,
+/// before the next is refused. A thread told nothing gives them a mebibyte from the outermost.
+/// Either way they are refused past PostgreSQL's own count, as it refuses them under its default
+/// `max_stack_depth`.
+pub fn stack_given(bytes: usize) {
+    let here = 0u8;
+    let at = std::ptr::addr_of!(here) as usize;
+    GIVEN.with(|g| g.set(Some((at, bytes))));
 }
 
 /// A call under way: the outermost lets its place on the stack go where it is dropped.
-struct Deeper(bool);
+struct Deeper;
 
 impl Drop for Deeper {
     fn drop(&mut self) {
-        if self.0 {
-            BASE.with(|b| b.set(None));
-        }
+        BASE.with(|b| {
+            b.set(match b.get() {
+                Some((base, n)) if n > 1 => Some((base, n - 1)),
+                _ => None,
+            })
+        });
     }
 }
 
 fn deeper() -> Result<Deeper> {
     let here = 0u8;
     let at = std::ptr::addr_of!(here) as usize;
-    BASE.with(|b| match b.get() {
-        None => {
-            b.set(Some(at));
-            Ok(Deeper(true))
-        }
-        Some(base) if base.abs_diff(at) > STACK => Err(Error::new("stack depth limit exceeded")),
-        Some(_) => Ok(Deeper(false)),
-    })
+    let (base, n) = BASE
+        .with(|b| b.get())
+        .map_or((at, 1), |(base, n)| (base, n + 1));
+    let within = match GIVEN.with(|g| g.get()) {
+        Some((top, bytes)) => top.abs_diff(at) <= bytes.saturating_sub(MARGIN),
+        None => base.abs_diff(at) <= STACK,
+    };
+    if n > CALLS || !within {
+        return Err(Error::new(TOO_DEEP));
+    }
+    BASE.with(|b| b.set(Some((base, n))));
+    Ok(Deeper)
 }
 
 /// Whether 18.6 inlines a call of the file's function of this name before its arguments are looked

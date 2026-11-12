@@ -4192,19 +4192,87 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
     if let Some(v) = computed.bound.and_then(|b| b(e)) {
         return v;
     }
-    let ev = |x: &Expr| eval(x, row, frame, computed);
     if is_subquery(e) {
         return match frame.subqueries {
             Some(s) => s.value(e, row, frame, computed),
             None => Err(Error::new(format!("{e} is not read here"))),
         };
     }
+    // The forms calls of the file's functions inside one another pass through, each read in a
+    // frame of its own, so that a level of them takes little of the stack.
+    match e {
+        Expr::Nested(x) => eval(x, row, frame, computed),
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result,
+            ..
+        } => searched_case(e, conditions, else_result.as_deref(), row, frame, computed),
+        Expr::BinaryOp { left, op, right } if of_two_values(left, op, right) => {
+            operated(e, left, op, right, row, frame, computed)
+        }
+        Expr::Function(f) if function_name(f) != "make_interval" => {
+            // A function of the file's, its arguments by place or by name.
+            match super::own::call(f, row, frame, computed)? {
+                Some(v) => Ok(v),
+                None => eval_whole(e, row, frame, computed),
+            }
+        }
+        _ => eval_whole(e, row, frame, computed),
+    }
+}
+
+/// A CASE with no operand: the result of its first condition that holds, else its ELSE's.
+fn searched_case(
+    e: &Expr,
+    conditions: &[sqlparser::ast::CaseWhen],
+    else_result: Option<&Expr>,
+    row: &[Value],
+    frame: &Frame,
+    computed: &Computed,
+) -> Result<Value> {
+    let mut taken = else_result;
+    for c in conditions {
+        if holds(&c.condition, row, frame, computed)? == Some(true) {
+            taken = Some(&c.result);
+            break;
+        }
+    }
+    match taken {
+        Some(x) => case_arm(frame, e, x, eval(x, row, frame, computed)?),
+        None => Ok(Value::Null),
+    }
+}
+
+/// Whether a binary operator is arithmetic or a comparison read on its two sides' values alone,
+/// as `operated` reads it.
+fn of_two_values(left: &Expr, op: &BinaryOperator, right: &Expr) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo
+            | BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    ) && super::image::operator(op).is_none()
+        && (row_parts(left).is_none() || row_parts(right).is_none())
+}
+
+/// Every form `eval` does not read in a frame of its own.
+#[inline(never)]
+fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<Value> {
+    let ev = |x: &Expr| eval(x, row, frame, computed);
     Ok(match e {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             let (q, n) = column_of(e).ok_or_else(|| Error::new(format!("{e} is not read")))?;
             row[frame.find(q.as_deref(), &n)?].clone()
         }
-        Expr::Nested(x) => ev(x)?,
         // Every collation the snail holds orders text by its bytes: a COLLATE changes no value.
         Expr::Collate { expr, collation } => {
             frame
@@ -4934,24 +5002,6 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
             }
             operated(e, left, op, right, row, frame, computed)?
         }
-        Expr::Case {
-            operand: None,
-            conditions,
-            else_result,
-            ..
-        } => {
-            let mut taken = else_result.as_deref();
-            for c in conditions {
-                if holds(&c.condition, row, frame, computed)? == Some(true) {
-                    taken = Some(&c.result);
-                    break;
-                }
-            }
-            match taken {
-                Some(x) => case_arm(frame, e, x, ev(x)?)?,
-                None => Value::Null,
-            }
-        }
         Expr::AtTimeZone {
             timestamp,
             time_zone,
@@ -5169,10 +5219,6 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     super::calls::time(&name, &values, frame.type_of(e), frame.now)?
                         .unwrap_or(Value::Null),
                 );
-            }
-            // A function of the file's, its arguments by place or by name.
-            if let Some(v) = super::own::call(f, row, frame, computed)? {
-                return Ok(v);
             }
             let a = args(f)?;
             if let ("record_image_eq" | "record_image_ne", [x, y]) = (name.as_str(), a.as_slice()) {

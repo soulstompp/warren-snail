@@ -1450,7 +1450,7 @@ fn output_text(v: &Value) -> Option<String> {
 }
 
 /// The keywords of PostgreSQL 19's grammar that are not unreserved, which quote_ident quotes.
-fn reserved() -> &'static std::collections::HashSet<&'static str> {
+pub(super) fn reserved() -> &'static std::collections::HashSet<&'static str> {
     static RESERVED: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
         std::sync::OnceLock::new();
     RESERVED.get_or_init(|| include_str!("../keywords.txt").lines().collect())

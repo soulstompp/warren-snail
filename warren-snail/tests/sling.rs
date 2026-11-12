@@ -1268,6 +1268,75 @@ fn an_aggregate_of_the_query_around_is_refused_in_its_clause_s_words() {
 }
 
 #[test]
+fn a_call_of_no_function_and_a_later_arm_s_name_are_refused_in_18_6_s_words() {
+    // As 18.6 refused and answered each on 28818 (2026-11-12).
+    let path = declared(
+        "no-function",
+        "CREATE SCHEMA o;
+         CREATE TABLE o.t (k integer NOT NULL, b text, PRIMARY KEY (k));
+         CREATE TABLE o.ls (acct text NOT NULL, seq integer, PRIMARY KEY (acct));",
+        &["INSERT INTO o.ls VALUES ('x', 1), ('y', 2)"],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    for (sql, call) in [
+        ("SELECT nosuch(1)", "nosuch(integer)"),
+        ("SELECT nosuch('a')", "nosuch(unknown)"),
+        ("SELECT nosuch()", "nosuch()"),
+        ("SELECT NoSuch(1, 2.5)", "nosuch(integer, numeric)"),
+        ("SELECT k FROM o.t WHERE nosuch(k) > 0", "nosuch(integer)"),
+        ("SELECT nosuch(b) FROM o.t", "nosuch(text)"),
+    ] {
+        let words = format!(
+            "function {call} does not exist\nHINT:  No function matches the given name and \
+             argument types. You might need to add explicit type casts."
+        );
+        assert_eq!(refused(&mut w, sql), said("42883", &words), "{sql}");
+    }
+    let grammar = "SELECT coalesce(1, 2), nullif(1, 2), greatest(1, 2), least(1, 2)";
+    assert_eq!(rows(&mut w, grammar), ["1|1|2|1"]);
+    // A set operation's ORDER BY naming a column of a later arm alone.
+    let one = |k: usize| {
+        format!(
+            "column \"acct\" does not exist\nDETAIL:  There is a column named \"acct\" in table \
+             \"*SELECT* {k}\", but it cannot be referenced from this part of the query."
+        )
+    };
+    let many =
+        "column \"acct\" does not exist\nDETAIL:  There are columns named \"acct\", but they \
+         are in tables that cannot be referenced from this part of the query.\nHINT:  Try using a \
+         table-qualified name.";
+    for (sql, words) in [
+        (
+            "SELECT acct AS a FROM o.ls UNION SELECT acct FROM o.ls ORDER BY acct",
+            one(2),
+        ),
+        (
+            "SELECT acct AS a FROM o.ls UNION SELECT acct AS b FROM o.ls UNION SELECT acct \
+             FROM o.ls ORDER BY acct",
+            one(3),
+        ),
+        (
+            "SELECT acct AS a FROM o.ls UNION SELECT acct FROM o.ls UNION SELECT acct FROM o.ls \
+             ORDER BY acct",
+            many.to_string(),
+        ),
+        (
+            "SELECT acct AS a FROM o.ls UNION (SELECT acct AS b FROM o.ls INTERSECT SELECT acct \
+             FROM o.ls) ORDER BY acct",
+            one(3),
+        ),
+        (
+            "SELECT acct AS a FROM o.ls UNION SELECT acct FROM o.ls ORDER BY seq",
+            "column \"seq\" does not exist".to_string(),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), said("42703", &words), "{sql}");
+    }
+    let ordered = "SELECT acct AS a FROM o.ls UNION SELECT acct FROM o.ls ORDER BY a DESC";
+    assert_eq!(rows(&mut w, ordered), ["y", "x"]);
+}
+
+#[test]
 fn any_in_a_select_list_and_rows_by_order_are_answered() {
     // As 18.6 answered each on 28818 (2026-11-12): ANY and ALL over an array in a select list; two
     // rows compared by order pair by pair, the first pair not equal deciding, NULL where a pair

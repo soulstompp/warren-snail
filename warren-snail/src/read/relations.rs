@@ -3906,6 +3906,41 @@ fn result_names(body: &SetExpr) -> Option<Vec<String>> {
     }
 }
 
+/// Each arm's column names, the arms in their written order; none for an arm returning a star.
+fn arms_names(body: &SetExpr, out: &mut Vec<Option<Vec<String>>>) {
+    match body {
+        SetExpr::SetOperation { left, right, .. } => {
+            arms_names(left, out);
+            arms_names(right, out);
+        }
+        SetExpr::Query(q) => arms_names(&q.body, out),
+        arm => out.push(result_names(arm)),
+    }
+}
+
+/// PostgreSQL's DETAIL for a name a set operation's ORDER BY reads that is no column of its result:
+/// the arm after the first that returns a column of the name, `*SELECT* 2` the second; more than one,
+/// with its HINT; none, no DETAIL.
+fn in_later_arms(body: &SetExpr, n: &str) -> String {
+    let mut arms = Vec::new();
+    arms_names(body, &mut arms);
+    let holding: Vec<usize> = (1..arms.len())
+        .filter(|&i| arms[i].as_ref().is_some_and(|a| a.iter().any(|x| x == n)))
+        .map(|i| i + 1)
+        .collect();
+    match holding.as_slice() {
+        [] => String::new(),
+        [k] => format!(
+            "\nDETAIL:  There is a column named \"{n}\" in table \"*SELECT* {k}\", but it cannot \
+             be referenced from this part of the query."
+        ),
+        _ => format!(
+            "\nDETAIL:  There are columns named \"{n}\", but they are in tables that cannot be \
+             referenced from this part of the query.\nHINT:  Try using a table-qualified name."
+        ),
+    }
+}
+
 /// A set operation as steps: each arm a step of its own, the operation one more under `name`;
 /// where it is sorted or limited, the operation under a name of its own, and `name` the step that
 /// sorts and limits it.
@@ -3934,7 +3969,10 @@ fn lift_set(
                         )));
                     }
                     if !names.contains(&n) {
-                        return Err(Error::new(format!("column \"{n}\" does not exist")));
+                        return Err(Error::new(format!(
+                            "column \"{n}\" does not exist{}",
+                            in_later_arms(&query.body, &n)
+                        )));
                     }
                 }
             }

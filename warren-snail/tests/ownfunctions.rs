@@ -273,23 +273,46 @@ fn a_recursion_past_the_stack_is_refused_as_postgresql_refuses_it() {
          CREATE FUNCTION c4.self(integer) RETURNS integer LANGUAGE sql AS 'SELECT c4.self($1 + 1)'; \
          CREATE FUNCTION c4.down(integer) RETURNS integer LANGUAGE sql AS 'SELECT CASE WHEN $1 <= 0 THEN 0 ELSE 1 + c4.down($1 - 1) END';";
     let path = written("recursion", ddl);
-    // On a stack wider than the calls may take, so the refusal is the snail's, never the thread's.
+    let too_deep = "stack depth limit exceeded\nHINT:  Increase the configuration parameter \
+         \"max_stack_depth\" (currently 2048kB), after ensuring the platform's stack depth limit is \
+         adequate.";
+    // On a thread its host gave a stack of its own and said so, as PostgreSQL 18.6 answered and
+    // refused each on 28818 (2026-11-12): 8422 levels answered, 8423 refused.
+    let given = path.clone();
     std::thread::Builder::new()
-        .stack_size(64 << 20)
+        .stack_size(1 << 30)
         .spawn(move || {
-            let mut s = Snail::open(&path).unwrap();
+            warren_snail::read::stack_given(1 << 30);
+            let mut s = Snail::open(&given).unwrap();
             assert_eq!(
                 question(&mut s, "SELECT c4.down(0), c4.down(1), c4.down(3)").unwrap(),
                 ["0|1|3"]
             );
-            assert_eq!(
-                question(&mut s, "SELECT c4.self(1)").unwrap_err(),
-                "stack depth limit exceeded"
-            );
+            assert_eq!(question(&mut s, "SELECT c4.down(8422)").unwrap(), ["8422"]);
+            for sql in [
+                "SELECT c4.down(8423)",
+                "SELECT c4.down(10000)",
+                "SELECT c4.self(1)",
+            ] {
+                let e = s.ask(sql, None).unwrap_err();
+                assert_eq!(
+                    (e.sqlstate(), e.to_string().as_str()),
+                    (Some("54001"), too_deep),
+                    "{sql}"
+                );
+            }
         })
         .unwrap()
         .join()
         .unwrap();
+    // On a thread whose host said nothing, a mebibyte from the outermost call: refused sooner, in
+    // the same words, never past the thread's stack; a release build answers 300 levels on it.
+    let mut s = Snail::open(&path).unwrap();
+    let held = if cfg!(debug_assertions) { 3 } else { 300 };
+    let asked = format!("SELECT c4.down({held})");
+    assert_eq!(question(&mut s, &asked).unwrap(), [held.to_string()]);
+    let past = question(&mut s, "SELECT c4.down(8422)").unwrap_err();
+    assert_eq!(past, too_deep);
 }
 
 #[test]

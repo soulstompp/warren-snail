@@ -873,6 +873,18 @@ impl Typing<'_> {
                         return Err(no_form(&as_written, &types));
                     }
                 }
+                // A bare name of no function: none of PostgreSQL's, no word of its grammar, none
+                // handed in.
+                if let [sqlparser::ast::ObjectNamePart::Identifier(_)] = f.name.0.as_slice() {
+                    let word = name.chars().all(|c| c.is_alphanumeric() || c == '_');
+                    if word
+                        && !super::own::built_in_name(&name)
+                        && !super::calls::reserved().contains(name.as_str())
+                        && !super::handed::is_handed(f)
+                    {
+                        return Err(no_form(&as_written, &types));
+                    }
+                }
                 // Its refusals of no form name the function as the call writes it.
                 let typed = (|| -> Result<Option<ColumnType>> {
                     if WRITING.contains(&name.as_str()) {
