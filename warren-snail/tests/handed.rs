@@ -369,6 +369,14 @@ fn refused(s: &mut Snail, q: &str) -> String {
     }
 }
 
+/// PostgreSQL's words for a call no form of a function takes, with their HINT.
+fn no_function(call: &str) -> String {
+    format!(
+        "function {call} does not exist\nHINT:  No function matches the given name and argument \
+         types. You might need to add explicit type casts."
+    )
+}
+
 #[test]
 fn a_scalar_function_handed_in_computes_past_64_bits_and_is_called_where_any_function_is() {
     let path = snail_file("scalar");
@@ -415,7 +423,7 @@ fn a_call_takes_the_form_whose_parameters_its_arguments_meet_as_postgresql_choos
     );
     assert_eq!(
         refused(&mut s, "SELECT pick(true) FROM a.p"),
-        "function pick(boolean) does not exist"
+        no_function("pick(boolean)")
     );
     // A bigint is taken by the numeric form, the one of the three it is cast to with no cast
     // written; an integer by its own form, which takes it exactly.
@@ -428,11 +436,11 @@ fn a_call_takes_the_form_whose_parameters_its_arguments_meet_as_postgresql_choos
     );
     assert_eq!(
         refused(&mut s, "SELECT det2(1, 2, 3) FROM a.p"),
-        "function det2(integer, integer, integer) does not exist"
+        no_function("det2(integer, integer, integer)")
     );
     assert_eq!(
         refused(&mut s, "SELECT half(true) FROM a.p"),
-        "function half(boolean) does not exist"
+        no_function("half(boolean)")
     );
     let e = refused(&mut s, "SELECT wrong() FROM a.p");
     assert!(e.starts_with("wrong() returned a value that is no integer"), "{e}");

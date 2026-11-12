@@ -1026,6 +1026,11 @@ fn write_made(
         }
     }
     let mut named = catalog.clone();
+    // The DDL's last statement kept with its `;`, so a declaration after it is a statement of its
+    // own.
+    if let std::borrow::Cow::Owned(ended) = crate::ddl::ended(&named.ddl)? {
+        named.ddl = ended;
+    }
     named.with_release(release)?;
     let monetary = crate::file::monetary_of(&named, carried.map_or(&[], |c| &c.monetary));
     named.with_monetary(&monetary)?;

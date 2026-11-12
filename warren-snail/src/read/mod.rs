@@ -989,7 +989,7 @@ impl Snail {
         }
         let committed = String::from_utf8(self.reader.catalog_text(newest)?)
             .map_err(|_| Error::new("the catalog is not UTF-8"))?;
-        let text = format!("{}\n{own}", committed.trim_end());
+        let text = format!("{}\n{own}", crate::ddl::ended(&committed)?.trim_end());
         let mut catalog = Catalog::parse_kept(&text, usize::MAX)?;
         old_names(&mut catalog, self.reader.format());
         catalog.with_release(newest.release)?;
@@ -1809,7 +1809,7 @@ impl Snail {
                 || image::asks_an_operator(sql)
             {
                 if order.is_some() && (pipeline::is_pipeline(q) || relations::is_set_operation(q)) {
-                    return Err(Error::new("a pipeline reads its table along its own order"));
+                    return Err(self.along_its_own_order(sql));
                 }
                 return self.ask_pipeline(q, params);
             }
@@ -1824,7 +1824,7 @@ impl Snail {
                 || own::calls(&self.catalog, q) && question::parse(&self.catalog, sql).is_err()
             {
                 if order.is_some() {
-                    return Err(Error::new("a pipeline reads its table along its own order"));
+                    return Err(self.along_its_own_order(sql));
                 }
                 return self.ask_pipeline(q, params);
             }
@@ -1844,6 +1844,15 @@ impl Snail {
                 }
                 (r, _) => r,
             },
+        }
+    }
+
+    /// The refusal of a question a pipeline reads, asked along an order: PostgreSQL's where it
+    /// refuses the question as it types it, an operator or a call no form takes, before the order's.
+    fn along_its_own_order(&self, sql: &str) -> Error {
+        match question::parse(&self.catalog, sql) {
+            Err(e) if e.sqlstate() == Some("42883") => e,
+            _ => Error::new("a pipeline reads its table along its own order"),
         }
     }
 

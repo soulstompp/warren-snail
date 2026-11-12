@@ -230,6 +230,33 @@ fn a_mismatch_is_refused_in_postgresql_s_words() {
 }
 
 #[test]
+fn a_set_operation_s_order_by_is_refused_in_postgresql_s_words() {
+    // As 18.6 refused each on 28818 (2026-11-11): every item's columns read among the result's
+    // alone, before an item that is no column of the result is refused.
+    let path = snail("order-by-refused");
+    let expression = "invalid UNION/INTERSECT/EXCEPT ORDER BY clause\nDETAIL:  Only result column \
+         names can be used, not expressions or functions.\nHINT:  Add the expression/function to \
+         every SELECT, or move the UNION into a FROM clause.";
+    for (by, code, words) in [
+        ("min(id)", "42703", "column \"id\" does not exist"),
+        ("id", "42703", "column \"id\" does not exist"),
+        ("t.g", "42P01", "missing FROM-clause entry for table \"t\""),
+        ("min(g)", "0A000", expression),
+        ("g + 1", "0A000", expression),
+        ("g + 1, id", "42703", "column \"id\" does not exist"),
+    ] {
+        let q = format!("SELECT g FROM a.t UNION SELECT g FROM a.u ORDER BY {by}");
+        let e = fresh(&path).ask(&q, None).unwrap_err();
+        assert_eq!((e.sqlstate(), e.to_string().as_str()), (Some(code), words), "{q}");
+    }
+    same(
+        &path,
+        "SELECT g FROM a.t UNION SELECT g FROM a.u ORDER BY g DESC",
+        "- 2 1",
+    );
+}
+
+#[test]
 fn sorted_and_limited_over_the_whole_inside_with_and_derived() {
     let path = snail("whole");
     same(

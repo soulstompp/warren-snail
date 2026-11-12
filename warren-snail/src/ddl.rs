@@ -1811,11 +1811,61 @@ fn routine(words: &[String]) -> bool {
 
 /// The statements of a DDL, split on their semicolons by sqlparser's PostgreSQL tokenizer.
 pub(crate) fn statements(ddl: &str) -> Result<Vec<Vec<Token>>> {
-    semicolons(&crate::read::scanned_unseeded(ddl, crate::regs::LATEST)?)
+    Ok(pieces(ddl)?.into_iter().filter(|s| said(s)).collect())
+}
+
+/// A DDL's text with its last statement ended, as psql ends a file's last statement: as written
+/// where a `;` ends it, a comment after the last `;` being no statement; else with a `;` after it,
+/// on a line of its own where a comment to the line's end follows the statement.
+pub(crate) fn ended(ddl: &str) -> Result<std::borrow::Cow<'_, str>> {
+    let last = pieces(ddl)?.pop().unwrap_or_default();
+    if !said(&last) {
+        return Ok(std::borrow::Cow::Borrowed(ddl));
+    }
+    let to_line_end = last
+        .iter()
+        .rev()
+        .find(|t| {
+            !matches!(
+                t,
+                Token::Whitespace(Whitespace::Space | Whitespace::Tab | Whitespace::Newline)
+            )
+        })
+        .is_some_and(|t| matches!(t, Token::Whitespace(Whitespace::SingleLineComment { .. })));
+    let end = if to_line_end { "\n;\n" } else { ";\n" };
+    Ok(std::borrow::Cow::Owned(format!("{}{end}", ddl.trim_end())))
+}
+
+/// Whether a piece of a DDL between its semicolons holds more than whitespace and comments.
+fn said(piece: &[Token]) -> bool {
+    piece.iter().any(|t| {
+        !matches!(
+            t,
+            Token::Whitespace(
+                Whitespace::Space
+                    | Whitespace::Tab
+                    | Whitespace::Newline
+                    | Whitespace::SingleLineComment { .. }
+                    | Whitespace::MultiLineComment(_)
+            )
+        )
+    })
+}
+
+/// A DDL split on its semicolons, the piece after the last among them: whitespace and comments
+/// only where a `;` ends the last statement.
+fn pieces(ddl: &str) -> Result<Vec<Vec<Token>>> {
+    cut(&crate::read::scanned_unseeded(ddl, crate::regs::LATEST)?)
 }
 
 /// The statements of a text as written, split on their semicolons as `statements` splits a DDL's.
 pub(crate) fn semicolons(ddl: &str) -> Result<Vec<Vec<Token>>> {
+    Ok(cut(ddl)?.into_iter().filter(|s| said(s)).collect())
+}
+
+/// A text split on its semicolons as it is given, every piece kept, the one after the last `;`
+/// among them.
+fn cut(ddl: &str) -> Result<Vec<Vec<Token>>> {
     let tokens = crate::read::image::tokens(ddl)?;
     let mut out = vec![Vec::new()];
     // A routine's BEGIN … END keeps the semicolons inside it, as psql keeps them: in a statement
@@ -1850,23 +1900,7 @@ pub(crate) fn semicolons(ddl: &str) -> Result<Vec<Vec<Token>>> {
         }
         out.last_mut().unwrap().push(t);
     }
-    Ok(out
-        .into_iter()
-        .filter(|s| {
-            s.iter().any(|t| {
-                !matches!(
-                    t,
-                    Token::Whitespace(
-                        Whitespace::Space
-                            | Whitespace::Tab
-                            | Whitespace::Newline
-                            | Whitespace::SingleLineComment { .. }
-                            | Whitespace::MultiLineComment(_)
-                    )
-                )
-            })
-        })
-        .collect())
+    Ok(out)
 }
 
 /// A statement as written, without the comments before it.

@@ -999,3 +999,153 @@ fn an_insert_select_of_no_rows_or_of_a_column_of_no_value_is_typed_by_its_questi
         [row(&["31", "NULL", "NULL"]), row(&["41", "2", "2"])]
     );
 }
+
+/// A snail's file and the files its pages span after it.
+fn files_of(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let next = |n: usize| {
+        let mut p = path.as_os_str().to_owned();
+        p.push(format!(".{n}"));
+        std::path::PathBuf::from(p)
+    };
+    std::iter::once(path.to_path_buf())
+        .chain((1..).map(next).take_while(|p| p.exists()))
+        .collect()
+}
+
+/// A snail's catalog text as a write before 0.2.0 kept it, from DDL whose last statement has no
+/// `;`: the `;` that ends `text` overwritten with a space where the file holds it.
+fn kept_unended(path: &std::path::Path, text: &str) {
+    let want = text.as_bytes();
+    let mut found = 0;
+    for f in files_of(path) {
+        let mut bytes = std::fs::read(&f).unwrap();
+        let at: Vec<usize> = (0..bytes.len().saturating_sub(want.len() - 1))
+            .filter(|&i| bytes[i..i + want.len()] == *want)
+            .collect();
+        for i in &at {
+            let semi = i + want.len() - 2;
+            assert_eq!(bytes[semi], b';', "{text:?}");
+            bytes[semi] = b' ';
+        }
+        if !at.is_empty() {
+            std::fs::write(&f, &bytes).unwrap();
+        }
+        found += at.len();
+    }
+    assert_eq!(found, 1, "{text:?} in {}", path.display());
+}
+
+#[test]
+fn a_catalog_whose_last_statement_lacks_a_semicolon_takes_a_declaration() {
+    // As PostgreSQL 18.6 took each on 28818 (2026-11-11), psql running a file's last statement
+    // without its `;`: each declaration after it a statement of its own, alone and inside a
+    // transaction, a comment after the last statement or after the last `;`.
+    let unended = "CREATE SCHEMA ac; CREATE TABLE ac.t1 (id integer PRIMARY KEY)";
+    let commented = "CREATE SCHEMA ac; CREATE TABLE ac.t1 (id integer PRIMARY KEY) -- the last";
+    let after = "CREATE SCHEMA ac; CREATE TABLE ac.t1 (id integer PRIMARY KEY); -- after it";
+    let answered = |path: &std::path::Path, sql: &str, want: &[&str]| {
+        let mut s = Snail::open(path).unwrap();
+        assert_eq!(rows(&mut s, sql), [row(want)], "{}", path.display());
+    };
+    // A file written now, from each.
+    for (name, ddl) in [
+        ("unended", unended),
+        ("unended-commented", commented),
+        ("ended-commented", after),
+    ] {
+        let path = made(name, ddl);
+        let mut w = Snail::open_writing(&path).unwrap();
+        run(&mut w, "CREATE TABLE ac.t8 (id integer PRIMARY KEY)");
+        run(&mut w, "INSERT INTO ac.t8 VALUES (8)");
+        run(&mut w, "BEGIN");
+        run(&mut w, "CREATE TABLE ac.t9 (id integer PRIMARY KEY)");
+        run(&mut w, "INSERT INTO ac.t9 VALUES (9)");
+        run(&mut w, "COMMIT");
+        drop(w);
+        answered(
+            &path,
+            "SELECT (SELECT id FROM ac.t8), (SELECT id FROM ac.t9), (SELECT count(*) FROM ac.t1)",
+            &["8", "9", "0"],
+        );
+    }
+    // A file written before, its text as the DDL gave it: a declaration alone.
+    let path = made("unended-before", unended);
+    kept_unended(&path, &format!("{unended};\n"));
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(&mut w, "CREATE TABLE ac.t8 (id integer PRIMARY KEY)");
+    run(&mut w, "INSERT INTO ac.t8 VALUES (8)");
+    drop(w);
+    answered(
+        &path,
+        "SELECT (SELECT id FROM ac.t8), (SELECT count(*) FROM ac.t1)",
+        &["8", "0"],
+    );
+    // Inside a transaction, two declarations.
+    let path = made("unended-before-begun", unended);
+    kept_unended(&path, &format!("{unended};\n"));
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(&mut w, "BEGIN");
+    run(&mut w, "CREATE TABLE ac.t8 (id integer PRIMARY KEY)");
+    run(&mut w, "CREATE TABLE ac.t9 (id integer PRIMARY KEY)");
+    run(&mut w, "INSERT INTO ac.t8 VALUES (8)");
+    run(&mut w, "INSERT INTO ac.t9 VALUES (9)");
+    run(&mut w, "COMMIT");
+    drop(w);
+    answered(
+        &path,
+        "SELECT (SELECT id FROM ac.t8), (SELECT id FROM ac.t9), (SELECT count(*) FROM ac.t1)",
+        &["8", "9", "0"],
+    );
+    // A comment to the line's end after its last statement.
+    let path = made("unended-before-commented", commented);
+    kept_unended(&path, &format!("{commented}\n;\n"));
+    let mut w = Snail::open_writing(&path).unwrap();
+    run(&mut w, "CREATE TABLE ac.t8 (id integer PRIMARY KEY)");
+    run(&mut w, "INSERT INTO ac.t8 VALUES (8)");
+    drop(w);
+    answered(
+        &path,
+        "SELECT (SELECT id FROM ac.t8), (SELECT count(*) FROM ac.t1)",
+        &["8", "0"],
+    );
+}
+
+#[test]
+fn a_transaction_declares_again_on_a_catalog_written_before_another_s_commit_moved() {
+    // A file written before, its catalog's text as the DDL gave it, its root within a byte of its
+    // page: 53 tables and a key whose name is 32 letters long (33 cut it).
+    let tables: String = (0..53)
+        .map(|i| format!("CREATE TABLE ac.f_{i:03} (id integer PRIMARY KEY);\n"))
+        .collect();
+    let ddl = format!(
+        "CREATE SCHEMA ac;\n{tables}CREATE TABLE ac.t1 (id integer, CONSTRAINT {} PRIMARY KEY (id))",
+        "k".repeat(32)
+    );
+    let path = made("unended-moved", &ddl);
+    kept_unended(&path, &format!("{ddl};\n"));
+    let cut = || {
+        warren_snail::file::Reader::open(&path)
+            .unwrap()
+            .root()
+            .unwrap()
+            .is_cut()
+    };
+    assert!(!cut());
+    // A transaction declares on it; another writer's serializable commit, its record on the root,
+    // cuts the root, the catalog's text moved unchanged into pages of its own.
+    let mut a = Snail::open_writing(&path).unwrap();
+    run(&mut a, "BEGIN");
+    run(&mut a, "CREATE TABLE ac.t8 (id integer PRIMARY KEY)");
+    let mut b = Snail::open_writing(&path).unwrap();
+    run(&mut b, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run(&mut b, "INSERT INTO ac.t1 VALUES (1)");
+    run(&mut b, "COMMIT");
+    assert!(cut());
+    // Its next statement and its commit declare its own again on that text.
+    run(&mut a, "INSERT INTO ac.t8 VALUES (8)");
+    run(&mut a, "COMMIT");
+    drop((a, b));
+    let mut s = Snail::open(&path).unwrap();
+    let sql = "SELECT (SELECT id FROM ac.t8), (SELECT id FROM ac.t1)";
+    assert_eq!(rows(&mut s, sql), [row(&["8", "1"])]);
+}

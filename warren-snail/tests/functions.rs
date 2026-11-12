@@ -81,6 +81,15 @@ fn refused(snail: &mut Snail, expr: &str) -> String {
     }
 }
 
+/// PostgreSQL's words for a call no form of a function takes, with their HINT.
+#[cfg(feature = "standalone")]
+fn no_function(call: &str) -> String {
+    format!(
+        "function {call} does not exist\nHINT:  No function matches the given name and argument \
+         types. You might need to add explicit type casts."
+    )
+}
+
 #[test]
 fn the_list_names_each_release_s_functions_by_its_census_count() {
     // The census's count of every function SQL calls on 14 to 19 (FINDINGS-28.md).
@@ -223,7 +232,7 @@ fn the_numbers_functions_take_the_form_postgresql_resolves() {
     );
     assert_eq!(
         refused(&mut snail, "round(d, 1)"),
-        "function round(double precision, integer) does not exist"
+        no_function("round(double precision, integer)")
     );
     assert_eq!(
         refused(&mut snail, "sqrt(-d)"),
@@ -240,11 +249,11 @@ fn the_numbers_functions_take_the_form_postgresql_resolves() {
 fn an_aggregate_with_no_form_for_its_type_is_refused_over_no_rows_too() {
     let mut snail = numbers("no-rows");
     for (agg, want) in [
-        ("pg_backend_pid()", "pg_backend_pid is the server's own (sessions): a snail answers only what its file holds"),
-        ("sum(ok)", "function sum(boolean) does not exist"),
-        ("min(ok)", "function min(boolean) does not exist"),
-        ("avg(ok)", "function avg(boolean) does not exist"),
-        ("bool_and(a)", "function bool_and(integer) does not exist"),
+        ("pg_backend_pid()", "pg_backend_pid is the server's own (sessions): a snail answers only what its file holds".to_string()),
+        ("sum(ok)", no_function("sum(boolean)")),
+        ("min(ok)", no_function("min(boolean)")),
+        ("avg(ok)", no_function("avg(boolean)")),
+        ("bool_and(a)", no_function("bool_and(integer)")),
     ] {
         let e = snail
             .ask(
@@ -484,7 +493,7 @@ fn the_aggregates_past_those_the_types_carry_fold_as_postgresql_s() {
             None,
         )
         .unwrap_err();
-    assert_eq!(e.to_string(), "function var_pop(boolean) does not exist");
+    assert_eq!(e.to_string(), no_function("var_pop(boolean)"));
     // Over no rows a hypothetical row ranks first.
     assert_eq!(
         rows_of(

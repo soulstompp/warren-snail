@@ -1217,6 +1217,57 @@ fn a_subquery_in_an_on_is_refused_in_postgresql_s_words() {
 }
 
 #[test]
+fn an_aggregate_of_the_query_around_is_refused_in_its_clause_s_words() {
+    // An aggregate reading only the query around a subquery is that query's: refused, as 18.6
+    // refused each on 28818 (2026-11-11), in the words of the clause of that query the subquery
+    // stands in, wherever in the subquery it stands.
+    let path = declared("around-aggregate-refused", K6, &K6_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let not_in = |clause: &str| {
+        (
+            Some("42803"),
+            format!("aggregate functions are not allowed in {clause}"),
+        )
+    };
+    for (sql, want) in [
+        (
+            "SELECT s.acct FROM k6.stated s WHERE EXISTS (SELECT 1 FROM k6.tiers t \
+             WHERE t.lower < max(s.balance))",
+            not_in("WHERE"),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s WHERE s.balance IN (SELECT max(s.balance) \
+             FROM k6.tiers t)",
+            not_in("WHERE"),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s WHERE s.balance IN (SELECT max(s.balance))",
+            not_in("WHERE"),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s WHERE s.balance > (SELECT min(t.lower) \
+             FROM k6.tiers t WHERE t.lower < max(s.balance))",
+            not_in("WHERE"),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s WHERE s.balance = ANY (SELECT max(s.balance) \
+             FROM k6.tiers t)",
+            not_in("WHERE"),
+        ),
+        (
+            "SELECT s.acct FROM k6.stated s JOIN k6.tiers t ON t.lower = (SELECT max(s.balance))",
+            not_in("JOIN conditions"),
+        ),
+        (
+            "SELECT count(*) FROM k6.stated s GROUP BY (SELECT max(s.balance))",
+            not_in("GROUP BY"),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+}
+
+#[test]
 fn a_join_s_on_inside_a_subquery_reads_the_query_around_it() {
     let asked: &[(&str, &[&str])] = &[
         (
@@ -1748,7 +1799,8 @@ fn type_and_function_refusals_are_18_6_s_words() {
          CREATE VIEW k7.v AS SELECT k FROM k7.t;
          CREATE SEQUENCE k7.q;
          CREATE FUNCTION k7.f(integer) RETURNS integer LANGUAGE sql RETURN $1;
-         CREATE TYPE k7.range7 AS RANGE (subtype = integer);",
+         CREATE TYPE k7.range7 AS RANGE (subtype = integer);
+         CREATE TABLE k7.vc (id integer NOT NULL, b varchar(10), PRIMARY KEY (id));",
         &[],
     );
     let mut w = Snail::open_writing(&path).unwrap();
@@ -1795,6 +1847,76 @@ fn type_and_function_refusals_are_18_6_s_words() {
     // A sequence has no row type, and an index none either: each takes a type's name.
     w.execute("CREATE TYPE k7.q AS ENUM ('c')").unwrap();
     w.execute("CREATE INDEX mood ON k7.t (k)").unwrap();
+    // A call no form of a function takes names the function as the call writes it, in its schema;
+    // no operator takes a number beside a varchar. Each as 18.6 refused it on 28818 (2026-11-11),
+    // with its HINT.
+    w.execute("INSERT INTO k7.vc VALUES (1, '2'), (2, 'x')").unwrap();
+    let no_function = |call: &str| {
+        said(
+            "42883",
+            &format!(
+                "function {call} does not exist\nHINT:  No function matches the given name and \
+                 argument types. You might need to add explicit type casts."
+            ),
+        )
+    };
+    let no_operator = |op: &str| {
+        said(
+            "42883",
+            &format!(
+                "operator does not exist: {op}\nHINT:  No operator matches the given name and \
+                 argument types. You might need to add explicit type casts."
+            ),
+        )
+    };
+    for (sql, want) in [
+        (
+            "SELECT pg_catalog.length(1, 2, 3)",
+            no_function("pg_catalog.length(integer, integer, integer)"),
+        ),
+        ("SELECT pg_catalog.nosuch(1)", no_function("pg_catalog.nosuch(integer)")),
+        ("SELECT public.length('a')", no_function("public.length(unknown)")),
+        (
+            "SELECT k FROM k7.t WHERE pg_catalog.length(k, 1) > 0",
+            no_function("pg_catalog.length(integer, integer)"),
+        ),
+        (
+            "SELECT public.length(b) FROM k7.vc",
+            no_function("public.length(character varying)"),
+        ),
+        ("SELECT k7.f(1, 2)", no_function("k7.f(integer, integer)")),
+        (
+            "SELECT id FROM k7.vc WHERE b = 2",
+            no_operator("character varying = integer"),
+        ),
+        (
+            "SELECT id FROM k7.vc WHERE b < 2",
+            no_operator("character varying < integer"),
+        ),
+        (
+            "SELECT id FROM k7.vc WHERE 2 = b",
+            no_operator("integer = character varying"),
+        ),
+        (
+            "SELECT id FROM k7.vc WHERE 2 < b",
+            no_operator("integer < character varying"),
+        ),
+        (
+            "SELECT id FROM k7.vc WHERE b = 2::bigint",
+            no_operator("character varying = bigint"),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+    // A function of pg_catalog's named in it is read as its bare name is.
+    assert_eq!(
+        rows(&mut w, "SELECT pg_catalog.length(b) FROM k7.vc ORDER BY id"),
+        ["1", "1"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT id FROM k7.vc WHERE pg_catalog.length(b) > 0 ORDER BY id"),
+        ["1", "2"]
+    );
 }
 
 /// Two writers of one snail of the tables the transactions name as committed, at a path of the

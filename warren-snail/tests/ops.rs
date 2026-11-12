@@ -1542,23 +1542,20 @@ fn text_matches_as_a_vector_of_it_under_the_file_s_configuration_each_way_of_ask
         held(&english, &under_english);
     }
     let mut snail = fresh(&simple);
+    let no_function = |call: &str| {
+        format!(
+            "function {call} does not exist\nHINT:  No function matches the given name and \
+             argument types. You might need to add explicit type casts."
+        )
+    };
     for (expr, words) in [
-        ("t @@ id", "operator does not exist: text @@ integer"),
-        ("id @@ q", "operator does not exist: integer @@ tsquery"),
-        ("q @@ t", "operator does not exist: tsquery @@ text"),
-        ("1 @@ 'a'", "operator does not exist: integer @@ unknown"),
-        (
-            "to_tsvector(id)",
-            "function to_tsvector(integer) does not exist",
-        ),
-        (
-            "to_tsquery(id)",
-            "function to_tsquery(integer) does not exist",
-        ),
-        (
-            "ts_headline(id, q)",
-            "function ts_headline(integer, tsquery) does not exist",
-        ),
+        ("t @@ id", "operator does not exist: text @@ integer".to_string()),
+        ("id @@ q", "operator does not exist: integer @@ tsquery".to_string()),
+        ("q @@ t", "operator does not exist: tsquery @@ text".to_string()),
+        ("1 @@ 'a'", "operator does not exist: integer @@ unknown".to_string()),
+        ("to_tsvector(id)", no_function("to_tsvector(integer)")),
+        ("to_tsquery(id)", no_function("to_tsquery(integer)")),
+        ("ts_headline(id, q)", no_function("ts_headline(integer, tsquery)")),
     ] {
         let q = format!("SELECT {expr} AS x FROM s.d WHERE id < 0");
         assert_eq!(snail.ask(&q, None).unwrap_err().to_string(), words, "{q}");

@@ -155,6 +155,7 @@ const SAID: &[(Words, &str)] = &[
         "42P10",
     ),
     (Words::Holds("ORDER BY position ", " is not in select list"), "42P10"),
+    (Words::Is("invalid UNION/INTERSECT/EXCEPT ORDER BY clause"), "0A000"),
     (Words::Holds("GROUP BY position ", " is not in select list"), "42P10"),
     (Words::Holds("DISTINCT ON position ", " is not in select list"), "42P10"),
     (Words::Starts("non-integer constant in "), "42601"),

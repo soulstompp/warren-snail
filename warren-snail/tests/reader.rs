@@ -651,6 +651,18 @@ fn fr(name: &str) -> Snail {
     w
 }
 
+/// PostgreSQL's words for a call no form of a function takes, with their HINT.
+macro_rules! no_function {
+    ($call:literal) => {
+        concat!(
+            "function ",
+            $call,
+            " does not exist\nHINT:  No function matches the given name and argument types. You \
+             might need to add explicit type casts."
+        )
+    };
+}
+
 /// Each statement refused as 18.6 refuses it, its SQLSTATE and its words, in its order.
 fn refusals(w: &mut Snail, asked: &[(&str, &str, &str)]) {
     for (sql, code, words) in asked {
@@ -1194,17 +1206,17 @@ fn generate_series_resolves_its_form() {
         (
             "1.5::float8, 2",
             "42883",
-            "function generate_series(double precision, integer) does not exist",
+            no_function!("generate_series(double precision, integer)"),
         ),
         (
             "'2026-01-01'::timestamp, '2026-01-02'",
             "42883",
-            "function generate_series(timestamp without time zone, unknown) does not exist",
+            no_function!("generate_series(timestamp without time zone, unknown)"),
         ),
         (
             "1, 2, '1 day'::interval",
             "42883",
-            "function generate_series(integer, integer, interval) does not exist",
+            no_function!("generate_series(integer, integer, interval)"),
         ),
     ] {
         refusals(&mut w, &[(&typed(args), code, words)]);
@@ -1435,7 +1447,7 @@ fn functions_side_by_side_run_as_long_as_the_longest() {
             (
                 "SELECT * FROM unnest(ARRAY[1, 2], 5) AS t(x, y)",
                 "42883",
-                "function pg_catalog.unnest(integer) does not exist",
+                no_function!("pg_catalog.unnest(integer)"),
             ),
             (
                 "SELECT * FROM unnest(ARRAY[1, 2], NULL) AS t(x, y)",
@@ -1927,7 +1939,7 @@ fn the_session_zone_s_abbreviations_are_read_first() {
         &[(
             "SELECT * FROM pg_timezone_abbrevs()",
             "42883",
-            "function pg_timezone_abbrevs() does not exist",
+            no_function!("pg_timezone_abbrevs()"),
         )],
     );
 }
@@ -1967,7 +1979,7 @@ fn before_18_the_set_alone_is_read() {
         &[(
             "SELECT * FROM pg_timezone_abbrevs_abbrevs()",
             "42883",
-            "function pg_timezone_abbrevs_abbrevs() does not exist",
+            no_function!("pg_timezone_abbrevs_abbrevs()"),
         )],
     );
 }

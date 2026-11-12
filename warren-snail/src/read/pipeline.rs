@@ -9165,14 +9165,13 @@ fn is_written_constant(e: &Expr) -> bool {
 
 /// Whether an expression calls a function, or an operator on numbers or on a document, the question
 /// path does not read, or reads a CASE, an OR, an IN list, a subscript, a COLLATE or a parameter:
-/// its aggregates and the functions a DDL names are its own.
+/// its aggregates are its own, and a function a DDL names it reads where it reads the question.
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         // A set-returning function, named in its schema or not, is the pipeline's.
         Expr::Function(f) if returns_set(&function_name(f)) => true,
         Expr::Function(f) => {
-            let own = !super::handed::is_handed(f) && f.name.0.len() > 1
-                || matches!(function_name(f).as_str(), "sum" | "min" | "max" | "avg")
+            let own = matches!(function_name(f).as_str(), "sum" | "min" | "max" | "avg")
                 || function_name(f) == "count" && is_count_star(f);
             // An aggregate of its own but over each value once, filtered or ordered, is not.
             let plain = f.filter.is_none()

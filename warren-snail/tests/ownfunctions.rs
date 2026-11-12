@@ -63,6 +63,14 @@ fn question(s: &mut Snail, sql: &str) -> Result<Vec<String>, String> {
     Ok(joined(s, &b))
 }
 
+/// PostgreSQL's words for a call no form of a function takes, with their HINT.
+fn no_function(call: &str) -> String {
+    format!(
+        "function {call} does not exist\nHINT:  No function matches the given name and argument \
+         types. You might need to add explicit type casts."
+    )
+}
+
 const PLUS: &str = "CREATE SCHEMA c1; \
      CREATE TABLE c1.t (id integer PRIMARY KEY, v integer, w integer); \
      CREATE FUNCTION c1.plus(integer, integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + $2';";
@@ -81,11 +89,11 @@ fn a_call_reads_its_arguments_types_as_postgresql_s_implicit_casts_take_them() {
     );
     assert_eq!(question(&mut s, "SELECT c1.plus(NULL, 1)").unwrap(), ["NULL"]);
     for (sql, why) in [
-        ("SELECT c1.plus(1.5, 2)", "function c1.plus(numeric, integer) does not exist"),
-        ("SELECT c1.plus(1)", "function c1.plus(integer) does not exist"),
-        ("SELECT c1.plus(1, 2, 3)", "function c1.plus(integer, integer, integer) does not exist"),
-        ("SELECT plus(1, 2)", "function plus(integer, integer) does not exist"),
-        ("SELECT c1.plus(2147483647, 1)", "integer out of range"),
+        ("SELECT c1.plus(1.5, 2)", no_function("c1.plus(numeric, integer)")),
+        ("SELECT c1.plus(1)", no_function("c1.plus(integer)")),
+        ("SELECT c1.plus(1, 2, 3)", no_function("c1.plus(integer, integer, integer)")),
+        ("SELECT plus(1, 2)", no_function("plus(integer, integer)")),
+        ("SELECT c1.plus(2147483647, 1)", "integer out of range".to_string()),
     ] {
         assert_eq!(question(&mut s, sql).unwrap_err(), why, "{sql}");
     }
@@ -461,13 +469,19 @@ fn a_call_gives_its_arguments_by_place_then_by_name_and_the_defaults_fill_the_re
         ["11|3|x5|z1|x2|w3|x4|x1|56|51|76|NULL|k9|3"]
     );
     for (sql, why) in [
-        ("SELECT n.named(c => 1)", "function n.named(c => integer) does not exist"),
-        ("SELECT n.dflt()", "function n.dflt() does not exist"),
-        ("SELECT n.named(b => 'q')", "function n.named(b => unknown) does not exist"),
-        ("SELECT n.named(1, a => 2)", "function n.named(integer, a => integer) does not exist"),
-        ("SELECT n.dflt(a => 1)", "function n.dflt(a => integer) does not exist"),
-        ("SELECT n.named(a => 1, a => 2)", "argument name \"a\" used more than once"),
-        ("SELECT n.named(a => 1, 2)", "positional argument cannot follow named argument"),
+        ("SELECT n.named(c => 1)", no_function("n.named(c => integer)")),
+        ("SELECT n.dflt()", no_function("n.dflt()")),
+        ("SELECT n.named(b => 'q')", no_function("n.named(b => unknown)")),
+        ("SELECT n.named(1, a => 2)", no_function("n.named(integer, a => integer)")),
+        ("SELECT n.dflt(a => 1)", no_function("n.dflt(a => integer)")),
+        (
+            "SELECT n.named(a => 1, a => 2)",
+            "argument name \"a\" used more than once".to_string(),
+        ),
+        (
+            "SELECT n.named(a => 1, 2)",
+            "positional argument cannot follow named argument".to_string(),
+        ),
     ] {
         assert_eq!(question(&mut s, sql).unwrap_err(), why, "{sql}");
     }

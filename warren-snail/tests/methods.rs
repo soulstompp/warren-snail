@@ -597,8 +597,9 @@ fn a_gist_strand_on_a_range_rules_out_a_block_whose_span_its_value_misses() {
 #[test]
 fn a_gist_strand_s_condition_it_cannot_hold_is_refused_never_taken_as_false() {
     let mut s = fresh(&ranges("gist-refused", 4096));
-    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31), along either order and before
-    // any row: no form of the operator takes a value of that type beside an int4range.
+    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31) and 18.6 (28818, 2026-11-11),
+    // along either order and before any row: no form of the operator takes a value of that type
+    // beside an int4range.
     for (q, refused) in [
         (
             "SELECT id FROM s.t WHERE r -|- '[20005,20010)'::int8range",
@@ -627,7 +628,14 @@ fn a_gist_strand_s_condition_it_cannot_hold_is_refused_never_taken_as_false() {
     ] {
         for order in ["t_pkey", "t_r"] {
             let got = s.ask(q, Some(order)).unwrap_err().to_string();
-            assert_eq!(got, format!("operator does not exist: {refused}"), "{q}");
+            assert_eq!(
+                got,
+                format!(
+                    "operator does not exist: {refused}\nHINT:  No operator matches the given name \
+                     and argument types. You might need to add explicit type casts."
+                ),
+                "{q}"
+            );
         }
     }
     // A value that fails as a row is held to it fails the question, as PostgreSQL's does.

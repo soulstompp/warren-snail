@@ -856,6 +856,28 @@ pub(super) fn text_literal(e: &Expr) -> Result<String> {
     }
 }
 
+/// The type of a number written out, or of a literal cast to a number's type, beside a column of a
+/// string type or bytea; none beside any other, or for any other value.
+fn number_beside_string(e: &Expr, ty: ColumnType) -> Option<ColumnType> {
+    if !matches!(
+        ty,
+        ColumnType::Text(_) | ColumnType::Bpchar(_) | ColumnType::Name | ColumnType::Bytes
+    ) {
+        return None;
+    }
+    match e {
+        Expr::Nested(x) => number_beside_string(x, ty),
+        Expr::Cast {
+            expr, data_type, ..
+        } if super::statement::number_datum(expr).is_some() || text_literal(expr).is_ok() => {
+            crate::catalog::held_type(data_type)
+                .ok()
+                .filter(|t| t.is_integer() || t.is_numeric() || t.is_float())
+        }
+        _ => super::statement::number_datum(e).map(|(_, t)| t),
+    }
+}
+
 /// A condition kept to another on the same column as well: the values both keep, and the NULLs
 /// both keep.
 fn merge(conds: &mut Vec<Cond>, c: Cond) {
@@ -2891,6 +2913,7 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
         None => op,
     };
     let lit_left = from.resolve(left).is_err();
+    let written_op = op.clone();
     let (side, s, lit, op) = match from.resolve(left) {
         Ok((side, s)) => (side, s, right, op),
         Err(on_left) => {
@@ -3015,6 +3038,27 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
                     "could not identify an equality operator for type {}",
                     part.pg_name()
                 )));
+            }
+            // A number, or a literal cast to a number's type, beside a string or bytes: no
+            // operator takes the two, as PostgreSQL finds before it reads a value.
+            let compares = matches!(
+                written_op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+            );
+            if let Some(other) = number_beside_string(lit, ty).filter(|_| compares) {
+                let column = super::typed::arg_name(Some(ty));
+                let other = super::typed::arg_name(Some(other));
+                let (l, r) = if lit_left {
+                    (other, column)
+                } else {
+                    (column, other)
+                };
+                return Err(super::typed::no_operator(&l, &written_op.to_string(), &r));
             }
             // A numeric held as its text, by its class's key; a composed value by its key,
             // written as text that sorts as the key does.

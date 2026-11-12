@@ -3741,6 +3741,28 @@ fn query_of(body: SetExpr) -> Query {
     q
 }
 
+/// The names of a set operation's columns, its first arm's; none where that arm returns a star.
+fn result_names(body: &SetExpr) -> Option<Vec<String>> {
+    match body {
+        SetExpr::SetOperation { left, .. } => result_names(left),
+        SetExpr::Query(q) => result_names(&q.body),
+        SetExpr::Select(s) => s
+            .projection
+            .iter()
+            .map(|i| match i {
+                SelectItem::UnnamedExpr(e) => Some(pipeline::default_name(e)),
+                SelectItem::ExprWithAlias { alias, .. } => Some(crate::catalog::ident(alias)),
+                _ => None,
+            })
+            .collect(),
+        SetExpr::Values(v) => v
+            .rows
+            .first()
+            .map(|r| (1..=r.len()).map(|i| format!("column{i}")).collect()),
+        _ => None,
+    }
+}
+
 /// A set operation as steps: each arm a step of its own, the operation one more under `name`;
 /// where it is sorted or limited, the operation under a name of its own, and `name` the step that
 /// sorts and limits it.
@@ -3756,6 +3778,24 @@ fn lift_set(
         let sqlparser::ast::OrderByKind::Expressions(items) = &by.kind else {
             return Err(Error::new(format!("{by} is not read")));
         };
+        // Every item's columns read as PostgreSQL reads them, among the result's alone, its first
+        // arm's names, before any item is refused for being no column of the result.
+        if let Some(names) = result_names(&query.body) {
+            for item in items {
+                let mut read = Vec::new();
+                pipeline::columns_read(&item.expr, &mut read);
+                for (q, n) in read {
+                    if let Some(q) = q {
+                        return Err(Error::new(format!(
+                            "missing FROM-clause entry for table \"{q}\""
+                        )));
+                    }
+                    if !names.contains(&n) {
+                        return Err(Error::new(format!("column \"{n}\" does not exist")));
+                    }
+                }
+            }
+        }
         for item in items {
             let named = match &item.expr {
                 Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
@@ -3764,8 +3804,9 @@ fn lift_set(
             };
             if !named {
                 return Err(Error::new(
-                    "invalid UNION/INTERSECT/EXCEPT ORDER BY clause: only result column names \
-                     can be used, not expressions or functions",
+                    "invalid UNION/INTERSECT/EXCEPT ORDER BY clause\nDETAIL:  Only result column \
+                     names can be used, not expressions or functions.\nHINT:  Add the \
+                     expression/function to every SELECT, or move the UNION into a FROM clause.",
                 ));
             }
         }
@@ -4701,6 +4742,38 @@ fn read_from(
     rows.each_chunk(&mut |c| each(c, order))
 }
 
+/// Whether a subquery holds an aggregate reading only the columns of the query around it, `from`'s
+/// past its own.
+fn aggregate_around(q: &Query, from: &From) -> bool {
+    let around = |a: &Expr| {
+        let mut read = Vec::new();
+        pipeline::columns_read(a, &mut read);
+        !read.is_empty()
+            && read.iter().all(|(q, n)| {
+                pipeline::naming(
+                    from.columns
+                        .iter()
+                        .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+                    q.as_deref(),
+                    n,
+                )
+                .first()
+                .is_some_and(|&i| i >= from.outer_at)
+            })
+    };
+    sqlparser::ast::visit_expressions(q, |e| match e {
+        Expr::Function(f)
+            if f.over.is_none()
+                && pipeline::is_aggregate(&pipeline::function_name(f))
+                && around(e) =>
+        {
+            std::ops::ControlFlow::Break(())
+        }
+        _ => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
 /// One SELECT of the statement, its FROM met as one relation, then read as the pipeline reads it;
 /// a subquery's with the columns of the query around it after its FROM's.
 fn select_step(
@@ -4796,6 +4869,16 @@ fn select_step(
         from.columns.extend(o.columns.iter().cloned());
     }
     let step = &*step;
+    // An aggregate of the query's around a subquery alone is that query's, wherever in the
+    // subquery it stands: refused in PostgreSQL's words where the subquery stands in a clause of
+    // that query no aggregate may stand in.
+    if let Some(clause) = outer.and_then(|o| o.clause) {
+        if aggregate_around(&step.query, &from) {
+            return Err(Error::new(format!(
+                "aggregate functions are not allowed in {clause}"
+            )));
+        }
+    }
     let (plans, mut seeded) =
         super::subqueries::Plans::of(asked, &step.query, &from.columns, made, casings)?;
     let typed = from.typed();

@@ -511,7 +511,7 @@ fn found(called: &str) -> Option<Rc<Own>> {
 }
 
 /// Whether pg_catalog holds a function of the name.
-fn built_in_name(name: &str) -> bool {
+pub(super) fn built_in_name(name: &str) -> bool {
     static NAMES: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
     NAMES
         .get_or_init(|| crate::functions::all().iter().map(|f| f.name).collect())
@@ -603,7 +603,11 @@ fn no_form(called: &str, written: &[(Option<String>, Option<ColumnType>)]) -> Er
             None => super::typed::arg_name(*t),
         })
         .collect();
-    Error::new(format!("function {called}({}) does not exist", shown.join(", ")))
+    Error::new(format!(
+        "function {called}({}) does not exist{}",
+        shown.join(", "),
+        super::typed::NO_FUNCTION
+    ))
 }
 
 /// The type a call of a function of the file's returns, read before any row; none where the call

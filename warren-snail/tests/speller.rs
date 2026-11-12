@@ -1968,7 +1968,12 @@ fn pg_prepared_statements_holds_the_sessions_statements_as_postgresql_shows_them
     }
     assert_eq!(
         refused(&mut w, "SELECT pg_prepared_statement(1)"),
-        (Some("42883"), "function pg_prepared_statement(integer) does not exist".to_string())
+        (
+            Some("42883"),
+            "function pg_prepared_statement(integer) does not exist\nHINT:  No function matches \
+             the given name and argument types. You might need to add explicit type casts."
+                .to_string()
+        )
     );
     // A statement whose types were not settled as PostgreSQL's parse analysis settles them refuses
     // the view while the session holds it, never answered with a guess.

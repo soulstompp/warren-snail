@@ -4657,7 +4657,8 @@ impl Snail {
             return self.declare(ddl);
         }
         let from = newest.catalog_named();
-        let base = format!("{}\n", self.catalog.ddl.trim_end());
+        // Joined to the kept text's last statement ended, as psql ends a file's last statement.
+        let base = format!("{}\n", crate::ddl::ended(&self.catalog.ddl)?.trim_end());
         let text = format!("{base}{ddl};\n");
         let kept = Catalog::statements_in(&self.catalog.ddl)?;
         let (format, root) = (self.reader.format(), &self.root);

@@ -304,9 +304,11 @@ impl<'q> Plans<'q> {
         made: &Steps,
         casings: &Casings,
     ) -> Result<(Plans<'q>, Types)> {
-        // Those read on each group where the step groups, and those read before it groups.
+        // Those read on each group where the step groups, and those read before it groups, each
+        // with the clause it stands in where an aggregate of the step's may not: WHERE, GROUP BY.
         let mut after = Vec::new();
         let mut before = Vec::new();
+        let mut clauses: Vec<Option<&'static str>> = Vec::new();
         if let SetExpr::Select(s) = q.body.as_ref() {
             for item in &s.projection {
                 if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item
@@ -317,28 +319,32 @@ impl<'q> Plans<'q> {
             if let Some(e) = &s.having {
                 on_groups(e, &mut after, &mut before);
             }
+            clauses.resize(before.len(), None);
             if let Some(e) = &s.selection {
                 pipeline::subqueries_in(e, &mut before);
             }
+            clauses.resize(before.len(), Some("WHERE"));
             if let GroupByExpr::Expressions(g, _) = &s.group_by {
                 for e in g {
                     pipeline::subqueries_in(e, &mut before);
                 }
             }
+            clauses.resize(before.len(), Some("GROUP BY"));
         }
         if let Some(OrderByKind::Expressions(os)) = q.order_by.as_ref().map(|o| &o.kind) {
             for o in os {
                 on_groups(&o.expr, &mut after, &mut before);
             }
         }
+        clauses.resize(before.len(), None);
         let mut plans = Plans::default();
         let mut seeded = Types::new();
         let found = after
             .into_iter()
-            .map(|e| (e, true))
-            .chain(before.into_iter().map(|e| (e, false)));
-        for (e, grouped) in found {
-            let plan = Plan::of(asked, e, columns, made, casings, grouped, None)?;
+            .map(|e| (e, true, None))
+            .chain(before.into_iter().zip(clauses).map(|(e, c)| (e, false, c)));
+        for (e, grouped, clause) in found {
+            let plan = Plan::of(asked, e, columns, made, casings, grouped, clause, None)?;
             if let (Asks::Scalar, Some(t)) = (&plan.asks, plan.first) {
                 seeded.insert(e as *const Expr, t);
             }
@@ -366,7 +372,16 @@ impl<'q> Plans<'q> {
         let mut plans = Plans::default();
         let mut seeded = Types::new();
         for e in found {
-            let plan = Plan::of(asked, e, columns, made, casings, sided, Some(unseen))?;
+            let plan = Plan::of(
+                asked,
+                e,
+                columns,
+                made,
+                casings,
+                sided,
+                Some("JOIN conditions"),
+                Some(unseen),
+            )?;
             if let (Asks::Scalar, Some(t)) = (&plan.asks, plan.first) {
                 seeded.insert(e as *const Expr, t);
             }
@@ -389,7 +404,9 @@ impl<'q> Plans<'q> {
 }
 
 impl<'q> Plan<'q> {
-    /// Where `on` holds the relations it cannot reference, it stands in a join's ON.
+    /// `clause` the clause of the step it stands in, where an aggregate of the step's may not; where
+    /// `on` holds the relations it cannot reference, it stands in a join's ON.
+    #[allow(clippy::too_many_arguments)]
     fn of(
         asked: Asked,
         e: &'q Expr,
@@ -397,6 +414,7 @@ impl<'q> Plan<'q> {
         made: &Steps,
         casings: &Casings,
         grouped: bool,
+        clause: Option<&'static str>,
         on: Option<&[String]>,
     ) -> Result<Plan<'q>> {
         let arity = |x: &Expr| match x {
@@ -468,7 +486,7 @@ impl<'q> Plan<'q> {
                 values: vec![Value::Null; columns.len()],
                 columns,
                 kept: &kept,
-                clause: on.map(|_| "JOIN conditions"),
+                clause,
                 unseen: on.map(<[String]>::to_vec).unwrap_or_default(),
             };
             relations::made_by(

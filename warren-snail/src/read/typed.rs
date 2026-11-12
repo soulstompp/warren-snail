@@ -113,15 +113,40 @@ pub(super) fn arg_name(t: Option<ColumnType>) -> String {
     }
 }
 
-/// PostgreSQL's refusal of a call no form of the function takes.
+/// The HINT under PostgreSQL's refusal of a call no function takes.
+pub(super) const NO_FUNCTION: &str = "\nHINT:  No function matches the given name and argument \
+     types. You might need to add explicit type casts.";
+
+/// PostgreSQL's refusal of a call no form of the function takes, the function named as the call
+/// names it.
 pub(super) fn no_form(name: &str, args: &[Option<ColumnType>]) -> Error {
     Error::new(format!(
-        "function {name}({}) does not exist",
+        "function {name}({}) does not exist{NO_FUNCTION}",
         args.iter()
             .map(|t| arg_name(*t))
             .collect::<Vec<_>>()
             .join(", ")
     ))
+}
+
+/// PostgreSQL's refusal of an operator no form of it takes, each side by its type's name.
+pub(super) fn no_operator(left: &str, op: &str, right: &str) -> Error {
+    Error::new(format!(
+        "operator does not exist: {left} {op} {right}\nHINT:  No operator matches the given name \
+         and argument types. You might need to add explicit type casts."
+    ))
+}
+
+/// A refusal of a call no form of a function takes, the function named as the call writes it, in
+/// its schema where it names one; any other refusal as it is.
+fn named_as_written(e: Error, name: &str, written: &str) -> Error {
+    let bare = format!("function {name}(");
+    match e.0.strip_prefix(&bare) {
+        Some(rest) if written != name && e.sqlstate() == Some("42883") => {
+            Error::new(format!("function {written}({rest}"))
+        }
+        _ => e,
+    }
 }
 
 /// The wider of two integers, as PostgreSQL's operators across integer widths return.
@@ -827,117 +852,134 @@ impl Typing<'_> {
                 for a in &args {
                     types.push(self.type_of(a)?);
                 }
-                if WRITING.contains(&name.as_str()) {
-                    for t in &types {
-                        written(*t)?;
+                // A call named in a schema calls a function of that schema: PostgreSQL's own only in
+                // pg_catalog, and there only of a name it defines a function of.
+                let as_written = crate::catalog::object_name(&f.name);
+                if let [sqlparser::ast::ObjectNamePart::Identifier(s), _] = f.name.0.as_slice() {
+                    let built_in = match crate::catalog::ident(s).as_str() {
+                        "pg_catalog" => super::own::built_in_name(&name),
+                        "information_schema" => true,
+                        _ => false,
+                    };
+                    if !built_in && !super::handed::is_handed(f) {
+                        return Err(no_form(&as_written, &types));
                     }
                 }
-                if super::handed::is_handed(f) {
-                    if let Some(t) = super::handed::typed(f, &types)? {
-                        return Ok(Some(t));
+                // Its refusals of no form name the function as the call writes it.
+                let typed = (|| -> Result<Option<ColumnType>> {
+                    if WRITING.contains(&name.as_str()) {
+                        for t in &types {
+                            written(*t)?;
+                        }
                     }
-                }
-                if let Some(t) = super::populate::typed(&name, &types, self.release)? {
-                    return Ok(t);
-                }
-                if f.name.0.len() == 1 && f.over.is_none() {
-                    if let Some(t) = chosen(&name, &args, &types)? {
-                        return Ok(Some(t));
+                    if super::handed::is_handed(f) {
+                        if let Some(t) = super::handed::typed(f, &types)? {
+                            return Ok(Some(t));
+                        }
                     }
-                }
-                if f.over.is_none() && !f.within_group.is_empty() {
-                    let mut within = Vec::with_capacity(f.within_group.len());
-                    for o in &f.within_group {
-                        within.push(self.type_of(&o.expr)?);
+                    if let Some(t) = super::populate::typed(&name, &types, self.release)? {
+                        return Ok(t);
                     }
-                    return ordered_set(&name, &types, &within);
-                }
-                if f.over.is_none() && super::pipeline::is_aggregate(&name) {
-                    return aggregate(&name, &types, f.args_star());
-                }
-                if f.over.is_some() {
-                    return window(&name, &types, f.args_star());
-                }
-                if let Some(t) = super::rest::typed(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = numbers(&name, &types)? {
-                    return Ok(t);
-                }
-                // generate_series names its zone from 16 on; the abbreviations' function is
-                // pg_timezone_abbrevs before 18, and from 18 on the set's and the zone's apart.
-                if name == "generate_series" && types.len() == 4 && self.release < 16 {
-                    return Err(no_form(&name, &types));
-                }
-                let abbreviations = match name.as_str() {
-                    "pg_timezone_abbrevs" => Some(self.release < 18),
-                    "pg_timezone_abbrevs_abbrevs" | "pg_timezone_abbrevs_zone" => {
-                        Some(self.release >= 18)
+                    if f.name.0.len() == 1 && f.over.is_none() {
+                        if let Some(t) = chosen(&name, &args, &types)? {
+                            return Ok(Some(t));
+                        }
                     }
-                    _ => None,
-                };
-                if abbreviations == Some(false) {
-                    return Err(no_form(&name, &types));
-                }
-                if let Some(t) = time(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = super::tsearch::typed(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = super::ranges::typed(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = strings(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = regexps(&name, &types)? {
-                    return Ok(t);
-                }
-                // unnest of a quoted literal or a NULL: an array's, a multirange's and a tsvector's
-                // forms all take it.
-                let literal = |e: &Expr| {
-                    matches!(untyped(e), Some(Some(_)))
-                        || matches!(e, Expr::Value(v) if v.value == SqlValue::Null)
-                };
-                if name == "unnest" && types == [None] && literal(args[0]) {
-                    return Err(Error::new(format!(
-                        "function {name}({}) is not unique",
-                        arg_name(None)
-                    )));
-                }
-                if let Some(t) = arrays(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = super::arrays::typed(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = super::json::typed(&name, &types)? {
-                    return Ok(t);
-                }
-                if let Some(t) = super::updatable::typed(&name) {
-                    return Ok(Some(t));
-                }
-                if let Some(t) = super::sequences::typed(&name) {
-                    return Ok(Some(t));
-                }
-                if let Some(t) = super::prepared::typed(&name, self.release) {
-                    if !types.is_empty() {
+                    if f.over.is_none() && !f.within_group.is_empty() {
+                        let mut within = Vec::with_capacity(f.within_group.len());
+                        for o in &f.within_group {
+                            within.push(self.type_of(&o.expr)?);
+                        }
+                        return ordered_set(&name, &types, &within);
+                    }
+                    if f.over.is_none() && super::pipeline::is_aggregate(&name) {
+                        return aggregate(&name, &types, f.args_star());
+                    }
+                    if f.over.is_some() {
+                        return window(&name, &types, f.args_star());
+                    }
+                    if let Some(t) = super::rest::typed(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = numbers(&name, &types)? {
+                        return Ok(t);
+                    }
+                    // generate_series names its zone from 16 on; the abbreviations' function is
+                    // pg_timezone_abbrevs before 18, and from 18 on the set's and the zone's apart.
+                    if name == "generate_series" && types.len() == 4 && self.release < 16 {
                         return Err(no_form(&name, &types));
                     }
-                    return Ok(Some(t));
-                }
-                if let Some(t) = crate::deparse::typed(&name) {
-                    return Ok(Some(t));
-                }
-                if crate::regs::visibility_kind(&name).is_some() {
-                    return Ok(Some(ColumnType::Boolean));
-                }
-                if name == "obj_description" || name == "col_description" {
-                    return Ok(Some(ColumnType::Text(None)));
-                }
-                crate::functions::refuse_server(&name, self.release)?;
-                None
+                    let abbreviations = match name.as_str() {
+                        "pg_timezone_abbrevs" => Some(self.release < 18),
+                        "pg_timezone_abbrevs_abbrevs" | "pg_timezone_abbrevs_zone" => {
+                            Some(self.release >= 18)
+                        }
+                        _ => None,
+                    };
+                    if abbreviations == Some(false) {
+                        return Err(no_form(&name, &types));
+                    }
+                    if let Some(t) = time(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = super::tsearch::typed(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = super::ranges::typed(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = strings(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = regexps(&name, &types)? {
+                        return Ok(t);
+                    }
+                    // unnest of a quoted literal or a NULL: an array's, a multirange's and a
+                    // tsvector's forms all take it.
+                    let literal = |e: &Expr| {
+                        matches!(untyped(e), Some(Some(_)))
+                            || matches!(e, Expr::Value(v) if v.value == SqlValue::Null)
+                    };
+                    if name == "unnest" && types == [None] && literal(args[0]) {
+                        return Err(Error::new(format!(
+                            "function {name}({}) is not unique",
+                            arg_name(None)
+                        )));
+                    }
+                    if let Some(t) = arrays(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = super::arrays::typed(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = super::json::typed(&name, &types)? {
+                        return Ok(t);
+                    }
+                    if let Some(t) = super::updatable::typed(&name) {
+                        return Ok(Some(t));
+                    }
+                    if let Some(t) = super::sequences::typed(&name) {
+                        return Ok(Some(t));
+                    }
+                    if let Some(t) = super::prepared::typed(&name, self.release) {
+                        if !types.is_empty() {
+                            return Err(no_form(&name, &types));
+                        }
+                        return Ok(Some(t));
+                    }
+                    if let Some(t) = crate::deparse::typed(&name) {
+                        return Ok(Some(t));
+                    }
+                    if crate::regs::visibility_kind(&name).is_some() {
+                        return Ok(Some(ColumnType::Boolean));
+                    }
+                    if name == "obj_description" || name == "col_description" {
+                        return Ok(Some(ColumnType::Text(None)));
+                    }
+                    crate::functions::refuse_server(&name, self.release)?;
+                    Ok(None)
+                })();
+                typed.map_err(|e| named_as_written(e, &name, &as_written))?
             }
             _ => None,
         })
@@ -1807,11 +1849,7 @@ pub(super) fn range_operator(
         _ => false,
     };
     if !fits {
-        return Err(Error::new(format!(
-            "operator does not exist: {} {op} {}",
-            arg_name(a),
-            arg_name(b)
-        )));
+        return Err(no_operator(&arg_name(a), op, &arg_name(b)));
     }
     let comparison = ["=", "<>", "<", "<=", ">", ">="].contains(&op);
     Ok(Some(if truth || comparison {
