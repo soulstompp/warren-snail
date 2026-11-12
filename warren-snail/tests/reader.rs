@@ -3368,3 +3368,330 @@ fn a_view_s_and_a_body_s_labels_are_the_file_s_release_s() {
     let e = c.with_release(19).unwrap_err();
     assert_eq!(e.to_string(), "syntax error at or near \"respect\"");
 }
+
+// A built-in called by its parameters' names, as 18.6's parser reads named and mixed notation:
+// each argument at its parameter's place, those left out their DEFAULTs; refused in its words where
+// no form takes the names, or the call writes one twice or one by place after them.
+#[test]
+fn a_built_in_called_by_its_parameters_names() {
+    let mut w = snail("named-calls");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT random_normal(stddev => 0) AS a, random_normal(mean => 5, stddev => 0) AS \
+                 b, random_normal(stddev => 0, mean => 5) AS c, random_normal(5, stddev => 0) AS d",
+                &["0|5|5|5"],
+            ),
+            ("SELECT setseed(0.5)", &[""]),
+            (
+                "SELECT random_normal(mean => 5) AS a, random_normal(stddev => 2) AS b",
+                &["7.583242670160505|-0.9026841997228229"],
+            ),
+            (
+                "SELECT parse_ident(str => 'a.b') AS a, parse_ident('a.b', strict => false) AS b, \
+                 parse_ident(strict => true, str => 'x') AS c",
+                &["{a,b}|{a,b}|{x}"],
+            ),
+            (
+                "SELECT jsonb_set('{\"a\":1}', '{a}', '2', create_if_missing => false) AS a, \
+                 jsonb_set('{\"a\":1}', '{b}', '2', create_if_missing => false) AS b",
+                &["{\"a\": 2}|{\"a\": 1}"],
+            ),
+            (
+                "SELECT jsonb_path_exists(target => '{\"a\":1}', path => '$.a') AS a, \
+                 jsonb_path_query_first('{\"a\":2}', '$.a', silent => true) AS b",
+                &["t|2"],
+            ),
+            (
+                "SELECT make_interval(days => 1, hours => 2) AS a, make_date(year => 2020, month \
+                 => 1, day => 2) AS b, json_strip_nulls('{\"a\":null,\"b\":1}'::json, \
+                 strip_in_arrays => true) AS c",
+                &["1 day 02:00:00|2020-01-02|{\"b\":1}"],
+            ),
+            (
+                "SELECT id, make_interval(days => id) AS d FROM dn.a WHERE id < 3 ORDER BY id",
+                &["1|1 day", "2|2 days"],
+            ),
+            (
+                "SELECT pg_typeof(random_normal(mean => 5::numeric, stddev => 0)) AS t",
+                &["double precision"],
+            ),
+        ],
+    );
+    let none = |call: &str| {
+        format!(
+            "function {call} does not exist\nHINT:  No function matches the given name and \
+             argument types. You might need to add explicit type casts."
+        )
+    };
+    for (sql, code, words) in [
+        ("SELECT random_normal(foo => 1)", "42883", none("random_normal(foo => integer)")),
+        (
+            "SELECT random_normal(mean => 1, 2)",
+            "42601",
+            "positional argument cannot follow named argument".to_string(),
+        ),
+        (
+            "SELECT random_normal(mean => 1, mean => 2)",
+            "42601",
+            "argument name \"mean\" used more than once".to_string(),
+        ),
+        ("SELECT left(str => 'abc', n => 2)", "42883", none("left(str => unknown, n => integer)")),
+        (
+            "SELECT jsonb_set(jsonb_in => '{}', path => '{a}')",
+            "42883",
+            none("jsonb_set(jsonb_in => unknown, path => unknown)"),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words), "{sql}");
+    }
+}
+
+// SET seed seeds the session's draws as setseed does, LOCAL too, and shows none; it cannot be reset,
+// and a value outside -1 to 1, or none a real reads, is refused in 18.6's words.
+#[test]
+fn set_seed_seeds_the_draws_as_setseed_does() {
+    let mut w = snail("set-seed");
+    let first = "0.9851677175347999";
+    for (sql, want) in [
+        ("SET SEED TO 0.5", None),
+        ("SELECT random() AS a, random() AS b", Some(vec!["0.9851677175347999|0.825301858027981"])),
+        ("SET seed = 0.5", None),
+        ("SELECT random() AS a", Some(vec![first])),
+        ("SET SESSION seed TO -1", None),
+        ("SELECT random() AS a", Some(vec!["0.725656831544149"])),
+        ("SHOW seed", Some(vec!["unavailable"])),
+        ("SELECT current_setting('seed') AS s", Some(vec!["unavailable"])),
+        ("SELECT random() AS a", Some(vec!["0.21342431605981593"])),
+        ("BEGIN", None),
+        ("SET LOCAL seed = 0.5", None),
+        ("SELECT random() AS a", Some(vec![first])),
+        ("COMMIT", None),
+        ("SELECT random() AS a", Some(vec!["0.825301858027981"])),
+        ("SELECT set_config('seed', '0.5', false) AS s", Some(vec!["unavailable"])),
+        ("SELECT random() AS a", Some(vec![first])),
+        ("SET seed = '0.5'", None),
+        ("SELECT random() AS a", Some(vec![first])),
+        ("SET seed = 1e-1", None),
+        ("SELECT random() AS a", Some(vec!["0.7345507212519062"])),
+    ] {
+        match want {
+            Some(want) => assert_eq!(rows(&mut w, sql), want, "{sql}"),
+            None => {
+                w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+        }
+    }
+    refusals(
+        &mut w,
+        &[
+            ("SET seed = 2", "22023", "2 is outside the valid range for parameter \"seed\" (-1 .. 1)"),
+            ("SET seed = 'abc'", "22023", "invalid value for parameter \"seed\": \"abc\""),
+            ("SET seed TO DEFAULT", "0A000", "parameter \"seed\" cannot be reset"),
+            ("RESET seed", "0A000", "parameter \"seed\" cannot be reset"),
+            ("SET seed = 0.5, 0.2", "22023", "SET seed takes only one argument"),
+        ],
+    );
+}
+
+// A reference no relation answers to, refused in 18.6's words on every path: a step's of one table
+// (DISTINCT ON, an aggregate), a FROM's of several, the question path's; a missing column with the
+// HINT naming the column of the relations in reach spelled most like it, two where two tie.
+#[test]
+fn a_missing_relation_or_column_is_refused_in_postgresql_s_words() {
+    let mut w = snail("missing-names");
+    let meant = |words: &str, column: &str| {
+        format!("{words}\nHINT:  Perhaps you meant to reference the column \"{column}\".")
+    };
+    let missing_b = "missing FROM-clause entry for table \"b\"".to_string();
+    for (sql, code, words) in [
+        ("SELECT DISTINCT ON (b.g) b.id FROM dn.a ORDER BY b.g", "42P01", missing_b.clone()),
+        ("SELECT count(b.g) FROM dn.a", "42P01", missing_b.clone()),
+        (
+            "SELECT DISTINCT ON (dn.a.g) dn.a.id FROM dn.a AS a ORDER BY dn.a.g",
+            "42P01",
+            unreachable_entry("a", "a"),
+        ),
+        (
+            "SELECT DISTINCT ON (dn.a.g) dn.a.id FROM dn.a AS x ORDER BY dn.a.g",
+            "42P01",
+            "invalid reference to FROM-clause entry for table \"a\"\nHINT:  Perhaps you meant to \
+             reference the table alias \"x\"."
+                .to_string(),
+        ),
+        (
+            "SELECT DISTINCT ON (g) a.nope FROM dn.a ORDER BY g",
+            "42703",
+            meant("column a.nope does not exist", "a.name"),
+        ),
+        ("SELECT count(a.nam) FROM dn.a", "42703", meant("column a.nam does not exist", "a.name")),
+        (
+            "SELECT DISTINCT ON (g) nam FROM dn.a ORDER BY g",
+            "42703",
+            meant("column \"nam\" does not exist", "a.name"),
+        ),
+        (
+            "SELECT DISTINCT ON (g) zz FROM dn.a ORDER BY g",
+            "42703",
+            "column \"zz\" does not exist".to_string(),
+        ),
+        (
+            "SELECT a.nam FROM dn.a a, (SELECT 1) s",
+            "42703",
+            meant("column a.nam does not exist", "a.name"),
+        ),
+        (
+            "SELECT nam FROM dn.a, (SELECT 1) s",
+            "42703",
+            meant("column \"nam\" does not exist", "a.name"),
+        ),
+        (
+            "SELECT a.idd FROM dn.a a JOIN dn.b b ON a.id = b.id, (SELECT 1) s",
+            "42703",
+            meant("column a.idd does not exist", "a.id"),
+        ),
+        ("SELECT a.nope FROM dn.a a", "42703", meant("column a.nope does not exist", "a.name")),
+        ("SELECT nam FROM dn.a", "42703", meant("column \"nam\" does not exist", "a.name")),
+        ("SELECT dn.a.nope FROM dn.a", "42703", meant("column a.nope does not exist", "a.name")),
+        (
+            "SELECT ids FROM dn.a JOIN dn.b ON true",
+            "42703",
+            "column \"ids\" does not exist\nHINT:  Perhaps you meant to reference the column \
+             \"a.id\" or the column \"b.id\"."
+                .to_string(),
+        ),
+        (
+            "SELECT idd FROM dn.a a JOIN dn.b b ON true JOIN dn.n n ON true",
+            "42703",
+            "column \"idd\" does not exist".to_string(),
+        ),
+        ("SELECT zz FROM dn.a", "42703", "column \"zz\" does not exist".to_string()),
+        ("SELECT b.nam FROM dn.a a", "42P01", missing_b),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words), "{sql}");
+    }
+}
+
+// A column added to a table of no rows, as 18.6 adds it: at its end, with its DEFAULT, NOT NULL and
+// IF NOT EXISTS, several a comma apart; refused in 18.6's words where its name is taken. A table that
+// holds rows keeps its columns (R12's), and a constraint, a serial, an identity or a generation
+// added with the column is refused by name, each the snail's own.
+#[test]
+fn a_column_is_added_to_a_table_of_no_rows() {
+    let mut w = snail("add-column");
+    for sql in [
+        "CREATE TABLE dn.e (id integer NOT NULL, v text, PRIMARY KEY (id))",
+        "ALTER TABLE dn.e ADD COLUMN w integer",
+        "ALTER TABLE dn.e ADD x text DEFAULT 'x' NOT NULL",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let done = w
+        .execute("ALTER TABLE dn.e ADD COLUMN IF NOT EXISTS w integer")
+        .unwrap();
+    assert_eq!(
+        done.notices,
+        ["NOTICE:  column \"w\" of relation \"e\" already exists, skipping"]
+    );
+    for sql in [
+        "INSERT INTO dn.e (id, v, w) VALUES (1, 'a', 10)",
+        "INSERT INTO dn.e VALUES (2, 'b', 20, 'y')",
+        "CREATE TABLE dn.f (id integer NOT NULL, PRIMARY KEY (id))",
+        "ALTER TABLE dn.f ADD COLUMN q integer, ADD r text DEFAULT 'r'",
+        "INSERT INTO dn.f (id) VALUES (1)",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    answered(
+        &mut w,
+        &[
+            ("SELECT * FROM dn.e ORDER BY id", &["1|a|10|x", "2|b|20|y"]),
+            (
+                "SELECT column_name, data_type, column_default, is_nullable FROM \
+                 information_schema.columns WHERE table_schema = 'dn' AND table_name = 'e' ORDER \
+                 BY ordinal_position",
+                &[
+                    "id|integer|NULL|NO",
+                    "v|text|NULL|YES",
+                    "w|integer|NULL|YES",
+                    "x|text|'x'::text|NO",
+                ],
+            ),
+            ("SELECT * FROM dn.f", &["1|NULL|r"]),
+            (
+                "SELECT attname, atttypid::regtype FROM pg_attribute WHERE attrelid = \
+                 'dn.f'::regclass AND attnum > 0 ORDER BY attnum",
+                &["id|integer", "q|integer", "r|text"],
+            ),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[
+            (
+                "ALTER TABLE dn.e ADD COLUMN w integer",
+                "42701",
+                "column \"w\" of relation \"e\" already exists",
+            ),
+            (
+                "ALTER TABLE dn.e ADD COLUMN ctid integer",
+                "42701",
+                "column name \"ctid\" conflicts with a system column name",
+            ),
+        ],
+    );
+    let own = "a constraint, a serial, an identity or a generation added with a column is not read";
+    for (sql, words) in [
+        (
+            "ALTER TABLE dn.a ADD COLUMN z integer",
+            "dn.a: it holds rows, so its columns and orders stay as written".to_string(),
+        ),
+        (
+            "ALTER TABLE dn.f ADD COLUMN p integer UNIQUE",
+            format!("ALTER TABLE dn.f ADD COLUMN p integer UNIQUE: {own}"),
+        ),
+        (
+            "ALTER TABLE dn.f ADD COLUMN s serial",
+            format!("ALTER TABLE dn.f ADD COLUMN s serial: {own}"),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql).1, words, "{sql}");
+    }
+}
+
+// A cast of an aggregate's value or of a column on one table, which the question path holds no
+// level for, is the pipeline's: answered as 18.6 casts it, on a snail open to read alone as on one
+// open to write.
+#[test]
+fn a_cast_the_question_path_reads_no_level_of_is_answered() {
+    let path = tmp("reader-casts.snail");
+    write(&path, &Catalog::parse(DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in ROWS {
+        w.execute(sql).unwrap();
+    }
+    drop(w);
+    let mut r = Snail::open(&path).unwrap();
+    let asked: [(&str, &[&str]); 6] = [
+        ("SELECT count(*)::text FROM dn.a", &["7"]),
+        ("SELECT id::text FROM dn.a ORDER BY id", &["1", "2", "3", "4", "5", "6", "7"]),
+        ("SELECT count(*)::text AS c FROM dn.a WHERE id > 3", &["4"]),
+        ("SELECT (g * 2)::text FROM dn.a WHERE id = 1", &["20"]),
+        ("SELECT sum(g)::numeric(10,2) FROM dn.a", &["90.00"]),
+        ("SELECT max(name)::varchar(3) FROM dn.a", &["two"]),
+    ];
+    for (sql, want) in asked {
+        let (b, _) = r.ask(sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got: Vec<String> = r
+            .text_of(&b)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>().join("|"))
+            .collect();
+        assert_eq!(got, want, "{sql}");
+    }
+    drop(r);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(&mut w, &asked);
+}

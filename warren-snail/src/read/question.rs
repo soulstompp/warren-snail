@@ -1086,6 +1086,33 @@ impl From<'_> {
         &self.catalog.tables[self.tables[side].0]
     }
 
+    /// A missing column's refusal with the HINT PostgreSQL gives it, the column of the question's
+    /// tables spelled most like it; any other refusal as it is.
+    fn hinted(&self, e: &Expr, err: Error) -> Error {
+        let words = err.to_string();
+        if !words.starts_with("column ") || !words.ends_with(" does not exist") {
+            return err;
+        }
+        let (alias, column) = match e {
+            Expr::Identifier(i) => (None, ident(i)),
+            Expr::CompoundIdentifier(p) if p.len() >= 2 => {
+                (Some(ident(&p[p.len() - 2])), ident(&p[p.len() - 1]))
+            }
+            _ => return err,
+        };
+        let relations: Vec<(String, Vec<String>)> = (0..self.tables.len())
+            .map(|s| {
+                let named = self.named(s);
+                let bare = named.rsplit('.').next().unwrap_or(&named).to_string();
+                (bare, self.table(s).columns.iter().map(|c| c.name.clone()).collect())
+            })
+            .collect();
+        match super::hint::column_hint(&relations, alias.as_deref(), &column) {
+            Some(hint) => Error::new(format!("{words}{hint}")),
+            None => err,
+        }
+    }
+
     /// The name a table goes by in the question: its alias, or its own.
     fn named(&self, side: usize) -> String {
         match &self.tables[side].1 {
@@ -1174,7 +1201,10 @@ impl From<'_> {
                 )))
             }
             [one] => Ok(*one),
-            [] => Err(first_error.unwrap_or_else(|| Error::new(format!("{e} reads no table")))),
+            [] => Err(match first_error {
+                Some(err) => self.hinted(e, err),
+                None => Error::new(format!("{e} reads no table")),
+            }),
             many => match self.seen.get() {
                 Some((start, side)) => {
                     let joined: Vec<_> = many
@@ -3286,6 +3316,11 @@ fn op_cond(
     lit_left: bool,
 ) -> Result<Option<OpCond>> {
     use crate::composed::{Composed, Item};
+    // A value the statement draws is no value a strand is read by, as no volatile value is an
+    // index's condition in PostgreSQL.
+    if super::pipeline::draws(lit) {
+        return Ok(None);
+    }
     if let Some(o) = super::elements::element_cond(table, c, op, lit, lit_left)? {
         return Ok(Some(o));
     }
@@ -3481,8 +3516,8 @@ pub(super) fn plane_condition(table: &Table, e: &Expr) -> bool {
         table.columns.iter().position(|c| c.name == name)
     };
     let cond = match (column(left), column(right)) {
-        (Some(c), None) => plane_cond(table, c, op, right, false),
-        (None, Some(c)) => plane_cond(table, c, op, left, true),
+        (Some(c), None) if !super::pipeline::draws(right) => plane_cond(table, c, op, right, false),
+        (None, Some(c)) if !super::pipeline::draws(left) => plane_cond(table, c, op, left, true),
         _ => return false,
     };
     matches!(cond, Ok(Some(_)))

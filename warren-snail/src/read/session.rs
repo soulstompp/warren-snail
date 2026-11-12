@@ -287,10 +287,6 @@ fn parse_setting(tokens: &[sqlparser::tokenizer::Token], release: u8) -> Option<
                     }
                     _ => Some(Err(syntax_at(w.get(i + 2)))),
                 },
-                ("SEED", _) => refused(
-                    "SET SEED",
-                    "the snail seeds random() by setseed() alone",
-                ),
                 _ => {
                     let (name, j) = match setting_name(&w, i, release) {
                         Ok(x) => x,
@@ -760,6 +756,12 @@ impl super::Snail {
             Some(_) if name == "datestyle" => Some(values.unwrap().join(", ")),
             Some(_) => return Err(Error::new(format!("SET {name} takes only one argument"))),
         };
+        // seed seeds the session's draws as setseed does, LOCAL or not, and keeps no value.
+        if name == "seed" {
+            self.drawing
+                .seed(super::settings::seed_value(value.as_deref())?);
+            return Ok(());
+        }
         let taken = super::settings::taken(
             self.catalog.release,
             self.catalog.monetary,

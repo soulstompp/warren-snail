@@ -343,6 +343,10 @@ pub(crate) struct View {
 
 /// SHOW of a setting: its name as PostgreSQL's SHOW names its column, and its value.
 pub(crate) fn shown(view: &View, name: &str) -> Result<(String, String)> {
+    // seed is set and never shown, as PostgreSQL's show_random_seed writes it.
+    if name == "seed" {
+        return Ok(("seed".into(), "unavailable".into()));
+    }
     let release = view.release;
     let unknown = || Error::new(format!("unrecognized configuration parameter \"{name}\""));
     let k = kind(release, name).ok_or_else(unknown)?;
@@ -435,6 +439,11 @@ pub(crate) fn set_config(name: &str, value: Option<&str>, local: bool) -> Option
         let view = v.as_mut()?;
         let lower = name.to_lowercase();
         Some((|| {
+            // seed seeds the session's draws as setseed does, and is never shown.
+            if lower == "seed" {
+                super::prng::seed_lent(seed_value(value)?);
+                return Ok("unavailable".to_string());
+            }
             let t = taken(view.release, view.lc_monetary, view.text_search, &lower, value)?;
             match &t {
                 Taken::Stored(Some(s)) => {
@@ -454,6 +463,29 @@ pub(crate) fn set_config(name: &str, value: Option<&str>, local: bool) -> Option
             }
         })())
     })
+}
+
+/// The value SET gives seed, a real from -1 to 1 as PostgreSQL's `parse_real` reads it; refused
+/// where it gives none, as seed cannot be reset.
+pub(crate) fn seed_value(value: Option<&str>) -> Result<f64> {
+    let Some(v) = value else {
+        return Err(Error::new("parameter \"seed\" cannot be reset"));
+    };
+    let f: f64 = match v.trim().parse() {
+        Ok(f) if !f64::is_nan(f) => f,
+        _ => {
+            return Err(Error::new(format!(
+                "invalid value for parameter \"seed\": \"{v}\""
+            )))
+        }
+    };
+    if !(-1.0..=1.0).contains(&f) {
+        return Err(Error::new(format!(
+            "{} is outside the valid range for parameter \"seed\" (-1 .. 1)",
+            g_format(f)
+        )));
+    }
+    Ok(f)
 }
 
 /// A setting's value as PostgreSQL's SET reads it and SHOW writes it back, or PostgreSQL's words

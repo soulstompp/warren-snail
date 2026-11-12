@@ -132,6 +132,17 @@ impl Drawing {
     pub(super) fn put_back(&self, at: Option<State>) {
         self.0.set(at);
     }
+
+    /// Seeded as setseed seeds it, by SET seed.
+    pub(super) fn seed(&self, f: f64) {
+        self.0.set(Some(State::of_double(f)));
+    }
+}
+
+/// The state lent to the statement under way seeded as setseed seeds it, by set_config('seed', …).
+pub(super) fn seed_lent(f: f64) {
+    let s = State::of_double(f);
+    drawn(|at| *at = s);
 }
 
 thread_local! {

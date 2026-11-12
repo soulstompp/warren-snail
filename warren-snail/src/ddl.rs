@@ -4731,10 +4731,91 @@ impl Draft {
         Ok(Some((table, column)))
     }
 
-    /// ALTER TABLE … ADD [CONSTRAINT n] CHECK (…) [NOT VALID], ADD [CONSTRAINT n] FOREIGN KEY …,
+    /// ALTER TABLE … ADD [COLUMN] a column, ADD [CONSTRAINT n] CHECK (…) [NOT VALID], ADD [CONSTRAINT
+    /// n] FOREIGN KEY …,
     /// VALIDATE CONSTRAINT, and ALTER [COLUMN] … SET DEFAULT or DROP DEFAULT; CLUSTER ON is read
     /// before. Any other form is refused by name.
     fn alter_table(&mut self, tokens: &[Token], object: &str) -> Result<Vec<String>> {
+        self.altered(tokens, object)
+    }
+
+    /// ALTER TABLE … ADD [COLUMN] [IF NOT EXISTS] and a column's definition: read as CREATE TABLE
+    /// reads one, over a copy of the catalog so far, and put at the table's end; a constraint, a
+    /// serial, an identity or a generation written with it refused by name. The table's rows decide whether it is
+    /// laid: a table that holds rows keeps its columns as written (the writer's refusal).
+    fn add_column(
+        &mut self,
+        name: &str,
+        definition: &str,
+        if_not_exists: bool,
+        mut notices: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let relation = bare(name).to_string();
+        let what = format!("ALTER TABLE {name} ADD COLUMN {definition}");
+        let serial = definition.split_whitespace().any(|w| {
+            matches!(
+                w.to_ascii_lowercase().as_str(),
+                "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
+                    | "generated"
+            )
+        });
+        if serial {
+            return Err(Error::new(format!(
+                "{what}: a constraint, a serial, an identity or a generation added with a column \
+                 is not read"
+            )));
+        }
+        let made = format!("{}.\u{7}added", schema_of(name));
+        let text = format!(
+            "CREATE TABLE \"{}\".\"\u{7}added\" ({definition})",
+            schema_of(name)
+        );
+        let tokens = Tokenizer::new(&PostgreSqlDialect {}, &text).tokenize()?;
+        let Some((kept, extras, fks, temporal)) = create_table_extras(&tokens)? else {
+            return Err(Error::new(format!("{what}: its column is not read")));
+        };
+        let mut copy = self.clone();
+        copy.create_table(&kept, extras, fks, &temporal)?;
+        let t = copy
+            .table(&made)
+            .ok_or_else(|| Error::new(format!("{what}: its column is not read")))?;
+        let [col] = t.columns.as_slice() else {
+            return Err(Error::new(format!("{what}: one column is added at a time")));
+        };
+        let beside = t.primary.is_some()
+            || !t.uniques.is_empty()
+            || !t.checks.is_empty()
+            || !t.indexes.is_empty()
+            || !t.foreign_keys.is_empty()
+            || copy.sequences.len() != self.sequences.len()
+            || col.identity.is_some();
+        if beside {
+            return Err(Error::new(format!(
+                "{what}: a constraint, a serial, an identity or a generation added with a column \
+                 is not read"
+            )));
+        }
+        let col = col.clone();
+        let table = self.table_mut(name).expect("the table altered");
+        if table.columns.iter().any(|x| x.name == col.name) {
+            if if_not_exists {
+                notices.push(format!(
+                    "column \"{}\" of relation \"{relation}\" already exists, skipping",
+                    col.name
+                ));
+                return Ok(notices);
+            }
+            return Err(Error::new(format!(
+                "column \"{}\" of relation \"{relation}\" already exists",
+                col.name
+            )));
+        }
+        table.columns.push(col);
+        Ok(notices)
+    }
+
+    /// The forms of ALTER TABLE, as `alter_table` names them.
+    fn altered(&mut self, tokens: &[Token], object: &str) -> Result<Vec<String>> {
         let mut c = Cursor::new(tokens);
         c.kws(&["ALTER", "TABLE"]);
         let if_exists = c.kws(&["IF", "EXISTS"]);
@@ -4822,9 +4903,34 @@ impl Draft {
         }
         if !c.kw("ADD") {
             return Err(Error::new(format!(
-                "ALTER TABLE {object}: only ADD CHECK, ADD FOREIGN KEY, VALIDATE CONSTRAINT, \
-                 CLUSTER ON, and ALTER COLUMN's SET DEFAULT and DROP DEFAULT are read"
+                "ALTER TABLE {object}: only ADD COLUMN, ADD CHECK, ADD FOREIGN KEY, VALIDATE \
+                 CONSTRAINT, CLUSTER ON, and ALTER COLUMN's SET DEFAULT and DROP DEFAULT are read"
             )));
+        }
+        // Columns added, each with COLUMN or with no constraint's word after ADD, one or several a
+        // comma apart.
+        let constraint = |c: &Cursor| {
+            ["CONSTRAINT", "CHECK", "FOREIGN", "PRIMARY", "UNIQUE", "EXCLUDE"]
+                .iter()
+                .any(|k| c.is(k))
+        };
+        if c.is("COLUMN") || !constraint(&c) {
+            c.i -= 1;
+            let mut actions = Vec::new();
+            while !c.done() {
+                actions.push(c.item());
+            }
+            for action in actions {
+                let mut a = Cursor { t: action, i: 0 };
+                if !a.kw("ADD") || !(a.kw("COLUMN") || !constraint(&a)) {
+                    return Err(Error::new(format!(
+                        "ALTER TABLE {object}: an ADD COLUMN beside another action is not read"
+                    )));
+                }
+                let if_not_exists = a.kws(&["IF", "NOT", "EXISTS"]);
+                notices = self.add_column(&name, &a.rest(), if_not_exists, notices)?;
+            }
+            return Ok(notices);
         }
         let at = c.i;
         if let Some(r) = table_key_reference(&mut c, &format!("ALTER TABLE {name}"))? {

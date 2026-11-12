@@ -421,10 +421,14 @@ fn every_point_operator_holds_along_each_strand_of_a_point_and_rules_blocks_out(
             "circle '<(1100,1100),0>'",
         ],
     );
-    // A value a statement draws is no value to rule a block out by.
+    // A value a statement draws is no value to rule a block out by, as 18.6 reads no index by a
+    // volatile value: asked along the strand, the question is read along the table's own order,
+    // every block, and answers as the constant's does.
     let drawn =
         "SELECT id FROM s.t WHERE v <@ box(point(random() * 0 + 1040, 1040), point(1100, 1100))";
-    assert!(s.ask(drawn, Some("t_gist")).is_err());
+    assert_eq!(s.ask(drawn, Some("t_gist")).unwrap().1.order, "t_pkey");
+    let constant = "SELECT id FROM s.t WHERE v <@ box '((1040,1040),(1100,1100))'";
+    assert_eq!(ids(&mut s, drawn, "t_gist"), ids(&mut s, constant, "t_pkey"));
     assert_eq!(
         ids(
             &mut s,

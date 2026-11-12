@@ -1975,6 +1975,13 @@ impl<'q> Computed<'q> {
 }
 
 fn args(f: &sqlparser::ast::Function) -> Result<Vec<&Expr>> {
+    // A built-in called by its parameters' names, its arguments put in their places.
+    if super::named::is_named(f) {
+        let release = crate::deparse::held().map_or(crate::regs::LATEST, |c| c.release);
+        if let Some(args) = super::named::positional(f, release)? {
+            return Ok(args);
+        }
+    }
     match &f.args {
         FunctionArguments::None => Ok(Vec::new()),
         FunctionArguments::List(l) => l
@@ -5477,6 +5484,113 @@ fn typed_from(
     out
 }
 
+/// Each column a step reads of its FROM's, refused before any row in PostgreSQL's words where none
+/// or two answer to it: a qualifier no relation goes by an invalid reference (the alias that hides
+/// the table in a HINT, or the entry found) or a missing entry; a column its relation lacks, with
+/// the HINT naming one spelled alike.
+fn step_names(
+    p: &Prepared,
+    columns: &[super::typed::TypedColumn],
+    items: &[TableWithJoins],
+    typed: &HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)>,
+    table: &str,
+) -> Result<()> {
+    let mut relations: Vec<(String, Vec<String>)> = Vec::new();
+    for (q, n, _) in columns {
+        let name = q.as_deref().map(unmarked).unwrap_or_default().to_string();
+        match relations.iter_mut().find(|(r, _)| *r == name) {
+            Some((_, cs)) => cs.push(n.clone()),
+            None => relations.push((name, vec![n.clone()])),
+        }
+    }
+    let missing = |q: Option<&str>, n: &str| {
+        let relation = q.map(relation_named);
+        let words = match relation {
+            Some(r) => format!("column {r}.{n} does not exist"),
+            None => format!("column \"{n}\" does not exist"),
+        };
+        let hint = super::hint::column_hint(&relations, relation, n).unwrap_or_default();
+        Error::new(format!("{words}{hint}"))
+    };
+    for (q, n) in p.reads() {
+        let found = naming(
+            columns.iter().map(|(q, n, _)| (q.as_deref(), n.as_str())),
+            q.as_deref(),
+            &n,
+        );
+        let Some(q) = q.filter(|_| found.is_empty()) else {
+            match found.len() {
+                // A relation's name alone is its whole row.
+                0 if relations.iter().any(|(r, _)| *r == n) => continue,
+                0 => return Err(missing(None, &n)),
+                1 => continue,
+                _ => return Err(Error::new(format!("column reference \"{n}\" is ambiguous"))),
+            }
+        };
+        if let Some(e) = too_many_names(&q, &n) {
+            return Err(e);
+        }
+        if columns.iter().any(|(c, _, _)| answers_to(c.as_deref(), &q)) {
+            return Err(missing(Some(&q), &n));
+        }
+        return Err(no_entry_of_step(&q, items, typed, table));
+    }
+    Ok(())
+}
+
+/// The refusal of a qualifier no relation of a step's FROM goes by, as `relations.rs`'s
+/// `no_entry` words it.
+fn no_entry_of_step(
+    q: &str,
+    items: &[TableWithJoins],
+    typed: &HashMap<String, (Vec<String>, Vec<Option<ColumnType>>)>,
+    table: &str,
+) -> Error {
+    let relation = relation_named(q);
+    let by_schema = q.strip_prefix(TABLE);
+    let entry = |name: &str| {
+        Error::new(format!(
+            "invalid reference to FROM-clause entry for table \"{relation}\": There is an entry \
+             for table \"{name}\", but it cannot be referenced from this part of the query."
+        ))
+    };
+    let mut goes_by = false;
+    for item in items {
+        for t in std::iter::once(&item.relation).chain(item.joins.iter().map(|j| &j.relation)) {
+            let TableFactor::Table { name, alias, .. } = t else {
+                continue;
+            };
+            let n = crate::catalog::object_name(name);
+            let base = (n == table || table.rsplit('.').next() == Some(n.as_str()))
+                && (!typed.contains_key(&n) || n == table);
+            let bare = n.rsplit('.').next().unwrap_or(&n).to_string();
+            let finds = match by_schema {
+                Some(full) => base && crate::oids::full(table) == full,
+                None if base => crate::catalog::found_by_qualifier(table, q),
+                None => n == q,
+            };
+            let named = alias.as_ref().map(|a| ident(&a.name));
+            match named {
+                Some(a) if finds && a != q && a == relation => return entry(&a),
+                Some(a) if finds && a != q => {
+                    return Error::new(format!(
+                        "invalid reference to FROM-clause entry for table \"{relation}\"\nHINT:  \
+                         Perhaps you meant to reference the table alias \"{a}\"."
+                    ))
+                }
+                _ => {}
+            }
+            goes_by |= by_schema.is_some() && named.unwrap_or(bare) == relation;
+        }
+    }
+    match goes_by {
+        true => entry(relation),
+        false => Error::new(format!(
+            "missing FROM-clause entry for table \"{relation}\""
+        )),
+    }
+}
+
 /// The names a FROM reads the table under: each alias it gives the table, or the table's own.
 fn base_qualifiers(
     items: &[TableWithJoins],
@@ -6644,7 +6758,7 @@ impl<'q> Prepared<'q> {
 
 /// Whether an expression calls a function that moves a sequence or reads what the session drew,
 /// or one that draws a random value or seeds the draws, each volatile in PostgreSQL's catalog.
-fn draws(e: &Expr) -> bool {
+pub(super) fn draws(e: &Expr) -> bool {
     let mut found = false;
     let _ = sqlparser::ast::visit_expressions(e, |x| {
         if let Expr::Function(f) = x {
@@ -8856,6 +8970,9 @@ impl<'q> Stream<'q> {
                 Default::default(),
                 &[],
             )?;
+            if let SetExpr::Select(sel) = query.body.as_ref() {
+                step_names(&p, &columns, &sel.from, &typed, &s.table.name)?;
+            }
             // Its windows fold as the rows come only along the order of the one relation it reads.
             let input = match (streamed.as_slice(), query.body.as_ref()) {
                 ([only], SetExpr::Select(sel))
@@ -9255,9 +9372,9 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
 /// NATURAL, or a RIGHT or FULL JOIN after the first join; it groups by a name its select list gives
 /// or orders by what it does not return; or it calls a function, an aggregate of a column's values
 /// counted, or over each value once, filtered or ordered, or an operator on numbers or on a document,
-/// the question path does not read, or reads a CASE, a subscript, a COLLATE or a parameter; or
-/// calls an aggregate or a window function in WHERE, which the pipeline refuses as PostgreSQL's
-/// parser does.
+/// the question path does not read, or reads a CASE, a subscript, a COLLATE or a parameter, or
+/// returns a cast; or calls an aggregate or a window function in WHERE, which the pipeline refuses
+/// as PostgreSQL's parser does.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
@@ -9324,9 +9441,9 @@ pub fn hands_over(q: &Query) -> bool {
         .collect();
     let returned = exprs.clone();
     let one_table = matches!(s.from.as_slice(), [only] if only.joins.is_empty());
-    if returned
-        .iter()
-        .any(|e| compares_no_constant(e) || is_written_constant(e) || any_or_all(e))
+    if returned.iter().any(|e| {
+        compares_no_constant(e) || is_written_constant(e) || any_or_all(e) || holds_cast(e)
+    })
         || one_table && s.selection.as_ref().is_some_and(compares_no_constant)
         || s.selection
             .iter()
@@ -9398,6 +9515,18 @@ fn stands_constant(e: &Expr) -> bool {
         } => stands_constant(left) || stands_constant(right),
         e => is_written_constant(e),
     }
+}
+
+/// Whether a select list's item holds a cast, which the question path holds a level for only of a
+/// column it reads as one: where it refuses one, of an aggregate's value or of a column it reads as
+/// no level, the pipeline casts it.
+fn holds_cast(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        found |= matches!(x, Expr::Cast { .. });
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    found
 }
 
 /// Whether a select list's item is a constant written out, which the question path holds no level

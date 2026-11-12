@@ -1,0 +1,37 @@
+1177	'{}'::jsonb, false
+1179	'{}'::jsonb, false
+1180	'{}'::jsonb, false
+1268	true
+2023	'{}'::jsonb, false
+2030	'{}'::jsonb, false
+2096	0
+2172	false
+2307	NULL::text
+2739	true
+3261	false
+3262	false
+3305	true
+3436	true, 60
+3464	0, 0, 0, 0, 0, 0, 0.0
+3577	false
+3578	false
+3579	false
+3775	NULL::text
+3779	false, false
+3782	'{}'::text[]
+3783	'{}'::text[]
+3784	'{}'::text[]
+3785	'{}'::text[]
+3786	false, false, false
+3960	false
+3961	false
+4005	'{}'::jsonb, false
+4006	'{}'::jsonb, false
+4007	'{}'::jsonb, false
+4008	'{}'::jsonb, false
+4009	'{}'::jsonb, false
+4350	'NFC'::text
+4351	'NFC'::text
+5054	true, 'use_json_null'::text
+6006	0
+6212	0, 1

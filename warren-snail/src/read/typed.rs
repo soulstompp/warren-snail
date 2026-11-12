@@ -849,7 +849,22 @@ impl Typing<'_> {
                 if let Some(t) = super::own::typed(f, &mut |x| self.type_of(x))? {
                     return Ok(Some(t));
                 }
-                let Some(args) = call_args(f) else {
+                // A built-in called by its parameters' names: its arguments in their places, or
+                // refused where no form takes them.
+                let placed = match super::named::is_named(f) {
+                    true => match super::named::positional(f, self.release)? {
+                        Some(args) => Some(args),
+                        None => {
+                            let mut written = Vec::new();
+                            for a in super::named::written_args(f) {
+                                written.push(self.type_of(a)?);
+                            }
+                            return Err(super::named::no_form(f, &written));
+                        }
+                    },
+                    false => None,
+                };
+                let Some(args) = placed.or_else(|| call_args(f)) else {
                     return Ok(None);
                 };
                 let mut types = Vec::with_capacity(args.len());

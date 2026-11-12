@@ -1622,7 +1622,10 @@ impl From {
             })
             .collect();
         match holding.as_slice() {
-            [] => Error::new(missing),
+            [] => Error::new(format!(
+                "{missing}{}",
+                super::hint::column_hint(&self.in_reach(), q, n).unwrap_or_default()
+            )),
             [l] => Error::new(format!(
                 "{missing}: There is a column named \"{n}\" in table \"{}\", but it cannot be \
                  referenced from this part of the query.{}",
@@ -1644,6 +1647,28 @@ impl From {
                 }
             )),
         }
+    }
+
+    /// The relations in reach of a reference, here and in the queries around it, each by the name
+    /// it goes by with its columns' names, a USING's merged columns and the system columns apart.
+    fn in_reach(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for c in &self.columns {
+            let Some(q) = c.qualifier.as_deref() else {
+                continue;
+            };
+            if q.trim_start_matches(pipeline::OUTER).starts_with(MERGED)
+                || matches!(c.name.as_str(), "ctid" | "tableoid")
+            {
+                continue;
+            }
+            let name = pipeline::unmarked(q);
+            match out.iter_mut().find(|(r, _)| r == name) {
+                Some((_, cs)) => cs.push(c.name.clone()),
+                None => out.push((name.to_string(), vec![c.name.clone()])),
+            }
+        }
+        out
     }
 
     fn typed(&self) -> Vec<TypedColumn> {
