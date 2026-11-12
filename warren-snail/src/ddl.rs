@@ -358,6 +358,23 @@ pub(crate) enum Form {
         if_exists: bool,
         cascade: bool,
     },
+    /// DROP TYPE, or DROP DOMAIN where `domain`.
+    DropTypes {
+        domain: bool,
+        names: Vec<TypeNamed>,
+        if_exists: bool,
+        cascade: bool,
+    },
+}
+
+/// A type a DROP TYPE or DROP DOMAIN names: its words, as a type's name is read; its schema where
+/// the name gives one; and the name as PostgreSQL shows it, its parts unquoted and `[]` where it
+/// names an array.
+#[derive(Clone, Debug)]
+pub(crate) struct TypeNamed {
+    words: String,
+    schema: Option<String>,
+    shown: String,
 }
 
 /// The kind of relation a DROP names: DROP TABLE, VIEW, SEQUENCE or INDEX.
@@ -495,6 +512,11 @@ pub(crate) fn read(tokens: &[Token]) -> Option<Result<Form>> {
     if c.kws(&["DROP", "SCHEMA"]) {
         return Some(drop_schema(&mut c));
     }
+    for (word, domain) in [("TYPE", false), ("DOMAIN", true)] {
+        if c.kws(&["DROP", word]) {
+            return Some(drop_types(&mut c, domain));
+        }
+    }
     if c.kws(&["COMMENT", "ON"]) {
         return Some(comment_on(&mut c));
     }
@@ -605,6 +627,81 @@ fn drop_schema(c: &mut Cursor) -> Result<Form> {
         if_exists,
         cascade,
     })
+}
+
+/// DROP { TYPE | DOMAIN } [IF EXISTS] name [, …] [CASCADE | RESTRICT]: each name a type's, as
+/// PostgreSQL's grammar takes a type name, array bounds and all.
+fn drop_types(c: &mut Cursor, domain: bool) -> Result<Form> {
+    let if_exists = c.kws(&["IF", "EXISTS"]);
+    let last = c.t.len().saturating_sub(1);
+    let cascade = c.t.len() > c.i && Cursor::word_is(c.t.get(last), "CASCADE");
+    let end = match cascade || (c.t.len() > c.i && Cursor::word_is(c.t.get(last), "RESTRICT")) {
+        true => last,
+        false => c.t.len(),
+    };
+    let mut list = Cursor {
+        t: c.t[c.i..end].to_vec(),
+        i: 0,
+    };
+    c.i = c.t.len();
+    let mut names = Vec::new();
+    loop {
+        let item = list.item();
+        if item.is_empty() {
+            return Err(match list.peek() {
+                Some(t) => Error::new(format!("syntax error at or near \"{t}\"")),
+                None => Error::new("syntax error at end of input"),
+            });
+        }
+        names.push(type_named(&item));
+        if list.done() && list.t.last() != Some(&Token::Comma) {
+            break;
+        }
+    }
+    Ok(Form::DropTypes {
+        domain,
+        names,
+        if_exists,
+        cascade,
+    })
+}
+
+/// A type's name as a DROP names it, its schema and its shown form read off a name's parts; any
+/// other spelling, one of the SQL standard's, shown as written.
+fn type_named(item: &[Token]) -> TypeNamed {
+    let words = text(item);
+    let mut c = Cursor {
+        t: item.to_vec(),
+        i: 0,
+    };
+    let mut parts = Vec::new();
+    while let Ok(p) = c.ident() {
+        parts.push(p);
+        if !c.token(Token::Period) {
+            break;
+        }
+    }
+    let mut array = false;
+    while c.token(Token::LBracket) {
+        if matches!(c.peek(), Some(Token::Number(..))) {
+            c.i += 1;
+        }
+        array = c.token(Token::RBracket);
+    }
+    if !c.done() || parts.is_empty() {
+        return TypeNamed {
+            shown: words.clone(),
+            words,
+            schema: None,
+        };
+    }
+    let schema = (parts.len() > 1).then(|| parts[..parts.len() - 1].join("."));
+    let shown = format!("{}{}", parts.join("."), if array { "[]" } else { "" });
+    TypeNamed {
+        words,
+        schema,
+        shown,
+    }
 }
 
 fn end(c: &Cursor, what: &str) -> Result<()> {
@@ -4204,6 +4301,12 @@ impl Draft {
                 if_exists,
                 cascade,
             } => return self.drop_relations(kind, &names, if_exists, cascade),
+            Form::DropTypes {
+                domain,
+                names,
+                if_exists,
+                cascade,
+            } => return self.drop_types(domain, &names, if_exists, cascade),
         }
         Ok(notices)
     }
@@ -4311,6 +4414,53 @@ impl Draft {
                 None => return Err(Error::new(format!("{word} \"{own}\" does not exist"))),
             }
         }
+        self.dropping(&named, cascade, notices)
+    }
+
+    /// DROP TYPE or DROP DOMAIN: each type named, found as a type's name is read (pg_catalog's own
+    /// first, then the file's), a DROP DOMAIN's refused where it is no domain; and under CASCADE
+    /// every object that depends on one, refused under RESTRICT where an object depends on one.
+    /// PostgreSQL's own types, an array and a table's row type are refused as PostgreSQL refuses
+    /// them, by what requires them.
+    fn drop_types(
+        &mut self,
+        domain: bool,
+        names: &[TypeNamed],
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<Vec<String>> {
+        use crate::oids::{full, Object as O};
+        let mut notices = Vec::new();
+        let mut named = Vec::new();
+        let held = crate::oids::named(std::sync::Arc::new(self.oids.clone()));
+        for n in names {
+            if let Some(s) = n.schema.as_deref().filter(|s| !self.schema_stands(s)) {
+                if !if_exists {
+                    return Err(Error::new(format!("schema \"{s}\" does not exist")));
+                }
+                notices.push(format!("schema \"{s}\" does not exist, skipping"));
+                continue;
+            }
+            let oid = match crate::regs::type_oid(&n.words, self.release) {
+                Ok(oid) => oid,
+                Err(e) if e.sqlstate() == Some("42704") => {
+                    if !if_exists {
+                        return Err(Error::new(format!("type \"{}\" does not exist", n.shown)));
+                    }
+                    notices.push(format!("type \"{}\" does not exist, skipping", n.shown));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let is_domain = self.domains.iter().any(|x| {
+                self.oids.of(&O::Type(full(&x.name))) == Some(oid)
+            });
+            if domain && !is_domain {
+                return Err(Error::new(format!("\"{}\" is not a domain", n.shown)));
+            }
+            named.push(crate::deparse::depend::Addr::of(crate::deparse::depend::TYPE, oid));
+        }
+        drop(held);
         self.dropping(&named, cascade, notices)
     }
 
@@ -4514,8 +4664,12 @@ impl Draft {
                     if t.part_of_whole() || whole(d::CLASS, t.addr.oid) {
                         continue;
                     }
+                    let composite = self.types.iter().any(|x| {
+                        full(&x.name) == *n && matches!(x.kind, TypeKind::Composite { .. })
+                    });
                     let what = match self.views.iter().any(|v| full(&v.name) == *n) {
                         true => "view",
+                        false if composite => "composite type",
                         false => "table",
                     };
                     let column = crate::pgcatalog::file_rows(catalog, "pg_attribute")
@@ -4527,9 +4681,13 @@ impl Draft {
                         })
                         .and_then(|r| r.get("attname").cloned().flatten())
                         .unwrap_or_default();
+                    let by = match composite {
+                        true => "an attribute is dropped by ALTER TYPE … DROP ATTRIBUTE",
+                        false => "a column is dropped by ALTER TABLE … DROP COLUMN",
+                    };
                     return Err(Error::new(format!(
-                        "the drop reaches column {column} of {what} {n}, which it leaves: a column \
-                         is dropped by ALTER TABLE … DROP COLUMN, which the snail does not write"
+                        "the drop reaches column {column} of {what} {n}{REACHED}{by}, which the \
+                         snail does not write"
                     )));
                 }
                 (d::CLASS, O::Class(n)) => {
@@ -7744,16 +7902,18 @@ pub(crate) fn set_constraints(tokens: &[Token]) -> Option<Result<(Option<Vec<Str
 }
 
 /// What a declaration locks, as it names it: a relation by its name, every relation of a schema it
-/// drops, or a schema itself.
+/// drops, a schema itself, or a type by the words that name it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Locked {
     Relation(String),
     Schema(String),
     Namespace(String),
+    Type(String),
 }
 
 /// The relations a declaration locks while it runs, in the modes PostgreSQL 18.6 takes: a DROP's,
-/// ACCESS EXCLUSIVE, a DROP SCHEMA's on the schema too; ALTER TABLE's, the strongest its actions
+/// ACCESS EXCLUSIVE, a DROP SCHEMA's on the schema too, a DROP TYPE's or DROP DOMAIN's on each type
+/// it names; ALTER TABLE's, the strongest its actions
 /// take (`AlterTableGetLockLevel`), and SHARE ROW EXCLUSIVE on a table a foreign key references;
 /// CREATE INDEX's table, SHARE, or SHARE UPDATE EXCLUSIVE CONCURRENTLY; ALTER SEQUENCE's, SHARE ROW
 /// EXCLUSIVE; COMMENT ON a relation or its column or constraint, SHARE UPDATE EXCLUSIVE; and a view
@@ -7790,6 +7950,16 @@ pub(crate) fn locked(sql: &str) -> Vec<(Locked, crate::read::tablelock::Mode)> {
         names
     };
     if c.kw("DROP") {
+        for (word, domain) in [("TYPE", false), ("DOMAIN", true)] {
+            if c.kw(word) {
+                if let Ok(Form::DropTypes { names, .. }) = drop_types(&mut c, domain) {
+                    for n in names {
+                        out.push((Locked::Type(n.words), Mode::AccessExclusive));
+                    }
+                }
+                return out;
+            }
+        }
         let schema = c.kw("SCHEMA");
         if !schema && !(c.kw("TABLE") || c.kw("VIEW") || c.kw("SEQUENCE") || c.kw("INDEX")) {
             return out;
@@ -7901,7 +8071,8 @@ pub(crate) fn locked(sql: &str) -> Vec<(Locked, crate::read::tablelock::Mode)> {
 }
 
 /// What a statement declares, where it declares something the catalog holds: CREATE TABLE, INDEX,
-/// SEQUENCE, TYPE, DOMAIN, COLLATION or VIEW, or ALTER TABLE, SEQUENCE, TYPE or DOMAIN.
+/// SEQUENCE, TYPE, DOMAIN, COLLATION, VIEW, FUNCTION or SCHEMA, ALTER TABLE, SEQUENCE, TYPE or
+/// DOMAIN, a DROP of a schema, a relation, a type or a domain, or COMMENT ON.
 pub(crate) fn declares(sql: &str) -> Option<&'static str> {
     let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize().ok()?;
     let (kind, _) = head(&tokens);
@@ -7924,6 +8095,8 @@ pub(crate) fn declares(sql: &str) -> Option<&'static str> {
         "DROP VIEW" => "DROP VIEW",
         "DROP SEQUENCE" => "DROP SEQUENCE",
         "DROP INDEX" => "DROP INDEX",
+        "DROP TYPE" => "DROP TYPE",
+        "DROP DOMAIN" => "DROP DOMAIN",
         "COMMENT ON" => "COMMENT",
         _ => return None,
     })
@@ -7936,6 +8109,18 @@ pub(crate) fn said_by_postgresql(notice: &str) -> bool {
     notice.ends_with(", skipping")
         || notice.starts_with("drop cascades to ")
         || notice.starts_with("using standard form ")
+}
+
+/// Where a DROP's refusal of a column it reaches turns from the relation it names to why.
+const REACHED: &str = ", which it leaves: ";
+
+/// The table a DROP's refusal names where the drop reaches a column of a table it leaves; none for
+/// any other refusal.
+pub(crate) fn reached_table(e: &Error) -> Option<String> {
+    let first = e.0.lines().next()?;
+    let rest = first.strip_prefix("the drop reaches column ")?;
+    let (_, table) = rest.rsplit_once(" of table ")?;
+    Some(table.split_once(REACHED)?.0.to_string())
 }
 
 /// A relation's name as text, as PostgreSQL's regclass reads it: its parts folded unless quoted.

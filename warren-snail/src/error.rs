@@ -288,6 +288,8 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("schema \"", "\" does not exist"), "3F000"),
     (Words::Is("no schema has been selected to create in"), "3F000"),
     (Words::Holds("type \"", "\" does not exist"), "42704"),
+    (Words::Holds("\"", "\" is not a domain"), "42809"),
+    (Words::Is("referenced type was concurrently dropped"), "42704"),
     (Words::Holds("collation \"", "\" does not exist"), "42704"),
     (Words::Holds("text search parser \"", "\" does not exist"), "42704"),
     (Words::Holds("cannot call ", " on a non-array"), "22023"),

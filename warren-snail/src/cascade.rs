@@ -89,6 +89,27 @@ fn deps(catalog: &Catalog) -> Result<Vec<Dep>> {
         .collect())
 }
 
+/// The types the rows of pg_depend `after` holds and `before` does not depend on, each OID once:
+/// those a dependency a declaration records names.
+pub(crate) fn types_newly_depended_on(before: &Catalog, after: &Catalog) -> Result<Vec<u32>> {
+    let rows = |c: &Catalog| -> Result<Vec<Dep>> {
+        let _named = crate::oids::named(c.oids.clone());
+        deps(c)
+    };
+    let key = |x: &Dep| {
+        let (o, n) = (x.obj, x.on);
+        (o.class, o.oid, o.sub, n.class, n.oid, n.sub, x.kind)
+    };
+    let was: std::collections::HashSet<_> = rows(before)?.iter().map(key).collect();
+    let mut out: Vec<u32> = Vec::new();
+    for x in rows(after)? {
+        if x.on.class == d::TYPE && !was.contains(&key(&x)) && !out.contains(&x.on.oid) {
+            out.push(x.on.oid);
+        }
+    }
+    Ok(out)
+}
+
 /// As `object_address_comparator`: OID falling, then the catalog, then the column.
 fn visiting_order(a: &Addr, b: &Addr) -> std::cmp::Ordering {
     b.oid
@@ -185,7 +206,9 @@ impl Walk<'_> {
         }
         if let Some(o) = owner {
             let (it, by) = (self.words.of(object), self.words.of(o));
-            return Err(Error::new(format!("cannot drop {it} because {by} requires it")));
+            return Err(Error::new(format!(
+                "cannot drop {it} because {by} requires it\nHINT:  You can drop {by} instead."
+            )));
         }
         let mut dependents: Vec<(Addr, u32)> = self
             .of
@@ -243,7 +266,7 @@ fn stack_add(object: Addr, flags: u32, stack: &mut [(Addr, u32)]) -> bool {
 
 /// What a DROP of `named` takes, as `performMultipleDeletions` finds it, and what it says: refused
 /// under RESTRICT where any object is reached by a normal dependency, in PostgreSQL's words with
-/// its DETAIL after a colon.
+/// its DETAIL after a colon and its HINT.
 pub(crate) fn dropped(catalog: &Catalog, named: &[Addr], cascade: bool) -> Result<Dropped> {
     let _named = crate::oids::named(catalog.oids.clone());
     let words = Words::of_file(catalog);
@@ -299,7 +322,9 @@ pub(crate) fn dropped(catalog: &Catalog, named: &[Addr], cascade: bool) -> Resul
             ),
             _ => "cannot drop desired object(s) because other objects depend on them".to_string(),
         };
-        return Err(Error::new(format!("{what}: {detail}")));
+        return Err(Error::new(format!(
+            "{what}: {detail}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too."
+        )));
     }
     let notice = match lines.len() {
         0 => None,

@@ -177,6 +177,9 @@ pub(super) struct Declared {
     relations: Vec<String>,
     /// The schemas it made, by name, as no other writer names them until it commits.
     schemas: Vec<String>,
+    /// The types and domains it made, by their names schema-qualified, as no other writer names
+    /// them until it commits.
+    types: Vec<String>,
 }
 
 impl Declared {
@@ -188,6 +191,11 @@ impl Declared {
     /// Whether it made the schema of that name.
     pub(super) fn made_schema(&self, name: &str) -> bool {
         self.schemas.iter().any(|s| s == name)
+    }
+
+    /// Whether it made the type or domain of that name, schema-qualified.
+    pub(super) fn made_type(&self, name: &str) -> bool {
+        self.types.iter().any(|t| t == name)
     }
 
     /// The catalog as committed it declared on.
@@ -4701,6 +4709,13 @@ impl Snail {
     /// A declaration: the catalog read again with the statement after its DDL, each order it makes
     /// or changes laid out, each a DROP takes out let go. Returns what PostgreSQL says of it.
     fn declare(&mut self, ddl: &str) -> Result<Vec<String>> {
+        self.declare_after(ddl, &[])
+    }
+
+    /// A declaration, as `declare`, begun again after waiting for another writer's lock on each
+    /// type of `waited` its new objects depend on: refused, as PostgreSQL refuses it once it holds
+    /// the lock, where that writer's end took one out.
+    fn declare_after(&mut self, ddl: &str, waited: &[String]) -> Result<Vec<String>> {
         // Its names are looked up, and its relations made, on the catalog as committed now: where
         // another writer's commit moved it past the catalog the transaction declares on, the
         // transaction's own statements are declared again on it first.
@@ -4714,10 +4729,18 @@ impl Snail {
         if let Some(committed) = self.committed_ddl(&newest, from, own)? {
             self.lay_over(committed)?;
         }
+        let stands = |n: &String| {
+            let full = crate::oids::full;
+            self.catalog.types.iter().any(|t| full(&t.name) == *n)
+                || self.catalog.domains.iter().any(|d| full(&d.name) == *n)
+        };
+        if !waited.iter().all(stands) {
+            return Err(Error::new("referenced type was concurrently dropped"));
+        }
         // The relations it changes are locked in PostgreSQL's modes; where it waited for another
         // writer's, it begins again on the catalog that writer's end leaves.
         if self.ddl_locked(ddl)? {
-            return self.declare(ddl);
+            return self.declare_after(ddl, waited);
         }
         let from = newest.catalog_named();
         // Joined to the kept text's last statement ended, as psql ends a file's last statement.
@@ -4738,18 +4761,27 @@ impl Snail {
             .strip_prefix(base.as_str())
             .ok_or_else(|| Error::new("the catalog's text moved as its last statement was read"))?
             .to_string();
-        let (mut catalog, said) = Catalog::parse_declared(&text, kept)?;
+        let (mut catalog, said) = match Catalog::parse_declared(&text, kept) {
+            Ok(read) => read,
+            Err(e) => return Err(self.reached_holding_rows(e, &newest)?),
+        };
         prepared(&mut catalog)?;
         // The relations it reads are locked as PostgreSQL's parse analysis locks them; where it
         // waited for another writer's, it begins again on the catalog that writer's end leaves.
         if self.reads_locked(&catalog)? {
-            return self.declare(ddl);
+            return self.declare_after(ddl, waited);
+        }
+        // The types it takes out, and those its new objects depend on, likewise.
+        if let Some(read) = self.types_locked(&catalog)? {
+            let mut waited = waited.to_vec();
+            waited.extend(read);
+            return self.declare_after(ddl, &waited);
         }
         // A name another writer is making and has not committed is waited for; where its end
         // leaves the name standing, refused there, and else the declaration begins again on the
         // catalog its end leaves.
         if self.names_taken(&catalog, from)? {
-            return self.declare(ddl);
+            return self.declare_after(ddl, waited);
         }
         let mut made: Vec<(String, String)> = Vec::new();
         let mut kept: Vec<(String, String)> = Vec::new();
@@ -4932,6 +4964,15 @@ impl Snail {
                 .collect()
         };
         let (had, has) = (schemas(&self.catalog), schemas(&catalog));
+        // The types and domains it made, and those it dropped.
+        let types = |c: &Catalog| -> Vec<String> {
+            c.types
+                .iter()
+                .map(|t| crate::oids::full(&t.name))
+                .chain(c.domains.iter().map(|d| crate::oids::full(&d.name)))
+                .collect()
+        };
+        let (typed, types_now) = (types(&self.catalog), types(&catalog));
         self.renumbered(&catalog);
         self.sequences_redeclared(&catalog);
         self.catalog = catalog;
@@ -4944,6 +4985,7 @@ impl Snail {
             taken_out: Vec::new(),
             relations: Vec::new(),
             schemas: Vec::new(),
+            types: Vec::new(),
         });
         for r in resets {
             if !d.resets.contains(&r) {
@@ -4955,6 +4997,8 @@ impl Snail {
             .extend(after.into_iter().filter(|r| !before.contains(r)));
         d.schemas.retain(|s| has.contains(s));
         d.schemas.extend(has.into_iter().filter(|s| !had.contains(s)));
+        d.types.retain(|t| types_now.contains(t));
+        d.types.extend(types_now.into_iter().filter(|t| !typed.contains(t)));
         d.from = from;
         d.ddl = text;
         d.own.push_str(&stated);
@@ -5304,6 +5348,26 @@ impl Snail {
     /// Whether any order of a table holds a live row, as the round reads the file.
     fn holds_rows(&self, table: &Table) -> Result<bool> {
         self.orders_hold_rows(&self.root, &table.name)
+    }
+
+    /// A declaration's refusal, as the catalog gave it; where a drop reaches a column of a table
+    /// that holds rows, refused as any change to such a table's columns is.
+    fn reached_holding_rows(&self, e: Error, newest: &Root) -> Result<Error> {
+        let Some(name) = crate::ddl::reached_table(&e) else {
+            return Ok(e);
+        };
+        let table = self
+            .catalog
+            .tables
+            .iter()
+            .find(|t| crate::oids::full(&t.name) == name);
+        match table {
+            Some(t) if self.holds_rows_now(t, newest)? => Ok(Error::new(format!(
+                "{}: it holds rows, so its columns and orders stay as written",
+                t.name
+            ))),
+            _ => Ok(e),
+        }
     }
 
     /// Whether any order of a table holds a live row, as the round reads the file or as `newest`

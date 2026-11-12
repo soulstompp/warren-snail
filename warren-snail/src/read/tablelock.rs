@@ -141,6 +141,81 @@ impl Snail {
         self.declared.as_ref().is_some_and(|d| d.made_relation(name))
     }
 
+    /// The key a type's locks are taken by, and its name: the OID the file gave it, an array's its
+    /// type's. None for a type the words name nowhere in the file, PostgreSQL's own, or one the
+    /// transaction made, which no other writer names until it commits.
+    fn type_key(&self, words: &str) -> Option<(u64, String)> {
+        use crate::oids::Object as O;
+        let oid = {
+            let _named = crate::oids::named(self.catalog.oids.clone());
+            crate::regs::type_oid(words, self.catalog.release).ok()?
+        };
+        let name = match self.catalog.oids.object(oid)? {
+            O::Type(n) | O::Array(n) => n.clone(),
+            _ => return None,
+        };
+        if self.declared.as_ref().is_some_and(|d| d.made_type(&name)) {
+            return None;
+        }
+        let key = self.catalog.oids.of(&O::Type(name.clone()))?;
+        Some((u64::from(key), name))
+    }
+
+    /// Locks the types a declaration takes out, ACCESS EXCLUSIVE, and those an object new in
+    /// `catalog` depends on, ACCESS SHARE, held to the transaction's end, as PostgreSQL locks each
+    /// type a DROP takes and each a new dependency is recorded on: by the type's OID, an array by
+    /// its type's; a type the transaction made, which no other writer names until it commits, not
+    /// at all. None where it waited for no other writer; else the types it waited for to read,
+    /// which that writer's end may have taken out.
+    pub(super) fn types_locked(
+        &mut self,
+        catalog: &crate::catalog::Catalog,
+    ) -> Result<Option<Vec<String>>> {
+        use crate::oids::{full, Object as O};
+        let own: Vec<String> = self
+            .catalog
+            .types
+            .iter()
+            .map(|t| full(&t.name))
+            .chain(self.catalog.domains.iter().map(|d| full(&d.name)))
+            .filter(|n| !self.declared.as_ref().is_some_and(|d| d.made_type(n)))
+            .collect();
+        if own.is_empty() || self.writer.is_none() {
+            return Ok(None);
+        }
+        let stands = |n: &String| {
+            catalog.types.iter().any(|t| full(&t.name) == *n)
+                || catalog.domains.iter().any(|d| full(&d.name) == *n)
+        };
+        let mut wanted: Vec<(String, Mode)> = own
+            .iter()
+            .filter(|n| !stands(n))
+            .map(|n| (n.clone(), AccessExclusive))
+            .collect();
+        for oid in crate::cascade::types_newly_depended_on(&self.catalog, catalog)? {
+            let name = match catalog.oids.object(oid) {
+                Some(O::Type(n) | O::Array(n)) => n.clone(),
+                _ => continue,
+            };
+            if own.contains(&name) && !wanted.iter().any(|(w, _)| *w == name) {
+                wanted.push((name, AccessShare));
+            }
+        }
+        let (mut waited, mut read) = (false, Vec::new());
+        for (name, mode) in wanted {
+            let Some(oid) = self.catalog.oids.of(&O::Type(name.clone())) else {
+                continue;
+            };
+            if self.lock_relation(u64::from(oid), &name, mode, false)? {
+                waited = true;
+                if mode == AccessShare {
+                    read.push(name);
+                }
+            }
+        }
+        Ok(waited.then_some(read))
+    }
+
     /// Takes a table's lock in `mode`, held to the transaction's end, waiting while another writer
     /// holds one that conflicts, as long as it takes, unless the writers waiting make a ring; with
     /// `nowait`, refused at once in PostgreSQL's words. Returns whether it waited.
@@ -241,7 +316,8 @@ impl Snail {
 
     /// Locks the relations a declaration changes, each in the mode PostgreSQL takes for it
     /// (`ddl::locked`), held to the transaction's end: each named on the catalog the transaction
-    /// declares on, an index by its table, a schema by itself and every relation in it, and a name
+    /// declares on, an index by its table, a schema by itself and every relation in it, a type by
+    /// its OID (`type_key`), and a name
     /// no relation holds not at all, the declaration refusing it in PostgreSQL's words. Returns
     /// whether it waited for another writer's.
     pub(super) fn ddl_locked(&mut self, ddl: &str) -> Result<bool> {
@@ -358,6 +434,13 @@ impl Snail {
                     };
                     if let Some(oid) = oid.filter(|_| !made) {
                         keys.push((u64::from(oid), s.clone(), mode));
+                    }
+                    continue;
+                }
+                // A type by its OID, as `type_key` finds it.
+                Locked::Type(words) => {
+                    if let Some((key, name)) = self.type_key(words) {
+                        keys.push((key, name, mode));
                     }
                     continue;
                 }

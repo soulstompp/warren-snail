@@ -1066,6 +1066,9 @@ fn said(w: &mut Snail, sql: &str) -> Vec<String> {
     w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).notices
 }
 
+/// The HINT 18.6 gives under a DROP refused for what depends on what it drops.
+const CASCADE: &str = "\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.";
+
 #[test]
 fn a_name_in_a_schema_no_statement_made_is_refused_but_in_a_files_kept_statements() {
     let mut w = snail("unmade");
@@ -1142,23 +1145,26 @@ fn a_schema_is_made_and_dropped_with_what_depends_on_it() {
     run(&mut w, "CREATE SCHEMA b");
     run(&mut w, "CREATE VIEW b.v AS SELECT id FROM a.t");
     run(&mut w, "CREATE VIEW b.w AS SELECT id FROM b.v");
-    // Each answer as 18.6 gives it, its DETAIL after a colon.
+    // Each answer as 18.6 gives it, its DETAIL after a colon and its HINT on a line of its own.
     assert_eq!(
         refused(&mut w, "DROP SCHEMA a"),
         (
             Some("2BP01"),
-            "cannot drop schema a because other objects depend on it: table a.t depends on schema \
-             a\nview b.v depends on table a.t\nview b.w depends on view b.v"
-                .into()
+            format!(
+                "cannot drop schema a because other objects depend on it: table a.t depends on \
+                 schema a\nview b.v depends on table a.t\nview b.w depends on view b.v{CASCADE}"
+            )
         )
     );
     assert_eq!(
         refused(&mut w, "DROP SCHEMA a, b"),
         (
             Some("2BP01"),
-            "cannot drop desired object(s) because other objects depend on them: table a.t \
-             depends on schema a\nview b.v depends on table a.t\nview b.w depends on view b.v"
-                .into()
+            format!(
+                "cannot drop desired object(s) because other objects depend on them: table a.t \
+                 depends on schema a\nview b.v depends on table a.t\nview b.w depends on view \
+                 b.v{CASCADE}"
+            )
         )
     );
     assert_eq!(
@@ -1278,24 +1284,29 @@ fn a_function_a_key_and_an_identity_are_dropped_as_postgresql_drops_them() {
         refused(&mut w, "DROP SCHEMA f"),
         (
             Some("2BP01"),
-            "cannot drop schema f because other objects depend on it: function f.g(integer) \
-             depends on schema f\nconstraint k_k_check on table k depends on function \
-             f.g(integer)\ntable f.r depends on schema f"
-                .into()
+            format!(
+                "cannot drop schema f because other objects depend on it: function f.g(integer) \
+                 depends on schema f\nconstraint k_k_check on table k depends on function \
+                 f.g(integer)\ntable f.r depends on schema f{CASCADE}"
+            )
         )
     );
     assert_eq!(
         refused(&mut w, "DROP INDEX f.r_pkey"),
         (
             Some("2BP01"),
-            "cannot drop index f.r_pkey because constraint r_pkey on table f.r requires it".into()
+            "cannot drop index f.r_pkey because constraint r_pkey on table f.r requires it\nHINT:  \
+             You can drop constraint r_pkey on table f.r instead."
+                .into()
         )
     );
     assert_eq!(
         refused(&mut w, "DROP SEQUENCE f.r_id_seq"),
         (
             Some("2BP01"),
-            "cannot drop sequence f.r_id_seq because column id of table f.r requires it".into()
+            "cannot drop sequence f.r_id_seq because column id of table f.r requires it\nHINT:  \
+             You can drop column id of table f.r instead."
+                .into()
         )
     );
     assert_eq!(
@@ -1329,6 +1340,173 @@ fn a_function_a_key_and_an_identity_are_dropped_as_postgresql_drops_them() {
     let ddl = w.catalog.ddl_of("k").unwrap();
     let read = Catalog::parse(&ddl).unwrap();
     assert!(read.table("k").is_some_and(|t| t.checks.is_empty()));
+}
+
+#[test]
+fn a_type_and_a_domain_are_dropped_as_postgresql_drops_them() {
+    let mut w = snail("dropped-types");
+    for sql in [
+        "CREATE TYPE s.mood AS ENUM ('sad', 'happy')",
+        "CREATE TYPE mood AS ENUM ('a')",
+        "CREATE DOMAIN pos AS integer CHECK (VALUE > 0)",
+        "CREATE TYPE pair AS (a integer, b text)",
+        "CREATE TYPE fr AS RANGE (subtype = float8)",
+        "CREATE TABLE t (id integer PRIMARY KEY, m mood)",
+        "CREATE TABLE u (id integer PRIMARY KEY, p pos, ms mood[])",
+        "CREATE DOMAIN dm AS mood",
+        "CREATE FUNCTION f(mood) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        "CREATE TYPE pairm AS (m mood)",
+        "CREATE VIEW v AS SELECT 'a'::mood AS m",
+    ] {
+        run(&mut w, sql);
+    }
+    let mood = format!(
+        "cannot drop type mood because other objects depend on it: column ms of table u depends \
+         on type mood[]\ncolumn m of table t depends on type mood\ntype dm depends on type \
+         mood\nfunction f(mood) depends on type mood\ncolumn m of composite type pairm depends \
+         on type mood\nview v depends on type mood{CASCADE}"
+    );
+    // Each refusal as 18.6 gives it: what is not there, PostgreSQL's own types, an array, a
+    // multirange and a table's row type by what requires each, and what depends on a type.
+    for (sql, code, words) in [
+        ("DROP TYPE nosuch", "42704", "type \"nosuch\" does not exist".to_string()),
+        ("DROP TYPE nos.x", "3F000", "schema \"nos\" does not exist".into()),
+        ("DROP TYPE nosuch[]", "42704", "type \"nosuch[]\" does not exist".into()),
+        (
+            "DROP TYPE integer",
+            "2BP01",
+            "cannot drop type integer because it is required by the database system".into(),
+        ),
+        (
+            "DROP TYPE int4[]",
+            "2BP01",
+            "cannot drop type integer[] because it is required by the database system".into(),
+        ),
+        (
+            "DROP TYPE pg_catalog.text",
+            "2BP01",
+            "cannot drop type text because it is required by the database system".into(),
+        ),
+        (
+            "DROP TYPE t",
+            "2BP01",
+            "cannot drop type t because table t requires it\nHINT:  You can drop table t instead."
+                .into(),
+        ),
+        (
+            "DROP TYPE mood[]",
+            "2BP01",
+            "cannot drop type mood[] because type mood requires it\nHINT:  You can drop type \
+             mood instead."
+                .into(),
+        ),
+        (
+            "DROP TYPE fr_multirange",
+            "2BP01",
+            "cannot drop type fr_multirange because type fr requires it\nHINT:  You can drop \
+             type fr instead."
+                .into(),
+        ),
+        ("DROP DOMAIN mood", "42809", "\"mood\" is not a domain".into()),
+        ("DROP DOMAIN nosuch", "42704", "type \"nosuch\" does not exist".into()),
+        ("DROP DOMAIN IF EXISTS pair", "42809", "\"pair\" is not a domain".into()),
+        ("DROP TYPE mood", "2BP01", mood.clone()),
+        ("DROP TYPE mood RESTRICT", "2BP01", mood),
+        (
+            "DROP TYPE pos",
+            "2BP01",
+            format!(
+                "cannot drop type pos because other objects depend on it: column p of table u \
+                 depends on type pos{CASCADE}"
+            ),
+        ),
+        ("DROP TYPE pair, nosuch", "42704", "type \"nosuch\" does not exist".into()),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words), "{sql}");
+    }
+    for (sql, notice) in [
+        ("DROP TYPE IF EXISTS nosuch", "type \"nosuch\" does not exist, skipping"),
+        ("DROP TYPE IF EXISTS nos.x", "schema \"nos\" does not exist, skipping"),
+        ("DROP TYPE IF EXISTS nosuch[]", "type \"nosuch[]\" does not exist, skipping"),
+        ("DROP DOMAIN IF EXISTS nosuch", "type \"nosuch\" does not exist, skipping"),
+    ] {
+        assert_eq!(said(&mut w, sql), [format!("NOTICE:  {notice}")], "{sql}");
+    }
+    // A list refused at a name not there drops none of it; with IF EXISTS the rest goes, its
+    // array with it, and its OID with it for good.
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_type WHERE typname = 'pair'"), ["1"]);
+    let oid = |w: &mut Snail| -> u32 { rows(w, "SELECT 'pair'::regtype::oid")[0].parse().unwrap() };
+    let pair = oid(&mut w);
+    assert_eq!(
+        said(&mut w, "DROP TYPE IF EXISTS pair, nosuch"),
+        ["NOTICE:  type \"nosuch\" does not exist, skipping"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT count(*) FROM pg_type WHERE typname IN ('pair', '_pair')"),
+        ["0"]
+    );
+    run(&mut w, "CREATE TYPE pair AS (a integer, b text)");
+    assert!(oid(&mut w) > pair);
+    // A range goes with its multirange; a domain over one that goes with it under CASCADE.
+    run(&mut w, "DROP TYPE fr");
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_type WHERE typname LIKE '%fr%'"), ["0"]);
+    run(&mut w, "DROP TYPE s.mood");
+    run(&mut w, "DROP DOMAIN dm");
+    run(&mut w, "DROP TYPE pairm");
+    run(&mut w, "CREATE DOMAIN d2 AS integer");
+    run(&mut w, "CREATE DOMAIN d3 AS d2");
+    assert_eq!(
+        refused(&mut w, "DROP DOMAIN d2"),
+        (
+            Some("2BP01"),
+            format!(
+                "cannot drop type d2 because other objects depend on it: type d3 depends on type \
+                 d2{CASCADE}"
+            )
+        )
+    );
+    assert_eq!(said(&mut w, "DROP DOMAIN d2 CASCADE"), ["NOTICE:  drop cascades to type d3"]);
+    assert_eq!(
+        rows(&mut w, "SELECT count(*) FROM pg_type WHERE typname IN ('d2', 'd3')"),
+        ["0"]
+    );
+    // A cascade that reaches a column of a table it leaves: refused as a change to the columns
+    // of a table holding rows, and by name over an empty one, whose column the snail cannot drop.
+    for sql in [
+        "CREATE TYPE e4 AS ENUM ('x')",
+        "CREATE TABLE w4 (id integer PRIMARY KEY, e e4 DEFAULT 'x')",
+        "CREATE TYPE e5 AS ENUM ('x')",
+        "CREATE TABLE w5 (id integer PRIMARY KEY, e e5 CHECK (e = 'x'))",
+        "INSERT INTO w5 (id, e) VALUES (1, 'x')",
+    ] {
+        run(&mut w, sql);
+    }
+    for (t, e) in [("w4", "e4"), ("w5", "e5")] {
+        assert_eq!(
+            refused(&mut w, &format!("DROP TYPE {e}")),
+            (
+                Some("2BP01"),
+                format!(
+                    "cannot drop type {e} because other objects depend on it: column e of table \
+                     {t} depends on type {e}{CASCADE}"
+                )
+            )
+        );
+    }
+    assert!(refused(&mut w, "DROP TYPE e4 CASCADE")
+        .1
+        .starts_with("the drop reaches column e of table public.w4, which it leaves: a column is"));
+    assert_eq!(
+        refused(&mut w, "DROP TYPE e5 CASCADE").1,
+        "w5: it holds rows, so its columns and orders stay as written"
+    );
+    // A DDL that drops a type reads to the catalog as it stands.
+    let read = Catalog::parse(&w.catalog.ddl_of("w4").unwrap()).unwrap();
+    let types: Vec<&str> = read.types.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        types.contains(&"pair") && !types.contains(&"fr") && !types.contains(&"s.mood"),
+        "{types:?}"
+    );
 }
 
 #[test]

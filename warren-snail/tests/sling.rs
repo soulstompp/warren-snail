@@ -17,10 +17,12 @@
 //! and DDL in a transaction naming and making
 //! against the catalog as committed, at each level, a name another committed since refused in its
 //! kind's words, one dropped since made again, DDL over a table made since reading none of its rows,
-//! and writers of different names both committing. Every answer and refusal is 18.6's over the same
-//! statements (`session.nu --suite sling`, and `sessions.nu --only serializable` for the writers,
-//! `sessions.nu --only "as committed"` for the DDL; 18.6 with its index, through `dblink`, for the
-//! writers by an OR). A snail writes on its own only with `standalone`, as `tests/ddl.rs`.
+//! and writers of different names both committing; a type a new object depends on holding off
+//! another's DROP of it, and a type being dropped holding off what is made on it. Every answer and
+//! refusal is 18.6's over the same statements (`session.nu --suite sling`, and `sessions.nu --only
+//! serializable` for the writers, `sessions.nu --only "as committed"` for the DDL; 18.6 with its
+//! index, through `dblink`, for the writers by an OR; psql's two sessions for a type's DROP). A snail
+//! writes on its own only with `standalone`, as `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -2658,8 +2660,10 @@ fn a_schema_an_object_is_being_made_in_holds_off_its_drop() {
         next(&rx),
         Err(said(
             "2BP01",
-            "cannot drop schema s9 because other objects depend on it: table s9.x depends on \
-             schema s9"
+            &format!(
+                "cannot drop schema s9 because other objects depend on it: table s9.x depends on \
+                 schema s9{CASCADE}"
+            )
         ))
     );
     drop(rx);
@@ -2692,6 +2696,112 @@ fn a_schema_an_object_is_being_made_in_holds_off_its_drop() {
     a.execute("CREATE TABLE s11.b (k integer NOT NULL, PRIMARY KEY (k))")
         .unwrap();
     let rx = later(&path, &["CREATE TABLE s11.c (k integer NOT NULL, PRIMARY KEY (k))"]);
+    assert_eq!(next(&rx), Ok(0));
+    a.execute("COMMIT").unwrap();
+}
+
+/// The HINT 18.6 gives under a DROP refused for what depends on what it drops.
+const CASCADE: &str = "\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.";
+
+#[test]
+fn a_type_an_object_is_being_made_on_holds_off_its_drop() {
+    let (mut a, _b, path) = named("made-on-a-type");
+    for (i, made) in [
+        "CREATE TABLE x{i} (k integer PRIMARY KEY, m e{i})",
+        "CREATE TABLE x{i} (k integer PRIMARY KEY, m e{i}[])",
+        "CREATE DOMAIN d{i} AS e{i}",
+        "CREATE FUNCTION f{i}(e{i}) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let made = made.replace("{i}", &i.to_string());
+        a.execute(&format!("CREATE TYPE e{i} AS ENUM ('a')")).unwrap();
+        // Each holds off another's DROP TYPE, as 18.6's lock on what a new object depends on
+        // does; its commit leaves the DROP refused for what depends on the type.
+        a.execute("BEGIN").unwrap();
+        a.execute(&made).unwrap_or_else(|e| panic!("{made}: {e}"));
+        let rx = later(&path, &[&format!("DROP TYPE e{i}")]);
+        assert!(waits(&rx), "{made}");
+        a.execute("COMMIT").unwrap();
+        let (code, words) = next(&rx).unwrap_err();
+        assert_eq!(code, Some("2BP01"), "{made}: {words}");
+        let dependent = match i {
+            0 => format!("column m of table x{i} depends on type e{i}"),
+            1 => format!("column m of table x{i} depends on type e{i}[]"),
+            2 => format!("type d{i} depends on type e{i}"),
+            _ => format!("function f{i}(e{i}) depends on type e{i}"),
+        };
+        assert_eq!(
+            words,
+            format!(
+                "cannot drop type e{i} because other objects depend on it: {dependent}{CASCADE}"
+            )
+        );
+    }
+    // A DROP waits before it reads what depends on the type, so it names what depended on it
+    // before and what the commit it waited for left depending on it.
+    a.execute("CREATE TYPE h AS ENUM ('a')").unwrap();
+    a.execute("CREATE TABLE h1 (k integer PRIMARY KEY, m h)").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE h2 (k integer PRIMARY KEY, m h)").unwrap();
+    let rx = later(&path, &["DROP TYPE h"]);
+    assert!(waits(&rx), "a DROP TYPE of a type something depends on already");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        next(&rx),
+        Err(said(
+            "2BP01",
+            &format!(
+                "cannot drop type h because other objects depend on it: column m of table h1 \
+                 depends on type h\ncolumn m of table h2 depends on type h{CASCADE}"
+            )
+        ))
+    );
+    // A type a CASCADE takes with the one it names is locked as that one is: the DROP waits for
+    // a domain being made over a domain over it, and takes both domains.
+    a.execute("CREATE TYPE c0 AS ENUM ('a')").unwrap();
+    a.execute("CREATE DOMAIN dc AS c0").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE DOMAIN dc2 AS dc").unwrap();
+    let rx = later(&path, &["DROP TYPE c0 CASCADE"]);
+    assert!(waits(&rx), "a DROP TYPE … CASCADE reaching a domain a domain is made over");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(next(&rx), Ok(0));
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_type WHERE typname IN ('c0', 'dc', 'dc2')"),
+        ["0"]
+    );
+    // A domain a column is being made of, dropped by another once the column's table rolls back.
+    a.execute("CREATE DOMAIN dd AS integer").unwrap();
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE z (k integer PRIMARY KEY, c dd)").unwrap();
+    let rx = later(&path, &["DROP DOMAIN dd"]);
+    assert!(waits(&rx), "a DROP DOMAIN of a domain a column is being made of");
+    a.execute("ROLLBACK").unwrap();
+    assert_eq!(next(&rx), Ok(0));
+    assert_eq!(rows(&mut a, "SELECT count(*) FROM pg_type WHERE typname = 'dd'"), ["0"]);
+    // A type another is dropping holds off what is made on it: refused in 18.6's words once the
+    // DROP commits, made on its rollback.
+    for (end, ended) in [
+        ("COMMIT", Err(said("42704", "referenced type was concurrently dropped"))),
+        ("ROLLBACK", Ok(0)),
+    ] {
+        a.execute("CREATE TYPE g AS ENUM ('a')").unwrap();
+        a.execute("BEGIN").unwrap();
+        a.execute("DROP TYPE g").unwrap();
+        let rx = later(&path, &["CREATE TABLE y (k integer PRIMARY KEY, m g)"]);
+        assert!(waits(&rx), "a table made of a type being dropped");
+        a.execute(end).unwrap();
+        assert_eq!(next(&rx), ended, "{end}");
+        a.execute("DROP TABLE IF EXISTS y").unwrap();
+        a.execute("DROP TYPE IF EXISTS g").unwrap();
+    }
+    // A question naming a type takes no lock on it.
+    a.execute("CREATE TYPE q AS ENUM ('a')").unwrap();
+    a.execute("BEGIN").unwrap();
+    assert_eq!(rows(&mut a, "SELECT 'a'::q"), ["a"]);
+    let rx = later(&path, &["DROP TYPE q"]);
     assert_eq!(next(&rx), Ok(0));
     a.execute("COMMIT").unwrap();
 }
