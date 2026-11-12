@@ -1973,6 +1973,11 @@ pub(super) struct Computed<'q> {
 }
 
 impl<'q> Computed<'q> {
+    /// The value an aggregate or a window function computed, by its place.
+    pub(super) fn of(&self, call: *const Expr) -> Option<Value> {
+        self.calls.get(&call).cloned()
+    }
+
     /// The same values, and each call's given beside them.
     fn and<'e>(&self, more: impl IntoIterator<Item = (&'e Expr, Value)>) -> Computed<'q> {
         let mut calls = self.calls.clone();
@@ -7789,6 +7794,28 @@ pub(super) fn prepare<'q>(
             return Err(Error::new("window functions are not allowed in HAVING"));
         }
     }
+    // An aggregate a subquery read on each group calls over this step's columns alone is this
+    // step's: computed on each group, and handed to the subquery.
+    let own: Vec<(Option<&str>, &str)> = columns
+        .iter()
+        .filter(|(q, _, _)| outer_level(q.as_deref()) == 0)
+        .map(|(q, n, _)| (q.as_deref(), n.as_str()))
+        .collect();
+    let of_step = |q: &str, n: &str| !naming(own.iter().copied(), Some(q), n).is_empty();
+    let mut lifted: Vec<&'q Expr> = Vec::new();
+    for e in items
+        .iter()
+        .map(|(e, _)| *e)
+        .chain(hidden.iter().copied())
+        .chain(having)
+    {
+        for sub in super::subqueries::read_on_groups(e) {
+            if let Some(asked) = super::subqueries::asked_query(sub) {
+                lifted.extend(super::subqueries::lifted(asked, &of_step));
+            }
+        }
+    }
+    calls.aggregates.extend(lifted.iter().copied());
     for e in &hidden {
         sets_placed(e)?;
     }
@@ -7886,6 +7913,9 @@ pub(super) fn prepare<'q>(
     }
     for e in joined {
         typing.type_of(e)?;
+    }
+    for a in &lifted {
+        typing.type_of(a)?;
     }
     if let Some(l) = &limit {
         l.check(&mut typing)?;

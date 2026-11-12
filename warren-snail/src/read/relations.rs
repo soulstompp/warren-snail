@@ -1398,6 +1398,18 @@ pub(super) struct Col {
     carried: Carried,
 }
 
+impl Col {
+    /// A column of a value the query around a subquery hands it, carrying no collation of a table's.
+    pub(super) fn handed(name: String, ty: Option<ColumnType>) -> Col {
+        Col {
+            qualifier: None,
+            name,
+            ty,
+            carried: Carried::None,
+        }
+    }
+}
+
 /// A column a USING or NATURAL join makes of the two it merges, each by its place in the FROM's row.
 #[derive(Clone, Debug)]
 struct Merged {

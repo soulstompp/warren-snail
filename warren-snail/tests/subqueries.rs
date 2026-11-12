@@ -403,6 +403,23 @@ fn a_lateral_subquery_reads_the_rows_before_it() {
     );
 }
 
+/// An aggregate of the query around a subquery is that query's, one value for its one group,
+/// which the subquery returns for each of its own rows, as 18.6 answers.
+#[test]
+fn an_aggregate_of_the_query_around_a_subquery_is_one_value_of_that_query_s() {
+    let path = snail("around");
+    same(
+        &path,
+        "SELECT (SELECT count(t.v) FROM a.u u WHERE u.id = 1) AS x FROM a.t t",
+        &["3"],
+    );
+    same(
+        &path,
+        "SELECT (SELECT count(t.v) FROM a.u u LIMIT 1) AS x FROM a.t t",
+        &["3"],
+    );
+}
+
 #[test]
 fn a_subquery_s_refusals_are_postgresql_s() {
     let path = snail("refused");
@@ -427,9 +444,11 @@ fn a_subquery_s_refusals_are_postgresql_s() {
             "SELECT t.id FROM a.t t WHERE t.id IN (SELECT u.t_id FROM a.u u FOR UPDATE)",
             "FOR UPDATE is not read: a question takes no lock on the rows it reads",
         ),
+        // The aggregate is the query's around it, one value; the subquery a row of it for each of
+        // a.u's four.
         (
             "SELECT (SELECT count(t.v) FROM a.u u) AS x FROM a.t t",
-            "count(t.v) is not read: an aggregate of the query around a subquery",
+            "more than one row returned by a subquery used as an expression",
         ),
     ] {
         assert_eq!(refused(&path, q), why, "{q}");

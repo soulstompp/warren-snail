@@ -3259,3 +3259,155 @@ fn a_lateral_right_side_of_a_right_or_full_join_reading_nothing_of_its_left_is_a
         ],
     );
 }
+
+/// An aggregate a subquery read on each group calls over the query around it alone is that
+/// query's: computed on each of its groups, which it makes the query's rows, and read by the
+/// subquery in its select list, its WHERE, a join's ON or its ORDER BY, as 18.6 reads it. One reading
+/// the subquery's own columns too is the subquery's, refused in its WHERE; one whose relation a
+/// query inside the subquery names as its own is that query's.
+#[test]
+fn an_aggregate_of_the_query_around_a_subquery_is_that_query_s() {
+    let path = declared("around-aggregate", K8, &K8_ROWS);
+    let mut w = Snail::open_writing(&path).unwrap();
+    let rows_of = |r: &[&str]| -> Result<Vec<String>, (Option<&'static str>, String)> {
+        Ok(r.iter().map(|s| s.to_string()).collect())
+    };
+    let asked = [
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = max(t.to_account)) AS n FROM k8.tr t",
+            rows_of(&["0"]),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s JOIN k8.accounts r \
+             ON r.account = max(t.from_account) AND s.bank = r.bank) AS n FROM k8.tr t",
+            rows_of(&["2"]),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s WHERE s.account = max(t.to_account)) AS n \
+             FROM k8.tr t",
+            rows_of(&["0"]),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s WHERE s.account <= max(t.to_account)) AS n \
+             FROM k8.tr t",
+            rows_of(&["3"]),
+        ),
+        ("SELECT (SELECT max(t.to_account)) FROM k8.tr t", rows_of(&["X9"])),
+        (
+            "SELECT count(*) FROM k8.tr t HAVING EXISTS (SELECT 1 FROM k8.accounts s \
+             WHERE s.account = max(t.to_account))",
+            rows_of(&[]),
+        ),
+        (
+            "SELECT count(*) FROM k8.tr t HAVING EXISTS (SELECT 1 FROM k8.accounts s \
+             WHERE s.account = min(t.to_account))",
+            rows_of(&["3"]),
+        ),
+        (
+            "SELECT t.from_account, (SELECT count(*) FROM k8.accounts s \
+             WHERE s.account <= max(t.to_account)) FROM k8.tr t GROUP BY t.from_account",
+            rows_of(&["A1|3"]),
+        ),
+        (
+            "SELECT t.to_account, (SELECT count(*) FROM k8.accounts s WHERE s.bank = max(t.request)) \
+             FROM k8.tr t GROUP BY t.to_account ORDER BY 1",
+            rows_of(&["A2|0", "C1|0", "X9|0"]),
+        ),
+        (
+            "SELECT (SELECT s.bank FROM k8.accounts s WHERE s.account = min(t.to_account)) \
+             FROM k8.tr t",
+            rows_of(&["BA"]),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s WHERE s.account = max(t.to_account)) AS n \
+             FROM k8.tr t WHERE false",
+            rows_of(&["0"]),
+        ),
+        (
+            "SELECT (SELECT max(t.to_account) || s.bank FROM k8.accounts s ORDER BY 1 LIMIT 1) \
+             FROM k8.tr t",
+            rows_of(&["X9BA"]),
+        ),
+        (
+            "SELECT (SELECT max(s.account) FROM k8.accounts s WHERE s.account <= max(t.to_account)) \
+             FROM k8.tr t",
+            rows_of(&["C1"]),
+        ),
+        // An inner relation of the name hides the query around: the aggregate is the subquery's.
+        (
+            "SELECT (SELECT max(t.to_account) FROM k8.tr t) FROM k8.tr t",
+            rows_of(&["X9", "X9", "X9"]),
+        ),
+        (
+            "SELECT (SELECT max(t.to_account) FROM (k8.accounts s JOIN k8.tr t ON true)) \
+             FROM k8.tr t",
+            rows_of(&["X9", "X9", "X9"]),
+        ),
+        // A query inside the subquery naming its own t: the aggregate there is its own.
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s WHERE s.account <= max(t.to_account) \
+             AND s.account IN (SELECT max(t.to_account) FROM k8.tr t WHERE t.request = 'T1')) \
+             FROM k8.tr t",
+            rows_of(&["1"]),
+        ),
+        (
+            "SELECT (SELECT max(t.to_account) || d.m FROM (SELECT max(t.to_account) AS m \
+             FROM k8.tr t WHERE t.request = 'T2') d) FROM k8.tr t",
+            rows_of(&["X9C1"]),
+        ),
+        // One naming no t of its own, or a join under an alias of its own, reads the query
+        // around's.
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s WHERE s.account <= max(t.to_account) \
+             AND EXISTS (SELECT 1 FROM k8.accounts r WHERE r.account < max(t.to_account))) \
+             FROM k8.tr t",
+            rows_of(&["3"]),
+        ),
+        (
+            "SELECT (SELECT max(t.to_account) FROM (k8.accounts s JOIN k8.tr r ON true) j) \
+             FROM k8.tr t",
+            Err(said(
+                "21000",
+                "more than one row returned by a subquery used as an expression",
+            )),
+        ),
+        (
+            "SELECT t.from_account FROM k8.tr t GROUP BY t.from_account ORDER BY (SELECT count(*) \
+             FROM k8.accounts s WHERE s.account <= max(t.to_account))",
+            rows_of(&["A1"]),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s WHERE s.account <= max(t.to_account)), \
+             count(*) FROM k8.tr t",
+            rows_of(&["3|3"]),
+        ),
+        (
+            "SELECT (SELECT count(*) FROM k8.accounts s WHERE s.account = max(t.to_account || s.bank)) \
+             FROM k8.tr t",
+            Err(said("42803", "aggregate functions are not allowed in WHERE")),
+        ),
+        (
+            "SELECT t.request, (SELECT count(*) FROM k8.accounts s WHERE s.account = max(t.to_account)) \
+             FROM k8.tr t",
+            Err(said(
+                "42803",
+                "column \"t.request\" must appear in the GROUP BY clause or be used in an aggregate \
+                 function",
+            )),
+        ),
+    ];
+    let wrong: Vec<String> = asked
+        .iter()
+        .filter_map(|(sql, want)| {
+            let got = outcome(&mut w, sql);
+            (&got != want).then(|| format!("{sql}\n  got {got:?}\n  want {want:?}"))
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

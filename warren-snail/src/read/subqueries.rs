@@ -262,7 +262,13 @@ struct Answers {
 
 /// A subquery of a step, as its place asks it.
 struct Plan<'q> {
-    query: &'q Query,
+    /// Its query as written, or with each aggregate of the query around it it calls read as a column
+    /// that query hands it.
+    query: std::borrow::Cow<'q, Query>,
+    /// Those aggregates, by their places in the query around it, which computes them on each of its
+    /// groups; and the columns they are handed as, in their order.
+    lifted: Vec<*const Expr>,
+    lifted_columns: Vec<Col>,
     asks: Asks<'q>,
     /// The type of its first column.
     first: Option<ColumnType>,
@@ -468,6 +474,47 @@ impl<'q> Plan<'q> {
             _ => unreachable!("a subquery"),
         };
         super::question::unlocked(query)?;
+        // Read on each group, an aggregate it calls over the step's columns alone is the step's,
+        // handed to it as a column of its own on each group.
+        let own: Vec<(Option<&str>, &str)> = columns
+            .iter()
+            .filter(|c| pipeline::outer_level(c.qualifier.as_deref()) == 0)
+            .map(|c| (c.qualifier.as_deref(), c.name.as_str()))
+            .collect();
+        let around =
+            |q: &str, n: &str| !pipeline::naming(own.iter().copied(), Some(q), n).is_empty();
+        let lifted_calls = match grouped {
+            true => lifted(query, &around),
+            false => Vec::new(),
+        };
+        let typed: Vec<super::typed::TypedColumn> = columns
+            .iter()
+            .map(|c| (c.qualifier.clone(), c.name.clone(), c.ty))
+            .collect();
+        let lifted_columns: Vec<Col> = lifted_calls
+            .iter()
+            .enumerate()
+            .map(|(k, a)| {
+                let ty = pipeline::typed_on(a, &typed, asked.release)
+                    .ok()
+                    .and_then(|t| t.get(&(*a as *const Expr)).copied());
+                Col::handed(handed_name(k), ty)
+            })
+            .collect();
+        let query: std::borrow::Cow<'q, Query> = match lifted_calls.is_empty() {
+            true => std::borrow::Cow::Borrowed(query),
+            false => {
+                let mut q = query.clone();
+                let mut handing = Handing {
+                    lifted: &lifted_calls,
+                    named: Vec::new(),
+                };
+                let _ = sqlparser::ast::VisitMut::visit(&mut q, &mut handing);
+                std::borrow::Cow::Owned(q)
+            }
+        };
+        let lifted: Vec<*const Expr> = lifted_calls.iter().map(|a| *a as *const Expr).collect();
+        let query_read: &Query = &query;
         // Read for its columns alone: a sequence it draws from is drawn only as rows ask it.
         let _probing = super::sequences::probing();
         let empty = relations::Empty(asked.reads.catalog());
@@ -478,7 +525,11 @@ impl<'q> Plan<'q> {
         // Read with the step's columns as the query around it, all of them, or all but one.
         let asked_around = |hidden: Option<usize>| {
             let kept = Kept::default();
-            let mut columns: Vec<Col> = columns.iter().map(relations::marked).collect();
+            let mut columns: Vec<Col> = columns
+                .iter()
+                .chain(&lifted_columns)
+                .map(relations::marked)
+                .collect();
             if let Some(i) = hidden {
                 columns[i].name.insert(0, '\u{3}');
             }
@@ -491,19 +542,19 @@ impl<'q> Plan<'q> {
             };
             relations::made_by(
                 probe,
-                query,
+                query_read,
                 made,
                 casings,
                 Some(&outer),
                 &Accrued::default(),
             )
         };
-        let none = relations::made_by(probe, query, made, casings, None, &Accrued::default());
+        let none = relations::made_by(probe, query_read, made, casings, None, &Accrued::default());
         let (m, around, reads_around) = match none {
             Ok((m, _)) => (m, None, Vec::new()),
             Err(_) => {
                 let (m, _) = asked_around(None)?;
-                let ws = relations::words(&query.to_string());
+                let ws = relations::words(&query_read.to_string());
                 let named: Vec<usize> = (0..columns.len())
                     .filter(|&i| ws.contains(&columns[i].name))
                     .collect();
@@ -529,10 +580,16 @@ impl<'q> Plan<'q> {
             (_, Some(n)) if width < n => return Err(Error::new("subquery has too few columns")),
             _ => {}
         }
+        let first = m.types.first().copied().flatten();
+        let in_order =
+            query_read.with.is_none() && matches!(query_read.body.as_ref(), SetExpr::Select(_));
+        drop(m);
         Ok(Plan {
             query,
+            lifted,
+            lifted_columns,
             asks,
-            first: m.types.first().copied().flatten(),
+            first,
             around,
             reads_around,
             once: RefCell::new(None),
@@ -540,9 +597,7 @@ impl<'q> Plan<'q> {
             written: RefCell::default(),
             refused: RefCell::default(),
             kept: Kept {
-                in_order: std::cell::Cell::new(
-                    query.with.is_none() && matches!(query.body.as_ref(), SetExpr::Select(_)),
-                ),
+                in_order: std::cell::Cell::new(in_order),
                 ..Kept::default()
             },
         })
@@ -618,7 +673,8 @@ impl<'a, 'q> Subs<'a, 'q> {
     /// around it names.
     pub(super) fn foresee(&self, rows: &Rows) -> Result<()> {
         for plan in self.plans.plans.values() {
-            let Some(places) = &plan.around else {
+            // One handed an aggregate of the step's reads values no row gives before it groups.
+            let (Some(places), true) = (&plan.around, plan.lifted.is_empty()) else {
                 continue;
             };
             plan.kept
@@ -628,8 +684,9 @@ impl<'a, 'q> Subs<'a, 'q> {
     }
 
     /// What a subquery returns for a row: once, where it reads nothing of the query around it; else
-    /// for the values the row gives what it names, the query around it read from those alone.
-    fn returned(&self, plan: &Plan, row: &[Value]) -> Result<Rc<Returned>> {
+    /// for the values the row gives what it names, and the group the aggregates of the step's it is
+    /// handed, the query around it read from those alone.
+    fn returned(&self, plan: &Plan, row: &[Value], computed: &Computed) -> Result<Rc<Returned>> {
         let asked = Asked {
             answer_kept: true,
             ..self.asked
@@ -638,13 +695,24 @@ impl<'a, 'q> Subs<'a, 'q> {
             if let Some(r) = plan.once.borrow().as_ref() {
                 return Ok(r.clone());
             }
-            let (m, _) =
-                relations::made_by(asked, plan.query, self.made, self.casings, None, self.accrued)?;
+            let (m, _) = relations::made_by(
+                asked,
+                &plan.query,
+                self.made,
+                self.casings,
+                None,
+                self.accrued,
+            )?;
             let r = Returned::of(&plan.asks, m)?;
             *plan.once.borrow_mut() = Some(r.clone());
             return Ok(r);
         };
-        let values: Vec<Value> = places.iter().map(|&i| row[i].clone()).collect();
+        let mut values: Vec<Value> = places.iter().map(|&i| row[i].clone()).collect();
+        for &a in &plan.lifted {
+            values.push(computed.of(a).ok_or_else(|| {
+                Error::new("an aggregate of the query around a subquery is not read here")
+            })?);
+        }
         let key = values_key(&values);
         if let Some(r) = self.answered(plan, &key)? {
             return Ok(r);
@@ -691,7 +759,9 @@ impl<'a, 'q> Subs<'a, 'q> {
         let outer = Outer {
             columns: places
                 .iter()
-                .map(|&i| relations::marked(&self.columns[i]))
+                .map(|&i| &self.columns[i])
+                .chain(&plan.lifted_columns)
+                .map(relations::marked)
                 .collect(),
             values,
             kept: &plan.kept,
@@ -709,7 +779,7 @@ impl<'a, 'q> Subs<'a, 'q> {
         };
         let (m, _) = relations::made_by(
             asked,
-            plan.query,
+            &plan.query,
             self.made,
             self.casings,
             Some(&outer),
@@ -829,7 +899,7 @@ impl pipeline::Subqueries for Subs<'_, '_> {
             .plans
             .get(&(e as *const Expr))
             .ok_or_else(|| Error::new(format!("{e} is not read here")))?;
-        let returned = self.returned(plan, row)?;
+        let returned = self.returned(plan, row, computed)?;
         let rows = &returned.rows;
         match &plan.asks {
             Asks::Scalar => match rows.as_slice() {
@@ -976,6 +1046,214 @@ fn on_groups<'q>(e: &'q Expr, after: &mut Vec<&'q Expr>, before: &mut Vec<&'q Ex
                 on_groups(p, after, before);
             }
         }
+    }
+}
+
+/// The name of the column the `k`th aggregate of the query around a subquery is handed to it as,
+/// one no query can write.
+fn handed_name(k: usize) -> String {
+    format!("\u{e}around{k}")
+}
+
+/// The subqueries an expression holds that its step reads on each group.
+pub(super) fn read_on_groups(e: &Expr) -> Vec<&Expr> {
+    let (mut after, mut before) = (Vec::new(), Vec::new());
+    on_groups(e, &mut after, &mut before);
+    after
+}
+
+/// The query a subquery expression asks.
+pub(super) fn asked_query(e: &Expr) -> Option<&Query> {
+    match e {
+        Expr::Subquery(q)
+        | Expr::Exists { subquery: q, .. }
+        | Expr::InSubquery { subquery: q, .. } => Some(q),
+        Expr::AnyOp { right, .. } | Expr::AllOp { right, .. } => match right.as_ref() {
+            Expr::Subquery(q) => Some(q),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The aggregates a subquery's own clauses call over the query around it alone, which that query
+/// computes on each of its groups and hands the subquery, as PostgreSQL's parser gives an aggregate
+/// to the query its columns are of: each column it reads qualified by a name `around` gives a
+/// relation of that query, and by none of the subquery's FROM. In the order its words hold them.
+pub(super) fn lifted<'q>(q: &'q Query, around: &dyn Fn(&str, &str) -> bool) -> Vec<&'q Expr> {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return Vec::new();
+    };
+    let mut own: Vec<String> = Vec::new();
+    from_names(&s.from, &mut own);
+    let mut ons: Vec<&Expr> = Vec::new();
+    for t in &s.from {
+        for j in &t.joins {
+            if let Some(sqlparser::ast::JoinConstraint::On(e)) = join_on(&j.join_operator) {
+                ons.push(e);
+            }
+        }
+    }
+    let of_around = |e: &Expr| {
+        let mut read = Vec::new();
+        pipeline::columns_read(e, &mut read);
+        !read.is_empty()
+            && read.iter().all(|(q, n)| {
+                q.as_deref().is_some_and(|q| {
+                    let last = q.rsplit('.').next().unwrap_or(q);
+                    !own.iter().any(|o| o == last) && around(q, n)
+                })
+            })
+    };
+    let mut roots: Vec<&Expr> = Vec::new();
+    for item in &s.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            roots.push(e);
+        }
+    }
+    roots.extend(ons);
+    roots.extend(s.selection.as_ref());
+    if let GroupByExpr::Expressions(g, _) = &s.group_by {
+        roots.extend(g);
+    }
+    roots.extend(s.having.as_ref());
+    if let Some(OrderByKind::Expressions(os)) = q.order_by.as_ref().map(|o| &o.kind) {
+        roots.extend(os.iter().map(|o| &o.expr));
+    }
+    let mut out = Vec::new();
+    for r in roots {
+        aggregates_of(r, &of_around, &mut out);
+    }
+    out
+}
+
+/// The aggregates an expression calls, a subquery's apart, that `keep` keeps.
+fn aggregates_of<'q>(e: &'q Expr, keep: &dyn Fn(&Expr) -> bool, out: &mut Vec<&'q Expr>) {
+    match e {
+        Expr::Function(f)
+            if f.over.is_none()
+                && (pipeline::is_aggregate(&pipeline::function_name(f))
+                    || !f.within_group.is_empty()) =>
+        {
+            if keep(e) {
+                out.push(e);
+            }
+        }
+        e => {
+            let mut parts = pipeline::parts_of(e);
+            if parts.is_empty() {
+                parts = super::collate::children(e);
+            }
+            for p in parts {
+                aggregates_of(p, keep, out);
+            }
+        }
+    }
+}
+
+/// The names a FROM's relations go by, those of a parenthesized join with no alias among them.
+fn from_names(from: &[sqlparser::ast::TableWithJoins], out: &mut Vec<String>) {
+    for t in from {
+        for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+            match f {
+                TableFactor::NestedJoin {
+                    table_with_joins,
+                    alias: None,
+                } => from_names(std::slice::from_ref(table_with_joins.as_ref()), out),
+                f => out.extend(relation_name(f)),
+            }
+        }
+    }
+}
+
+/// The names the relations of a query's own FROM go by, each arm's of a set operation.
+fn query_names(q: &Query) -> Vec<String> {
+    fn of_body(b: &SetExpr, out: &mut Vec<String>) {
+        match b {
+            SetExpr::Select(s) => from_names(&s.from, out),
+            SetExpr::SetOperation { left, right, .. } => {
+                of_body(left, out);
+                of_body(right, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    of_body(&q.body, &mut out);
+    out
+}
+
+/// A subquery's query with each aggregate of the query around it written as the column it is
+/// handed as: in its own clauses, and in a query inside it whose relations hide none of the
+/// aggregate's.
+struct Handing<'a, 'q> {
+    lifted: &'a [&'q Expr],
+    /// The names of each query's relations the walk is inside, the subquery's first.
+    named: Vec<Vec<String>>,
+}
+
+impl sqlparser::ast::VisitorMut for Handing<'_, '_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> std::ops::ControlFlow<()> {
+        self.named.push(query_names(q));
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &mut Query) -> std::ops::ControlFlow<()> {
+        self.named.pop();
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, e: &mut Expr) -> std::ops::ControlFlow<()> {
+        let Some(k) = self.lifted.iter().position(|a| **a == *e) else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        let mut read = Vec::new();
+        pipeline::columns_read(e, &mut read);
+        let hidden = self.named.iter().skip(1).flatten().any(|n| {
+            read.iter().any(|(q, _)| {
+                q.as_deref()
+                    .is_some_and(|q| q.rsplit('.').next().unwrap_or(q) == n)
+            })
+        });
+        if !hidden {
+            *e = Expr::Identifier(sqlparser::ast::Ident::with_quote('"', handed_name(k)));
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// The name a FROM item goes by: its alias, or a table's own name.
+fn relation_name(f: &TableFactor) -> Option<String> {
+    match f {
+        TableFactor::Table { alias: Some(a), .. }
+        | TableFactor::Derived { alias: Some(a), .. }
+        | TableFactor::Function { alias: Some(a), .. }
+        | TableFactor::TableFunction { alias: Some(a), .. }
+        | TableFactor::UNNEST { alias: Some(a), .. }
+        | TableFactor::NestedJoin { alias: Some(a), .. } => Some(crate::catalog::ident(&a.name)),
+        TableFactor::Table { name, .. } => {
+            let n = crate::catalog::object_name(name);
+            Some(n.rsplit('.').next().unwrap_or(&n).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// A join's constraint, where its kind has one.
+fn join_on(j: &sqlparser::ast::JoinOperator) -> Option<&sqlparser::ast::JoinConstraint> {
+    use sqlparser::ast::JoinOperator as J;
+    match j {
+        J::Join(c)
+        | J::Inner(c)
+        | J::Left(c)
+        | J::LeftOuter(c)
+        | J::Right(c)
+        | J::RightOuter(c)
+        | J::FullOuter(c)
+        | J::CrossJoin(c) => Some(c),
+        _ => None,
     }
 }
 
