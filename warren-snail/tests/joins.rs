@@ -782,7 +782,7 @@ fn what_a_join_does_not_read_is_refused_with_its_reason() {
         ),
         (
             "SELECT theme_id FROM j.sets s JOIN j.themes t ON t.theme_id = s.theme_id",
-            "qualify it",
+            "column reference \"theme_id\" is ambiguous",
         ),
     ] {
         let e = snail.ask(q, None).unwrap_err().to_string();

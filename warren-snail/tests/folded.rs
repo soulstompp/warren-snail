@@ -217,6 +217,131 @@ fn only_immutable_calls_are_folded() {
     );
 }
 
+/// After setseed(0.5), 18.6's draws for each statement, then the draw `SELECT random()` makes after
+/// it: a volatile call drawn for each row as the rows come, never once while the statement's
+/// constants are folded, beside a constant folded or not, and nothing drawn where the fold refuses.
+#[test]
+fn a_volatile_call_is_drawn_for_each_row_never_while_folding() {
+    let mut w = snail("random");
+    let (s1, s5, s9) = (
+        "0.9851677175347999",
+        "0.6476186144084",
+        "0.5145227426983392",
+    );
+    let four = [
+        s1,
+        "0.825301858027981",
+        "0.12974610012450416",
+        "0.16356291958601088",
+    ];
+    let asked = [
+        ("SELECT random() FROM fo.src", rows(&four), s5),
+        (
+            "SELECT k, random() FROM fo.src WHERE random() < 2",
+            rows(&[
+                "1|0.825301858027981",
+                "2|0.16356291958601088",
+                "3|0.8822771983038762",
+                "4|0.15619865764623442",
+            ]),
+            s9,
+        ),
+        (
+            "SELECT random(1, 10) FROM fo.src",
+            rows(&["3", "3", "3", "3"]),
+            s9,
+        ),
+        (
+            "SELECT k FROM fo.src WHERE random() < 2 AND 1 + 1 = 2",
+            rows(&["1", "2", "3", "4"]),
+            s5,
+        ),
+        (
+            "SELECT random() + (1 + 1) FROM fo.src",
+            rows(&[
+                "2.9851677175348",
+                "2.8253018580279807",
+                "2.129746100124504",
+                "2.1635629195860107",
+            ]),
+            s5,
+        ),
+        (
+            "SELECT k, random(1, 2 + 8) FROM fo.src WHERE random(1, 10) > 0",
+            rows(&["1|3", "2|3", "3|8", "4|9"]),
+            "0.7495564594841835",
+        ),
+        (
+            "SELECT k FROM fo.src WHERE random() < 0.5",
+            rows(&["3", "4"]),
+            s5,
+        ),
+        (
+            "SELECT k FROM fo.none WHERE random() < 2 AND 1/0 = 1",
+            zero(),
+            s1,
+        ),
+        ("SELECT random() < 2, 1/0 FROM fo.src", zero(), s1),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want, next) in asked {
+        w.execute("SELECT setseed(0.5)").unwrap();
+        let got = outcome(&mut w, sql);
+        let after = outcome(&mut w, "SELECT random()");
+        if got != want || after != rows(&[next]) {
+            wrong.push(format!(
+                "{sql}\n  got {got:?}, then {after:?}\n  want {want:?}, then {next}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A value relabelled to another type it is binary-coercible to keeps its text only where both
+/// types write it alike: a reg type's name is not its OID's digits, for the catalog's objects and
+/// the file's own; a varchar's text is its text.
+#[test]
+fn a_relabelled_constant_is_written_as_its_new_type_writes_it() {
+    let path = tmp("folded-reg.snail");
+    let ddl = "CREATE SCHEMA s; CREATE TABLE s.u (id integer PRIMARY KEY);
+         CREATE TABLE t (id integer PRIMARY KEY); CREATE TYPE mood AS ENUM ('a', 'b');";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    each(
+        &mut w,
+        &[
+            ("SELECT 'plpgsql_validator'::regproc::oid > 12000", rows(&["t"])),
+            (
+                "SELECT 'pg_class'::regclass::oid, 'pg_class'::regclass::oid::text, \
+                 'pg_class'::regclass::oid = 1259",
+                rows(&["1259|1259|t"]),
+            ),
+            (
+                "SELECT 'int4'::regtype::oid, 'int4'::regtype::oid::text, 23::oid::regtype, \
+                 23::regtype::text",
+                rows(&["23|23|integer|integer"]),
+            ),
+            (
+                "SELECT 't'::regclass::oid::text = 't'::regclass::oid::text, \
+                 's.u'::regclass::oid > 16000, 'mood'::regtype::oid > 16000",
+                rows(&["t|t|t"]),
+            ),
+            (
+                "SELECT 't'::regclass::text, 's'::regnamespace::oid > 16000, 'mood[]'::regtype::text",
+                rows(&["t|t|mood[]"]),
+            ),
+            ("SELECT id FROM t WHERE false AND 't'::regclass::oid > 0", rows(&[])),
+            (
+                "SELECT 'abc'::varchar(5)::text || 'd', length('abc'::varchar(5)), \
+                 'abc'::varchar(2)::text",
+                rows(&["abcd|3|ab"]),
+            ),
+            ("SELECT length('ab'::varchar) + 1/0 FROM t WHERE false", zero()),
+            ("SELECT 'ab'::varchar::text || (1/0)::text FROM t WHERE false", zero()),
+        ],
+    );
+}
+
 #[test]
 fn a_prepared_statement_folds_at_execute() {
     let mut w = snail("prepared");

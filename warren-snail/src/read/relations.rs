@@ -1251,11 +1251,16 @@ fn lift_factor(
             let origin = Origin::Join(crate::catalog::ident(&a.name));
             let first = out.len();
             lift_as(catalog, out, visible, step.clone(), query, renames, origin)?;
-            // The steps of the subqueries inside it cannot read the relations laid before it.
+            // The steps of the subqueries inside it cannot read the relations laid before it, nor
+            // can its ONs, which no LATERAL would let read them.
             let last = out.len() - 1;
             for s in &mut out[first..last] {
                 s.laid.extend(lifted.laid.iter().cloned());
             }
+            out[last].laid.extend(lifted.laid.iter().map(|l| Laid {
+                lateral: false,
+                ..l.clone()
+            }));
             let mut kept = a.clone();
             kept.columns.clear();
             *t = plain(&step, Some(kept));
@@ -4955,6 +4960,86 @@ fn aggregate_around(q: &Query, from: &From) -> bool {
     .is_break()
 }
 
+/// Each column a join's ON names outside its subqueries, one of the join's two sides or of the
+/// query around the step, as PostgreSQL's parser reads an ON; one the FROM holds elsewhere refused
+/// in its words: laid before the join, an entry it cannot reference (a bare name, a column) with
+/// the DETAIL; joined after it, missing there. One the FROM holds nowhere is the step's to refuse.
+fn on_names(from: &From, n: &Node, on: &Expr) -> Result<()> {
+    let end = n.at + n.width;
+    let found = |range: std::ops::Range<usize>, q: Option<&str>, name: &str| -> Vec<usize> {
+        let cols = &from.columns[range.clone()];
+        pipeline::naming(
+            cols.iter()
+                .map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+            q,
+            name,
+        )
+        .into_iter()
+        .map(|i| i + range.start)
+        .collect()
+    };
+    let mut read = Vec::new();
+    pipeline::columns_read(on, &mut read);
+    for (q, name) in read {
+        let seen = from.columns[n.at..end]
+            .iter()
+            .chain(&from.columns[from.outer_at..]);
+        match pipeline::naming(
+            seen.map(|c| (c.qualifier.as_deref(), c.name.as_str())),
+            q.as_deref(),
+            &name,
+        )
+        .len()
+        {
+            0 => {}
+            1 => continue,
+            _ => {
+                return Err(Error::new(format!(
+                    "column reference \"{name}\" is ambiguous"
+                )))
+            }
+        }
+        let entry = |i: &usize| {
+            from.columns[*i]
+                .qualifier
+                .as_deref()
+                .map(pipeline::unmarked)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let cannot = "but it cannot be referenced from this part of the query.";
+        let before = found(0..n.at, q.as_deref(), &name);
+        let relation = q.as_deref().map(|q| q.rsplit('.').next().unwrap_or(q));
+        if let Some(first) = before.first() {
+            let mut entries: Vec<String> = before.iter().map(entry).collect();
+            entries.dedup();
+            return Err(Error::new(match (relation, entries.as_slice()) {
+                (Some(r), _) => format!(
+                    "invalid reference to FROM-clause entry for table \"{r}\": There is an entry \
+                     for table \"{}\", {cannot}",
+                    entry(first)
+                ),
+                (None, [one]) => format!(
+                    "column \"{name}\" does not exist: There is a column named \"{name}\" in table \
+                     \"{one}\", {cannot}"
+                ),
+                (None, _) => format!(
+                    "column \"{name}\" does not exist: There are columns named \"{name}\", but \
+                     they are in tables that cannot be referenced from this part of the query.\n\
+                     HINT:  Try using a table-qualified name."
+                ),
+            }));
+        }
+        if !found(end..from.outer_at, q.as_deref(), &name).is_empty() {
+            return Err(Error::new(match relation {
+                Some(r) => format!("missing FROM-clause entry for table \"{r}\""),
+                None => format!("column \"{name}\" does not exist"),
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// One SELECT of the statement, its FROM met as one relation, then read as the pipeline reads it;
 /// a subquery's with the columns of the query around it after its FROM's.
 fn select_step(
@@ -5112,10 +5197,12 @@ fn select_step(
             _ => None,
         }));
     }
-    // A join's ON takes no set-returning function, refused with the FROM it is read in.
+    // A join's ON takes no set-returning function, refused with the FROM it is read in; and names
+    // only its two sides and the query around the step.
     for n in &joins {
         if let What::Join { on: Some(on), .. } = &n.what {
             pipeline::sets_refused(on, "JOIN conditions")?;
+            on_names(&from, n, on)?;
         }
     }
     // Each join's ON holding a subquery: its subqueries read as the pairs it meets are, over the
@@ -5252,8 +5339,20 @@ fn select_step(
             _ => None,
         })
         .collect();
+    // A name read only in joins' ONs is the one each ON's sides hold, as `on_names` found it.
+    let ons: Vec<*const Expr> = joins
+        .iter()
+        .filter_map(|n| match &n.what {
+            What::Join { on: Some(on), .. } => Some(on as *const Expr),
+            _ => None,
+        })
+        .collect();
+    let beside = p.reads_beside(&ons);
     for (q, n) in p.reads() {
         let found = place(&q, &n);
+        if found.len() > 1 && !beside.contains(&(q.clone(), n.clone())) {
+            continue;
+        }
         if let [one] = found.as_slice() {
             if let Some(why) = from.refused.get(one).filter(|_| outside_trees.contains(one)) {
                 return Err(Error::new(format!(

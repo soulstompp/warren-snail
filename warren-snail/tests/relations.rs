@@ -197,11 +197,14 @@ fn relations_a_from_names_meet_by_their_on() {
         ),
         "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions"
     );
-    assert!(refused(
-        &path,
-        &format!("{steps} SELECT a.id FROM a.k k, a JOIN b ON b.w = k.lo")
-    )
-    .contains("lo"));
+    assert_eq!(
+        refused(
+            &path,
+            &format!("{steps} SELECT a.id FROM a.k k, a JOIN b ON b.w = k.lo")
+        ),
+        "invalid reference to FROM-clause entry for table \"k\": There is an entry for table \
+         \"k\", but it cannot be referenced from this part of the query."
+    );
 }
 
 #[test]

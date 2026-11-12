@@ -6498,6 +6498,17 @@ impl<'q> Prepared<'q> {
         out
     }
 
+    /// The columns it reads outside the given expressions: a join's ONs, read on their own.
+    pub(super) fn reads_beside(&self, beside: &[*const Expr]) -> Vec<(Option<String>, String)> {
+        let mut out = Vec::new();
+        for e in self.read_expressions() {
+            if !beside.contains(&(e as *const Expr)) {
+                columns_read(e, &mut out);
+            }
+        }
+        out
+    }
+
     /// The expressions its columns are read in.
     fn read_expressions(&self) -> Vec<&Expr> {
         let windowed = self.calls.windows.iter().flat_map(|w| match w {

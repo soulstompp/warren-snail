@@ -1313,14 +1313,20 @@ impl<'c, 'a> Folding<'c, 'a> {
                     None => a,
                 }
             }
+            // A value relabelled keeps its text where both types write it alike: a reg type's name
+            // is not its OID's digits.
             N::Relabel {
                 arg, ty, typmod, ..
             } => match self.node(arg, at)? {
-                Shape::Const(Node::Const { text, .. }) => Shape::Const(Node::Const {
-                    ty: *ty,
-                    typmod: *typmod,
-                    text,
-                }),
+                Shape::Const(Node::Const { text, .. })
+                    if text.is_none() || self.written_alike(arg.ty(), *ty) =>
+                {
+                    Shape::Const(Node::Const {
+                        ty: *ty,
+                        typmod: *typmod,
+                        text,
+                    })
+                }
                 other => varies([other]),
             },
             N::Collate { arg, .. } | N::Named { arg, .. } => self.node(arg, at)?,
@@ -1677,6 +1683,14 @@ impl<'c, 'a> Folding<'c, 'a> {
                 let input = self.cat.ty(to).map_or(0, |t| t.input);
                 fixed(output) && fixed(input)
             }
+        }
+    }
+
+    /// Whether two types write one value as the same text: one output function, or both strings.
+    fn written_alike(&self, from: u32, to: u32) -> bool {
+        match (self.cat.ty(from), self.cat.ty(to)) {
+            (Some(a), Some(b)) => a.output == b.output || (a.category == 'S' && b.category == 'S'),
+            _ => false,
         }
     }
 

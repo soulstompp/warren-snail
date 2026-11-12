@@ -1059,10 +1059,25 @@ fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// PostgreSQL's refusal of an expression naming a column more than one table holds: by that
+/// column's name.
+fn ambiguous(e: &Expr) -> Error {
+    let mut read = Vec::new();
+    super::pipeline::columns_read(e, &mut read);
+    let name = read
+        .into_iter()
+        .find(|(q, _)| q.is_none())
+        .map_or_else(|| e.to_string(), |(_, n)| n);
+    Error::new(format!("column reference \"{name}\" is ambiguous"))
+}
+
 /// The tables a question reads, as it names them.
 struct From<'a> {
     catalog: &'a Catalog,
     tables: Vec<(usize, Option<String>)>,
+    /// While a join's ON is read, the first and last of the tables it joins: a name more than one
+    /// table holds is the one of them among those.
+    seen: std::cell::Cell<Option<(usize, usize)>>,
 }
 
 impl From<'_> {
@@ -1075,6 +1090,48 @@ impl From<'_> {
         match &self.tables[side].1 {
             Some(a) => a.clone(),
             None => self.table(side).name.clone(),
+        }
+    }
+
+    /// The refusal of an ON's condition `p` that reads the table at `side`, outside the tables its
+    /// join joins, in PostgreSQL's words: laid before the join, an entry it cannot reference, or for
+    /// a bare name a column, each with its DETAIL; joined after it, missing there.
+    fn unseen(&self, p: &Expr, side: usize, before: bool) -> Error {
+        let named = self.named(side);
+        let t = self.table(side);
+        let mut read = Vec::new();
+        super::pipeline::columns_read(p, &mut read);
+        let names = |q: &str| match &self.tables[side].1 {
+            Some(a) => q == a,
+            None => q == t.name || Some(q) == t.name.rsplit('.').next(),
+        };
+        let found = read.into_iter().find(|(q, n)| match q {
+            Some(q) => names(q),
+            None => t.columns.iter().any(|c| c.name == *n),
+        });
+        let cannot = "but it cannot be referenced from this part of the query.";
+        match (found, before) {
+            (Some((Some(q), _)), true) => {
+                let relation = q.rsplit('.').next().unwrap_or(&q);
+                Error::new(format!(
+                    "invalid reference to FROM-clause entry for table \"{relation}\": There is an \
+                     entry for table \"{named}\", {cannot}"
+                ))
+            }
+            (Some((None, n)), true) => Error::new(format!(
+                "column \"{n}\" does not exist: There is a column named \"{n}\" in table \
+                 \"{named}\", {cannot}"
+            )),
+            (Some((Some(q), _)), false) => {
+                let relation = q.rsplit('.').next().unwrap_or(&q).to_string();
+                Error::new(format!(
+                    "missing FROM-clause entry for table \"{relation}\""
+                ))
+            }
+            (Some((None, n)), false) => Error::new(format!("column \"{n}\" does not exist")),
+            (None, _) => Error::new(format!(
+                "invalid reference to FROM-clause entry for table \"{named}\""
+            )),
         }
     }
 
@@ -1117,9 +1174,20 @@ impl From<'_> {
             }
             [one] => Ok(*one),
             [] => Err(first_error.unwrap_or_else(|| Error::new(format!("{e} reads no table")))),
-            _ => Err(Error::new(format!(
-                "{e} could name a column of more than one table: qualify it"
-            ))),
+            many => match self.seen.get() {
+                Some((start, side)) => {
+                    let joined: Vec<_> = many
+                        .iter()
+                        .filter(|(s, _)| (start..=side).contains(s))
+                        .collect();
+                    match joined.as_slice() {
+                        [one] => Ok(**one),
+                        [] => Ok(many[0]),
+                        _ => Err(ambiguous(e)),
+                    }
+                }
+                None => Err(ambiguous(e)),
+            },
         }
     }
 
@@ -1559,7 +1627,11 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
             )));
         }
     }
-    let from = From { catalog, tables };
+    let from = From {
+        catalog,
+        tables,
+        seen: Default::default(),
+    };
 
     let mut listed: Vec<(String, Item)> = Vec::new();
     for item in &s.projection {
@@ -1745,13 +1817,13 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         let side = k + 1;
         let mut read = Vec::new();
         for p in on {
-            for c in read_conjunct(&from, p)? {
+            from.seen.set(Some((start, side)));
+            let conjuncts = read_conjunct(&from, p);
+            from.seen.set(None);
+            for c in conjuncts? {
                 // An ON reads only the tables of its FROM item joined by then.
                 if let Some(&s) = c.sides().iter().find(|&&s| s < start || s > side) {
-                    return Err(Error::new(format!(
-                        "invalid reference to FROM-clause entry for table \"{}\"",
-                        from.named(s)
-                    )));
+                    return Err(from.unseen(p, s, s < start));
                 }
                 read.push(c);
             }

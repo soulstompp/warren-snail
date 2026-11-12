@@ -2889,3 +2889,240 @@ fn writers_of_the_tables_each_made_write_them_beside_each_other() {
         ["1,1"]
     );
 }
+
+/// 18.6's refusal of a relation laid before a join, named in its ON, with its DETAIL.
+fn laid_before(relation: &str) -> Result<Vec<String>, (Option<&'static str>, String)> {
+    Err(said(
+        "42P01",
+        &format!(
+            "invalid reference to FROM-clause entry for table \"{relation}\": There is an entry for \
+             table \"{relation}\", but it cannot be referenced from this part of the query."
+        ),
+    ))
+}
+
+/// A statement's answer or its refusal.
+fn outcome(w: &mut Snail, sql: &str) -> Result<Vec<String>, (Option<&'static str>, String)> {
+    let done = w.execute(sql).map_err(|e| (e.sqlstate(), e.to_string()))?;
+    let b = done.answer.expect("an answer");
+    Ok(w.text_of(&b)
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            r.into_iter()
+                .map(|v| v.unwrap_or_else(|| "NULL".into()))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect())
+}
+
+/// Each statement answered or refused as 18.6 answers or refuses it, as written where `plain`, and
+/// as a WITH query read in a step, as 18.6 answers both; every one that is not, named.
+fn each_outcome(
+    w: &mut Snail,
+    asked: &[(&str, Result<Vec<String>, (Option<&'static str>, String)>)],
+    plain: bool,
+) {
+    let mut wrong = Vec::new();
+    for (sql, want) in asked {
+        let wrapped = format!("WITH q AS ({sql}) SELECT * FROM q");
+        let forms = match plain {
+            true => vec![sql.to_string(), wrapped],
+            false => vec![wrapped],
+        };
+        for f in forms {
+            let got = outcome(w, &f);
+            if &got != want {
+                wrong.push(format!("{f}\n  got {got:?}\n  want {want:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// A join's ON reads its own two sides and the query around the FROM (a LATERAL subquery's row
+/// among it), never a relation of its FROM laid before the join: refused as 18.6's parser refuses
+/// it, a qualified name by its entry and a bare one by its column, each with its DETAIL; a bare name
+/// found once among the join's sides reads that one, though one laid before holds it too.
+#[test]
+fn an_on_names_only_its_join_s_sides_and_the_query_around() {
+    let column = |n: &str, t: &str| {
+        Err(said(
+            "42703",
+            &format!(
+                "column \"{n}\" does not exist: There is a column named \"{n}\" in table \"{t}\", \
+                 but it cannot be referenced from this part of the query."
+            ),
+        ))
+    };
+    for (name, inserts) in [("on-sides-rows", &K6_ROWS[..]), ("on-sides-none", &[][..])] {
+        let path = declared(name, K6, inserts);
+        let mut w = Snail::open_writing(&path).unwrap();
+        let none = inserts.is_empty();
+        let count = |n: &str| Ok(vec![if none { "0".to_string() } else { n.to_string() }]);
+        each_outcome(
+            &mut w,
+            &[
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s FULL JOIN k6.tiers t \
+                     ON s.balance = t.lower AND o.owner = 'x'",
+                    laid_before("o"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower + length(o.owner)",
+                    laid_before("o"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s LEFT JOIN k6.tiers t \
+                     ON s.balance >= t.lower + length(o.owner)",
+                    laid_before("o"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower + length(owners.owner)",
+                    laid_before("owners"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower + length(k6.owners.owner)",
+                    laid_before("owners"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners x, (k6.stated b JOIN k6.tiers a \
+                     ON b.balance >= a.lower AND x.acct = b.acct) AS j",
+                    laid_before("x"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s LEFT JOIN k6.tiers t \
+                     ON s.balance >= t.lower + length(owner)",
+                    column("owner", "o"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower AND o.acct = s.acct",
+                    laid_before("o"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.caps c, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower AND c.owner = 'x'",
+                    laid_before("c"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.caps c, k6.owners o JOIN k6.stated s \
+                     ON o.acct = s.acct AND c.cap > 0",
+                    laid_before("c"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o JOIN k6.stated s ON o.acct = s.acct, \
+                     k6.tiers t JOIN k6.caps c ON t.lower > 0 AND s.balance > 0",
+                    laid_before("s"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o WHERE EXISTS (SELECT 1 FROM k6.caps c, \
+                     k6.stated s JOIN k6.tiers t ON s.balance >= t.lower AND c.owner = o.owner)",
+                    laid_before("c"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower AND nosuch.x = 1",
+                    Err(said(
+                        "42P01",
+                        "missing FROM-clause entry for table \"nosuch\"",
+                    )),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower AND nosuch = 1",
+                    Err(said("42703", "column \"nosuch\" does not exist")),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, LATERAL (SELECT 1 FROM k6.stated s \
+                     JOIN k6.tiers t ON s.balance = t.lower AND o.owner = 'x') q",
+                    count("0"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.owners p \
+                     ON p.acct = s.acct AND owner = 'ann' WHERE o.acct = s.acct",
+                    count("2"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.stated s JOIN k6.owners p ON p.acct = s.acct \
+                     AND acct = 'x'",
+                    Err(said("42702", "column reference \"acct\" is ambiguous")),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.owners p \
+                     ON p.acct = s.acct AND o.owner = 'x' WHERE o.acct = s.acct",
+                    laid_before("o"),
+                ),
+            ],
+            true,
+        );
+        // Answered, in a step alone (a table joined on no key the question as written refuses): a
+        // CROSS JOIN's left side, a bare name its join's sides hold once, the WHERE's reading the
+        // whole FROM.
+        each_outcome(
+            &mut w,
+            &[
+                (
+                    "SELECT count(*) FROM k6.owners o CROSS JOIN k6.stated s JOIN k6.tiers t \
+                     ON s.balance = t.lower AND o.owner = 'x'",
+                    count("0"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower AND acct = 'x'",
+                    count("0"),
+                ),
+                (
+                    "SELECT count(*) FROM k6.owners o, k6.stated s JOIN k6.tiers t \
+                     ON s.balance >= t.lower WHERE o.owner = 'ann'",
+                    count("10"),
+                ),
+            ],
+            false,
+        );
+        let subquery = "SELECT (SELECT count(*) FROM k6.stated s JOIN k6.tiers t \
+             ON s.balance >= t.lower AND o.owner = 'x') FROM k6.owners o, k6.caps c";
+        let want = vec!["0".to_string(); if none { 0 } else { 10 }];
+        assert_eq!(outcome(&mut w, subquery), Ok(want), "{subquery}");
+    }
+}
+
+/// A relation an ON names that its FROM joins only after it is missing there, as 18.6's parser
+/// finds it: by its entry where qualified, and a bare name of it by its column alone.
+#[test]
+fn a_relation_joined_after_an_on_is_missing_there() {
+    for (name, inserts) in [("on-after-rows", &K6_ROWS[..]), ("on-after-none", &[][..])] {
+        let path = declared(name, K6, inserts);
+        let mut w = Snail::open_writing(&path).unwrap();
+        each_outcome(
+            &mut w,
+            &[
+                (
+                    "SELECT count(*) FROM k6.stated s JOIN k6.tiers t ON length(o.owner) > 0 \
+                     JOIN k6.owners o ON o.acct = s.acct",
+                    Err(said("42P01", "missing FROM-clause entry for table \"o\"")),
+                ),
+                (
+                    "SELECT count(*) FROM k6.stated s JOIN k6.tiers t ON length(owner) > 0 \
+                     JOIN k6.owners o ON o.acct = s.acct",
+                    Err(said("42703", "column \"owner\" does not exist")),
+                ),
+                (
+                    "SELECT count(*) FROM k6.stated s JOIN k6.owners p ON p.acct = s.acct \
+                     AND o.owner = 'x' JOIN k6.owners o ON o.acct = s.acct",
+                    Err(said("42P01", "missing FROM-clause entry for table \"o\"")),
+                ),
+            ],
+            true,
+        );
+    }
+}
