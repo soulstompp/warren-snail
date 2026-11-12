@@ -6990,18 +6990,6 @@ pub(super) fn draws(e: &Expr) -> bool {
     found
 }
 
-/// Whether an expression draws a random value or seeds the draws.
-fn draws_at_random(e: &Expr) -> bool {
-    let mut found = false;
-    let _ = sqlparser::ast::visit_expressions(e, |x| {
-        if let Expr::Function(f) = x {
-            found |= super::prng::is_drawing(&function_name(f));
-        }
-        std::ops::ControlFlow::<()>::Continue(())
-    });
-    found
-}
-
 /// COALESCE, LEAST, GREATEST and NULLIF, each in the type the step resolved it to: COALESCE its
 /// first argument not NULL, read in turn and no further; LEAST and GREATEST the least and the
 /// greatest of those not NULL, under the collation their arguments settle; NULLIF its first
@@ -8010,9 +7998,10 @@ pub(super) fn prepare<'q>(
             Some(lead)
         }
     };
-    // An item that draws from a sequence and is no sort key is made above the sort and below the
-    // cut, as PostgreSQL's planner places a volatile item: in the rows' sorted order, for each row
-    // the LIMIT and OFFSET read. Under DISTINCT ON, only where it sorts by an ORDER BY.
+    // An item that draws, from a sequence or at random, and is no sort key is made above the sort
+    // and below the cut, as PostgreSQL's planner places a volatile item: in the rows' sorted order,
+    // for each row the LIMIT and OFFSET read, beside grouping, windows and sets too. Under DISTINCT
+    // ON, only where it sorts by an ORDER BY.
     // So are its select list's sets, where no sort key and nothing below its fold holds one and it
     // has no DISTINCT nor DISTINCT ON: each row carried past the sort becomes their rows, one at a
     // time as the cut reads them. Where a sort key holds one, they are made before the sort, and the
@@ -8042,22 +8031,6 @@ pub(super) fn prepare<'q>(
             .collect(),
         false => Vec::new(),
     };
-    // Beside grouping, windows or a set the snail makes such an item before the sort, where
-    // PostgreSQL draws it after: a random draw there is refused, its values otherwise drawn in
-    // another order.
-    let made_before = grouped || !calls.windows.is_empty() || !calls.sets.is_empty();
-    if cuts && made_before {
-        if let Some((_, (e, _))) = items
-            .iter()
-            .enumerate()
-            .find(|(i, (e, _))| !sorted.contains(i) && draws_at_random(e))
-        {
-            return Err(Error::new(format!(
-                "{e} beside grouping, a window or a set-returning function, made after an ORDER BY \
-                 or a LIMIT, is not read"
-            )));
-        }
-    }
     // The deepest level makes the items where none of its sets stands inside an expression.
     let levels = calls.levels();
     let listed = || items.iter().map(|(e, _)| *e).chain(hidden.iter().copied());

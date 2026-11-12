@@ -3302,16 +3302,45 @@ fn random_draws_as_postgresql_draws_after_setseed() {
             ("SELECT 1::void", "42846", "cannot cast type integer to void"),
         ],
     );
-    // The snail's own: beside grouping, a window or a set it makes such an item before the sort,
-    // where 18.6 makes it after.
-    for sql in [
-        "SELECT g % 2 AS k, random() FROM generate_series(1, 4) g GROUP BY g % 2 ORDER BY 1",
-        "SELECT id, random(), row_number() OVER (ORDER BY id) FROM dn.a ORDER BY id LIMIT 2",
-        "SELECT generate_series(1, 2) AS s, random() ORDER BY 1",
+    // Beside grouping, a window or a set, drawn after the sort in the sorted order, each row the
+    // cut reads, the ending pass's draw among them; the draw after each 18.6's.
+    for (sql, want, after) in [
+        (
+            "SELECT g % 2 AS k, random() FROM generate_series(1, 4) g GROUP BY g % 2 ORDER BY 1",
+            vec!["0|0.9851677175347999", "1|0.825301858027981"],
+            "0.12974610012450416",
+        ),
+        (
+            "SELECT id, random(), row_number() OVER (ORDER BY id) FROM dn.a ORDER BY id LIMIT 2",
+            vec!["1|0.9851677175347999|1", "2|0.825301858027981|2"],
+            "0.12974610012450416",
+        ),
+        (
+            "SELECT generate_series(1, 2) AS s, random() ORDER BY 1",
+            vec!["1|0.9851677175347999", "2|0.825301858027981"],
+            "0.12974610012450416",
+        ),
+        (
+            "SELECT g % 2 AS k, random() FROM generate_series(1, 4) g GROUP BY g % 2 ORDER BY 1 \
+             DESC LIMIT 1",
+            vec!["1|0.9851677175347999"],
+            "0.825301858027981",
+        ),
+        (
+            "SELECT id, random_normal() AS r FROM dn.a ORDER BY id DESC LIMIT 2",
+            vec!["7|2.5832426701605056", "6|-0.45134209986141144"],
+            "0.6476186144084",
+        ),
+        (
+            "SELECT generate_series(1, 2) AS s, random() AS r FROM dn.a WHERE id < 3 ORDER BY id \
+             DESC LIMIT 3",
+            vec!["1|0.9851677175347999", "2|0.825301858027981", "1|0.16356291958601088"],
+            "0.6476186144084",
+        ),
     ] {
-        let words = "random() beside grouping, a window or a set-returning function, made after \
-                     an ORDER BY or a LIMIT, is not read";
-        assert_eq!(refused(&mut w, sql), (None, words.to_string()), "{sql}");
+        seeded(&mut w, "0.5");
+        assert_eq!(rows(&mut w, sql), want, "{sql}");
+        assert_eq!(rows(&mut w, "SELECT random()"), [after], "after {sql}");
     }
 }
 
