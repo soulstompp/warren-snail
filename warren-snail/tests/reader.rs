@@ -3998,3 +3998,257 @@ fn a_cast_the_question_path_reads_no_level_of_is_answered() {
     let mut w = Snail::open_writing(&path).unwrap();
     answered(&mut w, &asked);
 }
+
+/// PostgreSQL's refusal of a sort key of a type it finds no ordering for, with its HINT.
+fn no_ordering(ty: &str) -> String {
+    format!(
+        "could not identify an ordering operator for type {ty}\nHINT:  Use an explicit ordering \
+         operator or modify the query."
+    )
+}
+
+/// PostgreSQL's refusal of a key that groups or finds DISTINCT values, of a type it finds no
+/// equality for.
+fn no_equality(ty: &str) -> String {
+    format!("could not identify an equality operator for type {ty}")
+}
+
+#[test]
+fn a_key_of_no_ordering_is_refused_before_any_row() {
+    let mut w = snail("unordered");
+    for sql in [
+        "CREATE TABLE dn.jj (id integer PRIMARY KEY, v json, p point)",
+        "CREATE TYPE dn.c AS (x json)",
+    ] {
+        w.execute(sql).unwrap();
+    }
+    // Over dn.a's rows, whose k no json reads, and over dn.jj's none: refused as each is read.
+    let asked = [
+        ("SELECT id FROM dn.a ORDER BY k::json", no_ordering("json")),
+        ("SELECT id FROM dn.a WHERE false ORDER BY k::json DESC, id", no_ordering("json")),
+        ("SELECT id FROM dn.jj ORDER BY p", no_ordering("point")),
+        ("SELECT id, v FROM dn.jj ORDER BY 2", no_ordering("json")),
+        ("SELECT id FROM dn.a ORDER BY ARRAY[k::json]", no_ordering("json[]")),
+        ("SELECT id FROM dn.a ORDER BY ROW(k::json)::dn.c", no_ordering("dn.c")),
+        ("SELECT DISTINCT k::json FROM dn.a", no_equality("json")),
+        ("SELECT DISTINCT v FROM dn.jj", no_equality("json")),
+        ("SELECT v FROM dn.jj GROUP BY v", no_equality("json")),
+        ("SELECT p FROM dn.jj GROUP BY 1", no_equality("point")),
+        ("SELECT id, k::json FROM dn.a ORDER BY 2", no_ordering("json")),
+        ("SELECT k::json FROM dn.a GROUP BY 1", no_equality("json")),
+        ("SELECT max(id) FROM dn.a GROUP BY ROW(k::json)::dn.c", no_equality("dn.c")),
+        ("SELECT DISTINCT ON (ARRAY[k::json]) id FROM dn.a", no_equality("json[]")),
+        ("SELECT id, rank() OVER (ORDER BY k::json) FROM dn.a", no_ordering("json")),
+        ("SELECT id, rank() OVER (PARTITION BY p) FROM dn.jj", no_equality("point")),
+        ("SELECT count(DISTINCT k::json) FROM dn.a", no_equality("json")),
+        ("SELECT array_agg(id ORDER BY v) FROM dn.jj", no_ordering("json")),
+        // In the order PostgreSQL's parser reads them: an aggregate's keys with the select list,
+        // the ORDER BY, then GROUP BY and DISTINCT, then LIMIT, then a window's ORDER BY before
+        // its PARTITION BY.
+        ("SELECT DISTINCT k FROM dn.a ORDER BY k::json", no_ordering("json")),
+        ("SELECT id FROM dn.a GROUP BY id, k::json ORDER BY id::text::xml", no_ordering("xml")),
+        (
+            "SELECT id, count(DISTINCT k::json) FROM dn.a GROUP BY id ORDER BY k::xml",
+            no_equality("json"),
+        ),
+        ("SELECT id, rank() OVER (ORDER BY k::xml) FROM dn.a ORDER BY k::json", no_ordering("json")),
+        ("SELECT id FROM dn.a ORDER BY k::json LIMIT 'x'", no_ordering("json")),
+        (
+            "SELECT id, rank() OVER (PARTITION BY k::json ORDER BY k::xml) FROM dn.a",
+            no_ordering("xml"),
+        ),
+        ("SELECT v, p FROM dn.jj GROUP BY v, p ORDER BY 2", no_ordering("point")),
+        (
+            "SELECT k::json AS kj, k::xml AS kx FROM dn.a GROUP BY 1, 2 ORDER BY 2",
+            no_ordering("xml"),
+        ),
+        ("SELECT count(*) FROM dn.jj GROUP BY id ORDER BY v", no_ordering("json")),
+    ];
+    for (sql, words) in asked {
+        assert_eq!(refused(&mut w, sql), (Some("42883"), words), "{sql}");
+    }
+    // A row constructor's record is compared only as two rows meet.
+    answered(
+        &mut w,
+        &[
+            ("SELECT id FROM dn.a WHERE false ORDER BY ROW(k::json)", &[]),
+            ("SELECT DISTINCT ON (ROW(k::json)) id FROM dn.a WHERE false", &[]),
+        ],
+    );
+    // xid has an equality and no ordering: DISTINCT answers; a sort is refused, an aggregate's
+    // DISTINCT with its DETAIL.
+    answered(&mut w, &[("SELECT DISTINCT '1'::xid FROM dn.a", &["1"])]);
+    assert_eq!(
+        refused(&mut w, "SELECT id FROM dn.a ORDER BY '1'::xid"),
+        (Some("42883"), no_ordering("xid"))
+    );
+    assert_eq!(
+        refused(&mut w, "SELECT count(DISTINCT k::xid) FROM dn.a WHERE false"),
+        (
+            Some("42883"),
+            "could not identify an ordering operator for type xid\nDETAIL:  Aggregates with \
+             DISTINCT must be able to sort their inputs."
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn a_values_list_is_a_question_of_its_own() {
+    let mut w = snail("values");
+    answered(
+        &mut w,
+        &[
+            ("VALUES (1, 'a'), (2, 'b') ORDER BY 1 DESC", &["2|b", "1|a"]),
+            ("VALUES (1)", &["1"]),
+            ("VALUES (1, 'a'), (2, 'b') ORDER BY column2 DESC LIMIT 1", &["2|b"]),
+            ("VALUES (1) UNION ALL VALUES (2)", &["1", "2"]),
+            ("VALUES (1, 2) OFFSET 0 FETCH FIRST 1 ROW ONLY", &["1|2"]),
+            ("VALUES (1, NULL), (NULL, 'x')", &["1|NULL", "NULL|x"]),
+            ("VALUES (1), (2.5)", &["1", "2.5"]),
+            ("VALUES (3), (1), (2) ORDER BY column1 + 0 DESC", &["3", "2", "1"]),
+            ("VALUES (3), (1), (2) ORDER BY \"*VALUES*\".column1", &["1", "2", "3"]),
+            ("VALUES (3), (1), (2) ORDER BY 1 LIMIT 2 OFFSET 1", &["2", "3"]),
+            ("WITH w AS (VALUES (2), (1) ORDER BY 1 LIMIT 1) SELECT * FROM w", &["1"]),
+            (
+                "SELECT * FROM (VALUES (2, 'b'), (1, 'a') ORDER BY 1 DESC LIMIT 1) AS v(n, s)",
+                &["2|b"],
+            ),
+            ("(VALUES (2), (1) ORDER BY 1) UNION ALL VALUES (3)", &["1", "2", "3"]),
+            ("VALUES (1), (NULL) ORDER BY 1 NULLS FIRST", &["NULL", "1"]),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[
+            ("VALUES (1), ('a')", "22P02", "invalid input syntax for type integer: \"a\""),
+            (
+                "VALUES (generate_series(1, 2))",
+                "0A000",
+                "set-returning functions are not allowed in VALUES",
+            ),
+            ("VALUES (1, 'a'), (2)", "42601", "VALUES lists must all be the same length"),
+            ("VALUES (1), (2) FOR UPDATE", "0A000", "FOR UPDATE cannot be applied to VALUES"),
+            ("VALUES (1) FOR SHARE", "0A000", "FOR SHARE cannot be applied to VALUES"),
+            // Its values, its ORDER BY and its LIMIT are read before its locking clause.
+            (
+                "VALUES (1), ('a') FOR UPDATE",
+                "22P02",
+                "invalid input syntax for type integer: \"a\"",
+            ),
+            (
+                "VALUES (1) ORDER BY 2 FOR UPDATE",
+                "42P10",
+                "ORDER BY position 2 is not in select list",
+            ),
+            ("VALUES (1) ORDER BY x", "42703", "column \"x\" does not exist"),
+            (
+                "VALUES (1, 'a') ORDER BY column3",
+                "42703",
+                "column \"column3\" does not exist\nHINT:  Perhaps you meant to reference the \
+                 column \"*VALUES*.column1\" or the column \"*VALUES*.column2\".",
+            ),
+            ("VALUES (1) LIMIT 'x'", "22P02", "invalid input syntax for type bigint: \"x\""),
+        ],
+    );
+    assert_eq!(
+        refused(&mut w, "VALUES ('{}'::json) ORDER BY 1"),
+        (Some("42883"), no_ordering("json"))
+    );
+}
+
+#[test]
+fn distinct_orders_by_a_cast_to_its_own_type() {
+    let mut w = snail("distinct-cast");
+    answered(
+        &mut w,
+        &[
+            ("SELECT DISTINCT g FROM dn.a ORDER BY g::integer", &["10", "20", "30", "NULL"]),
+            (
+                "SELECT DISTINCT g FROM dn.a ORDER BY (g)::integer DESC",
+                &["NULL", "30", "20", "10"],
+            ),
+            (
+                "SELECT DISTINCT g, k FROM dn.a ORDER BY k::text, g::integer DESC",
+                &["20|x", "10|x", "30|y", "20|y", "NULL|NULL"],
+            ),
+            ("SELECT DISTINCT g AS x FROM dn.a ORDER BY g::integer", &["10", "20", "30", "NULL"]),
+            (
+                "SELECT DISTINCT g + 1 AS x FROM dn.a ORDER BY (g + 1)::integer",
+                &["11", "21", "31", "NULL"],
+            ),
+            (
+                "SELECT DISTINCT g FROM dn.a ORDER BY g::integer::integer DESC",
+                &["NULL", "30", "20", "10"],
+            ),
+            (
+                "SELECT DISTINCT count(*) AS n FROM dn.a GROUP BY g ORDER BY count(*)::bigint",
+                &["1", "2"],
+            ),
+        ],
+    );
+    let words = "for SELECT DISTINCT, ORDER BY expressions must appear in select list";
+    refusals(
+        &mut w,
+        &[
+            ("SELECT DISTINCT g FROM dn.a ORDER BY g::bigint", "42P10", words),
+            ("SELECT DISTINCT k FROM dn.a ORDER BY k::varchar", "42P10", words),
+            ("SELECT DISTINCT g FROM dn.a ORDER BY id", "42P10", words),
+            (
+                "SELECT DISTINCT count(*) AS n FROM dn.a GROUP BY g ORDER BY count(*)::integer",
+                "42P10",
+                words,
+            ),
+        ],
+    );
+}
+
+#[test]
+fn select_all_is_no_distinct_anywhere() {
+    let mut w = snail("all");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT ALL g FROM dn.a ORDER BY g FOR UPDATE",
+                &["10", "10", "20", "20", "30", "NULL", "NULL"],
+            ),
+            (
+                "SELECT ALL g FROM dn.a WHERE g IS NOT NULL ORDER BY g, id FOR SHARE",
+                &["10", "10", "20", "20", "30"],
+            ),
+        ],
+    );
+    // A view of SELECT ALL is updatable.
+    w.execute("CREATE VIEW dn.va AS SELECT ALL id, k FROM dn.a").unwrap();
+    assert_eq!(w.execute("UPDATE dn.va SET k = k WHERE id = 1").unwrap().rows, 1);
+    answered(
+        &mut w,
+        &[
+            ("SELECT k FROM dn.va WHERE id = 1", &["x"]),
+            // An arm of SELECT ALL leaves its literal to the set operation's type.
+            ("SELECT 1 UNION SELECT ALL '2' ORDER BY 1", &["1", "2"]),
+        ],
+    );
+    // A cursor over SELECT ALL is updatable where it stands.
+    w.execute("BEGIN").unwrap();
+    w.execute("DECLARE c CURSOR FOR SELECT ALL id, k FROM dn.a WHERE id = 3").unwrap();
+    answered(&mut w, &[("FETCH 1 FROM c", &["3|x"])]);
+    assert_eq!(
+        w.execute("UPDATE dn.a SET k = 'z' WHERE CURRENT OF c").unwrap().rows,
+        1
+    );
+    w.execute("COMMIT").unwrap();
+    answered(&mut w, &[("SELECT id, k FROM dn.a WHERE k = 'z'", &["3|z"])]);
+    // An INSERT … SELECT ALL draws each row's DEFAULTs after its calls for that row.
+    w.execute("CREATE TABLE dn.t (id serial PRIMARY KEY, b bigint, k integer)").unwrap();
+    w.execute(
+        "INSERT INTO dn.t (b, k) SELECT ALL nextval('dn.t_id_seq'), id FROM dn.a WHERE id < 4 \
+         ORDER BY id",
+    )
+    .unwrap();
+    answered(
+        &mut w,
+        &[("SELECT id, b, k FROM dn.t ORDER BY id", &["2|1|1", "4|3|2", "6|5|3"])],
+    );
+}

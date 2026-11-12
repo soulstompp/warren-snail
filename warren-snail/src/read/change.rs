@@ -683,6 +683,20 @@ fn defaults_taken<'a>(
     counts.into_iter().enumerate().collect::<Vec<_>>().into_iter()
 }
 
+/// Whether an INSERT's VALUES draws a DEFAULT inside its question, which only a statement run on
+/// a tab answers.
+fn drawn_in_its_question(st: &Statement) -> bool {
+    match st.written() {
+        Statement::Insert {
+            source: Source::Computed(rows),
+            ..
+        } => rows
+            .iter()
+            .any(|(r, _)| r.iter().any(|f| matches!(f, Fill::Drawn(_)))),
+        _ => false,
+    }
+}
+
 /// The type of each column of an answer, as the snail answers a column of that type.
 pub(super) fn answer_types(batch: &RecordBatch) -> Result<Vec<ColumnType>> {
     let types: Vec<ColumnType> = batch
@@ -1378,10 +1392,15 @@ impl Snail {
                 let mark = self.mark();
                 // The rows the statement found when it began, which it keeps to if it runs again.
                 let mut found = None;
-                // A statement that calls the sequence functions runs on a tab; a run that owes the
-                // file is undone, its calls replayed on the file, and the statement runs again
-                // over what they came to.
-                let mut runs = match self.sequence_runs(text) {
+                // A statement that calls the sequence functions runs on a tab, as does an INSERT
+                // whose VALUES draws its DEFAULTs inside its question; a run that owes the file is
+                // undone, its calls replayed on the file, and the statement runs again over what
+                // they came to.
+                let runs = match drawn_in_its_question(&st) {
+                    true => self.runs().map(Some),
+                    false => self.sequence_runs(text),
+                };
+                let mut runs = match runs {
                     Ok(r) => r,
                     Err(e) => {
                         self.failed()?;
@@ -2254,12 +2273,14 @@ impl Snail {
     /// The rows a VALUES list gives where a cell is an expression, as 18.6 makes them row by row:
     /// every row's expressions typed against their columns first; then each row's question answered
     /// as the reader answers one, its expressions computed and its DEFAULTs drawn in their order
-    /// among its calls, and the row filled and checked before the next is computed.
+    /// among its calls, and the row filled and checked before the next is computed. One row is a
+    /// select list: each row its question answers is a row given, none where it answers none.
     fn computed(
         &mut self,
         table: usize,
         rows: Vec<(Vec<Fill>, Option<String>)>,
     ) -> Result<Vec<Row>> {
+        let one = rows.len() == 1;
         let t = self.catalog.tables[table].clone();
         given_refused(&t, rows.iter().map(|(r, _)| r))?;
         for (r, q) in &rows {
@@ -2282,19 +2303,24 @@ impl Snail {
         let mut drawn = self.draws(&t, defaults_taken(&t, rows.iter().map(|(r, _)| r)))?;
         let mut out = Vec::with_capacity(rows.len());
         for (r, q) in rows {
-            let (a, types) = match q {
-                None => (Row::new(), Vec::new()),
+            let (answers, types) = match q {
+                None => (vec![Row::new()], Vec::new()),
                 Some(q) => {
                     let (batch, _) = self.answer(&q, None)?;
                     let types = assigned_types(&self.catalog, &q, &batch, table, &answered(&r))?;
-                    let a = rows_of(&batch)?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| Error::new("a VALUES row's question answers its row"))?;
-                    (a, types)
+                    let mut answers = rows_of(&batch)?;
+                    if !one {
+                        answers.truncate(1);
+                        if answers.is_empty() {
+                            return Err(Error::new("a VALUES row's question answers its row"));
+                        }
+                    }
+                    (answers, types)
                 }
             };
-            out.push(self.row_filled(&t, r, &a, &types, &mut drawn)?);
+            for a in answers {
+                out.push(self.row_filled(&t, r.clone(), &a, &types, &mut drawn)?);
+            }
         }
         Ok(out)
     }
@@ -2570,13 +2596,18 @@ impl Snail {
         {
             return Ok(None);
         }
-        Ok(Some(Runs {
+        self.runs().map(Some)
+    }
+
+    /// A statement's runs on a tab, from what the session holds.
+    fn runs(&self) -> Result<Runs> {
+        Ok(Runs {
             start: self.drawn.clone(),
             held: self.handed.clone(),
             stands: self.sequences_standing()?,
             script: Vec::new(),
             replays: 0,
-        }))
+        })
     }
 
     /// The tab a run of the statement is lent: what the session holds, and what the replays so

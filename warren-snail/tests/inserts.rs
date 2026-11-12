@@ -358,3 +358,70 @@ fn a_value_given_a_generated_column_is_refused_in_postgresql_s_words() {
     );
     assert_eq!(rows(&mut w, "SELECT * FROM v4.g"), "1|5|50");
 }
+
+#[test]
+fn a_set_in_a_one_row_values_inserts_a_row_for_each_value() {
+    let mut w = snail("set");
+    run(
+        &mut w,
+        &["CREATE SCHEMA u1", "CREATE TABLE u1.v (n integer PRIMARY KEY)"],
+    );
+    let inserted = |w: &mut Snail, sql: &str| w.execute(sql).unwrap().rows;
+    assert_eq!(inserted(&mut w, "INSERT INTO u1.v VALUES (generate_series(1, 3))"), 3);
+    assert_eq!(
+        inserted(&mut w, "INSERT INTO u1.v (n) VALUES (generate_series(1, 0))"),
+        0
+    );
+    assert_eq!(
+        rows(&mut w, "INSERT INTO u1.v VALUES (unnest(ARRAY[7, 8])) RETURNING n"),
+        "7;8"
+    );
+    // Several rows take no set; one row's sets run beside each other, the shorter giving NULL.
+    assert_eq!(
+        refused(&mut w, "INSERT INTO u1.v VALUES (generate_series(1, 2)), (5)"),
+        (
+            Some("0A000"),
+            "set-returning functions are not allowed in VALUES".to_string()
+        )
+    );
+    assert_eq!(
+        refused(
+            &mut w,
+            "INSERT INTO u1.v VALUES (generate_series(1, 2) + generate_series(10, 12)) RETURNING n"
+        ),
+        (
+            Some("23502"),
+            "null value in column \"n\" of relation \"v\" violates not-null constraint: Failing \
+             row contains (null)."
+                .to_string()
+        )
+    );
+    assert_eq!(rows(&mut w, "SELECT n FROM u1.v ORDER BY n"), "1;2;3;7;8");
+    // Each row's DEFAULTs, and the draw a bare set's last call makes past its rows.
+    run(
+        &mut w,
+        &["CREATE TABLE u1.w (n integer PRIMARY KEY, m integer DEFAULT 0, s serial)"],
+    );
+    assert_eq!(
+        rows(
+            &mut w,
+            "INSERT INTO u1.w VALUES (generate_series(1, 2), DEFAULT) RETURNING n, m, s"
+        ),
+        "1|0|1;2|0|2"
+    );
+    assert_eq!(rows(&mut w, "SELECT nextval('u1.w_s_seq')"), "4");
+    run(&mut w, &["INSERT INTO u1.w (n) VALUES (generate_series(11, 10))"]);
+    assert_eq!(rows(&mut w, "SELECT nextval('u1.w_s_seq')"), "6");
+    assert_eq!(
+        rows(
+            &mut w,
+            "INSERT INTO u1.w (s, n) VALUES (DEFAULT, generate_series(21, 22) + 0) RETURNING n, s"
+        ),
+        "21|7;22|8"
+    );
+    assert_eq!(rows(&mut w, "SELECT nextval('u1.w_s_seq')"), "9");
+    assert_eq!(
+        rows(&mut w, "SELECT * FROM u1.w ORDER BY n"),
+        "1|0|1;2|0|2;21|0|7;22|0|8"
+    );
+}

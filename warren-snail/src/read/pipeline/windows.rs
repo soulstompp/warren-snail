@@ -359,6 +359,14 @@ pub(super) fn checked(
                 ));
             }
         }
+        // Its ORDER BY's operators found before any row, then its PARTITION BY's, as PostgreSQL's
+        // parser reads a window's definition.
+        for o in &spec.order_by {
+            super::sort_item(o, typing.type_of(&o.expr)?)?;
+        }
+        for e in &spec.partition_by {
+            super::grouped_type(typing.type_of(e)?)?;
+        }
         let Some(fr) = &spec.window_frame else {
             continue;
         };
@@ -833,15 +841,9 @@ fn ordered(a: &[Value], b: &[Value], items: &[OrderByExpr]) -> Result<Ordering> 
 fn sort_key(v: Value, under: Option<Casing>) -> Result<Value> {
     match v {
         Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _) if !ty.ordered() => {
-            Err(Error::new(format!(
-                "could not identify an ordering operator for type {}",
-                ty.pg_name()
-            )))
+            Err(super::unordered(&ty.pg_name()))
         }
-        Value::Geometric(g) => Err(Error::new(format!(
-            "could not identify an ordering operator for type {}",
-            g.kind().name()
-        ))),
+        Value::Geometric(g) => Err(super::unordered(g.kind().name())),
         v => Ok(match (under, v.string_key()) {
             (Some(Casing::Library(id)), Some(s)) => Value::Bytes(crate::collations::get(id).key(s)),
             _ => v,

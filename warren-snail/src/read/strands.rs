@@ -141,7 +141,7 @@ pub(super) fn wants(q: &Query) -> Option<Wants<'_>> {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return None;
     };
-    if s.from.len() != 1 || s.distinct.is_some() || s.having.is_some() {
+    if s.from.len() != 1 || super::pipeline::says_distinct(s) || s.having.is_some() {
         return None;
     }
     let grouping: &[Expr] = match &s.group_by {

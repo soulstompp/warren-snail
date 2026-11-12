@@ -1681,6 +1681,31 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
         };
         listed.push((label.unwrap_or_else(|| from.default_name(it)), it));
     }
+    // An ORDER BY item naming a column of a type with no ordering is refused before GROUP BY is
+    // read, as PostgreSQL's parser reads the ORDER BY first.
+    if let Some(OrderByKind::Expressions(exprs)) = q.order_by.as_ref().map(|o| &o.kind) {
+        for o in exprs {
+            let named = match (number(&o.expr), &o.expr) {
+                (Some(n), _) => listed.get((n as usize).wrapping_sub(1)).map(|(_, i)| *i),
+                (None, Expr::Identifier(i)) => listed
+                    .iter()
+                    .find(|(n, _)| *n == ident(i))
+                    .map(|(_, i)| *i)
+                    .or_else(|| from.key_of(&o.expr).ok().map(Item::Key)),
+                (None, e) => from.key_of(e).ok().map(Item::Key),
+            };
+            if let (
+                Some(Item::Key(Key::Column(c))),
+                None | Some(OrderBySort::Asc | OrderBySort::Desc),
+            ) = (named, &o.options.sort)
+            {
+                let ty = from.table(c.side).column_at(c.column).ty;
+                if !ty.ordered() {
+                    return Err(super::pipeline::unordered(&ty.pg_name()));
+                }
+            }
+        }
+    }
     let grouping = match &s.group_by {
         GroupByExpr::Expressions(e, modifiers) if modifiers.is_empty() => e,
         _ => return Err(Error::new("GROUP BY ALL and its modifiers are not read")),
@@ -1813,15 +1838,6 @@ pub fn parse(catalog: &Catalog, sql: &str) -> Result<Question> {
                     )))
                 }
             };
-            if let (_, Item::Key(Key::Column(c))) = listed[at] {
-                let ty = from.table(c.side).column_at(c.column).ty;
-                if !ty.ordered() {
-                    return Err(Error::new(format!(
-                        "could not identify an ordering operator for type {}",
-                        ty.pg_name()
-                    )));
-                }
-            }
             order.push(Sort {
                 at,
                 desc,

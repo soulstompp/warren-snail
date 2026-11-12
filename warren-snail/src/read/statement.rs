@@ -1167,10 +1167,10 @@ fn draw_item(catalog: &Catalog, col: &crate::catalog::Column) -> Option<String> 
 }
 
 /// Each VALUES row's question: its expressions and, where the statement calls the sequence
-/// functions, its DEFAULTs a sequence hands out, in the order 18.6 computes a row's. A VALUES list
-/// of several rows is read row by row, each row's list in its order, a DEFAULT in its place,
-/// then the columns the list leaves out in the table's; one row alone is computed in the table's
-/// order.
+/// functions or its one row holds a set, its DEFAULTs a sequence hands out, in the order 18.6
+/// computes a row's. A VALUES list of several rows is read row by row, each row's list in its
+/// order, a DEFAULT in its place, then the columns the list leaves out in the table's; one row
+/// alone is computed in the table's order.
 fn computed_rows(
     catalog: &Catalog,
     table: &Table,
@@ -1327,7 +1327,11 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             match computed {
                 false => Source::Filled(rows),
                 true => {
-                    let draws = calls_sequences(catalog, &i.to_string());
+                    // One row holding a set is a select list, as 18.6 reads it: its DEFAULTs a
+                    // sequence hands out are drawn inside its question, row by row.
+                    let set = v.rows.len() == 1
+                        && v.rows[0].content.iter().any(super::pipeline::holds_set);
+                    let draws = set || calls_sequences(catalog, &i.to_string());
                     Source::Computed(computed_rows(catalog, table, rows, &columns, draws))
                 }
             }
@@ -1366,7 +1370,7 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
             // DEFAULTs after its question's calls for that row. A DISTINCT question makes its
             // rows whole before any is written, and its DEFAULTs are drawn after it, as 18.6
             // draws them.
-            if s.distinct.is_none() && calls_sequences(catalog, &i.to_string()) {
+            if !super::pipeline::says_distinct(s) && calls_sequences(catalog, &i.to_string()) {
                 for (c, col) in table.columns.iter().enumerate() {
                     if !matches!(fill[c], Fill::Default) {
                         continue;

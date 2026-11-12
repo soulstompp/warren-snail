@@ -738,7 +738,7 @@ fn lift(
         }
         SetExpr::Values(_) => {
             if query.order_by.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
-                return Err(Error::new("a VALUES list sorted or limited is not read"));
+                return sorted_values(out, name, query, renames);
             }
         }
         SetExpr::SetOperation { .. } => {
@@ -763,6 +763,58 @@ fn lift(
             .into_iter()
             .map(|q| (q, Default::default()))
             .collect(),
+        recursion: None,
+        laid: Vec::new(),
+    });
+    Ok(())
+}
+
+/// A VALUES list sorted or cut: the list a step of its own, and over it a step reading it as
+/// `*VALUES*`, as PostgreSQL names the list, its columns `column1` on, that sorts and cuts it.
+fn sorted_values(
+    out: &mut Vec<Step>,
+    name: String,
+    query: Query,
+    renames: Vec<String>,
+) -> Result<()> {
+    let list = fresh("values");
+    let mut values = query.clone();
+    values.order_by = None;
+    values.limit_clause = None;
+    values.fetch = None;
+    out.push(Step {
+        name: list.clone(),
+        query: values,
+        renames: Vec::new(),
+        origin: Origin::With,
+        inside: Inside::default(),
+        calls: Vec::new(),
+        set: None,
+        laterals: Vec::new(),
+        recursion: None,
+        laid: Vec::new(),
+    });
+    let parsed = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        "SELECT * FROM x",
+    )?;
+    let [sqlparser::ast::Statement::Query(star)] = parsed.as_slice() else {
+        unreachable!("one SELECT")
+    };
+    let mut query = query;
+    query.body = star.body.clone();
+    if let SetExpr::Select(s) = query.body.as_mut() {
+        s.from[0].relation = plain(&list, Some(alias_named("*VALUES*")));
+    }
+    out.push(Step {
+        name,
+        query,
+        renames,
+        origin: Origin::With,
+        inside: Inside::default(),
+        calls: Vec::new(),
+        set: None,
+        laterals: Vec::new(),
         recursion: None,
         laid: Vec::new(),
     });
@@ -3925,6 +3977,11 @@ pub(super) fn is_set_operation(q: &Query) -> bool {
     matches!(q.body.as_ref(), SetExpr::SetOperation { .. })
 }
 
+/// Whether a question is a VALUES list, which these steps read as a set operation's arm is read.
+pub(super) fn is_values(q: &Query) -> bool {
+    matches!(q.body.as_ref(), SetExpr::Values(_))
+}
+
 /// A query of a body alone.
 fn query_of(body: SetExpr) -> Query {
     let parsed =
@@ -4166,7 +4223,7 @@ fn untyped_of(q: &Query) -> Vec<Untyped> {
     let grouped =
         !matches!(&s.group_by, sqlparser::ast::GroupByExpr::Expressions(g, _) if g.is_empty());
     if q.order_by.is_some()
-        || s.distinct.is_some()
+        || pipeline::says_distinct(s)
         || grouped
         || s.projection.iter().any(|i| {
             matches!(

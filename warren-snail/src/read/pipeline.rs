@@ -431,6 +431,98 @@ fn unequal(part: ColumnType) -> Error {
     ))
 }
 
+/// The HINT under PostgreSQL's refusal of a sort key of no ordering.
+const NO_ORDERING: &str = "\nHINT:  Use an explicit ordering operator or modify the query.";
+
+/// PostgreSQL's refusal of a sort key of the type it names, which it finds no ordering for.
+pub(super) fn unordered(name: &str) -> Error {
+    Error::new(format!(
+        "could not identify an ordering operator for type {name}{NO_ORDERING}"
+    ))
+}
+
+/// Whether a type is the record a row constructor makes, of no declared type: PostgreSQL's parser
+/// finds an ordering and an equality for every such record, and compares its fields only as two
+/// rows meet.
+fn anonymous_record(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Composed(r)
+        if matches!(r.def(), crate::composed::Composed::Record { name, .. } if name == "record"))
+}
+
+/// A sort key's type as PostgreSQL's parser reads it, before any row: refused where it finds no
+/// ordering for it, a declared composite by its fields and an array by its elements.
+pub(super) fn sorted_type(ty: Option<ColumnType>) -> Result<()> {
+    match ty {
+        Some(t) if !t.ordered() && !anonymous_record(t) => Err(unordered(&t.pg_name())),
+        _ => Ok(()),
+    }
+}
+
+/// A key that groups or finds DISTINCT values, read as PostgreSQL's parser reads its type before
+/// any row: refused, naming the type itself, where it finds no equality for it.
+pub(super) fn grouped_type(ty: Option<ColumnType>) -> Result<()> {
+    match ty {
+        Some(t) if !t.grouped() && !anonymous_record(t) => Err(unequal(t)),
+        _ => Ok(()),
+    }
+}
+
+/// An ORDER BY item of type `ty`, read as PostgreSQL's parser reads it before any row: by the
+/// operator it names after USING, else by its type's ordering.
+pub(super) fn sort_item(o: &sqlparser::ast::OrderByExpr, ty: Option<ColumnType>) -> Result<()> {
+    match o.options.sort {
+        Some(OrderBySort::Using(_)) => super::ordering::checked(&o.options, ty),
+        _ => sorted_type(ty),
+    }
+}
+
+/// An aggregate's DISTINCT arguments and its ORDER BY, read as PostgreSQL's parser reads them as
+/// it reads the call, before any row: each ORDER BY item sorted, then each argument found
+/// DISTINCT and sorted.
+fn folded_keys(call: &Expr, typing: &mut super::typed::Typing) -> Result<()> {
+    let Expr::Function(f) = call else {
+        return Ok(());
+    };
+    if f.over.is_some() {
+        return Ok(());
+    }
+    let mut by: Vec<&sqlparser::ast::OrderByExpr> = f.within_group.iter().collect();
+    let mut distinct = Vec::new();
+    if let FunctionArguments::List(l) = &f.args {
+        for c in &l.clauses {
+            if let sqlparser::ast::FunctionArgumentClause::OrderBy(o) = c {
+                by.extend(o);
+            }
+        }
+        if matches!(
+            l.duplicate_treatment,
+            Some(sqlparser::ast::DuplicateTreatment::Distinct)
+        ) {
+            distinct.extend(l.args.iter().filter_map(|a| match a {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    Some(e)
+                }
+                _ => None,
+            }));
+        }
+    }
+    for o in by {
+        sort_item(o, typing.type_of(&o.expr)?)?;
+    }
+    for e in distinct {
+        let ty = typing.type_of(e)?;
+        grouped_type(ty)?;
+        if let Some(t) = ty.filter(|t| !t.ordered() && !anonymous_record(*t)) {
+            return Err(Error::new(format!(
+                "could not identify an ordering operator for type {}\nDETAIL:  Aggregates with \
+                 DISTINCT must be able to sort their inputs.",
+                t.pg_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A value as a key that groups, refused where PostgreSQL has no equality to group it by.
 fn grouped_key(v: &Value) -> Result<Key> {
     match v {
@@ -7756,11 +7848,6 @@ pub(super) fn prepare<'q>(
         for o in os {
             sorted.push(match sorted_by(&o.expr, &items, columns, "ORDER BY")? {
                 Some(at) => at,
-                None if distinct => {
-                    return Err(Error::new(
-                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
-                    ))
-                }
                 None => hidden_place(&o.expr, &mut hidden, items.len(), columns),
             });
         }
@@ -7850,46 +7937,6 @@ pub(super) fn prepare<'q>(
     if grouped && !calls.windows.is_empty() {
         return Err(Error::new("a window over groups is not read"));
     }
-    // Where it groups, a column read outside an aggregate is one it groups by, or one its group by
-    // the table's primary key decides, as PostgreSQL's parser holds it.
-    if grouped {
-        let decided: Vec<&str> = keyed
-            .iter()
-            .filter(|(q, key)| {
-                !key.is_empty()
-                    && key.iter().all(|k| {
-                        grouping.iter().any(|g| {
-                            resolved(g, columns).is_some_and(|(cq, cn, _)| {
-                                cq.as_deref().map(unmarked) == Some(q.as_str()) && cn == k
-                            })
-                        })
-                    })
-            })
-            .map(|(q, _)| q.as_str())
-            .collect();
-        for e in items
-            .iter()
-            .map(|(e, _)| *e)
-            .chain(hidden.iter().copied())
-            .chain(having)
-        {
-            if let Some((q, n)) = ungrouped(e, &grouping, columns, &decided) {
-                return Err(Error::new(format!(
-                    "column \"{q}.{n}\" must appear in the GROUP BY clause or be used in an \
-                     aggregate function"
-                )));
-            }
-        }
-        // A subquery read on each group reads only what is one value for it.
-        for &at in around {
-            let e = Expr::Identifier(sqlparser::ast::Ident::new(format!("{MERGED}{at}")));
-            if let Some((q, n)) = ungrouped(&e, &grouping, columns, &decided) {
-                return Err(Error::new(format!(
-                    "subquery uses ungrouped column \"{q}.{n}\" from outer query"
-                )));
-            }
-        }
-    }
     let mut typing = super::typed::Typing {
         columns,
         release,
@@ -7917,35 +7964,61 @@ pub(super) fn prepare<'q>(
     for a in &lifted {
         typing.type_of(a)?;
     }
-    if let Some(l) = &limit {
-        l.check(&mut typing)?;
+    // Each key's operators found before any row, in the order PostgreSQL's parser reads them: an
+    // aggregate's as it reads the call, the select list's and HAVING's first; then each ORDER BY
+    // item, an aggregate it holds before it; then GROUP BY's; then DISTINCT's other items.
+    let folded = |e: &'q Expr| {
+        let mut c = Calls::default();
+        find_calls(e, &mut c);
+        c.aggregates
+    };
+    for e in items.iter().map(|(e, _)| *e).chain(having) {
+        for call in folded(e) {
+            folded_keys(call, &mut typing)?;
+        }
     }
     if let Some(OrderByKind::Expressions(os)) = q.order_by.as_ref().map(|o| &o.kind) {
         for (o, &at) in os.iter().zip(&sorted) {
             let ty = match returns.get(at) {
                 Some(t) => *t,
-                None => typing.type_of(hidden[at - items.len()])?,
+                None => {
+                    for call in folded(hidden[at - items.len()]) {
+                        folded_keys(call, &mut typing)?;
+                    }
+                    typing.type_of(hidden[at - items.len()])?
+                }
             };
-            super::ordering::checked(&o.options, ty)?;
+            sort_item(o, ty)?;
         }
     }
-    for call in calls.aggregates.iter().chain(calls.windows.iter()) {
-        if let Expr::Function(f) = call {
-            let mut by: Vec<&sqlparser::ast::OrderByExpr> = f.within_group.iter().collect();
-            if let FunctionArguments::List(l) = &f.args {
-                for c in &l.clauses {
-                    if let sqlparser::ast::FunctionArgumentClause::OrderBy(o) = c {
-                        by.extend(o);
-                    }
-                }
-            }
-            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
-                by.extend(&spec.order_by);
-            }
-            for o in by {
-                super::ordering::checked(&o.options, typing.type_of(&o.expr)?)?;
+    for g in &grouping {
+        grouped_type(typing.type_of(g)?)?;
+    }
+    if distinct {
+        // Under DISTINCT an ORDER BY item is one of the select list's, read alike once each cast
+        // to its operand's own type is passed over; any other is refused.
+        let typed = Some(&typing.types);
+        for at in sorted.iter_mut() {
+            let Some(own) = at.checked_sub(items.len()) else {
+                continue;
+            };
+            *at = items
+                .iter()
+                .position(|(x, _)| alike(x, hidden[own], columns, typed))
+                .ok_or_else(|| {
+                    Error::new(
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                    )
+                })?;
+        }
+        for (i, ty) in returns.iter().enumerate() {
+            if !sorted.contains(&i) {
+                grouped_type(*ty)?;
             }
         }
+    }
+    if let Some(l) = &limit {
+        l.check(&mut typing)?;
     }
     let listed: Vec<&Expr> = items.iter().map(|(e, _)| *e).collect();
     windows::checked(&calls.windows, &listed, &mut typing, release)?;
@@ -8002,9 +8075,7 @@ pub(super) fn prepare<'q>(
                     Some(t) => *t,
                     None => typing.type_of(hidden[k - items.len()])?,
                 };
-                if let Some(part) = ty.and_then(ColumnType::unequal_part) {
-                    return Err(unequal(part));
-                }
+                grouped_type(ty)?;
                 sorted.push(k);
                 lead = sorted.len();
             }
@@ -8028,6 +8099,46 @@ pub(super) fn prepare<'q>(
             Some(lead)
         }
     };
+    // Where it groups, a column read outside an aggregate is one it groups by, or one its group by
+    // the table's primary key decides, as PostgreSQL's parser holds it once the rest is read.
+    if grouped {
+        let decided: Vec<&str> = keyed
+            .iter()
+            .filter(|(q, key)| {
+                !key.is_empty()
+                    && key.iter().all(|k| {
+                        grouping.iter().any(|g| {
+                            resolved(g, columns).is_some_and(|(cq, cn, _)| {
+                                cq.as_deref().map(unmarked) == Some(q.as_str()) && cn == k
+                            })
+                        })
+                    })
+            })
+            .map(|(q, _)| q.as_str())
+            .collect();
+        for e in items
+            .iter()
+            .map(|(e, _)| *e)
+            .chain(hidden.iter().copied())
+            .chain(having)
+        {
+            if let Some((q, n)) = ungrouped(e, &grouping, columns, &decided) {
+                return Err(Error::new(format!(
+                    "column \"{q}.{n}\" must appear in the GROUP BY clause or be used in an \
+                     aggregate function"
+                )));
+            }
+        }
+        // A subquery read on each group reads only what is one value for it.
+        for &at in around {
+            let e = Expr::Identifier(sqlparser::ast::Ident::new(format!("{MERGED}{at}")));
+            if let Some((q, n)) = ungrouped(&e, &grouping, columns, &decided) {
+                return Err(Error::new(format!(
+                    "subquery uses ungrouped column \"{q}.{n}\" from outer query"
+                )));
+            }
+        }
+    }
     // An item that draws, from a sequence or at random, and is no sort key is made above the sort
     // and below the cut, as PostgreSQL's planner places a volatile item: in the rows' sorted order,
     // for each row the LIMIT and OFFSET read, beside grouping, windows and sets too. Under DISTINCT
@@ -9673,6 +9784,15 @@ pub fn run(q: &Query, table: &Table, params: &[String]) -> Result<Relation> {
     s.finish()
 }
 
+/// Whether a SELECT returns each row once, by DISTINCT or DISTINCT ON: SELECT ALL returns every row,
+/// as one that says neither.
+pub(super) fn says_distinct(s: &sqlparser::ast::Select) -> bool {
+    matches!(
+        s.distinct,
+        Some(sqlparser::ast::Distinct::Distinct | sqlparser::ast::Distinct::On(_))
+    )
+}
+
 /// Whether a question the question path does not read is handed to the pipeline: it reads no
 /// table; it returns each row once, or some of its rows (LIMIT, OFFSET, FETCH), or keeps the groups
 /// HAVING holds of; it returns a star, or reads a relation other than a table, a join by USING or
@@ -9690,7 +9810,7 @@ pub fn hands_over(q: &Query) -> bool {
         return false;
     }
     if s.from.is_empty()
-        || s.distinct.is_some()
+        || says_distinct(s)
         || q.limit_clause.is_some()
         || q.fetch.is_some()
         || s.having.is_some()

@@ -1825,13 +1825,14 @@ impl Snail {
                 round.directory_pages_predicted += touched;
                 return Ok((batch, round));
             }
+            let relations = relations::is_set_operation(q) || relations::is_values(q);
             if pipeline::is_pipeline(q)
-                || relations::is_set_operation(q)
+                || relations
                 || pipeline::tests_composite_null(&self.catalog, q)
                 || pipeline::reads_per_row(&self.catalog, q)
                 || image::asks_an_operator(sql)
             {
-                if order.is_some() && (pipeline::is_pipeline(q) || relations::is_set_operation(q)) {
+                if order.is_some() && (pipeline::is_pipeline(q) || relations) {
                     return Err(self.along_its_own_order(sql));
                 }
                 return self.ask_pipeline(q, params);

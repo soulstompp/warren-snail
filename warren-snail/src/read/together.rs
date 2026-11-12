@@ -308,6 +308,7 @@ fn answer_lying(snails: &[&Snail], sql: &str, lying: &mut Lying) -> Result<Round
         || subqueries::held(asked)
         || pipeline::is_pipeline(asked)
         || relations::is_set_operation(asked)
+        || relations::is_values(asked)
         || pipeline::tests_composite_null(&catalog, asked)
         || pipeline::reads_per_row(&catalog, asked)
         || relations::names_a_view(&catalog, asked);

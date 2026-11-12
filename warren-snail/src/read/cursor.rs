@@ -499,7 +499,7 @@ impl Cursor {
         };
         if s.from.len() != 1
             || !s.from[0].joins.is_empty()
-            || s.distinct.is_some()
+            || super::pipeline::says_distinct(s)
             || s.having.is_some()
             || !matches!(&s.group_by, sqlparser::ast::GroupByExpr::Expressions(g, _) if g.is_empty())
             || q.with.is_some()

@@ -108,15 +108,9 @@ pub(super) fn sort_key(
                 Value::Scalar(ty, _) | Value::Composed(ty, _) | Value::Typed(ty, _)
                     if !ty.ordered() =>
                 {
-                    Err(Error::new(format!(
-                        "could not identify an ordering operator for type {}",
-                        ty.pg_name()
-                    )))
+                    Err(super::unordered(&ty.pg_name()))
                 }
-                Value::Geometric(g) => Err(Error::new(format!(
-                    "could not identify an ordering operator for type {}",
-                    g.kind().name()
-                ))),
+                Value::Geometric(g) => Err(super::unordered(g.kind().name())),
                 v => Ok(match (under[i], v.string_key()) {
                     (Some(Casing::Library(id)), Some(s)) => {
                         Value::Bytes(crate::collations::get(id).key(s))

@@ -349,6 +349,16 @@ impl Snail {
             [Sql::Query(q)] => (**q).clone(),
             _ => return Err(Error::new(format!("{first} is read only on a SELECT"))),
         };
+        // A VALUES list is read whole, its lengths, its values' types, its ORDER BY and its LIMIT,
+        // before its locking clause is refused; read so, its calls move no sequence.
+        if let SetExpr::Values(_) = q.body.as_ref() {
+            let _probing = super::sequences::probing();
+            self.answer_with(&l.question, None, params)?;
+            return Err(Error::coded(
+                "0A000",
+                format!("{first} cannot be applied to VALUES"),
+            ));
+        }
         if q.with.is_some() {
             return Err(Error::new(format!(
                 "{first} beside WITH is not read: lock the rows of a question on tables"
@@ -378,7 +388,7 @@ impl Snail {
                 }
             }
         }
-        if s.distinct.is_some() {
+        if super::pipeline::says_distinct(s) {
             return Err(Error::new(format!(
                 "{first} is not allowed with DISTINCT clause"
             )));

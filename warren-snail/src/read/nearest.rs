@@ -119,7 +119,11 @@ fn asked<'q>(catalog: &Catalog, q: &'q Query) -> Option<Asked<'q>> {
         return None;
     };
     let plain = matches!(&s.group_by, GroupByExpr::Expressions(g, _) if g.is_empty());
-    if !plain || !from.joins.is_empty() || s.distinct.is_some() || s.having.is_some() {
+    if !plain
+        || !from.joins.is_empty()
+        || super::pipeline::says_distinct(s)
+        || s.having.is_some()
+    {
         return None;
     }
     let TableFactor::Table {

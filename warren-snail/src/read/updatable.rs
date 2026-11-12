@@ -41,7 +41,7 @@ pub(crate) fn through(
             "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.",
         ));
     };
-    if s.distinct.is_some() {
+    if super::pipeline::says_distinct(s) {
         return Ok(Err("Views containing DISTINCT are not automatically updatable."));
     }
     if !matches!(&s.group_by, GroupByExpr::Expressions(g, _) if g.is_empty()) {
