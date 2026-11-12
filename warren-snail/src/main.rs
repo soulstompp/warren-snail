@@ -750,7 +750,7 @@ fn cmd_recut(args: &[String]) -> Result<()> {
         println!(
             "{} {}: {}, {}",
             w.table,
-            w.order,
+            warren_snail::catalog::order_shown(&w.order),
             n(w.rows as u64, "row"),
             n(w.blocks as u64, "block")
         );
@@ -887,7 +887,7 @@ fn cmd_write(args: &[String]) -> Result<()> {
         println!(
             "{} {}: {}, {}, its directory {} in {}, its page maps {}",
             w.table,
-            w.order,
+            warren_snail::catalog::order_shown(&w.order),
             n(w.rows as u64, "row"),
             n(w.blocks as u64, "block"),
             n(w.index_pages, "page"),
@@ -1243,7 +1243,7 @@ fn print_round(question: &str, d: &Done) {
         "{question}, round {}: {}, along {}",
         d.n,
         n(r.rows, "row"),
-        r.order
+        warren_snail::catalog::order_shown(&r.order)
     );
     println!(
         "    pages: {} as it began, {} of the directory ({} held), {} of columns predicted, {} of them \

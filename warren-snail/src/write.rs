@@ -42,7 +42,7 @@ impl Rows {
     pub fn from_batches(table: &Table, batches: &[RecordBatch]) -> Result<Rows> {
         let mut columns = Vec::with_capacity(table.columns.len());
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        for c in &table.columns {
+        for c in table.own_columns() {
             let mut out = Values::new(c.ty);
             // A virtual column is computed at the read: no order holds it, and its rows give it
             // no value.
@@ -1103,6 +1103,23 @@ fn write_tables(
                 out.push(written);
             }
             continue;
+        };
+        // A table with no column of a B-tree lies as its rows are given: numbered from 1.
+        let numbered;
+        let rows = match table.arrival() {
+            Some(a) if rows.columns.len() == a => {
+                let n = rows.len() as i64;
+                numbered = Rows {
+                    columns: rows
+                        .columns
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(Values::Int((1..=n).map(Some).collect())))
+                        .collect(),
+                };
+                &numbered
+            }
+            _ => rows,
         };
         for (ci, (c, values)) in table.columns.iter().zip(&rows.columns).enumerate() {
             if values.len() != rows.len() {

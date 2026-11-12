@@ -396,7 +396,7 @@ impl Snail {
         let order = &table.orders[oi];
         let (head, blocks) = self.blocks_of(table, oi)?;
         // The columns it stores: a virtual one is computed again from them when read.
-        let stored: Vec<usize> = (0..table.columns.len())
+        let stored: Vec<usize> = (0..table.own_columns().len())
             .filter(|&c| !table.columns[c].is_virtual())
             .collect();
         // Each stored column's leaves, each with its column, its descriptor and its slot in the order.

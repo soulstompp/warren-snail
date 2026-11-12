@@ -177,7 +177,7 @@ fn table_of(catalog: &Catalog, oid: u32) -> Option<&Table> {
 
 /// A table's columns as an expression over it reads them.
 pub(crate) fn columns_of(cat: &Cat, t: &Table) -> Vec<Column> {
-    t.columns
+    t.own_columns()
         .iter()
         .enumerate()
         .map(|(i, c)| {
@@ -206,7 +206,7 @@ pub(crate) fn column_type(cat: &Cat, c: &crate::catalog::Column) -> (u32, i32) {
 /// The names of a relation's columns, by number.
 fn names_of(catalog: &Catalog, relid: u32) -> Option<Vec<String>> {
     if let Some(t) = table_of(catalog, relid) {
-        return Some(t.columns.iter().map(|c| c.name.clone()).collect());
+        return Some(t.own_columns().iter().map(|c| c.name.clone()).collect());
     }
     match catalog.oids.object(relid)? {
         Object::Class(n) => catalog

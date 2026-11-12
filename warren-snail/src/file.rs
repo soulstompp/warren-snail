@@ -67,6 +67,13 @@ pub(crate) fn holds(format: u32, table: &crate::catalog::Table) -> crate::Result
             table.name, o.name
         )));
     }
+    // 0.1.x refuses a table whose DDL names no order in the DDL it reads.
+    if table.orders.iter().any(|o| o.given()) {
+        return Err(crate::Error::new(format!(
+            "{} names no key, and lies along every column it orders, {way}",
+            table.name
+        )));
+    }
     // 0.1.x refuses any index but a B-tree in the DDL it reads.
     if let Some(o) = table
         .orders

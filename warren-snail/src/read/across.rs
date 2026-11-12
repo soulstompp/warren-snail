@@ -318,7 +318,8 @@ impl Snails {
             for t in &c.tables {
                 names.push(t.name.clone());
                 let schema = t.name.rsplit_once('.').map_or("", |(s, _)| s);
-                for o in &t.orders {
+                // The order a table is given where its DDL names none names no relation.
+                for o in t.orders.iter().filter(|o| !o.given()) {
                     names.push(match schema {
                         "" => o.name.clone(),
                         s => format!("{s}.{}", o.name),

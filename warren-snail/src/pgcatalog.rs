@@ -400,7 +400,12 @@ fn alone(c: &Catalog) -> Vec<(u32, Vec<String>)> {
         let n = full(&t.name);
         let (schema, _) = parts(&n);
         let mut names = vec![n.clone()];
-        names.extend(t.orders.iter().map(|o| format!("{schema}.{}", o.name)));
+        names.extend(
+            t.orders
+                .iter()
+                .filter(|o| !o.given())
+                .map(|o| format!("{schema}.{}", o.name)),
+        );
         names.extend(t.brins.iter().map(|b| format!("{schema}.{}", b.name)));
         names.extend(
             c.tables
@@ -1116,7 +1121,8 @@ impl<'a> File<'a> {
 
     /// Each index of a table, by its name: its method, its key columns as the table's columns
     /// numbered from 1 (0 for an expression), the columns its INCLUDE names, whether it is unique and
-    /// whether it stands for the primary key.
+    /// whether it stands for the primary key. The order a table is given where its DDL names none is
+    /// no index.
     fn indexes_of(&self, tb: &Table) -> Vec<IndexFacts> {
         let mut out: Vec<IndexFacts> = Vec::new();
         // A key's collation: its COLLATE's, else its column's; an expression here keys no text.
@@ -1129,7 +1135,7 @@ impl<'a> File<'a> {
                 _ => 0,
             }
         };
-        for o in &tb.orders {
+        for o in tb.orders.iter().filter(|o| !o.given()) {
             out.push(IndexFacts {
                 name: o.name.clone(),
                 method: o.method,
@@ -1221,7 +1227,7 @@ impl<'a> File<'a> {
                 'r',
                 self.oid(Object::Type(name.clone())),
                 0,
-                tb.columns.len(),
+                tb.own_columns().len(),
             );
             let indexes = self.indexes_of(tb);
             r.insert("relhasindex", Some(t(!indexes.is_empty())));
@@ -1677,7 +1683,7 @@ impl<'a> File<'a> {
         for tb in self.tables() {
             let n = full(&tb.name);
             let rel = self.oid(Object::Class(n.clone()));
-            for (i, c) in tb.columns.iter().enumerate() {
+            for (i, c) in tb.own_columns().iter().enumerate() {
                 let mut r = self.attribute(rel, i as i16 + 1, &c.name, c.ty, c.domain.as_deref());
                 r.insert("attndims", Some(c.dims.to_string()));
                 r.insert("attcollation", Some(self.column_collation(c).to_string()));
@@ -2118,7 +2124,7 @@ impl<'a> File<'a> {
             let n = full(&tb.name);
             let rel = class(&n);
             out.many(rel, vec![schema_of(&n)], 'n');
-            for (i, c) in tb.columns.iter().enumerate() {
+            for (i, c) in tb.own_columns().iter().enumerate() {
                 let col = Addr::column(rel.oid, i as i32 + 1);
                 out.one(col, Addr::of(d::TYPE, self.facts(c.ty, c.domain.as_deref()).oid), 'n');
                 if let Some(k) = collation(self.column_collation(c)) {

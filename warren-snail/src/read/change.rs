@@ -877,7 +877,7 @@ fn returning_list(
         }
     };
     let spread = |side: Option<&str>| -> Vec<String> {
-        t.columns
+        t.own_columns()
             .iter()
             .map(|c| format!("{} AS {}", quoted(&kept_name(side, &c.name)), quoted(&c.name)))
             .collect()
@@ -2152,9 +2152,45 @@ impl Snail {
         Ok(changes)
     }
 
+    /// Each row a write lands in a table with no column of a B-tree numbered as it arrives: the
+    /// table's last number's plus one, in the statement's order. A row an UPDATE writes keeps the
+    /// number it found.
+    fn arrived(&mut self, table: usize, changes: &mut [Change]) -> Result<()> {
+        let t = &self.catalog.tables[table];
+        let Some(a) = t.arrival() else {
+            return Ok(());
+        };
+        if !changes
+            .iter()
+            .any(|c| matches!(c, Change::Insert(r) if r[a] == Datum::Null))
+        {
+            return Ok(());
+        }
+        let last = format!(
+            "SELECT max(\"{}\") FROM {}",
+            crate::catalog::ARRIVAL,
+            t.name
+        );
+        let (b, _) = self.answer(&last, None)?;
+        let mut next = match rows_of(&b)?.first().map(|r| &r[0]) {
+            Some(Datum::Int(n)) => *n,
+            _ => 0,
+        };
+        for c in changes {
+            if let Change::Insert(r) = c {
+                if r[a] == Datum::Null {
+                    next += 1;
+                    r[a] = Datum::Int(next);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A write's changes applied, or held unapplied for a write inside WITH until every write of
     /// its statement has found its rows.
-    fn put(&mut self, table: usize, changes: Vec<Change>) -> Result<(u64, u64)> {
+    fn put(&mut self, table: usize, mut changes: Vec<Change>) -> Result<(u64, u64)> {
+        self.arrived(table, &mut changes)?;
         // Each new row written through a view meets the conditions of its CHECK OPTIONs.
         if let Some((through, conditions)) = &self.checking {
             if *through == table {

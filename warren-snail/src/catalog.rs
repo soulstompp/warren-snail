@@ -1148,7 +1148,33 @@ impl Column {
     pub fn is_virtual(&self) -> bool {
         self.generated.as_ref().is_some_and(|g| !g.stored)
     }
+
+    /// Whether it is the number a table with no column of a B-tree is laid out along: stored, read
+    /// by its name, and no column of the table its DDL declares.
+    pub fn is_arrival(&self) -> bool {
+        self.name == ARRIVAL
+    }
+
+    /// The number a table with no column of a B-tree is laid out along, as each row lands: its
+    /// last's plus one. It has no DEFAULT and no NOT NULL, so that it takes no OID.
+    pub fn arrival() -> Column {
+        Column {
+            name: ARRIVAL.to_string(),
+            ty: ColumnType::Int8,
+            not_null: false,
+            default: None,
+            generated: None,
+            identity: None,
+            collation: None,
+            domain: None,
+            library: None,
+            dims: 0,
+        }
+    }
 }
+
+/// The name of the number a table with no column of a B-tree is laid out along: no DDL writes it.
+pub const ARRIVAL: &str = "\u{1}arrival";
 
 /// One level of an order: a column, or the month of a timestamptz column on the UTC clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1320,7 +1346,25 @@ pub struct Exclusion {
     pub deferrable: bool,
 }
 
+/// The name of the order a table is given where its DDL names none: no DDL writes it, so it is no
+/// index's, and it names no relation.
+pub const GIVEN: &str = "\u{1}given";
+
+/// An order's name as `write` and EXPLAIN print it: the order a table is given, in words.
+pub fn order_shown(name: &str) -> &str {
+    if name == GIVEN {
+        "(every column it orders)"
+    } else {
+        name
+    }
+}
+
 impl Order {
+    /// Whether it is the order a table is given where its DDL names none: its own, and no index.
+    pub fn given(&self) -> bool {
+        self.name == GIVEN
+    }
+
     /// Whether it stands for a PRIMARY KEY or UNIQUE `WITHOUT OVERLAPS`: an EXCLUDE on GiST, `=` on
     /// each key but its last, `&&` on its last, a range or a multirange.
     pub fn without_overlaps(&self) -> bool {
@@ -1497,6 +1541,24 @@ impl Table {
         self.elements_of.is_none()
     }
 
+    /// The columns its DDL declares: every one but the number a table with no column of a B-tree
+    /// is laid out along, which lies past them.
+    pub fn own_columns(&self) -> &[Column] {
+        match self.columns.last() {
+            Some(c) if c.is_arrival() => &self.columns[..self.columns.len() - 1],
+            _ => &self.columns,
+        }
+    }
+
+    /// The place of the number it is laid out along as rows land, where its DDL gives it no column
+    /// of a B-tree.
+    pub fn arrival(&self) -> Option<usize> {
+        self.columns
+            .last()
+            .filter(|c| c.is_arrival())
+            .map(|_| self.columns.len() - 1)
+    }
+
     /// The column at a place: one of its own, or, past them, a system column a question reads
     /// beside them (`CTID`, `TABLEOID`).
     pub fn column_at(&self, c: usize) -> &Column {
@@ -1619,24 +1681,44 @@ impl Table {
     }
 
     /// What `write` says of a table laid out on a key handed out as rows arrive, where it is: the
-    /// DDL names no other order for it.
+    /// DDL names no other order for it. A table whose DDL names no key is laid out along every
+    /// column it orders, and said to be, its first column's arrival said where it leads.
     pub fn laid_out_on_arrival(&self) -> Option<String> {
-        let c = self.arrival_key()?;
         let order = self.orders.iter().find(|o| o.table_order)?;
+        if self.arrival().is_some() {
+            return Some(format!(
+                "{}: laid out as its rows arrive, since the DDL names no key and no column of it \
+                 has a B-tree: its blocks follow the rows' arrival, and each insert meets the newest",
+                self.name
+            ));
+        }
+        let Some(c) = self.arrival_key() else {
+            return order.given().then(|| {
+                format!(
+                    "{}: laid out along every column it orders, since the DDL names no key: equal \
+                     rows share a place",
+                    self.name
+                )
+            });
+        };
         let col = &self.columns[c];
+        let (along, on, names) = match order.given() {
+            true => ("every column it orders", format!("{} first", col.name), "no key"),
+            false => (order.name.as_str(), col.name.clone(), "no other order"),
+        };
         Some(if col.default.as_ref().is_some_and(hands_out_at_random) {
             format!(
-                "{}: laid out along {}, on {}, a key handed out at random as rows arrive, since the \
-                 DDL names no other order: each insert lands where its key falls, scattered across \
-                 the blocks",
-                self.name, order.name, col.name
+                "{}: laid out along {along}, on {on}, a key handed out at random as rows arrive, \
+                 since the DDL names {names}: each insert lands where its key falls, scattered \
+                 across the blocks",
+                self.name
             )
         } else {
             format!(
-                "{}: laid out along {}, on {}, a key handed out as rows arrive, since the DDL names \
-                 no other order: its blocks follow the rows' arrival, and each insert meets the \
+                "{}: laid out along {along}, on {on}, a key handed out as rows arrive, since the DDL \
+                 names {names}: its blocks follow the rows' arrival, and each insert meets the \
                  newest",
-                self.name, order.name, col.name
+                self.name
             )
         })
     }
@@ -3300,9 +3382,58 @@ mod tests {
     }
 
     #[test]
-    fn a_table_with_no_order_is_refused() {
-        let e = refused("CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL);");
-        assert!(e.contains("has no order"), "{e}");
+    fn a_table_with_no_key_lies_along_every_column_it_orders() {
+        let c = Catalog::parse(
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer NOT NULL, p point, b text COLLATE \"C\", \
+             j json, n numeric(6,2), v integer GENERATED ALWAYS AS (a + 1), x xid, w integer \
+             GENERATED ALWAYS AS (a * 2) STORED);",
+        )
+        .unwrap();
+        let t = &c.tables[0];
+        let o = &t.orders[0];
+        assert_eq!(t.orders.len(), 1);
+        assert!(o.given() && o.table_order && !o.unique && !o.clustered);
+        assert_eq!(o.method, Method::Btree);
+        // Neither a type with no B-tree nor a virtual column.
+        let at = |n: &str| t.columns.iter().position(|c| c.name == n).unwrap();
+        assert_eq!(
+            o.levels,
+            ["a", "b", "n", "w"].map(|n| Level::Column(at(n)))
+        );
+        assert_eq!(o.keys, ["a", "b", "n", "w"]);
+        assert_eq!(o.opclasses, ["int4_ops", "text_ops", "numeric_ops", "int4_ops"]);
+        assert_eq!(o.nulls_first, [false; 4]);
+        assert_eq!(o.desc, [false; 4]);
+        // It holds every column the table stores.
+        assert!(!o.columns.contains(&at("v")) && o.columns.len() == t.columns.len() - 1);
+        // Nor text a collation library orders, so that the order is the same in every build.
+        #[cfg(feature = "collations")]
+        {
+            let c = Catalog::parse(
+                "CREATE SCHEMA s; CREATE TABLE s.t (a integer, u text COLLATE \"en-x-icu\", b text);",
+            )
+            .unwrap();
+            assert_eq!(c.tables[0].orders[0].levels, [Level::Column(0), Level::Column(2)]);
+        }
+        // An index on it is a strand beside it; CLUSTER ON names the order.
+        let c = Catalog::parse(
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer, b text); CREATE INDEX i ON s.t (b);",
+        )
+        .unwrap();
+        let names: Vec<&str> = c.tables[0].orders.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, [GIVEN, "i"]);
+        let c = Catalog::parse(
+            "CREATE SCHEMA s; CREATE TABLE s.t (a integer, b text); CREATE INDEX i ON s.t (b); \
+             ALTER TABLE s.t CLUSTER ON i;",
+        )
+        .unwrap();
+        let o = &c.tables[0].orders[0];
+        assert!(o.name == "i" && o.table_order && !o.given() && c.tables[0].orders.len() == 1);
+        // A UNIQUE names no order.
+        let c = Catalog::parse("CREATE SCHEMA s; CREATE TABLE s.t (x integer UNIQUE, y text);")
+            .unwrap();
+        let names: Vec<&str> = c.tables[0].orders.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, [GIVEN, "t_x_key"]);
     }
 
     #[test]

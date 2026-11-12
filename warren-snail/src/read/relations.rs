@@ -1891,18 +1891,25 @@ impl Laying<'_> {
             )
         };
         let mut cols = cols;
-        if renames.len() > cols.len() {
+        // The number a table with no column of a B-tree lies along is past its own, in no star.
+        let starred = match &what {
+            What::Table { table, .. } => {
+                let t = &self.catalog.tables[*table];
+                cols.len() - usize::from(t.arrival().is_some())
+            }
+            _ => cols.len(),
+        };
+        if renames.len() > starred {
             return Err(Error::new(format!(
                 "table \"{}\" has {} columns available but {} columns specified",
                 alias.as_ref().map(|a| a.name.value.clone()).unwrap_or(n),
-                cols.len(),
+                starred,
                 renames.len()
             )));
         }
         for (c, r) in cols.iter_mut().zip(&renames) {
             c.name = r.clone();
         }
-        let starred = cols.len();
         // A table's system columns, past its own, in no star.
         if let (
             true,
@@ -2359,6 +2366,7 @@ impl Laying<'_> {
                 .as_deref()
                 .is_some_and(|q| q.starts_with(MERGED))
                 && !out.contains(&c.name)
+                && c.name != crate::catalog::ARRIVAL
             {
                 out.push(c.name.clone());
             }

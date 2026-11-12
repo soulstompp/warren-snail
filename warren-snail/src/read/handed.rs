@@ -379,7 +379,7 @@ pub(crate) fn rows_of(catalog: &crate::catalog::Catalog) -> Rows {
         .iter()
         .map(|t| {
             let fields = t
-                .columns
+                .own_columns()
                 .iter()
                 .map(|c| Field {
                     name: c.name.clone(),

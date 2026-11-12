@@ -185,7 +185,8 @@ fn stars_written(q: &Query, table: &Table, qualifier: &str) -> Option<Query> {
         return None;
     };
     let columns = || {
-        relations::stored(table).map(|c| {
+        let own = table.own_columns().len();
+        relations::stored(table).filter(move |&c| c < own).map(|c| {
             SelectItem::UnnamedExpr(Expr::Identifier(Ident::with_quote(
                 '"',
                 table.columns[c].name.clone(),

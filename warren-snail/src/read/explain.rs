@@ -3,6 +3,7 @@
 //! write's pages, are printed as they came. Text, a line a row of `QUERY PLAN`, or JSON.
 
 use super::{Round, Snail};
+use crate::catalog::order_shown;
 use crate::{Error, Result};
 
 /// EXPLAIN's options, as it names them.
@@ -149,7 +150,7 @@ pub(super) fn parse_explain(sql: &str) -> Option<Result<Explain>> {
 
 /// A round's lines, as `read` prints it.
 fn round_lines(r: &Round, e: &Explain, out: &mut Vec<String>) {
-    out.push(format!("Snail round along {}: {} rows", r.order, r.rows));
+    out.push(format!("Snail round along {}: {} rows", order_shown(&r.order), r.rows));
     if e.costs {
         out.push(format!(
             "  Pages: {} as it began, {} of the directory ({} held), {} of columns predicted, {} of \
@@ -170,7 +171,7 @@ fn round_lines(r: &Round, e: &Explain, out: &mut Vec<String>) {
         for c in &r.consulted {
             out.push(format!(
                 "  Order {}: {} pages of its directory; {} to {} column pages by its directory, {}",
-                c.order,
+                order_shown(&c.order),
                 c.directory_pages,
                 c.low,
                 c.high,
@@ -259,7 +260,7 @@ pub(super) fn explain(r: &mut dyn Runs, e: &Explain) -> Result<super::Done> {
                 })?;
                 lines.push(format!(
                     "Snail round along {}: {} to {} rows, about {}",
-                    p.order, p.rows_low, p.rows_high, p.rows_estimate
+                    order_shown(&p.order), p.rows_low, p.rows_high, p.rows_estimate
                 ));
                 if e.costs {
                     lines.push(format!(
@@ -273,7 +274,7 @@ pub(super) fn explain(r: &mut dyn Runs, e: &Explain) -> Result<super::Done> {
                         lines.push(format!(
                             "  Order {}: {} pages of its directory; {} to {} column pages by its \
                              directory, {}",
-                            c.order,
+                            order_shown(&c.order),
                             c.directory_pages,
                             c.low,
                             c.high,

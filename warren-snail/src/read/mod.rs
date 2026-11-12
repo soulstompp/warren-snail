@@ -322,9 +322,12 @@ fn computed(catalog: &Catalog, q: &sqlparser::ast::Query) -> Result<Option<sqlpa
             continue;
         }
         let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        // The number a table with no column of a B-tree lies along, only where the question names
+        // it: no star reads it.
         let items: Vec<String> = t
             .columns
             .iter()
+            .filter(|c| !c.is_arrival() || words.contains(&c.name))
             .map(|c| match &c.generated {
                 Some(g) if !g.stored => format!("({}) AS {}", g.expr, quote(&c.name)),
                 _ => quote(&c.name),

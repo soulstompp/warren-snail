@@ -167,7 +167,7 @@ pub(super) fn parse_copy(
             }
             let t = &catalog.tables[ti];
             let cols = if columns_named.is_empty() {
-                (0..t.columns.len())
+                (0..t.own_columns().len())
                     .filter(|&c| !t.columns[c].is_virtual())
                     .collect()
             } else {

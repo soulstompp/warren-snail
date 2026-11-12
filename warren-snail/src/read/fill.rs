@@ -793,7 +793,7 @@ fn not_null(table: &Table, row: &Row) -> Result<()> {
 pub(crate) fn failing_row(table: &Table, row: &Row) -> String {
     const LONGEST: usize = 64;
     let values: Vec<String> = table
-        .columns
+        .own_columns()
         .iter()
         .zip(row)
         .map(|(col, d)| {

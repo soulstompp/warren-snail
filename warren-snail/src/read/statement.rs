@@ -1350,12 +1350,24 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
         columns.push(c);
     }
     if columns.is_empty() {
-        columns = (0..table.columns.len()).collect();
+        columns = (0..table.own_columns().len()).collect();
     }
-    let q: &Query = i
-        .source
-        .as_deref()
-        .ok_or_else(|| Error::new("an INSERT gives its rows"))?;
+    // DEFAULT VALUES: one row, each column given its DEFAULT, as a VALUES row of none.
+    let defaults;
+    let q: &Query = match i.source.as_deref() {
+        Some(q) => q,
+        None => {
+            let mut q = match super::image::parse_sql("VALUES (1)")?.pop() {
+                Some(sqlparser::ast::Statement::Query(q)) => q,
+                _ => unreachable!("a VALUES"),
+            };
+            if let SetExpr::Values(v) = q.body.as_mut() {
+                v.rows[0].content.clear();
+            }
+            defaults = q;
+            &defaults
+        }
+    };
     if q.with.is_some() {
         return Err(refused("a write inside WITH"));
     }

@@ -6730,7 +6730,7 @@ impl Draft {
         Ok(notices)
     }
 
-    /// The tables, each given its order and its indexes; a table with no order is refused.
+    /// The tables, each given its order and its indexes.
     fn finish(&self) -> Vec<std::result::Result<Table, (String, Error)>> {
         let tables: Vec<_> = self
             .tables
@@ -6760,9 +6760,52 @@ impl Draft {
     }
 }
 
+/// The order a table is given where its DDL names none, neither a primary key nor CLUSTER ON: every
+/// column it stores whose type has a B-tree, in the columns' order, ascending, NULLs last, each
+/// under its type's default operator class, as an index of them all names them; not unique, so
+/// equal rows share a place. A column whose text a collation library orders is no level of it, so
+/// that the order is the same in every build. With no such column the table lies as its rows
+/// arrive: along a number of its own past its columns, its one level.
+fn given(columns: &mut Vec<Column>) -> Keyed {
+    let mut levels: Vec<usize> = (0..columns.len())
+        .filter(|&c| {
+            let col = &columns[c];
+            !col.is_virtual() && col.ty.ordered() && !col.keyed_under_a_library()
+        })
+        .collect();
+    if levels.is_empty() {
+        levels.push(columns.len());
+        columns.push(Column::arrival());
+    }
+    let n = levels.len();
+    Keyed {
+        name: crate::catalog::GIVEN.to_string(),
+        method: Method::Btree,
+        predicate: None,
+        predicate_columns: Vec::new(),
+        exclusion: None,
+        keys: levels.iter().map(|&c| columns[c].name.clone()).collect(),
+        opclasses: levels
+            .iter()
+            .map(|&c| columns[c].ty.default_opclass().to_string())
+            .collect(),
+        levels: levels.into_iter().map(Level::Column).collect(),
+        include: Vec::new(),
+        unique: false,
+        nulls_first: vec![false; n],
+        nulls_distinct: true,
+        desc: vec![false; n],
+        params: vec![None; n],
+        options: Vec::new(),
+        constraint: None,
+    }
+}
+
 fn finish_table(d: &Declared) -> Result<Table> {
     let name = &d.name;
-    let columns = &d.columns;
+    let mut columns = d.columns.clone();
+    let given = (d.clustered.is_none() && d.primary.is_none()).then(|| given(&mut columns));
+    let columns = &columns;
     let all: Vec<usize> = (0..columns.len())
         .filter(|&c| !columns[c].is_virtual())
         .collect();
@@ -6797,11 +6840,10 @@ fn finish_table(d: &Declared) -> Result<Table> {
                     .is_some_and(|p| p.unique && p.levels == s.levels);
             s
         }
-        None => d.primary.clone().ok_or_else(|| {
-            Error::new(format!(
-                "{name} has no order: name one with CLUSTER ON, or give it a primary key"
-            ))
-        })?,
+        None => match (&d.primary, given) {
+            (Some(p), _) => p.clone(),
+            (None, given) => given.expect("the order a table with no key is given"),
+        },
     };
     if d.clustered.is_some() {
         if let Some(p) = &d.primary {
@@ -6994,8 +7036,8 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
         })
     };
     for t in c.tables.iter().filter(|t| t.declared()) {
-        fact("table", &t.name, "columns", t.columns.len().to_string());
-        for (i, col) in t.columns.iter().enumerate() {
+        fact("table", &t.name, "columns", t.own_columns().len().to_string());
+        for (i, col) in t.own_columns().iter().enumerate() {
             let o = format!("{}.{}", t.name, col.name);
             fact("column", &o, "position", (i + 1).to_string());
             fact(
@@ -7047,10 +7089,11 @@ pub(crate) fn facts(c: &Catalog) -> Vec<Fact> {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        // The order a table is given where its DDL names none is no index of PostgreSQL's.
         for o in t
             .orders
             .iter()
-            .filter(|o| !t.element_keys.iter().any(|k| k.index == o.name))
+            .filter(|o| !o.given() && !t.element_keys.iter().any(|k| k.index == o.name))
         {
             let obj = format!("{}.{}", t.name, o.name);
             if let Some(k) = &o.constraint {

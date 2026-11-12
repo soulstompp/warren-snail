@@ -141,9 +141,15 @@ fn a_foreign_key_is_read_as_postgresql_reads_it() {
         let e = refused_ddl(&format!("{PARENT} {ddl}"));
         assert!(e.contains(why), "{ddl}: {e}");
     }
-    // A table whose key references a table refused is refused for it.
+    // A table with no key is taken, and a key may reference its UNIQUE.
     let r = Catalog::read(
         "CREATE SCHEMA s; CREATE TABLE s.u (id integer UNIQUE); CREATE TABLE s.c (id integer PRIMARY KEY, x integer REFERENCES s.u (id));",
+    )
+    .unwrap();
+    assert!(r.statements.iter().all(|s| s.refused.is_none()), "{:?}", r.statements);
+    // A table whose key references a table refused is refused for it.
+    let r = Catalog::read(
+        "CREATE SCHEMA s; CREATE TABLE s.u (id integer UNIQUE, x xid); CREATE INDEX ux ON s.u (x); CREATE TABLE s.c (id integer PRIMARY KEY, x integer REFERENCES s.u (id));",
     )
     .unwrap();
     // The schema's statement first.
@@ -151,8 +157,8 @@ fn a_foreign_key_is_read_as_postgresql_reads_it() {
         .refused
         .as_deref()
         .unwrap()
-        .contains("has no order"));
-    assert!(r.statements[2]
+        .contains("has no default operator class"));
+    assert!(r.statements[3]
         .refused
         .as_deref()
         .unwrap()
