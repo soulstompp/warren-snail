@@ -149,7 +149,7 @@ impl relations::Reads for Snail {
     }
 }
 pub use question::{instant, truth};
-pub(crate) use spelled::scanned_unseeded;
+pub(crate) use spelled::{scanned_unseeded, scanned_view};
 pub(crate) use typed::element_of as element_type;
 
 use crate::catalog::{Catalog, Table};

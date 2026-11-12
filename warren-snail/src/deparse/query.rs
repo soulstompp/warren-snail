@@ -49,6 +49,21 @@ pub(crate) enum RteKind {
     },
     Values { rows: Vec<Vec<Node>> },
     Cte { name: String },
+    /// A function in FROM, or ROWS FROM's several, whether WITH ORDINALITY follows them, and
+    /// whether it is LATERAL: its calls read a column of the items before it.
+    Function {
+        functions: Vec<RangeFunc>,
+        ordinality: bool,
+        lateral: bool,
+    },
+}
+
+/// One function of a FROM item: its call, and the column definition list written for it, each
+/// column's name, type, typmod and the collation its COLLATE names (0 where none).
+#[derive(Clone, Debug)]
+pub(crate) struct RangeFunc {
+    pub call: Node,
+    pub coldefs: Option<Vec<(String, u32, i32, u32)>>,
 }
 
 /// A range table entry: what it reads, the alias written for it, and the name and columns the
@@ -277,6 +292,8 @@ pub(crate) struct Scope<'p> {
     pub names: RefCell<Vec<Ns>>,
     pub ctes: RefCell<Vec<CteDef>>,
     windows: RefCell<Vec<WinDef>>,
+    /// The FROM items read so far, which a function in FROM reads as LATERAL does.
+    lateral: RefCell<Vec<Ns>>,
 }
 
 impl<'p> Scope<'p> {
@@ -287,6 +304,7 @@ impl<'p> Scope<'p> {
             names: RefCell::new(Vec::new()),
             ctes: RefCell::new(Vec::new()),
             windows: RefCell::new(Vec::new()),
+            lateral: RefCell::new(Vec::new()),
         }
     }
 
@@ -745,9 +763,11 @@ impl<'b> Builder<'b, '_, '_> {
         // FROM: each item's namespace in place once every item is read.
         let mut from = Vec::new();
         let mut names = Vec::new();
+        self.scope.lateral.borrow_mut().clear();
         for twj in &s.from {
             let (jt, _, ns) = self.table_with_joins(twj)?;
             from.push(jt);
+            self.scope.lateral.borrow_mut().extend(ns.iter().cloned());
             names.extend(ns);
         }
         *self.scope.names.borrow_mut() = names;
@@ -1155,7 +1175,12 @@ impl<'b> Builder<'b, '_, '_> {
             if j.global {
                 return Err(not_read(&j.relation));
             }
-            let (rjt, rtop, rns) = self.range_item(&j.relation)?;
+            // The right side's functions read the left's items.
+            let seen = self.scope.lateral.borrow().len();
+            self.scope.lateral.borrow_mut().extend(ns.iter().cloned());
+            let right = self.range_item(&j.relation);
+            self.scope.lateral.borrow_mut().truncate(seen);
+            let (rjt, rtop, rns) = right?;
             (jt, top, ns) = self.join(jt, top, ns, rjt, rtop, rns, &j.join_operator)?;
         }
         Ok((jt, top, ns))
@@ -1178,6 +1203,24 @@ impl<'b> Builder<'b, '_, '_> {
             } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty() => {
                 let alias = alias.as_ref().map(table_alias).transpose()?;
                 self.relation_item(name, alias, true)
+            }
+            A::TableFactor::Table {
+                name,
+                alias,
+                args: Some(args),
+                with_hints,
+                version: None,
+                with_ordinality,
+                partitions,
+                json_path: None,
+                sample: None,
+                index_hints,
+            } if args.settings.is_none()
+                && with_hints.is_empty()
+                && partitions.is_empty()
+                && index_hints.is_empty() =>
+            {
+                self.function_item(name, &args.args, alias.as_ref(), *with_ordinality)
             }
             A::TableFactor::Derived {
                 lateral: false,
@@ -1249,6 +1292,212 @@ impl<'b> Builder<'b, '_, '_> {
             }
             other => Err(not_read(other)),
         }
+    }
+
+    /// transformRangeFunction and addRangeTableEntryForFunction: a function in FROM, or ROWS FROM's
+    /// several as `spelled` writes them, each with the column definition list written for it, a
+    /// list beside the item its lone function's; an unnest of several arrays inside ROWS FROM an
+    /// unnest of each. Each function's columns: its list's, or one of its type, named by the alias
+    /// where it is the item's only function, else by the function; then the ordinality.
+    fn function_item(
+        &self,
+        name: &A::ObjectName,
+        args: &[A::FunctionArg],
+        alias: Option<&A::TableAlias>,
+        ordinality: bool,
+    ) -> Result<(Jt, Ns, Vec<Ns>)> {
+        use crate::read::spelled::{column_marks, ROWS_FROM, ROWS_MARK};
+        let call_of = |name: &A::ObjectName, args: Vec<A::FunctionArg>| {
+            A::Expr::Function(A::Function {
+                name: name.clone(),
+                uses_odbc_syntax: false,
+                parameters: A::FunctionArguments::None,
+                args: A::FunctionArguments::List(A::FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args,
+                    clauses: Vec::new(),
+                }),
+                filter: None,
+                null_treatment: None,
+                over: None,
+                within_group: Vec::new(),
+            })
+        };
+        // Each call, and the list written for it: each column by its name and its type.
+        type Listed = Option<Vec<(String, A::DataType)>>;
+        let mut calls: Vec<(A::Expr, Listed)> = Vec::new();
+        if crate::catalog::object_name(name) == ROWS_FROM {
+            for a in args {
+                match a {
+                    A::FunctionArg::Unnamed(A::FunctionArgExpr::Expr(e @ A::Expr::Function(_))) => {
+                        calls.push((e.clone(), None))
+                    }
+                    A::FunctionArg::ExprNamed {
+                        name: A::Expr::Identifier(n),
+                        arg: A::FunctionArgExpr::Expr(A::Expr::Cast { data_type, .. }),
+                        ..
+                    }
+                    | A::FunctionArg::Named {
+                        name: n,
+                        arg: A::FunctionArgExpr::Expr(A::Expr::Cast { data_type, .. }),
+                        ..
+                    } => {
+                        let last = calls.last_mut().ok_or_else(|| not_read(a))?;
+                        let column = (super::analyze::folded(n), data_type.clone());
+                        last.1.get_or_insert_with(Vec::new).push(column);
+                    }
+                    other => return Err(not_read(other)),
+                }
+            }
+            let mut each = Vec::with_capacity(calls.len());
+            for (call, listed) in calls {
+                let arrays = match (&call, &listed) {
+                    (A::Expr::Function(f), None)
+                        if f.name.0.len() == 1 && crate::catalog::object_name(&f.name) == "unnest" =>
+                    {
+                        match &f.args {
+                            A::FunctionArguments::List(l) if l.args.len() > 1 => Some(l.args.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match arrays {
+                    Some(arrays) => {
+                        let unnest = A::ObjectName::from(vec![
+                            A::Ident::new("pg_catalog"),
+                            A::Ident::new("unnest"),
+                        ]);
+                        each.extend(arrays.into_iter().map(|a| (call_of(&unnest, vec![a]), None)));
+                    }
+                    None => each.push((call, listed)),
+                }
+            }
+            calls = each;
+        } else {
+            calls.push((call_of(name, args.to_vec()), None));
+        }
+        // A list beside the item, its alias's typed columns, its lone function's; an alias that
+        // names nothing stands where none is written.
+        let mut written = alias.cloned();
+        if let Some(a) = written.as_mut() {
+            if a.columns.iter().any(|c| c.data_type.is_some()) {
+                let listed = std::mem::take(&mut a.columns)
+                    .into_iter()
+                    .map(|c| {
+                        let name = super::analyze::folded(&c.name);
+                        c.data_type.map(|t| (name, t)).ok_or_else(|| not_read(a))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                match calls.as_mut_slice() {
+                    [(_, l @ None)] => *l = Some(listed),
+                    _ => return Err(not_read(a)),
+                }
+            }
+        }
+        let written = written.filter(|a| a.name.value != ROWS_MARK.to_string());
+        let alias = written.as_ref().map(table_alias).transpose()?;
+        let a = self.analyzer();
+        // Each call reads the items before it, as LATERAL does.
+        let before = self.scope.lateral.borrow().clone();
+        let before = std::mem::replace(&mut *self.scope.names.borrow_mut(), before);
+        let nodes = calls.iter().map(|(c, _)| a.expr(c)).collect::<Result<Vec<Node>>>();
+        *self.scope.names.borrow_mut() = before;
+        let lone = calls.len() == 1;
+        let mut functions = Vec::with_capacity(calls.len());
+        let mut cols: Vec<(String, u32, i32)> = Vec::new();
+        let mut first = None;
+        for ((call, listed), node) in calls.into_iter().zip(nodes?) {
+            let named = match &call {
+                A::Expr::Function(f) => f
+                    .name
+                    .0
+                    .last()
+                    .and_then(|p| p.as_ident())
+                    .map(super::analyze::folded)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            first.get_or_insert_with(|| named.clone());
+            let coldefs = match listed {
+                Some(listed) => {
+                    let mut defs = Vec::with_capacity(listed.len());
+                    for (written, dt) in listed {
+                        let (name, setof, collation) = column_marks(&written);
+                        if setof {
+                            return Err(not_read(&written));
+                        }
+                        let (ty, typmod) = a.data_type(&dt)?;
+                        let coll = match collation {
+                            Some(c) => {
+                                let quoted: Vec<String> = c
+                                    .split('.')
+                                    .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
+                                    .collect();
+                                crate::regs::reg_parse(
+                                    crate::regs::RegKind::Collation,
+                                    &quoted.join("."),
+                                    self.cat.release,
+                                )?
+                            }
+                            None => 0,
+                        };
+                        defs.push((name.to_string(), ty, typmod, coll));
+                    }
+                    Some(defs)
+                }
+                None => None,
+            };
+            match &coldefs {
+                Some(defs) => cols.extend(defs.iter().map(|(n, t, m, _)| (n.clone(), *t, *m))),
+                // A record's columns of its OUT parameters or its type are not read here.
+                None if node.ty() == cat::RECORD || self.cat.complex(node.ty()) => {
+                    return Err(not_read(&call))
+                }
+                None => {
+                    let column = match (&alias, lone) {
+                        (Some(al), true) => al.name.clone(),
+                        _ => named,
+                    };
+                    cols.push((column, node.ty(), node.typmod()));
+                }
+            }
+            functions.push(RangeFunc {
+                call: node,
+                coldefs,
+            });
+        }
+        if ordinality {
+            cols.push(("ordinality".into(), cat::INT8, -1));
+        }
+        let names = renamed(cols.iter().map(|c| c.0.clone()).collect(), alias.as_ref());
+        let ename = alias
+            .as_ref()
+            .map_or_else(|| first.unwrap_or_default(), |a| a.name.clone());
+        let mut lateral = false;
+        for f in &functions {
+            f.call.walk(&mut |n| lateral |= matches!(n, Node::Var { up: 0, .. }));
+        }
+        let rtindex = self.scope.add(Rte {
+            kind: RteKind::Function {
+                functions,
+                ordinality,
+                lateral,
+            },
+            alias,
+            ename: ename.clone(),
+            ecols: names.clone(),
+            in_from: true,
+        });
+        let ns = Ns {
+            refname: ename,
+            schema: None,
+            rel_visible: true,
+            cols_visible: true,
+            names,
+            cols: plain_cols(rtindex, &cols),
+        };
+        Ok((Jt::Ref(rtindex), ns.clone(), vec![ns]))
     }
 
     /// A relation a FROM item names, a WITH query's where `ctes` lets one be: its range table

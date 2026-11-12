@@ -1858,6 +1858,16 @@ fn pieces(ddl: &str) -> Result<Vec<Vec<Token>>> {
     cut(&crate::read::scanned_unseeded(ddl, crate::regs::LATEST)?)
 }
 
+/// A CREATE VIEW's words as `scanned_view` reads its text, where `statements` leaves them as written.
+fn view_scanned(tokens: &[Token]) -> Result<Vec<Token>> {
+    let text = written(tokens);
+    let text = crate::read::scanned_view(&text, crate::regs::LATEST)?;
+    Ok(crate::read::image::tokens(&text)?
+        .into_iter()
+        .map(|t| t.token)
+        .collect())
+}
+
 /// The statements of a text as written, split on their semicolons as `statements` splits a DDL's.
 pub(crate) fn semicolons(ddl: &str) -> Result<Vec<Vec<Token>>> {
     Ok(cut(ddl)?.into_iter().filter(|s| said(s)).collect())
@@ -3540,9 +3550,11 @@ impl Draft {
         if kind == "ALTER TABLE" {
             return self.alter_table(tokens, &object);
         }
-        // A view's WITH CHECK OPTION, which sqlparser drops, read here.
+        // A view's body read as a statement's is, its ROWS FROM and its functions' column
+        // definition lists as `spelled` writes them; its WITH CHECK OPTION, which sqlparser drops,
+        // read here.
         let (tokens, check) = match kind == "CREATE VIEW" || kind == "CREATE OR REPLACE VIEW" {
-            true => check_option(tokens),
+            true => check_option(&view_scanned(tokens)?),
             false => (tokens.to_vec(), None),
         };
         // A function's body in SQL's own words, which sqlparser reads otherwise or not at all,

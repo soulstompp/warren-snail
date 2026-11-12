@@ -347,7 +347,7 @@ impl Printer<'_, '_> {
         }
     }
 
-    fn collation_name(&self, oid: u32) -> String {
+    pub(crate) fn collation_name(&self, oid: u32) -> String {
         crate::regs::reg_text(RegKind::Collation, oid, self.cat.release)
     }
 

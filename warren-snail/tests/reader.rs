@@ -1718,6 +1718,270 @@ fn a_column_definition_list_refused_as_postgresql_refuses() {
 }
 
 #[test]
+fn a_column_definition_list_carries_a_collation() {
+    let mut w = fr("collated");
+    answered(
+        &mut w,
+        &[
+            ("SELECT x FROM jsonb_to_record('{\"x\":\"b\"}') AS t(x text COLLATE \"C\")", &["b"]),
+            (
+                "SELECT pg_collation_for(x) FROM jsonb_to_record('{\"x\":\"b\"}') \
+                 AS t(x text COLLATE \"C\")",
+                &["\"C\""],
+            ),
+            (
+                "SELECT x FROM jsonb_to_recordset('[{\"x\":\"b\"},{\"x\":\"B\"},{\"x\":\"a\"}]') \
+                 AS t(x text COLLATE \"C\") ORDER BY x",
+                &["B", "a", "b"],
+            ),
+            (
+                "SELECT * FROM ROWS FROM (jsonb_to_record('{\"x\":\"b\"}') AS (x text COLLATE \"C\"), \
+                 generate_series(1, 2)) AS r",
+                &["b|1", "NULL|2"],
+            ),
+            (
+                "SELECT pg_collation_for(x) FROM ROWS FROM (jsonb_to_record('{\"x\":\"b\"}') \
+                 AS (x text COLLATE \"C\"), generate_series(1, 2)) AS r",
+                &["\"C\"", "\"C\""],
+            ),
+            (
+                "SELECT pg_collation_for(x), x FROM jsonb_to_record('{\"x\":\"b\"}') \
+                 AS (x text COLLATE \"C\")",
+                &["\"C\"|b"],
+            ),
+            (
+                "SELECT pg_collation_for(x), pg_collation_for(y) FROM \
+                 jsonb_to_record('{\"x\":\"b\",\"y\":\"c\"}') t(x text COLLATE pg_catalog.\"C\", y text)",
+                &["\"C\"|\"default\""],
+            ),
+            (
+                "SELECT pg_collation_for(x) FROM jsonb_to_record('{\"x\":\"b\"}') \
+                 AS t(x varchar(3) COLLATE \"POSIX\")",
+                &["\"POSIX\""],
+            ),
+            (
+                "SELECT pg_collation_for(x) FROM jsonb_to_record('{\"x\":[\"b\"]}') \
+                 AS t(x text[] COLLATE \"C\")",
+                &["\"C\""],
+            ),
+            (
+                "SELECT count(*) FROM jsonb_to_recordset('[{\"x\":\"b\"},{\"x\":\"B\"}]') \
+                 AS t(x text COLLATE \"C\") WHERE x < 'a'",
+                &["1"],
+            ),
+        ],
+    );
+    refusals(
+        &mut w,
+        &[
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x integer COLLATE \"C\")",
+                "42804",
+                "collations are not supported by type integer",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x nosuchtype COLLATE \"C\")",
+                "42704",
+                "type \"nosuchtype\" does not exist",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x integer, x text COLLATE \"C\")",
+                "42701",
+                "column name \"x\" specified more than once",
+            ),
+            (
+                "SELECT * FROM generate_series(1, 2) AS t(x integer COLLATE \"C\")",
+                "42601",
+                "a column definition list is only allowed for functions returning \"record\"",
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":\"b\"}') AS t(x COLLATE \"C\")",
+                "42601",
+                "syntax error at or near \"COLLATE\"",
+            ),
+        ],
+    );
+    // A collation the machine's libraries are asked for: read and compared under ICU's, and one
+    // they do not hold refused, as 18.6 refuses it before the type's. Without the feature, each
+    // refused by name.
+    let unheld = [
+        "SELECT * FROM jsonb_to_record('{\"x\":\"b\"}') AS t(x text COLLATE nosuch)",
+        "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x integer COLLATE nosuch)",
+    ];
+    #[cfg(feature = "collations")]
+    {
+        answered(
+            &mut w,
+            &[
+                (
+                    "SELECT x FROM jsonb_to_recordset('[{\"x\":\"b\"},{\"x\":\"B\"},{\"x\":\"a\"}]') \
+                     AS t(x text COLLATE \"und-x-icu\") ORDER BY x",
+                    &["a", "b", "B"],
+                ),
+                (
+                    "SELECT pg_collation_for(x) FROM jsonb_to_record('{\"x\":\"b\"}') \
+                     AS t(x text COLLATE \"und-x-icu\")",
+                    &["\"und-x-icu\""],
+                ),
+            ],
+        );
+        for sql in unheld {
+            assert_eq!(
+                refused(&mut w, sql),
+                (
+                    Some("42704"),
+                    "collation \"nosuch\" for encoding \"UTF8\" does not exist".to_string()
+                ),
+                "{sql}"
+            );
+        }
+    }
+    #[cfg(not(feature = "collations"))]
+    for sql in unheld {
+        let words = refused(&mut w, sql).1;
+        assert!(words.contains("without the feature collations"), "{sql}: {words}");
+    }
+}
+
+#[test]
+fn a_column_definition_list_refuses_setof() {
+    let mut w = fr("setof");
+    let setof = |c: &str| format!("column \"{c}\" cannot be declared SETOF");
+    let (x, y) = (setof("x"), setof("y"));
+    refusals(
+        &mut w,
+        &[
+            ("SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x SETOF integer)", "42P16", &x),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x integer, y SETOF text)",
+                "42P16",
+                &y,
+            ),
+            ("SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x SETOF nosuchtype)", "42P16", &x),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x SETOF integer COLLATE \"C\")",
+                "42P16",
+                &x,
+            ),
+            (
+                "SELECT * FROM ROWS FROM (jsonb_to_record('{\"x\":1}') AS (x SETOF integer))",
+                "42P16",
+                &x,
+            ),
+            ("SELECT * FROM jsonb_to_record('{\"x\":1}') AS (x SETOF integer)", "42P16", &x),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x SETOF integer, x text)",
+                "42P16",
+                &x,
+            ),
+            (
+                "SELECT * FROM jsonb_to_record('{\"x\":1}') AS t(x integer COLLATE \"C\", \
+                 y SETOF text)",
+                "42804",
+                "collations are not supported by type integer",
+            ),
+            (
+                "SELECT * FROM generate_series(1, 2) AS t(x SETOF integer)",
+                "42601",
+                "a column definition list is only allowed for functions returning \"record\"",
+            ),
+        ],
+    );
+}
+
+// Each refusal's first line: 18.6's HINT follows it.
+#[test]
+fn json_to_record_s_forms_are_refused_as_postgresql_refuses_them() {
+    let mut w = fr("record-forms");
+    let asked: &[(&str, &str, &str)] = &[
+        (
+            "SELECT * FROM jsonb_to_record('{\"x\":1}', 2)",
+            "42883",
+            "function jsonb_to_record(unknown, integer) does not exist",
+        ),
+        (
+            "SELECT * FROM jsonb_to_record(1) AS t(x integer)",
+            "42883",
+            "function jsonb_to_record(integer) does not exist",
+        ),
+        (
+            "SELECT * FROM jsonb_to_record('{\"x\":1}', '{}')",
+            "42883",
+            "function jsonb_to_record(unknown, unknown) does not exist",
+        ),
+        (
+            "SELECT * FROM jsonb_to_recordset() AS t(x integer)",
+            "42883",
+            "function jsonb_to_recordset() does not exist",
+        ),
+        (
+            "SELECT * FROM json_to_record('{\"x\":1}'::jsonb) AS t(x integer)",
+            "42883",
+            "function json_to_record(jsonb) does not exist",
+        ),
+        (
+            "SELECT * FROM json_to_recordset('[{\"x\":1}]'::jsonb) AS t(x integer)",
+            "42883",
+            "function json_to_recordset(jsonb) does not exist",
+        ),
+        (
+            "SELECT * FROM jsonb_to_recordset('[{\"x\":1}]'::json) AS t(x integer)",
+            "42883",
+            "function jsonb_to_recordset(json) does not exist",
+        ),
+        (
+            "SELECT * FROM jsonb_to_record(NULL::text) AS t(x integer)",
+            "42883",
+            "function jsonb_to_record(text) does not exist",
+        ),
+        (
+            "SELECT * FROM json_to_record('{\"x\":1}', true) AS t(x integer)",
+            "42883",
+            "function json_to_record(unknown, boolean) does not exist",
+        ),
+    ];
+    for (sql, code, words) in asked {
+        let (state, said) = refused(&mut w, sql);
+        assert_eq!((state, said.lines().next()), (Some(*code), Some(*words)), "{sql}");
+    }
+}
+
+#[test]
+fn a_view_over_rows_from_answers_its_rows() {
+    // One view made by the file's DDL, the others by statements; each read again once the file is
+    // opened anew.
+    let path = tmp("reader-fr-views.snail");
+    let ddl = format!(
+        "{FR_DDL} CREATE VIEW fr.rf AS SELECT * FROM ROWS FROM (generate_series(1, 2), \
+         generate_series(5, 7)) AS r(a, b);"
+    );
+    write(&path, &Catalog::parse(&ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in [
+        "CREATE VIEW fr.na AS SELECT * FROM jsonb_to_record('{\"x\":1}') AS (x integer)",
+        "CREATE VIEW fr.rf2 AS SELECT * FROM ROWS FROM (jsonb_to_record('{\"x\":1}') AS (x integer), \
+         generate_series(1, 2)) WITH ORDINALITY AS r",
+        "CREATE VIEW fr.co AS SELECT x FROM \
+         jsonb_to_recordset('[{\"x\":\"b\"},{\"x\":\"B\"},{\"x\":\"a\"}]') AS t(x text COLLATE \"C\")",
+    ] {
+        w.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let asked: &[(&str, &[&str])] = &[
+        ("SELECT * FROM fr.rf", &["1|5", "2|6", "NULL|7"]),
+        ("SELECT * FROM fr.na", &["1"]),
+        ("SELECT * FROM fr.rf2", &["1|1|1", "NULL|2|2"]),
+        (
+            "SELECT x, pg_collation_for(x) FROM fr.co ORDER BY x",
+            &["B|\"C\"", "a|\"C\"", "b|\"C\""],
+        ),
+    ];
+    answered(&mut w, asked);
+    drop(w);
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(&mut w, asked);
+}
+
+#[test]
 fn the_other_sets_in_from() {
     let mut w = fr("others");
     answered(
@@ -1980,6 +2244,68 @@ fn before_18_the_set_alone_is_read() {
             "SELECT * FROM pg_timezone_abbrevs_abbrevs()",
             "42883",
             no_function!("pg_timezone_abbrevs_abbrevs()"),
+        )],
+    );
+}
+
+// The views over those functions, read from their definitions for the file's release: from 18 on
+// pg_timezone_abbrevs lists the statement zone's own, then the set's not among them.
+#[cfg(feature = "zones")]
+#[test]
+fn the_zones_views_answer_as_postgresql_s() {
+    let mut w = fr("zones-views");
+    w.execute("SET TimeZone = 'UTC'").unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT abbrev, utc_offset, is_dst FROM pg_timezone_abbrevs \
+                 WHERE abbrev IN ('UTC', 'EST', 'CET', 'MSK')",
+                &["CET|01:00:00|f", "EST|-05:00:00|f", "MSK|03:00:00|f", "UTC|00:00:00|f"],
+            ),
+            (
+                "SELECT name, abbrev FROM pg_timezone_names WHERE name IN ('UTC', 'Etc/GMT+5')",
+                &["Etc/GMT+5|-05", "UTC|UTC"],
+            ),
+            (
+                "SELECT name, abbrev, utc_offset, is_dst FROM pg_catalog.pg_timezone_names \
+                 WHERE name = 'Asia/Kolkata'",
+                &["Asia/Kolkata|IST|05:30:00|f"],
+            ),
+            ("SELECT count(*) FROM pg_timezone_abbrevs", &["195"]),
+            ("SELECT abbrev FROM pg_timezone_abbrevs LIMIT 3", &["ACDT", "ACSST", "ACST"]),
+        ],
+    );
+    w.execute("SET TimeZone = 'Europe/Lisbon'").unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT abbrev, utc_offset, is_dst FROM pg_timezone_abbrevs \
+                 WHERE abbrev IN ('WET', 'WEST', 'LMT')",
+                &["LMT|-00:36:45|f", "WEST|01:00:00|t", "WET|00:00:00|f"],
+            ),
+            ("SELECT count(*) FROM pg_timezone_abbrevs", &["198"]),
+            ("SELECT count(*) FROM pg_timezone_abbrevs a WHERE abbrev = 'CET'", &["1"]),
+        ],
+    );
+    w.execute("SET TimeZone = 'Asia/Shanghai'").unwrap();
+    answered(
+        &mut w,
+        &[(
+            "SELECT abbrev, utc_offset, is_dst FROM pg_timezone_abbrevs WHERE abbrev = 'CST'",
+            &["CST|08:00:00|f"],
+        )],
+    );
+    // Before 18 the view is the set's function alone: CST the set's under any zone (the snail's
+    // own, as above).
+    let mut w = fr_of("zones-views-17", 17);
+    w.execute("SET TimeZone = 'Asia/Shanghai'").unwrap();
+    answered(
+        &mut w,
+        &[(
+            "SELECT abbrev, utc_offset, is_dst FROM pg_timezone_abbrevs WHERE abbrev = 'CST'",
+            &["CST|-06:00:00|f"],
         )],
     );
 }

@@ -136,7 +136,30 @@ struct Call {
     /// Whether it is written ROWS FROM (…), as a column definition list beside it is refused.
     rows_from: bool,
     /// The column definition list its alias writes, where it writes one.
-    listed: Option<Vec<(String, DataType)>>,
+    listed: Option<Vec<Defined>>,
+}
+
+/// A column of a column definition list: its name, its type as written, whether it is written
+/// SETOF, and the collation its COLLATE names.
+#[derive(Clone)]
+struct Defined {
+    name: String,
+    ty: DataType,
+    setof: bool,
+    collation: Option<String>,
+}
+
+impl Defined {
+    /// A column by the name `spelled` writes it under, which carries its SETOF and its COLLATE.
+    fn of(written: String, ty: DataType) -> Defined {
+        let (name, setof, collation) = super::spelled::column_marks(&written);
+        Defined {
+            name: name.to_string(),
+            ty,
+            setof,
+            collation: collation.map(str::to_string),
+        }
+    }
 }
 
 /// One function of a call in FROM, and the columns it lays out there.
@@ -147,8 +170,8 @@ struct Called {
     spread: bool,
     /// How many columns it lays out.
     width: usize,
-    /// The column definition list written for it inside ROWS FROM, each column's name and type.
-    defined: Option<Vec<(String, DataType)>>,
+    /// The column definition list written for it inside ROWS FROM, or beside it alone.
+    defined: Option<Vec<Defined>>,
     /// The record its column definition list makes, once laid.
     record: Option<ColumnType>,
 }
@@ -929,10 +952,10 @@ fn near_type(dt: &DataType) -> Error {
     ))
 }
 
-/// The column definition list a function's alias writes, taken from it: each column's name and
-/// type, where every column is typed; none where none is. A list typing some of its columns is
-/// refused as PostgreSQL's grammar refuses it, at the first word it cannot read.
-fn listed_of(alias: &mut Option<TableAlias>) -> Result<Option<Vec<(String, DataType)>>> {
+/// The column definition list a function's alias writes, taken from it: each column, where every
+/// column is typed; none where none is. A list typing some of its columns is refused as
+/// PostgreSQL's grammar refuses it, at the first word it cannot read.
+fn listed_of(alias: &mut Option<TableAlias>) -> Result<Option<Vec<Defined>>> {
     let Some(a) = alias else {
         return Ok(None);
     };
@@ -960,7 +983,7 @@ fn listed_of(alias: &mut Option<TableAlias>) -> Result<Option<Vec<(String, DataT
     let listed = a
         .columns
         .drain(..)
-        .map(|c| (crate::catalog::ident(&c.name), c.data_type.expect("typed")))
+        .map(|c| Defined::of(crate::catalog::ident(&c.name), c.data_type.expect("typed")))
         .collect();
     Ok(Some(listed))
 }
@@ -992,7 +1015,7 @@ fn rows_from_functions(args: &[FunctionArg]) -> Result<Vec<Called>> {
             Expr::Cast { data_type, .. } => data_type.clone(),
             other => {
                 return Err(Error::new(format!(
-                    "{other}: a column definition list's collation is not read"
+                    "{other} is not read in a column definition list"
                 )))
             }
         };
@@ -1001,7 +1024,7 @@ fn rows_from_functions(args: &[FunctionArg]) -> Result<Vec<Called>> {
         };
         last.defined
             .get_or_insert_with(Vec::new)
-            .push((crate::catalog::ident(name), data_type));
+            .push(Defined::of(crate::catalog::ident(name), data_type));
     }
     let mut each = Vec::with_capacity(out.len());
     for c in out {
@@ -1854,10 +1877,12 @@ impl Laying<'_> {
             let name = pipeline::function_name(f);
             // A record of no type of its own takes its columns from a list, and only it takes one.
             let record_of_none = super::populate::RECORDS.contains(&name.as_str());
+            let mut collated = None;
             let ty = match (&c.defined, record_of_none) {
                 (Some(listed), true) => {
-                    let record = defined_record(listed)?;
+                    let (record, carried) = defined_record(listed, &self.catalog.collations)?;
                     c.record = Some(record);
+                    collated = Some(carried);
                     Some(record)
                 }
                 (None, true) => {
@@ -1894,11 +1919,15 @@ impl Laying<'_> {
             c.spread = fields.is_some();
             let before = cols.len();
             match fields {
-                Some(fields) => cols.extend(fields.into_iter().map(|(n, t)| Col {
+                // A list's columns carry the collations it names.
+                Some(fields) => cols.extend(fields.into_iter().enumerate().map(|(i, (n, t))| Col {
                     qualifier: Some(q.clone()),
                     name: n,
                     ty: Some(t),
-                    carried: carried_of(Some(t)),
+                    carried: match &collated {
+                        Some(carried) => carried[i].clone(),
+                        None => carried_of(Some(t)),
+                    },
                 })),
                 None => {
                     let named = match name.as_str() {
@@ -2393,11 +2422,30 @@ fn record_name(ty: ColumnType) -> Option<String> {
     }
 }
 
-/// The anonymous record a column definition list makes: each column of the type it names, as a cast
-/// names it, refused where none has the name; no name twice.
-fn defined_record(listed: &[(String, DataType)]) -> Result<ColumnType> {
+/// The anonymous record a column definition list makes, and the collation each of its columns
+/// carries: each column of the type it names, as a cast names it, refused where none has the name,
+/// and where it is written SETOF; under the collation its COLLATE names, refused where none has the
+/// name and where its type takes none, else its type's. Each column refused in its turn, as
+/// PostgreSQL's addRangeTableEntryForFunction reads them; then no name twice.
+fn defined_record(
+    listed: &[Defined],
+    declared: &[crate::catalog::Collation],
+) -> Result<(ColumnType, Vec<Carried>)> {
     let mut fields: Vec<crate::composed::Field> = Vec::with_capacity(listed.len());
-    for (name, dt) in listed {
+    let mut carried = Vec::with_capacity(listed.len());
+    for Defined {
+        name,
+        ty: dt,
+        setof,
+        collation,
+    } in listed
+    {
+        if *setof {
+            return Err(Error::coded(
+                "42P16",
+                format!("column \"{name}\" cannot be declared SETOF"),
+            ));
+        }
         if matches!(dt, DataType::Custom(n, a) if a.is_empty() && crate::catalog::object_name(n) == "record")
         {
             return Err(Error::coded("42809", "record type has not been registered"));
@@ -2412,6 +2460,19 @@ fn defined_record(listed: &[(String, DataType)]) -> Result<ColumnType> {
                 };
                 Error::new(format!("type \"{written}\" does not exist"))
             })?;
+        carried.push(match collation {
+            Some(c) => {
+                crate::catalog::collation_casing(c, declared)?;
+                if !super::collate::collatable(ty) {
+                    return Err(Error::new(format!(
+                        "collations are not supported by type {}",
+                        ty.pg_name()
+                    )));
+                }
+                Carried::Named(super::collate::named(c))
+            }
+            None => carried_of(Some(ty)),
+        });
         fields.push(crate::composed::Field::new(name, ty));
     }
     for (i, f) in fields.iter().enumerate() {
@@ -2422,10 +2483,11 @@ fn defined_record(listed: &[(String, DataType)]) -> Result<ColumnType> {
             ));
         }
     }
-    Ok(crate::composed::type_of(crate::composed::Composed::Record {
+    let record = crate::composed::type_of(crate::composed::Composed::Record {
         name: "record".into(),
         fields,
-    }))
+    });
+    Ok((record, carried))
 }
 
 /// The collation a value of a type carries where nothing names one: the database's, for a string.

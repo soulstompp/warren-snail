@@ -970,7 +970,7 @@ impl Analyzer<'_, '_> {
         })
     }
 
-    fn data_type(&self, dt: &DataType) -> Result<(u32, i32)> {
+    pub(crate) fn data_type(&self, dt: &DataType) -> Result<(u32, i32)> {
         let text = dt.to_string();
         let oid = crate::regs::reg_parse(crate::regs::RegKind::Type, &text, self.cat.release)?;
         let typmod = match crate::catalog::held_type(dt) {

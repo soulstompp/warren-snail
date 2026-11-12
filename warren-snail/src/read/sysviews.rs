@@ -272,10 +272,6 @@ const SERVERS_VIEWS: &[(&[&str], &str)] = &[
         ],
         "replication",
     ),
-    (
-        &["pg_timezone_names", "pg_timezone_abbrevs"],
-        "the time zones installed beside it",
-    ),
 ];
 
 /// The functions whose value only a server knows: a column computed from one is refused.
@@ -375,7 +371,14 @@ fn refused_beneath(
         .iter()
         .flat_map(|t| std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)));
     for f in factors {
-        let sqlparser::ast::TableFactor::Table { name, alias, .. } = f else {
+        // A view is named alone: a call, `pg_timezone_names()` in its own view, is a function's.
+        let sqlparser::ast::TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            ..
+        } = f
+        else {
             continue;
         };
         let n = crate::catalog::object_name(name);

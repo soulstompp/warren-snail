@@ -216,8 +216,10 @@ impl Naming<'_> {
         let c = &mut self.cols[i];
         c.new_colnames = new;
         c.filled = true;
+        // A function's always, against its default names' instability.
         c.printaliases = match &rte.kind {
             RteKind::Relation { .. } => changed,
+            RteKind::Function { .. } => true,
             _ => rte.alias.as_ref().is_some_and(|a| !a.cols.is_empty()) || changed,
         };
     }
@@ -783,8 +785,18 @@ impl Printer<'_, '_> {
                     }
                     RteKind::Cte { name } => self.push(&quote(name)),
                     RteKind::Join { .. } => {}
+                    RteKind::Function {
+                        functions,
+                        ordinality,
+                        lateral,
+                    } => {
+                        if *lateral {
+                            self.push("LATERAL ");
+                        }
+                        self.functions(functions, *ordinality)?;
+                    }
                 }
-                // get_rte_alias.
+                // get_rte_alias: a function's always printed.
                 let refname = dpns.names[*i - 1].clone().unwrap_or_default();
                 let ci = &dpns.cols[*i - 1];
                 let print = rte.alias.is_some()
@@ -794,11 +806,26 @@ impl Printer<'_, '_> {
                         RteKind::Subquery(_) | RteKind::Values { .. } => true,
                         RteKind::Cte { name } => refname != *name,
                         RteKind::Join { .. } => false,
+                        RteKind::Function { .. } => true,
                     };
                 if print {
                     self.push(&format!(" {}", quote(&refname)));
                 }
-                self.column_aliases(ci);
+                // A lone function's column definition list, which is also its columns' aliases.
+                match &rte.kind {
+                    RteKind::Function {
+                        functions,
+                        ordinality,
+                        ..
+                    } => match functions.as_slice() {
+                        [f] if f.coldefs.is_some() && !*ordinality => {
+                            let defs = f.coldefs.as_deref().unwrap_or_default();
+                            self.coldefs(defs, Some(&ci.new_colnames));
+                        }
+                        _ => self.column_aliases(ci),
+                    },
+                    _ => self.column_aliases(ci),
+                }
             }
             Jt::Join(j) => {
                 let ci = dpns.cols[j.rtindex - 1].clone();
@@ -862,6 +889,77 @@ impl Printer<'_, '_> {
         }
         let names: Vec<String> = ci.new_colnames.iter().map(|n| quote(n)).collect();
         self.push(&format!("({})", names.join(", ")));
+    }
+
+    /// get_from_clause_item's functions: a lone one's call, its list printed after the alias; else
+    /// UNNEST(…) of every array where each is an unnest of one with no list, or ROWS FROM(…), each
+    /// call with its list; then WITH ORDINALITY.
+    fn functions(&mut self, functions: &[query::RangeFunc], ordinality: bool) -> Result<()> {
+        /// unnest(anyarray).
+        const UNNEST: u32 = 2331;
+        match functions {
+            [f] if f.coldefs.is_none() || !ordinality => self.expr(&f.call, true)?,
+            _ if functions.iter().all(|f| {
+                f.coldefs.is_none() && matches!(&f.call, Node::Func { oid: UNNEST, .. })
+            }) =>
+            {
+                self.push("UNNEST(");
+                let mut first = true;
+                for f in functions {
+                    let Node::Func { args, .. } = &f.call else {
+                        continue;
+                    };
+                    for a in args {
+                        if !first {
+                            self.push(", ");
+                        }
+                        first = false;
+                        self.expr(a, true)?;
+                    }
+                }
+                self.push(")");
+            }
+            _ => {
+                self.push("ROWS FROM(");
+                for (k, f) in functions.iter().enumerate() {
+                    if k > 0 {
+                        self.push(", ");
+                    }
+                    self.expr(&f.call, true)?;
+                    if let Some(defs) = &f.coldefs {
+                        self.push(" AS ");
+                        self.coldefs(defs, None);
+                    }
+                }
+                self.push(")");
+            }
+        }
+        if ordinality {
+            self.push(" WITH ORDINALITY");
+        }
+        Ok(())
+    }
+
+    /// get_from_clause_coldeflist: each column's name, the alias's where given, its type, and a
+    /// collation other than its type's.
+    fn coldefs(&mut self, defs: &[(String, u32, i32, u32)], names: Option<&[String]>) {
+        let cols: Vec<String> = defs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty, typmod, coll))| {
+                let name = names.and_then(|n| n.get(i)).unwrap_or(name);
+                let mut col = format!(
+                    "{} {}",
+                    quote(name),
+                    super::print::format_type(self.cat, *ty, *typmod)
+                );
+                if *coll != 0 && self.cat.ty(*ty).is_some_and(|t| t.collation != *coll) {
+                    col.push_str(&format!(" COLLATE {}", self.collation_name(*coll)));
+                }
+                col
+            })
+            .collect();
+        self.push(&format!("({})", cols.join(", ")));
     }
 
     /// get_setop_query.

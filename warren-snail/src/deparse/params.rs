@@ -152,6 +152,7 @@ fn each_param(q: &Query, f: &mut dyn FnMut(usize, u32)) {
         match &r.kind {
             RteKind::Subquery(sub) => each_param(sub, f),
             RteKind::Values { rows } => rows.iter().flatten().for_each(|n| each_in(n, f)),
+            RteKind::Function { functions, .. } => functions.iter().for_each(|x| each_in(&x.call, f)),
             _ => {}
         }
     }

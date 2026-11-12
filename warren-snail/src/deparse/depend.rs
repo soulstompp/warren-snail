@@ -162,6 +162,7 @@ impl<'c, 'a> Refs<'c, 'a> {
             match &r.kind {
                 RteKind::Subquery(sub) => self.query(sub),
                 RteKind::Values { rows } => rows.iter().flatten().for_each(|n| self.node(n)),
+                RteKind::Function { functions, .. } => functions.iter().for_each(|x| self.node(&x.call)),
                 _ => {}
             }
         }
@@ -379,6 +380,19 @@ pub(crate) fn of_expr(cat: &Cat, node: &Node) -> Vec<Addr> {
 /// a COLLATE written: the column's own, the COLLATE's, the default for any other value of a
 /// collatable type; none for a type without one.
 pub(crate) fn output_collation(cat: &Cat, q: &Query, n: &Node) -> Result<u32> {
+    /// The collation the column definition list names for a function entry's column `attno`
+    /// (from 1), 0 where it names none.
+    fn function_collation(functions: &[super::query::RangeFunc], attno: usize) -> u32 {
+        let mut at = attno;
+        for f in functions {
+            let width = f.coldefs.as_ref().map_or(1, Vec::len);
+            if at <= width {
+                return f.coldefs.as_ref().map_or(0, |d| d[at - 1].3);
+            }
+            at -= width;
+        }
+        0
+    }
     Ok(match n {
         Node::Collate { coll, .. } => *coll,
         Node::Var { attno, rel, up: 0, ty, .. } if *attno > 0 => {
@@ -392,6 +406,12 @@ pub(crate) fn output_collation(cat: &Cat, q: &Query, n: &Node) -> Result<u32> {
                     Some(t) => output_collation(cat, sub, &t.expr)?,
                     None => 0,
                 },
+                // A function's column the COLLATE of its column definition list names.
+                Some(RteKind::Function { functions, .. })
+                    if function_collation(functions, *attno as usize) != 0 =>
+                {
+                    function_collation(functions, *attno as usize)
+                }
                 _ if cat.collatable(*ty) => DEFAULT_COLLATION,
                 _ => 0,
             }

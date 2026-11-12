@@ -51,39 +51,69 @@ pub(crate) const ROWS_MARK: char = '\u{6}';
 /// definition list named arguments after it, each a column's name and a NULL of its type.
 pub(crate) const ROWS_FROM: &str = "\u{6}rows";
 
+/// A column definition list's column written SETOF or with a COLLATE, as its name carries them:
+/// the name, `ROWS_MARK`, `s` where SETOF, `ROWS_MARK` again, and the collation as named.
+fn marked_column(name: &str, setof: bool, collation: Option<&str>) -> String {
+    let s = if setof { "s" } else { "" };
+    format!("{name}{ROWS_MARK}{s}{ROWS_MARK}{}", collation.unwrap_or_default())
+}
+
+/// A column definition list's column by the name `marked_column` writes: its own name, whether it
+/// is written SETOF, and the collation it names.
+pub(crate) fn column_marks(written: &str) -> (&str, bool, Option<&str>) {
+    let Some((name, rest)) = written.split_once(ROWS_MARK) else {
+        return (written, false, None);
+    };
+    let (setof, collation) = rest.split_once(ROWS_MARK).unwrap_or((rest, ""));
+    (name, setof == "s", Some(collation).filter(|c| !c.is_empty()))
+}
+
 /// The statement as PostgreSQL's scanner and grammar read its words, where sqlparser's tokenizer
 /// reads them otherwise, under `release`: a number in its bases and with its underscores from 16
 /// on, a name written against it refused as trailing junk from 15 on; strings a newline apart as one
 /// string; `x ISNULL` and `x NOTNULL`; an interval's literal as the cast its grammar makes of it, its
 /// precision or its fields, and the fields of its type, refused where its grammar refuses them; a
 /// TABLESAMPLE clause carried in a call's name (`SAMPLED`), with a seed drawn for the statement where
-/// it names none; ROWS FROM (…) as a call (`ROWS_FROM`), and the alias a function's column definition
-/// list stands behind where none is written; and what sqlparser takes and PostgreSQL's grammar does
-/// not, refused, a label written without the AS the release's keywords want among them.
+/// it names none; ROWS FROM (…) as a call (`ROWS_FROM`), the alias a function's column definition
+/// list stands behind where none is written, and a column of such a list written SETOF or with a
+/// COLLATE by its name (`marked_column`); and what sqlparser takes and PostgreSQL's grammar does not,
+/// refused, a label written without the AS the release's keywords want among them.
 pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
-    let out = scanned_seeding(sql, release, true, true)?;
+    let out = scanned_seeding(sql, release, true, true, true)?;
     bare_labels(&out, release)?;
     Ok(out)
 }
 
 /// A DDL's text as `scanned` reads a statement's, a TABLESAMPLE that names no seed left to draw one
-/// each time a statement reads it: a view's. ROWS FROM and a column definition list with no alias
-/// are left as written, so that statements split from a text read again as PostgreSQL's; its labels
-/// are a statement's to read.
+/// each time a statement reads it: a view's. ROWS FROM and a column definition list, with no alias
+/// or with SETOF or a COLLATE, are left as written, so that statements split from a text read
+/// again as PostgreSQL's; its labels are a statement's to read.
 pub(crate) fn scanned_unseeded(sql: &str, release: u8) -> Result<Cow<'_, str>> {
-    scanned_seeding(sql, release, false, true)
+    scanned_seeding(sql, release, false, true, false)
 }
 
 /// A text as `scanned_unseeded` reads it to split it into its statements, an interval's literal
 /// left as written too: each statement split from it is the one written, read as the cast its
 /// grammar makes of the literal where the statement is read.
 pub(crate) fn scanned_split(sql: &str, release: u8) -> Result<Cow<'_, str>> {
-    scanned_seeding(sql, release, false, false)
+    scanned_seeding(sql, release, false, false, false)
 }
 
-fn scanned_seeding(sql: &str, release: u8, seeded: bool, casts: bool) -> Result<Cow<'_, str>> {
+/// A CREATE VIEW's text as `scanned_unseeded` reads a DDL's, its body's ROWS FROM and column
+/// definition lists read as a statement's are.
+pub(crate) fn scanned_view(sql: &str, release: u8) -> Result<Cow<'_, str>> {
+    scanned_seeding(sql, release, false, true, true)
+}
+
+fn scanned_seeding(
+    sql: &str,
+    release: u8,
+    seeded: bool,
+    casts: bool,
+    rows: bool,
+) -> Result<Cow<'_, str>> {
     let mut out = numbered(sql, release)?;
-    if let Some(next) = worded(&out, seeded, casts, release)? {
+    if let Some(next) = worded(&out, seeded, casts, rows, release)? {
         out = Cow::Owned(next);
     }
     Ok(out)
@@ -452,17 +482,27 @@ fn finish(sql: &str, mut out: String, copied: usize) -> Cow<'_, str> {
 
 /// The statement with its words as PostgreSQL's grammar reads them; none where it needs none, or
 /// where sqlparser's tokenizer refuses it, which its parser says. Without `casts`, an interval's
-/// literal is left as written, its fields refused where its grammar refuses them all the same.
-fn worded(sql: &str, seeded: bool, casts: bool, release: u8) -> Result<Option<String>> {
+/// literal is left as written, its fields refused where its grammar refuses them all the same;
+/// without `rows`, ROWS FROM and a column definition list are left as written.
+fn worded(
+    sql: &str,
+    seeded: bool,
+    casts: bool,
+    rows: bool,
+    release: u8,
+) -> Result<Option<String>> {
     let lower = sql.to_ascii_lowercase();
     // `AS (`, whatever stands between the two.
     let as_paren = lower.match_indices("as").any(|(at, _)| {
         lower[at + 2..].trim_start().starts_with('(')
     });
     if !as_paren
-        && !["isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>", "rows"]
-            .iter()
-            .any(|w| lower.contains(w))
+        && ![
+            "isnull", "notnull", "interval", "tablesample", "==", "[", "format", "*<", "*>", "rows",
+            "setof", "collate",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
     {
         return Ok(None);
     }
@@ -593,6 +633,30 @@ fn worded(sql: &str, seeded: bool, casts: bool, release: u8) -> Result<Option<St
             && word(i.wrapping_sub(2)).as_deref() == Some("TIME")
             && word(i.wrapping_sub(3)).as_deref() != Some("AT")
     };
+    // Whether the parenthesis opened at `o` is a call's, `ROWS FROM (` among them.
+    let called = |o: usize| {
+        o > 0
+            && match &solid[o - 1].0 {
+                Token::Word(w) if w.quote_style.is_some() => true,
+                Token::Word(w) => {
+                    !matches!(keyword(&w.value, release), Some(('R', _)))
+                        || (w.value.eq_ignore_ascii_case("from")
+                            && word(o.wrapping_sub(2)).as_deref() == Some("ROWS"))
+                }
+                _ => false,
+            }
+    };
+    // Whether the parenthesis closed last, at `c` and opened at `o`, is a call's that ends, with
+    // its WITH ORDINALITY if any, just before `i`.
+    let call_before = |i: usize, last: Option<(usize, usize)>| {
+        last.is_some_and(|(c, o)| {
+            let after_call = c + 1 == i
+                || (c + 3 == i
+                    && word(c + 1).as_deref() == Some("WITH")
+                    && word(c + 2).as_deref() == Some("ORDINALITY"));
+            after_call && called(o)
+        })
+    };
     let mut swaps: Vec<(usize, usize, String)> = Vec::new();
     let mut brackets = 0i32;
     let mut array_closes: Vec<i32> = Vec::new();
@@ -659,7 +723,7 @@ fn worded(sql: &str, seeded: bool, casts: bool, release: u8) -> Result<Option<St
             }
             // ROWS FROM, where a FROM item stands.
             Some("ROWS")
-                if seeded
+                if rows
                     && word(i + 1).as_deref() == Some("FROM")
                     && matches!(solid.get(i + 2).map(|t| &t.0), Some(Token::LParen))
                     && i > 0
@@ -673,30 +737,43 @@ fn worded(sql: &str, seeded: bool, casts: bool, release: u8) -> Result<Option<St
             }
             // A function's column definition list with no alias before it.
             Some("AS")
-                if seeded
+                if rows
                     && from_here
                     && matches!(solid.get(i + 1).map(|t| &t.0), Some(Token::LParen))
-                    && last_closed.is_some_and(|(c, o)| {
-                        let after_call = c + 1 == i
-                            || (c + 3 == i
-                                && word(c + 1).as_deref() == Some("WITH")
-                                && word(c + 2).as_deref() == Some("ORDINALITY"));
-                        let called = o > 0
-                            && match &solid[o - 1].0 {
-                                Token::Word(w) if w.quote_style.is_some() => true,
-                                Token::Word(w) => {
-                                    !matches!(keyword(&w.value, release), Some(('R', _)))
-                                        || (w.value.eq_ignore_ascii_case("from")
-                                            && word(o.wrapping_sub(2)).as_deref() == Some("ROWS"))
-                                }
-                                _ => false,
-                            };
-                        after_call && called
-                    }) =>
+                    && call_before(i, last_closed) =>
+
             {
                 swaps.push((solid[i].1, solid[i].2, format!("AS \"{ROWS_MARK}\"")));
             }
             _ => {}
+        }
+        // A function's column definition list, after its alias or after AS alone, holding SETOF
+        // or a COLLATE: each such column written by its name marked with them (`marked_column`),
+        // which sqlparser reads.
+        if rows
+            && solid[i].0 == Token::LParen
+            && in_from.len() > 1
+            && in_from[in_from.len() - 2]
+        {
+            let column_id = |j: usize| {
+                matches!(&solid[j].0, Token::Word(w) if w.quote_style.is_some()
+                    || !matches!(keyword(&w.value, release), Some(('R' | 'T', _))))
+            };
+            let before = match i.checked_sub(1) {
+                Some(j) if word(j).as_deref() == Some("AS") => Some(j),
+                Some(j) if column_id(j) => match j.checked_sub(1) {
+                    Some(k) if word(k).as_deref() == Some("AS") => Some(k),
+                    _ => Some(j),
+                },
+                _ => None,
+            };
+            if let (Some(b), Some(after)) = (before, closed(i, Token::LParen, Token::RParen)) {
+                let marked = (i + 1..after - 1)
+                    .any(|j| matches!(word(j).as_deref(), Some("SETOF" | "COLLATE")));
+                if marked && call_before(b, last_closed) {
+                    swaps.extend(defined_list(sql, &solid, (i + 1, after - 1), &word, &near)?);
+                }
+            }
         }
         match &solid[i].0 {
             // Touching an operator's characters before it, it ends a longer operator, the parser's.
@@ -1054,8 +1131,9 @@ fn sampled_clause(
 
 /// ROWS FROM (…) at `i` as a call of `ROWS_FROM`, its functions its arguments, each function's
 /// column definition list the named arguments after it: `ROWS FROM (f(a) AS (x t), g(b))` as
-/// `"\u{6}rows"(f(a) , "x" => CAST(NULL AS t), g(b))`. Each swap made, the functions' own text left
-/// to the rest; refused as PostgreSQL's grammar refuses a list it does not read.
+/// `"\u{6}rows"(f(a) , "x" => CAST(NULL AS t), g(b))`, a column written SETOF or with a COLLATE
+/// named as `defined_item` marks it. Each swap made, the functions' own text left to the rest;
+/// refused as PostgreSQL's grammar refuses a list it does not read.
 fn rows_from(
     sql: &str,
     solid: &[&(Token, usize, usize)],
@@ -1071,24 +1149,7 @@ fn rows_from(
     if after == open + 2 {
         return Err(near(open + 1));
     }
-    // The places of a list's items between `from` and `to`, split at its commas.
-    let items = |from: usize, to: usize| {
-        let mut out = Vec::new();
-        let (mut depth, mut start) = (0i32, from);
-        for k in from..to {
-            match solid[k].0 {
-                Token::LParen | Token::LBracket => depth += 1,
-                Token::RParen | Token::RBracket => depth -= 1,
-                Token::Comma if depth == 0 => {
-                    out.push((start, k));
-                    start = k + 1;
-                }
-                _ => {}
-            }
-        }
-        out.push((start, to));
-        out
-    };
+    let items = |from: usize, to: usize| items_between(solid, from, to);
     let mut swaps = vec![(solid[i].1, solid[open].2, format!("\"{ROWS_FROM}\"("))];
     for (a, b) in items(open + 1, after - 1) {
         if a == b {
@@ -1127,32 +1188,113 @@ fn rows_from(
         }
         let mut named = Vec::new();
         for (ea, eb) in items(k + 2, end - 1) {
-            let name = match &solid[ea].0 {
-                Token::Word(w) if w.quote_style.is_some() => w.value.clone(),
-                Token::Word(w) => w.value.to_lowercase(),
-                _ => return Err(near(ea)),
-            };
-            if eb <= ea + 1 {
-                return Err(near(eb));
-            }
-            let collate = (ea + 1..eb).find(|&c| word(c).as_deref() == Some("COLLATE"));
-            let typed_to = collate.unwrap_or(eb);
-            if typed_to == ea + 1 {
-                return Err(near(typed_to));
-            }
-            let ty = &sql[solid[ea + 1].1..solid[typed_to - 1].2];
-            let collation = match collate {
-                Some(c) => format!(" {}", &sql[solid[c].1..solid[eb - 1].2]),
-                None => String::new(),
-            };
+            let (name, ty) = defined_item(sql, solid, (ea, eb), word, near)?;
             named.push(format!(
-                ", \"{}\" => CAST(NULL AS {ty}){collation}",
+                ", \"{}\" => CAST(NULL AS {ty})",
                 name.replace('"', "\"\"")
             ));
         }
         swaps.push((solid[k].1, solid[end - 1].2, named.concat()));
     }
     Ok(swaps)
+}
+
+/// A function's column definition list from `from` to `to`: each column written SETOF or with a
+/// COLLATE by its name marked with them (`defined_item`). A list naming its first column alone
+/// refused as PostgreSQL's grammar refuses it, at the first type it meets.
+fn defined_list(
+    sql: &str,
+    solid: &[&(Token, usize, usize)],
+    (from, to): (usize, usize),
+    word: &dyn Fn(usize) -> Option<String>,
+    near: &dyn Fn(usize) -> Error,
+) -> Result<Vec<(usize, usize, String)>> {
+    let items = items_between(solid, from, to);
+    let lone = |&(a, b): &(usize, usize)| b == a + 1;
+    if items.first().is_some_and(lone) {
+        if let Some(&(a, _)) = items.iter().find(|x| !lone(x)) {
+            return Err(near(a + 1));
+        }
+    }
+    let mut swaps = Vec::new();
+    for (a, b) in items {
+        let (name, ty) = defined_item(sql, solid, (a, b), word, near)?;
+        if name.contains(ROWS_MARK) {
+            let written = format!("\"{}\" {ty}", name.replace('"', "\"\""));
+            swaps.push((solid[a].1, solid[b - 1].2, written));
+        }
+    }
+    Ok(swaps)
+}
+
+/// The places of a list's items between `from` and `to`, split at its commas.
+fn items_between(solid: &[&(Token, usize, usize)], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, from);
+    for k in from..to {
+        match solid[k].0 {
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => depth -= 1,
+            Token::Comma if depth == 0 => {
+                out.push((start, k));
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push((start, to));
+    out
+}
+
+/// One column of a column definition list, from `a` to `b`, as PostgreSQL's grammar reads it: a
+/// name, a type, SETOF perhaps before it, and a COLLATE perhaps after it. Its name, marked where it
+/// is written SETOF or with a COLLATE (`marked_column`), and its type's text; refused at the word
+/// the grammar stops at.
+fn defined_item<'s>(
+    sql: &'s str,
+    solid: &[&(Token, usize, usize)],
+    (a, b): (usize, usize),
+    word: &dyn Fn(usize) -> Option<String>,
+    near: &dyn Fn(usize) -> Error,
+) -> Result<(String, &'s str)> {
+    let part = |j: usize| match &solid[j].0 {
+        Token::Word(w) if w.quote_style.is_some() => Some(w.value.clone()),
+        Token::Word(w) => Some(w.value.to_lowercase()),
+        _ => None,
+    };
+    let name = part(a).ok_or_else(|| near(a))?;
+    if b <= a + 1 {
+        return Err(near(b));
+    }
+    let setof = word(a + 1).as_deref() == Some("SETOF");
+    let typed_from = if setof { a + 2 } else { a + 1 };
+    let collate = (typed_from..b).find(|&c| word(c).as_deref() == Some("COLLATE"));
+    let typed_to = collate.unwrap_or(b);
+    if typed_to == typed_from {
+        return Err(near(typed_to));
+    }
+    let ty = &sql[solid[typed_from].1..solid[typed_to - 1].2];
+    // A collation's name, in its schema perhaps: `pg_catalog."C"`.
+    let collation = match collate {
+        Some(c) => {
+            let mut parts = vec![part(c + 1).filter(|_| c + 1 < b).ok_or_else(|| near(c + 1))?];
+            let mut j = c + 2;
+            while j < b && solid[j].0 == Token::Period {
+                parts.push(part(j + 1).filter(|_| j + 1 < b).ok_or_else(|| near(j + 1))?);
+                j += 2;
+            }
+            if j < b {
+                return Err(near(j));
+            }
+            Some(parts.join("."))
+        }
+        None => None,
+    };
+    let name = match setof || collation.is_some() {
+        true => marked_column(&name, setof, collation.as_deref()),
+        false => name,
+    };
+    Ok((name, ty))
 }
 
 /// What stands on the right of `@@@`, which sqlparser reads as `@@` and a prefix `@`.

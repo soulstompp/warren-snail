@@ -496,3 +496,72 @@ fn distinct_on_and_grouping_sets_views_print_as_postgresql_prints_them() {
         ]
     );
 }
+
+const FROM_FUNCTIONS: &str = "CREATE SCHEMA v; CREATE TABLE v.t (id integer PRIMARY KEY); \
+     CREATE VIEW v.rf AS SELECT * FROM ROWS FROM (generate_series(1, 2), generate_series(5, 7)) \
+     AS r(a, b); \
+     CREATE VIEW v.na AS SELECT * FROM jsonb_to_record('{\"x\":1}') AS (x integer); \
+     CREATE VIEW v.rf2 AS SELECT * FROM ROWS FROM (jsonb_to_record('{\"x\":1}') AS (x integer), \
+     generate_series(1, 2)) WITH ORDINALITY AS r; \
+     CREATE VIEW v.un AS SELECT * FROM ROWS FROM (unnest(ARRAY[1, 2]), \
+     unnest(ARRAY['a', 'b', 'c'])) AS u(a, b); \
+     CREATE VIEW v.co AS SELECT x, y FROM jsonb_to_record('{\"x\":\"b\",\"y\":\"c\"}') \
+     AS t(x text COLLATE \"C\", y varchar(3)); \
+     CREATE VIEW v.gs AS SELECT g.n, t.id FROM v.t t, generate_series(1, t.id) WITH ORDINALITY \
+     g(n, o);";
+
+#[test]
+fn a_view_over_rows_from_or_a_bare_definition_list_is_made_and_printed() {
+    let path = tmp("dep-from-functions.snail");
+    let catalog = Catalog::parse(FROM_FUNCTIONS).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    let mut snail = Snail::open(&path).unwrap();
+    for (view, text) in [
+        (
+            "v.rf",
+            " SELECT a,\n    b\n   FROM ROWS FROM(generate_series(1, 2), generate_series(5, 7)) \
+             r(a, b);",
+        ),
+        (
+            "v.na",
+            " SELECT x\n   FROM jsonb_to_record('{\"x\": 1}'::jsonb) jsonb_to_record(x integer);",
+        ),
+        (
+            "v.rf2",
+            " SELECT x,\n    generate_series,\n    ordinality\n   FROM ROWS \
+             FROM(jsonb_to_record('{\"x\": 1}'::jsonb) AS (x integer), generate_series(1, 2)) \
+             WITH ORDINALITY r(x, generate_series, ordinality);",
+        ),
+        (
+            "v.un",
+            " SELECT a,\n    b\n   FROM UNNEST(ARRAY[1, 2], ARRAY['a'::text, 'b'::text, \
+             'c'::text]) u(a, b);",
+        ),
+        (
+            "v.co",
+            " SELECT x,\n    y\n   FROM jsonb_to_record('{\"x\": \"b\", \"y\": \"c\"}'::jsonb) \
+             t(x text COLLATE \"C\", y character varying(3));",
+        ),
+        (
+            "v.gs",
+            " SELECT g.n,\n    t.id\n   FROM v.t t,\n    LATERAL generate_series(1, t.id) WITH \
+             ORDINALITY g(n, o);",
+        ),
+    ] {
+        let q = format!("SELECT pg_get_viewdef('{view}'::regclass)");
+        assert_eq!(rows(&mut snail, &q), vec![s(&[text])], "{view}");
+    }
+    assert_eq!(
+        rows(
+            &mut snail,
+            "SELECT attname::text, format_type(atttypid, atttypmod), attcollation::text \
+             FROM pg_attribute WHERE attrelid IN ('v.na'::regclass, 'v.co'::regclass) \
+             AND attnum > 0 ORDER BY attrelid, attnum",
+        ),
+        vec![
+            s(&["x", "integer", "0"]),
+            s(&["x", "text", "950"]),
+            s(&["y", "character varying(3)", "100"]),
+        ]
+    );
+}
