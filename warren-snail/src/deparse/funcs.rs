@@ -198,7 +198,7 @@ fn own_defaults(cat: &Cat, p: &Proc) -> Result<Vec<String>> {
 /// statement over the parameters of the types it declares, a parameter named by its name read as
 /// `$n`, and a select list's column keeping the name its words give it; a RETURN's one target
 /// unnamed.
-fn body_query(cat: &Cat, f: &crate::catalog::Function) -> Result<super::query::Query> {
+pub(crate) fn body_query(cat: &Cat, f: &crate::catalog::Function) -> Result<super::query::Query> {
     use sqlparser::ast as A;
     let (text, is_return) = match f.form {
         crate::catalog::BodyForm::Return => (format!("SELECT {}", f.statement), true),

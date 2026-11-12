@@ -68,6 +68,9 @@ pub(crate) struct Type {
     pub collation: u32,
     pub len: i16,
     pub storage: char,
+    /// Its input and output functions, 0 where the row names them by no OID.
+    pub input: u32,
+    pub output: u32,
 }
 
 /// A row of pg_operator.
@@ -80,6 +83,8 @@ pub(crate) struct Oper {
     pub left: u32,
     pub right: u32,
     pub result: u32,
+    /// The function it calls.
+    pub code: u32,
 }
 
 /// A row of pg_proc.
@@ -96,6 +101,10 @@ pub(crate) struct Proc {
     pub kind: char,
     /// Its parameters' names as proargnames holds them, empty where it holds none.
     pub argnames: Vec<String>,
+    /// provolatile: i immutable, s stable, v volatile.
+    pub volatility: char,
+    pub strict: bool,
+    pub retset: bool,
 }
 
 /// The elements of a one-dimensional text array as its output writes it, `{a,"b c",""}`.
@@ -177,6 +186,8 @@ fn type_row(r: &Raw) -> Type {
         collation: num(r, "typcollation"),
         len: num(r, "typlen"),
         storage: letter(r, "typstorage"),
+        input: num(r, "typinput"),
+        output: num(r, "typoutput"),
     }
 }
 
@@ -203,6 +214,9 @@ fn proc_row(r: &Raw) -> Proc {
             .flatten()
             .map(|s| text_elements(&s))
             .unwrap_or_default(),
+        volatility: letter(r, "provolatile"),
+        strict: truth(r, "proisstrict"),
+        retset: truth(r, "proretset"),
     }
 }
 
@@ -233,6 +247,7 @@ impl Rows {
                 left: num(&r, "oprleft"),
                 right: num(&r, "oprright"),
                 result: num(&r, "oprresult"),
+                code: num(&r, "oprcode"),
             };
             rows.opers_named.entry(o.name.clone()).or_default().push(o.oid);
             rows.opers.insert(o.oid, o);

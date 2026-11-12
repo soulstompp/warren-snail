@@ -675,6 +675,11 @@ pub(super) fn typed(
 
 /// Whether a statement calls a function of the file's.
 pub(crate) fn calls(catalog: &crate::catalog::Catalog, q: &sqlparser::ast::Query) -> bool {
+    calls_in(catalog, q)
+}
+
+/// Whether anything a statement holds calls a function of the file's.
+pub(crate) fn calls_in<V: sqlparser::ast::Visit>(catalog: &crate::catalog::Catalog, q: &V) -> bool {
     if catalog.functions.is_empty() {
         return false;
     }
@@ -843,6 +848,17 @@ fn deeper() -> Result<Deeper> {
         Some(base) if base.abs_diff(at) > STACK => Err(Error::new("stack depth limit exceeded")),
         Some(_) => Ok(Deeper(false)),
     })
+}
+
+/// Whether 18.6 inlines a call of the file's function of this name before its arguments are looked
+/// at, and how often its body names each parameter; none where the file holds no such function or
+/// its body is not read.
+pub(crate) fn inlining(called: &str) -> Option<(bool, Vec<usize>)> {
+    let g = found(called)?;
+    if g.refused.is_some() {
+        return None;
+    }
+    Some((inlined(&g), g.uses.clone()))
 }
 
 /// Whether 18.6 inlines a function, before its arguments are looked at: a body of one expression

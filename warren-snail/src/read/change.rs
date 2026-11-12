@@ -1356,6 +1356,23 @@ impl Snail {
                 if self.begun.is_some() && !matches!(st, Statement::Constraints { .. }) {
                     self.levels.read();
                 }
+                // Its constants folded before any row is read, as PostgreSQL's planner folds them.
+                if matches!(
+                    st,
+                    Statement::Insert { .. }
+                        | Statement::Update { .. }
+                        | Statement::Delete { .. }
+                        | Statement::Set { .. }
+                        | Statement::Returning { .. }
+                        | Statement::OnConflict { .. }
+                        | Statement::Checked { .. }
+                        | Statement::Writes { .. }
+                ) {
+                    if let Err(e) = super::folded::folded(&self.catalog, text) {
+                        self.failed()?;
+                        return Err(e);
+                    }
+                }
                 self.touched = Touched::default();
                 let mark = self.mark();
                 // The rows the statement found when it began, which it keeps to if it runs again.

@@ -20,6 +20,7 @@ mod cursor;
 pub(crate) mod elements;
 mod explain;
 pub(crate) mod fill;
+mod folded;
 pub(crate) mod foreign;
 pub mod handed;
 mod hash;
@@ -1709,6 +1710,16 @@ impl Snail {
         let room = self.reader.room();
         let _room = self.entered_round(&room);
         self.wasted.borrow_mut().clear();
+        // Its constants folded before any row is read, as PostgreSQL's planner folds them; its
+        // parameters' values among them, as a statement bound to them is planned.
+        match params.is_empty() {
+            true => folded::folded(&self.catalog, sql)?,
+            false => {
+                if let Ok(bound) = statement::with_params(sql, params) {
+                    folded::folded(&self.catalog, &bound)?;
+                }
+            }
+        }
         // A question that calls the sequence functions is asked on a tab, and again over what its
         // calls came to wherever a run owed the file, drawing again from where it began.
         let began = self.drawing.stands();
