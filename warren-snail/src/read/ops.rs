@@ -7,6 +7,7 @@ use super::pipeline::{quoted, Value};
 use super::typed::NUMERIC;
 use crate::catalog::ColumnType;
 use crate::composed::Item;
+use crate::error::{NO_OPERATOR, NO_PREFIX_OPERATOR, OPERATOR_NOT_UNIQUE};
 use crate::{Error, Result};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 use std::cmp::Ordering;
@@ -87,7 +88,16 @@ fn named(t: Option<ColumnType>) -> String {
 }
 
 fn prefix_refused(why: &str, op: &UnaryOperator, t: Option<ColumnType>) -> Error {
-    Error::new(format!("operator {why}: {op} {}", named(t)))
+    let hint = hint_of(why, NO_PREFIX_OPERATOR);
+    Error::new(format!("operator {why}: {op} {}{hint}", named(t)))
+}
+
+/// The HINT under an operator's refusal: `none` where no form takes it, another where several do.
+pub(super) fn hint_of(why: &str, none: &'static str) -> &'static str {
+    match why {
+        "is not unique" => OPERATOR_NOT_UNIQUE,
+        _ => none,
+    }
 }
 
 /// The type a prefix operator returns, or its refusal where it has no form for its operand; none
@@ -154,7 +164,8 @@ pub(super) fn prefix(
 }
 
 fn refused(why: &str, op: &BinaryOperator, a: Option<ColumnType>, b: Option<ColumnType>) -> Error {
-    Error::new(format!("operator {why}: {} {op} {}", named(a), named(b)))
+    let hint = hint_of(why, NO_OPERATOR);
+    Error::new(format!("operator {why}: {} {op} {}{hint}", named(a), named(b)))
 }
 
 /// The type an operator of these returns, or its refusal where it has no form for its operands;
@@ -399,7 +410,7 @@ pub(super) fn like_form(
         return Ok(());
     }
     Err(Error::new(format!(
-        "operator does not exist: {} {op} {}",
+        "operator does not exist: {} {op} {}{NO_OPERATOR}",
         named(a),
         named(b)
     )))
@@ -460,7 +471,7 @@ pub(super) fn of_integers(
     };
     if other(x, left) || other(y, right) {
         return Err(Error::new(format!(
-            "operator does not exist: {} {op} {}",
+            "operator does not exist: {} {op} {}{NO_OPERATOR}",
             super::pipeline::kind_name(x),
             super::pipeline::kind_name(y)
         )));

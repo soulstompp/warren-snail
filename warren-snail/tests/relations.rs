@@ -427,7 +427,7 @@ fn coalesce_least_greatest_and_nullif_take_the_type_their_arguments_meet_in() {
             "operator does not exist: integer = text",
         ),
     ] {
-        assert_eq!(refused(&path, q), words, "{q}");
+        assert_eq!(refused(&path, q), weather::hinted(words), "{q}");
     }
 }
 

@@ -311,7 +311,7 @@ fn distinct_on_refuses_in_18_6_s_words() {
     for (sql, code, words) in asked {
         assert_eq!(
             refused(&mut w, sql),
-            (Some(*code), words.to_string()),
+            (Some(*code), weather::hinted(words)),
             "{sql}"
         );
     }
@@ -668,7 +668,7 @@ fn refusals(w: &mut Snail, asked: &[(&str, &str, &str)]) {
     for (sql, code, words) in asked {
         assert_eq!(
             refused(w, sql),
-            (Some(*code), words.to_string()),
+            (Some(*code), weather::hinted(words)),
             "{sql}"
         );
     }

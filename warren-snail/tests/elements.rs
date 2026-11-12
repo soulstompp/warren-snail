@@ -649,9 +649,8 @@ fn a_multirange_s_operators_answer_as_postgresql_s() {
 fn a_value_of_another_type_beside_a_range_is_refused_as_postgresql_resolves_the_operator() {
     let mut snail = snail_of("elements-resolution", QUESTIONS, &ROWS);
     let step = "WITH q AS (SELECT id, m, r FROM s.q)";
-    // Each refusal as PostgreSQL 19 RC1 gave it (28819, 2026-10-31): an element of a type other
-    // than the subtype, or a range of another range type, has no form of the operator, over a row
-    // and over none.
+    // Each refusal as 18.6 gives it, its HINT among it: an element of a type other than the subtype,
+    // or a range of another range type, has no form of the operator, over a row and over none.
     for (e, refused) in [
         ("m @> 4::bigint", "int4multirange @> bigint"),
         ("m @> 4.5", "int4multirange @> numeric"),
@@ -666,7 +665,9 @@ fn a_value_of_another_type_beside_a_range_is_refused_as_postgresql_resolves_the_
         for rows in ["id = 1", "id < 0"] {
             let q = format!("{step} SELECT id, ({e}) AS x FROM q WHERE {rows}");
             let got = snail.ask(&q, None).unwrap_err().to_string();
-            assert_eq!(got, format!("operator does not exist: {refused}"), "{e}");
+            let hint = "No operator matches the given name and argument types. You might need to \
+                        add explicit type casts.";
+            assert_eq!(got, format!("operator does not exist: {refused}\nHINT:  {hint}"), "{e}");
         }
     }
     for e in ["m @> 4", "m @> NULL", "r <@ m", "m @> '{[1,2)}'", "4 <@ r"] {

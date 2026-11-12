@@ -2,6 +2,7 @@
 //! each, the keys two tables meet on, and what it returns.
 
 use crate::catalog::{ident, object_name, shape, Catalog, ColumnType, Shape, Table};
+use crate::error::{NO_OPERATOR, OPERATOR_NOT_UNIQUE};
 use crate::{Error, Result};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
@@ -751,7 +752,7 @@ fn scalar_literal(e: &Expr, ty: ColumnType, release: u8) -> Result<i64> {
         Some((super::statement::Datum::Int(n), ColumnType::Int4 | ColumnType::Int8)) => n,
         Some((_, from)) => {
             return Err(Error::new(format!(
-                "operator does not exist: {} = {}",
+                "operator does not exist: {} = {}{NO_OPERATOR}",
                 ty.pg_name(),
                 from.pg_name().split('(').next().unwrap_or_default()
             )))
@@ -774,7 +775,7 @@ fn scalar_literal(e: &Expr, ty: ColumnType, release: u8) -> Result<i64> {
         ColumnType::Xid if int4 => n as i32 as u32,
         _ => {
             return Err(Error::new(format!(
-                "operator does not exist: {} = {}",
+                "operator does not exist: {} = {}{NO_OPERATOR}",
                 ty.pg_name(),
                 if int4 { "integer" } else { "bigint" }
             )))
@@ -797,7 +798,7 @@ fn bytes_literal(e: &Expr, ty: ColumnType) -> Result<Vec<u8>> {
     if let Some(s) = bit_literal(e) {
         if !ty.is_bits() {
             return Err(Error::new(format!(
-                "operator does not exist: {} = bit",
+                "operator does not exist: {} = bit{NO_OPERATOR}",
                 ty.pg_name().split('(').next().unwrap_or_default()
             )));
         }
@@ -2054,7 +2055,7 @@ impl Conj {
 /// equality.
 fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
     use crate::textual::{Internal, Textual};
-    let none = || format!("operator does not exist: {0} = {0}", ty.pg_name());
+    let none = || format!("operator does not exist: {0} = {0}{NO_OPERATOR}", ty.pg_name());
     Ok(match ty {
         ColumnType::Int2 | ColumnType::Int4 | ColumnType::Int8 => "integer".into(),
         ColumnType::Numeric { scale, .. } => format!("numeric {scale}"),
@@ -2080,7 +2081,7 @@ fn join_family(ty: ColumnType) -> std::result::Result<String, String> {
         ColumnType::Textual(t) => format!("{t:?}"),
         ColumnType::Internal(Internal::NodeTree) => "text".into(),
         ColumnType::Internal(Internal::Ndistinct | Internal::Dependencies | Internal::McvList) => {
-            return Err(format!("operator is not unique: {0} = {0}", ty.pg_name()))
+            return Err(format!("operator is not unique: {0} = {0}{OPERATOR_NOT_UNIQUE}", ty.pg_name()))
         }
         ColumnType::Internal(_)
         | ColumnType::Geometric(crate::geo::GeoKind::Point | crate::geo::GeoKind::Polygon) => {
@@ -2174,7 +2175,7 @@ fn comparable(
             Cmp::GtEq => ">=",
         };
         return Err(Error::new(format!(
-            "operator does not exist: {} {sign} {}",
+            "operator does not exist: {} {sign} {}{NO_OPERATOR}",
             a.pg_name(),
             b.pg_name()
         )));
@@ -2899,7 +2900,7 @@ fn three_ats(from: &From, p: &Expr) -> Result<Option<Expr>> {
                 )
             ) {
                 return Err(Error::new(format!(
-                    "operator does not exist: {} @@@ unknown",
+                    "operator does not exist: {} @@@ unknown{NO_OPERATOR}",
                     ty.pg_name()
                 )));
             }
@@ -3024,7 +3025,7 @@ fn conjunct(from: &From, p: &Expr) -> Result<Conj> {
         let number = super::statement::number_datum(lit).is_some();
         if !has || (ty == ColumnType::Xid && lit_left && number) {
             return Err(Error::new(format!(
-                "operator does not exist: {} {op} {}",
+                "operator does not exist: {} {op} {}{NO_OPERATOR}",
                 if lit_left {
                     "integer".into()
                 } else {

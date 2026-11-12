@@ -114,7 +114,7 @@ fn a_values_row_s_expressions_are_computed_and_assigned_as_postgresql_does() {
             "division by zero",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     assert_eq!(rows(&mut w, "SELECT count(*) FROM v1.t"), "7");
 }
@@ -261,7 +261,7 @@ fn a_values_row_refused_stops_before_the_next_row_draws() {
         ),
         (
             Some("42804"),
-            "column \"b\" is of type bigint but expression is of type text".to_string()
+            weather::hinted("column \"b\" is of type bigint but expression is of type text")
         )
     );
     assert_eq!(rows(&mut w, "SELECT nextval('v5.t_id_seq')"), "7");

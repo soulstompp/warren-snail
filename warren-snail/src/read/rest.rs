@@ -16,6 +16,7 @@ use crate::geo::{GeoArg, GeoKind, GeoValue};
 use crate::read::statement::Datum;
 use crate::regs::RegKind;
 use crate::textual::Textual;
+use crate::error::FUNCTION_NOT_UNIQUE;
 use crate::{Error, Result};
 
 /// A parameter of a form: a type; a bit string, bit or bit varying; any enum, one type across the
@@ -420,7 +421,7 @@ fn resolve(name: &str, types: &[Option<ColumnType>], open: bool) -> Result<Found
         [f] => Ok(Found::Form(f)),
         _ if open => Ok(Found::Open),
         _ => Err(Error::new(format!(
-            "function {name}({}) is not unique",
+            "function {name}({}) is not unique{FUNCTION_NOT_UNIQUE}",
             args()
         ))),
     }

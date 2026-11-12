@@ -7,6 +7,7 @@
 
 use crate::catalog::{Casing, ColumnType};
 use crate::numeric::Numeric;
+use crate::error::{NO_OPERATOR, NO_PREFIX_OPERATOR};
 use crate::{Error, Result};
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -270,7 +271,7 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
                 _ => Ordering::Less,
             })),
             None => Err(Error::new(format!(
-                "operator does not exist: {} = {}",
+                "operator does not exist: {} = {}{NO_OPERATOR}",
                 x.kind().name(),
                 y.kind().name()
             ))),
@@ -290,7 +291,7 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         }
         (Value::Typed(ty, _), other) | (other, Value::Typed(ty, _)) => {
             return Err(Error::new(format!(
-                "operator does not exist: {} = {}",
+                "operator does not exist: {} = {}{NO_OPERATOR}",
                 ty.pg_name(),
                 kind_name(other)
             )))
@@ -312,14 +313,14 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         }
         (Value::Composed(a, _), Value::Composed(b, _)) => {
             return Err(Error::new(format!(
-                "operator does not exist: {} = {}",
+                "operator does not exist: {} = {}{NO_OPERATOR}",
                 a.pg_name(),
                 b.pg_name()
             )))
         }
         (Value::Composed(ty, _), other) | (other, Value::Composed(ty, _)) => {
             return Err(Error::new(format!(
-                "operator does not exist: {} = {}",
+                "operator does not exist: {} = {}{NO_OPERATOR}",
                 ty.pg_name(),
                 kind_name(other)
             )))
@@ -330,7 +331,7 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>> {
         }
         (Value::Scalar(ty, _), other) | (other, Value::Scalar(ty, _)) => {
             return Err(Error::new(format!(
-                "operator does not exist: {} = {}",
+                "operator does not exist: {} = {}{NO_OPERATOR}",
                 ty.pg_name(),
                 kind_name(other)
             )))
@@ -2703,7 +2704,7 @@ fn compared(op: &BinaryOperator, x: &Value, y: &Value) -> Result<()> {
         Ok(())
     } else {
         Err(Error::new(format!(
-            "operator does not exist: {} {op} {}",
+            "operator does not exist: {} {op} {}{NO_OPERATOR}",
             kind_name(x),
             kind_name(y)
         )))
@@ -2796,7 +2797,7 @@ fn scalar_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Valu
         }
         _ => {
             return Err(Error::new(format!(
-                "operator does not exist: {} {op} {}",
+                "operator does not exist: {} {op} {}{NO_OPERATOR}",
                 kind_name(x),
                 kind_name(y)
             )))
@@ -2868,7 +2869,7 @@ fn geo_op(
     let (x, y) = (read(x, left, y)?, read(y, right, x)?);
     let refused = || {
         Error::new(format!(
-            "operator does not exist: {} {name} {}",
+            "operator does not exist: {} {name} {}{NO_OPERATOR}",
             kind_name(&x),
             kind_name(&y)
         ))
@@ -2988,7 +2989,7 @@ fn typed_op(
     };
     let refused = || {
         Error::new(format!(
-            "operator does not exist: {} {name} {}",
+            "operator does not exist: {} {name} {}{NO_OPERATOR}",
             kind_name(x),
             kind_name(y)
         ))
@@ -3323,7 +3324,7 @@ fn string_op(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value>>
         }
         _ => {
             return Err(Error::new(format!(
-                "operator does not exist: {} {op} {}",
+                "operator does not exist: {} {op} {}{NO_OPERATOR}",
                 kind_name(x),
                 kind_name(y)
             )))
@@ -3385,7 +3386,7 @@ fn like_of(
             crate::strings::like(&t, &q, '%', '_', escape)
         }
         _ => Err(Error::new(format!(
-            "operator does not exist: {} {} {}",
+            "operator does not exist: {} {} {}{NO_OPERATOR}",
             kind_name(v),
             if ilike.is_some() { "~~*" } else { "~~" },
             kind_name(p)
@@ -3449,7 +3450,7 @@ fn regex_match(
     let string = |v: &Value| matches!(v, Value::Null | Value::Text(_) | Value::Str(..));
     if !string(s) || !string(p) {
         return Err(Error::new(format!(
-            "operator does not exist: {} {op} {}",
+            "operator does not exist: {} {op} {}{NO_OPERATOR}",
             kind_name(s),
             kind_name(p)
         )));
@@ -3507,7 +3508,7 @@ fn float_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value
             }
             _ => {
                 return Err(Error::new(format!(
-                    "operator does not exist: {} {op} {}",
+                    "operator does not exist: {} {op} {}{NO_OPERATOR}",
                     kind_name(x),
                     kind_name(y)
                 )))
@@ -3528,7 +3529,7 @@ fn float_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value
     }
     let (Some(a), Some(b)) = (as_double(x), as_double(y)) else {
         return Err(Error::new(format!(
-            "operator does not exist: {} {op} {}",
+            "operator does not exist: {} {op} {}{NO_OPERATOR}",
             kind_name(x),
             kind_name(y)
         )));
@@ -3579,7 +3580,7 @@ fn float_arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<Value
         }
         _ => {
             return Err(Error::new(format!(
-                "operator does not exist: {} {op} {}",
+                "operator does not exist: {} {op} {}{NO_OPERATOR}",
                 kind_name(x),
                 kind_name(y)
             )))
@@ -3727,7 +3728,7 @@ pub(super) fn arith(op: &BinaryOperator, a: &Value, b: &Value) -> Result<Value> 
     }
     let (Some(x), Some(y)) = (a.to_numeric(), b.to_numeric()) else {
         return Err(Error::new(format!(
-            "operator does not exist: {} {op} {}",
+            "operator does not exist: {} {op} {}{NO_OPERATOR}",
             kind_name(a),
             kind_name(b)
         )));
@@ -3975,7 +3976,7 @@ fn beside(x: Value, y: Value, left: &Expr, right: &Expr) -> Result<(Value, Value
         }
         // xid's comparisons with an integer take it on their right only.
         (Value::Int(_), Value::Scalar(ColumnType::Xid, _)) => {
-            return Err(Error::new("operator does not exist: integer = xid"))
+            return Err(crate::error::no_operator(Some("integer"), "=", "xid"))
         }
         (Value::Int(_), Value::Scalar(..)) => {
             let x = integer_beside(&y, x)?;
@@ -4520,14 +4521,14 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                 Some(v) => of_geo(v?),
                 None => {
                     return Err(Error::new(format!(
-                        "operator does not exist: {op} {}",
+                        "operator does not exist: {op} {}{NO_PREFIX_OPERATOR}",
                         g.kind().name()
                     )))
                 }
             },
             other => {
                 return Err(Error::new(format!(
-                    "operator does not exist: {op} {}",
+                    "operator does not exist: {op} {}{NO_PREFIX_OPERATOR}",
                     kind_name(&other)
                 )))
             }
@@ -4548,7 +4549,7 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
             ),
             other => {
                 return Err(Error::new(format!(
-                    "operator does not exist: !! {}",
+                    "operator does not exist: !! {}{NO_PREFIX_OPERATOR}",
                     kind_name(&other)
                 )))
             }
@@ -4814,7 +4815,7 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                         "input of anonymous composite types is not implemented",
                     )),
                     None => Err(Error::new(format!(
-                        "operator does not exist: record = {}",
+                        "operator does not exist: record = {}{NO_OPERATOR}",
                         kind_name(&ev(x)?)
                     ))),
                 })?;
@@ -4921,7 +4922,7 @@ fn eval_whole(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Re
                 };
                 if !searched(&x) && !searched(&y) && !x.is_null() && !y.is_null() {
                     return Err(Error::new(format!(
-                        "operator does not exist: {} @@@ {}",
+                        "operator does not exist: {} @@@ {}{NO_OPERATOR}",
                         kind_name(&x),
                         kind_name(&y)
                     )));
@@ -10742,7 +10743,7 @@ fn composed_op(
     };
     let no = || {
         Error::new(format!(
-            "operator does not exist: {} {name} {}",
+            "operator does not exist: {} {name} {}{NO_OPERATOR}",
             kind_name(x),
             kind_name(y)
         ))

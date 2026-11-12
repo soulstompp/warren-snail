@@ -4,6 +4,7 @@
 
 use super::question::{instant, number, text_literal, truth_literal};
 use crate::catalog::{ident, object_name, Catalog, ColumnType, Table};
+use crate::error::NOT_ASSIGNED;
 use crate::{Error, Result};
 use sqlparser::ast::{
     AssignmentTarget, Expr, FromTable, Insert, ObjectName, ObjectNamePart, Query, SelectItem,
@@ -731,7 +732,7 @@ fn cast_through(e: &Expr, table: &Table, c: usize) -> Result<Option<Datum>> {
             };
         }
         return Err(Error::new(format!(
-            "column \"{}\" is of type {} but expression is of type {}",
+            "column \"{}\" is of type {} but expression is of type {}{NOT_ASSIGNED}",
             col.name,
             super::typed::type_name(col.ty),
             super::typed::type_name(from)
@@ -1346,12 +1347,11 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                     && of_no_type(e)
                     && !crate::catalog::assignable(ColumnType::Text(None), col.ty)
                 {
-                    return Err(Error::new(format!(
-                        "column \"{}\" is of type {} but expression is of type text\nHINT:  You \
-                         will need to rewrite or cast the expression.",
-                        col.name,
-                        super::typed::type_name(col.ty)
-                    )));
+                    return Err(crate::error::not_assigned(
+                        &col.name,
+                        &super::typed::type_name(col.ty),
+                        "text",
+                    ));
                 }
                 match literal_or_computed(e, table, c)? {
                     Some(d) => fill[c] = Fill::Literal(d),
@@ -1484,11 +1484,12 @@ fn sets_of(
         }
         if is_default(&a.value) {
             sets.push((c, Fill::Default));
-        } else if is_literal(&a.value) || crate::composed::constructs(table.columns[c].ty, &a.value)
-        {
-            sets.push((c, Fill::Literal(datum(&a.value, table, c)?)));
         } else {
-            sets.push((c, Fill::Expression(a.value.to_string())));
+            // A literal its column does not read is computed and assigned, as an INSERT's is.
+            match literal_or_computed(&a.value, table, c)? {
+                Some(d) => sets.push((c, Fill::Literal(d))),
+                None => sets.push((c, Fill::Expression(a.value.to_string()))),
+            }
         }
     }
     Ok(sets)

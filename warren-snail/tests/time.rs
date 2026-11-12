@@ -675,7 +675,7 @@ fn at_time_zone_an_interval_is_its_seconds_east_of_utc_as_postgresql_reads_it() 
             "timestamp out of range",
         ),
     ] {
-        assert_eq!(refusal(&mut s, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refusal(&mut s, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
 }
 
@@ -1206,6 +1206,26 @@ fn a_constant_its_question_makes_text_is_assigned_as_text_as_postgresql_assigns_
 
 #[cfg(feature = "standalone")]
 #[test]
+fn a_value_no_assignment_cast_takes_is_refused_with_postgresql_s_hint() {
+    let mut s = instants("not-assigned");
+    s.execute("CREATE TABLE s.h (k integer NOT NULL, h interval hour, PRIMARY KEY (k))").unwrap();
+    // By an INSERT's VALUES and by an UPDATE's SET alike, over no rows as over some.
+    for (sql, from) in [
+        ("INSERT INTO s.h VALUES (1, 5)", "integer"),
+        ("INSERT INTO s.h VALUES (2, true)", "boolean"),
+        ("UPDATE s.h SET h = 5", "integer"),
+        ("UPDATE s.h SET h = true WHERE k = 1", "boolean"),
+    ] {
+        let words = format!(
+            "column \"h\" is of type interval but expression is of type {from}\nHINT:  You will \
+             need to rewrite or cast the expression."
+        );
+        assert_eq!(refusal(&mut s, sql), (Some("42804"), words), "{sql}");
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
 fn on_conflict_after_a_select_with_no_from_is_read_as_postgresql_reads_it() {
     let mut s = instants("on-conflict-no-from");
     for sql in [
@@ -1382,7 +1402,7 @@ fn an_interval_s_qualifier_is_refused_where_postgresql_refuses_it_in_its_words()
             "syntax error at or near \"to\"",
         ),
     ] {
-        assert_eq!(refusal(&mut s, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refusal(&mut s, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     // A text holding one is split as psql sends each statement, as written, that one refused when
     // it is read.

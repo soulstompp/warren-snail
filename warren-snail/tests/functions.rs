@@ -228,7 +228,7 @@ fn the_numbers_functions_take_the_form_postgresql_resolves() {
     assert_eq!(one(&mut snail, "a NOT IN (1, NULL)").unwrap(), None);
     assert_eq!(
         refused(&mut snail, "gcd(1::int2, 1::int2)"),
-        "function gcd(smallint, smallint) is not unique"
+        weather::hinted("function gcd(smallint, smallint) is not unique")
     );
     assert_eq!(
         refused(&mut snail, "round(d, 1)"),
@@ -367,15 +367,17 @@ fn the_functions_of_time_answer_as_postgresql_s_under_utc() {
         at(&mut snail, "date_trunc('day', '2020-01-01 10:00')")
             .unwrap_err()
             .to_string(),
-        "function date_trunc(unknown, unknown) is not unique"
+        weather::hinted("function date_trunc(unknown, unknown) is not unique")
     );
     // An untyped NULL beside ends of two types leaves PostgreSQL more than one form.
     assert_eq!(
         at(&mut snail, "(d, ts) OVERLAPS (ts, NULL)")
             .unwrap_err()
             .to_string(),
-        "function pg_catalog.overlaps(date, timestamp without time zone, timestamp without time \
-         zone, unknown) is not unique"
+        weather::hinted(
+            "function pg_catalog.overlaps(date, timestamp without time zone, timestamp without \
+             time zone, unknown) is not unique"
+        )
     );
     let e = at(&mut snail, "age('5'::xid)").unwrap_err().to_string();
     assert!(e.contains("is the server's own (sessions)"), "{e}");

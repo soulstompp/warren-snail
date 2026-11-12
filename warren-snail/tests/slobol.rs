@@ -86,7 +86,7 @@ fn a_value_set_by_a_subquery_is_read_on_the_row_it_changes() {
         (e.sqlstate(), e.to_string()),
         (
             Some("42804"),
-            "column \"third_party\" is of type boolean but expression is of type numeric".into()
+            weather::hinted("column \"third_party\" is of type boolean but expression is of type numeric")
         )
     );
 }

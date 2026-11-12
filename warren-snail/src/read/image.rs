@@ -9,6 +9,7 @@ use super::statement::Datum;
 use crate::catalog::ColumnType;
 use crate::composed::{Composed, Field, Item};
 use crate::methods::bare_name;
+use crate::error::NO_OPERATOR;
 use crate::{Error, Result};
 use sqlparser::ast::{BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -246,7 +247,7 @@ pub(super) fn operands(
     if other(a) || other(b) {
         if (a.is_some() || unknown(left)) && (b.is_some() || unknown(right)) {
             return Err(Error::new(format!(
-                "operator does not exist: {} {name} {}",
+                "operator does not exist: {} {name} {}{NO_OPERATOR}",
                 shown(a),
                 shown(b)
             )));
@@ -311,7 +312,7 @@ fn pair(
     };
     if !record(&x, left) && !quoted(left) || !record(&y, right) && !quoted(right) {
         return Err(Error::new(format!(
-            "operator does not exist: {} {name} {}",
+            "operator does not exist: {} {name} {}{NO_OPERATOR}",
             kind_name(&x),
             kind_name(&y)
         )));
@@ -414,7 +415,7 @@ pub(super) fn over_array(
     }
     let (Value::Composed(a, p), true) = (&x, is_record(element)) else {
         return Err(Error::new(format!(
-            "operator does not exist: {} {name} {}",
+            "operator does not exist: {} {name} {}{NO_OPERATOR}",
             kind_name(&x),
             element.pg_name()
         )));

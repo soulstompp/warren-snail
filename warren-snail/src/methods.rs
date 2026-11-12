@@ -6,6 +6,7 @@ use crate::catalog::{ColumnType, Method};
 use crate::composed::Composed;
 use crate::geo::GeoKind;
 use crate::textual::{Internal, Textual};
+use crate::error::NO_OPERATOR;
 use crate::{Error, Result};
 
 /// Whether the snail holds an index of the method with a key of the operator class: a B-tree and a
@@ -542,7 +543,7 @@ pub fn exclusion_operator(method: Method, opclass: &str, ty: ColumnType, op: &st
         bare_name(ty)
     };
     if op == "@@" && matches!(opclass, "tsvector_ops" | "tsquery_ops") {
-        return Err(Error::new(format!("operator does not exist: {t} @@ {t}")));
+        return Err(Error::new(format!("operator does not exist: {t} @@ {t}{NO_OPERATOR}")));
     }
     if !["=", "<>", "&&", "-|-", "~="].contains(&op) {
         return Err(Error::new(format!(

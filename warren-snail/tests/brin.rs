@@ -1866,8 +1866,11 @@ mod written {
         );
     }
 
+    // 18.6's schedule (asked, the second session's CREATE INDEX between the first's statements): a
+    // one-snapshot transaction names a table as committed, a BRIN another declared since among it,
+    // and its rows go into the BRIN's summaries at its commit.
     #[test]
-    fn a_table_another_declared_a_brin_of_since_refuses_its_rows() {
+    fn a_table_another_declared_a_brin_of_since_takes_its_rows_into_the_brin() {
         let path = tmp("brin-declared-since.snail");
         write(
             &path,
@@ -1890,10 +1893,22 @@ mod written {
             "CREATE INDEX e_v ON s.e USING brin (v int4_bloom_ops)",
         );
         run(&mut a, "INSERT INTO s.e (id, v) VALUES (1, 1)");
-        assert_eq!(
-            a.execute("COMMIT").err().unwrap().to_string(),
-            "could not serialize access due to concurrent update"
-        );
+        let texts = |w: &mut Snail, sql: &str| -> Vec<String> {
+            let b = run(w, sql).answer.expect("an answer");
+            w.text_of(&b)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>().join("|"))
+                .collect()
+        };
+        assert_eq!(texts(&mut a, "SELECT id, v FROM s.e ORDER BY id"), ["1|1"]);
+        assert_eq!(texts(&mut a, "SELECT id FROM s.e WHERE v = 1"), ["1"]);
+        run(&mut a, "COMMIT");
+        for w in [&mut a, &mut b] {
+            assert_eq!(texts(w, "SELECT id, v FROM s.e ORDER BY id"), ["1|1"]);
+            assert_eq!(texts(w, "SELECT id FROM s.e WHERE v = 1"), ["1"]);
+            assert!(texts(w, "SELECT id FROM s.e WHERE v = 2").is_empty());
+        }
     }
 
     #[test]

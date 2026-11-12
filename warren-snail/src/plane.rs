@@ -8,6 +8,7 @@ use crate::directory::Span;
 use crate::geo::{
     box_contain_box, box_ov, fp_ge, fp_gt, fp_le, fp_lt, Geo, GeoBox, GeoKind, Point, EPSILON,
 };
+use crate::error::NO_OPERATOR;
 use crate::{Error, Result};
 
 /// Whether a column's values lie on the plane where a GiST or an SP-GiST strand names it.
@@ -191,7 +192,7 @@ pub(crate) fn exclusion_operator(opclass: &str, ty: ColumnType, op: &str) -> Res
         },
     )?;
     if crate::geo::geo_binary(op, &sample, &sample).is_none() {
-        return Err(Error::new(format!("operator does not exist: {t} {op} {t}")));
+        return Err(Error::new(format!("operator does not exist: {t} {op} {t}{NO_OPERATOR}")));
     }
     let (commutative, members): (&[&str], &[&str]) = match kind {
         GeoKind::Point => (&["*", "+", "<->", "<>", "?-", "?|", "~="], &["~="]),

@@ -4,6 +4,7 @@
 use super::pipeline::Value;
 use crate::catalog::ColumnType;
 use crate::times;
+use crate::error::NO_OPERATOR;
 use crate::{Error, Result};
 use sqlparser::ast::BinaryOperator;
 use std::cmp::Ordering;
@@ -333,7 +334,7 @@ pub(super) fn arith(op: &BinaryOperator, x: &Value, y: &Value) -> Result<Option<
 
 fn no_operator(op: &BinaryOperator, x: &Value, y: &Value) -> Error {
     Error::new(format!(
-        "operator does not exist: {} {op} {}",
+        "operator does not exist: {} {op} {}{NO_OPERATOR}",
         super::pipeline::kind_name(x),
         super::pipeline::kind_name(y)
     ))

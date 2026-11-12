@@ -4,6 +4,7 @@
 //! the tree printed is the one PostgreSQL would print.
 
 use super::cat::{self, Cat};
+use crate::error::{FUNCTION_NOT_UNIQUE, NO_OPERATOR, NO_PREFIX_OPERATOR, OPERATOR_NOT_UNIQUE};
 use crate::{Error, Result};
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -1171,8 +1172,8 @@ impl Analyzer<'_, '_> {
         let found = |not: &str| format!("operator {not}: {} {name} {}", self.type_name(l), self.type_name(r));
         match self.choose(&[l, r], &list) {
             Chosen::One(i) => Ok(candidates[i].clone()),
-            Chosen::NotFound => Err(Error::new(found("does not exist"))),
-            Chosen::NotUnique => Err(Error::new(found("is not unique"))),
+            Chosen::NotFound => Err(Error::new(found("does not exist") + NO_OPERATOR)),
+            Chosen::NotUnique => Err(Error::new(found("is not unique") + OPERATOR_NOT_UNIQUE)),
         }
     }
 
@@ -1185,8 +1186,8 @@ impl Analyzer<'_, '_> {
         let found = |not: &str| format!("operator {not}: {name} {}", self.type_name(r));
         match self.choose(&[r], &list) {
             Chosen::One(i) => Ok(candidates[i].clone()),
-            Chosen::NotFound => Err(Error::new(found("does not exist"))),
-            Chosen::NotUnique => Err(Error::new(found("is not unique"))),
+            Chosen::NotFound => Err(Error::new(found("does not exist") + NO_PREFIX_OPERATOR)),
+            Chosen::NotUnique => Err(Error::new(found("is not unique") + OPERATOR_NOT_UNIQUE)),
         }
     }
 
@@ -2203,7 +2204,7 @@ impl Analyzer<'_, '_> {
                     Chosen::One(c) => Some(c),
                     Chosen::NotFound => None,
                     Chosen::NotUnique => {
-                        return Err(Error::new(format!("function {name}({}) is not unique", shown())))
+                        return Err(Error::new(format!("function {name}({}) is not unique{FUNCTION_NOT_UNIQUE}", shown())))
                     }
                 }
             }
@@ -2287,7 +2288,7 @@ impl Analyzer<'_, '_> {
                     Chosen::NotFound => None,
                     Chosen::NotUnique => {
                         return Err(Error::new(format!(
-                            "function {name}({}) is not unique",
+                            "function {name}({}) is not unique{FUNCTION_NOT_UNIQUE}",
                             actual.iter().map(|&t| self.type_name(t)).collect::<Vec<_>>().join(", ")
                         )))
                     }

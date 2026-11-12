@@ -5,6 +5,7 @@
 //! as its input function reads it and printed as its output function writes it; those PostgreSQL
 //! orders are keyed as their comparison orders them.
 
+use crate::error::NO_OPERATOR;
 use crate::{Error, Result};
 
 /// A type held as PostgreSQL's text of each value.
@@ -435,7 +436,7 @@ pub fn compare(
     };
     if !kin {
         return Err(Error::new(format!(
-            "operator does not exist: {} = {}",
+            "operator does not exist: {} = {}{NO_OPERATOR}",
             a.pg_name(),
             b.pg_name()
         )));

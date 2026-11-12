@@ -862,10 +862,23 @@ impl<'a> File<'a> {
                         return varlena(oid, "d");
                     }
                 }
+                // Aligned as a double where its subtype is, else as an integer.
                 K::Range { name, .. } | K::Multirange { name, .. } => {
                     let oid = self.oid(Object::Type(full(name)));
                     if oid != 0 {
-                        return varlena(oid, "d");
+                        let subtype = match r.def() {
+                            K::Multirange { range, .. } => match range {
+                                ColumnType::Composed(g) => match g.def() {
+                                    K::Range { subtype, .. } => Some(*subtype),
+                                    _ => None,
+                                },
+                                _ => None,
+                            },
+                            K::Range { subtype, .. } => Some(*subtype),
+                            _ => None,
+                        };
+                        let double = subtype.is_some_and(|s| self.facts(s, None).align == "d");
+                        return varlena(oid, if double { "d" } else { "i" });
                     }
                 }
                 K::Array { element, domain } => {
@@ -1398,12 +1411,25 @@ impl<'a> File<'a> {
                     out.push(self.array_of(&n, oid, "i"));
                 }
                 crate::catalog::TypeKind::Range(r) => {
+                    // Aligned as a double where its subtype is, else as an integer, as
+                    // DefineRange aligns a range, its multirange and both arrays.
+                    let subtype = crate::regs::type_oid(&r.subtype, self.release).unwrap_or(0);
+                    let double = self
+                        .types
+                        .get(&subtype)
+                        .and_then(|t| t.get("typalign").cloned().flatten())
+                        .is_some_and(|a| a == "d");
+                    let align = if double { "d" } else { "i" };
+                    let facts = TypeFacts {
+                        align: align.into(),
+                        ..record.clone()
+                    };
                     let mut range = self.pg_type(
                         oid,
                         &n,
                         'r',
                         'R',
-                        &record,
+                        &facts,
                         ("range_in", "range_out", "range_recv", "range_send"),
                         0,
                         0,
@@ -1411,7 +1437,7 @@ impl<'a> File<'a> {
                     );
                     range.insert("typanalyze", Some(self.proc("range_typanalyze")));
                     out.push(range);
-                    out.push(self.array_of(&n, oid, "d"));
+                    out.push(self.array_of(&n, oid, align));
                     let m = full(&r.multirange);
                     let moid = self.oid(Object::Type(m.clone()));
                     let marray = self.oid(Object::Array(m.clone()));
@@ -1420,7 +1446,7 @@ impl<'a> File<'a> {
                         &m,
                         'm',
                         'R',
-                        &record,
+                        &facts,
                         (
                             "multirange_in",
                             "multirange_out",
@@ -1433,7 +1459,7 @@ impl<'a> File<'a> {
                     );
                     multi.insert("typanalyze", Some(self.proc("multirange_typanalyze")));
                     out.push(multi);
-                    out.push(self.array_of(&m, moid, "d"));
+                    out.push(self.array_of(&m, moid, align));
                 }
                 crate::catalog::TypeKind::Composite { .. } => {}
             }

@@ -108,7 +108,7 @@ fn order_by_using_sorts_as_its_operator_does_wherever_it_stands() {
         ("SELECT g FROM s.a UNION SELECT g FROM s.a ORDER BY g USING =", "operator = is not a valid ordering operator"),
         ("SELECT id FROM s.a ORDER BY id USING OPERATOR(public.>)", "operator does not exist: bigint public.> bigint"),
     ] {
-        assert_eq!(refused(&mut s, sql), pg, "{sql}");
+        assert_eq!(refused(&mut s, sql), weather::hinted(pg), "{sql}");
     }
 }
 

@@ -5,6 +5,7 @@
 //! not resolve is read as before, a row at a time.
 
 use crate::catalog::ColumnType;
+use crate::error::{FUNCTION_NOT_UNIQUE, NO_OPERATOR};
 use crate::{Error, Result};
 use sqlparser::ast::{
     BinaryOperator, CastKind, CeilFloorKind, DateTimeField, Expr, FunctionArg, FunctionArgExpr,
@@ -131,10 +132,7 @@ pub(super) fn no_form(name: &str, args: &[Option<ColumnType>]) -> Error {
 
 /// PostgreSQL's refusal of an operator no form of it takes, each side by its type's name.
 pub(super) fn no_operator(left: &str, op: &str, right: &str) -> Error {
-    Error::new(format!(
-        "operator does not exist: {left} {op} {right}\nHINT:  No operator matches the given name \
-         and argument types. You might need to add explicit type casts."
-    ))
+    crate::error::no_operator(Some(left), op, right)
 }
 
 /// A refusal of a call no form of a function takes, the function named as the call writes it, in
@@ -574,7 +572,7 @@ impl Typing<'_> {
                                 "input of anonymous composite types is not implemented",
                             )),
                             (None, Some(u)) => Err(Error::new(format!(
-                                "operator does not exist: record = {}",
+                                "operator does not exist: record = {}{NO_OPERATOR}",
                                 type_name(u)
                             ))),
                             (None, None) => Ok(()),
@@ -666,7 +664,7 @@ impl Typing<'_> {
                     .collect();
                 if ends.iter().any(Option::is_none) && known.windows(2).any(|w| w[0] != w[1]) {
                     return Err(Error::new(format!(
-                        "function pg_catalog.overlaps({}) is not unique",
+                        "function pg_catalog.overlaps({}) is not unique{FUNCTION_NOT_UNIQUE}",
                         ends.iter()
                             .map(|t| arg_name(*t))
                             .collect::<Vec<_>>()
@@ -962,7 +960,7 @@ impl Typing<'_> {
                     };
                     if name == "unnest" && types == [None] && literal(args[0]) {
                         return Err(Error::new(format!(
-                            "function {name}({}) is not unique",
+                            "function {name}({}) is not unique{FUNCTION_NOT_UNIQUE}",
                             arg_name(None)
                         )));
                     }
@@ -1052,9 +1050,10 @@ fn concatenated(
     }
     let refused = |why: &str| {
         Err(Error::new(format!(
-            "operator {why}: {} || {}",
+            "operator {why}: {} || {}{}",
             arg_name(a),
-            arg_name(b)
+            arg_name(b),
+            super::ops::hint_of(why, crate::error::NO_OPERATOR)
         )))
     };
     Ok(Some(match (a, b) {
@@ -1247,7 +1246,7 @@ pub(super) fn numbers(
             | [Arg::Int(C::Int2), Arg::Int(C::Int2) | Arg::Unknown]
             | [Arg::Unknown, Arg::Int(C::Int2)] => {
                 return Err(Error::new(format!(
-                    "function {name}({}, {}) is not unique",
+                    "function {name}({}, {}) is not unique{FUNCTION_NOT_UNIQUE}",
                     arg_name(args[0]),
                     arg_name(args[1])
                 )))
@@ -1294,14 +1293,16 @@ pub(super) fn numbers(
             [Arg::Numeric, Arg::Int(_) | Arg::Numeric | Arg::Unknown]
             | [Arg::Int(_) | Arg::Unknown, Arg::Numeric] => Some(Some(NUMERIC)),
             [Arg::Unknown, Arg::Unknown] => {
-                return Err(Error::new("function mod(unknown, unknown) is not unique"))
+                return Err(Error::new(format!(
+                    "function mod(unknown, unknown) is not unique{FUNCTION_NOT_UNIQUE}"
+                )))
             }
             _ => return refused(),
         },
         "gcd" | "lcm" => match a.as_slice() {
             [Arg::Int(C::Int2), Arg::Int(C::Int2)] => {
                 return Err(Error::new(format!(
-                    "function {name}(smallint, smallint) is not unique"
+                    "function {name}(smallint, smallint) is not unique{FUNCTION_NOT_UNIQUE}"
                 )))
             }
             [Arg::Int(x), Arg::Int(y)] => Some(Some(wider(*x, *y).max_int4())),
@@ -1325,7 +1326,7 @@ pub(super) fn numbers(
         "to_hex" | "to_oct" | "to_bin" => match a.as_slice() {
             [Arg::Int(C::Int2) | Arg::Unknown] => {
                 return Err(Error::new(format!(
-                    "function {name}({}) is not unique",
+                    "function {name}({}) is not unique{FUNCTION_NOT_UNIQUE}",
                     arg_name(args[0])
                 )))
             }
@@ -1353,7 +1354,7 @@ pub(super) fn numbers(
                 Some(t) if t != C::Int2 => Some(Some(t)),
                 _ => {
                     return Err(Error::new(format!(
-                        "function {name}({}) is not unique",
+                        "function {name}({}) is not unique{FUNCTION_NOT_UNIQUE}",
                         args.iter().map(|t| arg_name(*t)).collect::<Vec<_>>().join(", ")
                     )))
                 }
@@ -1396,7 +1397,7 @@ pub(super) fn time(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Opt
     let interval = super::calls::full_interval();
     let not_unique = || {
         Err(Error::new(format!(
-            "function {name}({}) is not unique",
+            "function {name}({}) is not unique{FUNCTION_NOT_UNIQUE}",
             args.iter()
                 .map(|t| arg_name(*t))
                 .collect::<Vec<_>>()
@@ -1779,9 +1780,10 @@ pub(super) fn statistics_operator(
     let concat = op == "||";
     let refused = |why: &str| {
         Err(Error::new(format!(
-            "operator {why}: {} {op} {}",
+            "operator {why}: {} {op} {}{}",
             arg_name(a),
-            arg_name(b)
+            arg_name(b),
+            super::ops::hint_of(why, crate::error::NO_OPERATOR)
         )))
     };
     if !s.casts() {
@@ -1984,7 +1986,7 @@ fn compared(
     match (a, b) {
         (Some(x), Some(y)) if x.is_string() && number(y) || number(x) && y.is_string() => {
             Err(Error::new(format!(
-                "operator does not exist: {} {op} {}",
+                "operator does not exist: {} {op} {}{NO_OPERATOR}",
                 type_name(x),
                 type_name(y)
             )))
@@ -2048,7 +2050,7 @@ fn chosen(name: &str, args: &[&Expr], types: &[Option<ColumnType>]) -> Result<Op
             (None, None) => ColumnType::Text(None),
             (Some(x), Some(y)) => common_type(&[Some(x), Some(y)], "NULLIF").map_err(|_| {
                 Error::new(format!(
-                    "operator does not exist: {} = {}",
+                    "operator does not exist: {} = {}{NO_OPERATOR}",
                     arg_name(Some(x)),
                     arg_name(Some(y))
                 ))

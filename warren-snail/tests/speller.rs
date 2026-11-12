@@ -156,7 +156,7 @@ fn each_refusal_carries_postgresqls_sqlstate_in_its_words() {
             "MAXVALUE (40000) is out of range for sequence data type smallint",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     // A numeric constant cast to an integer by assignment, half away from zero.
     run(&mut w, "INSERT INTO s.f (id, j, i) VALUES (1, 1.5, -2.5)");
@@ -188,7 +188,7 @@ fn each_refusal_carries_postgresqls_sqlstate_in_its_words() {
             "check constraint \"f_c\" of relation \"f\" is violated by some row",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
 }
 
@@ -416,7 +416,7 @@ fn a_columns_default_is_set_and_dropped_on_a_table_holding_rows() {
             "column \"nosuch\" of relation \"d\" does not exist",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
 }
 
@@ -588,7 +588,7 @@ fn on_conflict_passes_over_or_sets_the_row_its_key_meets() {
             "constraint \"nosuch\" for table \"w\" does not exist",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     assert_eq!(
         rows(&mut w, "SELECT k, a, b FROM s.w ORDER BY k"),
@@ -799,7 +799,7 @@ fn a_write_through_a_view_reaches_its_table_each_check_option_met() {
             "WITH CHECK OPTION is supported only on automatically updatable views",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
 }
 
@@ -895,7 +895,7 @@ fn the_sequence_functions_answer_as_the_session_holds_its_sequences() {
             "invalid input syntax for type boolean: \"x\"",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     // setval moves no lastval; a CACHE's values are the session's until a setval throws them away.
     for (sql, want) in [
@@ -1101,7 +1101,7 @@ fn a_name_in_a_schema_no_statement_made_is_refused_but_in_a_files_kept_statement
         ("CREATE INDEX i ON s.missing (id)", "42P01", "relation \"s.missing\" does not exist"),
         ("INSERT INTO nx.t VALUES (1)", "42P01", "relation \"nx.t\" does not exist"),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     run(&mut w, "CREATE TABLE public.base (id integer PRIMARY KEY)");
     assert_eq!(
@@ -1555,7 +1555,7 @@ fn the_session_time_zone_reads_and_writes_instants_as_postgresql_does() {
         ("SET TimeZone = ''", "22023", "invalid value for parameter \"TimeZone\": \"\""),
         ("SET TimeZone = 'UTC', 'GMT'", "22023", "SET timezone takes only one argument"),
     ] {
-        assert_eq!(refused(&mut w, set), (Some(code), words.to_string()), "{set}");
+        assert_eq!(refused(&mut w, set), (Some(code), weather::hinted(words)), "{set}");
     }
     // A build without the feature zones, on by default, refuses a named zone by name.
     #[cfg(not(feature = "zones"))]
@@ -1818,7 +1818,7 @@ fn a_parameter_is_typed_where_postgresql_settles_it_and_refused_where_it_cannot_
         ("PREPARE a (nosuchtype) AS SELECT $1", "42704", "type \"nosuchtype\" does not exist"),
         ("PREPARE a AS SELECT $0", "42P02", "there is no parameter $0"),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     // Each answered as its parameters' types answer it.
     run(&mut w, "PREPARE r AS SELECT abs($1)");
@@ -1852,12 +1852,12 @@ fn a_parameter_is_typed_where_postgresql_settles_it_and_refused_where_it_cannot_
         ("EXECUTE nosuch (1)", "26000", "prepared statement \"nosuch\" does not exist"),
         ("DEALLOCATE nosuch", "26000", "prepared statement \"nosuch\" does not exist"),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     // A host's statement given its parameters is read as a protocol's Parse reads it.
     let one = |v: &str| vec![v.to_string()];
     let e = w.execute_with("SELECT $1 + $2", &[one("1"), one("2")].concat()).unwrap_err();
-    assert_eq!((e.sqlstate(), e.0.as_str()), (Some("42725"), "operator is not unique: unknown + unknown"));
+    assert_eq!((e.sqlstate(), e.0), (Some("42725"), weather::hinted("operator is not unique: unknown + unknown")));
     let e = w.execute_with("SELECT $1 IS NULL", &one("1")).unwrap_err();
     assert_eq!(e.sqlstate(), Some("42P18"));
     let e = w.ask_with("SELECT $1 WHERE $1 = 1", None, &one("1")).unwrap_err();
@@ -2074,7 +2074,7 @@ fn a_locking_clause_a_name_written_twice_and_a_relation_not_held_carry_their_cod
             "common column name \"a\" appears more than once in left table",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
     // In a transaction block LOCK TABLE looks its tables up before its mode is read.
     run(&mut w, "BEGIN");
@@ -2189,7 +2189,7 @@ fn a_literal_is_read_as_the_type_its_place_gives_it() {
         ("SELECT id FROM s.t WHERE ROW(a, b) IS DISTINCT FROM ROW(2, 3)", "42883", "operator does not exist: text = integer"),
         ("WITH w AS (SELECT id, b FROM s.t) SELECT id FROM w WHERE b = 3", "42883", "operator does not exist: text = integer"),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
 }
 
@@ -2328,7 +2328,7 @@ fn a_subscript_an_aggregate_gives_and_a_function_reading_the_row_around_its_subq
             "more than one row returned by a subquery used as an expression",
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), (Some(code), words.to_string()), "{sql}");
+        assert_eq!(refused(&mut w, sql), (Some(code), weather::hinted(words)), "{sql}");
     }
 }
 

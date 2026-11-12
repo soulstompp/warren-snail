@@ -467,11 +467,11 @@ fn an_integer_s_complement_keeps_its_type_a_literal_of_no_type_is_not_unique() {
     );
     assert_eq!(
         at(&path, 1, "~ '5'").unwrap_err(),
-        "operator is not unique: ~ unknown"
+        weather::hinted("operator is not unique: ~ unknown")
     );
     assert_eq!(
         at(&path, 1, "~ NULL").unwrap_err(),
-        "operator is not unique: ~ unknown"
+        weather::hinted("operator is not unique: ~ unknown")
     );
     assert_eq!(at(&path, 1, "~ b'101'").unwrap(), "010");
     assert_eq!(
@@ -535,7 +535,7 @@ fn an_operator_a_type_has_no_form_of_is_refused_before_any_row_in_postgresql_s_w
             format!("SELECT id FROM s.t WHERE id < 0 AND ({expr}) IS NULL"),
         ] {
             let e = snail.ask(&q, None).unwrap_err().to_string();
-            assert_eq!(e, words, "{q}");
+            assert_eq!(e, weather::hinted(words), "{q}");
         }
     }
 }
@@ -1558,7 +1558,7 @@ fn text_matches_as_a_vector_of_it_under_the_file_s_configuration_each_way_of_ask
         ("ts_headline(id, q)", no_function("ts_headline(integer, tsquery)")),
     ] {
         let q = format!("SELECT {expr} AS x FROM s.d WHERE id < 0");
-        assert_eq!(snail.ask(&q, None).unwrap_err().to_string(), words, "{q}");
+        assert_eq!(snail.ask(&q, None).unwrap_err().to_string(), weather::hinted(&words), "{q}");
     }
 }
 

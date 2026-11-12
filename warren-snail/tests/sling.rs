@@ -894,7 +894,7 @@ fn a_row_value_in_a_list_of_rows_is_answered_as_postgresql_answers_it() {
         ("SELECT a FROM k5.r WHERE false AND (a, b) = (1, 'y', 3)", widths.clone()),
         ("DELETE FROM k5.r WHERE (a, b) IN ((1, 'y', 3))", widths),
     ] {
-        assert_eq!(refused(&mut w, sql), want, "{sql}");
+        assert_eq!(refused(&mut w, sql), (want.0, weather::hinted(&want.1)), "{sql}");
     }
 }
 
@@ -1263,7 +1263,7 @@ fn an_aggregate_of_the_query_around_is_refused_in_its_clause_s_words() {
             not_in("GROUP BY"),
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), want, "{sql}");
+        assert_eq!(refused(&mut w, sql), (want.0, weather::hinted(&want.1)), "{sql}");
     }
 }
 
@@ -1822,7 +1822,7 @@ fn a_subquery_in_from_reading_a_relation_laid_before_it_is_refused_in_postgresql
             ),
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), want, "{sql}");
+        assert_eq!(refused(&mut w, sql), (want.0, weather::hinted(&want.1)), "{sql}");
     }
 }
 
@@ -1915,13 +1915,13 @@ fn an_aggregate_or_a_window_in_a_join_s_on_is_refused_in_postgresql_s_words() {
             ),
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), want, "{sql}");
+        assert_eq!(refused(&mut w, sql), (want.0, weather::hinted(&want.1)), "{sql}");
     }
 }
 
 /// A statement's refusal's SQLSTATE and words, as `refused` gives them.
 fn said(code: &'static str, words: &str) -> (Option<&'static str>, String) {
-    (Some(code), words.to_string())
+    (Some(code), weather::hinted(words))
 }
 
 /// PostgreSQL's words for a relation whose row type would take a type's name.
@@ -1987,7 +1987,7 @@ fn type_and_function_refusals_are_18_6_s_words() {
             said("42723", "function \"f\" already exists with same argument types"),
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), want, "{sql}");
+        assert_eq!(refused(&mut w, sql), (want.0, weather::hinted(&want.1)), "{sql}");
     }
     // A sequence has no row type, and an index none either: each takes a type's name.
     w.execute("CREATE TYPE k7.q AS ENUM ('c')").unwrap();
@@ -2051,7 +2051,7 @@ fn type_and_function_refusals_are_18_6_s_words() {
             no_operator("character varying = bigint"),
         ),
     ] {
-        assert_eq!(refused(&mut w, sql), want, "{sql}");
+        assert_eq!(refused(&mut w, sql), (want.0, weather::hinted(&want.1)), "{sql}");
     }
     // A function of pg_catalog's named in it is read as its bare name is.
     assert_eq!(

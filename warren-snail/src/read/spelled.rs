@@ -1430,7 +1430,7 @@ pub(super) fn at_at_spaced(sql: &str) -> Result<()> {
                 .find(|t| !matches!(t, Token::Whitespace(_)));
             return Err(Error::new(match operand {
                 Some(Token::SingleQuotedString(_)) => {
-                    "operator is not unique: @ unknown".to_string()
+                    format!("operator is not unique: @ unknown{}", crate::error::OPERATOR_NOT_UNIQUE)
                 }
                 _ => "operator does not exist: @@ with a prefix @ on its right".to_string(),
             }));

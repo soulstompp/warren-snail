@@ -875,7 +875,7 @@ fn a_literal_written_with_casts_is_read_through_each_innermost_first() {
             .execute(sql)
             .err()
             .unwrap_or_else(|| panic!("{sql} was taken"));
-        assert_eq!(e.to_string(), why, "{sql}");
+        assert_eq!(e.to_string(), weather::hinted(why), "{sql}");
     }
     drop(w);
     let mut s = Snail::open(&path).unwrap();
@@ -982,7 +982,7 @@ fn an_insert_select_of_no_rows_or_of_a_column_of_no_value_is_typed_by_its_questi
             .execute(sql)
             .err()
             .unwrap_or_else(|| panic!("{sql} was taken"));
-        assert_eq!(e.to_string(), varchar, "{sql}");
+        assert_eq!(e.to_string(), weather::hinted(varchar), "{sql}");
     }
     for sql in [
         "INSERT INTO s.dom (id, v, w) SELECT n.id + 10, n.a, n.a FROM s.nn n WHERE n.id = 999",

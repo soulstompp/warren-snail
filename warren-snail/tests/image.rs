@@ -178,11 +178,11 @@ fn two_row_constructors_are_compared_a_pair_at_a_time() {
     let mut s = empty("pairs");
     assert_eq!(
         refused(&mut s, "SELECT ROW(1.0) *= ROW(1.00) AS x"),
-        "operator does not exist: numeric *= numeric"
+        weather::hinted("operator does not exist: numeric *= numeric")
     );
     assert_eq!(
         refused(&mut s, "SELECT ROW(1.0) *<> ROW(1.00) AS x"),
-        "operator does not exist: numeric *<> numeric"
+        weather::hinted("operator does not exist: numeric *<> numeric")
     );
     assert_eq!(
         refused(&mut s, "SELECT ROW(1, 2) *= ROW(1) AS x"),
@@ -240,7 +240,7 @@ fn what_postgresql_refuses_is_refused_in_its_words() {
         ("SELECT ROW(1) *= '(1)' AS x", "input of anonymous composite types is not implemented"),
         ("SELECT '(1)' *= ROW(1) AS x", "input of anonymous composite types is not implemented"),
     ] {
-        assert_eq!(refused(&mut s, sql), why, "{sql}");
+        assert_eq!(refused(&mut s, sql), weather::hinted(why), "{sql}");
     }
     let two = |a: &str, b: &str| format!("SELECT x *= y AS i FROM (SELECT {a} AS x, {b} AS y) q");
     for (a, b, why) in [
@@ -349,29 +349,32 @@ fn before_any_some_and_all_over_an_array_it_is_asked_of_each_element() {
         ("SELECT ROW(1) *= ANY(ROW(1)) AS x", "op ANY/ALL (array) requires array on right side"),
         ("SELECT ROW(1) *= ALL(1) AS x", "op ANY/ALL (array) requires array on right side"),
     ] {
-        assert_eq!(refused(&mut s, sql), why, "{sql}");
+        assert_eq!(refused(&mut s, sql), weather::hinted(why), "{sql}");
     }
     assert!(refused(&mut s, "SELECT ROW(1) *< ANY(ARRAY[ROW(1)]) AS x").contains("in-memory layout"));
     assert!(refused(&mut s, "SELECT ROW(1) *= ANY(SELECT ROW(1)) AS x").contains("found: *="));
 }
 
 #[test]
-fn a_row_constructor_compared_otherwise_stays_unread() {
+fn a_row_constructor_compares_pair_by_pair_and_records_by_bytes_stay_unread() {
     let mut s = empty("otherwise");
-    for sql in [
-        "SELECT ROW(1) < ROW(2) AS x",
-        "SELECT ROW(1) BETWEEN ROW(0) AND ROW(2) AS x",
-    ] {
-        assert!(refused(&mut s, sql).ends_with("is not read"), "{sql}");
-    }
-    // By `=` and `<>`, and in a list of rows, their pairs' comparisons, as 18.6 answers them.
+    // By `=` and `<>`, in a list of rows, and by order, their pairs' comparisons, BETWEEN its two,
+    // as 18.6 answers them.
     for (sql, want) in [
         ("SELECT ROW(1, NULL) = ROW(1, NULL) AS x", "NULL"),
         ("SELECT (1, 2) <> (1, 3) AS x", "true"),
         ("SELECT (1, 2) IN ((1, 2)) AS x", "true"),
+        ("SELECT ROW(1) < ROW(2) AS x", "true"),
+        ("SELECT ROW(1, NULL) < ROW(2, 1) AS x", "true"),
+        ("SELECT ROW(1, NULL) < ROW(1, 1) AS x", "NULL"),
+        ("SELECT ROW(1) BETWEEN ROW(0) AND ROW(2) AS x", "true"),
+        ("SELECT ROW(3) BETWEEN SYMMETRIC ROW(4) AND ROW(2) AS x", "true"),
     ] {
         assert_eq!(rows(&mut s, sql), [[want]], "{sql}");
     }
+    // Two records ordered by their bytes, which the snail does not keep, stay unread (18.6: true).
+    let sql = "SELECT x *< y AS z FROM (SELECT ROW(1) AS x, ROW(2) AS y) q";
+    assert!(refused(&mut s, sql).contains("is not read"), "{sql}");
     assert_eq!(rows(&mut s, "SELECT ROW(1, 2.50)::text AS x"), [["(1,2.50)"]]);
     assert_eq!(rows(&mut s, "SELECT (ROW(1, 2)).f2 AS x"), [["2"]]);
     assert_eq!(rows(&mut s, "SELECT (1, 'a')::text AS x"), [["(1,a)"]]);
@@ -521,15 +524,15 @@ mod written {
         let mut s = Snail::open(&made("before", DDL)).unwrap();
         assert_eq!(
             refused(&mut s, "SELECT id *= id AS x FROM s.t"),
-            "operator does not exist: integer *= integer"
+            weather::hinted("operator does not exist: integer *= integer")
         );
         assert_eq!(
             refused(&mut s, "SELECT id FROM s.t WHERE id *= 1"),
-            "operator does not exist: integer *= integer"
+            weather::hinted("operator does not exist: integer *= integer")
         );
         assert_eq!(
             refused(&mut s, "SELECT a *= 1 AS x FROM s.t"),
-            "operator does not exist: s.c *= integer"
+            weather::hinted("operator does not exist: s.c *= integer")
         );
         assert_eq!(
             refused(&mut s, "SELECT a *= '(1)' AS x FROM s.t"),
@@ -537,7 +540,7 @@ mod written {
         );
         assert_eq!(
             refused(&mut s, "WITH q AS (SELECT id FROM s.t) SELECT id *= id AS x FROM q"),
-            "operator does not exist: integer *= integer"
+            weather::hinted("operator does not exist: integer *= integer")
         );
     }
 

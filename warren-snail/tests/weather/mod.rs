@@ -663,3 +663,29 @@ pub fn tally(
     }
     m.into_iter().collect()
 }
+
+/// A refusal's words with the HINT 18.6 gives under them: of an operator or a function no form or
+/// several forms of which take its arguments, and of a value no assignment cast takes to its
+/// column. Any other words, and words holding their HINT, as they are.
+pub fn hinted(words: &str) -> String {
+    let operator = |c: char| "+-*/<>=~!@#%^&|`?".contains(c);
+    let hint = if words.contains("\nHINT:") {
+        return words.to_string();
+    } else if let Some(rest) = words.strip_prefix("operator does not exist: ") {
+        match rest.starts_with(operator) {
+            true => "No operator matches the given name and argument type. You might need to add \
+                     an explicit type cast.",
+            false => "No operator matches the given name and argument types. You might need to \
+                      add explicit type casts.",
+        }
+    } else if words.starts_with("operator is not unique: ") {
+        "Could not choose a best candidate operator. You might need to add explicit type casts."
+    } else if words.starts_with("function ") && words.ends_with(" is not unique") {
+        "Could not choose a best candidate function. You might need to add explicit type casts."
+    } else if words.starts_with("column \"") && words.contains(" but expression is of type ") {
+        "You will need to rewrite or cast the expression."
+    } else {
+        return words.to_string();
+    };
+    format!("{words}\nHINT:  {hint}")
+}

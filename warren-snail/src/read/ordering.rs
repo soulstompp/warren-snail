@@ -4,6 +4,7 @@
 
 use crate::catalog::ColumnType;
 use crate::composed::Composed;
+use crate::error::NO_OPERATOR;
 use crate::{Error, Result};
 use sqlparser::ast::{OrderByOptions, OrderBySort, ObjectNamePart};
 
@@ -110,7 +111,7 @@ pub(super) fn checked(o: &OrderByOptions, ty: Option<ColumnType>) -> Result<()> 
     };
     let missing = || {
         Error::new(format!(
-            "operator does not exist: {} {written} {}",
+            "operator does not exist: {} {written} {}{NO_OPERATOR}",
             bare(ty),
             bare(ty)
         ))

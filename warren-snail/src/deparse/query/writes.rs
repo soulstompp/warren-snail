@@ -5,6 +5,7 @@
 use super::{analyze, not_read, Builder, Ns, Query, Rte, RteKind, Target};
 use crate::deparse::analyze::{folded, Context, Form, Node};
 use crate::deparse::cat;
+use crate::error::NOT_ASSIGNED;
 use crate::{Error, Result};
 use sqlparser::ast as A;
 
@@ -94,7 +95,7 @@ impl Builder<'_, '_, '_> {
         let from = n.ty();
         if !a.can_coerce_all(&[from], &[c.ty], Context::Assignment) {
             return Err(Error::new(format!(
-                "column \"{}\" is of type {} but expression is of type {}",
+                "column \"{}\" is of type {} but expression is of type {}{NOT_ASSIGNED}",
                 c.name,
                 crate::deparse::print::format_type_be(self.cat, c.ty),
                 crate::deparse::print::format_type_be(self.cat, from)

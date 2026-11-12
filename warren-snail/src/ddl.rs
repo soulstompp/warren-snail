@@ -2909,7 +2909,8 @@ impl Draft {
                             ([], 1) => return own_refused(&format!("FUNCTION {name}")),
                             _ => {
                                 return Err(Error::new(format!(
-                                    "function name \"{name}\" is not unique"
+                                    "function name \"{name}\" is not unique\nHINT:  Specify the \
+                                     argument list to select the function unambiguously."
                                 )))
                             }
                         }

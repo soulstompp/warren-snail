@@ -305,3 +305,48 @@ fn a_view_the_snail_does_not_print_is_refused_by_name_never_left_out() {
     let mut snail = Snail::open(&path).unwrap();
     assert_eq!(snail.ask("SELECT id FROM dn.a", None).unwrap().0.num_rows(), 0);
 }
+
+// 18.6 over the same DDL: a range is aligned as a double where its subtype is, else as an integer,
+// its multirange and both arrays alike, and so is a column of each.
+#[test]
+fn a_file_s_range_is_aligned_as_its_subtype() {
+    let ddl = "CREATE SCHEMA s; CREATE TYPE s.tr AS RANGE (subtype = text); \
+         CREATE TYPE s.ir AS RANGE (subtype = int4); CREATE TYPE s.br AS RANGE (subtype = int8); \
+         CREATE TYPE s.fr AS RANGE (subtype = float8); CREATE TYPE s.nr AS RANGE (subtype = numeric); \
+         CREATE TYPE s.dr AS RANGE (subtype = date); \
+         CREATE TABLE s.t (id integer PRIMARY KEY, a s.tr, b s.ir, c s.br, d s.fr, e s.nr, f s.dr, \
+         h s.tr_multirange, i s.ir[], j s.br_multirange);";
+    let path = tmp("ranges-aligned.snail");
+    let catalog = Catalog::parse(ddl).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    let mut snail = Snail::open(&path).unwrap();
+    let pairs = |rows: Vec<Vec<Option<String>>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| r.into_iter().map(Option::unwrap_or_default).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    let types = rows(
+        &mut snail,
+        "SELECT typname::text, typalign::text FROM pg_type \
+         WHERE typnamespace = 's'::regnamespace ORDER BY typname",
+    );
+    assert_eq!(
+        pairs(types),
+        [
+            "_br|d", "_br_multirange|d", "_dr|i", "_dr_multirange|i", "_fr|d", "_fr_multirange|d",
+            "_ir|i", "_ir_multirange|i", "_nr|i", "_nr_multirange|i", "_t|d", "_tr|i",
+            "_tr_multirange|i", "br|d", "br_multirange|d", "dr|i", "dr_multirange|i", "fr|d",
+            "fr_multirange|d", "ir|i", "ir_multirange|i", "nr|i", "nr_multirange|i", "t|d", "tr|i",
+            "tr_multirange|i",
+        ]
+    );
+    let columns = rows(
+        &mut snail,
+        "SELECT attname::text, attalign::text FROM pg_attribute \
+         WHERE attrelid = 's.t'::regclass AND attnum > 0 ORDER BY attnum",
+    );
+    assert_eq!(
+        pairs(columns),
+        ["id|i", "a|i", "b|i", "c|d", "d|d", "e|i", "f|i", "h|i", "i|i", "j|d"]
+    );
+}

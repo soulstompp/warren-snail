@@ -11,6 +11,7 @@
 use super::pipeline::Value;
 use crate::catalog::ColumnType;
 use crate::composed::{Composed, Field, Item};
+use crate::error::FUNCTION_NOT_UNIQUE;
 use crate::{Error, Result};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -559,7 +560,7 @@ fn chosen(
             [(g, _)] => Ok(Some(Rc::clone(g))),
             [] => Err(super::typed::no_form(&called, types)),
             _ => Err(Error::new(format!(
-                "function {called}({}) is not unique",
+                "function {called}({}) is not unique{FUNCTION_NOT_UNIQUE}",
                 types
                     .iter()
                     .map(|t| t.map_or("unknown".into(), |t| t.pg_name()))

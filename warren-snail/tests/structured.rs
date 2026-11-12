@@ -383,7 +383,7 @@ fn the_planner_s_statistics_are_answered_as_their_bytes_their_output_refused_by_
             .ask(&format!("{step} SELECT {e} AS x FROM q"), None)
             .unwrap_err()
             .to_string();
-        assert_eq!(got, refused, "{e}");
+        assert_eq!(got, weather::hinted(refused), "{e}");
     }
     let one = |s: &mut Snail, e: &str| -> Option<String> {
         let (b, _) = s

@@ -5,6 +5,7 @@ use super::pipeline::{eval_on, Casings, Value};
 use super::statement::{Datum, Row};
 use crate::catalog::{ColumnType, Table};
 use crate::numeric::Numeric;
+use crate::error::NOT_ASSIGNED;
 use crate::{Error, Result};
 
 /// An instant as PostgreSQL writes a timestamptz under TimeZone UTC and DateStyle ISO.
@@ -125,7 +126,7 @@ pub fn assign(d: Datum, from: ColumnType, to: ColumnType, what: &str) -> Result<
     }
     let refused = || {
         Error::new(format!(
-            "column \"{what}\" is of type {} but expression is of type {}",
+            "column \"{what}\" is of type {} but expression is of type {}{NOT_ASSIGNED}",
             // PostgreSQL names both types without their modifiers.
             super::typed::type_name(to),
             super::typed::type_name(from)

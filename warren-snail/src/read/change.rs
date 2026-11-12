@@ -27,6 +27,7 @@ pub(super) const ABORTED: &str =
 use crate::places::{byte_key, key, month_of, null_key, KeyValue};
 use crate::values::Values;
 use crate::write::{empty_head, head_of, laid_out, leaf_descriptors, write_block, Laid, Rows};
+use crate::error::NOT_ASSIGNED;
 use crate::{Error, Result};
 use arrow::array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int16Array, Int32Array, Int64Array,
@@ -625,7 +626,7 @@ fn assigned_types(
 /// reaches.
 fn not_assigned(col: &crate::catalog::Column, from: ColumnType) -> Error {
     Error::new(format!(
-        "column \"{}\" is of type {} but expression is of type {}",
+        "column \"{}\" is of type {} but expression is of type {}{NOT_ASSIGNED}",
         col.name,
         super::typed::type_name(col.ty),
         super::typed::type_name(from)
@@ -1799,7 +1800,7 @@ impl Snail {
                 let from = stated.get(k).copied().flatten();
                 if let Some(from) = from.filter(|&from| !assignable(from, col.ty)) {
                     return Err(Error::new(format!(
-                        "column \"{}\" is of type {} but expression is of type {}",
+                        "column \"{}\" is of type {} but expression is of type {}{NOT_ASSIGNED}",
                         col.name,
                         super::typed::type_name(col.ty),
                         super::typed::type_name(from)

@@ -7,6 +7,42 @@ pub struct Error(pub String, Option<&'static str>);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The HINT PostgreSQL gives under *operator does not exist* of an operator of two operands.
+pub(crate) const NO_OPERATOR: &str = "\nHINT:  No operator matches the given name and argument \
+     types. You might need to add explicit type casts.";
+
+/// The HINT PostgreSQL gives under *operator does not exist* of a prefix operator.
+pub(crate) const NO_PREFIX_OPERATOR: &str = "\nHINT:  No operator matches the given name and \
+     argument type. You might need to add an explicit type cast.";
+
+/// The HINT PostgreSQL gives under *operator is not unique*.
+pub(crate) const OPERATOR_NOT_UNIQUE: &str = "\nHINT:  Could not choose a best candidate operator. \
+     You might need to add explicit type casts.";
+
+/// The HINT PostgreSQL gives under *function … is not unique*.
+pub(crate) const FUNCTION_NOT_UNIQUE: &str = "\nHINT:  Could not choose a best candidate \
+     function. You might need to add explicit type casts.";
+
+/// The HINT PostgreSQL gives under *column … is of type … but expression is of type …*.
+pub(crate) const NOT_ASSIGNED: &str = "\nHINT:  You will need to rewrite or cast the expression.";
+
+/// PostgreSQL's refusal of an operator no form of which takes its operands' types, with its HINT:
+/// of a prefix operator, `left` none.
+pub(crate) fn no_operator(left: Option<&str>, op: &str, right: &str) -> Error {
+    Error::new(match left {
+        Some(l) => format!("operator does not exist: {l} {op} {right}{NO_OPERATOR}"),
+        None => format!("operator does not exist: {op} {right}{NO_PREFIX_OPERATOR}"),
+    })
+}
+
+/// PostgreSQL's refusal of a value of type `from` given a column of type `to` no assignment cast
+/// reaches, with its HINT.
+pub(crate) fn not_assigned(column: &str, to: &str, from: &str) -> Error {
+    Error::new(format!(
+        "column \"{column}\" is of type {to} but expression is of type {from}{NOT_ASSIGNED}"
+    ))
+}
+
 impl Error {
     pub fn new(msg: impl Into<String>) -> Self {
         Error(msg.into(), None)
