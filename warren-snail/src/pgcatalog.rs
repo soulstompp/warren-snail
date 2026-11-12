@@ -511,7 +511,7 @@ pub(crate) fn seen(own: &Catalog, committed: &Catalog, snapshot: &Catalog) -> Ca
 
 /// The object a function is to the OIDs: its name and its arguments' types as PostgreSQL names
 /// them.
-fn function_object(f: &crate::catalog::Function) -> Object {
+pub(crate) fn function_object(f: &crate::catalog::Function) -> Object {
     let args: Vec<String> = f.args.iter().map(|t| t.pg_name()).collect();
     Object::Proc(full(&f.name), args.join(","))
 }

@@ -365,6 +365,11 @@ pub(crate) enum Form {
         if_exists: bool,
         cascade: bool,
     },
+    DropFunctions {
+        names: Vec<FunctionNamed>,
+        if_exists: bool,
+        cascade: bool,
+    },
 }
 
 /// A type a DROP TYPE or DROP DOMAIN names: its words, as a type's name is read; its schema where
@@ -517,6 +522,9 @@ pub(crate) fn read(tokens: &[Token]) -> Option<Result<Form>> {
             return Some(drop_types(&mut c, domain));
         }
     }
+    if c.kws(&["DROP", "FUNCTION"]) {
+        return Some(drop_functions(&mut c));
+    }
     if c.kws(&["COMMENT", "ON"]) {
         return Some(comment_on(&mut c));
     }
@@ -633,6 +641,18 @@ fn drop_schema(c: &mut Cursor) -> Result<Form> {
 /// PostgreSQL's grammar takes a type name, array bounds and all.
 fn drop_types(c: &mut Cursor, domain: bool) -> Result<Form> {
     let if_exists = c.kws(&["IF", "EXISTS"]);
+    let (items, cascade) = dropped_list(c)?;
+    Ok(Form::DropTypes {
+        domain,
+        names: items.iter().map(|item| type_named(item)).collect(),
+        if_exists,
+        cascade,
+    })
+}
+
+/// The objects a DROP names, each its tokens up to a comma outside parentheses, and whether CASCADE
+/// closes the list; RESTRICT read and taken. The rest of the statement is taken.
+fn dropped_list(c: &mut Cursor) -> Result<(Vec<Vec<Token>>, bool)> {
     let last = c.t.len().saturating_sub(1);
     let cascade = c.t.len() > c.i && Cursor::word_is(c.t.get(last), "CASCADE");
     let end = match cascade || (c.t.len() > c.i && Cursor::word_is(c.t.get(last), "RESTRICT")) {
@@ -644,7 +664,7 @@ fn drop_types(c: &mut Cursor, domain: bool) -> Result<Form> {
         i: 0,
     };
     c.i = c.t.len();
-    let mut names = Vec::new();
+    let mut items = Vec::new();
     loop {
         let item = list.item();
         if item.is_empty() {
@@ -653,17 +673,104 @@ fn drop_types(c: &mut Cursor, domain: bool) -> Result<Form> {
                 None => Error::new("syntax error at end of input"),
             });
         }
-        names.push(type_named(&item));
+        items.push(item);
         if list.done() && list.t.last() != Some(&Token::Comma) {
             break;
         }
     }
-    Ok(Form::DropTypes {
-        domain,
+    Ok((items, cascade))
+}
+
+/// A function a DROP FUNCTION names: its name, and its arguments' types where it lists them, an OUT
+/// argument's left out as PostgreSQL leaves it out of a function's identity.
+#[derive(Clone, Debug)]
+pub(crate) struct FunctionNamed {
+    name: String,
+    args: Option<Vec<DataType>>,
+}
+
+/// DROP FUNCTION [IF EXISTS] name [( [[mode] [name] type [, …]] )] [, …] [CASCADE | RESTRICT].
+fn drop_functions(c: &mut Cursor) -> Result<Form> {
+    let if_exists = c.kws(&["IF", "EXISTS"]);
+    let (items, cascade) = dropped_list(c)?;
+    let mut names = Vec::new();
+    for item in items {
+        let mut f = Cursor { t: item, i: 0 };
+        let name = f.name()?;
+        let args = match f.peek() == Some(&Token::LParen) {
+            true => Some(function_arguments(&f.group()?)?),
+            false => None,
+        };
+        if let Some(t) = f.peek() {
+            return Err(Error::new(format!("syntax error at or near \"{t}\"")));
+        }
+        names.push(FunctionNamed { name, args });
+    }
+    Ok(Form::DropFunctions {
         names,
         if_exists,
         cascade,
     })
+}
+
+/// A function's arguments as a DROP lists them: each its type, after its mode and its name where
+/// it writes them; an OUT argument none.
+fn function_arguments(tokens: &[Token]) -> Result<Vec<DataType>> {
+    let mut list = Cursor {
+        t: tokens.to_vec(),
+        i: 0,
+    };
+    let mut out = Vec::new();
+    while !list.done() {
+        let piece = list.item();
+        let mut p = Cursor { t: piece, i: 0 };
+        let out_only = p.kw("OUT");
+        if !out_only {
+            let _ = p.kw("INOUT") || p.kw("IN") || p.kw("VARIADIC");
+        }
+        let rest = &p.t[p.i..];
+        let ty = Cursor::data_type_item(rest).or_else(|e| match rest.len() > 1 {
+            true => Cursor::data_type_item(&rest[1..]),
+            false => Err(e),
+        })?;
+        if !out_only {
+            out.push(ty);
+        }
+    }
+    Ok(out)
+}
+
+/// A type's name as PostgreSQL's TypeNameToString writes one a statement gives: a type the SQL
+/// standard's words name as `pg_catalog`'s, any other as written, `[]` for an array.
+fn type_name_written(dt: &DataType) -> String {
+    use sqlparser::ast::TimezoneInfo as Tz;
+    let standard = match dt {
+        DataType::Array(sqlparser::ast::ArrayElemTypeDef::SquareBracket(e, _))
+        | DataType::Array(sqlparser::ast::ArrayElemTypeDef::AngleBracket(e)) => {
+            return format!("{}[]", type_name_written(e))
+        }
+        DataType::Int(_) | DataType::Integer(_) => "int4",
+        DataType::SmallInt(_) => "int2",
+        DataType::BigInt(_) => "int8",
+        DataType::Real => "float4",
+        DataType::DoublePrecision | DataType::Float(_) => "float8",
+        DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => "numeric",
+        DataType::Boolean => "bool",
+        DataType::Char(_) | DataType::Character(_) => "bpchar",
+        DataType::Varchar(_) | DataType::CharacterVarying(_) | DataType::CharVarying(_) => {
+            "varchar"
+        }
+        DataType::Timestamp(_, Tz::Tz | Tz::WithTimeZone) => "timestamptz",
+        DataType::Timestamp(..) => "timestamp",
+        DataType::Time(_, Tz::Tz | Tz::WithTimeZone) => "timetz",
+        DataType::Time(..) => "time",
+        DataType::Interval { .. } => "interval",
+        DataType::Bit(_) => "bit",
+        DataType::BitVarying(_) => "varbit",
+        DataType::JSON => "json",
+        _ => return dt.to_string().to_lowercase(),
+    };
+    format!("pg_catalog.{standard}")
 }
 
 /// A type's name as a DROP names it, its schema and its shown form read off a name's parts; any
@@ -3144,13 +3251,19 @@ impl Draft {
 
     /// How many of PostgreSQL's functions bear a name, which the search path finds first.
     fn built_in_functions(&self, name: &str) -> usize {
+        self.built_in_function_oids(name).len()
+    }
+
+    /// The OIDs of PostgreSQL's functions that bear a name.
+    fn built_in_function_oids(&self, name: &str) -> Vec<u32> {
         crate::pgcatalog::built_in("pg_proc", self.release)
             .iter()
             .filter(|r| {
                 r.get("proname").cloned().flatten().as_deref() == Some(name)
                     && r.get("pronamespace").cloned().flatten().as_deref() == Some("11")
             })
-            .count()
+            .filter_map(|r| r.get("oid").cloned().flatten()?.parse().ok())
+            .collect()
     }
 
     /// The descriptions as pg_description holds them once a statement is read: those of objects
@@ -4340,6 +4453,11 @@ impl Draft {
                 if_exists,
                 cascade,
             } => return self.drop_types(domain, &names, if_exists, cascade),
+            Form::DropFunctions {
+                names,
+                if_exists,
+                cascade,
+            } => return self.drop_functions(&names, if_exists, cascade),
         }
         Ok(notices)
     }
@@ -4494,6 +4612,115 @@ impl Draft {
             named.push(crate::deparse::depend::Addr::of(crate::deparse::depend::TYPE, oid));
         }
         drop(held);
+        self.dropping(&named, cascade, notices)
+    }
+
+    /// DROP FUNCTION: each function named, found as PostgreSQL's search path finds a name with no
+    /// schema (pg_catalog's own first, then the file's): by its arguments' types where it lists
+    /// them, else the one function of its name, refused where none or several bear it; and under
+    /// CASCADE every object that depends on one, refused under RESTRICT where an object depends on
+    /// one. PostgreSQL's own functions are refused as the system's.
+    fn drop_functions(
+        &mut self,
+        names: &[FunctionNamed],
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<Vec<String>> {
+        use crate::oids::{full, parts, Object as O};
+        let mut notices = Vec::new();
+        let mut named = Vec::new();
+        for n in names {
+            let f = full(&n.name);
+            let (s, own) = parts(&f);
+            let qualified = n.name.contains('.');
+            if qualified && !self.schema_stands(s) {
+                if !if_exists {
+                    return Err(Error::new(format!("schema \"{s}\" does not exist")));
+                }
+                notices.push(format!("schema \"{s}\" does not exist, skipping"));
+                continue;
+            }
+            // pg_catalog's, which the search path finds first; the file's own in its schema.
+            let system = !qualified || s == "pg_catalog";
+            let file = s != "pg_catalog";
+            let oid = match &n.args {
+                Some(args) => {
+                    let mut types = Vec::new();
+                    for a in args {
+                        types.push(self.held(a, "DROP FUNCTION")?.0.pg_name());
+                    }
+                    let joined = types.join(",");
+                    let built_in = system
+                        .then(|| {
+                            crate::regs::reg_parse(
+                                crate::regs::RegKind::Procedure,
+                                &format!("pg_catalog.{own}({joined})"),
+                                self.release,
+                            )
+                            .ok()
+                        })
+                        .flatten();
+                    let found = built_in.or_else(|| {
+                        file.then(|| self.oids.of(&O::Proc(f.clone(), joined.clone())))
+                            .flatten()
+                    });
+                    match found {
+                        Some(oid) => oid,
+                        None if if_exists => {
+                            let written: Vec<String> = args.iter().map(type_name_written).collect();
+                            notices.push(format!(
+                                "function {}({}) does not exist, skipping",
+                                n.name,
+                                written.join(",")
+                            ));
+                            continue;
+                        }
+                        None => {
+                            return Err(Error::new(format!(
+                                "function {}({}) does not exist",
+                                n.name,
+                                types.join(", ")
+                            )))
+                        }
+                    }
+                }
+                None => {
+                    let mut found: Vec<u32> = match system {
+                        true => self.built_in_function_oids(own),
+                        false => Vec::new(),
+                    };
+                    if file {
+                        found.extend(
+                            self.oids
+                                .each()
+                                .filter(|(_, o)| matches!(o, O::Proc(x, _) if *x == f))
+                                .map(|(oid, _)| oid),
+                        );
+                    }
+                    match found.as_slice() {
+                        [oid] => *oid,
+                        [] if if_exists => {
+                            notices.push(format!("function {}() does not exist, skipping", n.name));
+                            continue;
+                        }
+                        [] => {
+                            return Err(Error::new(format!(
+                                "could not find a function named \"{}\"",
+                                n.name
+                            )))
+                        }
+                        _ => {
+                            return Err(Error::new(format!(
+                                "function name \"{}\" is not unique\nHINT:  Specify the argument \
+                                 list to select the function unambiguously.",
+                                n.name
+                            )))
+                        }
+                    }
+                }
+            };
+            named.push(crate::deparse::depend::Addr::of(crate::deparse::depend::PROC, oid));
+        }
         self.dropping(&named, cascade, notices)
     }
 
@@ -8130,6 +8357,7 @@ pub(crate) fn declares(sql: &str) -> Option<&'static str> {
         "DROP INDEX" => "DROP INDEX",
         "DROP TYPE" => "DROP TYPE",
         "DROP DOMAIN" => "DROP DOMAIN",
+        "DROP FUNCTION" => "DROP FUNCTION",
         "COMMENT ON" => "COMMENT",
         _ => return None,
     })

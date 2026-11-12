@@ -17,12 +17,13 @@
 //! and DDL in a transaction naming and making
 //! against the catalog as committed, at each level, a name another committed since refused in its
 //! kind's words, one dropped since made again, DDL over a table made since reading none of its rows,
-//! and writers of different names both committing; a type a new object depends on holding off
-//! another's DROP of it, and a type being dropped holding off what is made on it. Every answer and
-//! refusal is 18.6's over the same statements (`session.nu --suite sling`, and `sessions.nu --only
-//! serializable` for the writers, `sessions.nu --only "as committed"` for the DDL; 18.6 with its
-//! index, through `dblink`, for the writers by an OR; psql's two sessions for a type's DROP). A snail
-//! writes on its own only with `standalone`, as `tests/ddl.rs`.
+//! and writers of different names both committing; a type or a function a new object depends on
+//! holding off another's DROP of it, and one being dropped holding off what is made on it. Every
+//! answer and refusal is 18.6's over the same statements (`session.nu --suite sling`, and
+//! `sessions.nu --only serializable` for the writers, `sessions.nu --only "as committed"` for the
+//! DDL; 18.6 with its index, through `dblink`, for the writers by an OR; psql's two sessions for a
+//! type's or a function's DROP). A snail writes on its own only with `standalone`, as
+//! `tests/ddl.rs`.
 #![cfg(feature = "standalone")]
 
 mod weather;
@@ -2804,6 +2805,64 @@ fn a_type_an_object_is_being_made_on_holds_off_its_drop() {
     let rx = later(&path, &["DROP TYPE q"]);
     assert_eq!(next(&rx), Ok(0));
     a.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_function_an_object_is_being_made_on_holds_off_its_drop() {
+    let (mut a, _b, path) = named("made-on-a-function");
+    for f in ["f1(integer)", "f2(integer)", "f3()", "f4()"] {
+        let body = match f.ends_with("()") {
+            true => "SELECT 1",
+            false => "SELECT $1",
+        };
+        a.execute(&format!("CREATE FUNCTION {f} RETURNS integer LANGUAGE sql AS '{body}'"))
+            .unwrap();
+    }
+    // A view being made on a function holds off another's DROP FUNCTION, as 18.6's lock on what a
+    // new object depends on does; its commit leaves the DROP refused for the view.
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE VIEW vf AS SELECT f1(1) AS x").unwrap();
+    let rx = later(&path, &["DROP FUNCTION f1(integer)"]);
+    assert!(waits(&rx), "a DROP FUNCTION of a function a view is being made on");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        next(&rx),
+        Err(said(
+            "2BP01",
+            &format!(
+                "cannot drop function f1(integer) because other objects depend on it: view vf \
+                 depends on function f1(integer){CASCADE}"
+            )
+        ))
+    );
+    // A function another is dropping holds off a view made on it, refused once the DROP commits.
+    a.execute("BEGIN").unwrap();
+    a.execute("DROP FUNCTION f2(integer)").unwrap();
+    let rx = later(&path, &["CREATE VIEW vf2 AS SELECT f2(1) AS x"]);
+    assert!(waits(&rx), "a view made on a function being dropped");
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        next(&rx),
+        Err(said("42704", "referenced function was concurrently dropped"))
+    );
+    // A DEFAULT being made on a function: the DROP goes on once its table rolls back.
+    a.execute("BEGIN").unwrap();
+    a.execute("CREATE TABLE tf (k integer PRIMARY KEY, n integer DEFAULT f3())")
+        .unwrap();
+    let rx = later(&path, &["DROP FUNCTION f3()"]);
+    assert!(waits(&rx), "a DROP FUNCTION of a function a DEFAULT is being made on");
+    a.execute("ROLLBACK").unwrap();
+    assert_eq!(next(&rx), Ok(0));
+    // A question calling a function takes no lock on it.
+    a.execute("BEGIN").unwrap();
+    assert_eq!(rows(&mut a, "SELECT f4()"), ["1"]);
+    let rx = later(&path, &["DROP FUNCTION f4()"]);
+    assert_eq!(next(&rx), Ok(0));
+    a.execute("COMMIT").unwrap();
+    assert_eq!(
+        rows(&mut a, "SELECT count(*) FROM pg_proc WHERE proname IN ('f2', 'f3', 'f4')"),
+        ["0"]
+    );
 }
 
 #[test]

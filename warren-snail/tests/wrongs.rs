@@ -99,6 +99,10 @@ fn order_by_using_sorts_as_its_operator_does_wherever_it_stands() {
     ] {
         assert_eq!(column(&mut s, sql), pg, "{sql}");
     }
+    // An operator of the type's that orders nothing 42809, with 18.6's HINT; one the type has none
+    // of 42883.
+    let ordering = "\nHINT:  Ordering operators must be \"<\" or \">\" members of btree operator \
+         families.";
     for (sql, pg) in [
         ("SELECT id FROM s.a ORDER BY id USING =", "operator = is not a valid ordering operator"),
         ("SELECT row_number() OVER (ORDER BY id USING <>) AS r FROM s.a", "operator <> is not a valid ordering operator"),
@@ -108,7 +112,12 @@ fn order_by_using_sorts_as_its_operator_does_wherever_it_stands() {
         ("SELECT g FROM s.a UNION SELECT g FROM s.a ORDER BY g USING =", "operator = is not a valid ordering operator"),
         ("SELECT id FROM s.a ORDER BY id USING OPERATOR(public.>)", "operator does not exist: bigint public.> bigint"),
     ] {
-        assert_eq!(refused(&mut s, sql), weather::hinted(pg), "{sql}");
+        let e = s.ask(sql, None).err().unwrap_or_else(|| panic!("{sql} was taken"));
+        let (code, words) = match pg.ends_with("ordering operator") {
+            true => ("42809", format!("{pg}{ordering}")),
+            false => ("42883", weather::hinted(pg)),
+        };
+        assert_eq!((e.sqlstate(), e.to_string()), (Some(code), words), "{sql}");
     }
 }
 

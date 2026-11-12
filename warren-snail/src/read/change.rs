@@ -177,9 +177,8 @@ pub(super) struct Declared {
     relations: Vec<String>,
     /// The schemas it made, by name, as no other writer names them until it commits.
     schemas: Vec<String>,
-    /// The types and domains it made, by their names schema-qualified, as no other writer names
-    /// them until it commits.
-    types: Vec<String>,
+    /// The types, domains and functions it made, as no other writer names them until it commits.
+    objects: Vec<crate::oids::Object>,
 }
 
 impl Declared {
@@ -193,9 +192,9 @@ impl Declared {
         self.schemas.iter().any(|s| s == name)
     }
 
-    /// Whether it made the type or domain of that name, schema-qualified.
-    pub(super) fn made_type(&self, name: &str) -> bool {
-        self.types.iter().any(|t| t == name)
+    /// Whether it made the type, domain or function.
+    pub(super) fn made_object(&self, o: &crate::oids::Object) -> bool {
+        self.objects.contains(o)
     }
 
     /// The catalog as committed it declared on.
@@ -4837,9 +4836,9 @@ impl Snail {
     }
 
     /// A declaration, as `declare`, begun again after waiting for another writer's lock on each
-    /// type of `waited` its new objects depend on: refused, as PostgreSQL refuses it once it holds
-    /// the lock, where that writer's end took one out.
-    fn declare_after(&mut self, ddl: &str, waited: &[String]) -> Result<Vec<String>> {
+    /// type or function of `waited` its new objects depend on: refused, as PostgreSQL refuses it
+    /// once it holds the lock, where that writer's end took one out.
+    fn declare_after(&mut self, ddl: &str, waited: &[crate::oids::Object]) -> Result<Vec<String>> {
         // Its names are looked up, and its relations made, on the catalog as committed now: where
         // another writer's commit moved it past the catalog the transaction declares on, the
         // transaction's own statements are declared again on it first.
@@ -4853,13 +4852,13 @@ impl Snail {
         if let Some(committed) = self.committed_ddl(&newest, from, own)? {
             self.lay_over(committed)?;
         }
-        let stands = |n: &String| {
-            let full = crate::oids::full;
-            self.catalog.types.iter().any(|t| full(&t.name) == *n)
-                || self.catalog.domains.iter().any(|d| full(&d.name) == *n)
-        };
+        let stands = |o: &crate::oids::Object| self.catalog.oids.of(o).is_some();
         if !waited.iter().all(stands) {
-            return Err(Error::new("referenced type was concurrently dropped"));
+            let what = match waited.iter().find(|o| !stands(o)) {
+                Some(crate::oids::Object::Proc(..)) => "function",
+                _ => "type",
+            };
+            return Err(Error::new(format!("referenced {what} was concurrently dropped")));
         }
         // The relations it changes are locked in PostgreSQL's modes; where it waited for another
         // writer's, it begins again on the catalog that writer's end leaves.
@@ -4895,8 +4894,8 @@ impl Snail {
         if self.reads_locked(&catalog)? {
             return self.declare_after(ddl, waited);
         }
-        // The types it takes out, and those its new objects depend on, likewise.
-        if let Some(read) = self.types_locked(&catalog)? {
+        // The types and functions it takes out, and those its new objects depend on, likewise.
+        if let Some(read) = self.depended_locked(&catalog)? {
             let mut waited = waited.to_vec();
             waited.extend(read);
             return self.declare_after(ddl, &waited);
@@ -5088,15 +5087,17 @@ impl Snail {
                 .collect()
         };
         let (had, has) = (schemas(&self.catalog), schemas(&catalog));
-        // The types and domains it made, and those it dropped.
-        let types = |c: &Catalog| -> Vec<String> {
+        // The types, domains and functions it made, and those it dropped.
+        let objects = |c: &Catalog| -> Vec<crate::oids::Object> {
+            use crate::oids::{full, Object as O};
             c.types
                 .iter()
-                .map(|t| crate::oids::full(&t.name))
-                .chain(c.domains.iter().map(|d| crate::oids::full(&d.name)))
+                .map(|t| O::Type(full(&t.name)))
+                .chain(c.domains.iter().map(|d| O::Type(full(&d.name))))
+                .chain(c.functions.iter().map(crate::pgcatalog::function_object))
                 .collect()
         };
-        let (typed, types_now) = (types(&self.catalog), types(&catalog));
+        let (had_objects, objects_now) = (objects(&self.catalog), objects(&catalog));
         self.renumbered(&catalog);
         self.sequences_redeclared(&catalog);
         self.catalog = catalog;
@@ -5109,7 +5110,7 @@ impl Snail {
             taken_out: Vec::new(),
             relations: Vec::new(),
             schemas: Vec::new(),
-            types: Vec::new(),
+            objects: Vec::new(),
         });
         for r in resets {
             if !d.resets.contains(&r) {
@@ -5121,8 +5122,8 @@ impl Snail {
             .extend(after.into_iter().filter(|r| !before.contains(r)));
         d.schemas.retain(|s| has.contains(s));
         d.schemas.extend(has.into_iter().filter(|s| !had.contains(s)));
-        d.types.retain(|t| types_now.contains(t));
-        d.types.extend(types_now.into_iter().filter(|t| !typed.contains(t)));
+        d.objects.retain(|o| objects_now.contains(o));
+        d.objects.extend(objects_now.into_iter().filter(|o| !had_objects.contains(o)));
         d.from = from;
         d.ddl = text;
         d.own.push_str(&stated);

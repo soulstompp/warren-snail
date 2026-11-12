@@ -89,9 +89,10 @@ fn deps(catalog: &Catalog) -> Result<Vec<Dep>> {
         .collect())
 }
 
-/// The types the rows of pg_depend `after` holds and `before` does not depend on, each OID once:
-/// those a dependency a declaration records names.
-pub(crate) fn types_newly_depended_on(before: &Catalog, after: &Catalog) -> Result<Vec<u32>> {
+/// The types and functions the rows of pg_depend `after` holds and `before` does not depend on,
+/// each OID once: those a dependency a declaration records names. None where either catalog's
+/// pg_depend is not read, a view among it not printed.
+pub(crate) fn newly_depended_on(before: &Catalog, after: &Catalog) -> Vec<u32> {
     let rows = |c: &Catalog| -> Result<Vec<Dep>> {
         let _named = crate::oids::named(c.oids.clone());
         deps(c)
@@ -100,14 +101,18 @@ pub(crate) fn types_newly_depended_on(before: &Catalog, after: &Catalog) -> Resu
         let (o, n) = (x.obj, x.on);
         (o.class, o.oid, o.sub, n.class, n.oid, n.sub, x.kind)
     };
-    let was: std::collections::HashSet<_> = rows(before)?.iter().map(key).collect();
+    let (Ok(was), Ok(now)) = (rows(before), rows(after)) else {
+        return Vec::new();
+    };
+    let was: std::collections::HashSet<_> = was.iter().map(key).collect();
     let mut out: Vec<u32> = Vec::new();
-    for x in rows(after)? {
-        if x.on.class == d::TYPE && !was.contains(&key(&x)) && !out.contains(&x.on.oid) {
+    for x in now {
+        let named = matches!(x.on.class, d::TYPE | d::PROC);
+        if named && !was.contains(&key(&x)) && !out.contains(&x.on.oid) {
             out.push(x.on.oid);
         }
     }
-    Ok(out)
+    out
 }
 
 /// As `object_address_comparator`: OID falling, then the catalog, then the column.
@@ -266,7 +271,7 @@ fn stack_add(object: Addr, flags: u32, stack: &mut [(Addr, u32)]) -> bool {
 
 /// What a DROP of `named` takes, as `performMultipleDeletions` finds it, and what it says: refused
 /// under RESTRICT where any object is reached by a normal dependency, in PostgreSQL's words with
-/// its DETAIL after a colon and its HINT.
+/// its DETAIL after a colon and its HINT; a CASCADE's NOTICE with its DETAIL on a line of its own.
 pub(crate) fn dropped(catalog: &Catalog, named: &[Addr], cascade: bool) -> Result<Dropped> {
     let _named = crate::oids::named(catalog.oids.clone());
     let words = Words::of_file(catalog);
@@ -326,10 +331,14 @@ pub(crate) fn dropped(catalog: &Catalog, named: &[Addr], cascade: bool) -> Resul
             "{what}: {detail}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too."
         )));
     }
+    // One object taken beside those named is said alone; more are counted, each in the DETAIL.
     let notice = match lines.len() {
         0 => None,
         1 if unreported == 0 => Some(detail),
-        n => Some(format!("drop cascades to {} other objects", n + unreported)),
+        n => Some(format!(
+            "drop cascades to {} other objects\nDETAIL:  {detail}",
+            n + unreported
+        )),
     };
     Ok(Dropped {
         taken: walk.targets,

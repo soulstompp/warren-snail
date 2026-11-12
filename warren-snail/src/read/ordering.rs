@@ -4,7 +4,7 @@
 
 use crate::catalog::ColumnType;
 use crate::composed::Composed;
-use crate::error::NO_OPERATOR;
+use crate::error::{NO_OPERATOR, NOT_ORDERING};
 use crate::{Error, Result};
 use sqlparser::ast::{OrderByOptions, OrderBySort, ObjectNamePart};
 
@@ -119,7 +119,11 @@ pub(super) fn checked(o: &OrderByOptions, ty: Option<ColumnType>) -> Result<()> 
     if schema.as_deref().is_some_and(|s| s != "pg_catalog") {
         return Err(missing());
     }
-    let invalid = || Error::new(format!("operator {op} is not a valid ordering operator"));
+    let invalid = || {
+        Error::new(format!(
+            "operator {op} is not a valid ordering operator{NOT_ORDERING}"
+        ))
+    };
     let operands = operands_of(ty);
     match op.as_str() {
         "<" | ">" if ty.ordered() => Ok(()),

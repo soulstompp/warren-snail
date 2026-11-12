@@ -1192,11 +1192,14 @@ fn a_schema_is_made_and_dropped_with_what_depends_on_it() {
     );
     run(&mut w, "CREATE SEQUENCE a.c CACHE 5");
     assert_eq!(rows(&mut w, "SELECT nextval('a.q'), nextval('a.c')"), ["1|1"]);
-    // A cascade's NOTICE counts what it reports: the sequence a.t's column owns goes with it,
-    // unreported.
+    // A cascade's NOTICE counts what it reports, each in its DETAIL: the sequence a.t's column owns
+    // goes with it, unreported.
     assert_eq!(
         said(&mut w, "DROP SCHEMA a CASCADE"),
-        ["NOTICE:  drop cascades to 4 other objects"]
+        [
+            "NOTICE:  drop cascades to 4 other objects\nDETAIL:  drop cascades to table a.t\ndrop \
+             cascades to view b.v\ndrop cascades to view b.w\ndrop cascades to sequence a.c"
+        ]
     );
     assert_eq!(
         refused(&mut w, "SELECT currval('a.q')"),
@@ -1327,7 +1330,11 @@ fn a_function_a_key_and_an_identity_are_dropped_as_postgresql_drops_them() {
     );
     assert_eq!(
         said(&mut w, "DROP SCHEMA f CASCADE"),
-        ["NOTICE:  drop cascades to 3 other objects"]
+        [
+            "NOTICE:  drop cascades to 3 other objects\nDETAIL:  drop cascades to function \
+             f.g(integer)\ndrop cascades to constraint k_k_check on table k\ndrop cascades to \
+             table f.r"
+        ]
     );
     // The CHECK went with the function, the table it was on kept.
     assert_eq!(
@@ -1466,6 +1473,16 @@ fn a_type_and_a_domain_are_dropped_as_postgresql_drops_them() {
         )
     );
     assert_eq!(said(&mut w, "DROP DOMAIN d2 CASCADE"), ["NOTICE:  drop cascades to type d3"]);
+    run(&mut w, "CREATE TYPE c0 AS ENUM ('a')");
+    run(&mut w, "CREATE DOMAIN dc AS c0");
+    run(&mut w, "CREATE DOMAIN dc2 AS dc");
+    assert_eq!(
+        said(&mut w, "DROP TYPE c0 CASCADE"),
+        [
+            "NOTICE:  drop cascades to 2 other objects\nDETAIL:  drop cascades to type dc\ndrop \
+             cascades to type dc2"
+        ]
+    );
     assert_eq!(
         rows(&mut w, "SELECT count(*) FROM pg_type WHERE typname IN ('d2', 'd3')"),
         ["0"]
@@ -1510,6 +1527,157 @@ fn a_type_and_a_domain_are_dropped_as_postgresql_drops_them() {
 }
 
 #[test]
+fn a_function_is_dropped_as_postgresql_drops_it() {
+    let mut w = snail("dropped-functions");
+    for sql in [
+        "CREATE SCHEMA fs",
+        "CREATE FUNCTION fs.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1'",
+        "CREATE FUNCTION g(a integer, b text) RETURNS integer LANGUAGE sql AS 'SELECT a'",
+        "CREATE FUNCTION h() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        "CREATE FUNCTION k(x double precision) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        "CREATE TABLE tf (id integer PRIMARY KEY, n integer DEFAULT h(), c integer CHECK (fs.f(c) > 0))",
+        "CREATE VIEW vf AS SELECT g(1, 'a') AS x",
+    ] {
+        run(&mut w, sql);
+    }
+    let g = format!(
+        "cannot drop function g(integer,text) because other objects depend on it: view vf depends \
+         on function g(integer,text){CASCADE}"
+    );
+    // Each refusal as 18.6 gives it: what is not there, a name several bear, PostgreSQL's own,
+    // and what depends on a function, found by its arguments' types however they are written.
+    for (sql, code, words) in [
+        ("DROP FUNCTION nosuch(integer)", "42883", "function nosuch(integer) does not exist".to_string()),
+        ("DROP FUNCTION nosuch", "42883", "could not find a function named \"nosuch\"".into()),
+        ("DROP FUNCTION nosuch()", "42883", "function nosuch() does not exist".into()),
+        ("DROP FUNCTION nos.f(integer)", "3F000", "schema \"nos\" does not exist".into()),
+        ("DROP FUNCTION fs.f(text)", "42883", "function fs.f(text) does not exist".into()),
+        (
+            "DROP FUNCTION abs",
+            "42725",
+            "function name \"abs\" is not unique\nHINT:  Specify the argument list to select the \
+             function unambiguously."
+                .into(),
+        ),
+        (
+            "DROP FUNCTION abs(integer)",
+            "2BP01",
+            "cannot drop function abs(integer) because it is required by the database system".into(),
+        ),
+        (
+            "DROP FUNCTION now",
+            "2BP01",
+            "cannot drop function now() because it is required by the database system".into(),
+        ),
+        (
+            "DROP FUNCTION pg_catalog.lower(text)",
+            "2BP01",
+            "cannot drop function lower(text) because it is required by the database system".into(),
+        ),
+        (
+            "DROP FUNCTION fs.f",
+            "2BP01",
+            format!(
+                "cannot drop function fs.f(integer) because other objects depend on it: constraint \
+                 tf_c_check on table tf depends on function fs.f(integer){CASCADE}"
+            ),
+        ),
+        (
+            "DROP FUNCTION h()",
+            "2BP01",
+            format!(
+                "cannot drop function h() because other objects depend on it: default value for \
+                 column n of table tf depends on function h(){CASCADE}"
+            ),
+        ),
+        ("DROP FUNCTION g(integer, text)", "2BP01", g.clone()),
+        ("DROP FUNCTION g(a integer, b text)", "2BP01", g.clone()),
+        ("DROP FUNCTION g(IN a integer, b text)", "2BP01", g.clone()),
+        ("DROP FUNCTION g(integer, text, OUT z integer)", "2BP01", g.clone()),
+        ("DROP FUNCTION g(integer, text) RESTRICT", "2BP01", g),
+        (
+            "DROP FUNCTION k(x double precision), nosuch(integer)",
+            "42883",
+            "function nosuch(integer) does not exist".into(),
+        ),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words), "{sql}");
+    }
+    for (sql, notice) in [
+        ("DROP FUNCTION IF EXISTS nosuch(integer)", "function nosuch(pg_catalog.int4) does not exist, skipping"),
+        ("DROP FUNCTION IF EXISTS nosuch(int)", "function nosuch(pg_catalog.int4) does not exist, skipping"),
+        ("DROP FUNCTION IF EXISTS nosuch", "function nosuch() does not exist, skipping"),
+        (
+            "DROP FUNCTION IF EXISTS nosuch(a integer, b text)",
+            "function nosuch(pg_catalog.int4,text) does not exist, skipping",
+        ),
+        ("DROP FUNCTION IF EXISTS nos.f(integer)", "schema \"nos\" does not exist, skipping"),
+    ] {
+        assert_eq!(said(&mut w, sql), [format!("NOTICE:  {notice}")], "{sql}");
+    }
+    // A list with IF EXISTS drops what stands of it.
+    let k = |w: &mut Snail| rows(w, "SELECT count(*) FROM pg_proc WHERE proname = 'k'");
+    assert_eq!(k(&mut w), ["1"]);
+    assert_eq!(
+        said(&mut w, "DROP FUNCTION IF EXISTS k(x double precision), nosuch(integer)"),
+        ["NOTICE:  function nosuch(pg_catalog.int4) does not exist, skipping"]
+    );
+    assert_eq!(k(&mut w), ["0"]);
+    // CASCADE takes a view, a DEFAULT and a CHECK, the table they were of kept; a function's OID
+    // goes for good.
+    assert_eq!(said(&mut w, "DROP FUNCTION g(integer, text) CASCADE"), ["NOTICE:  drop cascades to view vf"]);
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_class WHERE relname = 'vf'"), ["0"]);
+    let h = rows(&mut w, "SELECT 'h()'::regprocedure::oid")[0].parse::<u32>().unwrap();
+    assert_eq!(
+        said(&mut w, "DROP FUNCTION h() CASCADE"),
+        ["NOTICE:  drop cascades to default value for column n of table tf"]
+    );
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'tf'::regclass"), ["0"]);
+    run(&mut w, "CREATE FUNCTION h() RETURNS integer LANGUAGE sql AS 'SELECT 2'");
+    assert!(rows(&mut w, "SELECT 'h()'::regprocedure::oid")[0].parse::<u32>().unwrap() > h);
+    assert_eq!(
+        said(&mut w, "DROP FUNCTION fs.f(integer) CASCADE"),
+        ["NOTICE:  drop cascades to constraint tf_c_check on table tf"]
+    );
+    assert_eq!(
+        rows(&mut w, "SELECT conname FROM pg_constraint WHERE conrelid = 'tf'::regclass ORDER BY 1"),
+        ["tf_id_not_null", "tf_pkey"]
+    );
+    run(&mut w, "INSERT INTO tf (id, c) VALUES (1, -5)");
+    // Two named, one view on both: refused in the words of several, taken with CASCADE.
+    for sql in [
+        "CREATE FUNCTION m(integer) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+        "CREATE FUNCTION m2(integer) RETURNS integer LANGUAGE sql AS 'SELECT 2'",
+        "CREATE VIEW vm AS SELECT m(1) + m2(1) AS x",
+        "CREATE TYPE fmood AS ENUM ('a')",
+        "CREATE FUNCTION fm(fmood) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+    ] {
+        run(&mut w, sql);
+    }
+    assert_eq!(
+        refused(&mut w, "DROP FUNCTION m(integer), m2(integer)"),
+        (
+            Some("2BP01"),
+            format!(
+                "cannot drop desired object(s) because other objects depend on them: view vm \
+                 depends on function m(integer){CASCADE}"
+            )
+        )
+    );
+    assert_eq!(
+        said(&mut w, "DROP FUNCTION m(integer), m2(integer) CASCADE"),
+        ["NOTICE:  drop cascades to view vm"]
+    );
+    // A function of the file's own type, found by it.
+    run(&mut w, "DROP FUNCTION fm(fmood)");
+    assert_eq!(rows(&mut w, "SELECT count(*) FROM pg_proc WHERE proname = 'fm'"), ["0"]);
+    // A DDL that drops a function reads to the catalog as it stands.
+    let read = Catalog::parse(&w.catalog.ddl_of("tf").unwrap()).unwrap();
+    let functions: Vec<&str> = read.functions.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(functions, ["h"]);
+}
+
+#[test]
 fn a_cascade_takes_the_parts_of_a_table_it_leaves_in_a_write_beside_it() {
     let mut w = snail("cascade-parts");
     run(&mut w, "CREATE SCHEMA d");
@@ -1526,7 +1694,11 @@ fn a_cascade_takes_the_parts_of_a_table_it_leaves_in_a_write_beside_it() {
     run(&mut w, "INSERT INTO c (id, p) VALUES (2, 1)");
     assert_eq!(
         said(&mut w, "DROP SCHEMA d CASCADE"),
-        ["NOTICE:  drop cascades to 4 other objects"]
+        [
+            "NOTICE:  drop cascades to 4 other objects\nDETAIL:  drop cascades to sequence \
+             d.s\ndrop cascades to default value for column id of table c\ndrop cascades to table \
+             d.p\ndrop cascades to constraint c_p_fkey on table c"
+        ]
     );
     run(&mut w, "INSERT INTO c (id, p) VALUES (5, 9)");
     run(&mut w, "COMMIT");

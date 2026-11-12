@@ -30,6 +30,10 @@ pub(crate) const FUNCTION_NOT_UNIQUE: &str = "\nHINT:  Could not choose a best c
 /// The HINT PostgreSQL gives under *column … is of type … but expression is of type …*.
 pub(crate) const NOT_ASSIGNED: &str = "\nHINT:  You will need to rewrite or cast the expression.";
 
+/// The HINT PostgreSQL gives under *operator … is not a valid ordering operator*.
+pub(crate) const NOT_ORDERING: &str = "\nHINT:  Ordering operators must be \"<\" or \">\" members \
+     of btree operator families.";
+
 /// PostgreSQL's refusal of an operator no form of which takes its operands' types, with its HINT:
 /// of a prefix operator, `left` none.
 pub(crate) fn no_operator(left: Option<&str>, op: &str, right: &str) -> Error {
@@ -299,7 +303,7 @@ const SAID: &[(Words, &str)] = &[
     (Words::Is("no schema has been selected to create in"), "3F000"),
     (Words::Holds("type \"", "\" does not exist"), "42704"),
     (Words::Holds("\"", "\" is not a domain"), "42809"),
-    (Words::Is("referenced type was concurrently dropped"), "42704"),
+    (Words::Holds("referenced ", " was concurrently dropped"), "42704"),
     (Words::Holds("collation \"", "\" does not exist"), "42704"),
     (Words::Holds("text search parser \"", "\" does not exist"), "42704"),
     (Words::Holds("cannot call ", " on a non-array"), "22023"),
@@ -319,9 +323,11 @@ const SAID: &[(Words, &str)] = &[
     (Words::Holds("column \"", "\" does not exist"), "42703"),
     (Words::Holds("column ", " does not exist"), "42703"),
     (Words::Starts("operator does not exist: "), "42883"),
+    (Words::Holds("operator ", " is not a valid ordering operator"), "42809"),
     (Words::Holds("function ", " does not exist"), "42883"),
     (Words::Starts("operator is not unique: "), "42725"),
     (Words::Holds("function ", " is not unique"), "42725"),
+    (Words::Starts("could not find a function named \""), "42883"),
     (Words::Starts("could not determine data type of parameter "), "42P18"),
     (Words::Starts("inconsistent types deduced for parameter "), "42P08"),
     (Words::Starts("there is no parameter $"), "42P02"),

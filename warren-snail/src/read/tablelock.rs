@@ -151,50 +151,48 @@ impl Snail {
             crate::regs::type_oid(words, self.catalog.release).ok()?
         };
         let name = match self.catalog.oids.object(oid)? {
-            O::Type(n) | O::Array(n) => n.clone(),
+            O::Type(n) | O::Array(n) => O::Type(n.clone()),
             _ => return None,
         };
-        if self.declared.as_ref().is_some_and(|d| d.made_type(&name)) {
+        if self.declared.as_ref().is_some_and(|d| d.made_object(&name)) {
             return None;
         }
-        let key = self.catalog.oids.of(&O::Type(name.clone()))?;
-        Some((u64::from(key), name))
+        let key = self.catalog.oids.of(&name)?;
+        Some((u64::from(key), name.name().to_string()))
     }
 
-    /// Locks the types a declaration takes out, ACCESS EXCLUSIVE, and those an object new in
-    /// `catalog` depends on, ACCESS SHARE, held to the transaction's end, as PostgreSQL locks each
-    /// type a DROP takes and each a new dependency is recorded on: by the type's OID, an array by
-    /// its type's; a type the transaction made, which no other writer names until it commits, not
-    /// at all. None where it waited for no other writer; else the types it waited for to read,
-    /// which that writer's end may have taken out.
-    pub(super) fn types_locked(
+    /// Locks the types, domains and functions a declaration takes out, ACCESS EXCLUSIVE, and those
+    /// an object new in `catalog` depends on, ACCESS SHARE, held to the transaction's end, as
+    /// PostgreSQL locks each object a DROP takes and each a new dependency is recorded on: by the
+    /// object's OID, an array by its type's; one the transaction made, which no other writer names
+    /// until it commits, not at all. None where it waited for no other writer; else those it waited
+    /// for to read, which that writer's end may have taken out.
+    pub(super) fn depended_locked(
         &mut self,
         catalog: &crate::catalog::Catalog,
-    ) -> Result<Option<Vec<String>>> {
+    ) -> Result<Option<Vec<crate::oids::Object>>> {
         use crate::oids::{full, Object as O};
-        let own: Vec<String> = self
+        let own: Vec<O> = self
             .catalog
             .types
             .iter()
-            .map(|t| full(&t.name))
-            .chain(self.catalog.domains.iter().map(|d| full(&d.name)))
-            .filter(|n| !self.declared.as_ref().is_some_and(|d| d.made_type(n)))
+            .map(|t| O::Type(full(&t.name)))
+            .chain(self.catalog.domains.iter().map(|d| O::Type(full(&d.name))))
+            .chain(self.catalog.functions.iter().map(crate::pgcatalog::function_object))
+            .filter(|o| !self.declared.as_ref().is_some_and(|d| d.made_object(o)))
             .collect();
         if own.is_empty() || self.writer.is_none() {
             return Ok(None);
         }
-        let stands = |n: &String| {
-            catalog.types.iter().any(|t| full(&t.name) == *n)
-                || catalog.domains.iter().any(|d| full(&d.name) == *n)
-        };
-        let mut wanted: Vec<(String, Mode)> = own
+        let mut wanted: Vec<(O, Mode)> = own
             .iter()
-            .filter(|n| !stands(n))
+            .filter(|n| catalog.oids.of(n).is_none())
             .map(|n| (n.clone(), AccessExclusive))
             .collect();
-        for oid in crate::cascade::types_newly_depended_on(&self.catalog, catalog)? {
+        for oid in crate::cascade::newly_depended_on(&self.catalog, catalog) {
             let name = match catalog.oids.object(oid) {
-                Some(O::Type(n) | O::Array(n)) => n.clone(),
+                Some(O::Type(n) | O::Array(n)) => O::Type(n.clone()),
+                Some(f @ O::Proc(..)) => f.clone(),
                 _ => continue,
             };
             if own.contains(&name) && !wanted.iter().any(|(w, _)| *w == name) {
@@ -203,10 +201,10 @@ impl Snail {
         }
         let (mut waited, mut read) = (false, Vec::new());
         for (name, mode) in wanted {
-            let Some(oid) = self.catalog.oids.of(&O::Type(name.clone())) else {
+            let Some(oid) = self.catalog.oids.of(&name) else {
                 continue;
             };
-            if self.lock_relation(u64::from(oid), &name, mode, false)? {
+            if self.lock_relation(u64::from(oid), name.name(), mode, false)? {
                 waited = true;
                 if mode == AccessShare {
                     read.push(name);
