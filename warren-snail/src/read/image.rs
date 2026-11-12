@@ -45,6 +45,9 @@ fn written_bang(sql: &str, t: &TokenWithSpan) -> bool {
 /// as `=>`, the spelling sqlparser reads there.
 pub(crate) fn tokens(sql: &str) -> std::result::Result<Vec<TokenWithSpan>, TokenizerError> {
     let mut tokens = Tokenizer::new(&PostgreSqlDialect {}, sql).tokenize_with_location()?;
+    if sql.contains(".*") && sql.contains("::") {
+        tokens = star_cast(tokens);
+    }
     if sql.contains(":=") {
         for t in &mut tokens {
             if t.token == Token::Assignment {
@@ -172,6 +175,55 @@ pub(super) fn asks_an_operator(sql: &str) -> bool {
         })
 }
 
+/// The tokens with a relation's star cast written as the relation's name, its whole row: sqlparser
+/// reads no cast after `o.*`. A star named in its schema is written as its relation's name alone.
+fn star_cast(tokens: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    let mut out: Vec<TokenWithSpan> = Vec::with_capacity(tokens.len());
+    for (i, t) in tokens.iter().enumerate() {
+        let cast_next = || {
+            tokens[i + 1..]
+                .iter()
+                .find(|n| !matches!(n.token, Token::Whitespace(_)))
+                .is_some_and(|n| n.token == Token::DoubleColon)
+        };
+        let starred = t.token == Token::Mul
+            && matches!(out.last().map(|p| &p.token), Some(Token::Period))
+            && matches!(out.iter().rev().nth(1).map(|p| &p.token), Some(Token::Word(_)));
+        if starred && cast_next() {
+            out.pop();
+            let name = out.pop().expect("the relation's name just seen");
+            while matches!(out.last().map(|p| &p.token), Some(Token::Period))
+                && matches!(out.iter().rev().nth(1).map(|p| &p.token), Some(Token::Word(_)))
+            {
+                out.truncate(out.len() - 2);
+            }
+            out.push(name);
+            continue;
+        }
+        out.push(t.clone());
+    }
+    out
+}
+
+/// A relation's star under a cast, `(o.*)::text` or `CAST(o.* AS text)`, written as the relation's
+/// name alone, its whole row, as PostgreSQL reads a star anywhere but a select list's item.
+fn star_cast_named(statement: &mut Statement) {
+    let _ = sqlparser::ast::visit_expressions_mut(statement, |e| {
+        if let Expr::Cast { expr, .. } = e {
+            let mut inner: &mut Expr = expr;
+            while let Expr::Nested(x) = inner {
+                inner = x;
+            }
+            if let Expr::QualifiedWildcard(name, _) = inner {
+                if let Some(last) = name.0.last().and_then(|p| p.as_ident()).cloned() {
+                    *inner = Expr::Identifier(last);
+                }
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+}
+
 /// The statements of `sql`, as sqlparser's PostgreSQL dialect reads them, these operators among them,
 /// and what it takes past PostgreSQL's grammar refused by name (`unread`).
 pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
@@ -179,6 +231,9 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
         .with_tokens_with_locations(tokens(sql).map_err(ParserError::from)?)
         .parse_statements()?;
     super::unread::checked(sql, &mut statements)?;
+    if sql.contains(".*") {
+        statements.iter_mut().for_each(star_cast_named);
+    }
     Ok(statements)
 }
 

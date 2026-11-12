@@ -4017,8 +4017,16 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> 
     Ok(())
 }
 
-/// A VALUES list made: each column typed as select_common_type types its values, each value in it.
-fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -> Result<Made> {
+/// A VALUES list made: each column typed as select_common_type types its values, each value in it,
+/// a scalar subquery's among them.
+fn values_step(
+    step: &Step,
+    asked: Asked,
+    made: &Steps,
+    accrued: &Accrued,
+    casings: &Casings,
+) -> Result<Made> {
+    let (params, release) = (asked.params, asked.release);
     let SetExpr::Values(v) = step.query.body.as_ref() else {
         unreachable!("a VALUES step")
     };
@@ -4033,11 +4041,12 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
             return Err(Error::new("VALUES lists must all be the same length"));
         }
     }
+    let (plans, seeded) = super::subqueries::Plans::of_values(asked, &rows, made, casings)?;
     let columns: Vec<TypedColumn> = Vec::new();
     let mut typing = typed::Typing {
         columns: &columns,
         release,
-        types: typed::Types::new(),
+        types: seeded,
     };
     let mut types = Vec::with_capacity(n);
     for c in 0..n {
@@ -4047,6 +4056,7 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
         }
         types.push(typed::common_type(&ts, "VALUES")?);
     }
+    let subs = super::subqueries::Subs::new(&plans, asked, made, casings, &[], accrued);
     let frame = pipeline::Frame {
         columns: Vec::new(),
         params,
@@ -4054,7 +4064,7 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
         casings,
         types: &typing.types,
         now: crate::scalars::transaction_clock(),
-        subqueries: None,
+        subqueries: (!plans.is_empty()).then_some(&subs as &dyn pipeline::Subqueries),
         below: None,
     };
     let none = pipeline::computed_none();
@@ -4096,12 +4106,14 @@ enum Arm {
 }
 
 /// A column of an arm that takes the type its set operation finds: none, a NULL or a parameter, or
-/// a quoted literal, read in that type.
+/// a quoted literal, read in that type; or a literal or NULL its arm's DISTINCT, GROUP BY or ORDER
+/// BY sorts, which is text before the operation is typed.
 #[derive(Clone, Debug)]
 enum Untyped {
     No,
     Null,
     Literal(String),
+    Text,
 }
 
 /// Whether a question is a set operation.
@@ -4346,26 +4358,42 @@ fn arm_of(
 }
 
 /// What each column of an arm's SELECT is where an untyped literal or parameter makes it, as
-/// PostgreSQL leaves such an arm's output untyped; none where a star, a DISTINCT, a grouping or an
-/// ORDER BY reads them.
+/// PostgreSQL leaves such an arm's output untyped; text where its DISTINCT, DISTINCT ON, GROUP BY
+/// or ORDER BY sorts the column (by place, output name or the item itself); none where a star
+/// stands.
 fn untyped_of(q: &Query) -> Vec<Untyped> {
+    use sqlparser::ast::{Distinct, GroupByExpr, OrderByKind};
     let SetExpr::Select(s) = q.body.as_ref() else {
         return Vec::new();
     };
-    let grouped =
-        !matches!(&s.group_by, sqlparser::ast::GroupByExpr::Expressions(g, _) if g.is_empty());
-    if q.order_by.is_some()
-        || pipeline::says_distinct(s)
-        || grouped
-        || s.projection.iter().any(|i| {
-            matches!(
-                i,
-                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
-            )
-        })
-    {
+    if s.projection.iter().any(|i| {
+        matches!(
+            i,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    }) {
         return Vec::new();
     }
+    let mut keys: Vec<&Expr> = Vec::new();
+    if let Some(Distinct::On(on)) = &s.distinct {
+        keys.extend(on);
+    }
+    if let GroupByExpr::Expressions(g, _) = &s.group_by {
+        keys.extend(g);
+    }
+    if let Some(OrderByKind::Expressions(o)) = q.order_by.as_ref().map(|o| &o.kind) {
+        keys.extend(o.iter().map(|x| &x.expr));
+    }
+    let all = matches!(s.distinct, Some(Distinct::Distinct));
+    let sorted = |c: usize, e: &Expr, alias: Option<&Ident>| {
+        all || keys.iter().any(|&k| {
+            *k == *e
+                || matches!(k, Expr::Value(v) if matches!(&v.value,
+                    SqlValue::Number(n, _) if n.parse::<usize>() == Ok(c + 1)))
+                || matches!((k, alias), (Expr::Identifier(i), Some(a))
+                    if crate::catalog::ident(i) == crate::catalog::ident(a))
+        })
+    };
     fn of(e: &Expr) -> Untyped {
         match e {
             Expr::Nested(e) => of(e),
@@ -4379,9 +4407,22 @@ fn untyped_of(q: &Query) -> Vec<Untyped> {
     }
     s.projection
         .iter()
-        .map(|i| match i {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => of(e),
-            _ => Untyped::No,
+        .enumerate()
+        .map(|(c, i)| {
+            let (e, alias) = match i {
+                SelectItem::UnnamedExpr(e) => (e, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+                _ => return Untyped::No,
+            };
+            match of(e) {
+                Untyped::Literal(_) | Untyped::Null
+                    if sorted(c, e, alias) && !matches!(e, Expr::Value(v)
+                        if matches!(v.value, SqlValue::Placeholder(_))) =>
+                {
+                    Untyped::Text
+                }
+                u => u,
+            }
         })
         .collect()
 }
@@ -4553,12 +4594,19 @@ fn met(arm: &Arm, made: &Steps, casings: &Casings) -> Result<Met> {
                 .get(name)
                 .ok_or_else(|| Error::new("a set operation's arm was not made"))?;
             let n = m.rel.names.len();
+            let mut types = m.types.clone();
             return Ok(Met {
                 names: m.rel.names.clone(),
-                types: m.types.clone(),
                 untyped: (0..n)
-                    .map(|c| untyped.get(c).cloned().unwrap_or(Untyped::No))
+                    .map(|c| match untyped.get(c).cloned().unwrap_or(Untyped::No) {
+                        Untyped::Text => {
+                            types[c] = types[c].or(Some(ColumnType::Text(None)));
+                            Untyped::No
+                        }
+                        u => u,
+                    })
                     .collect(),
+                types,
                 carried: m.carried.clone(),
                 rows: m.rows_of()?,
             });
@@ -4895,7 +4943,7 @@ impl Making<'_, '_> {
         let m = match (&step.set, step.query.body.as_ref()) {
             (Some(arm), _) => set_step(arm, &self.made, &self.casings)?,
             (None, SetExpr::Values(_)) => {
-                values_step(step, asked.params, asked.release, &self.casings)?
+                values_step(step, asked, &self.made, self.accrued, &self.casings)?
             }
             _ => {
                 let before = self

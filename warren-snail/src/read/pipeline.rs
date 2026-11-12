@@ -10440,7 +10440,8 @@ pub fn hands_over(q: &Query) -> bool {
 }
 
 /// Whether a condition holds a constant written out where a truth stands, which the question path
-/// holds no level for: alone, or under NOT, AND, OR or a truth test.
+/// holds no level for: alone, compared with another or tested for NULL, or any of those under NOT,
+/// AND, OR or a truth test.
 fn stands_constant(e: &Expr) -> bool {
     match e {
         Expr::Nested(x)
@@ -10459,6 +10460,8 @@ fn stands_constant(e: &Expr) -> bool {
             op: BinaryOperator::And | BinaryOperator::Or,
             right,
         } => stands_constant(left) || stands_constant(right),
+        Expr::BinaryOp { left, right, .. } => is_written_constant(left) && is_written_constant(right),
+        Expr::IsNull(x) | Expr::IsNotNull(x) => is_written_constant(x),
         e => is_written_constant(e),
     }
 }

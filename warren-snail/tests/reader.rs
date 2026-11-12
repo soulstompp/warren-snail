@@ -5103,3 +5103,120 @@ fn a_literal_and_a_cast_are_read_as_the_statement_is_typed() {
         ],
     );
 }
+
+#[test]
+fn a_where_comparing_constants_alone_is_read_as_any_condition() {
+    let mut w = snail("constants-compared");
+    let all: &[&str] = &["1", "2", "3", "4", "5", "6", "7"];
+    answered(
+        &mut w,
+        &[
+            ("SELECT id FROM dn.a WHERE 'pg_class'::regclass::oid = 1259", all),
+            ("SELECT id FROM dn.a WHERE 1 = 1 ORDER BY id", all),
+            ("SELECT id FROM dn.a WHERE 2 > 1 AND id = 1", &["1"]),
+            ("SELECT id FROM dn.a WHERE 1 = 2", &[]),
+            ("SELECT id FROM dn.a WHERE 'a' = 'a' AND g = 10 ORDER BY id", &["1", "3"]),
+            ("SELECT id FROM dn.a WHERE NULL::int = 1", &[]),
+            ("SELECT id FROM dn.a WHERE 1 = 1 AND 2 = 2 AND id < 3 ORDER BY id", &["1", "2"]),
+            ("SELECT id FROM dn.a WHERE id = 1 OR 1 = 2", &["1"]),
+            ("SELECT id FROM dn.a WHERE 1 IS NOT NULL AND id < 3 ORDER BY id", &["1", "2"]),
+            ("SELECT id FROM dn.a WHERE NULL IS NULL AND id = 4", &["4"]),
+        ],
+    );
+}
+
+#[test]
+fn a_values_list_reads_its_subqueries() {
+    let mut w = snail("values-subqueries");
+    answered(
+        &mut w,
+        &[
+            ("VALUES ((SELECT max(g) FROM dn.a)), (2) ORDER BY 1", &["2", "30"]),
+            ("SELECT * FROM (VALUES ((SELECT 1))) v", &["1"]),
+            ("VALUES (1, (SELECT count(*) FROM dn.a))", &["1|7"]),
+            ("WITH v AS (VALUES ((SELECT min(id) FROM dn.a))) SELECT * FROM v", &["1"]),
+            (
+                "VALUES (EXISTS (SELECT 1 FROM dn.a WHERE id = 9)), (2 IN (SELECT id FROM dn.a))",
+                &["f", "t"],
+            ),
+            (
+                "VALUES ((SELECT name FROM dn.a WHERE id = 3), 'x'), ('y', (SELECT k FROM dn.a \
+                 WHERE id = 2))",
+                &["three|x", "y|y"],
+            ),
+            (
+                "SELECT * FROM (VALUES ((SELECT g FROM dn.a WHERE id = 6)), (5)) v(c) ORDER BY c",
+                &["5", "NULL"],
+            ),
+        ],
+    );
+    for (sql, want) in [
+        (
+            "SELECT * FROM (VALUES ((SELECT id FROM dn.a))) v",
+            (Some("21000"), "more than one row returned by a subquery used as an expression"),
+        ),
+        (
+            "SELECT * FROM (VALUES ((SELECT id, g FROM dn.a WHERE id = 1))) v",
+            (Some("42601"), "subquery must return only one column"),
+        ),
+        ("SELECT * FROM (VALUES (1), ((SELECT 1/0))) v", (Some("22012"), "division by zero")),
+    ] {
+        assert_eq!(refused(&mut w, sql), (want.0, want.1.to_string()), "{sql}");
+    }
+}
+
+#[test]
+fn a_relation_s_star_cast_is_its_whole_row() {
+    let mut w = snail("star-cast");
+    answered(
+        &mut w,
+        &[
+            ("SELECT a.*::text FROM dn.a a WHERE a.id = 1", &["(1,10,x,one)"]),
+            ("SELECT length(a.*::text) FROM dn.a a WHERE a.id = 1", &["12"]),
+            ("SELECT count(*) FROM dn.a a WHERE length(a.*::text) > 12", &["3"]),
+            ("SELECT (a.*)::text FROM dn.a a WHERE a.id = 6", &["(6,,,six)"]),
+            ("SELECT CAST(a.* AS text) FROM dn.a a WHERE a.id = 1", &["(1,10,x,one)"]),
+            ("SELECT a.*::dn.a FROM dn.a a WHERE a.id = 1", &["(1,10,x,one)"]),
+            ("SELECT dn.a.*::text FROM dn.a WHERE id = 2", &["(2,20,y,two)"]),
+            ("SELECT a.* :: text FROM dn.a a WHERE a.id = 3", &["(3,10,x,three)"]),
+            (
+                "SELECT b.id, a.*::text FROM dn.a a JOIN dn.b b ON b.a_id = a.id WHERE b.id < 3 \
+                 ORDER BY b.id",
+                &["1|(1,10,x,one)", "2|(1,10,x,one)"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
+    let mut w = snail("sorted-literal");
+    let unmatched = |op: &str, a: &str, b: &str| {
+        (
+            Some("42804"),
+            format!("{op} types {a} and {b} cannot be matched"),
+        )
+    };
+    for (sql, want) in [
+        ("SELECT 1 UNION SELECT DISTINCT '2'", unmatched("UNION", "integer", "text")),
+        ("SELECT 1 UNION SELECT DISTINCT '2'::text", unmatched("UNION", "integer", "text")),
+        ("SELECT DISTINCT '2' UNION SELECT 1", unmatched("UNION", "text", "integer")),
+        ("SELECT 1 INTERSECT SELECT DISTINCT 'x'", unmatched("INTERSECT", "integer", "text")),
+        ("SELECT 1 EXCEPT SELECT DISTINCT '2'", unmatched("EXCEPT", "integer", "text")),
+        ("SELECT 1 UNION ALL SELECT DISTINCT '2'", unmatched("UNION", "integer", "text")),
+        ("SELECT 1 UNION SELECT DISTINCT ON (1) '2'", unmatched("UNION", "integer", "text")),
+        ("SELECT 1 UNION (SELECT '2' ORDER BY 1)", unmatched("UNION", "integer", "text")),
+        ("SELECT 1 UNION SELECT '2' GROUP BY 1", unmatched("UNION", "integer", "text")),
+        ("SELECT 1 UNION SELECT DISTINCT NULL", unmatched("UNION", "integer", "text")),
+    ] {
+        assert_eq!(refused(&mut w, sql), want, "{sql}");
+    }
+    answered(
+        &mut w,
+        &[
+            ("SELECT 1 UNION SELECT ALL '2' ORDER BY 1", &["1", "2"]),
+            ("SELECT 1, 1 UNION ALL (SELECT '2', 2 ORDER BY 2)", &["1|1", "2|2"]),
+            ("SELECT 'a' UNION SELECT DISTINCT 'b' ORDER BY 1", &["a", "b"]),
+        ],
+    );
+}

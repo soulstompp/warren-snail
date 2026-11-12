@@ -396,6 +396,29 @@ impl<'q> Plans<'q> {
         Ok((plans, seeded))
     }
 
+    /// Each subquery a VALUES list's values hold outside any other, read over no columns.
+    pub(super) fn of_values(
+        asked: Asked,
+        rows: &[&'q Vec<Expr>],
+        made: &Steps,
+        casings: &Casings,
+    ) -> Result<(Plans<'q>, Types)> {
+        let mut found = Vec::new();
+        for e in rows.iter().flat_map(|r| r.iter()) {
+            pipeline::subqueries_in(e, &mut found);
+        }
+        let mut plans = Plans::default();
+        let mut seeded = Types::new();
+        for e in found {
+            let plan = Plan::of(asked, e, &[], made, casings, false, None, None)?;
+            if let (Asks::Scalar, Some(t)) = (&plan.asks, plan.first) {
+                seeded.insert(e as *const Expr, t);
+            }
+            plans.plans.insert(e as *const Expr, plan);
+        }
+        Ok((plans, seeded))
+    }
+
     /// The columns of the step its subqueries read on each group, where it groups.
     pub(super) fn around(&self) -> &[usize] {
         &self.around
