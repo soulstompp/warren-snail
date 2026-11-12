@@ -1100,6 +1100,7 @@ impl Snail {
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _standing =
             super::sequences::standing(&self.catalog, sql, || self.sequences_newest())?;
+        let _drawing = super::prng::lending(&self.drawing);
         let _timing = self.timing();
         let written_out;
         let text = match params.is_empty() {
@@ -1369,8 +1370,11 @@ impl Snail {
                         return Err(e);
                     }
                 };
+                // Each run draws from where the statement began.
+                let began = self.drawing.stands();
                 loop {
                     self.stale = false;
+                    self.drawing.put_back(began);
                     let tabbing = runs.as_ref().map(|r| self.tab_for(r));
                     // Its foreign keys are checked as it ends, their actions written first.
                     let written =

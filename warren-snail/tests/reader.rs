@@ -2868,3 +2868,432 @@ fn the_keywords_are_the_file_s_release_s() {
     syntax(&mut w, "SET TIME ZONE wait", "wait");
     syntax(&mut w, "SET TIME ZONE ignore", "ignore");
 }
+
+// After setseed, 18.6's values, drawn in its order: WHERE's for a row before the select list's, an
+// item no sort key after the sort for each row the LIMIT reads, its OFFSET's and the row a WITH TIES
+// compares among them; a WHERE read no further than the last row its LIMIT keeps; a subquery of no
+// column once. setseed answers void, written as nothing.
+#[test]
+fn random_draws_as_postgresql_draws_after_setseed() {
+    let mut w = snail("random");
+    let seeded = |w: &mut Snail, seed: &str| {
+        assert_eq!(rows(w, &format!("SELECT setseed({seed})")), [""], "setseed({seed})");
+    };
+    seeded(&mut w, "0.5");
+    answered(
+        &mut w,
+        &[("SELECT random(), random()", &["0.9851677175347999|0.825301858027981"])],
+    );
+    seeded(&mut w, "0.5");
+    answered(
+        &mut w,
+        &[(
+            "SELECT random(1, 10), random(1::bigint, 10::bigint), random(1.5, 2.5), \
+             random_normal(), random_normal(10, 2)",
+            &["3|3|2.5|-1.5976119949210055|10.106215605031105"],
+        )],
+    );
+    seeded(&mut w, "-1");
+    answered(
+        &mut w,
+        &[(
+            "SELECT random() FROM generate_series(1, 3)",
+            &["0.725656831544149", "0.21342431605981593", "0.08668744483804192"],
+        )],
+    );
+    seeded(&mut w, "0");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT random(0.000, 1.0), random(-5, 5), random(1, 1), random(5.5, 5.5), \
+                 random(0, 9223372036854775807), random(-2147483648, 2147483647)",
+                &["0.891|1|1|5.5|6165647961682858565|128965569"],
+            ),
+            ("SELECT random(1.25, 9999999.123456)", &["6924021.826976"]),
+            ("SELECT random(-1.5, 100000000000000000000.5)", &["50034793462446462500.2"]),
+        ],
+    );
+    seeded(&mut w, "0.25");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT random(0, 0.001), random(0, 99999999), random(0.0001, 0.0002), \
+                 random(123.45678, 98765.4321)",
+                &["0.000|28257152|0.0001|59189.93442"],
+            ),
+            (
+                "SELECT random(1, '2'), random(1::smallint, 2), random_normal(1), \
+                 random_normal(0, -1)",
+                &["1|1|0.5226302289302078|0.3021904140852716"],
+            ),
+            ("SELECT random() BETWEEN 0 AND 1, random() >= 0 AND random() < 1", &["t|t"]),
+            (
+                "SELECT pg_typeof(random()), pg_typeof(random(1, 2)), pg_typeof(random(1::bigint, \
+                 2)), pg_typeof(random(1, 2.0)), pg_typeof(random_normal()), \
+                 pg_typeof(setseed(0))",
+                &["double precision|integer|bigint|numeric|double precision|void"],
+            ),
+            (
+                "SELECT setseed(0) IS NULL, setseed(0)::text, ''::void, pg_typeof('x'::void)",
+                &["f|||void"],
+            ),
+            (
+                "SELECT setseed(NULL), random(NULL, 1), random_normal(NULL, 1), random(1, \
+                 NULL::bigint)",
+                &["NULL|NULL|NULL|NULL"],
+            ),
+            ("SELECT setseed(0.5), random()", &["|0.9851677175347999"]),
+            (
+                "SELECT random(), setseed(0.5), random()",
+                &["0.825301858027981||0.9851677175347999"],
+            ),
+        ],
+    );
+    let first = "0.9851677175347999";
+    let third = "0.12974610012450416";
+    let fourth = "0.16356291958601088";
+    let fifth = "0.6476186144084";
+    for (sql, want, after) in [
+        (
+            "SELECT random() AS r FROM generate_series(1, 3) g ORDER BY g DESC",
+            vec![first, "0.825301858027981", third],
+            None,
+        ),
+        (
+            "SELECT g, random() AS r FROM generate_series(1, 4) g ORDER BY g DESC LIMIT 2 OFFSET 1",
+            vec!["3|0.825301858027981", "2|0.12974610012450416"],
+            Some(fourth),
+        ),
+        (
+            "SELECT random() AS r, g FROM generate_series(1, 3) g ORDER BY r",
+            vec!["0.12974610012450416|3", "0.825301858027981|2", "0.9851677175347999|1"],
+            None,
+        ),
+        (
+            "SELECT random() FROM generate_series(1, 2) g WHERE random() < 2",
+            vec!["0.825301858027981", fourth],
+            None,
+        ),
+        (
+            "SELECT random() FROM generate_series(1, 5) g WHERE random() < 2 LIMIT 2",
+            vec!["0.825301858027981", fourth],
+            Some(fifth),
+        ),
+        (
+            "SELECT g FROM generate_series(1, 5) g WHERE random() < 0.5 LIMIT 1",
+            vec!["3"],
+            Some(fourth),
+        ),
+        (
+            "SELECT g / 2 AS h, random() FROM generate_series(1, 6) g ORDER BY g / 2 FETCH FIRST \
+             2 ROWS WITH TIES",
+            vec!["0|0.9851677175347999", "1|0.825301858027981", "1|0.12974610012450416"],
+            Some(fifth),
+        ),
+        ("SELECT random() FROM generate_series(1, 3) LIMIT 0 OFFSET 1", vec![], Some(first)),
+        (
+            "SELECT DISTINCT g % 2 AS k, random() < 2 AS b FROM generate_series(1, 4) g ORDER BY 1",
+            vec!["0|t", "1|t"],
+            Some(fifth),
+        ),
+        (
+            "SELECT id, random() FROM dn.a WHERE random() < 2 ORDER BY id DESC",
+            vec![
+                "7|0.15619865764623442",
+                "6|0.5145227426983392",
+                "5|0.7712969548127826",
+                "4|0.48403393317276766",
+                "3|0.9709894670705799",
+                "2|0.45481208559326447",
+                "1|0.5385999182909114",
+            ],
+            Some("0.7495564594841835"),
+        ),
+        ("SELECT id FROM dn.a WHERE random() < 2 LIMIT 2", vec!["1", "2"], Some(third)),
+        (
+            "SELECT id, (SELECT random()) FROM dn.a ORDER BY id DESC LIMIT 2",
+            vec!["7|0.9851677175347999", "6|0.9851677175347999"],
+            None,
+        ),
+        (
+            "WITH w AS (SELECT random() AS x FROM generate_series(1, 2)) SELECT x FROM w",
+            vec![first, "0.825301858027981"],
+            None,
+        ),
+    ] {
+        seeded(&mut w, "0.5");
+        assert_eq!(rows(&mut w, sql), want, "{sql}");
+        if let Some(after) = after {
+            assert_eq!(rows(&mut w, "SELECT random()"), [after], "after {sql}");
+        }
+    }
+    seeded(&mut w, "0.5");
+    w.execute("INSERT INTO dn.b SELECT g + 10, 1, random(1, 100) FROM generate_series(1, 3) g")
+        .unwrap();
+    let written = "SELECT id, v FROM dn.b WHERE id > 10 ORDER BY id";
+    answered(&mut w, &[(written, &["11|17", "12|21", "13|83"])]);
+    w.execute("UPDATE dn.b SET v = random(1, 100) WHERE id > 10")
+        .unwrap();
+    answered(&mut w, &[(written, &["11|18", "12|20", "13|66"])]);
+    refusals(
+        &mut w,
+        &[
+            ("SELECT setseed(2)", "22023", "setseed parameter 2 is out of allowed range [-1,1]"),
+            ("SELECT setseed('NaN')", "22023", "setseed parameter NaN is out of allowed range [-1,1]"),
+            ("SELECT setseed(-1.5)", "22023", "setseed parameter -1.5 is out of allowed range [-1,1]"),
+            (
+                "SELECT setseed(1.00000001)",
+                "22023",
+                "setseed parameter 1 is out of allowed range [-1,1]",
+            ),
+            ("SELECT random(10, 1)", "22023", "lower bound must be less than or equal to upper bound"),
+            ("SELECT random(2.5, 1.5)", "22023", "lower bound must be less than or equal to upper bound"),
+            (
+                "SELECT random(10::bigint, 1::bigint)",
+                "22023",
+                "lower bound must be less than or equal to upper bound",
+            ),
+            ("SELECT random('NaN'::numeric, 1)", "22023", "lower bound cannot be NaN"),
+            ("SELECT random(1, 'NaN'::numeric)", "22023", "upper bound cannot be NaN"),
+            ("SELECT random('-Infinity'::numeric, 1)", "22023", "lower bound cannot be infinity"),
+            ("SELECT random(1, 'Infinity'::numeric)", "22023", "upper bound cannot be infinity"),
+            ("SELECT random('1', '2')", "42725", "function random(unknown, unknown) is not unique"),
+            (
+                "SELECT random(1::smallint, 2::smallint)",
+                "42725",
+                "function random(smallint, smallint) is not unique",
+            ),
+            (
+                "SELECT random(1::smallint, '2')",
+                "42725",
+                "function random(smallint, unknown) is not unique",
+            ),
+            (
+                "SELECT random(1.5::float8, 2)",
+                "42883",
+                "function random(double precision, integer) does not exist\nHINT:  No function \
+                 matches the given name and argument types. You might need to add explicit type \
+                 casts.",
+            ),
+            (
+                "SELECT random(1)",
+                "42883",
+                "function random(integer) does not exist\nHINT:  No function matches the given \
+                 name and argument types. You might need to add explicit type casts.",
+            ),
+            (
+                "SELECT random_normal('x')",
+                "22P02",
+                "invalid input syntax for type double precision: \"x\"",
+            ),
+            ("SELECT setseed(0) = setseed(0)", "42883", "operator does not exist: void = void"),
+            ("SELECT 1::void", "42846", "cannot cast type integer to void"),
+        ],
+    );
+    // The snail's own: beside grouping, a window or a set it makes such an item before the sort,
+    // where 18.6 makes it after.
+    for sql in [
+        "SELECT g % 2 AS k, random() FROM generate_series(1, 4) g GROUP BY g % 2 ORDER BY 1",
+        "SELECT id, random(), row_number() OVER (ORDER BY id) FROM dn.a ORDER BY id LIMIT 2",
+        "SELECT generate_series(1, 2) AS s, random() ORDER BY 1",
+    ] {
+        let words = "random() beside grouping, a window or a set-returning function, made after \
+                     an ORDER BY or a LIMIT, is not read";
+        assert_eq!(refused(&mut w, sql), (None, words.to_string()), "{sql}");
+    }
+}
+
+// The array functions as `||` reads them, each in the array type of its arguments' common type.
+#[test]
+fn array_append_prepend_and_cat_answer_as_postgresql() {
+    let mut w = snail("joined-arrays");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT array_append(ARRAY[1, 2], 3), array_prepend(0, ARRAY[1, 2]), \
+                 array_cat(ARRAY[1], ARRAY[2, 3])",
+                &["{1,2,3}|{0,1,2}|{1,2,3}"],
+            ),
+            (
+                "SELECT array_append(ARRAY[1, 2], NULL), array_append(NULL::integer[], 3), \
+                 array_append(NULL, 3), array_prepend(NULL, ARRAY[1]), array_prepend(1, NULL), \
+                 array_cat(ARRAY[1], NULL), array_cat(NULL, ARRAY[1]), \
+                 array_cat(NULL::integer[], NULL)",
+                &["{1,2,NULL}|{3}|{3}|{NULL,1}|{1}|{1}|{1}|NULL"],
+            ),
+            (
+                "SELECT array_append(ARRAY[1, 2], 3.5), array_prepend('x', ARRAY['a', 'b']), \
+                 array_append(ARRAY['a'], 'b'), array_cat(ARRAY[[1, 2]], ARRAY[3, 4]), \
+                 array_cat(ARRAY[1, 2], ARRAY[[3, 4]]), array_cat(ARRAY[[1]], ARRAY[[2]])",
+                &["{1,2,3.5}|{x,a,b}|{a,b}|{{1,2},{3,4}}|{{1,2},{3,4}}|{{1},{2}}"],
+            ),
+            (
+                "SELECT array_append('{1,2}', 3), array_append('{}'::int[], 3), \
+                 array_prepend(0, '{}'::int[]), array_cat('{}'::int[], ARRAY[1])",
+                &["{1,2,3}|{3}|{0}|{1}"],
+            ),
+            (
+                "SELECT array_append(NULL, NULL), pg_typeof(array_append(NULL, NULL)), \
+                 array_cat(NULL, NULL), pg_typeof(array_cat(NULL, NULL))",
+                &["{NULL}|text[]|NULL|text[]"],
+            ),
+            (
+                "SELECT array_append(ARRAY[1, 2], 3) = ARRAY[1, 2] || 3, \
+                 array_cat(ARRAY['{1,2}'::int[]], ARRAY['{3,4}'::int[]])",
+                &["t|{{1,2},{3,4}}"],
+            ),
+            (
+                "SELECT array_append('[0:1]={1,2}'::int[], 3), array_prepend(0, \
+                 '[5:6]={1,2}'::int[]), array_cat('[2:3]={1,2}'::int[], ARRAY[3])",
+                &["[0:2]={1,2,3}|[5:7]={0,1,2}|[2:4]={1,2,3}"],
+            ),
+            (
+                "SELECT id, array_append(ARRAY[id], g), array_prepend(name, ARRAY[k]), \
+                 array_cat(ARRAY[g], ARRAY[id, id]) FROM dn.a WHERE id IN (1, 6) ORDER BY id",
+                &["1|{1,10}|{one,x}|{10,1,1}", "6|{6,NULL}|{six,NULL}|{NULL,6,6}"],
+            ),
+        ],
+    );
+    let dimensions = |why: &str| {
+        format!(
+            "cannot concatenate incompatible arrays\nDETAIL:  {why} not compatible for \
+             concatenation."
+        )
+    };
+    let one = "argument must be empty or one-dimensional array";
+    let none = |call: &str| {
+        format!(
+            "function {call} does not exist\nHINT:  No function matches the given name and \
+             argument types. You might need to add explicit type casts."
+        )
+    };
+    for (sql, code, words) in [
+        ("SELECT array_append(ARRAY[[1, 2]], 3)", "22000", one.to_string()),
+        ("SELECT array_prepend(0, ARRAY[[1, 2]])", "22000", one.to_string()),
+        (
+            "SELECT array_cat(ARRAY[[1, 2]], ARRAY[[3]])",
+            "2202E",
+            dimensions("Arrays with differing element dimensions are"),
+        ),
+        (
+            "SELECT array_cat(ARRAY[[[1]]], ARRAY[2])",
+            "2202E",
+            dimensions("Arrays of 3 and 1 dimensions are"),
+        ),
+        (
+            "SELECT array_cat(ARRAY[[1, 2]], ARRAY[3])",
+            "2202E",
+            dimensions("Arrays with differing dimensions are"),
+        ),
+        (
+            "SELECT array_cat('[0:0]={1}'::int[], ARRAY[[2]])",
+            "2202E",
+            dimensions("Arrays with differing dimensions are"),
+        ),
+        (
+            "SELECT array_append(ARRAY[1], 'x')",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"".to_string(),
+        ),
+        (
+            "SELECT array_append(ARRAY[1], 'x'::text)",
+            "42883",
+            none("array_append(integer[], text)"),
+        ),
+        ("SELECT array_append(1, 2)", "42883", none("array_append(integer, integer)")),
+        (
+            "SELECT array_prepend(ARRAY[1], ARRAY[2])",
+            "42883",
+            none("array_prepend(integer[], integer[])"),
+        ),
+        ("SELECT array_cat(ARRAY[1], 2)", "42883", none("array_cat(integer[], integer)")),
+    ] {
+        assert_eq!(refused(&mut w, sql), (Some(code), words), "{sql}");
+    }
+}
+
+// A column named by its table's schema and name, as 18.6 reads it: the table's where its FROM names
+// it without an alias, in every clause and in a subquery around which it stands; the file's own
+// database's name before them passed over, as 18.6 passes over its own. Elsewhere refused in 18.6's
+// words: an entry it finds, or the alias it meant.
+#[test]
+fn a_column_named_by_its_schema_and_table() {
+    let mut w = snail("by-schema");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT DISTINCT ON (dn.a.g) dn.a.id FROM dn.a ORDER BY dn.a.g, dn.a.id",
+                &["1", "2", "5", "6"],
+            ),
+            ("SELECT dn.a.id FROM dn.a WHERE id < 3 ORDER BY id", &["1", "2"]),
+            ("SELECT snail.dn.a.id FROM dn.a WHERE id < 3 ORDER BY id", &["1", "2"]),
+            ("SELECT snail.dn.a.id FROM dn.a, (SELECT 1) s WHERE dn.a.id = 1", &["1"]),
+            (
+                "SELECT dn.a.g, count(*) FROM dn.a GROUP BY dn.a.g ORDER BY dn.a.g",
+                &["10|2", "20|2", "30|1", "NULL|2"],
+            ),
+            (
+                "SELECT dn.a.id, row_number() OVER (ORDER BY dn.a.id DESC) FROM dn.a ORDER BY 1 \
+                 LIMIT 2",
+                &["1|7", "2|6"],
+            ),
+            (
+                "SELECT dn.a.id, dn.a.g + 1 FROM dn.a WHERE dn.a.g > 15 ORDER BY dn.a.id",
+                &["2|21", "4|21", "5|31"],
+            ),
+            ("SELECT dn.a.* FROM dn.a WHERE id = 1", &["1|10|x|one"]),
+            ("SELECT dn.a.id FROM dn.a JOIN dn.b USING (id) WHERE id = 1", &["1"]),
+            ("SELECT dn.a.id FROM dn.a ORDER BY dn.a.id DESC LIMIT 1", &["7"]),
+            (
+                "SELECT (SELECT dn.a.name FROM dn.a b WHERE b.id = dn.a.id + 1) FROM dn.a WHERE \
+                 dn.a.id = 1",
+                &["one"],
+            ),
+            ("SELECT count(dn.a.g), sum(dn.a.g) FROM dn.a", &["5|90"]),
+            ("SELECT dn.a.id FROM dn.a, dn.a b WHERE dn.a.id = b.id AND b.id < 2", &["1"]),
+            ("SELECT dn.a.id FROM dn.a WHERE dn.a.g IS NULL ORDER BY 1", &["6", "7"]),
+            (
+                "SELECT dn.a.id, dn.b.v FROM dn.a JOIN dn.b ON dn.b.a_id = dn.a.id WHERE dn.a.id \
+                 = 5 ORDER BY dn.b.v",
+                &["5|500", "5|600"],
+            ),
+        ],
+    );
+    let alias = |of: &str, meant: &str| {
+        format!(
+            "invalid reference to FROM-clause entry for table \"{of}\"\nHINT:  Perhaps you meant \
+             to reference the table alias \"{meant}\"."
+        )
+    };
+    refusals(
+        &mut w,
+        &[
+            ("SELECT dn.a.id FROM dn.a a", "42P01", &unreachable_entry("a", "a")),
+            ("SELECT dn.a.id FROM dn.a x", "42P01", &alias("a", "x")),
+            ("SELECT dn.a.* FROM dn.a x", "42P01", &alias("a", "x")),
+            ("SELECT public.a.id FROM dn.a", "42P01", &unreachable_entry("a", "a")),
+            ("SELECT dn.c.id FROM dn.a", "42P01", "missing FROM-clause entry for table \"c\""),
+            ("SELECT dn.a.zz FROM dn.a", "42703", "column a.zz does not exist"),
+            ("SELECT dn.a.id FROM (SELECT * FROM dn.a) a", "42P01", &unreachable_entry("a", "a")),
+            (
+                "SELECT other.dn.a.id FROM dn.a",
+                "0A000",
+                "cross-database references are not implemented: other.dn.a.id",
+            ),
+            (
+                "SELECT other.dn.a.id FROM dn.a, (SELECT 1) s",
+                "0A000",
+                "cross-database references are not implemented: other.dn.a.id",
+            ),
+            (
+                "SELECT x.dn.a.id.y FROM dn.a",
+                "42601",
+                "improper qualified name (too many dotted names): x.dn.a.id.y",
+            ),
+        ],
+    );
+}

@@ -39,6 +39,7 @@ mod point;
 mod populate;
 mod prefix;
 mod prepared;
+mod prng;
 mod question;
 mod ranges;
 mod relations;
@@ -557,6 +558,8 @@ pub struct Snail {
     handed: std::collections::HashMap<String, std::collections::VecDeque<i64>>,
     /// The value each sequence last handed this session, and the sequence it drew from last.
     drawn: sequences::Drawn,
+    /// What the session's random() and its kin draw from.
+    drawing: prng::Drawing,
     /// The changes a write makes to its own table, kept where its statement returns rows of them.
     kept: Option<Vec<change::Change>>,
     /// A write inside WITH's changes, held unapplied while every write of the statement finds its
@@ -866,6 +869,7 @@ impl Snail {
             clock: (0, 0),
             handed: Default::default(),
             drawn: Default::default(),
+            drawing: Default::default(),
             kept: None,
             dry: None,
             checking: None,
@@ -1529,6 +1533,7 @@ impl Snail {
         let _named = crate::oids::named(self.catalog.oids.clone());
         let _deparsing = crate::deparse::holding(&self.catalog, sql);
         let _standing = sequences::standing(&self.catalog, sql, || self.sequences_newest())?;
+        let _drawing = prng::lending(&self.drawing);
         let mut scan = self.scan(sql, order)?;
         while let Some(batch) = self.next_block(&mut scan)? {
             each(batch)?;
@@ -1698,19 +1703,22 @@ impl Snail {
         let _handed = handed::holding(&self.functions);
         let _own = own::holding(&self.catalog.functions, self.catalog.release);
         let _prepared = prepared::viewing(&self.session.prepared);
+        let _drawing = prng::lending(&self.drawing);
         let viewing = settings::viewing(self.settings_view());
         let _timing = self.timing();
         let room = self.reader.room();
         let _room = self.entered_round(&room);
         self.wasted.borrow_mut().clear();
         // A question that calls the sequence functions is asked on a tab, and again over what its
-        // calls came to wherever a run owed the file.
+        // calls came to wherever a run owed the file, drawing again from where it began.
+        let began = self.drawing.stands();
         let (batch, mut round) = match self.sequence_runs(sql)? {
             None => match locking::clauses(sql)? {
                 Some(l) => self.ask_locking(l, order, params)?,
                 None => self.answer_with(sql, order, params)?,
             },
             Some(mut runs) => loop {
+                self.drawing.put_back(began);
                 let tabbing = self.tab_for(&runs);
                 let asked = match locking::clauses(sql) {
                     Ok(Some(l)) => self.ask_locking(l, order, params),

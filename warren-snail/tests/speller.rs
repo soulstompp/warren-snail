@@ -203,21 +203,30 @@ fn a_qualifier_an_alias_hides_is_looked_up_as_postgresqls_parser_looks_it_up() {
         ),
         (
             "SELECT s.base.id FROM s.base x",
-            "invalid reference to FROM-clause entry for table \"base\"",
+            "invalid reference to FROM-clause entry for table \"base\"\nHINT:  Perhaps you meant \
+             to reference the table alias \"x\".",
         ),
         (
             "SELECT items.id FROM items x",
-            "invalid reference to FROM-clause entry for table \"items\"",
+            "invalid reference to FROM-clause entry for table \"items\"\nHINT:  Perhaps you meant \
+             to reference the table alias \"x\".",
         ),
         (
             "SELECT nowhere.id FROM s.base x",
             "missing FROM-clause entry for table \"nowhere\"",
         ),
+        // An alias of the table's own name: the entry it finds.
+        (
+            "SELECT s.base.id FROM s.base base",
+            "invalid reference to FROM-clause entry for table \"base\": There is an entry for \
+             table \"base\", but it cannot be referenced from this part of the query.",
+        ),
         // A WITH query by its name, in a join of steps.
         (
             "WITH c AS (SELECT id FROM s.base), d AS (SELECT id FROM s.base) SELECT c.id FROM c x \
              JOIN d ON d.id = x.id",
-            "invalid reference to FROM-clause entry for table \"c\"",
+            "invalid reference to FROM-clause entry for table \"c\"\nHINT:  Perhaps you meant to \
+             reference the table alias \"x\".",
         ),
     ] {
         assert_eq!(refused(&mut w, sql), (Some("42P01"), words.to_string()), "{sql}");

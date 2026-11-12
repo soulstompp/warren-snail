@@ -4621,11 +4621,19 @@ pub fn concat(
             lower: la,
         }));
     }
+    let incompatible = |why: String| {
+        Error::new(format!(
+            "cannot concatenate incompatible arrays\nDETAIL:  {why} not compatible for \
+             concatenation."
+        ))
+    };
     let mut elements = ea.clone();
     elements.extend(eb.iter().cloned());
     if da.len() == db.len() {
         if da[1..] != db[1..] || la[1..] != lb[1..] {
-            return Err(Error::new("cannot concatenate incompatible arrays"));
+            return Err(incompatible(
+                "Arrays with differing element dimensions are".into(),
+            ));
         }
         let mut dims = da.clone();
         dims[0] += db[0];
@@ -4635,25 +4643,29 @@ pub fn concat(
             lower: la,
         });
     }
-    if da.len() == db.len() + 1 && da[1..] == db[..] {
-        let mut dims = da.clone();
-        dims[0] += 1;
-        return Ok(Item::Array {
-            elements,
-            dims,
-            lower: la,
-        });
+    // An array of one dimension fewer is an element of the other, before or after its own: its
+    // dimensions and lower bounds those of the other's elements.
+    let (outer, inner, outer_lower, inner_lower) = match da.len() > db.len() {
+        true => (&da, &db, &la, &lb),
+        false => (&db, &da, &lb, &la),
+    };
+    if outer.len() != inner.len() + 1 {
+        return Err(incompatible(format!(
+            "Arrays of {} and {} dimensions are",
+            da.len(),
+            db.len()
+        )));
     }
-    if db.len() == da.len() + 1 && db[1..] == da[..] {
-        let mut dims = db.clone();
-        dims[0] += 1;
-        return Ok(Item::Array {
-            elements,
-            dims,
-            lower: lb,
-        });
+    if outer[1..] != inner[..] || outer_lower[1..] != inner_lower[..] {
+        return Err(incompatible("Arrays with differing dimensions are".into()));
     }
-    Err(Error::new("cannot concatenate incompatible arrays"))
+    let mut dims = outer.clone();
+    dims[0] += 1;
+    Ok(Item::Array {
+        elements,
+        dims,
+        lower: outer_lower.clone(),
+    })
 }
 
 /// An array's element at the subscripts given, each counted from its dimension's lower bound; NULL

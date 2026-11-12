@@ -432,6 +432,11 @@ pub(super) fn probing() -> Probing {
     Probing(PROBING.with(|p| p.replace(true)))
 }
 
+/// Whether the question under way is read only for the columns it returns.
+pub(super) fn probing_now() -> bool {
+    PROBING.with(std::cell::Cell::get)
+}
+
 impl Drop for Probing {
     fn drop(&mut self) {
         PROBING.with(|p| p.set(self.0));

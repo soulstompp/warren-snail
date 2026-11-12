@@ -1054,9 +1054,48 @@ pub(super) const SCALAR: char = '\u{1}';
 /// reference finds it only where no nearer query has a column it names.
 pub(super) const OUTER: char = '\u{2}';
 
+/// What follows the qualifier of a column of a table its FROM names without an alias: the table's
+/// full name, which a reference by its schema and name answers to. Such a reference's qualifier is
+/// the mark and the names before its column's, a database's among them where it writes one.
+pub(super) const TABLE: char = '\u{7}';
+
 /// A qualifier without its marks: the name of the relation it answers to.
 pub(super) fn unmarked(q: &str) -> &str {
-    q.trim_start_matches([MERGED, SCALAR, OUTER])
+    let q = q.trim_start_matches([MERGED, SCALAR, OUTER]);
+    q.split(TABLE).next().unwrap_or(q)
+}
+
+/// Whether a column of qualifier `q` answers to a reference's qualifier `want`: one by schema and
+/// name only where the column's relation is the table of that full name named without an alias,
+/// any other by the name its relation goes by.
+pub(super) fn answers_to(q: Option<&str>, want: &str) -> bool {
+    match want.strip_prefix(TABLE) {
+        Some(table) => q
+            .and_then(|q| q.split_once(TABLE))
+            .is_some_and(|(_, t)| t == table),
+        None => q.map(unmarked) == Some(want),
+    }
+}
+
+/// The relation a reference's qualifier names, as PostgreSQL's refusals name it: its last name.
+pub(super) fn relation_named(want: &str) -> &str {
+    let q = want.strip_prefix(TABLE).unwrap_or(want);
+    q.rsplit('.').next().unwrap_or(q)
+}
+
+/// The refusal of a reference by more names than a schema's and a table's before its column's, in
+/// PostgreSQL's words: a database's other than the file's, or more names still.
+pub(super) fn too_many_names(want: &str, name: &str) -> Option<Error> {
+    let names = want.strip_prefix(TABLE)?;
+    match names.split('.').count() {
+        0..=2 => None,
+        3 => Some(Error::new(format!(
+            "cross-database references are not implemented: {names}.{name}"
+        ))),
+        _ => Some(Error::new(format!(
+            "improper qualified name (too many dotted names): {names}.{name}"
+        ))),
+    }
 }
 
 /// How many queries out a column's relation stands.
@@ -1091,7 +1130,7 @@ pub(super) fn naming<'c>(
                 at(*q)
                     && *n == name
                     && match qualifier {
-                        Some(want) => q.map(unmarked) == Some(want),
+                        Some(want) => answers_to(*q, want),
                         None => !q.is_some_and(|q| q.trim_start_matches(OUTER).starts_with(MERGED)),
                     }
             })
@@ -1101,10 +1140,7 @@ pub(super) fn naming<'c>(
             return found;
         }
         if let Some(want) = qualifier {
-            if columns
-                .clone()
-                .any(|(q, _)| at(q) && q.map(unmarked) == Some(want))
-            {
+            if columns.clone().any(|(q, _)| at(q) && answers_to(q, want)) {
                 return found;
             }
             continue;
@@ -1126,14 +1162,31 @@ pub(super) fn naming<'c>(
     Vec::new()
 }
 
-/// The column an expression names, where it names one.
+/// The column an expression names, where it names one: by its name, its relation's and its own,
+/// or its table's schema and name and its own (`TABLE`), the file's database's name before them
+/// passed over.
 pub(super) fn column_of(e: &Expr) -> Option<(Option<String>, String)> {
     match e {
         Expr::Identifier(i) => Some((None, ident(i))),
         Expr::CompoundIdentifier(p) if p.len() == 2 => Some((Some(ident(&p[0])), ident(&p[1]))),
+        Expr::CompoundIdentifier(p) if p.len() > 2 => {
+            let names: Vec<String> = p.iter().map(ident).collect();
+            let (relation, column) = names.split_at(names.len() - 1);
+            Some((Some(qualified(relation)), column[0].clone()))
+        }
         Expr::Nested(e) => column_of(e),
         _ => None,
     }
+}
+
+/// The qualifier of a reference by a table's schema and name, the file's database's name before
+/// them passed over.
+pub(super) fn qualified(names: &[String]) -> String {
+    let names = match names {
+        [db, rest @ ..] if rest.len() == 2 && db == crate::pgcatalog::DATABASE => rest,
+        n => n,
+    };
+    format!("{TABLE}{}", names.join("."))
 }
 
 /// The aggregates and windows an expression holds, found once each, by their place in the text.
@@ -2285,6 +2338,7 @@ fn cast(
                 }
             }
         }
+        _ if super::prng::is_void(to) => super::prng::to_void(v)?,
         _ => match crate::catalog::held_type(to) {
             // text to regclass is regclass(text), which reads a name alone; a literal is read by
             // regclass's input.
@@ -5142,9 +5196,15 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     }
                 }
                 ("timezone", [zone, x]) => super::clock::at_zone(ev(x)?, ev(zone)?)?,
+                ("array_append" | "array_prepend" | "array_cat", [x, y]) => {
+                    array_joined(&name, (ev(x)?, x), (ev(y)?, y), frame.type_of(e))?
+                }
                 _ => {
                     let values = a.iter().map(|x| ev(x)).collect::<Result<Vec<_>>>()?;
                     if let Some(v) = super::sequences::call(&name, &values)? {
+                        return Ok(v);
+                    }
+                    if let Some(v) = super::prng::call(&name, &values, frame.type_of(e))? {
                         return Ok(v);
                     }
                     let types: Vec<Option<ColumnType>> =
@@ -5294,10 +5354,18 @@ fn typed_from(
             let Some((names, types)) = of else {
                 continue;
             };
-            let q = alias
-                .as_ref()
-                .map(|a| ident(&a.name))
-                .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+            // The table named without an alias answers by its schema and name too.
+            let base = (n == table || table.rsplit('.').next() == Some(n.as_str()))
+                && (!typed.contains_key(&n) || n == table);
+            let q = match alias {
+                Some(a) => ident(&a.name),
+                None if base => format!(
+                    "{}{TABLE}{}",
+                    n.rsplit('.').next().unwrap_or(&n),
+                    crate::oids::full(table)
+                ),
+                None => n.rsplit('.').next().unwrap_or(&n).to_string(),
+            };
             for (c, t) in names.iter().zip(types) {
                 out.push((Some(q.clone()), c.clone(), *t));
             }
@@ -5390,10 +5458,15 @@ fn from(
             TableFactor::Table { name, alias, .. } => {
                 let n = crate::catalog::object_name(name);
                 let r = relation(&n, steps, table)?.clone();
-                let q = alias
-                    .as_ref()
-                    .map(|a| ident(&a.name))
-                    .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+                let bare = n.rsplit('.').next().unwrap_or(&n).to_string();
+                // The table named without an alias answers by its schema and name too.
+                let q = match alias {
+                    Some(a) => ident(&a.name),
+                    None if !steps.contains_key(&n) => {
+                        format!("{bare}{TABLE}{}", crate::oids::full(&table.name))
+                    }
+                    None => bare,
+                };
                 parts.push((r, q));
                 Ok(())
             }
@@ -6456,15 +6529,26 @@ impl<'q> Prepared<'q> {
 }
 
 /// Whether an expression calls a function that moves a sequence or reads what the session drew,
-/// each volatile in PostgreSQL's catalog.
+/// or one that draws a random value or seeds the draws, each volatile in PostgreSQL's catalog.
 fn draws(e: &Expr) -> bool {
     let mut found = false;
     let _ = sqlparser::ast::visit_expressions(e, |x| {
         if let Expr::Function(f) = x {
-            found |= matches!(
-                function_name(f).as_str(),
-                "nextval" | "setval" | "currval" | "lastval"
-            );
+            let name = function_name(f);
+            found |= matches!(name.as_str(), "nextval" | "setval" | "currval" | "lastval")
+                || super::prng::is_drawing(&name);
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+/// Whether an expression draws a random value or seeds the draws.
+fn draws_at_random(e: &Expr) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_expressions(e, |x| {
+        if let Expr::Function(f) = x {
+            found |= super::prng::is_drawing(&function_name(f));
         }
         std::ops::ControlFlow::<()>::Continue(())
     });
@@ -7429,6 +7513,22 @@ pub(super) fn prepare<'q>(
             .collect(),
         false => Vec::new(),
     };
+    // Beside grouping, windows or a set the snail makes such an item before the sort, where
+    // PostgreSQL draws it after: a random draw there is refused, its values otherwise drawn in
+    // another order.
+    let made_before = grouped || !calls.windows.is_empty() || !calls.sets.is_empty();
+    if cuts && made_before {
+        if let Some((_, (e, _))) = items
+            .iter()
+            .enumerate()
+            .find(|(i, (e, _))| !sorted.contains(i) && draws_at_random(e))
+        {
+            return Err(Error::new(format!(
+                "{e} beside grouping, a window or a set-returning function, made after an ORDER BY \
+                 or a LIMIT, is not read"
+            )));
+        }
+    }
     // The deepest level makes the items where none of its sets stands inside an expression.
     let levels = calls.levels();
     let listed = || items.iter().map(|(e, _)| *e).chain(hidden.iter().copied());
@@ -7792,6 +7892,14 @@ struct Going {
 }
 
 impl Going {
+    /// Whether its LIMIT keeps no row past those it has, rows that come in their order.
+    fn ended(&mut self, p: &Prepared, frame: &Frame) -> Result<bool> {
+        if let (None, Some(l)) = (&self.cut, &p.limit) {
+            self.cut = Some(sorted::Cut::of(l, frame)?);
+        }
+        Ok(self.cut.as_ref().is_some_and(sorted::Cut::ended))
+    }
+
     /// Of rows the step returns, those to hand on now.
     fn take(
         &mut self,
@@ -7974,7 +8082,14 @@ impl<'q> StepRun<'q> {
             subqueries: self.subqueries,
         };
         let none = computed_none();
-        if let Some(w) = self.p.selection {
+        // A WHERE that draws is read a row at a time, each row it keeps made before the next is
+        // read, as PostgreSQL's scan reads its condition and then makes the row; where nothing
+        // sorts between, each row is handed on as it is made, and none is read past the last the
+        // LIMIT keeps.
+        let by_row = self.p.selection.filter(|w| {
+            draws(w) && !self.p.grouped && self.p.calls.windows.is_empty()
+        });
+        if let Some(w) = self.p.selection.filter(|_| by_row.is_none()) {
             let mut kept = Vec::with_capacity(rel.rows.len());
             for row in std::mem::take(&mut rel.rows) {
                 if holds(w, &row, &frame, &none)? == Some(true) {
@@ -8051,14 +8166,27 @@ impl<'q> StepRun<'q> {
             return Ok(None);
         }
         let per_row = windows(&self.p.calls.windows, &rel, &frame, &mut self.running)?;
+        let handed = by_row.is_some() && !self.going.sorts;
         let mut rows = Vec::with_capacity(rel.rows.len());
         for (row, w) in rel.rows.iter().zip(per_row) {
+            if let Some(sel) = by_row {
+                if handed && self.going.ended(&self.p, &frame)? {
+                    break;
+                }
+                if holds(sel, row, &frame, &none)? != Some(true) {
+                    continue;
+                }
+            }
             let computed = Computed {
                 calls: w,
                 bound: None,
                 _q: std::marker::PhantomData,
             };
-            rows.extend(self.p.project(row, &frame, computed)?);
+            let made = self.p.project(row, &frame, computed)?;
+            match handed {
+                true => rows.extend(self.going.take(&self.p, &frame, made)?),
+                false => rows.extend(made),
+            }
         }
         // The order holds where an item is the column that held it, and no set repeats a row.
         let order = rel
@@ -8070,7 +8198,10 @@ impl<'q> StepRun<'q> {
                 })
             });
         let names = self.names();
-        let rows = self.going.take(&self.p, &frame, rows)?;
+        let rows = match handed {
+            true => rows,
+            false => self.going.take(&self.p, &frame, rows)?,
+        };
         self.columns = frame.columns;
         if self.going.sorts {
             return Ok(None);
@@ -10370,6 +10501,50 @@ fn array_of_vector(v: &Value, other: Option<ColumnType>) -> Value {
 /// `&&`; a range's `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`, `+`, `*` and `-`, beside a
 /// range or, for `@>` and `<@`, an element of its subtype; a multirange's, beside a multirange, a
 /// range or an element, `+`, `*` and `-` beside a multirange. None where neither side is composed.
+/// array_append, array_prepend and array_cat in the array type the step resolved them to, as `||`
+/// joins an element or an array: each array read as that type, each element as its element type, a
+/// quoted literal by its input. array_cat of two NULLs is NULL.
+fn array_joined(
+    name: &str,
+    (x, left): (Value, &Expr),
+    (y, right): (Value, &Expr),
+    ty: Option<ColumnType>,
+) -> Result<Value> {
+    let element = ty.and_then(super::typed::element_of);
+    let (Some(ty), Some(element)) = (ty, element) else {
+        return Err(Error::new(format!(
+            "{name}: the type of its arguments is not read"
+        )));
+    };
+    let whole = |v: Value, e: &Expr| -> Result<Option<crate::composed::Item>> {
+        Ok(match v.is_null() {
+            true => None,
+            false => Some(part_of(ty, v, quoted(e))?),
+        })
+    };
+    let joined = match name {
+        "array_append" => crate::composed::concat(
+            ty,
+            whole(x, left)?.as_ref(),
+            Some(&part_of(element, y, quoted(right))?),
+            false,
+            true,
+        )?,
+        "array_prepend" => crate::composed::concat(
+            ty,
+            Some(&part_of(element, x, quoted(left))?),
+            whole(y, right)?.as_ref(),
+            true,
+            false,
+        )?,
+        _ => match (whole(x, left)?, whole(y, right)?) {
+            (None, None) => return Ok(Value::Null),
+            (a, b) => crate::composed::concat(ty, a.as_ref(), b.as_ref(), false, false)?,
+        },
+    };
+    Ok(composed(ty, joined))
+}
+
 fn composed_op(
     op: &BinaryOperator,
     x: &Value,

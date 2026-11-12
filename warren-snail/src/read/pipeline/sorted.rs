@@ -594,6 +594,9 @@ pub(super) struct Cut {
     left: Option<u64>,
     ties: bool,
     last: Option<Vec<Value>>,
+    /// Whether it reads no more rows: a count of none, which reads none, its OFFSET's neither; or
+    /// a row past its count found not to tie.
+    ended: bool,
 }
 
 impl Cut {
@@ -628,6 +631,7 @@ impl Cut {
             left,
             ties: limit.ties,
             last: None,
+            ended: left == Some(0),
         })
     }
 
@@ -636,8 +640,14 @@ impl Cut {
         self.left.map(|n| n.saturating_add(self.skip))
     }
 
+    /// Whether it reads no row past those it has read.
+    pub(super) fn ended(&self) -> bool {
+        self.ended || (self.skip == 0 && self.left == Some(0) && !self.ties)
+    }
+
     /// Of `rows` as they come, with the values each sorts by where it keeps ties, those it keeps;
-    /// `each` made of every row it reaches in their order, those its OFFSET passes over among them.
+    /// `each` made of every row it reaches in their order, those its OFFSET passes over among them
+    /// and, where it keeps ties, the first past its count, made before it is found to tie or not.
     pub(super) fn take(
         &mut self,
         rows: Vec<Vec<Value>>,
@@ -646,21 +656,32 @@ impl Cut {
     ) -> Result<Vec<Vec<Value>>> {
         let mut out = Vec::new();
         for (i, mut row) in rows.into_iter().enumerate() {
+            if self.ended {
+                break;
+            }
             if self.skip > 0 {
                 each(&mut row)?;
                 self.skip -= 1;
                 continue;
             }
             match self.left {
+                Some(0) if !self.ties => {
+                    self.ended = true;
+                    break;
+                }
                 Some(0) => {
+                    each(&mut row)?;
                     let with = self
                         .last
                         .as_ref()
                         .zip(keys.get(i))
-                        .is_some_and(|(a, b)| self.ties && tie(a, b));
+                        .is_some_and(|(a, b)| tie(a, b));
                     if !with {
+                        self.ended = true;
                         break;
                     }
+                    out.push(row);
+                    continue;
                 }
                 Some(n) => self.left = Some(n - 1),
                 None => {}

@@ -333,6 +333,7 @@ pub fn type_named(named: &str) -> Option<ColumnType> {
         "bpchar" => ColumnType::Bpchar(None),
         "name" => ColumnType::Name,
         "bit varying" => ColumnType::Varbit(None),
+        "void" => ColumnType::Internal(crate::textual::Internal::Void),
         n => {
             if let Some(t) = crate::textual::Textual::of_type_name(n) {
                 return Some(ColumnType::Textual(t));

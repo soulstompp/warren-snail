@@ -2736,30 +2736,67 @@ pub fn shape(
         Expr::Nested(e) => shape(e, table, alias, columns, functions, collations, env),
         Expr::Identifier(i) => column(&ident(i)),
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-            let qualifier = parts[..parts.len() - 1]
-                .iter()
-                .map(ident)
-                .collect::<Vec<_>>()
-                .join(".");
-            let name = ident(&parts[parts.len() - 1]);
-            // An alias hides the table's own name, as PostgreSQL reads it.
-            let named = match alias {
-                Some(a) => qualifier == a,
-                None => qualifier == bare || qualifier == table,
+            let mut names: Vec<String> = parts.iter().map(ident).collect();
+            let name = names.pop().expect("a column's name");
+            // A database's name before a schema's names the file's alone; more names are refused.
+            let written = || format!("{}.{name}", names.join("."));
+            match names.len() {
+                3 if names[0] == crate::pgcatalog::DATABASE => {
+                    names.remove(0);
+                }
+                3 => {
+                    return Err(Error::new(format!(
+                        "cross-database references are not implemented: {}",
+                        written()
+                    )))
+                }
+                n if n > 3 => {
+                    return Err(Error::new(format!(
+                        "improper qualified name (too many dotted names): {}",
+                        written()
+                    )))
+                }
+                _ => {}
+            }
+            let qualifier = names.join(".");
+            let by_schema = names.len() == 2;
+            // An alias hides the table's own name, as PostgreSQL reads it, and a table named by
+            // its schema is found only where no alias names it.
+            let named = match (alias, by_schema) {
+                (Some(a), false) => qualifier == a,
+                (Some(_), true) => false,
+                (None, false) => qualifier == bare,
+                (None, true) => crate::oids::full(table) == qualifier,
+            };
+            let finds = match by_schema {
+                true => crate::oids::full(table) == qualifier,
+                false => found_by_qualifier(table, &qualifier),
             };
             // Refused in PostgreSQL's words, the relation named by its own part: the table where an
-            // alias hides the name that finds it, or a name of no relation the statement reads.
-            let relation = ident(&parts[parts.len() - 2]);
-            if named {
-                column(&name)
-            } else if alias.is_some() && found_by_qualifier(table, &qualifier) {
+            // alias hides the name that finds it, an alias of another name in a HINT; a relation
+            // going by the name a reference by schema writes last; else a name of no relation the
+            // statement reads.
+            let relation = names.last().expect("a relation's name").clone();
+            let entry = |found: &str| {
                 Err(Error::new(format!(
-                    "invalid reference to FROM-clause entry for table \"{relation}\""
+                    "invalid reference to FROM-clause entry for table \"{relation}\": There is an \
+                     entry for table \"{found}\", but it cannot be referenced from this part of \
+                     the query."
                 )))
-            } else {
-                Err(Error::new(format!(
+            };
+            match alias {
+                _ if named => column(&name).map_err(|_| {
+                    Error::new(format!("column {relation}.{name} does not exist"))
+                }),
+                Some(a) if finds && a != relation => Err(Error::new(format!(
+                    "invalid reference to FROM-clause entry for table \"{relation}\"\nHINT:  \
+                     Perhaps you meant to reference the table alias \"{a}\"."
+                ))),
+                Some(a) if finds => entry(a),
+                a if by_schema && a.unwrap_or(bare) == relation => entry(&relation),
+                _ => Err(Error::new(format!(
                     "missing FROM-clause entry for table \"{relation}\""
-                )))
+                ))),
             }
         }
         Expr::Collate { expr, collation } => {

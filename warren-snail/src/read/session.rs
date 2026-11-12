@@ -289,7 +289,7 @@ fn parse_setting(tokens: &[sqlparser::tokenizer::Token], release: u8) -> Option<
                 },
                 ("SEED", _) => refused(
                     "SET SEED",
-                    "the snail's random() draws from no seed a session sets",
+                    "the snail seeds random() by setseed() alone",
                 ),
                 _ => {
                     let (name, j) = match setting_name(&w, i, release) {

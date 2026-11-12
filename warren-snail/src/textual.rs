@@ -124,9 +124,13 @@ pub enum Internal {
     BrinBloomSummary,
     /// pg_brin_minmax_multi_summary: a BRIN minmax-multi range's summary; NULL only in a table.
     BrinMinmaxMultiSummary,
+    /// void: what a function of no value answers, written as nothing; a pseudo-type, which no
+    /// table holds.
+    Void,
 }
 
 impl Internal {
+    /// Those a table's column may be of.
     pub const ALL: [Internal; 7] = [
         Internal::NodeTree,
         Internal::Ndistinct,
@@ -147,6 +151,7 @@ impl Internal {
             Internal::Gtsvector => "gtsvector",
             Internal::BrinBloomSummary => "pg_brin_bloom_summary",
             Internal::BrinMinmaxMultiSummary => "pg_brin_minmax_multi_summary",
+            Internal::Void => "void",
         }
     }
 
@@ -156,7 +161,7 @@ impl Internal {
 
     /// Whether its values are bytes, compared as bytea's, rather than text.
     pub fn is_bytes(self) -> bool {
-        !matches!(self, Internal::NodeTree)
+        !matches!(self, Internal::NodeTree | Internal::Void)
     }
 
     /// Whether PostgreSQL casts it implicitly to text, through its output, and to bytea, as its

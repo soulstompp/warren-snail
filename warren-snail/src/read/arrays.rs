@@ -100,6 +100,33 @@ pub(super) fn typed(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Op
         {
             array
         }
+        // An element put after or before an array, or two arrays joined: the array of the common
+        // type of the elements, as anycompatiblearray and anycompatible find it.
+        "array_append" | "array_prepend" | "array_cat" if args.len() == 2 => {
+            let (whole, other) = match name {
+                "array_prepend" => (args[1], args[0]),
+                _ => (args[0], args[1]),
+            };
+            let elements = |t: Option<ColumnType>| match t {
+                None => Ok(None),
+                Some(t) => element_of(t).map(Some).ok_or(()),
+            };
+            let Ok(of_whole) = elements(whole) else {
+                return no_form();
+            };
+            let of_other = match name {
+                "array_cat" => match elements(other) {
+                    Ok(e) => e,
+                    Err(()) => return no_form(),
+                },
+                _ => other,
+            };
+            match super::typed::common_type(&[of_whole, of_other], name) {
+                Ok(t) => Some(array_of(t)),
+                Err(_) => return no_form(),
+            }
+        }
+        "array_append" | "array_prepend" | "array_cat" => return no_form(),
         "width_bucket" if args.len() == 2 => int4,
         _ if is_array_function(name) => return no_form(),
         _ => return Ok(None),

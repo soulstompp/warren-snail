@@ -409,7 +409,8 @@ impl Typing<'_> {
                 let to = crate::catalog::held_type(data_type)
                     .ok()
                     .or_else(|| crate::composed::resolve(data_type))
-                    .or_else(|| super::handed::domain_named(data_type).and_then(|(d, _)| d.base_type));
+                    .or_else(|| super::handed::domain_named(data_type).and_then(|(d, _)| d.base_type))
+                    .or_else(|| super::prng::is_void(data_type).then_some(super::prng::VOID));
                 if to != from && to != Some(ColumnType::Bytes) {
                     written(from)?;
                 }
@@ -1221,6 +1222,28 @@ pub(super) fn numbers(
         | "dround" | "dtrunc" | "dexp" | "dlog1" | "dlog10" => return doubles(1),
         "atan2" | "atan2d" => return doubles(2),
         "pi" | "random" if args.is_empty() => Some(Some(C::Float8)),
+        // random's forms of two integers, two bigints and two numerics, found as gcd's are.
+        "random" if args.len() == 2 => match a.as_slice() {
+            [Arg::Unknown, Arg::Unknown]
+            | [Arg::Int(C::Int2), Arg::Int(C::Int2) | Arg::Unknown]
+            | [Arg::Unknown, Arg::Int(C::Int2)] => {
+                return Err(Error::new(format!(
+                    "function {name}({}, {}) is not unique",
+                    arg_name(args[0]),
+                    arg_name(args[1])
+                )))
+            }
+            [Arg::Int(x), Arg::Int(y)] => Some(Some(wider(*x, *y).max_int4())),
+            [Arg::Int(x), Arg::Unknown] | [Arg::Unknown, Arg::Int(x)] => Some(Some(x.max_int4())),
+            [Arg::Numeric, Arg::Int(_) | Arg::Numeric | Arg::Unknown]
+            | [Arg::Int(_) | Arg::Unknown, Arg::Numeric] => Some(Some(NUMERIC)),
+            _ => return refused(),
+        },
+        "random_normal" if args.len() <= 2 => return doubles(args.len()),
+        "setseed" if args.len() == 1 && a.iter().all(numberish) => {
+            Some(Some(C::Internal(crate::textual::Internal::Void)))
+        }
+        "random" | "random_normal" | "setseed" => return refused(),
         "ceil" | "ceiling" | "floor" | "sign" | "sqrt" | "exp" | "ln" | "log10" => {
             return either(1)
         }

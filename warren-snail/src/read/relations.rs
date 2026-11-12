@@ -1381,7 +1381,9 @@ enum Kind {
 }
 
 /// A column of a FROM: the name of the relation it answers to, marked where a USING or NATURAL
-/// join merged it away from a bare name, its own name, its type and the collation it carries.
+/// join merged it away from a bare name, and followed by its table's full name where the FROM
+/// names the table without an alias (`pipeline::TABLE`); its own name, its type and the collation
+/// it carries.
 #[derive(Clone, Debug)]
 pub(super) struct Col {
     pub(super) qualifier: Option<String>,
@@ -1410,10 +1412,12 @@ struct Node {
 }
 
 enum What {
-    /// A table of the snail, by its place in the catalog, and the TABLESAMPLE it is read under.
+    /// A table of the snail, by its place in the catalog, whether the FROM names it with an alias,
+    /// and the TABLESAMPLE it is read under.
     Table {
         table: usize,
         qualifier: String,
+        aliased: bool,
         sample: Option<String>,
     },
     /// A step made before.
@@ -1508,9 +1512,17 @@ impl From {
     /// subquery written without an alias, here or in a query around it, or a relation inside a join
     /// its alias hides, or one laid before it in a FROM it was lifted out of, or one of the query
     /// around it laid before the join whose ON holds it, each of these four with the entry it
-    /// found; else a missing entry.
+    /// found; else, for a reference by schema and name, an invalid reference where a relation goes
+    /// by its name, with that entry; else a missing entry. A relation its alias hides is named in
+    /// a HINT where the alias is another name, else as the entry found.
     fn no_entry(&self, catalog: &Catalog, q: &str) -> Error {
-        let relation = q.rsplit('.').next().unwrap_or(q);
+        let relation = pipeline::relation_named(q);
+        // A reference by schema and name finds the table of that full name alone.
+        let by_schema = q.strip_prefix(pipeline::TABLE);
+        let finds = |table: &str| match by_schema {
+            Some(full) => crate::oids::full(table) == full,
+            None => crate::catalog::found_by_qualifier(table, q),
+        };
         let entry = |name: &str| {
             Error::new(format!(
                 "invalid reference to FROM-clause entry for table \"{relation}\": There is an \
@@ -1531,33 +1543,37 @@ impl From {
         for n in &self.items {
             n.leaves(&mut leaves);
         }
-        let hidden = leaves.iter().any(|l| match &l.what {
+        let hidden = leaves.iter().find_map(|l| match &l.what {
             What::Table {
                 table, qualifier, ..
-            } => {
-                let name = &catalog.tables[*table].name;
-                qualifier != q && crate::catalog::found_by_qualifier(name, q)
+            } => (qualifier != q && finds(&catalog.tables[*table].name)).then_some(qualifier),
+            What::Made { name, qualifier } => {
+                (qualifier != q && by_schema.is_none() && apart::written(name) == q)
+                    .then_some(qualifier)
             }
-            What::Made { name, qualifier } => qualifier != q && apart::written(name) == q,
-            _ => false,
+            _ => None,
         });
-        if hidden {
-            return Error::new(format!(
-                "invalid reference to FROM-clause entry for table \"{relation}\""
-            ));
+        match hidden {
+            Some(alias) if alias == relation => return entry(alias),
+            Some(alias) => {
+                return Error::new(format!(
+                    "invalid reference to FROM-clause entry for table \"{relation}\"\nHINT:  \
+                     Perhaps you meant to reference the table alias \"{alias}\"."
+                ))
+            }
+            None => {}
         }
         let inside = self.hidden.iter().find(|(name, table)| {
-            name == q
-                || table
-                    .as_deref()
-                    .is_some_and(|t| crate::catalog::found_by_qualifier(t, q))
+            name == q || table.as_deref().is_some_and(finds)
         });
-        let laid = self.laid.iter().find(|l| {
-            l.name == q
-                || l.table
-                    .as_deref()
-                    .is_some_and(|t| crate::catalog::found_by_qualifier(t, q))
-        });
+        let laid = self
+            .laid
+            .iter()
+            .find(|l| l.name == q || l.table.as_deref().is_some_and(finds));
+        let goes_by = by_schema.is_some()
+            && leaves
+                .iter()
+                .any(|l| l.leaf_named() == Some(relation));
         match (inside, laid) {
             (Some((name, _)), _) => entry(name),
             (None, Some(l)) if l.lateral => Error::new(format!(
@@ -1565,7 +1581,9 @@ impl From {
                 entry(&l.name)
             )),
             (None, Some(l)) => entry(&l.name),
-            (None, None) if self.unseen.iter().any(|u| u == relation) => entry(relation),
+            (None, None) if goes_by || self.unseen.iter().any(|u| u == relation) => {
+                entry(relation)
+            }
             (None, None) => Error::new(format!(
                 "missing FROM-clause entry for table \"{relation}\""
             )),
@@ -1576,6 +1594,10 @@ impl From {
     /// it has one, in PostgreSQL's words: where tables laid before it in a FROM it was lifted out of
     /// (of that name, where qualified) hold a column of that name, that it cannot be read from here.
     fn no_column(&self, catalog: &Catalog, q: Option<&str>, n: &str) -> Error {
+        let q = q.map(|q| match q.starts_with(pipeline::TABLE) {
+            true => pipeline::relation_named(q),
+            false => q,
+        });
         let missing = match q {
             Some(q) => format!("column {q}.{n} does not exist"),
             None => format!("column \"{n}\" does not exist"),
@@ -1727,11 +1749,16 @@ impl Laying<'_> {
             let ti = table_of(self.catalog, &n)?;
             let table = &self.catalog.tables[ti];
             let q = qualifier(&table.name);
+            // A table named without an alias answers by its schema and name too.
+            let marked = match alias {
+                None => format!("{q}{}{}", pipeline::TABLE, crate::oids::full(&table.name)),
+                Some(_) => q.clone(),
+            };
             let carried = Casings::of_table(table, &self.catalog.collations);
             let carried = carried.relation(&table.name).unwrap_or_default();
             let cols = stored(table)
                 .map(|c| Col {
-                    qualifier: Some(q.clone()),
+                    qualifier: Some(marked.clone()),
                     name: table.columns[c].name.clone(),
                     ty: Some(table.columns[c].ty),
                     carried: carried
@@ -1744,6 +1771,7 @@ impl Laying<'_> {
                 What::Table {
                     table: ti,
                     qualifier: q,
+                    aliased: alias.is_some(),
                     sample: sample.as_ref().map(|k| match k {
                         sqlparser::ast::TableSampleKind::AfterTableAlias(s)
                         | sqlparser::ast::TableSampleKind::BeforeTableAlias(s) => s.to_string(),
@@ -1766,7 +1794,24 @@ impl Laying<'_> {
         }
         let starred = cols.len();
         // A table's system columns, past its own, in no star.
-        if let (true, What::Table { qualifier, .. }) = (self.systems, &what) {
+        if let (
+            true,
+            What::Table {
+                table,
+                qualifier,
+                aliased,
+                ..
+            },
+        ) = (self.systems, &what)
+        {
+            let qualifier = match aliased {
+                false => format!(
+                    "{qualifier}{}{}",
+                    pipeline::TABLE,
+                    crate::oids::full(&self.catalog.tables[*table].name)
+                ),
+                true => qualifier.clone(),
+            };
             for (name, ty) in [("ctid", ColumnType::Tid), ("tableoid", ColumnType::Oid)] {
                 cols.push(Col {
                     qualifier: Some(qualifier.clone()),
@@ -3053,9 +3098,11 @@ impl Reading<'_> {
         let catalog = self.reads.catalog();
         let t = &catalog.tables[table];
         // A sample is drawn from the whole table: no condition, key or strand narrows its read.
-        let sample = match &node.what {
-            What::Table { sample, .. } => sample.clone(),
-            _ => None,
+        let (sample, aliased) = match &node.what {
+            What::Table {
+                sample, aliased, ..
+            } => (sample.clone(), *aliased),
+            _ => (None, true),
         };
         let keep = match sample {
             Some(_) => None,
@@ -3083,9 +3130,14 @@ impl Reading<'_> {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        // A table named without an alias is read so, its conditions naming it by its schema too.
+        let named = match aliased {
+            true => format!("{} {}", quote_name(&t.name), quote(qualifier)),
+            false => quote_name(&t.name),
+        };
         let from = match &sample {
-            Some(s) => format!("{} {} {s}", quote_name(&t.name), quote(qualifier)),
-            None => format!("{} {}", quote_name(&t.name), quote(qualifier)),
+            Some(s) => format!("{named} {s}"),
+            None => named,
         };
         let conds: Vec<&Expr> = match preserved && sample.is_none() {
             true => self.own_wheres(node),
@@ -3349,11 +3401,17 @@ impl Reading<'_> {
     fn written(&self, node: &Node, _first: bool) -> Result<Option<String>> {
         let catalog = self.reads.catalog();
         Ok(Some(match &node.what {
-            What::Table { table, qualifier, .. } => format!(
+            What::Table {
+                table,
+                qualifier,
+                aliased: true,
+                ..
+            } => format!(
                 "{} {}",
                 quote_name(&catalog.tables[*table].name),
                 quote(qualifier)
             ),
+            What::Table { table, .. } => quote_name(&catalog.tables[*table].name),
             What::Join {
                 left,
                 right,
@@ -3677,18 +3735,41 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> 
                     return Err(Error::new(format!("{kind}.* {o} is not read")));
                 }
                 let q = match &kind {
+                    sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n)
+                        if n.0.len() > 1 =>
+                    {
+                        let names: Vec<String> = crate::catalog::object_name(n)
+                            .split('.')
+                            .map(str::to_string)
+                            .collect();
+                        pipeline::qualified(&names)
+                    }
                     sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n) => {
                         crate::catalog::object_name(n)
                     }
                     other => return Err(Error::new(format!("{other}.* is not read"))),
                 };
+                if let Some(e) = pipeline::too_many_names(&q, "*") {
+                    return Err(e);
+                }
                 let mut leaves = Vec::new();
                 for n in &from.items {
                     n.leaves(&mut leaves);
                 }
                 let found = leaves
                     .iter()
-                    .find(|l| l.leaf_named() == Some(q.as_str()))
+                    .find(|l| match (&l.what, q.strip_prefix(pipeline::TABLE)) {
+                        (
+                            What::Table {
+                                table,
+                                aliased: false,
+                                ..
+                            },
+                            Some(full),
+                        ) => crate::oids::full(&catalog.tables[*table].name) == full,
+                        (_, Some(_)) => false,
+                        (_, None) => l.leaf_named() == Some(q.as_str()),
+                    })
                     .ok_or_else(|| from.no_entry(catalog, &q))?;
                 out.extend(by_place(found.star.clone()));
             }
@@ -5142,12 +5223,16 @@ fn select_step(
                 )));
             }
         }
+        if let Some(e) = q.as_deref().and_then(|q| pipeline::too_many_names(q, &n)) {
+            return Err(e);
+        }
         match (found.len(), q) {
             (1, _) => {}
             (0, Some(q))
-                if !from.columns.iter().any(|c| {
-                    c.qualifier.as_deref().map(pipeline::unmarked) == Some(q.as_str())
-                }) =>
+                if !from
+                    .columns
+                    .iter()
+                    .any(|c| pipeline::answers_to(c.qualifier.as_deref(), &q)) =>
             {
                 return Err(from.no_entry(catalog, &q))
             }
