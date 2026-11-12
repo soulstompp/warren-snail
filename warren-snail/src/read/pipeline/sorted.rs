@@ -635,6 +635,35 @@ impl Cut {
         })
     }
 
+    /// Whether it reads one row more, as PostgreSQL's Limit asks the node beneath it for one: until
+    /// its count is reached, and past it where it keeps ties, until a row does not tie.
+    pub(super) fn wants(&self) -> bool {
+        !self.ended && (self.ties || self.left != Some(0))
+    }
+
+    /// A row it read, made where `wants` said, sorting by `key`: passed over within its OFFSET,
+    /// kept within its count or where it ties with the last kept, else the last it reads.
+    pub(super) fn offer(&mut self, row: Vec<Value>, key: &[Value], out: &mut Vec<Vec<Value>>) {
+        if self.skip > 0 {
+            self.skip -= 1;
+            return;
+        }
+        match self.left {
+            Some(0) => {
+                if !self.last.as_deref().is_some_and(|l| tie(l, key)) {
+                    self.ended = true;
+                    return;
+                }
+            }
+            Some(n) => self.left = Some(n - 1),
+            None => {}
+        }
+        if self.ties {
+            self.last = Some(key.to_vec());
+        }
+        out.push(row);
+    }
+
     /// The rows as they come it reaches: its OFFSET's and its count; none where it has no count.
     pub(super) fn reached(&self) -> Option<u64> {
         self.left.map(|n| n.saturating_add(self.skip))
@@ -643,55 +672,5 @@ impl Cut {
     /// Whether it reads no row past those it has read.
     pub(super) fn ended(&self) -> bool {
         self.ended || (self.skip == 0 && self.left == Some(0) && !self.ties)
-    }
-
-    /// Of `rows` as they come, with the values each sorts by where it keeps ties, those it keeps;
-    /// `each` made of every row it reaches in their order, those its OFFSET passes over among them
-    /// and, where it keeps ties, the first past its count, made before it is found to tie or not.
-    pub(super) fn take(
-        &mut self,
-        rows: Vec<Vec<Value>>,
-        keys: &[Vec<Value>],
-        each: &mut dyn FnMut(&mut Vec<Value>) -> Result<()>,
-    ) -> Result<Vec<Vec<Value>>> {
-        let mut out = Vec::new();
-        for (i, mut row) in rows.into_iter().enumerate() {
-            if self.ended {
-                break;
-            }
-            if self.skip > 0 {
-                each(&mut row)?;
-                self.skip -= 1;
-                continue;
-            }
-            match self.left {
-                Some(0) if !self.ties => {
-                    self.ended = true;
-                    break;
-                }
-                Some(0) => {
-                    each(&mut row)?;
-                    let with = self
-                        .last
-                        .as_ref()
-                        .zip(keys.get(i))
-                        .is_some_and(|(a, b)| tie(a, b));
-                    if !with {
-                        self.ended = true;
-                        break;
-                    }
-                    out.push(row);
-                    continue;
-                }
-                Some(n) => self.left = Some(n - 1),
-                None => {}
-            }
-            if self.ties {
-                self.last = keys.get(i).cloned();
-            }
-            each(&mut row)?;
-            out.push(row);
-        }
-        Ok(out)
     }
 }

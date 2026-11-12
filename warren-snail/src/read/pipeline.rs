@@ -488,6 +488,19 @@ pub(super) struct Frame<'a> {
     pub(super) now: i64,
     /// What answers the step's subqueries, where it has any.
     pub(super) subqueries: Option<&'a dyn Subqueries>,
+    /// The values a step makes below its fold and its windows, where it makes any (`Below`).
+    pub(super) below: Option<&'a Below>,
+}
+
+/// The expressions a step makes below its fold and its windows, a GROUP BY's, a PARTITION BY's or
+/// a window ORDER BY's holding a set-returning call: each row of its FROM made once for each value
+/// their sets give, in levels and in lockstep, each expression's value after the FROM's columns.
+/// `at` is each expression read from them, by its place in the text, and the value it reads; `n`
+/// how many there are.
+#[derive(Default)]
+pub(super) struct Below {
+    at: Vec<(*const Expr, usize)>,
+    n: usize,
 }
 
 /// What answers a subquery an expression holds (a scalar subquery, EXISTS, IN, ANY or ALL over
@@ -1197,6 +1210,9 @@ struct Calls<'q> {
     windows: Vec<&'q Expr>,
     /// The set-returning calls of its select list.
     sets: Vec<&'q Expr>,
+    /// The expressions it does not look inside, by their place in the text: those a step makes
+    /// below its fold (`Below`).
+    stops: Vec<*const Expr>,
 }
 
 const AGGREGATES: [&str; 37] = [
@@ -1269,11 +1285,7 @@ pub(super) fn aggregates(s: &sqlparser::ast::Select) -> bool {
 /// Whether an expression calls an aggregate, a window function or a set-returning function, as a
 /// step reads its calls.
 pub(super) fn calls_in(e: &Expr) -> (bool, bool, bool) {
-    let mut c = Calls {
-        aggregates: Vec::new(),
-        windows: Vec::new(),
-        sets: Vec::new(),
-    };
+    let mut c = Calls::default();
     find_calls(e, &mut c);
     (
         !c.aggregates.is_empty(),
@@ -1325,6 +1337,9 @@ pub(super) fn no_own_calls(
 }
 
 fn find_calls<'q>(e: &'q Expr, out: &mut Calls<'q>) {
+    if out.stops.iter().any(|&s| std::ptr::eq(s, e)) {
+        return;
+    }
     match e {
         Expr::Function(f) => {
             if f.over.is_some() {
@@ -1415,7 +1430,7 @@ impl<'q> Calls<'q> {
     fn levels(&self) -> Vec<Vec<&'q Expr>> {
         let mut levels: Vec<Vec<&'q Expr>> = Vec::new();
         for &s in &self.sets {
-            let at = depth(s);
+            let at = depth(s, &self.stops);
             if levels.len() < at {
                 levels.resize(at, Vec::new());
             }
@@ -1449,10 +1464,15 @@ fn is_set_call(e: &Expr) -> bool {
 }
 
 /// The level of an expression's deepest set-returning call: 0 where it calls none, 1 for a call
-/// holding none among its arguments, and one more than the deepest among them for any other.
-fn depth(e: &Expr) -> usize {
-    let mut inner = Calls::default();
+/// holding none among its arguments, and one more than the deepest among them for any other; the
+/// calls inside `stops` none of its own.
+fn depth(e: &Expr, stops: &[*const Expr]) -> usize {
+    let mut inner = Calls {
+        stops: stops.to_vec(),
+        ..Calls::default()
+    };
     match e {
+        _ if stops.iter().any(|&s| std::ptr::eq(s, e)) => 0,
         Expr::Function(f) if is_set_call(e) => {
             if let FunctionArguments::List(l) = &f.args {
                 for a in &l.args {
@@ -1461,11 +1481,11 @@ fn depth(e: &Expr) -> usize {
                     }
                 }
             }
-            1 + inner.sets.iter().map(|&s| depth(s)).max().unwrap_or(0)
+            1 + inner.sets.iter().map(|&s| depth(s, stops)).max().unwrap_or(0)
         }
         _ => {
             find_calls(e, &mut inner);
-            inner.sets.iter().map(|&s| depth(s)).max().unwrap_or(0)
+            inner.sets.iter().map(|&s| depth(s, stops)).max().unwrap_or(0)
         }
     }
 }
@@ -4200,6 +4220,12 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
     if let Some(v) = computed.bound.and_then(|b| b(e)) {
         return v;
     }
+    // A value made below the fold, on a row that carries it.
+    if let Some(b) = frame.below.filter(|b| b.n > 0 && row.len() == frame.columns.len() + b.n) {
+        if let Some(&(_, k)) = b.at.iter().find(|(p, _)| std::ptr::eq(*p, e)) {
+            return Ok(row[frame.columns.len() + k].clone());
+        }
+    }
     if is_subquery(e) {
         return match frame.subqueries {
             Some(s) => s.value(e, row, frame, computed),
@@ -6551,16 +6577,24 @@ pub(super) struct Prepared<'q> {
     sorted: Vec<usize>,
     hidden: Vec<&'q Expr>,
     items: Vec<(&'q Expr, String)>,
-    /// The items that draw from a sequence in a step that sorts or cuts its rows: each made once
-    /// the rows are sorted, for each row the cut reaches, from the row it came from, carried after
-    /// the ORDER BY's values until then.
+    /// The items made after the sort in a step that sorts or cuts its rows: those that draw from a
+    /// sequence, and where `late_sets`, those holding a set. Each is made once the rows are sorted,
+    /// for each row the cut reaches, from the row it came from and its aggregates' and windows'
+    /// values, carried after the ORDER BY's values until then.
     drawn: Vec<usize>,
+    /// Whether its select list's sets are made after the sort, each carried row becoming their rows.
+    late_sets: bool,
     calls: Calls<'q>,
     /// Its select list's set-returning calls by level, as `project` makes them.
     levels: Vec<Vec<&'q Expr>>,
     /// Whether each set of the deepest level is an item, or an ORDER BY item, by itself: the items
     /// are then made beside them, and once more in the pass that finds every one ended.
     ends: bool,
+    /// What it makes below its fold and its windows (`Below`): the expressions, their sets by level,
+    /// and where each is read.
+    below_exprs: Vec<&'q Expr>,
+    below_levels: Vec<Vec<&'q Expr>>,
+    pub(super) below: Below,
     grouping: Vec<&'q Expr>,
     grouped: bool,
     /// Whether it returns each row once (SELECT DISTINCT).
@@ -6649,110 +6683,295 @@ impl<'q> Prepared<'q> {
             .collect()
     }
 
+    /// The rows a row of its FROM becomes below its fold and its windows (`Below`): one for each
+    /// value its sets there give, in levels and in lockstep, each with the expressions' values after
+    /// the FROM's columns; none where a level gives none.
+    fn below_rows(&self, row: Vec<Value>, frame: &Frame, out: &mut Vec<Vec<Value>>) -> Result<()> {
+        each_level(&self.below_levels, &row, frame, &computed_none(), &mut |c| {
+            let mut r = row.clone();
+            for &e in &self.below_exprs {
+                r.push(eval(e, &row, frame, c)?);
+            }
+            out.push(r);
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
     /// The rows its select list makes of one row, each with its ORDER BY's expressions after them:
     /// one, or, where it calls set-returning functions, those its levels make, as PostgreSQL's
     /// ProjectSet makes them. Each level's sets are made over each row of the level beneath, the
     /// first's over the row itself, in lockstep (`zipped`); the items are made over the deepest
     /// level's rows, or beside its sets where it makes them (`passes`).
     fn project(&self, row: &[Value], frame: &Frame, computed: Computed) -> Result<Vec<Vec<Value>>> {
+        // An item made after the sort is NULL until then.
+        let before = |i: usize, e: &Expr, c: &Computed| match self.drawn.contains(&i) {
+            true => Ok(Value::Null),
+            false => eval(e, row, frame, c),
+        };
         let one = |c: &Computed| {
-            self.items
-                .iter()
-                .map(|(e, _)| *e)
-                .chain(self.hidden.iter().copied())
+            self.listed()
+                .into_iter()
                 .enumerate()
-                .map(|(i, e)| match self.drawn.contains(&i) {
-                    true => Ok(Value::Null),
-                    false => eval(e, row, frame, c),
-                })
+                .map(|(i, e)| before(i, e, c))
                 .collect::<Result<Vec<_>>>()
         };
-        // A row whose drawing items wait for the cut carries the row it came from.
-        if !self.drawn.is_empty() {
-            let mut made = one(&computed)?;
-            made.extend_from_slice(row);
-            return Ok(vec![made]);
-        }
-        let Some((deepest, beneath)) = self.levels.split_last() else {
-            return Ok(vec![one(&computed)?]);
+        // A row whose items wait for the sort and the cut carries the row it came from, and its
+        // aggregates' and windows' values.
+        let folds = match self.drawn.is_empty() {
+            true => Vec::new(),
+            false => self.folds_of(&computed),
         };
-        let mut made = vec![computed];
-        for sets in beneath {
-            let mut next = Vec::new();
-            for c in &made {
-                zipped(sets, row, frame, c, &mut |c| {
-                    next.push(c);
-                    Ok(())
-                })?;
+        let carry = |mut made: Vec<Value>| {
+            if !self.drawn.is_empty() {
+                made.extend_from_slice(row);
+                made.extend(folds.iter().cloned());
             }
-            made = next;
-        }
-        let mut out = Vec::new();
-        for c in &made {
-            match self.ends {
-                true => self.passes(deepest, row, frame, c, &mut out)?,
-                false => zipped(deepest, row, frame, c, &mut |c| {
-                    out.push(one(&c)?);
-                    Ok(())
-                })?,
-            }
-        }
-        Ok(out)
+            made
+        };
+        let Some((deepest, beneath)) = self.levels.split_last().filter(|_| !self.late_sets) else {
+            return Ok(vec![carry(one(&computed)?)]);
+        };
+        let mut made = Vec::new();
+        let mut taking = Taking {
+            cut: None,
+            key: &[],
+            out: &mut made,
+        };
+        each_level(beneath, row, frame, &computed, &mut |c| match self.ends {
+            true => self.passes(deepest, row, frame, c, &|i, e| before(i, e, c), &mut taking),
+            false => zipped(deepest, row, frame, c, &mut |c| {
+                taking.take(one(&c)?);
+                Ok(true)
+            }),
+        })?;
+        Ok(made.into_iter().map(carry).collect())
+    }
+
+    /// Its items, then its ORDER BY's expressions beside them.
+    fn listed(&self) -> Vec<&'q Expr> {
+        self.items
+            .iter()
+            .map(|(e, _)| *e)
+            .chain(self.hidden.iter().copied())
+            .collect()
+    }
+
+    /// Each aggregate's and window's value a row is made with, in their order.
+    fn folds_of(&self, computed: &Computed) -> Vec<Value> {
+        self.calls
+            .aggregates
+            .iter()
+            .chain(&self.calls.windows)
+            .map(|&c| {
+                computed
+                    .calls
+                    .get(&(c as *const Expr))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            })
+            .collect()
     }
 
     /// The rows the deepest level makes over one row beneath it, where each of its sets is an item
-    /// by itself: each pass the items in their order, a set giving its next value, NULL past its
-    /// end, while any gives one; and the items once more in the pass that finds every set ended,
-    /// its row dropped.
+    /// by itself: each pass the items in their order (`item` making any other than the sets), a set
+    /// giving its next value, NULL past its end, while any gives one; and the items once more in the
+    /// pass that finds every set ended, its row dropped. Each pass made only where `taking` wants a
+    /// row; false where it stopped them.
     fn passes(
         &self,
         sets: &[&Expr],
         row: &[Value],
         frame: &Frame,
         computed: &Computed,
-        out: &mut Vec<Vec<Value>>,
-    ) -> Result<()> {
-        let listed: Vec<&Expr> = self
-            .items
-            .iter()
-            .map(|(e, _)| *e)
-            .chain(self.hidden.iter().copied())
-            .collect();
-        let mut values: Vec<Option<Vec<Value>>> = vec![None; sets.len()];
-        for pass in 0.. {
+        item: &dyn Fn(usize, &Expr) -> Result<Value>,
+        taking: &mut Taking,
+    ) -> Result<bool> {
+        let listed = self.listed();
+        let mut values: Vec<Option<SetValues>> = (0..sets.len()).map(|_| None).collect();
+        loop {
+            if !taking.wants() {
+                return Ok(false);
+            }
             let mut made = Vec::with_capacity(listed.len());
             let mut given = false;
-            for &e in &listed {
+            for (i, &e) in listed.iter().enumerate() {
                 let Some(at) = sets.iter().position(|&s| std::ptr::eq(s, unnested(e))) else {
-                    made.push(eval(e, row, frame, computed)?);
+                    made.push(item(i, e)?);
                     continue;
                 };
                 if values[at].is_none() {
-                    values[at] = Some(set_values(sets[at], row, frame, computed)?);
+                    values[at] = Some(set_iter(sets[at], row, frame, computed)?);
                 }
-                let v = values[at].as_ref().and_then(|v| v.get(pass)).cloned();
+                let v = values[at].as_mut().and_then(Iterator::next).transpose()?;
                 given |= v.is_some();
                 made.push(v.unwrap_or(Value::Null));
             }
             if !given {
                 break;
             }
-            out.push(made);
+            taking.take(made);
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// A row the cut reaches, its drawing items made from the row it came from, which it carries
-    /// no further.
-    fn drawn_after(&self, row: &mut Vec<Value>, frame: &Frame) -> Result<()> {
+    /// The rows a row carried past the sort becomes, each as `taking` wants it: its items made
+    /// after the sort (`drawn`) made from the row it came from and its aggregates' and windows'
+    /// values, which it carries no further, and where its sets wait for the sort, the rows its
+    /// levels make, one at a time. A row carrying nothing is taken as it is.
+    fn late_rows(&self, mut row: Vec<Value>, frame: &Frame, taking: &mut Taking) -> Result<()> {
         if self.drawn.is_empty() {
+            if taking.wants() {
+                taking.take(row);
+            }
             return Ok(());
         }
-        let from = row.split_off(self.items.len() + self.hidden.len());
-        for &i in &self.drawn {
-            row[i] = eval(self.items[i].0, &from, frame, &computed_none())?;
-        }
+        let mut from = row.split_off(self.items.len() + self.hidden.len());
+        let folds = from.split_off(from.len() - self.calls.aggregates.len() - self.calls.windows.len());
+        let computed = Computed {
+            calls: self
+                .calls
+                .aggregates
+                .iter()
+                .chain(&self.calls.windows)
+                .zip(folds)
+                .map(|(&c, v)| (c as *const Expr, v))
+                .collect(),
+            bound: None,
+            _q: std::marker::PhantomData,
+        };
+        let base = row;
+        let after = |i: usize, e: &Expr, c: &Computed| match self.drawn.contains(&i) {
+            true => eval(e, &from, frame, c),
+            false => Ok(base[i].clone()),
+        };
+        let one = |c: &Computed| {
+            self.listed()
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| after(i, e, c))
+                .collect::<Result<Vec<_>>>()
+        };
+        let Some((deepest, beneath)) = self.levels.split_last().filter(|_| self.late_sets) else {
+            if taking.wants() {
+                taking.take(one(&computed)?);
+            }
+            return Ok(());
+        };
+        each_level(beneath, &from, frame, &computed, &mut |c| match self.ends {
+            true => self.passes(deepest, &from, frame, c, &|i, e| after(i, e, c), taking),
+            false => {
+                if !taking.wants() {
+                    return Ok(false);
+                }
+                zipped(deepest, &from, frame, c, &mut |c| {
+                    taking.take(one(&c)?);
+                    Ok(taking.wants())
+                })
+            }
+        })?;
         Ok(())
+    }
+}
+
+/// Over one row, each row the levels make handed to `each` as it is made: the first level's sets
+/// made over the row itself, each next's over each row of the level before, in lockstep (`zipped`);
+/// the row itself where there are none. False where `each` stopped them.
+fn each_level<'q>(
+    levels: &[Vec<&Expr>],
+    row: &[Value],
+    frame: &Frame,
+    computed: &Computed<'q>,
+    each: &mut dyn FnMut(&Computed<'q>) -> Result<bool>,
+) -> Result<bool> {
+    let Some((first, rest)) = levels.split_first() else {
+        return each(computed);
+    };
+    zipped(first, row, frame, computed, &mut |c| {
+        each_level(rest, row, frame, &c, each)
+    })
+}
+
+/// A set-returning call's values over one row as they are wanted: a generate_series's made one at a
+/// time, any other's made whole first.
+enum SetValues {
+    Whole(std::vec::IntoIter<Value>),
+    Series(super::series::Series),
+}
+
+impl Iterator for SetValues {
+    type Item = Result<Value>;
+    fn next(&mut self) -> Option<Result<Value>> {
+        match self {
+            SetValues::Whole(v) => v.next().map(Ok),
+            SetValues::Series(s) => s.next(),
+        }
+    }
+}
+
+/// A set-returning call's values over one row (`SetValues`), as `set_values` gives them.
+fn set_iter(c: &Expr, row: &[Value], frame: &Frame, computed: &Computed) -> Result<SetValues> {
+    if let Expr::Function(f) = c {
+        if function_name(f) == "generate_series" && !super::handed::is_handed(f) {
+            let given = args(f)?
+                .iter()
+                .map(|x| Ok((eval(x, row, frame, computed)?, quoted(x))))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(SetValues::Series(super::series::series(given, frame.type_of(c))?));
+        }
+    }
+    Ok(SetValues::Whole(set_values(c, row, frame, computed)?.into_iter()))
+}
+
+impl Prepared<'_> {
+    /// Of rows as they come in their order, each sorting by its value in `keys` where given, the
+    /// rows they become past the sort (`late_rows`), through `cut` where there is one.
+    fn after_sort(
+        &self,
+        rows: Vec<Vec<Value>>,
+        keys: &[Vec<Value>],
+        mut cut: Option<&mut sorted::Cut>,
+        frame: &Frame,
+    ) -> Result<Vec<Vec<Value>>> {
+        // Rows carrying nothing, with no cut, go on as they came.
+        if self.drawn.is_empty() && cut.is_none() {
+            return Ok(rows);
+        }
+        let mut out = Vec::new();
+        for (i, row) in rows.into_iter().enumerate() {
+            let mut taking = Taking {
+                cut: cut.as_deref_mut(),
+                key: keys.get(i).map_or(&[][..], Vec::as_slice),
+                out: &mut out,
+            };
+            if !taking.wants() {
+                break;
+            }
+            self.late_rows(row, frame, &mut taking)?;
+        }
+        Ok(out)
+    }
+}
+
+/// Where the rows a step makes go as they are made: through its cut where it has one, each sorting
+/// by `key`, or all of them.
+pub(super) struct Taking<'c> {
+    cut: Option<&'c mut sorted::Cut>,
+    key: &'c [Value],
+    out: &'c mut Vec<Vec<Value>>,
+}
+
+impl Taking<'_> {
+    /// Whether it reads one row more.
+    fn wants(&self) -> bool {
+        self.cut.as_ref().is_none_or(|c| c.wants())
+    }
+
+    fn take(&mut self, row: Vec<Value>) {
+        match self.cut.as_deref_mut() {
+            Some(c) => c.offer(row, self.key, self.out),
+            None => self.out.push(row),
+        }
     }
 }
 
@@ -6862,27 +7081,35 @@ fn chosen(
     }))
 }
 
-/// What one level's sets make over a row beneath them, each handed to `each`: their values side
-/// by side, a shorter set NULL past its end, until the longest ends; nothing where every set gives
-/// none.
+/// What one level's sets make over a row beneath them, each handed to `each` as it is made: their
+/// values side by side, a shorter set NULL past its end, until the longest ends; nothing where every
+/// set gives none. False where `each` stopped them.
 fn zipped<'q>(
     sets: &[&Expr],
     row: &[Value],
     frame: &Frame,
     computed: &Computed<'q>,
-    each: &mut dyn FnMut(Computed<'q>) -> Result<()>,
-) -> Result<()> {
-    let values = sets
+    each: &mut dyn FnMut(Computed<'q>) -> Result<bool>,
+) -> Result<bool> {
+    let mut values = sets
         .iter()
-        .map(|&s| set_values(s, row, frame, computed))
+        .map(|&s| set_iter(s, row, frame, computed))
         .collect::<Result<Vec<_>>>()?;
-    let n = values.iter().map(Vec::len).max().unwrap_or(0);
-    for i in 0..n {
-        each(computed.and(sets.iter().zip(&values).map(|(&s, v)| {
-            (s, v.get(i).cloned().unwrap_or(Value::Null))
-        })))?;
+    loop {
+        let mut given = false;
+        let mut now = Vec::with_capacity(sets.len());
+        for v in &mut values {
+            let x = v.next().transpose()?;
+            given |= x.is_some();
+            now.push(x.unwrap_or(Value::Null));
+        }
+        if !given {
+            return Ok(true);
+        }
+        if !each(computed.and(sets.iter().copied().zip(now)))? {
+            return Ok(false);
+        }
     }
-    Ok(())
 }
 
 /// The values a set-returning call gives over one row, under the collation its arguments settle; a
@@ -7077,6 +7304,67 @@ fn grouped_by<'q>(
         return Err(Error::new("window functions are not allowed in GROUP BY"));
     }
     Ok(e)
+}
+
+/// What a step makes below its fold and its windows, as PostgreSQL's planner places a set-returning
+/// call beneath them: each GROUP BY expression, PARTITION BY expression and window ORDER BY
+/// expression holding a set, once for those written alike; and where each is read, itself and any
+/// item, ORDER BY item or part of one written alike. A GROUP BY item refused is left to `grouped_by`.
+fn below_fold<'q>(
+    s: &'q sqlparser::ast::Select,
+    items: &[(&'q Expr, String)],
+    hidden: &[&'q Expr],
+    columns: &[super::typed::TypedColumn],
+) -> (Vec<&'q Expr>, Below) {
+    let listed = || items.iter().map(|(e, _)| *e).chain(hidden.iter().copied());
+    let mut found = Calls::default();
+    for e in listed() {
+        find_calls(e, &mut found);
+    }
+    let grouped: Vec<&'q Expr> = match &s.group_by {
+        GroupByExpr::Expressions(g, m) if m.is_empty() => g
+            .iter()
+            .filter_map(|g| grouped_by(g, items, columns).ok())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let keyed = found.windows.iter().flat_map(|w| match w {
+        Expr::Function(f) => match &f.over {
+            Some(WindowType::WindowSpec(spec)) => spec
+                .partition_by
+                .iter()
+                .chain(spec.order_by.iter().map(|o| &o.expr))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    });
+    let keys: Vec<&'q Expr> = grouped.into_iter().chain(keyed).filter(|e| holds_set(e)).collect();
+    let mut exprs: Vec<&'q Expr> = Vec::new();
+    for &k in &keys {
+        if !exprs.iter().any(|b| alike(b, k, columns, None)) {
+            exprs.push(k);
+        }
+    }
+    let mut at = Vec::new();
+    if !exprs.is_empty() {
+        let mut read = |x: &Expr| {
+            if let Some(k) = exprs.iter().position(|b| alike(b, x, columns, None)) {
+                at.push((x as *const Expr, k));
+            }
+        };
+        for &k in &keys {
+            read(k);
+        }
+        for e in listed() {
+            let _ = sqlparser::ast::visit_expressions(e, |x| {
+                read(x);
+                std::ops::ControlFlow::<()>::Continue(())
+            });
+        }
+    }
+    let n = exprs.len();
+    (exprs, Below { at, n })
 }
 
 /// The place in the select list an ORDER BY or DISTINCT ON item names, as PostgreSQL's parser
@@ -7484,9 +7772,13 @@ pub(super) fn prepare<'q>(
             });
         }
     }
+    let (below_exprs, below) = below_fold(s, &items, &hidden, columns);
     // Its sets are refused in PostgreSQL's parser's order: the select list's, WHERE's, HAVING's,
     // then the ORDER BY's.
-    let mut calls = Calls::default();
+    let mut calls = Calls {
+        stops: below.at.iter().map(|&(p, _)| p).collect(),
+        ..Calls::default()
+    };
     for (e, _) in &items {
         sets_placed(e)?;
     }
@@ -7520,11 +7812,6 @@ pub(super) fn prepare<'q>(
         .iter()
         .map(|g| grouped_by(g, &items, columns))
         .collect::<Result<Vec<&Expr>>>()?;
-    if grouping.iter().any(|g| holds_set(g)) {
-        return Err(Error::new(
-            "a set-returning function in GROUP BY is not read",
-        ));
-    }
     // Each DISTINCT ON key is read as an ORDER BY item is, after the ORDER BY and the GROUP BY, as
     // PostgreSQL's parser reads it: the select list's column it names, or an expression the ORDER
     // BY makes beside it, or one more of its own.
@@ -7726,17 +8013,31 @@ pub(super) fn prepare<'q>(
     // An item that draws from a sequence and is no sort key is made above the sort and below the
     // cut, as PostgreSQL's planner places a volatile item: in the rows' sorted order, for each row
     // the LIMIT and OFFSET read. Under DISTINCT ON, only where it sorts by an ORDER BY.
+    // So are its select list's sets, where no sort key and nothing below its fold holds one and it
+    // has no DISTINCT nor DISTINCT ON: each row carried past the sort becomes their rows, one at a
+    // time as the cut reads them. Where a sort key holds one, they are made before the sort, and the
+    // drawing items alone after.
     let cuts = q.order_by.is_some() || limit.is_some();
-    let plain = !distinct
-        && (on.is_empty() || q.order_by.is_some())
-        && !grouped
-        && calls.windows.is_empty()
-        && calls.sets.is_empty();
-    let drawn = match cuts && plain {
+    let open = cuts && !distinct && (on.is_empty() || q.order_by.is_some());
+    let place = |i: usize| {
+        items
+            .get(i)
+            .map_or_else(|| hidden[i - items.len()], |(e, _)| *e)
+    };
+    let set_keyed = !below_exprs.is_empty()
+        || sorted.iter().any(|&i| depth(place(i), &calls.stops) > 0);
+    let late_sets = open && on.is_empty() && !calls.sets.is_empty() && !set_keyed;
+    let drawn = match open {
         true => items
             .iter()
             .enumerate()
-            .filter(|(i, (e, _))| !sorted.contains(i) && draws(e))
+            .filter(|(i, (e, _))| {
+                !sorted.contains(i)
+                    && match depth(e, &calls.stops) > 0 {
+                        true => late_sets,
+                        false => draws(e),
+                    }
+            })
             .map(|(i, _)| i)
             .collect(),
         false => Vec::new(),
@@ -7760,12 +8061,23 @@ pub(super) fn prepare<'q>(
     // The deepest level makes the items where none of its sets stands inside an expression.
     let levels = calls.levels();
     let listed = || items.iter().map(|(e, _)| *e).chain(hidden.iter().copied());
-    let deepest = listed().map(depth).max().unwrap_or(0);
-    let ends = listed().filter(|e| depth(e) == deepest).all(is_set_call);
+    let deepest = listed().map(|e| depth(e, &calls.stops)).max().unwrap_or(0);
+    let ends = listed()
+        .filter(|e| depth(e, &calls.stops) == deepest)
+        .all(is_set_call);
+    // The sets below the fold, by level, as the select list's are.
+    let mut beneath = Calls::default();
+    for &e in &below_exprs {
+        find_calls(e, &mut beneath);
+    }
     Ok(Prepared {
         drawn,
+        late_sets,
         levels,
         ends,
+        below_levels: beneath.levels(),
+        below_exprs,
+        below,
         from: &s.from,
         selection: s.selection.as_ref(),
         having,
@@ -7818,6 +8130,7 @@ pub(crate) fn eval_typed(
         types,
         now: crate::scalars::transaction_clock(),
         subqueries: None,
+        below: None,
     };
     eval(e, row, &frame, &computed_none())
 }
@@ -7859,6 +8172,7 @@ pub(crate) fn eval_on_as(
         types: &types,
         now: crate::scalars::transaction_clock(),
         subqueries: None,
+        below: None,
     };
     eval(e, row, &frame, &computed_none())
 }
@@ -8165,12 +8479,8 @@ impl Going {
         };
         if !self.sorts {
             let Some(l) = &p.limit else {
-                // Rows that come in their order make their drawing items as they come.
-                let mut rows = rows;
-                for r in &mut rows {
-                    p.drawn_after(r, frame)?;
-                }
-                return Ok(rows);
+                // Rows that come in their order make what waits for the sort as they come.
+                return p.after_sort(rows, &[], None, frame);
             };
             let keys = match l.ties {
                 true => {
@@ -8184,11 +8494,7 @@ impl Going {
             if self.cut.is_none() {
                 self.cut = Some(sorted::Cut::of(l, frame)?);
             }
-            return self
-                .cut
-                .as_mut()
-                .expect("just made")
-                .take(rows, &keys, &mut |r| p.drawn_after(r, frame));
+            return p.after_sort(rows, &keys, self.cut.as_mut(), frame);
         }
         if self.sorter.is_none() {
             let mut s = sorted::Sorter::new(p, casings)?;
@@ -8308,6 +8614,7 @@ impl<'q> StepRun<'q> {
             types: &self.p.types,
             now: self.p.now,
             subqueries: self.subqueries,
+            below: Some(&self.p.below),
         };
         let none = computed_none();
         // A WHERE that draws is read a row at a time, each row it keeps made before the next is
@@ -8325,6 +8632,14 @@ impl<'q> StepRun<'q> {
                 }
             }
             rel.rows = kept;
+        }
+        // Its sets below the fold and the windows, each row made once for each of their values.
+        if !self.p.below_exprs.is_empty() {
+            let mut made = Vec::with_capacity(rel.rows.len());
+            for row in std::mem::take(&mut rel.rows) {
+                self.p.below_rows(row, &frame, &mut made)?;
+            }
+            rel.rows = made;
         }
         if self.p.grouped {
             let mut ended = Vec::new();
@@ -8419,7 +8734,7 @@ impl<'q> StepRun<'q> {
         // The order holds where an item is the column that held it, and no set repeats a row.
         let order = rel
             .order
-            .filter(|_| self.p.calls.sets.is_empty())
+            .filter(|_| self.p.calls.sets.is_empty() && self.p.below_exprs.is_empty())
             .and_then(|o| {
                 self.p.items.iter().position(|(e, _)| {
                     column_of(e).is_some_and(|(q, n)| frame.find(q.as_deref(), &n).ok() == Some(o))
@@ -8458,21 +8773,14 @@ impl<'q> StepRun<'q> {
             types: &self.p.types,
             now: self.p.now,
             subqueries: self.subqueries,
+            below: Some(&self.p.below),
         };
         if let (None, Some(l)) = (&self.going.cut, &self.p.limit) {
             self.going.cut = Some(sorted::Cut::of(l, &frame)?);
         }
         let (cut, out, p) = (&mut self.going.cut, &mut self.partitions_out, &self.p);
-        sorter.finish(&mut |mut rows, keys| {
-            out.extend(match cut {
-                Some(c) => c.take(rows, &keys, &mut |r| p.drawn_after(r, &frame))?,
-                None => {
-                    for r in &mut rows {
-                        p.drawn_after(r, &frame)?;
-                    }
-                    rows
-                }
-            });
+        sorter.finish(&mut |rows, keys| {
+            out.extend(p.after_sort(rows, &keys, cut.as_mut(), &frame)?);
             Ok(())
         })
     }
@@ -8497,6 +8805,7 @@ impl<'q> StepRun<'q> {
             types: &self.p.types,
             now: self.p.now,
             subqueries: self.subqueries,
+            below: Some(&self.p.below),
         };
         if !self.partitions_out.is_empty() {
             each(truncated(
@@ -8566,7 +8875,9 @@ impl<'q> StepRun<'q> {
             })?;
             order_out = order
                 .filter(|_| {
-                    p.calls.sets.is_empty() && p.order_by.is_none() && p.distinct_on.is_none()
+                    p.calls.sets.is_empty()
+                        && p.below_exprs.is_empty()
+                        && p.order_by.is_none() && p.distinct_on.is_none()
                 })
                 .and_then(|o| {
                     p.items.iter().position(|(e, _)| {
@@ -8605,19 +8916,11 @@ impl<'q> StepRun<'q> {
             // DISTINCT ON keeps its rows before the cut reads them.
             let mut first = p.distinct_on.map(sorted::First::of);
             sorter.finish(&mut |rows, keys| {
-                let (mut rows, keys) = match &mut first {
+                let (rows, keys) = match &mut first {
                     Some(f) => f.take(rows, keys),
                     None => (rows, keys),
                 };
-                let rows = match &mut cut {
-                    Some(c) => c.take(rows, &keys, &mut |r| p.drawn_after(r, frame_ref))?,
-                    None => {
-                        for r in &mut rows {
-                            p.drawn_after(r, frame_ref)?;
-                        }
-                        rows
-                    }
-                };
+                let rows = p.after_sort(rows, &keys, cut.as_mut(), frame_ref)?;
                 if !rows.is_empty() {
                     each(truncated(rows, width))?;
                 }
@@ -9133,6 +9436,7 @@ impl<'q> Stream<'q> {
             types: &run.p.types,
             now: run.p.now,
             subqueries: run.subqueries,
+            below: None,
         })
     }
 

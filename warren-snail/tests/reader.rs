@@ -2793,6 +2793,216 @@ fn a_set_where_18_6_refuses_one_is_refused_in_its_words() {
     answered(&mut w, &[("SELECT count(*) FROM sr.t", &["4"])]);
 }
 
+#[test]
+fn a_set_in_group_by_is_made_before_the_groups() {
+    let mut w = sr("group-by-set");
+    answered(
+        &mut w,
+        &[
+            ("SELECT generate_series(1, 3) AS g GROUP BY 1 ORDER BY 1", &["1", "2", "3"]),
+            (
+                "SELECT generate_series(1, 2) AS g, count(*) FROM sr.t GROUP BY 1 ORDER BY 1",
+                &["1|4", "2|4"],
+            ),
+            (
+                "SELECT generate_series(1, 3) AS g, generate_series(1, 2) AS h FROM sr.t GROUP BY 1 \
+                 ORDER BY 1, 2",
+                &["1|1", "1|2", "2|1", "2|2", "3|1", "3|2"],
+            ),
+            (
+                "SELECT (generate_series(1, 3) + 0) * 10 AS x FROM sr.t \
+                 GROUP BY generate_series(1, 3) + 0 ORDER BY 1",
+                &["10", "20", "30"],
+            ),
+            (
+                "SELECT generate_series(1, 3) AS g FROM sr.t GROUP BY generate_series(1, 3) + 0 \
+                 ORDER BY 1",
+                &["1", "1", "1", "2", "2", "2", "3", "3", "3"],
+            ),
+            (
+                "SELECT n, generate_series(1, n) AS k, count(*) FROM sr.t GROUP BY n, k \
+                 ORDER BY n, k",
+                &["2|1|1", "2|2|1", "3|1|1", "3|2|1", "3|3|1"],
+            ),
+            (
+                "SELECT generate_series(1, 2) AS g, count(*) FROM sr.t \
+                 GROUP BY generate_series(1, 2) ORDER BY 1",
+                &["1|4", "2|4"],
+            ),
+            (
+                "SELECT n, generate_series(1, 2) AS g, sum(id) FROM sr.t \
+                 GROUP BY n, generate_series(1, 2) ORDER BY 1, 2",
+                &["0|1|2", "0|2|2", "2|1|1", "2|2|1", "3|1|3", "3|2|3", "NULL|1|4", "NULL|2|4"],
+            ),
+            (
+                "SELECT generate_series(1, generate_series(1, 2)) AS g, count(*) FROM sr.t \
+                 GROUP BY 1 ORDER BY 1",
+                &["1|8", "2|4"],
+            ),
+            (
+                "SELECT count(*) FROM sr.t GROUP BY generate_series(1, 2), generate_series(1, 3) \
+                 ORDER BY 1",
+                &["4", "4", "4"],
+            ),
+            (
+                "SELECT g, count(*) FROM (SELECT generate_series(1, n) AS g FROM sr.t GROUP BY 1, n) \
+                 s GROUP BY g ORDER BY g",
+                &["1|2", "2|2", "3|1"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_set_in_a_windows_keys_is_made_before_the_window() {
+    let mut w = sr("window-key-set");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT generate_series(1, 2) AS g, id, row_number() OVER (PARTITION BY \
+                 generate_series(1, 2) ORDER BY id) AS r FROM sr.t ORDER BY 1, 2",
+                &[
+                    "1|1|1", "1|2|2", "1|3|3", "1|4|4", "2|1|1", "2|2|2", "2|3|3", "2|4|4",
+                ],
+            ),
+            (
+                "SELECT id, generate_series(1, 2) AS g, generate_series(1, 3) AS h, row_number() \
+                 OVER (PARTITION BY generate_series(1, 2) ORDER BY id) AS r FROM sr.t WHERE id = 1 \
+                 ORDER BY 2, 3",
+                &["1|1|1|1", "1|1|2|1", "1|1|3|1", "1|2|1|1", "1|2|2|1", "1|2|3|1"],
+            ),
+            (
+                "SELECT id, row_number() OVER (ORDER BY generate_series(1, 2), id) AS r FROM sr.t \
+                 ORDER BY 2",
+                &["1|1", "2|2", "3|3", "4|4", "1|5", "2|6", "3|7", "4|8"],
+            ),
+            (
+                "SELECT id, count(*) OVER (PARTITION BY generate_series(1, n)) AS c FROM sr.t \
+                 ORDER BY 1, 2",
+                &["1|2", "1|2", "3|1", "3|2", "3|2"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_set_no_sort_key_holds_is_made_after_the_sort() {
+    let mut w = sr("after-sort");
+    let drawn = "SELECT nextval('sr.q') AS v, generate_series(1, 2) AS g FROM sr.t";
+    let at = |tail: &str| format!("{drawn} {tail}");
+    let asked: Vec<(String, &[&str])> = vec![
+        (
+            "SELECT id, generate_series(1, 10 / (4 - id)) AS g FROM sr.t ORDER BY id LIMIT 2".into(),
+            &["1|1", "1|2"],
+        ),
+        (at("ORDER BY id DESC"), &["1|1", "2|2", "4|1", "5|2", "7|1", "8|2", "10|1", "11|2"]),
+        ("SELECT currval('sr.q')".into(), &["12"]),
+        (
+            at("ORDER BY id DESC, g"),
+            &["13|1", "14|2", "15|1", "16|2", "17|1", "18|2", "19|1", "20|2"],
+        ),
+        ("SELECT currval('sr.q')".into(), &["20"]),
+        (at("ORDER BY id LIMIT 3"), &["21|1", "22|2", "24|1"]),
+        ("SELECT currval('sr.q')".into(), &["24"]),
+        (at("ORDER BY id OFFSET 5"), &["32|2", "34|1", "35|2"]),
+        ("SELECT currval('sr.q')".into(), &["36"]),
+        (at("ORDER BY id FETCH FIRST 1 ROW WITH TIES"), &["37|1", "38|2"]),
+        ("SELECT currval('sr.q')".into(), &["40"]),
+        (at("ORDER BY id LIMIT 2"), &["41|1", "42|2"]),
+        ("SELECT currval('sr.q')".into(), &["42"]),
+        (at("LIMIT 3"), &["43|1", "44|2", "46|1"]),
+        ("SELECT currval('sr.q')".into(), &["46"]),
+        (
+            "SELECT id, generate_series(1, 2) * 10 AS g FROM sr.t ORDER BY id LIMIT 3".into(),
+            &["1|10", "1|20", "2|10"],
+        ),
+        (
+            "SELECT id, generate_series(1, generate_series(1, 2)) AS g FROM sr.t ORDER BY id \
+             LIMIT 3"
+                .into(),
+            &["1|1", "1|1", "1|2"],
+        ),
+        (
+            "SELECT id, generate_series(1, n) AS g FROM sr.t ORDER BY id OFFSET 1 LIMIT 3".into(),
+            &["1|2", "3|1", "3|2"],
+        ),
+    ];
+    let asked: Vec<(&str, &[&str])> = asked.iter().map(|(q, a)| (q.as_str(), *a)).collect();
+    answered(&mut w, &asked);
+}
+
+#[test]
+fn a_grouped_or_windowed_step_makes_its_sets_after_the_sort() {
+    let mut w = sr("grouped-after-sort");
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT n, generate_series(1, 10 / (3 - n)) AS g FROM sr.t GROUP BY n ORDER BY n \
+                 LIMIT 2",
+                &["0|1", "0|2"],
+            ),
+            (
+                "SELECT id, row_number() OVER (ORDER BY id) AS r, generate_series(1, 10 / (4 - id)) \
+                 AS g FROM sr.t ORDER BY id LIMIT 2",
+                &["1|1|1", "1|1|2"],
+            ),
+            (
+                "SELECT n, nextval('sr.q') AS v, generate_series(1, 2) AS g FROM sr.t GROUP BY n \
+                 ORDER BY n",
+                &["0|1|1", "0|2|2", "2|4|1", "2|5|2", "3|7|1", "3|8|2", "NULL|10|1", "NULL|11|2"],
+            ),
+            ("SELECT currval('sr.q')", &["12"]),
+            (
+                "SELECT n, nextval('sr.q') AS v FROM sr.t GROUP BY n ORDER BY n DESC NULLS LAST",
+                &["3|13", "2|14", "0|15", "NULL|16"],
+            ),
+            (
+                "SELECT n, generate_series(1, count(*)::integer + 1) AS g FROM sr.t GROUP BY n \
+                 ORDER BY n LIMIT 3",
+                &["0|1", "0|2", "2|1"],
+            ),
+            (
+                "SELECT id, generate_series(1, (row_number() OVER (ORDER BY id))::integer) AS g \
+                 FROM sr.t ORDER BY id DESC LIMIT 3",
+                &["4|1", "4|2", "4|3"],
+            ),
+            (
+                "SELECT id, nextval('sr.q') + count(*) OVER () AS v FROM sr.t ORDER BY id DESC",
+                &["4|21", "3|22", "2|23", "1|24"],
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_long_set_is_cut_without_being_made_whole() {
+    let mut w = sr("long-set");
+    let began = std::time::Instant::now();
+    answered(
+        &mut w,
+        &[
+            ("SELECT generate_series(1, 100000000) LIMIT 3", &["1", "2", "3"]),
+            ("SELECT generate_series(1, 100000000) + 0 AS g LIMIT 3", &["1", "2", "3"]),
+            (
+                "SELECT id, generate_series(1, 100000000) AS g FROM sr.t ORDER BY id LIMIT 3",
+                &["1|1", "1|2", "1|3"],
+            ),
+            (
+                "SELECT generate_series(1, generate_series(1, 100000000)) AS g LIMIT 4",
+                &["1", "1", "2", "1"],
+            ),
+            (
+                "SELECT generate_series(1, 100000000) AS g, generate_series(1, 2) AS h LIMIT 3",
+                &["1|1", "2|2", "3|NULL"],
+            ),
+            ("SELECT generate_series(1, 100000000) AS g OFFSET 5 LIMIT 2", &["6", "7"]),
+        ],
+    );
+    assert!(began.elapsed() < std::time::Duration::from_secs(1), "{:?}", began.elapsed());
+}
+
 /// A snail of one table and no rows, written as release `release`'s.
 fn keyed_of(name: &str, release: u8) -> Snail {
     let path = tmp(&format!("reader-keywords-{name}.snail"));

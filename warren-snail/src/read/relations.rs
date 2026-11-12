@@ -408,6 +408,7 @@ impl Tie<'_, '_> {
             types: self.types,
             now: self.asked.now,
             subqueries: None,
+            below: None,
         }
     }
 
@@ -3653,6 +3654,7 @@ impl Reading<'_> {
             types: self.types,
             now: self.now,
             subqueries: None,
+            below: None,
         };
         // A function's columns of one value it gives.
         let laid = |c: &Called, v: Value, out: &mut Vec<Value>| -> Result<()> {
@@ -3848,6 +3850,7 @@ fn values_step(step: &Step, params: &[String], release: u8, casings: &Casings) -
         types: &typing.types,
         now: crate::scalars::transaction_clock(),
         subqueries: None,
+        below: None,
     };
     let none = pipeline::computed_none();
     let mut made = Vec::with_capacity(rows.len());
@@ -5454,6 +5457,7 @@ fn select_step(
             types: &p.types,
             now,
             subqueries: Some(&subs),
+            below: None,
         };
         let row = vec![Value::Null; from.columns.len()];
         for g in gates {
@@ -5764,6 +5768,7 @@ fn tied_keeps(
         types,
         now: asked.now,
         subqueries: None,
+        below: None,
     };
     let none = pipeline::computed_none();
     let set_rows = Rows::of(sets)?;

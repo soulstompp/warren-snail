@@ -743,6 +743,7 @@ pub(super) fn call(
             types: &d.types,
             now: frame.now,
             subqueries: None,
+            below: None,
         })
         .collect();
     let expr_at = |at: usize| -> &Expr {
@@ -811,6 +812,7 @@ pub(super) fn call(
         types: &g.types,
         now: frame.now,
         subqueries: None,
+        below: None,
     };
     let none = vec![Value::Null; g.args.len()];
     let v = super::pipeline::eval(&g.body, &none, &body_frame, &Computed::bound_by(&bound))?;
