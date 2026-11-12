@@ -723,7 +723,11 @@ impl<'a, 'q> Subs<'a, 'q> {
                 return Ok(r.clone());
             }
             // Its one-time conditions first, as its plan starts.
-            super::folded::gated(self.asked.reads.catalog(), &plan.query.to_string(), Some(self.asked.reads))?;
+            super::folded::gated(
+                self.asked.reads.catalog(),
+                &plan.query.to_string(),
+                Some(self.asked.reads),
+            )?;
             let (m, _) = relations::made_by(
                 asked,
                 &plan.query,
