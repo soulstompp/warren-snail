@@ -530,18 +530,17 @@ impl Cursor {
             .as_ref()
             .map(|a| crate::catalog::ident(&a.name))
             .unwrap_or_else(|| n.rsplit('.').next().unwrap_or(&n).to_string());
+        // Each named apart from the question's own columns, a `*`'s among them, so that ORDER BY
+        // reads a name as the question gives it.
         let mut q2 = (**q).clone();
         if let SetExpr::Select(s2) = q2.body.as_mut() {
-            if s2
-                .projection
-                .iter()
-                .any(|p| matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)))
-            {
-                return None;
-            }
-            for &c in &key {
+            for (j, &c) in key.iter().enumerate() {
                 let col = &table.columns[c].name;
-                let text = format!("SELECT \"{}\".\"{}\"", by.replace('"', "\"\""), col.replace('"', "\"\""));
+                let text = format!(
+                    "SELECT \"{}\".\"{}\" AS \"?key{j}\"",
+                    by.replace('"', "\"\""),
+                    col.replace('"', "\"\"")
+                );
                 let Ok(p) = super::image::parse_sql(&text) else {
                     return None;
                 };

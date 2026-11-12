@@ -399,6 +399,20 @@ fn leaf_datums(table: &Table, column: usize, d: &Datum) -> Vec<Datum> {
         .collect()
 }
 
+/// The columns of a table's first unique order of plain NOT NULL columns, which know its rows;
+/// none where it has no such order.
+fn unique_key(table: &Table) -> Option<Vec<usize>> {
+    table.orders.iter().filter(|o| o.unique).find_map(|o| {
+        o.levels
+            .iter()
+            .map(|l| match l {
+                Level::Column(c) if table.columns[*c].not_null => Some(*c),
+                _ => None,
+            })
+            .collect::<Option<Vec<usize>>>()
+    })
+}
+
 /// A row's key on an order of `table`.
 pub(super) fn key_of(table: &Table, order: &Order, row: &Row) -> Result<Vec<KeyValue>> {
     order
@@ -2864,26 +2878,17 @@ impl Snail {
     /// kept as `found`; run again, only those whose key, on the table's first unique order of plain
     /// NOT NULL columns or else every column, is a key it found the first time, and of the rows
     /// sharing a key no more than it found then: a row alike written since is not one it found.
+    /// With no unique key, a row found that an update replaced since is followed to a row standing
+    /// in its place, one for each replaced.
     fn kept_to(&self, ti: usize, now: &[Row], found: &mut Option<Vec<Row>>) -> Result<Vec<usize>> {
         let Some(first) = found.as_ref() else {
             *found = Some(now.to_vec());
             return Ok((0..now.len()).collect());
         };
         let table = &self.catalog.tables[ti];
-        let columns: Vec<usize> = table
-            .orders
-            .iter()
-            .filter(|o| o.unique)
-            .find_map(|o| {
-                o.levels
-                    .iter()
-                    .map(|l| match l {
-                        Level::Column(c) if table.columns[*c].not_null => Some(*c),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<usize>>>()
-            })
-            .unwrap_or_else(|| (0..table.columns.len()).collect());
+        let unique = unique_key(table);
+        let keyed = unique.is_some();
+        let columns: Vec<usize> = unique.unwrap_or_else(|| (0..table.columns.len()).collect());
         let key = |r: &Row| -> Vec<Datum> { columns.iter().map(|&c| r[c].clone()).collect() };
         // How many rows it found the first time holding each key.
         let mut owed: std::collections::HashMap<Vec<Datum>, usize> = Default::default();
@@ -2916,9 +2921,48 @@ impl Snail {
                 }
             }
         }
+        // Rows found that no longer stand alike, as many of each as are gone: where an update
+        // replaced them, the keys on the table's order of the rows that replaced them.
+        let mut replaced: std::collections::HashMap<Vec<KeyValue>, usize> = Default::default();
+        if !keyed {
+            let mut standing: std::collections::HashMap<Vec<Datum>, usize> = Default::default();
+            for r in now {
+                *standing.entry(key(r)).or_default() += 1;
+            }
+            let mut gone: Vec<(&Row, usize)> = Vec::new();
+            let mut met: std::collections::HashSet<Vec<Datum>> = Default::default();
+            for f in first {
+                let k = key(f);
+                let n = owed[&k].saturating_sub(standing.get(&k).copied().unwrap_or(0));
+                if n > 0 && met.insert(k) {
+                    gone.push((f, n));
+                }
+            }
+            if !gone.is_empty() {
+                for to in self.chained_from(ti, &gone)? {
+                    *replaced.entry(to).or_default() += 1;
+                }
+            }
+        }
+        let order = table
+            .orders
+            .iter()
+            .find(|o| o.table_order)
+            .or(table.orders.first());
         let mut kept = Vec::new();
         for (i, r) in now.iter().enumerate() {
             if let Some(n) = owed.get_mut(&key(r)).filter(|n| **n > 0) {
+                *n -= 1;
+                kept.push(i);
+                continue;
+            }
+            let Some(order) = order.filter(|_| !replaced.is_empty()) else {
+                continue;
+            };
+            if let Some(n) = replaced
+                .get_mut(&key_of(table, order, r)?)
+                .filter(|n| **n > 0)
+            {
                 *n -= 1;
                 kept.push(i);
             }
@@ -4201,6 +4245,21 @@ impl Snail {
                     .locks
                     .contains(&lock::block_byte_of(self.lock_key(ti), oi, &entry.first));
                 if self.begun.is_some() && !held {
+                    continue;
+                }
+                // A block this writer staged, of a table with no unique key, holding rows its
+                // updates replaced, is left for a later prune: a writer waiting on those rows
+                // follows each to the row that replaced it.
+                let staged = self.rebased.get(&(ti, oi)).is_some_and(|log| {
+                    log.iter()
+                        .any(|r| r.entries.iter().any(|e| e.child == entry.child))
+                });
+                if staged
+                    && unique_key(&table).is_none()
+                    && !read_map(&self.reader, &entry, &head.level_text)?
+                        .chains
+                        .is_empty()
+                {
                     continue;
                 }
                 if !self.lock_blocks(ti, oi, vec![entry.clone()], Waiting::Try)? {

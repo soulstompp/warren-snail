@@ -4736,6 +4736,53 @@ fn group_by_distinct_drops_repeated_sets_and_all_keeps_them() {
     );
 }
 
+/// GROUP BY ALL or DISTINCT with no item after it, refused as 18.6's grammar refuses it, at what
+/// follows; under 19 a bare GROUP BY ALL is 19's own, not read.
+#[test]
+fn a_bare_group_by_all_or_distinct_is_a_syntax_error() {
+    let path = tmp("reader-gs-bare.snail");
+    let catalog = Catalog::parse(GS_DDL).unwrap();
+    warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for sql in GS_ROWS {
+        w.execute(sql).unwrap();
+    }
+    for (sql, near) in [
+        ("SELECT region, count(*) FROM gs.sale GROUP BY ALL;", "\";\""),
+        ("SELECT region, count(*) FROM gs.sale GROUP BY ALL", "end of input"),
+        ("SELECT region, count(*) FROM gs.sale GROUP BY ALL ORDER BY 1", "\"ORDER\""),
+        (
+            "SELECT region, count(*) FROM gs.sale GROUP BY ALL HAVING count(*) > 1",
+            "\"HAVING\"",
+        ),
+        ("SELECT * FROM (SELECT region FROM gs.sale GROUP BY ALL) q", "\")\""),
+        ("SELECT region FROM gs.sale GROUP BY ALL LIMIT 1", "\"LIMIT\""),
+        ("SELECT region, count(*) FROM gs.sale GROUP BY DISTINCT;", "\";\""),
+    ] {
+        let at = match near {
+            "end of input" => "syntax error at end of input".to_string(),
+            n => format!("syntax error at or near {n}"),
+        };
+        assert_eq!(refused(&mut w, sql), (Some("42601"), at), "{sql}");
+    }
+    answered(
+        &mut w,
+        &[(
+            "SELECT region, count(*) FROM gs.sale GROUP BY ALL region ORDER BY 1",
+            &["N|3", "S|3", "NULL|1"],
+        )],
+    );
+    let mut w = gs("bare-19");
+    assert_eq!(
+        refused(&mut w, "SELECT region, count(*) FROM gs.sale GROUP BY DISTINCT"),
+        (Some("42601"), "syntax error at end of input".to_string())
+    );
+    assert_eq!(
+        refused(&mut w, "SELECT region, count(*) FROM gs.sale GROUP BY ALL").1,
+        "GROUP BY ALL and its modifiers are not read"
+    );
+}
+
 #[test]
 fn grouping_sets_a_bit_for_each_argument_the_set_lacks() {
     let mut w = gs("bits");
@@ -5299,6 +5346,56 @@ fn an_arm_s_sorted_literal_is_text_before_its_set_operation_is_typed() {
             ("SELECT 1 UNION SELECT ALL '2' ORDER BY 1", &["1", "2"]),
             ("SELECT 1, 1 UNION ALL (SELECT '2', 2 ORDER BY 2)", &["1|1", "2|2"]),
             ("SELECT 'a' UNION SELECT DISTINCT 'b' ORDER BY 1", &["a", "b"]),
+        ],
+    );
+}
+
+/// A relation's star where an expression or a call's argument stands reads its whole row, as its
+/// name does; among ROW's arguments its columns; in a subquery's select list, where the
+/// subquery's FROM names no relation so, the columns of the query's around it.
+#[test]
+fn a_relation_s_star_reads_its_whole_row() {
+    let path = tmp("reader-whole-stars.snail");
+    write(&path, &Catalog::parse(WR_DDL).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    w.execute("INSERT INTO wr.a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, NULL, 50)")
+        .unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT ROW(a.*) FROM wr.a a WHERE a.id < 3 ORDER BY a.id",
+                &["(1,1,10)", "(2,1,20)"],
+            ),
+            ("SELECT count(a.*) FROM wr.a a", &["5"]),
+            ("SELECT row_to_json(a.*) FROM wr.a a WHERE a.id = 1", &["{\"id\":1,\"g\":1,\"k\":10}"]),
+            (
+                "SELECT a.id FROM wr.a a WHERE a.id < 3 AND EXISTS (SELECT a.*) ORDER BY a.id",
+                &["1", "2"],
+            ),
+            ("SELECT a.id FROM wr.a a ORDER BY a.* DESC", &["5", "4", "3", "2", "1"]),
+            ("SELECT ROW(a.*, 0) FROM wr.a a WHERE a.id = 1", &["(1,1,10,0)"]),
+            (
+                "SELECT row_to_json(a.*), row_to_json(b.*) FROM wr.a a JOIN wr.a b ON b.id = a.id \
+                 + 1 WHERE a.id = 1",
+                &["{\"id\":1,\"g\":1,\"k\":10}|{\"id\":2,\"g\":1,\"k\":20}"],
+            ),
+            (
+                "SELECT a.id FROM wr.a a WHERE EXISTS (SELECT a.* FROM wr.a b WHERE b.g = a.g AND \
+                 b.id <> a.id) ORDER BY a.id",
+                &["1", "2", "3", "4"],
+            ),
+            (
+                "SELECT a.id, (SELECT count(*) FROM (SELECT a.* FROM wr.a a WHERE a.id < 3) q) FROM \
+                 wr.a a WHERE a.id = 1",
+                &["1|2"],
+            ),
+            (
+                "SELECT a.id, (SELECT max(q.x) FROM (SELECT a.* FROM (VALUES (7), (8)) a(x)) q) \
+                 FROM wr.a a WHERE a.id = 1",
+                &["1|8"],
+            ),
+            ("SELECT count(DISTINCT a.*) FROM wr.a a", &["5"]),
         ],
     );
 }

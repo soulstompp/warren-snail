@@ -403,6 +403,63 @@ impl Snail {
         Ok(Since::Same)
     }
 
+    /// The keys on the table's order of the rows updates wrote in place of rows given, by the
+    /// newest root: a dead row an update left holding a given row's values names the key of the
+    /// row that replaced it. Each row is given with how many rows alike it stands for, and names
+    /// at most as many keys.
+    pub(super) fn chained_from(&self, ti: usize, rows: &[(&Row, usize)]) -> Result<Vec<Vec<KeyValue>>> {
+        let table = &self.catalog.tables[ti];
+        let order = table
+            .orders
+            .iter()
+            .find(|o| o.table_order)
+            .unwrap_or(&table.orders[0]);
+        let newest = self.reader.peek_root()?;
+        let Some((head, mut top)) = self.top_on(&newest, table, order)? else {
+            return Ok(Vec::new());
+        };
+        if top.entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut by_block: BTreeMap<Vec<usize>, Vec<(&Row, usize)>> = BTreeMap::new();
+        for &(r, n) in rows {
+            let key = key_of(table, order, r)?;
+            let mut path = Vec::new();
+            self.locate(&mut top, &head, &key, &mut path)?;
+            by_block.entry(path).or_default().push((r, n));
+        }
+        let held =
+            |r: &Row| -> Vec<Datum> { order.columns.iter().map(|&c| r[c].clone()).collect() };
+        let types: Vec<_> = order.columns.iter().map(|&c| table.columns[c].ty).collect();
+        let mut keys = Vec::new();
+        for (path, rows) in by_block {
+            let map = read_map(&self.reader, entry_at(&top, &path), &head.level_text)?;
+            if map.chains.is_empty() {
+                continue;
+            }
+            let columns = self.block_columns(table, order, &map)?;
+            let dead: HashSet<u32> = map.dead.iter().copied().collect();
+            let at = |p: usize| -> Vec<Datum> {
+                columns
+                    .iter()
+                    .zip(&types)
+                    .map(|(v, &ty)| datum_typed(v, p, ty))
+                    .collect()
+            };
+            for (r, n) in rows {
+                let values = held(r);
+                keys.extend(
+                    map.chains
+                        .iter()
+                        .filter(|(p, _)| dead.contains(p) && at(*p as usize) == values)
+                        .take(n)
+                        .map(|(_, to)| to.clone()),
+                );
+            }
+        }
+        Ok(keys)
+    }
+
     /// Tells the monitor of the blocks a statement's rows fall in on the newest root, on each order
     /// holding a column they change.
     pub(super) fn told_of_writes(

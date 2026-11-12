@@ -222,10 +222,11 @@ struct Locked {
 }
 
 /// What a locking question asks: the question without its limits, every locked table's key after
-/// the columns it returns; the columns it returns; its locked tables; and its OFFSET and LIMIT.
+/// the columns it returns; how many columns its answer holds past those it returns, a `*` among
+/// them standing for every column of its relations; its locked tables; and its OFFSET and LIMIT.
 struct Plan {
     asked: String,
-    width: usize,
+    appended: usize,
     locked: Vec<Locked>,
     offset: u64,
     limit: Option<u64>,
@@ -540,7 +541,7 @@ impl Snail {
                 s.projection.push(e);
             }
         }
-        let width = s.projection.len() - locked.iter().map(|t| t.read.len()).sum::<usize>();
+        let appended = locked.iter().map(|t| t.read.len()).sum::<usize>();
         let (mut offset, mut limit) = (0, None);
         match q.limit_clause.take() {
             None => {}
@@ -560,7 +561,7 @@ impl Snail {
         }
         Ok(Plan {
             asked: q.to_string(),
-            width,
+            appended,
             locked,
             offset,
             limit,
@@ -625,8 +626,9 @@ impl Snail {
         'round: loop {
             let base = self.root.generation;
             let (batch, round) = self.answer_with(&plan.asked, order, params)?;
+            let width = batch.num_columns() - plan.appended;
             let rows: Vec<Row> =
-                rows_of(&batch.project(&(plan.width..batch.num_columns()).collect::<Vec<_>>())?)?;
+                rows_of(&batch.project(&(width..batch.num_columns()).collect::<Vec<_>>())?)?;
             let kept: Vec<usize> = match &found {
                 None => {
                     found = Some(rows.iter().cloned().collect());
@@ -706,14 +708,11 @@ impl Snail {
                 self.unchanged_since(&plan, &rows, &locked_rows)?;
             }
             let picked = arrow::array::UInt32Array::from(chosen);
-            let columns = (0..plan.width)
+            let columns = (0..width)
                 .map(|c| arrow::compute::take(batch.column(c), &picked, None))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            let schema = std::sync::Arc::new(
-                batch
-                    .schema()
-                    .project(&(0..plan.width).collect::<Vec<_>>())?,
-            );
+            let schema =
+                std::sync::Arc::new(batch.schema().project(&(0..width).collect::<Vec<_>>())?);
             return Ok((RecordBatch::try_new(schema, columns)?, round));
         }
     }

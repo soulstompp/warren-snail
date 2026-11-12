@@ -3823,7 +3823,10 @@ fn along(table: &Table) -> Option<usize> {
 /// of its FROM's relations, by its alias or a table's name, read as that relation's whole row, as
 /// PostgreSQL's parser reads a lone name: a row of the relation's columns, of a table's row type, or
 /// of a record of the columns' names and types; an item so written keeps the name as its own. A
-/// name in ORDER BY or GROUP BY the select list gives an item is that item's. Each row made, by its
+/// name in ORDER BY or GROUP BY the select list gives an item is that item's. A relation's star
+/// where an expression stands, or among a call's arguments, is its whole row too; among ROW's, its
+/// columns, each an argument; and in a subquery's select list, where the subquery's own FROM names
+/// no relation so, its columns as the subquery reads the query's around it. Each row made, by its
 /// place, with its type.
 fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr, ColumnType)> {
     use sqlparser::ast::{VisitMut, VisitorMut};
@@ -3836,13 +3839,8 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
     for n in &from.items {
         n.leaves(&mut leaves);
     }
-    // A name's relation's row and its type, where no column bears the name.
-    let row_of = |name: &str| -> Option<(Expr, ColumnType)> {
-        let columns = typed.iter().map(|(q, n, _)| (q.as_deref(), n.as_str()));
-        if !pipeline::naming(columns, None, name).is_empty() {
-            return None;
-        }
-        let leaf = leaves.iter().find(|l| l.leaf_named() == Some(name))?;
+    // A relation's row and its type.
+    let row_of_leaf = |leaf: &Node| -> Option<(Expr, ColumnType)> {
         let fields: Vec<crate::composed::Field> = leaf
             .star
             .iter()
@@ -3870,31 +3868,127 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
             .collect();
         Some((Expr::Tuple(parts), ty))
     };
+    // A name's relation's row and its type, where no column bears the name.
+    let row_of = |name: &str| -> Option<(Expr, ColumnType)> {
+        let columns = typed.iter().map(|(q, n, _)| (q.as_deref(), n.as_str()));
+        if !pipeline::naming(columns, None, name).is_empty() {
+            return None;
+        }
+        let leaf = leaves.iter().find(|l| l.leaf_named() == Some(name))?;
+        row_of_leaf(leaf)
+    };
+    // A star's relation's row, its type and its columns' names.
+    let star_of = |n: &ObjectName| -> Option<(Expr, ColumnType, Vec<String>)> {
+        let leaf = star_leaf(&leaves, catalog, n)?;
+        let (row, ty) = row_of_leaf(leaf)?;
+        Some((row, ty, leaf.star.iter().map(|&p| typed[p].1.clone()).collect()))
+    };
     struct Rows<'r> {
         row_of: &'r dyn Fn(&str) -> Option<(Expr, ColumnType)>,
+        star_of: &'r dyn Fn(&ObjectName) -> Option<(Expr, ColumnType, Vec<String>)>,
         depth: usize,
+        // The names each subquery met so far binds in its FROM, the outermost first.
+        bound: Vec<Vec<String>>,
         made: Vec<(*const Expr, ColumnType)>,
+    }
+    impl Rows<'_> {
+        // In parentheses, a value compared as a composite is, not a row constructor's fields one
+        // by one.
+        fn whole(&mut self, row: Expr, ty: ColumnType) -> Expr {
+            let row = Box::new(row);
+            self.made.push((row.as_ref() as *const Expr, ty));
+            Expr::Nested(row)
+        }
     }
     impl VisitorMut for Rows<'_> {
         type Break = ();
-        fn pre_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
+        fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
             self.depth += 1;
+            let SetExpr::Select(s) = q.body.as_mut() else {
+                self.bound.push(Vec::new());
+                return ControlFlow::Continue(());
+            };
+            let mut binds = Vec::new();
+            for t in &s.from {
+                bound_names(&t.relation, &mut binds);
+                for j in &t.joins {
+                    bound_names(&j.relation, &mut binds);
+                }
+            }
+            self.bound.push(binds);
+            let mut items = Vec::with_capacity(s.projection.len());
+            for item in s.projection.drain(..) {
+                let SelectItem::QualifiedWildcard(
+                    sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n),
+                    o,
+                ) = &item
+                else {
+                    items.push(item);
+                    continue;
+                };
+                let last = n.0.last().and_then(|p| p.as_ident()).map(crate::catalog::ident);
+                let own = last
+                    .as_ref()
+                    .is_some_and(|l| self.bound.iter().flatten().any(|b| b == l));
+                match (self.star_of)(n).filter(|_| !own && o.to_string().is_empty()) {
+                    Some((_, _, columns)) => items.extend(columns.into_iter().map(|c| {
+                        let mut parts: Vec<Ident> =
+                            n.0.iter().filter_map(|p| p.as_ident().cloned()).collect();
+                        parts.push(Ident::with_quote('"', c));
+                        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))
+                    })),
+                    None => items.push(item),
+                }
+            }
+            s.projection = items;
             ControlFlow::Continue(())
         }
         fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
             self.depth -= 1;
+            self.bound.pop();
             ControlFlow::Continue(())
         }
         fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
-            if let (0, Expr::Identifier(i)) = (self.depth, &*e) {
-                if let Some((row, ty)) = (self.row_of)(&crate::catalog::ident(i)) {
-                    // In parentheses, a value compared as a composite is, not a row constructor's
-                    // fields one by one.
-                    *e = Expr::Nested(Box::new(row));
-                    if let Expr::Nested(row) = e {
-                        self.made.push((row.as_ref() as *const Expr, ty));
+            if self.depth != 0 {
+                return ControlFlow::Continue(());
+            }
+            match e {
+                Expr::Identifier(i) => {
+                    if let Some((row, ty)) = (self.row_of)(&crate::catalog::ident(i)) {
+                        *e = self.whole(row, ty);
                     }
                 }
+                Expr::QualifiedWildcard(n, _) => {
+                    if let Some((row, ty, _)) = (self.star_of)(n) {
+                        *e = self.whole(row, ty);
+                    }
+                }
+                Expr::Function(f) => {
+                    let spread = crate::catalog::object_name(&f.name).eq_ignore_ascii_case("row");
+                    let FunctionArguments::List(list) = &mut f.args else {
+                        return ControlFlow::Continue(());
+                    };
+                    let mut args = Vec::with_capacity(list.args.len());
+                    for a in list.args.drain(..) {
+                        let FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(n)) = &a else {
+                            args.push(a);
+                            continue;
+                        };
+                        match ((self.star_of)(n), spread) {
+                            (Some((Expr::Tuple(parts), _, _)), true) => args.extend(
+                                parts
+                                    .into_iter()
+                                    .map(|p| FunctionArg::Unnamed(FunctionArgExpr::Expr(p))),
+                            ),
+                            (Some((row, ty, _)), false) => args.push(FunctionArg::Unnamed(
+                                FunctionArgExpr::Expr(self.whole(row, ty)),
+                            )),
+                            _ => args.push(a),
+                        }
+                    }
+                    list.args = args;
+                }
+                _ => {}
             }
             ControlFlow::Continue(())
         }
@@ -3924,7 +4018,9 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
         |e: &Expr| matches!(e, Expr::Identifier(i) if named.contains(&crate::catalog::ident(i)));
     let mut rows = Rows {
         row_of: &row_of,
+        star_of: &star_of,
         depth: 0,
+        bound: Vec::new(),
         made: Vec::new(),
     };
     for item in &mut s.projection {
@@ -3949,6 +4045,70 @@ fn whole_rows(q: &mut Query, from: &From, catalog: &Catalog) -> Vec<(*const Expr
         }
     }
     rows.made
+}
+
+/// The names a relation of a FROM binds its columns by: its alias, or a table's or a function's
+/// own name; a join's, each of its sides'.
+fn bound_names(f: &TableFactor, out: &mut Vec<String>) {
+    match f {
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => match alias {
+            Some(a) => out.push(crate::catalog::ident(&a.name)),
+            None => {
+                bound_names(&table_with_joins.relation, out);
+                for j in &table_with_joins.joins {
+                    bound_names(&j.relation, out);
+                }
+            }
+        },
+        TableFactor::Table { name, alias, .. } | TableFactor::Function { name, alias, .. } => {
+            out.push(match alias {
+                Some(a) => crate::catalog::ident(&a.name),
+                None => {
+                    let full = crate::catalog::object_name(name);
+                    full.rsplit('.').next().unwrap_or(&full).to_string()
+                }
+            })
+        }
+        TableFactor::Derived { alias: Some(a), .. }
+        | TableFactor::UNNEST { alias: Some(a), .. }
+        | TableFactor::TableFunction { alias: Some(a), .. } => {
+            out.push(crate::catalog::ident(&a.name))
+        }
+        _ => {}
+    }
+}
+
+/// The relation a qualified star names among a FROM's, by its alias or its name, or by a table's
+/// schema and name where it names no alias.
+fn star_leaf<'n>(leaves: &[&'n Node], catalog: &Catalog, n: &ObjectName) -> Option<&'n Node> {
+    let q = match n.0.len() {
+        1 => crate::catalog::object_name(n),
+        _ => {
+            let names: Vec<String> = crate::catalog::object_name(n)
+                .split('.')
+                .map(str::to_string)
+                .collect();
+            pipeline::qualified(&names)
+        }
+    };
+    leaves
+        .iter()
+        .find(|l| match (&l.what, q.strip_prefix(pipeline::TABLE)) {
+            (
+                What::Table {
+                    table,
+                    aliased: false,
+                    ..
+                },
+                Some(full),
+            ) => crate::oids::full(&catalog.tables[*table].name) == full,
+            (_, Some(_)) => false,
+            (_, None) => l.leaf_named() == Some(q.as_str()),
+        })
+        .copied()
 }
 
 /// A star in a select list read as the columns it names, each by its place in the FROM's row.
@@ -3978,7 +4138,7 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> 
                 if o.to_string() != "" {
                     return Err(Error::new(format!("{kind}.* {o} is not read")));
                 }
-                let q = match &kind {
+                let (q, n) = match &kind {
                     sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n)
                         if n.0.len() > 1 =>
                     {
@@ -3986,10 +4146,10 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> 
                             .split('.')
                             .map(str::to_string)
                             .collect();
-                        pipeline::qualified(&names)
+                        (pipeline::qualified(&names), n)
                     }
                     sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(n) => {
-                        crate::catalog::object_name(n)
+                        (crate::catalog::object_name(n), n)
                     }
                     other => return Err(Error::new(format!("{other}.* is not read"))),
                 };
@@ -4000,21 +4160,8 @@ fn starred(projection: &mut Vec<SelectItem>, from: &From, catalog: &Catalog) -> 
                 for n in &from.items {
                     n.leaves(&mut leaves);
                 }
-                let found = leaves
-                    .iter()
-                    .find(|l| match (&l.what, q.strip_prefix(pipeline::TABLE)) {
-                        (
-                            What::Table {
-                                table,
-                                aliased: false,
-                                ..
-                            },
-                            Some(full),
-                        ) => crate::oids::full(&catalog.tables[*table].name) == full,
-                        (_, Some(_)) => false,
-                        (_, None) => l.leaf_named() == Some(q.as_str()),
-                    })
-                    .ok_or_else(|| from.no_entry(catalog, &q))?;
+                let found =
+                    star_leaf(&leaves, catalog, n).ok_or_else(|| from.no_entry(catalog, &q))?;
                 out.extend(by_place(found.star.clone()));
             }
             other => out.push(other),

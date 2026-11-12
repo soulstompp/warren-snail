@@ -10354,8 +10354,8 @@ pub(super) fn says_distinct(s: &sqlparser::ast::Select) -> bool {
 /// or orders by what it does not return; or it calls a function, an aggregate of a column's values
 /// counted, or over each value once, filtered or ordered, or an operator on numbers or on a document,
 /// the question path does not read, or reads a CASE, a subscript, a COLLATE or a parameter, or
-/// returns a cast; or calls an aggregate or a window function in WHERE, which the pipeline refuses
-/// as PostgreSQL's parser does.
+/// returns a cast or a truth; or calls an aggregate or a window function in WHERE, which the
+/// pipeline refuses as PostgreSQL's parser does.
 pub fn hands_over(q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
@@ -10424,6 +10424,7 @@ pub fn hands_over(q: &Query) -> bool {
     let one_table = matches!(s.from.as_slice(), [only] if only.joins.is_empty());
     if returned.iter().any(|e| {
         compares_no_constant(e) || is_written_constant(e) || any_or_all(e) || holds_cast(e)
+            || holds_truth(e)
     })
         || one_table && s.selection.as_ref().is_some_and(compares_no_constant)
         || s.selection
@@ -10511,6 +10512,34 @@ fn holds_cast(e: &Expr) -> bool {
         std::ops::ControlFlow::<()>::Continue(())
     });
     found
+}
+
+/// Whether a select list's item holds a truth made of its values, a test for NULL or a comparison
+/// among them, which the question path reads only as a condition: the pipeline returns it.
+fn holds_truth(e: &Expr) -> bool {
+    sqlparser::ast::visit_expressions(e, |x| match x {
+        Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_)
+        | Expr::IsDistinctFrom(..)
+        | Expr::IsNotDistinctFrom(..)
+        | Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        } => std::ops::ControlFlow::Break(()),
+        Expr::BinaryOp { op, .. }
+            if is_comparison(op) || matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+        {
+            std::ops::ControlFlow::Break(())
+        }
+        _ => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// Whether a select list's item is a constant written out, which the question path holds no level
@@ -10655,7 +10684,8 @@ fn compares_no_constant(e: &Expr) -> bool {
 }
 
 /// Whether a question over the snail's tables reads one's whole row, which only the pipeline reads:
-/// a bare name none of their columns bears that names one of them, by its alias or its name.
+/// a bare name none of their columns bears that names one of them, by its alias or its name, or a
+/// star of one where an expression or a call's argument stands.
 pub fn reads_whole_rows(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
     let SetExpr::Select(s) = q.body.as_ref() else {
         return false;
@@ -10679,9 +10709,21 @@ pub fn reads_whole_rows(catalog: &crate::catalog::Catalog, q: &Query) -> bool {
             names.push(alias.as_ref().map_or(last, |a| ident(&a.name)));
         }
     }
+    let starred = |n: &sqlparser::ast::ObjectName| {
+        n.0.last()
+            .and_then(|p| p.as_ident())
+            .is_some_and(|i| names.contains(&ident(i)))
+    };
     sqlparser::ast::visit_expressions(q, |e| match e {
         Expr::Identifier(i)
             if names.contains(&ident(i)) && !columns.contains(&ident(i).as_str()) =>
+        {
+            std::ops::ControlFlow::Break(())
+        }
+        Expr::QualifiedWildcard(n, _) if starred(n) => std::ops::ControlFlow::Break(()),
+        Expr::Function(f)
+            if matches!(&f.args, FunctionArguments::List(l) if l.args.iter().any(|a| matches!(a,
+                FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(n)) if starred(n)))) =>
         {
             std::ops::ControlFlow::Break(())
         }

@@ -454,16 +454,32 @@ fn a_whole_row_reads_every_column_of_it() {
     ] {
         same(&path, q, want);
     }
-    for q in [
-        "SELECT ROW(a.*) FROM s.a a WHERE a.id < 3",
-        "SELECT count(a.*) FROM s.a a",
-        "SELECT row_to_json(a.*) FROM s.a a WHERE a.id < 3",
-        "SELECT a.id FROM s.a a WHERE a.id < 3 AND EXISTS (SELECT a.*)",
-        "SELECT (SELECT count(a) FROM s.b b WHERE b.id < 2) FROM s.a a WHERE a.id < 2",
-        "SELECT a.id FROM s.a a WHERE a.id < 3 ORDER BY a.*",
+    // A relation's star read as its whole row, or among ROW's arguments as its columns.
+    for (q, want) in [
+        (
+            "SELECT ROW(a.*)::text FROM s.a a WHERE a.id < 3",
+            &["(0,0,\"name 0\")", "(1,1,\"name 1\")", "(2,2,\"name 2\")"][..],
+        ),
+        ("SELECT count(a.*) FROM s.a a", &["3000"]),
+        (
+            "SELECT row_to_json(a.*) FROM s.a a WHERE a.id < 3",
+            &[
+                "{\"id\":0,\"g\":0,\"name\":\"name 0\"}",
+                "{\"id\":1,\"g\":1,\"name\":\"name 1\"}",
+                "{\"id\":2,\"g\":2,\"name\":\"name 2\"}",
+            ],
+        ),
+        ("SELECT a.id FROM s.a a WHERE a.id < 3 AND EXISTS (SELECT a.*)", &["0", "1", "2"]),
+        ("SELECT a.id FROM s.a a WHERE a.id < 3 ORDER BY a.*", &["0", "1", "2"]),
     ] {
-        refused(&path, q);
+        same(&path, q, want);
     }
+    // An outer relation's whole row in a subquery is not read; 18.6 refuses this one too, its count
+    // the query's around, so that the subquery returns two rows.
+    refused(
+        &path,
+        "SELECT (SELECT count(a) FROM s.b b WHERE b.id < 2) FROM s.a a WHERE a.id < 2",
+    );
 }
 
 #[test]

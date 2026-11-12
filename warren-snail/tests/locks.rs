@@ -449,6 +449,54 @@ fn a_locking_clause_postgresql_refuses_is_refused_in_its_words() {
     assert!(e.contains("open it to write"), "{e}");
 }
 
+/// A `*` beside a locking clause returns every column of its relations, as without one: the key
+/// locked rows are read by is read past them.
+#[test]
+fn a_star_beside_a_locking_clause_returns_every_column() {
+    let path = made("star");
+    let mut w = Snail::open_writing(&path).unwrap();
+    let answered = |w: &mut Snail, sql: &str| shown(run(w, sql).answer.as_ref().unwrap());
+    for (sql, rows) in [
+        ("SELECT * FROM a.t WHERE id = 2 FOR UPDATE", &["2,2,two"][..]),
+        (
+            "SELECT * FROM a.t t ORDER BY id FOR SHARE",
+            &["1,1,one", "2,2,two", "3,5,three"][..],
+        ),
+        (
+            "SELECT t.*, u.w FROM a.t t JOIN a.u u ON u.t_id = t.id WHERE t.id = 1 ORDER BY u.w \
+             FOR UPDATE OF t",
+            &["1,1,one,100", "1,1,one,110"][..],
+        ),
+        (
+            "SELECT *, t.g * 2 AS d FROM a.t t WHERE t.id = 3 FOR NO KEY UPDATE",
+            &["3,5,three,10"][..],
+        ),
+        (
+            "SELECT * FROM a.inv WHERE id = 2 FOR KEY SHARE",
+            &["2,20,3.75,b,75.00"][..],
+        ),
+        (
+            "SELECT * FROM a.t ORDER BY id LIMIT 1 OFFSET 1 FOR UPDATE",
+            &["2,2,two"][..],
+        ),
+    ] {
+        assert_eq!(answered(&mut w, sql), rows, "{sql}");
+    }
+    run(&mut w, "BEGIN");
+    run(
+        &mut w,
+        "DECLARE c CURSOR FOR SELECT * FROM a.t WHERE id < 3 ORDER BY id FOR UPDATE",
+    );
+    assert_eq!(answered(&mut w, "FETCH 2 FROM c"), ["1,1,one", "2,2,two"]);
+    run(&mut w, "COMMIT");
+    run(&mut w, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(
+        answered(&mut w, "SELECT * FROM a.t WHERE id = 1 FOR UPDATE"),
+        ["1,1,one"]
+    );
+    run(&mut w, "COMMIT");
+}
+
 #[test]
 fn repeatable_read_reads_the_first_statement_s_snapshot_and_refuses_a_row_changed_since() {
     let path = made("repeatable");

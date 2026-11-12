@@ -936,9 +936,16 @@ fn worded(
             }
             // GROUP BY DISTINCT, which sqlparser does not read, written as its mark before the
             // first item (`SETS_DISTINCT`); GROUP BY ALL, the default, as GROUP BY where an item
-            // follows, a bare one left as written.
+            // follows. Either with no item after it is refused where PostgreSQL's grammar refuses
+            // it, at what follows; a bare GROUP BY ALL is left as written from 19 on.
             Some("BY") if casts && word(i.wrapping_sub(1)).as_deref() == Some("GROUP") => {
                 match word(i + 1).as_deref() {
+                    Some("DISTINCT") | Some("ALL")
+                        if !item_follows(i + 2)
+                            && (release < 19 || word(i + 1).as_deref() == Some("DISTINCT")) =>
+                    {
+                        return Err(near(i + 2));
+                    }
                     Some("DISTINCT") => swaps.push((
                         solid[i + 1].1,
                         solid[i + 1].2,
