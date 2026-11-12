@@ -2789,6 +2789,43 @@ fn ddl_reading_a_relation_another_is_changing_waits_then_answers() {
     );
 }
 
+// A view or a function body the snail does not print, and a body written in quotes, wait on a
+// table they read as 18.6's do: its parse analysis opens each, printed or not, and a quoted body
+// is analyzed as it is made.
+#[test]
+fn a_declaration_whose_question_is_not_printed_waits_on_what_it_reads() {
+    let (mut a, _b, path) = named("unprinted-read");
+    let locked = "ALTER TABLE t ADD CONSTRAINT c40 CHECK (y > 0)";
+    for theirs in [
+        "CREATE VIEW v40 AS SELECT k, sum(y) OVER (ORDER BY y RANGE BETWEEN 1 PRECEDING AND \
+         CURRENT ROW) AS s FROM t",
+        "CREATE FUNCTION f41() RETURNS bigint LANGUAGE sql RETURN (SELECT count(*) OVER (ORDER BY \
+         1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t LIMIT 1)",
+        "CREATE FUNCTION f42() RETURNS bigint LANGUAGE sql AS 'SELECT (SELECT count(*) FROM t)'",
+    ] {
+        a.execute("BEGIN").unwrap();
+        a.execute(locked).unwrap();
+        let rx = later(&path, &[theirs]);
+        assert!(waits(&rx), "{theirs} waits on {locked}");
+        a.execute("ROLLBACK").unwrap();
+        assert_eq!(next(&rx), Ok(0), "{theirs}");
+    }
+    // A quoted body of another table, and a view whose WITH query takes the table's name, do not
+    // wait.
+    a.execute("BEGIN").unwrap();
+    a.execute(locked).unwrap();
+    let rx = later(
+        &path,
+        &[
+            "CREATE FUNCTION f43() RETURNS bigint LANGUAGE sql AS 'SELECT (SELECT count(*) FROM t8)'",
+            "CREATE VIEW v44 AS WITH t AS (SELECT 1 AS y) SELECT y, sum(y) OVER (ORDER BY y RANGE \
+             BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t",
+        ],
+    );
+    assert_eq!((next(&rx), next(&rx)), (Ok(0), Ok(0)));
+    a.execute("ROLLBACK").unwrap();
+}
+
 #[test]
 fn a_question_names_as_committed_and_reads_its_snapshot() {
     let (mut a, mut b, path) = named("question-committed");

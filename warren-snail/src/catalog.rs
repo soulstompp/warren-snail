@@ -3598,6 +3598,13 @@ mod tests {
         .unwrap();
         let checks: Vec<&str> = c.tables[0].checks.iter().map(|k| k.name.as_str()).collect();
         assert_eq!(checks, ["t_a_check", "t_a_check1"]);
+        // A column read under IS NORMALIZED names its check, as 18.6 names it.
+        let c = Catalog::parse(
+            "CREATE SCHEMA s; CREATE TABLE s.t (id integer PRIMARY KEY, t text CHECK (t IS NFC NORMALIZED));",
+        )
+        .unwrap();
+        let checks: Vec<&str> = c.tables[0].checks.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(checks, ["t_t_check"]);
     }
 
     #[test]

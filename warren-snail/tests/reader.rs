@@ -317,6 +317,70 @@ fn distinct_on_refuses_in_18_6_s_words() {
     }
 }
 
+// A COLLATE over a type no collation orders is refused as 18.6 refuses it while typing the
+// expression: before DISTINCT ON's words and before the collation's name is looked up, the type
+// named as format_type_be names it, a domain by its own name.
+#[test]
+fn a_collation_on_an_integer_is_refused_before_distinct_on_s_words() {
+    let mut w = snail("collate-integer");
+    let refusals: &[(&str, &str)] = &[
+        ("SELECT DISTINCT ON (g) g, id FROM dn.a ORDER BY g COLLATE \"C\"", "integer"),
+        ("SELECT DISTINCT ON (g) g, id FROM dn.a ORDER BY id COLLATE \"C\"", "integer"),
+        ("SELECT g FROM dn.a ORDER BY g COLLATE \"C\"", "integer"),
+        ("SELECT g COLLATE \"C\" FROM dn.a", "integer"),
+        ("SELECT id FROM dn.a WHERE g COLLATE \"C\" = 1", "integer"),
+        ("SELECT count(*) FROM dn.a GROUP BY g COLLATE \"C\"", "integer"),
+        ("SELECT id FROM dn.a ORDER BY (g + 1) COLLATE \"C\"", "integer"),
+        ("SELECT ARRAY[g] COLLATE \"C\" FROM dn.a", "integer[]"),
+        ("SELECT x FROM dn.n ORDER BY x COLLATE \"C\"", "numeric"),
+        ("SELECT 1 COLLATE \"C\"", "integer"),
+        ("SELECT 1 COLLATE \"nosuch\"", "integer"),
+        ("SELECT id FROM dn.a ORDER BY id COLLATE \"nosuch\"", "integer"),
+        ("SELECT true COLLATE \"C\"", "boolean"),
+        ("SELECT ROW(1, 2) COLLATE \"C\"", "record"),
+        ("SELECT sum(id) COLLATE \"C\" FROM dn.a", "bigint"),
+        ("SELECT id FROM dn.a LIMIT 1 COLLATE \"C\"", "integer"),
+    ];
+    for (sql, ty) in refusals {
+        assert_eq!(
+            refused(&mut w, sql),
+            (Some("42804"), format!("collations are not supported by type {ty}")),
+            "{sql}"
+        );
+    }
+    answered(
+        &mut w,
+        &[
+            ("SELECT '1' COLLATE \"C\" AS x", &["1"]),
+            ("SELECT NULL COLLATE \"C\" AS x", &["NULL"]),
+            (
+                "SELECT k COLLATE \"C\" AS x FROM dn.a WHERE k IS NOT NULL ORDER BY 1",
+                &["x", "x", "x", "y", "y"],
+            ),
+        ],
+    );
+    let path = tmp("reader-collate-types.snail");
+    let ddl = "CREATE SCHEMA cz; CREATE DOMAIN cz.d AS integer; \
+               CREATE TABLE cz.t (id integer NOT NULL, d cz.d, m numeric(10,2), ts timestamp(3), \
+               b bit(3), vb bit varying(5), PRIMARY KEY (id));";
+    write(&path, &Catalog::parse(ddl).unwrap(), &[]).unwrap();
+    let mut w = Snail::open_writing(&path).unwrap();
+    for (sql, ty) in [
+        ("SELECT d COLLATE \"C\" FROM cz.t", "cz.d"),
+        ("SELECT m COLLATE \"C\" FROM cz.t", "numeric"),
+        ("SELECT ARRAY[m] COLLATE \"C\" FROM cz.t", "numeric[]"),
+        ("SELECT ts COLLATE \"C\" FROM cz.t", "timestamp without time zone"),
+        ("SELECT b COLLATE \"C\" FROM cz.t", "bit"),
+        ("SELECT vb COLLATE \"C\" FROM cz.t", "bit varying"),
+    ] {
+        assert_eq!(
+            refused(&mut w, sql),
+            (Some("42804"), format!("collations are not supported by type {ty}")),
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn distinct_on_groups_nulls_and_equal_values_as_one() {
     // numeric 1.00 and 1.0 are one key, each row printing its own; float8 0 and -0 one, NaN one.

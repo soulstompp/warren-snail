@@ -259,12 +259,19 @@ impl Snail {
         let _named = crate::oids::named(catalog.oids.clone());
         let cat = crate::deparse::cat::Cat::of(catalog);
         let mut read: Vec<u32> = Vec::new();
+        // The relations a question deparse does not read names, by their full names.
+        let mut named: Vec<String> = Vec::new();
         for v in &catalog.views {
             if self.catalog.views.iter().any(|x| x.name == v.name && x.query == v.query) {
                 continue;
             }
-            if let Ok((q, _)) = crate::deparse::query::view_query(&cat, v) {
-                read.extend(relations_read(&cat, &q));
+            match crate::deparse::query::view_query(&cat, v) {
+                Ok((q, _)) => read.extend(relations_read(&cat, &q)),
+                Err(_) => {
+                    let bound = crate::grammar::bound(&v.query);
+                    let parsed = super::image::parse_sql(bound.as_deref().unwrap_or(&v.query))?;
+                    named.extend(named_in(&parsed));
+                }
             }
         }
         for f in &catalog.functions {
@@ -275,19 +282,32 @@ impl Snail {
                 continue;
             }
             // A body naming a relation that does not stand is refused, as its parse analysis is.
+            // A body in quotes is analyzed as it is made, and one deparse does not read is still
+            // opened: each locks the relations its expression names.
             match crate::deparse::funcs::own_body(&cat, f) {
                 Ok(Some(q)) => read.extend(relations_read(&cat, &q)),
                 Err(e) if e.sqlstate() == Some("42P01") => return Err(e),
-                _ => {}
+                Ok(None) | Err(_) => named.extend(named_in(&f.body)),
             }
         }
         let mut wanted: Vec<(Locked, Mode)> = Vec::new();
+        let mut want = |n: &str| {
+            let l = Locked::Relation(n.to_string());
+            if !wanted.iter().any(|(w, _)| *w == l) {
+                wanted.push((l, AccessShare));
+            }
+        };
         for oid in read {
             if let Some(crate::oids::Object::Class(n)) = catalog.oids.object(oid) {
-                let l = Locked::Relation(n.clone());
-                if !wanted.iter().any(|(w, _)| *w == l) {
-                    wanted.push((l, AccessShare));
-                }
+                want(n);
+            }
+        }
+        for n in &named {
+            let stands = catalog.tables.iter().any(|t| crate::oids::full(&t.name) == *n)
+                || catalog.views.iter().any(|v| crate::oids::full(&v.name) == *n)
+                || catalog.sequences.iter().any(|s| crate::oids::full(&s.name) == *n);
+            if stands {
+                want(n);
             }
         }
         for s in &catalog.sequences {
@@ -425,6 +445,50 @@ impl Snail {
         }
         Ok(())
     }
+}
+
+/// The relations a statement's text names as FROM items, at every level, each by its full name: a
+/// name alone in public, a WITH query's name passed over, a function in FROM not one. What its parse
+/// analysis opens, read where deparse does not read the question.
+fn named_in(node: &impl sqlparser::ast::Visit) -> Vec<String> {
+    use crate::deparse::analyze::folded;
+    use sqlparser::ast::{Query, TableFactor, Visitor};
+    use std::ops::ControlFlow;
+    #[derive(Default)]
+    struct Named {
+        with: Vec<String>,
+        items: Vec<Vec<String>>,
+    }
+    impl Visitor for Named {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            for c in q.with.iter().flat_map(|w| &w.cte_tables) {
+                self.with.push(folded(&c.alias.name));
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_table_factor(&mut self, t: &TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table {
+                name, args: None, ..
+            } = t
+            {
+                self.items
+                    .push(name.0.iter().filter_map(|p| p.as_ident().map(folded)).collect());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut v = Named::default();
+    let _ = node.visit(&mut v);
+    v.items
+        .iter()
+        .filter_map(|parts| match parts.as_slice() {
+            [n] if v.with.contains(n) => None,
+            [n] => Some(format!("public.{n}")),
+            [s, n] => Some(format!("{s}.{n}")),
+            _ => None,
+        })
+        .collect()
 }
 
 /// LOCK [TABLE] [ONLY] name [*] [, …] [IN mode MODE] [NOWAIT], read off its words as PostgreSQL's

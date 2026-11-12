@@ -389,7 +389,17 @@ impl Typing<'_> {
             }
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => self.column(e),
             Expr::Nested(x) => self.type_of(x)?,
-            Expr::Collate { expr, .. } => self.type_of(expr)?,
+            // A COLLATE over a type no collation orders is refused as it is typed, before the
+            // collation's name is looked up; an untyped literal is let go.
+            Expr::Collate { expr, .. } => match self.type_of(expr)? {
+                Some(t) if !super::collate::collatable(t) => {
+                    let named = self.domain(expr).unwrap_or_else(|| type_name(t));
+                    return Err(Error::new(format!(
+                        "collations are not supported by type {named}"
+                    )));
+                }
+                t => t,
+            },
             Expr::Value(v) => match &v.value {
                 SqlValue::Number(s, _) => Some(number_type(s)),
                 SqlValue::Boolean(_) => Some(ColumnType::Boolean),
@@ -1970,7 +1980,21 @@ fn type_keyword(f: &sqlparser::ast::Function) -> Option<Error> {
 
 /// A type's name as PostgreSQL's format_type_be writes it in an error: without its modifier.
 pub(crate) fn type_name(t: ColumnType) -> String {
-    unmodified(t).pg_name()
+    let element = match t {
+        ColumnType::Composed(r) => match r.def() {
+            crate::composed::Composed::Array {
+                element,
+                domain: None,
+            } => Some(*element),
+            _ => None,
+        },
+        _ => None,
+    };
+    match (t, element) {
+        (ColumnType::Bit(_), _) => "bit".into(),
+        (_, Some(e)) => format!("{}[]", type_name(e)),
+        _ => unmodified(t).pg_name(),
+    }
 }
 
 /// A comparison typed as PostgreSQL's parser chooses its operator: a quoted literal beside a number

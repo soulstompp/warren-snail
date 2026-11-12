@@ -1,7 +1,8 @@
 //! pg_catalog's tables as relations: the built-in rows of the file's release and the rows of the
 //! file's own objects, in the columns that release defines; a column only a server fills refused
-//! where a statement asks it, and a table only a server holds refused whole; a view's rows refused
-//! by its name where the snail does not print its question, never left out.
+//! where a statement asks it, and a table only a server holds refused whole; the rows made from a
+//! view's question, a function's body or a stored expression refused by its object's name where the
+//! snail does not print it, never left out.
 
 mod weather;
 
@@ -349,4 +350,64 @@ fn a_file_s_range_is_aligned_as_its_subtype() {
         pairs(columns),
         ["id|i", "a|i", "b|i", "c|d", "d|d", "e|i", "f|i", "h|i", "i|i", "j|d"]
     );
+}
+
+// A function's body, a table's CHECK or generated column, and a domain's CHECK or DEFAULT the snail
+// does not print refuse the catalogs made from them by the object's name, as a view's question does: 18.6
+// answers each, and refuses the DROP 2BP01 for the function; never their rows left out.
+#[test]
+#[cfg(feature = "standalone")]
+fn a_body_or_a_stored_expression_the_snail_does_not_print_is_refused_by_name() {
+    let depend = "SELECT count(*)::text FROM pg_depend WHERE refobjid = 'dn.a'::regclass";
+    let constraints = "SELECT conname::text FROM pg_constraint WHERE conrelid = 'dn.a'::regclass";
+    let normal = "IS NFC NORMALIZED is not printed as PostgreSQL prints it";
+    let cases: [(&str, String, &[&str]); 5] = [
+        (
+            "CREATE FUNCTION dn.f() RETURNS bigint LANGUAGE sql RETURN (SELECT count(*) OVER \
+             (ORDER BY 1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM dn.a LIMIT 1);",
+            "the function dn.f() is not read: a RANGE frame with an offset is not printed as \
+             PostgreSQL prints it"
+                .into(),
+            &[depend],
+        ),
+        (
+            "CREATE TABLE dn.c (id integer PRIMARY KEY, t text CHECK (t IS NFC NORMALIZED));",
+            format!("the constraint c_t_check on table dn.c is not read: t {normal}"),
+            &[depend, constraints],
+        ),
+        (
+            "CREATE TABLE dn.c (id integer PRIMARY KEY, t text, \
+             u boolean GENERATED ALWAYS AS (t IS NFC NORMALIZED) STORED);",
+            format!("the default value for column u of table dn.c is not read: t {normal}"),
+            &[depend],
+        ),
+        (
+            "CREATE DOMAIN dn.d AS text CHECK (VALUE IS NFC NORMALIZED);",
+            format!("the constraint d_check on domain dn.d is not read: VALUE {normal}"),
+            &[depend],
+        ),
+        (
+            "CREATE DOMAIN dn.d AS boolean DEFAULT ('x' IS NFC NORMALIZED);",
+            format!("the type dn.d is not read: 'x' {normal}"),
+            &[depend],
+        ),
+    ];
+    for (i, (made, why, asked)) in cases.iter().enumerate() {
+        let path = tmp(&format!("pgc-unprinted-{i}.snail"));
+        let catalog = Catalog::parse(&format!(
+            "CREATE SCHEMA dn; CREATE TABLE dn.a (id integer PRIMARY KEY, g integer); {made}"
+        ))
+        .unwrap();
+        warren_snail::write::write_released(&path, &catalog, &[], &[], weather::span(), 18)
+            .unwrap();
+        let mut snail = Snail::open(&path).unwrap();
+        for q in *asked {
+            assert_eq!(snail.ask(q, None).unwrap_err().0, *why, "{made}: {q}");
+        }
+        drop(snail);
+        if i == 0 {
+            let mut w = Snail::open_writing(&path).unwrap();
+            assert_eq!(w.execute("DROP TABLE dn.a").unwrap_err().0, *why);
+        }
+    }
 }

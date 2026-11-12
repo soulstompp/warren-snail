@@ -6996,7 +6996,8 @@ pub(crate) fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         | Expr::IsFalse(expr)
         | Expr::IsNotFalse(expr)
         | Expr::IsUnknown(expr)
-        | Expr::IsNotUnknown(expr) => each_expr(expr, f),
+        | Expr::IsNotUnknown(expr)
+        | Expr::IsNormalized { expr, .. } => each_expr(expr, f),
         Expr::Between {
             expr, low, high, ..
         } => {

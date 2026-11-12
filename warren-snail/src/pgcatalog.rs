@@ -932,8 +932,8 @@ impl<'a> File<'a> {
             "pg_type" => self.pg_types(),
             "pg_attribute" => self.attributes()?,
             "pg_attrdef" => self.defaults(),
-            "pg_constraint" => self.constraints(),
-            "pg_index" => self.indexes(),
+            "pg_constraint" => self.constraints()?,
+            "pg_index" => self.indexes()?,
             "pg_enum" => self.labels(),
             "pg_sequence" => self.sequences(),
             "pg_collation" => self.collations(),
@@ -1713,8 +1713,7 @@ impl<'a> File<'a> {
                 let rel = self.oid(Object::Class(format!("{schema}.{}", i.name)));
                 let cat = cat.get_or_insert_with(|| crate::deparse::cat::Cat::of(self.catalog));
                 let classes = crate::deparse::defs::index_classes(cat, rel)
-                    .ok()
-                    .flatten()
+                    .map_err(|e| unread(&format!("index {schema}.{}", i.name), e))?
                     .map(|(c, _)| c)
                     .unwrap_or_default();
                 for (k, &col) in i.keys.iter().chain(&i.include).enumerate() {
@@ -1873,7 +1872,7 @@ impl<'a> File<'a> {
         r
     }
 
-    fn constraints(&self) -> Vec<Row> {
+    fn constraints(&self) -> Result<Vec<Row>> {
         let mut out = Vec::new();
         for tb in self.tables() {
             let n = full(&tb.name);
@@ -1890,12 +1889,14 @@ impl<'a> File<'a> {
             }
             let cat = (!tb.checks.is_empty()).then(|| crate::deparse::cat::Cat::of(self.catalog));
             for (ci, c) in tb.checks.iter().enumerate() {
-                // Its keys: the columns its expression reads, each once, in the order met.
-                let keys = cat
-                    .as_ref()
-                    .and_then(|cat| crate::deparse::stored_tree(cat, "check", rel, ci as i64).ok())
-                    .map(|node| crate::deparse::depend::columns_read(&node))
-                    .unwrap_or_default();
+                // Its keys: the columns its expression reads, each once, in the order met; refused
+                // by its name where deparse does not read its expression.
+                let keys = match cat.as_ref() {
+                    Some(cat) => crate::deparse::stored_tree(cat, "check", rel, ci as i64)
+                        .map(|node| crate::deparse::depend::columns_read(&node))
+                        .map_err(|e| unread(&format!("constraint {} on table {n}", c.name), e))?,
+                    None => Vec::new(),
+                };
                 let mut r = self.constraint(&n, &c.name, 'c', rel, 0, &keys, false);
                 r.insert("conbin", Some(crate::deparse::tree_handle("check", rel, ci as i64)));
                 r.insert("conenforced", Some(t(c.enforced)));
@@ -1980,7 +1981,7 @@ impl<'a> File<'a> {
                 out.push(r);
             }
         }
-        out
+        Ok(out)
     }
 
     /// The rows of pg_trigger the file's constraints make, as PostgreSQL's DDL makes them: each
@@ -2108,7 +2109,11 @@ impl<'a> File<'a> {
                 self.oid(Object::Trigger(table.to_string(), name.to_string(), place)),
             )
         };
-        let tree = |kind: &str, oid: u32, part: i64| crate::deparse::stored_tree(&cat, kind, oid, part).ok();
+        // A stored tree deparse does not read refuses the catalog by its object's name, never left
+        // out.
+        let tree = |kind: &str, oid: u32, part: i64, what: &dyn Fn() -> String| {
+            crate::deparse::stored_tree(&cat, kind, oid, part).map_err(|e| unread(&what(), e))
+        };
         for tb in self.tables() {
             let n = full(&tb.name);
             let rel = class(&n);
@@ -2129,11 +2134,12 @@ impl<'a> File<'a> {
                 let def = Addr::of(d::ATTRDEF, self.oid(Object::Default(n.clone(), c.name.clone())));
                 let generated = if c.generated.is_some() { 'i' } else { 'a' };
                 out.one(def, Addr::column(rel.oid, i as i32 + 1), generated);
-                if let Some(node) = tree("attrdef", rel.oid, i as i64 + 1) {
-                    let (own, other) = d::single_rel(&cat, &node, rel.oid);
-                    out.all(def, &own, 'n');
-                    out.all(def, &other, 'n');
-                }
+                let node = tree("attrdef", rel.oid, i as i64 + 1, &|| {
+                    format!("default value for column {} of table {n}", c.name)
+                })?;
+                let (own, other) = d::single_rel(&cat, &node, rel.oid);
+                out.all(def, &own, 'n');
+                out.all(def, &other, 'n');
             }
             if self.release >= 18 {
                 let own = parts(&n).1;
@@ -2144,9 +2150,9 @@ impl<'a> File<'a> {
             }
             for (ci, k) in tb.checks.iter().enumerate() {
                 let con = constraint(&n, &k.name);
-                let Some(node) = tree("check", rel.oid, ci as i64) else {
-                    continue;
-                };
+                let node = tree("check", rel.oid, ci as i64, &|| {
+                    format!("constraint {} on table {n}", k.name)
+                })?;
                 let cols = d::columns_read(&node);
                 let keys = match cols.is_empty() {
                     true => vec![rel],
@@ -2183,11 +2189,13 @@ impl<'a> File<'a> {
                 out.many(index, i.collations.iter().filter_map(|&c| collation(c)).collect(), 'n');
                 let (exprs, pred) = crate::deparse::defs::index_has_trees(self.catalog, index.oid);
                 for (has, kind) in [(exprs, "indexprs"), (pred, "indpred")] {
-                    if let Some(node) = tree(kind, index.oid, 0).filter(|_| has) {
-                        let (own, other) = d::single_rel(&cat, &node, rel.oid);
-                        out.all(index, &own, 'a');
-                        out.all(index, &other, 'n');
+                    if !has {
+                        continue;
                     }
+                    let node = tree(kind, index.oid, 0, &|| format!("index {schema}.{}", i.name))?;
+                    let (own, other) = d::single_rel(&cat, &node, rel.oid);
+                    out.all(index, &own, 'a');
+                    out.all(index, &other, 'n');
                 }
             }
             for f in &tb.foreign_keys {
@@ -2331,7 +2339,8 @@ impl<'a> File<'a> {
             let mut refs = vec![schema_of(&n), Addr::of(d::TYPE, base)];
             refs.extend(coll);
             out.many(typ, refs, 'n');
-            if let Some(node) = tree("domaindefault", typ.oid, 0).filter(|_| dm.default.is_some()) {
+            if dm.default.is_some() {
+                let node = tree("domaindefault", typ.oid, 0, &|| format!("type {n}"))?;
                 out.all(typ, &d::of_expr(&cat, &node), 'n');
             }
             out.many(array(&n), coll.into_iter().collect(), 'n');
@@ -2344,9 +2353,10 @@ impl<'a> File<'a> {
             for (ki, k) in dm.checks.iter().enumerate() {
                 let con = constraint(&n, &k.name);
                 out.one(con, typ, 'a');
-                if let Some(node) = tree("domaincheck", typ.oid, ki as i64) {
-                    out.all(con, &d::of_expr(&cat, &node), 'n');
-                }
+                let node = tree("domaincheck", typ.oid, ki as i64, &|| {
+                    format!("constraint {} on domain {n}", k.name)
+                })?;
+                out.all(con, &d::of_expr(&cat, &node), 'n');
             }
         }
         for f in &self.catalog.functions {
@@ -2361,15 +2371,19 @@ impl<'a> File<'a> {
             refs.extend(f.args.iter().map(|&a| Addr::of(d::TYPE, self.facts(a, None).oid)));
             // What a body in SQL's own words and its DEFAULTs name: through 18 each recorded on its
             // own after the rest, from 19 gathered with the rest and recorded once.
+            // A body or a DEFAULT deparse does not read refuses the catalog by the function's name.
+            let shown = f.args.iter().map(|t| t.pg_name()).collect::<Vec<_>>().join(", ");
+            let unread_function = |e: Error| unread(&format!("function {n}({shown})"), e);
             let body = match crate::deparse::funcs::own_body(&cat, f) {
                 Ok(Some(q)) => d::of_query(&cat, &q),
-                _ => Vec::new(),
+                Ok(None) => Vec::new(),
+                Err(e) => return Err(unread_function(e)),
             };
             let defaults = match f.defaults.is_empty() {
                 true => Vec::new(),
                 false => crate::deparse::defaults_of(&cat, f)
                     .map(|nodes| d::of_expr(&cat, &crate::deparse::analyze::Node::List(nodes)))
-                    .unwrap_or_default(),
+                    .map_err(unread_function)?,
             };
             if self.release >= 19 {
                 refs.extend(body);
@@ -2389,7 +2403,7 @@ impl<'a> File<'a> {
         Ok(out.rows)
     }
 
-    fn indexes(&self) -> Vec<Row> {
+    fn indexes(&self) -> Result<Vec<Row>> {
         let mut out = Vec::new();
         let cat = crate::deparse::cat::Cat::of(self.catalog);
         for tb in self.tables() {
@@ -2401,8 +2415,7 @@ impl<'a> File<'a> {
                 let all: Vec<i16> = i.keys.iter().chain(&i.include).copied().collect();
                 let ioid = self.oid(Object::Class(format!("{schema}.{}", i.name)));
                 let (classes, options) = crate::deparse::defs::index_classes(&cat, ioid)
-                    .ok()
-                    .flatten()
+                    .map_err(|e| unread(&format!("index {schema}.{}", i.name), e))?
                     .unwrap_or_else(|| (vec![0; i.keys.len()], vec![0; i.keys.len()]));
                 let words = |v: Vec<String>| v.join(" ");
                 out.push(row(&[
@@ -2440,7 +2453,7 @@ impl<'a> File<'a> {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     fn labels(&self) -> Vec<Row> {
@@ -2845,7 +2858,13 @@ pub(crate) fn attcollation_of(catalog: &Catalog, relid: u32, attno: i32) -> Resu
 /// A view of the file's whose question deparse analysis does not read, refused by its name where
 /// its catalog rows are asked for.
 fn unread_view(v: &crate::catalog::View, e: Error) -> Error {
-    Error::new(format!("the view {} is not read: {}", v.name, e.0))
+    unread(&format!("view {}", v.name), e)
+}
+
+/// The refusal of a catalog's rows where deparse does not read an object they are made from, by the
+/// object's name and why.
+fn unread(what: &str, e: Error) -> Error {
+    Error::new(format!("the {what} is not read: {}", e.0))
 }
 
 /// What a range's row of pg_range says of it.
