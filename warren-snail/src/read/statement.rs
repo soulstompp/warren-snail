@@ -1298,11 +1298,6 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                     }
                 }
             }
-            if kept.is_empty() {
-                return Err(Error::new(
-                    "an INSERT's question returns a column of the table it reads",
-                ));
-            }
             // Where the statement calls the sequence functions, each DEFAULT a sequence hands out
             // is drawn by the question too, after the row's own items, as 18.6 draws a row's
             // DEFAULTs after its question's calls for that row. A DISTINCT question makes its
@@ -1318,6 +1313,11 @@ fn insert(catalog: &Catalog, i: &Insert) -> Result<Statement> {
                         kept.push(SelectItem::UnnamedExpr(super::image::parse_expr(&item)?));
                     }
                 }
+            }
+            // A question of constants alone still returns a row for each row it reads, or one
+            // where it reads none: an item no column takes stands for them.
+            if kept.is_empty() {
+                kept.push(SelectItem::UnnamedExpr(super::image::parse_expr("NULL")?));
             }
             let mut reduced = q.clone();
             if let SetExpr::Select(s) = reduced.body.as_mut() {
@@ -1483,11 +1483,13 @@ pub(crate) fn with_params(sql: &str, params: &[String]) -> Result<String> {
     Ok(out)
 }
 
-/// The statements of a text, each as written, split on their semicolons by sqlparser's tokenizer.
-/// Where PostgreSQL's grammar refuses one of them, each is split as written, that one refused when
-/// it is read, as psql sends each alone.
+/// The statements of a text, each as written, split on their semicolons by sqlparser's tokenizer;
+/// an interval's literal as written too, read as its cast where the statement is read. Where
+/// PostgreSQL's grammar refuses one of them, each is split as written, that one refused when it is
+/// read, as psql sends each alone.
 pub fn split(text: &str) -> Result<Vec<String>> {
-    let pieces = match crate::ddl::statements(text) {
+    let scanned = super::spelled::scanned_split(text, crate::regs::LATEST);
+    let pieces = match scanned.and_then(|t| crate::ddl::semicolons(&t)) {
         Ok(pieces) => pieces,
         Err(_) => crate::ddl::semicolons(text)?,
     };

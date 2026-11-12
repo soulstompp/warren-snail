@@ -9229,6 +9229,8 @@ fn calls_beyond_the_question(e: &Expr) -> bool {
         Expr::Array(a) => a.elem.iter().any(calls_beyond_the_question),
         // A subscript or a field: the question path holds no level for either.
         Expr::CompoundFieldAccess { .. } => true,
+        // AT TIME ZONE: the question path holds a level only for a timestamptz column's UTC clock.
+        Expr::AtTimeZone { .. } => true,
         _ => false,
     }
 }

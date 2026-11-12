@@ -4309,6 +4309,9 @@ mod tests {
 
     #[test]
     fn an_instant_reads_and_writes_as_postgresql_does_under_utc() {
+        // Moscow's and New York's files are read through the directory another test may set.
+        #[cfg(feature = "zones")]
+        let _held = crate::zones::directory_held();
         for (s, want) in [
             ("2024-03-05 13:04:05.5", "2024-03-05 13:04:05.5+00"),
             ("2024-03-05 13:04:05+02", "2024-03-05 11:04:05+00"),

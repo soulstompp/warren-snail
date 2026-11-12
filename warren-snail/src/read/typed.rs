@@ -1386,6 +1386,11 @@ pub(super) fn time(name: &str, args: &[Option<ColumnType>]) -> Result<Option<Opt
         ("localtimestamp", []) => C::Timestamp(None),
         ("current_time", []) => C::Timetz(None),
         ("localtime", []) => C::Time(None),
+        // With a precision.
+        ("current_timestamp", [_]) => C::Timestamptz,
+        ("localtimestamp", [_]) => C::Timestamp(None),
+        ("current_time", [_]) => C::Timetz(None),
+        ("localtime", [_]) => C::Time(None),
         ("date_part", [_, t]) => match base(*t) {
             None => return not_unique(),
             Some(

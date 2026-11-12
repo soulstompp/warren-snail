@@ -71,8 +71,9 @@ fn some(v: &[&str]) -> Vec<Option<String>> {
     v.iter().map(|s| Some(s.to_string())).collect()
 }
 
-/// The tests that read a zone's file, one at a time: the directory zones are read from is the
-/// process's, and one of them sets another.
+/// The tests that read a zone through the directory zones are read from, one at a time: it is the
+/// process's, and one of them sets another. A name POSIX reads (`+02`, an interval's offset) is
+/// looked for there first.
 #[cfg(feature = "standalone")]
 static ZONE_FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -278,6 +279,7 @@ fn equal_intervals_share_a_place_group_as_one_and_sum_as_postgresql_sums_them() 
 #[cfg(feature = "standalone")]
 #[test]
 fn the_pipeline_adds_takes_and_casts_time_as_postgresql_does() {
+    let _zones = zone_files();
     let mut snail = snail_of(
         "time-arith",
         &table("date"),
@@ -585,6 +587,100 @@ fn at_time_zone_reads_an_abbreviation_first_as_postgresql_does() {
 
 #[cfg(feature = "standalone")]
 #[test]
+fn at_time_zone_an_interval_is_its_seconds_east_of_utc_as_postgresql_reads_it() {
+    let _zones = zone_files();
+    let mut s = instants("time-at-interval");
+    // timezone(interval, timestamptz) and timezone(interval, timestamp), qualified or not: the
+    // interval's whole seconds east of UTC, an infinite value as it is, NULL for NULL.
+    for (sql, want) in [
+        (
+            "SELECT timestamptz '2026-01-31 12:00:00+00' AT TIME ZONE interval '-05:00' hour to minute",
+            "2026-01-31 07:00:00",
+        ),
+        ("SELECT at AT TIME ZONE interval '-05:00' hour to minute FROM s.t", "2026-01-31 17:00:00+00"),
+        ("SELECT at AT TIME ZONE interval '+05:30' FROM s.t", "2026-01-31 06:30:00+00"),
+        ("SELECT (at AT TIME ZONE 'UTC') AT TIME ZONE interval '+05:30' FROM s.t", "2026-01-31 17:30:00"),
+        (
+            "SELECT timezone(interval '2 hours', at), timezone(interval '-2 hours', at::timestamptz) FROM s.t",
+            "2026-01-31 10:00:00+00|2026-01-31 10:00:00",
+        ),
+        (
+            "SELECT at AT TIME ZONE '-05:00'::interval, at AT TIME ZONE CAST('3:00' AS interval hour to minute) FROM s.t",
+            "2026-01-31 17:00:00+00|2026-01-31 09:00:00+00",
+        ),
+        (
+            "SELECT pg_typeof(at AT TIME ZONE interval '1' hour), pg_typeof(at::timestamptz AT TIME ZONE interval '1' hour) FROM s.t",
+            "timestamp with time zone|timestamp without time zone",
+        ),
+        (
+            "SELECT at AT TIME ZONE interval '1.9 seconds', at AT TIME ZONE interval '-1.9 seconds', at AT TIME ZONE interval '25 hours' FROM s.t",
+            "2026-01-31 11:59:59+00|2026-01-31 12:00:01+00|2026-01-30 11:00:00+00",
+        ),
+        (
+            "SELECT timestamp 'infinity' AT TIME ZONE interval 'infinity', timestamptz '-infinity' AT TIME ZONE interval '1 day'",
+            "infinity|-infinity",
+        ),
+        ("SELECT at AT TIME ZONE NULL::interval, NULL::timestamp AT TIME ZONE interval '1 hour' FROM s.t", "NULL|NULL"),
+        (
+            "SELECT id FROM s.t WHERE at AT TIME ZONE interval '-05:00' hour to minute = timestamptz '2026-01-31 17:00:00+00'",
+            "I1",
+        ),
+        // A date is the instant of its midnight, whichever zone is named.
+        (
+            "SELECT date '2026-01-31' AT TIME ZONE interval '1 hour', date '2026-01-31' AT TIME ZONE 'UTC'",
+            "2026-01-31 01:00:00|2026-01-31 00:00:00",
+        ),
+        // A zone's name over a column is read as over a constant.
+        (
+            "SELECT at AT TIME ZONE '+05:30', at AT TIME ZONE 'UTC' FROM s.t",
+            "2026-01-31 17:30:00+00|2026-01-31 12:00:00+00",
+        ),
+    ] {
+        assert_eq!(answer_rows(&mut s, sql), [want], "{sql}");
+    }
+    for (sql, code, words) in [
+        (
+            "SELECT at AT TIME ZONE interval '1 day' FROM s.t",
+            "22023",
+            "interval time zone \"1 day\" must not include months or days",
+        ),
+        (
+            "SELECT at AT TIME ZONE interval '1 mon 2 hours' FROM s.t",
+            "22023",
+            "interval time zone \"1 mon 02:00:00\" must not include months or days",
+        ),
+        (
+            "SELECT at::timestamptz AT TIME ZONE interval '-1 day -02:00:00' FROM s.t",
+            "22023",
+            "interval time zone \"-1 days -02:00:00\" must not include months or days",
+        ),
+        (
+            "SELECT at AT TIME ZONE interval 'infinity' FROM s.t",
+            "22023",
+            "interval time zone \"infinity\" must be finite",
+        ),
+        (
+            "SELECT at::timestamptz AT TIME ZONE interval '-infinity' FROM s.t",
+            "22023",
+            "interval time zone \"-infinity\" must be finite",
+        ),
+        (
+            "SELECT timestamp '4714-11-24 00:00:00 BC' AT TIME ZONE interval '05:00'",
+            "22008",
+            "timestamp out of range",
+        ),
+        (
+            "SELECT timestamptz '4714-11-24 00:00:00+00 BC' AT TIME ZONE interval '-05:00'",
+            "22008",
+            "timestamp out of range",
+        ),
+    ] {
+        assert_eq!(refusal(&mut s, sql), (Some(code), words.to_string()), "{sql}");
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
 fn a_transaction_reads_one_clock_its_start_wherever_postgresql_reads_it() {
     let mut s = snail_of(
         "one-clock",
@@ -732,11 +828,37 @@ fn an_interval_literal_with_a_qualifier_is_read_as_postgresql_reads_it() {
     }
     let done = s.execute("SELECT interval '1' week").unwrap();
     assert_eq!(done.answer.unwrap().schema().field(0).name(), "week");
+    // The label stands only in a select list or a RETURNING list, before what may follow an item.
+    for (sql, want) in [
+        ("SELECT interval '1' weeks, 2", vec!["00:00:01|2"]),
+        ("SELECT interval '1' epoch FROM s.t", vec!["00:00:01"]),
+        (
+            "SELECT interval '1' years UNION SELECT interval '2' years ORDER BY 1",
+            vec!["00:00:01", "00:00:02"],
+        ),
+        ("SELECT * FROM (SELECT interval '1' hours) v", vec!["00:00:01"]),
+        ("SELECT (SELECT interval '1' week)", vec!["00:00:01"]),
+        ("UPDATE s.t SET at = at WHERE id = 'I1' RETURNING interval '1' minutes", vec!["00:00:01"]),
+        ("SELECT interval(2) '1.234' weeks", vec!["00:00:01.23"]),
+    ] {
+        assert_eq!(answer_rows(&mut s, sql), want, "{sql}");
+    }
+    // Split from a text, each statement is the one written, read as the cast where it is read.
+    let parts = warren_snail::read::statement::split(
+        "SELECT interval '2' hour; SELECT interval(2) '1.2345', interval '1' week",
+    )
+    .unwrap();
+    assert_eq!(
+        parts,
+        ["SELECT interval '2' hour", "SELECT interval(2) '1.2345', interval '1' week"]
+    );
+    assert_eq!(answer_rows(&mut s, &parts[1]), ["00:00:01.23|00:00:01"]);
 }
 
 #[cfg(feature = "standalone")]
 #[test]
 fn an_interval_s_qualifier_is_read_beside_a_cast_a_column_and_a_function_s_body() {
+    let _zones = zone_files();
     let mut s = instants("interval-qualified-beside");
     // A string constant cast to an interval of named fields is read under them; a value of text,
     // or a parameter, is read whole, then cut.
@@ -820,6 +942,226 @@ fn an_interval_s_qualifier_is_read_beside_a_cast_a_column_and_a_function_s_body(
 
 #[cfg(feature = "standalone")]
 #[test]
+fn a_cast_s_fields_read_a_constant_s_days_as_postgresql_reads_them() {
+    let mut s = instants("interval-cast-days");
+    // A bare number in the last field's unit, a day among them; `a b` as a day and hours where
+    // the last field is HOUR; text read whole, then cut.
+    for (sql, want) in [
+        (
+            "SELECT '1'::interval day, '1 2'::interval day to hour, interval '1' day",
+            "1 day|1 day 02:00:00|1 day",
+        ),
+        (
+            "SELECT '1 2'::interval hour, '2 1'::interval day to hour, '-1 2'::interval day to hour, \
+             '1 -2'::interval day to hour, '1 2.5'::interval day to hour",
+            "1 day 02:00:00|2 days 01:00:00|-1 days +02:00:00|1 day -02:00:00|1 day 02:00:00",
+        ),
+        (
+            "SELECT '25:00'::interval day, '1.5'::interval day, ('1'::text)::interval day",
+            "00:00:00|1 day|00:00:00",
+        ),
+        (
+            "SELECT CAST('1' AS interval day), CAST('1 2' AS interval day to hour), \
+             '-1'::interval day, '1 2:3'::interval day to minute",
+            "1 day|1 day 02:00:00|-1 days|1 day 02:03:00",
+        ),
+    ] {
+        assert_eq!(answer_rows(&mut s, sql), [want], "{sql}");
+    }
+    for sql in [
+        "SELECT '1 2'::interval day",
+        "SELECT '1 2'::interval day to minute",
+        "SELECT '1 2'::interval minute",
+        "SELECT '1 2'::interval day to second",
+        "SELECT '1 2'::interval year to month",
+        "SELECT ('1 2'::text)::interval day to hour",
+    ] {
+        assert_eq!(
+            refusal(&mut s, sql),
+            (Some("22007"), "invalid input syntax for type interval: \"1 2\"".to_string()),
+            "{sql}"
+        );
+    }
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn a_seconds_precision_past_6_is_taken_as_6_with_postgresql_s_warning() {
+    let _zones = zone_files();
+    let mut s = instants("precision-past-6");
+    let warned = |kind: &str| format!("WARNING:  {kind} precision reduced to maximum allowed, 6");
+    let (i7, t7, z7) = (warned("INTERVAL(7)"), warned("TIMESTAMP(7)"), warned("TIME(7) WITH TIME ZONE"));
+    // Each statement, the WARNINGs it gives as 18.6 gives them, and its answer where it has one.
+    let asked: Vec<(&str, Vec<String>, Option<&str>)> = vec![
+        ("SELECT interval '1' second(7)", vec![i7.clone()], Some("00:00:01")),
+        ("SELECT '1'::interval hour to second(7)", vec![i7.clone()], Some("00:00:01")),
+        ("SELECT interval(7) '1.5'", vec![i7.clone()], Some("00:00:01.5")),
+        (
+            "SELECT '1'::interval(8), '2020-01-01 00:00:00.123456789'::timestamp(7), '12:00:00.1234567'::time(9)",
+            vec![warned("INTERVAL(8)"), t7.clone(), warned("TIME(9)")],
+            Some("00:00:01|2020-01-01 00:00:00.123457|12:00:00.123457"),
+        ),
+        (
+            "SELECT '2020-01-01 00:00:00.1234567+00'::timestamptz(7), CAST('2020-01-01' AS timestamp(7) with time zone), '12:00+01'::timetz(7), '12:00+01'::time(7) with time zone",
+            vec![
+                warned("TIMESTAMP(7) WITH TIME ZONE"),
+                warned("TIMESTAMP(7) WITH TIME ZONE"),
+                z7.clone(),
+                z7.clone(),
+            ],
+            Some("2020-01-01 00:00:00.123457+00|2020-01-01 00:00:00+00|12:00:00+01|12:00:00+01"),
+        ),
+        (
+            "SELECT current_timestamp(7) > '2000-01-01', localtimestamp(7) > '2000-01-01', current_time(7) IS NOT NULL, localtime(7) IS NOT NULL",
+            vec![warned("TIMESTAMP(7) WITH TIME ZONE"), t7.clone(), z7.clone(), warned("TIME(7)")],
+            Some("t|t|t|t"),
+        ),
+        (
+            "SELECT localtimestamp(0) = date_trunc('second', localtimestamp(0)), \
+             current_timestamp(0) = date_trunc('second', current_timestamp(0))",
+            vec![],
+            Some("t|t"),
+        ),
+        ("SELECT '1'::interval second(6), '1'::interval day to second(6)", vec![], Some("00:00:01|00:00:01")),
+        (
+            "SELECT '1'::interval second(7) AS a WHERE '1'::interval second(8) > '0'",
+            vec![i7.clone(), warned("INTERVAL(8)")],
+            Some("00:00:01"),
+        ),
+        // A table's columns' types twice, as PostgreSQL reads its columns and then lays them out,
+        // before what their expressions name.
+        (
+            "CREATE TABLE s.w (k integer NOT NULL, a timestamp(7), b interval day to second(9), \
+             c time(7) with time zone, PRIMARY KEY (k))",
+            vec![
+                t7.clone(),
+                warned("INTERVAL(9)"),
+                z7.clone(),
+                t7.clone(),
+                warned("INTERVAL(9)"),
+                z7.clone(),
+            ],
+            None,
+        ),
+        (
+            "CREATE TABLE s.d (k integer NOT NULL, a timestamp(7) DEFAULT '2020-01-01'::timestamp(8), \
+             b time(9) CHECK (b > '00:00'::time(7)), PRIMARY KEY (k))",
+            vec![
+                t7.clone(),
+                warned("TIME(9)"),
+                t7.clone(),
+                warned("TIME(9)"),
+                warned("TIMESTAMP(8)"),
+                warned("TIME(7)"),
+            ],
+            None,
+        ),
+        (
+            "INSERT INTO s.w VALUES (1, '2020-01-01 00:00:00.1234567', '1.2345678', '12:00:00.1234567+00')",
+            vec![],
+            None,
+        ),
+        (
+            "INSERT INTO s.w VALUES (2, '2020-01-01'::timestamp(8), NULL, NULL)",
+            vec![warned("TIMESTAMP(8)")],
+            None,
+        ),
+        ("UPDATE s.w SET a = '2021-01-01'::timestamp(7) WHERE k = 2", vec![t7.clone()], None),
+        (
+            "SELECT * FROM s.w ORDER BY k",
+            vec![],
+            Some("1|2020-01-01 00:00:00.123457|00:00:01.234568|12:00:00.123457+00"),
+        ),
+        ("CREATE VIEW s.wv AS SELECT '1'::interval second(7) AS x", vec![i7.clone()], None),
+        ("SELECT * FROM s.wv", vec![], Some("00:00:01")),
+        ("PREPARE wp AS SELECT $1::timestamp(7)", vec![t7.clone()], None),
+        ("EXECUTE wp('2020-01-01')", vec![], Some("2020-01-01 00:00:00")),
+        // A body after AS is read where CREATE FUNCTION checks it and at each call; one in SQL's
+        // own words only where it is declared.
+        (
+            "CREATE FUNCTION s.f7() RETURNS interval LANGUAGE sql AS $$ SELECT '1'::interval second(7) $$",
+            vec![i7.clone()],
+            None,
+        ),
+        ("SELECT s.f7(), s.f7()", vec![i7.clone(), i7.clone()], Some("00:00:01|00:00:01")),
+        (
+            "CREATE FUNCTION s.g7() RETURNS interval LANGUAGE sql RETURN '1'::interval second(7)",
+            vec![i7.clone()],
+            None,
+        ),
+        ("SELECT s.g7()", vec![], Some("00:00:01")),
+        (
+            "CREATE FUNCTION s.fa(a timestamp(7)) RETURNS time(8) LANGUAGE sql RETURN a::time",
+            vec![t7.clone(), warned("TIME(8)")],
+            None,
+        ),
+        ("SET TIME ZONE INTERVAL(7) '+05:30'", vec![i7.clone()], None),
+        ("RESET TimeZone", vec![], None),
+    ];
+    for (sql, warnings, answer) in asked {
+        let done = s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(done.notices, warnings, "{sql}");
+        if let Some(want) = answer {
+            let b = done.answer.expect("an answer");
+            let rows: Vec<String> = s
+                .text_of(&b)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.into_iter().map(|v| v.unwrap_or_else(|| "NULL".into())).collect::<Vec<_>>().join("|"))
+                .collect();
+            assert_eq!(rows[0], want, "{sql}");
+        }
+    }
+    assert_eq!(
+        answer_rows(
+            &mut s,
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 's.w'::regclass AND attnum > 1 ORDER BY attnum"
+        ),
+        ["timestamp(6) without time zone", "interval day to second(6)", "time(6) with time zone"]
+    );
+}
+
+#[cfg(feature = "standalone")]
+#[test]
+fn an_insert_of_constants_alone_inserts_a_row_for_each_its_question_returns() {
+    let mut s = instants("insert-constants");
+    // With a FROM or without, its constants read as the columns they fill, the rest DEFAULT.
+    for sql in [
+        "CREATE TABLE s.q (k integer NOT NULL, h interval hour DEFAULT '7', n text, PRIMARY KEY (k))",
+        "INSERT INTO s.q SELECT 1, '4'",
+        "INSERT INTO s.q SELECT 2, '1 day 2:03', 'x' FROM s.t",
+        "INSERT INTO s.q SELECT 3, '5' FROM s.t WHERE false",
+        "INSERT INTO s.q (k, n) SELECT 4, 'y'",
+    ] {
+        s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        answer_rows(&mut s, "INSERT INTO s.q (n, k) SELECT 'z', 5 FROM s.t RETURNING k, h, n"),
+        ["5|07:00:00|z"]
+    );
+    for sql in [
+        "INSERT INTO s.q SELECT 7 FROM s.t GROUP BY id",
+        "INSERT INTO s.q SELECT 1, '9' FROM s.t ON CONFLICT (k) DO NOTHING",
+    ] {
+        s.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let (code, words) = refusal(&mut s, "INSERT INTO s.q SELECT 1, '9'");
+    assert_eq!(code, Some("23505"));
+    assert!(words.starts_with("duplicate key value violates unique constraint \"q_pkey\""), "{words}");
+    assert_eq!(
+        answer_rows(&mut s, "SELECT * FROM s.q ORDER BY k"),
+        [
+            "1|04:00:00|NULL",
+            "2|1 day 02:00:00|x",
+            "4|07:00:00|y",
+            "5|07:00:00|z",
+            "7|07:00:00|NULL",
+        ]
+    );
+}
+
+#[cfg(feature = "standalone")]
+#[test]
 fn an_interval_s_qualifier_is_refused_where_postgresql_refuses_it_in_its_words() {
     let mut s = instants("interval-qualified-refused");
     for (sql, code, words) in [
@@ -843,6 +1185,37 @@ fn an_interval_s_qualifier_is_refused_where_postgresql_refuses_it_in_its_words()
         ("SELECT '1'::interval hour(2)", "42601", "syntax error at or near \"(\""),
         ("SELECT '1'::interval(2) hour", "42601", "syntax error at or near \"hour\""),
         ("SELECT '1'::interval year to second", "42601", "syntax error at or near \"second\""),
+        // A word sqlparser reads as a unit, where PostgreSQL's grammar takes no label, or after one.
+        ("SELECT interval '1' years AS x", "42601", "syntax error at or near \"AS\""),
+        ("SELECT interval '1' years x", "42601", "syntax error at or near \"x\""),
+        ("SELECT interval '1' years as x", "42601", "syntax error at or near \"as\""),
+        ("SELECT interval '1' years + 1", "42601", "syntax error at or near \"+\""),
+        ("SELECT interval '1' week week", "42601", "syntax error at or near \"week\""),
+        ("SELECT interval(2) '1.234' weeks AS x", "42601", "syntax error at or near \"AS\""),
+        (
+            "UPDATE s.t SET at = at WHERE id = 'I1' RETURNING interval '1' minutes AS m",
+            "42601",
+            "syntax error at or near \"AS\"",
+        ),
+        (
+            "SELECT 1 WHERE interval '1' years > interval '1' day",
+            "42601",
+            "syntax error at or near \"years\"",
+        ),
+        ("SELECT (interval '1' years)", "42601", "syntax error at or near \"years\""),
+        ("SELECT 1 ORDER BY interval '1' years", "42601", "syntax error at or near \"years\""),
+        (
+            "SELECT CASE WHEN true THEN interval '1' week END",
+            "42601",
+            "syntax error at or near \"week\"",
+        ),
+        (
+            "SELECT interval '1' day BETWEEN interval '1' hours AND interval '2' days",
+            "42601",
+            "syntax error at or near \"hours\"",
+        ),
+        ("SELECT ARRAY[interval '1' week]", "42601", "syntax error at or near \"week\""),
+        ("VALUES (interval '1' week)", "42601", "syntax error at or near \"week\""),
         (
             "CREATE TABLE s.bad (k integer NOT NULL, h interval month to day, PRIMARY KEY (k))",
             "42601",
@@ -851,11 +1224,12 @@ fn an_interval_s_qualifier_is_refused_where_postgresql_refuses_it_in_its_words()
     ] {
         assert_eq!(refusal(&mut s, sql), (Some(code), words.to_string()), "{sql}");
     }
-    // A text holding one is split as psql sends each statement, that one refused when it is read.
+    // A text holding one is split as psql sends each statement, as written, that one refused when
+    // it is read.
     let parts =
         warren_snail::read::statement::split("SELECT interval '1' hour(2); SELECT interval '2' hour")
             .unwrap();
-    assert_eq!(parts.len(), 2);
+    assert_eq!(parts, ["SELECT interval '1' hour(2)", "SELECT interval '2' hour"]);
     assert_eq!(refusal(&mut s, &parts[0]).1, "syntax error at or near \"(\"");
     assert_eq!(answer_rows(&mut s, &parts[1]), ["02:00:00"]);
 }

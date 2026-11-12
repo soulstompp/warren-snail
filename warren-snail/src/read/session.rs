@@ -172,9 +172,11 @@ fn zone_interval(w: &[&sqlparser::tokenizer::Token], mut i: usize) -> Result<Str
         if !matches!(w.get(i + 2), Some(Token::RParen)) {
             return Err(syntax_at(w.get(i + 2)));
         }
+        // Past 6 taken as 6, as interval's modifier input takes it.
         precision = Some(
             n.parse::<u32>()
-                .map_err(|_| syntax_at(w.get(i + 1)))?,
+                .map_err(|_| syntax_at(w.get(i + 1)))?
+                .min(6),
         );
         i += 3;
     }

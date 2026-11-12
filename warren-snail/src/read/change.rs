@@ -1052,8 +1052,18 @@ impl Snail {
 
     /// Runs one statement with its parameters, `$1` and on, given as text, each read as a quoted
     /// literal is, by its context. A question among the statements is answered as `ask_with`
-    /// answers it, its answer in what it did.
+    /// answers it, its answer in what it did. What PostgreSQL warns of a time type's precision
+    /// past 6 as it reads the statement comes before what it says as it runs it.
     pub fn execute_with(&mut self, sql: &str, params: &[String]) -> Result<Done> {
+        let mut done = self.executed_with(sql, params)?;
+        let warned = super::spelled::precisions_reduced(&self.catalog.functions, sql);
+        done.notices.splice(0..0, warned);
+        Ok(done)
+    }
+
+    /// A statement run as `execute_with` runs it, without what PostgreSQL warns as it reads it: a
+    /// prepared statement's, read where it was prepared.
+    pub(super) fn executed_with(&mut self, sql: &str, params: &[String]) -> Result<Done> {
         if self.writer.is_none() {
             return Err(Error::new(
                 "this snail was opened to read; open it to write",

@@ -1099,6 +1099,14 @@ pub use read::{canonical, digest, transitions};
 #[cfg(feature = "zones")]
 pub use read::{directory, set_directory};
 
+/// The tests that set the directory zones are read from, or read a zone through it, one at a time,
+/// as it is the process's.
+#[cfg(all(test, feature = "zones"))]
+pub(crate) fn directory_held() -> std::sync::MutexGuard<'static, ()> {
+    static HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(feature = "zones")]
 mod read {
     use super::*;
@@ -1634,10 +1642,6 @@ mod tests {
         assert_eq!(local_offset("Etc/UTC", 123).unwrap(), 0);
     }
 
-    /// The tests that set the directory, one at a time, as it is the process's.
-    #[cfg(feature = "zones")]
-    static DIRECTORY_SET: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[cfg(feature = "zones")]
     fn pg_directory() -> std::path::PathBuf {
         std::path::PathBuf::from(std::env::var("HOME").unwrap())
@@ -1647,7 +1651,7 @@ mod tests {
     #[cfg(feature = "zones")]
     #[test]
     fn a_zone_reads_as_postgresql_19_reads_its_own_copy() {
-        let _one = DIRECTORY_SET.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::directory_held();
         set_directory(pg_directory());
         // Measured on 19 RC1: Lisbon's spring change of 2024 at 01:00 UTC, its clock from 01:00 to
         // 02:00; 1900 on its local mean time.
@@ -1682,7 +1686,7 @@ mod tests {
     #[cfg(feature = "zones")]
     #[test]
     fn a_short_or_malformed_zone_file_is_refused_by_name_never_read() {
-        let _one = DIRECTORY_SET.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::directory_held();
         let dir = std::env::temp_dir().join(format!("zones-malformed-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let good = std::fs::read(pg_directory().join("Europe/Lisbon")).unwrap();

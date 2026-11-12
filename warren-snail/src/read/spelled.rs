@@ -61,7 +61,7 @@ pub(crate) const ROWS_FROM: &str = "\u{6}rows";
 /// list stands behind where none is written; and what sqlparser takes and PostgreSQL's grammar does
 /// not, refused, a label written without the AS the release's keywords want among them.
 pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
-    let out = scanned_seeding(sql, release, true)?;
+    let out = scanned_seeding(sql, release, true, true)?;
     bare_labels(&out, release)?;
     Ok(out)
 }
@@ -71,12 +71,19 @@ pub(crate) fn scanned(sql: &str, release: u8) -> Result<Cow<'_, str>> {
 /// are left as written, so that statements split from a text read again as PostgreSQL's; its labels
 /// are a statement's to read.
 pub(crate) fn scanned_unseeded(sql: &str, release: u8) -> Result<Cow<'_, str>> {
-    scanned_seeding(sql, release, false)
+    scanned_seeding(sql, release, false, true)
 }
 
-fn scanned_seeding(sql: &str, release: u8, seeded: bool) -> Result<Cow<'_, str>> {
+/// A text as `scanned_unseeded` reads it to split it into its statements, an interval's literal
+/// left as written too: each statement split from it is the one written, read as the cast its
+/// grammar makes of the literal where the statement is read.
+pub(crate) fn scanned_split(sql: &str, release: u8) -> Result<Cow<'_, str>> {
+    scanned_seeding(sql, release, false, false)
+}
+
+fn scanned_seeding(sql: &str, release: u8, seeded: bool, casts: bool) -> Result<Cow<'_, str>> {
     let mut out = numbered(sql, release)?;
-    if let Some(next) = worded(&out, seeded, release)? {
+    if let Some(next) = worded(&out, seeded, casts, release)? {
         out = Cow::Owned(next);
     }
     Ok(out)
@@ -444,8 +451,9 @@ fn finish(sql: &str, mut out: String, copied: usize) -> Cow<'_, str> {
 }
 
 /// The statement with its words as PostgreSQL's grammar reads them; none where it needs none, or
-/// where sqlparser's tokenizer refuses it, which its parser says.
-fn worded(sql: &str, seeded: bool, release: u8) -> Result<Option<String>> {
+/// where sqlparser's tokenizer refuses it, which its parser says. Without `casts`, an interval's
+/// literal is left as written, its fields refused where its grammar refuses them all the same.
+fn worded(sql: &str, seeded: bool, casts: bool, release: u8) -> Result<Option<String>> {
     let lower = sql.to_ascii_lowercase();
     // `AS (`, whatever stands between the two.
     let as_paren = lower.match_indices("as").any(|(at, _)| {
@@ -593,21 +601,45 @@ fn worded(sql: &str, seeded: bool, release: u8) -> Result<Option<String>> {
     let mut in_from: Vec<bool> = vec![false];
     let mut opens: Vec<usize> = Vec::new();
     let mut last_closed: Option<(usize, usize)> = None;
+    // Whether each depth of parentheses stands in a select list or a RETURNING list, where an item
+    // takes a label; and the CASEs and BETWEENs open at it, inside which an item cannot end.
+    let mut in_list: Vec<bool> = vec![false];
+    let mut unended: Vec<(i32, i32)> = vec![(0, 0)];
     for i in 0..solid.len() {
         let prev_as = i > 0 && (word(i - 1).as_deref() == Some("AS") || solid[i - 1].0 == Token::Period);
         match &solid[i].0 {
             Token::LParen => {
                 in_from.push(false);
+                in_list.push(false);
+                unended.push((0, 0));
                 opens.push(i);
             }
             Token::RParen => {
                 if in_from.len() > 1 {
                     in_from.pop();
                 }
+                if in_list.len() > 1 {
+                    in_list.pop();
+                    unended.pop();
+                }
                 if let Some(o) = opens.pop() {
                     last_closed = Some((i, o));
                 }
             }
+            _ => {}
+        }
+        let (cases, betweens) = unended.last_mut().unwrap();
+        match word(i).as_deref() {
+            Some("SELECT" | "RETURNING") if !prev_as => *in_list.last_mut().unwrap() = true,
+            Some("FROM") if matches!(word(i.wrapping_sub(1)).as_deref(), Some("ROWS" | "DISTINCT")) => {}
+            Some(
+                "FROM" | "INTO" | "WHERE" | "GROUP" | "HAVING" | "WINDOW" | "ORDER" | "LIMIT"
+                | "OFFSET" | "FETCH" | "UNION" | "INTERSECT" | "EXCEPT" | "VALUES" | "SET",
+            ) if !prev_as => *in_list.last_mut().unwrap() = false,
+            Some("CASE") if !prev_as => *cases += 1,
+            Some("END") if !prev_as && *cases > 0 => *cases -= 1,
+            Some("BETWEEN") if !prev_as => *betweens += 1,
+            Some("AND") if *betweens > 0 => *betweens -= 1,
             _ => {}
         }
         let from_here = *in_from.last().unwrap_or(&false);
@@ -732,6 +764,30 @@ fn worded(sql: &str, seeded: bool, release: u8) -> Result<Option<String>> {
                     && matches!(token(i + 2), Some(Token::Number(..)))
                     && token(i + 3) == Some(&Token::RParen);
                 let at = if precision { i + 4 } else { i + 1 };
+                // A word sqlparser reads as a unit after the literal is the item's label only in a
+                // select list or a RETURNING list, before what may follow an item there.
+                if string(at) && unit_otherwise(at + 1) {
+                    let ends = in_list.last().copied().unwrap_or(false)
+                        && unended.last() == Some(&(0, 0))
+                        && brackets == 0;
+                    if !ends {
+                        return Err(near(at + 1));
+                    }
+                    let follows = matches!(
+                        token(at + 2),
+                        None | Some(Token::EOF | Token::SemiColon | Token::Comma | Token::RParen)
+                    ) || matches!(
+                        word(at + 2).as_deref(),
+                        Some(
+                            "FROM" | "INTO" | "WHERE" | "GROUP" | "HAVING" | "WINDOW" | "UNION"
+                                | "INTERSECT" | "EXCEPT" | "ORDER" | "LIMIT" | "OFFSET" | "FETCH"
+                                | "FOR" | "ON" | "WITH" | "RETURNING"
+                        )
+                    );
+                    if !follows {
+                        return Err(near(at + 2));
+                    }
+                }
                 let cast = match (string(at), precision) {
                     (false, _) if matches!(token(at), Some(Token::Number(..))) => {
                         return Err(near(at))
@@ -751,7 +807,7 @@ fn worded(sql: &str, seeded: bool, release: u8) -> Result<Option<String>> {
                     (true, false) if unit_otherwise(at + 1) => Some("::interval".to_string()),
                     (true, false) => None,
                 };
-                if let Some(cast) = cast {
+                if let Some(cast) = cast.filter(|_| casts) {
                     let literal = &sql[solid[at].1..solid[at].2];
                     swaps.push((solid[i].1, solid[at].2, format!("{literal}{cast}")));
                 }
@@ -1977,4 +2033,271 @@ fn rows_distinct(e: &Expr) -> Option<Expr> {
         _ => any,
     };
     Some(Expr::Nested(Box::new(written)))
+}
+
+/// PostgreSQL's WARNINGs where a statement names a time type of a precision past 6, which its type's
+/// modifier input takes as 6 (`catalog::time_precision`): each in the order its analyser reads the
+/// type names, then each its planner reads in the bodies of the file's functions it calls.
+pub(crate) fn precisions_reduced(functions: &[crate::catalog::Function], sql: &str) -> Vec<String> {
+    let mut out = precisions_named(sql);
+    let first = super::statement::spans(sql).ok().and_then(|t| {
+        t.into_iter().find_map(|(t, _, _)| match t {
+            Token::Word(w) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+            Token::Whitespace(_) => None,
+            _ => Some(String::new()),
+        })
+    });
+    // A statement the planner reads; a parenthesis opens a question.
+    let plans = matches!(
+        first.as_deref(),
+        Some(
+            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES" | "WITH" | "TABLE"
+                | "EXPLAIN" | ""
+        )
+    );
+    if plans {
+        out.extend(precisions_called(functions, sql, 0));
+    }
+    out
+}
+
+/// The words of each time type a statement names of a precision past 6, in the order written: a
+/// CREATE TABLE's columns' types twice, as its columns are read and then laid out, before what
+/// their expressions name; a CREATE FUNCTION's body of LANGUAGE sql after AS read after its head.
+fn precisions_named(sql: &str) -> Vec<String> {
+    let Ok(sql) = scanned_unseeded(sql, crate::regs::LATEST) else {
+        return Vec::new();
+    };
+    let Ok(tokens) = super::statement::spans(&sql) else {
+        return Vec::new();
+    };
+    let solid: Vec<&Token> = tokens
+        .iter()
+        .map(|t| &t.0)
+        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    let word = |i: usize| match solid.get(i) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+        _ => None,
+    };
+    let precision = |i: usize| match (solid.get(i), solid.get(i + 1), solid.get(i + 2)) {
+        (Some(Token::LParen), Some(Token::Number(n, _)), Some(Token::RParen)) => {
+            n.parse::<i64>().ok()
+        }
+        _ => None,
+    };
+    let zoned = |i: usize| {
+        word(i).as_deref() == Some("WITH")
+            && word(i + 1).as_deref() == Some("TIME")
+            && word(i + 2).as_deref() == Some("ZONE")
+    };
+    let mut named: Vec<(usize, String)> = Vec::new();
+    for i in 0..solid.len() {
+        let w = word(i);
+        let typed = match w.as_deref() {
+            Some(k @ ("TIMESTAMP" | "TIME")) => precision(i + 1).map(|p| (k, p, zoned(i + 4))),
+            Some("TIMESTAMPTZ" | "CURRENT_TIMESTAMP") => {
+                precision(i + 1).map(|p| ("TIMESTAMP", p, true))
+            }
+            Some("LOCALTIMESTAMP") => precision(i + 1).map(|p| ("TIMESTAMP", p, false)),
+            Some("TIMETZ" | "CURRENT_TIME") => precision(i + 1).map(|p| ("TIME", p, true)),
+            Some("LOCALTIME") => precision(i + 1).map(|p| ("TIME", p, false)),
+            // INTERVAL(p), or SECOND(p) last of its fields.
+            Some("INTERVAL") => {
+                let mut j = i + 1;
+                while matches!(
+                    word(j).as_deref(),
+                    Some("YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" | "TO")
+                ) {
+                    j += 1;
+                }
+                match j == i + 1 || word(j - 1).as_deref() == Some("SECOND") {
+                    true => precision(j).map(|p| ("INTERVAL", p, false)),
+                    false => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((kind, p, zone)) = typed.filter(|t| t.1 > 6) {
+            let zone = if zone { " WITH TIME ZONE" } else { "" };
+            named.push((
+                i,
+                format!("WARNING:  {kind}({p}){zone} precision reduced to maximum allowed, 6"),
+            ));
+        }
+    }
+    let columns = column_types(&solid, &word);
+    let (types, rest): (Vec<_>, Vec<_>) =
+        named.into_iter().partition(|(i, _)| columns.contains(i));
+    let mut out: Vec<String> = types
+        .iter()
+        .chain(&types)
+        .chain(&rest)
+        .map(|(_, w)| w.clone())
+        .collect();
+    // CREATE FUNCTION checks a body of LANGUAGE sql after AS as a statement.
+    let routine = word(0).as_deref() == Some("CREATE")
+        && (matches!(word(1).as_deref(), Some("FUNCTION" | "PROCEDURE"))
+            || word(1).as_deref() == Some("OR")
+                && word(2).as_deref() == Some("REPLACE")
+                && matches!(word(3).as_deref(), Some("FUNCTION" | "PROCEDURE")));
+    let in_sql = (0..solid.len()).any(|i| {
+        word(i).as_deref() == Some("LANGUAGE")
+            && match solid.get(i + 1) {
+                Some(Token::Word(w)) => w.value.eq_ignore_ascii_case("sql"),
+                Some(Token::SingleQuotedString(s)) => s.eq_ignore_ascii_case("sql"),
+                _ => false,
+            }
+    });
+    if routine && in_sql {
+        for i in 0..solid.len() {
+            if word(i).as_deref() == Some("AS") {
+                if let Some(body) = string_of(solid.get(i + 1).copied()) {
+                    out.extend(precisions_named(&body));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A string constant's text, where the token is one.
+fn string_of(t: Option<&Token>) -> Option<String> {
+    match t? {
+        Token::SingleQuotedString(s) | Token::EscapedStringLiteral(s) => Some(s.clone()),
+        Token::DollarQuotedString(d) => Some(d.value.clone()),
+        _ => None,
+    }
+}
+
+/// Where each column's type begins in a CREATE TABLE's list of its columns and constraints.
+fn column_types(solid: &[&Token], word: &dyn Fn(usize) -> Option<String>) -> Vec<usize> {
+    let mut i = 1;
+    while matches!(
+        word(i).as_deref(),
+        Some("GLOBAL" | "LOCAL" | "TEMP" | "TEMPORARY" | "UNLOGGED")
+    ) {
+        i += 1;
+    }
+    if word(0).as_deref() != Some("CREATE") || word(i).as_deref() != Some("TABLE") {
+        return Vec::new();
+    }
+    i += 1;
+    if word(i).as_deref() == Some("IF") {
+        i += 3;
+    }
+    // The table's name, qualified or not.
+    i += 1;
+    while solid.get(i) == Some(&&Token::Period) {
+        i += 2;
+    }
+    if solid.get(i) != Some(&&Token::LParen) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut start = true;
+    for (j, t) in solid.iter().enumerate().skip(i) {
+        match t {
+            Token::LParen => {
+                depth += 1;
+                if depth == 1 {
+                    start = true;
+                    continue;
+                }
+            }
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            Token::Comma if depth == 1 => {
+                start = true;
+                continue;
+            }
+            _ => {}
+        }
+        if start && depth == 1 {
+            let constraint = matches!(
+                word(j).as_deref(),
+                Some("CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "EXCLUDE" | "LIKE")
+            );
+            if !constraint {
+                out.push(j + 1);
+            }
+        }
+        start = false;
+    }
+    out
+}
+
+/// The WARNINGs of each call of a file's function whose body is a string after AS, in the order
+/// written: its body's own, then its body's calls', as the planner reads the body where it puts it
+/// in the call's place.
+fn precisions_called(
+    functions: &[crate::catalog::Function],
+    sql: &str,
+    depth: usize,
+) -> Vec<String> {
+    let quoted = |f: &&crate::catalog::Function| f.form == crate::catalog::BodyForm::Quoted;
+    if depth > 16 || !functions.iter().any(|f| quoted(&f)) {
+        return Vec::new();
+    }
+    let Ok(tokens) = super::statement::spans(sql) else {
+        return Vec::new();
+    };
+    let solid: Vec<&Token> = tokens
+        .iter()
+        .map(|t| &t.0)
+        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
+        .collect();
+    let part = |i: usize| match solid.get(i) {
+        Some(Token::Word(w)) if w.quote_style.is_some() => Some(w.value.clone()),
+        Some(Token::Word(w)) => Some(w.value.to_lowercase()),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for i in 0..solid.len() {
+        if solid.get(i + 1) != Some(&&Token::LParen) {
+            continue;
+        }
+        let Some(name) = part(i) else { continue };
+        let schema = (i >= 2 && solid[i - 1] == &Token::Period)
+            .then(|| part(i - 2))
+            .flatten();
+        // A routine named where a statement names it, not called.
+        let before = if schema.is_some() { i.wrapping_sub(3) } else { i.wrapping_sub(1) };
+        if matches!(
+            part(before).as_deref(),
+            Some("function" | "procedure" | "routine" | "aggregate")
+        ) {
+            continue;
+        }
+        // Its arguments, counted by the commas outside any parenthesis within the call.
+        let (mut inside, mut args, mut any) = (0, 1, false);
+        for t in &solid[i + 2..] {
+            match t {
+                Token::LParen => inside += 1,
+                Token::RParen if inside == 0 => break,
+                Token::RParen => inside -= 1,
+                Token::Comma if inside == 0 => args += 1,
+                _ => {}
+            }
+            any = true;
+        }
+        let args = if any { args } else { 0 };
+        let named = |f: &crate::catalog::Function| match &schema {
+            Some(s) => f.name == format!("{s}.{name}"),
+            None => f.name == name || f.name == format!("public.{name}"),
+        };
+        let Some(f) = functions.iter().filter(quoted).find(|f| {
+            named(f) && args <= f.args.len() && args + f.defaults.len() >= f.args.len()
+        }) else {
+            continue;
+        };
+        out.extend(precisions_named(&f.source));
+        out.extend(precisions_called(functions, &f.source, depth + 1));
+    }
+    out
 }

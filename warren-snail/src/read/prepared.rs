@@ -707,7 +707,8 @@ pub(super) fn deallocate(kept: &mut Kept, name: Option<&str>) -> Result<()> {
 impl Snail {
     pub(super) fn execute_prepared(&mut self, name: &str, args: &[String]) -> Result<super::Done> {
         let text = bound(&self.session.prepared, &self.catalog, name, args)?;
-        self.execute(&text)
+        // Its type names were read, and warned of, where it was prepared.
+        self.executed_with(&text, &[])
     }
 }
 

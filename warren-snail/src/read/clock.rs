@@ -562,11 +562,17 @@ pub(super) fn zone_sets(name: &str, now: i64) -> Result<Option<Vec<Value>>> {
 
 /// A value AT TIME ZONE `zone`, as PostgreSQL's timestamptz_zone and timestamp_zone take it: an
 /// instant as the zone's clock shows it, and a time on the zone's clock as the instant it is. A zone
-/// other than UTC is read only under the feature zones.
+/// other than UTC is read only under the feature zones; an interval as `at_interval` reads it. A
+/// date is the instant of its midnight, as PostgreSQL resolves it to timezone(…, timestamptz).
 pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
+    let v = match time_of(&v) {
+        Some(ColumnType::Date) => cast(v, ColumnType::Timestamptz)?,
+        _ => v,
+    };
     let name = match zone {
         Value::Null => return Ok(Value::Null),
         Value::Text(t) => t,
+        Value::Interval(i) => return at_interval(v, i),
         other => {
             return Err(Error::new(format!(
                 "function timezone({}, …) does not exist",
@@ -619,4 +625,47 @@ pub(super) fn at_zone(v: Value, zone: Value) -> Result<Value> {
             )))
         }
     })
+}
+
+/// A value AT TIME ZONE an interval, as PostgreSQL's timestamptz_izone and timestamp_izone take it:
+/// the zone the interval's whole seconds east of UTC, its fraction cut toward zero; an infinite
+/// value as it is, before the interval is read; an infinite interval, or one with months or days,
+/// refused in PostgreSQL's words.
+fn at_interval(v: Value, zone: times::Interval) -> Result<Value> {
+    let (ty, t) = match (time_of(&v), &v) {
+        (_, Value::Null) => return Ok(Value::Null),
+        (Some(ty @ (ColumnType::Timestamptz | ColumnType::Timestamp(_))), Value::Scalar(_, t)) => {
+            (ty, *t)
+        }
+        _ => {
+            return Err(Error::new(format!(
+                "{} AT TIME ZONE is not read",
+                super::pipeline::kind_name(&v)
+            )))
+        }
+    };
+    let other = match ty {
+        ColumnType::Timestamptz => ColumnType::Timestamp(None),
+        _ => ColumnType::Timestamptz,
+    };
+    if t == i64::MIN || t == i64::MAX {
+        return Ok(Value::Scalar(other, t));
+    }
+    let shown = times::interval_out(zone);
+    if !zone.is_finite() {
+        return Err(Error::new(format!(
+            "interval time zone \"{shown}\" must be finite"
+        )));
+    }
+    if zone.months != 0 || zone.days != 0 {
+        return Err(Error::new(format!(
+            "interval time zone \"{shown}\" must not include months or days"
+        )));
+    }
+    let east = i128::from(zone.micros / 1_000_000) * 1_000_000;
+    let moved = match ty {
+        ColumnType::Timestamptz => i128::from(t) + east,
+        _ => i128::from(t) - east,
+    };
+    Ok(Value::Scalar(other, held_instant(moved)?))
 }

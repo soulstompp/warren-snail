@@ -1041,6 +1041,24 @@ pub(super) fn time(
                 crate::scalars::timetz_key(local.rem_euclid(day), -(east as i32)),
             )));
         }
+        // With a precision, the same clock rounded to its digits, more than 6 taken as 6.
+        (
+            "current_timestamp" | "localtimestamp" | "current_time" | "localtime",
+            [Value::Int(p)],
+        ) => {
+            let p = (*p).clamp(0, 6) as u32;
+            let (local, east) = t::local_of(now)?;
+            let time = t::round_time(local.rem_euclid(day), p);
+            return Ok(Some(match name {
+                "current_timestamp" => timestamptz(t::round_instant(now, p)?),
+                "localtimestamp" => timestamp(t::round_instant(local, p)?),
+                "localtime" => Value::Scalar(ColumnType::Time(None), time),
+                _ => Value::Scalar(
+                    ColumnType::Timetz(None),
+                    crate::scalars::timetz_key(time, -(east as i32)),
+                ),
+            }));
+        }
         _ => {}
     }
     if args.iter().any(|v| v.is_null()) {

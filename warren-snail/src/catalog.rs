@@ -2578,7 +2578,8 @@ fn type_length(n: u64, name: &str, most: u64) -> Result<u32> {
     Ok(n as u32)
 }
 
-/// The digits after the second a time type's typmod keeps: PostgreSQL takes more than 6 as 6.
+/// The digits after the second a time type's typmod keeps: PostgreSQL takes more than 6 as 6, with
+/// a WARNING where a statement names it (`read::spelled::precisions_reduced`).
 fn time_precision(p: Option<u64>) -> Option<u8> {
     p.map(|p| p.min(6) as u8)
 }

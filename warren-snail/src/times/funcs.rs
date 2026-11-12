@@ -1457,6 +1457,9 @@ mod tests {
 
     #[test]
     fn date_trunc_and_age_answer_as_postgresql_does() {
+        // `+05` is looked for in the directory another test may set before it is read as POSIX's.
+        #[cfg(feature = "zones")]
+        let _held = crate::zones::directory_held();
         assert_eq!(
             timestamp_out(timestamp_trunc("week", ts("2021-01-01 10:00")).unwrap()),
             "2020-12-28 00:00:00"

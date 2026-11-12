@@ -111,6 +111,8 @@ const SAID: &[(Words, &str)] = &[
     (Words::Starts("invalid value for parameter \""), "22023"),
     (Words::Holds("time zone \"", "\" appears to use leap seconds"), "22023"),
     (Words::Holds("time zone \"", "\" not recognized"), "22023"),
+    (Words::Holds("interval time zone \"", "\" must be finite"), "22023"),
+    (Words::Holds("interval time zone \"", "\" must not include months or days"), "22023"),
     (Words::Starts("step size cannot "), "22023"),
     (Words::Starts("start value cannot be "), "22023"),
     (Words::Starts("stop value cannot be "), "22023"),
