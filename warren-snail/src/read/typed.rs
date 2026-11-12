@@ -748,11 +748,18 @@ impl Typing<'_> {
                     | BinaryOperator::GtEq => {
                         // Two rows compared, of two widths or of none, as make_row_comparison_op
                         // refuses them.
+                        // Two rows of one width, each pair by the operator.
                         if let (Some(l), Some(r)) = (
                             super::pipeline::row_parts(left),
                             super::pipeline::row_parts(right),
                         ) {
-                            super::image::rows_agree(l?.len(), r?.len())?;
+                            let (l, r) = (l?, r?);
+                            super::image::rows_agree(l.len(), r.len())?;
+                            for (x, y) in l.iter().zip(&r) {
+                                let (t, u) = (self.type_of(x)?, self.type_of(y)?);
+                                compared(&op.to_string(), (t, *x), (u, *y))?;
+                            }
+                            return Ok(Some(ColumnType::Boolean));
                         }
                         compared(&op.to_string(), (a, left), (b, right))?;
                         Some(ColumnType::Boolean)

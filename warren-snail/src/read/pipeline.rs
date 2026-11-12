@@ -4009,6 +4009,19 @@ fn operated(
     let ev = |x: &Expr| eval(x, row, frame, computed);
     let x = ev(left)?;
     let y = ev(right)?;
+    operated_on(e, left, op, right, x, y, frame)
+}
+
+/// A binary operator's value on its two sides' values, read from `left` and `right`.
+fn operated_on(
+    e: &Expr,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    x: Value,
+    y: Value,
+    frame: &Frame,
+) -> Result<Value> {
     let (x, y) = (
         written_beside(frame, left, x, right),
         written_beside(frame, right, y, left),
@@ -4128,6 +4141,39 @@ fn operated(
         }
         other => return Err(Error::new(format!("the operator {other} is not read"))),
     })
+}
+
+/// Two rows of one width compared by `<`, `<=`, `>` or `>=` as PostgreSQL's executor compares
+/// them: pair by pair, each side read once, the first pair not equal deciding by `op`, NULL where a
+/// pair read before one decides holds a NULL; the last pair by `op` where every pair before it is
+/// equal.
+fn rows_by_order(
+    e: &Expr,
+    l: &[&Expr],
+    op: &BinaryOperator,
+    r: &[&Expr],
+    row: &[Value],
+    frame: &Frame,
+    computed: &Computed,
+) -> Result<Value> {
+    let ev = |x: &Expr| eval(x, row, frame, computed);
+    for (at, (a, b)) in l.iter().zip(r).enumerate() {
+        let (x, y) = (ev(a)?, ev(b)?);
+        if x.is_null() || y.is_null() {
+            return Ok(Value::Null);
+        }
+        if at + 1 < l.len() {
+            let eq = BinaryOperator::Eq;
+            if matches!(
+                operated_on(e, a, &eq, b, x.clone(), y.clone(), frame)?,
+                Value::Bool(true)
+            ) {
+                continue;
+            }
+        }
+        return operated_on(e, a, op, b, x, y, frame);
+    }
+    Ok(Value::Null)
 }
 
 /// Two truths joined by AND (`and`) or by OR, in SQL's three values.
@@ -4826,7 +4872,17 @@ pub(super) fn eval(e: &Expr, row: &[Value], frame: &Frame, computed: &Computed) 
                     return eval(&written, row, frame, computed);
                 }
                 if let (Some(l), Some(r)) = (row_parts(left), row_parts(right)) {
-                    super::image::rows_agree(l?.len(), r?.len())?;
+                    let (l, r) = (l?, r?);
+                    super::image::rows_agree(l.len(), r.len())?;
+                    if matches!(
+                        op,
+                        BinaryOperator::Lt
+                            | BinaryOperator::LtEq
+                            | BinaryOperator::Gt
+                            | BinaryOperator::GtEq
+                    ) {
+                        return rows_by_order(e, &l, op, &r, row, frame, computed);
+                    }
                 }
                 return Err(Error::new(format!("{left} is not read")));
             }
@@ -9210,9 +9266,14 @@ pub fn hands_over(q: &Query) -> bool {
         .collect();
     let returned = exprs.clone();
     let one_table = matches!(s.from.as_slice(), [only] if only.joins.is_empty());
-    if returned.iter().any(|e| compares_no_constant(e) || is_written_constant(e))
+    if returned
+        .iter()
+        .any(|e| compares_no_constant(e) || is_written_constant(e) || any_or_all(e))
         || one_table && s.selection.as_ref().is_some_and(compares_no_constant)
-        || s.selection.iter().chain(on.iter().copied()).any(stands_constant)
+        || s.selection
+            .iter()
+            .chain(on.iter().copied())
+            .any(stands_constant)
         || s.selection.as_ref().is_some_and(|w| {
             let (aggregate, window, _) = calls_in(w);
             aggregate || window
@@ -9297,6 +9358,15 @@ fn is_written_constant(e: &Expr) -> bool {
 /// Whether an expression calls a function, or an operator on numbers or on a document, the question
 /// path does not read, or reads a CASE, an OR, an IN list, a subscript, a COLLATE or a parameter:
 /// its aggregates are its own, and a function a DDL names it reads where it reads the question.
+/// Whether an expression holds ANY or ALL, which the question path reads only as a WHERE's points.
+fn any_or_all(e: &Expr) -> bool {
+    sqlparser::ast::visit_expressions(e, |x| match x {
+        Expr::AnyOp { .. } | Expr::AllOp { .. } => std::ops::ControlFlow::Break(()),
+        _ => std::ops::ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
 fn calls_beyond_the_question(e: &Expr) -> bool {
     match e {
         // A set-returning function, named in its schema or not, is the pipeline's.

@@ -347,10 +347,13 @@ fn a_refusal_names_the_clause_or_the_call_it_refuses() {
         [Some(2), Some(1), Some(0), Some(1), Some(0)]
     );
     for (q, words) in [
-        // A function over a join: once "… is no function the DDL declares".
+        // A function over a join: once "… is no function the DDL declares"; as 18.6 refused it on
+        // 28818 (2026-11-12).
         (
             format!("SELECT a.nothing(t.v) AS c {join}"),
-            "a.nothing(t.v) is not read".to_string(),
+            "function a.nothing(integer) does not exist\nHINT:  No function matches the given name \
+             and argument types. You might need to add explicit type casts."
+                .to_string(),
         ),
     ] {
         assert_eq!(refused(&path, &q), words, "{q}");

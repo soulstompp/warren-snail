@@ -1567,7 +1567,8 @@ fn rewrite_once(sql: &str) -> Result<Option<String>> {
                 let Some(and) = and.filter(|&a| a > first) else {
                     return Err(near(and.unwrap_or(first)));
                 };
-                // Already one parenthesis, read as the call.
+                // Already one parenthesis, read as the call; a row's, whose fields the call would
+                // read as its arguments, given one more.
                 let whole = matches!(solid[first].token, Token::LParen)
                     && matches!(solid[and - 1].token, Token::RParen)
                     && {
@@ -1576,6 +1577,7 @@ fn rewrite_once(sql: &str) -> Result<Option<String>> {
                             match solid[j].token {
                                 Token::LParen => d += 1,
                                 Token::RParen => d -= 1,
+                                Token::Comma if d == 1 => return false,
                                 _ => {}
                             }
                             d > 0 || j == and - 1

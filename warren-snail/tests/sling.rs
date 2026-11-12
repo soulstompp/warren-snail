@@ -1268,6 +1268,82 @@ fn an_aggregate_of_the_query_around_is_refused_in_its_clause_s_words() {
 }
 
 #[test]
+fn any_in_a_select_list_and_rows_by_order_are_answered() {
+    // As 18.6 answered each on 28818 (2026-11-12): ANY and ALL over an array in a select list; two
+    // rows compared by order pair by pair, the first pair not equal deciding, NULL where a pair
+    // read before one decides holds one; BETWEEN of rows as its two comparisons.
+    let path = declared(
+        "rows-by-order",
+        "CREATE SCHEMA k11;
+         CREATE TABLE k11.src (k integer NOT NULL, v integer, s text, PRIMARY KEY (k));",
+        &["INSERT INTO k11.src VALUES (1, 10, 'a'), (2, NULL, 'b'), (3, 30, 'c'), (4, 5, NULL)"],
+    );
+    let mut w = Snail::open_writing(&path).unwrap();
+    answered(
+        &mut w,
+        &[
+            (
+                "SELECT k, k = ANY (ARRAY[1, 3]) FROM k11.src ORDER BY k",
+                &["1|t", "2|f", "3|t", "4|f"],
+            ),
+            (
+                "SELECT k > ALL (ARRAY[1, 2]), k = ANY ('{}'::integer[]) FROM k11.src ORDER BY k",
+                &["f|f", "f|f", "t|f", "t|f"],
+            ),
+            (
+                "SELECT k, k = ANY (ARRAY[1, NULL]), k <> ALL (ARRAY[2, 3]), v > ANY (ARRAY[6, 20]) \
+                 FROM k11.src ORDER BY k",
+                &["1|t|t|t", "2|NULL|f|NULL", "3|NULL|f|t", "4|NULL|t|f"],
+            ),
+            (
+                "SELECT (1, 2) < (1, 3), ROW(1, 2) BETWEEN ROW(0, 0) AND ROW(2, 2), \
+                 (1, NULL) < (2, 0), (1, NULL) < (1, 0), (1, 2) >= (1, 2)",
+                &["t|t|t|NULL|t"],
+            ),
+            (
+                "SELECT (NULL, 1) < (2, 0), (2, NULL) > (1, 5), \
+                 ROW(1, NULL) BETWEEN ROW(0, 0) AND ROW(2, 2), (1, 3) <= (1, 2)",
+                &["NULL|t|t|f"],
+            ),
+            ("SELECT k FROM k11.src WHERE (k, 1) < (3, 0) ORDER BY k", &["1", "2"]),
+            (
+                "SELECT k, (k, v) > (2, 0), (v, k) <= (10, 1) FROM k11.src ORDER BY k",
+                &["1|f|t", "2|NULL|NULL", "3|t|f", "4|t|t"],
+            ),
+            (
+                "SELECT k FROM k11.src WHERE (k, v) BETWEEN (1, 0) AND (3, 20) ORDER BY k",
+                &["1", "2"],
+            ),
+            ("SELECT ROW(1, 2) NOT BETWEEN ROW(0, 0) AND ROW(0, 5)", &["t"]),
+            (
+                "SELECT (1, 'a') < (1, 'b'), ROW(1, 2) BETWEEN SYMMETRIC ROW(2, 2) AND ROW(0, 0), \
+                 (s, k) > ('a', 9) FROM k11.src ORDER BY k",
+                &["t|t|f", "t|t|t", "t|t|t", "t|t|NULL"],
+            ),
+            (
+                "SELECT (1, 2.5) < (1, 3), ('2026-01-01'::date, 1) < ('2026-01-02'::date, 0)",
+                &["t|t"],
+            ),
+            (
+                "SELECT 2 BETWEEN SYMMETRIC 3 AND 1, (1, 2) BETWEEN SYMMETRIC (2, 2) AND (0, 0), \
+                 (1, 2) NOT BETWEEN SYMMETRIC (2, 2) AND (1, 3)",
+                &["t|t|t"],
+            ),
+        ],
+    );
+    for sql in [
+        "SELECT (1, 2) < (1, 2, 3)",
+        "SELECT ROW(1, 2) BETWEEN ROW(0, 0) AND ROW(1)",
+    ] {
+        assert_eq!(
+            refused(&mut w, sql),
+            said("42601", "unequal number of entries in row expressions"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn a_join_s_on_inside_a_subquery_reads_the_query_around_it() {
     let asked: &[(&str, &[&str])] = &[
         (
