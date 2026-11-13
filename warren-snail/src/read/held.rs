@@ -3,10 +3,12 @@
 //! known before it is held.
 
 use super::answer::{Cell, Dict, Text};
-use super::pipeline::Value;
+use super::hash::WordHasher;
+use super::pipeline::{Key, Value};
 use crate::catalog::ColumnType;
 use crate::times::Interval;
 use parquet::data_type::ByteArray;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// Which rows are NULL: a bit a row, a word each 64 rows.
@@ -835,6 +837,230 @@ impl Slots {
     pub(super) fn bytes(&self) -> u64 {
         (self.slots.capacity() * std::mem::size_of::<(u32, u32)>()) as u64
     }
+
+    /// The bytes a row more adds to its slots: none until they grow.
+    fn width_of_one(&self) -> u64 {
+        match (self.len + 1) * 4 > self.slots.len() * 3 {
+            true => (((self.slots.len() * 2).max(16) - self.slots.len()) * 8) as u64,
+            false => 0,
+        }
+    }
+}
+
+/// A value of a key as a key set holds it: its kind, then its payload, its length first where it
+/// varies, so that equal values are equal bytes.
+pub(super) trait Encoded {
+    /// Appends its bytes, a type it names by its place among `types`.
+    fn encode(&self, types: &mut Vec<ColumnType>, out: &mut Vec<u8>);
+}
+
+/// Appends a value of a kind whose length varies: the kind, the length, the bytes.
+pub(super) fn varied(out: &mut Vec<u8>, kind: u8, b: &[u8]) {
+    out.push(kind);
+    let mut n = b.len();
+    while n >= 0x80 {
+        out.push(n as u8 | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+    out.extend_from_slice(b);
+}
+
+impl Encoded for Key {
+    fn encode(&self, types: &mut Vec<ColumnType>, out: &mut Vec<u8>) {
+        encode(self, types, out)
+    }
+}
+
+fn encode(k: &Key, types: &mut Vec<ColumnType>, out: &mut Vec<u8>) {
+    match k {
+        Key::Null => out.push(0),
+        Key::Num(m, 0) if i64::try_from(*m).is_ok() => {
+            out.push(1);
+            out.extend_from_slice(&(*m as i64).to_le_bytes());
+        }
+        Key::Num(m, s) => {
+            out.push(2);
+            out.extend_from_slice(&m.to_le_bytes());
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        Key::Text(t) => varied(out, 3, t.as_bytes()),
+        Key::Bytes(b) => varied(out, 4, b),
+        Key::Bool(b) => out.extend_from_slice(&[5, *b as u8]),
+        Key::Uuid(u) => {
+            out.push(6);
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        Key::Scalar(ty, v) => {
+            let at = match types.iter().position(|t| t == ty) {
+                Some(at) => at,
+                None => {
+                    types.push(*ty);
+                    types.len() - 1
+                }
+            };
+            out.push(7);
+            out.extend_from_slice(&(at as u32).to_le_bytes());
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Key::Real(v) => {
+            out.push(8);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Key::Double(v) => {
+            out.push(9);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Key::Class(s) => varied(out, 10, s.as_bytes()),
+        Key::Composed(b) => varied(out, 11, b),
+        Key::Interval(v) => {
+            out.push(12);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// Keys held, each as one string of bytes, its values' one after another, so that equal keys are
+/// equal bytes; found by their hash.
+#[derive(Default)]
+pub(super) struct KeySet {
+    bytes: Vec<u8>,
+    ends: Vec<u64>,
+    slots: Slots,
+    types: RefCell<Vec<ColumnType>>,
+    asked: RefCell<Vec<u8>>,
+    hash: std::cell::Cell<u64>,
+}
+
+impl KeySet {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn key(&self, at: usize) -> &[u8] {
+        let from = if at == 0 { 0 } else { self.ends[at - 1] as usize };
+        &self.bytes[from..self.ends[at] as usize]
+    }
+
+    /// Takes `key` as the one asked about next: where it lies among the keys held, none where it is
+    /// not one.
+    pub(super) fn ask<K: Encoded>(&self, key: &[K]) -> Option<usize> {
+        let mut asked = self.asked.borrow_mut();
+        asked.clear();
+        let mut types = self.types.borrow_mut();
+        for k in key {
+            k.encode(&mut types, &mut asked);
+        }
+        let hash = std::hash::BuildHasher::hash_one(
+            &std::hash::BuildHasherDefault::<WordHasher>::default(),
+            &asked[..],
+        );
+        self.hash.set(hash);
+        self.slots
+            .find(hash, |r| self.key(r as usize) == &asked[..])
+            .map(|r| r as usize)
+    }
+
+    /// The bytes the key last asked about adds held.
+    pub(super) fn width(&self) -> u64 {
+        self.asked.borrow().len() as u64 + 8 + self.slots.width_of_one()
+    }
+
+    /// Holds the key last asked about, not held: where it lies.
+    pub(super) fn hold(&mut self) -> usize {
+        let at = self.ends.len();
+        self.bytes.extend_from_slice(&self.asked.borrow());
+        self.ends.push(self.bytes.len() as u64);
+        self.slots.insert(self.hash.get(), at as u32);
+        at
+    }
+
+    /// Holds `key` where it is not held: whether it was not.
+    pub(super) fn insert<K: Encoded>(&mut self, key: &[K]) -> bool {
+        match self.ask(key) {
+            Some(_) => false,
+            None => {
+                self.hold();
+                true
+            }
+        }
+    }
+
+    /// Whether `key` is held.
+    pub(super) fn contains<K: Encoded>(&self, key: &[K]) -> bool {
+        self.ask(key).is_some()
+    }
+
+    /// The bytes `key` adds held: none where it is held.
+    pub(super) fn width_of<K: Encoded>(&self, key: &[K]) -> u64 {
+        match self.ask(key) {
+            Some(_) => 0,
+            None => self.width(),
+        }
+    }
+
+    /// The bytes every key held takes.
+    #[cfg(test)]
+    fn bytes(&self) -> u64 {
+        (self.bytes.len() + self.ends.len() * 8) as u64 + self.slots.bytes()
+    }
+}
+
+/// Row numbers by their keys: each key held once, its rows chained in the order they came.
+#[derive(Default)]
+pub(super) struct KeyRows {
+    keys: KeySet,
+    /// Each key's first and last row.
+    ends: Vec<(u32, u32)>,
+    /// Each row's next of its key.
+    next: Vec<u32>,
+}
+
+impl KeyRows {
+    /// Row `row` of `key`, rows coming in order; the bytes it adds held.
+    pub(super) fn push<K: Encoded>(&mut self, key: &[K], row: u32) -> u64 {
+        let mut w = 0;
+        if self.next.len() <= row as usize {
+            w += (row as usize + 1 - self.next.len()) as u64 * 4;
+            self.next.resize(row as usize + 1, EMPTY);
+        }
+        match self.keys.ask(key) {
+            Some(k) => {
+                let last = self.ends[k].1;
+                self.next[last as usize] = row;
+                self.ends[k].1 = row;
+            }
+            None => {
+                w += self.keys.width() + 8;
+                self.keys.hold();
+                self.ends.push((row, row));
+            }
+        }
+        w
+    }
+
+    /// The bytes a row more of `key` adds held.
+    pub(super) fn width_of<K: Encoded>(&self, key: &[K]) -> u64 {
+        4 + match self.keys.ask(key) {
+            Some(_) => 0,
+            None => self.keys.width() + 8,
+        }
+    }
+
+    /// The rows of `key`, in the order they came.
+    pub(super) fn rows<K: Encoded>(&self, key: &[K]) -> impl Iterator<Item = u32> + '_ {
+        let first = self.keys.ask(key).map(|k| self.ends[k].0);
+        std::iter::successors(first, move |&r| {
+            Some(self.next[r as usize]).filter(|&n| n != EMPTY)
+        })
+    }
+
+    /// The bytes it holds.
+    #[cfg(test)]
+    fn bytes(&self) -> u64 {
+        self.keys.bytes() + (self.ends.len() * 8 + self.next.len() * 4) as u64
+    }
 }
 
 #[cfg(test)]
@@ -949,5 +1175,50 @@ mod tests {
         }
         assert_eq!(slots.find(hash(1000), |x| x == 1000), None);
         assert_eq!(slots.bytes(), 2048 * 8);
+    }
+
+    #[test]
+    fn equal_keys_are_one_key_and_each_takes_the_bytes_it_was_counted_at() {
+        let keys = vec![
+            vec![Key::Null, Key::Num(1, 0)],
+            vec![Key::Text("ab".into()), Key::Num(i128::MAX, 3)],
+            vec![Key::Text("a".into()), Key::Text("b".into())],
+            vec![Key::Text("ab".into()), Key::Null],
+            vec![Key::Scalar(ColumnType::Oid, 7), Key::Bool(true)],
+            vec![Key::Scalar(ColumnType::Xid, 7), Key::Bool(true)],
+            vec![Key::Bytes(vec![0; 200]), Key::Interval(-1)],
+        ];
+        let mut set = KeySet::default();
+        let mut counted = 0;
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(set.ask(k), None, "{k:?}");
+            counted += set.width();
+            assert_eq!(set.hold(), i);
+            assert_eq!(set.bytes(), counted, "{k:?}");
+        }
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(set.ask(&k.clone()), Some(i), "{k:?}");
+            assert!(!set.insert(k));
+        }
+        assert_eq!(set.width_of(&[Key::Text("ab".into()), Key::Num(i128::MAX, 3)]), 0);
+        assert_eq!(set.len(), keys.len());
+        // A NULL 1 byte, an integer 1 + 8, "ab" 1 + 1 + 2, 200 bytes 1 + 2 + 200, an interval 1 + 16.
+        assert_eq!(set.key(0).len(), 1 + 9);
+        assert_eq!(set.key(3).len(), 4 + 1);
+        assert_eq!(set.key(6).len(), 203 + 17);
+
+        let mut rows = KeyRows::default();
+        let mut counted = 0;
+        for (r, k) in [0, 1, 0, 2, 1, 0].into_iter().enumerate() {
+            let w = rows.width_of(&keys[k]);
+            assert_eq!(rows.push(&keys[k], r as u32), w);
+            counted += w;
+        }
+        assert_eq!(rows.rows(&keys[0]).collect::<Vec<_>>(), vec![0, 2, 5]);
+        assert_eq!(rows.rows(&keys[1]).collect::<Vec<_>>(), vec![1, 4]);
+        assert_eq!(rows.rows(&keys[2]).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(rows.rows(&keys[3]).count(), 0);
+        assert_eq!(rows.bytes(), counted);
+        assert_eq!(rows.bytes(), rows.keys.bytes() + 3 * 8 + 6 * 4);
     }
 }

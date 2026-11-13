@@ -9,6 +9,7 @@
 use super::pipeline::{self, Casings, Computed, Frame, Key, Value};
 use super::question::Question;
 use super::relations::{self, Accrued, Asked, Col, Made, Outer, Reads, Steps};
+use super::held::{Columns, KeyRows, KeySet};
 use super::spill::{Rows, Run};
 use super::typed::Types;
 use super::Round;
@@ -18,7 +19,7 @@ use sqlparser::ast::{
     BinaryOperator, Expr, GroupByExpr, OrderByKind, Query, SelectItem, SetExpr, TableFactor,
 };
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// What a subquery's reads keep between the rows it is answered for: each question the question
@@ -146,7 +147,7 @@ enum Asks<'q> {
 struct Returned {
     rows: Vec<Vec<Value>>,
     past: Option<Rows>,
-    keys: OnceCell<Option<(HashSet<Key>, bool, crate::room::Holding)>>,
+    keys: OnceCell<Option<(KeySet, bool, crate::room::Holding)>>,
     /// What they hold in the round's room.
     _held: crate::room::Holding,
 }
@@ -187,22 +188,23 @@ impl Returned {
 
     /// The keys of its one column, and whether a NULL lies among them; none where they do not fit
     /// the room.
-    fn keys(&self) -> Option<(&HashSet<Key>, bool)> {
+    fn keys(&self) -> Option<(&KeySet, bool)> {
         let built = self.keys.get_or_init(|| {
             let mut held = crate::room::holding(0);
-            let mut keys = HashSet::new();
+            let mut keys = KeySet::default();
             let mut nulls = false;
             let mut add = |c: &[Vec<Value>]| -> bool {
                 for r in c {
                     match r[0].is_null() {
                         true => nulls = true,
                         false => {
-                            let k = pipeline::key(&r[0]);
-                            let w = super::spill::key_width(&k) + super::spill::slot::<Key>();
-                            if !held.fits(w) {
+                            if keys.ask(&[pipeline::key(&r[0])]).is_some() {
+                                continue;
+                            }
+                            if !held.fits(keys.width()) {
                                 return false;
                             }
-                            keys.insert(k);
+                            keys.hold();
                         }
                     }
                 }
@@ -281,8 +283,9 @@ struct Readied<'a> {
 /// by their keys.
 #[derive(Default)]
 struct Met {
-    keys: HashSet<Vec<Key>>,
-    rows: HashMap<Vec<Key>, Vec<Vec<Value>>>,
+    keys: KeySet,
+    rows: KeyRows,
+    pairs: Columns,
     held: Option<crate::room::Holding>,
     /// Whether they passed the room: a row whose truth is not held is answered as a subquery's.
     past: bool,
@@ -311,12 +314,23 @@ const CUTS: u32 = 8;
 const PARTS_UNKNOWN: u64 = 16;
 
 impl Met {
+    /// The bytes a row of the subquery's more adds held.
+    fn width(&self, key: &[Key], row: &[Value], by_pairs: bool) -> u64 {
+        match by_pairs {
+            true => self.rows.width_of(key) + self.pairs.width_of(row),
+            false => self.keys.width_of(key),
+        }
+    }
+
     /// A row of the subquery's more, by the values it gives its ties.
     fn hold(&mut self, key: Vec<Key>, row: Vec<Value>, by_pairs: bool) {
         match by_pairs {
-            true => self.rows.entry(key).or_default().push(row),
+            true => {
+                self.rows.push(&key, self.pairs.len() as u32);
+                self.pairs.push(row);
+            }
             false => {
-                self.keys.insert(key);
+                self.keys.insert(&key);
             }
         }
     }
@@ -332,8 +346,8 @@ impl Met {
         if !by_pairs {
             return Ok(self.keys.contains(key));
         }
-        for r in self.rows.get(key).into_iter().flatten() {
-            if pair(r)? {
+        for i in self.rows.rows(key) {
+            if pair(&self.pairs.row(i as usize))? {
                 return Ok(true);
             }
         }
@@ -779,7 +793,7 @@ pub(super) struct Subs<'a, 'q> {
 
 /// Each set of values rows give, gathered while they fit the room.
 struct Foreseen {
-    seen: HashSet<Vec<Key>>,
+    seen: KeySet,
     sets: Vec<Vec<Value>>,
     held: crate::room::Holding,
     over: bool,
@@ -788,7 +802,7 @@ struct Foreseen {
 impl Foreseen {
     fn new() -> Foreseen {
         Foreseen {
-            seen: HashSet::new(),
+            seen: KeySet::default(),
             sets: Vec::new(),
             held: crate::room::holding(0),
             over: false,
@@ -800,13 +814,11 @@ impl Foreseen {
         if self.over {
             return;
         }
-        let keys = keys_of(&set);
-        let w = super::spill::row_width(&set)
-            + super::spill::keys_width(&keys)
-            + super::spill::slot::<Vec<Key>>();
-        if !self.seen.insert(keys) {
+        if self.seen.ask(&keys_of(&set)).is_some() {
             return;
         }
+        let w = super::spill::row_width(&set) + self.seen.width();
+        self.seen.hold();
         match self.held.fits(w) {
             true => self.sets.push(set),
             false => self.over = true,
@@ -936,8 +948,9 @@ impl<'a, 'q> Subs<'a, 'q> {
         })?;
         // Every row held let go before any part is met.
         for a in ahead.iter_mut() {
-            a.met.keys = HashSet::new();
-            a.met.rows = HashMap::new();
+            a.met.keys = KeySet::default();
+            a.met.rows = KeyRows::default();
+            a.met.pairs = Columns::default();
             a.met.held = None;
         }
         for mut a in ahead {
@@ -1292,8 +1305,9 @@ impl<'a, 'q> Subs<'a, 'q> {
                 if met.past {
                     return Ok(());
                 }
-                if held.fits(w) {
-                    held_bytes += w;
+                let h = met.width(&key, &row, by_pairs);
+                if held.fits(h) {
+                    held_bytes += h;
                     met.hold(key, row, by_pairs);
                     return Ok(());
                 }
@@ -1617,7 +1631,7 @@ impl pipeline::Subqueries for Subs<'_, '_> {
                             match () {
                                 _ if returned.is_empty() => Value::Bool(false),
                                 _ if x.is_null() => Value::Null,
-                                _ if keys.contains(&pipeline::key(&x)) => Value::Bool(true),
+                                _ if keys.contains(&[pipeline::key(&x)]) => Value::Bool(true),
                                 _ if nulls => Value::Null,
                                 _ => Value::Bool(false),
                             }

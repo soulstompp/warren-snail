@@ -9249,7 +9249,7 @@ fn fold_partition(
 /// the step groups by sets, a group's first row carries each grouping expression's value after it.
 struct Groups {
     set: Vec<usize>,
-    at: HashMap<Vec<Key>, usize>,
+    at: super::held::KeySet,
     list: Vec<(Vec<Value>, Vec<Acc>)>,
     held: crate::room::Holding,
     past: Option<super::spill::Parts>,
@@ -9380,7 +9380,7 @@ impl Groups {
     fn new(set: Vec<usize>) -> Groups {
         Groups {
             set,
-            at: HashMap::new(),
+            at: Default::default(),
             list: Vec::new(),
             held: crate::room::holding(0),
             past: None,
@@ -9420,18 +9420,15 @@ impl Groups {
         let met: Vec<Value> = self.set.iter().map(|&i| values[i].clone()).collect();
         self.met.meet(&met)?;
         if let Some(end) = along {
-            if !self.list.is_empty() && !self.at.contains_key(&k) {
+            if !self.list.is_empty() && !self.at.contains(&k) {
                 self.project(p, frame, &mut |row, calls| end(p.group_rows(&row, calls, frame)?))?;
             }
         }
-        if let Some(&i) = self.at.get(&k) {
+        if let Some(i) = self.at.ask(&k) {
             return Ok(Some(i));
         }
         let mut first = row.to_vec();
-        let mut w = super::spill::row_width(&first)
-            + reading.group_bytes
-            + super::spill::keys_width(&k)
-            + super::spill::slot::<(Vec<Key>, usize)>();
+        let mut w = super::spill::row_width(&first) + reading.group_bytes + self.at.width();
         if p.sets.is_some() {
             w += values.iter().map(super::spill::width).sum::<u64>();
         }
@@ -9453,7 +9450,7 @@ impl Groups {
             first.extend_from_slice(values);
         }
         self.list.push((first, Self::fresh(p)?));
-        self.at.insert(k, self.list.len() - 1);
+        self.at.hold();
         Ok(Some(self.list.len() - 1))
     }
 
@@ -9562,7 +9559,7 @@ impl Groups {
             }
             out(row, computed.calls)?;
         }
-        self.at.clear();
+        self.at = Default::default();
         self.closed = false;
         self.held = crate::room::holding(0);
         self.kept = crate::room::holding(0);
@@ -9574,7 +9571,7 @@ impl Groups {
 /// are new written for a pass of their own; then held for its ORDER BY or LIMIT, or handed on.
 struct Going {
     distinct: bool,
-    seen: std::collections::HashSet<Vec<Key>>,
+    seen: super::held::KeySet,
     seen_held: crate::room::Holding,
     seen_past: Option<super::spill::Parts>,
     queue: super::spill::Queue,
@@ -9611,10 +9608,10 @@ impl Going {
             for r in rows {
                 self.met.meet(&r)?;
                 let k: Vec<Key> = r.iter().map(key).collect();
-                if self.seen.contains(&k) {
+                if self.seen.ask(&k).is_some() {
                     continue;
                 }
-                let w = super::spill::keys_width(&k) + super::spill::slot::<Vec<Key>>();
+                let w = self.seen.width();
                 if self.closed || !self.seen_held.fits(w) {
                     self.closed = true;
                     if self.expected.is_none() {
@@ -9626,7 +9623,7 @@ impl Going {
                         .push(parted::key_hash(&k, 0), r)?;
                     continue;
                 }
-                self.seen.insert(k);
+                self.seen.hold();
                 new.push(r);
             }
             new
@@ -10139,7 +10136,7 @@ impl<'q> StepRun<'q> {
             if let Some(past) = going.seen_past.take() {
                 past.into_queue(going.range.1, &mut going.queue)?;
             }
-            going.seen.clear();
+            going.seen = Default::default();
             going.closed = false;
             going.seen_held = crate::room::holding(0);
             let free = crate::room::current().map_or(u64::MAX, |r| r.free_bytes());

@@ -3,7 +3,7 @@
 //! is the bytes it takes as it is held; on the spill it takes a byte naming its kind, then the value.
 
 use super::held::{Columns, RowsAt};
-use super::pipeline::{Key, Value};
+use super::pipeline::Value;
 use crate::catalog::ColumnType;
 use crate::cut::PAGE;
 use crate::geo::GeoKind;
@@ -200,30 +200,6 @@ pub(super) fn row_width(row: &Vec<Value>) -> u64 {
 /// The bytes rows are held at.
 pub(super) fn rows_width(rows: &[Vec<Value>]) -> u64 {
     rows.iter().map(row_width).sum()
-}
-
-/// The bytes a key is held at: its own and those it holds.
-pub(super) fn key_width(k: &Key) -> u64 {
-    let heap = match k {
-        Key::Text(t) | Key::Class(t) => t.capacity(),
-        Key::Bytes(b) => b.capacity(),
-        Key::Composed(b) => b.len(),
-        _ => 0,
-    };
-    (std::mem::size_of::<Key>() + heap) as u64
-}
-
-/// The bytes a row's keys are held at.
-pub(super) fn keys_width(keys: &Vec<Key>) -> u64 {
-    (std::mem::size_of::<Vec<Key>>() + (keys.capacity() - keys.len()) * std::mem::size_of::<Key>())
-        as u64
-        + keys.iter().map(key_width).sum::<u64>()
-}
-
-/// The bytes a hash table holds for each entry of `T`: its slot and its control byte, at the most
-/// its load lets it fill.
-pub(super) fn slot<T>() -> u64 {
-    ((std::mem::size_of::<T>() as u64 + 1) * 8).div_ceil(7)
 }
 
 struct Bytes<'a> {

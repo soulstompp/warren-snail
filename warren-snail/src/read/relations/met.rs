@@ -7,11 +7,10 @@
 
 use super::{conjuncts, Kind, Merged, Node, Reading};
 use crate::read::pipeline::{self, parted, Key, Value};
-use crate::read::held::{Columns, RowsAt};
-use crate::read::spill::{self, Chunk, Rows, Run, CHUNK};
+use crate::read::held::{Columns, KeyRows, RowsAt};
+use crate::read::spill::{Chunk, Rows, Run, CHUNK};
 use crate::Result;
 use sqlparser::ast::{BinaryOperator, Expr};
-use std::collections::HashMap;
 
 /// One side of an equality a hash meets rows by: a column at its place, or an expression.
 #[derive(Clone, Copy)]
@@ -115,25 +114,20 @@ fn probe_pass(
     keeps_build: bool,
     out: &mut Chunk,
 ) -> Result<()> {
-    let mut map: HashMap<Vec<Key>, Vec<usize>> = HashMap::new();
+    let mut map = KeyRows::default();
     let mut held = crate::room::holding(build.count() as u64);
     for i in 0..build.count() {
         if let Some(k) = keys.side(&build.row(i), build_right)? {
-            let w = spill::keys_width(&k) + spill::slot::<(Vec<Key>, Vec<usize>)>();
-            let at = map.entry(k).or_insert_with(|| {
-                held.more(w);
-                Vec::new()
-            });
-            at.push(i);
-            held.more(std::mem::size_of::<usize>() as u64);
+            held.more(map.push(&k, i as u32));
         }
     }
     let mut met = vec![false; build.count()];
     probe.each_chunk(&mut |c| {
         for p in c {
             let mut any = false;
-            if let Some(found) = keys.side(&p, !build_right)?.and_then(|k| map.get(&k)) {
-                for &i in found {
+            if let Some(k) = keys.side(&p, !build_right)? {
+                for i in map.rows(&k) {
+                    let i = i as usize;
                     let pair = match build_right {
                         true => pairs.pair(&p, &build.row(i)),
                         false => pairs.pair(&build.row(i), &p),
@@ -543,19 +537,12 @@ impl Reading<'_> {
         let keep_left = matches!(kind, Kind::Inner | Kind::Cross | Kind::Left) && preserved;
         let mut out = Chunk::new(each);
         rrows.with_held(|rs| -> Result<()> {
-            let mut map: HashMap<Vec<Key>, Vec<usize>> = HashMap::new();
+            let mut map = KeyRows::default();
             let mut held = crate::room::holding(0);
             if let Some(keys) = &keys {
                 for i in 0..rs.count() {
                     if let Some(k) = keys.right(&rs.row(i))? {
-                        let w = spill::keys_width(&k) + spill::slot::<(Vec<Key>, Vec<usize>)>();
-                        map.entry(k)
-                            .or_insert_with(|| {
-                                held.more(w);
-                                Vec::new()
-                            })
-                            .push(i);
-                        held.more(std::mem::size_of::<usize>() as u64);
+                        held.more(map.push(&k, i as u32));
                     }
                 }
             }
@@ -572,9 +559,9 @@ impl Reading<'_> {
                     };
                     match &keys {
                         Some(keys) => {
-                            if let Some(found) = keys.left(&l)?.and_then(|k| map.get(&k)) {
-                                for &i in found {
-                                    meet(&rs.row(i), &mut out)?;
+                            if let Some(k) = keys.left(&l)? {
+                                for i in map.rows(&k) {
+                                    meet(&rs.row(i as usize), &mut out)?;
                                 }
                             }
                         }

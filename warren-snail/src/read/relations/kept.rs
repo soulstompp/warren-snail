@@ -10,7 +10,7 @@ use crate::read::spill::Rows;
 use crate::read::walk::KeySet;
 use crate::Result;
 use sqlparser::ast::{BinaryOperator, Expr};
-use std::collections::HashSet;
+use crate::read::held::KeySet as Keys;
 use std::rc::Rc;
 
 /// What rows made before a table hold of the columns it meets them on: the table's places in the
@@ -48,7 +48,7 @@ impl Keep {
         nulls_meet: bool,
         of: &mut dyn FnMut(&[Value]) -> Result<Vec<Value>>,
     ) -> Result<Option<Keep>> {
-        let mut seen: HashSet<Vec<Key>> = HashSet::new();
+        let mut seen = Keys::default();
         let mut values = Vec::new();
         let mut held = crate::room::holding(0);
         let mut over = false;
@@ -58,8 +58,11 @@ impl Keep {
                     break;
                 }
                 let v = of(r)?;
-                if seen.insert(v.iter().map(pipeline::key).collect()) {
-                    if !held.fits(3 * crate::read::spill::row_width(&v)) {
+                let k: Vec<Key> = v.iter().map(pipeline::key).collect();
+                if seen.ask(&k).is_none() {
+                    let w = 2 * crate::read::spill::row_width(&v) + seen.width();
+                    seen.hold();
+                    if !held.fits(w) {
                         over = true;
                         break;
                     }
@@ -163,7 +166,7 @@ fn numeric_key(v: &Value, ty: ColumnType) -> Option<KeyValue> {
 /// the node's first.
 pub(in crate::read) struct Kept {
     pub(in crate::read) set: Option<KeySet>,
-    keys: HashSet<Vec<Key>>,
+    keys: Keys,
     at: Vec<usize>,
     nulls_meet: bool,
 }
@@ -213,12 +216,14 @@ impl Kept {
                 }),
             )
         });
-        let keys = keep
+        let mut keys = Keys::default();
+        for r in keep
             .values
             .iter()
             .filter(|r| keep.nulls_meet || !r.iter().any(|v| v.is_null()))
-            .map(|r| r.iter().map(pipeline::key).collect())
-            .collect();
+        {
+            keys.insert(&r.iter().map(pipeline::key).collect::<Vec<_>>());
+        }
         Kept {
             set,
             keys,

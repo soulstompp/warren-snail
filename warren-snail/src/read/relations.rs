@@ -4776,8 +4776,9 @@ fn image(
     let room = crate::room::current();
     loop {
         // Each distinct row, by its first coming, with how many times each arm holds it.
-        let mut at: HashMap<Vec<pipeline::Key>, usize> = HashMap::new();
-        let mut groups: Vec<(Vec<Value>, usize, usize, u64)> = Vec::new();
+        let mut at = super::held::KeySet::default();
+        let mut groups = super::held::Columns::default();
+        let mut times: Vec<(usize, usize)> = Vec::new();
         let mut bytes = 0u64;
         let mut closed = false;
         let past = [Run::past(), Run::past()];
@@ -4785,12 +4786,12 @@ fn image(
             rows.each_chunk(&mut |c| {
                 for row in c {
                     let k = pipeline::row_key(&row, under)?;
-                    let i = match at.get(&k) {
-                        Some(&i) => i,
+                    let i = match at.ask(&k) {
+                        Some(i) => i,
                         None => {
-                            let w = super::spill::row_width(&row)
-                                + super::spill::keys_width(&k)
-                                + super::spill::slot::<(Vec<pipeline::Key>, usize)>();
+                            let w = groups.width_of(&row)
+                                + at.width()
+                                + std::mem::size_of::<(usize, usize)>() as u64;
                             let fits = !closed
                                 && match &room {
                                     Some(r) => {
@@ -4808,23 +4809,23 @@ fn image(
                                 continue;
                             }
                             bytes += w;
-                            at.insert(k, groups.len());
-                            groups.push((row, 0, 0, w));
-                            groups.len() - 1
+                            at.hold();
+                            groups.push(row);
+                            times.push((0, 0));
+                            times.len() - 1
                         }
                     };
                     match side {
-                        0 => groups[i].1 += 1,
-                        _ => groups[i].2 += 1,
+                        0 => times[i].0 += 1,
+                        _ => times[i].1 += 1,
                     }
                 }
                 Ok(())
             })?;
         }
-        for (row, x, y, w) in groups {
-            if let Some(r) = &room {
-                r.let_go(w);
-            }
+        drop(at);
+        for (i, &(x, y)) in times.iter().enumerate() {
+            let row = groups.row(i);
             let times = match (op, all) {
                 (SetOperator::Union, _) => 1,
                 (SetOperator::Intersect, false) => usize::from(x > 0 && y > 0),
@@ -4838,6 +4839,10 @@ fn image(
             if times > 0 {
                 out.push(row)?;
             }
+        }
+        drop(groups);
+        if let Some(r) = &room {
+            r.let_go(bytes);
         }
         if past.iter().all(|p| p.len() == 0) {
             break;

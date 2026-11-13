@@ -548,7 +548,7 @@ pub(in crate::read) fn make(
         .iter()
         .map(|k| making.casings.carried_under(k))
         .collect::<Result<Vec<_>>>()?;
-    let mut seen: HashSet<Vec<pipeline::Key>> = HashSet::new();
+    let mut seen = crate::read::held::KeySet::default();
     let mut seen_held = crate::room::holding(0);
     // Each row of a term in the recursion's types, where it is new: a place of its own.
     let mut fresh = |rows: &Rows, from: &[Option<ColumnType>], untyped: &[Untyped]| -> Result<Run> {
@@ -558,14 +558,11 @@ pub(in crate::read) fn make(
                 in_types(&mut row, from, untyped, &types)?;
                 if !rec.all {
                     let k = pipeline::row_key(&row, &under)?;
-                    if seen.contains(&k) {
+                    if seen.ask(&k).is_some() {
                         continue;
                     }
-                    seen_held.more(
-                        crate::read::spill::keys_width(&k)
-                            + crate::read::spill::slot::<Vec<pipeline::Key>>(),
-                    );
-                    seen.insert(k);
+                    seen_held.more(seen.width());
+                    seen.hold();
                 }
                 run.push(row)?;
             }
