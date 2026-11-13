@@ -187,10 +187,11 @@ fn stub(f: &Function) -> Own {
     }
 }
 
-/// A relation a body's subquery may read: its columns' names, and whether it is a table, whose
-/// system columns it reads too.
+/// A relation a body's subquery may read: its columns' names and types, a view's none, and whether
+/// it is a table, whose system columns it reads too.
 pub(crate) struct Readable {
     pub columns: Vec<String>,
+    pub types: Vec<Option<ColumnType>>,
     pub table: bool,
 }
 
@@ -202,11 +203,13 @@ pub(crate) type Relations = HashMap<String, Readable>;
 pub(crate) fn relations_of(catalog: &crate::catalog::Catalog) -> Relations {
     let tables = catalog.tables.iter().map(|t| {
         let columns = t.columns.iter().map(|c| c.name.clone()).collect();
-        (crate::oids::full(&t.name), Readable { columns, table: true })
+        let types = t.columns.iter().map(|c| Some(c.ty)).collect();
+        (crate::oids::full(&t.name), Readable { columns, types, table: true })
     });
     let views = catalog.views.iter().map(|v| {
         let columns = v.columns.clone();
-        (crate::oids::full(&v.name), Readable { columns, table: false })
+        let types = vec![None; v.columns.len()];
+        (crate::oids::full(&v.name), Readable { columns, types, table: false })
     });
     tables.chain(views).collect()
 }
@@ -727,7 +730,8 @@ fn question_text(f: &Function) -> String {
 
 /// The type a function's body gives, typed as 18.6 types it when the function is made, after
 /// `before` and itself, its subqueries' names read over `relations`: refused where its parser
-/// refuses the body. A quoted literal alone is text.
+/// refuses the body. A quoted literal alone is text; a statement, or a subquery alone, its one
+/// column's type.
 pub(crate) fn body_type(
     before: &[Function],
     f: &Function,
@@ -749,7 +753,72 @@ pub(crate) fn body_type(
         .types
         .get(&(own.body.as_ref() as *const Expr))
         .copied()
+        .or_else(|| match body {
+            Expr::Subquery(q) => subquery_type(q, relations, &f.args, release),
+            _ => None,
+        })
         .or_else(|| super::pipeline::quoted(body).then_some(ColumnType::Text(None))))
+}
+
+/// The type of a subquery's one column, typed over the tables its FROM names and the parameters,
+/// each named `"$1"` on: none where it reads what is not known here, or its column is not typed.
+fn subquery_type(
+    q: &sqlparser::ast::Query,
+    relations: &Relations,
+    args: &[ColumnType],
+    release: u8,
+) -> Option<ColumnType> {
+    use crate::catalog::ident;
+    use sqlparser::ast::{SelectItem, SetExpr, TableFactor};
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return None;
+    };
+    let [SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. }] =
+        s.projection.as_slice()
+    else {
+        return None;
+    };
+    if q.with.is_some() {
+        return None;
+    }
+    let mut columns: Vec<super::typed::TypedColumn> = Vec::new();
+    for t in &s.from {
+        for f in std::iter::once(&t.relation).chain(t.joins.iter().map(|j| &j.relation)) {
+            let TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } = f
+            else {
+                return None;
+            };
+            if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                return None;
+            }
+            let parts: Vec<String> = name.0.iter().filter_map(|p| p.as_ident().map(ident)).collect();
+            let key = match parts.as_slice() {
+                [n] => format!("public.{n}"),
+                [s, n] => format!("{s}.{n}"),
+                _ => return None,
+            };
+            let r = relations.get(&key)?;
+            let by = match alias {
+                Some(a) => ident(&a.name),
+                None => parts.last().cloned().unwrap_or_default(),
+            };
+            for (c, t) in r.columns.iter().zip(&r.types) {
+                columns.push((Some(by.clone()), c.clone(), *t));
+            }
+        }
+    }
+    columns.extend(
+        args.iter()
+            .enumerate()
+            .map(|(i, &t)| (None, format!("${}", i + 1), Some(t))),
+    );
+    let types = super::pipeline::typed_on(e, &columns, release).ok()?;
+    types.get(&(e as *const Expr)).copied()
 }
 
 /// The text a function's body and DEFAULTs are written in.

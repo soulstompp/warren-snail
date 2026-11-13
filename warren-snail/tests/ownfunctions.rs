@@ -267,6 +267,66 @@ fn create_function_refuses_a_body_as_postgresql_refuses_it_when_it_is_made() {
     );
 }
 
+const TYPED: &str = "CREATE SCHEMA fo; \
+     CREATE TABLE fo.src (k integer PRIMARY KEY, v integer, t text, b bigint);";
+
+// A statement's column, or a subquery's alone, is typed as the function is made, and refused where
+// RETURNS takes no value of its type, as 18.6 refuses it; a subquery of more than one column where
+// a value stands is refused as its parser refuses one. As 18.6 answered each (2026-11-13).
+#[test]
+fn create_function_types_a_statement_s_column_and_a_subquery_s_as_it_is_made() {
+    let mismatch = |r: &str, t: &str| {
+        format!("return type mismatch in function declared to return {r}\nDETAIL:  Actual return type is {t}.")
+    };
+    for (head, body, why) in [
+        ("fo.bad1() RETURNS integer", "AS 'SELECT k::text FROM fo.src'", mismatch("integer", "text")),
+        ("fo.bad2() RETURNS integer", "RETURN (SELECT k::text FROM fo.src LIMIT 1)", mismatch("integer", "text")),
+        ("fo.bad4() RETURNS integer", "AS 'SELECT t FROM fo.src'", mismatch("integer", "text")),
+        ("fo.bad5() RETURNS integer", "BEGIN ATOMIC SELECT t FROM fo.src; END", mismatch("integer", "text")),
+        ("fo.bad6(integer) RETURNS integer", "AS 'SELECT t FROM fo.src WHERE k = $1'", mismatch("integer", "text")),
+        ("fo.bad9() RETURNS boolean", "AS 'SELECT s.k FROM fo.src s'", mismatch("boolean", "integer")),
+        (
+            "fo.bad3() RETURNS integer",
+            "AS 'SELECT (SELECT k, v FROM fo.src LIMIT 1)'",
+            "subquery must return only one column".to_string(),
+        ),
+        (
+            "fo.bad7() RETURNS integer",
+            "RETURN (SELECT k, v FROM fo.src LIMIT 1)",
+            "subquery must return only one column".to_string(),
+        ),
+    ] {
+        let ddl = format!("{TYPED} CREATE FUNCTION {head} LANGUAGE sql {body};");
+        let e = Catalog::parse(&ddl).err().unwrap_or_else(|| panic!("{body} was taken"));
+        let code = if why.starts_with("subquery") { "42601" } else { "42P13" };
+        assert_eq!((e.sqlstate(), e.to_string()), (Some(code), why), "{body}");
+    }
+    let made = format!(
+        "{TYPED} \
+         CREATE FUNCTION fo.ok1() RETURNS integer LANGUAGE sql AS 'SELECT b FROM fo.src WHERE k = 1'; \
+         CREATE FUNCTION fo.ok2() RETURNS bigint LANGUAGE sql AS 'SELECT v FROM fo.src WHERE k = 1'; \
+         CREATE FUNCTION fo.ok3() RETURNS text LANGUAGE sql AS 'SELECT v FROM fo.src WHERE k = 1'; \
+         CREATE FUNCTION fo.ok4() RETURNS numeric LANGUAGE sql RETURN (SELECT v FROM fo.src LIMIT 1); \
+         CREATE FUNCTION fo.ok5() RETURNS integer LANGUAGE sql AS 'SELECT count(*) FROM fo.src'; \
+         CREATE FUNCTION fo.ok6() RETURNS integer LANGUAGE sql AS 'SELECT max(v) FROM fo.src'; \
+         CREATE FUNCTION fo.ok7() RETURNS text LANGUAGE sql AS 'SELECT ''x'' FROM fo.src LIMIT 1'; \
+         CREATE FUNCTION fo.ok8(integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 FROM fo.src LIMIT 1'; \
+         CREATE FUNCTION fo.ok9() RETURNS varchar LANGUAGE sql AS 'SELECT t FROM fo.src LIMIT 1';"
+    );
+    Catalog::parse(&made).unwrap();
+    #[cfg(feature = "standalone")]
+    {
+        let mut w = Snail::open_writing(&written("typed", &made)).unwrap();
+        rows(&mut w, "INSERT INTO fo.src VALUES (1, 10, 'a', 100), (2, 20, 'b', 200)");
+        asked(
+            &mut w,
+            "SELECT fo.ok1(), fo.ok2(), fo.ok3(), fo.ok4(), fo.ok5(), fo.ok6(), fo.ok7(), fo.ok8(5), fo.ok9()",
+            &["100|10|10|10|2|20|x|5|a"],
+        );
+        asked(&mut w, "SELECT pg_typeof(fo.ok3()), pg_typeof(fo.ok1())", &["text|integer"]);
+    }
+}
+
 // A body whose subquery reads a relation is made as 18.6 makes it: a name is the column of a
 // relation in reach before it is a parameter, a parameter the subquery's relations do not hold is
 // read as one, and a column no relation in reach holds is refused in 18.6's words. Each printed as

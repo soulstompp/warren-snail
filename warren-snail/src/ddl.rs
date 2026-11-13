@@ -2626,11 +2626,13 @@ impl Draft {
         use crate::read::own::Readable;
         let tables = self.tables.iter().map(|t| {
             let columns = t.columns.iter().map(|c| c.name.clone()).collect();
-            (crate::oids::full(&t.name), Readable { columns, table: true })
+            let types = t.columns.iter().map(|c| Some(c.ty)).collect();
+            (crate::oids::full(&t.name), Readable { columns, types, table: true })
         });
         let views = self.views.iter().map(|v| {
             let columns = v.columns.clone();
-            (crate::oids::full(&v.name), Readable { columns, table: false })
+            let types = vec![None; v.columns.len()];
+            (crate::oids::full(&v.name), Readable { columns, types, table: false })
         });
         tables.chain(views).collect()
     }
@@ -7810,6 +7812,11 @@ fn body_expression(
         && q.fetch.is_none()
         && q.locks.is_empty();
     if let SetExpr::Select(s) = q.body.as_ref() {
+        for item in &s.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                one_column_subqueries(e, relations)?;
+            }
+        }
         let grouped = !matches!(
             &s.group_by,
             sqlparser::ast::GroupByExpr::Expressions(g, m) if g.is_empty() && m.is_empty()
@@ -7834,6 +7841,37 @@ fn body_expression(
         return Err(one_column(returns));
     }
     Ok(Expr::Subquery(q.clone()))
+}
+
+/// Refuses a subquery of `e` whose value stands where an expression's does, and that returns other
+/// than one column, as PostgreSQL's parser refuses it; one beside a row is a row's.
+fn one_column_subqueries(e: &Expr, relations: &crate::read::own::Relations) -> Result<()> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    match e {
+        Expr::Subquery(q) => match crate::read::own::columns_written(q, relations) {
+            Some(n) if n != 1 => Err(Error::new("subquery must return only one column")),
+            _ => Ok(()),
+        },
+        Expr::Nested(x)
+        | Expr::UnaryOp { expr: x, .. }
+        | Expr::Cast { expr: x, .. }
+        | Expr::IsNull(x)
+        | Expr::IsNotNull(x) => one_column_subqueries(x, relations),
+        Expr::BinaryOp { left, right, .. }
+            if !matches!(left.as_ref(), Expr::Tuple(_)) && !matches!(right.as_ref(), Expr::Tuple(_)) =>
+        {
+            one_column_subqueries(left, relations)?;
+            one_column_subqueries(right, relations)
+        }
+        Expr::Function(f) => match &f.args {
+            FunctionArguments::List(l) => l.args.iter().try_for_each(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => one_column_subqueries(x, relations),
+                _ => Ok(()),
+            }),
+            _ => Ok(()),
+        },
+        _ => Ok(()),
+    }
 }
 
 /// PostgreSQL's refusal of a function whose last statement returns other than one column.
